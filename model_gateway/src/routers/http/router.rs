@@ -574,14 +574,21 @@ impl Router {
                     // entry before routing: the cast of a validated id cannot wrap
                     .map(|ids| ids.iter().map(|&id| id as u32).collect())
             });
-        let text = tokens
-            .is_none()
-            .then(|| typed_req.extract_text_for_routing());
+        let cache_namespace = CacheNamespace::derive(&typed_req.cache_partition());
+        // A classic policy is handed the text as before. The policy engine
+        // is handed it where a stage of its document reads it, or where the
+        // request names a cache partition, whose seed the engine states with
+        // a prompt. The hint was read above and a document's answer follows
+        // no routing key, so the registry is asked without the headers.
+        let text = (tokens.is_none()
+            && (self.policy_registry.engine().is_none()
+                || cache_namespace.is_some()
+                || self.policy_registry.any_policy_needs_request_text(None)))
+        .then(|| typed_req.extract_text_for_routing());
         let rid_key = self
             .policy_registry
             .derive_rid_key(typed_req.rid())
             .map(str::to_string);
-        let cache_namespace = CacheNamespace::derive(&typed_req.cache_partition());
         RoutingDerivatives {
             tokens,
             text,
@@ -7428,6 +7435,32 @@ mod tests {
                 "{model}: the bytes are whole"
             );
         }
+    }
+
+    /// A typed request's routing text is rendered for a classic policy, and
+    /// under the policy engine only where a stage of its document reads the
+    /// text: the document here reads none. A request that names a cache
+    /// partition is rendered there too, for its partition's seed.
+    #[tokio::test]
+    async fn a_typed_request_renders_no_text_for_a_document_that_reads_none() {
+        let router = streaming_router(PolicyConfig::RoundRobin, 1024 * 1024, vec![]);
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hello"}],
+        }))
+        .unwrap();
+        assert!(router.routing_derivatives(None, &request).text.is_some());
+
+        let _heard = hearing_engine_on(&router.policy_registry);
+        assert!(router.routing_derivatives(None, &request).text.is_none());
+
+        let salted: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hello"}],
+            "cache_salt": "tenant-a",
+        }))
+        .unwrap();
+        assert!(router.routing_derivatives(None, &salted).text.is_some());
     }
 
     /// A typed request the policy engine placed reaches the engine by its

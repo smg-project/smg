@@ -1,14 +1,13 @@
-//! The snapshot a decision reads (design 4.1 and 5.5): every pool derived
-//! from one membership, each a slice of whole candidate rows, and the build
-//! of one decision's view from it.
+//! The store's published world (design 4.1 and 5.5): every pool derived
+//! from one membership, each a slice of whole candidate rows.
 //!
 //! One invariant: **a decision reads one publication.** A world is
 //! everything the store published together: a pool per model and role, its
 //! rows sorted by worker id, the gateways' standing vetoes and the
 //! generation they were published under ([`StoreSnapshot::spec`]). One load
-//! hands a decision all of it, so both sides of a pair decision, their load
-//! records, the vetoes and the engine with its number are of one publication,
-//! never a prefill pool of one and a decode pool of the next.
+//! hands a decision all of it, so the vetoes it reads and the engine with
+//! its number are of one publication, never the vetoes of one and the
+//! engine of the next.
 //!
 //! **A membership write owes its build.** A registration, its refresh and
 //! a patch write their row and leave one membership build owed. The store's
@@ -54,9 +53,9 @@
 //! written when the membership's first world is built. Its moving facts
 //! (the load record with its sample instant, the two status bits) are
 //! folded into the writer's own copy of the pool, and a publication copies
-//! each pool that moved, whole. A published world never changes: a decision
-//! copies one run of memory nobody is writing and sees each row as one
-//! publication left it, through no lock.
+//! each pool that moved, whole. A published world never changes: a reader
+//! reads memory nobody is writing and sees each row as one publication left
+//! it, through no lock.
 //!
 //! **Published rows are written again only when nothing can read them.**
 //! A pool's copy goes over the rows the pool published before its last,
@@ -64,9 +63,7 @@
 //! world lists each pool's rows by a counted pointer and every reader holds
 //! a world, so that count is the proof, never a clock or a number of
 //! windows. Rows a world still lists are left as they are: the pool
-//! takes other rows the writer holds alone, or the publication allocates,
-//! which the store counts
-//! ([`MemoryStore::publication_allocations`](crate::store::MemoryStore::publication_allocations)).
+//! takes other rows the writer holds alone, or the publication allocates.
 //!
 //! **The store publishes at its own rate, never at its writers'.** Every
 //! deciding thread fetches every publication, so there is one world a
@@ -79,16 +76,7 @@
 //! sink names the instant it is due
 //! ([`LoadSink::publish_due`](crate::store::LoadSink::publish_due)).
 //!
-//! A decision's build is a copy and one pass ([`StoreSnapshot::build`]): the
-//! rows, less another gateway's host-local ones, then what is the decision's
-//! own (the position, the report's age), then the asking gateway's standing
-//! vetoes in the pool, reached by a walk among the few gateways that hold one
-//! there and by a search among many, each published with its row's place
-//! (masked by position in a pool every gateway copies whole, by id in a pool
-//! that holds host-local rows), then the pinned worker, found by its id in the
-//! slice the decision is made over: the sorted slice is its own index.
-//!
-//! **A veto is published in the form the build reads.** The writer keeps
+//! **A veto is published in its gateway's run.** The writer keeps
 //! each gateway's list and publishes each pool's standing vetoes as one run
 //! a gateway, by row. A veto's write builds its own gateway's run again in
 //! the pools its worker has a row in and shares every other run with the
@@ -108,30 +96,23 @@ use rustc_hash::FxHashMap;
 #[cfg(feature = "in-process")]
 use crate::engine::policy_engine::PolicyEngine;
 use crate::{
-    document::spec::{AppliedSpec, IndexKind, Pairing, ViewListPositions},
+    document::spec::{AppliedSpec, Pairing, ViewListPositions},
     engine::{
-        demands::DemandFacts,
-        framework::{Engine, OverloadThresholds, PairPools, PairTable},
-        view::{
-            fingerprint, AffinityFacts, Candidate, Engines, HashKind, Health, OverloadRegime,
-            Phase, PoolFacts, Role, WireModes, WorkerId,
-        },
-        warm_up::WarmUpRule,
-        EncodePool, EncoderFacts,
+        framework::{Engine, OverloadThresholds},
+        view::{fingerprint, Candidate, Health, Phase, Role, WorkerId},
     },
-    load::signals::{ReportSignals, SignalCell, SignalCells},
+    load::signals::ReportSignals,
     stages::lifecycle::Lifecycle,
     store::{
         applied::Applied,
         encoding::{EncodeClasses, EncodeMember},
-        index::{AffinityRowsBuffers, KvTables, PoolIndex, Predict, Reading},
         loads::LoadSample,
         pairing::{known, Derivation, Member, PairClasses, Pool},
         workers::{Overload, Reachability, WorkerFacts, WorkerRow, WorkerStatus},
         GatewayId,
     },
     tracking::{
-        in_flight::{InFlightBuffers, InFlightCounts, PoolInFlightCounts, WorkerSlot},
+        in_flight::{InFlightCounts, WorkerSlot},
         lease::Signal,
     },
 };
@@ -151,307 +132,15 @@ pub(super) fn micros(origin: Instant, at: Instant) -> u64 {
     u64::try_from(at.saturating_duration_since(origin).as_micros()).unwrap_or(u64::MAX)
 }
 
-/// Milliseconds from `at_micros` to `now_micros`, saturating at `u32::MAX`
-/// and at zero; never wrapping.
-fn age_ms(now_micros: u64, at_micros: u64) -> u32 {
-    u32::try_from(now_micros.saturating_sub(at_micros) / 1_000).unwrap_or(u32::MAX)
-}
-
-/// What a decision brings to the build of its view.
-#[derive(Clone, Copy, Debug)]
-pub struct ViewQuery {
-    /// The gateway the decision is for: its vetoes mask a worker for it
-    /// alone, and a host-local worker of another gateway is not its worker.
-    pub gateway: GatewayId,
-    /// The decision's instant on the host's clock.
-    pub now: Instant,
-    /// The worker the request's session key is pinned to, when the host
-    /// found one.
-    pub pinned: Option<WorkerId>,
-    /// Whether the profile's stages declared the affinity column
-    /// ([`Needs::affinity`](crate::document::Needs::affinity)): the build fills it
-    /// then, and leaves it empty otherwise.
-    pub affinity: bool,
-    /// Whether the profile's stages declared the signal cells
-    /// ([`Needs::signal_cells`](crate::document::Needs::signal_cells)): the build
-    /// hands them then, and none otherwise.
-    pub signal_cells: bool,
-}
-
-impl ViewQuery {
-    /// Whether the ask takes a column at all. The two flags are read as
-    /// one word: a view or a build makes one test for a profile that asks
-    /// for neither column, as most do.
-    #[inline]
-    fn any_column(&self) -> bool {
-        (u16::from(self.affinity) | (u16::from(self.signal_cells) << 8)) != 0
-    }
-}
-
-/// What a decision brings to the naming of its rows
-/// ([`StoreSnapshot::fill_affinity_rows`]).
-#[derive(Clone, Copy, Debug)]
-pub struct AffinityQuery<'a> {
-    /// The gateway the decision is for: the view was built for it.
-    pub gateway: GatewayId,
-    /// The request's block hashes, in order from its first block
-    /// ([`RequestFacts::block_hashes`](crate::engine::RequestFacts::block_hashes)).
-    pub block_hashes: &'a [u64],
-    /// The request's cache namespace ([`RequestFacts::namespace_seed`](crate::engine::RequestFacts::namespace_seed)).
-    pub namespace_seed: u64,
-    /// The decision's seed: where a list is cut, the rows kept are drawn
-    /// from it, on streams of the naming's own.
-    pub seed: u64,
-    /// The most rows either list may hold: what the engine names for the
-    /// decision
-    /// ([`Engine::affinity_rows_cap`](crate::engine::Engine::affinity_rows_cap)),
-    /// which is 0 for a profile that keeps its column. A host names no rows
-    /// there: a naming under 0 holds every row.
-    pub cap: u32,
-    /// The wires the view was narrowed by since its build, where the
-    /// decision's gateway states them.
-    pub wires: Option<WireModes>,
-    /// The decision's instant on the store's clock, in microseconds, as
-    /// its build read it ([`ViewFacts::now_micros`]): a warming row is named
-    /// until its own end.
-    pub now_micros: u64,
-}
-
-/// The buffers a host keeps across decisions: a build clears and fills
-/// them, and allocates only while they grow.
-#[derive(Debug, Default)]
-pub struct ViewBuffers {
-    /// The decision's candidate slice.
-    pub candidates: Vec<Candidate>,
-    /// The affinity column: one entry per candidate under a profile that
-    /// declared it, empty otherwise.
-    pub affinity: Vec<AffinityFacts>,
-    /// The rows a veto of the asking gateway masks, by position, where the
-    /// view is a publication's own rows ([`StoreSnapshot::view`]); empty where
-    /// the rows were written for the decision.
-    pub stalled: Vec<u32>,
-    /// What the decision read of its rows' requests in flight, where the
-    /// view lent its rows with the leases' counts beside them
-    /// ([`StoreSnapshot::view`]): a row's first read is kept here, so a
-    /// decision reads one count a row.
-    pub kept: InFlightBuffers,
-    /// The signal cells of the rows a build wrote here, in the rows' order,
-    /// under an ask that takes them ([`ViewQuery::signal_cells`]); a view names
-    /// the cells a decision reads ([`PoolView::signal_cells`]).
-    pub signal_cells: SignalCells,
-}
-
-impl ViewBuffers {
-    /// The signal cells of the rows a build wrote here
-    /// ([`StoreSnapshot::build`]): `None` where its ask took none and under a
-    /// generation that declares no signal. A view ([`StoreSnapshot::view`])
-    /// names its own cells ([`PoolView::signal_cells`]): one that lends its
-    /// rows writes none here, and these stay those of the build before.
-    pub fn cells(&self) -> Option<&SignalCells> {
-        (self.signal_cells.signals() != 0).then_some(&self.signal_cells)
-    }
-}
-
-/// The buffers a host keeps across pair decisions: both sides' views and
-/// the table that says which of their classes pair, all of one publication.
-/// A pair build clears and fills them ([`StoreSnapshot::build_pair`]).
-///
-/// What the store numbers for a table leaves it only with that table: the
-/// rows' classes are numbered for the table built beside them, and by the
-/// numbers alone they would pair wrongly. So nothing here is read apart:
-/// [`PairBuffers::pools`] hands the engine's pair entry all of it.
-#[derive(Debug, Default)]
-pub struct PairBuffers {
-    /// The prefill pool's view.
-    prefill: ViewBuffers,
-    /// The decode pool's view.
-    decode: ViewBuffers,
-    /// Where each prefill class's list ends in `listed`.
-    ends: Vec<u32>,
-    /// The decode classes each prefill class pairs with, list after list.
-    listed: Vec<u32>,
-}
-
-impl PairBuffers {
-    /// What the engine's pair entry reads: the two pools, their columns and
-    /// the table of the publication the rows were built from.
-    pub fn pools(&self) -> PairPools<'_> {
-        PairPools {
-            prefills: &self.prefill.candidates,
-            decodes: &self.decode.candidates,
-            prefill_affinity: &self.prefill.affinity,
-            decode_affinity: &self.decode.affinity,
-            prefill_signal_cells: self.prefill.cells(),
-            decode_signal_cells: self.decode.cells(),
-            table: PairTable::new(&self.ends, &self.listed),
-            ..PairPools::default()
-        }
-    }
-
-    fn clear(&mut self) {
-        for side in [&mut self.prefill, &mut self.decode] {
-            side.candidates.clear();
-            side.affinity.clear();
-            side.signal_cells.refill(0);
-        }
-        self.ends.clear();
-        self.listed.clear();
-    }
-}
-
-/// The buffers a host keeps across the decisions of requests that carry
-/// encode items: a pair's buffers, the encode pool's view and the two
-/// columns the encode side reads, all of one publication
-/// ([`StoreSnapshot::build_encode_pair`]).
-///
-/// An encode class is numbered for the publication that holds it, as a pair
-/// class is for its table. So nothing here is read apart:
-/// [`EncodePairBuffers::pools`] hands the engine's entry all of it.
-#[derive(Debug, Default)]
-pub struct EncodePairBuffers {
-    pair: PairBuffers,
-    /// The encode pool's view.
-    encode: ViewBuffers,
-    /// Each encoder's facts: one entry a row of the encode view.
-    facts: Vec<EncoderFacts>,
-    /// The encode class each row of the prefill view names.
-    prefill_classes: Vec<u32>,
-}
-
-impl EncodePairBuffers {
-    /// What the engine's encode-pair entry reads: the pair's pools with
-    /// their table, and the encode pool with its columns, of the
-    /// publication the rows were built from.
-    pub fn pools(&self) -> (PairPools<'_>, EncodePool<'_>) {
-        let encode = EncodePool {
-            encoders: &self.encode.candidates,
-            facts: &self.facts,
-            prefill_classes: &self.prefill_classes,
-            affinity: &self.encode.affinity,
-            signal_cells: self.encode.cells(),
-        };
-        (self.pair.pools(), encode)
-    }
-}
-
-/// What a build read beside the rows.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ViewFacts {
-    /// The rows written: the pool as the asking gateway reaches it.
-    pub pool_size: u32,
-    /// The store's epoch at the membership build the world's pools are of.
-    pub membership_epoch: u64,
-    /// The decision's instant in the rows' own clock: what the request's
-    /// `now_micros` takes.
-    pub now_micros: u64,
-    /// The number of the generation the world was published under
-    /// ([`StoreSnapshot::spec`]): the rows and it are of one load.
-    pub generation: u64,
-    /// Which list of the pool was written, as [`PoolFacts::reach`] takes
-    /// it: the asking gateway's id where the pool holds a host-local row,
-    /// each gateway being handed a list of its own there, or where a veto
-    /// of that gateway masks a row of its copy, and `0` for a pool every
-    /// gateway dials whole and reads alike.
-    pub reach: u64,
-    /// The pool the rows were read from, by its place among its world's
-    /// pools: what `StoreSnapshot::booked` takes, and good for that world
-    /// alone.
-    pub(crate) pool: u32,
-    /// How many rows of the pool hold no report: where it is 0 the pool
-    /// facts say that every row holds one ([`PoolFacts::reported`]).
-    /// Counted over the pool as it was published: the list of a gateway
-    /// that reaches fewer rows may hold fewer, so the facts never say it of
-    /// a list that holds such a row.
-    pub unreported: u32,
-}
-
-impl ViewFacts {
-    /// The pool facts of the decision, under the generation the build read
-    /// with its rows. No ring, no overload regime and no zone capacity are
-    /// derived yet.
-    pub fn pool_facts(&self) -> PoolFacts<'static> {
-        PoolFacts {
-            pool_size: self.pool_size,
-            membership_epoch: self.membership_epoch,
-            ring_epoch: 0,
-            regime: OverloadRegime::None,
-            generation: self.generation,
-            zones: &[],
-            reach: self.reach,
-            reported: self.unreported == 0,
-            engines: Engines::default(),
-            // The store keeps no word a list: its rotations go by name.
-            word: None,
-        }
-    }
-}
-
-/// One decision's view of a pool ([`StoreSnapshot::view`]): its rows, and
-/// beside them what is the decision's own where no row carries it.
-#[derive(Clone, Copy, Debug)]
-pub struct PoolView<'a> {
-    /// The decision's candidate slice, in the pool's order: a row's index
-    /// is its position. A publication's own rows where the pool was lent,
-    /// the decision's written copy otherwise.
-    pub candidates: &'a [Candidate],
-    /// The rows a veto of the asking gateway masks at the decision's
-    /// instant, by position, in order: what
-    /// [`Constraints::stalled`](crate::engine::Constraints::stalled) takes. Empty
-    /// where the rows carry their stalled bits. The rows of it a hold of
-    /// that gateway stands on are asked apart ([`StoreSnapshot::held`]): a view
-    /// under no veto has none, and carries nothing for them.
-    pub stalled: &'a [u32],
-    /// One more than the position of the pinned worker's row: what
-    /// [`RequestFacts::pinned_at`](crate::engine::RequestFacts::pinned_at) takes.
-    /// Zero where no pinned worker is in the pool and where the rows carry
-    /// their session bits.
-    pub pinned_at: u32,
-    /// The affinity column: one entry a row under a profile that declared
-    /// it, empty otherwise.
-    pub affinity: &'a [AffinityFacts],
-    /// What the leases on file book on each row, by position: what
-    /// [`RequestFacts::lent_in_flight`](crate::engine::RequestFacts::lent_in_flight)
-    /// takes. `None` where the rows carry their counts.
-    pub in_flight: Option<PoolInFlightCounts<'a>>,
-    /// The pool's engines ([`Engines`]), where it holds one of several
-    /// rows and the candidates stand at the pool's own positions: a pool
-    /// that holds a host-local row hands none.
-    pub engines: Engines<'a>,
-    /// The rows' signal cells: what
-    /// [`RequestFacts::signal_cells`](crate::engine::RequestFacts::signal_cells)
-    /// takes. The publication's own block where the pool was lent, the
-    /// decision's written copy otherwise. `None` for an ask that takes
-    /// none and under a generation that declares no signal.
-    pub signal_cells: Option<&'a SignalCells>,
-    /// What the view read beside the rows.
-    pub built: ViewFacts,
-}
-
-impl<'a> PoolView<'a> {
-    /// The pool facts of the decision ([`ViewFacts::pool_facts`]) with the
-    /// pool's engines beside them.
-    pub fn pool_facts(&self) -> PoolFacts<'a> {
-        let mut facts: PoolFacts<'a> = self.built.pool_facts();
-        facts.engines = self.engines;
-        facts
-    }
-}
-
 /// One pool's shape: what a membership build derives of it and no
 /// publication changes.
 struct PoolShape {
-    /// Each row's admission instant, in the rows' clock.
-    admitted_micros: Box<[u64]>,
     /// Each row's worker's slot in the store's counts of the leases on
     /// file ([`InFlightCounts`]): the slot its member keeps across membership
     /// builds.
     booked: Box<[WorkerSlot]>,
-    /// The host-local rows, by index, each with the gateway that holds its
-    /// socket; empty for a pool every gateway dials whole.
-    locals: Box<[(u32, GatewayId)]>,
     /// The pair classes of the pool's model, on its prefill pool where the
-    /// model has a decode too: a pair build reads them by the one lookup
-    /// that finds its two pools. Counted: a membership build hands them to
+    /// model has a decode too. Counted: a membership build hands them to
     /// the shape it derives where they stand, one of writes that moved no offer
     /// ([`Classes::Carry`]) and a written worker's derive that leaves them
     /// as they were ([`Classes::Written`]).
@@ -461,43 +150,6 @@ struct PoolShape {
     /// items reads its chosen prefill's class beside the pool it chose in.
     /// Counted and carried as the pair classes are.
     encodes: Option<Arc<EncodeClasses>>,
-    /// On an encode pool: what a decision reads of each encoder beside its
-    /// row, in the rows' order, counted and carried as the classes are.
-    /// `None` on every other pool.
-    encoders: Option<Arc<[EncoderFacts]>>,
-    /// The pool's engines, where one of them holds several rows.
-    engines: PoolEngines,
-    /// What each row states for a request's hard demands, in the rows'
-    /// order: the column a door reads for a request that states one
-    /// ([`StoreSnapshot::demand_facts`]).
-    demanded: Box<[DemandFacts]>,
-}
-
-/// One pool's engines: each engine's rows by position, the ranks of a
-/// data-parallel engine together and in their ranks' order, a single-rank
-/// worker alone. Empty, and unallocated, for a pool no engine of which
-/// holds two rows: a fleet of single-rank workers lists none.
-#[derive(Default)]
-struct PoolEngines {
-    /// The rows by position, engine after engine.
-    rows: Box<[u32]>,
-    /// Each engine's end in `rows`.
-    ends: Box<[u32]>,
-}
-
-impl PoolShape {
-    /// The pool's engines as a decision reads them, for rows that stand at
-    /// the pool's own positions: a pool that holds a host-local row hands
-    /// each gateway a list of its own, whose positions are not these, and
-    /// no engines with it. `pool` is the pool's index, its number while the
-    /// membership epoch stands.
-    fn engines(&self, pool: u32) -> Engines<'_> {
-        if self.locals.is_empty() {
-            Engines::new(pool, &self.engines.rows, &self.engines.ends)
-        } else {
-            Engines::default()
-        }
-    }
 }
 
 /// The roles a model's pools are derived for: one slot each.
@@ -541,9 +193,6 @@ struct Derived {
     /// a member that offers no model. With the pools' rows they are every
     /// member the build read ([`StoreSnapshot::unpooled_of`]).
     unpooled: Box<[(WorkerId, WorkerSlot)]>,
-    /// The store's counts of the leases on file, which the pools' slots
-    /// name: the one table of the store's life, lent with its shapes.
-    counts: Arc<InFlightCounts>,
 }
 
 impl Derived {
@@ -584,7 +233,7 @@ impl Derived {
     /// How many members `pool` holds: none where there is no pool.
     fn members(&self, pool: Option<u32>) -> usize {
         pool.and_then(|pool| self.pools.get(pool as usize))
-            .map_or(0, |shape| shape.admitted_micros.len())
+            .map_or(0, |shape| shape.booked.len())
     }
 }
 
@@ -619,16 +268,15 @@ impl Ends<'_> {
                         .binary_search_by_key(&id, |entry| entry.row.id)
                         .is_ok()
                 };
-                entries.len() == shape.map_or(0, |shape| shape.admitted_micros.len())
+                entries.len() == shape.map_or(0, |shape| shape.booked.len())
                     && !joined.is_some_and(holds)
             })
     }
 }
 
 /// One standing veto as its gateway's run in a pool carries it: the row it
-/// masks, by index and by id, and its ends. The index finds the row in a
-/// pool every gateway copies whole, the id in a pool that holds host-local
-/// rows, whichever gateway asks.
+/// masks, by index and by id, and its ends. A veto's write finds it in its
+/// run by the index, and a reader is handed the id.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PoolVeto {
     row: u32,
@@ -669,24 +317,16 @@ impl VetoEnds {
 struct GatewayRun {
     gateway: GatewayId,
     vetoes: Arc<[PoolVeto]>,
-    /// Whether a veto of the run has a hold's end, passed or not: a view
-    /// that lends its rows reads the holds of such a run alone.
-    holds: bool,
 }
 
 impl GatewayRun {
     fn new(gateway: GatewayId, vetoes: Arc<[PoolVeto]>) -> Self {
-        let holds = vetoes.iter().any(|veto| veto.ends.hold.is_some());
-        Self {
-            gateway,
-            vetoes,
-            holds,
-        }
+        Self { gateway, vetoes }
     }
 }
 
 /// One pool's standing vetoes: a run for each gateway that holds one in
-/// the pool, sorted by gateway. A build finds the asking gateway's run
+/// the pool, sorted by gateway. A reader finds the asking gateway's run
 /// among the runs ([`run_of`]) and reads no other gateway's veto; a veto's
 /// write builds its own gateway's run again and shares every other.
 type PoolVetoes = Arc<[GatewayRun]>;
@@ -738,9 +378,7 @@ pub(crate) struct StandingVeto {
 impl<'a> GatewayVetoes<'a> {
     /// The vetoes that stand at `now`, ascending by worker id, each once:
     /// a veto past its end is not handed, though its publication still
-    /// holds it. The two tests are the view's own, by which it names a
-    /// row stalled and held ([`StoreSnapshot::view`],
-    /// [`StoreSnapshot::held`]).
+    /// holds it.
     pub(crate) fn standing_at(self, now: Instant) -> impl Iterator<Item = StandingVeto> + 'a {
         self.vetoes
             .iter()
@@ -752,7 +390,7 @@ impl<'a> GatewayVetoes<'a> {
     }
 }
 
-/// The most runs a pool holds where a build still walks to its own, past
+/// The most runs a pool holds where a reader still walks to its own, past
 /// half of them at the most; above it the run is found by search. A few
 /// gateways that each hold a veto in a pool is the shape a fleet has, and
 /// there a walk reads the runs in order while a search waits for each of
@@ -996,12 +634,11 @@ pub struct OutsideLists {
     pub zones: u32,
 }
 
-/// Everything a decision reads, as one publication left it. A decision
-/// borrows it for its build
-/// ([`MemoryStore::build_view`](crate::store::MemoryStore::build_view)), and
-/// both sides of a pair decision are built from the same one
-/// ([`MemoryStore::build_pair`](crate::store::MemoryStore::build_pair)). A
-/// world never changes once published.
+/// Everything the store publishes together, as one publication left it. A
+/// decision borrows it
+/// ([`MemoryStore::deciding`](crate::store::MemoryStore::deciding)) for the
+/// engine of its generation and its gateway's standing vetoes. A world never
+/// changes once published.
 pub struct StoreSnapshot {
     epoch: u64,
     origin: Instant,
@@ -1012,14 +649,6 @@ pub struct StoreSnapshot {
     /// The standing vetoes by pool, each pool's by gateway: empty while no
     /// veto stands in the store.
     vetoes: Arc<[PoolVetoes]>,
-    /// How many rows of each pool hold no report, at the pool's index
-    /// ([`Working::unreported`]): kept by the writes and shown with the rows
-    /// a publication shows, so a decision reads one number. One list for
-    /// every world until a count moves.
-    unreported: Arc<[u32]>,
-    /// The epoch of the overload verdicts these rows carry
-    /// ([`Self::overload_epoch`]).
-    overload_epoch: u64,
     /// The generation this publication was made under: its engine and its
     /// number, read with the rows in one load.
     spec: Arc<Applied>,
@@ -1027,13 +656,6 @@ pub struct StoreSnapshot {
     /// the pointer to the generation.
     #[cfg(feature = "controller")]
     samples_decisions: bool,
-    /// Each pool's standing in its model's index, at the pool's index.
-    indexes: Arc<[Option<Arc<PoolIndex>>]>,
-    /// Each pool's signal cells as this publication left them, at the
-    /// pool's index: one cell a row a signal the generation declares, in
-    /// the rows' order. No list under a generation that declares none. One
-    /// list for every world until a pool's cells move.
-    cells: Arc<[Arc<SignalCells>]>,
 }
 
 impl std::fmt::Debug for StoreSnapshot {
@@ -1065,8 +687,8 @@ impl StoreSnapshot {
     ///
     /// The store's deciding door
     /// ([`MemoryStore::deciding`](crate::store::MemoryStore::deciding))
-    /// hands the engine under the borrow its rows are built from, never an
-    /// owned world, whose shared count a deciding thread would write.
+    /// hands the engine under a borrow of the world, never an owned world,
+    /// whose shared count a deciding thread would write.
     pub fn spec(&self) -> &AppliedSpec {
         &self.spec
     }
@@ -1131,17 +753,6 @@ impl StoreSnapshot {
         micros(self.origin, at)
     }
 
-    /// The epoch of this world's overload verdicts: the one thing to
-    /// compare between two worlds' verdicts. It moves with a judgment that
-    /// moved a row's bit, whatever started it, and with every membership
-    /// build, whose rows are judged from no bit. Two worlds of one epoch
-    /// carry the same verdict on every row, so a host that mirrors the
-    /// verdicts ([`Self::overloaded`]) reads them again only where the
-    /// epoch moved.
-    pub fn overload_epoch(&self) -> u64 {
-        self.overload_epoch
-    }
-
     /// Every row this world publishes under an overload verdict, pool by
     /// pool. A worker has a row in each pool it serves, and each row is
     /// judged under its own pool's thresholds. A host that mirrors the
@@ -1199,13 +810,6 @@ impl StoreSnapshot {
         Some((self.rows.get(index)?, self.derived.pools.get(index)?))
     }
 
-    /// How many rows of the pool at `index` hold no report, as this
-    /// publication showed them. A pool the counts do not reach reads as
-    /// holding one: the facts then say nothing of its reports.
-    fn unreported_at(&self, index: usize) -> u32 {
-        self.unreported.get(index).copied().unwrap_or(u32::MAX)
-    }
-
     fn index(&self, model: &str, role: Role) -> Option<usize> {
         Some(self.derived.by_model.get(model)?[role_slot(role)]? as usize)
     }
@@ -1239,384 +843,11 @@ impl StoreSnapshot {
         unpooled.get(at).map(|&(_, slot)| slot)
     }
 
-    /// Writes over `rows`, the candidates `built` left for `ask` before
-    /// anything narrowed them, what the leases on file book on each row's
-    /// worker at this call: one load a row, in the build's own walk of the
-    /// rows the asking gateway reaches. For rows that are written: a
-    /// decision over lent rows reads the table beside them
-    /// ([`StoreSnapshot::view`]). `built` is a build of this world.
-    pub fn count_in_flight(&self, built: &ViewFacts, ask: &ViewQuery, rows: &mut [Candidate]) {
-        let Some(shape) = self.derived.pools.get(built.pool as usize) else {
-            return;
-        };
-        // The rows as the build left them: a narrowing before this call
-        // would lay a count on another worker's row.
-        debug_assert_eq!(rows.len(), built.pool_size as usize);
-        let counts = &self.derived.counts;
-        let mut at = 0;
-        for (from, to) in Segments::of(&shape.locals, ask.gateway, shape.booked.len()) {
-            let booked = shape.booked.get(from..to).unwrap_or_default();
-            let reached = rows.get_mut(at..).unwrap_or_default();
-            for (row, in_flight) in reached.iter_mut().zip(counts.of(booked)) {
-                row.in_flight = in_flight;
-            }
-            at += booked.len();
-        }
-    }
-
-    /// Writes over both sides' rows of `out`, as [`StoreSnapshot::build_pair`]
-    /// left them for `ask`, what the leases on file book on each row's worker:
-    /// [`StoreSnapshot::count_in_flight`], a side at a time. `built` is that
-    /// build's pair.
-    pub fn count_pair_in_flight(
-        &self,
-        built: &(ViewFacts, ViewFacts),
-        ask: &ViewQuery,
-        out: &mut PairBuffers,
-    ) {
-        self.count_in_flight(&built.0, ask, &mut out.prefill.candidates);
-        self.count_in_flight(&built.1, ask, &mut out.decode.candidates);
-    }
-
-    /// The engines of the pool `built` read ([`Engines`]), for a decision
-    /// over the rows a build wrote ([`StoreSnapshot::build`]) as the build left
-    /// them: a narrowing moves a row from the position the list names.
-    /// None for a pool that holds a host-local row, and for a pool no
-    /// engine of which holds two rows. `built` is a build of this world.
-    pub fn engines(&self, built: &ViewFacts) -> Engines<'_> {
-        self.derived
-            .pools
-            .get(built.pool as usize)
-            .map_or_else(Engines::default, |shape| shape.engines(built.pool))
-    }
-
-    /// Build one decision's view of the pool serving `model` in `role` into
-    /// `out`; `None`, with the buffers cleared, when no member serves it.
-    ///
-    /// The candidates are the pool's rows in the pool's order, by worker
-    /// id, less the host-local rows of another gateway: the asking gateway
-    /// holds no socket to those, so its pool is the pool without them.
-    /// Each row is as this publication left it, its engine's overload
-    /// verdict with the rest ([`LoadSink::report`](crate::store::LoadSink::report)),
-    /// with what is the decision's own written over it: its position in the slice, its
-    /// report's age at `ask.now`, the bit of a veto of the asking gateway
-    /// that is in this publication and stands at that instant, and the
-    /// session bit on the pinned worker. A veto writes the stalled bit,
-    /// and the breaker bit beside it while its hold stands: the store
-    /// keeps no kind, and the hold says which veto no rule lifts. A veto
-    /// past its end masks nothing and costs the build one
-    /// compare until a window's publication drops it; a store that
-    /// publishes no window keeps it. A window's publication drops every
-    /// veto ended by its own instant, so a decision dated before that
-    /// instant finds a veto that still stood at its date already gone: a
-    /// decision reads one publication, and its date restores nothing the
-    /// publication dropped. The health sink's own answer keeps its compare.
-    /// Under `ask.affinity` the column holds one entry per candidate with
-    /// the worker's age since admission. Under `ask.signal_cells` the
-    /// buffers hold the rows' signal cells, each row's at its position
-    /// here ([`ViewBuffers::cells`]).
-    ///
-    /// A row's in-flight count is not written here: every decision moves
-    /// the count of the leases on file, so no publication carries it, and
-    /// a decision that reads it has it written over these rows
-    /// ([`StoreSnapshot::count_in_flight`]).
-    ///
-    /// What no fact of the store feeds yet reads as the row's default: the
-    /// two session counts, the two admission bits, the four positions into
-    /// declared lists, the encode bit, and the column's four index facts.
-    /// The breaker bit reads a hold of the asking gateway and nothing else
-    /// yet. The
-    /// healthy bit is the status alone: the health sink's precedence rule
-    /// (a gateway's completed dispatches against the prober) is not
-    /// applied here yet.
-    pub fn build(
-        &self,
-        model: &str,
-        role: Role,
-        ask: &ViewQuery,
-        out: &mut ViewBuffers,
-    ) -> Option<ViewFacts> {
-        let Some(index) = self.index(model, role) else {
-            out.candidates.clear();
-            out.affinity.clear();
-            out.stalled.clear();
-            out.signal_cells.refill(0);
-            return None;
-        };
-        self.build_at(index, ask, out)
-    }
-
-    /// [`StoreSnapshot::build`] past the model's lookup: the view of the pool
-    /// at `index` of this world's rows, into buffers cleared first. Inlined
-    /// into both doors: a single build stays one call, and a pair build runs
-    /// its two sides under its one lookup with no call between them.
-    #[inline(always)]
-    fn build_at(&self, index: usize, ask: &ViewQuery, out: &mut ViewBuffers) -> Option<ViewFacts> {
-        out.candidates.clear();
-        out.affinity.clear();
-        out.stalled.clear();
-        // What reads these buffers past the build knows no ask: cells an
-        // earlier build wrote are not this one's.
-        out.signal_cells.refill(0);
-        let (rows, shape) = (self.rows.get(index)?, self.derived.pools.get(index)?);
-        Some(self.written(index, rows, shape, ask, out))
-    }
-
-    /// The pool at `index` copied into `out` and written for the decision:
-    /// [`StoreSnapshot::build`] past its lookup, into buffers its caller
-    /// cleared.
-    #[inline(always)]
-    fn written(
-        &self,
-        index: usize,
-        rows: &[Candidate],
-        shape: &PoolShape,
-        ask: &ViewQuery,
-        out: &mut ViewBuffers,
-    ) -> ViewFacts {
-        let now_micros = micros(self.origin, ask.now);
-        for (from, to) in Segments::of(&shape.locals, ask.gateway, rows.len()) {
-            out.candidates.extend_from_slice(&rows[from..to]);
-        }
-        for (position, row) in out.candidates.iter_mut().enumerate() {
-            row.position = position as u32;
-            let sampled_at = row.load_sampled_at_micros;
-            if let Some(load) = &mut row.load {
-                load.report_age_ms = age_ms(now_micros, sampled_at);
-            }
-        }
-        if let Some(row) = ask.pinned.and_then(|id| row_of_id(&mut out.candidates, id)) {
-            row.session_hit = true;
-        }
-        if ask.any_column() {
-            if ask.affinity {
-                let admitted = &shape.admitted_micros;
-                for (from, to) in Segments::of(&shape.locals, ask.gateway, admitted.len()) {
-                    out.affinity
-                        .extend(admitted[from..to].iter().map(|&admitted| AffinityFacts {
-                            admitted_age_ms: age_ms(now_micros, admitted),
-                            ..AffinityFacts::default()
-                        }));
-                }
-            }
-            if ask.signal_cells {
-                self.write_cells(index, shape, ask, rows.len(), &mut out.signal_cells);
-            }
-        }
-        // The asking gateway's run among the gateways that hold a veto in
-        // this pool: no other gateway's veto is read.
-        let own = self
-            .vetoes
-            .get(index)
-            .and_then(|runs| run_of(runs, ask.gateway));
-        // Whether a veto of the asking gateway masks a row of its list:
-        // asked last, so no loop of the build holds the answer.
-        let masked =
-            own.is_some_and(|run| mask(run, ask.now, shape.locals.is_empty(), &mut out.candidates));
-        ViewFacts {
-            pool: index as u32,
-            pool_size: out.candidates.len() as u32,
-            membership_epoch: self.epoch,
-            now_micros,
-            generation: self.spec.generation(),
-            // A copy a veto masks reads apart from the other gateways': it
-            // is the asking gateway's own list, as one short of another's
-            // host-local rows is.
-            reach: if shape.locals.is_empty() && !masked {
-                0
-            } else {
-                ask.gateway.0
-            },
-            unreported: self.unreported_at(index),
-        }
-    }
-
-    /// The signal cells of the pool at `index`, written into `out` for the
-    /// rows the asking gateway reaches, in the order [`StoreSnapshot::build`]
-    /// writes those rows: a row's cells stand at its new position. No cell
-    /// under a generation that declares no signal.
-    fn write_cells(
-        &self,
-        index: usize,
-        shape: &PoolShape,
-        ask: &ViewQuery,
-        rows: usize,
-        out: &mut SignalCells,
-    ) {
-        let Some(block) = self.cells.get(index) else {
-            out.refill(0);
-            return;
-        };
-        let signals = block.signals();
-        let (held, cells) = (block.cells(), out.refill(signals));
-        for (from, to) in Segments::of(&shape.locals, ask.gateway, rows) {
-            if let Some(held) = held.get(from * signals..to * signals) {
-                cells.extend_from_slice(held);
-            }
-        }
-    }
-
-    /// One decision's view of the pool serving `model` in `role`; `None`,
-    /// with the buffers cleared, when no member serves it.
-    ///
-    /// Where every gateway reaches the pool whole, the view is the
-    /// publication's own rows, lent: nothing is written into a row, and
-    /// what [`StoreSnapshot::build`] writes there stands beside the rows. A
-    /// row's position was published with it. The vetoes of the asking gateway
-    /// that stand at `ask.now` are handed as positions, in order, read from its
-    /// own run alone and by the build's rule: a veto past its end masks
-    /// nothing. The rows of them a hold stands on are handed once more, apart:
-    /// where the build writes a row both bits, the view names the row twice.
-    /// The pinned worker's row is handed as one more than its position. Under
-    /// `ask.affinity` the column is filled as the build fills it. Under
-    /// `ask.signal_cells` the publication's own block of cells is lent beside
-    /// its rows, and nothing is copied. A row's report age stays what the
-    /// report carried when it was recorded. The report age limit uses the
-    /// decision's instant less the row's sample instant on either form of the
-    /// row.
-    ///
-    /// The rows are copied and written ([`StoreSnapshot::build`]) where they
-    /// cannot be lent: in a pool that holds host-local rows, where the asking
-    /// gateway's positions are its own, and for a decision that asks for
-    /// `written` rows. A profile that shows its rows to a plugin
-    /// ([`Profile::scoped`](crate::engine::Profile::scoped)) asks for them: a
-    /// plugin's view carries each row's bits and ages as the row's fields.
-    ///
-    /// What the leases on file book on each row goes into no publication:
-    /// the table is lent beside lent rows ([`PoolView::in_flight`]) and
-    /// its counts are written over rows that are written
-    /// ([`StoreSnapshot::count_in_flight`]). Both forms come back as one shape,
-    /// so a caller hands the mask, the pin and the counts on whichever rows it
-    /// was given.
-    pub fn view<'a>(
-        &'a self,
-        model: &str,
-        role: Role,
-        ask: &ViewQuery,
-        written: bool,
-        out: &'a mut ViewBuffers,
-    ) -> Option<PoolView<'a>> {
-        out.candidates.clear();
-        out.affinity.clear();
-        out.stalled.clear();
-        let index = self.index(model, role)?;
-        let (rows, shape) = (self.rows.get(index)?, self.derived.pools.get(index)?);
-        if written || !shape.locals.is_empty() {
-            let built = self.written(index, rows, shape, ask, out);
-            self.count_in_flight(&built, ask, &mut out.candidates);
-            return Some(PoolView {
-                candidates: &out.candidates,
-                stalled: &[],
-                pinned_at: 0,
-                affinity: &out.affinity,
-                in_flight: None,
-                engines: shape.engines(index as u32),
-                signal_cells: if ask.signal_cells { out.cells() } else { None },
-                built,
-            });
-        }
-        let now_micros = micros(self.origin, ask.now);
-        // The asking gateway's run alone, by the build's rule.
-        let own = self
-            .vetoes
-            .get(index)
-            .and_then(|runs| run_of(runs, ask.gateway));
-        if let Some(run) = own {
-            let standing = run.vetoes.iter().filter(|veto| veto.ends.until > ask.now);
-            out.stalled.extend(standing.map(|veto| veto.row));
-        }
-        // The search of the build's own pin, over the same rows.
-        let pinned_at = ask
-            .pinned
-            .and_then(|id| rows.binary_search_by_key(&id, |row| row.id).ok())
-            .map_or(0, |at| at as u32 + 1);
-        let mut signal_cells = None;
-        if ask.any_column() {
-            if ask.affinity {
-                let admitted = shape.admitted_micros.iter();
-                out.affinity.extend(admitted.map(|&admitted| AffinityFacts {
-                    admitted_age_ms: age_ms(now_micros, admitted),
-                    ..AffinityFacts::default()
-                }));
-            }
-            if ask.signal_cells {
-                signal_cells = self.cells.get(index).map(|block| &**block);
-            }
-        }
-        // A view a veto masks is the asking gateway's own list, as a copy
-        // a veto masks is.
-        let reach = if out.stalled.is_empty() {
-            0
-        } else {
-            ask.gateway.0
-        };
-        Some(PoolView {
-            candidates: rows,
-            stalled: &out.stalled,
-            pinned_at,
-            affinity: &out.affinity,
-            in_flight: Some(self.derived.counts.lend(&shape.booked, &mut out.kept)),
-            engines: shape.engines(index as u32),
-            signal_cells,
-            built: ViewFacts {
-                pool: index as u32,
-                pool_size: rows.len() as u32,
-                membership_epoch: self.epoch,
-                now_micros,
-                generation: self.spec.generation(),
-                reach,
-                unreported: self.unreported_at(index),
-            },
-        })
-    }
-
-    /// The rows of a lent view's mask ([`PoolView::stalled`]) a hold of the
-    /// asking gateway stands on at the decision's instant, by position, in
-    /// order, into `rows`: what
-    /// [`Constraints::held`](crate::engine::Constraints::held) takes beside the
-    /// mask. Asked of the publication the view was read from, with the
-    /// view's own `ask`. A hold stands no longer than its veto, so a held
-    /// row is a row of the mask.
-    ///
-    /// A view under no veto has no held row and is answered here at one
-    /// test: its pool's vetoes are not read again. Rows written for a
-    /// decision carry the breaker bit beside the stalled one where a hold
-    /// stands, and their view's mask is empty.
-    #[inline]
-    pub fn held<'a>(
-        &self,
-        view: &PoolView<'_>,
-        ask: &ViewQuery,
-        rows: &'a mut Vec<u32>,
-    ) -> &'a [u32] {
-        if view.stalled.is_empty() {
-            return &[];
-        }
-        self.held_rows(view.built.pool, ask, rows)
-    }
-
-    /// The walk behind [`Self::held`], out of line: the asking gateway's
-    /// run in pool `pool`, and the row of each of its vetoes whose hold
-    /// stands at the ask's instant. A run with no hold is one test.
-    #[inline(never)]
-    fn held_rows<'a>(&self, pool: u32, ask: &ViewQuery, rows: &'a mut Vec<u32>) -> &'a [u32] {
-        rows.clear();
-        let own = self
-            .vetoes
-            .get(pool as usize)
-            .and_then(|runs| run_of(runs, ask.gateway));
-        if let Some(run) = own.filter(|run| run.holds) {
-            let held = run.vetoes.iter().filter(|veto| veto.ends.held_at(ask.now));
-            rows.extend(held.map(|veto| veto.row));
-        }
-        rows
-    }
-
     /// `gateway`'s vetoes on the workers of `model`'s `role` pool, lent
     /// for one decision and read by worker id
-    /// ([`GatewayVetoes::standing_at`]): the run the view of the same ask
-    /// reads by row. Nothing is copied. Where no veto stands in the store
-    /// the answer is one test, and the model is not looked up.
+    /// ([`GatewayVetoes::standing_at`]). Nothing is copied. Where no veto
+    /// stands in the store the answer is one test, and the model is not
+    /// looked up.
     ///
     /// It hands every veto of the gateway on a worker of the pool. A
     /// caller finds each worker's place in its own list and passes over a
@@ -1645,302 +876,6 @@ impl StoreSnapshot {
         GatewayVetoes {
             vetoes: run.map_or(&[], |run| &run.vetoes),
         }
-    }
-
-    /// Build both sides of one pair decision into `out`: the model's
-    /// prefill pool, its decode pool ([`StoreSnapshot::build`] for each) and
-    /// the table of their classes, all as this publication holds them. `None`,
-    /// with every buffer cleared, when either pool has no member: one side
-    /// alone is no pair, and nothing of it is built. The model's name is looked
-    /// up once for both sides and the table.
-    pub fn build_pair(
-        &self,
-        model: &str,
-        ask: &ViewQuery,
-        out: &mut PairBuffers,
-    ) -> Option<(ViewFacts, ViewFacts)> {
-        // One lookup of the model finds both pools. The classes stand on
-        // the prefill pool's shape where both pools hold a member, so
-        // neither side is built for a model that has one side alone.
-        let built = self.derived.by_model.get(model).and_then(|pools| {
-            let prefill = pools[role_slot(Role::Prefill)]? as usize;
-            let decode = pools[role_slot(Role::Decode)]? as usize;
-            let classes = self.derived.pools.get(prefill)?.pairs.as_deref()?;
-            let prefill = self.build_at(prefill, ask, &mut out.prefill)?;
-            let decode = self.build_at(decode, ask, &mut out.decode)?;
-            classes.table_into(&mut out.ends, &mut out.listed);
-            Some((prefill, decode))
-        });
-        if built.is_none() {
-            out.clear();
-        }
-        built
-    }
-
-    /// Build one decision's pair and its encode pool into `out`: the two
-    /// pools and the table of [`StoreSnapshot::build_pair`], the model's encode
-    /// pool, the encode class each prefill names and each encoder's facts,
-    /// all as this publication holds them. A class's number is read here
-    /// beside the rows it names and leaves with them through
-    /// [`EncodePairBuffers::pools`], never apart.
-    ///
-    /// The columns follow the rows: a row left out of the asking gateway's
-    /// view, another gateway's host-local worker, takes its entry with it.
-    /// A model with no encoder builds an empty encode pool, and a model
-    /// whose encoders state no end names class `0` on every row. `None`,
-    /// with every buffer cleared, when either side of the pair has no
-    /// member. The pair is built by the pair's door as it stands; the
-    /// encode side looks the model up once more.
-    pub fn build_encode_pair(
-        &self,
-        model: &str,
-        ask: &ViewQuery,
-        out: &mut EncodePairBuffers,
-    ) -> Option<(ViewFacts, ViewFacts)> {
-        out.encode.candidates.clear();
-        out.encode.affinity.clear();
-        out.encode.signal_cells.refill(0);
-        out.facts.clear();
-        out.prefill_classes.clear();
-        let pair = self.build_pair(model, ask, &mut out.pair);
-        // `None`: the pair's door cleared its buffers, and the encode side's
-        // are clear already.
-        let built = pair?;
-        // The pair was built, so the index names the model and its pools.
-        let pools = self.derived.by_model.get(model);
-        let shape_of = |role: Role| {
-            let at = pools?[role_slot(role)]? as usize;
-            Some((at, self.derived.pools.get(at)?))
-        };
-        let classes =
-            shape_of(Role::Prefill).and_then(|(_, shape)| Some((shape, shape.encodes.as_deref()?)));
-        match classes {
-            Some((shape, classes)) => {
-                let named = classes.prefills();
-                for (from, to) in Segments::of(&shape.locals, ask.gateway, named.len()) {
-                    out.prefill_classes.extend_from_slice(&named[from..to]);
-                }
-            }
-            None => out.prefill_classes.resize(built.0.pool_size as usize, 0),
-        }
-        if let Some((encode, shape)) = shape_of(Role::Encode) {
-            if self.build_at(encode, ask, &mut out.encode).is_some() {
-                let stated = shape.encoders.as_deref().unwrap_or(&[]);
-                for (from, to) in Segments::of(&shape.locals, ask.gateway, stated.len()) {
-                    out.facts.extend_from_slice(&stated[from..to]);
-                }
-            }
-        }
-        Some(built)
-    }
-
-    /// What each row of a build states for a request's hard demands
-    /// ([`DemandFacts`]), into `out`, cleared first: one entry a row of the
-    /// list `built` was written as for `ask`'s gateway, in the rows' order,
-    /// as [`StoreSnapshot::build`] copied them. Asked of the publication the
-    /// build read, by a door whose request states a demand: a request that
-    /// states none reads no column. Empty where the build's pool is no pool of
-    /// this publication.
-    pub fn demand_facts(&self, built: &ViewFacts, ask: &ViewQuery, out: &mut Vec<DemandFacts>) {
-        out.clear();
-        let Some(shape) = self.derived.pools.get(built.pool as usize) else {
-            return;
-        };
-        for (from, to) in Segments::of(&shape.locals, ask.gateway, shape.demanded.len()) {
-            out.extend_from_slice(&shape.demanded[from..to]);
-        }
-    }
-
-    /// Name the rows the affinity stages read in the column's place
-    /// ([`AffinityRows`](crate::engine::AffinityRows)) for `view`, the rows a
-    /// decision of `model` in `role` is made over: the pool's as
-    /// [`StoreSnapshot::view`] lends them, or as [`StoreSnapshot::build`] wrote
-    /// them, which its caller may have narrowed by its gateway's wires since.
-    /// `named` takes the request's deepest holders, by one lookup of the pool's
-    /// index under the profile's cap (its sample, or no cap where it takes
-    /// none), and the pool's warming rows as this publication read them, less
-    /// those whose naming ended by the decision's instant. Under a cap the
-    /// holders' lookup lists nothing of the pool's length. Where the pool holds
-    /// a record of sent prefixes, its rows with no heard lane are named beside
-    /// the index's holders under the same cap: after them, in the room they
-    /// leave, or ahead of them where no prefix stage of the profile reads cache
-    /// events. That lookup finds the deepest block a worker of the view was
-    /// sent. The warming rows are read where the publication holds them: they
-    /// are copied only for a view that is not the pool whole, and past the
-    /// first row's end. No row is named, and no index is read, where the view
-    /// holds no row or no member serves `model` in `role`.
-    ///
-    /// The lookup is of this instant: an index is written between two
-    /// publications, so a holder may be named a window before its row's
-    /// load shows the request that made it one.
-    pub fn fill_affinity_rows(
-        &self,
-        model: &str,
-        role: Role,
-        naming: &AffinityQuery<'_>,
-        view: &[Candidate],
-        named: &mut AffinityRowsBuffers,
-    ) {
-        self.name_in::<false>(model, role, naming, view, HashKind::Token, named);
-    }
-
-    /// [`StoreSnapshot::fill_affinity_rows`] for rows its caller cut by more
-    /// than its gateway's wires since their build: the rows a request's hard
-    /// demands took are out of `view`, and nothing else says which. The
-    /// holders' lookup is kept within the view's own rows, so the cap is filled
-    /// from the rows that stay, and a warming row is named where the view holds
-    /// it.
-    pub fn fill_affinity_rows_narrowed(
-        &self,
-        model: &str,
-        role: Role,
-        naming: &AffinityQuery<'_>,
-        view: &[Candidate],
-        named: &mut AffinityRowsBuffers,
-    ) {
-        self.name_in::<true>(model, role, naming, view, HashKind::Token, named);
-    }
-
-    /// The one naming behind [`StoreSnapshot::fill_affinity_rows`] and
-    /// [`StoreSnapshot::fill_affinity_rows_narrowed`], built once for each.
-    /// Those two name a token request. The door names a request by the kind it
-    /// was hashed by: a text request is named by the record of sent prefixes
-    /// alone.
-    pub(crate) fn name_in<const CUT: bool>(
-        &self,
-        model: &str,
-        role: Role,
-        naming: &AffinityQuery<'_>,
-        view: &[Candidate],
-        hash_kind: HashKind,
-        named: &mut AffinityRowsBuffers,
-    ) {
-        named.clear();
-        // A view with no row (a subset hint of 0, wires no member shares)
-        // names nobody and reads no index.
-        if view.is_empty() {
-            return;
-        }
-        let Some(index) = self.index(model, role) else {
-            return;
-        };
-        let (Some(rows), Some(shape), Some(Some(held))) = (
-            self.rows.get(index),
-            self.derived.pools.get(index),
-            self.indexes.get(index),
-        ) else {
-            return;
-        };
-        let pool: (u32, &[Candidate]) = (index as u32, rows);
-        if CUT {
-            held.name_cut(naming, pool, &shape.locals, view, hash_kind, named);
-        } else {
-            held.name(naming, pool, &shape.locals, view, hash_kind, named);
-        }
-    }
-
-    /// The pool's standing in its model's index, for the cases: a
-    /// membership write that kept it publishes the same one.
-    #[cfg(test)]
-    pub(super) fn standing(&self, model: &str, role: Role) -> Option<Arc<PoolIndex>> {
-        self.indexes.get(self.index(model, role)?)?.clone()
-    }
-
-    /// Every pool's standing, for the cases: a membership write that moved
-    /// none publishes the same list.
-    #[cfg(test)]
-    pub(super) fn standings(&self) -> Arc<[Option<Arc<PoolIndex>>]> {
-        Arc::clone(&self.indexes)
-    }
-}
-
-/// Write a veto's bits on each row of `rows` a veto of `run` masks at
-/// `now`, and say whether one did: the stalled bit, and the breaker bit
-/// beside it while the veto's hold stands.
-///
-/// A pool every gateway dials whole is copied whole (`whole`): a veto's row
-/// is its position. Another gateway's host-local rows are left out, so
-/// there the row is found by its id.
-///
-/// Out of line: a build that holds no veto of the asking gateway pays one
-/// test for this walk, and the build's row loop pays nothing for it.
-#[inline(never)]
-fn mask(run: &GatewayRun, now: Instant, whole: bool, rows: &mut [Candidate]) -> bool {
-    let mut masked = false;
-    for veto in run.vetoes.iter() {
-        if veto.ends.until <= now {
-            continue;
-        }
-        let row = if whole {
-            rows.get_mut(veto.row as usize)
-        } else {
-            row_of_id(rows, veto.id)
-        };
-        if let Some(row) = row {
-            // Every standing veto masks its row, as the mask beside lent
-            // rows names it: a stage that reads the stalled bit refuses
-            // the row whichever way its host handed it. A hold says more,
-            // by the breaker bit: it refuses execution as an open breaker
-            // does, and no rule lifts it. A veto with no hold, or past its
-            // hold's end, is a doubt alone.
-            row.health.stalled = true;
-            if veto.ends.held_at(now) {
-                row.health.breaker_open = true;
-            }
-            masked = true;
-        }
-    }
-    masked
-}
-
-/// The row of worker `id` in a slice sorted by worker id.
-fn row_of_id(rows: &mut [Candidate], id: WorkerId) -> Option<&mut Candidate> {
-    let at = rows.binary_search_by_key(&id, |row| row.id).ok()?;
-    rows.get_mut(at)
-}
-
-/// The runs of a pool's rows a gateway's view takes: every row but the
-/// host-local ones of another gateway, as index ranges in order.
-struct Segments<'a> {
-    locals: std::slice::Iter<'a, (u32, GatewayId)>,
-    gateway: GatewayId,
-    from: usize,
-    len: usize,
-    done: bool,
-}
-
-impl<'a> Segments<'a> {
-    fn of(locals: &'a [(u32, GatewayId)], gateway: GatewayId, len: usize) -> Self {
-        Self {
-            locals: locals.iter(),
-            gateway,
-            from: 0,
-            len,
-            done: false,
-        }
-    }
-}
-
-impl Iterator for Segments<'_> {
-    type Item = (usize, usize);
-
-    fn next(&mut self) -> Option<(usize, usize)> {
-        if self.done {
-            return None;
-        }
-        for &(index, owner) in self.locals.by_ref() {
-            let index = (index as usize).min(self.len);
-            if owner == self.gateway {
-                continue;
-            }
-            let run = (self.from, index);
-            self.from = (index + 1).min(self.len);
-            if run.0 < run.1 {
-                return Some(run);
-            }
-        }
-        self.done = true;
-        (self.from < self.len).then_some((self.from, self.len))
     }
 }
 
@@ -2002,101 +937,15 @@ fn health_of(status: WorkerStatus) -> Health {
 }
 
 /// One member on its way into a pool: its row, what it registered with, and
-/// the two facts of its place.
+/// its slot in the store's counts.
 #[derive(Clone, Copy)]
 struct Entry<'a> {
     row: Candidate,
     facts: &'a WorkerFacts,
-    admitted_micros: u64,
-    local: Option<GatewayId>,
     /// The thresholds its registration names.
     own: Overload,
     /// Its member's slot in the store's counts.
     booked: WorkerSlot,
-}
-
-/// The engines of the pool `entries` list, which stand by id: the ranks of
-/// one data-parallel engine share its group in `ranked`, and every other
-/// member is an engine alone. `placed` holds a slot a group, each free on
-/// entry and on return. Nothing is listed, and nothing allocated, where no
-/// engine of the pool holds two rows.
-fn engines_of(
-    entries: &[Entry<'_>],
-    ranked: &[(WorkerId, u32, u64)],
-    placed: &mut [u32],
-) -> PoolEngines {
-    if ranked.is_empty() {
-        return PoolEngines::default();
-    }
-    // Each row's engine, the engines numbered as they first appear, and
-    // each engine's count of rows.
-    let mut of = Vec::with_capacity(entries.len());
-    let mut sizes: Vec<u32> = Vec::new();
-    let mut next = 0;
-    for entry in entries {
-        let group = ranked_at(ranked, &mut next, entry.row.id)
-            .and_then(|(group, _)| placed.get_mut(group as usize));
-        let engine = match group {
-            Some(place) if *place != u32::MAX => *place,
-            free => {
-                let engine = sizes.len() as u32;
-                sizes.push(0);
-                if let Some(place) = free {
-                    *place = engine;
-                }
-                engine
-            }
-        };
-        if let Some(size) = sizes.get_mut(engine as usize) {
-            *size += 1;
-        }
-        of.push(engine);
-    }
-    // The groups' slots are freed for the next pool.
-    next = 0;
-    for entry in entries {
-        let group = ranked_at(ranked, &mut next, entry.row.id);
-        if let Some(place) = group.and_then(|(group, _)| placed.get_mut(group as usize)) {
-            *place = u32::MAX;
-        }
-    }
-    if sizes.len() == entries.len() {
-        return PoolEngines::default();
-    }
-    // Each engine's end, then its rows written from its start.
-    let mut ends = sizes;
-    let mut end = 0;
-    for size in &mut ends {
-        end += *size;
-        *size = end;
-    }
-    let mut at: Vec<u32> = std::iter::once(0)
-        .chain(ends.iter().copied())
-        .take(ends.len())
-        .collect();
-    let mut rows = vec![0_u32; entries.len()];
-    for (position, &engine) in (0_u32..).zip(&of) {
-        let Some(slot) = at.get_mut(engine as usize) else {
-            continue;
-        };
-        if let Some(row) = rows.get_mut(*slot as usize) {
-            *row = position;
-        }
-        *slot += 1;
-    }
-    // An engine's rows stand in its ranks' order: by id they need not.
-    let rank_of = |row: &u32| entries.get(*row as usize).map(|entry| entry.facts.dp_rank);
-    let mut from = 0;
-    for &end in &ends {
-        if let Some(engine) = rows.get_mut(from as usize..end as usize) {
-            engine.sort_unstable_by_key(rank_of);
-        }
-        from = end;
-    }
-    PoolEngines {
-        rows: rows.into_boxed_slice(),
-        ends: ends.into_boxed_slice(),
-    }
 }
 
 /// The list a membership build fills for a pool that stood at `standing`
@@ -2171,9 +1020,7 @@ pub(super) enum Classes {
     /// No member joined or left and no member's offer moved
     /// ([`same_offer`]): the classes are the last write's, carried, and no
     /// member's facts are read for them. Every pool holds the rows it
-    /// held, each admitted when it was and stating the wires it stated: a
-    /// pool's standing in its model's index is carried on the same word
-    /// ([`Writer::index_pools`]).
+    /// held, each admitted when it was and stating the wires it stated.
     Carry,
 }
 
@@ -2225,15 +1072,6 @@ pub(super) fn same_offer(old: &WorkerFacts, new: &WorkerFacts) -> bool {
         && known(&old.engine_kind) == known(&new.engine_kind)
         && old.pairing == new.pairing
         && old.encode == new.encode
-}
-
-/// Whether the prefixes sent to a worker under `old` still say what it
-/// holds under `new`, where both are one worker's facts under one
-/// registration: the same offer at the same rank. A rank is a cache of
-/// its own. Every write that keeps a worker under its id asks here, and
-/// the worker leaves the records of sent prefixes where it says no.
-pub(super) fn same_cache(old: &WorkerFacts, new: &WorkerFacts) -> bool {
-    old.dp_rank == new.dp_rank && same_offer(old, new)
 }
 
 /// The models `old` stands in a pool of and `new` does not, where both are
@@ -2347,36 +1185,6 @@ fn encode_up(
     (classes.classes() != 0).then(|| Arc::new(classes))
 }
 
-/// What a decision reads of each encoder beside its row, in the rows'
-/// order: its class among `classes`, `0` where it states no end or the
-/// model has no class; whether its registration states a push, with its
-/// role or without; and whether it takes an item's references. They are
-/// what the last write left on the model's encode pool (`last_encode`)
-/// where this write left the model's encoders and prefills as they stood
-/// ([`Ends::stand`]), and `None` where the model has no encoder.
-fn encoder_facts(
-    encoders: &[Entry<'_>],
-    classes: Option<&EncodeClasses>,
-    last_encode: Option<&PoolShape>,
-) -> Option<Arc<[EncoderFacts]>> {
-    if let Some(last) = last_encode {
-        debug_assert!(
-            last.encoders
-                .iter()
-                .all(|stated| stated.len() == encoders.len()),
-            "the facts are these members'"
-        );
-        return last.encoders.clone();
-    }
-    if encoders.is_empty() {
-        return None;
-    }
-    // A model with no class reads class `0` at every encoder.
-    let none = EncodeClasses::default();
-    let offers = encoders.iter().map(|entry| &entry.facts.encode);
-    Some(classes.unwrap_or(&none).encoder_facts(offers))
-}
-
 /// One member's row in one pool of the writer's working copy.
 #[derive(Clone, Copy)]
 struct Place {
@@ -2391,22 +1199,11 @@ struct Working {
     rows: Vec<Candidate>,
     /// Folded since the last publication.
     dirty: bool,
-    /// How many of the rows hold no report ([`unreported`]): taken where a
-    /// membership write builds the rows, then moved by each write that
-    /// gives a row its first report or takes its last ([`rows_at`]). A
-    /// publication reads it and passes over no row.
-    unreported: u32,
     /// Each row's own overload thresholds, from its registration.
     own: Vec<Overload>,
     /// The thresholds the standing generation's binding hands this pool;
     /// `None` when no binding matches it or its block is switched off.
     binding: Option<OverloadThresholds>,
-    /// The rows' signal cells, row after row: one cell a signal the
-    /// standing generation declares, and none under a generation that
-    /// declares none.
-    cells: Vec<SignalCell>,
-    /// A cell was written since the last publication.
-    cells_dirty: bool,
 }
 
 /// One engine as the overload verdict reads it: the ranks of one
@@ -2478,51 +1275,17 @@ fn ranked_at(
 }
 
 /// What the load table holds of one rank, as a membership build and an
-/// applied generation read it: its load sample, and its signal cells under
-/// the standing generation's columns. A closure reads the samples of a
-/// table that keeps no cell.
+/// applied generation read it: its load sample. A closure reads the samples
+/// of a table.
 pub(super) trait OnFile {
     /// The rank's load sample.
     fn sample(&self, id: WorkerId, rank: u16) -> Option<LoadSample>;
-
-    /// The rank's signal cells, one a signal the standing generation
-    /// declares; `None` where no value was written for the rank.
-    fn cells(&self, id: WorkerId, rank: u16) -> Option<&[SignalCell]> {
-        let _ = (id, rank);
-        None
-    }
 }
 
 impl<F: Fn(WorkerId, u16) -> Option<LoadSample>> OnFile for F {
     fn sample(&self, id: WorkerId, rank: u16) -> Option<LoadSample> {
         self(id, rank)
     }
-}
-
-/// The signal cells of `rows`, row after row, as the table holds them:
-/// `signals` cells a row, and cells of no value for a rank with none on
-/// file.
-fn cells_beside(rows: &[Candidate], signals: usize, on_file: &impl OnFile) -> Vec<SignalCell> {
-    let mut cells = Vec::with_capacity(rows.len() * signals);
-    for row in rows {
-        let held = on_file.cells(row.id, row.dp_rank);
-        match held.filter(|held| held.len() == signals) {
-            Some(held) => cells.extend_from_slice(held),
-            None => cells.resize(cells.len() + signals, SignalCell::NONE),
-        }
-    }
-    cells
-}
-
-/// Writes `cells` over `over` when the writer holds the last reference to
-/// it, by the rule a pool's rows are written over ([`written_over`]).
-/// Whether it did.
-fn cells_over(over: &mut Arc<SignalCells>, cells: &[SignalCell], signals: usize) -> bool {
-    let Some(over) = Arc::get_mut(over) else {
-        return false;
-    };
-    over.refill(signals).extend_from_slice(cells);
-    true
 }
 
 /// The build the membership writes since the last one left owed.
@@ -2552,10 +1315,6 @@ pub(super) struct Writer {
     derivations: FxHashMap<Box<str>, Derivation>,
     /// Each pool's rows as the last publication left them.
     published: Vec<Arc<[Candidate]>>,
-    /// How many rows of each pool hold no report, as the last publication
-    /// showed them ([`Working::unreported`]): one list for every world until
-    /// a count moves.
-    unreported: Arc<[u32]>,
     /// Each pool's spare: the rows it published before its last, kept for
     /// its next publication to write over; none before the pool's first
     /// publication after a membership build. Beside the working copies,
@@ -2572,21 +1331,6 @@ pub(super) struct Writer {
     /// that publication alone: a pool of their length with no spare to
     /// write over takes them, and the publication frees the rest.
     unlisted: Vec<Arc<[Candidate]>>,
-    /// Each pool's signal cells as the last publication left them
-    /// ([`StoreSnapshot::cells`]): one list for every world until a pool's
-    /// cells move, and no list under a generation that declares no signal.
-    cells: Arc<[Arc<SignalCells>]>,
-    /// Each pool's spare cells: the block it published before its last,
-    /// kept for its next publication to write over, as its rows' spare is.
-    /// A block some world still lists is let go and stays that world's: a
-    /// world is freed by a write ([`Self::replaced`]), so no decision
-    /// frees a block.
-    cell_spares: Vec<Option<Arc<SignalCells>>>,
-    /// A write moved a pool's cells since the last publication: the one
-    /// word a publication tests for them.
-    cells_moved: bool,
-    /// How many times a publication allocated a pool's rows or its cells.
-    allocations: u64,
     /// How many times the pools were built from the membership.
     builds: u64,
     /// Every replaced world a reader still held when the cell let it go
@@ -2613,23 +1357,6 @@ pub(super) struct Writer {
     /// The generation every world is published under until the next is
     /// applied: the unbound one at the start.
     spec: Arc<Applied>,
-    /// Each pool's standing in its model's index: made by a membership
-    /// write, its warming rows read again by a window's publication.
-    indexes: Arc<[Option<Arc<PoolIndex>>]>,
-    /// The buffers a pool's reading is made in.
-    reading: Reading,
-    /// The lane table's count of moves as the last membership write read
-    /// it ([`KvTables::moves`]): while it stands, no pool's place in an
-    /// index moved.
-    lanes: u64,
-    /// How many membership writes walked the pools
-    /// ([`Self::index_pools`]), for the cases.
-    #[cfg(test)]
-    walks: u64,
-    /// The store's index tables, where a membership write reads each
-    /// pool's standing ([`Self::over`]). A writer made alone holds tables
-    /// of its own with no lane.
-    kv: Arc<KvTables>,
     /// The generation before the standing one, kept one apply longer: the
     /// publication that lets go of the last world published under it
     /// frees no engine, the next apply does. Its whole engine stays
@@ -2677,11 +1404,6 @@ pub(super) struct Writer {
     unnamed: Vec<(WorkerId, u16)>,
     /// How many writes to the load table moved an overload verdict.
     flips: u64,
-    /// The epoch of the working rows' overload verdicts. It moves with a
-    /// judgment that moved a row's bit ([`Self::judge`]) and with every
-    /// membership build, whose rows start with no bit. A world carries the
-    /// epoch of its publication ([`StoreSnapshot::overload_epoch`]).
-    overload_epoch: u64,
     /// The standing members outside the standing generation's lists.
     outside: OutsideLists,
     /// Each member's fields under the standing generation's lists, in id
@@ -2713,15 +1435,10 @@ impl Writer {
             derived: Arc::default(),
             derivations: FxHashMap::default(),
             published: Vec::new(),
-            unreported: Arc::from(Vec::new()),
             spares: Vec::new(),
             working: Vec::new(),
             held: Vec::new(),
             unlisted: Vec::new(),
-            cells: Arc::default(),
-            cell_spares: Vec::new(),
-            cells_moved: false,
-            allocations: 0,
             builds: 0,
             worlds: Vec::new(),
             publications: 0,
@@ -2730,12 +1447,6 @@ impl Writer {
             vetoes: Arc::default(),
             pool_vetoes: Arc::default(),
             spec: Arc::new(Applied::new(AppliedSpec::unbound(), origin)),
-            indexes: Arc::default(),
-            reading: Reading::default(),
-            lanes: 0,
-            #[cfg(test)]
-            walks: 0,
-            kv: Arc::default(),
             retired: None,
             engines: Vec::new(),
             engine_rows: Vec::new(),
@@ -2747,7 +1458,6 @@ impl Writer {
             silenced: 0,
             unnamed: Vec::new(),
             flips: 0,
-            overload_epoch: 0,
             outside: OutsideLists::default(),
             listed: Vec::new(),
             listed_spare: Vec::new(),
@@ -2763,14 +1473,6 @@ impl Writer {
         Arc::clone(&self.counts)
     }
 
-    /// The writer over the store's index tables: every membership write
-    /// reads its pools' standings in `kv`. The store hands them once, at
-    /// its making, and writes its lanes into the same tables.
-    pub(super) fn over(mut self, kv: Arc<KvTables>) -> Self {
-        self.kv = kv;
-        self
-    }
-
     /// A world of everything published so far: one small object, a pointer
     /// per pool. Nothing derived is built here.
     pub(super) fn world(&self) -> Arc<StoreSnapshot> {
@@ -2779,14 +1481,10 @@ impl Writer {
             origin: self.origin,
             derived: Arc::clone(&self.derived),
             rows: self.published.clone().into_boxed_slice(),
-            unreported: Arc::clone(&self.unreported),
-            overload_epoch: self.overload_epoch,
             vetoes: Arc::clone(&self.pool_vetoes),
             spec: Arc::clone(&self.spec),
             #[cfg(feature = "controller")]
             samples_decisions: self.spec.engine().explain_sample() != 0,
-            indexes: Arc::clone(&self.indexes),
-            cells: Arc::clone(&self.cells),
         })
     }
 
@@ -2823,9 +1521,7 @@ impl Writer {
     /// takes in every membership write since the last, so none stays owed.
     /// It reads every member where the generation's lists differ from the
     /// standing one's and carries each member's fields where they are the
-    /// same. Either way each pool's warming rows are ruled by the new
-    /// generation: the build's door reads the index tables under it, and a
-    /// generation of the standing mode rules each pool's standing again.
+    /// same.
     ///
     /// The generation this one replaces is kept until the next apply, and
     /// the one kept until now is handed back for the caller to let go
@@ -2863,13 +1559,9 @@ impl Writer {
             self.bind();
             // A generation of the standing mode comes with no membership
             // write: the receipts are read from the samples as the rows
-            // stand, and the cells under the generation's own columns.
+            // stand.
             self.hear_again(&on_file);
-            self.read_cells(&on_file);
             self.judge_every();
-            // A generation may rule a pool's warming rows by other numbers,
-            // or rule none, and it may turn a pool's record of sent prefixes.
-            self.rule_indexes();
             self.publish()
         };
         Ok((world, before))
@@ -2927,7 +1619,8 @@ impl Writer {
     /// Each pool's thresholds under the standing generation: those of the
     /// binding the pool is decided under, which is the first to match its
     /// model and its role's phase, or the model's pair binding for a
-    /// decode pool
+    /// decode pool, and for an encode pool where that binding's plan is
+    /// `epd`
     /// ([`Engine::pool_binding`](crate::engine::framework::Engine::pool_binding)).
     /// Whether any pool has a pair.
     fn bind(&mut self) -> bool {
@@ -3040,7 +1733,6 @@ impl Writer {
             heard,
             sample_bound,
             unnamed,
-            overload_epoch,
             ..
         } = self;
         let Some(engine) = engines.get(engine as usize).filter(|engine| engine.judged) else {
@@ -3137,7 +1829,6 @@ impl Writer {
                 moved = true;
             }
         }
-        *overload_epoch += u64::from(moved);
         moved
     }
 
@@ -3265,95 +1956,6 @@ impl Writer {
                 .and_then(|row| on_file.sample(row.id, row.dp_rank));
             *heard = sample.map_or(0, |sample| micros(self.origin, sample.received_at));
         }
-    }
-
-    /// Every pool's signal cells read from the table under the standing
-    /// generation's columns, and published whole with the next world: for
-    /// a membership build, whose rows are new, and for an applied
-    /// generation, whose columns may be other ones. One test where neither
-    /// the standing generation nor the one before declares a signal.
-    fn read_cells(&mut self, on_file: &impl OnFile) {
-        let signals = self.spec.signal_columns().len();
-        if signals == 0 && self.cells.is_empty() {
-            return;
-        }
-        self.cells_moved = false;
-        self.cell_spares.clear();
-        self.cell_spares.resize(self.working.len(), None);
-        for pool in &mut self.working {
-            pool.cells_dirty = false;
-            pool.cells = if signals == 0 {
-                Vec::new()
-            } else {
-                cells_beside(&pool.rows, signals, on_file)
-            };
-        }
-        self.cells = if signals == 0 {
-            Arc::default()
-        } else {
-            let block = |pool: &Working| Arc::new(SignalCells::new(pool.cells.clone(), signals));
-            self.working.iter().map(block).collect()
-        };
-    }
-
-    /// Write one value into the cells of member `id`'s rows at `rank`,
-    /// under `column`. Whether a row took it: none does for a member with
-    /// no place yet and for one whose rows stand at another rank, and the
-    /// build that gives the rank its row reads the value from the table.
-    pub(super) fn fold_signal(
-        &mut self,
-        id: WorkerId,
-        rank: u16,
-        column: usize,
-        cell: SignalCell,
-    ) -> bool {
-        let signals = self.spec.signal_columns().len();
-        let Self {
-            places, working, ..
-        } = self;
-        let mut folded = false;
-        for place in places_of(places, id) {
-            let Some(pool) = working.get_mut(place.pool as usize) else {
-                continue;
-            };
-            let row = place.row as usize;
-            if pool.rows.get(row).is_none_or(|row| row.dp_rank != rank) {
-                continue;
-            }
-            if let Some(held) = pool.cells.get_mut(row * signals + column) {
-                *held = cell;
-                pool.cells_dirty = true;
-                folded = true;
-            }
-        }
-        self.cells_moved |= folded;
-        folded
-    }
-
-    /// Member `id`'s rows hold no value any more: its cells left the table
-    /// with its load samples. Whether a row held one.
-    pub(super) fn forget_signals(&mut self, id: WorkerId) -> bool {
-        let signals = self.spec.signal_columns().len();
-        let Self {
-            places, working, ..
-        } = self;
-        let mut forgot = false;
-        for place in places_of(places, id) {
-            let Some(pool) = working.get_mut(place.pool as usize) else {
-                continue;
-            };
-            let from = place.row as usize * signals;
-            let Some(held) = pool.cells.get_mut(from..from + signals) else {
-                continue;
-            };
-            if held.iter().any(|cell| !cell.is_none()) {
-                held.fill(SignalCell::NONE);
-                pool.cells_dirty = true;
-                forgot = true;
-            }
-        }
-        self.cells_moved |= forgot;
-        forgot
     }
 
     /// The standing generation: the one every world is published under
@@ -3522,8 +2124,7 @@ impl Writer {
     /// caller says (`classes`). A member's engine family, zone and labels
     /// under the standing generation's lists are read where its row's
     /// revision moved since they were last read, and carried where it
-    /// stands. Each pool takes its standing in its model's index as the
-    /// write leaves the store's tables ([`Self::over`]).
+    /// stands.
     pub(super) fn rebuild<'a>(
         &mut self,
         epoch: u64,
@@ -3534,9 +2135,6 @@ impl Writer {
         // A build takes in every membership write: none stays owed.
         self.owed = None;
         self.builds += 1;
-        // A build's rows start with no bit: a verdict the last world showed
-        // can go with no judgment to move it.
-        self.overload_epoch += 1;
         let origin = self.origin;
         // The last write's classes: carried, or what the written worker's
         // derive starts from.
@@ -3669,11 +2267,6 @@ impl Writer {
             let entry = Entry {
                 row: row_of(member, sample.as_ref(), origin, listed),
                 facts,
-                admitted_micros: micros(origin, member.admitted_at),
-                local: match facts.reachable_from {
-                    Reachability::Any => None,
-                    Reachability::Gateway(gateway) => Some(gateway),
-                },
                 own: facts.overload,
                 // The slot the member's first write gave it: a build gives
                 // none and moves none.
@@ -3723,9 +2316,6 @@ impl Writer {
         self.places.clear();
         let mut by_model = FxHashMap::default();
         let mut pools = Vec::new();
-        // Each data-parallel engine's place among the engines of the pool
-        // being derived: a slot a group, free between two pools.
-        let mut placed = vec![u32::MAX; by_key.len()];
         let models = groups.len();
         for (nth, (model, sides_at)) in groups.into_iter().enumerate() {
             // The model's whole entries a side, freed with the model: the
@@ -3743,22 +2333,16 @@ impl Writer {
             // The model's classes go on its prefill pool's shape: a model
             // that has classes has that pool.
             // One read of the last write's pools of the model serves its
-            // pair classes, its encode classes and its encoders' facts.
+            // pair classes and its encode classes.
             let ends = last.as_deref().and_then(|last| last.ends(&model));
             let carried = ends.and_then(|ends| ends.prefill?.pairs.as_ref());
             let (mode, kept) = (self.spec.pairing(), &mut self.derivations);
             let mut pairs = pair_up(&mut sides, mode, classes, carried, kept, &model);
-            // The encode classes and the encoders' facts are the last
-            // write's in every model whose encoders and prefills this write
-            // left as they stood, and derived whole in the others.
+            // The encode classes are the last write's in every model whose
+            // encoders and prefills this write left as they stood, and
+            // derived whole in the others.
             let stood = ends.filter(|ends| ends.stand(classes, &sides));
             let mut encodes = encode_up(&sides, stood.and_then(|ends| ends.prefill));
-            let last_encode = stood.and_then(|ends| ends.encode);
-            let mut stated = encoder_facts(
-                &sides[role_slot(Role::Encode)],
-                encodes.as_deref(),
-                last_encode,
-            );
             let mut indexes = [None; ROLES];
             for (side, entries) in sides.into_iter().enumerate() {
                 if entries.is_empty() {
@@ -3781,13 +2365,7 @@ impl Writer {
                         row: row as u32,
                     }));
                 pools.push(PoolShape {
-                    admitted_micros: entries.iter().map(|entry| entry.admitted_micros).collect(),
                     booked: entries.iter().map(|entry| entry.booked).collect(),
-                    locals: entries
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(row, entry)| entry.local.map(|gateway| (row as u32, gateway)))
-                        .collect(),
                     pairs: if side == role_slot(Role::Prefill) {
                         pairs.take()
                     } else {
@@ -3798,23 +2376,11 @@ impl Writer {
                     } else {
                         None
                     },
-                    encoders: if side == role_slot(Role::Encode) {
-                        stated.take()
-                    } else {
-                        None
-                    },
-                    engines: engines_of(&entries, &ranked, &mut placed),
-                    demanded: entries
-                        .iter()
-                        .map(|entry| entry.facts.demand_facts)
-                        .collect(),
                 });
                 self.spares.push(None);
                 self.working.push(Working {
                     rows,
                     dirty: false,
-                    // Taken at this write's end, once its rows stand.
-                    unreported: 0,
                     // No list where no member names a threshold of its own:
                     // a row with none reads its pool's.
                     own: if owned {
@@ -3823,9 +2389,6 @@ impl Writer {
                         Vec::new()
                     },
                     binding: None,
-                    // Read at this write's end, once every pool stands.
-                    cells: Vec::new(),
-                    cells_dirty: false,
                 });
                 indexes[side] = Some(index);
             }
@@ -4012,15 +2575,11 @@ impl Writer {
             .map(|&(id, _, slot)| (id, slot))
             .collect();
         debug_assert!(unpooled.is_sorted_by(|a, b| a.0 < b.0));
-        let before = mem::replace(
-            &mut self.derived,
-            Arc::new(Derived {
-                by_model,
-                pools: pools.into_boxed_slice(),
-                unpooled,
-                counts: Arc::clone(&self.counts),
-            }),
-        );
+        self.derived = Arc::new(Derived {
+            by_model,
+            pools: pools.into_boxed_slice(),
+            unpooled,
+        });
         // A worker's vetoes leave with its row, in this write's own hold:
         // no publication shows the row without them. The ids stand in
         // order as the walk above pushed them.
@@ -4049,19 +2608,6 @@ impl Writer {
             pool.dirty = false;
             self.published.push(Arc::from(pool.rows.as_slice()));
         }
-        // Every pool's rows are new, and so are their cells.
-        self.read_cells(&on_file);
-        self.index_pools(&before, classes);
-        // Every pool's rows are new: each count is taken again, by the one
-        // pass over a pool's rows that a membership write pays for it.
-        self.unreported = self
-            .working
-            .iter_mut()
-            .map(|pool| {
-                pool.unreported = unreported(&pool.rows);
-                pool.unreported
-            })
-            .collect();
         self.publish()
     }
 
@@ -4388,11 +2934,11 @@ impl Writer {
     /// borrow of the outgoing world into that world's count before it
     /// returns, and a world counts on the rows it lists for as long as it
     /// lives. Rows some world still lists are left whole to that world's
-    /// reader, and a pool with none to write over takes a new copy, which
-    /// is counted: a publication never waits for a reader. Two buffers a
-    /// pool carry every window, and one more for each publication a reader
-    /// still holds. A publication asks each held row's count once, and each
-    /// pool with no spare to write over reads each unlisted row's length.
+    /// reader, and a pool with none to write over takes a new copy: a
+    /// publication never waits for a reader. Two buffers a pool carry every
+    /// window, and one more for each publication a reader still holds. A
+    /// publication asks each held row's count once, and each pool with no
+    /// spare to write over reads each unlisted row's length.
     fn publish(&mut self) -> Arc<StoreSnapshot> {
         // A world no reader holds any more is let go here, by a write, and
         // before the rows are asked: what it alone listed is free for this
@@ -4401,17 +2947,9 @@ impl Writer {
             .retain_mut(|world| Arc::get_mut(world).is_none());
         let unlisted = |rows: &mut Arc<[Candidate]>| Arc::get_mut(rows).is_some();
         self.unlisted.extend(self.held.extract_if(.., unlisted));
-        // One count a pool: every membership write takes the list again.
-        debug_assert_eq!(self.unreported.len(), self.working.len());
         let pools = self.working.iter_mut().zip(&mut self.published);
-        // Whether this publication moves a count. The list is then taken
-        // once more from the pools: the worlds that list the old counts
-        // keep them.
-        let mut moved = false;
-        for (at, ((pool, published), spare)) in pools.zip(&mut self.spares).enumerate() {
+        for ((pool, published), spare) in pools.zip(&mut self.spares) {
             if !pool.dirty {
-                // No write touched this pool: it holds the count listed.
-                debug_assert_eq!(self.unreported.get(at), Some(&pool.unreported));
                 continue;
             }
             let mut next = spare.take();
@@ -4423,23 +2961,9 @@ impl Writer {
                 let found = self.unlisted.iter_mut().position(fits);
                 next = found.map(|at| self.unlisted.swap_remove(at));
             }
-            let next = next.unwrap_or_else(|| {
-                self.allocations += 1;
-                Arc::from(pool.rows.as_slice())
-            });
+            let next = next.unwrap_or_else(|| Arc::from(pool.rows.as_slice()));
             *spare = Some(mem::replace(published, next));
             pool.dirty = false;
-            // The count the writes kept: no row is passed over for it.
-            let count = pool.unreported;
-            debug_assert_eq!(count, unreported(&pool.rows));
-            moved |= self.unreported.get(at) != Some(&count);
-        }
-        if moved {
-            // One allocation: the counts go straight into their shared list.
-            self.unreported = self.working.iter().map(|pool| pool.unreported).collect();
-        }
-        if mem::take(&mut self.cells_moved) {
-            self.publish_cells();
         }
         // Rows no world lists and no pool took are freed here, by a write.
         self.unlisted.clear();
@@ -4448,253 +2972,16 @@ impl Writer {
         self.world()
     }
 
-    /// Each pool whose cells a write moved since the last publication takes
-    /// a new block, whole, as its rows do: the pool's working cells written
-    /// over its spare where no world lists the spare any more, and over a
-    /// new block, which is counted, where one does. The worlds take one
-    /// new list of the blocks, in one allocation.
-    fn publish_cells(&mut self) {
-        let signals = self.spec.signal_columns().len();
-        let Self {
-            working,
-            cells,
-            cell_spares,
-            allocations,
-            ..
-        } = self;
-        debug_assert_eq!(cells.len(), working.len());
-        let pools = working.iter_mut().zip(cell_spares.iter_mut());
-        let blocks = pools.zip(cells.iter()).map(|((pool, spare), standing)| {
-            if !pool.cells_dirty {
-                return Arc::clone(standing);
-            }
-            pool.cells_dirty = false;
-            let over = spare
-                .take()
-                .and_then(|mut over| cells_over(&mut over, &pool.cells, signals).then_some(over));
-            let next = over.unwrap_or_else(|| {
-                *allocations += 1;
-                Arc::new(SignalCells::new(pool.cells.clone(), signals))
-            });
-            *spare = Some(Arc::clone(standing));
-            next
-        });
-        *cells = blocks.collect();
-    }
-
     /// How many worlds the writer published: the first world, made with
     /// the store, is not one.
     pub(super) fn publications(&self) -> u64 {
         self.publications
     }
 
-    /// How many times a publication allocated a pool's rows: it found
-    /// neither the pool's spare nor held rows of the pool's length free of
-    /// every world. A membership build's own rows are not counted.
-    pub(super) fn allocations(&self) -> u64 {
-        self.allocations
-    }
-
     /// How many times the pools were built from the membership: a build an
     /// ask or a window's end paid, or a generation of another pairing mode.
     pub(super) fn builds(&self) -> u64 {
         self.builds
-    }
-
-    /// How many membership writes walked the pools to stand each in its
-    /// model's index ([`Self::index_pools`]).
-    #[cfg(test)]
-    pub(super) fn walks(&self) -> u64 {
-        self.walks
-    }
-
-    /// Each pool's standing in its model's index as this membership write
-    /// leaves it. A pool the write did not move keeps its standing: its
-    /// tables, and its warming rows as a write or a window last read them.
-    /// A write that moved no pool looks none up and allocates nothing
-    /// here. A pool moved where its rows are not as many, a row was
-    /// admitted at another instant, a lane's row states other wires
-    /// ([`PoolIndex::holds`]), or a lane of the pool was made or retired
-    /// ([`KvTables::stands`]); its standing is made ([`KvTables::pool`])
-    /// with its warming rows under the standing generation's ruling for
-    /// the pool's model and phase, read at the last window's instant or an
-    /// admission after it. A pool is found at its place, or among
-    /// `before`, the pools as they stood, where the write moved its place.
-    /// A write that moved no member and no offer ([`Classes::Carry`]) moved
-    /// no row, no admission and no wire a row states: where no lane, no
-    /// block size of record and no row's word to record moved either
-    /// ([`KvTables::moves`]), every pool stands as it did and none is
-    /// walked. A pool is also made anew when its sent-prefix settings
-    /// change. Under [`Classes::Derive`] the pools may stand under a
-    /// generation of another pairing mode, one the standings were not ruled
-    /// by: every kept pool's warming rows are ruled and read again.
-    fn index_pools(&mut self, before: &Derived, classes: Classes) {
-        let Self {
-            derived,
-            working,
-            spec,
-            reading,
-            indexes: held,
-            origin,
-            last_window,
-            lanes,
-            kv,
-            ..
-        } = self;
-        let window = last_window.map_or(0, |at| micros(*origin, at));
-        // No lane was made or retired, no block size of record moved and
-        // no row's word to record was cleared since the last write stood
-        // its pools: no pool's place in an index moved, no record's bound
-        // and no row's word, and none is looked up.
-        let moves = kv.moves();
-        let still = mem::replace(lanes, moves) == moves;
-        if still && classes == Classes::Carry {
-            return;
-        }
-        #[cfg(test)]
-        {
-            self.walks += 1;
-        }
-        let ruled = classes != Classes::Derive;
-        // The list is copied at the first pool whose standing is new:
-        // where the pools are as many, every other stands in it already.
-        let same = held.len() == working.len();
-        let mut next = (!same).then(|| vec![None; working.len()]);
-        for (model, sides) in &derived.by_model {
-            // The model's pools as they stood, looked up at the first of
-            // its pools that does not stand at its place.
-            let mut stood = None;
-            for (side, pool) in sides.iter().enumerate() {
-                let Some(at) = pool.map(|pool| pool as usize) else {
-                    continue;
-                };
-                let (Some(rows), Some(shape)) = (working.get(at), derived.pools.get(at)) else {
-                    continue;
-                };
-                let (rows, admitted) = (&*rows.rows, &*shape.admitted_micros);
-                let predict = predict_of(spec, kv, model, rows);
-                let here = held.get(at).and_then(Option::as_ref);
-                let here = here.filter(|standing| standing.is_of(model, rows));
-                let was = here.map(|standing| (at, standing)).or_else(|| {
-                    let sides = *stood.get_or_insert_with(|| before.by_model.get(model));
-                    let old = sides?.get(side).copied().flatten()? as usize;
-                    Some((old, held.get(old)?.as_ref()?))
-                });
-                let kept = was.filter(|(_, standing)| {
-                    standing.predict() == predict
-                        && standing.holds(rows, admitted)
-                        && (still || kv.stands(model, rows, standing))
-                });
-                let now = || admitted.iter().copied().fold(window, u64::max);
-                let read = match kept {
-                    Some((old, standing)) => {
-                        let read = if ruled {
-                            None
-                        } else {
-                            standing.again(ruling_of(spec, model, rows), now(), reading)
-                        };
-                        match read {
-                            Some(read) => Arc::new(read),
-                            None if same && old == at => continue,
-                            None => Arc::clone(standing),
-                        }
-                    }
-                    None => {
-                        let rule = ruling_of(spec, model, rows);
-                        Arc::new(kv.pool(model, rows, admitted, rule, predict, now(), reading))
-                    }
-                };
-                let next = next.get_or_insert_with(|| held.to_vec());
-                if let Some(slot) = next.get_mut(at) {
-                    *slot = Some(read);
-                }
-            }
-        }
-        if let Some(next) = next {
-            *held = next.into();
-        }
-    }
-
-    /// Rule every pool's warming rows again under the standing generation,
-    /// at the last window's instant: it may rule a pool by other numbers,
-    /// or rule none. A pool whose settings for the record of sent prefixes
-    /// moved is made anew.
-    fn rule_indexes(&mut self) {
-        let Self {
-            derived,
-            working,
-            spec,
-            reading,
-            indexes,
-            kv,
-            origin,
-            last_window,
-            ..
-        } = self;
-        let now = last_window.map_or(0, |at| micros(*origin, at));
-        let mut next = None;
-        for (model, sides) in &derived.by_model {
-            for &pool in sides.iter().flatten() {
-                let at = pool as usize;
-                let (Some(Some(held)), Some(rows), Some(shape)) =
-                    (indexes.get(at), working.get(at), derived.pools.get(at))
-                else {
-                    continue;
-                };
-                let rule = ruling_of(spec, model, &rows.rows);
-                let predict = predict_of(spec, kv, model, &rows.rows);
-                let read = if held.predict() == predict {
-                    held.again(rule, now, reading)
-                } else {
-                    Some(kv.pool(
-                        model,
-                        &rows.rows,
-                        &shape.admitted_micros,
-                        rule,
-                        predict,
-                        now,
-                        reading,
-                    ))
-                };
-                if let Some(read) = read {
-                    put_read(&mut next, indexes, at, read);
-                }
-            }
-        }
-        if let Some(next) = next {
-            *indexes = next.into();
-        }
-    }
-
-    /// Read each ruled pool's warming rows again at the last window's
-    /// instant, under the ruling it was read by. A pool no ruling names
-    /// warms nobody, so a window reads nothing of it. The list is new only
-    /// when a pool's rows moved: a publication that moved none allocates
-    /// nothing.
-    fn read_indexes(&mut self) {
-        let Self {
-            reading,
-            indexes,
-            origin,
-            last_window,
-            ..
-        } = self;
-        let mut next = None;
-        for (at, held) in indexes.iter().enumerate() {
-            let Some(held) = held else {
-                continue;
-            };
-            let Some(rule) = held.rule() else {
-                continue;
-            };
-            let now = last_window.map_or(0, |at| micros(*origin, at));
-            if let Some(read) = held.again(Some(rule), now, reading) {
-                put_read(&mut next, indexes, at, read);
-            }
-        }
-        if let Some(next) = next {
-            *indexes = next.into();
-        }
     }
 
     fn publish_window(&mut self, at: Instant) -> Arc<StoreSnapshot> {
@@ -4706,72 +2993,8 @@ impl Writer {
             self.vetoes = Arc::new(vetoes);
             self.derive_vetoes();
         }
-        self.read_indexes();
         self.publish()
     }
-}
-
-/// Sets pool `at`'s standing to `read` in `next`, the list a writer
-/// publishes in `standing`'s place: a copy of it, made at the first pool
-/// whose rows moved.
-fn put_read(
-    next: &mut Option<Vec<Option<Arc<PoolIndex>>>>,
-    standing: &[Option<Arc<PoolIndex>>],
-    at: usize,
-    read: PoolIndex,
-) {
-    let next = next.get_or_insert_with(|| standing.to_vec());
-    if let Some(slot) = next.get_mut(at) {
-        *slot = Some(Arc::new(read));
-    }
-}
-
-/// The warm-up ruling of the profile a pool's decisions resolve to under
-/// `spec`, by the pool's model and its role's phase: as a request of that
-/// phase asked alone resolves its profile, not by the pair binding a decode
-/// pool's thresholds take
-/// ([`Engine::pool_binding`](crate::engine::framework::Engine::pool_binding)). The
-/// hand names rows for such a request alone; a pair's sides read their
-/// columns. `None` where the profile's warm-up stages rule by different
-/// numbers: it is named no rows.
-fn ruling_of(spec: &AppliedSpec, model: &str, rows: &[Candidate]) -> Option<WarmUpRule> {
-    let role = rows.first()?.role;
-    spec.engine().pool_rule_for(model, phase_of(role))
-}
-
-/// The tree's placement bound for a pool that keeps a record of sent
-/// prefixes: its profile reads them, its model's pair does at the decode
-/// side, or its binding's shadow does where that profile is named no row
-/// ([`Engine::pool_record_for`](crate::engine::framework::Engine::pool_record_for)).
-fn predict_of(
-    spec: &AppliedSpec,
-    kv: &KvTables,
-    model: &str,
-    rows: &[Candidate],
-) -> Option<Predict> {
-    let phase = phase_of(rows.first()?.role);
-    let ahead = spec.engine().pool_record_for(model, phase)?;
-    let index = spec.index_for(model);
-    if index.kind != IndexKind::Tree {
-        return None;
-    }
-    let size = kv
-        .block_size(model)
-        .unwrap_or_else(|| spec.block_size())
-        .max(1);
-    let bound = (index.max_size / u64::from(size)).max(1);
-    Some(Predict {
-        bound: usize::try_from(bound).unwrap_or(usize::MAX),
-        ahead,
-    })
-}
-
-/// How many of `rows` hold no report: the pass a membership write takes over
-/// each pool it builds. Every later write moves the pool's count by the row
-/// it folds ([`rows_at`]), so no publication and no decision takes the pass:
-/// a decision reads whether the count is 0 ([`PoolFacts::reported`]).
-fn unreported(rows: &[Candidate]) -> u32 {
-    rows.iter().filter(|row| row.load.is_none()).count() as u32
 }
 
 /// Writes `rows` over `over` when `over` is of `rows`' length and the
@@ -4804,9 +3027,7 @@ fn seek<T>(sorted: &[T], from: usize, id: WorkerId, id_of: impl Fn(&T) -> Worker
 }
 
 /// Hand `fold` each row of member `id` that stands at `rank` in the working
-/// copy; a pool is marked written where `fold` says it wrote, and its count
-/// of rows without a report ([`Working::unreported`]) moves where `fold`
-/// gave a row its first report or took its last. Where the
+/// copy; a pool is marked written where `fold` says it wrote. Where the
 /// member's first place stands when a row was handed, and `None` where no
 /// row of the member stands at the rank: the member has no place yet, or
 /// its rows stand at another rank. A load write folds a rank's record by
@@ -4832,13 +3053,7 @@ fn rows_at(
         if row.dp_rank != rank {
             continue;
         }
-        let held = row.load.is_some();
         pool.dirty |= fold(row);
-        match (held, row.load.is_some()) {
-            (false, true) => pool.unreported = pool.unreported.saturating_sub(1),
-            (true, false) => pool.unreported = pool.unreported.saturating_add(1),
-            _ => {}
-        }
         at = Some(first as u32);
     }
     at

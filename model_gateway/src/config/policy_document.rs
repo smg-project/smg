@@ -19,8 +19,9 @@ use smg_policy_controller::{
     document::{
         AppliedSpec, Assignment, ConnectionModeSetting, IndexKind, LoadMetricSetting, ModeSettings,
         OverloadSpec, Pairing, PolicySettings, PolicySpec, RoutingKeyOverrideSettings,
-        RoutingSettings, RoutingSettingsError, SpecError,
+        RoutingSettings, RoutingSettingsError, ShadowSpec, SpecError,
     },
+    engine::Phase,
     stages::StageRegistry,
 };
 use smg_worker::identity::basic::ConnectionMode;
@@ -112,9 +113,8 @@ impl RouterConfig {
     /// objects are built with one default and the routes read one shed
     /// word, and the document's words are the ones they are built and read
     /// under. Everywhere else they are the configuration's own two
-    /// settings, which the document the routing settings mean states too.
-    /// They are those two as well for a document this gateway refuses,
-    /// which no start runs.
+    /// settings. They are those two as well for a document whose two words
+    /// this gateway refuses, which no start runs.
     pub(crate) fn overload_words_in_force(&self) -> OverloadWords {
         let own = OverloadWords {
             protection: self.worker_overload_protection,
@@ -170,7 +170,7 @@ impl RouterConfig {
             && self.worker_overload_waiting_requests.is_none()
             && self.worker_overload_token_usage.is_none()
         {
-            return Err("worker_overload_waiting_requests and worker_overload_token_usage are both none beside a policy document whose overload block is on: a gateway with no default threshold vetoes by none; state a threshold, or switch the block off in the document".to_owned());
+            return Err("worker_overload_waiting_requests and worker_overload_token_usage are both none beside a policy document whose overload block is on: the block has no default threshold to switch on, and a worker's own thresholds veto either way; state a threshold, or switch the block off in the document".to_owned());
         }
         Ok(Some(OverloadWords {
             protection: first.enabled,
@@ -185,12 +185,31 @@ impl RouterConfig {
     /// ([`StageRegistry::builtin`]), or the table a build of the host's own
     /// hands in, which holds the stages that build added. A document that
     /// names a stage the table does not hold is refused by the stage's name.
+    ///
+    /// A binding's shadows by side are refused as not in this build: the
+    /// engine this gateway hosts decides a shadow beside a single request
+    /// alone, so a pair's would load and never run. So would the shadow of
+    /// a binding whose phase list is not empty and leaves out `single`, and
+    /// it is refused too.
     pub fn hosted_policy(
         &self,
         document: &PolicySpec,
         stages: &StageRegistry,
     ) -> Result<AppliedSpec, SpecError> {
-        AppliedSpec::validate_in(document, stages, &self.denied_view_headers())
+        let applied = AppliedSpec::validate_in(document, stages, &self.denied_view_headers())?;
+        for (index, binding) in document.bindings.iter().enumerate() {
+            let phases = &binding.matcher.phase;
+            let what = match binding.shadow {
+                Some(ShadowSpec::Sides(_)) => "a pair's shadow",
+                Some(_) if !phases.is_empty() && !phases.contains(&Phase::Single) => {
+                    "a shadow outside the single phase"
+                }
+                _ => continue,
+            };
+            let path = format!("bindings[{index}].shadow");
+            return Err(SpecError::NotInBuild { path, what });
+        }
+        Ok(applied)
     }
 
     /// The header names this gateway denies the view of a document it
@@ -623,6 +642,16 @@ mod tests {
             refused(&[Some(block(false, false)), Some(block(false, false)), None]),
             "bindings[2].overload.enabled = true is not the false bindings[0] says, by its block or the block's default: a gateway builds its workers with one default set of overload thresholds, so the bindings of its document say one word"
         );
+        // The shed word differs either way round: set first, dropped later.
+        assert_eq!(
+            refused(&[Some(block(true, true)), None]),
+            "bindings[1].overload.shed_when_all_vetoed = false is not the true bindings[0] says, by its block or the block's default: a gateway's routes read one shed word for the process, so the bindings of its document say one word"
+        );
+        // A binding that differs on both words is named by its switch.
+        assert_eq!(
+            refused(&[None, Some(block(false, true))]),
+            "bindings[1].overload.enabled = false is not the true bindings[0] says, by its block or the block's default: a gateway builds its workers with one default set of overload thresholds, so the bindings of its document say one word"
+        );
         let differs = RouterConfig {
             worker_overload_shed: true,
             ..supplied(bound(&[Some(block(false, false)), None]))
@@ -636,7 +665,8 @@ mod tests {
         );
     }
 
-    /// Both thresholds at none leave a gateway nothing to veto by. They stand
+    /// Both thresholds at none leave a gateway no default threshold to veto
+    /// by, and a worker's own thresholds veto either way. They stand
     /// beside a supplied document as every threshold does, so the comparison
     /// takes the document, whatever it is. This gateway then refuses one
     /// whose block is on, by the two settings' names and with the two ways
@@ -655,7 +685,7 @@ mod tests {
         assert_eq!(on.policy_document_in_force(), Ok(preset("round_robin")));
         assert_eq!(
             on.supplied_overload_words(),
-            Err("worker_overload_waiting_requests and worker_overload_token_usage are both none beside a policy document whose overload block is on: a gateway with no default threshold vetoes by none; state a threshold, or switch the block off in the document".to_owned())
+            Err("worker_overload_waiting_requests and worker_overload_token_usage are both none beside a policy document whose overload block is on: the block has no default threshold to switch on, and a worker's own thresholds veto either way; state a threshold, or switch the block off in the document".to_owned())
         );
 
         let off = bound(&[Some(block(false, false)), Some(block(false, false))]);
@@ -676,6 +706,20 @@ mod tests {
         assert_eq!(one.policy_document_in_force(), Ok(preset("round_robin")));
         assert_eq!(
             one.supplied_overload_words(),
+            Ok(Some(OverloadWords {
+                protection: true,
+                shed: false
+            }))
+        );
+
+        // The count alone at none leaves the usage to veto by.
+        let other = RouterConfig {
+            worker_overload_waiting_requests: None,
+            ..supplied(preset("round_robin"))
+        };
+        assert_eq!(other.policy_document_in_force(), Ok(preset("round_robin")));
+        assert_eq!(
+            other.supplied_overload_words(),
             Ok(Some(OverloadWords {
                 protection: true,
                 shed: false
@@ -1222,6 +1266,55 @@ mod tests {
             config.hosted_policy(&document, &StageRegistry::builtin()).err(),
             Some(SpecError::UnknownFilter { name, .. }) if name == "keeps-all"
         ));
+    }
+
+    /// One model's single binding with a shadow stands ahead of a pair's
+    /// binding. The single binding's shadow loads, and a shadow by side on
+    /// the pair's binding is refused by that binding's path. Scoped to the
+    /// decode phase, the single binding's shadow is refused too.
+    #[test]
+    fn a_pair_bindings_shadow_is_refused_as_not_in_this_build() {
+        let pairs = PolicySpec::pair_presets("round_robin", "round_robin");
+        let mut document = pairs.expect("the presets of a pair");
+        document.profiles.extend(preset("random").profiles);
+        let mut single = preset("round_robin");
+        document.profiles.append(&mut single.profiles);
+        let mut ahead = single.bindings.pop().expect("the single binding");
+        ahead.matcher.model = "one-model".to_owned();
+        ahead.shadow = Some(ShadowSpec::Profile("random".to_owned()));
+        document.bindings.insert(0, ahead);
+
+        let config = RouterConfig::default();
+        let refused = |document: &PolicySpec| {
+            config
+                .hosted_policy(document, &StageRegistry::builtin())
+                .err()
+        };
+        assert_eq!(refused(&document), None);
+
+        let pair = document.bindings.last_mut().expect("the pair's binding");
+        let by_side = [("prefill".to_owned(), "random".to_owned())];
+        pair.shadow = Some(ShadowSpec::Sides(by_side.into()));
+        assert_eq!(
+            refused(&document),
+            Some(SpecError::NotInBuild {
+                path: "bindings[1].shadow".to_owned(),
+                what: "a pair's shadow",
+            })
+        );
+
+        // No single request reaches a binding scoped to the decode phase:
+        // its shadow is named ahead of the pair's, and alone too.
+        let outside = Some(SpecError::NotInBuild {
+            path: "bindings[0].shadow".to_owned(),
+            what: "a shadow outside the single phase",
+        });
+        let ahead = document.bindings.first_mut().expect("the single binding");
+        ahead.matcher.phase = vec![Phase::Decode];
+        assert_eq!(refused(&document), outside);
+        let pair = document.bindings.last_mut().expect("the pair's binding");
+        pair.shadow = None;
+        assert_eq!(refused(&document), outside);
     }
 
     #[test]

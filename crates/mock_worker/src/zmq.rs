@@ -1024,6 +1024,7 @@ async fn forward_request(
     while let Some(event) = gen_rx.recv().await {
         let load = engine
             .as_ref()
+            .filter(|engine| !engine.load_muted())
             .map(|engine| to_scheduler_stats(&engine.load()));
         match event {
             GenEvent::Token { token_id, .. } => {
@@ -1093,6 +1094,7 @@ async fn scripted_request(
         }
         let load = engine
             .as_ref()
+            .filter(|engine| !engine.load_muted())
             .map(|engine| to_scheduler_stats(&engine.load()));
         let new_logprobs = top_logprobs
             .filter(|_| !frame.ids.is_empty() && frame.logprobs.len() == frame.ids.len())
@@ -1792,6 +1794,48 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         };
         assert_eq!(engine.load().max_total_num_tokens, 65_536);
+    }
+
+    /// A rank under the load-mute hook sends its outputs without scheduler
+    /// stats; cleared, they ride its outputs again.
+    #[tokio::test]
+    async fn a_load_mute_withholds_a_ranks_scheduler_stats() {
+        let dir = tempfile::tempdir().unwrap();
+        let endpoint = |name: &str| format!("ipc://{}", dir.path().join(name).display());
+        let (handshake, input, output) = (
+            endpoint("hs.sock"),
+            endpoint("in.sock"),
+            endpoint("out.sock"),
+        );
+        // An index no other test's rank takes: the fleet registry is
+        // process-wide.
+        let index = 4_218;
+        let name = format!("zmq:{index}");
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "serve loops until the test drops its handles"
+        )]
+        let _engine = tokio::spawn(serve(Arc::new(test_config()), handshake.clone(), index));
+        let transport = connect_handshake(&handshake, 1, &input, &output, Duration::from_secs(10))
+            .await
+            .expect("frontend handshake");
+        let client = EngineCoreClient::new(transport);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let engine = loop {
+            let found = fleet_engines()
+                .into_iter()
+                .find(|engine| engine.name() == name);
+            if let Some(engine) = found {
+                break engine;
+            }
+            assert!(Instant::now() < deadline, "the rank's engine did not start");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        for (on, stated) in [(true, false), (false, true)] {
+            engine.fault_load_mute(on);
+            prompt(&client, &format!("mute-{on}"), index).await;
+            assert_eq!(client.engine_load(index).is_some(), stated, "on: {on}");
+        }
     }
 
     /// A decode rank declares its role, binds no bootstrap port, and

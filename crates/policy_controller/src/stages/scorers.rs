@@ -199,6 +199,10 @@ impl<S: ReadsLoad> Scorer for WithLoadReportAgeLimit<S> {
         self.stage.needs()
     }
 
+    fn balances_load_against_affinity(&self) -> bool {
+        self.stage.balances_load_against_affinity()
+    }
+
     fn scope(&self) -> Option<&dyn DecisionScope> {
         self.stage.scope()
     }
@@ -310,7 +314,7 @@ impl Scorer for SessionAffinity {
 
     fn score(
         &self,
-        facts: &RequestFacts<'_>,
+        _: &RequestFacts<'_>,
         candidates: &[Candidate],
         kept: &[u32],
         out: &mut [f32],
@@ -321,12 +325,6 @@ impl Scorer for SessionAffinity {
             } else {
                 0.0
             };
-        }
-        // A pin that stands beside the rows names one row: it is looked for
-        // once, and a decision under no such pin pays one test for it.
-        let pinned = facts.pinned_at.checked_sub(1);
-        if let Some(slot) = pinned.and_then(|at| kept.iter().position(|&i| i == at)) {
-            out[slot] = 1.0;
         }
         TieBand::NORMALIZED
     }
@@ -400,9 +398,9 @@ pub(crate) struct RankCredit {
     /// the held word does not. The held word's subtraction there is a
     /// `Release` and the read of both words loads the held word with
     /// `Acquire`, so a reader finds that order on every target. A read
-    /// loads the two words apart: across a record or a release it may see
-    /// one without the other for the dispatch in flight, and across a
-    /// retirement for its batch.
+    /// loads the two words apart: across a record, a release or a
+    /// retirement it may see one without the other for the dispatch in
+    /// flight.
     unsized_held: AtomicU16,
     /// The estimates of the held dispatches that stated no size, summed:
     /// what a reader that prices such a send by its text adds to the
@@ -422,11 +420,6 @@ pub(crate) struct RankCredit {
     /// dispatch lowers it under its lane's lock; a release recomputes it
     /// under every lane's lock, so it never reads above any lane's front.
     oldest_micros: AtomicU64,
-    /// Held by the one retirement in progress: of the dispatches that read
-    /// the bound together, the first retires and the rest land while the row
-    /// is within a batch above the bound; past that a deciding thread lands
-    /// one and waits for the retirement.
-    retiring: Mutex<()>,
     lanes: [DispatchLane; DISPATCH_LANES],
     /// What a stage that keeps the row's cost as one number was last told
     /// of the row. A report's tell, its first decision and a dispatch hold
@@ -555,10 +548,10 @@ impl Dispatches {
     /// Holds one dispatch of `size` made at `at_micros`, and says whether
     /// it is the oldest held now.
     ///
-    /// It lands at its instant's place: a dispatch that waited for a
-    /// retirement on a shared lane, or one a stepped clock dated earlier,
-    /// lands behind a later one, and the release and the retirement read a
-    /// lane from its oldest. Instants mostly rise, so the newest is asked
+    /// It lands at its instant's place: a dispatch that waited for its
+    /// lane's lock, or one a stepped clock dated earlier, lands behind a
+    /// later one, and the release and the retirement read a lane from its
+    /// oldest. Instants mostly rise, so the newest is asked
     /// first: a dispatch no older than it is a push, and the place is
     /// searched for the one that is.
     fn hold(&mut self, at_micros: u64, size: SendSize) -> bool {
@@ -579,8 +572,7 @@ impl Dispatches {
     }
 
     /// Lets the oldest dispatch go where it was made at or before
-    /// `through_micros`, and hands back its size. A retirement lets it go
-    /// whenever it was made.
+    /// `through_micros`, and hands back its size.
     fn let_go(&mut self, through_micros: u64) -> Option<SendSize> {
         let &(at, size) = self.0.front()?;
         if at > through_micros {
@@ -611,27 +603,12 @@ struct DispatchLane {
 const DISPATCH_LANES: usize = 8;
 
 /// Dispatches kept per rank row between reports, over its lanes: a dispatch
-/// past the bound retires the row's oldest batch, by instant across the
-/// lanes, so the row holds within a batch below the bound and the newest
-/// credits stay. The row holds at most the bound, a batch and one dispatch
-/// per deciding thread: one retirement runs at a time, a dispatch that finds
-/// one running lands only while the row is within a batch above the bound
-/// and waits for it past that, so the request count's [`REQUEST_BITS`] bits
-/// never fill.
+/// that lands past the bound lets the row's oldest go, by instant across
+/// the lanes, so the newest credits stay and the row holds the bound: rows
+/// that stand there read level, and a decision spreads its sends over
+/// them. The row holds at most the bound and one dispatch per deciding
+/// thread, so the request count's [`REQUEST_BITS`] bits never fill.
 pub(crate) const RANK_CREDIT_KEPT: u64 = 8_192;
-
-/// Dispatches an overflow retires, by instant across the lanes under every
-/// lane's lock: the eight locks and the merge cost once per batch rather
-/// than once per dispatch. Eight deciders in a never-released regime paid
-/// 1.9x per decision retiring one at a time, and 2.1x retiring a batch
-/// from the oldest lane alone, whose few entries made the batch a handful.
-/// Where the lanes interleave by instant the order itself has a price: the
-/// bench's `least_load_rising` row reads 1.2x the drain of one
-/// lane at this batch and 1.9x at a batch of 64 (a merge taking
-/// one lane's lock at a time read 2.8x), paid in the overflow regime
-/// alone, a rank row holding more than the bound unreleased between two
-/// load reports.
-pub(crate) const RETIRE_BATCH: usize = 256;
 
 /// The low bits of [`RankCredit::held`] that count requests: room for the
 /// kept dispatches, with the token-work above them.
@@ -702,8 +679,13 @@ impl Default for DispatchLane {
 }
 
 impl DispatchLane {
+    /// Under the largest value where the lane holds a dispatch: that value
+    /// says an empty lane alone, to a retirement that reads the fronts with
+    /// no lock.
     fn publish_oldest(&self, dispatches: &Dispatches) {
-        let oldest = dispatches.oldest().unwrap_or(u64::MAX);
+        let oldest = dispatches
+            .oldest()
+            .map_or(u64::MAX, |at| at.min(u64::MAX - 1));
         self.oldest_micros.store(oldest, Ordering::Release);
     }
 }
@@ -715,7 +697,6 @@ impl Default for RankCredit {
             unsized_held: AtomicU16::new(0),
             estimated_held: AtomicU64::new(0),
             oldest_micros: AtomicU64::new(u64::MAX),
-            retiring: Mutex::new(()),
             lanes: Default::default(),
             told: Mutex::new(Told::default()),
             kept_of: AtomicU64::new(u64::MAX),
@@ -733,17 +714,12 @@ impl RankCredit {
     /// stated no size is counted as one, and its estimate is kept beside
     /// the stated token-work.
     pub(crate) fn record(&self, at_micros: u64, size: SendSize) {
-        // Past the bound the row's oldest batch retires before this dispatch
-        // lands, by instant across the lanes: the newest credits stay,
-        // whichever lane holds them, past a partial release.
-        if self.held.load(Ordering::Relaxed) & REQUEST_MASK >= RANK_CREDIT_KEPT {
-            self.retire_oldest_batch();
-        }
         let lane = &self.lanes[lane_of_this_thread()];
         let mut dispatches = lane.dispatches.lock();
         // The lane's front moves only where the dispatch lands there.
         let front = dispatches.hold(at_micros, size);
-        self.held
+        let held = self
+            .held
             .fetch_add(Self::weight(size.tokens()), Ordering::Relaxed);
         if size.is_unsized() {
             self.unsized_held.fetch_add(1, Ordering::Relaxed);
@@ -759,6 +735,13 @@ impl RankCredit {
         if at_micros < self.oldest_micros.load(Ordering::Acquire) {
             self.oldest_micros.fetch_min(at_micros, Ordering::AcqRel);
         }
+        drop(dispatches);
+        // The dispatch found the row at its bound: the row's oldest goes
+        // for it, by instant across the lanes, so the newest credits stay,
+        // whichever lane holds them, past a partial release.
+        if held & REQUEST_MASK >= RANK_CREDIT_KEPT {
+            self.retire_oldest();
+        }
     }
 
     /// Takes a dispatch of `tokens` its lane let go out of the held word.
@@ -770,78 +753,85 @@ impl RankCredit {
     }
 
     /// Every lane's dispatches under their locks, taken in lane order: the
-    /// one order the release and the retirement share, so neither waits on
-    /// the other for a second lane.
+    /// one order of every hold of them. A retirement holds one lane's lock
+    /// alone, so it waits on none of them for a second lane.
     fn lock_lanes(&self) -> [MutexGuard<'_, Dispatches>; DISPATCH_LANES] {
         std::array::from_fn(|i| self.lanes[i].dispatches.lock())
     }
 
-    /// Retires [`RETIRE_BATCH`] of the row's oldest dispatches by instant
-    /// across the lanes, one retirement at a time and under every lane's
-    /// lock as the release path holds them: one lock per lane and one
-    /// subtraction from the held word per batch. A row a release took below
-    /// the bound in the meantime keeps its dispatches. The row's oldest
-    /// instant stays where it was: a value too low costs a release walk,
-    /// never a missed one.
-    fn retire_oldest_batch(&self) {
-        // One retirement at a time: a dispatch that finds one in progress
-        // lands while the row is within a batch above the bound, and past
-        // that waits for the retirement and runs its own, so the row never
-        // holds more than the bound, a batch and one dispatch per deciding
-        // thread.
-        let _retiring = match self.retiring.try_lock() {
-            Some(retiring) => retiring,
-            None if self.held.load(Ordering::Relaxed) & REQUEST_MASK
-                < RANK_CREDIT_KEPT + RETIRE_BATCH as u64 =>
-            {
+    /// Lets the row's oldest dispatch go for one that landed past the
+    /// bound: the front of the lane that publishes the lowest instant,
+    /// under that lane's lock alone. Each dispatch that lands past the
+    /// bound lets one go, so the row holds the bound again once they are
+    /// through. A row a release took to the bound in the meantime keeps
+    /// its dispatches: the bound is read and the dispatch taken out in one
+    /// step of the held word, so retirements under two lanes' locks never
+    /// let two go for one. The row's oldest instant stays where it was: a
+    /// value too low costs a release walk, never a missed one.
+    fn retire_oldest(&self) {
+        loop {
+            // Each lane's front as the lane published it, read with no
+            // lock; the lowest lane of the lowest instant.
+            let (oldest, lane) = self
+                .lanes
+                .iter()
+                .fold((u64::MAX, &self.lanes[0]), |low, lane| {
+                    let front = lane.oldest_micros.load(Ordering::Acquire);
+                    if front < low.0 {
+                        (front, lane)
+                    } else {
+                        low
+                    }
+                });
+            let mut dispatches = lane.dispatches.lock();
+            // The bound read again under the lock: a release since this
+            // dispatch landed may have taken the row to it, and then the
+            // newer credits stay.
+            if self.held.load(Ordering::Relaxed) & REQUEST_MASK <= RANK_CREDIT_KEPT {
                 return;
             }
-            None => {
-                #[cfg(test)]
-                tests::RETIRE_WAITS.fetch_add(1, Ordering::Relaxed);
-                self.retiring.lock()
+            // Under the lock the lane's published front is its own. One
+            // past the instant read means the one read went to another
+            // dispatch's retirement, and the lanes are read again.
+            let front = lane.oldest_micros.load(Ordering::Relaxed);
+            if front > oldest {
+                continue;
             }
-        };
-        let mut held_lanes = self.lock_lanes();
-        // The bound read again under the locks: a release between the
-        // record path's read and these locks may have taken the row below
-        // it, and then the newer credits stay.
-        if self.held.load(Ordering::Relaxed) & REQUEST_MASK < RANK_CREDIT_KEPT {
-            return;
-        }
-        let mut retired = 0;
-        let mut unsized_retired = 0;
-        let mut estimates_retired = 0;
-        for _ in 0..RETIRE_BATCH {
-            // The lane whose front is the oldest; none when every lane is
-            // empty.
-            let oldest = held_lanes
-                .iter()
-                .enumerate()
-                .filter_map(|(i, dispatches)| dispatches.oldest().map(|at| (at, i)))
-                .min();
-            let Some((_, i)) = oldest else {
-                break;
+            let Some(&(_, size)) = dispatches.0.front() else {
+                continue;
             };
-            if let Some(size) = held_lanes[i].let_go(u64::MAX) {
-                retired += Self::weight(size.tokens());
-                unsized_retired += u16::from(size.is_unsized());
-                estimates_retired += u64::from(size.estimate());
+            // The estimate and the count of no stated size first and the
+            // held word next, as a release lowers them. The bound and the
+            // subtraction are one step of that word: a retirement under
+            // another lane's lock reads the same word, and one of the two
+            // takes the last dispatch past the bound.
+            if size.is_unsized() {
+                self.estimated_held
+                    .fetch_sub(u64::from(size.estimate()), Ordering::Relaxed);
+                self.unsized_held.fetch_sub(1, Ordering::Relaxed);
             }
-        }
-        self.estimated_held
-            .fetch_sub(estimates_retired, Ordering::Relaxed);
-        self.unsized_held
-            .fetch_sub(unsized_retired, Ordering::Relaxed);
-        // A case reads the row here, between the two writes.
-        #[cfg(test)]
-        if let Some(read) = tests::BETWEEN_A_RETIREMENTS_WRITES.get() {
-            read(self);
-        }
-        // A `Release`, as a release's subtraction is: see `take_out`.
-        self.held.fetch_sub(retired, Ordering::Release);
-        for (dispatches, lane) in held_lanes.iter().zip(&self.lanes) {
-            lane.publish_oldest(dispatches);
+            // A case reads the row here, between the two writes.
+            #[cfg(test)]
+            if let Some(read) = tests::BETWEEN_A_RETIREMENTS_WRITES.get() {
+                read(self);
+            }
+            let weight = Self::weight(size.tokens());
+            let taken = self
+                .held
+                .try_update(Ordering::Release, Ordering::Relaxed, |held| {
+                    (held & REQUEST_MASK > RANK_CREDIT_KEPT).then(|| held - weight)
+                });
+            if taken.is_err() {
+                if size.is_unsized() {
+                    self.unsized_held.fetch_add(1, Ordering::Relaxed);
+                    self.estimated_held
+                        .fetch_add(u64::from(size.estimate()), Ordering::Relaxed);
+                }
+                return;
+            }
+            dispatches.0.pop_front();
+            lane.publish_oldest(&dispatches);
+            return;
         }
     }
 
@@ -1036,8 +1026,8 @@ impl RankCredit {
     }
 }
 
-// What a test in another file reads of a row. The row's words and its
-// retirement lock stay this file's own.
+// What a test in another file reads of a row. The row's words stay this
+// file's own.
 #[cfg(test)]
 impl RankCredit {
     /// The held token-work and requests, and the sends of no stated size.
@@ -1055,14 +1045,10 @@ impl RankCredit {
         (tokens, requests, unsized_held, self.estimated())
     }
 
-    /// One retirement, as a dispatch that read the bound runs it.
+    /// One retirement, as a dispatch that found the row at its bound runs
+    /// it.
     pub(crate) fn retire_for_test(&self) {
-        self.retire_oldest_batch();
-    }
-
-    /// The retirement lock, held as a retirement in progress holds it.
-    pub(crate) fn retiring_for_test(&self) -> MutexGuard<'_, ()> {
-        self.retiring.lock()
+        self.retire_oldest();
     }
 
     /// Whether every lane's lock is held now: what a dispatch's record
@@ -1849,6 +1835,12 @@ impl Lifecycle for ResidentWork {
     /// A rank's report as its host shows it to decisions: the stage keeps
     /// the rank's cost as one number in the cell of its slot. A host that
     /// names no slot is kept no number.
+    ///
+    /// No host of this repository tells this stage a report. It does not
+    /// say that it keeps them ([`Lifecycle::keeps_loads`]), so an engine's
+    /// telling of its keepers passes it by, and no caller hands an engine
+    /// a load report for every stage. A kept number is read only beside a
+    /// lent table of counts, and no host's request lends one.
     fn on_signal(&self, signal: &Signal<'_>) {
         let Signal::Load {
             worker,
@@ -1874,10 +1866,6 @@ impl Lifecycle for ResidentWork {
             };
             self.tell(&mut bound, cell, &since, word);
         }
-    }
-
-    fn keeps_loads(&self) -> bool {
-        true
     }
 
     /// The dispatch: a credit is counted from it.
@@ -2490,10 +2478,6 @@ fn write_cost_scores(
 
 #[cfg(test)]
 pub(crate) mod tests {
-    /// The dispatches that waited for a retirement in progress; the retire
-    /// path counts them under test alone.
-    pub(crate) static RETIRE_WAITS: AtomicUsize = AtomicUsize::new(0);
-
     thread_local! {
         /// What a case runs on its own thread between a retirement's two
         /// writes, behind the estimates' and the count's and ahead of the
@@ -2642,6 +2626,9 @@ pub(crate) mod tests {
                     ..Needs::default()
                 }
             }
+            fn balances_load_against_affinity(&self) -> bool {
+                true
+            }
             fn scope(&self) -> Option<&dyn DecisionScope> {
                 Some(self.0.as_ref())
             }
@@ -2734,6 +2721,8 @@ pub(crate) mod tests {
         assert_eq!(own(wrapped.as_ref()), own(&bare));
         assert_eq!(wrapped.spread(), bare.spread());
         assert_eq!(wrapped.needs(), bare.needs());
+        assert!(bare.balances_load_against_affinity());
+        assert!(wrapped.balances_load_against_affinity());
         assert!(std::ptr::addr_eq(
             wrapped.scope().expect("the scope"),
             bare.scope().expect("the scope")
@@ -3515,11 +3504,11 @@ pub(crate) mod tests {
 
     /// The estimates' word goes down ahead of the held word at a
     /// retirement too. Every dispatch here is an estimate of three tokens,
-    /// and the dispatch past the row's bound retires a batch. A read of
-    /// the documents' two numbers between the retirement's two writes
-    /// finds the held word still counting the batch and no more than three
-    /// tokens a dispatch: it adds no estimate of a dispatch the held word
-    /// has let go.
+    /// and the dispatch past the row's bound lets the row's oldest go. A
+    /// read of the documents' two numbers between the retirement's two
+    /// writes finds the held word still counting that one and no more than
+    /// three tokens a dispatch: it adds no estimate of a dispatch the held
+    /// word has let go.
     #[test]
     fn a_read_between_a_retirements_writes_adds_no_estimate_of_a_dispatch_let_go() {
         const EACH: u32 = 3;
@@ -3543,7 +3532,7 @@ pub(crate) mod tests {
         row.record(RANK_CREDIT_KEPT + 1, SendSize::estimated(EACH));
         BETWEEN_A_RETIREMENTS_WRITES.set(None);
         assert_eq!(READS.get(), 1, "one retirement, read between its writes");
-        let kept = RANK_CREDIT_KEPT - RETIRE_BATCH as u64 + 1;
+        let kept = RANK_CREDIT_KEPT;
         let words = (0, kept, kept as u16, u64::from(EACH) * kept);
         assert_eq!(row.words_for_test(), words);
     }
@@ -3613,8 +3602,9 @@ pub(crate) mod tests {
         row.counts_through(3);
         assert_eq!(row.words_for_test(), (0, 0, 0, 0));
 
-        // A retirement: the row at its bound lets its oldest batch go, 86
-        // of the first size and 85 of each of the other two.
+        // A retirement: each of two dispatches that land past the row's
+        // bound lets the row's oldest go, a stated size and then an
+        // estimate.
         let row = RankCredit::default();
         for at in 0..RANK_CREDIT_KEPT {
             row.record(at + 1, mixed[(at % 3) as usize]);
@@ -3623,11 +3613,13 @@ pub(crate) mod tests {
             row.words_for_test(),
             (2_731 * 7 + 2_730 * 5, 8_192, 2_731, 2_731 * 101)
         );
-        row.retire_for_test();
+        for at in RANK_CREDIT_KEPT..RANK_CREDIT_KEPT + 2 {
+            row.record(at + 1, mixed[(at % 3) as usize]);
+        }
         assert_eq!(
             row.words_for_test(),
-            (2_645 * 12, 7_936, 2_646, 2_646 * 101),
-            "the oldest 256 went, each with its own word's share"
+            (2_731 * 12, 8_192, 2_730, 2_730 * 101),
+            "the oldest two went, each with its own word's share"
         );
         row.counts_through(u64::MAX);
         assert_eq!(row.words_for_test(), (0, 0, 0, 0));
@@ -3642,13 +3634,12 @@ pub(crate) mod tests {
     #[test]
     fn a_read_of_a_rows_dispatches_short_of_its_oldest_instant_writes_nothing_of_the_row() {
         let row = RankCredit::default();
-        // The dispatch that finds the row at its bound retires the oldest
-        // batch ahead of its own landing.
+        // The dispatch that finds the row at its bound lets the oldest go.
         let (first, last) = (10, 10 + RANK_CREDIT_KEPT);
         for at in first..=last {
             row.record(at, SendSize::stated(1));
         }
-        let oldest_held = first + RETIRE_BATCH as u64;
+        let oldest_held = first + 1;
         let held: Vec<u64> = (oldest_held..=last).collect();
         let oldest = || row.oldest_micros.load(Ordering::Acquire);
         let handed = |through_micros| {
@@ -3664,25 +3655,18 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_session_scorer_reads_the_pin_beside_the_rows_own_bit() {
-        let pool = [candidate(0, 0), candidate(1, 0), candidate(2, 0)];
-        let unpinned = RequestFacts::default();
-        let pinned = RequestFacts {
-            pinned_at: 2,
-            ..unpinned
-        };
-        assert!(pinned.pins(1) && !pinned.pins(0) && !pinned.pins(2));
-        assert!(!unpinned.pins(0) && !unpinned.pins(u32::MAX - 1));
-        // No position reads as pinned under no pin, the last one neither.
-        assert!(!unpinned.pins(u32::MAX));
+    fn the_session_scorer_reads_the_rows_own_bit() {
+        let mut pool = [candidate(0, 0), candidate(1, 0), candidate(2, 0)];
+        let facts = RequestFacts::default();
         let mut scores = [0.0f32; 3];
-        SessionAffinity.score(&unpinned, &pool, &kept(3), &mut scores);
+        SessionAffinity.score(&facts, &pool, &kept(3), &mut scores);
         assert_eq!(scores, [0.0, 0.0, 0.0]);
-        SessionAffinity.score(&pinned, &pool, &kept(3), &mut scores);
+        pool[1].session_hit = true;
+        SessionAffinity.score(&facts, &pool, &kept(3), &mut scores);
         assert_eq!(scores, [0.0, 1.0, 0.0]);
-        // The scorer is handed the rows kept: the pin is read by position.
+        // The scorer is handed the rows kept: a row is read by its index.
         let mut scores = [0.0f32; 2];
-        SessionAffinity.score(&pinned, &pool, &[1, 2], &mut scores);
+        SessionAffinity.score(&facts, &pool, &[1, 2], &mut scores);
         assert_eq!(scores, [1.0, 0.0]);
     }
 
@@ -4645,7 +4629,6 @@ pub(crate) mod tests {
             max_age_ms: 10,
         };
         let (told, untold) = (limited(), limited());
-        assert!(told.keeps_loads(), "the wrapper says what its stage keeps");
         let scores = |stage: &WithLoadReportAgeLimit<ResidentWork>, now_micros: u64| {
             let facts = lent.beside(&RequestFacts {
                 now_micros,
@@ -4800,11 +4783,7 @@ pub(crate) mod tests {
                     if was {
                         row.dp_rank ^= 1;
                     }
-                    let times = if burst {
-                        RANK_CREDIT_KEPT + 2 * RETIRE_BATCH as u64 + 3
-                    } else {
-                        1
-                    };
+                    let times = if burst { RANK_CREDIT_KEPT + 3 } else { 1 };
                     for nth in 0..times {
                         let lease = Lease {
                             issued_micros: now + nth - next(3_000),
@@ -4940,7 +4919,7 @@ pub(crate) mod tests {
         for row in &pool {
             shown(&told, &lent, lent.slot_of(row), row);
         }
-        let over = RANK_CREDIT_KEPT + 2 * RETIRE_BATCH as u64 + 3;
+        let over = RANK_CREDIT_KEPT + 3;
         for at in 0..over {
             let lease = Lease {
                 issued_micros: 2_000 + at,

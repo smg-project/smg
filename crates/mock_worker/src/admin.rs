@@ -4,8 +4,9 @@
 //!
 //! - `GET /admin/fleet`: every worker of the process: a realistic engine with
 //!   its cache size and load and, in a canned process, each listener with its
-//!   name and mode; with the shared KV tier on (`--global-l3-blocks`), the
-//!   blocks it holds and the tokens restored from it.
+//!   name, its mode and the generation requests it received; with the shared
+//!   KV tier on (`--global-l3-blocks`), the blocks it holds and the tokens
+//!   restored from it.
 //! - `GET /admin/requests?since=<seq>&limit=<n>`: admitted-request records
 //!   (`request_id`, serving worker, prompt/cached/oracle tokens and the
 //!   cached tokens restored from the shared tier, queue wait), oldest first,
@@ -15,12 +16,16 @@
 //!   cache and publish `AllBlocksCleared` (an engine restart, to the index).
 //! - `POST /admin/fault/{worker}/drop?batches=N`, `.../duplicate?batches=N`,
 //!   `.../swap?pairs=N`, `.../cut-streams`, `.../delay?ms=D`,
-//!   `.../restart-publisher`, `.../pause`, `.../resume`,
+//!   `.../load-lag?ms=D`, `.../restart-publisher`, `.../pause`, `.../resume`,
 //!   `.../fail?status=S[&count=N|&secs=T][&after_tokens=K][&stall_ms=M]` and
 //!   `GET /admin/fault/{worker}`: the fault hooks (see the README).
+//! - `POST /admin/fault/{worker}/load-fail?status=S`: the worker's load
+//!   polls are answered with S instead of a report (see the README).
+//! - `POST /admin/fault/{worker}/load-mute?on=B`: the worker pushes no
+//!   load report while B is `true` (see the README).
 //! - `GET /admin/ops/{worker}`: what the gateway's admin fan-out reached on
-//!   the worker: its flushes, its profiling runs and the last trace written
-//!   (`all`: every worker).
+//!   the worker: its flushes, its profiling runs and the last trace written,
+//!   and the generation requests the worker received (`all`: every worker).
 //! - `POST /admin/truth/{worker}` with `{"token_ids": [...]}`: what the
 //!   worker would serve from cache for that prompt right now;
 //!   `GET /admin/truth`: per worker, what it served over every admitted
@@ -89,6 +94,7 @@ fn router(state: Arc<AdminState>) -> Router {
         .route("/admin/fault/{worker}/admit-delay", post(fault_admit_delay))
         .route("/admin/fault/{worker}/admit-rate", post(fault_admit_rate))
         .route("/admin/fault/{worker}/cold-shape", post(fault_cold_shape))
+        .route("/admin/fault/{worker}/load-lag", post(fault_load_lag))
         .route(
             "/admin/fault/{worker}/restart-publisher",
             post(fault_restart_publisher),
@@ -96,6 +102,8 @@ fn router(state: Arc<AdminState>) -> Router {
         .route("/admin/fault/{worker}/pause", post(fault_pause))
         .route("/admin/fault/{worker}/resume", post(fault_resume))
         .route("/admin/fault/{worker}/fail", post(fault_fail))
+        .route("/admin/fault/{worker}/load-fail", post(fault_load_fail))
+        .route("/admin/fault/{worker}/load-mute", post(fault_load_mute))
         .route("/admin/ops/{worker}", get(ops_status))
         .route("/admin/truth", get(truth_served))
         .route("/admin/truth/{worker}", post(truth_prompt))
@@ -247,14 +255,25 @@ fn find(name: &str) -> Option<Engine> {
         .find(|e| e.name() == name)
 }
 
-/// The engines a `{worker}` path segment addresses: one by name, or `all`.
+/// Whether the engine named `engine` is `worker`'s: its own engine, or one
+/// of its data-parallel ranks (`<worker>:r<k>`).
+fn is_engine_of(worker: &str, engine: &str) -> bool {
+    engine
+        .strip_prefix(worker)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(":r"))
+}
+
+/// The engines a `{worker}` path segment addresses: one by name, each rank
+/// of a data-parallel worker by the worker's name, or `all`.
 fn select(worker: &str) -> Result<Vec<Engine>, Response> {
-    if worker == "all" {
-        return Ok(engine::fleet_engines());
+    let mut engines = engine::fleet_engines();
+    if worker != "all" {
+        engines.retain(|e| is_engine_of(worker, e.name()));
+        if engines.is_empty() {
+            return Err((StatusCode::NOT_FOUND, "unknown worker").into_response());
+        }
     }
-    find(worker)
-        .map(|e| vec![e])
-        .ok_or_else(|| (StatusCode::NOT_FOUND, "unknown worker").into_response())
+    Ok(engines)
 }
 
 fn status_json(e: &Engine) -> Value {
@@ -282,6 +301,7 @@ fn status_json(e: &Engine) -> Value {
         "admit_delay_ms": s.admit_delay_ms,
         "admit_per_sec": s.admit_per_sec,
         "cold_shape_ms": s.cold_shape_ms,
+        "load_lag_ms": s.load_lag_ms,
         "paused": s.paused,
         "generation": s.generation,
         "restarts": s.restarts,
@@ -294,6 +314,8 @@ fn status_json(e: &Engine) -> Value {
         "failed_total": s.failed_total,
         "cut_total": s.cut_total,
         "stalled_total": s.stalled_total,
+        "load_fail_status": s.load_fail_status,
+        "load_muted": s.load_muted,
     })
 }
 
@@ -321,6 +343,16 @@ fn optional<T: std::str::FromStr>(
     }
 }
 
+/// The `status` a hook answers with: 0 (none) or an error status.
+fn check_status(status: u16) -> Result<(), String> {
+    if status == 0 || (400..=599).contains(&status) {
+        return Ok(());
+    }
+    Err(format!(
+        "status must be 0 or an error status (400-599), got {status}"
+    ))
+}
+
 /// The request fault a `fail` query arms, or `None` to clear it:
 /// `status=S` (0, or 400 to 599) answered instead of serving, for the next
 /// `count=N` requests or every request for `secs=T` (neither: until cleared),
@@ -341,11 +373,7 @@ fn fail_query(q: &HashMap<String, String>) -> Result<Option<RequestFault>, Strin
         Some("error") => true,
         Some(other) => return Err(format!("finish must be \"error\", got {other}")),
     };
-    if status != 0 && !(400..=599).contains(&status) {
-        return Err(format!(
-            "status must be 0 or an error status (400-599), got {status}"
-        ));
-    }
+    check_status(status)?;
     if finish_error {
         after_tokens = Some(after_tokens.unwrap_or(0));
     } else if status == 0 && after_tokens.is_some() {
@@ -386,8 +414,9 @@ async fn fleet(State(state): State<Arc<AdminState>>) -> Json<Value> {
 
 /// One row per worker of the process, in name order: a realistic engine with
 /// its load (a data-parallel rank is a row of its own, named `<worker>:r<k>`)
-/// and, in a canned process, each listener with its name and mode alone, since
-/// no engine stands behind it. A listener registers its name when it starts,
+/// and, in a canned process, each listener with its name, its mode and the
+/// generation requests it received (an HTTP or gRPC worker's own count, since
+/// no engine stands behind it). A listener registers its name when it starts,
 /// before a realistic engine spawns (a ZMQ rank's after its handshake), so a
 /// realistic process lists its engines alone and a canned fleet counts here as
 /// it serves; an engine no listener claims is listed after them.
@@ -395,21 +424,34 @@ fn fleet_rows(cfg: &Config) -> Vec<Value> {
     let engines = engine::fleet_engines();
     let mut listed = vec![false; engines.len()];
     let mut rows = Vec::with_capacity(engines.len());
-    for worker in script::registered() {
+    // The names first, then every worker's count in one read of the registry
+    // (not one a row): a worker registers its count before its name, so each
+    // name read here has its count there.
+    let workers = script::registered();
+    let received: HashMap<String, u64> = if cfg.realistic {
+        HashMap::new()
+    } else {
+        AdminOps::all()
+            .iter()
+            .map(|ops| (ops.name().to_string(), ops.requests()))
+            .collect()
+    };
+    for worker in workers {
         let mut found = false;
         for (index, e) in engines.iter().enumerate() {
-            let rank_of_worker = e
-                .name()
-                .strip_prefix(worker.as_str())
-                .is_some_and(|rest| rest.starts_with(":r"));
-            if e.name() == worker || rank_of_worker {
+            if is_engine_of(&worker, e.name()) {
                 rows.push(engine_row(e, cfg));
                 listed[index] = true;
                 found = true;
             }
         }
         if !found && !cfg.realistic {
-            rows.push(json!({ "worker": worker, "engine": "canned" }));
+            let mut row = json!({ "worker": worker, "engine": "canned" });
+            // A ZMQ rank keeps no such count: its row stays without the key.
+            if let Some(requests) = received.get(&worker) {
+                row["requests"] = json!(requests);
+            }
+            rows.push(row);
         }
     }
     for (index, e) in engines.iter().enumerate() {
@@ -421,7 +463,7 @@ fn fleet_rows(cfg: &Config) -> Vec<Value> {
 }
 
 fn engine_row(e: &Engine, cfg: &Config) -> Value {
-    let load = e.load();
+    let load = e.load_truth();
     json!({
         "worker": e.name(),
         "engine": "realistic",
@@ -645,6 +687,18 @@ async fn fault_cold_shape(
     apply(&worker, |e| e.fault_cold_shape_ms(ms))
 }
 
+/// The worker's load reports state its counts of `ms` milliseconds ago.
+async fn fault_load_lag(
+    Path(worker): Path<String>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let ms: u64 = match param(&q, "ms") {
+        Ok(v) => v,
+        Err(response) => return response,
+    };
+    apply(&worker, |e| e.fault_load_lag_ms(ms))
+}
+
 async fn fault_admit_rate(
     Path(worker): Path<String>,
     Query(q): Query<HashMap<String, String>>,
@@ -682,6 +736,35 @@ async fn fault_fail(
         Err(why) => return (StatusCode::BAD_REQUEST, why).into_response(),
     };
     apply(&worker, |e| e.fault_fail(fault))
+}
+
+/// The worker's load polls are answered with `status` (400-599) instead of
+/// a report; 0 clears.
+async fn fault_load_fail(
+    Path(worker): Path<String>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let status: u16 = match param(&q, "status") {
+        Ok(v) => v,
+        Err(response) => return response,
+    };
+    if let Err(why) = check_status(status) {
+        return (StatusCode::BAD_REQUEST, why).into_response();
+    }
+    apply(&worker, |e| e.fault_load_fail(status))
+}
+
+/// The worker pushes no load report (`on=true`), or pushes it again
+/// (`on=false`).
+async fn fault_load_mute(
+    Path(worker): Path<String>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let on: bool = match param(&q, "on") {
+        Ok(v) => v,
+        Err(response) => return response,
+    };
+    apply(&worker, |e| e.fault_load_mute(on))
 }
 
 async fn fault_resume(Path(worker): Path<String>) -> Response {
@@ -907,6 +990,32 @@ mod tests {
         .await
         .expect("the server stops at the bind");
         drop(taken);
+    }
+
+    /// A hook addressed to a data-parallel worker by the worker's own name
+    /// reaches each of its ranks, and a rank's name that rank alone.
+    #[tokio::test]
+    async fn a_workers_name_addresses_each_of_its_ranks() {
+        // The fleet is process-wide; the names below are this test's own.
+        let ranks = ["grpc:hooked-dp:r0", "grpc:hooked-dp:r1"]
+            .map(|name| Engine::spawn_named(engine::EngineParams::default(), name.into(), true));
+        let paused = || ranks.each_ref().map(|rank| rank.fault_status().paused);
+        let answer = fault_pause(Path("grpc:hooked-dp".to_string())).await;
+        assert_eq!(
+            answer.status(),
+            StatusCode::OK,
+            "the name of the worker reaches its ranks"
+        );
+        assert_eq!(paused(), [true, true]);
+        let answer = fault_resume(Path("grpc:hooked-dp:r1".to_string())).await;
+        assert_eq!(answer.status(), StatusCode::OK);
+        assert_eq!(paused(), [true, false]);
+        // A name that only begins like the worker's addresses none of them.
+        let answer = fault_resume(Path("grpc:hooked".to_string())).await;
+        assert_eq!(answer.status(), StatusCode::NOT_FOUND);
+        assert_eq!(paused(), [true, false]);
+        fault_resume(Path("grpc:hooked-dp".to_string())).await;
+        assert_eq!(paused(), [false, false]);
     }
 
     #[tokio::test]

@@ -36,9 +36,14 @@ const MODEL: &str = "model-a";
 
 /// The engine of a stock document.
 fn preset(name: &str) -> PolicyEngine {
+    PolicyEngine::new(stock(name, 1))
+}
+
+/// The stock document `name` as applied under the generation `number`.
+fn stock(name: &str, number: u64) -> AppliedSpec {
     let mut document = PolicySpec::preset(name).expect("a built-in preset");
-    document.generation = 1;
-    PolicyEngine::new(AppliedSpec::validate(&document).expect("the document validates"))
+    document.generation = number;
+    AppliedSpec::validate(&document).expect("the document validates")
 }
 
 fn pool(workers: usize) -> Arc<[Arc<dyn Worker>]> {
@@ -345,6 +350,48 @@ fn a_key_over_prefill_workers_passes_an_owner_over_its_thresholds() {
     }
 }
 
+/// A list of decode workers and a list of encode workers pass the key on as
+/// a list of prefill workers does: every role but the regular one counts,
+/// on the ring the caller lends and on the stage's own.
+///
+/// The gateway's own placement lifts the overload veto for a key only
+/// where every candidate's type is the regular one (`select_pass`, at main
+/// `450084124`, `model_gateway/src/routers/common/placement.rs:1337`).
+#[test]
+fn a_key_over_decode_or_encode_workers_passes_an_owner_over_its_thresholds() {
+    for role in [WorkerType::Decode, WorkerType::Encode] {
+        let engine = preset("consistent_hashing");
+        let list: Arc<[Arc<dyn Worker>]> = (0..8)
+            .map(|at| {
+                let url = format!("http://other-{at}:8000");
+                let worker = worker_with_model_aliases(&url, MODEL, &[], role);
+                worker.set_status(WorkerStatus::Ready);
+                worker
+            })
+            .collect();
+        let members = PublishedList::new(Arc::clone(&list));
+        let ring = InOrder(list.iter().map(|worker| worker.url().to_owned()).collect());
+        let places = |lent: bool| -> Vec<u32> {
+            let mut asks = keyed(9, &members);
+            if lent {
+                asks.request.facts.ring = Some(&ring);
+                asks.request.facts.ring_positions = &[0];
+            }
+            let decision = decided(&engine, &asks).decision;
+            let trace = &decision.pick().expect("a pick").trace;
+            assert!(!lent || trace.drew_first(), "a pass over the list ran");
+            targets(&decision).iter().map(|&(place, _)| place).collect()
+        };
+        for lent in [true, false] {
+            let free = places(lent);
+            let owner = &list[free[0] as usize];
+            owner.set_overloaded(true);
+            assert_eq!(places(lent)[0], free[1], "{role:?}, ring lent: {lent}");
+            owner.set_overloaded(false);
+        }
+    }
+}
+
 /// A worker that leaves a list stays a member of the ring stage's own ring
 /// until its host says it is gone ([`PolicyEngine::forget`]): a list
 /// published without it tells that ring nothing. It changes no answer:
@@ -424,6 +471,33 @@ fn a_sessions_pin_is_made_at_the_dispatch_and_followed_with_no_pass_over_the_lis
     assert!(pick.targets.iter().all(|target| target.id != pinned.id));
 }
 
+/// A session's pin stands across a new document: the session table is the
+/// engine's, and the document put in force reads and writes it. A key
+/// pinned under one document follows its pin under the next, by one
+/// worker's record.
+#[test]
+fn a_sessions_pin_stands_across_a_new_document() {
+    let engine = preset("manual");
+    let list = pool(16);
+    let members = PublishedList::new(Arc::clone(&list));
+    let now = Instant::now();
+    let asks = keyed(41, &members);
+    let mut first =
+        DecisionGuard::decide_under(&engine, GatewayId::LOCAL, &asks, now).expect("a decision");
+    let pinned = first.take(0).expect("the first target");
+    first.dispatched(now);
+    first.completed(&served(pinned.id), now);
+    drop(first);
+
+    let applied = engine.apply(stock("manual", 2));
+    applied.expect("a number above the standing one");
+    let followed = decided(&engine, &asks).decision;
+    let pick = followed.pick().expect("a pick");
+    assert_eq!(pick.trace.generation, 2, "under the new document");
+    assert_eq!(pick.session_verdict, SessionVerdict::Pinned);
+    assert_eq!(targets(&followed), [(pinned.position, pinned.id)]);
+}
+
 /// The engine's own pass drops the session keys past their end, off the
 /// path of a request: a pin made at a dispatch is held through the rule's
 /// idle time and gone after it.
@@ -440,7 +514,7 @@ fn the_engines_pass_drops_the_session_keys_past_their_end() {
     first.dispatched(now);
     first.completed(&served(pinned.id), now);
     drop(first);
-    let sessions = engine.spec().engine().sessions();
+    let sessions = engine.standing_spec().engine().sessions();
     assert_eq!(sessions.len(), 1);
     // The stock rule forgets a key at its first sweep, one a minute, four
     // hours after its last request.

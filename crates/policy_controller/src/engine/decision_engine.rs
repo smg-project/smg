@@ -184,7 +184,9 @@ pub trait RequestMaker {
     /// record of sent prefixes, asks it of the pick's targets, best first,
     /// and stores the prompt for the first one answered `true`: for none
     /// where each is answered `false`, so neither names a worker the
-    /// request was not sent to.
+    /// request was not sent to. A pair's decode decided again asks it of
+    /// each target, and its maker answers for the target's decode alone:
+    /// the prefill a target names was sent already.
     ///
     /// It is asked behind the pick and ahead of the decision's lease,
     /// inside the decision: an answer asks the engine nothing. No other
@@ -197,6 +199,27 @@ pub trait RequestMaker {
     #[cfg(feature = "in-process")]
     fn sends_to(&self, target: &Target) -> bool {
         let _ = target;
+        true
+    }
+
+    /// Whether the request's caller sends to the encoder at `position` of
+    /// its encoders' list, one an encode request's decision placed an item
+    /// on. A caller that cannot send to such an encoder sends the request
+    /// to no target of that pick. So a decision that stores where its
+    /// prompt went asks it of the placed encoders first, a place once, and
+    /// stores the prompt for no target where one is answered `false`: it
+    /// asks of no encoder behind that answer.
+    ///
+    /// It is asked where [`Self::sends_to`] is, ahead of that question:
+    /// inside the decision, where an answer asks the engine nothing.
+    ///
+    /// `true` from a maker that does not say. The call that places a
+    /// request answers by whether the encoder can be sent to now, and
+    /// keeps the answer for its own read of that encoder. It asks its
+    /// route's rule of no encoder.
+    #[cfg(feature = "in-process")]
+    fn sends_to_encoder(&self, position: u32) -> bool {
+        let _ = position;
         true
     }
 }
@@ -279,7 +302,8 @@ pub enum WorkerLists<'a> {
     /// The host hands no list.
     #[default]
     None,
-    /// A single request's list.
+    /// A single request's list, and the one list of a request of another
+    /// phase that stands alone.
     Single(super::list_cell::LentList<'a>),
     /// A pair's two lists, its prefills and its decodes, with the pair
     /// classes of their workers and the host's reads of its admission.

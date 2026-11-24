@@ -1549,16 +1549,16 @@ impl<G: Generation> WorkerMonitor<G> {
     /// group that ended, changed its interval or had another loop spawned
     /// over it ahead of the call. It was
     /// told to end there, and a tick of it that is past its fetch can
-    /// still publish. Last the
+    /// still publish. Every pusher is evicted then. Last the
     /// monitor resets as its rebuild from the registry does: the shared
     /// snapshot is published empty, the probe memo goes, and the sink is
     /// told the reset ([`LoadSink::reset`]). The monitor's own sink takes
     /// every overload veto off the registry's workers there.
     ///
     /// The monitor then runs no task: its snapshot is empty, its probe memo
-    /// is gone and its sink was told the reset. A pusher that is still the
-    /// registry's `Ready` worker at its URL keeps its report on file, and
-    /// the sink its receipts. The receivers stay subscribed and read the
+    /// is gone and its sink was told the reset. No pusher has a report on
+    /// file, and the sink was told to forget each one that had
+    /// ([`LoadSink::forget`]). The receivers stay subscribed and read the
     /// empty snapshot, and [`Self::start_event_loop`] starts the monitor
     /// again over the registry as it stands at that call.
     ///
@@ -1573,6 +1573,24 @@ impl<G: Generation> WorkerMonitor<G> {
     /// So a worker whose stream pushes can carry an overload veto with no
     /// poll behind it, until the next start: its rebuild from the registry
     /// tells the sink the reset.
+    ///
+    /// No pusher's file outlives a stop. Behind the tasks' end and ahead of
+    /// the reset, the stop evicts every pusher, whatever its worker's
+    /// status: the report on file with every rank it holds, the publish it
+    /// queued or held, and what the sink keeps of the worker
+    /// ([`LoadSink::forget`]). The engine series of a pusher that stays
+    /// `Ready` keep their last value, as a polled worker's do through a
+    /// stop: the sentinel is written where the worker is no longer the
+    /// registry's `Ready` worker at its URL. The reset alone keeps the
+    /// file of a pusher that stays `Ready`: behind a rebuild the monitor's
+    /// tasks and the pusher's stream both go on, and the file is that
+    /// worker's newest word. A stop ends the run, and a host may hand a
+    /// stopped monitor no record. A file kept through the stop would then be as
+    /// old as the stop at the next start, where a publish it queued or its
+    /// worker's next record would publish every rank it held. So a host
+    /// that stops and starts its monitor in turn starts each worker from no
+    /// report: the start polls it as a worker that never pushed, and its
+    /// file starts again at its stream's next record.
     ///
     /// A stop dropped at its first wait puts the event task's handle back.
     /// That task was told to end, and a poll of it that still runs can
@@ -1612,6 +1630,17 @@ impl<G: Generation> WorkerMonitor<G> {
         }
         for mut task in ending {
             ended(&mut task).await;
+        }
+        // Every pusher goes ahead of the reset, which by itself keeps the
+        // file of a worker that stays `Ready`: no file outlives the stop.
+        let pushers: Vec<Arc<dyn Worker>> = self
+            .pushed_reports
+            .lock()
+            .values()
+            .map(|file| Arc::clone(&file.pusher))
+            .collect();
+        for pusher in &pushers {
+            self.evict_worker_loads(pusher);
         }
         self.stop_all_groups();
     }
@@ -2061,6 +2090,51 @@ impl<G: Generation> WorkerMonitor<G> {
         }
     }
 
+    /// One engine's answer as each member's report, in the members' order:
+    /// a member ahead of the last copies its own rank of the answer, and the
+    /// last takes the answer itself.
+    fn scope_to_members(
+        reports: &mut Vec<Option<WorkerLoadResponse>>,
+        members: &[Arc<dyn Worker>],
+        answer: WorkerLoadResponse,
+    ) {
+        let Some((last, ahead)) = members.split_last() else {
+            return;
+        };
+        for member in ahead {
+            let own = Self::copy_for_dp_rank(&answer, member.dp_rank());
+            reports.push(Some(own.unwrap_or_default()));
+        }
+        reports.push(Some(answer.for_dp_rank(last.dp_rank()).unwrap_or_default()));
+    }
+
+    /// [`WorkerLoadResponse::for_dp_rank`] of a copy, for a member that
+    /// leaves the answer to the members after it: the entries of its own
+    /// rank alone are copied, not every rank's.
+    fn copy_for_dp_rank(
+        answer: &WorkerLoadResponse,
+        rank: Option<usize>,
+    ) -> Option<WorkerLoadResponse> {
+        let Some(rank) = rank else {
+            return answer.clone().for_dp_rank(None);
+        };
+        if !answer.ranks_are_dp_ranks() {
+            return None;
+        }
+        let rank = i32::try_from(rank).ok()?;
+        let mut of_rank = answer.loads.iter().filter(|load| load.dp_rank == rank);
+        let mut loads = vec![of_rank.next()?.clone()];
+        loads.extend(of_rank.cloned());
+        Some(WorkerLoadResponse {
+            timestamp: answer.timestamp.clone(),
+            version: answer.version.clone(),
+            dp_rank_count: i32::try_from(loads.len()).ok()?,
+            loads,
+            aggregate: None,
+            sampled_at: answer.sampled_at,
+        })
+    }
+
     /// The backend-wide gauges of a worker whose native load routes brought
     /// no answer (`native`: why, or none where no route is there). A worker
     /// with no gauges to read fails as its native read did, and has no load
@@ -2357,7 +2431,10 @@ impl<G: Generation> WorkerMonitor<G> {
     /// the rank workers of a data-parallel engine, which share it. The
     /// engine answers once; each member's report is that
     /// answer scoped to its own rank, as its own poll would have had it (a
-    /// rank the answer omits is an empty report). A report's ranks and its
+    /// rank the answer omits is an empty report). The last member takes the
+    /// answer itself and each member ahead of it a copy of its own rank's
+    /// rows (of the whole of a gateway's rollup, which every member keeps),
+    /// so an engine of one worker copies none. A report's ranks and its
     /// named values stand under the report's bounds, and the values that
     /// left them are counted for its member.
     ///
@@ -2404,13 +2481,9 @@ impl<G: Generation> WorkerMonitor<G> {
             (Some(source), _) => {
                 let answer = Self::fetch_source_load(&members[0], source.as_ref()).await;
                 counts.fetched(over_http, &answer);
-                let answer = answer.ok();
-                for member in &members {
-                    reports.push(
-                        answer
-                            .clone()
-                            .map(|load| load.for_dp_rank(member.dp_rank()).unwrap_or_default()),
-                    );
+                match answer {
+                    Ok(load) => Self::scope_to_members(&mut reports, &members, load),
+                    Err(_) => reports.resize(members.len(), None),
                 }
             }
             (None, ConnectionMode::Http) => {
@@ -2424,11 +2497,16 @@ impl<G: Generation> WorkerMonitor<G> {
                             counts.fetched(over_http, &Ok(()));
                             for member in &members {
                                 liveness::on_contact(member);
-                                reports.push(Some(Self::scoped_native_load(
-                                    path,
-                                    load.clone(),
-                                    member.dp_rank(),
-                                )));
+                            }
+                            match path {
+                                NativeLoadsPath::Engine => {
+                                    Self::scope_to_members(&mut reports, &members, load);
+                                }
+                                // A gateway's rollup is every member's whole:
+                                // it keeps its worker annotations.
+                                NativeLoadsPath::Gateway => {
+                                    reports.extend(std::iter::repeat_n(Some(load), members.len()));
+                                }
                             }
                         }
                         // The members are one engine's ranks, and a rank
@@ -2446,13 +2524,9 @@ impl<G: Generation> WorkerMonitor<G> {
             (None, ConnectionMode::Grpc | ConnectionMode::Zmq) => {
                 let answer = Self::fetch_backend_load(&members).await;
                 counts.fetched(over_http, &answer);
-                let answer = answer.ok();
-                for member in &members {
-                    reports.push(
-                        answer
-                            .clone()
-                            .map(|load| load.for_dp_rank(member.dp_rank()).unwrap_or_default()),
-                    );
+                match answer {
+                    Ok(load) => Self::scope_to_members(&mut reports, &members, load),
+                    Err(_) => reports.resize(members.len(), None),
                 }
             }
         }
@@ -3790,6 +3864,35 @@ mod native_loads_tests {
         assert_eq!(stub.probes.load(Ordering::Relaxed), 0);
     }
 
+    /// A member's copy of its rank is the whole answer scoped to that rank,
+    /// field for field: a rank of its own, one the answer states twice, one
+    /// it leaves out, one past the entries' type, a rollup by worker, and
+    /// no rank at all.
+    #[test]
+    fn a_members_copy_of_its_rank_is_the_answer_scoped_to_that_rank() {
+        let mut twice = host_answer(3);
+        twice.loads[2].dp_rank = 0;
+        twice.timestamp = "2026-01-02T03:04:05Z".to_owned();
+        twice.version = "engine-7".to_owned();
+        twice.aggregate = Some(Default::default());
+        twice.sampled_at = Some(Instant::now());
+        let mut rollup = host_answer(2);
+        rollup.loads[1].worker = Some("http://engine-b".to_owned());
+        for answer in [host_answer(3), twice, rollup, WorkerLoadResponse::default()] {
+            for rank in [None, Some(0), Some(1), Some(2), Some(usize::MAX)] {
+                assert_eq!(
+                    format!("{:?}", WorkerMonitor::copy_for_dp_rank(&answer, rank)),
+                    format!("{:?}", answer.clone().for_dp_rank(rank)),
+                    "rank {rank:?}"
+                );
+            }
+        }
+        // Its list has room for its own row alone: a copy of the whole
+        // answer keeps room for every rank's.
+        let own = WorkerMonitor::copy_for_dp_rank(&host_answer(3), Some(1));
+        assert_eq!(own.map(|own| own.loads.capacity()), Some(1));
+    }
+
     /// A connector that keeps no source is asked once, and its worker is
     /// then polled over HTTP as a worker with no connector is: one request
     /// a poll, the engine's own answer, the same memo.
@@ -3960,6 +4063,109 @@ mod native_loads_tests {
             1,
             "a loop's poll still holds the monitor"
         );
+    }
+
+    /// A stop evicts every pusher ahead of its reset, so no rank of a file
+    /// outlives it. A worker's two ranks pushed and were published. Behind
+    /// the stop and the next start, one record of rank 0 publishes that
+    /// rank alone: the other rank's record went with the file. The reset
+    /// alone would keep the file, and the window would publish both ranks.
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_keeps_no_rank_of_a_pushers_file() {
+        let (registry, monitor) = monitor_with_readers(LoadReaders::Aware);
+        let worker = silent_worker("grpc://engine-a.invalid:50051", "a");
+        registry.register(Arc::clone(&worker)).unwrap();
+        let published = || -> Vec<(i32, i32)> {
+            let snapshot = monitor.load_state.snapshot();
+            let ranks = snapshot.get(worker.url()).map(|report| &report.loads);
+            ranks
+                .into_iter()
+                .flatten()
+                .map(|rank| (rank.dp_rank, rank.num_running_reqs))
+                .collect()
+        };
+        monitor.start_event_loop();
+        monitor.apply_pushed_load(&worker, 0, &PushedRecord::requests(8, 0), Instant::now());
+        monitor.apply_pushed_load(&worker, 1, &PushedRecord::requests(5, 0), Instant::now());
+        tokio::time::sleep(PUSHED_PUBLISH_WINDOW * 2).await;
+        assert_eq!(published(), vec![(0, 8), (1, 5)]);
+
+        monitor.stop().await;
+        assert_eq!(published(), vec![], "published while stopped");
+        monitor.start_event_loop();
+        monitor.apply_pushed_load(&worker, 0, &PushedRecord::requests(1, 0), Instant::now());
+        tokio::time::sleep(PUSHED_PUBLISH_WINDOW * 2).await;
+        assert_eq!(published(), vec![(0, 1)], "the ranks behind the next start");
+        monitor.stop().await;
+    }
+
+    /// A stop evicts the publish a pusher queued or held. One worker's
+    /// report is held, taken while the worker was not `Ready`, which it is
+    /// again by the stop. Another's record comes inside the last window.
+    /// The reset alone would keep both files, queued. The next start's
+    /// first window, which a third worker's record opens, publishes that
+    /// worker alone.
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_keeps_no_publish_a_pusher_queued_or_held() {
+        let (registry, monitor) = monitor_with_readers(LoadReaders::Aware);
+        let [held, queued, later] = ["a", "b", "c"]
+            .map(|at| silent_worker(&format!("grpc://engine-{at}.invalid:50051"), "a"));
+        held.set_status(WorkerStatus::NotReady);
+        for worker in [&held, &queued, &later] {
+            registry.register(Arc::clone(worker)).unwrap();
+        }
+        monitor.start_event_loop();
+        let record = PushedRecord::requests(8, 0);
+        monitor.apply_pushed_load(&held, 0, &record, Instant::now());
+        // Held: a flush that finds its worker not `Ready` keeps its place.
+        monitor.flush_pushed();
+        assert_eq!(monitor.pending_pushed_len(), 1, "the held report");
+        held.set_status(WorkerStatus::Ready);
+        monitor.apply_pushed_load(&queued, 0, &record, Instant::now());
+        assert_eq!(monitor.pending_pushed_len(), 2);
+
+        // Inside the second record's window: no flush has published it.
+        monitor.stop().await;
+        assert_eq!(monitor.pending_pushed_len(), 0, "queued behind the stop");
+
+        monitor.start_event_loop();
+        monitor.apply_pushed_load(&later, 0, &record, Instant::now());
+        tokio::time::sleep(PUSHED_PUBLISH_WINDOW * 2).await;
+        let snapshot = monitor.load_state.snapshot();
+        assert!(
+            snapshot.get(later.url()).is_some(),
+            "the start's own record"
+        );
+        for worker in [&held, &queued] {
+            assert!(
+                snapshot.get(worker.url()).is_none(),
+                "{} is published from ahead of the stop",
+                worker.url()
+            );
+        }
+        monitor.stop().await;
+    }
+
+    /// A stop evicts what the sink keeps of a pusher with its file: a
+    /// worker that pushed ahead of the stop is polled at the next start, as
+    /// one that never pushed. Its receipt, kept as the reset alone keeps
+    /// it, would leave the worker to its stream for that start's first
+    /// interval.
+    #[tokio::test(start_paused = true)]
+    async fn a_worker_that_pushed_ahead_of_a_stop_is_polled_at_the_next_start() {
+        let (connector, monitor) = polled_every(Duration::from_secs(1), &[None]);
+        monitor.start_event_loop();
+        // Between the start's poll and the next tick.
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(connector.calls(), 1);
+        let worker = monitor.worker_registry.get_all().pop().expect("the worker");
+        monitor.apply_pushed_load(&worker, 0, &PushedRecord::requests(8, 0), Instant::now());
+
+        monitor.stop().await;
+        monitor.start_event_loop();
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(connector.calls(), 2, "the next start's poll");
+        monitor.stop().await;
     }
 
     /// A monitor told `interval` as its own, over one group of HTTP workers

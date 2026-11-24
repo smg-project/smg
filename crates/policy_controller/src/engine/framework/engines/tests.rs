@@ -22,7 +22,7 @@ use crate::{
         random::Random,
     },
     stages::{
-        filters::NotOverloaded,
+        filters::{Healthy, NotOverloaded},
         lifecycle::Lifecycle,
         pickers::{Best, CountFirst, SampledBest},
     },
@@ -1421,6 +1421,48 @@ fn a_pick_the_whole_pass_makes_behind_the_unit_reads_the_stream_on() {
         widened - past_first >= 20 && past_first >= 20 && apart > 0,
         "{widened} widened, {past_first} of them past a first engine, {apart} apart"
     );
+}
+
+#[test]
+fn a_second_engine_not_drawn_is_the_stages_pick_under_a_fold() {
+    // The health filter folds into one test of a row, and this file's
+    // filter does not: its profile widens by the stages. No front row of
+    // the pool stands and three rows of two engines do, so most draws
+    // find one engine and no second.
+    let scored = || WeightedScorer {
+        scorer: Box::new(Handed),
+        weight: 1.0,
+    };
+    let folded = engine_under(
+        vec![Box::new(Healthy)],
+        vec![scored()],
+        Box::new(PowerOfTwo),
+    );
+    let staged = engine_with(Box::new(PowerOfTwo));
+    let (mut rows, listed, ends) = pool_of(&[3; 5], 1);
+    for row in &mut rows {
+        row.health.healthy = [7, 12, 13].contains(&row.position);
+    }
+    let engines = Engines::new(0, &listed, &ends);
+    let mut widened = 0;
+    for seed in 1..=400 {
+        let by_fold = decide(&folded, seed, &rows, engines);
+        let by_stages = decide(&staged, seed, &rows, engines);
+        let (by_fold, by_stages) = (
+            by_fold.pick().expect("a row stands"),
+            by_stages.pick().expect("a row stands"),
+        );
+        assert_eq!(
+            positions(&by_fold.targets),
+            positions(&by_stages.targets),
+            "seed {seed}"
+        );
+        assert_eq!(by_fold.trace.seed, by_stages.trace.seed, "seed {seed}");
+        let counted = by_fold.trace.survivors.get();
+        assert_eq!(counted, by_stages.trace.survivors.get(), "seed {seed}");
+        widened += usize::from(counted.is_some());
+    }
+    assert!(widened >= 200, "{widened} of 400 decisions widened");
 }
 
 /// The plain ring under `best`, behind the filter of this file and the

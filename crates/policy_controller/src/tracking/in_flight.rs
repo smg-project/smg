@@ -2,11 +2,11 @@
 //! leases the store holds on file and read by a decision beside its rows.
 //!
 //! The store keeps the table (`InFlightCounts`) and books it under its leases'
-//! lock. A decision over a publication's own rows is lent the table with
-//! the pool's slots ([`PoolInFlightCounts`]) and reads a row's count by the
-//! row's position: nothing is written into a row and no lock is taken. A row's
-//! first read in a decision is kept ([`InFlightBuffers`]) and every later read
-//! returns it, so a decision reads one count a row.
+//! lock. A decision that is lent the table with a pool's slots
+//! ([`PoolInFlightCounts`]) reads a row's count by the row's position:
+//! nothing is written into a row and no lock is taken. A row's first read in
+//! a decision is kept ([`InFlightBuffers`]) and every later read returns it,
+//! so a decision reads one count a row.
 //!
 //! A host that counts a worker's requests on an object of its own hands
 //! the table that count ([`HostCount`]), and the table keeps it equal to
@@ -245,6 +245,7 @@ impl InFlightCounts {
 
     /// The counts of `slots`, in their order: one load a slot, the piece
     /// found once for each run of slots that share it.
+    #[cfg(test)]
     pub(crate) fn of<'a>(&'a self, slots: &'a [WorkerSlot]) -> impl Iterator<Item = u32> + 'a {
         let (mut cells, mut first): (&[AtomicU32], u32) = (&[], 0);
         slots.iter().map(move |&slot| {
@@ -454,6 +455,7 @@ impl InFlightCounts {
     /// The table lent to one decision beside the rows whose slots are
     /// `slots`, in the rows' order: `kept` is opened for the decision and
     /// holds what it reads.
+    #[cfg(test)]
     pub(crate) fn lend<'a>(
         &'a self,
         slots: &'a [WorkerSlot],
@@ -465,6 +467,7 @@ impl InFlightCounts {
 
     /// The table beside `slots` with the cells a decision keeps its reads
     /// in, as they stand.
+    #[cfg(test)]
     fn lent<'a>(
         &'a self,
         slots: &'a [WorkerSlot],
@@ -633,6 +636,7 @@ pub struct InFlightBuffers {
     stamp: u32,
 }
 
+#[cfg(test)]
 impl InFlightBuffers {
     /// Opens the cells for one decision over `rows` rows: each reads as
     /// unread. One add a decision. The stamps come round once in 2^32

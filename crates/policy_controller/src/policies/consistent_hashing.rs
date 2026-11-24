@@ -716,11 +716,14 @@ impl ConsistentHash {
         .unwrap_or(false)
     }
 
-    /// The keys the decision is tried at, in order; none for a keyless one.
-    /// A routing key stands alone, and under the prefix form a request that
-    /// carries none is tried at its prefix keys.
+    /// The keys the decision is tried at under the prefix form, in order;
+    /// none for a keyless one. A routing key that leads the prompt stands
+    /// alone ([`Self::leading_key`]), and a request that carries none is
+    /// tried at its prefix keys, as is one whose key its own id handed.
+    /// The prefix form alone asks: the plain ring's one key is read where
+    /// it scores.
     fn keys<'a>(&'a self, facts: &'a RequestFacts<'_>) -> Keys<'a> {
-        let routing = facts.session_key.hash;
+        let routing = Self::leading_key(facts);
         let prefix = self.prefix.as_ref().filter(|_| routing == 0);
         Keys {
             facts,
@@ -893,11 +896,11 @@ impl ConsistentHash {
         for position in iter::once(first).chain(behind.iter().copied()) {
             let mut ranked = [usize::MAX; MAX_TARGETS];
             let mut found = 0usize;
-            ring.walk(position, &mut |address| {
+            ring.walk_ids(position, &mut |id| {
                 if found == most {
                     return true;
                 }
-                match survivor_at(address, candidates, kept) {
+                match survivor_at(id, candidates, kept) {
                     // A ring asks about a worker once: one it names again
                     // keeps the rank it has.
                     Some(slot) if !ranked[..found].contains(&slot) => {
@@ -932,11 +935,29 @@ impl ConsistentHash {
 
     /// The key the scorer places a request by where it places it by itself
     /// ([`Scorer::own`]), `0` for none. A client's key is the plain ring's:
-    /// the prefix form places a request with no routing key by its prefix.
+    /// the prefix form places a request with no routing key by its prefix,
+    /// and one whose key its own id handed too ([`Self::leading_key`]).
     fn own_key(&self, facts: &RequestFacts<'_>) -> u64 {
         match &self.prefix {
-            Some(_) => facts.session_key.hash,
+            Some(_) => Self::leading_key(facts),
             None => facts.ring_key(),
+        }
+    }
+
+    /// The routing key that leads a request's prompt under the prefix
+    /// form, `0` for none: its session key, where a header or its caller
+    /// handed it. A key the request's own id handed
+    /// ([`RequestFacts::session_key_from_rid`]) names the session alone,
+    /// and the ring places that request by its prompt: the gateway's own
+    /// policy of this form hashes a header's key and never the id's
+    /// (`model_gateway/src/policies/prefix_hash.rs`, `select_worker_impl`).
+    /// The plain ring reads no such word: it places by the id's key as by
+    /// any other.
+    fn leading_key(facts: &RequestFacts<'_>) -> u64 {
+        if facts.session_key_from_rid {
+            0
+        } else {
+            facts.session_key.hash
         }
     }
 }
@@ -946,11 +967,10 @@ impl ConsistentHash {
 /// ([`ConsistentHash::lent`]).
 type Lent<'a> = (&'a dyn LentRing, u64, &'a [u64]);
 
-/// The survivor a lent ring names by `address`, by its place among `kept`:
-/// the last of them whose row carries the address's id
-/// ([`WorkerId::from_address`]), `None` where none does.
-fn survivor_at(address: &str, candidates: &[Candidate], kept: &[u32]) -> Option<usize> {
-    let id = WorkerId::from_address(address);
+/// The survivor a lent ring names by its address's `id`
+/// ([`LentRing::walk_ids`]), by its place among `kept`: the last of them
+/// whose row carries the id, `None` where none does.
+fn survivor_at(id: WorkerId, candidates: &[Candidate], kept: &[u32]) -> Option<usize> {
     kept.iter()
         .rposition(|&row| candidates[row as usize].id == id)
 }
@@ -1094,9 +1114,9 @@ impl Scorer for ConsistentHash {
 
     /// The ring places a request that carries a routing key by its walk
     /// alone: under the prefix form too, where a routing key leads the
-    /// prefix. The bounded-load rule reads every survivor's count, and a
-    /// request keyed by its prefix is tried at more keys than one: both
-    /// read the pool whole.
+    /// prefix (`leading_key`). The bounded-load rule reads every
+    /// survivor's count, and a request keyed by its prefix is tried at
+    /// more keys than one: both read the pool whole.
     fn owns(&self) -> bool {
         self.bounded.is_none()
     }
@@ -1208,11 +1228,11 @@ impl Scorer for ConsistentHash {
         let (mut asked, mut kept, mut refused) = (0usize, 0usize, 0u32);
         // Whether the walk ended, and whether it ended decided.
         let (mut ended, mut decided) = (false, false);
-        ring.walk(position, &mut |address| {
+        ring.walk_ids(position, &mut |id| {
             if ended {
                 return true;
             }
-            let place = place_of(WorkerId::from_address(address));
+            let place = place_of(id);
             let Some(place) = place.filter(|place| !met[..asked].contains(place)) else {
                 return false;
             };
@@ -1745,6 +1765,11 @@ mod tests {
             "and the next view brings it back"
         );
         assert_eq!(scorer.ring().len(), 4);
+        // A join told again of a member that stands changes no score.
+        let before = out.clone();
+        scorer.on_membership(&Membership::Added(gone));
+        scorer.score(&keyed(3), &pool, &kept, &mut out);
+        assert_eq!((scorer.ring().len(), &out), (4, &before), "told twice");
         // A replacing handle is named too: the old id leaves, the new one
         // is admitted even when it repeats the old (a reused address).
         scorer.on_membership(&Membership::Replaced {
@@ -2126,6 +2151,49 @@ mod tests {
         ] {
             assert!(scores.iter().all(|&score| score == 0.0), "{scores:?}");
         }
+    }
+
+    /// The gateway's own policy of the prefix form hashes a key a header
+    /// handed (`model_gateway/src/policies/prefix_hash.rs:358`) and places
+    /// every other request by its prompt (`:360-372`): it never reads the
+    /// key the request's own id hands. Its plain ring reads that key
+    /// itself (`model_gateway/src/policies/consistent_hashing.rs:171`).
+    #[test]
+    fn a_key_the_requests_own_id_handed_leads_no_prefix_and_the_plain_form_places_by_it() {
+        let pool: Vec<Candidate> = (0..8).map(|i| candidate(i, 0)).collect();
+        let hashes = [11, 22, 33, 44];
+        let plain = ConsistentHash::new(None);
+        let unkeyed = scored(&prefixed(64), &hashed(&hashes), &pool);
+        let by_prefix = leader(&unkeyed);
+        // A routing key whose owner is another worker than the prefix's.
+        let (key, by_key) = (1..)
+            .map(|key| (key, leader(&scored(&plain, &keyed(key), &pool))))
+            .find(|&(_, owner)| owner != by_prefix)
+            .expect("a key with another owner");
+        // A header handed the key: it leads the prefix.
+        let by_header = RequestFacts {
+            session_key: Identity::hashed(key),
+            ..hashed(&hashes)
+        };
+        assert_eq!(leader(&scored(&prefixed(64), &by_header, &pool)), by_key);
+        assert_eq!(keys_of(&levelled(None), &by_header), [key]);
+        assert_eq!(prefixed(64).own_key(&by_header), key);
+        // The request's own id handed it: the request scores as the same
+        // prompt with no key, is tried at that prompt's keys, and the
+        // stage places it by no walk of its own.
+        let by_id = RequestFacts {
+            session_key_from_rid: true,
+            ..by_header
+        };
+        assert_eq!(scored(&prefixed(64), &by_id, &pool), unkeyed);
+        assert_eq!(
+            keys_of(&levelled(None), &by_id),
+            keys_of(&levelled(None), &hashed(&hashes))
+        );
+        assert_eq!(prefixed(64).own_key(&by_id), 0);
+        // The plain form reads no such word: the id's key has its owner.
+        assert_eq!(leader(&scored(&plain, &by_id, &pool)), by_key);
+        assert_eq!(plain.own_key(&by_id), key);
     }
 
     fn bounded(factor: f64, abs_margin: u32) -> ConsistentHash {

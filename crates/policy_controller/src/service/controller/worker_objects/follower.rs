@@ -19,18 +19,21 @@ use crate::{
 
 /// The overload thresholds an object states for each signal its row names
 /// none for: the worker crate's two default numbers, which a gateway hands
-/// its workers too. They are this crate's own two defaults, by which the
-/// store judges under a binding whose block is on
+/// each worker of an engine too where its overload switch is on. An
+/// external row's object takes none, as a gateway's external worker takes
+/// none at its registration. They are this crate's own two defaults, by
+/// which the store judges under a binding whose block is on
 /// ([`OVERLOAD_WAITING_REQUESTS`](crate::document::spec::OVERLOAD_WAITING_REQUESTS),
 /// [`OVERLOAD_TOKEN_USAGE`](crate::document::spec::OVERLOAD_TOKEN_USAGE)):
 /// no document names a threshold.
-/// One set a worker: a registration's own values, each over these.
+/// One set a worker: a registration's own values, each over these for an
+/// engine's worker.
 ///
 /// The usage is the worker crate's 64-bit number, as an engine reports it.
 /// This crate's constant is 32 bits wide: widened, it reads just above
 /// the 0.8 an engine reports, and a worker at the threshold would not be
 /// over it.
-const OVERLOAD_DEFAULTS: OverloadThresholds = OverloadThresholds {
+pub(crate) const OVERLOAD_DEFAULTS: OverloadThresholds = OverloadThresholds {
     waiting_requests: Some(DEFAULT_WAITING_REQUESTS),
     token_usage: Some(DEFAULT_TOKEN_USAGE_CEILING),
 };
@@ -42,17 +45,18 @@ const OVERLOAD_DEFAULTS: OverloadThresholds = OverloadThresholds {
 /// here. The replica cannot dial a row that one gateway alone reaches: such
 /// a row's object is built with its checks off, and no probe is sent to it.
 ///
-/// Each object states its row's overload thresholds over the program's
-/// default ([`OVERLOAD_DEFAULTS`]): what a load monitor over the registry
-/// judges the worker by ([`load_monitor`](crate::worker_host::load_monitor)).
+/// The object of an engine's row states its row's overload thresholds over
+/// the program's default ([`OVERLOAD_DEFAULTS`]), and an external row's
+/// object its row's alone: what a load monitor over the registry judges
+/// the worker by ([`load_monitor`](crate::worker_host::load_monitor)).
 /// The service runs that monitor while the replica leads, and it writes
 /// each verdict on the worker's object.
 ///
-/// An object's status follows its row's
-/// ([`Objects::with_status_followed`]). A decision reads a worker's status
-/// on its object, and a probe's outcome is not the only write of a row's
-/// status: a drain marks the row, and a standby applies the statuses its
-/// leader wrote.
+/// An object's status leads its row's. A decision reads a worker's status
+/// on its object. While the replica leads, a probe's outcome, a connect
+/// signal and a drain are written on the object, and the store is told.
+/// While it follows, the holder lays each status its leader's log tells.
+/// So the holder follows no status of its store's own tail.
 pub(crate) struct WorkerObjects {
     store: Arc<MemoryStore>,
     objects: Arc<Objects<Members>>,
@@ -79,7 +83,6 @@ impl WorkerObjects {
                 Objects::new(Arc::new(WorkerRegistry::new()))
                     .with_connector(connector)
                     .with_host_local_unchecked()
-                    .with_status_followed()
                     .with_overload_thresholds(OVERLOAD_DEFAULTS),
             ),
             wake,
@@ -124,9 +127,13 @@ impl WorkerObjects {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::{collections::BTreeMap, time::Instant};
 
+    use smg_worker::{
+        health::port::{HealthSink, ProbeAnswer},
+        worker::WorkerStatus as ObjectStatus,
+    };
     use tokio::{
         net::TcpListener,
         sync::oneshot,
@@ -146,7 +153,8 @@ mod tests {
             replication::Log,
         },
         store::{
-            LeasesStore, Overload, Position, WorkerFacts, WorkerPatch, WorkerStatus, WorkersStore,
+            HealthPolicy, HealthWrite, LeasesStore, Overload, Position, Registrant, WorkerFacts,
+            WorkerPatch, WorkerStatus, WorkersStore,
         },
     };
 
@@ -321,6 +329,63 @@ mod tests {
         replica.stopped().await;
     }
 
+    /// Two moves in a row end with the table at the object's newest
+    /// status. The follow reads the first move's event between the second
+    /// move and its telling, and leaves the object alone: the replica's
+    /// holder copies no status of its store's tail back onto an object.
+    /// With that copy the second move is lost: the object goes back to the
+    /// first status, and its tell finds nothing to tell.
+    #[test]
+    fn two_moves_in_a_row_end_with_the_table_at_the_objects_newest_status() {
+        let store = Arc::new(MemoryStore::default());
+        let workers = WorkerObjects::new(Arc::clone(&store), ObjectsWake::default());
+        let holder = workers.objects();
+        // A row each probe moves.
+        let stated = WorkerFacts {
+            health: HealthPolicy {
+                failure_threshold: 1,
+                success_threshold: 1,
+                ..HealthPolicy::default()
+            },
+            ..facts(1, 1)
+        };
+        let change = holder.upsert(&store, stated, Registrant::Control);
+        let row = change.expect("registered").id();
+        let id = holder.object(row).expect("the object");
+        let registry = holder.registry().as_ref();
+        let object = || registry.get(&id).expect("it stands");
+        let revision = object().revision();
+        // One probe, judged by the registry's own state machine as the
+        // health adapter hands it on: the object alone moves.
+        let probe = |passed: bool| {
+            HealthSink::probe_outcome(registry, &id, passed, revision, object().status())
+        };
+        let tell = |moved: ProbeAnswer| {
+            let ProbeAnswer::Moved { old, new } = moved else {
+                panic!("the probe moved nothing: {moved:?}");
+            };
+            holder.tell_status(&store, &id, revision, (old, new), &|| true)
+        };
+        let table = || WorkersStore::get(&*store, row).map(|row| row.status);
+        let statuses = || (table(), object().status());
+        // The first move, told.
+        assert!(tell(probe(true)).moved().is_some());
+        let ready = (Some(WorkerStatus::Ready), ObjectStatus::Ready);
+        assert_eq!(statuses(), ready);
+        // The second move stands on the object, and its tell has not run.
+        let second = probe(false);
+        holder.follow(&*store);
+        let trails = (Some(WorkerStatus::Ready), ObjectStatus::NotReady);
+        assert_eq!(statuses(), trails, "the follow left the object alone");
+        let told = HealthWrite::Moved {
+            from: WorkerStatus::Ready,
+            to: WorkerStatus::NotReady,
+        };
+        assert_eq!(tell(second), told);
+        let down = (Some(WorkerStatus::NotReady), ObjectStatus::NotReady);
+        assert_eq!(statuses(), down);
+    }
+
     /// The six membership changes, one write each on the leader. Each
     /// wakes the leader's follower, and applied on the standby wakes the
     /// standby's: both hold the objects of the same rows after each.
@@ -430,7 +495,7 @@ mod tests {
 
     /// A mock engine that serves `model` behind a port of its own: its
     /// address, what stops it and its task.
-    async fn engine(model: &str) -> (String, oneshot::Sender<()>, JoinSet<()>) {
+    pub(crate) async fn engine(model: &str) -> (String, oneshot::Sender<()>, JoinSet<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("a port");
         let addr = listener.local_addr().expect("the port's address");
         let config = mock_worker::config::Config {

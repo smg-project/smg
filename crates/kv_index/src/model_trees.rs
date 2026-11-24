@@ -95,6 +95,16 @@ impl ModelTrees {
         self.token_trees.len()
     }
 
+    /// Every model's token tree, copied out: a pass of the owner's over the
+    /// trees holds no lock of this store, so a model's first tree is not
+    /// kept waiting behind it.
+    pub fn token_trees(&self) -> Vec<Arc<TokenTree>> {
+        self.token_trees
+            .iter()
+            .map(|tree| Arc::clone(tree.value()))
+            .collect()
+    }
+
     /// Inserts the empty prompt for `tenant` in the two trees of `model_id`,
     /// making them where the model is new. The string tree then holds the
     /// tenant at its root and routes to it before it has served a request.
@@ -189,6 +199,20 @@ mod tests {
         assert_eq!(token.page_size(), 4);
         // A page of no tokens is a page of one.
         assert_eq!(ModelTrees::new(0).token_tree_or_new("a").page_size(), 1);
+    }
+
+    #[test]
+    fn every_models_token_tree_is_handed_out_and_no_string_tree() {
+        let trees = ModelTrees::new(4);
+        assert!(trees.token_trees().is_empty());
+        trees.string_tree_or_new("c");
+        let made = [trees.token_tree_or_new("a"), trees.token_tree_or_new("b")];
+
+        let handed = trees.token_trees();
+        assert_eq!(handed.len(), 2);
+        for tree in &made {
+            assert!(handed.iter().any(|other| Arc::ptr_eq(other, tree)));
+        }
     }
 
     #[test]

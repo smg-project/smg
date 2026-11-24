@@ -37,9 +37,11 @@
 //! worker's models does in a gateway. A change that sets one writes the
 //! table at the row's next patch.
 //!
-//! A status is the table's word still. The store hands the row a change
-//! leaves the status its table holds, and the put copies it onto the object
-//! where the holder follows statuses ([`Objects::with_status_followed`]).
+//! A status is the object's word ([`mod@super::status`]). A row changed in
+//! place keeps the status its table holds, and the holder tells the store
+//! the status of the object laid in the standing one's place. A key's next
+//! life starts in the status the rule hands on from the object that stood,
+//! and its object is built in it.
 //! The holder's place stays where its follow left it: the next follow reads
 //! the holder's own change in the tail and finds it laid.
 
@@ -149,6 +151,15 @@ impl<G: Generation> Objects<G> {
             return self.moved(store, place);
         }
         self.put(store, row, built);
+        // The object's status leads. One laid in another's place took the
+        // standing object's there, and the table is told it. A new object
+        // is built in the status its row starts in.
+        if matches!(
+            change,
+            MembershipChange::Relabelled { .. } | MembershipChange::Resized { .. }
+        ) {
+            self.tell_row(store, row.id, row.revision);
+        }
         Some(change)
     }
 
@@ -192,7 +203,7 @@ pub(super) mod tests {
     use super::*;
     use crate::{
         engine::view::Role,
-        store::{identity, HealthSink, Journal, Position, WorkerStatus, WorkersStore},
+        store::{identity, Journal, Position, WorkerStatus, WorkersStore},
         worker_host::Members,
     };
 
@@ -238,7 +249,7 @@ pub(super) mod tests {
     }
 
     /// A replica as a controller keeps one: a journaled store, and a holder
-    /// whose objects follow their rows' status.
+    /// whose objects lead their rows' status, so it follows none.
     pub(crate) struct Replica {
         pub(crate) store: MemoryStore,
         pub(crate) objects: Objects<Members>,
@@ -250,7 +261,7 @@ pub(super) mod tests {
             let told = Arc::new(Told::default());
             Self {
                 store: MemoryStore::journaled(Arc::clone(&told) as _),
-                objects: Objects::new(Arc::new(WorkerRegistry::new())).with_status_followed(),
+                objects: Objects::new(Arc::new(WorkerRegistry::new())),
                 told,
             }
         }
@@ -374,12 +385,13 @@ pub(super) mod tests {
         assert_eq!((left, took), (None, Some(next)));
     }
 
-    /// The status of a row a write leaves is the table's word. A key's next
-    /// life takes the status its ready worker stood in, a draining worker's
-    /// starts pending, and so does another worker's. The journal, the table
-    /// and the object say the same status, with no follow and behind one.
+    /// The status of a row a write leaves is its object's word. A key's
+    /// next life takes the status its ready worker stood in, a draining
+    /// worker's starts pending, and so does another worker's. The journal,
+    /// the table and the object say the same status, with no follow and
+    /// behind one.
     #[test]
-    fn a_keys_next_life_is_handed_the_status_the_table_holds() {
+    fn a_keys_next_life_is_handed_the_status_its_worker_stood_in() {
         type State = fn(&mut WorkerFacts);
         let lives: [(WorkerStatus, State, WorkerStatus); 3] = [
             (WorkerStatus::Ready, |_| {}, WorkerStatus::Ready),
@@ -392,16 +404,13 @@ pub(super) mod tests {
         ];
         for (stood, state, handed) in lives {
             let replica = Replica::new();
-            let store = &replica.store;
+            let (store, objects) = (&replica.store, &replica.objects);
             let id = replica.upsert(facts(1, "gold")).expect("registered").id();
-            // The table's status moves by the store's own doors: a connect
-            // signal, a drain. The object has not followed either.
-            assert!(matches!(
-                store.connected(id, 1, &|| true),
-                crate::store::HealthWrite::Moved { .. }
-            ));
+            // The status moves by the holder's own entries: a connect
+            // signal, a drain. The object leads, and the table is told.
+            objects.connect_row(store, id, 1);
             if stood == WorkerStatus::Draining {
-                store.set_status(id, stood, 1).expect("the row drains");
+                assert!(objects.drain_row(store, id, 1), "the row drains");
             }
             let mut next = facts(2, "gold");
             state(&mut next);
@@ -409,22 +418,22 @@ pub(super) mod tests {
             let row = replica.one_row(A);
             assert_eq!(row.status, handed, "behind a row that stood {stood:?}");
             // Behind a follow the three still say one row.
-            replica.objects.follow(store);
+            objects.follow(store);
             let object = replica.object(A).expect("the object");
             assert_eq!(replica.objects.row_of(&object), Some(row));
         }
     }
 
-    /// The store keeps its own word of a status, whatever a decided row
-    /// says: the holder reads a status off an object, which may trail the
-    /// table. A row changed in place keeps the table's status, and a key's
-    /// next life is handed the table's.
+    /// A status moves by its own event alone: a row changed in place keeps
+    /// the status the table holds, whatever its decided row says. A key's
+    /// next life starts in the status its decided row states: the one the
+    /// holder's rule handed on from the object.
     #[test]
-    fn the_store_keeps_its_word_of_a_status_whatever_a_decided_row_says() {
+    fn a_row_in_place_keeps_the_tables_status_and_a_next_life_takes_its_rows() {
         let replica = Replica::new();
         let store = &replica.store;
         let id = replica.upsert(facts(1, "gold")).expect("registered").id();
-        store.connected(id, 1, &|| true);
+        replica.objects.connect_row(store, id, 1);
         // In place, decided over a row that still reads pending.
         let stale = store.by_key(A).map(|row| WorkerRow {
             status: WorkerStatus::Pending,
@@ -445,10 +454,10 @@ pub(super) mod tests {
             facts(2, "gold").laid_over(standing.as_ref(), Registrant::Control, now);
         assert_eq!(next.status, WorkerStatus::Pending, "as the holder read it");
         assert!(store.follow_objects(change, Some(next), Some(2)));
-        assert_eq!(status(A), Some(WorkerStatus::Ready));
+        assert_eq!(status(A), Some(WorkerStatus::Pending));
         assert_eq!(
             replica.last().1.map(|row| row.status),
-            Some(WorkerStatus::Ready)
+            Some(WorkerStatus::Pending)
         );
     }
 

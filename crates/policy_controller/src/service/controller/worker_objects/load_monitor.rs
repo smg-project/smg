@@ -1,8 +1,15 @@
 //! The load reports of the replica's workers while it leads.
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
+use parking_lot::RwLock;
 use smg_worker::{
+    common_proto::EngineLoad,
+    identity::basic::Worker,
+    kv_events::PushedLoadSink,
     load::{monitor::WorkerMonitor, state::LoadReceiver},
     registry::WorkerRegistry,
 };
@@ -20,10 +27,12 @@ use crate::{
 /// loss of it.
 ///
 /// While the replica leads the monitor polls every `Ready` object the
-/// replica dials and publishes the reports as one snapshot. Its own sink
-/// writes the overload verdict on each object by the thresholds the object
-/// states. It writes no row: a report is read where the monitor publishes
-/// it. A row that one gateway alone reaches is asked for no load.
+/// replica dials and publishes the reports as one snapshot. It takes the
+/// load records on the workers' event streams as polls
+/// ([`PushedRecords`]). Its own sink writes the overload verdict on each
+/// object by the thresholds the object states. It writes no row: a report
+/// is read where the monitor publishes it. A row that one gateway alone
+/// reaches is asked for no load.
 ///
 /// The serve runs this task, and every deciding thread holds the monitor's
 /// channel from the bind: a single request's decision is given the newest
@@ -33,6 +42,47 @@ pub(crate) struct LoadMonitor {
     /// The holder's registry, which writes the monitor's overload verdicts
     /// on the objects and counts each one that changes.
     registry: Arc<WorkerRegistry<Members>>,
+    /// Where the load records on the workers' event streams go: the serve
+    /// hands it to its feed of those streams.
+    pushed: Arc<PushedRecords>,
+}
+
+/// Where the load records on the workers' event streams go: the replica's
+/// load monitor while this replica leads, and nowhere while it leads none.
+///
+/// The streams stand on every replica, for the cache events they carry,
+/// and the worker crate's monitor takes a pushed record whether it runs or
+/// not. So the replica's word is kept here. A record that comes while the
+/// monitor runs is handed on, and the monitor takes it as a poll: a worker
+/// whose records are fresh is polled no more. A record that comes while it
+/// is stopped is dropped: a standby files no report, writes no verdict and
+/// starts no task of the monitor's for it.
+///
+/// A stream's task hands a record on under a shared hold of the word.
+/// [`LoadMonitor::run`] turns the word under the exclusive hold: it sets
+/// it behind the monitor's start and clears it ahead of the monitor's
+/// stop, so no record lands behind a stop. Nothing else takes either
+/// hold, and no decision does.
+pub(crate) struct PushedRecords {
+    monitor: Arc<WorkerMonitor<Members>>,
+    /// Whether the monitor runs.
+    runs: RwLock<bool>,
+}
+
+impl PushedLoadSink for PushedRecords {
+    fn push_load(
+        self: Arc<Self>,
+        worker: &Arc<dyn Worker>,
+        dp_rank: i32,
+        record: &EngineLoad,
+        received_at: Instant,
+    ) {
+        let runs = self.runs.read();
+        if *runs {
+            self.monitor
+                .apply_pushed_load(worker, dp_rank, record, received_at);
+        }
+    }
 }
 
 impl LoadMonitor {
@@ -41,10 +91,22 @@ impl LoadMonitor {
     /// it.
     pub(crate) fn new(workers: &WorkerObjects, every: Duration) -> Self {
         let holder = workers.holder();
+        let monitor = load_monitor(&holder, every);
         Self {
-            monitor: load_monitor(&holder, every),
+            pushed: Arc::new(PushedRecords {
+                monitor: Arc::clone(&monitor),
+                runs: RwLock::new(false),
+            }),
+            monitor,
             registry: Arc::clone(holder.registry()),
         }
+    }
+
+    /// The sink of the load records that ride the workers' event streams,
+    /// for the serve's feed of those streams: one for the replica's life,
+    /// as the monitor is.
+    pub(crate) fn pushed(&self) -> &Arc<PushedRecords> {
+        &self.pushed
     }
 
     /// The monitor's channel, for the reader of its snapshots: one channel
@@ -75,14 +137,18 @@ impl LoadMonitor {
     /// reads the monitor's verdicts off them under every policy.
     ///
     /// At the word's first term the task starts the monitor
-    /// ([`WorkerMonitor::start_event_loop`]). At the word that nobody leads
-    /// here it stops the monitor and waits for the stop's end
-    /// ([`WorkerMonitor::stop`]). Every task of the monitor that stands has
-    /// ended then, a poll in flight with its task. The snapshot is published
-    /// empty and every overload verdict is off the objects. So a replica
-    /// that does not lead dials no engine for its load, and the next lead's
-    /// start comes behind the last poll. This task alone starts and stops
-    /// the monitor, each in its turn.
+    /// ([`WorkerMonitor::start_event_loop`]) and then lets the streams'
+    /// load records in ([`PushedRecords`]). At the word that nobody leads
+    /// here it shuts them out, then stops the monitor and waits for the
+    /// stop's end ([`WorkerMonitor::stop`]). Every task of the monitor
+    /// that stands has ended then, a poll in flight with its task. The
+    /// snapshot is published empty and every overload verdict is off the
+    /// objects. The monitor keeps nothing that a stream's records filed,
+    /// no rank of a report and no publish that waited for its window: the
+    /// next lead starts each worker from no report. So a replica that does
+    /// not lead dials no engine for its load, and the next lead's start
+    /// comes behind the last poll. This task alone starts and stops the
+    /// monitor, each in its turn.
     ///
     /// One loop is not awaited: that of a group which a registration, a
     /// removal or a change of its interval ended just ahead of the stop. A
@@ -121,6 +187,7 @@ impl LoadMonitor {
                 break;
             }
             self.monitor.start_event_loop();
+            *self.pushed.runs.write() = true;
             // `None` at the stop, else whether the word still has its
             // teller.
             let told = tokio::select! {
@@ -128,6 +195,9 @@ impl LoadMonitor {
                 () = &mut stopped => None,
                 told = led.wait_for(Option::is_none) => Some(told.is_ok()),
             };
+            // Ahead of the stop: a record that came behind it would file a
+            // report and start a task the stop no longer ends.
+            *self.pushed.runs.write() = false;
             self.monitor.stop().await;
             match told {
                 None => return,
@@ -165,6 +235,7 @@ mod tests {
 
     const A: &str = "grpc://a:9000";
     const B: &str = "grpc://b:9000";
+    const C: &str = "grpc://c:9000";
 
     /// How often the replica's monitor polls a worker.
     const EVERY: Duration = Duration::from_secs(2);
@@ -178,6 +249,35 @@ mod tests {
         waiting: AtomicI32,
         /// How long a poll's answer takes, in milliseconds.
         late: AtomicU64,
+        /// What a case does where a poll in flight is dropped unanswered,
+        /// as the monitor's stop drops it.
+        at_cut: parking_lot::Mutex<Option<AtCut>>,
+    }
+
+    /// A case's step for a poll that is dropped unanswered.
+    struct AtCut(Box<dyn Fn() + Send + Sync>);
+
+    impl std::fmt::Debug for AtCut {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("AtCut")
+        }
+    }
+
+    /// A poll in flight: dropped unanswered, it runs the engine's step.
+    struct InFlight<'a> {
+        engine: &'a Engine,
+        answered: bool,
+    }
+
+    impl Drop for InFlight<'_> {
+        fn drop(&mut self) {
+            if self.answered {
+                return;
+            }
+            if let Some(step) = self.engine.at_cut.lock().as_ref() {
+                (step.0)();
+            }
+        }
     }
 
     fn not_scripted<T>() -> Result<T, tonic::Status> {
@@ -202,7 +302,12 @@ mod tests {
 
         async fn get_loads(&self) -> Result<WorkerLoadResponse, tonic::Status> {
             self.polls.fetch_add(1, SeqCst);
+            let mut poll = InFlight {
+                engine: self,
+                answered: false,
+            };
             time::sleep(Duration::from_millis(self.late.load(SeqCst))).await;
+            poll.answered = true;
             Ok(WorkerLoadResponse {
                 dp_rank_count: 1,
                 loads: vec![SchedulerLoadSnapshot {
@@ -306,6 +411,8 @@ mod tests {
         loads: LoadReceiver,
         /// The reader of the monitor's counts, taken as the channel is.
         counts: Box<dyn Fn() -> LoadTotals>,
+        /// The sink of the streams' load records, taken as the channel is.
+        pushed: Arc<PushedRecords>,
         role: watch::Sender<Option<u64>>,
         stop: watch::Sender<bool>,
         task: JoinSet<()>,
@@ -325,6 +432,7 @@ mod tests {
             let monitor = LoadMonitor::new(&workers, EVERY);
             let loads = monitor.loads();
             let counts = Box::new(monitor.counts());
+            let pushed = Arc::clone(monitor.pushed());
             let (role, led) = watch::channel(None);
             let (stop, stopped) = watch::channel(false);
             let mut task = JoinSet::new();
@@ -335,6 +443,7 @@ mod tests {
                 engine,
                 loads,
                 counts,
+                pushed,
                 role,
                 stop,
                 task,
@@ -365,11 +474,50 @@ mod tests {
                 .map(WorkerLoadResponse::total_waiting_reqs)
         }
 
+        /// The ranks the monitor's snapshot states for the worker at `url`,
+        /// as its report lists them: none where it holds no report.
+        fn ranks(&self, url: &str) -> Vec<i32> {
+            let snapshot = self.loads.borrow();
+            let ranks = snapshot.get(url).map(|report| &report.loads);
+            ranks
+                .into_iter()
+                .flatten()
+                .map(|rank| rank.dp_rank)
+                .collect()
+        }
+
         /// Whether an overload verdict stands on the object at `url`.
         fn overloaded(&self, url: &str) -> bool {
             let registry = self.workers.objects().registry();
             let object = registry.get_by_url(url).expect("the row's object");
             object.is_overloaded()
+        }
+
+        /// Hands the sink a load record of the worker at `url`, as the task
+        /// of the worker's event stream does: `waiting` requests queue.
+        fn push(&self, url: &str, waiting: u32) {
+            self.push_rank(url, 0, waiting);
+        }
+
+        /// The same record for `rank` of the worker's engine.
+        fn push_rank(&self, url: &str, rank: i32, waiting: u32) {
+            let registry = self.workers.objects().registry();
+            let object = registry.get_by_url(url).expect("the row's object");
+            let record = EngineLoad {
+                waiting_requests: waiting,
+                ..EngineLoad::default()
+            };
+            Arc::clone(&self.pushed).push_load(&object, rank, &record, Instant::now());
+        }
+
+        /// Whether the object at `url` is marked as a worker whose stream
+        /// pushes its load: the monitor marks it at the first record it
+        /// takes.
+        fn pushes(&self, url: &str) -> bool {
+            let registry = self.workers.objects().registry();
+            let object = registry.get_by_url(url).expect("the row's object");
+            let state = object.runtime_state();
+            state.is_some_and(|state| state.pushes_load_records())
         }
 
         /// Tells the stop: whether the monitor's task ended clean.
@@ -427,6 +575,203 @@ mod tests {
 
         time::sleep(EVERY * 3).await;
         assert_eq!(replica.polls(), 0, "a standby polled");
+        assert!(replica.stopped().await, "the task ends at the stop");
+    }
+
+    /// A load record that comes while the replica leads none is dropped: no
+    /// report of it is published, no verdict is written, and its worker is
+    /// not marked as one whose stream pushes. The monitor is handed
+    /// nothing, so it starts no task for the record.
+    #[tokio::test(start_paused = true)]
+    async fn a_standby_drops_a_pushed_load_record() {
+        let mut replica = Replica::new();
+        replica.register(facts(A));
+
+        // Nine wait: over the eight of the program's default.
+        replica.push(A, 9);
+        time::sleep(EVERY).await;
+        assert_eq!(replica.waiting(A), None, "a standby published a report");
+        assert!(!replica.overloaded(A), "a standby wrote a verdict");
+        assert!(!replica.pushes(A), "a standby marked the worker");
+        assert_eq!(replica.polls(), 0, "a standby polled");
+        assert!(replica.stopped().await, "the task ends at the stop");
+    }
+
+    /// A load record that comes while the replica leads reaches the monitor
+    /// as a poll does: its report is published and judged at once, and its
+    /// worker, whose records are fresh, is left to its stream at the next
+    /// tick.
+    #[tokio::test(start_paused = true)]
+    async fn a_leader_takes_a_pushed_load_record_as_a_poll() {
+        let mut replica = Replica::new();
+        replica.register(facts(A));
+        replica.role.send_replace(Some(1));
+        assert!(
+            comes(|| replica.waiting(A) == Some(0)).await,
+            "the take's poll"
+        );
+
+        // Nine wait: over the eight of the program's default. The engine
+        // still answers a poll with none.
+        replica.push(A, 9);
+        assert!(replica.overloaded(A), "the record is judged at once");
+        assert!(replica.pushes(A), "the monitor took the record");
+        assert!(
+            comes(|| replica.waiting(A) == Some(9)).await,
+            "the record's report is published"
+        );
+
+        let (polled, left) = (replica.polls(), (replica.counts)().polls.suppressed);
+        time::sleep(EVERY).await;
+        assert!(
+            comes(|| (replica.counts)().polls.suppressed == left + 1).await,
+            "the tick left the worker to its stream"
+        );
+        assert_eq!(
+            replica.polls(),
+            polled,
+            "a worker of fresh records was polled"
+        );
+        assert_eq!(replica.waiting(A), Some(9), "the record's report stands");
+        assert!(replica.stopped().await, "the task ends at the stop");
+    }
+
+    /// A load record that comes behind the lead's end lands behind no stop:
+    /// the sink drops it once the word is turned, at whichever turn of the
+    /// stopping task it comes, and a lead that ended keeps the streams shut
+    /// out.
+    #[tokio::test(start_paused = true)]
+    async fn a_pushed_load_record_lands_behind_no_stop() {
+        let mut replica = Replica::new();
+        replica.register(facts(A));
+        replica.role.send_replace(Some(1));
+        assert!(
+            comes(|| replica.waiting(A) == Some(0)).await,
+            "the take's poll"
+        );
+
+        // The word turns, and a record comes at every turn the stopping
+        // task yields: nine wait, over the eight of the program's default.
+        replica.role.send_replace(None);
+        for _ in 0..64 {
+            replica.push(A, 9);
+            tokio::task::yield_now().await;
+        }
+        time::sleep(EVERY).await;
+        assert_eq!(replica.waiting(A), None, "a record landed behind the stop");
+        assert!(!replica.overloaded(A), "a verdict stands behind the stop");
+        assert!(replica.stopped().await, "the task ends at the stop");
+    }
+
+    /// A load record that comes while the stop waits for the monitor's
+    /// tasks is dropped: the streams are shut out ahead of the stop. The
+    /// record comes where the stop drops a poll in flight. Handed on there,
+    /// it would start a publishing task that the stop no longer ends and
+    /// mark its worker as one whose stream pushes. The stop's eviction
+    /// takes such a record's report, and neither the task nor the mark.
+    #[tokio::test(start_paused = true)]
+    async fn a_load_record_inside_the_stop_is_dropped() {
+        let mut replica = Replica::new();
+        replica.register(facts(A));
+        replica.role.send_replace(Some(1));
+        assert!(
+            comes(|| replica.waiting(A) == Some(0)).await,
+            "the take's poll"
+        );
+
+        // The period's poll is answered late, and the lead ends while it
+        // is in flight: nine wait in the record that comes at its drop,
+        // over the eight of the program's default.
+        replica.engine.late.store(60_000, SeqCst);
+        let polled = replica.polls();
+        time::sleep(EVERY).await;
+        assert!(
+            comes(|| replica.polls() == polled + 1).await,
+            "the period's poll is in flight"
+        );
+        let pushed = Arc::clone(&replica.pushed);
+        let registry = replica.workers.objects().registry();
+        let object = registry.get_by_url(A).expect("the row's object");
+        *replica.engine.at_cut.lock() = Some(AtCut(Box::new(move || {
+            let record = EngineLoad {
+                waiting_requests: 9,
+                ..EngineLoad::default()
+            };
+            Arc::clone(&pushed).push_load(&object, 0, &record, Instant::now());
+        })));
+        replica.role.send_replace(None);
+        time::sleep(EVERY).await;
+        assert_eq!(replica.waiting(A), None, "a record landed inside the stop");
+        assert!(!replica.overloaded(A), "a verdict stands behind the stop");
+        assert!(
+            !replica.pushes(A),
+            "the monitor took a record inside the stop"
+        );
+        // The step holds the sink, and the engine holds the step.
+        replica.engine.at_cut.lock().take();
+        assert!(replica.stopped().await, "the task ends at the stop");
+    }
+
+    /// Nothing that a stream filed under one lead is published under a later
+    /// one. Under the first lead B's rank 1 pushed and was published, and
+    /// A's record came inside the lead's last publish window: it is still
+    /// queued where the lead ends. The monitor's stop evicts both files.
+    /// The next lead's first window, which B's rank 0 opens while no poll
+    /// has answered yet, publishes that record alone: no rank of B's from
+    /// the earlier lead, and no report of A. C never pushes: its poll goes
+    /// out at each take, whatever the monitor keeps of the other two.
+    #[tokio::test(start_paused = true)]
+    async fn a_report_filed_under_one_lead_is_published_under_no_later_one() {
+        let mut replica = Replica::new();
+        replica.register(facts(A));
+        replica.register(facts(B));
+        replica.register(facts(C));
+        replica.role.send_replace(Some(1));
+        assert!(
+            comes(|| replica.waiting(A) == Some(0) && replica.waiting(B) == Some(0)).await,
+            "the take's poll"
+        );
+
+        // Five wait on B's rank 1, and its window publishes them under the
+        // rank the record named.
+        replica.push_rank(B, 1, 5);
+        assert!(
+            comes(|| replica.waiting(B) == Some(5)).await,
+            "the window publishes B's rank 1"
+        );
+        assert_eq!(replica.ranks(B), vec![1], "the record's rank");
+        // A's record, and the lead ends inside its publish window.
+        replica.push(A, 9);
+        replica.role.send_replace(None);
+        assert!(
+            comes(|| replica.waiting(A).is_none() && replica.waiting(B).is_none()).await,
+            "the lead's end empties the snapshot"
+        );
+
+        // The next lead's polls are answered late, so none lays over a
+        // report, and B's rank 0 opens that lead's first publish window.
+        replica.engine.late.store(60_000, SeqCst);
+        let polled = replica.polls();
+        replica.role.send_replace(Some(2));
+        assert!(
+            comes(|| replica.polls() > polled).await,
+            "the take's poll is in flight"
+        );
+        replica.push(B, 1);
+        assert!(
+            comes(|| replica.waiting(B).is_some()).await,
+            "the window publishes B's record"
+        );
+        assert_eq!(
+            replica.waiting(B),
+            Some(1),
+            "a rank of the earlier lead is published"
+        );
+        assert_eq!(
+            replica.waiting(A),
+            None,
+            "a report of the earlier lead is published"
+        );
         assert!(replica.stopped().await, "the task ends at the stop");
     }
 

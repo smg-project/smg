@@ -35,15 +35,15 @@
 //! | `zone`, `encode`, `max_running`, `priority` | not carried: a decision's facts, read of the store's rows and never of an object |
 //! | `vision`, `demand_facts` | not carried to the object: a decision's facts, which the holder keeps beside the object and lends with each list (`Objects::lent`) |
 //! | `pairing` | not carried to the object: a decision's fact, read of the store's rows. The object derives its own at its build ([`pairing_descriptor`] reads it). [`facts()`] keeps the standing row's, and so does the controller's door, whose log carries none |
-//! | `overload` | not carried to the object, where the store judges overload: a decision's fact, read of the store's rows. Under a host whose own load monitor judges it ([`Objects::with_overload_thresholds`]), the object's thresholds: the row's own, each over the host's default for its signal, the usage as a ratio. [`facts()`] states the thresholds of the object's own registration over the standing row's. A replacement by id states them whole: one it leaves out is cleared ([`Over::Replaced`]) |
+//! | `overload` | not carried to the object, where the store judges overload: a decision's fact, read of the store's rows. Under a host whose own load monitor judges it ([`Objects::with_overload_thresholds`]), the object's thresholds: the row's own, each over the host's default for its signal, the usage as a ratio. A row of the external runtime takes no default. [`facts()`] states the thresholds of the object's own registration over the standing row's. A replacement by id states them whole: one it leaves out is cleared ([`Over::Replaced`]) |
 //!
 //! A new object starts at its row's status. A replacement takes the
 //! standing object's running state, including its status. A host that gets
 //! health from the rows can use [`Objects::with_status_followed`] to copy
 //! their status on tail changes and snapshots, for objects kept or laid
 //! again. The holder checks the row's revision under the object's
-//! mutation lock and hands the registry the status, as the health
-//! adapter does: the registry's subscribers hear the change, and a
+//! mutation lock and hands the registry the status: the registry's
+//! subscribers hear the change, and a
 //! promotion comes back as any promotion does. The host's vetoes stand.
 //! The id and the revision stand beside the object in the
 //! holder ([`RowRevision`]), with every fact of the row the object does not
@@ -60,8 +60,10 @@
 //!
 //! # The adapters
 //!
-//! [`HealthAdapter`] writes probe outcomes and connect signals to the store
-//! and sets the object's status to the status that stands there. The host
+//! [`HealthAdapter`] hands a probe's outcome to the registry's own health
+//! machine, which moves the object, and tells the store the status that
+//! stands on it. A connect signal is written the same way: the object's
+//! status leads its row's. The host
 //! supplies the [`Lead`] and the term the adapter writes under.
 //!
 //! [`load_monitor`] is the worker crate's own load monitor over the
@@ -129,7 +131,7 @@ pub use lead::{Lead, SoleLead};
 pub use loads::load_monitor;
 pub use members::Members;
 #[cfg(feature = "in-process")]
-pub use members::OpenAdmission;
+pub use members::{EncodeColumns, OpenAdmission};
 #[cfg(all(test, feature = "controller"))]
 pub(crate) use membership_writer::tests::{
     check_event_signal, check_expectations, check_guard, check_health_scope, check_maker,
@@ -142,7 +144,11 @@ pub(crate) use membership_writer::{
 pub use membership_writer::{
     MembershipWriteOutcome, MembershipWriteRefused, MembershipWriter, Over, Precondition, Remover,
 };
+#[cfg(feature = "controller")]
+pub(crate) use object::dial_address;
 pub use object::object;
+#[cfg(all(test, feature = "controller"))]
+pub(crate) use objects::stand;
 pub use objects::{Objects, RowRevision};
 pub use steps::{
     registrant_of, registration_into_store, registration_into_store_keeping_credentials,

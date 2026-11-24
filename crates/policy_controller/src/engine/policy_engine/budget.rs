@@ -356,6 +356,7 @@ mod tests {
         let lists = EncodeLists {
             pair,
             encoders: members[2].lent(),
+            encoders_places: None,
             encoders_stalled: &[],
             encoders_held: &[],
             facts: &hands,

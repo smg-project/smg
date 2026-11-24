@@ -13,7 +13,7 @@
 //! | trait | who calls | how often |
 //! |---|---|---|
 //! | [`WorkersStore`] | discovery and the registration handshake, the control scope's register, patch and deregister calls | per membership change; a rollout of 512 workers is under one change per second |
-//! | [`HealthSink`] | the prober (one probe per worker per interval, 128 in flight), the connect signal, every gateway's vetoes and completed dispatches | per probe; two frames per request |
+//! | [`HealthSink`] | the prober (one probe per worker per interval, 128 in flight), the connect signal, every gateway's vetoes | per probe; per veto a gateway sets or lifts |
 //! | [`LoadSink`] | the subscription task per record, the poll per engine per tick, the scrape per interval, a relay per frame | up to ten records per rank per second busy, one per second idle |
 //! | [`KvEventSink`] | the subscription task per batch, a relay per frame | one batch per scheduler step that moved blocks |
 //! | [`ReservationStore`] | a commit (a prefill slot, a decode room), a lease's end | two per pair dispatch |
@@ -57,10 +57,10 @@
 //!
 //! A decision reads none of the tables behind those traits. The store
 //! derives a [`StoreSnapshot`] from them (every pool as whole candidate rows)
-//! and publishes it by pointer swap: `snapshot` holds the read side and the
-//! build of one decision's view. Every world is published under the generation
-//! the store holds, which [`MemoryStore::apply`] alone replaces: a decision
-//! reads its rows and its engine in one load.
+//! and publishes it by pointer swap: `snapshot` holds the read side. Every
+//! world is published under the generation the store holds, which
+//! [`MemoryStore::apply`] alone replaces: a decision reads the world and its
+//! engine in one load.
 //!
 //! [`LoadRow`]: crate::engine::view::LoadRow
 
@@ -86,8 +86,8 @@ mod tests;
 pub use encoding::{hands_to, EncodeClasses, EncodeHandoff, EncodeMember, EncodeOffer};
 pub use health::{HealthSink, HealthWrite, VetoWrite};
 pub use index::{
-    AffinityRowsBuffers, ApplyError, ChainBlockMap, ContentHash, KvEvent, LaneCounts, LaneWriter,
-    SequenceHash, StoredBlock, WorkerGroups, INDEX_WORKERS,
+    ApplyError, ChainBlockMap, ContentHash, KvEvent, LaneCounts, LaneWriter, SequenceHash,
+    StoredBlock, WorkerGroups, INDEX_WORKERS,
 };
 pub use journal::{Journal, Position};
 pub use kv_events::{
@@ -103,10 +103,7 @@ pub(crate) use memory::DecodeIssue;
 pub use memory::{AtWork, Hand, LookOutcome, MemoryStore, StoreCheckpoint, StoreStats};
 pub use reservations::{ReservationKind, ReservationStore};
 pub use signals::{SignalSink, SignalWriteOutcome};
-pub use snapshot::{
-    AffinityQuery, EncodePairBuffers, OutsideLists, PairBuffers, PoolView, StaleGeneration,
-    StoreSnapshot, ViewBuffers, ViewFacts, ViewQuery, PUBLISH_WINDOW,
-};
+pub use snapshot::{OutsideLists, StaleGeneration, StoreSnapshot, PUBLISH_WINDOW};
 pub use workers::{
     identity, identity_of, token, HealthPolicy, MembershipChange, MembershipTail, Overload,
     ProviderKey, ProviderKeyError, Reachability, Registrant, Signals, WorkerFacts, WorkerPatch,

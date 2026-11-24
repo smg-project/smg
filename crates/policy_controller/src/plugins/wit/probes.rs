@@ -91,9 +91,6 @@ wit! {
     // Host-only: a guest reads a candidate's requests in flight as the
     // candidate's own field, whichever feed its host read them from.
     Option<&crate::tracking::PoolInFlightCounts<'_>> => "host-only",
-    // Host-only: a guest reads a candidate's count of the request's session
-    // key as the candidate's own field, written there or lent beside it.
-    Option<&[crate::engine::KeyedRow]> => "host-only",
     // Host-only: the signal cells stand beside the rows of the host that
     // decides, and no contract carries them yet.
     Option<&crate::load::SignalCells> => "host-only",
@@ -219,13 +216,14 @@ pub(crate) fn all() -> Vec<Probe> {
             model, namespace_seed, tenant, priority, streaming, max_output_tokens,
             prompt_tokens, block_hashes, hash_kind, session_key, phase, attempt, tried,
             budget_micros, headers, media, seed, block_size, prompt_chars, prompt_bytes, now_micros,
-            pinned_at,
-            lent_in_flight, lent_session_in_flight, session_counted, affinity, named,
+            lent_in_flight, session_counted, affinity, named,
             model_fingerprint, signal_cells, client_key, ring, ring_positions,
+            session_key_from_rid,
         } host [
-            prompt_chars, prompt_bytes, now_micros, pinned_at, lent_in_flight, lent_session_in_flight,
+            prompt_chars, prompt_bytes, now_micros, lent_in_flight,
             session_counted,
-            affinity, named, model_fingerprint, signal_cells, client_key, ring, ring_positions
+            affinity, named, model_fingerprint, signal_cells, client_key, ring, ring_positions,
+            session_key_from_rid
         ],
         &request),
         probe!("zone-capacity", before [], ZoneCapacity { zone, healthy, total } host [], &zone),

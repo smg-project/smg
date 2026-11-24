@@ -138,14 +138,16 @@ use smg_policy_controller::{
         controller::{State, PROTOCOL_VERSION},
         proto::{
             self, busy, completed::Class, decision::Outcome, gateway_frame, identity::Form,
-            principal, released, worker_event, Completed, DecideRequest, Decision, Dispatched,
-            Hello, Identity, Lease, OverloadThresholds, Released, RequestFacts, ShedReason, Side,
+            principal, released, worker_event, DecideRequest, Decision, Dispatched, Hello,
+            Identity, Lease, OverloadThresholds, Released, RequestFacts, ShedReason, Side,
             WatchWorkersRequest,
         },
         watcher::{WatchStream, WatchStreamEnd, Watcher},
     },
     store::{LaneCounts, MemoryStore, WorkerFacts, WorkerStatus, WorkersStore},
+    worker_host::{Members, Objects},
 };
+use smg_worker::{registry::WorkerRegistry, worker::WorkerStatus as ObjectStatus};
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::{oneshot, Barrier, Notify},
@@ -157,10 +159,6 @@ use tonic::{transport::Endpoint, Code};
 /// a controller's decision yet: the two-draw preset's resident form holds
 /// one.
 const READS_KEPT_LOADS: bool = false;
-
-/// A controller decides no prefill whose plan pairs no side, no decode frame
-/// that names no lease and no encode request yet.
-const DECIDES_PHASES: bool = false;
 
 /// A new document's engine starts with no session pin yet: a pinned key is
 /// placed anew at its first request behind an apply.
@@ -1852,66 +1850,64 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
         // rule no booking reaches, eight asks of one size name one row
         // whatever their seeds, and a size from each third of the span
         // names a row of its own.
-        if DECIDES_PHASES {
-            within("the prefill pool's rows read healthy", ROOM, || {
-                harness
-                    .pool(SIZED, Role::Prefill)
-                    .is_ok_and(|pool| pool.len() == 3 && pool.iter().all(|row| row.healthy))
-            })
-            .await
-            .expect("the prefill pool turns ready");
+        within("the prefill pool's rows read healthy", ROOM, || {
             harness
-                .apply_document(by_size().expect("a form of this build's preset"))
-                .expect("a form of this build's preset applies");
-            let third = bucket::SPAN / 3;
-            let mut owners = Vec::new();
-            for part in 0u32..3 {
-                let tokens = part * third + third / 2;
-                let first = u64::from(part) * 8;
-                let owner = picked(&mut harness, sized(nth("sized", first), tokens))
+                .pool(SIZED, Role::Prefill)
+                .is_ok_and(|pool| pool.len() == 3 && pool.iter().all(|row| row.healthy))
+        })
+        .await
+        .expect("the prefill pool turns ready");
+        harness
+            .apply_document(by_size().expect("a form of this build's preset"))
+            .expect("a form of this build's preset applies");
+        let third = bucket::SPAN / 3;
+        let mut owners = Vec::new();
+        for part in 0u32..3 {
+            let tokens = part * third + third / 2;
+            let first = u64::from(part) * 8;
+            let owner = picked(&mut harness, sized(nth("sized", first), tokens))
+                .await
+                .expect("a pick answers an ask over a ready fleet");
+            for n in 1..8 {
+                let again = picked(&mut harness, sized(nth("sized", first + n), tokens))
                     .await
                     .expect("a pick answers an ask over a ready fleet");
-                for n in 1..8 {
-                    let again = picked(&mut harness, sized(nth("sized", first + n), tokens))
-                        .await
-                        .expect("a pick answers an ask over a ready fleet");
-                    assert_eq!(again, owner, "requests of like size meet on one engine");
-                }
-                owners.push(owner);
+                assert_eq!(again, owner, "requests of like size meet on one engine");
             }
-            let apart: HashSet<Picked> = owners.iter().copied().collect();
-            assert!(
+            owners.push(owner);
+        }
+        let apart: HashSet<Picked> = owners.iter().copied().collect();
+        assert!(
             apart.len() == 3 && owners.iter().all(|row| engines[7..].contains(&row.engine)),
             "a size from each third of the span has an engine of the pool to itself: {owners:?}"
         );
 
-            // The balance rule spills on what the decisions booked. Under the
-            // preset as the catalog spells it an idle pool places a size on
-            // its owner, and the tokens of that decision are booked on the
-            // engine: the next two asks of the same size go to the two engines
-            // that booked nothing.
-            harness
-                .apply("bucket")
-                .expect("a preset of this build applies");
-            let mut round = Vec::new();
-            for n in 0..3 {
-                let pick = picked(&mut harness, sized(nth("spill", n), third / 2))
-                    .await
-                    .expect("a pick answers an ask over a ready fleet");
-                round.push(pick);
-            }
-            assert_eq!(
-                round.first(),
-                owners.first(),
-                "an idle pool places a size on its owner"
-            );
-            let spilled: HashSet<Picked> = round.iter().copied().collect();
-            assert_eq!(
-                spilled.len(),
-                3,
-                "an engine a decision booked gives way to one that booked nothing: {round:?}"
-            );
+        // The balance rule spills on what the decisions booked. Under the
+        // preset as the catalog spells it an idle pool places a size on
+        // its owner, and the tokens of that decision are booked on the
+        // engine: the next two asks of the same size go to the two engines
+        // that booked nothing.
+        harness
+            .apply("bucket")
+            .expect("a preset of this build applies");
+        let mut round = Vec::new();
+        for n in 0..3 {
+            let pick = picked(&mut harness, sized(nth("spill", n), third / 2))
+                .await
+                .expect("a pick answers an ask over a ready fleet");
+            round.push(pick);
         }
+        assert_eq!(
+            round.first(),
+            owners.first(),
+            "an idle pool places a size on its owner"
+        );
+        let spilled: HashSet<Picked> = round.iter().copied().collect();
+        assert_eq!(
+            spilled.len(),
+            3,
+            "an engine a decision booked gives way to one that booked nothing: {round:?}"
+        );
 
         // The death. The kill waits for a pool that reads its engine
         // healthy, so the death alone moves its rows. Its promise is held
@@ -2125,20 +2121,12 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
         );
 
         // The reports. A gateway that decides by itself tells the controller
-        // each request's life on its session, and the store holds what a
-        // decision's precedence rule reads of it: one gateway's own
-        // completions of class ok, a worker at a time.
+        // each request's life on its session. No leader issued such a
+        // request's lease, so its reports name no lease on file and write
+        // nothing: each holds the class its transport read.
         let live = engines[0];
-        let asked = Instant::now();
         let class = harness.send(live).await.expect("a live engine is sent");
         assert_eq!(class, Class::Ok, "a live engine answers to the end");
-        within(
-            "the live engine's row holds this gateway's completion",
-            PROBE_INTERVAL + ROOM,
-            || harness.completed_ok(GATEWAY, live, asked),
-        )
-        .await
-        .expect("the completion is read");
         let class = harness.send(dead).await.expect("a dead engine is sent");
         assert_eq!(class, Class::ConnectFailed, "a dead engine connects none");
         let class = tokio::time::timeout(ROOM, harness.send(hung))
@@ -2147,7 +2135,9 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             .expect("a hung engine is sent");
         assert_eq!(class, Class::Timeout, "a hung engine answers nothing");
         // A lease no leader issued is given up: not on file, no error, and
-        // the session outlives it: the next request's reports are applied.
+        // the session outlives it. One session's frames are applied in
+        // their order: a lease the controller files next, given up on the
+        // same session, leaves the file behind every report before it.
         harness
             .client()
             .released(Released {
@@ -2157,34 +2147,9 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             })
             .await
             .expect("a release is reported");
-        let again = Instant::now();
-        let class = harness.send(live).await.expect("a live engine is sent");
-        assert_eq!(class, Class::Ok, "a live engine answers a second time");
-        within(
-            "the session outlives a release of a lease not on file",
-            PROBE_INTERVAL + ROOM,
-            || harness.completed_ok(GATEWAY, live, again),
-        )
-        .await
-        .expect("the second completion is read");
-        // One session's frames are applied in their order, so the dead and
-        // the hung engine's reports were read by now: neither wrote a
-        // completion of class ok for this gateway. A completion of another
-        // class writes nothing, so these hold the class each frame carries
-        // and nothing more.
-        assert!(
-            !harness.completed_ok(GATEWAY, dead, asked),
-            "a dead engine's row holds no completion of class ok"
-        );
-        assert!(
-            !harness.completed_ok(GATEWAY, hung, asked),
-            "a hung engine's row holds no completion of class ok"
-        );
-        // One gateway's completions are its own.
-        assert!(
-            !harness.completed_ok("another-gateway", live, asked),
-            "another gateway reads none of this gateway's completions"
-        );
+        picked(&mut harness, nth("reports", 0))
+            .await
+            .expect("the session outlives a release of a lease not on file");
         // A frame that reads wrong ends the session of the gateway that sent
         // it, by its field's name: a second gateway gives up neither a
         // lease nor a ticket.
@@ -2221,42 +2186,42 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             matches!(&told, client::Error::Status(status) if status.code() == Code::InvalidArgument),
             "a report into the ended session tells the status it ended with: {told:?}"
         );
-        // The first gateway's session stands: its next reports are applied.
-        let last = Instant::now();
-        let class = harness.send(live).await.expect("a live engine is sent");
-        assert_eq!(class, Class::Ok, "a live engine answers a third time");
-        within(
-            "the first gateway's session stands",
-            PROBE_INTERVAL + ROOM,
-            || harness.completed_ok(GATEWAY, live, last),
-        )
-        .await
-        .expect("the third completion is read");
+        // The first gateway's session stands: its next frames are applied.
+        picked(&mut harness, nth("reports", 1))
+            .await
+            .expect("the first gateway's session stands");
 
         // The blocking form's report leaves with no call after it: its
         // runtime drives the connection between calls. The client is held,
-        // and asked nothing more, until the store has read its completion:
-        // its drop would not wait for a report still queued.
-        let served = harness.worker(live).expect("the live engine's row").0;
+        // and asked nothing more, until the store has read its report: its
+        // drop would not wait for a report still queued. The report names
+        // the dispatch of a lease the controller filed for that client, so
+        // the file shows that it was read.
         let address = format!("http://{}", harness.gateway());
-        let reported = Instant::now();
         let (hold, held) = mpsc::channel::<()>();
         let (told, reporting) = oneshot::channel();
         std::thread::spawn(move || {
             let report =
                 blocking::Client::connect(&address, "blocking-gateway").and_then(|mut client| {
-                    client.completed(Completed {
-                        lease_id: 1,
-                        side: Side::Single.into(),
-                        served,
-                        class: Class::Ok.into(),
-                        ..Completed::default()
-                    })?;
-                    Ok(client)
+                    let lease = match client.decide(ask(b"blocking-report"))? {
+                        Answer::Decision(Decision { leases, .. }) => {
+                            leases.first().map(|lease| lease.id)
+                        }
+                        Answer::Busy(_) => None,
+                    };
+                    if let Some(lease_id) = lease {
+                        client.dispatched(Dispatched {
+                            lease_id,
+                            target_index: 0,
+                            side: Side::Single.into(),
+                            since_decision_micros: 0,
+                        })?;
+                    }
+                    Ok((client, lease))
                 });
             match report {
-                Ok(client) => {
-                    let _ = told.send(Ok(()));
+                Ok((client, lease)) => {
+                    let _ = told.send(Ok(lease));
                     let _ = held.recv();
                     drop(client);
                 }
@@ -2265,18 +2230,19 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
                 }
             }
         });
-        tokio::time::timeout(ROOM, reporting)
+        let lease = tokio::time::timeout(ROOM, reporting)
             .await
             .expect("the blocking client reports inside its bound")
             .expect("the client's thread sends its answer")
-            .expect("the blocking client's report");
+            .expect("the blocking client's report")
+            .expect("the controller files a lease for the blocking client");
         within(
             "the blocking form's report leaves with no call after it",
             PROBE_INTERVAL + ROOM,
-            || harness.completed_ok("blocking-gateway", live, reported),
+            || harness.dispatched("blocking-gateway", lease),
         )
         .await
-        .expect("the blocking gateway's completion is read");
+        .expect("the blocking gateway's dispatch is read");
         drop(hold);
 
         // The Numbers: one process holds the controller, the engines and
@@ -2853,7 +2819,7 @@ async fn a_link_refuses_a_frame_out_of_the_calls_ranges_and_stands() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_handle_over_a_link_ends_each_lease_on_the_worker_that_served() {
+async fn a_handle_over_a_link_ends_a_lease_its_alternate_served() {
     use smg_policy_controller::{
         engine::{PolicyEngine, Request, RequestFacts},
         tracking::{DecisionGuard, Outcome, Side, TransportClass},
@@ -2909,14 +2875,6 @@ async fn a_handle_over_a_link_ends_each_lease_on_the_worker_that_served() {
             leases_before_expiry(&harness, &link, GATEWAY, 0, started)
                 .await
                 .expect("the completion ends the lease");
-            within(
-                "the completion is written on the served worker",
-                ROOM,
-                || harness.completed_ok(GATEWAY, served, started),
-            )
-            .await
-            .expect("the controller records the named worker's completion");
-            assert!(!harness.completed_ok(GATEWAY, picked, started));
         }
         assert!(link.stands());
         drop(link);
@@ -2984,26 +2942,43 @@ async fn the_client_at_a_replica_that_does_not_lead_is_told_the_leader() {
         .expect("the case ends inside its outer bound");
 }
 
-/// What a watcher's store holds of its controller's workers, by id: each
-/// row's facts, status and revision.
-fn watched(watcher: &Watcher) -> Vec<(WorkerId, WorkerFacts, WorkerStatus, u64)> {
+/// A watcher of `store` over worker objects of its own. The holder follows
+/// no status of the store's tail: it lays each status the watch tells.
+fn watcher_of(store: Arc<MemoryStore>) -> Watcher<Members> {
+    let objects = Objects::new(Arc::new(WorkerRegistry::new()));
+    Watcher::new(store, Arc::new(objects))
+}
+
+/// What a watcher holds of its controller's workers, by id: each row's
+/// facts, status and revision. Each row has its worker object, built at the
+/// row's revision, and no other object stands.
+fn watched(watcher: &Watcher<Members>) -> Vec<(WorkerId, WorkerFacts, WorkerStatus, u64)> {
     let (_, mut rows) = WorkersStore::all_rows(&**watcher.store());
     rows.sort_by_key(|row| row.id.0);
+    let objects = watcher.objects();
+    assert_eq!(objects.len(), rows.len(), "one worker object a row");
+    let built = |id| Some(objects.standing(&objects.object(id)?)?.revision);
     rows.into_iter()
-        .map(|row| (row.id, row.facts, row.status, row.revision))
+        .map(|row| {
+            assert_eq!(built(row.id), Some(row.revision), "the row's object");
+            (row.id, row.facts, row.status, row.revision)
+        })
         .collect()
 }
 
-/// The status a watcher holds for a row, if it holds the row.
-fn status_of(watcher: &Watcher, id: WorkerId) -> Option<WorkerStatus> {
-    WorkersStore::get(&**watcher.store(), id).map(|row| row.status)
+/// The status of the worker object a watcher holds for a row, if it holds
+/// the row: what the watch told last, with nothing followed behind it.
+fn status_of(watcher: &Watcher<Members>, id: WorkerId) -> Option<ObjectStatus> {
+    let objects = watcher.objects();
+    let object = objects.registry().get(&objects.object(id)?)?;
+    Some(object.status())
 }
 
 /// Follows the stream until `stands` holds of its watcher, each event
 /// inside the room of a wait.
 async fn follows(
-    following: &mut WatchStream<'_>,
-    mut stands: impl FnMut(&Watcher) -> bool,
+    following: &mut WatchStream<'_, Members>,
+    mut stands: impl FnMut(&Watcher<Members>) -> bool,
 ) -> Result<(), String> {
     while !stands(following.watcher()) {
         let taken = tokio::time::timeout(ROOM, following.next())
@@ -3040,14 +3015,14 @@ async fn a_watcher_holds_the_fleets_rows_as_the_controller_tells_them() {
             .iter()
             .map(|engine| harness.worker(*engine).expect("the engine's row"))
             .collect();
-        let dead = |watcher: &Watcher, id: WorkerId| {
-            status_of(watcher, id).is_some_and(|status| status != WorkerStatus::Ready)
+        let dead = |watcher: &Watcher<Members>, id: WorkerId| {
+            status_of(watcher, id).is_some_and(|status| status != ObjectStatus::Ready)
         };
 
         // The snapshot tells the fleet as it registered. Where the stand-in
         // probes, no prober has started yet and every row is pending. A
         // controller that probes by itself may have readied a row already.
-        let mut watcher = Watcher::new(Arc::new(MemoryStore::new()));
+        let mut watcher = watcher_of(Arc::new(MemoryStore::new()));
         let opened = watcher.open(harness.client()).await;
         let mut stream = opened.expect("the watch opens");
         let told = follows(&mut stream, |held| held.at().is_some()).await;
@@ -3055,17 +3030,17 @@ async fn a_watcher_holds_the_fleets_rows_as_the_controller_tells_them() {
         for id in &ids {
             let status = status_of(stream.watcher(), *id);
             assert!(
-                status == Some(WorkerStatus::Pending)
-                    || (PRODUCT_PROBES && status == Some(WorkerStatus::Ready)),
+                status == Some(ObjectStatus::Pending)
+                    || (PRODUCT_PROBES && status == Some(ObjectStatus::Ready)),
                 "a row of the snapshot reads {status:?}"
             );
         }
 
         // The prober starts: the tail tells each engine it heard.
         harness.feed();
-        let ready = |watcher: &Watcher| {
+        let ready = |watcher: &Watcher<Members>| {
             ids.iter()
-                .all(|id| status_of(watcher, *id) == Some(WorkerStatus::Ready))
+                .all(|id| status_of(watcher, *id) == Some(ObjectStatus::Ready))
         };
         let told = follows(&mut stream, ready).await;
         told.expect("the fleet is told ready");
@@ -3074,7 +3049,8 @@ async fn a_watcher_holds_the_fleets_rows_as_the_controller_tells_them() {
         let late = harness.register(&FLEET[3..4]).await;
         let late = late.expect("one more engine registers")[0];
         let late = harness.worker(late).expect("the late engine's row");
-        let ready = |watcher: &Watcher| status_of(watcher, late) == Some(WorkerStatus::Ready);
+        let ready =
+            |watcher: &Watcher<Members>| status_of(watcher, late) == Some(ObjectStatus::Ready);
         let told = follows(&mut stream, ready).await;
         told.expect("the late engine is told ready");
 
@@ -3125,7 +3101,7 @@ async fn a_watcher_holds_the_fleets_rows_as_the_controller_tells_them() {
             })
             .expect("filed");
         assert_eq!(leases.live(gateway), 1);
-        let mut fresh = Watcher::new(Arc::clone(&store));
+        let mut fresh = watcher_of(Arc::clone(&store));
         let opened = fresh.open(harness.client()).await;
         let mut snapshot = opened.expect("a second watch opens");
         let told = follows(&mut snapshot, |held| held.at().is_some()).await;
@@ -3158,7 +3134,7 @@ async fn a_link_answers_beside_its_watch_and_the_watch_outlives_it() {
             .await
             .expect("a ready fleet");
         let first = harness.worker(0).expect("the first worker's row");
-        let mut watcher = Watcher::new(Arc::new(MemoryStore::new()));
+        let mut watcher = watcher_of(Arc::new(MemoryStore::new()));
         let mut stream = watcher
             .open_on(&link)
             .await
@@ -3169,7 +3145,7 @@ async fn a_link_answers_beside_its_watch_and_the_watch_outlives_it() {
         assert_eq!(watched(stream.watcher()).len(), 1);
         assert_eq!(
             status_of(stream.watcher(), first),
-            Some(WorkerStatus::Ready)
+            Some(ObjectStatus::Ready)
         );
 
         let tail = follows(&mut stream, |held| watched(held).len() == 2);
@@ -3198,7 +3174,7 @@ async fn a_link_answers_beside_its_watch_and_the_watch_outlives_it() {
 
         harness.kill(0).await.expect("the first worker dies");
         follows(&mut stream, |held| {
-            status_of(held, first).is_some_and(|status| status != WorkerStatus::Ready)
+            status_of(held, first).is_some_and(|status| status != ObjectStatus::Ready)
         })
         .await
         .expect("the watch takes the status after the link ends");
@@ -3238,7 +3214,7 @@ async fn a_watch_ends_when_its_controller_goes_silent() {
         let address = format!("http://{relay}");
         let connected = Client::connect(&address, "silent-gateway").await;
         let mut client = connected.expect("the client connects through the relay");
-        let mut watcher = Watcher::new(Arc::new(MemoryStore::new()));
+        let mut watcher = watcher_of(Arc::new(MemoryStore::new()));
         let opened = watcher.open(&mut client).await;
         let mut stream = opened.expect("the watch opens");
         let first = tokio::time::timeout(ROOM, stream.next()).await;

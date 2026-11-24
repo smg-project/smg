@@ -77,7 +77,9 @@ pub(crate) struct SentSettings {
 /// the sends of a profile that decides no request.
 ///
 /// A new document's count takes over the rows' entries of the standing
-/// count that a profile of the same name made, and shares them with it
+/// count under the same two settings, or else of the one that a profile
+/// of its maker's name made, or else of one that no count of the new
+/// document took, and shares them with it
 /// ([`Engine::succeed`](crate::engine::Engine::succeed)). Each count reads them
 /// under its own time limit and its own report delay, and a send that one
 /// read releases has left the other count too: of two report delays, a
@@ -91,7 +93,7 @@ pub(crate) struct SentSettings {
 /// limit and the row's removal. Under a report delay the report that ends
 /// a send is one sampled that long after the send, or longer: a report
 /// sampled sooner behind it leaves it counted. When a send arrives with
-/// 8,192 already held on a row, the tally retires the oldest batch to
+/// 8,192 already held on a row, the tally lets the row's oldest go to
 /// bound the count. This threshold applies at any age.
 #[derive(Debug)]
 pub struct DispatchCredit {
@@ -110,8 +112,9 @@ pub struct DispatchCredit {
     /// the document that writes the same two reads this count.
     pub(crate) settings: SentSettings,
     /// The name of the profile that made the count, the first of its
-    /// readers: the count a later document's profile of this name makes
-    /// takes over this one's entries.
+    /// readers: a later document's count that finds no standing count
+    /// under its settings is matched by this name
+    /// ([`Engine::succeed`](crate::engine::Engine::succeed)).
     pub(crate) profile: String,
 }
 

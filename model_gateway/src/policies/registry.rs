@@ -13,7 +13,7 @@ use openai_protocol::UNKNOWN_MODEL_ID;
 use parking_lot::{Mutex, RwLock};
 use rustc_hash::FxBuildHasher;
 use smg_policy_controller::{
-    document::Needs,
+    document::{Needs, PolicySpec},
     engine::{Engine, Phase, PolicyEngine},
 };
 use smg_worker::{
@@ -36,8 +36,8 @@ use super::{
     hash_ring::HashRing,
     kept_rings::KeptRings,
     manual::{ExecutionBranch, PinState},
-    normalize_model_key, DPRankLoadPolicy, LoadBalancingPolicy, ManualConfig, ManualPolicy,
-    PolicyFactory, SelectWorkerInfo, WorkerRole,
+    normalize_model_key, DPRankLoadPolicy, LentTrees, LoadBalancingPolicy, ManualConfig,
+    ManualPolicy, PolicyFactory, SelectWorkerInfo, WorkerRole,
 };
 use crate::{
     config::types::{
@@ -299,6 +299,12 @@ pub struct PolicyRegistry {
     /// every request.
     engine: Arc<OnceLock<&'static PolicyEngine>>,
 
+    /// The token trees the policy engine is lent, where its start asked
+    /// for them ([`Self::lend_token_trees`]). A worker the registry lost is
+    /// taken out of them by their own task
+    /// ([`LentTrees::follow_removals`]).
+    lent_trees: Arc<OnceLock<Arc<LentTrees>>>,
+
     /// Shared sticky selector for the routing-key override. `Some` when the
     /// override is enabled; consulted (instead of the configured policy) for keyed
     /// requests via [`PolicyRegistry::select_worker_for_model`]. `None` in a
@@ -335,6 +341,9 @@ pub struct PolicyRegistry {
     routing_key_headers: Arc<Vec<HeaderName>>,
     /// How strictly PD placement pairs prefill and decode descriptors.
     pd_pairing_mode: PdPairingMode,
+    /// The policy engine decides under a document the gateway was supplied
+    /// ([`Self::runs_supplied_document`]).
+    supplied_document: bool,
     /// The hash rings kept between membership generations ([`KeptRings`]).
     rings: Arc<KeptRings>,
 }
@@ -461,16 +470,20 @@ impl PolicyRegistry {
     /// (`RouterConfig::policy_engine_decides`, [`Self::for_policy_engine`]),
     /// under the pairing mode in force
     /// (`RouterConfig::pd_pairing_in_force`): a supplied document's own
-    /// where the policy controller runs one, else the configuration's. The
-    /// one place that reads the option for the registry.
+    /// where the policy controller runs one, else the configuration's. It
+    /// knows whether the engine decides under a supplied document
+    /// (`Self::runs_supplied_document`). The one place that reads the
+    /// option for the registry.
     pub fn of_config(config: &RouterConfig) -> Self {
         let (policy, routing_key_override) =
             (config.policy.clone(), config.routing_key_override.clone());
-        let registry = if config.policy_engine_decides() {
+        let decides = config.policy_engine_decides();
+        let mut registry = if decides {
             Self::for_policy_engine(policy, routing_key_override)
         } else {
             Self::with_override(policy, routing_key_override)
         };
+        registry.supplied_document = decides && config.policy_spec.is_some();
         registry.with_pd_pairing_mode(config.pd_pairing_in_force())
     }
 
@@ -513,6 +526,7 @@ impl PolicyRegistry {
             mesh_tree_sync: Arc::new(RwLock::new(None)),
             dp_rank_policy: Arc::new(OnceLock::new()),
             engine: Arc::new(OnceLock::new()),
+            lent_trees: Arc::new(OnceLock::new()),
             routing_key_sticky,
             routing_key_override: routing_key_override.enabled,
             classic,
@@ -520,6 +534,7 @@ impl PolicyRegistry {
             side_names: Arc::default(),
             routing_key_headers: Arc::new(routing_key_headers),
             pd_pairing_mode: PdPairingMode::default(),
+            supplied_document: false,
             rings: Arc::new(KeptRings::default()),
         }
     }
@@ -887,6 +902,54 @@ impl PolicyRegistry {
             self.pair_text_needs.store(pairs.0, Ordering::Release);
         }
         self.refresh_text_needs();
+    }
+
+    /// Whether the policy engine decides under a document the gateway was
+    /// supplied, and not under the one its routing settings mean. The names
+    /// the settings give the policies ([`Self::policy_name`],
+    /// [`Self::side_policy_name`]) then name nothing that runs: a row of a
+    /// traced request's decision record reads none of them. False for a
+    /// registry made of settings alone, as a classic one is, and beside a
+    /// document's path whose document was not loaded: that configuration
+    /// runs the settings' document.
+    pub(crate) fn runs_supplied_document(&self) -> bool {
+        self.supplied_document
+    }
+
+    /// The token trees the policy engine is lent, made at the first call
+    /// under the numbers of `document`, the document the engine runs, whose
+    /// block size is `page` tokens ([`LentTrees::of_document`]), and kept
+    /// here. The engine's start calls it, and only where its document reads
+    /// the prefixes sent to each worker: with the engine on no classic
+    /// policy is made that would keep such trees.
+    ///
+    /// The trees are made with the task that takes a worker `workers` lost
+    /// out of them ([`LentTrees::follow_removals`]), on the runtime the
+    /// call is made on. The start runs on one, the engine's own task needs
+    /// it. Where none is entered no task is started, nothing takes a worker
+    /// out of the trees, and a debug line says so.
+    pub(crate) fn lend_token_trees(
+        &self,
+        document: &PolicySpec,
+        page: u32,
+        workers: &WorkerRegistry,
+    ) -> Arc<LentTrees> {
+        let made = || {
+            let trees = Arc::new(LentTrees::of_document(document.clone(), page));
+            match tokio::runtime::Handle::try_current() {
+                Ok(runtime) => trees.follow_removals(workers, &runtime),
+                Err(_) => debug!("No runtime is entered: no task takes a worker that leaves out of the lent token trees"),
+            }
+            trees
+        };
+        Arc::clone(self.lent_trees.get_or_init(made))
+    }
+
+    /// The token trees the policy engine is lent, where its start asked
+    /// for them: for a case that reads what the start made.
+    #[cfg(test)]
+    pub(crate) fn lent_trees(&self) -> Option<Arc<LentTrees>> {
+        self.lent_trees.get().cloned()
     }
 
     /// The name the settings give the main policy: what a classic selection
@@ -1673,6 +1736,8 @@ impl LoadConsumer for PolicyRegistry {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse};
     use smg_policy_controller::document::{AppliedSpec, Pairing, PolicySpec};
     use smg_worker::{
@@ -1891,6 +1956,49 @@ mod tests {
             PolicyRegistry::of_config(&settings).pd_pairing_mode(),
             PdPairingMode::Strict
         );
+    }
+
+    /// The registry of a gateway that was supplied a policy document knows
+    /// it ([`PolicyRegistry::runs_supplied_document`]), with the document's
+    /// path beside it or without. One made of the routing settings alone
+    /// does not, with the policy controller on or off. Neither does one
+    /// beside a document that the option leaves unread, nor one beside a
+    /// path whose document was not loaded: the document in force there is
+    /// the one the routing settings mean.
+    #[test]
+    fn a_registry_knows_whether_its_gateway_runs_a_supplied_document() {
+        let on = RouterConfig {
+            policy_controller: true,
+            ..RouterConfig::default()
+        };
+        let supplied = RouterConfig {
+            policy_spec: Some(PolicySpec::preset("round_robin").expect("a stock preset")),
+            ..on.clone()
+        };
+        let path = || Some("policy.yaml".to_owned());
+        let read_from_its_path = RouterConfig {
+            policy_spec_path: path(),
+            ..supplied.clone()
+        };
+        let not_loaded = RouterConfig {
+            policy_spec_path: path(),
+            ..on.clone()
+        };
+        assert_eq!(
+            not_loaded.policy_document_in_force(),
+            not_loaded.policy_document(),
+            "the settings' document"
+        );
+        let unread = RouterConfig {
+            policy_controller: false,
+            ..supplied.clone()
+        };
+        let knows =
+            |config: &RouterConfig| PolicyRegistry::of_config(config).runs_supplied_document();
+        assert_eq!([&supplied, &read_from_its_path].map(knows), [true, true]);
+        let settings_alone = [&on, &RouterConfig::default(), &unread, &not_loaded].map(knows);
+        assert_eq!(settings_alone, [false; 4]);
+        assert!(!PolicyRegistry::new(PolicyConfig::RoundRobin).runs_supplied_document());
     }
 
     /// The static needs the host answers before any request exists: a
@@ -3589,6 +3697,55 @@ mod tests {
         let urls: HashSet<String> = workers.iter().map(|w| w.url().to_string()).collect();
         registry.remove_workers_from_cache_aware("llama-3", &urls);
         assert!(tree_of(&policy, "llama-3").is_empty());
+    }
+
+    /// A registry made for the policy engine keeps the token trees the
+    /// engine is lent: none until the start asks, one owner however often
+    /// it asks, under the numbers of the document the start hands it. The
+    /// trees are made with their task: a worker the worker registry lost is
+    /// taken out of them, and the call that takes a worker out of a
+    /// cache-aware policy's trees finds no policy in such a registry.
+    #[tokio::test]
+    async fn a_worker_that_left_is_taken_out_of_the_lent_trees() {
+        let config = RouterConfig {
+            policy: cache_aware_config(),
+            ..RouterConfig::default()
+        };
+        let document = config.policy_document().expect("the settings' document");
+        let registry = PolicyRegistry::for_policy_engine(
+            config.policy.clone(),
+            RoutingKeyOverrideConfig::default(),
+        );
+        let workers = WorkerRegistry::new();
+        for url in ["http://w1:8000", "http://w2:8000"] {
+            workers.register(ready_worker(url, "llama-3"));
+        }
+        assert!(registry.lent_trees().is_none());
+        let trees = registry.lend_token_trees(&document, 8, &workers);
+        assert!(Arc::ptr_eq(
+            &trees,
+            &registry.lend_token_trees(&document, 8, &workers)
+        ));
+        let tokens: Vec<u32> = (0..64).collect();
+        let tree = trees.token_tree("llama-3");
+        assert_eq!(tree.page_size(), 8, "the block size the start handed");
+        tree.insert_tokens(&tokens, "http://w1:8000");
+        tree.insert_tokens(&tokens, "http://w2:8000");
+
+        workers
+            .remove_by_url("http://w1:8000")
+            .expect("the removal");
+        let bound = Instant::now() + Duration::from_secs(60);
+        while tree.get_tenant_token_counts().len() > 1 {
+            assert!(Instant::now() < bound, "the trees' task never purged");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let kept: Vec<String> = tree.get_tenant_token_counts().into_keys().collect();
+        assert_eq!(kept, ["http://w2:8000"]);
+        // The removal step makes its call with the engine on too.
+        let left = HashSet::from(["http://w1:8000".to_owned()]);
+        registry.remove_workers_from_cache_aware("llama-3", &left);
+        assert_eq!(registry.classic_made_or_asked(), 0);
     }
 
     #[test]

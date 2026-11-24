@@ -101,11 +101,20 @@ pub(super) fn open(kept: &mut Vec<u32>, rows: usize, cx: &Constraints<'_>) {
 #[cold]
 #[inline(never)]
 fn among(kept: &mut Vec<u32>, rows: usize, places: &[u32]) {
+    debug_assert_ascending(places);
+    kept.extend(places.iter().copied().filter(|&at| (at as usize) < rows));
+}
+
+/// A debug build refuses places that do not ascend, each once, as their
+/// host states them ([`Constraints::places`]): wherever a pass reads them
+/// by one walk beside a list that ascends, another order reads as a
+/// shorter list and says nothing.
+#[inline]
+pub(super) fn debug_assert_ascending(places: &[u32]) {
     debug_assert!(
         places.windows(2).all(|pair| pair[0] < pair[1]),
         "the places are ascending, each once"
     );
-    kept.extend(places.iter().copied().filter(|&at| (at as usize) < rows));
 }
 
 #[cfg(test)]

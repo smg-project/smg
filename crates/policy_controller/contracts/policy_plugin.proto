@@ -251,7 +251,7 @@ message Candidate {
   fixed64 labels = 21;
   // Encode-side compatibility for an encode-prefill-decode dispatch.
   bool ec_compatible = 22;
-  bool vision = 23;  // takes images
+  bool vision = 23;  // takes pixel media: an image or a video
   // Reachable from one gateway only (a host-local wire).
   bool host_local = 24;
   uint32 active_sessions = 25;  // u16; keys with a request in flight
@@ -480,8 +480,9 @@ message Trace {
   // The soft veto lifted to make this pick; none unless that veto left the
   // pool nobody, or left a session key handed on at its sessions rule's
   // in-flight cap nobody. The all-vetoed rule's pick sets it,
-  // and so does the pick of a session key kept on its worker. A host counts
-  // both from this field.
+  // and so does the pick of a session key kept on its worker, and a pair
+  // placed by a prefill profile that weighs load against affinity. A host
+  // counts them all from this field.
   LiftedVeto lifted = 13;
   // True when the decision was made ahead of every profile, where no binding
   // resolved one. In that case profile is 0.
@@ -579,7 +580,7 @@ message Completed {
   fixed64 served = 3;
   // The HTTP status or the gRPC code the request ended with.
   uint32 status = 4;  // u16
-  // The transport outcome the health precedence reads.
+  // The transport outcome of the request.
   enum Class {
     CLASS_UNSPECIFIED = 0;
     CLASS_OK = 1;

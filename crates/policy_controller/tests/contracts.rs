@@ -149,9 +149,7 @@ fn request_record() -> &'static [&'static str] {
             prompt_chars,
             prompt_bytes,
             now_micros,
-            pinned_at,
             lent_in_flight,
-            lent_session_in_flight,
             session_counted,
             affinity,
             named,
@@ -160,6 +158,7 @@ fn request_record() -> &'static [&'static str] {
             client_key,
             ring,
             ring_positions,
+            session_key_from_rid,
         }
     )
 }
@@ -191,6 +190,7 @@ fn constraints_record() -> &'static [&'static str] {
             wire_modes,
             overload_lifted,
             decode_later,
+            counted_on_decode,
             subset_hint,
             demands,
             stalled,
@@ -591,9 +591,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
                 "prompt_chars",
                 "prompt_bytes",
                 "now_micros",
-                "pinned_at",
                 "lent_in_flight",
-                "lent_session_in_flight",
                 "session_counted",
                 "affinity",
                 "named",
@@ -601,6 +599,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
                 "signal_cells",
                 "ring",
                 "ring_positions",
+                "session_key_from_rid",
             ],
             wire_only: &["prompt_text"],
             wire: &[
@@ -631,7 +630,14 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
         ProtoMirror {
             message: "Constraints",
             record: constraints_record(),
-            host_only: &["decode_later", "demands", "stalled", "held", "places"],
+            host_only: &[
+                "decode_later",
+                "counted_on_decode",
+                "demands",
+                "stalled",
+                "held",
+                "places",
+            ],
             wire_only: &[],
             wire: &[
                 ("excluded", Type::Fixed64),
@@ -845,9 +851,7 @@ fn wit_mirrors() -> Vec<WitMirror> {
                 "prompt_chars",
                 "prompt_bytes",
                 "now_micros",
-                "pinned_at",
                 "lent_in_flight",
-                "lent_session_in_flight",
                 "session_counted",
                 "affinity",
                 "named",
@@ -856,6 +860,7 @@ fn wit_mirrors() -> Vec<WitMirror> {
                 "client_key",
                 "ring",
                 "ring_positions",
+                "session_key_from_rid",
             ],
             before: &[],
             beside: &[],

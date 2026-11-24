@@ -650,7 +650,9 @@ fn the_doors_of_a_chosen_decode_side_step_its_sessions_count() {
 /// whatever session it carries. A pair that a decision issues: at its
 /// filing, at its decode side's dispatch on another target and at its
 /// end. A single's lease whose decision read no count: at its dispatch on
-/// another target. Each books and moves its worker's count alone.
+/// another target. Each books and moves its worker's count alone. One
+/// lease that counts for the key stands on each worker throughout, so a
+/// step under the key that no door owes reads as a count off one.
 #[cfg(feature = "controller")]
 #[test]
 fn a_lease_that_counts_for_no_key_steps_no_sessions_count() {
@@ -664,6 +666,12 @@ fn a_lease_that_counts_for_no_key_steps_no_sessions_count() {
     leases.set_term(1);
     let world = store.snapshot();
     let minted = "minted under the store's term";
+    for worker in workers {
+        let counted = of_session(booking(gateway, 0, worker, now), KEY);
+        let counted = store.issue_keyed(counted, world.booked_of(worker), |_| ());
+        counted.expect(minted);
+    }
+    assert_eq!(read(), [(1, 1), (1, 1), (1, 1)], "the leases that count");
 
     let (mut record, mut decode) = pair(0, p, &[d, e], now);
     record.lease.booked = p;
@@ -672,15 +680,15 @@ fn a_lease_that_counts_for_no_key_steps_no_sessions_count() {
     let slots = [world.booked_of(p), world.booked_of(d)];
     let lease = store.issue_decided_pair(record, decode, slots, |_| ());
     let lease = lease.expect(minted).id;
-    assert_eq!(read(), [(0, 1), (0, 1), (0, 0)], "a pair's filing");
+    assert_eq!(read(), [(1, 2), (1, 2), (1, 1)], "a pair's filing");
     assert!(leases.dispatched(gateway, lease, on(Side::Decode, 1), now));
     assert_eq!(
         read(),
-        [(0, 1), (0, 0), (0, 1)],
+        [(1, 2), (1, 1), (1, 2)],
         "its decode on another target"
     );
     assert!(leases.released(gateway, lease, None, ReleaseReason::ClientGone));
-    assert_eq!(read(), [(0, 0), (0, 0), (0, 0)], "its end");
+    assert_eq!(read(), [(1, 1), (1, 1), (1, 1)], "its end");
 
     let mut targets = Targets::new();
     for id in [p, d] {
@@ -693,15 +701,15 @@ fn a_lease_that_counts_for_no_key_steps_no_sessions_count() {
     single.picked = PickRecord::of(&targets);
     let lease = store.issue_decided(single, world.booked_of(p), |_| ());
     let lease = lease.expect(minted).id;
-    assert_eq!(read(), [(0, 1), (0, 0), (0, 0)], "a single's filing");
+    assert_eq!(read(), [(1, 2), (1, 1), (1, 1)], "a single's filing");
     assert!(leases.dispatched(gateway, lease, on(Side::Single, 1), now));
     assert_eq!(
         read(),
-        [(0, 0), (0, 1), (0, 0)],
+        [(1, 1), (1, 2), (1, 1)],
         "its dispatch on another target"
     );
     assert!(leases.completed(gateway, lease, &done(Side::Single)));
-    assert_eq!(read(), [(0, 0), (0, 0), (0, 0)], "its completion");
+    assert_eq!(read(), [(1, 1), (1, 1), (1, 1)], "its completion");
 }
 
 /// The gateways that file at once in a case, and the leases each files.

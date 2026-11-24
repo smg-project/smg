@@ -28,6 +28,7 @@ use crate::{
         list_cell::tests::PublishedList,
         pair_classes::PartnerClasses,
         policy_engine::pair::PairAdmission,
+        prompt_hashes::{HashSeeds, PromptHashes},
         records::worker_id,
         view::{
             Candidate, Constraints, FixedFacts, Identity, MediaCounts, PoolFacts, RequestFacts,
@@ -38,6 +39,8 @@ use crate::{
     store::GatewayId,
     tracking::lease::{EventSet, Lease, Side},
 };
+
+mod signals;
 
 /// A host's reads of its own admission, as two tests of a place: whether
 /// the prefill there has capacity, then whether the decode there has a room.
@@ -62,12 +65,19 @@ impl PairAdmission for Gates {
 /// `images` says the request states an image, and `video` a video.
 /// `excluded` are the workers
 /// the host says it just failed to reach. `places` are the places of the
-/// prefill list and of the decode list the host holds the request to.
+/// prefill list and of the decode list the host holds the request to, and
+/// `encoder_places` those of the encoder list.
 /// `vetoes` are the places of each of the two its standing vetoes mask, and
 /// those of them a hold stands on. `encoder_vetoes` are the same two of the
 /// encoder list. `own` is a mask the request states itself: its stalled
 /// places, and those a hold stands on. `tried` are the workers a retry says
 /// its failed attempts were sent to, and `seed` is the request's seed.
+///
+/// `prompt` is the request's prompt as its host hashed it, where a case
+/// states one.
+///
+/// `asked` takes the place of each encoder a decision asks its caller of,
+/// where a case counts those questions: that caller answers yes to each.
 struct Host {
     engine: PolicyEngine,
     lists: [PublishedList; 3],
@@ -78,11 +88,14 @@ struct Host {
     video: bool,
     excluded: Vec<WorkerId>,
     places: [Option<Vec<u32>>; 2],
+    encoder_places: Option<Vec<u32>>,
     vetoes: [[Vec<u32>; 2]; 2],
     encoder_vetoes: [Vec<u32>; 2],
     own: [Vec<u32>; 2],
     tried: Vec<WorkerId>,
     seed: u64,
+    prompt: Option<PromptHashes>,
+    asked: Option<Mutex<Vec<u32>>>,
 }
 
 /// Where the worker at `place` of a host's list `list` answers.
@@ -175,11 +188,14 @@ impl Host {
             video: false,
             excluded: Vec::new(),
             places: [None, None],
+            encoder_places: None,
             vetoes: Default::default(),
             encoder_vetoes: Default::default(),
             own: Default::default(),
             tried: Vec::new(),
             seed: 0,
+            prompt: None,
+            asked: None,
         }
     }
 
@@ -217,6 +233,7 @@ impl Host {
         EncodeLists {
             pair,
             encoders: encoders.lent(),
+            encoders_places: self.encoder_places.as_deref(),
             encoders_stalled: &self.encoder_vetoes[0],
             encoders_held: &self.encoder_vetoes[1],
             facts: said.0,
@@ -261,7 +278,7 @@ impl Host {
         placed: &mut EncodePlaced,
     ) -> (Decision, Option<usize>, Vec<usize>) {
         let lists = self.lists(said);
-        let facts = RequestFacts {
+        let mut facts = RequestFacts {
             model: "model-a",
             phase: Phase::Prefill,
             media: MediaCounts {
@@ -274,6 +291,9 @@ impl Host {
             seed: self.seed,
             ..RequestFacts::default()
         };
+        if let Some(prompt) = &self.prompt {
+            prompt.write_to(&mut facts);
+        }
         let constraints = Constraints {
             subset_hint: hint,
             excluded: &self.excluded,
@@ -292,7 +312,31 @@ impl Host {
         };
         let (engine, now) = (&self.engine, Instant::now());
         let loads = self.loads.as_ref();
-        let decision = lists.decide(engine, loads, now, &mut request, items, placed);
+        let decision = match &self.asked {
+            None => lists.decide(engine, loads, now, &mut request, items, placed),
+            // A case that counts the questions of the encoders answers them
+            // itself, through the entry that takes its caller's answers.
+            Some(asked) => {
+                let own = engine.loaded();
+                let noted = |place| {
+                    asked.lock().push(place);
+                    true
+                };
+                let sides = lists.asked(own);
+                lists.decide_over(
+                    own,
+                    sides,
+                    None,
+                    loads,
+                    now,
+                    &mut request,
+                    items,
+                    placed,
+                    |_| true,
+                    noted,
+                )
+            }
+        };
         assert_eq!(request.facts.now_micros, engine.clock().micros(now));
         let named = |list: usize, place: u32, id| {
             assert_eq!(worker_id(self.worker(list, place as usize).as_ref()), id);
@@ -370,6 +414,81 @@ fn the_three_lists_records_read_the_load_reports_their_host_hands() {
     assert_eq!(encoders, vec![0]);
 }
 
+/// A prompt of four whole blocks as its host hashes it under `engine`'s
+/// document, its tokens counted from `first`.
+fn prompt(engine: &PolicyEngine, first: u32) -> PromptHashes {
+    let tokens: Vec<u32> = (first..first + 64).collect();
+    let seeds = HashSeeds::PLAIN;
+    PromptHashes::under_document(&engine.spec(), Some(16), Some(&tokens), None, seeds)
+}
+
+/// Under `cache_aware` on the pair's two sides, a prompt sent to an encode
+/// request's pair goes to that pair again under any draw: each side reads
+/// its own list's column of who was sent the prompt, and its pick is
+/// written behind the decision, as a pair's first decision does. The lists
+/// are of two sizes, and the engine admits two of the four prefills: a
+/// column's entries stay beside the rows admitted. Prompts nobody was sent
+/// are placed by their draws, on more than one pair.
+#[test]
+fn a_prompt_sent_to_an_encode_requests_pair_goes_to_that_pair_again() {
+    use std::collections::BTreeSet;
+
+    let aware = "cache_aware";
+    let document = PolicySpec::epd_presets("power_of_two", aware, aware).expect("the presets");
+    let spec = AppliedSpec::validate(&document).expect("a valid document");
+    let mut host = Host::under(spec, 4, 3, 2);
+    // The second encoder is not ready, so the prefills of its class, the
+    // second and the fourth, are not admitted.
+    let said = (&[of(1), of(2)][..], &[1, 2, 1, 2][..]);
+    host.worker(2, 1).set_status(WorkerStatus::NotReady);
+    let keys = [Identity::plain("item")];
+    let mut placed = EncodePlaced::new();
+    let mut pair_of = |first: u32, seed: u64| {
+        host.prompt = Some(prompt(&host.engine, first));
+        host.seed = seed;
+        let (decision, prefill, _) = host.decide(said, &keys, None, &mut placed);
+        (
+            prefill.expect("a pick"),
+            decode_of(&decision).expect("a pair"),
+        )
+    };
+    let sent = pair_of(1_000, 1);
+    for seed in 2..34 {
+        assert_eq!(pair_of(1_000, seed), sent, "seed {seed}");
+    }
+    let fresh: BTreeSet<_> = (0..32_u32)
+        .map(|at| pair_of(100_000 + 1_000 * at, u64::from(at)))
+        .collect();
+    assert!(fresh.len() > 1, "{fresh:?}");
+    assert!(
+        fresh.iter().all(|&(prefill, _)| prefill % 2 == 0),
+        "{fresh:?}"
+    );
+}
+
+/// A decision that writes where its prompt went asks its caller of an
+/// encoder once, however many of the request's items it placed there: two
+/// items on the one encoder that is ready are one question, of that
+/// encoder's place.
+#[test]
+fn an_encoder_two_items_are_placed_on_is_asked_of_once() {
+    let aware = "cache_aware";
+    let document = PolicySpec::epd_presets("power_of_two", aware, aware).expect("the presets");
+    let spec = AppliedSpec::validate(&document).expect("a valid document");
+    let mut host = Host::under(spec, 2, 2, 2);
+    // The first encoder is not ready: both items take the second.
+    host.worker(2, 0).set_status(WorkerStatus::NotReady);
+    host.prompt = Some(prompt(&host.engine, 1_000));
+    host.asked = Some(Mutex::default());
+    let said = (&[of(1), of(1)][..], &[1, 1][..]);
+    let keys = [Identity::plain("item-a"), Identity::plain("item-b")];
+    let mut placed = EncodePlaced::new();
+    let (_, prefill, encoders) = host.decide(said, &keys, None, &mut placed);
+    assert_eq!((prefill.is_some(), encoders), (true, vec![1, 1]));
+    let asked = host.asked.as_ref().expect("the questions are counted");
+    assert_eq!(*asked.lock(), [1]);
+}
+
 /// A request whose media is video alone asks vision of its encoder as one
 /// that states an image does: its item goes to the encoder its host says
 /// takes images, whichever reports the shorter queue, and where the host
@@ -443,11 +562,10 @@ fn a_request_that_states_a_subset_hint_is_shed_as_its_pair_and_places_no_key() {
 }
 
 /// The encoders' cell is asked where an encoder's rows are read, and by no
-/// answer that reads none. A request its pair alone answers, one whose
-/// pair is held to places, and one with no item that its wires decline
-/// each leave the cell of a list no decision read empty: none of them
-/// pays the fill of a list it does not read. The first decision over the
-/// three lists fills it.
+/// answer that reads none. A request its pair alone answers and one with
+/// no item that its wires decline each leave the cell of a list no
+/// decision read empty: neither pays the fill of a list it does not read.
+/// The first decision over the three lists fills it.
 #[test]
 fn an_answer_that_reads_no_encoder_fills_no_encoders_cell() {
     let said = (&[of(1)][..], &[1][..]);
@@ -457,14 +575,6 @@ fn an_answer_that_reads_no_encoder_fills_no_encoders_cell() {
     let (decision, _, _) = host.decide(said, &keys, Some(0), &mut placed);
     assert_eq!(gap(&decision), Some(SUBSET_HINT));
     assert!(!host.lists[2].filled(), "the pair's answer read no encoder");
-    let mut held = Host::of(1, 1, 1);
-    held.places = [Some(vec![0]), None];
-    let (decision, _, _) = held.decide(said, &keys, None, &mut placed);
-    assert_eq!(declined_under(&decision), Some("places"));
-    assert!(
-        !held.lists[2].filled(),
-        "the places' refusal read no encoder"
-    );
     // The prefills' first worker is dialed over gRPC, and the request
     // states HTTP and no item.
     let (mut wired, _) = hearing(2, 2, 2);
@@ -487,50 +597,136 @@ fn an_answer_that_reads_no_encoder_fills_no_encoders_cell() {
     assert!(host.lists[2].filled(), "the decision read the encoders");
 }
 
-/// An encode request's pair is held to no places of its two lists: the
-/// engine decides that pair over the workers it admits for the items. A
-/// host that states places for either list is declined under the places'
-/// name, and what an earlier decision placed is emptied. A pair's own
-/// decision is held to them ([`PairLists::decide`]). The gateway's classic
-/// router holds an encode request's pair to no rule of the request's own:
-/// it selects that pair under its own test of the workers an encoder can
-/// hand to, which stands where the request's rule would
-/// (`model_gateway/src/routers/grpc/common/stages/worker_selection.rs:2213-2229`
-/// at main `9f303447f`).
+/// An encode request's pair is decided among the places its host states
+/// for each of its two lists, as a pair's own decision is
+/// ([`PairLists::decide`]), and each item's encoder is one at the encoders'
+/// places. The worker at place 0 of each list reports the shorter queue, so
+/// a list held to no place answers there, and a list held to its second
+/// worker answers with that one. A request that states places of its own is
+/// declined under the places' name still: one set of places holds no three
+/// lists.
 #[test]
-fn an_encode_request_whose_pair_is_held_to_places_is_declined_by_name() {
-    let mut host = Host::of(2, 2, 1);
-    let said = (&[of(1)][..], &[1, 1][..]);
+fn an_encode_request_is_decided_among_the_places_of_each_of_its_lists() {
+    let mut host = Host::of(2, 2, 2);
+    host.loads = Some(reports(0));
+    let said = (&[of(1), of(1)][..], &[1, 1][..]);
     let keys = [Identity::plain("item")];
     let mut placed = EncodePlaced::new();
-    for held in [[Some(vec![0]), None], [None, Some(vec![1])]] {
-        host.places = [None, None];
-        let (_, prefill, encoders) = host.decide(said, &keys, None, &mut placed);
-        assert_eq!((prefill.is_some(), encoders), (true, vec![0]));
-        host.places = held;
-        let (decision, _, encoders) = host.decide(said, &keys, None, &mut placed);
-        match decision {
-            Decision::Shed(shed) => assert_eq!(
-                (shed.reason, shed.emptied_by),
-                (ShedReason::PolicyDeclined, "places")
-            ),
-            other => panic!("not declined: {other:?}"),
-        }
-        assert!(encoders.is_empty());
+    let second = || Some(vec![1]);
+    let stated = [
+        ([None, None], None, (0, 0, 0)),
+        ([second(), None], None, (1, 0, 0)),
+        ([None, second()], None, (0, 1, 0)),
+        ([None, None], second(), (0, 0, 1)),
+        ([second(), second()], second(), (1, 1, 1)),
+    ];
+    for (places, encoder_places, (prefill, decode, encoder)) in stated {
+        (host.places, host.encoder_places) = (places, encoder_places);
+        let (decision, at, encoders) = host.decide(said, &keys, None, &mut placed);
+        let answered = (at, decode_of(&decision), encoders);
+        assert_eq!(answered, (Some(prefill), Some(decode), vec![encoder]));
     }
+    // The request's own places name no one of the three lists.
+    (host.places, host.encoder_places) = ([None, None], None);
+    let lists = host.lists(said);
+    let mut request = Request {
+        id: b"",
+        facts: RequestFacts {
+            model: "model-a",
+            phase: Phase::Prefill,
+            ..RequestFacts::default()
+        },
+        constraints: Constraints {
+            places: Some(&[0]),
+            ..Constraints::default()
+        },
+    };
+    let items = EncodeItems {
+        keys: &keys,
+        ..EncodeItems::default()
+    };
+    let now = Instant::now();
+    let decision = lists.decide(&host.engine, None, now, &mut request, items, &mut placed);
+    assert_eq!(declined_under(&decision), Some("places"));
+    assert!(placed.encoders().is_empty(), "no key stays placed");
 }
 
-/// The places' decline reads whether a list's places are stated, and not
-/// what they state: both lists' places, and places that name no worker,
-/// are declined as one list's are. The engine says the decline ahead of
-/// every profile, in the shape of a profile's shed: it states the request's
-/// seed and the document's generation.
+/// A retry of an encode request is decided among the places of each list
+/// on its wire, where its decode must take images. The first decode is on
+/// the wire and takes no image, the second takes images off the wire, and
+/// the third takes images on it: the retry's decode is the third. The
+/// engine admits the decodes that take images and numbers the places with
+/// them, so the place of the first decode opens no other.
+///
+/// The classic router decides a retry of an encode request as its pair
+/// alone, held to the wire of the plan it kept
+/// (`model_gateway/src/routers/grpc/common/stages/worker_selection.rs:773-782`
+/// and `:867-902` on main c0019b84c). It asks the decode's vision there
+/// again where the encoders push (`:886-895`), and keeps the decode to the
+/// workers on that wire that take images while a pair on the wire has one
+/// (`:2431-2438`). Where the wire's decodes take none it hands the decode
+/// pool as it is, and its dispatch refuses the side (`:2403-2407`). The
+/// engine names that retry `places`. The name tells it from a retry whose
+/// wire holds no decode, which is shed as its pair alone is.
 #[test]
-fn the_places_decline_stands_for_both_lists_and_for_places_that_name_no_worker() {
-    let mut document = stock();
-    document.generation = 9;
-    let spec = AppliedSpec::validate(&document).expect("a valid document");
-    let mut host = Host::under(spec, 2, 2, 1);
+fn a_retry_of_an_encode_request_takes_a_decode_on_its_wire_that_takes_images() {
+    let mut host = Host::of(2, 3, 1);
+    // The host says of the second and the third decode that they take
+    // images.
+    let (decodes, blind) = (Arc::clone(host.lists[1].workers()), url(1, 0));
+    host.lists[1] = PublishedList::with_facts(decodes, |worker| FixedFacts {
+        vision: worker.url() != blind,
+        ..FixedFacts::default()
+    });
+    let said = (&[of(1)][..], &[1, 1][..]);
+    // No item: the first dispatch sent the encode jobs. The decode is held
+    // to the ones that take images still.
+    let retried = EncodeItems {
+        decode_images: true,
+        ..EncodeItems::default()
+    };
+    let (mut placed, now) = (EncodePlaced::new(), Instant::now());
+    let asked = || Request {
+        id: b"",
+        facts: RequestFacts {
+            model: "model-a",
+            phase: Phase::Prefill,
+            attempt: 1,
+            ..RequestFacts::default()
+        },
+        constraints: Constraints::default(),
+    };
+    let mut decode_under = |host: &Host| {
+        let lists = host.lists(said);
+        let decision = lists.decide(&host.engine, None, now, &mut asked(), retried, &mut placed);
+        assert!(placed.encoders().is_empty(), "a retry places no item");
+        (gap(&decision), decode_of(&decision))
+    };
+    // The wire holds the first and the third decode, and both prefills.
+    host.places = [Some(vec![0, 1]), Some(vec![0, 2])];
+    assert_eq!(decode_under(&host), (None, Some(2)));
+    // It holds the first and the second.
+    host.places = [Some(vec![0, 1]), Some(vec![0, 1])];
+    assert_eq!(decode_under(&host), (None, Some(1)));
+    // It holds the first alone: the request is held off every decode that
+    // takes images, and no gap of the membership says so.
+    host.places = [Some(vec![0, 1]), Some(vec![0])];
+    assert_eq!(decode_under(&host), (Some("places"), None));
+    // It holds no decode: the retry is shed as its pair alone is.
+    host.places = [Some(vec![0, 1]), Some(Vec::new())];
+    let pair = host.lists(said).pair;
+    let alone = gap(&pair.decide(&host.engine, None, now, &mut asked(), None));
+    assert!(alone.is_some_and(|stage| stage != "places"), "{alone:?}");
+    assert_eq!(decode_under(&host), (alone, None));
+}
+
+/// A list's places that name no worker leave the request no worker of that
+/// list. With every worker of the list admitted the pair's own pass reads
+/// them, so the request is shed as its pair alone is shed
+/// ([`PairLists::decide`]), and no key is placed.
+#[test]
+fn places_that_name_no_worker_shed_an_encode_request_as_they_shed_its_pair() {
+    let mut host = Host::of(2, 2, 1);
     let said = (&[of(1)][..], &[1, 1][..]);
     let keys = [Identity::plain("item")];
     let items = EncodeItems {
@@ -540,14 +736,8 @@ fn the_places_decline_stands_for_both_lists_and_for_places_that_name_no_worker()
     let mut placed = EncodePlaced::new();
     let now = Instant::now();
     let nobody = || Some(Vec::new());
-    let stated = [
-        [Some(vec![0]), Some(vec![1])],
-        [nobody(), None],
-        [None, nobody()],
-        [nobody(), nobody()],
-    ];
-    for held in stated {
-        let mut request = Request {
+    for held in [[nobody(), None], [None, nobody()], [nobody(), nobody()]] {
+        let asked = || Request {
             id: b"",
             facts: RequestFacts {
                 model: "model-a",
@@ -557,21 +747,21 @@ fn the_places_decline_stands_for_both_lists_and_for_places_that_name_no_worker()
             },
             constraints: Constraints::default(),
         };
-        let mut decide = |host: &Host| {
-            let lists = host.lists(said);
-            lists.decide(&host.engine, None, now, &mut request, items, &mut placed)
-        };
         host.places = [None, None];
-        let decision = decide(&host);
+        let lists = host.lists(said);
+        let decision = lists.decide(&host.engine, None, now, &mut asked(), items, &mut placed);
         assert!(decision.pick().is_some(), "not a pick: {decision:?}");
         host.places = held;
-        let decision = decide(&host);
-        let Decision::Shed(shed) = decision else {
-            panic!("not declined under {:?}: {decision:?}", host.places);
+        let lists = host.lists(said);
+        let decision = lists.decide(&host.engine, None, now, &mut asked(), items, &mut placed);
+        let pair = lists
+            .pair
+            .decide(&host.engine, None, now, &mut asked(), None);
+        let named = |decision: &Decision| match decision {
+            Decision::Shed(shed) => (shed.reason, shed.emptied_by),
+            other => panic!("not shed under {:?}: {other:?}", host.places),
         };
-        let named = (shed.reason, shed.emptied_by);
-        assert_eq!(named, (ShedReason::PolicyDeclined, "places"));
-        assert_eq!((shed.trace.seed, shed.trace.generation), (41, 9));
+        assert_eq!(named(&decision), named(&pair));
         assert!(placed.encoders().is_empty(), "{:?}", host.places);
     }
 }
@@ -1926,7 +2116,9 @@ fn a_request_whose_decode_is_held_to_images_and_sent_later_is_declined() {
 
 /// References beside a video hold the decode to the ones that take images
 /// as references beside an image do: sent with its prefill the request is
-/// decided on the decode its host says takes images, and one that states
+/// decided on the decode its host says takes images, where the other
+/// reports the shorter queue and takes the same references with no pixel
+/// beside them. One that states
 /// the later decode is declined under `decode-later`. The classic router
 /// asks vision for an image or a video alike
 /// (`model_gateway/src/routers/grpc/multimodal/capability.rs:325-344` on
@@ -1947,7 +2139,13 @@ fn references_beside_a_video_hold_the_decode_as_beside_an_image() {
         ..EncodeItems::default()
     };
     let (mut placed, now) = (EncodePlaced::new(), Instant::now());
+    // The first decode reports the shorter queue: under no hold it is the
+    // pair's.
+    host.loads = Some(reports(0));
     let entry = &host.engine;
+    let free = entry.decide_encode_at(&host.asks(said), refers, &mut placed, || now);
+    let (free, _) = free.expect("a decision");
+    assert_eq!(decode_of(&free.decision), Some(0), "no pixel: no hold");
     let with_video = |later| Asks {
         later,
         video: true,
@@ -2071,7 +2269,7 @@ fn equal_keys_are_placed_on_one_encoder() {
     let lists = host.lists(said);
     let asks = host.asks(said);
     let (engine, now) = (&host.engine, Instant::now());
-    let spec = engine.spec();
+    let spec = engine.standing_spec();
     let ids = [0, 1].map(|at| worker_id(host.worker(2, at).as_ref()));
     let mut placed = EncodePlaced::new();
     let mut seen = BTreeSet::new();

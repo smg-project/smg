@@ -7,7 +7,10 @@ use std::{
     cell::{Cell, RefCell},
     collections::{BTreeSet, HashMap},
     ptr,
-    sync::atomic::{self, AtomicU32},
+    sync::{
+        atomic::{self, AtomicU32},
+        OnceLock,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -24,13 +27,14 @@ use tokio::time::sleep;
 use super::*;
 use crate::{
     document::spec::{
-        BoundedLoadParams, ConsistentHashParams, FilterSpec, KeySourceSpec, Needs, OverloadSpec,
-        PolicySpec, RoutingKeySpec, ScoreStage, ShadowSpec, MANUAL_SESSION_HEADER,
+        Assignment, BoundedLoadParams, ConsistentHashParams, FilterSpec, KeySourceSpec, Needs,
+        OverloadSpec, PolicySpec, Recovery, RoutingKeySpec, ScoreStage, SessionsSpec, ShadowSpec,
+        MANUAL_SESSION_HEADER,
     },
     engine::{
         decision::{Queue, ShadowKind, Shed, Target, Targets, Trace},
-        decision_engine::Decided,
-        framework::{Filter, Picker, Place, Scorer, TieBand, DRAW_FROM},
+        decision_engine::{Decided, DecisionEngine},
+        framework::{Filter, Picker, Place, PoolWord, Scorer, TieBand, DRAW_FROM},
         list_cell::tests::PublishedList,
         records::worker_id,
         view::{fingerprint, Candidate, FixedFacts, HashKind},
@@ -199,6 +203,7 @@ fn three_of(pair: PairLists<'_>) -> WorkerLists<'_> {
     WorkerLists::Encode(EncodeLists {
         pair,
         encoders: pair.prefill,
+        encoders_places: None,
         encoders_stalled: &[],
         encoders_held: &[],
         facts: &[],
@@ -270,7 +275,7 @@ fn the_routing_value_and_the_clients_value_come_from_the_documents_sources() {
             ..PlaceRequest::of(MODEL, WorkerLists::None)
         };
         let made = Made::new(&engine, &request, &[]);
-        let facts = made.make(engine.spec()).facts;
+        let facts = made.make(engine.standing_spec()).facts;
         let clear = facts.session_key.plain.is_some();
         assert_eq!(
             facts.session_counted, clear,
@@ -304,7 +309,7 @@ fn the_routing_value_and_the_clients_value_come_from_the_documents_sources() {
         ..PlaceRequest::of(MODEL, WorkerLists::None)
     };
     let made = Made::new(&unkeyed, &request, &[]);
-    let facts = made.make(unkeyed.spec()).facts;
+    let facts = made.make(unkeyed.standing_spec()).facts;
     assert_eq!((facts.session_key, facts.client_key), (Identity::NONE, 0));
 }
 
@@ -338,7 +343,7 @@ fn a_request_is_made_of_what_its_caller_states() {
         id,
         facts,
         constraints,
-    } = made.make(engine.spec());
+    } = made.make(engine.standing_spec());
     assert_eq!(id, b"request-1");
     assert_eq!((facts.model, facts.phase), (MODEL, Phase::Single));
     assert_eq!((facts.attempt, facts.tried), (1, &tried[..]));
@@ -351,7 +356,7 @@ fn a_request_is_made_of_what_its_caller_states() {
     // A request with no id bears an empty one.
     let bare = PlaceRequest::of(MODEL, WorkerLists::None);
     assert!(Made::new(&engine, &bare, &[])
-        .make(engine.spec())
+        .make(engine.standing_spec())
         .id
         .is_empty());
     // A request with a pair's two lists is made, and says it is plain, at
@@ -362,12 +367,18 @@ fn a_request_is_made_of_what_its_caller_states() {
     let pair = pair_of(&members, &classes);
     let paired = PlaceRequest::of(MODEL, WorkerLists::Pair(pair));
     let made = Made::new(&engine, &paired, &[]);
-    assert_eq!(made.make(engine.spec()).facts.phase, Phase::Prefill);
+    assert_eq!(
+        made.make(engine.standing_spec()).facts.phase,
+        Phase::Prefill
+    );
     assert_eq!(made.plain().map(|plain| plain.phase), Some(Phase::Prefill));
     // And so is a request with an encode request's three.
     let three = PlaceRequest::of(MODEL, three_of(pair));
     let made = Made::new(&engine, &three, &[]);
-    assert_eq!(made.make(engine.spec()).facts.phase, Phase::Prefill);
+    assert_eq!(
+        made.make(engine.standing_spec()).facts.phase,
+        Phase::Prefill
+    );
     // A client's tokens and text reach no log line.
     let prompt = Prompt {
         tokens: Some(&[7, 8, 9]),
@@ -389,7 +400,7 @@ fn each_making_draws_a_seed_of_its_own() {
         let request = PlaceRequest::of(MODEL, WorkerLists::None);
         let made = Made::new(&engine, &request, &[]);
         (0..64)
-            .map(|_| made.make(engine.spec()).facts.seed)
+            .map(|_| made.make(engine.standing_spec()).facts.seed)
             .collect::<BTreeSet<u64>>()
     };
     let here = draw();
@@ -434,8 +445,8 @@ fn the_prompts_blocks_are_hashed_under_its_partition_once() {
     let request = stated(Some(&tokens[..]), Some(&text[..]));
     let made = Made::new(&engine, &request, &[]);
     let (first, again) = (
-        made.make(engine.spec()).facts,
-        made.make(engine.spec()).facts,
+        made.make(engine.standing_spec()).facts,
+        made.make(engine.standing_spec()).facts,
     );
     let mut expected = RequestFacts::default();
     let hashes = engine.prompt_hashes(MODEL, Some(&tokens), None, seeds);
@@ -456,7 +467,7 @@ fn the_prompts_blocks_are_hashed_under_its_partition_once() {
     // Token ids alone, as a tokenized request states its prompt.
     let request = stated(Some(&tokens[..]), None);
     let made = Made::new(&engine, &request, &[]);
-    let facts = made.make(engine.spec()).facts;
+    let facts = made.make(engine.standing_spec()).facts;
     assert_eq!(facts.block_hashes, expected.block_hashes);
     assert_eq!(
         (facts.hash_kind, facts.prompt_tokens),
@@ -465,7 +476,7 @@ fn the_prompts_blocks_are_hashed_under_its_partition_once() {
 
     let request = stated(None, Some(&text[..]));
     let made = Made::new(&engine, &request, &[]);
-    let facts = made.make(engine.spec()).facts;
+    let facts = made.make(engine.standing_spec()).facts;
     assert_eq!(facts.hash_kind, HashKind::Text);
     // The bytes are stated under any document, and the size is theirs.
     assert_eq!(
@@ -476,7 +487,7 @@ fn the_prompts_blocks_are_hashed_under_its_partition_once() {
 
     let request = stated(None, None);
     let made = Made::new(&engine, &request, &[]);
-    let facts = made.make(engine.spec()).facts;
+    let facts = made.make(engine.standing_spec()).facts;
     assert!(facts.block_hashes.is_empty());
     assert_eq!(facts.prompt_tokens, 0);
 }
@@ -521,8 +532,147 @@ fn a_prompt_is_hashed_by_the_block_size_of_its_workers_id() {
             ..PlaceRequest::of("another-id", lists)
         };
         let made = Made::new(&engine, &request, &[]);
-        assert_eq!(made.make(engine.spec()).facts.block_size, 4);
+        assert_eq!(made.make(engine.standing_spec()).facts.block_size, 4);
     }
+}
+
+/// A prompt is hashed under the document its decision hands the maker,
+/// whatever document the engine holds in force by then: a decision that
+/// began under one document reads no word of the next. The first document
+/// reads a prompt's blocks, and the one put in force behind it reads none.
+#[test]
+fn a_prompt_is_hashed_under_the_document_its_decision_runs_under() {
+    let engine = preset("cache_aware");
+    let began_under = engine.spec();
+    let mut next = PolicySpec::preset("random").expect("a built-in preset");
+    next.generation = 2;
+    let next = AppliedSpec::validate(&next).expect("the document validates");
+    engine.apply(next).expect("a number above the standing one");
+
+    let tokens = (0..600).collect::<Vec<u32>>();
+    let request = PlaceRequest {
+        prompt: Prompt {
+            tokens: Some(&tokens[..]),
+            ..Prompt::NONE
+        },
+        ..PlaceRequest::of(MODEL, WorkerLists::None)
+    };
+    let made = Made::new(&engine, &request, &[]);
+    let hashed = made.make(&began_under).facts.block_hashes.len();
+    assert!(hashed > 0, "the decision's document reads the blocks");
+    let made = Made::new(&engine, &request, &[]);
+    let in_force = engine.spec();
+    assert!(made.make(&in_force).facts.block_hashes.is_empty());
+}
+
+/// A plain pick's lease sizes the prompt under the document its decision
+/// runs under, whatever document the engine holds in force by then. The
+/// first document's picker places by itself, reads a request's size and
+/// takes a lease's issue. Its pick puts the `random` preset in force,
+/// none of whose stages reads a size, ahead of the lease.
+#[test]
+fn a_plain_picks_lease_sizes_its_prompt_under_its_decisions_document() {
+    const NAME: &str = "sizes-alone";
+    type Host = Arc<OnceLock<&'static PolicyEngine>>;
+
+    /// Keeps the characters each lease it hears issued states.
+    #[derive(Debug)]
+    struct SizesAlone(Arc<Mutex<Vec<u32>>>, Host);
+
+    impl Lifecycle for SizesAlone {
+        fn hears(&self) -> EventSet {
+            EventSet::LEASE
+        }
+
+        fn on_decision_issued(&self, lease: &Lease, _: &Decision) {
+            self.0.lock().push(lease.chars);
+        }
+    }
+
+    impl Picker for SizesAlone {
+        fn name(&self) -> &'static str {
+            NAME
+        }
+
+        fn needs(&self) -> Needs {
+            Needs {
+                prompt_size: true,
+                ..Needs::default()
+            }
+        }
+
+        fn refuses_by_reports(&self) -> bool {
+            false
+        }
+
+        fn picks_alone(&self) -> bool {
+            true
+        }
+
+        // The pool's first worker, behind the next document's apply.
+        fn pick_alone(
+            &self,
+            _: &PoolWord<'_>,
+            keep: &mut dyn FnMut(usize) -> bool,
+        ) -> Option<usize> {
+            let engine = self.1.get().expect("the engine is hosted");
+            let mut next = PolicySpec::preset("random").expect("a built-in preset");
+            next.generation = 2;
+            let next = AppliedSpec::validate(&next).expect("the document validates");
+            engine.apply(next).expect("a number above the standing one");
+            keep(0).then_some(0)
+        }
+
+        fn pick(
+            &self,
+            _: &RequestFacts<'_>,
+            candidates: &[Candidate],
+            kept: &[u32],
+            _: &[f32],
+            _: TieBand,
+            out: &mut Targets,
+        ) {
+            push_drawn(candidates, kept, out);
+        }
+    }
+
+    let chars = Arc::new(Mutex::new(Vec::new()));
+    let host = Host::default();
+    let (kept, hosted_at) = (Arc::clone(&chars), Arc::clone(&host));
+    let mut stages = StageRegistry::builtin();
+    stages
+        .picker(NAME, move || {
+            Box::new(SizesAlone(Arc::clone(&kept), Arc::clone(&hosted_at)))
+        })
+        .expect("a free picker name");
+    let mut document = PolicySpec::preset("random").expect("a built-in preset");
+    document.generation = 1;
+    let profile = document.profiles.get_mut("random");
+    profile.expect("the random profile").pick = NAME.into();
+    let spec = AppliedSpec::validate_in(&document, &stages, &[]).expect("a valid document");
+    let engine = hosted(PolicyEngine::new(spec));
+    let began_under = engine.spec();
+    assert!(began_under.needs().prompt_size, "a stage reads the size");
+    let place = began_under.place_for(MODEL, Phase::Single);
+    assert!(matches!(place, Place::Alone(_)), "{place:?}");
+    host.set(engine).expect("hosted once");
+
+    // A text of 200 two-byte characters, held as text alone.
+    let text = "\u{e9}".repeat(200);
+    let members = PublishedList::new(pool(4));
+    let request = PlaceRequest {
+        prompt: Prompt {
+            text: Some(&text[..]),
+            ..Prompt::NONE
+        },
+        ..PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()))
+    };
+    let placement = engine.place(&request).expect("a placement");
+    assert!(placement.owes_events(), "the pick has a lease");
+    let in_force = engine.spec();
+    assert_eq!(in_force.generation(), 2, "the pick put the next in force");
+    assert!(!in_force.needs().prompt_size, "no stage of it reads a size");
+    assert_eq!(*chars.lock(), [200], "sized under the decision's document");
 }
 
 /// A first attempt that names nothing tried or missed, demands nothing,
@@ -530,7 +680,9 @@ fn a_prompt_is_hashed_by_the_block_size_of_its_workers_id() {
 /// the size its request would state. The engine then answers it a place where one pick decides its
 /// place: no clock is read for it. Each fact that asks more than a worker
 /// of the list takes the request off that path. A decode asked again
-/// does not: over one list the word asks nothing.
+/// does not: over one list the word asks nothing. Neither does a list
+/// whose host states facts of its workers: a request that demands nothing
+/// reads none of them.
 #[test]
 fn a_plain_request_says_so_and_is_answered_a_place() {
     let engine = preset("round_robin");
@@ -567,7 +719,8 @@ fn a_plain_request_says_so_and_is_answered_a_place() {
         ..PlaceRequest::of(MODEL, plain.lists)
     };
     let sizes = |engine: &PolicyEngine, request: &PlaceRequest<'_>| {
-        let made = Made::new(engine, request, &[]);
+        let (document, call) = (engine.in_force(), Call::default());
+        let made = Made::asked(engine.under(&document), request, &call);
         let said = made.plain().expect("a plain request");
         (said.prompt_tokens, made.prompt_chars(), made.prompt_bytes())
     };
@@ -590,6 +743,22 @@ fn a_plain_request_says_so_and_is_answered_a_place() {
         Instant::now()
     };
     let decided = engine.decide_at(&Made::new(&engine, &plain, &[]), clock);
+    assert!(matches!(decided, Ok(Decided::Alone(pick)) if pick.place < 4));
+    assert_eq!(read.get(), 0, "a place dates nothing");
+    // A list whose host states a fact of each worker, as a host that dials
+    // several runtimes does: the fill of the list's cell takes the facts,
+    // and the plain request is answered a place as over the silent list.
+    let stating = PublishedList::with_facts(Arc::clone(&list), |_| {
+        let mut facts = FixedFacts::default();
+        facts.demands.runtime = 7;
+        facts
+    });
+    let stated = PlaceRequest {
+        prompt: plain.prompt,
+        ..PlaceRequest::of(MODEL, WorkerLists::Single(stating.lent()))
+    };
+    assert_eq!(Made::new(&engine, &stated, &[]).plain(), said);
+    let decided = engine.decide_at(&Made::new(&engine, &stated, &[]), clock);
     assert!(matches!(decided, Ok(Decided::Alone(pick)) if pick.place < 4));
     assert_eq!(read.get(), 0, "a place dates nothing");
 
@@ -655,7 +824,7 @@ fn the_later_decode_is_stated_where_the_document_picks_it_so() {
             ..PlaceRequest::of(MODEL, lists)
         };
         let made = Made::new(engine, &request, &[]);
-        made.make(engine.spec()).constraints.decode_later
+        made.make(engine.standing_spec()).constraints.decode_later
     };
     for lists in [WorkerLists::Pair(pair), three_of(pair)] {
         assert!(later(&after, lists, true));
@@ -668,7 +837,7 @@ fn the_later_decode_is_stated_where_the_document_picks_it_so() {
             ..PlaceRequest::of(MODEL, lists)
         };
         let made = Made::new(&after, &request, &[]);
-        let stated = made.make(after.spec());
+        let stated = made.make(after.standing_spec());
         assert!(!stated.constraints.decode_later);
         assert!(made.plain().is_some());
         assert_eq!(stated.plain(), made.plain());
@@ -748,7 +917,7 @@ fn a_header_map_hands_the_documents_sources_their_values() {
             ..PlaceRequest::of(MODEL, WorkerLists::None)
         };
         let made = Made::new(&engine, &request, &[]);
-        let key = made.make(engine.spec()).facts.session_key;
+        let key = made.make(engine.standing_spec()).facts.session_key;
         (key.hash, key.plain.is_some())
     };
     let name = HeaderName::from_bytes(b"X-Conversation").expect("a header's name");
@@ -772,7 +941,10 @@ fn a_header_map_hands_the_documents_sources_their_values() {
 #[test]
 fn a_plain_request_is_placed_on_the_worker_at_its_place() {
     let engine = hosted(preset("round_robin"));
-    let alone = matches!(engine.place_for(MODEL, Phase::Single), Place::Alone(_));
+    let alone = matches!(
+        engine.spec().place_for(MODEL, Phase::Single),
+        Place::Alone(_)
+    );
     assert!(alone, "one pick decides the place");
     let list = pool(4);
     let members = PublishedList::new(Arc::clone(&list));
@@ -868,7 +1040,7 @@ fn placed(engine: &'static PolicyEngine) -> Placement<'static> {
 fn a_placement_names_the_profile_that_picked_by_its_label() {
     // Where one pick decides the place, the position of the profile that
     // picks: the second in each document, behind the spare one.
-    let alone_at = |engine: &PolicyEngine| match engine.place_for(MODEL, Phase::Single) {
+    let alone_at = |engine: &PolicyEngine| match engine.spec().place_for(MODEL, Phase::Single) {
         Place::Alone(profile) => Some(profile.0),
         _ => None,
     };
@@ -1700,18 +1872,19 @@ fn an_ask_is_made_of_what_its_call_handed_on() {
         ..PlaceRequest::of(MODEL, WorkerLists::None)
     };
     let mut call = Call::default();
+    let document = engine.in_force();
     let blocks = {
-        let first = Made::asked(&engine, &request, &call);
+        let first = Made::asked(engine.under(&document), &request, &call);
         assert!(first.plain().is_some());
-        let facts = first.make(engine.spec()).facts;
+        let facts = first.make(engine.standing_spec()).facts;
         assert!(!facts.block_hashes.is_empty());
         facts.block_hashes.as_ptr()
     };
     assert!(call.hashes.get().is_some(), "hashed in the call's cell");
     call.missed.push(WorkerId(3));
-    let again = Made::asked(&engine, &request, &call);
+    let again = Made::asked(engine.under(&document), &request, &call);
     assert_eq!(again.plain(), None, "a missed target");
-    let made = again.make(engine.spec());
+    let made = again.make(engine.standing_spec());
     assert_eq!(made.constraints.excluded, [WorkerId(3)]);
     assert!(
         ptr::eq(made.facts.block_hashes.as_ptr(), blocks),
@@ -1882,7 +2055,7 @@ fn lent_ring_places(engine: &'static PolicyEngine) {
             ..PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()))
         };
         let made = Made::new(engine, &request, &[]);
-        let facts = made.make(engine.spec()).facts;
+        let facts = made.make(engine.standing_spec()).facts;
         (facts.ring.is_some(), facts.ring_positions.to_vec())
     };
     let keyed = [
@@ -1961,8 +2134,16 @@ fn a_requests_key_is_asked_of_the_lent_ring_once() {
         ..PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()))
     };
     let made = Made::new(engine, &request, &[]);
-    let first = made.make(engine.spec()).facts.ring_positions.to_vec();
-    let again = made.make(engine.spec()).facts.ring_positions.to_vec();
+    let first = made
+        .make(engine.standing_spec())
+        .facts
+        .ring_positions
+        .to_vec();
+    let again = made
+        .make(engine.standing_spec())
+        .facts
+        .ring_positions
+        .to_vec();
     assert_eq!(first, [ring.0.position("conv-1")]);
     assert_eq!(again, first);
     assert_eq!(ring.1.load(atomic::Ordering::Relaxed), 1);
@@ -2151,7 +2332,7 @@ fn a_lender_that_places_no_head_lends_no_ring_under_the_prefix_form() {
             };
             let lent = request(Some(ring));
             let made = Made::new(engine, &lent, &[]);
-            let facts = made.make(engine.spec()).facts;
+            let facts = made.make(engine.standing_spec()).facts;
             assert!(facts.ring.is_none(), "{name}");
             assert!(facts.ring_positions.is_empty(), "{name}");
             let with = placed(&lent);
@@ -2214,7 +2395,7 @@ fn a_request_under_the_prefix_form_states_where_its_heads_stand() {
         };
         let made = Made::new(engine, &request, &[]);
         let before = asks();
-        let facts = made.make(engine.spec()).facts;
+        let facts = made.make(engine.standing_spec()).facts;
         let places = facts.ring_positions.to_vec();
         assert_eq!(
             facts.ring.is_some(),
@@ -2222,7 +2403,10 @@ fn a_request_under_the_prefix_form_states_where_its_heads_stand() {
             "lent with a place"
         );
         assert_eq!(asks() - before, places.len() as u32, "one ask a head");
-        assert_eq!(made.make(engine.spec()).facts.ring_positions, places);
+        assert_eq!(
+            made.make(engine.standing_spec()).facts.ring_positions,
+            places
+        );
         assert_eq!(asks() - before, places.len() as u32, "a second making");
         let placement = engine.place(&request).expect("a placement");
         let worker = |held: &Arc<dyn Worker>| Arc::ptr_eq(held, &placement.worker);
@@ -2255,6 +2439,147 @@ fn a_request_under_the_prefix_form_states_where_its_heads_stand() {
     let client = [("x-client", "10.0.0.1")];
     assert_eq!(stated(Some(&ids), None, &client), both);
     assert_eq!(stated(None, None, &client), [0_u64; 0]);
+}
+
+/// The `prefix_hash` preset over a view of `boundaries`, whose binding
+/// reads a routing value from the header `x-smg-routing-key` and then from
+/// the request's own id, the turn and retry suffixes off: the sources a
+/// gateway's sticky override names. The view lists the header, so its
+/// value leaves in the clear as the id's does. `rule` is the binding's
+/// sessions rule.
+fn prefixed_by_id(boundaries: &[u32], rule: Option<SessionsSpec>) -> PolicyEngine {
+    let mut document = PolicySpec::preset("prefix_hash").expect("a built-in preset");
+    document.view.boundaries = boundaries.to_vec();
+    document.view.headers.push("x-smg-routing-key".to_owned());
+    let header = KeySourceSpec {
+        header: Some("x-smg-routing-key".to_owned()),
+        ..KeySourceSpec::default()
+    };
+    let rid = KeySourceSpec {
+        rid: true,
+        ..KeySourceSpec::default()
+    };
+    let binding = &mut document.bindings[0];
+    binding.routing_key = Some(RoutingKeySpec {
+        sources: vec![header, rid],
+        strip_lineage: true,
+    });
+    binding.sessions = rule;
+    engine_of(&document)
+}
+
+/// Under the prefix form a routing value leads the prompt only where a
+/// header handed it. The gateway's own policy hashes a header's value
+/// (`model_gateway/src/policies/prefix_hash.rs:358`) and places every other
+/// request by its prompt (`:360-372`), one keyed by its own id among them.
+/// So a request whose value its own id handed states its prompt's heads,
+/// and lands where the same prompt lands with no value, on a lent ring and
+/// on the stage's own. The value is still the request's session key, and
+/// the one call says where it came from.
+#[test]
+fn a_value_the_requests_own_id_handed_leads_no_prompt_under_the_prefix_form() {
+    let engine = hosted(prefixed_by_id(&[64, 256], None));
+    let list = pool(8);
+    let members = PublishedList::new(Arc::clone(&list));
+    let order = [6, 1, 4, 0, 7, 2, 5, 3];
+    let urls = order.iter().map(|&at| list[at].url().to_owned());
+    let ring = Lent(urls.collect());
+    let at = |head: Head<'_>| ring.head_position(head).expect("a lender of heads");
+    let ids: Vec<u32> = (500..800).collect();
+    // The request's places, whether its own id handed its value, the value
+    // in the clear, and the worker of the list it went to.
+    let stated = |headers: &dyn HeaderRead, id: Option<&str>, lent: bool| {
+        let request = PlaceRequest {
+            prompt: Prompt {
+                tokens: Some(&ids),
+                ..Prompt::NONE
+            },
+            headers,
+            request_id: id,
+            ring: lent.then_some(&ring as &dyn LentRing),
+            ..PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()))
+        };
+        let made = Made::new(engine, &request, &[]);
+        let facts = made.make(engine.standing_spec()).facts;
+        let (places, by_id) = (facts.ring_positions.to_vec(), facts.session_key_from_rid);
+        let key = facts.session_key.plain.map(str::to_owned);
+        let placement = engine.place(&request).expect("a placement");
+        let worker = |held: &Arc<dyn Worker>| Arc::ptr_eq(held, &placement.worker);
+        let went = list.iter().position(worker).expect("a worker of the list");
+        (places, by_id, key, went)
+    };
+    let heads = vec![at(Head::Tokens(&ids[..256])), at(Head::Tokens(&ids[..64]))];
+    let keyed = [("x-smg-routing-key", "conv-1")];
+    for lent in [true, false] {
+        let places = |heads: &[u64]| if lent { heads.to_vec() } else { Vec::new() };
+        let unkeyed = stated(&(), None, lent);
+        assert_eq!(unkeyed, (places(&heads), false, None, unkeyed.3));
+        // The id's value, its turn and retry suffixes off: the prompt's
+        // heads and the prompt's worker, under two ids.
+        for id in ["conv-1_t2_r1", "conv-2"] {
+            let key = id.split('_').next().map(str::to_owned);
+            let by_id = stated(&(), Some(id), lent);
+            assert_eq!(by_id, (places(&heads), true, key, unkeyed.3), "{id}");
+        }
+        // A header's value leads: its text is the one head, whatever the
+        // request's id.
+        let led = stated(&keyed, Some("conv-9"), lent);
+        let head = [at(Head::Text("conv-1"))];
+        assert_eq!(led.0, places(&head));
+        assert_eq!((led.1, led.2.as_deref()), (false, Some("conv-1")));
+    }
+    assert_ne!(heads[0], at(Head::Text("conv-1")), "two places");
+}
+
+/// A sessions rule pins the value the request's own id handed, as it pins
+/// a header's: the key's next request follows the pin, whatever its
+/// prompt. The ring placed the key's first request by its prompt, where a
+/// request of that prompt with no value lands, and another id's request of
+/// the second prompt lands on that prompt's worker.
+#[test]
+fn a_sessions_rule_pins_the_value_the_requests_own_id_handed() {
+    let rule = SessionsSpec {
+        sticky_header: String::new(),
+        assignment: Assignment::Delegate,
+        recovery: Recovery::Latest,
+        ..PolicySpec::preset("manual")
+            .expect("a built-in preset")
+            .bindings
+            .remove(0)
+            .sessions
+            .expect("the manual preset's rule")
+    };
+    let engine = hosted(prefixed_by_id(&[], Some(rule)));
+    let list = pool(8);
+    let members = PublishedList::new(Arc::clone(&list));
+    let went = |tokens: &[u32], id: Option<&str>| {
+        let request = PlaceRequest {
+            prompt: Prompt {
+                tokens: Some(tokens),
+                ..Prompt::NONE
+            },
+            request_id: id,
+            ..PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()))
+        };
+        let placement = engine.place(&request).expect("a placement");
+        let worker = |held: &Arc<dyn Worker>| Arc::ptr_eq(held, &placement.worker);
+        list.iter().position(worker).expect("a worker of the list")
+    };
+    let prompt = |from: u32| (from..from + 256).collect::<Vec<u32>>();
+    let first = prompt(500);
+    let home = went(&first, None);
+    // A second prompt whose worker is another.
+    let (second, other) = (1..)
+        .map(|n| prompt(n * 1000))
+        .map(|tokens| {
+            let worker = went(&tokens, None);
+            (tokens, worker)
+        })
+        .find(|&(_, worker)| worker != home)
+        .expect("a prompt with another worker");
+    assert_eq!(went(&first, Some("conv-1_t1")), home, "by its prompt");
+    assert_eq!(went(&second, Some("conv-1_t2")), home, "by its pin");
+    assert_eq!(went(&second, Some("conv-2_t1")), other, "another id");
 }
 
 /// A ring that places a head of token ids at its length in tokens. Its walk
@@ -2319,7 +2644,11 @@ fn a_prompt_that_reaches_nine_boundaries_is_tried_at_the_ninth() {
         ..PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()))
     };
     let made = Made::new(engine, &request, &[]);
-    let places = made.make(engine.spec()).facts.ring_positions.to_vec();
+    let places = made
+        .make(engine.standing_spec())
+        .facts
+        .ring_positions
+        .to_vec();
     assert_eq!(places, [144, 128, 112, 96, 80, 64, 48, 32, 16]);
     let placement = engine.place(&request).expect("a placement");
     assert!(
@@ -2336,7 +2665,11 @@ fn a_prompt_that_reaches_nine_boundaries_is_tried_at_the_ninth() {
         ..PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()))
     };
     let made = Made::new(engine, &request, &[]);
-    let places = made.make(engine.spec()).facts.ring_positions.to_vec();
+    let places = made
+        .make(engine.standing_spec())
+        .facts
+        .ring_positions
+        .to_vec();
     assert_eq!(places, [160, 144, 128, 112, 96, 80, 64, 48, 32, 16]);
 }
 
@@ -2412,7 +2745,7 @@ fn a_stage_is_asked_how_it_places_where_its_generation_is_built() {
             ..PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()))
         };
         let made = Made::new(engine, &request, &[]);
-        let facts = made.make(engine.spec()).facts;
+        let facts = made.make(engine.standing_spec()).facts;
         assert_eq!(facts.ring.is_some(), ring.is_some());
         engine.place(&request).expect("a placement");
     }
@@ -2475,7 +2808,7 @@ fn a_lender_that_declines_a_head_is_asked_nothing_more() {
         };
         let made = Made::new(engine, &request, &[]);
         for making in 0..2 {
-            let facts = made.make(engine.spec()).facts;
+            let facts = made.make(engine.standing_spec()).facts;
             assert!(facts.ring.is_none(), "{script:?}, making {making}");
             assert!(facts.ring_positions.is_empty(), "{script:?}");
             let asked = ring.1.load(atomic::Ordering::Relaxed);
@@ -2509,7 +2842,7 @@ fn a_pairs_request_is_lent_the_ring_a_side_of_it_places_by() {
             ..PlaceRequest::of(MODEL, WorkerLists::Pair(pair))
         };
         let made = Made::new(&engine, &request, &[]);
-        let facts = made.make(engine.spec()).facts;
+        let facts = made.make(engine.standing_spec()).facts;
         (facts.ring.is_some(), facts.ring_positions.to_vec())
     };
     let pair = |prefill: &str, decode: &str| {
@@ -2543,12 +2876,42 @@ fn a_pairs_request_is_lent_the_ring_a_side_of_it_places_by() {
     // own.
     let depths = |document: PolicySpec| {
         let engine = engine_of(&document);
-        let rule = |phase| engine.spec().engine().states_head_places(MODEL, phase);
+        let spec = engine.standing_spec();
+        let rule = |phase| spec.engine().states_head_places(MODEL, phase);
         [Phase::Prefill, Phase::Decode].map(|phase| rule(phase).map(|rule| rule.depth))
     };
     assert_eq!(depths(pair(prefixed, plain)), [Some(256), None]);
     assert_eq!(depths(pair(plain, prefixed)), [Some(256), Some(256)]);
     assert_eq!(depths(pair(prefixed, ringed)), [None, None]);
+}
+
+/// An `epd` binding pairs its prefill and its decode as a `pd-pair`
+/// binding does: asked at its prefill, the engine answers the lent ring's
+/// two questions for the decode profile too. Here the decode profile alone
+/// reads the ring, by a routing value's own text and then by heads.
+#[test]
+fn an_epd_models_prefill_is_answered_for_its_decode_profile_on_a_lent_ring() {
+    let epd = |prefill: &str, decode: &str| {
+        PolicySpec::epd_presets("round_robin", prefill, decode).expect("the epd presets")
+    };
+    let (ringed, prefixed, plain) = ("consistent_hashing", "prefix_hash", "round_robin");
+    let phases = [Phase::Prefill, Phase::Decode];
+    let by_text = |document: PolicySpec| {
+        let engine = engine_of(&document);
+        phases.map(|phase| engine.spec().engine().states_key_place(MODEL, phase))
+    };
+    assert_eq!(by_text(epd(plain, ringed)), [true, true]);
+    assert_eq!(by_text(epd(ringed, plain)), [true, false]);
+    assert_eq!(by_text(epd(plain, plain)), [false, false]);
+    let depths = |document: PolicySpec| {
+        let engine = engine_of(&document);
+        let spec = engine.standing_spec();
+        let rule = |phase| spec.engine().states_head_places(MODEL, phase);
+        phases.map(|phase| rule(phase).map(|rule| rule.depth))
+    };
+    assert_eq!(depths(epd(plain, prefixed)), [Some(256), Some(256)]);
+    assert_eq!(depths(epd(prefixed, plain)), [Some(256), None]);
+    assert_eq!(depths(epd(plain, plain)), [None, None]);
 }
 
 /// A filter of the host's own. It keeps a worker for a request that is
@@ -2632,7 +2995,7 @@ fn the_last_of_256_view_headers_is_named_by_its_place() {
         name: 255,
         value: "last",
     };
-    assert_eq!(made.make(engine.spec()).facts.headers, [last]);
+    assert_eq!(made.make(engine.standing_spec()).facts.headers, [last]);
 }
 
 /// The profile's picker receives the request's stated budget in microseconds.

@@ -17,8 +17,9 @@ use crate::{
 };
 
 /// The probes of the replica's workers while it leads: the worker crate's
-/// health loop over the holder's registry, each outcome written to the
-/// store through the health adapter under the term this replica leads.
+/// health loop over the holder's registry. Each outcome moves the
+/// worker's object, and the health adapter tells the store the status
+/// that stands, under the term this replica leads.
 ///
 /// The loop probes what the holder holds. The registry tells it of each
 /// object laid, replaced and ended, and nothing here reads a row. An object
@@ -56,10 +57,12 @@ impl Prober {
     /// that ended is told to end, and its end is awaited before the next
     /// starts: two loops never run at once.
     ///
-    /// An outcome that comes back behind its term's end is not written.
-    /// The term's adapter asks the lead ([`ElectedLead`]) before it takes
-    /// the object's lock and again under it, and the store asks it once
-    /// more behind its own lock.
+    /// An outcome that comes back behind its term's end moves nothing.
+    /// The term's adapter asks the lead ([`ElectedLead`]) before it hands
+    /// the outcome on and again under the object's lock, and the store
+    /// asks it once more behind its own lock. A move the store takes no
+    /// word of is taken back in the tell's own turn of the object's lock:
+    /// the object takes the status its row holds.
     ///
     /// The task ends at the stop alone. Once the word's teller is gone
     /// nothing leads here: the loop ends and the task waits for the stop.

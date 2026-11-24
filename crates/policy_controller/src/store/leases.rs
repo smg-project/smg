@@ -315,7 +315,8 @@ impl Sides {
     /// guard lends its engine, made from the record on file. `None`, and
     /// no call, for a pair's lease, which is no single's, and for a
     /// dispatch that names no target of the pick: it tells nothing of the
-    /// lease.
+    /// lease. A served controller tells a single's words through this
+    /// view, by the rule a guard's lease is told by.
     ///
     /// The parts are read as they stood before the word:
     ///
@@ -484,7 +485,8 @@ pub trait LeasesStore: Send + Sync {
     /// the side it names and no other: a decode's on another target moves
     /// the decode's booking alone, and a side the lease does not hold
     /// changes nothing. A dispatch on a chosen decode side books the
-    /// named target, or the first target if the index names none.
+    /// target it names. At an index the pick holds no target at, that
+    /// side stays chosen and books none.
     fn dispatched(
         &self,
         gateway: GatewayId,
@@ -534,7 +536,7 @@ pub trait LeasesStore: Send + Sync {
 
     /// The gateways are gone past their grace: every lease of each released
     /// as client gone, and with them what the store holds of each gateway's
-    /// own about a worker (its vetoes, its completed dispatches). One write
+    /// own about a worker: its vetoes. One write
     /// a table for them all: one pass over the leases, one over the vetoes
     /// and one publication. Returns how many leases each held, in the order
     /// of `gone`. It is the store's one door for a gone gateway.

@@ -64,12 +64,6 @@ pub const ENTRIES: &[(&str, &str, EntryReplication)] = &[
         EntryReplication::Rebuilt(HELLO),
     ),
     ("HealthSink", "vetoed", EntryReplication::Read),
-    (
-        "HealthSink",
-        "completed",
-        EntryReplication::Rebuilt("the gateways' reports of the last probe interval"),
-    ),
-    ("HealthSink", "completed_ok_since", EntryReplication::Read),
     // A log carries no load row: a standby holds none of its leader's and
     // no overload verdict. Its first poll goes out at its take.
     ("LoadSink", "record", EntryReplication::Rebuilt(REPORTED)),
@@ -224,10 +218,7 @@ pub const ENTRIES: &[(&str, &str, EntryReplication)] = &[
         EntryReplication::Journaled,
     ),
     ("MemoryStore", "snapshot", EntryReplication::Read),
-    ("MemoryStore", "build_view", EntryReplication::Read),
     ("MemoryStore", "with_snapshot", EntryReplication::Read),
-    ("MemoryStore", "build_pair", EntryReplication::Read),
-    ("MemoryStore", "build_encode_pair", EntryReplication::Read),
     ("MemoryStore", "deciding", EntryReplication::Read),
     ("MemoryStore", "prompt_hashes", EntryReplication::Read),
     ("MemoryStore", "micros", EntryReplication::Read),
@@ -239,11 +230,6 @@ pub const ENTRIES: &[(&str, &str, EntryReplication)] = &[
     ("MemoryStore", "stats", EntryReplication::Read),
     ("MemoryStore", "overload_flips", EntryReplication::Read),
     ("MemoryStore", "outside_lists", EntryReplication::Read),
-    (
-        "MemoryStore",
-        "publication_allocations",
-        EntryReplication::Read,
-    ),
     ("MemoryStore", "publications", EntryReplication::Read),
     ("MemoryStore", "membership_builds", EntryReplication::Read),
     ("MemoryStore", "resyncs", EntryReplication::Read),

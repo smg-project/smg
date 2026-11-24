@@ -182,7 +182,8 @@ struct CliArgs {
 /// for `grouped_dp_sticky`: the dispatch pins by the gateway's own key, and
 /// a supplied document names its own key sources. The two overload
 /// thresholds are not listed: no document names one, and the gateway builds
-/// its worker objects with them.
+/// its worker objects with them unless the document switches its overload
+/// block off.
 const DOCUMENT_REPLACES: [&str; 43] = [
     "policy",
     "cache_threshold",
@@ -734,7 +735,8 @@ struct RoutingArgs {
     /// setting, the overload switch and shed flag and the warm-up and pairing
     /// settings are each refused beside it by name. The two overload
     /// thresholds stand beside it: the gateway builds its workers with them,
-    /// unless the document switches its overload block off
+    /// unless the document switches its overload block off.
+    /// A file named `.json` is read as JSON, any other name as YAML
     #[arg(
         long,
         value_name = "FILE",
@@ -2262,8 +2264,9 @@ mod tests {
     }
 
     /// No document names an overload threshold. The two flags stand beside
-    /// a document, the document stays in force, and the settings a worker
-    /// object is built with hold the two.
+    /// a document, the document stays in force, and under a document whose
+    /// overload block is on the settings a worker object is built with hold
+    /// the two.
     #[test]
     fn the_overload_thresholds_stand_beside_a_document() {
         let (file, document) = policy_file("round_robin").expect("a policy document file");

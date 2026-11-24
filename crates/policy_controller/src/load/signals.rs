@@ -2,7 +2,7 @@
 //!
 //! A signal here is a named number about one row at one instant: a value
 //! a report states under a name the document declares
-//! ([`SignalSpec`](crate::document::spec::SignalSpec)), published with the rows. The
+//! ([`SignalSpec`](crate::document::spec::SignalSpec)). The
 //! lifecycle's event [`Signal`](crate::tracking::Signal) is the other thing of that
 //! name: one report, health change or veto about one worker, as a stage
 //! hears it.
@@ -186,6 +186,7 @@ impl SignalCells {
     }
 
     /// The cells, row after row.
+    #[cfg(all(test, feature = "in-process"))]
     pub(crate) fn cells(&self) -> &[SignalCell] {
         &self.cells
     }

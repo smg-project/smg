@@ -97,9 +97,9 @@ thread_local! {
 
 /// The stage a pair whose request states places is declined under
 /// ([`Constraints::places`](crate::engine::view::Constraints::places)):
-/// one set of places cannot hold a pair's two lists. An encode request's
-/// lists whose pair is held to places are declined under it too.
-pub(super) const PLACES: &str = "places";
+/// one set of places cannot hold a pair's two lists. An encode request
+/// that states places of its own is declined under it too.
+pub(super) use crate::engine::decision::PLACES;
 
 /// The crate's word, in a shed's `emptied_by`, for a pool no stage emptied.
 const NO_STAGE: &str = "none";
@@ -141,9 +141,9 @@ pub(super) fn alone(
 /// picked, alone ([`AlonePick::decision`]), and its lease, issued here as a
 /// whole pass's is ([`issued`]). The lease states the size `plain` states,
 /// the two lengths of its `text`, characters and bytes, and no session, and
-/// is dated at `now` on the engine's clock. The issue
-/// is told where a stage takes it. `None` where the list holds no worker at
-/// the place.
+/// is dated at `now` on the engine's clock. The issue is told where a
+/// stage takes it, under a catch of its own as a whole pass's is. `None`
+/// where the list holds no worker at the place.
 pub(super) fn noted(
     own: Loaded<'_, '_>,
     pick: AlonePick,
@@ -184,7 +184,7 @@ pub(super) fn noted(
     };
     if document.hears.contains(EventKind::Issued) {
         let stages = document.spec.engine();
-        stages.on_decision_issued(&lease, &decided.decision);
+        own.word_caught(|| stages.on_decision_issued(&lease, &decided.decision));
     }
     Some(decided)
 }
@@ -282,7 +282,7 @@ pub(super) fn decide(
     let cx = if cx.demands.is_none() {
         &cx
     } else {
-        match held(records, cx, &mut meeting) {
+        match held(records, cx, request.facts.phase, &mut meeting) {
             Ok(held) => {
                 narrowed = held;
                 &narrowed
@@ -362,13 +362,16 @@ fn by_facts<const RETRY: bool>(
     let (engine, workers) = (spec.engine(), members.workers());
     // A keyed request is decided by the rows its key names, where they say
     // what the whole pass would: its key's pin, or its ring's walk.
+    // Read ahead of the keyed entry: a leave told behind a pin's choice is
+    // seen where the pin is handed on.
+    let leaves = own.affinity.leaves();
     match keys::decide(engine, records, workers, live, facts, cx) {
         // A pin its rule keeps from the profile: no holder is named for it
         // and nothing is kept of where its prompt went.
         Some(keyed) if !lease_events::stages_hear(&keyed) => keyed,
         // A pin that is the profile's own goes through the same lookup with
         // its answer made.
-        Some(keyed) => handed_on(own, members, records, facts, maker, keyed),
+        Some(keyed) => handed_on(own, members, records, facts, maker, keyed, leaves),
         // A profile whose stages read who holds the prompt is named its
         // rows from the gateway's own data, at the decision's instant the
         // keyed entry wrote, and its pick is recorded behind it; any other
@@ -380,6 +383,7 @@ fn by_facts<const RETRY: bool>(
             workers,
             records.ids(),
             facts,
+            cx.places,
             |page| maker.token_key(page),
             |target| maker.sends_to(target),
             |facts| whole.decide(engine, records, workers, live, facts, cx),
@@ -411,8 +415,9 @@ fn handed_on(
     facts: &mut RequestFacts<'_>,
     maker: &(impl RequestMaker + ?Sized),
     keyed: Decision,
+    leaves: u64,
 ) -> Decision {
-    overlap::decide(
+    overlap::decide_behind(
         &own.affinity,
         members.affinity(),
         &own.document.spec,
@@ -421,7 +426,8 @@ fn handed_on(
         facts,
         |page| maker.token_key(page),
         |target| maker.sends_to(target),
-        |_| keyed,
+        leaves,
+        keyed,
     )
 }
 
@@ -471,12 +477,26 @@ fn retried(
 /// ([`held_in`]). The places stand in `meeting`, the calling thread's own
 /// list, taken here: its caller puts it back ([`MEETING`]). Out of line:
 /// its code stays off the path of a request that states no demand.
+///
+/// A request stands alone here, so its list is held to what a worker of
+/// its `phase`'s role holds of the demands ([`Demands::held_by`]). A
+/// prefill worker holds the input alone, with no decode beside it to hold
+/// the rest: a host states both bounds whatever the phase.
+///
+/// [`Demands::held_by`]: crate::engine::demands::Demands::held_by
 #[inline(never)]
 fn held<'a>(
     records: &PoolRecords,
     cx: Constraints<'a>,
+    phase: Phase,
     meeting: &'a mut Option<Vec<u32>>,
 ) -> Result<Constraints<'a>, UnmetDemand> {
+    let demands = cx.demands.held_by(phase.role());
+    let cx = Constraints { demands, ..cx };
+    // Where the role holds none of them, no row is judged.
+    if demands.is_none() {
+        return Ok(cx);
+    }
     held_in(records, cx, meeting.insert(MEETING.take()))
 }
 
@@ -549,8 +569,12 @@ fn shed(
 /// on a lease a pick is issued before the answer leaves: its lease takes
 /// the next id, books the pick's first target and is dated at the
 /// decision's instant, and the stages that take the issue hear of it here,
-/// on the calling thread and inside the decision's own catch. From the
-/// answer the lease is its guard's: nothing of it is filed.
+/// on the calling thread and under a catch of its own
+/// ([`super::PolicyEngine::word_caught`]). A stage that panics at the issue
+/// is held and counted, the stages behind it do not hear it, and the pick
+/// and its lease are answered all the same: the guard tells the lease's
+/// dispatch and its end as any lease's. From the answer the lease is its
+/// guard's: nothing of it is filed.
 ///
 /// A pick the binding's sessions rule keeps from the profile is issued
 /// too, and no stage hears its issue ([`lease_events::stages_hear`]).
@@ -589,7 +613,7 @@ pub(super) fn issued(
         // Asked behind the document's own word: a document whose stages
         // take no issue reads nothing of the pick here.
         if lease_events::stages_hear(&decision) {
-            document.spec.engine().on_decision_issued(lease, &decision);
+            own.word_caught(|| document.spec.engine().on_decision_issued(lease, &decision));
         }
     }
     DecideOutcome {
@@ -931,7 +955,8 @@ pub(crate) mod tests {
     #[test]
     fn a_place_picked_under_a_document_that_takes_a_word_is_noted() {
         let (engine, heard) = hearing_as(false, true, EventSet::LEASE);
-        let place = engine.place_for(MODEL, Phase::Single);
+        let document = engine.spec();
+        let place = document.place_for(MODEL, Phase::Single);
         assert!(matches!(place, Place::Alone(_)), "{place:?}");
         let list = pool(4);
         let members = PublishedList::new(Arc::clone(&list));
@@ -1020,7 +1045,7 @@ pub(crate) mod tests {
         });
         let records = engine
             .members_of(members.lent())
-            .records(engine.spec(), &engine.clock);
+            .records(engine.standing_spec(), &engine.clock);
         let stated: Vec<WorkerId> = (0..4).map(wide).collect();
         assert_eq!(records.ids(), stated);
         for (row, worker) in records.fixed().iter().zip(list.iter()) {
@@ -1050,7 +1075,7 @@ pub(crate) mod tests {
             .map(|worker| worker_id(worker.as_ref()))
             .collect();
         let unsaid = engine.members_of(unsaid.lent());
-        let records = unsaid.records(engine.spec(), &engine.clock);
+        let records = unsaid.records(engine.standing_spec(), &engine.clock);
         assert_eq!(records.ids(), prints);
     }
 
@@ -1075,7 +1100,7 @@ pub(crate) mod tests {
             .collect();
         let records = engine
             .members_of(members.lent())
-            .records(engine.spec(), &engine.clock);
+            .records(engine.standing_spec(), &engine.clock);
         assert_eq!(records.ids(), prints);
 
         // The stock sessions rule: a key's first request is placed and
@@ -1412,7 +1437,7 @@ pub(crate) mod tests {
         for workers in [3, DRAW_FROM - 1, DRAW_FROM, 64] {
             let spec = AppliedSpec::validate(&document).expect("the document validates");
             let engine = PolicyEngine::new(spec);
-            let Place::Alone(profile) = engine.place_for("unruled-1", Phase::Single) else {
+            let Place::Alone(profile) = engine.spec().place_for("unruled-1", Phase::Single) else {
                 panic!("one pick of round robin decides the place");
             };
             let (one, other) = (pool(workers), pool(workers));
@@ -1445,7 +1470,12 @@ pub(crate) mod tests {
             let mut shared = Vec::new();
             for turn in 0..8 {
                 shared.push(if turn % 2 == 0 {
-                    let alone = engine.pick(profile, lists[0].lent(), RoutingState::eligible);
+                    let alone = engine.pick(
+                        &engine.spec(),
+                        profile,
+                        lists[0].lent(),
+                        RoutingState::eligible,
+                    );
                     alone.expect("a worker")
                 } else {
                     whole(&lists[0], true)
@@ -1869,8 +1899,7 @@ pub(crate) mod tests {
     }
 
     /// A request that hands no list is decided over no worker. One that
-    /// states what no stage here runs is declined under that stage's name,
-    /// and a side sent on its own has no decision.
+    /// states what no stage here runs is declined under that stage's name.
     #[test]
     fn what_no_stage_runs_is_answered_by_name() {
         let engine = preset("round_robin");
@@ -1900,19 +1929,11 @@ pub(crate) mod tests {
         dialed.constraints.wire_modes = WireModes::HTTP.union(WireModes::GRPC);
         let asks = Asks::of(dialed, Some(&members));
         assert!(matches!(answered(&engine, &asks), Decided::Alone(_)));
-        let mut side = request();
-        side.facts.phase = Phase::Decode;
-        let asks = Asks::of(side, Some(&members));
-        assert_eq!(
-            engine
-                .decide_under(GatewayId::LOCAL, &asks, Instant::now())
-                .err(),
-            Some(DecisionRefused::PairSide)
-        );
     }
 
     /// A list's cell is asked where the engine decides over the list, and
-    /// nowhere else. A request the engine refuses by its phase asks no
+    /// nowhere else. A request the engine refuses by its phase, a pair's
+    /// decode sent on its own, asks no
     /// cell, plain or not, at either entry: its list's cell stays empty. A
     /// maker that names its list while it makes the request is decided over
     /// that list. So is a plain maker that lends one list ahead of its
@@ -1970,22 +1991,26 @@ pub(crate) mod tests {
         let list = pool(2);
         let members = PublishedList::new(Arc::clone(&list));
         let now = Instant::now();
-        for phase in [Phase::Decode, Phase::Encode] {
-            let mut side = request();
-            side.facts.phase = phase;
-            // A plain request, and the same one from a maker that does not
-            // say so.
-            let plain = Asks::of(side, Some(&members));
-            assert!(plain.plain().is_some());
-            let leased = engine.decide_under(GatewayId::LOCAL, &plain, now);
-            assert_eq!(leased.err(), Some(DecisionRefused::PairSide), "{phase:?}");
-            let whole = Whole(Asks::of(side, Some(&members)));
-            let leased = engine.decide_under(GatewayId::LOCAL, &whole, now);
-            assert_eq!(leased.err(), Some(DecisionRefused::PairSide), "{phase:?}");
-            let bare = engine.decide_without_lease(&whole, now);
-            assert_eq!(bare.err(), Some(DecisionRefused::PairSide), "{phase:?}");
-        }
-        assert_eq!(engine.values_made(), 0, "no cell was asked");
+        // Under a pair plan a decode is its pair's side: sent on its own
+        // over one list it is refused, and the list's cell is not asked.
+        let document =
+            PolicySpec::pair_presets("round_robin", "round_robin").expect("the pair presets");
+        let paired = PolicyEngine::new(AppliedSpec::validate(&document).expect("a valid document"));
+        let mut side = request();
+        side.facts.phase = Phase::Decode;
+        // A plain request, and the same one from a maker that does not say
+        // so.
+        let plain = Asks::of(side, Some(&members));
+        assert!(plain.plain().is_some());
+        let leased = paired.decide_under(GatewayId::LOCAL, &plain, now);
+        assert_eq!(leased.err(), Some(DecisionRefused::PairSide));
+        let whole = Whole(Asks::of(side, Some(&members)));
+        let leased = paired.decide_under(GatewayId::LOCAL, &whole, now);
+        assert_eq!(leased.err(), Some(DecisionRefused::PairSide));
+        let bare = paired.decide_without_lease(&whole, now);
+        assert_eq!(bare.err(), Some(DecisionRefused::PairSide));
+        assert_eq!(paired.values_made(), 0, "no cell was asked");
+        assert!(!members.filled(), "the list's cell stays empty");
 
         let late = Late(request(), &members, Cell::new(false));
         let leased = engine.decide_under(GatewayId::LOCAL, &late, now);
@@ -2114,6 +2139,40 @@ pub(crate) mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// A request held to places is handed its prompt's holder among them,
+    /// where more workers outside them were sent the prompt than the
+    /// profile's sample of sixteen. Forty workers are sent one prompt, each
+    /// by a request held to it alone. The prompt held to one of them, and
+    /// to seven workers it was never sent to, is then handed that one under
+    /// every seed. The classic policy narrows its workers first and takes
+    /// every candidate its tree matched
+    /// (`model_gateway/src/routers/common/placement.rs:474-484`,
+    /// `model_gateway/src/policies/cache_aware.rs:2541-2552`).
+    #[test]
+    fn a_held_request_is_handed_its_prompts_holder_among_its_places() {
+        let engine = preset("cache_aware");
+        let list = pool(64);
+        let members = PublishedList::new(Arc::clone(&list));
+        let tokens: Vec<u32> = (0..1_024).collect();
+        let hashes = engine.prompt_hashes(MODEL, Some(&tokens), None, HashSeeds::PLAIN);
+        let sent = |places: &[u32], seed: u64| {
+            let mut asked = request();
+            asked.facts.seed = seed;
+            asked.constraints.places = Some(places);
+            hashes.write_to(&mut asked.facts);
+            let decided = decided(&engine, &Asks::of(asked, Some(&members)));
+            let pick = decided.decision.pick().expect("a pick");
+            pick.targets.iter().next().expect("a target").position
+        };
+        for place in 0..40 {
+            assert_eq!(sent(&[place], 0), place);
+        }
+        for seed in 1..=32 {
+            let handed = sent(&[7, 40, 41, 42, 43, 44, 45, 46], seed);
+            assert_eq!(handed, 7, "seed {seed}");
         }
     }
 
@@ -2261,10 +2320,11 @@ pub(crate) mod tests {
         overlap::decide(
             engine.affinity(),
             &overlap::PoolAffinity::default(),
-            engine.spec(),
+            engine.standing_spec(),
             list,
             &ids,
             &mut asked.facts,
+            None,
             |_| None,
             |_| true,
             |facts| {
@@ -2529,7 +2589,8 @@ pub(crate) mod tests {
     #[test]
     fn a_decision_without_a_lease_takes_no_id_and_tells_no_stage() {
         let (engine, heard) = hearing_as(false, true, EventSet::LEASE);
-        let place = engine.place_for(MODEL, Phase::Single);
+        let document = engine.spec();
+        let place = document.place_for(MODEL, Phase::Single);
         assert!(matches!(place, Place::Alone(_)), "{place:?}");
         let list = pool(4);
         let members = PublishedList::new(Arc::clone(&list));
@@ -2633,9 +2694,10 @@ pub(crate) mod tests {
 
     /// A request that hands no list of its kind is decided over no worker,
     /// as the one entry decides it: a single with no list, a pair's prefill
-    /// with none, and a prefill over a single's list. A single over a pair's
-    /// two lists or an encode request's three is shed too. A decode or an
-    /// encode request sent on its own is refused.
+    /// with none, and a pair's prefill over a single's list. A single over a
+    /// pair's two lists or an encode request's three is shed too. So is a
+    /// decode or an encode request that stands alone and hands no list. A
+    /// pair's decode sent on its own is refused.
     #[test]
     fn a_decision_without_a_lease_over_no_list_names_no_worker() {
         use smg_worker::{test_support::worker_with_model_aliases, worker::WorkerType};
@@ -2685,6 +2747,7 @@ pub(crate) mod tests {
         let encode = EncodeLists {
             pair,
             encoders: encoders.lent(),
+            encoders_places: None,
             encoders_stalled: &[],
             encoders_held: &[],
             facts: &[EncoderFacts {
@@ -2704,7 +2767,9 @@ pub(crate) mod tests {
         for (phase, over, members, engine) in [
             (Phase::Single, "no list", WorkerLists::None, &engine),
             (Phase::Prefill, "no list", WorkerLists::None, &engine),
-            (Phase::Prefill, "a single's list", single, &engine),
+            (Phase::Decode, "no list", WorkerLists::None, &engine),
+            (Phase::Encode, "no list", WorkerLists::None, &engine),
+            (Phase::Prefill, "a single's list", single, &paired),
             (Phase::Single, "a pair's lists", both, &paired),
             (Phase::Single, "an encode request's lists", three, &paired),
         ] {
@@ -2725,11 +2790,9 @@ pub(crate) mod tests {
             };
             assert_eq!((theirs.reason, theirs.emptied_by), none);
         }
-        for phase in [Phase::Decode, Phase::Encode] {
-            let asks = stating(phase, WorkerLists::None);
-            let refused = engine.decide_without_lease(&asks, Instant::now());
-            assert_eq!(refused.err(), Some(DecisionRefused::PairSide), "{phase:?}");
-        }
+        let asks = stating(Phase::Decode, WorkerLists::None);
+        let refused = paired.decide_without_lease(&asks, Instant::now());
+        assert_eq!(refused.err(), Some(DecisionRefused::PairSide));
     }
 
     /// A request its sessions rule places alone says so on its pick, and its
@@ -3308,6 +3371,22 @@ pub(crate) mod tests {
         hearing_spec_as(false, false, EventSet::LEASE)
     }
 
+    /// [`hearing_spec`] under the generation `number`, for a case that
+    /// puts a later document in force.
+    pub(in crate::engine::policy_engine) fn hearing_spec_at(number: u64) -> (AppliedSpec, Heard) {
+        let heard = Heard::default();
+        let kept = Arc::clone(&heard);
+        let spec = spec_picked_by_at(number, "hears", move || {
+            Box::new(Hears {
+                heard: Arc::clone(&kept),
+                panics: false,
+                alone: false,
+                takes: EventSet::LEASE,
+            })
+        });
+        (spec, heard)
+    }
+
     /// [`hearing`] with a picker that places by itself where `alone`, and
     /// that names the words `takes`.
     fn hearing_as(panics: bool, alone: bool, takes: EventSet) -> (PolicyEngine, Heard) {
@@ -3344,11 +3423,20 @@ pub(crate) mod tests {
         name: &'static str,
         make: impl Fn() -> Box<dyn Picker> + Send + Sync + 'static,
     ) -> AppliedSpec {
+        spec_picked_by_at(1, name, make)
+    }
+
+    /// [`spec_picked_by`] under the generation `number`.
+    fn spec_picked_by_at(
+        number: u64,
+        name: &'static str,
+        make: impl Fn() -> Box<dyn Picker> + Send + Sync + 'static,
+    ) -> AppliedSpec {
         let mut stages = StageRegistry::builtin();
         let added = stages.picker(name, make);
         added.expect("a free name");
         let mut document = PolicySpec::preset("random").expect("a built-in preset");
-        document.generation = 1;
+        document.generation = number;
         let profile = document.profiles.get_mut("random");
         profile.expect("the preset's profile").pick = name.into();
         let spec = AppliedSpec::validate_in(&document, &stages, &[]);
@@ -3401,8 +3489,9 @@ pub(crate) mod tests {
     }
 
     /// The words a stage of `engine` put into `heard` of two requests: one
-    /// sent to its first target and completed, and one given up unsent.
-    fn told(engine: &PolicyEngine, heard: &Heard) -> Vec<&'static str> {
+    /// sent to its first target and completed, and one given up unsent. A
+    /// stage panicked at `unheard` of the words, and no decision faulted.
+    fn told(engine: &PolicyEngine, heard: &Heard, unheard: u64) -> Vec<&'static str> {
         let list = pool(4);
         let members = PublishedList::new(Arc::clone(&list));
         let asks = Asks::of(request(), Some(&members));
@@ -3428,7 +3517,7 @@ pub(crate) mod tests {
         let unsent =
             DecisionGuard::decide_under(engine, GatewayId::LOCAL, &asks, now).expect("a decision");
         drop(unsent);
-        assert_eq!((engine.faults(), engine.unheard()), (0, 0));
+        assert_eq!((engine.faults(), engine.unheard()), (0, unheard));
         let words = heard.lock().iter().map(|heard| heard.0).collect();
         words
     }
@@ -4008,7 +4097,7 @@ pub(crate) mod tests {
     fn a_word_no_stage_takes_is_told_to_nobody() {
         let told_of = |kind: EventKind| {
             let (engine, heard) = hearing_as(false, false, EventSet::NONE.with(kind));
-            told(&engine, &heard)
+            told(&engine, &heard, 0)
         };
         assert_eq!(told_of(EventKind::Issued), ["issued", "issued"]);
         assert_eq!(told_of(EventKind::Dispatched), ["dispatched"]);
@@ -4032,10 +4121,144 @@ pub(crate) mod tests {
                 takes: EventSet::NONE,
             }))
         });
-        assert_eq!(engine.document.hears, EventSet::LEASE);
+        assert_eq!(engine.in_force().hears, EventSet::LEASE);
         assert_eq!(
-            told(&engine, &heard),
+            told(&engine, &heard, 0),
             ["issued", "dispatched", "completed", "issued", "released"]
+        );
+    }
+
+    /// [`Hears`] as a stage that panics at one word of a lease, the kind it
+    /// names, and keeps each other word.
+    #[derive(Debug)]
+    struct StopsAt(Hears, EventKind);
+
+    impl StopsAt {
+        /// Panics where `word` is the stage's own.
+        fn stop(&self, word: EventKind) {
+            assert!(self.1 != word, "this stage panics at that word");
+        }
+    }
+
+    impl Lifecycle for StopsAt {
+        fn hears(&self) -> EventSet {
+            EventSet::LEASE
+        }
+
+        fn on_decision_issued(&self, lease: &Lease, decision: &Decision) {
+            self.stop(EventKind::Issued);
+            self.0.on_decision_issued(lease, decision);
+        }
+
+        fn on_dispatched(&self, lease: &Lease, target: &Target, side: Side, since: u32) {
+            self.stop(EventKind::Dispatched);
+            self.0.on_dispatched(lease, target, side, since);
+        }
+
+        fn on_completed(&self, lease: &Lease, outcome: &Outcome) {
+            self.stop(EventKind::Completed);
+            self.0.on_completed(lease, outcome);
+        }
+
+        fn on_released(&self, lease: &Lease, reason: ReleaseReason) {
+            self.stop(EventKind::Released);
+            self.0.on_released(lease, reason);
+        }
+    }
+
+    impl Picker for StopsAt {
+        fn name(&self) -> &'static str {
+            "stops-at"
+        }
+
+        fn refuses_by_reports(&self) -> bool {
+            self.0.refuses_by_reports()
+        }
+
+        fn picks_alone(&self) -> bool {
+            self.0.picks_alone()
+        }
+
+        fn pick_alone(
+            &self,
+            pool: &PoolWord<'_>,
+            keep: &mut dyn FnMut(usize) -> bool,
+        ) -> Option<usize> {
+            self.0.pick_alone(pool, keep)
+        }
+
+        fn pick(
+            &self,
+            facts: &RequestFacts<'_>,
+            candidates: &[Candidate],
+            kept: &[u32],
+            scores: &[f32],
+            band: TieBand,
+            out: &mut Targets,
+        ) {
+            self.0.pick(facts, candidates, kept, scores, band, out);
+        }
+    }
+
+    /// What [`told`] reads of an engine whose stage panics at `word`, with
+    /// `unheard` held panics counted and no fault. The stage's picker
+    /// places by itself where `alone`.
+    fn told_past(word: EventKind, alone: bool, unheard: u64) -> Vec<&'static str> {
+        let heard = Heard::default();
+        let kept = Arc::clone(&heard);
+        let engine = picked_by("stops-at", move || {
+            let hears = Hears {
+                heard: Arc::clone(&kept),
+                panics: false,
+                alone,
+                takes: EventSet::LEASE,
+            };
+            Box::new(StopsAt(hears, word))
+        });
+        told(&engine, &heard, unheard)
+    }
+
+    /// A stage that panics at a first decision's issue is held and counted
+    /// with the words a stage did not hear, on the whole pass and on the
+    /// short path of a picker that places by itself. The decision answers
+    /// its pick and its lease, so the guard tells the lease's dispatch and
+    /// its end as any lease's: of a request sent and one given up, the
+    /// stage hears every word but the two issues. Before, each request was
+    /// answered a fault.
+    ///
+    /// The classic pass tells a policy nothing where a pick is issued: it
+    /// asks the policy for one pick
+    /// (`model_gateway/src/routers/common/placement.rs:1391`).
+    #[test]
+    fn a_stage_that_panics_at_a_first_issue_costs_the_request_nothing() {
+        for alone in [false, true] {
+            // The two held panics alone are counted.
+            assert_eq!(
+                told_past(EventKind::Issued, alone, 2),
+                ["dispatched", "completed", "released"],
+                "a picker that places by itself: {alone}"
+            );
+        }
+    }
+
+    /// A stage that panics at a later word of a lease is held under the
+    /// same catch and counted the same way, as before this catch was the
+    /// issue's too: the request goes on, and the stage hears every other
+    /// word of the request sent and of the one given up.
+    #[test]
+    fn a_stage_that_panics_at_a_later_word_of_a_lease_is_held_and_counted() {
+        let past = |word| told_past(word, false, 1);
+        assert_eq!(
+            past(EventKind::Dispatched),
+            ["issued", "completed", "issued", "released"]
+        );
+        assert_eq!(
+            past(EventKind::Completed),
+            ["issued", "dispatched", "issued", "released"]
+        );
+        assert_eq!(
+            past(EventKind::Released),
+            ["issued", "dispatched", "completed", "issued"]
         );
     }
 

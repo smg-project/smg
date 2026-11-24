@@ -3,29 +3,41 @@
 //! the engine decides them in
 //! ([`Engine::decide_encode_pair`](crate::engine::Engine::decide_encode_pair)).
 //!
-//! No affinity column and no signal cell stands beside the encoders, and
-//! no ring is lent for them: an encode profile's stage that places by a
-//! ring places by its own.
+//! No affinity column stands beside the encoders, and no ring is lent for
+//! them: an encode profile's stage that places by a ring places by its
+//! own.
+//!
+//! **Named signals.** Under a document a stage of which reads a named
+//! signal, each of the three sides whose profile reads one is lent its own
+//! list's signal cells, of the snapshot the decision holds
+//! ([`signals::three`]). The decode asked again is a pair's
+//! ([`PairLists::decide`]) and is lent as one.
+//!
+//! **Who holds the prompt.** Each side of the pair is handed its own
+//! list's column and writes its pick behind the decision, as a pair's
+//! first decision does ([`side_columns`], [`record_sides`]).
 //!
 //! **The entries.** A host asks through
 //! [`PolicyEngine::decide_encode_at`]: the three lists' decision, with the
 //! pair's lease a pick is issued. No lease is issued for an encoder.
 
-use std::{sync::Arc, time::Instant};
+use std::{cell::OnceCell, sync::Arc, time::Instant};
 
 use smg_worker::load::state::LoadSnapshot;
 
 use super::{
-    pair::{issued, not_decided, stamp, tried_engines, Buffers, PairLists, BUFFERS},
-    single::{self, PLACES},
-    Loaded, PolicyEngine, PoolMembers,
+    pair::{
+        issued, not_decided, record_sides, side_columns, stamp, tried_engines, Buffers, PairLists,
+        BUFFERS,
+    },
+    signals, single, Loaded, PolicyEngine, PoolMembers,
 };
 use crate::engine::{
-    decision::{shed, Decision, ShedReason, WIRES},
+    decision::{Decision, Target, WIRES},
     decision_engine::{DecideOutcome, DecisionRefused, Request, RequestMaker, WorkerLists},
     framework::{EncodeItems, EncodePlaced, EncodePool, EncoderFacts, PairPools},
     list_cell::LentList,
-    records::Live,
+    records::{HeldCells, Live},
     view::{Constraints, Phase, RequestFacts},
 };
 
@@ -56,6 +68,14 @@ pub struct EncodeLists<'a> {
     pub pair: PairLists<'a>,
     /// The encoders.
     pub encoders: LentList<'a>,
+    /// The places of the encoder list the request may take, ascending,
+    /// each once; `None` for every place. The request's own fact and no
+    /// veto of a worker, stated as the pair's are
+    /// ([`PairLists::prefill_places`]): an item is placed on an encoder at
+    /// one of them under any document, and a prefill that only other
+    /// encoders hand to is not the pair's. A place past the list's end
+    /// names no encoder.
+    pub encoders_places: Option<&'a [u32]>,
     /// The places of the encoder list a standing veto of the host masks,
     /// ascending, each once; empty for none ([`Constraints::stalled`]). The
     /// encode side reads them as a single request's list reads its own. A
@@ -97,8 +117,8 @@ impl EncodeLists<'_> {
     /// A request that states no budget is decided with the widest one
     /// written into its facts too, as a pair's is ([`PairLists::decide`]).
     ///
-    /// These lists are narrowed by no demand, no subset hint and no
-    /// places, and a request's own mask names places of no one list: a
+    /// These lists are narrowed by no demand and no subset hint, and a
+    /// request's own places and its own mask name places of no one list: a
     /// request that states one of these is shed or declined as its pair's
     /// records answer it, and no key is placed. A pair's own request is
     /// held to a demand a side at a time ([`PairLists::decide`]), and an
@@ -109,19 +129,25 @@ impl EncodeLists<'_> {
     /// than their list are declined by the engine under the column's name:
     /// a request with none reads neither.
     ///
-    /// Lists whose pair is held to places ([`PairLists::prefill_places`],
-    /// [`PairLists::decode_places`]) are declined under the places' name,
-    /// and no key is placed: the engine decides an encode request's pair
-    /// over the workers it admits for the items and reads no place of the
-    /// lists.
+    /// Each list's host may hold the request to places of that list: the
+    /// pair's two ([`PairLists::prefill_places`],
+    /// [`PairLists::decode_places`]) and the encoders'
+    /// ([`Self::encoders_places`]). Each side of the pair is decided among
+    /// its own, numbered with the workers the engine admits for the items,
+    /// and each item's encoder is one at the encoders' places. A list
+    /// whose places name workers and none that takes the request, though a
+    /// worker outside them does, sheds it under the places' name, and no
+    /// key is placed: the request is held off every worker that takes it.
+    /// Places that name no worker of a list are no such case. Such places
+    /// of a side shed the request as they shed its pair alone, and such
+    /// places of the encoders shed it as a list with no open encoder does.
     ///
     /// Each side of the pair reads the places its host's standing vetoes
     /// mask and hold beside that side's list
     /// ([`PairLists::prefill_stalled`], [`PairLists::decode_stalled`]),
-    /// numbered with the workers the engine admits for the items. A side
-    /// whose host states none reads no mask. A side whose profile shows
-    /// its rows to a plugin is declined beside a mask, under the stage
-    /// `written-rows`.
+    /// numbered the same way. A side whose host states none reads no mask.
+    /// A side whose profile shows its rows to a plugin is declined beside
+    /// a mask, under the stage `written-rows`.
     ///
     /// The encoders read their own list's vetoes the same way
     /// ([`Self::encoders_stalled`], [`Self::encoders_held`]). A stage of
@@ -139,6 +165,11 @@ impl EncodeLists<'_> {
     /// is declined for a request with items, under the stage
     /// `encode-scope`, with a veto as without.
     ///
+    /// A side of the pair whose phase reads affinity is handed its own
+    /// list's column of who holds the prompt. Behind a pick the profile is
+    /// told of, that side's record of sent prefixes keeps where the prompt
+    /// went, as at a pair's first decision ([`PairLists::decide`]).
+    ///
     /// No lease is issued here and no stage is told of one: the engine's
     /// entry issues the pair's
     /// ([`PolicyEngine::decide_encode_at`](super::PolicyEngine::decide_encode_at)).
@@ -154,9 +185,21 @@ impl EncodeLists<'_> {
         items: EncodeItems<'_>,
         placed: &mut EncodePlaced,
     ) -> Decision {
-        let engine = engine.loaded();
+        let document = engine.in_force();
+        let engine = engine.under(&document);
         let sides = self.asked(engine);
-        self.decide_over(engine, sides, None, loads, now, request, items, placed)
+        self.decide_over(
+            engine,
+            sides,
+            None,
+            loads,
+            now,
+            request,
+            items,
+            placed,
+            |_| true,
+            |_| true,
+        )
     }
 
     /// The engine's own value of each of the pair's two lists, asked of
@@ -173,7 +216,13 @@ impl EncodeLists<'_> {
     /// which its caller asked of their cells, and of the encoders' where
     /// its caller read it. The encoders' cell is else asked here, behind
     /// every answer that reads no row of an encoder: a decision fills no
-    /// cell it does not read.
+    /// cell it does not read. `sends_to` says whether the request's caller
+    /// sends it to a target of the pick: each side's record of sent
+    /// prefixes is written for the first target it takes, as a pair's is
+    /// ([`record_sides`]). `sends_to_encoder` says the same of an encoder
+    /// the decision placed, by its place in the encoders' list: the record
+    /// is written for no target where the caller sends to one of them no
+    /// more, since it then sends the request to no target of the pick.
     #[expect(
         clippy::too_many_arguments,
         reason = "a pair's inputs and the encode side's"
@@ -188,6 +237,8 @@ impl EncodeLists<'_> {
         request: &mut Request<'_>,
         items: EncodeItems<'_>,
         placed: &mut EncodePlaced,
+        sends_to: impl Fn(&Target) -> bool,
+        sends_to_encoder: impl Fn(u32) -> bool,
     ) -> Decision {
         let (spec, clock) = (&engine.document.spec, &engine.clock);
         let pair = &self.pair;
@@ -202,20 +253,16 @@ impl EncodeLists<'_> {
         let live = Live::at(spec.engine(), clock, now, loads, None);
         request.facts.now_micros = live.now_micros();
         request.facts.budget_micros = super::budget::shown(request.facts.budget_micros);
-        // The engine's pass decides the pair over the prefills and the
-        // decodes it admits for the items: a place of the lists as their
-        // host holds them names no row there. The call's instant is
-        // written first, as every answer of this entry leaves it.
-        if pair.prefill_places.is_some() || pair.decode_places.is_some() {
-            placed.clear();
-            let (seed, generation) = (request.facts.seed, spec.generation());
-            return shed(ShedReason::PolicyDeclined, PLACES, seed, generation);
-        }
+        // Each side reads the places and the mask its host states beside
+        // its list. The engine's pass decides the pair over the prefills
+        // and the decodes it admits for the items, and numbers both with
+        // them.
         let (facts, cx) = (&request.facts, &request.constraints);
-        let [prefill_cx, decode_cx] = pair.masked(cx);
-        // The encoders read their own list's vetoes: the request states
-        // no mask of its own here.
+        let [prefill_cx, decode_cx] = pair.sides_of(cx);
+        // The encoders read their own list's places and vetoes: the
+        // request states none of its own here.
         let encode_cx = Constraints {
+            places: self.encoders_places,
             stalled: self.encoders_stalled,
             held: self.encoders_held,
             ..*cx
@@ -239,28 +286,51 @@ impl EncodeLists<'_> {
         };
         let mut decide = |buffers: &mut Buffers| {
             let [prefills, decodes] = &mut buffers.rows;
-            let (workers, records) = (prefill.workers(), prefill.records(spec, clock));
-            let (prefills, pool) = records.write(workers, &live, prefills);
-            let (workers, records) = (decode.workers(), decode.records(spec, clock));
-            let (decodes, _) = records.write(workers, &live, decodes);
+            let (workers, prefill_records) = (prefill.workers(), prefill.records(spec, clock));
+            let (prefills, pool) = prefill_records.write(workers, &live, prefills);
+            let (workers, decode_records) = (decode.workers(), decode.records(spec, clock));
+            let (decodes, _) = decode_records.write(workers, &live, decodes);
             stamp(prefills, decodes, pair.classes, pair.admission);
             let (workers, records) = (encoders.workers(), encoders.records(spec, clock));
-            let (encoders, _) = records.write(workers, &live, &mut buffers.encoders);
+            let (rows, _) = records.write(workers, &live, &mut buffers.encoders);
+            // Under a document a stage of which reads a named signal, each
+            // of the three sides that reads one is lent its list's cells
+            // for this call.
+            let lent = spec.needs().signal_cells.then(|| {
+                let members = [prefill, decode, encoders];
+                signals::three(members, spec, clock, &live, facts.model)
+            });
+            let [prefill_signal_cells, decode_signal_cells, signal_cells] = match &lent {
+                Some(lent) => lent
+                    .each_ref()
+                    .map(|side| side.as_ref().and_then(HeldCells::cells)),
+                None => [None; 3],
+            };
+            // Each side of the pair is handed its own list's column of who
+            // holds the prompt, as a pair's first decision is. The engine
+            // keeps a column's entries beside the rows it admits.
+            let sides = (Some((prefill, prefill_records)), (decode, decode_records));
+            let read = side_columns(engine, facts, sides.0, sides.1, &mut buffers.columns);
+            let [prefill_column, decode_column] = &buffers.columns;
             let pools = PairPools {
                 prefills,
                 decodes,
+                prefill_signal_cells,
+                decode_signal_cells,
+                prefill_affinity: prefill_column.as_slice(),
+                decode_affinity: decode_column.as_slice(),
                 table: pair.classes.table(),
                 first: pair.classes.first(),
-                ..PairPools::default()
             };
             let encode = EncodePool {
-                encoders,
+                encoders: rows,
+                signal_cells,
                 facts: self.facts,
                 prefill_classes: self.prefill_classes,
                 ..EncodePool::default()
             };
             let (engine, scratch) = (spec.engine(), &mut buffers.scratch);
-            engine.decide_encode_pair(
+            let decision = engine.decide_encode_pair(
                 facts,
                 &pool,
                 pools,
@@ -271,7 +341,25 @@ impl EncodeLists<'_> {
                 &encode_cx,
                 scratch,
                 placed,
-            )
+            );
+            // Behind the pick, each side's record keeps where the prompt
+            // went, as behind a pair's: nowhere, where the request's caller
+            // cannot send to an encoder the decision placed. The encoders
+            // are asked ahead of the first target, each place once.
+            let every_encoder = OnceCell::new();
+            let sends = |target: &Target| {
+                let asked = || {
+                    let encoders = placed.encoders();
+                    encoders.iter().enumerate().all(|(at, encoder)| {
+                        let place = encoder.position;
+                        let repeats = encoders.iter().take(at).any(|one| one.position == place);
+                        repeats || sends_to_encoder(place)
+                    })
+                };
+                *every_encoder.get_or_init(asked) && sends_to(target)
+            };
+            record_sides(&decision, facts, (prefill, decode), read, sends);
+            decision
         };
         let decision = BUFFERS.with(|buffers| match buffers.try_borrow_mut() {
             Ok(mut buffers) => decide(&mut buffers),
@@ -331,7 +419,9 @@ impl PolicyEngine {
         placed: &mut EncodePlaced,
         clock: impl FnOnce() -> Instant,
     ) -> Result<(DecideOutcome, bool), DecisionRefused> {
-        self.loaded().decide_encode_at(maker, items, placed, clock)
+        let document = self.in_force();
+        self.under(&document)
+            .decide_encode_at(maker, items, placed, clock)
     }
 
     /// [`Self::decide_encode_at`] with nothing its host hears of later: no
@@ -357,9 +447,14 @@ impl PolicyEngine {
         placed: &mut EncodePlaced,
         now: Instant,
     ) -> Result<Decision, DecisionRefused> {
-        let own = self.loaded();
+        let document = self.in_force();
+        let own = self.under(&document);
         own.over_three(maker, placed, |lists, request, loads, placed| {
-            decide(own, lists, request, items, loads, placed, now)
+            let sends_to = |target: &_| maker.sends_to(target);
+            let encoder = |place| maker.sends_to_encoder(place);
+            decide(
+                own, lists, request, items, loads, placed, now, sends_to, encoder,
+            )
         })
     }
 }
@@ -377,16 +472,28 @@ impl Loaded<'_, '_> {
     ) -> Result<(DecideOutcome, bool), DecisionRefused> {
         self.over_three(maker, placed, |lists, request, loads, placed| {
             let later = request.constraints.decode_later;
-            let decided = decided(self, lists, request, items, loads, placed, clock());
+            let sends_to = |target: &_| maker.sends_to(target);
+            let encoder = |place| maker.sends_to_encoder(place);
+            let decided = decided(
+                self,
+                lists,
+                request,
+                items,
+                loads,
+                placed,
+                clock(),
+                sends_to,
+                encoder,
+            );
             (decided, later)
         })
     }
 
     /// The request `maker` makes, decided by `decide` over the three lists
     /// the maker hands, with the load reports a pair's first decision
-    /// reads ([`PolicyEngine::loads_read`]), under the engine's catch. A request of
-    /// another phase than `Prefill`, or other lists, is a side sent on its
-    /// own. `placed` is left empty where no decision is made.
+    /// reads ([`Self::loads_read`]), under the engine's catch. A request
+    /// of another phase than `Prefill`, or other lists, is a side sent on
+    /// its own. `placed` is left empty where no decision is made.
     fn over_three<R>(
         self,
         maker: &impl RequestMaker,
@@ -444,7 +551,18 @@ impl Loaded<'_, '_> {
 /// ([`EncodeItems::references`]). The entries that decide a decode again
 /// take no items ([`WorkerLists::Encode`]). The decline reads the request's
 /// own facts and no list, so it stands also where no decode takes images.
+///
+/// `sends_to` says whether the request's caller sends it to a target of
+/// the pick ([`RequestMaker::sends_to`]): each side's record of sent
+/// prefixes is written for the first target it takes, as a pair's is.
+/// `sends_to_encoder` says whether it sends to an encoder the decision
+/// placed ([`RequestMaker::sends_to_encoder`]): the record is written for
+/// no target where it does not.
 #[inline]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "an encode request's inputs, and where its caller sends it"
+)]
 pub(super) fn decide(
     own: Loaded<'_, '_>,
     lists: &EncodeLists<'_>,
@@ -453,6 +571,8 @@ pub(super) fn decide(
     loads: Option<&Arc<LoadSnapshot>>,
     placed: &mut EncodePlaced,
     now: Instant,
+    sends_to: impl Fn(&Target) -> bool,
+    sends_to_encoder: impl Fn(u32) -> bool,
 ) -> Decision {
     // The engine's own value of each of the pair's lists, asked of the
     // list's cell once. The encoders' is asked where it is read: here
@@ -486,7 +606,18 @@ pub(super) fn decide(
         placed.clear();
         return single::declined(own, request, DECODE_LATER);
     }
-    lists.decide_over(own, sides, encoders, loads, now, request, items, placed)
+    lists.decide_over(
+        own,
+        sides,
+        encoders,
+        loads,
+        now,
+        request,
+        items,
+        placed,
+        sends_to,
+        sends_to_encoder,
+    )
 }
 
 /// One decision of an encode request by `own`, the engine of a gateway's
@@ -494,7 +625,12 @@ pub(super) fn decide(
 /// decision ([`decide`]) with the lease a pick issued. A pick issues its
 /// pair's two sides as a pair's first decision does ([`issued`]), and
 /// nothing for an encoder: no stage is told of one. A decision that picks
-/// no pair issues nothing.
+/// no pair issues nothing. `sends_to` and `sends_to_encoder` are handed to
+/// [`decide`] as they stand.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "an encode request's inputs, and where its caller sends it"
+)]
 pub(super) fn decided(
     own: Loaded<'_, '_>,
     lists: &EncodeLists<'_>,
@@ -503,7 +639,19 @@ pub(super) fn decided(
     loads: Option<&Arc<LoadSnapshot>>,
     placed: &mut EncodePlaced,
     now: Instant,
+    sends_to: impl Fn(&Target) -> bool,
+    sends_to_encoder: impl Fn(u32) -> bool,
 ) -> DecideOutcome {
-    let decision = decide(own, lists, request, items, loads, placed, now);
+    let decision = decide(
+        own,
+        lists,
+        request,
+        items,
+        loads,
+        placed,
+        now,
+        sends_to,
+        sends_to_encoder,
+    );
     issued(own, request, decision, None, now)
 }

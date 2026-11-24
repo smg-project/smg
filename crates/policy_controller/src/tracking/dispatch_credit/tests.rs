@@ -289,7 +289,7 @@ fn a_send_of_no_stated_size_leaves_the_count_with_its_release() {
 }
 
 #[test]
-fn a_retired_batch_takes_its_sends_of_no_stated_size_with_it() {
+fn a_retired_send_of_no_stated_size_leaves_that_count_too() {
     let (engine, sent) = built(None);
     let a = row(181, 5);
     for _ in 0..300 {
@@ -298,20 +298,20 @@ fn a_retired_batch_takes_its_sends_of_no_stated_size_with_it() {
     for _ in 300..8201 {
         send(&engine, &a, START + 1, 13);
     }
-    // The 256 oldest sends went, each of no stated size.
+    // The nine oldest sends went, each of no stated size.
     assert_eq!(
         sent.read(&clock(0), &a),
         CreditedDispatches {
-            requests: 7945,
+            requests: 8192,
             tokens: 7901 * 13,
-            unsized_requests: 44,
+            unsized_requests: 291,
             estimated_tokens: 0,
         }
     );
 }
 
 #[test]
-fn a_busy_rows_tally_retires_its_oldest_batch() {
+fn a_busy_rows_tally_lets_its_oldest_go_past_the_bound() {
     let (engine, sent) = built(None);
     let a = row(111, 3);
     for _ in 0..8037 {
@@ -331,8 +331,8 @@ fn a_busy_rows_tally_retires_its_oldest_batch() {
     assert_eq!(
         sent.read(&clock(0), &a),
         CreditedDispatches {
-            requests: 7945,
-            tokens: 7781 * 13 + 164 * 19,
+            requests: 8192,
+            tokens: 8028 * 13 + 164 * 19,
             ..CreditedDispatches::default()
         }
     );
@@ -1098,14 +1098,14 @@ fn a_new_documents_least_load_keeps_the_sends_of_the_standing_one() {
 }
 
 #[test]
-fn least_load_under_a_new_profile_name_starts_with_no_sends() {
+fn least_load_under_a_new_profile_name_keeps_the_sends_under_its_settings() {
     let standing = load_engine(POOL, None);
     let rows = reporting();
     send(&standing, &rows[0], START, TOKENS);
     let next = load_engine("renamed", None);
     next.succeed(&standing);
     let [sent_to, other] = scores(&next, &rows, START + 700);
-    assert_eq!(sent_to, other);
+    assert!(sent_to < other, "{sent_to} against {other}");
 }
 
 #[test]
@@ -1423,6 +1423,7 @@ mod over_lists {
         time::{Duration, Instant},
     };
 
+    use serde_json::json;
     use smg_worker::{
         identity::basic::Worker,
         load::state::{one_rank_load, LoadSnapshot},
@@ -1433,14 +1434,14 @@ mod over_lists {
         catalog, chosen, clock, document, one, send, validated, Readers, DELAY, POOL, TOKENS,
     };
     use crate::{
-        document::AppliedSpec,
+        document::{AppliedSpec, PolicySpec, API_VERSION},
         engine::{
             decision_engine::{Request, RequestMaker, WorkerLists},
             list_cell::tests::PublishedList,
             policy_engine::PolicyEngine,
-            Constraints, Live, RequestFacts,
+            Candidate, Constraints, Live, RequestFacts,
         },
-        store::GatewayId,
+        store::{GatewayId, StaleGeneration},
         tracking::{decision_guard::DecisionGuard, CreditedDispatches},
     };
 
@@ -1514,6 +1515,151 @@ mod over_lists {
         assert_eq!(sent.read(&clock(0), &sent_to), one(TOKENS));
     }
 
+    /// A send counted under one document is read under the next: where a
+    /// new document is put in force on the running engine, a profile's
+    /// count takes over the standing count.
+    #[test]
+    fn a_send_counted_under_one_document_is_read_under_the_next() {
+        let (engine, members, _) = bed();
+        let now = Instant::now();
+        let mut first = decide(&engine, &members, b"first", now);
+        let sent_to = chosen(&first);
+        first.dispatched(now);
+
+        let (catalog, later) = catalog();
+        let mut next = document(None);
+        next.generation += 1;
+        let applied = engine.apply(validated(&next, &catalog));
+        applied.expect("a number above the standing one");
+        assert_eq!(later.lock()[0].read(&clock(0), &sent_to), one(TOKENS));
+    }
+
+    /// [`document`] under the number behind the standing one's.
+    fn next_document(limit: Option<u32>) -> PolicySpec {
+        let mut next = document(limit);
+        next.generation += 1;
+        next
+    }
+
+    /// `next` put in force on `engine`, validated over a catalog of its
+    /// own: the readers of that document.
+    fn put(engine: &PolicyEngine, next: &PolicySpec) -> Readers {
+        let (catalog, readers) = catalog();
+        let applied = engine.apply(validated(next, &catalog));
+        applied.expect("a number above the standing one");
+        readers
+    }
+
+    /// The engine with one send told under its standing document: the
+    /// worker the send went to, the list, and the standing readers.
+    fn sent_once() -> (PolicyEngine, PublishedList, Readers, Candidate) {
+        let (engine, members, readers) = bed();
+        let now = Instant::now();
+        let sent_to = {
+            let mut first = decide(&engine, &members, b"before", now);
+            first.dispatched(now);
+            chosen(&first)
+        };
+        (engine, members, readers, sent_to)
+    }
+
+    /// The next document's time limit applies to the sends its profile
+    /// took over: a send ends at that limit for the new reader and stays
+    /// for the standing one.
+    #[test]
+    fn the_new_profiles_limit_applies_to_the_sends_it_took_over() {
+        let (engine, members, readers) = bed();
+        let now = Instant::now();
+        let mut first = decide(&engine, &members, b"before", now);
+        let sent_to = chosen(&first);
+        let issued = first.lease().expect("the pick's lease").lease.issued_micros;
+        first.dispatched(now);
+
+        let limit = 29;
+        let later = put(&engine, &next_document(Some(limit)));
+        let edge = issued + u64::from(limit) * 1000;
+        let (standing, next) = (&readers.lock()[0], &later.lock()[0]);
+        assert_eq!(next.read(&clock(edge - 1), &sent_to), one(TOKENS));
+        assert_eq!(standing.read(&clock(edge), &sent_to), one(TOKENS));
+        let nothing = CreditedDispatches::default();
+        assert_eq!(next.read(&clock(edge), &sent_to), nothing);
+    }
+
+    /// A document whose number is not above the standing one is refused,
+    /// and its profile took no send from the standing one.
+    #[test]
+    fn a_refused_document_takes_no_sends_from_the_standing_profile() {
+        let (engine, _members, readers, sent_to) = sent_once();
+        let (catalog, later) = catalog();
+        let stale = document(None);
+        let refused = StaleGeneration {
+            standing: stale.generation,
+            offered: stale.generation,
+        };
+        assert_eq!(engine.apply(validated(&stale, &catalog)), Err(refused));
+        let nothing = CreditedDispatches::default();
+        assert_eq!(later.lock()[0].read(&clock(0), &sent_to), nothing);
+        assert_eq!(readers.lock()[0].read(&clock(0), &sent_to), one(TOKENS));
+    }
+
+    /// The standing profile and the one that took its count over read one
+    /// entry for a worker both knew. A send told to that worker under the
+    /// next document is read by the standing profile's reader too, which a
+    /// decision under way may still ask.
+    #[test]
+    fn a_send_under_the_next_document_is_read_by_the_standing_profiles_reader() {
+        let (engine, _members, readers, sent_to) = sent_once();
+        let later = put(&engine, &next_document(None));
+        send(engine.standing_spec().engine(), &sent_to, 1, TOKENS);
+        let both = CreditedDispatches {
+            requests: 2,
+            tokens: 2 * u64::from(TOKENS),
+            ..CreditedDispatches::default()
+        };
+        for reader in [&readers.lock()[0], &later.lock()[0]] {
+            assert_eq!(reader.read(&clock(0), &sent_to), both);
+        }
+    }
+
+    /// A document with no reader keeps no count, so the document put in
+    /// force behind it starts with no sends.
+    #[test]
+    fn a_document_with_no_reader_leaves_the_sends_behind() {
+        let (engine, _members, readers, sent_to) = sent_once();
+        let unread: PolicySpec = serde_json::from_value(json!({
+            "apiVersion": API_VERSION,
+            "generation": 5,
+            "profiles": { (POOL): { "pick": "random" } }
+        }))
+        .expect("a document");
+        assert!(put(&engine, &unread).lock().is_empty());
+        let mut next = document(None);
+        next.generation = 6;
+        let later = put(&engine, &next);
+        let nothing = CreditedDispatches::default();
+        assert_eq!(later.lock()[0].read(&clock(0), &sent_to), nothing);
+        assert_eq!(readers.lock()[0].read(&clock(0), &sent_to), one(TOKENS));
+    }
+
+    /// A send said behind a new document, for a decision made under the
+    /// replaced one, is counted by neither document's reader: a word of a
+    /// lease reaches the stages of the document that issued it, and only
+    /// while that document is in force.
+    #[test]
+    fn a_send_said_behind_a_new_document_for_an_earlier_decision_is_counted_by_no_reader() {
+        let (engine, members, readers) = bed();
+        let now = Instant::now();
+        let mut first = decide(&engine, &members, b"first", now);
+        let sent_to = chosen(&first);
+        let later = put(&engine, &next_document(None));
+
+        first.dispatched(now);
+        let nothing = CreditedDispatches::default();
+        for reader in [&readers.lock()[0], &later.lock()[0]] {
+            assert_eq!(reader.read(&clock(0), &sent_to), nothing);
+        }
+    }
+
     /// A handle says its dispatch once, so a second word of the same send
     /// counts nothing. The engine files no lease: the handle is the one
     /// that tells it a word, and no entry takes a report by a lease's id.
@@ -1539,8 +1685,8 @@ mod over_lists {
         let time = engine.clock();
         let records = engine
             .members_of(members.lent())
-            .records(engine.spec(), time);
-        let stages = engine.spec().engine();
+            .records(engine.standing_spec(), time);
+        let stages = engine.standing_spec().engine();
 
         let issued = Instant::now();
         let dispatched = issued + Duration::from_micros(u64::from(DELAY));

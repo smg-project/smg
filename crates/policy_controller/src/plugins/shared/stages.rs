@@ -753,6 +753,29 @@ mod tests {
         assert!(PluginPicker::new(Arc::new(Quiet::default()), None).refuses_by_reports());
     }
 
+    /// A plugin's scorer says nothing of a gate of its own: the trait's own
+    /// answer stands, that it weighs no load against affinity. So a guest
+    /// lifts the overload veto for no profile, whatever it is fed: its
+    /// adapter answers no behind a fallback that reads the affinity column
+    /// and says the word of itself too.
+    #[test]
+    fn a_plugins_scorer_says_no_gate_of_its_own() {
+        use crate::{
+            document::spec::PrefixAffinityParams,
+            policies::cache_aware::{Gates, PrefixAffinity},
+        };
+
+        let bare = PluginScorer::new(Arc::new(Quiet::default()), None);
+        assert!(!bare.balances_load_against_affinity());
+        let params = PrefixAffinityParams::default();
+        let stage = PrefixAffinity::new(&params, Gates::of(Some(&params), None, None));
+        let fallback: Box<dyn Scorer> = Box::new(stage);
+        assert!(fallback.balances_load_against_affinity());
+        let behind = PluginScorer::new(Arc::new(Quiet::default()), Some(fallback));
+        assert!(behind.needs().affinity);
+        assert!(!behind.balances_load_against_affinity());
+    }
+
     /// The scorer's adapter returns the band its plugin answered, and its
     /// fallback's band where it takes the fallback.
     #[test]

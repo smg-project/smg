@@ -88,7 +88,7 @@ fn state(store: &MemoryStore, id: WorkerId, index: usize, at: Instant) {
 }
 
 /// A store with one pool of `n` members under the document, every one
-/// ready, with its record and its four values on file and published: the
+/// ready, with its record published and its four values on file: the
 /// store, its members by index and the instant its last window opened.
 fn pool_of(n: usize) -> (MemoryStore, Vec<WorkerId>, Instant) {
     let store = MemoryStore::new();

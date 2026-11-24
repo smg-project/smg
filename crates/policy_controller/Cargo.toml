@@ -10,8 +10,7 @@ categories = ["algorithms"]
 
 [dependencies]
 # No host crate in the default build: the engine knows nothing about its
-# host (a gateway, a controller, a binding). The ingestion drivers below the
-# `ingest` feature speak to the engines and are the first to need one.
+# host (a gateway, a controller, a binding).
 # The credit tally is read by every deciding thread and replaced whole on
 # the rare write (a rank's first dispatch, a membership change): a load
 # costs no shared write.
@@ -34,7 +33,7 @@ schemars = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 # The document's digest (SHA-256), at the version the gRPC client crate under
-# `ingest` and the gateway already link.
+# `controller` and the gateway already link.
 sha2 = "0.11"
 thiserror = { workspace = true }
 # The WebAssembly plugin host (`wasm`): the runtime and one kept instance per
@@ -59,16 +58,13 @@ wasmtime = { workspace = true, optional = true }
 k8s-openapi = { version = "0.27.0", features = ["v1_33"], optional = true }
 kube = { version = "3.0.1", default-features = false, features = ["client", "rustls-tls", "ring"], optional = true }
 
-# The ingestion drivers (the `ingest` feature): the load path over the
-# store's ingress traits (the `GetLoads` poll through the engines' gRPC
-# clients and the metrics scrape over HTTP).
-openai-protocol = { workspace = true, optional = true }
-reqwest = { workspace = true, features = ["rustls-no-provider"], optional = true }
+# The controller's engine client (the `controller` feature): the gRPC
+# connector each worker object dials through and the cache events' wire.
 smg-grpc-client = { workspace = true, optional = true }
 
-# The load report type for `ingest` and `worker-host`. The worker host also
-# needs the runtime for worker objects, the registry and collector ports,
-# and the worker crate's workflows for the membership steps it runs.
+# The load report type for `in-process` and `worker-host`. The worker host
+# also needs the runtime for worker objects, the registry and collector
+# ports, and the worker crate's workflows for the membership steps it runs.
 async-trait = { workspace = true, optional = true }
 smg-worker = { workspace = true, optional = true }
 wfaas = { workspace = true, optional = true }
@@ -89,9 +85,8 @@ metrics-exporter-prometheus = { version = "0.18.3", default-features = false, op
 # The protocol's generated messages, service and client (`proto`): the code
 # the build script writes from the contract files names both.
 prost = { workspace = true, optional = true }
-# The process TLS crypto provider, installed once before the first listener
-# or HTTP client; the gateway, the servicer and the mock worker install the
-# same one.
+# The process TLS crypto provider, installed once before the first listener;
+# the gateway, the servicer and the mock worker install the same one.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
 tokio = { workspace = true, features = ["sync"], optional = true }
 tonic = { workspace = true, features = ["tls-ring"], optional = true }
@@ -130,22 +125,6 @@ tikv-jemallocator = { workspace = true, optional = true }
 tonic-prost-build = { version = "0.14.6", optional = true }
 
 [features]
-# The ingestion drivers over the store: the load path (the `GetLoads` poll
-# per engine under the store's poll arbitration, the metrics scrape of an
-# engine without a servicer). Off by default. The controller turns it on.
-ingest = [
-    "dep:openai-protocol",
-    "dep:reqwest",
-    "dep:rustls",
-    "dep:smg-grpc-client",
-    "dep:smg-worker",
-    "dep:tokio",
-    "dep:tonic",
-    "dep:tracing",
-    "tokio/macros",
-    "tokio/rt",
-    "tokio/time",
-]
 # Reading and applying a policy document in process. The turn uses only
 # Tokio's sync primitives. It builds on every target. The spec store's file
 # calls come of `rustix`, a dependency on Linux and macOS alone: on another
@@ -157,16 +136,15 @@ operator = [
     "dep:tokio",
     "dep:tracing",
 ]
-# The standalone controller: the ingestion drivers, the listeners with their
-# scopes, the protocol's generated service and client, the election, the gRPC
-# health service and the admin endpoints. It turns on `worker-host`, so every
+# The standalone controller: the listeners with their scopes, the
+# protocol's generated service and client, the election, the gRPC health
+# service and the admin endpoints. It turns on `worker-host`, so every
 # controller keeps its worker objects, probes them and reads cache events,
 # and `in-process`, the engine over worker objects.
 # Off by default: the engine alone has no server dependency. It builds on
 # Linux and macOS: the gRPC plugin kind dials a Unix socket and reads its
 # peer's user through `rustix`, which is declared for those two.
 controller = [
-    "ingest",
     "operator",
     "in-process",
     "worker-host",
@@ -177,6 +155,7 @@ controller = [
     "dep:metrics-exporter-prometheus",
     "dep:prost",
     "dep:rustls",
+    "dep:smg-grpc-client",
     "dep:thread_local",
     "dep:tikv-jemallocator",
     "dep:tokio-stream",
@@ -243,8 +222,13 @@ default = ["wasm"]
 wasm = ["dep:wasmtime", "dep:thread_local", "dep:tracing", "dep:rustix"]
 # A case's hold of the gRPC plugin runtime's I/O thread, the stand-in for a
 # host that takes the thread's core. The package's own tests and benches
-# turn it on through the dev-dependency on the package itself; no build of
-# a product has it.
+# turn it on through the dev-dependency on the package itself, and the
+# gateway's `test-util` turns it on for the gateway's tests. A build of the
+# gateway's package alone leaves it off.
+#
+# It also builds the lookup over holders a host scored
+# (`overlap::deepest_of_within_groups`), which the gateway's reference index
+# calls in its cases.
 test-util = ["smg-worker?/test-util"]
 
 [dev-dependencies]
@@ -270,7 +254,7 @@ http = { workspace = true }
 # that ends with trailers, or never ends.
 http-body = "1.0"
 http-body-util = { workspace = true }
-# The load driver's unit tests add the test macro and tokio's paused clock.
+# The cases add the test macro and tokio's paused clock.
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "test-util"] }
 # The spec store cases collect the lines the source logs.
 tracing-subscriber = { workspace = true }
@@ -298,9 +282,12 @@ rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem
 # The admin router's tests drive it with `oneshot`, no socket.
 # The Kubernetes elector's stand-in is a `service_fn` of the same crate.
 tower = { version = "0.5", default-features = false, features = ["util"] }
-# The load driver's tests poll the mock worker's gRPC engines in-process:
+# The controller's cases poll the mock worker's gRPC engines in-process:
 # the same `GetLoads` answers the gateway's tests read.
 mock-worker = { path = "../mock_worker" }
+# The classic rows' scripted engine answers the worker crate's engine calls
+# in `tonic::Status`, under two features that turn no `tonic` on.
+tonic = { workspace = true }
 
 # The spec file's open is read on a terminal pair its test makes (`pty`).
 [target.'cfg(target_os = "linux")'.dev-dependencies]
@@ -343,12 +330,12 @@ required-features = ["controller"]
 name = "caller"
 required-features = ["in-process"]
 
-# Replays recorded rows through the load report conversion under `ingest`,
-# and the hard-demand rows over worker objects under `in-process`.
+# Replays recorded rows through the load report conversion and the
+# hard-demand rows over worker objects, both under `in-process`.
 # The overload rows run a host's load monitor, which `worker-host` brings.
 [[test]]
 name = "classic_rows"
-required-features = ["ingest", "in-process", "worker-host"]
+required-features = ["in-process", "worker-host"]
 
 [[test]]
 name = "controller"
@@ -376,10 +363,6 @@ name = "grpc_runtime"
 required-features = ["controller"]
 
 [[test]]
-name = "ingest"
-required-features = ["controller"]
-
-[[test]]
 name = "membership_calls"
 required-features = ["controller"]
 
@@ -393,6 +376,12 @@ required-features = ["controller"]
 
 [[test]]
 name = "watch_workers"
+required-features = ["controller"]
+
+# One case in a process of its own: another bind or TLS call of the process
+# would install the crypto provider first.
+[[test]]
+name = "crypto_provider"
 required-features = ["controller"]
 
 [[bench]]

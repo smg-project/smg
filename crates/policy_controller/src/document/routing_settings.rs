@@ -72,13 +72,14 @@ use crate::{
 ///   them under `routing_key`. The manual policy names them in its session
 ///   rule while they are headers alone, and under `routing_key` once the
 ///   override adds the request's own id.
-/// - The sticky override lands as a session rule on the binding of
-///   `random`, `power_of_two`, `least_load`, `passthrough`, `bucket` and
-///   `cache_aware` (`override_places` says why these six):
+/// - The sticky override lands as a session rule on the binding of every
+///   policy but `manual` and `consistent_hashing`, which place by the key
+///   themselves (`override_places` says why of each):
 ///   the override's own assignment and times, its two requests of a key a
 ///   worker, and the configured headers then the request's own id under
-///   `routing_key`. The rule runs under the single plan alone, so it has a
-///   document in a gateway of one router that serves single requests.
+///   `routing_key`. A rule with a cap runs under the single plan alone,
+///   so it has a document in a gateway of one router that serves single
+///   requests.
 /// - A number that means never lands as the largest its place holds: a
 ///   balance threshold past the document's width, and the sweep interval of
 ///   an index the configuration never sweeps. The gateway's own policy
@@ -95,9 +96,10 @@ use crate::{
 ///
 /// A document of two families plans one where the other has no document.
 /// Pairs are left out of a regular configuration of many routers under the
-/// manual policy, whose session rule runs under the single plan alone, and
-/// beside the encode mode. Single requests are left out of a pair gateway of
-/// one router that reaches its workers over gRPC or ZMQ: it places none.
+/// manual policy, whose pairs this module does not plan beside its single
+/// requests yet, and beside the encode mode. Single requests are left out
+/// of a pair gateway of one router that reaches its workers over gRPC or
+/// ZMQ: it places none.
 /// They are left out of a pair configuration whose main policy reads a
 /// setting no document says: a gateway of one router then refuses its token
 /// count, which its own policies place. That gateway leaves them out as well
@@ -113,7 +115,7 @@ use crate::{
 /// rooms. The two overload thresholds are the gateway's too: the default it
 /// builds its worker objects with, under each worker's own registration. No
 /// document carries a threshold, so one off its default means the same
-/// document. Both at none leave nothing to veto by, and the settings' own
+/// document. Both at none leave no default to veto by, and the settings' own
 /// document switches the block off. Beside a supplied document the two are
 /// no difference, whatever they are: its host says what a block that is on
 /// means over no threshold. The pin of a sticky key to one engine of a
@@ -248,11 +250,13 @@ pub struct RoutingKeyOverrideSettings {
     /// The header names a request's routing key is read from, in order.
     pub headers: Vec<String>,
     /// The seconds between two sweeps of the override's sessions. Zero here
-    /// or in `max_idle_secs` keeps every key pinned for ever.
+    /// or in `max_idle_secs` keeps every key the session table holds pinned
+    /// for ever: a table full of such keys records no new key.
     pub eviction_interval_secs: u64,
     /// The seconds with no request after which a key of the override leaves
     /// at the next sweep. Zero here or in `eviction_interval_secs` keeps
-    /// every key pinned for ever.
+    /// every key the session table holds pinned for ever: a table full of
+    /// such keys records no new key.
     pub max_idle_secs: u64,
     /// How a key the override sees for the first time picks its worker.
     pub assignment_mode: Assignment,
@@ -569,10 +573,13 @@ impl RoutingSettings {
     /// another value. A conflict names the first difference and the two
     /// values.
     ///
-    /// The two overload thresholds are no part of the comparison: no
-    /// document carries one, so they stand beside a supplied document
-    /// whatever they are, both at none too. What a supplied document's
-    /// switch means over no threshold is its host's to say.
+    /// The two overload thresholds are no part of the comparison with the
+    /// document of `defaults`: no document carries one, so beside settings
+    /// that state nothing else they stand beside a supplied document
+    /// whatever they are, both at none too. Settings that state a policy of
+    /// their own are held to their whole document, whose block is off for
+    /// both at none. What a supplied document's switch means over no
+    /// threshold is its host's to say.
     ///
     /// Both launchers refuse a routing setting beside a document before
     /// this runs, so the comparison judges a configuration built by hand.
@@ -801,11 +808,12 @@ fn presets(config: &RoutingSettings) -> Result<Planned<'_>, RoutingSettingsError
 ///
 /// `None` where the document plans one family: a regular configuration of
 /// one router, the encode mode of one router, a pair mode of one router
-/// over gRPC or ZMQ, and a regular configuration whose main policy runs on
-/// no side of a pair. The manual policy is that one: its picker leaves the
-/// placement to the binding's session rule, and a rule runs under the
-/// single plan alone. A gateway of one router in the encode mode counts
-/// tokens with no worker, so its document binds no single request.
+/// over gRPC or ZMQ, and a regular configuration under the manual policy.
+/// Its picker leaves the placement to the binding's session rule, and this
+/// module does not plan its pairs beside its single requests yet: a pair
+/// mode whose two sides are manual is planned, under the one rule. A
+/// gateway of one router in the encode mode counts tokens with no worker,
+/// so its document binds no single request.
 fn both_families(config: &RoutingSettings) -> Result<Option<Planned<'_>>, RoutingSettingsError> {
     let (mode, main) = (&config.mode, &config.policy);
     let (both, encode) = match mode {
@@ -1249,8 +1257,8 @@ fn seconds(setting: &'static str, secs: u64) -> Result<u32, RoutingSettingsError
 
 /// A sticky map's idle time and sweep interval as a session rule's `ttl_s`
 /// and `sweep_s`, each with the name of its setting. The map sweeps nothing
-/// where either time is zero: a key stays pinned for ever, which the rule
-/// says with its largest number.
+/// where either time is zero: a key the table holds stays pinned for ever,
+/// which the rule says with its largest number.
 fn pin_times(
     (idle_setting, max_idle_secs): (&'static str, u64),
     (sweep_setting, eviction_interval_secs): (&'static str, u64),
@@ -1440,7 +1448,7 @@ impl Bound {
         // one the settings are written into. It keeps the preset's word of
         // a request the rule places, the profile's own: the gateway's
         // `manual` policy places a keyed request itself
-        // (`model_gateway/src/policies/registry.rs:643`), and no stage
+        // (`model_gateway/src/policies/registry.rs:701`), and no stage
         // counts under its picker.
         let preset = match binding.sessions.take() {
             Some(rule) => Some(rule),
@@ -1530,7 +1538,10 @@ const CLIENT_HEADERS: [&str; 2] = ["x-forwarded-for", "cookie"];
 /// - `manual` and `consistent_hashing` read the routing key header behind
 ///   them. Under the override they read the request's own id behind that,
 ///   and every source loses its turn and retry suffixes.
-/// - `prefix_hash` reads the configured headers alone.
+/// - `prefix_hash` reads the configured headers alone. Under the override
+///   it reads the request's own id behind them, each source without its
+///   turn and retry suffixes, and the binding's session rule pins that key
+///   ([`override_places`]).
 /// - `random`, `round_robin`, `power_of_two`, `least_load`, `passthrough`,
 ///   `bucket` and `cache_aware` read no key themselves. Under the override
 ///   they read one ([`override_places`]):
@@ -1538,13 +1549,11 @@ const CLIENT_HEADERS: [&str; 2] = ["x-forwarded-for", "cookie"];
 ///   turn and retry suffixes. The binding's session rule pins that key
 ///   ([`override_rule`]).
 ///
-/// Three reads have no document yet and are refused by the setting's name.
-/// The gateway's override places a keyed request of `prefix_hash` by its
-/// sticky map too, and [`unplaced`] says what it lacks. In a gateway of
-/// many routers the override's rule would plan single requests alone,
-/// beside pairs the gateway serves too. And under the override the gateway
-/// reads the routing key header as sent where no configured header names
-/// it, while a block strips every source or none.
+/// Two reads have no document yet and are refused by the setting's name.
+/// In a gateway of many routers the override's rule would plan single
+/// requests alone, beside pairs the gateway serves too. And under the
+/// override the gateway reads the routing key header as sent where no
+/// configured header names it, while a block strips every source or none.
 ///
 /// `consistent_hashing` also names its two client headers as client
 /// sources: a key from them places a request that carries no session key,
@@ -1575,6 +1584,11 @@ fn key_sources(
             false
         }
         // Each kind is named: a new one builds once its answer is written.
+        // The override places every kind listed here (`override_places`),
+        // so one lands here with the override off, where it reads no key.
+        // `prefix_hash` never lands here: it reads the configured headers
+        // above. A kind the override did not place would bind no session
+        // rule and no key under it, so it is refused by the setting's name.
         PolicySettings::PrefixHash { .. }
         | PolicySettings::Random
         | PolicySettings::RoundRobin
@@ -1587,7 +1601,7 @@ fn key_sources(
                 Err(unsupported(
                     "routing_key_override.enabled",
                     true,
-                    unplaced(policy),
+                    "the sticky sessions' rule has no document under this policy yet",
                 ))
             } else {
                 Ok(None)
@@ -1638,19 +1652,31 @@ fn key_sources(
 }
 
 /// Whether the binding's session rule places a keyed request of `policy`
-/// ([`override_rule`]): the sticky override is on, and the policy's own
-/// stages place a single request by nothing its key hands them. The
-/// gateway's sticky map places a keyed request of every policy but
-/// `manual` and `consistent_hashing`, which place by the key themselves.
-/// `prefix_hash` alone is left out here and refused, for what its answer
-/// still lacks ([`unplaced`]).
+/// ([`override_rule`]): the sticky override is on, and the gateway's
+/// sticky map places the policy's keyed requests. It does for every
+/// policy but `manual` and `consistent_hashing`, which place by the key
+/// themselves. Of the others `prefix_hash` alone has a stage that reads a
+/// key, and every other places a single request by nothing its key hands
+/// it.
 ///
+/// - `prefix_hash` hashes the key a header handed in its prompt's place,
+///   and no key the request's own id handed: it places that request by
+///   its prompt (`model_gateway/src/policies/prefix_hash.rs:384`,
+///   `:387-412`). The gateway asks the policy for a key's first request
+///   and for a key at its pin's cap
+///   (`model_gateway/src/policies/registry.rs:832`, `:803`), and hands
+///   it the header's key without its turn and retry suffixes (`:646`).
+///   This crate's ring does the same in a gateway's own process, where
+///   the one call says that a key is the id's
+///   ([`RequestFacts::session_key_from_rid`](crate::engine::RequestFacts::session_key_from_rid)).
+///   No frame says it: a served controller's ring places a request by
+///   the key its id handed.
 /// - `random` draws.
 /// - `round_robin` takes turns. The gateway asks one policy object for a
 ///   request with no key, for a key's first request and for a key at its
-///   pin's cap (`model_gateway/src/policies/registry.rs:664`, `:774`,
-///   `:745`), so the three take the turns of one rotation, and a request
-///   that follows its pin takes none (`:736-739`). The rotation is the
+///   pin's cap (`model_gateway/src/policies/registry.rs:722`, `:832`,
+///   `:803`), so the three take the turns of one rotation, and a request
+///   that follows its pin takes none (`:794-797`). The rotation is the
 ///   list's own, by row, and where the row's worker takes no request, the
 ///   rotation of the workers that do
 ///   (`model_gateway/src/policies/round_robin.rs:142-168`). This crate's
@@ -1661,7 +1687,7 @@ fn key_sources(
 ///   from the profile ([`override_rule`]), so in a gateway's own process
 ///   no stage hears its dispatch (`lease_events::stages_hear`), as the
 ///   gateway's policy hears of no request its sticky map placed
-///   (`model_gateway/src/policies/registry.rs:736-739`). Both read such a
+///   (`model_gateway/src/policies/registry.rs:794-797`). Both read such a
 ///   request in the count of requests the gateway holds on the worker. A
 ///   controller keeps the rule's word on the lease it files, and tells no
 ///   stage that dispatch either.
@@ -1670,12 +1696,12 @@ fn key_sources(
 ///   requests alone. Its stage places a prefill decision by the sizes it
 ///   booked and draws for every other. The gateway's policy holds a bucket
 ///   of sizes for the prefill workers of a pair alone, and draws among
-///   single workers (`model_gateway/src/policies/registry.rs:1564-1575`,
+///   single workers (`model_gateway/src/policies/registry.rs:1698-1709`,
 ///   `model_gateway/src/policies/bucket.rs:186-191`).
 /// - `cache_aware` reads who was sent a prompt. The gateway's policy writes
 ///   a prompt where it placed the request, and it is not asked behind a pin
 ///   its sticky map followed nor for a key the map's own assignment placed
-///   (`model_gateway/src/policies/registry.rs:736-739`, `:756`, `:782`).
+///   (`model_gateway/src/policies/registry.rs:794-797`, `:814`, `:840`).
 ///   In a gateway's own process the record of sent prefixes, or a token
 ///   tree the host lends, takes a prompt behind a request the profile's
 ///   stages place, as under the policy alone, and behind none the rule
@@ -1686,7 +1712,8 @@ fn key_sources(
 fn override_places(policy: &PolicySettings, config: &RoutingSettings) -> bool {
     let placed = matches!(
         policy,
-        PolicySettings::Random
+        PolicySettings::PrefixHash { .. }
+            | PolicySettings::Random
             | PolicySettings::RoundRobin
             | PolicySettings::PowerOfTwo { .. }
             | PolicySettings::LeastLoad { .. }
@@ -1695,33 +1722,6 @@ fn override_places(policy: &PolicySettings, config: &RoutingSettings) -> bool {
             | PolicySettings::CacheAware { .. }
     );
     config.routing_key_override.enabled && placed
-}
-
-/// Why the sticky override has no document yet under a policy whose keyed
-/// requests the gateway's sticky map places. `prefix_hash` is the one: it
-/// hashes a key a header handed and no key the request's own id handed,
-/// and the gateway places that request by its prompt. A binding has one
-/// key, and its ring places by it whatever its source.
-///
-/// The kinds the rule or their own key places never reach this function:
-/// each is named, so a new kind builds once its sentence is written.
-fn unplaced(policy: &PolicySettings) -> &'static str {
-    match policy {
-        PolicySettings::PrefixHash { .. } => {
-            "under the override this policy's ring would place a key the request's own id handed, and the gateway places that request by its prompt"
-        }
-        PolicySettings::Manual { .. }
-        | PolicySettings::ConsistentHashing
-        | PolicySettings::Random
-        | PolicySettings::RoundRobin
-        | PolicySettings::Passthrough
-        | PolicySettings::CacheAware { .. }
-        | PolicySettings::PowerOfTwo { .. }
-        | PolicySettings::LeastLoad { .. }
-        | PolicySettings::Bucket { .. } => {
-            "the sticky sessions' rule has no document under this policy yet"
-        }
-    }
 }
 
 /// The requests of one key a worker carries under the sticky override
@@ -1746,7 +1746,7 @@ const OVERRIDE_INFLIGHT_CAP: u16 = 2;
 /// - A request the rule places alone is kept from the profile
 ///   ([`RulePlaced::Untold`]): the gateway's policy hears of no request
 ///   its sticky map placed
-///   (`model_gateway/src/policies/registry.rs:736-739`). No other rule
+///   (`model_gateway/src/policies/registry.rs:794-797`). No other rule
 ///   these settings write says so.
 ///
 /// The rule names no header: the binding's `routing_key` block lists the
@@ -2575,13 +2575,6 @@ mod tests {
             }))
         );
 
-        // The override places every other policy's keyed requests itself,
-        // and under this one its rule has no document yet.
-        assert_eq!(
-            refusal(&overridden("prefix_hash")),
-            ("routing_key_override.enabled", "true".to_string())
-        );
-
         // Behind other configured headers the gateway reads the routing key
         // header as sent, and a block strips every source or none.
         let mut behind = overridden("consistent_hashing");
@@ -2666,6 +2659,49 @@ mod tests {
             let applied = validated(&expected).expect("the controller takes the document");
             assert!(applied.engine().needs().session_in_flight, "{name}");
         }
+    }
+
+    /// Beside the prefix ring the override lands as the same session rule
+    /// over the same sources: the configured headers, then the request's
+    /// own id, each without its turn and retry suffixes. The ring reads a
+    /// key too. A header's key leads the prompt, as under the policy alone:
+    /// the gateway hands its policy that key without its suffixes
+    /// (`model_gateway/src/policies/registry.rs:646`). The key the
+    /// request's own id hands names the session alone: the gateway's policy
+    /// never hashes it (`model_gateway/src/policies/prefix_hash.rs:384`).
+    /// With no header configured the id is the one source.
+    #[test]
+    fn the_override_lands_as_a_session_rule_beside_the_prefix_ring() {
+        let expected = edited(preset("prefix_hash"), |document| {
+            document["view"]["headers"] = json!(["x-smg-routing-key"]);
+            let binding = &mut document["bindings"][0];
+            binding["routing_key"] = json!({
+                "sources": [{ "header": "x-smg-routing-key" }, { "rid": true }],
+                "strip_lineage": true
+            });
+            binding["sessions"] = json!({
+                "ttl_s": 14_400,
+                "sweep_s": 60,
+                "assignment": "delegate",
+                "inflight_cap": 2,
+                "recovery": "latest",
+                "rule_placed": "untold"
+            });
+        });
+        let settings = sticky("prefix_hash");
+        assert_eq!(settings.policy_document().as_ref(), Ok(&expected));
+        let applied = validated(&expected).expect("the controller takes the document");
+        assert!(applied.engine().needs().session_in_flight);
+
+        let mut bare = sticky("prefix_hash");
+        bare.routing_key_override.headers.clear();
+        let document = bare.policy_document().expect("a document");
+        assert!(validated(&document).is_ok(), "{document:?}");
+        let binding = document.bindings.into_iter().next().expect("the binding");
+        let key = binding.routing_key.expect("the key's sources");
+        assert_eq!(key.sources.len(), 1);
+        assert!(key.sources[0].rid && key.strip_lineage);
+        assert!(document.view.headers.is_empty());
     }
 
     /// The override's rule stands in the way of one pick. `passthrough`
@@ -2771,11 +2807,10 @@ mod tests {
         assert_eq!(sources(&[]), ("rid".to_string(), String::new()));
     }
 
-    /// The override's rule places single requests alone, beside a policy
-    /// that places one by nothing its key hands it. A pair plan, a gateway
-    /// of many routers and the one other policy whose keyed requests the
-    /// override places are each refused by the setting's name, in a
-    /// sentence that says which of the three it is.
+    /// The override's rule places single requests alone. A pair plan and a
+    /// gateway of many routers are each refused by the setting's name, in
+    /// a sentence that says which of the two it is, under every policy the
+    /// rule lands beside: the prefix ring among them.
     #[test]
     fn the_override_is_refused_where_its_rule_has_no_document() {
         let why = |config: &RoutingSettings| match config.policy_document() {
@@ -2786,7 +2821,7 @@ mod tests {
             }) => reason,
             other => panic!("expected the override refused by name, got {other:?}"),
         };
-        for name in PLACED {
+        for name in PLACED.into_iter().chain(["prefix_hash"]) {
             let pair = RoutingSettings {
                 mode: pair_mode(None, None),
                 ..sticky(name)
@@ -2804,11 +2839,6 @@ mod tests {
                 "{name}"
             );
         }
-        assert_eq!(
-            why(&sticky("prefix_hash")),
-            "under the override this policy's ring would place a key the request's own id \
-             handed, and the gateway places that request by its prompt"
-        );
     }
 
     #[test]
@@ -2942,6 +2972,21 @@ mod tests {
             worker_overload_token_usage: None,
             ..defaults()
         };
+        // A host whose own defaults state no threshold: the settings' two
+        // stand beside a supplied document all the same.
+        for (waiting, usage) in [(Some(8), None), (None, Some(0.8)), (Some(8), Some(0.8))] {
+            let beside = RoutingSettings {
+                policy_spec: Some(on.clone()),
+                worker_overload_waiting_requests: waiting,
+                worker_overload_token_usage: usage,
+                ..defaults()
+            };
+            assert_eq!(
+                beside.policy_document_in_force(&own),
+                Ok(on.clone()),
+                "{waiting:?} and {usage:?} over a host's defaults at none"
+            );
+        }
         let block = |document: PolicySpec| {
             document
                 .bindings
@@ -2956,8 +3001,11 @@ mod tests {
     #[test]
     fn a_setting_no_document_says_is_refused_by_its_name() {
         let round_robin = || config(PolicySettings::RoundRobin);
-        let mut sticky = config(at_flag_defaults("prefix_hash"));
-        sticky.routing_key_override.enabled = true;
+        // The override's rule places single requests alone.
+        let paired = RoutingSettings {
+            mode: pair_mode(None, None),
+            ..sticky("random")
+        };
         let mut selection = config(at_flag_defaults("cache_aware"));
         if let PolicySettings::CacheAware {
             selection_policy, ..
@@ -2966,7 +3014,7 @@ mod tests {
             *selection_policy = Some("another".to_string());
         }
         for (refused, setting, value) in [
-            (sticky, "routing_key_override.enabled", "true"),
+            (paired, "routing_key_override.enabled", "true"),
             (
                 RoutingSettings {
                     dp_minimum_tokens_scheduler: true,
@@ -3271,14 +3319,21 @@ mod tests {
     #[test]
     fn a_pair_mode_plans_pairs_alone_where_its_main_policy_has_no_document() {
         // Under the override the hash ring on both sides of the pair has a
-        // document, and a main policy of `prefix_hash` has none for its
-        // keyed requests.
+        // document, and a main policy of `cache_aware` that names a
+        // selection policy has none.
+        let mut unsaid = at_flag_defaults("cache_aware");
+        if let PolicySettings::CacheAware {
+            selection_policy, ..
+        } = &mut unsaid
+        {
+            *selection_policy = Some("another".to_string());
+        }
         let mut keyed = RoutingSettings {
             mode: pair_mode(
                 Some(PolicySettings::ConsistentHashing),
                 Some(PolicySettings::ConsistentHashing),
             ),
-            ..config(at_flag_defaults("prefix_hash"))
+            ..config(unsaid)
         };
         keyed.routing_key_override.enabled = true;
         let alone = pair_alone(&keyed).expect("the pair's own document");
@@ -3289,17 +3344,20 @@ mod tests {
 
         // Under a main policy the override has a rule for, the same pair
         // binds its single request, and the rule is the single binding's.
-        keyed.policy = PolicySettings::Random;
-        let both = keyed
-            .policy_document()
-            .expect("the document of two families");
-        let rules: Vec<bool> = both
-            .bindings
-            .iter()
-            .map(|binding| binding.sessions.is_some())
-            .collect();
-        assert_eq!(rules, [false, true]);
-        assert_eq!(validated(&both).err(), None);
+        // The prefix ring is one of them.
+        for main in ["random", "prefix_hash"] {
+            keyed.policy = at_flag_defaults(main);
+            let both = keyed
+                .policy_document()
+                .expect("the document of two families");
+            let rules: Vec<bool> = both
+                .bindings
+                .iter()
+                .map(|binding| binding.sessions.is_some())
+                .collect();
+            assert_eq!(rules, [false, true], "{main}");
+            assert_eq!(validated(&both).err(), None, "{main}");
+        }
     }
 
     /// The view holds one block size, and a prefix ring counts its key in
@@ -3835,13 +3893,9 @@ mod tests {
     /// and the sticky override is off and on. Where the pair's own document
     /// is refused, the mode's is refused by the same sentence. Where the
     /// controller's check takes the pair's own document, it takes the
-    /// mode's, which binds a single request behind the pair in all but
-    /// one: under the override, beside sides of the hash ring, a main
-    /// policy of `prefix_hash` has no document for its keyed requests, and
-    /// the pair is planned alone.
+    /// mode's, which binds a single request behind the pair in every one.
     #[test]
     fn no_pair_mode_loses_its_document_to_its_single_request() {
-        let mut alone_still = Vec::new();
         for main in PRESETS {
             for sides in std::iter::once(None).chain(PRESETS.iter().copied().map(Some)) {
                 for sticky in [false, true] {
@@ -3858,14 +3912,9 @@ mod tests {
                     };
                     let taken = validated(own).is_ok();
                     assert_eq!(validated(both).is_ok(), taken, "{named}");
-                    if taken && both.bindings.len() == 1 {
-                        assert_eq!(both, own, "{named}");
-                        alone_still.push((main, sides, sticky));
-                    }
+                    assert!(!taken || both.bindings.len() == 2, "{named}");
                 }
             }
         }
-        let ring = Some("consistent_hashing");
-        assert_eq!(alone_still, [("prefix_hash", ring, true)]);
     }
 }

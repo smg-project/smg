@@ -13,9 +13,8 @@ use crate::{
     engine::{
         decision::{Decision, Target, MAX_TARGETS},
         view::{
-            lay_session_in_flight, AffinityFacts, Candidate, Feed, HashKind, Health, Identity,
-            LoadRow, OverloadRegime, Phase, PoolFacts, RequestFacts, Role, SignalSource, WireModes,
-            ZoneCapacity,
+            AffinityFacts, Candidate, Feed, HashKind, Health, Identity, LoadRow, OverloadRegime,
+            Phase, PoolFacts, RequestFacts, Role, SignalSource, WireModes, ZoneCapacity,
         },
     },
     plugins::shared::{shown_hashes, shown_size},
@@ -319,11 +318,6 @@ impl Records {
                 .zip(candidates)
                 .map(|(index, c)| candidate(c, facts.affinity_at(index), counts(c)));
             self.candidates.extend(records);
-        });
-        // The key's counts a host lent beside its rows are each row's own
-        // in the record.
-        lay_session_in_flight(facts, &mut self.candidates, |row, in_flight| {
-            row.session_in_flight = in_flight;
         });
         self.zones.clear();
         self.zones.extend(pool.zones.iter().map(zone));
@@ -800,12 +794,6 @@ impl Packed {
                 }
             }
         });
-        // The key's counts a host lent beside its rows are each row's own
-        // in the table.
-        let rows = buf.as_chunks_mut::<ROW>().0;
-        lay_session_in_flight(facts, rows, |row, in_flight| {
-            put(row, layout::ROW_SESSION_IN_FLIGHT, &in_flight.to_le_bytes());
-        });
     }
 
     /// One candidate's row of the table, its affinity facts and the
@@ -1246,40 +1234,26 @@ mod tests {
     }
 
     /// Both fills carry each candidate's count of the request's session
-    /// key as the request's facts read it: the lent rows' counts where the
-    /// host lends them, and zero for every other row, whatever the rows
-    /// themselves say.
+    /// key, the row's own, and the two forms agree.
     #[test]
     fn both_fills_give_a_row_the_keys_count_its_request_reads() {
-        use crate::engine::view::KeyedRow;
         let mut rows = [Candidate::default(), candidate_row(), Candidate::default()];
         for (row, position) in rows.iter_mut().zip(0..) {
             row.position = position;
         }
-        let read = |facts: &RequestFacts<'_>| {
-            let mut records = Records::default();
-            records.fill(facts, &rows, &PoolFacts::default());
-            let record = records.candidates.iter().map(|r| r.session_in_flight);
-            let record: Vec<u16> = record.collect();
-            let mut packed = Packed::default();
-            packed.fill_candidates(facts, &rows);
-            let table = packed.candidates.as_chunks::<ROW>().0.iter();
-            let table: Vec<u16> = table
-                .map(|row| le_u16(row, ROW_SESSION_IN_FLIGHT))
-                .collect();
-            assert_eq!(record, table, "the two forms");
-            record
-        };
-        assert_eq!(read(&RequestFacts::default()), [0, 19, 0], "the rows' own");
-        let lent = [KeyedRow {
-            row: 2,
-            in_flight: 3,
-        }];
-        let facts = RequestFacts {
-            lent_session_in_flight: Some(&lent),
-            ..RequestFacts::default()
-        };
-        assert_eq!(read(&facts), [0, 0, 3], "the lent rows alone");
+        let facts = RequestFacts::default();
+        let mut records = Records::default();
+        records.fill(&facts, &rows, &PoolFacts::default());
+        let record = records.candidates.iter().map(|r| r.session_in_flight);
+        let record: Vec<u16> = record.collect();
+        let mut packed = Packed::default();
+        packed.fill_candidates(&facts, &rows);
+        let table = packed.candidates.as_chunks::<ROW>().0.iter();
+        let table: Vec<u16> = table
+            .map(|row| le_u16(row, ROW_SESSION_IN_FLIGHT))
+            .collect();
+        assert_eq!(record, table, "the two forms");
+        assert_eq!(record, [0, 19, 0], "the rows' own");
     }
 
     #[test]
@@ -1570,9 +1544,7 @@ mod tests {
             prompt_chars: 0,
             prompt_bytes: 0,
             now_micros: 0,
-            pinned_at: 0,
             lent_in_flight: None,
-            lent_session_in_flight: None,
             session_counted: false,
             // Host-only: the request block carries no affinity column and
             // no rows named in its place.
@@ -1582,6 +1554,7 @@ mod tests {
             client_key: 0,
             ring: None,
             ring_positions: &[],
+            session_key_from_rid: false,
         };
         let exposure = Exposure {
             tenant: Reveal::Plain,

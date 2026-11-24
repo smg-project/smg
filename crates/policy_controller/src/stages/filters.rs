@@ -766,15 +766,24 @@ impl Filter for NotTried {
 /// asks it about each row drawn: one call a row, where the filters' own
 /// `keep`s are a call a filter. A whole pass asks it about every row of
 /// the single plan's pool, in one loop where the filters are a loop each.
+///
+/// The set is the word a row is tested by. Each filter that reads a row's
+/// own bits names the bytes of the row's word ([`row_word`]) it refuses a
+/// row by, so the set asks all of them of a row in one compare.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct RowTests(u8);
+pub(crate) struct RowTests(u64);
 
 impl RowTests {
-    const HEALTHY: u8 = 1;
-    const NOT_OVERLOADED: u8 = 1 << 1;
-    const HAS_CAPACITY: u8 = 1 << 2;
-    const HAS_ROOM: u8 = 1 << 3;
-    const NOT_TRIED: u8 = 1 << 4;
+    /// Not healthy, the breaker open, stalled or draining: a byte each.
+    const HEALTHY: u64 = 0x0101_0101;
+    const NOT_OVERLOADED: u64 = 1 << 32;
+    const HAS_CAPACITY: u64 = 1 << 48;
+    const HAS_ROOM: u64 = 1 << 56;
+    /// A bit no row's word holds: this test reads the request's lists.
+    const NOT_TRIED: u64 = 1 << 1;
+    /// The bits of a row's word a row is kept by: a filter's other bits
+    /// refuse.
+    const KEPT_BY: u64 = 1 | Self::HAS_CAPACITY | Self::HAS_ROOM;
 
     /// `filters` as one set, where each is a filter of this file, known by
     /// its type. A host's own filter is no test the engine holds, one that
@@ -872,8 +881,10 @@ impl RowTests {
         self.0 & Self::HEALTHY != 0 && !cx.stalled.is_empty()
     }
 
-    /// Whether every filter of the set keeps the row, each by its own
-    /// `keep`. The health filter answers here for the row's own bits: the
+    /// Whether every filter of the set keeps the row, as each one's own
+    /// `keep` answers. The four that read a row's own bits are asked in
+    /// one compare of the row's word with the set, whatever the set holds.
+    /// The health filter answers here for the row's own bits: the
     /// host's mask, its other half, is the caller's to ask where
     /// [`RowTests::masked`] says a veto stands.
     #[inline(always)]
@@ -883,13 +894,30 @@ impl RowTests {
         c: &Candidate,
         cx: &Constraints<'_>,
     ) -> bool {
-        let holds = |test: u8| self.0 & test != 0;
-        (!holds(Self::HEALTHY) || OwnBits.keep(facts, c, cx))
-            && (!holds(Self::NOT_OVERLOADED) || NotOverloaded.keep(facts, c, cx))
-            && (!holds(Self::HAS_CAPACITY) || HasCapacity.keep(facts, c, cx))
-            && (!holds(Self::HAS_ROOM) || HasRoom.keep(facts, c, cx))
-            && (!holds(Self::NOT_TRIED) || NotTried.keep(facts, c, cx))
+        // The overload test asks nothing where the host lifted that veto.
+        let lifted = if cx.overload_lifted {
+            Self::NOT_OVERLOADED
+        } else {
+            0
+        };
+        (row_word(c) ^ Self::KEPT_BY) & self.0 & !lifted == 0
+            && (self.0 & Self::NOT_TRIED == 0 || NotTried.keep(facts, c, cx))
     }
+}
+
+/// The bits of a row that four filters of this file read, as one word: a
+/// byte a bit, in the row's own order. The byte between them that none of
+/// the four reads is read with them: the eight are one load.
+#[inline(always)]
+fn row_word(c: &Candidate) -> u64 {
+    u64::from(c.health.healthy)
+        | u64::from(c.health.breaker_open) << 8
+        | u64::from(c.health.stalled) << 16
+        | u64::from(c.health.draining) << 24
+        | u64::from(c.health.overloaded) << 32
+        | u64::from(c.session_hit) << 40
+        | u64::from(c.has_capacity) << 48
+        | u64::from(c.has_room) << 56
 }
 
 /// The five filters of this file a set names, by bit: what the cases of the
@@ -995,6 +1023,9 @@ mod tests {
                 ..candidate(position, 0)
             })
             .collect();
+        // The ready row holds the session hit: a flag of the row's word that
+        // none of these filters reads.
+        pool[0].session_hit = true;
         pool[1].health.healthy = false;
         pool[2].health.breaker_open = true;
         pool[3].health.stalled = true;
@@ -1050,6 +1081,80 @@ mod tests {
         // row is refused under some.
         assert_eq!(refused[0], 0);
         assert!(refused[1..].iter().all(|&times| times > 0), "{refused:?}");
+    }
+
+    #[test]
+    fn a_rows_eight_flags_are_one_word() {
+        use std::{array, mem::offset_of};
+        // Every flag of the health record is named: one it gains does not
+        // compile here until `row_word`'s packing and the masks are looked
+        // at again.
+        let none = Health::default();
+        let Health {
+            healthy: _,
+            breaker_open: _,
+            stalled: _,
+            draining: _,
+            overloaded: _,
+        } = none;
+        // `row_word` is one load only while these eight bytes sit side by
+        // side in the row, in the word's order.
+        let at = offset_of!(Candidate, health);
+        assert_eq!(
+            [
+                at + offset_of!(Health, healthy),
+                at + offset_of!(Health, breaker_open),
+                at + offset_of!(Health, stalled),
+                at + offset_of!(Health, draining),
+                at + offset_of!(Health, overloaded),
+                offset_of!(Candidate, session_hit),
+                offset_of!(Candidate, has_capacity),
+                offset_of!(Candidate, has_room),
+            ],
+            array::from_fn::<usize, 8, _>(|i| at + i),
+        );
+        // And the word holds each flag in its own byte, in that order.
+        let health = |health| Candidate {
+            health,
+            ..Candidate::default()
+        };
+        let alone = [
+            health(Health {
+                healthy: true,
+                ..none
+            }),
+            health(Health {
+                breaker_open: true,
+                ..none
+            }),
+            health(Health {
+                stalled: true,
+                ..none
+            }),
+            health(Health {
+                draining: true,
+                ..none
+            }),
+            health(Health {
+                overloaded: true,
+                ..none
+            }),
+            Candidate {
+                session_hit: true,
+                ..Candidate::default()
+            },
+            Candidate {
+                has_capacity: true,
+                ..Candidate::default()
+            },
+            Candidate {
+                has_room: true,
+                ..Candidate::default()
+            },
+        ];
+        for (place, row) in alone.iter().enumerate() {
+            assert_eq!(row_word(row), 1 << (8 * place), "flag {place}");
+        }
     }
 
     #[test]

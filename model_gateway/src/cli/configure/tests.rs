@@ -478,8 +478,7 @@ const HEADINGS: [&str; 2] = ["Routing Policy", "PD Disaggregation"];
 
 const POOLS: &str = "the pools and their addresses are the gateway's";
 const ADMISSION: &str = "the prefill queue and its limits are the gateway's admission";
-const THRESHOLDS: &str =
-    "the gateway builds its worker objects with the two overload thresholds, and no document carries one";
+const THRESHOLDS: &str = "the gateway builds its worker objects with the two overload thresholds unless the document switches its block off, and no document carries one";
 
 const EPD: &[&str] = &[
     "--epd-disaggregation",
@@ -752,14 +751,12 @@ fn the_print_option_says_a_refusal_in_one_sentence() {
     // A setting no document says: no document, and one sentence with the
     // setting by its name at the head. The words behind the head are the
     // policy crate's, and no case of the gateway holds them. The sticky
-    // override has no document beside the prefix hash ring.
-    let sticky = printed(&[
-        "smg",
-        "--policy",
-        "prefix_hash",
-        "--routing-key-override",
-        "--print-policy-spec",
-    ]);
+    // override's rule places single requests alone, and this line plans a
+    // pair.
+    let mut line = vec!["smg"];
+    line.extend_from_slice(PAIR);
+    line.extend_from_slice(&["--routing-key-override", "--print-policy-spec"]);
+    let sticky = printed(&line);
     assert_eq!(sticky.document(), None);
     assert!(
         sticky

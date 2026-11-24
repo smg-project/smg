@@ -87,10 +87,9 @@ use super::spec_store::StoreRefused;
 use super::SerialTurn;
 use super::{
     answers::OnFile,
-    reader::Refused,
     spec_store::{Persisted, SpecStore},
     ApplyCounts, ApplyOutcome, Document, DryRun, EnforceOutcome, EnforceRefused, Format, NeedsRow,
-    NotHeld, SpecRejected, Status, MAX_DOCUMENT_BYTES,
+    NotHeld, SpecRejected, Status,
 };
 use crate::{
     document::spec::{AppliedSpec, Digest, PolicySpec, SpecError},
@@ -149,12 +148,6 @@ fn guard(spec: &AppliedSpec, expected: &str) -> Result<(u64, Option<Digest>), En
     Ok((standing, digest))
 }
 
-/// A document's size, where it is over the bound.
-pub(crate) fn over_bound(document: &[u8]) -> Option<u64> {
-    let len = u64::try_from(document.len()).unwrap_or(u64::MAX);
-    (len > MAX_DOCUMENT_BYTES).then_some(len)
-}
-
 /// What a document's pass found it to be.
 pub(crate) struct Checked {
     /// The document's digest.
@@ -200,19 +193,10 @@ pub(crate) enum Line {
     Record(u64),
 }
 
-/// The first steps of a document's pass, in their order: the bound, the
-/// form, the digest.
+/// The first steps of a document's pass, in their order: the bound and the
+/// form ([`Format::read`]), then the digest.
 fn digested(document: &[u8], format: Format) -> Result<(PolicySpec, Digest), SpecRejected> {
-    if let Some(len) = over_bound(document) {
-        return Err(SpecRejected::TooLarge(len));
-    }
-    let spec = format
-        .parse(document)
-        .map_err(|Refused { path, message }| SpecRejected::Unparsed {
-            format: format.as_str(),
-            path,
-            message,
-        })?;
+    let spec = format.read(document)?;
     let digest = spec.digest()?;
     Ok((spec, digest))
 }

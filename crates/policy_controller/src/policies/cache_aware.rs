@@ -662,6 +662,12 @@ impl Scorer for PrefixAffinity {
         false
     }
 
+    /// The spill gate (`Gates::spill`) moves a request off a holder that
+    /// stands over it: one loaded past the pool's mean by both its bounds.
+    fn balances_load_against_affinity(&self) -> bool {
+        true
+    }
+
     /// Row by row, unless the fleet's KV gate is configured: that gate
     /// reads every row.
     fn row_wise(&self) -> bool {
@@ -1210,6 +1216,13 @@ impl Scorer for WarmupSlice {
     // Scores by the warm-up state. Its divert reads a holder's count and places elsewhere.
     fn refuses_by_reports(&self) -> bool {
         false
+    }
+
+    /// The slice sends a miss only to a warming worker under the spill gate
+    /// (`Gates::over`), and diverts a deep hit only to a worker with less
+    /// in flight than the hit's holder.
+    fn balances_load_against_affinity(&self) -> bool {
+        true
     }
 
     /// Row by row, unless the fleet's KV gate is configured: that gate

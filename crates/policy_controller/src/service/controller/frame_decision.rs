@@ -25,9 +25,14 @@
 //! the world's ([`StoreSnapshot::front`]). A lease is dated on that
 //! engine's clock, the one its decisions read.
 //!
-//! An encode request and a decode frame that names no lease have no
-//! decision here yet: their deciding thread answers them `Busy` and reads
-//! no list for them.
+//! A prefill frame, and a decode frame that names no lease, whose plan
+//! pairs no side of its phase stands alone: it is decided as a single
+//! request's frame is, over the list of its own phase's role
+//! ([`decide_alone`]).
+//!
+//! An encode request has no decision here yet, and a decode frame that
+//! names no lease has none under a plan that pairs its phase: their
+//! deciding thread answers them `Busy` and reads no list for them.
 
 use std::{
     panic::{catch_unwind, AssertUnwindSafe},
@@ -127,6 +132,48 @@ pub(crate) fn decide(
     loads: &Arc<LoadSnapshot>,
     own: &Part,
 ) -> Result<(Decision, Booked), DecisionRefused> {
+    decide_at(Phase::Single, world, objects, taken, buffers, loads, own)
+}
+
+/// The decision of a frame that stands alone at a side's phase: a prefill
+/// frame, or a decode frame that names no lease, whose plan pairs no side
+/// of its phase. It is decided as a single request's frame is ([`decide`]),
+/// by the binding of its own phase, over the list the registry holds for
+/// the model at that phase's role. The reach and the asking gateway's
+/// vetoes are that role's. A frame states no demand yet, so no list is
+/// held to one here.
+///
+/// Out of line: a single request's decision holds no part of it.
+///
+/// # Errors
+///
+/// Those of [`decide`].
+#[inline(never)]
+pub(crate) fn decide_alone(
+    world: &StoreSnapshot,
+    objects: &Objects<Members>,
+    taken: &DecisionCall<'_, Checked>,
+    buffers: &mut FrameBuffers,
+    loads: &Arc<LoadSnapshot>,
+    own: &Part,
+) -> Result<(Decision, Booked), DecisionRefused> {
+    let phase = taken.request.phase();
+    decide_at(phase, world, objects, taken, buffers, loads, own)
+}
+
+/// [`decide`] at `phase`, the frame's own: the binding the phase resolves
+/// to and the list of the phase's role. In line in both its callers, so a
+/// single request's decision stays the code it was.
+#[inline(always)]
+fn decide_at(
+    phase: Phase,
+    world: &StoreSnapshot,
+    objects: &Objects<Members>,
+    taken: &DecisionCall<'_, Checked>,
+    buffers: &mut FrameBuffers,
+    loads: &Arc<LoadSnapshot>,
+    own: &Part,
+) -> Result<(Decision, Booked), DecisionRefused> {
     let DecisionCall {
         request: frame,
         gateway,
@@ -136,26 +183,30 @@ pub(crate) fn decide(
         ..
     } = *taken;
     let front = world.front();
-    let spec = front.spec();
+    let spec = world.spec();
     let model = frame.model();
     if frame.hashes() > frame.hashes_read(spec) {
         own.hashes_cut.fetch_add(1, Ordering::Relaxed);
     }
-    let (_, _, by_reports) = spec.engine().reads_for(model, Phase::Single);
+    let (_, _, by_reports) = spec.engine().reads_for(model, phase);
     if let Some(place) = place.filter(|_| by_reports) {
         place.apply_waiting();
     }
+    let role = phase.role();
     let FrameBuffers { lists, places, .. } = buffers;
     let read = lists.of(frame);
     let over_none = || FrameRequest::new(frame, &read, left, WorkerLists::None);
     let generation = objects.registry().model_generation(model);
     let (decision, said) = match generation.as_deref() {
         Some(generation) => {
-            let lent = objects.lent(generation, Role::Single);
+            let lent = objects.lent(generation, role);
+            // The list's value is asked under the document in force at this
+            // call, and the decision below loads that document again. The
+            // two read one document: a store's engine takes no new one.
             let members = front.members_of(lent);
             let records = members.records(spec, front.clock());
-            let reach = objects.reach(generation, Role::Single);
-            let vetoes = world.gateway_vetoes(model, Role::Single, gateway);
+            let reach = objects.reach(generation, role);
+            let vetoes = world.gateway_vetoes(model, role, gateway);
             let asking = Asking::of(gateway, frame);
             let decided = match places.taken(reach, records, asking, vetoes.standing_at(now)) {
                 Taken::Held(held) => {
@@ -209,7 +260,8 @@ pub(crate) fn decide(
 /// ahead of the snapshot that task keeps, and a snapshot a request gives is
 /// outside that order ([`RequestMaker::loads`]). A controller runs no such
 /// task yet: a document that holds such a stage is given none here, and its
-/// decisions read no report.
+/// decisions read no report. No stage of this build keeps reports: such a
+/// stage is one a host registers.
 ///
 /// [`RequestMaker::loads`]: crate::engine::RequestMaker::loads
 fn hands_reports(spec: &AppliedSpec) -> bool {
@@ -260,7 +312,7 @@ pub(crate) fn decide_pair(
         ..
     } = *taken;
     let front = world.front();
-    let spec = front.spec();
+    let spec = world.spec();
     let model = frame.model();
     if frame.hashes() > frame.hashes_read(spec) {
         own.hashes_cut.fetch_add(1, Ordering::Relaxed);
@@ -464,7 +516,7 @@ pub(crate) fn issue(
         front.count_shadow(said);
         return Ok(None);
     };
-    let stages = front.spec().engine();
+    let stages = world.spec().engine();
     let sized = (session, tokens);
     // The stages hear of every pick but one the binding's sessions rule
     // keeps from the profile: that one's lease is filed under the word.
@@ -515,7 +567,9 @@ pub(crate) fn issue(
 ///
 /// No shadow runs on a pair's side yet, so none is counted here. The
 /// decode side's lease states the prefill side's session verdict: the
-/// store's decode side keeps none of its own yet.
+/// store's decode side keeps none of its own yet. So a document that
+/// binds a sessions rule under the pair plan is refused at its apply, as
+/// not in this build.
 ///
 /// # Errors
 ///
@@ -545,7 +599,7 @@ pub(crate) fn issue_pair(
         debug_assert!(decision.pick().is_none(), "a pair's pick: {decision:?}");
         return Ok(None);
     };
-    let stages = front.spec().engine();
+    let stages = world.spec().engine();
     let sized = (session, tokens);
     let record = record_of(front, taken, term, (pick, first), Side::Prefill, sized);
     let later = taken.request.decode_later();
@@ -622,7 +676,7 @@ pub(crate) fn decide_decode(
         ..
     } = *taken;
     let front = world.front();
-    let spec = front.spec();
+    let spec = world.spec();
     let model = frame.model();
     if frame.hashes() > frame.hashes_read(spec) {
         own.hashes_cut.fetch_add(1, Ordering::Relaxed);

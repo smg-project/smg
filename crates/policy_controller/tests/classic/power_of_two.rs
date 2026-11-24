@@ -136,7 +136,7 @@ fn a_recorded_report_reaches_the_row_field_for_field() {
 }
 
 /// A recorded report of an idle worker with a rate replays with none:
-/// outside the prefill role the crate's ingest writes a worker's rate only
+/// outside the prefill role the row builder writes a worker's rate only
 /// while it runs requests, and the sheet's workers carry no role.
 #[test]
 fn the_replay_carries_no_rate_for_an_idle_worker() {

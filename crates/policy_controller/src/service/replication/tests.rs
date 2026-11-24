@@ -25,7 +25,6 @@ use crate::{
         Signals, StoreCheckpoint, StoredBlock, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus,
         WorkersStore,
     },
-    tracking::lease::TransportClass,
 };
 
 /// A store with its log, `events` retained.
@@ -284,9 +283,8 @@ fn a_write_the_store_refused_and_an_entry_off_the_journal_tell_nothing() {
         now,
         LoadSource::Poll,
     );
-    // A gateway's own facts: its veto and its completed report.
+    // A gateway's own fact: its veto.
     store.gateway_veto(GatewayId(1), a, Some(now + Duration::from_secs(5)));
-    HealthSink::completed(&store, GatewayId(1), a, TransportClass::Ok, now);
     store.evict(a);
     store.publish(now + Duration::from_secs(1));
     assert_eq!(
@@ -1080,7 +1078,6 @@ fn a_restore_leaves_nothing_of_the_tables_it_replaces() {
     store.upsert(facts("http://kept:8000", 1));
     let now = Instant::now();
     store.record(gone, 0, running(1), now, LoadSource::Stream);
-    HealthSink::completed(&store, ASKER, kept, TransportClass::Ok, now);
     store.gateway_veto(ASKER, kept, Some(now + Duration::from_secs(3_600)));
     // Whether the published world hands the asker a held veto on the row.
     let held = |store: &MemoryStore| {
@@ -1098,7 +1095,6 @@ fn a_restore_leaves_nothing_of_the_tables_it_replaces() {
     assert!(store.load(gone, 0).is_none());
     assert!(!store.vetoed(ASKER, kept, now), "the veto in the table");
     assert!(!held(&store), "the veto in the world");
-    assert!(!store.completed_ok_since(ASKER, kept, now));
     // A watcher of the store that was reads no change across the restore.
     assert_eq!(store.changes_since(0), MembershipTail::SnapshotRequired);
     // And the key that left is free: its next registration is a first one.

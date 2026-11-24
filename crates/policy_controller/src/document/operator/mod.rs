@@ -5,6 +5,10 @@
 //! dry run. Without a spec store, an enforce and a rollback are refused. A host
 //! that runs a document and keeps no store for it checks another against the
 //! one it runs with [`dry_run_against`]. The calls run on the caller's thread.
+//!
+//! A host that starts from a file names the file's form with [`Format::of`]
+//! and reads the file's bytes with [`Format::read`]: the read every source's
+//! document passes, an apply's too.
 
 mod answers;
 mod document_manager;
@@ -28,9 +32,11 @@ pub(crate) use document_manager::needs_rows;
 #[cfg(all(test, feature = "controller"))]
 pub(crate) use document_manager::Validate;
 #[cfg(feature = "controller")]
-pub(crate) use document_manager::{above, over_bound, Checked, Held, Line};
+pub(crate) use document_manager::{above, Checked, Held, Line};
 pub use document_manager::{dry_run_against, DocumentManager};
 #[cfg(feature = "controller")]
 pub(crate) use document_manager::{DRY_RUNS_WAITING, WRITES_WAITING};
+#[cfg(feature = "controller")]
+pub(crate) use reader::over_bound;
 pub use reader::{Format, MAX_DOCUMENT_BYTES};
 pub use turn::SerialTurn;

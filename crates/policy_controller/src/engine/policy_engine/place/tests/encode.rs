@@ -27,7 +27,8 @@ impl PairAdmission for Capacity {
 }
 
 /// A picker of the encode side that places an item by its value: the item
-/// `last` on the last worker the filters left, every other on the first.
+/// `last` on the last worker the filters left, an item whose value is a
+/// number on the worker at that place of them, every other on the first.
 #[derive(Debug)]
 struct ByItem;
 
@@ -47,8 +48,12 @@ impl Picker for ByItem {
         _: TieBand,
         out: &mut Targets,
     ) {
-        let last = facts.session_key.plain == Some("last");
-        let at = if last { kept.last() } else { kept.first() };
+        let value = facts.session_key.plain;
+        let at = match value.and_then(|value| value.parse::<usize>().ok()) {
+            Some(place) => kept.get(place),
+            None if value == Some("last") => kept.last(),
+            None => kept.first(),
+        };
         push_drawn(candidates, at.map_or(&[], std::slice::from_ref), out);
     }
 }
@@ -167,6 +172,7 @@ impl Three {
         EncodeLists {
             pair,
             encoders: encoders.lent(),
+            encoders_places: None,
             encoders_stalled: &[],
             encoders_held: &[],
             facts: said.0,
@@ -549,6 +555,176 @@ fn a_rule_that_panics_behind_an_encoder_that_cannot_be_sent_to_loses_no_lease() 
     assert_eq!((engine.faults(), engine.unheard()), (0, 0));
 }
 
+/// An encode request whose pair's sides read their record of sent prefixes
+/// asks the route's rule inside its decision, at the question of where the
+/// prompt goes. A rule that panics there passes its panic to the call's
+/// caller, as a pair's does: the decision's lease is given up by name
+/// first, the call places the request on no other prefill, and the engine
+/// is owed nothing.
+#[test]
+fn a_rule_that_panics_inside_an_encode_requests_decision_passes_its_panic() {
+    let preset = "cache_aware";
+    let document = PolicySpec::epd_presets("power_of_two", preset, preset).expect("presets");
+    let (engine, heard) = hearing(document);
+    let three = Three::of([2, 4, 1], |_, _| false);
+    let said: Said<'_> = (&[PLAIN], &[1, 1]);
+    let tokens: Vec<u32> = (1_000..5_096).collect();
+    let keys = [Identity::plain("item")];
+    let items = EncodeItems {
+        keys: &keys,
+        ..EncodeItems::default()
+    };
+    // The rule panics at its first question alone: a panic swallowed there
+    // would leave the walk a rule that admits, and the call's next decision
+    // a second prefill to place the request on.
+    let asked = Cell::new(false);
+    let once = |_: &dyn Worker| -> bool {
+        if asked.replace(true) {
+            return true;
+        }
+        panic!("the route's rule failed")
+    };
+    let request = PlaceRequest {
+        prompt: Prompt {
+            tokens: Some(&tokens),
+            ..Prompt::NONE
+        },
+        admits: Some(&once),
+        ..asking(three.lists(said), items)
+    };
+    let placed = catch_unwind(AssertUnwindSafe(|| engine.place(&request).is_ok()));
+    assert!(placed.is_err(), "the panic passes");
+    // The decision's lease is given up ahead of the panic: its two sides
+    // are issued once and released once.
+    let heard = heard.lock();
+    assert_eq!(heard.len(), 4, "{heard:?}");
+    let (prefill, decode) = (heard[0].1, heard[1].1);
+    let released = |worker| ("released CommitFailed".to_owned(), worker);
+    let given_up = [
+        issued(prefill),
+        issued(decode),
+        released(prefill),
+        released(decode),
+    ];
+    assert_eq!(*heard, given_up);
+    drop(heard);
+    assert_eq!((engine.faults(), engine.unheard()), (0, 0));
+}
+
+/// An encode request's record of sent prefixes names no pair the request
+/// was not sent to. Behind an encoder that cannot be sent to, the call
+/// takes no target of the decision. So the decision writes its pair for
+/// neither side, and the prompt's next request is placed by its draw, as a
+/// prompt nobody was sent.
+///
+/// The encoder is read once a decision: where the decision asked of it,
+/// the call takes the answer given there.
+#[test]
+fn a_prompt_behind_an_encoder_that_cannot_be_sent_to_is_written_for_no_pair() {
+    // `cache_aware` on the pair's two sides, and no `healthy` filter: an
+    // encoder that cannot be sent to stays a candidate of the decision.
+    let preset = "cache_aware";
+    let mut document = PolicySpec::epd_presets("power_of_two", preset, preset).expect("presets");
+    for profile in document.profiles.values_mut() {
+        profile
+            .filter
+            .retain(|filter| *filter != FilterSpec::Name("healthy".to_owned()));
+    }
+    let (engine, heard) = hearing(document);
+    let three = Three::of([4, 4, 1], |_, _| false);
+    let lists = three.lists((&[PLAIN], &[1, 1, 1, 1]));
+    let keys = [Identity::plain("item")];
+    let items = EncodeItems {
+        keys: &keys,
+        ..EncodeItems::default()
+    };
+    let encoder = &three.workers[2][0];
+    // Each prompt is asked for once behind the encoder's open breaker, and
+    // placed once the breaker is closed again.
+    let (mut prefills, mut decodes) = (0, 0);
+    for at in 0..24_u32 {
+        let first = 1_000 + 10_000 * at;
+        let tokens: Vec<u32> = (first..first + 4_096).collect();
+        let request = PlaceRequest {
+            prompt: Prompt {
+                tokens: Some(&tokens),
+                ..Prompt::NONE
+            },
+            ..asking(lists, items)
+        };
+        trip(encoder);
+        heard.lock().clear();
+        let asked = ask(
+            engine.loaded(),
+            &request,
+            &lists,
+            items,
+            &mut Call::default(),
+        );
+        assert!(matches!(asked, Ok(None)), "no placement");
+        // The pair the decision picked and gave up, by what a stage heard
+        // issued: the prefill, then the decode.
+        let given_up = {
+            let heard = heard.lock();
+            assert_eq!(heard.len(), 4, "{heard:?}");
+            (heard[0].1, heard[1].1)
+        };
+        encoder.reset_circuit_breaker();
+        let placement = engine.place(&request).expect("a placement");
+        let (prefill, decode, _) = three.places(&placement);
+        prefills += usize::from(three.id(0, prefill) == given_up.0);
+        decodes += usize::from(three.id(1, decode) == given_up.1);
+        drop(placement);
+    }
+    // A side recorded for a prompt takes its next request under any draw:
+    // all twenty-four. Recorded for none, each side is drawn among four.
+    assert!(prefills < 24, "{prefills} of 24 to the prefill given up");
+    assert!(decodes < 24, "{decodes} of 24 to the decode given up");
+}
+
+/// The call keeps the answer its decision was given on every encoder,
+/// however many the request's items are placed on: five here. The route's
+/// rule is asked inside the decision, behind the question of the encoders,
+/// and the fifth encoder's breaker opens there. The decision wrote its pair
+/// by the answers it was given. So the call takes those answers and places
+/// the request on the five: it reads no encoder a second time, and gives up
+/// no decision whose pair is written.
+#[test]
+fn a_call_takes_its_decisions_answer_on_each_of_five_encoders() {
+    let preset = "cache_aware";
+    let mut document = PolicySpec::epd_presets("power_of_two", preset, preset).expect("presets");
+    let encode = document.profiles.get_mut("encode");
+    encode.expect("the encode profile").pick = "by-item".into();
+    let (engine, _) = hearing(document);
+    let three = Three::of([2, 2, 5], |_, _| false);
+    let lists = three.lists((&[PLAIN; 5], &[1, 1]));
+    // Each item is placed on the encoder at the place its value names.
+    let keys = ["0", "1", "2", "3", "4"].map(Identity::plain);
+    let items = EncodeItems {
+        keys: &keys,
+        ..EncodeItems::default()
+    };
+    let tokens: Vec<u32> = (1_000..5_096).collect();
+    let fifth = &three.workers[2][4];
+    let opens = |_: &dyn Worker| -> bool {
+        trip(fifth);
+        true
+    };
+    let request = PlaceRequest {
+        prompt: Prompt {
+            tokens: Some(&tokens),
+            ..Prompt::NONE
+        },
+        admits: Some(&opens),
+        ..asking(lists, items)
+    };
+    let mut call = Call::default();
+    let asked = ask(engine.loaded(), &request, &lists, items, &mut call);
+    let placement = asked.expect("a decision").expect("a placement");
+    assert_eq!(three.places(&placement).2, vec![0, 1, 2, 3, 4]);
+    assert!(call.missed.is_empty(), "{:?}", call.missed);
+}
+
 /// The pair's targets of an encode request are walked as a pair's are. A
 /// target whose decode cannot be sent to is passed over and the next is
 /// taken, with the items' encoders beside it: every target of one decision
@@ -766,4 +942,125 @@ fn an_encode_request_waits_for_a_prefills_room_and_a_panic_costs_it_alone() {
     });
     let placement = placement.expect("a placement");
     assert_eq!(three.places(&placement), (0, 0, vec![0]));
+}
+
+/// An item is placed by its own key, whatever handed its request's key.
+/// Under a ring's prefix form a routing value the request's own id handed
+/// leads no prompt ([`RequestFacts::session_key_from_rid`]). That word says
+/// how the REQUEST's key came, and an item's facts carry the item's key in
+/// its place: so under a prefix ring on the encode side each item of an
+/// id-keyed request goes to the encoder its key goes to with no id, beside
+/// a prompt and under two ids. The keys have two encoders among them, so
+/// items placed by the one prompt would not all be at home.
+#[test]
+fn an_id_keyed_requests_item_goes_where_its_key_goes_under_a_prefix_ring() {
+    let side = "round_robin";
+    let mut document = PolicySpec::epd_presets("prefix_hash", side, side).expect("the presets");
+    // The request's own id is its routing value.
+    let rid = KeySourceSpec {
+        rid: true,
+        ..KeySourceSpec::default()
+    };
+    document.bindings[0].routing_key = Some(RoutingKeySpec {
+        sources: vec![rid],
+        strip_lineage: false,
+    });
+    let spec = AppliedSpec::validate(&document).expect("a valid document");
+    let engine = hosted(PolicyEngine::new(spec));
+    let three = Three::of([1, 1, 8], |_, _| false);
+    let ids: Vec<u32> = (500..800).collect();
+    // The encoder of the one item `key` of a request whose own id is `id`.
+    let encoder_of = |key: Identity<'_>, id: Option<&str>| {
+        let keys = [key];
+        let items = EncodeItems {
+            keys: &keys,
+            ..EncodeItems::default()
+        };
+        let request = PlaceRequest {
+            prompt: Prompt {
+                tokens: Some(&ids),
+                ..Prompt::NONE
+            },
+            request_id: id,
+            ..asking(three.lists((&[PLAIN; 8], &[1])), items)
+        };
+        let placement = engine.place(&request).expect("a placement");
+        assert_eq!(placement.routing_key, id);
+        three.places(&placement).2[0]
+    };
+    let keys = ["a", "b", "c", "d", "e", "f"].map(Identity::plain);
+    let homes = keys.map(|key| encoder_of(key, None));
+    assert!(homes.iter().any(|home| *home != homes[0]), "{homes:?}");
+    for id in ["conv-1", "conv-2"] {
+        assert_eq!(keys.map(|key| encoder_of(key, Some(id))), homes, "{id}");
+    }
+}
+
+/// An encode request's record of sent prefixes names the pair its request
+/// went to, as a pair's does. Where the route's rule refuses the decode of
+/// the pick's first target, the request goes past it, and the prompt's next
+/// requests go to the pair that one was sent to.
+#[test]
+fn a_prompt_sent_past_a_refused_decode_goes_to_its_encode_requests_pair_again() {
+    let preset = "cache_aware";
+    let mut document = PolicySpec::epd_presets("power_of_two", preset, preset).expect("presets");
+    document.generation = 1;
+    let spec = AppliedSpec::validate(&document).expect("a valid document");
+    let engine = hosted(PolicyEngine::new(spec));
+    let three = Three::of([2, 4, 1], |_, _| false);
+    let said: Said<'_> = (&[PLAIN], &[1, 1]);
+    let tokens: Vec<u32> = (1_000..5_096).collect();
+    let prompt = Prompt {
+        tokens: Some(&tokens),
+        ..Prompt::NONE
+    };
+    let keys = [Identity::plain("item")];
+    let items = EncodeItems {
+        keys: &keys,
+        ..EncodeItems::default()
+    };
+    // The rule refuses the first decode it is asked of, at that question
+    // alone: asked of it again, it would take it.
+    let refused = RefCell::new(None::<String>);
+    let rule = |worker: &dyn Worker| {
+        if !worker.url().starts_with("http://decode-") {
+            return true;
+        }
+        let mut refused = refused.borrow_mut();
+        if refused.is_some() {
+            return true;
+        }
+        *refused = Some(worker.url().to_owned());
+        false
+    };
+    let refusing = PlaceRequest {
+        prompt,
+        admits: Some(&rule),
+        ..asking(three.lists(said), items)
+    };
+    let sent = engine.place(&refusing).expect("a placement");
+    let (prefill, decode, _) = three.places(&sent);
+    drop(sent);
+    let passed = refused.borrow().clone().expect("the rule refused a decode");
+    assert_ne!(
+        three.workers[1][decode].url(),
+        passed,
+        "past the refused decode"
+    );
+    let stated = PlaceRequest {
+        prompt,
+        ..asking(three.lists(said), items)
+    };
+    let mut went = Vec::new();
+    for _ in 0..16 {
+        let again = engine.place(&stated).expect("a placement");
+        let (prefill, decode, _) = three.places(&again);
+        went.push((prefill, decode));
+        drop(again);
+    }
+    assert_eq!(
+        went,
+        [(prefill, decode); 16],
+        "the pair the prompt was sent to"
+    );
 }

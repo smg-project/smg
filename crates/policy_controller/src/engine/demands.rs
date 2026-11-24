@@ -11,10 +11,10 @@
 //! ([`WorkerFacts::vision`](crate::store::WorkerFacts::vision)), the one
 //! fact a pairing plan reads too. The rest
 //! ([`WorkerFacts::demand_facts`](crate::store::WorkerFacts::demand_facts))
-//! stand in a column beside its pool's rows, one entry a row
-//! ([`StoreSnapshot::demand_facts`](crate::store::StoreSnapshot::demand_facts)):
-//! the candidate row carries none of them. The crate compares what the two
-//! sides state and derives nothing: it names no label and no runtime.
+//! stand in a column beside its pool's rows, one entry a row, which a pool
+//! keeps where a worker of it states one: the candidate row carries none of
+//! them. The crate compares what the two sides state and derives nothing: it
+//! names no label and no runtime.
 //!
 //! A request that demands nothing reads no column and pays one test.
 //!

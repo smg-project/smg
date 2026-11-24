@@ -190,12 +190,15 @@ impl Targets {
     }
 
     /// Turns a decode side's targets into a pair's where they stand: each
-    /// names `prefill` with the decode it held, in the order they had.
-    /// Nothing is stated of a pair's first target ([`Pick::overlap`]), and
-    /// no pair states a verdict of its decode side. The entries past the
-    /// count are not rewritten, as [`Self::clear`] leaves them. No accessor
-    /// goes past the count.
-    pub(crate) fn pair_under(&mut self, prefill: &Target) {
+    /// names `prefill` with the decode it held, in the order they had. The
+    /// first pair states `decode`, the decode side's own session verdict,
+    /// and no pair behind it states one. Nothing is stated of a pair's
+    /// first target ([`Pick::overlap`]). The entries past the count are not
+    /// rewritten, as [`Self::clear`] leaves them. No accessor goes past the
+    /// count.
+    pub(crate) fn pair_under(&mut self, prefill: &Target, decode: SessionVerdict) {
+        // Taken by the first pair: the pairs behind it read none.
+        let mut verdict = DecodeVerdict::of(decode);
         for target in &mut self.items[..usize::from(self.len)] {
             *target = Target {
                 position: prefill.position,
@@ -205,7 +208,7 @@ impl Targets {
                     decode_position: target.position,
                     decode_id: target.id,
                     decode_dp_rank: target.dp_rank,
-                    decode_verdict: DecodeVerdict::NONE,
+                    decode_verdict: std::mem::take(&mut verdict),
                 }),
             };
         }
@@ -320,7 +323,9 @@ impl fmt::Debug for Survivors {
 /// picks from. The rule's own pick writes it, and so does the pick of a
 /// session key kept on its worker where the veto as it stands kept no
 /// worker. A key handed on at its sessions rule's in-flight cap writes it
-/// too, where the veto as it stands kept no worker. Every
+/// too, where the veto as it stands kept no worker. So does a pair placed
+/// by its prefill profile that weighs load against affinity, where the veto
+/// as it stands kept no prefill. Every
 /// other pick reads `None`, the default. One mark is the decision's, since
 /// the pick and its alternates are of the one lifted pool. The mark sits in
 /// a byte the record had spare: the trace is no larger for it.
@@ -465,7 +470,8 @@ pub enum OverlapSource {
     None,
     /// The event index.
     Index,
-    /// The sent-prefix predictor.
+    /// What the worker was sent: the sent-prefix predictor, or the match of
+    /// a token tree the host lends.
     Predictor,
 }
 
@@ -479,10 +485,14 @@ pub enum OverlapSource {
 /// a single decision, from the first target's entry of the rows that
 /// decision was given: the rows the engine named from the host's own data,
 /// a caller's column, or the rows a caller named. No stage is asked. A
-/// decision given no rows states nothing. Neither does a pair, a request
-/// decided inside a caller's token tree, or a pick the binding's sessions
-/// rule keeps from the profile. [`Engine::decide`](crate::engine::Engine::decide)
-/// itself states nothing.
+/// decision given no rows states nothing. Neither does a pair, or a pick
+/// the binding's sessions rule keeps from the profile.
+/// [`Engine::decide`](crate::engine::Engine::decide) itself states nothing.
+///
+/// A request decided inside a token tree its host lends is given the rows
+/// the tree's match names, and its pick states by them: the match's tokens
+/// counted in the request's blocks for a worker among the match's holders,
+/// and a miss for any other. A match under one block is a miss.
 ///
 /// Six bytes, in bytes a pick's targets had spare behind their count: a
 /// pick is no larger for it ([`Pick::overlap`]).
@@ -788,6 +798,15 @@ pub(crate) const WIRES: &str = "wires";
 )]
 pub(crate) const SUBSET_HINT: &str = "subset-hint";
 
+/// The stage a request is answered under for the places it is held to
+/// ([`Constraints::places`](crate::engine::view::Constraints::places)). A
+/// pair whose own request states places is declined under it: one set of
+/// places cannot hold a pair's two lists. An encode request is shed under
+/// it where a list's places name workers and none of them takes the
+/// request, though a worker outside them does: it is held off every worker
+/// that takes it, which no gap of the membership says.
+pub(crate) const PLACES: &str = "places";
+
 /// A shed the deciders say in the engine's place, in the shape of the
 /// engine's own.
 #[cfg_attr(
@@ -857,7 +876,7 @@ mod tests {
 
         let mut targets = Targets::new();
         targets.push(Target::of(&decode));
-        targets.pair_under(&Target::of(&prefill));
+        targets.pair_under(&Target::of(&prefill), SessionVerdict::None);
         assert_eq!(targets.first(), Some(&pair));
     }
 
@@ -1099,7 +1118,7 @@ mod tests {
             assert_ne!(pick, by_stages);
             pick.targets.lead(target(1));
             assert_eq!((pick.placed_by(), pick.untold()), (PlacedBy::Rule, untold));
-            pick.targets.pair_under(&target(2));
+            pick.targets.pair_under(&target(2), SessionVerdict::None);
             assert_eq!((pick.placed_by(), pick.untold()), (PlacedBy::Rule, untold));
             pick.targets.clear();
             assert_eq!((pick.placed_by(), pick.untold()), (PlacedBy::Rule, untold));
@@ -1264,9 +1283,10 @@ mod tests {
     }
 
     /// A decode side's targets turn into a pair's where they stand. Each
-    /// names the prefill with the decode it held, in the order they had.
-    /// The list equals the one a new list takes push by push, and nothing
-    /// is stated of its first target.
+    /// names the prefill with the decode it held, in the order they had,
+    /// and the first pair alone states the decode side's verdict. The list
+    /// equals the one a new list takes push by push, and nothing is stated
+    /// of its first target.
     #[test]
     fn a_decodes_targets_turn_into_a_pairs_where_they_stand() {
         let prefill = Target {
@@ -1290,7 +1310,8 @@ mod tests {
                     decode_position: position,
                     decode_id: decode(position).id,
                     decode_dp_rank: decode(position).dp_rank,
-                    ..Pair::default()
+                    decode_verdict: [DecodeVerdict::CLAIMED, DecodeVerdict::NONE]
+                        [position as usize],
                 }),
                 ..prefill
             });
@@ -1301,16 +1322,36 @@ mod tests {
             source: OverlapSource::Index,
             margin_held: false,
         });
-        turned.pair_under(&prefill);
+        turned.pair_under(&prefill, SessionVerdict::Claimed(decode(0).id));
         assert_eq!(turned, pushed);
+        // The first pair reads its side's whole verdict back with its decode.
+        let first = turned.as_slice()[0].pair.expect("a pair");
+        assert_eq!(
+            first.decode_verdict.on(first.decode_id),
+            SessionVerdict::Claimed(decode(0).id)
+        );
         let pick = Pick {
             targets: turned,
             ..Pick::default()
         };
         assert_eq!(pick.overlap(), Overlap::NONE);
+        // Each verdict of the decode side is read back whole from the
+        // first pair, with the decode it names.
+        for verdict in [
+            SessionVerdict::None,
+            SessionVerdict::Pinned,
+            SessionVerdict::Respill,
+            SessionVerdict::Claimed(decode(0).id),
+        ] {
+            let mut list = Targets::new();
+            list.push(decode(0));
+            list.pair_under(&prefill, verdict);
+            let pair = list.as_slice()[0].pair.expect("a pair");
+            assert_eq!(pair.decode_verdict.on(pair.decode_id), verdict);
+        }
         // An empty list stays empty.
         let mut none = Targets::new();
-        none.pair_under(&prefill);
+        none.pair_under(&prefill, SessionVerdict::None);
         assert_eq!(none, Targets::new());
     }
 

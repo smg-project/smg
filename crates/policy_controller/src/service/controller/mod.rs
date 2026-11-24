@@ -6,8 +6,7 @@
 //! controller's deciding threads, and, on the leader, the control scope's
 //! registration calls and the gateway scope's watch of the worker rows, and
 //! the run loop sweeps the gateways that are gone; the scopes' other call
-//! bodies arrive with the gateway, ingestion and control scope PRs, the
-//! ingestion drivers with their move out of the gateway. In the
+//! bodies arrive with the gateway, ingestion and control scope PRs. In the
 //! `elected` mode the gateway runs this same loop inside its process. A
 //! controller given a spec file runs its document, watches the file and
 //! answers `GetPolicySpec` and a dry run of `ApplyPolicySpec`
@@ -29,10 +28,12 @@
 //! and returns.
 //!
 //! Every replica runs the same loop, the load monitor's task included. A
-//! follower polls no engine and holds no load report: the monitor is
-//! stopped where a lead ends, and its snapshot is published empty. Its
-//! first poll goes out at its promotion. No load row is written to the
-//! store.
+//! follower polls no engine, drops the load records its workers' event
+//! streams carry and holds no load report: the monitor is stopped where a
+//! lead ends, and its snapshot is published empty. Its first poll goes out
+//! at its promotion. No load row is written to the store. The controller
+//! keeps no ingestion driver of its own: its loads come from this monitor
+//! and its cache events from the worker host's feed.
 //!
 //! Every socket a listener accepts is set to send at once: a small answer
 //! never waits for the peer's acknowledgement of the write before it.
@@ -472,6 +473,10 @@ impl Controller {
         // The load monitor is built stopped, ahead of the deciding threads:
         // each takes its channel at its start, and the serve runs its task.
         let monitor = worker_objects::LoadMonitor::new(&workers, config.load_poll_interval);
+        // The load records that ride the workers' event streams go to the
+        // monitor while this replica leads: the feed takes their sink
+        // ahead of its first stream.
+        kv_feed.set_load_sink(monitor.pushed());
         let mut shared = Shared::new(
             config.controller_id.clone(),
             address.unwrap_or_default(),
@@ -485,19 +490,29 @@ impl Controller {
         shared.lag = Arc::new(Lag::new(standby::synced_within(config.load_poll_interval)));
         let (phase, readiness) =
             readiness::channel(elector.fence(), steps, Arc::clone(&shared.lag));
-        #[cfg(feature = "discovery")]
-        let discovery = config.discovery.as_ref().map(|settings| {
-            let host = Arc::new(discovery::Host::new(
-                Arc::clone(workers.holder().registry()),
-                settings.credential().cloned(),
-            ));
-            Box::new(discovery::Discovery::new(
-                settings.runtime().clone(),
-                host,
-                Arc::clone(&shared.fence),
-            ))
-        });
         let shared = Arc::new(shared);
+        #[cfg(feature = "discovery")]
+        let discovery = config
+            .discovery
+            .as_ref()
+            .map(|settings| {
+                // The replica's own writes are admitted as a control call's
+                // are: under the term its store leads, read at each write.
+                let own = Service::new(Vec::new(), Arc::clone(&shared));
+                let door = membership::ReplicaMembershipWriter::new(
+                    Arc::clone(&shared.door),
+                    principal::Principal::replica(&config.controller_id),
+                    move || own.leading(std::time::Instant::now()),
+                );
+                discovery::Discovery::registering(
+                    settings,
+                    &workers.holder(),
+                    Arc::new(door),
+                    Arc::clone(&shared.fence),
+                )
+                .map(Box::new)
+            })
+            .transpose()?;
         Ok(Self {
             config,
             catalog,
@@ -1376,7 +1391,6 @@ mod tests {
         decision_slots::{tests as bed, TERM_MARK},
         election::{self, ElectionObservation},
         following,
-        membership::tests::Logged,
         principal::Layer,
         readiness::{self, tests::fenced, Phase},
         standby::Lag,
@@ -1384,10 +1398,6 @@ mod tests {
         Scope,
     };
     use crate::{
-        load::ingest::{
-            loads::{LoadProbe, ReadError},
-            probe::{unbuildable, EngineProbe},
-        },
         service::elector::{
             ConditionalWriteOutcome, ElectError, ElectionSettings, Elector, LeaseBackend,
             LeaseRecord, MemoryLease, TickOutcome,
@@ -1420,31 +1430,6 @@ mod tests {
         fn place(&self) -> String {
             self.lease.place()
         }
-    }
-
-    /// A probe whose client cannot be built says so once, as a warning
-    /// that names the controller's own client and no engine.
-    #[tokio::test]
-    async fn a_client_that_cannot_be_built_is_said_once_as_the_controllers_own() {
-        let lines = Logged::default();
-        let writer = lines.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_ansi(false)
-            .with_writer(move || writer.clone())
-            .finish();
-        let _beside = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
-        let _kept = tracing::subscriber::set_default(subscriber);
-        let probe = EngineProbe::building(unbuildable);
-        for _ in 0..3 {
-            let read = probe
-                .scrape("http://127.0.0.1:9", Duration::from_secs(1))
-                .await;
-            assert!(matches!(read, Err(ReadError::Client(_))), "{read:?}");
-        }
-        let said = String::from_utf8(lines.0.lock().clone()).expect("the lines");
-        assert_eq!(said.matches("could not be built").count(), 1, "{said}");
-        assert!(said.contains("WARN"), "{said}");
-        assert!(!said.contains("127.0.0.1"), "no engine is named: {said}");
     }
 
     /// Every socket the controller accepts sends at once, read from the
