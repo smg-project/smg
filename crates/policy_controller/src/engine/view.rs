@@ -93,6 +93,20 @@ impl Phase {
             Self::Encode => "encode",
         }
     }
+
+    /// The role whose list decides a request of this phase that stands
+    /// alone: the role its demands are held by
+    /// ([`Demands::held_by`](super::demands::Demands::held_by)), and the
+    /// list a controller lends it.
+    #[cfg(feature = "in-process")]
+    pub(crate) const fn role(self) -> Role {
+        match self {
+            Self::Single => Role::Single,
+            Self::Prefill => Role::Prefill,
+            Self::Decode => Role::Decode,
+            Self::Encode => Role::Encode,
+        }
+    }
 }
 
 /// What the request's block hashes were computed over.
