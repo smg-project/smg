@@ -155,7 +155,8 @@ impl PromptHashes {
     /// win, else its text is hashed, else it has none. `read` is asked once,
     /// for the kind that is hashed: the size of one block of that kind and
     /// how many blocks are read, and whether the document reads a request's
-    /// size ([`block_size_and_depth`]). A prompt with neither asks nothing.
+    /// size ([`block_size_and_depth`]). A prompt with neither asks nothing,
+    /// and keeps the seed of its partition.
     pub(crate) fn of_prompt(
         tokens: Option<&[u32]>,
         text: Option<&str>,
@@ -171,7 +172,10 @@ impl PromptHashes {
                 let (window, depth, sized) = read(HashKind::Text);
                 Self::of_text(text, window, depth, sized, seeds)
             }
-            (None, None) => Self::default(),
+            (None, None) => Self {
+                namespace_seed: seeds.partition,
+                ..Self::default()
+            },
         }
     }
 
@@ -643,11 +647,16 @@ mod tests {
         let text = under(None, Some(RECORDED_TEXT));
         assert_eq!(written(&text).hash_kind, HashKind::Text);
         assert_eq!(written(&text).block_hashes, RECORDED_WINDOWS);
-        assert_eq!(five(&under(None, None)), five(&PromptHashes::default()));
+        // Nothing but the seed of its partition, the plain one here.
+        let plain = PromptHashes {
+            namespace_seed: XXH3_SEED,
+            ..PromptHashes::default()
+        };
+        assert_eq!(five(&under(None, None)), five(&plain));
         let neither = PromptHashes::of_prompt(None, None, HashSeeds::PLAIN, |kind| {
             panic!("a prompt with neither asked for the size of a {kind:?} block")
         });
-        assert_eq!(five(&neither), five(&PromptHashes::default()));
+        assert_eq!(five(&neither), five(&plain));
     }
 
     #[test]

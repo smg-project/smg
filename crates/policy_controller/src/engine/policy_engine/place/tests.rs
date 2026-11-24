@@ -414,7 +414,7 @@ fn each_making_draws_a_seed_of_its_own() {
 /// seeds its caller states, token ids ahead of a text, and they are hashed
 /// once: a second making borrows the first one's blocks. Token ids alone
 /// and a text alone are hashed too. A request with no prompt states no
-/// block and no size.
+/// block and no size, and the seed of its partition like any other.
 ///
 /// A text alone states no count of tokens, so a stage that credits a send
 /// of no stated size credits it at its own mean. The classic router's
@@ -490,6 +490,7 @@ fn the_prompts_blocks_are_hashed_under_its_partition_once() {
     let facts = made.make(engine.standing_spec()).facts;
     assert!(facts.block_hashes.is_empty());
     assert_eq!(facts.prompt_tokens, 0);
+    assert_eq!(facts.namespace_seed, 13, "its partition all the same");
 }
 
 /// A request that is lent a worker is hashed by the block size the host

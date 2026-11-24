@@ -783,6 +783,9 @@ impl RequestMaker for Made<'_, '_> {
         });
         let mut facts = RequestFacts {
             model: request.model,
+            // The partition's, with a prompt or with none: a plugin's view
+            // states the seed of a request that carries no block too.
+            namespace_seed: request.prompt.seeds.partition,
             phase: request.phase(),
             tenant: request.tenant.map_or(Identity::NONE, Identity::plain),
             priority: request.priority,
