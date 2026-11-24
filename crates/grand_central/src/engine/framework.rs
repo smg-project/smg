@@ -4851,18 +4851,19 @@ fn rows_not_written(bare: Trace, profile: u16) -> Decision {
     shed(ShedReason::PolicyDeclined, WRITTEN_ROWS, trace)
 }
 
-/// Whether an affinity column stands for `pool`: empty, or one entry a
+/// Whether a column its host hands stands for `pool`: empty, or one entry a
 /// candidate, in the candidates' order. Asked once where a decision takes
 /// its inputs and never at a read. A column of any other length was filled
-/// for another pool: nothing held is a real answer (a cold worker), so
-/// reading such a column as zeros would turn a host's mistake into a routing
-/// change no case sees.
+/// for another pool: nothing held is a real answer of an affinity column (a
+/// cold worker), and nothing stated is one of what an encoder states for a
+/// demand, so reading such a column as zeros would turn a host's mistake
+/// into a routing change no case sees.
 ///
 /// An empty column is of another kind and is taken, under a profile that
 /// declared the need as under one that did not: it is the host's word that
 /// it holds nothing for any candidate. The engine checks the column's shape,
 /// never its presence.
-fn column_fits(column: &[AffinityFacts], pool: &[Candidate]) -> bool {
+fn column_fits<T>(column: &[T], pool: &[Candidate]) -> bool {
     column.is_empty() || column.len() == pool.len()
 }
 
