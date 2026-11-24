@@ -689,6 +689,10 @@ impl SessionTable {
     /// A move on an id its worker had before it was registered again
     /// fronts the id that stands ([`Self::stands`]), as a dispatch on
     /// that id does.
+    /// A pair's decision moves its prefill side's pin where the pair
+    /// forms, to the prefill the pair formed on. A prefill its side placed
+    /// first and passed over is fronted at no instant, and a decision
+    /// that forms no pair moves no pin.
     pub(crate) fn respilled(&self, key: Session, target: WorkerId) {
         let key = key.get();
         if target == WorkerId(0) {

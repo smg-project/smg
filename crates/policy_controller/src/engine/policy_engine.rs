@@ -902,6 +902,7 @@ impl PolicyEngine {
                     let read = own.loads_read(maker);
                     let loads = read.snapshot();
                     let sends_to = |target: &_| maker.sends_to(target);
+                    let counted = || maker.session_counted_under();
                     Ok(pair::decide(
                         own,
                         &lists,
@@ -910,6 +911,7 @@ impl PolicyEngine {
                         loads,
                         now,
                         sends_to,
+                        counted,
                     ))
                 }
                 (Phase::Single | Phase::Prefill, _) => Ok(single::over_none(own, &request)),
@@ -955,7 +957,17 @@ impl PolicyEngine {
                     let loads = read.snapshot();
                     // The decode asked again is asked which decode it is sent to.
                     let sends_to = |target: &_| maker.sends_to(target);
-                    pair::decide(own, &lists, &mut request, Some(held), loads, now, sends_to)
+                    let counted = || maker.session_counted_under();
+                    pair::decide(
+                        own,
+                        &lists,
+                        &mut request,
+                        Some(held),
+                        loads,
+                        now,
+                        sends_to,
+                        counted,
+                    )
                 }
                 _ => single::over_none(own, &request),
             })
@@ -1119,7 +1131,17 @@ impl Loaded<'_, '_> {
                 let read = self.loads_read(maker);
                 let loads = read.snapshot();
                 let sends_to = |target: &_| maker.sends_to(target);
-                let decided = pair::decided(self, &lists, &mut request, None, loads, now, sends_to);
+                let counted = || maker.session_counted_under();
+                let decided = pair::decided(
+                    self,
+                    &lists,
+                    &mut request,
+                    None,
+                    loads,
+                    now,
+                    sends_to,
+                    counted,
+                );
                 *whole = Some((decided, later));
                 return Ok(None);
             }
@@ -1191,7 +1213,17 @@ impl DecisionEngine for PolicyEngine {
                     let loads = read.snapshot();
                     // The decode asked again is asked which decode it is sent to.
                     let sends_to = |target: &_| maker.sends_to(target);
-                    pair::decided(own, &lists, &mut request, Some(held), loads, now, sends_to)
+                    let counted = || maker.session_counted_under();
+                    pair::decided(
+                        own,
+                        &lists,
+                        &mut request,
+                        Some(held),
+                        loads,
+                        now,
+                        sends_to,
+                        counted,
+                    )
                 }
                 _ => single::issued(own, single::over_none(own, &request), &request, now),
             })

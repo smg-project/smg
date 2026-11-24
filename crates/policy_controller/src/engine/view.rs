@@ -1582,10 +1582,12 @@ pub struct Constraints<'a> {
     /// decode's requests in flight. Default: false. The decode asked again
     /// over the host's own worker lists then reads that decode's record
     /// with one request less in flight: the record of that id in the list
-    /// handed at the call. Its count of session keys is read as the worker
-    /// states it. A first decision does not read it, and no frame carries
-    /// it: a controller's requests are counted by the leases it holds on
-    /// file.
+    /// handed at the call. Where a stage reads the count of the key's
+    /// requests on a worker, that record carries one of the key's requests
+    /// less too: the host's guard counts the request under its key. Its
+    /// count of session keys is read as the worker states it. A first
+    /// decision does not read it, and no frame carries it: a controller's
+    /// requests are counted by the leases it holds on file.
     pub counted_on_decode: bool,
     /// A subset hint: decide over at most this many candidates.
     pub subset_hint: Option<u32>,

@@ -1836,7 +1836,8 @@ makes one itself.
 2. When the prefill has answered, the caller calls `decode_again` with the request stated
    again, as its first call stated it. A caller that counts the request on its first decode
    across this call states `counted_on_decode` beside it, and the decision reads that decode
-   without the request: one request less in flight.
+   without the request: one request less in flight, and one less of its key where a capped
+   sessions rule reads that count.
 3. The engine makes the request anew from what the caller stated, as it makes a first call's,
    and decides under the binding of the model stated there. Every fact of the decode's decision
    is that request's: the pair's two lists as they stand then, the request's size, its routing
@@ -2510,8 +2511,15 @@ Five things follow, and they are the first work of section 16.
    key folds whole blocks). One of them turns in the crate on a ring its caller lends
    (decision 3). The other measures which tokens are in a prompt's head, which is then the
    caller's recipe: it is proven at stage 3, by a gateway test of classic's own function. The
-   1 of `manual` replays as classic recorded now: a sessions rule with no cap runs on the two
-   sides of a pair, each side by its own session. Each
+   1 of `manual` replays as classic recorded now: a sessions rule runs on the two sides of a
+   pair, each side by its own session and under its own cap.
+   One answer under a cap differs from classic's and stands open under rule 6. Classic's sticky
+   map moves a prefill side's pin at its cap where it selects the prefill
+   (`select_sticky`, `model_gateway/src/policies/registry.rs:816-818`, on main `bd55beae5`),
+   and a pair that fails behind that selection keeps the move
+   (`pair_pass`, `model_gateway/src/routers/common/placement.rs:3072-3078`). The engine moves the pin where
+   the pair forms, to the prefill the pair formed on, and a decision that forms no pair moves
+   none. Each
    of the 23 is made equal to classic or named as an accepted difference: two in stage 1, one
    at stage 3, the 20 in stage 4.
 3. **Five policies have no sheet over a healthy pool**: `round_robin`, `random`, `passthrough`,
