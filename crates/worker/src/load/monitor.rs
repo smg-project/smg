@@ -87,8 +87,10 @@ use tokio::{
 };
 use tracing::{debug, info, warn};
 
+#[cfg(feature = "workflow")]
+use crate::connection::engine::EngineConnector;
 use crate::{
-    connection::engine::{EngineConnector, LoadSource},
+    connection::engine::LoadSource,
     health::liveness,
     identity::{
         basic::{ConnectionMode, Worker},
@@ -2178,6 +2180,10 @@ impl<G: Generation> WorkerMonitor<G> {
     /// a poll reads such an engine through its source alone, and the engine
     /// is asked nothing. The connector is asked under the poll's deadline,
     /// and one that does not say in time keeps none here.
+    ///
+    /// Its one caller is a registration's step, so it builds under that
+    /// step's feature.
+    #[cfg(feature = "workflow")]
     pub(crate) async fn read_engine_loads(
         connector: &dyn EngineConnector,
         runtime: RuntimeType,
