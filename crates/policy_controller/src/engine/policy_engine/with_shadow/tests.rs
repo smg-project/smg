@@ -40,7 +40,7 @@ use crate::{
         decision_engine::{Decided, DecisionEngine, Request},
         demands::Demands,
         framework::{Picker, ShadowRows, TieBand},
-        list_cell::tests::PublishedList,
+        list_cell::PublishedList,
         policy_engine::PolicyEngine,
         prompt_hashes::HashSeeds,
         records::worker_id,

@@ -64,7 +64,31 @@ realistic engine's admission hooks, counts in the admin API's `encodes` and
 answers accepted; it reports health under the encoder service's name, as the
 engine does in that role; its `Generate` is refused as the wrong pool, and a
 prefill worker on that wire refuses a request whose `encode_bootstrap_info`
-does not name a rendezvous for each media item once.
+does not name a rendezvous for each media item once. A request reaches that
+`Encode` only when the gateway processes the media itself, which it does for
+a model whose family it has a media spec for, matched by a model id that
+names the family (`llava` in it) or by the `model_type` in the model
+directory's `config.json`: with the default model id and a text model's
+tokenizer a chat request that carries an image is refused with
+`multimodal_not_supported`. A model directory of a vision family serves it:
+every worker is started with `--model mock-llava --tokenizer <dir>` and
+registered with `<dir>` as its tokenizer path, which the gateway reads itself
+(the mock serves no tokenizer: where the gateway cannot read `<dir>`, the
+model's requests are answered with `tokenizer_load_failed` once the load has
+failed), and `<dir>` holds a `config.json` of the llava family (`model_type`,
+`image_token_index`, the vision tower's `patch_size` and `image_size`),
+tokenizer files with the token `<image>`, a `preprocessor_config.json` of a
+CLIP image processor, and a chat template whose prompt holds one `<image>`
+for each image: a template that walks the content parts renders an image
+part as `<image>`, and one that prints the content as a string is given the
+tag by the gateway. A prompt with another count of the tag (a walk of the
+parts with no clause for an image part, a literal `<image>` in the text) is
+refused with `multimodal_prompt_contract_mismatch`; with the right count the
+request is answered, the encode worker takes one `Encode` for each image, and
+a prefill and a decode worker take the request. That holds with the gateway's
+policy controller off and its media processing at `auto` or `router` (the
+defaults are off and `auto`); with `--mm-processing worker` the gateway does
+not process the media and refuses the request with `multimodal_not_supported`.
 The SGLang wire has no encode role. On the TokenSpeed and the SGLang wires a
 request's media items are checked against the shape the engine's adapter
 requires before the canned answer: a known modality, the TokenSpeed item's
@@ -357,7 +381,7 @@ data-parallel ranks addresses each of its ranks (engines of their own, named
 `grpc:<port>:r<k>`), and a rank's name that rank alone. A hook applies to every KV-event
 transport of the worker (gRPC `SubscribeKvEvents` and the ZMQ publisher alike)
 and answers with the worker's hook state (`drop_pending`, `dropped_total`,
-`delay_ms`, `admit_delay_ms`, `admit_per_sec`, `cold_shape_ms`, `load_lag_ms`, `paused`, `generation`,
+`delay_ms`, `admit_delay_ms`, `admit_per_sec`, `cold_shape_ms`, `load_lag_ms`, `load_frozen`, `paused`, `generation`,
 `restarts`, and the request fault's `fail_status`, `fail_pending`,
 `fail_secs_left`, `fail_after_tokens`, `fail_finish_error`, `fail_stall_ms`, `failed_total`,
 `cut_total`, `stalled_total`, `load_fail_status`, `load_muted`). The hooks need `--engine realistic`: the canned
@@ -371,6 +395,7 @@ path has no engine to hook.
 | `POST /admin/fault/{worker}/admit-rate?per_sec=R` | at most R new gRPC requests per second enter the engine (0 clears); the rest wait their turn, unseen by the load record: a throttled input path whose backlog grows while the gateway keeps sending |
 | `POST /admin/fault/{worker}/cold-shape?ms=D` | the engine holds D ms before the pass that first runs a prompt longer than any it has run (0 clears): a kernel built for a new shape. It produces nothing meanwhile, its load record keeps flowing with its silence growing; paid once per new longest prompt, and the lengths run before the hook was set count as run |
 | `POST /admin/fault/{worker}/load-lag?ms=D` | every load report of the worker (`GetLoads`, `/v1/loads`, the pushed load record, a ZMQ rank's scheduler stats) states the counts the engine published D ms before the report is read (0 clears; a minute at most, a larger D is taken as 60000): an engine whose counters trail its intake. The requests are served on time, and what a servicer counts itself (the pushed record's silence and pending prefill tokens) does not trail, and `GET /admin/fleet` keeps stating the engine's own counts. The report that stood when the lag was set is stated for the first D ms; a lag set over a set one keeps its history |
+| `POST /admin/fault/{worker}/load-freeze?on=true` | every load report of the worker (`GetLoads`, `/v1/loads`, the pushed load record, a ZMQ rank's scheduler stats) states what a report read when the hook was set, until `on=false`: an engine that serves its requests while its counters stand still. The requests are served, what a servicer counts itself (the pushed record's silence and pending prefill tokens) moves on, and `GET /admin/fleet` keeps stating the engine's own counts. Set under a `load-lag`, the trailing report of that moment stands, and a `load-lag` set while the hook is on starts from the engine's own counts of that moment, which a report states once the hook is off; set again while it is set, the report that stands stays |
 | `POST /admin/fault/{worker}/restart-publisher` | the publisher restarts: gRPC sequence numbers start over at 1 and the ZMQ sequence at 0, the replay buffers are emptied, the cache is kept (no `AllBlocksCleared`); `generation` increments |
 | `POST /admin/fault/{worker}/pause` | the engine freezes after its current pass: no passes, no tokens, no events; requests queue (and count as waiting); health and `GetLoads` keep answering |
 | `POST /admin/fault/{worker}/resume` | the engine runs again |

@@ -19,7 +19,7 @@ use crate::{
     engine::{
         decision::{Decision, ShedReason, MAX_TARGETS, SUBSET_HINT},
         decision_engine::{Decided, Plain, Request, RequestMaker, WorkerLists},
-        list_cell::tests::PublishedList,
+        list_cell::PublishedList,
         pair_classes::PartnerClasses,
         policy_engine::PolicyEngine,
         view::{

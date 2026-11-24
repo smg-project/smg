@@ -26,7 +26,7 @@ use crate::{
     document::spec::{AppliedSpec, PolicySpec},
     engine::{
         decision_engine::{DecisionEngine, Request, RequestMaker, WorkerLists},
-        list_cell::tests::PublishedList,
+        list_cell::PublishedList,
         policy_engine::{
             membership::tests::{handed, id, in_id_order, registry, told},
             single::tests::hearing,

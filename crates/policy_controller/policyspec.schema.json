@@ -160,7 +160,7 @@
           "default": 180
         },
         "max_size": {
-          "description": "The size bound of a tree index: characters on a text host, tokens\notherwise. The crate's own store reads it for a pool whose profile\nreads sent prefixes: the model's record is bound to `max_size` over\nthe block size placements, never under one, one a block a worker\nwas sent. A lowered bound is met by sweeps at the record's next\nwrites, and a pool whose lanes are all heard writes none.",
+          "description": "The size bound of a tree index: on a text host its characters plus\n1024 for each node a worker stands on, tokens otherwise.\nThe crate's own store reads it for a pool whose profile\nreads sent prefixes: the model's record is bound to `max_size` over\nthe block size placements, never under one, one a block a worker\nwas sent. A lowered bound is met by sweeps at the record's next\nwrites, and a pool whose lanes are all heard writes none.",
           "type": "integer",
           "format": "uint64",
           "minimum": 1,
@@ -1582,7 +1582,7 @@
       ]
     },
     "OverloadSpec": {
-      "description": "What a binding says of the overload veto on the workers of the pools\ndecided under it, as its `overload` field: whether the default\nthresholds veto at all, and what a decision does where every worker is\nvetoed. The veto is evaluated per load report by the host and latched,\nnever per request. The block names no threshold: a worker's\nregistration states its own two, over its program's default where the\nprogram has one. The store's judge reads the switch, for each binding's\npools. A gateway that runs the document in its own process reads the\nswitch where it builds its workers' default thresholds, from the\ndocument it starts with, and its routes read one shed word: it refuses\na document whose bindings differ on either word. A controller that\njudges on its worker objects does not read the switch yet.",
+      "description": "What a binding says of the overload veto on the workers of the pools\ndecided under it, as its `overload` field: whether the default\nthresholds veto at all, and what a decision does where every worker is\nvetoed. The veto is evaluated per load report by the host and latched,\nnever per request. The block names no threshold: a worker's\nregistration states its own two, over its program's default where the\nprogram has one. The store's judge reads the switch, for each binding's\npools. A gateway that runs a supplied document in its own process reads\nthe switch where it builds its workers' default thresholds, and its\nroutes read one shed word, both from that document: it refuses one\nwhose bindings differ on either word. With no document supplied it\nreads its own two settings. A controller that judges on its worker\nobjects does not read the switch yet.",
       "type": "object",
       "properties": {
         "enabled": {

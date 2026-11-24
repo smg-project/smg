@@ -97,13 +97,13 @@ fn narrow(count: i64) -> u32 {
 
 /// One row's values of the declared signals from its report, each handed
 /// to `each` under its column, with the unit the report states, the value
-/// and its sample instant: what every source of a report writes to the
-/// signal sink behind the report's row ([`load_row`]), so each makes the
-/// same values of the same report. The column is the one of `columns` the
-/// value was made under, and the sink's write names it.
+/// and its sample instant: the crate's one conversion of a report's named
+/// values, beside the report's row ([`load_row`]), so every reader makes
+/// the same values of the same report. The column is the one of `columns`
+/// the value was made under.
 ///
 /// `columns` are the declared signals in name order
-/// ([`SignalSink::signal_columns`](crate::store::SignalSink::signal_columns)):
+/// ([`AppliedSpec::signal_columns`](crate::document::AppliedSpec::signal_columns)):
 /// a name the document does not declare is not offered. A row has a value
 /// only where every rank of the report states the name, under one unit: a
 /// sum over some of the ranks would understate the row, as the resident
@@ -268,8 +268,8 @@ impl Made {
 }
 
 /// The value over one more rank. A rank's value that is no finite number
-/// makes the row's none, under every reduction: the sink then counts it,
-/// where a maximum would pass it over.
+/// makes the row's none, under every reduction: the write of its cell then
+/// refuses it, where a maximum would pass it over.
 fn joined(across: AcrossRanks, so_far: f64, next: f64) -> f64 {
     match across {
         AcrossRanks::Sum | AcrossRanks::Mean => so_far + next,
@@ -631,7 +631,7 @@ mod tests {
                 value("depth", "items", 3.0, 50)
             ]
         );
-        // A value that is no number is handed on: the sink counts it.
+        // A value that is no number is handed on: the cell's write refuses it.
         let odd = report(vec![stating(vec![stated("wait", "ms", f64::NAN, None)])]);
         let made = made(&odd, &columns, received);
         assert!(matches!(made.as_slice(), [(_, _, value, _)] if value.is_nan()));

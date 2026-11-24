@@ -1366,15 +1366,12 @@ mod tests {
         }
     }
 
-    /// The controller's file of leases keeps one session verdict for the
-    /// two sides of a pair. So its own start refuses a spec file that binds
-    /// a sessions rule under the pair plan, by the rule's place, and starts
-    /// on the same file with no rule. The refusal is read through the
-    /// catalog the controller itself builds: the case fails where that
-    /// catalog comes to say every lifecycle call is made while the file of
-    /// leases still keeps one verdict.
+    /// The controller's file of leases keeps each side's own session
+    /// verdict of a pair. So its own start takes a spec file that binds a
+    /// sessions rule under the pair plan, as it takes the same file with
+    /// no rule.
     #[tokio::test]
-    async fn a_spec_file_that_binds_a_sessions_rule_under_a_pair_refuses_the_start() {
+    async fn a_spec_file_that_binds_a_sessions_rule_under_a_pair_starts() {
         let dir = tempfile::tempdir().expect("a directory");
         let path = dir.path().join("policy.yaml");
         let pair = "apiVersion: smg.policy/v1\nview:\n  headers: [x-session-id]\nprofiles:\n  q:\n    pick: random\nbindings:\n  - plan: pd-pair\n    profiles:\n      prefill: q\n      decode: q\n";
@@ -1385,25 +1382,10 @@ mod tests {
             let stages = StageRegistry::builtin();
             bind(config, stages, &[], SpecSource::File(path.clone()))
         };
-
-        let unruled = start(pair.to_string()).await;
-        let controller = unruled.expect("a pair under no rule starts");
-        assert_eq!(controller.store().snapshot().spec().generation(), 1);
-        drop(controller);
-
-        match start(format!("{pair}{rule}")).await {
-            Err(Error::SpecFile {
-                source: SpecRejected::Invalid(SpecError::NotInBuild { path: field, what }),
-                ..
-            }) => assert_eq!(
-                (field.as_str(), what),
-                (
-                    "bindings[0].sessions",
-                    "the session verdict a pair's decode side keeps of its own"
-                )
-            ),
-            Err(other) => panic!("the start was refused as {other}"),
-            Ok(_) => panic!("the file of leases keeps one verdict for a pair's two sides"),
+        for document in [pair.to_string(), format!("{pair}{rule}")] {
+            let started = start(document).await;
+            let controller = started.expect("a pair starts, under a rule and under none");
+            assert_eq!(controller.store().snapshot().spec().generation(), 1);
         }
     }
 

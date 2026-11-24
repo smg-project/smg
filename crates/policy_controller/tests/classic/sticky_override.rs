@@ -1733,15 +1733,15 @@ mod sends {
                 assert!(pinned, "{key:?}: request {step} states no pin");
                 // The policy places the first request and the third, and
                 // the rule the two behind them.
-                let policys = step % 2 == 0;
-                let expected = if policys {
+                let by_policy = step % 2 == 0;
+                let expected = if by_policy {
                     PlacedBy::Stages
                 } else {
                     PlacedBy::Rule
                 };
                 assert_eq!(by, expected, "{key:?}: request {step}");
                 let mut guards = vec![guard];
-                if policys {
+                if by_policy {
                     // The policy alone is handed a header's key, and never
                     // the id's.
                     let twin_key = if by_id { "" } else { key };

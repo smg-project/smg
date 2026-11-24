@@ -25,7 +25,7 @@
 //! column it holds ([`SignalColumn::told`]): the same index, and no age.
 
 use crate::{
-    document::spec::{AcrossRanks, COST_PARAMETER_LIMIT, MAX_SIGNALS},
+    document::spec::{AcrossRanks, MAX_SIGNALS},
     engine::view::{Candidate, RequestFacts},
 };
 
@@ -33,21 +33,26 @@ use crate::{
 /// parameters are held to. A value times a coefficient then stays far
 /// inside the finite range, and so does a sum of such terms. A cost that
 /// left the range would level the score of every other row.
-const VALUE_MAGNITUDE_LIMIT: f64 = COST_PARAMETER_LIMIT;
+#[cfg(feature = "in-process")]
+const VALUE_MAGNITUDE_LIMIT: f64 = {
+    use crate::document::spec::COST_PARAMETER_LIMIT;
+    COST_PARAMETER_LIMIT
+};
 
 /// Whether `value` is one a decision may read: a finite number of
-/// magnitude at most 1e15. Every source of a value is held to it, where
-/// it writes a cell.
+/// magnitude at most 1e15. The crate's one write of a cell holds a
+/// report's value to it ([`SignalCells::write`]).
+#[cfg(feature = "in-process")]
 pub(crate) fn in_range(value: f64) -> bool {
     value.is_finite() && value.abs() <= VALUE_MAGNITUDE_LIMIT
 }
 
 /// One value and when it was sampled, in microseconds on the host's clock.
 ///
-/// A value is finite and of magnitude at most 1e15. The store's sink takes
-/// no other, and neither does the engine over worker lists where it reads
-/// a load report. A host that hands cells it built passes neither, and
-/// holds its values to the same bound itself.
+/// A value is finite and of magnitude at most 1e15. The engine over worker
+/// lists takes no other where it reads a load report. A host that hands
+/// cells it built passes no such test, and holds its values to the same
+/// bound itself.
 #[derive(Clone, Copy, Debug)]
 pub struct SignalCell {
     pub value: f64,
@@ -56,10 +61,11 @@ pub struct SignalCell {
 
 impl SignalCell {
     /// No value. A value is finite by rule, so none collides with it. The
-    /// rule is the source's: a store's sink takes no other value, and a
-    /// host that hands cells it built hands finite values or this cell. A
-    /// read tests for this cell alone, since a test of every value would
-    /// stand on each read's path, and a debug build asserts the rule there.
+    /// rule is the source's: the engine over worker lists writes no other
+    /// value, and a host that hands cells it built hands finite values or
+    /// this cell. A read tests for this cell alone, since a test of every
+    /// value would stand on each read's path, and a debug build asserts
+    /// the rule there.
     pub const NONE: Self = Self {
         value: f64::NAN,
         sampled_at_micros: 0,
@@ -97,9 +103,9 @@ fn counted(signals: usize) -> u32 {
 }
 
 impl SignalCells {
-    /// For a host that keeps no store: `cells` holds `signals` cells a
-    /// row, in the rows' order, and a row's cells stand in the order of
-    /// the document's names. A count past the document's cap
+    /// For a host that builds the cells itself: `cells` holds `signals`
+    /// cells a row, in the rows' order, and a row's cells stand in the
+    /// order of the document's names. A count past the document's cap
     /// ([`MAX_SIGNALS`]) is taken as no signal.
     pub fn new(cells: Vec<SignalCell>, signals: usize) -> Self {
         Self {

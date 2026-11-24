@@ -575,8 +575,8 @@ mod tests {
                 config::Scope,
                 decision_slots::{
                     tests::{
-                        busy, fleet, followed, frame, frame_for, gone, hearing, holder, lease_of,
-                        picked, preset, settled, Script, Step, BUDGET, PATIENCE,
+                        busy, fleet, followed, frame, frame_for, gone, hearing, lease_of, picked,
+                        preset, settled, Script, Step, BUDGET, PATIENCE,
                     },
                     Clock, DecideStats, DecisionSlots, Job, Reads,
                 },
@@ -693,18 +693,21 @@ mod tests {
                 }
             })
         };
+        // One holder for the service's calls, the store's word to the engine
+        // and the bed's own deciders, as a replica has one.
+        let (store, feed, objects, loads) = followed((store, feed));
         let mut shared = Shared::new(
             ID.to_owned(),
             ADDRESS.to_owned(),
             &elector,
             stood.clone(),
-            followed((Arc::clone(&store), feed)),
+            (Arc::clone(&store), feed, Arc::clone(&objects), loads),
             Arc::new(crate::stages::StageRegistry::builtin()),
             deciders,
         )
         .expect("the deciders start");
         let reads = Reads {
-            objects: holder(&store),
+            objects,
             loads: frame_loads::silent(),
             store,
             fence: elector.fence(),
