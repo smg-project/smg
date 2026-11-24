@@ -1661,6 +1661,24 @@ impl PolicyRegistry {
         self.each_policy(|policy| policy.remove_worker(worker_url));
     }
 
+    /// Whether the prefill and the decode side's policy read their side's
+    /// workers at [`Self::init_pd_cache_aware_policies`] and
+    /// [`Self::init_pd_bucket_policies`]. A side's policy is set once, so
+    /// the answer of two set sides stands. While a side has none, both
+    /// read as `true`: one can still be set, and those calls test it
+    /// after their caller has listed the workers.
+    pub(crate) fn pd_lists_read(&self) -> (bool, bool) {
+        let (Some(prefill), Some(decode)) = (self.prefill_policy.get(), self.decode_policy.get())
+        else {
+            return (true, true);
+        };
+        let prefill = prefill.as_ref();
+        (
+            as_cache_aware(prefill).is_some() || as_bucket(prefill).is_some(),
+            as_cache_aware(decode.as_ref()).is_some(),
+        )
+    }
+
     /// Initialize cache-aware policies for PD mode (prefill and decode) - lock-free
     pub fn init_pd_cache_aware_policies(
         &self,
