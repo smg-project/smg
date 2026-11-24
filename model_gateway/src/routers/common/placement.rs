@@ -23,8 +23,8 @@ use rand::RngExt;
 use smg_policy_controller::{
     document::DecodePick,
     engine::{
-        LentList, PairAdmission, PairLists, Phase, PlaceRequest, PolicyEngine, Unplaced,
-        WorkerLists,
+        LentList, PairAdmission, PairLists, Phase, PlaceRequest, PolicyEngine, ShedReason,
+        Unplaced, WorkerLists,
     },
     policies::consistent_hashing::LentRing,
     tracking::{Placement, PlacementSide},
@@ -2301,7 +2301,9 @@ impl PairAdmission for PairGates<'_> {
 ///
 /// - A retry pinned to its retained plan's wire is held to the places of
 ///   each pool on that wire. The lists stay the pools' own.
-/// - A pair asked again behind a call that answered no worker, where the
+/// - A pair asked again behind a call that answered no worker, or that
+///   shed the request as saturated where the overload shed is off and a
+///   side has nobody the request may use and that is available, where the
 ///   route's rule takes a pair that can be sent to, is held to the places
 ///   of the workers `held_to` takes too, that rule ([`pair_by_engine`]). A
 ///   first ask states none, and neither does a decode asked again: its
@@ -2377,9 +2379,12 @@ fn with_pair_request<R>(
 /// [`select_pair`] where the gateway started the policy engine, out of
 /// line: the engine places the pair with one call, over the request
 /// [`with_pair_request`] states, and with one more, held to the route's
-/// rule, where the first answers no worker and the rule takes a pair that
-/// can be sent to. Its document picks both sides: no classic policy runs,
-/// and the load default of the classic pass pairs nobody here.
+/// rule, where that rule takes a pair that can be sent to and the first
+/// answers no worker, or sheds the request as saturated
+/// ([`ShedReason::Saturated`]) where the overload shed is off and a side
+/// has nobody the request may use and that is available. Its document
+/// picks both sides: no classic policy runs, and the load default of the
+/// classic pass pairs nobody here.
 ///
 /// Prefills all at the request's admission limit answer
 /// [`PlacementFailure::PrefillAtCapacity`], on which the route waits for a
@@ -2482,13 +2487,30 @@ fn pair_by_engine(
         }
         false
     };
+    let open = |pool: &[Arc<dyn Worker>]| pool.iter().any(|w| admitted(w) && w.is_available());
+    // The engine judges the overload steer over the pools it was handed: a
+    // worker under the thresholds that the rule refuses keeps it from a side
+    // whose workers the rule takes are all over them, and the call sheds the
+    // request. Where the gateway steers, that call is asked again the same
+    // way, as a classic pass steers a pool over the workers the rule takes.
+    let missed = |unplaced: &Unplaced| match unplaced {
+        Unplaced::NoWorkers => true,
+        Unplaced::Shed { reason, .. } => {
+            *reason == ShedReason::Saturated
+                && !registry.overload_shed_enabled()
+                && !(open(&pairs.prefill) && open(&pairs.decode_pool))
+        }
+        _ => false,
+    };
     let side_row = |side: RowSide, label| row_name(policies, Some(side), label);
     let prefill_seen = cache_trace::observe(&pairs.prefill_pool);
     let decode_seen = prefill_seen
         .as_ref()
         .and_then(|_| cache_trace::observe(&pairs.decode_pool));
     let placed = match place(None) {
-        Err(Unplaced::NoWorkers) if inputs.candidate_filter.is_some() && takes_a_pair() => {
+        Err(unplaced)
+            if inputs.candidate_filter.is_some() && missed(&unplaced) && takes_a_pair() =>
+        {
             place(inputs.candidate_filter)
         }
         placed => placed,
@@ -2503,8 +2525,6 @@ fn pair_by_engine(
         }
         Err(unplaced) => {
             report_unplaced(model_id, &unplaced, "The policy engine placed no pair");
-            let open =
-                |pool: &[Arc<dyn Worker>]| pool.iter().any(|w| admitted(w) && w.is_available());
             let (role, pool) = if open(&pairs.prefill) {
                 engine_row(decode_seen, || side_row(DECODE_ROW, ""), None);
                 (WorkerRole::Decode, &pairs.decode_pool)
@@ -8738,6 +8758,69 @@ pub(crate) mod tests {
         assert_eq!(refused(), Some((WorkerRole::Prefill, true)));
         decode.set_status(WorkerStatus::NotReady);
         assert_eq!(refused(), Some((WorkerRole::Decode, false)));
+    }
+
+    /// The engine steers a pair to the one decode its route's rule takes
+    /// where that decode is over the thresholds, as a classic policy does:
+    /// an idle decode the rule refuses, here one no prefill pairs with,
+    /// keeps the request from no steer. A gateway that sheds an overloaded
+    /// pool steers nobody. A rule that takes the idle decode has no pool to
+    /// steer: its request waits for no slot of a prefill at its limit.
+    #[test]
+    fn the_engine_steers_a_pair_to_the_overloaded_decode_its_rule_takes() {
+        let registry = pd_registry(&[
+            ("grpc://p:1", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://p:2", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://d:1", WorkerType::Decode, Some("NixlConnector")),
+            ("grpc://d:2", WorkerType::Decode, Some("MooncakeConnector")),
+        ]);
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let document = PolicySpec::pair_presets("round_robin", "round_robin");
+        let spec = AppliedSpec::validate(&document.expect("the pair presets"));
+        engine_on(&policies, spec.expect("a valid document"));
+        let d1 = registry.get_by_url("grpc://d:1").expect("registered");
+        registry.set_worker_overloaded(&d1, true);
+        let pairs = pairs_of(&registry, &policies);
+        // A pair for a request whose rule refuses the one worker at `refused`.
+        let pick = |refused: &str, limit: Option<&PrefillSelectionContext<'_>>| {
+            let takes = |worker: &dyn Worker| worker.url() != refused;
+            let inputs = PlacementInputs {
+                candidate_filter: Some(&takes),
+                ..Default::default()
+            };
+            select_pair(
+                &registry,
+                &policies,
+                MODEL,
+                &pairs,
+                None,
+                limit,
+                inputs,
+                Stated::nothing,
+            )
+        };
+        let steered = pick("grpc://d:2", None).ok();
+        let decode = steered.map(|pair| pair.decode.url().to_owned());
+        assert_eq!(decode.as_deref(), Some("grpc://d:1"));
+
+        registry.set_overload_shed(true);
+        let shed = pick("grpc://d:2", None).err();
+        let shed = shed.map(|failure| failure.verdict);
+        assert!(matches!(shed, Some(PlacementFailure::AllOverloaded(_))));
+        registry.set_overload_shed(false);
+
+        let p1 = registry.get_by_url("grpc://p:1").expect("registered");
+        p1.increment_load();
+        let admission = PrefillAdmission::new(1, 0, Duration::ZERO);
+        let runtime = tokio::runtime::Builder::new_current_thread().build();
+        let mut failure = None;
+        let asked = admission.admit(None, |limit: &PrefillSelectionContext<'_>| {
+            failure = pick("grpc://p:2", Some(limit)).err();
+            PrefillAdmissionAttempt::<()>::Unavailable
+        });
+        assert!(runtime.expect("a runtime").block_on(asked).is_err());
+        let refused = failure.map(|failure| (failure.role, failure.is_at_capacity()));
+        assert_eq!(refused, Some((WorkerRole::Decode, false)));
     }
 
     /// A guard sent on another answer than the one it was made ahead of
