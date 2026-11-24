@@ -408,7 +408,9 @@ fn stored_item_as_input(item: &Value) -> Option<ResponseInputOutputItem> {
 
 /// The replayable items of a conversation, its newest
 /// [`MAX_CONVERSATION_HISTORY_ITEMS`] oldest first, as the caller's `tenant`
-/// may see it: a conversation of another tenant is as missing.
+/// may see it: a conversation of another tenant is as missing. An
+/// `item_reference` row of the window is resolved as one of the request's own
+/// is ([`resolve_item_references`], its 404 and its 400 included).
 async fn conversation_items(
     stores: HistoryStores<'_>,
     conversation_id: &str,
@@ -491,24 +493,59 @@ async fn conversation_items(
             })
         })
         .collect();
-    let items = without_calls_answered_by(items, &skipped);
-    if !cut {
-        // The output of a call the rule hid is no history, as after a cut.
-        return Ok(if hidden {
-            without_outputs_of_missing_calls(items)
-        } else {
-            items
-        });
+    let mut items = without_calls_answered_by(items, &skipped);
+    if cut {
+        // The window is cut at the limit: it begins at its first turn boundary
+        // (the tail of the turn the cut split is not replayed), and an output
+        // whose call is before it is not either.
+        debug!(
+            conversation_id,
+            limit = MAX_CONVERSATION_HISTORY_ITEMS,
+            "Conversation history cut to its newest items"
+        );
+        items = from_turn_boundary(items);
     }
-    // The window is cut at the limit: it begins at its first turn boundary
-    // (the tail of the turn the cut split is not replayed), and an output
-    // whose call is before it is not either.
-    debug!(
-        conversation_id,
-        limit = MAX_CONVERSATION_HISTORY_ITEMS,
-        "Conversation history cut to its newest items"
-    );
-    Ok(without_outputs_of_missing_calls(from_turn_boundary(items)))
+    // The output of a call the rule hid is no history, as after a cut.
+    let lost_rows = cut || hidden;
+    // A call the window holds as an `item_reference` row pairs as a stored
+    // call does: what the boundary left is resolved before the outputs are
+    // matched with their calls.
+    let references: Vec<(usize, ResponseInputOutputItem)> = items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| matches!(item, ResponseInputOutputItem::ItemReference { .. }))
+        .map(|(at, item)| (at, item.clone()))
+        .collect();
+    if !references.is_empty() {
+        let mut marked = resolve_item_references(stores.responses.as_ref(), items, tenant).await?;
+        // Each reference row goes back in front of the item it named, as a
+        // mark: the pair rule passes it by, whatever it takes out.
+        for (at, row) in references.into_iter().rev() {
+            marked.insert(at, row);
+        }
+        if !cut {
+            // Not after a cut: the boundary may have dropped the output the
+            // first run kept a stored call for, and a run here would take
+            // that call from under the output the request brings.
+            marked = without_calls_answered_by(marked, &skipped);
+        }
+        // An output before a reference pairs with the calls before that
+        // reference alone: a call a reference names must not keep an
+        // older output of its id.
+        items = Vec::with_capacity(marked.len());
+        for item in marked {
+            if !matches!(item, ResponseInputOutputItem::ItemReference { .. }) {
+                items.push(item);
+            } else if lost_rows {
+                items = without_outputs_of_missing_calls(items);
+            }
+        }
+    }
+    Ok(if lost_rows {
+        without_outputs_of_missing_calls(items)
+    } else {
+        items
+    })
 }
 
 /// Replace every `item_reference` input item by the item it points to: an item
@@ -1367,6 +1404,71 @@ pub(crate) mod tests {
                 "message:user"
             ]
         );
+    }
+
+    /// A call the conversation holds as an `item_reference` row pairs as a
+    /// stored call does: it replays with its output behind a cut and beside
+    /// a row the caller may not see, and not at all when its output is such
+    /// a row. An output before the reference, of an older call of the id
+    /// that the cut left out, stays out, behind another reference too.
+    #[tokio::test]
+    async fn a_call_the_conversation_holds_by_reference_pairs_with_its_output() {
+        let pair = ["function_call:call_A", "function_call_output:call_A"];
+        for (case, messages, hidden, older_output, tool_items) in [
+            ("a cut window", 110, "", false, &pair[..]),
+            ("another row is hidden", 1, "message", false, &pair[..]),
+            ("the output is hidden", 1, "output", false, &pair[..0]),
+            ("an older output in a cut window", 110, "", true, &pair[..]),
+        ] {
+            let stores = Stores::with_conversation().await;
+            let first = ResponsesRequest {
+                input: ResponseInput::Text("q".to_string()),
+                ..Default::default()
+            };
+            stores
+                .store_turn("resp_1", &first, function_call_output())
+                .await;
+            let reference = |id: &str| NewConversationItem {
+                id: Some(ConversationItemId::from(id)),
+                response_id: None,
+                item_type: "item_reference".to_string(),
+                role: None,
+                content: json!({"type": "item_reference", "id": id}),
+                status: None,
+                tenant: None,
+            };
+            let mut rows: Vec<_> = (1..=messages).map(message_row).collect();
+            let mut output = output_row("call_A");
+            match hidden {
+                "message" => rows[0].tenant = Some("other".to_string()),
+                "output" => output.tenant = Some("other".to_string()),
+                _ => {}
+            }
+            if older_output {
+                // Behind another reference, to the message before it: the
+                // first reference of the window is not the call's.
+                rows[messages - 1].id = Some(ConversationItemId::from("msg_last"));
+                rows.push(NewConversationItem {
+                    id: None,
+                    ..reference("msg_last")
+                });
+                rows.push(output_row("call_A"));
+            }
+            rows.extend([reference("fc_1"), output]);
+            if messages > 100 {
+                // First in the cut window, before its turn boundary: a
+                // reference to nothing is dropped there, never looked up.
+                rows.insert(rows.len() - 99, reference("gone"));
+            }
+            link_rows(&stores, rows).await;
+            let kinds = shape(&replayed_items(&stores, "next").await);
+            let replayed: Vec<&str> = kinds
+                .iter()
+                .map(String::as_str)
+                .filter(|kind| kind.starts_with("function_call"))
+                .collect();
+            assert_eq!(replayed, tool_items, "{case}: {kinds:?}");
+        }
     }
 
     /// A conversation of 120 items replays its newest 100, oldest first,
