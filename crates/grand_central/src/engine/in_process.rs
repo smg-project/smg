@@ -168,7 +168,7 @@ pub struct InProcess {
     /// reports ([`Self::upkeep_faults`]).
     upkeep_faults: AtomicU64,
     /// The last lease id handed out. A pair's lease writes it, and a thread
-    /// once for a run of its single requests' ids ([`single::lease_id`]):
+    /// once for a run of its single requests' ids (`single::lease_id`):
     /// one atomic step, on cache lines of its own.
     leases: OwnWord,
     /// The session table, one for the engine's life: the pins of every key
