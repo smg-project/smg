@@ -60,6 +60,7 @@ use crate::{
 
 /// Why a watcher lost its place in the watch.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum WatchPositionLost {
     /// The controller's word: the watch cannot go on from the place asked.
     Required,
@@ -125,6 +126,7 @@ pub struct WatchStream<'w, G> {
 
 /// Why a stream is followed no further.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum WatchStreamEnd {
     /// The watcher lost its place: its next stream starts from a snapshot.
     Lost(WatchPositionLost),

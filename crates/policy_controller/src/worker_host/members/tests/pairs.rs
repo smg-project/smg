@@ -10,6 +10,9 @@ use smg_worker::{
 };
 
 use super::{Replica, DECODE, MODEL, PREFILL, STRAY};
+// The cases of a debug build's own checks.
+#[cfg(debug_assertions)]
+use crate::store::pairing::{Member, PairClasses};
 use crate::{
     document::spec::{AppliedSpec, Pairing, PolicySpec},
     engine::{
@@ -281,6 +284,37 @@ fn a_row_whose_pairing_facts_move_gets_a_new_object_and_a_new_generation() {
     assert!(ptr::eq(again, paired), "one set a mode");
     let apart = replica.objects.pair_classes(&after, Pairing::Lenient);
     assert_eq!((apart.prefills(), apart.decodes()), (&[0][..], &[0][..]));
+}
+
+/// The classes the rule derived over `prefills` prefills and `decodes`
+/// decodes that report nothing.
+#[cfg(debug_assertions)]
+fn derived_over(prefills: u64, decodes: u64) -> PairClasses {
+    let side = |ids: std::ops::Range<u64>| -> Vec<Member<'static>> {
+        let member = |id| Member::new(WorkerId(id), WireModes::default(), "", None);
+        ids.map(member).collect()
+    };
+    let (prefills, decodes) = (side(0..prefills), side(prefills..prefills + decodes));
+    PairClasses::derive(&prefills, &decodes, Pairing::Lenient)
+}
+
+/// The holder hands the rule's classes on by the places of its two lists,
+/// and says of each place whether a member was derived for it. A debug
+/// build holds it to that word: a place said to hold a member that no
+/// derivation made is refused.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "a member derived for every place given")]
+fn a_place_given_with_no_member_derived_is_refused_in_a_debug_build() {
+    let _ = derived_over(1, 1).by_place([true, true], [true]);
+}
+
+/// And so is a member derived that the caller says of no place.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "a place given for every member derived")]
+fn a_member_derived_with_no_place_given_is_refused_in_a_debug_build() {
+    let _ = derived_over(1, 2).by_place([true], [false, true]);
 }
 
 /// One fleet under the stock pair document, decided over the lists the

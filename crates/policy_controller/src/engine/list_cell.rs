@@ -29,6 +29,11 @@
 //! under it. A cell holds a value for each document its list is asked
 //! under, and an engine reads the one made under its own.
 
+#![expect(
+    clippy::exhaustive_structs,
+    reason = "a caller still builds or matches these types whole: each mark comes with its call"
+)]
+
 use std::{
     fmt,
     sync::{Arc, OnceLock},

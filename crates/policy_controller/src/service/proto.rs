@@ -9,6 +9,8 @@
     clippy::all,
     clippy::absolute_paths,
     clippy::allow_attributes,
+    clippy::exhaustive_enums,
+    clippy::exhaustive_structs,
     clippy::trivially_copy_pass_by_ref,
     missing_docs,
     unused_qualifications,

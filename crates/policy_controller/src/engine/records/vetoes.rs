@@ -29,7 +29,10 @@ use crate::engine::{
 /// `rows`, every record of its list written for it, where its host states
 /// a standing veto beside them. Where the decision's profile shows its
 /// rows to a plugin ([`Engine::reads_for`]), the vetoes are written into
-/// `rows` and the constraints state no mask. Under any other profile
+/// `rows` and the constraints state no mask. That word carries a pair's
+/// side for a decode or an encode decision of a model that also pairs: a
+/// decode alone under a binding ahead of the pair's has its vetoes written
+/// where the pair's decode side shows its rows. Under any other profile
 /// `rows` stand as written and the constraints are `cx`'s own.
 ///
 /// A record a hold stands on carries both bits, as the record of a worker

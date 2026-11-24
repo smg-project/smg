@@ -5,6 +5,7 @@ use crate::{engine::view::WorkerId, store::GatewayId, tracking::lease::LeaseId};
 
 /// What a reservation holds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum ReservationKind {
     /// A seat in a prefill worker's capacity window, held until its prefill
     /// phase ends.

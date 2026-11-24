@@ -13,6 +13,7 @@ use crate::{
 /// `ApplyResult` is another thing: it answers the operator's apply call,
 /// which is `EnforceOutcome` here.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum ApplyOutcome {
     /// It runs, as this generation.
     Generation(u64),
@@ -27,6 +28,7 @@ pub enum ApplyOutcome {
 /// Why a policy spec document was not applied. The running generation
 /// stays.
 #[derive(Debug, Eq, PartialEq, thiserror::Error)]
+#[non_exhaustive]
 pub enum SpecRejected {
     /// Its source could not read it.
     #[error("not read: {0}")]
@@ -93,6 +95,7 @@ pub enum SpecRejected {
 
 /// Why a generation has no document to read.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct NotHeld {
     /// The generation asked for: the standing one where the call names none.
     pub asked: u64,
@@ -108,6 +111,7 @@ pub struct NotHeld {
 
 /// The generations on file under a spec store, as a refusal names them.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct OnFile {
     /// How many are listed.
     pub count: usize,
@@ -144,6 +148,7 @@ impl std::error::Error for NotHeld {}
 
 /// The apply counter by result.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct ApplyCounts {
     /// Documents applied as a new generation.
     pub applied: u64,
@@ -190,6 +195,7 @@ impl SpecRejected {
 
 /// The standing generation as an operator reads it.
 #[derive(Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct Status {
     /// The number the store runs.
     pub generation: u64,
@@ -205,6 +211,7 @@ pub struct Status {
 
 /// A generation's document as its source wrote it.
 #[derive(Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct Document {
     /// The number it ran under.
     pub generation: u64,
@@ -220,6 +227,7 @@ pub struct Document {
 
 /// What a host must feed for a model and phase under one generation.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct NeedsRow {
     /// The model the row names.
     pub model: String,
@@ -231,6 +239,7 @@ pub struct NeedsRow {
 
 /// What a dry run of a document answers.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct DryRun {
     /// The number and the digest that stood when the document was checked.
     pub standing: (u64, Option<Digest>),
@@ -246,6 +255,7 @@ pub struct DryRun {
 /// What `DocumentManager::enforce` and `roll_back` answer for a document.
 /// The contract's `ApplyResult` is built from it.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct EnforceOutcome {
     /// The number and the digest that stood when the document was checked.
     pub standing: (u64, Option<Digest>),
@@ -260,6 +270,7 @@ pub struct EnforceOutcome {
 
 /// Why a dry run or write gave no verdict.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum EnforceRefused {
     /// The caller's guard names another digest than the standing one's.
     /// The refusal names the standing number and digest.

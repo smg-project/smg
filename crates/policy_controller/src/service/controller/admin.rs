@@ -29,6 +29,7 @@ use crate::store::MemoryStore;
 
 /// What `/version` answers.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[non_exhaustive]
 pub struct Version {
     /// The binary's name.
     pub name: &'static str,

@@ -265,6 +265,7 @@ pub(crate) fn normalize_costs(out: &mut [f32]) -> f32 {
 
 /// Fewest requests in flight on the host.
 #[derive(Debug, Default)]
+#[expect(clippy::exhaustive_structs, reason = "no field: its name is its value")]
 pub struct LeastRequests;
 
 impl Lifecycle for LeastRequests {}
@@ -298,6 +299,7 @@ impl Scorer for LeastRequests {
 
 /// The owner of the request's session key scores `1.0`, every other `0.0`.
 #[derive(Debug)]
+#[expect(clippy::exhaustive_structs, reason = "no field: its name is its value")]
 pub struct SessionAffinity;
 
 impl Lifecycle for SessionAffinity {}
@@ -340,6 +342,7 @@ impl Scorer for SessionAffinity {
 /// Fewest session keys with a request in flight on the worker (the host's
 /// count): the `min_group` assignment of a sticky session.
 #[derive(Debug, Default)]
+#[expect(clippy::exhaustive_structs, reason = "no field: its name is its value")]
 pub struct FewestSessions;
 
 impl Lifecycle for FewestSessions {}

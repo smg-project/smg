@@ -29,6 +29,7 @@ use smg_policy_controller::{
         Candidate, Constraints, EncodeItems, EncodePlaced, EncodePool, EncoderFacts, Health,
         Identity, MediaCounts, PairPools, Phase, PoolFacts, RequestFacts, Role, Scratch, WorkerId,
     },
+    policies::consistent_hashing::LentRing,
 };
 
 #[global_allocator]
@@ -190,6 +191,30 @@ fn side(role: Role, first: u32, n: u32) -> Vec<Candidate> {
         .collect()
 }
 
+/// A caller's ring over the encode pool's rows, in their order: it names a
+/// row by its id, and a key's place is the key's first byte. Nothing is
+/// hashed and nothing is kept for a walk, so a decision that is lent it is
+/// charged the engine's own work alone.
+#[derive(Debug)]
+struct ByRow(Vec<WorkerId>);
+
+impl LentRing for ByRow {
+    fn position(&self, key: &str) -> u64 {
+        u64::from(key.as_bytes().first().copied().unwrap_or(0))
+    }
+
+    fn walk(&self, _: u64, _: &mut dyn FnMut(&str) -> bool) {}
+
+    fn walk_ids(&self, position: u64, take: &mut dyn FnMut(WorkerId) -> bool) {
+        let (before, behind) = self.0.split_at(position as usize % self.0.len().max(1));
+        let _ = behind.iter().chain(before).any(|&id| take(id));
+    }
+}
+
+/// The texts an item's key carries where its request's caller lends a ring
+/// for the items: each begins with a byte of its own.
+const TEXTS: [&str; 8] = ["a0", "b1", "c2", "d3", "e4", "f5", "g6", "h7"];
+
 /// The plan's one decision, the pair with three items, over two encode
 /// classes that the prefills and the encoders take in turn. With rows left
 /// out, the second class's encoders are not ready and every other decode
@@ -200,15 +225,19 @@ fn side(role: Role, first: u32, n: u32) -> Vec<Candidate> {
 /// meet one on every side from the hundredth on, and allocate nothing for
 /// the lists it is numbered anew into. Under one more engine the encode
 /// profile holds no hard filter that reads the mask: the masked encoder is
-/// offered, and the mask is numbered with the encoders offered.
+/// offered, and the mask is numbered with the encoders offered. Under one
+/// more the items carry their text and the request's caller lends a ring
+/// for them: the ring is asked a key's place and walked for each item, and
+/// nothing is allocated for the place a key's run is stated.
 #[test]
 fn an_encode_pair_decision_allocates_nothing_after_its_first_32() {
     let beside = Beside::start();
-    for (preset, unfiltered) in [
-        ("consistent_hashing", false),
-        ("least_load", false),
-        ("round_robin", false),
-        ("round_robin", true),
+    for (preset, unfiltered, lent) in [
+        ("consistent_hashing", false, false),
+        ("consistent_hashing", false, true),
+        ("least_load", false, false),
+        ("round_robin", false, false),
+        ("round_robin", true, false),
     ] {
         let mut spec =
             PolicySpec::epd_presets(preset, "round_robin", "round_robin").expect("an epd spec");
@@ -264,8 +293,15 @@ fn an_encode_pair_decision_allocates_nothing_after_its_first_32() {
                 };
                 let mut scratch = Scratch::new();
                 let mut placed = EncodePlaced::new();
+                let ring = ByRow(pool.iter().map(|row| row.id).collect());
                 let mut decide = |seed: u64, cx: &Constraints<'_>| {
-                    let keys = [1u64, 2, 3].map(|item| Identity::hashed(seed * 16 + item));
+                    let keys = [1u64, 2, 3].map(|item| {
+                        if lent {
+                            Identity::plain(TEXTS[(seed + item) as usize % TEXTS.len()])
+                        } else {
+                            Identity::hashed(seed * 16 + item)
+                        }
+                    });
                     let facts = RequestFacts {
                         model: "m",
                         media: MediaCounts {
@@ -281,6 +317,7 @@ fn an_encode_pair_decision_allocates_nothing_after_its_first_32() {
                         one: None,
                         references: false,
                         decode_images: left_out,
+                        ring: lent.then_some(&ring as &dyn LentRing),
                     };
                     let decision = engine.decide_encode_pair(
                         &facts,
@@ -310,7 +347,7 @@ fn an_encode_pair_decision_allocates_nothing_after_its_first_32() {
                 assert_eq!(encoders_placed, 3 * 199);
                 assert_eq!(
                     allocated, 0,
-                    "{preset} over {n} of each side, rows left out: {left_out}, no hard filter on the mask: {unfiltered}: {allocated} allocations in 199 decisions"
+                    "{preset} over {n} of each side, rows left out: {left_out}, no hard filter on the mask: {unfiltered}, a ring lent for the items: {lent}: {allocated} allocations in 199 decisions"
                 );
             }
         }

@@ -15,6 +15,7 @@ use crate::engine::WorkerId;
 /// its routing value. A head is a part of the request's own ids or text:
 /// nothing is copied for it.
 #[derive(Clone, Copy, PartialEq, Eq)]
+#[expect(clippy::exhaustive_enums, reason = "a caller answers every case")]
 pub enum Head<'a> {
     /// The first token ids of a tokenized prompt. The bytes a lender's
     /// recipe reads are each id's four bytes in the machine's order, one id

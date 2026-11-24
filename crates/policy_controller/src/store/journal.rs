@@ -9,6 +9,11 @@
 //! pays one branch a write. A journal carries no load row: a load write
 //! tells it nothing.
 
+#![expect(
+    clippy::exhaustive_structs,
+    reason = "a caller still builds or matches these types whole: each mark comes with its call"
+)]
+
 use crate::store::workers::{MembershipChange, WorkerRow};
 
 /// A place in a store's history: the number of a replicated write, and the

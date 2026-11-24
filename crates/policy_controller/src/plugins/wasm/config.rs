@@ -3,6 +3,11 @@
 //! `max_candidates`) deserializes into these; until that row lands a host
 //! builds them directly.
 
+#![expect(
+    clippy::exhaustive_structs,
+    reason = "a caller still builds or matches these types whole: each mark comes with its call"
+)]
+
 use std::fmt;
 
 use crate::document::spec::Needs;
@@ -73,6 +78,7 @@ impl fmt::Display for Abi {
 /// debug, 4 trace; a lower level is raised to the cap) and lines per
 /// second.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct LogLimit {
     pub level_cap: u8,
     pub per_second: u32,
@@ -89,6 +95,7 @@ impl Default for LogLimit {
 
 /// One plugin as the host loads it.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct PluginSpec {
     /// The name the trace and the shed carry as the stage.
     pub name: String,

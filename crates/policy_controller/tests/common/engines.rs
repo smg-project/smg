@@ -31,9 +31,30 @@ pub fn engine_config(port: u16, ranks: u16) -> Config {
 /// A mock gRPC engine of the vLLM wire with `ranks` data-parallel ranks,
 /// served until the returned sender drops. Returns its address.
 pub async fn mock_engine(ranks: u16) -> Result<(SocketAddr, oneshot::Sender<()>), std::io::Error> {
+    serve(ranks, true).await
+}
+
+/// [`mock_engine`] for an engine that serves no stream of its load records,
+/// the mock worker out of its realistic mode: a host reads its load by its
+/// poll alone, at every tick.
+pub async fn polled_engine(
+    ranks: u16,
+) -> Result<(SocketAddr, oneshot::Sender<()>), std::io::Error> {
+    serve(ranks, false).await
+}
+
+/// Serves the engine of [`engine_config`], in the mock worker's realistic
+/// mode or out of it.
+async fn serve(
+    ranks: u16,
+    realistic: bool,
+) -> Result<(SocketAddr, oneshot::Sender<()>), std::io::Error> {
     let listener = TcpListener::bind(loopback()).await?;
     let addr = listener.local_addr()?;
-    let cfg = Arc::new(engine_config(addr.port(), ranks));
+    let cfg = Arc::new(Config {
+        realistic,
+        ..engine_config(addr.port(), ranks)
+    });
     let (stop, stopped) = oneshot::channel();
     let mut served = JoinSet::new();
     served.spawn(mock_worker::grpc::serve_with_listener_until(

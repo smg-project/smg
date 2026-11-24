@@ -498,6 +498,38 @@ fn a_sessions_pin_stands_across_a_new_document() {
     assert_eq!(targets(&followed), [(pinned.position, pinned.id)]);
 }
 
+/// A dispatch said behind a new document, for a decision the document
+/// before made, is told to the session table: the table is the engine's,
+/// and it heard that decision's claim. The key follows its pin under the
+/// new document, whose profile has another text: it kept no stage.
+#[test]
+fn a_dispatch_said_behind_a_new_document_pins_its_session() {
+    let engine = preset("manual");
+    let list = pool(16);
+    let members = PublishedList::new(Arc::clone(&list));
+    let now = Instant::now();
+    let asks = keyed(41, &members);
+    let mut first =
+        DecisionGuard::decide_under(&engine, GatewayId::LOCAL, &asks, now).expect("a decision");
+    let sent_to = first.take(0).expect("the first target");
+
+    let mut next = PolicySpec::preset("manual").expect("a built-in preset");
+    next.generation = 2;
+    let profile = next.profiles.get_mut("manual");
+    profile.expect("the preset's profile").filter.reverse();
+    let next = AppliedSpec::validate(&next).expect("the document validates");
+    engine.apply(next).expect("a number above the standing one");
+    first.dispatched(now);
+    first.completed(&served(sent_to.id), now);
+    drop(first);
+
+    let followed = decided(&engine, &asks).decision;
+    let pick = followed.pick().expect("a pick");
+    assert_eq!(pick.trace.generation, 2, "under the new document");
+    assert_eq!(pick.session_verdict, SessionVerdict::Pinned);
+    assert_eq!(targets(&followed), [(sent_to.position, sent_to.id)]);
+}
+
 /// The engine's own pass drops the session keys past their end, off the
 /// path of a request: a pin made at a dispatch is held through the rule's
 /// idle time and gone after it.

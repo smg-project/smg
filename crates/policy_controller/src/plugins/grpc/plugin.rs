@@ -48,6 +48,7 @@ const OBSERVE_QUEUE: usize = 1_024;
 
 /// Why a plugin did not load.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum LoadError {
     /// The row is not a plugin the host can connect to.
     Spec(String),
@@ -72,6 +73,7 @@ impl std::error::Error for LoadError {}
 
 /// The counters of one plugin, read through [`Plugin::stats`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Stats {
     /// Frames the plugin answered within the contract.
     pub answered: u64,

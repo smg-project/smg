@@ -74,6 +74,7 @@ pub type Wake = Box<dyn Fn() + Send + Sync>;
 /// The store's counts one scrape reports: the first two of one state of
 /// the store.
 #[derive(Clone, Copy, Debug, Default)]
+#[non_exhaustive]
 pub struct StoreStats {
     /// The members outside the standing generation's lists.
     pub outside: OutsideLists,
@@ -151,6 +152,7 @@ pub struct MemoryStore {
 /// three snapshot messages are built from it: the operator's, the watch's
 /// and the replication's.
 #[derive(Clone, Debug)]
+#[expect(clippy::exhaustive_structs, reason = "its mark comes with its call")]
 pub struct StoreCheckpoint {
     /// The last journaled write that the tables hold, with its term; the
     /// default for a store with no journal.

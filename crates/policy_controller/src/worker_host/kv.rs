@@ -766,6 +766,7 @@ where
 
 /// Why a subscription got no feed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SkipReason {
     /// The holder keeps no row for the worker's object: it laid none, or it
     /// has laid another object in its place.
@@ -776,6 +777,7 @@ pub enum SkipReason {
 
 /// How many subscriptions a host gave no feed, by the reason.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SkippedSubscriptions {
     /// The holder kept no row for the worker's object.
     pub no_row: u64,

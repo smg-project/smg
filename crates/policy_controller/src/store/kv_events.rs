@@ -1,6 +1,12 @@
 //! The KV event sink: the admission cursor per rank in front of the index
 //! (design 5.1, the KV index row; 5.4, a standby subscribes itself).
 
+#![expect(
+    clippy::exhaustive_enums,
+    clippy::exhaustive_structs,
+    reason = "the store's index of cache events moves to the worker's side, which decides its types"
+)]
+
 use super::index::LaneWriter;
 use crate::engine::view::WorkerId;
 

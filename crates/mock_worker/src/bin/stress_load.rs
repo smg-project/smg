@@ -20,7 +20,10 @@
 //! `/generate` route, the prompt as its `text`) and `completion`
 //! (`/v1/completions`, the prompt as its `prompt`). `--json-schema` asks a
 //! chat request for a JSON answer under a fixed schema. `--tenants N` spreads
-//! the requests over N tenant ids sent in `--tenant-header`.
+//! the requests over N tenant ids sent in `--tenant-header`. Those ids come
+//! round again and the warm-up sends them before the window opens, so
+//! `--new-tenants S` sends the share S of the requests under an id that no
+//! request carried before.
 //!
 //! Prompts are deterministic from `--seed`: `--distinct` distinct prompts of
 //! about `--prompt-tokens` words (one token each for a large-vocabulary BPE),
@@ -165,6 +168,14 @@ struct Args {
     tenants: usize,
     #[arg(long, default_value = "x-smg-tenant-id")]
     tenant_header: String,
+    /// Share of the requests (0 to 1) sent under a tenant id of their own,
+    /// `tenant-new-<seed>-<request number>`, in place of one of the
+    /// `--tenants` ids: an id no request carried before, in the warm-up or
+    /// in the window. A later run against the same gateway sends other ids
+    /// under another `--seed`. Refused with the linked requests of `--mode
+    /// responses` (`--chain` above 1): a link holds under one tenant.
+    #[arg(long, default_value_t = 0.0, value_parser = share)]
+    new_tenants: f64,
     /// Image file(s) for `--mode image` (repeat the flag; cycled per prompt).
     #[arg(long)]
     image: Vec<PathBuf>,
@@ -256,6 +267,27 @@ fn prompt(args: &Args, i: usize) -> String {
     let head = words(args.seed ^ 0x5EED_0000 ^ (i % pool) as u64, head_words);
     let tail = words(args.seed ^ 0x7A11_0000 ^ ((i as u64) << 20), tail_words);
     format!("{head} [session {i}] {tail}")
+}
+
+/// A share from 0 to 1 (`--new-tenants`).
+fn share(s: &str) -> Result<f64, String> {
+    let v: f64 = s.parse().map_err(|e| format!("{e}"))?;
+    (0.0..=1.0)
+        .contains(&v)
+        .then_some(v)
+        .ok_or_else(|| format!("{s} is not a share from 0 to 1"))
+}
+
+/// The tenant id of request `i`, if it carries one: an id of its own for the
+/// `new_tenants` share of the requests, else the next of the `tenants` ids,
+/// which the other requests take in turn. Of the first `n` requests
+/// `floor(n * share)` carry a new id.
+fn tenant(args: &Args, i: u64) -> Option<String> {
+    let new = |n: u64| (n as f64 * args.new_tenants).floor() as u64;
+    if new(i) > new(i.saturating_sub(1)) {
+        return Some(format!("tenant-new-{}-{i}", args.seed));
+    }
+    (args.tenants > 0).then(|| format!("tenant-{}", (i - new(i)) % args.tenants as u64))
 }
 
 /// Builds a chat user message as a string (zero parts) or text content blocks.
@@ -414,6 +446,9 @@ fn build_bodies(args: &Args) -> Result<Vec<Bytes>> {
         .iter()
         .map(|p| data_url(p))
         .collect::<Result<_>>()?;
+    if args.mode == Mode::Responses && args.chain > 1 && args.new_tenants > 0.0 {
+        anyhow::bail!("--new-tenants parts the linked requests of --mode responses: use --chain 1");
+    }
     if args.mode == Mode::Image && images.is_empty() {
         anyhow::bail!("--mode image needs at least one --image <file>");
     }
@@ -788,11 +823,8 @@ async fn one(shared: Arc<Shared>, i: u64, sampled: bool) {
         .post(&shared.url)
         .header("content-type", "application/json")
         .body(body);
-    if args.tenants > 0 {
-        request = request.header(
-            &args.tenant_header,
-            format!("tenant-{}", i % args.tenants as u64),
-        );
+    if let Some(tenant) = tenant(args, i) {
+        request = request.header(&args.tenant_header, tenant);
     }
     let started = Instant::now();
     let keep_body = args.mode == Mode::Responses || args.debug_first;
@@ -1294,6 +1326,45 @@ mod tests {
             42,
             "40 words plus the marker"
         );
+    }
+
+    #[test]
+    fn new_tenants_are_an_exact_share_and_no_id_comes_twice() {
+        let mut a = args(Mode::Chat);
+        a.tenants = 4;
+        let ids = |a: &Args| (1..=4000).filter_map(|i| tenant(a, i)).collect::<Vec<_>>();
+        let distinct = |ids: &[String]| ids.iter().collect::<std::collections::BTreeSet<_>>().len();
+        assert_eq!(tenant(&a, 6).as_deref(), Some("tenant-2"));
+        assert_eq!(distinct(&ids(&a)), 4, "without the flag: the set in turn");
+
+        a.new_tenants = 0.25;
+        let mixed = ids(&a);
+        let new: Vec<String> = mixed
+            .iter()
+            .filter(|id| id.starts_with("tenant-new-"))
+            .cloned()
+            .collect();
+        assert_eq!(new.len(), 1000, "a quarter of 4,000 requests");
+        assert_eq!(distinct(&new), 1000, "no new id comes twice");
+        assert_eq!(distinct(&mixed), 1004, "the others take the four in turn");
+
+        a.seed += 1;
+        let other = ids(&a);
+        assert!(new.iter().all(|id| !other.contains(id)), "another seed");
+
+        a.tenants = 0;
+        a.new_tenants = 1.0;
+        assert_eq!(distinct(&ids(&a)), 4000, "every request, with no set");
+
+        for bad in ["25", "-0.1", "nan", "inf"] {
+            let read = Args::try_parse_from(["stress_load", "--new-tenants", bad]);
+            assert!(read.is_err(), "{bad} is no share");
+        }
+        let mut linked = args(Mode::Responses);
+        linked.new_tenants = 0.5;
+        assert!(build_bodies(&linked).is_err(), "one tenant a link");
+        linked.chain = 1;
+        assert!(build_bodies(&linked).is_ok(), "no link, no refusal");
     }
 
     #[test]
