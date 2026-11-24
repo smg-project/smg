@@ -577,14 +577,16 @@ crate's collector connects to the worker and subscribes, and the worker answers 
 (`crates/worker/src/kv_events/`). It sends its cache events with the load records that ride
 them, or its load records alone, as its host asks. A gateway asks a worker for its cache events
 where what places the worker reads them. Otherwise it asks for the load records alone, and opens
-no stream where its load monitor wants no loads of the worker. On main a controller opens no
-stream for load records alone. It asks a worker for its cache events where the worker's
-registration asks for them, or, for a worker its own discovery found, where the document in
-force at the find reads cache events for the worker's first model. It asks on one stream for
-each engine: a data-parallel engine's rank 0 streams every rank's events. The collector hands
-the load records to the load monitor and the cache events to the index of cache events (section
-4.5). Only a worker dialed over gRPC has such a stream; the monitor polls the others. A worker
-dials nobody for this, so it needs no address of a gateway or of a controller.
+no stream where its load monitor wants no loads of the worker. A controller asks a worker for
+its cache events where the worker's registration asks for them, or, for a worker its own
+discovery found, where the document in force at the find reads cache events for the worker's
+first model. Otherwise it asks for the load records alone, on every replica: its load monitor
+wants the loads of every worker the replica dials. It asks for an engine's cache events on one
+stream: a data-parallel engine's rank 0 streams every rank's events. For each rank above 0 it
+opens a stream of load records alone, and takes that rank's records from it. The collector
+hands the load records to the load monitor and the cache events to the index of cache events
+(section 4.5). Only a worker dialed over gRPC has such a stream; the monitor polls the others.
+A worker dials nobody for this, so it needs no address of a gateway or of a controller.
 
 The host that opens the stream is the process that holds the workers' data (the table of
 section 1): the gateway in classic and with the engine in the gateway, the controller with the
@@ -1988,7 +1990,7 @@ Its data is one in-memory store (`store/memory.rs`):
 | worker records | the `RegisterWorker`, `PatchWorker`, `DeregisterWorker` calls, and the leader's own discovery | discovery is behind a feature the image leaves out; a record it writes asks for the worker's cache events where the document in force at the find reads them for the worker's first model, and a document applied later does not write that word again |
 | worker objects | a task that follows the worker records | a second form of the same workers, of the worker crate's type; each states its registration's overload thresholds over one default, 8 queued requests and 0.8 usage, an external record's over none, and the load monitor judges by them while the replica leads; an object's status leads its record's, and a single request's decision reads the workers here |
 | health | the worker crate's health checker over the worker objects, on the leader | copied into the records |
-| loads | the worker crate's load monitor over the worker objects, while the replica leads: a poll every 10 seconds, and the load records on the workers' event streams | `PushLoad` is not served; a single request's decision is given the monitor's snapshot where the document reads reports and keeps none; the store's load table is written by nothing |
+| loads | the worker crate's load monitor over the worker objects, while the replica leads: a poll every 10 seconds, and the load records on the workers' streams | `PushLoad` is not served; a single request's decision is given the monitor's snapshot where the document reads reports and keeps none; the store's load table is written by nothing |
 | cache index | a follower of each worker's cache events | an index of the store's own; `PushKvEvents` is not served; a single request's decision reads none yet, only the engine's own record of sent prompts |
 | leases | decisions | not replicated to a standby; a lease that counts for its session key steps that key's count on its worker's object, which a controller's in-flight cap reads (10.2); a single request's session pins are the engine's own table, one for each document |
 
@@ -2048,7 +2050,7 @@ the worker crate's structures, and the one engine.
 | workers | records in the store, and worker objects kept in step with them | worker objects in a worker-crate registry; beside each, the code that keeps the objects holds what a registration stated and the object does not hold as stated (10.3); the membership log that watchers and standbys read stays |
 | lists | the store's published copy; a single request's decision reads the registry's published list of the model's single workers, a pair's, at its prefill and at its decode call, the lists of its two sides, an encode request's those two and its encoders', and a prefill or a decode request that stands alone the list of its own phase's workers | the registry's published lists by role and protocol, with the engine's value beside each (decision 10) |
 | health | the worker crate's health checker over the worker objects, on the leader; each outcome moves the object, the store's record is told the status that stands, and a decision reads the object's | the same checker; a decision reads the object's own status; a gateway's veto on a worker stays in the store |
-| loads | the worker crate's load monitor over the worker objects, while the replica leads, fed by its polls and by the load records on the workers' event streams: a decision is given its snapshot where the document reads reports and keeps none, and reads the overload verdict on the object; the crate's own poller runs no more, and the store's load table is written by nothing and read by no decision | the worker crate's load monitor, publishing `LoadSnapshot` (decision 10). Every worker is judged by the thresholds its object states, so the loads of every worker the controller dials are read: no new cost against classic as it runs by default, whose gateway hands each worker of an engine the same two defaults and an external worker none at its registration, as a controller's objects state them. A gateway started with `--disable-load-monitoring` polls by need, and this monitor polls every group |
+| loads | the worker crate's load monitor over the worker objects, while the replica leads, fed by its polls and by the load records on the workers' streams: a decision is given its snapshot where the document reads reports and keeps none, and reads the overload verdict on the object; the crate's own poller runs no more, and the store's load table is written by nothing and read by no decision | the worker crate's load monitor, publishing `LoadSnapshot` (decision 10). Every worker is judged by the thresholds its object states, so the loads of every worker the controller dials are read: no new cost against classic as it runs by default, whose gateway hands each worker of an engine the same two defaults and an external worker none at its registration, as a controller's objects state them. A gateway started with `--disable-load-monitoring` polls by need, and this monitor polls every group |
 | cache events | an index of the store's own; a decision reads none yet | the kv-index crate's index, filled by the worker crate's collector |
 | sessions | the engine's session table for a single request, one for each document | the engine's session table |
 | leases | the store's lease tables, in memory, one for each deciding thread | stay: a controller must remember what it issued to gateways |
@@ -2059,10 +2061,11 @@ the worker crate's structures, and the one engine.
 cache events on the stream its host opens (section 4.3), and here the host is the controller. The
 controller runs the worker crate's collector and load monitor over its own worker objects, as a
 gateway does in classic. A gateway under a controller opens no such stream (section 11). On main
-the controller already opens the workers' streams with that collector, for their cache events,
-and runs that load monitor while it leads. The load records that ride the streams are handed to
-that monitor while the replica leads, and a standby drops them. A gRPC worker that is not indexed
-has no stream there yet: the monitor polls it.
+the controller already opens the workers' streams with that collector, on every replica, and
+runs that load monitor while it leads. The load records on the streams are handed to that
+monitor while the replica leads, and a standby drops them. A gRPC worker that is not indexed
+streams its load records alone: the leader reads its load from that stream, and polls it only
+while its records are not fresh. A standby holds that stream too, so a take finds it open.
 
 The contract has two calls that would push the same data to a controller, `PushLoad` and
 `PushKvEvents`. They are a relay's calls, not a worker's. A relay is a gateway in front of a

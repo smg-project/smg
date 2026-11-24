@@ -6,7 +6,8 @@
 //! No stub server: the client is the generated one and the server is the
 //! binary. The one engine that answers is the mock worker's, in the case's
 //! process: the leader is given its address through the door and nothing
-//! else, and its own load monitor's counter says it polled it.
+//! else, and its own load monitor's counter says it reads the engine's load
+//! from the engine's stream.
 //!
 //! The door opens to a caller with a principal: the control listener is one
 //! its operator named, and every call states the caller's name. The
@@ -191,7 +192,8 @@ fn later(first: u64, writes: u64) -> u64 {
     first + writes
 }
 
-/// The value of an unlabelled counter in a scrape.
+/// The value of a counter in a scrape, by its series as the page writes
+/// it: its name, and its label where it has one.
 fn counter(scrape: &str, name: &str) -> Option<u64> {
     scrape
         .lines()
@@ -199,7 +201,7 @@ fn counter(scrape: &str, name: &str) -> Option<u64> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_leader_takes_a_fleet_through_the_door_and_polls_the_engine_it_was_given() {
+async fn the_leader_takes_a_fleet_through_the_door_and_reads_the_load_of_the_engine_it_was_given() {
     let dir = tempfile::tempdir().expect("a temp dir");
     let lease = dir.path().join("lease");
     let mut replicas: Vec<Replica> = ["replica-a", "replica-b"]
@@ -499,28 +501,31 @@ async fn the_leader_takes_a_fleet_through_the_door_and_polls_the_engine_it_was_g
         .expect_err("the retry names a registration that left");
     assert_eq!(retried.code(), Code::NotFound);
 
-    // The leader's own load monitor polls the one ready engine it was given:
-    // its counter moves within two of its poll periods. The follower was given
-    // nothing and polls nothing.
+    // The leader's own load monitor reads the one ready engine it was given
+    // from the engine's stream of load records: within two of its poll
+    // periods one of its ticks leaves the engine to that stream, whose
+    // records are fresh. The follower was given nothing: it polls nothing,
+    // and its monitor has no tick to leave to a stream.
+    let left = "smg_policy_controller_load_polls_total{mode=\"suppressed\"}";
     let started = Instant::now();
-    let polled = loop {
+    let streamed = loop {
         let (status, scrape) = http_get(replicas[leader].admin, "/metrics")
             .await
             .expect("the leader's scrape");
         assert_eq!(status, 200);
-        let rows = counter(&scrape, "smg_policy_controller_load_rows_total");
-        if rows.is_some_and(|rows| rows > 0) {
-            break rows;
+        let ticks = counter(&scrape, left);
+        if ticks.is_some_and(|ticks| ticks > 0) {
+            break ticks;
         }
         assert!(
             started.elapsed() < 2 * Config::DEFAULT_LOAD_POLL_INTERVAL + Duration::from_secs(20),
-            "the leader polled no row of the engine it was given: {rows:?}"
+            "the leader left no tick to the stream of the engine it was given: {ticks:?}"
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
     writeln!(
         std::io::stdout(),
-        "the leader read {polled:?} load rows {:?} after the engine's registration",
+        "the leader left {streamed:?} ticks to the engine's stream {:?} after its registration",
         started.elapsed()
     )
     .expect("stdout");
@@ -531,6 +536,7 @@ async fn the_leader_takes_a_fleet_through_the_door_and_polls_the_engine_it_was_g
         counter(&scrape, "smg_policy_controller_load_rows_total"),
         Some(0)
     );
+    assert_eq!(counter(&scrape, left), Some(0));
     record.check().expect("the election's promise held");
 }
 
