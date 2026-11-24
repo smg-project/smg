@@ -457,8 +457,8 @@ Beside a pair's two lists it hands their pair classes (`Objects::pair_classes`):
 class by its place in the list as lent, under the store's own pairing rule over what the rows
 state. Those classes state no first partner, so a controller makes no pair on one known runtime
 ahead of another. A row whose facts change gets a new worker object, so the registry builds a
-new list and a new `G` for it. The classes are derived once for a `G` and a pairing mode, at the
-first ask, and stand with it.
+new list and a new `G` for each model the worker serves. The classes are derived once for a `G`
+and a pairing mode, at the first ask, and stand with it.
 
 A controller knows no admission window of a gateway. So it reads a pair's admission open
 (`OpenAdmission`), as the rows its store builds state it. The gateway that asks is to gate
@@ -791,7 +791,9 @@ pub struct Candidate {
 
 The identity half is filled once for a list and cached (`PoolRecords`, `engine/records.rs`). The
 live half is read from the worker object once for each decision. The load report comes from the
-load snapshot; a snapshot's reports are converted once for a list and cached.
+load snapshot; a snapshot's reports are converted once for a list and cached. Until the list
+holds them, a record written alone takes its report by one look-up in the snapshot: a drawn
+worker's, a worker's that a routing key names, and the held prefill's of a decode decided again.
 
 The field `engine` numbers the list's data-parallel engines: records that state one number are
 ranks of one engine. `PolicyEngine` writes the numbers once for a list, where it finds the list's
@@ -836,7 +838,8 @@ pub struct RequestFacts<'a> {
     pub now_micros: u64,           // the host's clock at the decision
     pub ring: Option<&'a dyn LentRing>, // the hash ring the host keeps, lent to this decision
     pub ring_positions: &'a [u64], // where the request stands on that ring, as the host states it
-    // eight more fields: `affinity`, `named` and `signal_cells`, and the five that 5.8 removes
+    // eight more fields: `affinity`, `named`, `signal_cells`, `session_counted` and
+    // `session_key_from_rid`, and the three that 5.8 removes
 }
 
 pub struct Constraints<'a> {
@@ -1351,7 +1354,10 @@ for a head of the request, each by the lender's own recipe.
 A caller of the one call states the ring alone (`PlaceRequest::ring`). The engine reads where the
 routing value stands on it with the request's keys, under a profile whose ring stage places a value
 by its own text. Under `prefix_hash` the engine cuts the request into the heads classic cuts it
-into, a routing value first, and asks the ring where each stands (`LentRing::head_position`). A
+into and asks the ring where each stands (`LentRing::head_position`): the routing value where a
+header handed the request one, else the prompt's heads. Where a document names the request's own
+id as a source, the value it hands is no head: it names the session alone, as classic hashes a
+header's key and never the id's. A
 ring whose lender places no head answers nothing: such a request is lent no ring, the lender is
 asked about no further head, and the stage's own ring places the request. A request that has no
 head states no place and is lent no ring either.
@@ -1630,7 +1636,9 @@ makes one itself.
    and decides under the binding of the model stated there. Every fact of the decode's decision
    is that request's: the pair's two lists as they stand then, the request's size, its routing
    value and the workers it tried among them. The engine decides the decode on the records of
-   that instant, behind the prefill that was sent.
+   that instant, behind the prefill that was sent. Of the prefills it writes that one's record
+   alone and reads no other prefill's worker. Where the list names no place of that prefill,
+   it writes every prefill's.
 4. The placement takes the first decode the engine names that can be sent to. Its routing key
    and its two profile labels stay as the first call wrote them.
 
