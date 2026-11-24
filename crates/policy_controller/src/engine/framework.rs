@@ -7068,8 +7068,8 @@ impl Engine {
     /// its set reads are lent for the run and stand in the scratch again
     /// behind it.
     ///
-    /// Out of line: a pair whose prefill side its profile runs holds one
-    /// test of it and the two runs of its profile, as it did.
+    /// Out of line: a pair whose prefill side its profile runs holds the
+    /// test of it at each run and the two runs of its profile, as it did.
     #[inline(never)]
     #[expect(
         clippy::too_many_arguments,
@@ -15987,11 +15987,10 @@ mod tests {
     /// was shown in the scratch, where a side's shadow reads them.
     ///
     /// The classic router hands its policy the prefills that pair on a
-    /// known runtime alone
-    /// (`model_gateway/src/routers/common/placement.rs:2651-2674`), and
-    /// the classic manual policy selects anew for a key whose workers are
-    /// not among those it is handed
-    /// (`model_gateway/src/policies/manual.rs:303-308`).
+    /// known runtime alone (the candidates of `pair_pass` in
+    /// `model_gateway/src/routers/common/placement.rs`), and the classic
+    /// manual policy selects anew for a key whose workers are not among
+    /// those it is handed (`model_gateway/src/policies/manual.rs:303-308`).
     #[test]
     fn a_rule_places_a_pairs_prefill_among_first_partners_then_over_every_partner() {
         let engine = pair_session_engine(vec![least_requests_profile()], Assignment::Delegate);

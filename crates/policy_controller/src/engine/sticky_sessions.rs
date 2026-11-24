@@ -647,7 +647,9 @@ impl SessionTable {
     /// of record, else a pin's. A claim a dispatch confirmed is a pin the
     /// key was served on: it stands, and nothing is written. Another
     /// decision's claim is not this one's to move. A `target` that is a pin
-    /// of the key already is no claim either.
+    /// of the key already is no claim either. The claim names the id its
+    /// decision read, as [`Self::claim`]'s does: neither asks the table's
+    /// renames.
     pub(crate) fn move_claim(
         &self,
         key: Session,
