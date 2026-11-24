@@ -1,13 +1,25 @@
-//! One request's routing under the classic policies, over one fleet of
-//! workers a model, every one ready unless the cell says otherwise.
+//! One request's routing under the classic policies or under the policy
+//! engine, over one fleet of workers a model, every one ready unless the
+//! cell says otherwise.
 //!
-//! `--path classic`, the default, is the one path: the classic policies
-//! over the worker registry. The paths `object`, `records` and `engine`
-//! are refused by name: they are no longer part of this bench.
+//! `--path classic`, the default, routes by the classic policies over the
+//! worker registry. `--path engine` routes the same cell by the policy
+//! engine, over what a gateway builds with the policy controller on: a
+//! registry that makes no classic policy object, workers with no
+//! completion sink, and the engine of the document the cell's routing
+//! settings mean, started by the gateway's own start over the cell's
+//! registry and, where the cell publishes reports, its load feed. The
+//! same routing calls then place by it. The engine's task is spawned and
+//! not waited for, as at a gateway's start: a cell's first decisions,
+//! which are untimed, may run ahead of its first step. The bench keeps no
+//! cache-event monitor, so the engine is handed no index of cache events.
+//! The paths `object` and `records` are refused by name: they are no
+//! longer part of this bench.
 //!
 //! A cell is one route, one policy, one fleet size and one count of
 //! callers. Each caller routes requests back to back: the placement, the
-//! worker's load guard and what its drop tells the model's policy.
+//! worker's load guard, and what the request's end tells the model's
+//! policy or the engine.
 //! The cell prints its decisions a second over every caller and one caller's
 //! time a decision. The callers are threads that stand for the whole cell,
 //! and each makes its first decisions untimed. The gateway's metrics
@@ -27,9 +39,9 @@
 //!
 //! `--pair true` makes the cell a pair gateway's: the fleet is the cell's
 //! size of prefill workers and as many decode workers, on the gRPC wire,
-//! and a request is placed as a pair by the classic pair placement over
-//! its two side policies. `--not-ready` and `--ready` then hold for each
-//! side.
+//! and a request is placed as a pair: by the classic pair placement over
+//! its two side policies, or by the engine, whose document plans the pair
+//! alone. `--not-ready` and `--ready` then hold for each side.
 //!
 //! `--keys N` gives each request one of `N` routing keys in turn, in the
 //! header `x-smg-routing-key`: a policy that places by a key places by it.
@@ -98,6 +110,7 @@ use openai_protocol::{
     worker::{HealthCheckConfig, WorkerLoadResponse, WorkerStatus},
 };
 use smg::{
+    app_context::AppContextBuilder,
     config::{
         types::{PolicyConfig, RoutingMode},
         RouterConfig,
@@ -468,18 +481,22 @@ struct Feed {
     loads: HashMap<String, WorkerLoadResponse>,
 }
 
-/// A cell's path as `build` leaves it: the routing call, and the load feed
-/// where the cell publishes reports.
+/// A cell's path as `build` leaves it: the routing call, the load feed
+/// where the cell publishes reports, and the engine's runtime on its path.
 struct Built {
     routing: Routing,
     feed: Option<Feed>,
+    /// The runtime the policy engine's task runs on, kept for the cell's
+    /// life: `None` on the classic path, which starts no engine.
+    runtime: Option<tokio::runtime::Runtime>,
 }
 
-/// A cell's path, built: a registry with the fleet, the policies a
-/// registration leaves (the model's policy and each worker's completion
-/// sink), and the load feed the monitor would publish. A pair cell's
-/// registry holds the two side policies a pair gateway's start sets, and
-/// each model's fleet is its two sides.
+/// A cell's path, built: a registry with the fleet, what a registration
+/// leaves (under the classic policies the model's policy and each worker's
+/// completion sink, under the engine neither), and the load feed the
+/// monitor would publish. A classic pair cell's registry holds the two
+/// side policies a pair gateway's start sets, and each model's fleet is
+/// its two sides. On the engine's path the engine is started last.
 fn build(cell: &Cell) -> Built {
     let registry = Arc::new(WorkerRegistry::new());
     let mut config = RouterConfig {
@@ -493,6 +510,11 @@ fn build(cell: &Cell) -> Built {
             prefill_policy: None,
             decode_policy: None,
         };
+        // The cell's workers are on the gRPC wire, and its settings say so:
+        // a pair gateway of one router over gRPC plans the pair alone, where
+        // one over HTTP plans single requests beside it. Only the engine's
+        // document reads this.
+        config.connection_mode = ConnectionMode::Grpc;
     }
     let policies = match cell.path.as_str() {
         "classic" => {
@@ -502,8 +524,15 @@ fn build(cell: &Cell) -> Built {
             }
             Arc::new(policies)
         }
-        gone @ ("object" | "records" | "engine") => {
-            panic!("the path {gone} was removed from this bench: it runs the classic path only")
+        "engine" => {
+            // The registry a gateway builds with the policy controller on:
+            // it makes no classic policy object, and a pair's two side
+            // policies are not set on it.
+            config.policy_controller = true;
+            Arc::new(PolicyRegistry::of_config(&config))
+        }
+        gone @ ("object" | "records") => {
+            panic!("the path {gone} was removed from this bench: it runs the classic and the engine path")
         }
         other => panic!("no path {other}"),
     };
@@ -522,7 +551,9 @@ fn build(cell: &Cell) -> Built {
             for worker in &fleet {
                 registry.register(Arc::clone(worker)).unwrap();
                 policies.on_worker_added(model, None);
-                worker.set_completion_sink(Some(policies.completion_sink()));
+                // The sink a registration gives a worker: the registry's own
+                // under the classic policies, none where the engine places.
+                worker.set_completion_sink(policies.worker_completion_sink());
             }
             leave_not_ready(&fleet, cell.not_ready);
             leave_ready(&fleet, cell.ready);
@@ -532,7 +563,8 @@ fn build(cell: &Cell) -> Built {
             every.extend(fleet);
         }
     }
-    // The feed's receiver goes to the registry's policies.
+    // The feed's receiver goes to the registry's policies, and to the engine
+    // on its path.
     let mut receiver = None;
     let feed = cell.reports.then(|| {
         let feed = TestFeed::attached_to(|rx| receiver = rx);
@@ -543,9 +575,34 @@ fn build(cell: &Cell) -> Built {
         feed.publish(&loads);
         Feed { feed, loads }
     });
+    let engine_loads = receiver.clone();
     if cell.reports {
         attach_loads(&policies, receiver);
     }
+    // The engine path: the gateway's own start, with the policy controller
+    // on in the cell's settings, behind the fleet's registration and, where
+    // the cell publishes reports, the feed's first publication. The engine's
+    // task runs on a runtime of its own thread, kept for the cell's life,
+    // and its first step is not waited for.
+    let runtime = (cell.path == "engine").then(|| {
+        config.policy_controller = true;
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        {
+            let _entered = runtime.enter();
+            AppContextBuilder::start_policy_engine_for_bench(
+                &config,
+                &policies,
+                &registry,
+                engine_loads,
+            )
+            .unwrap();
+        }
+        runtime
+    });
     let (route, pair) = (cell.route, cell.pair);
     assert!(
         !(pair && cell.keys != 0),
@@ -568,7 +625,11 @@ fn build(cell: &Cell) -> Built {
             route_classic(&registry, &policies, model, route, Some(tokens), headers)
         }
     });
-    Built { routing, feed }
+    Built {
+        routing,
+        feed,
+        runtime,
+    }
 }
 
 fn main() {
@@ -576,7 +637,11 @@ fn main() {
     let recorder = start_prometheus(PrometheusConfig::default());
     let prompts = prompts(cell.prompts);
     let tokens_at = |turn: u64| &prompts[(turn % prompts.len() as u64) as usize][..];
-    let Built { routing, feed } = build(&cell);
+    let Built {
+        routing,
+        feed,
+        runtime: _engine_runtime,
+    } = build(&cell);
     // The path's first sight of the pool, untimed: what a registration and
     // the first request after it build once.
     let warm = (cell.workers as u64 * 8).max(4_096) * cell.models.max(1) as u64;
