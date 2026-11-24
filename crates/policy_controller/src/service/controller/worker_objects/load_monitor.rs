@@ -474,6 +474,18 @@ mod tests {
                 .map(WorkerLoadResponse::total_waiting_reqs)
         }
 
+        /// The ranks the monitor's snapshot states for the worker at `url`,
+        /// as its report lists them: none where it holds no report.
+        fn ranks(&self, url: &str) -> Vec<i32> {
+            let snapshot = self.loads.borrow();
+            let ranks = snapshot.get(url).map(|report| &report.loads);
+            ranks
+                .into_iter()
+                .flatten()
+                .map(|rank| rank.dp_rank)
+                .collect()
+        }
+
         /// Whether an overload verdict stands on the object at `url`.
         fn overloaded(&self, url: &str) -> bool {
             let registry = self.workers.objects().registry();
@@ -720,12 +732,14 @@ mod tests {
             "the take's poll"
         );
 
-        // Five wait on B's rank 1, and its window publishes them.
+        // Five wait on B's rank 1, and its window publishes them under the
+        // rank the record named.
         replica.push_rank(B, 1, 5);
         assert!(
             comes(|| replica.waiting(B) == Some(5)).await,
             "the window publishes B's rank 1"
         );
+        assert_eq!(replica.ranks(B), vec![1], "the record's rank");
         // A's record, and the lead ends inside its publish window.
         replica.push(A, 9);
         replica.role.send_replace(None);
