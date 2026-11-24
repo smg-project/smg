@@ -22,7 +22,7 @@ use std::{
 };
 
 use axum::{routing::get, Router};
-use engines::mock_engine;
+use engines::polled_engine;
 use net::{http_get, loopback, vm_rss_kib};
 use openai_protocol::worker::RuntimeType;
 use rcgen::{
@@ -1795,15 +1795,16 @@ fn series(page: &str, name: &str) -> Option<u64> {
 
 /// The serve runs the load monitor while the replica leads, and the admin
 /// page's load series read the monitor's counts. A worker on a connection
-/// is polled and a worker with a gauge page alone is read over HTTP. The
-/// monitor publishes a report of each. The second's states its page's
-/// gauges, over the queue bound its row states: one overload verdict moves,
-/// once. The store holds no load row: the serve writes none.
+/// that serves no stream of its load records is polled, and a worker with
+/// a gauge page alone is read over HTTP. The monitor publishes a report of
+/// each. The second's states its page's gauges, over the queue bound its
+/// row states: one overload verdict moves, once. The store holds no load
+/// row: the serve writes none.
 #[tokio::test]
 async fn the_serve_runs_the_load_monitor_and_renders_its_counts() {
     const PATIENCE: Duration = Duration::from_secs(30);
 
-    let (addr, _engine) = mock_engine(1).await.expect("a mock engine");
+    let (addr, _engine) = polled_engine(1).await.expect("a mock engine");
     let (read, _server) = metrics_server(METRICS_TEXT)
         .await
         .expect("a metrics server");

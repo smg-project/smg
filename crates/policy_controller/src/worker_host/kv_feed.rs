@@ -86,15 +86,17 @@ impl<G: Generation> KvFeed<G> {
     /// then gets a stream for its load records alone where the monitor
     /// wants them ([`WorkerMonitor::loads_wanted`]). A worker already told
     /// keeps the stream it has, so a host calls this before [`Self::run`].
-    /// No program calls it yet: which replica of a controller opens such
-    /// a stream, and when, is a later change's to decide.
+    /// The stock controller's serve calls it at its bind, on every replica:
+    /// a standby holds such a stream too, and its sink drops the records
+    /// until the replica leads.
     pub fn set_loads_wanted(&self, monitor: &Arc<WorkerMonitor<G>>) {
         let _ = self.loads.set(Arc::downgrade(monitor));
     }
 
-    /// The collector, for the stock controller's cases of the follow.
+    /// The collector, for the stock controller's cases of the follow:
+    /// shared, so a case reads it behind the serve that takes the follow.
     #[cfg(all(test, feature = "controller"))]
-    pub(crate) fn collector(&self) -> &KvEventCollector<KvHost<G, MemoryStore>> {
+    pub(crate) fn collector(&self) -> &Arc<KvEventCollector<KvHost<G, MemoryStore>>> {
         &self.collector
     }
 
