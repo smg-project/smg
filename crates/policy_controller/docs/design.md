@@ -1713,9 +1713,43 @@ value (`overload_fallback` in `placement.rs`; `routes_by_session_key` in
 request that names no worker and carries no routing value, by the binding's rule for workers
 that are all vetoed.
 
-One thing differs from classic there, by rule. Classic reads the header for a pair too, each
-side's policy over its own workers (`pair_pass` in `placement.rs`). **[planned]**
-The engine reads no pair's and no encode request's header for a target yet.
+**[built]** A pair can name its worker too, a side at a time. Classic reads the header once a
+side, each side's policy over its own workers (`pair_pass` in `placement.rs`), and a side it
+holds is narrowed by no admission filter and by no retry (`strict_target`,
+`admission_prefilters`). A pair's binding names one list of sources for its two sides, so the
+target source is the side's whose profile is the hash ring keyed by no prefix
+(`Engine::names_worker_on`): classic's policy of that name alone reads the header. The call
+counts the prefill's number as classic counts its candidates: the prefills that can be sent to
+and have a partner that can, at the places the caller states for each side, and those with such a
+partner among their first partners alone where there is one. A worker that fails a hard demand
+its side's role is held to takes no number on that side: classic narrows both pools of a pinned
+pair to its wire ahead of the count. A place its host masks takes no number either, as one that
+fails its own test. The mask (`PairLists::prefill_stalled`, `PairLists::decode_stalled`) states a
+veto the host's worker objects do not carry, and classic's carry every veto its count reads.
+Where the decode's side is the ring's too, its number counts
+those partners of the prefill reached, and the pair's one decision is held to the two places
+(`PairLists::prefill_places`, `PairLists::decode_places`). Where it is not, the decision is held
+to the prefill's place and the decode is its own profile's pick. A named prefill at the admission
+limit is waited for (`Unplaced::PrefillsFull`), as classic waits for it. A named decode with no
+free room is taken, because the `has-room` filter is soft (classic,
+`retain_decodes_with_a_room`). A retry is handed the pair again. A number that reaches no worker
+on a side sheds the pair under `target-worker`, as classic refuses it. Where no decode can be
+sent to, a decode over its thresholds alone counts as a partner, and the decode goes by load, as
+classic pairs such a pool. Under a binding that sheds a pool over its thresholds on every worker,
+no decode counts so, as under classic's shedding. Where no prefill is counted, the pair is placed
+as one that names no worker, and a pool its binding sheds is shed as for any pair. A pair held to
+the two workers it names books its decode with its prefill under every document, as classic picks
+a decode once, with its prefill: a decode asked again behind the prefill is refused as one that
+never stood chosen (`DecodeRefused::NotChosen`). Classic's side of every clause is `pair_pass`,
+and the cases name its lines (`place/tests/pair/named.rs`).
+
+Two things differ from classic there, by rule. **[planned]** A pair whose decode side alone is
+the plain hash ring is read for no target yet: its prefill is its profile's pick, known inside
+the decision alone, and classic counts the decode's number behind that pick (its case
+`an_explicit_target_under_consistent_hashing_keeps_its_full_decode_partner` in `placement.rs`).
+**[planned]** The engine reads no encode request's header for a target yet. One limit is a
+supplied policy spec's own: a pair's target source holds a side only where that side's profile is
+the plain hash ring, because the spec has no word for a side.
 
 An encode request is placed over its three lists as a pair is over its two, each decision given the whole budget. Where it carries items its call makes three decisions at most, and none is held to the workers the rule takes. One
 decision names its pair and each item's encoder, and the pair's targets are tried as a pair's

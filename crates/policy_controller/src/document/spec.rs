@@ -2416,8 +2416,14 @@ pub struct KeySourceSpec {
     /// absent, empty or not text names no worker. One entry a block,
     /// beside the eight and never without one of them: a header alone,
     /// so `rid`, `max_bytes` and `client` are refused beside it. It is
-    /// read for a single request a program places in process, and for no
-    /// pair. Default false.
+    /// read for a request a program places in process: a single request,
+    /// and a pair under the `pd-pair` plan, on each side whose profile
+    /// scores by `consistent-hash` with no `prefix_tokens`, where its
+    /// prefill side is one. A pair's prefill is counted among the prefills
+    /// that have a decode to pair with, and its decode among that
+    /// prefill's partners. A pair whose prefill side is no such profile
+    /// and a request under the `epd` plan are not read for it. Default
+    /// false.
     #[serde(skip_serializing_if = "is_default")]
     pub target: bool,
 }

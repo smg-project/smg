@@ -5441,6 +5441,38 @@ impl Engine {
         (own.key_place() || decode.key_place()) && !(own.other_place() || decode.other_place())
     }
 
+    /// Which sides of `model`'s pair a target source of its binding holds
+    /// to the worker a request names: the prefill's, then the decode's. A
+    /// pair's binding names one list of sources for its two sides, and the
+    /// source is the side's whose profile holds a scorer that places by
+    /// the routing value's own text on a ring
+    /// ([`Scorer::places_by_key_text`]): the hash ring keyed by no prefix.
+    /// Neither side where no such profile stands beside the source, and
+    /// where the model's prefill resolves to no pair's binding. One lookup
+    /// of the binding ([`Self::ring_profiles`]), asked by a pair's call
+    /// under a document that names a target source.
+    #[cfg(feature = "in-process")]
+    pub(crate) fn names_worker_on(&self, model: &str) -> [bool; 2] {
+        let (prefill, decode) = self.ring_profiles(model, Phase::Prefill);
+        let plain = |at: Option<usize>| {
+            let marks = at.and_then(|at| self.marks.get(at));
+            marks.is_some_and(|marks| marks.key_place())
+        };
+        // A binding that pairs names a decode profile: no other has sides.
+        [decode.is_some() && plain(prefill), plain(decode)]
+    }
+
+    /// Whether the binding of `model`'s pair steers a pool the overload
+    /// veto empties to its least-vetoed worker ([`AllVetoed::Steer`]), and
+    /// does not shed it: `false` where the model's prefill resolves to no
+    /// binding. One lookup of the binding, asked by the call of a pair that
+    /// names its worker where no decode can be sent to.
+    #[cfg(feature = "in-process")]
+    pub(crate) fn steers_all_vetoed(&self, model: &str) -> bool {
+        let entry = self.resolve(model, Phase::Prefill);
+        entry.is_some_and(|(entry, _, _)| entry.vetoed == AllVetoed::Steer)
+    }
+
     /// [`Self::states_head_places`] by the two profiles of
     /// [`Self::ring_profiles`].
     pub(crate) fn head_rule_of(&self, (own, decode): RingProfiles) -> Option<HeadRule<'_>> {

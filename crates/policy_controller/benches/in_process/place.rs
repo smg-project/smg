@@ -29,7 +29,7 @@ use smg_policy_controller::{
     tracking::{Outcome, Placement, Side, TransportClass},
 };
 
-use super::{conversations, ruled, worded, Host, Run, MODEL, RING};
+use super::{conversations, pair, ruled, worded, Host, Run, MODEL, RING};
 
 /// The prompt a request by the one call states: 1,024 token ids, the size
 /// the plain request states.
@@ -52,7 +52,8 @@ impl TokenEntry for Whole {
 /// `place` with a rule ([`ruled::names`]), or `place` with a prompt of text
 /// ([`worded::ENTRY`]).
 pub(super) fn named(value: &str) -> String {
-    let known = matches!(value, "decide_at" | "place" | worded::ENTRY) || ruled::names(value);
+    let known =
+        matches!(value, "decide_at" | "place" | worded::ENTRY | pair::NAMED) || ruled::names(value);
     assert!(known, "no entry {value}");
     value.to_owned()
 }
@@ -162,6 +163,7 @@ pub(super) fn word() -> &'static str {
     if ASKED.load(Ordering::Relaxed) {
         ruled::word()
             .or_else(worded::word)
+            .or_else(pair::word)
             .unwrap_or(" entry=place")
     } else {
         " entry=decide_at"
@@ -175,8 +177,12 @@ pub(super) fn word() -> &'static str {
 /// on one. The result line's word says the entry asked.
 pub(super) fn asked_with_lists(run: &Run, takes_rule: bool) -> bool {
     let rule = ruled::names(&run.entry);
-    assert!(takes_rule || !rule, "such a cell states no rule");
-    let asked = rule || run.entry == "place";
+    let named = run.entry == pair::NAMED;
+    assert!(
+        takes_rule || !(rule || named),
+        "such a cell states no rule and names no worker"
+    );
+    let asked = rule || named || run.entry == "place";
     ASKED.store(asked, Ordering::Relaxed);
     asked
 }

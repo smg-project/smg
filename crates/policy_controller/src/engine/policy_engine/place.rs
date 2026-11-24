@@ -42,7 +42,9 @@
 //!
 //! A single request that names its worker, under a document whose binding
 //! says which header names it, is held to that one worker and goes to no
-//! other ([`target`]).
+//! other ([`target`]). A pair that names its worker is held so on each
+//! side whose profile is the hash ring keyed by no prefix, its prefill's
+//! first.
 //!
 //! A request with a pair's two lists is placed a target at a time over both
 //! its workers ([`pair`]). Its later decisions are held to the workers the
@@ -292,7 +294,9 @@ pub struct PlaceRequest<'a> {
     /// decode asked again reads no image fact. So does one with items
     /// that demands vision or a way of processing its references
     /// ([`Self::demands`]): its encoders meet that part of the demand, and
-    /// a decode asked again would hold the decode to it.
+    /// a decode asked again would hold the decode to it. So does a pair
+    /// held to the two workers its request names: a decode asked again
+    /// would be picked by the pair's routing value.
     pub decode_again: bool,
     /// Whether the caller counts this request on the decode its first
     /// decision named while it asks that decode again: one of that
@@ -348,6 +352,9 @@ pub struct PlaceRequest<'a> {
     /// the list its caller hands. For a single request that names its
     /// worker ([`PolicyEngine::place`]) it is asked ahead of the call's
     /// decision too, of each available worker the request's number counts.
+    /// For a pair that names its worker it is asked there of each available
+    /// worker of the two lists its number counts, at the places the caller
+    /// states for each and does not mask.
     ///
     /// Where a pair's decode is decided again on its decode side
     /// ([`PlacementSide::decode_again`](crate::tracking::PlacementSide::decode_again)),
@@ -857,10 +864,13 @@ impl RequestMaker for Made<'_, '_> {
         // of references beside pixels, states none either: a decode asked
         // again reads no image fact. Nor does one that leaves a part of
         // its hard demand to its encoders: a decode asked again takes no
-        // items and would hold the decode to the whole. Both are read
-        // last, so a request that asks no decode again reads neither.
+        // items and would hold the decode to the whole. A pair held to the
+        // two workers it names states none: a decode asked again would be
+        // picked by the pair's routing value. The holds are read last, so a
+        // request that asks no decode again reads none of them.
         let later = request.asks_decode_again()
             && spec.decode_pick() == DecodePick::AfterPrefill
+            && !self.of_call.is_some_and(|call| call.named_pair)
             && !request.encode.is_some_and(|items| {
                 items.holds_decode_to_images(request.media.holds_pixels())
                     || splits(&items, request.demands)
@@ -1358,6 +1368,12 @@ pub(super) struct Call {
     /// names outranks its routing value, so that value keeps no worker
     /// over a veto.
     unkeyed: bool,
+    /// Whether the call's pair is held to the two workers its request
+    /// names ([`target::pair`]). Such a call makes one decision: it books
+    /// the decode with its prefill under every document, and no ask
+    /// follows it ([`pair`]). The worker a request names is that
+    /// decision's, so no later one moves it.
+    named_pair: bool,
     /// The instant of the call's first ask, for a request that states a
     /// budget: the budget is counted from it ([`Call::left`]). `None` for
     /// a request that states no budget: no clock is read for its budget.
@@ -1682,9 +1698,38 @@ impl PolicyEngine {
     /// the request is placed as one that names no worker, by the binding's
     /// rule for workers that are all vetoed, and with no routing value,
     /// which a named worker outranks. A header that is absent, empty or
-    /// not text names no worker. A pair's request and an encode request
-    /// are not read for a target: they are placed by the rest of the
-    /// document.
+    /// not text names no worker.
+    ///
+    /// A pair may name its worker too, a side at a time. A pair's binding
+    /// names one list of sources for its two sides, and its target source
+    /// is the side's whose profile is the hash ring keyed by no prefix.
+    /// The prefill's number counts, in the prefill list's order, the
+    /// prefills that can be sent to and have a partner that can, at the
+    /// places the caller states for each side: those with such a partner
+    /// among their first partners alone, where there is one. Where the
+    /// decode's side is the ring's too, its number counts those partners
+    /// of the prefill reached, and the call's one decision is held to the
+    /// two places
+    /// ([`PairLists::prefill_places`](crate::engine::PairLists::prefill_places),
+    /// [`PairLists::decode_places`](crate::engine::PairLists::decode_places)).
+    /// Where it is not, the decision is
+    /// held to the prefill's place and the decode is its own profile's
+    /// pick. A named prefill at the caller's admission limit is waited
+    /// for ([`Unplaced::PrefillsFull`]), a named decode with no free room
+    /// is taken, and a retry is handed the pair again. A number that
+    /// reaches no worker on a side, and a pair the held decision cannot
+    /// place, shed the request under `target-worker`. Where no decode can
+    /// be sent to and the binding steers decodes that are all over their
+    /// thresholds, one over them alone counts as a partner, and the decode
+    /// goes by load. Under a binding that sheds them no decode counts so.
+    /// Where no prefill is counted, the pair is placed as one that names
+    /// no worker, with its routing value. A pair whose decode side alone is
+    /// such a ring is not read for a target, and neither is an encode
+    /// request: they are placed by the rest of the document. A pair held
+    /// to the two workers it names books its decode with its prefill
+    /// under every document ([`PlaceRequest::decode_again`]): a decode
+    /// asked again behind its prefill ([`Placement::decode_again`]) is
+    /// refused as one that never stood chosen, and that decode stands.
     ///
     /// Declined by name ([`ShedReason::PolicyDeclined`]): a request that
     /// carries encode items over other lists than an encode request's
@@ -1740,10 +1785,13 @@ impl PolicyEngine {
         let document = self.in_force();
         let own = self.under(&document);
         match request.lists {
-            WorkerLists::Pair(ref lists) => pair::place(own, request, lists, &mut Call::default()),
             // Whether a binding names a target source was decided when the
             // document was applied: under one that names none, a request
             // pays this test and no read of a header.
+            WorkerLists::Pair(ref lists) if own.document.spec.names_target() => {
+                target::pair(own, request, lists)
+            }
+            WorkerLists::Pair(ref lists) => pair::place(own, request, lists, &mut Call::default()),
             WorkerLists::Single(list) if own.document.spec.names_target() => {
                 target::single(own, request, list)
             }
