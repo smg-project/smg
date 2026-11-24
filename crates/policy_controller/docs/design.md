@@ -376,7 +376,7 @@ whether it is marked non-exhaustive and how code writes it:
 
 Rule 2 says the engine keeps no copy of worker data. This section says where the data lives: in
 structures of the worker crate and of the kv-index crate. The policy crate adds structures of its
-own in two places: the engine's hash table (section 4.5), and the controller's value for a worker
+own, among them the engine's hash table (section 4.5) and the controller's value for a worker
 list and its holder (section 4.1).
 
 ### 4.1 The worker registry **[built]** (`smg-worker`)
@@ -450,8 +450,8 @@ record, and on a controller by its worker host, which follows the store's row. T
 is also written on the word of the stream a worker pushes on (section 4.3), of a passed probe
 and of a request's own token stream.
 
-A decision reads a worker in one read: `Worker::routing_state()` gives ready, circuit breaker,
-stalled, overloaded and the in-flight count.
+A decision reads a worker's routing state in one read: `Worker::routing_state()` gives ready,
+circuit breaker, stalled, overloaded, the in-flight count and the count of requests processed.
 
 ### 4.3 The load reports **[built]** (`smg-worker`)
 
@@ -734,9 +734,11 @@ load snapshot; a snapshot's reports are converted once for a list and cached.
 
 The field `engine` numbers the list's data-parallel engines: records that state one number are
 ranks of one engine. `PolicyEngine` writes the numbers once for a list, where it finds the list's
-engines. A default record leaves 0 on every record, which would read as one engine. So a stage
-reads the field only where `PolicyEngine` decides: in process, and in a controller for a single
-request. The number holds within one generation of one list and is no id beyond it.
+engines. A default record leaves 0 on every record, which would read as one engine. So the field
+tells engines apart only where the records' maker numbered them. `PolicyEngine` does, in process
+and in a controller. A host that writes its own records numbers them itself, as the crate's
+example does (`crates/policy_controller/examples/in_process/main.rs`). The number holds within
+one generation of one list and is no id beyond it.
 
 ### 5.4 What a request states **[partly]**
 
@@ -911,7 +913,8 @@ On main three pickers say so: round robin, `random` and `passthrough`.
    key's pin in the session table, or from the workers its key reaches on the ring its host
    lends. Only the records of the workers the key names are read.
 6. **Cache affinity.** A profile that reads which worker holds the prompt's beginning has those
-   workers named before the pass, and the pick recorded after it.
+   workers named before the pass. After it the prompt is recorded for the first target the
+   request's caller sends to, and for none where it sends to none (section 4.5).
 7. **Records.** One `Candidate` for each worker is written into the thread's buffer. Over a list
    of 16 workers or more, a profile whose picker draws first (`random`, `round-robin`,
    `passthrough`, power of two, `best` with a sample) has only the drawn workers' records written.
@@ -920,7 +923,11 @@ On main three pickers say so: round robin, `random` and `passthrough`.
 8. **Filters.** Each filter removes records. If a filter leaves nothing, the binding's rule for a
    list wholly over its thresholds may still pick among the workers the overload filter removed.
    Otherwise the decision is a refusal that names the filter: `Saturated` for the overload filter,
-   `NoEndpoints` for any other.
+   `NoEndpoints` for any other. A single request with a routing key keeps its key's worker over
+   the overload veto, beside free workers too, where its binding does not shed, the plain ring
+   alone places its profile and every worker it may take is a single worker. A sessions rule adds
+   conditions of its own. Over workers of another role the veto stands, and the key passes on to
+   the next worker its ring reaches.
 9. **Scorers and the picker.** Each scorer scores the survivors. The scores are combined by the
    document's weights. The picker orders up to four targets. No target is a refusal,
    `PolicyDeclined`, naming the picker.
@@ -1692,6 +1699,8 @@ request ──> route (HTTP or gRPC, any family)
 
   The fifth, the encode stage's own selection, takes its pair from `select_pair` and refuses a request that carries an item for the encode workers by name **[planned]**: the gateway does not yet hand the engine an encode request's three lists.
 
+  The pair's function makes its call twice in one case, as a stopgap: where the first call answers that none of its workers could be sent to, the request carries a rule of its route, and that rule takes a prefill and a decode it pairs with that can both be sent to, the overload veto apart. The second call holds both pools to the workers the rule takes. The engine is to hold a pair's later decisions to the rule inside its own call, as it holds a single request's (section 8.2) **[planned]**.
+
   Where the document asks a pair's decode again, the two pair routes make one more call between the prefill's answer and the decode's dispatch (section 8.2).
 
   A retry held to its wire is placed over the pool's whole list: the gateway holds it there by the route's own rule for a worker, and a pair's retry by the places of each pool on that wire. It does not yet give each runtime and transport it dials a number, as a worker's fact and as the retry's demand (section 8.2) **[planned]**.
@@ -1847,17 +1856,16 @@ A replica that takes the lead holds its last leader's last change in them at onc
 
 ### 10.3 The controller's worker data **[partly]**
 
-One worker's data stands four times whole in a controller, and a fifth time in part: the
-remainder holds 17 of its 24 facts as stated and one bit of an eighteenth. The membership log
+One worker's data stands several times in a controller, whole or in part. The membership log
 tells the data once more:
 
 | Copy | Where | Read by |
 |---|---|---|
 | the worker record | the store's table of records (`store/memory.rs`) | the registration calls, for a record's status; the load poller, and the follower of cache events for whether a worker's events are indexed, each until it reads the worker objects; a watcher's and a standby's first copy |
 | a copy of the record's facts | beside the worker objects (`worker_host/objects.rs`) | the code that keeps the objects, to tell a record that changed under its object |
-| the worker object | the worker-crate registry | the health checker, the follower of cache events and a single request's decision |
-| the remainder: 17 of the 24 facts and one bit of an eighteenth, with the record's id and revision | beside each worker object (`worker_host/remainder.rs`) | a single request's decision, for the record's id, whether the worker takes images, its wire modes and from where it is reached. What the worker states for a request's hard demands is lent with the list, and no frame states a demand yet |
-| the published copy of the records | the store | a pick's booking and a gateway's vetoes; no request is decided over it |
+| the worker object | the worker-crate registry | the health checker, the follower of cache events and a decision |
+| the remainder: 17 of the 24 facts and one bit of an eighteenth, with the record's id and revision | beside each worker object (`worker_host/remainder.rs`) | a decision, for the record's id, whether the worker takes images, its wire modes and from where it is reached. A pair's classes read its engine kind and its pairing descriptor too. What the worker states for a request's hard demands is lent with the list, and no frame states a demand yet |
+| the published copy of the records | the store | a pick's booking and a gateway's vetoes, among others; no request is decided over it |
 | the membership log's event | `service/replication/log.rs` | a watcher behind its first copy; a standby |
 
 A leader's write of a record is decided over the worker object since step 1 below, and the
@@ -1865,17 +1873,17 @@ table follows it. The record still leads a status and a first copy, and the
 object follows it there. After the switch the object leads: a worker's data
 stands once, as its worker object with its remainder beside it, and the log still tells it. The
 remainder is the copy that stays. The table of records and the second copy of the facts end
-with step 4 below. The published copy ends when its two readers, a pick's booking and a gateway's
-vetoes, read the worker objects: a later step **[planned]**.
+with step 4 below. The published copy ends when its readers, a pick's booking and a gateway's
+vetoes among them, read the worker objects: a later step **[planned]**.
 
 **What stands beside an object [built].** `RowRemainder` (`worker_host/remainder.rs`) holds
 what a registration stated and the worker object does not hold as stated. The code that keeps
 the objects writes one with every object it builds. `Objects::row_of` gives a worker's
 whole record back from the object and its remainder, with no read of the store's table.
-A single request's
-decision reads four of the remainder's facts: the record's id, whether the worker takes images,
-its wire modes and from where it is reached. The controller's registration calls decide a write
-over a whole record read back (step 1 below). Of the 24 facts a registration states:
+A decision reads the remainder's facts, among them the record's id, whether the worker takes
+images, its wire modes and from where it is reached. A pair's classes read its engine kind and its
+pairing descriptor too. The controller's registration calls decide a write over a whole record
+read back (step 1 below). Of the 24 facts a registration states:
 
 - Six stand on the object whole, and the remainder holds none of them: the address, the role,
   the models, the labels, the cache block size and the bootstrap port. So does the status.
@@ -1943,7 +1951,7 @@ its address is one function beside the other membership rules (`WorkerFacts::lai
 `store/membership.rs`): from the record that stands and the facts stated, the change and the
 record it leaves. The store's own write decides by it over the table's record. It then writes
 the decided change by the one body a standby's applier writes a leader's change by
-(`MemoryStore::follow`). The rule's second caller is the code that keeps the worker
+(`MemoryStore::decided`). The rule's second caller is the code that keeps the worker
 objects, over the record read back from an object (step 1).
 
 **A standby's events through the worker objects [built].** A standby's applier hands each
@@ -2238,7 +2246,7 @@ bursts. It is bounded by the tree's size bound and the time between two eviction
 | The crate's bench of the kept engine | **[planned]** | |
 | The gateway as a host | **[partly]** | section 9, behind `--policy-controller on`, which is off by default: single requests and pairs on the HTTP and gRPC routes, a pair's decode asked again, a host's table of stages at the start; an encode request that carries an item is refused by name until the gateway hands the engine its three lists; every classic test of the gateway with the engine on (the bar's fourth point) is not met yet |
 | The controller: service, election, replication, document apply and roll back | **[partly]** | a session never pushes the document and refuses a gateway's replay; a standby serves neither the worker list nor the snapshot (section 10.1) |
-| The controller on the one engine and the worker crate's structures | **[partly]** | a single request, a pair at its prefill and its decode call are decided by `PolicyEngine` over the registry's lists; an encode request is answered `Busy`; a decision reads no cache event, and no load report under a document that holds a stage that keeps reports, and a sessions rule's cap counts nothing (section 10.2) |
+| The controller on the one engine and the worker crate's structures | **[partly]** | a single request, a pair at its prefill and its decode call are decided by `PolicyEngine` over the registry's lists; an encode request is answered `Busy`; a decision reads no cache event, and no load report under a document that holds a stage that keeps reports (section 10.2) |
 | The controller finding its own workers | **[partly]** | discovery registers nothing yet |
 | A gateway under a controller | **[planned]** | section 11 |
 | User stages in WebAssembly and over gRPC | **[partly]** | library code that no document reaches |
