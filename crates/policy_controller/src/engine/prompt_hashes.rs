@@ -587,7 +587,6 @@ mod tests {
         let text = under(None, Some(RECORDED_TEXT));
         assert_eq!(written(&text).hash_kind, HashKind::Text);
         assert_eq!(written(&text).block_hashes, RECORDED_WINDOWS);
-        // Nothing but the seed of its partition, the plain one here.
         let plain = PromptHashes {
             namespace_seed: XXH3_SEED,
             ..PromptHashes::default()
@@ -597,6 +596,15 @@ mod tests {
             panic!("a prompt with neither asked for the size of a {kind:?} block")
         });
         assert_eq!(five(&neither), five(&plain));
+        // Seeds that differ: the partition's is kept, not the event's.
+        let parted = HashSeeds {
+            event: 3,
+            partition: 7,
+        };
+        let neither = PromptHashes::of_prompt(None, None, parted, |kind| {
+            panic!("a prompt with neither asked for the size of a {kind:?} block")
+        });
+        assert_eq!(written(&neither).namespace_seed, 7);
     }
 
     #[test]
