@@ -769,12 +769,26 @@ a new document the engine that issued the lease is gone, and the standing one co
 gateway's own process the stages kept since the lease's document hear the word, every count of
 sends in force takes a dispatch, the session table hears it, and a stage built since hears nothing.
 
+An entry of the engine reads the document through a reference its own thread keeps. The engine
+holds the number of the document in force in one atomic word, written behind the document at an
+apply. A thread keeps one counted reference of the document it read last, and an entry compares
+that document's number with the engine's. Where they are one, the entry takes a plain count on the
+thread's reference: no atomic exchange, and nothing allocated. Otherwise it reads the engine's cell
+and the thread keeps what it read: at a thread's first entry, at its first entry behind a new
+document, and at each entry of a thread that asks two engines by turns. So a replaced document
+lives until its last decision ends, its last handle is let go, and each thread that read it last
+asks an engine again or ends: at most one replaced document for each thread. The stages that the
+document in force did not keep are dropped on the thread that lets the last reference go: as a
+rule at the start of that thread's next decision, or at its end.
+
 ```rust
 // engine/policy_engine.rs
 pub struct PolicyEngine {
     document: ArcSwap<InForce>, // the validated document (profiles, bindings, stage objects and their state), its
                           // number, what is read of it once (which lease events its stages need) and its
                           // shadow counts
+    applied: AtomicU64,   // the number of the document in force: an entry compares it with the number of
+                          // the document its thread read last
     clock: DecisionClock, // one clock for every decision and every load report's age
     leases: OwnWord,      // the id of the last lease issued: one atomic counter
     sessions: Arc<SessionTable>, // the pins of every key a sessions rule placed: one table for the

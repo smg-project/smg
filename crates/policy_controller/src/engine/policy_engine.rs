@@ -132,9 +132,16 @@ pub struct PolicyEngine {
     /// What the engine holds of the document in force ([`InForce`]): the
     /// document, its number, what the engine reads of the document once,
     /// and the shadow decisions counted under it. Replaced whole where a
-    /// new document is put in force ([`Self::apply`]). A decision loads it
-    /// once, at its entry ([`Self::in_force`]).
+    /// new document is put in force ([`Self::apply`]). A decision reads it
+    /// once, at its entry, through the reference its thread keeps
+    /// ([`Self::in_force`]): the cell itself is read where a thread kept
+    /// another document or none.
     document: ArcSwap<InForce>,
+    /// The number of the document in force ([`InForce::applied`]): what an
+    /// entry compares with the number of the document its thread read
+    /// last ([`Self::in_force`]). Written behind the document where a new
+    /// one is put in force ([`Self::apply`]).
+    applied: AtomicU64,
     /// Held while a change of membership is told and while a new document
     /// is put in force ([`Self::apply`]), so no word is told to a document
     /// that a new one is replacing. No decision takes it.
@@ -342,8 +349,10 @@ impl PolicyEngine {
         // engine takes the pointer.
         let sessions = Arc::new(SessionTable::new(0).with_shards(shards_for_this_host()));
         spec.share_sessions(Arc::clone(&sessions));
+        let document = InForce::of(spec);
         Self {
-            document: ArcSwap::from_pointee(InForce::of(spec)),
+            applied: AtomicU64::new(document.applied),
+            document: ArcSwap::from_pointee(document),
             telling: Mutex::new(()),
             epochs: AtomicU64::new(0),
             clock: DecisionClock::new(),
@@ -558,7 +567,9 @@ impl PolicyEngine {
 
     /// The number of the document in force, which no other applied
     /// document of the process has. A list's value is made under it
-    /// and read under it alone ([`Self::members_of`]).
+    /// and read under it alone ([`Self::members_of`]). Read of the
+    /// engine's cell, as [`Self::spec`] is: no request's entry asks it, so
+    /// the calling thread keeps no document for it.
     pub(super) fn applied(&self) -> u64 {
         self.document.load().applied
     }
@@ -795,7 +806,7 @@ impl PolicyEngine {
         clock: impl FnOnce() -> Instant,
     ) -> Result<Decided, DecisionRefused> {
         let mut whole = None;
-        let document = self.document.load();
+        let document = self.in_force();
         let alone = self.under(&document).decide_into(maker, clock, &mut whole);
         // The document is let go ahead of the answer's making: an answer
         // made while it is held is moved once more behind its release.
@@ -876,7 +887,7 @@ impl PolicyEngine {
         maker: &impl RequestMaker,
         now: Instant,
     ) -> Result<(super::decision::Decision, Option<Shadowed>), DecisionRefused> {
-        let document = self.document.load();
+        let document = self.in_force();
         let own = self.under(&document);
         self.caught(|| {
             let mut request = own.made(maker);
@@ -945,7 +956,7 @@ impl PolicyEngine {
         held: &super::decision::Target,
         now: Instant,
     ) -> Result<super::decision::Decision, DecisionRefused> {
-        let document = self.document.load();
+        let document = self.in_force();
         let own = self.under(&document);
         self.caught(|| {
             let mut request = own.made(maker);
@@ -1179,7 +1190,7 @@ impl DecisionEngine for PolicyEngine {
         held: &HeldDecision<'_>,
         now: Instant,
     ) -> Result<DecideOutcome, DecisionRefused> {
-        let document = self.document.load();
+        let document = self.in_force();
         let own = self.under(&document);
         self.caught(|| {
             let mut request = own.made(maker);
@@ -1211,7 +1222,7 @@ impl DecisionEngine for PolicyEngine {
         // built since. Its dispatch is counted by every count of sends in
         // force: a send is a fact of its worker, whatever document decided
         // it.
-        let document = self.document.load();
+        let document = self.in_force();
         let sends = document.spec.engine();
         let mut engine = sends;
         if held.lease.generation != document.spec.generation() {
@@ -1241,7 +1252,7 @@ impl DecisionEngine for PolicyEngine {
     }
 
     fn with_spec<R>(&self, read: impl FnOnce(&AppliedSpec) -> R) -> R {
-        read(&self.document.load().spec)
+        read(&self.in_force().spec)
     }
 
     // By the block size the model's cache events taught the host's index,
@@ -1255,7 +1266,7 @@ impl DecisionEngine for PolicyEngine {
         seeds: HashSeeds,
     ) -> PromptHashes {
         let size = self.affinity.block_size(model);
-        PromptHashes::under_document(&self.document.load().spec, size, tokens, text, seeds)
+        PromptHashes::under_document(&self.in_force().spec, size, tokens, text, seeds)
     }
 
     fn faults(&self) -> u64 {
