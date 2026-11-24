@@ -51,7 +51,7 @@ use crate::{
 /// the profile's own and every word of it is told.
 ///
 /// What is kept of where a request's prompt went asks the same: the
-/// record of sent prefixes takes no entry, and a lent token tree stores no
+/// record of sent prefixes takes no entry, and a lent tree stores no
 /// prompt, behind a pick the stages do not hear of
 /// (`policy_engine::overlap`). A pin the keyed entry followed is handed to
 /// that lookup only where the stages hear of it (`policy_engine::single`).
