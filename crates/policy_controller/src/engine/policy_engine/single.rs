@@ -8,8 +8,10 @@
 //! reads the list in order up to the first eligible worker. It writes no
 //! record and takes no lock. It answers a plain request ([`Plain`]) over a
 //! list where the rule finds an eligible worker, and it reads no fact of a
-//! request: the engine asks it before the request is made, so such a
-//! request is never made.
+//! request: the engine asks it before the request is made, so no request
+//! is made for such a decision. Under a document that keeps a sample of its
+//! decisions the request's maker is asked its id behind the pick
+//! ([`RequestMaker::request_id`]).
 //!
 //! **A key's rows, between** ([`keys::decide`]). A keyed request that is
 //! made is decided by the rows its key names: under a sessions rule its

@@ -253,7 +253,9 @@ pub struct PlaceRequest<'a> {
     /// The request's headers.
     pub headers: &'a dyn HeaderRead,
     /// The request's own id, where it has one: a source of its routing
-    /// value where the document names it.
+    /// value where the document names it, and what a decision the engine
+    /// kept of the request is found by ([`PolicyEngine::explained`]). A
+    /// request with none is not kept.
     pub request_id: Option<&'a str>,
     /// The tenant the request is of.
     pub tenant: Option<&'a str>,
@@ -918,6 +920,12 @@ impl RequestMaker for Made<'_, '_> {
         })
     }
 
+    // The id the request made states, read where its caller stated it: no
+    // request is made for it.
+    fn request_id<'w>(&'w self, _: &'w AppliedSpec) -> &'w [u8] {
+        self.request.request_id.map_or(&[], str::as_bytes)
+    }
+
     // Asked where a plain request's pick is leased, ahead of its making:
     // the hashing counts the text of a request that is made, so a text is
     // passed over once. The lease is its decision's document's, and so is
@@ -1146,7 +1154,9 @@ const fn declined(stated: &'static str) -> Unplaced {
 /// place it answers, or `None` with its whole decision written into
 /// `whole`, the room its caller keeps ([`Loaded::decide_into`]); and the
 /// instant it was dated at. A place dates nothing: no clock is read for
-/// it. A single's ask and a pair's decide here, three lists with no item
+/// it, but for the record of one that is kept as a sample
+/// ([`PolicyEngine::explained`]). A single's ask and a pair's decide here,
+/// three lists with no item
 /// stated among the pairs. An encode request's items are decided with its
 /// pair in one call ([`Loaded::decide_encode_at`]), and a decode decided
 /// again is asked through its guard ([`decode_again`]).

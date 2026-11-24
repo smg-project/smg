@@ -2703,7 +2703,7 @@ bursts. It is bounded by the tree's size bound and the time between two eviction
 | A binding's overload switch (`overload.enabled`) under worker objects | **[partly]** | a gateway that runs a supplied document reads it at its start, where it builds its workers' default: one word for the bindings a host runs (decision 10); a controller does not read it there yet |
 | Bindings by tenant, priority, header, prompt size, labels; a session id issued by the engine (`issue_session_id`) | **[planned]** | in the schema; a document that writes one is refused as not in this build |
 | `canary`, `override: allowed`, `admission` | **[planned]** | in the schema; a document that writes one is refused, and the error names the field |
-| `shadow`, `explain.sample` | **[partly]** | the kept engine runs a single request's shadow, but not one that reads affinity rows of its own; a pair's shadows run in no engine, and `explain.sample` is kept by the served controller alone (decision 7) |
+| `shadow`, `explain.sample` | **[partly]** | the kept engine runs a single request's shadow, but not one that reads affinity rows of its own; a pair's shadows run in no engine, and `explain.sample` is kept by the served controller and, for a single request and a pair's first decision, by the engine in a gateway's process, where no route reads a record yet (decision 7) |
 | The ten presets and the conversion from routing settings | **[built]** | |
 | A worker's `policy` label names its model's policy | **[partly]** | section 3.3: built: the builder of the settings' document takes a label and binds its model, and a registration that states a label is answered with a warning; planned: the gateway hands the builder its labels, and a document put in force keeps the stages of a profile that did not change |
 | The stage interfaces and a builder's own stages | **[built]** | |
@@ -2838,8 +2838,8 @@ every fallback engine".
 ### Decision 7: shadow and explain
 
 The kept engine runs a single request's shadow, and counts as skipped one that reads affinity
-rows of its own. A pair's shadows run in no engine, and the explain sample is kept by the
-served controller alone. A host reads the shadow counts in one call of the engine
+rows of its own. A pair's shadows run in no engine. The explain sample is kept by the
+served controller, and by the engine in a gateway's process for a single request and a pair's first decision. There an encode request decided with its items, a decode decided again and a pair's shadows are in no record, and no route of the gateway reads a record yet. A host reads the shadow counts in one call of the engine
 (`PolicyEngine::shadow_counts`). A gateway shows them at each scrape of its metrics endpoint,
 as the series `smg_policy_shadow_decisions_total`. A document
 that writes `canary`, `override: allowed` or `admission` is refused. No engine runs them.
