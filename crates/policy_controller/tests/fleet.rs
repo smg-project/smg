@@ -145,7 +145,9 @@ use smg_policy_controller::{
         watcher::{WatchStream, WatchStreamEnd, Watcher},
     },
     store::{LaneCounts, MemoryStore, WorkerFacts, WorkerStatus, WorkersStore},
+    worker_host::{Members, Objects},
 };
+use smg_worker::{registry::WorkerRegistry, worker::WorkerStatus as ObjectStatus};
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::{oneshot, Barrier, Notify},
@@ -2984,26 +2986,43 @@ async fn the_client_at_a_replica_that_does_not_lead_is_told_the_leader() {
         .expect("the case ends inside its outer bound");
 }
 
-/// What a watcher's store holds of its controller's workers, by id: each
-/// row's facts, status and revision.
-fn watched(watcher: &Watcher) -> Vec<(WorkerId, WorkerFacts, WorkerStatus, u64)> {
+/// A watcher of `store` over worker objects of its own, which follow their
+/// rows' status as a gateway's do.
+fn watcher_of(store: Arc<MemoryStore>) -> Watcher<Members> {
+    let objects = Objects::new(Arc::new(WorkerRegistry::new())).with_status_followed();
+    Watcher::new(store, Arc::new(objects))
+}
+
+/// What a watcher holds of its controller's workers, by id: each row's
+/// facts, status and revision. Each row has its worker object, built at the
+/// row's revision, and no other object stands.
+fn watched(watcher: &Watcher<Members>) -> Vec<(WorkerId, WorkerFacts, WorkerStatus, u64)> {
     let (_, mut rows) = WorkersStore::all_rows(&**watcher.store());
     rows.sort_by_key(|row| row.id.0);
+    let objects = watcher.objects();
+    assert_eq!(objects.len(), rows.len(), "one worker object a row");
+    let built = |id| Some(objects.standing(&objects.object(id)?)?.revision);
     rows.into_iter()
-        .map(|row| (row.id, row.facts, row.status, row.revision))
+        .map(|row| {
+            assert_eq!(built(row.id), Some(row.revision), "the row's object");
+            (row.id, row.facts, row.status, row.revision)
+        })
         .collect()
 }
 
-/// The status a watcher holds for a row, if it holds the row.
-fn status_of(watcher: &Watcher, id: WorkerId) -> Option<WorkerStatus> {
-    WorkersStore::get(&**watcher.store(), id).map(|row| row.status)
+/// The status of the worker object a watcher holds for a row, if it holds
+/// the row: what the watch told last, with nothing followed behind it.
+fn status_of(watcher: &Watcher<Members>, id: WorkerId) -> Option<ObjectStatus> {
+    let objects = watcher.objects();
+    let object = objects.registry().get(&objects.object(id)?)?;
+    Some(object.status())
 }
 
 /// Follows the stream until `stands` holds of its watcher, each event
 /// inside the room of a wait.
 async fn follows(
-    following: &mut WatchStream<'_>,
-    mut stands: impl FnMut(&Watcher) -> bool,
+    following: &mut WatchStream<'_, Members>,
+    mut stands: impl FnMut(&Watcher<Members>) -> bool,
 ) -> Result<(), String> {
     while !stands(following.watcher()) {
         let taken = tokio::time::timeout(ROOM, following.next())
@@ -3040,14 +3059,14 @@ async fn a_watcher_holds_the_fleets_rows_as_the_controller_tells_them() {
             .iter()
             .map(|engine| harness.worker(*engine).expect("the engine's row"))
             .collect();
-        let dead = |watcher: &Watcher, id: WorkerId| {
-            status_of(watcher, id).is_some_and(|status| status != WorkerStatus::Ready)
+        let dead = |watcher: &Watcher<Members>, id: WorkerId| {
+            status_of(watcher, id).is_some_and(|status| status != ObjectStatus::Ready)
         };
 
         // The snapshot tells the fleet as it registered. Where the stand-in
         // probes, no prober has started yet and every row is pending. A
         // controller that probes by itself may have readied a row already.
-        let mut watcher = Watcher::new(Arc::new(MemoryStore::new()));
+        let mut watcher = watcher_of(Arc::new(MemoryStore::new()));
         let opened = watcher.open(harness.client()).await;
         let mut stream = opened.expect("the watch opens");
         let told = follows(&mut stream, |held| held.at().is_some()).await;
@@ -3055,17 +3074,17 @@ async fn a_watcher_holds_the_fleets_rows_as_the_controller_tells_them() {
         for id in &ids {
             let status = status_of(stream.watcher(), *id);
             assert!(
-                status == Some(WorkerStatus::Pending)
-                    || (PRODUCT_PROBES && status == Some(WorkerStatus::Ready)),
+                status == Some(ObjectStatus::Pending)
+                    || (PRODUCT_PROBES && status == Some(ObjectStatus::Ready)),
                 "a row of the snapshot reads {status:?}"
             );
         }
 
         // The prober starts: the tail tells each engine it heard.
         harness.feed();
-        let ready = |watcher: &Watcher| {
+        let ready = |watcher: &Watcher<Members>| {
             ids.iter()
-                .all(|id| status_of(watcher, *id) == Some(WorkerStatus::Ready))
+                .all(|id| status_of(watcher, *id) == Some(ObjectStatus::Ready))
         };
         let told = follows(&mut stream, ready).await;
         told.expect("the fleet is told ready");
@@ -3074,7 +3093,8 @@ async fn a_watcher_holds_the_fleets_rows_as_the_controller_tells_them() {
         let late = harness.register(&FLEET[3..4]).await;
         let late = late.expect("one more engine registers")[0];
         let late = harness.worker(late).expect("the late engine's row");
-        let ready = |watcher: &Watcher| status_of(watcher, late) == Some(WorkerStatus::Ready);
+        let ready =
+            |watcher: &Watcher<Members>| status_of(watcher, late) == Some(ObjectStatus::Ready);
         let told = follows(&mut stream, ready).await;
         told.expect("the late engine is told ready");
 
@@ -3125,7 +3145,7 @@ async fn a_watcher_holds_the_fleets_rows_as_the_controller_tells_them() {
             })
             .expect("filed");
         assert_eq!(leases.live(gateway), 1);
-        let mut fresh = Watcher::new(Arc::clone(&store));
+        let mut fresh = watcher_of(Arc::clone(&store));
         let opened = fresh.open(harness.client()).await;
         let mut snapshot = opened.expect("a second watch opens");
         let told = follows(&mut snapshot, |held| held.at().is_some()).await;
@@ -3158,7 +3178,7 @@ async fn a_link_answers_beside_its_watch_and_the_watch_outlives_it() {
             .await
             .expect("a ready fleet");
         let first = harness.worker(0).expect("the first worker's row");
-        let mut watcher = Watcher::new(Arc::new(MemoryStore::new()));
+        let mut watcher = watcher_of(Arc::new(MemoryStore::new()));
         let mut stream = watcher
             .open_on(&link)
             .await
@@ -3169,7 +3189,7 @@ async fn a_link_answers_beside_its_watch_and_the_watch_outlives_it() {
         assert_eq!(watched(stream.watcher()).len(), 1);
         assert_eq!(
             status_of(stream.watcher(), first),
-            Some(WorkerStatus::Ready)
+            Some(ObjectStatus::Ready)
         );
 
         let tail = follows(&mut stream, |held| watched(held).len() == 2);
@@ -3198,7 +3218,7 @@ async fn a_link_answers_beside_its_watch_and_the_watch_outlives_it() {
 
         harness.kill(0).await.expect("the first worker dies");
         follows(&mut stream, |held| {
-            status_of(held, first).is_some_and(|status| status != WorkerStatus::Ready)
+            status_of(held, first).is_some_and(|status| status != ObjectStatus::Ready)
         })
         .await
         .expect("the watch takes the status after the link ends");
@@ -3238,7 +3258,7 @@ async fn a_watch_ends_when_its_controller_goes_silent() {
         let address = format!("http://{relay}");
         let connected = Client::connect(&address, "silent-gateway").await;
         let mut client = connected.expect("the client connects through the relay");
-        let mut watcher = Watcher::new(Arc::new(MemoryStore::new()));
+        let mut watcher = watcher_of(Arc::new(MemoryStore::new()));
         let opened = watcher.open(&mut client).await;
         let mut stream = opened.expect("the watch opens");
         let first = tokio::time::timeout(ROOM, stream.next()).await;

@@ -1930,7 +1930,8 @@ A fact leaves the remainder when the worker object gets a field that holds it as
    new object takes the standing one's place under its id, with its running state, as the code
    that keeps the objects does today for a record that changed.
 2. A standby applies the leader's events to its own worker objects **[built]**. A call reads the
-   record that stands from the worker objects **[built]**. A watcher's and a
+   record that stands from the worker objects **[built]**. A gateway's watcher hands its
+   watch's events to its own worker objects **[built]**. A watcher's and a
    standby's first copy is cut from the objects and their remainders behind step 3, because a
    copy's statuses must be the ones the log last told **[planned]**.
 3. No health outcome is copied into a record: a decision reads the object's status, as a single
@@ -1953,8 +1954,8 @@ hands the store the event at its place in the log, and puts the object in the re
 the store took the event. A removal's object leaves the registry first. A record changed in
 place keeps the instant it was admitted at. A status is still the table's word, and it is
 copied onto the object in the same turn. A restore is the store's restore and the read of its
-records in one turn of that code. A first copy is still cut from the table, and a watcher
-still writes a table of its own: two later parts of step 2.
+records in one turn of that code. A first copy is still cut from the table: a later
+part of step 2.
 
 **A call reads the worker objects [built].** A registration call reads the record that stands
 before it writes: the record under an address, the record under an id, and an engine's records.
@@ -1967,6 +1968,14 @@ where the store passed over every record under the membership lock: that read of
 deleted. A first copy stays on the table until step 3. Its statuses must be the ones the log
 last told at its place, and until an object's status leads the table alone holds them under
 the lock that orders the log.
+
+**A watcher's events through the worker objects [built].** A gateway's watcher hands each
+event of a controller's worker watch, and the watch's first copy at its last page, to the
+code that keeps the gateway's worker objects (the third part of step 2), as a standby's
+applier does. So the object of a record stands when the event that told it returns, and the
+host of the watcher follows nothing behind the watch. A first copy keeps the object of a
+record that stands through it. The store's two entries for a watcher, a told change and a
+first copy, have no caller in the product but that code.
 
 A lease keeps naming its worker by the record's id, never by a place in a list: a gateway
 reports on a lease later and across membership changes.

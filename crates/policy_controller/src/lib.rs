@@ -104,9 +104,9 @@
 //!   for concurrent asks on one decide stream and reports on one session.
 //! - Behind the same feature, the watcher (`watcher`): a gateway's copy of
 //!   the controller's workers. It takes the watch's events in their order
-//!   into a [`store::MemoryStore`] of its own, through the door a
-//!   standby's applier writes a followed row by, and names the place a
-//!   watch opened again goes on from.
+//!   into a [`store::MemoryStore`] of its own, through the holder of the
+//!   gateway's worker objects as a standby's applier writes a followed
+//!   row, and names the place a watch opened again goes on from.
 //! - Behind the same feature, the worker follower
 //!   (`service::worker_follower::WorkerFollower`): the task a gateway
 //!   follows a controller's worker list with. It dials the controller,
