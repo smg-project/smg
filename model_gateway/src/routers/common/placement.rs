@@ -518,9 +518,9 @@ impl RequestEnd {
     }
 
     /// The request ended with `status`, as the reader of its answer took
-    /// it. `answered` says whether the worker itself answered so
-    /// ([`super::attempt_ledger::UpstreamAnswer`]), where the status is no
-    /// transport failure and none the router made.
+    /// it. `answered` says whether the worker itself answered the request:
+    /// at a route's account, whether the answer carries the worker's mark
+    /// ([`super::attempt_ledger::UpstreamAnswer`]).
     ///
     /// The outcome is made behind the handle's test: an empty handle pays
     /// that test, and nothing is asked or classed for it.
@@ -548,9 +548,13 @@ fn reported(end: &SideEnd, status: u16, answered: bool) {
 
 /// The class of an end of `status`, the one mapping of the gateway: a
 /// status under 400 is a success, 408 and 504 a timeout, any other 4xx the
-/// client's error. A 5xx is the server's error where the worker answered
-/// it. A 5xx the router made is a failed connection: a transport failure,
-/// or an answer of the worker's that the router refused.
+/// client's error. A 5xx follows whether the worker answered the request.
+/// Where it did, the 5xx is the server's error, whoever wrote the status:
+/// the worker's own, or the 502 the Decisions adapter makes of an answer
+/// it cannot map. Where no answer of the worker stands, the 5xx is a
+/// failed connection. One refusal differs: a plain route's refusal of a
+/// body over its limit carries no mark, so it reads as a failed
+/// connection.
 fn transport_class(status: u16, answered: bool) -> TransportClass {
     match status {
         ..400 => TransportClass::Ok,
@@ -805,7 +809,7 @@ impl Placed {
 
     /// The request this answer placed ended with `status`, as the route
     /// that keeps the answer takes it at its attempt's account. `answered`
-    /// says whether the worker itself answered so
+    /// says whether the answer carries the worker's mark
     /// ([`super::attempt_ledger::UpstreamAnswer`]): it is asked only where
     /// the policy engine hears the outcome. A classic answer pays the test
     /// of its one empty word.
@@ -7404,8 +7408,8 @@ pub(crate) mod tests {
 
     /// The gateway's one mapping of a status to a class: under 400 a
     /// success, 408 and 504 a timeout, any other 4xx the client's error, and
-    /// a 5xx the server's error where the worker answered it, a failed
-    /// connection where the router made it.
+    /// a 5xx the server's error where the worker answered the request, a
+    /// failed connection where it did not.
     #[test]
     fn a_status_is_classed_by_one_mapping() {
         for (status, answered, class) in [

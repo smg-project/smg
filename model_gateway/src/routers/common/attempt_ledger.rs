@@ -33,9 +33,10 @@ use smg_worker::identity::basic::{Worker, WorkerType};
 
 use crate::routers::common::{placement::CandidateFilter, retry::mark_non_retryable};
 
-/// Response extension: the worker answered the request itself, so the status
-/// is the worker's verdict on this payload rather than a transport failure or
-/// a status the router synthesized.
+/// Response extension: the worker answered the request itself. The status is
+/// the worker's own, or the router's judgement of an answer the worker gave
+/// (the Decisions adapter's 502 for an answer it cannot map). A transport
+/// failure carries no mark.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct UpstreamAnswer;
 

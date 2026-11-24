@@ -7619,6 +7619,44 @@ mod tests {
         );
     }
 
+    /// The Decisions adapter reads a worker's good answer whole and puts a
+    /// 502 of its own in the place of one it cannot map. That answer keeps
+    /// the worker's mark, and the route charges the worker's breaker with
+    /// the 502. The engine hears the same status as the server's error: the
+    /// worker answered, so it is no failed connection.
+    #[tokio::test]
+    async fn the_engine_hears_a_refused_decisions_answer_as_the_servers_error() {
+        // A good status over a body that is no Decisions answer.
+        let (url, hits) = fixed_status_upstream(&[UPSTREAM_ROUTE], StatusCode::OK).await;
+        let worker = BasicWorkerBuilder::new(&url)
+            .worker_type(WorkerType::Regular)
+            .runtime_type(RuntimeType::Sglang)
+            .health_config(no_health_check())
+            .build();
+        let mut router = streaming_router(PolicyConfig::RoundRobin, 1024 * 1024, vec![worker]);
+        router.retry_config = fast_retry_config(1);
+        let heard = hearing_engine_on(&router.policy_registry);
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+        let request: DecisionsRequest = serde_json::from_value(json!({
+            "model": "m",
+            "input": "The sky is blue.",
+            "questions": [{"type": "predicate", "instructions": "Is the sky blue?"}],
+        }))
+        .unwrap();
+
+        let response = router
+            .route_decisions(None, &tenant, request, UNKNOWN_MODEL_ID)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(hits.load(AtomicOrdering::SeqCst), 1);
+        drop(response);
+        assert_eq!(
+            heard_of(&heard),
+            ["issued", "dispatched Single", "completed ServerError 502"]
+        );
+    }
+
     /// Each attempt is a request of the engine's own: a first attempt its
     /// worker refused and a second one served are two leases, each with the
     /// end of its own answer.
