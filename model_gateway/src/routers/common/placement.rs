@@ -2461,12 +2461,14 @@ fn pair_by_engine(
     // The engine asks a pair's rule of its picks alone, a few a decision,
     // which miss the workers a rule takes of a long pool: the pair is then
     // decided once more among the workers the rule takes now, where it
-    // takes a prefill and a decode that prefill pairs with, each open but
-    // for the overload veto, which the engine lifts itself. Prefills of one
-    // descriptor share one partner list: the rule is asked of a list once.
+    // takes a prefill and a decode that prefill pairs with, each ready and
+    // let through by its circuit breaker: the overload veto and the liveness
+    // veto are the engine's to lift. Prefills of one descriptor share one
+    // partner list: the rule is asked of a list once.
     let takes_a_pair = || {
         let takes = |worker: &Arc<dyn Worker>| {
-            worker.routing_state().eligible_ignoring_overload() && admitted(worker)
+            let state = worker.routing_state();
+            state.healthy && state.can_execute && admitted(worker)
         };
         let mut refused: Vec<&Arc<[Arc<dyn Worker>]>> = Vec::new();
         for (prefill, partners) in pairs.prefill.iter().zip(&pairs.partners) {
@@ -8656,10 +8658,11 @@ pub(crate) mod tests {
     /// A route's rule that takes one worker of each pool finds that pair.
     /// The engine's call names twelve pairs at most, four a decision: where
     /// none of them holds the rule's two workers, the pair is decided once
-    /// more among the workers the rule takes. That ask answers as a first
-    /// one does: with the rule's prefill at its admission limit the request
-    /// waits for a slot. A rule whose decode is not ready takes no second
-    /// ask: the first answer stands.
+    /// more among the workers the rule takes, a stalled prefill or decode
+    /// among them. That ask answers as a first one does: with the rule's
+    /// prefill at its admission limit the request waits for a slot. A rule
+    /// whose decode is not ready takes no second ask: the first answer
+    /// stands.
     #[test]
     fn the_engines_pair_finds_the_one_decode_its_routes_rule_takes() {
         let grpc = ConnectionMode::Grpc;
@@ -8702,6 +8705,21 @@ pub(crate) mod tests {
         };
         let placed = pick(None).ok().map(|pair| pair.decode.url().to_owned());
         assert_eq!(placed.as_deref(), Some(decode.url()));
+
+        // A stalled prefill is found too, and so is a stalled decode: the
+        // engine lifts the liveness veto of a side whose workers are all
+        // stalled.
+        let placed = || {
+            let pair = pick(None).ok()?;
+            Some((pair.prefill.url().to_owned(), pair.decode.url().to_owned()))
+        };
+        let expected = Some((prefill.url().to_owned(), decode.url().to_owned()));
+        prefill.set_stall(Some(StallReason::Wedged));
+        assert_eq!(placed(), expected);
+        prefill.set_stall(None);
+        decode.set_stall(Some(StallReason::Wedged));
+        assert_eq!(placed(), expected);
+        decode.set_stall(None);
 
         let admission = PrefillAdmission::new(1, 0, Duration::ZERO);
         let runtime = tokio::runtime::Builder::new_current_thread().build();
