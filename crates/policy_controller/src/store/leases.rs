@@ -315,7 +315,8 @@ impl Sides {
     /// guard lends its engine, made from the record on file. `None`, and
     /// no call, for a pair's lease, which is no single's, and for a
     /// dispatch that names no target of the pick: it tells nothing of the
-    /// lease.
+    /// lease. A served controller tells a single's words through this
+    /// view, by the rule a guard's lease is told by.
     ///
     /// The parts are read as they stood before the word:
     ///

@@ -7764,10 +7764,10 @@ impl Engine {
     /// The session table's part of a dispatch ([`Lifecycle::on_dispatched`]): the
     /// session pin follows the dispatched worker of the side, the decode
     /// of a pair target on the decode side and the target itself
-    /// otherwise. The controller tells the table first and the stages last
-    /// ([`Self::dispatched_stages`]): a stage's call that unwinds leaves
-    /// the table's entry written. A host tells a dispatch whole, by the
-    /// trait.
+    /// otherwise. A dispatch is told in parts: the counts of sends, this
+    /// table, then the stages ([`Self::dispatched_stages`]), so a stage's
+    /// call that unwinds leaves the table's entry written. Every teller of
+    /// a dispatch keeps that order, the trait's own entry among them.
     pub(crate) fn dispatched_table(&self, lease: &Lease, target: &Target, side: Side) {
         let dispatched = match (side, target.pair) {
             (Side::Decode, Some(pair)) => pair.decode_id,
@@ -7900,8 +7900,8 @@ impl Lifecycle for Engine {
         side: Side,
         since_decision_micros: u32,
     ) {
-        self.dispatched_table(lease, target, side);
         self.dispatched_sent(lease, target, side, since_decision_micros, || true);
+        self.dispatched_table(lease, target, side);
         self.dispatched_stages(lease, target, side, since_decision_micros);
     }
 

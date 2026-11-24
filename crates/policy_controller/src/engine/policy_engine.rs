@@ -1061,7 +1061,7 @@ impl DecisionEngine for PolicyEngine {
         }
         let engine = self.document.spec.engine();
         let tell = || match held.lease.side {
-            Side::Single => lease_events::single(engine, held, said),
+            Side::Single => lease_events::single(&lease_events::one_engine(engine), held, said),
             // A pair's guard holds its prefill side's lease.
             Side::Prefill => lease_events::pair(engine, held, said, |at| self.clock.micros(at)),
             // No lease is issued for a side on its own.
