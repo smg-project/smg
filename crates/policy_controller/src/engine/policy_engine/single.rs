@@ -93,6 +93,34 @@ thread_local! {
     /// ([`retried`]): taken for one decision and put back behind it, as
     /// [`MEETING`] is. A pair's retry takes it the same way.
     pub(super) static TRIED: Cell<Vec<WorkerId>> = const { Cell::new(Vec::new()) };
+
+    /// The calling thread's own run of lease ids ([`lease_id`]): the number
+    /// of the document its engine decides under, the run's next id and how
+    /// many ids the run has left.
+    static IDS: Cell<(u64, u64, u64)> = const { Cell::new((0, 0, 0)) };
+}
+
+/// The ids a thread takes of its engine's counter at once.
+pub(super) const ID_RUN: u64 = 64;
+
+/// The id of the next lease the calling thread issues a single request: no
+/// other lease of the engine has it. A thread takes [`ID_RUN`] ids of the
+/// engine's counter at once and issues them one by one, in rising order: the
+/// word every deciding thread shares is written once a run, where a write a
+/// lease made each caller wait for the others' line. The ids a thread leaves
+/// of its run name no lease. A pair's lease takes its own step of the
+/// counter, so its id may read above a single's the thread issues after it.
+#[inline]
+fn lease_id(own: Loaded<'_, '_>) -> LeaseId {
+    let engine = own.document.applied;
+    let (of, next, left) = IDS.get();
+    if left != 0 && of == engine {
+        IDS.set((of, next + 1, left - 1));
+        return LeaseId(next);
+    }
+    let first = own.leases.0.fetch_add(ID_RUN, Ordering::Relaxed) + 1;
+    IDS.set((engine, first + 1, ID_RUN - 1));
+    LeaseId(first)
 }
 
 /// The stage a pair whose request states places is declined under
@@ -161,7 +189,7 @@ pub(super) fn noted(
     let id = *records.ids().get(position)?;
     let dp_rank = records::worker_rank(worker.as_ref());
     let lease = Lease {
-        id: LeaseId(own.leases.0.fetch_add(1, Ordering::Relaxed) + 1),
+        id: lease_id(own),
         kind: LeaseKind::Credit,
         side: Side::Single,
         target_index: 0,
@@ -588,7 +616,7 @@ pub(super) fn issued(
     let lease = noted.and_then(|pick| {
         let first = pick.targets.first()?;
         Some(Lease {
-            id: LeaseId(own.leases.0.fetch_add(1, Ordering::Relaxed) + 1),
+            id: lease_id(own),
             kind: LeaseKind::Credit,
             side: Side::Single,
             target_index: 0,
@@ -984,6 +1012,8 @@ pub(crate) mod tests {
         }
         assert_eq!(seen, [2; 4], "every worker takes its turn");
         assert_eq!(heard.lock().len(), 8, "one issue a pick");
+        let taken = engine.leases.0.load(Ordering::Relaxed);
+        assert_eq!(taken, ID_RUN, "eight ids, one write of the shared word");
         assert_eq!(asks.made.get(), 0, "the pick read no fact of a request");
     }
 

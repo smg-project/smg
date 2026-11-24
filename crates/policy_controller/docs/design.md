@@ -687,7 +687,7 @@ pub struct PolicyEngine {
                           // number, what is read of it once (which lease events its stages need) and its
                           // shadow counts
     clock: DecisionClock, // one clock for every decision and every load report's age
-    leases: OwnWord,      // the id of the last lease issued: one atomic counter
+    leases: OwnWord,      // the last lease id handed out: one atomic counter
     sessions: Arc<SessionTable>, // the pins of every key a sessions rule placed: one table for the
                           // engine's life
     affinity: Affinity,   // cache affinity: the host's index of cache events, and the engine's own
@@ -1019,7 +1019,8 @@ What one decision writes:
 
 - the thread's own buffer;
 - on the short path under `round-robin`, one atomic add on the list's counter;
-- one atomic add for a lease id, where a stage needs lease events;
+- one atomic add for a pair's lease id, or for each 64 ids a thread gives single requests, where a
+  stage needs lease events;
 - a session pin, where a sessions rule decides;
 - the record of sent prefixes, where a cache-affinity profile decides;
 - once for each new load snapshot and list, the converted load reports, which allocates.
