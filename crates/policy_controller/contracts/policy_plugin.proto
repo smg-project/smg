@@ -251,7 +251,7 @@ message Candidate {
   fixed64 labels = 21;
   // Encode-side compatibility for an encode-prefill-decode dispatch.
   bool ec_compatible = 22;
-  bool vision = 23;  // takes images
+  bool vision = 23;  // takes pixel media: an image or a video
   // Reachable from one gateway only (a host-local wire).
   bool host_local = 24;
   uint32 active_sessions = 25;  // u16; keys with a request in flight

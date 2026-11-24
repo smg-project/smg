@@ -272,17 +272,16 @@ impl<'a> Beside<'a> {
 }
 
 impl<'a> PairLists<'a> {
-    /// The request's constraints as each side reads them where its places
-    /// are not stated: the prefills', then the decodes'. A side reads the
-    /// mask its host states beside its list and no other: a request that
-    /// states a mask of its own is declined ahead of this
-    /// ([`not_decided`]). An encode request's decision hands them to the
-    /// engine, which numbers a mask with the workers it admits for the
-    /// items.
-    pub(super) fn masked(&self, cx: &Constraints<'a>) -> [Constraints<'a>; 2] {
-        let side = |stalled, held| {
+    /// The request's constraints as each side reads them: the prefills',
+    /// then the decodes'. A side reads the places and the mask its host
+    /// states beside its list and no other: a request that states places
+    /// or a mask of its own is declined ahead of this ([`not_decided`]).
+    /// An encode request's decision hands them to the engine, which
+    /// numbers both with the workers it admits for the items.
+    pub(super) fn sides_of(&self, cx: &Constraints<'a>) -> [Constraints<'a>; 2] {
+        let side = |places, stalled, held| {
             let side = Beside {
-                places: None,
+                places,
                 stalled,
                 held,
                 unmet: None,
@@ -290,8 +289,8 @@ impl<'a> PairLists<'a> {
             side.of(cx)
         };
         [
-            side(self.prefill_stalled, self.prefill_held),
-            side(self.decode_stalled, self.decode_held),
+            side(self.prefill_places, self.prefill_stalled, self.prefill_held),
+            side(self.decode_places, self.decode_stalled, self.decode_held),
         ]
     }
 

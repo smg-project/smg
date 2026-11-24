@@ -25,6 +25,13 @@
 //! prefill it alone hands to is no candidate of the pair. A host that
 //! states no wire asks nothing of an encoder's. The pair's two sides are
 //! held to no wire here: their host hands them on the request's wires.
+//!
+//! A request held to places of a list takes a worker at one of them, on
+//! each of the three lists ([`Constraints::places`]). An encoder outside the
+//! encoders' places is not open to the request: no item is placed on it,
+//! and a prefill it alone hands to is no candidate of the pair. It is a
+//! member all the same. A gap is named by what the model takes, and a
+//! place says what this request may reach.
 
 use super::{
     carries_a_column, column_fits, debug_assert_cells, debug_assert_indexed, reason_of,
@@ -33,7 +40,7 @@ use super::{
 };
 use crate::{
     engine::{
-        decision::{Decision, ShedReason, Target, Targets, Trace},
+        decision::{Decision, ShedReason, Target, Targets, Trace, PLACES},
         view::{
             AffinityFacts, Candidate, Constraints, Identity, Phase, PoolFacts, RequestFacts,
             WireModes,
@@ -192,11 +199,19 @@ struct Admitted {
     /// numbered, not with the rows: a decision under no hold pays nothing
     /// for it.
     held: Vec<u32>,
+    /// The rows here at the places of the pool its host holds the request
+    /// to, by their index here. Emptied and filled where the places are
+    /// numbered anew ([`Admitted::renumber`]) and read with those places
+    /// alone. Its room is taken there: a decision held to no place pays
+    /// nothing for it.
+    places: Vec<u32>,
 }
 
 /// One mask over a pool's rows numbered by the rows admitted from it, whose
 /// places in the pool are `from`: each masked row that was admitted is
 /// pushed by its index among the admitted. Both ascend by the pool's index.
+/// The places a request is held to are numbered by this walk too: a list of
+/// rows of the pool, as a mask is.
 #[inline(always)]
 fn number(from: &[u32], mask: &[u32], numbered: &mut Vec<u32>) {
     let mut mask = mask.iter().copied().peekable();
@@ -242,13 +257,33 @@ impl Admitted {
     /// held list takes its room here, one place a row admitted: the first
     /// decision under a hold sizes it once, and no fuller hold over as many
     /// rows grows it.
-    fn renumber(&mut self, stalled: &[u32], held: &[u32]) {
+    ///
+    /// The places the request is held to (`places`) are numbered by the
+    /// same walk into a list of their own, sized the same way: a place
+    /// whose row was left out opens none.
+    fn renumber(&mut self, stalled: &[u32], held: &[u32], places: Option<&[u32]>) {
         number(&self.from, stalled, &mut self.masked);
         self.held.clear();
         if !held.is_empty() {
             self.held.reserve(self.rows.len());
             number(&self.from, held, &mut self.held);
         }
+        self.places.clear();
+        if let Some(places) = places {
+            self.places.reserve(self.rows.len());
+            number(&self.from, places, &mut self.places);
+        }
+    }
+
+    /// Whether the request is held off every row admitted: its host holds
+    /// it to `places` of a pool of `whole` rows, a place names a row of the
+    /// pool, and no row admitted stands at one. Places that name no row of
+    /// the pool leave nobody out that this side admitted: they are the
+    /// pair's to answer, as beside a whole pool. The places ascend, so the
+    /// first is the least. Read behind [`Admitted::renumber`].
+    fn held_off(&self, places: Option<&[u32]>, whole: usize) -> bool {
+        let names_a_row = |places: &[u32]| places.first().is_some_and(|&at| (at as usize) < whole);
+        self.places.is_empty() && !self.rows.is_empty() && places.is_some_and(names_a_row)
     }
 
     /// Takes the room a mask numbered anew fills at most, one place a row
@@ -298,6 +333,11 @@ pub(super) struct EncodeScratch {
     /// ascending. The pass reads an encoder's hard filters once, and the
     /// items are offered from this list.
     opened: Vec<u32>,
+    /// The opened encoders at the places the request is held to, each by
+    /// its index among the opened: filled where a request states places of
+    /// the encode pool ([`EncodeScratch::hold_opened`]), and read there
+    /// alone.
+    reached: Vec<u32>,
     /// The decode classes with a registered decode: one bit a class, no
     /// wider than the fleet.
     decodes_of: ClassBits,
@@ -314,6 +354,38 @@ pub(super) struct EncodeScratch {
     decodes: Admitted,
     /// The chosen class's open encoders that take the request's media.
     offered: Admitted,
+}
+
+impl EncodeScratch {
+    /// Holds the opened encoders to `places`, the places of the encode pool
+    /// the request's host holds it to: an encoder outside them takes no key
+    /// and opens no class. The places are numbered over the opened
+    /// encoders by the walk that numbers a mask ([`number`]). The open
+    /// classes are then read again from the encoders kept, whose facts are
+    /// `facts`, into a set `width` wide. Out of line: a request held to no
+    /// place runs none of it.
+    #[cold]
+    #[inline(never)]
+    fn hold_opened(&mut self, facts: &[EncoderFacts], width: usize, places: &[u32]) {
+        self.reached.clear();
+        number(&self.opened, places, &mut self.reached);
+        // Both lists ascend, so a kept encoder moves to a slot at or ahead
+        // of its own.
+        let mut kept = 0;
+        for &from in &self.reached {
+            self.opened[kept] = self.opened[from as usize];
+            kept += 1;
+        }
+        self.opened.truncate(kept);
+        self.open.reset(width);
+        self.far_open.clear();
+        for &at in &self.opened {
+            let class = facts.get(at as usize).map_or(0, |of| of.class);
+            if !self.open.insert(class) {
+                self.far_open.push(class);
+            }
+        }
+    }
 }
 
 /// The name of the gap when no encoder is open for the request, read from
@@ -372,12 +444,34 @@ fn takes_request(
     (!items.references || of.references) && (!pixels || row.vision) && dialed(wires, row)
 }
 
+/// The encoders a request may take, each with its facts: every encoder of
+/// the pool, or the ones at the places its host holds it to
+/// ([`Constraints::places`]). A place past the pool's end names none.
+fn reached<'a>(
+    encode: &EncodePool<'a>,
+    places: Option<&'a [u32]>,
+) -> impl Iterator<Item = (&'a Candidate, &'a EncoderFacts)> {
+    let (encoders, facts) = (encode.encoders, encode.facts);
+    let (every, held): (u32, &[u32]) = match places {
+        None => (encoders.len() as u32, &[]),
+        Some(places) => (0, places),
+    };
+    (0..every)
+        .chain(held.iter().copied())
+        .filter_map(move |at| {
+            let at = at as usize;
+            Some((encoders.get(at)?, facts.get(at)?))
+        })
+}
+
 /// The stage that left no encoder open, when its reason is saturation:
 /// the overload veto's stage. The encoders that take the
 /// request are put to the profile's hard filters in their order, as a
 /// pair's side puts its rows: the stage that refuses the last of them left
 /// none. A stage ahead of the veto that leaves none is no saturation, and
-/// neither is one behind it that refuses an encoder the veto kept.
+/// neither is one behind it that refuses an encoder the veto kept. Of a
+/// request held to places they are the encoders at its places
+/// ([`reached`]): one outside them is none of the request's.
 ///
 /// Cold and out of line: a request an encoder is open for never comes here.
 #[cold]
@@ -393,10 +487,7 @@ fn saturation(
     let hard = || profile.filters.iter().filter(|f| !f.soft());
     // Where each of them is refused, counted over the hard filters: the
     // farthest of those places is the stage that left none.
-    let last = encode
-        .encoders
-        .iter()
-        .zip(encode.facts)
+    let last = reached(encode, cx.places)
         .filter(|(row, of)| of.class != 0 && takes_request(items, pixels, cx.wire_modes, row, of))
         .filter_map(|(row, _)| hard().position(|f| !f.keep(facts, row, cx)))
         .max()?;
@@ -488,6 +579,25 @@ impl Engine {
     /// pass, where a rotation is turned by the rows kept: two such lists of
     /// one size turn rotations apart, and none takes a name of its own
     /// ([`PoolFacts::reach`]).
+    ///
+    /// The places a list's host holds the request to
+    /// ([`Constraints::places`]) number the rows of the host's pool too:
+    /// the prefills' in `cx`, the decodes' in `decode_cx` and the encoders'
+    /// in `encode_cx`. Beside a list of prefills or of decodes this side
+    /// numbers anew they are numbered with the rows, by the walk that
+    /// numbers the mask: a place whose row was left out opens none. So a
+    /// side with places answers as it does for a host that hands the rows
+    /// admitted itself, with its places among them. An encoder outside the
+    /// encoders' places is not open to the request: it takes no key and
+    /// opens no class, and a key's run over the encoders offered reads no
+    /// place. The gaps named by membership are read over every worker all
+    /// the same. Where a list's places name workers and none of them takes
+    /// the request, though a worker outside them does, the request is held
+    /// off every worker that takes it: it is shed under the places' name
+    /// (`places`), which no gap says. Places that name no worker of a list
+    /// are no such case. Such places of a side shed the request as they
+    /// shed its pair alone, and such places of the encoders shed it as a
+    /// pool with no open encoder does.
     #[expect(
         clippy::too_many_arguments,
         reason = "the pair entry's inputs and the encode side's"
@@ -628,6 +738,11 @@ impl Engine {
             ..*facts
         };
         let wires = encode_cx.wire_modes;
+        // What a key's run reads of the encode side's constraints: no place,
+        // where the request is held to some. The encoders offered to a key
+        // stand at the request's places already.
+        let unplaced;
+        let mut key_cx = encode_cx;
         let takes =
             |row: &Candidate, of: &EncoderFacts| takes_request(&items, pixels, wires, row, of);
         let open = |row: &Candidate| {
@@ -663,6 +778,30 @@ impl Engine {
                         }
                     }
                 }
+            }
+            // A request held to places of the encode pool takes no encoder
+            // outside them. The membership above is read over every
+            // encoder: it says what the model takes, and a place says what
+            // this request may reach. Encoders at the places that take no
+            // such request, beside one outside them that does, hold it off
+            // every encoder that takes it. Places that name no encoder
+            // leave the request none, and the gap below says so.
+            if let Some(places) = encode_cx.places {
+                let mut at_places = reached(&encode, Some(places)).peekable();
+                let named = at_places.peek().is_some();
+                if any_member
+                    && named
+                    && !at_places.any(|(row, of)| of.class != 0 && takes(row, of))
+                {
+                    return gap(PLACES);
+                }
+                side.hold_opened(encode.facts, width, places);
+                any_open = !side.opened.is_empty();
+                unplaced = Constraints {
+                    places: None,
+                    ..*encode_cx
+                };
+                key_cx = &unplaced;
             }
             if !any_open {
                 // Encoders the overload veto left none of are a saturated
@@ -752,9 +891,12 @@ impl Engine {
                 .prefill_classes
                 .iter()
                 .all(|&class| open_class(class));
-        // A list handed on in a pool's stead is numbered anew, and a mask
-        // numbers the rows of the host's pool: beside such a list the mask
-        // is numbered with the rows.
+        // A list handed on in a pool's stead is numbered anew. A mask and
+        // the places a side's host holds the request to number the rows of
+        // the host's pool: beside such a list both are numbered with the
+        // rows, by one walk. A side whose places name rows and none that
+        // was admitted is held off every worker that takes the request,
+        // and says so.
         let (prefill_mask, decode_mask);
         let (mut cx, mut decode_cx) = (cx, decode_cx);
         if !every_prefill {
@@ -772,11 +914,15 @@ impl Engine {
                 side.prefills.copy_cells(cells);
             }
             side.prefills.take_room();
-            if !cx.stalled.is_empty() {
-                side.prefills.renumber(cx.stalled, cx.held);
+            if !cx.stalled.is_empty() || cx.places.is_some() {
+                side.prefills.renumber(cx.stalled, cx.held, cx.places);
+                if side.prefills.held_off(cx.places, pools.prefills.len()) {
+                    return gap(PLACES);
+                }
                 prefill_mask = Constraints {
                     stalled: &side.prefills.masked,
                     held: &side.prefills.held,
+                    places: cx.places.map(|_| side.prefills.places.as_slice()),
                     ..*cx
                 };
                 cx = &prefill_mask;
@@ -800,11 +946,16 @@ impl Engine {
                 side.decodes.copy_cells(cells);
             }
             side.decodes.take_room();
-            if !decode_cx.stalled.is_empty() {
-                side.decodes.renumber(decode_cx.stalled, decode_cx.held);
+            if !decode_cx.stalled.is_empty() || decode_cx.places.is_some() {
+                side.decodes
+                    .renumber(decode_cx.stalled, decode_cx.held, decode_cx.places);
+                if side.decodes.held_off(decode_cx.places, pools.decodes.len()) {
+                    return gap(PLACES);
+                }
                 decode_mask = Constraints {
                     stalled: &side.decodes.masked,
                     held: &side.decodes.held,
+                    places: decode_cx.places.map(|_| side.decodes.places.as_slice()),
                     ..*decode_cx
                 };
                 decode_cx = &decode_mask;
@@ -862,9 +1013,10 @@ impl Engine {
         // The offered encoders are numbered anew unless they are the whole
         // pool, and the encode side's mask is numbered with them.
         let offered_mask;
-        let mut encode_cx = encode_cx;
+        let mut encode_cx = key_cx;
         if !encode_cx.stalled.is_empty() && side.offered.rows.len() != encode.encoders.len() {
-            side.offered.renumber(encode_cx.stalled, encode_cx.held);
+            side.offered
+                .renumber(encode_cx.stalled, encode_cx.held, None);
             offered_mask = Constraints {
                 stalled: &side.offered.masked,
                 held: &side.offered.held,

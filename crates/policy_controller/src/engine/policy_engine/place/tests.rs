@@ -199,6 +199,7 @@ fn three_of(pair: PairLists<'_>) -> WorkerLists<'_> {
     WorkerLists::Encode(EncodeLists {
         pair,
         encoders: pair.prefill,
+        encoders_places: None,
         encoders_stalled: &[],
         encoders_held: &[],
         facts: &[],
