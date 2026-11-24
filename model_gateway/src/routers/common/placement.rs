@@ -1020,7 +1020,7 @@ fn placed_by_engine(
 ) -> Option<Placed> {
     let mut tried = TriedIds::new();
     tried_ids(lent.workers, inputs.tried, &mut tried);
-    let mut request = place_request(model_id, WorkerLists::Single(lent), inputs, &tried, stated);
+    let mut request = place_request(model_id, WorkerLists::Single(lent), &inputs, &tried, stated);
     request.ring = ring;
     let seen = cache_trace::observe(lent.workers);
     let answer = engine.place(&request);
@@ -2367,7 +2367,7 @@ fn with_pair_request<R>(
     tried_ids(decode.workers, inputs.tried, &mut decodes_tried);
     tried.append(&mut decodes_tried);
     let ring = ModelRing::read(engine, policies, registry, model_id);
-    let mut request = place_request(model_id, WorkerLists::Pair(lists), inputs, &tried, stated);
+    let mut request = place_request(model_id, WorkerLists::Pair(lists), &inputs, &tried, stated);
     request.ring = ring.lent();
     request.attempt = u8::try_from(inputs.tried.len().div_ceil(2)).unwrap_or(u8::MAX);
     request.decode_again = true;
