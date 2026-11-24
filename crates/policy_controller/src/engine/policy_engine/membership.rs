@@ -305,6 +305,10 @@ pub(super) struct Follow {
     /// word lost to a panic of the host's own code, and behind a word of
     /// membership of a host that states ids.
     unread: bool,
+    /// Whether the last upkeep owed a whole read and did not make it: the
+    /// host's own code panicked in the subscription or in the read. The
+    /// next upkeep says so ([`PolicyEngine::follow_registry`]).
+    late: bool,
     /// Whether the host stated an id of a worker at any ask so far. Such a
     /// host can state an id and take it back between the registry's write
     /// and the follow's ask.
@@ -431,13 +435,14 @@ impl PolicyEngine {
     /// with words still standing: those a whole read owed, those of words
     /// that never stood alone on the subscription, and, where the program
     /// handed its lists behind the whole read, those of every list that
-    /// stands.
-    pub(super) fn follow_registry(&self, members: &mut Option<Follow>) {
+    /// stands. It answers whether the upkeep before this one owed a whole
+    /// read and did not make it.
+    pub(super) fn follow_registry(&self, members: &mut Option<Follow>) -> bool {
         let follow = match members {
             Some(follow) => follow,
             None => {
                 let Some(registry) = self.members.get() else {
-                    return;
+                    return false;
                 };
                 members.insert(Follow {
                     registry: Arc::clone(registry),
@@ -445,6 +450,7 @@ impl PolicyEngine {
                     told: FxHashMap::default(),
                     under: FxHashMap::default(),
                     unread: true,
+                    late: false,
                     stating: false,
                     owed: Vec::new(),
                     filling: false,
@@ -463,6 +469,14 @@ impl PolicyEngine {
             read = self.held(|| self.read_whole(follow)).is_some();
             follow.unread = !read;
         }
+        // The upkeep before this one owed a whole read and did not make it:
+        // the load reports wait for this answer. A read the host fails
+        // again writes no record of a worker it read, as the host is asked
+        // of every worker ahead of the first write: the telling behind it
+        // tells the workers the subscription told as joined since the
+        // snapshot at hand, and no other.
+        let again = follow.late;
+        follow.late = follow.unread;
         // The program handed its lists since the follow last owed every
         // list that stands: a whole read owed them, and else they are owed
         // here, once.
@@ -473,6 +487,7 @@ impl PolicyEngine {
         // What the whole read owes, and what words left owed that never
         // stood alone on the subscription.
         self.fill_owed(follow);
+        again
     }
 
     /// Every list that stands is owed a fill: the lists of each model a
