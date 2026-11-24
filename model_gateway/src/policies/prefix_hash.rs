@@ -431,6 +431,17 @@ impl LoadBalancingPolicy for PrefixHashPolicy {
         "prefix_hash"
     }
 
+    /// A request that carries no token ids is keyed by its text.
+    fn needs_request_text(&self) -> bool {
+        true
+    }
+
+    /// With token ids the selection never reads the text: the ids key the
+    /// request.
+    fn needs_request_text_with_tokens(&self) -> bool {
+        false
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -444,6 +455,13 @@ mod tests {
 
     use super::*;
     use crate::policies::{hash_ring::Unfilled, test_support::make_workers};
+
+    #[test]
+    fn text_is_wanted_only_without_token_ids() {
+        let policy = PrefixHashPolicy::with_defaults();
+        assert!(policy.needs_request_text());
+        assert!(!policy.needs_request_text_with_tokens());
+    }
 
     #[test]
     fn test_prefix_hash_consistent_routing() {
