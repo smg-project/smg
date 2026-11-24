@@ -665,7 +665,7 @@ class TestPolicyDocument:
 
             path = Path(sys.argv[1])
             args = parse_router_args(
-                ["--policy-controller", "on", "--policy-spec", str(path), *sys.argv[2:]]
+                ["--grand-central", "on", "--policy-spec", str(path), *sys.argv[2:]]
             )
             args.storage_hook_wasm_path = str(path.with_name("missing.wasm"))
             Router.from_args(args).start()
@@ -678,14 +678,14 @@ class TestPolicyDocument:
             timeout=30,
         )
         assert result.returncode == 1, result.stderr
-        # The start ends in the policy controller's refusal of the document, which
-        # names what the document wrote. The words between are the policy crate's,
+        # The start ends in Grand Central's refusal of the document, which
+        # names what the document wrote. The words between are the Grand Central crate's,
         # and no case here holds them.
         refusals = [
             line for line in result.stderr.splitlines() if line.startswith("RuntimeError: ")
         ]
         assert len(refusals) == 1, result.stderr
-        assert refusals[0].startswith("RuntimeError: policy controller: "), result.stderr
+        assert refusals[0].startswith("RuntimeError: Grand Central: "), result.stderr
         assert named in refusals[0], result.stderr
 
     @pytest.mark.parametrize(
@@ -710,7 +710,7 @@ class TestPolicyDocument:
         self, policy_document, flags, named
     ):
         path = policy_document("round_robin")
-        args = parse_router_args(["--policy-controller", "on", "--policy-spec", str(path), *flags])
+        args = parse_router_args(["--grand-central", "on", "--policy-spec", str(path), *flags])
         with pytest.raises(ValueError) as refusal:
             Router.from_args(args)
         assert str(refusal.value) == (
@@ -723,7 +723,7 @@ class TestPolicyDocument:
         with pytest.raises(ValueError, match=named):
             _Router(
                 worker_urls=[],
-                policy_controller="on",
+                grand_central="on",
                 policy_spec=str(tmp_path / "routing.yaml"),
                 policy=PolicyType.Random,
                 prefill_policy=PolicyType.Random,
@@ -752,7 +752,7 @@ class TestPolicyDocument:
         # the router itself meets the same refusal, before anything starts.
         router = _Router(
             worker_urls=[],
-            policy_controller="on",
+            grand_central="on",
             policy_spec=str(tmp_path / "routing.yaml"),
             **{name: self.moved(name)},
         )
@@ -765,7 +765,7 @@ class TestPolicyDocument:
         # block off, so both stand beside a document.
         flags = ["--worker-overload-waiting-requests", "32", "--worker-overload-token-usage", "0.9"]
         path = policy_document("round_robin")
-        args = parse_router_args(["--policy-controller", "on", "--policy-spec", str(path), *flags])
+        args = parse_router_args(["--grand-central", "on", "--policy-spec", str(path), *flags])
         assert args.options_a_document_replaces() == []
         assert args.worker_overload_waiting_requests == 32
         assert args.worker_overload_token_usage == pytest.approx(0.9)
@@ -787,14 +787,14 @@ class TestPolicyDocument:
             "--block-size=16",
         ]
         path = policy_document("round_robin")
-        args = parse_router_args(["--policy-controller", "on", "--policy-spec", str(path), *line])
+        args = parse_router_args(["--grand-central", "on", "--policy-spec", str(path), *line])
         assert args.options_a_document_replaces() == []
         Router.from_args(args)
 
 
 class TestKeywordOnlyParametersOfTheCliFlags:
     """The parameters behind the CLI's --engine-metrics, --grouped-dp-sticky,
-    --pd-pairing-mode, --policy-controller, --policy-spec, --runtime-worker-threads, --webrtc-bind-addr and
+    --pd-pairing-mode, --grand-central, --policy-spec, --runtime-worker-threads, --webrtc-bind-addr and
     --webrtc-stun-server are keyword-only (no positional slot to keep) with the
     CLI's defaults, and a value the CLI refuses is refused before anything starts."""
 
@@ -806,7 +806,7 @@ class TestKeywordOnlyParametersOfTheCliFlags:
             "engine_metrics",
             "grouped_dp_sticky",
             "pd_pairing_mode",
-            "policy_controller",
+            "grand_central",
             "policy_spec",
             "runtime_worker_threads",
             "webrtc_bind_addr",
@@ -827,9 +827,9 @@ class TestKeywordOnlyParametersOfTheCliFlags:
         with pytest.raises(ValueError, match="grouped_dp_sticky"):
             _Router(worker_urls=["http://w:8000"], grouped_dp_sticky="round_robin").start()
 
-    def test_an_unknown_policy_controller_value_is_refused(self):
-        with pytest.raises(ValueError, match=r"policy_controller.*other.*expected 'on' or 'off'"):
-            _Router(worker_urls=["http://w:8000"], policy_controller="other").start()
+    def test_an_unknown_grand_central_value_is_refused(self):
+        with pytest.raises(ValueError, match=r"grand_central.*other.*expected 'on' or 'off'"):
+            _Router(worker_urls=["http://w:8000"], grand_central="other").start()
 
     def test_a_document_path_reaches_the_configuration(self, tmp_path):
         path = tmp_path / "routing.yaml"
@@ -842,7 +842,7 @@ class TestKeywordOnlyParametersOfTheCliFlags:
         with pytest.raises(ValueError, match=r"policy_spec.*" + re.escape(str(path))):
             _Router(**options).start()
         with pytest.raises(ValueError, match=r"retry\.initial_backoff_ms"):
-            _Router(**options, policy_controller="on").start()
+            _Router(**options, grand_central="on").start()
 
     def test_zero_runtime_threads_is_refused(self):
         with pytest.raises(ValueError, match="runtime_worker_threads"):

@@ -1,6 +1,6 @@
 # WASM Guest Examples for Shepherd Model Gateway
 
-This directory contains example WASM middleware components demonstrating how to implement custom middleware for Shepherd Model Gateway (SMG) using the WebAssembly Component Model. One example, `wasm-guest-policy`, is a routing policy for the policy controller instead of middleware.
+This directory contains example WASM middleware components demonstrating how to implement custom middleware for Shepherd Model Gateway (SMG) using the WebAssembly Component Model. One example, `wasm-guest-policy`, is a routing policy for Grand Central instead of middleware.
 
 ## Examples Overview
 
@@ -65,7 +65,7 @@ Minimal storage hook that never rejects. Used as an E2E test fixture.
 
 ### [wasm-guest-policy](./wasm-guest-policy/)
 
-A routing policy for the policy controller's plugin host: a filter, a scorer and a picker in one component. Not gateway middleware: it targets a different host, with a different world and a different build target.
+A routing policy for Grand Central's plugin host: a filter, a scorer and a picker in one component. Not gateway middleware: it targets a different host, with a different world and a different build target.
 
 **Features:**
 - Keeps the healthy workers that have capacity, scores the least loaded highest, with a bonus for the session's worker

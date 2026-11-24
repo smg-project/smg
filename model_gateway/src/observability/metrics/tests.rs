@@ -6,7 +6,7 @@ use std::{
 };
 
 use metrics_exporter_prometheus::PrometheusBuilder;
-use smg_policy_controller::{
+use smg_grand_central::{
     document::{AppliedSpec, PolicySpec},
     engine::{Candidate, Decision, Members, RequestFacts, Scorer, TieBand},
     stages::{Lifecycle, StageRegistry},
@@ -87,7 +87,7 @@ fn encode_path_activity_registers_every_path_and_reason_on_scrape() {
 struct Shadowing {
     workers: WorkerRegistry,
     policies: PolicyRegistry,
-    engine: &'static PolicyEngine,
+    engine: &'static InProcess,
 }
 
 impl Shadowing {
@@ -96,7 +96,7 @@ impl Shadowing {
         let worker = ready_worker("http://h:1", "m");
         workers.register(worker).expect("the worker registers");
         let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
-        policies.set_engine(Box::leak(Box::new(PolicyEngine::new(shadowing_spec()))));
+        policies.set_engine(Box::leak(Box::new(InProcess::new(shadowing_spec()))));
         let engine = policies.engine().expect("the engine that was set");
         Self {
             workers,
@@ -122,7 +122,7 @@ impl Shadowing {
     }
 }
 
-/// The policy engine's shadow counts on a scrape. The one binding that
+/// Grand Central's shadow counts on a scrape. The one binding that
 /// names a shadow has a zero series of each kind from the first scrape, by
 /// its place in the policy document and beside a single request. The
 /// binding ahead of it names none and has no series. A shadow that places
@@ -131,7 +131,7 @@ impl Shadowing {
 /// policy document starts from zero and is added whole: the series goes on
 /// from where it stood.
 ///
-/// The series is new with the policy engine: a classic gateway counts no
+/// The series is new with Grand Central: a classic gateway counts no
 /// shadow, and publishes no such family.
 #[test]
 fn the_engines_shadow_counts_are_published_from_zero_and_added_by_their_growth() {
@@ -152,7 +152,7 @@ fn the_engines_shadow_counts_are_published_from_zero_and_added_by_their_growth()
         let first = Shadowing::new();
         assert_eq!(scraped(&first), agreed(0));
         let rendered = handle.render();
-        let help = "# HELP smg_policy_shadow_decisions_total Shadow decisions of the policy engine";
+        let help = "# HELP smg_policy_shadow_decisions_total Shadow decisions of Grand Central";
         assert!(rendered.contains(help));
         let series = |line: &&str| line.starts_with("smg_policy_shadow_decisions_total{");
         assert_eq!(rendered.lines().filter(series).count(), 4, "{rendered}");
@@ -228,7 +228,7 @@ impl Members for PanicsAtItsEvents {
 struct Faulty {
     workers: WorkerRegistry,
     policies: PolicyRegistry,
-    engine: &'static PolicyEngine,
+    engine: &'static InProcess,
     at: Arc<AtomicU8>,
 }
 
@@ -253,7 +253,7 @@ impl Faulty {
         let spec = AppliedSpec::validate_in(&document, &stages, &[]);
         let spec = spec.expect("the stages hold the scorer");
         let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
-        policies.set_engine(Box::leak(Box::new(PolicyEngine::new(spec))));
+        policies.set_engine(Box::leak(Box::new(InProcess::new(spec))));
         let engine = policies.engine().expect("the engine that was set");
         engine.set_registry(Arc::new(PanicsAtItsEvents));
         Self {
@@ -293,14 +293,14 @@ impl Faulty {
     }
 }
 
-/// The panics the policy engine held and counted, on a scrape. Each kind
+/// The panics Grand Central held and counted, on a scrape. Each kind
 /// has a zero series from the first scrape. A decision that panics is
 /// refused, and raises `decision`. A stage that panics at the issue of a
 /// request's lease costs that request nothing, and raises `event`. A panic
 /// of the host's own code in a step of the engine's upkeep raises `upkeep`.
 /// Each series stands at its count as read, however many scrapes read it.
 ///
-/// The series is new with the policy engine: a classic gateway starts no
+/// The series is new with Grand Central: a classic gateway starts no
 /// engine, and publishes no such family.
 #[test]
 fn the_engines_fault_counts_are_published_from_zero_each_under_its_kind() {
@@ -317,7 +317,7 @@ fn the_engines_fault_counts_are_published_from_zero_each_under_its_kind() {
 
         assert_eq!(scraped(), [Some(0); 3]);
         let rendered = handle.render();
-        let help = "# HELP smg_policy_faults_total Panics the policy engine held and counted";
+        let help = "# HELP smg_policy_faults_total Panics Grand Central held and counted";
         assert!(rendered.contains(help), "{rendered}");
         let series = |line: &&str| line.starts_with("smg_policy_faults_total{");
         assert_eq!(rendered.lines().filter(series).count(), 3, "{rendered}");

@@ -29,7 +29,7 @@
 use std::{fmt, sync::Arc};
 
 use dashmap::{mapref::entry::Entry, DashMap};
-use smg_policy_controller::engine::{CacheIndex, CacheIndexes};
+use smg_grand_central::engine::{CacheIndex, CacheIndexes};
 use smg_worker::{
     identity::{basic::Worker, endpoint::Endpoint},
     load::monitor::WorkerMonitor,
@@ -336,7 +336,7 @@ impl KvEventMonitor {
     }
 }
 
-/// The policy engine's reads of the monitor, where it decides in the
+/// Grand Central's reads of the monitor, where it decides in the
 /// gateway's own process: a model's index and its block size, each read
 /// where the engine reads a list of workers, never once a request.
 impl CacheIndexes for KvEventMonitor {
@@ -795,7 +795,7 @@ mod tests {
         assert!(monitor.get_indexer("nonexistent").is_none());
     }
 
-    /// The policy engine's reads of the monitor. A block that a worker's
+    /// Grand Central's reads of the monitor. A block that a worker's
     /// event stored in a model's index is what the engine's lookup answers,
     /// under the index's own number of the worker, and the model's block
     /// size is the one the monitor holds. The index the engine is handed is

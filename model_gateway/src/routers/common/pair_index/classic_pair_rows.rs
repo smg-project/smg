@@ -5,14 +5,14 @@
 //! prefill and decode of the fleet, the partners the index lists for each
 //! prefill and the refusal it records when no pair is left. The gRPC wire's
 //! requests are runtime-specific, so it holds two known runtimes apart in
-//! every mode; the HTTP wire has no such fact. The policy controller crate
+//! every mode; the HTTP wire has no such fact. The Grand Central crate
 //! replays the rows through its own pair classes.
 //!
 //! This file is an ignored test of the gateway crate, kept beside the code
 //! it runs. It records from the checkout it is built in and writes the sheet
 //! under `CLASSIC_ROWS_OUT`, naming `CLASSIC_ROWS_COMMIT` as the commit it
-//! recorded from. The sheets the policy controller crate replays are in
-//! `crates/policy_controller/tests/classic/sheets`; to record this one again:
+//! recorded from. The sheets the Grand Central crate replays are in
+//! `crates/grand_central/tests/classic/sheets`; to record this one again:
 //!
 //! ```text
 //! CLASSIC_ROWS_OUT=<dir> CLASSIC_ROWS_COMMIT=<commit> \

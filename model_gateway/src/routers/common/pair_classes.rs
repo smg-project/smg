@@ -1,5 +1,5 @@
-//! The pair classes of a snapshot's prefill and decode pools, as the policy
-//! engine reads them.
+//! The pair classes of a snapshot's prefill and decode pools, as Grand
+//! Central reads them.
 //!
 //! Which prefill pairs with which decode is decided once a membership by the
 //! snapshot's pair index ([`PdPairIndex`]). The engine's pair decision reads
@@ -11,7 +11,7 @@
 
 use std::{ptr, sync::Arc};
 
-use smg_policy_controller::engine::PartnerClasses;
+use smg_grand_central::engine::PartnerClasses;
 use smg_worker::identity::basic::{RuntimeType, Worker};
 use tracing::warn;
 
@@ -70,7 +70,7 @@ struct Listed<'a> {
 /// `30f636706`). The other wire states no first partner, and neither does a
 /// prefill of no known runtime.
 ///
-/// Called once an index, at the policy engine's first pair decision over it
+/// Called once an index, at Grand Central's first pair decision over it
 /// ([`PdPairIndex::lent`]). Prefills of one descriptor share one partner
 /// list, so a list is turned into places once, however many prefills hold
 /// it.
@@ -122,7 +122,7 @@ pub(super) fn of(index: &PdPairIndex) -> PartnerClasses {
     if let Err(clause) = classes.table().validate() {
         warn!(
             %clause,
-            "The pair classes' table is not one the policy engine honours whole"
+            "The pair classes' table is not one Grand Central honours whole"
         );
     }
     if let Err(clause) = classes.first().within(&classes.table()) {

@@ -720,8 +720,8 @@ struct RoutingArgs {
     #[arg(long, default_value_t = 8, help_heading = "Routing Policy")]
     worker_warmup_divert_every: u64,
 
-    /// Choose off for the classic routing policies or on for the policy
-    /// controller. With on, the routing flags keep their meaning through a
+    /// Choose off for the classic routing policies or on for Grand
+    /// Central. With on, the routing flags keep their meaning through a
     /// policy document
     #[arg(
         long,
@@ -729,7 +729,7 @@ struct RoutingArgs {
         default_value = "off",
         help_heading = "Routing Policy"
     )]
-    policy_controller: String,
+    grand_central: String,
 
     /// Run this policy document in place of the one the routing flags mean.
     /// The document replaces those flags. A policy name, a policy's own
@@ -2224,18 +2224,18 @@ mod tests {
 
         for (flags, enabled) in [
             (&[][..], false),
-            (&["--policy-controller", "on"][..], true),
-            (&["--policy-controller", "off"][..], false),
+            (&["--grand-central", "on"][..], true),
+            (&["--grand-central", "off"][..], false),
         ] {
             let config = cli_args_from(flags)
                 .to_router_config(vec![], vec![])
                 .expect("the routing configuration");
-            assert_eq!(config.policy_controller, enabled, "{flags:?}");
+            assert_eq!(config.grand_central, enabled, "{flags:?}");
         }
-        let refusal = Cli::try_parse_from(["smg", "--policy-controller", "other"])
+        let refusal = Cli::try_parse_from(["smg", "--grand-central", "other"])
             .expect_err("the switch takes only on and off");
         assert_eq!(refusal.kind(), ErrorKind::InvalidValue);
-        assert!(refusal.to_string().contains("--policy-controller"));
+        assert!(refusal.to_string().contains("--grand-central"));
     }
 
     fn policy_file(
@@ -2243,12 +2243,12 @@ mod tests {
     ) -> Result<
         (
             tempfile::NamedTempFile,
-            smg_policy_controller::document::PolicySpec,
+            smg_grand_central::document::PolicySpec,
         ),
         Box<dyn std::error::Error>,
     > {
         let file = tempfile::NamedTempFile::new()?;
-        let document = smg_policy_controller::document::PolicySpec::preset(name)?;
+        let document = smg_grand_central::document::PolicySpec::preset(name)?;
         serde_yaml::to_writer(file.as_file(), &document)?;
         Ok((file, document))
     }
@@ -2257,7 +2257,7 @@ mod tests {
     fn the_plain_start_takes_the_document() {
         let (file, document) = policy_file("round_robin").expect("a policy document file");
         let path = file.path().to_str().expect("a UTF-8 path");
-        let config = cli_args_from(&["--policy-controller", "on", "--policy-spec", path])
+        let config = cli_args_from(&["--grand-central", "on", "--policy-spec", path])
             .to_router_config(vec![], vec![])
             .expect("the routing configuration");
         assert_eq!(config.policy_spec_path.as_deref(), Some(path));
@@ -2274,7 +2274,7 @@ mod tests {
         let (file, document) = policy_file("round_robin").expect("a policy document file");
         let path = file.path().to_str().expect("a UTF-8 path");
         let config = cli_args_from(&[
-            "--policy-controller",
+            "--grand-central",
             "on",
             "--policy-spec",
             path,
@@ -2294,7 +2294,7 @@ mod tests {
     /// The flags under the routing policy heading a document does not
     /// replace: the controller's own, and what the gateway reads itself.
     const BESIDE_A_DOCUMENT: [&str; 8] = [
-        "policy_controller",
+        "grand_central",
         "policy_spec",
         "print_policy_spec",
         "dp_aware",

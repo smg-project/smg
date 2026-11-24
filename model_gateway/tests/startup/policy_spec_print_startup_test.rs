@@ -8,7 +8,7 @@ use std::{
     process::{Command, Output},
 };
 
-use smg_policy_controller::document::PolicySpec;
+use smg_grand_central::document::PolicySpec;
 
 /// The binary's whole answer to `args` and the print option.
 fn print(args: &[&str]) -> io::Result<Output> {
@@ -24,7 +24,7 @@ fn text(bytes: &[u8]) -> String {
 
 /// Whether `stderr` is the binary's one sentence of error that begins with
 /// `head`: one line, ended by one line break. The words behind the head are
-/// the policy crate's, and no case of the gateway holds them.
+/// the Grand Central crate's, and no case of the gateway holds them.
 fn is_one_sentence_headed(stderr: &str, head: &str) -> bool {
     stderr
         .strip_prefix("error: ")

@@ -20,7 +20,7 @@ use kv_index::{
     GroupViews, OverlapScores, SequenceHash, ShardedChainIndex, StoredBlock, WorkerGroups,
     WorkerIdExhausted,
 };
-use smg_policy_controller::engine::{overlap, CacheIndex};
+use smg_grand_central::engine::{overlap, CacheIndex};
 use smg_worker::kv_events::apply::{BlockIndex, HeldBlocks};
 
 /// Workers one chain index interns at once: the index's own ceiling per shard.
@@ -461,11 +461,11 @@ impl fmt::Debug for KvIndex {
     }
 }
 
-// The policy engine's capped lookup reads the chain index's one shard, whose
+// Grand Central's capped lookup reads the chain index's one shard, whose
 // ids are the index's own.
 const _: () = assert!(CHAIN_INDEX_SHARDS == 1);
 
-/// The policy engine's reads of the index, where it decides in the
+/// Grand Central's reads of the index, where it decides in the
 /// gateway's own process: a worker's id and its block count once a list of
 /// workers is read, and one lookup a request.
 impl CacheIndex for KvIndex {
@@ -481,8 +481,8 @@ impl CacheIndex for KvIndex {
     /// holders itself, and nothing is allocated. Where a worker keeps cache
     /// groups, every holder's depth is first lowered to what its groups can
     /// serve ([`Self::cap_by_groups`]'s rule), as the classic decision
-    /// lowers it, and the deepest are kept after. The lookup is the policy
-    /// crate's ([`overlap::deepest_within_groups`]).
+    /// lowers it, and the deepest are kept after. The lookup is the Grand
+    /// Central crate's ([`overlap::deepest_within_groups`]).
     fn deepest_into(
         &self,
         block_hashes: &[u64],
@@ -826,7 +826,7 @@ mod tests {
         mask
     }
 
-    /// The policy engine's lookup: the holders of a request among the
+    /// Grand Central's lookup: the holders of a request among the
     /// workers its mask names, the deepest first under a cap, and the depth
     /// the cap cuts drawn from. Both backends answer alike.
     #[test]

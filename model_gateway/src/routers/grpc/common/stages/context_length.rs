@@ -114,7 +114,7 @@ impl ContextRequirements {
     }
 
     /// The request's completion budget as [`Self::new`] captured it: what a
-    /// selection states to the policy engine as the answer's limit. `None`
+    /// selection states to Grand Central as the answer's limit. `None`
     /// where the body names none, and for requirements that were not
     /// captured (the encode-prefill-decode mode's default).
     pub(crate) fn output_tokens(self) -> Option<u32> {

@@ -57,7 +57,7 @@
 # every policy, 29 ns a placement, fails them: +13.4 and +12.4 %, 2 of 8 ids failed and 0
 # suspect.
 #
-# Count: `count = true`, as policy-engine.toml records it. An id that still fails by time after
+# Count: `count = true`, as grand-central-engine.toml records it. An id that still fails by time after
 # its re-measurement is counted on both executables before the verdict. On the same count with
 # the measured function at another address, a change within twice the threshold is a placement,
 # reported and not failed; any other id whose counts read level is measured again from a fresh
