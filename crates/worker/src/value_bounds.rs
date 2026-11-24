@@ -7,7 +7,7 @@
 use std::{fmt, sync::Arc};
 
 use serde::{
-    de::{DeserializeSeed, MapAccess, SeqAccess, Visitor},
+    de::{DeserializeSeed, Error, MapAccess, SeqAccess, Visitor},
     Deserializer,
 };
 
@@ -128,7 +128,9 @@ where
 enum Stated {
     Text(Arc<str>),
     Unsigned(u64),
-    Negative(i64),
+    /// A whole number stated as present: an age alone takes it.
+    Present(u64),
+    Signed(i64),
     Float(f64),
     Null,
     List(Vec<NamedValue>),
@@ -141,7 +143,7 @@ enum Stated {
 /// name or a unit, or any other value. Each takes the shape it looks for
 /// and reads any other to its end as [`Stated::Other`]. A value that is
 /// left is still read as a value, so a token that fails a body fails it
-/// here too, and only a name's and a unit's text is copied.
+/// here too, and only a name and a unit are made strings.
 #[derive(Clone, Copy)]
 enum Read {
     Values,
@@ -174,14 +176,6 @@ impl Key {
             _ => Self::Other,
         }
     }
-
-    /// The place that reads the field's value.
-    fn place(self) -> Read {
-        match self {
-            Self::Name | Self::Unit => Read::Text,
-            Self::Value | Self::AgeMs | Self::Other => Read::Rest,
-        }
-    }
 }
 
 /// An entry's fields as far as they are stated. A field stated twice, or
@@ -197,15 +191,25 @@ struct Fields {
 }
 
 impl Fields {
+    /// The place that reads a field's value: a name and a unit are made
+    /// strings where the entry still stands and states none yet.
+    fn place(&self, key: Key) -> Read {
+        match key {
+            Key::Name if !self.broken && self.name.is_none() => Read::Text,
+            Key::Unit if !self.broken && self.unit.is_none() => Read::Text,
+            _ => Read::Rest,
+        }
+    }
+
     fn take(&mut self, key: Key, stated: Stated) {
         let fresh = match (key, stated) {
             (Key::Name, Stated::Text(name)) => self.name.replace(name).is_none(),
             (Key::Unit, Stated::Text(unit)) => self.unit.replace(unit).is_none(),
             (Key::Value, Stated::Unsigned(value)) => self.value.replace(value as f64).is_none(),
-            (Key::Value, Stated::Negative(value)) => self.value.replace(value as f64).is_none(),
+            (Key::Value, Stated::Signed(value)) => self.value.replace(value as f64).is_none(),
             (Key::Value, Stated::Float(value)) => self.value.replace(value).is_none(),
             (Key::AgeMs, Stated::Null) => self.age_ms.replace(None).is_none(),
-            (Key::AgeMs, Stated::Unsigned(age)) => {
+            (Key::AgeMs, Stated::Unsigned(age) | Stated::Present(age)) => {
                 u32::try_from(age).is_ok_and(|age| self.age_ms.replace(Some(age)).is_none())
             }
             (Key::Other, _) => true,
@@ -255,7 +259,11 @@ impl<'de> Visitor<'de> for Read {
     }
 
     fn visit_i64<E>(self, value: i64) -> Result<Stated, E> {
-        Ok(u64::try_from(value).map_or(Stated::Negative(value), Stated::Unsigned))
+        Ok(match (self, u64::try_from(value)) {
+            // A key reads by place as an unsigned number alone.
+            (Self::Key, _) | (_, Err(_)) => Stated::Signed(value),
+            (_, Ok(value)) => Stated::Unsigned(value),
+        })
     }
 
     fn visit_u64<E>(self, value: u64) -> Result<Stated, E> {
@@ -284,6 +292,51 @@ impl<'de> Visitor<'de> for Read {
         Ok(Stated::Null)
     }
 
+    // The rest is what a source other than a JSON text may state. Each is
+    // read as the buffered read gave it to the derived readers, so none
+    // fails an answer: a key by place is a number of 8 or of 64 bits, a
+    // character is no text, bytes that are text are text, a value left
+    // out is a null, one stated as present is an age alone, and a wrapped
+    // one is read and left.
+    fn visit_u16<E: Error>(self, value: u16) -> Result<Stated, E> {
+        self.visit_u32(value.into())
+    }
+
+    fn visit_u32<E>(self, value: u32) -> Result<Stated, E> {
+        Ok(match self {
+            Self::Key => Stated::Other,
+            _ => Stated::Unsigned(value.into()),
+        })
+    }
+
+    fn visit_char<E>(self, _: char) -> Result<Stated, E> {
+        Ok(Stated::Other)
+    }
+
+    fn visit_bytes<E: Error>(self, bytes: &[u8]) -> Result<Stated, E> {
+        match (str::from_utf8(bytes), self) {
+            (Ok(text), _) => self.visit_str(text),
+            // Bytes that are no text are a key of the entry's own.
+            (Err(_), Self::Key) => Ok(Stated::Key(Key::Other)),
+            (Err(_), _) => Ok(Stated::Other),
+        }
+    }
+
+    fn visit_none<E>(self) -> Result<Stated, E> {
+        Ok(Stated::Null)
+    }
+
+    fn visit_some<D: Deserializer<'de>>(self, source: D) -> Result<Stated, D::Error> {
+        Ok(match source.deserialize_any(Self::Rest)? {
+            Stated::Unsigned(age) => Stated::Present(age),
+            _ => Stated::Other,
+        })
+    }
+
+    fn visit_newtype_struct<D: Deserializer<'de>>(self, source: D) -> Result<Stated, D::Error> {
+        source.deserialize_any(Self::Rest).map(|_| Stated::Other)
+    }
+
     fn visit_seq<A: SeqAccess<'de>>(self, mut list: A) -> Result<Stated, A::Error> {
         match self {
             Self::Values => {
@@ -307,7 +360,7 @@ impl<'de> Visitor<'de> for Read {
             Self::Entry => {
                 let mut fields = Fields::default();
                 let mut place = 0;
-                while let Some(stated) = list.next_element_seed(Key::at(place).place())? {
+                while let Some(stated) = list.next_element_seed(fields.place(Key::at(place)))? {
                     fields.take(Key::at(place), stated);
                     place += 1;
                 }
@@ -338,7 +391,7 @@ impl<'de> Visitor<'de> for Read {
                     Key::Other
                 }
             };
-            fields.take(key, entry.next_value_seed(key.place())?);
+            fields.take(key, entry.next_value_seed(fields.place(key))?);
         }
         Ok(fields.named())
     }
