@@ -96,7 +96,8 @@ impl Blocks for Held {
             view.clear();
         }
         // The one routine that empties a rank says so, whoever asked: a
-        // resync, the cursor, the worker reported gone.
+        // resync, the cursor, the worker reported gone, a lent body that
+        // unwound.
         self.emptied = emptying();
     }
 }
@@ -245,15 +246,13 @@ fn hear_written(held: &Held, wrote: bool) {
     }
 }
 
-/// Run one batch's header through `cursor`, with `clears` the fact that
-/// the batch carries the engine's own clear. `Ok` where the batch is
+/// Run one batch's header through `cursor`. `Ok` where the batch is
 /// admitted, with the reason when the cursor emptied the rank ahead of it.
 /// `Err` with the batch's outcome where it is not.
 fn admitted<B: Blocks>(
     cursor: &mut RankCursor,
     blocks: &mut B,
     facts: BatchFacts,
-    clears: bool,
 ) -> Result<Option<ResyncReason>, BatchOutcome> {
     if let Some(chunk) = facts.snapshot {
         // A chunk only adds: the snapshot's start was said to the row, by
@@ -261,7 +260,7 @@ fn admitted<B: Blocks>(
         cursor.resync_to(facts.sequence, chunk.unknown_before);
         return Ok(None);
     }
-    match cursor.admit(facts.sequence, clears) {
+    match cursor.admit(facts.sequence, facts.clears) {
         BatchAdmission::Stale => Err(BatchOutcome::Skipped),
         BatchAdmission::Replay { expected } => Err(BatchOutcome::Gap {
             expected,
@@ -389,19 +388,16 @@ struct Table {
 }
 
 /// The resync reasons, counted apart.
-const REASONS: usize = 9;
+const REASONS: usize = 6;
 
 const fn slot(reason: ResyncReason) -> usize {
     match reason {
         ResyncReason::OutOfRange => 0,
         ResyncReason::DataLoss => 1,
-        ResyncReason::StreamEnded => 2,
-        ResyncReason::SnapshotAbandoned => 3,
-        ResyncReason::RelayRestart => 4,
-        ResyncReason::EngineReplaced => 5,
-        ResyncReason::PublisherRestart => 6,
-        ResyncReason::GapCleared => 7,
-        ResyncReason::Snapshot => 8,
+        ResyncReason::SnapshotAbandoned => 2,
+        ResyncReason::PublisherRestart => 3,
+        ResyncReason::GapCleared => 4,
+        ResyncReason::Snapshot => 5,
     }
 }
 
@@ -545,7 +541,7 @@ impl KvTables {
             return BatchOutcome::Skipped;
         };
         *heard = true;
-        let emptied = match admitted(cursor, held, facts, facts.clears) {
+        let emptied = match admitted(cursor, held, facts) {
             Ok(emptied) => emptied,
             Err(outcome) => return outcome,
         };
