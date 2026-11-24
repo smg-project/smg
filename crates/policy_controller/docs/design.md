@@ -295,6 +295,8 @@ error names the first difference. A supplied document that binds no single reque
 single request, in any gateway. For a prefill-decode mode of one router over HTTP that is the
 token count.
 
+A gateway reads the supplied file by the crate's one read of a document (`Format::read`), the read an apply and a controller's file pass. A file named `.json` is read as JSON, any other name as YAML (`Format::of`). A YAML document reads as JSON does: text that looks like a number, a boolean or a null is written in quotes, a key with nothing under it is refused where a list or a map stands, and a tag is refused. A refusal names the field by its path, or the line and column where the file itself does not read.
+
 ### 3.4 A validated document
 
 Validation turns a `PolicySpec` into an `AppliedSpec`. An `AppliedSpec` holds the built profiles
