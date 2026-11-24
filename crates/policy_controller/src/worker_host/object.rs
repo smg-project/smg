@@ -116,6 +116,13 @@ pub(super) fn thresholds(overload: &Overload) -> OverloadUpdate {
     }
 }
 
+/// Whether `facts` state the external runtime: an endpoint of another
+/// party's API. A host's default thresholds are no such row's
+/// ([`Objects::with_overload_thresholds`](super::Objects::with_overload_thresholds)).
+pub(super) fn external(facts: &WorkerFacts) -> bool {
+    facts.engine_kind.parse() == Ok(smg_worker::worker::RuntimeType::External)
+}
+
 /// The store's role for a worker object.
 pub(super) fn role(worker_type: WorkerType) -> Role {
     Role::from(worker_type)

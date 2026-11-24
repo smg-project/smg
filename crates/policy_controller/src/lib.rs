@@ -202,15 +202,9 @@ pub mod worker_host;
 ///   the workers the count-first picker passed over;
 /// - the first value of the seed's stream: the seed a pair plan hands its
 ///   decode side, whose stages derive their streams from it as above;
-/// - the seed under the store's two naming masks: where the store names a
-///   decision's rows and cuts a list at the profile's sample, the holders'
-///   draw and the warming rows' draw;
-/// - the first value of the holders' stream, and of each stream so seeded:
-///   the seed of each lookup a naming makes again, a stream a round;
-/// - the first value of the seed under the store's mask for refused
-///   holders, and of each stream so seeded: the seed of each lookup a
-///   naming makes again past a cap of holders the pass refused, a stream a
-///   round.
+/// - the seed under the two naming masks: where a decision's rows are named
+///   and a list is cut at the profile's sample, the holders' draw and the
+///   warming rows' draw.
 #[derive(Clone, Copy, Debug)]
 pub struct Draw(u64);
 

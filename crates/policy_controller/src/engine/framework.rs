@@ -20,7 +20,7 @@ use crate::{
         sticky_sessions::{self, Claim, SessionRule, SessionTable, SessionVerdict},
         view::{
             mean_in_flight, AffinityFacts, AffinityRows, Candidate, Constraints, LoadReportCutoff,
-            Phase, PoolFacts, RequestFacts, WorkerId,
+            Phase, PoolFacts, RequestFacts, Session, WorkerId,
         },
         warm_up::WarmUpRule,
     },
@@ -384,7 +384,8 @@ pub trait Scorer: Lifecycle + Debug {
 
     /// Whether this scorer says what a pick's first target holds of its
     /// request ([`Self::said`]); the default is no. No entry of the engine
-    /// reads it: none states a pick's overlap.
+    /// reads it: an entry states a pick's overlap itself, from the rows the
+    /// decision was given ([`Pick::overlap`]).
     fn states_overlap(&self) -> bool {
         false
     }
@@ -395,8 +396,9 @@ pub trait Scorer: Lifecycle + Debug {
     /// call, so a second row asked of the same decision may read no margin
     /// held. The default says nothing.
     ///
-    /// No entry of the engine asks it: a pick's overlap reads as not stated
-    /// ([`Pick::overlap`]).
+    /// No entry of the engine asks it: an entry states a pick's overlap
+    /// itself, from the rows the decision was given ([`Pick::overlap`]),
+    /// and not by this word.
     fn said(&self, _facts: &RequestFacts<'_>, _candidates: &[Candidate], _row: u32) -> Overlap {
         Overlap::default()
     }
@@ -966,10 +968,11 @@ impl Profile {
             Some(tests) => Held::Folded(tests),
             None => Held::Called,
         };
+        let needs = self.needs();
         NamedBy {
             cap,
             rule,
-            sent: cap > 0 && self.needs().sent_prefixes,
+            sent: needs.affinity && needs.sent_prefixes,
             sent_alone: self.reads_sent_alone(),
             held,
         }
@@ -3175,8 +3178,9 @@ enum Pattern<'a> {
 /// affinity column's place: the cap of each list
 /// ([`Engine::affinity_rows_cap`]), the one ruling of the warming rows
 /// ([`Engine::warm_up_rule_for`]), and the record of sent prefixes, whether
-/// its holders are named ([`Engine::reads_sent_for`]) and whether ahead
-/// of the index's ([`Engine::reads_sent_alone_for`]). A naming that
+/// the profile's pool keeps it ([`Engine::reads_sent_for`]) and whether
+/// its holders are named ahead of the index's
+/// ([`Engine::reads_sent_alone_for`]). A naming that
 /// fills its cap is held to a test of the profile's own too
 /// ([`Engine::keeps_for`]). Every input of a naming that is a profile's
 /// own stands here: two profiles are named the same rows where
@@ -3188,8 +3192,9 @@ pub(crate) struct NamedBy {
     /// The one ruling its warm-up stages rule by: `None` where it holds
     /// no such stage, and where two of them rule by different numbers.
     rule: Option<WarmUpRule>,
-    /// Whether the record of sent prefixes names holders for it: a stage
-    /// of it reads them, and it is named rows.
+    /// Whether its pool keeps the record of sent prefixes for it: a stage
+    /// of it reads them, in the rows it is named or in the column it is
+    /// handed whole.
     sent: bool,
     /// Whether it reads a request's holders from the record of sent
     /// prefixes alone: a scorer of it reads the record and none reads the
@@ -3307,6 +3312,9 @@ impl ShadowRows {
         };
         let column = needs.get(shadow).is_some_and(|needs| needs.affinity);
         match (live.cap, by.cap) {
+            // A shadow that reads the record in the column it is handed
+            // whole: the pool of a live profile that reads none keeps none.
+            (0, 0) if by.sent && !live.sent => Self::Apart,
             // Neither is named a row: both read the view as it is handed.
             (0, 0) => Self::Same,
             // The live profile alone is named rows. A shadow that reads
@@ -3319,7 +3327,7 @@ impl ShadowRows {
             // The shadow profile is named rows of its own. The pool's
             // warming rows are of one ruling and its record of one
             // profile: the live one's. A live profile that is named no
-            // row reads no record, so the record is left to the shadow
+            // row and reads no record leaves the record to the shadow
             // there, and the ruling too where that profile rules by
             // none. The record is the model's, though, under one bound:
             // entries kept for a shadow never stand under the bound a
@@ -3328,7 +3336,7 @@ impl ShadowRows {
             (live_cap, _) => {
                 let left = live_cap == 0;
                 let ruled = live.rule == by.rule || (left && live.rule.is_none());
-                let recorded = if left {
+                let recorded = if left && !live.sent {
                     !(by.sent && beside())
                 } else {
                     (live.sent, live.sent_alone) == (by.sent, by.sent_alone)
@@ -5580,9 +5588,9 @@ impl Engine {
     }
 
     /// Whether the profile a decision resolves to reads sent prefixes: a
-    /// stage of it reads them, and its decisions are named rows
-    /// ([`Self::affinity_rows_cap`]). A profile that is named no row reads no
-    /// holder, so its pool keeps no record. The answer is of what the
+    /// stage of it reads them, in the rows its decisions are named
+    /// ([`Self::affinity_rows_cap`]) or, where it is named no row, in the
+    /// column it is handed whole. The answer is of what the
     /// build kept: a membership write asks it of every pool, and no stage
     /// is asked again.
     pub(crate) fn reads_sent_for(&self, model: &str, phase: Phase) -> bool {
@@ -5612,8 +5620,8 @@ impl Engine {
     /// is the live profile's word ([`Self::reads_sent_for`],
     /// [`Self::reads_sent_alone_for`]) and, where that profile is named
     /// no row and its binding's shadow is named rows of its own, the
-    /// shadow profile's. A live profile that is named no row reads no
-    /// holder, so the record its pool keeps moves nothing it is handed.
+    /// shadow profile's. A live profile that is named no row and reads
+    /// no sent prefix reads nothing of the record its pool keeps there.
     /// A document that names no such shadow keeps none there. A shadow
     /// is named no such rows where a live profile reads the record of
     /// the same model ([`live_reader_beside`]): the entries kept for a
@@ -5674,9 +5682,10 @@ impl Engine {
 
     /// Whether the profile a decision of `phase` for `model` resolves to
     /// reads affinity by its own stages: the word of [`Self::needs_for`]
-    /// less the binding's shadow profile and its sessions rule. `false`
-    /// where no binding matches. A pick's overlap is stated by this word:
-    /// rows a host names for a shadow alone say nothing of the live pick.
+    /// less the binding's shadow profile, its sessions rule and, for a
+    /// decode decision, the model's pair binding. `false` where no binding
+    /// matches. A pick's overlap is stated by this word: rows a host names
+    /// for a shadow alone say nothing of the live pick.
     #[cfg(feature = "in-process")]
     pub(crate) fn profile_reads_affinity(&self, model: &str, phase: Phase) -> bool {
         self.resolve(model, phase)
@@ -6314,7 +6323,10 @@ impl Engine {
     /// routable pin is placed by the stages. The stages are the profile's own
     /// under `delegate`, else the assignment's, and `placing` names which:
     /// the binding's placing assignment, not the rule's declared one. The
-    /// pin is written by the dispatch (`on_dispatched`), never here.
+    /// pin is written by the dispatch (`on_dispatched`). Two writes come
+    /// ahead of it here, the live decision's alone: a key with no routable
+    /// pin claims the worker it is placed on, and a pin at the cap moves to
+    /// the worker a respill takes ([`Self::moved`]).
     ///
     /// `KEPT` is the form of a profile that places by the session key, under
     /// a binding that steers ([`Engine::keep`]): the pin's test reads the
@@ -6412,7 +6424,7 @@ impl Engine {
                 if let Some(respilled) = self.respill(
                     profile, index, rule, placing, facts, pool, candidates, cx, buf, c.id,
                 ) {
-                    return respilled;
+                    return self.moved::<WRITE_SESSIONS>(key, respilled);
                 }
             }
             let mut targets = Targets::new();
@@ -6491,7 +6503,7 @@ impl Engine {
                             profile, index, rule, placing, facts, pool, set, cx, buf, all_vetoed,
                             first,
                         ) {
-                            return handed;
+                            return self.moved::<WRITE_SESSIONS>(key, handed);
                         }
                     }
                     return decision;
@@ -6557,7 +6569,7 @@ impl Engine {
                                     profile, index, rule, placing, facts, pool, set, cx, buf,
                                     all_vetoed, owner,
                                 ) {
-                                    return handed;
+                                    return self.moved::<WRITE_SESSIONS>(key, handed);
                                 }
                             }
                         }
@@ -6566,6 +6578,30 @@ impl Engine {
             }
         }
         decision
+    }
+
+    /// A respill's move, written where the request is decided: the worker a
+    /// pin at its cap hands the key on to leads the key's pins from this
+    /// decision on ([`SessionTable::respilled`]), ahead of the request's
+    /// dispatch. A gateway's sticky map moves a pin where it selects the
+    /// worker, so the key's next request, decided ahead of that dispatch,
+    /// follows the move there too. The live decision's alone: with
+    /// `WRITE_SESSIONS` off the decision is a shadow's and writes no pin.
+    /// A placement on the pin again, and one on another worker at the cap,
+    /// move no pin ([`Self::respill`]). `key` is the key the decision
+    /// looked up.
+    #[inline]
+    fn moved<const WRITE_SESSIONS: bool>(&self, key: Session, handed: Decision) -> Decision {
+        if WRITE_SESSIONS {
+            if let Decision::Pick(pick) = &handed {
+                if pick.session_verdict == SessionVerdict::Respill {
+                    if let Some(first) = pick.targets.first() {
+                        self.sessions.respilled(key, first.id);
+                    }
+                }
+            }
+        }
+        handed
     }
 
     /// A request of a profile whose picker leaves the placement to the
@@ -6639,9 +6675,10 @@ impl Engine {
     /// may move, not where a request may go. A placement on `pin` again is
     /// the pin taken ([`SessionVerdict::Pinned`]), and the decision names no
     /// other target: at the cap a pin moves by a respill alone. One on
-    /// another worker under the cap is marked [`SessionVerdict::Respill`],
-    /// and its commit fronts that worker, whichever of its targets it lands
-    /// on: a respill's alternates are the workers under the cap alone. One on
+    /// another worker under the cap is marked [`SessionVerdict::Respill`].
+    /// The live decision fronts that worker at once ([`Self::moved`]), and
+    /// its commit fronts the worker it lands on, whichever of its targets:
+    /// a respill's alternates are the workers under the cap alone. One on
     /// another worker at the cap carries no verdict: its commit moves no
     /// pin. `None` where no survivor stands. A pin the decision follows
     /// asks in its form's order ([`Self::hand_on`]).
@@ -8465,6 +8502,14 @@ mod tests {
         // Prefill workers: no key is kept over them.
         let mut prefill = with(|row| row.role = Role::Prefill);
         prefill[1].health.overloaded = true;
+        // Nor over decode or encode workers: every role but the regular
+        // one passes the key on, as the gateway's own placement asks that
+        // every candidate is a regular worker (`select_pass`, at main
+        // `450084124`, `model_gateway/src/routers/common/placement.rs:1337`).
+        let mut decode = with(|row| row.role = Role::Decode);
+        decode[1].health.overloaded = true;
+        let mut encode = with(|row| row.role = Role::Encode);
+        encode[1].health.overloaded = true;
         let plain = RequestFacts {
             model: "m",
             ..RequestFacts::default()
@@ -8578,6 +8623,8 @@ mod tests {
                 &prefill,
                 false,
             ),
+            ("kept, decode workers", None, true, &keyed, &decode, false),
+            ("kept, encode workers", None, true, &keyed, &encode, false),
         ];
         let cx = &Constraints::default();
         for (path, sessions, keeps, facts, rows, pinned) in paths {
@@ -8603,9 +8650,9 @@ mod tests {
                 .expect("a shadow decision");
             assert_eq!(said(&shadow), said(&live), "{path}");
             assert_eq!(shadow.trace().profile, 1, "{path}");
-            // The prefill worker over its thresholds passes the key on: a
-            // kept key would take it.
-            if rows[0].role == Role::Prefill {
+            // A worker of another role over its thresholds passes the key
+            // on: a kept key would take it.
+            if rows[0].role != Role::Single {
                 assert_eq!(said(&live).0, [free[0].id], "{path}");
             }
             if !facts.session_key.is_none() {
@@ -8660,9 +8707,10 @@ mod tests {
         assert_eq!(first_of(&shadow), Some(rows[1].id));
     }
 
-    /// A respill's commit fronts the worker it landed on. The shadow asked
-    /// behind it still reads the pin at its cap, and hands the key on by its
-    /// own stages.
+    /// A live respill fronts the worker it takes where it is decided, and
+    /// its commit fronts the worker it landed on. The shadow asked behind
+    /// it still reads the pin at its cap, and hands the key on by its own
+    /// stages: a respill of its own, which moves no pin.
     #[test]
     fn shadow_behind_a_respills_commit_hands_the_key_on_by_its_own_stages() {
         let engine = with_shadow(by_sessions(), Some(SESSIONS));
@@ -8682,15 +8730,20 @@ mod tests {
             live.pick().map(|pick| pick.session_verdict),
             Some(SessionVerdict::Respill)
         );
+        let moved = Some([rows[1].id, rows[0].id]);
+        let pins = || engine.sessions().pins(facts.session());
+        assert_eq!(pins(), moved, "ahead of the live commit");
         assert_eq!(commit(&engine, &facts, &live, 0), rows[1].id);
-        assert_eq!(
-            engine.sessions().pins(facts.session()),
-            Some([rows[1].id, rows[0].id])
-        );
+        assert_eq!(pins(), moved);
         let shadow = engine
             .shadow(&facts, &pool, &rows, &cx, &mut scratch)
             .expect("a shadow decision");
         assert_eq!(first_of(&shadow), Some(rows[2].id));
+        assert_eq!(
+            shadow.pick().map(|pick| pick.session_verdict),
+            Some(SessionVerdict::Respill)
+        );
+        assert_eq!(pins(), moved, "the shadow's respill moves no pin");
     }
 
     /// A claim's commit on an alternate withdraws the claim and fronts the
@@ -9639,7 +9692,9 @@ mod tests {
     /// shadow keeps none there.
     #[test]
     fn a_pool_keeps_the_record_for_its_shadow_where_the_live_profile_is_named_no_row() {
-        use crate::document::spec::{AffinitySource, PrefixAffinityParams, ScoreStage, ShadowSpec};
+        use crate::document::spec::{
+            AffinitySource, PrefixAffinityParams, ScoreStage, ShadowSpec, WarmupSliceParams,
+        };
         let aware = PolicySpec::preset("cache_aware").expect("a preset");
         let second = aware.profiles.values().next();
         let second = second.expect("the preset's profile").clone();
@@ -9669,6 +9724,37 @@ mod tests {
         document.profiles.insert("second".into(), by_record);
         let engine = document.validate().expect("a binding with a shadow");
         assert_eq!(engine.pool_record_for("m", Phase::Single), Some(true));
+
+        // A live profile that is named no row and reads the record keeps
+        // it by its own word: here two warm-up stages of different
+        // windows leave it the column whole. A shadow that reads the
+        // record another way is not named rows of its own beside it.
+        let aware = PolicySpec::preset("cache_aware").expect("a preset");
+        let live = aware.profiles.into_values().next();
+        let mut live = live.expect("the preset's profile");
+        let slice = WarmupSliceParams {
+            weight: 1.0,
+            secs: Some(7),
+            ..WarmupSliceParams::default()
+        };
+        live.score.push(ScoreStage::WarmupSlice(slice).into());
+        document.profiles.insert("live".into(), live.clone());
+        let unread = document.bindings[0].profile.replace("live".into());
+        let engine = document.validate().expect("a live profile named no row");
+        assert_eq!(engine.affinity_rows_cap("m", Phase::Single), 0);
+        assert_eq!(engine.pool_record_for("m", Phase::Single), Some(false));
+        let rows = engine.shadow_for("m", Phase::Single);
+        assert_eq!(rows.map(|(_, rows)| rows), Some(ShadowRows::Apart));
+
+        // That profile as the shadow of one that reads no record: its
+        // pool keeps none, so the shadow is not asked over a column that
+        // lacks the record it would read live.
+        document.profiles.insert("second".into(), live);
+        document.bindings[0].profile = unread;
+        let engine = document.validate().expect("a shadow named no row");
+        assert_eq!(engine.pool_record_for("m", Phase::Single), None);
+        let rows = engine.shadow_for("m", Phase::Single);
+        assert_eq!(rows.map(|(_, rows)| rows), Some(ShadowRows::Apart));
     }
 
     /// A model keeps one record of sent prefixes under one bound. A
@@ -14621,7 +14707,9 @@ mod tests {
     /// A respill's commit fronts the worker it lands on, the first target or
     /// an alternate behind it. So no worker at the cap stands among a
     /// respill's targets: the pinned worker and a peer at the cap leave the
-    /// list, and an alternate's dispatch moves the pin under the cap.
+    /// list, and an alternate's dispatch moves the pin under the cap. The
+    /// alternate then leads, and the worker the decision first took, which
+    /// it fronted where it was made, stands behind it.
     #[test]
     fn a_respill_names_no_alternate_at_the_cap() {
         let engine = session_engine(SESSIONS);
@@ -14651,12 +14739,62 @@ mod tests {
             ..Lease::default()
         };
         engine.on_dispatched(&lease, &alternate, Side::Single, 0);
+        let first = pick.targets.as_slice()[0];
+        assert_eq!(
+            engine.sessions().pins(session(7)),
+            Some([alternate.id, first.id]),
+            "the alternate, then the worker first taken"
+        );
         pool[0].session_in_flight = 0;
         assert_eq!(
             place_keyed(&engine, &pool, 7, 30).position,
             3,
             "the pin moved under the cap"
         );
+    }
+
+    /// A respill fronts the worker it takes where it is decided, ahead of
+    /// its dispatch: the key's next request follows the move under the cap,
+    /// as a gateway's sticky map moves a pin where it selects the worker.
+    /// The commit on that worker finds the pins in place.
+    #[test]
+    fn a_respill_fronts_its_worker_where_it_is_decided() {
+        let engine = session_engine(SESSIONS);
+        let mut pool = vec![candidate(0, 0), candidate(1, 1), candidate(2, 2)];
+        let home = place_keyed(&engine, &pool, 7, 10);
+        assert_eq!(home.position, 0);
+        let pins = || engine.sessions().pins(session(7));
+        // The pin at the cap and the busiest, and every other worker at the
+        // cap too: the placement carries no verdict and moves no pin.
+        pool[0].in_flight = 9;
+        for row in &mut pool {
+            row.session_in_flight = 2;
+        }
+        let over = decide_keyed(&engine, &pool, 7, 15);
+        let pick = over.pick().expect("a placement at the cap");
+        assert_eq!(pick.session_verdict, SessionVerdict::None);
+        assert_eq!(pins(), Some([home.id, WorkerId(0)]), "no verdict");
+        // The others under the cap: the respill takes the second row.
+        (pool[1].session_in_flight, pool[2].session_in_flight) = (0, 0);
+        let respill = decide_keyed(&engine, &pool, 7, 20);
+        let pick = respill.pick().expect("the respill places");
+        assert_eq!(pick.session_verdict, SessionVerdict::Respill);
+        let taken = *pick.targets.first().expect("a target");
+        assert_eq!(taken.position, 1);
+        assert_eq!(pins(), Some([taken.id, home.id]), "ahead of its dispatch");
+        // The key's next request, decided ahead of that dispatch.
+        let next = decide_keyed(&engine, &pool, 7, 30);
+        let pick = next.pick().expect("a pick");
+        assert_eq!(pick.session_verdict, SessionVerdict::Pinned);
+        assert_eq!(pick.targets.first().map(|target| target.id), Some(taken.id));
+        let lease = Lease {
+            session: session(7),
+            session_verdict: SessionVerdict::Respill,
+            issued_micros: 20,
+            ..Lease::default()
+        };
+        engine.on_dispatched(&lease, &taken, Side::Single, 0);
+        assert_eq!(pins(), Some([taken.id, home.id]), "behind its dispatch");
     }
 
     /// The pin taken again at the cap is the decision's one target. A

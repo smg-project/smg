@@ -868,13 +868,21 @@ the request states, and a request with items is refused under `wires` where the 
 encoders and none serves one. The pair's two lists are refused as a pair's are.
 The other inputs are honoured by the old engine only.
 A request that states places of its list (`Constraints::places`) is refused too, and the refusal
-names `places`, where the request is a pair: one list of places cannot hold a pair's two lists
-(5.8). A single request that states places is decided among them.
+names `places`, where the request is a pair or an encode request: one list of places cannot hold
+a pair's two lists, or an encode request's three. A single request that states places is decided
+among them.
 
 A pair's host states each list's places beside its two lists (`PairLists::prefill_places`,
-`PairLists::decode_places`), and each side is decided among its own. `EncodeLists::decide` refuses
-lists whose pair states places, under the same name: the encode pass decides its pair over the
-workers it admits for the items and reads no place.
+`PairLists::decode_places`), and each side is decided among its own. An encode request's host
+states its encoders' places as well (`EncodeLists::encoders_places`). The encode pass decides its
+pair over the workers it admits for the items, and numbers each side's places with them as it
+numbers a mask: a place whose worker it left out opens none. An item's encoder is one at the
+encoders' places, and a prefill that only other encoders hand to is not the pair's. Where a list's
+places name workers and none of them takes the request, though a worker outside them does, the
+request is shed under `places`: it is held off every worker that takes it. No gap of the membership
+says that, and the gaps stay read over every worker. Places that name no worker of a list are no
+such case. Such places of a side shed the request as they shed its pair alone, and such places of
+the encoders shed it as a list with no open encoder does.
 A pair's host states its standing vetoes the same way, the places each list's vetoes mask and those
 a hold stands on (`PairLists::prefill_stalled`, `prefill_held`, `decode_stalled`, `decode_held`).
 Each side reads its own, under an encode request too, and a pair's or an encode request's own mask
@@ -1008,6 +1016,8 @@ On main three pickers say so: round robin, `random` and `passthrough`.
   encode request's over its three.
 
 A decision that panics is caught, counted and answered as refused. It never takes the host down.
+A stage that panics at a word of a lease, its issue among them, is held and counted apart: the
+request keeps its decision and its lease.
 
 A request whose host hands no list (`WorkerLists::None`) is decided over no worker: it is shed
 with no endpoint under the stage `none`, and its trace names no profile. A controller hands none
@@ -1046,8 +1056,8 @@ The types the two engines shared stay where they were moved ahead of the deletio
 ### 5.8 What changes in the kept engine **[planned]**
 
 - It honours what it refuses today: an encode request's pair held to some workers of its two
-  lists (`PairLists::decide` keeps a pair to the positions its host states, and a single
-  request states the positions of its list in `Constraints::places` and is decided, which is
+  lists, and its encoders held to some of theirs (`EncodeLists::decide` decides the request
+  among the places its host states for each of the three lists, section 5.4, which is
   built); an encode request's demands (a single request's and a pair's are kept, which is built).
 - The request fields that only the old engine's host fills leave with it. `pinned_at`,
   `lent_in_flight` and `model_fingerprint` have yet to go.
@@ -1140,7 +1150,7 @@ What an event does:
 
 | Event | What the stages do with it |
 |---|---|
-| Dispatched | the session's pin follows the worker the request went to; each profile counts what it sent since the worker's last load report; scorers and pickers that asked hear it. A pick a sessions rule keeps from the profile moves the pin alone |
+| Dispatched | the session's pin follows the worker the request went to; each profile counts what it sent since the worker's last load report; scorers and pickers that asked hear it. A pick a sessions rule keeps from the profile moves the pin alone. A pin at its rule's cap moved already, where the request that met the cap was decided, to the worker it was placed on: the dispatch finds it there, or fronts the later target the request went to |
 | Completed | scorers and pickers that asked hear the outcome (status, time to first token, tokens in and out, duration) |
 | Released | the same stages hear the reason |
 
@@ -1837,7 +1847,7 @@ Its data is one in-memory store (`store/memory.rs`):
 | Data | Filled by | Note |
 |---|---|---|
 | worker records | the `RegisterWorker`, `PatchWorker`, `DeregisterWorker` calls | discovery is in the code behind a feature the image leaves out, and registers nothing yet |
-| worker objects | a task that follows the worker records | a second form of the same workers, of the worker crate's type; each states its registration's overload thresholds over one default, 8 queued requests and 0.8 usage, and the load monitor judges by them while the replica leads; an object's status follows its record's, and a single request's decision reads the workers here |
+| worker objects | a task that follows the worker records | a second form of the same workers, of the worker crate's type; each states its registration's overload thresholds over one default, 8 queued requests and 0.8 usage, an external record's over none, and the load monitor judges by them while the replica leads; an object's status follows its record's, and a single request's decision reads the workers here |
 | health | the worker crate's health checker over the worker objects, on the leader | copied into the records |
 | loads | the worker crate's load monitor over the worker objects, every 10 seconds while the replica leads | `PushLoad` is not served; a single request's decision is given the monitor's snapshot where the document reads reports and keeps none; the store's load table is written by nothing |
 | cache index | a follower of each worker's cache events | an index of the store's own; `PushKvEvents` is not served; a single request's decision reads none yet, only the engine's own record of sent prompts |
@@ -1883,7 +1893,7 @@ the worker crate's structures, and the one engine.
 | workers | records in the store, and worker objects kept in step with them | worker objects in a worker-crate registry; beside each, the code that keeps the objects holds what a registration stated and the object does not hold as stated (10.3); the membership log that watchers and standbys read stays |
 | lists | the store's published copy; a single request's decision reads the registry's published list of the model's single workers, a pair's, at its prefill and at its decode call, the lists of its two sides, and a prefill or a decode request that stands alone the list of its own phase's workers | the registry's published lists by role and protocol, with the engine's value beside each (decision 10) |
 | health | the worker crate's health checker over the worker objects, on the leader; each outcome is copied into the store's record, an object's status follows its record's, and a decision reads the object's | the same checker; a decision reads the object's own status; a gateway's veto on a worker stays in the store |
-| loads | the worker crate's load monitor over the worker objects, while the replica leads: a decision is given its snapshot where the document reads reports and keeps none, and reads the overload verdict on the object; the crate's own poller runs no more, and the store's load table is written by nothing and read by no decision | the worker crate's load monitor, publishing `LoadSnapshot` (decision 10). Every worker is judged by the thresholds its object states, so the loads of every worker the controller dials are read: no new cost against classic, whose gateway hands every worker the same two defaults |
+| loads | the worker crate's load monitor over the worker objects, while the replica leads: a decision is given its snapshot where the document reads reports and keeps none, and reads the overload verdict on the object; the crate's own poller runs no more, and the store's load table is written by nothing and read by no decision | the worker crate's load monitor, publishing `LoadSnapshot` (decision 10). Every worker is judged by the thresholds its object states, so the loads of every worker the controller dials are read: no new cost against classic as it runs by default, whose gateway hands each worker of an engine the same two defaults and an external worker none at its registration, as a controller's objects state them. A gateway started with `--disable-load-monitoring` polls by need, and this monitor polls every group |
 | cache events | an index of the store's own; a decision reads none yet | the kv-index crate's index, filled by the worker crate's collector |
 | sessions | the engine's session table for a single request, one for each document | the engine's session table |
 | leases | the store's lease tables, in memory, one for each deciding thread | stay: a controller must remember what it issued to gateways |
@@ -1972,7 +1982,7 @@ read back (step 1 below). Of the 24 facts a registration states:
 | the wire modes | the one protocol the object speaks | the other protocols of the set |
 | the engine's kind | the runtime the worker crate reads the name as | a name that crate does not know, and a known name as it was written |
 | the health policy | the checks in whole seconds, off where the controller cannot dial the worker | a part of a second, and the policy of a worker built with its checks off |
-| the overload thresholds | where a program asks for them, as the controller's does, the worker's own over the program's defaults | which of them the worker stated |
+| the overload thresholds | where a program asks for them, as the controller's does, an engine's worker's own over the program's defaults and an external worker's own alone | which of them an engine's worker stated |
 | the drain window | the window in force | a window stated equal to the object's default, which reads back as none |
 
 - Ten are not carried to the worker object: the incarnation, the zone, the pairing facts, the

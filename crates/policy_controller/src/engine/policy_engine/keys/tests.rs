@@ -345,6 +345,48 @@ fn a_key_over_prefill_workers_passes_an_owner_over_its_thresholds() {
     }
 }
 
+/// A list of decode workers and a list of encode workers pass the key on as
+/// a list of prefill workers does: every role but the regular one counts,
+/// on the ring the caller lends and on the stage's own.
+///
+/// The gateway's own placement lifts the overload veto for a key only
+/// where every candidate's type is the regular one (`select_pass`, at main
+/// `450084124`, `model_gateway/src/routers/common/placement.rs:1337`).
+#[test]
+fn a_key_over_decode_or_encode_workers_passes_an_owner_over_its_thresholds() {
+    for role in [WorkerType::Decode, WorkerType::Encode] {
+        let engine = preset("consistent_hashing");
+        let list: Arc<[Arc<dyn Worker>]> = (0..8)
+            .map(|at| {
+                let url = format!("http://other-{at}:8000");
+                let worker = worker_with_model_aliases(&url, MODEL, &[], role);
+                worker.set_status(WorkerStatus::Ready);
+                worker
+            })
+            .collect();
+        let members = PublishedList::new(Arc::clone(&list));
+        let ring = InOrder(list.iter().map(|worker| worker.url().to_owned()).collect());
+        let places = |lent: bool| -> Vec<u32> {
+            let mut asks = keyed(9, &members);
+            if lent {
+                asks.request.facts.ring = Some(&ring);
+                asks.request.facts.ring_positions = &[0];
+            }
+            let decision = decided(&engine, &asks).decision;
+            let trace = &decision.pick().expect("a pick").trace;
+            assert!(!lent || trace.drew_first(), "a pass over the list ran");
+            targets(&decision).iter().map(|&(place, _)| place).collect()
+        };
+        for lent in [true, false] {
+            let free = places(lent);
+            let owner = &list[free[0] as usize];
+            owner.set_overloaded(true);
+            assert_eq!(places(lent)[0], free[1], "{role:?}, ring lent: {lent}");
+            owner.set_overloaded(false);
+        }
+    }
+}
+
 /// A worker that leaves a list stays a member of the ring stage's own ring
 /// until its host says it is gone ([`PolicyEngine::forget`]): a list
 /// published without it tells that ring nothing. It changes no answer:

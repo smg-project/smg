@@ -508,15 +508,6 @@ impl PairClasses {
         PairTable::new(&self.ends, &self.listed)
     }
 
-    /// Write the table into `ends` and `listed`, each cleared first: a
-    /// pair build hands a decision the table with its rows.
-    pub(super) fn table_into(&self, ends: &mut Vec<u32>, listed: &mut Vec<u32>) {
-        ends.clear();
-        ends.extend_from_slice(&self.ends);
-        listed.clear();
-        listed.extend_from_slice(&self.listed);
-    }
-
     /// The partner list of prefill class `class`: the decodes of the
     /// classes it pairs with, as indexes into the decodes given, in that
     /// order; empty for class `0` and for a class past the last. Built on

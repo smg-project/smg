@@ -788,6 +788,15 @@ pub(crate) const WIRES: &str = "wires";
 )]
 pub(crate) const SUBSET_HINT: &str = "subset-hint";
 
+/// The stage a request is answered under for the places it is held to
+/// ([`Constraints::places`](crate::engine::view::Constraints::places)). A
+/// pair whose own request states places is declined under it: one set of
+/// places cannot hold a pair's two lists. An encode request is shed under
+/// it where a list's places name workers and none of them takes the
+/// request, though a worker outside them does: it is held off every worker
+/// that takes it, which no gap of the membership says.
+pub(crate) const PLACES: &str = "places";
+
 /// A shed the deciders say in the engine's place, in the shape of the
 /// engine's own.
 #[cfg_attr(

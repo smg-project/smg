@@ -40,7 +40,7 @@
 //! name.
 //!
 //! **The words.** A side is told its issue once: with the prefill's
-//! ([`issue`]), or, where the request sends its decode later, at the decode
+//! ([`issue_caught`]), or, where its decode is sent later, at the decode
 //! call ([`issue_decode`]) or at the dispatch that sends the decode with no
 //! call ([`lease_events::pair`]). A decode call whose placement can send to
 //! none of its decodes gives the side up by name, and the next call, or the
@@ -84,7 +84,6 @@
 use std::{
     cell::RefCell,
     fmt,
-    panic::{catch_unwind, AssertUnwindSafe},
     sync::{atomic::Ordering, Arc},
     time::Instant,
 };
@@ -97,7 +96,7 @@ use crate::{
         decision::{shed, Decision, ShedReason, Target, SUBSET_HINT, WIRES},
         decision_engine::{DecideOutcome, HeldDecision, Leased, Request},
         demands::{Demands, UnmetDemand},
-        framework::{release, Engine, PairPools, Scratch},
+        framework::{Engine, PairPools, Scratch},
         lease_events,
         list_cell::LentList,
         pair_classes::PartnerClasses,
@@ -275,17 +274,16 @@ impl<'a> Beside<'a> {
 }
 
 impl<'a> PairLists<'a> {
-    /// The request's constraints as each side reads them where its places
-    /// are not stated: the prefills', then the decodes'. A side reads the
-    /// mask its host states beside its list and no other: a request that
-    /// states a mask of its own is declined ahead of this
-    /// ([`not_decided`]). An encode request's decision hands them to the
-    /// engine, which numbers a mask with the workers it admits for the
-    /// items.
-    pub(super) fn masked(&self, cx: &Constraints<'a>) -> [Constraints<'a>; 2] {
-        let side = |stalled, held| {
+    /// The request's constraints as each side reads them: the prefills',
+    /// then the decodes'. A side reads the places and the mask its host
+    /// states beside its list and no other: a request that states places
+    /// or a mask of its own is declined ahead of this ([`not_decided`]).
+    /// An encode request's decision hands them to the engine, which
+    /// numbers both with the workers it admits for the items.
+    pub(super) fn sides_of(&self, cx: &Constraints<'a>) -> [Constraints<'a>; 2] {
+        let side = |places, stalled, held| {
             let side = Beside {
-                places: None,
+                places,
                 stalled,
                 held,
                 unmet: None,
@@ -293,8 +291,8 @@ impl<'a> PairLists<'a> {
             side.of(cx)
         };
         [
-            side(self.prefill_stalled, self.prefill_held),
-            side(self.decode_stalled, self.decode_held),
+            side(self.prefill_places, self.prefill_stalled, self.prefill_held),
+            side(self.decode_places, self.decode_stalled, self.decode_held),
         ]
     }
 
@@ -790,22 +788,55 @@ fn decide_records(
     engine.decide_pair(facts, pool, pools, &prefill_cx, &decode_cx, scratch)
 }
 
-/// What a pair's first pick ([`PairLists::decide`]) issues: the prefill
-/// side's lease under `id`, which is the answer's lease, and the request's
-/// session under the decode phase, which its guard keeps for the decode
-/// side's words. The stages hear the prefill's issue, and the decode's
-/// behind it unless the request sends its decode `later`: such a side
-/// stands chosen and is told at its own issue ([`issue_decode`],
+/// What a pair's first pick ([`PairLists::decide`]) issues, for a first
+/// decision of `own`: the prefill side's lease under `id`, which is the
+/// answer's lease, and the request's session under the decode phase, which
+/// its guard keeps for the decode side's words ([`first_sides`]). The
+/// stages hear the prefill's issue, and the decode's behind it unless the
+/// request sends its decode `later` ([`tell_first`]): such a side stands
+/// chosen and is told at its own issue ([`issue_decode`],
 /// [`lease_events::pair`]).
 ///
+/// The two issues are told under one catch of their own
+/// ([`PolicyEngine::word_caught`]). A stage that panics at a side's issue
+/// is held and counted, as at a later word of the lease, and the stages
+/// behind it do not hear that issue, nor the decode side's where the
+/// prefill side's panicked. The pick stands: the leases are made ahead of
+/// the catch, so the decision answers its lease all the same, and its guard
+/// holds the pair as issued and tells each side's dispatch and its end. A
+/// stage that heard an issue then hears that side end.
+///
+/// A panic in the decision itself is not held here: it costs the request
+/// its decision ([`PolicyEngine::caught`]).
+///
 /// `None` for a decision that picks no pair: it issues nothing.
-pub(super) fn issue(
-    engine: &Engine,
+// In line in the one issue of a pair: as a call it costs a pair's first
+// decision about 44 instructions, counted with Callgrind.
+#[inline(always)]
+fn issue_caught(
+    own: Loaded<'_, '_>,
     facts: &RequestFacts<'_>,
     decision: &Decision,
     id: LeaseId,
     later: bool,
 ) -> Option<(Lease, Session)> {
+    let (lease, decode, session) = first_sides(facts, decision, id)?;
+    let engine = own.document.spec.engine();
+    own.word_caught(|| tell_first(engine, &lease, &decode, decision, later));
+    Some((lease, session))
+}
+
+/// The two sides of a pair's first pick, and no word to a stage: the
+/// prefill side's lease under `id`, the decode side's as it is told with
+/// the pair, and the request's session under the decode phase.
+///
+/// `None` for a decision that picks no pair.
+#[inline]
+fn first_sides(
+    facts: &RequestFacts<'_>,
+    decision: &Decision,
+    id: LeaseId,
+) -> Option<(Lease, Lease, Session)> {
     let pick = decision.pick()?;
     let first = pick.targets.first()?;
     let session = decode_session(facts);
@@ -824,11 +855,18 @@ pub(super) fn issue(
         bytes: facts.prompt_bytes,
     };
     let decode = lease_events::decode_as_issued(&lease, first, session)?;
-    engine.on_decision_issued(&lease, decision);
+    Some((lease, decode, session))
+}
+
+/// The issue of a pair's first pick told to the stages of `engine`: the
+/// prefill side's `lease`, then the `decode` side's unless the request
+/// sends its decode `later`.
+#[inline]
+fn tell_first(engine: &Engine, lease: &Lease, decode: &Lease, decision: &Decision, later: bool) {
+    engine.on_decision_issued(lease, decision);
     if !later {
-        engine.on_decision_issued(&decode, decision);
+        engine.on_decision_issued(decode, decision);
     }
-    Some((lease, session))
 }
 
 /// The decode asked again over the records of the two lists, stamped
@@ -930,12 +968,12 @@ fn decode_side(facts: &RequestFacts<'_>, decision: &Decision, prefill: &Lease) -
 }
 
 /// [`issue_decode`] for the decode call of `own`, dated at the call, under
-/// a catch of its own. A stage that panics at the side's issue is held and
-/// counted ([`PolicyEngine::unheard`]), as at a later word of the lease, and
-/// the stages behind it do not hear the issue. The pick stands: the call
-/// answers the side's lease all the same, so its guard holds the side as
-/// issued and tells its dispatch and its end. A stage that heard the issue
-/// then hears the side end.
+/// a catch of its own ([`PolicyEngine::word_caught`]). A stage that panics
+/// at the side's issue is held and counted, as at a later word of the
+/// lease, and the stages behind it do not hear the issue. The pick stands:
+/// the call answers the side's lease all the same, so its guard holds the
+/// side as issued and tells its dispatch and its end. A stage that heard
+/// the issue then hears the side end.
 ///
 /// A panic in the decision itself is not held here: it costs the call its
 /// decision, as a first decision's does.
@@ -946,15 +984,8 @@ fn issue_decode_caught(
     prefill: &Lease,
 ) -> Option<Lease> {
     let engine = own.document.spec.engine();
-    let told = || issue_decode(engine, facts, decision, prefill, facts.now_micros);
-    match catch_unwind(AssertUnwindSafe(told)) {
-        Ok(decode) => decode,
-        Err(payload) => {
-            release(payload);
-            own.unheard.fetch_add(1, Ordering::Relaxed);
-            decode_side(facts, decision, prefill)
-        }
-    }
+    let told = own.word_caught(|| issue_decode(engine, facts, decision, prefill, facts.now_micros));
+    told.unwrap_or_else(|| decode_side(facts, decision, prefill))
 }
 
 /// One decision of a pair by `own` over the `lists` its host handed, and
@@ -1023,11 +1054,13 @@ pub(super) fn decided(
 /// A pair's `decision` as its host takes it, with the lease its pick is
 /// issued: the one issue of a pair, for its own decision and for an encode
 /// request's ([`super::encode::decided`]). With no `held` decision the pick
-/// is a pair's first, issued under the engine's next id ([`issue`]). With
-/// the view of the guard that holds the first, the pick issues the decode
-/// side under the held lease, dated at this call ([`issue_decode`]). A
-/// lease's dispatch is due as a single's. A decision that picks no pair
-/// issues nothing.
+/// is a pair's first, issued under the engine's next id
+/// ([`issue_caught`]). With the view of the guard that holds the first,
+/// the pick issues the decode side under the held lease, dated at this
+/// call ([`issue_decode_caught`]). Either issue is told under a catch of
+/// its own: a stage that panics at it costs the call nothing. A lease's
+/// dispatch is due as a single's. A decision that picks no pair issues
+/// nothing.
 // In line at its two callers: as a call it costs a pair's decision 33
 // instructions, counted with Callgrind.
 #[inline(always)]
@@ -1038,13 +1071,12 @@ pub(super) fn issued(
     held: Option<&HeldDecision<'_>>,
     now: Instant,
 ) -> DecideOutcome {
-    let (spec, later) = (&own.document.spec, request.constraints.decode_later);
-    let (engine, facts) = (spec.engine(), &request.facts);
+    let (facts, later) = (&request.facts, request.constraints.decode_later);
     let issued = match held {
         // A shed writes no word that every pick shares.
         None => decision.pick().and_then(|_| {
             let id = LeaseId(own.leases.0.fetch_add(1, Ordering::Relaxed) + 1);
-            issue(engine, facts, &decision, id, later)
+            issue_caught(own, facts, &decision, id, later)
         }),
         Some(held) => issue_decode_caught(own, facts, &decision, held.lease)
             .map(|decode| (decode, decode.session)),
@@ -2948,6 +2980,21 @@ mod tests {
         })
     }
 
+    /// A pair's first pick issued as a first decision issues it
+    /// ([`first_sides`], [`tell_first`]), with no engine above the stages
+    /// and so no catch.
+    fn issue(
+        engine: &Engine,
+        facts: &RequestFacts<'_>,
+        decision: &Decision,
+        id: LeaseId,
+        later: bool,
+    ) -> Option<(Lease, Session)> {
+        let (lease, decode, session) = first_sides(facts, decision, id)?;
+        tell_first(engine, &lease, &decode, decision, later);
+        Some((lease, session))
+    }
+
     /// One word of a held pair told to the stages, the clock reading 9,900
     /// and every worker still listed.
     fn tell(engine: &Engine, held: &HeldDecision<'_>, word: Said) {
@@ -3702,6 +3749,49 @@ mod tests {
             ]
         );
         // The held panic alone is counted, and no later word of the side.
+        assert_eq!((host.engine.faults(), host.engine.unheard()), (0, 1));
+    }
+
+    /// A stage that panics at an issue of a pair's first decision is held
+    /// and counted with the words a stage did not hear. The decision
+    /// answers its pick and its lease, so the guard holds both sides as
+    /// issued: the stage that heard each issue ahead of the panic hears
+    /// each side's dispatch and its end. Before, the request was answered
+    /// a fault and no word ended the two issues that stage had heard.
+    ///
+    /// The classic pass tells a policy nothing where a pick is issued: it
+    /// asks each side's policy for one pick
+    /// (`model_gateway/src/routers/common/placement.rs:2758`, `:2820`).
+    #[test]
+    fn a_stage_that_panics_at_a_pairs_first_issue_costs_the_request_nothing() {
+        let host = Host::under(stopping(), 1, 2);
+        let classes = every(1, 2);
+        // The decode is issued with its prefill: its issue is the one the
+        // stage panics at, behind the prefill side's.
+        let (asks, now) = (host.asks(&classes, false), Instant::now());
+        let mut guard = DecisionGuard::decide_under(&host.engine, GatewayId::LOCAL, &asks, now)
+            .expect("a decision");
+        assert!(!guard.decode_chosen(), "the pick issued both sides");
+        let first = target_at(guard.decision(), 0);
+        let decode = first.pair.expect("a pair").decode_id;
+        let at = guard.lease().expect("a lease").lease.issued_micros;
+        guard.dispatched(now);
+        guard.dispatched_decode(now);
+        guard.completed(&outcome(Side::Prefill, first.id), now);
+        guard.completed(&outcome(Side::Decode, decode), now);
+        drop(guard);
+        assert_eq!(
+            host.words(),
+            [
+                ("issued", Side::Prefill, first.id, at),
+                ("issued", Side::Decode, decode, at),
+                ("dispatched", Side::Prefill, first.id, at),
+                ("dispatched", Side::Decode, decode, at),
+                ("completed", Side::Prefill, first.id, at),
+                ("completed", Side::Decode, decode, at),
+            ]
+        );
+        // The held panic alone is counted: no decision faulted.
         assert_eq!((host.engine.faults(), host.engine.unheard()), (0, 1));
     }
 

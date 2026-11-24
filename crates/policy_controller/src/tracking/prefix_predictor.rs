@@ -59,8 +59,9 @@
 //! takes it ahead of the oldest end. A worker's place is given to
 //! another worker once a whole pass has run since it left.
 //!
-//! Memory: 32 bytes a block and its entry in a map, about 60 bytes
-//! together. A block that more than one worker was sent keeps their
+//! Memory: 32 bytes a block and 13 a bucket of its map, about 55 bytes
+//! together: a map holds a key in halves, so no bucket is padded. A
+//! block that more than one worker was sent keeps their
 //! places in a list of its own: two bytes a worker, room for eight
 //! places or for twice its workers at most, whichever is more, and the
 //! list's own 24 bytes. A block left with one worker holds it in itself
@@ -70,7 +71,10 @@
 //! model that sent a few blocks holds no room for 4,096. The keys stand
 //! in 256 maps by their top byte, so a growth moves one map's entries.
 
-use std::{mem, slice};
+use std::{
+    hash::{Hash, Hasher},
+    mem, slice,
+};
 
 use rustc_hash::FxHashMap;
 
@@ -98,6 +102,25 @@ const POOLED: usize = 8;
 /// The map a key is found through.
 const fn map_of(key: u64) -> usize {
     (key >> 56) as usize
+}
+
+/// A block's key as a map holds it: in halves, so that the key and the
+/// block's place fill an entry of twelve bytes. A whole word is aligned
+/// to eight, and the entry is then padded to sixteen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Halves([u32; 2]);
+
+impl Halves {
+    const fn of(key: u64) -> Self {
+        Self([key as u32, (key >> 32) as u32])
+    }
+}
+
+impl Hash for Halves {
+    /// One write of the whole key, as the word itself hashes.
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u64(u64::from(self.0[1]) << 32 | u64::from(self.0[0]));
+    }
 }
 
 /// One block of a sent prefix.
@@ -178,7 +201,7 @@ pub struct PrefixPredictor {
     /// The first free entry; `NONE` where every entry handed out is held.
     free: u32,
     /// Where a block stands, by its key.
-    maps: Box<[FxHashMap<u64, u32>]>,
+    maps: Box<[FxHashMap<Halves, u32>]>,
     /// The workers of the blocks that more than one was sent.
     groups: Vec<Vec<u16>>,
     /// The groups no block holds.
@@ -518,7 +541,7 @@ impl PrefixPredictor {
     }
 
     fn find(&self, key: u64) -> Option<u32> {
-        self.maps[map_of(key)].get(&key).copied()
+        self.maps[map_of(key)].get(&Halves::of(key)).copied()
     }
 
     fn is_live(&self, place: u16) -> bool {
@@ -677,7 +700,7 @@ impl PrefixPredictor {
             touched: tick,
             ..Block::BLANK
         };
-        self.maps[map_of(key)].insert(key, at);
+        self.maps[map_of(key)].insert(Halves::of(key), at);
         self.blocks += 1;
         if before != NONE {
             let block = self.block_mut(before);
@@ -830,7 +853,7 @@ impl PrefixPredictor {
         if block.older != UNLISTED {
             self.unlink(at);
         }
-        self.maps[map_of(block.key)].remove(&block.key);
+        self.maps[map_of(block.key)].remove(&Halves::of(block.key));
         if block.group == NONE {
             self.placements -= usize::from(block.lone != NOBODY);
         } else {

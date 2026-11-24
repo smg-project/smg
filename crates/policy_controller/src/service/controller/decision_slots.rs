@@ -7051,8 +7051,10 @@ pub(crate) mod tests {
     /// The controller's own service counts a key's requests. Under a rule
     /// with an in-flight cap the request that finds the cap met on its
     /// key's worker is placed again and lands on a worker with fewer
-    /// requests, and the key's next request returns once one of them
-    /// ended. The frames carry the key as its hash.
+    /// requests. The pin moves there where that request is decided, ahead
+    /// of its gateway's Dispatched frame, so the key's next request follows
+    /// it, and the one after stays once one of the two ended. The frames
+    /// carry the key as its hash.
     #[tokio::test]
     async fn the_service_hands_a_key_on_at_its_rules_cap() {
         handed_on_at_the_cap(|seed| keyed(1, seed)).await;
@@ -7066,10 +7068,10 @@ pub(crate) mod tests {
         handed_on_at_the_cap(|seed| keyed_in_the_clear("talk-1", seed)).await;
     }
 
-    /// One key's four requests under a rule whose in-flight cap is two,
+    /// One key's five requests under a rule whose in-flight cap is two,
     /// each made by `frame` from its seed: the first claims a worker, the
-    /// second stays, the third is placed again, and the fourth returns
-    /// behind an end.
+    /// second stays, the third is placed again and moves the pin, the
+    /// fourth follows the move, and the fifth stays behind an end.
     async fn handed_on_at_the_cap(frame: impl Fn(u64) -> proto::DecideRequest) {
         use crate::{
             engine::sticky_sessions::SessionVerdict,
@@ -7103,12 +7105,19 @@ pub(crate) mod tests {
         assert_eq!(picked(&second), owner);
         assert_eq!(verdict(&bed, &second), SessionVerdict::Pinned);
         // Two in flight on the key's worker: the third is placed again,
-        // on a worker with fewer requests.
+        // on a worker with fewer requests. Its decision moves the pin
+        // there, and no Dispatched frame has come for it.
         let third = bed.ask(frame(1_003)).await;
-        assert_ne!(picked(&third), owner);
+        let moved = picked(&third);
+        assert_ne!(moved, owner);
         assert_eq!(verdict(&bed, &third), SessionVerdict::Respill);
+        // The fourth follows the move, as a gateway's sticky map sends it:
+        // that worker carries two of the key's requests now.
+        let fourth = bed.ask(frame(1_004)).await;
+        assert_eq!(picked(&fourth), moved);
+        assert_eq!(verdict(&bed, &fourth), SessionVerdict::Pinned);
         // One of the two ended: the key's next request is under the cap.
-        let ended = LeaseId(lease_of(&second).id);
+        let ended = LeaseId(lease_of(&third).id);
         let gone = ReleaseReason::ClientGone;
         assert!(LeasesStore::released(
             &*bed.store,
@@ -7117,9 +7126,9 @@ pub(crate) mod tests {
             None,
             gone
         ));
-        let fourth = bed.ask(frame(1_004)).await;
-        assert_eq!(picked(&fourth), owner);
-        assert_eq!(verdict(&bed, &fourth), SessionVerdict::Pinned);
+        let fifth = bed.ask(frame(1_005)).await;
+        assert_eq!(picked(&fifth), moved);
+        assert_eq!(verdict(&bed, &fifth), SessionVerdict::Pinned);
     }
 
     /// The keys the bed's worker objects count, over all of them: a key

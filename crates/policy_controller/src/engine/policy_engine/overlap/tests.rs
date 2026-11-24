@@ -1780,6 +1780,33 @@ fn a_profile_named_no_row_is_handed_the_column() {
     assert_eq!(seen, [(0, 0), (0, 0), (4, 0), (0, 0)]);
 }
 
+/// A profile that is named no row and reads sent prefixes is handed what
+/// its own picks sent: a request's pick writes its prefix for its worker,
+/// and the column of the repeat holds it.
+#[test]
+fn a_profile_named_no_row_is_handed_the_prefix_its_pick_sent() {
+    let asked = prompt(1_000, 4);
+    let bed = Bed::new(hosted(false).0, handed_whole(), 4);
+    assert!(bed.decide(&request(&asked, 7, NOW), Some(1)).is_none());
+    let mut seen = None;
+    decide(
+        &bed.affinity,
+        &bed.pool,
+        &bed.spec,
+        &bed.workers,
+        &bed.ids,
+        &mut request(&asked, 7, NOW),
+        None,
+        |_| None,
+        |_| true,
+        |facts| {
+            seen = Some(held(facts.affinity));
+            shed()
+        },
+    );
+    assert_eq!(seen.expect("a decision"), [(0, 0), (0, 4), (0, 0), (0, 0)]);
+}
+
 /// A pick states what its first target holds of the request, read from the
 /// rows the engine named for its decision. A worker the index speaks for is
 /// stated by the blocks the index holds for it, of the request's blocks. A
@@ -3291,4 +3318,37 @@ fn a_holder_is_lowered_to_what_its_groups_serve_before_the_deepest_are_kept() {
     );
     scored.sort_unstable();
     assert_eq!(scored, lookup(2));
+
+    // The chain a thread keeps is made anew for each request, and a deeper
+    // holder extends the chain a shallower one made: a second request, whose
+    // first block differs, held two blocks deep and three, the shallower
+    // holder handed first. Each holder's state group keeps its last block
+    // alone, so it is served its depth only under that request's own chain.
+    let second = [7u64, 2, 3];
+    store(&index, 4, &second);
+    store(&index, 5, &second[..2]);
+    let more = numbers(&index, 6);
+    let (deep, shallow) = (more[4], more[5]);
+    let chain = request_prefix_hashes(&second.map(ContentHash));
+    for (number, depth) in [(deep, 3u32), (shallow, 2)] {
+        let view = groups.get_or_create(number);
+        view.learn(1, Some(GroupKind::State), 0);
+        view.main_stored(None, &named(&second[..depth as usize]));
+        view.group_stored(1, &[chain[depth as usize - 1]]);
+        assert_eq!(view.cap(&chain, depth, BLOCK as usize).depth, depth);
+    }
+    deepest_of_within_groups(
+        [(shallow, 2), (deep, 3)],
+        &groups,
+        &second,
+        BLOCK,
+        &naming(&[deep, shallow]),
+        16,
+        &mut below,
+        &mut kept,
+    );
+    kept.sort_unstable();
+    let mut wanted = [(deep, 3), (shallow, 2)];
+    wanted.sort_unstable();
+    assert_eq!(kept, wanted);
 }

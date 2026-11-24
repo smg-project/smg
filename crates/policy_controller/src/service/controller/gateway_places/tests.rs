@@ -212,9 +212,8 @@ fn a_frames_wires_and_hint_are_what_its_gateway_asks_by() {
 }
 
 /// A worker another gateway alone dials is no place, and the asking
-/// gateway's own is one, as the rows of another gateway's host-local
-/// workers are left out of a gateway's list (`Segments::of`). A list whose
-/// host-local workers are all the asking gateway's own states no place.
+/// gateway's own is one. A list whose host-local workers are all the asking
+/// gateway's own states no place.
 #[test]
 fn another_gateways_host_local_worker_is_no_place() {
     let reach = [any(HTTP), local(OTHER, HTTP), local(ASKER, HTTP), any(HTTP)];
@@ -289,8 +288,8 @@ fn a_gateway_that_dials_no_worker_of_the_list_decides_over_no_worker() {
 }
 
 /// A standing veto holds its worker's position back, and holds it for
-/// good while its hold stands, as the view names the row stalled and held.
-/// The positions ascend whatever the order the vetoes come in.
+/// good while its hold stands. The positions ascend whatever the order the
+/// vetoes come in.
 #[test]
 fn a_standing_veto_holds_its_workers_position_back() {
     let reach = [any(HTTP), any(HTTP), any(HTTP), any(HTTP)];
@@ -302,9 +301,8 @@ fn a_standing_veto_holds_its_workers_position_back() {
     );
 }
 
-/// A veto on a worker that is no place says nothing, as a veto on a row
-/// the gateway's list leaves out masks nothing (`mask`, by the row's id).
-/// Neither does a veto on a worker the list does not hold.
+/// A veto on a worker that is no place says nothing. Neither does a veto
+/// on a worker the list does not hold.
 #[test]
 fn a_veto_on_a_worker_that_is_no_place_says_nothing() {
     let reach = [any(HTTP), local(OTHER, HTTP), any(GRPC), any(HTTP)];

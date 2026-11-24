@@ -1065,11 +1065,18 @@ impl MockScheduler {
     /// the canned and scripted answers with a stream still open on this
     /// worker (not the process's other workers); nothing waits there, and
     /// with no engine to count them its row carries no resident tokens.
-    pub(crate) fn load_rows(&self, wanted: Option<i32>) -> Vec<(i32, engine::LoadSnapshot)> {
+    /// A rank under the load-fail hook has no row, and a poll the hook
+    /// leaves with none is answered with the hook's status.
+    pub(crate) fn load_rows(
+        &self,
+        wanted: Option<i32>,
+    ) -> Result<Vec<(i32, engine::LoadSnapshot)>, Status> {
         self.overrides.note_loads_poll();
-        let mut rows: Vec<(i32, engine::LoadSnapshot)> = if self.ranks.is_empty() {
+        let asked = |rank: i32| wanted.is_none_or(|wanted| wanted == rank);
+        let mut refused = None;
+        let rows: Vec<(i32, engine::LoadSnapshot)> = if self.ranks.is_empty() {
             let running = i32::try_from(self.in_flight.get()).unwrap_or(i32::MAX);
-            vec![(
+            let canned = (
                 0,
                 engine::LoadSnapshot {
                     num_running_reqs: running,
@@ -1087,23 +1094,34 @@ impl MockScheduler {
                     num_kv_batches: 0,
                     num_resident_tokens: None,
                 },
-            )]
+            );
+            Vec::from_iter(asked(0).then_some(canned))
         } else {
             self.ranks
                 .iter()
                 .enumerate()
-                .map(|(index, rank)| {
-                    (
-                        i32::try_from(index).unwrap_or(i32::MAX),
-                        rank.engine.load().as_reported_by(self.cfg.loads_like),
-                    )
+                .filter_map(|(index, rank)| {
+                    let index = i32::try_from(index).unwrap_or(i32::MAX);
+                    if !asked(index) {
+                        return None;
+                    }
+                    if let Some(status) = rank.engine.load_refused() {
+                        refused.get_or_insert(status);
+                        return None;
+                    }
+                    let load = rank.engine.load().as_reported_by(self.cfg.loads_like);
+                    Some((index, load))
                 })
                 .collect()
         };
-        if let Some(wanted) = wanted {
-            rows.retain(|(rank, _)| *rank == wanted);
+        match refused {
+            // The mapping's code alone: a load poll is no constrained
+            // request, so 422 carries no constraint report here.
+            Some(status) if rows.is_empty() => {
+                Err(Status::new(injected_status(status).code(), "injected"))
+            }
+            _ => Ok(rows),
         }
-        rows
     }
 
     /// The KV-event subscription every wire serves alike (the batches are the
@@ -3108,6 +3126,39 @@ mod tests {
             width.kind,
             Some(prost_types::value::Kind::StringValue("4".to_string()))
         );
+    }
+
+    /// A worker whose load poll fails or is missing: a rank under the
+    /// load-fail hook has no row in the answer, a poll the hook leaves with
+    /// no row is answered with the hook's status (at 422 its code alone, no
+    /// constraint report), and a cleared hook has the rank report again.
+    #[tokio::test]
+    async fn a_load_fail_answers_a_load_poll_with_its_status() {
+        let (service, _stop) = scheduler_with_ranks(2, 65_117);
+        let poll = |dp_rank| {
+            service.get_loads(Request::new(ts::GetLoadsRequest {
+                dp_rank,
+                include: Vec::new(),
+            }))
+        };
+        let ranks = |answer: Response<ts::GetLoadsResponse>| -> Vec<i32> {
+            let loads = answer.into_inner().loads;
+            loads.iter().map(|load| load.dp_rank).collect()
+        };
+        service.ranks[1].engine.fault_load_fail(501);
+        assert_eq!(
+            ranks(poll(None).await.expect("rank 0 reports")),
+            vec![0],
+            "the rank under the hook has no row"
+        );
+        let refused = poll(Some(1)).await.expect_err("no row is left");
+        assert_eq!(refused.code(), Code::Unimplemented);
+        service.ranks[1].engine.fault_load_fail(422);
+        let refused = poll(Some(1)).await.expect_err("no row is left");
+        assert_eq!(refused.code(), Code::FailedPrecondition);
+        assert!(!smg_grpc_client::is_constraint_failure(&refused));
+        service.ranks[1].engine.fault_load_fail(0);
+        assert_eq!(ranks(poll(None).await.expect("both report")), vec![0, 1]);
     }
 
     /// One report on two wires: a rank's pushed record carries the resident

@@ -23,12 +23,10 @@ use smg_worker::load::state::LoadSnapshot;
 
 use super::{
     pair::{issued, not_decided, stamp, tried_engines, Buffers, PairLists, BUFFERS},
-    signals,
-    single::{self, PLACES},
-    Loaded, PolicyEngine, PoolMembers,
+    signals, single, Loaded, PolicyEngine, PoolMembers,
 };
 use crate::engine::{
-    decision::{shed, Decision, ShedReason, WIRES},
+    decision::{Decision, WIRES},
     decision_engine::{DecideOutcome, DecisionRefused, Request, RequestMaker, WorkerLists},
     framework::{EncodeItems, EncodePlaced, EncodePool, EncoderFacts, PairPools},
     list_cell::LentList,
@@ -63,6 +61,14 @@ pub struct EncodeLists<'a> {
     pub pair: PairLists<'a>,
     /// The encoders.
     pub encoders: LentList<'a>,
+    /// The places of the encoder list the request may take, ascending,
+    /// each once; `None` for every place. The request's own fact and no
+    /// veto of a worker, stated as the pair's are
+    /// ([`PairLists::prefill_places`]): an item is placed on an encoder at
+    /// one of them under any document, and a prefill that only other
+    /// encoders hand to is not the pair's. A place past the list's end
+    /// names no encoder.
+    pub encoders_places: Option<&'a [u32]>,
     /// The places of the encoder list a standing veto of the host masks,
     /// ascending, each once; empty for none ([`Constraints::stalled`]). The
     /// encode side reads them as a single request's list reads its own. A
@@ -104,8 +110,8 @@ impl EncodeLists<'_> {
     /// A request that states no budget is decided with the widest one
     /// written into its facts too, as a pair's is ([`PairLists::decide`]).
     ///
-    /// These lists are narrowed by no demand, no subset hint and no
-    /// places, and a request's own mask names places of no one list: a
+    /// These lists are narrowed by no demand and no subset hint, and a
+    /// request's own places and its own mask name places of no one list: a
     /// request that states one of these is shed or declined as its pair's
     /// records answer it, and no key is placed. A pair's own request is
     /// held to a demand a side at a time ([`PairLists::decide`]), and an
@@ -116,19 +122,25 @@ impl EncodeLists<'_> {
     /// than their list are declined by the engine under the column's name:
     /// a request with none reads neither.
     ///
-    /// Lists whose pair is held to places ([`PairLists::prefill_places`],
-    /// [`PairLists::decode_places`]) are declined under the places' name,
-    /// and no key is placed: the engine decides an encode request's pair
-    /// over the workers it admits for the items and reads no place of the
-    /// lists.
+    /// Each list's host may hold the request to places of that list: the
+    /// pair's two ([`PairLists::prefill_places`],
+    /// [`PairLists::decode_places`]) and the encoders'
+    /// ([`Self::encoders_places`]). Each side of the pair is decided among
+    /// its own, numbered with the workers the engine admits for the items,
+    /// and each item's encoder is one at the encoders' places. A list
+    /// whose places name workers and none that takes the request, though a
+    /// worker outside them does, sheds it under the places' name, and no
+    /// key is placed: the request is held off every worker that takes it.
+    /// Places that name no worker of a list are no such case. Such places
+    /// of a side shed the request as they shed its pair alone, and such
+    /// places of the encoders shed it as a list with no open encoder does.
     ///
     /// Each side of the pair reads the places its host's standing vetoes
     /// mask and hold beside that side's list
     /// ([`PairLists::prefill_stalled`], [`PairLists::decode_stalled`]),
-    /// numbered with the workers the engine admits for the items. A side
-    /// whose host states none reads no mask. A side whose profile shows
-    /// its rows to a plugin is declined beside a mask, under the stage
-    /// `written-rows`.
+    /// numbered the same way. A side whose host states none reads no mask.
+    /// A side whose profile shows its rows to a plugin is declined beside
+    /// a mask, under the stage `written-rows`.
     ///
     /// The encoders read their own list's vetoes the same way
     /// ([`Self::encoders_stalled`], [`Self::encoders_held`]). A stage of
@@ -209,20 +221,16 @@ impl EncodeLists<'_> {
         let live = Live::at(spec.engine(), clock, now, loads, None);
         request.facts.now_micros = live.now_micros();
         request.facts.budget_micros = super::budget::shown(request.facts.budget_micros);
-        // The engine's pass decides the pair over the prefills and the
-        // decodes it admits for the items: a place of the lists as their
-        // host holds them names no row there. The call's instant is
-        // written first, as every answer of this entry leaves it.
-        if pair.prefill_places.is_some() || pair.decode_places.is_some() {
-            placed.clear();
-            let (seed, generation) = (request.facts.seed, spec.generation());
-            return shed(ShedReason::PolicyDeclined, PLACES, seed, generation);
-        }
+        // Each side reads the places and the mask its host states beside
+        // its list. The engine's pass decides the pair over the prefills
+        // and the decodes it admits for the items, and numbers both with
+        // them.
         let (facts, cx) = (&request.facts, &request.constraints);
-        let [prefill_cx, decode_cx] = pair.masked(cx);
-        // The encoders read their own list's vetoes: the request states
-        // no mask of its own here.
+        let [prefill_cx, decode_cx] = pair.sides_of(cx);
+        // The encoders read their own list's places and vetoes: the
+        // request states none of its own here.
         let encode_cx = Constraints {
+            places: self.encoders_places,
             stalled: self.encoders_stalled,
             held: self.encoders_held,
             ..*cx

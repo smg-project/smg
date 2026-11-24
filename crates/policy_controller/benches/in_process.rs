@@ -231,6 +231,15 @@ const CELLS: &[Cell] = &[
         document: || preset("consistent_hashing"),
         ..Cell::PLAIN
     },
+    // An encode request held to places of each of its three lists: every
+    // worker of the list, as a gateway states the workers on its wire.
+    Cell {
+        name: "encode_held_least_load",
+        document: || encode::of("least_load"),
+        request: encode::request,
+        words: encode::words,
+        ..Cell::PLAIN
+    },
     Cell {
         name: "encode_least_load",
         document: || encode::of("least_load"),

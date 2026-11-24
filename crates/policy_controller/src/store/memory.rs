@@ -1,8 +1,8 @@
 //! The one-process store: every ingress trait over plain tables behind
 //! mutexes. The controller's own store once its drivers move in (soft state
 //! its sources republish, no log), and the double the contract tests and the
-//! controller's tests run over. Nothing here is on a decision path: a view is
-//! built from the world the store publishes ([`MemoryStore::snapshot`]), not
+//! controller's tests run over. Nothing here is on a decision path: a decision
+//! reads the world the store publishes ([`MemoryStore::snapshot`]), not
 //! through these locks.
 
 #[cfg(test)]
@@ -27,7 +27,7 @@ use crate::{
     engine::{
         decision_engine::DecodeRefused,
         prompt_hashes::{block_size_and_depth, HashSeeds, PromptHashes},
-        view::{LoadRow, Role, Session, WorkerId, LOAD_REPORT_CLOCK_HISTORY_MS},
+        view::{LoadRow, Session, WorkerId, LOAD_REPORT_CLOCK_HISTORY_MS},
     },
     load::signals::{in_range, SignalCell, SignalColumn},
     stages::lifecycle::Lifecycle,
@@ -46,9 +46,8 @@ use crate::{
         reservations::{ReservationKind, ReservationStore},
         signals::{SignalSink, SignalWriteOutcome, Writes},
         snapshot::{
-            left_models, micros, same_cache, same_offer, Classes, EncodePairBuffers, OnFile,
-            OutsideLists, PairBuffers, StaleGeneration, StoreSnapshot, ViewBuffers, ViewFacts,
-            ViewQuery, Writer, PUBLISH_WINDOW,
+            left_models, micros, same_cache, same_offer, Classes, OnFile, OutsideLists,
+            StaleGeneration, StoreSnapshot, Writer, PUBLISH_WINDOW,
         },
         workers::{
             MembershipChange, MembershipTail, Registrant, WorkerFacts, WorkerPatch, WorkerRow,
@@ -963,12 +962,9 @@ impl MemoryStore {
     /// This door hands an owned pointer, for a reader that keeps a world
     /// across calls. Taking it and dropping it each write the count every
     /// holder of that world shares, so deciding threads that took it would
-    /// write one cache line twice a decision. A decision builds through
-    /// [`build_view`](Self::build_view), a pair decision through
-    /// [`build_pair`](Self::build_pair), and a decision that runs the
-    /// generation's engine over its rows through
-    /// [`deciding`](Self::deciding): all three borrow the world and write
-    /// no shared count.
+    /// write one cache line twice a decision. A decision reads the world
+    /// through [`deciding`](Self::deciding), which borrows it and writes no
+    /// shared count.
     ///
     /// A world kept across two publications of a pool keeps the rows it
     /// lists as they are: the second publication writes over other rows,
@@ -978,75 +974,25 @@ impl MemoryStore {
         self.world.load_full()
     }
 
-    /// Build one decision's view of the pool serving `model` in `role`
-    /// ([`StoreSnapshot::build`]) from the world of this instant.
-    pub fn build_view(
-        &self,
-        model: &str,
-        role: Role,
-        ask: &ViewQuery,
-        out: &mut ViewBuffers,
-    ) -> Option<ViewFacts> {
-        self.world.load().build(model, role, ask, out)
-    }
-
     /// Read the snapshot of this instant under one load, held until `read`
-    /// returns: the rows it takes ([`StoreSnapshot::view`]), the generation and
-    /// its engine ([`StoreSnapshot::spec`]) are of one publication, and a
-    /// decision made inside is made over that publication's rows where they
-    /// stand. Like [`build_view`](Self::build_view) it borrows the world and
-    /// writes no shared count. The load is held for as long as `read` runs: a
-    /// reader that waits inside keeps the publication's rows from their next
-    /// use.
+    /// returns: the rows it reads, the generation and its engine
+    /// ([`StoreSnapshot::spec`]) are of one publication. Like
+    /// [`deciding`](Self::deciding) it borrows the world and writes no
+    /// shared count. The load is held for as long as `read` runs: a reader
+    /// that waits inside keeps the publication's rows from their next use.
     pub fn with_snapshot<R>(&self, read: impl FnOnce(&StoreSnapshot) -> R) -> R {
         let world = self.world.load();
         read(&world)
     }
 
-    /// Build both sides of one pair decision from the world of this instant
-    /// under one borrow ([`StoreSnapshot::build_pair`]): the model's prefill
-    /// pool, its decode pool and the table of their classes, all of one
-    /// publication. `None`, with every buffer cleared, when either pool has no
-    /// member: one side alone is no pair.
-    ///
-    /// This is a pair decision's door. It borrows the world, so the two
-    /// builds and the table read one publication and no deciding thread
-    /// writes the world's shared count.
-    pub fn build_pair(
-        &self,
-        model: &str,
-        ask: &ViewQuery,
-        out: &mut PairBuffers,
-    ) -> Option<(ViewFacts, ViewFacts)> {
-        self.world.load().build_pair(model, ask, out)
-    }
-
-    /// Build one decision's pair and its encode pool from the world as it
-    /// is now, under one borrow ([`StoreSnapshot::build_encode_pair`]): the
-    /// pair's two pools and table, the model's encode pool and the two columns
-    /// the encode side reads, all of one publication. `None`, with every buffer
-    /// cleared, when either side of the pair has no member.
-    ///
-    /// This is the door of a request that carries encode items. Like the
-    /// pair's door it borrows the world for the builds and writes no shared
-    /// count.
-    pub fn build_encode_pair(
-        &self,
-        model: &str,
-        ask: &ViewQuery,
-        out: &mut EncodePairBuffers,
-    ) -> Option<(ViewFacts, ViewFacts)> {
-        self.world.load().build_encode_pair(model, ask, out)
-    }
-
     /// One decision's door: `decide` is handed the world of this instant
-    /// under one borrow, for the build of its view ([`StoreSnapshot::build`])
-    /// and for the engine of the generation those rows were published under
-    /// ([`StoreSnapshot::spec`]). The rows, the engine and the generation's
-    /// number are then of one load, and the borrow writes no shared count, so
-    /// no two deciding threads write one line through it. A publication that
-    /// replaces the world meanwhile is the next decision's: the world handed
-    /// here stays whole until `decide` returns.
+    /// under one borrow, with the engine of the generation it was published
+    /// under ([`StoreSnapshot::spec`]). What the decision reads of the world,
+    /// the engine and the generation's number are then of one load, and the
+    /// borrow writes no shared count, so no two deciding threads write one
+    /// line through it. A publication that replaces the world meanwhile is
+    /// the next decision's: the world handed here stays whole until `decide`
+    /// returns.
     pub fn deciding<R>(&self, decide: impl FnOnce(&StoreSnapshot) -> R) -> R {
         decide(&self.world.load())
     }
@@ -1125,7 +1071,7 @@ impl MemoryStore {
     /// returns, whoever wrote. A join is told when the store takes it, and
     /// the world that lists its row follows at its window's build. A
     /// decision takes neither lock and meets the call at a stage's own lock
-    /// alone. One that built its view before a leave's swap may still name
+    /// alone. One that read its world before a leave's swap may still name
     /// the worker: a stage answers that from its own state, as the ring
     /// fences a pruned id ([`crate::stages::RETIRED_WORKER_TTL`]).
     fn tell_membership(&self, change: MembershipChange) {
@@ -3430,10 +3376,11 @@ fn waits(found: &Sides, side: Side) -> bool {
 
 /// Whether a dispatch moves `side` of the lease `found`
 /// ([`Leases::dispatched_side`]): a side that waits for it, or a pair's
-/// decode side still chosen, which its dispatch books. A handed frame's
-/// dispatch is told by this. A record's own state is never chosen, so a
-/// single's dispatch and a prefill's read one state: a pair's decode side
-/// alone is asked the second.
+/// decode side still chosen, which a dispatch that names a target books.
+/// A handed frame's dispatch is told by this, whatever index it names. A
+/// record's own state is never chosen, so a single's dispatch and a
+/// prefill's read one state: a pair's decode side alone is asked the
+/// second.
 fn takes_dispatch(found: &Sides, side: Side) -> bool {
     waits(found, side)
         || (side == Side::Decode && found.decode.is_some_and(|decode| decode.state.is_chosen()))
@@ -3837,7 +3784,9 @@ impl Leases {
 
     /// Dispatches the named side if it is issued or chosen. Every target
     /// of a pair's pick names the same prefill, so only the decode's
-    /// booking can move. A chosen decode books its target at dispatch.
+    /// booking can move. A chosen decode books its target at a dispatch
+    /// that names one, and stays chosen at an index its pick holds no
+    /// target at.
     fn dispatched_side(
         slots: Slots<'_>,
         counts: &InFlightCounts,
@@ -3876,10 +3825,14 @@ impl Leases {
             }
             Side::Decode if decode.side.state.is_chosen() => {
                 let side = &mut decode.side;
-                if let Some((target, _)) = side.target_at(dispatch.target_index) {
-                    side.target = target;
-                    side.target_index = dispatch.target_index;
-                }
+                // The side has no issue outstanding, and a word that names
+                // no target of its pick names no worker to book: the side
+                // waits on for a call, or for a word that names one.
+                let Some((target, _)) = side.target_at(dispatch.target_index) else {
+                    return;
+                };
+                side.target = target;
+                side.target_index = dispatch.target_index;
                 side.state = LeaseState::Dispatched { at };
                 decode.booked = slots.of(side.target);
                 if let Some(booked) = decode.booked {

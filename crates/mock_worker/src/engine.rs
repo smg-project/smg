@@ -26,7 +26,7 @@ use std::{
     collections::{hash_map::Entry, BTreeSet, HashMap, VecDeque},
     pin::Pin,
     sync::{
-        atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex, OnceLock, RwLock,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -771,6 +771,9 @@ struct Faults {
     admit_next: tokio::sync::Mutex<Option<Instant>>,
     /// The engine is frozen: no passes until resumed.
     paused: AtomicBool,
+    /// The status a load poll is answered with instead of a report (0 =
+    /// none): a worker whose load call fails, or is not implemented.
+    load_fail_status: AtomicU16,
     /// Publisher generation; a restart bumps it.
     generation: AtomicU64,
     restarts: AtomicU64,
@@ -846,6 +849,7 @@ pub(crate) struct FaultStatus {
     pub admit_delay_ms: u64,
     pub admit_per_sec: u64,
     pub paused: bool,
+    pub load_fail_status: u16,
     pub generation: u64,
     pub restarts: u64,
     /// The armed request fault, if any.
@@ -1330,6 +1334,23 @@ impl Engine {
         self.shared.resume.notify_one();
     }
 
+    /// Answer every load poll of this engine with `status` instead of a
+    /// report (0 clears): a worker whose load call fails, or with 501 one
+    /// that does not implement it. Its requests are served, and what it
+    /// pushes is no poll.
+    pub(crate) fn fault_load_fail(&self, status: u16) {
+        self.shared
+            .faults
+            .load_fail_status
+            .store(status, Ordering::Relaxed);
+    }
+
+    /// The status the load-fail hook answers a load poll with, while set.
+    pub(crate) fn load_refused(&self) -> Option<u16> {
+        let status = self.shared.faults.load_fail_status.load(Ordering::Relaxed);
+        (status != 0).then_some(status)
+    }
+
     /// How long the engine has produced nothing while it holds requests
     /// (running or queued): the time since its last pass, counted from the
     /// dispatch when it was idle before; `None` while nothing is in flight.
@@ -1436,6 +1457,7 @@ impl Engine {
             admit_delay_ms: f.admit_delay_ms.load(Ordering::Relaxed),
             admit_per_sec: f.admit_per_sec.load(Ordering::Relaxed),
             paused: f.paused.load(Ordering::Relaxed),
+            load_fail_status: f.load_fail_status.load(Ordering::Relaxed),
             generation: f.generation.load(Ordering::Relaxed),
             restarts: f.restarts.load(Ordering::Relaxed),
             fail,

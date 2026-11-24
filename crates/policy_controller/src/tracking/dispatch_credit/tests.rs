@@ -289,7 +289,7 @@ fn a_send_of_no_stated_size_leaves_the_count_with_its_release() {
 }
 
 #[test]
-fn a_retired_batch_takes_its_sends_of_no_stated_size_with_it() {
+fn a_retired_send_of_no_stated_size_leaves_that_count_too() {
     let (engine, sent) = built(None);
     let a = row(181, 5);
     for _ in 0..300 {
@@ -298,20 +298,20 @@ fn a_retired_batch_takes_its_sends_of_no_stated_size_with_it() {
     for _ in 300..8201 {
         send(&engine, &a, START + 1, 13);
     }
-    // The 256 oldest sends went, each of no stated size.
+    // The nine oldest sends went, each of no stated size.
     assert_eq!(
         sent.read(&clock(0), &a),
         CreditedDispatches {
-            requests: 7945,
+            requests: 8192,
             tokens: 7901 * 13,
-            unsized_requests: 44,
+            unsized_requests: 291,
             estimated_tokens: 0,
         }
     );
 }
 
 #[test]
-fn a_busy_rows_tally_retires_its_oldest_batch() {
+fn a_busy_rows_tally_lets_its_oldest_go_past_the_bound() {
     let (engine, sent) = built(None);
     let a = row(111, 3);
     for _ in 0..8037 {
@@ -331,8 +331,8 @@ fn a_busy_rows_tally_retires_its_oldest_batch() {
     assert_eq!(
         sent.read(&clock(0), &a),
         CreditedDispatches {
-            requests: 7945,
-            tokens: 7781 * 13 + 164 * 19,
+            requests: 8192,
+            tokens: 8028 * 13 + 164 * 19,
             ..CreditedDispatches::default()
         }
     );
