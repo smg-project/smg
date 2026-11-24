@@ -305,7 +305,8 @@ mod tests {
     /// draw and a pass-through take none: a request under them is owed no
     /// word. A pick of two and least load take the dispatch, which moves
     /// their count of sends, and a bucket the issue beside it. No stock
-    /// stage takes an end.
+    /// stage takes an end. The session table of `manual` takes a release:
+    /// a commit that refused every target takes back its decision's claim.
     #[test]
     fn the_stock_documents_name_the_words_they_take() {
         let hears = |name: &str| {
@@ -326,8 +327,10 @@ mod tests {
         let booked = EventSet::of([EventKind::Issued, EventKind::Dispatched]);
         assert_eq!(hears("bucket"), booked);
         for name in PRESETS {
-            let ends = EventSet::of([EventKind::Completed, EventKind::Released]);
-            assert!(!hears(name).intersects(ends), "{name}");
+            let heard = hears(name);
+            assert!(!heard.contains(EventKind::Completed), "{name}");
+            let released = heard.contains(EventKind::Released);
+            assert_eq!(released, name == "manual", "{name}");
         }
     }
 

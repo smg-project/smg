@@ -5029,12 +5029,15 @@ impl Engine {
             .map(|(profile, &folded)| profile.named_by(folded))
             .collect();
         let keepers = Keeper::of(&profiles);
-        // The engine's own: the session table follows a dispatch where a
-        // binding states a sessions rule. At an issue the engine does
-        // nothing but tell its stages: the record of dispatched prefixes
-        // is its host's to write, where the host decides.
+        // The engine's own: the session table follows a dispatch, and at a
+        // release takes back the claim of a decision its commit refused,
+        // where a binding states a sessions rule. At an issue the engine
+        // does nothing but tell its stages: the record of dispatched
+        // prefixes is its host's to write, where the host decides.
         let own = if bindings.iter().any(|binding| binding.sessions.is_some()) {
-            EventSet::NONE.with(EventKind::Dispatched)
+            EventSet::NONE
+                .with(EventKind::Dispatched)
+                .with(EventKind::Released)
         } else {
             EventSet::NONE
         };
@@ -8361,6 +8364,15 @@ impl Lifecycle for Engine {
     }
 
     fn on_released(&self, lease: &Lease, reason: ReleaseReason) {
+        // The table hears first and the stages last, as at a dispatch: a
+        // commit that refused every target leaves the decision's claim no
+        // worker to move to.
+        if reason == ReleaseReason::CommitFailed {
+            if let SessionVerdict::Claimed(claimed) = lease.session_verdict {
+                self.sessions
+                    .move_claim(lease.session, claimed, WorkerId(0));
+            }
+        }
         for profile in &self.profiles {
             for w in &profile.scorers {
                 w.scorer.on_released(lease, reason);
@@ -8410,9 +8422,9 @@ impl Lifecycle for Engine {
     }
 
     /// The words the document takes: a stage's, the session table's at a
-    /// dispatch under a sessions rule, the record of dispatched prefixes
-    /// at an issue, and a count of sends at a dispatch. Folded at the
-    /// build: one read here.
+    /// dispatch and at a release under a sessions rule, the record of
+    /// dispatched prefixes at an issue, and a count of sends at a
+    /// dispatch. Folded at the build: one read here.
     fn hears(&self) -> EventSet {
         if self.sent_credits.is_empty() {
             self.hears

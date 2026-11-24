@@ -1785,6 +1785,44 @@ fn a_keyed_request_whose_owner_the_rule_refuses_stays_on_one_worker() {
     }
 }
 
+/// A fresh key whose first decision names workers the rule refuses keeps no
+/// pin of them: the commit refused every target of that decision, and the
+/// claim it made goes with it. The request is sent to the rule's one
+/// worker, and that worker is the key's pin: the key's request with no rule
+/// lands there.
+///
+/// The classic router pins no worker its rule refuses: it narrows the list
+/// by the rule ahead of its policy (`Candidates::of`,
+/// `model_gateway/src/routers/common/placement.rs`).
+#[test]
+fn a_fresh_key_keeps_no_pin_of_a_worker_its_rule_refused() {
+    let mut document = PolicySpec::preset("manual").expect("a built-in preset");
+    document.generation = 1;
+    let rule = document.bindings[0].sessions.as_mut();
+    rule.expect("the stock rule").assignment = Assignment::MinLoad;
+    let engine = hosted(engine_of(&document));
+    // Four idle workers and a busier one: the first decision names the four.
+    let list = pool(5);
+    list[4].increment_load();
+    let members = PublishedList::new(Arc::clone(&list));
+    let busy = worker_id(list[4].as_ref());
+    let admits = |worker: &dyn Worker| worker_id(worker) == busy;
+    let headers = [(MANUAL_SESSION_HEADER, "talk-fresh")];
+    let keyed = PlaceRequest {
+        headers: &headers,
+        ..PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()))
+    };
+    let ruled = PlaceRequest {
+        admits: Some(&admits),
+        ..keyed
+    };
+    let mut placement = engine.place(&ruled).expect("a placement");
+    placement.sent(Side::Single);
+    assert_eq!(placement.id(), busy);
+    let next = engine.place(&keyed).expect("a placement");
+    assert_eq!(next.id(), busy, "the pin is the worker that served the key");
+}
+
 /// A call's first decision is given the request's whole budget, and a later
 /// one what the call has left of it. A request none of whose budget is left
 /// is shed under `budget`, with no further decision. A request that states
