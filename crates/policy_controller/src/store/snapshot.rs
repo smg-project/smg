@@ -1949,12 +1949,6 @@ impl Writer {
         }
     }
 
-    /// The standing generation: the one every world is published under
-    /// until the next is applied.
-    pub(super) fn spec(&self) -> &AppliedSpec {
-        &self.spec
-    }
-
     /// Every ready rank is heard once a `period` from here on: a judgment
     /// counts a rank only while its receipt lies within three periods of
     /// its engine's newest, and every engine with a threshold is judged

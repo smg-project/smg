@@ -954,8 +954,8 @@ pub struct ResidentWorkParams {
     pub request_tokens: u32,
 }
 
-/// The largest magnitude of a cost rule's parameter. The signal sink holds
-/// a value it takes to the same bound.
+/// The largest magnitude of a cost rule's parameter. A signal's value is
+/// held to the same bound where its cell is written.
 pub(crate) const COST_PARAMETER_LIMIT: f64 = 1e15;
 const RELATIVE_MARGIN_LIMIT: f64 = 1e6;
 
@@ -5669,14 +5669,16 @@ impl AppliedSpec {
     /// The document's signals, resolved, in column order: a signal's place
     /// here is its column's number. What a stage's build answered from
     /// ([`StageBuild::signal_column`](crate::stages::StageBuild::signal_column)),
-    /// and the one reading of the names for a store that keeps the cells.
+    /// and the one reading of the names for whoever makes the cells: the
+    /// engine over worker lists, or a host that builds its own.
     /// Empty for a document that declares none and for the unbound start.
     pub fn signal_columns(&self) -> &[SignalColumn] {
         &self.signal_columns
     }
 
-    /// [`Self::signal_columns`] as the list is shared: what the store's
-    /// signal sink hands a report's conversion.
+    /// [`Self::signal_columns`] as the list is shared: what a worker list's
+    /// records keep for a report's conversion.
+    #[cfg(feature = "in-process")]
     pub(crate) fn shared_signal_columns(&self) -> Arc<[SignalColumn]> {
         Arc::clone(&self.signal_columns)
     }
