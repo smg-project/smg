@@ -263,12 +263,14 @@ impl<'a> DeepestPrefix<'a> {
     /// that tick, or a write at that tick ended at it. `false` where no
     /// worker was sent the request's first block.
     ///
-    /// An owner passes no write where a read finds the whole request
+    /// An owner may pass no write where a read finds the whole request
     /// ([`Self::blocks`] is the count of its keys), its end fresh at the
-    /// owner's tick and the picked worker among [`Self::holders`]: that
-    /// write would move nothing a reader can see. The list of ends is then
-    /// true to one tick. A tick is sixteen bits: a block last used 65,536
-    /// ticks ago reads fresh once, and one move of the list is passed.
+    /// owner's tick and the picked worker among [`Self::holders`]: while
+    /// the record stands as read, that write would add no placement and
+    /// move no tick, only make the end the newest of the list again. The
+    /// list of ends is then true to one tick. A tick is sixteen bits: a
+    /// block last used 65,536 ticks ago reads fresh through that one tick,
+    /// and the moves of the list in it are passed.
     pub fn fresh(&self, tick: u16) -> bool {
         self.at != NONE && self.predictor.block(self.at).touched == tick
     }
@@ -405,9 +407,11 @@ impl PrefixPredictor {
     /// the write makes takes the tick, and so does the block it ends at.
     ///
     /// Below the bound, a write of a longer leading part of a request at
-    /// one tick, behind a write of a shorter one at that tick, leaves what
-    /// one write of the longer leaves, so an owner may write a long request
-    /// in parts. At the bound each part makes its own room, so the parts
+    /// one tick, behind a write of a shorter one at that tick, leaves the
+    /// placements one write of the longer leaves, so an owner may write a
+    /// long request in parts. The block a part ends at can take a tick and
+    /// a place in the list of ends that one write of the longer would not
+    /// give it. At the bound each part makes its own room, so the parts
     /// may forget other blocks than one write would.
     ///
     /// At the bound the blocks that wait leave first, then the oldest that

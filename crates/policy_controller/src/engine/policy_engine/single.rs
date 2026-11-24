@@ -2806,8 +2806,8 @@ pub(crate) mod tests {
     /// Where the rule keeps what it places from the profile no form leaves
     /// a block of the prompt in the record: a gateway's sticky map hands
     /// none of them to its policy, so the policy's record never sees the
-    /// prompt (`model_gateway/src/policies/registry.rs:736-739` for a pin
-    /// under its cap, `:782-783` for the map's own assignment). Where the
+    /// prompt (`model_gateway/src/policies/registry.rs:794-797` for a pin
+    /// under its cap, `:840-841` for the map's own assignment). Where the
     /// request is the profile's own, the rule's default, every form leaves
     /// the whole prompt for the session's worker and for no other, the pin
     /// by one record as the pin the whole decision follows. That prompt
@@ -2876,8 +2876,8 @@ pub(crate) mod tests {
                 }
                 if whole {
                     // A second warm-up stage that rules by another window:
-                    // the live profile is named no row and reads the column
-                    // whole, and its list keeps the record for the shadow.
+                    // the live profile is named no row, reads the column
+                    // whole and keeps the record by its own word.
                     let profile = document.profiles.get_mut("cache_aware");
                     profile.expect("the preset's profile").score.push(
                         ScoreStage::WarmupSlice(WarmupSliceParams {
