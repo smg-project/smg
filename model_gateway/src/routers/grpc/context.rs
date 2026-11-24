@@ -1981,18 +1981,24 @@ pub(crate) type DispatchWait = Option<std::time::Duration>;
 /// run inside it, so they read the wait there, against the dispatch instant
 /// their stream's clocks start at, and hand it to the reading they build:
 /// the response body drives that reading once the request's future has
-/// returned, outside the scope.
+/// returned, outside the scope. A collected answer is built inside the
+/// request's future, so its processor reads the wait where it makes the
+/// answer's records, against the dispatch its generation clock starts at.
 ///
-/// A streamed Responses tool loop dispatches its generations from a task of
-/// its own and puts each of them under a stamp there: the first turn's under
-/// the request's own, a later turn's under one taken where that turn starts.
-/// A later turn's wait is therefore the gateway's time from the turn's start
-/// to its dispatch, with none of the generations and tool calls before it.
+/// A Responses tool loop puts each of its generations under a stamp: the
+/// first turn's under the request's own, a later turn's under one taken
+/// where that turn starts (the streamed loop dispatches from a task of its
+/// own and carries the request's stamp there; the collected loop runs in the
+/// request's future). A later turn's wait is therefore the gateway's time
+/// from the turn's start to its dispatch, with none of the generations and
+/// tool calls before it.
 ///
-/// `None` when no stamp is in scope. Behind the edge every entry point that
-/// reads the wait runs under one. A pipeline a test runs bare has none, on
-/// any turn of a tool loop either, and its stream records its time to first
-/// token alone.
+/// `None` when no stamp is in scope. Behind the edge every streaming entry
+/// point that reads the wait runs under one, and so does every collected
+/// answer but a background Responses request's: its generations run in a
+/// task of its own, outside the request's scope, and record no wait. A
+/// pipeline a test runs bare has none, on any turn of a tool loop either,
+/// and its answer records its other families alone.
 pub(crate) fn dispatch_wait(dispatched: Instant) -> DispatchWait {
     let entered = RequestStarted::current()?;
     Some(dispatched.saturating_duration_since(entered))
