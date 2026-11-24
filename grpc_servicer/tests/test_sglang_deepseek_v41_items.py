@@ -527,6 +527,7 @@ def test_other_families_are_delegated_to_the_sdk_without_v41_splitting(
 
 _INSTALLED_SGLANG_MEDIA_BRIDGE = r'''"""Run by the proposed test in a fresh interpreter, never by preparation."""
 
+import ast
 import base64
 import hashlib
 import importlib
@@ -538,6 +539,7 @@ from pathlib import Path
 import resource
 import sys
 import traceback
+import urllib.parse
 
 
 def file_pin(path):
@@ -560,10 +562,139 @@ def distribution_pin(name):
     return dist, files, result
 
 
+def record_file_pin(dist, row):
+    pin = file_pin(dist.locate_file(row))
+    assert row.hash and row.hash.mode == "sha256", (str(row), "missing SHA256 RECORD anchor")
+    encoded = base64.urlsafe_b64encode(bytes.fromhex(pin["sha256"])).decode().rstrip("=")
+    assert encoded == row.hash.value and row.size == pin["bytes"], (str(row), "RECORD mismatch")
+    return dict(pin, RECORD_path=str(row), RECORD_sha256=row.hash.value)
+
+
+def editable_module_pin(module, dist, files, pin):
+    # A RECORD miss alone never authorizes arbitrary source/module fallback.
+    assert dist.metadata["Name"].lower().replace("_", "-") == "sglang"
+    assert module.__name__ == "sglang" or module.__name__.startswith("sglang.")
+    direct_rows = [f for f in files if f.name == "direct_url.json" and ".dist-info" in str(f.parent)]
+    assert len(direct_rows) == 1, "editable source requires distribution-owned direct_url.json"
+    direct_pin = record_file_pin(dist, direct_rows[0])
+    direct = json.loads(Path(direct_pin["path"]).read_text())
+    assert set(direct) <= {"url", "dir_info", "subdirectory"}
+    assert direct.get("dir_info", {}).get("editable") is True, "unproven source install is not editable"
+    url = urllib.parse.urlsplit(direct["url"])
+    assert url.scheme == "file" and url.netloc in ("", "localhost")
+    assert not url.query and not url.fragment and not url.username and not url.password
+    project = Path(urllib.parse.unquote(url.path, errors="strict"))
+    assert project.is_absolute()
+    if "subdirectory" in direct:
+        relative = Path(direct["subdirectory"])
+        assert not relative.is_absolute() and ".." not in relative.parts
+        project = project / relative
+    project = project.resolve(strict=True)
+    package = sys.modules.get("sglang")
+    assert package is not None, "the real parent package must already have been imported"
+    package_init = file_pin(package.__file__)
+    package_root = Path(package_init["path"]).parent
+    candidates = [project / "sglang", project / "src/sglang", project / "python/sglang"]
+    assert package_root in [p.resolve() for p in candidates]
+    assert Path(package_init["path"]).name == "__init__.py"
+    assert Path(package.__spec__.origin).resolve() == Path(package_init["path"])
+    assert [Path(p).resolve() for p in package.__spec__.submodule_search_locations] == [package_root]
+    source_version = vars(package).get("__version__")
+    assert isinstance(source_version, str) and source_version == dist.version
+    project_metadata = [file_pin(project / name) for name in ("pyproject.toml", "setup.py")
+                        if (project / name).is_file()]
+    assert project_metadata, "editable project metadata is not observable"
+    expected = package_root.joinpath(*module.__name__.split(".")[1:])
+    expected = expected / "__init__.py" if vars(module).get("__path__") is not None else expected.with_suffix(".py")
+    path = Path(pin["path"])
+    assert path.is_relative_to(package_root) and path == expected.resolve(strict=True)
+    assert Path(module.__spec__.origin).resolve() == path and path.suffix == ".py"
+    bindings = []
+    for row in files:
+        if row.suffix != ".pth":
+            continue
+        pth = record_file_pin(dist, row)
+        lines = [line.strip() for line in Path(pth["path"]).read_text().splitlines()
+                 if line.strip() and not line.lstrip().startswith("#")]
+        if len(lines) != 1:
+            continue
+        line = lines[0]
+        if not line.startswith(("import ", "import\t")):
+            entry = Path(line)
+            if not entry.is_absolute():
+                entry = Path(pth["path"]).parent / entry
+            if entry.resolve() == package_root.parent and any(
+                Path(p).resolve() == entry.resolve() for p in sys.path if p
+            ):
+                bindings.append({"kind": "PEP610-editable-path-pth", "files": [pth]})
+            continue
+        # Inspect, never execute, the finite setuptools editable-finder form.
+        statements = ast.parse(line).body
+        if len(statements) != 2 or not isinstance(statements[0], ast.Import):
+            continue
+        aliases = statements[0].names
+        if len(aliases) != 1 or aliases[0].asname is not None:
+            continue
+        finder_name = aliases[0].name
+        if not (finder_name.isidentifier() and finder_name.startswith("__editable__")):
+            continue
+        call = statements[1].value if isinstance(statements[1], ast.Expr) else None
+        if not (isinstance(call, ast.Call) and not call.args and not call.keywords
+                and isinstance(call.func, ast.Attribute) and call.func.attr == "install"
+                and isinstance(call.func.value, ast.Name) and call.func.value.id == finder_name):
+            continue
+        finder_rows = [f for f in files if f.name == finder_name + ".py"]
+        assert len(finder_rows) == 1, "editable finder must be distribution RECORD-owned"
+        finder_pin = record_file_pin(dist, finder_rows[0])
+        parsed = ast.parse(Path(finder_pin["path"]).read_text())
+        values = []
+        for statement in parsed.body:
+            if isinstance(statement, ast.Assign):
+                targets = statement.targets
+            elif isinstance(statement, ast.AnnAssign):
+                targets = [statement.target]
+            else:
+                continue
+            if any(isinstance(target, ast.Name) and target.id == "MAPPING" for target in targets):
+                values.append(ast.literal_eval(statement.value))
+        assert len(values) == 1 and isinstance(values[0], dict)
+        mapping = values[0]
+        assert all(isinstance(k, str) and isinstance(v, str) for k, v in mapping.items())
+        finder = sys.modules.get(finder_name)
+        assert finder is not None and Path(finder.__file__).resolve() == Path(finder_pin["path"])
+        assert Path(finder.__spec__.origin).resolve() == Path(finder_pin["path"])
+        assert vars(finder).get("MAPPING") == mapping
+        live_finder = vars(finder).get("_EditableFinder")
+        assert live_finder is not None and live_finder.__module__ == finder_name
+        assert live_finder in sys.meta_path
+        resolver = live_finder.find_spec
+        resolver_code = getattr(resolver, "__func__", resolver).__code__
+        assert Path(resolver_code.co_filename).resolve() == Path(finder_pin["path"])
+        assert "sglang" in mapping and Path(mapping["sglang"]).resolve() == package_root
+        bindings.append({"kind": "PEP610-editable-record-owned-finder", "files": [pth, finder_pin]})
+    assert len(bindings) == 1, "missing or ambiguous active distribution-owned editable import mapping"
+    evidence = [direct_pin, package_init, *project_metadata, *bindings[0]["files"]]
+    version_module = sys.modules.get("sglang.version")
+    if version_module is not None:
+        version_pin = file_pin(version_module.__file__)
+        assert Path(version_pin["path"]).is_relative_to(package_root)
+        evidence.append(version_pin)
+    pin.update(
+        module=module.__name__, RECORD_path=None, RECORD_sha256=None,
+        installation_kind=bindings[0]["kind"], installation_evidence=evidence,
+        editable_project_root=str(project), editable_package_root=str(package_root),
+        actual_source_package_version=source_version, installed_distribution_version=dist.version,
+        scope="installed metadata and active editable mapping to actual source bytes; no archive/Git identity inferred",
+    )
+    return pin
+
+
 def installed_module_pin(module, dist, files):
     pin = file_pin(module.__file__)
     path = Path(pin["path"])
     rows = [f for f in files if Path(dist.locate_file(f)).resolve() == path]
+    if not rows:
+        return editable_module_pin(module, dist, files, pin)
     assert len(rows) == 1 and rows[0].hash, (module.__name__, "module not RECORD-bound")
     row = rows[0]
     assert row.hash.mode == "sha256", (module.__name__, row.hash.mode)
@@ -833,6 +964,9 @@ def main():
                 result["SMG_modules"][name] = file_pin(source_path)
         for pins in (result["SDK_modules"], result["SMG_modules"], result["proto_modules"]):
             assert all(file_pin(pin["path"])["sha256"] == pin["sha256"] for pin in pins.values())
+            for pin in pins.values():
+                for evidence in pin.get("installation_evidence", []):
+                    assert file_pin(evidence["path"])["sha256"] == evidence["sha256"]
         result.update(
             status="PASS", stage="complete", actual_SDK_function_called=modern,
             original_0_5_21_modern_qualification=sdk_dist.version.split("+")[0] == "0.5.21" and modern,
