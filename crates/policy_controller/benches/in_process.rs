@@ -420,11 +420,19 @@ const KEYS: u64 = 1_024;
 
 /// The ring a host lends with a keyed request: the list's addresses in the
 /// list's order, walked round once from the place a key states. A stand-in
-/// for the ring a host keeps: it hashes nothing and holds no points, so a
-/// keyed cell counts what the engine does with a lent ring and no lookup of
-/// a host's ring.
+/// for the ring a host keeps: a walk hashes nothing and it holds no points,
+/// so a keyed cell counts what the engine does with a lent ring and no
+/// lookup of a host's ring. As a host's ring does, it keeps each worker's id
+/// beside its address, hashed once where the ring is made, and names a
+/// worker by it.
 #[derive(Debug)]
-struct ListOrder(Vec<String>);
+struct ListOrder(Vec<String>, Vec<WorkerId>);
+
+/// A list's entries, round once from the entry a position states.
+fn round<T>(list: &[T], position: u64) -> impl Iterator<Item = &T> {
+    let (before, behind) = list.split_at(position as usize % list.len());
+    behind.iter().chain(before)
+}
 
 impl LentRing for ListOrder {
     fn position(&self, _: &str) -> u64 {
@@ -440,8 +448,11 @@ impl LentRing for ListOrder {
     }
 
     fn walk(&self, position: u64, take: &mut dyn FnMut(&str) -> bool) {
-        let (before, behind) = self.0.split_at(position as usize % self.0.len());
-        let _ = behind.iter().chain(before).any(|address| take(address));
+        let _ = round(&self.0, position).any(|address| take(address));
+    }
+
+    fn walk_ids(&self, position: u64, take: &mut dyn FnMut(WorkerId) -> bool) {
+        let _ = round(&self.1, position).any(|&id| take(id));
     }
 }
 
@@ -451,7 +462,12 @@ static RING: OnceLock<ListOrder> = OnceLock::new();
 /// Makes the run's ring of `workers`, in the list's order.
 fn lend(workers: &[Arc<dyn Worker>]) {
     let addresses = workers.iter().map(|worker| worker.url().to_owned());
-    let lent = RING.set(ListOrder(addresses.collect()));
+    let addresses: Vec<String> = addresses.collect();
+    let ids = addresses
+        .iter()
+        .map(|address| WorkerId::from_address(address));
+    let ids = ids.collect();
+    let lent = RING.set(ListOrder(addresses, ids));
     lent.expect("one list a run");
 }
 
