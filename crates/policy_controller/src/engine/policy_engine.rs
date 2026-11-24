@@ -775,7 +775,10 @@ impl<'d> Loaded<'_, 'd> {
 
 impl PolicyEngine {
     /// A whole decision under the engine's catch: a panic in it costs its
-    /// request alone and is counted ([`DecisionEngine::faults`]).
+    /// request alone and is counted ([`DecisionEngine::faults`]). A side's
+    /// shadow of a pair runs under a catch of its own here too
+    /// (`pair::side_shadows`): its panic is counted the same and costs
+    /// its request nothing.
     #[inline]
     fn caught<R>(
         &self,
@@ -870,8 +873,9 @@ impl PolicyEngine {
     /// counted nowhere here: the caller counts it once its own filing of
     /// the lease stands, and a shed's, which files none, all the same
     /// ([`Self::count_shadow`]). So a decision whose issue fails counts
-    /// none under either entry. A pair's prefill answers no word: no
-    /// shadow runs on a pair's side here yet.
+    /// none under either entry. A pair's prefill answers no word: the
+    /// pair's decision alone asks no side's shadow ([`pair::decide`]), so
+    /// none runs here yet.
     ///
     /// # Errors
     ///
