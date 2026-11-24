@@ -23,8 +23,9 @@ use crate::{
 /// A known rate under one token a second reads as one, zero being unknown.
 /// The resident tokens are counted by such a complete report alone: a
 /// rank the report leaves out holds tokens no sum of the others states.
-/// Their sum over the ranks saturates: counts past what one sum holds read
-/// as the most the row states, and never wrap.
+/// Their sum over the ranks is exact in any order of the ranks, in a count
+/// wider than a rank's: the row's field reads a sum past it as the most it
+/// states and one under zero as none, and nothing wraps.
 /// `source` is where the report came from; `report_age_ms` is `now` less
 /// `sampled_at`.
 pub fn load_row(
@@ -43,7 +44,7 @@ pub fn load_row(
     let mut live_rate = 0.0f64;
     let complete = report.lists_every_rank();
     let mut prefill_rate: Option<f64> = complete.then_some(0.0);
-    let mut resident: Option<i64> = complete.then_some(0);
+    let mut resident: Option<i128> = complete.then_some(0);
     for rank in &report.loads {
         running += i64::from(rank.num_running_reqs);
         queued += i64::from(rank.num_waiting_reqs);
@@ -65,7 +66,7 @@ pub fn load_row(
         }
         resident = resident
             .zip(rank.num_resident_tokens)
-            .map(|(sum, count)| sum.saturating_add(count));
+            .map(|(sum, count)| sum + i128::from(count));
     }
     if role == Role::Prefill {
         live_rate = prefill_rate.unwrap_or(0.0);
@@ -94,9 +95,10 @@ pub fn load_row(
     }
 }
 
-/// A summed engine count as the row's field: negative reads as none.
-fn narrow(count: i64) -> u32 {
-    u32::try_from(count.max(0)).unwrap_or(u32::MAX)
+/// A summed engine count as the row's field: negative reads as none, and a
+/// sum past the field as the most it states.
+fn narrow(count: impl Into<i128>) -> u32 {
+    u32::try_from(count.into().max(0)).unwrap_or(u32::MAX)
 }
 
 /// One row's values of the declared signals from its report, each handed
@@ -363,10 +365,11 @@ mod tests {
         );
     }
 
-    /// Ranks that state counts past what one sum holds make a counted row
-    /// of the most its field states: the sum over the ranks saturates and
-    /// never wraps. Under the least count it saturates too, and the row
-    /// reads none.
+    /// Ranks that state counts past what one sum of their width holds make
+    /// a counted row of the most its field states, and under the least
+    /// count a row that reads none: nothing wraps. The sum is exact in any
+    /// order of the ranks, so a rank of the other sign gives back what the
+    /// ranks ahead of it took the sum past.
     #[test]
     fn resident_tokens_past_what_one_sum_holds_saturate() {
         let now = Instant::now();
@@ -375,15 +378,26 @@ mod tests {
             stated.num_resident_tokens = Some(count);
             stated
         };
-        let most = report(vec![stating(i64::MAX), stating(i64::MAX)]);
-        let row = load_row(&most, Role::Single, now, now, SignalSource::Poll);
+        let row_of = |counts: &[i64]| {
+            let stated = report(counts.iter().copied().map(stating).collect());
+            let row = load_row(&stated, Role::Single, now, now, SignalSource::Poll);
+            (row.resident_tokens, row.resident_counted)
+        };
+        assert_eq!(row_of(&[i64::MAX, i64::MAX]), (u32::MAX, true));
+        assert_eq!(row_of(&[i64::MIN, i64::MIN]), (0, true));
+        // Mixed signs: a whole sum that one count of the ranks' width holds,
+        // past steps that one such count does not.
+        for counts in [
+            [i64::MAX, i64::MAX, i64::MIN],
+            [i64::MAX, i64::MIN, i64::MAX],
+            [i64::MIN, i64::MAX, i64::MAX],
+        ] {
+            assert_eq!(row_of(&counts), (u32::MAX, true), "{counts:?}");
+        }
         assert_eq!(
-            (row.resident_tokens, row.resident_counted),
-            (u32::MAX, true)
+            row_of(&[i64::MIN, i64::MIN, i64::MAX, i64::MAX, 7]),
+            (5, true)
         );
-        let least = report(vec![stating(i64::MIN), stating(i64::MIN)]);
-        let row = load_row(&least, Role::Single, now, now, SignalSource::Poll);
-        assert_eq!((row.resident_tokens, row.resident_counted), (0, true));
     }
 
     #[test]
