@@ -1124,3 +1124,34 @@ fn a_write_handed_a_depth_leaves_what_a_searching_write_leaves() {
     }
     handed.check();
 }
+
+/// A write that meets a block of another prefix under its key keeps its
+/// own blocks on the record's lists: the record's rules hold behind it.
+#[test]
+fn a_write_that_meets_another_prefixs_block_keeps_its_own_on_the_lists() {
+    let mut predictor = PrefixPredictor::new(64);
+    // The second request's third key is the first request's only key.
+    predictor.record(&[30], worker(1), 1);
+    predictor.record(&[10, 20, 30, 40], worker(1), 2);
+    predictor.check();
+    // The third request ends at that key, so its read finds the block.
+    predictor.record(&[50, 60, 30], worker(2), 3);
+    predictor.check();
+    // The block it meets may wait: the worker of [30, 31] left, 31 went
+    // and 30 waits. The write gives 30 a worker and goes on behind it.
+    let mut predictor = PrefixPredictor::new(64);
+    predictor.record(&[30, 31], worker(1), 1);
+    predictor.forget(worker(1));
+    assert_eq!(predictor.sweep(2), 2);
+    predictor.record(&[10, 20, 30, 40], worker(2), 2);
+    predictor.check();
+    // The block it meets may be the request's deepest while its worker
+    // was sent another: room is not made out of that one, here under a
+    // bound lowered below what is held.
+    let mut predictor = PrefixPredictor::new(64);
+    predictor.record(&[10], worker(1), 1);
+    predictor.record(&[20], worker(2), 2);
+    predictor.set_bound(1);
+    predictor.record(&[10, 20], worker(1), 3);
+    predictor.check();
+}
