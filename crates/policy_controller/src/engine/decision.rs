@@ -506,8 +506,9 @@ pub enum OverlapSource {
 /// Six bytes, in bytes a pick's targets had spare behind their count: a
 /// pick is no larger for it ([`Pick::overlap`]).
 ///
-/// The record gains fields: code outside this crate that builds one writes the
-/// rest as `..Overlap::default()`, and a pattern of it ends with `..`.
+/// The record gains fields: code outside this crate starts one from
+/// [`Overlap::NONE`] or `Overlap::default()` and assigns the fields it sets,
+/// and a pattern of it ends with `..`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Overlap {
@@ -635,8 +636,9 @@ enum Placing {
 /// request ([`crate::engine::RequestFacts::session`]) for every keyed request, rule
 /// or no rule: the verdict alone says whether the commit moves a pin.
 ///
-/// The record gains fields: code outside this crate that builds one writes the
-/// rest as `..Pick::default()`, and a pattern of it ends with `..`.
+/// The record gains fields: code outside this crate starts one from
+/// `Pick::default()` and assigns the fields it sets, and a pattern of it
+/// ends with `..`.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 #[non_exhaustive]
 pub struct Pick {

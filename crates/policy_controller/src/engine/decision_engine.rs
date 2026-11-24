@@ -276,7 +276,6 @@ impl RequestMaker for Request<'_> {
 /// A lease issued for a plain request that was never made states no
 /// session: no rule of a place picked by its picker alone reads one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
 pub struct Plain {
     /// The request's phase
     /// ([`RequestFacts::phase`](super::view::RequestFacts::phase)).

@@ -264,7 +264,6 @@ impl LeaseRecord {
 /// its decode side. The prefill side of a pair is the record's own lease,
 /// target and state. What a frame on a side names is read here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
 pub struct Sides {
     pub record: LeaseRecord,
     /// The decode side of a pair's lease; `None` for a single's.

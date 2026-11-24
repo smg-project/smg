@@ -458,12 +458,16 @@ whether it is marked non-exhaustive and how code writes it:
 | the enums closed by design | `Decision`, `ShedReason`, `Side`, `Phase`, `Role`, `Said`, `Pairing`, `Head` | no | a caller answers every case of them, and a new case must stop its build |
 | the records closed by their shape | a record of one value: `WorkerId`, `LeaseId`, `GatewayId`, `TieBand`. A record with no field, as the stage `Best` | no | its one value, or its name, is the whole record |
 | a record closed by its own doc | `DispatchCounts` | no | a further number goes on `CreditedDispatches` |
+| an enum with no case | `DiscoverySettings` in a build without discovery | no | it has no value, and a caller may match it with no arm |
 
 The crate's lint lines hold the table. `clippy::exhaustive_enums` and `clippy::exhaustive_structs` are
 on at the crate's root. A public enum, or a public record whose fields are all public, fails them
-unless it carries the mark or says at its declaration why it does not. The store's modules that leave
-the crate, and its index of cache events, take no mark: each says why at its head. No lint reads a
-case's own named fields: beyond the events above, such a case carries no mark yet.
+unless it carries the mark or says why it does not: at its declaration where it stays closed, at its
+module's head where it waits for its call. The store's modules that leave the crate, and its index of
+cache events, take no mark: each says why at its head. A module that says so at its head quiets its
+lint for every type in it, so a mark inside such a module is held by review until the module's last
+waiting type is marked. No lint reads a case's own named fields: beyond the events above, such a case
+carries no mark yet.
 
 ## 4. The data the engine reads
 

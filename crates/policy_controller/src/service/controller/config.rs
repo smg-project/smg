@@ -21,6 +21,7 @@ use super::election::ElectionConfig;
 /// configuration names none.
 #[cfg(not(feature = "discovery"))]
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[expect(clippy::exhaustive_enums, reason = "no case: discovery is not built")]
 pub enum DiscoverySettings {}
 
 /// A credentialed group of the controller's calls (design 8). Each scope is

@@ -2074,7 +2074,6 @@ impl JsonSchema for PickSpec {
 /// picker.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-#[expect(clippy::exhaustive_structs, reason = "its mark follows a field change")]
 pub struct ProfileSpec {
     /// The hard filters, in order: each a name, or the name of a filter the
     /// catalog adds mapped to its parameters. Which workers the hard

@@ -160,9 +160,11 @@
 //! [`Needs`]: document::Needs
 //!
 
-// Every public enum and record of this crate is marked non-exhaustive, or
-// says at its declaration why it stays closed. These two lints hold that
-// under every feature set the crate is linted with.
+// Every public enum and record written in this crate is marked
+// non-exhaustive, or says why it is not: at its declaration where it stays
+// closed, at its module's head where it waits. These two lints hold that
+// under each feature set the crate is linted with. Inside a module that
+// says so at its head they are quiet, so a mark there is held by review.
 #![warn(clippy::exhaustive_enums, clippy::exhaustive_structs)]
 
 use std::{cell::Cell, collections::hash_map::RandomState, hash::BuildHasher, thread};

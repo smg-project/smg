@@ -146,7 +146,7 @@ pub struct MemoryStore {
 /// ([`MemoryStore::checkpoint`]). The contract's three snapshot messages are
 /// built from it: the operator's, the watch's and the replication's.
 #[derive(Clone, Debug)]
-#[non_exhaustive]
+#[expect(clippy::exhaustive_structs, reason = "its mark comes with its call")]
 pub struct StoreCheckpoint {
     /// The last journaled write that the tables hold, with its term; the
     /// default for a store with no journal.
