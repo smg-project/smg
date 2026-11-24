@@ -285,6 +285,12 @@ them:
 - In a gateway of one router, or in the encode mode of many routers, a policy of one of the two
   families (the mode's own sides, the single requests) names a block size and a policy of the
   other places by a prefix ring, which counts its key in another size.
+- In the encode mode of many routers, the controller's check refuses the document of both
+  families, whatever it refuses. Two such main policies: one that places by a prefix ring the
+  view carries no block for (its depth, or any cache boundary of the view, holds no whole block
+  or more blocks than a request carries), and one that sets what the build does not run. The
+  mode's own document is checked where it is applied, and its refusal still ends a start: sides
+  that state no policy run the main one.
 
 A request of the family left out is then refused: the token count in a gateway of one router,
 each single request in a gateway of many routers.
