@@ -249,7 +249,7 @@ impl Sides {
         if one_call {
             self.place_items(host, items, ring)
         } else {
-            self.decide_items(host, seed, items)
+            self.decide_items::<true>(host, seed, items)
         }
     }
 
@@ -263,13 +263,22 @@ impl Sides {
             keys: &keys,
             ..EncodeItems::default()
         };
-        self.decide_items(host, seed, items)
+        self.decide_items::<false>(host, seed, items)
     }
 
     /// [`Self::decide`] for `items`. Built into each of its two callers,
-    /// so a cell's turn is one body.
+    /// so a cell's turn is one body. `KEYED` gives each caller an instance
+    /// of its own: the closure that borrows the thread's placed room then
+    /// has one caller in each, and stays built into that turn. With one
+    /// instance for both it was compiled apart, and the turn of a cell
+    /// that stood before read 243 instructions more.
     #[inline(always)]
-    fn decide_items(&self, host: &Host, seed: u64, items: EncodeItems<'_>) -> Option<u32> {
+    fn decide_items<const KEYED: bool>(
+        &self,
+        host: &Host,
+        seed: u64,
+        items: EncodeItems<'_>,
+    ) -> Option<u32> {
         let stated = StatedEncode {
             stated: Stated {
                 host,
