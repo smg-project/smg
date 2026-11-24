@@ -81,6 +81,11 @@
 //! convert writes its own into a buffer of the calling thread, and where
 //! both sides do, the second side's are allocated.
 
+#![expect(
+    clippy::exhaustive_structs,
+    reason = "a caller still builds or matches these types whole: each mark comes with its call"
+)]
+
 use std::{
     cell::RefCell,
     fmt,

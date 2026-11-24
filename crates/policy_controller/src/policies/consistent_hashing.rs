@@ -131,6 +131,7 @@ fn key_position(key: u64) -> u64 {
 }
 
 /// What a walk's visitor answers for the member it is shown.
+#[non_exhaustive]
 pub enum WalkStep<T> {
     /// Take the member: the walk ends with the value.
     Take(T),

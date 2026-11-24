@@ -2,6 +2,12 @@
 //! that change it and the watch the gateways' pools derive from (design 5.1,
 //! the workers row; 5.2, `WatchWorkers`).
 
+#![expect(
+    clippy::exhaustive_enums,
+    clippy::exhaustive_structs,
+    reason = "the store's table of worker records leaves the crate, and its types with it"
+)]
+
 use std::{collections::BTreeMap, sync::Arc, time::Instant};
 
 use crate::{

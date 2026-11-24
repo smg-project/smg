@@ -18,6 +18,7 @@ pub trait Lead: Send + Sync + 'static {
 /// The lead of a host with no election: it leads from its start, under one
 /// term, and never changes.
 #[derive(Clone, Copy, Debug, Default)]
+#[expect(clippy::exhaustive_structs, reason = "no field: its name is its value")]
 pub struct SoleLead;
 
 impl SoleLead {

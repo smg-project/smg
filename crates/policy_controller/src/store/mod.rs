@@ -111,6 +111,7 @@ pub use workers::{
 /// session was authenticated as, never a message field. Leases, vetoes and
 /// completed reports are keyed by it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[expect(clippy::exhaustive_structs, reason = "its one value is the record")]
 pub struct GatewayId(pub u64);
 
 impl GatewayId {

@@ -36,10 +36,16 @@
 //! the pool is shed under the last of those: where a host cuts a pool one
 //! demand after another, that is the demand that took its last worker.
 
+#![expect(
+    clippy::exhaustive_structs,
+    reason = "a caller still builds or matches these types whole: each mark comes with its call"
+)]
+
 use crate::engine::{decision, framework, view::Role};
 
 /// Where a request's media by reference may be processed.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum References {
     /// The request carries no media by reference.
     #[default]

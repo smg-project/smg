@@ -7,6 +7,12 @@
 //! into the spec's declared lists (zones, engine kinds, connectors, labels,
 //! headers) are the same positions here.
 
+#![expect(
+    clippy::exhaustive_enums,
+    clippy::exhaustive_structs,
+    reason = "a caller still builds or matches these types whole: each mark comes with its call"
+)]
+
 use std::sync::atomic::AtomicU64;
 
 use super::demands::DemandFacts;
@@ -21,6 +27,7 @@ use crate::{load::signals, policies::consistent_hashing::LentRing, tracking::in_
 /// ([`FixedFacts::id`]). A hash ring a caller lends finds a worker's row
 /// by the address's fingerprint alone.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[expect(clippy::exhaustive_structs, reason = "its one value is the record")]
 pub struct WorkerId(pub u64);
 
 impl WorkerId {
@@ -38,6 +45,7 @@ impl WorkerId {
 
 /// A worker's role in the fleet.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[expect(clippy::exhaustive_enums, reason = "a caller answers every case")]
 pub enum Role {
     #[default]
     Single,
@@ -74,6 +82,7 @@ impl From<smg_worker::worker::WorkerType> for Role {
     schemars::JsonSchema,
 )]
 #[serde(rename_all = "lowercase")]
+#[expect(clippy::exhaustive_enums, reason = "a caller answers every case")]
 pub enum Phase {
     #[default]
     Single,
@@ -360,6 +369,7 @@ impl LoadRow {
 /// plugin sees one form or the other by its exposure. [`Identity::NONE`] is
 /// the absent key.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Identity<'a> {
     /// The fingerprint of the key; `0` when absent.
     pub hash: u64,
@@ -1108,6 +1118,7 @@ pub(crate) fn mean_in_flight(
 /// or by the decisions it holds on file and never by both, so the two
 /// names do not meet on one object.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SessionCountedUnder {
     /// The key's own text: the caller's own guard counts each request on
     /// the worker it sends it to, for as long as the request runs. What a

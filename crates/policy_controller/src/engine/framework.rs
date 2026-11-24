@@ -3,6 +3,11 @@
 //! to its binding and decides. A scorer or picker allocates nothing per
 //! decision: scratch lives in the per-thread [`Scratch`] the host keeps.
 
+#![expect(
+    clippy::exhaustive_structs,
+    reason = "a caller still builds or matches these types whole: each mark comes with its call"
+)]
+
 use std::{
     any::Any,
     collections::HashMap,
@@ -152,6 +157,7 @@ pub trait Filter: Any + Send + Sync + Debug {
 /// near-equal pool) publishes its own; a profile's band is the weighted sum
 /// of its scorers' bands.
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[expect(clippy::exhaustive_structs, reason = "its one value is the record")]
 pub struct TieBand(pub f32);
 
 impl TieBand {
@@ -3030,6 +3036,7 @@ fn run_encode(
 
 /// The plan: the sequence of profiles a request runs.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Plan {
     /// One profile over one pool.
     #[default]
@@ -4573,6 +4580,7 @@ impl<'a> PairTable<'a> {
 
 /// The clause of [`PairTable::validate`] a host's table fails.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum PairTableError {
     #[error("an end stands before the end of the list before it")]
     EndsDescend,
@@ -4672,6 +4680,7 @@ impl<'a> FirstPartners<'a> {
 
 /// The clause of [`FirstPartners::within`] a host's first partners fail.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum FirstPartnersError {
     #[error("the first partners' lists: {0}")]
     Lists(PairTableError),
@@ -4681,6 +4690,7 @@ pub enum FirstPartnersError {
 
 /// One side of a pair decision.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum PairSide {
     Prefill,
     Decode,

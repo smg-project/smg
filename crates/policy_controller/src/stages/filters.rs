@@ -16,6 +16,7 @@ use crate::{
 
 /// Ready, breaker closed, not stalled, not draining.
 #[derive(Debug)]
+#[expect(clippy::exhaustive_structs, reason = "no field: its name is its value")]
 pub struct Healthy;
 
 impl Filter for Healthy {
@@ -84,6 +85,7 @@ fn retain_masked(candidates: &[Candidate], cx: &Constraints<'_>, kept: &mut Vec<
 
 /// Not over the overload thresholds, unless the host lifted the veto.
 #[derive(Debug)]
+#[expect(clippy::exhaustive_structs, reason = "no field: its name is its value")]
 pub struct NotOverloaded;
 
 impl Filter for NotOverloaded {
@@ -107,6 +109,7 @@ impl Filter for NotOverloaded {
 
 /// The prefill capacity window has a slot (a host-supplied bit).
 #[derive(Debug)]
+#[expect(clippy::exhaustive_structs, reason = "no field: its name is its value")]
 pub struct HasCapacity;
 
 impl Filter for HasCapacity {
@@ -132,6 +135,7 @@ impl Filter for HasCapacity {
 /// with every candidate full the list stands and the dispatch waits at its
 /// pick's gate, as today.
 #[derive(Debug)]
+#[expect(clippy::exhaustive_structs, reason = "no field: its name is its value")]
 pub struct HasRoom;
 
 impl Filter for HasRoom {
@@ -711,6 +715,7 @@ impl Filter for HasRoomSignals {
 /// Not tried by an earlier attempt and not excluded by the host. Soft: the
 /// engines a retry already tried step aside while another remains.
 #[derive(Debug)]
+#[expect(clippy::exhaustive_structs, reason = "no field: its name is its value")]
 pub struct NotTried;
 
 impl NotTried {

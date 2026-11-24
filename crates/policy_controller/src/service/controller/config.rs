@@ -5,6 +5,11 @@
 //! shutdown bounds, and worker discovery settings when built with discovery.
 //! The configuration is validated before anything binds.
 
+#![expect(
+    clippy::exhaustive_structs,
+    reason = "a caller still builds or matches these types whole: each mark comes with its call"
+)]
+
 use std::{collections::BTreeMap, fmt, net::SocketAddr, path::PathBuf, thread, time::Duration};
 
 use smg_worker::health::overload::{
@@ -20,6 +25,7 @@ use super::election::ElectionConfig;
 /// configuration names none.
 #[cfg(not(feature = "discovery"))]
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[expect(clippy::exhaustive_enums, reason = "no case: discovery is not built")]
 pub enum DiscoverySettings {}
 
 /// A credentialed group of the controller's calls (design 8). Each scope is
@@ -27,6 +33,7 @@ pub enum DiscoverySettings {}
 /// credential rule is its scopes' rule, so scopes with different rules go
 /// on different listeners.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[non_exhaustive]
 pub enum Scope {
     /// `Session`, `Decide` and `WatchWorkers`: the gateways' calls. Mutual
     /// TLS, or a per-gateway bearer whose verified subject is the gateway id
@@ -321,6 +328,7 @@ impl Config {
 
 /// A controller setting refused by name.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+#[non_exhaustive]
 pub enum ConfigError {
     /// `controller_id` is empty.
     #[error("the controller id is empty")]

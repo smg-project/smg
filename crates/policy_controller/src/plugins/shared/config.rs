@@ -3,6 +3,11 @@
 //! when it cannot answer, when the breaker bypasses it, and the frame budget
 //! of one call.
 
+#![expect(
+    clippy::exhaustive_structs,
+    reason = "a caller still builds or matches these types whole: each mark comes with its call"
+)]
+
 // A row lists the kinds of lifecycle event its plugin hears in the
 // lifecycle's own set.
 pub(crate) use crate::tracking::lease::EventSet;
@@ -10,6 +15,7 @@ pub(crate) use crate::tracking::lease::EventSet;
 /// How a tenant or a session key reaches the plugin: withheld, as its
 /// fingerprint (the default), or in the clear when the host holds it so.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Reveal {
     None,
     #[default]
@@ -56,6 +62,7 @@ pub struct Exposure {
 /// What a stage does when its plugin cannot answer (a trap, an exhausted
 /// budget, a decline without a fallback stage, an open breaker).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Failure {
     /// The stage steps aside: a filter keeps every row, a scorer writes a
     /// flat score, a picker ranks by the combined scores.
@@ -98,6 +105,7 @@ impl Default for BreakerSpec {
 /// [`Self::DEFAULT_MICROS`]) and the fuel per microsecond it is metered at:
 /// the one place the frame is clamped to the request's and turned into fuel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct FrameBudget {
     pub micros: u32,
     pub fuel_per_micro: u64,

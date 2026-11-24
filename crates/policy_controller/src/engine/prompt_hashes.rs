@@ -1,5 +1,10 @@
 //! The block hashes of a request's prompt: [`PromptHashes`] and its seeds.
 
+#![expect(
+    clippy::exhaustive_structs,
+    reason = "a caller still builds or matches these types whole: each mark comes with its call"
+)]
+
 use kv_index::{
     salt::{request_content_hashes_with_seed, request_text_hashes_with_seed},
     XXH3_SEED,

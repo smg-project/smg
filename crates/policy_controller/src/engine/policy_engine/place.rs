@@ -60,6 +60,11 @@
 //! request is made of that anew: its routing value derived and its prompt's
 //! blocks hashed a second time.
 
+#![expect(
+    clippy::exhaustive_structs,
+    reason = "a caller still builds or matches these types whole: each mark comes with its call"
+)]
+
 mod decode_again;
 mod encode;
 mod pair;

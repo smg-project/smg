@@ -160,6 +160,14 @@
 //! [`Needs`]: document::Needs
 //!
 
+// Every public enum and record written in this crate is marked
+// non-exhaustive, or says why it is not: at its declaration where it stays
+// closed, and where it waits at its module's head or at its own
+// declaration. These two lints hold that under each feature set the crate
+// is linted with. Inside a module that says so at its head they are quiet,
+// so a mark there is held by review.
+#![warn(clippy::exhaustive_enums, clippy::exhaustive_structs)]
+
 use std::{cell::Cell, collections::hash_map::RandomState, hash::BuildHasher, thread};
 
 #[cfg(feature = "operator")]

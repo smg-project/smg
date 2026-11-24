@@ -126,6 +126,7 @@ const DIGITS: usize = 20;
 
 /// Why a spec store did not become a controller's source.
 #[derive(Debug, Eq, PartialEq, thiserror::Error)]
+#[non_exhaustive]
 pub enum StoreRefused {
     /// The path leads to a file, through one, or nowhere.
     #[error("the path leads to no directory")]

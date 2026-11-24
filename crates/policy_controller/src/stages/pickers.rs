@@ -19,6 +19,7 @@ use crate::{
 /// The best score first, ties drawn uniformly from the decision's seed, then
 /// the next best as alternates.
 #[derive(Debug, Default)]
+#[expect(clippy::exhaustive_structs, reason = "no field: its name is its value")]
 pub struct Best;
 
 impl Lifecycle for Best {}
@@ -673,6 +674,7 @@ const ALTERNATES_STREAM: u64 = 0xa54f_f53a_5f1d_36f1;
 /// its tried list: the `not-tried` filter leaves the rest, compared among
 /// themselves.
 #[derive(Debug)]
+#[expect(clippy::exhaustive_structs, reason = "no field: its name is its value")]
 pub struct CountFirst;
 
 impl Lifecycle for CountFirst {}

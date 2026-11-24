@@ -316,6 +316,7 @@ impl std::error::Error for StageError {}
 
 /// What a stage is in a profile.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum StageKind {
     Filter,
     Scorer,
@@ -334,6 +335,7 @@ impl fmt::Display for StageKind {
 
 /// A registration the registry refuses.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum StageRegistryError {
     /// The name is held already, by a built-in or by an earlier
     /// registration of any kind.

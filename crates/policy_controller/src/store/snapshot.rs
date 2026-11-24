@@ -85,6 +85,11 @@
 //! again. A veto leaves with its worker's row in the membership build's own
 //! step, so no publication shows the row without it.
 
+#![expect(
+    clippy::exhaustive_structs,
+    reason = "the store's views for a decision leave the crate, and their types with them"
+)]
+
 use std::{
     mem,
     sync::Arc,

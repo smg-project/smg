@@ -65,6 +65,7 @@ struct Source {
 
 /// Where a derived key came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum KeySource<'a> {
     /// The request header of this name.
     Header(&'a str),
@@ -74,6 +75,7 @@ pub enum KeySource<'a> {
 
 /// A request's routing key and the source it came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DerivedKey<'a> {
     /// The key as a decision takes it. It carries its plain form only where
     /// the document lets a stage read its source: a header `view.headers`
@@ -87,6 +89,7 @@ pub struct DerivedKey<'a> {
 /// A request's keys by the sources its binding names
 /// ([`KeySources::derive_keys`]). The default holds none.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DerivedKeys<'a> {
     /// Its routing key ([`KeySources::derive`]), `None` where it carries
     /// none.
