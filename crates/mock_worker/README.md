@@ -314,7 +314,11 @@ engines do not expose:
   `http:<port>` / `zmq:<index>`): a realistic engine with cache size, load,
   cached blocks and preemptions under `"engine": "realistic"` and, in a
   canned process, each listener with its name under `"engine": "canned"`
-  alone (a realistic process lists its engines alone, since a listener
+  and, on an HTTP or gRPC worker, `requests`: the generation requests that
+  reached it since the process started, one it refused for its rendezvous or
+  failed by a fault hook included, one its server could not read (a message
+  the wire refuses, a body over the size limit) left out (a realistic
+  process lists its engines alone, since a listener
   registers before its engine spawns; a listener joins the fleet once its
   bootstrap port, when it has one, is bound, so a worker that stopped at
   that bind is never listed); with the shared KV tier on, `global_l3` beside
@@ -333,7 +337,9 @@ engines do not expose:
 - `GET /admin/cache/{worker}` — the worker's cached block keys;
 - `GET /admin/ops/{worker}` — what the gateway's admin fan-out reached on the
   worker: `flushes`, `profiles_started`, `profiles_stopped`, whether a run is
-  `profiling`, the `last_trace` written (`all`: every worker);
+  `profiling`, the `last_trace` written, and beside them `requests`, the
+  generation requests the worker received, in either engine mode (`all`:
+  every worker);
 - `POST /admin/reset[/{worker}]` — clear caches and publish `AllBlocksCleared`
   (an engine restart, to the index).
 

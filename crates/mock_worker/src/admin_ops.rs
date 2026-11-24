@@ -46,8 +46,11 @@ struct ProfileRun {
 /// What the admin operations did on one worker, and what an encode worker
 /// served (its encode requests reach no engine and no script, so the admin
 /// API is where a bed reads that the encode side ran).
+/// Beside them, the generation requests the worker received: a canned worker
+/// has no engine that counts them.
 pub struct AdminOps {
     name: String,
+    requests: AtomicU64,
     flushes: AtomicU64,
     profiles_started: AtomicU64,
     profiles_stopped: AtomicU64,
@@ -79,6 +82,7 @@ impl AdminOps {
         }
         let ops = Arc::new(Self {
             name: name.to_string(),
+            requests: AtomicU64::new(0),
             flushes: AtomicU64::new(0),
             profiles_started: AtomicU64::new(0),
             profiles_stopped: AtomicU64::new(0),
@@ -110,6 +114,21 @@ impl AdminOps {
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// One generation request the worker received (`requests` in the status
+    /// and on a canned worker's row of the fleet list), counted as it reaches
+    /// the worker's generation path: one the worker then refuses for its
+    /// rendezvous or fails by a fault hook was sent to it all the same; one
+    /// its server could not read (a message the wire refuses, a body over the
+    /// size limit) is not counted.
+    pub(crate) fn record_request(&self) {
+        self.requests.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The generation requests the worker received so far.
+    pub(crate) fn requests(&self) -> u64 {
+        self.requests.load(Ordering::Relaxed)
     }
 
     /// One encode request served by an encode worker (`encodes` in the
@@ -211,6 +230,7 @@ impl AdminOps {
             .unwrap_or_else(PoisonError::into_inner);
         json!({
             "worker": self.name,
+            "requests": self.requests(),
             "flushes": self.flushes.load(Ordering::Relaxed),
             "profiles_started": self.profiles_started.load(Ordering::Relaxed),
             "profiles_stopped": self.profiles_stopped.load(Ordering::Relaxed),
