@@ -11,13 +11,16 @@
 //! **The lists.** A host lends its two lists for one decision
 //! ([`PairLists`]): each list with its cell, the pair class of every
 //! worker, and its own reads of its admission. The engine asks each side's
-//! cell for its own value of the list, once a decision. A decision writes one
-//! record for each worker of the prefill list and of the decode list, each
-//! in its list's order, as the workers stand at that call
-//! ([`PoolRecords::write`](crate::engine::records::PoolRecords::write)).
-//! The decode decided again is handed the decode its pair's first decision
-//! named: a decode profile that keeps its pick answers that decode while
-//! its filters keep it
+//! cell for its own value of the list, once a decision. A pair's first
+//! decision writes one record for each worker of the prefill list and of
+//! the decode list, each in its list's order, as the workers stand at that
+//! call ([`PoolRecords::write`](crate::engine::records::PoolRecords::write)).
+//! The decode decided again writes the decodes' records and, of the
+//! prefills', the held prefill's alone where its list names its place
+//! ([`PoolRecords::read`](crate::engine::records::PoolRecords::read)): it
+//! reads no other prefill's worker. It is handed the decode its pair's
+//! first decision named: a decode profile that keeps its pick answers that
+//! decode while its filters keep it
 //! ([`Engine::decide_decode`](crate::engine::framework::Engine::decide_decode)).
 //!
 //! **The records.** [`stamp`] writes on them what a pair reads beside a
@@ -86,7 +89,7 @@ use std::{
     time::Instant,
 };
 
-use smg_worker::load::state::LoadSnapshot;
+use smg_worker::{identity::basic::Worker, load::state::LoadSnapshot};
 
 use super::{overlap, signals, single, Loaded, PolicyEngine, PoolMembers};
 use crate::{
@@ -452,7 +455,11 @@ impl<'a> PairLists<'a> {
         let decide = |buffers: &mut Buffers| {
             let [prefills, decodes] = &mut buffers.rows;
             let (workers, prefill_records) = (prefill.workers(), prefill.records(spec, clock));
-            let (prefills, prefill_facts) = prefill_records.write(workers, &live, prefills);
+            // The decode asked again reads one prefill, the held one.
+            let (prefills, prefill_facts) = match held {
+                Some(held) => held_prefill(prefill_records, workers, &live, held, prefills),
+                None => prefill_records.write(workers, &live, prefills),
+            };
             let (workers, decode_records) = (decode.workers(), decode.records(spec, clock));
             let (decodes, decode_facts) = decode_records.write(workers, &live, decodes);
             stamp(prefills, decodes, self.classes, self.admission);
@@ -614,6 +621,34 @@ pub(super) fn tried_engines(
     Some(whole)
 }
 
+/// The record of the prefill `held` names, written alone into `rows` for
+/// the decode asked again, which reads no other prefill and no fact of the
+/// prefills' list ([`PoolRecords::read`]). No other prefill's worker is
+/// read: a circuit breaker that such a read moves from open to half-open
+/// at its timeout waits for the next first decision. Where the list names
+/// no place of the held prefill, because it left or because an id stands
+/// twice in the list ([`PoolRecords::place_of`]), it is looked for in the
+/// list's whole write. Out of line: its code stays off the path of a
+/// pair's first decision.
+#[inline(never)]
+fn held_prefill<'a, 'f>(
+    records: &'f PoolRecords,
+    workers: &[Arc<dyn Worker>],
+    live: &Live<'f>,
+    held: &Target,
+    rows: &'a mut Vec<Candidate>,
+) -> (&'a mut [Candidate], PoolFacts<'f>) {
+    let place = records.place_of(held.id);
+    match place.and_then(|place| records.read(workers, live, place)) {
+        Some(row) => {
+            rows.clear();
+            rows.push(row);
+            (rows.as_mut_slice(), PoolFacts::default())
+        }
+        None => records.write(workers, live, rows),
+    }
+}
+
 /// What one thread keeps for its pair decisions: each list's records, the
 /// prefills' first, and the engine's scratch. An encode request's decision
 /// keeps its encoders' records here too ([`super::encode`]): a pair's
@@ -639,8 +674,10 @@ thread_local! {
 
 /// Writes on the two lists' records what a pair's decision reads beside a
 /// single's: each record's pair class, a prefill's capacity bit and a
-/// decode's room bit, as `admission` reads them now. A record past the
-/// classes takes class `0`, which pairs with nobody.
+/// decode's room bit, as `admission` reads them now, each by the record's
+/// place in its list ([`Candidate::position`]): the decode asked again
+/// hands its one prefill's record. A record past the classes takes class
+/// `0`, which pairs with nobody.
 pub(super) fn stamp(
     prefills: &mut [Candidate],
     decodes: &mut [Candidate],
@@ -648,11 +685,13 @@ pub(super) fn stamp(
     admission: &dyn PairAdmission,
 ) {
     let class = |classes: &[u32], at: usize| classes.get(at).copied().unwrap_or(0);
-    for (at, row) in prefills.iter_mut().enumerate() {
+    for row in prefills.iter_mut() {
+        let at = row.position as usize;
         row.pair_class = class(classes.prefills(), at);
         row.has_capacity = admission.has_capacity(at);
     }
-    for (at, row) in decodes.iter_mut().enumerate() {
+    for row in decodes.iter_mut() {
+        let at = row.position as usize;
         row.pair_class = class(classes.decodes(), at);
         row.has_room = admission.has_room(at);
     }
@@ -2255,6 +2294,36 @@ mod tests {
             Decision::Shed(shed) => assert_eq!(shed.emptied_by, "prefill-gone"),
             other => panic!("not shed: {other:?}"),
         }
+    }
+
+    /// The decode asked again reads one prefill, the held one: its host's
+    /// prefill limit is asked of that prefill's place alone.
+    #[test]
+    fn the_decode_asked_again_asks_the_limit_of_its_held_prefill_alone() {
+        /// A host with no limit that keeps the places its prefill limit
+        /// was asked of.
+        #[derive(Debug, Default)]
+        struct Asked(RefCell<Vec<usize>>);
+
+        impl PairAdmission for Asked {
+            fn has_capacity(&self, prefill: usize) -> bool {
+                self.0.borrow_mut().push(prefill);
+                true
+            }
+
+            fn has_room(&self, _: usize) -> bool {
+                true
+            }
+        }
+
+        let (host, asked) = (Host::of(3, 2), Asked::default());
+        let held = worker_id(host.prefills[1].as_ref());
+        let again = host.decide(&asked, 4, Some(held));
+        assert_eq!(host.picked(&again).0, 1);
+        assert_eq!(asked.0.take(), [1]);
+        // The thread's buffer holds the one prefill record written.
+        let written = BUFFERS.with(|buffers| buffers.borrow().rows[0].len());
+        assert_eq!(written, 1);
     }
 
     /// A decode asked again where its host lists no decode is refused for
