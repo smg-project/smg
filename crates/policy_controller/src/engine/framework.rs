@@ -5234,7 +5234,8 @@ impl Engine {
     /// sends. A count starts empty where none is left. The two engines share
     /// those entries from here on: a decision still running under the
     /// standing engine reads the sends a later one counts, and each count
-    /// reads them under its own time limit and report delay.
+    /// reads them under its own `sent_ttl_ms`, `sent_report_delay_ms` and
+    /// `sent_until_report_changes`.
     ///
     /// [`MemoryStore::apply`](crate::store::MemoryStore::apply) calls it
     /// before it shows the new engine. A host with a store of its own

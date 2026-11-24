@@ -784,11 +784,11 @@ reads of a stage when it builds a profile. A factory of the host's own may build
 And the profiles that read one count of sends are kept together or built new together: where the new
 document adds one of them, changes one, or drops the first of them by name, each of them is built
 new, and their count takes over the sends of the standing one (`Engine::succeed`). Profiles whose
-stages read a count under the same `sent_ttl_ms` and `sent_report_delay_ms` read one count, and a
-document that states neither, as the one built from the routing settings does, puts them all under
-one. It holds no worker of its own: the registry that its host hands it (section 8.1) holds them. A
-controller builds a new engine object for each document it applies, and every stage of it new
-(section 10.2).
+stages read a count under the same `sent_ttl_ms`, `sent_report_delay_ms` and
+`sent_until_report_changes` read one count, and a document that states none of the three, as the one
+built from the routing settings does, puts them all under one. It holds no worker of its own: the
+registry that its host hands it (section 8.1) holds them. A controller builds a new engine object
+for each document it applies, and every stage of it new (section 10.2).
 
 The host says who hears a word of a lease issued under an earlier document. On a controller, behind
 a new document the engine that issued the lease is gone, and the standing one counts the send. In a

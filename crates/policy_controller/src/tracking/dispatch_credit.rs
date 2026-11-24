@@ -168,14 +168,14 @@ impl ComparedReports {
 }
 
 /// A profile's count of what its host sent each row since the row's last
-/// report, under the profile's time limit and its report delay. The engine
-/// feeds it and stages read it: a registered stage, `least-cost` through
-/// its `sent.` terms, and `least-load` for its credit. Under a standalone
-/// controller it counts sends from every gateway through that controller.
-/// The profiles of a document that set the same time limit and report
-/// delay read one count: the engine records a send in every count, and
-/// only a decision's read lets one go, so a count of its own would keep
-/// the sends of a profile that decides no request.
+/// report, under the profile's time limit, its report delay and its
+/// `sent_until_report_changes`. The engine feeds it and stages read it: a
+/// registered stage, `least-cost` through its `sent.` terms, and
+/// `least-load` for its credit. Under a standalone controller it counts
+/// sends from every gateway through that controller. The profiles of a
+/// document that set the same three read one count: the engine records a
+/// send in every count, and only a decision's read lets one go, so a count
+/// of its own would keep the sends of a profile that decides no request.
 ///
 /// A new document's count takes over the rows' entries of the standing
 /// count under the same settings, or else of the one that a profile
@@ -535,10 +535,11 @@ impl DispatchCreditPass<'_> {
     }
 }
 
-/// A pass over a count that sets no time limit and no report delay
-/// ([`DispatchCredit::reads_unlimited`]). A row's report alone ends its
-/// sends there, so the pass keeps the tally map and nothing else: a profile
-/// that sets neither setting stores no cutoff and no delay.
+/// A pass over a count that sets no time limit and no report delay and
+/// ends its sends at any report ([`DispatchCredit::reads_unlimited`]). A
+/// row's report alone ends its sends there, so the pass keeps the tally
+/// map and nothing else: a profile that sets none of its three settings
+/// on the count stores no cutoff and no delay.
 pub(crate) struct UnlimitedPass<'a> {
     tally: Guard<Arc<Tally>>,
     credit: PhantomData<&'a DispatchCredit>,
@@ -550,9 +551,10 @@ pub(crate) struct UnlimitedPass<'a> {
 /// and no estimate. Each of a count's two passes answers it by its own
 /// rule, and which pass reads is settled once a pass
 /// ([`DispatchCredit::limited`]): the pass of a count with no time limit
-/// and no report delay compares no cutoff and takes no delay off a sample.
-/// The count of sends of no stated size is as its word stands: beside a
-/// send that lands between the reads it may differ by that send.
+/// and no report delay that ends its sends at any report compares no
+/// cutoff and takes no delay off a sample. The count of sends of no
+/// stated size is as its word stands: beside a send that lands between
+/// the reads it may differ by that send.
 pub(crate) trait ReportedSends {
     fn reported(&self, row: &Candidate) -> SentCredit;
 }

@@ -76,7 +76,7 @@ impl LeastLoad {
 
     /// The stage over its profile's count of sends, as a document builds
     /// it: the profile's other readers read the same sends, and the
-    /// profile's time limit and report delay hold here too.
+    /// profile's three settings on that count hold here too.
     pub(crate) fn of_profile(
         kv_pressure_weight: f32,
         mean_prefill_tokens: u32,
@@ -260,8 +260,8 @@ impl LeastLoad {
     /// Writes each reporting row's credit work and marks each row without
     /// a report, and says how many report. Built once for each of the
     /// count's two passes ([`DispatchCredit::limited`]): the pass of a count
-    /// with no time limit and no report delay reads each row by its sample
-    /// alone.
+    /// with no time limit and no report delay that ends its sends at any
+    /// report reads each row by its sample alone.
     #[inline(always)]
     fn credit_pass(
         &self,

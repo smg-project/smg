@@ -8051,7 +8051,8 @@ mod tests {
     }
 
     /// Profiles under one time limit and one report delay read one count
-    /// of sends. A profile under another limit or another delay keeps a
+    /// of sends where they agree on `sent_until_report_changes` too, as
+    /// these do. A profile under another limit or another delay keeps a
     /// count of its own.
     #[test]
     fn profiles_under_one_sent_setting_read_one_count_of_sends() {
