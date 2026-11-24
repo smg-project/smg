@@ -174,7 +174,7 @@ pub struct ProfileSpec {
     pub filter: Vec<FilterSpec>,  // the filters, in order: each removes workers
     pub score: Vec<ScoreSpec>,    // the scorers, each with a weight
     pub pick: PickSpec,           // exactly one picker
-    pub sent_ttl_ms: Option<u32>, // how long a dispatched request counts in the profile's records
+    pub sent_ttl_ms: Option<u32>, // how long a send stays in the count of sends the profile reads
     pub sent_report_delay_ms: Option<u32>, // how long behind a dispatch a load report ends its count
 }
 
@@ -1157,7 +1157,7 @@ pub enum Said {
 decide ──> lease issued ──> Dispatched ──> Completed
                 │                └───────> Released (client gone, send failed, worker removed)
                 └── never dispatched ──> Released when the host drops its guard
-                                         (the old engine releases it 5 s after issue)
+                                         (a controller releases one on its file 5 s after issue)
 ```
 
 The kept engine stores nothing about a lease. The host keeps what it was handed and hands it back
@@ -1173,7 +1173,7 @@ What an event does:
 
 | Event | What the stages do with it |
 |---|---|
-| Dispatched | the session's pin follows the worker the request went to; each profile counts what it sent since the worker's last load report; scorers and pickers that asked hear it. A pick a sessions rule keeps from the profile moves the pin alone. A pin at its rule's cap moved already, where the request that met the cap was decided, to the worker it was placed on: the dispatch finds it there, or fronts the later target the request went to |
+| Dispatched | the session's pin follows the worker the request went to; every count of sends takes it: a count holds what was dispatched to each worker since the worker's last load report, whichever profile placed the request; scorers and pickers that asked hear it. A pick a sessions rule keeps from the profile moves the pin alone. A pin at its rule's cap moved already, where the request that met the cap was decided, to the worker it was placed on: the dispatch finds it there, or fronts the later target the request went to |
 | Completed | scorers and pickers that asked hear the outcome (status, time to first token, tokens in and out, duration) |
 | Released | the same stages hear the reason |
 
@@ -1181,10 +1181,10 @@ A sessions rule places some requests alone, behind the profile's filters and wit
 picker of the profile asked: it follows a pin of the request's key, or its own assignment places
 the key. The rule says whether such a request is the profile's own (`rule_placed`). Under `told`,
 the default, it is: the stages hear its issue and its dispatch,
-the profile counts it among its sends, and its prompt is recorded as behind any pick. Under
-`untold` it is kept from the profile: no stage hears its issue or its dispatch, no profile counts
-it, and neither the engine's record of sent prefixes nor a lent token tree takes its prompt. The
-session's pin still follows its dispatch, and its completion and its release are told as any
+every count of sends takes it, and its prompt is recorded as behind any pick. Under
+`untold` it is kept from the profile: no stage hears its issue or its dispatch, no count of sends
+takes it, and neither the engine's record of sent prefixes nor a lent token tree takes its prompt.
+The session's pin still follows its dispatch, and its completion and its release are told as any
 request's, so a stage matches an end by the lease's id. The routing settings write `untold` for
 the sticky override's rule alone: a gateway's sticky map keeps a request it places from the
 gateway's policy. The kept engine keeps the word on the pick, and one function reads it
@@ -1196,6 +1196,9 @@ a pick's lease, and keeps the answer on the lease's record (`LeaseRecord::untold
 that issue, and the dispatch it tells off the file moves the session's pin and reaches no stage
 and no count of sends. Its decision is the engine's own, so its record of sent prefixes follows the
 word too.
+
+The session table takes no new key once it holds 4,194,304 keys. A request of such a key is
+placed with no pin, until keys leave the table.
 
 Upkeep, about once a second (`sweep`): expired session keys are removed, and the record of sent
 prefixes gets a bounded step of clean-up. A record leaves the engine's map once no list's table
@@ -1606,7 +1609,9 @@ list by wire.
 Two things keep the short path of section 5.6 as cheap as it is today. The route's rule is asked
 of the one picked worker, and of a single request's whole list only behind a decision all of whose ready picks it refuses; a rule that is the same for every request of a
 route belongs to the list itself. And a plain request touches neither the load snapshot nor the
-other fields of the request.
+other fields of the request, with one exception in a gateway's own process. Where a stage needs
+lease events, the lease states the text's bytes, and its characters where a stage reads a size.
+Counting the characters is the one pass over a plain request's text.
 
 A request decided inside a lent token tree has the rule asked inside the tree's walk, of the
 pick's targets best first, so the tree stores the prompt for a worker the rule takes. The call
@@ -1906,8 +1911,10 @@ its phase: it is decided as a single request is, over the registry's list of its
 workers, and its lease is a single's. The token count of a prefill-decode mode (section 3.3) is
 not decided this way: it is a single request over the prefill workers, the wire cannot say so,
 and a controller reads the single workers' list for it, which such a fleet does not have. An
-encode request, and a decode request that names no lease under a pair plan, are answered `Busy`,
-and their gateway decides them.
+encode request, and a decode request that names no lease under a pair plan, are answered `Busy`.
+By the contract the gateway decides such a request locally
+(`crates/policy_controller/contracts/policy_controller.proto`) **[planned]**: no gateway calls a
+controller yet.
 
 ### 10.2 As designed **[partly]**
 
