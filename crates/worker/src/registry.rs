@@ -1793,14 +1793,45 @@ impl<G: Generation> WorkerRegistry<G> {
         let mut previous = Vec::with_capacity(holding.len());
         for model_id in &holding {
             if let Some(mut entry) = self.model_index.get_mut(model_id) {
-                let members = Arc::clone(entry.members());
-                previous.push(std::mem::replace(&mut *entry, Arc::new(G::of(members))));
+                previous.push(Self::published_again(&mut entry));
             }
         }
         drop(previous);
         let _order = self.global_membership_order.read();
         self.bump_global_routing_epoch();
         true
+    }
+
+    /// Publishes every model's snapshot again over the same list, with the
+    /// global one: what a host's value of a generation keeps beside its
+    /// lists starts anew, and the next request reads it again. No worker is
+    /// written and no list changes.
+    ///
+    /// For a host that changes what its values keep, with no membership
+    /// change at hand. The cost is the host's value built again for every
+    /// model a worker serves, so a host calls it at such a change of its
+    /// own and at no request. The generation without a member is built once
+    /// with the registry and is not published again.
+    ///
+    /// Emits no events.
+    pub fn publish_again(&self) {
+        // As in add_worker_to_model_index: a replaced snapshot drops after
+        // its shard guard, not under it.
+        let mut previous = Vec::with_capacity(self.model_index.len());
+        for mut entry in self.model_index.iter_mut() {
+            previous.push(Self::published_again(&mut entry));
+        }
+        drop(previous);
+        let _order = self.global_membership_order.read();
+        self.bump_global_routing_epoch();
+    }
+
+    /// One model's snapshot published again over the list it holds. Answers
+    /// the snapshot it replaced, for its caller to drop behind the shard
+    /// guard.
+    fn published_again(entry: &mut Arc<G>) -> Arc<G> {
+        let members = Arc::clone(entry.members());
+        std::mem::replace(entry, Arc::new(G::of(members)))
     }
 
     /// The models whose index entry holds `worker`, by its handle.

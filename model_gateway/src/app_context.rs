@@ -732,6 +732,11 @@ impl AppContextBuilder {
         // words. The engine is started last, from the document that was
         // checked here.
         let policy = Self::policy_in_force(&router_config, policy_stages.as_ref())?;
+        // The maker of every later spec takes the very table that check
+        // read: a spec a worker's `policy` label builds is validated over it.
+        let respec = policy
+            .is_some()
+            .then(|| Self::respec(&router_config, policy_stages));
         // The overload veto's two words are read once below, where the
         // registration settings are made and the registry's shed word is set.
         // A supplied document this gateway refuses for them ends the start
@@ -769,7 +774,7 @@ impl AppContextBuilder {
             .await?
             .with_wasm_manager(&router_config)
             .with_kv_event_monitor()
-            .with_engine(policy)?
+            .with_engine(policy, respec)?
             .webrtc_bind_addr(
                 webrtc_bind_addr.or_else(|| Some(default_bind_addr(&router_config.host))),
             )
@@ -1088,7 +1093,11 @@ impl AppContextBuilder {
     /// each once: the worker registry, the load monitor's channel, and the
     /// cache-event monitor with the token trees the engine is lent
     /// ([`Self::engine_caches`]).
-    fn with_engine(self, policy: Option<(PolicySpec, AppliedSpec)>) -> Result<Self, String> {
+    fn with_engine(
+        self,
+        policy: Option<(PolicySpec, AppliedSpec)>,
+        respec: Option<crate::policies::Respec>,
+    ) -> Result<Self, String> {
         let Some((document, spec)) = policy else {
             return Ok(self);
         };
@@ -1115,8 +1124,23 @@ impl AppContextBuilder {
             loads: Some(monitor.subscribe()),
             cache_indexes: Self::engine_caches(&document, &spec, events, policies, registry),
         };
-        Self::start_engine(spec, data, policies)?;
+        Self::start_engine(spec, data, policies, registry, respec)?;
         Ok(self)
+    }
+
+    /// The maker of every later spec of this process: the spec the routing
+    /// settings mean with a model's own policy for each worker's `policy`
+    /// label, checked as the start checks its own
+    /// (`RouterConfig::hosted_policy_with_labels`). It owns a copy of the
+    /// settings and `stages`, the table the start was handed, or the stock
+    /// one where it was handed none. The registry is handed it with the
+    /// engine and puts each spec it makes in force on that engine.
+    fn respec(config: &RouterConfig, stages: Option<StageRegistry>) -> crate::policies::Respec {
+        let config = config.clone();
+        let stages = stages.unwrap_or_else(StageRegistry::builtin);
+        Box::new(move |labels, generation| {
+            config.hosted_policy_with_labels(labels, generation, &stages)
+        })
     }
 
     /// What the engine is handed of this process's caches, as one object
@@ -1155,11 +1179,16 @@ impl AppContextBuilder {
     /// events and tells the document's stages a worker that joined or was
     /// removed, and it keeps the newest load snapshot at hand. It is
     /// spawned on the runtime this context is built on, and the placement
-    /// functions find the engine through `policies`.
+    /// functions find the engine through `policies`. `workers` is the
+    /// registry `data` holds, by its own type: `policies` keeps it with
+    /// the maker of later specs and publishes its lists again behind each
+    /// spec a worker's label puts in force.
     fn start_engine(
         spec: AppliedSpec,
         data: WorkerData,
         policies: &PolicyRegistry,
+        workers: &Arc<WorkerRegistry>,
+        respec: Option<crate::policies::Respec>,
     ) -> Result<(), String> {
         let runtime = tokio::runtime::Handle::try_current().map_err(|error| {
             format!("Grand Central: the engine's task needs a Tokio runtime: {error}")
@@ -1170,6 +1199,11 @@ impl AppContextBuilder {
         // its load snapshot and its follow of the registry end with the
         // runtime.
         runtime.spawn(task);
+        // The maker stands before the engine does: a registration finds
+        // both, or no engine and decides nothing.
+        if let Some(respec) = respec {
+            policies.set_respec(respec, Arc::clone(workers));
+        }
         policies.set_engine(engine);
         Ok(())
     }
@@ -1184,6 +1218,12 @@ impl AppContextBuilder {
     /// monitor's channel. Such a context keeps no cache-event monitor, so
     /// the engine is handed none, and the token trees it is lent where its
     /// document reads them (`engine_caches`).
+    ///
+    /// The registry is handed the maker of later specs where the test
+    /// brings no table (`respec` over the stock one). A table a
+    /// test lends for this call cannot be kept behind it, so a start over
+    /// one hands no maker, and a worker's `policy` label is not applied
+    /// there.
     #[cfg(any(test, feature = "test-util"))]
     pub fn start_engine_by_hand(
         config: &RouterConfig,
@@ -1198,7 +1238,8 @@ impl AppContextBuilder {
                 loads: Some(monitor.subscribe()),
                 cache_indexes: Self::engine_caches(&document, &spec, None, policies, registry),
             };
-            Self::start_engine(spec, data, policies)?;
+            let respec = stages.is_none().then(|| Self::respec(config, None));
+            Self::start_engine(spec, data, policies, registry, respec)?;
         }
         Ok(())
     }
@@ -1226,7 +1267,8 @@ impl AppContextBuilder {
                 loads,
                 cache_indexes: Self::engine_caches(&document, &spec, None, policies, registry),
             };
-            Self::start_engine(spec, data, policies)?;
+            let respec = Some(Self::respec(config, None));
+            Self::start_engine(spec, data, policies, registry, respec)?;
         }
         Ok(())
     }

@@ -307,9 +307,11 @@ single request, in any gateway. For a prefill-decode mode of one router over HTT
 token count.
 
 **A worker's `policy` label [partly].** With the classic policies a registration can name its
-model's policy. The engine follows no such label today: the document's builder takes one, no
-gateway hands it one yet, and a registration that states one is answered with a warning that it
-names no policy (`model_gateway/src/workflow/steps/shared/update_policies.rs`).
+model's policy. Under the engine the gateway follows the label where its document is built from
+the routing settings: the document's builder takes the label, and the gateway puts the document
+it builds in force on the running engine (`model_gateway/src/policies/labels.rs`). A document
+put in force keeps the stages of a profile that did not change. What stays different from
+classic is named below, where it stands.
 
 What classic does: the registry builds a model's policy at the registration that finds the model
 with none, from that worker's `policy` label, for the worker's primary model. Where two such
@@ -337,18 +339,38 @@ another policy for a model whose id is empty or holds a `*` is refused the same 
 reads a `*` at its start or its end as a pattern, and the document refuses one anywhere else.
 Classic keeps a model's policy under the id as written, so there such a model follows its label.
 
-One difference from classic stays. Models that name one policy by their labels are bound to one
+A difference from classic stays. Models that name one policy by their labels are bound to one
 profile, so a stage that keeps a history of its own keeps one for all of them: the count round
 robin draws a new list's start from, and the warm-up's counts of misses and hits with its
 shallow mark. A model whose label names the default policy shares the main profile's the same
 way. Classic builds a policy object for each such model, so there each keeps its own. A profile
 for each labelled model would end the difference.
 
-What is planned: the gateway hands the builder its labels by classic's rule. The registration
-that finds the model with none decides, and the binding leaves with the model's last worker. The
-name is resolved as classic resolves it, and an unknown name adds no binding.
+What the gateway does: it hands the builder its labels by classic's rule. The registration that
+finds the model with none decides, whatever its worker's role, and so does one that states no
+label. The binding leaves with the model's last worker. The name is resolved as classic resolves
+it, and an unknown name adds no binding. A label the builder or the validation refuses fails
+alone: the document in force stays, the registration is answered with a warning, and the label
+is not tried again while the model is served.
 
-The gateway then puts the new document in force on the running engine. A document put in force keeps
+The gateway then puts the new document in force on the running engine, under the next generation
+number, and stores again the two answers it keeps of the document in force: the text questions'
+and a pair's. Where the document it built says what the standing one says, it puts none in
+force. Behind each document it puts in force it publishes its worker lists again
+(`WorkerRegistry::publish_again`, `crates/worker/src/registry.rs`). Each list then stands beside
+an empty cell and keeps no value for each label that came and went (section 5.2), and the request
+that asks a list first pays the list's fill, as behind a membership change. The registry's list
+of no workers, which a request for a model no worker serves reads, is built once and is not
+published again. The gateway lends it with a cell of the request's own, so no value is kept beside
+it: the value made for such a request falls with the request.
+
+The token trees the engine is lent are made at the start alone, where the start's document reads
+sent prefixes. So a model that a later label makes `cache_aware` is placed by the engine's own
+record of sent prefixes, where classic builds that model's trees at its registration. That
+difference from classic stands open: trees made where a label's document first reads sent
+prefixes would end it.
+
+A document put in force keeps
 the stages of a profile that did not change, under the rules of section 5.1: its name stands in
 both documents, its stages are built from the same text (the profile's own block, `view` and
 `signals`), over one stage table, and each stage built again says of itself what the standing one
@@ -361,13 +383,11 @@ no signal, and into the view only headers the view does not list yet: a `manual`
 headers, and under the sticky override a label of a policy the override places adds the
 override's headers, beside a main policy whose binding lists none (`consistent_hashing`). A
 `cache_aware` label also writes the document's `index` block where the settings wrote none.
-Where the new document cannot be built, the document in force stays and the registration is
-answered with a warning.
 
 That holds where the document is built from the routing settings. Where the operator supplies a
-document, and on a controller, the document decides, and a registration whose label names
-another policy is answered with a warning. The gateway takes that first step today: with the
-engine on, it warns at each registration that states a label.
+document, and on a controller, the document decides, and no label is read. In a gateway a
+registration whose label does not name what places its model is answered with a warning, under
+either kind of document.
 
 ### 3.4 A validated document
 
@@ -851,12 +871,21 @@ For each list the registry publishes, the engine keeps one value. It keeps the v
 that the host lends:
 
 - The host keeps an empty cell beside each list it publishes (`ListCell`). It lends the list and
-  its cell together with each request (`LentList`).
+  its cell together with each request (`LentList`). The last point names the one list a host
+  lends with another cell.
 - The engine makes its value into the cell at the list's first ask, and reads it there from then
   on. Where the host handed the engine its lists (section 8.2), the engine's own task asks first.
   Otherwise the first decision over the list does.
 - When the membership changes, the registry publishes a new list with an empty cell. The old
   value is dropped with the old list.
+- A cell holds one value for each document its list was asked under, and a read passes each value
+  made before its own. A host that puts a document in force while its lists stand publishes them
+  again behind it. The gateway does so behind each document a worker's label puts in force
+  (section 3.3).
+- A list such a host never publishes again, as a registry's list of no workers that is built
+  once, it lends with a cell of the call's own in place of the kept one. The value made for the
+  call falls with it. The gateway lends its registry's list of no workers so. An engine that kept
+  no value for a list with no member would spare a host that rule: that stands open.
 
 A host may know a fact of its workers that their objects do not hold. It lends such a fact with
 the list (`LentList::facts`): one value for each worker, in the list's order. The engine writes it
@@ -1463,7 +1492,8 @@ A host's start has these steps.
 3. **It keeps an empty cell beside each published worker list**: a `ListCell` in its value of a
    membership generation. The cell is lent with the list as a `LentList`, with `facts` where the
    host knows a fact of its workers that their objects do not hold. `PublishedList` keeps the
-   three as one value (section 5.2).
+   three as one value (section 5.2). A list the host never publishes again is lent with a cell of
+   the call's own where the host puts documents in force (section 5.2, the last point).
 4. **It hands its worker lists by model, once**: `engine.set_lists(lists)`, beside the start,
    which does not take them yet. The host implements `ModelLists` over its registry. The engine's
    task fills a list's cell behind the registry's word of the membership change. A later call is
@@ -2790,7 +2820,7 @@ bursts. It is bounded by the tree's size bound and the time between two eviction
 | `canary`, `override: allowed`, `admission` | **[planned]** | in the schema; a document that writes one is refused, and the error names the field |
 | `shadow`, `explain.sample` | **[partly]** | the kept engine runs a single request's shadow, but not one that reads affinity rows of its own; it runs a pair's shadows by side at the pair's first decision in a host's own process; no gateway takes a document that names them yet, and no served controller asks them, and `explain.sample` is kept by the served controller and, for a single request and a pair's first decision, by the engine in a gateway's process, where no route reads a record yet (decision 7) |
 | The ten presets and the conversion from routing settings | **[built]** | |
-| A worker's `policy` label names its model's policy | **[partly]** | section 3.3: built: the builder of the settings' document takes a label and binds its model, and a registration that states a label is answered with a warning; planned: the gateway hands the builder its labels, and a document put in force keeps the stages of a profile that did not change |
+| A worker's `policy` label names its model's policy | **[partly]** | section 3.3: built: the builder of the settings' document takes a label and binds its model, the gateway hands it its labels and puts the document in force, and a document put in force keeps the stages of a profile that did not change; open: a profile for each labelled model, and token trees made where a label's document first reads sent prefixes |
 | The stage interfaces and a builder's own stages | **[built]** | |
 | The engine over worker lists (`InProcess`) | **[partly]** | refuses a subset hint and mixed protocols; of the recorded lines only the three hard-demand sheets and `sticky_rank` (34), and 31 lines of `prefix_hash`, replay through it |
 | `round_robin`, `random`, `passthrough`, `least_load`, `power_of_two` on that engine | **[partly]** | no sheet over a healthy pool for four of them |

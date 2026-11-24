@@ -3,8 +3,14 @@
 //! and replacements of its workers, and dropped with the last worker this
 //! node owns, so the model's next registration builds the policy its own
 //! labels name.
+//!
+//! The cases run a second time with Grand Central on ([`engine_on`]):
+//! there the label names the policy of the profile that places the model's
+//! single requests in the spec in force, and no policy object is built.
 
-use std::sync::Arc;
+mod engine_on;
+
+use std::{cell::Cell, sync::Arc};
 
 use openai_protocol::{
     model_card::ModelCard,
@@ -33,14 +39,21 @@ use crate::{
     workflow::data::WorkerRegistrationMode,
 };
 
+thread_local! {
+    /// Whether the case on this thread runs with Grand Central on
+    /// ([`engine_on::with_the_engine_on`]): its context then starts the
+    /// engine, and its policy is read of the spec in force.
+    static ENGINE_ON: Cell<bool> = const { Cell::new(false) };
+}
+
 fn app_context() -> Arc<AppContext> {
-    app_context_for_tests(
-        RouterConfig::builder()
-            .round_robin_policy()
-            .build_unchecked(),
-        Arc::new(WorkerRegistry::new()),
-        None,
-    )
+    let config = RouterConfig::builder()
+        .round_robin_policy()
+        .build_unchecked();
+    if ENGINE_ON.get() {
+        return engine_on::app_context(config);
+    }
+    app_context_for_tests(config, Arc::new(WorkerRegistry::new()), None)
 }
 
 fn worker(url: &str, model: &str) -> Arc<dyn Worker> {
@@ -61,6 +74,9 @@ fn endpoint(url: &str, models: &[&str]) -> Arc<dyn Worker> {
 /// The model's own policy entry, `None` once it is dropped: routing would
 /// fall back to the default policy, this does not.
 fn policy_of(app_context: &AppContext, model: &str) -> Option<&'static str> {
+    if ENGINE_ON.get() {
+        return engine_on::policy_of(app_context, model);
+    }
     app_context
         .policy_registry
         .get_policy(model)

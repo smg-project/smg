@@ -1239,6 +1239,13 @@ fn row_name(policies: &PolicyRegistry, side: Option<RowSide>, label: &'static st
 /// list as it stands ahead of the engine's call, and the worker picked, or
 /// no worker, under the row's name ([`row_name`]). Its origin is
 /// [`BY_ENGINE`].
+///
+/// A list of no workers is lent on with a cell of this call's own, because
+/// the worker registry builds that list once and never publishes it again:
+/// the cell kept beside it would take one value of the engine for each spec
+/// put in force, and every request for a model no worker serves would walk
+/// them. The engine decides and refuses over such a list as over any, and
+/// the value it makes falls with the call.
 #[expect(
     clippy::too_many_arguments,
     reason = "the placement's own arguments, the engine it asks and what the request states for it"
@@ -1253,6 +1260,15 @@ fn placed_by_engine(
     inputs: PlacementInputs<'_>,
     stated: Stated,
 ) -> Option<Placed> {
+    // Made where the list holds no worker alone: a list with workers pays
+    // the test of its length.
+    let own;
+    let lent = if lent.workers.is_empty() {
+        own = smg_grand_central::engine::ListCell::default();
+        LentList { cell: &own, ..lent }
+    } else {
+        lent
+    };
     let mut tried = TriedIds::new();
     tried_ids(lent.workers, inputs.tried, &mut tried);
     let mut request = place_request(

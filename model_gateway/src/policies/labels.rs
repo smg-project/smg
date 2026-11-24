@@ -1,0 +1,292 @@
+//! A worker's `policy` label under Grand Central.
+//!
+//! A classic registry builds a policy object of its own for a model whose
+//! first worker names one by its `policy` label. Under Grand Central no
+//! policy object is built. The label names the policy that places the
+//! model's single requests in the policy spec in force, and this module
+//! puts that spec in force.
+//!
+//! The registration that finds a model undecided decides it, whatever the
+//! worker's role, as a classic registry's first registration does. Its
+//! word stands until no worker of this node serves the model: a later
+//! registration's label changes nothing. A registration that carries no
+//! label decides too, and so does one whose label names no policy.
+//!
+//! A decided label that names a policy other than the settings' own is
+//! handed to the builder of the settings' spec, with every label that
+//! stands ([`RouterConfig::policy_document_with_labels`]). The spec it
+//! writes is checked over the table of stages the start was handed and put
+//! in force on the running engine ([`InProcess::apply`]). A label that
+//! is refused fails alone: the standing spec stays, the registration goes
+//! on, and one warning names the reason. It is not built again while the
+//! model is served: the model's next first registration decides anew.
+//! Beside a supplied spec no label is read at all.
+//!
+//! Behind each spec put in force the worker lists are published again
+//! (`WorkerRegistry::publish_again`). The engine keeps its value of a list
+//! in the cell beside the list, one value for each spec the list was asked
+//! under, and a read walks them all. A list published again stands beside
+//! an empty cell, so no list keeps a value for each label that came and
+//! went.
+//!
+//! [`RouterConfig::policy_document_with_labels`]: crate::config::RouterConfig::policy_document_with_labels
+
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, OnceLock},
+};
+
+use parking_lot::Mutex;
+use smg_grand_central::{
+    document::{AppliedSpec, PRESETS},
+    engine::{InProcess, Phase},
+};
+use tracing::{debug, info, warn};
+
+use crate::routers::common::snapshot::WorkerRegistry;
+
+/// Makes the checked spec this gateway runs with a set of labels: the spec
+/// the routing settings mean with a model's own policy for each label (a
+/// model's exact id to the name of a policy's preset), numbered as the
+/// second argument says and checked over the table of stages the start was
+/// handed. A refusal is answered in its own words, and no spec.
+///
+/// The start makes it, since the start holds the settings and that table,
+/// and hands it to the registry with the engine.
+pub(crate) type Respec =
+    Box<dyn Fn(&BTreeMap<String, String>, u64) -> Result<AppliedSpec, String> + Send + Sync>;
+
+/// What the deciding registration of a model said.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Decided {
+    /// The preset its label named, where the label named a policy other
+    /// than the settings' own. `None` for no label, for the settings' own
+    /// policy and for a name that is no policy's.
+    preset: Option<&'static str>,
+    /// Whether the builder took the label: it is handed again with every
+    /// later build. False for a label the builder or the check refused.
+    stands: bool,
+}
+
+/// The models a registration decided, with the maker of the specs their
+/// labels put in force.
+///
+/// One lock holds the decisions, and it is held across a build and an
+/// apply: two registrations of one model decide in turn, and the second
+/// finds the model decided. The lock's order is this lock first, then the
+/// engine's own lock of an apply. Nothing takes them the other way round:
+/// the engine calls no code of the gateway under its lock but the worker
+/// registry's reads. The worker lists are published again under this lock
+/// too, behind the apply: that takes the worker registry's own guards, and
+/// no caller of this module holds one.
+#[derive(Default)]
+pub(crate) struct Labels {
+    decided: Mutex<BTreeMap<String, Decided>>,
+    /// The maker of the specs, and the registry of the worker lists the
+    /// engine is lent.
+    respec: OnceLock<(Respec, Arc<WorkerRegistry>)>,
+}
+
+impl Labels {
+    /// Hands the maker of every later spec, once: the start hands it with
+    /// the engine, and with `workers`, the registry of the worker lists the
+    /// engine is lent. A second one is not taken.
+    pub(crate) fn set_respec(&self, respec: Respec, workers: Arc<WorkerRegistry>) {
+        if self.respec.set((respec, workers)).is_err() {
+            warn!("a maker of policy specs is already set: the second one is not taken");
+        }
+    }
+
+    /// A worker of `model` registered, with `hint` as its `policy` label.
+    /// Where the model is undecided this registration decides it, and a
+    /// label that names a policy other than `own`, the settings' own
+    /// policy, is built into the spec and put in force on `engine`.
+    ///
+    /// Answers whether a spec was put in force: the caller then reads again
+    /// what it keeps of the spec.
+    pub(crate) fn registered(
+        &self,
+        engine: &InProcess,
+        model: &str,
+        hint: Option<&str>,
+        own: &str,
+    ) -> bool {
+        let mut decided = self.decided.lock();
+        if decided.contains_key(model) {
+            return false;
+        }
+        let preset = hint.and_then(|hint| preset_named(hint, own));
+        let (stands, applied) = match preset {
+            Some(preset) => self.put_in_force(engine, &decided, Some((model, preset))),
+            None => (false, false),
+        };
+        decided.insert(model.to_owned(), Decided { preset, stands });
+        applied
+    }
+
+    /// No worker of this node serves `model` any more: its decision goes
+    /// with its last worker, and where its label stood in the spec, the
+    /// spec is built without it and put in force on `engine`.
+    ///
+    /// Answers whether a spec was put in force.
+    pub(crate) fn unserved(&self, engine: &InProcess, model: &str) -> bool {
+        let mut decided = self.decided.lock();
+        match decided.remove(model) {
+            Some(was) if was.stands => self.put_in_force(engine, &decided, None).1,
+            _ => false,
+        }
+    }
+
+    /// Whether `hint`, a worker's `policy` label, names what places
+    /// `model`'s single requests under the spec in force on `engine`.
+    ///
+    /// Under the spec the settings mean, a model whose label stands is
+    /// placed by the profile of that label's policy, which bears the
+    /// policy's name, and every other model by the settings' own policy,
+    /// `own`. So a label names what places its model where it names the
+    /// policy that stands for the model, or `own` for a model none stands
+    /// for. Beside a `supplied` spec the profile's name alone is read: the
+    /// label names what places the model where the profile that places it
+    /// bears the policy's name. False for a name that is no policy's, and
+    /// where the spec binds no single request of the model.
+    pub(crate) fn places(
+        &self,
+        engine: &InProcess,
+        model: &str,
+        hint: &str,
+        own: &str,
+        supplied: bool,
+    ) -> bool {
+        let Some(named) = policy_named(hint) else {
+            return false;
+        };
+        // Held across the read of the spec: no label's spec is put in force
+        // between the two reads.
+        let decided = self.decided.lock();
+        let Some(placing) = placing_profile(engine, model) else {
+            return false;
+        };
+        if supplied {
+            return placing == named;
+        }
+        match decided.get(model) {
+            Some(Decided {
+                preset: Some(preset),
+                stands: true,
+            }) => named == *preset && placing == *preset,
+            _ => named == own,
+        }
+    }
+
+    /// Builds the spec of the labels that stand in `decided`, with `added`
+    /// (a model and the preset its label named) where a registration brings
+    /// one, and puts it in force on `engine`. The spec takes the number
+    /// behind the standing one.
+    ///
+    /// Answers two words: whether the builder and the check took the labels,
+    /// and whether a spec was put in force. A spec that says what the
+    /// standing one says is not put in force: a label that binds nothing
+    /// there costs no stage its state. Behind a spec put in force the worker
+    /// lists are published again.
+    fn put_in_force(
+        &self,
+        engine: &InProcess,
+        decided: &BTreeMap<String, Decided>,
+        added: Option<(&str, &'static str)>,
+    ) -> (bool, bool) {
+        let Some((respec, workers)) = self.respec.get() else {
+            debug!("No maker of policy specs is set: a worker's policy label is not applied");
+            return (false, false);
+        };
+        let mut labels: BTreeMap<String, String> = decided
+            .iter()
+            .filter(|(_, decided)| decided.stands)
+            .filter_map(|(model, decided)| Some((model.clone(), decided.preset?.to_owned())))
+            .collect();
+        if let Some((model, preset)) = added {
+            labels.insert(model.to_owned(), preset.to_owned());
+        }
+        let standing = engine.spec();
+        let next = standing.generation().saturating_add(1);
+        let spec = match respec(&labels, next) {
+            Ok(spec) => spec,
+            Err(refused) => {
+                match added {
+                    Some((model, preset)) => {
+                        let cut = cut_mark(model);
+                        warn!(
+                            "Worker label policy = {preset} of model {model:.64}{cut} is not \
+                             applied, and the policy spec in force stays: {refused}"
+                        );
+                    }
+                    None => warn!(
+                        "The policy spec is not built again behind a model's last worker, and \
+                         the spec in force stays: {refused}"
+                    ),
+                }
+                return (false, false);
+            }
+        };
+        if spec.digest() == standing.digest() {
+            return (true, false);
+        }
+        match engine.apply(spec) {
+            Ok(()) => {
+                // Each list that stands holds a value of the spec before in
+                // its cell: published again, it stands beside an empty one.
+                workers.publish_again();
+                info!(
+                    generation = next,
+                    labels = labels.len(),
+                    "A policy spec is in force with the policies the workers' labels name"
+                );
+                (true, true)
+            }
+            Err(stale) => {
+                warn!("A policy spec built for a worker's policy label is not applied: {stale}");
+                (false, false)
+            }
+        }
+    }
+}
+
+/// The policy `hint` names, as the name of its preset: the name in lower
+/// case, equal to a preset's name or to it without its underscores, as a
+/// classic registry reads a label's spelling. `None` for a name that is no
+/// policy's, and for `own`, the settings' own policy: that policy places
+/// the model already, with the settings' options.
+fn preset_named(hint: &str, own: &str) -> Option<&'static str> {
+    let named = policy_named(hint)?;
+    (named != own).then_some(named)
+}
+
+/// The policy `hint` names by a preset's name, `own` included.
+fn policy_named(hint: &str) -> Option<&'static str> {
+    let hint = hint.to_lowercase();
+    PRESETS
+        .into_iter()
+        .find(|name| hint == *name || hint == name.replace('_', ""))
+}
+
+/// The name of the profile that places `model`'s single requests under the
+/// spec in force on `engine`. `None` where that spec binds no single
+/// request of the model.
+pub(crate) fn placing_profile(engine: &InProcess, model: &str) -> Option<String> {
+    let spec = engine.spec();
+    let (_, profile) = spec.engine().profile_for(model, Phase::Single)?;
+    Some(profile.name.clone())
+}
+
+/// The mark of a cut behind a model's id in a log line that writes its
+/// first 64 characters (`{model:.64}`): a worker names its model, so the id
+/// is free text of unknown length.
+pub(crate) fn cut_mark(model: &str) -> &'static str {
+    if model.chars().nth(64).is_some() {
+        "..."
+    } else {
+        ""
+    }
+}
+
+#[cfg(test)]
+mod tests;
