@@ -31,7 +31,7 @@ use openai_protocol::{
     },
     common::{FunctionCallResponse, ToolCall, ToolCallDelta, Usage},
     event_types::McpEvent,
-    responses::{ResponseUsage, ResponsesRequest},
+    responses::{ResponseTool, ResponseUsage, ResponsesRequest},
 };
 use serde::{
     de::{Deserializer, IgnoredAny, SeqAccess, Visitor},
@@ -101,6 +101,7 @@ use crate::{
 pub(super) async fn convert_chat_stream_to_responses_stream(
     ctx: &ResponsesContext,
     chat_request: Arc<ChatCompletionRequest>,
+    effective_tools: Option<Vec<ResponseTool>>,
     params: ResponsesCallContext,
     original_request: &Arc<ResponsesRequest>,
     background: Option<BackgroundStream>,
@@ -164,6 +165,7 @@ pub(super) async fn convert_chat_stream_to_responses_stream(
         match process_and_transform_sse_stream(
             body,
             original_request_clone,
+            effective_tools,
             response_id,
             response_storage,
             conversation_storage,
@@ -528,6 +530,7 @@ async fn record_departure(
 async fn process_and_transform_sse_stream(
     body: Body,
     original_request: Arc<ResponsesRequest>,
+    effective_tools: Option<Vec<ResponseTool>>,
     response_id: Option<String>,
     response_storage: Arc<dyn ResponseStorage>,
     conversation_storage: Arc<dyn ConversationStorage>,
@@ -546,6 +549,7 @@ async fn process_and_transform_sse_stream(
     let created_at = chrono::Utc::now().timestamp() as u64;
     let mut event_emitter = ResponseStreamEventEmitter::new(response_id, model, created_at);
     event_emitter.set_original_request(ResponsesRequest::clone(&original_request));
+    event_emitter.set_effective_tools(effective_tools);
 
     // Emit initial response.created and response.in_progress events (a
     // background stream reports response.queued between the two)
@@ -775,7 +779,6 @@ pub(super) async fn execute_tool_loop_streaming(
 struct CallSite<'a> {
     session: &'a McpToolSession<'a>,
     format_registry: &'a FormatRegistry,
-    original_request: &'a ResponsesRequest,
     /// The loop's current request: its model labels the call's metrics, its
     /// tools name the call's namespace.
     request: &'a ResponsesRequest,
@@ -864,8 +867,7 @@ async fn stream_mcp_call(
         tool_call.name,
         tool_call.arguments
     );
-    let arguments =
-        dispatch_arguments(response_format, site.original_request, &tool_call.arguments);
+    let arguments = dispatch_arguments(response_format, site.request, &tool_call.arguments);
 
     // Execute the single tool via the normalized MCP execution API.
     // This avoids custom serialization and manual re-transformation in streaming paths.
@@ -1013,6 +1015,7 @@ async fn execute_tool_loop_streaming_internal(
     let mut emitter =
         ResponseStreamEventEmitter::new(response_id, current_request.model.clone(), created_at);
     emitter.set_original_request(original_request.clone());
+    emitter.set_effective_tools(current_request.tools.clone());
 
     // Emit initial response.created and response.in_progress events (a
     // background stream reports response.queued between the two)
@@ -1172,7 +1175,6 @@ async fn execute_tool_loop_streaming_internal(
             let site = CallSite {
                 session: &session,
                 format_registry: &ctx.mcp_format_registry,
-                original_request,
                 request: &current_request,
             };
             for tool_call in mcp_tool_calls {
@@ -1523,6 +1525,7 @@ mod tests {
                 ..Default::default()
             }),
             None,
+            None,
             Arc::new(smg_data_connector::MemoryResponseStorage::new()),
             Arc::new(smg_data_connector::MemoryConversationStorage::new()),
             Arc::new(smg_data_connector::MemoryConversationItemStorage::new()),
@@ -1671,6 +1674,7 @@ mod tests {
                 store: Some(true),
                 ..request
             }),
+            None,
             None,
             storage.clone(),
             Arc::new(smg_data_connector::MemoryConversationStorage::new()),
@@ -2156,6 +2160,7 @@ mod tests {
                     ..Default::default()
                 }),
                 None,
+                None,
                 storage.clone(),
                 Arc::new(smg_data_connector::MemoryConversationStorage::new()),
                 Arc::new(smg_data_connector::MemoryConversationItemStorage::new()),
@@ -2271,6 +2276,7 @@ mod tests {
                 ..Default::default()
             }),
             None,
+            None,
             storage.clone(),
             Arc::new(smg_data_connector::MemoryConversationStorage::new()),
             Arc::new(smg_data_connector::MemoryConversationItemStorage::new()),
@@ -2322,6 +2328,7 @@ mod tests {
                 store: Some(true),
                 ..Default::default()
             }),
+            None,
             None,
             storage.clone(),
             Arc::new(smg_data_connector::MemoryConversationStorage::new()),
@@ -2391,6 +2398,7 @@ mod tests {
                     store: Some(true),
                     ..Default::default()
                 }),
+                None,
                 None,
                 storage.clone(),
                 Arc::new(smg_data_connector::MemoryConversationStorage::new()),
@@ -2792,6 +2800,7 @@ mod tests {
                 store: Some(true),
                 ..Default::default()
             }),
+            None,
             None,
             response_storage.clone(),
             Arc::new(smg_data_connector::MemoryConversationStorage::new()),

@@ -87,6 +87,7 @@ use crate::{
                 ws::handle_realtime_ws, RealtimeLabels, RealtimeRegistry,
             },
             request_lease::{ReleasePoint, RequestLease, RoutingDerivatives},
+            responses_compat::lower_responses_request_for_local_backend,
             retry::{
                 is_request_timeout, is_retryable_response, request_timeout_response, RetryExecutor,
             },
@@ -2744,9 +2745,12 @@ impl RouterTrait for Router {
         &self,
         headers: Option<&HeaderMap>,
         tenant_meta: &TenantRequestMeta,
-        body: ResponsesRequest,
+        mut body: ResponsesRequest,
         model_id: &str,
     ) -> Response {
+        if let Err(response) = lower_responses_request_for_local_backend(&mut body) {
+            return response;
+        }
         self.route_typed_request(headers, Some(tenant_meta), body, "/v1/responses", model_id)
             .await
     }
@@ -7535,6 +7539,143 @@ mod tests {
             .expect("the error event is a frame of its own");
         assert_eq!(error["error"]["type"], "stream_error", "{body}");
         assert_eq!(events[2], "data: [DONE]");
+    }
+
+    #[tokio::test]
+    async fn route_responses_lowers_codex_additional_tools_and_agent_message_before_forwarding() {
+        let captured = Arc::new(parking_lot::Mutex::new(None::<Value>));
+        let seen = Arc::clone(&captured);
+        let app = axum::Router::new().route(
+            "/v1/responses",
+            axum::routing::post(move |Json(payload): Json<Value>| {
+                let seen = Arc::clone(&seen);
+                async move {
+                    *seen.lock() = Some(payload);
+                    (
+                        StatusCode::OK,
+                        [(CONTENT_TYPE, "application/json")],
+                        serde_json::json!({
+                            "id": "resp_codex_sub",
+                            "object": "response",
+                            "status": "completed",
+                            "output": []
+                        })
+                        .to_string(),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test stub server lives for the duration of the test process"
+        )]
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let url = format!("http://{addr}");
+        let router = streaming_router(least_load_policy(), 1024 * 1024, vec![plain_worker(&url)]);
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-codex"));
+        let req: ResponsesRequest = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "tool_choice": "auto",
+            "store": false,
+            "input": [
+                {
+                    "type": "additional_tools",
+                    "id": "at_1",
+                    "role": "developer",
+                    "tools": [
+                        {
+                            "type": "namespace",
+                            "name": "functions",
+                            "description": "",
+                            "tools": [{
+                                "type": "function",
+                                "name": "exec_command",
+                                "description": "Execute shell command",
+                                "parameters": {"type": "object", "properties": {}}
+                            }]
+                        },
+                        {
+                            "type": "namespace",
+                            "name": "collaboration",
+                            "description": "Collab tools",
+                            "tools": [{
+                                "type": "function",
+                                "name": "send_message",
+                                "description": "Send message",
+                                "parameters": {"type": "object", "properties": {}}
+                            }]
+                        }
+                    ]
+                },
+                {
+                    "type": "message",
+                    "id": "msg_dev",
+                    "role": "developer",
+                    "content": [{"type": "input_text", "text": "System policy"}]
+                },
+                {
+                    "type": "agent_message",
+                    "id": "am_task",
+                    "author": "/root",
+                    "recipient": "/root/subagent",
+                    "content": [{"type": "input_text", "text": "Compute SHA-256 of hello"}]
+                }
+            ]
+        }))
+        .unwrap();
+
+        let response = router
+            .route_responses(None, &tenant, req, UNKNOWN_MODEL_ID)
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let forwarded = captured
+            .lock()
+            .take()
+            .expect("upstream /v1/responses must receive the lowered request");
+        let tools = forwarded["tools"].as_array().expect("lifted tools");
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0]["type"], "function");
+        assert_eq!(tools[0]["name"], "exec_command");
+        assert_eq!(tools[1]["type"], "namespace");
+        assert_eq!(tools[1]["name"], "collaboration");
+
+        let input = forwarded["input"].as_array().expect("lowered input");
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[0]["type"], "message");
+        assert_eq!(input[0]["role"], "developer");
+        assert_eq!(input[1]["type"], "message");
+        assert_eq!(input[1]["role"], "user");
+        assert_eq!(input[1]["id"], "am_task");
+        let text = input[1]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("Sender: /root"), "{text}");
+        assert!(text.contains("Recipient: /root/subagent"), "{text}");
+        assert!(text.contains("Compute SHA-256 of hello"), "{text}");
+
+        // An encrypted agent_message must be refused locally with 400 and never reach upstream.
+        let encrypted_req: ResponsesRequest = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "input": [{
+                "type": "agent_message",
+                "author": "/root",
+                "recipient": "/root/subagent",
+                "content": [{"type": "encrypted_content", "encrypted_content": "opaque"}]
+            }]
+        }))
+        .unwrap();
+        let refused = router
+            .route_responses(None, &tenant, encrypted_req, UNKNOWN_MODEL_ID)
+            .await;
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            captured.lock().is_none(),
+            "encrypted agent_message must not be forwarded upstream"
+        );
     }
 }
 

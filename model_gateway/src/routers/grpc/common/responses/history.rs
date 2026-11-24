@@ -13,10 +13,13 @@
 use std::sync::Arc;
 
 use axum::response::Response;
-use openai_protocol::responses::{
-    from_turn_boundary, generate_id, normalize_input_item, without_calls_answered_by,
-    without_outputs_of_missing_calls, McpToolCallError, ResponseContentPart, ResponseInput,
-    ResponseInputOutputItem, ResponsesRequest, StringOrContentParts,
+use openai_protocol::{
+    responses::{
+        from_turn_boundary, generate_id, normalize_input_item, without_calls_answered_by,
+        without_outputs_of_missing_calls, McpToolCallError, ResponseContentPart, ResponseInput,
+        ResponseInputOutputItem, ResponsesRequest, StringOrContentParts,
+    },
+    validated::Normalizable,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -26,8 +29,16 @@ use smg_data_connector::{
 };
 use tracing::{debug, warn};
 
-use super::{previous_response_chain, ResponsesContext};
-use crate::routers::{common::persistence_utils::split_stored_message_content, error};
+use super::{
+    previous_response_chain, utils::refuse_tools_without_a_direct_caller, ResponsesContext,
+};
+use crate::routers::{
+    common::{
+        persistence_utils::split_stored_message_content,
+        responses_compat::lower_responses_request_for_local_backend,
+    },
+    error,
+};
 
 /// How many of a conversation's stored items a request replays: its newest
 /// ones, oldest first; what is older is not in the prompt. A window this
@@ -141,6 +152,18 @@ pub(crate) async fn load_history(
             kept.extend(rest);
             *items = kept;
         }
+    }
+
+    // Lower any inline `additional_tools` / `agent_message` items (from the
+    // loaded history or the current turn) into standard top-level `tools` and
+    // `user` messages for local backends, while keeping the caller's original
+    // `request` untouched for persistence so subsequent turns can replay them.
+    lower_responses_request_for_local_backend(&mut loaded)?;
+    if continues && loaded.tool_choice.is_none() {
+        loaded.normalize();
+    }
+    if let Some(error_response) = refuse_tools_without_a_direct_caller(loaded.tools.as_deref()) {
+        return Err(error_response);
     }
 
     debug!(
@@ -293,7 +316,9 @@ fn unreplayed_kind(item: &ResponseInputOutputItem) -> Option<&'static str> {
         ResponseInputOutputItem::ApplyPatchCallOutput { .. } => Some("apply_patch_call_output"),
         ResponseInputOutputItem::LocalShellCall { .. } => Some("local_shell_call"),
         ResponseInputOutputItem::LocalShellCallOutput { .. } => Some("local_shell_call_output"),
-        ResponseInputOutputItem::Message { .. }
+        ResponseInputOutputItem::AdditionalTools { .. }
+        | ResponseInputOutputItem::AgentMessage { .. }
+        | ResponseInputOutputItem::Message { .. }
         | ResponseInputOutputItem::SimpleInputMessage { .. }
         | ResponseInputOutputItem::Reasoning { .. }
         | ResponseInputOutputItem::FunctionToolCall { .. }
@@ -630,7 +655,6 @@ async fn resolve_item_references(
 fn input_item_id(item: &ResponseInputOutputItem) -> Option<&str> {
     match item {
         ResponseInputOutputItem::Message { id, .. }
-        | ResponseInputOutputItem::Reasoning { id, .. }
         | ResponseInputOutputItem::McpApprovalRequest { id, .. }
         | ResponseInputOutputItem::ImageGenerationCall { id, .. }
         | ResponseInputOutputItem::ComputerCall { id, .. }
@@ -638,7 +662,10 @@ fn input_item_id(item: &ResponseInputOutputItem) -> Option<&str> {
         | ResponseInputOutputItem::LocalShellCallOutput { id, .. }
         | ResponseInputOutputItem::McpCall { id, .. }
         | ResponseInputOutputItem::McpListTools { id, .. } => Some(id.as_str()),
-        ResponseInputOutputItem::FunctionToolCall { id, .. }
+        ResponseInputOutputItem::Reasoning { id, .. }
+        | ResponseInputOutputItem::AdditionalTools { id, .. }
+        | ResponseInputOutputItem::AgentMessage { id, .. }
+        | ResponseInputOutputItem::FunctionToolCall { id, .. }
         | ResponseInputOutputItem::FunctionCallOutput { id, .. }
         | ResponseInputOutputItem::McpApprovalResponse { id, .. }
         | ResponseInputOutputItem::Compaction { id, .. }
@@ -1565,7 +1592,7 @@ pub(crate) mod tests {
         assert!(matches!(
             reasoning,
             ResponseInputOutputItem::Reasoning { ref id, ref content, .. }
-                if id == "reasoning_1" && content.len() == 1
+                if id.as_deref() == Some("reasoning_1") && content.len() == 1
         ));
 
         // a row with no input form is left out, not an error
@@ -1840,5 +1867,104 @@ pub(crate) mod tests {
         assert_eq!(kinds.last().map(String::as_str), Some("message:user"));
         // steps 18 to 50 whole, then the request
         assert_eq!(items.len(), 33 * 3 + 1);
+    }
+
+    /// A first turn that declares tools inline via `additional_tools` keeps
+    /// them in the stored input; a second turn continuing via
+    /// either history mechanism with only a `function_call_output` recovers
+    /// those tools even when the client sends an empty top-level list.
+    #[tokio::test]
+    async fn continuations_preserve_inline_additional_tools() {
+        let stores = Stores::with_conversation().await;
+        let turn_1_req: ResponsesRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "store": true,
+            "conversation": "conv_1",
+            "input": [
+                {
+                    "type": "additional_tools",
+                    "id": "at_1",
+                    "role": "developer",
+                    "tools": [{
+                        "type": "namespace",
+                        "name": "functions",
+                        "description": "",
+                        "tools": [{
+                            "type": "function",
+                            "name": "exec_command",
+                            "description": "Run shell command",
+                            "parameters": {"type": "object", "properties": {}}
+                        }]
+                    }]
+                },
+                {
+                    "type": "agent_message",
+                    "id": "am_1",
+                    "author": "/root",
+                    "recipient": "/root/worker",
+                    "content": [{"type": "input_text", "text": "Check status"}]
+                }
+            ]
+        }))
+        .unwrap();
+        let turn_1_resp =
+            openai_protocol::responses::ResponsesResponse::builder("resp_turn_1", "test-model")
+                .output(vec![
+                    openai_protocol::responses::ResponseOutputItem::FunctionToolCall {
+                        id: Some("fc_1".to_string()),
+                        call_id: "call_1".to_string(),
+                        name: "exec_command".to_string(),
+                        namespace: None,
+                        arguments: "{}".to_string(),
+                        output: None,
+                        status: "completed".to_string(),
+                    },
+                ])
+                .build();
+
+        super::super::utils::persist_response_if_needed(
+            stores.conversations.clone(),
+            stores.conversation_items.clone(),
+            stores.responses.clone(),
+            &turn_1_resp,
+            &turn_1_req,
+            None,
+            None,
+        )
+        .await
+        .expect("turn 1 persists");
+
+        for (field, id) in [
+            ("previous_response_id", "resp_turn_1"),
+            ("conversation", "conv_1"),
+        ] {
+            let body = json!({
+                (field): id,
+                "model": "test-model",
+                "tools": [],
+                "input": [{"type": "function_call_output", "call_id": "call_1", "output": "ok"}]
+            });
+            let mut turn_2: ResponsesRequest = serde_json::from_value(body).unwrap();
+
+            turn_2.normalize();
+            let loaded = load_history(stores.history(), &turn_2, None, ReplayInto::Chat)
+                .await
+                .expect("turn 2 reloads turn 1 history");
+            assert_eq!(serde_json::to_value(&loaded.tool_choice).unwrap(), "auto");
+            let tools = loaded.tools.as_deref().expect("lifted tools from turn 1");
+            assert_eq!(tools.len(), 1);
+            assert!(matches!(
+                &tools[0],
+                openai_protocol::responses::ResponseTool::Function(ft) if ft.function.name == "exec_command"
+            ));
+            let ResponseInput::Items(items) = &loaded.input else {
+                panic!("expected items");
+            };
+            assert_eq!(items.len(), 3);
+            assert!(matches!(
+                &items[0],
+                ResponseInputOutputItem::Message { role, .. } if role == "user"
+            ));
+        }
     }
 }
