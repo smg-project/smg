@@ -2377,10 +2377,10 @@ pub struct KeySourceSpec {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub header: Option<String>,
     /// The request's own id, the `rid` of its body: `true` names it. Under
-    /// a ring's prefix form (`prefix_tokens`) in a gateway's own process
-    /// its key names the session alone: a sessions rule pins it, and the
-    /// ring places the request by its prompt. The plain ring places by it,
-    /// and so does a served controller's prefix ring.
+    /// a ring's prefix form (`prefix_tokens`) its key names the session
+    /// alone: a sessions rule pins it, and the ring places the request by
+    /// its prompt. The plain ring places by it, and so does a controller's
+    /// prefix ring where its host's frame does not say the id handed it.
     #[serde(skip_serializing_if = "is_default")]
     pub rid: bool,
     /// The most bytes of a value this source hands, 8192 at most (default
