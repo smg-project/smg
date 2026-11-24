@@ -676,10 +676,10 @@ fn the_eviction_of_a_member_with_nothing_on_file_asks_for_no_publication() {
     let id = ready(&store, "http://w:8000");
     let loads: &dyn LoadSink = &store;
     let published = store.publications();
-    assert_eq!(loads.publish_due(), None);
+    assert_eq!(store.publish_due(), None);
     loads.evict(id);
     assert_eq!(
-        (store.publications(), loads.publish_due()),
+        (store.publications(), store.publish_due()),
         (published, None)
     );
 }

@@ -85,9 +85,6 @@ pub const ENTRIES: &[(&str, &str, EntryReplication)] = &[
         "evict",
         EntryReplication::Rebuilt("each replica drops its own load rows"),
     ),
-    ("LoadSink", "publish_due", EntryReplication::Read),
-    ("LoadSink", "publish", EntryReplication::Rebuilt(PUBLISHED)),
-    ("LoadSink", "wake_with", EntryReplication::Read),
     (
         "KvEventSink",
         "admit_through",
@@ -210,6 +207,13 @@ pub const ENTRIES: &[(&str, &str, EntryReplication)] = &[
         "publish_now",
         EntryReplication::Rebuilt(PUBLISHED),
     ),
+    ("MemoryStore", "publish_due", EntryReplication::Read),
+    (
+        "MemoryStore",
+        "publish",
+        EntryReplication::Rebuilt(PUBLISHED),
+    ),
+    ("MemoryStore", "wake_with", EntryReplication::Read),
     ("MemoryStore", "stats", EntryReplication::Read),
     ("MemoryStore", "overload_flips", EntryReplication::Read),
     ("MemoryStore", "outside_lists", EntryReplication::Read),
