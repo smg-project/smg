@@ -75,12 +75,6 @@
 //!   bound to a profile as the framework's own stages. What every plugin
 //!   kind shares (the breaker, the counters, the stage adapters) is the
 //!   `plugins::shared` module.
-//! - Behind the `ingest` feature, the ingestion drivers (`ingest`): the load
-//!   path (the `GetLoads` poll per engine under the store's poll
-//!   arbitration, the metrics scrape of an engine without a servicer) and
-//!   the metrics parser. The load driver and a worker list's records share
-//!   the `load_report` conversion.
-//!
 //! - Behind the `operator` feature, `document::operator::DocumentManager`
 //!   applies a host's start document and serves its status, document and dry
 //!   run. The feature also serves worker snapshots over the host's store.
@@ -168,7 +162,7 @@
 
 use std::{cell::Cell, collections::hash_map::RandomState, hash::BuildHasher, thread};
 
-#[cfg(any(feature = "ingest", feature = "operator"))]
+#[cfg(feature = "operator")]
 mod address;
 pub mod document;
 pub mod engine;

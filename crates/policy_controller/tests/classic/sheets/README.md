@@ -399,11 +399,11 @@ behavior did, and the drawn rows are a new sample.
 
 ## Reading
 
-The crate's replay reads this directory, every run of its suite with the `ingest`, `in-process` and `worker-host`
+The crate's replay reads this directory, every run of its suite with the `in-process` and `worker-host`
 features:
 
 ```bash
-cargo test -p smg-policy-controller --features ingest,in-process,worker-host --test classic_rows
+cargo test -p smg-policy-controller --features in-process,worker-host --test classic_rows
 ```
 
 A few rows of each sheet a module replays are also copied into the crate's test source, and the replay holds each

@@ -357,9 +357,11 @@ mod tests {
     use crate::{
         document::operator::test_support::Logged,
         engine::view::WorkerId,
-        load::ingest::probe::install_crypto_provider,
         service::{
-            controller::{config::tests::valid, Controller, Scope, State, PRINCIPAL_ENTRY},
+            controller::{
+                config::tests::valid, tls::install_crypto_provider, Controller, Scope, State,
+                PRINCIPAL_ENTRY,
+            },
             proto::{self, policy_controller_client::PolicyControllerClient, worker_event::Event},
         },
         store::{MemoryStore, WorkerStatus, WorkersStore},
