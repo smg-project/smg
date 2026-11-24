@@ -425,9 +425,10 @@ impl Checked {
             // as it learns it from the rows.
             ring: None,
             ring_positions: &[],
-            // No frame states where a key came from: a served controller's
-            // prefix ring places by any session key.
-            session_key_from_rid: false,
+            // The frame states who handed the key. A host older than the
+            // field states nothing: its frame reads false, and a prefix
+            // ring places it by its key, as before the field.
+            session_key_from_rid: facts.session_key_from_rid,
         }
     }
 
@@ -1287,6 +1288,7 @@ pub(crate) mod tests {
                 prompt_text: Vec::new(),
                 block_size: 25,
                 client_key: 29,
+                session_key_from_rid: true,
             }),
             constraints: Some(proto::Constraints {
                 excluded: vec![26, 27, 28],

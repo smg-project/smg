@@ -919,10 +919,11 @@ pub struct ConsistentHashParams {
     /// depth, a shorter request whole, and a text at four characters a
     /// token. A routing key the request's own id handed (a `rid` source)
     /// leads no prompt under this form: it names the session alone, and
-    /// the request is keyed by its prefix as one with no routing key. That
-    /// holds in a gateway's own process: no frame states where a key came
-    /// from, so under a controller's address the id's key places as any
-    /// other. Absent, a request with no routing key has none.
+    /// the request is keyed by its prefix as one with no routing key. A
+    /// gateway's frame states to a controller where the key came from.
+    /// The frame of a host older than that field states nothing, and
+    /// under it the id's key places as any other. Absent, a request with
+    /// no routing key has none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1))]
     pub prefix_tokens: Option<u32>,
@@ -2378,10 +2379,10 @@ pub struct KeySourceSpec {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub header: Option<String>,
     /// The request's own id, the `rid` of its body: `true` names it. Under
-    /// a ring's prefix form (`prefix_tokens`) in a gateway's own process
-    /// its key names the session alone: a sessions rule pins it, and the
-    /// ring places the request by its prompt. The plain ring places by it,
-    /// and so does a served controller's prefix ring.
+    /// a ring's prefix form (`prefix_tokens`) its key names the session
+    /// alone: a sessions rule pins it, and the ring places the request by
+    /// its prompt. The plain ring places by it, and so does a controller's
+    /// prefix ring where its host's frame does not say the id handed it.
     #[serde(skip_serializing_if = "is_default")]
     pub rid: bool,
     /// The most bytes of a value this source hands, 8192 at most (default

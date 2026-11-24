@@ -599,7 +599,6 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
                 "signal_cells",
                 "ring",
                 "ring_positions",
-                "session_key_from_rid",
             ],
             wire_only: &["prompt_text"],
             wire: &[
@@ -623,6 +622,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
                 ("prompt_text", Type::Bytes),
                 ("block_size", Type::Uint32),
                 ("client_key", Type::Fixed64),
+                ("session_key_from_rid", Type::Bool),
             ],
             repeated: &["block_hashes", "tried", "headers"],
             optional: &[],
