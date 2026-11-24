@@ -520,7 +520,7 @@ The store keeps the values for you. A worker's load report can state values by n
 What to expect of a stored value:
 
 - It stays until a newer one arrives or its `max_age_ms` passes. A report that leaves a name out removes nothing.
-- A value is as old as its report. A value reported with its own age is that much older. The stock controller dates a polled report by the stamp its answer carries, else at the start of its poll.
+- A value is as old as its report. A value reported with its own age is that much older. The stock controller's load monitor dates a polled report when it reads the answer.
 - A row and its values are two writes. One decision can read a new row beside the values of the report before.
 - Where one row's report holds several ranks, the row has a value only where every rank states the name under one unit. The ranks' values are then made one as `across_ranks` says, under the oldest sample among them. A worker that pushes its load dates each rank by that rank's own record, so a rank that stops reporting ends the row's value at `max_age_ms`.
 - A new document keeps the values of every name it declares again under the same unit and the same `across_ranks`. A name whose unit or `across_ranks` changed starts with no value. A value a report made under the document before is dropped where its name changed so, and counted as `undeclared`.
