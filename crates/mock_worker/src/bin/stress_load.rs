@@ -10,6 +10,11 @@
 //! but not sampled. One JSON summary on stdout at the end (`--out` writes it
 //! too); `STRESS_INTERIM {...}` counters on stderr every `--interim` seconds.
 //!
+//! `--closed-loop N` drives a closed loop instead: N callers, each sending
+//! its next request the moment its last one ended, so the answers set the
+//! rate and no request is skipped. `achieved_rps` counts, as in the open
+//! loop, the requests that started inside the window and ended well.
+//!
 //! Modes (`--mode`): `chat` (chat completions; `--stream` for SSE), `tools`
 //! (a tool-heavy conversation: `--turns` tool-call rounds over `--tools`
 //! function schemas), `responses` (the Responses API with `store: true`,
@@ -36,6 +41,7 @@
 
 use std::{
     collections::BTreeMap,
+    num::NonZeroUsize,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -50,7 +56,7 @@ use clap::{Parser, ValueEnum};
 use futures::StreamExt;
 use serde::Serialize;
 use serde_json::{json, Value};
-use tokio::task::JoinSet;
+use tokio::task::{coop, JoinSet};
 
 /// A few hundred common words: prompts are made of these so a BPE tokenizer
 /// with a large vocabulary gives about one token per word.
@@ -107,7 +113,7 @@ enum Mode {
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "stress_load",
-    about = "Open-loop load client for the gateway stress bed (chat, tools, responses, image, messages, embeddings, generate, completion)"
+    about = "Load client for the gateway's stress runs, open loop or closed loop (chat, tools, responses, image, messages, embeddings, generate, completion)"
 )]
 struct Args {
     /// Gateway base URL.
@@ -124,6 +130,11 @@ struct Args {
     /// Requests per second, open loop (fractional allowed).
     #[arg(long, default_value_t = 100.0)]
     rate: f64,
+    /// A closed loop of this many callers instead of a rate: each caller
+    /// sends its next request the moment its last one ended (answered or
+    /// failed), so none is skipped.
+    #[arg(long, conflicts_with_all = ["rate", "max_inflight"])]
+    closed_loop: Option<NonZeroUsize>,
     /// Sampled seconds after the warm-up.
     #[arg(long, default_value_t = 60)]
     duration: u64,
@@ -181,8 +192,8 @@ struct Args {
     /// `previous_response_id`; a new session starts after the last).
     #[arg(long, default_value_t = 10)]
     chain: usize,
-    /// Concurrent sessions kept in `--mode responses` (0: four per req/s,
-    /// at least 64).
+    /// Concurrent sessions kept in `--mode responses` (0: four per req/s, or
+    /// one per caller of a closed loop; at least 64).
     #[arg(long, default_value_t = 0)]
     sessions: usize,
     /// Tokio worker threads of the client.
@@ -956,6 +967,9 @@ struct Summary {
     mode: String,
     stream: bool,
     rate_target: f64,
+    /// The callers of a closed loop; an open-loop summary has no such key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    closed_loop: Option<NonZeroUsize>,
     duration_s: u64,
     warmup_s: u64,
     wall_s: f64,
@@ -995,7 +1009,8 @@ fn summarize(shared: &Shared, wall: Duration, unfinished: u64) -> Summary {
     Summary {
         mode: format!("{:?}", shared.args.mode).to_lowercase(),
         stream: shared.args.stream,
-        rate_target: shared.args.rate,
+        rate_target: shared.args.closed_loop.map_or(shared.args.rate, |_| 0.0),
+        closed_loop: shared.args.closed_loop,
         duration_s: shared.args.duration,
         warmup_s: shared.args.warmup,
         wall_s: wall.as_secs_f64(),
@@ -1066,6 +1081,8 @@ async fn run(args: Args) -> Result<Summary> {
     let bodies = build_bodies(&args)?;
     let sessions = if args.sessions > 0 {
         args.sessions
+    } else if let Some(callers) = args.closed_loop {
+        callers.get().max(64)
     } else {
         ((args.rate * 4.0).ceil() as usize).max(64)
     };
@@ -1104,24 +1121,45 @@ async fn run(args: Args) -> Result<Summary> {
             }
         })
     });
-    loop {
-        ticker.tick().await;
-        let elapsed = start.elapsed();
-        if elapsed >= total {
-            break;
+    if let Some(callers) = args.closed_loop {
+        for _ in 0..callers.get() {
+            let shared = Arc::clone(&shared);
+            tasks.spawn(async move {
+                loop {
+                    // A send that fails without a wait must not hold its
+                    // thread to the end of the window.
+                    coop::consume_budget().await;
+                    let elapsed = start.elapsed();
+                    if elapsed >= total {
+                        break;
+                    }
+                    let i = shared.stats.sent.fetch_add(1, Ordering::Relaxed) + 1;
+                    shared.stats.note_inflight();
+                    one(Arc::clone(&shared), i, elapsed >= warm).await;
+                }
+            });
         }
-        while tasks.try_join_next().is_some() {}
-        let due = (elapsed.as_secs_f64() * args.rate).floor() as u64;
-        while launched < due {
-            let sampled = elapsed >= warm;
-            launched += 1;
-            if shared.stats.inflight.load(Ordering::Relaxed) >= args.max_inflight {
-                shared.stats.skipped.fetch_add(1, Ordering::Relaxed);
-                continue;
+        tokio::time::sleep_until((start + total).into()).await;
+    } else {
+        loop {
+            ticker.tick().await;
+            let elapsed = start.elapsed();
+            if elapsed >= total {
+                break;
             }
-            shared.stats.sent.fetch_add(1, Ordering::Relaxed);
-            shared.stats.note_inflight();
-            tasks.spawn(one(Arc::clone(&shared), launched, sampled));
+            while tasks.try_join_next().is_some() {}
+            let due = (elapsed.as_secs_f64() * args.rate).floor() as u64;
+            while launched < due {
+                let sampled = elapsed >= warm;
+                launched += 1;
+                if shared.stats.inflight.load(Ordering::Relaxed) >= args.max_inflight {
+                    shared.stats.skipped.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                shared.stats.sent.fetch_add(1, Ordering::Relaxed);
+                shared.stats.note_inflight();
+                tasks.spawn(one(Arc::clone(&shared), launched, sampled));
+            }
         }
     }
     let drain_until = Instant::now() + Duration::from_secs(args.drain);
@@ -1533,5 +1571,92 @@ mod tests {
         assert_eq!(percentile(&sorted, 0.5), 3.0);
         assert_eq!(percentile(&sorted, 1.0), 100.0);
         assert_eq!(percentile(&[], 0.5), 0.0);
+    }
+
+    /// Three callers against a server that holds every answer for a permit:
+    /// three requests are out and no fourth, and one answer, a refusal,
+    /// brings one more.
+    #[tokio::test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the server and the load end with the test's runtime"
+    )]
+    async fn a_closed_loop_caller_sends_its_next_request_at_its_answer() {
+        for refused in [
+            &["--closed-loop", "0"][..],
+            &["--closed-loop", "3", "--rate", "5"],
+            &["--closed-loop", "3", "--max-inflight", "8"],
+        ] {
+            let words = ["stress_load"].iter().chain(refused);
+            assert!(Args::try_parse_from(words).is_err(), "{refused:?}");
+        }
+
+        let seen = Arc::new(AtomicU64::new(0));
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let held = {
+            let (seen, gate) = (Arc::clone(&seen), Arc::clone(&gate));
+            move || async move {
+                seen.fetch_add(1, Ordering::Relaxed);
+                match gate.acquire().await {
+                    Ok(permit) => {
+                        permit.forget();
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE
+                    }
+                    Err(_) => axum::http::StatusCode::OK,
+                }
+            }
+        };
+        let app = axum::Router::new().route("/v1/chat/completions", axum::routing::post(held));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gateway = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        let args = Args::try_parse_from([
+            "stress_load",
+            "--gateway",
+            &gateway,
+            "--closed-loop",
+            "3",
+            "--warmup",
+            "0",
+            "--duration",
+            "3",
+            "--interim",
+            "0",
+            "--distinct",
+            "1",
+        ]);
+        let load = tokio::spawn(run(args.expect("a closed loop is a flag")));
+
+        let requests = |n: u64| {
+            let seen = Arc::clone(&seen);
+            tokio::time::timeout(Duration::from_secs(5), async move {
+                while seen.load(Ordering::Relaxed) < n {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+        };
+        requests(3).await.expect("each caller sends a request");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            seen.load(Ordering::Relaxed),
+            3,
+            "a caller waits for its answer"
+        );
+        gate.add_permits(1);
+        requests(4)
+            .await
+            .expect("the answered caller sends its next request");
+
+        gate.close();
+        let summary = load.await.unwrap().unwrap();
+        assert_eq!(summary.sent, seen.load(Ordering::Relaxed));
+        assert_eq!((summary.ok + 1, summary.failed), (summary.sent, 1));
+        assert_eq!((summary.skipped, summary.unfinished), (0, 0));
+        assert_eq!(summary.inflight_max, 3);
+        let read = serde_json::to_value(&summary).unwrap();
+        assert_eq!(
+            (&read["closed_loop"], &read["rate_target"]),
+            (&json!(3), &json!(0.0))
+        );
     }
 }
