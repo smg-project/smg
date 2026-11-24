@@ -1,6 +1,7 @@
 //! The `round_robin` policy: how it is composed, and the picker only it uses.
 
 use std::{
+    cell::Cell,
     hash::Hasher,
     sync::atomic::{AtomicU64, Ordering},
 };
@@ -86,6 +87,239 @@ const EMPTY_SLOT: u64 = u64::MAX;
 const POSITION_BITS: u32 = 32;
 
 const POSITION_MASK: u64 = (1 << POSITION_BITS) - 1;
+
+/// How many pools a thread keeps a place for ([`row_of`]).
+const KEPT_RUNS: usize = 4;
+
+/// The lengths of a run of turns: a pool's runs take the first that does
+/// not divide its size, so they start at each of its workers in turn. Runs
+/// of a length that divided the size would start at few of its workers.
+const RUN_LENGTHS: [u64; 2] = [61, 67];
+
+/// The single steps a thread takes of a pool's word for each worker of the
+/// pool before its first run of the word's turns ([`begin_run`]).
+const STEPS_FIRST: u64 = 64;
+
+/// The asks in a row that must find a held place unused before it goes to
+/// the pool that asks ([`begin_run`]): a pool the thread still decides for
+/// keeps its place beside a fifth one.
+const IDLE_ASKS: u64 = 64;
+
+/// A thread's place for one pool: its count of single steps, then its run
+/// of turns of the pool's word.
+struct Run {
+    /// The pool: its word's address and its size, so one word asked under
+    /// two sizes has a place for each. A pool of the same size made where
+    /// a dropped pool's word stood keeps the place: it plays the turns the
+    /// thread had left of that one first, as a run left behind, and takes
+    /// the single steps that one had not taken.
+    pool: Cell<(usize, usize)>,
+    /// The run's next turn and the turn after its last: the same turn
+    /// where the thread holds no run of the pool.
+    next: Cell<u64>,
+    end: Cell<u64>,
+    /// The turn of the pool's first worker at or under the next turn: a
+    /// turn's row is counted from it, and divided out once a lap.
+    lap: Cell<u64>,
+    /// The single steps the thread took of the pool's word in this place.
+    steps: Cell<u64>,
+    /// The next turn the place had when a pool last asked for it
+    /// ([`begin_run`]).
+    asked_at: Cell<u64>,
+    /// The asks in a row that found no turn taken in the place since the
+    /// ask before.
+    idle: Cell<u64>,
+}
+
+impl Run {
+    /// The row of the run's next turn, where the run has one left.
+    #[inline]
+    fn play(&self, rows: usize) -> Option<usize> {
+        let turn = self.next.get();
+        if turn == self.end.get() {
+            return None;
+        }
+        self.next.set(turn.wrapping_add(1));
+        let row = turn.wrapping_sub(self.lap.get());
+        if row < rows as u64 {
+            return Some(row as usize);
+        }
+        // The turn begins a lap of the pool.
+        let row = turn % rows as u64;
+        self.lap.set(turn - row);
+        Some(row as usize)
+    }
+
+    /// One ask for the place: the asks in a row, this one counted, that
+    /// found no turn taken in it since the ask before.
+    fn ask(&self) -> u64 {
+        let next = self.next.get();
+        let idle = if self.asked_at.replace(next) == next {
+            self.idle.get() + 1
+        } else {
+            0
+        };
+        self.idle.set(idle);
+        idle
+    }
+
+    /// The two places change pools: each pool goes on in the other's place
+    /// with all its own held, so no turn is dropped.
+    fn swap(&self, other: &Self) {
+        self.pool.swap(&other.pool);
+        self.next.swap(&other.next);
+        self.end.swap(&other.end);
+        self.lap.swap(&other.lap);
+        self.steps.swap(&other.steps);
+        self.asked_at.swap(&other.asked_at);
+        self.idle.swap(&other.idle);
+    }
+}
+
+thread_local! {
+    /// The calling thread's places, one a pool.
+    static RUNS: [Run; KEPT_RUNS] = const {
+        [const {
+            Run {
+                pool: Cell::new((0, 0)),
+                next: Cell::new(0),
+                end: Cell::new(0),
+                lap: Cell::new(0),
+                steps: Cell::new(0),
+                asked_at: Cell::new(0),
+                idle: Cell::new(0),
+            }
+        }; KEPT_RUNS]
+    };
+    /// The place a pool with none asks for next.
+    static ASKED: Cell<usize> = const { Cell::new(0) };
+}
+
+/// The row the calling thread's next turn lands on, of the pool of `rows`
+/// workers whose word is `word`: the row a single step of the word gives
+/// that turn.
+///
+/// A thread that stays with a pool takes a run of the word's turns at once
+/// and plays them one by one, so the word every deciding thread shares is
+/// written once a run ([`begin_run`]). Each turn of the word is handed out
+/// once and the turns of a run follow one another: a thread that decides
+/// alone takes the pool's workers in the order single steps give for as
+/// long as it keeps the pool's place. Across threads the picks follow no
+/// one order. Until the word wraps, for one pool, a word under one size,
+/// the turns two workers took part by one at most, and by one more for
+/// each run that holds turns not played: the run a thread plays from, and
+/// each run left behind, by a thread that ended or by a place given up
+/// ([`begin_run`]).
+#[inline]
+fn row_of(word: &AtomicU64, rows: usize) -> usize {
+    first_turn(word, rows).unwrap_or_else(|| later_turn(word, rows))
+}
+
+/// The pool's row where the thread's first place is the pool's and holds a
+/// turn: all a thread that decides for one pool reads.
+#[inline]
+fn first_turn(word: &AtomicU64, rows: usize) -> Option<usize> {
+    let pool = (std::ptr::from_ref(word).addr(), rows);
+    RUNS.with(|runs| {
+        let first = &runs[0];
+        if first.pool.get() == pool {
+            first.play(rows)
+        } else {
+            None
+        }
+    })
+}
+
+/// The pool's row where the thread's first place is not the pool's or holds
+/// no turn: the next turn of the pool's own place, or a turn the thread
+/// takes of the word. Kept out of line, so a thread that decides for one
+/// pool pays for the one place it reads.
+#[inline(never)]
+fn later_turn(word: &AtomicU64, rows: usize) -> usize {
+    let pool = (std::ptr::from_ref(word).addr(), rows);
+    RUNS.with(|runs| {
+        let own = runs.iter().find(|run| run.pool.get() == pool);
+        own.and_then(|run| run.play(rows))
+            .unwrap_or_else(|| begin_run(runs, own, word, pool))
+    })
+}
+
+/// [`Picker::pick_alone`] where the thread's first place gives no turn.
+/// Kept out of line whole, with its call of `keep`, so the pick the first
+/// place gives saves no register around this one.
+#[inline(never)]
+fn later_pick(pool: &PoolWord<'_>, keep: &mut dyn FnMut(usize) -> bool) -> Option<usize> {
+    let turn = later_turn(pool.word, pool.rows);
+    keep(turn).then_some(turn)
+}
+
+/// The row of a turn the calling thread takes of the pool's word: a single
+/// step, or the first turn of a run.
+///
+/// A thread's first turns of a pool are single steps, [`STEPS_FIRST`] for
+/// each worker of the pool: a thread that ends before leaves no turn
+/// unplayed. Past them it takes a run whenever it holds none, and a thread
+/// that ends then leaves the turns of one run, which part the picks of two
+/// workers by one at most. A run stops at the top of the word: the turns
+/// it took past the top are not played, so no row is counted across the
+/// wrap.
+///
+/// The steps are counted in the pool's place. A pool with none asks the
+/// thread's places for one, one place a turn: a place no pool holds gives
+/// itself at once; a held place gives itself up once [`IDLE_ASKS`] asks in
+/// a row found no turn taken in it, and the turns its run had left are not
+/// played; a place in use stays. A pool takes single steps for as
+/// long as it has no place, so a fifth pool beside four in use pays this
+/// look and a step of the word on every turn.
+///
+/// A pick reads the thread's first place in line ([`first_turn`]). A pool
+/// that takes a run from a later place asks for the first: where that gave
+/// no turn since the ask before, the two pools change places, each with
+/// all its place held. So a pool the thread decides for alone, as one made
+/// anew where its workers changed, is read in line from its second run on.
+#[cold]
+fn begin_run(
+    runs: &[Run; KEPT_RUNS],
+    own: Option<&Run>,
+    word: &AtomicU64,
+    pool: (usize, usize),
+) -> usize {
+    let rows = pool.1 as u64;
+    let place = own.or_else(|| {
+        let run = &runs[ASKED.replace((ASKED.get() + 1) % KEPT_RUNS)];
+        (run.ask() >= IDLE_ASKS || run.pool.get().1 == 0).then(|| {
+            run.pool.set(pool);
+            run.steps.set(0);
+            run.idle.set(0);
+            run
+        })
+    });
+    let Some(mut run) = place else {
+        return (word.fetch_add(1, Ordering::Relaxed) % rows) as usize;
+    };
+    let steps = run.steps.get();
+    let length = if steps < STEPS_FIRST.saturating_mul(rows) {
+        run.steps.set(steps + 1);
+        1
+    } else {
+        RUN_LENGTHS
+            .into_iter()
+            .find(|&length| !rows.is_multiple_of(length))
+            .unwrap_or(1)
+    };
+    let first_place = &runs[0];
+    if length > 1 && !std::ptr::eq(run, first_place) && first_place.ask() > 0 {
+        run.swap(first_place);
+        run = first_place;
+    }
+    let first = word.fetch_add(length, Ordering::Relaxed);
+    let row = first % rows;
+    run.next.set(first.wrapping_add(1));
+    run.end.set(first.checked_add(length).unwrap_or(0));
+    run.lap.set(first - row);
+    run.asked_at.set(u64::MAX);
+    row as usize
+}
 
 impl Default for RotationBucket {
     fn default() -> Self {
@@ -239,7 +473,7 @@ impl Picker for RoundRobin {
         true
     }
 
-    /// The pool's own turn by the pool's own word: one step of the word and
+    /// The pool's own turn by the pool's own word: one turn of the word and
     /// one read of the worker the turn lands on, which is the pick where
     /// the caller keeps it. A turn that lands on a refused worker picks
     /// nobody: the caller reads the pool whole, and the workers that pass
@@ -257,7 +491,9 @@ impl Picker for RoundRobin {
         if rows == 0 {
             return None;
         }
-        let turn = pool.word.fetch_add(1, Ordering::Relaxed) as usize % rows;
+        let Some(turn) = first_turn(pool.word, rows) else {
+            return later_pick(pool, keep);
+        };
         keep(turn).then_some(turn)
     }
 
@@ -302,11 +538,10 @@ impl Picker for RoundRobin {
         if rows == 0 || facts.attempt != 0 || !facts.tried.is_empty() {
             return false;
         }
-        let turn = match pool.word {
-            Some(word) => word.fetch_add(1, Ordering::Relaxed),
-            None => self.advance(Self::pool_key(facts, pool, rows)),
+        let pick = match pool.word {
+            Some(word) => row_of(word, rows),
+            None => self.advance(Self::pool_key(facts, pool, rows)) as usize % rows,
         };
-        let pick = turn as usize % rows;
         if !keep(&candidates[pick]) {
             return false;
         }
@@ -422,6 +657,109 @@ mod tests {
         assert_eq!((read(&word), read(&rr.claims)), (23, 0));
         drawn(&PoolFacts::default());
         assert_eq!((read(&word), read(&rr.claims)), (23, 1));
+    }
+
+    /// A thread's first turns of a pool are single steps of the pool's
+    /// word, so threads that take one turn and end leave every turn played.
+    /// A thread that stays takes the word's turns a run at a time, in the
+    /// order single steps give.
+    #[test]
+    fn a_thread_takes_a_pools_turns_in_runs_once_it_stays() {
+        // On a thread of its own, whose places are all free.
+        let stays = std::thread::spawn(|| {
+            let rr = RoundRobin::new();
+            let word = AtomicU64::new(0);
+            let pool = PoolWord {
+                rows: 62,
+                word: &word,
+            };
+            let turn = || rr.pick_alone(&pool, &mut |_| true).expect("a kept row");
+            // Threads that take one turn of the pool and end, a turn of
+            // this thread between them: every worker takes one.
+            let mut picked = [0; 62];
+            for _ in 0..31 {
+                let once = std::thread::scope(|ends| ends.spawn(turn).join());
+                picked[once.expect("its turn")] += 1;
+                picked[turn()] += 1;
+            }
+            assert_eq!(picked, [1; 62]);
+            // This thread stays. Its single steps, 64 a worker, end at the
+            // turn 3,999: from there one write of the word takes 61 turns,
+            // and the thread's rows go on in the order single steps give.
+            let steps = 31 + STEPS_FIRST as usize * 62;
+            for step in 62..steps {
+                assert_eq!(turn(), step % 62);
+            }
+            assert_eq!(word.load(Ordering::Relaxed), steps as u64);
+            for played in steps..steps + 62 {
+                assert_eq!(turn(), played % 62);
+            }
+            assert_eq!(word.load(Ordering::Relaxed), steps as u64 + 2 * 61);
+            // A run stops at the top of the word. The thread plays the 60
+            // turns left of its run, then takes 61 turns 31 under the top:
+            // it plays those 31, and its next run starts at the turn 30,
+            // where the word stands.
+            word.store(u64::MAX - 30, Ordering::Relaxed);
+            for _ in 0..60 {
+                turn();
+            }
+            for under in (0..31).rev() {
+                assert_eq!(turn() as u64, (u64::MAX - under) % 62);
+            }
+            assert_eq!((turn(), word.load(Ordering::Relaxed)), (30, 30 + 61));
+        });
+        stays.join().expect("the thread's asserts hold");
+    }
+
+    /// A fifth pool takes single steps beside four that are decided for:
+    /// none of the four loses its place to it. Decided for alone, it takes
+    /// the place of one that went unused and moves to the thread's first.
+    #[test]
+    fn a_fifth_pool_leaves_four_pools_in_use_their_places() {
+        let places = std::thread::spawn(|| {
+            let rr = RoundRobin::new();
+            let words: [AtomicU64; 5] = std::array::from_fn(|_| AtomicU64::new(0));
+            let pick = |list: usize| {
+                let pool = PoolWord {
+                    rows: 3,
+                    word: &words[list],
+                };
+                rr.pick_alone(&pool, &mut |_| true).expect("a kept row")
+            };
+            // Four pools past their single steps, 64 for each of 3 workers.
+            for step in 0..192 * 4 {
+                pick(step % 4);
+            }
+            // Five pools in an order that leaves none out for long: the
+            // four go on in runs of 61, the fifth in single steps.
+            let (mut order, mut fifth) = (1_u64, 0);
+            for _ in 0..10_000 {
+                order = order
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                let list = (order >> 33) as usize % 5;
+                fifth += u64::from(list == 4);
+                pick(list);
+            }
+            for word in &words[..4] {
+                assert_eq!((word.load(Ordering::Relaxed) - 192) % 61, 0);
+            }
+            assert_eq!(words[4].load(Ordering::Relaxed), fifth);
+            // The fifth decided for alone: a place goes to it once 64 asks
+            // in a row found it unused, and past its own single steps it
+            // goes on in runs, read from the thread's first place.
+            for _ in 0..4 * 65 + 192 + 61 {
+                pick(4);
+            }
+            let before = words[4].load(Ordering::Relaxed);
+            for _ in 0..60 {
+                pick(4);
+            }
+            assert_eq!((words[4].load(Ordering::Relaxed) - before) % 61, 0);
+            let first = RUNS.with(|runs| runs[0].pool.get());
+            assert_eq!(first, (std::ptr::from_ref(&words[4]).addr(), 3));
+        });
+        places.join().expect("the thread's asserts hold");
     }
 
     #[test]

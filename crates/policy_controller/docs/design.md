@@ -992,7 +992,7 @@ On main three pickers say so: round robin, `random` and `passthrough`.
 
    | Picker | Its rule |
    |---|---|
-   | round robin | It adds one to the list's counter and takes the worker it lands on if that worker is eligible. Where it is not, the engine reads the list once and the rotation picks among the eligible workers. |
+   | round robin | It takes the next turn of the list's counter and takes the worker it lands on if that worker is eligible. Where it is not, the engine reads the list once and the rotation picks among the eligible workers. A thread's first turns of a list are single steps of the counter, 64 for each worker; past them the thread takes 61 turns at once (67 where 61 divides the list's size, one where 67 does too) and plays them in order, for four lists at a time. |
    | `random` | It draws a position below the list's size from the calling thread's own draw sequence, and again while the worker drawn is not eligible, eight draws at most. Past them the engine reads the list once and draws among the eligible workers. |
    | `passthrough` | It takes the first eligible worker in the list's order. |
 
@@ -1060,7 +1060,12 @@ What one decision writes:
 - the record of sent prefixes, where a cache-affinity profile decides;
 - once for each new load snapshot and list, the converted load reports, which allocates.
 
-On the short path it allocates nothing. A draw that looked up load reports counts them toward its
+On the short path it allocates nothing. Under round robin not every decision writes the list's
+counter: past a thread's first turns of a list, 64 for each worker, the thread takes 61 turns of the
+counter in one write (67 where 61 divides the list's size, one where 67 does too), and between two
+such writes a pick writes the thread's own run alone. A thread keeps such runs for four lists; a
+fifth writes the counter on every pick until one of the four places goes unused.
+A draw that looked up load reports counts them toward its
 list's conversion where it takes the list's claim, which it tries and never waits for.
 
 ### 5.7 One engine **[partly]**
