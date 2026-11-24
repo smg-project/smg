@@ -573,7 +573,7 @@ fn a_lists_word_is_of_the_phase_it_was_first_asked_for() {
         let published = PublishedList::new(Arc::clone(&list));
         let members = engine.members_of(published.lent());
         for phase in order.into_iter().chain(order) {
-            let reads = members.reads_signal(engine.spec(), MODEL, phase);
+            let reads = members.reads_signal(engine.standing_spec(), MODEL, phase);
             assert_eq!(reads, phase == Phase::Decode, "{phase:?} of {order:?}");
         }
     }

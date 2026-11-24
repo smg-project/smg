@@ -1765,6 +1765,11 @@ mod tests {
             "and the next view brings it back"
         );
         assert_eq!(scorer.ring().len(), 4);
+        // A join told again of a member that stands changes no score.
+        let before = out.clone();
+        scorer.on_membership(&Membership::Added(gone));
+        scorer.score(&keyed(3), &pool, &kept, &mut out);
+        assert_eq!((scorer.ring().len(), &out), (4, &before), "told twice");
         // A replacing handle is named too: the old id leaves, the new one
         // is admitted even when it repeats the old (a reused address).
         scorer.on_membership(&Membership::Replaced {

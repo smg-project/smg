@@ -470,7 +470,8 @@ pub enum OverlapSource {
     None,
     /// The event index.
     Index,
-    /// The sent-prefix predictor.
+    /// What the worker was sent: the sent-prefix predictor, or the match of
+    /// a token tree the host lends.
     Predictor,
 }
 
@@ -484,10 +485,14 @@ pub enum OverlapSource {
 /// a single decision, from the first target's entry of the rows that
 /// decision was given: the rows the engine named from the host's own data,
 /// a caller's column, or the rows a caller named. No stage is asked. A
-/// decision given no rows states nothing. Neither does a pair, a request
-/// decided inside a caller's token tree, or a pick the binding's sessions
-/// rule keeps from the profile. [`Engine::decide`](crate::engine::Engine::decide)
-/// itself states nothing.
+/// decision given no rows states nothing. Neither does a pair, or a pick
+/// the binding's sessions rule keeps from the profile.
+/// [`Engine::decide`](crate::engine::Engine::decide) itself states nothing.
+///
+/// A request decided inside a token tree its host lends is given the rows
+/// the tree's match names, and its pick states by them: the match's tokens
+/// counted in the request's blocks for a worker among the match's holders,
+/// and a miss for any other. A match under one block is a miss.
 ///
 /// Six bytes, in bytes a pick's targets had spare behind their count: a
 /// pick is no larger for it ([`Pick::overlap`]).

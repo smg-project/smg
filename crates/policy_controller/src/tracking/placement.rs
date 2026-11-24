@@ -162,9 +162,8 @@ pub struct Placement<'a> {
     /// alone ([`Pick::overlap`](crate::engine::Pick::overlap)), so it
     /// stands here where the request goes to that target.
     /// [`Overlap::NONE`], which states nothing, where the pick states none,
-    /// as a pair's and one made inside a lent token tree do. So too for a
-    /// place of which nothing is owed, and for a request that goes to a
-    /// later target of its pick.
+    /// as a pair's does. So too for a place of which nothing is owed, and
+    /// for a request that goes to a later target of its pick.
     pub overlap: Overlap,
     /// The pick's lease: a pair's always, a single request's where a stage
     /// of the document takes a word of a request. `None` for an answer of

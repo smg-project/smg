@@ -145,7 +145,7 @@ fn whole() -> Answer {
 /// hold stands.
 fn taken(reach: &[Reach], asking: Asking, vetoes: &[(usize, bool)]) -> Answer {
     let (engine, members) = list(reach.len());
-    let records = members.records(engine.spec(), engine.clock());
+    let records = members.records(engine.standing_spec(), engine.clock());
     let ids = records.ids();
     let vetoes = vetoes.iter().map(|&(place, held)| StandingVeto {
         id: ids[place],
@@ -313,7 +313,7 @@ fn a_veto_on_a_worker_that_is_no_place_says_nothing() {
     );
 
     let (engine, members) = list(2);
-    let records = members.records(engine.spec(), engine.clock());
+    let records = members.records(engine.standing_spec(), engine.clock());
     let reach = ListReach::new([any(HTTP), any(HTTP)]);
     let elsewhere = StandingVeto {
         id: WorkerId(u64::MAX),
@@ -330,7 +330,7 @@ fn a_veto_on_a_worker_that_is_no_place_says_nothing() {
 #[test]
 fn a_later_frames_places_hold_nothing_of_an_earlier_frames() {
     let (engine, members) = list(3);
-    let records = members.records(engine.spec(), engine.clock());
+    let records = members.records(engine.standing_spec(), engine.clock());
     let ids = records.ids();
     let mixed = ListReach::new([any(HTTP), any(GRPC), any(HTTP)]);
     let every = ListReach::new([any(HTTP), any(HTTP), any(HTTP)]);
@@ -386,7 +386,7 @@ fn a_veto_holds_its_workers_position_back_over_a_lent_list() {
     let lent = objects.lent(&generation, Role::Single);
     let records = engine
         .members_of(lent)
-        .records(engine.spec(), engine.clock());
+        .records(engine.standing_spec(), engine.clock());
     assert_eq!(records.ids(), [first, second, third]);
     let reach = objects.reach(&generation, Role::Single);
     let stated = [any(HTTP), local(ASKER, HTTP), any(HTTP)];
@@ -434,7 +434,7 @@ fn measure_one_ask() {
     let mut number = || named.next().and_then(|n| n.parse::<usize>().ok());
     let (workers, asks) = (number().expect("the workers"), number().expect("the asks"));
     let (engine, members) = list(workers);
-    let records = members.records(engine.spec(), engine.clock());
+    let records = members.records(engine.standing_spec(), engine.clock());
     let reach = ListReach::new((0..workers).map(|at| {
         if form == "wires" && at % 3 == 2 {
             any(GRPC)

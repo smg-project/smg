@@ -955,44 +955,28 @@ fn an_entrys_debug_form_holds_no_token() {
 /// ([`a_pick_the_sessions_rule_placed_is_recorded_by_the_rules_word_at_both_writes`]).
 /// A pick the rule keeps from the profile leaves no prompt in the tree. One
 /// that is the profile's own is written as a pick by the profile's stages
-/// is. The lookup returns the answer it is handed either way. A gateway's
-/// sticky map hands a request it places to no policy, so the policy's tree
-/// never takes that request's prompt
+/// is. The lookup returns the answer it is handed either way, but for what
+/// it states of the pick: nothing of one kept from the profile, and its
+/// worker's entry of the match's rows of one that is the profile's own. A
+/// gateway's sticky map hands a request it places to no policy, so the
+/// policy's tree never takes that request's prompt
 /// (`model_gateway/src/policies/registry.rs:736-739`, `:782-783`).
 #[test]
 fn a_pick_the_sessions_rule_placed_is_written_to_a_tree_by_the_rules_word() {
     let (affinity, _tree) = lending(false);
     let bed = Bed::new(affinity, preset("cache_aware"), 4);
-    // One decision of the prompt answered `answer`, inside the host's tree.
-    let decided = |asked: &[u32], answer: Decision| {
-        let hashes = hashed(asked);
-        let key = TokenKey {
-            tokens: Cow::Borrowed(asked),
-            marker: 0,
-        };
-        let returned = decide(
-            &bed.affinity,
-            &bed.pool,
-            &bed.spec,
-            &bed.workers,
-            &bed.ids,
-            &mut request(&hashes, 7, NOW),
-            None,
-            |_| Some(key),
-            |_| true,
-            |_| answer,
-        );
-        assert_eq!(returned, answer, "the answer handed");
-    };
     let (kept, own) = (tokens(1_000, 4), tokens(2_000, 4));
-    decided(&kept, ruled(1, bed.ids[1], RulePlaced::Untold));
+    let miss = holds(0, 4, OverlapSource::None);
+    let untold = ruled(1, bed.ids[1], RulePlaced::Untold);
+    assert_eq!(answered_in_tree(&bed, &kept, untold), Overlap::NONE);
     assert!(
         bed.keyed(&kept, 0, None).is_empty(),
         "kept from the profile"
     );
-    decided(&own, ruled(1, bed.ids[1], RulePlaced::Told));
+    let told = ruled(1, bed.ids[1], RulePlaced::Told);
+    assert_eq!(answered_in_tree(&bed, &own, told), miss);
     assert_eq!(bed.keyed(&own, 0, None), [(1, 0, 4)], "the rule's, told");
-    decided(&kept, picked(2, bed.ids[2]));
+    assert_eq!(stated_in_tree(&bed, &kept, 2), miss);
     assert_eq!(bed.keyed(&kept, 0, None), [(2, 0, 4)], "the stages'");
 }
 
@@ -2022,28 +2006,109 @@ fn a_pick_states_its_workers_entry_of_the_column_the_engine_filled() {
     assert_eq!(bed.states(&facts, 1), holds(0, 4, OverlapSource::None));
 }
 
-/// A request decided inside its host's token tree states nothing of its
-/// pick: the tree's match is a count of tokens and no entry of blocks. The
-/// match names the worker all the same. The same request with no entry
-/// named is decided over the rows the engine names, and states.
+/// What the lookup states of `answer`'s first target, for a request of
+/// `key`'s tokens whose host names them as its entry in the token tree it
+/// lends: the request is decided inside the tree's match, and its descent
+/// writes the prompt for the worker a pick the profile is told of goes to.
+/// The lookup returns the answer it was handed but for that statement.
+fn answered_in_tree(bed: &Bed, key: &[u32], answer: Decision) -> Overlap {
+    let hashes = hashed(key);
+    let entry = TokenKey {
+        tokens: Cow::Borrowed(key),
+        marker: 0,
+    };
+    bed.stated(&request(&hashes, 7, NOW), Some(entry), answer)
+}
+
+/// [`answered_in_tree`] behind a pick of the worker at `row` by the
+/// profile's stages.
+fn stated_in_tree(bed: &Bed, key: &[u32], row: u32) -> Overlap {
+    answered_in_tree(bed, key, picked(row, bed.ids[row as usize]))
+}
+
+/// A request decided inside its host's token tree states its pick's entry
+/// of the rows the tree's match named, as a pick over the engine's own rows
+/// does. A prompt the tree holds for nobody is a miss of the request's
+/// blocks. Once the tree holds it for a worker, a pick of that worker states
+/// the match's tokens counted in the request's blocks, read as sent. A
+/// longer prompt that begins with it states the blocks the two share, of
+/// its own.
 #[test]
-fn a_pick_made_inside_a_hosts_token_tree_states_nothing() {
+fn a_pick_made_inside_a_hosts_token_tree_states_the_matchs_blocks() {
     let (affinity, _tree) = lending(false);
     let bed = Bed::new(affinity, preset("cache_aware"), 4);
     let asked = tokens(1_000, 4);
-    let hashes = hashed(&asked);
-    let facts = request(&hashes, 7, NOW);
-    let key = || TokenKey {
-        tokens: Cow::Borrowed(asked.as_slice()),
-        marker: 0,
-    };
-    let answer = picked(1, bed.ids[1]);
-    assert_eq!(bed.stated(&facts, Some(key()), answer), Overlap::NONE);
-    // The tree holds the prompt for that worker now, and its match names it.
+    let miss = holds(0, 4, OverlapSource::None);
+    assert_eq!(stated_in_tree(&bed, &asked, 1), miss);
+    // That pick wrote the prompt for its worker, and the match names it.
     assert_eq!(bed.keyed(&asked, 0, None), [(1, 0, 4)]);
-    assert_eq!(bed.stated(&facts, Some(key()), answer), Overlap::NONE);
+    let sent = holds(4, 4, OverlapSource::Predictor);
+    assert_eq!(stated_in_tree(&bed, &asked, 1), sent);
+    let longer = tokens(1_000, 6);
+    let shared = holds(4, 6, OverlapSource::Predictor);
+    assert_eq!(stated_in_tree(&bed, &longer, 1), shared);
     // No entry named: the record of hashed prefixes, which nothing wrote.
-    assert_eq!(bed.states(&facts, 1), holds(0, 4, OverlapSource::None));
+    let hashes = hashed(&asked);
+    assert_eq!(bed.states(&request(&hashes, 7, NOW), 1), miss);
+}
+
+/// A pick that is none of the match's holders states a miss of the
+/// request's blocks, whatever the match holds for another worker: the pick
+/// states its own worker's entry. A gateway's classic policy observes the
+/// match's share of such a request, whoever it chose
+/// (`model_gateway/src/policies/cache_aware.rs:3103-3123`).
+#[test]
+fn a_pick_that_is_no_holder_of_a_trees_match_states_a_miss() {
+    let (affinity, _tree) = lending(false);
+    let bed = Bed::new(affinity, preset("cache_aware"), 4);
+    let asked = tokens(1_000, 4);
+    let miss = holds(0, 4, OverlapSource::None);
+    assert_eq!(stated_in_tree(&bed, &asked, 1), miss);
+    assert_eq!(bed.keyed(&asked, 0, None), [(1, 0, 4)]);
+    // The match names the first worker alone, and the pick is the second.
+    assert_eq!(stated_in_tree(&bed, &asked, 2), miss);
+    // The descent wrote the prompt for the second too: both hold it now.
+    assert_eq!(bed.keyed(&asked, 0, None), [(1, 0, 4), (2, 0, 4)]);
+    let sent = holds(4, 4, OverlapSource::Predictor);
+    assert_eq!(stated_in_tree(&bed, &asked, 2), sent);
+    assert_eq!(stated_in_tree(&bed, &asked, 1), sent);
+}
+
+/// A match under one block states a miss: the match is counted in the
+/// request's blocks, and a match of less than one names no holder. Under a
+/// tree of four-token pages, a prompt that shares its first eight tokens
+/// with one the tree holds states a miss of its own four blocks. A prompt
+/// shorter than one block always states a miss, even once the tree holds
+/// every token of it for the worker picked. A gateway's classic policy
+/// divides the tokens matched by the prompt's tokens, and observes that
+/// last request whole (`model_gateway/src/policies/cache_aware.rs:3103-3123`).
+#[test]
+fn a_trees_match_under_one_block_states_a_miss() {
+    const PAGE: usize = 4;
+    let (affinity, tree) = lending_by(PAGE, false);
+    let bed = Bed::new(affinity, preset("cache_aware"), 4);
+    let asked = tokens(1_000, 4);
+    assert_eq!(
+        stated_in_tree(&bed, &asked, 1),
+        holds(0, 4, OverlapSource::None)
+    );
+    // Eight tokens of the prompt held, and then another prompt's.
+    let mut branch = asked[..2 * PAGE].to_vec();
+    branch.extend(tokens(5_000, 4).into_iter().skip(2 * PAGE));
+    assert!(bed.keyed(&branch, 0, None).is_empty(), "no holder is named");
+    assert_eq!(
+        stated_in_tree(&bed, &branch, 1),
+        holds(0, 4, OverlapSource::None)
+    );
+    // Three whole pages, and under one block.
+    let short = &asked[..3 * PAGE];
+    let none = holds(0, 1, OverlapSource::None);
+    assert_eq!(stated_in_tree(&bed, short, 3), none);
+    let held = tree.get_tenant_token_counts();
+    assert!(held
+        .get(&address(3))
+        .is_some_and(|&held| held >= short.len()));
+    assert_eq!(stated_in_tree(&bed, short, 3), none);
 }
 
 /// A pick the binding's sessions rule placed alone and keeps from the
@@ -2083,6 +2148,8 @@ fn a_pick_its_rule_keeps_from_the_profile_states_nothing() {
 /// A decision whose profile reads no affinity states nothing, whatever its
 /// host fed: under a document none of whose bindings reads affinity, and
 /// under one where another model's profile does. The reader's pick states.
+/// Nor does it state where its host lends a token tree and names the
+/// request's entry: such a profile is decided inside no tree.
 #[test]
 fn a_profile_that_reads_no_affinity_states_nothing() {
     let asked = prompt(1_000, 4);
@@ -2099,6 +2166,14 @@ fn a_profile_that_reads_no_affinity_states_nothing() {
     let bed = Bed::new(affinity, preset("least_load"), 4);
     assert_eq!(bed.states(&plain, 1), Overlap::NONE);
     assert_eq!(bed.states(&fed, 1), Overlap::NONE);
+    let (affinity, tree) = lending(false);
+    let bed = Bed::new(affinity, preset("least_load"), 4);
+    let key = tokens(1_000, 4);
+    assert_eq!(stated_in_tree(&bed, &key, 1), Overlap::NONE);
+    assert!(
+        tree.get_tenant_token_counts().is_empty(),
+        "nothing is written"
+    );
     // One model's profile reads affinity in the single phase. Another
     // model's reads none there.
     let mut document = PolicySpec::preset("least_load").expect("the preset");

@@ -6671,7 +6671,13 @@ impl Engine {
                     // reads the pins the table held there against its own
                     // pins and its own pick, as the table does. Where no
                     // pin came in, the table's answer was the live pick:
-                    // that is no pin, and the shadow keeps its own.
+                    // no pin for the shadow to follow, and it keeps its
+                    // own. Where the pins stood as read, the live pick
+                    // was a pin already under the id that stands for its
+                    // worker. A shadow asks no id that stands: it keeps
+                    // its own pick there too, put to no cap. Where the
+                    // live claim took a rename's step for the key first,
+                    // the pin it renamed reads as the newcomer.
                     match Claim::standing(&found.standing, &pins, first) {
                         Some(owner) => Claim::Standing(owner, found.standing),
                         None => return decision,
@@ -6685,11 +6691,13 @@ impl Engine {
                     // placement stands as the profile made it.
                     Claim::NoRoom => {}
                     // The table took no claim of this decision's: another
-                    // request's stands, or the pins moved under the
-                    // decision. The worker it names is a pin of the key
-                    // where it is among the survivors: the rule's cap
-                    // holds for it as for the pin read first, and it leads
-                    // where the placement stood elsewhere.
+                    // request's stands, the pins moved under the
+                    // decision, or its worker is a pin of the key already,
+                    // under the id that stands or under one a rename's
+                    // walk had yet to reach. The worker it names is a
+                    // pin of the key where it is among the survivors: the
+                    // rule's cap holds for it as for the pin read first,
+                    // and it leads where the placement stood elsewhere.
                     Claim::Standing(owner, held) => {
                         if WRITE_SESSIONS && KEEPS {
                             // The pins the table held, kept for the shadow.
@@ -15419,6 +15427,112 @@ mod tests {
         );
         assert_eq!(place_keyed(&engine, &pool, 7, 60).id, WorkerId(103));
         assert_eq!(place_keyed(&engine, &pool, 8, 60).id, WorkerId(202));
+    }
+
+    /// A decision reads its rows ahead of its claim. Where its worker is
+    /// registered again between the two, the key is claimed under the id
+    /// that stands: the key's next request, decided on the rows that stand
+    /// ahead of the first one's dispatch, follows the claim. The first
+    /// request's verdict and its dispatch name the id its decision read,
+    /// and the dispatch confirms the claim.
+    #[test]
+    fn a_claim_behind_its_workers_rename_leads_under_the_id_that_stands() {
+        let engine = session_engine(SESSIONS);
+        // The rows the first decision read, and the rows that stand: the
+        // host replaced the first worker's row and says it is the worker
+        // it was.
+        let read = [candidate(0, 0), candidate(1, 1)];
+        let mut rows = read;
+        rows[0].id = WorkerId(900);
+        engine.on_membership(&Membership::Replaced {
+            old: read[0].id,
+            new: rows[0].id,
+        });
+        engine.pins_follow(read[0].id, rows[0].id);
+        let decision = decide_keyed(&engine, &read, 7, 10);
+        let pick = decision.pick().expect("a placement");
+        let first = *pick.targets.first().expect("a target");
+        assert_eq!(first.id, read[0].id);
+        assert_eq!(pick.session_verdict, SessionVerdict::Claimed(read[0].id));
+        let pins = || engine.sessions.pins(session(7));
+        assert_eq!(
+            pins(),
+            Some([rows[0].id, WorkerId(0)]),
+            "the id that stands"
+        );
+        // The worker is the busiest now: the key's pin alone sends there.
+        rows[0].in_flight = 9;
+        let next = decide_keyed(&engine, &rows, 7, 20);
+        let pick = next.pick().expect("a pick");
+        assert_eq!(pick.targets.first().map(|t| t.id), Some(rows[0].id));
+        let lease = Lease {
+            session: session(7),
+            session_verdict: SessionVerdict::Claimed(read[0].id),
+            issued_micros: 10,
+            ..Lease::default()
+        };
+        engine.on_dispatched(&lease, &first, Side::Single, 0);
+        assert_eq!(pins(), Some([rows[0].id, WorkerId(0)]), "confirmed");
+    }
+
+    /// A key pinned on a worker and decided on rows read before the worker
+    /// was registered again: the pin names the id that stands, no row
+    /// read holds it, and the rotation's turn lands on the worker under
+    /// the id it had. The table answers that the worker is a pin of the
+    /// key already, and the decision takes its pick as the pin it is:
+    /// nothing is claimed, and the rule's cap holds for it. At the cap the
+    /// key is handed on to the rotation's next turn, as from a pin read
+    /// first, and that worker leads the pins ahead of the dispatch.
+    #[test]
+    fn a_pick_answered_as_a_pin_already_is_put_to_the_rules_cap() {
+        let engine = session_engine_of(round_robin_profile(), SESSIONS);
+        let read = [
+            candidate(0, 0),
+            candidate(1, 0),
+            candidate(2, 0),
+            candidate(3, 0),
+        ];
+        let home = place_keyed(&engine, &read, 7, 10);
+        let stands = WorkerId(900);
+        engine.on_membership(&Membership::Replaced {
+            old: home.id,
+            new: stands,
+        });
+        engine.pins_follow(home.id, stands);
+        let pins = || engine.sessions.pins(session(7));
+        assert_eq!(pins(), Some([stands, WorkerId(0)]));
+        // A request with no key takes one turn of the rotation.
+        let turn = |now: u64| {
+            let facts = RequestFacts {
+                model: "m",
+                now_micros: now,
+                ..RequestFacts::default()
+            };
+            let (shared, cx) = (PoolFacts::default(), Constraints::default());
+            let decision = engine.decide(&facts, &shared, &read, &cx, &mut Scratch::new());
+            let pick = decision.pick().expect("a pick");
+            pick.targets.first().expect("a target").position
+        };
+        // Three turns bring the rotation back to the key's worker. Under
+        // the cap its turn is the pin: no claim, and nothing is written.
+        let behind: Vec<u32> = (0..3).map(|step| turn(20 + step)).collect();
+        assert!(!behind.contains(&home.position), "{behind:?}");
+        let under = decide_keyed(&engine, &read, 7, 30);
+        let pick = under.pick().expect("a pick");
+        assert_eq!(pick.targets.first().map(|t| t.id), Some(home.id));
+        assert_eq!(pick.session_verdict, SessionVerdict::Pinned, "no claim");
+        assert_eq!(pins(), Some([stands, WorkerId(0)]), "nothing is written");
+        // At the cap, a rotation later: the key is handed on.
+        let behind: Vec<u32> = (0..3).map(|step| turn(40 + step)).collect();
+        assert!(!behind.contains(&home.position), "{behind:?}");
+        let mut capped = read;
+        capped[home.position as usize].session_in_flight = SESSIONS.inflight_cap;
+        let handed = decide_keyed(&engine, &capped, 7, 50);
+        let pick = handed.pick().expect("a pick");
+        assert_eq!(pick.session_verdict, SessionVerdict::Respill);
+        let taken = *pick.targets.first().expect("a target");
+        assert_ne!(taken.id, home.id);
+        assert_eq!(pins(), Some([taken.id, stands]), "ahead of its dispatch");
     }
 
     #[test]
