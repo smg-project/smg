@@ -383,6 +383,7 @@ fn by_facts<const RETRY: bool>(
             workers,
             records.ids(),
             facts,
+            cx.places,
             |page| maker.token_key(page),
             |target| maker.sends_to(target),
             |facts| whole.decide(engine, records, workers, live, facts, cx),
@@ -2135,6 +2136,40 @@ pub(crate) mod tests {
         }
     }
 
+    /// A request held to places is handed its prompt's holder among them,
+    /// where more workers outside them were sent the prompt than the
+    /// profile's sample of sixteen. Forty workers are sent one prompt, each
+    /// by a request held to it alone. The prompt held to one of them, and
+    /// to seven workers it was never sent to, is then handed that one under
+    /// every seed. The classic policy narrows its workers first and takes
+    /// every candidate its tree matched
+    /// (`model_gateway/src/routers/common/placement.rs:474-484`,
+    /// `model_gateway/src/policies/cache_aware.rs:2541-2552`).
+    #[test]
+    fn a_held_request_is_handed_its_prompts_holder_among_its_places() {
+        let engine = preset("cache_aware");
+        let list = pool(64);
+        let members = PublishedList::new(Arc::clone(&list));
+        let tokens: Vec<u32> = (0..1_024).collect();
+        let hashes = engine.prompt_hashes(MODEL, Some(&tokens), None, HashSeeds::PLAIN);
+        let sent = |places: &[u32], seed: u64| {
+            let mut asked = request();
+            asked.facts.seed = seed;
+            asked.constraints.places = Some(places);
+            hashes.write_to(&mut asked.facts);
+            let decided = decided(&engine, &Asks::of(asked, Some(&members)));
+            let pick = decided.decision.pick().expect("a pick");
+            pick.targets.iter().next().expect("a target").position
+        };
+        for place in 0..40 {
+            assert_eq!(sent(&[place], 0), place);
+        }
+        for seed in 1..=32 {
+            let handed = sent(&[7, 40, 41, 42, 43, 44, 45, 46], seed);
+            assert_eq!(handed, 7, "seed {seed}");
+        }
+    }
+
     /// The rule for a list whose every worker is refused steers a held
     /// request among its places. Held to a worker over its thresholds, it
     /// is handed that worker with the veto lifted, beside free workers
@@ -2283,6 +2318,7 @@ pub(crate) mod tests {
             list,
             &ids,
             &mut asked.facts,
+            None,
             |_| None,
             |_| true,
             |facts| {
