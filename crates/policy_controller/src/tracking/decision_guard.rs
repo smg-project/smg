@@ -975,7 +975,7 @@ mod tests {
             decision::{Decision, Target, Targets},
             decision_engine::{Request, RequestMaker, WorkerLists},
             framework::{Picker, TieBand},
-            list_cell::tests::PublishedList,
+            list_cell::PublishedList,
             policy_engine::PolicyEngine,
             view::{Candidate, Constraints, RequestFacts, WorkerId},
         },

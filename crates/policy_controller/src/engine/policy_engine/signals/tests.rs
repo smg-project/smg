@@ -36,7 +36,7 @@ use crate::{
         decision::{Decision, ShadowKind},
         decision_engine::{DecisionEngine, Request, RequestMaker, WorkerLists},
         framework::{Scorer, TieBand},
-        list_cell::tests::PublishedList,
+        list_cell::PublishedList,
         policy_engine::PolicyEngine,
         sticky_sessions::SessionVerdict,
         view::{Candidate, Constraints, Identity, RequestFacts, WorkerId},
