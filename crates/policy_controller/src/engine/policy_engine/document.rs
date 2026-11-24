@@ -251,14 +251,15 @@ impl Deref for Loaded<'_, '_> {
     }
 }
 
-impl PolicyEngine {
-    /// Whether a stage of the document in force takes events of `kind`
-    /// ([`InForce::hears`]): what a host's value for a request asks before
-    /// it keeps anything for a word of that kind. One read of the
-    /// document ([`Self::in_force`]).
+impl Loaded<'_, '_> {
+    /// Whether a stage of the document this decision runs under takes
+    /// events of `kind` ([`InForce::hears`]): what the call that places a
+    /// request states of its placement, for the split that keeps something
+    /// for a word of that kind
+    /// ([`Placement::sides`](crate::tracking::Placement::sides)).
     #[inline]
-    pub(crate) fn takes(&self, kind: EventKind) -> bool {
-        self.in_force().hears.contains(kind)
+    pub(crate) fn takes(self, kind: EventKind) -> bool {
+        self.document.hears.contains(kind)
     }
 }
 

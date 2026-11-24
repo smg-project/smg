@@ -184,6 +184,11 @@ pub struct DecisionGuard<D: Deref<Target: DecisionEngine>> {
     /// chosen. A decode that owes a dispatch or an end was then picked by
     /// a decode call, and was issued with its prefill otherwise.
     later: bool,
+    /// Whether a stage of the document the decision was made under takes
+    /// an end, as the call that placed the request stated it
+    /// ([`Self::set_takes_end`]). `false` where no call stated it.
+    #[cfg(feature = "in-process")]
+    takes_end: bool,
     /// The three sizes the decode side's words state: the lease's own, and
     /// a decode call's from the call that picks the side. Nothing reads a
     /// single's.
@@ -293,6 +298,8 @@ impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
             decided,
             index: 0,
             later,
+            #[cfg(feature = "in-process")]
+            takes_end: false,
             stated,
             target,
             owed,
@@ -560,6 +567,25 @@ impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
     #[must_use]
     pub(crate) fn later_ended(&self) -> bool {
         self.later && !self.owes()
+    }
+
+    /// States whether a stage of the document the decision was made under
+    /// takes an end. The call that places a request states it of the
+    /// document it decided under, and the split of the placement reads it
+    /// ([`Self::takes_end`]).
+    #[cfg(feature = "in-process")]
+    pub(crate) fn set_takes_end(&mut self, takes: bool) {
+        self.takes_end = takes;
+    }
+
+    /// Whether a stage of the document the decision was made under takes
+    /// an end ([`Self::set_takes_end`]). A document put in force since the
+    /// decision changes nothing here: a word of the handle's lease goes to
+    /// the stages that stood at its issue.
+    #[cfg(feature = "in-process")]
+    #[must_use]
+    pub(crate) fn takes_end(&self) -> bool {
+        self.takes_end
     }
 
     /// The engine of this process the handle decides by. `None` for a
