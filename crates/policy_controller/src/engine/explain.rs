@@ -25,6 +25,9 @@ use crate::{
     store::GatewayId,
 };
 
+#[cfg(feature = "in-process")]
+mod json;
+
 /// The maximum records a decider holds.
 const SLOTS: usize = 1_024;
 

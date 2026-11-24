@@ -1,9 +1,5 @@
 //! The cost of the store's writes, at 8, 64 and 512 members of one pool:
 //!
-//! - `policy_store/load_write/<n>`: one load record's write inside the
-//!   publication window: on file and folded into the writer's rows;
-//! - `policy_store/publish/<n>`: one window's publication of the pool: one
-//!   copy, one pointer swap;
 //! - `policy_store/floor/<n>`: the decision benches' gated build, rows
 //!   written from facts in hand, in this binary: a cell that asks the store
 //!   nothing, so one job reads it beside the store's writes;
@@ -16,11 +12,6 @@
 //! - `policy_store/member_write_listed/512`: one membership write under a
 //!   generation that declares the view's three lists: the worker written
 //!   is read under them and the 512 members' fields are carried.
-//!
-//! `policy_store_held/publish/<n>` is the publication beside a reader that
-//! holds the world listing the rows it would write over: the publication
-//! leaves those rows whole and writes over rows the reader let go. Outside
-//! the gate.
 //!
 //! This binary is built on the base branch with the pull request's bench
 //! sources, so a row here calls nothing the base's store lacks.
@@ -37,10 +28,10 @@
 //! written again as it stands, in a store of eight workers of one model and
 //! one worker of `ids` models of its own. The gate reads it at 1,024.
 //!
-//! Every member is ready with a record on file. The floor's rows are
-//! written into a buffer on a page's start (`placed`), one placement per
-//! size for the whole binary: the helper walks its earlier rejects first,
-//! and a size placed a fifth time stops at its bound.
+//! Every member is ready. The floor's rows are written into a buffer on a
+//! page's start (`placed`), one placement per size for the whole binary:
+//! the helper walks its earlier rejects first, and a size placed a fifth
+//! time stops at its bound.
 #![expect(
     clippy::expect_used,
     reason = "a bench's setup has no caller to answer"
@@ -57,7 +48,6 @@ mod filled;
 mod placed;
 
 use std::{
-    cell::Cell,
     hint::black_box,
     sync::Arc,
     time::{Duration, Instant},
@@ -67,32 +57,12 @@ use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criteri
 use placed::page_start_buffer;
 use smg_policy_controller::{
     document::{AppliedSpec, PolicySpec},
-    engine::{Candidate, LoadRow, Role, SignalSource, WorkerId},
-    store::{
-        GatewayId, HealthSink, LoadSink, LoadSource, MemoryStore, WorkerFacts, WorkerStatus,
-        WorkersStore, PUBLISH_WINDOW,
-    },
+    engine::{Candidate, Role, WorkerId},
+    store::{GatewayId, HealthSink, MemoryStore, WorkerFacts, WorkerStatus, WorkersStore},
 };
 
 const SIZES: [usize; 3] = [8, 64, 512];
 const MODEL: &str = "m";
-
-/// Member `index`'s record as of write `turn`: figures that differ per
-/// member and per write, so no two rows read alike.
-fn record_of(index: usize, turn: u64) -> LoadRow {
-    let x = (index as u64 + 1)
-        .wrapping_mul(0x9e37_79b9_7f4a_7c15)
-        .wrapping_add(turn.wrapping_mul(0xbf58_476d_1ce4_e5b9));
-    LoadRow {
-        running: (x >> 16) as u32 % 12,
-        queued: (x >> 24) as u32 % 4,
-        kv_usage_permille: ((x >> 32) % 900) as u16,
-        live_rate: 1_000 + ((x >> 40) % 3_000) as u32,
-        report_age_ms: 5,
-        source: SignalSource::Events,
-        ..LoadRow::default()
-    }
-}
 
 /// One pool of `n` members in a store, and the buffer the floor's rows are
 /// timed in.
@@ -100,18 +70,13 @@ struct Fixture {
     n: usize,
     store: Arc<MemoryStore>,
     ids: Vec<WorkerId>,
-    /// The instant the store's last window opened; a cell that publishes
-    /// moves it.
-    window: Cell<Instant>,
     rows: Vec<Candidate>,
 }
 
-/// A store with one pool of `n` members, every one registered, ready, with
-/// its record on file and published: the store, its members by index and
-/// the instant its last window opened.
-fn pool_of(n: usize) -> (Arc<MemoryStore>, Vec<WorkerId>, Instant) {
+/// A store with one pool of `n` members, every one registered, ready and
+/// published: the store and its members by index.
+fn pool_of(n: usize) -> (Arc<MemoryStore>, Vec<WorkerId>) {
     let store = Arc::new(MemoryStore::new());
-    let opened = Instant::now();
     let ids: Vec<WorkerId> = (0..n)
         .map(|index| {
             let key = format!("http://w{index}:8000");
@@ -131,25 +96,21 @@ fn pool_of(n: usize) -> (Arc<MemoryStore>, Vec<WorkerId>, Instant) {
             store
                 .set_status(id, WorkerStatus::Ready, revision)
                 .expect("ready");
-            store.record(id, 0, record_of(index, 0), opened, LoadSource::Stream);
             id
         })
         .collect();
-    let opened = opened + PUBLISH_WINDOW;
-    store.publish(opened);
     assert_eq!(store.publish_due(), None);
     filled::filled(&store, MODEL, Role::Single, n);
-    (store, ids, opened)
+    (store, ids)
 }
 
 impl Fixture {
     fn new(n: usize, rows: Vec<Candidate>) -> Self {
-        let (store, ids, opened) = pool_of(n);
+        let (store, ids) = pool_of(n);
         Self {
             n,
             store,
             ids,
-            window: Cell::new(opened),
             rows,
         }
     }
@@ -207,10 +168,9 @@ fn writes_beside_vetoes(c: &mut Criterion, fixtures: &mut [Fixture]) {
         return;
     };
     let (n, store) = (fixture.n, &fixture.store);
-    // The gateway whose veto is written, and a veto's end: a minute behind
-    // the second that follows the store's last window.
+    // The gateway whose veto is written, and a veto's end.
     let asking = GatewayId(1);
-    let until = fixture.window.get() + Duration::from_secs(61);
+    let until = Instant::now() + Duration::from_secs(3_600);
     let others = (2..10).map(GatewayId);
     let vetoed = |nth: usize| fixture.ids[nth * n / 64];
     for gateway in others.clone() {
@@ -269,7 +229,6 @@ fn member_write_beside_spread_vetoes(c: &mut Criterion) {
     const MEMBERS: usize = 512;
     const POOLS: usize = 64;
     let store = MemoryStore::new();
-    let opened = Instant::now();
     let facts = |key: String, pool: usize| WorkerFacts {
         engine: key.clone(),
         key,
@@ -289,16 +248,13 @@ fn member_write_beside_spread_vetoes(c: &mut Criterion) {
             store
                 .set_status(id, WorkerStatus::Ready, revision)
                 .expect("ready");
-            store.record(id, 0, record_of(index, 0), opened, LoadSource::Stream);
             id
         })
         .collect();
-    let opened = opened + PUBLISH_WINDOW;
-    store.publish(opened);
     assert_eq!(store.publish_due(), None);
     let spread = (0..MEMBERS).step_by(POOLS).count();
     filled::filled(&store, "spread-0", Role::Single, spread);
-    let until = opened + Duration::from_secs(3_600);
+    let until = Instant::now() + Duration::from_secs(3_600);
     for gateway in (2..14).map(GatewayId) {
         for id in &ids {
             store.gateway_veto(gateway, *id, Some(until));
@@ -331,7 +287,6 @@ fn member_write_under_lists(c: &mut Criterion) {
     document.view.labels = (0..8).map(|key| format!("k{key}")).collect();
     let listing = AppliedSpec::validate(&document).expect("the document validates");
     store.apply(listing).expect("applied");
-    let opened = Instant::now();
     let facts = |key: String, index: usize| WorkerFacts {
         engine: key.clone(),
         key,
@@ -360,9 +315,7 @@ fn member_write_under_lists(c: &mut Criterion) {
         store
             .set_status(id, WorkerStatus::Ready, revision)
             .expect("ready");
-        store.record(id, 0, record_of(index, 0), opened, LoadSource::Stream);
     }
-    store.publish(opened + PUBLISH_WINDOW);
     assert_eq!(store.publish_due(), None);
     filled::filled(&store, MODEL, Role::Single, MEMBERS);
     // A fifth of the members state a zone the list does not name: the
@@ -379,88 +332,8 @@ fn member_write_under_lists(c: &mut Criterion) {
     group.finish();
 }
 
-fn load_write(c: &mut Criterion, fixtures: &mut [Fixture]) {
-    let mut group = c.benchmark_group("policy_store/load_write");
-    for fixture in fixtures.iter_mut() {
-        let n = fixture.n;
-        // Inside the window: the record is folded and waits, so the write
-        // is timed without a publication.
-        let at = fixture.window.get() + Duration::from_millis(1);
-        let mut turn = 0u64;
-        group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
-            b.iter(|| {
-                turn += 1;
-                let index = (turn as usize).wrapping_mul(67) % n;
-                fixture.store.record(
-                    black_box(fixture.ids[index]),
-                    0,
-                    record_of(index, turn),
-                    at,
-                    LoadSource::Stream,
-                );
-            });
-        });
-        // A cell the filter left out wrote nothing, and nothing waits.
-        assert!(turn == 0 || fixture.store.publish_due().is_some());
-    }
-    group.finish();
-}
-
-/// One window's publication of the pool: `policy_store/publish/<n>` with no
-/// reader holding a world, and `policy_store_held/publish/<n>` beside a
-/// reader that keeps the worlds of the last two publications. The older of
-/// the two lists the rows the publication would write over, so every
-/// publication of the held cell leaves them and takes other rows.
-fn publish(c: &mut Criterion, fixtures: &mut [Fixture]) {
-    for (group, reader) in [
-        ("policy_store/publish", false),
-        ("policy_store_held/publish", true),
-    ] {
-        let mut group = c.benchmark_group(group);
-        for fixture in fixtures.iter_mut() {
-            let n = fixture.n;
-            let mut turn = 0u64;
-            let mut kept = [None, None];
-            group.throughput(Throughput::Elements(n as u64));
-            group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
-                b.iter_batched(
-                    || {
-                        // One record folded inside the window: the pool has
-                        // something to publish at the window's end.
-                        turn += 1;
-                        let index = (turn as usize).wrapping_mul(67) % n;
-                        let opened = fixture.window.get();
-                        fixture.store.record(
-                            fixture.ids[index],
-                            0,
-                            record_of(index, turn),
-                            opened + Duration::from_millis(1),
-                            LoadSource::Stream,
-                        );
-                        if reader {
-                            // The last publication's world takes the place
-                            // of the one three publications back.
-                            kept[(turn % 2) as usize] = Some(fixture.store.snapshot());
-                        }
-                        let due = opened + PUBLISH_WINDOW;
-                        fixture.window.set(due);
-                        due
-                    },
-                    |due| fixture.store.publish(black_box(due)),
-                    BatchSize::PerIteration,
-                );
-            });
-            // A cell the filter left out published nothing: the write
-            // cell's records may still wait.
-            assert!(turn == 0 || fixture.store.publish_due().is_none());
-        }
-        group.finish();
-    }
-}
-
 /// One membership write of a fleet of pairs: `n` prefills and `n` decodes
-/// of one model, every one ready with a record on file and published, none
-/// naming a runtime. `policy_store_pairs/kept/<n>` writes one prefill's
+/// of one model, every one ready and published, none naming a runtime. `policy_store_pairs/kept/<n>` writes one prefill's
 /// registration again as it stands, which moves no offer;
 /// `policy_store_pairs/moved/<n>` names its runtime and unnames it in turn,
 /// which moves its offer at every write. A store of its own a size: the
@@ -485,7 +358,6 @@ fn pair_writes(c: &mut Criterion) {
             }
         };
         let store = MemoryStore::new();
-        let opened = Instant::now();
         for index in 0..2 * n {
             let id = store.upsert(facts_of(index)).id();
             store.publish_now();
@@ -493,9 +365,7 @@ fn pair_writes(c: &mut Criterion) {
             store
                 .set_status(id, WorkerStatus::Ready, revision)
                 .expect("ready");
-            store.record(id, 0, record_of(index, 0), opened, LoadSource::Stream);
         }
-        store.publish(opened + PUBLISH_WINDOW);
         assert_eq!(store.publish_due(), None);
         for role in [Role::Prefill, Role::Decode] {
             filled::filled(&store, MODEL, role, n);
@@ -544,11 +414,11 @@ fn pair_writes(c: &mut Criterion) {
 
 /// One membership write beside a worker that lists many models, in a store
 /// of its own a size: eight workers of one model and one worker that lists
-/// `ids` models of its own, every one ready with a record on file and
-/// published. `policy_store_models/member_write/<ids>` writes one of the
-/// eight's registration again as it stands. The write reads every row's
-/// models into their pools: the row fails when that read looks back over
-/// the models a row listed before.
+/// `ids` models of its own, every one ready and published.
+/// `policy_store_models/member_write/<ids>` writes one of the eight's
+/// registration again as it stands. The write reads every row's models into
+/// their pools: the row fails when that read looks back over the models a
+/// row listed before.
 fn member_write_beside_many_models(c: &mut Criterion) {
     let facts_of = |key: String, models: Vec<String>| WorkerFacts {
         engine: key.clone(),
@@ -565,17 +435,14 @@ fn member_write_beside_many_models(c: &mut Criterion) {
         let listed = (0..ids).map(|model| format!("model-{model}")).collect();
         let wide = facts_of("http://wide:8000".to_string(), listed);
         let store = MemoryStore::new();
-        let opened = Instant::now();
-        for (index, facts) in (0..8).map(&small).chain([wide]).enumerate() {
+        for facts in (0..8).map(&small).chain([wide]) {
             let id = store.upsert(facts).id();
             store.publish_now();
             let revision = WorkersStore::get(&store, id).expect("the row").revision;
             store
                 .set_status(id, WorkerStatus::Ready, revision)
                 .expect("ready");
-            store.record(id, 0, record_of(index, 0), opened, LoadSource::Stream);
         }
-        store.publish(opened + PUBLISH_WINDOW);
         assert_eq!(store.publish_due(), None);
         filled::filled(&store, MODEL, Role::Single, 8);
         filled::filled(&store, "model-0", Role::Single, 1);
@@ -607,8 +474,6 @@ fn store_view(c: &mut Criterion) {
         .map(|(&n, rows)| Fixture::new(n, rows))
         .collect();
     floor(c, &mut fixtures);
-    load_write(c, &mut fixtures);
-    publish(c, &mut fixtures);
     writes_beside_vetoes(c, &mut fixtures);
     member_write_beside_spread_vetoes(c);
     member_write_under_lists(c);

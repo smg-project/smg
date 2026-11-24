@@ -1835,6 +1835,24 @@ fn the_decode_call_fields_and_reasons_are_pinned() {
     }
 }
 
+/// The number a request names its worker by, by name and number. The field
+/// is optional: its absence says the request names no worker, so the frame
+/// of a host older than the field is decided as it was.
+#[test]
+fn the_named_worker_field_is_pinned() {
+    let set = compile_protocol().expect("protoc compiles the two protocol files");
+    let controller =
+        file(&set, CONTROLLER_PROTO).expect("the controller file is in the descriptor set");
+    let request = message(controller, "DecideRequest").expect("the request is a message");
+    let found: Vec<(String, i32, Type, bool)> = fields(request)
+        .into_iter()
+        .filter(|(name, _, _, _, _)| name == "named_worker")
+        .map(|(name, number, kind, _, optional)| (name, number, kind, optional))
+        .collect();
+    let pinned = ("named_worker".to_owned(), 8, Type::Uint32, true);
+    assert_eq!(found, [pinned], "the named worker's field moved");
+}
+
 /// What a registration states and its answer tells, by name and number: the
 /// prober's settings (one message for the registration and the row), the
 /// row's rank and engine, and the two thresholds a row is judged by.

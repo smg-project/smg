@@ -15,11 +15,12 @@
 //! change. Each thread keeps every Nth of its own decisions, as each
 //! decider of a controller does.
 //!
-//! **A request that states no id** is not counted and not kept: a record
-//! is found by its request's id ([`PolicyEngine::explained`]) and by
-//! nothing else. A plain request that is never made is asked its id through
-//! its maker ([`RequestMaker::request_id`]), under a document that keeps a
-//! sample and under no other.
+//! **A record is found by its request's id** ([`PolicyEngine::explained`]),
+//! or where the request states none by the id its host states for it
+//! ([`RequestMaker::explain_id`]), and by nothing else. A request that has
+//! neither is not counted and not kept. A plain request that is never made
+//! is asked its id through its maker ([`RequestMaker::request_id`]), under
+//! a document that keeps a sample and under no other.
 //!
 //! **What is kept**: a single request's decision and a pair's first
 //! decision, in the pass that answers both ([`Loaded::decide_into`]). A
@@ -61,7 +62,7 @@ thread_local! {
 /// the document's number and its generation. `decision` is the decision
 /// where it stands, which counts where it is a pick or a shed
 /// ([`SampleCount::keeps`]). A place hands none: it is a pick. A request
-/// that states no id takes no step.
+/// that is found by no id ([`found_by`]) takes no step.
 fn nth(own: Loaded<'_, '_>, id: &[u8], decision: Option<&Decision>) -> bool {
     if id.is_empty() {
         return false;
@@ -105,23 +106,53 @@ fn keep(
     );
 }
 
+/// The id a decision is kept under: `own_id`, the request's own, or where
+/// that is empty the id `maker`'s host states for a kept decision alone
+/// ([`RequestMaker::explain_id`]).
+fn found_by<'m>(maker: &'m impl RequestMaker, own_id: &'m [u8]) -> &'m [u8] {
+    if own_id.is_empty() {
+        maker.explain_id()
+    } else {
+        own_id
+    }
+}
+
 /// A whole decision's step toward a sample: the decision of `request` at
 /// `at`, as the pass wrote it into `written`, is kept where it is the
 /// calling thread's next sample ([`nth`]), with what its binding's shadow
-/// said. It is read where it was written, by reference. Under a document
-/// that keeps no sample the pass runs this one test of the step.
+/// said, under the id `request` states or else the one `maker`'s host
+/// states ([`found_by`]). It is read where it was written, by reference.
+/// Under a document that keeps no sample the pass runs this one test of
+/// the step.
 #[inline(always)]
 pub(super) fn whole(
     own: Loaded<'_, '_>,
+    maker: &impl RequestMaker,
     request: &Request<'_>,
     at: Instant,
     written: Option<&(DecideOutcome, bool)>,
     shadow: Option<Shadowed>,
 ) {
     if own.document.samples {
-        let asked = (request.facts.model, request.facts.phase);
-        counted(own, request.id, asked, at, written, shadow);
+        made_and_counted(own, maker, request, at, written, shadow);
     }
+}
+
+/// [`whole`] behind its test of the document. Out of line: no decision of
+/// a document that keeps no sample runs it.
+#[cold]
+#[inline(never)]
+fn made_and_counted(
+    own: Loaded<'_, '_>,
+    maker: &impl RequestMaker,
+    request: &Request<'_>,
+    at: Instant,
+    written: Option<&(DecideOutcome, bool)>,
+    shadow: Option<Shadowed>,
+) {
+    let asked = (request.facts.model, request.facts.phase);
+    let id = found_by(maker, request.id);
+    counted(own, id, asked, at, written, shadow);
 }
 
 /// A noted place's step toward a sample ([`super::single::noted`]): the
@@ -152,7 +183,7 @@ fn asked_and_counted(
     at: Instant,
     written: Option<&(DecideOutcome, bool)>,
 ) {
-    let id = maker.request_id(&own.document.spec);
+    let id = found_by(maker, maker.request_id(&own.document.spec));
     counted(own, id, (maker.model(), Phase::Single), at, written, None);
 }
 
@@ -193,7 +224,7 @@ pub(super) fn place(
     clock: impl FnOnce() -> Instant,
 ) {
     let document = own.document;
-    let id = maker.request_id(&document.spec);
+    let id = found_by(maker, maker.request_id(&document.spec));
     if !nth(own, id, None) {
         return;
     }
@@ -219,7 +250,10 @@ impl PolicyEngine {
     /// `explain.sample`, each calling thread keeps every Nth pick or shed
     /// among its requests that state an id, in one ring of 1,024 records a
     /// document: a single request's decision and a pair's first decision.
-    /// A request that states no id is not counted and not kept. A record
+    /// A request that states no id of its own is counted and found by the
+    /// id its host states for it
+    /// ([`PlaceRequest::explain_id`](crate::engine::PlaceRequest::explain_id)),
+    /// and is not counted and not kept where it has neither. A record
     /// names its plan, its profile and that profile's stages through
     /// [`DecisionRecord::names`], read under the document's engine
     /// ([`AppliedSpec::engine`](crate::document::spec::AppliedSpec::engine)).

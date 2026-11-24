@@ -193,6 +193,11 @@ pub struct DecisionGuard<D: Deref<Target: DecisionEngine>> {
     /// chosen. A decode that owes a dispatch or an end was then picked by
     /// a decode call, and was issued with its prefill otherwise.
     later: bool,
+    /// Whether a stage of the document the decision was made under takes
+    /// an end, as the call that placed the request stated it
+    /// ([`Self::set_takes_end`]). `false` where no call stated it.
+    #[cfg(feature = "in-process")]
+    takes_end: bool,
     /// The three sizes the decode side's words state: the lease's own, and
     /// a decode call's from the call that picks the side. Nothing reads a
     /// single's.
@@ -302,6 +307,8 @@ impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
             decided,
             index: 0,
             later,
+            #[cfg(feature = "in-process")]
+            takes_end: false,
             stated,
             target,
             owed,
@@ -569,6 +576,25 @@ impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
     #[must_use]
     pub(crate) fn later_ended(&self) -> bool {
         self.later && !self.owes()
+    }
+
+    /// States whether a stage of the document the decision was made under
+    /// takes an end. The call that places a request states it of the
+    /// document it decided under, and the split of the placement reads it
+    /// ([`Self::takes_end`]).
+    #[cfg(feature = "in-process")]
+    pub(crate) fn set_takes_end(&mut self, takes: bool) {
+        self.takes_end = takes;
+    }
+
+    /// Whether a stage of the document the decision was made under takes
+    /// an end ([`Self::set_takes_end`]). A document put in force since the
+    /// decision changes nothing here: a word of the handle's lease goes to
+    /// the stages that stood at its issue.
+    #[cfg(feature = "in-process")]
+    #[must_use]
+    pub(crate) fn takes_end(&self) -> bool {
+        self.takes_end
     }
 
     /// The engine of this process the handle decides by. `None` for a
@@ -893,8 +919,56 @@ impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
         now: Instant,
         budget: Duration,
     ) -> Result<Self, DecisionUnavailable> {
+        Self::asked_naming(link, request, None, now, budget).await
+    }
+
+    /// [`Self::asked`] for a request that may name its worker. `named` is
+    /// what the target source of the request's binding answered for it
+    /// ([`KeySources::target`](crate::document::KeySources::target)), which
+    /// its host reads once, where it derives the request's keys: the
+    /// number, `Some(None)` for a text that is no number, and `None` for a
+    /// request that names no worker, which is asked as [`Self::asked`]
+    /// asks it.
+    ///
+    /// The frame states the number (`DecideRequest.named_worker`). The
+    /// controller counts it over its own list, from 0 and in that list's
+    /// order, among the workers this gateway can be sent to: by its reach
+    /// and wires, its standing vetoes, and each worker's own test of being
+    /// available. The decision is held to the worker the number reaches,
+    /// and the answer names that worker or sheds the request with no
+    /// endpoint. The frame names `target-worker` for that shed, and this
+    /// handle reads it as `controller`, as it reads every shed's stage.
+    /// Where this gateway can be sent to no worker of the list, the request
+    /// is decided as one that names no worker, with neither its session
+    /// key nor its client's key, and the answer is that decision's. A
+    /// controller older than the field reads none, and places the request
+    /// by the rest of its document.
+    ///
+    /// Only a frame decided over one list is read for the number: a single
+    /// request's, and one that stands alone at a side's phase. A pair's
+    /// frame is decided as one that names no worker, and its pick need not
+    /// be the worker the number names.
+    ///
+    /// The host's own rule for a worker is not asked there, and the
+    /// controller's list need not stand in the order of the host's own. A
+    /// host that decides by itself for lack of an answer counts over its
+    /// own list, by its own rule.
+    ///
+    /// # Errors
+    ///
+    /// Those of [`Self::asked`].
+    pub async fn asked_naming(
+        link: &Link,
+        request: &Request<'_>,
+        named: Option<Option<u32>>,
+        now: Instant,
+        budget: Duration,
+    ) -> Result<Self, DecisionUnavailable> {
         Self::sendable(request)?;
-        Self::answered(link, wire::request(request), now, budget, |_, _| Ok(())).await
+        Self::answered(link, wire::request(request, named), now, budget, |_, _| {
+            Ok(())
+        })
+        .await
     }
 
     /// [`Self::asked`] for an encode request, its pair's one request: the

@@ -35,8 +35,11 @@ use tokio::{
 
 use super::{kv_tables::indexed_under, KvHost, Objects};
 use crate::{
-    engine::{view::WireModes, Engine},
-    store::{snapshot::phase_of, WorkerFacts},
+    engine::{
+        view::{Phase, Role, WireModes},
+        Engine,
+    },
+    store::WorkerFacts,
 };
 
 /// A host's cache-event collector and the worker objects it follows.
@@ -245,4 +248,14 @@ pub(super) fn asks_events(facts: &WorkerFacts, engine: &Engine) -> bool {
             .models
             .first()
             .is_some_and(|model| engine.needs_for(model, phase_of(facts.role)).events)
+}
+
+/// The phase a role's pool decides: what a binding is matched on.
+const fn phase_of(role: Role) -> Phase {
+    match role {
+        Role::Single => Phase::Single,
+        Role::Prefill => Phase::Prefill,
+        Role::Decode => Phase::Decode,
+        Role::Encode => Phase::Encode,
+    }
 }

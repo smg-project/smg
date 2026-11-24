@@ -217,7 +217,7 @@ impl Held {
 /// under a row's URL is replaced by the row's.
 ///
 /// Every writer of a row's facts holds the holder's turn from its decision
-/// to the journal's telling: a door's write, a standby's applier, a
+/// to the journal's telling: a write call, a standby's applier, a
 /// watcher's, and a restore. So a first copy cut in that turn states each
 /// row the journal told at the copy's place, and none it did not. Three
 /// writes move the journal's place with no turn of the holder, and a copy
@@ -232,6 +232,39 @@ impl Held {
 ///
 /// A row takes the place of its own object alone: an object another row
 /// holds under its URL is dropped first.
+///
+/// # A host's write calls
+///
+/// [`Self::upsert`], [`Self::patch`], [`Self::remove`], [`Self::connect_row`]
+/// and [`Self::drain_row`] are the write side of a host that keeps worker
+/// objects: a controller's own registration calls write through them. Each
+/// call decides over the object that stands and tells `store` what it
+/// decided. The object the call leaves stands when it returns, and a
+/// removed row's object is gone by then. The three calls that write a row
+/// ([`Self::upsert`], [`Self::patch`], [`Self::remove`]) run in the
+/// holder's turn, one at a time, and take the store's membership lock
+/// inside the turn for the store's own write. One that lays an object in
+/// another's place then tells `store` that object's status as a status
+/// call does: inside the turn and behind the store's write, it takes the
+/// object's lock and the store's lock inside it. The two that write a
+/// status ([`Self::connect_row`], [`Self::drain_row`]) take no turn: each
+/// runs under its object's mutation lock, the registry's lock of one
+/// worker, and takes the store's membership lock inside it. So a status
+/// call can run at one time with a row call, or with a status call on
+/// another object. No lock of the store is held over a
+/// write of the registry. A call whose caller read a row that no longer
+/// stands so writes nothing. Every call but [`Self::connect_row`] says so
+/// in its answer: the caller reads the row again and decides again. A host
+/// numbers each life of a key itself. A call takes the incarnation its
+/// caller states, and a key registered again under an incarnation it had
+/// stands under its old id at the first revision: a patch or a removal
+/// guarded by the earlier life's id and revision lands on it. No call asks
+/// whether its replica leads. A host asks that before it calls. A leader's
+/// write through these calls is told to its log, and its standbys and
+/// watchers are sent it as they are sent a registration call's. A host
+/// that does not lead must not write: such a write lands in its own store
+/// alone, its leader's next event no longer fits that store, and the
+/// leader's snapshot takes the write back.
 ///
 /// The registry numbers its own objects, so an object's id is not its row's.
 /// The holder keeps the two together ([`Self::standing`], [`Self::object`]).
@@ -323,16 +356,11 @@ impl<G> Objects<G> {
     /// the object states, at each load report of its worker.
     ///
     /// Without it an object built from a row states no threshold, and a
-    /// load monitor writes no verdict on it: the store alone judges such a
-    /// worker, for its own decisions, and the holder does not copy its
-    /// verdict onto the object's flag.
+    /// load monitor writes no verdict on it: nothing judges such a worker.
     ///
-    /// The monitor and the store read their thresholds from two places. The
-    /// crate's two defaults, which the store reads under a binding whose
-    /// block is on for each signal a row names none for, are not read here:
-    /// `defaults` stands in their place, and with no signal in `defaults`
-    /// the monitor does not judge a row that names none. No document names
-    /// a threshold. The store judges an engine's ranks together, and the
+    /// The crate's two defaults are not read here: `defaults` stands in
+    /// their place, and with no signal in `defaults` the monitor does not
+    /// judge a row that names none. No document names a threshold. The
     /// monitor judges each object by its own report.
     #[must_use]
     pub fn with_overload_thresholds(mut self, defaults: OverloadThresholds) -> Self {

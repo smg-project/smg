@@ -31,9 +31,9 @@
 //! follower polls no engine, drops the load records its workers' event
 //! streams carry and holds no load report: the monitor is stopped where a
 //! lead ends, and its snapshot is published empty. Its first poll goes out
-//! at its promotion. No load row is written to the store. The controller
-//! keeps no ingestion driver of its own: its loads come from this monitor
-//! and its cache events from the worker host's feed.
+//! at its promotion. The store holds no load row. The controller keeps no
+//! ingestion driver of its own: its loads come from this monitor and its
+//! cache events from the worker host's feed.
 //!
 //! Every socket a listener accepts is set to send at once: a small answer
 //! never waits for the peer's acknowledgement of the write before it.
@@ -118,7 +118,7 @@ use crate::{
     service::elector::{Elector, Fence},
     stages::registry::StageRegistry,
     store::{MemoryStore, WorkersStore},
-    worker_host::{KvFeed, KvTables, Members},
+    worker_host::{KvFeed, KvTables, Members, Objects},
 };
 
 /// The protobuf package of the controller's API.
@@ -461,15 +461,9 @@ impl Controller {
         );
         let (standing, stood) = watch::channel(ElectionObservation::default());
         let steps = stood.clone();
-        // What a watched write wakes beside the feed: the follower of the
-        // replica's worker objects.
-        let objects = worker_objects::ObjectsWake::default();
-        let woken = objects.clone();
-        let journal =
-            replication::journaled_waking(&config.election.lease, config.decide_shards, objects);
+        let journal = replication::journaled(&config.election.lease, config.decide_shards);
         let workers = Arc::new(worker_objects::WorkerObjects::stating(
             Arc::clone(&journal.0),
-            woken,
             config.worker_overload,
         ));
         let kv_feed = KvFeed::new(workers.holder());
@@ -774,10 +768,7 @@ impl Controller {
         }
     }
 
-    /// The store the serve's tasks and the scopes' calls feed and read. The
-    /// serve writes no load row to it and drops none: a host that writes
-    /// load rows through this handle drops them itself where its role
-    /// turns.
+    /// The store the serve's tasks and the scopes' calls feed and read.
     pub fn store(&self) -> Arc<MemoryStore> {
         Arc::clone(&self.shared.store)
     }
@@ -788,6 +779,19 @@ impl Controller {
     /// block size through it, and writes nothing.
     pub fn kv_tables(&self) -> Arc<KvTables> {
         self.workers.kv_tables()
+    }
+
+    /// The holder of the replica's worker objects, which the scopes' calls
+    /// write a worker through. A host that registers a worker in the
+    /// serve's own process writes it here ([`Objects::upsert`]) while the
+    /// replica leads ([`Self::readiness`]). No call asks the term itself:
+    /// the holder's doc says what a write on a replica that follows comes
+    /// to ("A host's write calls"). A row written through the entries of
+    /// [`Self::store`] itself has no worker object until the holder next
+    /// reads the store, at its next call that writes a row or its next
+    /// first copy.
+    pub fn workers(&self) -> Arc<Objects<Members>> {
+        self.workers.holder()
     }
 
     /// A read handle on the controller's state, valid across [`Self::serve`].
@@ -874,7 +878,6 @@ impl Controller {
             spec_file,
             listeners,
             admin,
-            workers,
             kv_feed,
             prober,
             monitor,
@@ -883,10 +886,6 @@ impl Controller {
             ..
         } = self;
         let store = Arc::clone(&shared.store);
-        // The worker objects stand at the store's end before a listener
-        // serves: a controller that starts over standing rows decides its
-        // first request over them. The follower's task goes on from here.
-        workers.holder().follow(&*store);
         // The listeners' close is one word, and an open decide stream hears
         // it too: the word is `Shared`'s.
         let stop = shared.stop.clone();
@@ -976,14 +975,7 @@ impl Controller {
                 Ok(())
             });
         }
-        // The worker objects follow the store on every replica alike: a
-        // standby holds the objects its leader's rows make, there at a take.
         {
-            let workers_stop = stop.subscribe();
-            tasks.spawn(async move {
-                workers.run(workers_stop).await;
-                Ok(())
-            });
             let kv_stop = stop.subscribe();
             tasks.spawn(async move {
                 kv_feed.run(kv_stop).await;
@@ -1419,7 +1411,7 @@ mod tests {
             ConditionalWriteOutcome, ElectError, ElectionSettings, Elector, LeaseBackend,
             LeaseRecord, MemoryLease, TickOutcome,
         },
-        store::{HealthPolicy, WorkerFacts, WorkerStatus, WorkersStore},
+        store::{HealthPolicy, Registrant, WorkerFacts, WorkerStatus, WorkersStore},
     };
 
     /// A lease that stores `writes` writes: the thread that steps it panics
@@ -1517,35 +1509,6 @@ mod tests {
         assert!(starts.iter().all(|start| start.seq != 0 && start.term == 0));
     }
 
-    /// A controller that starts over standing rows holds their worker
-    /// objects before a listener serves. The serve follows the store to its
-    /// end ahead of its listeners' tasks: one poll of it, which runs no task
-    /// it spawned, leaves the holder with the standing worker, and a
-    /// decision over the list the holder lends names it. Left to the
-    /// follower's task alone, a start over a large fleet answered its first
-    /// requests no worker.
-    #[tokio::test]
-    async fn a_start_over_standing_rows_holds_their_worker_objects_before_it_serves() {
-        use crate::engine::view::{Role, WireModes};
-
-        let controller = Controller::bind(valid()).await.expect("the listeners bind");
-        let store = Arc::clone(&controller.shared.store);
-        let objects = controller.workers.holder();
-        store
-            .apply(bed::preset("round_robin", 1))
-            .expect("above the unbound start");
-        let standing = bed::ready(&store, "w0", bed::MODEL, Role::Single, WireModes::NONE);
-        assert!(objects.is_empty(), "no object stands before the serve");
-        let mut serve = std::pin::pin!(controller.serve(pending()));
-        tokio::select! {
-            biased;
-            served = &mut serve => panic!("the serve stands: {served:?}"),
-            () = std::future::ready(()) => {}
-        }
-        let named = bed::lent_pick(&store, &objects, bed::frame(1, 1));
-        assert_eq!(named, Some(standing));
-    }
-
     /// The thread gone at its take, before the serve read ready, and at its
     /// first renewal, after: the serve ends with the error either way, so
     /// the process exits and its supervisor starts it again.
@@ -1626,6 +1589,7 @@ mod tests {
     async fn a_served_controller_keeps_no_sent_prefixes_of_a_model_whose_workers_left() {
         let controller = Controller::bind(valid()).await.expect("the listeners bind");
         let (shared, store) = (Arc::clone(&controller.shared), controller.store());
+        let workers = controller.workers();
         let (stop, stopped) = oneshot::channel::<()>();
         let serve = controller.serve(async {
             let _ = stopped.await;
@@ -1637,6 +1601,9 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
             let (singles, sides) = bed::fleet(&store);
+            // The fleet is written through the store's own entries: the
+            // case follows the store itself, as no task does.
+            workers.follow(&*store);
             let applied = store.apply(bed::preset("cache_aware", 1));
             applied.expect("above the unbound start");
             let records = || store.deciding(|world| world.front().affinity().held());
@@ -1650,7 +1617,7 @@ mod tests {
             );
             for id in singles.into_iter().chain(sides.map(|(_, id)| id)) {
                 let revision = store.get(id).expect("the row").revision;
-                store.remove(id, revision).expect("a removal");
+                workers.remove(&store, id, revision).expect("a removal");
             }
             while !records().is_empty() {
                 assert!(begun.elapsed() < wait, "a record no worker is left in");
@@ -1664,14 +1631,16 @@ mod tests {
         served.expect("a serve that leaves by its signal");
     }
 
-    /// The serve starts the follower of the replica's worker objects, on
-    /// the wake the store's log tells: a row written while the controller
-    /// leads has its object, and a row removed has none.
+    /// A served controller hands its holder ([`Controller::workers`]): a
+    /// worker written through it while the controller leads has its object
+    /// when the write returns, and a worker removed has none. A row written
+    /// through the store's own entry gets no object: no task follows the
+    /// store's table.
     #[tokio::test]
-    async fn a_served_controller_holds_the_worker_objects_of_its_stores_rows() {
+    async fn a_served_controller_lays_a_worker_written_through_its_holder() {
         let controller = Controller::bind(valid()).await.expect("the listeners bind");
         let (shared, store) = (Arc::clone(&controller.shared), controller.store());
-        let workers = Arc::clone(&controller.workers);
+        let workers = controller.workers();
         let (stop, stopped) = oneshot::channel::<()>();
         let serve = controller.serve(async {
             let _ = stopped.await;
@@ -1682,26 +1651,26 @@ mod tests {
                 assert!(begun.elapsed() < wait, "no first take");
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
-            let url = "http://w:8000".to_owned();
-            let row = store
-                .upsert(WorkerFacts {
-                    key: url.clone(),
-                    engine: url,
-                    models: vec!["m".to_owned()],
-                    dp_size: 1,
-                    ..WorkerFacts::default()
-                })
-                .id();
-            while workers.objects().object(row).is_none() {
-                assert!(begun.elapsed() < wait, "no object of the row");
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
+            let facts = |url: &str| WorkerFacts {
+                key: url.to_owned(),
+                engine: url.to_owned(),
+                models: vec!["m".to_owned()],
+                dp_size: 1,
+                ..WorkerFacts::default()
+            };
+            let written = workers.upsert(&store, facts("http://w:8000"), Registrant::Control);
+            let row = written.expect("the store took the registration").id();
+            assert!(
+                workers.object(row).is_some(),
+                "the object stands at the write"
+            );
             let revision = store.get(row).expect("the row").revision;
-            store.remove(row, revision).expect("a removal");
-            while !workers.objects().is_empty() {
-                assert!(begun.elapsed() < wait, "the object of a row that went");
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
+            workers.remove(&store, row, revision).expect("a removal");
+            assert!(workers.is_empty(), "the object left with its row");
+            // The store's own entry: a row, and no object.
+            let around = store.upsert(facts("http://around:8000")).id();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert_eq!(workers.object(around), None, "no task follows the table");
             stop.send(()).expect("the serve waits for its stop");
         };
         let (served, ()) = timeout(Duration::from_secs(60), async { tokio::join!(serve, case) })
@@ -1710,9 +1679,9 @@ mod tests {
         served.expect("a serve that leaves by its signal");
     }
 
-    /// The serve starts the probes of the replica's workers: a row written
-    /// while the controller leads is readied by the first probe its engine
-    /// passes, with no hand on its status.
+    /// The serve starts the probes of the replica's workers: a worker
+    /// written while the controller leads is readied by the first probe its
+    /// engine passes, with no hand on its status.
     #[tokio::test]
     async fn a_served_controller_probes_its_rows_while_it_leads() {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("a port");
@@ -1723,6 +1692,7 @@ mod tests {
 
         let controller = Controller::bind(valid()).await.expect("the listeners bind");
         let (shared, store) = (Arc::clone(&controller.shared), controller.store());
+        let workers = controller.workers();
         let (stop, stopped) = oneshot::channel::<()>();
         let serve = controller.serve(async {
             let _ = stopped.await;
@@ -1734,19 +1704,19 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
             let url = format!("http://{addr}");
-            let row = store
-                .upsert(WorkerFacts {
-                    key: url.clone(),
-                    engine: url,
-                    models: vec!["m".to_owned()],
-                    dp_size: 1,
-                    health: HealthPolicy {
-                        success_threshold: 1,
-                        ..HealthPolicy::default()
-                    },
-                    ..WorkerFacts::default()
-                })
-                .id();
+            let stated = WorkerFacts {
+                key: url.clone(),
+                engine: url,
+                models: vec!["m".to_owned()],
+                dp_size: 1,
+                health: HealthPolicy {
+                    success_threshold: 1,
+                    ..HealthPolicy::default()
+                },
+                ..WorkerFacts::default()
+            };
+            let written = workers.upsert(&store, stated, Registrant::Control);
+            let row = written.expect("the store took the registration").id();
             assert_eq!(
                 store.get(row).map(|row| row.status),
                 Some(WorkerStatus::Pending)

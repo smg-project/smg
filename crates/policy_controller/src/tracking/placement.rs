@@ -47,7 +47,7 @@ use smg_worker::identity::basic::Worker;
 
 use super::{
     decision_guard::DecisionGuard,
-    lease::{Outcome, Side},
+    lease::{EventKind, Outcome, Side},
 };
 use crate::{
     engine::{
@@ -241,6 +241,10 @@ impl Placement<'_> {
             .then(|| DecisionGuard::holding(engine.object, GatewayId::LOCAL, decided, later, now));
         let (profile, target) = (profile?, target?);
         if let Some(held) = &mut held {
+            // Stated here, in the call that decided: a word of the lease
+            // goes to the stages that stood at its issue, whatever document
+            // is in force when the placement is split.
+            held.set_takes_end(engine.takes(EventKind::Completed));
             held.take(index)?;
         }
         debug_assert_eq!(

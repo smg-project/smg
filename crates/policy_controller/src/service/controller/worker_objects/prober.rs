@@ -140,10 +140,7 @@ mod tests {
         time,
     };
 
-    use super::{
-        super::{lead::lasting, ObjectsWake},
-        *,
-    };
+    use super::{super::lead::lasting, *};
     use crate::{
         engine::view::{WireModes, WorkerId},
         service::{
@@ -220,7 +217,6 @@ mod tests {
             let dials: Arc<dyn EngineConnector> = connector.clone();
             let workers = Arc::new(WorkerObjects::with_connector(
                 Arc::clone(&store),
-                ObjectsWake::default(),
                 dials,
                 Config::DEFAULT_WORKER_OVERLOAD,
             ));
@@ -246,8 +242,8 @@ mod tests {
             })
         }
 
-        /// Writes the row of `facts` and lays its object, as the follower's
-        /// task does at the store's wake.
+        /// Writes the row of `facts` through the store's own entry and has
+        /// the holder follow it, as a host that writes its store does.
         fn register(&self, facts: WorkerFacts) -> WorkerId {
             let row = self.store.upsert(facts).id();
             self.workers.holder().follow(&*self.store);

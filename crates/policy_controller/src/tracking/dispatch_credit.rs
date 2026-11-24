@@ -10,11 +10,10 @@ use std::{
 
 use arc_swap::Guard;
 use parking_lot::Mutex;
-use rustc_hash::FxHashMap;
 
 use crate::{
-    engine::{Candidate, LoadRow, RequestFacts, Target, WorkerId},
-    stages::scorers::{Credits, RankCredit, SentCredit},
+    engine::{Candidate, LoadRow, RequestFacts, Target},
+    stages::scorers::{Credits, RankCredit, RankTable, SentCredit},
     tracking::{Lease, Membership, Side},
 };
 
@@ -457,7 +456,7 @@ impl DispatchCredit {
     }
 }
 
-type Tally = FxHashMap<(WorkerId, u16), Arc<RankCredit>>;
+type Tally = RankTable;
 
 /// A pass over a profile's send tally at one request's clock.
 pub struct DispatchCreditPass<'a> {

@@ -5,17 +5,22 @@ use std::{
     thread,
 };
 
-use smg_worker::identity::basic::Worker;
+use smg_worker::{
+    identity::{basic::Worker, builder::BasicWorkerBuilder},
+    model_card::ModelCard,
+    test_support::no_health_check,
+    worker::WorkerStatus,
+};
 
 use super::{
     super::{
-        place::PlaceRequest,
+        place::{PlaceRequest, Prompt},
         single::tests::{pool, request, Asks, MODEL},
     },
     *,
 };
 use crate::{
-    document::spec::{AppliedSpec, PolicySpec, ShadowSpec},
+    document::spec::{AppliedSpec, KeySourceSpec, PolicySpec, RoutingKeySpec, ShadowSpec},
     engine::{
         decision_engine::{Decided, DecisionEngine, WorkerLists},
         framework::Place,
@@ -38,6 +43,21 @@ fn sampling(name: &str, sample: u32) -> PolicySpec {
     let mut document = PolicySpec::preset(name).expect("a built-in preset");
     document.generation = 1;
     document.explain.sample = sample;
+    document
+}
+
+/// The preset `round_robin` under a document that takes a word on a lease
+/// and keeps every `sample`th decision. Another model's binding, ahead of
+/// this model's, names a profile that takes a lease's words: the document
+/// takes them, and this model's place stays one pick's.
+fn noting(sample: u32) -> PolicySpec {
+    let mut document = sampling("round_robin", sample);
+    let loads = PolicySpec::preset("least_load").expect("a built-in preset");
+    document.profiles.extend(loads.profiles);
+    let mut other = document.bindings[0].clone();
+    other.matcher.model = "another-model".into();
+    other.profile = Some("least_load".into());
+    document.bindings.insert(0, other);
     document
 }
 
@@ -128,6 +148,38 @@ fn a_kept_place_is_the_pick_as_it_was_taken() {
     assert_eq!(engine.leases.0.load(Ordering::Relaxed), 0, "no id taken");
 }
 
+/// A kept place names its worker by the rank that worker's registration
+/// states, as a noted pick names it: over three ranks of one data-parallel
+/// engine, listed out of their order, each record's target holds the rank
+/// of the worker its request was placed on.
+#[test]
+fn a_kept_place_names_the_rank_its_worker_registered() {
+    const RANKS: [u16; 3] = [2, 0, 1];
+    let engine = hosted(&sampling("round_robin", 1));
+    let list: Arc<[Arc<dyn Worker>]> = RANKS
+        .iter()
+        .map(|&rank| -> Arc<dyn Worker> {
+            let worker = <BasicWorkerBuilder>::new("http://engine:8000")
+                .model(ModelCard::new(MODEL))
+                .dp_config(usize::from(rank), RANKS.len())
+                .health_config(no_health_check())
+                .build();
+            worker.set_status(WorkerStatus::Ready);
+            Arc::new(worker)
+        })
+        .collect();
+    let members = PublishedList::new(Arc::clone(&list));
+    for n in 0..RANKS.len() {
+        let id = format!("r-{n}");
+        let place = placed(engine, &list, &members, Some(id.as_str()));
+        let record = engine.explained(id.as_bytes()).expect("a kept place");
+        let pick = record.decision.pick().expect("a pick");
+        let target = pick.targets.first().expect("the target");
+        let named = (target.position as usize, target.dp_rank);
+        assert_eq!(named, (place, RANKS[place]), "request {n}");
+    }
+}
+
 /// A request that states no id is not counted and not kept: the requests
 /// that state one are counted among themselves, and no record is found
 /// under no id.
@@ -144,12 +196,117 @@ fn a_request_that_states_no_id_is_not_counted() {
     assert_eq!(engine.explained(b""), None);
 }
 
+/// A request that states no id of its own is counted and kept under the id
+/// its host states for it. One that states both is found by its own id
+/// and not by its host's. An empty id of its own is none. A request that
+/// has neither is not counted.
+#[test]
+fn a_request_with_no_id_is_found_by_the_id_its_host_states() {
+    let engine = hosted(&sampling("round_robin", 2));
+    let list = pool(4);
+    let members = PublishedList::new(Arc::clone(&list));
+    let stated = [
+        (None, Some("host-1")),
+        (None, None),
+        (Some("own-2"), Some("host-2")),
+        (Some(""), Some("host-3")),
+        (None, None),
+        (None, Some("host-4")),
+    ];
+    for (request_id, explain_id) in stated {
+        let request = PlaceRequest {
+            request_id,
+            explain_id,
+            ..PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()))
+        };
+        let _ = engine.place(&request).expect("a placement");
+    }
+    let ids = ["host-1", "own-2", "host-2", "host-3", "host-4"];
+    let kept = ids.map(|id| engine.explained(id.as_bytes()).is_some());
+    assert_eq!(kept, [false, true, false, false, true]);
+}
+
+/// A place one pick decides, a noted place and a whole decision alike keep
+/// a request that states no id under its host's. The record names the
+/// worker the request was placed on. Each document is held to its road:
+/// whether one pick decides the place, and whether the document takes a
+/// word on a lease.
+#[test]
+fn a_place_a_noted_place_and_a_whole_decision_are_kept_under_a_hosts_id() {
+    let roads = [
+        ("a place", sampling("round_robin", 1), (true, false)),
+        ("a noted place", noting(1), (true, true)),
+        ("a whole decision", sampling("least_load", 1), (false, true)),
+    ];
+    for (road, document, (alone, noted)) in roads {
+        let engine = hosted(&document);
+        let handle = engine.spec();
+        let one_pick = matches!(handle.place_for(MODEL, Phase::Single), Place::Alone(_));
+        let hears = engine.in_force().hears.intersects(EventSet::LEASE);
+        assert_eq!((one_pick, hears), (alone, noted), "{road}");
+        let list = pool(4);
+        let members = PublishedList::new(Arc::clone(&list));
+        let request = PlaceRequest {
+            explain_id: Some("host-1"),
+            ..PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()))
+        };
+        let placement = engine.place(&request).expect("a placement");
+        let record = engine.explained(b"host-1").expect(road);
+        let pick = record.decision.pick().expect("a pick");
+        let first = pick.targets.first().expect("a target");
+        assert_eq!(first.id, placement.id(), "{road}");
+    }
+}
+
+/// A kept decision's JSON form holds no fact of its request. A request
+/// placed with a session header that keys it and that the document's view
+/// shows its stages, a prompt, a tenant and its host's id is kept, and none
+/// of the four stands in what a host is handed to answer.
+#[test]
+fn a_records_json_holds_no_fact_of_its_request() {
+    let mut document = sampling("least_load", 1);
+    document.view.headers = vec!["x-session".into()];
+    document.bindings[0].routing_key = Some(RoutingKeySpec {
+        sources: vec![KeySourceSpec {
+            header: Some("x-session".into()),
+            ..KeySourceSpec::default()
+        }],
+        strip_lineage: false,
+    });
+    let engine = hosted(&document);
+    let list = pool(4);
+    let members = PublishedList::new(Arc::clone(&list));
+    let headers = [("x-session", "session-secret")];
+    let request = PlaceRequest {
+        headers: &headers,
+        prompt: Prompt {
+            text: Some("prompt-secret"),
+            ..Prompt::NONE
+        },
+        tenant: Some("tenant-secret"),
+        explain_id: Some("host-1"),
+        ..PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()))
+    };
+    let placement = engine.place(&request).expect("a placement");
+    assert_eq!(placement.routing_key, Some("session-secret"), "keyed");
+    let record = engine.explained(b"host-1").expect("the decision is kept");
+    let handle = engine.spec();
+    let json = record.json(handle.engine(), &|_| None);
+    let written = json.to_string();
+    let stated = ["session-secret", "prompt-secret", "tenant-secret", "host-1"];
+    for secret in stated {
+        assert!(!written.contains(secret), "{secret} in {written}");
+    }
+    assert!(written.contains("\"decision\""), "{written}");
+}
+
 /// A whole decision is kept as it was answered, a pick and a shed alike,
 /// dated at the decision's instant. The newest record under an id is the
-/// one read.
+/// one read. The profile scores every worker of its list, so its request
+/// is made whatever a picker that draws for itself does with a plain one.
 #[test]
 fn a_whole_decision_is_kept_as_it_was_answered() {
-    let engine = hosted(&sampling("power_of_two", 1));
+    let engine = hosted(&sampling("least_load", 1));
     let list = pool(4);
     let members = PublishedList::new(Arc::clone(&list));
     let asks = Asks::of(request(), Some(&members));
@@ -203,16 +360,7 @@ fn a_singles_record_holds_what_its_shadow_said() {
 /// request takes one id and one turn of its pool.
 #[test]
 fn a_noted_place_is_kept_as_it_was_noted() {
-    // Another model's binding names a profile that takes a lease's words:
-    // the document takes them, and this model's place stays one pick's.
-    let mut document = sampling("round_robin", 1);
-    let loads = PolicySpec::preset("least_load").expect("a built-in preset");
-    document.profiles.extend(loads.profiles);
-    let mut other = document.bindings[0].clone();
-    other.matcher.model = "another-model".into();
-    other.profile = Some("least_load".into());
-    document.bindings.insert(0, other);
-    let engine = hosted(&document);
+    let engine = hosted(&noting(1));
     assert!(engine.in_force().hears.intersects(EventSet::LEASE));
     let handle = engine.spec();
     let alone = matches!(handle.place_for(MODEL, Phase::Single), Place::Alone(_));

@@ -35,7 +35,19 @@ use crate::{
 /// frame to its size from the list's tail, so a longer copy would wait in
 /// the link's queue for nothing. The link counts the hashes left out with
 /// its own cut.
-pub(crate) fn request(request: &Request<'_>) -> (proto::DecideRequest, usize) {
+///
+/// `named` is what the target source of the request's binding answered for
+/// it ([`KeySources::target`](crate::document::KeySources::target)): the
+/// number the request names its worker by, `Some(None)` for a text that is
+/// no number, and `None` for a request that names no worker. The frame
+/// states the number (`DecideRequest.named_worker`), and a text that is no
+/// number as the widest one: neither reaches a worker of any list. A
+/// request that names none states nothing, as the frame of a host older
+/// than the field does.
+pub(crate) fn request(
+    request: &Request<'_>,
+    named: Option<Option<u32>>,
+) -> (proto::DecideRequest, usize) {
     let (facts, constraints) = (&request.facts, &request.constraints);
     let held = facts.block_hashes.len().min(MAX_HASHES);
     let asked = proto::DecideRequest {
@@ -100,6 +112,7 @@ pub(crate) fn request(request: &Request<'_>) -> (proto::DecideRequest, usize) {
         decode_of: None,
         // An encode request's frame states its items ([`encode_request`]).
         encode: None,
+        named_worker: named.map(|number| number.unwrap_or(u32::MAX)),
     };
     (asked, facts.block_hashes.len() - held)
 }
@@ -131,7 +144,7 @@ pub(crate) fn encode_request(
         },
         ..*request
     };
-    let (mut asked, left_out) = self::request(&stated);
+    let (mut asked, left_out) = self::request(&stated, None);
     asked.encode = Some(proto::EncodeItems {
         keys: items
             .keys
@@ -600,7 +613,7 @@ mod tests {
             asked.facts.phase = phase;
             asked.facts.hash_kind = hash_kind;
             let want = &asked.facts;
-            let (sent, left_out) = request(&asked);
+            let (sent, left_out) = request(&asked, None);
             assert_eq!(left_out, 0);
             let facts = sent.facts.as_ref().expect("request facts");
             assert_eq!(facts.client_key, want.client_key);
@@ -683,7 +696,8 @@ mod tests {
                 },
                 constraints: Constraints::default(),
             };
-            let facts = request(&asked).0.facts.expect("the frame's facts");
+            let facts = request(&asked, None).0.facts;
+            let facts = facts.expect("the frame's facts");
             facts.prompt_tokens
         };
         // 52 one-byte characters, 26 two-byte characters, a text of 52
@@ -709,7 +723,7 @@ mod tests {
             },
             constraints: Constraints::default(),
         };
-        let (sent, left_out) = request(&asked);
+        let (sent, left_out) = request(&asked, None);
         let copied = sent.facts.expect("request facts").block_hashes;
         assert_eq!((copied.len(), copied.capacity()), (MAX_HASHES, MAX_HASHES));
         assert_eq!(left_out, 1_000);
@@ -733,7 +747,7 @@ mod tests {
         };
         let want = &asked.facts;
         assert!(!want.tenant.is_none() && !want.session_key.is_none());
-        let (sent, _) = request(&asked);
+        let (sent, _) = request(&asked, None);
         let checked = Checked::new(sent).expect("the controller reads the request");
         made(&checked, &mut Lists::default(), LEFT, |facts, _| {
             assert_eq!(facts.tenant.hash, want.tenant.hash);
@@ -829,7 +843,7 @@ mod tests {
                 let key = facts.session_key.as_ref();
                 key.and_then(|key| key.form.clone())
             });
-            let pair = read(request(&asked).0);
+            let pair = read(request(&asked, None).0);
             assert_eq!(pair, (want, session.hash));
             assert_eq!(read(encode), pair, "{session:?}");
             // The hash form on the encode frame is the session's value
@@ -843,6 +857,35 @@ mod tests {
                 assert_eq!(stated, Some(Form::Hash(at_encode.session().get())));
             }
         }
+    }
+
+    /// A request that names its worker states the number its target source
+    /// answered for it, and the controller reads that number off the frame.
+    /// A text that is no number crosses as the widest number, which reaches
+    /// no worker of any list. A request that names no worker states no
+    /// number, as the frame of a host older than the field.
+    #[test]
+    fn a_request_that_names_its_worker_states_its_number_on_the_frame() {
+        let asked = Request {
+            id: b"a request",
+            facts: RequestFacts {
+                model: "model-a",
+                budget_micros: 2_000,
+                ..RequestFacts::default()
+            },
+            constraints: Constraints::default(),
+        };
+        let read = |named: Option<Option<u32>>| {
+            let (sent, _) = request(&asked, named);
+            let stated = sent.named_worker;
+            let checked = Checked::new(sent).expect("the controller reads the request");
+            (stated, checked.named_worker())
+        };
+        assert_eq!(read(Some(Some(0))), (Some(0), Some(0)));
+        assert_eq!(read(Some(Some(7))), (Some(7), Some(7)));
+        let widest = Some(u32::MAX);
+        assert_eq!(read(Some(None)), (widest, widest), "no number");
+        assert_eq!(read(None), (None, None), "names no worker");
     }
 
     fn trace(survivors: Survivors) -> Trace {

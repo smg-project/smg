@@ -2,7 +2,10 @@
 //! with the pair's cases ([`super::pair`]).
 
 use super::*;
-use crate::policies::consistent_hashing::target_source;
+use crate::{
+    engine::policy_engine::place::target::{reached, Reached},
+    policies::consistent_hashing::target_source,
+};
 
 /// The header the stock hash ring document names as its target source.
 pub(super) const TARGET: &str = "x-smg-target-worker";
@@ -184,6 +187,47 @@ fn the_number_counts_the_workers_that_are_available() {
     trip(&list[0]);
     assert_eq!(placed("0"), Ok(id(1)), "an open breaker");
     assert_eq!(placed("1"), Ok(id(2)));
+}
+
+/// The count both doors share walks the list once, in its order, and asks
+/// its caller's test of each worker with that worker's place, as far as
+/// the worker the number reaches and of none behind it. A number past the
+/// workers the test takes reaches none, behind a walk of the whole list. A
+/// text that is no number reaches none too, and is asked as far as the
+/// first worker the test takes. Where the test takes no worker there is
+/// none to count, whatever the number: so over an empty list.
+#[test]
+fn the_count_asks_no_worker_behind_the_one_its_number_reaches() {
+    let list = pool(6);
+    let asked = RefCell::new(Vec::new());
+    let counted = |number: Option<u32>, takes: fn(u32) -> bool| {
+        asked.borrow_mut().clear();
+        let answer = reached(&list, number, |place, worker| {
+            let held = Arc::as_ptr(&list[place as usize]);
+            assert!(ptr::addr_eq(ptr::from_ref(worker), held), "{place}");
+            asked.borrow_mut().push(place);
+            takes(place)
+        });
+        (answer, asked.borrow().clone())
+    };
+    let odd = |place: u32| place % 2 == 1;
+    assert_eq!(counted(Some(0), odd), (Reached::Place(1), vec![0, 1]));
+    assert_eq!(counted(Some(1), odd), (Reached::Place(3), vec![0, 1, 2, 3]));
+    let every: Vec<u32> = (0..6).collect();
+    assert_eq!(counted(Some(2), odd), (Reached::Place(5), every.clone()));
+    assert_eq!(counted(Some(3), odd), (Reached::NoWorker, every.clone()));
+    assert_eq!(
+        counted(Some(u32::MAX), odd),
+        (Reached::NoWorker, every.clone())
+    );
+    assert_eq!(counted(None, odd), (Reached::NoWorker, vec![0, 1]));
+    let none = |_: u32| false;
+    assert_eq!(
+        counted(Some(0), none),
+        (Reached::NoneToCount, every.clone())
+    );
+    assert_eq!(counted(None, none), (Reached::NoneToCount, every));
+    assert_eq!(reached(&[], Some(0), |_, _| true), Reached::NoneToCount);
 }
 
 /// The number counts among the workers the route's rule takes: the rule

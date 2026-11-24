@@ -127,14 +127,29 @@ pub trait RequestMaker {
     /// document that keeps a sample of its decisions (`explain.sample`),
     /// for a plain request one pick decided, and under no other document.
     /// A kept decision is found by its request's id. A request that states
-    /// none is not counted and not kept: a host states an id for a request
-    /// it wants found.
+    /// none is found by the id its host states for it
+    /// ([`Self::explain_id`]), and is not counted and not kept where it
+    /// has neither.
     ///
     /// The trait's answer makes the request to read its id. A maker that
     /// holds the id answers with no making, as the call that places a
     /// request does.
     fn request_id<'w>(&'w self, spec: &'w AppliedSpec) -> &'w [u8] {
         self.make(spec).id
+    }
+
+    /// The id a kept decision of the request is found by where the request
+    /// states no id of its own: its host's name for it. Empty from a maker
+    /// that states none, as a served controller's is: its frame's id is the
+    /// request's own.
+    ///
+    /// It is no id of the request made. An id of the request made is a
+    /// source of its routing value and stands on its lease, so a host's
+    /// name stated there would key a request that states no id. Asked
+    /// under a document that keeps a sample, of a request that states no
+    /// id of its own, and nowhere else.
+    fn explain_id(&self) -> &[u8] {
+        &[]
     }
 
     /// Where a worker's object counts the requests of the request's

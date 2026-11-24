@@ -27,7 +27,7 @@ use super::{
 use crate::{
     document::spec::{AppliedSpec, PolicySpec},
     engine::{
-        decision::{Target, Targets},
+        decision::{Decision, Target, Targets},
         decision_engine::HeldDecode,
         framework::{Picker, TieBand},
         sticky_sessions::SessionVerdict,
@@ -43,23 +43,26 @@ use crate::{
     tracking::lease::{Dispatch, Lease, LeaseId, LeaseKind, Outcome, ReleaseReason, Said, Side},
 };
 
-const GATEWAY: GatewayId = GatewayId(11);
+pub(super) const GATEWAY: GatewayId = GatewayId(11);
 /// The session every lease here was issued under.
-const KEY: Session = Session::from_raw(41);
+pub(super) const KEY: Session = Session::from_raw(41);
 /// The generation every lease here was issued under.
-const GENERATION: u64 = 1;
+pub(super) const GENERATION: u64 = 1;
 /// The instant every lease here was issued at, on the decision clock.
-const ISSUED_MICROS: u64 = 1_000;
+pub(super) const ISSUED_MICROS: u64 = 1_000;
 /// The prompt size every lease here states.
-const TOKENS: u32 = 100;
+pub(super) const TOKENS: u32 = 100;
 /// The span every dispatch here names.
-const SINCE: u32 = 250;
+pub(super) const SINCE: u32 = 250;
 /// How long a lease here waits for its dispatch.
-const DISPATCH_TTL: Duration = Duration::from_secs(5);
+pub(super) const DISPATCH_TTL: Duration = Duration::from_secs(5);
 
 /// One call of a stage about a lease, with all it was handed.
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum Event {
+#[derive(Clone, Debug, PartialEq)]
+pub(super) enum Event {
+    /// An issue, which a dispatch tells of a pair's decode side no call
+    /// issued: the pick is kept apart, where a word is not.
+    Issued(Lease, Box<Decision>),
     Dispatched(Lease, Target, Side, u32),
     Completed(Lease, Outcome),
     Released(Lease, ReleaseReason),
@@ -70,6 +73,11 @@ enum Event {
 struct Records(Arc<Mutex<Vec<Event>>>);
 
 impl Lifecycle for Records {
+    fn on_decision_issued(&self, lease: &Lease, decision: &Decision) {
+        let event = Event::Issued(*lease, Box::new(*decision));
+        self.0.lock().push(event);
+    }
+
     fn on_dispatched(&self, lease: &Lease, target: &Target, side: Side, since: u32) {
         let event = Event::Dispatched(*lease, *target, side, since);
         self.0.lock().push(event);
@@ -104,14 +112,14 @@ impl Picker for Records {
 
 /// A store whose standing generation keeps every word its stages are told
 /// of a lease.
-struct Bed {
-    store: MemoryStore,
+pub(super) struct Bed {
+    pub(super) store: MemoryStore,
     events: Arc<Mutex<Vec<Event>>>,
-    now: Instant,
+    pub(super) now: Instant,
 }
 
 impl Bed {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let store = MemoryStore::new();
         let events = Arc::new(Mutex::new(Vec::new()));
         let kept = Arc::clone(&events);
@@ -135,7 +143,7 @@ impl Bed {
     }
 
     /// What the stages were told since the last read.
-    fn told(&self) -> Vec<Event> {
+    pub(super) fn told(&self) -> Vec<Event> {
         mem::take(&mut *self.events.lock())
     }
 
@@ -236,7 +244,7 @@ fn single_targets() -> Targets {
 }
 
 /// A target as a word names it: a worker and its rank, at no position.
-fn target(id: WorkerId, dp_rank: u16) -> Target {
+pub(super) fn target(id: WorkerId, dp_rank: u16) -> Target {
     Target {
         id,
         dp_rank,

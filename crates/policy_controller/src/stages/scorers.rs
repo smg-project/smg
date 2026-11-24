@@ -8,6 +8,7 @@
 use std::{
     cell::Cell,
     collections::VecDeque,
+    hash::BuildHasher,
     sync::{
         atomic::{AtomicU16, AtomicU64, AtomicUsize, Ordering},
         Arc, OnceLock,
@@ -16,7 +17,7 @@ use std::{
 
 use arc_swap::ArcSwap;
 use parking_lot::{Mutex, MutexGuard};
-use rustc_hash::FxHashMap;
+use rustc_hash::FxBuildHasher;
 
 use crate::{
     document::spec::{CostMargin, Needs, Unreported},
@@ -1079,28 +1080,122 @@ impl RankCredit {
 /// A candidate row's identity in the tally: the worker and the DP rank. A row
 /// is one worker or one rank of a data-parallel worker, and a rank's report
 /// and credit are its own (design 4.1: a rank is a candidate), so two ranks of
-/// one worker never share an entry. The id is a fingerprint already, so the
-/// tally hashes the pair with the repository's fast hasher: the default
-/// hasher's second block over the two-word key cost the credited decision 3
-/// to 8 % at 64 and 512 rows.
+/// one worker never share an entry.
 type RankKey = (WorkerId, u16);
+
+/// A slot of a [`RankTable`]: a rank beside its entry, or free.
+type RankSlot = Option<(RankKey, Arc<RankCredit>)>;
+
+/// A tally's entries by rank, as a decision's row loop reads them. Each slot
+/// holds a rank beside its entry: a read starts at the slot the pair's hash
+/// names and walks to the rank or to a free slot, where a general map's
+/// probe of a group of slots cost a least-load decision about 3 % at 72
+/// rows. At most half of the slots are held, so a walk ends.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct RankTable {
+    /// A power of two of slots, or none.
+    slots: Box<[RankSlot]>,
+    held: usize,
+}
+
+impl RankTable {
+    /// The slot a walk for `rank` starts at, before the table's mask: the
+    /// hash a map takes of the pair, so ids a program states in a pattern
+    /// start apart.
+    #[inline(always)]
+    fn start(rank: &RankKey) -> usize {
+        FxBuildHasher.hash_one(rank) as usize
+    }
+
+    #[inline(always)]
+    pub(crate) fn get(&self, rank: &RankKey) -> Option<&Arc<RankCredit>> {
+        // A count nothing was sent under answers before it hashes.
+        if self.slots.is_empty() {
+            return None;
+        }
+        let mask = self.slots.len() - 1;
+        let mut at = Self::start(rank) & mask;
+        loop {
+            match self.slots.get(at)? {
+                Some((held, since)) if held == rank => return Some(since),
+                Some(_) => at = (at + 1) & mask,
+                None => return None,
+            }
+        }
+    }
+
+    pub(crate) fn contains_key(&self, rank: &RankKey) -> bool {
+        self.get(rank).is_some()
+    }
+
+    #[inline(always)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.held == 0
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &(RankKey, Arc<RankCredit>)> {
+        self.slots.iter().flatten()
+    }
+
+    pub(crate) fn keys(&self) -> impl Iterator<Item = &RankKey> {
+        self.iter().map(|(rank, _)| rank)
+    }
+
+    /// Enters `since` under `rank`, which the table does not hold.
+    fn insert(&mut self, rank: RankKey, since: Arc<RankCredit>) {
+        if (self.held + 1) * 2 > self.slots.len() {
+            let entries = std::mem::take(&mut self.slots);
+            self.slots = vec![None; (entries.len() * 2).max(4)].into();
+            self.held = 0;
+            for (rank, since) in entries.into_vec().into_iter().flatten() {
+                self.insert(rank, since);
+            }
+        }
+        let mask = self.slots.len() - 1;
+        let mut at = Self::start(&rank) & mask;
+        while self.slots[at].is_some() {
+            at = (at + 1) & mask;
+        }
+        self.slots[at] = Some((rank, since));
+        self.held += 1;
+    }
+
+    /// The table of the entries `stays` keeps, laid anew in as many slots,
+    /// and in none where no entry stays: a walk stops at a free slot, so
+    /// none is freed in place.
+    fn retained(&self, mut stays: impl FnMut(&RankKey, &Arc<RankCredit>) -> bool) -> Self {
+        let mut next = Self {
+            slots: vec![None; self.slots.len()].into(),
+            held: 0,
+        };
+        for (rank, since) in self.iter() {
+            if stays(rank, since) {
+                next.insert(*rank, Arc::clone(since));
+            }
+        }
+        if next.held == 0 {
+            next.slots = Box::default();
+        }
+        next
+    }
+}
 
 /// The since-report dispatch credit of a load scorer: per rank row, the
 /// dispatches no report reflects yet. A decision and a dispatch to a rank the
-/// tally knows load the map without a shared write (a read-write lock's
+/// tally knows load the table without a shared write (a read-write lock's
 /// reader count is one, and eight deciders queued on it); a rank's first
-/// dispatch and a membership change replace the map whole, which is rare.
+/// dispatch and a membership change replace the table whole, which is rare.
 /// Within a row the dispatches take per-thread lanes: deciders that read the
 /// same minimum book the same rank, and one lock there queued them too.
 #[derive(Debug)]
 pub(crate) struct Credits {
-    pub(crate) tally: ArcSwap<FxHashMap<RankKey, Arc<RankCredit>>>,
+    pub(crate) tally: ArcSwap<RankTable>,
 }
 
 impl Default for Credits {
     fn default() -> Self {
         Self {
-            tally: ArcSwap::from_pointee(FxHashMap::default()),
+            tally: ArcSwap::from_pointee(RankTable::default()),
         }
     }
 }
@@ -1134,7 +1229,7 @@ impl Credits {
             if tally.contains_key(&rank) {
                 return Arc::clone(tally);
             }
-            let mut next = FxHashMap::clone(tally);
+            let mut next = RankTable::clone(tally);
             next.insert(rank, Arc::new(RankCredit::default()));
             Arc::new(next)
         });
@@ -1149,15 +1244,17 @@ impl Credits {
         let mut went: Vec<Arc<RankCredit>> = Vec::new();
         self.tally.rcu(|tally| {
             went.clear();
-            let mut next = FxHashMap::clone(tally);
-            next.retain(|rank, since| {
+            // A change that takes no rank keeps the table it found.
+            if !tally.keys().any(&gone) {
+                return Arc::clone(tally);
+            }
+            Arc::new(tally.retained(|rank, since| {
                 let stays = !gone(rank);
                 if !stays {
                     went.push(Arc::clone(since));
                 }
                 stays
-            });
-            next
+            }))
         });
         for since in &went {
             dropped(since);
@@ -1382,7 +1479,7 @@ impl ResidentWork {
     #[inline(always)]
     fn cost_reported(
         &self,
-        tally: &FxHashMap<RankKey, Arc<RankCredit>>,
+        tally: &RankTable,
         row: &Candidate,
         report: Option<&LoadRow>,
         in_flight: impl FnOnce() -> u32,
@@ -2825,6 +2922,28 @@ pub(crate) mod tests {
             [1.0, 0.0],
             "3,000 on rank 0 against 2,000 + 1,500 + 1,000 for each of two requests on rank 1"
         );
+    }
+
+    /// Three ranks whose walks start at one slot are each found, and the two
+    /// behind are still found once the first is dropped: a walk stops at a
+    /// free slot, so the table is laid again and no slot is freed in place.
+    #[test]
+    fn a_rank_is_found_behind_one_the_table_dropped() {
+        let at = |id: u64| RankTable::start(&(WorkerId(id), 0)) & 7;
+        let alike: Vec<RankKey> = (1..)
+            .filter(|&id| at(id) == at(1))
+            .take(3)
+            .map(|id| (WorkerId(id), 0))
+            .collect();
+        let mut table = RankTable::default();
+        for &rank in &alike {
+            table.insert(rank, Arc::new(RankCredit::default()));
+        }
+        assert!(alike.iter().all(|rank| table.contains_key(rank)));
+        let table = table.retained(|rank, _| *rank != alike[0]);
+        assert!(!table.contains_key(&alike[0]));
+        assert!(table.contains_key(&alike[1]) && table.contains_key(&alike[2]));
+        assert_eq!(table.iter().count(), 2);
     }
 
     /// The mean context is the resident tokens over the requests the report

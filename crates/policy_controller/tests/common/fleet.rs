@@ -27,9 +27,10 @@
 //! engine of one rank is an add on the control listener, under the name the
 //! harness states there. The call makes one rank, so a rank of a wider
 //! engine is still the store's membership write. The rows a case reads
-//! ([`Harness::pool`]) are the store's too: its workers' table and its load
-//! table, as the controller's own writers left them. A case calls the
-//! handle alone, so a move of either rewrites no case.
+//! ([`Harness::pool`]) are the store's too: its workers' table, as the
+//! controller's own writers left it, each row with the load monitor's
+//! newest report of it. A case calls the handle alone, so a move of either
+//! rewrites no case.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -74,10 +75,10 @@ use smg_policy_controller::{
     stages::StageRegistry,
     store::{
         GatewayId, HealthPolicy, LeaseState, MembershipChange, MembershipTail, MemoryStore,
-        Signals, WorkerFacts, WorkerStatus, WorkersStore,
+        Registrant, Signals, WorkerFacts, WorkerStatus, WorkersStore,
     },
     tracking::LeaseId,
-    worker_host::KvTables,
+    worker_host::{KvTables, Members, Objects},
 };
 use smg_worker::{
     kv_events::port::{KvCursor, ResyncReason},
@@ -372,6 +373,9 @@ pub struct Replica {
     /// The controller's KV tables: the index its feed writes, its cursors
     /// and its resync counts.
     tables: Arc<KvTables>,
+    /// The holder of the controller's worker objects: what a membership
+    /// write of the harness's own goes through.
+    workers: Arc<Objects<Members>>,
     /// The channel of the controller's load monitor: what a decision is
     /// given of its workers' load.
     loads: LoadReceiver,
@@ -609,28 +613,34 @@ async fn start_engine(ranks: u16, runtime: RuntimeType) -> Result<Engine, String
     })
 }
 
-/// One rank written into the store by its membership write, pending: a
-/// rank of a wider engine under a controller.
-fn written(store: &MemoryStore, endpoint: &str, shape: &Shape, rank: u16) -> WorkerId {
-    store
-        .upsert(WorkerFacts {
-            key: format!("{endpoint}@{rank}"),
-            engine: endpoint.to_owned(),
-            incarnation: 1,
-            role: shape.role,
-            wire_modes: WireModes::GRPC,
-            engine_kind: shape.runtime.as_str().to_owned(),
-            models: vec![shape.model.to_owned()],
-            dp_rank: rank,
-            dp_size: shape.ranks,
-            signals: Signals {
-                events: !counts_resident(shape.runtime),
-                ..Signals::default()
-            },
-            health: health_policy(),
-            ..WorkerFacts::default()
-        })
-        .id()
+/// One rank written through the controller's holder, as a registration
+/// call writes one, pending: a rank of a wider engine under a controller.
+fn written(
+    workers: &Objects<Members>,
+    store: &MemoryStore,
+    endpoint: &str,
+    shape: &Shape,
+    rank: u16,
+) -> Option<WorkerId> {
+    let stated = WorkerFacts {
+        key: format!("{endpoint}@{rank}"),
+        engine: endpoint.to_owned(),
+        incarnation: 1,
+        role: shape.role,
+        wire_modes: WireModes::GRPC,
+        engine_kind: shape.runtime.as_str().to_owned(),
+        models: vec![shape.model.to_owned()],
+        dp_rank: rank,
+        dp_size: shape.ranks,
+        signals: Signals {
+            events: !counts_resident(shape.runtime),
+            ..Signals::default()
+        },
+        health: health_policy(),
+        ..WorkerFacts::default()
+    };
+    let written = workers.upsert(store, stated, Registrant::Control)?;
+    Some(written.id())
 }
 
 /// Sends one short request named `id` to the engine at `endpoint` on the
@@ -1056,7 +1066,7 @@ impl Replica {
         let replication = addresses
             .of(Scope::Replication)
             .ok_or("the controller has no replication listener")?;
-        let store = controller.store();
+        let (store, workers) = (controller.store(), controller.workers());
         let tables = controller.kv_tables();
         let loads = controller.loads();
         let readiness = controller.readiness();
@@ -1075,6 +1085,7 @@ impl Replica {
             replication,
             store,
             tables,
+            workers,
             loads,
             readiness,
             stop: Some(stop),
@@ -1381,7 +1392,8 @@ impl Harness {
         if shape.ranks == 1 {
             return self.add(endpoint, shape).await;
         }
-        Ok(written(&self.store, endpoint, shape, rank))
+        written(&self.replica.workers, &self.store, endpoint, shape, rank)
+            .ok_or_else(|| format!("the store took no write of rank {rank} at {endpoint}"))
     }
 
     /// An operator's add of a one-rank engine. The answer is the row the

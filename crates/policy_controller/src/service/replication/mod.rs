@@ -29,8 +29,7 @@
 //! the rows both read the watched kinds (membership, status, a term's
 //! start). The log keeps them in one ring, in the one order of positions,
 //! and it tells one listener when they grew, once the store that wrote has
-//! let its locks go ([`Log::on_watched`]). The log carries no load row: a
-//! load write tells nothing there.
+//! let its locks go ([`Log::on_watched`]). The log carries no load row.
 //!
 //! What is here: the bounded log ([`Log`]) and the reads made of it
 //! ([`Log::holds`] for the place a reader brings from another connection or

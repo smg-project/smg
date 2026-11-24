@@ -55,24 +55,19 @@ use crate::{
     store::{MembershipChange, MemoryStore, Registrant, WorkerFacts, WorkerPatch, WorkerRow},
 };
 
-#[cfg_attr(
-    not(any(test, feature = "controller")),
-    expect(dead_code, reason = "a controller's doors write through the holder")
-)]
 impl<G: Generation> Objects<G> {
     /// Lay a registration's `facts`, by `maker`, over the object that
-    /// stands under their key: the write of [`WorkersStore::upsert_by`],
-    /// decided here ([`WorkerFacts::laid_over`]). The change it made, or
-    /// `None` where the store did not take it.
+    /// stands under their key, by the one rule every writer of a row
+    /// decides by. The change it made, or `None` where `store` did not take
+    /// it: another writer moved the row under the call.
     ///
     /// A row changed in place gets a new object in the standing one's
     /// place, under its id in the registry and with its running state. A
     /// key's next life registers its object under a new id, and the old
-    /// life's object is dropped first, as a follow lays the two
-    /// ([`Self::put`]).
+    /// life's object is dropped first.
     ///
-    /// [`WorkersStore::upsert_by`]: crate::store::WorkersStore::upsert_by
-    pub(crate) fn upsert(
+    /// One of a host's write calls ([`Objects`]).
+    pub fn upsert(
         &self,
         store: &MemoryStore,
         facts: WorkerFacts,
@@ -87,12 +82,11 @@ impl<G: Generation> Objects<G> {
     }
 
     /// Write `patch` over the row `id` where its object was built at
-    /// `revision`: the write of [`WorkersStore::patch`], decided here. The
-    /// change it made, or `None` where the row moved or left, or the store
-    /// did not take the write.
+    /// `revision`. The change it made, or `None` where the row moved or
+    /// left, or `store` did not take the write.
     ///
-    /// [`WorkersStore::patch`]: crate::store::WorkersStore::patch
-    pub(crate) fn patch(
+    /// One of a host's write calls ([`Objects`]).
+    pub fn patch(
         &self,
         store: &MemoryStore,
         id: WorkerId,
@@ -108,13 +102,13 @@ impl<G: Generation> Objects<G> {
         self.lay_decided(store, &mut place, change, &row, Some(revision))
     }
 
-    /// Remove the row `id` where its object was built at `revision`: the
-    /// write of [`WorkersStore::remove`], decided here. The object leaves
-    /// the registry, then the store is told. The change it made, or `None`
-    /// where the row moved or left, or the store did not take the write.
+    /// Remove the row `id` where its object was built at `revision`. The
+    /// object leaves the registry, then `store` is told. The change it
+    /// made, or `None` where the row moved or left, or `store` did not take
+    /// the write.
     ///
-    /// [`WorkersStore::remove`]: crate::store::WorkersStore::remove
-    pub(crate) fn remove(
+    /// One of a host's write calls ([`Objects`]).
+    pub fn remove(
         &self,
         store: &MemoryStore,
         id: WorkerId,

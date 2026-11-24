@@ -1639,7 +1639,7 @@ pub(crate) mod tests {
                 lifecycle,
                 watch_workers::Feed,
                 wire::{self, Checked},
-                worker_objects::{ObjectsWake, WorkerObjects},
+                worker_objects::WorkerObjects,
             },
             elector::{Elector, TickOutcome, TERM_CEILING},
             proto::{self, busy::Reason, decide_answer::Answer, decision::Outcome},
@@ -1742,7 +1742,7 @@ pub(crate) mod tests {
     /// a decider lays the objects of the rows written since its last
     /// decision.
     pub(crate) fn holder(store: &Arc<MemoryStore>) -> Arc<Objects<Members>> {
-        WorkerObjects::new(Arc::clone(store), ObjectsWake::default()).holder()
+        WorkerObjects::new(Arc::clone(store)).holder()
     }
 
     /// A store and its feed with the holder of its worker objects and a
@@ -3185,25 +3185,19 @@ pub(crate) mod tests {
     /// worker's next report, and each lease states no size.
     #[tokio::test]
     async fn a_dispatched_request_that_stated_no_size_is_priced_until_its_workers_next_report() {
-        use crate::{
-            engine::view::LoadRow,
-            store::{LoadSink, LoadSource, PUBLISH_WINDOW},
-        };
         let mut bed = bed(Some(preset("least_load", 1)), true, (2, 8), []);
-        // Each member reports at the take, at one rate: the first holds no
-        // work and the other two a quarter of a mean prompt each. The
-        // window the first record opens ends, and one world shows the
-        // three.
-        let (sink, at): (&dyn LoadSink, _) = (bed.store.as_ref(), bed.script.taken);
-        for (turn, &id) in bed.workers.iter().enumerate() {
-            let row = LoadRow {
-                waiting_uncached_tokens: if turn == 0 { 0 } else { 256 },
-                live_rate: 1_000,
-                ..LoadRow::default()
-            };
-            sink.record(id, 0, row, at, LoadSource::Stream);
-        }
-        bed.store.publish(at + PUBLISH_WINDOW);
+        // Each member's report, sampled ahead of every send, at one rate:
+        // the first holds no work and the other two a quarter of a mean
+        // prompt each. The load monitor publishes the three.
+        let at = bed.script.taken;
+        let loads = ["w0", "w1", "w2"].iter().enumerate();
+        let loads = loads.map(|(turn, name)| {
+            let mut report = one_rank_load(if turn == 0 { 0 } else { 256 }, 0.1, 1_000.0);
+            report.sampled_at = Some(at - Duration::from_millis(1));
+            (format!("http://{name}:8000"), report)
+        });
+        bed.loads
+            .send_replace(LoadSnapshot::from_loads_for_test(loads.collect()));
         // Three requests that state no prompt size, each dispatched before
         // the next is decided. A dispatch is its worker's credit until that
         // worker's next report, and the load stage credits one of no stated

@@ -14,9 +14,10 @@ use std::{
 use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
 use smg_worker::{
-    identity::basic::Worker,
+    identity::{basic::Worker, builder::BasicWorkerBuilder},
+    model_card::ModelCard,
     registry::{event::WorkerEvent, Generation, WorkerId as ObjectId, WorkerRegistry},
-    test_support::ready_worker,
+    test_support::{no_health_check, ready_worker},
     worker::WorkerStatus,
 };
 use tokio::{
@@ -1000,6 +1001,67 @@ fn a_replacement_that_takes_a_model_forgets_the_workers_sent_prefixes() {
         drain(&engine, &mut follow);
         assert_eq!(places(300) == second, kept, "found serving {model}");
     }
+}
+
+/// A list keeps its record of sent prefixes under the model its first
+/// worker states. Where every worker is replaced under its id by one that
+/// states another model and still answers to the first by an alias, no
+/// list reads the first record again: it leaves at the task's sweep with
+/// its places. A record whose model a worker still states stays where its
+/// list is published again and no request follows.
+#[tokio::test(start_paused = true)]
+async fn a_record_leaves_once_no_worker_states_its_model() {
+    let mut document = PolicySpec::preset("cache_aware").expect("a built-in preset");
+    document.generation = 1;
+    let spec = AppliedSpec::validate(&document).expect("the document validates");
+    let engine = Arc::new(PolicyEngine::new(spec));
+    let registry = registry(2);
+    engine.set_registry(handed(&registry));
+    let task = running(&engine);
+    settle().await;
+    let sent = |list: &PublishedList| {
+        for prompt in 0..16u32 {
+            let tokens: Vec<u32> = (prompt * 100_000..prompt * 100_000 + 1_024).collect();
+            let hashes = engine.prompt_hashes(MODEL, Some(&tokens), None, HashSeeds::PLAIN);
+            let mut asked = request();
+            asked.facts.seed = u64::from(prompt);
+            hashes.write_to(&mut asked.facts);
+            let decided = decided(&engine, &Asks::of(asked, Some(list)));
+            assert!(decided.decision.pick().is_some());
+        }
+    };
+    let models = || {
+        let held = engine.affinity.held();
+        let mut models: Vec<Box<str>> = held.into_iter().map(|(model, _)| model).collect();
+        models.sort();
+        models
+    };
+    let list = PublishedList::new(pool(2));
+    sent(&list);
+    drop(list);
+    sleep(Duration::from_secs(1)).await;
+    assert_eq!(models(), [Box::from(MODEL)], "its workers state the model");
+
+    let renamed: Arc<[Arc<dyn Worker>]> = (0..2)
+        .map(|at| {
+            let card = ModelCard::new("model-b").with_alias(MODEL);
+            let built = <BasicWorkerBuilder>::new(url(at)).models(vec![card]);
+            Arc::new(built.health_config(no_health_check()).build()) as Arc<dyn Worker>
+        })
+        .collect();
+    assert!(registry.replace(&object(&registry, 0), Arc::clone(&renamed[0])));
+    sleep(Duration::from_secs(1)).await;
+    assert_eq!(models(), [Box::from(MODEL)], "one worker states it yet");
+    assert!(registry.replace(&object(&registry, 1), Arc::clone(&renamed[1])));
+    let list = PublishedList::new(Arc::clone(&renamed));
+    sent(&list);
+    sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        models(),
+        [Box::from("model-b")],
+        "no list reads the first record"
+    );
+    task.abort();
 }
 
 /// The engine's own task follows the registry its host handed: the workers

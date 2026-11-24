@@ -217,8 +217,8 @@ impl Follower {
                     self.objects.follow_at(&self.store, at, epoch, change, row);
                 }
                 // A leader of this build sends no load row: this one is an
-                // older leader's. The store keeps none of its leader's, so
-                // the place alone is journaled and the next event follows.
+                // older leader's. The store keeps no load row, so the place
+                // alone is journaled and the next event follows.
                 Some(Sent::Load(_)) => adopting.mark(),
                 Some(Sent::TermStart(_)) => self.store.follow_term(at),
                 // Through the replica's door, which journals the place: the
@@ -1014,20 +1014,20 @@ mod tests {
     use super::*;
     use crate::{
         document::spec::Pairing,
-        engine::view::{LoadRow, Role, WireModes, WorkerId},
+        engine::view::{Role, WireModes, WorkerId},
         service::{
             controller::{
                 decision_slots::tests::{followed, frame_for, holder, lent_pick, preset},
                 election::LeasePlace,
                 replication::{journaled, journaled_from, parts, Replication},
-                worker_objects::{ObjectsWake, WorkerObjects},
+                worker_objects::WorkerObjects,
             },
             elector::{ElectionSettings, Elector, TickOutcome},
             proto::policy_controller_server::{PolicyController, PolicyControllerServer},
             replication::{Entry, Event},
         },
         stages::registry,
-        store::{LoadSink, LoadSource, WorkerFacts, WorkerStatus, WorkersStore},
+        store::{WorkerFacts, WorkerStatus, WorkersStore},
     };
 
     type Replica = (Arc<MemoryStore>, Arc<Log>);
@@ -1048,7 +1048,7 @@ mod tests {
     /// A standby's applier over a replica's store and log, with the holder
     /// of its worker objects as a controller keeps one.
     fn applier((store, log): &Replica) -> Follower {
-        let objects = WorkerObjects::new(Arc::clone(store), ObjectsWake::default()).holder();
+        let objects = WorkerObjects::new(Arc::clone(store)).holder();
         Follower::new(Arc::clone(store), Arc::clone(log), objects)
     }
 
@@ -1079,13 +1079,6 @@ mod tests {
     fn a_page_and_one(leader: &MemoryStore) {
         for n in 0..129 {
             leader.upsert(facts(&format!("http://w{n:03}:8000"), 1));
-        }
-    }
-
-    fn running(count: u32) -> LoadRow {
-        LoadRow {
-            running: count,
-            ..LoadRow::default()
         }
     }
 
@@ -1160,15 +1153,13 @@ mod tests {
             .collect()
     }
 
-    /// Writes under the first term: registrations, a status change, a load
-    /// row of each source on the leader's own table, a relabel and a resize.
-    fn first(leader: &MemoryStore, at: Instant) {
+    /// Writes under the first term: registrations, a status change, a
+    /// relabel and a resize.
+    fn first(leader: &MemoryStore) {
         let revision = |id| WorkersStore::get(leader, id).expect("the row").revision;
         let a = leader.upsert(facts("http://a:8000", 1)).id();
-        let b = leader.upsert(facts("http://b:8000", 1)).id();
+        leader.upsert(facts("http://b:8000", 1));
         leader.set_status(a, WorkerStatus::Ready, revision(a));
-        leader.record(a, 0, running(3), at, LoadSource::Stream);
-        leader.report(&[(b, 0, Some(running(5)))], at, LoadSource::Poll);
         let mut labelled = facts("http://a:8000", 1);
         labelled.labels.insert("tier".to_owned(), "gold".to_owned());
         leader.upsert(labelled);
@@ -1181,9 +1172,8 @@ mod tests {
 
     /// What follows: a new life of a ready worker (its status comes over),
     /// a removal, the next term's start and a registration under it.
-    fn rest(leader: &MemoryStore, at: Instant) {
-        let again = leader.upsert(facts("http://a:8000", 2)).id();
-        leader.record(again, 0, running(7), at, LoadSource::Stream);
+    fn rest(leader: &MemoryStore) {
+        leader.upsert(facts("http://a:8000", 2));
         let b = leader.by_key("http://b:8000").expect("the row");
         leader.remove(b.id, b.revision);
         leader.set_term(2);
@@ -1198,7 +1188,7 @@ mod tests {
         assert_eq!(follower.place(), Position::default());
         assert_eq!(start(&followed), followed.head());
         let at = Instant::now();
-        first(&leader, at);
+        first(&leader);
         follow(&follower, &led, at);
         // The join told the store its leader's term: under the first term
         // the standby holds what its leader holds, the term with it.
@@ -1206,7 +1196,7 @@ mod tests {
             format!("{:?}", held(&standby)),
             format!("{:?}", held(&leader))
         );
-        rest(&leader, at);
+        rest(&leader);
         follow(&follower, &led, at);
         // Its log starts where its leader's does: it serves a standby that
         // applied nothing from there when it leads.
@@ -1240,10 +1230,10 @@ mod tests {
     fn a_standby_fed_the_leaders_log_holds_each_rows_object() {
         let ((leader, led), follower, (standby, _)) = pair();
         let at = Instant::now();
-        first(&leader, at);
+        first(&leader);
         follow(&follower, &led, at);
         each_row_has_its_object(&follower, &standby);
-        rest(&leader, at);
+        rest(&leader);
         follow(&follower, &led, at);
         each_row_has_its_object(&follower, &standby);
     }
@@ -1253,7 +1243,7 @@ mod tests {
     #[test]
     fn a_standby_restored_from_the_snapshot_holds_each_rows_object() {
         let ((leader, _), follower, (standby, _)) = pair();
-        first(&leader, Instant::now());
+        first(&leader);
         assert_eq!(follower.restore(leader.checkpoint(), None), Ok(true));
         each_row_has_its_object(&follower, &standby);
     }
@@ -1285,7 +1275,7 @@ mod tests {
         leader.upsert(side("http://pb:8000", Role::Prefill, "green"));
         leader.upsert(side("http://da:8000", Role::Decode, "green"));
         follow(&follower, &led, Instant::now());
-        let leading = WorkerObjects::new(Arc::clone(&leader), ObjectsWake::default()).holder();
+        let leading = WorkerObjects::new(Arc::clone(&leader)).holder();
         leading.follow(&*leader);
         for mode in [Pairing::Lenient, Pairing::Strict] {
             let behind = pair_classes(&follower.objects, mode);
@@ -1386,9 +1376,8 @@ mod tests {
         };
         assert_eq!(follower.apply(&older, at), Ok(()));
         // The standby went on with the next watched event: it holds both
-        // rows, and no load row of its leader's.
+        // rows.
         assert_eq!(standby.all_rows().1.len(), 2);
-        assert!(standby.load(a, 0).is_none(), "no load row is kept");
         // The load row's place is journaled alone, so the next event
         // followed it and the standby stands at the batch's last place.
         let last = Position {
@@ -1421,21 +1410,20 @@ mod tests {
         assert_eq!(cut.rows.len(), 1);
         assert!(standby.restore_from(cut));
         assert_eq!(standby.all_rows().1.len(), 1);
-        assert!(standby.load(a, 0).is_none(), "no load row is kept");
     }
 
     #[test]
     fn a_standby_restored_from_the_snapshot_continues_from_its_place() {
         let (leader, follower, (standby, _followed)) = pair();
         let at = Instant::now();
-        first(&leader.0, at);
+        first(&leader.0);
         // The standby held a row of its own, under no term.
         standby.upsert(facts("http://stale:8000", 1));
         let first = snapshot(&leader, at);
         assert_eq!(follower.restore(staged(&first, at), None), Ok(true));
         assert_eq!(follower.place(), leader.1.head());
         assert_eq!(held(&standby), held(&leader.0));
-        rest(&leader.0, at);
+        rest(&leader.0);
         follow(&follower, &leader.1, at);
         assert_eq!(held(&standby), held(&leader.0));
         // A snapshot of the term it followed before is a history it left:
@@ -1450,7 +1438,7 @@ mod tests {
     fn a_batch_that_is_not_its_snapshots_next_part_is_refused_by_its_path() {
         let (leader, ..) = pair();
         let at = Instant::now();
-        first(&leader.0, at);
+        first(&leader.0);
         a_page_and_one(&leader.0);
         let parts = snapshot(&leader, at);
         assert_eq!(parts.len(), 2, "two parts of rows");
@@ -1518,7 +1506,7 @@ mod tests {
     fn a_part_the_leader_did_not_announce_is_refused_by_its_path() {
         let (leader, follower, (standby, _followed)) = pair();
         let at = Instant::now();
-        first(&leader.0, at);
+        first(&leader.0);
         let parts = snapshot(&leader, at);
         let (place, before) = (follower.place(), held(&standby));
         let why = "a part of a snapshot the leader did not announce";
@@ -3166,7 +3154,7 @@ mod tests {
         let (leading, following) = (door(&leader), door(&standby));
         let follower = through(&standby, &following);
         let at = Instant::now();
-        first(&leader.0, at);
+        first(&leader.0);
         leading
             .apply(LEAST_LOAD.into(), Format::Yaml)
             .expect("a valid document");
