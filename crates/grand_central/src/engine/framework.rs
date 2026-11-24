@@ -3116,21 +3116,6 @@ fn shadow_index(binding: &Binding, phase: Phase) -> Option<u16> {
     }
 }
 
-/// The overload thresholds a binding hands the pools decided under it
-/// ([`Engine::pool_binding`]): the crate's two defaults where its block is
-/// switched on, resolved once by validation. A block names no number.
-/// The host judges an engine's load reports against them and latches the
-/// verdict on the engine's rows.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct OverloadThresholds {
-    /// Queued requests, summed over an engine's ranks, at or above which
-    /// the engine's rows are vetoed.
-    pub waiting_requests: u32,
-    /// KV usage in permille, the mean over an engine's ranks, at or above
-    /// which the engine's rows are vetoed.
-    pub kv_usage_permille: u16,
-}
-
 /// A binding: which profile (or plan of profiles) a request resolves to.
 #[derive(Clone, Debug)]
 pub struct Binding {
@@ -3151,10 +3136,6 @@ pub struct Binding {
     /// placed on (design 4.6), under the `single` plan and on each side of
     /// a pair, by the side's own session.
     pub sessions: Option<SessionRule>,
-    /// The overload thresholds of the pools decided under the binding
-    /// ([`Engine::pool_binding`]); `None` when its block is switched off,
-    /// and for a binding built by hand that names none.
-    pub overload: Option<OverloadThresholds>,
 }
 
 impl Binding {
@@ -5758,25 +5739,6 @@ impl Engine {
         self.entry(model, Phase::Prefill).and_then(paired)
     }
 
-    /// The binding a `phase` pool of `model` is decided under, whose
-    /// overload block judges the pool. Every decision resolves by its own
-    /// phase but a pair's decode side and an `epd` pair's encode side,
-    /// which run under the pair binding: a decode pool is that binding's
-    /// wherever the model has one, and an encode pool wherever the model
-    /// has one of the `epd` plan. A binding of the side's phase ahead of
-    /// it still decides a request of that phase asked alone, and its block
-    /// is not read for the pool.
-    pub fn pool_binding(&self, model: &str, phase: Phase) -> Option<&Binding> {
-        let pair = match phase {
-            Phase::Decode => self.pair_binding(model),
-            Phase::Encode => self
-                .pair_binding(model)
-                .filter(|pair| matches!(pair.plan, Plan::Epd { .. })),
-            Phase::Single | Phase::Prefill => None,
-        };
-        pair.or_else(|| self.binding(model, phase))
-    }
-
     /// What some decision of `phase` may read, over every binding that
     /// covers the phase: the host's answer to "does any regular placement
     /// read the request text" and its kin, read at apply. A single decision
@@ -6041,8 +6003,8 @@ impl Engine {
     /// shadow share a bound with no live reader's.
     ///
     /// A decode pool is read by its model's pair too: the pair's decode
-    /// side runs under the pair's binding, whatever binding a decode
-    /// request asked alone resolves to ([`Self::pool_binding`]). Where
+    /// side runs under the pair's binding ([`Self::pair_binding`]),
+    /// whatever binding a decode request asked alone resolves to. Where
     /// that request's profile reads no record, the pool keeps the one
     /// the pair's decode profile reads: that side is a live reader of
     /// the model's record. So a decode pool's word is, in this order,
@@ -9008,7 +8970,6 @@ mod tests {
                 shadow: None,
                 decode_shadow: None,
                 sessions: None,
-                overload: None,
             }],
             1,
             Needs::default(),
@@ -11099,7 +11060,6 @@ mod tests {
                 shadow: None,
                 decode_shadow: None,
                 sessions: None,
-                overload: None,
             }],
             1,
             Needs::default(),
@@ -11131,7 +11091,6 @@ mod tests {
             shadow: None,
             decode_shadow: None,
             sessions: None,
-            overload: None,
         }
     }
 
@@ -11195,87 +11154,6 @@ mod tests {
             decode_profile: None,
             ..pair_binding()
         }
-    }
-
-    /// A pair's decode side runs under the model's pair binding, so the
-    /// pool's lookup names that binding for a decode pool whatever covers
-    /// the decode phase first. An `epd` pair's encode side runs under it
-    /// too, so an encode pool is that binding's the same way. An encode
-    /// pool of a model whose pair is of the `pd-pair` plan is the encode
-    /// phase's own: that plan names no encode side. Every other pool is
-    /// its own phase's.
-    #[test]
-    fn a_decode_pool_is_decided_under_its_models_pair_binding() {
-        let phase_first = |phase: Phase| Binding {
-            phases: vec![phase],
-            ..single_binding()
-        };
-        let pair = |plan: Plan| Binding {
-            model: "m".into(),
-            plan,
-            ..pair_binding()
-        };
-        let engine = |bindings: Vec<Binding>| {
-            Engine::new(
-                vec![least_requests_profile()],
-                bindings,
-                1,
-                Needs::default(),
-            )
-        };
-        let plan_of = |engine: &Engine, model: &str, phase: Phase| {
-            engine.pool_binding(model, phase).map(|b| b.plan)
-        };
-
-        let pd = engine(vec![phase_first(Phase::Decode), pair(Plan::PdPair)]);
-        // A decode request asked alone still resolves to the phase's first
-        // binding. The pool follows the pair, which is what decides over it.
-        assert_eq!(
-            pd.binding("m", Phase::Decode).map(|b| b.plan),
-            Some(Plan::Single)
-        );
-        assert_eq!(plan_of(&pd, "m", Phase::Decode), Some(Plan::PdPair));
-        assert_eq!(plan_of(&pd, "m", Phase::Prefill), Some(Plan::PdPair));
-        // A model the pair binding does not match has the phase's own.
-        assert_eq!(plan_of(&pd, "n", Phase::Decode), Some(Plan::Single));
-        assert_eq!(plan_of(&pd, "n", Phase::Prefill), None);
-        // A binding of another plan that covers prefill ahead of the pair
-        // binding takes the model's prefill lookup: no pair decision runs
-        // for the model, and its decode pool is the decode phase's own.
-        let ahead = engine(vec![
-            phase_first(Phase::Prefill),
-            phase_first(Phase::Decode),
-            pair(Plan::PdPair),
-        ]);
-        let decode = ahead.pool_binding("m", Phase::Decode);
-        assert_eq!(
-            decode.map(|b| (b.plan, b.phases.clone())),
-            Some((Plan::Single, vec![Phase::Decode]))
-        );
-
-        let epd = Plan::Epd { encode: 0 };
-        let with_encoders = engine(vec![
-            phase_first(Phase::Decode),
-            phase_first(Phase::Encode),
-            pair(epd),
-        ]);
-        assert_eq!(plan_of(&with_encoders, "m", Phase::Decode), Some(epd));
-        // An encode item asked alone still resolves to the phase's first
-        // binding. The pool follows the pair, whose one call decides over
-        // it.
-        assert_eq!(
-            with_encoders.binding("m", Phase::Encode).map(|b| b.plan),
-            Some(Plan::Single)
-        );
-        assert_eq!(plan_of(&with_encoders, "m", Phase::Encode), Some(epd));
-        assert_eq!(
-            plan_of(&with_encoders, "n", Phase::Encode),
-            Some(Plan::Single)
-        );
-        // A pair of two sides names no encode side: its model's encode
-        // pool is the encode phase's own.
-        let two_sides = engine(vec![phase_first(Phase::Encode), pair(Plan::PdPair)]);
-        assert_eq!(plan_of(&two_sides, "m", Phase::Encode), Some(Plan::Single));
     }
 
     /// One profile that keeps the healthy rows and leads with the deepest
@@ -12477,7 +12355,6 @@ mod tests {
                     shadow: None,
                     decode_shadow: None,
                     sessions: None,
-                    overload: None,
                 },
                 pair_binding(),
             ],
@@ -12734,7 +12611,6 @@ mod tests {
                 shadow: None,
                 decode_shadow: None,
                 sessions: None,
-                overload: None,
             }],
             1,
             Needs::default(),
@@ -12807,7 +12683,6 @@ mod tests {
                 shadow: None,
                 decode_shadow: None,
                 sessions: None,
-                overload: None,
             }],
             1,
             Needs::default(),
@@ -12832,7 +12707,6 @@ mod tests {
                 shadow: None,
                 decode_shadow: None,
                 sessions: None,
-                overload: None,
             }],
             1,
             Needs::default(),
@@ -12858,7 +12732,6 @@ mod tests {
                 shadow: None,
                 decode_shadow: None,
                 sessions: None,
-                overload: None,
             }],
             1,
             Needs::default(),
@@ -12888,7 +12761,6 @@ mod tests {
                 shadow: None,
                 decode_shadow: None,
                 sessions: None,
-                overload: None,
             }],
             1,
             Needs::default(),
@@ -13013,7 +12885,6 @@ mod tests {
                 shadow: None,
                 decode_shadow: None,
                 sessions: None,
-                overload: None,
             }],
             1,
             Needs::default(),
@@ -13098,7 +12969,6 @@ mod tests {
                 shadow: None,
                 decode_shadow: None,
                 sessions,
-                overload: None,
             }],
             1,
             Needs::default(),
@@ -13404,7 +13274,6 @@ mod tests {
                     shadow: None,
                     decode_shadow: None,
                     sessions: None,
-                    overload: None,
                 }],
                 1,
                 Needs::default(),
@@ -13515,7 +13384,6 @@ mod tests {
                 shadow: None,
                 decode_shadow: None,
                 sessions: None,
-                overload: None,
             }],
             1,
             Needs::default(),
@@ -15286,7 +15154,6 @@ mod tests {
             shadow: None,
             decode_shadow: None,
             sessions: None,
-            overload: None,
         };
         assert!(b.matches("pd/a", Phase::Prefill));
         assert!(!b.matches("pd/a", Phase::Single));
@@ -15300,7 +15167,6 @@ mod tests {
             shadow: None,
             decode_shadow: None,
             sessions: None,
-            overload: None,
         };
         assert!(any.matches("anything", Phase::Decode));
         let suffix = Binding {
@@ -15457,7 +15323,6 @@ mod tests {
                 shadow: None,
                 decode_shadow: None,
                 sessions: Some(rule),
-                overload: None,
             }],
             1,
             Needs::default(),
@@ -16182,7 +16047,6 @@ mod tests {
             shadow: None,
             decode_shadow: None,
             sessions: Some(rule),
-            overload: None,
         };
         let engine = Engine::new(
             vec![least_requests_profile()],
@@ -16273,7 +16137,6 @@ mod tests {
                 shadow: None,
                 decode_shadow: None,
                 sessions: None,
-                overload: None,
             }],
             1,
             Needs::default(),
@@ -16394,7 +16257,6 @@ mod tests {
                 shadow: None,
                 decode_shadow: None,
                 sessions,
-                overload: None,
             }],
             1,
             Needs::default(),
@@ -17751,7 +17613,6 @@ mod tests {
                 shadow: None,
                 decode_shadow: None,
                 sessions: None,
-                overload: None,
             }],
             1,
             Needs::default(),
@@ -17794,7 +17655,6 @@ mod tests {
                 shadow: None,
                 decode_shadow: None,
                 sessions: None,
-                overload: None,
             }],
             1,
             Needs::default(),

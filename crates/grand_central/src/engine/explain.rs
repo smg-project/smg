@@ -284,7 +284,6 @@ mod tests {
             shadow: None,
             decode_shadow: None,
             sessions: None,
-            overload: None,
         });
         Engine::new(
             profiles.into(),
