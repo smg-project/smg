@@ -462,8 +462,8 @@ pub trait Generation: std::fmt::Debug + Send + Sync + 'static {
 ```
 
 `G` is the host's own type. Whenever a worker joins, leaves or is replaced, the registry builds a
-new list and a new `G` for each model the worker serves, and readers get the new value whole. A
-published list is never changed.
+new list and a new `G` for each model the worker serves, and for each model it leaves, and readers
+get the new value whole. A published list is never changed.
 
 The gateway's `G` holds the model's workers and its lists by role and protocol (prefill workers
 over gRPC, regular workers over HTTP, and so on). The controller's `G` holds its lists by role
@@ -1189,9 +1189,16 @@ What an event does:
 
 | Event | What the stages do with it |
 |---|---|
-| Dispatched | the session's pin follows the worker the request went to; every count of sends takes it: a count holds what was dispatched to each worker since the worker's last load report, whichever profile placed the request; scorers and pickers that asked hear it. A pick a sessions rule keeps from the profile moves the pin alone. A pin at its rule's cap moved already, where the request that met the cap was decided, to the worker it was placed on: the dispatch finds it there, or fronts the later target the request went to |
+| Dispatched | the session's pin follows the worker the request went to; every count of sends takes it, whichever profile placed the request; scorers and pickers that asked hear it. A pick a sessions rule keeps from the profile moves the pin alone. A pin at its rule's cap moved already, where the request that met the cap was decided, to the worker it was placed on: the dispatch finds it there, or fronts the later target the request went to |
 | Completed | scorers and pickers that asked hear the outcome (status, time to first token, tokens in and out, duration) |
 | Released | the same stages hear the reason |
+
+A count of sends holds a send until one of four ends: a load report of the worker sampled at or
+after the send (later by `sent_report_delay_ms`, where the profile sets it), the age `sent_ttl_ms`
+where the profile sets it, a newer send once the worker's rank holds 8,192, or a membership
+change the count is told. The changes that end a worker's sends are its removal, its replacement
+under another id and a change of its data-parallel width. A list of the ids that stand
+(section 8.1) ends the sends of each worker it leaves out.
 
 A sessions rule places some requests alone, behind the profile's filters and with no scorer or
 picker of the profile asked: it follows a pin of the request's key, or its own assignment places
@@ -1231,7 +1238,7 @@ the decode side adds `has-room`.
 | `random` | none | `random` | nothing: it draws from the decision's seed, and the one pick from the calling thread's own draw sequence |
 | `passthrough` | none | `passthrough` | nothing: the first survivor |
 | `round_robin` | none | `round-robin` | one counter for each worker list, which the one pick and a first attempt's whole decision both turn, at every list size; in a fixed table, one rotation for each set of surviving workers, which a refused turn, a retry and a request held to places turn, and one for each pool whose draw is handed no list counter |
-| `power_of_two` | `least-load` | `power-of-two` | what was dispatched to each worker since its last load report |
+| `power_of_two` | `least-load` | `power-of-two` | a count of sends (section 6) |
 | `least_load` | `least-load` | `best` | the same |
 | `consistent_hashing` | `consistent-hash` | `best` | nothing where the host lends its ring and states the request's place; else one hash ring, of the workers its decisions have read |
 | `prefix_hash` | `consistent-hash` by the routing key, else by the prompt's first 256 tokens, with a bounded-load rule; `least-requests` | `best` | the same ring |
@@ -1400,7 +1407,8 @@ id as a source, the value it hands is no head: it names the session alone, as cl
 header's key and never the id's. A
 ring whose lender places no head answers nothing: such a request is lent no ring, the lender is
 asked about no further head, and the stage's own ring places the request. A request that has no
-head states no place and is lent no ring either.
+head states no place and is lent no ring either. Neither is a pair whose two sides read the ring
+by two forms, or cut a prompt at two depths: each side's stage then places by its own ring.
 
 ### 8.2 The contract as designed **[partly]**
 
@@ -1684,7 +1692,7 @@ makes one itself.
    is that request's: the pair's two lists as they stand then, the request's size, its routing
    value and the workers it tried among them. The engine decides the decode on the records of
    that instant, behind the prefill that was sent. Of the prefills it writes that one's record
-   alone and reads no other prefill's worker. Where the list names no place of that prefill,
+   alone and reads no other prefill's state. Where the list names no place of that prefill,
    it writes every prefill's.
 4. The placement takes the first decode the engine names that can be sent to. Its routing key
    and its two profile labels stay as the first call wrote them.
@@ -1942,6 +1950,10 @@ By the contract the gateway decides such a request locally
 (`crates/policy_controller/contracts/policy_controller.proto`) **[planned]**: no gateway calls a
 controller yet.
 
+A frame states no source of a key. So a controller's prefix ring places by any session key, also
+one the request's own id handed, where a gateway's own process places that request by its prompt
+(section 8.1).
+
 ### 10.2 As designed **[partly]**
 
 Rule 2 and rule 3 apply to the controller as they do to the gateway: one set of worker data, in
@@ -2008,7 +2020,7 @@ tells the data once more:
 | the worker record | the store's table of records (`store/memory.rs`) | the load poller, and the follower of cache events for whether a worker's events are indexed, each until it reads the worker objects; a watcher's and a standby's first copy |
 | a copy of the record's facts | beside the worker objects (`worker_host/objects.rs`) | the code that keeps the objects, to tell a record that changed under its object |
 | the worker object | the worker-crate registry | the health checker, the follower of cache events and a decision |
-| the remainder: 17 of the 24 facts and one bit of an eighteenth, with the record's id and revision | beside each worker object (`worker_host/remainder.rs`) | a decision, for the record's id, whether the worker takes images, its wire modes and from where it is reached. A pair's classes read its engine kind and its pairing descriptor too. What the worker states for a request's hard demands is lent with the list, and no frame states a demand yet |
+| the remainder: 17 of the 24 facts and one bit of an eighteenth, with the record's id and revision | beside each worker object (`worker_host/remainder.rs`) | a decision, for the record's id, whether the worker takes images, its wire modes and from where it is reached. A pair's classes read the worker's engine kind and its pairing descriptor too. What the worker states for a request's hard demands is lent with the list, and no frame states a demand yet |
 | the published copy of the records | the store | a pick's booking and a gateway's vetoes, among others; no request is decided over it |
 | the membership log's event | `service/replication/log.rs` | a watcher behind its first copy; a standby |
 
@@ -2025,9 +2037,9 @@ what a registration stated and the worker object does not hold as stated. The co
 the objects writes one with every object it builds. `Objects::row_of` gives a worker's
 whole record back from the object and its remainder, with no read of the store's table.
 A decision reads the remainder's facts, among them the record's id, whether the worker takes
-images, its wire modes and from where it is reached. A pair's classes read its engine kind and its
-pairing descriptor too. The controller's registration calls decide a write over a whole record
-read back (step 1 below). Of the 24 facts a registration states:
+images, its wire modes and from where it is reached. A pair's classes read the worker's engine
+kind and its pairing descriptor too. The controller's registration calls decide a write over a
+whole record read back (step 1 below). Of the 24 facts a registration states:
 
 - Six stand on the object whole, and the remainder holds none of them: the address, the role,
   the models, the labels, the cache block size and the bootstrap port. So does the status.
@@ -2308,10 +2320,13 @@ Five things follow, and they are the first work of section 16.
    With a lent ring a request's place is the host's to state, so these 16 test the host's
    recipe. In the crate they stay on the crate's own ring with its own hashes, which a caller
    that lends no ring still runs: 15 hold classic's shares, as on main, and one is held apart.
-   A gateway never runs that ring. Classic's key recipe is inside its policy's own selection
-   today, and its ring lookup takes a key and not a position. So at stage 3 the gateway's
-   change cuts both into functions that classic and the lender call, and a gateway test puts
-   all 47 lines through them, classic's ring and the engine, count for count.
+   A gateway runs that ring for some requests, among them a pair whose two sides read the ring
+   by two forms, or cut a prompt at two depths: such a pair is lent no ring (section 8.1).
+   Classic's key recipe and its ring lookup are functions that classic and the lender both call
+   (`PrefixHashPolicy::ring_key` and `HashRing::walk_from` in `model_gateway/src/policies/`), and
+   gateway tests place the policy's own requests through classic and through the engine, worker
+   for worker (`model_gateway/src/routers/common/placement.rs`) **[built]**. A gateway test that
+   puts all 47 lines through both is not written **[planned]**.
 
 Hosted CI's first test line of the crate enables the feature `client`. It takes `controller`,
 which takes the feature the kept engine is behind, so that line runs that engine's own tests.
@@ -2492,12 +2507,13 @@ different modes would disagree.
 
 | Option | Cost |
 |---|---|
-| (a) The host lends the ring it keeps; the engine asks it which workers a routing key reaches. | Crate only: one deletion and four changes. The crate's ring beside a worker list is deleted (1,728 lines removed, 230 added, 17 files). The four changes are about 580, 270, 450 and 550 changed lines, about 370 of them product code and 1,050 proof. The host lends its ring through one trait (`LentRing`) and states where a request stands on it. The crate then writes no hash and no ring for such a host, so a request is placed on classic's own ring. The price in proof: 16 of the 47 recorded `prefix_hash` lines test which tokens are in a key. In the crate they keep replaying on the crate's own ring, share for share as on main. A gateway then never runs that ring, so for a gateway they are proven at stage 3 (section 13.1), where the change also cuts classic's key recipe and classic's ring lookup into functions that classic and the lender both call. A controller has no classic ring to be lent: until (b) it keeps its own ring and places a routing key on another worker than a gateway would. |
+| (a) The host lends the ring it keeps; the engine asks it which workers a routing key reaches. | Crate only: one deletion and four changes. The crate's ring beside a worker list is deleted (1,728 lines removed, 230 added, 17 files). The four changes are about 580, 270, 450 and 550 changed lines, about 370 of them product code and 1,050 proof. The host lends its ring through one trait (`LentRing`) and states where a request stands on it. For such a request the crate then reads no ring of its own, so the request is placed on classic's own ring. The price in proof: 16 of the 47 recorded `prefix_hash` lines measure which tokens are in a key (15 lines) or how prompts spread over workers (1 line). In the crate they keep replaying on the crate's own ring, share for share as on main. For a gateway they are proven at stage 3 (section 13.1). On main classic's key recipe and its ring lookup are functions that classic and the lender both call. A controller has no classic ring to be lent: until (b) it keeps its own ring and places a routing key on another worker than a gateway would. |
 | (b) Classic's ring (one file, 508 lines) moves to a crate both sides use. | A pure move, about 15 lines changed beside it. The gateway, the engine and the controller then build one ring type. |
 | (c) The crate's ring is changed to classic's hashes. | About 125 lines. Classic's recipe written twice; a gateway would keep two rings for a model. |
 
-**Recommendation: (a) now, (b) with the controller's switch.** Not (c). Work on (a) has started,
-inside the crate only.
+**Recommendation: (a) now, (b) with the controller's switch.** Not (c). Work on (a) is on main in
+the crate and in the gateway: the gateway lends the ring it keeps, for a key's own text and for a
+request's heads.
 
 ### Decision 4: where a placement stays during a request
 
