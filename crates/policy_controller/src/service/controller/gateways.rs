@@ -2,7 +2,7 @@
 //! its `Welcome` until its grace period ends with no new `Hello`, one
 //! period more at most while a session a newer one replaced still runs,
 //! and what the store holds under its key lives exactly that long: its
-//! lease records, its vetoes and its completions.
+//! lease records and its vetoes.
 //!
 //! Presence is read from the clock at the instant of the question, as the
 //! fence is: a gateway is present while a session of it stands and for the
@@ -856,10 +856,9 @@ impl Gateways {
     }
 
     /// The end of presences, under the table's lock: what the store holds
-    /// for each gateway (its lease records, its vetoes and its completions)
-    /// is let go through the store's one door for a gone gateway, in one
-    /// write for them all, then the rows go and their decide streams are
-    /// told.
+    /// for each gateway (its lease records and its vetoes) is let go
+    /// through the store's one door for a gone gateway, in one write for
+    /// them all, then the rows go and their decide streams are told.
     fn end(&self, gone: Vec<(GatewayId, Row)>) {
         let gateways: Vec<GatewayId> = gone.iter().map(|(gateway, _)| *gateway).collect();
         let leases = self.store.drop_gateways(&gateways);

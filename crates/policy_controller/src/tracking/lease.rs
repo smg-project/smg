@@ -182,8 +182,9 @@ impl Outcome {
     /// leaves both as made here. A guard's caller states both
     /// ([`Outcome::with_served`]).
     ///
-    /// The class has no default: it feeds a worker's health, and an end
-    /// whose caller forgot it must not read as [`TransportClass::Ok`].
+    /// The class has no default: a plugin is shown it and a session's
+    /// frame carries it, and an end whose caller forgot it must not read
+    /// as [`TransportClass::Ok`].
     #[must_use]
     pub const fn reported(status: u16, class: TransportClass) -> Self {
         Self {
