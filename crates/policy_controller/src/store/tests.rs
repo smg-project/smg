@@ -2484,6 +2484,96 @@ fn a_watch_snapshot_publishes_the_cut_at_once_and_tells_the_members_once() {
     );
 }
 
+/// A stage that panics at a store's word of membership is held and counted
+/// by the engine that decides under the standing document, as at a
+/// gateway's word: the store's write goes on with what it still owes. An
+/// apply stands and tells the journal its generation, a registration leaves
+/// its row on file and a removal takes it off. The stage behind the one
+/// that panicked hears none of the words. Before, the panic unwound out of
+/// the write: an apply left with its world shown and its journal untold.
+#[cfg(feature = "in-process")]
+#[test]
+fn a_stage_that_panics_at_the_stores_word_of_membership_is_held_and_counted() {
+    use crate::{
+        document::{AppliedSpec, PolicySpec},
+        engine::{
+            view::{Candidate, RequestFacts},
+            Scorer, TieBand,
+        },
+        stages::{Lifecycle, StageRegistry},
+    };
+
+    /// A scorer that scores every row alike. `Some` counts the words of
+    /// membership it hears; `None` panics at each.
+    #[derive(Debug)]
+    struct Hears(&'static str, Option<Arc<AtomicU32>>);
+
+    impl Lifecycle for Hears {
+        fn on_membership(&self, _: &Membership<'_>) {
+            let Some(heard) = &self.1 else {
+                panic!("the case's own panic, at a word of membership");
+            };
+            heard.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    impl Scorer for Hears {
+        fn name(&self) -> &'static str {
+            self.0
+        }
+
+        fn score(
+            &self,
+            _: &RequestFacts<'_>,
+            _: &[Candidate],
+            _: &[u32],
+            out: &mut [f32],
+        ) -> TieBand {
+            out.fill(0.0);
+            TieBand::NORMALIZED
+        }
+    }
+
+    let log = Arc::new(Log::new(8));
+    let journal: Arc<Log> = Arc::clone(&log);
+    let store = MemoryStore::journaled(journal);
+    store.set_term(1);
+    let behind = Arc::new(AtomicU32::new(0));
+    let heard = Arc::clone(&behind);
+    let mut catalog = StageRegistry::builtin();
+    catalog
+        .scorer("deaf", || Box::new(Hears("deaf", None)))
+        .expect("a free name");
+    catalog
+        .scorer("behind", move || {
+            Box::new(Hears("behind", Some(Arc::clone(&heard))))
+        })
+        .expect("a free name");
+    let document: PolicySpec = serde_json::from_str(
+        r#"{"apiVersion":"smg.policy/v1","generation":1,"profiles":{"p":{"score":["deaf","behind"],"pick":"best"}}}"#,
+    )
+    .expect("a policy document");
+    let digest = document.digest().expect("the digest");
+    let spec =
+        AppliedSpec::validate_digested(&document, digest, &catalog, &[]).expect("a generation");
+    let unheard = || store.deciding(|world| world.front().unheard());
+
+    // An apply tells its engine the members that stand.
+    let told = log.head().seq;
+    store.apply(spec).expect("the generation is applied");
+    assert_eq!(unheard(), 1);
+    assert!(log.head().seq > told, "the journal is told the generation");
+
+    // A registration and a removal each tell their word.
+    let id = store.upsert(facts("http://a:1", 1)).id();
+    assert_eq!(unheard(), 2);
+    let row = WorkersStore::get(&store, id).expect("the row is on file");
+    assert!(store.remove(id, row.revision).is_some());
+    assert_eq!(unheard(), 3);
+    assert!(WorkersStore::get(&store, id).is_none());
+    assert_eq!(behind.load(Ordering::Relaxed), 0);
+}
+
 #[test]
 fn a_watch_snapshot_the_journal_refuses_changes_nothing() {
     let store = MemoryStore::journaled(Arc::new(Log::new(8)));
