@@ -198,13 +198,17 @@ pub(crate) fn ranges(facts: &proto::RequestFacts) -> Result<(Phase, HashKind, u6
 }
 
 /// The range of the items a frame states (`DecideRequest.encode`). `phase`
-/// is the phase the frame's facts state ([`ranges`]) and `decode_of` the
-/// lease whose decode side it asks ([`asked_decode`]). Items are read on a
-/// frame of the encode phase, [`MAX_ITEMS`] keys at most. A frame of
-/// another phase that states them is out of range, and one that asks a
-/// lease's decode side is such a frame, whatever its facts say. The check
-/// of a frame received reads the field here ([`Checked::new`]), and so
-/// does a sender whose callers share one stream, as both read [`ranges`].
+/// is the phase the frame is read at ahead of its items and `decode_of`
+/// the lease whose decode side it asks ([`asked_decode`]). A sender hands
+/// the phase its facts state ([`ranges`]). The check of a frame received
+/// hands that phase too, or the decode phase where the frame asks a
+/// lease's decode side ([`Checked::new`]): the answer is the same, since
+/// such a frame is refused here by its lease. Items are read on a frame
+/// of the encode phase, [`MAX_ITEMS`] keys at most. A frame of another
+/// phase that states them is out of range, and one that asks a lease's
+/// decode side is such a frame, whatever its facts say. The check of a
+/// frame received reads the field here, and so does a sender whose
+/// callers share one stream, as both read [`ranges`].
 #[inline(always)]
 pub(crate) fn stated_items(
     encode: Option<&proto::EncodeItems>,
@@ -409,17 +413,19 @@ impl Checked {
     /// `keys` ([`Self::item_keys`]). A request with no key is one all the
     /// same: it still says what it asks of its pair's decode. A frame that
     /// is no encode request ([`Self::carries_items`]) states no item and
-    /// asks nothing. The items are lent no ring, as no frame carries one:
-    /// the encode stage's own ring places them.
+    /// asks nothing. The items' one key is the frame's where it states one
+    /// (`EncodeItems.one`), with a form or with none: one with no form
+    /// still says that the items are taken as one. The items are lent no
+    /// ring, as no frame carries one: the encode stage's own ring places
+    /// them.
     pub(crate) fn items<'a>(&'a self, keys: &'a [Identity<'a>]) -> EncodeItems<'a> {
         let Some(items) = self.items.as_deref() else {
             return EncodeItems::default();
         };
         let stated = &items.stated;
-        let one = identity(stated.one.as_ref());
         EncodeItems {
             keys,
-            one: (!one.is_none()).then_some(one),
+            one: stated.one.as_ref().map(|one| identity(Some(one))),
             references: stated.references,
             decode_images: stated.decode_images,
             ring: None,
@@ -1628,7 +1634,8 @@ pub(crate) mod tests {
     /// items. It is read at the prefill phase, as its pair's one request,
     /// and says so in the byte of the words few frames say. Its items read
     /// as the engine takes them: each key in the frame's order, the one key
-    /// where the frame states one, and what the request asks of its decode.
+    /// where the frame states one, with a form or with none, and what the
+    /// request asks of its decode.
     /// The field's presence marks the request, with a key or with none. A
     /// frame of the encode phase that does not state the field is read at
     /// its own phase and is no encode request.
@@ -1661,6 +1668,19 @@ pub(crate) mod tests {
         assert_eq!(items.keys, [Identity::hashed(1), Identity::hashed(2)]);
         assert_eq!(items.one, Some(Identity::plain("digest")));
         assert!(items.references && items.decode_images);
+
+        // A one key stated with no form is stated all the same: the items
+        // are taken as one. A frame that states none has none.
+        let mut formless = with_items(proto::Phase::Encode, 2);
+        let stated = formless.encode.as_mut().expect("the case's items");
+        stated.one = Some(proto::Identity { form: None });
+        let formless = Checked::new(formless).expect("a key with no form is in range");
+        let keys = formless.item_keys(Vec::new());
+        assert_eq!(formless.items(&keys).one, Some(Identity::NONE));
+        let each = with_items(proto::Phase::Encode, 2);
+        let each = Checked::new(each).expect("items are no field out of its range");
+        let keys = each.item_keys(Vec::new());
+        assert!(each.items(&keys).one.is_none());
 
         let keyless = with_items(proto::Phase::Encode, 0);
         let keyless = Checked::new(keyless).expect("no key is in the field's range");

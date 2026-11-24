@@ -2232,7 +2232,9 @@ The crate's own client states the items. A handle asked over a link takes an enc
 prefill phase, as the engine's entry takes it in process, with its items
 (`DecisionGuard::asked_encode`), and its frame states the encode phase. A session key in its hash
 form crosses as the session's value under the encode phase. The controller reads the key back under
-that phase, so the pair's session is the one the request has in process. The handle is a pair's,
+that phase, so the pair's session is the one the request has in process. The items' one key
+crosses where the host states one, with a form or with none: one with no form still places the
+items as one, with no affinity, as in process. The handle is a pair's,
 and it reads each item's encoder from the answer, in the keys' order. The link refuses a frame whose
 items are out of range by the controller's own check and sends nothing, so no such frame ends its
 stream.

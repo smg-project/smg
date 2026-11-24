@@ -144,6 +144,83 @@ fn an_encode_request_is_decided_for_its_pair_and_for_each_items_encoder() {
     assert_eq!((encoders_of(Some(&placed)), placed.one), (vec![e], true));
 }
 
+/// A request's items are taken as one where it states their one key, with
+/// a form or with none: the form is only what that one placement is placed
+/// by. So a one key that is stated with no form crosses a link as it is.
+/// The crate's own client makes the frame. A class that pushes places the
+/// key in the items' stead, with no affinity, as the engine's pass does in
+/// process ([`Engine::decide_encode_pair`](crate::engine::Engine::decide_encode_pair)).
+/// The client reads one encoder for the items, and that they were placed as
+/// one. A host that states no one key is answered an encoder an item.
+///
+/// The classic router takes one encoder a prompt under a push handoff with
+/// no image to fan out on, whatever the keys say. Its selection hands one
+/// hash for all the items
+/// (`model_gateway/src/routers/grpc/common/stages/worker_selection.rs:2680-2693`
+/// on main cb9aca544), and its push plan refuses a second encoder
+/// (`model_gateway/src/routers/grpc/common/stages/encode.rs:328-333`).
+#[cfg(feature = "client")]
+#[test]
+fn a_one_key_with_no_form_crosses_a_link_as_one_placement() {
+    use crate::{
+        engine::{
+            decision_engine::Request,
+            framework::{EncodeItems, EncodePlaced},
+            view::{Constraints, Identity, Phase},
+        },
+        service::client::wire::{encode_request, placed},
+    };
+    let store = encode_store();
+    let p = member(&store, "p0", Role::Prefill, PUSHING);
+    let d = member(&store, "d0", Role::Decode, PUSHING);
+    let e0 = member(&store, "e0", Role::Encode, PUSHING);
+    let e1 = member(&store, "e1", Role::Encode, PUSHING);
+    let objects = holder(&store);
+    let now = Instant::now();
+    let keys = [11, 12, 13].map(Identity::hashed);
+    let each = EncodeItems {
+        keys: &keys,
+        ..EncodeItems::default()
+    };
+    let formless = EncodeItems {
+        one: Some(Identity::NONE),
+        ..each
+    };
+    let hashed = EncodeItems {
+        one: Some(Identity::hashed(99)),
+        ..each
+    };
+    let mut room = EncodePlaced::new();
+    // One request over the link: the frame the client makes of it, the
+    // controller's decision, and the answer as the client reads it.
+    let mut linked = |n: u8, items: EncodeItems<'_>| {
+        let id = [n];
+        let asked = Request {
+            id: &id,
+            facts: RequestFacts {
+                model: ENCODED,
+                seed: u64::from(n),
+                phase: Phase::Prefill,
+                budget_micros: 200_000,
+                ..RequestFacts::default()
+            },
+            constraints: Constraints::default(),
+        };
+        let (frame, _) = encode_request(&asked, items);
+        let (answer, told) = served_encode(&store, &objects, frame, GATEWAY, now);
+        assert_eq!(pairs_of(&answer), [(p, d)], "frame {n}: {answer:?}");
+        placed(told.as_ref(), &answer, &items, &mut room).expect("an answer the client reads");
+        let encoders: Vec<_> = room.encoders().iter().map(|encoder| encoder.id).collect();
+        assert!(encoders.iter().all(|id| [e0, e1].contains(id)), "frame {n}");
+        (encoders.len(), room.one())
+    };
+    for n in 1..=16 {
+        assert_eq!(linked(n, formless), (1, true), "frame {n}: no form");
+        assert_eq!(linked(n, hashed), (1, true), "frame {n}: a hash");
+        assert_eq!(linked(n, each), (3, false), "frame {n}: no one key");
+    }
+}
+
 /// The field's presence marks an encode request, with a key or with none.
 /// One with no key is decided as its pair and takes no encoder: its answer
 /// carries the field with no encoder in it. Nothing is read of the
