@@ -3622,7 +3622,7 @@ pub struct Engine {
     /// ([`Lifecycle::keeps_loads`]), each by its place: listed once at the
     /// build, so a publication asks no stage whether it keeps them.
     keepers: Vec<Keeper>,
-    /// One tally for each two send settings a profile's stages read
+    /// One tally for each set of send settings a profile's stages read
     /// under, in the order of the names of the profiles that made them:
     /// a later engine finds one by its settings, then by that name, then
     /// takes one that is left
@@ -5173,7 +5173,7 @@ impl Engine {
 
     /// Takes over what the standing engine's counts of sends hold: each
     /// count takes the rows' entries of the standing count under the same
-    /// two settings, whichever profile made that one. Where no standing
+    /// settings, whichever profile made that one. Where no standing
     /// count has its settings, it takes the count that a profile of its
     /// maker's name made, unless another count of this engine took that
     /// one: two counts on one standing count would hold every send twice.

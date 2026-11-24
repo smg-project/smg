@@ -26,6 +26,7 @@ pub(crate) fn profile() -> ProfileSpec {
         pick: "random".into(),
         sent_ttl_ms: None,
         sent_report_delay_ms: None,
+        sent_until_report_changes: false,
     }
 }
 

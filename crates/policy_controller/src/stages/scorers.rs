@@ -10,7 +10,7 @@ use std::{
     collections::VecDeque,
     sync::{
         atomic::{AtomicU16, AtomicU64, AtomicUsize, Ordering},
-        Arc,
+        Arc, OnceLock,
     },
 };
 
@@ -32,7 +32,7 @@ use crate::{
         lifecycle::Lifecycle,
     },
     tracking::{
-        dispatch_credit::{DispatchCounts, DispatchCredit},
+        dispatch_credit::{ComparedReports, DispatchCounts, DispatchCredit},
         in_flight::{with_counts, Pieces, PoolInFlightCounts, WorkerSlot},
         lease::{EventKind, EventSet, Lease, Membership, Outcome, ReleaseReason, Side, Signal},
     },
@@ -404,7 +404,7 @@ pub(crate) struct RankCredit {
     unsized_held: AtomicU16,
     /// The estimates of the held dispatches that stated no size, summed:
     /// what a reader that prices such a send by its text adds to the
-    /// stated token-work ([`Self::counts_through`]). A word of its own,
+    /// stated token-work ([`Self::counts_released`]). A word of its own,
     /// kept as the count beside it is: raised behind the held word at a
     /// record, and lowered ahead of it at a release and at a retirement,
     /// whose subtraction from the held word is a `Release`. A read loads
@@ -433,6 +433,11 @@ pub(crate) struct RankCredit {
     /// with no lock: under a later sample its release may take dispatches
     /// that number counts ([`ResidentWork::settle`]).
     kept_of: AtomicU64,
+    /// What a count that ends a send only at a changed report keeps of
+    /// the row's reports, made at such a count's first compare. No other
+    /// count reads or writes it: under one, the entry holds the empty
+    /// cell alone.
+    pub(crate) reports: OnceLock<Box<ComparedReports>>,
 }
 
 /// The last report a stage was told of one rank row, with the row's slot:
@@ -700,6 +705,7 @@ impl Default for RankCredit {
             lanes: Default::default(),
             told: Mutex::new(Told::default()),
             kept_of: AtomicU64::new(u64::MAX),
+            reports: OnceLock::new(),
         }
     }
 }
@@ -854,10 +860,19 @@ impl RankCredit {
     /// a retirement's subtraction: the estimates are read as they stood at
     /// that write or later, so no read adds the estimate of a dispatch
     /// the held word has let go, on any target.
+    ///
+    /// `release` is the release of the count that reads: it runs where
+    /// the row holds a dispatch made at or before `through_micros`. A
+    /// count that ends a send only at a changed report compares the row's
+    /// report there.
     #[inline(always)]
-    pub(crate) fn counts_through(&self, through_micros: u64) -> DispatchCounts {
+    pub(crate) fn counts_released(
+        &self,
+        through_micros: u64,
+        release: impl FnOnce(&Self),
+    ) -> DispatchCounts {
         if self.reaches(through_micros) {
-            self.release_through(through_micros);
+            release(self);
         }
         let held = self.held.load(Ordering::Acquire);
         DispatchCounts {
@@ -867,7 +882,16 @@ impl RankCredit {
         }
     }
 
-    /// The held requests and stated token-work of [`Self::counts_through`]
+    /// [`Self::counts_released`] under the release of a count that sets no
+    /// rule on a changed report: a test's read of a row.
+    #[cfg(test)]
+    pub(crate) fn counts_through(&self, through_micros: u64) -> DispatchCounts {
+        self.counts_released(through_micros, |since| {
+            since.release_through(through_micros);
+        })
+    }
+
+    /// The held requests and stated token-work of [`Self::counts_released`]
     /// with the count of the held dispatches of no tokens in the
     /// estimates' place: three loads too. The held word is loaded with
     /// `Acquire`, against the `Release` of a release's and a retirement's
@@ -876,8 +900,21 @@ impl RankCredit {
     /// across a release, on any target.
     #[inline(always)]
     pub(crate) fn sent_through(&self, through_micros: u64) -> SentCredit {
+        self.sent_released(through_micros, |since| {
+            since.release_through(through_micros);
+        })
+    }
+
+    /// [`Self::sent_through`] with the release of the count that reads
+    /// ([`Self::counts_released`]).
+    #[inline(always)]
+    pub(crate) fn sent_released(
+        &self,
+        through_micros: u64,
+        release: impl FnOnce(&Self),
+    ) -> SentCredit {
         if self.reaches(through_micros) {
-            self.release_through(through_micros);
+            release(self);
         }
         let held = self.held.load(Ordering::Acquire);
         SentCredit {
@@ -897,7 +934,7 @@ impl RankCredit {
     /// Calls `each` with the instant and the stated tokens of every
     /// dispatch the row holds once those made at or before
     /// `through_micros` are released: the dispatches
-    /// [`Self::counts_through`] counts. Lane by
+    /// [`Self::counts_released`] counts. Lane by
     /// lane, oldest first within a lane. The release and the calls run
     /// under one hold of every lane's lock, so the row stands still from
     /// the release on: no dispatch made at or before the instant lands
@@ -910,10 +947,24 @@ impl RankCredit {
     /// lane's and a retirement leaves it. So past `through_micros` it says
     /// that no lane holds a dispatch the release would take, and such a
     /// read stores nothing on the line every decision loads for the row.
-    pub(crate) fn each_through(&self, through_micros: u64, mut each: impl FnMut(u64, u32)) {
+    ///
+    /// `ends` is asked there, under the hold, for the instant the count
+    /// that reads ends the row's dispatches through: `through_micros`
+    /// itself, or the one a count that ends a send only at a changed
+    /// report makes of the row's reports, and `None` where it ends none.
+    pub(crate) fn each_released(
+        &self,
+        through_micros: u64,
+        ends: impl FnOnce(&Self) -> Option<u64>,
+        mut each: impl FnMut(u64, u32),
+    ) {
         let mut held_lanes = self.lock_lanes();
         if self.reaches(through_micros) {
-            self.release_held(&mut held_lanes, through_micros);
+            // An instant before the row's oldest dispatch takes none, and
+            // such a read stores nothing on the row's line either.
+            if let Some(ends) = ends(self).filter(|&ends| self.reaches(ends)) {
+                self.release_held(&mut held_lanes, ends);
+            }
         }
         for &(at_micros, size) in held_lanes.iter().flat_map(|dispatches| &dispatches.0) {
             each(at_micros, size.tokens());
@@ -923,8 +974,26 @@ impl RankCredit {
     /// Whether the row holds a dispatch made at or before the sample: one
     /// a report sampled then reflects, which its release takes.
     #[inline(always)]
-    fn reaches(&self, sampled_at_micros: u64) -> bool {
+    pub(crate) fn reaches(&self, sampled_at_micros: u64) -> bool {
         self.oldest_micros.load(Ordering::Acquire) <= sampled_at_micros
+    }
+
+    /// [`Self::each_released`] under a count that sets no rule on a
+    /// changed report: a test's list of a row.
+    #[cfg(test)]
+    pub(crate) fn each_through(&self, through_micros: u64, each: impl FnMut(u64, u32)) {
+        self.each_released(through_micros, |_| Some(through_micros), each);
+    }
+
+    /// Whether a lane's front is a dispatch made at or before the
+    /// instant, by the fronts the lanes publish, read with no lock. The
+    /// row's oldest instant ([`Self::reaches`]) can stand below every
+    /// dispatch the row holds, behind a retirement: a count that keeps
+    /// what a read shows it asks here first.
+    pub(crate) fn holds_through(&self, through_micros: u64) -> bool {
+        self.lanes
+            .iter()
+            .any(|lane| lane.oldest_micros.load(Ordering::Acquire) <= through_micros)
     }
 
     /// The held token-work and requests, as the word stands.
@@ -952,7 +1021,7 @@ impl RankCredit {
     /// too large to stay in a second scorer's row loop.
     #[cold]
     #[inline(never)]
-    fn release_through(&self, sampled_at_micros: u64) -> u64 {
+    pub(crate) fn release_through(&self, sampled_at_micros: u64) -> u64 {
         let mut held_lanes = self.lock_lanes();
         self.release_held(&mut held_lanes, sampled_at_micros);
         // Loaded behind the locks, as a reader's own load is: under them

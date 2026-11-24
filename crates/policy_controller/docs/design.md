@@ -176,6 +176,7 @@ pub struct ProfileSpec {
     pub pick: PickSpec,           // exactly one picker
     pub sent_ttl_ms: Option<u32>, // how long a send stays in the count of sends the profile reads
     pub sent_report_delay_ms: Option<u32>, // how long behind a dispatch a load report ends its count
+    pub sent_until_report_changes: bool, // a load report ends a count only where it differs from the one before
 }
 
 pub struct BindingSpec {

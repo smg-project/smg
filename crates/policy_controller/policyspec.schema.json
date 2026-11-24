@@ -281,13 +281,17 @@
           "minimum": 1
         },
         "sent_report_delay_ms": {
-          "description": "The least number of milliseconds between a send and the sample of a\nload report that ends it: a report sampled less than that long after\na send leaves the send counted. Unset, a report sampled at or after\na send ends it. A written zero is refused, as a zero limit is. A\nprofile whose stages do not read its count of sends is refused if it\nsets a delay. The limit ends a send whatever the delay. The\nprofiles of a document that set the same limit and the same delay\nread one count, under the name of the first of them that reads it,\nin the order of their names. A new document's count takes over the\nsends of the standing count under the same limit and delay,\nwhichever profiles read that one. Where none stands under them, it\ntakes over those of the standing count under the same name, unless\na count of the new document took that one by its settings, or else\nof a standing count that no count of the new document took. The\ntwo counts share the sends: a read under the shorter of two delays\nends such a send for both. A count that finds none starts empty.",
+          "description": "The least number of milliseconds between a send and the sample of a\nload report that ends it: a report sampled less than that long after\na send leaves the send counted. Unset, a report sampled at or after\na send ends it. A written zero is refused, as a zero limit is. A\nprofile whose stages do not read its count of sends is refused if it\nsets a delay. The limit ends a send whatever the delay. The\nprofiles of a document that set the same limit, the same delay and\nthe same `sent_until_report_changes`\nread one count, under the name of the first of them that reads it,\nin the order of their names. A new document's count takes over the\nsends of the standing count under the same three settings,\nwhichever profiles read that one. Where none stands under them, it\ntakes over those of the standing count under the same name, unless\na count of the new document took that one by its settings, or else\nof a standing count that no count of the new document took. The\ntwo counts share the sends: a read under the shorter of two delays\nends such a send for both. A count that finds none starts empty.",
           "type": [
             "integer",
             "null"
           ],
           "format": "uint32",
           "minimum": 1
+        },
+        "sent_until_report_changes": {
+          "description": "Whether a load report ends a send only where it differs from the\nreport the count read of the worker before it, by anything but its\nage. Set, a report that repeats the one before it ends no send,\nand neither does the first report the count reads of a worker: for\nan engine that shows a new request in its reports late and repeats\nits last report meanwhile. The delay applies as it does unset: the\nreport that ends a send differs from the one before it and is\nsampled the delay behind the send, or longer. The limit ends a\nsend whatever its worker's reports say, so a profile sets one\nbeside this where a worker's reports can stand still for good.\nThe count compares the reports its decisions read, at each\ndecision that reads the sends of a worker that holds one: a report\nthat no decision of the profile read is not compared, and the next\none is compared with the last that was. A profile whose stages do\nnot read its count of sends is refused if it sets this.",
+          "type": "boolean"
         }
       },
       "additionalProperties": false,

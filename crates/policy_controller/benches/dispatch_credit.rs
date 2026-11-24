@@ -19,8 +19,8 @@ use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criteri
 use smg_policy_controller::{
     document::{PolicySpec, API_VERSION},
     engine::{
-        Candidate, Constraints, Engine, PoolFacts, RequestFacts, Scorer, Scratch, Target, TieBand,
-        WorkerId,
+        Candidate, Constraints, Engine, LoadRow, PoolFacts, RequestFacts, Scorer, Scratch, Target,
+        TieBand, WorkerId,
     },
     stages::{Lifecycle, StageRegistry},
     tracking::{DispatchCredit, Lease, Side},
@@ -115,11 +115,21 @@ fn whole() -> Engine {
 }
 
 fn least_cost() -> Engine {
+    least_cost_ending(false)
+}
+
+/// [`least_cost`] whose count ends a send only at a changed report.
+fn least_cost_changed() -> Engine {
+    least_cost_ending(true)
+}
+
+fn least_cost_ending(until_report_changes: bool) -> Engine {
     let document: PolicySpec = serde_json::from_value(serde_json::json!({
         "apiVersion": API_VERSION,
         "profiles": {
             "work": {
                 "sent_ttl_ms": TTL_MS,
+                "sent_until_report_changes": until_report_changes,
                 "score": [{ "least-cost": { "terms": {
                     "candidate.in_flight": 177, "sent.requests": 1000, "sent.tokens": 1
                 } } }],
@@ -148,8 +158,15 @@ fn fill(engine: &Engine, rows: &[Candidate]) {
 }
 
 /// The three cells of one group. The rows' counts in flight repeat every
-/// `in_flight_cycle` rows: a cycle of one leaves every row at zero.
-fn cells(c: &mut Criterion, group: &str, engine: fn() -> Engine, in_flight_cycle: u32) {
+/// `in_flight_cycle` rows: a cycle of one leaves every row at zero. Each
+/// row holds `report`, sampled a microsecond ahead of the sends.
+fn cells(
+    c: &mut Criterion,
+    group: &str,
+    engine: fn() -> Engine,
+    in_flight_cycle: u32,
+    report: Option<LoadRow>,
+) {
     let mut group = c.benchmark_group(group);
     for n in [8, 64, 512] {
         let rows: Vec<_> = (0..n)
@@ -157,6 +174,8 @@ fn cells(c: &mut Criterion, group: &str, engine: fn() -> Engine, in_flight_cycle
                 position,
                 id: WorkerId(1003 + u64::from(position)),
                 in_flight: position % in_flight_cycle,
+                load: report,
+                load_sampled_at_micros: report.map_or(0, |_| SENT_AT - 1),
                 ..Candidate::default()
             })
             .collect();
@@ -263,9 +282,16 @@ fn dispatch(c: &mut Criterion) {
 }
 
 fn sent(c: &mut Criterion) {
-    cells(c, "policy_sent", engine, 1);
-    cells(c, "policy_sent_whole", whole, 1);
-    cells(c, "policy_engine/least_cost_sent", least_cost, 17);
+    cells(c, "policy_sent", engine, 1, None);
+    cells(c, "policy_sent_whole", whole, 1, None);
+    cells(c, "policy_engine/least_cost_sent", least_cost, 17, None);
+    // One document with and without `sent_until_report_changes`, over
+    // rows that hold a report.
+    let report = Some(LoadRow::default());
+    let group = "policy_engine/least_cost_sent_reported";
+    cells(c, group, least_cost, 17, report);
+    let group = "policy_engine/least_cost_sent_changed";
+    cells(c, group, least_cost_changed, 17, report);
     dispatch(c);
 }
 

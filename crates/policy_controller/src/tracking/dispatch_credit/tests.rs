@@ -15,7 +15,11 @@ use crate::{
         decision, decision_engine::DecisionEngine, framework, Candidate, Constraints, Engine,
         Filter, LoadRow, Pair, PoolFacts, RequestFacts, Scorer, Scratch, Target, TieBand, WorkerId,
     },
-    stages::{pickers, scorers::take_lane, Lifecycle, StageRegistry},
+    stages::{
+        pickers,
+        scorers::{take_lane, RANK_CREDIT_KEPT},
+        Lifecycle, StageRegistry,
+    },
     tracking::{
         decision_guard::DecisionGuard, CreditedDispatches, DispatchCounts, DispatchCredit, Lease,
         Membership, Side,
@@ -466,6 +470,162 @@ fn a_delay_longer_than_a_u32_of_microseconds_holds_to_its_end() {
     assert_eq!(sent.read(&clock(0), &a), one(TOKENS));
     a.load_sampled_at_micros += 1;
     assert_eq!(sent.read(&clock(0), &a), CreditedDispatches::default());
+}
+
+#[test]
+fn a_report_that_repeats_the_one_before_it_ends_no_send_where_the_profile_says_so() {
+    let keyed = |mut document: PolicySpec| {
+        let profile = document.profiles.get_mut(POOL).expect("the profile");
+        profile.sent_report_delay_ms = Some(REPORT_DELAY_MS);
+        profile.sent_until_report_changes = true;
+        document
+    };
+    // One count for each of the three reads: a read that compares and
+    // releases would hide what the next read of the same count misses.
+    let [(by_read, read), (by_counts, counts), (by_sends, listed)] =
+        [(); 3].map(|()| counting(keyed(document(None))));
+    let (plain, unset) = counting(delayed(None, REPORT_DELAY_MS));
+    let mut a = row(251, 3);
+    let sent_at = START + u64::from(DELAY);
+    // Each report: the milliseconds its sample is behind the first send,
+    // the requests it says run, then the sends that count under it with
+    // the key and without. A second send lands 21 ms behind the first.
+    for (behind_ms, running, with_key, without) in [
+        // The report the send was decided under: the count has read none
+        // before it.
+        (0, 2, 1, 1),
+        // One that repeats it, the delay behind the send: it ends the
+        // send where the key is unset.
+        (REPORT_DELAY_MS, 2, 1, 0),
+        // One that differs ends the first send. It is sampled 2 ms behind
+        // the second, sooner than the delay.
+        (23, 3, 1, 1),
+        // A repeat 19 ms behind the second send ends it without the key.
+        (40, 3, 1, 0),
+        (41, 4, 0, 0),
+    ] {
+        for engine in [&by_read, &by_counts, &by_sends, &plain] {
+            if behind_ms == 0 {
+                send(engine, &a, START, TOKENS);
+            } else if behind_ms == 23 {
+                send(engine, &a, START + 21_000, TOKENS);
+            }
+        }
+        // The age differs at every report: it is no part of the compare.
+        a.load = Some(LoadRow {
+            running,
+            report_age_ms: behind_ms,
+            ..LoadRow::default()
+        });
+        a.load_sampled_at_micros = sent_at + u64::from(behind_ms) * 1000;
+        let facts = clock(a.load_sampled_at_micros + 500);
+        assert_eq!(read.read(&facts, &a).requests, with_key, "{behind_ms}");
+        let numbers = counts.pass(&facts).counts(&a);
+        assert_eq!(numbers.requests, with_key, "{behind_ms}");
+        let handed = instants(&listed, &facts, &a).len();
+        assert_eq!(u32::try_from(handed), Ok(with_key), "{behind_ms}");
+        assert_eq!(unset.read(&facts, &a).requests, without, "{behind_ms}");
+    }
+
+    // A decision that holds an earlier snapshot reads its report late. A
+    // report sampled 10 ms behind a send is kept and its repeat of 30 ms
+    // ends nothing; the late report of 6 ms differs from it, so the kept
+    // one differed from a report before it at its first sample, not at
+    // its repeat. The late read ends the send its own sample reaches, the
+    // next read the one made 3 ms behind the first, and the send of 18 ms
+    // stays: no report has differed behind it.
+    let (late, held) = counting(keyed(document(None)));
+    for behind in [0, 3_000, 18_000] {
+        send(&late, &a, START + behind, TOKENS);
+    }
+    for (behind_ms, running, counted) in [(10, 0, 3), (30, 0, 3), (6, 1, 2), (40, 0, 1)] {
+        a.load = Some(LoadRow {
+            running,
+            ..LoadRow::default()
+        });
+        a.load_sampled_at_micros = sent_at + behind_ms * 1000;
+        let facts = clock(sent_at + 41_000);
+        assert_eq!(held.read(&facts, &a).requests, counted, "{behind_ms}");
+    }
+
+    // The time limit ends a send whose row's reports repeat for good. It
+    // runs by the request's clock alone: under a clock of zero a first
+    // report sampled past the limit ends nothing.
+    let (limited, timed) = counting(keyed(document(Some(60))));
+    send(&limited, &a, START, TOKENS);
+    a.load_sampled_at_micros = sent_at + 70_000;
+    assert_eq!(timed.read(&clock(0), &a), one(TOKENS));
+    assert_eq!(timed.read(&clock(sent_at + 59_999), &a), one(TOKENS));
+    let ended = timed.read(&clock(sent_at + 60_000), &a);
+    assert_eq!(ended, CreditedDispatches::default());
+
+    // A read whose clock no send of the row has reached keeps no report,
+    // though the row's oldest instant stands below them all behind a
+    // retirement at the bound: the next report is the first compared.
+    let (full, kept) = counting(keyed(document(None)));
+    send(&full, &a, START, TOKENS);
+    for nth in 0..RANK_CREDIT_KEPT {
+        send(&full, &a, START + 20_000 + nth, TOKENS);
+    }
+    for (behind, running) in [(6_000, 0), (9_000_000, 1)] {
+        a.load = Some(LoadRow {
+            running,
+            ..LoadRow::default()
+        });
+        a.load_sampled_at_micros = sent_at + behind;
+        let counted = kept.read(&clock(sent_at + behind + 2_000), &a);
+        assert_eq!(u64::from(counted.requests), RANK_CREDIT_KEPT, "{behind}");
+    }
+
+    // A send made at instant zero: the first report, sampled at zero too,
+    // is kept and ends nothing, and one that differs, sampled the delay
+    // behind it, ends the send.
+    let (origin, first) = counting(keyed(document(None)));
+    let lease = Lease {
+        tokens: TOKENS,
+        ..Lease::default()
+    };
+    origin.on_dispatched(&lease, &target(&a), Side::Single, 0);
+    for (sample, running, handed) in [(0, 0, 1), (REPORT_DELAY, 1, 0)] {
+        a.load = Some(LoadRow {
+            running,
+            ..LoadRow::default()
+        });
+        a.load_sampled_at_micros = sample;
+        let sends = instants(&first, &clock(sample + 1), &a);
+        assert_eq!(sends.len(), handed, "{sample}");
+    }
+
+    // `least-load` reads its credit under the same rule: two reports that
+    // repeat keep it, and one that differs ends it.
+    let engine = keyed(load_document(POOL, None, false))
+        .validate()
+        .expect("the profile validates");
+    send(&engine, &reporting()[0], START, TOKENS);
+    for (behind, running, credited) in [(0, 0, true), (REPORT_DELAY, 0, true), (9_000, 1, false)] {
+        let rows = sampled(behind).map(|row| Candidate {
+            load: Some(LoadRow {
+                running,
+                ..LoadRow::default()
+            }),
+            ..row
+        });
+        let [sent_to, other] = scores(&engine, &rows, sent_at + behind + 500);
+        assert_eq!(sent_to < other, credited, "{behind}: {sent_to}, {other}");
+    }
+
+    // A profile none of whose stages reads its count is refused the key.
+    let mut unread = PolicySpec::preset("random").expect("a preset");
+    let profile = unread.profiles.get_mut("random").expect("the profile");
+    profile.sent_until_report_changes = true;
+    assert_eq!(
+        unread.validate().err(),
+        Some(SpecError::BadField {
+            path: "profiles.random.sent_until_report_changes".into(),
+            value: "true".into(),
+            reason: "a setting any stage of this profile reads",
+        })
+    );
 }
 
 /// What [`DispatchCreditPass::sends`](super::DispatchCreditPass::sends)

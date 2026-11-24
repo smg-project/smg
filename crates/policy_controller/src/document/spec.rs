@@ -2074,10 +2074,11 @@ pub struct ProfileSpec {
     /// a send ends it. A written zero is refused, as a zero limit is. A
     /// profile whose stages do not read its count of sends is refused if it
     /// sets a delay. The limit ends a send whatever the delay. The
-    /// profiles of a document that set the same limit and the same delay
+    /// profiles of a document that set the same limit, the same delay and
+    /// the same `sent_until_report_changes`
     /// read one count, under the name of the first of them that reads it,
     /// in the order of their names. A new document's count takes over the
-    /// sends of the standing count under the same limit and delay,
+    /// sends of the standing count under the same three settings,
     /// whichever profiles read that one. Where none stands under them, it
     /// takes over those of the standing count under the same name, unless
     /// a count of the new document took that one by its settings, or else
@@ -2087,6 +2088,23 @@ pub struct ProfileSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1))]
     pub sent_report_delay_ms: Option<u32>,
+    /// Whether a load report ends a send only where it differs from the
+    /// report the count read of the worker before it, by anything but its
+    /// age. Set, a report that repeats the one before it ends no send,
+    /// and neither does the first report the count reads of a worker: for
+    /// an engine that shows a new request in its reports late and repeats
+    /// its last report meanwhile. The delay applies as it does unset: the
+    /// report that ends a send differs from the one before it and is
+    /// sampled the delay behind the send, or longer. The limit ends a
+    /// send whatever its worker's reports say, so a profile sets one
+    /// beside this where a worker's reports can stand still for good.
+    /// The count compares the reports its decisions read, at each
+    /// decision that reads the sends of a worker that holds one: a report
+    /// that no decision of the profile read is not compared, and the next
+    /// one is compared with the last that was. A profile whose stages do
+    /// not read its count of sends is refused if it sets this.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sent_until_report_changes: bool,
 }
 
 /// A closed range with one or both bounds.
@@ -4202,10 +4220,11 @@ fn check_profile(
     let settings = SentSettings {
         ttl_ms: p.sent_ttl_ms,
         report_delay_ms: p.sent_report_delay_ms,
+        until_report_changes: p.sent_until_report_changes,
     };
     // The profile's count of sends, made where a stage's factory first
     // asks for it: a filter's may, ahead of any scorer's. An earlier
-    // profile's count under the same two settings is the one handed.
+    // profile's count under the same settings is the one handed.
     let mut sent = SentSlot {
         asked: None,
         shared: sent_credits
@@ -4277,6 +4296,13 @@ fn check_profile(
             "sent_report_delay_ms",
             ms,
             "a delay any stage of this profile reads",
+        ));
+    }
+    if p.sent_until_report_changes && sent.asked.is_none() {
+        return Err(at.bad(
+            "sent_until_report_changes",
+            true,
+            "a setting any stage of this profile reads",
         ));
     }
     // The scores combine by each weight's share of the weights' sum: a sum
@@ -7972,7 +7998,7 @@ mod tests {
     }
 
     /// A later document's count takes over the standing count under its
-    /// two settings, whichever profile made that one. Where none stands
+    /// settings, whichever profile made that one. Where none stands
     /// under them it takes the count its maker's name made, unless a
     /// count of the later document took that one, and then the first
     /// standing count that none took.
