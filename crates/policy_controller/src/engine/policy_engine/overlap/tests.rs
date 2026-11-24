@@ -1603,6 +1603,32 @@ fn a_profile_named_no_row_is_handed_the_column() {
     assert_eq!(seen, [(0, 0), (0, 0), (4, 0), (0, 0)]);
 }
 
+/// A profile that is named no row and reads sent prefixes is handed what
+/// its own picks sent: a request's pick writes its prefix for its worker,
+/// and the column of the repeat holds it.
+#[test]
+fn a_profile_named_no_row_is_handed_the_prefix_its_pick_sent() {
+    let asked = prompt(1_000, 4);
+    let bed = Bed::new(hosted(false).0, handed_whole(), 4);
+    assert!(bed.decide(&request(&asked, 7, NOW), Some(1)).is_none());
+    let mut seen = None;
+    decide(
+        &bed.affinity,
+        &bed.pool,
+        &bed.spec,
+        &bed.workers,
+        &bed.ids,
+        &mut request(&asked, 7, NOW),
+        |_| None,
+        |_| true,
+        |facts| {
+            seen = Some(held(facts.affinity));
+            shed()
+        },
+    );
+    assert_eq!(seen.expect("a decision"), [(0, 0), (0, 4), (0, 0), (0, 0)]);
+}
+
 /// A pick states what its first target holds of the request, read from the
 /// rows the engine named for its decision. A worker the index speaks for is
 /// stated by the blocks the index holds for it, of the request's blocks. A

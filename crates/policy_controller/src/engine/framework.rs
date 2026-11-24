@@ -968,10 +968,11 @@ impl Profile {
             Some(tests) => Held::Folded(tests),
             None => Held::Called,
         };
+        let needs = self.needs();
         NamedBy {
             cap,
             rule,
-            sent: cap > 0 && self.needs().sent_prefixes,
+            sent: needs.affinity && needs.sent_prefixes,
             sent_alone: self.reads_sent_alone(),
             held,
         }
@@ -3177,8 +3178,9 @@ enum Pattern<'a> {
 /// affinity column's place: the cap of each list
 /// ([`Engine::affinity_rows_cap`]), the one ruling of the warming rows
 /// ([`Engine::warm_up_rule_for`]), and the record of sent prefixes, whether
-/// its holders are named ([`Engine::reads_sent_for`]) and whether ahead
-/// of the index's ([`Engine::reads_sent_alone_for`]). A naming that
+/// the profile's pool keeps it ([`Engine::reads_sent_for`]) and whether
+/// its holders are named ahead of the index's
+/// ([`Engine::reads_sent_alone_for`]). A naming that
 /// fills its cap is held to a test of the profile's own too
 /// ([`Engine::keeps_for`]). Every input of a naming that is a profile's
 /// own stands here: two profiles are named the same rows where
@@ -3190,8 +3192,9 @@ pub(crate) struct NamedBy {
     /// The one ruling its warm-up stages rule by: `None` where it holds
     /// no such stage, and where two of them rule by different numbers.
     rule: Option<WarmUpRule>,
-    /// Whether the record of sent prefixes names holders for it: a stage
-    /// of it reads them, and it is named rows.
+    /// Whether its pool keeps the record of sent prefixes for it: a stage
+    /// of it reads them, in the rows it is named or in the column it is
+    /// handed whole.
     sent: bool,
     /// Whether it reads a request's holders from the record of sent
     /// prefixes alone: a scorer of it reads the record and none reads the
@@ -3309,6 +3312,9 @@ impl ShadowRows {
         };
         let column = needs.get(shadow).is_some_and(|needs| needs.affinity);
         match (live.cap, by.cap) {
+            // A shadow that reads the record in the column it is handed
+            // whole: the pool of a live profile that reads none keeps none.
+            (0, 0) if by.sent && !live.sent => Self::Apart,
             // Neither is named a row: both read the view as it is handed.
             (0, 0) => Self::Same,
             // The live profile alone is named rows. A shadow that reads
@@ -3321,7 +3327,7 @@ impl ShadowRows {
             // The shadow profile is named rows of its own. The pool's
             // warming rows are of one ruling and its record of one
             // profile: the live one's. A live profile that is named no
-            // row reads no record, so the record is left to the shadow
+            // row and reads no record leaves the record to the shadow
             // there, and the ruling too where that profile rules by
             // none. The record is the model's, though, under one bound:
             // entries kept for a shadow never stand under the bound a
@@ -3330,7 +3336,7 @@ impl ShadowRows {
             (live_cap, _) => {
                 let left = live_cap == 0;
                 let ruled = live.rule == by.rule || (left && live.rule.is_none());
-                let recorded = if left {
+                let recorded = if left && !live.sent {
                     !(by.sent && beside())
                 } else {
                     (live.sent, live.sent_alone) == (by.sent, by.sent_alone)
@@ -5582,9 +5588,9 @@ impl Engine {
     }
 
     /// Whether the profile a decision resolves to reads sent prefixes: a
-    /// stage of it reads them, and its decisions are named rows
-    /// ([`Self::affinity_rows_cap`]). A profile that is named no row reads no
-    /// holder, so its pool keeps no record. The answer is of what the
+    /// stage of it reads them, in the rows its decisions are named
+    /// ([`Self::affinity_rows_cap`]) or, where it is named no row, in the
+    /// column it is handed whole. The answer is of what the
     /// build kept: a membership write asks it of every pool, and no stage
     /// is asked again.
     pub(crate) fn reads_sent_for(&self, model: &str, phase: Phase) -> bool {
@@ -5614,8 +5620,8 @@ impl Engine {
     /// is the live profile's word ([`Self::reads_sent_for`],
     /// [`Self::reads_sent_alone_for`]) and, where that profile is named
     /// no row and its binding's shadow is named rows of its own, the
-    /// shadow profile's. A live profile that is named no row reads no
-    /// holder, so the record its pool keeps moves nothing it is handed.
+    /// shadow profile's. A live profile that is named no row and reads
+    /// no sent prefix reads nothing of the record its pool keeps there.
     /// A document that names no such shadow keeps none there. A shadow
     /// is named no such rows where a live profile reads the record of
     /// the same model ([`live_reader_beside`]): the entries kept for a
@@ -9686,7 +9692,9 @@ mod tests {
     /// shadow keeps none there.
     #[test]
     fn a_pool_keeps_the_record_for_its_shadow_where_the_live_profile_is_named_no_row() {
-        use crate::document::spec::{AffinitySource, PrefixAffinityParams, ScoreStage, ShadowSpec};
+        use crate::document::spec::{
+            AffinitySource, PrefixAffinityParams, ScoreStage, ShadowSpec, WarmupSliceParams,
+        };
         let aware = PolicySpec::preset("cache_aware").expect("a preset");
         let second = aware.profiles.values().next();
         let second = second.expect("the preset's profile").clone();
@@ -9716,6 +9724,37 @@ mod tests {
         document.profiles.insert("second".into(), by_record);
         let engine = document.validate().expect("a binding with a shadow");
         assert_eq!(engine.pool_record_for("m", Phase::Single), Some(true));
+
+        // A live profile that is named no row and reads the record keeps
+        // it by its own word: here two warm-up stages of different
+        // windows leave it the column whole. A shadow that reads the
+        // record another way is not named rows of its own beside it.
+        let aware = PolicySpec::preset("cache_aware").expect("a preset");
+        let live = aware.profiles.into_values().next();
+        let mut live = live.expect("the preset's profile");
+        let slice = WarmupSliceParams {
+            weight: 1.0,
+            secs: Some(7),
+            ..WarmupSliceParams::default()
+        };
+        live.score.push(ScoreStage::WarmupSlice(slice).into());
+        document.profiles.insert("live".into(), live.clone());
+        let unread = document.bindings[0].profile.replace("live".into());
+        let engine = document.validate().expect("a live profile named no row");
+        assert_eq!(engine.affinity_rows_cap("m", Phase::Single), 0);
+        assert_eq!(engine.pool_record_for("m", Phase::Single), Some(false));
+        let rows = engine.shadow_for("m", Phase::Single);
+        assert_eq!(rows.map(|(_, rows)| rows), Some(ShadowRows::Apart));
+
+        // That profile as the shadow of one that reads no record: its
+        // pool keeps none, so the shadow is not asked over a column that
+        // lacks the record it would read live.
+        document.profiles.insert("second".into(), live);
+        document.bindings[0].profile = unread;
+        let engine = document.validate().expect("a shadow named no row");
+        assert_eq!(engine.pool_record_for("m", Phase::Single), None);
+        let rows = engine.shadow_for("m", Phase::Single);
+        assert_eq!(rows.map(|(_, rows)| rows), Some(ShadowRows::Apart));
     }
 
     /// A model keeps one record of sent prefixes under one bound. A
