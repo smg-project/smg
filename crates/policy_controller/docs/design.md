@@ -638,7 +638,8 @@ request goes to.
 - **[built]** A prefill-decode pair decided over worker lists reads the hash table and the
   host's index of cache events for each side, by the side's own list, and writes each side's
   pick into the hash table, where the index does not speak for the picked worker. An encode
-  request's first decision does the same for its pair. Classic keeps
+  request's first decision does the same for its pair. It writes neither side where its caller
+  cannot send to an encoder the decision placed (`RequestMaker::sends_to_encoder`). Classic keeps
   trees for each side. **[planned]** The engine reads the host's trees for each side.
 
 A decision of the engine publishes no insert to other gateways.
@@ -1305,6 +1306,7 @@ pub trait RequestMaker {
     fn loads(&self) -> Option<&Arc<LoadSnapshot>>;    // a request's snapshot of the host's own; without one the engine reads its own
     fn token_key(&self, page: usize) -> Option<TokenKey<'_>>; // the prompt's entry in the host's token tree, where the host lends one
     fn sends_to(&self, target: &Target) -> bool;      // whether its caller sends to this target of a pick: the prompt is stored for the first such
+    fn sends_to_encoder(&self, position: u32) -> bool; // whether its caller sends to this encoder of an encode request's pick: the prompt is stored for no target behind one it does not
 }
 
 pub enum WorkerLists<'a> {

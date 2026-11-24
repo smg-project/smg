@@ -21,7 +21,7 @@
 //! [`PolicyEngine::decide_encode_at`]: the three lists' decision, with the
 //! pair's lease a pick is issued. No lease is issued for an encoder.
 
-use std::{sync::Arc, time::Instant};
+use std::{cell::OnceCell, sync::Arc, time::Instant};
 
 use smg_worker::load::state::LoadSnapshot;
 
@@ -197,6 +197,7 @@ impl EncodeLists<'_> {
             items,
             placed,
             |_| true,
+            |_| true,
         )
     }
 
@@ -217,7 +218,10 @@ impl EncodeLists<'_> {
     /// cell it does not read. `sends_to` says whether the request's caller
     /// sends it to a target of the pick: each side's record of sent
     /// prefixes is written for the first target it takes, as a pair's is
-    /// ([`record_sides`]).
+    /// ([`record_sides`]). `sends_to_encoder` says the same of an encoder
+    /// the decision placed, by its place in the encoders' list: the record
+    /// is written for no target where the caller sends to one of them no
+    /// more, since it then sends the request to no target of the pick.
     #[expect(
         clippy::too_many_arguments,
         reason = "a pair's inputs and the encode side's"
@@ -233,6 +237,7 @@ impl EncodeLists<'_> {
         items: EncodeItems<'_>,
         placed: &mut EncodePlaced,
         sends_to: impl Fn(&Target) -> bool,
+        sends_to_encoder: impl Fn(u32) -> bool,
     ) -> Decision {
         let (spec, clock) = (&engine.document.spec, &engine.clock);
         let pair = &self.pair;
@@ -337,8 +342,22 @@ impl EncodeLists<'_> {
                 placed,
             );
             // Behind the pick, each side's record keeps where the prompt
-            // went, as behind a pair's.
-            record_sides(&decision, facts, (prefill, decode), read, &sends_to);
+            // went, as behind a pair's: nowhere, where the request's caller
+            // cannot send to an encoder the decision placed. The encoders
+            // are asked ahead of the first target, each place once.
+            let every_encoder = OnceCell::new();
+            let sends = |target: &Target| {
+                let asked = || {
+                    let encoders = placed.encoders();
+                    encoders.iter().enumerate().all(|(at, encoder)| {
+                        let place = encoder.position;
+                        let repeats = encoders.iter().take(at).any(|one| one.position == place);
+                        repeats || sends_to_encoder(place)
+                    })
+                };
+                *every_encoder.get_or_init(asked) && sends_to(target)
+            };
+            record_sides(&decision, facts, (prefill, decode), read, sends);
             decision
         };
         let decision = BUFFERS.with(|buffers| match buffers.try_borrow_mut() {
@@ -428,7 +447,10 @@ impl PolicyEngine {
         let own = self.loaded();
         own.over_three(maker, placed, |lists, request, loads, placed| {
             let sends_to = |target: &_| maker.sends_to(target);
-            decide(own, lists, request, items, loads, placed, now, sends_to)
+            let encoder = |place| maker.sends_to_encoder(place);
+            decide(
+                own, lists, request, items, loads, placed, now, sends_to, encoder,
+            )
         })
     }
 }
@@ -447,6 +469,7 @@ impl Loaded<'_, '_> {
         self.over_three(maker, placed, |lists, request, loads, placed| {
             let later = request.constraints.decode_later;
             let sends_to = |target: &_| maker.sends_to(target);
+            let encoder = |place| maker.sends_to_encoder(place);
             let decided = decided(
                 self,
                 lists,
@@ -456,6 +479,7 @@ impl Loaded<'_, '_> {
                 placed,
                 clock(),
                 sends_to,
+                encoder,
             );
             (decided, later)
         })
@@ -527,6 +551,9 @@ impl Loaded<'_, '_> {
 /// `sends_to` says whether the request's caller sends it to a target of
 /// the pick ([`RequestMaker::sends_to`]): each side's record of sent
 /// prefixes is written for the first target it takes, as a pair's is.
+/// `sends_to_encoder` says whether it sends to an encoder the decision
+/// placed ([`RequestMaker::sends_to_encoder`]): the record is written for
+/// no target where it does not.
 #[inline]
 #[expect(
     clippy::too_many_arguments,
@@ -541,6 +568,7 @@ pub(super) fn decide(
     placed: &mut EncodePlaced,
     now: Instant,
     sends_to: impl Fn(&Target) -> bool,
+    sends_to_encoder: impl Fn(u32) -> bool,
 ) -> Decision {
     // The engine's own value of each of the pair's lists, asked of the
     // list's cell once. The encoders' is asked where it is read: here
@@ -575,7 +603,16 @@ pub(super) fn decide(
         return single::declined(own, request, DECODE_LATER);
     }
     lists.decide_over(
-        own, sides, encoders, loads, now, request, items, placed, sends_to,
+        own,
+        sides,
+        encoders,
+        loads,
+        now,
+        request,
+        items,
+        placed,
+        sends_to,
+        sends_to_encoder,
     )
 }
 
@@ -584,7 +621,8 @@ pub(super) fn decide(
 /// decision ([`decide`]) with the lease a pick issued. A pick issues its
 /// pair's two sides as a pair's first decision does ([`issued`]), and
 /// nothing for an encoder: no stage is told of one. A decision that picks
-/// no pair issues nothing. `sends_to` is handed to [`decide`] as it stands.
+/// no pair issues nothing. `sends_to` and `sends_to_encoder` are handed to
+/// [`decide`] as they stand.
 #[expect(
     clippy::too_many_arguments,
     reason = "an encode request's inputs, and where its caller sends it"
@@ -598,7 +636,18 @@ pub(super) fn decided(
     placed: &mut EncodePlaced,
     now: Instant,
     sends_to: impl Fn(&Target) -> bool,
+    sends_to_encoder: impl Fn(u32) -> bool,
 ) -> DecideOutcome {
-    let decision = decide(own, lists, request, items, loads, placed, now, sends_to);
+    let decision = decide(
+        own,
+        lists,
+        request,
+        items,
+        loads,
+        placed,
+        now,
+        sends_to,
+        sends_to_encoder,
+    );
     issued(own, request, decision, None, now)
 }

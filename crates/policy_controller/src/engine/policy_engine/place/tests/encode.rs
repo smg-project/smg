@@ -553,15 +553,14 @@ fn a_rule_that_panics_behind_an_encoder_that_cannot_be_sent_to_loses_no_lease() 
 /// An encode request whose pair's sides read their record of sent prefixes
 /// asks the route's rule inside its decision, at the question of where the
 /// prompt goes. A rule that panics there passes its panic to the call's
-/// caller, as a pair's does: the call places the request on no other
-/// prefill, and the engine is owed nothing.
+/// caller, as a pair's does: the decision's lease is given up by name
+/// first, the call places the request on no other prefill, and the engine
+/// is owed nothing.
 #[test]
 fn a_rule_that_panics_inside_an_encode_requests_decision_passes_its_panic() {
     let preset = "cache_aware";
-    let mut document = PolicySpec::epd_presets("power_of_two", preset, preset).expect("presets");
-    document.generation = 1;
-    let spec = AppliedSpec::validate(&document).expect("a valid document");
-    let engine = hosted(PolicyEngine::new(spec));
+    let document = PolicySpec::epd_presets("power_of_two", preset, preset).expect("presets");
+    let (engine, heard) = hearing(document);
     let three = Three::of([2, 4, 1], |_, _| false);
     let said: Said<'_> = (&[PLAIN], &[1, 1]);
     let tokens: Vec<u32> = (1_000..5_096).collect();
@@ -590,7 +589,92 @@ fn a_rule_that_panics_inside_an_encode_requests_decision_passes_its_panic() {
     };
     let placed = catch_unwind(AssertUnwindSafe(|| engine.place(&request).is_ok()));
     assert!(placed.is_err(), "the panic passes");
+    // The decision's lease is given up ahead of the panic: its two sides
+    // are issued once and released once.
+    let heard = heard.lock();
+    assert_eq!(heard.len(), 4, "{heard:?}");
+    let (prefill, decode) = (heard[0].1, heard[1].1);
+    let released = |worker| ("released CommitFailed".to_owned(), worker);
+    let given_up = [
+        issued(prefill),
+        issued(decode),
+        released(prefill),
+        released(decode),
+    ];
+    assert_eq!(*heard, given_up);
+    drop(heard);
     assert_eq!((engine.faults(), engine.unheard()), (0, 0));
+}
+
+/// An encode request's record of sent prefixes names no pair the request
+/// was not sent to. Behind an encoder that cannot be sent to, the call
+/// takes no target of the decision. So the decision writes its pair for
+/// neither side, and the prompt's next request is placed by its draw, as a
+/// prompt nobody was sent.
+///
+/// The encoder is read once a decision: where the decision asked of it,
+/// the call takes the answer given there.
+#[test]
+fn a_prompt_behind_an_encoder_that_cannot_be_sent_to_is_written_for_no_pair() {
+    // `cache_aware` on the pair's two sides, and no `healthy` filter: an
+    // encoder that cannot be sent to stays a candidate of the decision.
+    let preset = "cache_aware";
+    let mut document = PolicySpec::epd_presets("power_of_two", preset, preset).expect("presets");
+    for profile in document.profiles.values_mut() {
+        profile
+            .filter
+            .retain(|filter| *filter != FilterSpec::Name("healthy".to_owned()));
+    }
+    let (engine, heard) = hearing(document);
+    let three = Three::of([4, 4, 1], |_, _| false);
+    let lists = three.lists((&[PLAIN], &[1, 1, 1, 1]));
+    let keys = [Identity::plain("item")];
+    let items = EncodeItems {
+        keys: &keys,
+        ..EncodeItems::default()
+    };
+    let encoder = &three.workers[2][0];
+    // Each prompt is asked for once behind the encoder's open breaker, and
+    // placed once the breaker is closed again.
+    let (mut prefills, mut decodes) = (0, 0);
+    for at in 0..24_u32 {
+        let first = 1_000 + 10_000 * at;
+        let tokens: Vec<u32> = (first..first + 4_096).collect();
+        let request = PlaceRequest {
+            prompt: Prompt {
+                tokens: Some(&tokens),
+                ..Prompt::NONE
+            },
+            ..asking(lists, items)
+        };
+        trip(encoder);
+        heard.lock().clear();
+        let asked = ask(
+            engine.loaded(),
+            &request,
+            &lists,
+            items,
+            &mut Call::default(),
+        );
+        assert!(matches!(asked, Ok(None)), "no placement");
+        // The pair the decision picked and gave up, by what a stage heard
+        // issued: the prefill, then the decode.
+        let given_up = {
+            let heard = heard.lock();
+            assert_eq!(heard.len(), 4, "{heard:?}");
+            (heard[0].1, heard[1].1)
+        };
+        encoder.reset_circuit_breaker();
+        let placement = engine.place(&request).expect("a placement");
+        let (prefill, decode, _) = three.places(&placement);
+        prefills += usize::from(three.id(0, prefill) == given_up.0);
+        decodes += usize::from(three.id(1, decode) == given_up.1);
+        drop(placement);
+    }
+    // A side recorded for a prompt takes its next request under any draw:
+    // all twenty-four. Recorded for none, each side is drawn among four.
+    assert!(prefills < 24, "{prefills} of 24 to the prefill given up");
+    assert!(decodes < 24, "{decodes} of 24 to the decode given up");
 }
 
 /// The pair's targets of an encode request are walked as a pair's are. A

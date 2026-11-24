@@ -437,6 +437,10 @@ pub(super) struct Made<'r, 'a> {
     /// The same on the decodes of a pair's targets, by their places in the
     /// decode list: `sent` holds the prefills' then.
     decodes: Cell<Sent>,
+    /// The same on the encoders an encode request's decision placed, by
+    /// their places in the encoders' list
+    /// ([`RequestMaker::sends_to_encoder`]).
+    encoders: Cell<Sent>,
     /// Whether the request is a pair's decode decided again: a target's
     /// prefill was sent already, and its decode alone is asked.
     decode_alone: bool,
@@ -510,6 +514,7 @@ impl<'r, 'a> Made<'r, 'a> {
             panicked: OnceCell::new(),
             sent: Cell::new(Sent::NONE),
             decodes: Cell::new(Sent::NONE),
+            encoders: Cell::new(Sent::NONE),
             decode_alone: false,
         }
     }
@@ -886,6 +891,25 @@ impl RequestMaker for Made<'_, '_> {
                 })
             }
         }
+    }
+
+    // The call's own read of an encoder a decision placed, made ahead of
+    // that read for the write of where the prompt went: ready, on one read
+    // of its state. The route's rule is asked of no encoder. The answer is
+    // kept ([`Sent`]) and the call takes it, so an encoder is read once a
+    // decision.
+    fn sends_to_encoder(&self, position: u32) -> bool {
+        let WorkerLists::Encode(lists) = &self.request.lists else {
+            return true;
+        };
+        let mut kept = self.encoders.get();
+        kept.answer(position).unwrap_or_else(|| {
+            let worker = lists.encoders.workers.get(position as usize);
+            let sendable = worker.is_some_and(|worker| ready(worker.as_ref()));
+            kept.keep(position, sendable);
+            self.encoders.set(kept);
+            sendable
+        })
     }
 }
 
