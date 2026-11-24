@@ -2152,8 +2152,8 @@ gateway                                           controller (leader)
   stages also learn of the requests they placed from these reports (section 6). A request that
   the gateway placed by itself holds no lease on file, so it enters no count of requests in
   flight: its dispatch names no worker (decision 6). Its completion names the worker that served
-  it and still counts toward that worker's health. In process the gateway tells its own engine no
-  outcome yet (section 9.2).
+  it. Nothing counts it toward that worker's health yet **[planned]**. In process the gateway
+  tells its own engine no outcome yet (section 9.2).
 - When no answer comes in time (no credit on the stream, a change of leader, the controller
   gone), the gateway decides by itself with the same engine, under the document the controller
   pushed, over the worker list it follows (decision 6). That list stops changing while the
