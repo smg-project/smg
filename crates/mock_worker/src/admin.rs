@@ -18,6 +18,8 @@
 //!   `.../restart-publisher`, `.../pause`, `.../resume`,
 //!   `.../fail?status=S[&count=N|&secs=T][&after_tokens=K][&stall_ms=M]` and
 //!   `GET /admin/fault/{worker}`: the fault hooks (see the README).
+//! - `POST /admin/fault/{worker}/load-fail?status=S`: the worker's load
+//!   polls are answered with S instead of a report (see the README).
 //! - `GET /admin/ops/{worker}`: what the gateway's admin fan-out reached on
 //!   the worker: its flushes, its profiling runs and the last trace written
 //!   (`all`: every worker).
@@ -96,6 +98,7 @@ fn router(state: Arc<AdminState>) -> Router {
         .route("/admin/fault/{worker}/pause", post(fault_pause))
         .route("/admin/fault/{worker}/resume", post(fault_resume))
         .route("/admin/fault/{worker}/fail", post(fault_fail))
+        .route("/admin/fault/{worker}/load-fail", post(fault_load_fail))
         .route("/admin/ops/{worker}", get(ops_status))
         .route("/admin/truth", get(truth_served))
         .route("/admin/truth/{worker}", post(truth_prompt))
@@ -294,6 +297,7 @@ fn status_json(e: &Engine) -> Value {
         "failed_total": s.failed_total,
         "cut_total": s.cut_total,
         "stalled_total": s.stalled_total,
+        "load_fail_status": s.load_fail_status,
     })
 }
 
@@ -321,6 +325,16 @@ fn optional<T: std::str::FromStr>(
     }
 }
 
+/// The `status` a hook answers with: 0 (none) or an error status.
+fn check_status(status: u16) -> Result<(), String> {
+    if status == 0 || (400..=599).contains(&status) {
+        return Ok(());
+    }
+    Err(format!(
+        "status must be 0 or an error status (400-599), got {status}"
+    ))
+}
+
 /// The request fault a `fail` query arms, or `None` to clear it:
 /// `status=S` (0, or 400 to 599) answered instead of serving, for the next
 /// `count=N` requests or every request for `secs=T` (neither: until cleared),
@@ -341,11 +355,7 @@ fn fail_query(q: &HashMap<String, String>) -> Result<Option<RequestFault>, Strin
         Some("error") => true,
         Some(other) => return Err(format!("finish must be \"error\", got {other}")),
     };
-    if status != 0 && !(400..=599).contains(&status) {
-        return Err(format!(
-            "status must be 0 or an error status (400-599), got {status}"
-        ));
-    }
+    check_status(status)?;
     if finish_error {
         after_tokens = Some(after_tokens.unwrap_or(0));
     } else if status == 0 && after_tokens.is_some() {
@@ -682,6 +692,22 @@ async fn fault_fail(
         Err(why) => return (StatusCode::BAD_REQUEST, why).into_response(),
     };
     apply(&worker, |e| e.fault_fail(fault))
+}
+
+/// The worker's load polls are answered with `status` (400-599) instead of
+/// a report; 0 clears.
+async fn fault_load_fail(
+    Path(worker): Path<String>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let status: u16 = match param(&q, "status") {
+        Ok(v) => v,
+        Err(response) => return response,
+    };
+    if let Err(why) = check_status(status) {
+        return (StatusCode::BAD_REQUEST, why).into_response();
+    }
+    apply(&worker, |e| e.fault_load_fail(status))
 }
 
 async fn fault_resume(Path(worker): Path<String>) -> Response {

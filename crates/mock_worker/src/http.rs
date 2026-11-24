@@ -212,6 +212,9 @@ async fn models(State(state): State<Arc<AppState>>) -> Response {
 }
 
 async fn loads(State(state): State<Arc<AppState>>) -> Response {
+    if let Some(status) = state.engine.as_ref().and_then(|e| e.load_refused()) {
+        return injected_error(status);
+    }
     let load = state
         .engine
         .as_ref()
@@ -1914,6 +1917,38 @@ mod tests {
             ])
         );
         assert!(entry("http:65202").await.get("values").is_none());
+    }
+
+    /// A worker under the load-fail hook answers `/v1/loads` with the hook's
+    /// status and the fault body, and a cleared hook has it report again.
+    #[tokio::test]
+    async fn a_load_fail_answers_the_loads_list_with_its_status() {
+        let engine = Engine::spawn(engine::EngineParams::default());
+        let state = Arc::new(AppState {
+            cfg: Arc::new(Config::default()),
+            name: "http:65203".to_string(),
+            engine: Some(engine.clone()),
+            in_flight: WorkerInFlight::default(),
+            ops: AdminOps::register("http:65203"),
+            bootstrap_port: None,
+        });
+        let poll = || async {
+            let answer = loads(State(Arc::clone(&state))).await;
+            let status = answer.status();
+            let bytes = axum::body::to_bytes(answer.into_body(), usize::MAX)
+                .await
+                .expect("a body");
+            let body: Value = serde_json::from_slice(&bytes).expect("json");
+            (status, body)
+        };
+        engine.fault_load_fail(501);
+        let (status, body) = poll().await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(body["error"]["type"], "fault");
+        engine.fault_load_fail(0);
+        let (status, body) = poll().await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["loads"][0]["dp_rank"], 0);
     }
 
     fn token() -> engine::GenEvent {
