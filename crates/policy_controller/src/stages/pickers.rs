@@ -139,6 +139,14 @@ fn alone(
     at + 1 >= len || below_band(best_five[at + 1].1, best_five[at].1, band)
 }
 
+/// Whether the five best stand for a pool: no score is a NaN (one ties in
+/// every band, and the pass that keeps the five may have dropped it) and the
+/// band is a width of zero or more (under a band below zero a row lies below
+/// its own band). One read of the scores.
+fn five_stand(scores: &[f32], band: TieBand) -> bool {
+    band.0 >= 0.0 && !scores.iter().fold(false, |nan, s| nan | s.is_nan())
+}
+
 /// The rows of a ranked pick, by their places in `scores`, handed to `pick`
 /// in slot order: `slots` of them at most, and `slots` no more than a
 /// target list holds or `scores` holds. Per slot the rows within the band
@@ -200,7 +208,7 @@ fn draw_ranked<const DRAWN: bool>(
         filled += 1;
     }
     // Whether the five stand for the pool: unread until a band asks.
-    let mut sound = false;
+    let mut sound = None;
     // Several rows share the band of the best score left, the next entry
     // among them.
     while filled < slots {
@@ -221,9 +229,10 @@ fn draw_ranked<const DRAWN: bool>(
         {
             break;
         }
-        if !sound {
-            sound = band.0 >= 0.0 && !scores.iter().fold(false, |nan, s| nan | s.is_nan());
-            if !sound {
+        if sound.is_none() {
+            let stands = five_stand(scores, band);
+            sound = Some(stands);
+            if !stands {
                 break;
             }
         }
@@ -283,8 +292,8 @@ fn draw_ranked<const DRAWN: bool>(
 /// of `draw`. `taken` holds the rows of the slots before `filled` and takes
 /// the rows drawn here. Returns the end of the slots filled.
 ///
-/// In a pool the five best stand for (`sound`, or read here where no band
-/// asked: no score a NaN, a band of zero or more) the best score left is the
+/// In a pool the five best stand for ([`five_stand`]: `sound`, read here
+/// where no band of the five asked) the best score left is the
 /// first of `best`, the five, whose row is not taken. The rows within its
 /// band are counted over the whole pool, once while that score stands, and
 /// one pass finds the row drawn. In any other pool a slot costs the passes
@@ -298,11 +307,11 @@ fn draw_left(
     scores: &[f32],
     band: TieBand,
     best: &[(usize, f32)],
-    sound: bool,
+    sound: Option<bool>,
     taken: &mut [usize],
     filled: usize,
 ) -> usize {
-    let sound = sound || (band.0 >= 0.0 && !scores.iter().fold(false, |nan, s| nan | s.is_nan()));
+    let sound = sound.unwrap_or_else(|| five_stand(scores, band));
     // The best score the band was counted under last, and its rows over
     // the whole pool.
     let mut counted = (f32::NAN, 0usize);
