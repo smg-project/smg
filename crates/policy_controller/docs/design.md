@@ -2636,7 +2636,9 @@ every fallback engine".
 
 The kept engine runs a single request's shadow, and counts as skipped one that reads affinity
 rows of its own. A pair's shadows run in no engine, and the explain sample is kept by the
-served controller alone. A document
+served controller alone. A host reads the shadow counts in one call of the engine
+(`PolicyEngine::shadow_counts`). A gateway shows them at each scrape of its metrics endpoint,
+as the series `smg_policy_shadow_decisions_total`. A document
 that writes `canary`, `override: allowed` or `admission` is refused. No engine runs them.
 
 | Option | Cost |

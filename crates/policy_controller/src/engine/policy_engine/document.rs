@@ -73,9 +73,9 @@ pub(in crate::engine) struct InForce {
     /// pays one test of it, and a place picked alone pays none.
     pub(super) any_shadow: bool,
     /// The shadow decisions counted so far
-    /// ([`DecisionEngine::shadowed`](crate::engine::DecisionEngine::shadowed)),
-    /// by binding and kind. The table is allocated at the first of them: a
-    /// document that names no shadow keeps none.
+    /// ([`PolicyEngine::shadow_counts`]), by binding, side and kind. The
+    /// tables are allocated at the first of them: a document that names no
+    /// shadow keeps none.
     pub(super) shadow_counts: OnceLock<Box<ShadowCounts>>,
 }
 
@@ -200,7 +200,7 @@ impl PolicyEngine {
     ///
     /// A word of a lease issued under the standing document reaches no
     /// stage from here on ([`DecisionEngine::say`]), and the shadow counts
-    /// start at zero ([`DecisionEngine::shadowed`]). The session table
+    /// start at zero ([`Self::shadow_counts`]). The session table
     /// hears no dispatch of such a lease either: a claim that decision
     /// made is neither confirmed nor taken back, and a pin its dispatch
     /// would move stays. A list keeps the
@@ -211,7 +211,6 @@ impl PolicyEngine {
     /// call, or the last decision under it.
     ///
     /// [`DecisionEngine::say`]: crate::engine::DecisionEngine::say
-    /// [`DecisionEngine::shadowed`]: crate::engine::DecisionEngine::shadowed
     /// [`LentList`]: crate::engine::LentList
     ///
     /// The call holds the lock a change of membership is told under, and

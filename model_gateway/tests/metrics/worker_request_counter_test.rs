@@ -152,7 +152,7 @@ fn completion() -> CompletionRequest {
 #[tokio::test]
 async fn every_dispatch_moves_the_worker_request_counter() {
     let handle = recorder();
-    let (metrics_addr, _server) = start_metrics_server(handle, "127.0.0.1".to_string(), 0)
+    let (metrics_addr, _server) = start_metrics_server(handle, "127.0.0.1".to_string(), 0, None)
         .await
         .expect("metrics server binds an ephemeral port");
 

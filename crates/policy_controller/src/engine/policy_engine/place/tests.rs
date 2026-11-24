@@ -32,7 +32,7 @@ use crate::{
         MANUAL_SESSION_HEADER,
     },
     engine::{
-        decision::{Queue, ShadowKind, Shed, Target, Targets, Trace},
+        decision::{Queue, Shed, Target, Targets, Trace},
         decision_engine::{Decided, DecisionEngine},
         framework::{Filter, Picker, Place, PoolWord, Scorer, TieBand, DRAW_FROM},
         list_cell::PublishedList,
@@ -2183,7 +2183,7 @@ fn a_shadow_of_another_ring_form_is_lent_no_ring() {
     let placement = engine.place(&request).expect("a placement");
     assert!(Arc::ptr_eq(&placement.worker, &list[0]), "the ring's owner");
     // Agreed, another target, another outcome, skipped.
-    let counted = ShadowKind::ALL.map(|kind| engine.shadowed(0, kind));
+    let counted = engine.shadow_kinds(0);
     assert_eq!(counted, [0, 1, 0, 0]);
 }
 
@@ -2249,7 +2249,7 @@ fn a_shadow_is_lent_the_ring_where_it_places_as_its_live_profile_does() {
         let placement = engine.place(&request).expect("a placement");
         assert!(Arc::ptr_eq(&placement.worker, &list[0]), "the ring's owner");
         // Agreed, another target, another outcome, skipped.
-        let counted = ShadowKind::ALL.map(|kind| engine.shadowed(0, kind));
+        let counted = engine.shadow_kinds(0);
         (ring.1.load(atomic::Ordering::Relaxed), counted)
     };
     let (plain, prefix) = ("consistent_hashing", "prefix_hash");

@@ -93,7 +93,6 @@ use self::{
     overlap::{Affinity, PoolAffinity},
 };
 use super::{
-    decision::ShadowKind,
     decision_engine::{
         AlonePick, DecideOutcome, Decided, DecisionEngine, DecisionRefused, HeldDecision, Request,
         RequestMaker, WorkerLists,
@@ -103,7 +102,7 @@ use super::{
     list_cell::{HandedLists, LentList},
     prompt_hashes::{HashSeeds, PromptHashes},
     records::{DecisionClock, PoolRecords},
-    shadow::{Counted, Shadowed},
+    shadow::Shadowed,
     sticky_sessions::{shards_for_this_host, SessionTable},
     view::{FixedFacts, Phase, WireModes, WorkerId},
 };
@@ -1205,18 +1204,6 @@ impl DecisionEngine for PolicyEngine {
 
     fn faults(&self) -> u64 {
         self.faults.load(Ordering::Relaxed)
-    }
-
-    // The shadow decisions counted for single requests. No shadow profile
-    // runs on a pair's side here.
-    fn shadowed(&self, binding: u32, kind: ShadowKind) -> u64 {
-        let document = self.document.load();
-        let counts = document.shadow_counts.get();
-        counts.map_or(0, |counts| {
-            counts
-                .of(binding, Counted::Single, kind)
-                .load(Ordering::Relaxed)
-        })
     }
 }
 

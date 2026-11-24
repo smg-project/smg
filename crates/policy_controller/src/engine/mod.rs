@@ -79,7 +79,7 @@ pub use policy_engine::{PolicyEngine, SpecHandle};
 pub use prompt_hashes::{HashSeeds, PromptHashes};
 #[cfg(feature = "in-process")]
 pub use records::{decide, worker_id, worker_rank, DecisionClock, Live, PoolRecords};
-pub use shadow::SHADOW_ROWS;
+pub use shadow::{ShadowCount, ShadowSide, SHADOW_ROWS};
 pub use sticky_sessions::{
     DecodeVerdict, SessionExpiry, SessionPins, SessionRule, SessionTable, SessionVerdict,
     ABSENT_WORKER_PIN_TTL_MICROS,
