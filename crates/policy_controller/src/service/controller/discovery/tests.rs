@@ -13,7 +13,7 @@ use crate::{
     service::{
         controller::{
             config::tests::valid,
-            worker_objects::{engine, ObjectsWake, WorkerObjects},
+            worker_objects::{engine, WorkerObjects},
             Controller, Error as BindError,
         },
         elector::{ElectError, ElectionSettings, Elector},
@@ -88,7 +88,7 @@ impl Bed {
         let (standing, _) = watch::channel(ElectionObservation::default());
         let (stop, _) = watch::channel(false);
         let store = Arc::new(MemoryStore::new());
-        let workers = WorkerObjects::new(Arc::clone(&store), ObjectsWake::default());
+        let workers = WorkerObjects::new(Arc::clone(&store));
         let host = Arc::new(Host::new(
             Arc::clone(workers.objects().registry()),
             Some(Credential::for_test(KEY)),

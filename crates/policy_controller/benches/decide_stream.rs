@@ -1111,6 +1111,11 @@ fn serve(shape: Shape) -> Served {
                     .expect("a listener of the configuration");
                 let store = controller.store();
                 fill(&store, shape);
+                // The fleet is written through the store's own entries, and
+                // no task of the serve lays a worker object: the holder
+                // follows the store here, as a host that writes its store
+                // does.
+                controller.workers().follow(&*store);
                 let addr = controller
                     .addresses()
                     .of(Scope::Gateway)

@@ -1639,7 +1639,7 @@ pub(crate) mod tests {
                 lifecycle,
                 watch_workers::Feed,
                 wire::{self, Checked},
-                worker_objects::{ObjectsWake, WorkerObjects},
+                worker_objects::WorkerObjects,
             },
             elector::{Elector, TickOutcome, TERM_CEILING},
             proto::{self, busy::Reason, decide_answer::Answer, decision::Outcome},
@@ -1742,7 +1742,7 @@ pub(crate) mod tests {
     /// a decider lays the objects of the rows written since its last
     /// decision.
     pub(crate) fn holder(store: &Arc<MemoryStore>) -> Arc<Objects<Members>> {
-        WorkerObjects::new(Arc::clone(store), ObjectsWake::default()).holder()
+        WorkerObjects::new(Arc::clone(store)).holder()
     }
 
     /// A store and its feed with the holder of its worker objects and a

@@ -1020,7 +1020,7 @@ mod tests {
                 decision_slots::tests::{followed, frame_for, holder, lent_pick, preset},
                 election::LeasePlace,
                 replication::{journaled, journaled_from, parts, Replication},
-                worker_objects::{ObjectsWake, WorkerObjects},
+                worker_objects::WorkerObjects,
             },
             elector::{ElectionSettings, Elector, TickOutcome},
             proto::policy_controller_server::{PolicyController, PolicyControllerServer},
@@ -1048,7 +1048,7 @@ mod tests {
     /// A standby's applier over a replica's store and log, with the holder
     /// of its worker objects as a controller keeps one.
     fn applier((store, log): &Replica) -> Follower {
-        let objects = WorkerObjects::new(Arc::clone(store), ObjectsWake::default()).holder();
+        let objects = WorkerObjects::new(Arc::clone(store)).holder();
         Follower::new(Arc::clone(store), Arc::clone(log), objects)
     }
 
@@ -1275,7 +1275,7 @@ mod tests {
         leader.upsert(side("http://pb:8000", Role::Prefill, "green"));
         leader.upsert(side("http://da:8000", Role::Decode, "green"));
         follow(&follower, &led, Instant::now());
-        let leading = WorkerObjects::new(Arc::clone(&leader), ObjectsWake::default()).holder();
+        let leading = WorkerObjects::new(Arc::clone(&leader)).holder();
         leading.follow(&*leader);
         for mode in [Pairing::Lenient, Pairing::Strict] {
             let behind = pair_classes(&follower.objects, mode);

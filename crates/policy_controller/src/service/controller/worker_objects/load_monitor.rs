@@ -242,7 +242,7 @@ mod tests {
     };
     use tokio::{task::JoinSet, time};
 
-    use super::{super::ObjectsWake, *};
+    use super::*;
     use crate::{
         engine::view::WireModes,
         service::controller::{frame_loads::FrameLoads, Config},
@@ -447,7 +447,6 @@ mod tests {
             let dials: Arc<dyn EngineConnector> = Arc::new(Dials(Arc::clone(&engine)));
             let workers = Arc::new(WorkerObjects::with_connector(
                 Arc::clone(&store),
-                ObjectsWake::default(),
                 dials,
                 overload,
             ));
@@ -472,8 +471,8 @@ mod tests {
             }
         }
 
-        /// Writes the `Ready` row of `facts` and lays its object, as the
-        /// follower's task does at the store's wake.
+        /// Writes the `Ready` row of `facts` through the store's own entries
+        /// and has the holder follow it, as a host that writes its store does.
         fn register(&self, facts: WorkerFacts) {
             let row = self.store.upsert(facts).id();
             let standing = self.store.get(row).expect("the row");

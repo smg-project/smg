@@ -114,25 +114,21 @@ impl<G: Generation> Objects<G> {
             .1
     }
 
-    /// [`Self::connect`] for a door, which names the row and the revision
-    /// it read. A door asks its term in its own turn, so it hands no last
-    /// word.
-    #[cfg_attr(
-        not(any(test, feature = "controller")),
-        expect(dead_code, reason = "a controller's doors write a status here")
-    )]
-    pub(crate) fn connect_row(&self, store: &MemoryStore, row: WorkerId, revision: u64) {
+    /// The connect signal of the row `row`, read at `revision`: its object
+    /// is ready at once, with its probes counted anew, and `store` is told.
+    /// A ready or a draining object stands, and its counters with it. A row
+    /// that left the revision, or left, moves nothing. One of a host's
+    /// write calls ([`Objects`]): its caller asks its term itself, so the
+    /// call hands the store no last word.
+    pub fn connect_row(&self, store: &MemoryStore, row: WorkerId, revision: u64) {
         self.row_status(store, row, revision, Write::Connect);
     }
 
     /// The drain of the row `row`, read at `revision`, as
-    /// [`Self::connect_row`] writes a status. Whether the row's object
-    /// moved: a row that left the revision, or left, moves nothing.
-    #[cfg_attr(
-        not(any(test, feature = "controller")),
-        expect(dead_code, reason = "a controller's doors write a status here")
-    )]
-    pub(crate) fn drain_row(&self, store: &MemoryStore, row: WorkerId, revision: u64) -> bool {
+    /// [`Self::connect_row`] writes a status: its object drains, and
+    /// `store` is told. Whether the row's object moved: a row that left
+    /// the revision, or left, moves nothing, and a draining object stands.
+    pub fn drain_row(&self, store: &MemoryStore, row: WorkerId, revision: u64) -> bool {
         self.row_status(store, row, revision, Write::Drain)
             .is_some()
     }
@@ -140,20 +136,12 @@ impl<G: Generation> Objects<G> {
     /// Tell `store` the status of the object that stands for `row`, behind
     /// a write that laid the object in another's place: it took the
     /// standing object's status there, and the table holds its own.
-    #[cfg_attr(
-        not(any(test, feature = "controller")),
-        expect(dead_code, reason = "a controller's doors lay a row here")
-    )]
     pub(super) fn tell_row(&self, store: &MemoryStore, row: WorkerId, revision: u64) {
         self.row_status(store, row, revision, Write::Tell(None));
     }
 
     /// A status write that names its row: on the object that stands for
     /// `row`, where it was built from `revision`.
-    #[cfg_attr(
-        not(any(test, feature = "controller")),
-        expect(dead_code, reason = "a controller's doors write a status here")
-    )]
     fn row_status(&self, store: &MemoryStore, row: WorkerId, revision: u64, write: Write) -> Moved {
         let id = self.object(row)?;
         let object = self.registry.get(&id)?;

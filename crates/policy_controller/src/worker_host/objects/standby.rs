@@ -252,6 +252,40 @@ mod tests {
         assert!(standby.objects.is_empty());
     }
 
+    /// A write call asks no term, so a host that does not lead must not
+    /// call one. Where it does, the write lands in its own store alone: its
+    /// leader's next event no longer fits that store and lays nothing, and
+    /// the leader's snapshot takes the write back.
+    #[test]
+    fn a_standbys_own_write_is_lost_at_its_leaders_next_snapshot() {
+        let (leader, standby) = (Replica::new(), Replica::new());
+        leader.upsert(facts(1, "gold"));
+        follow(&standby, &leader);
+        // The standby's own write, which no leader told.
+        let own = WorkerFacts {
+            key: B.to_owned(),
+            engine: B.to_owned(),
+            ..facts(1, "iron")
+        };
+        assert!(standby.upsert(own).is_some());
+        assert!(standby.object(B).is_some());
+        // The leader's next event comes at the leader's epoch.
+        leader.upsert(facts(1, "iron"));
+        let (change, row) = told(&leader);
+        let epoch = leader.store.epoch();
+        let (store, objects) = (&standby.store, &standby.objects);
+        assert!(!objects.follow_at(store, at(epoch), epoch, change, row));
+        let stale = store.by_key(A).expect("the row stands");
+        assert_eq!(stale.revision, 1, "nothing of the event is laid");
+        // The applier starts again from the leader's snapshot.
+        assert!(objects.restore_from(store, leader.store.checkpoint()));
+        assert_eq!(standby.object(B), None, "the standby's own write is gone");
+        assert_eq!(store.by_key(B), None);
+        let object = standby.object(A).expect("the leader's row has its object");
+        assert_eq!(objects.row_of(&object), leader.store.by_key(A));
+        assert_eq!(objects.len(), 1);
+    }
+
     /// The locks in their order. Behind the store's write of an event and
     /// ahead of the put, the holder's turn is held, the store's membership
     /// lock is free and its table holds the row, and the registry does not

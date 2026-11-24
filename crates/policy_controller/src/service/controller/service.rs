@@ -227,9 +227,9 @@ impl Shared {
     /// another fence guards. A spec document names the stages `catalog`
     /// holds. `deciders` is how many threads decide. The store comes with
     /// the feed of the log it journals to, the one value one place builds
-    /// ([`journaled_waking`](super::replication::journaled_waking)), and
-    /// with the holder of the replica's worker objects, which follow that
-    /// store: the deciders decide over their lists.
+    /// ([`journaled`](super::replication::journaled)), and with the holder
+    /// of the replica's worker objects, whose rows stand in that store: the
+    /// deciders decide over their lists.
     ///
     /// # Errors
     ///
@@ -1188,7 +1188,7 @@ mod tests {
                     tests::{stating, told, NO_PRINCIPAL},
                     Layer,
                 },
-                replication::{journaled_for, journaled_from},
+                replication::{journaled_at, journaled_from},
                 spec_store::{tests::names, SpecStore},
                 wire::Checked,
                 PROTOCOL_VERSION,
@@ -1249,7 +1249,7 @@ mod tests {
                 ADDRESS.to_owned(),
                 &elector,
                 stood,
-                bed::followed(journaled_for(&LeasePlace::Process, 0, 2)),
+                bed::followed(journaled_at(&LeasePlace::Process, 0, 2)),
                 Arc::new(catalog),
                 2,
             )
@@ -1730,7 +1730,7 @@ mod tests {
         let elector = Elector::new(Box::new(FileLease::new(&path)), IDENTITY, settings)
             .expect("the settings are in order");
         let (standing, stood) = watch::channel(ElectionObservation::default());
-        let (store, feed) = journaled_for(&LeasePlace::Process, 0, 2);
+        let (store, feed) = journaled_at(&LeasePlace::Process, 0, 2);
         let shared = Arc::new(
             Shared::new(
                 ID.to_owned(),
@@ -2304,7 +2304,7 @@ mod tests {
         )
         .expect("the settings are in order");
         let (standing, stood) = watch::channel(ElectionObservation::default());
-        let (store, feed) = journaled_for(&LeasePlace::Process, 0, 2);
+        let (store, feed) = journaled_at(&LeasePlace::Process, 0, 2);
         let service = Service::new(
             vec![Scope::Gateway],
             Arc::new(

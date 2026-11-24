@@ -28,10 +28,7 @@ mod tests {
         document::{AppliedSpec, PolicySpec},
         engine::view::{WireModes, WorkerId as RowId},
         service::controller::{
-            config::tests::valid,
-            readiness::State,
-            worker_objects::{ObjectsWake, WorkerObjects},
-            Controller,
+            config::tests::valid, readiness::State, worker_objects::WorkerObjects, Controller,
         },
         store::{MemoryStore, Registrant, Signals, WorkerFacts, WorkerStatus, WorkersStore},
         worker_host::{
@@ -74,7 +71,7 @@ mod tests {
     impl Fixture {
         fn new() -> Self {
             let store = Arc::new(MemoryStore::new());
-            let objects = WorkerObjects::new(Arc::clone(&store), ObjectsWake::default()).holder();
+            let objects = WorkerObjects::new(Arc::clone(&store)).holder();
             Self::over(store, objects)
         }
 
@@ -542,11 +539,10 @@ mod tests {
             let _ = stopped.await;
         }));
         let case = async {
-            let id = store.upsert(row).id();
+            let written = objects.upsert(&store, row, Registrant::Control);
+            let id = written.expect("the store took the registration").id();
             let revision = store.get(id).expect("the row").revision;
-            store
-                .set_status(id, WorkerStatus::Ready, revision)
-                .expect("the worker is ready");
+            objects.connect_row(&store, id, revision);
             store.publish_now();
 
             timeout(WAIT, async {
@@ -678,11 +674,10 @@ mod tests {
             })
             .await
             .expect("the replica takes the lead");
-            let id = store.upsert(row).id();
+            let written = objects.upsert(&store, row, Registrant::Control);
+            let id = written.expect("the store took the registration").id();
             let revision = store.get(id).expect("the row").revision;
-            store
-                .set_status(id, WorkerStatus::Ready, revision)
-                .expect("the worker is ready");
+            objects.connect_row(&store, id, revision);
             store.publish_now();
 
             // The monitor marks a worker at the first record it takes, and
