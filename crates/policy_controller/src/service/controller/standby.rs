@@ -1013,7 +1013,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        engine::view::{LoadRow, WireModes, WorkerId},
+        document::spec::Pairing,
+        engine::view::{LoadRow, Role, WireModes, WorkerId},
         service::{
             controller::{
                 decision_slots::tests::{followed, frame_for, lent_pick, preset},
@@ -1255,6 +1256,45 @@ mod tests {
         first(&leader, Instant::now());
         assert_eq!(follower.restore(leader.checkpoint(), None), Ok(true));
         each_row_has_its_object(&follower, &standby);
+    }
+
+    /// The pair classes `objects` derives of the model's two lists under
+    /// `mode`, each list's by place.
+    fn pair_classes(objects: &Objects<Members>, mode: Pairing) -> [Vec<u32>; 2] {
+        let generation = objects.registry().model_generation("m");
+        let generation = generation.expect("the model's generation");
+        let classes = objects.pair_classes(&generation, mode);
+        [classes.prefills().to_vec(), classes.decodes().to_vec()]
+    }
+
+    /// A standby pairs as its leader does. A row that states no pairing
+    /// descriptor pairs by what its worker object offers, and each replica
+    /// builds a row's object of the row alone. So behind the leader's log
+    /// the standby's holder derives the classes a holder over the leader's
+    /// own table derives, under each mode, and neither pairs two workers
+    /// whose labels name two pairing protocols.
+    #[test]
+    fn a_standby_derives_its_leaders_pair_classes_of_the_rows_it_followed() {
+        let ((leader, led), follower, _) = pair();
+        let side = |key: &str, role: Role, protocol: &str| WorkerFacts {
+            role,
+            labels: [("pairing_protocol".to_owned(), protocol.to_owned())].into(),
+            ..facts(key, 1)
+        };
+        leader.upsert(side("http://pa:8000", Role::Prefill, "blue"));
+        leader.upsert(side("http://pb:8000", Role::Prefill, "green"));
+        leader.upsert(side("http://da:8000", Role::Decode, "green"));
+        follow(&follower, &led, Instant::now());
+        let leading = WorkerObjects::new(Arc::clone(&leader), ObjectsWake::default()).holder();
+        leading.follow(&*leader);
+        for mode in [Pairing::Lenient, Pairing::Strict] {
+            let behind = pair_classes(&follower.objects, mode);
+            assert_eq!(behind, pair_classes(&leading, mode), "{mode:?}");
+        }
+        let generation = follower.objects.registry().model_generation("m");
+        let generation = generation.expect("the model's generation");
+        let lenient = follower.objects.pair_classes(&generation, Pairing::Lenient);
+        assert_eq!([lenient.pairs(0, 0), lenient.pairs(1, 0)], [false, true]);
     }
 
     /// What the applier's way through the holder is for: a replica that

@@ -2079,7 +2079,7 @@ tells the data once more:
 | the worker record | the store's table of records (`store/memory.rs`) | the load poller, and the follower of cache events for whether a worker's events are indexed, each until it reads the worker objects; a watcher's and a standby's first copy |
 | a copy of the record's facts | beside the worker objects (`worker_host/objects.rs`) | the code that keeps the objects, to tell a record that changed under its object |
 | the worker object | the worker-crate registry | the health checker, the follower of cache events and a decision |
-| the remainder: 17 of the 24 facts and one bit of an eighteenth, with the record's id and revision | beside each worker object (`worker_host/remainder.rs`) | a decision, for the record's id, whether the worker takes images, its wire modes and from where it is reached. A pair's classes read the worker's engine kind and its pairing descriptor too. What the worker states for a request's hard demands is lent with the list, and no frame states a demand yet |
+| the remainder: 17 of the 24 facts and one bit of an eighteenth, with the record's id and revision | beside each worker object (`worker_host/remainder.rs`) | a decision, for the record's id, whether the worker takes images, its wire modes and from where it is reached. A pair's classes read the worker's engine kind and its pairing descriptor too, and for a record that states no descriptor the pairing facts its worker object derives of its labels. What the worker states for a request's hard demands is lent with the list, and no frame states a demand yet |
 | the published copy of the records | the store | a pick's booking and a gateway's vetoes, among others; no request is decided over it |
 | the membership log's event | `service/replication/log.rs` | a watcher behind its first copy; a standby |
 
@@ -2097,8 +2097,13 @@ the objects writes one with every object it builds. `Objects::row_of` gives a wo
 whole record back from the object and its remainder, with no read of the store's table.
 A decision reads the remainder's facts, among them the record's id, whether the worker takes
 images, its wire modes and from where it is reached. A pair's classes read the worker's engine
-kind and its pairing descriptor too. The controller's registration calls decide a write over a
-whole record read back (step 1 below). Of the 24 facts a registration states:
+kind and its pairing descriptor too. A record that states no descriptor is read by what its
+worker object offers a partner: the pairing facts the object derives of the record's labels and
+engine kind, as a gateway reads them of its own worker. The controller's door lays no
+descriptor, since its log holds none, so a controller's workers pair by their labels; its
+reading of a worker's spec lays the pairing protocol and the KV connector the spec holds
+among those labels. The controller's registration calls decide a write over a
+whole record read back (step 1 below). Of the 24 facts a worker's record holds:
 
 - Six stand on the object whole, and the remainder holds none of them: the address, the role,
   the models, the labels, the cache block size and the bootstrap port. So does the status.

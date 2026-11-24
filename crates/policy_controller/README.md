@@ -231,7 +231,7 @@ The binary then takes the gateway's worker discovery flags, under the same names
 | `--service-discovery-namespace` | Kubernetes: the namespace to watch. Every namespace when unset. |
 | `--model-id-from` | Kubernetes: take each worker's model id from pod metadata: `namespace`, `label:<key>` or `annotation:<key>`. |
 | `--kv-connector-annotation`, `--kv-engine-id-annotation` | Kubernetes: `smg.ai/kv-connector` and `smg.ai/kv-engine-id`. The pod annotations that name a worker's KV connector and its engine ids. |
-| `--pairing-protocol-label` | Kubernetes: `smg.ai/pairing-protocol`. The pod label that names a worker's prefill/decode pairing protocol. A prefill and a decode pair only when their protocols are equal. |
+| `--pairing-protocol-label` | Kubernetes: `smg.ai/pairing-protocol`. The pod label that names a worker's prefill/decode pairing protocol. A prefill and a decode that both name one pair only when the two are equal, under `lenient` and `strict`. |
 | `--discovery-file` | File: the JSON manifest that lists the workers. Required with `--discovery-provider file`. It may be created after startup. |
 | `--slurm-job-name`, `--slurm-encode-job-name`, `--slurm-prefill-job-name`, `--slurm-decode-job-name` | Slurm: the job names whose nodes are regular, encode, prefill and decode workers. Each can be given more than once. |
 | `--slurm-port` | Slurm: the inference port on every node of a discovered job. Required with `--discovery-provider slurm`. |
@@ -696,7 +696,7 @@ bindings:
 
 An embedded host using the store can supply the runtime and a KV handoff descriptor. `lenient` rejects known differences. `strict` also rejects missing runtime or transport, a value missing on one side for a hard fact, and different versions when both are provided. Both sides may omit a KV layout fact. A shared explicit protocol settles the handoff after the runtime check. `off` skips descriptor checks. In every mode, HTTP-only workers pair within their wire class and workers on the other side of that division cannot pair if their known runtimes differ. The store derives compatibility from membership and rebuilds it when the pairing mode changes.
 
-Over the standalone registration RPC, the pairing descriptor accepts only a bootstrap port, and the runtime comes from `spec.runtime`. Use `lenient` or `off` for workers registered this way. A host supplying its own admission facts can also add `has-capacity` and `has-room` to the profiles.
+Over the standalone registration RPC, the pairing descriptor accepts only a bootstrap port, and the runtime comes from `spec.runtime`. A worker registered this way, or found by the controller's own discovery, pairs by what its labels report, as a gateway reads them: its transfer backend or `kv_connector`, its version, its KV layout facts and its operator's `pairing_protocol`. The controller's discovery writes a found worker's pairing protocol and KV connector among the row's labels. Use `lenient` or `off` for workers whose labels report no transport. A host supplying its own admission facts can also add `has-capacity` and `has-room` to the profiles.
 
 ### Encode with a pair
 
