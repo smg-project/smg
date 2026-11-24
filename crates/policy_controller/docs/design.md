@@ -1398,6 +1398,10 @@ Upkeep, about once a second (`sweep`): expired session keys are removed, and the
 prefixes gets a bounded step of clean-up. A record leaves the engine's map once no list's table
 holds it and it holds no worker's place.
 
+Under the follow of a host's registry a record no table holds leaves with its places too, once no
+worker that stands states its model as its own: the follow asks the registry behind its own step
+of the upkeep, and a record a table took during the ask stays.
+
 ## 7. The ten built-in policies **[built]**
 
 Each classic policy name has a preset in the crate. Every preset starts with the filters
