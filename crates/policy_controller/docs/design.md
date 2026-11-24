@@ -1696,6 +1696,7 @@ pub struct PlaceRequest<'a> {
     pub prompt: Prompt<'a>,           // token ids or text, and the seeds of its cache partition
     pub headers: &'a dyn HeaderRead,  // the engine reads the headers the document names
     pub request_id: Option<&'a str>,
+    pub explain_id: Option<&'a str>,  // its host's name for it: what a kept decision is found by where it states no id
     pub tenant: Option<&'a str>,
     pub priority: i32,
     pub streaming: bool,

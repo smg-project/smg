@@ -1139,7 +1139,7 @@ impl Loaded<'_, '_> {
                 if let Some(said) = said {
                     let decided = with_shadow::issued(self, decision, &request, now, said);
                     *whole = Some((decided, later));
-                    sample::whole(self, &request, now, whole.as_ref(), Some(said));
+                    sample::whole(self, maker, &request, now, whole.as_ref(), Some(said));
                     return Ok(None);
                 }
                 decision
@@ -1166,7 +1166,7 @@ impl Loaded<'_, '_> {
                     counted,
                 );
                 *whole = Some((decided, later));
-                sample::whole(self, &request, now, whole.as_ref(), None);
+                sample::whole(self, maker, &request, now, whole.as_ref(), None);
                 return Ok(None);
             }
             // A request that hands no list of its own is decided over
@@ -1179,7 +1179,7 @@ impl Loaded<'_, '_> {
         };
         let decided = single::issued(self, decided, &request, now);
         *whole = Some((decided, later));
-        sample::whole(self, &request, now, whole.as_ref(), None);
+        sample::whole(self, maker, &request, now, whole.as_ref(), None);
         Ok(None)
     }
 }
