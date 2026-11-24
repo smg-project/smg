@@ -317,6 +317,7 @@ fn the_lent_lists_and_the_holders_columns_place_an_item_of_one_fleet() {
             decode_held: &[],
         },
         encoders: lent(Role::Encode),
+        encoders_places: None,
         encoders_stalled: &[],
         encoders_held: &[],
         facts: columns.facts(),

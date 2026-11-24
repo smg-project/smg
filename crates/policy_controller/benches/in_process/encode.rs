@@ -17,6 +17,10 @@
 //! encode request. The line also says a request's items and the list's
 //! encoders (`items=`, `encoders=`).
 //!
+//! A cell named `encode_held_...` holds its request to places of each of
+//! the three lists: every worker of the list, as a gateway states the
+//! workers on a request's wire. The decision is then one among places.
+//!
 //! Every worker of the three lists has a load report, and a prefill states
 //! its rate as its measured input rate too, as in a pair's cell. Under a
 //! document that declares the bench's signal each decode's report states a
@@ -55,6 +59,10 @@ use super::{
 
 /// The images one request carries, each an item of its own.
 const ITEMS: usize = 4;
+
+// An item's number stands in the four bits a turn's seed leaves free, in
+// the items' keys.
+const _: () = assert!(ITEMS <= 16, "an item's number stands in four bits");
 
 /// The encoders of the run's list, for the result line.
 static ENCODERS: AtomicUsize = AtomicUsize::new(0);
@@ -113,6 +121,9 @@ struct Sides {
     facts: Vec<EncoderFacts>,
     /// The encode class each prefill names: the one.
     prefill_classes: Vec<u32>,
+    /// The places the host holds a request to, where the cell states them:
+    /// the prefills', the decodes' and the encoders', every worker of each.
+    places: Option<[Vec<u32>; 3]>,
 }
 
 /// One turn's encode request as its host states it: the request of
@@ -164,13 +175,14 @@ thread_local! {
 impl Sides {
     /// The three lists as the host hands them for one request.
     fn lists<'a>(&'a self, host: &'a Host) -> EncodeLists<'a> {
+        let places = |list: usize| Some(self.places.as_ref()?[list].as_slice());
         let pair = PairLists {
             prefill: host.list.lent(),
             decode: self.decodes.lent(),
             classes: &self.classes,
             admission: &Open,
-            prefill_places: None,
-            decode_places: None,
+            prefill_places: places(0),
+            decode_places: places(1),
             prefill_stalled: &[],
             prefill_held: &[],
             decode_stalled: &[],
@@ -183,6 +195,7 @@ impl Sides {
         EncodeLists {
             pair,
             encoders,
+            encoders_places: places(2),
             encoders_stalled: &[],
             encoders_held: &[],
             facts: &self.facts,
@@ -264,8 +277,8 @@ impl Sides {
 }
 
 /// Both sides' dispatch and end, as a host says them of an encode request's
-/// placement, in a function of its own as the engine's entry has one for
-/// its guard. Nothing is said of an encoder.
+/// placement. Out of line, so a count by function reads it apart. Nothing
+/// is said of an encoder.
 #[inline(never)]
 fn said(placement: &mut Placement<'_>) {
     let (prefill, decode) = (placement.id(), placement.decode_id());
@@ -325,6 +338,10 @@ pub(super) fn runs(run: &Run) -> bool {
         sees: vec![sees; encoders.len()],
         facts: vec![class; encoders.len()],
         prefill_classes: vec![class.class; prefills.len()],
+        places: name.starts_with("encode_held_").then(|| {
+            [prefills.len(), decodes.len(), encoders.len()]
+                .map(|workers| (0..workers as u32).collect())
+        }),
     };
     let mut receiver = None;
     let feed = TestFeed::attached_to(|loads| receiver = loads);

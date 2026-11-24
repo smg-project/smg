@@ -868,13 +868,21 @@ the request states, and a request with items is refused under `wires` where the 
 encoders and none serves one. The pair's two lists are refused as a pair's are.
 The other inputs are honoured by the old engine only.
 A request that states places of its list (`Constraints::places`) is refused too, and the refusal
-names `places`, where the request is a pair: one list of places cannot hold a pair's two lists
-(5.8). A single request that states places is decided among them.
+names `places`, where the request is a pair or an encode request: one list of places cannot hold
+a pair's two lists, or an encode request's three. A single request that states places is decided
+among them.
 
 A pair's host states each list's places beside its two lists (`PairLists::prefill_places`,
-`PairLists::decode_places`), and each side is decided among its own. `EncodeLists::decide` refuses
-lists whose pair states places, under the same name: the encode pass decides its pair over the
-workers it admits for the items and reads no place.
+`PairLists::decode_places`), and each side is decided among its own. An encode request's host
+states its encoders' places as well (`EncodeLists::encoders_places`). The encode pass decides its
+pair over the workers it admits for the items, and numbers each side's places with them as it
+numbers a mask: a place whose worker it left out opens none. An item's encoder is one at the
+encoders' places, and a prefill that only other encoders hand to is not the pair's. Where a list's
+places name workers and none of them takes the request, though a worker outside them does, the
+request is shed under `places`: it is held off every worker that takes it. No gap of the membership
+says that, and the gaps stay read over every worker. Places that name no worker of a list are no
+such case. Such places of a side shed the request as they shed its pair alone, and such places of
+the encoders shed it as a list with no open encoder does.
 A pair's host states its standing vetoes the same way, the places each list's vetoes mask and those
 a hold stands on (`PairLists::prefill_stalled`, `prefill_held`, `decode_stalled`, `decode_held`).
 Each side reads its own, under an encode request too, and a pair's or an encode request's own mask
@@ -1048,8 +1056,8 @@ The types the two engines shared stay where they were moved ahead of the deletio
 ### 5.8 What changes in the kept engine **[planned]**
 
 - It honours what it refuses today: an encode request's pair held to some workers of its two
-  lists (`PairLists::decide` keeps a pair to the positions its host states, and a single
-  request states the positions of its list in `Constraints::places` and is decided, which is
+  lists, and its encoders held to some of theirs (`EncodeLists::decide` decides the request
+  among the places its host states for each of the three lists, section 5.4, which is
   built); an encode request's demands (a single request's and a pair's are kept, which is built).
 - The request fields that only the old engine's host fills leave with it. `pinned_at`,
   `lent_in_flight` and `model_fingerprint` have yet to go.

@@ -97,9 +97,9 @@ thread_local! {
 
 /// The stage a pair whose request states places is declined under
 /// ([`Constraints::places`](crate::engine::view::Constraints::places)):
-/// one set of places cannot hold a pair's two lists. An encode request's
-/// lists whose pair is held to places are declined under it too.
-pub(super) const PLACES: &str = "places";
+/// one set of places cannot hold a pair's two lists. An encode request
+/// that states places of its own is declined under it too.
+pub(super) use crate::engine::decision::PLACES;
 
 /// The crate's word, in a shed's `emptied_by`, for a pool no stage emptied.
 const NO_STAGE: &str = "none";
@@ -2699,6 +2699,7 @@ pub(crate) mod tests {
         let encode = EncodeLists {
             pair,
             encoders: encoders.lent(),
+            encoders_places: None,
             encoders_stalled: &[],
             encoders_held: &[],
             facts: &[EncoderFacts {

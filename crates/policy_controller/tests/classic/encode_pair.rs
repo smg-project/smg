@@ -502,6 +502,7 @@ fn decided(row: &Row, classes: &EncodeClasses, offers: &[EncodeOffer]) -> Vec<St
             decode_held: &[],
         },
         encoders: fleet.lent(2),
+        encoders_places: None,
         encoders_stalled: &[],
         encoders_held: &[],
         facts: &of_encoders,

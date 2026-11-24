@@ -1096,6 +1096,7 @@ fn a_handle_of_an_encode_pair_holds_the_pairs_two_sides() {
     let lists = WorkerLists::Encode(EncodeLists {
         pair: host.lists(),
         encoders: encoders.lent(),
+        encoders_places: None,
         encoders_stalled: &[],
         encoders_held: &[],
         facts: &facts,
