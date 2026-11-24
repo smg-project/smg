@@ -68,6 +68,12 @@ pub(in crate::engine) struct InForce {
     /// and its plain requests are answered a place
     /// ([`Decided::Alone`](crate::engine::Decided::Alone)).
     pub(super) hears: EventSet,
+    /// The kinds the document takes of a pick its session table has no
+    /// word for: [`Self::hears`] without the table's own, read once, here.
+    /// Under a sessions rule over stages that take no word on a lease,
+    /// such a pick costs its request no lease either
+    /// ([`super::single::issued`]).
+    pub(super) hears_beside_table: EventSet,
     /// Whether a place one pick decided is not the whole of what the
     /// document asks of its request: a stage takes a word on a lease
     /// ([`Self::hears`]), or the document keeps a sample of its decisions
@@ -122,6 +128,7 @@ impl InForce {
     pub(super) fn of(spec: AppliedSpec) -> Self {
         let samples = spec.engine().explain_sample() != 0;
         let hears = spec.engine().hears();
+        let hears_beside_table = spec.engine().hears_beside_table();
         let needs = spec.needs();
         let any_shadow = spec.engine().seat_flags() & SHADOWS != 0;
         let engine = spec.engine();
@@ -130,6 +137,7 @@ impl InForce {
             older: engine.kept_since().into_iter().map(kept).collect(),
             table: engine.hearing(|_| false),
             hears,
+            hears_beside_table,
             leases_or_samples: hears.intersects(EventSet::LEASE) || samples,
             labels: labels::of(&spec),
             signals: needs.signal_cells,

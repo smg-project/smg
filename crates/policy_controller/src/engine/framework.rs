@@ -3674,6 +3674,9 @@ pub struct Engine {
     /// the build, with the engine's own. A word of a request is told to
     /// every profile's stages, so the answer is the document's.
     hears: EventSet,
+    /// The stages' answers alone, as [`Self::hears`] folds them, without
+    /// the engine's own ([`Self::hears_beside_table`]).
+    stages_hear: EventSet,
 }
 
 /// A stage that keeps a number of the reports, by its place in the engine.
@@ -5081,13 +5084,14 @@ impl Engine {
         } else {
             EventSet::NONE
         };
-        let hears = profiles.iter().fold(own, |hears, profile| {
+        let stages_hear = profiles.iter().fold(EventSet::NONE, |hears, profile| {
             let stages = profile
                 .scorers
                 .iter()
                 .map(|weighted| weighted.scorer.hears());
             stages.fold(hears.union(profile.picker.hears()), EventSet::union)
         });
+        let hears = stages_hear.union(own);
         let shadows = bindings
             .iter()
             .any(|binding| binding.shadow.is_some() || binding.decode_shadow.is_some());
@@ -5212,6 +5216,7 @@ impl Engine {
             #[cfg(feature = "in-process")]
             stage_table: None,
             hears,
+            stages_hear,
         }
     }
 
@@ -5561,6 +5566,29 @@ impl Engine {
     )]
     pub(crate) fn seat_flags(&self) -> u8 {
         self.seat_flags
+    }
+
+    /// The words the document takes of a pick its session table has no
+    /// word for ([`SessionVerdict::None`]: [`Self::dispatched_table`]
+    /// passes it by): a stage's, and a count of sends at a dispatch.
+    #[cfg_attr(
+        not(feature = "in-process"),
+        expect(
+            dead_code,
+            reason = "the one reader is the engine over worker lists, built under `in-process`"
+        )
+    )]
+    pub(crate) fn hears_beside_table(&self) -> EventSet {
+        self.with_sends(self.stages_hear)
+    }
+
+    /// `hears` with the dispatch a count of sends takes.
+    fn with_sends(&self, hears: EventSet) -> EventSet {
+        if self.sent_credits.is_empty() {
+            hears
+        } else {
+            hears.with(EventKind::Dispatched)
+        }
     }
 
     pub(crate) fn set_explain_sample(&mut self, sample: u32) {
@@ -8852,11 +8880,7 @@ impl Lifecycle for Engine {
     /// dispatched prefixes at an issue, and a count of sends at a
     /// dispatch. Folded at the build: one read here.
     fn hears(&self) -> EventSet {
-        if self.sent_credits.is_empty() {
-            self.hears
-        } else {
-            self.hears.with(EventKind::Dispatched)
-        }
+        self.with_sends(self.hears)
     }
 }
 

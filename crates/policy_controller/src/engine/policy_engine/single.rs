@@ -585,7 +585,12 @@ fn shed(
 /// too, and no stage hears its issue ([`lease_events::stages_hear`]).
 ///
 /// Under a document that takes no word a pick has no lease: no id is
-/// taken, and its guard owes the engine nothing.
+/// taken, and its guard owes the engine nothing. Nor has a pick the
+/// session table has no word for ([`SessionVerdict::None`]: a request
+/// with no key or under a binding that states no rule, and any other pick
+/// the table is told nothing of) under a document whose session table
+/// alone takes one: the table passes such a dispatch by. A stage or a
+/// count of sends that takes a word keeps every pick's lease.
 pub(super) fn issued(
     own: Loaded<'_, '_>,
     decision: Decision,
@@ -594,8 +599,13 @@ pub(super) fn issued(
 ) -> DecideOutcome {
     let facts = &request.facts;
     let document = own.document;
-    let leased = document.hears.intersects(EventSet::LEASE);
-    let noted = decision.pick().filter(|_| leased);
+    let noted = decision.pick().filter(|pick| {
+        let hears = match pick.session_verdict {
+            SessionVerdict::None => document.hears_beside_table,
+            _ => document.hears,
+        };
+        hears.intersects(EventSet::LEASE)
+    });
     let lease = noted.and_then(|pick| {
         let first = pick.targets.first()?;
         Some(Lease {
@@ -3174,7 +3184,9 @@ pub(crate) mod tests {
     /// profile's picker leaves the placement to the binding: the binding's
     /// placing assignment places such a request, under a rule and under
     /// none, and its pick keeps the stages' word. The rule's word is for
-    /// its key alone, which the same assignment places.
+    /// its key alone, which the same assignment places. So is the lease:
+    /// the preset's stages take no word of one, the session table follows
+    /// a key's dispatch alone, and a request with no key is issued none.
     #[test]
     fn a_request_with_no_key_is_never_its_sessions_rules() {
         for ruled in [true, false] {
@@ -3195,8 +3207,14 @@ pub(crate) mod tests {
                 asked.facts.session_key = Identity::hashed(key);
                 let asks = Asks::of(asked, Some(&members));
                 let now = Instant::now();
-                let guard = DecisionGuard::decide_under(&engine, GatewayId::LOCAL, &asks, now)
+                let mut guard = DecisionGuard::decide_under(&engine, GatewayId::LOCAL, &asks, now)
                     .expect("a decision");
+                // A guard that holds no lease hands no target by `take`:
+                // its host reads the decision, as under a document that
+                // takes no word.
+                let leased = ruled && key != 0;
+                assert_eq!(guard.lease().is_some(), leased, "key {key}");
+                assert_eq!(guard.take(0).is_some(), leased, "key {key}");
                 guard.decision().pick().expect("a pick").placed_by()
             };
             assert_eq!(placed_by(0), PlacedBy::Stages, "no key, ruled: {ruled}");
