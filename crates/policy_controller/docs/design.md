@@ -1783,7 +1783,8 @@ call is served, and this design names no use for them.
 
 What leaves the crate with that switch: the store's copies of the worker data that a worker
 object holds, and the adapters that write worker state into the
-store. The crate's own load poller has left. Some facts of a worker are not carried to its worker object today, and some stand there in
+store. The crate's own load poller has left.
+Some facts of a worker are not carried to its worker object today, and some stand there in
 a narrower form than a registration states: 10.3 names them and where they are kept.
 
 **The first step, on main.** A single request's decision reads the model's single workers in the
