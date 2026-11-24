@@ -72,7 +72,7 @@ use std::{
     time::Instant,
 };
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use smg_worker::{
     identity::basic::Worker,
     registry::{
@@ -211,6 +211,27 @@ impl fmt::Debug for Handed {
     }
 }
 
+/// The model ids of `held` that `worker` answers to no more, in the order
+/// of `held`. One read of its cards strikes each held id a card answers
+/// to, by its id or by an alias, and an id no card answers is lost. A
+/// worker that lists no card is asked for each id
+/// ([`Worker::supports_model`]): one that answers to every name keeps them
+/// all, and one built with an empty list keeps none.
+fn lost_models(held: &[String], worker: &dyn Worker) -> Vec<String> {
+    let mut left: FxHashSet<&str> = held.iter().map(String::as_str).collect();
+    let mut cards = false;
+    worker.any_model(&mut |card| {
+        cards = true;
+        left.remove(card.id.as_str());
+        for alias in &card.aliases {
+            left.remove(alias.as_str());
+        }
+        left.is_empty()
+    });
+    let kept = |model: &str| !left.contains(model) || (!cards && worker.supports_model(model));
+    held.iter().filter(|model| !kept(model)).cloned().collect()
+}
+
 /// What the follow told of one worker: the id it told the worker as joined
 /// under, the worker's object, and the state the object keeps
 /// ([`Worker::runtime_state`]). The pointers are weak ones: each names
@@ -222,8 +243,9 @@ struct Held {
     state: Option<Weak<WorkerRuntime>>,
     /// The model ids the object named where the follow took it, none
     /// where its code panicked at the ask: a whole read that finds another
-    /// object of this life asks that one for each. A model the object's
-    /// cards gained in place since is not among them, and is not asked.
+    /// object of this life judges that one by them ([`lost_models`]). A
+    /// model the object's cards gained in place since is not among them,
+    /// and is not asked.
     models: Option<Vec<String>>,
     /// What a telling of load reports reads of the worker: none where the
     /// document has no stage that keeps them, and nothing is read for it.
@@ -647,12 +669,7 @@ impl PolicyEngine {
                     // code is read as a model lost that no word can name:
                     // the records forget the worker and the stages hear
                     // nothing.
-                    let left = |model: &String| !new.supports_model(model);
-                    let lost = || {
-                        let mut models = worker_model_ids(&old);
-                        models.retain(left);
-                        models
-                    };
+                    let lost = || lost_models(&worker_model_ids(&old), new.as_ref());
                     if was == Some(id) {
                         let lost = self.held(lost);
                         if lost.as_ref().is_none_or(|lost| !lost.is_empty()) {
@@ -806,9 +823,9 @@ impl PolicyEngine {
             // replacement: the read found it ahead of the word, or the word
             // was dropped. It is asked for the models the worker was held
             // with, as the word's arm asks: a panic is read as a model lost.
-            let left = |model: &String| !worker.supports_model(model);
             let lost = |was: &Held| {
-                let asked = || was.models.as_ref().is_none_or(|ids| ids.iter().any(left));
+                let held = was.models.as_ref();
+                let asked = || held.is_none_or(|ids| !lost_models(ids, worker.as_ref()).is_empty());
                 let found = was.id == id && !was.holds(&worker) && was.is(&worker);
                 found && self.held(asked).unwrap_or(true)
             };
