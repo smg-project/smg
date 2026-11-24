@@ -15,7 +15,8 @@
 //!   cache and publish `AllBlocksCleared` (an engine restart, to the index).
 //! - `POST /admin/fault/{worker}/drop?batches=N`, `.../duplicate?batches=N`,
 //!   `.../swap?pairs=N`, `.../cut-streams`, `.../delay?ms=D`,
-//!   `.../load-lag?ms=D`, `.../restart-publisher`, `.../pause`, `.../resume`,
+//!   `.../load-lag?ms=D`, `.../load-freeze?on=B`, `.../restart-publisher`,
+//!   `.../pause`, `.../resume`,
 //!   `.../fail?status=S[&count=N|&secs=T][&after_tokens=K][&stall_ms=M]` and
 //!   `GET /admin/fault/{worker}`: the fault hooks (see the README).
 //! - `POST /admin/fault/{worker}/load-fail?status=S`: the worker's load
@@ -94,6 +95,7 @@ fn router(state: Arc<AdminState>) -> Router {
         .route("/admin/fault/{worker}/admit-rate", post(fault_admit_rate))
         .route("/admin/fault/{worker}/cold-shape", post(fault_cold_shape))
         .route("/admin/fault/{worker}/load-lag", post(fault_load_lag))
+        .route("/admin/fault/{worker}/load-freeze", post(fault_load_freeze))
         .route(
             "/admin/fault/{worker}/restart-publisher",
             post(fault_restart_publisher),
@@ -301,6 +303,7 @@ fn status_json(e: &Engine) -> Value {
         "admit_per_sec": s.admit_per_sec,
         "cold_shape_ms": s.cold_shape_ms,
         "load_lag_ms": s.load_lag_ms,
+        "load_frozen": s.load_frozen,
         "paused": s.paused,
         "generation": s.generation,
         "restarts": s.restarts,
@@ -678,6 +681,19 @@ async fn fault_load_lag(
         Err(response) => return response,
     };
     apply(&worker, |e| e.fault_load_lag_ms(ms))
+}
+
+/// The worker's load reports stand as they read now (`on=true`), or follow
+/// its engine again (`on=false`).
+async fn fault_load_freeze(
+    Path(worker): Path<String>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let on: bool = match param(&q, "on") {
+        Ok(v) => v,
+        Err(response) => return response,
+    };
+    apply(&worker, |e| e.fault_load_freeze(on))
 }
 
 async fn fault_admit_rate(
