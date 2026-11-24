@@ -461,6 +461,7 @@ fn a_pairs_lease_lends_nothing_as_a_singles() {
         target: WorkerId(8),
         picked: PickRecord::default(),
         session: Session::NONE,
+        session_verdict: SessionVerdict::None,
         state: LeaseState::ISSUED,
         tokens: TOKENS,
         target_index: 0,

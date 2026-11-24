@@ -561,11 +561,10 @@ pub(crate) fn issue(
 /// until a decode call issues it ([`issue_decode`]) or a dispatch names it.
 /// Its answer carries the prefill side's lease alone.
 ///
-/// No shadow runs on a pair's side yet, so none is counted here. The
-/// decode side's lease states the prefill side's session verdict: the
-/// store's decode side keeps none of its own yet. So a document that
-/// binds a sessions rule under the pair plan is refused at its apply, as
-/// not in this build.
+/// No shadow runs on a pair's side yet, so none is counted here. Each
+/// side's lease states its own session verdict: the prefill's the pick's,
+/// and the decode's the one the pick's first target states of its decode,
+/// which the store keeps with the side.
 ///
 /// # Errors
 ///
@@ -603,6 +602,7 @@ pub(crate) fn issue_pair(
         target: chosen.decode_id,
         picked: PickRecord::of_decodes(&pick.targets),
         session: decode_session,
+        session_verdict: chosen.decode_verdict.on(chosen.decode_id),
         state: if later {
             LeaseState::Chosen
         } else {
@@ -766,8 +766,9 @@ pub(crate) fn decide_decode(
 /// Files a decode call's pick under `lease`, the pair's own lease, and
 /// tells the engine, under one hold of the file: the decode side on the
 /// pick's first decode, under the request's session of the decode phase,
-/// booking that decode's count. The side's lease comes with its issue's
-/// count, for an answer that does not leave
+/// booking that decode's count. The side keeps the call's own session
+/// verdict, in place of the one its first decision stated. The side's
+/// lease comes with its issue's count, for an answer that does not leave
 /// ([`MemoryStore::unissue_decode`]). `None` for a shed, which files none.
 ///
 /// The engine told is the one of the lease's own generation ([`issuing`]):
@@ -804,6 +805,7 @@ pub(crate) fn issue_decode(
         target: chosen.decode_id,
         picked: PickRecord::of_decodes(&pick.targets),
         session,
+        session_verdict: chosen.decode_verdict.on(chosen.decode_id),
         state: LeaseState::ISSUED,
         tokens,
         target_index: 0,
