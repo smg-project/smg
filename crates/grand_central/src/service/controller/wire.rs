@@ -563,8 +563,7 @@ impl Checked {
             // The wire carries the name: each read of the request's
             // session fingerprints it.
             model_fingerprint: ModelFingerprint::NONE,
-            // What the leases book stands beside rows a view lent: no
-            // frame carries it.
+            // The request's maker sets it: no frame carries it.
             session_counted: false,
             // The frame carries no signal cells: they stand beside the
             // candidates of the program that decides.

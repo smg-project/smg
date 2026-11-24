@@ -45,7 +45,7 @@ use crate::{
     },
     policies::standard_filters,
     stages::{lifecycle::Lifecycle, scorers::ReadsLoad},
-    tracking::{in_flight::with_counts, lease::Membership},
+    tracking::lease::Membership,
     Draw,
 };
 
@@ -390,28 +390,26 @@ impl Pass<'_> {
     ) -> Option<usize> {
         let mut pick: Option<(usize, u32)> = None;
         let mut tied = 0usize;
-        with_counts!(self.facts, |counts| {
-            for (slot, &i) in self.kept.iter().enumerate() {
-                let c = &self.candidates[i as usize];
-                let held = counts(c);
-                if !wanted(i, c, held) {
-                    continue;
+        for (slot, &i) in self.kept.iter().enumerate() {
+            let c = &self.candidates[i as usize];
+            let held = self.facts.in_flight(c);
+            if !wanted(i, c, held) {
+                continue;
+            }
+            match pick {
+                Some((_, load)) if held > load => {}
+                Some((_, load)) if held == load => {
+                    tied += 1;
+                    if self.draw.below(tied + 1) == 0 {
+                        pick = Some((slot, load));
+                    }
                 }
-                match pick {
-                    Some((_, load)) if held > load => {}
-                    Some((_, load)) if held == load => {
-                        tied += 1;
-                        if self.draw.below(tied + 1) == 0 {
-                            pick = Some((slot, load));
-                        }
-                    }
-                    _ => {
-                        pick = Some((slot, held));
-                        tied = 0;
-                    }
+                _ => {
+                    pick = Some((slot, held));
+                    tied = 0;
                 }
             }
-        });
+        }
         pick.map(|(slot, _)| slot)
     }
 }
@@ -553,26 +551,24 @@ impl PrefixAffinity {
         };
         let mut entry = reads();
         let mut ceilings = 0u32;
-        with_counts!(facts, |counts| {
-            for (o, &i) in out.iter_mut().zip(kept) {
-                let c = &candidates[i as usize];
-                let load = counts(c) as f32;
-                // A match above zero was read from a feed that holds entries.
-                *o = if best > 0
-                    && self.matched(entry(i), whole) == best
-                    && !self.gates.over(load, avg, held)
-                {
-                    // Counted where it is written: a row under the ceiling
-                    // adds nothing to the pass.
-                    ceilings += 1;
-                    1.0
-                } else if !self.gates.over(load, avg, 0.0) {
-                    0.5
-                } else {
-                    0.0
-                };
-            }
-        });
+        for (o, &i) in out.iter_mut().zip(kept) {
+            let c = &candidates[i as usize];
+            let load = facts.in_flight(c) as f32;
+            // A match above zero was read from a feed that holds entries.
+            *o = if best > 0
+                && self.matched(entry(i), whole) == best
+                && !self.gates.over(load, avg, held)
+            {
+                // Counted where it is written: a row under the ceiling
+                // adds nothing to the pass.
+                ceilings += 1;
+                1.0
+            } else if !self.gates.over(load, avg, 0.0) {
+                0.5
+            } else {
+                0.0
+            };
+        }
         (TieBand(0.0), ceilings)
     }
 
@@ -612,15 +608,13 @@ impl PrefixAffinity {
             0.0
         };
         let (holder, anyone) = (self.gates.spill(avg, held), self.gates.spill(avg, 0.0));
-        with_counts!(facts, |counts| {
-            for (o, &i) in out.iter_mut().zip(kept) {
-                let load = counts(&candidates[i as usize]) as f32;
-                // A match above zero was read into this slot.
-                let deepest = (best > 0) & (o.to_bits() == best);
-                let own = usize::from(deepest & !holder.over(load));
-                *o = [0.0, 0.5, 1.0, 1.0][own << 1 | usize::from(!anyone.over(load))];
-            }
-        });
+        for (o, &i) in out.iter_mut().zip(kept) {
+            let load = facts.in_flight(&candidates[i as usize]) as f32;
+            // A match above zero was read into this slot.
+            let deepest = (best > 0) & (o.to_bits() == best);
+            let own = usize::from(deepest & !holder.over(load));
+            *o = [0.0, 0.5, 1.0, 1.0][own << 1 | usize::from(!anyone.over(load))];
+        }
         TieBand(0.0)
     }
 
