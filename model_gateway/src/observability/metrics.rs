@@ -17,7 +17,7 @@ pub use smg_external_router::metrics::{
     bool_to_static_str, error_reason_from_status, intern_model_label, intern_tool_label,
     metrics_labels, STREAMING_FALSE, STREAMING_TRUE,
 };
-use smg_policy_controller::engine::{PolicyEngine, ShadowKind, ShadowSide};
+use smg_policy_controller::engine::{DecisionEngine, PolicyEngine, ShadowKind, ShadowSide};
 use smg_worker::metrics::{
     series as worker_series,
     series::{WorkerSeries, WorkerSeriesRecorder},
@@ -889,6 +889,13 @@ pub(crate) fn init_metrics() {
          the shadow is asked beside (single, prefill, decode, decode-again) and by kind \
          (agreed, other-target, other-outcome, skipped); a shadow that panicked is not counted"
     );
+    describe_counter!(
+        "smg_policy_faults_total",
+        "Panics the policy engine held and counted, by kind: decision (a decision that \
+         panicked, a shadow's beside a live decision among them), event (a stage at a lease \
+         event or a change of membership), upkeep (a step of the engine's upkeep: its sweep, \
+         the registry's follow, a load report, a fill of worker lists)"
+    );
     describe_histogram!(
         "smg_cache_aware_match_ratio",
         "The predicted overlap of a cache-aware routing decision as a ratio (0..1), one observation per decision: in tree mode the best prefix match in the tree (matched/input units, whatever branch the decision took); in event mode the chosen worker's overlap in blocks over the request's blocks (0 where the chosen worker holds none: a miss, a spill, a warm-up placement). \
@@ -1172,6 +1179,23 @@ pub(super) fn record_policy_shadow_activity(engine: &PolicyEngine, published: &S
             "kind" => count.kind.as_str()
         )
         .increment(grew);
+    }
+}
+
+/// Publish the panics `engine` held and counted, read at the scrape and on
+/// no request's path: a decision's, a stage's at a lease event or a change
+/// of membership, and a step's of the engine's upkeep, each kind as a zero
+/// series from the first scrape. The three counts are the engine's own for
+/// its whole life, under every policy document, and nothing sets one back:
+/// each series is set to its count as read, with no record of the scrapes
+/// before, and of two scrapes at once the larger read stands.
+pub(super) fn record_policy_fault_activity(engine: &PolicyEngine) {
+    for (kind, held) in [
+        ("decision", engine.faults()),
+        ("event", engine.unheard()),
+        ("upkeep", engine.upkeep_faults()),
+    ] {
+        counter!("smg_policy_faults_total", "kind" => kind).absolute(held);
     }
 }
 
@@ -2619,6 +2643,19 @@ pub(crate) mod test_support {
                 line.starts_with("smg_policy_shadow_decisions_total{")
                     && labels.iter().all(|label| line.contains(label))
             };
+            let line = rendered.lines().find(of_kind)?;
+            line.rsplit(' ').next()?.parse().ok()
+        })
+    }
+
+    /// The series of the panics the policy engine held and counted in a
+    /// scrape, by kind: decision, event, upkeep. `None` where the scrape
+    /// holds no such series.
+    pub(crate) fn fault_kinds(rendered: &str) -> [Option<u64>; 3] {
+        ["decision", "event", "upkeep"].map(|kind| {
+            let label = format!(r#"kind="{kind}""#);
+            let of_kind =
+                |line: &&str| line.starts_with("smg_policy_faults_total{") && line.contains(&label);
             let line = rendered.lines().find(of_kind)?;
             line.rsplit(' ').next()?.parse().ok()
         })
