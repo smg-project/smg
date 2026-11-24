@@ -1857,12 +1857,12 @@ impl MemoryStore {
     /// call: a caller of the store's own registration, patch or removal
     /// takes no turn of the holder.
     ///
-    /// A status is the table's word until a worker object's leads. The
-    /// holder read `row`'s off an object, which trails the table by the
-    /// status writes it has not followed. So a row changed in place keeps
-    /// the status the table holds, and a key's next life is handed the
-    /// table's by the rule every writer decides by
-    /// ([`WorkerRow::hands_on`]). The holder copies it onto the object.
+    /// A worker object's status leads its row's. The holder read `row`'s
+    /// off the object, and the rule every writer decides by handed it on
+    /// to a key's next life ([`WorkerRow::hands_on`]): the store takes
+    /// that. A row changed in place keeps the status the table holds: a
+    /// status moves by its own event alone, and the holder tells the
+    /// object's behind the write ([`Self::status_told`]).
     ///
     /// Whether the store took the change. One it does not take writes
     /// nothing: another writer moved the row under the holder's turn, or
@@ -1882,19 +1882,61 @@ impl MemoryStore {
             MembershipChange::Relabelled { id }
             | MembershipChange::Resized { id }
             | MembershipChange::Removed { id } => table(id),
-            // No holder decides a status: it is the table's own write.
+            // A status is told by its own entry.
             MembershipChange::StatusChanged { .. } => return false,
         };
         if over.map(|over| over.revision) != seen {
             return false;
         }
         if let (Some(row), Some(over)) = (&mut row, over) {
-            row.status = match change {
-                MembershipChange::Replaced { .. } => over.hands_on(&row.facts),
-                _ => over.status,
-            };
+            if !matches!(change, MembershipChange::Replaced { .. }) {
+                row.status = over.status;
+            }
         }
         self.decided(workers, Instant::now(), change, row)
+    }
+
+    /// The status this replica's worker object states for the row `id`,
+    /// told by the holder of the objects: a leader's side of a told status
+    /// ([`Self::follow`]). The object's status leads. Its holder tells each
+    /// move here: a probe's verdict, a connect signal and a drain. The
+    /// store steps its own epoch and journals the write as its own.
+    ///
+    /// `revision` is the row's revision the object was built from. The
+    /// table's row must stand at it still, under this hold of the
+    /// membership lock: a stale status is dropped, never written onto a
+    /// successor.
+    ///
+    /// `leads` is the writer's last word. The store asks it behind the
+    /// lock the write waits for. Where it says no, the status is stale: a
+    /// term that ended while the write waited there moves no status and
+    /// tells the journal nothing. It is asked under the store's lock and
+    /// takes none of the store's: a lock it takes is never held by its
+    /// writer across a write of the store. A writer with no term to end
+    /// hands a word that always holds.
+    ///
+    /// What the write found: the status moved; it stood, because the row
+    /// holds it already; the row left `revision`; or no row stands.
+    pub(crate) fn status_told(
+        &self,
+        id: WorkerId,
+        status: WorkerStatus,
+        revision: u64,
+        leads: &dyn Fn() -> bool,
+    ) -> HealthWrite {
+        let mut workers = self.writing();
+        let Some(row) = workers.guarded(id, revision) else {
+            return workers.unjudged(id);
+        };
+        if !leads() {
+            return HealthWrite::Stale;
+        }
+        let from = row.row.status;
+        if workers.set_status(id, status).is_none() {
+            return HealthWrite::Stood(from);
+        }
+        self.show_status(id, status);
+        HealthWrite::Moved { from, to: status }
     }
 }
 

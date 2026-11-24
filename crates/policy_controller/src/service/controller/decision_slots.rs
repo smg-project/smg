@@ -1618,7 +1618,7 @@ pub(crate) mod tests {
             WorkerFacts, WorkerStatus, WorkersStore,
         },
         tracking::lease::{Dispatch, Lease, LeaseId, ReleaseReason, Said, Side, DISPATCH_TTL},
-        worker_host::{Members, Objects},
+        worker_host::{stand, Members, Objects},
     };
 
     /// How long a case waits for a decider before it fails.
@@ -2430,17 +2430,20 @@ pub(crate) mod tests {
     }
 
     /// A decision reads a worker's status on its object, and the object's
-    /// follows its record's. A worker whose record is marked draining, and
-    /// one set not ready by hand, are passed by at the next decision, and
-    /// one set ready again is picked again.
+    /// leads its record's. A worker a drain marks on its object, and one
+    /// a verdict sets not ready there, are passed by at the next decision,
+    /// and one set ready again is picked again.
     #[tokio::test]
-    async fn a_worker_whose_record_leaves_ready_is_passed_by_at_the_next_decision() {
+    async fn a_worker_whose_object_leaves_ready_is_passed_by_at_the_next_decision() {
         let mut bed = leading([]);
-        let store = Arc::clone(&bed.store);
+        let (store, objects) = (Arc::clone(&bed.store), Arc::clone(&bed.reads.objects));
         let set = |worker: WorkerId, status: WorkerStatus| {
-            let row = WorkersStore::get(&*store, worker).expect("the row");
-            let moved = store.set_status(worker, status, row.revision);
-            moved.expect("the row stands");
+            if status == WorkerStatus::Draining {
+                let row = WorkersStore::get(&*store, worker).expect("the row");
+                assert!(objects.drain_row(&store, worker, row.revision));
+            } else {
+                stand(&objects, &store, worker, status);
+            }
         };
         let (draining, unready, kept) = (bed.workers[0], bed.workers[1], bed.workers[2]);
         let mut named = BTreeSet::new();
@@ -7139,11 +7142,10 @@ pub(crate) mod tests {
         keys.sum()
     }
 
-    /// Writes `status` into the record of the bed's worker `worker`.
+    /// Stands the bed's worker `worker` in `status`: on its object, as a
+    /// verdict leaves it, and the store is told.
     fn set_status(bed: &Bed, worker: WorkerId, status: WorkerStatus) {
-        let row = WorkersStore::get(&*bed.store, worker).expect("the row");
-        let moved = bed.store.set_status(worker, status, row.revision);
-        moved.expect("the row stands");
+        stand(&bed.reads.objects, &bed.store, worker, status);
     }
 
     /// The service counts a keyed single request for its key under any

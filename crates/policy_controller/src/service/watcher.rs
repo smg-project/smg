@@ -5,8 +5,9 @@
 //! A [`Watcher`] takes a snapshot's rows at its last page
 //! ([`MemoryStore::watch_from`]). The store keeps its leases and session
 //! pins, and the workers still present keep their gateway vetoes.
-//! Each membership and status event after the snapshot lands by the door a
-//! standby's applier uses for a row ([`MemoryStore::follow`]). A
+//! Each membership and status event after the snapshot lands as a
+//! standby's applier lands one: through the holder of the worker objects
+//! (below), by the body of [`MemoryStore::follow`]. A
 //! row holds the controller's id and revision, and the store's epoch is
 //! the controller's. The watcher keeps the place of the last event it
 //! took, and its next stream goes on after it ([`Watcher::open`],
@@ -53,7 +54,7 @@ use crate::{
         controller::worker_wire::{self, Refused},
         proto::{self, worker_event::Event},
     },
-    store::{MemoryStore, Position, StoreCheckpoint, WorkerRow, WorkersStore},
+    store::{MemoryStore, Position, StoreCheckpoint, WorkerRow},
     worker_host::Objects,
 };
 
@@ -174,8 +175,8 @@ impl<G: Generation> Watcher<G> {
     /// and of `objects`, the holder of the host's worker objects over that
     /// store. The watch alone writes the store's rows, and through the
     /// holder: the object of a row stands when its event returns. The
-    /// watch tells each status, so the holder is one whose objects follow
-    /// their rows' status ([`Objects::with_status_followed`]).
+    /// watch tells each status, and the holder lays it on the row's
+    /// object: it needs no option for that.
     /// A snapshot keeps the store's leases and session pins, and gateway
     /// vetoes for workers still present. Use a store with no journal, since
     /// the places in a watch can skip. A journaled store takes a snapshot
@@ -307,12 +308,10 @@ impl<G: Generation> Watcher<G> {
                 if !matches!(event, Event::Needs(_)) {
                     let (epoch, change, row) =
                         worker_wire::told_change(told, now).map_err(unread)?;
-                    let before = WorkersStore::epoch(&*self.store);
-                    self.objects.follow_at(&self.store, at, epoch, change, row);
-                    // A change that does not fit writes nothing and says
-                    // nothing: it landed where the epoch moved to its own.
-                    // One at the epoch the store held already moves none.
-                    if before == epoch || WorkersStore::epoch(&*self.store) != epoch {
+                    // A change that does not fit writes nothing, and one
+                    // at the epoch the store held already moves none: the
+                    // holder says whether the store took it.
+                    if !self.objects.follow_at(&self.store, at, epoch, change, row) {
                         return Err(WatchPositionLost::Apart);
                     }
                 }
@@ -492,10 +491,10 @@ mod tests {
         (epoch, rows)
     }
 
-    /// A watcher of `store` over a holder of its own, whose objects follow
-    /// their rows' status as a gateway's do.
+    /// A watcher of `store` over a holder of its own, which follows no
+    /// status of the store's tail: it lays each status the watch tells.
     fn over(store: Arc<MemoryStore>) -> Watcher<Members> {
-        let objects = Objects::new(Arc::new(WorkerRegistry::new())).with_status_followed();
+        let objects = Objects::new(Arc::new(WorkerRegistry::new()));
         Watcher::new(store, Arc::new(objects))
     }
 
