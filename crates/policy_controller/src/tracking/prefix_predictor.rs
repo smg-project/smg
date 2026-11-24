@@ -72,6 +72,7 @@
 //! in 256 maps by their top byte, so a growth moves one map's entries.
 
 use std::{
+    collections::hash_map::Entry,
     hash::{Hash, Hasher},
     mem, slice,
 };
@@ -423,6 +424,24 @@ impl PrefixPredictor {
     /// write for a worker told gone gives it a place again, and nothing takes
     /// that one back until the worker is told gone once more.
     pub fn record(&mut self, keys: &[u64], worker: WorkerId, tick: u16) {
+        self.record_behind(keys, 0, worker, tick);
+    }
+
+    /// [`Self::record`] for a caller that read, a moment ago, that `worker`
+    /// held the request's first `known` blocks. Where the block at that
+    /// depth still names the worker and no block of the request follows
+    /// it, the write stands there by two lookups. A `known` the record
+    /// does not bear out is not trusted: the write then finds its place as
+    /// [`Self::record`] does. The two leave one record where a key names
+    /// one prefix, as the record takes it; where two prefixes share a key,
+    /// each write stands where its own lookups fall.
+    pub(crate) fn record_behind(
+        &mut self,
+        keys: &[u64],
+        known: usize,
+        worker: WorkerId,
+        tick: u16,
+    ) {
         let blocks = keys.len();
         if blocks == 0 {
             return;
@@ -432,8 +451,22 @@ impl PrefixPredictor {
             return;
         };
         // What anyone was sent of the request, and what the worker was.
-        let (have, end) = self.depth(keys, blocks, Ask::Any);
-        let (held, mut before) = self.depth(keys, have, Ask::Holds(place));
+        let stood = match known.checked_sub(1) {
+            Some(last) if known <= blocks => {
+                self.probe(keys, last, Ask::Holds(place)).filter(|_| {
+                    keys.get(known)
+                        .is_none_or(|&next| self.find(next).is_none())
+                })
+            }
+            _ => None,
+        };
+        let ((have, end), (held, mut before)) = match stood {
+            Some(at) => ((known, at), (known, at)),
+            None => {
+                let (have, end) = self.depth(keys, blocks, Ask::Any);
+                ((have, end), self.depth(keys, have, Ask::Holds(place)))
+            }
+        };
         let need = blocks - held;
         if need == 0 {
             self.end_at(before, tick);
@@ -454,7 +487,10 @@ impl PrefixPredictor {
         let room = need.min(self.bound.saturating_sub(self.placements));
         self.dropped += (need - room) as u64;
         for (at, &key) in keys.iter().enumerate().take(held + room).skip(held) {
-            before = match self.find(key) {
+            // A block past what anyone was sent is not there: the lookup
+            // that puts it in is its only one.
+            let found = if at < have { self.find(key) } else { None };
+            before = match found {
                 Some(block) => {
                     if self.add(block, place) {
                         self.placements += 1;
@@ -462,11 +498,13 @@ impl PrefixPredictor {
                     block
                 }
                 None => {
-                    let Some(block) = self.take(key, before, place, tick) else {
+                    let Some((block, made)) = self.take(key, before, place, tick) else {
                         self.dropped += (held + room - at) as u64;
                         break;
                     };
-                    self.placements += 1;
+                    if made || self.add(block, place) {
+                        self.placements += 1;
+                    }
                     block
                 }
             };
@@ -665,9 +703,15 @@ impl PrefixPredictor {
         true
     }
 
-    /// A new block of one worker behind `before`, made at `tick`; `None`
-    /// past the entries a link can name.
-    fn take(&mut self, key: u64, before: u32, place: u16, tick: u16) -> Option<u32> {
+    /// The block of `key` and whether the call made it: a new block of one
+    /// worker behind `before`, made at `tick`, where the key had none.
+    /// `None` past the entries a link can name. A key that stands takes
+    /// no entry.
+    fn take(&mut self, key: u64, before: u32, place: u16, tick: u16) -> Option<(u32, bool)> {
+        let vacant = match self.maps[map_of(key)].entry(Halves::of(key)) {
+            Entry::Occupied(held) => return Some((*held.get(), false)),
+            Entry::Vacant(vacant) => vacant,
+        };
         let at = if self.free == NONE {
             if self.span == UNLISTED {
                 return None;
@@ -689,9 +733,10 @@ impl PrefixPredictor {
             self.span - 1
         } else {
             let at = self.free;
-            self.free = self.block(at).before;
+            self.free = self.chunks[at as usize / CHUNK][at as usize % CHUNK].before;
             at
         };
+        vacant.insert(at);
         *self.block_mut(at) = Block {
             key,
             before,
@@ -700,7 +745,6 @@ impl PrefixPredictor {
             touched: tick,
             ..Block::BLANK
         };
-        self.maps[map_of(key)].insert(Halves::of(key), at);
         self.blocks += 1;
         if before != NONE {
             let block = self.block_mut(before);
@@ -710,7 +754,7 @@ impl PrefixPredictor {
                 self.unlink(before);
             }
         }
-        Some(at)
+        Some((at, true))
     }
 
     fn link_newest(&mut self, at: u32) {

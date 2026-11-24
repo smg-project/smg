@@ -670,6 +670,9 @@ impl PrefixRecord {
         // no block to add: left undone, it leaves nothing out.
         let adds = end < keys.len();
         loop {
+            // What the target holds as the turn begins: the naming's depth,
+            // then the turns before this one.
+            let behind = end;
             end = (end + Self::SLICE).min(keys.len());
             let Some(mut predictor) = self.predictor.try_write() else {
                 if adds {
@@ -680,7 +683,7 @@ impl PrefixRecord {
             if self.left.load(Ordering::Relaxed) != read.left {
                 return;
             }
-            predictor.record(&keys[..end], target, read.tick);
+            predictor.record_behind(&keys[..end], behind, target, read.tick);
             if end == keys.len() {
                 self.sweep(&mut predictor);
                 return;
