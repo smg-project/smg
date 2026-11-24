@@ -791,7 +791,7 @@ where
             // The body is checked as text once, as a whole: a parse from bytes
             // checks every key and every string on its own.
             let direct = std::str::from_utf8(&bytes).ok().and_then(|text| {
-                crate::message_read::direct::<T, _>(|| serde_json::from_str::<T>(text)).ok()
+                crate::kind_read::direct::<T, _>(|| serde_json::from_str::<T>(text)).ok()
             });
             match direct {
                 Some(data) => Json(data),
