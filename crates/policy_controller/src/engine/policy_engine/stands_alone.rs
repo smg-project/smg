@@ -64,7 +64,7 @@ mod tests {
     use crate::{
         document::spec::{AppliedSpec, PolicySpec, ShadowSpec, PRESETS},
         engine::{
-            decision::{Decision, ShadowKind, ShedReason, Target},
+            decision::{Decision, ShedReason, Target},
             decision_engine::{
                 DecideOutcome, DecisionEngine, DecisionRefused, Request, RequestMaker, WorkerLists,
             },
@@ -462,10 +462,7 @@ mod tests {
         let engine = engine_of(&document);
         let list = pool(4);
         let members = PublishedList::new(Arc::clone(&list));
-        let counted = |binding: u32| -> u64 {
-            let kinds = ShadowKind::ALL.map(|kind| engine.shadowed(binding, kind));
-            kinds.iter().sum()
-        };
+        let counted = |binding: u32| -> u64 { engine.shadow_kinds(binding).iter().sum() };
         let now = Instant::now();
         let ask = |phase: Phase, seed: u64| {
             let asks = Asks::of(stating(phase, seed), Some(&members));

@@ -657,7 +657,7 @@ bindings:
 
 A `single` binding can name a second profile with `shadow: next`. Request handling runs the live profile, and only its decision serves the request. The engine over worker lists (`PolicyEngine`) decides the shadow beside each live decision of that binding, on the caller's thread and ahead of the decision's commit. The shadow reads the rows, the counts and the session pins the live decision read, so a twin of the live profile agrees where its stages keep no state of their own. A stage that keeps one, as a rotation does, moves only where its shadow is asked. It issues no lease and tells no stage.
 
-The engine counts what each shadow said, by the binding's position in its document and one of four kinds (`DecisionEngine::shadowed`):
+The engine counts what each shadow said, by the binding's position in its document and one of four kinds. A host reads every count in one call (`PolicyEngine::shadow_counts`):
 
 | Kind | Meaning |
 |---|---|
@@ -667,6 +667,8 @@ The engine counts what each shadow said, by the binding's position in its docume
 | `skipped` | The shadow was due and not asked. |
 
 The count is a position's: a binding past the sixteenth counts with the sixteenth.
+
+A gateway that runs the document in its own process shows the counts on its metrics endpoint, as `smg_policy_shadow_decisions_total`. Each scrape reads the engine once, and no request does. A binding that names a shadow has its four series from the first scrape. See [Gateway routing metrics](#gateway-routing-metrics).
 
 A shadow is asked over the rows its own profile would be handed. Where that profile would be named cached-block rows of its own, the shadow is skipped and counted. So `cache_aware` is not shadowed behind `least_load` or `random`, and neither is a shadow of another sample than the live profile's. A pool keeps one warm-up rule and one sent-prefix record. They are the live profile's. Behind a live profile that is named rows of its own, a shadow of another warm-up rule or another record is skipped and counted. The engine reads this from the document alone: the bindings' model patterns, phase lists and order. A shadow profile that reads no cached blocks is asked over the whole pool, as it decides live.
 
@@ -934,6 +936,7 @@ including role, replication, election, and load polling.
 | `smg_cache_tree_tokens`, `smg_cache_tree_tenants` | Same | Kept for the token trees the gateway lends the engine: their size pass writes both. No string tree is lent, so `smg_cache_tree_tenants{tree="string"}` is not written. |
 | `smg_cache_tree_chars`, `smg_manual_policy_cache_entries` | — | Ends with the classic trees and manual cache. |
 | `smg_cache_aware_prefix_margin_held_total` | — | Open. An embedded successor requires the scorer to report whether the margin held without an extra read. Otherwise the counter ends with classic routing. |
+| — | `smg_policy_shadow_decisions_total{binding,side,kind}` | New with the policy engine. Shadow decisions beside live ones, read from the engine at each scrape. `binding` is the binding's position in the policy document from 0, and `15` stands for every binding from the sixteenth on. `side` is `single`, `prefill`, `decode` or `decode-again`. A gateway shows `single` alone today: it refuses a binding's shadows by side, and no decision counts a pair's shadow yet. `kind` is `agreed`, `other-target`, `other-outcome` or `skipped`. A shadow that panicked is in the engine's fault count and not here. A classic gateway publishes no such family. |
 | — | — | Planned additions. Embedded writers are pending for `smg_policy_leases{kind,state}`, `smg_policy_spec_generation`, and `smg_policy_spec_apply_total{result}`. The standalone controller already publishes the two spec families when it has a spec source. No code writes `smg_policy_leases` yet. |
 | — | — | Planned renames of the standalone controller's `smg_policy_controller_decide_busy_total` to `smg_policy_fallback_total{reason}` for fallback and of its `smg_policy_controller_decide_budget_outlasted_total` to `smg_policy_deadline_misses_total` for decision deadlines. No code writes the new names yet. |
 | `smg_router_requests_total`, `smg_router_request_errors_total`, `smg_router_request_duration_seconds`, `smg_router_tokens_total`, `smg_router_ttft_seconds`, `smg_router_dispatch_wait_seconds`, `smg_router_tpot_seconds`, `smg_http_responses_total`, `smg_http_request_duration_seconds`, `smg_http_inflight_request_age_count`, `smg_http_connections_active` | Same | Kept. Request and connection metrics. |

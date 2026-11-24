@@ -1810,6 +1810,7 @@ async fn start_observability(
             handle,
             prometheus_config.host.clone(),
             prometheus_config.port,
+            app_context.policy_registry.engine(),
         )
         .await?;
         runtime_metrics::spawn_observer();
@@ -3780,6 +3781,55 @@ mod tests {
 
     use super::*;
     use crate::config::TenantApiKeyEntry;
+
+    /// The gateway's start hands its metrics endpoint the policy engine it
+    /// started. A scrape of a gateway whose policy document names a shadow
+    /// holds that binding's shadow series, at zero before any request.
+    #[tokio::test]
+    async fn the_started_metrics_endpoint_publishes_the_policy_engines_shadow_counts() {
+        use crate::observability::metrics::test_support::{shadow_kinds, shadowing_document};
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let _guard = ::metrics::set_default_local_recorder(&recorder);
+        let router_config = RouterConfig {
+            policy_controller: true,
+            policy_spec: Some(shadowing_document()),
+            ..RouterConfig::default()
+        };
+        // The start binds the port its configuration names. A port read as
+        // free is held by nobody until then, so another case may take it: a
+        // start that fails is tried again on another port.
+        let mut tries = 0;
+        let (port, _probes) = loop {
+            let free = TcpListener::bind("127.0.0.1:0").await.expect("a free port");
+            let port = free.local_addr().expect("the port's address").port();
+            drop(free);
+            let prometheus = PrometheusConfig {
+                port,
+                host: "127.0.0.1".to_string(),
+                duration_buckets: None,
+            };
+            let config = ServerConfig {
+                prometheus_config: Some(prometheus),
+                ..ServerConfig::minimal(router_config.clone())
+            };
+            let app = build_app_context(&config, Extensions::new())
+                .await
+                .expect("the gateway starts");
+            match start_observability(&config, &app, Some(recorder.handle())).await {
+                Ok(probes) => break (port, probes),
+                Err(error) => {
+                    tries += 1;
+                    assert!(tries < 8, "the metrics endpoint starts: {error}");
+                }
+            }
+        };
+
+        let url = format!("http://127.0.0.1:{port}/metrics");
+        let scrape = http_client().get(url).send().await.expect("a scrape");
+        let body = scrape.text().await.expect("the scrape's text");
+        assert_eq!(shadow_kinds(&body), [Some(0); 4], "{body}");
+    }
 
     /// A gRPC worker imported from a mesh peer runs no registration workflow
     /// here; without its model's tokenizer, readiness answers 503.

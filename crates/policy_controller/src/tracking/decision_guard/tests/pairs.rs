@@ -22,7 +22,7 @@ use smg_worker::{
 use crate::{
     document::spec::{AppliedSpec, PolicySpec},
     engine::{
-        decision::{Decision, ShadowKind, Target},
+        decision::{Decision, Target},
         decision_engine::{
             DecideOutcome, Decided, DecisionEngine, DecisionRefused, DecodeRefused, HeldDecision,
             Plain, Request, RequestMaker, TokenKey, WorkerLists,
@@ -201,10 +201,6 @@ impl DecisionEngine for Door<'_> {
 
     fn faults(&self) -> u64 {
         DecisionEngine::faults(self.engine)
-    }
-
-    fn shadowed(&self, binding: u32, kind: ShadowKind) -> u64 {
-        DecisionEngine::shadowed(self.engine, binding, kind)
     }
 }
 
