@@ -24,7 +24,6 @@ use super::{
 use crate::{
     common_proto::KvEventBatch,
     identity::{basic::Worker, endpoint::Endpoint},
-    load::monitor::WorkerMonitor,
     metrics::writers::Metrics,
     registry::{Generation, WorkerRegistry},
     worker::ConnectionMode,
@@ -194,10 +193,11 @@ impl<H: KvEventHost> KvEventCollector<H> {
         }
     }
 
-    /// Route the load records on every worker's event stream to the worker
-    /// monitor (once; a later call is ignored).
-    pub fn set_load_sink<G: Generation>(&self, monitor: &Arc<WorkerMonitor<G>>) {
-        let sink = Arc::downgrade(monitor);
+    /// Route the load records on every worker's event stream to `sink`
+    /// (once; a later call is ignored): the worker monitor, or a sink of
+    /// the host's own.
+    pub fn set_load_sink<S: PushedLoadSink + 'static>(&self, sink: &Arc<S>) {
+        let sink: Weak<S> = Arc::downgrade(sink);
         let _ = self.load_sink.set(sink);
     }
 
