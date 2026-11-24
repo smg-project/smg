@@ -354,6 +354,9 @@ pub struct Affinity {
     /// What the records that left the map had left out
     /// ([`Self::left_out`]). Written under the map's mutex.
     left_out: AtomicU64,
+    /// How many leaves were told ([`Self::leaves`]), each counted ahead of
+    /// its records' own counts.
+    leaves: AtomicU64,
 }
 
 impl fmt::Debug for Affinity {
@@ -381,11 +384,19 @@ impl Affinity {
         self.indexes.get()?.block_size(model)
     }
 
+    /// How many leaves the records were told ([`Self::forget`],
+    /// [`Self::keep`]): read ahead of an answer that [`decide_behind`] is
+    /// handed.
+    pub(super) fn leaves(&self) -> u64 {
+        self.leaves.load(Ordering::Relaxed)
+    }
+
     /// A worker left the pool, was replaced, or joins with no leave told
     /// ahead: every record of sent prefixes forgets it. Takes the records'
     /// map and, for a record that holds the worker, that record's lock as
     /// a writer.
     pub fn forget(&self, worker: WorkerId) {
+        self.leaves.fetch_add(1, Ordering::Relaxed);
         for record in self.records.lock().values() {
             record.forget(worker);
         }
@@ -396,6 +407,7 @@ impl Affinity {
     /// that is not among them, so a worker whose leave was never told
     /// keeps no place. Takes what [`Self::forget`] takes.
     pub(super) fn keep(&self, standing: &[WorkerId]) {
+        self.leaves.fetch_add(1, Ordering::Relaxed);
         let standing: FxHashSet<WorkerId> = standing.iter().copied().collect();
         for record in self.records.lock().values() {
             record.keep(&standing);
@@ -562,12 +574,12 @@ impl PrefixRecord {
     fn forget(&self, worker: WorkerId) {
         let held = self.predictor.read();
         if !held.holds(worker) {
-            self.left.fetch_add(1, Ordering::Relaxed);
+            self.left.fetch_add(1, Ordering::Release);
             return;
         }
         drop(held);
         let mut predictor = self.predictor.write();
-        self.left.fetch_add(1, Ordering::Relaxed);
+        self.left.fetch_add(1, Ordering::Release);
         predictor.forget(worker);
         self.sweeping.store(true, Ordering::Relaxed);
     }
@@ -577,7 +589,7 @@ impl PrefixRecord {
     /// worker `standing` names no more may be under its first pick.
     fn keep(&self, standing: &FxHashSet<WorkerId>) {
         let held = self.predictor.read();
-        self.left.fetch_add(1, Ordering::Relaxed);
+        self.left.fetch_add(1, Ordering::Release);
         let gone: Vec<WorkerId> = held
             .held()
             .filter(|worker| !standing.contains(worker))
@@ -1113,7 +1125,9 @@ impl Table {
             blocks: found.blocks(),
             whole: found.blocks() as usize == keys.len(),
             fresh: found.fresh(tick),
-            left: record.left.load(Ordering::Relaxed),
+            // Acquire against the leaves' Release: a raise read here was
+            // made behind the holder's own, which a hand-on's compare reads.
+            left: record.left.load(Ordering::Acquire),
         };
         (found.blocks(), read)
     }
@@ -1462,6 +1476,39 @@ pub fn decide<'p>(
             table.decide(workers, facts, buffers, token_key, sends_to, decide)
         })
     })
+}
+
+/// [`decide`] behind an answer made ahead of the lookup, a pin the keyed
+/// entry followed. `leaves` is [`Affinity::leaves`] as read ahead of that
+/// answer: where a leave was told since, the answer's worker may be the
+/// one that left, and its prompt is stored for no target.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "what `decide` takes, the count of leaves read ahead of the answer, and the answer"
+)]
+pub(super) fn decide_behind<'p>(
+    affinity: &Affinity,
+    pool: &PoolAffinity,
+    spec: &AppliedSpec,
+    workers: &[Arc<dyn Worker>],
+    ids: &[WorkerId],
+    facts: &mut RequestFacts<'_>,
+    token_key: impl FnOnce(usize) -> Option<TokenKey<'p>>,
+    sends_to: impl Fn(&Target) -> bool,
+    leaves: u64,
+    made: Decision,
+) -> Decision {
+    decide(
+        affinity,
+        pool,
+        spec,
+        workers,
+        ids,
+        facts,
+        token_key,
+        |target| affinity.leaves() == leaves && sends_to(target),
+        |_| made,
+    )
 }
 
 /// One list's column for a decision that reads a column in the rows' place:
