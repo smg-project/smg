@@ -59,8 +59,10 @@ use crate::{
 /// the lease's record: the dispatch it tells off its file later follows it
 /// (`LeaseRecord::untold`).
 ///
-/// A pair's sides are not read here: each side keeps a verdict of its own,
-/// and a pick's one word does not say which side the rule placed.
+/// A pair's pick is read here by its one word, ahead of both sides' writes
+/// of where the prompt went (`policy_engine::pair`). No side's own word is
+/// read: each side keeps a verdict of its own, and a pick's one word does
+/// not say which side the rule placed.
 ///
 /// [`RulePlaced::Untold`]: crate::document::spec::RulePlaced::Untold
 #[inline]
