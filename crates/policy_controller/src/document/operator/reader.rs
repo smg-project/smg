@@ -116,11 +116,18 @@ impl Format {
     /// the values it reads as, held under a bound ([`read_yaml`]), and the
     /// document is built from those values alone. So a YAML document reads
     /// as JSON does: text that looks like a number or a boolean is quoted
-    /// where a field takes text. A field the reader refuses is named by its
-    /// path.
+    /// where a field takes text, and a whole number past 64 bits reads as a
+    /// fraction. A field the reader refuses is named by its path, and a
+    /// YAML document's refusal says what its writer does about a plain word
+    /// ([`cured`]).
     fn parse(self, document: &[u8]) -> Result<PolicySpec, Refused> {
         match self {
-            Self::Yaml => placed(read_yaml(document).map_err(Refused::whole)?),
+            Self::Yaml => placed(read_yaml(document).map_err(Refused::whole)?).map_err(
+                |Refused { path, message }| Refused {
+                    path,
+                    message: cured(message),
+                },
+            ),
             // A JSON document that reads is read once, by the typed read
             // alone. A refused one is read again as values and placed as a
             // YAML document's are, for the field of its refusal.
@@ -146,15 +153,15 @@ fn placed(values: Value) -> Result<PolicySpec, Refused> {
         let path = if path == "." { String::new() } else { path };
         Refused {
             path: wanted(path, &message),
-            message: cured(message),
+            message,
         }
     })
 }
 
-/// `message` with what a writer does about it, where the typed read refused
-/// a plain word of YAML. A number, a boolean or a null where the field takes
-/// text is that text in quotes. A null where a list or a map stands is a
-/// key with nothing under it.
+/// `message` with what a writer of YAML does about it, where the typed read
+/// refused a plain word. A number or a boolean where the field takes text
+/// is that text in quotes. A null is a key with nothing under it: the key
+/// is taken out, or given its text, its list or its map.
 fn cured(message: String) -> String {
     let cure = message
         .strip_prefix("invalid type: ")
@@ -165,9 +172,12 @@ fn cured(message: String) -> String {
             let holds =
                 ["a sequence", "a map"].contains(&expected) || expected.starts_with("struct ");
             match word {
-                "integer" | "floating" | "boolean" | "null" if text => {
+                "integer" | "floating" | "boolean" if text => {
                     Some("text that reads as a number, a boolean or a null is written in quotes")
                 }
+                "null" if text => Some(
+                    "a key with nothing under it is a null: take the key out, or write its text in quotes",
+                ),
                 "null" if holds => Some(
                     "a key with nothing under it is a null: take the key out, or write [] or {}",
                 ),
@@ -346,16 +356,14 @@ impl<'de> Visitor<'de> for Weighed<'_> {
             .ok_or_else(|| E::custom(format_args!("the number {value} is none JSON writes")))
     }
 
+    /// A whole number past 64 bits reads as a fraction, as the JSON form
+    /// reads it.
     fn visit_i128<E: de::Error>(self, value: i128) -> Result<Value, E> {
-        Err(E::custom(format_args!(
-            "the number {value} is none JSON writes"
-        )))
+        self.visit_f64(value as f64)
     }
 
     fn visit_u128<E: de::Error>(self, value: u128) -> Result<Value, E> {
-        Err(E::custom(format_args!(
-            "the number {value} is none JSON writes"
-        )))
+        self.visit_f64(value as f64)
     }
 
     fn visit_str<E: de::Error>(self, text: &str) -> Result<Value, E> {
@@ -509,7 +517,8 @@ mod tests {
     /// Each value weighs what it holds: its own size and its text, a key
     /// its own size, its text and its place in the map, and a list keeps no
     /// room it does not fill. What JSON does not write is refused by name: a
-    /// tagged value, a number past its range, a key written twice.
+    /// tagged value, a number that is not finite, a key written twice. A
+    /// whole number past 64 bits reads as a fraction.
     #[test]
     fn a_yaml_document_reads_as_the_values_json_writes() {
         let read = read_yaml(
@@ -543,14 +552,15 @@ mod tests {
         };
         assert_eq!(items.capacity(), 2, "a list keeps no room it does not fill");
 
+        let long =
+            read_yaml(b"a: 340282366920938463463374607431768211455\nb: -18446744073709551616\n");
+        let fractions = serde_json::json!({"a": u128::MAX as f64, "b": -(2f64.powi(64))});
+        assert_eq!(long, Ok(fractions));
+
         for (document, named) in [
             (
                 "a: !tagged 1\n",
                 "the tag `!tagged` is none JSON writes: take the tag out",
-            ),
-            (
-                "a: 340282366920938463463374607431768211455\n",
-                "the number 340282366920938463463374607431768211455 is none JSON writes",
             ),
             ("a: .inf\n", "is none JSON writes"),
             ("a: 1\na: 2\n", "the key `a` is written twice"),
@@ -628,6 +638,8 @@ mod tests {
             "text that reads as a number, a boolean or a null is written in quotes";
         const EMPTY: &str =
             "a key with nothing under it is a null: take the key out, or write [] or {}";
+        const NO_TEXT: &str =
+            "a key with nothing under it is a null: take the key out, or write its text in quotes";
         let document = |profile: &str, more: &str| {
             format!("apiVersion: smg.policy/v1\nprofiles:\n  default: {profile}\n{more}")
         };
@@ -648,7 +660,7 @@ mod tests {
             ),
             (
                 binding("~"),
-                format!("bindings[0].match.model: invalid type: null, expected a string: {QUOTES}"),
+                format!("bindings[0].match.model: invalid type: null, expected a string: {NO_TEXT}"),
             ),
             (
                 document("{pick: random, score: }", ""),
@@ -661,10 +673,6 @@ mod tests {
             (
                 binding("!mine batch"),
                 "bindings[0].match.model: the tag `!mine` is none JSON writes: take the tag out at line 5 column 18".to_owned(),
-            ),
-            (
-                document("{pick: best, score: [{least-load: {weight: 18446744073709551616}}]}", ""),
-                "profiles.default.score[0].least-load.weight: the number 18446744073709551616 is none JSON writes at line 3 column 55".to_owned(),
             ),
         ] {
             assert_eq!(
@@ -680,5 +688,40 @@ mod tests {
         );
         assert!(unknown.starts_with("not a policy spec in yaml: more: unknown field `more`"));
         assert!(!unknown.contains(QUOTES) && !unknown.contains(EMPTY));
+        // A JSON document's refusal names its field, and says no cure: the
+        // cures are a YAML writer's.
+        let json = br#"{"apiVersion":"smg.policy/v1","profiles":{"default":{"pick":"random"}},"bindings":[{"match":{"model":123},"profile":"default"}]}"#;
+        assert_eq!(
+            refusal(Format::Json, json),
+            "not a policy spec in json: bindings[0].match.model: invalid type: integer `123`, expected a string"
+        );
+    }
+
+    /// A whole number past 64 bits reads as a fraction where one stands, as
+    /// the JSON form reads it: both forms read one document. Where a whole
+    /// number stands, both forms refuse it by its type, in the same words.
+    #[test]
+    fn a_whole_number_past_64_bits_reads_as_a_fraction_as_the_json_form_does() {
+        let yaml = "apiVersion: smg.policy/v1\nprofiles:\n  default:\n    \
+                    score: [{least-load: {weight: 18446744073709551616}}]\n    pick: best\n";
+        let json = br#"{"apiVersion":"smg.policy/v1","profiles":{"default":{"score":[{"least-load":{"weight":18446744073709551616}}],"pick":"best"}}}"#;
+        let read = Format::Yaml
+            .read(yaml.as_bytes())
+            .expect("the YAML form reads");
+        assert_eq!(Format::Json.read(json).ok(), Some(read));
+
+        let refused =
+            "generation: invalid type: floating point `1.8446744073709552e+19`, expected u64";
+        let yaml = "apiVersion: smg.policy/v1\ngeneration: 18446744073709551616\n\
+                    profiles:\n  default: {pick: random}\n";
+        let json = br#"{"apiVersion":"smg.policy/v1","generation":18446744073709551616,"profiles":{"default":{"pick":"random"}}}"#;
+        assert_eq!(
+            refusal(Format::Yaml, yaml.as_bytes()),
+            format!("not a policy spec in yaml: {refused}")
+        );
+        assert_eq!(
+            refusal(Format::Json, json),
+            format!("not a policy spec in json: {refused}")
+        );
     }
 }
