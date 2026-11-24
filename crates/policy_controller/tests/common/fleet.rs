@@ -1026,6 +1026,7 @@ impl Replica {
             shutdown_settle: Duration::ZERO,
             shutdown_grace: Duration::from_secs(5),
             load_poll_interval: POLL_INTERVAL,
+            worker_overload: Config::DEFAULT_WORKER_OVERLOAD,
             discovery: None,
             election: ElectionConfig {
                 lease: lease.map_or(LeasePlace::Process, |file| {

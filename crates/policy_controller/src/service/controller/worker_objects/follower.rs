@@ -5,37 +5,17 @@ use std::sync::Arc;
 
 use smg_grpc_client::engine_port::GrpcConnector;
 use smg_worker::{
-    connection::engine::EngineConnector,
-    health::overload::{OverloadThresholds, DEFAULT_TOKEN_USAGE_CEILING, DEFAULT_WAITING_REQUESTS},
+    connection::engine::EngineConnector, health::overload::OverloadThresholds,
     registry::WorkerRegistry,
 };
 use tokio::sync::watch;
 
 use super::ObjectsWake;
+#[cfg(test)]
+use crate::service::controller::Config;
 use crate::{
     store::MemoryStore,
     worker_host::{Members, Objects},
-};
-
-/// The overload thresholds an object states for each signal its row names
-/// none for: the worker crate's two default numbers, which a gateway hands
-/// each worker of an engine too where its overload switch is on. An
-/// external row's object takes none, as a gateway's external worker takes
-/// none at its registration. They are this crate's own two defaults, by
-/// which the store judges under a binding whose block is on
-/// ([`OVERLOAD_WAITING_REQUESTS`](crate::document::spec::OVERLOAD_WAITING_REQUESTS),
-/// [`OVERLOAD_TOKEN_USAGE`](crate::document::spec::OVERLOAD_TOKEN_USAGE)):
-/// no document names a threshold.
-/// One set a worker: a registration's own values, each over these for an
-/// engine's worker.
-///
-/// The usage is the worker crate's 64-bit number, as an engine reports it.
-/// This crate's constant is 32 bits wide: widened, it reads just above
-/// the 0.8 an engine reports, and a worker at the threshold would not be
-/// over it.
-pub(crate) const OVERLOAD_DEFAULTS: OverloadThresholds = OverloadThresholds {
-    waiting_requests: Some(DEFAULT_WAITING_REQUESTS),
-    token_usage: Some(DEFAULT_TOKEN_USAGE_CEILING),
 };
 
 /// The replica's worker objects: their holder, the store it follows and the
@@ -46,9 +26,13 @@ pub(crate) const OVERLOAD_DEFAULTS: OverloadThresholds = OverloadThresholds {
 /// a row's object is built with its checks off, and no probe is sent to it.
 ///
 /// The object of an engine's row states its row's overload thresholds over
-/// the program's default ([`OVERLOAD_DEFAULTS`]), and an external row's
-/// object its row's alone: what a load monitor over the registry judges
-/// the worker by ([`load_monitor`](crate::worker_host::load_monitor)).
+/// the program's default, which the controller's start states
+/// ([`Config::worker_overload`](crate::service::controller::Config::worker_overload)),
+/// and an external row's object its row's alone: what a load monitor over
+/// the registry judges the worker by
+/// ([`load_monitor`](crate::worker_host::load_monitor)). One set a worker:
+/// a registration's own values, each over the start's for an engine's
+/// worker.
 /// The service runs that monitor while the replica leads, and it writes
 /// each verdict on the worker's object.
 ///
@@ -65,17 +49,31 @@ pub(crate) struct WorkerObjects {
 
 impl WorkerObjects {
     /// The objects of `store`'s rows, none built yet: [`Self::run`] builds
-    /// them. `wake` is the copy of the one the store's log tells.
-    pub(crate) fn new(store: Arc<MemoryStore>, wake: ObjectsWake) -> Self {
-        Self::with_connector(store, wake, Arc::new(GrpcConnector))
+    /// them. `wake` is the copy of the one the store's log tells, and
+    /// `overload` the thresholds the object of an engine's row states for
+    /// each signal its row names none for: the start's.
+    pub(crate) fn stating(
+        store: Arc<MemoryStore>,
+        wake: ObjectsWake,
+        overload: OverloadThresholds,
+    ) -> Self {
+        Self::with_connector(store, wake, Arc::new(GrpcConnector), overload)
     }
 
-    /// [`Self::new`] with `connector` making each object's engine
+    /// [`Self::stating`] the default thresholds of a start, for a case that
+    /// sets no others.
+    #[cfg(test)]
+    pub(crate) fn new(store: Arc<MemoryStore>, wake: ObjectsWake) -> Self {
+        Self::stating(store, wake, Config::DEFAULT_WORKER_OVERLOAD)
+    }
+
+    /// [`Self::stating`] with `connector` making each object's engine
     /// connection.
     pub(super) fn with_connector(
         store: Arc<MemoryStore>,
         wake: ObjectsWake,
         connector: Arc<dyn EngineConnector>,
+        overload: OverloadThresholds,
     ) -> Self {
         Self {
             store,
@@ -83,7 +81,7 @@ impl WorkerObjects {
                 Objects::new(Arc::new(WorkerRegistry::new()))
                     .with_connector(connector)
                     .with_host_local_unchecked()
-                    .with_overload_thresholds(OVERLOAD_DEFAULTS),
+                    .with_overload_thresholds(overload),
             ),
             wake,
         }
@@ -186,10 +184,15 @@ pub(crate) mod tests {
 
     impl Replica {
         fn new() -> Self {
+            Self::stating(Config::DEFAULT_WORKER_OVERLOAD)
+        }
+
+        /// [`Self::new`] of a start that states `overload`.
+        fn stating(overload: OverloadThresholds) -> Self {
             let wake = ObjectsWake::default();
             let place = LeasePlace::File("shared".into());
             let (store, feed) = journaled_at(&place, 0, 1, wake.clone());
-            let workers = Arc::new(WorkerObjects::new(Arc::clone(&store), wake));
+            let workers = Arc::new(WorkerObjects::stating(Arc::clone(&store), wake, overload));
             let (stop, stopped) = watch::channel(false);
             let mut task = JoinSet::new();
             task.spawn({
@@ -287,10 +290,14 @@ pub(crate) mod tests {
     }
 
     /// A replica's object states its row's overload thresholds, each over
-    /// the program's default: the worker crate's two default numbers, which
-    /// are the document's. The default's usage is the 64-bit 0.8 an engine
-    /// reports: the document's 32-bit constant is the same number, and
-    /// widened it reads above it.
+    /// the program's default, which its start states. The start's own
+    /// default is the worker crate's two numbers, which are the document's.
+    /// Its usage is the 64-bit 0.8 an engine reports: the document's 32-bit
+    /// constant is the same number, and widened it reads above it. A start
+    /// that states its own two has them stated by the object of a row that
+    /// names none, and a row's own count stands over the start's as over
+    /// the default. A signal a start states none for has no default: the
+    /// object of a row that names none for it states none.
     #[tokio::test(start_paused = true)]
     async fn an_object_states_its_rows_thresholds_over_the_programs_default() {
         const STRICT: &str = "http://strict:8000";
@@ -298,35 +305,59 @@ pub(crate) mod tests {
             waiting_requests: Some(8),
             token_usage: Some(0.8),
         };
-        assert_eq!(OVERLOAD_DEFAULTS, defaults);
+        assert_eq!(Config::DEFAULT_WORKER_OVERLOAD, defaults);
         assert_eq!(OVERLOAD_WAITING_REQUESTS, 8);
         assert_eq!(0.8_f64 as f32, OVERLOAD_TOKEN_USAGE);
         assert!(f64::from(OVERLOAD_TOKEN_USAGE) > 0.8, "widened, it is over");
 
-        let replica = Replica::new();
-        replica.store.upsert(facts(1, 1));
-        replica.store.upsert(WorkerFacts {
-            key: STRICT.to_string(),
-            engine: STRICT.to_string(),
-            overload: Overload {
-                kv_usage_permille: None,
+        let started = OverloadThresholds {
+            waiting_requests: Some(4),
+            token_usage: Some(0.625),
+        };
+        let count_alone = OverloadThresholds {
+            token_usage: None,
+            ..started
+        };
+        let usage_alone = OverloadThresholds {
+            waiting_requests: None,
+            ..started
+        };
+        let neither = OverloadThresholds::default();
+        assert_eq!(
+            (neither.waiting_requests, neither.token_usage),
+            (None, None)
+        );
+        for (replica, start) in [
+            (Replica::new(), defaults),
+            (Replica::stating(started), started),
+            (Replica::stating(count_alone), count_alone),
+            (Replica::stating(usage_alone), usage_alone),
+            (Replica::stating(neither), neither),
+        ] {
+            replica.store.upsert(facts(1, 1));
+            replica.store.upsert(WorkerFacts {
+                key: STRICT.to_string(),
+                engine: STRICT.to_string(),
+                overload: Overload {
+                    kv_usage_permille: None,
+                    waiting_requests: Some(2),
+                },
+                ..facts(1, 1)
+            });
+            replica.caught_up("two registrations").await;
+            let stated = |url: &str| {
+                let registry = replica.workers.objects.registry();
+                let object = registry.get_by_url(url).expect("the row's object");
+                object.metadata().overload
+            };
+            assert_eq!(stated(URL), start);
+            let own = OverloadThresholds {
                 waiting_requests: Some(2),
-            },
-            ..facts(1, 1)
-        });
-        replica.caught_up("two registrations").await;
-        let stated = |url: &str| {
-            let registry = replica.workers.objects.registry();
-            let object = registry.get_by_url(url).expect("the row's object");
-            object.metadata().overload
-        };
-        assert_eq!(stated(URL), defaults);
-        let own = OverloadThresholds {
-            waiting_requests: Some(2),
-            ..defaults
-        };
-        assert_eq!(stated(STRICT), own);
-        replica.stopped().await;
+                ..start
+            };
+            assert_eq!(stated(STRICT), own);
+            replica.stopped().await;
+        }
     }
 
     /// Two moves in a row end with the table at the object's newest

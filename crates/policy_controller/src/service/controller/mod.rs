@@ -464,9 +464,10 @@ impl Controller {
         let woken = objects.clone();
         let journal =
             replication::journaled_waking(&config.election.lease, config.decide_shards, objects);
-        let workers = Arc::new(worker_objects::WorkerObjects::new(
+        let workers = Arc::new(worker_objects::WorkerObjects::stating(
             Arc::clone(&journal.0),
             woken,
+            config.worker_overload,
         ));
         let kv_feed = KvFeed::new(Arc::clone(&journal.0), workers.holder());
         let prober = worker_objects::Prober::new(Arc::clone(&workers), elector.fence());
@@ -509,6 +510,7 @@ impl Controller {
                     &workers.holder(),
                     Arc::new(door),
                     Arc::clone(&shared.fence),
+                    config.worker_overload,
                 )
                 .map(Box::new)
             })

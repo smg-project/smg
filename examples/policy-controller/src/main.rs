@@ -475,6 +475,7 @@ mod tests {
             shutdown_settle: Config::DEFAULT_SHUTDOWN_SETTLE,
             shutdown_grace: Config::DEFAULT_SHUTDOWN_GRACE,
             load_poll_interval: Config::DEFAULT_LOAD_POLL_INTERVAL,
+            worker_overload: Config::DEFAULT_WORKER_OVERLOAD,
             election: ElectionConfig::default(),
             discovery: None,
         }
