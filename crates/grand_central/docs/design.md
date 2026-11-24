@@ -1902,8 +1902,8 @@ impl Placement<'_> {
 
 What a placement holds, and so what these calls do, depends on the request:
 
-- **A single request.** Where the document's stages want no events, its placement holds no lease
-  and these calls do nothing.
+- **A single request.** Where the document takes no lease event, its placement holds no lease:
+  `sent` and `ended` then tell the engine nothing, and `decode_again` refuses.
 - **A pair.** Its placement always holds a lease (section 6).
 - **An encode request.** Its placement always holds a lease too: it reports its pair's two sides
   as a pair does, and nothing of an encode side. No lease stands for an encoder, so `sent` and
@@ -2832,7 +2832,7 @@ All twelve at a glance. An answer can be as short as the numbers with their lett
 | 8 | User stages in WebAssembly and over gRPC | (a) left as library code | nothing now |
 | 9 | The gateway's options | three with stage 3, the address and TLS options with stage 5 | stages 3 and 5 |
 | 10 | What the controller needs in the worker crate | one list type, and a load monitor that can be stopped; the other worker facts are kept beside the object; recommended: one set of overload thresholds for each worker | stage 4 |
-| 11 | The crate in CI and in the published set | closed inside the crate: the feature `controller` takes the engine's feature; (a) out of the published set until stage 3 | CI's run of the kept engine's tests; stage 0 |
+| 11 | The crate in CI and in the published set | closed inside the crate: the feature `controller` takes the engine's feature; (a) out of the published set until stage 3, and as it went the crate stayed in it | CI's run of the kept engine's tests; stage 0 |
 | 12 | The last report of a worker whose load call fails | (a) the engine alone reads it, about 40 seconds at most at the default poll | rule 6, for the documents whose stages read load reports |
 
 ### Decision 1: the name of a cache partition
@@ -3005,7 +3005,7 @@ registers it with no threshold at all. What that leaves of a binding's block:
 | Question | Fact | Options | Recommendation |
 |---|---|---|---|
 | How does CI run the kept engine's own tests? | The kept engine compiles only under the feature `in-process`. The feature `controller` takes it. The first of CI's four test lines of the crate in `scripts/ci_rust_tests.sh` enables `client`, which takes `controller`, so that line runs the cases behind `in-process` and the test target `caller`. | (a) The crate's default build includes the feature: one line in the crate's manifest. Measured: two of CI's four lines then run the 82 cases, in under a second more. But a default build of the crate goes from 147 to 272 packages, the controller's image and three bench workflows then build the engine in, and two READMEs become wrong, one of them outside the crate. (b) CI's first test line names the feature: one line in the script, outside the crate. That line builds the same 364 packages with it and without it, and nothing else builds differently. (c) The crate's test-only dependency on itself names the feature: inside the crate, and no product build changes. But every build that takes the crate's test-only dependencies then builds the engine too: CI's two lines that test one feature alone, the lint of `operator` alone, and the three bench workflows that (a) names. Not measured. | Closed a fourth way, inside the crate: `controller` takes `in-process` and `worker-host`, the two features the controller's switch (section 10.2) builds on. A build with `controller` or `client` then compiles the kept engine and the worker objects, and a controller built with `controller` alone keeps worker objects as the stock binary does. No line outside the crate changed. |
-| Is the crate published before it is ready? | The earlier integration added the crate to the published set: four lines in two release workflows and the release version check. | (a) Stage 0's change takes the four lines out, and they return with the gateway's integration (stage 3). (b) They stay. | (a). |
+| Is the crate published before it is ready? | The earlier integration added the crate to the published set: four lines in two release workflows and the release version check. | (a) Stage 0's change takes the four lines out, and they return with the gateway's integration (stage 3). (b) They stay. | (a). As it went: (b). No change took the lines out, and the gateway's integration is on main. |
 
 ### Decision 12: the last report of a worker whose load call fails
 
@@ -3082,4 +3082,4 @@ and the store's lease file into the kept engine's modules, with no behaviour cha
 Behind them, in the crate: `random` and `round_robin` details of the short path; pairs and encode
 requests over worker lists; the hash ring a host lends (decision 3). Waiting for a decision:
 new recorders (2), the controller's parts (5, 10), shadow and explain on the
-kept engine (7), the published set (11).
+kept engine (7).
