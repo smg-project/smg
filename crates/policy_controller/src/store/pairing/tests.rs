@@ -8,7 +8,10 @@ use super::{
 };
 use crate::{
     document::spec::Pairing,
-    engine::view::{WireModes, WorkerId},
+    engine::{
+        view::{WireModes, WorkerId},
+        PartnerClasses,
+    },
 };
 
 mod written;
@@ -115,6 +118,23 @@ fn table_of(classes: &PairClasses) -> Vec<Vec<u32>> {
     let table = classes.table();
     (1..=classes.classes())
         .map(|class| table.of(&class).to_vec())
+        .collect()
+}
+
+/// The classes as an engine over the two pools reads them, every worker
+/// of both among the members derived.
+fn by_place(classes: &PairClasses) -> PartnerClasses {
+    let every = |side: &[(WorkerId, u32)]| vec![true; side.len()];
+    let (prefills, decodes) = (every(classes.prefills()), every(classes.decodes()));
+    classes.clone().by_place(prefills, decodes)
+}
+
+/// The first partners: the decode classes each prefill class is paired
+/// with first, from class 1.
+fn first_of(classes: &PairClasses) -> Vec<Vec<u32>> {
+    let read = by_place(classes);
+    (1..=classes.classes())
+        .map(|class| read.first().of(class).to_vec())
         .collect()
 }
 
@@ -594,6 +614,9 @@ fn off_is_one_class_on_the_plain_side_and_one_a_known_runtime_on_the_other() {
     assert_eq!(off.list(1), [0, 1, 2]);
     assert_eq!(decode_class_of(&off), [1, 1, 1]);
     assert_eq!(table_of(&off), [[1]]);
+    // No request is built for a runtime there: no pair goes behind, and
+    // no first partner is kept.
+    assert_eq!(first_of(&off), [[0u32; 0]]);
 
     // The runtime-specific side: the wire's fact stands under off. A class
     // per known runtime, each with the decodes of unknown runtime, and a
@@ -613,6 +636,118 @@ fn off_is_one_class_on_the_plain_side_and_one_a_known_runtime_on_the_other() {
     assert_eq!(off.list(3), [0, 1, 2]);
     assert_eq!(decode_class_of(&off), [1, 2, 3]);
     assert_eq!(table_of(&off), [vec![2, 3], vec![1, 2], vec![1, 2, 3]]);
+    // A class of a known runtime pairs first with the decode of that
+    // runtime, and the prefill of unknown runtime with none: each of its
+    // pairs goes behind.
+    assert_eq!(first_of(&off), [vec![3], vec![1], vec![]]);
+}
+
+#[test]
+fn a_pair_of_one_known_runtime_goes_first_on_the_runtime_specific_side() {
+    // A prefill of a known runtime beside a decode of that runtime and two
+    // of none: all three pair where the mode refuses no unknown runtime,
+    // and the one of its runtime goes first. The three decodes pair with
+    // the same prefills, and the first partner stands apart all the same:
+    // a class's first partners are whole classes of its list.
+    let (known, unknown) = (worker("rt-a"), worker(""));
+    let decodes = [unknown.clone(), known.clone(), unknown];
+    for mode in [Pairing::Off, Pairing::Lenient] {
+        let classes = derived(std::slice::from_ref(&known), &decodes, mode);
+        assert_eq!(class_of(&classes), [1], "{mode:?}");
+        assert_eq!(decode_class_of(&classes), [1, 2, 1], "{mode:?}");
+        assert_eq!(table_of(&classes), [[1, 2]], "{mode:?}");
+        assert_eq!(first_of(&classes), [[2]], "{mode:?}");
+    }
+    // The plain side builds no request for a runtime: the same workers
+    // pair alike there and no pair of theirs goes behind, so no first
+    // partner is kept.
+    let plain = |worker: &Worker| worker.clone().wires(WireModes::HTTP);
+    let classes = derived(
+        &[plain(&known)],
+        &decodes.each_ref().map(plain),
+        Pairing::Lenient,
+    );
+    assert_eq!(decode_class_of(&classes), [1, 1, 1]);
+    assert_eq!(table_of(&classes), [[1]]);
+    assert_eq!(first_of(&classes), [[0u32; 0]]);
+}
+
+#[test]
+fn a_prefill_of_a_known_runtime_stands_apart_from_one_of_none_with_the_same_partners() {
+    // Both prefills pair with both decodes. The one that names a runtime
+    // pairs first with the decode of that runtime and the other with none
+    // first: two classes over one list of partners, and two decode classes.
+    let both = [worker("rt-a"), worker("")];
+    let classes = derived(&both, &both, Pairing::Lenient);
+    assert_eq!(class_of(&classes), [1, 2]);
+    assert_eq!((classes.list(1), classes.list(2)), (vec![0, 1], vec![0, 1]));
+    assert_eq!(decode_class_of(&classes), [1, 2]);
+    assert_eq!(table_of(&classes), [[1, 2], [1, 2]]);
+    assert_eq!(first_of(&classes), [vec![1], vec![]]);
+    // Which workers pair is as it was: four pairs.
+    assert_eq!(classes.pairs(), 4);
+    // The same four on the plain side are one class a side.
+    let plain = both
+        .each_ref()
+        .map(|worker| worker.clone().wires(WireModes::HTTP));
+    let classes = derived(&plain, &plain, Pairing::Lenient);
+    assert_eq!(
+        (class_of(&classes), decode_class_of(&classes)),
+        (vec![1, 1], vec![1, 1])
+    );
+}
+
+#[test]
+fn a_pair_of_the_plain_side_goes_first_beside_one_of_unknown_runtime() {
+    // One model's workers on both sides of the wire's fact. On the
+    // runtime-specific side a prefill of a known runtime pairs with a
+    // decode of none and with one of its own; on the plain side a prefill
+    // and a decode of no runtime pair. The pair with the decode of none on
+    // the runtime-specific side alone goes behind: the plain pair is a
+    // first pair, as the pair on one runtime is.
+    let (known, unknown) = (worker("rt-a"), worker(""));
+    let plain = worker("").wires(WireModes::HTTP);
+    let prefills = [known.clone(), plain.clone()];
+    let classes = derived(
+        &prefills,
+        &[unknown, known.clone(), plain.clone()],
+        Pairing::Lenient,
+    );
+    assert_eq!(class_of(&classes), [1, 2]);
+    assert_eq!(decode_class_of(&classes), [1, 2, 3]);
+    assert_eq!(table_of(&classes), [vec![1, 2], vec![3]]);
+    assert_eq!(first_of(&classes), [vec![2], vec![3]]);
+    // Where every worker of the runtime-specific side names the runtime,
+    // no pair goes behind: no first partner is kept, plain workers beside
+    // them or not.
+    let classes = derived(&prefills, &[known.clone(), known, plain], Pairing::Lenient);
+    assert_eq!(table_of(&classes), [vec![1], vec![2]]);
+    assert!(first_of(&classes).iter().all(Vec::is_empty));
+}
+
+#[test]
+fn where_every_pair_goes_first_or_none_does_no_first_partner_is_kept() {
+    // Strict pairs no worker of unknown runtime, so every pair it makes on
+    // the runtime-specific side is of one known runtime. No pair goes ahead
+    // of another: the classes are those of the pairs alone, and they state
+    // no first partner.
+    let on = |runtime: &'static str| worker(runtime).transport("tx-a");
+    let prefills = [on("rt-a"), on("rt-b"), on("")];
+    let decodes = [on("rt-b"), on(""), on("rt-a"), on("rt-a")];
+    let strict = derived(&prefills, &decodes, Pairing::Strict);
+    assert_eq!(class_of(&strict), [1, 2, 0]);
+    assert_eq!(decode_class_of(&strict), [1, 0, 2, 2]);
+    assert_eq!(table_of(&strict), [[2], [1]]);
+    let pairs: [&[u32]; 3] = [&[2, 3], &[0], &[]];
+    assert_eq!(by_place(&strict), PartnerClasses::number(4, pairs));
+    // No worker names a runtime: every pair is made, and none first.
+    let nameless = [worker(""), worker("").transport("tx-a")];
+    let lenient = derived(&nameless, &nameless, Pairing::Lenient);
+    let every: &[u32] = &[0, 1];
+    assert_eq!(
+        by_place(&lenient),
+        PartnerClasses::number(2, [every, every])
+    );
 }
 
 #[test]
@@ -713,6 +848,14 @@ fn pairs(prefill: &Member<'_>, decode: &Member<'_>, mode: Pairing) -> bool {
         && wire_mismatch(prefill, decode, mode).is_none()
 }
 
+/// Whether a pair of the two goes first, worker by worker: every pair of
+/// the plain side, and on the runtime-specific side a prefill that names a
+/// runtime beside a decode of it.
+fn goes_first(prefill: &Member<'_>, decode: &Member<'_>) -> bool {
+    !runtime_specific(prefill.wires)
+        || (!prefill.runtime.is_empty() && prefill.runtime == decode.runtime)
+}
+
 /// The workers of a pool on one side of the wire's fact.
 fn on_side<'a>(side: bool, pool: &[Member<'a>]) -> Vec<Member<'a>> {
     let on = |member: &&Member<'a>| runtime_specific(member.wires) == side;
@@ -752,51 +895,54 @@ fn refusal_of(
 }
 
 /// The derivation of the two pools against the rule run worker by worker.
-fn holds_worker_by_worker(prefills: &[Member<'_>], decodes: &[Member<'_>], mode: Pairing) {
+/// Whether the classes keep a first partner.
+fn holds_worker_by_worker(prefills: &[Member<'_>], decodes: &[Member<'_>], mode: Pairing) -> bool {
     let classes = PairClasses::derive(prefills, decodes, mode);
     assert_eq!(classes.prefills().len(), prefills.len());
-    // The distinct lists, as their first prefill comes.
-    let mut lists: Vec<Vec<u32>> = Vec::new();
-    for (prefill, &(id, class)) in prefills.iter().zip(classes.prefills()) {
-        assert_eq!(id, prefill.id);
-        let list: Vec<u32> = (0..decodes.len() as u32)
-            .filter(|&decode| pairs(prefill, &decodes[decode as usize], mode))
-            .collect();
-        assert_eq!(classes.list(class), list, "{mode:?}: {prefill:?}");
-        let number = if list.is_empty() {
-            0
-        } else if let Some(at) = lists.iter().position(|known| *known == list) {
-            at as u32 + 1
-        } else {
-            lists.push(list);
-            lists.len() as u32
-        };
-        assert_eq!(class, number, "{mode:?}: {prefill:?}");
-    }
-    assert_eq!(classes.classes() as usize, lists.len());
-    // The decodes that pair with the same prefill classes are one class,
-    // numbered as its first decode comes.
     assert_eq!(classes.decodes().len(), decodes.len());
-    let mut columns: Vec<Vec<u32>> = Vec::new();
-    for (decode, &(id, class)) in decodes.iter().zip(classes.decodes()) {
-        assert_eq!(id, decode.id);
-        let mut column: Vec<u32> = prefills
-            .iter()
-            .zip(classes.prefills())
-            .filter(|(prefill, _)| pairs(prefill, decode, mode))
-            .map(|(_, &(_, class))| class)
-            .collect();
-        column.sort_unstable();
-        column.dedup();
-        let number = if column.is_empty() {
-            0
-        } else if let Some(at) = columns.iter().position(|known| *known == column) {
-            at as u32 + 1
-        } else {
-            columns.push(column);
-            columns.len() as u32
+    // Each prefill's partners, and those of them it is paired with first.
+    let partners = |prefill: &Member<'_>, first: bool| -> Vec<u32> {
+        let paired = |&at: &u32| {
+            let decode = &decodes[at as usize];
+            pairs(prefill, decode, mode) && (!first || goes_first(prefill, decode))
         };
-        assert_eq!(class, number, "{mode:?}: {decode:?}");
+        (0..decodes.len() as u32).filter(paired).collect()
+    };
+    let lists: Vec<[Vec<u32>; 2]> = prefills
+        .iter()
+        .map(|prefill| [partners(prefill, false), partners(prefill, true)])
+        .collect();
+    let held = prefills.iter().zip(classes.prefills()).zip(&lists);
+    for ((prefill, &(id, class)), [list, _]) in held {
+        assert_eq!(id, prefill.id);
+        assert_eq!(classes.list(class), *list, "{mode:?}: {prefill:?}");
+    }
+    for (decode, &(id, _)) in decodes.iter().zip(classes.decodes()) {
+        assert_eq!(id, decode.id);
+    }
+    // The classes, the table and the first partners are those the engine
+    // numbers from the same pairs: a class a distinct list of partners and
+    // of first partners, numbered as its first worker comes, and no first
+    // partner kept where every pair goes first or none does.
+    let both = lists.iter().map(|[list, first]| (&list[..], &first[..]));
+    let numbered = PartnerClasses::number_first(decodes.len(), both);
+    let read = by_place(&classes);
+    assert_eq!(read, numbered, "{mode:?}");
+    assert_eq!(read.first().within(&read.table()), Ok(()), "{mode:?}");
+    // What a decision reads of them: a pair goes first as the rule says
+    // worker by worker, where some pair does and some pair does not.
+    let made = |which: usize| lists.iter().map(|both| both[which].len()).sum::<usize>();
+    let kept = made(1) != 0 && made(1) != made(0);
+    for (prefill, [_, first]) in lists.iter().enumerate() {
+        for decode in 0..decodes.len() {
+            let (place, pair) = (decode as u32, (prefill, decode));
+            let goes = kept && first.contains(&place);
+            assert_eq!(
+                read.pairs_first(prefill, decode),
+                goes,
+                "{mode:?}: {pair:?}"
+            );
+        }
     }
     // What a pair decision reads: a prefill pairs with a decode exactly
     // when its class lists the decode's, each list ascending and naming no
@@ -833,24 +979,27 @@ fn holds_worker_by_worker(prefills: &[Member<'_>], decodes: &[Member<'_>], mode:
             "{mode:?}: side {side}"
         );
     }
+    kept
 }
 
 #[test]
 fn the_classes_hold_exactly_the_pairs_the_rule_makes_worker_by_worker() {
     // Small fleets refuse a side often; large ones repeat every offer.
-    let mut refused = 0;
+    let (mut refused, mut kept) = (0, 0);
     for (prefills, decodes) in [(1, 1), (2, 3), (5, 4), (12, 17), (40, 60)] {
         for seed in 0..40 {
             let (prefills, decodes) = (fleet(seed, prefills), fleet(seed + 1_000, decodes));
             let (prefills, decodes) = (pool(&prefills, 1), pool(&decodes, 101));
             for mode in MODES {
-                holds_worker_by_worker(&prefills, &decodes, mode);
+                kept += usize::from(holds_worker_by_worker(&prefills, &decodes, mode));
                 let classes = PairClasses::derive(&prefills, &decodes, mode);
                 refused += usize::from(classes.refusal(WireModes::HTTP).is_some())
                     + usize::from(classes.refusal(WireModes::GRPC).is_some());
             }
         }
     }
-    // The fleets drawn do reach the refusal.
+    // The fleets drawn do reach the refusal, and classes that keep a first
+    // partner.
     assert!(refused > 20, "{refused} refusals over the fleets drawn");
+    assert!(kept > 20, "{kept} fleets drawn keep a first partner");
 }

@@ -495,10 +495,15 @@ worker (`Objects::lent`).
 
 Beside a pair's two lists it hands their pair classes (`Objects::pair_classes`): each worker's
 class by its place in the list as lent, under the store's own pairing rule over what the rows
-state. Those classes state no first partner, so a controller makes no pair on one known runtime
-ahead of another. A row whose facts change gets a new worker object, so the registry builds a
-new list and a new `G` for each model the worker serves. The classes are derived once for a `G`
-and a pairing mode, at the first ask, and stand with it.
+state. On a wire that carries one runtime's request, a pair with a worker whose runtime is
+unknown goes behind every other pair: the rule states a prefill's partners in those other pairs
+as its first partners. So a controller makes a pair on one known runtime ahead of a pair with
+such a worker, as a gateway does on that wire (section 9.2). The classes hold a model's workers
+of both wires in one table, so a pair of the HTTP wire is a first pair too: no order stands
+between the wires, and a frame decided over both has no twin in a gateway's own placement,
+which places each request on one wire. A row whose facts change gets a new worker object, so
+the registry builds a new list and a new `G` for each model the worker serves. The classes are
+derived once for a `G` and a pairing mode, at the first ask, and stand with it.
 
 A controller knows no admission window of a gateway. So it reads a pair's admission open
 (`OpenAdmission`), as the rows its store builds state it. The gateway that asks is to gate
@@ -2496,7 +2501,7 @@ bursts. It is bounded by the tree's size bound and the time between two eviction
 | `consistent_hashing`, `prefix_hash` on that engine | **[partly]** | placed on the ring the host lends (decision 3): through `place` the plain ring at the place the engine reads with the request's keys, and `prefix_hash` at the places the host's ring answers for the request's heads, where it answers for a head; that both are classic's is proven at stage 3; a host that lends none is placed on the crate's ring, which may be another worker than classic's |
 | `manual` and sticky sessions on that engine | **[partly]** | their sheets replay through the decision function, not through the engine |
 | `bucket` on that engine | **[partly]** | the same |
-| Prefill-decode pairs on that engine | **[partly]** | the sheet of classic's pair choice (`pair_select`) replays through the pair's decision function, not through the engine; one of its 40 lines is held to an answer of the crate's own; the 8 lines behind the prefill admission's bound (`pair_bound`) and the 10 lines of a pair on one known runtime (`pair_runtime`) replay through that function as recorded |
+| Prefill-decode pairs on that engine | **[partly]** | the sheet of classic's pair choice (`pair_select`) replays through the pair's decision function, not through the engine; one of its 40 lines is held to an answer of the crate's own; the 8 lines behind the prefill admission's bound (`pair_bound`) and the 10 lines of a pair on one known runtime (`pair_runtime`) replay through that function as recorded, the 10 also over the classes a controller's pairing rule derives |
 | Encode-prefill-decode on that engine | **[partly]** | `PolicyEngine::decide_encode_at` decides it over a host's three lists and issues the pair's lease, and `place` places it; the entry declines a request held to a wire that a worker of its pair's two lists is not dialed on, places its items on the encoders dialed on a wire it states, declines a request with items where the list holds encoders and none is, and declines one that states the later decode where its decode is held to the workers that take images: a decode asked again takes no items |
 | The lease and its events; the guard | **[built]** | |
 | The host contract of section 8.2 (`place`, `Placement`) | **[partly]** | `Placement` is built, with its call for a pair's decode decided again, and `place` for a single request, for a pair and for an encode request, with the route's rule and the decision made again, three decisions a call at most or a single request's fourth where the third found the workers the route's rule takes, and a single request's later decisions held to those workers; the later decisions of a pair and of an encode request held to them are not |

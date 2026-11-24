@@ -2,7 +2,7 @@
 //! writer keeps, moved by one worker at a time, answers as a whole
 //! derivation of the two pools does and holds no more than the pools do.
 
-use super::{fleet, worker, Worker, MODES};
+use super::{first_of, fleet, table_of, worker, Worker, MODES};
 use crate::{
     document::spec::Pairing,
     engine::view::WorkerId,
@@ -201,6 +201,37 @@ fn a_worker_that_moves_between_two_offers_of_one_class_is_carried() {
             (Some(3), Some(3))
         ));
     }
+}
+
+#[test]
+fn a_write_that_moves_the_first_partners_alone_is_not_carried() {
+    // Two prefill classes tell the two decodes apart already. The first
+    // prefill then names the first decode's runtime: no worker's class
+    // moves and no entry of the table does, and the pair of the two now
+    // goes first. The classes that answer state it.
+    let mode = Pairing::Lenient;
+    let on = |runtime: &'static str, transport: &str| worker(runtime).transport(transport);
+    let mut pools: [Workers; 2] = [
+        vec![(1, on("", "tx-a")), (2, on("", "tx-b"))],
+        vec![(11, on("rt-a", "tx-a")), (12, worker(""))],
+    ];
+    let mut kept = Derivation::default();
+    let (prefills, decodes) = (members(&pools[0]), members(&pools[1]));
+    let mut last = kept.whole(prefills.as_slice(), decodes.as_slice(), mode);
+    let before = last.clone();
+    assert_eq!(table_of(&before), [vec![1, 2], vec![2]]);
+    assert!(first_of(&before).iter().all(Vec::is_empty));
+    pools[0][0].1 = on("rt-a", "tx-a");
+    let named = (Some(1), Some(1));
+    assert!(!written(&mut kept, &mut last, &pools, mode, named));
+    assert_eq!(last.prefills(), before.prefills());
+    assert_eq!(last.decodes(), before.decodes());
+    assert_eq!(table_of(&last), table_of(&before));
+    assert_eq!(first_of(&last), [vec![1], vec![]]);
+    // It names no runtime again: the first partners go alone.
+    pools[0][0].1 = on("", "tx-a");
+    assert!(!written(&mut kept, &mut last, &pools, mode, named));
+    assert_eq!(last, before);
 }
 
 #[test]
