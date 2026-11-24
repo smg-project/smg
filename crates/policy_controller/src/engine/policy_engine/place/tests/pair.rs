@@ -366,6 +366,43 @@ fn no_pair_crosses_the_classes_its_caller_states() {
     assert_eq!(call.missed, [lists.decode_id(0)]);
 }
 
+/// A caller that states first partners is placed on a pair of them while
+/// one can be sent to, whatever else its lists hold: the engine hands the
+/// pair's decision the first partners its caller numbered
+/// ([`PartnerClasses::number_first`]). Where no first partner is ready,
+/// every pair of the classes stands.
+///
+/// The classic router places a pair on one known runtime ahead of a pair
+/// with a worker whose runtime is unknown
+/// (`model_gateway/src/routers/common/placement.rs:2479-2502` on main
+/// `30f636706`), and a gateway states that order as first partners.
+#[test]
+fn a_pair_of_first_partners_is_placed_ahead_of_every_other() {
+    let mut document = PolicySpec::pair_presets("round_robin", "round_robin").expect("presets");
+    document.generation = 1;
+    let engine = hosted(engine_of(&document));
+    let lists = Lists::of(2, 2);
+    // Both prefills pair with both decodes, and prefill 1 with decode 1
+    // first.
+    let both: &[u32] = &[0, 1];
+    let classes = PartnerClasses::number_first(2, [(both, &[][..]), (both, &[1][..])]);
+    let pair = lists.under(&classes, &Open);
+    let request = PlaceRequest::of(MODEL, WorkerLists::Pair(pair));
+    for _ in 0..8 {
+        let placement = engine.place(&request).expect("a placement");
+        assert_eq!(lists.places(&placement), (1, 1), "the pair that goes first");
+    }
+    lists.decodes[1].set_status(WorkerStatus::NotReady);
+    let mut taken = [0_u32; 2];
+    for _ in 0..8 {
+        let placement = engine.place(&request).expect("a placement");
+        let (prefill, decode) = lists.places(&placement);
+        assert_eq!(decode, 0, "the one ready decode");
+        taken[prefill] += 1;
+    }
+    assert!(taken[0] > 0 && taken[1] > 0, "{taken:?}");
+}
+
 /// Prefills that are all at their caller's admission limit answer the word
 /// on which the caller waits for room, and no refusal: no lease was issued
 /// and nothing is said. With one prefill under its limit the request is

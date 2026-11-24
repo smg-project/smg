@@ -6,6 +6,11 @@
 //! one of them names none. A decode may report a running window with the
 //! rooms of it the decode admission has claimed, and a row may run behind
 //! the prefill admission, which lets one prefill hold a bound of requests.
+//! A worker that is not on the sheet's one runtime names its own, a second
+//! known runtime or none: two workers of two known runtimes never pair. A
+//! row placed on the wire that carries one runtime's request (`grpc`) pairs
+//! a prefill of a known runtime first with its partners on that runtime
+//! ([`FirstPartners`]).
 //!
 //! A row's requests are placed one after another and none changes what the
 //! router holds. An answer is the pair, the prefill's place in its list and
@@ -28,8 +33,8 @@ use serde_json::Value;
 use smg_policy_controller::{
     document::{OverloadSpec, PolicySpec},
     engine::{
-        Candidate, Constraints, Decision, Engine, Health, PairPools, PairTable, PoolFacts,
-        RequestFacts, Role, Scratch, ShedReason, WorkerId,
+        Candidate, Constraints, Decision, Engine, FirstPartners, Health, PairPools, PairTable,
+        PoolFacts, RequestFacts, Role, Scratch, ShedReason, WorkerId,
     },
     policies::power_of_two::PowerOfTwoMetric,
 };
@@ -84,6 +89,20 @@ struct Worker {
     transport: Option<String>,
     #[serde(default)]
     rooms: Option<Rooms>,
+    /// `other` or `unknown`, where it is not on the sheet's one runtime.
+    #[serde(default)]
+    runtime: Option<String>,
+}
+
+impl Worker {
+    /// The runtime the worker is known to be on, none for `unknown`.
+    fn runtime(&self) -> Option<&str> {
+        match self.runtime.as_deref() {
+            None => Some("own"),
+            Some("unknown") => None,
+            named => named,
+        }
+    }
 }
 
 /// The gateway's answer to one request: the pair, the prefill's place and
@@ -118,6 +137,10 @@ struct Row {
     /// The most requests the prefill admission lets one prefill hold.
     #[serde(default)]
     prefill_bound: Option<u32>,
+    /// `grpc`, where the pair is placed on the wire that carries one
+    /// runtime's request.
+    #[serde(default)]
+    wire: Option<String>,
     prefills: Vec<Worker>,
     decodes: Vec<Worker>,
     requests: usize,
@@ -186,22 +209,34 @@ fn candidate(at: usize, first: u64, role: Role, worker: &Worker) -> Candidate {
 
 /// The pair classes of a row: each prefill is a class of its own, each
 /// decode a class numbered as the prefills' lists first name it (`0` for a
-/// decode no prefill pairs with), and the table's two slices follow.
+/// decode no prefill pairs with), and the table's two slices follow. The
+/// last two slices are each prefill's first partners, laid out as the
+/// table's: its partners on its own known runtime, on the wire that carries
+/// one runtime's request. They are empty where no prefill has one.
 struct Pairing {
     decode_classes: Vec<u32>,
     ends: Vec<u32>,
     listed: Vec<u32>,
+    first_ends: Vec<u32>,
+    first_listed: Vec<u32>,
 }
 
 fn pairing(row: &Row) -> Pairing {
     let mut decode_classes = vec![0u32; row.decodes.len()];
     let mut named = 0u32;
     let (mut ends, mut listed) = (Vec::new(), Vec::new());
+    let (mut first_ends, mut first_listed) = (Vec::new(), Vec::new());
+    let apart = row.wire.as_deref() == Some("grpc");
     for prefill in &row.prefills {
-        let pairs = |decode: &Worker| match (&prefill.transport, &decode.transport) {
-            (Some(ours), Some(theirs)) => ours == theirs,
-            _ => true,
+        let pairs = |decode: &Worker| {
+            let known = |one: Option<&str>, other: Option<&str>| match (one, other) {
+                (Some(ours), Some(theirs)) => ours == theirs,
+                _ => true,
+            };
+            known(prefill.transport.as_deref(), decode.transport.as_deref())
+                && known(prefill.runtime(), decode.runtime())
         };
+        let own = prefill.runtime().filter(|_| apart);
         let mut list: Vec<u32> = (row.decodes.iter().zip(&mut decode_classes))
             .filter(|(decode, _)| pairs(decode))
             .map(|(_, class)| {
@@ -215,11 +250,23 @@ fn pairing(row: &Row) -> Pairing {
         list.sort_unstable();
         listed.extend(list);
         ends.push(listed.len() as u32);
+        let mut first: Vec<u32> = (row.decodes.iter().zip(&decode_classes))
+            .filter(|(decode, _)| own.is_some() && decode.runtime() == own && pairs(decode))
+            .map(|(_, class)| *class)
+            .collect();
+        first.sort_unstable();
+        first_listed.extend(first);
+        first_ends.push(first_listed.len() as u32);
+    }
+    if first_listed.is_empty() {
+        first_ends.clear();
     }
     Pairing {
         decode_classes,
         ends,
         listed,
+        first_ends,
+        first_listed,
     }
 }
 
@@ -265,6 +312,10 @@ fn run(row: &Row, engine: &Engine, draw: u64) -> Result<Vec<Here>, String> {
     table
         .validate()
         .map_err(|clause| format!("the row's pair table: {clause}"))?;
+    let first = FirstPartners::new(&paired.first_ends, &paired.first_listed);
+    first
+        .within(&table)
+        .map_err(|clause| format!("the row's first partners: {clause}"))?;
     // One side alone is no pair: a host answers such lists over no worker.
     let (pools, pool_size) = if prefills.is_empty() || decodes.is_empty() {
         (PairPools::default(), 0)
@@ -273,6 +324,7 @@ fn run(row: &Row, engine: &Engine, draw: u64) -> Result<Vec<Here>, String> {
             prefills: &prefills,
             decodes: &decodes,
             table,
+            first,
             ..PairPools::default()
         };
         (pools, prefills.len() as u32)
