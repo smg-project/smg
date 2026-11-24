@@ -32,6 +32,7 @@ pub(crate) fn profile() -> ProfileSpec {
 /// The load metric the `power_of_two` preset compares its candidates by:
 /// one form of the preset each.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum PowerOfTwoMetric {
     /// Two draws, the lower expected wait: the preset under its bare name.
     ExpectedWait,
@@ -195,6 +196,7 @@ fn push_two(
 /// weight, where over the pool they would blend. A profile that wants the
 /// blend names one scorer here, or the `best` picker over the pool.
 #[derive(Debug)]
+#[expect(clippy::exhaustive_structs, reason = "no field: its name is its value")]
 pub struct PowerOfTwo;
 
 impl Lifecycle for PowerOfTwo {}
@@ -258,6 +260,7 @@ impl Picker for PowerOfTwo {
 /// compared, as under [`PowerOfTwo`], and several weighted scorers vote
 /// between them as they do there.
 #[derive(Debug)]
+#[expect(clippy::exhaustive_structs, reason = "no field: its name is its value")]
 pub struct PowerOfTwoCountFirst;
 
 impl Lifecycle for PowerOfTwoCountFirst {}

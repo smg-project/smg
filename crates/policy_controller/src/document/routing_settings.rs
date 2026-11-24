@@ -2,6 +2,11 @@
 //! the types it is made of, and why some settings have no document
 //! ([`RoutingSettingsError`]).
 
+#![expect(
+    clippy::exhaustive_structs,
+    reason = "a caller still builds or matches these types whole: each mark comes with its call"
+)]
+
 use std::collections::{btree_map::Entry, BTreeMap};
 
 use serde::Serialize;
@@ -110,8 +115,12 @@ use crate::{
 /// setting no document says: a gateway of one router then refuses its token
 /// count, which its own policies place. That gateway leaves them out as well
 /// where one family's policy names a block size and the other places by a
-/// prefix ring, which counts its key in another size. A request of the
-/// family left out is refused.
+/// prefix ring, which counts its key in another size. The encode mode of
+/// many routers leaves them out where the controller's check refuses the
+/// document of both families, whatever it refuses: a main prefix ring the
+/// view carries no block for and a main policy setting the build does not
+/// run are two such. The mode's own document is checked where it is applied.
+/// A request of the family left out is refused.
 ///
 /// # What is not read
 ///
@@ -239,6 +248,7 @@ impl RoutingSettings {
 /// mode places a single request, which its document then binds
 /// ([`RoutingSettings`], where a setting lands).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ConnectionModeSetting {
     /// Over HTTP. A pair mode counts tokens on one prefill worker, a single
     /// request its own routing places by the main policy.
@@ -289,6 +299,7 @@ impl Default for RoutingKeyOverrideSettings {
 /// runs under the main one. The pools of a mode and their addresses are the
 /// gateway's own, and no part of this type.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum ModeSettings {
     /// Single workers.
     Regular,
@@ -352,6 +363,7 @@ impl ModeSettings {
 /// configuration says it: [`PowerOfTwoMetric`], with the price of a request
 /// in the configuration's width.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum LoadMetricSetting {
     /// The expected wait of two random workers.
     ExpectedWait,
@@ -371,6 +383,7 @@ pub enum LoadMetricSetting {
 /// A policy lands on the preset of its name ([`PolicySettings::name`]), and
 /// each setting in the stage of that preset that reads it.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum PolicySettings {
     /// `random`.
     Random,
@@ -573,6 +586,7 @@ const ENCODE_SIDE: &str = "encode";
 
 /// Why a set of routing settings has no policy document to run.
 #[derive(Debug, PartialEq, thiserror::Error)]
+#[non_exhaustive]
 pub enum RoutingSettingsError {
     /// A setting decides a placement and the document has no place for it.
     #[error("{setting} = {value}: {reason}")]
@@ -646,16 +660,24 @@ impl RoutingSettings {
     /// document says.
     ///
     /// A pure function of the settings. The document is not validated
-    /// here: the controller validates a document where it is applied, and
-    /// names there a stage its build does not run yet.
+    /// here, the encode mode of many routers apart: the controller
+    /// validates a document where it is applied, and names there a stage
+    /// its build does not run yet.
     pub fn policy_document(&self) -> Result<PolicySpec, RoutingSettingsError> {
         refuse_unsupported(self)?;
         if let Some(both) = both_families(self)? {
+            let encode_mode = matches!(self.mode, ModeSettings::EncodePrefillDecode { .. });
             match written(self, both) {
                 // A setting the other family's policy reads and no document
                 // says leaves that family out. The document then plans the
                 // configuration's own family alone.
                 Err(RoutingSettingsError::UnsupportedSetting { .. }) => {}
+                // The encode mode of many routers ran its own family alone
+                // before it bound a single request. A document of both that
+                // the controller's check refuses leaves the single family
+                // out as well, so that binding costs the mode no document
+                // that was taken.
+                Ok(both) if encode_mode && both.validate().is_err() => {}
                 said => return said,
             }
         }
@@ -730,10 +752,10 @@ impl RoutingSettings {
     /// [`Self::policy_document`] it answers the document the settings mean
     /// and reads no supplied document: where one is in force
     /// ([`Self::policy_document_in_force`]), that document decides, and a
-    /// host hands this function no label. And like it, it does not run the
-    /// document's own check. That check judges the whole document and names
-    /// no label, so a host that adds one label at a time knows whose
-    /// document it refused.
+    /// host hands this function no label. It does not run the document's
+    /// own check on what the labels add: that check judges the whole
+    /// document and names no label, so a host that adds one label at a time
+    /// knows whose document it refused.
     pub fn policy_document_with_labels(
         &self,
         labels: &BTreeMap<String, String>,
@@ -4110,6 +4132,76 @@ mod tests {
         let own = ringed.policy_document().expect("the mode's own document");
         assert!(validated(&own).is_ok());
         assert_eq!(many_routers(ringed).policy_document().as_ref(), Ok(&own));
+
+        // A main policy the controller's check refuses is no document of
+        // the single family: a prefix ring the view carries no block for
+        // (its depth under one block or past the blocks a request carries,
+        // or a boundary under one block), or a cache-aware setting the
+        // build does not run. The mode's own document stands there too, the
+        // controller takes it, and a single request has no side under it.
+        let mut mains = Vec::new();
+        for (depth, boundaries, alone) in [
+            (15, vec![], true),
+            (16, vec![], false),
+            (4111, vec![], false),
+            (4112, vec![], true),
+            (256, vec![8], true),
+        ] {
+            let named = format!("a main ring of {depth} tokens over {boundaries:?}");
+            let mut main = at_flag_defaults("prefix_hash");
+            if let PolicySettings::PrefixHash {
+                prefix_token_count,
+                cache_boundaries,
+                ..
+            } = &mut main
+            {
+                (*prefix_token_count, *cache_boundaries) = (depth, boundaries);
+            }
+            mains.push((named, main, alone));
+        }
+        for setting in [
+            "",
+            "overlap_decay",
+            "selection_temperature",
+            "selection_accounting_ttl_ms",
+            "balance_uncached_credit",
+        ] {
+            let mut main = at_flag_defaults("cache_aware");
+            if let PolicySettings::CacheAware {
+                overlap_decay,
+                selection_temperature,
+                selection_accounting_ttl_ms,
+                balance_uncached_credit,
+                ..
+            } = &mut main
+            {
+                match setting {
+                    "overlap_decay" => *overlap_decay = 0.5,
+                    "selection_temperature" => *selection_temperature = 0.05,
+                    "selection_accounting_ttl_ms" => *selection_accounting_ttl_ms = 200,
+                    "balance_uncached_credit" => *balance_uncached_credit = true,
+                    _ => {}
+                }
+            }
+            let named = format!("a cache-aware main policy that sets {setting:?}");
+            mains.push((named, main, !setting.is_empty()));
+        }
+        for (named, main, alone) in mains {
+            let round_robin = Some(PolicySettings::RoundRobin);
+            let uncarried = RoutingSettings {
+                mode: encode_mode(round_robin.clone(), round_robin),
+                ..config(main)
+            };
+            let own = uncarried
+                .policy_document()
+                .expect("the mode's own document");
+            let said = many_routers(uncarried)
+                .policy_document()
+                .expect("the settings' document");
+            let applied = validated(&said).unwrap_or_else(|refusal| panic!("{named}: {refusal}"));
+            let unplaced = applied.engine().place_for("", Phase::Single) == Place::NoSide;
+            assert_eq!((said == own, unplaced), (alone, alone), "{named}");
+        }
 
         // No configuration of the mode loses its document to its single
         // request. Every policy is the main one in turn, the encode side

@@ -17,6 +17,9 @@ use std::{
 };
 
 use clap::Parser;
+use smg_worker::health::overload::{
+    OverloadThresholds, DEFAULT_TOKEN_USAGE_CEILING, DEFAULT_WAITING_REQUESTS,
+};
 use tokio::runtime::{Builder, Runtime};
 #[cfg(unix)]
 use tokio::signal::unix::{signal, SignalKind};
@@ -185,6 +188,20 @@ struct Cli {
     #[arg(long, default_value_t = Config::DEFAULT_LOAD_POLL_INTERVAL.as_secs(), help_heading = "Load Monitoring")]
     load_monitor_interval: u64,
 
+    /// Queued requests a worker's load report states, at or above which an
+    /// engine's worker that registers no count of its own is vetoed as
+    /// overloaded; from 1 to 2^63 - 1, the most a load report states; the
+    /// gateway's flag of the same name. An external worker takes no default
+    #[arg(long, default_value_t = DEFAULT_WAITING_REQUESTS, value_parser = overload_waiting_requests, allow_negative_numbers = true, help_heading = "Load Monitoring")]
+    worker_overload_waiting_requests: usize,
+
+    /// KV usage a worker's load report states, at or above which an
+    /// engine's worker that registers no usage of its own is vetoed as
+    /// overloaded; above 0 and at most 1; the gateway's flag of the same
+    /// name. An external worker takes no default
+    #[arg(long, default_value_t = DEFAULT_TOKEN_USAGE_CEILING, value_parser = overload_token_usage, allow_negative_numbers = true, help_heading = "Load Monitoring")]
+    worker_overload_token_usage: f64,
+
     /// The policy spec as a file, in YAML (JSON under a `.json` name): read
     /// and applied at the start, as generation 1 or under the number its
     /// `generation` line writes. Under `--lease-file` or `--lease-name` it
@@ -278,6 +295,33 @@ fn millis(duration: Duration) -> u64 {
 
 fn default_decide_shards() -> u16 {
     u16::try_from(Config::default_decide_shards()).unwrap_or(1)
+}
+
+/// Why the value a flag is typed with is refused: the parser says it beside
+/// the flag's name and the value.
+type Refusal = Box<dyn std::error::Error + Send + Sync>;
+
+/// The count `--worker-overload-waiting-requests` is typed with, held to
+/// the configuration's bounds where the command line is read. The flag
+/// takes a negative number as its value, so that one is refused here too.
+fn overload_waiting_requests(typed: &str) -> Result<usize, Refusal> {
+    let count: usize = typed.parse()?;
+    Config::overload_in_bounds(OverloadThresholds {
+        waiting_requests: Some(count),
+        token_usage: None,
+    })?;
+    Ok(count)
+}
+
+/// The usage `--worker-overload-token-usage` is typed with, held as the
+/// count is.
+fn overload_token_usage(typed: &str) -> Result<f64, Refusal> {
+    let usage: f64 = typed.parse()?;
+    Config::overload_in_bounds(OverloadThresholds {
+        waiting_requests: None,
+        token_usage: Some(usage),
+    })?;
+    Ok(usage)
 }
 
 impl Cli {
@@ -411,6 +455,10 @@ impl Cli {
             shutdown_settle: Duration::from_secs(self.shutdown_settle_secs),
             shutdown_grace: Duration::from_secs(self.shutdown_grace_period_secs),
             load_poll_interval: Duration::from_secs(self.load_monitor_interval),
+            worker_overload: OverloadThresholds {
+                waiting_requests: Some(self.worker_overload_waiting_requests),
+                token_usage: Some(self.worker_overload_token_usage),
+            },
             decide_shards: usize::from(self.decide_shards),
             election: ElectionConfig {
                 lease: self.lease(),
@@ -682,7 +730,7 @@ mod tests {
     use clap::Parser;
     use tokio::{runtime::Handle, sync::oneshot};
 
-    use super::{bind, color_for, set, truthy, Cli, SpecSource};
+    use super::{bind, color_for, set, truthy, Cli, OverloadThresholds, SpecSource};
     use crate::{
         document::spec::SpecError,
         engine::{Candidate, Constraints, Filter, RequestFacts},
@@ -1061,6 +1109,83 @@ mod tests {
         assert_eq!(two.load_poll_interval, Duration::from_secs(2));
         let zero = config(&["--load-monitor-interval", "0"]).expect("parsed");
         assert_eq!(zero.validate(), Err(ConfigError::ZeroLoadPollInterval));
+    }
+
+    /// The two overload flags are the gateway's by name and default, and by
+    /// bounds but for one: a count over the most a load report states is
+    /// refused here, which the gateway's flag takes. A start that types
+    /// neither states 8 queued requests and a usage of 0.8, and one that
+    /// types them states what it typed. A value out of the configuration's
+    /// bounds is refused where the command line is read, by the flag's name
+    /// beside the value, typed after an equals sign or as the next word: a
+    /// count or a usage of zero, a usage over one, a negative number and
+    /// one that is no number. The ends are taken.
+    #[test]
+    fn the_overload_flags_are_the_gateways_and_refuse_a_value_out_of_bounds() {
+        let stating = |waiting, usage| OverloadThresholds {
+            waiting_requests: Some(waiting),
+            token_usage: Some(usage),
+        };
+        let default = config(&[]).expect("parsed");
+        assert_eq!(default.worker_overload, Config::DEFAULT_WORKER_OVERLOAD);
+        assert_eq!(default.worker_overload, stating(8, 0.8));
+        let typed = config(&[
+            "--worker-overload-waiting-requests",
+            "4",
+            "--worker-overload-token-usage",
+            "0.625",
+        ])
+        .expect("parsed");
+        assert_eq!(typed.worker_overload, stating(4, 0.625));
+        assert_eq!(typed.validate(), Ok(()));
+        let ends = config(&[
+            "--worker-overload-waiting-requests",
+            "1",
+            "--worker-overload-token-usage",
+            "1",
+        ])
+        .expect("parsed");
+        assert_eq!(ends.worker_overload, stating(1, 1.0));
+        assert_eq!(ends.validate(), Ok(()));
+
+        // What the parser says of `flag` typed with `value`, after an equals
+        // sign and as the next word: the first of the two.
+        let refusal = |flag: &str, value: &str| {
+            let joined = format!("{flag}={value}");
+            let said = [vec![joined.as_str()], vec![flag, value]].map(|typed| {
+                let mut argv = vec!["smg-policy-controller", "--controller-id", "c"];
+                argv.extend(SOURCE);
+                argv.extend(typed);
+                let refused = Cli::try_parse_from(argv).expect_err("a value out of bounds");
+                refused.to_string()
+            });
+            let named = format!("invalid value '{value}' for '{flag} <");
+            assert!(said.iter().all(|one| one.contains(&named)), "{said:?}");
+            let [after_equals, _] = said;
+            after_equals
+        };
+        let count = "--worker-overload-waiting-requests";
+        let bounds = ConfigError::OverloadWaitingRequests(0).to_string();
+        let bounds = bounds.split_once(": ").map_or("", |(_, bounds)| bounds);
+        assert!(bounds.starts_with("the count is from 1 to "), "{bounds}");
+        assert!(refusal(count, "0").contains(bounds));
+        // The most queued requests a load report states, where a count holds
+        // it: taken, and the first count over it is out of bounds.
+        if let Ok(most) = usize::try_from(i64::MAX) {
+            let top = config(&[count, &most.to_string()]).expect("parsed");
+            assert_eq!(top.worker_overload.waiting_requests, Some(most));
+            assert_eq!(top.validate(), Ok(()));
+            assert!(refusal(count, "9223372036854775808").contains(bounds));
+        }
+        for typed in ["-1", "4e0"] {
+            refusal(count, typed);
+        }
+        let usage = "--worker-overload-token-usage";
+        let bounds = ConfigError::OverloadTokenUsageOutOfRange.to_string();
+        for typed in ["0", "1.5", "-0.5", "inf", "NaN"] {
+            assert!(refusal(usage, typed).contains(&bounds), "{typed}");
+        }
+        refusal(usage, "half");
     }
 
     #[test]

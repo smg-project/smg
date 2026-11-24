@@ -16,6 +16,11 @@
 //!
 //! [`Affinity::set_indexes`]: super::overlap::Affinity::set_indexes
 
+#![expect(
+    clippy::exhaustive_structs,
+    reason = "a caller still builds or matches these types whole: each mark comes with its call"
+)]
+
 use std::{future::Future, sync::Arc};
 
 use smg_worker::load::state::LoadReceiver;

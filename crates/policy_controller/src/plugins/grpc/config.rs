@@ -4,6 +4,11 @@
 //! directly. The parts a row has whatever its kind are the shared ones of
 //! [`crate::plugins::shared`], re-exported here.
 
+#![expect(
+    clippy::exhaustive_structs,
+    reason = "a caller still builds or matches these types whole: each mark comes with its call"
+)]
+
 use std::{fmt, path::PathBuf};
 
 use crate::document::spec::Needs;
@@ -39,6 +44,7 @@ impl fmt::Debug for Tls {
 /// TCP: a socket on the host, whose peer is checked by its credentials, or
 /// TCP under mutual TLS with the server name pinned.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Transport {
     /// A Unix socket. At connect the peer's uid must be this process's own,
     /// or `peer_uid` when the plugin runs as another user by design.
@@ -52,6 +58,7 @@ pub enum Transport {
 
 /// One gRPC plugin as the host connects to it.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct GrpcPluginSpec {
     /// The name the trace and the shed carry as the stage.
     pub name: String,

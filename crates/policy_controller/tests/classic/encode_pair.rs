@@ -25,6 +25,19 @@
 //! equal keys to one encoder. The pair's own refusal is replayed by its
 //! name alone.
 //!
+//! A row that places its items on the ring is replayed a second time with
+//! a ring lent for the items ([`EncodeItems::ring`]), built from the row's
+//! own answer ([`ByAnswer`]): from where a key stands, its walk reaches the
+//! encoder the gateway's ring gave that key first. That replay holds every
+//! key to its recorded encoder, pick for pick, and the one key by its
+//! recorded text. It shows that the engine places an item on the first
+//! offered encoder of the lent ring's walk from the item's own text, as
+//! the gateway's selection places it
+//! (`model_gateway/src/routers/grpc/common/stages/worker_selection.rs`,
+//! lines 2637 to 2649 and 2722 to 2772 at 6aa129a5c). It does not show
+//! that a gateway's ring walks in that order: no row records a ring's
+//! order, and that proof is the gateway's, with its recorder.
+//!
 //! A row records the handoff's form on its encoders. The gateway reads a
 //! prefill's form as it reads an encoder's, from the runtime, so a prefill
 //! here states the form its runtime's encoders state in the row.
@@ -40,6 +53,7 @@ use smg_policy_controller::{
         PartnerClasses, Phase, PolicyEngine, Request as HostRequest, RequestFacts, RequestMaker,
         WorkerLists,
     },
+    policies::consistent_hashing::LentRing,
     store::{EncodeClasses, EncodeHandoff, EncodeMember, EncodeOffer},
 };
 use smg_worker::{
@@ -303,7 +317,17 @@ fn replay(row: &Row) -> Vec<String> {
             Answer::Refused { .. } => {}
         }
     }
-    found.extend(decided(row, &classes, &of_encoders));
+    found.extend(decided(row, &classes, &of_encoders, false));
+    // A row that places its items on the ring, a second time: with a ring
+    // lent for the items, built from the row's own answer.
+    if row.encode_policy != FEWEST {
+        let again = decided(row, &classes, &of_encoders, true);
+        found.extend(
+            again
+                .into_iter()
+                .map(|why| format!("on a ring lent for the items: {why}")),
+        );
+    }
     found
 }
 
@@ -334,10 +358,15 @@ fn engine(row: &Row) -> Option<PolicyEngine> {
     Some(PolicyEngine::new(applied))
 }
 
+/// The address the worker at `at` of a row's list `list` is registered at.
+fn address(list: &str, at: usize) -> String {
+    format!("http://{list}-{at}:8000")
+}
+
 /// One worker object of a row's list: ready or not, with the requests the
 /// router holds on it as its object's own count.
 fn object(list: &str, at: usize, role: WorkerType, open: bool, in_flight: u32) -> Arc<dyn Worker> {
-    let object = <BasicWorkerBuilder>::new(format!("http://{list}-{at}:8000"))
+    let object = <BasicWorkerBuilder>::new(address(list, at))
         .worker_type(role)
         .model(ModelCard::new(MODEL))
         .health_config(HealthCheckConfig {
@@ -474,9 +503,44 @@ fn refusal(stage: &str) -> &'static str {
     }
 }
 
+/// A caller's ring built from one recorded answer, for the second replay of
+/// a row that places its items on the ring. A key the answer placed stands
+/// at its place among the answer's keys, equal keys at one place, and the
+/// walk from there reaches the encoder the gateway's ring gave that key
+/// first, then every other encoder of the row in the list's order. The
+/// order behind the first is this replay's own: no row records it.
+#[derive(Debug)]
+struct ByAnswer<'a> {
+    /// The keys the answer placed: each item's, or the one key.
+    keys: &'a [String],
+    /// Each placed key's encoder, by its place in the row's list.
+    encoders: &'a [u32],
+    /// The encoders the row lists.
+    listed: usize,
+}
+
+impl LentRing for ByAnswer<'_> {
+    fn position(&self, key: &str) -> u64 {
+        let at = self.keys.iter().position(|placed| placed == key);
+        at.unwrap_or(self.keys.len()) as u64
+    }
+
+    fn walk(&self, position: u64, take: &mut dyn FnMut(&str) -> bool) {
+        let first = self.encoders.get(position as usize).map(|&at| at as usize);
+        let rest = (0..self.listed).filter(|at| Some(*at) != first);
+        let _ = first
+            .into_iter()
+            .chain(rest)
+            .any(|at| take(&address("encode", at)));
+    }
+}
+
 /// What of one row's answers the decision does not replay, request by
 /// request. `offers` are the ends its encoders state, in the row's order.
-fn decided(row: &Row, classes: &EncodeClasses, offers: &[EncodeOffer]) -> Vec<String> {
+/// With `lent`, each request whose answer placed keys is lent a ring for
+/// its items, built from that answer ([`ByAnswer`]), the one key carries
+/// its recorded text, and every key is held to its recorded encoder.
+fn decided(row: &Row, classes: &EncodeClasses, offers: &[EncodeOffer], lent: bool) -> Vec<String> {
     let Some(engine) = engine(row) else {
         return vec!["a policy this replay does not build".to_string()];
     };
@@ -519,11 +583,34 @@ fn decided(row: &Row, classes: &EncodeClasses, offers: &[EncodeOffer]) -> Vec<St
         // The items taken as one: the caller's digest, any value its
         // callers agree on.
         let digest = Identity::hashed(fingerprint(request.items.concat().as_bytes()));
+        // On a lent ring the answer's keys are the ring's: its own ring of
+        // this answer, and the one key by the text the gateway placed it by.
+        let (of_answer, one_text) = match answer {
+            Answer::Placed {
+                keys: placed_by,
+                encoders: recorded,
+                ..
+            } if lent && !placed_by.is_empty() => {
+                let of_answer = ByAnswer {
+                    keys: placed_by,
+                    encoders: recorded,
+                    listed: row.encoders.len(),
+                };
+                let one = (*placed_by != request.items).then(|| placed_by.first());
+                (Some(of_answer), one.flatten())
+            }
+            _ => (None, None),
+        };
+        let one = match one_text {
+            Some(text) => Some(Identity::plain(text)),
+            None => (!request.fanout && !keys.is_empty()).then_some(digest),
+        };
         let items = EncodeItems {
             keys: &keys,
-            one: (!request.fanout && !keys.is_empty()).then_some(digest),
+            one,
             references: request.references,
             decode_images: request.decode_images,
+            ring: of_answer.as_ref().map(|ring| ring as &dyn LentRing),
         };
         let seed = at as u64 + 1;
         let id = seed.to_le_bytes();
@@ -582,7 +669,7 @@ fn decided(row: &Row, classes: &EncodeClasses, offers: &[EncodeOffer]) -> Vec<St
                     ));
                 }
                 let here: Vec<u32> = placed.encoders().iter().map(|t| t.position).collect();
-                let same = if ring {
+                let same = if ring && !lent {
                     let of_keys = || placed_by.iter().zip(&here);
                     here.len() == recorded.len()
                         && here.iter().all(|encoder| offered.contains(encoder))

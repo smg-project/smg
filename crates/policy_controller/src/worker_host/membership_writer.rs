@@ -28,6 +28,7 @@ use crate::{
 
 /// What a write of the membership writer made of the row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum MembershipWriteOutcome {
     Registered(WorkerId),
     InPlace(WorkerId),
@@ -78,6 +79,7 @@ impl MembershipWriteRefused {
 
 /// Who asks to drain or remove a row.
 #[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
 pub enum Remover<'a> {
     /// A caller acting as the row's whole registrant.
     Registrant(&'a Registrant),
@@ -93,6 +95,7 @@ pub enum Remover<'a> {
 /// is registered, and a standing row is left, changed in place or replaced
 /// as its facts say.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Precondition {
     /// Nothing: an add. A row standing under a URL it states, or one the
     /// registration would retire, refuses it whole
@@ -125,6 +128,7 @@ pub enum Precondition {
 /// object stands for the row by then. A door holds the write against no
 /// object, and reads the verb.
 #[derive(Clone, Copy)]
+#[non_exhaustive]
 pub enum Over<'a> {
     /// A replacement by id. It is its maker's whole statement of what a
     /// registration can state: a threshold it leaves out is cleared.

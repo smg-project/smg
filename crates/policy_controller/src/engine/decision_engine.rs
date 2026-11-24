@@ -30,6 +30,12 @@
 //!   decisions that meet at a list's first ask wait for the one that fills
 //!   its cell (`ListCell`).
 
+#![expect(
+    clippy::exhaustive_enums,
+    clippy::exhaustive_structs,
+    reason = "a caller still builds or matches these types whole: each mark comes with its call"
+)]
+
 use std::time::Instant;
 #[cfg(feature = "in-process")]
 use std::{borrow::Cow, fmt, sync::Arc};
@@ -114,6 +120,23 @@ pub trait RequestMaker {
         0
     }
 
+    /// The request's id, as the request made would state it
+    /// ([`Request::id`]): empty for a request that states none.
+    ///
+    /// An engine that decides over its host's lists asks this under a
+    /// document that keeps a sample of its decisions (`explain.sample`),
+    /// for a plain request one pick decided, and under no other document.
+    /// A kept decision is found by its request's id. A request that states
+    /// none is not counted and not kept: a host states an id for a request
+    /// it wants found.
+    ///
+    /// The trait's answer makes the request to read its id. A maker that
+    /// holds the id answers with no making, as the call that places a
+    /// request does.
+    fn request_id<'w>(&'w self, spec: &'w AppliedSpec) -> &'w [u8] {
+        self.make(spec).id
+    }
+
     /// Where a worker's object counts the requests of the request's
     /// session key ([`SessionCountedUnder`]). The trait's answer is the
     /// key's own text, where the caller's own guard counts each request it
@@ -178,10 +201,28 @@ pub trait RequestMaker {
         None
     }
 
+    /// The entry of the request's prompt in the host's string tree of sent
+    /// prefixes ([`CacheIndexes::string_tree`]), as its host names it
+    /// ([`TextKey`]): `None` from a host that holds the prompt's token ids,
+    /// whose request is decided by them, from one that holds no text of it,
+    /// and from a maker that does not say.
+    ///
+    /// Asked at most once a decision, of a request hashed by its text, and
+    /// only where the host lends the request's place such a tree. A host
+    /// that makes the key (a partition's marker ahead of the text) makes it
+    /// here, for such a decision alone.
+    ///
+    /// [`CacheIndexes::string_tree`]: crate::engine::CacheIndexes::string_tree
+    #[cfg(feature = "in-process")]
+    fn text_key(&self) -> Option<TextKey<'_>> {
+        None
+    }
+
     /// Whether the request's caller sends it to `target`, a target of the
     /// decision's pick. A decision that stores where its prompt went, in
-    /// the host's token tree ([`Self::token_key`]) or in the engine's
-    /// record of sent prefixes, asks it of the pick's targets, best first,
+    /// the host's token tree ([`Self::token_key`]), in its string tree
+    /// ([`Self::text_key`]) or in the engine's record of sent prefixes,
+    /// asks it of the pick's targets, best first,
     /// and stores the prompt for the first one answered `true`: for none
     /// where each is answered `false`, so neither names a worker the
     /// request was not sent to. A pair's decode decided again asks it of
@@ -257,6 +298,10 @@ impl RequestMaker for Request<'_> {
     fn prompt_bytes(&self) -> u32 {
         self.facts.prompt_bytes
     }
+
+    fn request_id<'w>(&'w self, _: &'w AppliedSpec) -> &'w [u8] {
+        self.id
+    }
 }
 
 /// What a plain request states ([`RequestMaker::plain`]): all that a pick
@@ -298,6 +343,7 @@ pub struct Plain {
 /// target's position in the list it lent, with no lookup by id.
 #[cfg(feature = "in-process")]
 #[derive(Clone, Copy, Debug, Default)]
+#[non_exhaustive]
 pub enum WorkerLists<'a> {
     /// The host hands no list.
     #[default]
@@ -347,6 +393,38 @@ impl fmt::Debug for TokenKey<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TokenKey")
             .field("tokens", &self.tokens.len())
+            .field("marker", &self.marker)
+            .finish()
+    }
+}
+
+/// The entry of a request's prompt in its host's string tree of sent
+/// prefixes, named by the request's host ([`RequestMaker::text_key`]): the
+/// text's counterpart of [`TokenKey`], for a request that holds no token
+/// ids.
+///
+/// The naming is the host's. A host that partitions its workers' caches
+/// hands the prompt's text behind a marker of the partition and says how
+/// long the marker is, in characters, the unit its tree matches by.
+///
+/// It is never a field of a request's facts: no stage, trace or kept
+/// sample holds a client's text. Its `Debug` prints sizes alone.
+#[cfg(feature = "in-process")]
+pub struct TextKey<'a> {
+    /// The text the tree is matched and written by: the prompt's text,
+    /// behind the partition's marker where the request has one.
+    pub text: Cow<'a, str>,
+    /// How many of the leading characters are the marker and no part of
+    /// the prompt: a match's length has them taken off. Zero with no
+    /// partition.
+    pub marker: usize,
+}
+
+#[cfg(feature = "in-process")]
+impl fmt::Debug for TextKey<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TextKey")
+            .field("text", &self.text.len())
             .field("marker", &self.marker)
             .finish()
     }
@@ -465,7 +543,13 @@ impl Decided {
 /// eligible at this call. No request was made for the pick, no lease is
 /// issued, no id is taken and nothing is dated. The host sends to the
 /// worker and owes the engine no word of the request.
+///
+/// Under a document that keeps a sample of its decisions the answer is the
+/// same place. The engine keeps every Nth such pick as a decision of one
+/// target ([`Self::decision`]), under the id its maker states
+/// ([`RequestMaker::request_id`]) and dated for its record alone.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct AlonePick {
     /// The worker's place in the list.
     pub place: u32,
@@ -636,6 +720,7 @@ pub struct Request<'a> {
 
 /// A decision as its host takes it.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct DecideOutcome {
     /// The engine's decision.
     pub decision: Decision,
@@ -664,6 +749,7 @@ impl DecideOutcome {
 
 /// A pick's lease as its host receives it, with its dispatch deadline.
 #[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
 pub struct Leased {
     /// The lease issued for the pick.
     pub lease: Lease,
@@ -675,6 +761,7 @@ pub struct Leased {
 
 /// Why a door has no decision for a request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DecisionRefused {
     /// The request is a decode or encode side sent on its own. A pair is
     /// asked at its prefill, and that one request decides both sides.
@@ -692,6 +779,7 @@ pub enum DecisionRefused {
 
 /// Why a call could not issue the decode side of a pair's lease.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DecodeRefused {
     /// No lease of the gateway under that id.
     NoLease,

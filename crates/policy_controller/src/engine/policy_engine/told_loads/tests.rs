@@ -48,16 +48,13 @@ use crate::{
     load::{ReportSignals, SignalCell, SignalCells, SignalColumn},
     policies::random::Random,
     stages::{registry::StageRegistry, Lifecycle},
-    tracking::{
-        in_flight::WorkerSlot,
-        lease::{Membership, Signal},
-    },
+    tracking::lease::{Membership, Signal},
 };
 
 const MODEL: &str = "model-a";
 
-/// One report a stage was told: the worker, its rank, the row, the slot of
-/// its count and the sample's instant. With them, the snapshot the engine
+/// One report a stage was told: the worker, its rank, the row and the
+/// sample's instant. With them, the snapshot the engine
 /// kept at hand while the stage heard it, by its place in memory, and zero
 /// for none, whether the stage had been told the worker as joined, and
 /// whether the report stated no named value.
@@ -66,7 +63,6 @@ struct Told {
     worker: WorkerId,
     dp_rank: u16,
     row: LoadRow,
-    slot: WorkerSlot,
     sampled_at_micros: u64,
     at_hand: usize,
     joined: bool,
@@ -116,7 +112,6 @@ impl Lifecycle for Keeps {
             worker,
             dp_rank,
             row,
-            slot,
             sampled_at_micros,
             signals,
         } = *signal
@@ -136,7 +131,6 @@ impl Lifecycle for Keeps {
             worker,
             dp_rank,
             row,
-            slot,
             sampled_at_micros,
             at_hand: kept.map_or(0, |kept| Arc::as_ptr(&kept) as usize),
             joined,
@@ -329,7 +323,7 @@ fn steps_of(engine: &PolicyEngine, told: &[Told]) -> Vec<(WorkerId, u64)> {
 /// told as joined, as a list's record states it, from the task's first
 /// step on: under the id the list names the worker by,
 /// with its rank, the same row and the same sample instant on the engine's
-/// clock, and with no slot. The row's age is at rest, where a record states
+/// clock. The row's age is at rest, where a record states
 /// it at its decision. The third worker is a prefill and the second rank of
 /// its engine: its report converts by its role, so it states no rate where
 /// the first's states one, and it is told under its rank. The second
@@ -381,8 +375,7 @@ async fn a_stage_that_keeps_reports_is_told_each_report_as_a_record_states_it() 
         assert_eq!((word.worker, word.dp_rank, word.row), stated, "{position}");
         assert_eq!(word.sampled_at_micros, record.load_sampled_at_micros);
         let waiting = if position == 1 { 8_192 } else { 4_096 };
-        let stated = (word.slot, word.row.waiting_uncached_tokens);
-        assert_eq!(stated, (WorkerSlot::NONE, waiting), "{position}");
+        assert_eq!(word.row.waiting_uncached_tokens, waiting, "{position}");
     }
     let rates = (told[0].row.live_rate, told[2].row.live_rate);
     assert_eq!(rates, (1_000, 0), "a prefill states no such rate");
@@ -1056,17 +1049,13 @@ async fn of_two_workers_under_one_id_neither_is_told_until_one_stands_alone() {
     task.abort();
 }
 
-/// A report whose conversion panics is held and counted, once: it is told
-/// to no stage and counts as told, the other worker's report is told, the
-/// task goes on and keeps the snapshot, and the worker's next sample is
-/// told. The sum of two ranks' resident tokens overflows where overflow is
-/// checked.
+/// A report whose ranks state resident tokens past what one sum of their
+/// width holds is told like any other, with a row of the most its field
+/// states: its conversion panics in no build and wraps in none. No fault
+/// is counted, the other worker's report is told beside it, and the task
+/// goes on.
 #[tokio::test(start_paused = true)]
-#[cfg_attr(
-    not(debug_assertions),
-    ignore = "the sum wraps where overflow is not checked"
-)]
-async fn a_report_that_panics_at_its_conversion_ends_no_task() {
+async fn a_report_past_what_one_sum_holds_is_told_as_the_rows_most() {
     let (engine, heard) = keeping("least_load", false);
     engine.set_registry(registry(2) as Arc<dyn Members>);
     let mut stated = reports(&[1, 2], 0);
@@ -1076,24 +1065,17 @@ async fn a_report_that_panics_at_its_conversion_ends_no_task() {
     };
     let second = stated.get_mut(&url(1)).expect("the second report");
     second.loads = vec![rank(i64::MAX), rank(1)];
-    let (feed, channel) = monitor(&stated);
+    let (_feed, channel) = monitor(&stated);
     engine.set_loads(channel);
     let task = running(&engine).await;
-    let told = steps_of(&engine, &told_since(&heard));
-    assert_eq!(told, [(id(0), 1)], "the other worker's report is told");
-    assert_eq!(engine.upkeep_faults(), 1, "held and counted");
-    assert!(at_hand(&engine).is_some(), "the snapshot is kept");
-
-    // The report that panicked counts as told: it is not tried again.
-    feed.publish(&stated);
-    settle().await;
-    assert_eq!(told_since(&heard), [], "no report is new");
-    assert_eq!(engine.upkeep_faults(), 1, "counted once");
-
-    feed.publish(&reports(&[1, 3], 0));
-    settle().await;
-    let told = steps_of(&engine, &told_since(&heard));
-    assert_eq!(told, [(id(1), 3)], "the worker's next sample");
+    let told = told_since(&heard);
+    assert_eq!(steps_of(&engine, &told), [(id(0), 1), (id(1), 2)]);
+    let most = told[1].row;
+    assert_eq!(
+        (most.resident_tokens, most.resident_counted),
+        (u32::MAX, true)
+    );
+    assert_eq!(engine.upkeep_faults(), 0, "no conversion panics");
     assert!(!task.is_finished(), "the task goes on");
     task.abort();
 }

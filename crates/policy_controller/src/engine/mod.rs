@@ -44,7 +44,7 @@ pub use decision_engine::{
     HeldDecision, HeldDecode, Leased, Plain, Request, RequestMaker,
 };
 #[cfg(feature = "in-process")]
-pub use decision_engine::{TokenKey, WorkerLists};
+pub use decision_engine::{TextKey, TokenKey, WorkerLists};
 pub use decision_slot::{DecisionSlot, DecisionSlotGuard};
 pub use demands::{DemandFacts, Demands, References, UnmetDemand};
 pub use explain::{DecisionNames, DecisionRecord};

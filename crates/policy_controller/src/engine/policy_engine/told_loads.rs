@@ -57,10 +57,7 @@
 //! it ([`stated_report`]): the row at rest, its age left for a decision to
 //! state, and the sample's instant on the engine's decision clock. A worker
 //! object that stands for several ranks is told as its one record: the
-//! ranks' sum, under the rank its registration states. The slot of the
-//! worker's count is none
-//! ([`WorkerSlot::NONE`](crate::tracking::WorkerSlot::NONE)): this engine
-//! keeps no table of counts, and a worker's count is its object's.
+//! ranks' sum, under the rank its registration states.
 //!
 //! **Its named values.** Under a document a stage of which keeps a signal's
 //! column, the report is told with the values it states under the

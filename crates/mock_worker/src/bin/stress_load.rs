@@ -10,6 +10,11 @@
 //! but not sampled. One JSON summary on stdout at the end (`--out` writes it
 //! too); `STRESS_INTERIM {...}` counters on stderr every `--interim` seconds.
 //!
+//! `--closed-loop N` drives a closed loop instead: N callers, each sending
+//! its next request the moment its last one ended, so the answers set the
+//! rate and no request is skipped. `achieved_rps` counts, as in the open
+//! loop, the requests that started inside the window and ended well.
+//!
 //! Modes (`--mode`): `chat` (chat completions; `--stream` for SSE), `tools`
 //! (a tool-heavy conversation: `--turns` tool-call rounds over `--tools`
 //! function schemas), `responses` (the Responses API with `store: true`,
@@ -20,7 +25,10 @@
 //! `/generate` route, the prompt as its `text`) and `completion`
 //! (`/v1/completions`, the prompt as its `prompt`). `--json-schema` asks a
 //! chat request for a JSON answer under a fixed schema. `--tenants N` spreads
-//! the requests over N tenant ids sent in `--tenant-header`.
+//! the requests over N tenant ids sent in `--tenant-header`. Those ids come
+//! round again and the warm-up sends them before the window opens, so
+//! `--new-tenants S` sends the share S of the requests under an id that no
+//! request carried before.
 //!
 //! Prompts are deterministic from `--seed`: `--distinct` distinct prompts of
 //! about `--prompt-tokens` words (one token each for a large-vocabulary BPE),
@@ -36,6 +44,7 @@
 
 use std::{
     collections::BTreeMap,
+    num::NonZeroUsize,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -50,7 +59,7 @@ use clap::{Parser, ValueEnum};
 use futures::StreamExt;
 use serde::Serialize;
 use serde_json::{json, Value};
-use tokio::task::JoinSet;
+use tokio::task::{coop, JoinSet};
 
 /// A few hundred common words: prompts are made of these so a BPE tokenizer
 /// with a large vocabulary gives about one token per word.
@@ -107,7 +116,7 @@ enum Mode {
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "stress_load",
-    about = "Open-loop load client for the gateway stress bed (chat, tools, responses, image, messages, embeddings, generate, completion)"
+    about = "Load client for the gateway's stress runs, open loop or closed loop (chat, tools, responses, image, messages, embeddings, generate, completion)"
 )]
 struct Args {
     /// Gateway base URL.
@@ -124,6 +133,11 @@ struct Args {
     /// Requests per second, open loop (fractional allowed).
     #[arg(long, default_value_t = 100.0)]
     rate: f64,
+    /// A closed loop of this many callers instead of a rate: each caller
+    /// sends its next request the moment its last one ended (answered or
+    /// failed), so none is skipped.
+    #[arg(long, conflicts_with_all = ["rate", "max_inflight"])]
+    closed_loop: Option<NonZeroUsize>,
     /// Sampled seconds after the warm-up.
     #[arg(long, default_value_t = 60)]
     duration: u64,
@@ -165,6 +179,14 @@ struct Args {
     tenants: usize,
     #[arg(long, default_value = "x-smg-tenant-id")]
     tenant_header: String,
+    /// Share of the requests (0 to 1) sent under a tenant id of their own,
+    /// `tenant-new-<seed>-<request number>`, in place of one of the
+    /// `--tenants` ids: an id no request carried before, in the warm-up or
+    /// in the window. A later run against the same gateway sends other ids
+    /// under another `--seed`. Refused with the linked requests of `--mode
+    /// responses` (`--chain` above 1): a link holds under one tenant.
+    #[arg(long, default_value_t = 0.0, value_parser = share)]
+    new_tenants: f64,
     /// Image file(s) for `--mode image` (repeat the flag; cycled per prompt).
     #[arg(long)]
     image: Vec<PathBuf>,
@@ -181,8 +203,8 @@ struct Args {
     /// `previous_response_id`; a new session starts after the last).
     #[arg(long, default_value_t = 10)]
     chain: usize,
-    /// Concurrent sessions kept in `--mode responses` (0: four per req/s,
-    /// at least 64).
+    /// Concurrent sessions kept in `--mode responses` (0: four per req/s, or
+    /// one per caller of a closed loop; at least 64).
     #[arg(long, default_value_t = 0)]
     sessions: usize,
     /// Tokio worker threads of the client.
@@ -256,6 +278,27 @@ fn prompt(args: &Args, i: usize) -> String {
     let head = words(args.seed ^ 0x5EED_0000 ^ (i % pool) as u64, head_words);
     let tail = words(args.seed ^ 0x7A11_0000 ^ ((i as u64) << 20), tail_words);
     format!("{head} [session {i}] {tail}")
+}
+
+/// A share from 0 to 1 (`--new-tenants`).
+fn share(s: &str) -> Result<f64, String> {
+    let v: f64 = s.parse().map_err(|e| format!("{e}"))?;
+    (0.0..=1.0)
+        .contains(&v)
+        .then_some(v)
+        .ok_or_else(|| format!("{s} is not a share from 0 to 1"))
+}
+
+/// The tenant id of request `i`, if it carries one: an id of its own for the
+/// `new_tenants` share of the requests, else the next of the `tenants` ids,
+/// which the other requests take in turn. Of the first `n` requests
+/// `floor(n * share)` carry a new id.
+fn tenant(args: &Args, i: u64) -> Option<String> {
+    let new = |n: u64| (n as f64 * args.new_tenants).floor() as u64;
+    if new(i) > new(i.saturating_sub(1)) {
+        return Some(format!("tenant-new-{}-{i}", args.seed));
+    }
+    (args.tenants > 0).then(|| format!("tenant-{}", (i - new(i)) % args.tenants as u64))
 }
 
 /// Builds a chat user message as a string (zero parts) or text content blocks.
@@ -414,6 +457,9 @@ fn build_bodies(args: &Args) -> Result<Vec<Bytes>> {
         .iter()
         .map(|p| data_url(p))
         .collect::<Result<_>>()?;
+    if args.mode == Mode::Responses && args.chain > 1 && args.new_tenants > 0.0 {
+        anyhow::bail!("--new-tenants parts the linked requests of --mode responses: use --chain 1");
+    }
     if args.mode == Mode::Image && images.is_empty() {
         anyhow::bail!("--mode image needs at least one --image <file>");
     }
@@ -788,11 +834,8 @@ async fn one(shared: Arc<Shared>, i: u64, sampled: bool) {
         .post(&shared.url)
         .header("content-type", "application/json")
         .body(body);
-    if args.tenants > 0 {
-        request = request.header(
-            &args.tenant_header,
-            format!("tenant-{}", i % args.tenants as u64),
-        );
+    if let Some(tenant) = tenant(args, i) {
+        request = request.header(&args.tenant_header, tenant);
     }
     let started = Instant::now();
     let keep_body = args.mode == Mode::Responses || args.debug_first;
@@ -956,6 +999,9 @@ struct Summary {
     mode: String,
     stream: bool,
     rate_target: f64,
+    /// The callers of a closed loop; an open-loop summary has no such key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    closed_loop: Option<NonZeroUsize>,
     duration_s: u64,
     warmup_s: u64,
     wall_s: f64,
@@ -995,7 +1041,8 @@ fn summarize(shared: &Shared, wall: Duration, unfinished: u64) -> Summary {
     Summary {
         mode: format!("{:?}", shared.args.mode).to_lowercase(),
         stream: shared.args.stream,
-        rate_target: shared.args.rate,
+        rate_target: shared.args.closed_loop.map_or(shared.args.rate, |_| 0.0),
+        closed_loop: shared.args.closed_loop,
         duration_s: shared.args.duration,
         warmup_s: shared.args.warmup,
         wall_s: wall.as_secs_f64(),
@@ -1066,6 +1113,8 @@ async fn run(args: Args) -> Result<Summary> {
     let bodies = build_bodies(&args)?;
     let sessions = if args.sessions > 0 {
         args.sessions
+    } else if let Some(callers) = args.closed_loop {
+        callers.get().max(64)
     } else {
         ((args.rate * 4.0).ceil() as usize).max(64)
     };
@@ -1104,24 +1153,45 @@ async fn run(args: Args) -> Result<Summary> {
             }
         })
     });
-    loop {
-        ticker.tick().await;
-        let elapsed = start.elapsed();
-        if elapsed >= total {
-            break;
+    if let Some(callers) = args.closed_loop {
+        for _ in 0..callers.get() {
+            let shared = Arc::clone(&shared);
+            tasks.spawn(async move {
+                loop {
+                    // A send that fails without a wait must not hold its
+                    // thread to the end of the window.
+                    coop::consume_budget().await;
+                    let elapsed = start.elapsed();
+                    if elapsed >= total {
+                        break;
+                    }
+                    let i = shared.stats.sent.fetch_add(1, Ordering::Relaxed) + 1;
+                    shared.stats.note_inflight();
+                    one(Arc::clone(&shared), i, elapsed >= warm).await;
+                }
+            });
         }
-        while tasks.try_join_next().is_some() {}
-        let due = (elapsed.as_secs_f64() * args.rate).floor() as u64;
-        while launched < due {
-            let sampled = elapsed >= warm;
-            launched += 1;
-            if shared.stats.inflight.load(Ordering::Relaxed) >= args.max_inflight {
-                shared.stats.skipped.fetch_add(1, Ordering::Relaxed);
-                continue;
+        tokio::time::sleep_until((start + total).into()).await;
+    } else {
+        loop {
+            ticker.tick().await;
+            let elapsed = start.elapsed();
+            if elapsed >= total {
+                break;
             }
-            shared.stats.sent.fetch_add(1, Ordering::Relaxed);
-            shared.stats.note_inflight();
-            tasks.spawn(one(Arc::clone(&shared), launched, sampled));
+            while tasks.try_join_next().is_some() {}
+            let due = (elapsed.as_secs_f64() * args.rate).floor() as u64;
+            while launched < due {
+                let sampled = elapsed >= warm;
+                launched += 1;
+                if shared.stats.inflight.load(Ordering::Relaxed) >= args.max_inflight {
+                    shared.stats.skipped.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                shared.stats.sent.fetch_add(1, Ordering::Relaxed);
+                shared.stats.note_inflight();
+                tasks.spawn(one(Arc::clone(&shared), launched, sampled));
+            }
         }
     }
     let drain_until = Instant::now() + Duration::from_secs(args.drain);
@@ -1294,6 +1364,45 @@ mod tests {
             42,
             "40 words plus the marker"
         );
+    }
+
+    #[test]
+    fn new_tenants_are_an_exact_share_and_no_id_comes_twice() {
+        let mut a = args(Mode::Chat);
+        a.tenants = 4;
+        let ids = |a: &Args| (1..=4000).filter_map(|i| tenant(a, i)).collect::<Vec<_>>();
+        let distinct = |ids: &[String]| ids.iter().collect::<std::collections::BTreeSet<_>>().len();
+        assert_eq!(tenant(&a, 6).as_deref(), Some("tenant-2"));
+        assert_eq!(distinct(&ids(&a)), 4, "without the flag: the set in turn");
+
+        a.new_tenants = 0.25;
+        let mixed = ids(&a);
+        let new: Vec<String> = mixed
+            .iter()
+            .filter(|id| id.starts_with("tenant-new-"))
+            .cloned()
+            .collect();
+        assert_eq!(new.len(), 1000, "a quarter of 4,000 requests");
+        assert_eq!(distinct(&new), 1000, "no new id comes twice");
+        assert_eq!(distinct(&mixed), 1004, "the others take the four in turn");
+
+        a.seed += 1;
+        let other = ids(&a);
+        assert!(new.iter().all(|id| !other.contains(id)), "another seed");
+
+        a.tenants = 0;
+        a.new_tenants = 1.0;
+        assert_eq!(distinct(&ids(&a)), 4000, "every request, with no set");
+
+        for bad in ["25", "-0.1", "nan", "inf"] {
+            let read = Args::try_parse_from(["stress_load", "--new-tenants", bad]);
+            assert!(read.is_err(), "{bad} is no share");
+        }
+        let mut linked = args(Mode::Responses);
+        linked.new_tenants = 0.5;
+        assert!(build_bodies(&linked).is_err(), "one tenant a link");
+        linked.chain = 1;
+        assert!(build_bodies(&linked).is_ok(), "no link, no refusal");
     }
 
     #[test]
@@ -1533,5 +1642,92 @@ mod tests {
         assert_eq!(percentile(&sorted, 0.5), 3.0);
         assert_eq!(percentile(&sorted, 1.0), 100.0);
         assert_eq!(percentile(&[], 0.5), 0.0);
+    }
+
+    /// Three callers against a server that holds every answer for a permit:
+    /// three requests are out and no fourth, and one answer, a refusal,
+    /// brings one more.
+    #[tokio::test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the server and the load end with the test's runtime"
+    )]
+    async fn a_closed_loop_caller_sends_its_next_request_at_its_answer() {
+        for refused in [
+            &["--closed-loop", "0"][..],
+            &["--closed-loop", "3", "--rate", "5"],
+            &["--closed-loop", "3", "--max-inflight", "8"],
+        ] {
+            let words = ["stress_load"].iter().chain(refused);
+            assert!(Args::try_parse_from(words).is_err(), "{refused:?}");
+        }
+
+        let seen = Arc::new(AtomicU64::new(0));
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let held = {
+            let (seen, gate) = (Arc::clone(&seen), Arc::clone(&gate));
+            move || async move {
+                seen.fetch_add(1, Ordering::Relaxed);
+                match gate.acquire().await {
+                    Ok(permit) => {
+                        permit.forget();
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE
+                    }
+                    Err(_) => axum::http::StatusCode::OK,
+                }
+            }
+        };
+        let app = axum::Router::new().route("/v1/chat/completions", axum::routing::post(held));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gateway = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        let args = Args::try_parse_from([
+            "stress_load",
+            "--gateway",
+            &gateway,
+            "--closed-loop",
+            "3",
+            "--warmup",
+            "0",
+            "--duration",
+            "3",
+            "--interim",
+            "0",
+            "--distinct",
+            "1",
+        ]);
+        let load = tokio::spawn(run(args.expect("a closed loop is a flag")));
+
+        let requests = |n: u64| {
+            let seen = Arc::clone(&seen);
+            tokio::time::timeout(Duration::from_secs(5), async move {
+                while seen.load(Ordering::Relaxed) < n {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+        };
+        requests(3).await.expect("each caller sends a request");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            seen.load(Ordering::Relaxed),
+            3,
+            "a caller waits for its answer"
+        );
+        gate.add_permits(1);
+        requests(4)
+            .await
+            .expect("the answered caller sends its next request");
+
+        gate.close();
+        let summary = load.await.unwrap().unwrap();
+        assert_eq!(summary.sent, seen.load(Ordering::Relaxed));
+        assert_eq!((summary.ok + 1, summary.failed), (summary.sent, 1));
+        assert_eq!((summary.skipped, summary.unfinished), (0, 0));
+        assert_eq!(summary.inflight_max, 3);
+        let read = serde_json::to_value(&summary).unwrap();
+        assert_eq!(
+            (&read["closed_loop"], &read["rate_target"]),
+            (&json!(3), &json!(0.0))
+        );
     }
 }

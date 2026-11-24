@@ -144,8 +144,13 @@ pub(crate) type PairsAgain<'a> = &'a dyn Fn() -> Arc<PdPairIndex>;
 /// and makes it, as it reads a pair index again ([`PairsAgain`]): a classic
 /// placement reads none of it, and the call's own reads of the body are
 /// not made for one. A route's call takes what it reads by value (`move`),
-/// so that nothing of the request is kept in memory for it on the way to
-/// a classic placement.
+/// or borrows what its route holds until the placement answers in any
+/// case, as a stage holds its request: nothing of the request is kept in
+/// memory for the call on the way to a classic placement.
+///
+/// A pair's decode keeps what its request stated ([`Placed::stated`]): a
+/// route that holds the body no more states it again from that answer,
+/// where it asks the decode again and where it retries the request.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Stated {
     /// The most tokens the request's answer may hold, as its body states
@@ -623,7 +628,9 @@ struct ByEngine {
     /// What the request stated for the engine alone at the decision that
     /// made this answer, kept by the answer of a pair's decode. Asked again
     /// behind its prefill, that decode states it again from here: its
-    /// route may hold the body no more by then.
+    /// route may hold the body no more by then. A retry of such a route
+    /// reads it too ([`Placed::stated`]), so the decode a request moved to
+    /// keeps what the first one kept.
     stated: Stated,
 }
 
@@ -710,6 +717,19 @@ impl Placed {
     #[inline]
     pub(crate) fn worker(&self) -> &Arc<dyn Worker> {
         &self.worker
+    }
+
+    /// What the request stated for the policy engine alone ([`Stated`]) at
+    /// the decision that made this answer, where the answer is a pair's
+    /// decode the engine placed, or the decode such a request moved to.
+    /// Nothing for any other answer. A route whose retry holds the body no
+    /// more makes this call where the engine decides, off the answer of
+    /// the attempt before: a classic retry never makes it.
+    #[inline]
+    pub(crate) fn stated(&self) -> Stated {
+        self.engine
+            .as_ref()
+            .map_or_else(Stated::nothing, |engine| engine.stated)
     }
 
     /// The request's load guard on the placed worker: it raises the worker's
@@ -1015,10 +1035,11 @@ impl ByEngine {
         debug!(decode = %worker.redacted_url(), "A pair's decode moved behind its prefill");
         let guard = ahead.onto(Arc::clone(&worker));
         // The decode the request moved to is asked nothing again: the
-        // engine decides a pair's decode again once, so its answer keeps
-        // nothing of what the request stated.
+        // engine decides a pair's decode again once. Its answer keeps what
+        // the request stated all the same, for a retry that states it
+        // again off the answer of the attempt before ([`Placed::stated`]).
         let routing_key = self.routing_key.as_deref();
-        let moved = Placed::by_side(worker, *side, routing_key, Stated::nothing());
+        let moved = Placed::by_side(worker, *side, routing_key, self.stated);
         (Some(moved), guard)
     }
 }
@@ -2471,14 +2492,11 @@ fn unpairable(
 /// A pair's admission as the policy engine reads it of this gateway, a
 /// worker at a time and live: a prefill's capacity by the request's prefill
 /// admission, where its route set one, and a decode's room by its gate
-/// ([`pd_admission::has_free_room`]). The decode `claimed` counts has a
-/// room whatever its gate reads: the request holds a claim at that gate,
-/// which its route made before the prefill was sent ([`decode_again`]).
+/// ([`pd_admission::has_free_room`]).
 struct PairGates<'a> {
     prefills: &'a [Arc<dyn Worker>],
     decodes: &'a [Arc<dyn Worker>],
     capacity: Option<&'a PrefillSelectionContext<'a>>,
-    claimed: Option<&'a WorkerLoadGuard>,
 }
 
 impl fmt::Debug for PairGates<'_> {
@@ -2502,10 +2520,41 @@ impl PairAdmission for PairGates<'_> {
     }
 
     fn has_room(&self, decode: usize) -> bool {
-        self.decodes.get(decode).is_some_and(|worker| {
-            pd_admission::has_free_room(worker.as_ref())
-                || self.claimed.is_some_and(|claimed| claimed.counts(worker))
-        })
+        self.decodes
+            .get(decode)
+            .is_some_and(|worker| pd_admission::has_free_room(worker.as_ref()))
+    }
+}
+
+/// A pair's admission ([`PairGates`]) for a decode asked again by a request
+/// that holds a claim at its decode's gate, which its route made before the
+/// prefill was sent ([`decode_again`]): the decode `claimed` counts has a
+/// room whatever its gate reads, since the room that fills the gate is the
+/// request's own. Every other worker is read as the gates read it.
+struct ClaimedGates<'a> {
+    gates: &'a PairGates<'a>,
+    claimed: &'a WorkerLoadGuard,
+}
+
+impl fmt::Debug for ClaimedGates<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClaimedGates")
+            .field("gates", self.gates)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PairAdmission for ClaimedGates<'_> {
+    fn has_capacity(&self, prefill: usize) -> bool {
+        self.gates.has_capacity(prefill)
+    }
+
+    fn has_room(&self, decode: usize) -> bool {
+        self.gates
+            .decodes
+            .get(decode)
+            .is_some_and(|worker| self.claimed.counts(worker))
+            || self.gates.has_room(decode)
     }
 }
 
@@ -2517,7 +2566,8 @@ impl PairAdmission for PairGates<'_> {
 /// first ([`pair_by_engine`]), and the decode asked again behind its
 /// prefill ([`decode_again`]), which reads no prefill's capacity and hands
 /// the guard of its first decode as `claimed` where the request holds a
-/// claim at that decode's gate.
+/// claim at that decode's gate: the engine then reads the gates with that
+/// claim ([`ClaimedGates`]).
 ///
 /// What `inputs` and `stated` state of the request is handed as the engine
 /// reads it ([`place_request`]), the route's own rule among it, which the
@@ -2558,13 +2608,20 @@ fn with_pair_request<R>(
         prefills: prefill.workers,
         decodes: decode.workers,
         capacity: prefill_capacity,
+    };
+    let claimed = claimed.map(|claimed| ClaimedGates {
+        gates: &gates,
         claimed,
+    });
+    let admission: &dyn PairAdmission = match &claimed {
+        Some(claimed) => claimed,
+        None => &gates,
     };
     let lists = PairLists {
         prefill,
         decode,
         classes,
-        admission: &gates,
+        admission,
         // No place of a list is stated. A pinned request is held to its
         // wire by its demand, a side at a time, and the engine asks the
         // route's rule of a list itself.
@@ -10091,6 +10148,59 @@ pub(crate) mod tests {
 
         let (_moved, guard) = asked_again(&registry, &policies, None, &pair, ahead);
         assert_eq!(said()[3..5], ["limit 64", "issued"]);
+        drop(guard);
+    }
+
+    /// A pair's decode keeps what its request stated, for a retry whose
+    /// route holds the body no more: the answer of the first decision keeps
+    /// it, and so does the answer of the decode the request moved to behind
+    /// its prefill. The prefill's answer keeps nothing, and neither answer
+    /// of a classic pair does.
+    #[test]
+    fn a_pairs_decode_keeps_what_its_request_stated_through_a_move() {
+        let stated = || Stated {
+            max_output_tokens: 64,
+        };
+        let fleet = || {
+            pd_registry(&[
+                ("grpc://p:1", WorkerType::Prefill, Some("NixlConnector")),
+                ("grpc://d:1", WorkerType::Decode, Some("NixlConnector")),
+                ("grpc://d:2", WorkerType::Decode, Some("NixlConnector")),
+            ])
+        };
+        let inputs = PlacementInputs::default();
+
+        // A classic pair: no answer keeps anything.
+        let registry = fleet();
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let pairs = pairs_of(&registry, &policies);
+        let pair = select_pair(
+            &registry, &policies, MODEL, &pairs, None, None, inputs, stated,
+        );
+        let pair = pair.expect("a classic pair");
+        assert_eq!(pair.prefill.stated(), Stated::nothing());
+        assert_eq!(pair.decode.stated(), Stated::nothing());
+
+        // The engine's pair: the decode's answer keeps it.
+        let registry = fleet();
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let _heard = hearing_pairs_on(&policies, true);
+        let pairs = pairs_of(&registry, &policies);
+        let pair = select_pair(
+            &registry, &policies, MODEL, &pairs, None, None, inputs, stated,
+        );
+        let pair = pair.expect("the engine places the pair");
+        assert_eq!(pair.prefill.stated(), Stated::nothing());
+        assert_eq!(pair.decode.stated(), stated());
+
+        // The decode the request moves to keeps it too.
+        drop(pair.prefill.guard(None));
+        let ahead = pair.decode.ahead(None);
+        pair.decode.worker().set_status(WorkerStatus::NotReady);
+        let (moved, guard) = asked_again(&registry, &policies, None, &pair, ahead);
+        let moved = moved.expect("the decode moved");
+        assert_ne!(moved.url(), pair.decode.url());
+        assert_eq!(moved.stated(), stated());
         drop(guard);
     }
 

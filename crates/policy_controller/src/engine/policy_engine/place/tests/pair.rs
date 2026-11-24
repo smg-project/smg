@@ -1,6 +1,7 @@
 //! The cases of a request with a pair's two lists.
 
 mod decode_again;
+mod named;
 mod ruled;
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -233,6 +234,33 @@ fn a_pair_is_placed_on_the_first_target_both_of_whose_workers_can_be_sent_to() {
     let pair = lists.under(&classes, &Open);
     let request = PlaceRequest::of(MODEL, WorkerLists::Pair(pair));
     assert_eq!(engine.place(&request).err(), Some(Unplaced::NoWorkers));
+}
+
+/// Under a document that keeps a sample of its decisions, a pair's first
+/// decision is kept as it was answered and found by its request's id: the
+/// pick whose first target names both workers of the placement, under the
+/// pair's binding. A request of another id finds nothing.
+#[test]
+fn a_pairs_first_decision_is_kept_and_found_by_its_request() {
+    let mut document = PolicySpec::pair_presets("round_robin", "round_robin").expect("presets");
+    document.generation = 1;
+    document.explain.sample = 1;
+    let engine = hosted(engine_of(&document));
+    let lists = Lists::of(2, 2);
+    let classes = lists.every();
+    let request = PlaceRequest {
+        request_id: Some("pair-1"),
+        ..PlaceRequest::of(MODEL, WorkerLists::Pair(lists.under(&classes, &Open)))
+    };
+    let placement = engine.place(&request).expect("a placement");
+    let record = engine.explained(b"pair-1").expect("the decision is kept");
+    let pick = record.decision.pick().expect("a pick");
+    let first = pick.targets.first().expect("a target");
+    let named = (first.id, first.pair.map(|pair| pair.decode_id));
+    assert_eq!(named, (placement.id(), placement.decode_id()));
+    let names = record.names(engine.standing_spec().engine());
+    assert_eq!(names.expect("its names").plan, "pd-pair");
+    assert_eq!(engine.explained(b"pair-2"), None);
 }
 
 /// A side that cannot be sent to is left out of the next ask by its own

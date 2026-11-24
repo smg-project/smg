@@ -5647,8 +5647,8 @@ pub(crate) mod tests {
         let encode = phased(frame(3, 1), proto::Phase::Encode);
         assert_eq!(busy(&bed.ask(encode).await), Reason::Unspecified);
         assert_eq!(bed.counts.pair_sides.load(Ordering::Relaxed), 1);
-        // A model served by a single worker alone: no prefill of it stands
-        // in the registry's lists.
+        // A model served by a single worker alone: no prefill and no decode
+        // of it stands in the registry's lists.
         serving(
             &bed.store,
             "s9",
@@ -5656,9 +5656,11 @@ pub(crate) mod tests {
             Role::Single,
             WireModes::NONE,
         );
-        let lone = phased(frame_for("model-of-singles", 9, 9), proto::Phase::Prefill);
         let none = declined(proto::ShedReason::NoEndpoints, "none");
-        assert_eq!(*outcome(&bed.ask(lone).await), none);
+        for (id, phase) in (9..).zip([proto::Phase::Prefill, proto::Phase::Decode]) {
+            let lone = phased(frame_for("model-of-singles", id, 9), phase);
+            assert_eq!(*outcome(&bed.ask(lone).await), none, "{phase:?}");
+        }
         assert_eq!(bed.counts.pair_sides.load(Ordering::Relaxed), 1);
         assert_eq!(bed.store.live(GATEWAY), 2);
     }
@@ -5713,6 +5715,43 @@ pub(crate) mod tests {
         ];
         assert_eq!(sides_of(&answer), pair);
         assert_eq!(booked(&bed, [prefill, decoder]), [1, 2]);
+    }
+
+    /// A prefill frame, and a decode frame that names no lease, of a model
+    /// that no binding matches stand alone too: the document pairs the
+    /// sides of another model, and no plan pairs a side of this one. The
+    /// model has workers of each role here, and each frame is declined as
+    /// the model's single request is: by the policy, at the stage
+    /// `binding`. Nothing is filed, and neither frame is counted with the
+    /// sides.
+    #[tokio::test]
+    async fn a_prefill_or_a_decode_frame_of_a_model_no_binding_matches_is_declined_as_its_single_is(
+    ) {
+        let document = r#"{
+          "apiVersion": "smg.policy/v1",
+          "generation": 1,
+          "profiles": { "p": { "pick": "random" } },
+          "bindings": [
+            { "match": { "model": "model-of-another", "phase": ["prefill", "decode"] },
+              "plan": "pd-pair", "profiles": { "prefill": "p", "decode": "p" } },
+            { "match": { "model": "model-of-another" }, "profile": "p" }
+          ]
+        }"#;
+        let document: PolicySpec =
+            serde_json::from_str(document).expect("a document of this build");
+        let mut bed = bed(Some(applied(&document)), true, (2, 8), []);
+        let unbound = declined(proto::ShedReason::PolicyDeclined, "binding");
+        let phases = [
+            proto::Phase::Single,
+            proto::Phase::Prefill,
+            proto::Phase::Decode,
+        ];
+        for (n, phase) in (1..).zip(phases) {
+            let answer = bed.ask(phased(frame(n, 1), phase)).await;
+            assert_eq!(*outcome(&answer), unbound, "{phase:?}");
+        }
+        assert_eq!(bed.counts.pair_sides.load(Ordering::Relaxed), 0);
+        assert_eq!(bed.store.live(GATEWAY), 0);
     }
 
     /// What the engine told a stage of a lease's sides: an issue and a

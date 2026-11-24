@@ -152,6 +152,7 @@ pub struct KeptCredential {
 
 /// A keep found a registration in flight at its address and took nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[expect(clippy::exhaustive_structs, reason = "no field: its name is its value")]
 pub struct RegistrationInFlight;
 
 impl fmt::Display for RegistrationInFlight {

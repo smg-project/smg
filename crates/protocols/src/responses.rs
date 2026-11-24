@@ -1,7 +1,10 @@
 // OpenAI Responses API types
 // https://platform.openai.com/docs/api-reference/responses
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    borrow::Cow,
+    collections::{HashMap, HashSet},
+};
 
 use serde::{
     de::value::{MapAccessDeserializer, MapDeserializer},
@@ -115,6 +118,7 @@ pub enum BuiltInToolChoiceType {
     ComputerUsePreview,
     ComputerUse,
     CodeInterpreter,
+    ProgrammaticToolCalling,
 }
 
 /// Canonical payload for the Responses API `Function` tool-choice variant.
@@ -446,16 +450,16 @@ pub enum ResponseTool {
     #[serde(rename = "shell")]
     Shell(ShellTool),
 
-    /// Built-in `apply_patch` tool — `{ type: "apply_patch" }`.
+    /// Built-in `apply_patch` tool — `{ type: "apply_patch", allowed_callers? }`.
     ///
     /// Spec (openai-responses-api-spec.md §tools, L478): `ApplyPatch
-    /// { type: "apply_patch" }`. Unit variant with no payload — the model is
-    /// simply told the apply_patch surface is available and subsequently emits
+    /// { type: "apply_patch", allowed_callers? }`. The model is told the
+    /// apply_patch surface is available and subsequently emits
     /// `apply_patch_call` items carrying file-edit operations (see
     /// [`ResponseInputOutputItem::ApplyPatchCall`]). Pairs with
     /// [`ResponsesToolChoice::ApplyPatch`] when callers want to force usage.
     #[serde(rename = "apply_patch")]
-    ApplyPatch,
+    ApplyPatch(ApplyPatchTool),
 
     /// Built-in host-execute shell tool — `{ type: "local_shell" }`.
     ///
@@ -473,9 +477,29 @@ pub enum ResponseTool {
     /// Emitted by Codex and Responses clients using deferred tool loading.
     #[serde(rename = "tool_search")]
     ToolSearch(ToolSearchTool),
+
+    /// Programmatic Tool Calling (`{ type: "programmatic_tool_calling" }`).
+    #[serde(rename = "programmatic_tool_calling")]
+    ProgrammaticToolCalling,
 }
 
 impl ResponseTool {
+    /// Whether the tool itself permits direct calls. Check namespace members separately.
+    pub fn allows_direct_calls(&self) -> bool {
+        let callers = match self {
+            Self::Function(tool) => return tool.allows_direct_calls(),
+            Self::Custom(tool) => return tool.allows_direct_calls(),
+            Self::Mcp(tool) => &tool.allowed_callers,
+            Self::CodeInterpreter(tool) => &tool.allowed_callers,
+            Self::Shell(tool) => &tool.allowed_callers,
+            Self::ApplyPatch(tool) => &tool.allowed_callers,
+            _ => return true,
+        };
+        callers
+            .as_ref()
+            .is_none_or(|callers| callers.iter().any(|caller| caller == "direct"))
+    }
+
     /// Wire `type` tag for this variant — matches the variant's
     /// `#[serde(rename = ...)]` attribute. Stable across serde
     /// roundtrips and safe to use as a discriminator string.
@@ -493,11 +517,22 @@ impl ResponseTool {
             ResponseTool::Custom(_) => "custom",
             ResponseTool::Namespace(_) => "namespace",
             ResponseTool::Shell(_) => "shell",
-            ResponseTool::ApplyPatch => "apply_patch",
+            ResponseTool::ApplyPatch(_) => "apply_patch",
             ResponseTool::LocalShell => "local_shell",
             ResponseTool::ToolSearch(_) => "tool_search",
+            ResponseTool::ProgrammaticToolCalling => "programmatic_tool_calling",
         }
     }
+}
+
+/// Payload for [`ResponseTool::ApplyPatch`].
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ApplyPatchTool {
+    /// Allowed invocation contexts (e.g. `["direct"]`, `["programmatic"]`).
+    #[serde(default)]
+    pub allowed_callers: Option<Vec<String>>,
 }
 
 /// Tool-search declaration (`type: "tool_search"`).
@@ -916,6 +951,9 @@ pub struct ShellTool {
     /// Optional environment scope for the shell tool. When omitted, the
     /// model runs commands inside the platform-default environment.
     pub environment: Option<ShellEnvironment>,
+    /// Allowed invocation contexts (e.g. `["direct"]`, `["programmatic"]`).
+    #[serde(default)]
+    pub allowed_callers: Option<Vec<String>>,
 }
 
 /// Tool-side environment union carried on [`ShellTool::environment`].
@@ -1254,6 +1292,12 @@ pub struct McpTool {
     /// Not yet present in OpenAI Python SDK 2.8.1 `types/responses/tool.py`;
     /// included here to track the documented Responses API surface.
     pub defer_loading: Option<bool>,
+    /// Allowed invocation contexts (e.g. `["direct"]`, `["programmatic"]`).
+    #[serde(default)]
+    pub allowed_callers: Option<Vec<String>>,
+    /// Optional tunnel identifier for hosted MCP transport.
+    #[serde(default)]
+    pub tunnel_id: Option<String>,
 }
 
 /// Allowed-tools filter for an MCP tool.
@@ -1418,6 +1462,9 @@ pub struct WebSearchUserLocation {
 pub struct CodeInterpreterTool {
     pub container: Option<Value>,
     pub environment: Option<ResponseToolEnvironment>,
+    /// Allowed invocation contexts (e.g. `["direct"]`, `["programmatic"]`).
+    #[serde(default)]
+    pub allowed_callers: Option<Vec<String>>,
 }
 
 #[serde_with::skip_serializing_none]
@@ -1872,6 +1919,15 @@ impl AgentMessageContentPart {
     }
 }
 
+/// Execution context that produced a tool call or output (OpenAI Responses API
+/// Programmatic Tool Calling).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, schemars::JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ToolCallCaller {
+    Direct,
+    Program { caller_id: String },
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]
@@ -1916,6 +1972,8 @@ pub enum ResponseInputOutputItem {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<String>,
         call_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller: Option<ToolCallCaller>,
         name: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         namespace: Option<String>,
@@ -1929,7 +1987,14 @@ pub enum ResponseInputOutputItem {
     FunctionCallOutput {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<String>,
-        call_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller: Option<ToolCallCaller>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        namespace: Option<String>,
         output: StringOrContentParts,
         #[serde(skip_serializing_if = "Option::is_none")]
         status: Option<String>,
@@ -1976,7 +2041,8 @@ pub enum ResponseInputOutputItem {
     /// side.
     #[serde(rename = "image_generation_call")]
     ImageGenerationCall {
-        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
         /// `"generate" | "edit" | "auto"` — which image-generation action the
         /// prior turn dispatched. Preserved free-form so future actions pass
         /// through without a wire break.
@@ -1986,6 +2052,9 @@ pub enum ResponseInputOutputItem {
         /// `image_generation` tool input knob of the same name.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         background: Option<String>,
+        /// Optional error payload carried on failed image-generation items.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<Value>,
         /// `"png" | "webp" | "jpeg"`. Matches the `image_generation` tool
         /// input knob of the same name.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2009,6 +2078,9 @@ pub enum ResponseInputOutputItem {
         /// Generation status. Omitted on id-only references.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         status: Option<ImageGenerationCallStatus>,
+        /// Optional SVG usage metadata.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        svg_usage: Option<Value>,
     },
     /// `type: "compaction"` — opaque compacted-history payload generated by
     /// the `/v1/responses/compact` API. Spec
@@ -2081,6 +2153,8 @@ pub enum ResponseInputOutputItem {
     #[serde(rename = "custom_tool_call")]
     CustomToolCall {
         call_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller: Option<ToolCallCaller>,
         input: String,
         name: String,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -2089,14 +2163,18 @@ pub enum ResponseInputOutputItem {
         namespace: Option<String>,
     },
     /// `type: "custom_tool_call_output"` — client's response to a
-    /// `custom_tool_call`. Spec: `{ call_id, output, type, id? }` (no
-    /// `status` field per spec). `id` is
-    /// `Option<String>` for the same reason as `CustomToolCall.id` above.
-    /// `output` is either a plain string or an array of input-typed content
-    /// parts (`input_text` / `input_image` / `input_file`).
+    /// `custom_tool_call`. Spec: `{ call_id, output, type, id?, caller?, name? }`
+    /// (no `status` field per spec). `id` is `Option<String>` for the same
+    /// reason as `CustomToolCall.id` above. `output` is either a plain string
+    /// or an array of input-typed content parts (`input_text` / `input_image`
+    /// / `input_file`).
     #[serde(rename = "custom_tool_call_output")]
     CustomToolCallOutput {
         call_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller: Option<ToolCallCaller>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
         output: CustomToolCallOutputContent,
         #[serde(skip_serializing_if = "Option::is_none")]
         id: Option<String>,
@@ -2106,7 +2184,7 @@ pub enum ResponseInputOutputItem {
     ///
     /// Spec (openai-responses-api-spec.md §ShellCall, L228-231) +
     /// OpenAI SDK v2.8.1 `ResponseFunctionShellToolCall`:
-    /// `{ action, call_id, type, id, environment, status, created_by? }`.
+    /// `{ action, call_id, type, id, environment, status, created_by?, caller? }`.
     /// `id` is `Option<String>` so newly-minted client-side calls can omit
     /// it; the model populates it on items round-tripped from a previous
     /// response. `created_by` carries provenance metadata the SDK types
@@ -2116,6 +2194,8 @@ pub enum ResponseInputOutputItem {
     ShellCall {
         action: ShellCallAction,
         call_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller: Option<ToolCallCaller>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<String>,
         /// Resolved execution environment. Spec constrains this to
@@ -2136,13 +2216,15 @@ pub enum ResponseInputOutputItem {
     ///
     /// Spec (openai-responses-api-spec.md §ShellCallOutput, L233-238) +
     /// OpenAI SDK v2.8.1 `ResponseFunctionShellToolCallOutput`:
-    /// `{ call_id, output, type, id, max_output_length?, status, created_by? }`.
+    /// `{ call_id, output, type, id, max_output_length?, status, created_by?, caller? }`.
     /// `id`, `max_output_length`, and `created_by` are modelled as
     /// `Option` per the SDK's `Optional[...]` typing; the server populates
     /// them on items round-tripped from a previous response.
     #[serde(rename = "shell_call_output")]
     ShellCallOutput {
         call_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller: Option<ToolCallCaller>,
         output: Vec<ShellOutputChunk>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<String>,
@@ -2157,7 +2239,7 @@ pub enum ResponseInputOutputItem {
     },
     /// `type: "apply_patch_call"` — model-issued file-edit request. Spec
     /// (openai-responses-api-spec.md §ApplyPatchCall L240-L246):
-    /// `{ call_id, operation, status, type, id }`. `id` is `Option<String>`
+    /// `{ call_id, operation, status, type, id, caller? }`. `id` is `Option<String>`
     /// so newly-minted client-side calls can omit it; it is always present on
     /// items round-tripped from a previous response. The `operation` union is
     /// `CreateFile | DeleteFile | UpdateFile` per
@@ -2166,6 +2248,8 @@ pub enum ResponseInputOutputItem {
     #[serde(rename = "apply_patch_call")]
     ApplyPatchCall {
         call_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller: Option<ToolCallCaller>,
         operation: ApplyPatchOperation,
         status: ApplyPatchCallStatus,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -2174,13 +2258,15 @@ pub enum ResponseInputOutputItem {
     /// `type: "apply_patch_call_output"` — client's response to an
     /// `apply_patch_call`. Spec (openai-responses-api-spec.md
     /// §ApplyPatchCallOutput L248-L251): `{ call_id, status, type, id,
-    /// output }` where `output` is optional log text. `id` is
+    /// output, caller? }` where `output` is optional log text. `id` is
     /// `Option<String>` for the same reason as `ApplyPatchCall.id` above;
     /// `output` uses `skip_serializing_if` so a no-log success round-trips
     /// without emitting an explicit `null`.
     #[serde(rename = "apply_patch_call_output")]
     ApplyPatchCallOutput {
         call_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller: Option<ToolCallCaller>,
         status: ApplyPatchCallOutputStatus,
         #[serde(skip_serializing_if = "Option::is_none")]
         id: Option<String>,
@@ -2190,14 +2276,16 @@ pub enum ResponseInputOutputItem {
     /// `type: "local_shell_call"` — assistant's call into the
     /// `local_shell` built-in tool. Spec
     /// (openai-responses-api-spec.md §LocalShellCall L219-222):
-    /// `{ id, action, call_id, status, type }` where `action` is a
+    /// `{ id?, action, call_id?, status, type }` where `action` is a
     /// [`LocalShellExec`] payload describing the command to run on the
-    /// host. The client executes the command and replies with a
-    /// matching [`Self::LocalShellCallOutput`].
+    /// host. `id` and `call_id` are optional on input to match Codex's wire
+    /// shape.
     #[serde(rename = "local_shell_call")]
     LocalShellCall {
-        id: String,
-        call_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call_id: Option<String>,
         action: LocalShellExec,
         status: LocalShellCallStatus,
     },
@@ -2285,6 +2373,66 @@ pub enum ResponseInputOutputItem {
         /// Codex stamps agent mail with creation time and content attribution.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         internal_chat_message_metadata_passthrough: Option<serde_json::Map<String, Value>>,
+    },
+    /// `type: "tool_search_call"` — deferred tool discovery invocation.
+    #[serde(rename = "tool_search_call")]
+    ToolSearchCall {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call_id: Option<String>,
+        arguments: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        execution: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+    },
+    /// `type: "tool_search_output"` — tool definitions returned for a
+    /// `tool_search_call`.
+    #[serde(rename = "tool_search_output")]
+    ToolSearchOutput {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        execution: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+        tools: Vec<Value>,
+    },
+    /// `type: "web_search_call"` — hosted web-search call replayed in history
+    /// (including cross-model session continuations).
+    #[serde(rename = "web_search_call")]
+    WebSearchCall {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        action: Option<Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        results: Option<Vec<WebSearchResult>>,
+    },
+    /// `type: "program"` — Programmatic Tool Calling program item.
+    #[serde(rename = "program")]
+    Program {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        call_id: String,
+        code: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fingerprint: Option<String>,
+    },
+    /// `type: "program_output"` — output of a Programmatic Tool Calling item.
+    #[serde(rename = "program_output")]
+    ProgramOutput {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        call_id: String,
+        result: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
     },
     #[serde(untagged)]
     SimpleInputMessage {
@@ -2636,6 +2784,8 @@ enum TaggedItem {
         #[serde(default)]
         id: Option<String>,
         call_id: String,
+        #[serde(default)]
+        caller: Option<ToolCallCaller>,
         name: String,
         #[serde(default)]
         namespace: Option<String>,
@@ -2647,7 +2797,14 @@ enum TaggedItem {
     FunctionCallOutput {
         #[serde(default)]
         id: Option<String>,
-        call_id: String,
+        #[serde(default)]
+        call_id: Option<String>,
+        #[serde(default)]
+        caller: Option<ToolCallCaller>,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        namespace: Option<String>,
         output: StringOrContentParts,
         status: Option<String>,
     },
@@ -2667,11 +2824,14 @@ enum TaggedItem {
     },
     #[serde(rename = "image_generation_call")]
     ImageGenerationCall {
-        id: String,
+        #[serde(default)]
+        id: Option<String>,
         #[serde(default)]
         action: Option<String>,
         #[serde(default)]
         background: Option<String>,
+        #[serde(default)]
+        error: Option<Value>,
         #[serde(default)]
         output_format: Option<String>,
         #[serde(default)]
@@ -2684,6 +2844,8 @@ enum TaggedItem {
         size: Option<String>,
         #[serde(default)]
         status: Option<ImageGenerationCallStatus>,
+        #[serde(default)]
+        svg_usage: Option<Value>,
     },
     #[serde(rename = "compaction")]
     Compaction {
@@ -2717,6 +2879,8 @@ enum TaggedItem {
     #[serde(rename = "custom_tool_call")]
     CustomToolCall {
         call_id: String,
+        #[serde(default)]
+        caller: Option<ToolCallCaller>,
         input: String,
         name: String,
         id: Option<String>,
@@ -2725,6 +2889,10 @@ enum TaggedItem {
     #[serde(rename = "custom_tool_call_output")]
     CustomToolCallOutput {
         call_id: String,
+        #[serde(default)]
+        caller: Option<ToolCallCaller>,
+        #[serde(default)]
+        name: Option<String>,
         output: CustomToolCallOutputContent,
         id: Option<String>,
     },
@@ -2732,6 +2900,8 @@ enum TaggedItem {
     ShellCall {
         action: ShellCallAction,
         call_id: String,
+        #[serde(default)]
+        caller: Option<ToolCallCaller>,
         #[serde(default)]
         id: Option<String>,
         #[serde(default)]
@@ -2744,6 +2914,8 @@ enum TaggedItem {
     #[serde(rename = "shell_call_output")]
     ShellCallOutput {
         call_id: String,
+        #[serde(default)]
+        caller: Option<ToolCallCaller>,
         output: Vec<ShellOutputChunk>,
         #[serde(default)]
         id: Option<String>,
@@ -2757,6 +2929,8 @@ enum TaggedItem {
     #[serde(rename = "apply_patch_call")]
     ApplyPatchCall {
         call_id: String,
+        #[serde(default)]
+        caller: Option<ToolCallCaller>,
         operation: ApplyPatchOperation,
         status: ApplyPatchCallStatus,
         id: Option<String>,
@@ -2764,14 +2938,18 @@ enum TaggedItem {
     #[serde(rename = "apply_patch_call_output")]
     ApplyPatchCallOutput {
         call_id: String,
+        #[serde(default)]
+        caller: Option<ToolCallCaller>,
         status: ApplyPatchCallOutputStatus,
         id: Option<String>,
         output: Option<String>,
     },
     #[serde(rename = "local_shell_call")]
     LocalShellCall {
-        id: String,
-        call_id: String,
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(default)]
+        call_id: Option<String>,
         action: LocalShellExec,
         status: LocalShellCallStatus,
     },
@@ -2822,6 +3000,59 @@ enum TaggedItem {
         content: Vec<AgentMessageContentPart>,
         #[serde(default)]
         internal_chat_message_metadata_passthrough: Option<serde_json::Map<String, Value>>,
+    },
+    #[serde(rename = "tool_search_call")]
+    ToolSearchCall {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(default)]
+        call_id: Option<String>,
+        arguments: Value,
+        #[serde(default)]
+        execution: Option<String>,
+        #[serde(default)]
+        status: Option<String>,
+    },
+    #[serde(rename = "tool_search_output")]
+    ToolSearchOutput {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(default)]
+        call_id: Option<String>,
+        #[serde(default)]
+        execution: Option<String>,
+        #[serde(default)]
+        status: Option<String>,
+        tools: Vec<Value>,
+    },
+    #[serde(rename = "web_search_call")]
+    WebSearchCall {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(default)]
+        status: Option<String>,
+        #[serde(default)]
+        action: Option<Value>,
+        #[serde(default)]
+        results: Option<Vec<WebSearchResult>>,
+    },
+    #[serde(rename = "program")]
+    Program {
+        #[serde(default)]
+        id: Option<String>,
+        call_id: String,
+        code: String,
+        #[serde(default)]
+        fingerprint: Option<String>,
+    },
+    #[serde(rename = "program_output")]
+    ProgramOutput {
+        #[serde(default)]
+        id: Option<String>,
+        call_id: String,
+        result: Value,
+        #[serde(default)]
+        status: Option<String>,
     },
 }
 
@@ -4197,6 +4428,26 @@ pub struct ResponsesRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_management: Option<Vec<ContextManagementEntry>>,
 
+    /// Prompt cache options (`{ comparison_response_id?, mode?, prewarm?, ttl? }`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_options: Option<Value>,
+
+    /// Background execution options (`{ completion_window?, continuation_id? }`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background_options: Option<Value>,
+
+    /// Per-request moderation configuration (`{ model, policy? }`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub moderation: Option<Value>,
+
+    /// Per-request image processing options (`{ context_compression? }`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<Value>,
+
+    /// Optional access-program flags (`{ cyber? }`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_programs: Option<Value>,
+
     /// Client-side tracing metadata (Codex sends installation / session /
     /// thread / turn ids and a W3C traceparent here on every request).
     /// Accepted so such clients are not rejected with `unknown_parameter`;
@@ -4327,6 +4578,11 @@ impl Default for ResponsesRequest {
             prompt: None,
             prompt_cache_key: None,
             prompt_cache_retention: None,
+            prompt_cache_options: None,
+            background_options: None,
+            moderation: None,
+            image: None,
+            access_programs: None,
             safety_identifier: None,
             stream_options: None,
             context_management: None,
@@ -4340,9 +4596,7 @@ impl Default for ResponsesRequest {
 
 impl Normalizable for ResponsesRequest {
     /// Normalize the request by applying defaults:
-    /// 1. Apply tool_choice defaults based on tools presence (including inline
-    ///    `additional_tools` declarations so an empty top-level `tools: []`
-    ///    does not silently default to `"none"` and disable inline tools)
+    /// 1. Apply tool_choice defaults based on top-level, inline, and discovered tools
     /// 2. Apply parallel_tool_calls defaults
     /// 3. Apply store field defaults
     fn normalize(&mut self) {
@@ -4360,8 +4614,6 @@ impl Normalizable for ResponsesRequest {
                 // open until the backend has loaded the preceding turn.
                 self.tool_choice = Some(ResponsesToolChoice::Options(ToolChoiceOptions::None));
             }
-            // If neither top-level `tools` nor inline `additional_tools` is
-            // present, leave tool_choice as None.
         }
 
         // 2. Apply default for parallel_tool_calls if tools are present
@@ -4451,7 +4703,12 @@ impl GenerationRequest for ResponsesRequest {
                         | ResponseInputOutputItem::LocalShellCall { .. }
                         | ResponseInputOutputItem::LocalShellCallOutput { .. }
                         | ResponseInputOutputItem::McpCall { .. }
-                        | ResponseInputOutputItem::McpListTools { .. } => {}
+                        | ResponseInputOutputItem::McpListTools { .. }
+                        | ResponseInputOutputItem::ToolSearchCall { .. }
+                        | ResponseInputOutputItem::ToolSearchOutput { .. }
+                        | ResponseInputOutputItem::WebSearchCall { .. }
+                        | ResponseInputOutputItem::Program { .. }
+                        | ResponseInputOutputItem::ProgramOutput { .. } => {}
                     }
                 }
 
@@ -4495,23 +4752,34 @@ pub fn validate_conversation_id(conv: &ConversationRef) -> Result<(), Validation
     Ok(())
 }
 
-/// Iterate over every tool declared on the request: top-level `tools` first,
-/// followed by tools declared inline via `additional_tools` items in `input`.
-fn all_declared_tools(request: &ResponsesRequest) -> impl Iterator<Item = (&ResponseTool, bool)> {
+/// Iterate over top-level, inline, and discovered tool declarations.
+fn all_declared_tools(
+    request: &ResponsesRequest,
+) -> impl Iterator<Item = (Cow<'_, ResponseTool>, bool)> {
     let top_level = request
         .tools
         .as_deref()
         .unwrap_or_default()
         .iter()
-        .map(|tool| (tool, false));
+        .map(|tool| (Cow::Borrowed(tool), false));
     let inline = match &request.input {
         ResponseInput::Items(items) => items.as_slice(),
         ResponseInput::Text(_) => &[],
     }
     .iter()
-    .flat_map(|item| match item {
-        ResponseInputOutputItem::AdditionalTools { tools, .. } => tools.as_slice(),
-        _ => &[],
+    .flat_map(|item| {
+        let (tools, discovered) = match item {
+            ResponseInputOutputItem::AdditionalTools { tools, .. } => (tools.as_slice(), &[][..]),
+            ResponseInputOutputItem::ToolSearchOutput { tools, .. } => (&[][..], tools.as_slice()),
+            _ => (&[][..], &[][..]),
+        };
+        tools.iter().map(Cow::Borrowed).chain(
+            // The wire item is kept raw for upstream passthrough. Local lowering
+            // reports malformed declarations using their input and tool indices.
+            discovered
+                .iter()
+                .filter_map(|value| ResponseTool::deserialize(value).ok().map(Cow::Owned)),
+        )
     })
     .map(|tool| (tool, true));
     top_level.chain(inline)
@@ -4523,46 +4791,29 @@ fn validate_tool_choice_with_tools(request: &ResponsesRequest) -> Result<(), Val
         return Ok(());
     };
 
-    let has_tools = all_declared_tools(request).next().is_some();
     // `none` and `auto` name no tool, so they stand without tools (with nothing
     // to call, `auto` answers in text as an omitted `tool_choice` does); Codex
     // sends `tools: []` with `tool_choice: "auto"` when it compacts a
     // conversation.
-    let is_some_choice = !matches!(
+    if matches!(
         tool_choice,
         ResponsesToolChoice::Options(ToolChoiceOptions::None | ToolChoiceOptions::Auto)
-    );
+    ) {
+        return Ok(());
+    }
 
-    // Check if tool_choice requires tools but none are provided
-    if is_some_choice && !has_tools {
+    let declared_tools: Vec<_> = all_declared_tools(request).collect();
+    if declared_tools.is_empty() {
         return Err(invalid(
             "tool_choice_requires_tools",
             "Invalid value for 'tool_choice': 'tool_choice' is only allowed when 'tools' are specified.",
         ));
     }
-
-    // Validate tool references exist when tools are present
-    if !has_tools {
-        return Ok(());
-    }
-
-    // Extract function tool names from top-level tools and inline additional_tools
-    let mut function_tool_names: Vec<&str> = Vec::new();
-    for (tool, from_additional_tools) in all_declared_tools(request) {
-        match tool {
-            ResponseTool::Function(ft) => function_tool_names.push(ft.function.name.as_str()),
-            ResponseTool::Namespace(namespace)
-                if from_additional_tools && namespace.name == "functions" =>
-            {
-                for member in &namespace.tools {
-                    if let NamespaceTool::Function(ft) = member {
-                        function_tool_names.push(ft.function.name.as_str());
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
+    let tools = || {
+        declared_tools
+            .iter()
+            .map(|(tool, inline)| (tool.as_ref(), *inline))
+    };
 
     // Validate tool references exist
     match tool_choice {
@@ -4571,11 +4822,11 @@ fn validate_tool_choice_with_tools(request: &ResponsesRequest) -> Result<(), Val
             // the underlying wire shape (flat vs. legacy nested) — both are
             // normalized at deserialize time.
             if let Some(name) = tool_choice.function_name() {
-                let found = all_declared_tools(request).any(|(tool, from_additional_tools)| {
+                let found = tools().any(|(tool, from_inline)| {
                     match (tool, choice.namespace.as_deref()) {
                         (ResponseTool::Function(function), None) => function.function.name == name,
                         (ResponseTool::Namespace(namespace), None)
-                            if from_additional_tools && namespace.name == "functions" =>
+                            if from_inline && namespace.name == "functions" =>
                         {
                             namespace.tools.iter().any(|member| {
                                 matches!(member, NamespaceTool::Function(function) if function.function.name == name)
@@ -4617,7 +4868,16 @@ fn validate_tool_choice_with_tools(request: &ResponsesRequest) -> Result<(), Val
             // Validate that all function tool references exist
             for tool_ref in allowed_tools {
                 if let ToolReference::Function { name } = tool_ref {
-                    if !function_tool_names.contains(&name.as_str()) {
+                    let found = tools().any(|(tool, from_inline)| match tool {
+                        ResponseTool::Function(function) => function.function.name == *name,
+                        ResponseTool::Namespace(namespace) if from_inline && namespace.name == "functions" => {
+                            namespace.tools.iter().any(|member| {
+                                matches!(member, NamespaceTool::Function(function) if function.function.name == *name)
+                            })
+                        }
+                        _ => false,
+                    });
+                    if !found {
                         return Err(invalid(
                             "tool_choice_tool_not_found",
                             format!(
@@ -4688,7 +4948,7 @@ fn validate_openai_structured_output_rules(
     request: &ResponsesRequest,
 ) -> Result<(), ValidationError> {
     for (tool, _) in all_declared_tools(request) {
-        match tool {
+        match tool.as_ref() {
             ResponseTool::Function(function_tool) => {
                 validate_strict_function_schema(&function_tool.function)?;
             }
@@ -5005,6 +5265,11 @@ fn validate_input_item(
         // cleanly.
         ResponseInputOutputItem::McpCall { .. } => {}
         ResponseInputOutputItem::McpListTools { .. } => {}
+        ResponseInputOutputItem::ToolSearchCall { .. }
+        | ResponseInputOutputItem::ToolSearchOutput { .. }
+        | ResponseInputOutputItem::WebSearchCall { .. }
+        | ResponseInputOutputItem::Program { .. }
+        | ResponseInputOutputItem::ProgramOutput { .. } => {}
     }
     Ok(())
 }
@@ -5095,8 +5360,11 @@ fn validate_response_tools(tools: &[ResponseTool]) -> Result<(), ValidationError
 
 /// Validates a ResponseTool array, naming any refusal under `prefix`
 /// (`"tools"` for top-level declarations or `"input[i].tools"` for inline
-/// `additional_tools`).
-fn validate_response_tools_at(tools: &[ResponseTool], prefix: &str) -> Result<(), ValidationError> {
+/// and discovered tools).
+pub fn validate_response_tools_at(
+    tools: &[ResponseTool],
+    prefix: &str,
+) -> Result<(), ValidationError> {
     // MCP server_label must be present and unique (case-insensitive).
     let mut seen_mcp_labels: HashSet<String> = HashSet::new();
 
@@ -5388,7 +5656,11 @@ fn tool_call_id(item: &ResponseInputOutputItem) -> Option<&str> {
         | ResponseInputOutputItem::ComputerCall { call_id, .. }
         | ResponseInputOutputItem::ShellCall { call_id, .. }
         | ResponseInputOutputItem::ApplyPatchCall { call_id, .. }
-        | ResponseInputOutputItem::LocalShellCall { call_id, .. } => Some(call_id),
+        | ResponseInputOutputItem::Program { call_id, .. } => Some(call_id),
+        ResponseInputOutputItem::LocalShellCall { id, call_id, .. } => {
+            call_id.as_deref().or(id.as_deref())
+        }
+        ResponseInputOutputItem::ToolSearchCall { call_id, .. } => call_id.as_deref(),
         _ => None,
     }
 }
@@ -5398,10 +5670,12 @@ fn tool_call_id(item: &ResponseInputOutputItem) -> Option<&str> {
 fn tool_output_call_id(item: &ResponseInputOutputItem) -> Option<&str> {
     match item {
         ResponseInputOutputItem::FunctionCallOutput { call_id, .. }
-        | ResponseInputOutputItem::CustomToolCallOutput { call_id, .. }
+        | ResponseInputOutputItem::ToolSearchOutput { call_id, .. } => call_id.as_deref(),
+        ResponseInputOutputItem::CustomToolCallOutput { call_id, .. }
         | ResponseInputOutputItem::ComputerCallOutput { call_id, .. }
         | ResponseInputOutputItem::ShellCallOutput { call_id, .. }
-        | ResponseInputOutputItem::ApplyPatchCallOutput { call_id, .. } => Some(call_id),
+        | ResponseInputOutputItem::ApplyPatchCallOutput { call_id, .. }
+        | ResponseInputOutputItem::ProgramOutput { call_id, .. } => Some(call_id),
         ResponseInputOutputItem::LocalShellCallOutput { id, .. } => Some(id),
         _ => None,
     }
@@ -6028,16 +6302,16 @@ mod tests {
     }
 
     /// Every tagged variant's smallest payload.
-    const SMALLEST_TAGGED_ITEMS: [&str; 22] = [
+    const SMALLEST_TAGGED_ITEMS: [&str; 27] = [
         r#"{"type":"additional_tools","tools":[]}"#,
         r#"{"type":"agent_message","author":"root","recipient":"worker","content":[]}"#,
         r#"{"type":"message","id":"msg_1","role":"user","content":[]}"#,
         r#"{"type":"reasoning","content":null}"#,
         r#"{"type":"function_call","call_id":"call_1","name":"lookup","arguments":"{}"}"#,
-        r#"{"type":"function_call_output","call_id":"call_1","output":"found"}"#,
+        r#"{"type":"function_call_output","output":"found"}"#,
         r#"{"type":"mcp_approval_request","id":"mcpr_1","server_label":"docs","name":"search","arguments":"{}"}"#,
         r#"{"type":"mcp_approval_response","approval_request_id":"mcpr_1","approve":true}"#,
-        r#"{"type":"image_generation_call","id":"ig_1"}"#,
+        r#"{"type":"image_generation_call"}"#,
         r#"{"type":"compaction","encrypted_content":"opaque"}"#,
         r#"{"type":"computer_call","id":"cu_1","call_id":"call_1","status":"completed"}"#,
         r#"{"type":"computer_call_output","call_id":"call_1","output":{"type":"computer_screenshot"},"acknowledged_safety_checks":null}"#,
@@ -6047,10 +6321,15 @@ mod tests {
         r#"{"type":"shell_call_output","call_id":"call_1","output":[]}"#,
         r#"{"type":"apply_patch_call","call_id":"call_1","operation":{"type":"delete_file","path":"old.txt"},"status":"completed"}"#,
         r#"{"type":"apply_patch_call_output","call_id":"call_1","status":"completed"}"#,
-        r#"{"type":"local_shell_call","id":"lsh_1","call_id":"call_1","action":{"type":"exec","command":["ls"],"env":{}},"status":"completed"}"#,
+        r#"{"type":"local_shell_call","action":{"type":"exec","command":["ls"],"env":{}},"status":"completed"}"#,
         r#"{"type":"local_shell_call_output","id":"lsh_1","output":"ok"}"#,
         r#"{"type":"mcp_call","id":"mcp_1","arguments":"{}","name":"search","server_label":"docs","error":"boom"}"#,
         r#"{"type":"mcp_list_tools","id":"mcpl_1","server_label":"docs","tools":[]}"#,
+        r#"{"type":"tool_search_call","arguments":{"query":"weather"}}"#,
+        r#"{"type":"tool_search_output","tools":[]}"#,
+        r#"{"type":"web_search_call"}"#,
+        r#"{"type":"program","call_id":"prog_1","code":"return 1;"}"#,
+        r#"{"type":"program_output","call_id":"prog_1","result":"1"}"#,
     ];
 
     /// Every tagged variant's smallest payload reads the same through the
@@ -6293,6 +6572,9 @@ mod tests {
             {"type": "function_call_output", "call_id": "call_kept", "output": "2"},
             {"type": "custom_tool_call_output", "call_id": "call_gone_too", "output": "3"},
             {"type": "local_shell_call_output", "id": "call_gone_shell", "output": "4"},
+            {"type": "local_shell_call", "id": "ls_1",
+             "action": {"type": "exec", "command": ["pwd"], "env": {}}, "status": "completed"},
+            {"type": "local_shell_call_output", "id": "ls_1", "output": "5"},
             {"type": "message", "id": "msg_2", "role": "assistant",
              "content": [{"type": "output_text", "text": "ok", "annotations": []}]},
         ]))
@@ -6315,12 +6597,15 @@ mod tests {
                 "message",
                 "function_call",
                 "function_call_output",
+                "local_shell_call",
+                "local_shell_call_output",
                 "message"
             ]
         );
         assert!(matches!(
             &kept[2],
-            ResponseInputOutputItem::FunctionCallOutput { call_id, .. } if call_id == "call_kept"
+            ResponseInputOutputItem::FunctionCallOutput { call_id, .. }
+                if call_id.as_deref() == Some("call_kept")
         ));
     }
 
@@ -6626,7 +6911,7 @@ mod tests {
     fn response_tool_as_str_matches_serde_tag_for_unit_variants() {
         for tool in [
             ResponseTool::Computer,
-            ResponseTool::ApplyPatch,
+            ResponseTool::ApplyPatch(ApplyPatchTool::default()),
             ResponseTool::LocalShell,
         ] {
             let serialized = serde_json::to_value(&tool).unwrap();

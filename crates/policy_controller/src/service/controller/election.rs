@@ -28,6 +28,11 @@
 //! hand-over names that term, and the thread drops one whose term this replica
 //! no longer holds the lease under: that lease is left already.
 
+#![expect(
+    clippy::exhaustive_structs,
+    reason = "a caller still builds or matches these types whole: each mark comes with its call"
+)]
+
 use std::{
     fmt, io,
     net::{IpAddr, SocketAddr},
@@ -57,6 +62,7 @@ const RELEASE_ATTEMPTS: u32 = 3;
 
 /// Where the lease lives.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum LeasePlace {
     /// A record in this process: one replica, which leads itself. A second
     /// replica under this place leads too; replicas need a shared place.
@@ -278,6 +284,7 @@ pub(crate) fn split_identity(identity: &str) -> (&str, &str) {
 
 /// The lease could not be opened.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum LeaseError {
     /// The lease file's directory is not there: the file is created at the
     /// first take, its directory never.

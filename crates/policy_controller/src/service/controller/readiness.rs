@@ -27,6 +27,7 @@ use crate::service::elector::Fence;
 
 /// Where the controller is between its start and its exit.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum State {
     /// Binding, wiring and the first look at the lease; the probes answer
     /// not ready. A controller that cannot reach its lease stays here.

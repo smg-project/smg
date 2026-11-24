@@ -1,6 +1,12 @@
 //! The load sink: one row per rank from any of the three sources, with the
 //! poll arbitration per worker (design 5.1, the loads row).
 
+#![expect(
+    clippy::exhaustive_enums,
+    clippy::exhaustive_structs,
+    reason = "the store's copy of this worker data leaves the crate, and its types with it"
+)]
+
 use std::time::{Duration, Instant};
 
 use crate::{

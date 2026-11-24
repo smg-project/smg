@@ -4,6 +4,12 @@
 //! on its stream and the host's fallback takes over at once, so the enum
 //! never carries one.
 
+#![expect(
+    clippy::exhaustive_enums,
+    clippy::exhaustive_structs,
+    reason = "a caller still builds or matches these types whole: each mark comes with its call"
+)]
+
 use std::fmt;
 
 #[cfg(any(test, feature = "in-process"))]
@@ -261,6 +267,7 @@ impl Targets {
 /// Why a decision shed the request. The host maps each reason to its status
 /// code and `Retry-After`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[expect(clippy::exhaustive_enums, reason = "a caller answers every case")]
 pub enum ShedReason {
     /// Every candidate is over the overload thresholds and shedding is on.
     Saturated,
@@ -464,6 +471,7 @@ impl Trace {
 /// Where the blocks a pick's first target holds were read ([`Overlap`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum OverlapSource {
     /// Nothing is held, or nothing is stated.
     #[default]
@@ -471,7 +479,7 @@ pub enum OverlapSource {
     /// The event index.
     Index,
     /// What the worker was sent: the sent-prefix predictor, or the match of
-    /// a token tree the host lends.
+    /// a tree the host lends.
     Predictor,
 }
 
@@ -489,18 +497,21 @@ pub enum OverlapSource {
 /// the binding's sessions rule keeps from the profile.
 /// [`Engine::decide`](crate::engine::Engine::decide) itself states nothing.
 ///
-/// A request decided inside a token tree its host lends is given the rows
-/// the tree's match names, and its pick states by them: the match's tokens
-/// counted in the request's blocks for a worker named among the match's
-/// holders, and a miss for any other. Past the profile's sample the holders
-/// named are a draw. A match under one block is a miss.
+/// A request decided inside a tree its host lends is given the rows the
+/// tree's match names, and its pick states by them: the match's tokens, or
+/// the bytes of text it matched, counted in the request's blocks for a
+/// worker named among the match's holders, and a miss for any other. Past
+/// the profile's sample the holders named are a draw. A match under one
+/// block is a miss.
 ///
 /// Six bytes, in bytes a pick's targets had spare behind their count: a
 /// pick is no larger for it ([`Pick::overlap`]).
 ///
-/// The record gains fields: code outside this crate that builds one writes the
-/// rest as `..Overlap::default()`, and a pattern of it ends with `..`.
+/// The record gains fields: code outside this crate starts one from
+/// [`Overlap::NONE`] or `Overlap::default()` and assigns the fields it sets,
+/// and a pattern of it ends with `..`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Overlap {
     /// The leading blocks the worker holds: the larger of its entry's two
     /// readings, the index's and the sent-prefix predictor's. Halved with
@@ -583,7 +594,7 @@ impl Overlap {
 /// (`lease_events::stages_hear`): by the front in a gateway's own process,
 /// and by a controller where it files the pick's lease. Under `untold` no
 /// stage hears the issue or the dispatch of such a single request, the
-/// record of sent prompts takes no entry behind it and a lent token tree
+/// record of sent prompts takes no entry behind it and a lent tree
 /// stores no prompt for it, as a gateway's sticky map keeps a request it
 /// places from the gateway's policy. Under `told`, the default, the stages
 /// hear both and where the prompt went is kept as behind any pick. The
@@ -597,6 +608,7 @@ impl Overlap {
 /// first: a pick is no larger for it ([`Pick::placed_by`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum PlacedBy {
     /// The profile's stages. Every pick no sessions rule placed reads this:
     /// a request with no key is never the rule's, whoever placed it.
@@ -625,9 +637,11 @@ enum Placing {
 /// request ([`crate::engine::RequestFacts::session`]) for every keyed request, rule
 /// or no rule: the verdict alone says whether the commit moves a pin.
 ///
-/// The record gains fields: code outside this crate that builds one writes the
-/// rest as `..Pick::default()`, and a pattern of it ends with `..`.
+/// The record gains fields: code outside this crate starts one from
+/// `Pick::default()` and assigns the fields it sets, and a pattern of it
+/// ends with `..`.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[non_exhaustive]
 pub struct Pick {
     pub targets: Targets,
     pub trace: Trace,
@@ -690,6 +704,7 @@ pub struct Queue {
 
 /// What a decision answers.
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[expect(clippy::exhaustive_enums, reason = "a caller answers every case")]
 pub enum Decision {
     Pick(Pick),
     Shed(Shed),

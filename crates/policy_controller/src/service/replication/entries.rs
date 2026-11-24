@@ -7,6 +7,7 @@
 
 /// How a standby comes to hold what an entry writes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum EntryReplication {
     /// The store tells its journal: a standby applies the leader's event.
     Journaled,

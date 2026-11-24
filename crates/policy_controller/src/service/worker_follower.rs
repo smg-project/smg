@@ -20,6 +20,11 @@
 //! answers can name a row whose event the watch has not told yet. The
 //! owner passes that target over and asks again.
 
+#![expect(
+    clippy::exhaustive_structs,
+    reason = "a caller still builds or matches these types whole: each mark comes with its call"
+)]
+
 use std::{io, sync::Arc, time::Duration};
 
 use smg_worker::registry::Generation;

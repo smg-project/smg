@@ -13,7 +13,8 @@
 //! plain request's size, with both dispatches and each side's end said of
 //! the placement. Such a request states no later decode, and its run
 //! refuses no pair. `--entry place_ruled` and `--entry place_held` state a
-//! route's rule with it (the bench's `ruled` file).
+//! route's rule with it (the bench's `ruled` file). `--entry place_named`
+//! asks the one call with a pair that names its worker ([`NAMED`]).
 //!
 //! Every worker has a load report, and a prefill states its rate as its
 //! measured input rate too: the one drain a prefill's record reads. Under
@@ -27,7 +28,15 @@
 //! refused the way the run states. A cell that leaves that path counts no
 //! turn. The result's `conversions=` counts the two lists together.
 
-use std::{cell::OnceCell, ops::Deref, sync::Arc, time::Instant};
+use std::{
+    cell::OnceCell,
+    ops::Deref,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Instant,
+};
 
 use smg_policy_controller::{
     document::{AppliedSpec, PolicySpec},
@@ -50,6 +59,27 @@ use super::{
     encode, measure, place, plain, published, reports, ruled, signals, Cell, Host, Run, Shadowed,
     Stated, MODEL,
 };
+
+/// The word of `--entry` that asks the one call with a pair's request
+/// that names its worker: the number 0 under the header a hash ring's
+/// document reads for it. What the hold costs a request is this entry's
+/// count over the same cell's under a build that does not read the header
+/// for a pair.
+pub(super) const NAMED: &str = "place_named";
+
+/// The header such a request carries: the first worker a side.
+const NUMBER: [(&str, &str); 1] = [("x-smg-target-worker", "0")];
+
+/// Whether this run's pairs name their worker: what the result line's word
+/// says.
+static NAMES: AtomicBool = AtomicBool::new(false);
+
+/// The result line's word for a run whose pairs name their worker.
+pub(super) fn word() -> Option<&'static str> {
+    NAMES
+        .load(Ordering::Relaxed)
+        .then_some(" entry=place_named")
+}
 
 /// The pair document of the preset `name` on both sides.
 pub(super) fn of(name: &str) -> PolicySpec {
@@ -208,11 +238,11 @@ impl Decodes {
     /// One pair request of `host` by the one call: the model, the two
     /// lists and a prompt of the plain request's size, with both sides'
     /// dispatch and end said of the placement. With `rule` the request
-    /// states the run's rule of its route ([`ruled::admits`]). The call
-    /// answers workers and no place of a list, so the place this says is
-    /// the first.
-    fn called(&self, host: &Host, rule: bool) -> Option<u32> {
-        let request = PlaceRequest {
+    /// states the run's rule of its route ([`ruled::admits`]), and with
+    /// `named` the worker it names ([`NAMED`]). The call answers workers
+    /// and no place of a list, so the place this says is the first.
+    fn called(&self, host: &Host, rule: bool, named: bool) -> Option<u32> {
+        let mut request = PlaceRequest {
             prompt: Prompt {
                 tokens: Some(&place::PROMPT),
                 ..Prompt::NONE
@@ -220,6 +250,9 @@ impl Decodes {
             admits: ruled::admits(rule),
             ..PlaceRequest::of(MODEL, self.lists(host))
         };
+        if named {
+            request.headers = &NUMBER;
+        }
         let mut answer = host.engine.place(&request);
         let placement = answer.as_mut().ok()?;
         if placement.owes_events() {
@@ -377,9 +410,11 @@ pub(super) fn runs(run: &Run) -> bool {
     if place::asked_with_lists(run, true) {
         assert!(run.refused == Refused::No, "the one call's pair is open");
         let rule = ruled::stated(run);
+        let named = run.entry == NAMED;
+        NAMES.store(named, Ordering::Relaxed);
         let publish = || feed.publish(&loads);
         measure(run, &host, upkeep, publish, converted, |_| {
-            decode_side.called(&host, rule)
+            decode_side.called(&host, rule, named)
         });
         return true;
     }

@@ -28,11 +28,13 @@ use crate::{
 ///
 /// While the replica leads the monitor polls every `Ready` object the
 /// replica dials and publishes the reports as one snapshot. It takes the
-/// load records on the workers' event streams as polls
-/// ([`PushedRecords`]). Its own sink writes the overload verdict on each
-/// object by the thresholds the object states. It writes no row: a report
-/// is read where the monitor publishes it. A row that one gateway alone
-/// reaches is asked for no load.
+/// load records on the workers' streams as polls ([`PushedRecords`]): a
+/// worker's cache-event stream carries them, and a gRPC worker that is not
+/// indexed streams them alone ([`Self::wanted`]). Its own sink writes the
+/// overload verdict on each object by the thresholds the object states. It
+/// writes no row: a report is read where the monitor publishes it. A row
+/// that one gateway alone reaches is asked for no load, and has no stream
+/// for its load records.
 ///
 /// The serve runs this task, and every deciding thread holds the monitor's
 /// channel from the bind: a single request's decision is given the newest
@@ -42,20 +44,22 @@ pub(crate) struct LoadMonitor {
     /// The holder's registry, which writes the monitor's overload verdicts
     /// on the objects and counts each one that changes.
     registry: Arc<WorkerRegistry<Members>>,
-    /// Where the load records on the workers' event streams go: the serve
-    /// hands it to its feed of those streams.
+    /// Where the load records on the workers' streams go: the serve hands
+    /// it to its feed of those streams.
     pushed: Arc<PushedRecords>,
 }
 
-/// Where the load records on the workers' event streams go: the replica's
-/// load monitor while this replica leads, and nowhere while it leads none.
+/// Where the load records on the workers' streams go: the replica's load
+/// monitor while this replica leads, and nowhere while it leads none.
 ///
-/// The streams stand on every replica, for the cache events they carry,
-/// and the worker crate's monitor takes a pushed record whether it runs or
-/// not. So the replica's word is kept here. A record that comes while the
-/// monitor runs is handed on, and the monitor takes it as a poll: a worker
-/// whose records are fresh is polled no more. A record that comes while it
-/// is stopped is dropped: a standby files no report, writes no verdict and
+/// The streams stand on every replica: a worker's cache-event stream for
+/// the events it carries, and the stream of a gRPC worker that is not
+/// indexed for its load records alone, so that a take finds it open. The
+/// worker crate's monitor takes a pushed record whether it runs or not. So
+/// the replica's word is kept here. A record that comes while the monitor
+/// runs is handed on, and the monitor takes it as a poll: a worker whose
+/// records are fresh is polled no more. A record that comes while it is
+/// stopped is dropped: a standby files no report, writes no verdict and
 /// starts no task of the monitor's for it.
 ///
 /// A stream's task hands a record on under a shared hold of the word.
@@ -102,11 +106,21 @@ impl LoadMonitor {
         }
     }
 
-    /// The sink of the load records that ride the workers' event streams,
-    /// for the serve's feed of those streams: one for the replica's life,
-    /// as the monitor is.
+    /// The sink of the load records on the workers' streams, for the
+    /// serve's feed of those streams: one for the replica's life, as the
+    /// monitor is.
     pub(crate) fn pushed(&self) -> &Arc<PushedRecords> {
         &self.pushed
+    }
+
+    /// The monitor itself, which says whose loads are wanted
+    /// ([`WorkerMonitor::loads_wanted`]): those of every worker the replica
+    /// dials. The serve hands it to its feed of the workers' streams, which
+    /// then opens a stream for the load records alone of a gRPC worker that
+    /// is not indexed. The answer does not follow the role, so a standby
+    /// opens that stream too, and [`PushedRecords`] drops its records.
+    pub(crate) fn wanted(&self) -> &Arc<WorkerMonitor<Members>> {
+        &self.monitor
     }
 
     /// The monitor's channel, for the reader of its snapshots: one channel
@@ -147,7 +161,7 @@ impl LoadMonitor {
     /// no rank of a report and no publish that waited for its window, and
     /// no object stays marked as a worker whose stream pushes: the
     /// next lead starts each worker from no report. So a replica that does
-    /// not lead dials no engine for its load, and the next lead's start
+    /// not lead polls no engine for its load, and the next lead's start
     /// comes behind the last poll. This task alone starts and stops the
     /// monitor, each in its turn.
     ///
@@ -223,6 +237,7 @@ mod tests {
         connection::engine::{
             AdminAnswer, EngineConnection, EngineConnector, HealthAnswer, ZmqLink,
         },
+        health::overload::OverloadThresholds,
         worker::{ProfileOptions, RuntimeType, SchedulerLoadSnapshot, WorkerLoadResponse},
     };
     use tokio::{task::JoinSet, time};
@@ -230,7 +245,7 @@ mod tests {
     use super::{super::ObjectsWake, *};
     use crate::{
         engine::view::WireModes,
-        service::controller::frame_loads::FrameLoads,
+        service::controller::{frame_loads::FrameLoads, Config},
         store::{GatewayId, MemoryStore, Reachability, WorkerFacts, WorkerStatus, WorkersStore},
     };
 
@@ -422,6 +437,11 @@ mod tests {
     impl Replica {
         /// A replica that does not lead yet, its monitor's task started.
         fn new() -> Self {
+            Self::stating(Config::DEFAULT_WORKER_OVERLOAD)
+        }
+
+        /// [`Self::new`] of a start that states `overload`.
+        fn stating(overload: OverloadThresholds) -> Self {
             let store = Arc::new(MemoryStore::new());
             let engine = Arc::new(Engine::default());
             let dials: Arc<dyn EngineConnector> = Arc::new(Dials(Arc::clone(&engine)));
@@ -429,6 +449,7 @@ mod tests {
                 Arc::clone(&store),
                 ObjectsWake::default(),
                 dials,
+                overload,
             ));
             let monitor = LoadMonitor::new(&workers, EVERY);
             let loads = monitor.loads();
@@ -541,6 +562,30 @@ mod tests {
         holds()
     }
 
+    /// The monitor judges a worker whose row names no threshold by the two
+    /// its start states. Five wait: a replica started with a count of four
+    /// vetoes the worker at its first poll, and one started with the
+    /// default of eight does not.
+    #[tokio::test(start_paused = true)]
+    async fn a_worker_that_names_no_threshold_is_judged_by_its_starts() {
+        let four = OverloadThresholds {
+            waiting_requests: Some(4),
+            ..Config::DEFAULT_WORKER_OVERLOAD
+        };
+        for (overload, vetoed) in [(four, true), (Config::DEFAULT_WORKER_OVERLOAD, false)] {
+            let mut replica = Replica::stating(overload);
+            replica.register(facts(A));
+            replica.engine.waiting.store(5, SeqCst);
+            replica.role.send_replace(Some(1));
+            assert!(comes(|| replica.waiting(A) == Some(5)).await, "the report");
+            // The verdict is the first poll's own: the next is an interval
+            // away, and a moment more moves nothing.
+            time::sleep(Duration::from_millis(5)).await;
+            assert_eq!(replica.overloaded(A), vetoed, "{overload:?}");
+            assert!(replica.stopped().await, "the task ends at the stop");
+        }
+    }
+
     /// The reader of the monitor's counts answers what the replica's polls
     /// did and how often an overload verdict of a worker changed: nothing
     /// before a lead, then the lead's poll, its row and the verdict it
@@ -568,7 +613,7 @@ mod tests {
         assert!(replica.stopped().await, "the task ends at the stop");
     }
 
-    /// A replica that does not lead dials no engine for its load.
+    /// A replica that does not lead polls no engine for its load.
     #[tokio::test(start_paused = true)]
     async fn a_standby_polls_nothing() {
         let mut replica = Replica::new();

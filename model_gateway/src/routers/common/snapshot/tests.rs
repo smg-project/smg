@@ -9,6 +9,7 @@ use std::{
 };
 
 use openai_protocol::{model_card::ModelCard, worker::WorkerStatus};
+use smg_policy_controller::engine::FixedFacts;
 use smg_worker::{
     identity::basic::BasicWorker,
     test_support::{no_health_check, worker_with_model_aliases},
