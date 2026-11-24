@@ -261,6 +261,24 @@ const CELLS: &[Cell] = &[
         words: encode::words,
         ..Cell::PLAIN
     },
+    // An encode request whose items carry their text, each placed on the
+    // ring its host lends for the items: the encode side places by the
+    // plain ring.
+    Cell {
+        name: "encode_ring",
+        document: encode::ringed,
+        request: encode::request,
+        words: encode::words,
+        ..Cell::PLAIN
+    },
+    // The same request with no ring lent: the encode stage's own ring.
+    Cell {
+        name: "encode_ring_own",
+        document: encode::ringed,
+        request: encode::request,
+        words: encode::words,
+        ..Cell::PLAIN
+    },
     Cell {
         name: "encode_round_robin",
         document: || encode::of("round_robin"),
@@ -510,18 +528,25 @@ impl LentRing for ListOrder {
     }
 }
 
+impl ListOrder {
+    /// The ring of `workers`, in the list's order.
+    fn of(workers: &[Arc<dyn Worker>]) -> Self {
+        let addresses = workers.iter().map(|worker| worker.url().to_owned());
+        let addresses: Vec<String> = addresses.collect();
+        let ids = addresses
+            .iter()
+            .map(|address| WorkerId::from_address(address));
+        let ids = ids.collect();
+        Self(addresses, ids)
+    }
+}
+
 /// The run's ring, made of its list before the first request ([`lend`]).
 static RING: OnceLock<ListOrder> = OnceLock::new();
 
 /// Makes the run's ring of `workers`, in the list's order.
 fn lend(workers: &[Arc<dyn Worker>]) {
-    let addresses = workers.iter().map(|worker| worker.url().to_owned());
-    let addresses: Vec<String> = addresses.collect();
-    let ids = addresses
-        .iter()
-        .map(|address| WorkerId::from_address(address));
-    let ids = ids.collect();
-    let lent = RING.set(ListOrder(addresses, ids));
+    let lent = RING.set(ListOrder::of(workers));
     lent.expect("one list a run");
 }
 

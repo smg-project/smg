@@ -3,8 +3,10 @@
 //! the engine decides them in
 //! ([`Engine::decide_encode_pair`](crate::engine::Engine::decide_encode_pair)).
 //!
-//! No affinity column stands beside the encoders, and no ring is lent for
-//! them: an encode profile's stage that places by a ring places by its
+//! No affinity column stands beside the encoders. A ring lent for the
+//! items ([`EncodeItems::ring`]) places each item that carries its text
+//! where that ring's walk reaches among the encoders offered. Where none
+//! is lent, an encode profile's stage that places by a ring places by its
 //! own.
 //!
 //! **Named signals.** Under a document a stage of which reads a named
