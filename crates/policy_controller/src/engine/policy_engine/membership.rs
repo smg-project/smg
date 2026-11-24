@@ -225,6 +225,10 @@ struct Held {
     /// object of this life asks that one for each. A model the object's
     /// cards gained in place since is not among them, and is not asked.
     models: Option<Vec<String>>,
+    /// The model the object stated as its own where the follow took it
+    /// ([`Worker::model_id`]), as the follow counts it ([`Follow::stated`]):
+    /// none where its code panicked at the ask.
+    first: Option<Box<str>>,
     /// What a telling of load reports reads of the worker: none where the
     /// document has no stage that keeps them, and nothing is read for it.
     joined: Option<Joined>,
@@ -269,6 +273,7 @@ impl Held {
         id: WorkerId,
         worker: &Arc<dyn Worker>,
         models: Option<Vec<String>>,
+        first: Option<Box<str>>,
         keeps_loads: bool,
     ) -> Self {
         let state = worker.runtime_state();
@@ -277,6 +282,7 @@ impl Held {
             object: Arc::downgrade(worker),
             state: state.as_ref().map(Arc::downgrade),
             models,
+            first,
             joined: keeps_loads.then(|| Joined::of(worker.as_ref())),
         }
     }
@@ -311,6 +317,12 @@ pub(super) struct Follow {
     /// How many workers the follow holds under each id it told: the ids
     /// that stand.
     under: FxHashMap<WorkerId, u32>,
+    /// How many workers the follow holds stated each model as their own
+    /// ([`Held::first`]). A list keeps its record of sent prefixes under
+    /// the model its first worker states: a record under a model that is
+    /// not here may be one no list reads again, and the upkeep asks the
+    /// registry of it ([`PolicyEngine::follow_registry`]).
+    stated: FxHashMap<Box<str>, u32>,
     /// Whether the follow owes a whole read of the registry at the task's
     /// next upkeep: at its start, behind a channel that closed, behind a
     /// word lost to a panic of the host's own code, and behind a word of
@@ -353,6 +365,26 @@ impl Follow {
         let alone = |held: &&Held| self.under.get(&held.id) == Some(&1);
         let held = self.told.values().filter(alone);
         held.filter_map(|held| Some((held.id, held.joined.as_ref()?)))
+    }
+
+    /// One worker more that the follow holds states `model` as its own
+    /// (`stands`), or one fewer. Nothing for a worker whose code panicked
+    /// at the ask.
+    fn states(&mut self, model: Option<&str>, stands: bool) {
+        let Some(model) = model else {
+            return;
+        };
+        match self.stated.get_mut(model) {
+            Some(workers) if stands => *workers += 1,
+            Some(workers) if *workers > 1 => *workers -= 1,
+            Some(_) => {
+                self.stated.remove(model);
+            }
+            None if stands => {
+                self.stated.insert(model.into(), 1);
+            }
+            None => {}
+        }
     }
 
     /// How many words stand on the subscription, the dropped ones counted.
@@ -402,8 +434,11 @@ impl PolicyEngine {
     /// `Removed` and a `Registered`: a leave, then a join. The records of
     /// sent prefixes forget the worker's id at a leave, at a join no leave
     /// came ahead of, at a replacement that takes a model from the worker,
-    /// and behind a whole read where it stands no more. The session table
-    /// is told nothing, as at the two calls.
+    /// and behind a whole read where it stands no more. A record under a
+    /// model that no worker that stands states as its own
+    /// ([`Worker::model_id`]) leaves with its places at the task's upkeep,
+    /// once no list's table holds it. The session table is told nothing,
+    /// as at the two calls.
     ///
     /// An id names one worker. A worker registered under an id that
     /// another worker is held under is read as the id's next life: a leave
@@ -446,8 +481,18 @@ impl PolicyEngine {
     /// with words still standing: those a whole read owed, those of words
     /// that never stood alone on the subscription, and, where the program
     /// handed its lists behind the whole read, those of every list that
-    /// stands. It answers whether the upkeep before this one owed a whole
-    /// read and did not make it.
+    /// stands. Then the records of sent prefixes that no list reads again
+    /// leave with their places. The follow's count names them: a record no
+    /// table holds, under a model none of the workers it holds stated as
+    /// its own ([`super::overlap::Affinity::unstated`]). The count can run
+    /// short of the registry, by a word not heard yet or a worker whose
+    /// code panicked at its take, so the registry is asked where a record
+    /// is named, and there alone: a record leaves where no worker that
+    /// stands states its model, and no table took it during the ask
+    /// ([`super::overlap::Affinity::let_go`]). A panic of the host's own
+    /// code in the ask is held and counted, and every record stays. It
+    /// answers whether the upkeep before this one owed a whole read and
+    /// did not make it.
     pub(super) fn follow_registry(&self, members: &mut Option<Follow>) -> bool {
         let follow = match members {
             Some(follow) => follow,
@@ -460,6 +505,7 @@ impl PolicyEngine {
                     events: None,
                     told: FxHashMap::default(),
                     under: FxHashMap::default(),
+                    stated: FxHashMap::default(),
                     unread: true,
                     late: false,
                     stating: false,
@@ -498,6 +544,26 @@ impl PolicyEngine {
         // What the whole read owes, and what words left owed that never
         // stood alone on the subscription.
         self.fill_owed(follow);
+        let mut unstated = self
+            .affinity
+            .unstated(|model| follow.stated.contains_key(model));
+        if !unstated.is_empty() {
+            // Each worker that stands is asked once, and no further where
+            // every record named has a worker that states its model.
+            let asked = self.held(|| {
+                for (_, worker) in follow.registry.standing() {
+                    if unstated.is_empty() {
+                        break;
+                    }
+                    let stated = worker.model_id();
+                    unstated.retain(|(model, _)| **model != *stated);
+                }
+                unstated
+            });
+            if let Some(unstated) = asked {
+                self.affinity.let_go(&unstated);
+            }
+        }
         again
     }
 
@@ -710,7 +776,9 @@ impl PolicyEngine {
     /// read, and under an engine handed its program's lists the lists of
     /// those models are owed a fill, as [`Self::owes`] owes them. A panic
     /// of the object's code is held and counted ([`Self::upkeep_faults`])
-    /// and costs the models kept and that worker's fills alone.
+    /// and costs the models kept and that worker's fills alone. The model
+    /// it states as its own is asked under a catch of its own too: behind
+    /// a panic there the follow counts the worker under no model.
     fn stands(
         &self,
         follow: &mut Follow,
@@ -726,8 +794,21 @@ impl PolicyEngine {
             follow.owed.extend(models.iter().flatten().cloned());
         }
         let keeps_loads = self.document.load().spec.engine().keeps_loads();
-        let record = Held::of(id, worker, models, keeps_loads);
+        let first = self.held(|| Box::from(worker.model_id()));
+        // Built ahead of the count: a panic of the object's code here
+        // leaves the follow's count as it was.
+        let record = Held::of(id, worker, models, first, keeps_loads);
+        // A worker found as it was held states what it stated: its count
+        // stands.
+        let held = follow.told.get(&object);
+        let counted = held.is_some_and(|was| was.first == record.first);
+        if !counted {
+            follow.states(record.first.as_deref(), true);
+        }
         if let Some(was) = follow.told.insert(object, record) {
+            if !counted {
+                follow.states(was.first.as_deref(), false);
+            }
             if was.id == id && (replaced || was.is(worker)) {
                 return;
             }
@@ -755,6 +836,7 @@ impl PolicyEngine {
             return;
         }
         if let Some(was) = follow.told.remove(object) {
+            follow.states(was.first.as_deref(), false);
             self.unnamed(follow, was.id);
         }
     }
