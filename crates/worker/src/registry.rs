@@ -27,7 +27,7 @@ use crate::{
     health::circuit_breaker::CircuitState,
     identity::{
         basic::{ConnectionMode, RuntimeType, Worker, WorkerType},
-        endpoint::Endpoint,
+        endpoint::{Endpoint, Scheme},
         sampling_defaults::DEFAULT_SAMPLING_PARAMS_LABEL,
     },
     metrics::writers::Metrics,
@@ -229,6 +229,9 @@ pub struct WorkerRegistry<G> {
 
     /// URL to worker ID mapping
     url_to_id: Arc<DashMap<String, WorkerId, FxBuildHasher>>,
+    /// Orders a local URL reservation with the equivalent-URL check and
+    /// insertion of a new guarded mesh import. Held only while claiming a URL.
+    reservation_order: parking_lot::RwLock<()>,
 
     /// Per-worker-ID locks for serializing replace() operations.
     /// Only held during the in-memory model index diff (no I/O, microseconds).
@@ -343,6 +346,7 @@ impl<G: Generation> WorkerRegistry<G> {
             type_workers: Arc::new(DashMap::new()),
             connection_workers: Arc::new(DashMap::new()),
             url_to_id: Arc::new(DashMap::with_hasher(FxBuildHasher)),
+            reservation_order: parking_lot::RwLock::new(()),
             worker_mutation_locks: Arc::new(DashMap::new()),
             model_overloaded: Arc::new(DashMap::with_hasher(FxBuildHasher)),
             pool_sizes: pool::PoolSizes::default(),
@@ -515,6 +519,29 @@ impl<G: Generation> WorkerRegistry<G> {
     /// live workers alone. The exact URL, no scheme canonicalisation.
     pub fn get_id_by_url_or_reservation(&self, url: &str) -> Option<WorkerId> {
         self.url_to_id.get(url).map(|id| id.clone())
+    }
+
+    /// A pending local registration of this URL or its legacy scheme-less spelling.
+    pub fn has_pending_reservation(&self, url: &str) -> bool {
+        Self::any_matching_url(url, |candidate| {
+            self.get_id_by_url_or_reservation(candidate)
+                .is_some_and(|id| !self.workers.contains_key(&id))
+        })
+    }
+
+    /// A legacy bare URL can refer to any network transport. Two explicitly
+    /// schemed URLs match only when they name the same transport.
+    fn any_matching_url(url: &str, matches: impl Fn(&str) -> bool) -> bool {
+        matches(url)
+            || match Scheme::split_from(url) {
+                Some((Scheme::Http | Scheme::Https | Scheme::Grpc | Scheme::Grpcs, bare)) => {
+                    matches(bare)
+                }
+                None => ["http://", "grpc://", "https://", "grpcs://"]
+                    .iter()
+                    .any(|scheme| matches(&format!("{scheme}{url}"))),
+                _ => false,
+            }
     }
 
     /// Resolve a URL string to the `WorkerId` of a live worker.
@@ -1665,6 +1692,25 @@ impl<G: Generation> WorkerRegistry<G> {
         self.transition_under_lock(worker_id, Some(expected_revision), f)
     }
 
+    /// Run a status decision only on the registered object that the caller holds.
+    /// A mesh replay may advance that same object's revision before activation.
+    pub fn apply_if_current<T>(
+        &self,
+        worker_id: &WorkerId,
+        expected: &Arc<dyn Worker>,
+        decide: impl FnOnce(&Arc<dyn Worker>) -> (T, Option<WorkerStatus>),
+    ) -> Option<(T, Option<(WorkerStatus, WorkerStatus)>)> {
+        let (result, transition) = self.transition_under_lock(worker_id, None, |held| {
+            if Arc::ptr_eq(held, expected) {
+                let (value, status) = decide(held);
+                (Some(value), status)
+            } else {
+                (None, None)
+            }
+        })?;
+        Some((result?, transition))
+    }
+
     /// Read the revision only while this exact worker is the registered
     /// entry. Replacements share revision state, so both reads must hold
     /// the mutation lock before a cleanup caller can pin the incarnation.
@@ -1673,13 +1719,8 @@ impl<G: Generation> WorkerRegistry<G> {
         worker_id: &WorkerId,
         expected: &Arc<dyn Worker>,
     ) -> Option<u64> {
-        self.transition_under_lock(worker_id, None, |worker| {
-            (
-                Arc::ptr_eq(worker, expected).then(|| worker.revision()),
-                None,
-            )
-        })?
-        .0
+        self.apply_if_current(worker_id, expected, |held| (held.revision(), None))
+            .map(|(revision, _)| revision)
     }
 
     /// The one place a registered worker's status transitions. Under the
@@ -1902,6 +1943,7 @@ impl<G: Generation> WorkerRegistry<G> {
     /// create the worker under this ID. Idempotent — repeated calls for
     /// the same URL return the same ID. Emits no events.
     pub fn reserve_id_for_url(&self, url: &str) -> WorkerId {
+        let _order = self.reservation_order.read();
         self.url_to_id.entry(url.to_string()).or_default().clone()
     }
 
@@ -2252,20 +2294,30 @@ impl<G: Generation> WorkerRegistry<G> {
         &self,
         worker: Arc<dyn Worker>,
         origin: WorkerOrigin,
-        vacant_mesh_id: Option<WorkerId>,
+        mesh_claim: Option<(WorkerId, &str)>,
     ) -> Option<WorkerId> {
         // Resolve (or reserve) the worker_id from url_to_id. The entry
         // API is atomic per bucket, so concurrent callers either reuse
         // the same existing_id or serialize on vacant insertion.
-        let worker_id = match self.url_to_id.entry(worker.url().to_string()) {
-            // A guarded mesh import must not adopt a concurrent local POST's
-            // reservation. This is the same atomic entry the POST claims.
-            Entry::Occupied(_) if vacant_mesh_id.is_some() => return None,
-            Entry::Occupied(entry) => entry.get().clone(),
-            Entry::Vacant(entry) => {
-                let new_id = vacant_mesh_id.unwrap_or_default();
-                entry.insert(new_id.clone());
-                new_id
+        let worker_id = {
+            let _order = mesh_claim.as_ref().map(|_| self.reservation_order.write());
+            let url = worker.url();
+            if let Some((_, published_url)) = &mesh_claim {
+                let claimed = |url: &str| {
+                    Self::any_matching_url(url, |candidate| self.url_to_id.contains_key(candidate))
+                };
+                if claimed(url) || (*published_url != url && claimed(published_url)) {
+                    return None;
+                }
+            }
+            match self.url_to_id.entry(url.to_string()) {
+                Entry::Occupied(_) if mesh_claim.is_some() => return None,
+                Entry::Occupied(entry) => entry.get().clone(),
+                Entry::Vacant(entry) => {
+                    let id = mesh_claim.map(|(id, _)| id).unwrap_or_default();
+                    entry.insert(id.clone());
+                    id
+                }
             }
         };
 
@@ -3009,7 +3061,11 @@ impl<G: Generation> WorkerRegistry<G> {
                 WorkerId::from_string(state.worker_id.clone())
             }
         });
-        if let Some(id) = self.register_inner(worker, WorkerOrigin::Mesh, vacant_id) {
+        if let Some(id) = self.register_inner(
+            worker,
+            WorkerOrigin::Mesh,
+            vacant_id.map(|id| (id, state.url.as_str())),
+        ) {
             let record = ImportRecord {
                 version: state.version,
                 from_spec: spec_applied,

@@ -1758,11 +1758,18 @@ mod scheduler_tests {
                 .await
                 .unwrap();
             assert_eq!(engine.get_status(id).await.unwrap().status, first);
-            tracker.write().failed.insert(StepId::new("failed"));
+            let (tx, _rx) = mpsc::channel(1);
+            WorkflowEngine::<Data>::settle(
+                &tracker,
+                &tx,
+                &StepId::new("failed"),
+                StepResult::Failure,
+            );
             engine
                 .finish(id, &tracker, std::time::Instant::now())
                 .await
                 .unwrap();
+            assert_eq!(engine.get_status(id).await.unwrap().status, first);
             engine.fail_blocked(id, &tracker).await.unwrap();
             assert_eq!(engine.get_status(id).await.unwrap().status, first);
             engine.cancel_workflow(id).await.unwrap();

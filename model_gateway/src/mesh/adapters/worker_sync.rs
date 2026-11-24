@@ -124,7 +124,7 @@ pub struct WorkerSyncAdapter {
     intake: Mutex<()>,
     app_context: Weak<crate::app_context::AppContext>,
     preparation_slots: Arc<Semaphore>,
-    preparing: Mutex<HashMap<String, preparation::PendingImport>>,
+    preparing: Mutex<preparation::PendingImports>,
     workers: Arc<CrdtNamespace>,
     worker_registry: Arc<WorkerRegistry>,
     /// This node's mesh server name: the owner stamped on every key it
@@ -220,7 +220,7 @@ impl WorkerSyncAdapter {
             intake: Mutex::new(()),
             app_context,
             preparation_slots: Arc::new(Semaphore::new(16)),
-            preparing: Mutex::new(HashMap::new()),
+            preparing: Mutex::default(),
             workers,
             worker_registry,
             node_name,
@@ -378,12 +378,7 @@ impl WorkerSyncAdapter {
         }
         // A missed tombstone can also belong to an import still preparing,
         // with no registry entry yet to discover in the pass above.
-        let pending: Vec<_> = self
-            .preparing
-            .lock()
-            .values()
-            .map(|pending| pending.key_id.clone())
-            .collect();
+        let pending: Vec<_> = self.preparing.lock().urls_by_key.keys().cloned().collect();
         for id in pending {
             let key = format!("{PREFIX}{id}");
             if !live.contains(&key) {
@@ -407,12 +402,18 @@ impl WorkerSyncAdapter {
 
     fn sync_key_from_store_inner(self: &Arc<Self>, key: &str, worker_id: &str) -> Option<String> {
         match self.workers.get(key) {
-            Some(bytes) => {
-                self.apply_incoming(worker_id, &bytes);
-                None
-            }
+            Some(bytes) => match decode_worker_state(&bytes) {
+                Ok(state) => {
+                    self.apply_state_inner(worker_id, state);
+                    None
+                }
+                Err(err) => {
+                    warn!(worker_id, %err, "failed to decode WorkerState");
+                    self.cancel_preparation(worker_id)
+                }
+            },
             None => {
-                self.cancel_preparation(worker_id);
+                let pending_url = self.cancel_preparation(worker_id);
                 let id = WorkerId::from_string(worker_id.to_string());
                 // A missing key for a locally-owned worker is anomalous
                 // (foreign tombstone or a lost publish): the key is already
@@ -437,10 +438,7 @@ impl WorkerSyncAdapter {
                         info!(worker_id, "removed worker on remote tombstone");
                         Some(worker.url().to_owned())
                     }
-                    None => {
-                        debug!(worker_id, "ignored tombstone (unknown id)");
-                        None
-                    }
+                    None => pending_url,
                 }
             }
         }
@@ -658,13 +656,6 @@ impl WorkerSyncAdapter {
                     "removed mesh-imported worker: this gateway removed its endpoint"
                 );
             }
-        }
-    }
-
-    fn apply_incoming(self: &Arc<Self>, worker_id: &str, bytes: &[u8]) {
-        match decode_worker_state(bytes) {
-            Ok(state) => self.apply_state_inner(worker_id, state),
-            Err(err) => warn!(worker_id, %err, "failed to decode WorkerState"),
         }
     }
 
@@ -1245,7 +1236,7 @@ mod tests {
                 registry.get_by_url(published_url).is_none(),
                 "{reserved_url} must block {published_url}"
             );
-            assert!(adapter.preparing.lock().is_empty());
+            assert!(adapter.preparing.lock().by_url.is_empty());
             assert_eq!(
                 registry.get_id_by_url_or_reservation(reserved_url),
                 Some(reservation)
@@ -1303,6 +1294,7 @@ mod tests {
             assert!(adapter
                 .preparing
                 .lock()
+                .by_url
                 .get(url)
                 .is_some_and(|pending| pending.key_id == "w1"));
 
@@ -1318,7 +1310,17 @@ mod tests {
             // Every cleanup path uses the authoritative key, including
             // legacy values with no publisher ID in the payload.
             match cleanup {
-                "tombstone" => ns.delete("worker:w1"),
+                "tombstone" => {
+                    adapter.start();
+                    ns.delete("worker:w1");
+                    assert!(
+                        wait_for(|| registry
+                            .get_id_by_url(url)
+                            .is_some_and(|id| id.as_str() == "w2"))
+                        .await,
+                        "the subscription refills a pending-only endpoint before reconciliation"
+                    );
+                }
                 "owner-down" => {
                     set_status(&cluster, "node-b", NodeStatus::Down);
                     adapter.refresh_membership();
@@ -1326,9 +1328,11 @@ mod tests {
                 }
                 _ => adapter.retire(url, None),
             }
-            adapter.reconcile_once();
+            if cleanup != "tombstone" {
+                adapter.reconcile_once();
+            }
             assert!(
-                !adapter.preparing.lock().contains_key(url),
+                !adapter.preparing.lock().by_url.contains_key(url),
                 "{cleanup}, empty ID: {empty_payload_id}"
             );
             if cleanup == "retired" {
@@ -1338,6 +1342,94 @@ mod tests {
                 adapter.reconcile_once();
             }
             assert_eq!(registry.get_id_by_url(url).unwrap().as_str(), "w2");
+        }
+    }
+
+    #[tokio::test]
+    async fn completing_preparation_rechecks_its_key_before_releasing_the_endpoint() {
+        use crate::workflow::tokenizer_registration::test_support::tokenizer_dir;
+
+        enum Change {
+            OwnerDown,
+            Tombstone,
+            InvalidState,
+        }
+        let tokenizer = tokenizer_dir();
+        for change in [Change::OwnerDown, Change::Tombstone, Change::InvalidState] {
+            let ns = worker_namespace(&MeshKV::new("node-a".into()));
+            let registry = Arc::new(WorkerRegistry::new());
+            let cluster =
+                cluster_with(&[("node-b", NodeStatus::Alive), ("node-c", NodeStatus::Alive)]);
+            let app = app_context_for_tests(
+                RouterConfig::builder()
+                    .wait_for_tokenizer(true)
+                    .build_unchecked(),
+                Arc::clone(&registry),
+                None,
+            );
+            let adapter = WorkerSyncAdapter::new_with_context(
+                Arc::clone(&ns),
+                Arc::clone(&registry),
+                "node-a".into(),
+                Arc::clone(&cluster),
+                Arc::downgrade(&app),
+            );
+            let url = "grpc://shared:8080";
+            let mut first = owned_state("w1", url, "node-b");
+            first.model_id = "new-model".into();
+            first.spec = serde_json::to_vec(&serde_json::json!({
+                "url": url, "connection_mode": "grpc", "runtime_type": "sglang",
+                "models": [{"id": "new-model", "tokenizer_path": tokenizer.path()}]
+            }))
+            .unwrap();
+            ns.put("worker:w1", bincode::serialize(&first).unwrap());
+            adapter.sync_key_from_store("worker:w1", "w1");
+            ns.put(
+                "worker:w2",
+                bincode::serialize(&owned_state("w2", url, "node-c")).unwrap(),
+            );
+            adapter.sync_key_from_store("worker:w2", "w2");
+            assert!(registry.get_by_url(url).is_none());
+            assert!(adapter.preparing.lock().by_url.contains_key(url));
+
+            // The single-thread runtime starts the load at the first await below.
+            // Leave subscriptions stopped so its completion sees the change first.
+            match change {
+                Change::OwnerDown => {
+                    set_status(&cluster, "node-b", NodeStatus::Down);
+                    adapter.refresh_membership();
+                }
+                Change::Tombstone => ns.delete("worker:w1"),
+                Change::InvalidState => ns.put("worker:w1", vec![0xff]),
+            }
+            assert!(
+                wait_for(|| app.tokenizer_preparations.lock().is_empty()).await,
+                "the original preparation has released its pins"
+            );
+
+            if matches!(change, Change::OwnerDown) {
+                adapter.sync_key_from_store("worker:w2", "w2");
+                assert!(
+                    registry.get_by_url(url).is_none(),
+                    "the competing key must wait through grace"
+                );
+                set_status(&cluster, "node-b", NodeStatus::Alive);
+                adapter.sync_key_from_store("worker:w1", "w1");
+                assert!(
+                    wait_for(|| registry
+                        .get_id_by_url(url)
+                        .is_some_and(|id| id.as_str() == "w1"))
+                    .await
+                );
+                assert_eq!(registry.get_by_url(url).unwrap().model_id(), "new-model");
+            } else {
+                assert_eq!(
+                    registry.get_id_by_url(url).unwrap().as_str(),
+                    "w2",
+                    "completion refills the released endpoint immediately"
+                );
+            }
+            assert!(adapter.preparing.lock().urls_by_key.is_empty());
         }
     }
 

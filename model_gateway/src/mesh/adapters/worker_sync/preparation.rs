@@ -1,10 +1,10 @@
 //! Prepare a peer's tokenizer locally without stalling mesh reconciliation.
 
-use std::{sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use smg_mesh::WorkerState;
 use smg_worker::{
-    identity::{basic::Worker, endpoint::Scheme},
+    identity::basic::Worker,
     registry::{worker_model_ids, WorkerId, WorkerOrigin},
 };
 use tracing::{info, warn};
@@ -25,6 +25,28 @@ pub(super) struct PendingImport {
     scope: Option<Arc<TokenizerPreparation>>,
 }
 
+#[derive(Default)]
+pub(super) struct PendingImports {
+    pub(super) by_url: HashMap<String, PendingImport>,
+    pub(super) urls_by_key: HashMap<String, String>,
+}
+
+impl PendingImports {
+    fn take(&mut self, key: &str) -> Option<(String, PendingImport)> {
+        let url = self.urls_by_key.remove(key)?;
+        self.by_url.remove(&url).map(|pending| (url, pending))
+    }
+
+    fn replace(&mut self, pending: PendingImport) -> Option<PendingImport> {
+        let previous = self.take(&pending.key_id).map(|(_, pending)| pending);
+        let url = &pending.state.url;
+        debug_assert!(!self.by_url.contains_key(url));
+        self.urls_by_key.insert(pending.key_id.clone(), url.clone());
+        self.by_url.insert(url.clone(), pending);
+        previous
+    }
+}
+
 fn same_generation(left: &WorkerState, right: &WorkerState) -> bool {
     left.worker_id == right.worker_id
         && left.owner == right.owner
@@ -35,21 +57,13 @@ fn same_generation(left: &WorkerState, right: &WorkerState) -> bool {
 }
 
 impl WorkerSyncAdapter {
-    pub(super) fn cancel_preparation(&self, worker_id: &str) {
-        let pending = {
-            let mut preparing = self.preparing.lock();
-            let url = preparing
-                .iter()
-                .find(|(_, pending)| pending.key_id == worker_id)
-                .map(|(url, _)| url.clone());
-            url.and_then(|url| preparing.remove(&url))
-        };
-        if let Some(pending) = pending {
-            if let Some(scope) = pending.scope {
-                scope.close();
-            }
-            info!(worker_id, "Ended mesh tokenizer preparation");
+    pub(super) fn cancel_preparation(&self, worker_id: &str) -> Option<String> {
+        let (url, pending) = self.preparing.lock().take(worker_id)?;
+        if let Some(scope) = pending.scope {
+            scope.close();
         }
+        info!(worker_id, "Ended mesh tokenizer preparation");
+        Some(url)
     }
 
     fn release_import_tokenizers(&self, worker: &Arc<dyn Worker>) {
@@ -85,22 +99,7 @@ impl WorkerSyncAdapter {
         }
         // A pending local REST registration owns its reserved UUID. A peer
         // must not fill it while its local preparation is still running.
-        let reserved = |url: &str| {
-            self.worker_registry
-                .get_id_by_url_or_reservation(url)
-                .is_some_and(|id| self.worker_registry.get(&id).is_none())
-        };
-        let pending_registration = reserved(&state.url)
-            || match Scheme::split_from(&state.url) {
-                Some((Scheme::Http | Scheme::Https | Scheme::Grpc | Scheme::Grpcs, bare)) => {
-                    reserved(bare)
-                }
-                None => ["http://", "grpc://"]
-                    .iter()
-                    .any(|scheme| reserved(&format!("{scheme}{}", state.url))),
-                _ => false,
-            };
-        if pending_registration {
+        if self.worker_registry.has_pending_reservation(&state.url) {
             return;
         }
         // The first live publisher preparing this endpoint owns its pending
@@ -108,6 +107,7 @@ impl WorkerSyncAdapter {
         if self
             .preparing
             .lock()
+            .by_url
             .get(&state.url)
             .is_some_and(|pending| pending.key_id != worker_id)
         {
@@ -159,26 +159,22 @@ impl WorkerSyncAdapter {
         }
         let (superseded, permit) = {
             let mut preparing = self.preparing.lock();
-            if let Some(pending) = preparing.get(&state.url) {
+            if let Some(pending) = preparing.by_url.get(&state.url) {
                 if (same_generation(&pending.state, &state) && pending.scope.is_some())
                     || pending.key_id != worker_id
                 {
                     return;
                 }
             }
-            let superseded = preparing.remove(&state.url);
             let permit = Arc::clone(&self.preparation_slots).try_acquire_owned().ok();
             // A slotless entry still owns this endpoint while the CRDT
             // backlog waits for a later reconcile; another key cannot restore
             // its obsolete model at the same address in the meantime.
-            preparing.insert(
-                state.url.clone(),
-                PendingImport {
-                    key_id: worker_id.to_owned(),
-                    state: state.clone(),
-                    scope: permit.as_ref().map(|_| Arc::clone(&scope)),
-                },
-            );
+            let superseded = preparing.replace(PendingImport {
+                key_id: worker_id.to_owned(),
+                state: state.clone(),
+                scope: permit.as_ref().map(|_| Arc::clone(&scope)),
+            });
             (superseded, permit)
         };
         if let Some(scope) = superseded.and_then(|pending| pending.scope) {
@@ -206,40 +202,44 @@ impl WorkerSyncAdapter {
             let cancelled = scope.is_cancelled();
             let succeeded = matches!(result, Ok(Ok(())));
             drop(permit);
-            {
-                let _intake = adapter.intake.lock();
-                let retry = adapter
-                    .preparing
-                    .lock()
-                    .get(&state.url)
-                    .is_none_or(|pending| {
-                        pending
-                            .scope
-                            .as_ref()
-                            .is_some_and(|pending_scope| Arc::ptr_eq(pending_scope, &scope))
-                    });
-                if retry && (succeeded || cancelled) {
-                    // Read and apply current store truth under the same lock
-                    // as tombstones, replacement events and warm imports.
-                    adapter.sync_key_from_store_inner(&format!("{PREFIX}{worker_id}"), &worker_id);
-                }
-                let mut preparing = adapter.preparing.lock();
-                if preparing.get(&state.url).is_some_and(|pending| {
-                    pending
-                        .scope
-                        .as_ref()
-                        .is_some_and(|pending_scope| Arc::ptr_eq(pending_scope, &scope))
-                }) {
-                    if succeeded || cancelled {
-                        preparing.remove(&state.url);
-                    } else if let Some(pending) = preparing.get_mut(&state.url) {
-                        pending.scope = None;
-                    }
-                }
-            }
+            adapter.finish_preparation(&worker_id, &state.url, &scope, succeeded || cancelled);
             if !succeeded && !cancelled {
                 warn!(worker_id, error = ?result, "Mesh worker tokenizer preparation failed; a later reconcile will retry");
             }
         });
+    }
+    /// Replay only the completed generation. A deferred replay keeps the key's
+    /// claim, with no task attached, until its owner returns or the key goes away.
+    fn finish_preparation(
+        self: &Arc<Self>,
+        key: &str,
+        url: &str,
+        scope: &Arc<TokenizerPreparation>,
+        replay: bool,
+    ) {
+        let refill = {
+            let _intake = self.intake.lock();
+            {
+                let mut preparing = self.preparing.lock();
+                let Some(pending) = preparing.by_url.get_mut(url) else {
+                    return;
+                };
+                if !pending
+                    .scope
+                    .as_ref()
+                    .is_some_and(|active| Arc::ptr_eq(active, scope))
+                {
+                    return;
+                }
+                pending.scope = None;
+            }
+            if !replay {
+                return;
+            }
+            self.sync_key_from_store_inner(&format!("{PREFIX}{key}"), key)
+        };
+        if let Some(url) = refill {
+            self.reimport_endpoint(&url);
+        }
     }
 }
