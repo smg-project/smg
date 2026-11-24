@@ -74,7 +74,7 @@
 //! waits for an owed build, and else publishes by itself when the last
 //! window is a window old; one that lands inside the window waits, and the
 //! sink names the instant it is due
-//! ([`LoadSink::publish_due`](crate::store::LoadSink::publish_due)).
+//! ([`MemoryStore::publish_due`](crate::store::MemoryStore::publish_due)).
 //!
 //! **A veto is published in its gateway's run.** The writer keeps
 //! each gateway's list and publishes each pool's standing vetoes as one run

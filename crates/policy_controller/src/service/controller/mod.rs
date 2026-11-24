@@ -937,7 +937,7 @@ impl Controller {
         // world as a leader's own does.
         let (published, publications_stop) = (Arc::clone(&store), stop.subscribe());
         tasks.spawn(async move {
-            publications::run(&*published, publications_stop).await;
+            publications::run(&published, publications_stop).await;
             Ok(())
         });
         // The load monitor's counts are read where they are rendered: the

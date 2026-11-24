@@ -40,7 +40,7 @@ use crate::{
             DecodeMark, DecodeSide, HostCount, InFlightCounts, LeaseRecord, LeaseRefused,
             LeaseState, LeasesStore, Sides, WorkerSlot,
         },
-        loads::{LoadSample, LoadSink, LoadSource, PollMode, Wake},
+        loads::{LoadSample, LoadSink, LoadSource, PollMode},
         membership::same_worker,
         reservations::{ReservationKind, ReservationStore},
         snapshot::{
@@ -67,6 +67,11 @@ pub use turn::{AtWork, Hand, LookOutcome};
 /// Membership changes kept for watchers; a watcher further behind snapshots
 /// again (the registry's broadcast is sized the same today).
 const CHANGE_LOG: usize = 1_024;
+
+/// The host's wake: what the store calls to have its host read
+/// [`MemoryStore::publish_due`] again. It is called under the writer's
+/// locks: it sets a flag or a notification and returns.
+pub type Wake = Box<dyn Fn() + Send + Sync>;
 
 /// The store's counts one scrape reports: the first two of one state of
 /// the store.
@@ -135,7 +140,7 @@ pub struct MemoryStore {
     /// for a store nobody follows. The membership writes tell through
     /// their table's own handle.
     journal: Option<Arc<dyn Journal>>,
-    /// The host's wake, once its loop handed one ([`LoadSink::wake_with`]):
+    /// The host's wake, once its loop handed one ([`MemoryStore::wake_with`]):
     /// called where a membership write leaves a build owed and none was,
     /// the one instant the host's loop cannot have read. A lock of its own,
     /// the last taken and held for the call alone.
@@ -1152,7 +1157,7 @@ impl MemoryStore {
     ///
     /// The build of a registration, a refresh and a patch starts within one
     /// publication window of their answer, when the store's host pays the
-    /// due instant ([`LoadSink::publish_due`]), and they are in force for
+    /// due instant ([`Self::publish_due`]), and they are in force for
     /// decisions when it ends; a registration that takes its worker off a
     /// model has paid its own. A caller that needs its own write in force
     /// at once asks here: a test, a bench's fill, a host with no loop. The
@@ -1163,6 +1168,49 @@ impl MemoryStore {
     pub fn publish_now(&self) {
         let workers = self.workers.lock();
         self.pay(&workers, None);
+    }
+
+    /// When the writes the store took and has not yet shown its readers are
+    /// due to be shown; `None` when nothing waits. The controller's serve
+    /// keeps the instant; a host that writes from a task of its own reads
+    /// it after a write and calls [`Self::publish`] at it. A host that does
+    /// neither shows a waiting write with its next one, and the row's age
+    /// says so meanwhile.
+    ///
+    /// The instant is named for one thing more: the build the membership
+    /// writes owe. The store pays that build ahead of the instant for one
+    /// load write alone, a poll's answer for a rank that has no row yet,
+    /// and no load write is shown before it, so a host with no loop asks
+    /// for it ([`Self::publish_now`]).
+    pub fn publish_due(&self) -> Option<Instant> {
+        self.loads.lock().writer.due()
+    }
+
+    /// Show the readers what waits, when `now` is at or past the instant
+    /// [`Self::publish_due`] names; a call before it shows nothing.
+    pub fn publish(&self, now: Instant) {
+        {
+            let mut loads = self.loads.lock();
+            if !loads.writer.build_due(now) {
+                let world = loads.writer.publish_if_due(now);
+                self.show(&mut loads.writer, world);
+                return;
+            }
+        }
+        // A build is owed and due. The workers lock comes first, as every
+        // membership write takes it, and the build is asked again under
+        // both: another call may have paid it meanwhile.
+        let workers = self.workers.lock();
+        self.pay(&workers, Some(now));
+    }
+
+    /// Hand the store the host's wake. The store calls it, on the writing
+    /// thread, where a write that is no load call leaves an instant for
+    /// [`Self::publish_due`] to name and none stood: the build a
+    /// membership write owes. The host's loop reads the instant again at
+    /// each call. The last wake handed stands.
+    pub fn wake_with(&self, wake: Wake) {
+        *self.wake.lock() = Some(wake);
     }
 
     /// Show the deciders the world a write made, when it made one. Called
@@ -2492,30 +2540,6 @@ impl LoadSink for MemoryStore {
                 self.show(writer, world);
             }
         }
-    }
-
-    fn publish_due(&self) -> Option<Instant> {
-        self.loads.lock().writer.due()
-    }
-
-    fn publish(&self, now: Instant) {
-        {
-            let mut loads = self.loads.lock();
-            if !loads.writer.build_due(now) {
-                let world = loads.writer.publish_if_due(now);
-                self.show(&mut loads.writer, world);
-                return;
-            }
-        }
-        // A build is owed and due. The workers lock comes first, as every
-        // membership write takes it, and the build is asked again under
-        // both: another call may have paid it meanwhile.
-        let workers = self.workers.lock();
-        self.pay(&workers, Some(now));
-    }
-
-    fn wake_with(&self, wake: Wake) {
-        *self.wake.lock() = Some(wake);
     }
 }
 

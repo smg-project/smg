@@ -2946,7 +2946,7 @@ pub(crate) mod tests {
             };
             sink.record(id, 0, row, at, LoadSource::Stream);
         }
-        sink.publish(at + PUBLISH_WINDOW);
+        bed.store.publish(at + PUBLISH_WINDOW);
         // Three requests that state no prompt size, each dispatched before
         // the next is decided. A dispatch is its worker's credit until that
         // worker's next report, and the load stage credits one of no stated

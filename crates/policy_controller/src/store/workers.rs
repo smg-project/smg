@@ -435,7 +435,7 @@ pub enum MembershipTail {
 /// ([`crate::store::PUBLISH_WINDOW`]), however many writes the window
 /// took. The build of a registration, its refresh and a patch starts
 /// within one window of their answer, where the store's host pays the due
-/// instant ([`crate::store::LoadSink::publish_due`]), and they are in force
+/// instant ([`crate::store::MemoryStore::publish_due`]), and they are in force
 /// for decisions when it ends. A caller that needs its own write in force
 /// at once, or whose host runs no loop, asks for the build
 /// ([`crate::store::MemoryStore::publish_now`]). A removal and a replaced
