@@ -60,13 +60,18 @@ mod tests;
 const ENCODERS: &str = "encoders";
 /// The stage named when the request holds pixels, an image or a video, and
 /// none of the registered encoders that would take it otherwise takes
-/// images.
-const ENCODE_VISION: &str = "encode-vision";
+/// images. A demand for vision the request states says this word too where
+/// it leaves no encoder
+/// ([`UnmetDemand::encoders_stage`](crate::engine::demands::UnmetDemand::encoders_stage)).
+pub(crate) const ENCODE_VISION: &str = "encode-vision";
 /// The stage named when no registered encoder hands to a prefill of a pair:
 /// a pushing encoder states no role, or no prefill states its end.
 const EC_COMPATIBLE: &str = "ec-compatible";
 /// The stage named when no registered encoder takes the request's media.
-const ENCODE_MEDIA: &str = "encode-media";
+/// A demand for media by reference the request states says this word too
+/// where it leaves no encoder
+/// ([`UnmetDemand::encoders_stage`](crate::engine::demands::UnmetDemand::encoders_stage)).
+pub(crate) const ENCODE_MEDIA: &str = "encode-media";
 /// The stage named when the decode must take images and no decode of a pair
 /// an encoder serves does.
 const DECODE_VISION: &str = "decode-vision";
@@ -595,8 +600,9 @@ impl Engine {
     /// the same. Where a list's places name workers and none of them takes
     /// the request, though a worker outside them does, the request is held
     /// off every worker that takes it: it is shed under the places' name
-    /// (`places`), which no gap says. A gap this pass reads is answered
-    /// ahead of every list's places: no other place closes it. What the
+    /// (`places`), which no gap says. A gap of the pairs' membership this
+    /// pass reads (`ec-compatible`, `decode-vision`) is answered ahead of
+    /// every list's places: no other place closes it. What the
     /// pair's own decision answers stays behind the pass, under places as
     /// under none. Places that name no worker of a list are no such case.
     /// Such places of a side shed the request as they shed its pair alone,
@@ -912,8 +918,8 @@ impl Engine {
         if items.decode_images && any_served && !any_vision {
             return gap(DECODE_VISION);
         }
-        // No gap this pass reads stands, and the encoders' places hold
-        // the request off every encoder that takes it.
+        // No gap of the pairs' membership stands, and the encoders' places
+        // hold the request off every encoder that takes it.
         if held_off {
             return gap(PLACES);
         }

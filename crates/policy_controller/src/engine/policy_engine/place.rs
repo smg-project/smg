@@ -72,7 +72,10 @@ use std::{
 
 use smg_worker::identity::basic::Worker;
 
-use super::{encode::EncodeLists, Loaded, PolicyEngine};
+use super::{
+    encode::{splits, EncodeLists},
+    Loaded, PolicyEngine,
+};
 use crate::{
     document::{
         spec::{AppliedSpec, DecodePick},
@@ -282,7 +285,10 @@ pub struct PlaceRequest<'a> {
     /// encode request whose decode is held to the workers that take images
     /// ([`EncodeItems::decode_images`], or references beside an image or a
     /// video) books its decode with its prefill whatever it states here: a
-    /// decode asked again reads no image fact.
+    /// decode asked again reads no image fact. So does one with items
+    /// that demands vision or a way of processing its references
+    /// ([`Self::demands`]): its encoders meet that part of the demand, and
+    /// a decode asked again would hold the decode to it.
     pub decode_again: bool,
     /// Whether the caller counts this request on the decode its first
     /// decision named while it asks that decode again: one of that
@@ -835,13 +841,16 @@ impl RequestMaker for Made<'_, '_> {
         // the plain test reads it. An encode request whose decode is held
         // to the ones that take images, by its demand or by the preference
         // of references beside pixels, states none either: a decode asked
-        // again reads no image fact. The hold is read last, so a request
-        // that asks no decode again reads none of it.
+        // again reads no image fact. Nor does one that leaves a part of
+        // its hard demand to its encoders: a decode asked again takes no
+        // items and would hold the decode to the whole. Both are read
+        // last, so a request that asks no decode again reads neither.
         let later = request.asks_decode_again()
             && spec.decode_pick() == DecodePick::AfterPrefill
-            && !request
-                .encode
-                .is_some_and(|items| items.holds_decode_to_images(request.media.holds_pixels()));
+            && !request.encode.is_some_and(|items| {
+                items.holds_decode_to_images(request.media.holds_pixels())
+                    || splits(&items, request.demands)
+            });
         Request {
             id: request.request_id.map_or(&[], str::as_bytes),
             facts,
@@ -1627,10 +1636,10 @@ impl PolicyEngine {
     ///
     /// Declined by name ([`ShedReason::PolicyDeclined`]): a request that
     /// carries encode items over other lists than an encode request's
-    /// three (`encode-items`). A pair that states a demand is shed with no
-    /// worker for it ([`ShedReason::NoEndpoints`], under `wires`) where
-    /// each of its lists holds a worker: a pair's decision narrows neither
-    /// list by a demand.
+    /// three (`encode-items`). A request that states a demand is held to
+    /// the workers of each list that meet it ([`PlaceRequest::demands`]):
+    /// a list the demand leaves nobody sheds it with no endpoint
+    /// ([`ShedReason::NoEndpoints`]), under that demand's stage.
     ///
     /// Its caller counts each request it sends under the placement's
     /// routing value on the request's worker, as that worker's load guard
