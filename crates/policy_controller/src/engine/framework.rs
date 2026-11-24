@@ -3574,8 +3574,10 @@ pub struct Engine {
     /// ([`Lifecycle::keeps_loads`]), each by its place: listed once at the
     /// build, so a publication asks no stage whether it keeps them.
     keepers: Vec<Keeper>,
-    /// One tally per profile that reads sends, in the order of the
-    /// profiles' names: a later engine finds a profile's by its name
+    /// One tally for each two send settings a profile's stages read
+    /// under, in the order of the names of the profiles that made them:
+    /// a later engine finds one by its settings, then by that name, then
+    /// takes one that is left
     /// ([`Engine::succeed`]).
     pub(crate) sent_credits: Vec<Arc<DispatchCredit>>,
     /// The kinds of event the document takes, but for its counts of sends
@@ -5106,13 +5108,17 @@ impl Engine {
     }
 
     /// Takes over what the standing engine's counts of sends hold: each
-    /// count takes the rows' entries of the standing count that a profile
-    /// of the same name made. Profiles that share a count carry it under
-    /// the name of the first of them, so a count starts empty where that
-    /// name made no standing count. The two engines share those entries
-    /// from here on: a decision still running under the standing engine
-    /// reads the sends a later one counts, and each count reads them under
-    /// its own time limit and report delay.
+    /// count takes the rows' entries of the standing count under the same
+    /// two settings, whichever profile made that one. Where no standing
+    /// count has its settings, it takes the count that a profile of its
+    /// maker's name made, unless another count of this engine took that
+    /// one: two counts on one standing count would hold every send twice.
+    /// It then takes the first standing count that none took: the engine
+    /// records a send in every count, so any one of them carries the
+    /// sends. A count starts empty where none is left. The two engines share
+    /// those entries from here on: a decision still running under the
+    /// standing engine reads the sends a later one counts, and each count
+    /// reads them under its own time limit and report delay.
     ///
     /// [`MemoryStore::apply`](crate::store::MemoryStore::apply) calls it
     /// before it shows the new engine. A host with a store of its own
@@ -5121,12 +5127,38 @@ impl Engine {
     /// is let go. A rank the standing count first hears of behind this
     /// call is entered in the standing count alone.
     pub fn succeed(&self, standing: &Engine) {
-        for credit in &self.sent_credits {
-            if let Ok(at) = standing
-                .sent_credits
-                .binary_search_by(|prior| prior.profile.cmp(&credit.profile))
-            {
-                credit.succeed(&standing.sent_credits[at]);
+        let prior = &standing.sent_credits;
+        // The standing count of each count. One rule at a time over every
+        // count that has none yet: by the settings, by the maker's name,
+        // then the first left. So no count's match by an earlier rule is
+        // taken by another count's later one.
+        let mut taken: Vec<Option<usize>> = vec![None; self.sent_credits.len()];
+        let mut free = vec![true; prior.len()];
+        // The third rule's place among the standing counts: it only moves on.
+        let mut left = 0..prior.len();
+        for rule in 0..3 {
+            for (at, credit) in self.sent_credits.iter().enumerate() {
+                if taken[at].is_some() {
+                    continue;
+                }
+                taken[at] = match rule {
+                    0 => prior
+                        .iter()
+                        .position(|count| count.settings == credit.settings),
+                    1 => prior
+                        .binary_search_by(|count| count.profile.cmp(&credit.profile))
+                        .ok()
+                        .filter(|&standing| free[standing]),
+                    _ => left.find(|&standing| free[standing]),
+                };
+                if let Some(standing) = taken[at] {
+                    free[standing] = false;
+                }
+            }
+        }
+        for (credit, at) in self.sent_credits.iter().zip(taken) {
+            if let Some(at) = at {
+                credit.succeed(&prior[at]);
             }
         }
     }
