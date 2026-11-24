@@ -2066,11 +2066,12 @@ pub struct ProfileSpec {
     /// profiles of a document that set the same limit and the same delay
     /// read one count, under the name of the first of them that reads it,
     /// in the order of their names. A new document's count takes over the
-    /// sends the standing count under the same name holds and shares them:
-    /// a read under the shorter of the two delays ends such a send for
-    /// both. A count under a name with no standing count starts empty: a
-    /// document that drops that first profile, or groups it apart from the
-    /// others, starts the count of the others empty, once.
+    /// sends of the standing count under the same limit and delay,
+    /// whichever profiles read that one. Where none stands under them, it
+    /// takes over those of the standing count under the same name, unless
+    /// a count of the new document took that one by its settings. The two
+    /// counts share the sends: a read under the shorter of two delays ends
+    /// such a send for both. A count that finds neither starts empty.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1))]
     pub sent_report_delay_ms: Option<u32>,
@@ -5279,8 +5280,8 @@ impl PolicySpec {
         needs.headers |= !self.view.headers.is_empty();
         let mut engine = Engine::new(profiles, bindings, self.generation, needs);
         // In the order of the profiles' names, as the map walks them: a
-        // later engine finds a count by the name of the profile that made
-        // it.
+        // later engine that finds no count under its settings searches
+        // this order for the name of the profile that made one.
         debug_assert!(sent_credits
             .windows(2)
             .all(|pair| pair[0].profile < pair[1].profile));
@@ -7813,12 +7814,12 @@ mod tests {
         }
     }
 
-    /// A later document takes over a shared count by the name of the
-    /// profile that made it: the same profiles again keep its sends, and
-    /// where that profile is gone the count of the one that stays starts
-    /// empty.
+    /// A later document's count takes over the standing count under its
+    /// two settings, whichever profile made that one. Where none stands
+    /// under them it takes the count its maker's name made, unless a
+    /// count of the later document took that one.
     #[test]
-    fn a_later_document_takes_a_shared_count_by_the_name_of_its_maker() {
+    fn a_later_count_takes_the_standing_one_by_its_settings_then_by_its_name() {
         let both = r#"{"apiVersion":"smg.policy/v1","profiles":{"p":{"score":["least-load"],"pick":"best"},"q":{"score":["least-load"],"pick":"best"}},"bindings":[{"match":{"model":"m"},"profile":"p"},{"match":{"model":"*"},"profile":"q"}]}"#;
         let q_alone = r#"{"apiVersion":"smg.policy/v1","profiles":{"q":{"score":["least-load"],"pick":"best"}},"bindings":[{"match":{"model":"*"},"profile":"q"}]}"#;
         let worker = crate::engine::WorkerId(7);
@@ -7826,23 +7827,51 @@ mod tests {
             id: worker,
             ..Default::default()
         };
-        // The later document, and the sends its one count holds.
-        for (later, want) in [(both, 1), (q_alone, 0)] {
-            let standing = doc(both).validate().expect("a valid document");
-            standing.on_dispatched(
+        // A document with the limits its `p` and its `q` set.
+        let built = |document: &str, limits: [Option<u32>; 2]| {
+            let mut spec = doc(document);
+            for (name, limit) in ["p", "q"].into_iter().zip(limits) {
+                if let Some(profile) = spec.profiles.get_mut(name) {
+                    profile.sent_ttl_ms = limit;
+                }
+            }
+            spec.validate().expect("a valid document")
+        };
+        // The limits of the standing `p` and `q`, the later document and
+        // its limits, and the sends the later counts hold, in the order
+        // of their makers' names. The send is in the last standing count.
+        for (was, later, limits, want) in [
+            // The same document again.
+            ([None, None], both, [None, None], vec![1]),
+            // `p` made the shared count and leaves: `q` keeps the send.
+            ([None, None], q_alone, [None, None], vec![1]),
+            // Both under a new limit: the name `p` carries the count.
+            ([None, None], both, [Some(43), Some(43)], vec![1]),
+            // `p` leaves the shared count for a limit of its own: `q`
+            // keeps the send and `p` starts empty.
+            ([None, None], both, [Some(43), None], vec![0, 1]),
+            // `p` takes the limit `q` had and `q` a new one: `p` holds the
+            // send of the count under its limit, and `q` does not take
+            // that count too by its name.
+            ([Some(1), Some(9)], both, [Some(9), Some(43)], vec![1, 0]),
+        ] {
+            let standing = built(both, was);
+            let sent = standing.sent_credits.last().expect("a count");
+            sent.dispatched(
                 &crate::tracking::Lease::default(),
                 &target,
                 crate::tracking::Side::Single,
                 0,
+                || true,
             );
-            let next = doc(later).validate().expect("a valid document");
+            let next = built(later, limits);
             next.succeed(&standing);
             let held: Vec<_> = next
                 .sent_credits
                 .iter()
                 .map(|count| count.credits.held(worker))
                 .collect();
-            assert_eq!(held, [want], "{later}");
+            assert_eq!(held, want, "{was:?}, then {later} under {limits:?}");
         }
     }
 

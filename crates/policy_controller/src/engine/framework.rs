@@ -3542,8 +3542,9 @@ pub struct Engine {
     /// ([`Lifecycle::keeps_loads`]), each by its place: listed once at the
     /// build, so a publication asks no stage whether it keeps them.
     keepers: Vec<Keeper>,
-    /// One tally per profile that reads sends, in the order of the
-    /// profiles' names: a later engine finds a profile's by its name
+    /// One tally for each two send settings a profile's stages read
+    /// under, in the order of the names of the profiles that made them:
+    /// a later engine finds one by its settings, then by that name
     /// ([`Engine::succeed`]).
     pub(crate) sent_credits: Vec<Arc<DispatchCredit>>,
     /// The kinds of event the document takes, but for its counts of sends
@@ -4924,13 +4925,15 @@ impl Engine {
     }
 
     /// Takes over what the standing engine's counts of sends hold: each
-    /// count takes the rows' entries of the standing count that a profile
-    /// of the same name made. Profiles that share a count carry it under
-    /// the name of the first of them, so a count starts empty where that
-    /// name made no standing count. The two engines share those entries
-    /// from here on: a decision still running under the standing engine
-    /// reads the sends a later one counts, and each count reads them under
-    /// its own time limit and report delay.
+    /// count takes the rows' entries of the standing count under the same
+    /// two settings, whichever profile made that one. Where no standing
+    /// count has its settings, it takes the count that a profile of its
+    /// maker's name made, unless another count of this engine took that
+    /// one: two counts on one standing count would hold every send twice.
+    /// A count that finds neither starts empty. The two engines share
+    /// those entries from here on: a decision still running under the
+    /// standing engine reads the sends a later one counts, and each count
+    /// reads them under its own time limit and report delay.
     ///
     /// [`MemoryStore::apply`](crate::store::MemoryStore::apply) calls it
     /// before it shows the new engine. A host with a store of its own
@@ -4939,12 +4942,21 @@ impl Engine {
     /// is let go. A rank the standing count first hears of behind this
     /// call is entered in the standing count alone.
     pub fn succeed(&self, standing: &Engine) {
+        let under = |counts: &[Arc<DispatchCredit>], settings| {
+            counts.iter().position(|count| count.settings == settings)
+        };
         for credit in &self.sent_credits {
-            if let Ok(at) = standing
-                .sent_credits
-                .binary_search_by(|prior| prior.profile.cmp(&credit.profile))
-            {
-                credit.succeed(&standing.sent_credits[at]);
+            let prior = &standing.sent_credits;
+            let by_name = || {
+                let at = prior
+                    .binary_search_by(|count| count.profile.cmp(&credit.profile))
+                    .ok()?;
+                under(&self.sent_credits, prior[at].settings)
+                    .is_none()
+                    .then_some(at)
+            };
+            if let Some(at) = under(prior, credit.settings).or_else(by_name) {
+                credit.succeed(&prior[at]);
             }
         }
     }
