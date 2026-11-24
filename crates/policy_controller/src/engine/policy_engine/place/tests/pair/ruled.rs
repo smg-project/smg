@@ -419,14 +419,8 @@ fn the_rule_is_asked_among_the_places_a_pairs_caller_states() {
 
     // The places kept for a list are the caller's that the rule takes.
     let older = [1, 2, 9];
-    let (mut kept, mut spent) = (None, 0);
-    let held = hold_to_rule(
-        &request,
-        Some(pair.prefill),
-        Some(&older),
-        &mut kept,
-        &mut spent,
-    );
+    let mut kept = None;
+    let held = hold_to_rule(&request, Some(pair.prefill), Some(&older), &mut kept);
     held.expect("the rule takes a stated prefill");
     assert_eq!(kept.as_deref(), Some(&[2][..]));
     assert_eq!((engine.faults(), engine.unheard()), (0, 0));
@@ -471,16 +465,10 @@ fn a_pair_that_states_no_rule_keeps_no_places() {
     let classes = lists.every();
     let pair = lists.under(&classes, &Open);
     let request = PlaceRequest::of(MODEL, WorkerLists::Pair(pair));
-    let (mut prefills, mut decodes, mut spent) = (None, None, 0);
-    let asked = hold_to_rule(
-        &request,
-        Some(pair.prefill),
-        None,
-        &mut prefills,
-        &mut spent,
-    );
+    let (mut prefills, mut decodes) = (None, None);
+    let asked = hold_to_rule(&request, Some(pair.prefill), None, &mut prefills);
     asked.expect("no rule sheds nothing");
-    let asked = hold_to_rule(&request, Some(pair.decode), None, &mut decodes, &mut spent);
+    let asked = hold_to_rule(&request, Some(pair.decode), None, &mut decodes);
     asked.expect("no rule sheds nothing");
     assert_eq!((prefills, decodes), (None, None));
 }
@@ -759,5 +747,32 @@ fn a_pair_shed_as_saturated_whose_rules_workers_do_not_pair_is_answered_by_the_d
         panic!("a shed");
     };
     assert_eq!((reason, emptied_by), (ShedReason::NoEndpoints, "partnered"));
+    assert_eq!((engine.faults(), engine.unheard()), (0, 0));
+}
+
+/// A held pair's call makes three decisions, as any call does: the two
+/// behind its first are made among the rule's workers, and no fourth
+/// follows them. Under a profile with no `healthy` filter the rule takes
+/// three prefills of four, two of them not ready. The second decision and
+/// the third each name one of those two and are given up, and the request
+/// has no worker though the rule's third prefill is ready.
+#[test]
+fn a_held_pairs_call_makes_three_decisions() {
+    let (engine, heard) = paired(false);
+    let lists = Lists::of(4, 1);
+    lists.prefills[1].set_status(WorkerStatus::NotReady);
+    lists.prefills[2].set_status(WorkerStatus::NotReady);
+    let classes = lists.every();
+    let pair = lists.under(&classes, &Open);
+    let refused = lists.prefill_id(0);
+    let admits = |worker: &dyn Worker| worker_id(worker) != refused;
+    let request = PlaceRequest {
+        admits: Some(&admits),
+        ..PlaceRequest::of(MODEL, WorkerLists::Pair(pair))
+    };
+    assert_eq!(engine.place(&request).err(), Some(Unplaced::NoWorkers));
+    let decode = lists.decode_id(0);
+    let given_up = [0, 1, 2].map(|at| both_given_up(lists.prefill_id(at), decode));
+    assert_eq!(said(&heard), given_up.concat(), "three decisions");
     assert_eq!((engine.faults(), engine.unheard()), (0, 0));
 }

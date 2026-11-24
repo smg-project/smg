@@ -29,16 +29,14 @@
 //! can be sent to: ready ([`ready`]), and admitted by its route's own rule
 //! ([`PlaceRequest::admits`]). Where no target of a decision can be sent
 //! to, the engine decides again with the workers it could not send to
-//! excluded, three decisions a call ([`ASKS`]). Behind a decision none of
-//! whose targets can be sent to, the later decisions of a request that
-//! states a rule are held to the workers the rule takes
-//! ([`hold_to_rule`]): those of a single request's list, where the rule
-//! refused a worker that was ready, and those of each of a pair's two,
-//! whatever kept its targets from being sent to, and where its first
-//! decision shed the request as saturated. A single request's call
-//! makes one decision among them at least: a fourth where its third found
-//! them. The caller is answered a [`Placement`], which it keeps with the
-//! request, or the reason there is none ([`Unplaced`]).
+//! excluded, three decisions a call ([`ASKS`]). Behind the first decision
+//! none of whose targets can be sent to, the later decisions of a request
+//! that states a rule are held to the workers the rule takes
+//! ([`hold_to_rule`]): those of a single request's list, and those of each
+//! of a pair's two, whatever kept its targets from being sent to, and
+//! where a pair's first decision shed the request as saturated. The
+//! caller is answered a [`Placement`], which it keeps with the request, or
+//! the reason there is none ([`Unplaced`]).
 //!
 //! A single request that names its worker, under a document whose binding
 //! says which header names it, is held to that one worker and goes to no
@@ -327,13 +325,13 @@ pub struct PlaceRequest<'a> {
     /// decision: it asks the engine nothing, and where it panics the prompt
     /// is stored for no worker and the panic reaches the caller behind the
     /// decision.
-    /// Behind a decision none of whose picks can be sent to, it is asked
-    /// of every worker of the list, once a call, and the call decides
-    /// again among the workers it takes ([`PolicyEngine::place`]): those
-    /// of a single request's list, where it refused a pick that was
-    /// ready, and those of each of a pair's two, among the places its
-    /// caller states for that side, whether it refused the picks or they
-    /// were not ready. A first call may ask the rule of any worker
+    /// Behind the first decision none of whose picks can be sent to,
+    /// whether it refused them or they were not ready, it is asked of
+    /// every worker of the list, once a call, and the call decides again
+    /// among the workers it takes ([`PolicyEngine::place`]): those of a
+    /// single request's list, and those of each of a pair's two, among the
+    /// places its caller states for that side. A first call may ask the
+    /// rule of any worker
     /// of its lists, picked or not. A pick it is asked of is ready. A
     /// worker of a list it is asked of may not be: it answers for a worker
     /// in any state. No request is sent to a worker it refuses when it is
@@ -491,8 +489,6 @@ struct Sent {
     asked: u8,
     /// A bit a place kept, in that order: set where the call sends to it.
     sendable: u8,
-    /// Whether the route's rule refused a target that was ready.
-    refused: bool,
 }
 
 impl Sent {
@@ -501,7 +497,6 @@ impl Sent {
         places: [0; MAX_TARGETS],
         asked: 0,
         sendable: 0,
-        refused: false,
     };
 
     /// The answer on the target at `place`: whether the call sends to it.
@@ -983,10 +978,7 @@ impl Made<'_, '_> {
         let sendable = ready(worker)
             && self.request.admits.is_none_or(|admits| {
                 match catch_unwind(AssertUnwindSafe(|| admits(worker))) {
-                    Ok(admitted) => {
-                        sent.refused |= !admitted;
-                        admitted
-                    }
+                    Ok(admitted) => admitted,
                     Err(panic) => {
                         drop(self.panicked.set(panic));
                         false
@@ -1243,28 +1235,24 @@ pub(super) fn give_up(
 /// kept in `held`, ascending, each once: a single request's in its call
 /// ([`Call::admitted`]), and each of a pair's two beside the asks that
 /// are lent them ([`pair`]). It is asked of a list once a call, while the
-/// call holds no decision: behind a single request's first decision none
-/// of whose targets can be sent to where it refused a worker that was
-/// ready, and behind a pair's first decision no target of which holds,
-/// whether it refused a side or the side was not ready, or that sheds
-/// the request as saturated. A request that states no rule keeps no
-/// places: its later asks are made over its lists whole. A rule that
-/// panics here leaves no lease behind. Out of line: a
-/// request whose first decision takes a target runs none of it. An encode
-/// request that carries items comes here for no list: this call hands
-/// its decision no places of the rule's.
+/// call holds no decision: behind the call's first decision none of whose
+/// targets can be sent to, whether it refused them or they were not
+/// ready, and behind a pair's first decision that sheds the request as
+/// saturated. A request that states no rule keeps no places: its later
+/// asks are made over its lists whole. A rule that panics here leaves no
+/// lease behind. Out of line: a request whose first decision takes a
+/// target runs none of it. An encode request that carries items comes
+/// here for no list: this call hands its decision no places of the
+/// rule's.
 ///
 /// A worker that is not ready is asked too. A rule that takes no worker
 /// is so told from a rule whose workers are not ready: the first is the
 /// rule's own answer, and the second is the decision's, by the filter
 /// that left nobody.
 ///
-/// The ask that finds the rule's workers is followed by one decision
-/// among them at least. Where it is the call's last ([`ASKS`]), the call
-/// is given one more (`spent`, the call's own): no ask behind that one
-/// finds them again, so a call makes four decisions at most. A pair's
-/// are found behind its call's first ask that takes no target, so a
-/// pair's call makes three.
+/// The rule's workers are found behind the call's first ask that takes
+/// no target, so the two asks the call has left are made among them
+/// ([`ASKS`]).
 ///
 /// # Errors
 ///
@@ -1278,7 +1266,6 @@ fn hold_to_rule(
     list: Option<LentList<'_>>,
     stated: Option<&[u32]>,
     held: &mut Option<Vec<u32>>,
-    spent: &mut usize,
 ) -> Result<(), Unplaced> {
     if held.is_some() || request.admits.is_none() {
         return Ok(());
@@ -1306,15 +1293,13 @@ fn hold_to_rule(
         });
     }
     *held = Some(places);
-    // One ask is left behind this one, whichever of the call's it is.
-    *spent = (*spent).min(ASKS - 2);
     Ok(())
 }
 
 /// The asks of one call: the first, and two more that leave out the
 /// workers the call could not send to. An ask is one decision of the call
-/// and the walk of its targets. A single request's call whose third ask
-/// found the workers its route's rule takes is given a fourth among them
+/// and the walk of its targets. The two later asks of a request that
+/// states a rule are made among the workers the rule takes
 /// ([`hold_to_rule`]).
 const ASKS: usize = 3;
 
@@ -1334,14 +1319,14 @@ pub(super) struct Call {
     spent: usize,
     /// The places of the list whose worker the route's rule takes
     /// ([`PlaceRequest::admits`]), ascending, each once, from the first
-    /// decision none of whose targets could be sent to where the rule
-    /// refused one that was ready ([`hold_to_rule`]). The call's later
-    /// asks are held to them ([`Constraints::places`]). `None` ahead of
-    /// that decision, and for a request with no rule. For a request that
-    /// names its worker they are that worker's one place, from ahead of
-    /// the call's first ask ([`target`]), and the rule is not asked of
-    /// the list again. A single request's alone: the places of a pair's
-    /// two lists stand beside its later asks ([`pair`]).
+    /// decision none of whose targets could be sent to
+    /// ([`hold_to_rule`]). The call's later asks are held to them
+    /// ([`Constraints::places`]). `None` ahead of that decision, and for a
+    /// request with no rule. For a request that names its worker they are
+    /// that worker's one place, from ahead of the call's first ask
+    /// ([`target`]), and the rule is not asked of the list again. A single
+    /// request's alone: the places of a pair's two lists stand beside its
+    /// later asks ([`pair`]).
     admitted: Option<Vec<u32>>,
     /// Whether the call's requests are made with no routing value and no
     /// client's value: a request that names its worker over a list none of
@@ -1390,10 +1375,9 @@ impl Call {
     /// What an ask answers where no target of its decision can be sent to:
     /// the answer of `ask`, the call's next ask, while the call has an ask
     /// left, and no worker for the request ([`Unplaced::NoWorkers`]) behind
-    /// its last: [`ASKS`] asks a call, and one more where the last of them
-    /// found the workers the route's rule takes ([`hold_to_rule`]). The
-    /// next ask answers in this one's place, and a request whose first ask
-    /// takes a target pays for no other.
+    /// its last: [`ASKS`] asks a call. The next ask answers in this one's
+    /// place, and a request whose first ask takes a target pays for no
+    /// other.
     #[cold]
     pub(super) fn again<'a>(
         &mut self,
@@ -1448,8 +1432,8 @@ fn raise(
 /// Where none can be sent to, the decision is given up by name, its
 /// targets join the ones the call's next ask leaves out
 /// ([`Call::missed`]), and the call's next ask answers ([`Call::again`]).
-/// Where the rule refused one of them that was ready, the call's later
-/// asks are held to the workers the rule takes ([`hold_to_rule`]).
+/// The later asks of a request that states a rule are held to the
+/// workers the rule takes ([`hold_to_rule`]).
 fn single<'a>(
     engine: Loaded<'static, '_>,
     request: &PlaceRequest<'a>,
@@ -1489,7 +1473,7 @@ fn single<'a>(
                 call.missed.push(id);
                 // The pick read the worker ready, and a place holds no
                 // decision: the rule is asked of the list at once.
-                hold_to_rule(request, list, None, &mut call.admitted, &mut call.spent)?;
+                hold_to_rule(request, list, None, &mut call.admitted)?;
                 return call.again(|call| single(engine, request, list, call));
             }
             let mut placement = Placement::alone(Arc::clone(worker), engine.label_at(pick.profile));
@@ -1504,20 +1488,11 @@ fn single<'a>(
             };
             let (key, sent) = (made.key(), made.sent.get());
             let now = dated.unwrap_or_else(Instant::now);
-            // Whether the rule refused a target that was ready: inside
-            // the decision, or here.
-            let refused = Cell::new(sent.refused);
             let taken = walk(engine, decided, later, now, &mut call.missed, |target| {
                 let worker = at(target.position);
                 // The lookup's answer stands for a target it asked.
                 let sendable = sent.answer(target.position).unwrap_or_else(|| {
-                    worker.is_some_and(|worker| {
-                        ready(worker.as_ref()) && {
-                            let admitted = admitted(request, worker.as_ref());
-                            refused.set(refused.get() || !admitted);
-                            admitted
-                        }
-                    })
+                    worker.is_some_and(|worker| sendable(request, worker.as_ref()))
                 });
                 match worker {
                     Some(worker) if sendable => Ok((Arc::clone(worker), None)),
@@ -1533,11 +1508,9 @@ fn single<'a>(
                     Ok(placement)
                 }
                 Ok(None) => {
-                    // The walk gave the decision up: the rule is asked of
+                    // The walk gave the decision up: a rule is asked of
                     // the list while the call holds none.
-                    if refused.get() {
-                        hold_to_rule(request, list, None, &mut call.admitted, &mut call.spent)?;
-                    }
+                    hold_to_rule(request, list, None, &mut call.admitted)?;
                     call.again(|call| single(engine, request, list, call))
                 }
                 Err(unplaced) => Err(unplaced),
@@ -1574,14 +1547,12 @@ impl PolicyEngine {
     /// A worker the rule refuses is left out like one that is not ready.
     /// The rule is asked of a decision's picks first: a request whose
     /// first pick it admits pays one call of it, inside the decision where
-    /// that stores the prompt for a worker. Behind a decision none of
-    /// whose picks can be sent to, it is given up and the rule is asked of
+    /// that stores the prompt for a worker. Behind the first decision
+    /// none of whose picks can be sent to, whether the rule refused them
+    /// or they were not ready, it is given up and the rule is asked of
     /// every worker of the list, ready or not, once a call: of a single
-    /// request's list, behind the first such decision in which the rule
-    /// refused a pick that was ready, and of each of a pair's two, among
-    /// the places its caller states for that side, behind the first such
-    /// decision, whether the rule refused its picks or they were not
-    /// ready. The call's later decisions are held
+    /// request's list, and of each of a pair's two, among the places its
+    /// caller states for that side. The call's later decisions are held
     /// to the places of the workers it takes ([`Constraints::places`], and
     /// a pair's a side each,
     /// [`PairLists::prefill_places`](crate::engine::PairLists::prefill_places)
@@ -1589,9 +1560,8 @@ impl PolicyEngine {
     /// the one such worker of a long list is
     /// found, one over its overload thresholds is answered by the
     /// binding's rule for a list wholly over them, and one an earlier
-    /// attempt tried is handed again where no other is left. A single
-    /// request's call makes one decision among them at least, a fourth
-    /// where its third found them, and a pair's makes three decisions.
+    /// attempt tried is handed again where no other is left. The call's
+    /// two later decisions are made among them: three decisions a call.
     /// A request whose rule takes no worker of a list is shed
     /// with no endpoint, under `admits`. One whose rule takes workers none
     /// of which is ready, or workers of a pair's two lists no two of which
