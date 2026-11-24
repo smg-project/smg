@@ -4,9 +4,12 @@
 //! the record is read, a polled answer's list where the load monitor takes
 //! it.
 
-use std::sync::Arc;
+use std::{fmt, sync::Arc};
 
-use serde::{de::IgnoredAny, Deserialize, Deserializer};
+use serde::{
+    de::{DeserializeSeed, MapAccess, SeqAccess, Visitor},
+    Deserializer,
+};
 
 use crate::worker::NamedValue;
 #[cfg(feature = "runtime")]
@@ -108,36 +111,236 @@ pub(crate) fn bound(values: &mut Vec<NamedValue>) -> usize {
 /// reader takes, a bare `NaN` among them, fails the whole body here as
 /// anywhere in it: the load monitor keeps a route that had answered over
 /// such a body.
+///
+/// The list is read where it lies on the wire: no entry is set aside to
+/// be tried, so a named value costs its own text and its two strings.
 pub(crate) fn stated<'de, D>(source: D) -> Result<Vec<NamedValue>, D::Error>
 where
     D: Deserializer<'de>,
 {
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum Entry {
-        Named(NamedValue),
-        Other(IgnoredAny),
+    Ok(match source.deserialize_any(Read::Values)? {
+        Stated::List(values) => values,
+        _ => Vec::new(),
+    })
+}
+
+/// What an answer states at one place of a `values` key, taken whole.
+enum Stated {
+    Text(Arc<str>),
+    Unsigned(u64),
+    Negative(i64),
+    Float(f64),
+    Null,
+    List(Vec<NamedValue>),
+    Named(NamedValue),
+    Key(Key),
+    Other,
+}
+
+/// The place read: the key's list, one entry of it, a key of an entry, a
+/// name or a unit, or any other value. Each takes the shape it looks for
+/// and reads any other to its end as [`Stated::Other`]. A value that is
+/// left is still read as a value, so a token that fails a body fails it
+/// here too, and only a name's and a unit's text is copied.
+#[derive(Clone, Copy)]
+enum Read {
+    Values,
+    Entry,
+    Key,
+    Text,
+    Rest,
+}
+
+/// A field of an entry. `Other` is a key the entry states for itself:
+/// its value is read and left.
+#[derive(Clone, Copy)]
+enum Key {
+    Name,
+    Unit,
+    Value,
+    AgeMs,
+    Other,
+}
+
+impl Key {
+    /// The field at a place: of an entry stated as a list, or of a key
+    /// stated as a number.
+    fn at(place: u64) -> Self {
+        match place {
+            0 => Self::Name,
+            1 => Self::Unit,
+            2 => Self::Value,
+            3 => Self::AgeMs,
+            _ => Self::Other,
+        }
     }
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum Stated {
-        List(Vec<Entry>),
-        Other(IgnoredAny),
+
+    /// The place that reads the field's value.
+    fn place(self) -> Read {
+        match self {
+            Self::Name | Self::Unit => Read::Text,
+            Self::Value | Self::AgeMs | Self::Other => Read::Rest,
+        }
     }
-    match Stated::deserialize(source)? {
-        Stated::List(entries) => Ok(entries
-            .into_iter()
-            .map(|entry| match entry {
-                Entry::Named(value) => value,
-                Entry::Other(IgnoredAny) => NamedValue {
-                    name: Arc::default(),
-                    unit: Arc::default(),
-                    value: 0.0,
-                    age_ms: None,
-                },
-            })
-            .collect()),
-        Stated::Other(IgnoredAny) => Ok(Vec::new()),
+}
+
+/// An entry's fields as far as they are stated. A field stated twice, or
+/// as something its type does not read, breaks the entry: it is still
+/// read to its end, and stands as one with no name.
+#[derive(Default)]
+struct Fields {
+    name: Option<Arc<str>>,
+    unit: Option<Arc<str>>,
+    value: Option<f64>,
+    age_ms: Option<Option<u32>>,
+    broken: bool,
+}
+
+impl Fields {
+    fn take(&mut self, key: Key, stated: Stated) {
+        let fresh = match (key, stated) {
+            (Key::Name, Stated::Text(name)) => self.name.replace(name).is_none(),
+            (Key::Unit, Stated::Text(unit)) => self.unit.replace(unit).is_none(),
+            (Key::Value, Stated::Unsigned(value)) => self.value.replace(value as f64).is_none(),
+            (Key::Value, Stated::Negative(value)) => self.value.replace(value as f64).is_none(),
+            (Key::Value, Stated::Float(value)) => self.value.replace(value).is_none(),
+            (Key::AgeMs, Stated::Null) => self.age_ms.replace(None).is_none(),
+            (Key::AgeMs, Stated::Unsigned(age)) => {
+                u32::try_from(age).is_ok_and(|age| self.age_ms.replace(Some(age)).is_none())
+            }
+            (Key::Other, _) => true,
+            _ => false,
+        };
+        self.broken |= !fresh;
+    }
+
+    /// The named value, where the entry stands and states its name, its
+    /// unit and its value.
+    fn named(self) -> Stated {
+        match self {
+            Self {
+                name: Some(name),
+                unit: Some(unit),
+                value: Some(value),
+                age_ms,
+                broken: false,
+            } => Stated::Named(NamedValue {
+                name,
+                unit,
+                value,
+                age_ms: age_ms.flatten(),
+            }),
+            _ => Stated::Other,
+        }
+    }
+}
+
+impl<'de> DeserializeSeed<'de> for Read {
+    type Value = Stated;
+
+    fn deserialize<D: Deserializer<'de>>(self, source: D) -> Result<Stated, D::Error> {
+        source.deserialize_any(self)
+    }
+}
+
+impl<'de> Visitor<'de> for Read {
+    type Value = Stated;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("any value")
+    }
+
+    fn visit_bool<E>(self, _: bool) -> Result<Stated, E> {
+        Ok(Stated::Other)
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Stated, E> {
+        Ok(u64::try_from(value).map_or(Stated::Negative(value), Stated::Unsigned))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Stated, E> {
+        Ok(Stated::Unsigned(value))
+    }
+
+    fn visit_f64<E>(self, value: f64) -> Result<Stated, E> {
+        Ok(Stated::Float(value))
+    }
+
+    fn visit_str<E>(self, text: &str) -> Result<Stated, E> {
+        Ok(match self {
+            Self::Key => Stated::Key(match text {
+                "name" => Key::Name,
+                "unit" => Key::Unit,
+                "value" => Key::Value,
+                "age_ms" => Key::AgeMs,
+                _ => Key::Other,
+            }),
+            Self::Text => Stated::Text(Arc::from(text)),
+            Self::Values | Self::Entry | Self::Rest => Stated::Other,
+        })
+    }
+
+    fn visit_unit<E>(self) -> Result<Stated, E> {
+        Ok(Stated::Null)
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut list: A) -> Result<Stated, A::Error> {
+        match self {
+            Self::Values => {
+                let room = list.size_hint().map_or(0, |stated| stated.min(MAX_VALUES));
+                let mut values = Vec::with_capacity(room);
+                while let Some(entry) = list.next_element_seed(Self::Entry)? {
+                    values.push(match entry {
+                        Stated::Named(value) => value,
+                        _ => NamedValue {
+                            name: Arc::default(),
+                            unit: Arc::default(),
+                            value: 0.0,
+                            age_ms: None,
+                        },
+                    });
+                }
+                Ok(Stated::List(values))
+            }
+            // An entry stated by place: its name, unit, value and age,
+            // and nothing past them.
+            Self::Entry => {
+                let mut fields = Fields::default();
+                let mut place = 0;
+                while let Some(stated) = list.next_element_seed(Key::at(place).place())? {
+                    fields.take(Key::at(place), stated);
+                    place += 1;
+                }
+                fields.broken |= place != 4;
+                Ok(fields.named())
+            }
+            Self::Key | Self::Text | Self::Rest => {
+                while list.next_element_seed(Self::Rest)?.is_some() {}
+                Ok(Stated::Other)
+            }
+        }
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut entry: A) -> Result<Stated, A::Error> {
+        let Self::Entry = self else {
+            while entry.next_key_seed(Self::Rest)?.is_some() {
+                entry.next_value_seed(Self::Rest)?;
+            }
+            return Ok(Stated::Other);
+        };
+        let mut fields = Fields::default();
+        while let Some(key) = entry.next_key_seed(Self::Key)? {
+            let key = match key {
+                Stated::Key(key) => key,
+                Stated::Unsigned(place) => Key::at(place),
+                _ => {
+                    fields.broken = true;
+                    Key::Other
+                }
+            };
+            fields.take(key, entry.next_value_seed(key.place())?);
+        }
+        Ok(fields.named())
     }
 }
 
@@ -269,5 +472,35 @@ mod tests {
         assert_eq!(snapshot.bound_values(), 4);
         assert_eq!(names(&snapshot.values), ["depth", "rate"]);
         assert_eq!(snapshot.values[1].value, 0.5);
+        // A list of four states an entry by place: its name, unit, value
+        // and age. A list of three or of five, a key stated twice and a
+        // unit that is no text are read with no name, each to its end.
+        let snapshot = read(
+            r#"[["place","items",-4,null],
+                ["short","items",4],
+                ["long","items",4,null,5],
+                {"name":"twice","unit":"items","value":1,"value":2},
+                {"name":"deep","unit":{"of":["items"]},"value":1},
+                {"name":"last","unit":"items","value":1}]"#,
+        );
+        assert_eq!(names(&snapshot.values), ["place", "", "", "", "", "last"]);
+        assert_eq!(snapshot.values[0].value, -4.0);
+        assert_eq!(snapshot.num_waiting_reqs, 7);
+        // What the key keeps nothing of is read as a value all the same:
+        // a number past any float, or half a pair of escapes, fails the
+        // body under a key of the entry's own, in a unit that is a list,
+        // and in a key that is no list.
+        for refused in [
+            r#"[{"name":"depth","unit":"items","value":3,"more":1e400}]"#,
+            r#"[{"name":"depth","unit":"items","value":3,"more":"\udc00"}]"#,
+            r#"[{"name":"depth","unit":[1e400],"value":3}]"#,
+            r#"{"depth":1e400}"#,
+        ] {
+            let answer = format!(r#"{{"dp_rank":2,"values":{refused}}}"#);
+            assert!(
+                serde_json::from_str::<SchedulerLoadSnapshot>(&answer).is_err(),
+                "{refused}"
+            );
+        }
     }
 }

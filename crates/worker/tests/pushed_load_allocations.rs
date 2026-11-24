@@ -1,4 +1,5 @@
-//! Allocation calls made while converting a pushed load record.
+//! Allocation calls made while a load report is taken in: a pushed record
+//! converted, a report copied, a polled answer read.
 
 #![cfg(feature = "proto")]
 #![expect(
@@ -88,4 +89,20 @@ fn a_copy_of_a_named_report_allocates_its_list_alone() {
     assert_eq!(copy.values.len(), 2);
     eprintln!("allocations per copy of a report of two named values = {calls}");
     assert_eq!(calls, 1);
+}
+
+/// The load monitor reads a polled answer's named values where they lie
+/// in its text: a value costs its two strings, and the list its one block.
+#[test]
+fn a_read_of_a_polled_answer_allocates_its_strings_and_its_list() {
+    let answer = r#"{"dp_rank":0,"num_running_reqs":13,"values":[
+        {"name":"queue_age","unit":"ms","value":6.5},
+        {"name":"read_rate","unit":"items/s","value":0.125,"age_ms":41}]}"#;
+    let before = CALLS.with(Cell::get);
+    let snapshot: SchedulerLoadSnapshot =
+        serde_json::from_str(std::hint::black_box(answer)).unwrap_or_default();
+    let calls = CALLS.with(Cell::get) - before;
+    assert_eq!(snapshot.values.len(), 2);
+    eprintln!("allocations per read of an answer of two named values = {calls}");
+    assert_eq!(calls, 5);
 }
