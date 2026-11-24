@@ -1000,17 +1000,13 @@ async fn of_two_workers_under_one_id_neither_is_told_until_one_stands_alone() {
     task.abort();
 }
 
-/// A report whose conversion panics is held and counted, once: it is told
-/// to no stage and counts as told, the other worker's report is told, the
-/// task goes on and keeps the snapshot, and the worker's next sample is
-/// told. The sum of two ranks' resident tokens overflows where overflow is
-/// checked.
+/// A report whose ranks state resident tokens past what one sum of their
+/// width holds is told like any other, with a row of the most its field
+/// states: its conversion panics in no build and wraps in none. No fault
+/// is counted, the other worker's report is told beside it, and the task
+/// goes on.
 #[tokio::test(start_paused = true)]
-#[cfg_attr(
-    not(debug_assertions),
-    ignore = "the sum wraps where overflow is not checked"
-)]
-async fn a_report_that_panics_at_its_conversion_ends_no_task() {
+async fn a_report_past_what_one_sum_holds_is_told_as_the_rows_most() {
     let (engine, heard) = keeping("least_load", false);
     engine.set_registry(registry(2) as Arc<dyn Members>);
     let mut stated = reports(&[1, 2], 0);
@@ -1020,24 +1016,17 @@ async fn a_report_that_panics_at_its_conversion_ends_no_task() {
     };
     let second = stated.get_mut(&url(1)).expect("the second report");
     second.loads = vec![rank(i64::MAX), rank(1)];
-    let (feed, channel) = monitor(&stated);
+    let (_feed, channel) = monitor(&stated);
     engine.set_loads(channel);
     let task = running(&engine).await;
-    let told = steps_of(&engine, &told_since(&heard));
-    assert_eq!(told, [(id(0), 1)], "the other worker's report is told");
-    assert_eq!(engine.upkeep_faults(), 1, "held and counted");
-    assert!(at_hand(&engine).is_some(), "the snapshot is kept");
-
-    // The report that panicked counts as told: it is not tried again.
-    feed.publish(&stated);
-    settle().await;
-    assert_eq!(told_since(&heard), [], "no report is new");
-    assert_eq!(engine.upkeep_faults(), 1, "counted once");
-
-    feed.publish(&reports(&[1, 3], 0));
-    settle().await;
-    let told = steps_of(&engine, &told_since(&heard));
-    assert_eq!(told, [(id(1), 3)], "the worker's next sample");
+    let told = told_since(&heard);
+    assert_eq!(steps_of(&engine, &told), [(id(0), 1), (id(1), 2)]);
+    let most = told[1].row;
+    assert_eq!(
+        (most.resident_tokens, most.resident_counted),
+        (u32::MAX, true)
+    );
+    assert_eq!(engine.upkeep_faults(), 0, "no conversion panics");
     assert!(!task.is_finished(), "the task goes on");
     task.abort();
 }
