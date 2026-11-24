@@ -354,23 +354,23 @@ impl Placement<'_> {
     /// - [`Unplaced::Refused`] with any other reason: the engine made no
     ///   decision, as at a first call.
     pub fn decode_again(&mut self, request: &PlaceRequest<'_>) -> Result<(), Unplaced> {
-        self.decode_taken(request).map(drop)
+        self.decode_taken(request).map(|_| ())
     }
 
-    /// [`Self::decode_again`], answering the decode it took and wrote: what
-    /// a pair's decode side hands its host.
+    /// [`Self::decode_again`], answering the decode it took as the placement
+    /// holds it: a pair's decode side copies that handle for its host, and
+    /// the public call copies none.
     pub(super) fn decode_taken(
         &mut self,
         request: &PlaceRequest<'_>,
-    ) -> Result<Arc<dyn Worker>, Unplaced> {
+    ) -> Result<&Arc<dyn Worker>, Unplaced> {
         // An answer of which nothing is owed is a single request's.
         let Some(held) = &mut self.held else {
             let refused = DecisionRefused::Decode(DecodeRefused::NotChosen);
             return Err(Unplaced::Refused(refused));
         };
         let decode = PolicyEngine::decode_placed(held, request)?;
-        self.decode = Some(Arc::clone(&decode));
-        Ok(decode)
+        Ok(self.decode.insert(decode))
     }
 
     /// One side of the request went out: its dispatch, said once

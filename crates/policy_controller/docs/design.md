@@ -1778,6 +1778,11 @@ side's send was said. It may let the prefill side go before that call or behind 
 end that waits is said behind the decode the call took. Behind a call that took none, it still
 waits. A side that is not a pair's decode side is refused by name, with no decision made.
 
+Whatever a request lends that second decision (its rule, its headers, its ring, its lists'
+admission and their workers' own calls) is asked under the pair's lock. None of it may send or
+drop a side of the pair, or report through or drop a handle on a side's end: it would wait on a
+lock it is asked under and never return.
+
 Nothing else is asked of a host that makes the one call (`place`). In particular it never names
 a policy, never looks inside a decision, never keeps a lease and never runs a timer for the
 engine.
