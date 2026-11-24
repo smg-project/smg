@@ -1324,11 +1324,12 @@ pub struct RequestFacts<'a> {
     /// ring only where its list keeps that worker, and a key no kept
     /// worker of the side takes goes by the same rule over that side's
     /// kept workers. An encode request's items take none of this: the
-    /// place stated is the request's routing value's. Each item is placed
-    /// by its own text on the ring lent for the items
-    /// ([`EncodeItems::ring`](crate::engine::EncodeItems::ring)), and by
-    /// its own key on the stage's ring where none is lent for them.
-    /// In-process only.
+    /// place stated is the request's routing value's. An item whose key
+    /// carries its text is placed by that text on the ring lent for the
+    /// items ([`EncodeItems::ring`](crate::engine::EncodeItems::ring)),
+    /// where the encode profile reads that ring and its lender places
+    /// what it is asked. Every other item is placed by its own key on the
+    /// stage's ring. In-process only.
     pub ring: Option<&'a dyn LentRing>,
     /// Where the request stands on the lent ring, as its caller states it:
     /// the position of the value it is placed by ([`LentRing::position`]).
