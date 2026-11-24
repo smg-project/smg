@@ -96,6 +96,8 @@ pub(crate) fn request(request: &Request<'_>) -> (proto::DecideRequest, usize) {
         // No link asks its decode later: the controller issues both sides.
         decode_later: false,
         decode_of: None,
+        // No link states an encode request's items yet.
+        encode: None,
     };
     (asked, facts.block_hashes.len() - held)
 }
@@ -667,6 +669,7 @@ mod tests {
             term: 3,
             decision,
             lease,
+            encode: None,
         }
         .frame();
         let Some(Answer::Decision(told)) = answer.answer else {

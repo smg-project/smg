@@ -434,10 +434,10 @@ impl PolicyEngine {
     ///
     /// As [`Self::decide_encode_at`].
     #[cfg_attr(
-        not(test),
+        not(any(test, feature = "controller")),
         expect(
             dead_code,
-            reason = "the controller's service calls it once it decides by this engine"
+            reason = "a controller's deciding thread calls it, and no build without one does"
         )
     )]
     pub(crate) fn decide_encode_without_lease(
