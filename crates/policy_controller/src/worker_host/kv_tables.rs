@@ -1,16 +1,17 @@
-//! The KV index in the store (design 5.1, the KV index row): one event-fed
-//! index a model, each an instance of the `kv-index` crate's chain index.
-//! The store writes no index code of its own.
+//! The KV index beside the worker objects (design 5.1, the KV index row):
+//! one event-fed index a model, each an instance of the `kv-index` crate's
+//! chain index. The worker host writes no index code of its own.
 //!
 //! One invariant: **an index is written only through a lane, and a lane
 //! lives exactly as long as its row.** A lane is one member row's writer:
 //! the admission cursor of its rank, the reverse map the chain index asks
-//! each writer to keep, and the row's worker id in its model's index. A
-//! membership write makes the lane with the row and takes it out with the
-//! row, under the workers lock: the ids are handed out in the order of the
-//! membership writes, and a batch for a worker the store holds no row for
-//! writes nothing. A batch runs through the cursor first; what the cursor
-//! admits is applied by the index's own entries, in the batch's order.
+//! each writer to keep, and the row's worker id in its model's index. The
+//! holder of the worker objects makes the lane where it states a row and
+//! takes it out where the row leaves, under its own lock: the ids are
+//! handed out in the order the holder states its rows, and a batch for a
+//! row the holder has not stated writes nothing. A batch runs through the
+//! cursor first; what the cursor admits is applied by the index's own
+//! entries, in the batch's order.
 //!
 //! A lane is a rank's and a snapshot is an engine's. The collector, which
 //! alone sees the engine's stream whole, says a snapshot's start to every
@@ -29,13 +30,17 @@
 //! one bit of its model's index (`Index`) that it applied an event, since a
 //! worker that asks for cache events may never publish one.
 //!
-//! Locks: the table's, taken under the workers lock by a membership write
-//! and alone by a batch, each for as long as it takes to find or to change
-//! an entry; then the lane's own, so two rows apply at once. No product
-//! path holds one while it asks for the other: a leaving row's blocks go
-//! out under its lane's lock alone, and no batch of another row waits
-//! behind them. The cases' reader of overlaps takes each lane's lock under
-//! the table's, an order no path inverts.
+//! Locks, in one order: the holder's, then the table's, then a lane's. The
+//! table's is taken under the holder's lock where a row is stated or
+//! leaves, and alone by a batch, each for as long as it takes to find or to
+//! change an entry; then the lane's own, so two rows apply at once. Nothing
+//! here calls the holder, and what runs in a lane's turn reads neither the
+//! holder nor the adapter's list of rows: a holder that waits for a lane's
+//! turn waits for one batch and no more. No product path holds the table's
+//! lock while it asks for a lane's: a leaving row's blocks go out under its
+//! lane's lock alone, and no batch of another row waits behind them. The
+//! cases' reader of overlaps takes each lane's lock under the table's, an
+//! order no path inverts.
 
 use std::{
     cell::Cell,
@@ -46,27 +51,22 @@ use std::{
     },
 };
 
-pub use kv_index::{
-    ApplyError, ChainBlockMap, ContentHash, SequenceHash, StoredBlock, WorkerGroups,
-};
+pub(super) use kv_index::{ApplyError, ChainBlockMap, SequenceHash, StoredBlock, WorkerGroups};
 use kv_index::{ChainIndex, GroupViews};
 use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
 
-use crate::{
-    engine::view::WorkerId,
-    store::{
-        kv_events::{BatchAdmission, BatchFacts, BatchOutcome, KvCursor, RankCursor, ResyncReason},
-        workers::WorkerRow,
-    },
+use super::kv_cursor::{
+    BatchAdmission, BatchFacts, BatchOutcome, KvCursor, RankCursor, ResyncReason,
 };
+use crate::{engine::view::WorkerId, store::workers::WorkerRow};
 
 #[cfg(test)]
 mod tests;
 
 /// Workers one model's index holds at once: the chain index's own ceiling.
-/// A row written past it holds no lane until one of its own later writes
-/// finds a place; the store counts the rows that stand so.
+/// A row stated past it holds no lane until one of its own later
+/// statements finds a place.
 pub const INDEX_WORKERS: usize = 1_024;
 
 /// One worker's blocks in an index, as a lane's cursor empties them.
@@ -91,7 +91,7 @@ impl Blocks for Held {
     fn cleared(&mut self) {
         self.index.chain.apply_cleared(self.worker, &mut self.map);
         // The row's view of its other cache groups goes with its blocks:
-        // what a reader can see is emptied in the store's own turn.
+        // what a reader can see is emptied in the lane's own turn.
         if let Some(view) = self.index.groups.get(self.worker) {
             view.clear();
         }
@@ -114,21 +114,21 @@ fn emptying() -> u64 {
 }
 
 /// A row's lane, lent to the body of one admitted batch
-/// ([`KvEventSink::admit_through`](super::KvEventSink::admit_through)): the
-/// chain's calls under the row's id in its model's index, the row's view
-/// in the model's group views, and the row's reverse map.
+/// ([`KvTables::admit_through`]): the chain's calls under the row's id in
+/// its model's index, the row's view in the model's group views, and the
+/// row's reverse map.
 ///
-/// The map is the lane's between batches, since the store empties a rank
+/// The map is the lane's between batches, since the tables empty a rank
 /// by it. A body whose apply rules hold the map as their own state takes
 /// it for the batch and puts it back before it returns. That call stays
-/// inside the crate: the store empties a rank by the map with no caller's
+/// inside the crate: the tables empty a rank by the map with no caller's
 /// help, and that rule is no host's contract. The writes stay inside the
 /// crate with it, since each writes through that map: a write through any
 /// other would leave blocks that no emptying finds.
 ///
-/// The body runs under the lane's lock. It calls nothing of the sink for
+/// The body runs under the lane's lock. It calls nothing of the tables for
 /// its own row. A body that unwinds leaves its rank half written, so the
-/// store has the lane start over before the unwind goes on.
+/// lane starts over before the unwind goes on.
 pub struct LaneWriter<'a> {
     held: &'a mut Held,
     /// Whether the body wrote: the lane says its row heard behind a body
@@ -142,28 +142,25 @@ impl LaneWriter<'_> {
         self.held.worker
     }
 
-    /// A value that moves each time the store empties the rank, and where
+    /// A value that moves each time the tables empty the rank, and where
     /// the lane is made: a resync, a restart or a cleared gap its cursor
-    /// read, the worker reported gone, a lent body that
-    /// unwound. The emptying this batch's admission made has moved it. It
-    /// never repeats under a row,
-    /// across the lanes the store makes for it. A body that keeps state
-    /// beside the map remembers the value it read, and resets that state
-    /// where the next batch reads another.
+    /// read, the worker reported gone, a lent body that unwound. The
+    /// emptying this batch's admission made has moved it. It never repeats
+    /// under a row, across the lanes the holder makes for it. A body that
+    /// keeps state beside the map remembers the value it read, and resets
+    /// that state where the next batch reads another.
     pub fn emptied(&self) -> u64 {
         self.held.emptied
     }
 
     /// The row's blocks by the engine's hash: the reverse map the chain
-    /// asks a writer to keep. The crate's worker host alone takes it.
-    #[cfg(any(test, feature = "worker-host"))]
+    /// asks a writer to keep. The cache-event adapter alone takes it.
     pub(crate) fn map(&mut self) -> &mut ChainBlockMap {
         &mut self.held.map
     }
 
     /// Store `blocks` after `parent`, or from the root when it is absent,
     /// with `map` the row's reverse map.
-    #[cfg(any(test, feature = "worker-host"))]
     pub(crate) fn stored(
         &self,
         blocks: &[StoredBlock],
@@ -178,7 +175,6 @@ impl LaneWriter<'_> {
     }
 
     /// Forget the named blocks of the row.
-    #[cfg(any(test, feature = "worker-host"))]
     pub(crate) fn removed(&self, hashes: &[SequenceHash], map: &mut ChainBlockMap) {
         self.wrote.set(true);
         self.held
@@ -188,7 +184,6 @@ impl LaneWriter<'_> {
     }
 
     /// Forget every block of the row.
-    #[cfg(any(test, feature = "worker-host"))]
     pub(crate) fn cleared(&self, map: &mut ChainBlockMap) {
         self.wrote.set(true);
         self.held.index.chain.apply_cleared(self.held.worker, map);
@@ -414,10 +409,21 @@ pub(crate) fn indexed_under(row: &WorkerRow) -> Option<&String> {
     facts.models.first().filter(|_| facts.signals.events)
 }
 
-/// The store's KV tables: the lanes, the indexes they write and the block
-/// sizes of record.
+/// The worker host's KV tables: the lanes, the indexes they write and the
+/// block sizes of record.
+///
+/// A host builds one ([`KvTables::default`]) and hands it to the holder of
+/// its worker objects
+/// ([`Objects::with_kv_tables`](super::Objects::with_kv_tables)). The holder
+/// alone makes and retires lanes, and the host's cache-event adapter alone
+/// writes blocks, cursors and block sizes through them: nothing outside the
+/// crate writes. The public face is four readers: a rank's cursor, a row's
+/// indexed blocks, the resyncs counted under a reason and a model's block
+/// size of record. Each answers a plain value behind one short hold of a
+/// lock of the tables' own (the table's, then one lane's where it reads a
+/// lane), so no caller holds a lock of the tables.
 #[derive(Default)]
-pub(crate) struct KvTables {
+pub struct KvTables {
     table: Mutex<Table>,
     resyncs: [AtomicU64; REASONS],
 }
@@ -425,8 +431,8 @@ pub(crate) struct KvTables {
 impl KvTables {
     /// Make, keep or retire `row`'s lane as its facts ask: a row is indexed
     /// under its first model name when its signals ask for events. Called
-    /// under the workers lock by every membership write that makes a row or
-    /// changes its facts. The row's id in its model's index comes back when
+    /// by the holder of the worker objects, under its lock, wherever it
+    /// states a row's facts. The row's id in its model's index comes back when
     /// this call interned it: what a replica must repeat to hold the same
     /// ids. A lane made anew holds nothing and is unheard: its cursor reads
     /// `None` until its first batch, which is what tells a collector to
@@ -451,8 +457,8 @@ impl KvTables {
                 index: Arc::new(Index::new()),
                 lanes: 0,
             });
-        // An index at its ceiling: the row holds no lane, and stands in the
-        // store's count, until one of its own later writes finds a place.
+        // An index at its ceiling: the row holds no lane until one of its
+        // own later statements finds a place.
         let worker = held.index.chain.intern_worker(&name_of(row.id)).ok()?;
         held.index.take(worker);
         held.lanes += 1;
@@ -482,8 +488,8 @@ impl KvTables {
     /// its id there is free for the next row, and a model's index goes with
     /// its last lane. The table's lock is held for the table's own edits
     /// alone: the blocks go out under the lane's lock. Called under the
-    /// workers lock, which keeps every other membership write out between
-    /// the steps.
+    /// holder's lock, which keeps every other statement of a row out
+    /// between the steps.
     pub(super) fn forget(&self, id: WorkerId) {
         let Some(entry) = self.table.lock().lanes.remove(&id) else {
             return;
@@ -506,7 +512,7 @@ impl KvTables {
         }
     }
 
-    /// The lane of `id`, when the store holds one for `rank` (any rank
+    /// The lane of `id`, when the tables hold one for `rank` (any rank
     /// under `None`).
     fn lane(&self, id: WorkerId, rank: Option<u16>) -> Option<Arc<Mutex<Lane>>> {
         let table = self.table.lock();
@@ -520,6 +526,12 @@ impl KvTables {
     /// lends the lane to `body`, once, inside the lane's turn. The lane
     /// says its row heard behind a body that wrote. A body that unwinds
     /// has the lane start over ([`Lent`]).
+    ///
+    /// A batch the cursor skips or answers with a gap runs no body. The
+    /// cursor reads `facts` alone, since it holds no batch to look into: a
+    /// batch that carries the engine's own clear says so in
+    /// [`BatchFacts::clears`]. The body runs under the lane's lock and
+    /// calls nothing of the tables for its own row.
     pub(super) fn admit_through(
         &self,
         id: WorkerId,
@@ -556,6 +568,8 @@ impl KvTables {
         BatchOutcome::Applied
     }
 
+    /// A new stream connection was made for the worker: the first batch on
+    /// it shows where the publisher stands.
     pub(super) fn reconnected(&self, id: WorkerId) {
         if let Some(lane) = self.lane(id, None) {
             lane.lock().cursor.reconnected();
@@ -566,7 +580,8 @@ impl KvTables {
     /// snapshot its stream did not finish is the one reason that keeps the
     /// blocks: the stream cannot be trusted, so the next subscription asks
     /// from zero, and what the chunks showed stays until the next
-    /// snapshot's start empties the lane.
+    /// snapshot's start empties the lane. A `rank` that is not the row's
+    /// resets nothing; `None` asks no check.
     pub(super) fn resync(&self, id: WorkerId, rank: Option<u16>, reason: ResyncReason) {
         if let Some(lane) = self.lane(id, rank) {
             let mut lane = lane.lock();
@@ -580,7 +595,9 @@ impl KvTables {
         self.note(reason);
     }
 
-    pub(super) fn cursor(&self, id: WorkerId, rank: u16) -> Option<KvCursor> {
+    /// The cursor of the row `id` at `rank`, once the rank has been heard
+    /// from; `None` for a row that holds no lane at that rank.
+    pub fn cursor(&self, id: WorkerId, rank: u16) -> Option<KvCursor> {
         let lane = self.lane(id, Some(rank))?;
         let lane = lane.lock();
         lane.heard.then(|| lane.cursor.view())
@@ -594,10 +611,19 @@ impl KvTables {
         }
     }
 
-    pub(super) fn block_size(&self, model: &str) -> Option<u32> {
+    /// The block size of record for `model`, in tokens: the size a request
+    /// of the model is hashed by. A registration names it, provisionally
+    /// and only upward. A stored block confirms it: from then it is the
+    /// engines' own size, the widest block the model's indexed stores
+    /// named, which the next stored block puts back where a registration
+    /// raised it. It is dropped with the model's last events subscription.
+    /// `None` where none was named.
+    pub fn block_size(&self, model: &str) -> Option<u32> {
         self.table.lock().block_sizes.get(model).copied()
     }
 
+    /// Name a model's block size: provisional until a stored block confirms
+    /// it, and only ever raised.
     pub(super) fn set_block_size(&self, model: &str, size: u32) {
         let mut table = self.table.lock();
         let of_record = table.block_sizes.get(model).copied();
@@ -615,17 +641,21 @@ impl KvTables {
         self.resyncs[slot(reason)].fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(super) fn resyncs(&self, reason: ResyncReason) -> u64 {
+    /// How many resyncs were recorded for `reason`.
+    pub fn resyncs(&self, reason: ResyncReason) -> u64 {
         self.resyncs[slot(reason)].load(Ordering::Relaxed)
     }
 
-    /// How many rows hold a lane.
+    /// How many rows hold a lane, for the cases: the rows that ask for
+    /// events less these are the rows an index had no place for.
+    #[cfg(test)]
     pub(super) fn lanes(&self) -> usize {
         self.table.lock().lanes.len()
     }
 
-    /// Blocks the index holds for the row of `id` at `rank`.
-    pub(super) fn indexed_blocks(&self, id: WorkerId, rank: u16) -> usize {
+    /// Blocks the index holds for the row of `id` at `rank`; `0` for a row
+    /// that holds no lane there.
+    pub fn indexed_blocks(&self, id: WorkerId, rank: u16) -> usize {
         let Some(lane) = self.lane(id, Some(rank)) else {
             return 0;
         };

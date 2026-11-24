@@ -1,14 +1,31 @@
-//! The KV event sink: the admission cursor per rank in front of the index
-//! (design 5.1, the KV index row; 5.4, a standby subscribes itself).
+//! The admission cursor per rank in front of the KV index (design 5.1, the
+//! KV index row; 5.4, a standby subscribes itself).
+//!
+//! The cursor rules, per `(worker, rank)`: the first batch sets the cursor
+//! wherever it is; a contiguous batch applies; a batch at or below the cursor
+//! is a duplicate and is skipped, unless it carries a clear, sits a restart
+//! window (1,024) or more below, is a counter at its start, or is the first
+//! batch of a fresh connection below the cursor, which read as a restarted
+//! publisher: the rank's blocks are cleared and the batch applied; a batch
+//! past the cursor is a gap answered once by a replay request from the
+//! expected sequence; a second gap is lost history, applied with the rank
+//! marked degraded (its state kept under 1,024 missed batches, cleared
+//! past). A snapshot chunk is applied outside these rules and moves the
+//! cursor to its stamp. Never-drop flow control is the subscriber's: past the
+//! index lanes' depth it stops reading the rank's stream.
+//!
+//! The tables' unit is a row, one rank of an engine: an id names the row,
+//! and a rank repeats its rank as a check. The collector's unit is an
+//! engine. What is an engine's (a snapshot's start, a new connection) the
+//! collector says to each row of the engine, the rows a snapshot holds
+//! nothing for included. A snapshot's start is a resync for
+//! [`ResyncReason::Snapshot`] before its first block, and a chunk only adds.
 
 #![expect(
     clippy::exhaustive_enums,
     clippy::exhaustive_structs,
     reason = "the store's index of cache events moves to the worker's side, which decides its types"
 )]
-
-use super::index::LaneWriter;
-use crate::engine::view::WorkerId;
 
 /// The header facts of one batch, read by the cursor; the batch itself (the
 /// servicer's message, with the blocks the index applies) rides beside them
@@ -49,8 +66,8 @@ pub enum BatchOutcome {
     /// Applied to the index; the cursor advanced to it.
     Applied,
     /// A duplicate below the cursor, a chunk of a snapshot still arriving,
-    /// another rank's batch, or a batch for a worker the store holds no row
-    /// for: not applied.
+    /// another rank's batch, or a batch for a row that holds no lane: not
+    /// applied.
     Skipped,
     /// A gap with no replay asked yet: the caller reconnects asking for a
     /// replay from `expected`; the batch is not applied (the replay resends
@@ -110,82 +127,6 @@ pub struct KvCursor {
     pub degraded: bool,
 }
 
-/// Where KV event batches are admitted and applied.
-///
-/// The cursor rules, per `(worker, rank)`: the first batch sets the cursor
-/// wherever it is; a contiguous batch applies; a batch at or below the cursor
-/// is a duplicate and is skipped, unless it carries a clear, sits a restart
-/// window (1,024) or more below, is a counter at its start, or is the first
-/// batch of a fresh connection below the cursor, which read as a restarted
-/// publisher: the rank's blocks are cleared and the batch applied; a batch
-/// past the cursor is a gap answered once by a replay request from the
-/// expected sequence; a second gap is lost history, applied with the rank
-/// marked degraded (its state kept under 1,024 missed batches, cleared
-/// past). A snapshot chunk is applied outside these rules and moves the
-/// cursor to its stamp. Never-drop flow control is the subscriber's: past the
-/// index lanes' depth it stops reading the rank's stream.
-///
-/// The sink's unit is a row, one rank of an engine: `id` names the row, and
-/// `rank` repeats its rank as a check. The collector's unit is an engine.
-/// What is an engine's (a snapshot's start, a new connection) the collector
-/// says to each row of the engine, the rows a snapshot holds nothing for
-/// included. A snapshot's start is a resync for [`ResyncReason::Snapshot`]
-/// before its first block, and a chunk only adds.
-pub trait KvEventSink: Send + Sync {
-    /// Run one batch of `rank` through its cursor and, where the cursor
-    /// admits it, lend the row's lane to `body`: once, inside the lane's
-    /// turn, behind whatever emptying the cursor asked. A batch the cursor
-    /// skips or answers with a gap runs no body. The body is the host's own
-    /// apply rules over the lane's writer: it writes what the batch's
-    /// events leave. The writer's writes are this crate's own
-    /// ([`LaneWriter`]): the crate's worker host is the body that writes.
-    ///
-    /// The cursor reads `facts` alone, since it holds no batch to look
-    /// into: a batch that carries the engine's own clear says so in
-    /// [`BatchFacts::clears`].
-    ///
-    /// The body runs under the lane's lock and calls nothing of the sink
-    /// for its own row. A body that unwinds leaves the rank half written:
-    /// the store has the lane start over, as where the worker was reported
-    /// gone, before the unwind goes on.
-    fn admit_through(
-        &self,
-        id: WorkerId,
-        rank: u16,
-        facts: BatchFacts,
-        body: &mut dyn FnMut(&mut LaneWriter<'_>),
-    ) -> BatchOutcome;
-
-    /// A new stream connection was made for the worker: the first batch on
-    /// it shows where the publisher stands.
-    fn reconnected(&self, id: WorkerId);
-
-    /// Reset the row's cursor for `reason`: its blocks go with it, and the
-    /// next stream is taken from wherever it starts. A `rank` that is not
-    /// the row's resets nothing; `None` asks no check. A snapshot the
-    /// stream did not finish keeps the blocks it showed: the next
-    /// snapshot's start replaces them.
-    fn resync(&self, id: WorkerId, rank: Option<u16>, reason: ResyncReason);
-
-    /// The cursor of one rank, when the rank has been heard from.
-    fn cursor(&self, id: WorkerId, rank: u16) -> Option<KvCursor>;
-
-    /// The worker left: its blocks out of the index, its cursors gone. A
-    /// same-key successor is interned only after this returns.
-    fn removed(&self, id: WorkerId);
-
-    /// The block size of record for a model, once a stored block or a
-    /// registration named it.
-    fn block_size(&self, model: &str) -> Option<u32>;
-
-    /// Name a model's block size: provisional until a stored block confirms
-    /// it, and only ever raised.
-    fn set_block_size(&self, model: &str, size: u32);
-
-    /// Drop the model's block size of record when its last events subscription leaves.
-    fn forget_block_size(&self, model: &str);
-}
-
 /// A sequence this far below the cursor is a restarted publisher, not a late
 /// duplicate: replays start at the sequence asked for, so a legitimate
 /// duplicate sits just below the cursor.
@@ -212,24 +153,8 @@ pub enum BatchAdmission {
     Unrecovered { missed: u64, cleared: bool },
 }
 
-impl BatchAdmission {
-    /// The batch is applied after this decision.
-    pub const fn applies(self) -> bool {
-        matches!(self, Self::Apply | Self::Restart | Self::Unrecovered { .. })
-    }
-
-    /// The rank's blocks are cleared before the batch is applied.
-    pub const fn clears_rank(self) -> bool {
-        matches!(
-            self,
-            Self::Restart | Self::Unrecovered { cleared: true, .. }
-        )
-    }
-}
-
-/// The admission cursor of one rank: the rules of [`KvEventSink`] as one
-/// state machine, shared by every store (the one-process store, a gateway
-/// host, the controller's moved monitor).
+/// The admission cursor of one rank: the rules of this module's doc as one
+/// state machine.
 #[derive(Clone, Copy, Debug, Default)]
 /// The gateway's event monitor keeps its own copy of these rules until the
 /// step that moves the ingestion drivers points it at this cursor; the two
@@ -310,12 +235,6 @@ impl RankCursor {
         *self = Self::default();
     }
 
-    /// The batches a pending replay was asked for; `0` when none is pending.
-    pub fn pending_gap(&self) -> u64 {
-        self.replay
-            .map_or(0, |(expected, received)| received - expected)
-    }
-
     /// The cursor as a subscriber reads it.
     pub fn view(&self) -> KvCursor {
         KvCursor {
@@ -323,33 +242,5 @@ impl RankCursor {
             replay_pending: self.replay.is_some(),
             degraded: self.degraded,
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::KvEventSink;
-    use crate::store::{MemoryStore, Signals, WorkerFacts, WorkersStore};
-
-    #[test]
-    fn a_forgotten_block_size_is_gone_and_a_new_one_stands() {
-        let store = MemoryStore::new();
-        let model = "m";
-        store.upsert(WorkerFacts {
-            key: "http://a:8000".into(),
-            models: vec![model.into()],
-            signals: Signals {
-                events: true,
-                ..Signals::default()
-            },
-            ..WorkerFacts::default()
-        });
-        store.set_block_size(model, 32);
-        store.set_block_size("other", 64);
-        store.forget_block_size(model);
-        assert_eq!(store.block_size(model), None);
-        assert_eq!(store.block_size("other"), Some(64));
-        store.set_block_size(model, 16);
-        assert_eq!(store.block_size(model), Some(16));
     }
 }

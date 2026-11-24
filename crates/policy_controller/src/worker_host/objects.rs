@@ -35,6 +35,7 @@ use super::members::{EncodeColumns, Members, Stated};
 use super::reach::{ListReach, Reach};
 use super::{
     credentials::Credentials,
+    kv_tables::KvTables,
     membership_writer::MembershipWriteRefused,
     object::{builder, dial_address, external, status, thresholds, unchecked},
     remainder::RowRemainder,
@@ -104,17 +105,28 @@ struct Held {
     /// The rows of each engine's ranks, by the address they dial: what
     /// routes a rank's batch on the engine's one events stream.
     ranks: HashMap<String, Vec<(u16, WorkerId)>>,
+    /// The KV tables the host handed the holder, where it handed any. A
+    /// row's lane there is made where its facts are stated and retired
+    /// where the row leaves, inside this entry's lock: a lane stands
+    /// exactly while a rank's batch can be routed to its row. The one lock
+    /// order is this entry's, then the tables' own. Nothing of the tables
+    /// calls the holder.
+    tables: Option<Arc<KvTables>>,
 }
 
 impl Held {
     /// State `row`'s facts in the entry, where every lay states them: at a
     /// build, and where a row another maker made again is stated anew. The
     /// row's place among its engine's ranks moves with them: a row laid
-    /// again leaves the rank its old facts stated.
+    /// again leaves the rank its old facts stated. Its lane in the KV
+    /// tables is made, kept or made again as the facts ask, in this turn.
     fn state(&mut self, row: &WorkerRow) {
         self.unrank(row.id);
         self.rank(row.id, &row.facts);
         self.facts.insert(row.id, row.facts.clone());
+        if let Some(tables) = &self.tables {
+            tables.member(row);
+        }
     }
 
     /// `row` stands among its engine's ranks, by the facts it is laid from.
@@ -141,7 +153,8 @@ impl Held {
 
     /// Take the row `id` out of every table of the entry: its place among
     /// its engine's ranks, its facts, its object's id, and that object's
-    /// own entry. A row that leaves goes through here, at its object's end
+    /// own entry. Its lane in the KV tables goes with it, with the blocks
+    /// it wrote. A row that leaves goes through here, at its object's end
     /// and where its next life takes its object's place.
     fn leave(&mut self, id: WorkerId) {
         // The rank first: it is found by the row's facts.
@@ -149,6 +162,9 @@ impl Held {
         self.facts.remove(&id);
         if let Some(object) = self.objects.remove(&id) {
             self.rows.remove(&object);
+        }
+        if let Some(tables) = &self.tables {
+            tables.forget(id);
         }
     }
 }
@@ -371,6 +387,25 @@ impl<G: Generation> Objects<G> {
     /// keeper.
     pub fn credentials(&self) -> Option<&Arc<Credentials>> {
         self.credentials.as_ref()
+    }
+
+    /// Hand the holder the KV tables its rows' lanes are made in. The
+    /// holder states each row to them where it states the row's facts, and
+    /// retires the row's lane where the row leaves: a lane stands exactly
+    /// while a rank's batch can be routed to its row. The host's cache-event
+    /// feed reads the tables here ([`Self::kv_tables`]), so they are stated
+    /// once. A holder handed none makes no lane, which suits a host that
+    /// indexes no cache event.
+    #[must_use]
+    pub fn with_kv_tables(mut self, tables: Arc<KvTables>) -> Self {
+        self.held.get_mut().tables = Some(tables);
+        self
+    }
+
+    /// The KV tables the host handed the holder ([`Self::with_kv_tables`]),
+    /// where it handed any.
+    pub fn kv_tables(&self) -> Option<Arc<KvTables>> {
+        self.held.read().tables.clone()
     }
 
     /// Lay again the object of each row that dials the address of `facts`
@@ -1233,7 +1268,9 @@ mod tests {
         store::{
             GatewayId, MemoryStore, Overload, Registrant, WorkerFacts, WorkerPatch, WorkerStatus,
         },
-        worker_host::{object, HealthAdapter, KeptCredential, Members, SoleLead},
+        worker_host::{
+            kv_cursor, kv_tables, object, HealthAdapter, KeptCredential, Members, SoleLead,
+        },
     };
 
     const A: &str = "http://a:8000";
@@ -1885,6 +1922,96 @@ mod tests {
         let laid = registry.get_by_url(A).expect("the row's object");
         assert!(laid.api_key().is_none());
         assert_eq!(objects.lay_again(&store, &facts(A, 1)), 0);
+    }
+
+    /// [`facts`] of a row whose signals ask for cache events.
+    fn asking(key: &str, incarnation: u64) -> WorkerFacts {
+        WorkerFacts {
+            signals: crate::store::Signals {
+                events: true,
+                ..crate::store::Signals::default()
+            },
+            ..facts(key, incarnation)
+        }
+    }
+
+    /// Whether each of `rows` holds a lane at rank 0 of `tables`.
+    fn lanes(tables: &KvTables, rows: &[WorkerId]) -> Vec<bool> {
+        rows.iter().map(|row| tables.holds_lane(*row, 0)).collect()
+    }
+
+    /// One block of `row`'s own written through its lane at rank 0, as the
+    /// body of an admitted batch writes it.
+    fn one_block(tables: &KvTables, row: WorkerId, sequence: u64) -> kv_cursor::BatchOutcome {
+        let block = [kv_tables::StoredBlock {
+            seq_hash: kv_tables::SequenceHash(1_000 + sequence),
+            content_hash: kv_index::ContentHash(2_000 + sequence),
+        }];
+        let facts = kv_cursor::BatchFacts {
+            sequence,
+            ..kv_cursor::BatchFacts::default()
+        };
+        tables.admit_through(row, 0, facts, &mut |lane| {
+            let mut map = std::mem::take(lane.map());
+            let placed = lane.stored(&block, None, &mut map);
+            *lane.map() = map;
+            placed.expect("stored");
+        })
+    }
+
+    #[test]
+    fn a_holder_handed_tables_keeps_a_lane_for_each_row_that_asks_for_events() {
+        let tables = Arc::new(KvTables::default());
+        let objects = Objects::new(Arc::new(WorkerRegistry::<Members>::new()))
+            .with_kv_tables(Arc::clone(&tables));
+        let store = MemoryStore::new();
+        let a = store.upsert(asking(A, 1)).id();
+        let b = store.upsert(asking(B, 1)).id();
+        let quiet = store.upsert(facts(C, 1)).id();
+        objects.follow(&store);
+        assert_eq!(lanes(&tables, &[a, b, quiet]), [true, true, false]);
+        // A row stated again in place: one that stops asking gives its lane
+        // up, one that asks takes one. No object is laid anew for either.
+        store.upsert(facts(A, 1));
+        store.upsert(asking(C, 1));
+        objects.follow(&store);
+        assert_eq!(lanes(&tables, &[a, b, quiet]), [false, true, true]);
+        // A replaced row's lane leaves with it, blocks and all, and its
+        // next life under the same URL starts with an empty lane, unheard.
+        assert_eq!(one_block(&tables, b, 1), kv_cursor::BatchOutcome::Applied);
+        assert_eq!(tables.indexed_blocks(b, 0), 1);
+        let again = store.upsert(asking(B, 2)).id();
+        objects.follow(&store);
+        assert_eq!(lanes(&tables, &[b, again]), [false, true]);
+        assert_eq!(tables.indexed_blocks(again, 0), 0);
+        assert_eq!(tables.cursor(again, 0), None, "unheard");
+        // A removed row's lane leaves with it.
+        let left = store.by_key(C).expect("the row");
+        assert!(store.remove(left.id, left.revision).is_some());
+        objects.follow(&store);
+        assert_eq!(lanes(&tables, &[quiet, again]), [false, true]);
+        // A row that stays keeps what was heard for it through a later
+        // follow that changes nothing of it.
+        assert_eq!(
+            one_block(&tables, again, 1),
+            kv_cursor::BatchOutcome::Applied
+        );
+        store.upsert(asking(D, 1));
+        objects.follow(&store);
+        assert_eq!(tables.indexed_blocks(again, 0), 1);
+    }
+
+    #[test]
+    fn a_holder_handed_no_tables_makes_no_lane() {
+        let objects = Objects::new(Arc::new(WorkerRegistry::<Members>::new()));
+        let store = MemoryStore::new();
+        store.upsert(asking(A, 1));
+        objects.follow(&store);
+        assert!(objects.kv_tables().is_none());
+        assert!(
+            objects.registry().get_by_url(A).is_some(),
+            "the object is laid all the same"
+        );
     }
 
     #[test]

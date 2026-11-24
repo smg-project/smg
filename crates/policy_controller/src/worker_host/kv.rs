@@ -1,7 +1,7 @@
-//! The worker's KV port over the store's index. The store's cursor reads a
-//! batch's header, and an admitted batch is applied inside the row's lane
-//! by the worker crate's apply rules, the ones every index of cache events
-//! is written by.
+//! The worker's KV port over the worker host's KV tables. A lane's cursor
+//! reads a batch's header, and an admitted batch is applied inside the
+//! row's lane by the worker crate's apply rules, the ones every index of
+//! cache events is written by.
 //!
 //! # What the adapter keeps
 //!
@@ -13,12 +13,12 @@
 //! worker leaves. The row's reverse map is the lane's: the state holds it
 //! for a batch alone, and nothing between batches.
 //!
-//! The store empties a rank in its own turn: a resync, a restart or a gap
-//! its cursor reads, the worker reported gone. The lane says a value that
+//! The tables empty a rank in their own turn: a resync, a restart or a gap
+//! a cursor reads, the worker reported gone. The lane says a value that
 //! moves with each emptying, and a batch that reads another value than the
-//! row's last one resets the row's state first. The table's lock is let go
-//! before a row's state is locked, and a row's state is locked inside its
-//! lane's turn alone.
+//! row's last one resets the row's state first. The tables' own lock is let
+//! go before a row's state is locked, and a row's state is locked inside
+//! its lane's turn alone.
 //!
 //! A row opened without that state loses any cached blocks and cursor
 //! before its feed starts.
@@ -43,10 +43,10 @@
 //! object was laid again opens no feed.
 //!
 //! A row's stream and a stream's rows are kept under one lock: a row
-//! moves between two streams in one step, and the store clears it in
+//! moves between two streams in one step, and its lane is cleared in
 //! that step, so the clear takes nothing a later stream wrote. A stream
 //! that leaves reaches only the rows it still writes. It clears them in
-//! the store outside that lock, which every row's batch takes, and each
+//! the tables outside that lock, which every row's batch takes, and each
 //! stays its row until its clear ends. A stream that would take one in
 //! between passes its batch over, so a removal clears nothing a new
 //! stream wrote.
@@ -64,7 +64,7 @@
 //!
 //! # The block size
 //!
-//! A batch the store takes that carries a store names the model's block
+//! A batch the tables take that carries a store names the model's block
 //! size: the row's block of record, the widest block its stores carried
 //! since its last clear. The engine's word only rises: an engine also
 //! publishes prefix entries narrower than its block, and a request hashed
@@ -73,11 +73,11 @@
 //! replaces a size a registration named, and the next one puts back a size
 //! a registration raised behind it. A worker that states no size needs no
 //! other word. The adapter keeps the model each open row streams for and
-//! the engine's word for each model. The store keeps the size of record.
+//! the engine's word for each model. The tables keep the size of record.
 //!
 //! # The series
 //!
-//! A batch the store takes is applied and accounted for by the worker
+//! A batch the tables take is applied and accounted for by the worker
 //! crate's one routine, under the URL of the stream's worker: its blocks
 //! by operation, the stores the index did not take as they came, its age
 //! and the batch itself. The adapter adds what its own answers say: a
@@ -92,16 +92,15 @@
 //!   not the index takes its blocks.
 //! - A batch of a rank whose row the holder has not laid is passed over.
 //!   That row's index begins with the blocks stored once it is laid.
-//! - An adapter made with no holder writes every batch to its stream's row.
 //! - A feed's own row laid again in place as rank 0 of another engine is
 //!   written by its old stream until that stream ends. Its end clears
 //!   every row it wrote.
 //! - What a row's old stream had in flight as the row moved, a batch or a
 //!   reset, can land behind the new stream's clear.
-//! - What the store's cursor decides by itself is in no series: a gap kept
+//! - What a lane's cursor decides by itself is in no series: a gap kept
 //!   or cleared, the batches missed, the degraded ranks, and the reason it
 //!   emptied a rank ahead of a batch.
-//! - The index-blocks gauge moves at a batch: a rank the store emptied
+//! - The index-blocks gauge moves at a batch: a rank the tables emptied
 //!   shows at its row's next batch.
 //! - A batch the adapter passes over by itself is counted nowhere: one of
 //!   a rank with no row laid, or one on a stream that is ending.
@@ -128,14 +127,19 @@ use smg_worker::{
     registry::Generation,
 };
 
-use super::Objects;
-use crate::{
-    engine::view::WorkerId,
-    store::{self, ApplyError, ChainBlockMap, LaneWriter, SequenceHash, StoredBlock, WorkerGroups},
+use super::{
+    kv_cursor,
+    kv_tables::{
+        ApplyError, ChainBlockMap, KvTables, LaneWriter, SequenceHash, StoredBlock, WorkerGroups,
+    },
+    Objects,
 };
+use crate::engine::view::WorkerId;
 
-/// The worker crate's KV event port over a store's KV event sink.
-pub struct KvAdapter<S: ?Sized> {
+/// The worker crate's KV event port over the worker host's KV tables. A
+/// host builds [`KvHost`] and never the adapter: its subscriptions get the
+/// host's one adapter as their sink.
+pub struct KvAdapter {
     /// The rows the streams write: a row's stream and a stream's rows,
     /// which move together under this one lock.
     rows: Mutex<Rows>,
@@ -146,7 +150,7 @@ pub struct KvAdapter<S: ?Sized> {
     urls: Mutex<HashMap<WorkerId, Arc<str>>>,
     /// Where the ranks of an engine stand, where a host handed its holder.
     ranks: Option<Arc<dyn Ranks>>,
-    store: Arc<S>,
+    tables: Arc<KvTables>,
 }
 
 /// The rows the adapter's streams write, both ways.
@@ -194,7 +198,7 @@ struct Written {
     /// another rank.
     stream: WorkerId,
     /// The stream is leaving, and its removal has not cleared the row in
-    /// the store yet: no stream takes the row until it has.
+    /// the tables yet: no stream takes the row until it has.
     leaving: bool,
 }
 
@@ -217,7 +221,7 @@ struct Applied {
     state: WorkerIndexState<Lent>,
     /// The value the row's lane said when the state was last applied
     /// ([`LaneWriter::emptied`]), and none until the row's first batch. A
-    /// batch that reads another resets the state first: the store emptied
+    /// batch that reads another resets the state first: the tables emptied
     /// the rank in between.
     emptied: Option<u64>,
     /// The blocks the row's map held behind its last batch.
@@ -225,7 +229,7 @@ struct Applied {
 }
 
 /// The row's reverse map inside the rules' state. The map is the lane's,
-/// since the store empties a rank by it. So this holds it for a batch
+/// since the tables empty a rank by it. So this holds it for a batch
 /// alone and nothing between batches, where no read answers for the row.
 #[derive(Default)]
 struct Lent(Option<ChainBlockMap>);
@@ -296,7 +300,7 @@ impl BlockIndex for Lane<'_, '_> {
 }
 
 /// The lane's map inside a row's state for one batch. Dropped, it puts the
-/// map back, also behind rules that unwound: the store then empties the
+/// map back, also behind rules that unwound: the tables then empty the
 /// rank by a map that names every block the row wrote.
 struct Lending<'a, 'w> {
     lane: &'a mut LaneWriter<'w>,
@@ -341,19 +345,22 @@ struct Sizes {
     named: HashMap<Arc<str>, u32>,
 }
 
-impl<S: ?Sized> KvAdapter<S> {
-    /// An adapter that writes `store`, every batch to its stream's row.
-    pub fn new(store: Arc<S>) -> Self {
-        Self::over(store, None)
+impl KvAdapter {
+    /// An adapter that writes `tables`, every batch to its stream's row. It
+    /// has no holder to state its rows: the cases that build one state
+    /// theirs to the tables themselves.
+    #[cfg(test)]
+    fn new(tables: Arc<KvTables>) -> Self {
+        Self::over(tables, None)
     }
 
-    fn over(store: Arc<S>, ranks: Option<Arc<dyn Ranks>>) -> Self {
+    fn over(tables: Arc<KvTables>, ranks: Option<Arc<dyn Ranks>>) -> Self {
         Self {
             rows: Mutex::new(Rows::default()),
             sizes: Mutex::new(Sizes::default()),
             urls: Mutex::new(HashMap::new()),
             ranks,
-            store,
+            tables,
         }
     }
 
@@ -403,15 +410,10 @@ impl<S: ?Sized> KvAdapter<S> {
         // Each row's state by itself, outside the table's lock.
         states.iter().map(|state| state.lock().blocks).sum()
     }
-}
 
-impl<S> KvAdapter<S>
-where
-    S: store::KvEventSink + ?Sized,
-{
     /// The state of `row` for a batch on `id`'s stream, and whether the
     /// table keeps it: the stream's own row that no entry is kept of gets a
-    /// state the table takes once the store took a batch ([`Self::keep`]).
+    /// state the table takes once a batch was admitted ([`Self::keep`]).
     /// `None` where the stream writes no row any longer: another stream
     /// took its own row, so it is ending, and it writes no row of any
     /// rank. A row of another rank that the stream writes for the first
@@ -437,10 +439,10 @@ where
 
     /// `stream` takes `row`, the row of another rank, for a batch. The row
     /// begins from nothing, as a feed's own row does at its open: what the
-    /// store kept of it was decided by facts that are gone, or by another
+    /// tables kept of it was decided by facts that are gone, or by another
     /// stream's batches. The stream that wrote it reaches it no longer:
-    /// the row changes lists, and the store clears it, in one hold of the
-    /// lock. The clear is of one row, and of nothing where the store never
+    /// the row changes lists, and its lane is cleared, in one hold of the
+    /// lock. The clear is of one row, and of nothing where the tables never
     /// held it. The row's new state comes back. `None`, with nothing done,
     /// where the row is not this stream's to take, and the batch is passed
     /// over. Its stream is leaving and still clears it: a later batch
@@ -460,7 +462,7 @@ where
         let applied = rows.claim(stream, row)?;
         // In the hold that wrote the entry: no stream claims the row, and
         // writes it, ahead of this clear.
-        self.store.removed(row);
+        self.tables.removed(row);
         Some(applied)
     }
 
@@ -474,9 +476,9 @@ where
     /// routes to it, and never by this feed from that stream.
     ///
     /// A row the adapter holds no facts for begins from nothing: what the
-    /// store kept of its stream was decided by facts that are gone. The
-    /// store drops the row's lane at whatever rank it keeps it, and a row
-    /// with none loses nothing. A row another stream wrote, as a rank of
+    /// tables kept of its stream was decided by facts that are gone. The
+    /// row's lane starts over at whatever rank it stands, and a row with
+    /// none loses nothing. A row another stream wrote, as a rank of
     /// its engine, begins from nothing too. One a leaving stream still
     /// clears is left to it, and this feed's batches are passed over until
     /// that ends.
@@ -495,7 +497,7 @@ where
         if !own && rows.claim(row, row).is_some() {
             // In the hold that wrote the entry, as a take's clear is, and
             // on the caller's task: it ends before the feed is handed back.
-            self.store.removed(row);
+            self.tables.removed(row);
         }
         Ok(())
     }
@@ -516,7 +518,7 @@ where
     /// what it says of the block size of the model the row streams for, by
     /// the module's rule. A row no feed was opened for names no model.
     fn learn(&self, id: WorkerId, size: u32) {
-        // Held through the store's calls: two rows of one model learn in turn.
+        // Held through the tables' calls: two rows of one model learn in turn.
         let mut sizes = self.sizes.lock();
         let Sizes { models, named } = &mut *sizes;
         let Some(model) = models.get(&id) else {
@@ -524,15 +526,15 @@ where
         };
         let last = named.get(model).copied();
         let word = last.map_or(size, |last| last.max(size));
-        let of_record = self.store.block_size(model);
+        let of_record = self.tables.block_size(model);
         if of_record != Some(word) {
-            // The store's setter only raises, so a wider size that no stored
+            // The tables' setter only raises, so a wider size that no stored
             // block named goes first. A request hashed between the two calls
             // reads no size and states no hash.
             if of_record.is_some_and(|of_record| of_record > word) {
-                self.store.forget_block_size(model);
+                self.tables.forget_block_size(model);
             }
-            self.store.set_block_size(model, word);
+            self.tables.set_block_size(model, word);
             tracing::info!(
                 model = %model,
                 block_size = word,
@@ -546,10 +548,7 @@ where
     }
 }
 
-impl<S> KvEventSink for KvAdapter<S>
-where
-    S: store::KvEventSink + ?Sized + 'static,
-{
+impl KvEventSink for KvAdapter {
     type Batch = KvEventBatch;
     type Id = WorkerId;
 
@@ -571,10 +570,10 @@ where
         // The stream's worker, as its series name it.
         let url = self.urls.lock().get(&id).cloned();
         let snapshot = facts.snapshot.is_some();
-        let facts = store::BatchFacts {
+        let facts = kv_cursor::BatchFacts {
             sequence: facts.sequence,
             clears: facts.clears,
-            snapshot: facts.snapshot.map(|chunk| store::SnapshotChunk {
+            snapshot: facts.snapshot.map(|chunk| kv_cursor::SnapshotChunk {
                 unknown_before: chunk.unknown_before,
             }),
         };
@@ -587,7 +586,7 @@ where
         let mut took = None;
         // The cursor reads the header alone. The body runs where it admits
         // the batch: inside the lane's turn, with the table's lock let go.
-        let outcome = self.store.admit_through(row, rank, facts, &mut |lane| {
+        let outcome = self.tables.admit_through(row, rank, facts, &mut |lane| {
             let mut applied = applied.lock();
             let Applied {
                 state,
@@ -595,7 +594,7 @@ where
                 blocks,
             } = &mut *applied;
             if *emptied != Some(lane.emptied()) {
-                // The store emptied the rank since the row's last batch, or
+                // The tables emptied the rank since the row's last batch, or
                 // the row begins: what the rules kept beside the map goes
                 // with the blocks.
                 state.index_emptied();
@@ -638,7 +637,7 @@ where
             record = state.block_of_record();
         });
         match outcome {
-            store::BatchOutcome::Applied => {
+            kv_cursor::BatchOutcome::Applied => {
                 if !kept {
                     self.keep(id, applied);
                 }
@@ -655,16 +654,16 @@ where
                 }
                 BatchOutcome::Applied
             }
-            store::BatchOutcome::Skipped => {
+            kv_cursor::BatchOutcome::Skipped => {
                 // A batch behind its lane's cursor. A row with no lane
                 // skips every batch and counts none.
-                let behind = || self.store.cursor(row, rank).is_some();
+                let behind = || self.tables.cursor(row, rank).is_some();
                 if let Some(url) = url.as_ref().filter(|_| behind()) {
                     Metrics::record_kv_event_batch(url, "stale");
                 }
                 BatchOutcome::Skipped
             }
-            store::BatchOutcome::Gap { expected, received } => {
+            kv_cursor::BatchOutcome::Gap { expected, received } => {
                 // The collector asks the publisher to replay from here.
                 if let Some(url) = &url {
                     Metrics::record_kv_event_gap(url, "replay_requested", 0);
@@ -676,7 +675,7 @@ where
 
     fn reconnected(&self, id: WorkerId) {
         for row in self.written_by(id) {
-            self.store.reconnected(row);
+            self.tables.reconnected(row);
         }
     }
 
@@ -685,26 +684,26 @@ where
             Metrics::record_kv_event_resync(url, reason.as_str());
         }
         let reason = match reason {
-            ResyncReason::OutOfRange => store::ResyncReason::OutOfRange,
-            ResyncReason::DataLoss => store::ResyncReason::DataLoss,
-            ResyncReason::SnapshotAbandoned => store::ResyncReason::SnapshotAbandoned,
-            ResyncReason::PublisherRestart => store::ResyncReason::PublisherRestart,
-            ResyncReason::GapCleared => store::ResyncReason::GapCleared,
-            ResyncReason::Snapshot => store::ResyncReason::Snapshot,
+            ResyncReason::OutOfRange => kv_cursor::ResyncReason::OutOfRange,
+            ResyncReason::DataLoss => kv_cursor::ResyncReason::DataLoss,
+            ResyncReason::SnapshotAbandoned => kv_cursor::ResyncReason::SnapshotAbandoned,
+            ResyncReason::PublisherRestart => kv_cursor::ResyncReason::PublisherRestart,
+            ResyncReason::GapCleared => kv_cursor::ResyncReason::GapCleared,
+            ResyncReason::Snapshot => kv_cursor::ResyncReason::Snapshot,
         };
         match rank {
             // One rank's reset is its own row's, and a rank with no row
             // holds nothing to reset.
             Some(rank) => {
                 if let Some(row) = self.routed(id, rank) {
-                    self.store.resync(row, Some(rank), reason);
+                    self.tables.resync(row, Some(rank), reason);
                 }
             }
             // The stream's reset reaches every row it writes, its own
             // first.
             None => {
                 for row in self.written_by(id) {
-                    self.store.resync(row, None, reason);
+                    self.tables.resync(row, None, reason);
                 }
             }
         }
@@ -712,7 +711,7 @@ where
 
     fn cursor(&self, id: WorkerId, rank: u16) -> Option<KvCursor> {
         let row = self.routed(id, rank)?;
-        self.store.cursor(row, rank).map(|cursor| KvCursor {
+        self.tables.cursor(row, rank).map(|cursor| KvCursor {
             applied: cursor.applied,
             replay_pending: cursor.replay_pending,
             degraded: cursor.degraded,
@@ -725,7 +724,7 @@ where
         // What the stream still writes goes with it, since no stream feeds
         // it now: the rows of other ranks, and its own unless another
         // stream took it. Each is marked in the one hold that reads the
-        // list, cleared in the store outside the lock, and forgotten. A
+        // list, cleared in the tables outside the lock, and forgotten. A
         // stream that would take one in between passes its batch over, so
         // nothing a new stream wrote is cleared here. These clears take
         // every block the stream stored: no batch waits for them.
@@ -747,7 +746,7 @@ where
             leaving
         };
         for &row in &leaving {
-            self.store.removed(row);
+            self.tables.removed(row);
         }
         let mut rows = self.rows.lock();
         for row in &leaving {
@@ -756,11 +755,11 @@ where
     }
 
     fn block_size(&self, model: &str) -> Option<u32> {
-        self.store.block_size(model)
+        self.tables.block_size(model)
     }
 
     fn set_block_size(&self, model: &str, size: u32) {
-        self.store.set_block_size(model, size);
+        self.tables.set_block_size(model, size);
     }
 }
 
@@ -785,23 +784,30 @@ pub struct SkippedSubscriptions {
     pub upper_rank: u64,
 }
 
-/// The KV collector's host over the store an events subscription feeds.
-pub struct KvHost<G, S: ?Sized> {
+/// The KV collector's host over the tables an events subscription feeds.
+pub struct KvHost<G> {
     objects: Arc<Objects<G>>,
-    sink: Arc<KvAdapter<S>>,
+    sink: Arc<KvAdapter>,
     no_row: AtomicU64,
     upper_rank: AtomicU64,
 }
 
-impl<G: Generation, S: ?Sized> KvHost<G, S> {
-    /// A host whose subscriptions feed `store`, each under the row
-    /// `objects` holds for its worker. A batch of another rank of the
-    /// worker's engine is written to the row `objects` holds for that rank.
-    pub fn new(objects: Arc<Objects<G>>, store: Arc<S>) -> Self {
+impl<G: Generation> KvHost<G> {
+    /// A host whose subscriptions feed the tables `objects` was handed
+    /// ([`Objects::with_kv_tables`]), each under the row `objects` holds
+    /// for its worker. A batch of another rank of the worker's engine is
+    /// written to the row `objects` holds for that rank.
+    ///
+    /// The holder states the tables once, so the lanes it makes and the
+    /// events written here meet in one set. Over a holder that was handed
+    /// none, no row has a lane: every batch is skipped and nothing is
+    /// indexed.
+    pub fn new(objects: Arc<Objects<G>>) -> Self {
         let ranks: Arc<dyn Ranks> = Arc::clone(&objects) as _;
+        let tables = objects.kv_tables().unwrap_or_default();
         Self {
             objects,
-            sink: Arc::new(KvAdapter::over(store, Some(ranks))),
+            sink: Arc::new(KvAdapter::over(tables, Some(ranks))),
             no_row: AtomicU64::new(0),
             upper_rank: AtomicU64::new(0),
         }
@@ -817,7 +823,7 @@ impl<G: Generation, S: ?Sized> KvHost<G, S> {
     }
 }
 
-impl<G, S: ?Sized> KvHost<G, S> {
+impl<G> KvHost<G> {
     /// How many subscriptions got no feed so far, by the reason.
     pub fn skipped_subscriptions(&self) -> SkippedSubscriptions {
         SkippedSubscriptions {
@@ -827,16 +833,15 @@ impl<G, S: ?Sized> KvHost<G, S> {
     }
 }
 
-impl<G, S> KvEventHost for KvHost<G, S>
+impl<G> KvEventHost for KvHost<G>
 where
     G: Generation,
-    S: store::KvEventSink + ?Sized + 'static,
 {
-    type Sink = KvAdapter<S>;
+    type Sink = KvAdapter;
     type Ticket = Result<WorkerId, SkipReason>;
 
     fn enroll(&self, worker: &Arc<dyn Worker>, model: &str) -> Self::Ticket {
-        // A size the store's width cannot hold is not a size of record.
+        // A size the tables' width cannot hold is not a size of record.
         if let Some(size) = worker
             .metadata()
             .spec
@@ -905,13 +910,13 @@ where
 
     fn model_left(&self, model: &str) {
         self.sink.sizes.lock().named.remove(model);
-        self.sink.store.forget_block_size(model);
+        self.sink.tables.forget_block_size(model);
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{OnceLock, Weak};
+    use std::sync::mpsc;
 
     use smg_worker::{
         common_proto::{
@@ -925,7 +930,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        store::{KvEventSink as _, MemoryStore, Signals, WorkerFacts, WorkersStore},
+        store::{MemoryStore, Signals, WorkerFacts, WorkersStore},
         worker_host::Members,
     };
 
@@ -934,11 +939,13 @@ mod tests {
     const RANK: u16 = 1;
     const BLOCK_SIZE: u32 = 32;
 
-    type Store = dyn store::KvEventSink;
-
+    /// A store's rows, the tables beside them and an adapter with no
+    /// holder: the cases state a row to the tables themselves
+    /// ([`Fixture::state`]), as a holder does where it lays the row.
     struct Fixture {
         store: Arc<MemoryStore>,
-        sink: Arc<KvAdapter<Store>>,
+        tables: Arc<KvTables>,
+        sink: Arc<KvAdapter>,
         row: WorkerId,
     }
 
@@ -972,8 +979,23 @@ mod tests {
                     ..WorkerFacts::default()
                 })
                 .id();
-            let sink = Arc::new(KvAdapter::new(Arc::clone(&store) as Arc<Store>));
-            Self { store, sink, row }
+            let tables = Arc::new(KvTables::default());
+            let sink = Arc::new(KvAdapter::new(Arc::clone(&tables)));
+            let fixture = Self {
+                store,
+                tables,
+                sink,
+                row,
+            };
+            fixture.state(row);
+            fixture
+        }
+
+        /// State the row `id` to the tables by the facts the store holds
+        /// for it now, as a holder does where it lays the row.
+        fn state(&self, id: WorkerId) {
+            let row = self.store.get(id).expect("the row");
+            self.tables.member(&row);
         }
 
         fn applied(&self, sequence: u64, batch: &KvEventBatch) {
@@ -985,13 +1007,18 @@ mod tests {
         }
 
         fn blocks(&self) -> usize {
-            self.store.indexed_blocks(self.row, RANK)
+            self.tables.indexed_blocks(self.row, RANK)
         }
 
-        fn host(&self) -> KvHost<Members, Store> {
-            let objects = Arc::new(Objects::new(Arc::new(WorkerRegistry::new())));
+        /// A host over a holder that was handed the fixture's tables and
+        /// has laid the store's rows.
+        fn host(&self) -> KvHost<Members> {
+            let objects = Arc::new(
+                Objects::new(Arc::new(WorkerRegistry::new()))
+                    .with_kv_tables(Arc::clone(&self.tables)),
+            );
             objects.follow(self.store.as_ref());
-            KvHost::new(objects, Arc::clone(&self.store) as Arc<Store>)
+            KvHost::new(objects)
         }
     }
 
@@ -1004,7 +1031,7 @@ mod tests {
 
     /// Whether the adapter keeps `row` as its own stream's, begun from
     /// nothing: no batch was applied under its state.
-    fn begun(sink: &KvAdapter<Store>, row: WorkerId) -> bool {
+    fn begun(sink: &KvAdapter, row: WorkerId) -> bool {
         let rows = sink.rows.lock();
         rows.written.get(&row).is_some_and(|written| {
             written.stream == row && !written.leaving && written.applied.lock().emptied.is_none()
@@ -1482,7 +1509,7 @@ mod tests {
         f.applied(4, &batch([Data::Stored(window_store(&[1], 0, true))]));
         f.applied(5, &batch([Data::Stored(window_store(&[2], 0, true))]));
         // A main store at a sequence the row holds would restart the worker.
-        // Its clear is not the engine's own: the store skips the batch.
+        // Its clear is not the engine's own: the cursor skips the batch.
         let late = batch([Data::Stored(main_store(7, 1))]);
         assert_eq!(
             f.sink.admit(f.row, RANK, facts(4), &late),
@@ -1495,7 +1522,7 @@ mod tests {
     }
 
     /// A clear owned by a name the header does not count, at a sequence the
-    /// row holds: the batch is late, and the store skips it as any other.
+    /// row holds: the batch is late, and the cursor skips it as any other.
     #[test]
     fn a_late_batch_with_an_owned_clear_is_skipped_as_any_late_batch() {
         let f = Fixture::new();
@@ -1519,7 +1546,7 @@ mod tests {
     }
 
     /// The first batch of a new connection under the cursor is a restarted
-    /// publisher by the store's own rule. Its owned clear still wipes what
+    /// publisher by the cursor's own rule. Its owned clear still wipes what
     /// stood ahead of it in the batch.
     #[test]
     fn an_owned_clear_in_a_late_batch_the_store_takes_wipes_what_stood_ahead_of_it() {
@@ -1565,7 +1592,7 @@ mod tests {
 
     /// A main store in a batch 0 that arrives again would restart the
     /// worker by the adapter's own clear. Behind batch 0 it is late as
-    /// well, and the store skips it.
+    /// well, and the cursor skips it.
     #[test]
     fn a_repeated_first_batch_that_shows_a_main_group_is_no_restarted_publisher() {
         let f = Fixture::new();
@@ -1582,7 +1609,7 @@ mod tests {
     }
 
     /// A cursor reads 0 behind a resync too, and the resync emptied the
-    /// rank. A batch 0 there is the stream's first: the store takes it, and
+    /// rank. A batch 0 there is the stream's first: the cursor takes it, and
     /// what it holds behind its last clear stands.
     #[test]
     fn a_first_batch_behind_a_resync_stands_from_its_last_clear() {
@@ -1625,7 +1652,7 @@ mod tests {
     fn a_batch_the_store_does_not_take_shows_nothing() {
         let f = Fixture::new();
         f.applied(1, &batch([Data::Stored(main_store(1, 0))]));
-        // A batch at a sequence the store holds: its store shows no group.
+        // A batch at a sequence the cursor holds: its store shows no group.
         let late = batch([Data::Stored(window_store(&[1], 0, false))]);
         assert_eq!(
             f.sink.admit(f.row, RANK, facts(1), &late),
@@ -1727,7 +1754,7 @@ mod tests {
         assert_eq!(f.blocks(), 0);
     }
 
-    /// The store empties a rank in its own turn, here at a resync. The
+    /// The tables empty a rank in their own turn, here at a resync. The
     /// row's next batch reads another value of its lane and forgets the
     /// copies it counted: a block stored once behind the resync leaves at
     /// its one removal.
@@ -1738,8 +1765,8 @@ mod tests {
             1,
             &batch([Data::Stored(stored(1)), Data::Stored(stored(1))]),
         );
-        f.store
-            .resync(f.row, Some(RANK), store::ResyncReason::DataLoss);
+        f.tables
+            .resync(f.row, Some(RANK), kv_cursor::ResyncReason::DataLoss);
         assert_eq!(f.blocks(), 0);
         f.applied(5, &batch([Data::Stored(stored(1))]));
         assert_eq!(f.blocks(), 1);
@@ -1764,31 +1791,31 @@ mod tests {
         assert_eq!(f.blocks(), 2);
     }
 
-    /// The store empties a rank in its own turn, and the row's next batch
+    /// The tables empty a rank in their own turn, and the row's next batch
     /// forgets its block of record: an engine that comes back with a
     /// narrower block has its stores indexed as they come.
     #[test]
     fn a_rank_the_store_emptied_forgets_its_block_of_record() {
         let f = Fixture::new();
         f.applied(1, &wide(1, 32));
-        f.store
-            .resync(f.row, Some(RANK), store::ResyncReason::DataLoss);
+        f.tables
+            .resync(f.row, Some(RANK), kv_cursor::ResyncReason::DataLoss);
         f.applied(5, &wide(2, 16));
         assert_eq!(f.blocks(), 1, "the narrower block is the row's block now");
     }
 
-    /// The row's view in the store's index, read by a lent batch with no
+    /// The row's view in the tables' index, read by a lent batch with no
     /// event at `sequence`.
     fn view(f: &Fixture, sequence: u64) -> Arc<WorkerGroups> {
-        let facts = store::BatchFacts {
+        let facts = kv_cursor::BatchFacts {
             sequence,
-            ..store::BatchFacts::default()
+            ..kv_cursor::BatchFacts::default()
         };
         let mut view = None;
         let outcome = f
-            .store
+            .tables
             .admit_through(f.row, RANK, facts, &mut |lane| view = Some(lane.groups()));
-        assert_eq!(outcome, store::BatchOutcome::Applied);
+        assert_eq!(outcome, kv_cursor::BatchOutcome::Applied);
         view.expect("the body ran")
     }
 
@@ -1802,7 +1829,7 @@ mod tests {
     }
 
     /// A store of a cache group other than main attention feeds the row's
-    /// view in the store's index, where a decision can read it.
+    /// view in the tables' index, where a decision can read it.
     #[test]
     fn a_group_store_feeds_the_rows_view_in_the_stores_index() {
         let f = Fixture::new();
@@ -1813,23 +1840,26 @@ mod tests {
         assert_eq!(view.named_blocks(), 1, "the main block is named in it");
     }
 
-    /// The store makes a row's lane again under the row's id, and its index
-    /// holds another view for the row. The row's next batch reads another
-    /// value of its lane and takes that view: what its group stores name
-    /// is in the store's index, not in the view of the lane before.
+    /// A row's lane is made again under the row's id, and the index holds
+    /// another view for the row. The row's next batch reads another value
+    /// of its lane and takes that view: what its group stores name is in
+    /// the tables' index, not in the view of the lane before.
     #[test]
     fn a_lane_made_again_gives_the_rows_state_the_indexs_new_view() {
         let f = Fixture::new();
         f.applied(1, &hybrid());
         let old = view(&f, 2);
-        // The row stops asking for its events, and asks again.
+        // The row stops asking for its events, and asks again: each fact
+        // is stated to the tables as a holder states it.
         let facts = f.store.get(f.row).expect("the row").facts;
         let quiet = WorkerFacts {
             signals: Signals::default(),
             ..facts.clone()
         };
         assert_eq!(f.store.upsert(quiet).id(), f.row);
+        f.state(f.row);
         assert_eq!(f.store.upsert(facts).id(), f.row);
+        f.state(f.row);
         f.applied(1, &hybrid());
         let new = view(&f, 2);
         assert!(!Arc::ptr_eq(&old, &new));
@@ -1953,8 +1983,8 @@ mod tests {
                 BatchOutcome::Applied
             );
             assert_eq!(
-                f.store.cursor(f.row, RANK),
-                Some(store::KvCursor {
+                f.tables.cursor(f.row, RANK),
+                Some(kv_cursor::KvCursor {
                     applied: sequence,
                     degraded: unknown_before,
                     replay_pending: false
@@ -1965,7 +1995,7 @@ mod tests {
 
     #[test]
     fn each_reason_reaches_the_store_under_its_own_name() {
-        use store::ResyncReason as To;
+        use kv_cursor::ResyncReason as To;
 
         let f = Fixture::new();
         let store = batch([Data::Stored(stored(1))]);
@@ -1978,7 +2008,7 @@ mod tests {
             (ResyncReason::Snapshot, To::Snapshot),
         ] {
             f.sink.resync(f.row, Some(RANK), reason);
-            assert_eq!(f.store.resyncs(expected), 1, "{reason:?}");
+            assert_eq!(f.tables.resyncs(expected), 1, "{reason:?}");
 
             f.applied(7, &store);
             f.sink.resync(f.row, Some(0), reason);
@@ -1999,28 +2029,28 @@ mod tests {
     fn a_cursor_reads_as_the_stores() {
         let f = Fixture::new();
         assert_eq!(f.sink.cursor(f.row, RANK), None);
-        f.store.admit_through(
+        f.tables.admit_through(
             f.row,
             RANK,
-            store::BatchFacts {
+            kv_cursor::BatchFacts {
                 sequence: 41,
                 clears: false,
-                snapshot: Some(store::SnapshotChunk {
+                snapshot: Some(kv_cursor::SnapshotChunk {
                     unknown_before: true,
                 }),
             },
             &mut |_| {},
         );
-        f.store.admit_through(
+        f.tables.admit_through(
             f.row,
             RANK,
-            store::BatchFacts {
+            kv_cursor::BatchFacts {
                 sequence: 43,
                 ..Default::default()
             },
             &mut |_| {},
         );
-        let expected = f.store.cursor(f.row, RANK).expect("the store's cursor");
+        let expected = f.tables.cursor(f.row, RANK).expect("the store's cursor");
         assert!(expected.replay_pending && expected.degraded);
         assert_eq!(
             f.sink.cursor(f.row, RANK),
@@ -2049,11 +2079,11 @@ mod tests {
         assert_eq!(f.blocks(), 1);
         f.sink.removed(f.row);
         assert_eq!(f.blocks(), 0);
-        assert_eq!(f.store.cursor(f.row, RANK), None);
+        assert_eq!(f.tables.cursor(f.row, RANK), None);
     }
 
     /// The feed of the fixture's one worker, opened by its host.
-    fn opened(f: &Fixture) -> (KvHost<Members, Store>, Arc<KvAdapter<Store>>) {
+    fn opened(f: &Fixture) -> (KvHost<Members>, Arc<KvAdapter>) {
         let host = f.host();
         let worker = host
             .objects
@@ -2082,35 +2112,35 @@ mod tests {
         batch([Data::Stored(wide_store(hash, block_size))])
     }
 
-    /// A batch the store takes names the model's block size, whatever the
+    /// A batch the cursor takes names the model's block size, whatever the
     /// worker stated at its registration: none, a narrower size or a wider
-    /// one. A narrower store behind it moves nothing, and a batch the store
+    /// one. A narrower store behind it moves nothing, and a batch the cursor
     /// skips names none.
     #[test]
     fn a_batch_the_store_takes_names_the_models_block_size() {
         for stated in [None, Some(16), Some(64)] {
             let f = Fixture::single(stated);
             let (_host, sink) = opened(&f);
-            assert_eq!(f.store.block_size(MODEL), stated);
+            assert_eq!(f.tables.block_size(MODEL), stated);
             let mut first = wide(1, 16);
             first.events.extend(wide(2, 32).events);
             assert_eq!(
                 sink.admit(f.row, 0, facts(1), &first),
                 BatchOutcome::Applied
             );
-            assert_eq!(f.store.block_size(MODEL), Some(32), "stated: {stated:?}");
+            assert_eq!(f.tables.block_size(MODEL), Some(32), "stated: {stated:?}");
             // A narrower store is a prefix entry.
             assert_eq!(
                 sink.admit(f.row, 0, facts(2), &wide(3, 8)),
                 BatchOutcome::Applied
             );
-            assert_eq!(f.store.block_size(MODEL), Some(32));
+            assert_eq!(f.tables.block_size(MODEL), Some(32));
             // A duplicate of the batch the row holds is skipped.
             assert_eq!(
                 sink.admit(f.row, 0, facts(2), &wide(4, 64)),
                 BatchOutcome::Skipped
             );
-            assert_eq!(f.store.block_size(MODEL), Some(32));
+            assert_eq!(f.tables.block_size(MODEL), Some(32));
         }
     }
 
@@ -2127,7 +2157,7 @@ mod tests {
         };
         let both = batch([Data::Stored(wide_store(1, 16)), Data::Stored(passed_over)]);
         assert_eq!(sink.admit(f.row, 0, facts(1), &both), BatchOutcome::Applied);
-        assert_eq!(f.store.block_size(MODEL), Some(16));
+        assert_eq!(f.tables.block_size(MODEL), Some(16));
     }
 
     /// A registration that names a wider size behind a stored block is put
@@ -2145,33 +2175,33 @@ mod tests {
                 sink.admit(f.row, 0, facts(u64::from(sequence)), &batch),
                 BatchOutcome::Applied
             );
-            f.store.block_size(MODEL)
+            f.tables.block_size(MODEL)
         };
         assert_eq!(stored(16), Some(16));
         // Another worker of the model registers and states a wider size.
-        f.store.set_block_size(MODEL, 64);
-        assert_eq!(f.store.block_size(MODEL), Some(64));
+        f.tables.set_block_size(MODEL, 64);
+        assert_eq!(f.tables.block_size(MODEL), Some(64));
         assert_eq!(stored(16), Some(16));
         // The model leaves, and comes back with a registration's size.
         host.model_left(MODEL);
-        assert_eq!(f.store.block_size(MODEL), None);
-        f.store.set_block_size(MODEL, 64);
+        assert_eq!(f.tables.block_size(MODEL), None);
+        f.tables.set_block_size(MODEL, 64);
         assert_eq!(stored(16), Some(16));
         // A wider block raises it.
         assert_eq!(stored(32), Some(32));
         // A prefix entry behind a wider registration puts the engine's block
         // back, not its own width.
-        f.store.set_block_size(MODEL, 64);
+        f.tables.set_block_size(MODEL, 64);
         assert_eq!(stored(8), Some(32));
     }
 
     #[test]
     fn the_block_size_is_read_and_set_at_the_store() {
         let f = Fixture::new();
-        f.store.set_block_size(MODEL, 16);
+        f.tables.set_block_size(MODEL, 16);
         assert_eq!(f.sink.block_size(MODEL), Some(16));
         f.sink.set_block_size(MODEL, 32);
-        assert_eq!(f.store.block_size(MODEL), Some(32));
+        assert_eq!(f.tables.block_size(MODEL), Some(32));
     }
 
     #[test]
@@ -2185,7 +2215,7 @@ mod tests {
             .expect("the worker's object");
         let ticket = host.enroll(&worker, MODEL);
         assert_eq!(ticket, Ok(f.row));
-        assert_eq!(f.store.block_size(MODEL), Some(BLOCK_SIZE));
+        assert_eq!(f.tables.block_size(MODEL), Some(BLOCK_SIZE));
         let (sink, row) = host.open(ticket, &worker, MODEL).expect("the row's feed");
         assert_eq!(row, f.row);
         assert!(Arc::ptr_eq(&sink, &host.sink));
@@ -2207,10 +2237,10 @@ mod tests {
             BatchOutcome::Applied
         );
         assert_eq!(
-            f.store.cursor(f.row, 0).map(|cursor| cursor.applied),
+            f.tables.cursor(f.row, 0).map(|cursor| cursor.applied),
             Some(7)
         );
-        assert_eq!(f.store.indexed_blocks(f.row, 0), 1);
+        assert_eq!(f.tables.indexed_blocks(f.row, 0), 1);
 
         let host = f.host();
         let worker = host
@@ -2222,7 +2252,7 @@ mod tests {
             .open(host.enroll(&worker, MODEL), &worker, MODEL)
             .expect("the row's feed");
         assert_eq!(sink.cursor(row, 0), None);
-        assert_eq!(f.store.indexed_blocks(row, 0), 0);
+        assert_eq!(f.tables.indexed_blocks(row, 0), 0);
         assert!(begun(&sink, row));
 
         assert_eq!(sink.admit(row, 0, facts(9), &stores), BatchOutcome::Applied);
@@ -2230,7 +2260,7 @@ mod tests {
             .open(host.enroll(&worker, MODEL), &worker, MODEL)
             .expect("the row's feed");
         assert_eq!(sink.cursor(row, 0).map(|cursor| cursor.applied), Some(9));
-        assert_eq!(f.store.indexed_blocks(row, 0), 1);
+        assert_eq!(f.tables.indexed_blocks(row, 0), 1);
         assert_eq!(
             sink.admit(
                 row,
@@ -2240,12 +2270,12 @@ mod tests {
             ),
             BatchOutcome::Applied
         );
-        assert_eq!(f.store.indexed_blocks(row, 0), 1);
+        assert_eq!(f.tables.indexed_blocks(row, 0), 1);
     }
 
-    /// The store keeps a row's lane at the row's own rank. A row the holder
+    /// The tables keep a row's lane at the row's own rank. A row the holder
     /// stands above rank 0 is its engine's rank 0 stream's. A ticket for
-    /// it opens no feed, and what the store keeps of the row stands. It is
+    /// it opens no feed, and what the tables keep of the row stands. It is
     /// counted as an upper rank's: the holder keeps the row.
     #[test]
     fn a_ticket_for_a_row_above_rank_0_opens_no_feed() {
@@ -2256,7 +2286,7 @@ mod tests {
         ]);
         f.applied(7, &stores);
         assert_eq!(
-            f.store.cursor(f.row, RANK).map(|cursor| cursor.applied),
+            f.tables.cursor(f.row, RANK).map(|cursor| cursor.applied),
             Some(7)
         );
         assert_eq!(f.blocks(), 1);
@@ -2271,7 +2301,7 @@ mod tests {
             .expect("the worker's object");
         assert!(host.open(Ok(f.row), &worker, MODEL).is_none());
         assert_eq!(
-            f.store.cursor(f.row, RANK).map(|cursor| cursor.applied),
+            f.tables.cursor(f.row, RANK).map(|cursor| cursor.applied),
             Some(7)
         );
         assert_eq!(f.blocks(), 1);
@@ -2291,7 +2321,7 @@ mod tests {
         let ticket = host.enroll(&worker, MODEL);
         assert_eq!(ticket, Err(SkipReason::UpperRank));
         // The model's size is seeded all the same.
-        assert_eq!(f.store.block_size(MODEL), Some(BLOCK_SIZE));
+        assert_eq!(f.tables.block_size(MODEL), Some(BLOCK_SIZE));
         assert!(host.open(ticket, &worker, MODEL).is_none());
         let unfed = SkippedSubscriptions {
             no_row: 0,
@@ -2349,6 +2379,32 @@ mod tests {
         assert_eq!(host.skipped_subscriptions(), unfed);
     }
 
+    /// A host over a holder that was handed no tables indexes nothing. The
+    /// row's feed opens all the same, since a stream brings more than
+    /// blocks. No row holds a lane, so its batch is passed over and no
+    /// cursor stands for it.
+    #[test]
+    fn a_host_over_a_holder_handed_no_tables_indexes_nothing() {
+        let f = Fixture::single(Some(BLOCK_SIZE));
+        let objects = Arc::new(Objects::new(Arc::new(WorkerRegistry::new())));
+        objects.follow(f.store.as_ref());
+        assert!(objects.kv_tables().is_none());
+        let host: KvHost<Members> = KvHost::new(objects);
+        let worker = host
+            .objects
+            .registry()
+            .get_by_url(URL)
+            .expect("the worker's object");
+        let (sink, row) = host
+            .open(host.enroll(&worker, MODEL), &worker, MODEL)
+            .expect("the row's feed");
+        assert_eq!(row, f.row);
+        let one = batch([Data::Stored(stored(1))]);
+        assert_eq!(sink.admit(row, 0, facts(1), &one), BatchOutcome::Skipped);
+        assert_eq!(sink.cursor(row, 0), None);
+        assert_eq!(sink.tables.indexed_blocks(row, 0), 0);
+    }
+
     #[test]
     fn a_worker_with_no_positive_block_size_leaves_it_unset() {
         for size in [None, Some(0)] {
@@ -2360,7 +2416,7 @@ mod tests {
                 .get_by_url(URL)
                 .expect("the worker's object");
             assert_eq!(host.enroll(&worker, MODEL), Ok(f.row));
-            assert_eq!(f.store.block_size(MODEL), None);
+            assert_eq!(f.tables.block_size(MODEL), None);
         }
     }
 
@@ -2368,11 +2424,11 @@ mod tests {
     fn a_model_that_left_forgets_its_block_size() {
         let f = Fixture::new();
         let host = f.host();
-        f.store.set_block_size(MODEL, 32);
+        f.tables.set_block_size(MODEL, 32);
         host.model_left(MODEL);
-        assert_eq!(f.store.block_size(MODEL), None);
-        f.store.set_block_size(MODEL, 16);
-        assert_eq!(f.store.block_size(MODEL), Some(16));
+        assert_eq!(f.tables.block_size(MODEL), None);
+        f.tables.set_block_size(MODEL, 16);
+        assert_eq!(f.tables.block_size(MODEL), Some(16));
     }
 
     const UPPER: &str = "http://a:8000#1";
@@ -2443,7 +2499,7 @@ mod tests {
             }
         }
 
-        /// A batch the store takes counts its blocks by operation and
+        /// A batch the cursor takes counts its blocks by operation and
         /// itself as applied, publishes its pace and sets the worker's
         /// index blocks. A removal behind it counts its blocks and moves
         /// the gauge.
@@ -2605,7 +2661,7 @@ mod tests {
                     f.sink.admit(f.row, 0, facts(1), &wide(1, 32)),
                     BatchOutcome::Applied
                 );
-                assert_eq!(f.store.indexed_blocks(f.row, 0), 1);
+                assert_eq!(f.tables.indexed_blocks(f.row, 0), 1);
                 assert!(!series.names_the_worker());
 
                 let (_host, sink) = opened(&f);
@@ -2620,8 +2676,10 @@ mod tests {
     /// store, and the feed the host opened for that row.
     struct Ranked {
         store: Arc<MemoryStore>,
-        host: KvHost<Members, Store>,
-        sink: Arc<KvAdapter<Store>>,
+        /// The tables the holder was handed: it makes each row's lane.
+        tables: Arc<KvTables>,
+        host: KvHost<Members>,
+        sink: Arc<KvAdapter>,
         lower: WorkerId,
     }
 
@@ -2630,9 +2688,12 @@ mod tests {
         fn new() -> Self {
             let store = Arc::new(MemoryStore::new());
             let lower = store.upsert(rank_facts(URL, URL, 0)).id();
-            let objects = Arc::new(Objects::new(Arc::new(WorkerRegistry::new())));
+            let tables = Arc::new(KvTables::default());
+            let objects = Arc::new(
+                Objects::new(Arc::new(WorkerRegistry::new())).with_kv_tables(Arc::clone(&tables)),
+            );
             objects.follow(store.as_ref());
-            let host = KvHost::new(objects, Arc::clone(&store) as Arc<Store>);
+            let host = KvHost::new(objects);
             let worker = host
                 .objects
                 .registry()
@@ -2644,6 +2705,7 @@ mod tests {
             assert_eq!(row, lower);
             Self {
                 store,
+                tables,
                 host,
                 sink,
                 lower,
@@ -2685,8 +2747,8 @@ mod tests {
         /// The blocks rank 0's row and rank 1's row hold.
         fn blocks(&self, upper: WorkerId) -> (usize, usize) {
             (
-                self.store.indexed_blocks(self.lower, 0),
-                self.store.indexed_blocks(upper, 1),
+                self.tables.indexed_blocks(self.lower, 0),
+                self.tables.indexed_blocks(upper, 1),
             )
         }
     }
@@ -2737,13 +2799,13 @@ mod tests {
         f.sink.resync(f.lower, Some(1), ResyncReason::GapCleared);
         assert_eq!(f.blocks(upper), (1, 0));
         f.sink.resync(f.lower, Some(2), ResyncReason::GapCleared);
-        assert_eq!(f.store.resyncs(store::ResyncReason::GapCleared), 1);
+        assert_eq!(f.tables.resyncs(kv_cursor::ResyncReason::GapCleared), 1);
 
         assert_eq!(f.admit(1, 8, store(3)), BatchOutcome::Applied);
         assert_eq!(f.blocks(upper), (1, 1));
         f.sink.resync(f.lower, None, ResyncReason::OutOfRange);
         assert_eq!(f.blocks(upper), (0, 0));
-        assert_eq!(f.store.resyncs(store::ResyncReason::OutOfRange), 2);
+        assert_eq!(f.tables.resyncs(kv_cursor::ResyncReason::OutOfRange), 2);
     }
 
     /// An engine that leaves clears every rank its stream fed, and the
@@ -2758,7 +2820,7 @@ mod tests {
         assert_eq!(f.blocks(upper), (1, 1));
         f.sink.removed(f.lower);
         assert_eq!(f.blocks(upper), (0, 0));
-        assert_eq!(f.store.cursor(upper, 1), None);
+        assert_eq!(f.tables.cursor(upper, 1), None);
         let rows = f.sink.rows.lock();
         assert!(rows.written.is_empty() && rows.fed.is_empty());
     }
@@ -2811,14 +2873,14 @@ mod tests {
     }
 
     /// A rank's row the stream feeds for the first time begins from
-    /// nothing, as a feed's own row does at its open: what the store kept
+    /// nothing, as a feed's own row does at its open: what the tables kept
     /// of it was another writer's.
     #[test]
     fn a_ranks_row_the_stream_feeds_first_begins_from_nothing() {
         let f = Ranked::new();
         let upper = f.upper();
         // Another adapter over the same store wrote the row before.
-        let other = KvAdapter::new(Arc::clone(&f.store) as Arc<Store>);
+        let other = KvAdapter::new(Arc::clone(&f.tables));
         let before = batch([Data::Stored(wide_store(1, 16))]);
         assert_eq!(
             other.admit(upper, 1, facts(7), &before),
@@ -2860,14 +2922,14 @@ mod tests {
             f.sink.admit(other, 1, facts(2), &batch([store(3)])),
             BatchOutcome::Applied
         );
-        assert_eq!(f.store.indexed_blocks(upper, 1), 1);
+        assert_eq!(f.tables.indexed_blocks(upper, 1), 1);
         let applied = f.sink.cursor(other, 1).map(|cursor| cursor.applied);
         assert_eq!(applied, Some(2));
 
         f.sink.removed(f.lower);
-        assert_eq!(f.store.indexed_blocks(upper, 1), 1);
+        assert_eq!(f.tables.indexed_blocks(upper, 1), 1);
         f.sink.resync(other, None, ResyncReason::OutOfRange);
-        assert_eq!(f.store.indexed_blocks(upper, 1), 0);
+        assert_eq!(f.tables.indexed_blocks(upper, 1), 0);
     }
 
     /// A feed's own row whose facts make it a rank of another engine is
@@ -2889,7 +2951,7 @@ mod tests {
         };
         assert_eq!(late(0, 5, 1), BatchOutcome::Applied);
         assert_eq!(f.admit(2, 5, store(9)), BatchOutcome::Applied);
-        let thirds = || f.store.indexed_blocks(third, 2);
+        let thirds = || f.tables.indexed_blocks(third, 2);
         assert_eq!(thirds(), 1);
 
         // The same registration states rank 1 of the first engine now. A
@@ -2900,7 +2962,7 @@ mod tests {
         f.host.objects.follow(f.store.as_ref());
         assert_eq!(late(2, 4, 7), BatchOutcome::Skipped);
         assert_eq!(f.admit(1, 2, store(2)), BatchOutcome::Applied);
-        assert_eq!(f.store.indexed_blocks(own, 1), 1);
+        assert_eq!(f.tables.indexed_blocks(own, 1), 1);
         assert_eq!(late(0, 6, 3), BatchOutcome::Skipped);
         assert_eq!(late(2, 4, 8), BatchOutcome::Skipped);
         assert_eq!(thirds(), 1);
@@ -2913,7 +2975,7 @@ mod tests {
         assert_eq!(back, own);
         f.host.objects.follow(f.store.as_ref());
         assert_eq!(late(1, 1, 4), BatchOutcome::Skipped);
-        assert_eq!(f.store.indexed_blocks(fourth, 1), 0);
+        assert_eq!(f.tables.indexed_blocks(fourth, 1), 0);
 
         f.sink.removed(own);
         assert_eq!(thirds(), 1);
@@ -2945,10 +3007,10 @@ mod tests {
         f.host.objects.follow(f.store.as_ref());
         let store = Data::Stored(wide_store(1, 16));
         assert_eq!(f.admit(1, 2, store), BatchOutcome::Applied);
-        assert_eq!(f.store.indexed_blocks(row, 1), 1);
+        assert_eq!(f.tables.indexed_blocks(row, 1), 1);
 
         assert!(f.host.open(ticket, &worker, MODEL).is_none());
-        assert_eq!(f.store.indexed_blocks(row, 1), 1);
+        assert_eq!(f.tables.indexed_blocks(row, 1), 1);
         assert_eq!(f.host.skipped_subscriptions().no_row, 1);
     }
 
@@ -2981,14 +3043,14 @@ mod tests {
             .expect("the row's entry")
             .leaving = true;
         assert_eq!(late(2, 2), BatchOutcome::Skipped);
-        assert_eq!(f.store.indexed_blocks(upper, 1), 1);
+        assert_eq!(f.tables.indexed_blocks(upper, 1), 1);
 
         // The removal ends: the row is cleared and forgotten, and the
         // other engine's next batch takes it.
         f.sink.removed(f.lower);
-        assert_eq!(f.store.indexed_blocks(upper, 1), 0);
+        assert_eq!(f.tables.indexed_blocks(upper, 1), 0);
         assert_eq!(late(3, 3), BatchOutcome::Applied);
-        assert_eq!(f.store.indexed_blocks(upper, 1), 1);
+        assert_eq!(f.tables.indexed_blocks(upper, 1), 1);
         let rows = f.sink.rows.lock();
         let stream = rows.written.get(&upper).map(|written| written.stream);
         assert_eq!(stream, Some(other));
@@ -3017,7 +3079,7 @@ mod tests {
             f.sink.admit(upper, 0, facts(1), &own),
             BatchOutcome::Applied
         );
-        assert_eq!(f.store.indexed_blocks(upper, 0), 1);
+        assert_eq!(f.tables.indexed_blocks(upper, 0), 1);
     }
 
     /// A feed's open asks whether its object still stands for the row in
@@ -3040,54 +3102,51 @@ mod tests {
         assert!(sink.rows.lock().written.is_empty());
     }
 
-    /// A store that says, at each clear of a row, whether the adapter over
-    /// it holds its rows.
-    struct Clears {
-        store: Arc<Store>,
-        sink: OnceLock<Weak<KvAdapter<Store>>>,
-        held: Mutex<Vec<bool>>,
+    /// What `seen` reads while `step` stands still inside its clear of
+    /// `row`. The tables' own lock is the probe: a clear of a row takes its
+    /// lane's lock, and here a batch's body holds that lock until `seen`
+    /// has answered, so the step cannot get past its clear before then.
+    fn at_its_clear<T>(
+        tables: &KvTables,
+        row: WorkerId,
+        sequence: u64,
+        step: impl FnOnce() + Send,
+        seen: impl Fn() -> Option<T>,
+    ) -> T {
+        let (entered, at_body) = mpsc::channel();
+        let (release, held) = mpsc::channel::<()>();
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                let outcome = tables.admit_through(row, 0, cursor_facts(sequence), &mut |_| {
+                    entered.send(()).expect("the case waits for the body");
+                    held.recv().expect("the case lets the body go");
+                });
+                assert_eq!(outcome, kv_cursor::BatchOutcome::Applied);
+            });
+            at_body.recv().expect("the body holds the lane");
+            let stepping = scope.spawn(step);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let read = loop {
+                if let Some(read) = seen() {
+                    break Some(read);
+                }
+                if std::time::Instant::now() >= deadline {
+                    break None;
+                }
+                std::thread::yield_now();
+            };
+            // The body is let go before any failure is said, so a case that
+            // fails ends: no thread of it waits on the lane.
+            release.send(()).expect("the body waits");
+            stepping.join().expect("the step ends");
+            read.expect("the step never showed what the case waits for")
+        })
     }
 
-    impl store::KvEventSink for Clears {
-        fn admit_through(
-            &self,
-            id: WorkerId,
-            rank: u16,
-            facts: store::BatchFacts,
-            body: &mut dyn FnMut(&mut LaneWriter<'_>),
-        ) -> store::BatchOutcome {
-            self.store.admit_through(id, rank, facts, body)
-        }
-
-        fn reconnected(&self, id: WorkerId) {
-            self.store.reconnected(id);
-        }
-
-        fn resync(&self, id: WorkerId, rank: Option<u16>, reason: store::ResyncReason) {
-            self.store.resync(id, rank, reason);
-        }
-
-        fn cursor(&self, id: WorkerId, rank: u16) -> Option<store::KvCursor> {
-            self.store.cursor(id, rank)
-        }
-
-        fn removed(&self, id: WorkerId) {
-            if let Some(sink) = self.sink.get().and_then(Weak::upgrade) {
-                self.held.lock().push(sink.rows.try_lock().is_none());
-            }
-            self.store.removed(id);
-        }
-
-        fn block_size(&self, model: &str) -> Option<u32> {
-            self.store.block_size(model)
-        }
-
-        fn set_block_size(&self, model: &str, size: u32) {
-            self.store.set_block_size(model, size);
-        }
-
-        fn forget_block_size(&self, model: &str) {
-            self.store.forget_block_size(model);
+    fn cursor_facts(sequence: u64) -> kv_cursor::BatchFacts {
+        kv_cursor::BatchFacts {
+            sequence,
+            ..kv_cursor::BatchFacts::default()
         }
     }
 
@@ -3099,23 +3158,36 @@ mod tests {
     #[test]
     fn a_claimed_rows_first_clear_runs_in_the_hold_that_writes_its_entry() {
         let store = Arc::new(MemoryStore::new());
-        let clears = Arc::new(Clears {
-            store: Arc::clone(&store) as Arc<Store>,
-            sink: OnceLock::new(),
-            held: Mutex::default(),
-        });
-        let sink = Arc::new(KvAdapter::new(Arc::clone(&clears) as Arc<Store>));
-        assert!(clears.sink.set(Arc::downgrade(&sink)).is_ok());
+        let tables = Arc::new(KvTables::default());
+        let sink = Arc::new(KvAdapter::new(Arc::clone(&tables)));
         let row = store.upsert(rank_facts(URL, URL, 0)).id();
         let other = store.upsert(rank_facts(OTHER, OTHER, 0)).id();
+        for id in [row, other] {
+            tables.member(&store.get(id).expect("the row"));
+        }
+        // The adapter's list of rows is held: read while the step waits at
+        // its clear, and for as long as the case looks.
+        let rows_held = || {
+            let held = sink.rows.try_lock().is_none();
+            held.then(|| (0..64).all(|_| sink.rows.try_lock().is_none()))
+        };
 
         // Another stream's take of the row, then the open of its own feed.
-        assert!(sink.take(other, row).is_some());
-        assert_eq!(sink.begin(row, || true), Ok(()));
-        assert_eq!(*clears.held.lock(), [true, true]);
+        let take = || assert!(sink.take(other, row).is_some());
+        assert!(at_its_clear(&tables, row, 1, take, rows_held));
+        let begin = || assert_eq!(sink.begin(row, || true), Ok(()));
+        assert!(at_its_clear(&tables, row, 1, begin, rows_held));
 
-        // The feed's removal.
-        sink.removed(row);
-        assert_eq!(*clears.held.lock(), [true, true, false]);
+        // The feed's removal: its mark stands in the list, which is free,
+        // while its clear still waits for the lane.
+        let marked = || {
+            let rows = sink.rows.try_lock()?;
+            let leaving = rows
+                .written
+                .get(&row)
+                .is_some_and(|written| written.leaving);
+            leaving.then_some(())
+        };
+        at_its_clear(&tables, row, 1, || sink.removed(row), marked);
     }
 }

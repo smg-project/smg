@@ -19,11 +19,9 @@ use crate::{
     document::spec::{AppliedSpec, PolicySpec},
     engine::view::{Health, LoadRow, Role, WireModes, WorkerId},
     store::{
-        identity, pairing::PairingDescriptor, BatchFacts, BatchOutcome, ContentHash, GatewayId,
-        HealthSink, Journal, KvEventSink, LaneWriter, LeasesStore, LoadSink, LoadSource,
-        MembershipChange, MembershipTail, MemoryStore, OutsideLists, Position, SequenceHash,
-        Signals, StoreCheckpoint, StoredBlock, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus,
-        WorkersStore,
+        identity, pairing::PairingDescriptor, GatewayId, HealthSink, Journal, LeasesStore,
+        LoadSink, LoadSource, MembershipChange, MembershipTail, MemoryStore, OutsideLists,
+        Position, StoreCheckpoint, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
     },
 };
 
@@ -817,82 +815,6 @@ fn a_standby_that_follows_holds_the_leaders_tables_and_its_log() {
     assert!(!pool(&standby, later()).is_empty());
     assert_eq!(standby.term(), 3, "the leader's term, told under its guard");
     assert_eq!(followed.followed(), Some(3));
-}
-
-#[test]
-fn a_standbys_index_holds_a_lane_for_each_row_that_asks_for_events() {
-    let asks = |key: &str, incarnation| WorkerFacts {
-        signals: Signals {
-            events: true,
-            ..Signals::default()
-        },
-        ..facts(key, incarnation)
-    };
-    let (leader, led) = journaled(256);
-    let (standby, followed) = journaled(256);
-    leader.set_term(1);
-    let a = leader.upsert(asks("http://a:8000", 1)).id();
-    let b = leader.upsert(asks("http://b:8000", 1)).id();
-    let quiet = leader.upsert(facts("http://quiet:8000", 1)).id();
-    let lanes = |store: &MemoryStore, ids: &[WorkerId]| -> Vec<bool> {
-        let lane = |id: &WorkerId| store.kv().holds_lane(*id, 0);
-        ids.iter().map(lane).collect()
-    };
-    // Each read: the standby follows what the leader wrote since the last,
-    // and both hold a lane for exactly the rows that ask.
-    let mut told = 0;
-    let mut reads = |ids: &[WorkerId], want: &[bool]| {
-        let entries = all(&led);
-        for entry in entries.iter().skip(told) {
-            follows(&standby, &followed, entry);
-        }
-        told = entries.len();
-        assert_eq!(lanes(&leader, ids), want, "the leader");
-        assert_eq!(lanes(&standby, ids), want, "the standby");
-    };
-    reads(&[a, b, quiet], &[true, true, false]);
-    // A relabel that stops asking retires the lane, one that asks makes it.
-    leader.upsert(facts("http://a:8000", 1));
-    leader.upsert(asks("http://quiet:8000", 1));
-    reads(&[a, b, quiet], &[false, true, true]);
-    // A replaced row's lane leaves with it and the new row takes its own.
-    let again = leader.upsert(asks("http://b:8000", 2)).id();
-    reads(&[b, again], &[false, true]);
-    // A removed row's lane leaves with it.
-    let left = leader.by_key("http://quiet:8000").expect("the row");
-    assert!(leader.remove(left.id, left.revision).is_some());
-    reads(&[quiet, again], &[false, true]);
-    // A restore: the lanes are the cut's rows', and a row that left gave
-    // its lane up.
-    let (other, _) = journaled(256);
-    let own = other.upsert(asks("http://own:8000", 1)).id();
-    assert_eq!(lanes(&other, &[own, again]), [true, false]);
-    assert!(other.restore_from(leader.checkpoint()));
-    assert_eq!(lanes(&other, &[own, again, a]), [false, true, false]);
-    // A row that stays through a restore keeps what this replica heard for
-    // it: its lane's blocks are the replica's own, in no cut.
-    let heard: &dyn KvEventSink = &other;
-    let block = [StoredBlock {
-        seq_hash: SequenceHash(1),
-        content_hash: ContentHash(2),
-    }];
-    let first = BatchFacts {
-        sequence: 1,
-        ..BatchFacts::default()
-    };
-    let mut body = |lane: &mut LaneWriter<'_>| {
-        let mut map = std::mem::take(lane.map());
-        let placed = lane.stored(&block, None, &mut map);
-        *lane.map() = map;
-        placed.expect("stored");
-    };
-    assert_eq!(
-        heard.admit_through(again, 0, first, &mut body),
-        BatchOutcome::Applied
-    );
-    assert_eq!(other.indexed_blocks(again, 0), 1);
-    assert!(other.restore_from(leader.checkpoint()));
-    assert_eq!(other.indexed_blocks(again, 0), 1, "the lane was made again");
 }
 
 #[test]

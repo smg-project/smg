@@ -15,7 +15,7 @@ use super::ObjectsWake;
 use crate::service::controller::Config;
 use crate::{
     store::MemoryStore,
-    worker_host::{Members, Objects},
+    worker_host::{KvTables, Members, Objects},
 };
 
 /// The replica's worker objects: their holder, the store it follows and the
@@ -78,10 +78,13 @@ impl WorkerObjects {
         Self {
             store,
             objects: Arc::new(
+                // The KV tables are the replica's own, made here once: the
+                // holder states its rows to them and the feed writes them.
                 Objects::new(Arc::new(WorkerRegistry::new()))
                     .with_connector(connector)
                     .with_host_local_unchecked()
-                    .with_overload_thresholds(overload),
+                    .with_overload_thresholds(overload)
+                    .with_kv_tables(Arc::new(KvTables::default())),
             ),
             wake,
         }

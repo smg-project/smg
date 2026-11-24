@@ -167,15 +167,17 @@ impl<G: Generation> Objects<G> {
 mod tests {
     use std::{cell::Cell, rc::Rc, sync::Arc, time::Duration};
 
-    use smg_worker::{identity::basic::Worker, worker::WorkerStatus as ObjectStatus};
+    use smg_worker::{
+        identity::basic::Worker, registry::WorkerRegistry, worker::WorkerStatus as ObjectStatus,
+    };
 
     use super::{
         super::write::tests::{facts, Replica, A},
         *,
     };
     use crate::{
-        store::{memory::seam, WorkerFacts, WorkerStatus, WorkersStore},
-        worker_host::Members,
+        store::{memory::seam, Signals, WorkerFacts, WorkerStatus, WorkersStore},
+        worker_host::{KvTables, Members},
     };
 
     const B: &str = "http://b:8000";
@@ -538,5 +540,90 @@ mod tests {
         assert!(watching.object(B).is_some(), "the row the snapshot brings");
         assert_eq!(objects.len(), 2);
         assert_eq!(objects.read_to(), Some(told.store.epoch()));
+    }
+
+    /// A leader, and a standby whose holder was handed the KV tables that
+    /// come back beside them.
+    fn tabled() -> (Replica, Replica, Arc<KvTables>) {
+        let tables = Arc::new(KvTables::default());
+        let mut standby = Replica::new();
+        standby.objects =
+            Objects::new(Arc::new(WorkerRegistry::new())).with_kv_tables(Arc::clone(&tables));
+        (Replica::new(), standby, tables)
+    }
+
+    /// [`facts`] of the row at `key`, whose signals ask for cache events
+    /// where `events` says so.
+    fn asking(key: &str, events: bool) -> WorkerFacts {
+        WorkerFacts {
+            key: key.to_owned(),
+            engine: key.to_owned(),
+            signals: Signals {
+                events,
+                ..Signals::default()
+            },
+            ..facts(1, "gold")
+        }
+    }
+
+    /// A standby's holder that was handed KV tables keeps a lane for each
+    /// row that asks for cache events, where its leader's event is told. A
+    /// row told quiet in place gives its lane up, one told asking again
+    /// takes one, and a row told gone holds none.
+    #[test]
+    fn a_standbys_holder_keeps_a_lane_for_each_told_row_that_asks_for_events() {
+        let (leader, standby, tables) = tabled();
+        let lane = |id| tables.holds_lane(id, 0);
+        leader.upsert(asking(A, true));
+        follow(&standby, &leader);
+        let row = leader.store.by_key(A).expect("the leader's row").id;
+        assert!(lane(row), "a told row that asks");
+        leader.upsert(asking(A, false));
+        follow(&standby, &leader);
+        assert!(!lane(row), "told quiet in place");
+        leader.upsert(asking(A, true));
+        follow(&standby, &leader);
+        assert!(lane(row), "told asking again");
+        let stands = leader.store.by_key(A).expect("the leader's row");
+        assert_eq!(stands.id, row, "in place");
+        let removed = leader
+            .objects
+            .remove(&leader.store, stands.id, stands.revision);
+        assert_eq!(removed, Some(MembershipChange::Removed { id: row }));
+        follow(&standby, &leader);
+        assert!(!lane(row), "told gone");
+        assert_eq!(tables.lanes(), 0);
+    }
+
+    /// A cut laid whole leaves a lane for each of its rows that asks for
+    /// cache events, by a restore and by a watch's snapshot, and a row the
+    /// cut drops holds none.
+    #[test]
+    fn a_cut_laid_whole_leaves_a_lane_for_each_row_that_asks_for_events() {
+        type Lay = fn(&Objects<Members>, &MemoryStore, StoreCheckpoint) -> bool;
+        let lays: [(&str, Lay); 2] = [
+            ("a restore", |objects, store, cut| {
+                objects.restore_from(store, cut)
+            }),
+            ("a watch's snapshot", |objects, store, cut| {
+                objects.watch_from(store, cut)
+            }),
+        ];
+        for (name, lay) in lays {
+            let (leader, standby, tables) = tabled();
+            let lane = |id| tables.holds_lane(id, 0);
+            // A row of the standby's own, which the cut drops.
+            standby.upsert(asking(B, true));
+            let dropped = standby.store.by_key(B).expect("its own row").id;
+            assert!(lane(dropped), "{name}");
+            leader.upsert(asking(A, true));
+            leader.upsert(asking("http://c:8000", false));
+            let cut = leader.store.checkpoint();
+            assert!(lay(&standby.objects, &standby.store, cut), "{name}");
+            let asks = leader.store.by_key(A).expect("the cut's row").id;
+            assert!(lane(asks), "{name}: a row of the cut that asks");
+            assert!(!lane(dropped), "{name}: a row the cut drops");
+            assert_eq!(tables.lanes(), 1, "{name}: the quiet row holds none");
+        }
     }
 }
