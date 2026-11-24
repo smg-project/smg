@@ -12,7 +12,11 @@ mod lead;
 mod load_monitor;
 mod prober;
 
+#[cfg(all(test, feature = "discovery"))]
+pub(crate) use follower::tests::engine;
 pub(crate) use follower::WorkerObjects;
+#[cfg(feature = "discovery")]
+pub(crate) use follower::OVERLOAD_DEFAULTS;
 pub(crate) use lead::ElectedLead;
 pub(crate) use load_monitor::LoadMonitor;
 pub(crate) use prober::Prober;

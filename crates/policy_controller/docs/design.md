@@ -531,11 +531,12 @@ them, or its load records alone, as its host asks. A gateway asks a worker for i
 where what places the worker reads them. Otherwise it asks for the load records alone, and opens
 no stream where its load monitor wants no loads of the worker. On main a controller opens no
 stream for load records alone. It asks a worker for its cache events where the worker's
-registration asks for them, on one stream for each engine: a data-parallel engine's rank 0
-streams every rank's events. The collector hands the load records to the load monitor and the
-cache events to the index of cache events (section 4.5). Only a worker dialed over gRPC has such
-a stream; the monitor polls the others. A worker dials nobody for this, so it needs no address
-of a gateway or of a controller.
+registration asks for them, or, for a worker its own discovery found, where the document in
+force at the find reads cache events for the worker's first model. It asks on one stream for
+each engine: a data-parallel engine's rank 0 streams every rank's events. The collector hands
+the load records to the load monitor and the cache events to the index of cache events (section
+4.5). Only a worker dialed over gRPC has such a stream; the monitor polls the others. A worker
+dials nobody for this, so it needs no address of a gateway or of a controller.
 
 The host that opens the stream is the process that holds the workers' data (the table of
 section 1): the gateway in classic and with the engine in the gateway, the controller with the
@@ -1848,7 +1849,7 @@ Its data is one in-memory store (`store/memory.rs`):
 
 | Data | Filled by | Note |
 |---|---|---|
-| worker records | the `RegisterWorker`, `PatchWorker`, `DeregisterWorker` calls | discovery is in the code behind a feature the image leaves out, and registers nothing yet |
+| worker records | the `RegisterWorker`, `PatchWorker`, `DeregisterWorker` calls, and the leader's own discovery | discovery is behind a feature the image leaves out; a record it writes asks for the worker's cache events where the document in force at the find reads them for the worker's first model, and a document applied later does not write that word again |
 | worker objects | a task that follows the worker records | a second form of the same workers, of the worker crate's type; each states its registration's overload thresholds over one default, 8 queued requests and 0.8 usage, an external record's over none, and the load monitor judges by them while the replica leads; an object's status follows its record's, and a single request's decision reads the workers here |
 | health | the worker crate's health checker over the worker objects, on the leader | copied into the records |
 | loads | the worker crate's load monitor over the worker objects, every 10 seconds while the replica leads | `PushLoad` is not served; a single request's decision is given the monitor's snapshot where the document reads reports and keeps none; the store's load table is written by nothing |
@@ -1900,7 +1901,7 @@ the worker crate's structures, and the one engine.
 | sessions | the engine's session table for a single request, one for each document | the engine's session table |
 | leases | the store's lease tables, in memory, one for each deciding thread | stay: a controller must remember what it issued to gateways |
 | decisions | a single request, a pair at its prefill, its decode call, and a prefill or a decode request that stands alone: `PolicyEngine` over the registry's lists; an encode request, and a decode request that names no lease under a pair plan: none, the request is answered `Busy` | `PolicyEngine::decide_without_lease` over the registry's lists |
-| discovery | not registering | the discovery crate through its host interface, registering through the worker crate's job queue |
+| discovery | the discovery crate through its host interface, registering and removing through the worker crate's job queue while the replica leads; behind a feature the image leaves out; a worker's API key is refused at the start, since no replica keeps one | the same in the image, with a worker's API key; how a replica comes by the key of a worker found before it led is open, as a gateway's way to a key is (section 11) |
 
 **Who sends a worker's data.** Nothing changes for a worker. It pushes its load records and its
 cache events on the stream its host opens (section 4.3), and here the host is the controller. The
@@ -2343,7 +2344,7 @@ bursts. It is bounded by the tree's size bound and the time between two eviction
 | The gateway as a host | **[partly]** | section 9, behind `--policy-controller on`, which is off by default: single requests and pairs on the HTTP and gRPC routes, a pair's decode asked again, a host's table of stages at the start; an encode request that carries an item is refused by name until the gateway hands the engine its three lists; every classic test of the gateway with the engine on (the bar's fourth point) is not met yet |
 | The controller: service, election, replication, document apply and roll back | **[partly]** | a session never pushes the document and refuses a gateway's replay; a standby serves neither the worker list nor the snapshot (section 10.1) |
 | The controller on the one engine and the worker crate's structures | **[partly]** | a single request, a pair at its prefill and its decode call are decided by `PolicyEngine` over the registry's lists; an encode request is answered `Busy`; a decision reads no cache event, and no load report under a document that holds a stage that keeps reports (section 10.2) |
-| The controller finding its own workers | **[partly]** | discovery registers nothing yet |
+| The controller finding its own workers | **[partly]** | the image leaves the feature out; a worker's API key is refused; no flag sets a registration's timing |
 | A gateway under a controller | **[planned]** | section 11 |
 | User stages in WebAssembly and over gRPC | **[partly]** | library code that no document reaches |
 

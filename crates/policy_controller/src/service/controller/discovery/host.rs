@@ -34,10 +34,6 @@ impl Host {
 
     /// Hands the host its job queue. A queue that stands is kept, and a
     /// second call returns `false`.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the queue is supplied by the host")
-    )]
     pub(crate) fn set_jobs(&self, jobs: Arc<dyn WorkerJobs>) -> bool {
         self.jobs.set(jobs).is_ok()
     }

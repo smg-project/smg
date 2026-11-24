@@ -1,7 +1,7 @@
 //! The membership writer: a host's writes of worker rows into the store.
 
 #![cfg_attr(
-    not(test),
+    not(any(test, feature = "discovery")),
     expect(
         dead_code,
         reason = "A drain's, a removal's and a refresh's rules run at the replica's own door, which the host owns."

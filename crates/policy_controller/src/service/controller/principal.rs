@@ -53,6 +53,16 @@ impl Principal {
     pub(crate) fn gateway(&self) -> GatewayId {
         gateway_id(&self.subject)
     }
+
+    /// The replica itself, for a write of its own discovery: its subject
+    /// is the controller's id, and no listener placed it.
+    #[cfg(feature = "discovery")]
+    pub(crate) fn replica(controller_id: &str) -> Self {
+        Self {
+            subject: controller_id.to_owned(),
+            method: Method::Unspecified,
+        }
+    }
 }
 
 /// The store's key for a gateway's subject.
