@@ -26,10 +26,12 @@
 //! **The counts.** A shadow decision is counted in the engine's one table
 //! ([`ShadowCounts`]), behind the issue of its live decision: a pick's
 //! lease is issued first, and a live shed, which issues none, counts its
-//! shadow too. The entry that issues a lease counts by itself ([`issued`]).
-//! The entry that issues none answers what the shadow said, and its caller
-//! counts it behind its own filing ([`PolicyEngine::count_shadow`]). Under
-//! either, a decision whose issue fails counts none.
+//! shadow too. The entry that issues a lease counts by itself ([`issued`]):
+//! a stage that panics at that issue is held, so the decision stands and
+//! its shadow is counted. The entry that issues none answers what the
+//! shadow said, and its caller counts it behind its own filing
+//! ([`PolicyEngine::count_shadow`]): a decision whose filing fails counts
+//! none.
 
 use std::{
     sync::{atomic::Ordering, Arc},
@@ -81,7 +83,8 @@ impl WholeDecision for WithShadow<'_> {
 
 /// The issue of one single request's decision beside which its binding's
 /// shadow said `said` ([`single::issued`]), with that word counted behind
-/// the issue ([`count`]): a decision whose issue panics counts none.
+/// the issue ([`count`]). A stage that panics at the issue is held there:
+/// the decision stands and its shadow is counted.
 ///
 /// Out of line: the path of a binding without a shadow holds no part of
 /// this one.

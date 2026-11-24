@@ -384,7 +384,8 @@ pub trait Scorer: Lifecycle + Debug {
 
     /// Whether this scorer says what a pick's first target holds of its
     /// request ([`Self::said`]); the default is no. No entry of the engine
-    /// reads it: none states a pick's overlap.
+    /// reads it: an entry states a pick's overlap itself, from the rows the
+    /// decision was given ([`Pick::overlap`]).
     fn states_overlap(&self) -> bool {
         false
     }
@@ -395,8 +396,9 @@ pub trait Scorer: Lifecycle + Debug {
     /// call, so a second row asked of the same decision may read no margin
     /// held. The default says nothing.
     ///
-    /// No entry of the engine asks it: a pick's overlap reads as not stated
-    /// ([`Pick::overlap`]).
+    /// No entry of the engine asks it: an entry states a pick's overlap
+    /// itself, from the rows the decision was given ([`Pick::overlap`]),
+    /// and not by this word.
     fn said(&self, _facts: &RequestFacts<'_>, _candidates: &[Candidate], _row: u32) -> Overlap {
         Overlap::default()
     }
@@ -5674,9 +5676,10 @@ impl Engine {
 
     /// Whether the profile a decision of `phase` for `model` resolves to
     /// reads affinity by its own stages: the word of [`Self::needs_for`]
-    /// less the binding's shadow profile and its sessions rule. `false`
-    /// where no binding matches. A pick's overlap is stated by this word:
-    /// rows a host names for a shadow alone say nothing of the live pick.
+    /// less the binding's shadow profile, its sessions rule and, for a
+    /// decode decision, the model's pair binding. `false` where no binding
+    /// matches. A pick's overlap is stated by this word: rows a host names
+    /// for a shadow alone say nothing of the live pick.
     #[cfg(feature = "in-process")]
     pub(crate) fn profile_reads_affinity(&self, model: &str, phase: Phase) -> bool {
         self.resolve(model, phase)

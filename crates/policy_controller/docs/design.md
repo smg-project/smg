@@ -1008,6 +1008,8 @@ On main three pickers say so: round robin, `random` and `passthrough`.
   encode request's over its three.
 
 A decision that panics is caught, counted and answered as refused. It never takes the host down.
+A stage that panics at a word of a lease, its issue among them, is held and counted apart: the
+request keeps its decision and its lease.
 
 A request whose host hands no list (`WorkerLists::None`) is decided over no worker: it is shed
 with no endpoint under the stage `none`, and its trace names no profile. A controller hands none
