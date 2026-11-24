@@ -168,7 +168,7 @@ A host that manages the lease itself calls `door.decide_decode(gateway, &request
 
 A host that files pairs directly through `LeasesStore::issue_pair` can set the decode side to `LeaseState::Chosen`. The side keeps the pick's decode targets without booking a worker or starting a dispatch deadline. A side still chosen leaves the store when its prefill ends.
 
-Once the prefill is dispatched, `store.issue_decode(gateway, id, decode, now)` can replace that choice once, while the prefill is held. It books the new first target and gives the decode five seconds to dispatch. A dispatch on a chosen side can also book a target from the original pick. An index outside the pick uses its first target.
+Once the prefill is dispatched, `store.issue_decode(gateway, id, decode, now)` can replace that choice once, while the prefill is held. It books the new first target and gives the decode five seconds to dispatch. A dispatch on a chosen side can also book a target from the original pick. An index outside the pick books none, and the side stays chosen.
 
 `issue_decode` returns `DecodeRefused::NoLease` when the gateway has no lease under that id, `NotChosen` when the lease was filed without a chosen side, `PrefillNotHeld` when its prefill is waiting or has ended, and `DecodeStands` when its chosen side has already been issued or dispatched, or its gateway ended it.
 

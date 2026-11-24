@@ -484,7 +484,8 @@ pub trait LeasesStore: Send + Sync {
     /// the side it names and no other: a decode's on another target moves
     /// the decode's booking alone, and a side the lease does not hold
     /// changes nothing. A dispatch on a chosen decode side books the
-    /// named target, or the first target if the index names none.
+    /// target it names. At an index the pick holds no target at, that
+    /// side stays chosen and books none.
     fn dispatched(
         &self,
         gateway: GatewayId,

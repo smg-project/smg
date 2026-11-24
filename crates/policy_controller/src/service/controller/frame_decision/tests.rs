@@ -45,17 +45,18 @@ use crate::{
                 Part,
             },
             frame_request::FrameRequest,
+            lifecycle,
             wire::{Checked, Lists},
         },
         proto,
     },
     stages::{lifecycle::Lifecycle, registry::StageRegistry},
     store::{
-        pairing::PairingDescriptor, AtWork, DecodeIssue, DecodeMark, GatewayId, HealthSink,
+        pairing::PairingDescriptor, AtWork, DecodeIssue, DecodeMark, GatewayId, Hand, HealthSink,
         LeaseRecord, LeaseState, LeasesStore, LookOutcome, MemoryStore, PickRecord, Reachability,
         WorkerFacts, WorkerStatus, WorkersStore,
     },
-    tracking::lease::{Dispatch, Lease, LeaseId, Side, DISPATCH_TTL},
+    tracking::lease::{Dispatch, Lease, LeaseId, Outcome, ReleaseReason, Side, DISPATCH_TTL},
     worker_host::{Members, Objects},
 };
 
@@ -1916,4 +1917,180 @@ fn a_pair_and_its_decode_call_pair_by_the_classes_of_the_documents_pairing() {
     let (sides, same, other) = named(Some("off"));
     let both = BTreeSet::from([same, other]);
     assert_eq!(sides, [both.clone(), both]);
+}
+
+/// The `random` picker, keeping each word its engine tells it of a lease's
+/// side: the call, the side, and the worker the call names.
+#[derive(Debug)]
+struct SideWords(Arc<Mutex<Vec<SideWord>>>);
+
+/// One call of a stage about a lease's side: the worker is the one the
+/// lease books at an issue or at an end, and the target of a dispatch.
+type SideWord = (&'static str, Side, WorkerId);
+
+impl Lifecycle for SideWords {
+    fn on_decision_issued(&self, lease: &Lease, _: &Decision) {
+        self.0.lock().push(("issued", lease.side, lease.booked));
+    }
+
+    fn on_dispatched(&self, _: &Lease, target: &Target, side: Side, _: u32) {
+        self.0.lock().push(("dispatched", side, target.id));
+    }
+
+    fn on_completed(&self, lease: &Lease, _: &Outcome) {
+        self.0.lock().push(("completed", lease.side, lease.booked));
+    }
+
+    fn on_released(&self, lease: &Lease, _: ReleaseReason) {
+        self.0.lock().push(("released", lease.side, lease.booked));
+    }
+}
+
+impl Picker for SideWords {
+    fn name(&self) -> &'static str {
+        "side-words"
+    }
+
+    fn pick(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        scores: &[f32],
+        band: TieBand,
+        out: &mut Targets,
+    ) {
+        Random.pick(facts, candidates, kept, scores, band, out);
+    }
+}
+
+/// A `Dispatched` frame at an index the pick holds no target at names no
+/// worker. On a decode side that stands chosen it moves nothing, and no
+/// stage hears of it: no issue, no dispatch and, where the gateway then
+/// reports the side's end or gives the lease up, no end of that side. A
+/// decode call behind the frame is decided as behind no frame, and its
+/// pick is issued under the pair's lease. A frame behind it that names a
+/// target is told as the side's issue and then its dispatch, once each.
+#[test]
+fn a_dispatched_frame_at_an_index_its_pick_does_not_hold_leaves_a_chosen_side_as_it_stood() {
+    let store = Arc::new(MemoryStore::new());
+    let told = Arc::new(Mutex::new(Vec::new()));
+    let kept = Arc::clone(&told);
+    let mut catalog = StageRegistry::builtin();
+    let stage = move || -> Box<dyn Picker> { Box::new(SideWords(Arc::clone(&kept))) };
+    catalog.picker("side-words", stage).expect("a free name");
+    store
+        .apply(pair_plan(
+            &catalog,
+            r#"["healthy"]"#,
+            ["random", "side-words"],
+        ))
+        .expect("above the unbound start");
+    let p = side_member(&store, "p0", Role::Prefill, None);
+    let d = side_member(&store, "d0", Role::Decode, None);
+    LeasesStore::set_term(&*store, 1);
+    let objects = holder(&store);
+    // The word to the engine of a frame applied to a lease, as a replica
+    // gives it at the start of its deciders, and a session's hand at the
+    // files: no decider is at work here, so the hand applies each frame.
+    lifecycle::tells(&store, &objects);
+    let hand = Hand::new(GATEWAY);
+    let now = Instant::now();
+    // A `Dispatched` frame of the decode side of `lease`, at `index`.
+    let sent = |lease: LeaseId, index: u32| {
+        let frame = proto::Dispatched {
+            lease_id: lease.0,
+            target_index: index,
+            side: proto::Side::Decode.into(),
+            since_decision_micros: 0,
+        };
+        lifecycle::dispatched(&store, &hand, &frame, now).expect("the frame reads");
+    };
+    // What the decode side's stage heard since the last read.
+    let heard = || mem::take(&mut *told.lock());
+    // What the leases on file book on the prefill and on the decode.
+    let booked = || {
+        let load = |name: &str| {
+            let url = format!("http://{name}:8000");
+            let object = objects.registry().get_by_url(&url).expect("its object");
+            object.load()
+        };
+        [load("p0"), load("d0")]
+    };
+    let side_on_file = |lease: LeaseId| {
+        let sides = LeasesStore::sides(&*store, GATEWAY, lease).expect("on file");
+        sides.decode.map(|side| (side.state, side.target))
+    };
+    let chosen = Some((LeaseState::Chosen, d));
+
+    // The pick holds one target. A frame past it, at the next index and at
+    // the last a byte names, moves nothing and reaches no stage.
+    let (_, first) = held_pair_at(&store, &objects, (1, 0), now);
+    assert_eq!(heard(), [("issued", Side::Prefill, p)]);
+    for index in [1, 255] {
+        sent(first.id, index);
+    }
+    assert_eq!((side_on_file(first.id), booked()), (chosen, [1, 0]));
+    assert!(
+        heard().is_empty(),
+        "no stage hears a frame that names no worker"
+    );
+    // A decode call behind it finds the side chosen: its pick is issued
+    // under the pair's lease, and the stages hear that issue.
+    let call = at_call(2, first.id, WireModes::NONE, None);
+    let (decision, issued) = leased_call(&store, &objects, call, now);
+    assert_eq!(pairs_of(&decision), [(p, d)]);
+    let (side, _) = issued.expect("a pick's issue");
+    assert_eq!(
+        (side.id, side.side, side.booked),
+        (first.id, Side::Decode, d)
+    );
+    assert_eq!(heard(), [("issued", Side::Decode, d)]);
+    let issued = Some((LeaseState::ISSUED, d));
+    assert_eq!((side_on_file(first.id), booked()), (issued, [1, 1]));
+
+    // A second pair, whose decode is reported complete behind such a
+    // frame and whose lease is then given up whole: the prefill's release
+    // is told, and no end of a side no stage heard issued.
+    let (_, second) = held_pair_at(&store, &objects, (3, 0), now);
+    told.lock().clear();
+    sent(second.id, 1);
+    let ended = proto::Completed {
+        lease_id: second.id.0,
+        side: proto::Side::Decode.into(),
+        served: d.0,
+        status: 200,
+        class: proto::completed::Class::Ok.into(),
+        ttft_micros: 0,
+        tokens_in: 0,
+        tokens_out: 0,
+        duration_micros: 0,
+    };
+    lifecycle::completed(&store, &hand, &ended, now).expect("the frame reads");
+    assert!(heard().is_empty(), "a side no stage heard issued");
+    let complete = Some((LeaseState::Completed, d));
+    assert_eq!((side_on_file(second.id), booked()), (complete, [2, 1]));
+    let gone = proto::Released {
+        what: Some(proto::released::What::LeaseId(second.id.0)),
+        reason: proto::released::Reason::ClientGone.into(),
+        side: proto::Side::Unspecified.into(),
+    };
+    lifecycle::released(&store, &hand, &gone).expect("the frame reads");
+    assert_eq!(heard(), [("released", Side::Prefill, p)]);
+    assert_eq!(booked(), [1, 1]);
+
+    // A third: a frame behind it that names the pick's target is the
+    // side's issue and then its dispatch, and the same frame again tells
+    // nothing.
+    let (_, third) = held_pair_at(&store, &objects, (4, 0), now);
+    told.lock().clear();
+    for index in [1, 0] {
+        sent(third.id, index);
+    }
+    let words = [("issued", Side::Decode, d), ("dispatched", Side::Decode, d)];
+    assert_eq!(heard(), words);
+    sent(third.id, 0);
+    assert!(heard().is_empty(), "the same frame again");
+    let sent_to = Some((LeaseState::Dispatched { at: now }, d));
+    assert_eq!((side_on_file(third.id), booked()), (sent_to, [2, 2]));
 }

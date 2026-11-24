@@ -3430,10 +3430,11 @@ fn waits(found: &Sides, side: Side) -> bool {
 
 /// Whether a dispatch moves `side` of the lease `found`
 /// ([`Leases::dispatched_side`]): a side that waits for it, or a pair's
-/// decode side still chosen, which its dispatch books. A handed frame's
-/// dispatch is told by this. A record's own state is never chosen, so a
-/// single's dispatch and a prefill's read one state: a pair's decode side
-/// alone is asked the second.
+/// decode side still chosen, which a dispatch that names a target books.
+/// A handed frame's dispatch is told by this, whatever index it names. A
+/// record's own state is never chosen, so a single's dispatch and a
+/// prefill's read one state: a pair's decode side alone is asked the
+/// second.
 fn takes_dispatch(found: &Sides, side: Side) -> bool {
     waits(found, side)
         || (side == Side::Decode && found.decode.is_some_and(|decode| decode.state.is_chosen()))
@@ -3837,7 +3838,9 @@ impl Leases {
 
     /// Dispatches the named side if it is issued or chosen. Every target
     /// of a pair's pick names the same prefill, so only the decode's
-    /// booking can move. A chosen decode books its target at dispatch.
+    /// booking can move. A chosen decode books its target at a dispatch
+    /// that names one, and stays chosen at an index its pick holds no
+    /// target at.
     fn dispatched_side(
         slots: Slots<'_>,
         counts: &InFlightCounts,
@@ -3876,10 +3879,14 @@ impl Leases {
             }
             Side::Decode if decode.side.state.is_chosen() => {
                 let side = &mut decode.side;
-                if let Some((target, _)) = side.target_at(dispatch.target_index) {
-                    side.target = target;
-                    side.target_index = dispatch.target_index;
-                }
+                // The side has no issue outstanding, and a word that names
+                // no target of its pick names no worker to book: the side
+                // waits on for a call, or for a word that names one.
+                let Some((target, _)) = side.target_at(dispatch.target_index) else {
+                    return;
+                };
+                side.target = target;
+                side.target_index = dispatch.target_index;
                 side.state = LeaseState::Dispatched { at };
                 decode.booked = slots.of(side.target);
                 if let Some(booked) = decode.booked {

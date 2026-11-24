@@ -2289,10 +2289,8 @@ fn a_dispatch_on_a_chosen_side_books_it_once_as_it_lands() {
     let leases: &dyn LeasesStore = &store;
     let (gateway, now) = (GatewayId(1), Instant::now());
     leases.set_term(1);
-    for (index, target, booked_index, counts) in
-        [(1, d1, 1, [1, 0, 1]), (u8::MAX, d0, 0, [1, 1, 0])]
-    {
-        let id = LeaseId(u64::from(index));
+    for (index, target, counts) in [(1, d1, [1, 0, 1]), (0, d0, [1, 1, 0])] {
+        let id = LeaseId(u64::from(index) + 1);
         let (record, decode) = chosen_pair(id.0, p, &[d0, d1], now);
         issue_pair(leases, (record, decode)).expect("the key is free");
         assert!(leases.dispatched(gateway, id, on(Side::Prefill, 0), now));
@@ -2305,19 +2303,86 @@ fn a_dispatch_on_a_chosen_side_books_it_once_as_it_lands() {
             filed.decode,
             Some(DecodeSide {
                 target,
-                target_index: booked_index,
+                target_index: index,
                 state: LeaseState::Dispatched { at },
                 ..decode
             })
         );
         assert_eq!(booked(&store, &[p, d0, d1]), counts);
         assert_eq!(store.queued(), 0);
-        assert!(leases.dispatched(gateway, id, on(Side::Decode, 0), now));
+        // A second word, on the pick's other target, moves nothing.
+        assert!(leases.dispatched(gateway, id, on(Side::Decode, 1 - index), now));
         assert_eq!(leases.sides(gateway, id), Some(filed));
         assert_eq!(booked(&store, &[p, d0, d1]), counts);
         assert!(leases.released(gateway, id, None, ReleaseReason::ClientGone));
         assert_eq!(booked(&store, &[p, d0, d1]), [0, 0, 0]);
     }
+}
+
+/// A dispatch at an index the pick holds no target at names no worker. A
+/// chosen side takes nothing of it: the side stays chosen on its pick's
+/// first decode and books none, and the door still answers that the lease
+/// is on file. Behind the word a call issues the side, a dispatch that
+/// names a target books that target, and the side's release frees no
+/// count. The pick is as wide as a record keeps one, four targets, so the
+/// first index past it is the first that no record holds.
+#[test]
+fn a_dispatch_at_an_index_its_pick_holds_no_target_at_leaves_a_chosen_side_as_it_stood() {
+    let store = MemoryStore::new();
+    let keys = ["p", "d0", "d1", "d2", "d3"].map(|name| format!("http://{name}:1"));
+    let workers = keys.map(|key| ready(&store, &key));
+    let [p, d0, d1, d2, d3] = workers;
+    let leases: &dyn LeasesStore = &store;
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    leases.set_term(1);
+    let at = now + Duration::from_secs(8);
+    // A pair of four targets with its prefill sent, and the word said past
+    // them: at the first index the pick does not hold, and at a byte's
+    // last.
+    let past_its_pick = |id: u64| {
+        let id = LeaseId(id);
+        let (record, decode) = chosen_pair(id.0, p, &[d0, d1, d2, d3], now);
+        issue_pair(leases, (record, decode)).expect("the key is free");
+        assert!(leases.dispatched(gateway, id, on(Side::Prefill, 0), now));
+        let filed = leases.sides(gateway, id);
+        for index in [4, u8::MAX] {
+            assert!(leases.dispatched(gateway, id, on(Side::Decode, index), at));
+        }
+        assert_eq!(leases.sides(gateway, id), filed);
+        assert_eq!(filed.and_then(|sides| sides.decode), Some(decode));
+        assert_eq!(booked(&store, &workers), [1, 0, 0, 0, 0]);
+        id
+    };
+
+    // A call behind the word issues the side, on its own pick's first
+    // decode.
+    let id = past_its_pick(1);
+    let (_, called) = pair(id.0, p, &[d1, d0], now);
+    assert_eq!(leases.issue_decode(gateway, id, called, now), Ok(()));
+    assert_eq!(booked(&store, &workers), [1, 0, 1, 0, 0]);
+    assert!(leases.released(gateway, id, None, ReleaseReason::ClientGone));
+
+    // A dispatch behind it that names a target books that target: here
+    // the pick's last.
+    let id = past_its_pick(2);
+    assert!(leases.dispatched(gateway, id, on(Side::Decode, 3), at));
+    let sent = (
+        LeaseState::Dispatched { at: now },
+        LeaseState::Dispatched { at },
+    );
+    assert_eq!(sides(&store, id.0), Some(sent));
+    assert_eq!(booked(&store, &workers), [1, 0, 0, 0, 1]);
+    assert!(leases.released(gateway, id, None, ReleaseReason::ClientGone));
+
+    // A release of the side behind it ends the side and frees no count.
+    let id = past_its_pick(3);
+    assert!(leases.released(gateway, id, Some(Side::Decode), ReleaseReason::ClientGone));
+    let gone = LeaseState::Released(ReleaseReason::ClientGone);
+    let ended = (LeaseState::Dispatched { at: now }, gone);
+    assert_eq!(sides(&store, id.0), Some(ended));
+    assert_eq!(booked(&store, &workers), [1, 0, 0, 0, 0]);
+    assert!(leases.completed(gateway, id, &done(Side::Prefill)));
+    assert_eq!(booked(&store, &workers), [0, 0, 0, 0, 0]);
 }
 
 #[test]
