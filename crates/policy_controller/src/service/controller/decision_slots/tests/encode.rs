@@ -146,9 +146,9 @@ pub(crate) fn frame_of(
 /// a side of the pair under one id, and each item's encoder beside them. No
 /// lease stands for an encoder and none books one. A frame that states the
 /// later decode is answered the prefill side's lease alone, as a pair's
-/// frame is. A frame of the encode phase that carries no items is still
-/// answered `Busy` with no reason and counted with the sides, and its
-/// answer names no encoder.
+/// frame is. A frame of the encode phase that does not state
+/// `DecideRequest.encode` is still answered `Busy` with no reason and
+/// counted with the sides, and its answer names no encoder.
 #[tokio::test]
 async fn a_served_encode_request_is_answered_its_pairs_leases_and_each_items_encoder() {
     let mut bed = bed(Some(encode_plan()), true, (2, 8), []);

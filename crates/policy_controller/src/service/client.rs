@@ -69,8 +69,8 @@ use crate::service::{
     proto::{
         controller_frame, decide_answer, gateway_frame,
         policy_controller_client::PolicyControllerClient, Busy, Completed, ControllerFrame,
-        DecideAnswer, DecideRequest, Decision, Dispatched, GatewayFrame, Hello, LeaderInfo,
-        LeaderRequest, Released, WatchWorkersRequest, Welcome, WorkerEvent,
+        DecideAnswer, DecideRequest, Decision, Dispatched, EncodePlaced, GatewayFrame, Hello,
+        LeaderInfo, LeaderRequest, Released, WatchWorkersRequest, Welcome, WorkerEvent,
     },
 };
 
@@ -460,8 +460,10 @@ async fn dial_leader(
 pub enum Answer {
     /// The controller's decision as the wire says it: a pick, a shed or a
     /// queue, with the leases it booked and its trace. One with no outcome
-    /// is a deadline miss.
-    Decision(Decision),
+    /// is a deadline miss. Beside a pick of a request that stated encode
+    /// items (`DecideRequest.encode`) comes where its items go
+    /// (`DecideAnswer.encode`), and `None` beside every other decision.
+    Decision(Decision, Option<EncodePlaced>),
     /// The controller decided nothing, for the reason it names: the gateway
     /// decides this request itself.
     Busy(Busy),
@@ -602,7 +604,7 @@ impl Decide {
                 }
                 return match frame.answer {
                     Some(decide_answer::Answer::Decision(decision)) => {
-                        Ok(Answer::Decision(decision))
+                        Ok(Answer::Decision(decision, frame.encode))
                     }
                     Some(decide_answer::Answer::Busy(busy)) => Ok(Answer::Busy(busy)),
                     // A `Credit` was read above: what is left is no kind
@@ -1126,8 +1128,8 @@ mod tests {
         MAX_FRAME, MAX_REQUEST_ID, PRINCIPAL_ENTRY, PROTOCOL_VERSION,
     };
     use crate::service::proto::{
-        busy, Completed, Credit, Dispatched, LeaderInfo, LeaderRequest, NotLeader, Released,
-        RequestFacts,
+        busy, Completed, Credit, Dispatched, EncodePlaced, LeaderInfo, LeaderRequest, NotLeader,
+        Released, RequestFacts, Target,
     };
 
     /// The bound a case gives a wait it wants ended.
@@ -2050,7 +2052,7 @@ mod tests {
         );
         let answer = stream.answer(&mut floor, b"a", ROOM).await;
         assert!(
-            matches!(&answer, Ok(Answer::Decision(told)) if *told == Decision::default()),
+            matches!(&answer, Ok(Answer::Decision(told, None)) if *told == Decision::default()),
             "{answer:?}"
         );
         assert_eq!(
@@ -2058,6 +2060,37 @@ mod tests {
             "the credit frame added its window to the credit the stream held"
         );
         assert_eq!(floor, 1, "a frame's term raises the floor");
+    }
+
+    /// The frame of an encode request's pick says where its items go
+    /// beside the decision (`DecideAnswer.encode`): the answer hands it
+    /// as the frame carried it, the encoders in their order.
+    #[tokio::test]
+    async fn an_answer_hands_where_an_encode_requests_items_go() {
+        fn placed() -> EncodePlaced {
+            let encoder = |id| Target {
+                id,
+                ..Target::default()
+            };
+            EncodePlaced {
+                encoders: vec![encoder(9), encoder(4)],
+                one: false,
+            }
+        }
+        let (address, _serving) = deciding(|| {
+            let frame = DecideAnswer {
+                encode: Some(placed()),
+                ..told(1, b"a", decision())
+            };
+            (vec![frame], None)
+        })
+        .await;
+        let (mut stream, _stub) = stream(address, 1).await;
+        let answer = asked(&mut stream, &mut 0, b"a").await;
+        assert!(
+            matches!(&answer, Ok(Answer::Decision(_, Some(told))) if *told == placed()),
+            "{answer:?}"
+        );
     }
 
     #[tokio::test]
@@ -2438,7 +2471,7 @@ mod tests {
         for id in [b"a", b"b"] {
             let answer = client.decide(ask(id)).await;
             assert!(
-                matches!(answer, Ok(Answer::Decision(_))),
+                matches!(answer, Ok(Answer::Decision(..))),
                 "a second ask rides the stream the first one left: {answer:?}"
             );
         }
@@ -2500,7 +2533,7 @@ mod tests {
         client.session.welcome.decide_window = 3;
 
         let answer = client.decide(ask(b"a")).await;
-        assert!(matches!(answer, Ok(Answer::Decision(_))), "{answer:?}");
+        assert!(matches!(answer, Ok(Answer::Decision(..))), "{answer:?}");
         let credit = client.decide.as_ref().map(|stream| stream.credit);
         assert_eq!(
             credit,

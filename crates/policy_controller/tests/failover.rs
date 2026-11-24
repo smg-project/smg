@@ -254,11 +254,14 @@ async fn placed(gateway: &mut Client, replica: &Replica, key: u64, n: u64) -> Re
             answer => break answer.map_err(|error| format!("no answer: {error}"))?,
         }
     };
-    let Answer::Decision(Decision {
-        leases,
-        outcome: Some(Outcome::Pick(pick)),
-        ..
-    }) = &answer
+    let Answer::Decision(
+        Decision {
+            leases,
+            outcome: Some(Outcome::Pick(pick)),
+            ..
+        },
+        _,
+    ) = &answer
     else {
         return Err(format!("no pick: {answer:?}"));
     };
