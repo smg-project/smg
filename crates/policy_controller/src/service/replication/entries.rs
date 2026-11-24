@@ -209,7 +209,6 @@ pub const ENTRIES: &[(&str, &str, EntryReplication)] = &[
     ("MemoryStore", "snapshot", EntryReplication::Read),
     ("MemoryStore", "with_snapshot", EntryReplication::Read),
     ("MemoryStore", "deciding", EntryReplication::Read),
-    ("MemoryStore", "prompt_hashes", EntryReplication::Read),
     ("MemoryStore", "micros", EntryReplication::Read),
     (
         "MemoryStore",
