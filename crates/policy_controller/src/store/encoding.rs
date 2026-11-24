@@ -267,9 +267,8 @@ impl EncodeClasses {
     /// with its role or without. It takes an item's references where its
     /// offer says so.
     ///
-    /// The store writes these on a model's encode pool. A host that holds
-    /// its own lists of workers writes them for its encoders by this one
-    /// rule.
+    /// A host that holds its own lists of workers writes these for its
+    /// encoders by this one rule.
     pub fn encoder_facts<'a, C>(&self, offers: impl IntoIterator<Item = &'a EncodeOffer>) -> C
     where
         C: FromIterator<EncoderFacts>,

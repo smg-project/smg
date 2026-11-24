@@ -66,9 +66,10 @@ fn draw_in_band(
 /// band's best where it was: the band is counted once, each slot draws its
 /// row among the band's rows left as [`draw_in_band`] would (one value of
 /// `draw` while two rows are left, none for the last), and one more pass
-/// finds the rows drawn. Returns how many of `picks` it filled, in slot
-/// order: none where the band is not flat, and the slots it leaves are drawn
-/// one by one.
+/// finds the rows drawn, or none where every row is of the band: a rank is
+/// its row there. Returns how many of `picks` it filled, in slot order:
+/// none where the band is not flat, and the slots it leaves are drawn one
+/// by one.
 ///
 /// Inlined into the ranked push's two bodies, a pass's and a draw's, as it
 /// was into the one body before a draw had its own.
@@ -112,6 +113,13 @@ fn draw_flat(
         ranks[at] = rank;
         slots[at] = slot;
     }
+    // Where every row is of the band, a row's rank is its place.
+    if rows == scores.len() {
+        for (&rank, &slot) in ranks.iter().zip(&slots).take(fills) {
+            picks[slot] = rank;
+        }
+        return fills;
+    }
     let (mut next, mut seen) = (0usize, 0usize);
     for (i, &s) in scores.iter().enumerate() {
         if next == fills {
@@ -139,6 +147,14 @@ fn alone(
     at + 1 >= len || below_band(best_five[at + 1].1, best_five[at].1, band)
 }
 
+/// Whether the five best stand for a pool: no score is a NaN (one ties in
+/// every band, and the pass that keeps the five may have dropped it) and the
+/// band is a width of zero or more (under a band below zero a row lies below
+/// its own band). One read of the scores.
+fn five_stand(scores: &[f32], band: TieBand) -> bool {
+    band.0 >= 0.0 && !scores.iter().fold(false, |nan, s| nan | s.is_nan())
+}
+
 /// The rows of a ranked pick, by their places in `scores`, handed to `pick`
 /// in slot order: `slots` of them at most, and `slots` no more than a
 /// target list holds or `scores` holds. Per slot the rows within the band
@@ -163,8 +179,8 @@ fn alone(
 /// fails, where a band reaches the fifth entry (rows behind the five may
 /// stand in it) and where a band's rows differ within it, the slots left
 /// are read over the pool: a flat band is counted once and drawn by rank
-/// ([`draw_flat`]), and each slot it leaves costs the passes of
-/// [`draw_in_band`].
+/// ([`draw_flat`]), and each slot it leaves is drawn as [`draw_in_band`]
+/// draws it ([`draw_left`]).
 ///
 /// `DRAWN` is the order of a draw: the five best are read with no branch on
 /// a score ([`top_drawn`]). Inlined into the ranked push's two bodies, where
@@ -200,7 +216,7 @@ fn draw_ranked<const DRAWN: bool>(
         filled += 1;
     }
     // Whether the five stand for the pool: unread until a band asks.
-    let mut sound = false;
+    let mut sound = None;
     // Several rows share the band of the best score left, the next entry
     // among them.
     while filled < slots {
@@ -221,9 +237,10 @@ fn draw_ranked<const DRAWN: bool>(
         {
             break;
         }
-        if !sound {
-            sound = band.0 >= 0.0 && !scores.iter().fold(false, |nan, s| nan | s.is_nan());
-            if !sound {
+        if sound.is_none() {
+            let stands = five_stand(scores, band);
+            sound = Some(stands);
+            if !stands {
                 break;
             }
         }
@@ -262,14 +279,84 @@ fn draw_ranked<const DRAWN: bool>(
         }
         filled += fills;
     }
-    for slot in filled..slots {
+    if filled < slots {
+        let end = draw_left(
+            draw,
+            scores,
+            band,
+            &best_five[..len],
+            sound,
+            &mut taken[..slots],
+            filled,
+        );
+        for &row in &taken[filled..end] {
+            pick(row);
+        }
+    }
+}
+
+/// The slots from `filled` on of a ranked pick, as many as `taken` holds,
+/// each drawn as [`draw_in_band`] draws it: the same row for the same values
+/// of `draw`. `taken` holds the rows of the slots before `filled` and takes
+/// the rows drawn here. Returns the end of the slots filled.
+///
+/// In a pool the five best stand for ([`five_stand`]: `sound`, read here
+/// where no band of the five asked) the best score left is the
+/// first of `best`, the five, whose row is not taken. The rows within its
+/// band are counted over the whole pool, once while that score stands, and
+/// one pass finds the row drawn. In any other pool a slot costs the passes
+/// of [`draw_in_band`], behind that one read where the band is zero or more.
+///
+/// Out of line: the ranked push's two bodies hold none of these passes, and
+/// a pick that leaves no such slot pays nothing for them.
+#[inline(never)]
+fn draw_left(
+    draw: &mut Draw,
+    scores: &[f32],
+    band: TieBand,
+    best: &[(usize, f32)],
+    sound: Option<bool>,
+    taken: &mut [usize],
+    filled: usize,
+) -> usize {
+    let sound = sound.unwrap_or_else(|| five_stand(scores, band));
+    // The best score the band was counted under last, and its rows over
+    // the whole pool.
+    let mut counted = (f32::NAN, 0usize);
+    for slot in filled..taken.len() {
         let open = |i: usize| !taken[..slot].contains(&i);
-        let Some(row) = draw_in_band(scores, band, draw, open) else {
-            break;
+        let row = if sound {
+            // Fewer rows are taken than the five hold.
+            let Some(&(_, top)) = best.iter().find(|&&(row, _)| open(row)) else {
+                return slot;
+            };
+            if counted.0 != top {
+                let within = scores.iter().filter(|&&s| !below_band(s, top, band));
+                counted = (top, within.count());
+            }
+            // A row taken scores no less than the band's lower end, which
+            // only falls: each of them is in the count.
+            let rows = counted.1.saturating_sub(slot);
+            let back = if rows > 1 { draw.below(rows) } else { 0 };
+            let Some(at) = rows.checked_sub(1 + back) else {
+                return slot;
+            };
+            let tied = |&(i, &s): &(usize, &f32)| !below_band(s, top, band) && open(i);
+            scores
+                .iter()
+                .enumerate()
+                .filter(tied)
+                .nth(at)
+                .map(|(i, _)| i)
+        } else {
+            draw_in_band(scores, band, draw, open)
+        };
+        let Some(row) = row else {
+            return slot;
         };
         taken[slot] = row;
-        pick(row);
     }
+    taken.len()
 }
 
 /// Push the kept positions in descending score order, ties by draw

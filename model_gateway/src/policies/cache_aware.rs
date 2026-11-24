@@ -334,7 +334,7 @@ fn token_tree_totals(tree: &TokenTree) -> (usize, usize) {
 /// One eviction pass over every tree of `trees` at `max_tree_size`, with the
 /// per-model gauges and the log line of the tree sizes: what the eviction
 /// task runs on its interval.
-fn evict_trees(trees: &ModelTrees, max_tree_size: usize) {
+pub(super) fn evict_trees(trees: &ModelTrees, max_tree_size: usize) {
     // Evict string trees (HTTP)
     let mut total_chars: usize = 0;
     let mut string_hashed: usize = 0;
@@ -484,13 +484,8 @@ impl CacheAwarePolicy {
     // the event-driven index through `event_content_hashes`.
 
     /// The token tree's key for `tokens` and the length of the marker at its
-    /// head. A partitioned request keys under its namespace marker: another
-    /// namespace diverges at position 0 and can never match, and the marker
-    /// never counts toward the match ratio, so a match count read from the
-    /// tree has the marker length subtracted. The marker fills whole pages,
-    /// so the prompt's page grid is the unpartitioned one. An unpartitioned
-    /// request keys under its tokens stripped of marker material, marker
-    /// length 0.
+    /// head: the one rule ([`CacheNamespace::keyed_tokens`]) at this
+    /// policy's page.
     #[inline]
     fn keyed_tokens<'a>(
         &self,
@@ -498,16 +493,7 @@ impl CacheAwarePolicy {
         tokens: &'a [u32],
     ) -> (Cow<'a, [u32]>, usize) {
         let page_size = self.config.block_size.max(1);
-        match info.cache_namespace {
-            Some(namespace) => (
-                Cow::Owned(namespace.prefixed_tokens(tokens, page_size)),
-                CacheNamespace::token_marker_len(page_size),
-            ),
-            None => (
-                Cow::Borrowed(CacheNamespace::unpartitioned_tokens(tokens)),
-                0,
-            ),
-        }
+        CacheNamespace::keyed_tokens(info.cache_namespace, tokens, page_size)
     }
 
     /// The string tree's key for `text` and the length of the marker at its

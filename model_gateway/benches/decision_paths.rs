@@ -13,6 +13,9 @@
 //! not waited for, as at a gateway's start: a cell's first decisions,
 //! which are untimed, may run ahead of its first step. The bench keeps no
 //! cache-event monitor, so the engine is handed no index of cache events.
+//! Where the document reads the prefixes sent to each worker, as
+//! `cache_aware`'s does, the start lends the engine the gateway's token
+//! trees.
 //! The paths `object` and `records` are refused by name: they are no
 //! longer part of this bench.
 //!

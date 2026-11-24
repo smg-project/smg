@@ -77,8 +77,9 @@ use crate::{
 ///   `cache_aware` (`override_places` says why these six):
 ///   the override's own assignment and times, its two requests of a key a
 ///   worker, and the configured headers then the request's own id under
-///   `routing_key`. The rule runs under the single plan alone, so it has a
-///   document in a gateway of one router that serves single requests.
+///   `routing_key`. A rule with a cap runs under the single plan alone,
+///   so it has a document in a gateway of one router that serves single
+///   requests.
 /// - A number that means never lands as the largest its place holds: a
 ///   balance threshold past the document's width, and the sweep interval of
 ///   an index the configuration never sweeps. The gateway's own policy
@@ -95,9 +96,10 @@ use crate::{
 ///
 /// A document of two families plans one where the other has no document.
 /// Pairs are left out of a regular configuration of many routers under the
-/// manual policy, whose session rule runs under the single plan alone, and
-/// beside the encode mode. Single requests are left out of a pair gateway of
-/// one router that reaches its workers over gRPC or ZMQ: it places none.
+/// manual policy, whose pairs this module does not plan beside its single
+/// requests yet, and beside the encode mode. Single requests are left out
+/// of a pair gateway of one router that reaches its workers over gRPC or
+/// ZMQ: it places none.
 /// They are left out of a pair configuration whose main policy reads a
 /// setting no document says: a gateway of one router then refuses its token
 /// count, which its own policies place. That gateway leaves them out as well
@@ -803,11 +805,12 @@ fn presets(config: &RoutingSettings) -> Result<Planned<'_>, RoutingSettingsError
 ///
 /// `None` where the document plans one family: a regular configuration of
 /// one router, the encode mode of one router, a pair mode of one router
-/// over gRPC or ZMQ, and a regular configuration whose main policy runs on
-/// no side of a pair. The manual policy is that one: its picker leaves the
-/// placement to the binding's session rule, and a rule runs under the
-/// single plan alone. A gateway of one router in the encode mode counts
-/// tokens with no worker, so its document binds no single request.
+/// over gRPC or ZMQ, and a regular configuration under the manual policy.
+/// Its picker leaves the placement to the binding's session rule, and this
+/// module does not plan its pairs beside its single requests yet: a pair
+/// mode whose two sides are manual is planned, under the one rule. A
+/// gateway of one router in the encode mode counts tokens with no worker,
+/// so its document binds no single request.
 fn both_families(config: &RoutingSettings) -> Result<Option<Planned<'_>>, RoutingSettingsError> {
     let (mode, main) = (&config.mode, &config.policy);
     let (both, encode) = match mode {
@@ -3838,9 +3841,9 @@ mod tests {
     /// is refused, the mode's is refused by the same sentence. Where the
     /// controller's check takes the pair's own document, it takes the
     /// mode's, which binds a single request behind the pair in all but
-    /// one: under the override, beside sides of the hash ring, a main
-    /// policy of `prefix_hash` has no document for its keyed requests, and
-    /// the pair is planned alone.
+    /// two: under the override, beside sides of the hash ring or of the
+    /// manual policy, a main policy of `prefix_hash` has no document for
+    /// its keyed requests, and the pair is planned alone.
     #[test]
     fn no_pair_mode_loses_its_document_to_its_single_request() {
         let mut alone_still = Vec::new();
@@ -3867,7 +3870,10 @@ mod tests {
                 }
             }
         }
-        let ring = Some("consistent_hashing");
-        assert_eq!(alone_still, [("prefix_hash", ring, true)]);
+        let (ring, manual) = (Some("consistent_hashing"), Some("manual"));
+        assert_eq!(
+            alone_still,
+            [("prefix_hash", ring, true), ("prefix_hash", manual, true)]
+        );
     }
 }

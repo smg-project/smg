@@ -10,7 +10,8 @@
 use std::sync::Arc;
 
 use smg_policy_controller::engine::{
-    worker_id, HashSeeds, HeaderRead, PlaceRequest, Prompt, WorkerId, WorkerLists, WorkerRule,
+    worker_id, HashSeeds, HeaderRead, PlaceRequest, Prompt, TokenEntry, TokenKey, WorkerId,
+    WorkerLists, WorkerRule,
 };
 use smg_worker::identity::basic::Worker;
 
@@ -44,6 +45,18 @@ pub(crate) fn tried_ids(workers: &[Arc<dyn Worker>], tried: &[String], ids: &mut
     );
 }
 
+/// A request's entry in the token tree the gateway lends the engine: the
+/// key the classic policy matches and writes its own tree by
+/// ([`CacheNamespace::keyed_tokens`]), under the request's cache partition
+/// and at the tree's page. A request that holds no token ids names none.
+impl TokenEntry for PlacementInputs<'_> {
+    fn token_key(&self, page: usize) -> Option<TokenKey<'_>> {
+        let (tokens, marker) =
+            CacheNamespace::keyed_tokens(self.cache_namespace, self.tokens?, page);
+        Some(TokenKey { tokens, marker })
+    }
+}
+
 /// The request `inputs` and `stated` state for `model_id` over `lists`, as
 /// the engine reads it. `tried` are the workers at the engines the
 /// request's failed attempts were sent to ([`tried_ids`]).
@@ -51,6 +64,10 @@ pub(crate) fn tried_ids(workers: &[Arc<dyn Worker>], tried: &[String], ids: &mut
 /// - The prompt's text and token ids, and the two seeds of its cache
 ///   partition. The engine hashes the prompt under them, where a classic
 ///   policy keys its trees under the partition's marker.
+/// - The prompt's entry in the token tree the gateway lends the engine
+///   ([`TokenEntry`]): the inputs themselves, which name the classic
+///   policy's key. The engine asks for it where a decision reads that tree,
+///   and of no other request.
 /// - The headers, and the body's `rid` as the request states it
 ///   ([`PlacementInputs::rid`]). The engine derives the request's routing
 ///   value from the sources its document names, and takes the id's retry
@@ -77,7 +94,7 @@ pub(crate) fn tried_ids(workers: &[Arc<dyn Worker>], tried: &[String], ids: &mut
 pub(crate) fn place_request<'a>(
     model_id: &'a str,
     lists: WorkerLists<'a>,
-    inputs: PlacementInputs<'a>,
+    inputs: &'a PlacementInputs<'a>,
     tried: &'a [WorkerId],
     stated: Stated,
 ) -> PlaceRequest<'a> {
@@ -90,9 +107,7 @@ pub(crate) fn place_request<'a>(
             tokens: inputs.tokens,
             text: inputs.text,
             seeds: seeds(inputs.cache_namespace),
-            // The gateway lends the engine no token tree yet, so a prompt
-            // has no entry in one.
-            entry: None,
+            entry: Some(inputs),
         },
         headers,
         request_id: inputs.rid,
@@ -174,7 +189,7 @@ mod tests {
         let stated = Stated {
             max_output_tokens: 256,
         };
-        let request = place_request(MODEL, WorkerLists::Single(lent), inputs, &ids, stated);
+        let request = place_request(MODEL, WorkerLists::Single(lent), &inputs, &ids, stated);
 
         assert_eq!(request.model, MODEL);
         assert!(
@@ -219,10 +234,61 @@ mod tests {
             tokens: None,
             ..inputs
         };
-        let request = place_request(MODEL, WorkerLists::None, worded, &ids, Stated::nothing());
+        let request = place_request(MODEL, WorkerLists::None, &worded, &ids, Stated::nothing());
         assert!(request.prompt.tokens.is_none());
         assert_eq!(request.prompt.seeds, seeds);
         assert_eq!(request.max_output_tokens, 0, "a route that states no limit");
+    }
+
+    /// A request's entry in a lent token tree is the key the classic policy
+    /// keys its own tree by ([`CacheNamespace::keyed_tokens`]): the token
+    /// ids behind the partition's marker, which fills whole pages of the
+    /// tree asked for, and the ids alone for a request in no partition. A
+    /// request that holds no token ids names no entry.
+    ///
+    /// The classic policy keys its tree by the same function at its own
+    /// page (`model_gateway/src/policies/cache_aware.rs`, `keyed_tokens`,
+    /// read by `select_worker_with_tokens`).
+    #[test]
+    fn a_requests_entry_is_the_classic_policys_key() {
+        let tokens: Vec<u32> = (0..40).collect();
+        let partition = CachePartition {
+            cache_salt: Some("tenant"),
+            extra_key: None,
+            lora_path: None,
+        };
+        let namespace = CacheNamespace::derive(&partition).expect("a partition");
+        let key_of = |inputs: &PlacementInputs<'_>, page: usize| {
+            let request = place_request(MODEL, WorkerLists::None, inputs, &[], Stated::nothing());
+            let entry = request.prompt.entry.expect("a request states its entry");
+            let key = entry.token_key(page)?;
+            Some((key.tokens.into_owned(), key.marker))
+        };
+
+        let partitioned = PlacementInputs {
+            tokens: Some(&tokens),
+            cache_namespace: Some(namespace),
+            ..PlacementInputs::default()
+        };
+        for page in [1, 16, 64] {
+            let marker = CacheNamespace::token_marker_len(page);
+            assert_eq!(marker % page, 0, "the marker fills whole pages");
+            let keyed = namespace.prefixed_tokens(&tokens, page);
+            assert_eq!(key_of(&partitioned, page), Some((keyed, marker)));
+        }
+
+        let plain = PlacementInputs {
+            tokens: Some(&tokens),
+            ..PlacementInputs::default()
+        };
+        assert_eq!(key_of(&plain, 16), Some((tokens.clone(), 0)));
+
+        let worded = PlacementInputs {
+            text: Some("a prompt"),
+            cache_namespace: Some(namespace),
+            ..PlacementInputs::default()
+        };
+        assert_eq!(key_of(&worded, 16), None);
     }
 
     /// A first attempt that hands nothing states its model alone, as the
@@ -230,13 +296,8 @@ mod tests {
     /// for an id the request does not state.
     #[test]
     fn a_request_with_no_input_states_its_model_alone() {
-        let request = place_request(
-            MODEL,
-            WorkerLists::None,
-            PlacementInputs::default(),
-            &[],
-            Stated::nothing(),
-        );
+        let nothing = PlacementInputs::default();
+        let request = place_request(MODEL, WorkerLists::None, &nothing, &[], Stated::nothing());
         assert_eq!(request.model, MODEL);
         assert!(matches!(request.lists, WorkerLists::None));
         assert!(request.prompt.tokens.is_none() && request.prompt.text.is_none());
@@ -249,7 +310,7 @@ mod tests {
             rid_key: Some("session-7"),
             ..PlacementInputs::default()
         };
-        let request = place_request(MODEL, WorkerLists::None, keyed, &[], Stated::nothing());
+        let request = place_request(MODEL, WorkerLists::None, &keyed, &[], Stated::nothing());
         assert!(request.request_id.is_none());
     }
 
@@ -263,7 +324,7 @@ mod tests {
                 tried,
                 ..PlacementInputs::default()
             };
-            place_request(MODEL, WorkerLists::None, inputs, &[], Stated::nothing()).attempt
+            place_request(MODEL, WorkerLists::None, &inputs, &[], Stated::nothing()).attempt
         };
         assert_eq!(attempt(&engines[..3]), 3);
         assert_eq!(attempt(&engines[..255]), 255);

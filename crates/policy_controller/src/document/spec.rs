@@ -3540,7 +3540,8 @@ fn built_scorer(scorer: impl Scorer + 'static) -> Resolved<Box<dyn Scorer>> {
 
 /// The gates a profile's affinity stages share: the spill gate of its
 /// `prefix-affinity` entry, the fleet gate of its `kv-pressure` entry and
-/// the view's block size.
+/// the view's block size. Of two entries of a kind the last one's stands
+/// here; a `prefix-affinity` scorer spills by its own entry's gate.
 fn gates_of(p: &ProfileSpec, view: &ViewSpec) -> Gates {
     let mut affinity = None;
     let mut kv = None;
@@ -3591,10 +3592,21 @@ fn scorer_of(
         {
             Resolved::NotInBuild("the prefix-affinity uncached credit")
         }
-        ScoreStage::PrefixAffinity(p) => Resolved::Built(with_load_report_age_limit(
-            PrefixAffinity::new(p, gates),
-            max_age,
-        )),
+        ScoreStage::PrefixAffinity(p) => {
+            // The entry spills by the gate it writes itself. The KV gate
+            // and the block size stay the profile's.
+            let own = Gates::of(Some(p), None, None);
+            let gates = Gates {
+                rel: own.rel,
+                abs: own.abs,
+                prefix_margin_tokens: own.prefix_margin_tokens,
+                ..gates
+            };
+            Resolved::Built(with_load_report_age_limit(
+                PrefixAffinity::new(p, gates),
+                max_age,
+            ))
+        }
         ScoreStage::KvPressure(_) => built_scorer(KvPressure),
         ScoreStage::WarmupSlice(p) => Resolved::Built(with_load_report_age_limit(
             WarmupSlice::new(p, gates),
@@ -4362,6 +4374,9 @@ struct BindingContext<'a> {
     /// The profiles whose built picker leaves the placement to a sessions
     /// rule ([`Picker::by_assignment`]), by name.
     by_assignment: &'a [&'a str],
+    /// Whether the host makes the lifecycle's calls
+    /// ([`StageRegistry::makes_lifecycle_calls`]).
+    lifecycle: bool,
 }
 
 fn check_bounds<T>(bounds: &Bounds<T>, at: &At) -> Result<(), SpecError>
@@ -4898,18 +4913,32 @@ fn check_binding(
     let shadow = check_binding_rules(b, cx, &at, deferred)?;
     let mut built = resolve_plan(b, cx, shadow)?;
     // A picker that leaves the placement to a sessions rule, and a rule runs
-    // under the single plan alone: on a side of a pair or of `epd` nothing
-    // would place its requests. The built picker answers, as it answers the
-    // engine.
-    if b.plan.unwrap_or_default() != PlanName::Single {
+    // under the single plan and on the two sides of a pair: on a side of
+    // `epd` nothing would place its requests. The built picker answers, as
+    // it answers the engine.
+    if b.plan.unwrap_or_default() == PlanName::Epd {
         for (side, name) in &b.profiles {
             if cx.by_assignment.contains(&name.as_str()) {
                 deferred.note(
                     at.sub("profiles").field(side),
-                    "a picker that places by the sessions rule outside the single plan",
+                    "a picker that places by the sessions rule under the epd plan",
                 );
             }
         }
+    }
+    // The store's file of leases keeps no session verdict of a pair's
+    // decode side: that side's lease states the prefill side's
+    // (`store::DecodeSide::lease`). A controller that serves from the file
+    // would settle a decode side's claim by the prefill side's word, so a
+    // rule under the pair plan is not in its build. The catalog's word is
+    // how the validator knows such a controller today: it makes some
+    // lifecycle calls only. The change that makes the file keep that
+    // verdict takes this refusal out.
+    if b.sessions.is_some() && b.plan.unwrap_or_default() == PlanName::PdPair && !cx.lifecycle {
+        deferred.note(
+            at.field("sessions"),
+            "the session verdict a pair's decode side keeps of its own",
+        );
     }
     if let (Some(binding), Some(sessions)) = (built.as_mut(), &b.sessions) {
         let rule = session_rule(sessions, cx.index, binding.plan)?;
@@ -4923,18 +4952,32 @@ fn check_binding(
 /// The sessions rule as the engine runs it: the schema's largest cap is no
 /// cap, its largest idle time or sweep is for ever (a sweep for ever under a
 /// finite idle time is refused, as nothing would forget the keys; an idle
-/// time for ever sweeps nothing), and the rule runs under the `single` plan
-/// alone.
+/// time for ever sweeps nothing). The rule runs under the `single` plan, and
+/// on the two sides of a `pd-pair` plan where it states no cap and tells
+/// its stages: a pair's side reads no count of a key's requests in flight,
+/// and a pair's pick has one word for whether its stages hear of it, not
+/// one a side.
 fn session_rule(
     sessions: &SessionsSpec,
     index: usize,
     plan: Plan,
 ) -> Result<SessionRule, SpecError> {
-    if plan != Plan::Single {
+    let refused = match plan {
+        Plan::Single => None,
+        Plan::PdPair if sessions.inflight_cap != u16::MAX => {
+            Some(("inflight_cap", "65535 (no cap) under the pd-pair plan"))
+        }
+        Plan::PdPair if sessions.rule_placed != RulePlaced::Told => {
+            Some(("rule_placed", "`told` under the pd-pair plan"))
+        }
+        Plan::PdPair => None,
+        Plan::Epd { .. } => Some(("plan", "`single` or `pd-pair`")),
+    };
+    if let Some((name, reason)) = refused {
         return Err(SpecError::BadSessions {
             index,
-            name: "plan",
-            reason: "sessions run under the single plan",
+            name,
+            reason,
         });
     }
     let forever = |secs: u32| secs == u32::MAX;
@@ -5250,6 +5293,7 @@ impl PolicySpec {
                 live_profiles: &live_profiles,
                 scoped_stages: &scoped_stages,
                 by_assignment: &by_assignment,
+                lifecycle: catalog.makes_lifecycle_calls(),
             };
             if let Some(built) = check_binding(binding, &cx, &mut needs, &mut deferred)? {
                 if binding
@@ -6235,6 +6279,69 @@ mod tests {
         );
     }
 
+    /// A registered scorer that reads the affinity column and says nothing
+    /// of a gate of its own.
+    #[derive(Debug)]
+    struct ReadsColumn;
+
+    impl Lifecycle for ReadsColumn {}
+
+    impl Scorer for ReadsColumn {
+        fn name(&self) -> &'static str {
+            "reads-column"
+        }
+
+        fn score(
+            &self,
+            _: &RequestFacts<'_>,
+            _: &[Candidate],
+            _: &[u32],
+            out: &mut [f32],
+        ) -> TieBand {
+            out.fill(0.0);
+            TieBand::NORMALIZED
+        }
+
+        fn needs(&self) -> Needs {
+            Needs {
+                affinity: true,
+                ..Needs::default()
+            }
+        }
+    }
+
+    /// A profile weighs load against affinity where one of its scorers says
+    /// so of itself, and by nothing a stage is fed. Each of the two
+    /// affinity stages says so, behind the view's report age limit too. A
+    /// registered scorer that reads the column and says nothing leaves its
+    /// profile's need standing and its profile unmarked, and beside one of
+    /// the two it changes nothing.
+    #[test]
+    fn a_profile_weighs_by_a_scorers_own_word_and_by_no_need() {
+        let mut catalog = StageRegistry::builtin();
+        catalog
+            .scorer("reads-column", || Box::new(ReadsColumn))
+            .expect("a free name");
+        // The profile's need for the column, then its word.
+        let said = |score: &str, view: &str| {
+            let document = doc(&format!(
+                r#"{{"apiVersion":"smg.policy/v1","view":{view},"profiles":{{"p":{{"score":[{score}],"pick":"best"}}}}}}"#
+            ));
+            let (engine, ..) = document
+                .built(&catalog, &[])
+                .expect("the document validates");
+            (engine.profiles()[0].needs().affinity, engine.weighs(0))
+        };
+        for view in ["{}", r#"{"max_report_age_ms":500}"#] {
+            assert_eq!(said(r#""prefix-affinity""#, view), (true, true), "{view}");
+            assert_eq!(said(r#""warmup-slice""#, view), (true, true), "{view}");
+            assert_eq!(said(r#""reads-column""#, view), (true, false), "{view}");
+            let both = r#""reads-column","warmup-slice""#;
+            assert_eq!(said(both, view), (true, true), "{view}");
+            assert_eq!(said(r#""least-load""#, view), (false, false), "{view}");
+        }
+    }
+
     fn doc(text: &str) -> PolicySpec {
         serde_json::from_str(text).expect("a well-formed document")
     }
@@ -6647,6 +6754,9 @@ mod tests {
             // The affinity column is fed where an affinity stage reads it
             // and nowhere else: a preset without one declares no column.
             assert_eq!(engine.needs().affinity, name == "cache_aware", "{name}");
+            // The same preset alone weighs load against affinity: its two
+            // affinity stages say so of themselves, and no other stage does.
+            assert_eq!(engine.weighs(0), name == "cache_aware", "{name}");
             assert_eq!(engine.needs().headers, name == "manual", "{name}");
             assert!(!engine.needs().active_sessions, "{name}");
             assert!(!engine.needs().session_in_flight, "{name}");
@@ -8149,22 +8259,12 @@ mod tests {
     }
 
     /// The manual picker places by a sessions rule, and a rule runs under
-    /// the single plan alone: on a side of a pair or of `epd` the profile is
-    /// refused, with the side that names it. The built picker answers, so
-    /// any picker that leaves the placement to the rule is refused the same
-    /// way.
+    /// the single plan and on the two sides of a pair: on a side of `epd`
+    /// the profile is refused, with the side that names it. The built
+    /// picker answers, so any picker that leaves the placement to the rule
+    /// is refused the same way.
     #[test]
-    fn the_manual_picker_outside_the_single_plan_is_not_in_this_build() {
-        let spec = doc(
-            r#"{"apiVersion":"smg.policy/v1","profiles":{"q":{"pick":"random"},"sticky":{"pick":"manual"}},"bindings":[{"plan":"pd-pair","profiles":{"prefill":"q","decode":"sticky"}}]}"#,
-        );
-        assert_eq!(
-            not_in_build(&spec),
-            (
-                "bindings[0].profiles.decode".to_string(),
-                "a picker that places by the sessions rule outside the single plan"
-            )
-        );
+    fn the_manual_picker_under_the_epd_plan_is_not_in_this_build() {
         let epd = doc(
             r#"{"apiVersion":"smg.policy/v1","profiles":{"q":{"pick":"random"},"sticky":{"pick":"manual"}},"bindings":[{"plan":"epd","profiles":{"encode":"sticky","prefill":"q","decode":"q"}}]}"#,
         );
@@ -8172,15 +8272,113 @@ mod tests {
             not_in_build(&epd),
             (
                 "bindings[0].profiles.encode".to_string(),
-                "a picker that places by the sessions rule outside the single plan"
+                "a picker that places by the sessions rule under the epd plan"
             )
         );
-        // Under the single plan the same profile validates, here with no
-        // rule; the preset is the profile with one.
+        // On a side of a pair the same profile validates, and so it does
+        // under the single plan, here with no rule; the preset is the
+        // profile with one.
+        let pair = doc(
+            r#"{"apiVersion":"smg.policy/v1","profiles":{"q":{"pick":"random"},"sticky":{"pick":"manual"}},"bindings":[{"plan":"pd-pair","profiles":{"prefill":"q","decode":"sticky"}}]}"#,
+        );
+        assert!(pair.validate().is_ok());
         let single = doc(
             r#"{"apiVersion":"smg.policy/v1","profiles":{"sticky":{"pick":"manual"}},"bindings":[{"profile":"sticky"}]}"#,
         );
         assert!(single.validate().is_ok());
+    }
+
+    /// A host that makes some lifecycle calls only keeps one session
+    /// verdict for the two sides of a pair's lease. A sessions rule under
+    /// the pair plan is not in its build, by the rule's place. The same
+    /// rule under the single plan is, and so is a pair under no rule.
+    #[test]
+    fn a_pairs_sessions_rule_is_not_in_the_build_of_a_host_with_one_verdict_a_lease() {
+        let (whole, some) = (
+            StageRegistry::builtin(),
+            StageRegistry::builtin().without_lifecycle(),
+        );
+        let rule = r#"{"sticky_header":"x-session-id","inflight_cap":65535}"#;
+        let pair = format!(
+            r#"{{"plan":"pd-pair","profiles":{{"prefill":"q","decode":"q"}},"sessions":{rule}}}"#
+        );
+        let pair = spec_with_binding(&pair);
+        assert!(pair.validate_in(&whole, &[]).is_ok());
+        assert_eq!(
+            pair.validate_in(&some, &[]).err(),
+            Some(SpecError::NotInBuild {
+                path: "bindings[0].sessions".to_string(),
+                what: "the session verdict a pair's decode side keeps of its own",
+            })
+        );
+        let single = spec_with_binding(&format!(r#"{{"profile":"q","sessions":{rule}}}"#));
+        assert!(single.validate_in(&some, &[]).is_ok());
+        let unruled =
+            spec_with_binding(r#"{"plan":"pd-pair","profiles":{"prefill":"q","decode":"q"}}"#);
+        assert!(unruled.validate_in(&some, &[]).is_ok());
+    }
+
+    /// A sessions rule runs under the single plan, and on the two sides of
+    /// a pair where it states no cap and tells its stages. A cap under the
+    /// pair is refused by its own name, the schema's default cap as one
+    /// that is written. A rule that keeps what it places from the profile
+    /// is refused by that field's name, and a rule under `epd` by the
+    /// plan's.
+    #[test]
+    fn a_sessions_rule_runs_under_a_pair_with_no_cap_and_not_under_epd() {
+        let under = |plan: &str, profiles: &str, sessions: &str| {
+            spec_with_binding(&format!(
+                r#"{{"plan":"{plan}","profiles":{profiles},"sessions":{sessions}}}"#
+            ))
+            .validate()
+            .err()
+        };
+        let pair = r#"{"prefill":"q","decode":"q"}"#;
+        let uncapped = r#"{"sticky_header":"x-session-id","inflight_cap":65535}"#;
+        assert_eq!(under("pd-pair", pair, uncapped), None);
+        for capped in [
+            r#"{"sticky_header":"x-session-id"}"#,
+            r#"{"sticky_header":"x-session-id","inflight_cap":4}"#,
+        ] {
+            assert_eq!(
+                under("pd-pair", pair, capped),
+                Some(SpecError::BadSessions {
+                    index: 0,
+                    name: "inflight_cap",
+                    reason: "65535 (no cap) under the pd-pair plan",
+                }),
+                "{capped}"
+            );
+        }
+        let untold =
+            r#"{"sticky_header":"x-session-id","inflight_cap":65535,"rule_placed":"untold"}"#;
+        assert_eq!(
+            under("pd-pair", pair, untold),
+            Some(SpecError::BadSessions {
+                index: 0,
+                name: "rule_placed",
+                reason: "`told` under the pd-pair plan",
+            })
+        );
+        // The single plan takes each of the three.
+        for rule in [uncapped, untold, r#"{"sticky_header":"x-session-id"}"#] {
+            let single = spec_with_binding(&format!(r#"{{"profile":"q","sessions":{rule}}}"#));
+            assert_eq!(single.validate().err(), None, "{rule}");
+        }
+        let epd = r#"{"encode":"q","prefill":"q","decode":"q"}"#;
+        let refused = under("epd", epd, uncapped);
+        assert_eq!(
+            refused,
+            Some(SpecError::BadSessions {
+                index: 0,
+                name: "plan",
+                reason: "`single` or `pd-pair`",
+            })
+        );
+        assert_eq!(
+            refused.map(|err| err.to_string()),
+            Some("binding 0: sessions plan is not `single` or `pd-pair`".to_string())
+        );
     }
 
     #[test]
@@ -9488,7 +9686,8 @@ mod tests {
     /// The spill parameters of a prefix-affinity entry reach the gates the
     /// profile's stages share: under a relative threshold of four a holder
     /// three times as loaded as the mean keeps its request; under the
-    /// default (1.5, plus the margin) it spills.
+    /// default (1.5, plus the margin) it spills. Of two entries each spills
+    /// by its own gate.
     #[test]
     fn the_spill_parameters_of_the_spec_reach_the_profiles_gates() {
         use crate::engine::{
@@ -9545,6 +9744,13 @@ mod tests {
             0,
             "under the default gate the loaded holder spills"
         );
+        // Two entries, each under its own gate: the heavier one keeps the
+        // holder whichever is written first.
+        let heavy = r#"{"prefix-affinity":{"weight":4.0,"spill":{"rel":4.0}}}"#;
+        let light = r#"{"prefix-affinity":{"weight":1.0}}"#;
+        for score in [format!("{light},{heavy}"), format!("{heavy},{light}")] {
+            assert_eq!(leader(&score), 0, "{score}");
+        }
     }
 
     /// The digest names the document, not the file: the form (YAML or JSON,

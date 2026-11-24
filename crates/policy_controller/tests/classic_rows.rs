@@ -69,13 +69,10 @@
 //! The minimum-tokens module replays no row through the engine: the engine
 //! serves no rank option, and where each rank is a worker object it picks
 //! among them by its profile, which these rows do not record.
-//! A row whose form this crate does not build yet is owed: [`OWED`] names
-//! it with the validator's words and the
-//! change that builds it, and the replay fails once the row is no longer
-//! refused in those words. A sheet no module here replays is owed too:
-//! [`OWED_SHEETS`] names its policy, the rows it holds and the change that
-//! brings the module, and the suite fails once a module replays that
-//! policy.
+//! A row whose form this crate refuses to build is a defect. A sheet no
+//! module here replays is owed: [`OWED_SHEETS`] names its policy, the rows
+//! it holds and the change that brings the module, and the suite fails
+//! once a module replays that policy.
 #![expect(clippy::expect_used, reason = "a replay that stops on a broken setup")]
 
 use std::{
@@ -125,24 +122,6 @@ enum Replayed {
     Ran(Outcome),
     Refused(String),
 }
-
-/// A recorded row whose form this crate does not build yet: validation
-/// refuses it in the words `refused`, and `by` names the change that builds
-/// it. The row passes while it is refused that way and fails the day it is
-/// not, so an entry cannot outlive its debt.
-struct Owed {
-    row: &'static str,
-    refused: &'static str,
-    by: &'static str,
-}
-
-/// The owed rows. The classic manual policy keeps a key's pins apart under
-/// each role of a pair; here a sessions rule runs under the single plan.
-const OWED: &[Owed] = &[Owed {
-    row: "manual-one-key-pins-apart-under-the-prefill-and-the-decode-role",
-    refused: "sessions run under the single plan",
-    by: "sessions on the sides of a pair, which read the pair's partner lists",
-}];
 
 /// A sheet of the directory no module here replays: `policy` is its head's,
 /// `rows` how many rows it holds, and `by` names the change that brings the
@@ -206,18 +185,12 @@ fn same_outcome(recorded: &Outcome, here: &Outcome) -> bool {
     }
 }
 
-/// `None` when a row's replay is its recorded outcome, or when the row is
-/// owed and refused in its entry's words; the reason otherwise.
-fn verdict(name: &str, recorded: &Outcome, replayed: &Replayed) -> Option<String> {
-    let owed = OWED.iter().find(|owed| owed.row == name);
-    match (replayed, owed) {
-        (Replayed::Refused(why), Some(owed)) if why.contains(owed.refused) => None,
-        (Replayed::Refused(why), _) => Some(format!("refused here: {why}")),
-        (Replayed::Ran(_), Some(owed)) => Some(format!(
-            "its form is built now ({}): take the row out of OWED",
-            owed.by
-        )),
-        (Replayed::Ran(here), None) => (!same_outcome(recorded, here))
+/// `None` when a row's replay is its recorded outcome; the reason
+/// otherwise, a form this crate refuses to build among them.
+fn verdict(recorded: &Outcome, replayed: &Replayed) -> Option<String> {
+    match replayed {
+        Replayed::Refused(why) => Some(format!("refused here: {why}")),
+        Replayed::Ran(here) => (!same_outcome(recorded, here))
             .then(|| format!("recorded {recorded:?}, replayed {here:?}")),
     }
 }
@@ -263,7 +236,7 @@ fn replay_rows<R: Recorded>(text: &str, source: &str) -> (usize, Vec<String>) {
         .rows
         .iter()
         .filter_map(|row| {
-            verdict(row.name(), row.outcome(), &row.replay())
+            verdict(row.outcome(), &row.replay())
                 .map(|why| format!("{source}: {}: {why}", row.name()))
         })
         .collect();
@@ -938,24 +911,6 @@ fn an_owed_policy_with_no_sheet_is_a_defect_and_so_is_a_second_sheet() {
     );
 }
 
-/// Every owed row is in an inline subset, so every run of the suite checks
-/// that it is still refused, the copied rows' replay beside the whole one.
-#[test]
-fn every_owed_row_is_an_inline_row() {
-    // The names as written: a module's rows need not pick to be named.
-    let inline: Vec<String> = MODULES
-        .iter()
-        .flat_map(|module| {
-            let written: Written = serde_json::from_str(module.inline).expect("inline rows");
-            written.rows
-        })
-        .filter_map(|row| row.get("name").and_then(Value::as_str).map(str::to_string))
-        .collect();
-    for owed in OWED {
-        assert!(inline.iter().any(|name| name == owed.row), "{}", owed.row);
-    }
-}
-
 /// A copied row is held to the sheet's row of its name: a row the sheet
 /// lacks, another input, another number of draws, another sequence and
 /// another distribution are one defect each, and the sheet the rows were
@@ -1459,8 +1414,7 @@ fn the_report_holds_a_line_a_sheet_a_line_a_module_and_every_defect() {
         "{defects:#?}"
     );
 
-    // The first pick of a sequence row that is not owed, moved by one, in
-    // the manual sheet.
+    // The first pick of a sequence row, moved by one, in the manual sheet.
     let mut changed = sheets.clone();
     let manual_sheet = |(name, _): &&mut (String, String)| name == "manual.json";
     for (_, text) in changed.iter_mut().filter(manual_sheet) {
@@ -1469,10 +1423,6 @@ fn the_report_holds_a_line_a_sheet_a_line_a_module_and_every_defect() {
         let pick = rows
             .expect("its rows")
             .iter_mut()
-            .filter(|row| {
-                let name = row.get("name").and_then(Value::as_str);
-                OWED.iter().all(|owed| name != Some(owed.row))
-            })
             .find_map(|row| row.get_mut("outcome")?.get_mut("sequence")?.get_mut(0))
             .expect("a sequence row");
         *pick = Value::from(pick.as_u64().expect("a pick") + 1);

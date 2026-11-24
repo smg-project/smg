@@ -199,6 +199,10 @@ impl<S: ReadsLoad> Scorer for WithLoadReportAgeLimit<S> {
         self.stage.needs()
     }
 
+    fn balances_load_against_affinity(&self) -> bool {
+        self.stage.balances_load_against_affinity()
+    }
+
     fn scope(&self) -> Option<&dyn DecisionScope> {
         self.stage.scope()
     }
@@ -2626,6 +2630,9 @@ pub(crate) mod tests {
                     ..Needs::default()
                 }
             }
+            fn balances_load_against_affinity(&self) -> bool {
+                true
+            }
             fn scope(&self) -> Option<&dyn DecisionScope> {
                 Some(self.0.as_ref())
             }
@@ -2718,6 +2725,8 @@ pub(crate) mod tests {
         assert_eq!(own(wrapped.as_ref()), own(&bare));
         assert_eq!(wrapped.spread(), bare.spread());
         assert_eq!(wrapped.needs(), bare.needs());
+        assert!(bare.balances_load_against_affinity());
+        assert!(wrapped.balances_load_against_affinity());
         assert!(std::ptr::addr_eq(
             wrapped.scope().expect("the scope"),
             bare.scope().expect("the scope")

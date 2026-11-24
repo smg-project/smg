@@ -125,6 +125,19 @@ impl DecodeVerdict {
             _ => SessionVerdict::None,
         }
     }
+
+    /// What a pair keeps of its decode side's `verdict`: a claim's worker
+    /// is the decode the pair names, the first target of that side's
+    /// decision.
+    #[must_use]
+    pub(crate) const fn of(verdict: SessionVerdict) -> Self {
+        match verdict {
+            SessionVerdict::None => Self::NONE,
+            SessionVerdict::Pinned => Self::PINNED,
+            SessionVerdict::Respill => Self::RESPILL,
+            SessionVerdict::Claimed(_) => Self::CLAIMED,
+        }
+    }
 }
 
 /// The pins of one key: the preferred worker first, the failover second;
@@ -206,6 +219,8 @@ struct Entry {
     /// there), the claiming decision's dispatch elsewhere withdraws it while
     /// it stands unconfirmed, and no other dispatch elsewhere touches it; a
     /// claim whose commit never comes stands until the TTL sweeps the key.
+    /// A pair's decision moves its own claim to the prefill its pair formed
+    /// on, and withdraws it where none formed ([`SessionTable::move_claim`]).
     claim: WorkerId,
     /// The id the claim's lease names: the claimed worker's id when the
     /// claim was made, read while a claim stands. It differs from `claim`
@@ -562,6 +577,8 @@ impl SessionTable {
     /// claim is a pin made before a commit, and it is marked as such:
     /// any dispatch to it confirms it, the claiming decision's own dispatch
     /// elsewhere withdraws it (`dispatched`), the TTL sweeps it otherwise.
+    /// A pair's decision moves its own claim before its dispatch
+    /// ([`Self::move_claim`]).
     /// Always inlined: the keyed decision has two forms, and a second caller
     /// would otherwise move this out of line under the first.
     #[inline(always)]
@@ -617,6 +634,48 @@ impl SessionTable {
             };
             entry.front(target);
         }
+    }
+
+    /// The decision that claimed `claimed` for `key` does not go there: a
+    /// pair's decision formed its pair on another prefill, `target`, or on
+    /// none (`WorkerId(0)`). The claim is withdrawn where it still stands
+    /// unconfirmed, as the claiming decision's commit elsewhere withdraws
+    /// it ([`Self::dispatched`]), and `target` is claimed in its place by
+    /// the key's recovery: the key's next decision follows a worker the
+    /// request goes to, before any dispatch. The answer is the verdict the
+    /// decision states of `target`: its claim where `target` is the claim
+    /// of record, else a pin's. A claim a dispatch confirmed is a pin the
+    /// key was served on: it stands, and nothing is written. Another
+    /// decision's claim is not this one's to move. A `target` that is a pin
+    /// of the key already is no claim either. The claim names the id its
+    /// decision read, as [`Self::claim`]'s does: neither asks the table's
+    /// renames.
+    pub(crate) fn move_claim(
+        &self,
+        key: Session,
+        claimed: WorkerId,
+        target: WorkerId,
+    ) -> SessionVerdict {
+        let key = key.get();
+        let mut shard = self.shard(key).lock();
+        let Some(entry) = shard.get_mut(&key) else {
+            return SessionVerdict::Pinned;
+        };
+        if entry.claim == WorkerId(0) || entry.leased != claimed {
+            return SessionVerdict::Pinned;
+        }
+        let pin = std::mem::replace(&mut entry.claim, WorkerId(0));
+        entry.withdraw(pin);
+        if target == WorkerId(0) || entry.pins.contains(&target) {
+            return SessionVerdict::Pinned;
+        }
+        match entry.recovery {
+            Recovery::Latest => entry.front(target),
+            Recovery::Original => entry.append(target),
+        }
+        entry.claim = target;
+        entry.leased = target;
+        SessionVerdict::Claimed(target)
     }
 
     /// The commit dispatched a decision for `key` to `target` under the
@@ -1006,12 +1065,48 @@ impl SessionTable {
     /// nothing written: a key the table never read, or one past its end,
     /// has none, as at [`Self::lookup`]. The key's idle time is not
     /// renewed and no sweep runs: a decision that goes on to follow one of
-    /// these pins renews it by that read.
+    /// these pins reads them by [`Self::pins_renewed`].
     pub(crate) fn pins_at(&self, key: Session, now_micros: u64) -> SessionPins {
         let key = key.get();
         match self.shard(key).lock().get(&key) {
             Some(entry) if entry.expires_at_micros > now_micros => entry.pins,
             _ => [WorkerId(0); 2],
+        }
+    }
+
+    /// The pins of `key` for a decision at `now_micros` that follows one of
+    /// them, under one lock: a key that holds a pin and is not past its end
+    /// is touched as at [`Self::lookup`]. Of any other key nothing is
+    /// written, as at [`Self::pins_at`]: it reads as no pins and no entry is
+    /// made for it. No sweep runs here: the decision that goes on to follow
+    /// one of these pins runs the one this read owes ([`Self::sweep_owed`]).
+    pub(crate) fn pins_renewed(
+        &self,
+        key: Session,
+        now_micros: u64,
+        rule: &SessionRule,
+    ) -> SessionPins {
+        let key = key.get();
+        match self.shard(key).lock().get_mut(&key) {
+            Some(entry)
+                if entry.expires_at_micros > now_micros && entry.pins != [WorkerId(0); 2] =>
+            {
+                entry.touch(now_micros, rule);
+                entry.pins
+            }
+            _ => [WorkerId(0); 2],
+        }
+    }
+
+    /// The sweep a renewing read owes where no pass of the table's host
+    /// sweeps it ([`Self::lookup`]), for a decision that follows a pin
+    /// [`Self::pins_renewed`] read: it runs behind that read, with no
+    /// shard's lock held, and a request that follows no pin runs none.
+    /// Always inlined: the check is one compare on a followed pin's path.
+    #[inline(always)]
+    pub(crate) fn sweep_owed(&self, now_micros: u64) {
+        if !self.swept_by_pass.load(Ordering::Relaxed) {
+            self.sweep_if_due(now_micros);
         }
     }
 
@@ -1975,6 +2070,75 @@ mod tests {
             Some([WorkerId(1), WorkerId(3)]),
             "a commit elsewhere by another request confirms nothing"
         );
+    }
+
+    /// A decision that does not go to the worker it claimed moves the
+    /// claim while it stands unconfirmed: the worker claimed leaves the
+    /// pins, and the worker the request goes to is the claim in its place,
+    /// by the key's recovery. With no worker to go to, the claim is
+    /// withdrawn alone and the key is claimed afresh. A claim a dispatch
+    /// confirmed stands, and a worker that is a pin already takes no claim.
+    #[test]
+    fn a_claim_moves_to_the_worker_its_decision_goes_to_while_it_stands_unconfirmed() {
+        let (id, pinned) = (WorkerId, SessionVerdict::Pinned);
+        let cases = [
+            (&RULE, [2, 1], [3, 1], [4, 1]),
+            (&ORIGINAL, [1, 2], [1, 3], [1, 4]),
+        ];
+        for (rule, claimed, moved, committed) in cases {
+            // The owner is down: the decision claims 2, then goes to 3.
+            let table = SessionTable::new(RULE.sweep_micros);
+            table.lookup(s(1), 10, rule);
+            table.dispatched(s(1), pinned, id(1));
+            let seen = table.lookup(s(1), 20, rule);
+            assert_eq!(table.claim(s(1), seen, id(2)), Claim::Made(id(2)));
+            // A decision whose claim is not the one of record moves none.
+            assert_eq!(table.move_claim(s(1), id(9), id(3)), pinned);
+            assert_eq!(table.pins(s(1)), Some(claimed.map(id)));
+            let moved_to = SessionVerdict::Claimed(id(3));
+            assert_eq!(table.move_claim(s(1), id(2), id(3)), moved_to);
+            assert_eq!(table.pins(s(1)), Some(moved.map(id)));
+            // The worker it moved to is the claim: the decision's commit
+            // elsewhere withdraws that one.
+            table.dispatched(s(1), SessionVerdict::Claimed(id(3)), id(4));
+            assert_eq!(table.pins(s(1)), Some(committed.map(id)));
+            // No worker to go to: the claim is withdrawn alone, and the
+            // key's next decision claims afresh.
+            let seen = table.lookup(s(2), 10, rule);
+            assert_eq!(table.claim(s(2), seen, id(2)), Claim::Made(id(2)));
+            assert_eq!(table.move_claim(s(2), id(2), id(0)), pinned);
+            assert_eq!(table.pins(s(2)), Some([id(0); 2]));
+            assert_eq!(table.claim(s(2), seen, id(5)), Claim::Made(id(5)));
+            // Another request was served on the claim: it stands.
+            table.dispatched(s(2), pinned, id(5));
+            assert_eq!(table.move_claim(s(2), id(5), id(6)), pinned);
+            assert_eq!(table.pins(s(2)), Some([id(5), id(0)]));
+            // A key the table does not hold is not written.
+            assert_eq!(table.move_claim(s(3), id(1), id(2)), pinned);
+            assert_eq!(table.len(), 2);
+        }
+        // Another request's commit made 3 a pin behind the claim on 2: the
+        // claim leaves, and 3 stands as the pin it is, marked no claim. A
+        // claimant's commit elsewhere then withdraws nothing.
+        let table = SessionTable::new(RULE.sweep_micros);
+        let seen = table.lookup(s(1), 10, &RULE);
+        assert_eq!(table.claim(s(1), seen, id(2)), Claim::Made(id(2)));
+        table.dispatched(s(1), pinned, id(3));
+        assert_eq!(table.pins(s(1)), Some([id(3), id(2)]));
+        assert_eq!(table.move_claim(s(1), id(2), id(3)), pinned);
+        assert_eq!(table.pins(s(1)), Some([id(3), id(0)]));
+        table.dispatched(s(1), SessionVerdict::Claimed(id(3)), id(9));
+        assert_eq!(table.pins(s(1)), Some([id(9), id(3)]));
+        // Two other requests' commits pushed the claim on 2 out of the
+        // pins: withdrawn to no worker, it leaves them as they stand.
+        let table = SessionTable::new(RULE.sweep_micros);
+        let seen = table.lookup(s(1), 10, &ORIGINAL);
+        assert_eq!(table.claim(s(1), seen, id(2)), Claim::Made(id(2)));
+        table.dispatched(s(1), pinned, id(3));
+        table.dispatched(s(1), pinned, id(4));
+        assert_eq!(table.pins(s(1)), Some([id(3), id(4)]));
+        assert_eq!(table.move_claim(s(1), id(2), id(0)), pinned);
+        assert_eq!(table.pins(s(1)), Some([id(3), id(4)]));
     }
 
     #[test]

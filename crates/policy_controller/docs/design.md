@@ -362,8 +362,8 @@ one of them.
 ### 3.5 The stage interfaces
 
 A filter, a scorer and a picker are three traits (`engine/framework.rs`). Each has two required
-methods, shown here. The others have default bodies and are not shown: most are switches and
-short paths that the built-in stages use.
+methods, shown here. The others have default bodies, and all but one are not shown: most are
+switches and short paths that the built-in stages use.
 
 ```rust
 pub trait Filter {
@@ -377,6 +377,8 @@ pub trait Scorer: Lifecycle {
     // write one score for each surviving worker
     fn score(&self, facts: &RequestFacts<'_>, candidates: &[Candidate], kept: &[u32],
              out: &mut [f32]) -> TieBand;
+    // a gate of the scorer's own weighs load against cache affinity
+    fn balances_load_against_affinity(&self) -> bool { false }
 }
 
 pub trait Picker: Lifecycle {
@@ -402,6 +404,21 @@ The built-in stages:
 
 A program that embeds the crate can add stages of its own under new names
 (`StageRegistry::filter`, `scorer`, `picker`) and validate documents against that table.
+
+**[built]** One default method is shown, `balances_load_against_affinity`: a scorer of a program's
+own that weighs load against affinity must answer it, because a pair's lift rests on it. A scorer
+that answers yes places a request by who holds the prompt's beginning, and a gate of its own bounds
+where it sends the request by the workers' load: `prefix-affinity` moves a request off that worker
+once it is loaded well past the others. Under a binding that steers, a pair's prefill profile with
+such a scorer is decided with the overload filter lifted, so a prompt stays on the prefill that
+holds its beginning while that worker is over its thresholds. The lift rests on that answer alone,
+as classic's rests on its policy's answer of the same name:
+`LoadBalancingPolicy::balances_load_against_affinity` (`model_gateway/src/policies/mod.rs`), read
+where `select_pair` places a pair (`model_gateway/src/routers/common/placement.rs`).
+`prefix-affinity` and `warmup-slice` answer yes, by their spill gate. What a stage reads says
+nothing of a gate: a stage that reads the cache records and answers no keeps the filter for its
+profile, a scorer a program adds answers for itself, and a plugin's stage answers no. A filter or a
+picker has no such word: one that reads the cache records keeps the filter for its profile.
 
 **[built]** Such a stage keeps building when the crate grows. For each type below, the table says
 whether it is marked non-exhaustive and how code writes it:
@@ -637,7 +654,9 @@ request goes to.
   cache events reads the index and the hash table together, as today.
 - **[built]** A prefill-decode pair decided over worker lists reads the hash table and the
   host's index of cache events for each side, by the side's own list, and writes each side's
-  pick into the hash table. An encode request's first decision reads neither yet. Classic keeps
+  pick into the hash table, where the index does not speak for the picked worker. An encode
+  request's first decision does the same for its pair. It writes neither side where its caller
+  cannot send to an encoder the decision placed (`RequestMaker::sends_to_encoder`). Classic keeps
   trees for each side. **[planned]** The engine reads the host's trees for each side.
 
 A decision of the engine publishes no insert to other gateways.
@@ -650,14 +669,14 @@ the gateway the gateway keeps them and lends them to the engine. On main it lend
 (section 9.2). Until it does, a request under the engine reads the hash table, and the index
 beside it where its model has one. A prefill-decode pair is lent no tree: each of its sides
 reads the hash table, and the index where its model has one, by the side's own list. An encode
-request's first decision reads neither yet. A controller is to
+request's pair reads them the same way. A controller is to
 keep trees of its own **[planned]**, and section 11 says what its contract must hold for that. On
 main a controller's engine reads its hash table alone (section 10.1).
 
 One change was made outside the policy crate first **[built]**: classic's trees moved out of
 its policy object into one store type of the kv-index crate (`ModelTrees`), with no behaviour
-change. Classic's policy object keeps its trees in that type. The engine's host keeps the trees
-it lends in the same type **[planned]**.
+change. Classic's policy object keeps its trees in that type. The gateway keeps the token trees
+it lends the engine in the same type **[built]**.
 
 ### 4.6 Who writes and who reads
 
@@ -1144,7 +1163,11 @@ decide ──> lease issued ──> Dispatched ──> Completed
 The kept engine stores nothing about a lease. The host keeps what it was handed and hands it back
 with each event (`DecisionEngine::say`). The crate has a guard for that, `DecisionGuard`
 (`tracking/decision_guard.rs`): it holds one decision's lease, has `dispatched`, `completed` and
-`released`, and releases at its drop.
+`released`, and releases at its drop. A controller keeps its leases in a file. It lends a single
+request's lease back from that file in the guard's form, so one rule tells a single request's
+events under either host (`lease_events::single`). The host says who hears: behind a new
+document the engine that issued the lease is gone, and the standing one counts the send. A pair's
+events on a controller are told by the controller's own code.
 
 What an event does:
 
@@ -1304,6 +1327,7 @@ pub trait RequestMaker {
     fn loads(&self) -> Option<&Arc<LoadSnapshot>>;    // a request's snapshot of the host's own; without one the engine reads its own
     fn token_key(&self, page: usize) -> Option<TokenKey<'_>>; // the prompt's entry in the host's token tree, where the host lends one
     fn sends_to(&self, target: &Target) -> bool;      // whether its caller sends to this target of a pick: the prompt is stored for the first such
+    fn sends_to_encoder(&self, position: u32) -> bool; // whether its caller sends to this encoder of an encode request's pick: the prompt is stored for no target behind one it does not
 }
 
 pub enum WorkerLists<'a> {
@@ -1763,9 +1787,11 @@ request ──> route (HTTP or gRPC, any family)
 
 - **Start.** One function builds the engine from the routing settings or a supplied document and
   hands it the worker registry, the load monitor's channel and the cache-event monitor. With
-  the engine on, no classic policy object is built. So the start function owns the trees the
-  engine is lent **[planned]**: it keeps them, runs their size pass on a timer and tells them a
-  worker that left.
+  the engine on, no classic policy object is built. So the start makes the token trees the
+  engine is lent **[built]**, where the document reads the prefixes sent to each worker. The
+  policy registry keeps them, classic's size pass runs over them on its timer, and a worker that
+  left is taken out of them. The trees take the document's numbers: its block size is a tree's
+  page, and a model's `index` entry states the size its tree is held to and how often.
 
   The start makes the policy crate's one start call as the last step of the context's build. The document is checked first against the table of stages the gateway's host hands the start, or the stock table where it hands none, and a refused document ends the start before the gateway listens. The engine's task follows the registry's events and tells the document's stages a worker that joined and a worker that was removed. With the engine on, the gateway builds its policy registry with no classic policy object: a stand-in that places nothing stands in its default and encode slots, and a worker's registration and a router's build add no policy.
 
@@ -2170,7 +2196,7 @@ On main: 19 sheets, 489 lines.
 | replayed and passing | 18 | 484 |
 | recorded, replayed by nothing (`constraint_decider`) | 1 | 5 |
 | replayed through the engine that stays (`PolicyEngine`) | **4**, and 31 lines of `prefix_hash` | **65** |
-| replayed lines held to an answer of the crate's own, not classic's | | 8 |
+| replayed lines held to an answer of the crate's own, not classic's | | 7 |
 
 A replay of all fifteen decision sheets through `PolicyEngine` over worker objects is in work and not on main yet: on main the three hard-demand sheets (`retry_wire`, `media_refs`, `context_window`; 26 lines), `sticky_rank` (8 lines) and 31 lines of `prefix_hash` replay through it. Measured
 with it locally on 2026-11-22, on main (`096c0f5ea`): of the 408 lines that recorded a decision
@@ -2199,7 +2225,10 @@ Five things follow, and they are the first work of section 16.
    key folds whole blocks). One of them turns in the crate on a ring its caller lends
    (decision 3). The other measures which tokens are in a prompt's head, which is then the
    caller's recipe: it is proven at stage 3, by a gateway test of classic's own function. The
-   1 of `manual` cannot be asked (validation refuses a sessions rule under a pair plan). Each
+   1 of `manual` replays as classic recorded now: a sessions rule with no cap runs on the two
+   sides of a pair, each side by its own session, where the host decides in process. A served
+   controller refuses the rule under a pair: its file of leases keeps one session verdict for
+   a pair's two sides. Each
    of the 23 is made equal to classic or named as an accepted difference: two in stage 1, one
    at stage 3, the 20 in stage 4.
 3. **Five policies have no sheet over a healthy pool**: `round_robin`, `random`, `passthrough`,

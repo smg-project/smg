@@ -1262,6 +1262,69 @@ pub(crate) mod tests {
         assert_eq!(sends(&first, served), 0, "the generation that left");
     }
 
+    /// The `random` picker, whose call at a dispatch panics.
+    #[derive(Debug)]
+    struct Bursts;
+
+    impl Lifecycle for Bursts {
+        fn on_dispatched(&self, lease: &Lease, _: &Target, _: Side, _: u32) {
+            assert_eq!(lease.id.0, 0, "the stage's call panics");
+        }
+    }
+
+    impl Picker for Bursts {
+        fn name(&self) -> &'static str {
+            "bursts"
+        }
+
+        fn pick(
+            &self,
+            facts: &RequestFacts<'_>,
+            candidates: &[Candidate],
+            kept: &[u32],
+            scores: &[f32],
+            band: TieBand,
+            out: &mut Targets,
+        ) {
+            Random.pick(facts, candidates, kept, scores, band, out);
+        }
+    }
+
+    /// A single's dispatch is told in one order: the count of sends, the
+    /// session table, then the stages. A stage whose call panics at the
+    /// dispatch is held and counted as a fault, and the send is counted and
+    /// the session's pin moved all the same.
+    #[test]
+    fn a_stage_that_panics_at_a_dispatch_leaves_the_send_counted_and_the_pin_moved() {
+        let store = MemoryStore::new();
+        let t0 = Instant::now();
+        let served = ready(&store, "a", COUNTED, Role::Single, WireModes::HTTP);
+        let mut catalog = StageRegistry::builtin();
+        catalog
+            .picker("bursts", || Box::new(Bursts))
+            .expect("a free name");
+        let mut document = PolicySpec::preset("least_load").expect("a preset of this build");
+        document.generation = 1;
+        let profile = document.profiles.get_mut("least_load");
+        profile.expect("the preset's profile").pick = "bursts".into();
+        let digest = document.digest().expect("the document digests");
+        let spec = AppliedSpec::validate_digested(&document, digest, &catalog, &[])
+            .expect("the catalog holds the stage");
+        store.apply(spec).expect("a later generation");
+        let count = store.deciding(|world| Arc::clone(&world.spec().engine().sent_credits[0]));
+        let mut record = lease(A, 1, t0);
+        record.lease.generation = 1;
+        record.lease.session = KEY;
+        record.lease.session_verdict = SessionVerdict::Claimed(served);
+        record.target = served;
+        store.issue(record).expect("a lease");
+        dispatched(&store, &open(&store, A), &a_dispatched(1), t0).expect("the frame reads");
+        assert_eq!(store.lifecycle_faults(), 1, "the stage's call panicked");
+        assert_eq!(sends(&count, served), 1);
+        let pins = store.with_snapshot(|world| world.spec().engine().sessions().pins(KEY));
+        assert_eq!(pins.map(|pins| pins[0]), Some(served));
+    }
+
     /// A dispatch that comes late enters no rank of a worker that left: a
     /// count asks the worker objects the store's word holds whether the
     /// rank is listed, and the removal took the worker's object out

@@ -337,6 +337,12 @@ fn a_rings_walk_over_rows_read_one_at_a_time_is_the_whole_decisions_answer() {
 /// alike: its pins and the instant it is forgotten. Rows go down and come
 /// back, a whole pool goes down for a while, and the clock runs past the
 /// rule's idle time. A pin is followed by reading one row or two.
+///
+/// A key asked while every filter refuses its pool is renewed by the pin's
+/// read alone
+/// ([`a_pinned_keys_idle_time_starts_over_where_every_filter_refuses_its_pool`]):
+/// the two tables then part in the instant that key is forgotten, until it
+/// is asked again. Every key is, behind the outage.
 fn pins_followed(whole: &Engine, keyed: &Engine, capped: bool) -> (u32, u32) {
     let mut rows = pool(16, 31, 0, 0);
     let mut draw = Draw::new(33);
@@ -826,4 +832,52 @@ fn a_pin_under_a_scope_or_a_shadow_is_left_to_the_whole_decision() {
         assert_eq!(followed.is_none(), left, "{scoped} {shadow:?}");
         assert_eq!(listed.read(), u32::from(!left), "{scoped} {shadow:?}");
     }
+}
+
+/// A key that holds a pin is renewed by the one read that follows it, also
+/// where every filter refuses its pool: no pin is followed then, and the
+/// whole decision the request is left to writes nothing more.
+#[test]
+fn a_pinned_keys_idle_time_starts_over_where_every_filter_refuses_its_pool() {
+    let rows = pool(16, 41, 0, 0);
+    let cx = Constraints::default();
+    let keyed = RequestFacts {
+        model: "m",
+        session_key: Identity::hashed(7),
+        now_micros: 5,
+        ..RequestFacts::default()
+    };
+    let manual = stock("manual");
+    let engine = manual.engine();
+    let placed = engine.decide(&keyed, &facts_of(&rows), &rows, &cx, &mut Scratch::new());
+    let pick = placed.pick().expect("a pick");
+    let lease = Lease {
+        session: keyed.session(),
+        session_verdict: pick.session_verdict,
+        issued_micros: 5,
+        ..Lease::default()
+    };
+    engine.on_dispatched(&lease, &pick.targets.as_slice()[0], Side::Single, 0);
+    let made = engine.sessions().held(keyed.session()).expect("a pin");
+    // An hour on, every row is down.
+    let down: Vec<Candidate> = rows
+        .iter()
+        .map(|row| Candidate {
+            health: Health {
+                healthy: false,
+                ..row.health
+            },
+            ..*row
+        })
+        .collect();
+    let later = RequestFacts {
+        now_micros: 3_600_000_000,
+        ..keyed
+    };
+    assert!(engine
+        .decide_keyed(&later, &Listed::of(&down), &cx)
+        .is_none());
+    let renewed = engine.sessions().held(keyed.session()).expect("a pin");
+    assert_eq!(renewed.0, made.0, "the pins stand");
+    assert_ne!(renewed.1, made.1, "the key's idle time starts over");
 }

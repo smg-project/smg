@@ -4,10 +4,7 @@
 //! reads the places stated beside its own list, and no place of the other.
 
 use super::*;
-use crate::{
-    document::spec::SpecError,
-    engine::{decision::LiftedVeto, framework::DecisionScope},
-};
+use crate::engine::{decision::LiftedVeto, framework::DecisionScope};
 
 /// The places a host's vetoes mask and hold, for the prefill list and then
 /// for the decode list: what [`Host::decide_vetoed`] takes.
@@ -63,25 +60,17 @@ fn each_sides_vetoes_mask_that_sides_list_alone() {
 /// masks is in no target of a pick, on either side, with a hold on it or
 /// without. Four prefills and four decodes. The two places masked are
 /// places the preset names with no veto: on each side, the lowest place
-/// among the targets of its first 32 turns. The one preset left out places
-/// by the sessions rule, which no side of a pair runs: its pair document
-/// is refused by that name.
+/// among the targets of its first 32 turns. No preset is left out: the one
+/// whose picker leaves the placement to the sessions rule places each side
+/// by the rule's assignment.
 #[test]
 fn a_masked_place_is_in_no_pick_under_any_pair_preset() {
     use crate::document::spec::PRESETS;
     let free = Constraints::default();
-    let mut refused = Vec::new();
     for name in PRESETS {
         let mut document = PolicySpec::pair_presets(name, name).expect("presets");
         document.generation = 3;
-        let spec = match AppliedSpec::validate(&document) {
-            Ok(spec) => spec,
-            Err(SpecError::NotInBuild { what, .. }) => {
-                refused.push((name, what));
-                continue;
-            }
-            Err(other) => panic!("{name}: {other}"),
-        };
+        let spec = AppliedSpec::validate(&document).unwrap_or_else(|err| panic!("{name}: {err}"));
         let host = Host::under((spec, Arc::default()), 4, 4);
         // Each side's places that a target of 32 turns names under `vetoes`.
         let named_under = |vetoes: Vetoes<'_>| {
@@ -108,8 +97,6 @@ fn a_masked_place_is_in_no_pick_under_any_pair_preset() {
             assert!(!masked.1[decode], "{name}, held {held}: the decode");
         }
     }
-    let by_sessions = "a picker that places by the sessions rule outside the single plan";
-    assert_eq!(refused, [("manual", by_sessions)]);
 }
 
 /// A side's mask is read among that side's places. A prefill list held to

@@ -433,8 +433,8 @@ fails once the reason no longer holds.
   is a refusal's reason: where the only ready prefill's partners are all over their thresholds beside a free decode
   of another transport, the gateway answers unavailable and the pair's decision names the overload veto. The other
   39 rows replay, the four of a prefill policy that weighs load against cache affinity itself (`cache_aware`)
-  among them: the gateway lifts the overload veto for such a policy and lets it place, and a prefill profile that
-  reads affinity runs with that veto lifted under a binding that steers.
+  among them: the gateway lifts the overload veto for such a policy and lets it place, and a prefill profile one of
+  whose scorers says the same of itself runs with that veto lifted under a binding that steers.
 - `pair_bound.json`: none. All 8 rows replay.
 - `pair_runtime.json`: none. All 10 rows replay.
 - `overload.json`: none where the worker is one object for all its ranks, as the recording gateway held it. All 25
@@ -453,9 +453,10 @@ fails once the reason no longer holds.
   (`the-usage-vetoes-at-its-mean-and-above-over-two-ranks`). A rank's object states the address, the engine's
   address, the rank and the width that the worker crate's builder gives a rank worker, which a gateway that
   registers each data-parallel rank as a worker builds its workers with.
-- `manual.json`: one row is owed, `manual-one-key-pins-apart-under-the-prefill-and-the-decode-role`. The gateway
-  keeps a key's pins apart under each role of a prefill and decode pair. The crate refuses a sessions rule under a
-  pair plan today, so it cannot build the row; the other 13 rows replay.
+- `manual.json`: all 14 rows replay. One row asks a pair a role at a time,
+  `manual-one-key-pins-apart-under-the-prefill-and-the-decode-role`, and the crate decides a pair once: the replay
+  joins a prefill step and the decode step behind it into one decision, whose prefill side reads the pool as it
+  stood at the prefill step.
 - `prefix_hash.json`: two rows are decided apart, each by the key this crate reads, and the replay names both with
   the outcome the crate gives. The gateway hashes a prompt's own tokens. A key here is the hash of a request's last
   whole block of the view's block size, made by the host that feeds the request. So the tokens past that block are

@@ -480,8 +480,9 @@ message Trace {
   // The soft veto lifted to make this pick; none unless that veto left the
   // pool nobody, or left a session key handed on at its sessions rule's
   // in-flight cap nobody. The all-vetoed rule's pick sets it,
-  // and so does the pick of a session key kept on its worker. A host counts
-  // both from this field.
+  // and so does the pick of a session key kept on its worker, and a pair
+  // placed by a prefill profile that weighs load against affinity. A host
+  // counts them all from this field.
   LiftedVeto lifted = 13;
   // True when the decision was made ahead of every profile, where no binding
   // resolved one. In that case profile is 0.
