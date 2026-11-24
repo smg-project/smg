@@ -159,7 +159,7 @@ pub(crate) struct Shared {
     /// The election's last sight of the lease.
     pub(crate) standing: watch::Receiver<ElectionObservation>,
     /// The controller's store: what the calls feed and read, and the run
-    /// loop's drivers with them.
+    /// loop's tasks with them.
     pub(crate) store: Arc<MemoryStore>,
     /// Who is present: the gateways a `Session` welcomed, over this fence
     /// and this store.

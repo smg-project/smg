@@ -1,7 +1,7 @@
 //! The end-to-end case, the harness first: a controller on ephemeral ports,
 //! a fleet of mock engines and the generated client, in one process. The
 //! fleet registers, an engine of one rank through the control scope's call;
-//! the controller's own load driver polls it; each engine is asked its
+//! the controller's own load monitor polls it; each engine is asked its
 //! health and what it answered is written, by the controller's own prober
 //! where its build has one and by a probe turn of the case elsewhere; and
 //! the pool is read back as the store holds it: every rank a row, healthy
@@ -131,7 +131,7 @@ use openai_protocol::worker::RuntimeType;
 use prost::Message as _;
 use smg_policy_controller::{
     document::{BindingSpec, Match, PolicySpec, SpecError},
-    engine::{Role, SignalSource, WireModes, WorkerId},
+    engine::{Role, WireModes, WorkerId},
     policies::{bucket, power_of_two::PowerOfTwoMetric},
     service::{
         client::{self, blocking, Answer, Client, DecisionUnavailable, Link},
@@ -359,7 +359,7 @@ async fn named_again(harness: &mut Harness, run: &str, engine: usize) -> Result<
 
 /// Waits until the controller's load monitor has polled every row of each
 /// of `engines` since `since`: a decision is given the monitor's snapshot,
-/// where the pool's rows are the store's.
+/// and so is the pool's reader.
 async fn monitored(
     harness: &Harness,
     engines: &[usize],
@@ -741,20 +741,15 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
         );
 
         // Feed. The probe's verdict makes a rank ready and the controller's
-        // own driver then polls its engine.
+        // own load monitor then polls its engine.
         harness.feed();
         let ready = within(
-            "every rank is healthy and holds a polled load row",
+            "every rank is healthy and holds a load report",
             PROBE_INTERVAL + POLL_INTERVAL + ROOM,
             || {
-                harness.pool(MODEL, Role::Single).is_ok_and(|pool| {
-                    pool.iter().all(|row| {
-                        row.healthy
-                            && row
-                                .load
-                                .is_some_and(|load| load.source == SignalSource::Poll)
-                    })
-                })
+                harness
+                    .pool(MODEL, Role::Single)
+                    .is_ok_and(|pool| pool.iter().all(|row| row.healthy && row.load.is_some()))
             },
         )
         .await
@@ -884,9 +879,9 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
         .await
         .expect("the resident tokens follow");
 
-        // A decision is given the load monitor's snapshot, where the pool
-        // above is the store's table. The monitor polls each engine on its
-        // own clock: it has polled both pools since the table read so.
+        // A decision is given the load monitor's snapshot, which the pool
+        // above read. The monitor polls each engine on its own clock: it
+        // has polled both pools once more since the pool read so.
         let told = Instant::now();
         monitored(&harness, &engines, told)
             .await
@@ -2433,7 +2428,7 @@ async fn a_pair_plan_answers_its_prefill_for_both_sides_by_the_loads_their_engin
         let sides = [(Role::Prefill, held_prefill), (Role::Decode, held_decode)];
         harness.feed();
         within(
-            "each side's rows are healthy and hold a polled load row",
+            "each side's rows are healthy and hold a load report",
             PROBE_INTERVAL + POLL_INTERVAL + ROOM,
             || {
                 sides.iter().all(|&(side, _)| {
@@ -3556,13 +3551,13 @@ mod hosted {
 
 /// A pair's case in this harness: a standby takes the fleet when its leader
 /// stops. Two controllers stand over one lease. The fleet registers at the
-/// leader, and the standby holds every rank ready and no load row, under
+/// leader, and the standby holds every rank ready and no load report, under
 /// the id the leader gave it, by the leader's log alone. The leader stops
 /// and the standby leads under a higher term. A gateway that turns to it
 /// is answered over the same rows: each routing key is back on the worker
 /// it had, a request in flight at the stop is given up at no cost and
-/// booked nowhere twice, and the promoted controller's own driver reads
-/// the engines.
+/// booked nowhere twice, and the promoted controller's own load monitor
+/// reads the engines.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg_attr(
     not(target_os = "linux"),
@@ -3583,17 +3578,11 @@ async fn a_standby_takes_the_fleet_when_its_leader_stops() {
         let ranks = shapes.len();
         harness.feed();
         within(
-            "every rank is healthy and holds a polled load row",
+            "every rank is healthy and holds a load report",
             PROBE_INTERVAL + POLL_INTERVAL + ROOM,
             || {
                 harness.pool(MODEL, Role::Single).is_ok_and(|pool| {
-                    pool.len() == ranks
-                        && pool.iter().all(|row| {
-                            row.healthy
-                                && row
-                                    .load
-                                    .is_some_and(|load| load.source == SignalSource::Poll)
-                        })
+                    pool.len() == ranks && pool.iter().all(|row| row.healthy && row.load.is_some())
                 })
             },
         )
@@ -3601,7 +3590,7 @@ async fn a_standby_takes_the_fleet_when_its_leader_stops() {
         .expect("the fleet turns ready");
 
         // The standby follows: the leader's log alone brings it every rank,
-        // ready, under the id the leader gave it, and no load row.
+        // ready, under the id the leader gave it, and no load report.
         within("the standby holds every rank of the fleet", ROOM, || {
             harness.followed(&standby) == Ok(ranks)
         })
@@ -3713,7 +3702,7 @@ async fn a_standby_takes_the_fleet_when_its_leader_stops() {
             },
         )
         .await
-        .expect("a promoted standby's own driver reads the engines");
+        .expect("a promoted standby's own load monitor reads the engines");
 
         harness.stop().await.expect("a clean stop");
     };

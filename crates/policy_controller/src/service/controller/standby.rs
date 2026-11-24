@@ -8,8 +8,7 @@
 //! log's guard of the event's position ([`Log::adopt`]), so the twin's log
 //! holds the leader's positions and terms, and an event that does not land
 //! stops the stream ([`Halt`]). The applier is the one writer of the
-//! replicated tables while a replica follows: its own load driver writes
-//! nothing then.
+//! replicated tables while a replica follows.
 //!
 //! A membership event and a restore go through the holder of the replica's
 //! worker objects, which lays each row's object and hands the store the
