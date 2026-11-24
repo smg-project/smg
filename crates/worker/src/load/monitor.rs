@@ -2314,9 +2314,11 @@ impl<G: Generation> WorkerMonitor<G> {
     /// the rank workers of a data-parallel engine, which share it. The
     /// engine answers once; each member's report is that
     /// answer scoped to its own rank, as its own poll would have had it (a
-    /// rank the answer omits is an empty report). A report's ranks and its
-    /// named values stand under the report's bounds, and the values that
-    /// left them are counted for its member.
+    /// rank the answer omits is an empty report). The last member takes the
+    /// answer itself and each member ahead of it a copy, so an engine of one
+    /// worker copies none. A report's ranks and its named values stand under
+    /// the report's bounds, and the values that left them are counted for
+    /// its member.
     ///
     /// Where the host keeps a load source for an HTTP worker
     /// ([`Worker::load_source`]), the source answers for the engine in the
@@ -2361,12 +2363,10 @@ impl<G: Generation> WorkerMonitor<G> {
             (Some(source), _) => {
                 let answer = Self::fetch_source_load(&members[0], source.as_ref()).await;
                 counts.fetched(over_http, &answer);
-                let answer = answer.ok();
-                for member in &members {
+                let answers = std::iter::repeat_n(answer.ok(), members.len());
+                for (member, answer) in members.iter().zip(answers) {
                     reports.push(
-                        answer
-                            .clone()
-                            .map(|load| load.for_dp_rank(member.dp_rank()).unwrap_or_default()),
+                        answer.map(|load| load.for_dp_rank(member.dp_rank()).unwrap_or_default()),
                     );
                 }
             }
@@ -2379,11 +2379,12 @@ impl<G: Generation> WorkerMonitor<G> {
                     match Self::fetch_native_loads(&members[0], Some(native_loads_memo)).await {
                         Ok((path, load)) => {
                             counts.fetched(over_http, &Ok(()));
-                            for member in &members {
+                            let loads = std::iter::repeat_n(load, members.len());
+                            for (member, load) in members.iter().zip(loads) {
                                 liveness::on_contact(member);
                                 reports.push(Some(Self::scoped_native_load(
                                     path,
-                                    load.clone(),
+                                    load,
                                     member.dp_rank(),
                                 )));
                             }
@@ -2403,12 +2404,10 @@ impl<G: Generation> WorkerMonitor<G> {
             (None, ConnectionMode::Grpc | ConnectionMode::Zmq) => {
                 let answer = Self::fetch_backend_load(&members).await;
                 counts.fetched(over_http, &answer);
-                let answer = answer.ok();
-                for member in &members {
+                let answers = std::iter::repeat_n(answer.ok(), members.len());
+                for (member, answer) in members.iter().zip(answers) {
                     reports.push(
-                        answer
-                            .clone()
-                            .map(|load| load.for_dp_rank(member.dp_rank()).unwrap_or_default()),
+                        answer.map(|load| load.for_dp_rank(member.dp_rank()).unwrap_or_default()),
                     );
                 }
             }
