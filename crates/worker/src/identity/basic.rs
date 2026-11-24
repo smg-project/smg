@@ -101,6 +101,19 @@ fn context_length_from(models: &WorkerModels, model_id: &str) -> Option<u32> {
 /// (`Worker::max_running_requests`) prefers them.
 pub const WINDOW_LABELS: [&str; 2] = ["max_num_seqs", "max_running_requests"];
 
+/// The running window `labels` name ([`Worker::max_running_requests`]).
+pub(super) fn running_window(labels: &HashMap<String, String>) -> Option<u16> {
+    WINDOW_LABELS
+        .iter()
+        .find_map(|key| labels.get(*key))
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        // A figure wider than the count (an explicit flag above 65535 on
+        // a large engine) saturates: a window that wide is the widest the
+        // gate and the capacity sum can use, not no window at all.
+        .map(|n| u16::try_from(n).unwrap_or(u16::MAX))
+}
+
 /// The labels that name a model's context window (one spelling per engine
 /// family's model info), in the order the card's read
 /// (`create_worker::card_from_labels`) prefers them.
@@ -400,16 +413,7 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// estimate otherwise. The PD admission gate uses it as the decode
     /// side's admission bound.
     fn max_running_requests(&self) -> Option<u16> {
-        let labels = &self.metadata().spec.labels;
-        WINDOW_LABELS
-            .iter()
-            .find_map(|key| labels.get(*key))
-            .and_then(|s| s.parse::<u64>().ok())
-            .filter(|n| *n > 0)
-            // A figure wider than the count (an explicit flag above 65535 on
-            // a large engine) saturates: a window that wide is the widest the
-            // gate and the capacity sum can use, not no window at all.
-            .map(|n| u16::try_from(n).unwrap_or(u16::MAX))
+        running_window(&self.metadata().spec.labels)
     }
 
     /// Whether this worker can serve the Realtime API (WS/WebRTC/REST
@@ -1061,6 +1065,10 @@ pub struct BasicWorker {
     /// The handles of the series this worker writes for its requests and
     /// its engine load; shared by clones, which write the same series.
     pub metric_handles: Arc<WorkerHandles>,
+    /// The running window the labels name, read once where the worker is
+    /// built: the spec is set once there ([`WorkerMetadata::spec`]), and a
+    /// label update builds a replacement.
+    pub(super) running_window: Option<u16>,
 }
 
 impl Clone for BasicWorker {
@@ -1085,6 +1093,7 @@ impl Clone for BasicWorker {
             superseded: AtomicBool::new(self.superseded.load(Ordering::Relaxed)),
             http_client: Arc::clone(&self.http_client),
             resilience: self.resilience.clone(),
+            running_window: self.running_window,
         }
     }
 }
@@ -1680,6 +1689,10 @@ impl Worker for BasicWorker {
 
     fn metadata(&self) -> &WorkerMetadata {
         &self.metadata
+    }
+
+    fn max_running_requests(&self) -> Option<u16> {
+        self.running_window
     }
 
     fn circuit_breaker_state(&self) -> CircuitState {

@@ -4,7 +4,10 @@ use arc_swap::{ArcSwap, ArcSwapOption};
 use tokio::sync::mpsc;
 
 use super::{
-    basic::{BasicWorker, ConnectionMode, RuntimeType, WorkerMetadata, WorkerRuntime, WorkerType},
+    basic::{
+        running_window, BasicWorker, ConnectionMode, RuntimeType, WorkerMetadata, WorkerRuntime,
+        WorkerType,
+    },
     endpoint::Endpoint,
     metadata::DecodingLabels,
 };
@@ -503,6 +506,7 @@ impl<D: ConnectorDefault> BasicWorkerBuilder<D> {
                 self.circuit_breaker_config,
                 metadata.spec.url.clone(),
             )),
+            running_window: running_window(&metadata.spec.labels),
             metadata,
             engine_connection,
             engine_connector: self.engine_connector.or_else(D::default_connector),
