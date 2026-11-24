@@ -2463,11 +2463,11 @@ Five things follow, and they are the first work of section 16.
    caller's recipe: it is proven at stage 3, by a gateway test of classic's own function. The
    1 of `manual` replays as classic recorded now: a sessions rule runs on the two sides of a
    pair, each side by its own session and under its own cap.
-   One answer under a cap differs from classic's, and is accepted as named. Classic's sticky
+   One answer under a cap differs from classic's and stands open under rule 6. Classic's sticky
    map moves a prefill side's pin at its cap where it selects the prefill
-   (`model_gateway/src/policies/registry.rs:816-818`, on main `662a8d1f5`), and a pair that
-   fails behind that selection keeps the move
-   (`model_gateway/src/routers/common/placement.rs:2935-2941`). The engine moves the pin where
+   (`select_sticky`, `model_gateway/src/policies/registry.rs:816-818`, on main `bd55beae5`),
+   and a pair that fails behind that selection keeps the move
+   (`pair_pass`, `model_gateway/src/routers/common/placement.rs:3072-3078`). The engine moves the pin where
    the pair forms, to the prefill the pair formed on, and a decision that forms no pair moves
    none. Each
    of the 23 is made equal to classic or named as an accepted difference: two in stage 1, one

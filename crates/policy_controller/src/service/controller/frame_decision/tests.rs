@@ -2582,6 +2582,65 @@ fn a_served_pair_hands_each_sides_key_on_at_its_rules_cap() {
     assert_eq!((fourth, follows), (third, pinned));
 }
 
+/// A served decode call under a rule with an in-flight cap hands its side's
+/// key on at the cap. A call is decided through the entry that issues no
+/// lease, and its maker counts a key under the side's own session, as the
+/// leases on file do. The key's second pair leaves its decode for later:
+/// that side stands chosen on the key's decode and counts nothing there.
+/// Two whole pairs of the key stand on that decode when the call comes. The
+/// call meets the cap there and is placed again, on the other decode. The
+/// side it issues states the respill, and the decode side's pin leads the
+/// other decode where the call is decided.
+#[test]
+fn a_served_decode_call_hands_its_sides_key_on_at_its_rules_cap() {
+    let store = Arc::new(MemoryStore::new());
+    store
+        .apply(ruled_pair_plan_under(Assignment::MinLoad, 2))
+        .expect("above the unbound start");
+    let p = side_member(&store, "p0", Role::Prefill, None);
+    let decodes = ["d0", "d1"].map(|name| side_member(&store, name, Role::Decode, None));
+    LeasesStore::set_term(&*store, 1);
+    let objects = holder(&store);
+    let now = Instant::now();
+    let hand = open(&store, GATEWAY);
+    let leased = |n: u8, later: bool| {
+        let mut frame = keyed(at_prefill(n, WireModes::NONE, None), 7);
+        frame.decode_later = later;
+        let (decision, prefill, _) = leased_pair(&store, &objects, frame, now);
+        (pairs_of(&decision)[0], prefill)
+    };
+    // The key's first pair claims a decode, and its gateway's two
+    // Dispatched frames pin each side's key.
+    let (first, whole) = leased(1, false);
+    for side in [proto::Side::Prefill, proto::Side::Decode] {
+        let own = sent(&whole, side, 0);
+        lifecycle::dispatched(&store, &hand, &own, now).expect("the frame reads");
+    }
+    // The second pair's decode is sent later: its side stands chosen on
+    // the key's decode.
+    let (second, held) = leased(2, true);
+    assert_eq!(second, first);
+    let own = sent(&held, proto::Side::Prefill, 0);
+    lifecycle::dispatched(&store, &hand, &own, now).expect("the frame reads");
+    // The third pair is whole: the key's decode carries two of its
+    // requests, the first pair's and this one's.
+    let (third, _) = leased(3, false);
+    assert_eq!(third, first);
+    // The call meets the cap on the key's decode.
+    let call = keyed(at_call(4, held.id, WireModes::NONE, None), 7);
+    let (again, issued) = leased_call(&store, &objects, call, now);
+    let other = if first.1 == decodes[0] {
+        decodes[1]
+    } else {
+        decodes[0]
+    };
+    assert_eq!(pairs_of(&again), [(p, other)], "the call is placed again");
+    let (side, _) = issued.expect("a pick's issue");
+    assert_eq!(side.session_verdict, SessionVerdict::Respill);
+    let moved = Some([other, first.1]);
+    assert_eq!(pins_of(&store, side.session), moved);
+}
+
 /// A served pair whose decode is sent later counts its key on the
 /// prefill's worker at its filing, and on the decode's from the call that
 /// issues the side: a side that stands chosen carries no request. The

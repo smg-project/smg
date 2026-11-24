@@ -6859,7 +6859,8 @@ impl Engine {
     /// other target: at the cap a pin moves by a respill alone. One on
     /// another worker under the cap is marked [`SessionVerdict::Respill`].
     /// The live decision fronts that worker at once ([`Self::moved`]), and
-    /// its commit fronts the worker it lands on, whichever of its targets:
+    /// a pair's prefill side where its pair forms ([`Self::decide_pair`]).
+    /// Its commit fronts the worker it lands on, whichever of its targets:
     /// a respill's alternates are the workers under the cap alone. One on
     /// another worker at the cap carries no verdict: its commit moves no
     /// pin. `None` where no survivor stands. A pin the decision follows
