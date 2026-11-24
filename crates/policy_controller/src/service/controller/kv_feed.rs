@@ -510,7 +510,7 @@ mod tests {
             },
             ..MockConfig::default()
         };
-        // The row states no block size: the stream is the store's one word of it.
+        // The row states no block size: the stream is the tables' one word of it.
         let row = WorkerFacts {
             engine_kind: mock.grpc_wire.as_str().to_owned(),
             ..facts(&url, WireModes::GRPC, true)
