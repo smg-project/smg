@@ -1252,6 +1252,14 @@ pub(crate) struct ResponseState {
     /// unchanged (completion, generate, decisions, embeddings, classify).
     pub engine_counts: Option<TokenCounts>,
 
+    /// The rendered prompt of a chat request that asked for it
+    /// (`return_prompt_text`), kept by request building where the wire lets
+    /// the text go, which is where no media travels with the prompt
+    /// (`backed_plan::build`), and taken by the answer. Here and
+    /// not on the response spec: every attempt but the last dispatches a
+    /// clone of the spec, and the text is moved to the answer, never copied.
+    pub prompt_text: Option<String>,
+
     /// Responses API iteration result (Harmony only, for tool loop
     /// orchestration). Behind a pointer: the field is empty on every other
     /// path, and the dispatch context is boxed once per request; inline, its

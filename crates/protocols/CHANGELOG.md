@@ -27,6 +27,14 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Added
 
+- `ChatCompletionRequest.return_prompt_text` (a boolean, `false` unless sent, serialized only
+  when `true`), `ChatCompletionResponse.prompt_text` and
+  `ChatCompletionStreamResponse.prompt_text` (an optional string each, absent unless set): a chat
+  request asks for the prompt as rendered for the model, and the answer carries it. The gateway's
+  gRPC path fills it for a request that sends the worker no media (not where media travels with
+  the prompt), at the top level of a collected answer and on the first opening chunk of a stream.
+  Breaking for a caller that writes one of the three types as a whole literal: the literal names
+  the new field (a request literal that ends in `..Default::default()` does not).
 - `responses::validate_metadata_pairs` (the public API's bounds on a `metadata` object, for any
   map of its pairs), `responses::validate_metadata_pair_count` (its 16-pair bound alone, for a
   count read on its own), `responses::validate_input_message_role` (an input message's role in

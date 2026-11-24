@@ -1550,6 +1550,138 @@ async fn chat_lone_complete_opens_its_choice_among_others() {
 }
 
 #[tokio::test]
+async fn the_rendered_prompt_rides_the_first_opening_chunk_alone() {
+    // Two choices open, the second one first: the chunk that opens it is the
+    // stream's first and carries the prompt the request asked back; the chunk
+    // that opens the other choice carries none, and no later chunk does.
+    let mut spec = chat_spec(false);
+    spec.prompt_text = Some("user: hi\nassistant: ".to_string());
+    let (result, events) = chat_events_with_spec(
+        vec![
+            chunk(1, "b"),
+            chunk(0, "a"),
+            complete(1, "stop"),
+            complete(0, "stop"),
+        ],
+        false,
+        spec,
+        "0",
+    )
+    .await;
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(
+        events[0]["prompt_text"], "user: hi\nassistant: ",
+        "{events:?}"
+    );
+    assert_eq!(events[0]["choices"][0]["index"], 1, "{events:?}");
+    assert_eq!(
+        choice_trail(&events, 0).first(),
+        Some(&(Some("assistant"), None)),
+        "{events:?}"
+    );
+    assert!(
+        events[1..]
+            .iter()
+            .all(|event| event.get("prompt_text").is_none()),
+        "{events:?}"
+    );
+}
+
+/// The rendered prompt's chunk is a frame of its own, the body's first, and
+/// the first token's frame behind it still reaches the connection before the
+/// reading runs on into a burst: the body yields for its first frame alone,
+/// so the reading yields twice at the first token's hand-off and the
+/// connection's next pull is pending. With one yield that pull would run the
+/// reading on through the engine messages ready behind the first token and
+/// return the burst's frame instead.
+#[tokio::test]
+async fn the_first_tokens_frame_behind_the_prompts_is_pending_before_the_burst_is_read() {
+    // Four chunks ready at once: the first token, then a burst behind it.
+    let (stream, server) = scripted_stream(
+        vec![
+            chunk(0, "a"),
+            chunk(0, "b"),
+            chunk(0, "c"),
+            chunk(0, "d"),
+            complete(0, "stop"),
+        ],
+        "0",
+    )
+    .await;
+    let (tx, rx) = driven_channel();
+    let processor = processor(false);
+    let mut spec = chat_spec(false);
+    spec.prompt_text = Some("user: hi\nassistant: ".to_string());
+    let reading = async move {
+        let result = processor
+            .process_streaming_chunks(
+                stream,
+                dispatch(),
+                Arc::new(CharacterTokenizer::default()),
+                (None, None, false, false, false),
+                spec,
+                &tx,
+                None,
+            )
+            .await;
+        assert!(result.is_ok(), "{result:?}");
+        ReadingEnd::Complete
+    };
+    let mut body = DrivenBody::new(Box::pin(reading), rx);
+    // The prompt's chunk (the body's own yield follows it), then the first
+    // token's frame.
+    let mut frames = Vec::new();
+    loop {
+        let frame = body
+            .next()
+            .await
+            .expect("the body ends only after the first token")
+            .expect("a write");
+        let text = String::from_utf8(frame.to_vec()).expect("text");
+        let first_token = text.contains(r#""content":"a""#);
+        frames.push(text);
+        if first_token {
+            break;
+        }
+    }
+    assert_eq!(
+        frames.len(),
+        2,
+        "the prompt's chunk, then the first token's frame: {frames:?}"
+    );
+    assert!(
+        frames[0].contains(r#""prompt_text":"user: hi\nassistant: ""#)
+            && frames[0].contains(r#""role":"assistant""#),
+        "the body's first frame opens the choice with the prompt: {frames:?}"
+    );
+    assert!(
+        !frames[1].contains("prompt_text"),
+        "the first token's frame carries no prompt: {frames:?}"
+    );
+    // The pull after it: pending, so the connection writes the first
+    // token's frame before the reading runs on. With one yield at the
+    // hand-off it is the burst's frame.
+    let next = pull(&mut body).await;
+    assert!(
+        next.is_pending(),
+        "the pull after the first token's frame must be pending, not a frame: {next:?}"
+    );
+    let rest: Vec<String> = body
+        .map(|frame| String::from_utf8(frame.expect("a write").to_vec()).expect("text"))
+        .collect()
+        .await;
+    server.abort();
+    assert!(
+        rest.iter().any(|frame| frame.contains(r#""content":"b""#)),
+        "the burst follows: {rest:?}"
+    );
+    assert!(
+        rest.iter().all(|frame| !frame.contains("prompt_text")),
+        "no later frame carries the prompt: {rest:?}"
+    );
+}
+
+#[tokio::test]
 async fn chat_lone_complete_role_chunk_reports_the_completes_usage() {
     // With continuous usage, the role chunk a lone Complete opens the choice
     // with carries the Complete's counts, as a first Chunk's carries that

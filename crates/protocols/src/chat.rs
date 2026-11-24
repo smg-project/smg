@@ -606,6 +606,24 @@ pub struct ChatCompletionRequest {
     )]
     pub return_hidden_states: bool,
 
+    /// Return the prompt as rendered for the model. With `true` the answer
+    /// carries `prompt_text` ([`ChatCompletionResponse::prompt_text`]; on a
+    /// stream, [`ChatCompletionStreamResponse::prompt_text`]): the chat
+    /// template's output for this request, with the special tokens and the
+    /// generation prefix the template wrote. Encoding that string anew need
+    /// not give the token
+    /// ids the model received: text of a message that spells a special token
+    /// is encoded as plain text in the prompt, and as that token when the
+    /// whole string is encoded again.
+    /// Serialized only when `true`, so a worker that is sent the request
+    /// reads the key only where the client asked.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_null_as_false",
+        skip_serializing_if = "is_false"
+    )]
+    pub return_prompt_text: bool,
+
     /// Random seed for sampling for deterministic outputs
     pub sampling_seed: Option<u64>,
 
@@ -1347,6 +1365,17 @@ pub struct ChatCompletionResponse {
     /// OpenAI API sends it; the gateway has one tier, `default`.
     #[serde(default = "default_service_tier")]
     pub service_tier: String,
+    /// The prompt as rendered for the model, on the answer of a request that
+    /// set `return_prompt_text`: the chat template's output, with the
+    /// special tokens and the generation prefix the template wrote. The
+    /// gateway's gRPC path returns it for a request that sends the worker no
+    /// media; where media
+    /// travels to the worker with the prompt, and for a model served through
+    /// the Harmony pipeline, the answer carries none. The rule follows what
+    /// was sent: an image that a text-only model's template turned into a
+    /// note in the prompt sent no media, and the answer carries the prompt,
+    /// note included. Absent otherwise.
+    pub prompt_text: Option<String>,
 }
 
 /// The one service tier the gateway serves.
@@ -1418,6 +1447,11 @@ pub struct ChatCompletionStreamResponse {
     pub created: u64,
     pub model: String,
     pub system_fingerprint: Option<String>,
+    /// The prompt as rendered for the model
+    /// ([`ChatCompletionResponse::prompt_text`]). The gateway's gRPC path
+    /// writes it on the first chunk that opens a choice and on no other, so
+    /// a stream of several choices carries it once.
+    pub prompt_text: Option<String>,
     pub choices: Vec<ChatStreamChoice>,
     pub usage: Option<Usage>,
 }
