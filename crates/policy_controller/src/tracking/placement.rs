@@ -200,6 +200,9 @@ impl Placement<'_> {
     /// to, that call holds the answer in a guard itself and releases it
     /// under its reason ([`DecisionGuard::released`]).
     #[must_use]
+    // In line in the walk that makes it: under a plain mark the compiler
+    // keeps it a call, which every request a whole decision places pays.
+    #[inline(always)]
     pub(crate) fn taken(
         engine: Loaded<'static, '_>,
         decided: DecideOutcome,
