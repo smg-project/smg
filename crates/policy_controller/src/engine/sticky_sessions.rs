@@ -165,7 +165,8 @@ pub(crate) enum Claim {
     /// commit settles it.
     Made(WorkerId),
     /// The claim was not taken: the key's pins are not the ones the
-    /// decision read, or nothing was recorded (an empty key or target).
+    /// decision read, the worker is a pin of the key already under the id
+    /// that stands for it, or nothing was recorded (an empty key or target).
     /// It names the worker the decision follows ([`Claim::standing`]) and
     /// the pins the key held: a shadow reads those against its own pins
     /// and its own pick.
@@ -222,10 +223,11 @@ struct Entry {
     /// A pair's decision moves its own claim to the prefill its pair formed
     /// on, and withdraws it where none formed ([`SessionTable::move_claim`]).
     claim: WorkerId,
-    /// The id the claim's lease names: the claimed worker's id when the
-    /// claim was made, read while a claim stands. It differs from `claim`
-    /// once the worker is registered again under the claim
-    /// ([`SessionTable::rename_worker`]).
+    /// The id the claim's lease names: the id the claiming decision read
+    /// for its worker, read while a claim stands. It differs from `claim`
+    /// where the worker was registered again, under the claim
+    /// ([`SessionTable::rename_worker`]) or between the decision's read
+    /// of its rows and its claim ([`SessionTable::stands`]).
     leased: WorkerId,
 }
 
@@ -395,12 +397,11 @@ pub struct SessionTable {
     /// the id that stands for it ([`Self::rename_worker`]). A dispatch
     /// names the id its lease was issued on, and one that lands behind
     /// the rename is the standing worker's. [`RENAMED_WORKERS`] at most.
-    /// A dispatch and a respill's move read this lock under their shard's.
-    /// A rename writes it with no shard held.
+    /// A write of a worker's id reads this lock under its shard's
+    /// ([`Self::stands`]). A rename writes it with no shard held.
     renamed: RwLock<FxHashMap<WorkerId, WorkerId>>,
-    /// How many ids the list holds: what a dispatch and a respill's move
-    /// read ahead of the lock, so a table that renamed no worker asks
-    /// nothing.
+    /// How many ids the list holds: what a write of a worker's id reads
+    /// ahead of the lock, so a table that renamed no worker asks nothing.
     renamed_len: AtomicUsize,
     /// Whether a pass of the table's host sweeps it ([`Self::sweep_due`]):
     /// set at the first such pass, for good. A read of a key then runs no
@@ -579,6 +580,15 @@ impl SessionTable {
     /// elsewhere withdraws it (`dispatched`), the TTL sweeps it otherwise.
     /// A pair's decision moves its own claim before its dispatch
     /// ([`Self::move_claim`]).
+    ///
+    /// The pin and the claim of record take the id that stands for the
+    /// worker ([`Self::stands`]): the decision read its rows ahead of this
+    /// write, and the worker may have been registered again between the
+    /// two. The lease is issued on the id the decision read, so that id is
+    /// the lease's and the answer's, as behind a rename that finds a
+    /// claim made ahead of it ([`Self::rename_worker`]). A worker that is
+    /// a pin of the key already under the id that stands is no claim: the
+    /// answer names the decision's own pick, and nothing is written.
     /// Always inlined: the keyed decision has two forms, and a second caller
     /// would otherwise move this out of line under the first.
     #[inline(always)]
@@ -592,11 +602,17 @@ impl SessionTable {
             return Claim::NoRoom;
         };
         let Some(owner) = Claim::standing(&entry.pins, &seen, target) else {
-            match entry.recovery {
-                Recovery::Latest => entry.front(target),
-                Recovery::Original => entry.append(target),
+            let stands = self.stands(&entry.pins, target);
+            if stands != target && entry.pins.contains(&stands) {
+                // A pin the key was served on is marked no claim: an
+                // alternate's commit would withdraw it.
+                return Claim::Standing(target, entry.pins);
             }
-            entry.claim = target;
+            match entry.recovery {
+                Recovery::Latest => entry.front(stands),
+                Recovery::Original => entry.append(stands),
+            }
+            entry.claim = stands;
             entry.leased = target;
             return Claim::Made(target);
         };
@@ -614,7 +630,7 @@ impl SessionTable {
     /// later one last, as their two commits do. No entry is made: a key
     /// the table holds no more, as an empty key, is left to the commit.
     /// A move on an id its worker had before it was registered again
-    /// fronts the id that stands ([`Self::standing`]), as a dispatch on
+    /// fronts the id that stands ([`Self::stands`]), as a dispatch on
     /// that id does.
     pub(crate) fn respilled(&self, key: Session, target: WorkerId) {
         let key = key.get();
@@ -626,12 +642,7 @@ impl SessionTable {
             // pin, its worker may have been registered again between the
             // two: the dispatch behind this move finds the worker pinned
             // and asks the renames no more, so the move asks them here.
-            let renamed = self.renamed_len.load(Ordering::Relaxed) != 0;
-            let target = if renamed && !entry.pins.contains(&target) {
-                self.standing(target)
-            } else {
-                target
-            };
+            let target = self.stands(&entry.pins, target);
             entry.front(target);
         }
     }
@@ -647,9 +658,10 @@ impl SessionTable {
     /// of record, else a pin's. A claim a dispatch confirmed is a pin the
     /// key was served on: it stands, and nothing is written. Another
     /// decision's claim is not this one's to move. A `target` that is a pin
-    /// of the key already is no claim either. The claim names the id its
-    /// decision read, as [`Self::claim`]'s does: neither asks the table's
-    /// renames.
+    /// of the key already is no claim either. The new claim is written as
+    /// a first one is ([`Self::claim`]): the pin and the claim of record
+    /// under the id that stands for `target`, the lease's id and the
+    /// answer under the id the decision read.
     pub(crate) fn move_claim(
         &self,
         key: Session,
@@ -666,14 +678,18 @@ impl SessionTable {
         }
         let pin = std::mem::replace(&mut entry.claim, WorkerId(0));
         entry.withdraw(pin);
-        if target == WorkerId(0) || entry.pins.contains(&target) {
+        if target == WorkerId(0) {
+            return SessionVerdict::Pinned;
+        }
+        let stands = self.stands(&entry.pins, target);
+        if entry.pins.contains(&stands) {
             return SessionVerdict::Pinned;
         }
         match entry.recovery {
-            Recovery::Latest => entry.front(target),
-            Recovery::Original => entry.append(target),
+            Recovery::Latest => entry.front(stands),
+            Recovery::Original => entry.append(stands),
         }
-        entry.claim = target;
+        entry.claim = stands;
         entry.leased = target;
         SessionVerdict::Claimed(target)
     }
@@ -686,7 +702,7 @@ impl SessionTable {
     /// confirms the claim first; the claiming decision's commit elsewhere
     /// withdraws it. A dispatch on an id its worker had before it was
     /// registered again is one on that worker, under the id that stands
-    /// ([`Self::standing`]).
+    /// ([`Self::stands`]).
     pub(crate) fn dispatched(&self, key: Session, verdict: SessionVerdict, target: WorkerId) {
         let key = key.get();
         if key == 0 || target == WorkerId(0) {
@@ -706,16 +722,13 @@ impl SessionTable {
         // dispatch on that id is one on the claimed worker, registered
         // again since or not.
         let claimed_here = entry.claim != WorkerId(0) && entry.leased == target;
-        let renamed = || self.renamed_len.load(Ordering::Relaxed) != 0;
         let target = if claimed_here {
             entry.claim
-        } else if !entry.pins.contains(&target) && renamed() {
+        } else {
             // A dispatch names the id its lease was issued on. In neither
             // pin, its worker may have been registered again since: the
             // table's renames say which id stands for it.
-            self.standing(target)
-        } else {
-            target
+            self.stands(&entry.pins, target)
         };
         if entry.claim != WorkerId(0) && entry.claim == target {
             entry.claim = WorkerId(0);
@@ -856,11 +869,29 @@ impl SessionTable {
         self.renamed_len.store(renamed.len(), Ordering::Relaxed);
     }
 
-    /// The id that stands for `target`, the id a dispatch's lease was
-    /// issued on or a respill's decision read: its worker's own where the
-    /// worker was registered again since. Out of line: a dispatch and a
-    /// respill's move ask only where their target is in neither pin and
-    /// the table renamed a worker.
+    /// The id a write names `target` by beside `pins`, the pins of the
+    /// write's key: `target` where it is one of them or the table renamed
+    /// no worker, else the id that stands for its worker
+    /// ([`Self::standing`]). A decision reads its rows ahead of its writes
+    /// and a dispatch names the id its lease was issued on, so the worker
+    /// may have been registered again since. Each write of a worker's id
+    /// asks, under its shard's lock: a claim, a pair's moved claim, a
+    /// respill's move and the commit. The pins are read first: a worker
+    /// among them costs no read of the renames' count.
+    #[inline]
+    fn stands(&self, pins: &SessionPins, target: WorkerId) -> WorkerId {
+        if !pins.contains(&target) && self.renamed_len.load(Ordering::Relaxed) != 0 {
+            self.standing(target)
+        } else {
+            target
+        }
+    }
+
+    /// The id that stands for `target`, an id a decision read or a
+    /// dispatch's lease was issued on: its worker's own where the worker
+    /// was registered again since. Out of line: a write asks only where
+    /// its target is in neither pin and the table renamed a worker
+    /// ([`Self::stands`]).
     #[cold]
     #[inline(never)]
     fn standing(&self, target: WorkerId) -> WorkerId {
@@ -2268,6 +2299,187 @@ mod tests {
             assert_eq!(table.pins(s(key)), led, "key {key} behind the renames");
             table.dispatched(s(key), SessionVerdict::Respill, WorkerId(had));
             assert_eq!(table.pins(s(key)), led, "key {key} behind its dispatch");
+        }
+    }
+
+    /// A decision reads its rows ahead of its claim, and its worker may be
+    /// registered again between the two. The pin and the claim of record
+    /// take the id that stands, behind the whole rename and behind its
+    /// first half, and the answer keeps the id the decision read. The
+    /// lease names that id: the claim's own dispatch on it confirms the
+    /// claim, a later commit elsewhere withdraws no confirmed pin, and the
+    /// claiming decision's commit elsewhere withdraws its claim.
+    #[test]
+    fn a_claim_on_the_id_a_worker_had_pins_the_id_that_stands() {
+        for rule in [RULE, ORIGINAL] {
+            let table = SessionTable::new(rule.sweep_micros);
+            // Worker 1 is registered again whole, worker 3 by the rename's
+            // first half: remembered, the shards not yet walked.
+            table.rename_worker(WorkerId(1), WorkerId(11));
+            table.remember(WorkerId(3), WorkerId(13));
+            let claims = [(1, 1, 11), (2, 1, 11), (3, 3, 13), (4, 3, 13)];
+            for (key, had, stands) in claims {
+                assert_eq!(table.lookup(s(key), 10, &rule), [WorkerId(0); 2]);
+                let claim = table.claim(s(key), [WorkerId(0); 2], WorkerId(had));
+                assert_eq!(
+                    claim,
+                    Claim::Made(WorkerId(had)),
+                    "the id the decision read"
+                );
+                let led = Some([WorkerId(stands), WorkerId(0)]);
+                assert_eq!(
+                    table.pins(s(key)),
+                    led,
+                    "key {key} claims the id that stands"
+                );
+            }
+            table.rename_worker(WorkerId(3), WorkerId(13));
+            for (key, had, stands) in claims {
+                let claimed = SessionVerdict::Claimed(WorkerId(had));
+                if key % 2 == 1 {
+                    // Its own dispatch names the id the decision read.
+                    table.dispatched(s(key), claimed, WorkerId(had));
+                    let led = Some([WorkerId(stands), WorkerId(0)]);
+                    assert_eq!(table.pins(s(key)), led, "key {key} is confirmed");
+                    // A pin a dispatch confirmed is withdrawn by no commit.
+                    table.dispatched(s(key), claimed, WorkerId(2));
+                    let both = match rule.recovery {
+                        Recovery::Latest => [WorkerId(2), WorkerId(stands)],
+                        Recovery::Original => [WorkerId(stands), WorkerId(2)],
+                    };
+                    assert_eq!(table.pins(s(key)), Some(both), "key {key} keeps its pin");
+                } else {
+                    // The claiming decision's commit lands elsewhere.
+                    table.dispatched(s(key), claimed, WorkerId(2));
+                    let alone = Some([WorkerId(2), WorkerId(0)]);
+                    assert_eq!(table.pins(s(key)), alone, "key {key} is withdrawn");
+                }
+            }
+        }
+    }
+
+    /// A key pinned on a worker is claimed by a decision that read the
+    /// worker's row under the id it had: the key's pin, which names the id
+    /// that stands, read as not routable there, and the decision's pick is
+    /// the same worker. The table writes nothing and answers the
+    /// decision's own pick. A pin the key was served on is marked no
+    /// claim, so the request's commit on an alternate withdraws nothing.
+    #[test]
+    fn a_claim_on_a_worker_pinned_under_the_id_that_stands_writes_nothing() {
+        for rule in [RULE, ORIGINAL] {
+            let table = SessionTable::new(rule.sweep_micros);
+            table.lookup(s(1), 10, &rule);
+            table.dispatched(s(1), SessionVerdict::Pinned, WorkerId(1));
+            table.rename_worker(WorkerId(1), WorkerId(11));
+            let pins = [WorkerId(11), WorkerId(0)];
+            assert_eq!(table.lookup(s(1), 20, &rule), pins);
+            let claim = table.claim(s(1), pins, WorkerId(1));
+            assert_eq!(claim, Claim::Standing(WorkerId(1), pins));
+            assert_eq!(table.pins(s(1)), Some(pins), "nothing is written");
+            // The request's dispatch on its pick is one on the pin.
+            table.dispatched(s(1), SessionVerdict::Pinned, WorkerId(1));
+            assert_eq!(table.pins(s(1)), Some(pins));
+            // Its commit on an alternate moves the pins as a pin's does.
+            table.dispatched(s(1), SessionVerdict::Pinned, WorkerId(2));
+            let both = match rule.recovery {
+                Recovery::Latest => [WorkerId(2), WorkerId(11)],
+                Recovery::Original => [WorkerId(11), WorkerId(2)],
+            };
+            assert_eq!(table.pins(s(1)), Some(both));
+        }
+    }
+
+    /// A pair's decision moves its claim to the prefill its pair formed
+    /// on, which it read ahead of that write: a prefill registered again
+    /// between the two is claimed under the id that stands, behind the
+    /// whole rename and behind its first half, and the answer keeps the
+    /// id the decision read. Its dispatch on that id confirms the claim,
+    /// and its commit elsewhere withdraws it. A prefill that is a pin of
+    /// the key under the id that stands is no claim.
+    #[test]
+    fn a_moved_claim_on_the_id_a_worker_had_pins_the_id_that_stands() {
+        for rule in [RULE, ORIGINAL] {
+            let table = SessionTable::new(rule.sweep_micros);
+            for key in [1, 2, 3] {
+                table.lookup(s(key), 10, &rule);
+                let claim = table.claim(s(key), [WorkerId(0); 2], WorkerId(5));
+                assert_eq!(claim, Claim::Made(WorkerId(5)));
+            }
+            table.rename_worker(WorkerId(1), WorkerId(11));
+            table.remember(WorkerId(3), WorkerId(13));
+            for (key, had, stands) in [(1, 1, 11), (2, 1, 11), (3, 3, 13)] {
+                let verdict = table.move_claim(s(key), WorkerId(5), WorkerId(had));
+                let claimed = SessionVerdict::Claimed(WorkerId(had));
+                assert_eq!(verdict, claimed, "the id the decision read");
+                let led = Some([WorkerId(stands), WorkerId(0)]);
+                assert_eq!(
+                    table.pins(s(key)),
+                    led,
+                    "key {key} claims the id that stands"
+                );
+            }
+            table.rename_worker(WorkerId(3), WorkerId(13));
+            for (key, had, stands) in [(1, 1, 11), (3, 3, 13)] {
+                table.dispatched(
+                    s(key),
+                    SessionVerdict::Claimed(WorkerId(had)),
+                    WorkerId(had),
+                );
+                let led = Some([WorkerId(stands), WorkerId(0)]);
+                assert_eq!(table.pins(s(key)), led, "key {key} is confirmed");
+            }
+            table.dispatched(s(2), SessionVerdict::Claimed(WorkerId(1)), WorkerId(2));
+            assert_eq!(
+                table.pins(s(2)),
+                Some([WorkerId(2), WorkerId(0)]),
+                "withdrawn"
+            );
+            // The key was served on the prefill under the id that stands.
+            table.lookup(s(4), 10, &rule);
+            table.dispatched(s(4), SessionVerdict::Pinned, WorkerId(11));
+            let pins = [WorkerId(11), WorkerId(0)];
+            assert_eq!(
+                table.claim(s(4), pins, WorkerId(5)),
+                Claim::Made(WorkerId(5))
+            );
+            let verdict = table.move_claim(s(4), WorkerId(5), WorkerId(1));
+            assert_eq!(verdict, SessionVerdict::Pinned);
+            assert_eq!(
+                table.pins(s(4)),
+                Some(pins),
+                "the pin stands alone, and no claim"
+            );
+            table.dispatched(s(4), SessionVerdict::Pinned, WorkerId(1));
+            assert_eq!(table.pins(s(4)), Some(pins));
+        }
+    }
+
+    /// The race the table leaves as it stands: the key's own pin is
+    /// renamed between a decision's read of the key and its claim. The
+    /// pins are not the ones the decision read, and the renamed id answers
+    /// as their newcomer. No row of that decision holds it, so the request
+    /// keeps its own pick, and its commit moves the pins by the key's
+    /// recovery beside the renamed pin.
+    #[test]
+    fn a_claim_behind_the_rename_of_the_keys_own_pin_answers_the_renamed_pin() {
+        for rule in [RULE, ORIGINAL] {
+            let table = SessionTable::new(rule.sweep_micros);
+            table.lookup(s(1), 10, &rule);
+            table.dispatched(s(1), SessionVerdict::Pinned, WorkerId(5));
+            // The decision read the pin, found no row for it and chose 2.
+            let seen = table.lookup(s(1), 20, &rule);
+            assert_eq!(seen, [WorkerId(5), WorkerId(0)]);
+            table.rename_worker(WorkerId(5), WorkerId(15));
+            let renamed = [WorkerId(15), WorkerId(0)];
+            let claim = table.claim(s(1), seen, WorkerId(2));
+            assert_eq!(claim, Claim::Standing(WorkerId(15), renamed));
+            assert_eq!(table.pins(s(1)), Some(renamed), "nothing is claimed");
+            table.dispatched(s(1), SessionVerdict::Pinned, WorkerId(2));
+            let moved = match rule.recovery {
+                Recovery::Latest => [WorkerId(2), WorkerId(15)],
+                Recovery::Original => [WorkerId(15), WorkerId(2)],
+            };
+            assert_eq!(table.pins(s(1)), Some(moved));
         }
     }
 

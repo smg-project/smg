@@ -6535,7 +6535,11 @@ impl Engine {
                     // reads the pins the table held there against its own
                     // pins and its own pick, as the table does. Where no
                     // pin came in, the table's answer was the live pick:
-                    // that is no pin, and the shadow keeps its own.
+                    // no pin for the shadow to follow, and it keeps its
+                    // own. Where the pins stood as read, the live pick
+                    // was a pin already under the id that stands for its
+                    // worker. A shadow asks no id that stands: it keeps
+                    // its own pick there too, put to no cap.
                     match Claim::standing(&found.standing, &pins, first) {
                         Some(owner) => Claim::Standing(owner, found.standing),
                         None => return decision,
@@ -6549,11 +6553,12 @@ impl Engine {
                     // placement stands as the profile made it.
                     Claim::NoRoom => {}
                     // The table took no claim of this decision's: another
-                    // request's stands, or the pins moved under the
-                    // decision. The worker it names is a pin of the key
-                    // where it is among the survivors: the rule's cap
-                    // holds for it as for the pin read first, and it leads
-                    // where the placement stood elsewhere.
+                    // request's stands, the pins moved under the
+                    // decision, or its worker is a pin of the key already
+                    // under the id that stands. The worker it names is a
+                    // pin of the key where it is among the survivors: the
+                    // rule's cap holds for it as for the pin read first,
+                    // and it leads where the placement stood elsewhere.
                     Claim::Standing(owner, held) => {
                         if WRITE_SESSIONS && KEEPS {
                             // The pins the table held, kept for the shadow.
@@ -15200,6 +15205,52 @@ mod tests {
         );
         assert_eq!(place_keyed(&engine, &pool, 7, 60).id, WorkerId(103));
         assert_eq!(place_keyed(&engine, &pool, 8, 60).id, WorkerId(202));
+    }
+
+    /// A decision reads its rows ahead of its claim. Where its worker is
+    /// registered again between the two, the key is claimed under the id
+    /// that stands: the key's next request, decided on the rows that stand
+    /// ahead of the first one's dispatch, follows the claim. The first
+    /// request's verdict and its dispatch name the id its decision read,
+    /// and the dispatch confirms the claim.
+    #[test]
+    fn a_claim_behind_its_workers_rename_leads_under_the_id_that_stands() {
+        let engine = session_engine(SESSIONS);
+        // The rows the first decision read, and the rows that stand: the
+        // host replaced the first worker's row and says it is the worker
+        // it was.
+        let read = [candidate(0, 0), candidate(1, 1)];
+        let mut rows = read;
+        rows[0].id = WorkerId(900);
+        engine.on_membership(&Membership::Replaced {
+            old: read[0].id,
+            new: rows[0].id,
+        });
+        engine.pins_follow(read[0].id, rows[0].id);
+        let decision = decide_keyed(&engine, &read, 7, 10);
+        let pick = decision.pick().expect("a placement");
+        let first = *pick.targets.first().expect("a target");
+        assert_eq!(first.id, read[0].id);
+        assert_eq!(pick.session_verdict, SessionVerdict::Claimed(read[0].id));
+        let pins = || engine.sessions.pins(session(7));
+        assert_eq!(
+            pins(),
+            Some([rows[0].id, WorkerId(0)]),
+            "the id that stands"
+        );
+        // The worker is the busiest now: the key's pin alone sends there.
+        rows[0].in_flight = 9;
+        let next = decide_keyed(&engine, &rows, 7, 20);
+        let pick = next.pick().expect("a pick");
+        assert_eq!(pick.targets.first().map(|t| t.id), Some(rows[0].id));
+        let lease = Lease {
+            session: session(7),
+            session_verdict: SessionVerdict::Claimed(read[0].id),
+            issued_micros: 10,
+            ..Lease::default()
+        };
+        engine.on_dispatched(&lease, &first, Side::Single, 0);
+        assert_eq!(pins(), Some([rows[0].id, WorkerId(0)]), "confirmed");
     }
 
     #[test]
