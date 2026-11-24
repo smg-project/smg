@@ -93,7 +93,26 @@
 //! its guard. It is counted against `kept`, which keeps that answer and
 //! reports nothing. A pair route tells no end yet: under `streamed` its
 //! decode's reader tests the empty handle it is handed, and a pair cell
-//! takes neither `kept` nor `answer`.
+//! takes no other form but `passed`.
+//!
+//! `told` is a single request of the gRPC execution stage, behind a
+//! dispatch that answered: the stage asks its selection whether the request
+//! tells its end, the answer's word, and behind a yes asks its guards the
+//! handle and hands it to the request's stream. It is counted against
+//! `dispatched`, which makes the same selection, guards and stream and asks
+//! nothing. `walked` asks the guards whatever the answer's word says: what
+//! a request Grand Central placed pays there, counted on a classic
+//! guard against `dispatched`. `read` reads the stream once, to its end,
+//! counted against `dispatched` too. `watched` watches the stream for a
+//! client as a streaming reader does, and `stopped` lets that stream go as
+//! a reader lets it go at its own stop, counted against `watched`. A
+//! classic request's stream holds no layer of Grand Central's, so a
+//! read walks the layers it walked before and a stop finds nothing to tell.
+//!
+//! `layered` puts on the stream the layer that tells its end under a policy
+//! document one of whose stages takes an end, with an empty handle in it.
+//! `layered-read` reads that stream once through the layer. They count what
+//! the layer costs a request and a read, the report itself apart.
 //!
 //! No Criterion harness: a cell runs a fixed count of decisions, so the same
 //! binary counts instructions under callgrind (two counts, one difference).
@@ -263,6 +282,14 @@ fn cell() -> Cell {
                     "streamed" => Ended::Streamed,
                     "kept" => Ended::Kept,
                     "answer" => Ended::Answer,
+                    "dispatched" => Ended::Dispatched,
+                    "told" => Ended::Told,
+                    "walked" => Ended::Walked,
+                    "read" => Ended::Read,
+                    "watched" => Ended::Watched,
+                    "stopped" => Ended::Stopped,
+                    "layered" => Ended::Layered,
+                    "layered-read" => Ended::LayeredRead,
                     other => panic!("no end {other}"),
                 });
             }
@@ -633,8 +660,8 @@ fn build(cell: &Cell) -> Built {
         "a pair cell sends no routing key"
     );
     assert!(
-        !(pair && matches!(end, Some(Ended::Kept | Ended::Answer))),
-        "a pair cell reports through no answer"
+        !pair || matches!(end, None | Some(Ended::Passed | Ended::Streamed)),
+        "a pair cell reports through no answer and runs no single request's stage"
     );
     assert!(
         !(cell.grow > 0 && cell.models > 1),

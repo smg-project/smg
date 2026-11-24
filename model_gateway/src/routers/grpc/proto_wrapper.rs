@@ -35,9 +35,10 @@ use smg_worker::{health::liveness, identity::basic::Worker, runtime::WorkerRunti
 use tokio::time::error::Elapsed;
 
 use crate::routers::{
-    common::sse::SseSender,
+    common::{placement::RequestEnd, sse::SseSender},
     grpc::{
         multimodal::{log_mm_timing_enabled, mm_rdma_exporter},
+        utils::tonic_ext::TonicStatusExt,
         zmq_client::ZmqGenerateStream,
     },
 };
@@ -723,6 +724,46 @@ pub enum ProtoStream {
     /// abort-on-drop reaches the engine, its tickets go back to the worker)
     /// and the reader meets the end (see [`WatchedStream`]).
     Watched(Box<WatchedStream>),
+    /// A stream that tells Grand Central how it ended (see
+    /// [`ReportedStream`]). No stream of a request the classic policies
+    /// placed is one.
+    Reported(Box<ReportedStream>),
+}
+
+/// A worker's stream that tells Grand Central its end, through the
+/// handle the execution plan asked for it once its call had answered
+/// ([`ProtoStream::report_through`]). It lies
+/// under the stream's tracked layer, and it is the one reader that tells a
+/// worker's end from a client's leaving: the watch above drops it unread.
+///
+/// A clean end is the worker's 200. A failure is told by the status the
+/// circuit breaker samples for it, and one the breaker takes no sample of
+/// is not told ([`TonicStatusExt::end_status`]). The end is told once, and
+/// the handle goes with it. A reader whose own stop ended the generation
+/// tells the same good end where it lets the engine go
+/// ([`ProtoStream::abort_past_stop`]). A stream dropped before its end
+/// tells nothing: a client that left, a reading the gateway gave up. The
+/// engine then hears that end as it did before.
+pub struct ReportedStream {
+    inner: ProtoStream,
+    end: RequestEnd,
+}
+
+impl ReportedStream {
+    /// The stream met `item`: an end is told, a response is not looked at.
+    #[inline]
+    fn met(&mut self, item: Option<&Result<ProtoGenerateResponse, tonic::Status>>) {
+        let failure = match item {
+            Some(Ok(_)) => return,
+            Some(Err(status)) => Some(status),
+            None => None,
+        };
+        let end = std::mem::take(&mut self.end);
+        match failure {
+            Some(status) => end.report_with(|| status.end_status()),
+            None => end.report(200, || true),
+        }
+    }
 }
 
 /// A stream with its first item (`None`: its end) pulled ahead of its reader
@@ -1994,6 +2035,115 @@ impl ProtoStream {
         }))
     }
 
+    /// From here on this stream tells Grand Central its end through
+    /// `end` (see [`ReportedStream`]). An empty handle leaves the stream as
+    /// it is: a request the classic policies placed, or one under a policy
+    /// document no stage of which takes an end. Such a request pays the
+    /// handle's test, and its stream is not moved.
+    #[inline]
+    pub(crate) fn report_through(&mut self, end: RequestEnd) {
+        if !end.is_empty() {
+            self.put_report_layer(end);
+        }
+    }
+
+    /// [`Self::report_through`] behind its test of the handle: the layer is
+    /// made whatever `end` holds. It goes under the stream's tracked layer,
+    /// where it has one. The decision bench counts the layer through this,
+    /// on an empty handle.
+    ///
+    /// The stage puts the layer before a reader watches the stream for its
+    /// client: over a watch the layer would read a client's leaving as the
+    /// worker's end. A debug build stops at a stream watched already.
+    #[inline(never)]
+    pub(crate) fn put_report_layer(&mut self, end: RequestEnd) {
+        debug_assert!(
+            !matches!(self, Self::Watched(_)),
+            "the layer is put before the stream is watched"
+        );
+        let over = match self {
+            Self::Tracked(tracked) => &mut tracked.inner,
+            stream => stream,
+        };
+        // Nothing unwinds between the take and the write that follows it.
+        let empty = Self::Fanout(FanoutStream::new(Vec::new()));
+        let inner = std::mem::replace(over, empty);
+        *over = Self::Reported(Box::new(ReportedStream { inner, end }));
+    }
+
+    /// The reader's own stop ended the generation while the engine streamed
+    /// on. The answer is whole, so the stream tells Grand Central the
+    /// worker's 200 as at a clean end ([`ReportedStream`]). It is then
+    /// dropped un-marked, which aborts the engine's tail.
+    ///
+    /// A streaming reader's stream over a classic request is the watch for
+    /// its client over the tracked layer over its worker's own stream, and
+    /// a decode side lays its stamp over that. Such a stream holds no layer
+    /// to tell through: it is tested for that shape in line and dropped as
+    /// before. A stream of any other shape walks its layers out of line.
+    #[inline]
+    pub(crate) fn abort_past_stop(mut self) {
+        let plain = self.has_only_watch_and_tracking()
+            || matches!(
+                &self,
+                Self::DecodeSide(side) if side.inner.has_only_watch_and_tracking()
+            );
+        if !plain {
+            self.tell_stop();
+        }
+    }
+
+    /// Whether this is the watch for a client over the tracked layer over
+    /// a stream with no layer ([`Self::has_no_layer`]), and nothing else.
+    #[inline]
+    fn has_only_watch_and_tracking(&self) -> bool {
+        let Self::Watched(watched) = self else {
+            return false;
+        };
+        matches!(&watched.inner, Some(Self::Tracked(tracked)) if tracked.inner.has_no_layer())
+    }
+
+    /// [`Self::abort_past_stop`] for a stream that may hold the layer, out
+    /// of line: the layers are walked, and the layer tells the good end.
+    #[inline(never)]
+    fn tell_stop(&mut self) {
+        if let Some(reported) = self.reported() {
+            reported.met(None);
+        }
+    }
+
+    /// Whether this stream holds no layer the walk to the layer enters
+    /// ([`Self::reported`]): a worker's own stream, or a fan-out. A fan-out's
+    /// children are streams of their own, and the walk does not enter one
+    /// either, so naming it here changes no answer. A form added to the
+    /// stream counts as layered until it is named here: it walks its layers
+    /// at a reader's stop.
+    #[inline]
+    fn has_no_layer(&self) -> bool {
+        matches!(
+            self,
+            Self::Sglang(_)
+                | Self::Vllm(_)
+                | Self::Trtllm(_)
+                | Self::Mlx(_)
+                | Self::TokenSpeed(_)
+                | Self::Zmq(_)
+                | Self::Fanout(_)
+        )
+    }
+
+    /// The layer that tells this stream's end, under whatever lies over it.
+    fn reported(&mut self) -> Option<&mut ReportedStream> {
+        match self {
+            Self::Reported(reported) => Some(reported),
+            Self::Tracked(tracked) => tracked.inner.reported(),
+            Self::DecodeSide(side) => side.inner.reported(),
+            Self::Ahead(ahead) => ahead.inner.reported(),
+            Self::Watched(watched) => watched.inner.as_mut()?.reported(),
+            _ => None,
+        }
+    }
+
     /// Whether the end this stream's reader met was the client's leaving
     /// (see [`Self::until_client_gone`]), not the engine's end: the
     /// generation did not complete, and nothing accounts it as one. Read
@@ -2178,6 +2328,13 @@ impl ProtoStream {
                 *self = std::mem::replace(&mut ahead.inner, empty);
                 return first;
             }
+            // Read behind a boxed future, as any layer under the tracked
+            // one is: the stream under it mapped the item.
+            Self::Reported(reported) => {
+                let item = Box::pin(reported.inner.next_untracked()).await;
+                reported.met(item.as_ref());
+                return item;
+            }
         };
         item.map(reject_engine_error)
     }
@@ -2200,6 +2357,7 @@ impl ProtoStream {
                     inner.mark_completed();
                 }
             }
+            Self::Reported(reported) => reported.inner.mark_completed(),
         }
     }
 
@@ -2235,6 +2393,7 @@ impl ProtoStream {
                     inner.apply_deadline(deadline);
                 }
             }
+            Self::Reported(reported) => reported.inner.apply_deadline(deadline),
         }
     }
 
@@ -2314,6 +2473,13 @@ impl ProtoStream {
                     inner: inner.map(|inner| inner.defer_abort_within(bound)),
                     client_gone,
                     request_id,
+                }))
+            }
+            Self::Reported(reported) => {
+                let ReportedStream { inner, end } = *reported;
+                Self::Reported(Box::new(ReportedStream {
+                    inner: inner.defer_abort_within(bound),
+                    end,
                 }))
             }
         }
@@ -3613,6 +3779,80 @@ mod watched_tests {
         drop(rx);
         assert!(stream.next().await.is_none());
         assert!(stream.next().await.is_none());
+    }
+
+    /// A reader's own stop finds the layer that tells a stream's end under
+    /// each layer a reader's stream has: the tracked layer, the watch for
+    /// its client and a decode side's stamp, in a reader's order and in
+    /// another. Grand Central hears the worker's 200 each time.
+    #[test]
+    fn a_readers_stop_tells_the_end_under_each_layer_of_its_stream() {
+        use super::FanoutStream;
+        use crate::routers::common::placement::{tests::heard_request, RequestEnd};
+
+        let (client, _body) = sse_channel();
+        let stamp = || {
+            let mut prefill = PrefillCachedTokens::default();
+            prefill.note(&ProtoGenerateComplete::Vllm(Box::new(
+                vllm::GenerateComplete {
+                    cached_tokens: 2,
+                    ..Default::default()
+                },
+            )));
+            prefill
+        };
+        let layered = |end: RequestEnd| {
+            let mut stream = ProtoStream::Fanout(FanoutStream::new(Vec::new()));
+            stream.report_through(end);
+            stream
+        };
+        let tracked = |end: RequestEnd| {
+            let worker: Arc<dyn Worker> =
+                Arc::new(BasicWorkerBuilder::new("grpc://e:30000").build());
+            let mut stream =
+                ProtoStream::Fanout(FanoutStream::new(Vec::new())).tracked(worker, 0, false);
+            stream.report_through(end);
+            stream
+        };
+        let watched = |end: RequestEnd| tracked(end).until_client_gone(&client, "req-stopped");
+        let shapes: [(&str, &dyn Fn(RequestEnd) -> ProtoStream); 5] = [
+            ("the layer alone", &layered),
+            ("under the tracked layer", &tracked),
+            ("under the watch", &watched),
+            ("under a decode side's stamp", &|end| {
+                watched(end).decode_side(stamp())
+            }),
+            ("under a stamp that is watched", &|end| {
+                tracked(end)
+                    .decode_side(stamp())
+                    .until_client_gone(&client, "req-stopped")
+            }),
+        ];
+        for (shape, stream) in shapes {
+            let (heard, guard, end) = heard_request();
+            stream(end).abort_past_stop();
+            drop(guard);
+            assert_eq!(
+                *heard.lock().expect("the stage heard"),
+                ["issued", "dispatched Single", "completed Ok 200"],
+                "{shape}"
+            );
+        }
+    }
+
+    /// The stage puts the layer before a reader watches the stream: a debug
+    /// build stops at a stream watched already.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "the layer is put before the stream is watched")]
+    fn the_layer_is_not_put_over_a_watch() {
+        use super::FanoutStream;
+        use crate::routers::common::placement::RequestEnd;
+
+        let (client, _body) = sse_channel();
+        let mut stream = ProtoStream::Fanout(FanoutStream::new(Vec::new()))
+            .until_client_gone(&client, "req-watched");
+        stream.put_report_layer(RequestEnd::default());
     }
 
     /// A client that stays reads the stream as it is: every response, a gap

@@ -720,7 +720,7 @@ impl<'a> CompletionStream<'a> {
             endpoint: metrics_labels::ENDPOINT_COMPLETIONS,
             tail_tokens: self.tail_tokens,
         });
-        drop(grpc_stream);
+        grpc_stream.abort_past_stop();
     }
 
     /// The unit's totals for the coordinator. The closed choices are the

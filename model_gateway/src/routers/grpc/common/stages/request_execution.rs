@@ -44,7 +44,7 @@ use crate::{
             },
             pd_admission,
             pd_failure::{PdSide, SidePhase},
-            placement::Placed,
+            placement::{Placed, RequestEnd},
             prefill_admission::{PrefillAhead, PrefillLoadGuard},
             retry::mark_non_retryable,
         },
@@ -486,18 +486,31 @@ pub(crate) async fn execute_plan(
     // The deadline bounds the dispatch itself: a call the worker has not
     // answered when it passes is dropped, which cancels it on the worker as a
     // client's leaving does (see `dispatch_timed_out`).
-    let result = match deadline {
+    let mut result = match deadline {
         Some(deadline) => match tokio::time::timeout_at(deadline.at(), dispatch).await {
             Ok(result) => result,
             Err(_) => {
                 // The timeout is the decode's that was waited on: the one a
                 // second ask moved the pair to, where it moved.
                 let waited_on = moved.as_ref().unwrap_or(workers);
-                Err(dispatch_timed_out(deadline, waited_on, ledger, request_id))
+                let guards = ctx.load_guards.as_ref();
+                Err(dispatch_timed_out(
+                    deadline, waited_on, ledger, request_id, guards,
+                ))
             }
         },
         None => dispatch.await,
     };
+    // Grand Central hears the attempt's end from here, and from no
+    // dispatch: the plan holds the guards the handle is asked of. No await
+    // lies between the dispatch's return and this, so a stream takes its
+    // layer ahead of any reader's watch for its client (see
+    // `ProtoStream::put_report_layer`) and a failed call is told ahead of
+    // its retry's backoff. The selection's test stands here in line: a
+    // request the classic policies placed pays it and no more.
+    if workers.tells_end() {
+        tell_end(&mut result, workers.end(ctx.load_guards.as_ref()));
+    }
     // A pair's decode that moved behind its prefill: the attempt's selection
     // names the decode that was sent, for the response's stages and for a
     // retry.
@@ -537,6 +550,73 @@ pub(crate) async fn execute_plan(
     Ok(())
 }
 
+/// What one attempt's dispatch tells Grand Central of its request's
+/// end, through `end`, the handle the plan asked of the attempt's guards
+/// ([`WorkerSelection::end`]). The plan calls it once, behind the dispatch's
+/// return, for a request that tells its end
+/// ([`WorkerSelection::tells_end`]): a classic request never comes here, so
+/// it stands out of line.
+///
+/// A dispatch that answered hands the handle to its result, which tells its
+/// own end from here on ([`ExecutionResult::report_through`]). A dispatch
+/// that failed opened no stream to tell it: its answer bears the end it
+/// owes ([`UntoldEnd`]), which is taken off the answer and told. The
+/// deadline's answer bears none: [`dispatch_timed_out`] told that end.
+#[inline(never)]
+fn tell_end(result: &mut Result<ExecutionResult, Response>, end: RequestEnd) {
+    match result {
+        Ok(result) => result.report_through(end),
+        Err(response) => {
+            if let Some(untold) = UntoldEnd::take(response) {
+                end.report(untold.status, || untold.answered);
+            }
+        }
+    }
+}
+
+/// A request's end that its dispatch owes Grand Central and cannot
+/// tell: a dispatch holds no guard to ask the handle of. A dispatch that
+/// fails puts the end on the client's answer it makes ([`Self::mark`]), and
+/// the plan, which holds the guards, takes it off that answer and tells it
+/// ([`tell_end`]). No answer leaves the stage with it.
+///
+/// It holds the status the circuit breaker sampled for the request and
+/// whether the worker itself answered it: the two words of
+/// `RequestEnd::report`.
+#[derive(Clone, Copy)]
+struct UntoldEnd {
+    status: u16,
+    answered: bool,
+}
+
+impl UntoldEnd {
+    /// The end a dispatch under `workers` owes where it fails, as `read`
+    /// answers it: the status and whether the worker answered. `read` is
+    /// asked only for a request that tells its end
+    /// ([`WorkerSelection::tells_end`]): a request the classic policies
+    /// placed pays that test, and its answer takes no mark. `None` from
+    /// `read` is a failure that says nothing about its worker: nobody tells
+    /// it.
+    #[inline]
+    fn owed(workers: &WorkerSelection, read: impl FnOnce() -> Option<(u16, bool)>) -> Option<Self> {
+        if !workers.tells_end() {
+            return None;
+        }
+        read().map(|(status, answered)| Self { status, answered })
+    }
+
+    /// Mark `response`, the client's answer for the failed dispatch, with
+    /// this end.
+    fn mark(self, response: &mut Response) {
+        response.extensions_mut().insert(self);
+    }
+
+    /// The end `response` bears, taken off it.
+    fn take(response: &mut Response) -> Option<Self> {
+        response.extensions_mut().remove::<Self>()
+    }
+}
+
 /// The client's answer for an attempt whose deadline passed before the
 /// worker answered the call that opens the stream (a worker that took the
 /// request and never spoke; on a disaggregated pair, a side the pair's own
@@ -550,12 +630,16 @@ pub(crate) async fn execute_plan(
 /// prefill side's first response waits for the decode side; a prefill side
 /// that is itself silent is the prefill silence bound's to charge, which
 /// fires before this deadline when it is on. The dropped call is what
-/// cancels the request on the worker(s).
+/// cancels the request on the worker(s). A single request tells Grand
+/// Central the timeout here, where the breaker samples it: the dropped call
+/// left no answer to mark ([`UntoldEnd`]), so the plan hands in `guards`,
+/// the attempt's, and the handle is asked of them.
 fn dispatch_timed_out(
     deadline: RequestDeadline,
     workers: &WorkerSelection,
     ledger: &AttemptLedger,
     request_id: &str,
+    guards: Option<&LoadGuards>,
 ) -> Response {
     let status = deadline.status();
     let urls: Vec<&str> = workers
@@ -572,6 +656,7 @@ fn dispatch_timed_out(
         if let Some(sample) = status.breaker_status() {
             ledger.record_outcome(worker.as_ref(), sample);
         }
+        workers.end(guards).report_with(|| status.end_status());
         UpstreamClass::account_dispatch_failure(
             worker.worker_type().as_metric_label(),
             worker.connection_mode().as_metric_label(),
@@ -1284,6 +1369,11 @@ fn note_unpinned_prefill_room(prefill: &dyn Worker, request: &'static str) {
     });
 }
 
+/// Dispatch one generation to the selection's one worker. The dispatch
+/// tells Grand Central nothing of the request's end: the plan does
+/// ([`tell_end`]). A call that answers returns its stream unread, for the
+/// plan to hand the handle to. A call that fails marks its answer with the
+/// end it owes, the status the breaker samples here ([`UntoldEnd`]).
 async fn execute_single(
     mut proto_request: ProtoGenerateRequest,
     clients: &mut ClientSelection,
@@ -1328,12 +1418,16 @@ async fn execute_single(
                 &e,
             );
         }
-        start_failure_response(
+        let mut response = start_failure_response(
             &e,
             "execute_single",
             "Failed to start generation",
             "start_generation_failed",
-        )
+        );
+        if let Some(untold) = UntoldEnd::owed(workers, || e.end_status()) {
+            untold.mark(&mut response);
+        }
+        response
     })?;
     Ok(ExecutionResult::Single {
         stream,
@@ -1485,7 +1579,11 @@ where
 /// The worker's request count takes one per call, as the batched completions
 /// route counts its sub-requests.
 /// The circuit breaker takes one sample for the request, the worst answer by
-/// the worker's reading ([`batch_breaker_status`]).
+/// the worker's reading ([`batch_breaker_status`]). The request opens no
+/// stream, so that sample is the end Grand Central hears, and the plan
+/// tells it ([`tell_end`]): a request that fails marks its answer with it
+/// ([`UntoldEnd`]), and one whose answers are all good is told as the
+/// worker's 200, which is its sample.
 async fn execute_embed(
     requests: Vec<ProtoEmbedRequest>,
     clients: &mut ClientSelection,
@@ -1516,9 +1614,20 @@ async fn execute_embed(
     };
     // One breaker sample for the request, read from every answer: a worker
     // failure on any input counts whatever its place in the batch.
+    let mut untold = None;
     if let Some(status) = worker.and_then(|worker| batch_breaker_status(&answers, worker.as_ref()))
     {
         workers.record_outcome(ledger, status);
+        // The end a request that fails owes Grand Central: the sample,
+        // and whether the worker itself answered it, by an answer of that
+        // status that is no failure of the call under it.
+        untold = UntoldEnd::owed(workers, || {
+            let answered = answers.iter().any(|answer| match answer {
+                Ok(_) => status == 200,
+                Err(failure) => failure.end_status() == Some((status, true)),
+            });
+            Some((status, answered))
+        });
     }
     let result: Result<Vec<_>, _> = answers.into_iter().collect();
 
@@ -1530,12 +1639,16 @@ async fn execute_embed(
                 &e,
             );
         }
-        start_failure_response(
+        let mut response = start_failure_response(
             &e,
             "execute_embed",
             "Failed to start embedding",
             "start_embedding_failed",
-        )
+        );
+        if let Some(untold) = untold {
+            untold.mark(&mut response);
+        }
+        response
     })?;
 
     Ok(ExecutionResult::Embedding { responses })
@@ -2985,9 +3098,14 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::routers::{
-        common::{attempt_ledger::FailedSide, retry::is_retryable_response},
+        common::{
+            attempt_ledger::FailedSide,
+            placement::tests::{heard_request, Heard},
+            retry::is_retryable_response,
+        },
         grpc::{
             backend_client::BasicWorkerBuilder,
+            proto_wrapper::ProtoEmbedComplete,
             regular::streaming::tests::eof::{complete, scripted_stream},
         },
     };
@@ -6607,6 +6725,84 @@ pub(crate) mod tests {
             Some(500 | 503)
         ));
         assert_eq!(batch_breaker_status(&answers, &capacity_503), Some(500));
+    }
+
+    /// Whether `response` bears the end its dispatch owes Grand Central
+    /// ([`UntoldEnd`]). For the pipeline's cases: the mark is this file's
+    /// own, and no answer leaves the stage with it.
+    pub(crate) fn bears_untold_end(response: &Response) -> bool {
+        response.extensions().get::<UntoldEnd>().is_some()
+    }
+
+    /// What the stage of a hearing engine heard of one request.
+    fn heard_of(heard: &Heard) -> Vec<String> {
+        heard.lock().expect("the stage heard").clone()
+    }
+
+    /// The plan's one telling behind a failed dispatch. The answer bears
+    /// the end its dispatch owes: the plan takes it off the answer and tells
+    /// it. An answer that bears none tells nothing: the deadline's, whose
+    /// end was told where the answer was made. A request the classic
+    /// policies placed and a pair owe no end, and their failure is not read
+    /// for one.
+    #[test]
+    fn the_plan_takes_the_end_a_failed_dispatch_owes_off_its_answer_and_tells_it() {
+        let failed = || error::internal_error("stub_failed", "the stub's answer");
+
+        let (heard, guard, end) = heard_request();
+        let mut answer = failed();
+        let owed = UntoldEnd {
+            status: 500,
+            answered: true,
+        };
+        owed.mark(&mut answer);
+        assert!(bears_untold_end(&answer));
+        let mut result = Err(answer);
+        tell_end(&mut result, end);
+        assert!(result.is_err_and(|answer| !bears_untold_end(&answer)));
+        drop(guard);
+        assert_eq!(
+            heard_of(&heard),
+            ["issued", "dispatched Single", "completed ServerError 500"]
+        );
+
+        let (heard, guard, end) = heard_request();
+        let mut result = Err(failed());
+        tell_end(&mut result, end);
+        drop((result, guard));
+        assert_eq!(
+            heard_of(&heard),
+            ["issued", "dispatched Single", "completed Cancelled"]
+        );
+
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("grpc://w:30000").build());
+        let classic = WorkerSelection::Single {
+            worker: worker.into(),
+        };
+        for selection in [classic, tokenspeed_pair()] {
+            assert!(!selection.tells_end());
+            let owed = UntoldEnd::owed(&selection, || panic!("no end is owed"));
+            assert!(owed.is_none());
+        }
+    }
+
+    /// What a result in hand tells once the plan hands it the handle. An
+    /// embedding's answers are all good, so the worker's 200 is told at
+    /// once. An embedding of no answer tells nothing, as the breaker takes
+    /// no sample of it.
+    #[test]
+    fn an_embedding_in_hand_tells_the_workers_200_and_one_of_no_answer_nothing() {
+        let answer = ProtoEmbedComplete::Vllm(vllm::EmbedResponse::default());
+        for (responses, end_heard) in [
+            (vec![answer], "completed Ok 200"),
+            (Vec::new(), "completed Cancelled"),
+        ] {
+            let (heard, guard, end) = heard_request();
+            let mut result = ExecutionResult::Embedding { responses };
+            result.report_through(end);
+            drop((result, guard));
+            assert_eq!(heard_of(&heard), ["issued", "dispatched Single", end_heard]);
+        }
     }
 }
 

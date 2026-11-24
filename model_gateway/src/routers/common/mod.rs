@@ -240,14 +240,21 @@ pub mod bench_support {
             select_pair, select_single, Placed, PlacedPair, PlacementInputs, RequestEnd, Stated,
         },
         prefill_admission::hold_unbounded,
+        sse::sse_channel,
     };
     use crate::{
         config::RouterConfig,
         observability::cache_trace,
         policies::{PolicyRegistry, Side},
-        routers::common::{
-            pair_index::{PdPairIndex, PdWire},
-            snapshot::{RoutingPool, WorkerRegistry, WorkerRegistryExt},
+        routers::{
+            common::{
+                pair_index::{PdPairIndex, PdWire},
+                snapshot::{RoutingPool, WorkerRegistry, WorkerRegistryExt},
+            },
+            grpc::{
+                context::{LoadGuards, WorkerSelection},
+                proto_wrapper::{FanoutStream, ProtoStream},
+            },
         },
     };
 
@@ -292,6 +299,80 @@ pub mod bench_support {
         /// An answer read whole: the route keeps its answer and reports
         /// through it.
         Answer,
+        /// The gRPC execution stage's steps behind a placement, and what the
+        /// stage's plan does behind a dispatch that answered: it asks the
+        /// selection whether the request tells its end, the answer's word,
+        /// and behind a yes asks its guards the handle and hands it to the
+        /// request's stream. A classic request pays that test, and its
+        /// stream is left as it is.
+        Told,
+        /// The same with the guards asked whatever the answer's word says:
+        /// the walk a request Grand Central placed makes, counted here
+        /// on a classic guard.
+        Walked,
+        /// The stage's steps with nobody asking: the selection keeps the
+        /// answer, the attempt's guards are made from it and a tracked
+        /// stream stands for the call's. What the gRPC forms are counted
+        /// against. It stands among them in this list, so that the choice
+        /// among the forms costs it what it costs them: a form at the
+        /// list's edge is told apart by a range test, the others by a jump.
+        Dispatched,
+        /// The same as [`Self::Dispatched`], and the stream is read once, to
+        /// its end: one walk of a classic request's stream through its
+        /// layers, where no layer of Grand Central's lies.
+        Read,
+        /// The same as [`Self::Dispatched`], and the stream is watched for
+        /// a client, as a streaming reader's stream is. What
+        /// [`Self::Stopped`] is counted against.
+        Watched,
+        /// The same as [`Self::Watched`], and the stream is let go as a
+        /// reader lets it go at its own stop: asked for the layer that
+        /// tells its end, which a classic request's stream has not.
+        Stopped,
+        /// The same as [`Self::Dispatched`], and the stream takes the layer
+        /// that tells its end, as under a policy document one of whose
+        /// stages takes an end. The handle in it is empty: the report itself
+        /// is not in this count.
+        Layered,
+        /// The same as [`Self::Layered`], and the stream is read once, to
+        /// its end, through the layer. Counted against [`Self::Layered`],
+        /// and less what [`Self::Read`] pays, it is what the layer costs a
+        /// read.
+        LayeredRead,
+    }
+
+    /// The gRPC execution stage's steps behind a placement: the selection
+    /// that keeps the answer, the attempt's guards made from it, and a
+    /// stream that stands for the call's, tracked on its worker as the
+    /// stage tracks it.
+    #[inline]
+    fn dispatched(worker: Placed, key: Option<&str>) -> (WorkerSelection, LoadGuards, ProtoStream) {
+        let selection = black_box(WorkerSelection::Single { worker });
+        let guards = LoadGuards::new(&selection, key);
+        let stream = ProtoStream::Fanout(FanoutStream::new(Vec::new()));
+        let stream = match selection.single() {
+            Some(worker) => stream.tracked(Arc::clone(worker), 0, false),
+            None => stream,
+        };
+        (selection, guards, stream)
+    }
+
+    /// `stream` watched for a client whose channel is made here, out of
+    /// line: the two forms that watch run the same code for it.
+    #[inline(never)]
+    fn watched(stream: ProtoStream) -> ProtoStream {
+        let (client, _body) = sse_channel();
+        stream.until_client_gone(&client, "")
+    }
+
+    /// One read of `stream`, out of line, so that both executables of a
+    /// count run the same code around the read: whether it handed an item.
+    #[inline(never)]
+    fn read_once(stream: &mut ProtoStream) -> bool {
+        matches!(
+            futures::FutureExt::now_or_never(stream.next()),
+            Some(Some(_))
+        )
     }
 
     /// Bytes the calling thread has allocated since it started, by the
@@ -488,6 +569,49 @@ pub mod bench_support {
                     worker.ended(200, || true);
                 }
             }
+            // The gRPC execution stage's forms run one body, so that a form
+            // and its control differ by the form's own calls alone: the
+            // stream and the guards stand in the same places for each.
+            Ended::Told
+            | Ended::Walked
+            | Ended::Dispatched
+            | Ended::Read
+            | Ended::Watched
+            | Ended::Stopped
+            | Ended::Layered
+            | Ended::LayeredRead => {
+                let (selection, guards, mut stream) = dispatched(worker, key);
+                // Whether the stream was read stands in memory from here. In a
+                // register it is set again at the head of a form's own block,
+                // and the form's cell would count that beside its own calls.
+                let mut read = false;
+                let read = black_box(&mut read);
+                match end {
+                    Ended::Told => {
+                        if selection.tells_end() {
+                            stream.report_through(selection.end(Some(&guards)));
+                        }
+                    }
+                    Ended::Walked => stream.report_through(guards.end()),
+                    Ended::Layered | Ended::LayeredRead => {
+                        stream.put_report_layer(RequestEnd::default());
+                    }
+                    _ => {}
+                }
+                if matches!(end, Ended::Watched | Ended::Stopped) {
+                    stream = watched(stream);
+                }
+                if matches!(end, Ended::Read | Ended::LayeredRead) {
+                    *read = read_once(&mut stream);
+                }
+                black_box((&guards, &stream, *read));
+                if end == Ended::Stopped {
+                    stream.abort_past_stop();
+                } else {
+                    drop(stream);
+                }
+                drop((guards, selection));
+            }
         }
         Some(went)
     }
@@ -495,8 +619,8 @@ pub mod bench_support {
     /// [`route_pair`] with both guards standing where they are, shown to an
     /// opaque reader. Under [`Ended::Streamed`] the decode's reader tests
     /// the empty handle a pair route hands its relay. A pair route keeps no
-    /// answer to report through: [`Ended::Kept`] and [`Ended::Answer`] end
-    /// as [`Ended::Passed`] does.
+    /// answer to report through, and the gRPC stage's forms are a single
+    /// request's: every other form ends as [`Ended::Passed`] does.
     pub fn route_pair_ended(
         registry: &WorkerRegistry,
         policies: &PolicyRegistry,

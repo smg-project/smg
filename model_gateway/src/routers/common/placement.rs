@@ -536,6 +536,26 @@ impl RequestEnd {
             reported(&self.0, status, answered());
         }
     }
+
+    /// [`Self::report`] for a reader that works its status out of what it
+    /// read: `read` is asked only behind the handle's test, and answers the
+    /// status and whether the worker itself answered the request. `None`
+    /// reports nothing: an end that says nothing about its worker.
+    #[inline]
+    pub(crate) fn report_with(&self, read: impl FnOnce() -> Option<(u16, bool)>) {
+        if !self.0.is_empty() {
+            if let Some((status, answered)) = read() {
+                reported(&self.0, status, answered);
+            }
+        }
+    }
+
+    /// Whether the handle is empty. A reader that would hold something for
+    /// its report alone asks first, and holds nothing for an empty handle.
+    #[inline]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
 }
 
 /// [`RequestEnd::of`] for a guard that keeps something, out of line: a
@@ -561,6 +581,10 @@ fn reported(end: &SideEnd, status: u16, answered: bool) {
 /// failed connection. One refusal differs: the router's refusal of a
 /// worker's body over its limit carries no mark, on the Decisions route
 /// too, so it reads as a failed connection.
+///
+/// A gRPC route reads the word off the status itself
+/// (`TonicStatusExt::end_status`): a status the transport made, or one of
+/// the worker's side ending the call, is no answer of the worker's.
 fn transport_class(status: u16, answered: bool) -> TransportClass {
     match status {
         ..400 => TransportClass::Ok,
@@ -825,6 +849,29 @@ impl Placed {
     /// sends it as it does with no engine.
     #[inline]
     pub(crate) fn owed_behind_prefill(&self) -> bool {
+        self.engine.is_some()
+    }
+
+    /// The handle on the end of the request this answer placed, for a
+    /// route whose guard lies under what rides with it. `ask` finds the
+    /// guard made from this answer and asks it ([`RequestEnd::of`]), and is
+    /// called only where Grand Central placed the request. A classic
+    /// answer tests its one word and hands the empty handle: nothing is
+    /// walked for it.
+    #[inline]
+    pub(crate) fn end_of(&self, ask: impl FnOnce() -> RequestEnd) -> RequestEnd {
+        match &self.engine {
+            None => RequestEnd::default(),
+            Some(_) => ask(),
+        }
+    }
+
+    /// Whether the request this answer placed tells Grand Central its
+    /// end: the one word [`Self::end_of`] tests. A route asks it where the
+    /// guard is not at hand, or where it would make something for the
+    /// report alone. A classic answer says no, and nothing is made for it.
+    #[inline]
+    pub(crate) fn tells_end(&self) -> bool {
         self.engine.is_some()
     }
 
@@ -7127,6 +7174,18 @@ pub(crate) mod tests {
         let spec = AppliedSpec::validate_in(&document, &stages, &[]);
         engine_on(policies, spec.expect("the stages hold the scorer"));
         heard
+    }
+
+    /// One request a hearing engine placed, for a case of another module:
+    /// what the stage hears, the request's load guard and the handle on its
+    /// end.
+    pub(crate) fn heard_request() -> (Heard, WorkerLoadGuard, RequestEnd) {
+        let registry = http_registry(&["http://h:1"]);
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let heard = hearing_engine_on(&policies);
+        let guard = answered(&registry, &policies, PlacementInputs::default()).guard(None);
+        let end = RequestEnd::of(&guard);
+        (heard, guard, end)
     }
 
     /// With an engine handed to the registry the placement asks it, and the
