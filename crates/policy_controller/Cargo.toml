@@ -280,6 +280,9 @@ tower = { version = "0.5", default-features = false, features = ["util"] }
 # The controller's cases poll the mock worker's gRPC engines in-process:
 # the same `GetLoads` answers the gateway's tests read.
 mock-worker = { path = "../mock_worker" }
+# The classic rows' scripted engine answers the worker crate's engine calls
+# in `tonic::Status`, under two features that turn no `tonic` on.
+tonic = { workspace = true }
 
 # The spec file's open is read on a terminal pair its test makes (`pty`).
 [target.'cfg(target_os = "linux")'.dev-dependencies]
