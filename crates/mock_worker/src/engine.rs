@@ -771,9 +771,9 @@ impl PublishedLoad {
 
 /// Fault hooks the admin API switches on: batches lost on the wire, published
 /// twice or in the other order, event streams cut, delayed publishing,
-/// delayed admission, a load report that trails the engine, a frozen
-/// engine, a publisher restart, and requests answered with an error
-/// status, held back or cut mid-stream.
+/// delayed admission, a load report that trails the engine or stands
+/// still, a frozen engine, a publisher restart, and requests answered with
+/// an error status, held back or cut mid-stream.
 #[derive(Default)]
 struct Faults {
     /// Event batches still to lose on the wire.
@@ -835,6 +835,13 @@ struct Faults {
     /// lag was set, then what the engine published since, less the entries
     /// a newer one older than the lag made of no use.
     load_history: Mutex<VecDeque<(Instant, PublishedLoad)>>,
+    /// The load-freeze hook is set: every load report states
+    /// `load_standing`, whatever the engine holds meanwhile.
+    load_frozen: AtomicBool,
+    /// The report that stands while the load-freeze hook is set, written
+    /// with `load_frozen` under this lock. A report takes the lock only
+    /// while the hook is set.
+    load_standing: Mutex<Option<LoadSnapshot>>,
 }
 
 /// A request fault the admin API arms: what the worker answers instead of
@@ -904,6 +911,7 @@ pub(crate) struct FaultStatus {
     pub stalled_total: u64,
     pub cold_shape_ms: u64,
     pub load_lag_ms: u64,
+    pub load_frozen: bool,
 }
 
 /// What the engine itself would serve from cache for a prompt right now.
@@ -1330,6 +1338,23 @@ impl Engine {
         }
     }
 
+    /// Have every load report state what a report reads now, until the hook
+    /// is turned off: an engine that serves its requests while its counters
+    /// stand still. Set again while it is set, the report that stands stays.
+    pub(crate) fn fault_load_freeze(&self, on: bool) {
+        let faults = &self.shared.faults;
+        let mut standing = faults
+            .load_standing
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if !on {
+            *standing = None;
+        } else if standing.is_none() {
+            *standing = Some(self.load_at(Instant::now()));
+        }
+        faults.load_frozen.store(on, Ordering::Relaxed);
+    }
+
     /// Let at most `per_sec` new requests per second into the engine (0
     /// clears); the rest wait their turn, unseen by the load record.
     pub(crate) fn fault_admit_per_sec(&self, per_sec: u64) {
@@ -1557,6 +1582,7 @@ impl Engine {
             stalled_total: f.stalled_total.load(Ordering::Relaxed),
             cold_shape_ms: f.cold_shape_ms.load(Ordering::Relaxed),
             load_lag_ms: f.load_lag_ms.load(Ordering::Relaxed),
+            load_frozen: f.load_frozen.load(Ordering::Relaxed),
         }
     }
 
@@ -1657,13 +1683,25 @@ impl Engine {
     /// the read: an idle engine builds no new snapshot, and the one it
     /// published when its last pass ended would carry that pass's rate for
     /// as long as the engine sits idle (a paused one too), where a servicer's
-    /// tracker drops its samples after a minute (`PREFILL_RATE_TTL`).
+    /// tracker drops its samples after a minute (`PREFILL_RATE_TTL`). Under
+    /// the load-freeze hook it is the report that stood when the hook was
+    /// set, whole.
     pub fn load(&self) -> LoadSnapshot {
-        self.load_at(Instant::now())
+        let faults = &self.shared.faults;
+        let standing = if faults.load_frozen.load(Ordering::Relaxed) {
+            faults
+                .load_standing
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone()
+        } else {
+            None
+        };
+        standing.unwrap_or_else(|| self.load_at(Instant::now()))
     }
 
-    /// The engine's own counts, whatever lag the load-lag hook has a report
-    /// state them under: the ground truth the admin API's fleet states.
+    /// The engine's own counts, whatever the load-lag and load-freeze hooks
+    /// have a report state: the ground truth the admin API's fleet states.
     pub(crate) fn load_truth(&self) -> LoadSnapshot {
         self.load_behind(Instant::now(), Duration::ZERO)
     }
@@ -6002,6 +6040,45 @@ mod tests {
         assert_eq!(engine.fault_status().load_lag_ms, 0);
         let room = history.lock().unwrap_or_else(|p| p.into_inner()).capacity();
         assert_eq!(room, 0, "a cleared lag gives the history's room back");
+    }
+
+    /// An engine that serves while its counters stand still: under the
+    /// load-freeze hook every report states the one that stood when the
+    /// hook was set while the admin API's truth states the engine's own,
+    /// and a report follows the engine again once the hook is turned off.
+    #[tokio::test]
+    async fn a_load_freeze_holds_the_report_while_the_engine_serves() {
+        let engine = live();
+        let (request, mut rx) = req("a", vec![3; 32], 40);
+        engine.submit(request);
+        // The hook is set at the request's first token, and the request
+        // ends under it.
+        let mut frozen = false;
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("the request is served under the freeze")
+                .expect("stream open");
+            if !frozen {
+                frozen = true;
+                engine.fault_load_freeze(true);
+            }
+            if matches!(event, GenEvent::Done { .. }) {
+                break;
+            }
+        }
+        // Set again while it is set: the report that stands stays.
+        engine.fault_load_freeze(true);
+        assert_eq!(
+            engine.load().num_running_reqs,
+            1,
+            "the report from before the request ended stands"
+        );
+        assert_eq!(engine.load_truth().num_running_reqs, 0, "the truth");
+        assert!(engine.fault_status().load_frozen);
+        engine.fault_load_freeze(false);
+        assert_eq!(engine.load().num_running_reqs, 0, "off: its own count");
+        assert!(!engine.fault_status().load_frozen);
     }
 
     /// A kernel built for a new shape: the engine holds before the pass that
