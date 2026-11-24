@@ -48,11 +48,6 @@ pub const ENTRIES: &[(&str, &str, EntryReplication)] = &[
         "host_count",
         EntryReplication::Rebuilt("each replica's holder hands its own worker objects"),
     ),
-    // The status a verdict moves is journaled as the status write it makes.
-    // The streak between two moves is the prober's own count: a promoted
-    // standby's prober starts it again.
-    ("HealthSink", "probe_outcome", EntryReplication::Journaled),
-    ("HealthSink", "connected", EntryReplication::Journaled),
     (
         "HealthSink",
         "gateway_veto",

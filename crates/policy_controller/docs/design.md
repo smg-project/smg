@@ -1930,7 +1930,7 @@ Its data is one in-memory store (`store/memory.rs`):
 | Data | Filled by | Note |
 |---|---|---|
 | worker records | the `RegisterWorker`, `PatchWorker`, `DeregisterWorker` calls, and the leader's own discovery | discovery is behind a feature the image leaves out; a record it writes asks for the worker's cache events where the document in force at the find reads them for the worker's first model, and a document applied later does not write that word again |
-| worker objects | a task that follows the worker records | a second form of the same workers, of the worker crate's type; each states its registration's overload thresholds over one default, 8 queued requests and 0.8 usage, an external record's over none, and the load monitor judges by them while the replica leads; an object's status follows its record's, and a single request's decision reads the workers here |
+| worker objects | a task that follows the worker records | a second form of the same workers, of the worker crate's type; each states its registration's overload thresholds over one default, 8 queued requests and 0.8 usage, an external record's over none, and the load monitor judges by them while the replica leads; an object's status leads its record's, and a single request's decision reads the workers here |
 | health | the worker crate's health checker over the worker objects, on the leader | copied into the records |
 | loads | the worker crate's load monitor over the worker objects, while the replica leads: a poll every 10 seconds, and the load records on the workers' event streams | `PushLoad` is not served; a single request's decision is given the monitor's snapshot where the document reads reports and keeps none; the store's load table is written by nothing |
 | cache index | a follower of each worker's cache events | an index of the store's own; `PushKvEvents` is not served; a single request's decision reads none yet, only the engine's own record of sent prompts |
@@ -2119,7 +2119,7 @@ A fact leaves the remainder when the worker object gets a field that holds it as
 3. No health outcome is judged over a record. It moves the worker object, whose status leads,
    and the record is told the status that stands, for the log and a first copy **[built]**. A
    connect signal and a drain are written the same way **[built]**. The store's own machine
-   for a health outcome is deleted **[planned]**. A decision reads the object's status, as a single
+   for a health outcome is deleted **[built]**. A decision reads the object's status, as a single
    request's does on main.
 4. The table of records, the second copy of the facts, the two conversions between a record
    and an object, and the task that follows the table are deleted.
@@ -2168,15 +2168,18 @@ the worker registry's own health machine, which moves the object. The code that 
 objects then tells the store the status that stands, under the object's own lock, through one
 entry that asks the writer's lead under the membership lock. A move the store takes no word
 of is taken back in that same turn of the object's lock: the object takes the status its
-record holds. A registration call's connect signal and its drain go through
+record holds or, where no record stands for it, the status it left. A registration call's
+connect signal and its drain go through
 that entry too: the store is told first, and the object moves where the store took the
 status. The locks in their order: the object's own, then the store's membership lock. No
 holder of the store's lock takes an object's, and no decision takes one. From the table to an
-object there is one way, the told one: a standby's applier and a gateway's watcher lay each
-status their leader tells, and each status of a first copy. The code that keeps a
+object there are two ways, both of a told status. A standby's applier and a gateway's watcher
+lay each status their leader tells, the status of each record it tells, and each status of a
+first copy. A tell the store refuses gives the object the status its record holds. The
+code that keeps a
 controller's objects copies no status from its own store's tail: with that copy, two moves in
-a row could end with the object at the older one. The store's own health machine has no
-caller in the product, and the next change deletes it.
+a row could end with the object at the older one. The store judges no health outcome: its
+own machine for one is deleted.
 
 A lease keeps naming its worker by the record's id, never by a place in a list: a gateway
 reports on a lease later and across membership changes.

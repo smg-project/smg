@@ -40,22 +40,27 @@ use smg_worker::{
 };
 
 use super::{Lead, Objects};
-use crate::store::{HealthSink as StoreHealthSink, MemoryStore};
+use crate::store::MemoryStore;
 
 /// The health sink for a replica that keeps its workers in the store.
-pub struct HealthAdapter<G, S: ?Sized> {
+pub struct HealthAdapter<G> {
     objects: Arc<Objects<G>>,
-    store: Arc<S>,
+    store: Arc<MemoryStore>,
     lead: Arc<dyn Lead>,
     term: u64,
 }
 
-impl<G: Generation, S: StoreHealthSink + ?Sized> HealthAdapter<G, S> {
+impl<G: Generation> HealthAdapter<G> {
     /// An adapter for `term`. Each call checks that `lead` still names it
     /// before it hands a verdict on. A status is told under the object's
     /// lock where `lead` names the term still, and the store asks it once
     /// more behind its own.
-    pub fn new(objects: Arc<Objects<G>>, store: Arc<S>, lead: Arc<dyn Lead>, term: u64) -> Self {
+    pub fn new(
+        objects: Arc<Objects<G>>,
+        store: Arc<MemoryStore>,
+        lead: Arc<dyn Lead>,
+        term: u64,
+    ) -> Self {
         Self {
             objects,
             store,
@@ -69,7 +74,7 @@ impl<G: Generation, S: StoreHealthSink + ?Sized> HealthAdapter<G, S> {
     }
 }
 
-impl<G: Generation> HealthSink for HealthAdapter<G, MemoryStore> {
+impl<G: Generation> HealthSink for HealthAdapter<G> {
     /// The registry's state machine judges the probe over the object, and
     /// a move is told to the store.
     fn probe_outcome(
@@ -172,7 +177,7 @@ mod tests {
             })
         }
 
-        fn adapter(&self) -> HealthAdapter<Members, MemoryStore> {
+        fn adapter(&self) -> HealthAdapter<Members> {
             HealthAdapter::new(
                 Arc::clone(&self.objects),
                 Arc::clone(&self.store),
@@ -338,7 +343,7 @@ mod tests {
                 1,
             )
         };
-        let pass = |adapter: &HealthAdapter<Members, MemoryStore>| {
+        let pass = |adapter: &HealthAdapter<Members>| {
             adapter.probe_outcome(&replica.id, true, replica.revision, ObjectStatus::Pending)
         };
         // One pass of the two the policy asks, under a term that stands.
