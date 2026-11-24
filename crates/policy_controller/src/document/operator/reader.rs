@@ -4,6 +4,7 @@ use std::{cell::Cell, fmt, path::Path};
 
 use serde::de::{self, DeserializeSeed, Deserializer, EnumAccess, MapAccess, SeqAccess, Visitor};
 use serde_json::{map::Entry, Map, Number, Value};
+use serde_path_to_error::Segment;
 
 use super::SpecRejected;
 use crate::document::spec::PolicySpec;
@@ -105,40 +106,42 @@ impl Format {
             return Err(SpecRejected::TooLarge(len));
         }
         self.parse(document)
-            .map_err(|Refused { path, message }| SpecRejected::Unparsed {
+            .map_err(|Refused { path, message, .. }| SpecRejected::Unparsed {
                 format: self.as_str(),
                 path,
                 message,
             })
     }
 
-    /// The document these bytes read as. A YAML document is read once, into
-    /// the values it reads as, held under a bound ([`read_yaml`]), and the
-    /// document is built from those values alone. So a YAML document reads
-    /// as JSON does: text that looks like a number or a boolean is quoted
-    /// where a field takes text, and a whole number past 64 bits reads as a
-    /// fraction. A field the reader refuses is named by its path, and a
-    /// YAML document's refusal says what its writer does about a plain word
-    /// ([`cured`]).
+    /// The document these bytes read as. A document of either form is read
+    /// once, into the values it reads as ([`read_yaml`], [`read_json`]),
+    /// and the document is built from those values alone: one typed read
+    /// for both forms. So a YAML document reads as JSON does: text that
+    /// looks like a number or a boolean is quoted where a field takes text,
+    /// and a whole number past 64 bits reads as a fraction. A number reads
+    /// one way in both forms and in every build: a whole number of 64 bits
+    /// as itself, and any other as the nearest double. A narrower field
+    /// takes it by a cast. So a number that rounds past the largest single
+    /// reads as infinite where a single stands, and the spec's check
+    /// refuses it by its field. A field the reader refuses is named by its
+    /// path, and a YAML document's refusal says what its writer does about
+    /// a plain word ([`cured`]).
+    ///
+    /// Three numbers read apart, by the two forms' own rules. A zero
+    /// written `-0` is the whole number zero in YAML and a fraction in
+    /// JSON, which a whole-number field refuses. A number past a double is
+    /// out of range in JSON and text in YAML, which a number's field
+    /// refuses. And a YAML whole number may be written in hex, octal or
+    /// binary.
     fn parse(self, document: &[u8]) -> Result<PolicySpec, Refused> {
         match self {
-            Self::Yaml => placed(read_yaml(document).map_err(Refused::whole)?).map_err(
-                |Refused { path, message }| Refused {
-                    path,
-                    message: cured(message),
-                },
-            ),
-            // A JSON document that reads is read once, by the typed read
-            // alone. A refused one is read again as values and placed as a
-            // YAML document's are, for the field of its refusal.
-            Self::Json => serde_json::from_slice(document).map_err(|refused| {
-                match serde_json::from_slice(document).map(placed) {
-                    Ok(Err(at_field)) => at_field,
-                    // No values, or values that read (a key written twice
-                    // keeps its last): the refusal is the typed read's own.
-                    Ok(Ok(_)) | Err(_) => Refused::whole(refused),
-                }
-            }),
+            Self::Yaml => {
+                placed(read_yaml(document).map_err(Refused::whole)?).map_err(|refused| Refused {
+                    message: cured(refused.message, refused.item),
+                    ..refused
+                })
+            }
+            Self::Json => placed(read_json(document).map_err(Refused::whole)?),
         }
     }
 }
@@ -147,6 +150,7 @@ impl Format {
 /// field the read refused.
 fn placed(values: Value) -> Result<PolicySpec, Refused> {
     serde_path_to_error::deserialize(values).map_err(|refused| {
+        let item = matches!(refused.path().iter().next_back(), Some(Segment::Seq { .. }));
         let path = refused.path().to_string();
         let message = refused.into_inner().to_string();
         // The document itself has no name.
@@ -154,15 +158,17 @@ fn placed(values: Value) -> Result<PolicySpec, Refused> {
         Refused {
             path: wanted(path, &message),
             message,
+            item,
         }
     })
 }
 
 /// `message` with what a writer of YAML does about it, where the typed read
 /// refused a plain word. A number or a boolean where the field takes text
-/// is that text in quotes. A null is a key with nothing under it: the key
-/// is taken out, or given its text, its list or its map.
-fn cured(message: String) -> String {
+/// is that text in quotes. A null is a key with nothing under it, or a list
+/// item with nothing in it where the refusal's place is one (`item`): the
+/// key or the item is taken out, or given its text, its list or its map.
+fn cured(message: String, item: bool) -> String {
     let cure = message
         .strip_prefix("invalid type: ")
         .and_then(|rest| rest.split_once(", expected "))
@@ -175,8 +181,14 @@ fn cured(message: String) -> String {
                 "integer" | "floating" | "boolean" if text => {
                     Some("text that reads as a number, a boolean or a null is written in quotes")
                 }
+                "null" if text && item => Some(
+                    "a list item with nothing in it is a null: take the item out, or write its text in quotes",
+                ),
                 "null" if text => Some(
                     "a key with nothing under it is a null: take the key out, or write its text in quotes",
+                ),
+                "null" if holds && item => Some(
+                    "a list item with nothing in it is a null: take the item out, or write [] or {}",
                 ),
                 "null" if holds => Some(
                     "a key with nothing under it is a null: take the key out, or write [] or {}",
@@ -208,10 +220,12 @@ fn wanted(mut path: String, message: &str) -> String {
 }
 
 /// Why a reader refused a document: the path of the field, where the
-/// refusal is about one, and the reader's message.
+/// refusal is about one, the reader's message, and whether the place is a
+/// list's item, which has no key.
 struct Refused {
     path: String,
     message: String,
+    item: bool,
 }
 
 impl Refused {
@@ -220,6 +234,7 @@ impl Refused {
         Self {
             path: String::new(),
             message: message.to_string(),
+            item: false,
         }
     }
 }
@@ -263,6 +278,30 @@ pub(super) fn read_yaml(document: &[u8]) -> Result<Value, String> {
     Weighed(&left)
         .deserialize(serde_yaml::Deserializer::from_slice(document))
         .map_err(|error| error.to_string())
+}
+
+/// Reads a JSON document once, into the values it reads as, by the visitor
+/// a YAML document's values are read by ([`read_yaml`]). A key written
+/// twice is refused by name, a field's as a map's, at the place where its
+/// map ends. A JSON document has no alias, so one of the size bound is
+/// under both bounds of the read: its densest form, a list of one-digit
+/// numbers, builds one value for each two bytes. The library has a limit
+/// of its own: a document nested 128 deep is refused in the library's
+/// words.
+///
+/// The document is not built from its bytes. That read asks the JSON
+/// library for a single-precision number where a single stands, and the
+/// library answers by its build. With its exact reading it refuses a number
+/// past single precision and rounds a long number straight to a single,
+/// and without it does neither. A value is the nearest double in every
+/// build that asks for the exact reading, and this crate's manifest asks
+/// for it.
+fn read_json(document: &[u8]) -> Result<Value, serde_json::Error> {
+    let left = Left::whole();
+    let mut reader = serde_json::Deserializer::from_slice(document);
+    let values = Weighed(&left).deserialize(&mut reader)?;
+    reader.end()?;
+    Ok(values)
 }
 
 /// What a read has left of a document's two bounds.
@@ -465,6 +504,7 @@ mod tests {
     use std::fmt::Write as _;
 
     use super::*;
+    use crate::document::spec::ScoreSpec;
 
     #[test]
     fn a_files_form_is_read_off_its_name() {
@@ -631,7 +671,9 @@ mod tests {
 
     /// A typed YAML read takes each of these, and so a host's own did. This
     /// read refuses each by its field or its place, with what a writer does
-    /// about it where a plain word of YAML is the cause.
+    /// about it where a plain word of YAML is the cause. A null in a list
+    /// where text, a list or a map stands is an item with nothing in it,
+    /// and is told so: it has no key to take out.
     #[test]
     fn a_refusal_names_its_place_and_what_a_writer_does() {
         const QUOTES: &str =
@@ -640,6 +682,9 @@ mod tests {
             "a key with nothing under it is a null: take the key out, or write [] or {}";
         const NO_TEXT: &str =
             "a key with nothing under it is a null: take the key out, or write its text in quotes";
+        const EMPTY_ITEM: &str =
+            "a list item with nothing in it is a null: take the item out, or write [] or {}";
+        const NO_TEXT_ITEM: &str = "a list item with nothing in it is a null: take the item out, or write its text in quotes";
         let document = |profile: &str, more: &str| {
             format!("apiVersion: smg.policy/v1\nprofiles:\n  default: {profile}\n{more}")
         };
@@ -669,6 +714,28 @@ mod tests {
             (
                 document("{pick: random}", "signals:\n"),
                 format!("signals: invalid type: null, expected a map: {EMPTY}"),
+            ),
+            (
+                document("{pick: random}", "view:\n  headers: [~]\n"),
+                format!("view.headers[0]: invalid type: null, expected a string: {NO_TEXT_ITEM}"),
+            ),
+            (
+                document("{pick: random}", "view:\n  headers:\n  - x-tenant\n  -\n"),
+                format!("view.headers[1]: invalid type: null, expected a string: {NO_TEXT_ITEM}"),
+            ),
+            (
+                document("{pick: random}", "bindings:\n-\n"),
+                format!("bindings[0]: invalid type: null, expected struct BindingSpec: {EMPTY_ITEM}"),
+            ),
+            // A key with nothing under it inside a list's item is a key's.
+            (
+                document("{pick: random}", "bindings:\n- profiles:\n"),
+                format!("bindings[0].profiles: invalid type: null, expected a map: {EMPTY}"),
+            ),
+            // No cure where neither text, a list nor a map stands.
+            (
+                document("{pick: random}", "view:\n  boundaries: [~]\n"),
+                "view.boundaries[0]: invalid type: null, expected u32".to_owned(),
             ),
             (
                 binding("!mine batch"),
@@ -722,6 +789,408 @@ mod tests {
         assert_eq!(
             refusal(Format::Json, json),
             format!("not a policy spec in json: {refused}")
+        );
+    }
+
+    /// One document in both forms, with `number` the weight of its one
+    /// scorer: what the YAML form reads, which the JSON form reads too.
+    fn weighted(number: &str) -> PolicySpec {
+        let yaml = format!(
+            "apiVersion: smg.policy/v1\nprofiles:\n  default:\n    \
+             score: [{{least-load: {{weight: {number}}}}}]\n    pick: best\n"
+        );
+        let json = format!(
+            r#"{{"apiVersion":"smg.policy/v1","profiles":{{"default":{{"score":[{{"least-load":{{"weight":{number}}}}}],"pick":"best"}}}}}}"#
+        );
+        let read = Format::Yaml
+            .read(yaml.as_bytes())
+            .expect("the YAML form reads");
+        match Format::Json.read(json.as_bytes()) {
+            Ok(json) => assert_eq!(json, read, "the weight {number}"),
+            Err(refused) => panic!("the JSON form refuses the weight {number}: {refused}"),
+        }
+        read
+    }
+
+    /// A number past single precision reads alike in both forms where a
+    /// single stands: as infinite, which the spec's check refuses by its
+    /// field. So does the whole number one under the last rounding boundary
+    /// of single precision: as a double it is the boundary itself. A long
+    /// number at a rounding boundary reads as one single in both forms too:
+    /// each form reads a double first, and the field takes it by a cast.
+    #[test]
+    fn a_number_past_single_precision_reads_alike_in_both_forms() {
+        for past in [
+            "340282366920938463463374607431768211455",
+            "3.5e38",
+            "1e39",
+            // 2^128 - 2^103 - 1.
+            "340282356779733661637539395458142568447",
+        ] {
+            let refused = weighted(past)
+                .validate()
+                .err()
+                .map(|refused| refused.to_string());
+            assert_eq!(
+                refused.as_deref(),
+                Some(
+                    "profiles.default.score[0].least-load.weight = inf is not a finite number \
+                     above zero"
+                ),
+                "{past}"
+            );
+        }
+        let weight = |number: &str| match &weighted(number).profiles["default"].score[0] {
+            ScoreSpec::Params(stage) => stage.weight().to_bits(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(weight("3.4028235e38"), f32::MAX.to_bits());
+        // Just over the middle of the single 1 + 2^-22 and the next above:
+        // the nearest double is that middle, and its tie goes to the even
+        // single, the lower one.
+        assert_eq!(
+            weight("1.0000002980232238769531250000000000001"),
+            (1.0 + 2.0 * f32::EPSILON).to_bits()
+        );
+    }
+
+    /// How many numbers of single precision a schema writes.
+    fn singles(schema: &Value) -> usize {
+        match schema {
+            Value::Object(fields) => {
+                usize::from(fields.get("format").and_then(Value::as_str) == Some("float"))
+                    + fields.values().map(singles).sum::<usize>()
+            }
+            Value::Array(items) => items.iter().map(singles).sum(),
+            _ => 0,
+        }
+    }
+
+    /// Every field of single precision, at each place a spec writes it,
+    /// reads a number past it alike in both forms, and the spec's check
+    /// refuses it by the field's own path: no such field takes an infinite
+    /// number into a decision. The rows are counted against the schema, so
+    /// a new field of single precision joins them. The schema writes each
+    /// field as a `float`, once: three scorers share the bare weight. The
+    /// overload's usage it writes as a null alone.
+    #[test]
+    fn every_field_of_single_precision_refuses_a_number_past_it_in_both_forms() {
+        const ABOVE: &str = "a finite number above zero";
+        const FROM: &str = "a finite number at or above zero";
+        const UNIT: &str = "between 0 and 1";
+        const ONE: &str = "a finite number at least 1";
+        const STATED: &str = "left out: a worker's registration states this threshold, or its \
+                              program's default does";
+        let spec = |profile: &str, more: &str| {
+            format!(r#"{{"apiVersion":"smg.policy/v1","profiles":{{"default":{profile}}}{more}}}"#)
+        };
+        let scorer = |name: &str, written: &str| {
+            spec(
+                &format!(r#"{{"score":[{{"{name}":{written}}}],"pick":"best"}}"#),
+                "",
+            )
+        };
+        let mut rows = Vec::new();
+        for (name, key, range) in [
+            ("least-requests", "weight", ABOVE),
+            ("fewest-sessions", "weight", ABOVE),
+            ("session-affinity", "weight", ABOVE),
+            ("least-load", "weight", ABOVE),
+            ("least-load", "kv_pressure_weight", FROM),
+            ("least-load", "default_throughput", ABOVE),
+            ("prefix-affinity", "weight", ABOVE),
+            ("prefix-affinity", "threshold", UNIT),
+            ("prefix-affinity", "decay", FROM),
+            ("prefix-affinity", "spill.rel", ONE),
+            ("kv-pressure", "weight", ABOVE),
+            ("kv-pressure", "spread", ABOVE),
+            ("kv-pressure", "ceiling", ABOVE),
+            ("warmup-slice", "weight", ABOVE),
+            ("warmup-slice", "share", UNIT),
+            ("warmup-slice", "thin_ratio", UNIT),
+            ("warmup-slice", "miss_share", UNIT),
+            ("bucket", "weight", ABOVE),
+            ("bucket", "rel_threshold", ONE),
+            ("consistent-hash", "weight", ABOVE),
+        ] {
+            // A key under a key: `spill.rel` is written {"spill":{"rel":1e39}}.
+            let written = key.rsplit('.').fold("1e39".to_owned(), |inner, key| {
+                format!(r#"{{"{key}":{inner}}}"#)
+            });
+            rows.push((
+                scorer(name, &written),
+                format!("profiles.default.score[0].{name}.{key} = inf is not {range}"),
+            ));
+        }
+        // Two scorers want a second parameter beside the weight.
+        for (name, written) in [
+            ("resident-work", r#"{"weight":1e39,"request_tokens":0}"#),
+            ("least-cost", r#"{"weight":1e39,"terms":{"load.queued":1}}"#),
+        ] {
+            rows.push((
+                scorer(name, written),
+                format!("profiles.default.score[0].{name}.weight = inf is not {ABOVE}"),
+            ));
+        }
+        rows.push((
+            spec(
+                r#"{"pick":{"best-with-temperature":{"temperature":1e39}}}"#,
+                "",
+            ),
+            format!("profiles.default.pick.best-with-temperature.temperature = inf is not {FROM}"),
+        ));
+        rows.push((
+            spec(
+                r#"{"pick":"random"}"#,
+                r#","bindings":[{"profile":"default","overload":{"token_usage":1e39}}]"#,
+            ),
+            format!("bindings[0].overload.token_usage = inf is not {STATED}"),
+        ));
+        for (document, refused) in &rows {
+            // A JSON text is YAML's flow form too: both forms read these
+            // bytes.
+            let yaml = Format::Yaml
+                .read(document.as_bytes())
+                .expect("the YAML form reads");
+            match Format::Json.read(document.as_bytes()) {
+                Ok(json) => assert_eq!(json, yaml, "{document}"),
+                Err(refusal) => panic!("the JSON form refuses {document}: {refusal}"),
+            }
+            let check = yaml.validate().err().map(|refusal| refusal.to_string());
+            assert_eq!(check.as_ref(), Some(refused), "{document}");
+        }
+        let schema = PolicySpec::schema_json().expect("the schema");
+        let schema: Value = serde_json::from_str(&schema).expect("the schema is JSON");
+        // Two rows more than fields: the three scorers of a bare weight.
+        assert_eq!(
+            rows.len() - 2,
+            singles(&schema) + 1,
+            "a field of single precision has no row here"
+        );
+    }
+
+    /// A long number reads as the nearest double in both forms, to its last
+    /// bit: which fraction a whole number past 64 bits reads as is held.
+    /// 2^64 + 2049 is one past the middle of two doubles, so its lowest bit
+    /// decides between them.
+    #[test]
+    fn a_long_number_reads_as_the_nearest_double_in_both_forms() {
+        for (number, nearest) in [
+            ("18446744073709553665", 2f64.powi(64) + 4096.0),
+            ("-18446744073709553665", -(2f64.powi(64) + 4096.0)),
+            ("18446744073710621455", 1.844_674_407_371_062e19),
+            ("1.7017420689181831", 1.701_742_068_918_183),
+            ("1.9940575818108110", 1.994_057_581_810_811),
+        ] {
+            let nearest = serde_json::json!({ "a": nearest });
+            assert_eq!(
+                read_yaml(format!("a: {number}\n").as_bytes()),
+                Ok(nearest.clone()),
+                "{number}"
+            );
+            let json = read_json(format!(r#"{{"a":{number}}}"#).as_bytes());
+            assert_eq!(
+                json.map_err(|refused| refused.to_string()),
+                Ok(nearest),
+                "{number}"
+            );
+        }
+    }
+
+    /// A JSON document is read into values first, as a YAML one is. A key
+    /// written twice is refused by name, a field's as a map's, at the place
+    /// where its map ends. What stands behind the document's value, white
+    /// space apart, is refused. And the library reads 127 values deep and no
+    /// deeper.
+    #[test]
+    fn a_json_document_is_read_into_values_first() {
+        const SPEC: &str =
+            r#"{"apiVersion":"smg.policy/v1","profiles":{"default":{"pick":"random"}}}"#;
+        assert!(Format::Json.read(SPEC.as_bytes()).is_ok());
+        for (document, refused) in [
+            (
+                SPEC.replace(
+                    r#""profiles""#,
+                    r#""generation":1,"generation":2,"profiles""#,
+                ),
+                "the key `generation` is written twice at line 1 column 101",
+            ),
+            (
+                SPEC.replace("}}}", r#"},"default":{"pick":"random"}}}"#),
+                "the key `default` is written twice at line 1 column 98",
+            ),
+            (
+                SPEC.replace(
+                    r#"{"pick":"random"}"#,
+                    r#"{"score":[{"least-load":{"weight":1,"weight":2}}],"pick":"best"}"#,
+                ),
+                "the key `weight` is written twice at line 1 column 99",
+            ),
+            (
+                format!("{SPEC} {{}}"),
+                "trailing characters at line 1 column 73",
+            ),
+        ] {
+            assert_eq!(
+                refusal(Format::Json, document.as_bytes()),
+                format!("not a policy spec in json: {refused}"),
+                "{document}"
+            );
+        }
+        let nest = |depth: usize| format!("{}{}", "[".repeat(depth), "]".repeat(depth));
+        assert!(read_json(nest(127).as_bytes()).is_ok());
+        assert_eq!(
+            read_json(nest(128).as_bytes()).map_err(|refused| refused.to_string()),
+            Err("recursion limit exceeded at line 1 column 128".to_owned())
+        );
+    }
+
+    /// A JSON document has no alias, so one of the size bound is under both
+    /// bounds of the read. These are its densest forms: a list of one-digit
+    /// numbers by the values it builds, one value for each two bytes; one
+    /// text by the text it reads as; and keys of a number each. A key
+    /// written twice to the size bound is weighed whole too, and refused by
+    /// its name, not by a bound. The read is held to its two bounds all the
+    /// same: a text past twice the size bound, handed to it past the size
+    /// bound, is refused by the text's.
+    #[test]
+    fn a_json_document_of_the_size_bound_is_under_both_bounds_of_the_read() {
+        let bound = usize::try_from(MAX_DOCUMENT_BYTES).expect("the bound fits");
+        let numbers = format!("[{}0]", "0,".repeat((bound - 3) / 2));
+        assert_eq!(numbers.len(), bound - 1, "a byte under the bound");
+        let read = read_json(numbers.as_bytes()).expect("the numbers read");
+        assert_eq!(read.as_array().map(Vec::len), Some(bound / 2 - 1));
+
+        let text = format!("\"{}\"", "x".repeat(bound - 2));
+        let read = read_json(text.as_bytes()).expect("the text reads");
+        assert_eq!(read.as_str().map(str::len), Some(bound - 2));
+
+        let mut keys = String::from("{\"0\":0");
+        let mut key = 1;
+        while keys.len() + 12 < bound {
+            let _ = write!(keys, ",\"{key:x}\":0");
+            key += 1;
+        }
+        keys.push('}');
+        let read = read_json(keys.as_bytes()).expect("the keys read");
+        assert_eq!(read.as_object().map(Map::len), Some(key));
+
+        let twice = format!("{{{}\"\":0}}", "\"\":0,".repeat((bound - 7) / 5));
+        assert!(twice.len() > bound - 5 && twice.len() <= bound);
+        assert_eq!(
+            read_json(twice.as_bytes()).map_err(|refused| refused.to_string()),
+            Err(format!(
+                "the key `` is written twice at line 1 column {}",
+                twice.len()
+            ))
+        );
+
+        let past = format!("\"{}\"", "x".repeat(2 * bound + 1));
+        match read_json(past.as_bytes()) {
+            Err(refused) => assert!(refused.to_string().contains(PAST_TEXT), "{refused}"),
+            Ok(_) => panic!("{} bytes of text read", past.len() - 2),
+        }
+    }
+
+    /// The three numbers the two forms read apart, each by its form's own
+    /// rule: a zero written `-0`, a number past a double, and a whole number
+    /// in hex, octal or binary.
+    #[test]
+    fn the_two_forms_read_three_texts_apart() {
+        let read = |format: Format, generation: &str| {
+            let document = match format {
+                Format::Yaml => format!(
+                    "apiVersion: smg.policy/v1\ngeneration: {generation}\n\
+                     profiles:\n  default: {{pick: random}}\n"
+                ),
+                Format::Json => format!(
+                    r#"{{"apiVersion":"smg.policy/v1","generation":{generation},"profiles":{{"default":{{"pick":"random"}}}}}}"#
+                ),
+            };
+            format
+                .read(document.as_bytes())
+                .map_err(|refused| refused.to_string())
+        };
+        // `-0` is the whole number zero in YAML, and a fraction in JSON.
+        assert_eq!(read_yaml(b"a: -0\n"), Ok(serde_json::json!({"a": 0})));
+        let fraction = read_json(br#"{"a":-0}"#).expect("it reads");
+        assert!(fraction["a"].is_f64());
+        assert!(fraction["a"].as_f64().is_some_and(f64::is_sign_negative));
+        let zero = read(Format::Yaml, "0");
+        assert!(zero.is_ok(), "{zero:?}");
+        assert_eq!(read(Format::Yaml, "-0"), zero);
+        assert_eq!(
+            read(Format::Json, "-0"),
+            Err(
+                "not a policy spec in json: generation: invalid type: floating point `-0.0`, \
+                 expected u64"
+                    .to_owned()
+            )
+        );
+        // A number past a double is text in YAML, and out of range in JSON.
+        assert_eq!(
+            read(Format::Yaml, "1e400"),
+            Err(
+                "not a policy spec in yaml: generation: invalid type: string \"1e400\", \
+                 expected u64"
+                    .to_owned()
+            )
+        );
+        assert_eq!(
+            read(Format::Json, "1e400"),
+            Err("not a policy spec in json: number out of range at line 1 column 48".to_owned())
+        );
+        // A YAML whole number in hex, octal or binary: JSON has no such form.
+        for sixteen in ["0x10", "0o20", "0b10000"] {
+            assert_eq!(
+                read(Format::Yaml, sixteen),
+                read(Format::Yaml, "16"),
+                "{sixteen}"
+            );
+            assert_eq!(
+                read(Format::Json, sixteen),
+                Err(
+                    "not a policy spec in json: expected `,` or `}` at line 1 column 45".to_owned()
+                ),
+                "{sixteen}"
+            );
+        }
+        assert!(read(Format::Yaml, "16").is_ok() && read(Format::Json, "16").is_ok());
+    }
+
+    /// The crate's manifest asks the JSON library for its exact reading
+    /// (`float_roundtrip`) in its own entry of that library. No case of
+    /// behaviour can hold that line: every test build of the crate has the
+    /// feature on without it, by the ask of another crate that the cases'
+    /// build reaches, so a case reads a long number the exact way with the
+    /// line and without it. The crate built alone, and a package built on
+    /// it that reaches no such crate, have the feature by this line only.
+    /// So this case reads the entry itself.
+    #[test]
+    fn the_crates_manifest_asks_the_json_library_for_its_exact_reading() {
+        let manifest = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"));
+        let dependencies = manifest
+            .split_once("\n[dependencies]\n")
+            .map(|(_, rest)| rest.split("\n[").next().unwrap_or(rest))
+            .expect("the manifest's dependencies");
+        let entries: Vec<&str> = dependencies
+            .lines()
+            .filter(|line| line.starts_with("serde_json = "))
+            .collect();
+        let [entry] = entries.as_slice() else {
+            panic!("one entry of the JSON library: {entries:?}")
+        };
+        // A comment behind the entry asks for nothing.
+        let written = entry.split('#').next().unwrap_or_default();
+        let features = written
+            .split_once("features = [")
+            .and_then(|(_, rest)| rest.split_once(']'))
+            .map_or("", |(features, _)| features);
+        assert!(
+            features
+                .split(',')
+                .any(|feature| feature.trim() == "\"float_roundtrip\""),
+            "{entry}"
         );
     }
 }
