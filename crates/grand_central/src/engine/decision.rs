@@ -198,10 +198,11 @@ impl Targets {
     /// Turns a decode side's targets into a pair's where they stand: each
     /// names `prefill` with the decode it held, in the order they had. The
     /// first pair states `decode`, the decode side's own session verdict,
-    /// and no pair behind it states one. Nothing is stated of a pair's
-    /// first target ([`Pick::overlap`]). The entries past the count are not
-    /// rewritten, as [`Self::clear`] leaves them. No accessor goes past the
-    /// count.
+    /// and no pair behind it states one. What the decode side's list
+    /// stated of its first target goes ([`Pick::overlap`]): the engine
+    /// over worker lists states what a pair's prefill holds behind this
+    /// turn. The entries past the count are not rewritten, as
+    /// [`Self::clear`] leaves them. No accessor goes past the count.
     pub(crate) fn pair_under(&mut self, prefill: &Target, decode: SessionVerdict) {
         // Taken by the first pair: the pairs behind it read none.
         let mut verdict = DecodeVerdict::of(decode);
@@ -493,8 +494,12 @@ pub enum OverlapSource {
 /// a single decision, from the first target's entry of the rows that
 /// decision was given: the rows the engine named from the host's own data,
 /// a caller's column, or the rows a caller named. No stage is asked. A
-/// decision given no rows states nothing. Neither does a pair, or a pick
-/// the binding's sessions rule keeps from the profile.
+/// pair's first decision states the same of its prefill, which is its first
+/// target's worker, from the prefills' column: a pick has room for one
+/// statement, so nothing is stated of the decode. A decision given no rows
+/// states nothing. Neither does a pair's decode decided again, an encode
+/// request's pair, or a pick the binding's sessions rule keeps from the
+/// profile.
 /// [`Engine::decide`](crate::engine::Engine::decide) itself states nothing.
 ///
 /// A request decided inside a tree its host lends is given the rows the

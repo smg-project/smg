@@ -1153,13 +1153,14 @@ fn placing_a_request_asks_the_table_of_names_for_nothing() {
 /// to ([`Placement::overlap`]): a host observes its cache series from it.
 /// A prompt's first request reads a miss of its blocks. Its next request
 /// reads every block held, by the record of sent prefixes, and a kept
-/// placement says the same. A pick states its first target alone: a request
-/// its route's rule sends to the target behind is stated nothing, though
-/// one decision placed it. Neither is a place one pick decides, nor a pair.
+/// placement says the same. A pick states its first target's worker alone:
+/// a single request its route's rule sends to the target behind goes to
+/// another worker and is stated nothing, though one decision placed it.
+/// Neither is a place one pick decides. A pair's statement stands with a
+/// pair's cases (`a_pairs_placement_states_what_its_prefill_holds`).
 ///
 /// The classic policy observes the share of the worker it chose
-/// (`model_gateway/src/policies/cache_aware.rs:2676-2688`), a pair's sides
-/// each by its own policy.
+/// (`model_gateway/src/policies/cache_aware.rs:2676-2688`).
 #[test]
 fn a_placement_states_what_its_pick_states_of_the_worker_taken() {
     use crate::engine::decision::{Overlap, OverlapSource};
@@ -1217,22 +1218,6 @@ fn a_placement_states_what_its_pick_states_of_the_worker_taken() {
     let plain = hosted(preset("round_robin"));
     let placed = plain.place(&request).expect("a placement");
     assert_eq!(placed.overlap, Overlap::NONE);
-
-    // A pair whose two sides read who holds the prompt: its pick states
-    // none, at the prompt's first request and at its next.
-    let sides = PolicySpec::pair_presets("cache_aware", "cache_aware");
-    let paired = hosted(engine_of(&sides.expect("the pair presets")));
-    let two = PublishedList::new(pool(2));
-    let classes = PartnerClasses::number(2, [&[0_u32, 1][..], &[0, 1][..]]);
-    let pair = PlaceRequest {
-        prompt,
-        ..PlaceRequest::of(MODEL, WorkerLists::Pair(pair_of(&two, &classes)))
-    };
-    for _ in 0..2 {
-        let placement = paired.place(&pair).expect("a pair");
-        assert!(placement.decode.is_some());
-        assert_eq!(placement.overlap, Overlap::NONE);
-    }
 }
 
 /// A program that asks `place` states no worker id of its own: a placement
