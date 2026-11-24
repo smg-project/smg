@@ -1461,20 +1461,6 @@ impl framework::Filter for ShowsItsRows {
     }
 }
 
-/// A filter that refuses an encoder to a request that carries a pin.
-#[derive(Debug)]
-struct NoEncoderUnderAPin;
-
-impl framework::Filter for NoEncoderUnderAPin {
-    fn name(&self) -> &'static str {
-        "no-encoder-under-a-pin"
-    }
-
-    fn keep(&self, facts: &RequestFacts<'_>, row: &Candidate, _: &Constraints<'_>) -> bool {
-        !matches!(row.role, Role::Encode) || facts.pinned_at == 0
-    }
-}
-
 /// The bed's decision over `pools` under `facts` and each side's
 /// constraints: the prefill's, the decode's and the encode's.
 fn decide_under(
@@ -1584,25 +1570,6 @@ fn a_mask_on_a_row_cut_out_declines_nothing_for_a_side_that_shows_its_rows() {
         shed_of(&decide(&[1])),
         (ShedReason::PolicyDeclined, "written-rows")
     );
-}
-
-/// A pin is a position in another pool, and the encode side's stages are
-/// handed none.
-#[test]
-fn the_encode_side_is_handed_no_pin() {
-    let mut engine = engine();
-    for profile in &mut engine.profiles {
-        profile.filters.push(Box::new(NoEncoderUnderAPin));
-    }
-    let bed = Bed::new();
-    let pinned = RequestFacts {
-        pinned_at: 1,
-        ..bed.asked().0
-    };
-    let cx = Constraints::default();
-    let (decision, placed) = decide_under(&bed, &engine, &pinned, bed.pools(), [&cx; 3]);
-    assert!(decision.pick().is_some(), "a pick, not {decision:?}");
-    assert_eq!(placed.encoders().len(), 1);
 }
 
 /// A pair column of another length than its pool declines as the pair

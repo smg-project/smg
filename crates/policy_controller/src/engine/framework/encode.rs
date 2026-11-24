@@ -568,8 +568,7 @@ impl Engine {
     /// key. A pair column of another length than its pool names
     /// `affinity-column` before a cut, as the pair entry names it. So does
     /// a column on the request, or rows named on it, before a stage of the
-    /// encode side is asked. The encode side's stages are handed no pin
-    /// ([`RequestFacts::pinned_at`]): a pin is a position in another pool.
+    /// encode side is asked.
     ///
     /// A list this side hands on in a pool's stead (the prefills or the
     /// decodes it admits, the encoders it offers a key) is numbered anew. A
@@ -722,9 +721,8 @@ impl Engine {
         let encode_facts = RequestFacts {
             phase: Phase::Encode,
             affinity: encode.affinity,
-            // A pin and lent counts are positions in another pool: the
-            // encode side takes neither.
-            pinned_at: 0,
+            // Lent counts are positions in another pool: the encode side
+            // takes none.
             lent_in_flight: None,
             // The encoders' own cells: the request's would be read by
             // another pool's positions.

@@ -310,7 +310,7 @@ impl Scorer for SessionAffinity {
 
     fn score(
         &self,
-        facts: &RequestFacts<'_>,
+        _: &RequestFacts<'_>,
         candidates: &[Candidate],
         kept: &[u32],
         out: &mut [f32],
@@ -321,12 +321,6 @@ impl Scorer for SessionAffinity {
             } else {
                 0.0
             };
-        }
-        // A pin that stands beside the rows names one row: it is looked for
-        // once, and a decision under no such pin pays one test for it.
-        let pinned = facts.pinned_at.checked_sub(1);
-        if let Some(slot) = pinned.and_then(|at| kept.iter().position(|&i| i == at)) {
-            out[slot] = 1.0;
         }
         TieBand::NORMALIZED
     }
@@ -3650,25 +3644,18 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_session_scorer_reads_the_pin_beside_the_rows_own_bit() {
-        let pool = [candidate(0, 0), candidate(1, 0), candidate(2, 0)];
-        let unpinned = RequestFacts::default();
-        let pinned = RequestFacts {
-            pinned_at: 2,
-            ..unpinned
-        };
-        assert!(pinned.pins(1) && !pinned.pins(0) && !pinned.pins(2));
-        assert!(!unpinned.pins(0) && !unpinned.pins(u32::MAX - 1));
-        // No position reads as pinned under no pin, the last one neither.
-        assert!(!unpinned.pins(u32::MAX));
+    fn the_session_scorer_reads_the_rows_own_bit() {
+        let mut pool = [candidate(0, 0), candidate(1, 0), candidate(2, 0)];
+        let facts = RequestFacts::default();
         let mut scores = [0.0f32; 3];
-        SessionAffinity.score(&unpinned, &pool, &kept(3), &mut scores);
+        SessionAffinity.score(&facts, &pool, &kept(3), &mut scores);
         assert_eq!(scores, [0.0, 0.0, 0.0]);
-        SessionAffinity.score(&pinned, &pool, &kept(3), &mut scores);
+        pool[1].session_hit = true;
+        SessionAffinity.score(&facts, &pool, &kept(3), &mut scores);
         assert_eq!(scores, [0.0, 1.0, 0.0]);
-        // The scorer is handed the rows kept: the pin is read by position.
+        // The scorer is handed the rows kept: a row is read by its index.
         let mut scores = [0.0f32; 2];
-        SessionAffinity.score(&pinned, &pool, &[1, 2], &mut scores);
+        SessionAffinity.score(&facts, &pool, &[1, 2], &mut scores);
         assert_eq!(scores, [1.0, 0.0]);
     }
 

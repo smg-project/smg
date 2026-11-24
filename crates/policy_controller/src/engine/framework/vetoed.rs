@@ -3595,7 +3595,7 @@ mod tests {
     }
 
     /// A profile under the key's mark that shows its rows declines what
-    /// the scope's own arm declines: a mask or a pin beside the rows says
+    /// the scope's own arm declines: a mask beside the rows says
     /// they were not written for the decision, and the key's arm opens no
     /// scope over them, for a request with a key and for one with none.
     #[test]
@@ -3604,10 +3604,6 @@ mod tests {
         let pool = [free(0, 4), free(1, 4)];
         let key = keyed("k1");
         let none = facts(1);
-        let pinned = RequestFacts {
-            pinned_at: 1,
-            ..key
-        };
         let masked = Constraints {
             stalled: &[0],
             ..Constraints::default()
@@ -3618,7 +3614,6 @@ mod tests {
         };
         for (facts, cx, beside) in [
             (&key, &masked, "a mask"),
-            (&pinned, &written, "a pin"),
             (&none, &masked, "a mask and no key"),
         ] {
             assert_eq!(
