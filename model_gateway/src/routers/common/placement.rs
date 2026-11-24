@@ -24,7 +24,7 @@ use smg_policy_controller::{
     document::DecodePick,
     engine::{
         DecisionEngine, LentList, PairAdmission, PairLists, Phase, PlaceRequest, PolicyEngine,
-        ShedReason, Unplaced, WorkerLists,
+        Unplaced, WorkerLists,
     },
     policies::consistent_hashing::LentRing,
     tracking::{Placement, PlacementSide},
@@ -790,7 +790,6 @@ impl ByEngine {
             model_id,
             &pairs,
             wire,
-            None,
             None,
             inputs,
             self.stated,
@@ -2307,22 +2306,16 @@ impl PairAdmission for PairGates<'_> {
 ///
 /// What `inputs` and `stated` state of the request is handed as the engine
 /// reads it ([`place_request`]), the route's own rule among it, which the
-/// engine asks of the workers it picked. Four things are the pair's own:
+/// engine asks of the workers it picked and, behind a first decision that
+/// places nobody, of each pool. Three things are the pair's own:
 ///
 /// - A request pinned to a wire, as a retry is to its retained plan's,
 ///   states it as its demand ([`place_request`]): each pool states its
 ///   workers' wires, and the engine holds each side to the workers on the
 ///   request's. The lists stay the pools' own, and the wire states no
-///   place beside them.
-/// - A pair asked again behind a call that answered no worker, or that
-///   shed the request as saturated where the overload shed is off and a
-///   side has nobody the request may use and that is available, where the
-///   route's rule takes a pair that can be sent to, is held to the places
-///   of the workers `held_to` takes, that rule ([`pair_by_engine`]). A
-///   first ask states none, and neither does a decode asked again: its
-///   route's rule claims the decode it is asked of. A pinned pair asked
-///   again so is held to both: the engine judges its demand among the
-///   places stated.
+///   place beside them. A pinned pair the engine decides again among
+///   the workers its route's rule takes stays on its wire: the engine
+///   judges the demand among the places it holds a side to.
 /// - The retry number is stated as half the engines the request tried,
 ///   rounded up: a pair's failed attempt names both its engines.
 /// - The request states that its decode may be asked again behind its
@@ -2339,27 +2332,12 @@ fn with_pair_request<R>(
     model_id: &str,
     pairs: &PdPairIndex,
     wire: Option<WireConstraint>,
-    held_to: Option<CandidateFilter<'_>>,
     prefill_capacity: Option<&PrefillSelectionContext<'_>>,
     inputs: PlacementInputs<'_>,
     stated: Stated,
     ask: impl FnOnce(&mut PlaceRequest<'_>) -> R,
 ) -> R {
     let ([prefill, decode], classes) = pairs.lent();
-    // The places of the workers the route's rule takes, where the pair is
-    // asked again held to it. The wire is no part of them: a pinned request
-    // states it as its demand, and the engine judges that demand among the
-    // places a side is held to.
-    let held = |pool: &[Arc<dyn Worker>]| -> Option<Vec<u32>> {
-        held_to.map(|takes| {
-            (0u32..)
-                .zip(pool)
-                .filter(|(_, worker)| takes(worker.as_ref()))
-                .map(|(place, _)| place)
-                .collect()
-        })
-    };
-    let (prefill_places, decode_places) = (held(prefill.workers), held(decode.workers));
     let gates = PairGates {
         prefills: prefill.workers,
         decodes: decode.workers,
@@ -2370,10 +2348,11 @@ fn with_pair_request<R>(
         decode,
         classes,
         admission: &gates,
-        // A pinned request is held to its wire by its demand, a side at a
-        // time: the wire states no place of a list.
-        prefill_places: prefill_places.as_deref(),
-        decode_places: decode_places.as_deref(),
+        // No place of a list is stated. A pinned request is held to its
+        // wire by its demand, a side at a time, and the engine asks the
+        // route's rule of a list itself.
+        prefill_places: None,
+        decode_places: None,
         // The gateway's standing vetoes are on its worker objects, which
         // the engine reads: none is stated beside a list.
         prefill_stalled: &[],
@@ -2403,13 +2382,12 @@ fn with_pair_request<R>(
 
 /// [`select_pair`] where the gateway started the policy engine, out of
 /// line: the engine places the pair with one call, over the request
-/// [`with_pair_request`] states, and with one more, held to the route's
-/// rule, where that rule takes a pair that can be sent to and the first
-/// answers no worker, or sheds the request as saturated
-/// ([`ShedReason::Saturated`]) where the overload shed is off and a side
-/// has nobody the request may use and that is available. Its document
-/// picks both sides: no classic policy runs, and the load default of the
-/// classic pass pairs nobody here.
+/// [`with_pair_request`] states. Behind the call's first decision none of
+/// whose picks can be sent to, refused by the route's rule or not ready,
+/// or that sheds the request as saturated, the call asks a rule the route
+/// states of each pool, once, and decides again among the workers it
+/// takes. Its document picks both sides: no classic policy runs, and the
+/// load default of the classic pass pairs nobody here.
 ///
 /// Prefills all at the request's admission limit answer
 /// [`PlacementFailure::PrefillAtCapacity`], on which the route waits for a
@@ -2459,87 +2437,31 @@ fn pair_by_engine(
     let stated = stated();
     let fail =
         |role: WorkerRole, verdict: PlacementFailure| Box::new(PairFailure { role, verdict });
-    let admitted = |worker: &Arc<dyn Worker>| {
-        WireConstraint::admits(wire, worker.as_ref())
-            && inputs
-                .candidate_filter
-                .is_none_or(|accepts| accepts(worker.as_ref()))
-    };
-    let place = |held_to: Option<CandidateFilter<'_>>| {
-        with_pair_request(
-            engine,
-            registry,
-            policies,
-            model_id,
-            pairs,
-            wire,
-            held_to,
-            prefill_capacity,
-            inputs,
-            stated,
-            |request| {
-                engine.place(request).map(|placement| {
-                    let labels = (
-                        placement.profile,
-                        placement.decode_profile.unwrap_or(placement.profile),
-                    );
-                    (labels, PlacedPair::by_engine(placement, stated))
-                })
-            },
-        )
-    };
-    // The engine asks a pair's rule of its picks alone, a few a decision,
-    // which miss the workers a rule takes of a long pool: the pair is then
-    // decided once more among the workers the rule takes now, where it
-    // takes a prefill and a decode that prefill pairs with, each ready and
-    // let through by its circuit breaker: the overload veto and the liveness
-    // veto are the engine's to lift. Prefills of one descriptor share one
-    // partner list: the rule is asked of a list once.
-    let takes_a_pair = || {
-        let takes = |worker: &Arc<dyn Worker>| {
-            let state = worker.routing_state();
-            state.healthy && state.can_execute && admitted(worker)
-        };
-        let mut refused: Vec<&Arc<[Arc<dyn Worker>]>> = Vec::new();
-        for (prefill, partners) in pairs.prefill.iter().zip(&pairs.partners) {
-            if refused.iter().any(|&list| Arc::ptr_eq(list, partners)) || !takes(prefill) {
-                continue;
-            }
-            if partners.iter().any(takes) {
-                return true;
-            }
-            refused.push(partners);
-        }
-        false
-    };
-    let open = |pool: &[Arc<dyn Worker>]| pool.iter().any(|w| admitted(w) && w.is_available());
-    // The engine judges the overload steer over the pools it was handed: a
-    // worker under the thresholds that the rule refuses keeps it from a side
-    // whose workers the rule takes are all over them, and the call sheds the
-    // request. Where the gateway steers, that call is asked again the same
-    // way, as a classic pass steers a pool over the workers the rule takes.
-    let missed = |unplaced: &Unplaced| match unplaced {
-        Unplaced::NoWorkers => true,
-        Unplaced::Shed { reason, .. } => {
-            *reason == ShedReason::Saturated
-                && !registry.overload_shed_enabled()
-                && !(open(&pairs.prefill) && open(&pairs.decode_pool))
-        }
-        _ => false,
-    };
     let side_row = |side: RowSide, label| row_name(policies, Some(side), label);
     let prefill_seen = cache_trace::observe(&pairs.prefill_pool);
     let decode_seen = prefill_seen
         .as_ref()
         .and_then(|_| cache_trace::observe(&pairs.decode_pool));
-    let placed = match place(None) {
-        Err(unplaced)
-            if inputs.candidate_filter.is_some() && missed(&unplaced) && takes_a_pair() =>
-        {
-            place(inputs.candidate_filter)
-        }
-        placed => placed,
-    };
+    let placed = with_pair_request(
+        engine,
+        registry,
+        policies,
+        model_id,
+        pairs,
+        wire,
+        prefill_capacity,
+        inputs,
+        stated,
+        |request| {
+            engine.place(request).map(|placement| {
+                let labels = (
+                    placement.profile,
+                    placement.decode_profile.unwrap_or(placement.profile),
+                );
+                (labels, PlacedPair::by_engine(placement, stated))
+            })
+        },
+    );
     let (labels, pair) = match placed {
         Ok(placed) => placed,
         Err(Unplaced::PrefillsFull) => {
@@ -2550,6 +2472,14 @@ fn pair_by_engine(
         }
         Err(unplaced) => {
             report_unplaced(model_id, &unplaced, "The policy engine placed no pair");
+            let admitted = |worker: &Arc<dyn Worker>| {
+                WireConstraint::admits(wire, worker.as_ref())
+                    && inputs
+                        .candidate_filter
+                        .is_none_or(|accepts| accepts(worker.as_ref()))
+            };
+            let open =
+                |pool: &[Arc<dyn Worker>]| pool.iter().any(|w| admitted(w) && w.is_available());
             let (role, pool) = if open(&pairs.prefill) {
                 engine_row(decode_seen, || side_row(DECODE_ROW, ""), None);
                 (WorkerRole::Decode, &pairs.decode_pool)
@@ -3047,7 +2977,9 @@ pub(crate) mod tests {
         worker::{HealthCheckConfig, WorkerStatus},
     };
     use smg_policy_controller::{
-        document::{AppliedSpec, DecodePick, KeySourceSpec, PolicySpec, RoutingKeySpec},
+        document::{
+            AppliedSpec, DecodePick, KeySourceSpec, OverloadSpec, PolicySpec, RoutingKeySpec,
+        },
         engine::{Candidate, Decision, RequestFacts, Scorer, Target, TieBand},
         stages::{Lifecycle, StageRegistry},
         tracking::{EventSet, Lease, Outcome, ReleaseReason, Side},
@@ -9181,14 +9113,13 @@ pub(crate) mod tests {
         );
     }
 
-    /// A route's rule that takes one worker of each pool finds that pair.
-    /// The engine's call names twelve pairs at most, four a decision: where
-    /// none of them holds the rule's two workers, the pair is decided once
-    /// more among the workers the rule takes, a stalled prefill or decode
-    /// among them. That ask answers as a first one does: with the rule's
-    /// prefill at its admission limit the request waits for a slot. A rule
-    /// whose decode is not ready takes no second ask: the first answer
-    /// stands.
+    /// A route's rule that takes one worker of each pool finds that pair,
+    /// by the engine's one call. Where a decision's picks miss the rule's
+    /// two workers, the call asks the rule of each pool and decides again
+    /// among the workers it takes, a stalled prefill or decode among
+    /// them. That decision answers as any does: with the rule's prefill at
+    /// its admission limit the request waits for a slot, and with the
+    /// rule's decode not ready the decode side has nobody.
     #[test]
     fn the_engines_pair_finds_the_one_decode_its_routes_rule_takes() {
         let grpc = ConnectionMode::Grpc;
@@ -9286,17 +9217,32 @@ pub(crate) mod tests {
         engine_on(&policies, spec.expect("a valid document"));
         let d1 = registry.get_by_url("grpc://d:1").expect("registered");
         registry.set_worker_overloaded(&d1, true);
-        let pairs = pairs_of(&registry, &policies);
-        // A pair for a request whose rule refuses the one worker at `refused`.
-        let pick = |refused: &str, limit: Option<&PrefillSelectionContext<'_>>| {
+        // A gateway that sheds an overloaded pool says so in its document,
+        // and its engine decides under that word.
+        let shedding = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let mut sheds = PolicySpec::pair_presets("round_robin", "round_robin").expect("presets");
+        sheds.bindings[0].overload = Some(OverloadSpec {
+            shed_when_all_vetoed: true,
+            ..OverloadSpec::default()
+        });
+        engine_on(
+            &shedding,
+            AppliedSpec::validate(&sheds).expect("a valid document"),
+        );
+        // A pair under `policies` for a request whose rule refuses the one
+        // worker at `refused`.
+        let pick = |policies: &PolicyRegistry,
+                    refused: &str,
+                    limit: Option<&PrefillSelectionContext<'_>>| {
             let takes = |worker: &dyn Worker| worker.url() != refused;
             let inputs = PlacementInputs {
                 candidate_filter: Some(&takes),
                 ..Default::default()
             };
+            let pairs = pairs_of(&registry, policies);
             select_pair(
                 &registry,
-                &policies,
+                policies,
                 MODEL,
                 &pairs,
                 None,
@@ -9305,12 +9251,12 @@ pub(crate) mod tests {
                 Stated::nothing,
             )
         };
-        let steered = pick("grpc://d:2", None).ok();
+        let steered = pick(&policies, "grpc://d:2", None).ok();
         let decode = steered.map(|pair| pair.decode.url().to_owned());
         assert_eq!(decode.as_deref(), Some("grpc://d:1"));
 
         registry.set_overload_shed(true);
-        let shed = pick("grpc://d:2", None).err();
+        let shed = pick(&shedding, "grpc://d:2", None).err();
         let shed = shed.map(|failure| failure.verdict);
         assert!(matches!(shed, Some(PlacementFailure::AllOverloaded(_))));
         registry.set_overload_shed(false);
@@ -9321,7 +9267,7 @@ pub(crate) mod tests {
         let runtime = tokio::runtime::Builder::new_current_thread().build();
         let mut failure = None;
         let asked = admission.admit(None, |limit: &PrefillSelectionContext<'_>| {
-            failure = pick("grpc://p:2", Some(limit)).err();
+            failure = pick(&policies, "grpc://p:2", Some(limit)).err();
             PrefillAdmissionAttempt::<()>::Unavailable
         });
         assert!(runtime.expect("a runtime").block_on(asked).is_err());
@@ -9332,11 +9278,12 @@ pub(crate) mod tests {
     /// A pinned pair asked again under its route's rule is held to both at
     /// once: to the workers the rule takes, and among them to those on its
     /// wire. The rule takes one prefill and one decode on the request's
-    /// wire, past the pairs a first ask names, and one of each on another
-    /// wire, which stand first in their pools. The second ask states the
-    /// places of the four and the wire as the request's demand, and the
-    /// engine answers the pair on the wire, as classic does. Held to the
-    /// places alone it would be free to answer the pair off the wire.
+    /// wire, past the pairs a first decision names, and one of each on
+    /// another wire, which stand first in their pools. The engine's call
+    /// asks the rule of each pool and decides again among the four, the
+    /// wire still the request's demand, and answers the pair on the wire,
+    /// as classic does. Held to the places alone it would be free to
+    /// answer the pair off the wire.
     #[test]
     fn a_pinned_pair_asked_again_is_held_to_its_wire_and_to_its_routes_rule() {
         let grpc = ConnectionMode::Grpc;

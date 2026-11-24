@@ -1619,24 +1619,21 @@ reason.
 
 Built so far, for a single request, a pair over its two lists and an encode request over its three: the key, the hashes, the decision, and its targets tried
 best first by health, circuit breaker and the route's rule. Where none holds, a lease the pick was issued is given up at once and the decision is made again, told to leave out the workers that could not be sent to, three decisions a call at most, or a single request's fourth where its third found the workers the rule takes; then the request has no worker
-(`NoWorkers`). Planned: the later decisions of a pair and of an encode request held to the workers the rule takes.
+(`NoWorkers`). Planned: the later decisions of an encode request that carries items held to the workers the rule takes.
 
 A pair's target holds where both its workers can be sent to.
 
 A profile's `not-tried` filter leaves those workers out while another worker remains, and a
-profile that lists no such filter decides over the whole list again, or over the workers the rule takes once a single request's call is held to them. Of a pair's target they are
+profile that lists no such filter decides over the whole list again, or over the workers the rule takes once a call is held to them. Of a pair's target they are
 the sides that could not be sent to: a side that held stays a candidate. A worker the rule
-refuses is left out like one that is not ready. Until a pair's later decisions are held to the
-workers the rule takes, a pair whose rule takes few workers can have no worker though its lists
-hold one the rule takes: where three decisions' picks are all refused, where that worker is
-overloaded and a refused one is not, and where an earlier attempt tried it.
+refuses is left out like one that is not ready.
 
 Behind a single request's first decision none of whose targets holds, where the rule refused one
 that was ready, the rule is asked of every worker of the list once, ready or not, and the later
-decisions are held to the workers it takes. So the rule's one worker of a long list is found, one
+decisions are held to the workers it takes. Behind a pair's first decision none of whose targets holds, whether the rule refused a side or the side was not ready, a rule the request states is asked of each of its two lists, among the places its host states for that side, and its later decisions are held to the workers it takes on each. A pair's first decision that sheds the request as saturated has the rule asked the same way: it judged the overload over the whole lists, and the next decision judges it over the workers the rule takes. So the rule's one worker of a long list is found, one
 over its overload thresholds is answered by the binding's rule for a list wholly over them, and
 one an earlier attempt tried is handed again where no other is left. A request whose rule takes
-no worker of the list is shed with no endpoint, under `admits`. A single request's later decision
+no worker of a list is shed with no endpoint, under `admits`. A single request's later decision
 is given what the call has left of the request's budget, and a request with none left when a
 decision is due is shed under `budget`. A pair's decisions are each given the whole budget.
 
@@ -1667,8 +1664,7 @@ One thing differs from classic there, by rule. Classic reads the header once a s
 each side's policy over its own workers (`placement.rs:2519`, `:2540`, `:2616`). **[planned]**
 The engine reads no pair's and no encode request's header for a target yet.
 
-An encode request is placed over its three lists as a pair is over its two: three decisions a
-call at most, each given the whole budget, and none held to the workers the rule takes. One
+An encode request is placed over its three lists as a pair is over its two, each decision given the whole budget. Where it carries items its call makes three decisions at most, and none is held to the workers the rule takes. One
 decision names its pair and each item's encoder, and the pair's targets are tried as a pair's
 are. The placement names each item's encoder beside the pair (`Placement::encoders`). An item has
 one encoder: where it cannot be sent to, the decision is given up and made again with that
@@ -1886,8 +1882,6 @@ request ──> route (HTTP or gRPC, any family)
   they already take. A route names the answer's type and makes its load guard from the answer, in the places it made one before.
 
   The fifth, the encode stage's own selection, takes its pair from `select_pair` and refuses a request that carries an item for the encode workers by name **[planned]**: the gateway does not yet hand the engine an encode request's three lists.
-
-  The pair's function makes its call twice in one case, as a stopgap: where the first call answers that none of its workers could be sent to, the request carries a rule of its route, and that rule takes a prefill and a decode it pairs with that can both be sent to, the overload veto apart. The second call holds both pools to the workers the rule takes. The engine is to hold a pair's later decisions to the rule inside its own call, as it holds a single request's (section 8.2) **[planned]**.
 
   Where the document asks a pair's decode again, the two pair routes make one more call between the prefill's answer and the decode's dispatch (section 8.2).
 
@@ -2482,7 +2476,7 @@ bursts. It is bounded by the tree's size bound and the time between two eviction
 | Prefill-decode pairs on that engine | **[partly]** | the sheet of classic's pair choice (`pair_select`) replays through the pair's decision function, not through the engine; one of its 40 lines is held to an answer of the crate's own; the 8 lines behind the prefill admission's bound (`pair_bound`) and the 10 lines of a pair on one known runtime (`pair_runtime`) replay through that function as recorded |
 | Encode-prefill-decode on that engine | **[partly]** | `PolicyEngine::decide_encode_at` decides it over a host's three lists and issues the pair's lease, and `place` places it; the entry declines a request held to a wire that a worker of its pair's two lists is not dialed on, places its items on the encoders dialed on a wire it states, declines a request with items where the list holds encoders and none is, and declines one that states the later decode where its decode is held to the workers that take images: a decode asked again takes no items |
 | The lease and its events; the guard | **[built]** | |
-| The host contract of section 8.2 (`place`, `Placement`) | **[partly]** | `Placement` is built, with its call for a pair's decode decided again, and `place` for a single request, for a pair and for an encode request, with the route's rule and the decision made again, three decisions a call at most or a single request's fourth where the third found the workers the route's rule takes, and a single request's later decisions held to those workers; the later decisions of a pair and of an encode request held to them are not |
+| The host contract of section 8.2 (`place`, `Placement`) | **[partly]** | `Placement` is built, with its call for a pair's decode decided again, and `place` for a single request, for a pair and for an encode request, with the route's rule and the decision made again, three decisions a call at most or a single request's fourth where the third found the workers the route's rule takes, and the later decisions of a single request and of a pair held to those workers; the later decisions of an encode request that carries items held to them are not |
 | The crate's bench of the kept engine | **[planned]** | |
 | The gateway as a host | **[partly]** | section 9, behind `--policy-controller on`, which is off by default: single requests and pairs on the HTTP and gRPC routes, a pair's decode asked again, a host's table of stages at the start; an encode request that carries an item is refused by name until the gateway hands the engine its three lists; every classic test of the gateway with the engine on (the bar's fourth point) is not met yet |
 | The controller: service, election, replication, document apply and roll back | **[partly]** | a session never pushes the document and refuses a gateway's replay; a standby serves neither the worker list nor the snapshot (section 10.1) |

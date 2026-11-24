@@ -1,7 +1,9 @@
 //! An encode request placed: a decision over its caller's three lists, each
 //! item's encoder, and the first of its pair's targets both of whose
 //! workers can be sent to. Where an encoder or every target cannot be sent
-//! to, the call decides again as a pair's does ([`place`]).
+//! to, the call decides again ([`place`]), three decisions at most: this
+//! call hands the decision of a request that carries items no places of
+//! the rule's, so none of them is held to the workers its rule takes.
 //!
 //! The engine's entry for an encode request decides the pair and each
 //! item's encoder in one call ([`Loaded::decide_encode_at`]). The
@@ -183,7 +185,7 @@ fn asked<'a>(
 
 /// The asks of one call for an encode request over `lists` ([`ask`]): where
 /// an ask takes no placement, the call's next ask answers in its place,
-/// as a pair's does ([`Call::again`]).
+/// three asks a call at most ([`Call::again`]).
 ///
 /// # Errors
 ///
