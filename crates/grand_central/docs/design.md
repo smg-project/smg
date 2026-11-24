@@ -830,10 +830,10 @@ pub struct InProcess {
     affinity: Affinity,   // cache affinity: the host's index of cache events, and the engine's own
                           // record of the prefixes it sent, one for each model
     epochs: AtomicU64,    // how many list values were made
-    faults: AtomicU64,    // decisions that panicked
-    unheard: AtomicU64,   // lease events and membership changes that panicked inside a stage
-    upkeep_faults: AtomicU64, // steps of the engine's own task that panicked: the upkeep, the registry's follow,
-                          // a telling of load reports
+    held: Arc<HeldFaults>, // the panics the engine held, three counts: decisions that panicked, lease events
+                          // and membership changes that panicked inside a stage, and steps of the engine's
+                          // own task that panicked (the upkeep, the registry's follow, a telling of load
+                          // reports). A controller's store hands every engine it builds one set of them
     loads: task::Loads,   // the host's load channel, once handed, and the newest load snapshot
                           // the engine's own task keeps at hand
     members: membership::Handed, // the host's worker registry, once handed: the engine's own task
@@ -1206,10 +1206,13 @@ On main three pickers say so: round robin, `random` and `passthrough`.
 
 A decision that panics is caught, counted and answered as refused. It never takes the host down.
 A stage that panics at a word of a lease, its issue among them, or at a change of membership is
-held and counted apart: the request keeps its decision and its lease, and a registration or a
-removal goes on. A gateway shows both counts and the count of its upkeep's panics at each scrape
-of its metrics endpoint, as the series `smg_policy_faults_total` by `kind`: `decision`, `event`
-and `upkeep`.
+held and counted apart: the request keeps its decision and its lease, and a registration, a
+removal or an apply goes on. A gateway shows both counts and the count of its upkeep's panics
+at each scrape of its metrics endpoint, as the series `smg_policy_faults_total` by `kind`:
+`decision`, `event` and `upkeep`. A controller shows the same series on its metrics page,
+counted over every engine its store built, so a count outlasts the document it rose under. Its
+`event` is a change of membership alone: a controller holds a stage's panic at a word of a
+lease under catches of its own, and counts it in series of its own.
 
 A request whose host hands no list (`WorkerLists::None`) is decided over no worker: it is shed
 with no endpoint under the stage `none`, and its trace names no profile. A controller hands none

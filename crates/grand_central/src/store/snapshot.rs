@@ -92,7 +92,7 @@ use crate::{
     document::spec::{AppliedSpec, Pairing, ViewListPositions},
     engine::view::{fingerprint, Candidate, Health, Role, WorkerId},
     store::{
-        applied::Applied,
+        applied::{Applied, EngineCounts},
         pairing::{known, Derivation, Member, PairClasses, Pool},
         workers::{Reachability, WorkerFacts, WorkerRow, WorkerStatus},
         GatewayId,
@@ -1069,8 +1069,9 @@ pub(super) struct Writer {
 
 impl Writer {
     /// The write side of a store with no member, whose rows' clock starts
-    /// at `origin`.
-    pub(super) fn new(window: Duration, origin: Instant) -> Self {
+    /// at `origin`. The engine of its unbound start counts the panics it
+    /// holds into `counts`, the store's, as every engine behind it does.
+    pub(super) fn new(window: Duration, origin: Instant, counts: &EngineCounts) -> Self {
         Self {
             window,
             origin,
@@ -1089,7 +1090,7 @@ impl Writer {
             counts: Arc::default(),
             vetoes: Arc::default(),
             pool_vetoes: Arc::default(),
-            spec: Arc::new(Applied::new(AppliedSpec::unbound(), origin)),
+            spec: Arc::new(Applied::new(AppliedSpec::unbound(), origin, counts)),
             retired: None,
             outside: OutsideLists::default(),
             listed: Vec::new(),

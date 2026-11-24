@@ -29,7 +29,7 @@ use crate::{
         view::{Session, WorkerId, LOAD_REPORT_CLOCK_HISTORY_MS},
     },
     store::{
-        applied::Applied,
+        applied::{Applied, EngineCounts, EngineFaults},
         health::{HealthSink, VetoWrite},
         journal::{Journal, Position},
         leases::{
@@ -78,6 +78,9 @@ pub struct StoreStats {
     /// ([`MemoryStore::lifecycle_faults`]): a count of its own, read
     /// beside the first.
     pub lifecycle_faults: u64,
+    /// The panics the store's engines held under their own catches, over
+    /// every document the store applied: counts of their own too.
+    pub engine_faults: EngineFaults,
 }
 
 /// The store. `Default` is empty with term `0`.
@@ -116,6 +119,9 @@ pub struct MemoryStore {
     counts: Arc<InFlightCounts>,
     /// Where the rows' clock starts.
     origin: Instant,
+    /// What every engine the store builds counts its held panics into: the
+    /// unbound start's and each applied document's ([`Applied::new`]).
+    engine_faults: EngineCounts,
     /// Where the term is told, and that a write's locks are let go; `None`
     /// for a store nobody follows. The membership writes tell through
     /// their table's own handle.
@@ -191,7 +197,8 @@ impl MemoryStore {
         // own.
         let history = Duration::from_millis(u64::from(LOAD_REPORT_CLOCK_HISTORY_MS));
         let origin = now.checked_sub(history).unwrap_or(now);
-        let writer = Writer::new(window, origin);
+        let engine_faults = EngineCounts::default();
+        let writer = Writer::new(window, origin, &engine_faults);
         let world = ArcSwap::new(writer.world());
         // The leases' file writes the counts the writer's shapes name, and
         // a membership write gives a joining member its slot in them.
@@ -210,6 +217,7 @@ impl MemoryStore {
             joined: Mutex::default(),
             counts,
             origin,
+            engine_faults,
             journal: None,
             wake: Mutex::new(None),
         }
@@ -782,7 +790,7 @@ impl MemoryStore {
     ) -> Result<bool, StaleGeneration> {
         // The writer takes a second reference: when it refuses, the last
         // one is this one, let go after the lock.
-        let spec = Arc::new(Applied::new(spec, self.origin));
+        let spec = Arc::new(Applied::new(spec, self.origin, &self.engine_faults));
         let generation = spec.generation();
         let before = {
             // Taken before the lock, so dropped after it: the journal
@@ -1122,6 +1130,7 @@ impl MemoryStore {
         StoreStats {
             outside: loads.writer.outside(),
             lifecycle_faults: self.lifecycle_faults(),
+            engine_faults: self.engine_faults.read(),
         }
     }
 

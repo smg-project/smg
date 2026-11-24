@@ -64,6 +64,7 @@ pub(crate) mod workers;
 #[cfg(test)]
 mod tests;
 
+pub use applied::EngineFaults;
 pub use encoding::{EncodeHandoff, EncodeOffer};
 pub use health::{HealthSink, HealthWrite, VetoWrite};
 pub use journal::{Journal, Position};
