@@ -13,8 +13,10 @@
 //! - Reduced hash table overhead (1 lookup per PAGE_SIZE tokens)
 
 use std::{
+    cell::Cell,
     collections::HashMap,
     hash::{BuildHasherDefault, Hasher},
+    mem,
     sync::{
         atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering},
         Arc, Weak,
@@ -411,6 +413,46 @@ impl Node {
             }
         }
         Some(tenant)
+    }
+}
+
+/// One node the fused walk descended through.
+struct Step {
+    node: NodeRef,
+    stamped: Option<TenantId>,
+    key: TokenPageKey,
+}
+
+thread_local! {
+    /// The calling thread's list of steps, empty between walks.
+    static STEPS: Cell<Vec<Step>> = const { Cell::new(Vec::new()) };
+}
+
+/// A walk's list of steps: the thread's own, taken as the walk starts and
+/// put back empty as it ends.
+struct Steps(Vec<Step>);
+
+impl Steps {
+    /// The longest list a thread keeps between walks; a longer one is
+    /// freed with its walk.
+    const KEPT: usize = 256;
+
+    fn take() -> Self {
+        // A walk made from inside another's choice finds the list taken.
+        let mut steps = STEPS.try_with(Cell::take).unwrap_or_default();
+        if steps.capacity() == 0 {
+            steps.reserve_exact(16);
+        }
+        Self(steps)
+    }
+}
+
+impl Drop for Steps {
+    fn drop(&mut self) {
+        self.0.clear();
+        if self.0.capacity() <= Self::KEPT {
+            let _ = STEPS.try_with(|kept| kept.set(mem::take(&mut self.0)));
+        }
     }
 }
 
@@ -1203,14 +1245,11 @@ impl TokenTree {
         // the match stamped on it (`None` once the match is frozen) and the page
         // key its edge was descended by, so the replay can confirm an edge still
         // exists before it attaches a tenant under it. Each node is cloned once,
-        // into `path`; `current` indexes it (`None` = root). One list, so one
-        // allocation a request.
-        struct Step {
-            node: NodeRef,
-            stamped: Option<TenantId>,
-            key: TokenPageKey,
-        }
-        let mut path: Vec<Step> = Vec::with_capacity(16);
+        // into `path`; `current` indexes it (`None` = root). One list, the
+        // calling thread's own, kept from walk to walk: a walk allocates one
+        // only where the thread holds none or the path outgrows it.
+        let mut steps = Steps::take();
+        let path = &mut steps.0;
         let mut current: Option<usize> = None;
         // Where the match resolved: the deepest full-match node that had a
         // tenant (an index into `path`), or the partial-match node.
