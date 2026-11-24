@@ -3198,4 +3198,25 @@ fn a_holder_is_lowered_to_what_its_groups_serve_before_the_deepest_are_kept() {
     let mut wanted = [(deep, 3), (shallow, 2)];
     wanted.sort_unstable();
     assert_eq!(kept, wanted);
+
+    // Of the depth the cap cuts, the draw says who stays. Workers 0 and 3
+    // serve both of the request's first two blocks, and the cap leaves one.
+    let cut = |drawn: u32| {
+        let mut kept = Vec::new();
+        let mut below = |_: u32| drawn;
+        deepest_within_groups(
+            &index,
+            &groups,
+            &request[..2],
+            BLOCK,
+            &within,
+            1,
+            &mut below,
+            &mut kept,
+        );
+        kept
+    };
+    let mut both = [cut(0), cut(1)].concat();
+    both.sort_unstable();
+    assert_eq!(both, [(all[0], 2), (all[3], 2)]);
 }

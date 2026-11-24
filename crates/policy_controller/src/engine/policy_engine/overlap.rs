@@ -211,6 +211,11 @@ pub fn deepest_within_groups(
 /// blocks it holds. Those `within` names go to `kept`, which is emptied
 /// first. Each is lowered to what its groups can serve, and the deepest are
 /// kept.
+///
+/// Built under `test-util` alone: the package's own cases turn the feature
+/// on, and so does a host for its cases over a reference index of its own.
+#[cfg(feature = "test-util")]
+#[doc(hidden)]
 #[expect(
     clippy::too_many_arguments,
     reason = "the lookup's own arguments, beside the holders and their groups"
