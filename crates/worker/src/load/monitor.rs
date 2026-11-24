@@ -1568,13 +1568,13 @@ impl<G: Generation> WorkerMonitor<G> {
     ///
     /// No pusher's file outlives a stop. Behind the tasks' end and ahead of
     /// the reset, the stop evicts every pusher, whatever its worker's
-    /// status ([`Self::evict_worker_loads`]): the report on file with every
-    /// rank it holds, the publish it queued or held, what the sink keeps of
-    /// the worker ([`LoadSink::forget`]) and the series the report fed. The
-    /// reset alone keeps the file of a pusher that stays `Ready`
-    /// ([`Self::evict_lost_pushers`]): behind a rebuild the monitor's tasks
-    /// and the pusher's stream both go on, and the file is that worker's
-    /// newest word. A stop ends the run, and a host may hand a stopped
+    /// status, as an event evicts a worker that leaves: the report on file
+    /// with every rank it holds, the publish it queued or held, what the
+    /// sink keeps of the worker ([`LoadSink::forget`]) and the series the
+    /// report fed. The reset alone keeps the file of a pusher that stays
+    /// `Ready`: behind a rebuild the monitor's tasks and the pusher's
+    /// stream both go on, and the file is that worker's newest word. A
+    /// stop ends the run, and a host may hand a stopped
     /// monitor no record. A file kept through the stop would then be as
     /// old as the stop at the next start, where a publish it queued or its
     /// worker's next record would publish every rank it held. So a host
