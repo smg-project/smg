@@ -2,9 +2,6 @@
 //! of one pool, each cell beside its twin on a store with no journal, in
 //! one binary:
 //!
-//! - `policy_store_journal/load_write/<plain|journaled>/<n>`: one load
-//!   record's write inside the publication window, which a journal is told
-//!   nothing of;
 //! - `policy_store_journal/status_write/<plain|journaled|told>/<n>`: one
 //!   status flip of a member, published at once; `told` is the journaled
 //!   write on a log with a listener of the watched kinds, as a controller
@@ -24,9 +21,8 @@
 //! - `policy_store_journal/cut/watched/<n>`: one cut of the rows: the copy
 //!   a writer of the rows waits for, and the sort after it.
 //!
-//! Every member is ready with a record on file, in a store that leads a
-//! term as a serving controller's does. The journaled store's log
-//! retains 4,096 events.
+//! Every member is ready, in a store that leads a term as a serving
+//! controller's does. The journaled store's log retains 4,096 events.
 #![expect(
     clippy::expect_used,
     reason = "a bench's setup has no caller to answer"
@@ -35,11 +31,7 @@
 #[path = "common/filled.rs"]
 mod filled;
 
-use std::{
-    hint::black_box,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{hint::black_box, sync::Arc};
 
 use criterion::{
     criterion_group, criterion_main, measurement::WallTime, BenchmarkGroup, BenchmarkId, Criterion,
@@ -47,12 +39,9 @@ use criterion::{
 #[cfg(feature = "worker-host")]
 use smg_policy_controller::worker_host::{Members, Objects};
 use smg_policy_controller::{
-    engine::{LoadRow, Role, SignalSource, WorkerId},
+    engine::{Role, WorkerId},
     service::replication::Log,
-    store::{
-        LeasesStore, LoadSink, LoadSource, MemoryStore, Position, WorkerFacts, WorkerStatus,
-        WorkersStore, PUBLISH_WINDOW,
-    },
+    store::{LeasesStore, MemoryStore, Position, WorkerFacts, WorkerStatus, WorkersStore},
 };
 #[cfg(feature = "worker-host")]
 use smg_worker::registry::WorkerRegistry;
@@ -63,22 +52,6 @@ const SIZES: [usize; 3] = [8, 64, 512];
 const MODEL: &str = "m";
 /// The log's ring.
 const WATCHED: usize = 4_096;
-
-/// Member `index`'s record as of write `turn`.
-fn record_of(index: usize, turn: u64) -> LoadRow {
-    let x = (index as u64 + 1)
-        .wrapping_mul(0x9e37_79b9_7f4a_7c15)
-        .wrapping_add(turn.wrapping_mul(0xbf58_476d_1ce4_e5b9));
-    LoadRow {
-        running: (x >> 16) as u32 % 12,
-        queued: (x >> 24) as u32 % 4,
-        kv_usage_permille: ((x >> 32) % 900) as u16,
-        live_rate: 1_000 + ((x >> 40) % 3_000) as u32,
-        report_age_ms: 5,
-        source: SignalSource::Events,
-        ..LoadRow::default()
-    }
-}
 
 fn facts(index: usize, priority: i32) -> WorkerFacts {
     let key = format!("http://w{index}:8000");
@@ -94,14 +67,12 @@ fn facts(index: usize, priority: i32) -> WorkerFacts {
     }
 }
 
-/// One pool of `n` members, each ready with its record on file and
-/// published, in a store with no journal or with a log: the store, its
-/// log, its members and the instant its last window opened.
+/// One pool of `n` members, each ready and published, in a store with no
+/// journal or with a log: the store, its log and its members.
 struct Pool {
     store: MemoryStore,
     log: Option<Arc<Log>>,
     ids: Vec<WorkerId>,
-    opened: Instant,
 }
 
 fn pool_of(n: usize, journaled: bool) -> Pool {
@@ -120,7 +91,6 @@ fn pool_on(n: usize, log: Option<Log>) -> Pool {
     };
     // The store leads: its writes are journaled under its term.
     store.set_term(1);
-    let opened = Instant::now();
     let ids: Vec<WorkerId> = (0..n)
         .map(|index| {
             let id = store.upsert(facts(index, 0)).id();
@@ -129,52 +99,14 @@ fn pool_on(n: usize, log: Option<Log>) -> Pool {
             store
                 .set_status(id, WorkerStatus::Ready, revision)
                 .expect("ready");
-            store.record(id, 0, record_of(index, 0), opened, LoadSource::Stream);
             id
         })
         .collect();
-    let opened = opened + PUBLISH_WINDOW;
-    store.publish(opened);
     filled::filled(&store, MODEL, Role::Single, n);
-    Pool {
-        store,
-        log,
-        ids,
-        opened,
-    }
+    Pool { store, log, ids }
 }
 
 const KINDS: [(&str, bool); 2] = [("plain", false), ("journaled", true)];
-
-fn load_write(c: &mut Criterion) {
-    let mut group = c.benchmark_group("policy_store_journal/load_write");
-    for (kind, journaled) in KINDS {
-        for n in SIZES {
-            let pool = pool_of(n, journaled);
-            let before = pool.log.as_ref().map(|log| log.head());
-            // Inside the window: the record is folded and waits.
-            let at = pool.opened + Duration::from_millis(1);
-            let mut turn = 0u64;
-            group.bench_with_input(BenchmarkId::new(kind, n), &n, |b, _| {
-                b.iter(|| {
-                    turn += 1;
-                    let index = (turn as usize).wrapping_mul(67) % n;
-                    pool.store.record(
-                        black_box(pool.ids[index]),
-                        0,
-                        record_of(index, turn),
-                        at,
-                        LoadSource::Stream,
-                    );
-                });
-            });
-            // The cell is held to what it claims: the log was told no
-            // load write.
-            assert_eq!(pool.log.as_ref().map(|log| log.head()), before);
-        }
-    }
-    group.finish();
-}
 
 fn status_write(c: &mut Criterion) {
     let mut group = c.benchmark_group("policy_store_journal/status_write");
@@ -334,5 +266,5 @@ fn cut(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, load_write, status_write, member_write, read, cut);
+criterion_group!(benches, status_write, member_write, read, cut);
 criterion_main!(benches);

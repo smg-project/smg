@@ -9,7 +9,11 @@
 
 use std::{sync::atomic::AtomicU64, time::Duration};
 
-use super::{decision::ShadowKind, view::WorkerId};
+use super::{
+    decision::ShadowKind,
+    framework::PairSide,
+    view::{RequestFacts, WorkerId},
+};
 
 /// How many of a generation's bindings count their shadows in a row of
 /// their own ([`ShadowCount::binding`]). The bindings behind them count in
@@ -21,18 +25,12 @@ pub const SHADOW_ROWS: usize = 16;
 /// for each place a shadow is asked ([`ShadowSide`]).
 #[derive(Debug, Default)]
 #[repr(align(128))]
-pub(crate) struct ShadowCounts([[[AtomicU64; ShadowKind::COUNT]; SHADOW_ROWS]; 4]);
+pub(crate) struct ShadowCounts([[[AtomicU64; ShadowKind::COUNT]; SHADOW_ROWS]; ShadowSide::COUNT]);
 
 impl ShadowCounts {
     pub(crate) fn of(&self, binding: u32, side: ShadowSide, kind: ShadowKind) -> &AtomicU64 {
-        let table = match side {
-            ShadowSide::Single => 0,
-            ShadowSide::Prefill => 1,
-            ShadowSide::Decode => 2,
-            ShadowSide::DecodeAgain => 3,
-        };
         let row = (binding as usize).min(SHADOW_ROWS - 1);
-        &self.0[table][row][kind.index()]
+        &self.0[side.index()][row][kind.index()]
     }
 }
 
@@ -54,9 +52,35 @@ pub enum ShadowSide {
 }
 
 impl ShadowSide {
-    /// Every side, in the order a host is told a binding's counts.
-    pub(crate) const ALL: [Self; 4] =
+    /// How many sides there are: the tables of a decider's counts, and
+    /// the width of a row's word of which sides it counts by.
+    pub(crate) const COUNT: usize = 4;
+
+    /// Every side, in the order of its place: the order a host is told a
+    /// binding's counts.
+    pub(crate) const ALL: [Self; Self::COUNT] =
         [Self::Single, Self::Prefill, Self::Decode, Self::DecodeAgain];
+
+    /// The side's place among the sides, under [`Self::COUNT`]. Every side
+    /// is named here: one added to the enum does not build until it takes
+    /// a place.
+    pub(crate) const fn index(self) -> usize {
+        match self {
+            Self::Single => 0,
+            Self::Prefill => 1,
+            Self::Decode => 2,
+            Self::DecodeAgain => 3,
+        }
+    }
+
+    /// Where the shadow of `side` of a pair is asked at the pair's first
+    /// decision.
+    pub(crate) const fn of_pair(side: PairSide) -> Self {
+        match side {
+            PairSide::Prefill => Self::Prefill,
+            PairSide::Decode => Self::Decode,
+        }
+    }
 
     /// The side's label.
     #[must_use]
@@ -92,6 +116,16 @@ pub struct ShadowCount {
 /// take a served answer past its budget, where the decider's last read
 /// refuses it.
 pub(crate) const SHADOW_FLOOR: Duration = Duration::from_millis(1);
+
+/// What a request's own budget holds, as its host states it, for the
+/// floor a shadow is held to ([`SHADOW_FLOOR`]): a request that states
+/// none has no floor to hold.
+pub(crate) fn budget_left(facts: &RequestFacts<'_>) -> Duration {
+    match facts.budget_micros {
+        0 => Duration::MAX,
+        micros => Duration::from_micros(micros.into()),
+    }
+}
 
 /// What a decision's shadow said beside it, where one was due.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

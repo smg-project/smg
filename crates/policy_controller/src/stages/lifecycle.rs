@@ -92,7 +92,16 @@ pub trait Lifecycle: Send + Sync {
     /// A dispatched side finished, whatever the status.
     fn on_completed(&self, _lease: &Lease, _outcome: &Outcome) {}
 
-    /// The host gave the lease up before its completion.
+    /// The host gave the lease up before its completion. The lease told
+    /// names the worker the stages last heard the side on
+    /// ([`Lease::booked`]): the one its issue booked, or behind a dispatch
+    /// the one the side went to. A stage undoes what it holds of the lease
+    /// by that worker. A stage reads no index off a release: behind a
+    /// dispatch a single's names the target its dispatch took, and a
+    /// pair's decode side is told under index 0, whichever target its
+    /// dispatch took. That side states its claim
+    /// ([`Lease::session_verdict`]) where it stands on the worker it
+    /// claimed, and none behind a dispatch on another worker.
     fn on_released(&self, _lease: &Lease, _reason: ReleaseReason) {}
 
     /// The host's membership changed. A host may call this under its own
@@ -108,19 +117,16 @@ pub trait Lifecycle: Send + Sync {
     fn on_signal(&self, _signal: &Signal<'_>) {}
 
     /// Whether the stage keeps a number of each rank's report, which a host
-    /// tells it ([`Signal::Load`] with the report's sample instant, with
-    /// the rank's slot where the host keeps counts, and with the report's
-    /// named values where the host states them). The policy store tells
-    /// every report before it shows a decision that report. The engine over
-    /// a host's worker lists tells a report that is new before it keeps the
-    /// report's snapshot for its decisions, and its own doc names the
-    /// reports a decision can read first. `false` by
-    /// default: a host tells no report to an engine none of whose stages
-    /// keeps one, and such a stage decides the same untold. The engine asks
-    /// once, at its build: the answer is the stage's for the engine's life.
-    /// A host may tell such a stage under its own locks, as the policy store
-    /// does under its membership and load locks: a stage that calls from
-    /// that word a door of the host that takes one of them waits on itself.
+    /// tells it ([`Signal::Load`] with the report's sample instant, and with
+    /// the report's named values where the host states them). The engine
+    /// over a host's worker lists tells a report that is new before it keeps
+    /// the report's snapshot for its decisions, and its own doc names the
+    /// reports a decision can read first. `false` by default: a host tells
+    /// no report to an engine none of whose stages keeps one, and such a
+    /// stage decides the same untold. The engine asks once, at its build:
+    /// the answer is the stage's for the engine's life. A host may tell
+    /// such a stage under its own locks: a stage that calls from that word a
+    /// door of the host that takes one of them waits on itself.
     fn keeps_loads(&self) -> bool {
         false
     }

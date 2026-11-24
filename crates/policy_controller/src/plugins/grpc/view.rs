@@ -1136,18 +1136,16 @@ mod tests {
     }
 
     /// The frame carries each candidate's requests in flight as the
-    /// request's facts read them: the lent count where the host lends a
-    /// table, the rows themselves reading zero.
+    /// request's facts read them: the row's own count.
     #[test]
     fn the_frame_gives_a_row_the_count_its_request_reads() {
         use crate::{
             document::spec::Needs,
             engine::view::{Candidate, PoolFacts, RequestFacts},
             plugins::shared::config::Exposure,
-            tracking::in_flight::tests::Lent,
         };
 
-        let mut rows: Vec<Candidate> = (0..)
+        let rows: Vec<Candidate> = (0..)
             .zip([4, 0, 9])
             .map(|(position, in_flight)| Candidate {
                 position,
@@ -1155,8 +1153,7 @@ mod tests {
                 ..Candidate::default()
             })
             .collect();
-        let lent = Lent::take(&mut rows);
-        let facts = lent.beside(&RequestFacts::default());
+        let facts = RequestFacts::default();
         let frame = super::decide(
             1,
             &facts,

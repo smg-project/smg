@@ -587,7 +587,7 @@ mod tests {
                 frame_loads,
                 gateways::{tests::PATIENT, SessionPlace},
                 principal::{tests::told, Layer, ENTRY},
-                replication::journaled_for,
+                replication::journaled_at,
                 service::{Service, Shared},
                 session::GRACE_PERIOD,
                 watch_workers::tests::Woken,
@@ -659,7 +659,7 @@ mod tests {
         cap: Option<u32>,
         steps: impl IntoIterator<Item = Step>,
     ) -> Bed {
-        let (store, feed) = journaled_for(&LeasePlace::Process, 0, deciders);
+        let (store, feed) = journaled_at(&LeasePlace::Process, 0, deciders);
         let (workers, _sides) = fleet(&store);
         store
             .apply(preset("random", 1))

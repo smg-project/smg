@@ -521,7 +521,7 @@ fn the_instants_read_are_the_sends_the_two_numbers_count_across_a_release() {
     // instants lets them go, with no other read ahead of it.
     a.load = Some(LoadRow::default());
     assert_eq!(instants(&sent, &facts, &a), all[2..]);
-    assert_eq!(sent.credits.held_at(a.id, a.dp_rank), 1);
+    assert_eq!(sent.credits().held_at(a.id, a.dp_rank), 1);
     let counts = DispatchCounts {
         requests: 1,
         tokens: 293,
@@ -596,7 +596,7 @@ fn a_send_reported_while_the_instants_are_read_lands_behind_the_read() {
     let a = row(277, 3);
     send(&engine, &a, START, TOKENS);
     send(&engine, &a, START + 3, 281);
-    let entry = sent.credits.tally.load().get(&(a.id, a.dp_rank)).cloned();
+    let entry = sent.credits().tally.load().get(&(a.id, a.dp_rank)).cloned();
     let entry = entry.expect("the row's entry");
     let facts = clock(0);
     let (started, landed) = (AtomicBool::new(false), AtomicBool::new(false));
@@ -773,6 +773,52 @@ fn a_join_drops_the_sends_told_behind_its_ids_removal() {
     let reads = sent.pass(&facts);
     assert_eq!(reads.of(&a), CreditedDispatches::default());
     assert_eq!(reads.of(&b), one(TOKENS));
+}
+
+/// Every word of a count that follows another reads and writes the entries
+/// of the count it follows, and none of its own: a send, each of the two
+/// passes' reads, the reads of a dump and a worker's removal.
+#[cfg(feature = "in-process")]
+#[test]
+fn every_word_of_a_count_that_follows_goes_to_the_entries_of_the_count_it_follows() {
+    use super::{ReportedSends, SentSettings};
+
+    let settings = SentSettings::default();
+    let followed = Arc::new(DispatchCredit::new("standing", settings));
+    let follows = DispatchCredit::new("built", settings);
+    follows.follow(&followed);
+    let reporting = |id: u64| Candidate {
+        load: Some(LoadRow::default()),
+        load_sampled_at_micros: START - 1,
+        ..row(id, 3)
+    };
+    let (a, b) = (reporting(211), reporting(223));
+    let lease = Lease {
+        issued_micros: START,
+        tokens: TOKENS,
+        ..Lease::default()
+    };
+    let facts = clock(START + 700);
+
+    // A send said to the count that follows is held by the count followed.
+    follows.dispatched(&lease, &target(&a), Side::Single, DELAY, || true);
+    assert!(follows.credits.tally.load().is_empty(), "none of its own");
+    assert_eq!(followed.read(&facts, &a), one(TOKENS));
+
+    // A send said to the count followed is read through the one that
+    // follows, by each of its passes and by a dump.
+    followed.dispatched(&lease, &target(&b), Side::Single, DELAY, || true);
+    assert_eq!(follows.read(&facts, &b), one(TOKENS));
+    assert_eq!(follows.pass(&facts).counts(&b).requests, 1);
+    assert_eq!(follows.reads_unlimited().reported(&b).requests, 1);
+    assert_eq!(follows.credits().held(b.id), 1);
+    assert_eq!(follows.credits().held_at(b.id, b.dp_rank), 1);
+
+    // A removal told to the count that follows lets the worker's sends go
+    // from the count followed.
+    follows.membership(&Membership::Removed(a.id));
+    assert_eq!(followed.read(&facts, &a), CreditedDispatches::default());
+    assert_eq!(followed.read(&facts, &b), one(TOKENS));
 }
 
 #[cfg_attr(
@@ -1137,7 +1183,7 @@ fn presence_is_asked_only_where_a_send_enters_a_rank() {
     // A rank the count does not know is asked for, and a row that left
     // enters none.
     engine.dispatched_sent(&lease, &target(&a), Side::Single, DELAY, || false);
-    assert!(!sent.credits.tally.load().contains_key(&(a.id, a.dp_rank)));
+    assert!(!sent.credits().tally.load().contains_key(&(a.id, a.dp_rank)));
     engine.dispatched_sent(&lease, &target(&a), Side::Single, DELAY, || true);
     // A rank it knows takes the send unasked.
     engine.dispatched_sent(&lease, &target(&a), Side::Single, DELAY, || {
@@ -1679,8 +1725,9 @@ mod over_lists {
     /// A send said behind a new document, for a decision the document
     /// before made, is counted where the new document kept the profile's
     /// count: both were validated over one catalog, and the profile's text
-    /// is the same. The reader the later validation built is let go and
-    /// reads nothing.
+    /// is the same. The reader the later validation built is let go, and
+    /// the count it was handed follows the standing one: it reads the same
+    /// send.
     #[test]
     fn a_send_said_behind_a_document_that_kept_its_count_is_counted() {
         let (catalog, readers) = catalog();
@@ -1695,8 +1742,30 @@ mod over_lists {
         first.dispatched(now);
         let readers = readers.lock();
         assert_eq!(readers[0].read(&clock(0), &sent_to), one(TOKENS));
+        assert_eq!(readers[1].read(&clock(0), &sent_to), one(TOKENS));
+    }
+
+    /// A document validated and never put in force leaves the standing
+    /// count as it was, over one catalog and under the same text, where
+    /// an apply would keep the profile. A count follows another only
+    /// where an apply keeps its reader: the count that validation built
+    /// reads no send, and the standing count reads the send once.
+    #[test]
+    fn a_document_validated_and_never_applied_leaves_the_standing_count_as_it_was() {
+        let (catalog, readers) = catalog();
+        let engine = PolicyEngine::new(validated(&document(None), &catalog));
+        let (_, members, _) = bed();
+        let now = Instant::now();
+        let mut first = decide(&engine, &members, b"first", now);
+        let sent_to = chosen(&first);
+        let unapplied = validated(&next_document(None), &catalog);
+
+        first.dispatched(now);
         let nothing = CreditedDispatches::default();
-        assert_eq!(readers[1].read(&clock(0), &sent_to), nothing);
+        let read = |at: usize| readers.lock()[at].read(&clock(0), &sent_to);
+        assert_eq!((read(0), read(1)), (one(TOKENS), nothing));
+        drop(unapplied);
+        assert_eq!(read(0), one(TOKENS), "as it was");
     }
 
     /// A handle says its dispatch once, so a second word of the same send

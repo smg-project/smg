@@ -1259,14 +1259,16 @@ impl Router {
     }
 
     /// The worker of a transcription, or the refusal this router answers.
-    /// The placement is handed the model's HTTP pool whole: a worker that
+    /// The route reads the model's snapshot once and places the request
+    /// over its HTTP pool whole, by the selection every other single
+    /// request takes ([`placement::select_single_of`]): a worker that
     /// registered a data-parallel rank takes a transcription like a plain
     /// one. Multipart transcription can't route through
     /// `worker.prepare_request`, the hook that injects `data_parallel_rank`
     /// for a DP-aware worker, so no worker is sent a rank and the two are
     /// the same send. An empty pool is answered model_not_found, and the
     /// verdict on a placement that returns no worker is judged from the
-    /// same pool.
+    /// same pool: the one read serves the refusals and the placement.
     fn select_transcription_worker(
         &self,
         headers: Option<&HeaderMap>,
@@ -1274,9 +1276,8 @@ impl Router {
         routing: &RoutingDerivatives,
         rid: Option<&str>,
     ) -> Result<placement::Placed, Response> {
-        let all_workers = self
-            .worker_registry
-            .get_routing_pool(model_id, RoutingPool::HttpRegular);
+        let snapshot = self.worker_registry.get_routing_snapshot(model_id);
+        let all_workers = snapshot.pool(RoutingPool::HttpRegular);
         if all_workers.is_empty() {
             return Err(self.report_refusal(
                 "Router::route_multipart_transcription",
@@ -1284,12 +1285,13 @@ impl Router {
                 error::model_not_found(model_id),
             ));
         }
-        let Some(placed) = placement::select_from(
+        let Some(placed) = placement::select_single_of(
             &self.worker_registry,
             &self.policy_registry,
             model_id,
+            &snapshot,
             RoutingPool::HttpRegular,
-            &all_workers,
+            None,
             PlacementInputs {
                 text: routing.text.as_deref(),
                 tokens: routing.tokens.as_deref(),
@@ -1306,7 +1308,7 @@ impl Router {
             // or a self-filtering policy missed on an all-overloaded pool, so
             // a shed keeps its Retry-After, retryability and metric.
             let resp = match placement::failure_from(
-                &all_workers,
+                all_workers,
                 model_id,
                 self.worker_registry.overload_shed_enabled(),
             ) {

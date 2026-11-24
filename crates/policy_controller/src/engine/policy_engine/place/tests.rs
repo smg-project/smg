@@ -391,6 +391,75 @@ fn a_request_is_made_of_what_its_caller_states() {
     assert!(!shown.contains("secret"), "{shown}");
 }
 
+/// A request states its id with no making. An engine that keeps a sample of
+/// its decisions asks it of a plain request, which is never made. A request
+/// with no id states an empty one.
+#[test]
+fn a_request_states_its_id_with_no_making() {
+    let engine = preset("round_robin");
+    let request = PlaceRequest {
+        request_id: Some("request-1"),
+        ..PlaceRequest::of(MODEL, WorkerLists::None)
+    };
+    let made = Made::new(&engine, &request, &[]);
+    assert_eq!(made.request_id(engine.standing_spec()), b"request-1");
+    assert!(made.headers.get().is_none(), "the request was not made");
+    let _ = made.make(engine.standing_spec());
+    assert!(made.headers.get().is_some(), "a making fills its headers");
+    let bare = PlaceRequest::of(MODEL, WorkerLists::None);
+    let made = Made::new(&engine, &bare, &[]);
+    assert!(made.request_id(engine.standing_spec()).is_empty());
+}
+
+/// The id a host states for a kept decision alone is no id of the request
+/// made. Under a document that keys by the request's id, a request that
+/// states one is made with that id and its key. One that states an explain
+/// id alone is made as a request that states neither: an empty id and no
+/// key. The maker answers the explain id beside the request's own.
+#[test]
+fn an_explain_id_is_no_id_of_the_request_made() {
+    let mut document = PolicySpec::preset("round_robin").expect("a built-in preset");
+    document.generation = 1;
+    document.bindings[0].routing_key = Some(RoutingKeySpec {
+        sources: vec![KeySourceSpec {
+            rid: true,
+            ..KeySourceSpec::default()
+        }],
+        strip_lineage: false,
+    });
+    let engine = engine_of(&document);
+    let spec = engine.standing_spec();
+    let stated = |request_id, explain_id| PlaceRequest {
+        request_id,
+        explain_id,
+        ..PlaceRequest::of(MODEL, WorkerLists::None)
+    };
+    let keys = |request: &Request<'_>| {
+        let facts = &request.facts;
+        let keyed = facts.session_key != Identity::NONE;
+        (keyed, facts.session_key_from_rid, facts.client_key)
+    };
+
+    let both = stated(Some("request-1"), Some("explain-1"));
+    let made = Made::new(&engine, &both, &[]);
+    let request = made.make(spec);
+    assert_eq!(request.id, b"request-1");
+    assert!(keys(&request).0, "keyed by its own id");
+    let ids = (made.request_id(spec), made.explain_id());
+    assert_eq!(ids, (&b"request-1"[..], &b"explain-1"[..]));
+
+    let named = stated(None, Some("explain-1"));
+    let bare = stated(None, None);
+    let named = Made::new(&engine, &named, &[]);
+    let bare = Made::new(&engine, &bare, &[]);
+    let (request, unnamed) = (named.make(spec), bare.make(spec));
+    assert!(request.id.is_empty(), "the explain id is not the request's");
+    assert!(!keys(&request).0, "and it is no key");
+    assert_eq!(keys(&request), keys(&unnamed));
+    assert_eq!(named.explain_id(), b"explain-1");
+    assert!(bare.explain_id().is_empty());
+}
+
 /// Each making draws a seed no other making of the thread drew, and a
 /// second thread draws others.
 #[test]

@@ -1205,18 +1205,15 @@ mod tests {
     }
 
     /// Both fills carry each candidate's requests in flight as the
-    /// request's facts read them: the lent count where the host lends a
-    /// table, the rows themselves reading zero.
+    /// request's facts read them: the row's own count.
     #[test]
     fn both_fills_give_a_row_the_count_its_request_reads() {
-        use crate::tracking::in_flight::tests::Lent;
         let mut rows = [Candidate::default(), candidate_row(), Candidate::default()];
         for (row, position) in rows.iter_mut().zip(0..) {
             row.position = position;
         }
         rows[2].in_flight = 3;
-        let lent = Lent::take(&mut rows);
-        let facts = lent.beside(&RequestFacts::default());
+        let facts = RequestFacts::default();
         let mut records = Records::default();
         records.fill(&facts, &rows, &PoolFacts::default());
         let record: Vec<u32> = records.candidates.iter().map(|r| r.in_flight).collect();
@@ -1544,7 +1541,6 @@ mod tests {
             prompt_chars: 0,
             prompt_bytes: 0,
             now_micros: 0,
-            lent_in_flight: None,
             session_counted: false,
             // Host-only: the request block carries no affinity column and
             // no rows named in its place.

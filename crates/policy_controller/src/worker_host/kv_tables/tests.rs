@@ -2,24 +2,142 @@
 //! held to the `kv-index` crate's reference index over streams with
 //! holes, clears, restarts, gaps and snapshots.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, ops::Deref};
 
-use kv_index::{chain_prefix_hash, ApplyError, GroupKind, ReferenceIndexer};
+use kv_index::{chain_prefix_hash, ApplyError, ContentHash, GroupKind, ReferenceIndexer};
+use smg_worker::kv_events::port::{
+    BatchFacts, BatchOutcome, KvCursor, ResyncReason, SnapshotChunk,
+};
 
 use super::{
-    admitted as by_cursor, Blocks, ChainBlockMap, ContentHash, LaneWriter, SequenceHash,
-    StoredBlock, INDEX_WORKERS,
+    admitted as by_cursor, indexed_under, Blocks, ChainBlockMap, KvTables, LaneWriter,
+    SequenceHash, StoredBlock, INDEX_WORKERS,
 };
 use crate::{
     engine::view::WorkerId,
-    store::{
-        kv_events::{RankCursor, GAP_CLEAR_THRESHOLD},
-        BatchFacts, BatchOutcome, KvEventSink, MemoryStore, ResyncReason, Signals, SnapshotChunk,
-        WorkerFacts, WorkersStore,
-    },
+    store::{MembershipChange, MemoryStore, Signals, WorkerFacts, WorkersStore},
+    worker_host::kv_cursor::{RankCursor, GAP_CLEAR_THRESHOLD},
 };
 
 const MODEL: &str = "m";
+
+/// A store's rows with the KV tables beside them, as a holder of worker
+/// objects keeps the two: what a membership write changes is stated to the
+/// tables in the same step. A case writes its rows and its batches through
+/// this one value, and reads the store's rows through it.
+struct Kept {
+    store: MemoryStore,
+    tables: KvTables,
+}
+
+impl Deref for Kept {
+    type Target = MemoryStore;
+
+    fn deref(&self) -> &MemoryStore {
+        &self.store
+    }
+}
+
+impl Kept {
+    fn new() -> Self {
+        Self {
+            store: MemoryStore::new(),
+            tables: KvTables::default(),
+        }
+    }
+
+    /// State `change` to the tables as the holder states it: a row that
+    /// arrived or changed its facts is a member, a row that left is
+    /// forgotten.
+    fn said(&self, change: MembershipChange) -> MembershipChange {
+        let member = |id: WorkerId| {
+            if let Some(row) = self.store.get(id) {
+                self.tables.member(&row);
+            }
+        };
+        match change {
+            MembershipChange::Registered { id }
+            | MembershipChange::Relabelled { id }
+            | MembershipChange::Resized { id } => member(id),
+            MembershipChange::Replaced { old, new } => {
+                self.tables.forget(old);
+                member(new);
+            }
+            MembershipChange::Removed { id } => self.tables.forget(id),
+            MembershipChange::StatusChanged { .. } => {}
+        }
+        change
+    }
+
+    fn upsert(&self, facts: WorkerFacts) -> MembershipChange {
+        self.said(self.store.upsert(facts))
+    }
+
+    fn remove(&self, id: WorkerId, revision: u64) -> Option<MembershipChange> {
+        let change = self.store.remove(id, revision)?;
+        Some(self.said(change))
+    }
+
+    /// The tables, for a case that reads them whole.
+    fn kv(&self) -> &KvTables {
+        &self.tables
+    }
+
+    fn admit_through(
+        &self,
+        id: WorkerId,
+        rank: u16,
+        facts: BatchFacts,
+        body: &mut dyn FnMut(&mut LaneWriter<'_>),
+    ) -> BatchOutcome {
+        self.tables.admit_through(id, rank, facts, body)
+    }
+
+    fn reconnected(&self, id: WorkerId) {
+        self.tables.reconnected(id);
+    }
+
+    fn resync(&self, id: WorkerId, rank: Option<u16>, reason: ResyncReason) {
+        self.tables.resync(id, rank, reason);
+    }
+
+    fn cursor(&self, id: WorkerId, rank: u16) -> Option<KvCursor> {
+        self.tables.cursor(id, rank)
+    }
+
+    fn removed(&self, id: WorkerId) {
+        self.tables.removed(id);
+    }
+
+    fn block_size(&self, model: &str) -> Option<u32> {
+        self.tables.block_size(model)
+    }
+
+    fn set_block_size(&self, model: &str, size: u32) {
+        self.tables.set_block_size(model, size);
+    }
+
+    fn resyncs(&self, reason: ResyncReason) -> u64 {
+        self.tables.resyncs(reason)
+    }
+
+    fn indexed_blocks(&self, id: WorkerId, rank: u16) -> usize {
+        self.tables.indexed_blocks(id, rank)
+    }
+
+    /// Rows that ask for events and hold no lane. Each was stated while
+    /// its model's index stood at its ceiling ([`INDEX_WORKERS`]): it holds
+    /// nothing in the index until one of its own later writes finds a
+    /// place.
+    fn unindexed_rows(&self) -> usize {
+        let (_, rows) = self.store.all_rows();
+        let asking = rows
+            .iter()
+            .filter(|row| indexed_under(row).is_some())
+            .count();
+        asking.saturating_sub(self.tables.lanes())
+    }
+}
 
 /// The facts of a row whose signals ask for events.
 fn publisher(key: &str, models: &[&str]) -> WorkerFacts {
@@ -37,7 +155,7 @@ fn publisher(key: &str, models: &[&str]) -> WorkerFacts {
     }
 }
 
-fn admitted(store: &MemoryStore, key: &str) -> WorkerId {
+fn admitted(store: &Kept, key: &str) -> WorkerId {
     let id = store.upsert(publisher(key, &[MODEL])).id();
     // The build this registration owes, asked: the cases read the row at
     // once.
@@ -168,7 +286,7 @@ trait Drive {
     fn drive(&self, id: WorkerId, rank: u16, facts: BatchFacts, events: &[Event]) -> BatchOutcome;
 }
 
-impl Drive for MemoryStore {
+impl Drive for Kept {
     fn drive(&self, id: WorkerId, rank: u16, facts: BatchFacts, events: &[Event]) -> BatchOutcome {
         self.admit_through(id, rank, header(facts, events), &mut |writer| {
             let mut map = std::mem::take(writer.map());
@@ -199,13 +317,13 @@ fn batch(sequence: u64) -> BatchFacts {
 }
 
 /// The rows holding a prefix of `request` in `model`'s index.
-fn held(store: &MemoryStore, model: &str, request: &[u64]) -> BTreeMap<WorkerId, u32> {
+fn held(store: &Kept, model: &str, request: &[u64]) -> BTreeMap<WorkerId, u32> {
     store.kv().overlaps(model, request).into_iter().collect()
 }
 
 #[test]
 fn a_members_blocks_reach_its_models_index_and_a_removal_leaves_a_hole() {
-    let store = MemoryStore::new();
+    let store = Kept::new();
     let (a, b) = (admitted(&store, "a"), admitted(&store, "b"));
     let long = chain(&[1, 2, 3, 4]);
     let fork = chain(&[1, 2, 9]);
@@ -250,7 +368,7 @@ fn a_members_blocks_reach_its_models_index_and_a_removal_leaves_a_hole() {
 
 #[test]
 fn a_row_leaves_with_its_blocks_and_its_successor_starts_empty() {
-    let store = MemoryStore::new();
+    let store = Kept::new();
     let (a, b) = (admitted(&store, "a"), admitted(&store, "b"));
     let blocks = chain(&[1, 2, 3]);
     store.drive(a, 0, batch(1), &stored(None, &blocks));
@@ -292,7 +410,7 @@ fn a_row_leaves_with_its_blocks_and_its_successor_starts_empty() {
     // The row removed: its blocks go. The model's index stays while a row
     // writes it and goes with the last.
     let remove = |id| {
-        let revision = WorkersStore::get(&store, id).expect("the row").revision;
+        let revision = WorkersStore::get(&*store, id).expect("the row").revision;
         store.remove(id, revision).expect("removed");
     };
     remove(successor);
@@ -309,7 +427,7 @@ fn a_row_leaves_with_its_blocks_and_its_successor_starts_empty() {
 
 #[test]
 fn a_row_is_indexed_under_its_first_model_at_its_own_rank_when_it_asks_for_events() {
-    let store = MemoryStore::new();
+    let store = Kept::new();
     let blocks = chain(&[1, 2]);
     // No row: nothing is heard and nothing is written.
     let stranger = WorkerId(9);
@@ -373,7 +491,7 @@ fn a_row_is_indexed_under_its_first_model_at_its_own_rank_when_it_asks_for_event
 
 #[test]
 fn a_row_past_the_ceiling_stands_counted_until_its_own_write_finds_a_place() {
-    let store = MemoryStore::new();
+    let store = Kept::new();
     let blocks = chain(&[1]);
     let ids: Vec<WorkerId> = (0..INDEX_WORKERS)
         .map(|n| admitted(&store, &format!("w{n}")))
@@ -402,7 +520,7 @@ fn a_row_past_the_ceiling_stands_counted_until_its_own_write_finds_a_place() {
     // A row leaves, and no write names the row past the ceiling: it is
     // still out, and the place is the next written row's.
     let leave = |id| {
-        let revision = WorkersStore::get(&store, id).expect("the row").revision;
+        let revision = WorkersStore::get(&*store, id).expect("the row").revision;
         store.remove(id, revision).expect("removed");
     };
     leave(ids[3]);
@@ -447,7 +565,7 @@ fn write_lent(lane: &mut LaneWriter<'_>, blocks: &[StoredBlock]) {
 /// the next batch goes on from the same cursor and map.
 #[test]
 fn a_lent_batch_runs_its_body_where_the_cursor_admits_it() {
-    let store = MemoryStore::new();
+    let store = Kept::new();
     let a = admitted(&store, "a");
     let blocks = chain(&[1, 2, 3]);
     let mut ran = 0;
@@ -495,7 +613,7 @@ fn a_lent_batch_runs_its_body_where_the_cursor_admits_it() {
 /// empty by then.
 #[test]
 fn a_lent_body_reads_each_emptying_of_its_rank() {
-    let store = MemoryStore::new();
+    let store = Kept::new();
     let a = admitted(&store, "a");
     let blocks = chain(&[1, 2, 3]);
     let lent = |sequence, clears| {
@@ -538,7 +656,7 @@ fn a_lent_body_reads_each_emptying_of_its_rank() {
 /// a body that outlives the lane resets its state at the next batch.
 #[test]
 fn a_lane_made_again_under_one_row_id_reads_another_value() {
-    let store = MemoryStore::new();
+    let store = Kept::new();
     let a = admitted(&store, "a");
     let read = || {
         store.resync(a, Some(0), ResyncReason::Snapshot);
@@ -571,7 +689,7 @@ fn a_lane_made_again_under_one_row_id_reads_another_value() {
 /// row that comes next finds a view of its own.
 #[test]
 fn a_rows_group_view_empties_with_its_rank_and_leaves_with_the_row() {
-    let store = MemoryStore::new();
+    let store = Kept::new();
     let a = admitted(&store, "a");
     let view_of = |id, sequence| {
         let mut view = None;
@@ -610,7 +728,7 @@ fn a_rows_group_view_empties_with_its_rank_and_leaves_with_the_row() {
 /// body reads another value over an empty map.
 #[test]
 fn a_lent_body_that_unwinds_starts_its_lane_over() {
-    let store = MemoryStore::new();
+    let store = Kept::new();
     let a = admitted(&store, "a");
     let blocks = chain(&[1, 2, 3]);
     let mut first = None;
@@ -645,7 +763,7 @@ fn a_lent_body_that_unwinds_starts_its_lane_over() {
 
 #[test]
 fn a_snapshots_start_a_long_gap_and_a_clear_among_the_events_each_empty_the_rank() {
-    let store = MemoryStore::new();
+    let store = Kept::new();
     let a = admitted(&store, "a");
     let old = chain(&[1, 2, 3]);
     let new = chain(&[7, 8]);
@@ -886,7 +1004,7 @@ fn refer(
     }
 }
 
-/// The store's index answers every lookup as the reference index does when
+/// The tables' index answers every lookup as the reference index does when
 /// both are written by the lane's admission, batch for batch: the stream
 /// evicts in the middle of chains, clears, restarts its publisher, repeats,
 /// holds back and loses batches, and is retold by snapshots.
@@ -895,7 +1013,7 @@ fn the_sinks_apply_path_holds_the_index_to_the_reference_over_lossy_streams() {
     for seed in 1..=8u64 {
         let mut mix = Mix(seed);
         let prompts = prompts(&mut mix);
-        let store = MemoryStore::new();
+        let store = Kept::new();
         let ids: Vec<WorkerId> = (0..WORKERS)
             .map(|n| admitted(&store, &format!("w{n}")))
             .collect();
@@ -1045,7 +1163,7 @@ fn the_sinks_apply_path_holds_the_index_to_the_reference_over_lossy_streams() {
 fn rows_apply_at_once_beside_a_reader() {
     const ROWS: usize = 4;
     const BATCHES: u64 = 400;
-    let store = MemoryStore::new();
+    let store = Kept::new();
     let ids: Vec<WorkerId> = (0..ROWS)
         .map(|n| admitted(&store, &format!("w{n}")))
         .collect();
@@ -1100,7 +1218,7 @@ fn rows_apply_at_once_beside_a_reader() {
 
 #[test]
 fn a_row_that_stops_asking_for_events_leaves_its_lane_and_its_blocks() {
-    let store = MemoryStore::new();
+    let store = Kept::new();
     let a = admitted(&store, "a");
     let blocks = chain(&[1, 2, 3]);
     assert_eq!(
@@ -1131,7 +1249,7 @@ fn a_row_that_stops_asking_for_events_leaves_its_lane_and_its_blocks() {
 
 #[test]
 fn a_row_moved_to_another_first_model_leaves_nothing_in_the_old_index() {
-    let store = MemoryStore::new();
+    let store = Kept::new();
     let two = store.upsert(publisher("two", &["first", "second"])).id();
     let blocks = chain(&[1, 2]);
     store.drive(two, 0, batch(1), &stored(None, &blocks));
@@ -1158,7 +1276,7 @@ fn a_row_moved_to_another_first_model_leaves_nothing_in_the_old_index() {
 /// with its cursor started over.
 #[test]
 fn a_snapshot_said_to_every_rank_of_its_engine_leaves_each_what_the_snapshot_holds() {
-    let store = MemoryStore::new();
+    let store = Kept::new();
     let ranks: Vec<WorkerId> = (0..3)
         .map(|rank| store.upsert(ranked("e", rank, 3)).id())
         .collect();
@@ -1217,7 +1335,7 @@ fn a_snapshot_said_to_every_rank_of_its_engine_leaves_each_what_the_snapshot_hol
 /// nothing: it adds to what its rank holds.
 #[test]
 fn a_second_snapshot_leaves_nothing_of_the_first_and_a_chunk_alone_only_adds() {
-    let store = MemoryStore::new();
+    let store = Kept::new();
     let a = admitted(&store, "a");
     let chunk = |sequence| BatchFacts {
         sequence,
@@ -1255,7 +1373,7 @@ fn a_second_snapshot_leaves_nothing_of_the_first_and_a_chunk_alone_only_adds() {
 /// nothing.
 #[test]
 fn an_abandoned_snapshot_keeps_its_blocks_and_starts_its_cursor_over() {
-    let store = MemoryStore::new();
+    let store = Kept::new();
     let a = admitted(&store, "a");
     let chunk = |sequence| BatchFacts {
         sequence,
@@ -1299,7 +1417,7 @@ fn an_abandoned_snapshot_keeps_its_blocks_and_starts_its_cursor_over() {
 /// it.
 #[test]
 fn a_clear_in_the_middle_of_a_batch_below_the_cursor_is_a_restart() {
-    let store = MemoryStore::new();
+    let store = Kept::new();
     let a = admitted(&store, "a");
     let (old, new) = (chain(&[1, 2, 3]), chain(&[7, 8]));
     store.drive(a, 0, batch(9), &stored(None, &old));
@@ -1330,7 +1448,7 @@ fn a_clear_in_the_middle_of_a_batch_below_the_cursor_is_a_restart() {
 /// and empty, and a batch of its old rank is skipped.
 #[test]
 fn a_row_written_at_another_rank_starts_over_there() {
-    let store = MemoryStore::new();
+    let store = Kept::new();
     let row = store.upsert(ranked("e", 0, 2)).id();
     let blocks = chain(&[1, 2, 3]);
     assert_eq!(
@@ -1354,4 +1472,261 @@ fn a_row_written_at_another_rank_starts_over_there() {
         BatchOutcome::Applied
     );
     assert_eq!(store.indexed_blocks(row, 1), 1);
+}
+
+#[test]
+fn a_forgotten_block_size_is_gone_and_a_new_one_stands() {
+    let tables = KvTables::default();
+    let model = "m";
+    tables.set_block_size(model, 32);
+    tables.set_block_size("other", 64);
+    tables.forget_block_size(model);
+    assert_eq!(tables.block_size(model), None);
+    assert_eq!(tables.block_size("other"), Some(64));
+    tables.set_block_size(model, 16);
+    assert_eq!(tables.block_size(model), Some(16));
+}
+
+/// A row whose signals ask for events, at `rank`: the tables index its
+/// blocks.
+fn publishing(store: &Kept, key: &str, rank: u16) -> WorkerId {
+    let facts = WorkerFacts {
+        dp_rank: rank,
+        ..publisher(key, &[MODEL])
+    };
+    store.upsert(facts).id()
+}
+
+/// What the batch of `sequence` writes in these cases, as the body its
+/// row's lane is lent to: one block of its own at a chain's start, so the
+/// blocks a rank holds count the batches applied since its last clear.
+fn one_block(sequence: u64) -> impl FnMut(&mut LaneWriter<'_>) {
+    move |lane| {
+        let block = StoredBlock {
+            seq_hash: SequenceHash(1_000 + sequence),
+            content_hash: ContentHash(2_000 + sequence),
+        };
+        let mut map = std::mem::take(lane.map());
+        let placed = lane.stored(&[block], None, &mut map);
+        *lane.map() = map;
+        placed.expect("stored");
+    }
+}
+
+#[test]
+fn a_reorder_that_moves_the_first_model_moves_the_rows_lane_with_it() {
+    let store = Kept::new();
+    let sink = &store;
+    let mut stated = WorkerFacts {
+        models: vec!["m".to_owned(), "n".to_owned()],
+        signals: Signals {
+            events: true,
+            ..Signals::default()
+        },
+        ..publisher("w", &[MODEL])
+    };
+    let id = store.upsert(stated.clone()).id();
+    for seq in 1..=3 {
+        sink.admit_through(id, 0, batch(seq), &mut one_block(seq));
+    }
+    let held = || (store.kv().held_blocks("m"), store.kv().held_blocks("n"));
+    assert_eq!(held(), (3, 0));
+    // The same two the other way round, written in place. A row's events
+    // are keyed by its first model, and the lane moves with it in the same
+    // write: no block stays under the old key, and the lane made anew is
+    // unheard, which tells a collector to feed it from a snapshot.
+    stated.models.reverse();
+    assert_eq!(store.upsert(stated).id(), id);
+    assert_eq!(held(), (0, 0));
+    assert_eq!(sink.cursor(id, 0), None);
+    assert_eq!(
+        sink.admit_through(id, 0, batch(1), &mut one_block(1)),
+        BatchOutcome::Applied
+    );
+    assert_eq!(held(), (0, 1));
+}
+
+#[test]
+fn kv_batches_apply_in_sequence_skip_duplicates_and_ask_one_replay_per_gap() {
+    let store = Kept::new();
+    let sink = &store;
+    let id = publishing(&store, "w", 0);
+    assert_eq!(sink.cursor(id, 0), None, "a rank never heard from");
+    assert_eq!(
+        sink.admit_through(id, 0, batch(17), &mut one_block(17)),
+        BatchOutcome::Applied
+    );
+    assert_eq!(
+        sink.admit_through(id, 0, batch(18), &mut one_block(18)),
+        BatchOutcome::Applied
+    );
+    assert_eq!(
+        sink.admit_through(id, 0, batch(18), &mut one_block(18)),
+        BatchOutcome::Skipped,
+        "a duplicate"
+    );
+    assert_eq!(sink.cursor(id, 0).expect("heard").applied, 18);
+    assert_eq!(
+        sink.admit_through(id, 0, batch(25), &mut one_block(25)),
+        BatchOutcome::Gap {
+            expected: 19,
+            received: 25
+        }
+    );
+    assert!(sink.cursor(id, 0).expect("heard").replay_pending);
+    for seq in 19..=25 {
+        assert_eq!(
+            sink.admit_through(id, 0, batch(seq), &mut one_block(seq)),
+            BatchOutcome::Applied,
+            "the replay fills the gap"
+        );
+    }
+    assert_eq!(store.indexed_blocks(id, 0), 9);
+    assert_eq!(
+        sink.admit_through(id, 0, batch(40), &mut one_block(40)),
+        BatchOutcome::Gap {
+            expected: 26,
+            received: 40
+        }
+    );
+    assert_eq!(
+        sink.admit_through(id, 0, batch(50), &mut one_block(50)),
+        BatchOutcome::Applied,
+        "a second gap is lost history, applied"
+    );
+    let cursor = sink.cursor(id, 0).expect("heard");
+    assert!(cursor.degraded && !cursor.replay_pending);
+    assert_eq!(
+        store.indexed_blocks(id, 0),
+        10,
+        "a small gap keeps the state"
+    );
+    let second = publishing(&store, "w/1", 1);
+    assert_eq!(
+        sink.admit_through(second, 1, batch(3), &mut one_block(3)),
+        BatchOutcome::Applied
+    );
+    assert_eq!(
+        sink.cursor(second, 1).expect("heard").applied,
+        3,
+        "each rank its own counter"
+    );
+    assert_eq!(
+        sink.admit_through(id, 1, batch(3), &mut one_block(3)),
+        BatchOutcome::Skipped,
+        "a batch of a rank the row is not"
+    );
+    assert_eq!(
+        sink.admit_through(WorkerId(9), 0, batch(1), &mut one_block(1)),
+        BatchOutcome::Skipped,
+        "a batch of a worker the store holds no row for"
+    );
+}
+
+/// The same sequence below the cursor is a late duplicate on the connection
+/// that produced it and a restarted publisher on a fresh one; neither a
+/// clear nor the restart window is needed to tell them apart.
+#[test]
+fn a_fresh_connection_below_the_cursor_is_a_restart_where_a_late_duplicate_is_not() {
+    let store = Kept::new();
+    let sink = &store;
+    let id = publishing(&store, "w", 0);
+    for seq in 1..=5 {
+        assert_eq!(
+            sink.admit_through(id, 0, batch(seq), &mut one_block(seq)),
+            BatchOutcome::Applied
+        );
+    }
+    assert_eq!(
+        sink.admit_through(id, 0, batch(3), &mut one_block(3)),
+        BatchOutcome::Skipped,
+        "a late duplicate on the same connection"
+    );
+    assert_eq!(sink.cursor(id, 0).expect("heard").applied, 5);
+    assert_eq!(store.resyncs(ResyncReason::PublisherRestart), 0);
+    sink.reconnected(id);
+    assert_eq!(
+        sink.admit_through(id, 0, batch(3), &mut one_block(3)),
+        BatchOutcome::Applied,
+        "the same sequence on a fresh connection is a restarted publisher"
+    );
+    let cursor = sink.cursor(id, 0).expect("heard");
+    assert_eq!((cursor.applied, cursor.degraded), (3, false));
+    assert_eq!(store.indexed_blocks(id, 0), 1, "the rank was cleared first");
+    assert_eq!(store.resyncs(ResyncReason::PublisherRestart), 1);
+    assert_eq!(
+        sink.admit_through(id, 0, batch(4), &mut one_block(4)),
+        BatchOutcome::Applied,
+        "the new life continues from there"
+    );
+    assert_eq!(sink.cursor(id, 0).expect("heard").applied, 4);
+}
+
+#[test]
+fn a_publisher_restart_and_a_resync_clear_the_rank_and_a_removal_forgets_it() {
+    let store = Kept::new();
+    let sink = &store;
+    let id = publishing(&store, "w", 0);
+    for seq in 1..=5 {
+        assert_eq!(
+            sink.admit_through(id, 0, batch(seq), &mut one_block(seq)),
+            BatchOutcome::Applied
+        );
+    }
+    let clearing = BatchFacts {
+        sequence: 2,
+        clears: true,
+        snapshot: None,
+    };
+    assert_eq!(
+        sink.admit_through(id, 0, clearing, &mut one_block(2)),
+        BatchOutcome::Applied,
+        "a clear below the cursor is a restarted publisher"
+    );
+    assert_eq!(store.indexed_blocks(id, 0), 1, "the rank was cleared first");
+    assert_eq!(store.resyncs(ResyncReason::PublisherRestart), 1);
+    sink.reconnected(id);
+    assert_eq!(
+        sink.admit_through(id, 0, batch(1), &mut one_block(1)),
+        BatchOutcome::Applied,
+        "below the cursor on a fresh connection: a restart too"
+    );
+    assert_eq!(store.resyncs(ResyncReason::PublisherRestart), 2);
+    for seq in 2..=4 {
+        sink.admit_through(id, 0, batch(seq), &mut one_block(seq));
+    }
+    assert_eq!(store.indexed_blocks(id, 0), 4);
+    sink.resync(id, Some(0), ResyncReason::OutOfRange);
+    assert_eq!(store.indexed_blocks(id, 0), 0);
+    assert_eq!(sink.cursor(id, 0).expect("heard").applied, 0);
+    assert_eq!(store.resyncs(ResyncReason::OutOfRange), 1);
+    let chunk = BatchFacts {
+        sequence: 90,
+        clears: false,
+        snapshot: Some(SnapshotChunk {
+            unknown_before: true,
+        }),
+    };
+    sink.resync(id, Some(0), ResyncReason::Snapshot);
+    assert_eq!(
+        sink.admit_through(id, 0, chunk, &mut one_block(90)),
+        BatchOutcome::Applied
+    );
+    let cursor = sink.cursor(id, 0).expect("heard");
+    assert_eq!((cursor.applied, cursor.degraded), (90, true));
+    assert_eq!(store.resyncs(ResyncReason::Snapshot), 1);
+    assert_eq!(
+        sink.admit_through(id, 0, batch(91), &mut one_block(91)),
+        BatchOutcome::Applied,
+        "live batches continue after the snapshot's stamp"
+    );
+    assert_eq!(store.indexed_blocks(id, 0), 2);
+    sink.removed(id);
+    assert_eq!(sink.cursor(id, 0), None);
+    assert_eq!(store.indexed_blocks(id, 0), 0);
+    sink.set_block_size("m", 16);
+    sink.set_block_size("m", 8);
+    assert_eq!(sink.block_size("m"), Some(16), "only ever raised");
+    sink.set_block_size("m", 32);
+    assert_eq!(sink.block_size("m"), Some(32));
 }

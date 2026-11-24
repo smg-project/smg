@@ -134,7 +134,7 @@ fn profile_of(preset: &str) -> ProfileSpec {
 
 /// What a case's picker does with a decision.
 #[derive(Clone, Copy, Debug)]
-enum Rule {
+pub(crate) enum Rule {
     /// Takes the row at this place among the rows kept, and the row behind
     /// it as its alternate.
     Place(usize),
@@ -149,17 +149,17 @@ enum Rule {
 
 /// What the stages of a case heard of the leases issued: the stage, and
 /// the worker its lease books, by its id.
-type Heard = Arc<Mutex<Vec<(&'static str, WorkerId)>>>;
+pub(crate) type Heard = Arc<Mutex<Vec<(&'static str, WorkerId)>>>;
 
 /// A picker under a case's rule. It counts the decisions it picks for and
 /// those that hand it affinity rows, and keeps the lease issues it hears.
 #[derive(Debug)]
-struct Takes {
-    name: &'static str,
-    rule: Rule,
-    asked: Arc<AtomicU64>,
-    named: Arc<AtomicU64>,
-    heard: Heard,
+pub(crate) struct Takes {
+    pub(crate) name: &'static str,
+    pub(crate) rule: Rule,
+    pub(crate) asked: Arc<AtomicU64>,
+    pub(crate) named: Arc<AtomicU64>,
+    pub(crate) heard: Heard,
 }
 
 impl Lifecycle for Takes {

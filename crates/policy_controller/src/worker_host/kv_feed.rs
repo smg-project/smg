@@ -1,4 +1,4 @@
-//! A host reads its workers' cache events into its own store's index: every
+//! A host reads its workers' cache events into its own KV tables: every
 //! replica of the controller, and a gateway that decides in its own process.
 //! A host that hands the follow a sink ([`KvFeed::set_load_sink`]) reads
 //! the load records the streams carry as well. Under a host that hands it
@@ -33,18 +33,20 @@ use tokio::{
     task::{JoinError, JoinSet},
 };
 
-use super::{KvHost, Objects};
+use super::{kv_tables::indexed_under, KvHost, Objects};
 use crate::{
-    engine::{view::WireModes, Engine},
-    store::{index::indexed_under, snapshot::phase_of, MemoryStore, WorkerFacts, WorkersStore},
+    engine::{
+        view::{Phase, Role, WireModes},
+        Engine,
+    },
+    store::WorkerFacts,
 };
 
 /// A host's cache-event collector and the worker objects it follows.
 pub struct KvFeed<G: Generation> {
     /// Shared with the tasks the follow hands its removals to.
-    collector: Arc<KvEventCollector<KvHost<G, MemoryStore>>>,
+    collector: Arc<KvEventCollector<KvHost<G>>>,
     registry: Arc<WorkerRegistry<G>>,
-    store: Arc<MemoryStore>,
     objects: Arc<Objects<G>>,
     /// The host's worker monitor, once handed: it says whether a worker's
     /// loads are wanted. The collector keeps its own weak hold of the
@@ -53,19 +55,19 @@ pub struct KvFeed<G: Generation> {
 }
 
 impl<G: Generation> KvFeed<G> {
-    /// The feed over `store` and its worker objects. [`Self::run`] starts
-    /// the streams.
-    pub fn new(store: Arc<MemoryStore>, objects: Arc<Objects<G>>) -> Self {
+    /// The feed over a host's worker objects. [`Self::run`] starts the
+    /// streams. It writes the KV tables the holder was handed
+    /// ([`Objects::with_kv_tables`]), and reads no store: over a holder
+    /// handed none it indexes nothing.
+    pub fn new(objects: Arc<Objects<G>>) -> Self {
         let registry = Arc::clone(objects.registry());
-        let collector = Arc::new(KvEventCollector::new(Arc::new(KvHost::new(
-            Arc::clone(&objects),
-            Arc::clone(&store),
-        ))));
+        let collector = Arc::new(KvEventCollector::new(Arc::new(KvHost::new(Arc::clone(
+            &objects,
+        )))));
         collector.set_worker_registry(&registry);
         Self {
             collector,
             registry,
-            store,
             objects,
             loads: OnceLock::new(),
         }
@@ -96,7 +98,7 @@ impl<G: Generation> KvFeed<G> {
     /// The collector, for the stock controller's cases of the follow:
     /// shared, so a case reads it behind the serve that takes the follow.
     #[cfg(all(test, feature = "controller"))]
-    pub(crate) fn collector(&self) -> &Arc<KvEventCollector<KvHost<G, MemoryStore>>> {
+    pub(crate) fn collector(&self) -> &Arc<KvEventCollector<KvHost<G>>> {
         &self.collector
     }
 
@@ -184,11 +186,12 @@ impl<G: Generation> KvFeed<G> {
         if *worker.connection_mode() != ConnectionMode::Grpc {
             return None;
         }
+        // The record beside the object answers: the facts the holder made
+        // the row's lane from. No row of the store is read.
         let indexed = worker.dp_rank().is_none_or(|rank| rank == 0)
             && self
                 .objects
-                .standing(id)
-                .and_then(|standing| self.store.get(standing.row))
+                .row_of(id)
                 .is_some_and(|row| indexed_under(&row).is_some());
         if indexed {
             return Some(SubscriptionKind::Events);
@@ -237,12 +240,22 @@ fn reaped(ended: Result<(), JoinError>) {
 
 /// Whether a found row asks for its engine's cache events under `engine`:
 /// whether a decision reads the index for the row's first model, the one
-/// the store indexes the row under, in the phase of the row's role. Only a
-/// gRPC worker streams.
+/// the row is indexed under, in the phase of the row's role. Only a gRPC
+/// worker streams.
 pub(super) fn asks_events(facts: &WorkerFacts, engine: &Engine) -> bool {
     facts.wire_modes.contains(WireModes::GRPC)
         && facts
             .models
             .first()
             .is_some_and(|model| engine.needs_for(model, phase_of(facts.role)).events)
+}
+
+/// The phase a role's pool decides: what a binding is matched on.
+const fn phase_of(role: Role) -> Phase {
+    match role {
+        Role::Single => Phase::Single,
+        Role::Prefill => Phase::Prefill,
+        Role::Decode => Phase::Decode,
+        Role::Encode => Phase::Encode,
+    }
 }

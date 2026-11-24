@@ -266,7 +266,7 @@ fn every_field_of_a_frame_reaches_the_request_its_maker_makes() {
     // and the decision's instant is the engine's to write.
     assert_eq!((facts.budget_micros, facts.now_micros), (1_500, 0));
     assert!(facts.affinity.is_empty() && facts.named.is_none());
-    assert!(facts.lent_in_flight.is_none() && facts.signal_cells.is_none());
+    assert!(facts.signal_cells.is_none());
     // The frame carries its model's name and no fingerprint of it: each
     // read of the request's session fingerprints the name.
     assert_eq!(facts.model_fingerprint, ModelFingerprint::NONE);
@@ -339,6 +339,31 @@ fn a_keyed_frames_request_says_its_keys_requests_are_counted() {
     let clear = Form::Plain("talk-1".to_owned());
     assert!(counted(Some(clear)));
     assert!(!counted(None));
+}
+
+/// A request its maker makes with no key states neither of its frame's
+/// keys: no session key, no client's key and no word that its own id
+/// handed the first, so no count stands for it. Every other fact is the
+/// frame's. A maker not told so makes the request with both keys.
+#[test]
+fn a_request_made_with_no_key_states_neither_of_its_frames_keys() {
+    let spec = applied(&preset("random"));
+    let frame = Checked::new(full()).expect("a frame the record holds");
+    let mut buffers = Lists::default();
+    let lists = buffers.of(&frame);
+    let maker = FrameRequest::new(&frame, &lists, LEFT, WorkerLists::None);
+    let keyed = maker.make(&spec).facts;
+    assert!(!keyed.session_key.is_none(), "the frame's key");
+    assert_eq!((keyed.client_key, keyed.session_key_from_rid), (29, true));
+    assert!(keyed.session_counted);
+    let unkeyed = maker.unkeyed();
+    let bare = unkeyed.make(&spec).facts;
+    assert!(bare.session_key.is_none());
+    assert_eq!((bare.client_key, bare.session_key_from_rid), (0, false));
+    assert!(!bare.session_counted);
+    assert_eq!((bare.model, bare.seed), (keyed.model, keyed.seed));
+    assert_eq!((bare.tenant, bare.headers), (keyed.tenant, keyed.headers));
+    assert_eq!(bare.block_hashes, keyed.block_hashes);
 }
 
 /// A decider reads frame after frame onto the same buffers: a later frame's

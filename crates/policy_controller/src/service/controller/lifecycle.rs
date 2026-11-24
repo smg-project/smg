@@ -257,6 +257,7 @@ fn past(field: &'static str, number: u32, most: u32) -> Status {
 pub(crate) mod tests {
     // The rule a guard's lease is told by.
     mod lease_on_file;
+    mod pair_on_file;
 
     use std::{
         cell::RefCell,
@@ -632,6 +633,65 @@ pub(crate) mod tests {
         let second = hearing(&store, 2);
         dispatched(&store, &open(&store, A), &a_dispatched(1), t0).expect("the frame reads");
         released(&store, &open(&store, A), &a_released(1)).expect("the frame reads");
+        assert!(first.lock().is_empty() && second.lock().is_empty());
+        assert_eq!(
+            state(&store, A, 1),
+            None,
+            "the file is written all the same"
+        );
+    }
+
+    /// Files the pair `id` of [`A`] as `generation` issued it: the prefill
+    /// side on `prefill`, and the decode side on `decode`, standing as
+    /// `stands`.
+    fn issued_pair(
+        store: &MemoryStore,
+        (id, generation): (u64, u64),
+        (prefill, decode): (WorkerId, WorkerId),
+        stands: LeaseState,
+        now: Instant,
+    ) {
+        let mut record = lease(A, id, now);
+        (record.lease.side, record.lease.generation) = (Side::Prefill, generation);
+        record.target = prefill;
+        let side = DecodeSide {
+            target: decode,
+            picked: PickRecord::default(),
+            session: Session::NONE,
+            session_verdict: SessionVerdict::None,
+            state: stands,
+            tokens: 0,
+            target_index: 0,
+        };
+        LeasesStore::issue_pair(store, record, side).expect("the key is free");
+    }
+
+    /// A pair's words reach the stages of the generation that issued its
+    /// lease and of no later one, as a single's do: no dispatch and no end
+    /// of a side, also of a decode side its dispatch issues.
+    #[test]
+    fn a_pairs_lease_of_a_generation_that_left_tells_no_engine() {
+        let store = MemoryStore::new();
+        let t0 = Instant::now();
+        let first = hearing(&store, 1);
+        let workers = (WorkerId(7), WorkerId(8));
+        issued_pair(&store, (1, 1), workers, LeaseState::ISSUED, t0);
+        issued_pair(&store, (2, 1), workers, LeaseState::Chosen, t0);
+        // A later generation's stages never saw the issue.
+        let second = hearing(&store, 2);
+        for id in [1, 2] {
+            let sent = proto::Dispatched {
+                side: proto::Side::Decode.into(),
+                ..a_dispatched(id)
+            };
+            dispatched(&store, &open(&store, A), &sent, t0).expect("the frame reads");
+            let ended = proto::Completed {
+                side: proto::Side::Decode.into(),
+                ..a_completed(id, workers.1)
+            };
+            completed(&store, &open(&store, A), &ended).expect("the frame reads");
+            released(&store, &open(&store, A), &a_released(id)).expect("the frame reads");
+        }
         assert!(first.lock().is_empty() && second.lock().is_empty());
         assert_eq!(
             state(&store, A, 1),
@@ -1313,6 +1373,41 @@ pub(crate) mod tests {
         ));
         assert_eq!(sends(&count, left), 0);
         assert_eq!(sends(&count, stays), 1);
+    }
+
+    /// A pair's dispatch is counted as a single's is: on the side's own
+    /// worker, by the generation that stands, whichever issued the lease,
+    /// and at no rank of a worker that left.
+    #[test]
+    fn a_pairs_dispatch_is_counted_by_the_standing_generation_where_its_worker_stands() {
+        let store = Arc::new(MemoryStore::new());
+        let objects = holder(&store);
+        tells(&store, &objects);
+        let t0 = Instant::now();
+        let [prefill, stays, left] =
+            ["p", "a", "b"].map(|key| ready(&store, key, COUNTED, Role::Single, WireModes::HTTP));
+        let first = counting(&store, 1);
+        // Two pairs of the first generation, each on a decode of its own.
+        for (id, decode) in [(1, stays), (2, left)] {
+            issued_pair(&store, (id, 1), (prefill, decode), LeaseState::ISSUED, t0);
+        }
+        let standing = counting(&store, 2);
+        objects.follow(&*store);
+        let row = WorkersStore::get(&*store, left).expect("the row");
+        let removed = objects.remove(&store, left, row.revision);
+        assert!(removed.is_some(), "the row leaves");
+        let hand = Hand::new(A);
+        for id in [1, 2] {
+            let frame = proto::Dispatched {
+                side: proto::Side::Decode.into(),
+                ..a_dispatched(id)
+            };
+            dispatched(&store, &hand, &frame, t0).expect("the frame reads");
+        }
+        assert_eq!(sends(&standing, stays), 1);
+        assert_eq!(sends(&standing, left), 0);
+        assert_eq!(sends(&standing, prefill), 0, "no prefill was sent");
+        assert_eq!(sends(&first, stays), 0, "the generation that left");
     }
 
     /// A dispatch on a worker whose object stands is counted while the

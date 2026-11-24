@@ -13,12 +13,10 @@ use std::{
 use super::{
     identity, identity_of,
     leases::{InFlightCounts, WorkerSlot},
-    AtWork, BatchFacts, BatchOutcome, ContentHash, DecodeMark, DecodeSide, GatewayId, Hand,
-    HealthSink, Journal, KvEventSink, LaneWriter, LeaseRecord, LeaseRefused, LeaseState,
-    LeasesStore, LoadSink, LoadSource, LookOutcome, MembershipChange, MembershipTail, MemoryStore,
-    PickRecord, PollMode, Position, ReservationKind, ReservationStore, ResyncReason, SequenceHash,
-    Sides, Signals, SnapshotChunk, StoreSnapshot, StoredBlock, VetoWrite, WorkerFacts, WorkerPatch,
-    WorkerRow, WorkerStatus, WorkersStore,
+    AtWork, DecodeMark, DecodeSide, GatewayId, Hand, HealthSink, Journal, LeaseRecord,
+    LeaseRefused, LeaseState, LeasesStore, LookOutcome, MembershipChange, MembershipTail,
+    MemoryStore, PickRecord, Position, ReservationKind, ReservationStore, Sides, StoreSnapshot,
+    VetoWrite, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
 };
 use crate::{
     document::spec,
@@ -28,7 +26,7 @@ use crate::{
         decision_slot::DecisionSlot,
         demands::DemandFacts,
         sticky_sessions::SessionVerdict,
-        view::{fingerprint, LoadRow, Role, Session, SignalSource, WorkerId},
+        view::{fingerprint, Role, Session, WorkerId},
     },
     service::replication::Log,
     tracking::{
@@ -62,21 +60,6 @@ fn ready(store: &MemoryStore, key: &str) -> WorkerId {
         .set_status(id, WorkerStatus::Ready, revision)
         .expect("ready");
     id
-}
-
-fn row(age_ms: u32) -> LoadRow {
-    LoadRow {
-        running: 1,
-        report_age_ms: age_ms,
-        ..LoadRow::default()
-    }
-}
-
-fn batch(sequence: u64) -> BatchFacts {
-    BatchFacts {
-        sequence,
-        ..BatchFacts::default()
-    }
 }
 
 /// A lease of `gateway` on worker 7, issued at `now` under `term`: the one
@@ -437,73 +420,6 @@ fn a_replaced_incarnation_leaves_the_health_tables_with_its_row() {
     assert_eq!(store.health_entries(), 0, "and the new id starts clean");
 }
 
-/// A worker's load rows live exactly as long as its row: the removal deletes
-/// them, and a record or a report that lands later (a poll that was out, a
-/// stream's last frame) writes nothing.
-#[test]
-fn a_removed_worker_leaves_no_load_row_and_a_late_record_or_report_writes_none() {
-    let store = MemoryStore::new();
-    let id = ready(&store, "http://d:8000");
-    let loads: &dyn LoadSink = &store;
-    let t0 = Instant::now();
-    loads.record(id, 0, row(0), t0, LoadSource::Stream);
-    loads.report(&[(id, 1, Some(row(0)))], t0, LoadSource::Poll);
-    assert_eq!(loads.ranks(id), 2);
-    assert_eq!(store.load_entries(), 1);
-
-    let revision = WorkersStore::get(&store, id).expect("the row").revision;
-    store.remove(id, revision).expect("removed");
-    assert_eq!(loads.ranks(id), 0, "the rows left with the row");
-    assert_eq!(store.load_entries(), 0, "and the entry with them");
-
-    let later = t0 + Duration::from_secs(1);
-    loads.record(id, 0, row(0), later, LoadSource::Stream);
-    loads.record(id, 0, row(0), later, LoadSource::Relay(GatewayId(4)));
-    loads.report(
-        &[(id, 0, Some(row(0))), (id, 1, Some(row(0)))],
-        later,
-        LoadSource::Poll,
-    );
-    assert_eq!(loads.ranks(id), 0, "a late write re-creates nothing");
-    assert!(loads.load(id, 0).is_none());
-    assert_eq!(store.load_entries(), 0);
-    assert_eq!(
-        loads.poll_mode(id, later, Duration::from_secs(10)),
-        PollMode::Poll
-    );
-}
-
-#[test]
-fn a_replaced_incarnation_leaves_the_old_id_without_rows_and_the_new_id_starts_empty() {
-    let store = MemoryStore::new();
-    let old = ready(&store, "http://w:8000");
-    let loads: &dyn LoadSink = &store;
-    let t0 = Instant::now();
-    loads.record(old, 0, row(0), t0, LoadSource::Stream);
-    assert_eq!(loads.ranks(old), 1);
-
-    let new = store.upsert(facts("http://w:8000", 2)).id();
-    assert_ne!(old, new, "a new incarnation under the key");
-    assert_eq!(
-        loads.ranks(old),
-        0,
-        "the old incarnation's rows left with its row"
-    );
-    assert_eq!(
-        loads.ranks(new),
-        0,
-        "nothing the old one reported is the new one's"
-    );
-    assert_eq!(store.load_entries(), 1, "one entry, the new member's");
-
-    // The old incarnation's stream is still draining: its record is dropped,
-    // the new one's is written.
-    loads.record(old, 0, row(0), t0, LoadSource::Stream);
-    loads.record(new, 0, row(0), t0, LoadSource::Stream);
-    assert_eq!((loads.ranks(old), loads.ranks(new)), (0, 1));
-    assert_eq!(store.load_entries(), 1);
-}
-
 #[test]
 fn a_new_row_takes_its_maker_and_a_standing_row_keeps_it() {
     use super::Registrant;
@@ -571,645 +487,12 @@ fn a_providers_maker_is_made_inside_the_rules_of_its_two_parts() {
     ));
 }
 
-#[test]
-fn a_load_write_for_an_id_that_never_registered_is_dropped() {
-    let store = MemoryStore::new();
-    let loads: &dyn LoadSink = &store;
-    let stranger = WorkerId(77);
-    let t0 = Instant::now();
-    loads.record(stranger, 0, row(0), t0, LoadSource::Scrape);
-    loads.report(&[(stranger, 0, Some(row(0)))], t0, LoadSource::Poll);
-    assert_eq!(loads.ranks(stranger), 0);
-    assert_eq!(store.load_entries(), 0);
-}
-
-/// The removal and a writer racing it: whichever takes the table first, no
-/// row is on file once the removal has returned.
-#[test]
-fn a_writer_racing_the_removal_finds_no_row_after_it_returns() {
-    for _ in 0..200 {
-        let store = MemoryStore::new();
-        let id = ready(&store, "http://r:8000");
-        let revision = WorkersStore::get(&store, id).expect("the row").revision;
-        let t0 = Instant::now();
-        std::thread::scope(|scope| {
-            scope.spawn(|| {
-                for _ in 0..50 {
-                    store.record(id, 0, row(0), t0, LoadSource::Stream);
-                    store.report(&[(id, 1, Some(row(0)))], t0, LoadSource::Poll);
-                }
-            });
-            scope.spawn(|| {
-                store.remove(id, revision).expect("removed");
-            });
-        });
-        assert_eq!(LoadSink::ranks(&store, id), 0);
-        assert_eq!(store.load_entries(), 0);
-    }
-}
-
-/// A member with nothing on file but a mark: its engine's last answer named
-/// another rank and left its own out. Its eviction takes the mark, judges
-/// the engine again and is said, as the eviction of a member with a record
-/// is: a world is made, or one is due.
-#[test]
-fn the_eviction_of_a_member_an_answer_left_out_is_said() {
-    let store = MemoryStore::new();
-    let member = |rank: u16| {
-        let facts = WorkerFacts {
-            engine: "http://e:8000".to_string(),
-            dp_rank: rank,
-            dp_size: 2,
-            ..facts(&format!("http://e:8000/{rank}"), 1)
-        };
-        let id = store.upsert(facts).id();
-        store.publish_now();
-        let revision = WorkersStore::get(&store, id).expect("the row").revision;
-        store
-            .set_status(id, WorkerStatus::Ready, revision)
-            .expect("ready");
-        id
-    };
-    let (named, left_out) = (member(0), member(1));
-    let loads: &dyn LoadSink = &store;
-    let t0 = Instant::now();
-    loads.report(
-        &[(named, 0, Some(row(0))), (left_out, 1, None)],
-        t0,
-        LoadSource::Poll,
-    );
-    store.publish_now();
-    assert_eq!(loads.ranks(left_out), 0, "nothing of it is on file");
-    let published = store.publications();
-    assert_eq!(store.publish_due(), None);
-    loads.evict(left_out);
-    assert!(
-        store.publications() > published || store.publish_due().is_some(),
-        "the eviction is said"
-    );
-}
-
-#[test]
-fn an_evicted_member_has_nothing_on_file_and_takes_its_next_report() {
-    let store = MemoryStore::new();
-    let id = ready(&store, "http://w:8000");
-    let loads: &dyn LoadSink = &store;
-    let t0 = Instant::now();
-    loads.record(id, 0, row(0), t0, LoadSource::Stream);
-    loads.evict(id);
-    assert_eq!(loads.ranks(id), 0);
-    assert_eq!(
-        loads.poll_mode(id, t0, Duration::from_secs(10)),
-        PollMode::Poll,
-        "its receipts went too"
-    );
-    loads.report(&[(id, 0, Some(row(0)))], t0, LoadSource::Poll);
-    assert_eq!(loads.ranks(id), 1, "a member's next report is written");
-}
-
-/// The eviction of a member with nothing on file moves no row a
-/// publication shows: no world is made for it, and none is due at the
-/// window's end.
-#[test]
-fn the_eviction_of_a_member_with_nothing_on_file_asks_for_no_publication() {
-    let store = MemoryStore::new();
-    let id = ready(&store, "http://w:8000");
-    let loads: &dyn LoadSink = &store;
-    let published = store.publications();
-    assert_eq!(store.publish_due(), None);
-    loads.evict(id);
-    assert_eq!(
-        (store.publications(), store.publish_due()),
-        (published, None)
-    );
-}
-
-/// A poll's row stands in for a silent rank's sample but never for its
-/// receipt: the poll decision keeps asking while that rank stays silent,
-/// whatever its neighbour pushes.
-#[test]
-fn fallback_polling_stays_while_a_silent_rank_stays_silent() {
-    let store = MemoryStore::new();
-    let sink: &dyn LoadSink = &store;
-    let id = ready(&store, "http://w:8000");
-    let interval = Duration::from_secs(10);
-    let t0 = Instant::now();
-    let row = LoadRow::default();
-    sink.record(id, 0, row, t0, LoadSource::Stream);
-    sink.record(id, 1, row, t0, LoadSource::Stream);
-    assert_eq!(
-        sink.poll_mode(id, t0 + Duration::from_secs(1), interval),
-        PollMode::Suppressed
-    );
-    let later = t0 + interval + Duration::from_secs(1);
-    sink.record(id, 0, row, later, LoadSource::Stream);
-    assert_eq!(
-        sink.poll_mode(id, later, interval),
-        PollMode::Fallback,
-        "rank 1 fell silent"
-    );
-    sink.report(
-        &[(id, 0, Some(row)), (id, 1, Some(row))],
-        later,
-        LoadSource::Poll,
-    );
-    assert_eq!(
-        sink.poll_mode(id, later, interval),
-        PollMode::Fallback,
-        "the poll's row for rank 1 is no record of its own"
-    );
-    assert_eq!(
-        sink.load(id, 1).expect("the poll's row").source,
-        LoadSource::Poll
-    );
-    sink.record(
-        id,
-        0,
-        row,
-        later + Duration::from_secs(1),
-        LoadSource::Stream,
-    );
-    assert_eq!(
-        sink.poll_mode(id, later + Duration::from_secs(1), interval),
-        PollMode::Fallback
-    );
-    sink.record(
-        id,
-        1,
-        row,
-        later + Duration::from_secs(2),
-        LoadSource::Stream,
-    );
-    assert_eq!(
-        sink.poll_mode(id, later + Duration::from_secs(2), interval),
-        PollMode::Suppressed,
-        "both ranks push again"
-    );
-}
-
 /// Formatting the store takes each table's guard once.
 #[test]
 fn the_store_formats_without_holding_a_table_twice() {
     let store = MemoryStore::new();
     let shown = format!("{store:?}");
     assert!(shown.starts_with("MemoryStore"), "{shown}");
-}
-
-#[test]
-fn a_record_replaces_its_rank_alone_and_a_poll_fills_only_the_ranks_that_stayed_quiet() {
-    let store = MemoryStore::new();
-    let loads: &dyn LoadSink = &store;
-    let id = ready(&store, "http://w:8000");
-    let t0 = Instant::now();
-    loads.record(id, 0, row(10), t0, LoadSource::Stream);
-    loads.record(id, 1, row(0), t0, LoadSource::Stream);
-    assert_eq!(loads.ranks(id), 2);
-    let rank0 = loads.load(id, 0).expect("rank 0");
-    assert_eq!(rank0.sampled_at, t0 - Duration::from_millis(10));
-    assert_eq!(SignalSource::from(rank0.source), SignalSource::Events);
-    let polled_at = t0 + Duration::from_millis(50);
-    loads.record(
-        id,
-        1,
-        LoadRow {
-            running: 9,
-            ..row(0)
-        },
-        polled_at + Duration::from_millis(1),
-        LoadSource::Stream,
-    );
-    let mut polled = row(0);
-    polled.running = 2;
-    loads.report(
-        &[
-            (id, 0, Some(polled)),
-            (id, 1, Some(polled)),
-            (id, 2, Some(polled)),
-        ],
-        polled_at,
-        LoadSource::Poll,
-    );
-    assert_eq!(
-        loads.load(id, 0).expect("rank 0").row.running,
-        2,
-        "a quiet rank takes the poll's row"
-    );
-    assert_eq!(
-        loads.load(id, 1).expect("rank 1").row.running,
-        9,
-        "a rank that pushed since the poll began keeps the stream's"
-    );
-    assert_eq!(
-        loads.load(id, 2).map(|sample| sample.source),
-        Some(LoadSource::Poll),
-        "a rank the stream never named stands on the poll"
-    );
-    loads.record(
-        id,
-        0,
-        row(0),
-        polled_at + Duration::from_secs(1),
-        LoadSource::Stream,
-    );
-    assert_eq!(loads.load(id, 0).expect("rank 0").row.running, 1);
-    loads.evict(id);
-    assert_eq!(loads.ranks(id), 0);
-}
-
-#[test]
-fn a_report_answers_the_positions_of_the_rows_it_passed_over() {
-    let store = MemoryStore::new();
-    let loads: &dyn LoadSink = &store;
-    let id = ready(&store, "http://w:8000");
-    let stranger = WorkerId(77);
-    let t0 = Instant::now();
-    loads.record(id, 0, row(0), t0, LoadSource::Stream);
-    loads.record(id, 1, row(0), t0, LoadSource::Stream);
-    let polled = LoadRow {
-        running: 2,
-        ..row(0)
-    };
-    let quiet = t0 + Duration::from_millis(50);
-    assert_eq!(
-        loads.report(
-            &[(id, 0, Some(polled)), (id, 1, Some(polled))],
-            quiet,
-            LoadSource::Poll,
-        ),
-        Vec::<usize>::new(),
-        "no rank pushed since the poll began: both rows are written"
-    );
-    // Rank 1 pushes while the next poll is out.
-    let polled_at = quiet + Duration::from_secs(1);
-    let pushed = LoadRow {
-        running: 9,
-        ..row(0)
-    };
-    loads.record(
-        id,
-        1,
-        pushed,
-        polled_at + Duration::from_millis(1),
-        LoadSource::Stream,
-    );
-    assert_eq!(
-        loads.report(
-            &[
-                (stranger, 0, Some(polled)),
-                (id, 0, Some(polled)),
-                (id, 1, Some(polled)),
-            ],
-            polled_at,
-            LoadSource::Poll,
-        ),
-        vec![2],
-        "the row of the rank that pushed, by its position: a stranger's row is dropped and rank 0's is written"
-    );
-    assert_eq!(loads.load(id, 1).expect("rank 1").row.running, 9);
-    assert_eq!(
-        loads.report(
-            &[(id, 0, Some(polled)), (id, 1, None)],
-            polled_at,
-            LoadSource::Poll,
-        ),
-        Vec::<usize>::new(),
-        "a rank that pushed and brought no row is not on the list"
-    );
-    assert_eq!(
-        loads.report(&[(id, 1, Some(polled))], polled_at, LoadSource::Poll),
-        vec![0],
-        "an answer of passed-over rows alone says them too"
-    );
-    // Both ranks push: each row passed over is said, in the answer's order.
-    loads.record(
-        id,
-        0,
-        pushed,
-        polled_at + Duration::from_millis(2),
-        LoadSource::Stream,
-    );
-    assert_eq!(
-        loads.report(
-            &[
-                (id, 1, Some(polled)),
-                (stranger, 0, Some(polled)),
-                (id, 0, Some(polled)),
-            ],
-            polled_at,
-            LoadSource::Poll,
-        ),
-        vec![0, 2]
-    );
-    assert_eq!(loads.load(id, 0).expect("rank 0").row.running, 9);
-}
-
-#[test]
-fn the_poll_mode_reads_the_receipts_of_the_pushing_ranks_alone() {
-    let store = MemoryStore::new();
-    let loads: &dyn LoadSink = &store;
-    let id = ready(&store, "http://w:8000");
-    let interval = Duration::from_secs(10);
-    let t0 = Instant::now();
-    assert_eq!(loads.poll_mode(id, t0, interval), PollMode::Poll);
-    loads.report(&[(id, 0, Some(row(0)))], t0, LoadSource::Poll);
-    assert_eq!(
-        loads.poll_mode(id, t0, interval),
-        PollMode::Poll,
-        "a poll's own row is not the stream working"
-    );
-    loads.record(id, 0, row(0), t0, LoadSource::Stream);
-    loads.record(id, 1, row(0), t0, LoadSource::Relay(GatewayId(4)));
-    assert_eq!(
-        loads.poll_mode(id, t0 + Duration::from_secs(5), interval),
-        PollMode::Suppressed
-    );
-    loads.record(
-        id,
-        0,
-        row(0),
-        t0 + Duration::from_secs(20),
-        LoadSource::Stream,
-    );
-    assert_eq!(
-        loads.poll_mode(id, t0 + Duration::from_secs(21), interval),
-        PollMode::Fallback,
-        "one stale pushing rank falls back to the poll"
-    );
-}
-
-/// A scrape is the gateway's own read, not the engine pushing: its record
-/// writes no receipt, so the poll it came from stays.
-#[test]
-fn a_scrape_writes_no_receipt_so_the_poll_stays() {
-    let store = MemoryStore::new();
-    let loads: &dyn LoadSink = &store;
-    let id = ready(&store, "http://w:8000");
-    let interval = Duration::from_secs(10);
-    let t0 = Instant::now();
-    loads.record(id, 0, row(4), t0, LoadSource::Scrape);
-    assert_eq!(
-        loads.load(id, 0).map(|sample| sample.source),
-        Some(LoadSource::Scrape),
-        "the row is held"
-    );
-    assert_eq!(
-        loads.poll_mode(id, t0 + Duration::from_secs(1), interval),
-        PollMode::Poll
-    );
-    loads.record(id, 1, row(0), t0, LoadSource::Stream);
-    assert_eq!(
-        loads.poll_mode(id, t0 + Duration::from_secs(1), interval),
-        PollMode::Suppressed,
-        "the pushing rank's receipt is the one read"
-    );
-}
-
-/// A row whose signals ask for events, at `rank`: the store indexes its
-/// blocks.
-fn publisher(store: &MemoryStore, key: &str, rank: u16) -> WorkerId {
-    let facts = WorkerFacts {
-        dp_rank: rank,
-        signals: Signals {
-            events: true,
-            ..Signals::default()
-        },
-        ..facts(key, 1)
-    };
-    store.upsert(facts).id()
-}
-
-/// What the batch of `sequence` writes in these cases, as the body its
-/// row's lane is lent to: one block of its own at a chain's start, so the
-/// blocks a rank holds count the batches applied since its last clear.
-fn one_block(sequence: u64) -> impl FnMut(&mut LaneWriter<'_>) {
-    move |lane| {
-        let block = StoredBlock {
-            seq_hash: SequenceHash(1_000 + sequence),
-            content_hash: ContentHash(2_000 + sequence),
-        };
-        let mut map = std::mem::take(lane.map());
-        let placed = lane.stored(&[block], None, &mut map);
-        *lane.map() = map;
-        placed.expect("stored");
-    }
-}
-
-#[test]
-fn a_reorder_that_moves_the_first_model_moves_the_rows_lane_with_it() {
-    let store = MemoryStore::new();
-    let sink: &dyn KvEventSink = &store;
-    let mut stated = WorkerFacts {
-        models: vec!["m".to_owned(), "n".to_owned()],
-        signals: Signals {
-            events: true,
-            ..Signals::default()
-        },
-        ..facts("w", 1)
-    };
-    let id = store.upsert(stated.clone()).id();
-    for seq in 1..=3 {
-        sink.admit_through(id, 0, batch(seq), &mut one_block(seq));
-    }
-    let held = || (store.kv().held_blocks("m"), store.kv().held_blocks("n"));
-    assert_eq!(held(), (3, 0));
-    // The same two the other way round, written in place. A row's events
-    // are keyed by its first model, and the lane moves with it in the same
-    // write: no block stays under the old key, and the lane made anew is
-    // unheard, which tells a collector to feed it from a snapshot.
-    stated.models.reverse();
-    assert_eq!(store.upsert(stated).id(), id);
-    assert_eq!(held(), (0, 0));
-    assert_eq!(sink.cursor(id, 0), None);
-    assert_eq!(
-        sink.admit_through(id, 0, batch(1), &mut one_block(1)),
-        BatchOutcome::Applied
-    );
-    assert_eq!(held(), (0, 1));
-}
-
-#[test]
-fn kv_batches_apply_in_sequence_skip_duplicates_and_ask_one_replay_per_gap() {
-    let store = MemoryStore::new();
-    let sink: &dyn KvEventSink = &store;
-    let id = publisher(&store, "w", 0);
-    assert_eq!(sink.cursor(id, 0), None, "a rank never heard from");
-    assert_eq!(
-        sink.admit_through(id, 0, batch(17), &mut one_block(17)),
-        BatchOutcome::Applied
-    );
-    assert_eq!(
-        sink.admit_through(id, 0, batch(18), &mut one_block(18)),
-        BatchOutcome::Applied
-    );
-    assert_eq!(
-        sink.admit_through(id, 0, batch(18), &mut one_block(18)),
-        BatchOutcome::Skipped,
-        "a duplicate"
-    );
-    assert_eq!(sink.cursor(id, 0).expect("heard").applied, 18);
-    assert_eq!(
-        sink.admit_through(id, 0, batch(25), &mut one_block(25)),
-        BatchOutcome::Gap {
-            expected: 19,
-            received: 25
-        }
-    );
-    assert!(sink.cursor(id, 0).expect("heard").replay_pending);
-    for seq in 19..=25 {
-        assert_eq!(
-            sink.admit_through(id, 0, batch(seq), &mut one_block(seq)),
-            BatchOutcome::Applied,
-            "the replay fills the gap"
-        );
-    }
-    assert_eq!(store.indexed_blocks(id, 0), 9);
-    assert_eq!(
-        sink.admit_through(id, 0, batch(40), &mut one_block(40)),
-        BatchOutcome::Gap {
-            expected: 26,
-            received: 40
-        }
-    );
-    assert_eq!(
-        sink.admit_through(id, 0, batch(50), &mut one_block(50)),
-        BatchOutcome::Applied,
-        "a second gap is lost history, applied"
-    );
-    let cursor = sink.cursor(id, 0).expect("heard");
-    assert!(cursor.degraded && !cursor.replay_pending);
-    assert_eq!(
-        store.indexed_blocks(id, 0),
-        10,
-        "a small gap keeps the state"
-    );
-    let second = publisher(&store, "w/1", 1);
-    assert_eq!(
-        sink.admit_through(second, 1, batch(3), &mut one_block(3)),
-        BatchOutcome::Applied
-    );
-    assert_eq!(
-        sink.cursor(second, 1).expect("heard").applied,
-        3,
-        "each rank its own counter"
-    );
-    assert_eq!(
-        sink.admit_through(id, 1, batch(3), &mut one_block(3)),
-        BatchOutcome::Skipped,
-        "a batch of a rank the row is not"
-    );
-    assert_eq!(
-        sink.admit_through(WorkerId(9), 0, batch(1), &mut one_block(1)),
-        BatchOutcome::Skipped,
-        "a batch of a worker the store holds no row for"
-    );
-}
-
-/// The same sequence below the cursor is a late duplicate on the connection
-/// that produced it and a restarted publisher on a fresh one; neither a
-/// clear nor the restart window is needed to tell them apart.
-#[test]
-fn a_fresh_connection_below_the_cursor_is_a_restart_where_a_late_duplicate_is_not() {
-    let store = MemoryStore::new();
-    let sink: &dyn KvEventSink = &store;
-    let id = publisher(&store, "w", 0);
-    for seq in 1..=5 {
-        assert_eq!(
-            sink.admit_through(id, 0, batch(seq), &mut one_block(seq)),
-            BatchOutcome::Applied
-        );
-    }
-    assert_eq!(
-        sink.admit_through(id, 0, batch(3), &mut one_block(3)),
-        BatchOutcome::Skipped,
-        "a late duplicate on the same connection"
-    );
-    assert_eq!(sink.cursor(id, 0).expect("heard").applied, 5);
-    assert_eq!(store.resyncs(ResyncReason::PublisherRestart), 0);
-    sink.reconnected(id);
-    assert_eq!(
-        sink.admit_through(id, 0, batch(3), &mut one_block(3)),
-        BatchOutcome::Applied,
-        "the same sequence on a fresh connection is a restarted publisher"
-    );
-    let cursor = sink.cursor(id, 0).expect("heard");
-    assert_eq!((cursor.applied, cursor.degraded), (3, false));
-    assert_eq!(store.indexed_blocks(id, 0), 1, "the rank was cleared first");
-    assert_eq!(store.resyncs(ResyncReason::PublisherRestart), 1);
-    assert_eq!(
-        sink.admit_through(id, 0, batch(4), &mut one_block(4)),
-        BatchOutcome::Applied,
-        "the new life continues from there"
-    );
-    assert_eq!(sink.cursor(id, 0).expect("heard").applied, 4);
-}
-
-#[test]
-fn a_publisher_restart_and_a_resync_clear_the_rank_and_a_removal_forgets_it() {
-    let store = MemoryStore::new();
-    let sink: &dyn KvEventSink = &store;
-    let id = publisher(&store, "w", 0);
-    for seq in 1..=5 {
-        assert_eq!(
-            sink.admit_through(id, 0, batch(seq), &mut one_block(seq)),
-            BatchOutcome::Applied
-        );
-    }
-    let clearing = BatchFacts {
-        sequence: 2,
-        clears: true,
-        snapshot: None,
-    };
-    assert_eq!(
-        sink.admit_through(id, 0, clearing, &mut one_block(2)),
-        BatchOutcome::Applied,
-        "a clear below the cursor is a restarted publisher"
-    );
-    assert_eq!(store.indexed_blocks(id, 0), 1, "the rank was cleared first");
-    assert_eq!(store.resyncs(ResyncReason::PublisherRestart), 1);
-    sink.reconnected(id);
-    assert_eq!(
-        sink.admit_through(id, 0, batch(1), &mut one_block(1)),
-        BatchOutcome::Applied,
-        "below the cursor on a fresh connection: a restart too"
-    );
-    assert_eq!(store.resyncs(ResyncReason::PublisherRestart), 2);
-    for seq in 2..=4 {
-        sink.admit_through(id, 0, batch(seq), &mut one_block(seq));
-    }
-    assert_eq!(store.indexed_blocks(id, 0), 4);
-    sink.resync(id, Some(0), ResyncReason::OutOfRange);
-    assert_eq!(store.indexed_blocks(id, 0), 0);
-    assert_eq!(sink.cursor(id, 0).expect("heard").applied, 0);
-    assert_eq!(store.resyncs(ResyncReason::OutOfRange), 1);
-    let chunk = BatchFacts {
-        sequence: 90,
-        clears: false,
-        snapshot: Some(SnapshotChunk {
-            unknown_before: true,
-        }),
-    };
-    sink.resync(id, Some(0), ResyncReason::Snapshot);
-    assert_eq!(
-        sink.admit_through(id, 0, chunk, &mut one_block(90)),
-        BatchOutcome::Applied
-    );
-    let cursor = sink.cursor(id, 0).expect("heard");
-    assert_eq!((cursor.applied, cursor.degraded), (90, true));
-    assert_eq!(store.resyncs(ResyncReason::Snapshot), 1);
-    assert_eq!(
-        sink.admit_through(id, 0, batch(91), &mut one_block(91)),
-        BatchOutcome::Applied,
-        "live batches continue after the snapshot's stamp"
-    );
-    assert_eq!(store.indexed_blocks(id, 0), 2);
-    sink.removed(id);
-    assert_eq!(sink.cursor(id, 0), None);
-    assert_eq!(store.indexed_blocks(id, 0), 0);
-    sink.set_block_size("m", 16);
-    sink.set_block_size("m", 8);
-    assert_eq!(sink.block_size("m"), Some(16), "only ever raised");
-    sink.set_block_size("m", 32);
-    assert_eq!(sink.block_size("m"), Some(32));
 }
 
 #[test]
@@ -2385,11 +1668,10 @@ fn a_side_s_lease_names_the_worker_its_record_books() {
     };
     assert_eq!(record.lease.booked, WorkerId(0), "filed with no word");
     assert_eq!(told(&single, Side::Single), Some(record.target));
-    assert_eq!(single.ending(None).map(booked), [Some(record.target), None]);
-    // A single's end is told off its record, with no list built.
-    let mut ended = Vec::new();
-    single.each_ending(None, |lease| ended.push(lease.booked));
-    assert_eq!(ended, [record.target]);
+    // A single's end is lent off its record, under the same worker.
+    let whole = Said::Released(None, ReleaseReason::ClientGone);
+    let lent = single.with_held_single(whole, |held| held.lease.booked);
+    assert_eq!(lent, Some(record.target));
     let (record, decode) = pair(2, p, &[d], now);
     let both = Sides {
         record,
@@ -2397,7 +1679,16 @@ fn a_side_s_lease_names_the_worker_its_record_books() {
     };
     assert_eq!(told(&both, Side::Prefill), Some(p));
     assert_eq!(told(&both, Side::Decode), Some(d));
-    assert_eq!(both.ending(None).map(booked), [Some(p), Some(d)]);
+    // A pair's end is lent once a side, the prefill's first: the lease
+    // names the prefill, and the target's pair the decode.
+    let mut ended = Vec::new();
+    both.with_held_pair(whole, |held, said| {
+        let decode = held.target.pair.map(|pair| pair.decode_id);
+        ended.push((said, held.lease.booked, decode));
+    });
+    let of = |side| Said::Released(Some(side), ReleaseReason::ClientGone);
+    let sides = [Side::Prefill, Side::Decode].map(|side| (of(side), p, Some(d)));
+    assert_eq!(ended, sides);
 }
 
 #[test]
@@ -2564,10 +1855,12 @@ fn the_dispatch_deadline_ends_each_side_that_waits_and_a_dispatched_side_stands(
         let Said::Released(side, ReleaseReason::Abandoned) = said else {
             panic!("this issue tells the deadline's ends alone: {said:?}");
         };
-        // The word reads the side's lease off the lease as the end found
-        // it.
-        let lease = found.ending(side)[0];
-        (found.record.lease.id.0, lease.map(|lease| lease.side))
+        // The word is lent off the lease as the end found it: once, of
+        // the side it names, which waited.
+        let mut lent = Vec::new();
+        found.with_held_pair(said, |_, said| lent.push(said));
+        assert_eq!(lent, [said]);
+        (found.record.lease.id.0, side)
     });
     assert_eq!(
         ended.collect::<Vec<_>>(),
@@ -3029,7 +2322,6 @@ fn a_restore_tells_each_end_under_the_decider_whose_file_holds_its_lease() {
 fn a_watch_snapshot_keeps_a_members_local_tables() {
     let store = MemoryStore::new();
     let id = ready(&store, "http://a:1");
-    assert_eq!(publisher(&store, "http://a:1", 0), id);
     store.publish_now();
     let (gateway, now) = (GatewayId(1), Instant::now());
     let lease = booking(gateway, 1, id, now);
@@ -3038,12 +2330,6 @@ fn a_watch_snapshot_keeps_a_members_local_tables() {
     leases.issue(lease).expect("filed");
     let slot = store.snapshot().booked_of(id).expect("the member's slot");
     store.gateway_veto(gateway, id, Some(now + Duration::from_secs(60)));
-    LoadSink::record(&store, id, 0, row(0), now, LoadSource::Stream);
-    let local_load = LoadSink::load(&store, id, 0).expect("the local report");
-    assert_eq!(
-        store.admit_through(id, 0, batch(1), &mut one_block(1)),
-        BatchOutcome::Applied
-    );
 
     let mut cut = store.checkpoint();
     cut.epoch += 1;
@@ -3061,15 +2347,13 @@ fn a_watch_snapshot_keeps_a_members_local_tables() {
     assert_eq!(store.snapshot().booked_of(id), Some(slot));
     assert_eq!(in_flight(&store), [(id, 1)]);
     assert!(store.vetoed(gateway, id, now));
-    assert_eq!(LoadSink::load(&store, id, 0), Some(local_load));
-    assert_eq!(store.kv().held_blocks("m"), 1);
     assert_eq!(WorkersStore::get(&store, id), Some(expected));
 }
 
 #[test]
 fn a_watch_snapshot_evicts_a_leavers_tables_and_its_lease_moves_no_other_count() {
     let store = MemoryStore::new();
-    let left = publisher(&store, "http://a:1", 0);
+    let left = store.upsert(facts("http://a:1", 1)).id();
     store.publish_now();
     let before = store.snapshot();
     let slot = before.booked_of(left).expect("the leaver's slot");
@@ -3079,31 +2363,17 @@ fn a_watch_snapshot_evicts_a_leavers_tables_and_its_lease_moves_no_other_count()
     leases.set_term(1);
     leases.issue(lease).expect("filed");
     store.gateway_veto(gateway, left, Some(now + Duration::from_secs(60)));
-    LoadSink::record(&store, left, 0, row(0), now, LoadSource::Stream);
-    assert_eq!(
-        store.admit_through(left, 0, batch(1), &mut one_block(1)),
-        BatchOutcome::Applied
-    );
 
     let source = MemoryStore::new();
     let joined = ready(&source, "http://b:1");
-    LoadSink::record(&source, joined, 0, row(0), now, LoadSource::Stream);
     assert!(store.watch_from(source.checkpoint()));
     assert_eq!(leases.get(gateway, lease.lease.id), Some(lease));
     assert_ne!(store.snapshot().booked_of(joined), Some(slot));
     assert_eq!(in_flight(&store), [(joined, 0)]);
     assert!(WorkersStore::by_key(&store, "http://a:1").is_none());
     assert!(!store.vetoed(gateway, left, now));
-    assert!(LoadSink::load(&store, left, 0).is_none());
-    assert!(
-        LoadSink::load(&store, joined, 0).is_none(),
-        "the cut's load is ignored"
-    );
-    assert_eq!(store.kv().held_blocks("m"), 0);
     assert!(leases.released(gateway, lease.lease.id, None, ReleaseReason::ClientGone));
     assert_eq!(in_flight(&store), [(joined, 0)]);
-    LoadSink::record(&store, joined, 0, row(0), now, LoadSource::Stream);
-    assert!(LoadSink::load(&store, joined, 0).is_some());
 }
 
 #[test]
@@ -3222,6 +2492,96 @@ fn a_watch_snapshot_publishes_the_cut_at_once_and_tells_the_members_once() {
         *heard.lock().expect("the stage heard"),
         [format!("{snapshot:?}")]
     );
+}
+
+/// A stage that panics at a store's word of membership is held and counted
+/// by the engine that decides under the standing document, as at a
+/// gateway's word: the store's write goes on with what it still owes. An
+/// apply stands and tells the journal its generation, a registration leaves
+/// its row on file and a removal takes it off. The stage behind the one
+/// that panicked hears none of the words. Before, the panic unwound out of
+/// the write: an apply left with its world shown and its journal untold.
+#[cfg(feature = "in-process")]
+#[test]
+fn a_stage_that_panics_at_the_stores_word_of_membership_is_held_and_counted() {
+    use crate::{
+        document::{AppliedSpec, PolicySpec},
+        engine::{
+            view::{Candidate, RequestFacts},
+            Scorer, TieBand,
+        },
+        stages::{Lifecycle, StageRegistry},
+    };
+
+    /// A scorer that scores every row alike. `Some` counts the words of
+    /// membership it hears; `None` panics at each.
+    #[derive(Debug)]
+    struct Hears(&'static str, Option<Arc<AtomicU32>>);
+
+    impl Lifecycle for Hears {
+        fn on_membership(&self, _: &Membership<'_>) {
+            let Some(heard) = &self.1 else {
+                panic!("the case's own panic, at a word of membership");
+            };
+            heard.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    impl Scorer for Hears {
+        fn name(&self) -> &'static str {
+            self.0
+        }
+
+        fn score(
+            &self,
+            _: &RequestFacts<'_>,
+            _: &[Candidate],
+            _: &[u32],
+            out: &mut [f32],
+        ) -> TieBand {
+            out.fill(0.0);
+            TieBand::NORMALIZED
+        }
+    }
+
+    let log = Arc::new(Log::new(8));
+    let journal: Arc<Log> = Arc::clone(&log);
+    let store = MemoryStore::journaled(journal);
+    store.set_term(1);
+    let behind = Arc::new(AtomicU32::new(0));
+    let heard = Arc::clone(&behind);
+    let mut catalog = StageRegistry::builtin();
+    catalog
+        .scorer("deaf", || Box::new(Hears("deaf", None)))
+        .expect("a free name");
+    catalog
+        .scorer("behind", move || {
+            Box::new(Hears("behind", Some(Arc::clone(&heard))))
+        })
+        .expect("a free name");
+    let document: PolicySpec = serde_json::from_str(
+        r#"{"apiVersion":"smg.policy/v1","generation":1,"profiles":{"p":{"score":["deaf","behind"],"pick":"best"}}}"#,
+    )
+    .expect("a policy document");
+    let digest = document.digest().expect("the digest");
+    let spec =
+        AppliedSpec::validate_digested(&document, digest, &catalog, &[]).expect("a generation");
+    let unheard = || store.deciding(|world| world.front().unheard());
+
+    // An apply tells its engine the members that stand.
+    let told = log.head().seq;
+    store.apply(spec).expect("the generation is applied");
+    assert_eq!(unheard(), 1);
+    assert!(log.head().seq > told, "the journal is told the generation");
+
+    // A registration and a removal each tell their word.
+    let id = store.upsert(facts("http://a:1", 1)).id();
+    assert_eq!(unheard(), 2);
+    let row = WorkersStore::get(&store, id).expect("the row is on file");
+    assert!(store.remove(id, row.revision).is_some());
+    assert_eq!(unheard(), 3);
+    assert!(WorkersStore::get(&store, id).is_none());
+    assert_eq!(behind.load(Ordering::Relaxed), 0);
 }
 
 #[test]

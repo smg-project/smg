@@ -19,7 +19,7 @@
 //!   ([`RequestMaker::plain`]): such a request is not made at all.
 //!
 //! One thing of the request the engine does not make: the prompt's entry in
-//! a token tree its caller lends. The caller names it ([`Prompt::entry`]),
+//! a tree its caller lends. The caller names it ([`Prompt::entry`]),
 //! by its own rule for a cache partition, and a decision that reads the
 //! tree asks it. That decision stores the prompt in the tree for the first
 //! of its targets this call can send to ([`RequestMaker::sends_to`]), and
@@ -40,7 +40,9 @@
 //!
 //! A single request that names its worker, under a document whose binding
 //! says which header names it, is held to that one worker and goes to no
-//! other ([`target`]).
+//! other ([`target`]). A pair that names its worker is held so on each
+//! side whose profile is the hash ring keyed by no prefix, its prefill's
+//! first.
 //!
 //! A request with a pair's two lists is placed a target at a time over both
 //! its workers ([`pair`]). Its later decisions are held to the workers the
@@ -66,7 +68,7 @@
 mod decode_again;
 mod encode;
 mod pair;
-mod target;
+pub(crate) mod target;
 
 use std::{
     any::Any,
@@ -91,8 +93,8 @@ use crate::{
     engine::{
         decision::{Decision, Pick, ShedReason, Target, MAX_TARGETS},
         decision_engine::{
-            AlonePick, DecideOutcome, DecisionRefused, Plain, Request, RequestMaker, TokenKey,
-            WorkerLists,
+            AlonePick, DecideOutcome, DecisionRefused, Plain, Request, RequestMaker, TextKey,
+            TokenKey, WorkerLists,
         },
         demands::Demands,
         framework::EncodeItems,
@@ -148,19 +150,32 @@ impl HeaderRead for http::HeaderMap {
     }
 }
 
-/// A prompt's entry in a token tree, as the request's caller names it: the
-/// one question a decision asks where it reads the tree the caller lends
-/// ([`CacheIndexes::token_tree`]). A caller of [`PolicyEngine::place`]
-/// answers it for its request ([`Prompt::entry`]), as a maker written by
-/// hand answers [`RequestMaker::token_key`].
+/// A prompt's entry in a tree its caller lends, as the caller names it: the
+/// one question a decision asks where it reads the caller's token tree
+/// ([`CacheIndexes::token_tree`]), and the one it asks where it reads the
+/// caller's string tree ([`CacheIndexes::string_tree`]). A caller of
+/// [`PolicyEngine::place`] answers them for its request
+/// ([`Prompt::entry`]), as a maker written by hand answers
+/// [`RequestMaker::token_key`] and [`RequestMaker::text_key`].
+///
+/// The trait is named for its first question. A caller that keeps no
+/// string tree answers that one alone.
 ///
 /// [`CacheIndexes::token_tree`]: crate::engine::CacheIndexes::token_tree
+/// [`CacheIndexes::string_tree`]: crate::engine::CacheIndexes::string_tree
 pub trait TokenEntry {
     /// The entry by token ids for a tree whose page is `page` tokens
     /// ([`TokenKey`]): `None` where the caller holds no token ids of the
     /// prompt. The marker of a cache partition fills whole pages, which is
     /// why the page is asked with.
     fn token_key(&self, page: usize) -> Option<TokenKey<'_>>;
+
+    /// The entry by text for the caller's string tree ([`TextKey`]):
+    /// `None`, the default, where the caller holds the prompt's token ids
+    /// or no text of it, or lends no string tree.
+    fn text_key(&self) -> Option<TextKey<'_>> {
+        None
+    }
 }
 
 /// A request's prompt, as its caller holds it: what the stages that place a
@@ -176,14 +191,15 @@ pub struct Prompt<'a> {
     /// [`HashSeeds::PLAIN`] for a request with none. The caller's own rule
     /// keeps two partitions apart.
     pub seeds: HashSeeds,
-    /// The prompt's entry in the token tree the caller lends
-    /// ([`CacheIndexes::token_tree`]), named by the caller's own rule as
-    /// the seeds are: the same cache partition, for a tree's lookup.
-    /// `None` from a caller that lends no tree or holds no token ids: the
+    /// The prompt's entry in the tree the caller lends: its token tree
+    /// ([`CacheIndexes::token_tree`]), or its string tree for a prompt it
+    /// holds as text ([`CacheIndexes::string_tree`]). The caller's own
+    /// rule names it as the seeds are: the same cache partition, for a
+    /// tree's lookup. `None` from a caller that lends no tree: the
     /// request is then named its holders from the record of hashed
     /// prefixes. One entry answers for every tree the request is decided
-    /// in, a pair's two sides too when a pair reads one: the tree's page
-    /// is the question's argument.
+    /// in, a pair's two sides too when a pair reads one: the token tree's
+    /// page is that question's argument.
     ///
     /// It is asked once by each decision of the call that reads the tree,
     /// and never where no stage of the request's place reads the tree. The
@@ -198,6 +214,7 @@ pub struct Prompt<'a> {
     /// between two awaits.
     ///
     /// [`CacheIndexes::token_tree`]: crate::engine::CacheIndexes::token_tree
+    /// [`CacheIndexes::string_tree`]: crate::engine::CacheIndexes::string_tree
     pub entry: Option<&'a dyn TokenEntry>,
 }
 
@@ -236,7 +253,7 @@ pub type WorkerRule<'a> = &'a dyn Fn(&dyn Worker) -> bool;
 /// `PlaceRequest { streaming: true, tried: &tried, ..PlaceRequest::of(model, lists) }`.
 ///
 /// A request is not [`Send`]: its headers, its route's rule and its
-/// prompt's entry in a token tree are borrowed as their caller holds them,
+/// prompt's entry in a lent tree are borrowed as their caller holds them,
 /// and none is asked to be [`Sync`]. A caller makes one for each call,
 /// between two awaits.
 pub struct PlaceRequest<'a> {
@@ -251,8 +268,16 @@ pub struct PlaceRequest<'a> {
     /// The request's headers.
     pub headers: &'a dyn HeaderRead,
     /// The request's own id, where it has one: a source of its routing
-    /// value where the document names it.
+    /// value where the document names it, and what a decision the engine
+    /// kept of the request is found by ([`PolicyEngine::explained`]). A
+    /// request with none is found by its `explain_id`, and is not kept
+    /// where it states neither.
     pub request_id: Option<&'a str>,
+    /// The id a decision the engine kept of the request is found by where
+    /// the request states no id of its own: its host's name for it. It is
+    /// no source of a routing value and no lease holds it. The engine
+    /// reads it under a document that keeps a sample, and nowhere else.
+    pub explain_id: Option<&'a str>,
     /// The tenant the request is of.
     pub tenant: Option<&'a str>,
     /// The request's priority band.
@@ -297,7 +322,9 @@ pub struct PlaceRequest<'a> {
     /// decode asked again reads no image fact. So does one with items
     /// that demands vision or a way of processing its references
     /// ([`Self::demands`]): its encoders meet that part of the demand, and
-    /// a decode asked again would hold the decode to it.
+    /// a decode asked again would hold the decode to it. So does a pair
+    /// held to the two workers its request names: a decode asked again
+    /// would be picked by the pair's routing value.
     pub decode_again: bool,
     /// Whether the caller counts this request on the decode its first
     /// decision named while it asks that decode again: one of that
@@ -363,6 +390,9 @@ pub struct PlaceRequest<'a> {
     /// the list its caller hands. For a single request that names its
     /// worker ([`PolicyEngine::place`]) it is asked ahead of the call's
     /// decision too, of each available worker the request's number counts.
+    /// For a pair that names its worker it is asked there of each available
+    /// worker of the two lists its number counts, at the places the caller
+    /// states for each and does not mask.
     ///
     /// Where a pair's decode is decided again on its decode side
     /// ([`PlacementSide::decode_again`](crate::tracking::PlacementSide::decode_again)),
@@ -370,8 +400,8 @@ pub struct PlaceRequest<'a> {
     /// under the lock the pair's two sides share. It must leave both sides
     /// alone: the send or the drop of one, from inside the rule, waits on
     /// that lock and never returns. That decision asks the request's
-    /// headers, its ring and its lists' admission under the same lock, and
-    /// each is held to the same.
+    /// headers, its ring, its lists' admission and their workers' own calls
+    /// under the same lock, and each is held to the same.
     ///
     /// For an encode request the rule is its pair's: it is asked of the
     /// pair's two workers and of no encoder, and of no list where the
@@ -392,6 +422,7 @@ impl<'a> PlaceRequest<'a> {
             prompt: Prompt::NONE,
             headers: &(),
             request_id: None,
+            explain_id: None,
             tenant: None,
             priority: 0,
             streaming: false,
@@ -500,7 +531,7 @@ pub(super) struct Made<'r, 'a> {
 }
 
 /// What a call's maker answered on a decision's targets where the decision
-/// asked which of them a prompt is stored for, in a lent token tree or in
+/// asked which of them a prompt is stored for, in a lent tree or in
 /// the record of sent prefixes: each place asked, and whether the call
 /// sends to it. A pick's targets are asked best first up to the first one
 /// the call sends to, so a pick's targets fit.
@@ -869,10 +900,13 @@ impl RequestMaker for Made<'_, '_> {
         // of references beside pixels, states none either: a decode asked
         // again reads no image fact. Nor does one that leaves a part of
         // its hard demand to its encoders: a decode asked again takes no
-        // items and would hold the decode to the whole. Both are read
-        // last, so a request that asks no decode again reads neither.
+        // items and would hold the decode to the whole. A pair held to the
+        // two workers it names states none: a decode asked again would be
+        // picked by the pair's routing value. The holds are read last, so a
+        // request that asks no decode again reads none of them.
         let later = request.asks_decode_again()
             && spec.decode_pick() == DecodePick::AfterPrefill
+            && !self.of_call.is_some_and(|call| call.named_pair)
             && !request.encode.is_some_and(|items| {
                 items.holds_decode_to_images(request.media.holds_pixels())
                     || splits(&items, request.demands)
@@ -908,6 +942,17 @@ impl RequestMaker for Made<'_, '_> {
         })
     }
 
+    // The id the request made states, read where its caller stated it: no
+    // request is made for it.
+    fn request_id<'w>(&'w self, _: &'w AppliedSpec) -> &'w [u8] {
+        self.request.request_id.map_or(&[], str::as_bytes)
+    }
+
+    // The id its host states for a kept decision alone, as it stated it.
+    fn explain_id(&self) -> &[u8] {
+        self.request.explain_id.map_or(&[], str::as_bytes)
+    }
+
     // Asked where a plain request's pick is leased, ahead of its making:
     // the hashing counts the text of a request that is made, so a text is
     // passed over once. The lease is its decision's document's, and so is
@@ -932,6 +977,10 @@ impl RequestMaker for Made<'_, '_> {
     // The caller's own naming, handed on: nothing else reads the field.
     fn token_key(&self, page: usize) -> Option<TokenKey<'_>> {
         self.request.prompt.entry?.token_key(page)
+    }
+
+    fn text_key(&self) -> Option<TextKey<'_>> {
+        self.request.prompt.entry?.text_key()
     }
 
     // The walk's own read of a target, made ahead of the walk for the
@@ -1136,7 +1185,9 @@ const fn declined(stated: &'static str) -> Unplaced {
 /// place it answers, or `None` with its whole decision written into
 /// `whole`, the room its caller keeps ([`Loaded::decide_into`]); and the
 /// instant it was dated at. A place dates nothing: no clock is read for
-/// it. A single's ask and a pair's decide here, three lists with no item
+/// it, but for the record of one that is kept as a sample
+/// ([`PolicyEngine::explained`]). A single's ask and a pair's decide here,
+/// three lists with no item
 /// stated among the pairs. An encode request's items are decided with its
 /// pair in one call ([`Loaded::decide_encode_at`]), and a decode decided
 /// again is asked through its guard ([`decode_again`]).
@@ -1360,6 +1411,12 @@ pub(super) struct Call {
     /// names outranks its routing value, so that value keeps no worker
     /// over a veto.
     unkeyed: bool,
+    /// Whether the call's pair is held to the two workers its request
+    /// names ([`target::pair`]). Such a call makes one decision: it books
+    /// the decode with its prefill under every document, and no ask
+    /// follows it ([`pair`]). The worker a request names is that
+    /// decision's, so no later one moves it.
+    named_pair: bool,
     /// The instant of the call's first ask, for a request that states a
     /// budget: the budget is counted from it ([`Call::left`]). `None` for
     /// a request that states no budget: no clock is read for its budget.
@@ -1603,7 +1660,7 @@ impl PolicyEngine {
     /// first target all the same.
     ///
     /// Where a prompt went is written otherwise, in the record of sent
-    /// prefixes a `cache_aware` profile keeps and in a token tree the
+    /// prefixes a `cache_aware` profile keeps and in a tree the
     /// caller lends ([`Prompt::entry`]). A decision that writes either
     /// asks, ahead of the write, which of its targets this call can send
     /// to ([`RequestMaker::sends_to`]): ready, and admitted by the route's
@@ -1669,9 +1726,38 @@ impl PolicyEngine {
     /// the request is placed as one that names no worker, by the binding's
     /// rule for workers that are all vetoed, and with no routing value,
     /// which a named worker outranks. A header that is absent, empty or
-    /// not text names no worker. A pair's request and an encode request
-    /// are not read for a target: they are placed by the rest of the
-    /// document.
+    /// not text names no worker.
+    ///
+    /// A pair may name its worker too, a side at a time. A pair's binding
+    /// names one list of sources for its two sides, and its target source
+    /// is the side's whose profile is the hash ring keyed by no prefix.
+    /// The prefill's number counts, in the prefill list's order, the
+    /// prefills that can be sent to and have a partner that can, at the
+    /// places the caller states for each side: those with such a partner
+    /// among their first partners alone, where there is one. Where the
+    /// decode's side is the ring's too, its number counts those partners
+    /// of the prefill reached, and the call's one decision is held to the
+    /// two places
+    /// ([`PairLists::prefill_places`](crate::engine::PairLists::prefill_places),
+    /// [`PairLists::decode_places`](crate::engine::PairLists::decode_places)).
+    /// Where it is not, the decision is
+    /// held to the prefill's place and the decode is its own profile's
+    /// pick. A named prefill at the caller's admission limit is waited
+    /// for ([`Unplaced::PrefillsFull`]), a named decode with no free room
+    /// is taken, and a retry is handed the pair again. A number that
+    /// reaches no worker on a side, and a pair the held decision cannot
+    /// place, shed the request under `target-worker`. Where no decode can
+    /// be sent to and the binding steers decodes that are all over their
+    /// thresholds, one over them alone counts as a partner, and the decode
+    /// goes by load. Under a binding that sheds them no decode counts so.
+    /// Where no prefill is counted, the pair is placed as one that names
+    /// no worker, with its routing value. A pair whose decode side alone is
+    /// such a ring is not read for a target, and neither is an encode
+    /// request: they are placed by the rest of the document. A pair held
+    /// to the two workers it names books its decode with its prefill
+    /// under every document ([`PlaceRequest::decode_again`]): a decode
+    /// asked again behind its prefill ([`Placement::decode_again`]) is
+    /// refused as one that never stood chosen, and that decode stands.
     ///
     /// Declined by name ([`ShedReason::PolicyDeclined`]): a request that
     /// carries encode items over other lists than an encode request's
@@ -1727,10 +1813,13 @@ impl PolicyEngine {
         let document = self.in_force();
         let own = self.under(&document);
         match request.lists {
-            WorkerLists::Pair(ref lists) => pair::place(own, request, lists, &mut Call::default()),
             // Whether a binding names a target source was decided when the
             // document was applied: under one that names none, a request
             // pays this test and no read of a header.
+            WorkerLists::Pair(ref lists) if own.document.spec.names_target() => {
+                target::pair(own, request, lists)
+            }
+            WorkerLists::Pair(ref lists) => pair::place(own, request, lists, &mut Call::default()),
             WorkerLists::Single(list) if own.document.spec.names_target() => {
                 target::single(own, request, list)
             }

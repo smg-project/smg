@@ -95,7 +95,12 @@ fn extract_text_for_routing_old(req: &ResponsesRequest) -> String {
                     }
                 }
                 ResponseInputOutputItem::McpCall { .. }
-                | ResponseInputOutputItem::McpListTools { .. } => None,
+                | ResponseInputOutputItem::McpListTools { .. }
+                | ResponseInputOutputItem::ToolSearchCall { .. }
+                | ResponseInputOutputItem::ToolSearchOutput { .. }
+                | ResponseInputOutputItem::WebSearchCall { .. }
+                | ResponseInputOutputItem::Program { .. }
+                | ResponseInputOutputItem::ProgramOutput { .. } => None,
             })
             .collect::<Vec<String>>()
             .join(" "),

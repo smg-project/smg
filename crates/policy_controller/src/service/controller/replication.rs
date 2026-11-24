@@ -17,7 +17,7 @@
 //! [`RESTORES`] restores at once, and lets go of the cut of one whose
 //! stream took no part for [`STALLED`] ([`Hold`]).
 //!
-//! No load row is journaled or sent ([`journaled_waking`]): a replica polls
+//! No load row is journaled or sent ([`journaled`]): a replica polls
 //! its engines itself from the take that makes it the leader. A controller
 //! that leads itself over a lease in its own process can have no standby,
 //! and the call is refused by that state of its configuration.
@@ -42,8 +42,7 @@ use tonic::{codegen::tokio_stream::Stream, Code, Status, Streaming};
 use tracing::info;
 
 use super::{
-    election::LeasePlace, generations::Generations, service::not_leader, watch_workers,
-    worker_objects::ObjectsWake, worker_wire,
+    election::LeasePlace, generations::Generations, service::not_leader, watch_workers, worker_wire,
 };
 use crate::{
     service::{
@@ -75,12 +74,11 @@ const MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 
 /// A store and the feed of the log it journals to, for a lease at `place`,
 /// built in one place ([`journaled_at`]). A watched write wakes the feed's
-/// one task and tells `objects`, the wake of the replica's worker objects.
-/// The log carries the watched kinds alone wherever the lease lives: a load
-/// write tells nothing and wakes nobody, and a standby is sent none. Where
-/// the lease is shared a replica added to a running
-/// leader follows it with no restart; where the lease lives in this process
-/// the log is told that no standby can follow it ([`Log::kept_alone`]).
+/// one task. The log carries the watched kinds alone wherever the lease
+/// lives: a load write tells nothing and wakes nobody, and a standby is sent
+/// none. Where the lease is shared a replica added to a running leader
+/// follows it with no restart; where the lease lives in this process the
+/// log is told that no standby can follow it ([`Log::kept_alone`]).
 ///
 /// The log's places start after a number drawn once a run, wherever the
 /// lease lives. A later run can take a term again: at each start where the
@@ -92,22 +90,12 @@ const MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 /// reader is told to start again. A standby that applied nothing names no
 /// place of any run: the standby's feed joins it at the drawn start
 /// ([`Feed::join`]).
-pub(crate) fn journaled_waking(
-    place: &LeasePlace,
-    deciders: usize,
-    objects: ObjectsWake,
-) -> (Arc<MemoryStore>, watch_workers::Feed) {
-    let first = RandomState::new().hash_one(0u8) % FIRST_PLACES;
-    journaled_at(place, first, deciders, objects)
-}
-
-/// [`journaled_waking`] with no worker objects to wake, for the cases.
-#[cfg(test)]
 pub(crate) fn journaled(
     place: &LeasePlace,
     deciders: usize,
 ) -> (Arc<MemoryStore>, watch_workers::Feed) {
-    journaled_waking(place, deciders, ObjectsWake::default())
+    let first = RandomState::new().hash_one(0u8) % FIRST_PLACES;
+    journaled_at(place, first, deciders)
 }
 
 /// The same over one file of leases with the log's places starting after
@@ -117,18 +105,7 @@ pub(crate) fn journaled_from(
     place: &LeasePlace,
     first: u64,
 ) -> (Arc<MemoryStore>, watch_workers::Feed) {
-    journaled_for(place, first, 1)
-}
-
-/// The store and its feed with the log's places starting after `first`
-/// and `deciders` files of leases, with no worker objects to wake.
-#[cfg(test)]
-pub(crate) fn journaled_for(
-    place: &LeasePlace,
-    first: u64,
-    deciders: usize,
-) -> (Arc<MemoryStore>, watch_workers::Feed) {
-    journaled_at(place, first, deciders, ObjectsWake::default())
+    journaled_at(place, first, 1)
 }
 
 /// The store and its feed with the log's places starting after `first`,
@@ -136,26 +113,20 @@ pub(crate) fn journaled_for(
 /// ([`MemoryStore::with_decision_slots`]): the one place the two are built.
 ///
 /// The log tells one listener, and that listener is made here: one
-/// callback that wakes the feed's one task and tells `objects`, each on a
-/// wake of its own, so neither sleeps through a write the other took. The
-/// set is fixed for the log's life. The callback runs on the writer's
-/// thread once the store has let the write's locks go: it wakes and does
-/// no work.
+/// callback that wakes the feed's one task. The callback runs on the
+/// writer's thread once the store has let the write's locks go: it wakes
+/// and does no work.
 pub(super) fn journaled_at(
     place: &LeasePlace,
     first: u64,
     deciders: usize,
-    objects: ObjectsWake,
 ) -> (Arc<MemoryStore>, watch_workers::Feed) {
     let landed = Arc::new(Notify::new());
     let log = {
         let landed = Arc::clone(&landed);
         Log::new(WATCHED_EVENTS)
             .starting_after(first)
-            .on_watched(move || {
-                landed.notify_one();
-                objects.tell();
-            })
+            .on_watched(move || landed.notify_one())
     };
     let log = if place.is_shared() {
         log
@@ -1074,7 +1045,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        engine::view::{LoadRow, WorkerId},
+        engine::view::WorkerId,
         service::{
             controller::decision_slots::tests::holder,
             elector::{ElectionSettings, Elector, TickOutcome},
@@ -1083,8 +1054,7 @@ mod tests {
         },
         stages::registry,
         store::{
-            LeasesStore, LoadSink, LoadSource, MembershipChange, WorkerFacts, WorkerRow,
-            WorkerStatus, WorkersStore,
+            LeasesStore, MembershipChange, WorkerFacts, WorkerRow, WorkerStatus, WorkersStore,
         },
     };
 
@@ -2219,17 +2189,6 @@ mod tests {
         let leader = Leader::leading();
         let id = leader.writes(3);
         let head = leader.log.head();
-        // A load row on the leader's own table: it is journaled nowhere,
-        // so the log stands where it stood, and no part holds it.
-        let row = LoadRow {
-            running: 2,
-            ..LoadRow::default()
-        };
-        leader
-            .store
-            .record(id, 0, row, leader.at, LoadSource::Stream);
-        assert!(leader.store.load(id, 0).is_some(), "the leader's own row");
-        assert_eq!(leader.log.head(), head);
         let cut = leader.replication().cut(leader.term).expect("a cut");
         assert_eq!((cut.at, cut.epoch), (head, leader.store.epoch()));
         // One part, the row's, and the last. It says the place as a

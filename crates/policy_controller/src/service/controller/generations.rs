@@ -2631,8 +2631,8 @@ pub(crate) mod tests {
         /// The door's, of the held bytes: the entry has passed both of the
         /// door's reads of the fence and waits in the door.
         Held,
-        /// The store's last, of the loads, as a load's write holds it: the
-        /// entry waits inside the store.
+        /// The store's last, of the loads, as a membership write holds it:
+        /// the entry waits inside the store.
         Loads,
     }
 

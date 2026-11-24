@@ -491,17 +491,41 @@ message DecideRequest {
   // Such a frame is its pair's one request. It is decided at the prefill
   // phase, whatever its facts' phase says, for both sides of the pair and
   // for each item's encoder, and its again and its decode_later read as on
-  // a pair's frame. A frame of the encode phase that carries none has no
-  // decision: it is answered Busy with no reason. A decode asked again
-  // names its lease and states no items: a frame that carries decode_of
-  // and this field is out of range, whatever its facts' phase says.
+  // a pair's frame. The hash form of its facts' session_key is the
+  // session's value under the phase the facts state, encode: the key is
+  // read back under that phase, and the pair's session is the key's at
+  // the prefill phase. A frame of the encode phase that does not state
+  // this field has no decision: it is answered Busy with no reason. A
+  // decode asked again names its lease and states no items: a frame that
+  // carries decode_of and this field is out of range, whatever its facts'
+  // phase says.
   EncodeItems encode = 7;
+  // The number this request names its worker by, as its host read it under
+  // the target source of its binding's routing key. It counts, from 0 and
+  // in the order of the controller's list, the workers the asking gateway
+  // can be sent to: a place it may take of the list, that none of its
+  // standing vetoes holds back, and whose worker is available by the
+  // controller's own test. The decision is held to the worker the number
+  // reaches, and the request goes to that worker or to none: where the
+  // number reaches no worker, or that worker cannot take the request after
+  // all, the request is shed with no endpoint, under `target-worker`. Where
+  // no worker can be counted, the request is decided as one that names no
+  // worker, and neither its session key nor its client key is read. A text
+  // that is no number is stated as 4294967295: it reaches no worker of any
+  // list, as that text does. Absent, the request names no worker, so the
+  // frame of a host older than the field is decided as it was. Read on a
+  // frame that is decided over one list, a single request's and one that
+  // stands alone at a side's phase, under a spec whose binding for the
+  // frame names a target source, and on no other.
+  optional uint32 named_worker = 8;
 }
 
 // The encode items of a request and what it asks for them.
 message EncodeItems {
   // Each item's key, the caller's content hash, in the request's order. At
   // most 256: a longer list is out of range, and its frame is refused whole.
+  // A key with no form reads as no key: its item keeps its place, and its
+  // encoder is picked with no affinity.
   repeated Identity keys = 1;
   // The items taken as one: the caller's digest over them. A class of
   // encoders that takes them as one places it in the items' stead, so
@@ -788,7 +812,7 @@ message PairingDescriptor {
   // The worker's end of the encode handoff, with its two EC roles: the form
   // its registration states and, under a push, the connector the role is
   // stated on. Unspecified is no end, as a registration that names no form
-  // reads; the connector above is the pair's. The store derives from them
+  // reads; the connector above is the pair's. A host derives from them
   // which encoders hand an item to which prefills.
   EncodeHandoff encode_handoff = 12;
   string ec_connector = 13;

@@ -479,7 +479,7 @@ pub enum OverlapSource {
     /// The event index.
     Index,
     /// What the worker was sent: the sent-prefix predictor, or the match of
-    /// a token tree the host lends.
+    /// a tree the host lends.
     Predictor,
 }
 
@@ -497,11 +497,12 @@ pub enum OverlapSource {
 /// the binding's sessions rule keeps from the profile.
 /// [`Engine::decide`](crate::engine::Engine::decide) itself states nothing.
 ///
-/// A request decided inside a token tree its host lends is given the rows
-/// the tree's match names, and its pick states by them: the match's tokens
-/// counted in the request's blocks for a worker named among the match's
-/// holders, and a miss for any other. Past the profile's sample the holders
-/// named are a draw. A match under one block is a miss.
+/// A request decided inside a tree its host lends is given the rows the
+/// tree's match names, and its pick states by them: the match's tokens, or
+/// the bytes of text it matched, counted in the request's blocks for a
+/// worker named among the match's holders, and a miss for any other. Past
+/// the profile's sample the holders named are a draw. A match under one
+/// block is a miss.
 ///
 /// Six bytes, in bytes a pick's targets had spare behind their count: a
 /// pick is no larger for it ([`Pick::overlap`]).
@@ -593,7 +594,7 @@ impl Overlap {
 /// (`lease_events::stages_hear`): by the front in a gateway's own process,
 /// and by a controller where it files the pick's lease. Under `untold` no
 /// stage hears the issue or the dispatch of such a single request, the
-/// record of sent prompts takes no entry behind it and a lent token tree
+/// record of sent prompts takes no entry behind it and a lent tree
 /// stores no prompt for it, as a gateway's sticky map keeps a request it
 /// places from the gateway's policy. Under `told`, the default, the stages
 /// hear both and where the prompt went is kept as behind any pick. The

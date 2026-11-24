@@ -30,6 +30,12 @@
 //! request's frame is, over the list of its own phase's role
 //! ([`decide_alone`]).
 //!
+//! A frame decided over one list may name its request's worker by a number
+//! (`DecideRequest.named_worker`), under a binding that names a target
+//! source: its decision is held to the place of the worker that number
+//! reaches, counted as the one call counts it in a host's own process
+//! ([`decide_named`]).
+//!
 //! An encode request is its pair's one request, read at the prefill phase
 //! ([`Checked::carries_items`]): [`decide_encode`] decides it over its
 //! model's three lists, the pair's two and the encoders', by the engine's
@@ -38,18 +44,19 @@
 //! encoder, and its answer names each item's encoder
 //! ([`FrameBuffers::answered`]).
 //!
-//! A frame of the encode phase that carries no items has no decision here,
-//! and a decode frame that names no lease has none under a plan that pairs
-//! its phase: their deciding thread answers them `Busy` and reads no list
-//! for them.
+//! A frame of the encode phase that does not state `DecideRequest.encode`
+//! has no decision here, and a decode frame that names no lease has none
+//! under a plan that pairs its phase: their deciding thread answers them
+//! `Busy` and reads no list for them.
 
 use std::{
     mem,
     panic::{catch_unwind, AssertUnwindSafe},
     sync::{atomic::Ordering, Arc},
+    time::Instant,
 };
 
-use smg_worker::load::state::LoadSnapshot;
+use smg_worker::{identity::basic::Worker, load::state::LoadSnapshot};
 use tracing::error;
 
 use super::{
@@ -57,16 +64,19 @@ use super::{
     frame_request::FrameRequest,
     gateway_places::{Asking, GatewayPlaces, Held, Taken},
     lease_words::{issued_later, issuing},
-    wire::{spent_keys, Checked, ItemsPlaced, Lists},
+    wire::{spent_keys, Checked, FrameLists, ItemsPlaced, Lists},
 };
 use crate::{
-    document::spec::AppliedSpec,
+    document::{spec::AppliedSpec, KeySources},
     engine::{
         decision::{shed, Decision, Pair, Pick, ShedReason, Target},
         decision_engine::{DecisionRefused, DecodeRefused, WorkerLists},
         framework::{release, EncodeItems, EncodePlaced},
         lease_events,
-        policy_engine::PolicyEngine,
+        policy_engine::{
+            named_worker::{self, Reached},
+            PolicyEngine,
+        },
         shadow::Shadowed,
         view::{fingerprint, Identity, Phase, RequestFacts, Role, Session, WorkerId},
         EncodeLists, PairLists,
@@ -151,6 +161,10 @@ pub(crate) struct PairBooked {
 /// A profile with a stage that may refuse by a report of leases is decided
 /// behind an apply of what waits at the files of leases, where the decider
 /// lent its place.
+///
+/// A frame whose request names its worker is decided for that worker or
+/// for none ([`decide_named`]). A frame that names none pays one test of
+/// the number for it.
 ///
 /// # Errors
 ///
@@ -250,7 +264,23 @@ fn decide_at(
                     } else {
                         maker
                     };
-                    front.decide_without_lease(&maker, now)
+                    match frame.named_worker() {
+                        None => front.decide_without_lease(&maker, now),
+                        // A frame that names its worker goes its own way
+                        // to its end, out of line.
+                        Some(number) => {
+                            let named = Named {
+                                number,
+                                phase,
+                                workers: &lent.workers[..],
+                                held,
+                                read: &read,
+                            };
+                            let decided = decide_named(front, spec, frame, maker, named, now);
+                            count_undialed(places, own);
+                            return decided;
+                        }
+                    }
                 }
                 Taken::Emptied(stage) => {
                     let (seed, generation) = (frame.seed(), spec.generation());
@@ -259,20 +289,49 @@ fn decide_at(
                 Taken::Unreached => front.decide_without_lease(&over_none(), now),
             };
             // Counted whatever the decision came to.
-            let undialed = places.undialed();
-            if undialed > 0 {
-                own.undialed.fetch_add(undialed, Ordering::Relaxed);
-            }
+            count_undialed(places, own);
             decided?
         }
         None => front.decide_without_lease(&over_none(), now)?,
     };
-    // What the lease of a pick takes of its request, read where the frame's
-    // lists still stand.
+    Ok(booked(decision, said, frame, &read, true))
+}
+
+/// Counts in `own` the workers the asking gateway's wires took at the last
+/// ask of `places`. In line: one text for the two ends of a single
+/// request's decision.
+#[inline(always)]
+fn count_undialed(places: &GatewayPlaces, own: &Part) {
+    let undialed = places.undialed();
+    if undialed > 0 {
+        own.undialed.fetch_add(undialed, Ordering::Relaxed);
+    }
+}
+
+/// `decision` with what the lease of its pick takes of its request, read
+/// off `frame` where the frame's lists `read` still stand. `keyed` is
+/// whether the request was made with its frame's keys: one made with none
+/// books under no session, and its lease counts for none.
+///
+/// In line: a frame that names no worker states the word as written, and
+/// its decision reads no test of it.
+#[inline(always)]
+fn booked(
+    decision: Decision,
+    said: Option<Shadowed>,
+    frame: &Checked,
+    read: &FrameLists<'_>,
+    keyed: bool,
+) -> (Decision, Booked) {
     let (session, tokens) = match decision.pick() {
         Some(_) => {
-            let facts = frame.facts(&read, 0, 0);
-            (facts.session(), facts.prompt_tokens)
+            let facts = frame.facts(read, 0, 0);
+            let session = if keyed {
+                facts.session()
+            } else {
+                Session::NONE
+            };
+            (session, facts.prompt_tokens)
         }
         None => (Session::NONE, 0),
     };
@@ -281,7 +340,118 @@ fn decide_at(
         tokens,
         said,
     };
-    Ok((decision, booked))
+    (decision, booked)
+}
+
+/// A frame whose request names its worker, as its decision takes it
+/// ([`decide_named`]).
+struct Named<'a> {
+    /// The number the frame states (`DecideRequest.named_worker`).
+    number: u32,
+    /// The phase the frame is decided at: its binding's target source is
+    /// the one the number was read under.
+    phase: Phase,
+    /// The workers of the one list the frame is decided over, in the
+    /// list's order.
+    workers: &'a [Arc<dyn Worker>],
+    /// What the asking gateway may take of that list.
+    held: Held<'a>,
+    /// The frame's lists as its decider read them: a pick's lease is read
+    /// off them.
+    read: &'a FrameLists<'a>,
+}
+
+/// The decision of a frame whose request names its worker by a number
+/// (`DecideRequest.named_worker`), over the one list `maker` is made over,
+/// which its gateway may take as `named.held` states: the request goes to
+/// the worker the number reaches or to none. The answer is the decision
+/// with what its pick's lease takes of the frame ([`booked`]).
+///
+/// The number counts as the one call counts it in a host's own process,
+/// by the same function ([`named_worker::reached`]): from 0 and in the
+/// list's order, over the workers the asking gateway can be sent to. A
+/// controller's tests are its own: a place the gateway may take, that none
+/// of its standing vetoes holds back, whose worker object is available by
+/// its own test. The route's rule is the gateway's own code, and is not
+/// asked here. The widest number is a text that was no number
+/// ([`Checked::named_worker`]): no list holds that many workers, so it
+/// reaches none.
+///
+/// - **A worker reached.** The frame's one decision is held to that
+///   worker's place ([`FrameRequest::held_to`]), and answers as the
+///   decision of any request held to places does. A shed of it with no
+///   endpoint, or for workers over their thresholds, is the request's shed
+///   under `target-worker` ([`named_worker::held_answer`]).
+/// - **No worker reached.** Where the gateway can be sent to a worker of
+///   the list and the number reaches none, the request is shed with no
+///   endpoint, under `target-worker`, and the engine is asked nothing.
+/// - **None to count.** Where the gateway can be sent to no worker of the
+///   list, the request leaves its worker's hold: it is decided as one that
+///   names no worker and carries neither its session key nor its client's
+///   key ([`FrameRequest::unkeyed`]), and its pick's lease counts for no
+///   session.
+///
+/// Under a spec whose binding for the frame names no target source the
+/// number is not read, and the frame is decided as one that names no
+/// worker: its host read the number under another document.
+///
+/// Out of line and cold: a frame that names no worker holds no part of it.
+///
+/// # Errors
+///
+/// Those of [`decide`].
+#[cold]
+#[inline(never)]
+fn decide_named(
+    front: &PolicyEngine,
+    spec: &AppliedSpec,
+    frame: &Checked,
+    maker: FrameRequest<'_>,
+    named: Named<'_>,
+    now: Instant,
+) -> Result<(Decision, Booked), DecisionRefused> {
+    let Named {
+        number,
+        phase,
+        workers,
+        held,
+        read,
+    } = named;
+    let sources = spec.key_sources_for(frame.model(), phase);
+    if !sources.is_some_and(KeySources::names_target) {
+        let (decision, said) = front.decide_without_lease(&maker, now)?;
+        return Ok(booked(decision, said, frame, read, true));
+    }
+    // Both run ascending, as the count walks the list: each is read in
+    // step with it.
+    let mut may = held.places.map(|places| places.iter().copied().peekable());
+    let mut stalls = held.stalled.iter().copied().peekable();
+    let reached = named_worker::reached(workers, Some(number), |place, worker| {
+        let taken = may
+            .as_mut()
+            .is_none_or(|may| may.next_if_eq(&place).is_some());
+        let stalled = stalls.next_if_eq(&place).is_some();
+        taken && !stalled && worker.is_available()
+    });
+    match reached {
+        Reached::Place(place) => {
+            let one = [place];
+            let maker = maker.held_to(Some(&one), held.stalled, held.held);
+            let (decision, said) = front.decide_without_lease(&maker, now)?;
+            let answer = named_worker::held_answer(decision);
+            Ok(booked(answer, said, frame, read, true))
+        }
+        Reached::NoWorker => {
+            let (seed, generation) = (frame.seed(), spec.generation());
+            let stage = named_worker::TARGET_WORKER;
+            let answer = shed(ShedReason::NoEndpoints, stage, seed, generation);
+            Ok(booked(answer, None, frame, read, true))
+        }
+        Reached::NoneToCount => {
+            let (decision, said) = front.decide_without_lease(&maker.unkeyed(), now)?;
+            Ok(booked(decision, said, frame, read, false))
+        }
+    }
 }
 
 /// Whether a frame's request is given the load monitor's snapshot under
@@ -703,10 +873,10 @@ pub(crate) fn issue(
 /// until a decode call issues it ([`issue_decode`]) or a dispatch names it.
 /// Its answer carries the prefill side's lease alone.
 ///
-/// No shadow runs on a pair's side yet, so none is counted here. Each
-/// side's lease states its own session verdict: the prefill's the pick's,
-/// and the decode's the one the pick's first target states of its decode,
-/// which the store keeps with the side.
+/// A controller's decision asks no shadow of a pair's side yet, so none
+/// is counted here. Each side's lease states its own session verdict: the
+/// prefill's the pick's, and the decode's the one the pick's first target
+/// states of its decode, which the store keeps with the side.
 ///
 /// A pair's lease counts for each side's key
 /// ([`MemoryStore::issue_decided_pair`]), under any sessions rule and under

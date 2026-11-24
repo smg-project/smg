@@ -35,7 +35,7 @@
 //! | `zone`, `encode`, `max_running`, `priority` | not carried: a decision's facts, read of the store's rows and never of an object |
 //! | `vision`, `demand_facts` | not carried to the object: a decision's facts, which the holder keeps beside the object and lends with each list (`Objects::lent`) |
 //! | `pairing` | not carried to the object: a decision's fact, read of the store's rows. The object derives its own at its build ([`pairing_descriptor`] reads it). [`facts()`] keeps the standing row's, and so does the controller's door, whose log carries none. A row that states none pairs by its object's own, so [`facts()`] lays the pairing facts a worker's spec holds among the row's labels |
-//! | `overload` | not carried to the object, where the store judges overload: a decision's fact, read of the store's rows. Under a host whose own load monitor judges it ([`Objects::with_overload_thresholds`]), the object's thresholds: the row's own, each over the host's default for its signal, the usage as a ratio. A row of the external runtime takes no default. [`facts()`] states the thresholds of the object's own registration over the standing row's. A replacement by id states them whole: one it leaves out is cleared ([`Over::Replaced`]) |
+//! | `overload` | not carried to the object by a holder built with no thresholds: nothing judges its workers. Under a host whose own load monitor judges it ([`Objects::with_overload_thresholds`]), the object's thresholds: the row's own, each over the host's default for its signal, the usage as a ratio. A row of the external runtime takes no default. [`facts()`] states the thresholds of the object's own registration over the standing row's. A replacement by id states them whole: one it leaves out is cleared ([`Over::Replaced`]) |
 //!
 //! A new object starts at its row's status. A replacement takes the
 //! standing object's running state, including its status. A host that gets
@@ -73,8 +73,11 @@
 //! runs it where its decisions read the snapshot, and writes no load to
 //! the store then.
 //!
-//! [`KvAdapter`] decodes the worker's KV events for the store's index, and
-//! [`KvHost`] gives each subscription its row in the store. Every replica
+//! [`KvAdapter`] decodes the worker's KV events for the index of the KV
+//! tables the host handed the holder ([`KvTables`],
+//! [`Objects::with_kv_tables`]), and [`KvHost`] gives each subscription
+//! its row. The holder makes a row's lane in the tables where it states
+//! the row, and retires it where the row leaves. Every replica
 //! runs the adapter over its own streams. The adapter keeps what a row's
 //! stream showed of its cache groups, as the gateway's index does. A row
 //! above rank 0 of a data-parallel worker gets no feed yet ([`SkipReason`]).
@@ -108,7 +111,9 @@ mod credentials;
 mod found;
 mod health;
 mod kv;
+mod kv_cursor;
 mod kv_feed;
+mod kv_tables;
 mod lead;
 mod loads;
 mod members;
@@ -127,6 +132,7 @@ pub use found::{facts, pairing_descriptor};
 pub use health::HealthAdapter;
 pub use kv::{KvAdapter, KvHost, SkipReason, SkippedSubscriptions};
 pub use kv_feed::KvFeed;
+pub use kv_tables::KvTables;
 pub use lead::{Lead, SoleLead};
 pub use loads::load_monitor;
 pub use members::Members;

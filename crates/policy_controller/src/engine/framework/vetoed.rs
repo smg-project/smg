@@ -804,8 +804,7 @@ pub(super) fn paired(
         decode.usable(lifted, steers, &mut scratch.decode);
         // Each usable prefill with the fewest requests among its usable
         // partners. The prefills of the least pair stay. A pair's rows hold
-        // their own counts, and no side is lent any ([`PairPools::side`]):
-        // they are read off the rows.
+        // their own counts: they are read off the rows.
         let (prefills, decodes) = (&mut scratch.single.kept, &scratch.decode.kept);
         let loads = |at: &u32| {
             let row = &prefill.rows[*at as usize];
@@ -890,10 +889,7 @@ mod tests {
             pickers::Best,
             registry::StageRegistry,
         },
-        tracking::{
-            in_flight::tests::Lent,
-            lease::{Lease, Side},
-        },
+        tracking::lease::{Lease, Side},
     };
 
     /// A ready worker over its thresholds, holding `in_flight` requests.
@@ -1028,24 +1024,6 @@ mod tests {
                 let pick = decision.pick().expect("a pick");
                 assert_eq!(pick.trace.survivors.get(), Some(3), "{preset}");
                 assert_eq!(pick.session_verdict, SessionVerdict::None, "{preset}");
-            }
-        }
-    }
-
-    /// The steer reads the fewest requests through the request's facts: a
-    /// pool whose counts stand in a table lent beside its rows, each row
-    /// reading zero, is steered as the pool that carries them, under
-    /// presets whose own stages read no count.
-    #[test]
-    fn a_steered_pool_goes_to_the_fewest_in_flight_by_a_lent_table() {
-        let mut pool = [over(0, 3), over(1, 1), over(2, 2)];
-        let lent = Lent::take(&mut pool);
-        assert!(pool.iter().all(|row| row.in_flight == 0));
-        for preset in ["random", "round_robin", "passthrough"] {
-            let engine = engine_of(preset, false);
-            for seed in 1..=8 {
-                let decision = decide(&engine, &lent.beside(&facts(seed)), &pool);
-                assert_eq!(order(&decision), vec![1, 2, 0], "{preset}, seed {seed}");
             }
         }
     }

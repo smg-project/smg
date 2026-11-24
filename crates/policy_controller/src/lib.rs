@@ -49,11 +49,11 @@
 //!   [`document::RoutingSettings`] writes it.
 //!
 //! - 5.1 and appendix A, the store ingress ([`store`]): the traits through
-//!   which the controller's store is fed (membership, health, loads, KV
-//!   events, reservations, sessions, leases), the one-process
-//!   [`store::MemoryStore`] behind them and the contract tests over it. The
-//!   KV events feed the index the store holds for each model
-//!   ([`store`]), which no decision reads yet. A
+//!   which the controller's store is fed (membership, health,
+//!   reservations, sessions, leases), the one-process
+//!   [`store::MemoryStore`] behind them and the contract tests over it. KV
+//!   events are the worker host's: they feed the index its tables hold for
+//!   each model (`worker_host::KvTables`), which no decision reads yet. A
 //!   gateway in the embedded mode implements the same traits over its own
 //!   structures.
 //! - 10, the election ([`service::elector`]): one [`service::elector::Elector`] over a
@@ -61,10 +61,9 @@
 //!   here, the Kubernetes `Lease` next), terms that only grow, and the
 //!   [`service::elector::Fence`] a shard thread reads before every decision it sends.
 //! - 5.4, replication ([`service::replication`]): the log of the store's replicated
-//!   writes (membership and status, load rows, a term's start), each at its
+//!   writes (membership and status, a term's start), each at its
 //!   position under its term, told by the store through
-//!   [`store::Journal`], the watched kinds kept apart from the load
-//!   rows; the rejoin rule and the bounded read a standby or a watcher of
+//!   [`store::Journal`]; the rejoin rule and the bounded read a standby or a watcher of
 //!   the rows is served by, and the store's cut at one position
 //!   ([`store::MemoryStore::checkpoint`]). The stream, the standby and the
 //!   watch are later steps.

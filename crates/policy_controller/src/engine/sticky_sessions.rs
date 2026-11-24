@@ -173,8 +173,9 @@ pub(crate) enum Claim {
     /// commit settles it.
     Made(WorkerId),
     /// The claim was not taken: the key's pins are not the ones the
-    /// decision read, the worker is a pin of the key already under another
-    /// id, or nothing was recorded (an empty key or target).
+    /// decision read, the worker is a pin of the key already, one the
+    /// decision read or one under another id, or nothing was recorded (an
+    /// empty key or target).
     /// It names the worker the decision follows ([`Claim::standing`]) and
     /// the pins the key held: a shadow reads those against its own pins
     /// and its own pick.
@@ -632,11 +633,21 @@ impl SessionTable {
     /// claim made ahead of it ([`Self::rename_worker`]). A worker that is
     /// a pin of the key already, under the id that stands or under one it
     /// had that a rename's walk has yet to reach, is no claim: the answer
-    /// names the decision's own pick, and no pin is written beside it.
-    /// Where the ask takes a rename's step for the key
-    /// ([`Self::standing`]), the pins are read against `seen` once more:
-    /// a pin the step renamed is the newcomer to follow, as behind the
-    /// walk, and nothing is claimed.
+    /// names the decision's own pick, and no pin is written beside it. A
+    /// pin the decision read is such a worker too. A claim would mark a
+    /// worker the key was served on, and the decision's commit on an
+    /// alternate would withdraw it.
+    ///
+    /// The ask comes ahead of the read of the pins against `seen`. Where
+    /// it takes a rename's step for the key ([`Self::standing`]), that
+    /// read runs on the walked entry: a pin the step renamed is the
+    /// newcomer to follow, as behind the walk, and nothing is claimed.
+    /// Pins that moved under the decision take the step whatever its
+    /// worker, where the table remembers a rename: the answer names a
+    /// pin, and a newcomer under an id its worker had is one no row of
+    /// the decision holds. Pins the step makes the ones the decision
+    /// read again stand as read: a worker that is a pin already is no
+    /// claim there either.
     /// Always inlined: the keyed decision has two forms, and a second caller
     /// would otherwise move this out of line under the first.
     #[inline(always)]
@@ -649,31 +660,41 @@ impl SessionTable {
         let Some(entry) = self.slot(&mut shard, key) else {
             return Claim::NoRoom;
         };
-        let Some(owner) = Claim::standing(&entry.pins, &seen, target) else {
-            let stands = self.stands(entry, target);
-            if !seen.contains(&target) && entry.pins.contains(&stands) {
-                // No pin as the decision read them, and a pin under the
-                // id that stands: the worker is one the key was served
-                // on, or another decision's claim. A claim of this
-                // decision's would mark it again, and this decision's
-                // commit on an alternate would withdraw it.
-                return Claim::Standing(target, entry.pins);
-            }
-            // The ask may have taken a rename's step for the key: the
-            // pins are then not the ones the decision read, and a pin
-            // the step renamed is their newcomer, as behind the walk.
-            if let Some(owner) = Claim::standing(&entry.pins, &seen, target) {
-                return Claim::Standing(owner, entry.pins);
-            }
-            match entry.recovery {
-                Recovery::Latest => entry.front(stands),
-                Recovery::Original => entry.append(stands),
-            }
-            entry.claim = stands;
-            entry.leased = target;
-            return Claim::Made(target);
+        // The pins as written, read ahead of the ask. Where they are
+        // the ones the decision read, the ask is a write's
+        // (`stands`). Where they moved, the answer names their
+        // newcomer: the key takes a pending rename's step whatever
+        // the target, a pin as written too.
+        let stood = entry.pins == seen;
+        let stands = if stood {
+            self.stands(entry, target)
+        } else if self.renamed_len.load(Ordering::Relaxed) != 0 {
+            self.standing(entry, target)
+        } else {
+            target
         };
-        Claim::Standing(owner, entry.pins)
+        if (stood || entry.pins == seen) && entry.pins.contains(&stands) {
+            // The pins stand as the decision read them, as written or
+            // behind the step, and the worker is a pin among them: one
+            // the decision read, or one under the id that stands. The
+            // key was served on it, or another decision claimed it. A
+            // claim of this decision's would mark it again, and this
+            // decision's commit on an alternate would withdraw it.
+            return Claim::Standing(target, entry.pins);
+        }
+        // The pins are not the ones the decision read: another
+        // decision moved them, or the step renamed one. Their
+        // newcomer is the pin to follow, by the id that stands.
+        if let Some(owner) = Claim::standing(&entry.pins, &seen, target) {
+            return Claim::Standing(owner, entry.pins);
+        }
+        match entry.recovery {
+            Recovery::Latest => entry.front(stands),
+            Recovery::Original => entry.append(stands),
+        }
+        entry.claim = stands;
+        entry.leased = target;
+        Claim::Made(target)
     }
 
     /// A decision that met `key`'s routable pin at the cap and placed the
@@ -944,13 +965,16 @@ impl SessionTable {
     /// asks, under its shard's lock: a claim, a pair's moved claim, a
     /// respill's move and the commit. A moved claim, a respill's move and
     /// the commit ask ahead of every line of their own, and a claim asks
-    /// where it is taken: the pins stand as its decision read them. The
-    /// pins are read first: a worker among them costs no read of the
-    /// renames' count. A write whose target is a pin as written asks
-    /// nothing, whatever a rename's walk has yet to reach: it adds no
-    /// pin. It puts the pins in another order or withdraws its own
-    /// decision's claim, so the walk, or the key's next write that asks,
-    /// finds what it would have found ahead of it.
+    /// ahead of its read of the pins against the ones its decision read
+    /// ([`Self::claim`]). The pins are read first: a worker among them
+    /// costs no read of the renames' count. A write whose target is a pin
+    /// as written asks nothing here, whatever a rename's walk has yet to
+    /// reach: it adds no pin. It puts the pins in another order or
+    /// withdraws its own decision's claim, so the walk, or the key's next
+    /// write that asks, finds what it would have found ahead of it. One
+    /// caller asks past this test: a claim on pins that moved under its
+    /// decision takes the step whatever its target, a pin as written
+    /// too, because its answer names a pin ([`Self::claim`]).
     #[inline]
     fn stands(&self, entry: &mut Entry, target: WorkerId) -> WorkerId {
         if !entry.pins.contains(&target) && self.renamed_len.load(Ordering::Relaxed) != 0 {
@@ -971,7 +995,9 @@ impl SessionTable {
     /// it meets a worker's pin under the id that stands, and no claim's
     /// mark stands on a pin the key was served on. Out of line: a write
     /// asks only where its target is in neither pin and the table renamed
-    /// a worker ([`Self::stands`]).
+    /// a worker ([`Self::stands`]), and a claim where the pins moved
+    /// under its decision and the table renamed a worker
+    /// ([`Self::claim`]).
     #[cold]
     #[inline(never)]
     fn standing(&self, entry: &mut Entry, target: WorkerId) -> WorkerId {
@@ -2937,6 +2963,326 @@ mod tests {
             let one = [WorkerId(11), WorkerId(0)];
             assert_eq!(claim, Claim::Standing(WorkerId(2), one));
             assert_eq!(table.pins(s(1)), Some(one), "nothing is claimed");
+        }
+    }
+
+    /// Pins that moved under a decision are read behind a pending
+    /// rename's step. A host replaces a worker's row before it tells the
+    /// table. A decision reads the key's pin on the new rows, finds it
+    /// not routable and picks worker 2. A request decided on the earlier
+    /// rows commits on the replaced worker, under the id it had. The
+    /// rename is then said, and its walk has yet to reach the key. The
+    /// decision's claim names the newcomer by the id that stands, the
+    /// one its rows hold, and nothing is claimed. So too for key 2,
+    /// where another request committed on the decision's own pick as
+    /// well: a pin as written, which a write asks nothing for.
+    #[test]
+    fn a_claim_on_pins_that_moved_names_the_newcomer_by_the_id_that_stands() {
+        for rule in [RULE, ORIGINAL] {
+            let latest = rule.recovery == Recovery::Latest;
+            let table = SessionTable::new(rule.sweep_micros);
+            // (key, the commits between the decision's read and its
+            // claim, the pins behind the step). Key 2's commits come in
+            // the order that leaves the replaced worker in the lead.
+            let keys: [(u64, &[u64], [u64; 2]); 2] = [
+                (1, &[1], if latest { [11, 5] } else { [5, 11] }),
+                (2, if latest { &[2, 1] } else { &[1, 2] }, [11, 2]),
+            ];
+            let read = [WorkerId(5), WorkerId(0)];
+            for (key, commits, _) in keys {
+                table.lookup(s(key), 10, &rule);
+                table.dispatched(s(key), SessionVerdict::Pinned, WorkerId(5));
+                assert_eq!(table.lookup(s(key), 20, &rule), read);
+                for worker in commits {
+                    table.dispatched(s(key), SessionVerdict::Pinned, WorkerId(*worker));
+                }
+            }
+            // The rename's first half: remembered, the shards not yet
+            // walked.
+            table.remember(WorkerId(1), WorkerId(11));
+            for (key, _, walked) in keys {
+                let walked = walked.map(WorkerId);
+                assert_ne!(table.pins(s(key)), Some(walked), "key {key} is not walked");
+                let claim = table.claim(s(key), read, WorkerId(2));
+                assert_eq!(claim, Claim::Standing(WorkerId(11), walked), "key {key}");
+                assert_eq!(
+                    table.pins(s(key)),
+                    Some(walked),
+                    "key {key}: the step alone"
+                );
+            }
+            table.rename_worker(WorkerId(1), WorkerId(11));
+            for (key, _, walked) in keys {
+                let walked = walked.map(WorkerId);
+                assert_eq!(
+                    table.pins(s(key)),
+                    Some(walked),
+                    "key {key} behind the walk"
+                );
+            }
+        }
+    }
+
+    /// Pins that moved with no rename said are read as written, and
+    /// their first newcomer is the pin to follow, where the decision's
+    /// own pick is the second: two other requests committed, the later
+    /// one on the worker the decision picked. A worker that is a pin
+    /// already answers the decision's own pick only where the pins stand
+    /// as the decision read them.
+    #[test]
+    fn a_claim_on_pins_that_moved_follows_their_first_newcomer_past_its_own_pick() {
+        for rule in [RULE, ORIGINAL] {
+            let table = SessionTable::new(rule.sweep_micros);
+            table.lookup(s(1), 10, &rule);
+            table.dispatched(s(1), SessionVerdict::Pinned, WorkerId(5));
+            let read = [WorkerId(5), WorkerId(0)];
+            assert_eq!(table.lookup(s(1), 20, &rule), read);
+            // The two commits, in the order that leaves worker 9 in the
+            // lead and the decision's pick behind it.
+            let commits = match rule.recovery {
+                Recovery::Latest => [7, 9],
+                Recovery::Original => [9, 7],
+            };
+            for worker in commits {
+                table.dispatched(s(1), SessionVerdict::Pinned, WorkerId(worker));
+            }
+            let held = [WorkerId(9), WorkerId(7)];
+            assert_eq!(table.pins(s(1)), Some(held));
+            let claim = table.claim(s(1), read, WorkerId(7));
+            assert_eq!(claim, Claim::Standing(WorkerId(9), held));
+            assert_eq!(table.pins(s(1)), Some(held), "nothing is written");
+        }
+    }
+
+    /// Pins the step makes the ones the decision read again stand as
+    /// read. One worker is registered three times around one decision:
+    /// it was 3 where the decision read its rows and 1 where the
+    /// decision read the key's pins, a rename to 11 walked the key, and
+    /// a rename back to 1 is said and has yet to walk it. The pins as
+    /// written are not the ones the decision read, and the step makes
+    /// them so. The decision's pick is that worker under its first id, a
+    /// pin of the key already: the table writes nothing and answers the
+    /// decision's own pick, as where the pins stood as written. A claim
+    /// there would mark a pin the key was served on, and the decision's
+    /// commit on an alternate would withdraw it.
+    #[test]
+    fn a_claim_on_pins_the_step_makes_the_ones_read_again_meets_its_workers_pin() {
+        for rule in [RULE, ORIGINAL] {
+            let table = SessionTable::new(rule.sweep_micros);
+            table.rename_worker(WorkerId(3), WorkerId(1));
+            table.lookup(s(1), 10, &rule);
+            table.dispatched(s(1), SessionVerdict::Pinned, WorkerId(5));
+            table.dispatched(s(1), SessionVerdict::Pinned, WorkerId(1));
+            let read = table.lookup(s(1), 20, &rule);
+            let served = match rule.recovery {
+                Recovery::Latest => [WorkerId(1), WorkerId(5)],
+                Recovery::Original => [WorkerId(5), WorkerId(1)],
+            };
+            assert_eq!(read, served);
+            table.rename_worker(WorkerId(1), WorkerId(11));
+            assert_ne!(table.pins(s(1)), Some(read), "the walk renamed the pin");
+            // The rename back by its first half: remembered, the shards
+            // not yet walked.
+            table.remember(WorkerId(11), WorkerId(1));
+            let claim = table.claim(s(1), read, WorkerId(3));
+            assert_eq!(claim, Claim::Standing(WorkerId(3), read));
+            assert_eq!(table.pins(s(1)), Some(read), "the step alone");
+            // The request's commit on an alternate withdraws nothing.
+            table.dispatched(s(1), SessionVerdict::Pinned, WorkerId(2));
+            let both = match rule.recovery {
+                Recovery::Latest => [WorkerId(2), WorkerId(1)],
+                Recovery::Original => [WorkerId(1), WorkerId(2)],
+            };
+            assert_eq!(table.pins(s(1)), Some(both), "the key keeps its pin");
+        }
+    }
+
+    /// Pins the step makes the ones the decision read again stand as
+    /// read for a pick that is in neither pin too: the claim is taken, as
+    /// where the pins stood as written. One worker is registered twice
+    /// around one decision: it was 1 where the decision read the key's
+    /// pins, a rename to 11 walked the key, and a rename back to 1 is
+    /// said and has yet to walk it. The step makes the pins the ones
+    /// read, and the decision's pick, another worker, is claimed by the
+    /// key's recovery. The claim is marked: the claiming decision's
+    /// commit elsewhere withdraws it, and the key's pin stays.
+    #[test]
+    fn a_claim_on_pins_the_step_makes_the_ones_read_again_is_taken_for_a_new_worker() {
+        for rule in [RULE, ORIGINAL] {
+            let table = SessionTable::new(rule.sweep_micros);
+            table.lookup(s(1), 10, &rule);
+            table.dispatched(s(1), SessionVerdict::Pinned, WorkerId(5));
+            table.dispatched(s(1), SessionVerdict::Pinned, WorkerId(1));
+            let read = table.lookup(s(1), 20, &rule);
+            assert!(read.contains(&WorkerId(1)) && read.contains(&WorkerId(5)));
+            table.rename_worker(WorkerId(1), WorkerId(11));
+            assert_ne!(table.pins(s(1)), Some(read), "the walk renamed the pin");
+            // The rename back by its first half: remembered, the shards
+            // not yet walked.
+            table.remember(WorkerId(11), WorkerId(1));
+            let claim = table.claim(s(1), read, WorkerId(2));
+            assert_eq!(claim, Claim::Made(WorkerId(2)));
+            let claimed = match rule.recovery {
+                Recovery::Latest => [WorkerId(2), WorkerId(1)],
+                Recovery::Original => [WorkerId(1), WorkerId(2)],
+            };
+            assert_eq!(table.pins(s(1)), Some(claimed), "on the walked pins");
+            // The claiming decision's commit lands elsewhere.
+            table.dispatched(s(1), SessionVerdict::Claimed(WorkerId(2)), WorkerId(7));
+            let withdrawn = match rule.recovery {
+                Recovery::Latest => [WorkerId(7), WorkerId(1)],
+                Recovery::Original => [WorkerId(1), WorkerId(7)],
+            };
+            assert_eq!(table.pins(s(1)), Some(withdrawn), "the claim is withdrawn");
+        }
+    }
+
+    /// A decision that claims a worker it read as a pin of the key, on
+    /// pins that stand as it read them, makes no claim: the table writes
+    /// nothing, marks nothing and answers the decision's own pick, as for
+    /// a worker pinned under another id. The decision's commit on that
+    /// pick then leaves the pins as read, as a failover taken does, and
+    /// its commit elsewhere moves them as a pin's alternate does. The
+    /// keyed decision answers a pin it read ahead of its claim, and this
+    /// is the table's answer to a caller that does not. The gateway's
+    /// sticky map writes nothing where a key's request lands on a
+    /// candidate it holds
+    /// (`model_gateway/src/policies/registry.rs:794-797`).
+    #[test]
+    fn a_claim_of_a_pin_its_decision_read_is_no_claim() {
+        for rule in [RULE, ORIGINAL] {
+            // The key's table up to the claim, made once for each commit.
+            let claimed = || {
+                let table = SessionTable::new(rule.sweep_micros);
+                table.lookup(s(1), 10, &rule);
+                table.dispatched(s(1), SessionVerdict::Pinned, WorkerId(5));
+                table.dispatched(s(1), SessionVerdict::Pinned, WorkerId(1));
+                let read = table.lookup(s(1), 20, &rule);
+                // The decision picks the pin it read behind the lead.
+                let pick = read[1];
+                let claim = table.claim(s(1), read, pick);
+                assert_eq!(claim, Claim::Standing(pick, read));
+                assert_eq!(table.pins(s(1)), Some(read), "nothing is written");
+                (table, read, pick)
+            };
+            // The decision's commit lands on its pick: the failover taken.
+            let (table, read, pick) = claimed();
+            table.dispatched(s(1), SessionVerdict::Pinned, pick);
+            assert_eq!(table.pins(s(1)), Some(read), "the pins stay as read");
+            // The decision's commit lands elsewhere, under a pin's verdict.
+            let (table, read, pick) = claimed();
+            table.dispatched(s(1), SessionVerdict::Pinned, WorkerId(9));
+            let moved = match rule.recovery {
+                Recovery::Latest => [WorkerId(9), read[0]],
+                Recovery::Original => [pick, WorkerId(9)],
+            };
+            assert_eq!(table.pins(s(1)), Some(moved), "as a pin's alternate");
+        }
+    }
+
+    /// A key that holds one pin keeps it where the decision that read it
+    /// claims it and is sent elsewhere. The table marks no claim, so the
+    /// commit withdraws nothing, even one that names a claim: the worker
+    /// the key was served on stands behind the newcomer by the key's
+    /// recovery. A marked pin would go with that commit and the key would
+    /// forget its worker. The gateway's sticky map pins a new worker first
+    /// and keeps the one before it as its second candidate
+    /// (`model_gateway/src/policies/manual.rs:269-274`), and under its own
+    /// assignments the new worker joins behind (`manual.rs:125-130`).
+    #[test]
+    fn a_claim_of_a_keys_one_pin_leaves_it_behind_a_commit_elsewhere() {
+        for rule in [RULE, ORIGINAL] {
+            let table = SessionTable::new(rule.sweep_micros);
+            table.lookup(s(1), 10, &rule);
+            table.dispatched(s(1), SessionVerdict::Pinned, WorkerId(5));
+            let read = table.lookup(s(1), 20, &rule);
+            assert_eq!(read, [WorkerId(5), WorkerId(0)]);
+            let claim = table.claim(s(1), read, WorkerId(5));
+            assert_eq!(claim, Claim::Standing(WorkerId(5), read));
+            assert_eq!(table.pins(s(1)), Some(read), "nothing is written");
+            // A commit elsewhere that names a claim finds no mark.
+            table.dispatched(s(1), SessionVerdict::Claimed(WorkerId(5)), WorkerId(9));
+            let kept = match rule.recovery {
+                Recovery::Latest => [WorkerId(9), WorkerId(5)],
+                Recovery::Original => [WorkerId(5), WorkerId(9)],
+            };
+            assert_eq!(table.pins(s(1)), Some(kept), "the served pin stays");
+        }
+    }
+
+    /// A pin the decision read under an id its worker had is no claim
+    /// either, ahead of the rename's walk. The key was served on worker 1,
+    /// the decision read that pin and its rows, and a rename of 1 to 11
+    /// is said with its walk pending. The decision's pick is 1, a pin as
+    /// written: the table takes no step, writes nothing and answers the
+    /// decision's own pick. The walk then renames the pin, and a commit
+    /// elsewhere that names a claim leaves the worker's pin under the id
+    /// that stands. A marked pin would follow the rename and go with that
+    /// commit. The gateway's sticky map names a key's workers by address
+    /// (`model_gateway/src/policies/manual.rs:120`, read by `:471-473`),
+    /// so a worker registered again is the key's candidate still.
+    #[test]
+    fn a_claim_of_a_pin_read_under_an_id_its_worker_had_is_no_claim() {
+        for rule in [RULE, ORIGINAL] {
+            let table = SessionTable::new(rule.sweep_micros);
+            table.lookup(s(1), 10, &rule);
+            table.dispatched(s(1), SessionVerdict::Pinned, WorkerId(1));
+            let read = table.lookup(s(1), 20, &rule);
+            assert_eq!(read, [WorkerId(1), WorkerId(0)]);
+            // The rename by its first half: remembered, the shards not
+            // yet walked.
+            table.remember(WorkerId(1), WorkerId(11));
+            let claim = table.claim(s(1), read, WorkerId(1));
+            assert_eq!(claim, Claim::Standing(WorkerId(1), read));
+            assert_eq!(table.pins(s(1)), Some(read), "no step and no write");
+            table.rename_worker(WorkerId(1), WorkerId(11));
+            assert_eq!(table.pins(s(1)), Some([WorkerId(11), WorkerId(0)]));
+            // A commit elsewhere that names a claim finds no mark.
+            table.dispatched(s(1), SessionVerdict::Claimed(WorkerId(1)), WorkerId(9));
+            let kept = match rule.recovery {
+                Recovery::Latest => [WorkerId(9), WorkerId(11)],
+                Recovery::Original => [WorkerId(11), WorkerId(9)],
+            };
+            assert_eq!(table.pins(s(1)), Some(kept), "the worker's pin stays");
+        }
+    }
+
+    /// A pin the decision read is no claim on pins a rename's step makes
+    /// the ones read again either. One worker is registered twice around
+    /// one decision: it was 1 where the decision read the key's pins, a
+    /// rename to 11 walked the key, and a rename back to 1 is said and
+    /// has yet to walk it. The decision's pick is that worker, a pin it
+    /// read. The step makes the pins the ones read, and the table writes
+    /// nothing more and answers the decision's own pick. A commit
+    /// elsewhere that names a claim then keeps the worker's pin. A marked
+    /// pin would go with that commit. The gateway's sticky map names a
+    /// key's workers by address
+    /// (`model_gateway/src/policies/manual.rs:120`, read by `:471-473`),
+    /// so a worker registered again twice is the key's candidate still.
+    #[test]
+    fn a_claim_of_a_pin_its_decision_read_is_no_claim_behind_a_renames_step() {
+        for rule in [RULE, ORIGINAL] {
+            let table = SessionTable::new(rule.sweep_micros);
+            table.lookup(s(1), 10, &rule);
+            table.dispatched(s(1), SessionVerdict::Pinned, WorkerId(5));
+            table.dispatched(s(1), SessionVerdict::Pinned, WorkerId(1));
+            let read = table.lookup(s(1), 20, &rule);
+            assert!(read.contains(&WorkerId(1)) && read.contains(&WorkerId(5)));
+            table.rename_worker(WorkerId(1), WorkerId(11));
+            assert_ne!(table.pins(s(1)), Some(read), "the walk renamed the pin");
+            // The rename back by its first half: remembered, the shards
+            // not yet walked.
+            table.remember(WorkerId(11), WorkerId(1));
+            let claim = table.claim(s(1), read, WorkerId(1));
+            assert_eq!(claim, Claim::Standing(WorkerId(1), read));
+            assert_eq!(table.pins(s(1)), Some(read), "the step alone");
+            // A commit elsewhere that names a claim finds no mark.
+            table.dispatched(s(1), SessionVerdict::Claimed(WorkerId(1)), WorkerId(9));
+            let kept = match rule.recovery {
+                Recovery::Latest => [WorkerId(9), WorkerId(1)],
+                Recovery::Original => [WorkerId(1), WorkerId(9)],
+            };
+            assert_eq!(table.pins(s(1)), Some(kept), "the worker's pin stays");
         }
     }
 

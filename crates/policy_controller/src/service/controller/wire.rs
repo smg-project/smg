@@ -197,6 +197,27 @@ pub(crate) fn ranges(facts: &proto::RequestFacts) -> Result<(Phase, HashKind, u6
     Ok((phase, hash_kind, session_key))
 }
 
+/// The range of the items a frame states (`DecideRequest.encode`). `phase`
+/// is the phase the frame's facts state ([`ranges`]) and `decode_of` the
+/// lease whose decode side it asks ([`asked_decode`]). Items are read on a
+/// frame of the encode phase, [`MAX_ITEMS`] keys at most. A frame of
+/// another phase that states them is out of range, and one that asks a
+/// lease's decode side is such a frame, whatever its facts say. The check
+/// of a frame received reads the field here ([`Checked::new`]), and so
+/// does a sender whose callers share one stream, as both read [`ranges`].
+#[inline(always)]
+pub(crate) fn stated_items(
+    encode: Option<&proto::EncodeItems>,
+    phase: Phase,
+    decode_of: u64,
+) -> Result<(), Refusal> {
+    match encode {
+        Some(_) if phase != Phase::Encode || decode_of != 0 => Err(Refusal::OutOfRange("encode")),
+        Some(stated) if stated.keys.len() > MAX_ITEMS => Err(Refusal::OutOfRange("encode.keys")),
+        _ => Ok(()),
+    }
+}
+
 /// A `DecideRequest` the engine's record holds whole.
 #[derive(Debug)]
 pub(crate) struct Checked {
@@ -213,6 +234,10 @@ pub(crate) struct Checked {
     /// [`AGAIN`], [`DECODE_LATER`], [`DECODE_OF`], [`ITEMS`]): `0` for a
     /// frame that says none, so a decider reads them by one test.
     rare: u8,
+    /// The number the frame's request names its worker by
+    /// (`DecideRequest.named_worker`), as it came; `None` for a frame that
+    /// names no worker.
+    named: Option<u32>,
     /// The lease whose decode side the frame asks; `0` for a frame that
     /// asks none.
     decode_of: u64,
@@ -226,8 +251,8 @@ pub(crate) struct Checked {
 /// (`DecideRequest.encode`), with the room its answer takes for where they
 /// go (`DecideAnswer.encode`): an encoder a key at most. Both are made
 /// where the frame is checked, on its stream's thread. A deciding thread
-/// fills the room and makes no list, and the stream that sends the answer
-/// frees both.
+/// fills the room and makes no list. A pick's stream frees both, and any
+/// other answer frees them where it is decided.
 #[derive(Debug)]
 struct Items {
     stated: proto::EncodeItems,
@@ -261,20 +286,14 @@ impl Checked {
         // items is decided without them. A frame that asks a lease's
         // decode side is one of another phase, whatever its facts say: a
         // decode asked again states no items.
-        let items = match request.encode {
-            Some(stated) if phase == Phase::Encode => {
-                if stated.keys.len() > MAX_ITEMS {
-                    return Err(Refusal::OutOfRange("encode.keys"));
-                }
-                let placed = proto::EncodePlaced {
-                    encoders: Vec::with_capacity(stated.keys.len()),
-                    one: false,
-                };
-                Some(Box::new(Items { stated, placed }))
-            }
-            Some(_) => return Err(Refusal::OutOfRange("encode")),
-            None => None,
-        };
+        stated_items(request.encode.as_ref(), phase, decode_of)?;
+        let items = request.encode.map(|stated| {
+            let placed = proto::EncodePlaced {
+                encoders: Vec::with_capacity(stated.keys.len()),
+                one: false,
+            };
+            Box::new(Items { stated, placed })
+        });
         let phase = if items.is_some() {
             Phase::Prefill
         } else {
@@ -293,6 +312,10 @@ impl Checked {
             hash_kind,
             session_key,
             rare,
+            // Kept as the frame states it, whatever the frame's phase: the
+            // decision of a frame over one list reads it, under a spec
+            // whose binding names a target source, and no other does.
+            named: request.named_worker,
             decode_of,
             items,
         })
@@ -356,6 +379,16 @@ impl Checked {
     /// the prefill phase as its pair's one request ([`Self::phase`]).
     pub(crate) const fn carries_items(&self) -> bool {
         self.rare & ITEMS != 0
+    }
+
+    /// The number the frame's request names its worker by
+    /// (`DecideRequest.named_worker`), as its host read it under the
+    /// target source of its binding's routing key
+    /// ([`KeySources::target`](crate::document::KeySources::target));
+    /// `None` for a frame that names no worker. The widest number is a
+    /// text that was no number: it reaches no worker of any list.
+    pub(crate) const fn named_worker(&self) -> Option<u32> {
+        self.named
     }
 
     /// The keys of an encode request's items as the engine takes them, in
@@ -532,7 +565,6 @@ impl Checked {
             model_fingerprint: ModelFingerprint::NONE,
             // What the leases book stands beside rows a view lent: no
             // frame carries it.
-            lent_in_flight: None,
             session_counted: false,
             // The frame carries no signal cells: they stand beside the
             // candidates of the program that decides.
@@ -1549,6 +1581,28 @@ pub(crate) mod tests {
         assert_eq!(said(false, last), (true, false, last, Phase::Decode));
     }
 
+    /// The number a frame's request names its worker by is kept as it came:
+    /// none for a frame that states none, the first worker's apart from
+    /// none, and the widest number. It is kept whatever the frame's phase:
+    /// its decision reads it or does not. It is no word of the byte few
+    /// frames say one of: a decider's one test reads a frame that names its
+    /// worker as it reads any other.
+    #[test]
+    fn a_frame_keeps_the_number_its_request_names_its_worker_by() {
+        let said = |named: Option<u32>, phase: proto::Phase| {
+            let mut frame = with(|facts| facts.phase = phase.into());
+            frame.named_worker = named;
+            let frame = Checked::new(frame).expect("no word is a field out of its range");
+            (frame.says_more(), frame.named_worker())
+        };
+        let single = proto::Phase::Single;
+        assert_eq!(said(None, single), (false, None));
+        assert_eq!(said(Some(0), single), (false, Some(0)));
+        assert_eq!(said(Some(7), proto::Phase::Prefill), (false, Some(7)));
+        let widest = Some(u32::MAX);
+        assert_eq!(said(widest, single), (false, widest));
+    }
+
     /// No lease has the id 0: a frame that names it is refused by its
     /// field, as any field out of its range is.
     #[test]
@@ -1576,8 +1630,8 @@ pub(crate) mod tests {
     /// as the engine takes them: each key in the frame's order, the one key
     /// where the frame states one, and what the request asks of its decode.
     /// The field's presence marks the request, with a key or with none. A
-    /// frame of the encode phase that carries none is read at its own phase
-    /// and is no encode request.
+    /// frame of the encode phase that does not state the field is read at
+    /// its own phase and is no encode request.
     #[test]
     fn an_encode_phase_frame_that_carries_items_is_read_at_the_prefill_phase() {
         let bare = with(|facts| facts.phase = proto::Phase::Encode.into());
@@ -1617,6 +1671,58 @@ pub(crate) mod tests {
         let keys = keyless.item_keys(Vec::new());
         let items = keyless.items(&keys);
         assert!(items.keys.is_empty() && items.one.is_none());
+    }
+
+    /// The hash form of a session key is the session's value under the
+    /// phase the facts state. An encode request's frame states the encode
+    /// phase and is decided at the prefill phase: its key is read back
+    /// under the phase it states, so the request made of it holds the key
+    /// its host holds, and the pair's session is that key's at the prefill
+    /// phase. A value made under the prefill phase reads back as another
+    /// key.
+    #[test]
+    fn a_hash_form_session_key_on_an_encode_frame_is_read_back_under_the_encode_phase() {
+        let key = Identity::hashed(0x5e55_10f7);
+        let session = |phase| {
+            let facts = RequestFacts {
+                model: "model-a",
+                session_key: key,
+                phase,
+                ..RequestFacts::default()
+            };
+            facts.session().get()
+        };
+        let read = |value| {
+            let mut frame = with_items(proto::Phase::Encode, 1);
+            let facts = frame.facts.as_mut().expect("the full frame has facts");
+            facts.session_key = Some(key_form(Form::Hash(value)));
+            let frame = Checked::new(frame).expect("a frame the record holds");
+            assert_eq!(frame.phase(), Phase::Prefill);
+            let left = std::time::Duration::from_millis(1);
+            made(&frame, &mut Lists::default(), left, |facts, _| {
+                (facts.session_key.hash, facts.session().get())
+            })
+        };
+        let pair = session(Phase::Prefill);
+        assert_eq!(read(session(Phase::Encode)), (key.hash, pair));
+        assert_ne!(read(pair).0, key.hash);
+    }
+
+    /// A key with no form reads as no key, and so do an empty text and a
+    /// hash of zero. Each such item keeps its place in the list, so the
+    /// answer's encoders stand in the keys' order.
+    #[test]
+    fn an_item_key_with_no_form_reads_as_no_key_at_its_place() {
+        let mut frame = with_items(proto::Phase::Encode, 5);
+        let stated = frame.encode.as_mut().expect("the case's items");
+        stated.keys[1] = proto::Identity { form: None };
+        stated.keys[2] = key_form(Form::Plain(String::new()));
+        stated.keys[3] = key_form(Form::Hash(0));
+        let frame = Checked::new(frame).expect("no key is in the field's range");
+        let keys = frame.item_keys(Vec::new());
+        let none = Identity::NONE;
+        let read = [Identity::hashed(1), none, none, none, Identity::hashed(5)];
+        assert_eq!(keys, read);
     }
 
     /// The field is read on a frame of the encode phase and on no other. A

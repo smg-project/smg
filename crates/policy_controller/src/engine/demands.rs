@@ -35,6 +35,14 @@
 //! it fails first, in the order a host answers for them ([`UnmetDemand`]), and
 //! the pool is shed under the last of those: where a host cuts a pool one
 //! demand after another, that is the demand that took its last worker.
+//!
+//! An encode request's encoders are the one list no judge cuts ahead of its
+//! decision. The encode pass tests an encoder for a request once, by its
+//! media, its wire and its role, and names what a fleet lacks by lifting
+//! one of them at a time. A demand enters that test a part at a time: the
+//! runtime with the wire, the references and their pipeline with the
+//! items', vision with the request's pixels. So the name follows the
+//! pass's order whether a request states a fact as a demand or as its own.
 
 #![expect(
     clippy::exhaustive_structs,
@@ -122,25 +130,14 @@ impl Demands {
     /// demand.
     #[must_use]
     pub const fn unmet_by(self, vision: bool, facts: DemandFacts) -> Option<UnmetDemand> {
-        if self.runtime != 0 && self.runtime != facts.runtime {
+        if !self.on_runtime(facts) {
             return Some(UnmetDemand::Runtime);
         }
         if self.vision && !vision {
             return Some(UnmetDemand::Vision);
         }
-        let host = match self.references {
-            References::None => None,
-            References::Any => Some(facts.host_pipeline),
-            References::Caller => Some(true),
-            References::Worker => Some(false),
-        };
-        if let Some(host) = host {
-            if !facts.references {
-                return Some(UnmetDemand::References);
-            }
-            if facts.host_pipeline != host {
-                return Some(UnmetDemand::Pipeline);
-            }
+        if let Some(unmet) = self.references_unmet_by(facts) {
+            return Some(unmet);
         }
         // A window that is stated holds each bound alone.
         let held = facts.window == 0
@@ -150,6 +147,36 @@ impl Demands {
         }
         if self.decoding != 0 && self.decoding != facts.decoding {
             return Some(UnmetDemand::Decoding);
+        }
+        None
+    }
+
+    /// Whether a worker is on the runtime the request stays on, the first
+    /// test of [`Self::unmet_by`] alone. An encode pass reads it beside the
+    /// wires its request states: a runtime is the rest of a request's wire.
+    #[must_use]
+    pub(crate) const fn on_runtime(self, facts: DemandFacts) -> bool {
+        self.runtime == 0 || self.runtime == facts.runtime
+    }
+
+    /// The demand for media by reference a worker fails, alone:
+    /// [`UnmetDemand::References`] where it processes none,
+    /// [`UnmetDemand::Pipeline`] where it processes them by the other
+    /// pipeline than the request names. `None` where it meets the demand,
+    /// and where the request names none.
+    #[must_use]
+    pub(crate) const fn references_unmet_by(self, facts: DemandFacts) -> Option<UnmetDemand> {
+        let host = match self.references {
+            References::None => return None,
+            References::Any => facts.host_pipeline,
+            References::Caller => true,
+            References::Worker => false,
+        };
+        if !facts.references {
+            return Some(UnmetDemand::References);
+        }
+        if facts.host_pipeline != host {
+            return Some(UnmetDemand::Pipeline);
         }
         None
     }
@@ -292,8 +319,9 @@ impl UnmetDemand {
     /// The stage a pool this demand left nobody is shed under. A runtime is
     /// the rest of a request's wire, and is shed as its gateway's wires
     /// are. Vision is shed under the word of the `epd` plan's vision rule.
-    /// An encode pair's decision names two stages of its own, by the side
-    /// that lacks it.
+    /// An encode request's encoders are shed under none of these: the
+    /// encode pass keeps their part of a demand in its one test of an
+    /// encoder, and names what they lack in its own order.
     #[must_use]
     pub const fn stage(self) -> &'static str {
         match self {
@@ -303,24 +331,6 @@ impl UnmetDemand {
             Self::Pipeline => PIPELINE,
             Self::Window => CONTEXT_WINDOW,
             Self::Decoding => DECODING,
-        }
-    }
-
-    /// The stage an encode request is shed under where this demand left
-    /// its encoders nobody. The encode pass tests an encoder's vision and
-    /// its media from the request's own facts, under two words of its own.
-    /// A stated demand that leaves no encoder says one of the two as well.
-    /// Which of them a fleet hears follows the order of the one that
-    /// judged it: where its encoders lack different things, the pass names
-    /// the images first and the demand the last it judged. A runtime keeps
-    /// its own stage, for which the pass has no word, and so does what no
-    /// encoder beside a pair is held to ([`Demands::beside_pair`]).
-    #[must_use]
-    pub const fn encoders_stage(self) -> &'static str {
-        match self {
-            Self::Vision => framework::ENCODE_VISION,
-            Self::References | Self::Pipeline => framework::ENCODE_MEDIA,
-            Self::Runtime | Self::Window | Self::Decoding => self.stage(),
         }
     }
 }
@@ -668,19 +678,6 @@ mod tests {
                 "vision",
                 "references",
                 "pipeline",
-                "context-window",
-                "decoding"
-            ]
-        );
-        // An encode request's encoders say the encode pass's own word for
-        // the two facts the pass tests itself.
-        assert_eq!(
-            order.map(UnmetDemand::encoders_stage),
-            [
-                "wires",
-                "encode-vision",
-                "encode-media",
-                "encode-media",
                 "context-window",
                 "decoding"
             ]

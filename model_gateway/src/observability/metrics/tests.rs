@@ -1,14 +1,29 @@
-use std::net::TcpListener;
+use std::{
+    net::TcpListener,
+    pin::pin,
+    sync::atomic::{AtomicU8, Ordering},
+    task::Poll,
+};
 
 use metrics_exporter_prometheus::PrometheusBuilder;
+use smg_policy_controller::{
+    document::{AppliedSpec, PolicySpec},
+    engine::{Candidate, Decision, Members, RequestFacts, Scorer, TieBand},
+    stages::{Lifecycle, StageRegistry},
+    tracking::{EventSet, Lease},
+};
 use smg_worker::{
+    identity::basic::Worker,
     metrics::writers::{Metrics as WorkerMetrics, WorkerHandles},
+    registry::{event::WorkerEvent, WorkerId as ObjectId},
     test_support::{gone, held, ready_worker},
 };
+use tokio::sync::broadcast::Receiver;
 
 use super::{
     test_support::{
-        assert_metric, render_with_recorder, shadow_kinds, shadowing_spec, sorted_series,
+        assert_metric, fault_kinds, render_with_recorder, shadow_kinds, shadowing_spec,
+        sorted_series,
     },
     *,
 };
@@ -151,6 +166,179 @@ fn the_engines_shadow_counts_are_published_from_zero_and_added_by_their_growth()
         second.place(2);
         assert_eq!(scraped(&second), agreed(7));
         assert_eq!(scraped(&second), agreed(7));
+    });
+}
+
+/// The stage of the fault counts' case, as its table and its document name
+/// it.
+const FAULTY: &str = "of-the-case";
+
+/// Where [`PanicsAt`] panics: nowhere, at its score, or at the issue of a
+/// request's lease.
+const NOWHERE: u8 = 0;
+const AT_ITS_SCORE: u8 = 1;
+const AT_AN_ISSUE: u8 = 2;
+
+/// A scorer that panics where the case says. It takes every word of a
+/// lease, so the engine leases each pick under it and tells it the issue.
+#[derive(Debug)]
+struct PanicsAt(Arc<AtomicU8>);
+
+impl Lifecycle for PanicsAt {
+    fn hears(&self) -> EventSet {
+        EventSet::LEASE
+    }
+
+    fn on_decision_issued(&self, _: &Lease, _: &Decision) {
+        let at = self.0.load(Ordering::Relaxed);
+        assert_ne!(at, AT_AN_ISSUE, "the case's panic at an issue");
+    }
+}
+
+impl Scorer for PanicsAt {
+    fn name(&self) -> &'static str {
+        FAULTY
+    }
+
+    fn score(&self, _: &RequestFacts<'_>, _: &[Candidate], _: &[u32], out: &mut [f32]) -> TieBand {
+        let at = self.0.load(Ordering::Relaxed);
+        assert_ne!(at, AT_ITS_SCORE, "the case's panic at a score");
+        out.fill(1.0);
+        TieBand::NORMALIZED
+    }
+}
+
+/// A host's registry whose own code panics where the engine's upkeep
+/// subscribes to it.
+struct PanicsAtItsEvents;
+
+impl Members for PanicsAtItsEvents {
+    fn events(&self) -> Receiver<WorkerEvent> {
+        panic!("the case's panic in the host's own code")
+    }
+
+    fn standing(&self) -> Vec<(ObjectId, Arc<dyn Worker>)> {
+        Vec::new()
+    }
+}
+
+/// Two ready workers of the model `m`, and a gateway's policies with an
+/// engine whose one scorer is [`PanicsAt`] and whose host's registry is
+/// [`PanicsAtItsEvents`]. `at` says where the scorer panics next.
+struct Faulty {
+    workers: WorkerRegistry,
+    policies: PolicyRegistry,
+    engine: &'static PolicyEngine,
+    at: Arc<AtomicU8>,
+}
+
+impl Faulty {
+    fn new() -> Self {
+        let workers = WorkerRegistry::new();
+        for url in ["http://h:1", "http://h:2"] {
+            let worker = ready_worker(url, "m");
+            workers.register(worker).expect("the worker registers");
+        }
+        let at = Arc::new(AtomicU8::new(NOWHERE));
+        let asked = Arc::clone(&at);
+        let mut stages = StageRegistry::builtin();
+        stages
+            .scorer(FAULTY, move || Box::new(PanicsAt(Arc::clone(&asked))))
+            .expect("a free name");
+        let mut document = PolicySpec::preset("round_robin").expect("a stock preset");
+        for profile in document.profiles.values_mut() {
+            profile.score = vec![FAULTY.into()];
+            profile.pick = "best".into();
+        }
+        let spec = AppliedSpec::validate_in(&document, &stages, &[]);
+        let spec = spec.expect("the stages hold the scorer");
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        policies.set_engine(Box::leak(Box::new(PolicyEngine::new(spec))));
+        let engine = policies.engine().expect("the engine that was set");
+        engine.set_registry(Arc::new(PanicsAtItsEvents));
+        Self {
+            workers,
+            policies,
+            engine,
+            at,
+        }
+    }
+
+    /// Whether the engine places one request of the model.
+    fn places(&self) -> bool {
+        let (inputs, pool) = (PlacementInputs::default(), RoutingPool::HttpRegular);
+        let placed = select_single(
+            &self.workers,
+            &self.policies,
+            "m",
+            pool,
+            None,
+            inputs,
+            Stated::nothing,
+        );
+        placed.is_some()
+    }
+
+    /// One poll of the engine's own task: its first upkeep runs at that
+    /// poll, and subscribes to the host's registry.
+    fn runs_one_upkeep(&self) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("a runtime");
+        runtime.block_on(async {
+            let mut task = pin!(self.engine.run());
+            assert!(matches!(futures::poll!(task.as_mut()), Poll::Pending));
+        });
+    }
+}
+
+/// The panics the policy engine held and counted, on a scrape. Each kind
+/// has a zero series from the first scrape. A decision that panics is
+/// refused, and raises `decision`. A stage that panics at the issue of a
+/// request's lease costs that request nothing, and raises `event`. A panic
+/// of the host's own code in a step of the engine's upkeep raises `upkeep`.
+/// Each series stands at its count as read, however many scrapes read it.
+///
+/// The series is new with the policy engine: a classic gateway starts no
+/// engine, and publishes no such family.
+#[test]
+fn the_engines_fault_counts_are_published_from_zero_each_under_its_kind() {
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    metrics::with_local_recorder(&recorder, || {
+        init_metrics();
+        let faulty = Faulty::new();
+        let scraped = || {
+            record_policy_fault_activity(faulty.engine);
+            fault_kinds(&handle.render())
+        };
+        assert!(!handle.render().contains("smg_policy_faults_total"));
+
+        assert_eq!(scraped(), [Some(0); 3]);
+        let rendered = handle.render();
+        let help = "# HELP smg_policy_faults_total Panics the policy engine held and counted";
+        assert!(rendered.contains(help), "{rendered}");
+        let series = |line: &&str| line.starts_with("smg_policy_faults_total{");
+        assert_eq!(rendered.lines().filter(series).count(), 3, "{rendered}");
+
+        faulty.at.store(AT_ITS_SCORE, Ordering::Relaxed);
+        assert!(!faulty.places(), "a decision that panicked places nothing");
+        assert_eq!(scraped(), [Some(1), Some(0), Some(0)]);
+
+        faulty.at.store(AT_AN_ISSUE, Ordering::Relaxed);
+        for _ in 0..2 {
+            assert!(faulty.places(), "the request keeps its decision");
+        }
+        assert_eq!(scraped(), [Some(1), Some(2), Some(0)]);
+
+        faulty.at.store(NOWHERE, Ordering::Relaxed);
+        for _ in 0..3 {
+            faulty.runs_one_upkeep();
+        }
+        assert!(faulty.places(), "no panic is left behind");
+        assert_eq!(scraped(), [Some(1), Some(2), Some(3)]);
+        assert_eq!(scraped(), [Some(1), Some(2), Some(3)]);
     });
 }
 

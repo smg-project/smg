@@ -16,7 +16,7 @@
 use std::sync::atomic::AtomicU64;
 
 use super::demands::DemandFacts;
-use crate::{load::signals, policies::consistent_hashing::LentRing, tracking::in_flight};
+use crate::{load::signals, policies::consistent_hashing::LentRing};
 
 /// The identity of a candidate, as its host states it. A controller's
 /// membership states a hash of the registration key and the incarnation
@@ -826,10 +826,7 @@ pub struct Candidate {
     /// takes one row and no index, so a filter that read the affinity
     /// column there would have to read it at the position; no filter of
     /// this crate does. A debug build asserts that the two agree where a
-    /// decision takes its inputs; a release build does not check. A count
-    /// the host lent beside its rows is read at the position too
-    /// ([`RequestFacts::in_flight`]): the row's place in the host's pool,
-    /// whatever its index.
+    /// decision takes its inputs; a release build does not check.
     pub position: u32,
     /// The worker's id ([`WorkerId`]). Each rank of a data-parallel engine
     /// is a row of its own with an id of its own: a rank's worker object
@@ -849,10 +846,8 @@ pub struct Candidate {
     /// The pairing descriptor's connector, as a position into the spec's
     /// declared list; `0` when none.
     pub connector: u16,
-    /// Requests the deciding host holds on the worker right now. A host
-    /// that lends its counts beside the rows
-    /// ([`RequestFacts::lent_in_flight`]) leaves this zero, so a reader
-    /// asks [`RequestFacts::in_flight`].
+    /// Requests the deciding host holds on the worker right now: what
+    /// [`RequestFacts::in_flight`] reads.
     ///
     /// The in-process front reads it off the worker object at every
     /// decision, but for a pair's or an encode request's rows filled with
@@ -1092,9 +1087,8 @@ pub struct Header<'a> {
 
 /// The mean of the in-flight counts of `rows` of `candidates`; zero over no
 /// row.
-// Forced into its callers: the walk is two small loops, one a kind of rows.
-// Out of line they cost an affinity pass a call and one instruction a row
-// more than the one loop that stood inside the pass.
+// Forced into its callers: out of line the walk cost an affinity pass a call
+// and one instruction a row more than the loop that stood inside the pass.
 #[inline(always)]
 pub(crate) fn mean_in_flight(
     facts: &RequestFacts<'_>,
@@ -1248,15 +1242,6 @@ pub struct RequestFacts<'a> {
     /// The host's clock at the decision, in microseconds since its origin.
     /// In-process only; no absolute instant crosses the wire.
     pub now_micros: u64,
-    /// What the leases on file book on each row, where the host did not
-    /// write the count into the row: a view of a publication's own rows
-    /// lends the table here. A reader of a row's requests in flight asks
-    /// both ([`RequestFacts::in_flight`]). `None` where the rows carry
-    /// their counts: rows written for the decision, and a host that keeps
-    /// the count itself. A pair takes none: a position is a place in one
-    /// pool, and a pair's rows carry what counts their host wrote.
-    /// In-process only.
-    pub lent_in_flight: Option<&'a in_flight::PoolInFlightCounts<'a>>,
     /// The host holds each row's count of this request's session key, the
     /// count a capped sessions rule asks for
     /// ([`Needs::session_in_flight`](crate::document::Needs::session_in_flight)),
@@ -1476,18 +1461,15 @@ impl<'a> RequestFacts<'a> {
         }
     }
 
-    /// The requests in flight of `row`: what the host lent for the row's
-    /// position where it lent a table ([`RequestFacts::lent_in_flight`]),
-    /// the row's own count otherwise. Every reader of a row's count asks
-    /// here, and none learns which rows it was given. A decision reads one
-    /// count a row: beside lent rows the first read is kept, and every
-    /// later read returns it.
+    /// The requests in flight of `row`: the row's own count
+    /// ([`Candidate::in_flight`]).
     #[inline]
+    #[expect(
+        clippy::unused_self,
+        reason = "stages call the reader on the request: the receiver keeps their calls as they stand"
+    )]
     pub fn in_flight(&self, row: &Candidate) -> u32 {
-        match self.lent_in_flight {
-            Some(lent) => lent.at(row.position),
-            None => row.in_flight,
-        }
+        row.in_flight
     }
 
     /// The affinity facts of the candidate at `index` of the slice the
@@ -1604,10 +1586,14 @@ pub struct Constraints<'a> {
     /// that meet them. Over a pair's two worker lists each side is held
     /// to the workers that meet them as its role is held to them
     /// ([`Demands::held_by`](crate::engine::Demands::held_by)). An encode
-    /// request's three lists are held a list at a time too. Where it has
+    /// request's pair is held a side at a time too. Where it has
     /// items its encoders are held to the runtime and the media's demands
     /// ([`Demands::beside_pair`](crate::engine::Demands::beside_pair)),
-    /// and its pair's two sides to the rest.
+    /// and its pair's two sides to the rest. The encoders' part is the one
+    /// demand an entry of the engine keeps itself: the encode pass holds
+    /// each encoder to what its encode side's constraints state, against
+    /// what the encoder states beside its row
+    /// ([`EncodePool::demands`](crate::engine::EncodePool::demands)).
     /// In-process only: this protocol version
     /// states no demand, and a handle refuses a request that states one
     /// before it sends it over a link (`DecisionGuard::asked`).
@@ -1808,29 +1794,20 @@ pub struct PoolFacts<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tracking::in_flight::tests::Lent;
 
-    /// One reader, two feeds: a row's requests in flight are the lent count
-    /// at the row's position where the host lends a table, whatever the
-    /// row's own field holds, and the row's own field where it lends none.
+    /// The one reader of a row's requests in flight returns the row's own
+    /// count.
     #[test]
-    fn a_rows_requests_in_flight_are_the_lent_count_or_the_rows_own() {
+    fn a_rows_requests_in_flight_are_the_rows_own() {
         let row = |position, in_flight| Candidate {
             position,
             in_flight,
             ..Candidate::default()
         };
-        let mut rows = [row(0, 5), row(1, 2)];
-        let own = RequestFacts::default();
-        let read = |facts: &RequestFacts<'_>, rows: &[Candidate]| -> Vec<u32> {
-            rows.iter().map(|row| facts.in_flight(row)).collect()
-        };
-        assert_eq!(read(&own, &rows), [5, 2]);
-        let lent = Lent::take(&mut rows);
-        assert_eq!(read(&own, &rows), [0, 0]);
-        // A count a host left on a row does not speak over its table.
-        rows[0].in_flight = 9;
-        assert_eq!(read(&lent.beside(&own), &rows), [5, 2]);
+        let rows = [row(0, 5), row(1, 2)];
+        let facts = RequestFacts::default();
+        let read: Vec<u32> = rows.iter().map(|row| facts.in_flight(row)).collect();
+        assert_eq!(read, [5, 2]);
     }
 
     #[test]
@@ -1921,7 +1898,7 @@ mod tests {
     /// bench's cells that copy the facts (`benches/decision.rs`).
     #[test]
     fn a_requests_facts_take_the_pinned_bytes() {
-        assert_eq!(size_of::<RequestFacts<'_>>(), 312);
+        assert_eq!(size_of::<RequestFacts<'_>>(), 304);
     }
 
     #[test]

@@ -1,13 +1,17 @@
-//! The cases of a single request that names its worker.
+//! The cases of a single request that names its worker. A pair's stand
+//! with the pair's cases ([`super::pair`]).
 
 use super::*;
-use crate::policies::consistent_hashing::target_source;
+use crate::{
+    engine::policy_engine::place::target::{reached, Reached},
+    policies::consistent_hashing::target_source,
+};
 
 /// The header the stock hash ring document names as its target source.
-const TARGET: &str = "x-smg-target-worker";
+pub(super) const TARGET: &str = "x-smg-target-worker";
 
 /// The shed of a request whose named worker cannot take it.
-const MISSED: Unplaced = Unplaced::Shed {
+pub(super) const MISSED: Unplaced = Unplaced::Shed {
     reason: ShedReason::NoEndpoints,
     emptied_by: "target-worker",
     retry_after_secs: 1,
@@ -17,7 +21,7 @@ const MISSED: Unplaced = Unplaced::Shed {
 /// as its block's last source. A binding that named no block is given the
 /// routing key header as its one source of a key first: a target source
 /// is no block alone.
-fn names_target(document: &mut PolicySpec) {
+pub(super) fn names_target(document: &mut PolicySpec) {
     let keyed = || RoutingKeySpec {
         sources: vec![KeySourceSpec {
             header: Some(MANUAL_SESSION_HEADER.to_owned()),
@@ -38,13 +42,13 @@ fn naming(name: &str) -> &'static PolicyEngine {
 }
 
 /// A request's headers that count how often the target header is read.
-struct Counted<'a> {
+pub(super) struct Counted<'a> {
     carried: &'a [(&'a str, &'a str)],
-    reads: Cell<u32>,
+    pub(super) reads: Cell<u32>,
 }
 
 impl<'a> Counted<'a> {
-    fn of(carried: &'a [(&'a str, &'a str)]) -> Self {
+    pub(super) fn of(carried: &'a [(&'a str, &'a str)]) -> Self {
         let reads = Cell::new(0);
         Self { carried, reads }
     }
@@ -183,6 +187,47 @@ fn the_number_counts_the_workers_that_are_available() {
     trip(&list[0]);
     assert_eq!(placed("0"), Ok(id(1)), "an open breaker");
     assert_eq!(placed("1"), Ok(id(2)));
+}
+
+/// The count both doors share walks the list once, in its order, and asks
+/// its caller's test of each worker with that worker's place, as far as
+/// the worker the number reaches and of none behind it. A number past the
+/// workers the test takes reaches none, behind a walk of the whole list. A
+/// text that is no number reaches none too, and is asked as far as the
+/// first worker the test takes. Where the test takes no worker there is
+/// none to count, whatever the number: so over an empty list.
+#[test]
+fn the_count_asks_no_worker_behind_the_one_its_number_reaches() {
+    let list = pool(6);
+    let asked = RefCell::new(Vec::new());
+    let counted = |number: Option<u32>, takes: fn(u32) -> bool| {
+        asked.borrow_mut().clear();
+        let answer = reached(&list, number, |place, worker| {
+            let held = Arc::as_ptr(&list[place as usize]);
+            assert!(ptr::addr_eq(ptr::from_ref(worker), held), "{place}");
+            asked.borrow_mut().push(place);
+            takes(place)
+        });
+        (answer, asked.borrow().clone())
+    };
+    let odd = |place: u32| place % 2 == 1;
+    assert_eq!(counted(Some(0), odd), (Reached::Place(1), vec![0, 1]));
+    assert_eq!(counted(Some(1), odd), (Reached::Place(3), vec![0, 1, 2, 3]));
+    let every: Vec<u32> = (0..6).collect();
+    assert_eq!(counted(Some(2), odd), (Reached::Place(5), every.clone()));
+    assert_eq!(counted(Some(3), odd), (Reached::NoWorker, every.clone()));
+    assert_eq!(
+        counted(Some(u32::MAX), odd),
+        (Reached::NoWorker, every.clone())
+    );
+    assert_eq!(counted(None, odd), (Reached::NoWorker, vec![0, 1]));
+    let none = |_: u32| false;
+    assert_eq!(
+        counted(Some(0), none),
+        (Reached::NoneToCount, every.clone())
+    );
+    assert_eq!(counted(None, none), (Reached::NoneToCount, every));
+    assert_eq!(reached(&[], Some(0), |_, _| true), Reached::NoneToCount);
 }
 
 /// The number counts among the workers the route's rule takes: the rule
@@ -572,41 +617,5 @@ fn the_target_header_is_read_once_a_call_and_only_where_the_document_names_it() 
         assert!(!unnamed.spec().names_target(), "{name}");
         let (read, placed) = reads(unnamed, &[(TARGET, "8")]);
         assert_eq!((read, placed.is_ok()), (0, true), "{name}");
-    }
-}
-
-/// A pair's request is not read for a target: under the stock pair of two
-/// hash rings, whose binding names the target source, a pair that carries
-/// the header is placed on the workers its routing value owns, as it is
-/// without the header, and the header is never read.
-///
-/// The classic router reads the header once a side, each side's policy
-/// over its own workers
-/// (`model_gateway/src/routers/common/placement.rs:2519`, `:2540`,
-/// `:2616`): the engine does not yet.
-#[test]
-fn a_pairs_request_is_not_read_for_a_target() {
-    let document = PolicySpec::pair_presets("consistent_hashing", "consistent_hashing");
-    let engine = hosted(engine_of(&document.expect("the pair presets")));
-    assert!(engine.spec().names_target());
-    let list = pool(2);
-    let members = PublishedList::new(Arc::clone(&list));
-    let classes = PartnerClasses::number(2, [&[0_u32, 1][..], &[0, 1][..]]);
-    let placed = |carried: &[(&str, &str)]| {
-        let headers = Counted::of(carried);
-        let request = PlaceRequest {
-            headers: &headers,
-            ..PlaceRequest::of(MODEL, WorkerLists::Pair(pair_of(&members, &classes)))
-        };
-        let placement = engine.place(&request).expect("a placement");
-        let decode = placement.decode.as_deref().map(worker_id);
-        (headers.reads.get(), placement.id(), decode)
-    };
-    for key in ["talk-1", "talk-2", "talk-3", "talk-4"] {
-        let (_, prefill, decode) = placed(&[(MANUAL_SESSION_HEADER, key)]);
-        for named in ["0", "1", "7"] {
-            let with = placed(&[(MANUAL_SESSION_HEADER, key), (TARGET, named)]);
-            assert_eq!(with, (0, prefill, decode), "{key}, names {named}");
-        }
     }
 }

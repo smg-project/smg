@@ -131,13 +131,13 @@ mod tests {
 
     use super::{router, Admin, VERSION};
     use crate::{
-        document::{spec::BindingSpec, AppliedSpec, PolicySpec},
-        engine::view::{LoadRow, Role},
+        document::{AppliedSpec, PolicySpec},
+        engine::view::Role,
         service::controller::{
             metrics::{LoadTotals, Metrics},
             readiness::{tests::fenced, Phase},
         },
-        store::{LoadSink, LoadSource, MemoryStore, WorkerFacts, WorkersStore},
+        store::{MemoryStore, WorkerFacts, WorkersStore},
     };
 
     async fn get(app: axum::Router, path: &str) -> (StatusCode, String, String) {
@@ -263,17 +263,6 @@ mod tests {
         document.generation = 1;
         document.view.engines = vec!["alpha".to_owned()];
         document.view.zones = vec!["east".to_owned()];
-        let profile = document
-            .profiles
-            .keys()
-            .next()
-            .expect("the preset's profile");
-        // The binding's overload block stands switched on: its pools are
-        // judged at the crate's count of eight queued requests.
-        document.bindings = vec![BindingSpec {
-            profile: Some(profile.clone()),
-            ..BindingSpec::default()
-        }];
         let lists = AppliedSpec::validate(&document).expect("the document validates");
         store.apply(lists).expect("applied");
         let member = |key: &str, engine: &str, zone: &str| WorkerFacts {
@@ -288,7 +277,7 @@ mod tests {
             ..WorkerFacts::default()
         };
 
-        let listed = store.upsert(member("listed", "alpha", "east")).id();
+        store.upsert(member("listed", "alpha", "east"));
         store.publish_now();
         let (_, _, body) = get(app.clone(), "/metrics").await;
         assert!(body.contains("smg_policy_controller_members_outside_list{list=\"engines\"} 0"));
@@ -305,20 +294,7 @@ mod tests {
         assert!(body.contains("smg_policy_controller_members_outside_list{list=\"zones\"} 2"));
         assert!(body.contains("smg_policy_controller_overload_flips_total 0"));
 
-        // A load write that moves the store's own verdict is no flip of the
-        // series: the flips are the load monitor's, read at each scrape.
-        let queue = LoadRow {
-            queued: 9,
-            ..LoadRow::default()
-        };
-        store.report(
-            &[(listed, 0, Some(queue))],
-            Instant::now(),
-            LoadSource::Poll,
-        );
-        assert_eq!(store.stats().overload_flips, 1, "the store's own count");
-        let (_, _, body) = get(app.clone(), "/metrics").await;
-        assert!(body.contains("smg_policy_controller_overload_flips_total 0"));
+        // The flips are the load monitor's, read at each scrape.
         flips.store(3, Ordering::Relaxed);
         let (_, _, body) = get(app, "/metrics").await;
         assert!(body.contains("smg_policy_controller_overload_flips_total 3"));

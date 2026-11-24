@@ -167,15 +167,21 @@ impl<G: Generation> Objects<G> {
 mod tests {
     use std::{cell::Cell, rc::Rc, sync::Arc, time::Duration};
 
-    use smg_worker::{identity::basic::Worker, worker::WorkerStatus as ObjectStatus};
+    use smg_worker::{
+        identity::basic::Worker, kv_events::port::BatchOutcome, registry::WorkerRegistry,
+        worker::WorkerStatus as ObjectStatus,
+    };
 
     use super::{
-        super::write::tests::{facts, Replica, A},
+        super::{
+            tests::one_block,
+            write::tests::{facts, Replica, A},
+        },
         *,
     };
     use crate::{
-        store::{memory::seam, WorkerFacts, WorkerStatus, WorkersStore},
-        worker_host::Members,
+        store::{memory::seam, Signals, WorkerFacts, WorkerStatus, WorkersStore},
+        worker_host::{KvTables, Members},
     };
 
     const B: &str = "http://b:8000";
@@ -244,6 +250,40 @@ mod tests {
         assert_eq!(standby.store.by_key(A), None);
         assert_eq!(standby.object(A), None);
         assert!(standby.objects.is_empty());
+    }
+
+    /// A write call asks no term, so a host that does not lead must not
+    /// call one. Where it does, the write lands in its own store alone: its
+    /// leader's next event no longer fits that store and lays nothing, and
+    /// the leader's snapshot takes the write back.
+    #[test]
+    fn a_standbys_own_write_is_lost_at_its_leaders_next_snapshot() {
+        let (leader, standby) = (Replica::new(), Replica::new());
+        leader.upsert(facts(1, "gold"));
+        follow(&standby, &leader);
+        // The standby's own write, which no leader told.
+        let own = WorkerFacts {
+            key: B.to_owned(),
+            engine: B.to_owned(),
+            ..facts(1, "iron")
+        };
+        assert!(standby.upsert(own).is_some());
+        assert!(standby.object(B).is_some());
+        // The leader's next event comes at the leader's epoch.
+        leader.upsert(facts(1, "iron"));
+        let (change, row) = told(&leader);
+        let epoch = leader.store.epoch();
+        let (store, objects) = (&standby.store, &standby.objects);
+        assert!(!objects.follow_at(store, at(epoch), epoch, change, row));
+        let stale = store.by_key(A).expect("the row stands");
+        assert_eq!(stale.revision, 1, "nothing of the event is laid");
+        // The applier starts again from the leader's snapshot.
+        assert!(objects.restore_from(store, leader.store.checkpoint()));
+        assert_eq!(standby.object(B), None, "the standby's own write is gone");
+        assert_eq!(store.by_key(B), None);
+        let object = standby.object(A).expect("the leader's row has its object");
+        assert_eq!(objects.row_of(&object), leader.store.by_key(A));
+        assert_eq!(objects.len(), 1);
     }
 
     /// The locks in their order. Behind the store's write of an event and
@@ -538,5 +578,106 @@ mod tests {
         assert!(watching.object(B).is_some(), "the row the snapshot brings");
         assert_eq!(objects.len(), 2);
         assert_eq!(objects.read_to(), Some(told.store.epoch()));
+    }
+
+    /// A leader, and a standby whose holder was handed the KV tables that
+    /// come back beside them.
+    fn tabled() -> (Replica, Replica, Arc<KvTables>) {
+        let tables = Arc::new(KvTables::default());
+        let mut standby = Replica::new();
+        standby.objects =
+            Objects::new(Arc::new(WorkerRegistry::new())).with_kv_tables(Arc::clone(&tables));
+        (Replica::new(), standby, tables)
+    }
+
+    /// [`facts`] of the row at `key`, whose signals ask for cache events
+    /// where `events` says so.
+    fn asking(key: &str, events: bool) -> WorkerFacts {
+        WorkerFacts {
+            key: key.to_owned(),
+            engine: key.to_owned(),
+            signals: Signals {
+                events,
+                ..Signals::default()
+            },
+            ..facts(1, "gold")
+        }
+    }
+
+    /// A standby's holder that was handed KV tables keeps a lane for each
+    /// row that asks for cache events, where its leader's event is told. A
+    /// row told quiet in place gives its lane up, one told asking again
+    /// takes one, and a row told gone holds none.
+    #[test]
+    fn a_standbys_holder_keeps_a_lane_for_each_told_row_that_asks_for_events() {
+        let (leader, standby, tables) = tabled();
+        let lane = |id| tables.holds_lane(id, 0);
+        leader.upsert(asking(A, true));
+        follow(&standby, &leader);
+        let row = leader.store.by_key(A).expect("the leader's row").id;
+        assert!(lane(row), "a told row that asks");
+        leader.upsert(asking(A, false));
+        follow(&standby, &leader);
+        assert!(!lane(row), "told quiet in place");
+        leader.upsert(asking(A, true));
+        follow(&standby, &leader);
+        assert!(lane(row), "told asking again");
+        let stands = leader.store.by_key(A).expect("the leader's row");
+        assert_eq!(stands.id, row, "in place");
+        let removed = leader
+            .objects
+            .remove(&leader.store, stands.id, stands.revision);
+        assert_eq!(removed, Some(MembershipChange::Removed { id: row }));
+        follow(&standby, &leader);
+        assert!(!lane(row), "told gone");
+        assert_eq!(tables.lanes(), 0);
+    }
+
+    /// A cut laid whole leaves a lane for each of its rows that asks for
+    /// cache events, by a restore and by a watch's snapshot, and a row the
+    /// cut drops holds none. A row that stays through the next cut keeps the
+    /// blocks this replica heard for it: they are the replica's own, in no
+    /// cut, so a lay that made its lane again would lose them.
+    #[test]
+    fn a_cut_laid_whole_leaves_a_lane_for_each_row_that_asks_for_events() {
+        type Lay = fn(&Objects<Members>, &MemoryStore, StoreCheckpoint) -> bool;
+        let lays: [(&str, Lay); 2] = [
+            ("a restore", |objects, store, cut| {
+                objects.restore_from(store, cut)
+            }),
+            ("a watch's snapshot", |objects, store, cut| {
+                objects.watch_from(store, cut)
+            }),
+        ];
+        for (name, lay) in lays {
+            let (leader, standby, tables) = tabled();
+            let lane = |id| tables.holds_lane(id, 0);
+            // A row of the standby's own, which the cut drops.
+            standby.upsert(asking(B, true));
+            let dropped = standby.store.by_key(B).expect("its own row").id;
+            assert!(lane(dropped), "{name}");
+            leader.upsert(asking(A, true));
+            leader.upsert(asking("http://c:8000", false));
+            let cut = leader.store.checkpoint();
+            assert!(lay(&standby.objects, &standby.store, cut), "{name}");
+            let asks = leader.store.by_key(A).expect("the cut's row").id;
+            assert!(lane(asks), "{name}: a row of the cut that asks");
+            assert!(!lane(dropped), "{name}: a row the cut drops");
+            assert_eq!(tables.lanes(), 1, "{name}: the quiet row holds none");
+            // The replica hears one block of the row, and the leader's next
+            // cut brings one row more: the row that stays keeps its block.
+            let heard = one_block(&tables, asks, 1);
+            assert_eq!(heard, BatchOutcome::Applied, "{name}");
+            assert_eq!(tables.indexed_blocks(asks, 0), 1, "{name}");
+            leader.upsert(asking("http://d:8000", true));
+            let next = leader.store.checkpoint();
+            assert!(lay(&standby.objects, &standby.store, next), "{name}");
+            assert_eq!(tables.lanes(), 2, "{name}: the row the next cut brings");
+            let kept = tables.indexed_blocks(asks, 0);
+            assert_eq!(
+                kept, 1,
+                "{name}: the lane of a row that stays was made again"
+            );
+        }
     }
 }

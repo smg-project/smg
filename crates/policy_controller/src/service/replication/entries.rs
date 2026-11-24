@@ -21,13 +21,10 @@ pub enum EntryReplication {
 }
 
 const HELLO: &str = "a gateway's own fact: it returns in the gateway's hello";
-const SUBSCRIPTION: &str = "each replica hears the engines' cache events itself";
 const DISPATCHED: &str = "a new leader reads dispatched leases from the engines' in-flight \
                           snapshots and rebuilds credits from its own tally";
 const LEASES: &str = "no journal entry carries a reservation, an issue or a lease's end yet";
 const PUBLISHED: &str = "every replica publishes its own world";
-const REPORTED: &str = "a host's own writer states the values again at each engine's next \
-                        load report, and a controller's serve writes none";
 
 /// The list: `(trait or type, entry, fate)`, each in its file's own order.
 pub const ENTRIES: &[(&str, &str, EntryReplication)] = &[
@@ -60,64 +57,6 @@ pub const ENTRIES: &[(&str, &str, EntryReplication)] = &[
         EntryReplication::Rebuilt(HELLO),
     ),
     ("HealthSink", "vetoed", EntryReplication::Read),
-    // A log carries no load row: a standby holds none of its leader's and
-    // no overload verdict. Its first poll goes out at its take.
-    ("LoadSink", "record", EntryReplication::Rebuilt(REPORTED)),
-    ("LoadSink", "report", EntryReplication::Rebuilt(REPORTED)),
-    (
-        "LoadSink",
-        "report_sampled",
-        EntryReplication::Rebuilt(REPORTED),
-    ),
-    ("LoadSink", "poll_mode", EntryReplication::Read),
-    // The report period is the setting of a host's own writer of load
-    // rows, told where that writer is built.
-    (
-        "LoadSink",
-        "heard_every",
-        EntryReplication::Rebuilt("a host's own writer of load rows tells its report period"),
-    ),
-    ("LoadSink", "load", EntryReplication::Read),
-    ("LoadSink", "ranks", EntryReplication::Read),
-    // A host's own writer drops the rows it wrote: each replica's own
-    // rows, and a standby holds none.
-    (
-        "LoadSink",
-        "evict",
-        EntryReplication::Rebuilt("each replica drops its own load rows"),
-    ),
-    (
-        "KvEventSink",
-        "admit_through",
-        EntryReplication::Rebuilt(SUBSCRIPTION),
-    ),
-    (
-        "KvEventSink",
-        "reconnected",
-        EntryReplication::Rebuilt(SUBSCRIPTION),
-    ),
-    (
-        "KvEventSink",
-        "resync",
-        EntryReplication::Rebuilt(SUBSCRIPTION),
-    ),
-    ("KvEventSink", "cursor", EntryReplication::Read),
-    (
-        "KvEventSink",
-        "removed",
-        EntryReplication::Rebuilt(SUBSCRIPTION),
-    ),
-    ("KvEventSink", "block_size", EntryReplication::Read),
-    (
-        "KvEventSink",
-        "set_block_size",
-        EntryReplication::Rebuilt(SUBSCRIPTION),
-    ),
-    (
-        "KvEventSink",
-        "forget_block_size",
-        EntryReplication::Rebuilt(SUBSCRIPTION),
-    ),
     ("ReservationStore", "window", EntryReplication::Read),
     (
         "ReservationStore",
@@ -215,13 +154,9 @@ pub const ENTRIES: &[(&str, &str, EntryReplication)] = &[
     ),
     ("MemoryStore", "wake_with", EntryReplication::Read),
     ("MemoryStore", "stats", EntryReplication::Read),
-    ("MemoryStore", "overload_flips", EntryReplication::Read),
     ("MemoryStore", "outside_lists", EntryReplication::Read),
     ("MemoryStore", "publications", EntryReplication::Read),
     ("MemoryStore", "membership_builds", EntryReplication::Read),
-    ("MemoryStore", "resyncs", EntryReplication::Read),
-    ("MemoryStore", "indexed_blocks", EntryReplication::Read),
-    ("MemoryStore", "unindexed_rows", EntryReplication::Read),
 ];
 
 #[cfg(test)]
@@ -229,11 +164,9 @@ mod tests {
     use super::*;
 
     /// The store's ingress traits, each with its file's text.
-    const TRAITS: [(&str, &str); 6] = [
+    const TRAITS: [(&str, &str); 4] = [
         ("WorkersStore", include_str!("../../store/workers.rs")),
         ("HealthSink", include_str!("../../store/health.rs")),
-        ("LoadSink", include_str!("../../store/loads.rs")),
-        ("KvEventSink", include_str!("../../store/kv_events.rs")),
         (
             "ReservationStore",
             include_str!("../../store/reservations.rs"),

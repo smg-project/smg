@@ -153,8 +153,9 @@ pub struct WorkerFacts {
     pub pairing: Option<Arc<PairingDescriptor>>,
     /// The worker's end of the encode handoff, as the handshake learned it;
     /// the default states none. A worker host derives its encode classes
-    /// from it, with the engine kind as the runtime (`encoding`). The door
-    /// drops a blank connector and reads its name past its blanks.
+    /// from it by the engine's rule, with the engine kind as the runtime
+    /// ([`EncodeClasses`](crate::engine::EncodeClasses)). The door drops a
+    /// blank connector and reads its name past its blanks.
     pub encode: EncodeOffer,
     /// The worker takes images, as its registration states: an encoder
     /// encodes them and a decode attends to them. A request that needs

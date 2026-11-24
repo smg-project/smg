@@ -30,7 +30,7 @@ use openai_protocol::{
 use tracing::warn;
 
 use crate::routers::{
-    common::responses_compat::format_agent_message_text,
+    common::responses_compat::{format_agent_message_text, lower_call_id_less_tool_output_parts},
     grpc::common::responses::{
         history::hosted_call_result,
         streaming::OutputItemKind,
@@ -194,7 +194,10 @@ fn push_item(
     item: &ResponseInputOutputItem,
 ) -> Result<(), ConversionError> {
     match item {
-        ResponseInputOutputItem::AdditionalTools { .. } => {}
+        ResponseInputOutputItem::AdditionalTools { .. }
+        | ResponseInputOutputItem::ToolSearchCall { .. }
+        | ResponseInputOutputItem::ToolSearchOutput { .. }
+        | ResponseInputOutputItem::WebSearchCall { .. } => {}
         ResponseInputOutputItem::AgentMessage {
             author,
             recipient,
@@ -260,17 +263,30 @@ fn push_item(
             }
         }
         ResponseInputOutputItem::FunctionCallOutput {
-            call_id, output, ..
+            call_id,
+            name,
+            namespace,
+            output,
+            ..
         } => {
-            // Function call output - add as tool message
-            // Note: The function name is looked up from prev_outputs in Harmony path
-            // For Chat path, we just use the call_id
-            messages.push(tool_result(
-                call_id,
-                output
-                    .to_text_only()
-                    .map_err(ConversionError::UnsupportedToolOutput)?,
-            ));
+            if let Some(call_id) = call_id.as_deref().filter(|id| !id.is_empty()) {
+                // Function call output - add as tool message
+                // Note: The function name is looked up from prev_outputs in Harmony path
+                // For Chat path, we just use the call_id
+                messages.push(tool_result(
+                    call_id,
+                    output
+                        .to_text_only()
+                        .map_err(ConversionError::UnsupportedToolOutput)?,
+                ));
+            } else {
+                let parts = lower_call_id_less_tool_output_parts(
+                    name.as_deref(),
+                    namespace.as_deref(),
+                    output.clone(),
+                );
+                push_role_message(messages, "user", response_parts_to_message_content(&parts)?)?;
+            }
         }
         // A hosted tool call of a stored turn replays as the
         // assistant's call and, once it ran, its result: the
@@ -351,6 +367,11 @@ fn push_item(
         ResponseInputOutputItem::LocalShellCall { .. }
         | ResponseInputOutputItem::LocalShellCallOutput { .. } => {
             return unsupported(None);
+        }
+        ResponseInputOutputItem::Program { .. } | ResponseInputOutputItem::ProgramOutput { .. } => {
+            return unsupported(Some(
+                "Programmatic tool calling item reached chat conversion",
+            ));
         }
     }
     Ok(())
@@ -1475,6 +1496,7 @@ mod tests {
             input: ResponseInput::Items(vec![ResponseInputOutputItem::FunctionToolCall {
                 id: Some("fc_item_id".to_string()),
                 call_id: "call_tool_id".to_string(),
+                caller: None,
                 name: "lookup".to_string(),
                 namespace: Some("weather".to_string()),
                 arguments: "{\"q\":\"rust\"}".to_string(),
@@ -1759,15 +1781,17 @@ mod tests {
         // sibling hosted-tool items (Computer/Shell/Custom/ApplyPatch).
         let req = ResponsesRequest {
             input: ResponseInput::Items(vec![ResponseInputOutputItem::ImageGenerationCall {
-                id: "ig_test".to_string(),
+                id: Some("ig_test".to_string()),
                 action: None,
                 background: None,
+                error: None,
                 output_format: None,
                 quality: None,
                 result: Some("base64data".to_string()),
                 revised_prompt: Some("a cat".to_string()),
                 size: None,
                 status: None,
+                svg_usage: None,
             }]),
             ..Default::default()
         };

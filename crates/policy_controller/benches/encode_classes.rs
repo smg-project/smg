@@ -6,16 +6,20 @@
 //!   and the prefills;
 //! - `policy_encodes/membership_write/<fleet>/<n>`: one membership write of
 //!   a store that holds the fleet: a registration refreshed with the facts
-//!   it had, every pool derived again, the classes carried, and published;
+//!   it had, every pool derived again, the pair classes carried, and
+//!   published;
 //! - `policy_encodes/moved_write/<fleet>/<n>`: the same write where the
-//!   registration states another runtime each time: the model's classes,
-//!   the pair classes and the encode classes, are derived;
+//!   registration states another runtime each time: the pair classes are
+//!   derived for that worker;
 //! - `policy_encodes/decode_write/<fleet>/<n>`: the same write where the
 //!   first decode states another runtime each time: the pair classes are
-//!   derived for that decode and the encode classes are carried;
+//!   derived for that decode;
 //! - `policy_encodes/models_write/apart/<models>`: the moved write over
-//!   that many models, each of the fleet `apart` at 64: one model's
-//!   classes are derived and the others' are carried.
+//!   that many models, each of the fleet `apart` at 64: the pair classes
+//!   are derived for that worker in its model and carried in every other.
+//!
+//! A store derives no encode class: the four write cells say what a
+//! membership write costs over a fleet that holds encoders.
 //!
 //! The fleets, each of one runtime and one wire:
 //!
@@ -42,11 +46,8 @@ use std::hint::black_box;
 
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
 use smg_policy_controller::{
-    engine::{Role, WireModes},
-    store::{
-        EncodeClasses, EncodeHandoff, EncodeMember, EncodeOffer, MemoryStore, WorkerFacts,
-        WorkersStore,
-    },
+    engine::{EncodeClasses, EncodeMember, Role, WireModes},
+    store::{EncodeHandoff, EncodeOffer, MemoryStore, WorkerFacts, WorkersStore},
 };
 
 const SIZES: [usize; 3] = [8, 64, 512];
@@ -166,7 +167,7 @@ fn derivation(c: &mut Criterion) {
     group.finish();
 }
 
-/// A membership write that moves no offer: the classes are carried.
+/// A membership write that moves no offer: the pair classes are carried.
 fn membership_write(c: &mut Criterion) {
     let mut group = c.benchmark_group("policy_encodes/membership_write");
     for name in FLEETS {
@@ -191,7 +192,8 @@ fn membership_write(c: &mut Criterion) {
 }
 
 /// A membership write that moves an offer: the first prefill registers with
-/// another runtime each time, so every write derives the model's classes.
+/// another runtime each time, so every write derives that prefill's pair
+/// classes.
 fn moved_write(c: &mut Criterion) {
     let mut group = c.benchmark_group("policy_encodes/moved_write");
     for name in FLEETS {
@@ -228,8 +230,8 @@ fn moved_write(c: &mut Criterion) {
 }
 
 /// A membership write that moves an offer the encode handoff does not read:
-/// the first decode registers with another runtime each time, so the
-/// model's encode classes are carried.
+/// the first decode registers with another runtime each time, so every
+/// write derives that decode's pair classes.
 fn decode_write(c: &mut Criterion) {
     let mut group = c.benchmark_group("policy_encodes/decode_write");
     for name in FLEETS {
@@ -269,7 +271,7 @@ fn decode_write(c: &mut Criterion) {
 /// A membership write that moves an offer in one model of several: the
 /// first prefill of the first model registers with another runtime each
 /// time. Every model holds the fleet `apart` at 64, so the write derives
-/// one model's encode classes and carries the others'.
+/// that prefill's pair classes in its model and carries the others'.
 fn models_write(c: &mut Criterion) {
     let mut group = c.benchmark_group("policy_encodes/models_write");
     for models in [1, 8] {

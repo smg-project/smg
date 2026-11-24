@@ -70,8 +70,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[cfg(feature = "client")]
-use crate::service::client::{wire, DecisionUnavailable, Error, Link};
 use crate::{
     engine::{
         decision::{Decision, Target},
@@ -84,6 +82,17 @@ use crate::{
     store::GatewayId,
     tracking::lease::{
         Dispatch, Lease, LeaseId, Outcome, ReleaseReason, Said, Side, TransportClass,
+    },
+};
+#[cfg(feature = "client")]
+use crate::{
+    engine::{
+        framework::{EncodeItems, EncodePlaced},
+        view::Phase,
+    },
+    service::{
+        client::{wire, DecisionUnavailable, Error, Link},
+        proto,
     },
 };
 
@@ -184,6 +193,11 @@ pub struct DecisionGuard<D: Deref<Target: DecisionEngine>> {
     /// chosen. A decode that owes a dispatch or an end was then picked by
     /// a decode call, and was issued with its prefill otherwise.
     later: bool,
+    /// Whether a stage of the document the decision was made under takes
+    /// an end, as the call that placed the request stated it
+    /// ([`Self::set_takes_end`]). `false` where no call stated it.
+    #[cfg(feature = "in-process")]
+    takes_end: bool,
     /// The three sizes the decode side's words state: the lease's own, and
     /// a decode call's from the call that picks the side. Nothing reads a
     /// single's.
@@ -293,6 +307,8 @@ impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
             decided,
             index: 0,
             later,
+            #[cfg(feature = "in-process")]
+            takes_end: false,
             stated,
             target,
             owed,
@@ -560,6 +576,25 @@ impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
     #[must_use]
     pub(crate) fn later_ended(&self) -> bool {
         self.later && !self.owes()
+    }
+
+    /// States whether a stage of the document the decision was made under
+    /// takes an end. The call that places a request states it of the
+    /// document it decided under, and the split of the placement reads it
+    /// ([`Self::takes_end`]).
+    #[cfg(feature = "in-process")]
+    pub(crate) fn set_takes_end(&mut self, takes: bool) {
+        self.takes_end = takes;
+    }
+
+    /// Whether a stage of the document the decision was made under takes
+    /// an end ([`Self::set_takes_end`]). A document put in force since the
+    /// decision changes nothing here: a word of the handle's lease goes to
+    /// the stages that stood at its issue.
+    #[cfg(feature = "in-process")]
+    #[must_use]
+    pub(crate) fn takes_end(&self) -> bool {
+        self.takes_end
     }
 
     /// The engine of this process the handle decides by. `None` for a
@@ -884,6 +919,107 @@ impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
         now: Instant,
         budget: Duration,
     ) -> Result<Self, DecisionUnavailable> {
+        Self::asked_naming(link, request, None, now, budget).await
+    }
+
+    /// [`Self::asked`] for a request that may name its worker. `named` is
+    /// what the target source of the request's binding answered for it
+    /// ([`KeySources::target`](crate::document::KeySources::target)), which
+    /// its host reads once, where it derives the request's keys: the
+    /// number, `Some(None)` for a text that is no number, and `None` for a
+    /// request that names no worker, which is asked as [`Self::asked`]
+    /// asks it.
+    ///
+    /// The frame states the number (`DecideRequest.named_worker`). The
+    /// controller counts it over its own list, from 0 and in that list's
+    /// order, among the workers this gateway can be sent to: by its reach
+    /// and wires, its standing vetoes, and each worker's own test of being
+    /// available. The decision is held to the worker the number reaches,
+    /// and the answer names that worker or sheds the request with no
+    /// endpoint. The frame names `target-worker` for that shed, and this
+    /// handle reads it as `controller`, as it reads every shed's stage.
+    /// Where this gateway can be sent to no worker of the list, the request
+    /// is decided as one that names no worker, with neither its session
+    /// key nor its client's key, and the answer is that decision's. A
+    /// controller older than the field reads none, and places the request
+    /// by the rest of its document.
+    ///
+    /// Only a frame decided over one list is read for the number: a single
+    /// request's, and one that stands alone at a side's phase. A pair's
+    /// frame is decided as one that names no worker, and its pick need not
+    /// be the worker the number names.
+    ///
+    /// The host's own rule for a worker is not asked there, and the
+    /// controller's list need not stand in the order of the host's own. A
+    /// host that decides by itself for lack of an answer counts over its
+    /// own list, by its own rule.
+    ///
+    /// # Errors
+    ///
+    /// Those of [`Self::asked`].
+    pub async fn asked_naming(
+        link: &Link,
+        request: &Request<'_>,
+        named: Option<Option<u32>>,
+        now: Instant,
+        budget: Duration,
+    ) -> Result<Self, DecisionUnavailable> {
+        Self::sendable(request)?;
+        Self::answered(link, wire::request(request, named), now, budget, |_, _| {
+            Ok(())
+        })
+        .await
+    }
+
+    /// [`Self::asked`] for an encode request, its pair's one request: the
+    /// frame states its `items`, and `placed` takes each item's encoder
+    /// from the answer, in the keys' order. The two are the arguments the
+    /// engine's entry takes in process
+    /// ([`PolicyEngine::decide_encode_at`](crate::engine::PolicyEngine::decide_encode_at)),
+    /// and the handle is a pair's: no lease is an encoder's.
+    ///
+    /// `request` is at the prefill phase, as that entry asks. `placed` is
+    /// emptied at each ask and stays empty unless a pick is read. A linked
+    /// encoder names its worker and its rank
+    /// ([`EncodePlaced::encoders`]).
+    ///
+    /// A ring lent for the items ([`EncodeItems::ring`]) does not cross:
+    /// a frame states none, as it states none of the request's own, and
+    /// the controller places each key by the ring its own stage keeps.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::asked`]. A request of another phase is answered
+    /// [`DecisionUnavailable::Unsent`] with [`Error::OutOfRange`] before
+    /// anything is sent, as the door in process refuses a side sent on
+    /// its own. An answer whose encoders are not one where it says so,
+    /// else one a key, or that names a pair on an encoder, is one the
+    /// handle cannot read.
+    pub async fn asked_encode(
+        link: &Link,
+        request: &Request<'_>,
+        items: EncodeItems<'_>,
+        placed: &mut EncodePlaced,
+        now: Instant,
+        budget: Duration,
+    ) -> Result<Self, DecisionUnavailable> {
+        placed.clear();
+        Self::sendable(request)?;
+        if request.facts.phase != Phase::Prefill {
+            return Err(DecisionUnavailable::Unsent(Error::OutOfRange(
+                "facts.phase",
+            )));
+        }
+        let asked = wire::encode_request(request, items);
+        let beside = |told: Option<&proto::EncodePlaced>, decision: &Decision| {
+            wire::placed(told, decision, &items, placed)
+        };
+        Self::answered(link, asked, now, budget, beside).await
+    }
+
+    /// What a handle refuses of a request before anything is sent: a
+    /// budget of 0, and a hard demand.
+    fn sendable(request: &Request<'_>) -> Result<(), DecisionUnavailable> {
         if request.facts.budget_micros == 0 {
             return Err(DecisionUnavailable::Late);
         }
@@ -892,9 +1028,23 @@ impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
                 "constraints.demands",
             )));
         }
-        let (asked, left_out) = wire::request(request);
-        let told = link.ask_cut(asked, left_out, budget).await?;
-        match wire::decided(&told, now) {
+        Ok(())
+    }
+
+    /// The frame `asked` sent over `link` and its answer held. `beside`
+    /// reads what the answer carries beside its decision. An answer that
+    /// it, or the handle, cannot read has its leases released as late.
+    async fn answered(
+        link: &Link,
+        (asked, left_out): (proto::DecideRequest, usize),
+        now: Instant,
+        budget: Duration,
+        beside: impl FnOnce(Option<&proto::EncodePlaced>, &Decision) -> Result<(), wire::Unread>,
+    ) -> Result<Self, DecisionUnavailable> {
+        let (told, encode) = link.ask_cut(asked, left_out, budget).await?;
+        let read = wire::decided(&told, now)
+            .and_then(|decided| beside(encode.as_ref(), &decided.decision).map(|()| decided));
+        match read {
             // No link's request asks its decode later: both sides are issued.
             Ok(decided) => Ok(Self::hold(
                 Arm::Link(Box::new(link.clone())),
@@ -1525,10 +1675,14 @@ mod tests {
 
         use super::{
             outcome, stated, DecisionGuard, DecisionRefused, DecodeRefused, Duration, Instant,
-            PolicyEngine, Request, Side, TransportClass, WorkerId, PATIENCE,
+            PolicyEngine, Request, Side, Target, TransportClass, WorkerId, PATIENCE,
         };
         use crate::{
-            engine::Demands,
+            engine::{
+                framework::{EncodeItems, EncodePlaced},
+                view::{Identity, Phase},
+                Demands,
+            },
             service::{
                 client::{poll, DecisionUnavailable, Error, Peer},
                 proto::{
@@ -2089,6 +2243,190 @@ mod tests {
                 "{answer:?}"
             );
             assert_eq!(tokio::time::Instant::now(), before);
+        }
+
+        /// Where an answer puts two items: the workers 9 and 4, in that
+        /// order.
+        fn two_encoders() -> proto::EncodePlaced {
+            let encoder = |id| proto::Target {
+                id,
+                dp_rank: 1,
+                pair: None,
+            };
+            proto::EncodePlaced {
+                encoders: vec![encoder(9), encoder(4)],
+                one: false,
+            }
+        }
+
+        /// [`answered`] for an encode request of `phase` with `items`,
+        /// whose room is `placed`: the frame that went out, and the handle.
+        /// The peer answers `told`, with `beside` for where the items go.
+        async fn encode_answered(
+            peer: &mut Peer,
+            (phase, items): (Phase, EncodeItems<'_>),
+            placed: &mut EncodePlaced,
+            told: proto::Decision,
+            beside: Option<proto::EncodePlaced>,
+        ) -> (
+            proto::DecideRequest,
+            Result<DecisionGuard<&'static PolicyEngine>, DecisionUnavailable>,
+        ) {
+            let mut ask = stated(&[1]);
+            ask.facts.budget_micros = 200_000;
+            ask.facts.phase = phase;
+            peer.read_hello().await;
+            let link = peer.link.clone();
+            let exchange = async {
+                let sent = peer.requests.next().await.expect("an ask went out");
+                peer.answer_beside(1, link.term_floor(), Answer::Decision(told), beside);
+                sent
+            };
+            let both = async {
+                let now = Instant::now();
+                let held = pin!(DecisionGuard::asked_encode(
+                    &link, &ask, items, placed, now, PATIENCE
+                ));
+                tokio::join!(exchange, held)
+            };
+            timeout(PATIENCE, both).await.expect("an answer came back")
+        }
+
+        /// An encode request over a link is its pair's one request. Its
+        /// frame states the encode phase and its items, a key that is none
+        /// at its place. The handle is a pair's, and the host's room takes
+        /// each item's encoder in the keys' order, by its worker and its
+        /// rank. The room is emptied at the ask: an earlier answer's
+        /// encoders are gone.
+        #[tokio::test(start_paused = true)]
+        async fn a_linked_encode_request_states_its_items_and_takes_its_encoders() {
+            let mut peer = Peer::new(1);
+            let keys = [Identity::hashed(11), Identity::NONE];
+            let items = EncodeItems {
+                keys: &keys,
+                references: true,
+                ..EncodeItems::default()
+            };
+            let mut placed = EncodePlaced::new();
+            placed.room(true).extend([Target::default(); 3]);
+            let asked = (Phase::Prefill, items);
+            let beside = Some(two_encoders());
+            let (sent, handle) =
+                encode_answered(&mut peer, asked, &mut placed, paired(), beside).await;
+            let facts = sent.facts.expect("request facts");
+            assert_eq!(facts.phase, i32::from(proto::Phase::Encode));
+            let stated = sent.encode.expect("the frame states its items");
+            let forms: Vec<_> = stated.keys.iter().map(|key| key.form.clone()).collect();
+            assert_eq!(forms, [Some(proto::identity::Form::Hash(11)), None]);
+            assert!(stated.references && !stated.decode_images && stated.one.is_none());
+
+            let handle = handle.expect("a pair's handle");
+            let lease = handle.lease().expect("the pair's lease");
+            assert_eq!((lease.lease.id.0, lease.lease.side), (73, Side::Prefill));
+            let named = |id| Target {
+                id: WorkerId(id),
+                dp_rank: 1,
+                ..Target::default()
+            };
+            assert_eq!(placed.encoders(), [named(9), named(4)]);
+            assert!(!placed.one());
+        }
+
+        /// The engine's entry takes an encode request at the prefill phase
+        /// and refuses any other as a side sent on its own. The handle
+        /// refuses it by the field before anything is sent, with what
+        /// [`DecisionGuard::asked`] refuses: no credit goes, no time
+        /// passes, and the room is emptied.
+        #[tokio::test(start_paused = true)]
+        async fn a_linked_encode_request_the_handle_refuses_sends_nothing() {
+            let mut peer = Peer::new(1);
+            let demand = Demands {
+                runtime: 7,
+                ..Demands::default()
+            };
+            let asks = [
+                (Phase::Single, 200_000, Demands::default(), "facts.phase"),
+                (Phase::Decode, 200_000, Demands::default(), "facts.phase"),
+                (Phase::Encode, 200_000, Demands::default(), "facts.phase"),
+                (Phase::Prefill, 200_000, demand, "constraints.demands"),
+                (Phase::Prefill, 0, Demands::default(), ""),
+            ];
+            let before = tokio::time::Instant::now();
+            for (phase, budget_micros, demands, field) in asks {
+                let mut ask = stated(&[1]);
+                ask.facts.budget_micros = budget_micros;
+                ask.facts.phase = phase;
+                ask.constraints.demands = demands;
+                let mut placed = EncodePlaced::new();
+                placed.room(true).push(Target::default());
+                let answer = timeout(
+                    PATIENCE,
+                    pin!(DecisionGuard::<&PolicyEngine>::asked_encode(
+                        &peer.link,
+                        &ask,
+                        EncodeItems::default(),
+                        &mut placed,
+                        Instant::now(),
+                        PATIENCE
+                    )),
+                )
+                .await
+                .expect("the ask returns");
+                let refused = match &answer {
+                    Err(DecisionUnavailable::Unsent(Error::OutOfRange(named))) => *named == field,
+                    Err(DecisionUnavailable::Late) => field.is_empty(),
+                    _ => false,
+                };
+                assert!(refused, "{phase:?} {field}: {answer:?}");
+                assert!(placed.encoders().is_empty() && !placed.one());
+            }
+            assert_eq!(tokio::time::Instant::now(), before);
+            assert!(
+                poll(pin!(peer.requests.next())).is_pending(),
+                "nothing went out"
+            );
+        }
+
+        /// An answer whose encoders do not fit its request is one the
+        /// handle cannot read: a pick that names no encoder for its keys,
+        /// a count that is not one a key, an encoder that names a pair.
+        /// Its pair's lease is released late, whole, as any unreadable
+        /// pair's is, and the room is left empty.
+        #[tokio::test(start_paused = true)]
+        async fn an_encode_answer_the_handle_cannot_read_is_released_late() {
+            let short = proto::EncodePlaced {
+                encoders: two_encoders().encoders[..1].to_vec(),
+                ..two_encoders()
+            };
+            let mut paired_encoder = two_encoders();
+            paired_encoder.encoders[1].pair = Some(proto::Pair::default());
+            for (beside, path) in [
+                (None, "encode:"),
+                (Some(short), "encode.encoders:"),
+                (Some(paired_encoder), "encode.encoders.pair:"),
+            ] {
+                let mut peer = Peer::new(1);
+                let keys = [Identity::hashed(11), Identity::hashed(12)];
+                let items = EncodeItems {
+                    keys: &keys,
+                    ..EncodeItems::default()
+                };
+                let mut placed = EncodePlaced::new();
+                let asked = (Phase::Prefill, items);
+                let (_, answer) =
+                    encode_answered(&mut peer, asked, &mut placed, paired(), beside).await;
+                assert!(
+                    matches!(&answer, Err(DecisionUnavailable::Unsent(Error::NoDecision(why))) if why.starts_with(path)),
+                    "{path} {answer:?}"
+                );
+                assert!(placed.encoders().is_empty() && !placed.one());
+                reports(
+                    &mut peer,
+                    [released(proto::Side::Unspecified, Reason::LateDecision)],
+                )
+                .await;
+                assert!(peer.link.stands());
+            }
         }
 
         /// Over a link a budget of 0 says the request's time is spent, and
