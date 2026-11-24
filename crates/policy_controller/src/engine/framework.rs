@@ -876,21 +876,6 @@ pub struct Profile {
 }
 
 impl Profile {
-    /// Whether a pick of this profile stands while its worker does: the
-    /// profile holds no scorer, and each pick of its picker takes a turn
-    /// ([`Picker::takes_turns`]). Decided again, such a profile would spend
-    /// a second turn for one request, and move the request by nothing its
-    /// workers show. So a pair's decode decided again keeps the decode of
-    /// its first decision ([`Engine::decide_decode`]). The engine keeps it
-    /// too under a scorer the picker does not read
-    /// ([`Picker::picks_alone`]): this answer is the unscored profile's
-    /// alone. Every other profile decides again, on the workers as they
-    /// stand at that call.
-    #[must_use]
-    pub fn keeps_its_pick(&self) -> bool {
-        self.scorers.is_empty() && self.picker.takes_turns()
-    }
-
     /// What this profile's stages read from the host beyond the facts every
     /// view carries: every stage of every kind, so a stage that reads the
     /// affinity column as a filter or as the picker counts as one that
@@ -7633,7 +7618,7 @@ impl Engine {
     ///
     /// `first_decode` is the worker and the rank of the decode the pair's
     /// first decision named, where the caller holds them. Under a decode
-    /// profile that keeps its pick ([`Profile::keeps_its_pick`]) the call
+    /// profile that holds no scorer and whose picker takes turns, the call
     /// answers that decode first while the profile's filters keep it, the
     /// decodes they keep behind it as its alternates, and the picker is not
     /// asked: a second pick would turn a rotation a second time for one
