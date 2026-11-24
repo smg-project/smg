@@ -785,8 +785,8 @@ fn a_readers_refusal_names_the_field_it_refused() {
     assert_eq!(path(json, Format::Json), "profiles.default.pick");
     assert_eq!(path("profiles: [", Format::Yaml), "");
     assert_eq!(path("7", Format::Json), "");
-    // No values, and values that read (a key written twice keeps its
-    // last): the refusal stays the typed read's, about the document.
+    // No values, and a key written twice: the refusal is the read of
+    // the values' own, about the document.
     assert_eq!(path("{", Format::Json), "");
     let twice = r#"{"apiVersion":"smg.policy/v1","profiles":{"p":{"pick":"random"},"p":{"pick":"random"}}}"#;
     assert_eq!(path(twice, Format::Json), "");
@@ -1834,8 +1834,8 @@ fn an_applys_time_by_the_documents_size() {
         .expect("stdout");
     }
     // A JSON document the typed read refuses at its last binding is
-    // read three times: by the typed read, again as values, and by the
-    // typed read of those. The time to that refusal, by its size.
+    // read as one that runs is: into values, and by the typed read of
+    // those. The time to that refusal, by its size.
     for size in [2 << 10, 64 << 10, bound - 128] {
         let document = refused_json_of(size);
         let mut micros = Vec::with_capacity(ROUNDS);
