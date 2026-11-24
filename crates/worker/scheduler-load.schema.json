@@ -220,7 +220,7 @@
       }
     },
     "NamedValue": {
-      "description": "One value an engine reports by name alongside its fixed fields. The name\nand the unit are shared strings: a copy of a report, which the load\nmonitor makes at each publish, allocates none. A connection that knows\na name ahead of its reports makes it once and clones it.",
+      "description": "One value an engine reports by name alongside its fixed fields. The name\nand the unit are shared strings: a copy of an entry, which the load\nmonitor makes where several workers share one engine's answer, allocates\nnone. A connection that knows a name ahead of its reports makes it once\nand clones it.",
       "type": "object",
       "properties": {
         "name": {

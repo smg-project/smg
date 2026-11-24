@@ -2053,6 +2053,54 @@ impl<G: Generation> WorkerMonitor<G> {
         }
     }
 
+    /// One engine's answer as each member's report, in the members' order:
+    /// a member ahead of the last copies its own rank of the answer, and the
+    /// last takes the answer itself.
+    fn scope_to_members(
+        reports: &mut Vec<Option<WorkerLoadResponse>>,
+        members: &[Arc<dyn Worker>],
+        answer: WorkerLoadResponse,
+    ) {
+        let Some((last, ahead)) = members.split_last() else {
+            return;
+        };
+        for member in ahead {
+            let own = Self::copy_for_dp_rank(&answer, member.dp_rank());
+            reports.push(Some(own.unwrap_or_default()));
+        }
+        reports.push(Some(answer.for_dp_rank(last.dp_rank()).unwrap_or_default()));
+    }
+
+    /// [`WorkerLoadResponse::for_dp_rank`] of a copy, for a member that
+    /// leaves the answer to the members after it: the entries of its own
+    /// rank alone are copied, not every rank's.
+    fn copy_for_dp_rank(
+        answer: &WorkerLoadResponse,
+        rank: Option<usize>,
+    ) -> Option<WorkerLoadResponse> {
+        let Some(rank) = rank else {
+            return answer.clone().for_dp_rank(None);
+        };
+        if !answer.ranks_are_dp_ranks() {
+            return None;
+        }
+        let rank = i32::try_from(rank).ok()?;
+        let of_rank = || answer.loads.iter().filter(|load| load.dp_rank == rank);
+        let mut loads = Vec::with_capacity(of_rank().count());
+        loads.extend(of_rank().cloned());
+        if loads.is_empty() {
+            return None;
+        }
+        Some(WorkerLoadResponse {
+            timestamp: answer.timestamp.clone(),
+            version: answer.version.clone(),
+            dp_rank_count: i32::try_from(loads.len()).ok()?,
+            loads,
+            aggregate: None,
+            sampled_at: answer.sampled_at,
+        })
+    }
+
     /// The backend-wide gauges of a worker whose native load routes brought
     /// no answer (`native`: why, or none where no route is there). A worker
     /// with no gauges to read fails as its native read did, and has no load
@@ -2363,11 +2411,9 @@ impl<G: Generation> WorkerMonitor<G> {
             (Some(source), _) => {
                 let answer = Self::fetch_source_load(&members[0], source.as_ref()).await;
                 counts.fetched(over_http, &answer);
-                let answers = std::iter::repeat_n(answer.ok(), members.len());
-                for (member, answer) in members.iter().zip(answers) {
-                    reports.push(
-                        answer.map(|load| load.for_dp_rank(member.dp_rank()).unwrap_or_default()),
-                    );
+                match answer {
+                    Ok(load) => Self::scope_to_members(&mut reports, &members, load),
+                    Err(_) => reports.resize(members.len(), None),
                 }
             }
             (None, ConnectionMode::Http) => {
@@ -2379,14 +2425,18 @@ impl<G: Generation> WorkerMonitor<G> {
                     match Self::fetch_native_loads(&members[0], Some(native_loads_memo)).await {
                         Ok((path, load)) => {
                             counts.fetched(over_http, &Ok(()));
-                            let loads = std::iter::repeat_n(load, members.len());
-                            for (member, load) in members.iter().zip(loads) {
+                            for member in &members {
                                 liveness::on_contact(member);
-                                reports.push(Some(Self::scoped_native_load(
-                                    path,
-                                    load,
-                                    member.dp_rank(),
-                                )));
+                            }
+                            match path {
+                                NativeLoadsPath::Engine => {
+                                    Self::scope_to_members(&mut reports, &members, load);
+                                }
+                                // A gateway's rollup is every member's whole:
+                                // it keeps its worker annotations.
+                                NativeLoadsPath::Gateway => {
+                                    reports.extend(std::iter::repeat_n(Some(load), members.len()));
+                                }
                             }
                         }
                         // The members are one engine's ranks, and a rank
@@ -2404,11 +2454,9 @@ impl<G: Generation> WorkerMonitor<G> {
             (None, ConnectionMode::Grpc | ConnectionMode::Zmq) => {
                 let answer = Self::fetch_backend_load(&members).await;
                 counts.fetched(over_http, &answer);
-                let answers = std::iter::repeat_n(answer.ok(), members.len());
-                for (member, answer) in members.iter().zip(answers) {
-                    reports.push(
-                        answer.map(|load| load.for_dp_rank(member.dp_rank()).unwrap_or_default()),
-                    );
+                match answer {
+                    Ok(load) => Self::scope_to_members(&mut reports, &members, load),
+                    Err(_) => reports.resize(members.len(), None),
                 }
             }
         }
@@ -2424,6 +2472,10 @@ impl<G: Generation> WorkerMonitor<G> {
                 let one_engine = answer.ranks_are_dp_ranks();
                 let left =
                     value_bounds::bound_ranks(&mut answer.loads, member.dp_rank(), one_engine);
+                // The report stands until the worker's next one: it keeps no
+                // room for an entry that left, or that a decoder made room
+                // for and did not read.
+                answer.loads.shrink_to_fit();
                 if member.dp_rank().is_some() {
                     // `for_dp_rank` counted the scoped rows, a repeated one
                     // among them: a pinned member's count is its rows kept.
@@ -3744,6 +3796,29 @@ mod native_loads_tests {
             std::slice::from_ref(&stub.url)
         );
         assert_eq!(stub.probes.load(Ordering::Relaxed), 0);
+    }
+
+    /// A member's copy of its rank is the whole answer scoped to that rank,
+    /// field for field: a rank of its own, one the answer states twice, one
+    /// it leaves out, one past the entries' type, a rollup by worker, and
+    /// no rank at all.
+    #[test]
+    fn a_members_copy_of_its_rank_is_the_answer_scoped_to_that_rank() {
+        let mut twice = host_answer(3);
+        twice.loads[2].dp_rank = 0;
+        twice.aggregate = Some(Default::default());
+        twice.sampled_at = Some(Instant::now());
+        let mut rollup = host_answer(2);
+        rollup.loads[1].worker = Some("http://engine-b".to_owned());
+        for answer in [host_answer(3), twice, rollup, WorkerLoadResponse::default()] {
+            for rank in [None, Some(0), Some(1), Some(2), Some(usize::MAX)] {
+                assert_eq!(
+                    format!("{:?}", WorkerMonitor::copy_for_dp_rank(&answer, rank)),
+                    format!("{:?}", answer.clone().for_dp_rank(rank)),
+                    "rank {rank:?}"
+                );
+            }
+        }
     }
 
     /// A connector that keeps no source is asked once, and its worker is
