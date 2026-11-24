@@ -2240,7 +2240,7 @@ fn a_dispatched_frame_at_an_index_its_pick_does_not_hold_leaves_a_chosen_side_as
         tokens_out: 0,
         duration_micros: 0,
     };
-    lifecycle::completed(&store, &hand, &ended, now).expect("the frame reads");
+    lifecycle::completed(&store, &hand, &ended).expect("the frame reads");
     assert!(heard().is_empty(), "a side no stage heard issued");
     let complete = Some((LeaseState::Completed, d));
     assert_eq!((side_on_file(second.id), booked()), (complete, [2, 1]));

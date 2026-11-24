@@ -913,10 +913,7 @@ pub(crate) mod tests {
             view::{Role, Session, WorkerId},
         },
         service::{
-            controller::lifecycle::{
-                self,
-                tests::{a_completed, worker},
-            },
+            controller::lifecycle::tests::worker,
             elector::{ElectionSettings, Elector, TickOutcome},
         },
         store::{
@@ -1100,74 +1097,12 @@ pub(crate) mod tests {
         );
     }
 
-    /// What the store holds under a gateway's key ends with its presence:
-    /// its completions with its lease records, and no other gateway's.
-    #[test]
-    fn a_gateway_let_go_leaves_no_completion_in_the_store() {
-        let (_elector, store, gateways, t0) = leading(GRACE);
-        let served = worker(&store, "http://a:8000");
-        let gone = welcomed(&gateways, A, "gateway-a", TERM, t0);
-        let _stands = welcomed(&gateways, B, "gateway-b", TERM, t0);
-        for gateway in [A, B] {
-            lifecycle::completed(
-                &store,
-                &lifecycle::tests::open(&store, gateway),
-                &a_completed(1, served),
-                t0,
-            )
-            .expect("the frame reads");
-        }
-        gone.end(t0);
-
-        assert_eq!(gateways.sweep(t0 + GRACE - MS), 0);
-        assert!(
-            store.completed_ok_since(A, served, t0),
-            "inside the period nothing is let go"
-        );
-        assert_eq!(gateways.sweep(t0 + GRACE), 1);
-        assert!(
-            !store.completed_ok_since(A, served, t0),
-            "the gateway's completion went with it"
-        );
-        assert!(
-            store.completed_ok_since(B, served, t0),
-            "another gateway's stands"
-        );
-    }
-
-    /// A `Hello` past the grace period lets the gateway go before it is
-    /// welcomed anew, with no pass of the sweep between: the new presence
-    /// starts with no completion of the one that ended.
-    #[test]
-    fn a_gateway_welcomed_anew_past_its_grace_period_starts_with_no_completion() {
-        let (_elector, store, gateways, t0) = leading(GRACE);
-        let served = worker(&store, "http://a:8000");
-        let gone = welcomed(&gateways, A, "gateway-a", TERM, t0);
-        lifecycle::completed(
-            &store,
-            &lifecycle::tests::open(&store, A),
-            &a_completed(1, served),
-            t0,
-        )
-        .expect("the frame reads");
-        gone.end(t0);
-
-        let _anew = welcomed(&gateways, A, "gateway-a", TERM, t0 + GRACE);
-        assert!(
-            !store.completed_ok_since(A, served, t0),
-            "the completion ended with the presence that wrote it"
-        );
-        assert_eq!(store.health_entries(), 0);
-    }
-
     /// A frame of a replaced session that is past the seat's question may
     /// still be written. The gateway is not let go while that session
-    /// runs: what the frame writes lands under the row it was read for and
-    /// leaves with it.
+    /// runs.
     #[test]
     fn a_gateway_is_not_let_go_while_a_session_it_replaced_still_runs() {
-        let (_elector, store, gateways, t0) = leading(GRACE);
-        let served = worker(&store, "http://a:8000");
+        let (_elector, _store, gateways, t0) = leading(GRACE);
         let first = welcomed(&gateways, A, "gateway-a", TERM, t0);
         let second = welcomed(&gateways, A, "gateway-a", TERM, t0);
         welcomed(&gateways, A, "gateway-a", TERM, t0).end(t0);
@@ -1178,21 +1113,8 @@ pub(crate) mod tests {
         // The later of the two ends first: the earlier one holds the row.
         drop(second);
         assert_eq!(gateways.sweep(t0 + GRACE), 0, "a replaced session runs");
-        // Its late frame, then its end.
-        lifecycle::completed(
-            &store,
-            &lifecycle::tests::open(&store, A),
-            &a_completed(1, served),
-            t0 + GRACE,
-        )
-        .expect("the frame reads");
         drop(first);
         assert_eq!(gateways.sweep(t0 + GRACE), 1);
-        assert!(
-            !store.completed_ok_since(A, served, t0),
-            "the late frame's completion left with the row"
-        );
-        assert_eq!(store.health_entries(), 0);
 
         // The other order, on a second gateway: the earlier of the two ends
         // first, and the later one holds the row alone.
@@ -1261,35 +1183,6 @@ pub(crate) mod tests {
         }
         assert_eq!(gateways.noted(A), 0, "no ended session remains");
         drop(stands);
-    }
-
-    /// The completions on file are bounded by who is present, never by who
-    /// was ever welcomed: waves of gateways under the table's ceiling, each
-    /// reporting a completion and let go, leave nothing behind.
-    #[test]
-    fn the_completions_on_file_do_not_grow_with_the_gateways_ever_welcomed() {
-        let (_elector, store, gateways, t0) = ceiled(GRACE, 8);
-        let served = worker(&store, "http://a:8000");
-        let mut now = t0;
-        for wave in 0..5_u64 {
-            for n in 0..8_u64 {
-                let gateway = GatewayId(100 + wave * 8 + n);
-                let subject = format!("gateway-{wave}-{n}");
-                let seat = welcomed(&gateways, gateway, &subject, TERM, now);
-                lifecycle::completed(
-                    &store,
-                    &lifecycle::tests::open(&store, gateway),
-                    &a_completed(1, served),
-                    now,
-                )
-                .expect("the frame reads");
-                seat.end(now);
-            }
-            assert_eq!(store.health_entries(), 8, "a completion a gateway");
-            now += GRACE;
-            assert_eq!(gateways.sweep(now), 8);
-            assert_eq!(store.health_entries(), 0, "wave {wave}");
-        }
     }
 
     /// A welcome and a letting-go of one gateway at one instant are

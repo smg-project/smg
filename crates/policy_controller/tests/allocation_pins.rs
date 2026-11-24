@@ -10,8 +10,8 @@
 //! other, a write that moves an offer to one that moves none and a
 //! registration into 512 workers to one into 8. A lease's life at the store
 //! allocates nothing once its file is sized: its record filed, its
-//! dispatch and its completion handed to the file, the completion written
-//! for the health rule and the sweep's pass. A host in process is pinned
+//! dispatch and its completion handed to the file,
+//! and the sweep's pass. A host in process is pinned
 //! too, in a build
 //! with the `in-process` feature: a request held from its decision to its
 //! completion allocates nothing after the first ones. A separate
@@ -33,8 +33,8 @@ use smg_policy_controller::{
     },
     stages::Lifecycle,
     store::{
-        GatewayId, Hand, HealthSink, LeaseRecord, LeaseState, LeasesStore, LoadSink, LoadSource,
-        MemoryStore, PickRecord, WorkerFacts, WorkerStatus, WorkersStore, PUBLISH_WINDOW,
+        GatewayId, Hand, LeaseRecord, LeaseState, LeasesStore, LoadSink, LoadSource, MemoryStore,
+        PickRecord, WorkerFacts, WorkerStatus, WorkersStore, PUBLISH_WINDOW,
     },
     tracking::{Dispatch, Lease, LeaseId, Outcome, Said, Side, TransportClass},
 };
@@ -617,10 +617,9 @@ fn store_of(n: usize) -> (MemoryStore, Vec<WorkerId>, Instant) {
 
 /// A lease's life at the store, over the store's own calls and no engine:
 /// its record filed, its dispatch and its completion handed to its file as
-/// a session hands a gateway's frames, the gateway's completion written on
-/// the served worker for the health rule, and the sweep's pass a host's
-/// loop makes. The hand and the health write are the calls a served
-/// controller makes for a `Dispatched` and a `Completed` frame. The record
+/// a session hands a gateway's frames, and the sweep's pass a host's
+/// loop makes. The hand is the call a served controller makes for a
+/// `Dispatched` and for a `Completed` frame. The record
 /// is filed by the trait's door, under an id of the case's own: a served
 /// decision's issue mints its id and steps the deadline queue inside the
 /// crate, and no case out here reaches that call. Behind the trait's door
@@ -667,12 +666,11 @@ fn a_lease_filed_dispatched_and_completed_at_the_store_allocates_nothing() {
             let outcome =
                 Outcome::reported(200, TransportClass::Ok).with_served(Side::Single, worker);
             store.hand(&hand, lease, Said::Completed(outcome));
-            HealthSink::completed(&store, gateway, worker, outcome.class, now);
             let ended = store.expire(now);
             assert!(ended.is_empty(), "no lease waited out its deadline");
         };
-        // The first lives size the file, fill the deadline queue to its
-        // span and write each worker's first completion of this gateway.
+        // The first lives size the file and fill the deadline queue to its
+        // span.
         for request in 0..LEASES {
             life(request);
         }
@@ -683,12 +681,6 @@ fn a_lease_filed_dispatched_and_completed_at_the_store_allocates_nothing() {
             }
         });
         assert_eq!(store.live(gateway), 0, "a completed lease left the file");
-        let counted = opened + STEP * LEASES;
-        assert!(
-            ids.iter()
-                .all(|worker| store.completed_ok_since(gateway, *worker, counted)),
-            "{n} members: each worker holds a completion of the counted lives"
-        );
         assert_eq!(allocations, 0, "{n} members: a lease's life allocated");
     }
 }

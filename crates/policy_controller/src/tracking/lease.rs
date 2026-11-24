@@ -124,10 +124,8 @@ impl Lease {
     }
 }
 
-/// The transport outcome of a dispatch, beside its status: what a health
-/// rule reads when it weighs a prober's verdict against the gateways'
-/// reports. Further classes add their cases: a `match` outside this crate
-/// keeps an arm for the rest.
+/// The transport outcome of a dispatch, beside its status. Further classes
+/// add their cases: a `match` outside this crate keeps an arm for the rest.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum TransportClass {

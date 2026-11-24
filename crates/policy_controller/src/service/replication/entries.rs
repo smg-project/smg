@@ -64,12 +64,6 @@ pub const ENTRIES: &[(&str, &str, EntryReplication)] = &[
         EntryReplication::Rebuilt(HELLO),
     ),
     ("HealthSink", "vetoed", EntryReplication::Read),
-    (
-        "HealthSink",
-        "completed",
-        EntryReplication::Rebuilt("the gateways' reports of the last probe interval"),
-    ),
-    ("HealthSink", "completed_ok_since", EntryReplication::Read),
     // A log carries no load row: a standby holds none of its leader's and
     // no overload verdict. Its first poll goes out at its take.
     ("LoadSink", "record", EntryReplication::Rebuilt(REPORTED)),
