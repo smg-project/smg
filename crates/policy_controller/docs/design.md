@@ -1549,6 +1549,8 @@ ring whose lender places no head answers nothing: such a request is lent no ring
 asked about no further head, and the stage's own ring places the request. A request that has no
 head states no place and is lent no ring either. Neither is a pair whose two sides read the ring
 by two forms, or cut a prompt at two depths: each side's stage then places by its own ring.
+The items of an encode request are placed on that one ring too, each by its own text, where the
+encode profile's ring stage reads it.
 
 ### 8.2 The contract as designed **[partly]**
 

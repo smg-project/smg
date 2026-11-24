@@ -209,6 +209,12 @@ pub(super) fn place<'a>(
 /// items it carries ([`place`]), and as its pair where it states none.
 /// Out of line: a request with other lists runs none of it.
 ///
+/// The items are lent the ring the request states
+/// ([`PlaceRequest::ring`]), whatever their caller wrote into them
+/// ([`EncodeItems::ring`]): a caller of this call states its ring once.
+/// The encode profile's word alone says whether that ring is asked for an
+/// item, so a request whose own profile reads no ring lends its items one.
+///
 /// # Errors
 ///
 /// What the call for its items or for its pair answers.
@@ -219,7 +225,13 @@ pub(super) fn three<'a>(
     lists: &EncodeLists<'_>,
 ) -> Result<Placement<'a>, Unplaced> {
     match request.encode {
-        Some(items) => place(engine, request, lists, items, &mut Call::default()),
+        Some(items) => {
+            let items = EncodeItems {
+                ring: request.ring,
+                ..items
+            };
+            place(engine, request, lists, items, &mut Call::default())
+        }
         // No item stated: the three lists are placed as their pair.
         None => pair::place(engine, request, &lists.pair, &mut Call::default()),
     }

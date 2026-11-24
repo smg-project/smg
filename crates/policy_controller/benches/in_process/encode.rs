@@ -21,6 +21,16 @@
 //! the three lists: every worker of the list, as a gateway states the
 //! workers on a request's wire. The decision is then one among places.
 //!
+//! A cell named `encode_ring...` places its items by the plain ring on the
+//! encode side ([`ringed`]), and each item's key carries its text, as a
+//! host holds the hex of an item's content hash. In `encode_ring` the host
+//! lends its ring for the items: the bench's stand-in for a ring a host
+//! keeps, over the encoders in their list's order, which hashes nothing.
+//! So the cell counts what the engine does with a ring lent for the items,
+//! one ask and one walk an item, and no lookup of a host's ring. In
+//! `encode_ring_own` no ring is lent, and the encode stage's own ring
+//! places each item.
+//!
 //! Every worker of the three lists has a load report, and a prefill states
 //! its rate as its measured input rate too, as in a pair's cell. Under a
 //! document that declares the bench's signal each decode's report states a
@@ -45,6 +55,7 @@ use smg_policy_controller::{
         PairLists, PartnerClasses, PlaceRequest, Plain, PolicyEngine, Prompt, PublishedList,
         Request, RequestMaker, WorkerId, WorkerLists,
     },
+    policies::consistent_hashing::LentRing,
     store::GatewayId,
     tracking::{DecisionGuard, Outcome, Placement, Side, TransportClass},
 };
@@ -54,7 +65,7 @@ use tokio::runtime::Builder;
 use super::{
     measure, mix,
     pair::{self, typed, Open},
-    place, published, reports, signals, Cell, Host, Run, Shadowed, Stated, MODEL,
+    place, published, reports, signals, Cell, Host, ListOrder, Run, Shadowed, Stated, MODEL,
 };
 
 /// The images one request carries, each an item of its own.
@@ -71,6 +82,17 @@ static ENCODERS: AtomicUsize = AtomicUsize::new(0);
 pub(super) fn of(name: &str) -> PolicySpec {
     PolicySpec::epd_presets(name, name, name).expect("a preset's name")
 }
+
+/// The encode document of the cells named `encode_ring...`: the encode side
+/// places an item by the plain ring, and each side of the pair takes its
+/// workers in turn.
+pub(super) fn ringed() -> PolicySpec {
+    let side = "round_robin";
+    PolicySpec::epd_presets("consistent_hashing", side, side).expect("a preset's name")
+}
+
+/// The texts the items of an `encode_ring...` cell carry, in turn.
+const TEXTS: usize = 1_024;
 
 /// A pair's request that states [`ITEMS`] images.
 pub(super) fn request(seed: u64) -> Request<'static> {
@@ -123,6 +145,13 @@ struct Sides {
     /// The places the host holds a request to, where the cell states them:
     /// the prefills', the decodes' and the encoders', every worker of each.
     places: Option<[Vec<u32>; 3]>,
+    /// The texts an `encode_ring...` cell's items carry, each with its
+    /// fingerprint, made once as a host holds the hex of an item's content
+    /// hash beside the item; `None` in every other cell.
+    texts: Option<Vec<(String, u64)>>,
+    /// The ring the host lends for the items in the cell `encode_ring`: the
+    /// encoders in their list's order.
+    ring: Option<ListOrder>,
 }
 
 /// One turn's encode request as its host states it: the request of
@@ -198,11 +227,59 @@ impl Sides {
         }
     }
 
+    /// One request of an `encode_ring...` cell, by the engine's entry or by
+    /// the one call: its items' keys in the clear, each with the text the
+    /// turn's seed names, and the cell's ring lent for them.
+    fn keyed(&self, host: &Host, seed: u64, one_call: bool) -> Option<u32> {
+        let texts = self.texts.as_deref()?;
+        let keys: [Identity<'_>; ITEMS] = array::from_fn(|item| {
+            let turn = (seed as usize).wrapping_mul(ITEMS).wrapping_add(item);
+            let (text, hash) = &texts[turn % texts.len()];
+            // The key by its constructor, then its text: a bench stands
+            // outside the crate, where the type may gain a field.
+            let mut key = Identity::hashed(*hash);
+            key.plain = Some(text);
+            key
+        });
+        let ring = self.ring.as_ref().map(|ring| ring as &dyn LentRing);
+        let items = EncodeItems {
+            keys: &keys,
+            ring,
+            ..EncodeItems::default()
+        };
+        if one_call {
+            self.place_items(host, items, ring)
+        } else {
+            self.decide_items::<true>(host, seed, items)
+        }
+    }
+
     /// One encode request of `host` by the engine's entry: the prefill's
     /// place in its list, with both dispatches and each side's end told
     /// where the decision is leased. A turn that leaves an item with no
     /// encoder places nothing.
     fn decide(&self, host: &Host, seed: u64) -> Option<u32> {
+        let keys = keys(seed);
+        let items = EncodeItems {
+            keys: &keys,
+            ..EncodeItems::default()
+        };
+        self.decide_items::<false>(host, seed, items)
+    }
+
+    /// [`Self::decide`] for `items`. Built into each of its two callers,
+    /// so a cell's turn is one body. `KEYED` gives each caller an instance
+    /// of its own: the closure that borrows the thread's placed room then
+    /// has one caller in each, and stays built into that turn. With one
+    /// instance for both it was compiled apart, and the turn of a cell
+    /// that stood before read 243 instructions more.
+    #[inline(always)]
+    fn decide_items<const KEYED: bool>(
+        &self,
+        host: &Host,
+        seed: u64,
+        items: EncodeItems<'_>,
+    ) -> Option<u32> {
         let stated = StatedEncode {
             stated: Stated {
                 host,
@@ -210,11 +287,6 @@ impl Sides {
                 prompt: None,
             },
             lists: self.lists(host),
-        };
-        let keys = keys(seed);
-        let items = EncodeItems {
-            keys: &keys,
-            ..EncodeItems::default()
         };
         let dated = OnceCell::new();
         let clock = || *dated.get_or_init(Instant::now);
@@ -250,6 +322,19 @@ impl Sides {
             keys: &keys,
             ..EncodeItems::default()
         };
+        self.place_items(host, items, None)
+    }
+
+    /// [`Self::place`] for `items`, with the `ring` the host states on the
+    /// request: the call lends it to the items. Built into each of its two
+    /// callers, as [`Self::decide_items`] is.
+    #[inline(always)]
+    fn place_items(
+        &self,
+        host: &Host,
+        items: EncodeItems<'_>,
+        ring: Option<&dyn LentRing>,
+    ) -> Option<u32> {
         let request = PlaceRequest {
             prompt: Prompt {
                 tokens: Some(&place::PROMPT),
@@ -257,6 +342,7 @@ impl Sides {
             },
             media: images(),
             encode: Some(items),
+            ring,
             ..PlaceRequest::of(MODEL, WorkerLists::Encode(self.lists(host)))
         };
         let mut answer = host.engine.place(&request);
@@ -336,6 +422,13 @@ pub(super) fn runs(run: &Run) -> bool {
             [prefills.len(), decodes.len(), encoders.len()]
                 .map(|workers| (0..workers as u32).collect())
         }),
+        texts: name.starts_with("encode_ring").then(|| {
+            let text = |key: usize| format!("{:016x}", mix(key as u64));
+            let keyed = |text: String| (Identity::plain(&text).hash, text);
+            let texts = (0..TEXTS).map(text).map(keyed);
+            texts.map(|(hash, text)| (text, hash)).collect()
+        }),
+        ring: (name == "encode_ring").then(|| ListOrder::of(&encoders)),
     };
     let mut receiver = None;
     let feed = TestFeed::attached_to(|loads| receiver = loads);
@@ -367,6 +460,13 @@ pub(super) fn runs(run: &Run) -> bool {
         let (decodes, encoders) = (sides.decodes.lent(), sides.encoders.lent());
         host.conversions() + engine.conversions(decodes) + engine.conversions(encoders)
     };
+    // A cell whose items carry their text makes its own turn, so every
+    // other cell's turn is the body it was.
+    if sides.texts.is_some() {
+        let turn = |seed| sides.keyed(&host, seed, one_call);
+        measure(run, &host, upkeep, || feed.publish(&loads), converted, turn);
+        return true;
+    }
     measure(
         run,
         &host,

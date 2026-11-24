@@ -267,7 +267,9 @@ pub struct PlaceRequest<'a> {
     pub demands: Demands,
     /// The items of an encode request, which hands its three lists
     /// ([`WorkerLists::Encode`]), and `None` for every other. Three lists
-    /// with `None` are placed as their pair.
+    /// with `None` are placed as their pair. The call lends the items the
+    /// ring this request states ([`Self::ring`]): a ring written into the
+    /// items themselves ([`EncodeItems::ring`]) is not read.
     pub encode: Option<EncodeItems<'a>>,
     /// The retry number, `0` for the first attempt. It is stated and not
     /// counted: a failed attempt of a pair names two workers as tried.
@@ -324,6 +326,14 @@ pub struct PlaceRequest<'a> {
     /// to a request that has no head. Under any other document the ring
     /// is asked nothing. `None` from a caller that keeps no ring: the
     /// stage places by its own.
+    ///
+    /// An encode request's items are lent this ring too
+    /// ([`EncodeItems::ring`]). An item that carries its text goes to the
+    /// encoder the ring's walk reaches from where that text stands, where
+    /// the caller's own ring policy puts an item. The encode profile's
+    /// word alone says whether the ring is asked for an item and by which
+    /// of its two questions: a request whose own profile reads no ring
+    /// lends its items one all the same.
     pub ring: Option<&'a dyn LentRing>,
     /// The route's own rule for a worker its request may be sent to, and
     /// `None` for a route that has none. It is asked of the workers the
