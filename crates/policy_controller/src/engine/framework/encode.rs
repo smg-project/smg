@@ -3,14 +3,14 @@
 //! over one view, so no item is placed on an encoder its pair's prefill
 //! takes nothing from.
 //!
-//! Which encoders hand to which prefill is the store's fact: every encoder
-//! and every prefill carries its encode class
-//! ([`store`](crate::store)), and an item is placed
-//! over the encoders of the chosen prefill's class. Three sentences rule
-//! the rest. The pair is picked among the prefills whose class holds an
-//! open encoder that takes the request's media. A refusal's name comes
-//! from membership: only the registered encoders prove a gap no retry
-//! closes. The pick comes from what is open.
+//! Which encoders hand to which prefill is the host's fact: it states the
+//! encode class of every encoder and of every prefill, as the encode class
+//! rule derives them ([`EncodeClasses`](crate::engine::EncodeClasses)), and
+//! an item is placed over the encoders of the chosen prefill's class. Three
+//! sentences rule the rest. The pair is picked among the prefills whose
+//! class holds an open encoder that takes the request's media. A refusal's
+//! name comes from membership: only the registered encoders prove a gap no
+//! retry closes. The pick comes from what is open.
 //!
 //! The pair itself is the pair entry's ([`Engine::decide_pair`]), entered
 //! unchanged over the prefills and decodes this side admits: a prefill of a
@@ -213,7 +213,9 @@ impl EncodePlaced {
 
     /// The encoder of each placed key, in the keys' order: one for the one
     /// key, else one an item. A target's position is its row in the encode
-    /// pool. Empty unless the decision is a pick.
+    /// pool, and 0 in an answer read from a link: a linked target names
+    /// its worker and its rank, and its row stays with the controller.
+    /// Empty unless the decision is a pick.
     pub fn encoders(&self) -> &[Target] {
         &self.encoders
     }
@@ -229,6 +231,16 @@ impl EncodePlaced {
     pub(crate) fn clear(&mut self) {
         self.encoders.clear();
         self.one = false;
+    }
+
+    /// The room for the encoders an answer read from a link names, with
+    /// what that answer says of the one key. Its reader empties it first
+    /// ([`Self::clear`]) and writes them in the keys' order, as a decision
+    /// in process does.
+    #[cfg(feature = "client")]
+    pub(crate) fn room(&mut self, one: bool) -> &mut Vec<Target> {
+        self.one = one;
+        &mut self.encoders
     }
 }
 

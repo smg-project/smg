@@ -5405,12 +5405,6 @@ impl PolicySpec {
         }
         needs.headers |= !self.view.headers.is_empty();
         let mut engine = Engine::new(profiles, bindings, self.generation, needs);
-        // In the order of the profiles' names, as the map walks them: a
-        // later engine that finds no count under its settings searches
-        // this order for the name of the profile that made one.
-        debug_assert!(sent_credits
-            .windows(2)
-            .all(|pair| pair[0].profile < pair[1].profile));
         engine.sent_credits = sent_credits;
         #[cfg(feature = "in-process")]
         {
@@ -8050,22 +8044,27 @@ mod tests {
         }
     }
 
-    /// Profiles under one time limit and one report delay read one count
-    /// of sends where they agree on `sent_until_report_changes` too, as
-    /// these do. A profile under another limit or another delay keeps a
-    /// count of its own.
+    /// Profiles under one time limit, one report delay and one value of
+    /// `sent_until_report_changes` read one count of sends. A profile
+    /// under another limit, another delay or another value of the key
+    /// keeps a count of its own.
     #[test]
     fn profiles_under_one_sent_setting_read_one_count_of_sends() {
         for (sent, want) in [
-            ((None, None), 1),
-            ((Some(43), None), 2),
-            ((None, Some(5)), 2),
+            ((None, None, false), 1),
+            ((Some(43), None, false), 2),
+            ((None, Some(5), false), 2),
+            ((None, None, true), 2),
         ] {
             let mut spec = doc(
                 r#"{"apiVersion":"smg.policy/v1","profiles":{"p":{"score":["least-load"],"pick":"best"},"q":{"score":["least-load"],"pick":"best"}},"bindings":[{"match":{"model":"m"},"profile":"p"},{"match":{"model":"*"},"profile":"q"}]}"#,
             );
             let q = spec.profiles.get_mut("q").expect("the profile");
-            (q.sent_ttl_ms, q.sent_report_delay_ms) = sent;
+            (
+                q.sent_ttl_ms,
+                q.sent_report_delay_ms,
+                q.sent_until_report_changes,
+            ) = sent;
             let engine = spec.validate().expect("a valid document");
             assert_eq!(engine.sent_credits.len(), want, "q under {sent:?}");
             // Both scorers hold a count of the list, the ones the engine
@@ -8132,7 +8131,7 @@ mod tests {
             let held: Vec<_> = next
                 .sent_credits
                 .iter()
-                .map(|count| count.credits.held(worker))
+                .map(|count| count.credits().held(worker))
                 .collect();
             assert_eq!(held, want, "{was:?}, then {later} under {limits:?}");
         }
@@ -8140,10 +8139,9 @@ mod tests {
 
     /// A later spec keeps the stage objects of each profile whose name and
     /// text did not change, and builds every other profile's anew. A count
-    /// of sends goes with its readers: where one of them changed, or the
-    /// first of them left, the count and each of its readers are built
-    /// new, and where a later one left, the count and the others stand.
-    /// A spec that changes `view` or `signals` builds every profile anew.
+    /// of sends stands where a profile that reads it is kept, whichever of
+    /// its other readers changed, left or came. A spec that changes `view`
+    /// or `signals` builds every profile anew.
     #[cfg(feature = "in-process")]
     #[test]
     fn a_later_spec_keeps_the_stages_of_a_profile_whose_text_did_not_change() {
@@ -8163,15 +8161,22 @@ mod tests {
             let score = serde_json::from_str(r#"[{"least-load":{"weight":2}}]"#);
             q.score = score.expect("a score");
         };
-        // The first reader of the count goes: the count is made under `q`.
+        // The first reader of the count goes: `q` keeps the count.
         let without_p: Edit = |spec| {
             spec.profiles.remove("p");
             spec.bindings.remove(0);
         };
-        // A later reader of the count goes: `p` still makes it, so it stands.
+        // A later reader of the count goes: `p` keeps the count.
         let without_q: Edit = |spec| {
             spec.profiles.remove("q");
             spec.bindings.remove(1);
+        };
+        // A reader of the count comes: the others and the count stand.
+        let with_s: Edit = |spec| {
+            let s = serde_json::from_str(r#"{"score":["least-load"],"pick":"best"}"#);
+            spec.profiles.insert("s".into(), s.expect("a profile"));
+            let bound = serde_json::from_str(r#"{"match":{"model":"s"},"profile":"s"}"#);
+            spec.bindings.insert(0, bound.expect("a binding"));
         };
         let view: Edit = |spec| spec.view.max_report_age_ms = Some(900);
         let signals: Edit = |spec| {
@@ -8180,13 +8185,14 @@ mod tests {
                 .insert("free".into(), signal.expect("a signal"));
         };
         // The edit, the profiles kept and whether the count is.
-        let cases: [(Edit, [bool; 3], bool); 8] = [
+        let cases: [(Edit, [bool; 3], bool); 9] = [
             (|_| {}, [true; 3], true),
-            (filter_of_q, [false, false, true], false),
-            (weight_of_q, [false, false, true], false),
+            (filter_of_q, [true, false, true], true),
+            (weight_of_q, [true, false, true], true),
             (pick_of_r, [true, true, false], true),
-            (without_p, [false, false, true], false),
+            (without_p, [false, true, true], true),
             (without_q, [true, false, true], true),
+            (with_s, [true; 3], true),
             (view, [false; 3], false),
             (signals, [false; 3], false),
         ];
@@ -8263,6 +8269,67 @@ mod tests {
         assert_eq!(keeps(&hosted, &table), none);
     }
 
+    /// Each of a table's six adders puts the table under a number of its
+    /// own. So a table that took a stage by any of them keeps nothing
+    /// behind the stock table, behind another table under the same names,
+    /// or behind itself as it stood before a later stage.
+    #[cfg(feature = "in-process")]
+    #[test]
+    fn a_table_goes_under_a_number_of_its_own_by_each_of_its_six_adders() {
+        type Add = fn(&mut StageRegistry, &'static str);
+        let adders: [(&str, Add); 6] = [
+            ("filter", |table, name| {
+                let added = table.filter(name, move || Box::new(ReadsHashes(name)));
+                added.expect("a free name");
+            }),
+            ("filter_with", |table, name| {
+                let added = table.filter_with(name, move |_| Ok(Box::new(ReadsHashes(name))));
+                added.expect("a free name");
+            }),
+            ("scorer", |table, name| {
+                let added = table.scorer(name, move || Box::new(ReadsHashes(name)));
+                added.expect("a free name");
+            }),
+            ("scorer_with", |table, name| {
+                let added = table.scorer_with(name, move |_| Ok(Box::new(ReadsHashes(name))));
+                added.expect("a free name");
+            }),
+            ("picker", |table, name| {
+                let added = table.picker(name, move || Box::new(ReadsHashes(name)));
+                added.expect("a free name");
+            }),
+            ("picker_with", |table, name| {
+                let added = table.picker_with(name, move |_| Ok(Box::new(ReadsHashes(name))));
+                added.expect("a free name");
+            }),
+        ];
+        let over = |stages: &StageRegistry| {
+            let spec = AppliedSpec::validate_in(&doc(KEPT), stages, &[]);
+            spec.expect("a valid document")
+        };
+        let (all, none) = (([true; 3], true), ([false; 3], false));
+        let keeps = |standing: &AppliedSpec, stages: &StageRegistry| {
+            let mut next = over(stages);
+            next.keep_from(standing);
+            kept(&next, standing)
+        };
+        for (adder, add) in adders {
+            let own = || {
+                let mut own = StageRegistry::builtin();
+                add(&mut own, "guest");
+                own
+            };
+            let mut table = own();
+            let hosted = over(&table);
+            assert_eq!(keeps(&hosted, &table), all, "{adder}: the one table");
+            let stock = StageRegistry::builtin();
+            assert_eq!(keeps(&hosted, &stock), none, "{adder}: the stock table");
+            assert_eq!(keeps(&hosted, &own()), none, "{adder}: another table");
+            add(&mut table, "late");
+            assert_eq!(keeps(&hosted, &table), none, "{adder}: a stage since");
+        }
+    }
+
     /// A profile is kept only where its stages bear the standing profile's
     /// names in their order: a factory that builds a stage of another name
     /// at a later call has its profile built new, and kept once the name
@@ -8303,10 +8370,9 @@ mod tests {
     /// of a stage has its profile built new: the words it takes, the load
     /// reports, a need, a mark, its ranks, the rule of its heads, its
     /// warm-up ruling, a filter of another type under one name, the
-    /// lifecycle's calls, or no ask for the count of sends. Each
-    /// other reader of its count of sends is built new with it, and the
-    /// count takes over the standing one's sends. The same stage again is
-    /// kept.
+    /// lifecycle's calls, or no ask for the count of sends. The other
+    /// reader of its count of sends is kept, and the count with it. The
+    /// same stage again is kept.
     #[cfg(feature = "in-process")]
     #[test]
     fn a_profile_whose_factory_builds_a_stage_that_says_otherwise_is_built_new() {
@@ -8444,7 +8510,7 @@ mod tests {
             ..Default::default()
         };
         let all = ([true, true, false], true);
-        let none = ([false; 3], false);
+        let beside = ([false, true, false], true);
         let turns = [
             (1, "other words"),
             (2, "load reports"),
@@ -8466,10 +8532,10 @@ mod tests {
             says.store(other, Relaxed);
             let mut next = validated().expect("a valid document");
             next.keep_from(&standing);
-            assert_eq!(kept(&next, &standing), none, "{what}: both readers anew");
+            assert_eq!(kept(&next, &standing), beside, "{what}: `p` alone anew");
             next.engine().succeed(standing.engine());
-            let taken = next.engine().sent_credits[0].credits.held(worker);
-            assert_eq!(taken, 1, "{what}: the count built new takes the send over");
+            let held = next.engine().sent_credits[0].credits().held(worker);
+            assert_eq!(held, 1, "{what}: the count stands with its send");
             let mut third = validated().expect("a valid document");
             third.keep_from(&next);
             assert_eq!(kept(&third, &next), all, "{what}: the same stage again");
@@ -8506,9 +8572,146 @@ mod tests {
         assert!(kept, "the count of `p` is the standing one");
         let held: Vec<_> = counts
             .iter()
-            .map(|count| count.credits.held(worker))
+            .map(|count| count.credits().held(worker))
             .collect();
         assert_eq!(held, [2, 1], "each send once in each count that stood");
+    }
+
+    /// A count built beside a reader kept follows the standing one. The
+    /// engine goes on with the standing count, a send behind the keep is
+    /// counted once, and a worker first heard there stands once, for the
+    /// reader kept and for the reader built new.
+    #[cfg(feature = "in-process")]
+    #[test]
+    fn a_count_built_beside_a_reader_kept_follows_the_standing_one() {
+        let send = |spec: &AppliedSpec, worker: u64| {
+            let target = crate::engine::Target {
+                id: crate::engine::WorkerId(worker),
+                ..Default::default()
+            };
+            let lease = crate::tracking::Lease::default();
+            spec.engine()
+                .on_dispatched(&lease, &target, crate::tracking::Side::Single, 0);
+        };
+        let standing = AppliedSpec::validate(&doc(KEPT)).expect("a valid document");
+        send(&standing, 7);
+        // The text of `q` moves: it is built new beside `p`, which is kept.
+        let mut later = doc(KEPT);
+        let q = later.profiles.get_mut("q").expect("the profile");
+        q.filter.push("healthy".into());
+        let mut next = AppliedSpec::validate(&later).expect("a valid document");
+        let built = Arc::clone(&next.engine().sent_credits[0]);
+        next.keep_from(&standing);
+        next.engine().succeed(standing.engine());
+        let own = &next.engine().sent_credits[0];
+        let stands = Arc::ptr_eq(own, &standing.engine().sent_credits[0]);
+        assert!(stands, "the engine goes on with the standing count");
+        assert!(!Arc::ptr_eq(own, &built), "the count built is in no list");
+        send(&next, 9);
+        let held = |count: &DispatchCredit| {
+            [7, 9].map(|worker| count.credits().held(crate::engine::WorkerId(worker)))
+        };
+        assert_eq!(held(&built), [1, 1], "read through the count built");
+        assert_eq!(held(own), [1, 1], "each send once");
+    }
+
+    /// Each later spec adds a reader of the one count. The count each
+    /// build made follows the first spec's count, and no chain of them
+    /// grows: every reader reads the first count's own entries, and a
+    /// worker first heard behind the third spec stands once.
+    #[cfg(feature = "in-process")]
+    #[test]
+    fn a_count_followed_across_three_specs_is_one_set_of_entries() {
+        let with = |names: &str| {
+            let profile = r#"{"score":["least-load"],"pick":"best"}"#;
+            let named = |name: char| format!(r#""{name}":{profile}"#);
+            let bound =
+                |name: char| format!(r#"{{"match":{{"model":"{name}"}},"profile":"{name}"}}"#);
+            let profiles: Vec<String> = names.chars().map(named).collect();
+            let bindings: Vec<String> = names.chars().map(bound).collect();
+            let (profiles, bindings) = (profiles.join(","), bindings.join(","));
+            let text = format!(
+                r#"{{"apiVersion":"smg.policy/v1","profiles":{{{profiles}}},"bindings":[{bindings}]}}"#
+            );
+            AppliedSpec::validate(&doc(&text)).expect("a valid document")
+        };
+        let first = with("p");
+        let mut second = with("pq");
+        let built_second = Arc::clone(&second.engine().sent_credits[0]);
+        second.keep_from(&first);
+        second.engine().succeed(first.engine());
+        let mut third = with("pqs");
+        let built_third = Arc::clone(&third.engine().sent_credits[0]);
+        third.keep_from(&second);
+        third.engine().succeed(second.engine());
+        let worker = crate::engine::WorkerId(9);
+        let target = crate::engine::Target {
+            id: worker,
+            ..Default::default()
+        };
+        let lease = crate::tracking::Lease::default();
+        let engine = third.engine();
+        engine.on_dispatched(&lease, &target, crate::tracking::Side::Single, 0);
+        let leader = &first.engine().sent_credits[0];
+        assert!(
+            Arc::ptr_eq(leader, &engine.sent_credits[0]),
+            "the engine's own"
+        );
+        for count in [leader, &built_second, &built_third] {
+            let entries = std::ptr::eq(count.credits(), leader.credits());
+            assert!(entries, "the first count's own entries, by no chain");
+            assert_eq!(count.credits().held(worker), 1);
+        }
+    }
+
+    /// A count kept bears the name of the profile that made it under an
+    /// earlier spec, so an engine's counts stand in no order of those
+    /// names. A count built new under settings no standing count has still
+    /// finds the count its profile's name made, past a count left free
+    /// ahead of it.
+    #[cfg(feature = "in-process")]
+    #[test]
+    fn a_count_built_new_finds_its_makers_count_among_counts_kept() {
+        let spec = |profiles: &[(&str, u32)]| {
+            let block = |&(name, ttl): &(&str, u32)| {
+                let stages = r#""score":["least-load"],"pick":"best""#;
+                format!(r#""{name}":{{{stages},"sent_ttl_ms":{ttl}}}"#)
+            };
+            let bound = |&(name, _): &(&str, u32)| {
+                format!(r#"{{"match":{{"model":"{name}"}},"profile":"{name}"}}"#)
+            };
+            let blocks: Vec<String> = profiles.iter().map(block).collect();
+            let bindings: Vec<String> = profiles.iter().map(bound).collect();
+            let (blocks, bindings) = (blocks.join(","), bindings.join(","));
+            let text = format!(
+                r#"{{"apiVersion":"smg.policy/v1","profiles":{{{blocks}}},"bindings":[{bindings}]}}"#
+            );
+            AppliedSpec::validate(&doc(&text)).expect("a valid document")
+        };
+        let makers = |spec: &AppliedSpec| {
+            let counts = spec.engine().sent_credits.iter();
+            counts
+                .map(|count| count.profile.clone())
+                .collect::<Vec<_>>()
+        };
+        let first = spec(&[("a", 40), ("b", 41), ("x", 42)]);
+        // `c` reads the count `x` made: the count kept stands at the place
+        // of `c`'s, under `x`'s name.
+        let mut second = spec(&[("a", 40), ("b", 41), ("c", 42), ("m", 43), ("x", 42)]);
+        second.keep_from(&first);
+        second.engine().succeed(first.engine());
+        assert_eq!(makers(&second), ["a", "b", "x", "m"], "in no order");
+        // `b` goes, and `m` writes another limit: no standing count has
+        // its new count's settings, and `b`'s count is left free.
+        let mut third = spec(&[("a", 40), ("c", 42), ("m", 44), ("x", 42)]);
+        third.keep_from(&second);
+        third.engine().succeed(second.engine());
+        let entries = |count: &DispatchCredit| count.credits().tally.load_full();
+        let new = &third.engine().sent_credits[2];
+        let made = &second.engine().sent_credits[3];
+        assert_eq!((new.profile.as_str(), made.profile.as_str()), ("m", "m"));
+        let taken = Arc::ptr_eq(&entries(new), &entries(made));
+        assert!(taken, "the entries of the count its maker's name made");
     }
 
     #[test]

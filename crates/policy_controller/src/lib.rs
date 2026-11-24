@@ -49,11 +49,11 @@
 //!   [`document::RoutingSettings`] writes it.
 //!
 //! - 5.1 and appendix A, the store ingress ([`store`]): the traits through
-//!   which the controller's store is fed (membership, health, loads, KV
-//!   events, reservations, sessions, leases), the one-process
-//!   [`store::MemoryStore`] behind them and the contract tests over it. The
-//!   KV events feed the index the store holds for each model
-//!   ([`store`]), which no decision reads yet. A
+//!   which the controller's store is fed (membership, health, loads,
+//!   reservations, sessions, leases), the one-process
+//!   [`store::MemoryStore`] behind them and the contract tests over it. KV
+//!   events are the worker host's: they feed the index its tables hold for
+//!   each model (`worker_host::KvTables`), which no decision reads yet. A
 //!   gateway in the embedded mode implements the same traits over its own
 //!   structures.
 //! - 10, the election ([`service::elector`]): one [`service::elector::Elector`] over a

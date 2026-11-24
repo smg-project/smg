@@ -30,7 +30,7 @@ use crate::{
     policies::consistent_hashing::{InOrder, LentRing},
     store::GatewayId,
     tracking::{
-        lease::{Outcome, Side, TransportClass},
+        lease::{Outcome, ReleaseReason, Side, TransportClass},
         DecisionGuard,
     },
 };
@@ -531,6 +531,73 @@ fn a_dispatch_said_behind_a_new_document_pins_its_session() {
     assert_eq!(pick.trace.generation, 2, "under the new document");
     assert_eq!(pick.session_verdict, SessionVerdict::Pinned);
     assert_eq!(targets(&followed), [(sent_to.position, sent_to.id)]);
+}
+
+/// The engine with a decision of the key `41` held under its first
+/// document, and a second document in force whose profile has another
+/// text: it kept no stage. What the held decision says from here on is a
+/// word of an older request.
+fn held_behind_a_new_document<'e>(
+    engine: &'e PolicyEngine,
+    members: &PublishedList,
+) -> DecisionGuard<&'e PolicyEngine> {
+    let now = Instant::now();
+    let asks = keyed(41, members);
+    let first = DecisionGuard::decide_under(engine, GatewayId::LOCAL, &asks, now);
+    let first = first.expect("a decision");
+    let mut next = PolicySpec::preset("manual").expect("a built-in preset");
+    next.generation = 2;
+    let profile = next.profiles.get_mut("manual");
+    profile.expect("the preset's profile").filter.reverse();
+    let next = AppliedSpec::validate(&next).expect("the document validates");
+    engine.apply(next).expect("a number above the standing one");
+    first
+}
+
+/// A dispatch said behind a new document on the decision's second target
+/// reaches the engine's session table: the claim the decision made on its
+/// first target is withdrawn there, and the worker the request went to is
+/// pinned. The key's next request follows the second target. A table of
+/// the older stages' own would leave the key on the first.
+#[test]
+fn a_dispatch_on_a_second_target_behind_a_new_document_moves_its_sessions_pin() {
+    let engine = preset("manual");
+    let list = pool(16);
+    let members = PublishedList::new(Arc::clone(&list));
+    let now = Instant::now();
+    let mut first = held_behind_a_new_document(&engine, &members);
+    let claimed = first.take(0).expect("the first target");
+    let sent_to = first.take(1).expect("the second target");
+    assert_ne!(sent_to.id, claimed.id);
+    first.dispatched(now);
+    first.completed(&served(sent_to.id), now);
+    drop(first);
+
+    let followed = decided(&engine, &keyed(41, &members)).decision;
+    let pick = followed.pick().expect("a pick");
+    assert_eq!(pick.trace.generation, 2, "under the new document");
+    assert_eq!(pick.session_verdict, SessionVerdict::Pinned);
+    assert_eq!(targets(&followed), [(sent_to.position, sent_to.id)]);
+}
+
+/// A release at a failed commit said behind a new document reaches the
+/// engine's session table: the claim the decision made is withdrawn there,
+/// and the key's next request is placed anew by the whole pass. A table of
+/// the older stages' own would leave the key pinned on the claimed worker.
+#[test]
+fn a_release_at_a_failed_commit_behind_a_new_document_withdraws_its_sessions_claim() {
+    let engine = preset("manual");
+    let list = pool(16);
+    let members = PublishedList::new(Arc::clone(&list));
+    let mut first = held_behind_a_new_document(&engine, &members);
+    first.released(ReleaseReason::CommitFailed, Instant::now());
+    drop(first);
+
+    let placed = decided(&engine, &keyed(41, &members)).decision;
+    let pick = placed.pick().expect("a pick");
+    assert_eq!(pick.trace.generation, 2, "under the new document");
+    assert_ne!(pick.session_verdict, SessionVerdict::Pinned);
+    assert!(!pick.trace.drew_first(), "the whole pass places the key");
 }
 
 /// The engine's own pass drops the session keys past their end, off the

@@ -3273,7 +3273,8 @@ impl Glob {
 /// fills its cap is held to a test of the profile's own too
 /// ([`Engine::keeps_for`]). Every input of a naming that is a profile's
 /// own stands here: two profiles are named the same rows where
-/// [`Self::names_as`] says so.
+/// [`Self::names_as`] says so. `==` asks another thing, whether two
+/// builds made one value: what a keep asks (`Engine::read_as`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct NamedBy {
     /// The cap of each list: `0` where the profile is named no row.
@@ -3311,7 +3312,9 @@ impl NamedBy {
 /// standing pass asks of a row ([`Engine::keeps_for`]), as far as one
 /// profile's can be told from another's. The key's mark is no part of
 /// it: the mark is set behind the build, and the test reads it where it
-/// is made.
+/// is made. `==` asks whether two builds made one value, what a keep
+/// asks (`Engine::read_as`): whether two namings are held to one test is
+/// [`Self::same_test`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Held {
     /// To no test: the pass alone can say which rows stay
@@ -3651,10 +3654,10 @@ pub struct Engine {
     /// build, so a publication asks no stage whether it keeps them.
     keepers: Vec<Keeper>,
     /// One tally for each set of send settings a profile's stages read
-    /// under, in the order of the names of the profiles that made them:
-    /// a later engine finds one by its settings, then by that name, then
-    /// takes one that is left
-    /// ([`Engine::succeed`]).
+    /// under: a later engine finds one by its settings, then by the name
+    /// of the profile that made it, then takes one that is left
+    /// ([`Engine::succeed`]). A tally kept from an earlier engine bears
+    /// the name of the profile that made it there.
     pub(crate) sent_credits: Vec<Arc<DispatchCredit>>,
     /// Beside each profile, the place in `sent_credits` of the tally its
     /// stages read, where one asked for it at the build.
@@ -5262,10 +5265,9 @@ impl Engine {
                     0 => prior
                         .iter()
                         .position(|count| count.settings == credit.settings),
-                    1 => prior
-                        .binary_search_by(|count| count.profile.cmp(&credit.profile))
-                        .ok()
-                        .filter(|&standing| free[standing]),
+                    1 => (0..prior.len()).find(|&standing| {
+                        free[standing] && prior[standing].profile == credit.profile
+                    }),
                     _ => left.find(|&standing| free[standing]),
                 };
                 if let Some(standing) = taken[at] {
@@ -5293,12 +5295,14 @@ impl Engine {
     /// engine's tables were folded from the stages built for it: a
     /// profile whose factory built it a stage that says otherwise, under
     /// the same name and text, is built new.
-    /// A count of sends goes with its readers: it is kept where every
-    /// profile that reads it is kept and the standing count was made under
-    /// the same profile's name, and else every reader of it is built new,
-    /// since a rank first heard behind this call would stand in one of two
-    /// counts alone. A profile kept keeps the generation its object was
-    /// made under ([`Engine::hearing`]).
+    /// A count of sends stands where a profile that reads it is kept: this
+    /// engine goes on with the standing count, and the count its build
+    /// made follows that one ([`DispatchCredit::follow`]), so a reader
+    /// built new and a reader kept read one set of entries and a rank
+    /// first heard behind this call stands once. A count none of whose
+    /// readers is kept is this engine's own, and takes a standing count
+    /// over ([`Self::succeed`]). A profile kept keeps the generation its
+    /// object was made under ([`Engine::hearing`]).
     ///
     /// Nothing is kept across two stage tables that may build another
     /// stage under one name: the stock table's number, or one table of a
@@ -5335,28 +5339,27 @@ impl Engine {
             like.then_some(stood)
         };
         let profiles = self.profiles.iter().enumerate();
-        let mut kept: Vec<Option<usize>> = profiles.map(twin).collect();
-        // A count's readers, by their places: kept whole, or built new whole.
+        let kept: Vec<Option<usize>> = profiles.map(twin).collect();
+        // A count's readers, by their places. Where one of them is kept,
+        // the engine goes on with the standing count that reader holds, and
+        // the count the build made follows it: a reader built new reads
+        // and writes the standing count's entries through its own.
         debug_assert_eq!(self.sent_of.len(), self.profiles.len());
         let read = |of: &Self, at: usize| of.sent_of.get(at).copied().flatten();
         self.sent_born = vec![self.generation; self.sent_credits.len()];
         for count in 0..self.sent_credits.len() {
-            let readers = (0..self.profiles.len()).filter(|&at| read(self, at) == Some(count));
-            let readers: Vec<usize> = readers.collect();
-            let stood = readers.first().and_then(|&at| {
-                let stood = read(standing, kept[at]?)?;
-                let reads = |other| read(standing, other) == Some(stood);
-                let whole = readers.iter().all(|&at| kept[at].is_some_and(reads));
-                let made = &standing.sent_credits[stood].profile;
-                (whole && *made == self.sent_credits[count].profile).then_some(stood)
-            });
-            let Some(stood) = stood else {
-                readers.into_iter().for_each(|at| kept[at] = None);
-                continue;
-            };
+            let mut readers = (0..self.profiles.len()).filter(|&at| read(self, at) == Some(count));
+            let stood = readers.find_map(|at| read(standing, kept[at]?));
+            let Some(stood) = stood else { continue };
+            // One set of settings, one standing count: the other readers
+            // kept hold the same one.
+            let same = |twin| read(standing, twin) == Some(stood);
+            debug_assert!(readers.all(|at| kept[at].is_none_or(same)));
+            let leader = &standing.sent_credits[stood];
+            self.sent_credits[count].follow(leader);
             let born = standing.sent_born.get(stood).copied();
             self.sent_born[count] = born.unwrap_or(standing.generation);
-            self.sent_credits[count] = Arc::clone(&standing.sent_credits[stood]);
+            self.sent_credits[count] = Arc::clone(leader);
         }
         for (at, stood) in kept.into_iter().enumerate() {
             let Some(stood) = stood else { continue };

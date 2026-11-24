@@ -21,7 +21,6 @@ pub enum EntryReplication {
 }
 
 const HELLO: &str = "a gateway's own fact: it returns in the gateway's hello";
-const SUBSCRIPTION: &str = "each replica hears the engines' cache events itself";
 const DISPATCHED: &str = "a new leader reads dispatched leases from the engines' in-flight \
                           snapshots and rebuilds credits from its own tally";
 const LEASES: &str = "no journal entry carries a reservation, an issue or a lease's end yet";
@@ -85,38 +84,6 @@ pub const ENTRIES: &[(&str, &str, EntryReplication)] = &[
         "LoadSink",
         "evict",
         EntryReplication::Rebuilt("each replica drops its own load rows"),
-    ),
-    (
-        "KvEventSink",
-        "admit_through",
-        EntryReplication::Rebuilt(SUBSCRIPTION),
-    ),
-    (
-        "KvEventSink",
-        "reconnected",
-        EntryReplication::Rebuilt(SUBSCRIPTION),
-    ),
-    (
-        "KvEventSink",
-        "resync",
-        EntryReplication::Rebuilt(SUBSCRIPTION),
-    ),
-    ("KvEventSink", "cursor", EntryReplication::Read),
-    (
-        "KvEventSink",
-        "removed",
-        EntryReplication::Rebuilt(SUBSCRIPTION),
-    ),
-    ("KvEventSink", "block_size", EntryReplication::Read),
-    (
-        "KvEventSink",
-        "set_block_size",
-        EntryReplication::Rebuilt(SUBSCRIPTION),
-    ),
-    (
-        "KvEventSink",
-        "forget_block_size",
-        EntryReplication::Rebuilt(SUBSCRIPTION),
     ),
     ("ReservationStore", "window", EntryReplication::Read),
     (
@@ -219,9 +186,6 @@ pub const ENTRIES: &[(&str, &str, EntryReplication)] = &[
     ("MemoryStore", "outside_lists", EntryReplication::Read),
     ("MemoryStore", "publications", EntryReplication::Read),
     ("MemoryStore", "membership_builds", EntryReplication::Read),
-    ("MemoryStore", "resyncs", EntryReplication::Read),
-    ("MemoryStore", "indexed_blocks", EntryReplication::Read),
-    ("MemoryStore", "unindexed_rows", EntryReplication::Read),
 ];
 
 #[cfg(test)]
@@ -229,11 +193,10 @@ mod tests {
     use super::*;
 
     /// The store's ingress traits, each with its file's text.
-    const TRAITS: [(&str, &str); 6] = [
+    const TRAITS: [(&str, &str); 5] = [
         ("WorkersStore", include_str!("../../store/workers.rs")),
         ("HealthSink", include_str!("../../store/health.rs")),
         ("LoadSink", include_str!("../../store/loads.rs")),
-        ("KvEventSink", include_str!("../../store/kv_events.rs")),
         (
             "ReservationStore",
             include_str!("../../store/reservations.rs"),

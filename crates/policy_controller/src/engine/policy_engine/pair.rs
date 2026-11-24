@@ -69,7 +69,7 @@
 //! worker of the side holds of the request, by the host's index of cache
 //! events and by the record of sent prefixes, read at the side's phase.
 //! Behind a pick its profile is told of, each side's record keeps where
-//! the prompt went ([`overlap::record_prefix`]). The decode asked again
+//! the prompt went ([`overlap::record_by_column`]). The decode asked again
 //! reads the decodes' column alone. The two sides write into the model's
 //! one record under its one bound: a pair's request spends a placement a
 //! block for each side, where a single's spends one.
@@ -605,7 +605,14 @@ impl<'a> PairLists<'a> {
                     decide_decode_records(engine, facts, side, &decode_facts, pools, held, scratch)
                 }
             };
-            record_sides(&decision, facts, (prefill, decode), read, &sends_to);
+            record_sides(
+                &decision,
+                facts,
+                (prefill, decode),
+                read,
+                &buffers.columns,
+                &sends_to,
+            );
             decision
         };
         let decision = BUFFERS.with(|buffers| match buffers.try_borrow_mut() {
@@ -671,19 +678,20 @@ pub(super) fn side_columns(
 }
 
 /// Behind a pick its profile is told of, each side's record of sent
-/// prefixes keeps where the prompt went ([`overlap::record_prefix`]): the
-/// first target the request's caller sends to (`sends_to`,
+/// prefixes keeps where the prompt went ([`overlap::record_by_column`]):
+/// the first target the request's caller sends to (`sends_to`,
 /// [`overlap::sent_target`]), and nobody where it sends to none. The
 /// prefill's worker is written at the prefill phase and the decode's at
 /// the decode phase, each where its side's fill read the record (`read`,
-/// as [`side_columns`] returned it). A pair neither side of which read its
-/// record asks nothing of the pick.
+/// as [`side_columns`] returned it, and `columns` as it filled them). A
+/// pair neither side of which read its record asks nothing of the pick.
 #[inline]
 pub(super) fn record_sides(
     decision: &Decision,
     facts: &RequestFacts<'_>,
     (prefill, decode): (&PoolMembers, &PoolMembers),
     [prefill_read, decode_read]: [Option<overlap::PrefixRead>; 2],
+    [prefill_column, decode_column]: &[Vec<AffinityFacts>; 2],
     sends_to: impl Fn(&Target) -> bool,
 ) {
     if prefill_read.is_none() && decode_read.is_none() {
@@ -693,12 +701,12 @@ pub(super) fn record_sides(
         return;
     };
     if let Some(read) = prefill_read {
-        let pool = prefill.affinity();
-        overlap::record_prefix(pool, Phase::Prefill, facts, read, sent.id);
+        let (pool, column) = (prefill.affinity(), Some(prefill_column.as_slice()));
+        overlap::record_by_column(pool, Phase::Prefill, facts, read, column, sent.id);
     }
     if let (Some(read), Some(pair)) = (decode_read, sent.pair) {
-        let pool = decode.affinity();
-        overlap::record_prefix(pool, Phase::Decode, facts, read, pair.decode_id);
+        let (pool, column) = (decode.affinity(), Some(decode_column.as_slice()));
+        overlap::record_by_column(pool, Phase::Decode, facts, read, column, pair.decode_id);
     }
 }
 

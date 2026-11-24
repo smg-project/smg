@@ -4,7 +4,7 @@ use std::{
     marker::PhantomData,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc,
+        Arc, OnceLock,
     },
 };
 
@@ -177,7 +177,11 @@ impl ComparedReports {
 /// send in every count, and only a decision's read lets one go, so a count
 /// of its own would keep the sends of a profile that decides no request.
 ///
-/// A new document's count takes over the rows' entries of the standing
+/// Where a new document keeps a profile that reads a count, its engine
+/// goes on with that count, and the count built for the document's
+/// readers follows it (`follow`): the readers kept and the readers
+/// built new read one set of entries. Any other count of a new document
+/// takes over the rows' entries of the standing
 /// count under the same settings, or else of the one that a profile
 /// of its maker's name made, or else of one that no count of the new
 /// document took, and shares them with it
@@ -209,7 +213,14 @@ impl ComparedReports {
 /// the count. This threshold applies at any age.
 #[derive(Debug)]
 pub struct DispatchCredit {
-    pub(crate) credits: Credits,
+    /// The rows' entries of this count's own: what every word of it reads
+    /// and writes, unless it follows another count ([`Self::credits`]).
+    credits: Credits,
+    /// The standing count this one follows, from the keep that built it
+    /// beside that count's readers on ([`Self::follow`]): every word of
+    /// this count reads and writes that count's entries. Unset for a count
+    /// an engine holds as its own.
+    follows: OnceLock<Arc<DispatchCredit>>,
     /// The profile's time limit, `u64::MAX` where it sets none: no clock
     /// reaches a cutoff that far back. Zero under a count that ends a
     /// send only at a changed report: a pass's cutoff is then its
@@ -255,6 +266,7 @@ impl DispatchCredit {
         let changed = settings.until_report_changes;
         Self {
             credits: Credits::default(),
+            follows: OnceLock::new(),
             ttl_micros: if changed { 0 } else { ttl_micros },
             changed_ttl_micros: settings.ttl_ms.map(micros),
             report_delay_micros: settings.report_delay_ms.map_or(0, micros),
@@ -272,6 +284,36 @@ impl DispatchCredit {
             settings,
             profile: profile.to_owned(),
         }
+    }
+
+    /// The rows' entries every word of this count reads and writes: its
+    /// own, or those of the count it follows. One load of the cell, which
+    /// a count that follows none answers by its own entries.
+    #[inline(always)]
+    pub(crate) fn credits(&self) -> &Credits {
+        match self.follows.get() {
+            Some(leader) => &leader.credits,
+            None => &self.credits,
+        }
+    }
+
+    /// This count reads and writes `leader`'s entries from here on. A new
+    /// document's count is built for its readers, and where the document
+    /// keeps a standing reader of the same settings the engine goes on
+    /// with that reader's count: the count built follows it, so the
+    /// readers built new and the reader kept read one set of entries, and
+    /// a rank first heard later stands once. The engine tells the count it
+    /// goes on with and no count that follows: a send is counted once.
+    /// Called once, before a word reaches this count, with a count that
+    /// follows none: a count follows one count for its life, and no chain
+    /// of them grows.
+    #[cfg(feature = "in-process")]
+    pub(crate) fn follow(&self, leader: &Arc<Self>) {
+        debug_assert_eq!(self.settings, leader.settings, "one set of settings");
+        debug_assert!(leader.follows.get().is_none(), "its leader follows none");
+        debug_assert!(self.credits.tally.load().is_empty(), "no word yet");
+        let set = self.follows.set(Arc::clone(leader));
+        debug_assert!(set.is_ok(), "a count follows one count");
     }
 
     /// [`Self::release`] of a count that sets no rule on a changed
@@ -338,8 +380,13 @@ impl DispatchCredit {
     /// Takes over the rows' entries `standing` holds: the map as it
     /// stands, so both counts credit and release the same entries, and
     /// each enters a rank the other never saw in a map of its own.
+    /// Neither count follows another: an engine holds the count followed
+    /// in the place of each count that follows, and it alone calls this.
     pub(crate) fn succeed(&self, standing: &Self) {
-        self.credits.tally.store(standing.credits.tally.load_full());
+        debug_assert!(self.follows.get().is_none(), "an engine's own count");
+        debug_assert!(standing.follows.get().is_none(), "an engine's own count");
+        let held = standing.credits.tally.load_full();
+        self.credits.tally.store(held);
     }
 
     /// Counts one send. `present` is asked only where the send would
@@ -352,7 +399,7 @@ impl DispatchCredit {
         since_decision_micros: u32,
         present: impl FnOnce() -> bool,
     ) {
-        self.credits.dispatched(
+        self.credits().dispatched(
             lease,
             target,
             side,
@@ -363,7 +410,7 @@ impl DispatchCredit {
     }
 
     pub(crate) fn membership(&self, change: &Membership<'_>) {
-        self.credits.membership(change, |_| {});
+        self.credits().membership(change, |_| {});
     }
 
     /// Whether the profile sets a time limit or a report delay on its
@@ -386,7 +433,7 @@ impl DispatchCredit {
     #[inline]
     pub fn pass<'a>(&'a self, facts: &RequestFacts<'_>) -> DispatchCreditPass<'a> {
         DispatchCreditPass {
-            tally: self.credits.tally.load(),
+            tally: self.credits().tally.load(),
             cutoff: facts.now_micros.saturating_sub(self.ttl_micros),
             delay: self.report_delay_micros,
             credit: self,
@@ -404,7 +451,7 @@ impl DispatchCredit {
             "the count sets no limit, no delay and no compare"
         );
         UnlimitedPass {
-            tally: self.credits.tally.load(),
+            tally: self.credits().tally.load(),
             credit: PhantomData,
         }
     }

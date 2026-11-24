@@ -248,17 +248,12 @@ pub(crate) async fn ensure_mcp_connection(
     Ok((false, Vec::new()))
 }
 
-/// Refuse a Responses request with a function or custom tool, alone or in a
-/// namespace, that only code may call (`allowed_callers` without `direct`).
-/// This router runs no programmatic tool calls, and its chat template offers
-/// the model every function tool it is handed, so it could serve such a tool
-/// only as one the model calls directly, which the request forbids.
+/// Refuse tools that disallow direct calls, including namespace members.
+/// This router can offer tools to the model only for direct calls.
 pub(crate) fn refuse_tools_without_a_direct_caller(
     tools: Option<&[ResponseTool]>,
 ) -> Option<Response> {
     let refused_at = |idx: usize, tool: &ResponseTool| match tool {
-        ResponseTool::Function(ft) => (!ft.allows_direct_calls()).then(|| format!("tools[{idx}]")),
-        ResponseTool::Custom(ct) => (!ct.allows_direct_calls()).then(|| format!("tools[{idx}]")),
         ResponseTool::Namespace(namespace) => {
             namespace
                 .tools
@@ -272,7 +267,7 @@ pub(crate) fn refuse_tools_without_a_direct_caller(
                     (!direct).then(|| format!("tools[{idx}].tools[{member_idx}]"))
                 })
         }
-        _ => None,
+        _ => (!tool.allows_direct_calls()).then(|| format!("tools[{idx}]")),
     };
     let at = tools
         .unwrap_or_default()
@@ -1460,6 +1455,23 @@ mod tests {
         for (tools, at) in [
             (json!([function(json!(["programmatic"]))]), "tools[0]"),
             (json!([function(json!([]))]), "tools[0]"),
+            (
+                json!([{"type": "mcp", "server_label": "docs", "server_url": "https://example.com/mcp",
+                         "allowed_callers": ["programmatic"]}]),
+                "tools[0]",
+            ),
+            (
+                json!([{"type": "code_interpreter", "allowed_callers": ["programmatic"]}]),
+                "tools[0]",
+            ),
+            (
+                json!([{"type": "shell", "allowed_callers": ["programmatic"]}]),
+                "tools[0]",
+            ),
+            (
+                json!([{"type": "apply_patch", "allowed_callers": ["programmatic"]}]),
+                "tools[0]",
+            ),
             (
                 json!([{"type": "function", "name": "a", "parameters": {}}, custom(json!(["programmatic"]))]),
                 "tools[1]",

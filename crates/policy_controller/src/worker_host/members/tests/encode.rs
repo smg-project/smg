@@ -82,7 +82,7 @@ fn meets(class: u32) -> EncoderFacts {
 
 /// The holder hands what an encode request's decision reads beside its
 /// encoder list and its prefill list by the places of the two lists as
-/// lent, under the store's encode rule over what the rows state. The
+/// lent, under the engine's encode rule over what the rows state. The
 /// encoders of one end are one class, numbered where its first encoder is
 /// lent, and a prefill names the class of the end it states. A prefill with
 /// no row stands among the members and in no list, so it takes no place.

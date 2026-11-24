@@ -4,8 +4,8 @@
 //! encoders it offered the request's items and each item's encoder, or a
 //! refusal by its name. Nothing is drawn.
 //!
-//! A row replays in two parts. The store's part is which encoders hand to
-//! which prefill ([`EncodeClasses`]). A placed request with items was
+//! A row replays in two parts. The encode rule's part is which encoders
+//! hand to which prefill ([`EncodeClasses`]). A placed request with items was
 //! offered the encoders of its prefill's class, those that were ready and
 //! take the request's media, and no other. A refusal that names a permanent
 //! gap of the encode side says no class serves the request: no prefill with
@@ -48,13 +48,13 @@ use serde::Deserialize;
 use smg_policy_controller::{
     document::{AppliedSpec, PolicySpec},
     engine::{
-        fingerprint, Constraints, Decision, EncodeItems, EncodeLists, EncodePlaced, EncoderFacts,
-        FixedFacts, Identity, LentList, ListCell, MediaCounts, PairAdmission, PairLists,
-        PartnerClasses, Phase, PolicyEngine, Request as HostRequest, RequestFacts, RequestMaker,
-        WorkerLists,
+        fingerprint, Constraints, Decision, EncodeClasses, EncodeItems, EncodeLists, EncodeMember,
+        EncodePlaced, EncoderFacts, FixedFacts, Identity, LentList, ListCell, MediaCounts,
+        PairAdmission, PairLists, PartnerClasses, Phase, PolicyEngine, Request as HostRequest,
+        RequestFacts, RequestMaker, WorkerLists,
     },
     policies::consistent_hashing::LentRing,
-    store::{EncodeClasses, EncodeHandoff, EncodeMember, EncodeOffer},
+    store::{EncodeHandoff, EncodeOffer},
 };
 use smg_worker::{
     identity::{basic::Worker, builder::BasicWorkerBuilder},
@@ -234,7 +234,8 @@ fn offers(row: &Row) -> Option<(Vec<EncodeOffer>, Vec<EncodeOffer>)> {
     Some((encoders, prefills))
 }
 
-/// What of one row's store part does not replay, request by request.
+/// What of the encode rule's part of one row does not replay, request by
+/// request.
 fn replay(row: &Row) -> Vec<String> {
     let Some((of_encoders, of_prefills)) = offers(row) else {
         return vec!["the encoders of one runtime state two forms".to_string()];
@@ -546,8 +547,8 @@ fn decided(row: &Row, classes: &EncodeClasses, offers: &[EncodeOffer], lent: boo
     };
     let ring = row.encode_policy != FEWEST;
     let fleet = Fleet::of(row);
-    // What the decision reads of each encoder, by the rule the store
-    // writes it by.
+    // What the decision reads of each encoder, by the rule a host derives
+    // it by.
     let of_encoders: Vec<EncoderFacts> = classes.encoder_facts(offers);
     let prefill_classes: Vec<u32> = (0..row.prefills.len())
         .map(|at| classes.prefill_class(at))
@@ -732,7 +733,7 @@ pub fn replay_rows(text: &str, source: &str) -> (usize, Vec<String>) {
 }
 
 /// Rows copied from the recorded sheet, one or more of each form the
-/// store's part reads, with every runtime replaced by a token. The rule
+/// rule's part reads, with every runtime replaced by a token. The rule
 /// compares runtimes for equality and reads none, and the tokens keep the
 /// names' order, so a copied row is its sheet's row under one renaming: the
 /// pair index's rule for a copied row holds these rows to that too.

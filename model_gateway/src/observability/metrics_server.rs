@@ -17,7 +17,8 @@ use crate::config::bind_socket_addr;
 struct MetricsState {
     handle: PrometheusHandle,
     /// The policy engine, where the gateway started one, and what the
-    /// scrapes so far published of its shadow counts.
+    /// scrapes so far published of its shadow counts. A scrape reads the
+    /// engine's fault counts too, and keeps nothing of them.
     shadows: Option<(&'static PolicyEngine, Arc<ShadowsPublished>)>,
 }
 
@@ -27,6 +28,7 @@ async fn prometheus_handler(State(state): State<MetricsState>) -> impl IntoRespo
     super::metrics::record_tokenizer_encode_activity();
     if let Some((engine, published)) = &state.shadows {
         super::metrics::record_policy_shadow_activity(engine, published);
+        super::metrics::record_policy_fault_activity(engine);
     }
     let mut body = state.handle.render();
     worker_series::render_into(&mut body);
@@ -51,8 +53,8 @@ async fn bind_metrics_listener(addr: SocketAddr) -> Result<tokio::net::TcpListen
 ///
 /// `engine` is the policy engine the gateway started, where it started one:
 /// each scrape publishes that engine's shadow counts too
-/// (`smg_policy_shadow_decisions_total`). With no engine the family is not
-/// published.
+/// (`smg_policy_shadow_decisions_total`), and the panics it held and counted
+/// (`smg_policy_faults_total`). With no engine neither family is published.
 pub async fn start_metrics_server(
     handle: PrometheusHandle,
     host: String,
@@ -113,7 +115,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        observability::metrics::test_support::{shadow_kinds, shadowing_spec},
+        observability::metrics::test_support::{fault_kinds, shadow_kinds, shadowing_spec},
         server::http_client,
     };
 
@@ -150,6 +152,22 @@ mod tests {
                 "{scrape}"
             );
         }
+    }
+
+    /// A scrape of a gateway that started a policy engine publishes the
+    /// panics that engine held and counted: a series of each kind, at zero
+    /// before any panic. A gateway that started no engine publishes no such
+    /// family.
+    #[tokio::test]
+    async fn a_scrape_publishes_the_fault_counts_of_the_engine_it_was_started_with() {
+        let preset = PolicySpec::preset("round_robin").expect("a stock preset");
+        let plain = AppliedSpec::validate(&preset).expect("a valid policy document");
+        let engine: &'static PolicyEngine = Box::leak(Box::new(PolicyEngine::new(plain)));
+        let started = scraped(Some(engine)).await;
+        assert_eq!(fault_kinds(&started), [Some(0); 3], "{started}");
+
+        let classic = scraped(None).await;
+        assert!(!classic.contains("smg_policy_faults_total"), "{classic}");
     }
 
     #[tokio::test]

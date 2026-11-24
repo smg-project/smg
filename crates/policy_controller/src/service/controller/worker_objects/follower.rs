@@ -15,7 +15,7 @@ use super::ObjectsWake;
 use crate::service::controller::Config;
 use crate::{
     store::MemoryStore,
-    worker_host::{Members, Objects},
+    worker_host::{KvTables, Members, Objects},
 };
 
 /// The replica's worker objects: their holder, the store it follows and the
@@ -44,6 +44,9 @@ use crate::{
 pub(crate) struct WorkerObjects {
     store: Arc<MemoryStore>,
     objects: Arc<Objects<Members>>,
+    /// The KV tables the holder was handed, kept beside it: a reader of the
+    /// replica's tables is handed these, the ones its feed writes.
+    tables: Arc<KvTables>,
     wake: ObjectsWake,
 }
 
@@ -75,14 +78,19 @@ impl WorkerObjects {
         connector: Arc<dyn EngineConnector>,
         overload: OverloadThresholds,
     ) -> Self {
+        // The KV tables are the replica's own, made here once: the holder
+        // states its rows to them and the feed writes them.
+        let tables = Arc::new(KvTables::default());
         Self {
             store,
             objects: Arc::new(
                 Objects::new(Arc::new(WorkerRegistry::new()))
                     .with_connector(connector)
                     .with_host_local_unchecked()
-                    .with_overload_thresholds(overload),
+                    .with_overload_thresholds(overload)
+                    .with_kv_tables(Arc::clone(&tables)),
             ),
+            tables,
             wake,
         }
     }
@@ -90,6 +98,11 @@ impl WorkerObjects {
     /// The store the objects' rows stand in.
     pub(crate) fn store(&self) -> Arc<MemoryStore> {
         Arc::clone(&self.store)
+    }
+
+    /// The replica's KV tables: the ones the holder was handed at its build.
+    pub(crate) fn kv_tables(&self) -> Arc<KvTables> {
+        Arc::clone(&self.tables)
     }
 
     /// The holder shared with readers of the replica's worker objects.

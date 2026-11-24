@@ -100,6 +100,7 @@ impl ToolLoopState {
             .push(ResponseInputOutputItem::FunctionToolCall {
                 id: Some(id),
                 call_id,
+                caller: None,
                 name,
                 namespace,
                 arguments: args_json_str,
@@ -383,6 +384,11 @@ pub(super) fn build_next_request(
         prompt: current_request.prompt,
         prompt_cache_key: current_request.prompt_cache_key,
         prompt_cache_retention: current_request.prompt_cache_retention,
+        prompt_cache_options: current_request.prompt_cache_options,
+        background_options: current_request.background_options,
+        moderation: current_request.moderation,
+        image: current_request.image,
+        access_programs: current_request.access_programs,
         safety_identifier: current_request.safety_identifier,
         stream_options: current_request.stream_options,
         context_management: current_request.context_management,
@@ -742,7 +748,10 @@ mod history_tests {
         let result = |k: usize| {
             ResponseInput::Items(vec![ResponseInputOutputItem::FunctionCallOutput {
                 id: None,
-                call_id: format!("call_{k}"),
+                call_id: Some(format!("call_{k}")),
+                caller: None,
+                name: None,
+                namespace: None,
                 output: StringOrContentParts::String("ok".to_string()),
                 status: None,
             }])
@@ -837,7 +846,10 @@ mod history_tests {
             model: "deepseek-flash".to_string(),
             input: ResponseInput::Items(vec![ResponseInputOutputItem::FunctionCallOutput {
                 id: None,
-                call_id: "call_unknown".to_string(),
+                call_id: Some("call_unknown".to_string()),
+                caller: None,
+                name: None,
+                namespace: None,
                 output: StringOrContentParts::String("ok".to_string()),
                 status: None,
             }]),
@@ -903,7 +915,10 @@ mod history_tests {
                         reference,
                         ResponseInputOutputItem::FunctionCallOutput {
                             id: None,
-                            call_id: "call_1".to_string(),
+                            call_id: Some("call_1".to_string()),
+                            caller: None,
+                            name: None,
+                            namespace: None,
                             output: StringOrContentParts::String("42".to_string()),
                             status: None,
                         },

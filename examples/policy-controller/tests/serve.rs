@@ -477,10 +477,13 @@ async fn the_started_binary_decides_by_its_document_over_the_fleet_its_door_was_
             })
             .await
             .expect("the controller answers the ask");
-        let Answer::Decision(proto::Decision {
-            outcome: Some(decision::Outcome::Pick(pick)),
-            ..
-        }) = &answer
+        let Answer::Decision(
+            proto::Decision {
+                outcome: Some(decision::Outcome::Pick(pick)),
+                ..
+            },
+            _,
+        ) = &answer
         else {
             panic!("a pick answers an ask over a ready fleet: {answer:?}");
         };
