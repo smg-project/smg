@@ -501,9 +501,19 @@ fn skipped_under_a_process_trace(group: &str) -> bool {
 /// of this file's list: a placement counts its selection on a kept handle, as a serving
 /// process does. With no recorder the count builds its key on every placement, a form no
 /// serving process runs. The handle is the one a serving process's upkeep drains.
+///
+/// It is drained twice where it starts. The first two drains each replay what the start
+/// described into one of the two copies the recorder keeps of its descriptions, hashed
+/// under a random seed: paid in a cell's first two batches, a batch of two placements
+/// counted 170 thousand instructions more, and not the same number in two processes.
 fn count_as_a_serving_process() -> &'static PrometheusHandle {
     static RECORDER: OnceLock<PrometheusHandle> = OnceLock::new();
-    RECORDER.get_or_init(|| start_prometheus(PrometheusConfig::default()))
+    RECORDER.get_or_init(|| {
+        let recorder = start_prometheus(PrometheusConfig::default());
+        recorder.run_upkeep();
+        recorder.run_upkeep();
+        recorder
+    })
 }
 
 /// Placements timed between two drains of the recorder. The recorder holds every
