@@ -35,7 +35,7 @@ use crate::{
         decision::{Queue, ShadowKind, Shed, Target, Targets, Trace},
         decision_engine::{Decided, DecisionEngine},
         framework::{Filter, Picker, Place, PoolWord, Scorer, TieBand, DRAW_FROM},
-        list_cell::tests::PublishedList,
+        list_cell::PublishedList,
         records::worker_id,
         view::{fingerprint, Candidate, FixedFacts, HashKind},
         CacheIndex, CacheIndexes, EncodeLists, PairAdmission, PairLists, PartnerClasses,

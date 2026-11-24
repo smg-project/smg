@@ -1311,7 +1311,7 @@ mod tests {
     use super::*;
     use crate::{
         document::spec::{Needs, PolicySpec},
-        engine::{framework::InTheWay, list_cell::tests::PublishedList},
+        engine::{framework::InTheWay, list_cell::PublishedList},
     };
 
     const MODEL: &str = "model-a";

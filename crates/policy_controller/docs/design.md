@@ -779,9 +779,17 @@ the list (`LentList::facts`): one value for each worker, in the list's order. Th
 into the worker's record (section 5.3) where it fills the cell. Three such facts stand today:
 
 - whether a worker takes images;
-- the id the host knows the worker by, where the host keeps ids of its own;
+- the id the host knows the worker by, where the host keeps ids of its own: one for every worker
+  of its lists or for none, and no id twice in a list. A debug build checks each list on its own
+  where it fills the cell;
 - what the worker states for a request's hard demands, which stands in a column beside the
   records.
+
+`PublishedList` is a list, its cell and its facts as one value, and lends the three together. A
+host builds one with the list at hand. One built with facts reads its workers there. So a host
+whose registry makes a generation's value under its own guard builds it behind the guard, at the
+list's first lending, in a once-cell of that value, and a lending reads that one cell. The
+controller's holder keeps each role's list so.
 
 The fill makes the list's records.
 
@@ -1317,7 +1325,8 @@ A host's start has these steps.
    - it fills the cells of the lists the host handed, ahead of their requests.
 3. **It keeps an empty cell beside each published worker list**: a `ListCell` in its value of a
    membership generation. The cell is lent with the list as a `LentList`, with `facts` where the
-   host knows a fact of its workers that their objects do not hold.
+   host knows a fact of its workers that their objects do not hold. `PublishedList` keeps the
+   three as one value (section 5.2).
 4. **It hands its worker lists by model, once**: `engine.set_lists(lists)`, beside the start,
    which does not take them yet. The host implements `ModelLists` over its registry. The engine's
    task fills a list's cell behind the registry's word of the membership change. A later call is
