@@ -11,7 +11,6 @@ use std::{
 use dashmap::{mapref::entry::Entry, DashMap};
 use parking_lot::RwLock;
 use rustc_hash::FxBuildHasher;
-use tracing::debug;
 
 use super::{
     common::{intern_tenant, MatchResult, TenantId, MATCHED_TENANTS_CAP},
@@ -1422,11 +1421,6 @@ impl Tree {
             }
         }
 
-        debug!("Before eviction - Used size per tenant:");
-        for entry in &self.tenant_char_count {
-            debug!("Tenant: {}, Size: {}", entry.key(), entry.value());
-        }
-
         // Process eviction until the tree-wide total obeys the budget
         while self.total_char_size() > max_size {
             let Some(Reverse(entry)) = pq.pop() else {
@@ -1498,11 +1492,6 @@ impl Tree {
         // that crossed the node's detach) leaves here, so the map never
         // outgrows the tree's hashed nodes by more than one eviction pass.
         self.hashed.retain(|_, node| node.strong_count() > 0);
-
-        debug!("After eviction - Used size per tenant:");
-        for entry in &self.tenant_char_count {
-            debug!("Tenant: {}, Size: {}", entry.key(), entry.value());
-        }
     }
 
     pub fn get_tenant_char_count(&self) -> HashMap<String, usize> {
