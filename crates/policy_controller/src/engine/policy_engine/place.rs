@@ -270,8 +270,14 @@ pub struct PlaceRequest<'a> {
     /// The request's own id, where it has one: a source of its routing
     /// value where the document names it, and what a decision the engine
     /// kept of the request is found by ([`PolicyEngine::explained`]). A
-    /// request with none is not kept.
+    /// request with none is found by its `explain_id`, and is not kept
+    /// where it states neither.
     pub request_id: Option<&'a str>,
+    /// The id a decision the engine kept of the request is found by where
+    /// the request states no id of its own: its host's name for it. It is
+    /// no source of a routing value and no lease holds it. The engine
+    /// reads it under a document that keeps a sample, and nowhere else.
+    pub explain_id: Option<&'a str>,
     /// The tenant the request is of.
     pub tenant: Option<&'a str>,
     /// The request's priority band.
@@ -416,6 +422,7 @@ impl<'a> PlaceRequest<'a> {
             prompt: Prompt::NONE,
             headers: &(),
             request_id: None,
+            explain_id: None,
             tenant: None,
             priority: 0,
             streaming: false,
@@ -939,6 +946,11 @@ impl RequestMaker for Made<'_, '_> {
     // request is made for it.
     fn request_id<'w>(&'w self, _: &'w AppliedSpec) -> &'w [u8] {
         self.request.request_id.map_or(&[], str::as_bytes)
+    }
+
+    // The id its host states for a kept decision alone, as it stated it.
+    fn explain_id(&self) -> &[u8] {
+        self.request.explain_id.map_or(&[], str::as_bytes)
     }
 
     // Asked where a plain request's pick is leased, ahead of its making:
