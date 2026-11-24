@@ -25,7 +25,7 @@ use crate::{
         decision::{Decision, ShadowKind, Target},
         decision_engine::{
             DecideOutcome, Decided, DecisionEngine, DecisionRefused, DecodeRefused, HeldDecision,
-            Plain, Request, RequestMaker, TokenKey, WorkerLists,
+            Plain, Request, RequestMaker, TextKey, TokenKey, WorkerLists,
         },
         framework::{EncodeItems, EncodePlaced, EncoderFacts},
         list_cell::tests::PublishedList,
@@ -131,6 +131,10 @@ impl<M: RequestMaker> RequestMaker for Listed<'_, M> {
 
     fn token_key(&self, page: usize) -> Option<TokenKey<'_>> {
         self.0.token_key(page)
+    }
+
+    fn text_key(&self) -> Option<TextKey<'_>> {
+        self.0.text_key()
     }
 }
 

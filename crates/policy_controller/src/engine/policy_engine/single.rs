@@ -401,8 +401,8 @@ fn by_facts<const RETRY: bool>(
 /// Where the profile's stages read who holds the prompt, the lookup does
 /// behind this answer what it does behind any pick. It states in the pick
 /// what the pin's worker holds of the request, from the rows it names. It
-/// hands the prompt to the record of sent prefixes, or to the host's token
-/// tree by the entry and the target its maker names. It may read its list's
+/// hands the prompt to the record of sent prefixes, or to a tree its host
+/// lends by the entry and the target its maker names. It may read its list's
 /// table again, as any decision that finds the table expired, and a tree's
 /// match marks the path it walked as used. Where no binding of the phase
 /// reads affinity, the lookup is one test.

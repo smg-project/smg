@@ -1526,15 +1526,16 @@ struct Asked<'a> {
 /// rows of its binding's shadow.
 ///
 /// A request decided inside a tree's match states what the match's rows
-/// say: the match's tokens counted in the request's blocks for a worker
-/// named among its holders, and a miss for any other. A gateway's classic
-/// cache-aware policy observes another thing of such a request, the match's
-/// share of the prompt's tokens whoever it chose, so the two differ in
-/// three places. A match under one block states a miss: a prompt shorter
-/// than one block always does, where the classic policy may observe it
-/// whole. A pick that is none of the match's holders states a miss, where
-/// the classic policy observes the match's share. Past the cap the holders
-/// named are a draw, so a holder the draw left out states a miss too.
+/// say: the match's tokens, or the bytes of text it matched, counted in the
+/// request's blocks for a worker named among its holders, and a miss for
+/// any other. A gateway's classic cache-aware policy observes another
+/// thing of such a request, the match's share of the prompt's tokens or
+/// chars whoever it chose, so the two differ in three places. A match
+/// under one block states a miss: a prompt shorter than one block always
+/// does, where the classic policy may observe it whole. A pick that is
+/// none of the match's holders states a miss, where the classic policy
+/// observes the match's share. Past the cap the holders named are a draw,
+/// so a holder the draw left out states a miss too.
 ///
 /// The rows live in the calling thread's buffers until this returns:
 /// `decide` reads them and keeps nothing of them. Nothing is allocated once
@@ -1845,17 +1846,11 @@ type Over<'a, 'w> = dyn FnMut(&[TenantId], u32) -> Option<&'w str> + 'a;
 /// The bytes of the leading `matched` chars of `text` that lie behind its
 /// first `marker` chars: what a string tree's match holds of a prompt whose
 /// key begins with a partition's marker. A string tree counts chars, and a
-/// request of text is sized in bytes. One pass over the matched chars.
+/// request of text is sized in bytes. One pass over the matched chars,
+/// which its caller makes only for a key of several bytes a char.
 fn bytes_behind(text: &str, marker: usize, matched: usize) -> usize {
-    // The byte the first `chars` chars of the text end at.
-    let end_of = |chars: usize| {
-        let mut rest = text.chars();
-        if let Some(last) = chars.checked_sub(1) {
-            rest.nth(last);
-        }
-        text.len() - rest.as_str().len()
-    };
-    end_of(matched).saturating_sub(end_of(marker.min(matched)))
+    let matched = text.chars().take(matched);
+    matched.skip(marker).map(char::len_utf8).sum()
 }
 
 impl Table {
@@ -1910,8 +1905,14 @@ impl Table {
             let facts = &*facts;
             let walk = |over: &mut Over<'_, '_>| {
                 sent.match_and_insert_with(&key.text, |found| {
-                    // The match counts the marker's chars too.
-                    let bytes = bytes_behind(&key.text, key.marker, found.matched_char_count);
+                    // The match counts the marker's chars too. A key of
+                    // as many bytes as chars holds one byte a char: its
+                    // chars are its bytes, and no pass is made over it.
+                    let bytes = if found.input_char_count == key.text.len() {
+                        found.matched_char_count.saturating_sub(key.marker)
+                    } else {
+                        bytes_behind(&key.text, key.marker, found.matched_char_count)
+                    };
                     over(&found.matched_tenants, self.blocks_of_text(bytes, facts))
                 });
             };
