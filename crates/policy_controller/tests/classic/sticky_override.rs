@@ -136,6 +136,12 @@ impl Row {
                 selection_policy: None,
                 selection_accounting_ttl_ms: 0,
             },
+            "prefix_hash" => PolicySettings::PrefixHash {
+                prefix_token_count: 256,
+                load_factor: 1.25,
+                balance_abs_threshold: 10,
+                cache_boundaries: Vec::new(),
+            },
             other => return Err(format!("no settings are written here for `{other}`")),
         };
         let settings = RoutingSettings {
@@ -859,13 +865,27 @@ mod sends {
 
         /// [`Self::decide`] for a request that states its prompt: `prompt`
         /// is the hashes of the prompt's blocks, as `engine`'s document
-        /// reads a prompt.
+        /// reads a prompt. A header handed its key.
         fn decide_prompt(
+            &self,
+            engine: &'e PolicyEngine,
+            members: LentList<'_>,
+            asked: (&'static str, u32, u32),
+            prompt: Option<&PromptHashes>,
+        ) -> Decided<'e> {
+            self.decide_keyed(engine, members, asked, prompt, false)
+        }
+
+        /// [`Self::decide_prompt`] for a request whose key a header handed,
+        /// or its own id where `by_id` says so: the word the one call
+        /// states where it derives the key.
+        fn decide_keyed(
             &self,
             engine: &'e PolicyEngine,
             members: LentList<'_>,
             (key, tokens, nth): (&'static str, u32, u32),
             prompt: Option<&PromptHashes>,
+            by_id: bool,
         ) -> Decided<'e> {
             let session_key = match key {
                 "" => Identity::NONE,
@@ -876,6 +896,7 @@ mod sends {
                 seed: u64::from(nth),
                 prompt_tokens: tokens,
                 session_key,
+                session_key_from_rid: by_id,
                 session_counted: true,
                 ..RequestFacts::default()
             };
@@ -1473,6 +1494,276 @@ mod sends {
                  prompt sent back to its worker, {grown:?} grown prompts and {own:?} prompts of \
                  their own placed at the cap on the pinned worker again"
             );
+        }
+    }
+
+    /// `prefix_hash` under the override, which no sheet of the gateway
+    /// records, held to the gateway's rule
+    /// (`model_gateway/src/policies/registry.rs`, `select_sticky`) by a twin
+    /// engine that runs the policy alone over the same worker objects. The
+    /// gateway asks its policy at a key's first request and at a key's
+    /// request with two of its requests on its pin's worker (`:832`,
+    /// `:803`). The policy hashes the key a header handed and places every
+    /// other request by its prompt
+    /// (`model_gateway/src/policies/prefix_hash.rs:384`, `:387-412`): it
+    /// never reads the key the request's own id hands. So the twin is asked
+    /// with the key where a header handed it and with no key where the
+    /// request's own id did, each time with the request's prompt, and each
+    /// request the policy places goes to one worker under both engines.
+    ///
+    /// Two keys of each source take turns with a request that carries
+    /// none, and each request states a prompt of its own. The first worker
+    /// holds twenty requests more than the others, so the ring's load bound
+    /// passes it over under both engines. From the ninth request on the
+    /// oldest request in flight ends ahead of every second decision, and a
+    /// key still meets its cap. Each request is held to the gateway's rule
+    /// by the key's leading pin ([`Pins::rule`]), and each decision's
+    /// verdict to the gateway's write of that pin ([`Pins::sent`]). Over
+    /// three workers and over sixteen.
+    #[test]
+    fn prefix_hash_places_under_the_override_as_the_policy_alone_places() {
+        for workers in [3, 16] {
+            let (keyed, alone) = (engine("prefix_hash", true), engine("prefix_hash", false));
+            let mut host = Host::new(&vec![0; workers]);
+            for _ in 0..20 {
+                host.list[0].increment_load();
+            }
+            let (list, cell) = (Arc::clone(&host.list), ListCell::default());
+            let members = lent(&list, &cell);
+            // A prompt of its own: 1,024 tokens no other prompt holds,
+            // hashed as each engine's document reads a prompt.
+            let prompt = |engine: &PolicyEngine, of: u32| {
+                let tokens: Vec<u32> = (of * 100_000..of * 100_000 + 1_024).collect();
+                engine.prompt_hashes(MODEL, Some(&tokens), None, HashSeeds::PLAIN)
+            };
+            let mut pins = Pins::default();
+            let (mut pinned, mut capped) = (0, 0);
+            // The requests the policy placed, by who handed their key: a
+            // header, the request's own id, nobody.
+            let mut placed = [0_u32; 3];
+            for nth in 0..96_u32 {
+                if nth >= 8 && nth % 2 == 0 {
+                    let oldest = host.held.pop_front().expect("a request in flight");
+                    host.ended(oldest, nth);
+                }
+                let turns = [
+                    ("h0", false),
+                    ("i0", true),
+                    ("h1", false),
+                    ("i1", true),
+                    ("", false),
+                ];
+                let (key, by_id) = turns[nth as usize % turns.len()];
+                let hashes = prompt(&keyed, nth);
+                let asked = (key, 1_024, nth);
+                let (guard, place, by) =
+                    host.decide_keyed(&keyed, members, asked, Some(&hashes), by_id);
+                let at_cap = pins.rule(&host, key, (place, by));
+                pins.sent(&host, key, place, verdict(&guard));
+                let mut guards = vec![guard];
+                if by == PlacedBy::Rule {
+                    pinned += 1;
+                } else {
+                    // The policy alone is handed a header's key, and never
+                    // the id's.
+                    let twin_key = if by_id { "" } else { key };
+                    let hashes = prompt(&alone, nth);
+                    let asked = (twin_key, 1_024, nth);
+                    let (twin, twin_place, _) =
+                        host.decide_prompt(&alone, members, asked, Some(&hashes));
+                    assert_eq!(
+                        place, twin_place,
+                        "{workers} workers: request {nth}, {key:?}"
+                    );
+                    guards.push(twin);
+                    capped += u32::from(at_cap);
+                    placed[if key.is_empty() {
+                        2
+                    } else {
+                        usize::from(by_id)
+                    }] += 1;
+                }
+                host.sent(guards, (key, nth), place);
+            }
+            let floors = pinned >= 8 && capped >= 8 && placed.iter().all(|&count| count >= 8);
+            assert!(
+                floors,
+                "{workers} workers: {pinned} pinned requests, {capped} keyed requests at their \
+                 pin's cap, {placed:?} requests the policy placed by a header's key, by an id's \
+                 and with none"
+            );
+        }
+    }
+
+    /// The ring's load bound moves a pin at its cap. A header's key is
+    /// pinned on its ring owner, which holds some requests more than each
+    /// other worker. With two requests of the key on its worker the gateway
+    /// asks the policy again
+    /// (`model_gateway/src/policies/registry.rs:802-803`), and the policy
+    /// counts those two with the worker's others. Where they put the owner
+    /// past the bound the lookup walks on, and the gateway moves the key's
+    /// pin to that worker, which stands under the cap (`:816-818`). Where
+    /// they do not, the policy answers the owner again and the pin stays.
+    ///
+    /// The owner's lead runs from none to thirty requests. Under each, four
+    /// requests of the key stay in flight, and each is held to the gateway's
+    /// rule ([`Pins::rule`], [`Pins::sent`]) and, where the policy places
+    /// it, to the policy alone. Both rows occur: a pin that stays at its
+    /// cap, and a pin the bound moves off the key's owner, which the key's
+    /// next request follows.
+    #[test]
+    fn the_rings_load_bound_moves_a_pin_at_its_cap() {
+        const KEY: &str = "h0";
+        let prompt = |engine: &PolicyEngine, of: u32| {
+            let tokens: Vec<u32> = (of * 100_000..of * 100_000 + 1_024).collect();
+            engine.prompt_hashes(MODEL, Some(&tokens), None, HashSeeds::PLAIN)
+        };
+        // The key's owner: where the policy alone sends it over workers of
+        // one load.
+        let owner = {
+            let alone = engine("prefix_hash", false);
+            let host = Host::new(&[0; 4]);
+            let (list, cell) = (Arc::clone(&host.list), ListCell::default());
+            let hashes = prompt(&alone, 0);
+            let asked = (KEY, 1_024, 0);
+            let (_, place, _) =
+                host.decide_prompt(&alone, lent(&list, &cell), asked, Some(&hashes));
+            place
+        };
+        let (mut stayed, mut moved) = (0, 0);
+        for lead in 0..=30 {
+            // Engines of their own under each lead: no pin of another lead
+            // stands in the rule's table.
+            let (keyed, alone) = (engine("prefix_hash", true), engine("prefix_hash", false));
+            let mut host = Host::new(&[0; 4]);
+            for _ in 0..lead {
+                host.list[owner].increment_load();
+            }
+            let (list, cell) = (Arc::clone(&host.list), ListCell::default());
+            let members = lent(&list, &cell);
+            let mut pins = Pins::default();
+            let mut places = Vec::new();
+            for nth in 0..4_u32 {
+                let hashes = prompt(&keyed, nth);
+                let asked = (KEY, 1_024, nth);
+                let (guard, place, by) =
+                    host.decide_keyed(&keyed, members, asked, Some(&hashes), false);
+                let at_cap = pins.rule(&host, KEY, (place, by));
+                pins.sent(&host, KEY, place, verdict(&guard));
+                let mut guards = vec![guard];
+                if by != PlacedBy::Rule {
+                    let hashes = prompt(&alone, nth);
+                    let (twin, twin_place, _) =
+                        host.decide_prompt(&alone, members, asked, Some(&hashes));
+                    assert_eq!(place, twin_place, "a lead of {lead}: request {nth}");
+                    guards.push(twin);
+                }
+                host.sent(guards, (KEY, nth), place);
+                places.push((place, by, at_cap));
+            }
+            // The key's second request follows its pin, and its third meets
+            // the cap there: the policy is asked.
+            let pin = places[0].0;
+            assert_eq!(places[1], (pin, PlacedBy::Rule, false), "a lead of {lead}");
+            let (third, by, at_cap) = places[2];
+            assert!(
+                at_cap && by == PlacedBy::Stages,
+                "a lead of {lead}: {places:?}"
+            );
+            if third == pin {
+                stayed += 1;
+            } else if pin == owner {
+                // The owner took the key's first request and not its third:
+                // the key's own two requests put it past the bound.
+                moved += 1;
+                assert_eq!(
+                    places[3],
+                    (third, PlacedBy::Rule, false),
+                    "a lead of {lead}"
+                );
+            }
+        }
+        assert!(
+            stayed >= 1 && moved >= 1,
+            "{stayed} leads keep the pin at its cap, {moved} move it off the key's owner"
+        );
+    }
+
+    /// A pinned worker over its thresholds passes its key on under the
+    /// prefix ring. The gateway lifts the overload veto for a request its
+    /// policy places by session key, and the plain ring's is the one policy
+    /// that says so (`model_gateway/src/routers/common/placement.rs:1406`,
+    /// `model_gateway/src/policies/consistent_hashing.rs:262`). Under
+    /// `prefix_hash` its sticky map reads a pin on such a worker as no pin
+    /// to follow, asks the policy, and moves the key's pin to its pick
+    /// (`model_gateway/src/policies/registry.rs:791-793`, `:827-837`). The
+    /// engine does the same: the ring's prefix form keeps no key over that
+    /// veto.
+    ///
+    /// A key's requests end one by one, so its cap is never met, and each
+    /// states the key's one prompt. The first is the policy's and the
+    /// second follows its pin. With the pinned worker over its thresholds
+    /// the third goes where the policy alone sends it past that worker,
+    /// asked with a header's key, or with no key where the id handed it.
+    /// The fourth follows the new pin, though the first worker is under its
+    /// thresholds again.
+    #[test]
+    fn a_pinned_worker_over_its_thresholds_passes_its_key_on_under_the_prefix_ring() {
+        let (keyed, alone) = (engine("prefix_hash", true), engine("prefix_hash", false));
+        let mut host = Host::new(&[0; 8]);
+        let (list, cell) = (Arc::clone(&host.list), ListCell::default());
+        let members = lent(&list, &cell);
+        let tokens: Vec<u32> = (7_000_000..7_001_024).collect();
+        let prompt = |engine: &PolicyEngine| {
+            engine.prompt_hashes(MODEL, Some(&tokens), None, HashSeeds::PLAIN)
+        };
+        let mut nth = 0_u32;
+        for (key, by_id) in [("h0", false), ("i0", true)] {
+            let mut places = Vec::new();
+            for step in 0..4 {
+                if step >= 2 {
+                    let first: usize = places[0];
+                    host.list[first].set_overloaded(step == 2);
+                }
+                let hashes = prompt(&keyed);
+                let asked = (key, 1_024, nth);
+                let (guard, place, by) =
+                    host.decide_keyed(&keyed, members, asked, Some(&hashes), by_id);
+                let pinned = verdict(&guard) != SessionVerdict::None;
+                assert!(pinned, "{key:?}: request {step} states no pin");
+                // The policy places the first request and the third, and
+                // the rule the two behind them.
+                let policys = step % 2 == 0;
+                let expected = if policys {
+                    PlacedBy::Stages
+                } else {
+                    PlacedBy::Rule
+                };
+                assert_eq!(by, expected, "{key:?}: request {step}");
+                let mut guards = vec![guard];
+                if policys {
+                    // The policy alone is handed a header's key, and never
+                    // the id's.
+                    let twin_key = if by_id { "" } else { key };
+                    let hashes = prompt(&alone);
+                    let asked = (twin_key, 1_024, nth);
+                    let (twin, twin_place, _) =
+                        host.decide_prompt(&alone, members, asked, Some(&hashes));
+                    assert_eq!(place, twin_place, "{key:?}: request {step}");
+                    guards.push(twin);
+                }
+                host.sent(guards, (key, nth), place);
+                let sent = host.held.pop_front().expect("the request in flight");
+                host.ended(sent, nth + 1);
+                places.push(place);
+                nth += 2;
+            }
+            let (first, moved) = (places[0], places[2]);
+            assert_ne!(
+                moved, first,
+                "{key:?}: a worker over its thresholds takes no request of its key"
+            );
+            assert_eq!(places, [first, first, moved, moved], "{key:?}");
         }
     }
 }

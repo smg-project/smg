@@ -8457,6 +8457,115 @@ pub(crate) mod tests {
         assert_eq!(engine.classic_made_or_asked(), 0);
     }
 
+    /// The classic `prefix_hash` registry under the routing-key override
+    /// beside one whose engine decides under the document the same settings
+    /// mean.
+    fn overridden_prefix_policies() -> (PolicyRegistry, PolicyRegistry) {
+        use crate::config::RouterConfig;
+
+        let settings = RouterConfig {
+            policy: PolicyConfig::PrefixHash {
+                prefix_token_count: 256,
+                load_factor: 1.25,
+                balance_abs_threshold: 10,
+                cache_boundaries: vec![64, 256],
+            },
+            routing_key_override: RoutingKeyOverrideConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let engine = PolicyRegistry::for_policy_engine(
+            settings.policy.clone(),
+            settings.routing_key_override.clone(),
+        );
+        let document = settings.policy_document().expect("the settings' document");
+        let spec = AppliedSpec::validate(&document).expect("a valid document");
+        engine_on(&engine, spec);
+        let classic = PolicyRegistry::with_override(settings.policy, settings.routing_key_override);
+        (classic, engine)
+    }
+
+    /// Under the engine a keyed request of a `prefix_hash` gateway with the
+    /// routing-key override goes where the gateway's sticky map sends it. A
+    /// key's first request goes to the worker the policy picks: by the key
+    /// where a header handed it, by the prompt where the request's own id
+    /// did. Its next requests follow that pin, whatever their prompts. A
+    /// request that finds two of its key's requests on the pin is the
+    /// policy's again: a header's key lands on its owner once more, and an
+    /// id's key moves its pin to the worker of the new prompt. Each side
+    /// counts a key's requests on its own worker objects.
+    #[test]
+    fn the_engine_pins_a_prefix_rings_key_where_the_sticky_map_does() {
+        let urls: Vec<String> = (0..8).map(|at| format!("http://w{at:02}:8000")).collect();
+        let urls: Vec<&str> = urls.iter().map(String::as_str).collect();
+        let fleets = (http_registry(&urls), http_registry(&urls));
+        let (classic, engine) = overridden_prefix_policies();
+        let prompt = |seed: u32| -> Vec<u32> { (0..300).map(|i| seed * 1_000 + i).collect() };
+        // One request under both registries: the worker both sent it to,
+        // and its two load guards.
+        let step = |round: &str, header: Option<&str>, rid: Option<&str>, tokens: &[u32]| {
+            let mut headers = HeaderMap::new();
+            if let Some(key) = header {
+                headers.insert("x-smg-routing-key", key.parse().expect("a header value"));
+            }
+            let inputs = PlacementInputs {
+                tokens: Some(tokens),
+                headers: Some(&headers),
+                rid_key: rid,
+                rid,
+                ..Default::default()
+            };
+            let by_classic = answered(&fleets.0, &classic, inputs);
+            let by_engine = answered(&fleets.1, &engine, inputs);
+            let url = by_classic.worker().url().to_owned();
+            let key = header.or(rid);
+            assert_eq!(by_engine.worker().url(), url, "{key:?}, {round}");
+            (url, (by_classic.into_guard(key), by_engine.into_guard(key)))
+        };
+        let (mut moved, mut stayed) = (0, 0);
+        let mut owners = BTreeMap::new();
+        for at in 0..12u32 {
+            let by_header = at % 2 == 0;
+            let name = if by_header {
+                format!("conv-{at}")
+            } else {
+                format!("req-{at}")
+            };
+            let (header, rid) = if by_header {
+                (Some(name.as_str()), None)
+            } else {
+                (None, Some(name.as_str()))
+            };
+            let mut held = Vec::new();
+            let (first, guards) = step("its first request", header, rid, &prompt(at));
+            held.push(guards);
+            let (second, guards) = step("under its pin", header, rid, &prompt(at + 50));
+            assert_eq!(second, first, "{name}: the pin");
+            held.push(guards);
+            let (third, guards) = step("at its pin's cap", header, rid, &prompt(at + 100));
+            held.push(guards);
+            let (fourth, guards) = step("behind the cap", header, rid, &prompt(at + 150));
+            drop(guards);
+            if third == first {
+                stayed += 1;
+            } else {
+                moved += 1;
+                assert_eq!(fourth, third, "{name}: the moved pin");
+            }
+            held.clear();
+            let (last, _) = step("with no request left", header, rid, &prompt(at + 200));
+            *owners.entry(last).or_insert(0) += 1;
+        }
+        assert!(
+            moved >= 2 && stayed >= 2,
+            "{moved} pins moved, {stayed} stayed"
+        );
+        assert!(owners.len() > 3, "the keys spread: {owners:?}");
+        assert_eq!(engine.classic_made_or_asked(), 0);
+    }
+
     /// The engine's request reads the model's ring only under a document
     /// that places by one, as a classic placement reads it only for a
     /// policy that walks it: a ring nobody walks is not filled.
