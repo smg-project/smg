@@ -35,6 +35,8 @@ use serde::{
 };
 use sha2::{Digest as _, Sha256};
 
+#[cfg(feature = "in-process")]
+use crate::engine::sticky_sessions::SessionTable;
 use crate::{
     document::routing_key::KeySources,
     engine::{
@@ -67,7 +69,7 @@ use crate::{
             DEFAULT_KV_PRESSURE_WEIGHT, DEFAULT_MEAN_PREFILL_TOKENS, DEFAULT_THROUGHPUT,
         },
     },
-    tracking::dispatch_credit::DispatchCredit,
+    tracking::dispatch_credit::{DispatchCredit, SentSettings},
 };
 
 pub const API_VERSION: &str = "smg.policy/v1";
@@ -193,7 +195,25 @@ const SIDES: [&str; 4] = ["single", "prefill", "decode", "encode"];
 
 /// What the host must feed for the spec's stages to mean anything, per
 /// deployment. Read at apply, never per request.
+///
+/// The record gains flags. Code outside this crate writes its needs as one
+/// chain from [`Needs::NONE`], a call a flag
+/// (`Needs::NONE.with_loads().with_prompt_size()`), or assigns a flag that
+/// follows a value (`needs.signal_cells = keeps`). It reads a field, and
+/// matches the record with `..`: a literal of it does not build there.
+///
+/// ```
+/// use smg_policy_controller::document::Needs;
+/// let needs = Needs::NONE.with_loads().with_prompt_size();
+/// assert!(needs.loads && needs.prompt_size && !needs.events);
+/// ```
+///
+/// ```compile_fail
+/// use smg_policy_controller::document::Needs;
+/// let _ = Needs { loads: true, ..Needs::NONE };
+/// ```
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Needs {
     /// The request's text itself, for a controller that hashes it into
     /// windows for a foreign host. No stage of this build declares it: a
@@ -236,7 +256,8 @@ pub struct Needs {
     /// The stage reads the prefixes sent to each worker.
     #[serde(default)]
     pub sent_prefixes: bool,
-    /// A consistent-hash ring per model.
+    /// A consistent-hash ring per model. A host that keeps one lends it with
+    /// a request ([`RequestFacts::ring`](crate::engine::RequestFacts::ring)).
     pub ring: bool,
     /// Allow-listed headers in the view.
     pub headers: bool,
@@ -290,7 +311,75 @@ pub struct Needs {
     pub signal_cells: bool,
 }
 
+/// Writes one call a flag of [`Needs`]: the needs with that flag declared.
+/// The flags are listed once, below.
+macro_rules! declares {
+    ($($call:ident => $flag:ident),+ $(,)?) => {
+        impl Needs {
+            $(
+                #[doc = concat!("These needs with [`Self::", stringify!($flag), "`] declared.")]
+                #[must_use]
+                pub const fn $call(mut self) -> Self {
+                    self.$flag = true;
+                    self
+                }
+            )+
+        }
+
+        // Never run: the pattern names every field, so a flag the list
+        // lacks stops the build and no flag comes without its call.
+        const _: () = {
+            let Needs { $($flag: _,)+ sample: _ } = Needs::NONE;
+        };
+    };
+}
+
+declares! {
+    with_text => text,
+    with_token_hashes => token_hashes,
+    with_text_hashes => text_hashes,
+    with_prompt_size => prompt_size,
+    with_loads => loads,
+    with_events => events,
+    with_sent_prefixes => sent_prefixes,
+    with_ring => ring,
+    with_headers => headers,
+    with_media => media,
+    with_active_sessions => active_sessions,
+    with_session_in_flight => session_in_flight,
+    with_affinity => affinity,
+    with_signal_cells => signal_cells,
+}
+
 impl Needs {
+    /// No need: what a stage that reads nothing the host feeds declares,
+    /// and where every other stage's chain starts. The default, as a
+    /// constant.
+    pub const NONE: Self = Self {
+        text: false,
+        token_hashes: false,
+        text_hashes: false,
+        prompt_size: false,
+        loads: false,
+        events: false,
+        sent_prefixes: false,
+        ring: false,
+        headers: false,
+        media: false,
+        active_sessions: false,
+        session_in_flight: false,
+        affinity: false,
+        sample: 0,
+        signal_cells: false,
+    };
+
+    /// These needs with a sample of `rows` rows ([`Self::sample`]).
+    #[must_use]
+    pub const fn with_sample(mut self, rows: u32) -> Self {
+        self.sample = rows;
+        self
+    }
+
     /// Whether these declare a request's block hashes, in the token form or
     /// the text form. A stage that declares neither reads none of them.
     pub(crate) fn request_hashes(self) -> bool {
@@ -1192,9 +1281,12 @@ impl FilterStage {
 pub struct HasRoomParams {
     /// What a worker holds: field names and their coefficients, summed. At
     /// least one is required. A name written `signal.<name>` reads a signal
-    /// the document declares. Under a capacity that is a number, a field
-    /// or a signal of the worker is required: the request's size alone
-    /// reads nothing of a worker there. A worker that lacks a named value
+    /// the document declares. `request.max_output_tokens` reads the most
+    /// tokens the request's answer may hold, so a coefficient above zero
+    /// reserves room for the answer: a request that states no limit
+    /// reserves none. Under a capacity that is a number, a field or a
+    /// signal of the worker is required: the request's own values alone
+    /// read nothing of a worker there. A worker that lacks a named value
     /// has no room.
     #[serde(deserialize_with = "keyed_once")]
     #[schemars(extend(
@@ -1235,10 +1327,11 @@ fn signal_pattern() -> String {
     )
 }
 
-/// The names `has-room` may sum: every term's, and the request's size.
+/// The names `has-room` may sum: every term's, the request's size and its
+/// output limit.
 fn room_fields() -> Vec<&'static str> {
     let mut names: Vec<_> = CostTerm::NAMES.iter().map(|&(name, _)| name).collect();
-    names.push(HasRoomRule::REQUEST_TOKENS);
+    names.extend([HasRoomRule::REQUEST_TOKENS, HasRoomRule::OUTPUT_TOKENS]);
     names.sort_unstable();
     names
 }
@@ -1962,6 +2055,18 @@ pub struct ProfileSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1))]
     pub sent_ttl_ms: Option<u32>,
+    /// The least number of milliseconds between a send and the sample of a
+    /// load report that ends it: a report sampled less than that long after
+    /// a send leaves the send counted. Unset, a report sampled at or after
+    /// a send ends it. A written zero is refused, as a zero limit is. A
+    /// profile whose stages do not read its count of sends is refused if it
+    /// sets a delay. The limit ends a send whatever the delay. A new
+    /// document's profile of the same name takes over the sends the
+    /// standing profile holds and shares them: a read under the shorter of
+    /// the two delays ends such a send for both.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
+    pub sent_report_delay_ms: Option<u32>,
 }
 
 /// A closed range with one or both bounds.
@@ -2029,33 +2134,47 @@ impl Default for Match {
 }
 
 /// The queued requests, summed over an engine's ranks, at or above which
-/// its rows are vetoed where a binding's overload block names no count.
+/// a binding whose overload block is on vetoes the engine's rows, where
+/// the worker's registration states no count: the crate's default. No
+/// binding states one.
 pub const OVERLOAD_WAITING_REQUESTS: u32 = 8;
 
-/// The mean active KV usage over an engine's ranks at or above which its
-/// rows are vetoed where a binding's overload block names no usage.
+/// The mean active KV usage over an engine's ranks at or above which a
+/// binding whose overload block is on vetoes the engine's rows, where the
+/// worker's registration states no usage: the crate's default. No binding
+/// states one.
 pub const OVERLOAD_TOKEN_USAGE: f32 = 0.8;
 
-/// The overload veto's defaults for the workers of the pools decided under
-/// the binding, as the binding's `overload` field says: evaluated per load
-/// report by the host and latched, never per request; a worker's own
-/// registration thresholds resolve over these.
+/// What a binding says of the overload veto on the workers of the pools
+/// decided under it, as its `overload` field: whether the default
+/// thresholds veto at all, and what a decision does where every worker is
+/// vetoed. The veto is evaluated per load report by the host and latched,
+/// never per request. The block names no threshold: a worker's
+/// registration states its own two, over its program's default where the
+/// program has one. The store's judge reads the switch; a host that judges
+/// on its worker objects does not read it yet.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct OverloadSpec {
     /// Whether the host's thresholds veto at all (a worker's own block still
     /// does).
     pub enabled: bool,
-    /// Queued requests, summed over an engine's ranks, at or above which a
-    /// worker is vetoed; at least 1 (default 8).
+    /// A number here is refused: a binding names no count of queued
+    /// requests. A worker's registration states the count at or above which
+    /// it is vetoed, or its program's default does. The field stands so
+    /// that a document which names a number is refused by its path. Its
+    /// schema is `null` alone, as a writer that spells an absent field
+    /// writes it: an editor refuses the number on shape.
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[schemars(range(min = 1))]
+    #[schemars(with = "()")]
     pub waiting_requests: Option<u32>,
-    /// Mean active KV usage over an engine's ranks at or above which a
-    /// worker is vetoed; above 0 and at most 1 (default 0.8). A rank that
-    /// reports no active share counts its whole usage.
+    /// A number here is refused: a binding names no KV usage. A worker's
+    /// registration states the usage at or above which it is vetoed, or its
+    /// program's default does. The field stands so that a document which
+    /// names a number is refused by its path, and its schema is `null`
+    /// alone.
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[schemars(extend("exclusiveMinimum" = 0), range(max = 1.0))]
+    #[schemars(with = "()")]
     pub token_usage: Option<f32>,
     /// Shed with a 503 when every usable worker is vetoed, instead of
     /// falling back to the least-vetoed one. The same word decides what a
@@ -2117,6 +2236,22 @@ pub enum Recovery {
     Latest,
 }
 
+/// Whether a single request a sessions rule placed alone is the profile's
+/// own: a pin of the request's key followed, or the rule's own assignment.
+/// No stage of the profile placed such a request.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RulePlaced {
+    /// The profile's own: its stages hear the request's issue and its
+    /// dispatch, it counts among the profile's sends, and its prompt is
+    /// recorded as behind any pick.
+    #[default]
+    Told,
+    /// Kept from the profile, as a gateway's sticky map keeps a request it
+    /// places from the gateway's policy.
+    Untold,
+}
+
 /// Sticky sessions on the binding: a keyed request stays on the worker its
 /// key was first placed on.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -2132,13 +2267,16 @@ pub struct SessionsSpec {
     /// `view.headers`. Left out under `routing_key` too.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub headers: Vec<String>,
-    /// How long an idle key stays pinned, in seconds; above zero (default
-    /// 14400), `4294967295` for ever.
+    /// How long an idle key stays pinned, in seconds, before the rule's
+    /// next sweep forgets it; above zero (default 14400), `4294967295` for
+    /// ever.
     #[serde(default = "default_ttl_s")]
     #[schemars(range(min = 1))]
     pub ttl_s: u32,
-    /// The sweep cadence of idle keys, in seconds; above zero (default 120),
-    /// `4294967295` for never, allowed under a `ttl_s` for ever alone.
+    /// The sweep cadence of idle keys, in seconds: a key idle for `ttl_s`
+    /// is forgotten at the next sweep, and one used again ahead of it stays
+    /// pinned. Above zero (default 120), `4294967295` for never, allowed
+    /// under a `ttl_s` for ever alone.
     #[serde(default = "default_sweep_s")]
     #[schemars(range(min = 1))]
     pub sweep_s: u32,
@@ -2161,6 +2299,18 @@ pub struct SessionsSpec {
     /// `original`).
     #[serde(default)]
     pub recovery: Recovery,
+    /// Whether a single request this rule placed alone is the profile's
+    /// own (default `told`). Under `untold` no stage hears that request's
+    /// issue or its dispatch, it is none of the profile's sends, and
+    /// neither the engine's record of sent prefixes nor a lent token tree
+    /// takes its prompt. The session table still hears its dispatch,
+    /// and the stages its completion and its release. A pair's sides are
+    /// told under either word. A host that tells a lease's words off its
+    /// file keeps no such word of a pick: it takes the rule, and tells such
+    /// a request as it tells any other. Its decision is the engine's own,
+    /// so its record of sent prefixes follows the word all the same.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub rule_placed: RulePlaced,
 }
 
 fn default_ttl_s() -> u32 {
@@ -2182,9 +2332,9 @@ fn default_inflight_cap() -> u16 {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RoutingKeySpec {
-    /// The sources, read in order: one to eight, each named once, and up
-    /// to four client sources beside them.
-    #[schemars(length(min = 1, max = 12))]
+    /// The sources, read in order: one to eight, each named once, with up
+    /// to four client sources and one target source beside them.
+    #[schemars(length(min = 1, max = 13))]
     pub sources: Vec<KeySourceSpec>,
     /// Take the turn and retry suffixes off a key, so every turn of a
     /// conversation shares one (`conv_t2_r1` keys as `conv`); default
@@ -2224,6 +2374,22 @@ pub struct KeySourceSpec {
     /// key. Default false.
     #[serde(skip_serializing_if = "is_default")]
     pub client: bool,
+    /// A source that names the one worker the request goes to, and hands
+    /// no key. The header's value is a number that counts, from 0 and in
+    /// the order of the request's list of workers, the workers that can
+    /// take the request when it arrives: so a number names another worker
+    /// while one ahead of it is down. A request that carries it goes to
+    /// that worker and to no other. Where the value is no number, or
+    /// fewer workers can take the request, it is shed under
+    /// `target-worker`. Where no worker at all can take it, it is placed
+    /// as a request that names none and carries no key. A header that is
+    /// absent, empty or not text names no worker. One entry a block,
+    /// beside the eight and never without one of them: a header alone,
+    /// so `rid`, `max_bytes` and `client` are refused beside it. It is
+    /// read for a single request a program places in process, and for no
+    /// pair. Default false.
+    #[serde(skip_serializing_if = "is_default")]
+    pub target: bool,
 }
 
 /// A second profile deciding a share of the binding's requests, the
@@ -2369,8 +2535,8 @@ pub struct BindingSpec {
         skip_serializing_if = "BTreeMap::is_empty"
     )]
     pub profiles: BTreeMap<String, String>,
-    /// The overload veto's defaults for the workers of the pools decided
-    /// under the binding: the pools whose model and phase it is the first
+    /// What the binding says of the overload veto for the workers of the
+    /// pools decided under it: the pools whose model and phase it is the first
     /// to match. A decode pool of a model whose prefill lookup resolves to
     /// a pair binding (`pd-pair` or `epd`) is decided under that binding,
     /// so its block judges the pool: a decode-phase binding's block is not
@@ -2762,10 +2928,6 @@ fn unit_interval(v: f32) -> bool {
 fn at_least_one<T: Into<f64>>(v: T) -> bool {
     let v: f64 = v.into();
     v.is_finite() && v >= 1.0
-}
-
-fn unit_fraction(v: f32) -> bool {
-    v.is_finite() && v > 0.0 && v <= 1.0
 }
 
 /// The matcher understands an id, `prefix*`, `*suffix` and `*`; any other
@@ -3440,7 +3602,7 @@ fn picker_of(
     profile: &str,
     at: &At,
     from: StageInputs<'_>,
-    sent_ttl_ms: Option<u32>,
+    settings: SentSettings,
     sent: &mut Option<Arc<DispatchCredit>>,
 ) -> Result<Resolved<Box<dyn Picker>>, SpecError> {
     let named = pick.name();
@@ -3454,7 +3616,7 @@ fn picker_of(
         let picker = StageBuild::built(
             &params,
             profile,
-            sent_ttl_ms,
+            settings,
             sent,
             from.reports,
             from.signals,
@@ -3587,7 +3749,7 @@ fn filtered<'a>(
     at: &At,
     index: usize,
     from: StageInputs<'_>,
-    sent_ttl_ms: Option<u32>,
+    settings: SentSettings,
     sent: &mut Option<Arc<DispatchCredit>>,
 ) -> Result<Filtered<'a>, SpecError> {
     let name = entry.name();
@@ -3601,7 +3763,7 @@ fn filtered<'a>(
         let filter = StageBuild::built(
             &params,
             profile,
-            sent_ttl_ms,
+            settings,
             sent,
             from.reports,
             from.signals,
@@ -3690,14 +3852,19 @@ fn has_room_of(
     max_age_ms: Option<u64>,
     at: &At,
 ) -> Result<Box<dyn Filter>, SpecError> {
-    if p.used.is_empty() {
+    // The first name, in name order, which is the map's own: a rule that
+    // comes to read nothing of a worker is refused by it.
+    let Some(first) = p.used.keys().next().map(String::as_str) else {
         return Err(at.bad("used", "{}", "at least one field with its coefficient"));
-    }
+    };
     let mut terms = Vec::new();
     let mut signal_terms = Vec::new();
     let mut request_tokens = 0.0;
+    let mut output_tokens = 0.0;
     for (name, &coefficient) in &p.used {
-        let term = if name == HasRoomRule::REQUEST_TOKENS {
+        // The request's own values are read off the request: no term of a
+        // worker stands for one.
+        let term = if name == HasRoomRule::REQUEST_TOKENS || name == HasRoomRule::OUTPUT_TOKENS {
             None
         } else {
             Some(named_term(signals, at, "used", name)?)
@@ -3714,6 +3881,7 @@ fn has_room_of(
         match term {
             Some(Named::Field(term)) => terms.push((term, coefficient)),
             Some(Named::Signal(signal)) => signal_terms.push((signal, coefficient)),
+            None if name == HasRoomRule::OUTPUT_TOKENS => output_tokens = coefficient,
             None => request_tokens = coefficient,
         }
     }
@@ -3737,16 +3905,17 @@ fn has_room_of(
             }
         },
     };
-    // Under a capacity that is a number, the request's size alone is one
-    // answer for every row: such a rule reads nothing of a worker, and it
-    // keeps every row or steps aside. A signal in the sum reads a worker,
+    // Under a capacity that is a number, the request's own values alone are
+    // one answer for every row: such a rule reads nothing of a worker, and
+    // it keeps every row or steps aside. A signal in the sum reads a worker,
     // and so does a capacity read of each worker, so both are settled
-    // first.
+    // first. Every name of such a rule is the request's, since any other
+    // became a term or was refused: the refusal names the first of them.
     if terms.is_empty() && signal_terms.is_empty() && capacity_signal.is_none() {
         return Err(at.bad(
             "used",
-            HasRoomRule::REQUEST_TOKENS,
-            "at least one field or signal of the worker beside the request's size",
+            first,
+            "at least one field or signal of the worker beside the request's own values",
         ));
     }
     if !(0.0..1.0).contains(&p.headroom) {
@@ -3756,6 +3925,7 @@ fn has_room_of(
     let rule = HasRoomRule::new(
         &terms,
         request_tokens,
+        output_tokens,
         capacity,
         p.headroom,
         reads_sent.then(sent),
@@ -3791,7 +3961,7 @@ fn scored(
     profile: &str,
     at: &At,
     from: StageInputs<'_>,
-    sent_ttl_ms: Option<u32>,
+    settings: SentSettings,
     sent: &mut Option<Arc<DispatchCredit>>,
 ) -> Result<Scored, SpecError> {
     let name = entry.name();
@@ -3850,7 +4020,7 @@ fn scored(
             let scorer = StageBuild::built(
                 &params,
                 profile,
-                sent_ttl_ms,
+                settings,
                 sent,
                 from.reports,
                 from.signals,
@@ -3989,16 +4159,21 @@ fn check_profile(
     let gates = gates_of(p, view);
     let at = At::new(format!("profiles.{name}"));
     at.nonzero("sent_ttl_ms", p.sent_ttl_ms)?;
+    at.nonzero("sent_report_delay_ms", p.sent_report_delay_ms)?;
+    let settings = SentSettings {
+        ttl_ms: p.sent_ttl_ms,
+        report_delay_ms: p.sent_report_delay_ms,
+    };
     // The profile's count of sends, made where a stage's factory first
     // asks for it: a filter's may, ahead of any scorer's.
     let mut sent = None;
     let mut filters = Vec::with_capacity(p.filter.len());
     for (index, entry) in p.filter.iter().enumerate() {
-        let filter = match filtered(entry, name, &at, index, from, p.sent_ttl_ms, &mut sent)? {
+        let filter = match filtered(entry, name, &at, index, from, settings, &mut sent)? {
             Filtered::Built(filter) => filter,
             Filtered::Typed(stage) => {
                 let stage_at = At::new(format!("{}.filter[{index}].{}", at.0, stage.name()));
-                let count = || profile_sent(&mut sent, name, p.sent_ttl_ms);
+                let count = || profile_sent(&mut sent, name, settings);
                 filter_of(stage, view, from.signals, count, &stage_at)?
             }
         };
@@ -4009,7 +4184,7 @@ fn check_profile(
     let mut plain_ring = false;
     for (i, entry) in p.score.iter().enumerate() {
         let entry_at = At::new(format!("{}.score[{i}]", at.0));
-        let stage = match scored(entry, name, &entry_at, from, p.sent_ttl_ms, &mut sent)? {
+        let stage = match scored(entry, name, &entry_at, from, settings, &mut sent)? {
             Scored::Typed(stage) => stage,
             Scored::Built(weighted) => {
                 depth.deepen(HashDepth::of(weighted.scorer.needs()));
@@ -4020,7 +4195,7 @@ fn check_profile(
         let stage_at = entry_at.sub(stage.name());
         check_stage(&stage, &stage_at)?;
         check_prefix_depth(&stage, gates, view, &stage_at)?;
-        let count = || profile_sent(&mut sent, name, p.sent_ttl_ms);
+        let count = || profile_sent(&mut sent, name, settings);
         match scorer_of(&stage, gates, view, from.signals, count, &stage_at)? {
             Resolved::Built(scorer) => {
                 let read = HashDepth::of_scorer(&stage, &view.boundaries, scorer.needs());
@@ -4041,7 +4216,7 @@ fn check_profile(
             }
         }
     }
-    let picker = match picker_of(&p.pick, name, &at, from, p.sent_ttl_ms, &mut sent)? {
+    let picker = match picker_of(&p.pick, name, &at, from, settings, &mut sent)? {
         Resolved::Built(picker) => Some(picker),
         Resolved::NotInBuild(what) => {
             deferred.note(at.field("pick"), what);
@@ -4050,6 +4225,13 @@ fn check_profile(
     };
     if let Some(ms) = p.sent_ttl_ms.filter(|_| sent.is_none()) {
         return Err(at.bad("sent_ttl_ms", ms, "a limit any stage of this profile reads"));
+    }
+    if let Some(ms) = p.sent_report_delay_ms.filter(|_| sent.is_none()) {
+        return Err(at.bad(
+            "sent_report_delay_ms",
+            ms,
+            "a delay any stage of this profile reads",
+        ));
     }
     // The scores combine by each weight's share of the weights' sum: a sum
     // that is not finite, or whose reciprocal is not, gives shares that
@@ -4215,30 +4397,35 @@ fn check_matcher(
     Ok(())
 }
 
-/// The thresholds a binding hands its pools: its block's values, each else
-/// the default, and none when the block is switched off. A binding with no
-/// block has the default block. The usage goes to permille by the one
-/// conversion of a threshold ([`threshold_permille`]): the rounding a
-/// report's usage takes, so one rank's usage at or above the threshold in
-/// the document's unit is never read as under it, and a floor of one.
+/// The thresholds a binding hands its pools: the crate's two defaults, and
+/// none when the block is switched off. A binding with no block has the
+/// default block. A block names no number of its own ([`check_overload`]):
+/// a worker's registration states its two over these. The usage goes to
+/// permille by the one conversion of a threshold ([`threshold_permille`]):
+/// the rounding a report's usage takes, so one rank's usage at or above the
+/// threshold as a ratio is never read as under it.
 fn overload_thresholds(block: Option<&OverloadSpec>) -> Option<OverloadThresholds> {
-    let (enabled, waiting, usage) = block.map_or((true, None, None), |block| {
-        (block.enabled, block.waiting_requests, block.token_usage)
-    });
+    let enabled = block.is_none_or(|block| block.enabled);
     enabled.then(|| OverloadThresholds {
-        waiting_requests: waiting.unwrap_or(OVERLOAD_WAITING_REQUESTS),
-        kv_usage_permille: threshold_permille(f64::from(usage.unwrap_or(OVERLOAD_TOKEN_USAGE))),
+        waiting_requests: OVERLOAD_WAITING_REQUESTS,
+        kv_usage_permille: threshold_permille(f64::from(OVERLOAD_TOKEN_USAGE)),
     })
 }
 
+/// A binding's overload block names no number, with its switch on or off:
+/// a block that names one is refused by the number's path. One set of
+/// thresholds stands for each worker, its registration's own over its
+/// program's default, and a worker is judged by that set alone.
 fn check_overload(overload: &OverloadSpec, at: &At) -> Result<(), SpecError> {
-    at.nonzero("waiting_requests", overload.waiting_requests)?;
-    at.number(
-        "token_usage",
-        overload.token_usage,
-        unit_fraction,
-        "a fraction above zero and at most 1",
-    )
+    const STATED: &str =
+        "left out: a worker's registration states this threshold, or its program's default does";
+    if let Some(waiting) = overload.waiting_requests {
+        return Err(at.bad("waiting_requests", waiting, STATED));
+    }
+    match overload.token_usage {
+        Some(usage) => Err(at.bad("token_usage", usage, STATED)),
+        None => Ok(()),
+    }
 }
 
 fn check_sessions(
@@ -4316,18 +4503,23 @@ fn check_session_headers(
     Ok(())
 }
 
-/// A binding's routing key sources: one to eight entries and up to four
-/// client entries beside them, never client entries alone, each a header
-/// outside the credential names or the request's own id, each named once
-/// as a session's source and once as a client's, with a byte cap inside the
-/// schema's.
+/// A binding's routing key sources: one to eight entries, with up to four
+/// client entries and one target entry beside them, never those with none
+/// of the eight, each a header outside the credential names or the
+/// request's own id, each named once as a session's source, once as a
+/// client's and once as the target's, with a byte cap inside the schema's.
 fn check_routing_key(
     block: &RoutingKeySpec,
     cx: &BindingContext<'_>,
     at: &At,
 ) -> Result<(), SpecError> {
-    let clients = block.sources.iter().filter(|source| source.client).count();
-    let listed = block.sources.len() - clients;
+    let targets = block.sources.iter().filter(|source| source.target).count();
+    let clients = block
+        .sources
+        .iter()
+        .filter(|source| source.client && !source.target);
+    let clients = clients.count();
+    let listed = block.sources.len() - clients - targets;
     if block.sources.is_empty() || listed > MAX_KEY_SOURCES {
         return Err(at.bad(
             "sources",
@@ -4340,6 +4532,13 @@ fn check_routing_key(
             "sources",
             format_args!("{clients} client entries"),
             "a list of four client sources at most",
+        ));
+    }
+    if targets > 1 {
+        return Err(at.bad(
+            "sources",
+            format_args!("{targets} target entries"),
+            "a list of one target source at most",
         ));
     }
     let mut seen = BTreeSet::new();
@@ -4366,7 +4565,14 @@ fn check_routing_key(
                 reason: "a header read whole, with no rid and no max_bytes beside it",
             });
         }
-        if !seen.insert((source.rid, source.client, name)) {
+        if source.target && (source.rid || source.max_bytes.is_some() || source.client) {
+            return Err(SpecError::BadField {
+                path: at.field("target"),
+                value: "true".to_string(),
+                reason: "a header alone, with no rid, no max_bytes and no client beside it",
+            });
+        }
+        if !seen.insert((source.rid, source.client, source.target, name)) {
             return Err(SpecError::Duplicate {
                 path: at.0,
                 name: name.to_string(),
@@ -4380,11 +4586,13 @@ fn check_routing_key(
         )?;
     }
     if listed == 0 {
-        return Err(at.bad(
-            "sources",
-            "client entries alone",
-            "a list of one to eight sources",
-        ));
+        // Neither hands a session's key: a sessions rule beside the block
+        // would have no source of one.
+        let alone = match targets {
+            0 => "client entries alone",
+            _ => "a target entry and no source of a key",
+        };
+        return Err(at.bad("sources", alone, "a list of one to eight sources"));
     }
     Ok(())
 }
@@ -4715,6 +4923,7 @@ fn session_rule(
             u64::from(sessions.sweep_s) * 1_000_000
         },
         recovery: sessions.recovery,
+        rule_placed: sessions.rule_placed,
     })
 }
 
@@ -5265,10 +5474,16 @@ pub struct AppliedSpec {
     /// The document's `plans.pd-pair.decode`.
     decode_pick: DecodePick,
     lists: ViewLists,
+    /// The document's `view.headers`, in their order
+    /// ([`AppliedSpec::view_headers`]).
+    view_headers: Box<[Box<str>]>,
     /// Each binding's routing key sources, by the binding's place in the
     /// document; none where a binding names none
     /// ([`AppliedSpec::key_sources_for`]).
     key_sources: Box<[Option<KeySources>]>,
+    /// Whether a binding names a target source
+    /// ([`AppliedSpec::names_target`]).
+    names_target: bool,
     /// The document's signals, resolved, in column order
     /// ([`AppliedSpec::signal_columns`]).
     signal_columns: Arc<[SignalColumn]>,
@@ -5331,6 +5546,8 @@ impl AppliedSpec {
         digest: Digest,
         (engine, depth, signal_columns): (Engine, HashDepth, Arc<[SignalColumn]>),
     ) -> Self {
+        let sources = |binding| KeySources::of_binding(binding, &document.view);
+        let key_sources: Box<[_]> = document.bindings.iter().map(sources).collect();
         Self {
             engine,
             digest: Some(digest),
@@ -5342,11 +5559,14 @@ impl AppliedSpec {
             pairing: document.plans.pd_pair.pairing,
             decode_pick: document.plans.pd_pair.decode,
             lists: ViewLists::of(&document.view),
-            key_sources: document
-                .bindings
+            view_headers: document
+                .view
+                .headers
                 .iter()
-                .map(|binding| KeySources::of_binding(binding, &document.view))
+                .map(|name| name.as_str().into())
                 .collect(),
+            names_target: key_sources.iter().flatten().any(KeySources::names_target),
+            key_sources,
             #[cfg(feature = "controller")]
             awaited: AtomicBool::new(false),
         }
@@ -5369,7 +5589,9 @@ impl AppliedSpec {
             pairing: Pairing::default(),
             decode_pick: DecodePick::default(),
             lists: ViewLists::default(),
+            view_headers: Box::default(),
             key_sources: Box::default(),
+            names_target: false,
             #[cfg(feature = "controller")]
             awaited: AtomicBool::new(false),
         }
@@ -5427,6 +5649,14 @@ impl AppliedSpec {
     #[must_use]
     pub fn engine(&self) -> &Engine {
         &self.engine
+    }
+
+    /// The document's engine reads and writes `table` from here on
+    /// ([`Engine::share_sessions`]): the session table of an engine object
+    /// that outlives the document.
+    #[cfg(feature = "in-process")]
+    pub(crate) fn share_sessions(&mut self, table: Arc<SessionTable>) {
+        self.engine.share_sessions(table);
     }
 
     /// The document's block size, in tokens: the size a request's blocks
@@ -5509,6 +5739,26 @@ impl AppliedSpec {
         self.key_sources.get(usize::try_from(at).ok()?)?.as_ref()
     }
 
+    /// Whether a binding of this generation takes a routing key from the
+    /// request's own id ([`KeySources::reads_rid`]). A host that learns
+    /// which binding a request meets from its body alone, where the model
+    /// stands, keeps every request's body readable while this generation
+    /// stands. A binding no request reaches counts too.
+    #[must_use]
+    pub fn reads_request_id(&self) -> bool {
+        let mut sources = self.key_sources.iter().flatten();
+        sources.any(KeySources::reads_rid)
+    }
+
+    /// Whether a binding of this generation names a target source
+    /// ([`KeySourceSpec::target`]), decided when the document was applied.
+    /// A request under a document that names none pays this one test, and
+    /// no header of it is read for a target.
+    #[must_use]
+    pub fn names_target(&self) -> bool {
+        self.names_target
+    }
+
     /// The mode a store derives its pair classes under while this
     /// generation stands: the document's `plans.pd-pair.pairing`.
     #[must_use]
@@ -5532,6 +5782,14 @@ impl AppliedSpec {
     #[must_use]
     pub fn lists(&self) -> &ViewLists {
         &self.lists
+    }
+
+    /// The request headers a stage may read (`view.headers`), in the
+    /// document's order. A host states each one a request carries as a
+    /// [`Header`](crate::engine::view::Header), which names its header by
+    /// its place here.
+    pub fn view_headers(&self) -> impl Iterator<Item = &str> {
+        self.view_headers.iter().map(|name| &**name)
     }
 }
 
@@ -5741,7 +5999,6 @@ mod tests {
     fn an_applied_generation_reads_block_hashes_as_deep_as_its_stages_do() {
         use HashKind::{Text, Token};
 
-        use crate::engine::store_backed_engine::tests::sent_prefixes::use_sent_prefixes;
         let preset = |name: &str| {
             let mut document = PolicySpec::preset(name).expect("a preset of this build");
             document.generation = 1;
@@ -5749,6 +6006,16 @@ mod tests {
         };
         let applied = |document: &PolicySpec| {
             AppliedSpec::validate(document).expect("the document validates")
+        };
+        // The source each prefix stage a document states with parameters
+        // reads, as the presets state theirs.
+        let read_from = |document: &mut PolicySpec, source: AffinitySource| {
+            let stages = document.profiles.values_mut();
+            for stage in stages.flat_map(|profile| &mut profile.score) {
+                if let ScoreSpec::Params(ScoreStage::PrefixAffinity(params)) = stage {
+                    params.source = Some(source);
+                }
+            }
         };
         // No stage of the random preset reads the hashes, and the unbound
         // start has no stage.
@@ -5794,10 +6061,10 @@ mod tests {
         // A kind no stage declares is read by none. The prefix stage
         // declares text hashes where its source reads the record of sent
         // prefixes, and none where it reads cache events alone.
-        use_sent_prefixes(&mut held, AffinitySource::Index);
+        read_from(&mut held, AffinitySource::Index);
         assert_eq!(applied(&held).block_hashes_read(Token, 0), 128);
         assert_eq!(applied(&held).block_hashes_read(Text, 4), 0);
-        use_sent_prefixes(&mut held, AffinitySource::Merged);
+        read_from(&mut held, AffinitySource::Merged);
         assert_eq!(applied(&held).block_hashes_read(Text, 4), 128);
         // A generation reads as deep as the deepest of its profiles.
         let two = doc(
@@ -5985,7 +6252,7 @@ mod tests {
             ),
             (
                 "consistent_hashing",
-                "sha256:f7f4be1857e6241e4e910252f2cdfc8b8c36a2516e822ec9607f683f5db7fb63",
+                "sha256:c9bb5fdc96f68381ac99700d79a793499cdf915ab2ce590ffb82942b398e6745",
             ),
             (
                 "prefix_hash",
@@ -6327,9 +6594,11 @@ mod tests {
             assert_eq!(engine.needs().token_hashes, hashes, "{name}");
             assert_eq!(engine.needs().text_hashes, hashes, "{name}");
             assert!(!engine.needs().text, "{name}");
-            // The request's size is counted where a stage places by it: a
-            // host that sends a request on unread reads it for that stage.
-            assert_eq!(engine.needs().prompt_size, name == "bucket", "{name}");
+            // The request's size is counted where a stage places by it or
+            // takes a share of it: a host that sends a request on unread
+            // reads it for that stage.
+            let sized = ["bucket", "cache_aware"].contains(&name);
+            assert_eq!(engine.needs().prompt_size, sized, "{name}");
             // The affinity stage's source is left out: it reads each worker
             // by what it has, its cache events or the prefixes sent to it.
             assert_eq!(engine.needs().events, name == "cache_aware", "{name}");
@@ -7444,7 +7713,7 @@ mod tests {
             "p",
             &At::new("profiles.p.score[0]"),
             from,
-            None,
+            SentSettings::default(),
             &mut None,
         )
         .expect("a built-in scorer") else {
@@ -7750,6 +8019,7 @@ mod tests {
                 inflight_cap: u16::MAX,
                 issue_session_id: false,
                 recovery: Recovery::Original,
+                rule_placed: RulePlaced::Told,
             }
         );
         assert_eq!(spec.view.headers, ["x-smg-routing-key"]);
@@ -7843,102 +8113,37 @@ mod tests {
 
     #[test]
     fn the_binding_rules_are_checked_in_shape_then_by_the_build() {
-        let overload = spec_with_binding(
-            r#"{"profile":"p","overload":{"waiting_requests":32,"token_usage":0.9,"shed_when_all_vetoed":true}}"#,
-        );
         let thresholds = |spec: &PolicySpec| {
             spec.validate()
                 .expect("the binding validates")
                 .binding("m", Phase::Single)
                 .and_then(|binding| binding.overload)
         };
-        assert_eq!(
-            thresholds(&overload),
-            Some(OverloadThresholds {
-                waiting_requests: 32,
-                kv_usage_permille: 900,
-            }),
-            "the block's two values, the usage in permille"
-        );
-        // A value the block does not name is the default, and so is a
-        // binding with no block and the binding of a document that
-        // writes none.
+        // A block names no number. Switched on, a binding hands its pools
+        // the crate's two, the usage in permille, whatever its shed word
+        // says. So does a binding with no block, and the binding of a
+        // document that writes none.
         let defaults = OverloadThresholds {
             waiting_requests: OVERLOAD_WAITING_REQUESTS,
             kv_usage_permille: 800,
         };
-        assert_eq!(
-            thresholds(&spec_with_binding(
-                r#"{"profile":"p","overload":{"waiting_requests":3}}"#
-            )),
-            Some(OverloadThresholds {
-                waiting_requests: 3,
-                ..defaults
-            })
-        );
-        assert_eq!(
-            thresholds(&spec_with_binding(
-                r#"{"profile":"p","overload":{"token_usage":0.25}}"#
-            )),
-            Some(OverloadThresholds {
-                kv_usage_permille: 250,
-                ..defaults
-            })
-        );
-        // A usage that would round to no permille is held as one: at none,
-        // every engine with a row on file would read over it.
-        assert_eq!(
-            thresholds(&spec_with_binding(
-                r#"{"profile":"p","overload":{"token_usage":0.0004}}"#
-            )),
-            Some(OverloadThresholds {
-                kv_usage_permille: 1,
-                ..defaults
-            })
-        );
-        // The usage is rounded to its permille, not cut.
-        assert_eq!(
-            thresholds(&spec_with_binding(
-                r#"{"profile":"p","overload":{"token_usage":0.2496}}"#
-            )),
-            Some(OverloadThresholds {
-                kv_usage_permille: 250,
-                ..defaults
-            })
-        );
-        assert_eq!(
-            thresholds(&spec_with_binding(r#"{"profile":"p"}"#)),
-            Some(defaults)
-        );
+        for on in [
+            r#"{"profile":"p"}"#,
+            r#"{"profile":"p","overload":{}}"#,
+            r#"{"profile":"p","overload":{"enabled":true,"shed_when_all_vetoed":true}}"#,
+            r#"{"profile":"p","overload":{"waiting_requests":null,"token_usage":null}}"#,
+        ] {
+            assert_eq!(thresholds(&spec_with_binding(on)), Some(defaults), "{on}");
+        }
         assert_eq!(
             thresholds(&doc(
                 r#"{"apiVersion":"smg.policy/v1","profiles":{"p":{"score":["kv-pressure"],"pick":"best"}}}"#
             )),
             Some(defaults)
         );
-        assert_eq!(
-            bad_field(&spec_with_binding(
-                r#"{"profile":"p","overload":{"waiting_requests":0}}"#
-            )),
-            "bindings[0].overload.waiting_requests"
-        );
-        for token_usage in ["1.5", "0"] {
-            assert_eq!(
-                bad_field(&spec_with_binding(&format!(
-                    r#"{{"profile":"p","overload":{{"token_usage":{token_usage}}}}}"#
-                ))),
-                "bindings[0].overload.token_usage",
-                "{token_usage}"
-            );
-        }
-        // Off is the block's switch alone: the binding hands no threshold,
-        // whatever values the block still names.
-        for off in [
-            r#"{"profile":"p","overload":{"enabled":false}}"#,
-            r#"{"profile":"p","overload":{"enabled":false,"waiting_requests":3,"token_usage":0.5}}"#,
-        ] {
-            assert_eq!(thresholds(&spec_with_binding(off)), None, "{off}");
-        }
+        // Off is the block's switch alone: the binding hands no threshold.
+        let off = r#"{"profile":"p","overload":{"enabled":false,"shed_when_all_vetoed":true}}"#;
+        assert_eq!(thresholds(&spec_with_binding(off)), None);
 
         let sessions = spec_with_binding(
             r#"{"profile":"p","sessions":{"sticky_header":"x-session-id","ttl_s":600,"assignment":"min_load"}}"#,
@@ -8242,6 +8447,54 @@ mod tests {
                 "{refused}"
             );
         }
+        // A target source stands beside the eight and the four. It hands
+        // no key, so it is no block alone, nor with client sources only: a
+        // sessions rule beside the block would have no source of a
+        // session's key.
+        let with_target =
+            |block: String| block.replace("]}", r#",{"header":"x-target","target":true}]}"#);
+        assert!(block(&with_target(beside_eight(4))).is_ok());
+        for alone in [
+            r#"{"header":"x-target","target":true}"#,
+            r#"{"header":"cookie","client":true},{"header":"x-target","target":true}"#,
+        ] {
+            assert_eq!(
+                client(alone).map(|refused| refused.to_string()),
+                Some(
+                    "bindings[0].routing_key.sources = a target entry and no source of a key is not a list of one to eight sources"
+                        .to_string()
+                ),
+                "{alone}"
+            );
+        }
+        // A header is named once as the target's too, and a block names
+        // one target.
+        assert_eq!(
+            client(r#"{"header":"x-a"},{"header":"x-a","target":true}"#),
+            None
+        );
+        assert_eq!(
+            client(r#"{"header":"x-a","target":true},{"header":"x-b","target":true}"#)
+                .map(|refused| refused.to_string()),
+            Some(
+                "bindings[0].routing_key.sources = 2 target entries is not a list of one target source at most"
+                    .to_string()
+            )
+        );
+        // A target source is a header alone.
+        for refused in [
+            r#"{"rid":true,"target":true}"#,
+            r#"{"header":"x-target","max_bytes":64,"target":true}"#,
+            r#"{"header":"x-target","client":true,"target":true}"#,
+        ] {
+            assert!(
+                matches!(
+                    client(refused),
+                    Some(SpecError::BadField { path, .. }) if path.ends_with("sources[0].target")
+                ),
+                "{refused}"
+            );
+        }
         // One spelling or the other beside a sessions rule.
         let beside = |sessions: &str| {
             spec_with_binding(&format!(
@@ -8304,6 +8557,50 @@ mod tests {
         assert!(AppliedSpec::unbound()
             .key_sources_for("chat/a", Phase::Single)
             .is_none());
+        // One binding of the three keys by the request's own id, so the
+        // document does. The same document without that source does not,
+        // and neither does one that binds nothing.
+        assert!(applied.reads_request_id());
+        let headers_alone = AppliedSpec::validate(&doc(
+            r#"{"apiVersion":"smg.policy/v1","profiles":{"p":{"pick":"best"}},"bindings":[
+                {"match":{"model":"chat/*"},"profile":"p","routing_key":{"sources":[{"header":"x-smg-routing-key"},{"header":"cookie"}]}},
+                {"profile":"p"}]}"#,
+        ))
+        .expect("the document validates");
+        assert!(!headers_alone.reads_request_id());
+        assert!(!AppliedSpec::unbound().reads_request_id());
+    }
+
+    /// Whether a binding names a target source is decided when the document
+    /// is applied. One binding of several is enough, and its sources alone
+    /// say so. A document that names none says so, as the generation no
+    /// document was applied to does.
+    #[test]
+    fn the_applied_document_says_whether_a_binding_names_a_target() {
+        let applied = |second: &str| {
+            AppliedSpec::validate(&doc(&format!(
+                r#"{{"apiVersion":"smg.policy/v1","profiles":{{"p":{{"pick":"best"}}}},"bindings":[
+                {{"match":{{"model":"chat/*"}},"profile":"p","routing_key":{{"sources":[{{"header":"x-smg-routing-key"}}]}}}},
+                {{"profile":"p"{second}}}]}}"#
+            )))
+            .expect("the document validates")
+        };
+        assert!(!applied("").names_target());
+        let named = applied(
+            r#","routing_key":{"sources":[{"header":"x-b"},{"header":"x-smg-target-worker","target":true}]}"#,
+        );
+        assert!(named.names_target());
+        let sources = |model| named.key_sources_for(model, Phase::Single);
+        let first = sources("chat/a").expect("the first binding's sources");
+        assert!(!first.names_target());
+        let second = sources("other").expect("the second binding's sources");
+        assert!(second.names_target());
+        assert_eq!(
+            second.headers().collect::<Vec<_>>(),
+            ["x-b"],
+            "no key's source"
+        );
+        assert!(!AppliedSpec::unbound().names_target());
     }
 
     #[test]
@@ -8356,6 +8653,85 @@ mod tests {
         assert_eq!(
             not_in_build(&matching(r#"{"labels":["large"]}"#)).1,
             "the label matcher"
+        );
+    }
+
+    /// A binding's overload block names no number. Either one is refused by
+    /// its path, with the block switched on, switched off or left as it
+    /// stands, at the crate's own number too, and the refusal says where a
+    /// threshold is stated and states the number as it was written. A block
+    /// that names both is refused by the count, switched off too.
+    #[test]
+    fn a_number_in_a_bindings_overload_block_is_refused_by_its_path() {
+        const STATED: &str =
+            "left out: a worker's registration states this threshold, or its program's default does";
+        let refused = |block: &str| {
+            let binding = format!(r#"{{"profile":"p","overload":{block}}}"#);
+            match spec_with_binding(&binding).validate().err() {
+                Some(SpecError::BadField {
+                    path,
+                    value,
+                    reason,
+                }) => (path, value, reason),
+                other => panic!("{block} validated as {other:?}"),
+            }
+        };
+        for (block, field, value) in [
+            (r#"{"waiting_requests":8}"#, "waiting_requests", "8"),
+            (r#"{"waiting_requests":0}"#, "waiting_requests", "0"),
+            (r#"{"waiting_requests":300}"#, "waiting_requests", "300"),
+            (
+                r#"{"enabled":true,"waiting_requests":32}"#,
+                "waiting_requests",
+                "32",
+            ),
+            (
+                r#"{"enabled":false,"waiting_requests":3}"#,
+                "waiting_requests",
+                "3",
+            ),
+            (r#"{"token_usage":0.8}"#, "token_usage", "0.8"),
+            (r#"{"token_usage":1.5}"#, "token_usage", "1.5"),
+            (r#"{"token_usage":0}"#, "token_usage", "0"),
+            (r#"{"token_usage":-0.5}"#, "token_usage", "-0.5"),
+            (
+                r#"{"enabled":true,"token_usage":0.9}"#,
+                "token_usage",
+                "0.9",
+            ),
+            (
+                r#"{"enabled":false,"token_usage":0.5}"#,
+                "token_usage",
+                "0.5",
+            ),
+            (
+                r#"{"waiting_requests":32,"token_usage":0.9,"shed_when_all_vetoed":true}"#,
+                "waiting_requests",
+                "32",
+            ),
+            (
+                r#"{"enabled":false,"waiting_requests":32,"token_usage":0.9}"#,
+                "waiting_requests",
+                "32",
+            ),
+        ] {
+            assert_eq!(
+                refused(block),
+                (
+                    format!("bindings[0].overload.{field}"),
+                    value.to_owned(),
+                    STATED
+                ),
+                "{block}"
+            );
+        }
+        // The refusal as a document's writer reads it.
+        let named = spec_with_binding(r#"{"profile":"p","overload":{"token_usage":0.9}}"#);
+        assert_eq!(
+            named.validate().err().map(|refusal| refusal.to_string()),
+            Some(format!(
+                "bindings[0].overload.token_usage = 0.9 is not {STATED}"
+            ))
         );
     }
 
@@ -8457,7 +8833,7 @@ mod tests {
               "plan": "pd-pair", "profiles": { "prefill": "least_load", "decode": "least_load" } },
             { "match": { "model": "*" }, "profile": "cache_aware", "shadow": "spare",
               "canary": { "profile": "least_load", "percent": 5 }, "override": "allowed",
-              "overload": { "enabled": true, "waiting_requests": 64, "token_usage": 0.9, "shed_when_all_vetoed": false },
+              "overload": { "enabled": true, "shed_when_all_vetoed": false },
               "sessions": { "sticky_header": "x-session-id", "headers": ["x-session-id"], "ttl_s": 600, "sweep_s": 120, "assignment": "delegate", "inflight_cap": 2, "issue_session_id": false },
               "admission": { "enabled": false } }
           ]

@@ -46,16 +46,17 @@ use crate::vision::{
     processor::{ModelSpecificValue, PreprocessedEncoderInputs, VisionPreProcessor},
     transforms::{
         center_crop, crop_rgb, expand_to_square, extend_planes_by_table, mean_to_rgb, paste_rgb,
-        pil_to_filter, resize, resize_bicubic_torch_aa, resize_bicubic_torch_aa_cropped, rgb_bytes,
-        stack_batch, to_tensor_by_table, TransformError,
+        pil_to_filter, resize, resize_bicubic_torch_aa, resize_bicubic_torch_aa_cropped,
+        resize_bicubic_torch_aa_squared, rgb_bytes, stack_batch, to_tensor_by_table,
+        TransformError,
     },
 };
 
 /// CLIP normalization mean values used by LLaVA models.
-pub const CLIP_MEAN: [f64; 3] = [0.48145466, 0.4578275, 0.40821073];
+pub(crate) const CLIP_MEAN: [f64; 3] = [0.48145466, 0.4578275, 0.40821073];
 
 /// CLIP normalization std values used by LLaVA models.
-pub const CLIP_STD: [f64; 3] = [0.26862954, 0.26130258, 0.27577711];
+pub(crate) const CLIP_STD: [f64; 3] = [0.26862954, 0.26130258, 0.27577711];
 
 /// The reference processor's default grid pinpoints, `[[336, 672], [672, 336],
 /// [672, 672], [1008, 336], [336, 1008]]` as `[height, width]`, here as
@@ -186,20 +187,10 @@ impl LlavaProcessor {
         }
     }
 
-    /// Create a processor with custom settings.
-    pub fn with_config(patch_size: u32, image_size: u32, aspect_ratio: ImageAspectRatio) -> Self {
-        Self {
-            transforms: LlavaTransforms::new(&PreProcessorConfig::default()),
-            patch_size,
-            image_size,
-            aspect_ratio,
-        }
-    }
-
     /// Create a processor from model config JSON.
     ///
     /// Extracts patch_size, image_size, and image_aspect_ratio from config.
-    pub fn from_config(config: &Value) -> Self {
+    pub(crate) fn from_config(config: &Value) -> Self {
         let patch_size = config
             .get("vision_config")
             .and_then(|v| v.get("patch_size"))
@@ -277,6 +268,18 @@ impl LlavaProcessor {
             ImageAspectRatio::Pad => {
                 // Pad mode: expand to square with mean color padding, then resize
                 let (w, h) = image.dimensions();
+                // On x86-64 the square of an RGB image is resized without
+                // the square: the same bytes.
+                if let (DynamicImage::ImageRgb8(rgb), true, FilterType::CatmullRom) =
+                    (image, transforms.do_resize, filter)
+                {
+                    let color = mean_to_rgb(&transforms.mean);
+                    if let Some(resized) = resize_bicubic_torch_aa_squared(rgb, color, target_size)
+                    {
+                        let resized = DynamicImage::ImageRgb8(resized);
+                        return to_tensor_by_table(&resized, &transforms.table);
+                    }
+                }
                 let squared = if w == h {
                     Cow::Borrowed(image)
                 } else {
@@ -435,13 +438,13 @@ impl Default for LlavaNextProcessor {
 
 impl LlavaNextProcessor {
     /// Resolve model geometry and image transforms once for a loaded model.
-    pub fn from_configs(model_config: &Value, config: &PreProcessorConfig) -> Self {
+    pub(crate) fn from_configs(model_config: &Value, config: &PreProcessorConfig) -> Self {
         Self::from_config(model_config).with_preprocessor_config(config)
     }
 
     /// Resolve the image transforms from `config`, keeping this processor's
     /// model geometry.
-    pub fn with_preprocessor_config(mut self, config: &PreProcessorConfig) -> Self {
+    pub(crate) fn with_preprocessor_config(mut self, config: &PreProcessorConfig) -> Self {
         self.base.transforms = LlavaTransforms::new(config);
         self
     }
@@ -473,23 +476,15 @@ impl LlavaNextProcessor {
     /// Create a new LLaVA-NeXT processor with default settings.
     ///
     /// Default grid pinpoints are common LLaVA-NeXT resolutions.
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             base: LlavaProcessor::new(),
             image_grid_pinpoints: DEFAULT_GRID_PINPOINTS.to_vec(),
         }
     }
 
-    /// Create a processor with custom grid pinpoints.
-    pub fn with_grid_pinpoints(grid_pinpoints: Vec<(u32, u32)>) -> Self {
-        Self {
-            base: LlavaProcessor::new(),
-            image_grid_pinpoints: grid_pinpoints,
-        }
-    }
-
     /// Create a processor from model config.
-    pub fn from_config(config: &Value) -> Self {
+    pub(crate) fn from_config(config: &Value) -> Self {
         let base = LlavaProcessor::from_config(config);
 
         let grid_pinpoints = config
@@ -517,7 +512,7 @@ impl LlavaNextProcessor {
     /// Select the best resolution from grid pinpoints for the given image.
     ///
     /// Minimizes wasted pixels while maximizing effective resolution.
-    pub fn select_best_resolution(&self, original_size: (u32, u32)) -> (u32, u32) {
+    pub(crate) fn select_best_resolution(&self, original_size: (u32, u32)) -> (u32, u32) {
         select_best_resolution(original_size, &self.image_grid_pinpoints)
     }
 
@@ -525,18 +520,9 @@ impl LlavaNextProcessor {
     ///
     /// Returns (grid_width, grid_height) — the number of 336×336 crops along
     /// each axis of the best-fit resolution.
-    pub fn get_anyres_grid_shape(&self, image_size: (u32, u32)) -> (u32, u32) {
+    pub(crate) fn get_anyres_grid_shape(&self, image_size: (u32, u32)) -> (u32, u32) {
         let (width, height) = self.select_best_resolution(image_size);
         (width / self.base.image_size, height / self.base.image_size)
-    }
-
-    /// Calculate unpad dimensions based on original aspect ratio.
-    #[expect(
-        clippy::unused_self,
-        reason = "method logically belongs to the processor; keeps API consistent"
-    )]
-    pub fn calculate_unpad(&self, grid_shape: (u32, u32), original_size: (u32, u32)) -> (u32, u32) {
-        calculate_unpad(grid_shape, original_size)
     }
 
     /// Resize and pad image to target resolution, maintaining aspect ratio.
@@ -759,26 +745,6 @@ fn select_best_resolution(
 /// as that integer and anything else rounds down.
 fn unpadded_side(value: f64) -> f64 {
     ((value * 1e7).round() / 1e7).floor()
-}
-
-/// Calculate unpad dimensions based on aspect ratio.
-fn calculate_unpad(size: (u32, u32), original_size: (u32, u32)) -> (u32, u32) {
-    let (original_width, original_height) = original_size;
-    let (current_width, current_height) = size;
-    let original_aspect_ratio = original_width as f32 / original_height as f32;
-    let current_aspect_ratio = current_width as f32 / current_height as f32;
-
-    if original_aspect_ratio > current_aspect_ratio {
-        let scale_factor = current_width as f32 / original_width as f32;
-        let new_height = (original_height as f32 * scale_factor).floor() as u32;
-        let padding = (current_height - new_height) / 2;
-        (current_width, current_height - 2 * padding)
-    } else {
-        let scale_factor = current_height as f32 / original_height as f32;
-        let new_width = (original_width as f32 * scale_factor).floor() as u32;
-        let padding = (current_width - new_width) / 2;
-        (current_width - 2 * padding, current_height)
-    }
 }
 
 /// Resize and pad image to target resolution, centering the image.
@@ -1065,17 +1031,6 @@ mod tests {
     }
 
     #[test]
-    fn test_calculate_unpad() {
-        // Square grid, wide original -> should reduce width padding
-        let unpad = calculate_unpad((24, 24), (800, 400));
-        assert!(unpad.0 >= unpad.1); // Width should be >= height
-
-        // Square grid, tall original -> should reduce height padding
-        let unpad = calculate_unpad((24, 24), (400, 800));
-        assert!(unpad.1 >= unpad.0); // Height should be >= width
-    }
-
-    #[test]
     fn test_llava_next_processor_default() {
         let processor = LlavaNextProcessor::new();
         assert!(!processor.image_grid_pinpoints.is_empty());
@@ -1339,7 +1294,7 @@ mod tests {
 
     /// The reference's processors default to bicubic when a config omits
     /// `resample`, and the crate-wide fallback is bilinear: a processor built
-    /// without a config (`new()`, `with_grid_pinpoints`) resized, padded and
+    /// without a config (`new()`) resized, padded and
     /// patched through the other kernel.
     #[test]
     fn a_config_without_resample_resizes_bicubic_like_the_reference() {

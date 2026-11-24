@@ -97,7 +97,7 @@ pub trait BoundPlugin: DecisionScope + 'static {
     fn observe_completed(&self, lease: &Lease, outcome: &Outcome);
     fn observe_released(&self, lease: &Lease, reason: ReleaseReason);
     fn observe_membership(&self, change: &Membership<'_>);
-    fn observe_signal(&self, signal: &Signal);
+    fn observe_signal(&self, signal: &Signal<'_>);
 }
 
 /// What one adapter needs from the host: its plugin's declared needs and
@@ -382,7 +382,7 @@ macro_rules! forward_lifecycle {
                 }
             }
 
-            fn on_signal(&self, signal: &Signal) {
+            fn on_signal(&self, signal: &Signal<'_>) {
                 if self.observes.contains(EventKind::Signal) {
                     self.bound.observe_signal(signal);
                 }
@@ -502,7 +502,7 @@ mod tests {
 
         fn observe_membership(&self, _: &Membership<'_>) {}
 
-        fn observe_signal(&self, _: &Signal) {}
+        fn observe_signal(&self, _: &Signal<'_>) {}
     }
 
     /// A bound plugin that answers no stage and counts the events it is
@@ -604,7 +604,7 @@ mod tests {
             self.note(EventKind::Membership);
         }
 
-        fn observe_signal(&self, _: &Signal) {
+        fn observe_signal(&self, _: &Signal<'_>) {
             self.note(EventKind::Signal);
         }
     }
@@ -643,7 +643,7 @@ mod tests {
             self.count();
         }
 
-        fn on_signal(&self, _: &Signal) {
+        fn on_signal(&self, _: &Signal<'_>) {
             self.count();
         }
 
@@ -778,13 +778,13 @@ mod tests {
     /// for one that lists them all, and each kind alone its own call.
     #[test]
     fn an_adapter_hands_the_kinds_the_row_lists_and_no_other() {
-        let alone = EventKind::ALL.map(|kind| EventSet::of([kind]));
+        let alone = EventKind::EVERY.map(|kind| EventSet::of([kind]));
         let two = EventSet::of([EventKind::Completed, EventKind::Signal]);
         for listed in [EventSet::NONE, EventSet::ALL, two]
             .into_iter()
             .chain(alone)
         {
-            let wanted = EventKind::ALL.map(|kind| u32::from(listed.contains(kind)));
+            let wanted = EventKind::EVERY.map(|kind| u32::from(listed.contains(kind)));
             let scored = Told::listing(listed);
             tell(&PluginScorer::new(Arc::clone(&scored), None));
             assert_eq!(scored.told(), wanted, "the scorer, {listed:?}");

@@ -34,12 +34,12 @@ use crate::{
         ProfileSpec, ScoreStage, WarmupSliceParams,
     },
     engine::{
-        decision::{Overlap, OverlapSource},
+        decision::Overlap,
         framework::{ScoreFront, ScoreSpread, Scorer, TieBand},
         prefix_pass::{keep_prefix_pass, take_prefix_pass, withdraw_prefix_pass, PrefixStageId},
         view::{
-            blocks_within, mean_in_flight, AffinityFacts, AffinityRows, Candidate, Feed, HashKind,
-            LoadRow, Phase, RequestFacts, Walk, WorkerId, TEXT_BYTES_PER_TOKEN,
+            blocks_within, mean_in_flight, units_within, AffinityFacts, AffinityRows, Candidate,
+            Feed, HashKind, LoadRow, Phase, RequestFacts, Walk, WorkerId, TEXT_BYTES_PER_TOKEN,
         },
         warm_up::WarmUpRule,
     },
@@ -77,6 +77,7 @@ pub(crate) fn profile() -> ProfileSpec {
         // rows the host names: its holders and its warming rows.
         pick: PickStage::Best(BestParams { sample: 16 }).into(),
         sent_ttl_ms: None,
+        sent_report_delay_ms: None,
     }
 }
 
@@ -254,11 +255,7 @@ impl Gates {
     /// The size of one of the request's blocks: the facts' own when the
     /// host counted with one (an index's learned size), else the view's.
     fn block_size_of(&self, facts: &RequestFacts<'_>) -> u32 {
-        if facts.block_size > 0 {
-            facts.block_size
-        } else {
-            self.block_size
-        }
+        facts.block_size_or(self.block_size)
     }
 
     /// How many whole blocks of the request lie within its first `tokens`
@@ -268,16 +265,29 @@ impl Gates {
         blocks_within(tokens, facts.hash_kind, self.block_size_of(facts))
     }
 
-    /// The request's size in blocks: its token count over the block size
-    /// (the text kind's bytes over the window's size in bytes, as
-    /// `tokens_of` reads them back), never under one and never under the
-    /// block hashes the host sent. The host caps that list, so a long
-    /// request's hashes alone would understate it and overstate every
-    /// holder's share.
+    /// The request's size in blocks ([`RequestFacts::blocks`]): its token
+    /// count over the block size (the text kind's bytes over the window's
+    /// size in bytes, as `tokens_of` reads them back), never under one and
+    /// never under the block hashes the host sent.
     fn request_blocks(&self, facts: &RequestFacts<'_>) -> u32 {
-        let from_tokens = self.whole_blocks(facts.prompt_tokens, facts).max(1);
-        let from_hashes = u32::try_from(facts.block_hashes.len()).unwrap_or(u32::MAX);
-        from_tokens.max(from_hashes)
+        facts.blocks(self.block_size)
+    }
+
+    /// What a sent prefix's share of the request is taken of
+    /// ([`Whole::clears`]): one of the request's blocks and the request's
+    /// size, both in the unit the request was counted in ([`units_within`]).
+    /// The size is the whole prompt's, not its whole blocks': a prompt that
+    /// ends inside a block is larger than they say. It is never under one
+    /// block and never under the block hashes the host sent, as
+    /// [`Self::request_blocks`] holds its count.
+    fn whole(&self, facts: &RequestFacts<'_>) -> Whole {
+        let block = self.block_size_of(facts);
+        let hashed = u32::try_from(facts.block_hashes.len()).unwrap_or(u32::MAX);
+        let size = units_within(facts.prompt_size(), facts.hash_kind);
+        Whole {
+            block,
+            size: size.max(block).max(hashed.saturating_mul(block)),
+        }
     }
 
     /// `blocks` of the request in tokens, for the held prefix's price: at
@@ -288,6 +298,25 @@ impl Gates {
             HashKind::Token => units,
             HashKind::Text => units / TEXT_BYTES_PER_TOKEN as f32,
         }
+    }
+}
+
+/// A request's size and the size of one of its blocks, in one unit
+/// ([`Gates::whole`]).
+#[derive(Clone, Copy, Debug)]
+struct Whole {
+    block: u32,
+    size: u32,
+}
+
+impl Whole {
+    /// Whether `blocks` blocks sent to a worker are more than the share
+    /// `threshold` of the request. The share is one division of two whole
+    /// numbers, the blocks' size over the request's: the two the classic
+    /// policy divides, its matched tokens over the prompt's. Blocks over a
+    /// count of blocks would round the request's size first.
+    fn clears(self, blocks: u32, threshold: f32) -> bool {
+        blocks.saturating_mul(self.block) as f32 / self.size as f32 > threshold
     }
 }
 
@@ -413,10 +442,12 @@ fn neutral(out: &mut [f32]) -> TieBand {
 /// The holders of the request's prefix first. A candidate's match is its
 /// index overlap at any depth and, when the source reads placements too, a
 /// predicted placement whose share of the request clears the threshold. The
-/// rows holding the deepest match and under the spill gate score `1.0`, the
-/// rows under the gate `0.5`, the rest `0.0`; under the fleet KV gate every
-/// row scores alike and the load scorer decides. The values are exact, so
-/// the band is zero.
+/// share is of the whole prompt, as the classic policy takes it: the size
+/// of the placement's blocks over the prompt's size. The rows holding the
+/// deepest match and under the spill gate score `1.0`, the rows under the
+/// gate `0.5`, the rest `0.0`; under the fleet KV gate every row scores
+/// alike and the load scorer decides. The values are exact, so the band is
+/// zero.
 #[derive(Debug)]
 pub struct PrefixAffinity {
     threshold: f32,
@@ -445,7 +476,7 @@ impl PrefixAffinity {
     }
 
     /// Leaves what this pass judges by for the word of the pick
-    /// ([`keep_prefix_pass`]). The first stage of a decision to judge keeps
+    /// ([`keep_prefix_pass`]). The first stage to judge on a thread keeps
     /// the slot, and a later pass of its own writes over it.
     fn judge(&self, best: u32, mean: f32) {
         keep_prefix_pass(self.id, best, mean);
@@ -457,8 +488,10 @@ impl PrefixAffinity {
         withdraw_prefix_pass(self.id);
     }
 
-    /// The blocks of the request a candidate holds by this stage's source.
-    fn matched(&self, held: AffinityFacts, request_blocks: u32) -> u32 {
+    /// The blocks of the request a candidate holds by this stage's source,
+    /// `whole` being what a predicted placement's share is taken of
+    /// ([`Gates::whole`]).
+    fn matched(&self, held: AffinityFacts, whole: Whole) -> u32 {
         let index = match self.source {
             AffinitySource::Predictor => 0,
             AffinitySource::Index | AffinitySource::Merged => held.overlap_blocks,
@@ -466,7 +499,7 @@ impl PrefixAffinity {
         let predicted = match self.source {
             AffinitySource::Index => 0,
             AffinitySource::Predictor | AffinitySource::Merged
-                if held.predicted_blocks as f32 / request_blocks as f32 > self.threshold =>
+                if whole.clears(held.predicted_blocks, self.threshold) =>
             {
                 held.predicted_blocks
             }
@@ -495,14 +528,14 @@ impl PrefixAffinity {
         feed: Feed<'_>,
         reads: impl Fn() -> R,
     ) -> (TieBand, u32) {
-        let request_blocks = self.gates.request_blocks(facts);
+        let whole = self.gates.whole(facts);
         let holds = !feed.is_empty();
         // Nobody holding anything, the deepest match is zero without a
         // pass; any other feed answers for every kept row.
         let best = if holds {
             let mut entry = reads();
             kept.iter()
-                .map(|&i| self.matched(entry(i), request_blocks))
+                .map(|&i| self.matched(entry(i), whole))
                 .max()
                 .unwrap_or(0)
         } else {
@@ -525,7 +558,7 @@ impl PrefixAffinity {
                 let load = counts(c) as f32;
                 // A match above zero was read from a feed that holds entries.
                 *o = if best > 0
-                    && self.matched(entry(i), request_blocks) == best
+                    && self.matched(entry(i), whole) == best
                     && !self.gates.over(load, avg, held)
                 {
                     // Counted where it is written: a row under the ceiling
@@ -559,13 +592,13 @@ impl PrefixAffinity {
         out: &mut [f32],
         named: AffinityRows<'_>,
     ) -> TieBand {
-        let request_blocks = self.gates.request_blocks(facts);
+        let whole = self.gates.whole(facts);
         // Nobody holding anything, the deepest match is zero without a
         // pass.
         let mut best = 0;
         if !named.holders.is_empty() {
             for (o, &i) in out.iter_mut().zip(kept) {
-                let matched = self.matched(named.entry(i), request_blocks);
+                let matched = self.matched(named.entry(i), whole);
                 *o = f32::from_bits(matched);
                 best = best.max(matched);
             }
@@ -657,19 +690,9 @@ impl Scorer for PrefixAffinity {
     /// own fits, so the share they say stays true.
     fn said(&self, facts: &RequestFacts<'_>, candidates: &[Candidate], row: u32) -> Overlap {
         let request_blocks = self.gates.request_blocks(facts);
-        // A row past a column holds nothing, as a row no host named.
-        let held = match facts.feed() {
-            Feed::Column(column) => column.get(row as usize).copied().unwrap_or_default(),
-            Feed::Named(named) => named.entry(row),
-        };
-        let blocks = self.matched(held, request_blocks);
-        let source = if blocks == 0 {
-            OverlapSource::None
-        } else if self.source != AffinitySource::Predictor && held.overlap_blocks == blocks {
-            OverlapSource::Index
-        } else {
-            OverlapSource::Predictor
-        };
+        let held = facts.feed().entry_or_default(row);
+        let blocks = self.matched(held, self.gates.whole(facts));
+        let indexed = self.source != AffinitySource::Predictor && held.overlap_blocks == blocks;
         // The pass's word is taken whichever row is asked about: it is
         // the word of one decision.
         let judged = take_prefix_pass(self.id);
@@ -682,15 +705,9 @@ impl Scorer for PrefixAffinity {
                         self.gates.over(load, mean, 0.0) && !self.gates.over(load, mean, price)
                     })
             });
-        // Both counts by one shift: the share they say holds for a
-        // request past sixteen bits.
-        let shift = (u32::BITS - request_blocks.leading_zeros()).saturating_sub(u16::BITS);
-        Overlap {
-            blocks: u16::try_from(blocks >> shift).unwrap_or(u16::MAX),
-            of: u16::try_from(request_blocks >> shift).unwrap_or(u16::MAX),
-            source,
-            margin_held,
-        }
+        // Both counts by one shift, and the source, where every statement
+        // of an overlap ends.
+        Overlap::of(blocks, indexed, request_blocks, margin_held)
     }
 
     fn score_front(
@@ -728,6 +745,9 @@ impl Scorer for PrefixAffinity {
             // host hashes its text for a source that reads the record.
             sent_prefixes: placements,
             text_hashes: placements,
+            // A sent prefix's share is taken of the prompt's size: a host
+            // that can send a request on unread reads it under this stage.
+            prompt_size: true,
             loads: self.gates.kv_configured(),
             ..Needs::default()
         }
@@ -1232,6 +1252,8 @@ impl Scorer for WarmupSlice {
             affinity: true,
             events: true,
             loads: true,
+            // A miss is an overlap that is thin against the prompt's size.
+            prompt_size: true,
             ..Needs::default()
         }
     }
@@ -1310,10 +1332,12 @@ impl ReadsLoad for WarmupSlice {
 mod tests {
     use super::*;
     use crate::{
-        document::spec::SpillParams,
+        document::spec::{PolicySpec, SpillParams},
         engine::{
+            decision::OverlapSource,
+            framework::{Engine, Scratch},
             prefix_pass::forget_prefix_pass,
-            view::{AffinityHolder, Health, LoadRow},
+            view::{AffinityHolder, Constraints, Health, LoadRow, PoolFacts},
         },
         tracking::in_flight::tests::Lent,
     };
@@ -1513,6 +1537,146 @@ mod tests {
         );
     }
 
+    /// A sent prefix's share is taken of the whole prompt, as the classic
+    /// policy takes it: its matched tokens over the prompt's tokens, above
+    /// the threshold (`model_gateway/src/policies/cache_aware.rs:3561-3569`).
+    /// A prompt that ends inside a block is larger than its whole blocks, so
+    /// a share of those would let a prefix under the threshold count. The
+    /// share is one division of the two counts: at the threshold itself it
+    /// does not clear it.
+    #[test]
+    fn a_sent_prefix_counts_by_its_share_of_the_whole_prompt() {
+        static HASHES: [u64; 64] = [0; 64];
+        // Whether `held` blocks of `block` tokens sent to a worker count
+        // for a prompt of `tokens` tokens, hashed by its whole blocks.
+        let counts = |threshold: Option<f32>, block: u32, held: u32, tokens: u32| {
+            let params = PrefixAffinityParams {
+                threshold,
+                source: Some(AffinitySource::Predictor),
+                ..PrefixAffinityParams::default()
+            };
+            let stage = PrefixAffinity::new(&params, Gates::of(Some(&params), None, Some(block)));
+            let (row, nothing) = candidate(0, 0, 0);
+            let sent = AffinityFacts {
+                predicted_blocks: held,
+                ..nothing
+            };
+            let facts = RequestFacts {
+                block_hashes: &HASHES[..(tokens / block) as usize],
+                prompt_tokens: tokens,
+                seed: 7,
+                ..RequestFacts::default()
+            };
+            let scored = scores(&stage, &facts, &[(row, sent), candidate(1, 0, 0)]);
+            assert!(scored == [1.0, 0.5] || scored == [0.5, 0.5], "{scored:?}");
+            scored[0] == 1.0
+        };
+        // One block of 16 tokens at the default share of 0.3: it is 0.302 of
+        // 53 tokens and 0.296 of 54, and a third of either prompt's three
+        // whole blocks.
+        let counted = [48, 53, 54, 63, 64].map(|tokens| counts(None, 16, 1, tokens));
+        assert_eq!(counted, [true, true, false, false, false]);
+        // Four blocks: 0.3005 of 213 tokens, 0.2991 of 214.
+        assert!(counts(None, 16, 4, 213));
+        assert!(!counts(None, 16, 4, 214));
+        // 72 tokens of 160 are 0.45 to the bit, and do not clear 0.45. Three
+        // blocks over 160 / 24 blocks would read one bit above it.
+        assert!(!counts(Some(0.45), 24, 3, 160));
+        assert!(counts(Some(0.45), 24, 3, 159));
+        // The whole keeps what the request's block count guards: a size
+        // stated under the hashes the host sent reads as the hashes, a
+        // prompt of no size as one block, and the text kind's as its bytes
+        // beside a window of bytes. A request of text states its length and
+        // no count of tokens: 100 two-byte characters are 200 bytes, and
+        // the share is taken of the bytes.
+        let whole = |facts: RequestFacts<'_>| {
+            let whole = Gates::of(None, None, Some(16)).whole(&facts);
+            (whole.block, whole.size)
+        };
+        let hashed = RequestFacts {
+            block_hashes: &HASHES[..3],
+            ..RequestFacts::default()
+        };
+        let sized = |prompt_tokens| RequestFacts {
+            prompt_tokens,
+            ..hashed
+        };
+        assert_eq!(whole(sized(54)), (16, 54));
+        assert_eq!(whole(sized(20)), (16, 48));
+        assert_eq!(whole(RequestFacts::default()), (16, 16));
+        let text = RequestFacts {
+            hash_kind: HashKind::Text,
+            block_size: 64,
+            prompt_chars: 100,
+            prompt_bytes: 200,
+            ..hashed
+        };
+        assert_eq!(whole(text), (64, 200));
+    }
+
+    /// The engine of the built-in `cache_aware` document.
+    fn built_in() -> Engine {
+        PolicySpec::preset("cache_aware")
+            .expect("a preset")
+            .validate()
+            .expect("the preset validates")
+    }
+
+    /// The built-in document's decision over `pool`, a pool of more than
+    /// twice its sample of sixteen rows, for a prompt of `tokens` tokens in
+    /// three whole blocks whose first block was sent to row 7: the row
+    /// picked. The host names row 7, and the decision runs behind a draw.
+    fn decided_past_the_sample(engine: &Engine, pool: &[Candidate], tokens: u32, seed: u64) -> u32 {
+        static HASHES: [u64; 3] = [0; 3];
+        let sent = [AffinityHolder {
+            row: 7,
+            overlap_blocks: 0,
+            predicted_blocks: 1,
+        }];
+        let facts = RequestFacts {
+            model: "m",
+            block_hashes: &HASHES,
+            prompt_tokens: tokens,
+            seed: Draw::new(seed).next_u64(),
+            named: Some(named(&sent, &[], false)),
+            ..RequestFacts::default()
+        };
+        let decision = engine.decide(
+            &facts,
+            &PoolFacts::default(),
+            pool,
+            &Constraints::default(),
+            &mut Scratch::new(),
+        );
+        assert!(decision.trace().drew_first(), "seed {seed}");
+        let pick = decision.pick().expect("a pick");
+        pick.targets.first().expect("a target").position
+    }
+
+    /// Behind a draw the share is the same one. A pool of more than twice
+    /// the built-in document's sample is decided over the rows drawn and the
+    /// rows its host named, and 16 tokens sent of a prompt of 54 hold
+    /// nothing there: they are under 0.3 of the prompt, and a third of its
+    /// three whole blocks. The classic policy divides the same two counts,
+    /// and under its threshold it selects with no holder named
+    /// (`model_gateway/src/policies/cache_aware.rs:3561-3569`, `:3579-3588`).
+    #[test]
+    fn behind_a_draw_a_sent_prefix_counts_by_its_share_of_the_whole_prompt() {
+        let engine = built_in();
+        // Sixty-four rows. Row 7 was sent the prefix and is the one busy
+        // row: it takes a request it holds, and an idle row takes any other.
+        let pool: Vec<Candidate> = (0..64)
+            .map(|row| candidate(row, if row == 7 { 2 } else { 0 }, 0).0)
+            .collect();
+        for seed in 0..32 {
+            // 0.302 of 53 tokens, 0.296 of 54.
+            let held = decided_past_the_sample(&engine, &pool, 53, seed);
+            assert_eq!(held, 7, "53 tokens, seed {seed}");
+            let missed = decided_past_the_sample(&engine, &pool, 54, seed);
+            assert_ne!(missed, 7, "54 tokens, seed {seed}");
+        }
+    }
+
     fn reporting(position: u32, in_flight: u32, overlap_blocks: u32, active_kv: u16) -> Held {
         let (row, held) = candidate(position, in_flight, overlap_blocks);
         (
@@ -1678,11 +1842,14 @@ mod tests {
         capped.prompt_tokens = 16 * 16;
         assert_eq!(scores(&slice, &capped, &held(4)), vec![0.0, 0.0, 1.0]);
         assert_eq!(scores(&slice, &capped, &held(8)), vec![1.0, 1.0, 1.0]);
-        // A text-kind request counts characters: 64 tokens are 256
-        // characters, sixteen blocks of sixteen, the same quarter.
+        // A text-kind request states its length and no count of tokens.
+        // Its windows are bytes: 128 two-byte characters are 256 bytes,
+        // sixteen windows of sixteen, the same quarter. Read by its
+        // characters the request would be eight windows, and four of them
+        // half of it.
         let mut text = facts(8);
         text.hash_kind = HashKind::Text;
-        text.prompt_tokens = 64;
+        (text.prompt_tokens, text.prompt_chars, text.prompt_bytes) = (0, 128, 256);
         assert_eq!(scores(&slice, &text, &held(4)), vec![0.0, 0.0, 1.0]);
     }
 
@@ -2062,6 +2229,29 @@ mod tests {
         }
         assert!(warmup(1.0, 0).needs().affinity);
         assert!(!KvPressure.needs().affinity);
+    }
+
+    /// The two stages that read the prompt's size declare it, under every
+    /// source: a host may state zero where no stage declares the size
+    /// ([`Needs::prompt_size`]), and a zero size reads every sent prefix as
+    /// the whole prompt. The classic policy is handed the prompt's length
+    /// always (`model_gateway/src/policies/cache_aware.rs:3474-3482`).
+    #[test]
+    fn the_stages_that_read_the_prompts_size_declare_it() {
+        for source in [
+            AffinitySource::Index,
+            AffinitySource::Predictor,
+            AffinitySource::Merged,
+        ] {
+            let params = PrefixAffinityParams {
+                source: Some(source),
+                ..PrefixAffinityParams::default()
+            };
+            let stage = PrefixAffinity::new(&params, Gates::of(Some(&params), None, Some(16)));
+            assert!(stage.needs().prompt_size, "{source:?}");
+        }
+        assert!(warmup(1.0, 0).needs().prompt_size);
+        assert!(!KvPressure.needs().prompt_size);
     }
 
     /// `row` named as holding `blocks` by the index.

@@ -12,6 +12,8 @@ use std::{
 /// same name reuses the allocation.
 pub(crate) fn intern(name: &str) -> &'static str {
     static NAMES: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
+    #[cfg(test)]
+    ASKED.with(|asked| asked.set(asked.get() + 1));
     let names = NAMES.get_or_init(|| Mutex::new(HashSet::new()));
     let mut guard = names
         .lock()
@@ -22,6 +24,14 @@ pub(crate) fn intern(name: &str) -> &'static str {
     let leaked: &'static str = Box::leak(name.to_owned().into_boxed_str());
     guard.insert(leaked);
     leaked
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many names this thread asked [`intern`] for: a case reads it
+    /// around a call to show that the call takes no name from the table,
+    /// and so not the table's lock.
+    pub(crate) static ASKED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]

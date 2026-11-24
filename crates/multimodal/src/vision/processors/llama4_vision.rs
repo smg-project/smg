@@ -50,19 +50,19 @@ use crate::{
 };
 
 /// Default normalization mean for LLaMA 4 Vision.
-pub const LLAMA4_MEAN: [f64; 3] = [0.5, 0.5, 0.5];
+pub(crate) const LLAMA4_MEAN: [f64; 3] = [0.5, 0.5, 0.5];
 
 /// Default normalization std for LLaMA 4 Vision.
-pub const LLAMA4_STD: [f64; 3] = [0.5, 0.5, 0.5];
+pub(crate) const LLAMA4_STD: [f64; 3] = [0.5, 0.5, 0.5];
 
 /// Default tile size for LLaMA 4 Vision.
-pub const TILE_SIZE: u32 = 336;
+pub(crate) const TILE_SIZE: u32 = 336;
 
 /// Default maximum number of patches/tiles.
-pub const DEFAULT_MAX_PATCHES: usize = 16;
+pub(crate) const DEFAULT_MAX_PATCHES: usize = 16;
 
 /// Patch size used in vision encoder.
-pub const PATCH_SIZE: usize = 14;
+pub(crate) const PATCH_SIZE: usize = 14;
 
 /// LLaMA 4 Vision image processor.
 ///
@@ -89,21 +89,10 @@ impl Default for Llama4VisionProcessor {
 
 impl Llama4VisionProcessor {
     /// Create a new LLaMA 4 Vision processor with default settings.
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             tile_size: TILE_SIZE,
             max_patches: DEFAULT_MAX_PATCHES,
-            resize_to_max_canvas: false,
-            mean: LLAMA4_MEAN,
-            std: LLAMA4_STD,
-        }
-    }
-
-    /// Create a processor with custom max_patches setting.
-    pub fn with_max_patches(max_patches: usize) -> Self {
-        Self {
-            tile_size: TILE_SIZE,
-            max_patches,
             resize_to_max_canvas: false,
             mean: LLAMA4_MEAN,
             std: LLAMA4_STD,
@@ -146,16 +135,6 @@ impl Llama4VisionProcessor {
         Err(TransformError::ShapeError(format!(
             "Llama 4 {zero} must be positive"
         )))
-    }
-
-    /// Get the tile size.
-    pub fn tile_size(&self) -> u32 {
-        self.tile_size
-    }
-
-    /// Get the max patches setting.
-    pub fn max_patches(&self) -> usize {
-        self.max_patches
     }
 
     /// Get all factors of a number.
@@ -391,7 +370,10 @@ impl Llama4VisionProcessor {
     }
 
     /// Calculate number of image tokens for a given aspect ratio.
-    pub fn calculate_num_tokens_for_aspect_ratio(&self, aspect_ratio: (usize, usize)) -> usize {
+    pub(crate) fn calculate_num_tokens_for_aspect_ratio(
+        &self,
+        aspect_ratio: (usize, usize),
+    ) -> usize {
         let (h_tiles, w_tiles) = aspect_ratio;
         let num_tiles = h_tiles * w_tiles;
         // Add 1 for global tile if num_tiles > 1
@@ -463,6 +445,20 @@ fn tile_blocks(
     buffer_pool::recycle(bytes);
 }
 
+/// The request's error for a patch output that cannot be reserved.
+fn refused(reason: impl std::fmt::Display) -> TransformError {
+    TransformError::ReserveRefused(format!("cannot reserve Llama 4 patch output: {reason}"))
+}
+
+/// The product of `factors`, the size of a patch output, or the request's
+/// error when `usize` cannot count it.
+fn output_len(factors: &[usize]) -> Result<usize, TransformError> {
+    factors
+        .iter()
+        .try_fold(1usize, |n, &d| n.checked_mul(d))
+        .ok_or_else(|| refused("its size overflows usize"))
+}
+
 impl VisionPreProcessor for Llama4VisionProcessor {
     fn default_mean(&self) -> [f64; 3] {
         self.mean
@@ -484,7 +480,8 @@ impl VisionPreProcessor for Llama4VisionProcessor {
         let table = self.norm().table_f32();
         // Every image's tiles land in the one buffer the engine reads:
         // [total_tiles, C, H, W], no batch dimension, no zero-padding.
-        let mut data = scratch::take_f32_cap(tiles * 3 * tile * tile);
+        let mut data =
+            scratch::try_take_f32_cap(output_len(&[tiles, 3, tile, tile])?).map_err(refused)?;
         for (image, plan) in images.iter().zip(&plans) {
             self.write_image(image, plan, |channel, bytes| {
                 let table = &table[channel];
@@ -514,10 +511,16 @@ impl VisionPreProcessor for Llama4VisionProcessor {
         let plans = self.plans(images);
         let tile = self.tile_size as usize;
         let tiles: usize = plans.iter().map(Plan::tiles).sum();
-        let block_bytes = tile * tile * writer.element_size();
         // A pooled buffer: its bytes are a previous request's until the tiles
         // are written, and the tiles cover it.
-        let mut wire = buffer_pool::take(tiles * 3 * block_bytes);
+        let reserved = output_len(&[tile, tile, writer.element_size()]).and_then(|block_bytes| {
+            let len = output_len(&[tiles, 3, block_bytes])?;
+            Ok((block_bytes, buffer_pool::try_take(len).map_err(refused)?))
+        });
+        let (block_bytes, mut wire) = match reserved {
+            Ok(reserved) => reserved,
+            Err(error) => return Some(Err(error)),
+        };
         let mut written = 0;
         for (image, plan) in images.iter().zip(&plans) {
             self.write_image(image, plan, |channel, bytes| {
@@ -566,8 +569,8 @@ mod tests {
     #[test]
     fn test_llama4_vision_processor_default() {
         let processor = Llama4VisionProcessor::new();
-        assert_eq!(processor.tile_size(), TILE_SIZE);
-        assert_eq!(processor.max_patches(), DEFAULT_MAX_PATCHES);
+        assert_eq!(processor.tile_size, TILE_SIZE);
+        assert_eq!(processor.max_patches, DEFAULT_MAX_PATCHES);
         assert_eq!(processor.mean, LLAMA4_MEAN);
         assert_eq!(processor.std, LLAMA4_STD);
     }
@@ -586,7 +589,10 @@ mod tests {
 
     #[test]
     fn test_find_supported_resolutions() {
-        let processor = Llama4VisionProcessor::with_max_patches(4);
+        let processor = Llama4VisionProcessor {
+            max_patches: 4,
+            ..Llama4VisionProcessor::new()
+        };
         let resolutions = processor.find_supported_resolutions();
 
         // Should include 1x1, 1x2, 2x1, 1x3, 3x1, 2x2, 1x4, 4x1
@@ -851,5 +857,37 @@ mod tests {
         }
         // Three channels of a 336x336 tile, 338,688 bytes: the 512 KiB class.
         assert_eq!(MINE.held(), 512 << 10);
+    }
+
+    /// A tile too large for any allocation, and a batch of them too large
+    /// for `usize` to count: the request reads an error in both forms of the
+    /// output.
+    #[test]
+    fn a_patch_output_that_cannot_be_reserved_is_an_error() {
+        let processor = Llama4VisionProcessor {
+            tile_size: 1 << 30,
+            max_patches: 1,
+            ..Llama4VisionProcessor::new()
+        };
+        let image = create_test_image(1, 1, Rgb([0, 0, 0]));
+        let wire = |images: &[&DynamicImage]| {
+            processor
+                .preprocess_wire(images, EncoderDtype::BFloat16)
+                .expect("a narrow wire")
+        };
+
+        for result in [
+            wire(&[&image]),
+            wire(&[&image; 3]),
+            processor.preprocess(&[&image]),
+        ] {
+            assert!(
+                matches!(&result, Err(TransformError::ReserveRefused(message))
+                    if message
+                        .strip_prefix("cannot reserve Llama 4 patch output: ")
+                        .is_some_and(|cause| !cause.is_empty())),
+                "{result:?}"
+            );
+        }
     }
 }

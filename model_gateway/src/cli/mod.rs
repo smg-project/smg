@@ -175,6 +175,60 @@ struct CliArgs {
     integrations: IntegrationArgs,
 }
 
+/// The routing flags a policy document replaces. `--policy-spec` conflicts
+/// with each of them, and the parser knows where a value came from: a flag
+/// typed beside a document is refused by both names, at its default value
+/// too. A flag the gateway still reads under a document is not listed, but
+/// for `grouped_dp_sticky`: the dispatch pins by the gateway's own key, and
+/// a supplied document names its own key sources. The two overload
+/// thresholds are not listed: no document names one, and the gateway builds
+/// its worker objects with them.
+const DOCUMENT_REPLACES: [&str; 43] = [
+    "policy",
+    "cache_threshold",
+    "balance_abs_threshold",
+    "balance_rel_threshold",
+    "balance_prefix_margin_tokens",
+    "balance_uncached_credit",
+    "bucket_adjust_interval_secs",
+    "balance_token_usage_threshold",
+    "overload_token_usage_threshold",
+    "worker_overload_protection",
+    "disable_worker_overload_protection",
+    "worker_overload_shed",
+    "overlap_decay",
+    "selection_temperature",
+    "selection_policy",
+    "selection_accounting_ttl_ms",
+    "eviction_interval",
+    "max_tree_size",
+    "block_size",
+    "cache_boundaries",
+    "cache_index",
+    "cache_ttl_secs",
+    "max_idle_secs",
+    "assignment_mode",
+    "prefix_token_count",
+    "prefix_hash_load_factor",
+    "prefix_hash_balance_abs_threshold",
+    "least_load_kv_pressure_weight",
+    "least_load_default_throughput",
+    "least_load_mean_prefill_tokens",
+    "power_of_two_load_metric",
+    "routing_key_override",
+    "pd_pairing_mode",
+    "grouped_dp_sticky",
+    "dp_minimum_tokens_scheduler",
+    "worker_warmup_secs",
+    "worker_warmup_share",
+    "worker_warmup_blocks",
+    "worker_warmup_thin_ratio",
+    "worker_warmup_divert_every",
+    "prefill_policy",
+    "decode_policy",
+    "encode_policy",
+];
+
 #[derive(clap::Args, Debug)]
 #[group(skip)]
 struct RoutingArgs {
@@ -268,11 +322,11 @@ struct RoutingArgs {
     #[arg(long, default_value_t = 200, value_parser = parse_job_queue_concurrency, help_heading = "Worker Configuration")]
     job_queue_concurrency: usize,
 
-    /// DP engines per startup ZMQ worker: each ipc:// or tcp:// worker becomes a
-    /// grouped worker whose handshake awaits this many engines on one socket set
-    /// (default: as many as the first engine to dial declares, one for an
-    /// engine that declares none). Under --dp-aware a worker given this count
-    /// registers as one worker per engine, which share the socket set.
+    /// DP engines per startup ZMQ worker: each ipc:// or tcp:// worker given a
+    /// count above one registers as one worker per engine, which share one
+    /// socket set whose handshake awaits this many engines (default: one
+    /// worker, whose handshake awaits as many engines as the first to dial
+    /// declares, one for an engine that declares none).
     #[arg(long, value_parser = parse_positive_usize, help_heading = "Worker Configuration")]
     zmq_engine_count: Option<usize>,
 
@@ -309,9 +363,10 @@ struct RoutingArgs {
     worker_startup_check_interval: u64,
 
     // ==================== Routing Policy ====================
-    /// Load balancing policy to use
-    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "passthrough", "cache_aware", "power_of_two", "least_load", "prefix_hash", "consistent_hashing", "manual", "bucket"], help_heading = "Routing Policy")]
-    policy: String,
+    /// Load balancing policy to use. Defaults to cache_aware. A policy
+    /// document replaces the routing flags, and --policy is refused beside one.
+    #[arg(long, value_parser = ["random", "round_robin", "passthrough", "cache_aware", "power_of_two", "least_load", "prefix_hash", "consistent_hashing", "manual", "bucket"], help_heading = "Routing Policy")]
+    policy: Option<String>,
 
     /// Minimum matched-prefix share (0.0-1.0) before cache-aware routing
     /// pins a request to a worker already holding that prefix; below it the
@@ -561,7 +616,8 @@ struct RoutingArgs {
     #[arg(long, default_value = "expected_wait", value_parser = parse_power_of_two_load_metric, help_heading = "Routing Policy")]
     power_of_two_load_metric: PowerOfTwoLoadMetric,
 
-    /// Enable data parallelism aware scheduling
+    /// Deprecated, accepted and ignored: every registration reads an engine's
+    /// data-parallel size and registers one worker per rank (warned at start-up)
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
     dp_aware: bool,
 
@@ -602,12 +658,13 @@ struct RoutingArgs {
     routing_key_headers: Vec<String>,
 
     /// Whether, and how, a request that carries a routing key is pinned to
-    /// one engine of a grouped data-parallel worker (a ZMQ worker whose
-    /// socket set several engines dial, as many as --zmq-engine-count says
-    /// or its engines declare), so a conversation keeps one engine's prefix
-    /// cache. The key is the sticky-session key: the first valid
-    /// --routing-key-headers header, or the body rid under
-    /// --routing-key-override
+    /// one engine of a grouped data-parallel worker (a ZMQ worker given no
+    /// engine count, whose socket set as many engines dial as they declare),
+    /// so a conversation keeps one engine's prefix cache. A worker given
+    /// --zmq-engine-count registers as one worker per engine, where the
+    /// routing policy picks the engine and this option does nothing. The key
+    /// is the sticky-session key: the first valid --routing-key-headers
+    /// header, or the body rid under --routing-key-override
     #[arg(
         long,
         value_enum,
@@ -622,9 +679,9 @@ struct RoutingArgs {
 
     /// Choose a data-parallel rank per request from the ranks' reported token
     /// loads: the HTTP prefill-decode router, for an engine registered as one
-    /// worker. Under --dp-aware the engine's ranks are workers and the policy's
-    /// pick among them is the rank choice, so this flag chooses nothing there
-    /// (warned at start-up)
+    /// worker. An engine that reports its data-parallel size registers as one
+    /// worker per rank and the policy's pick among them is the rank choice, so
+    /// this flag chooses nothing there (warned at start-up)
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
     dp_minimum_tokens_scheduler: bool,
 
@@ -660,6 +717,44 @@ struct RoutingArgs {
     /// workload where every request has a holder. 0 disables.
     #[arg(long, default_value_t = 8, help_heading = "Routing Policy")]
     worker_warmup_divert_every: u64,
+
+    /// Choose off for the classic routing policies or on for the policy
+    /// controller. With on, the routing flags keep their meaning through a
+    /// policy document
+    #[arg(
+        long,
+        value_parser = ["on", "off"],
+        default_value = "off",
+        help_heading = "Routing Policy"
+    )]
+    policy_controller: String,
+
+    /// Run this policy document in place of the one the routing flags mean.
+    /// The document replaces those flags. A policy name, a policy's own
+    /// setting, the overload switch and shed flag and the warm-up and pairing
+    /// settings are each refused beside it by name. The two overload
+    /// thresholds stand beside it: the gateway builds its workers with them
+    #[arg(
+        long,
+        value_name = "FILE",
+        help_heading = "Routing Policy",
+        conflicts_with = "print_policy_spec",
+        conflicts_with_all = DOCUMENT_REPLACES
+    )]
+    policy_spec: Option<String>,
+
+    /// Print the policy document these routing flags mean, as YAML, and
+    /// exit. The routing part of the line is read and checked as a start
+    /// checks it: the routing flags, the discovery flags and the tenant
+    /// header's name. A Consul address and the Consul environment are
+    /// resolved at a start alone. A flag of a wrong shape is refused first,
+    /// as at a start. Nothing is started and no file is read, so no secret
+    /// and no key. A start checks the rest of the command line. A setting the
+    /// document cannot say yet, and a part of the document this build's
+    /// controller does not run yet, is named in one sentence on stderr, and
+    /// the exit is then a failure
+    #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
+    print_policy_spec: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -725,6 +820,12 @@ struct WorkerArgs {
     /// Interval in seconds between load monitor checks for PowerOfTwo routing
     #[arg(long, default_value_t = 10, help_heading = "Load Monitoring")]
     load_monitor_interval: u64,
+
+    /// Interval in milliseconds between load monitor checks, 100 at the
+    /// least. When set it is the interval, and --load-monitor-interval is
+    /// not read for it.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(100..), help_heading = "Load Monitoring")]
+    load_monitor_interval_ms: Option<u64>,
 
     /// Seconds without any contact from a worker (a load poll, a health probe,
     /// a KV event, a response) after which a transport failure excludes it
@@ -943,6 +1044,18 @@ struct DiscoveryArgs {
         help_heading = "Service Discovery (Kubernetes)"
     )]
     kv_engine_id_annotation: String,
+
+    /// Pod label containing the worker's prefill/decode pairing protocol.
+    /// A prefill and a decode pair only when their protocols are equal, so
+    /// an operator that rolls both roles can label the Pods of one rollout
+    /// alike and keep a prefill of one rollout from a decode of another.
+    /// A Pod without the label states none.
+    #[arg(
+        long,
+        default_value = "smg.ai/pairing-protocol",
+        help_heading = "Service Discovery (Kubernetes)"
+    )]
+    pairing_protocol_label: String,
 
     /// Label selector for encode server pods in EPD mode
     #[arg(long, num_args = 0.., help_heading = "Service Discovery (Kubernetes)")]
@@ -1172,7 +1285,11 @@ struct ServingArgs {
     /// Idle timeout in seconds for pooled upstream connections. Must stay
     /// below the backend HTTP server's keep-alive timeout (vLLM and SGLang
     /// default to 5), or reused connections the server already closed fail
-    /// non-idempotent sends. 0 keeps idle connections forever.
+    /// non-idempotent sends. 0 keeps idle connections forever. While a
+    /// nonzero value is below --load-monitor-interval, an idle HTTP worker is
+    /// connected anew for every load poll; where the server's keep-alive can
+    /// be raised above that interval, a value between the two keeps the
+    /// connection.
     #[arg(long, default_value_t = 3, help_heading = "Request Handling")]
     upstream_pool_idle_timeout_secs: u64,
 
@@ -1379,7 +1496,8 @@ struct ServingArgs {
     #[arg(long, default_value_t = 60, help_heading = "Circuit Breaker")]
     cb_timeout_duration_secs: u64,
 
-    /// Sliding window duration for tracking failures
+    /// While the circuit is closed, a failed request more than this many
+    /// seconds after the last one starts the count anew (at least 1)
     #[arg(long, default_value_t = 120, help_heading = "Circuit Breaker")]
     cb_window_duration_secs: u64,
 
@@ -1964,10 +2082,28 @@ fn serve(
     server::run_with(&runtime, server_config, extensions)
 }
 
+/// Says the refusal of a `--print-policy-spec` on stderr, as its type writes
+/// the sentence, and answers with the failing exit. `main`'s own error
+/// return would print the type's debug form.
+#[expect(
+    clippy::print_stderr,
+    reason = "the refusal of --print-policy-spec, said before any logger is up"
+)]
+fn refused_print(refusal: &str) -> ExitCode {
+    eprintln!("error: {refusal}");
+    ExitCode::FAILURE
+}
+
 /// The start-up sequence: parse, resolve the secrets' sources, announce,
 /// configure, serve. The version flags are answered first, before clap sees
-/// the line.
-#[expect(clippy::print_stdout, reason = "the version flags' answer")]
+/// the line. `--print-policy-spec` is answered right after the parse, ahead
+/// of the secrets and the banner: its output is the document alone, it
+/// reads no secret, and nothing is started. A refusal of it is a failing
+/// exit with its sentence on stderr; every other failure is the error return.
+#[expect(
+    clippy::print_stdout,
+    reason = "the answers of the version flags and of --print-policy-spec"
+)]
 pub(super) fn main_from_args(
     extensions: Extensions,
 ) -> Result<ExitCode, Box<dyn std::error::Error>> {
@@ -1978,6 +2114,17 @@ pub(super) fn main_from_args(
     }
     let command_line = CommandLine::split(&args);
     let (mut cli_args, igw_enabled_for_discovery) = parse_cli_args(command_line.clap_args);
+    if cli_args.routing.print_policy_spec {
+        let (prefill, encode) = (command_line.prefill_urls, command_line.encode_urls);
+        let answer = cli_args.policy_spec_print(prefill, encode);
+        if let Some(document) = answer.document() {
+            print!("{document}");
+        }
+        return Ok(match answer.refusal() {
+            Some(refusal) => refused_print(refusal),
+            None => ExitCode::SUCCESS,
+        });
+    }
     cli_args.resolve_secret_sources(&process_env)?;
     cli_args.announce(
         igw_enabled_for_discovery,
@@ -2067,7 +2214,151 @@ mod tests {
     }
 
     #[test]
-    fn a_line_with_no_policy_builds_cache_aware() {
+    fn the_switch_flows_into_router_config() {
+        use clap::error::ErrorKind;
+
+        for (flags, enabled) in [
+            (&[][..], false),
+            (&["--policy-controller", "on"][..], true),
+            (&["--policy-controller", "off"][..], false),
+        ] {
+            let config = cli_args_from(flags)
+                .to_router_config(vec![], vec![])
+                .expect("the routing configuration");
+            assert_eq!(config.policy_controller, enabled, "{flags:?}");
+        }
+        let refusal = Cli::try_parse_from(["smg", "--policy-controller", "other"])
+            .expect_err("the switch takes only on and off");
+        assert_eq!(refusal.kind(), ErrorKind::InvalidValue);
+        assert!(refusal.to_string().contains("--policy-controller"));
+    }
+
+    fn policy_file(
+        name: &str,
+    ) -> Result<
+        (
+            tempfile::NamedTempFile,
+            smg_policy_controller::document::PolicySpec,
+        ),
+        Box<dyn std::error::Error>,
+    > {
+        let file = tempfile::NamedTempFile::new()?;
+        let document = smg_policy_controller::document::PolicySpec::preset(name)?;
+        serde_yaml::to_writer(file.as_file(), &document)?;
+        Ok((file, document))
+    }
+
+    #[test]
+    fn the_plain_start_takes_the_document() {
+        let (file, document) = policy_file("round_robin").expect("a policy document file");
+        let path = file.path().to_str().expect("a UTF-8 path");
+        let config = cli_args_from(&["--policy-controller", "on", "--policy-spec", path])
+            .to_router_config(vec![], vec![])
+            .expect("the routing configuration");
+        assert_eq!(config.policy_spec_path.as_deref(), Some(path));
+        assert_eq!(config.policy_spec.as_ref(), Some(&document));
+        assert_eq!(config.policy_document_in_force(), Ok(document));
+    }
+
+    /// No document names an overload threshold. The two flags stand beside
+    /// a document, the document stays in force, and the settings a worker
+    /// object is built with hold the two.
+    #[test]
+    fn the_overload_thresholds_stand_beside_a_document() {
+        let (file, document) = policy_file("round_robin").expect("a policy document file");
+        let path = file.path().to_str().expect("a UTF-8 path");
+        let config = cli_args_from(&[
+            "--policy-controller",
+            "on",
+            "--policy-spec",
+            path,
+            "--worker-overload-waiting-requests",
+            "32",
+            "--worker-overload-token-usage",
+            "0.9",
+        ])
+        .to_router_config(vec![], vec![])
+        .expect("the routing configuration");
+        assert_eq!(config.policy_document_in_force(), Ok(document));
+        let built = config.registration_settings().overload_defaults;
+        assert_eq!(built.waiting_requests, Some(32));
+        assert_eq!(built.token_usage, Some(0.9));
+    }
+
+    /// The flags under the routing policy heading a document does not
+    /// replace: the controller's own, and what the gateway reads itself.
+    const BESIDE_A_DOCUMENT: [&str; 8] = [
+        "policy_controller",
+        "policy_spec",
+        "print_policy_spec",
+        "dp_aware",
+        "routing_key_headers",
+        "enable_igw",
+        "worker_overload_waiting_requests",
+        "worker_overload_token_usage",
+    ];
+
+    #[test]
+    fn every_routing_flag_is_replaced_by_a_document_or_stays_beside_it() {
+        use clap::CommandFactory;
+
+        let command = Cli::command();
+        for arg in command.get_arguments() {
+            if arg.get_help_heading() != Some("Routing Policy") {
+                continue;
+            }
+            let id = arg.get_id().as_str();
+            assert_ne!(
+                DOCUMENT_REPLACES.contains(&id),
+                BESIDE_A_DOCUMENT.contains(&id),
+                "{id}: a routing flag stands in exactly one of the two lists"
+            );
+        }
+    }
+
+    #[test]
+    fn a_routing_flag_typed_beside_a_document_is_refused_by_both_names() {
+        use clap::{error::ErrorKind, CommandFactory};
+
+        let command = Cli::command();
+        for id in DOCUMENT_REPLACES {
+            let arg = command
+                .get_arguments()
+                .find(|arg| arg.get_id() == id)
+                .unwrap_or_else(|| panic!("{id} is no flag of the command line"));
+            let flag = format!("--{}", arg.get_long().expect("a long flag"));
+            let mut line = vec!["smg", "--policy-spec", "routing.yaml", flag.as_str()];
+            // The flag's own default where it has one: the parser refuses
+            // by where the value came from, never by the value.
+            let default = arg
+                .get_default_values()
+                .first()
+                .map(|value| value.to_string_lossy().into_owned());
+            let choice = arg
+                .get_possible_values()
+                .first()
+                .map(|value| value.get_name().to_owned());
+            let value = default.or(choice).unwrap_or_else(|| "1".to_owned());
+            if arg.get_action().takes_values() {
+                line.push(&value);
+            }
+            let refusal =
+                Cli::try_parse_from(&line).expect_err("the flag is typed beside a document");
+            assert_eq!(
+                refusal.kind(),
+                ErrorKind::ArgumentConflict,
+                "{flag}: {refusal}"
+            );
+            let message = refusal.to_string();
+            assert!(
+                message.contains("--policy-spec") && message.contains(&flag),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_line_with_no_document_builds_cache_aware_as_before() {
         for (flags, threshold) in [(&[][..], 0.3), (&["--cache-threshold", "0.7"][..], 0.7)] {
             let config = cli_args_from(flags)
                 .to_router_config(vec![], vec![])
@@ -2079,6 +2370,23 @@ mod tests {
                 config.policy
             );
         }
+    }
+
+    #[test]
+    fn the_print_flag_refuses_a_document_beside_it() {
+        use clap::error::ErrorKind;
+
+        let line = [
+            "smg",
+            "--print-policy-spec",
+            "--policy-spec",
+            "routing.yaml",
+        ];
+        let refusal = Cli::try_parse_from(line).expect_err("the print and input flags conflict");
+        assert_eq!(refusal.kind(), ErrorKind::ArgumentConflict);
+        let message = refusal.to_string();
+        assert!(message.contains("--print-policy-spec"));
+        assert!(message.contains("--policy-spec"));
     }
 
     /// The CLI preserves independent role thresholds and rounds percentages up.
@@ -3567,6 +3875,37 @@ mod tests {
         assert_eq!(defaults.kv_engine_id_annotation, "smg.ai/kv-engine-id");
     }
 
+    #[test]
+    fn the_pairing_protocol_label_flows_into_both_configs() {
+        let cli = cli_args_from(&[
+            "--service-discovery",
+            "--selector",
+            "app=worker",
+            "--pairing-protocol-label",
+            "example.com/rollout",
+        ]);
+        let router = cli.to_router_config(vec![], vec![]).unwrap();
+        let Some(DiscoveryConfig::Kubernetes(discovery)) = &router.discovery else {
+            panic!("expected Kubernetes discovery");
+        };
+        assert_eq!(discovery.pairing_protocol_label, "example.com/rollout");
+
+        let server = cli.to_server_config(router).unwrap();
+        let Some(RuntimeDiscoveryConfig::Kubernetes(discovery)) = &server.service_discovery_config
+        else {
+            panic!("expected Kubernetes runtime discovery");
+        };
+        assert_eq!(discovery.pairing_protocol_label, "example.com/rollout");
+
+        let defaults = cli_args_from(&["--service-discovery", "--selector", "app=worker"])
+            .to_router_config(vec![], vec![])
+            .unwrap();
+        let Some(DiscoveryConfig::Kubernetes(defaults)) = &defaults.discovery else {
+            panic!("expected Kubernetes discovery");
+        };
+        assert_eq!(defaults.pairing_protocol_label, "smg.ai/pairing-protocol");
+    }
+
     /// `--discovery-provider kubernetes` is `--service-discovery` under its
     /// new name: the same detail flags build the same configuration, worker
     /// and router discovery alike.
@@ -4248,6 +4587,55 @@ mod tests {
         let server_config = cli.to_server_config(router_config).unwrap();
         assert!(server_config.router_config.worker_overload_protection);
         assert!(!server_config.router_config.disable_load_monitoring);
+    }
+
+    /// `--load-monitor-interval-ms` reaches both configurations beside the
+    /// seconds option, which keeps its own value, and is the monitor's
+    /// interval over it. With no word of it the seconds are the interval,
+    /// ten by default. A value under the monitor's least is refused when
+    /// the line is read.
+    #[test]
+    fn the_load_monitor_interval_in_milliseconds_flows_into_both_configs() {
+        use std::time::Duration;
+
+        use smg_worker::load::monitor::LEAST_POLL_INTERVAL;
+
+        let cli = cli_args_from(&[
+            "--load-monitor-interval",
+            "5",
+            "--load-monitor-interval-ms",
+            "250",
+        ]);
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(router_config.load_monitor_interval_secs, 5);
+        assert_eq!(router_config.load_monitor_interval_ms, Some(250));
+        assert_eq!(
+            router_config.load_monitor_interval(),
+            Duration::from_millis(250)
+        );
+        let server_config = cli.to_server_config(router_config).unwrap();
+        let nested = &server_config.router_config;
+        assert_eq!(nested.load_monitor_interval_secs, 5);
+        assert_eq!(nested.load_monitor_interval_ms, Some(250));
+
+        let seconds = |flags: &[&str]| {
+            let config = cli_args_from(flags).to_router_config(vec![], vec![]);
+            let config = config.unwrap();
+            assert_eq!(config.load_monitor_interval_ms, None);
+            config.load_monitor_interval()
+        };
+        assert_eq!(
+            seconds(&["--load-monitor-interval", "5"]),
+            Duration::from_secs(5)
+        );
+        assert_eq!(seconds(&[]), Duration::from_secs(10));
+
+        let least = LEAST_POLL_INTERVAL.as_millis();
+        for (millis, taken) in [(least - 1, false), (least, true)] {
+            let millis = millis.to_string();
+            let line = ["smg", "--load-monitor-interval-ms", millis.as_str()];
+            assert_eq!(Cli::try_parse_from(line).is_ok(), taken, "{millis} ms");
+        }
     }
 
     /// Cache-index flags must reach the cache_aware policy variant and the

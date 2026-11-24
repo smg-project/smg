@@ -81,5 +81,6 @@ pub(crate) use request_execution::execute_plan;
 #[cfg(any(test, feature = "test-util"))]
 pub use worker_selection::SelectionBench;
 pub(crate) use worker_selection::{
-    WorkerSelectionMode, WorkerSelectionStage, SELECTION_QUEUE_TIMEOUT_ERROR_CODE,
+    MovedDecode, RequestAgain, WorkerSelectionMode, WorkerSelectionStage,
+    SELECTION_QUEUE_TIMEOUT_ERROR_CODE,
 };

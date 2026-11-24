@@ -62,6 +62,8 @@
 //! the field as false: the controller issues both sides at the first ask, and
 //! [`DecisionGuard::decide_decode`] answers that the side was not chosen.
 
+#[cfg(feature = "in-process")]
+use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::{
     fmt,
     ops::Deref,
@@ -77,12 +79,33 @@ use crate::{
             DecideOutcome, DecisionEngine, DecisionRefused, DecodeRefused, HeldDecision,
             HeldDecode, Leased, Request, RequestMaker,
         },
-        framework::{EncodeItems, EncodePlaced},
         view::WorkerId,
     },
     store::GatewayId,
-    tracking::lease::{Dispatch, LeaseId, Outcome, ReleaseReason, Said, Side, TransportClass},
+    tracking::lease::{
+        Dispatch, Lease, LeaseId, Outcome, ReleaseReason, Said, Side, TransportClass,
+    },
 };
+
+/// The three sizes a side's words state: its lease's token count and its
+/// text's two lengths ([`Lease::tokens`], [`Lease::chars`] and
+/// [`Lease::bytes`]).
+#[derive(Clone, Copy, Default)]
+struct Stated {
+    tokens: u32,
+    chars: u32,
+    bytes: u32,
+}
+
+impl Stated {
+    const fn of(lease: &Lease) -> Self {
+        Self {
+            tokens: lease.tokens,
+            chars: lease.chars,
+            bytes: lease.bytes,
+        }
+    }
+}
 
 /// Where a handle's decision came from, and where its reports go.
 enum Arm<D> {
@@ -161,6 +184,10 @@ pub struct DecisionGuard<D: Deref<Target: DecisionEngine>> {
     /// chosen. A decode that owes a dispatch or an end was then picked by
     /// a decode call, and was issued with its prefill otherwise.
     later: bool,
+    /// The three sizes the decode side's words state: the lease's own, and
+    /// a decode call's from the call that picks the side. Nothing reads a
+    /// single's.
+    stated: Stated,
     /// The target at that index.
     target: Target,
     owed: Owed,
@@ -226,31 +253,6 @@ impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
         Self::hold(Arm::Engine { door, gateway }, decided, later, now)
     }
 
-    /// Holds the decision made with the request's encode items
-    /// ([`DecisionEngine::decide_encode_pair`]). For a pair, the handle
-    /// reports the prefill and decode.
-    ///
-    /// # Errors
-    ///
-    /// [`DecisionRefused`]: the door made no decision for the request.
-    pub fn decide_encode_pair(
-        door: D,
-        gateway: GatewayId,
-        request: &Request<'_>,
-        items: EncodeItems<'_>,
-        placed: &mut EncodePlaced,
-        now: Instant,
-    ) -> Result<Self, DecisionRefused> {
-        let decided = door.decide_encode_pair(gateway, request, items, placed, now)?;
-        let later = request.constraints.decode_later;
-        Ok(Self::hold(
-            Arm::Engine { door, gateway },
-            decided,
-            later,
-            now,
-        ))
-    }
-
     fn hold(arm: Arm<D>, decided: DecideOutcome, later: bool, now: Instant) -> Self {
         let first = decided
             .decision
@@ -282,11 +284,16 @@ impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
         } else {
             Owed::Nothing
         };
+        // The sizes the decode side's words state until a decode call picks
+        // the side: the lease's own.
+        let stated = decided.lease.map(|leased| Stated::of(&leased.lease));
+        let stated = stated.unwrap_or_default();
         Self {
             arm,
             decided,
             index: 0,
             later,
+            stated,
             target,
             owed,
             decode,
@@ -304,10 +311,13 @@ impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
             index: self.index,
             target: &self.target,
             // Lent as the handle keeps them, with no test of the lease's
-            // side: a single's answer names no decode session and its
-            // decode side never stands chosen.
+            // side: a single's answer names no decode session, its sizes are
+            // the lease's own and its decode side never stands chosen.
             decode: HeldDecode {
                 session: self.decided.decode_session,
+                tokens: self.stated.tokens,
+                chars: self.stated.chars,
+                bytes: self.stated.bytes,
                 chosen: matches!(self.decode, Owed::Later { .. }),
             },
         })
@@ -374,6 +384,22 @@ impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
             &HeldDecision<'_>,
         ) -> Result<DecideOutcome, DecisionRefused>,
     ) -> Result<&Decision, DecisionRefused> {
+        self.decode_asked(call)?;
+        Ok(self.decision())
+    }
+
+    /// Asks the handle's door by `call` for the decode side of its pair's
+    /// lease. A pick is taken, its first target with it, and the answer is
+    /// `None`. Where the door picked nothing the handle stands as it was,
+    /// and the answer is the door's own: its shed, or its queue.
+    fn decode_asked(
+        &mut self,
+        call: impl FnOnce(
+            &D::Target,
+            GatewayId,
+            &HeldDecision<'_>,
+        ) -> Result<DecideOutcome, DecisionRefused>,
+    ) -> Result<Option<Decision>, DecisionRefused> {
         let refused = |refused| Err(DecisionRefused::Decode(refused));
         if self.decided.lease.is_none() {
             return refused(DecodeRefused::NoLease);
@@ -390,8 +416,10 @@ impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
         // decode call picked it already, or it was issued with its
         // prefill. A decode that stands chosen is decided once its prefill
         // is held: dispatched, and not ended. A file also counts a side's
-        // issues and refuses a call past the count's end. A handle sees
-        // one issue of a side at the most, and leaves that count to the
+        // issues and refuses a call past the count's end. A handle holds
+        // one issue of a side at a time: a placement's call that takes no
+        // decode releases the side it issued before the handle asks again
+        // ([`Self::decode_placed_under`]). It leaves that count to the
         // file.
         match (self.decided.pair(), self.owed, self.decode) {
             (false, ..) => return refused(DecodeRefused::NotChosen),
@@ -422,13 +450,79 @@ impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
         if let Some((leased, target)) = answer.lease.zip(first) {
             self.decided.decision = answer.decision;
             self.decided.decode_session = answer.decode_session;
+            // The call issued the side under the three sizes it stated.
+            self.stated = Stated::of(&leased.lease);
             (self.index, self.target) = (0, *target);
             self.decode = self.decode.sent_later();
             if let Some(held) = &mut self.decided.lease {
                 held.due = leased.due;
             }
+            return Ok(None);
         }
-        Ok(self.decision())
+        Ok(Some(answer.decision))
+    }
+
+    /// [`Self::decide_decode_under`] for a placement, which takes a decode
+    /// itself and answers its host a shed by name
+    /// ([`Placement::decode_again`](super::Placement::decode_again)).
+    ///
+    /// `sendable` is asked of the targets of the call's pick, best first,
+    /// and the first it admits is taken ([`Self::take_decode`]): the
+    /// answer is then `None`. Otherwise the answer is the decision the
+    /// call made, and the handle stands as it stood before the call, on
+    /// the first decision's target with its decode chosen and booked
+    /// nowhere, so its host may ask again. That decision is the door's own
+    /// shed or queue, or a pick none of whose targets `sendable` admits:
+    /// the side such a pick issued is released by name
+    /// ([`ReleaseReason::CommitFailed`]).
+    ///
+    /// What stands again is the handle's own note of the pair. The engine
+    /// of a gateway's own process keeps no other, and a placement is held
+    /// by no other door: a door that keeps a file of leases answers a
+    /// second ask by its file.
+    ///
+    /// What `sendable` asks can panic, a route's own rule among it. The
+    /// side the call issued is then released by the same name, the handle
+    /// stands as it stood before the call, and the panic goes on to the
+    /// caller: a walk leaves no lease behind, and its host may still send
+    /// the first decision's decode or ask again.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::decide_decode`].
+    #[cfg(feature = "in-process")]
+    pub(crate) fn decode_placed_under(
+        &mut self,
+        maker: &impl RequestMaker,
+        now: Instant,
+        mut sendable: impl FnMut(&Target) -> bool,
+    ) -> Result<Option<Decision>, DecisionRefused> {
+        let (decision, lease) = (self.decided.decision, self.decided.lease);
+        let before = (self.decided.decode_session, self.stated, self.index);
+        let (target, chosen) = (self.target, self.decode);
+        let asked = self.decode_asked(|door, gateway, held| {
+            door.decide_decode_under(gateway, maker, held, now)
+        })?;
+        if asked.is_some() {
+            return Ok(asked);
+        }
+        let pick = self.decided.decision.pick();
+        let walked = catch_unwind(AssertUnwindSafe(|| {
+            pick.and_then(|pick| pick.targets.iter().position(&mut sendable))
+        }));
+        let first = walked.as_ref().map_or(None, |first| *first);
+        if first.and_then(|index| self.take_decode(index)).is_some() {
+            return Ok(None);
+        }
+        self.released_decode(ReleaseReason::CommitFailed, now);
+        let unsent = self.decided.decision;
+        (self.decided.decision, self.decided.lease) = (decision, lease);
+        (self.decided.decode_session, self.stated, self.index) = before;
+        (self.target, self.decode) = (target, chosen);
+        match walked {
+            Ok(_) => Ok(Some(unsent)),
+            Err(panic) => resume_unwind(panic),
+        }
     }
 
     /// Whether the pair's decode side stands chosen: its request stated a
@@ -448,6 +542,51 @@ impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
     #[must_use]
     pub fn lease(&self) -> Option<&Leased> {
         self.decided.lease.as_ref()
+    }
+
+    /// Whether the handle still owes its lease a word on some side: a
+    /// dispatch, an end, or the release in their place. A handle that
+    /// owes nothing says nothing at its drop.
+    #[must_use]
+    pub(crate) fn owes(&self) -> bool {
+        !matches!((self.owed, self.decode), (Owed::Nothing, Owed::Nothing))
+    }
+
+    /// Whether the handle is of a pair that asked its decode later and owes
+    /// nothing on either side any more: both sides ended, or the prefill
+    /// ended with the decode still chosen, which left with it. A decode's
+    /// send said then meets no side.
+    #[cfg(feature = "in-process")]
+    #[must_use]
+    pub(crate) fn later_ended(&self) -> bool {
+        self.later && !self.owes()
+    }
+
+    /// The engine of this process the handle decides by. `None` for a
+    /// handle over a link.
+    #[cfg(feature = "in-process")]
+    #[cfg_attr(
+        not(feature = "client"),
+        expect(
+            clippy::unnecessary_wraps,
+            reason = "a handle over a link alone has no engine"
+        )
+    )]
+    #[must_use]
+    pub(crate) fn door(&self) -> Option<&D> {
+        match &self.arm {
+            Arm::Engine { door, .. } => Some(door),
+            #[cfg(feature = "client")]
+            Arm::Link(_) => None,
+        }
+    }
+
+    /// The target the handle names at its dispatch: the pick's first, or
+    /// the one a take moved to. A pair's decode is in it.
+    #[cfg(feature = "in-process")]
+    #[must_use]
+    pub(crate) fn target(&self) -> &Target {
+        &self.target
     }
 
     /// Takes the target at `index` of the pick, best first: the one the
@@ -546,6 +685,9 @@ impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
     }
 
     /// Says a dispatch and keeps the worker it named for a cancelled end.
+    /// It stands in line in its two callers: a host says a dispatch once
+    /// a request.
+    #[inline]
     fn dispatch(&self, owed: Owed, worker: WorkerId, now: Instant) -> Owed {
         let Owed::Dispatch {
             lease,
@@ -653,6 +795,47 @@ impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
         self.decode = self.release(self.decode, reason, now);
     }
 
+    /// Gives up the prefill side alone, a single's one side, as
+    /// [`Self::released_decode`] gives up the decode's. A sent prefill
+    /// completes as cancelled on the worker it was sent to, with the span
+    /// from its dispatch to `now`. An issued prefill is released by name
+    /// under `reason`. A decode that still stands chosen leaves with it,
+    /// as it leaves with the prefill's end ([`Self::completed`]).
+    #[cfg(feature = "in-process")]
+    pub(crate) fn released_prefill(&mut self, reason: ReleaseReason, now: Instant) {
+        self.owed = self.release(self.owed, reason, now);
+        if self.decode_chosen() {
+            self.decode = Owed::Nothing;
+        }
+    }
+
+    /// Whether the prefill's end would take the pair's decode with it: the
+    /// prefill went out, and the decode still stands chosen
+    /// ([`Self::decode_chosen`]).
+    #[cfg(feature = "in-process")]
+    #[must_use]
+    pub(crate) fn end_takes_decode(&self) -> bool {
+        matches!(self.owed, Owed::Completion { .. }) && self.decode_chosen()
+    }
+
+    /// The span from `side`'s dispatch to `at`, in whole microseconds: what
+    /// an end of class cancelled states of a side given up at `at`
+    /// ([`Self::released`]). Zero for a side whose dispatch was not said,
+    /// and for one whose end was.
+    #[cfg(feature = "in-process")]
+    #[must_use]
+    pub(crate) fn since_sent(&self, side: Side, at: Instant) -> u32 {
+        let owed = match side {
+            Side::Decode if self.decided.pair() => self.decode,
+            _ => self.owed,
+        };
+        if let Owed::Completion { sent, .. } = owed {
+            micros(at.saturating_duration_since(sent))
+        } else {
+            0
+        }
+    }
+
     fn release(&self, owed: Owed, reason: ReleaseReason, now: Instant) -> Owed {
         match owed {
             Owed::Nothing | Owed::Later { .. } => {}
@@ -669,12 +852,8 @@ impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
                 let cancelled = Outcome {
                     side,
                     served: worker,
-                    status: 0,
-                    class: TransportClass::Cancelled,
-                    ttft_micros: 0,
-                    tokens_in: 0,
-                    tokens_out: 0,
                     duration_micros: micros(now.saturating_duration_since(sent)),
+                    ..Outcome::reported(0, TransportClass::Cancelled)
                 };
                 self.say(lease, side, Said::Completed(cancelled), now);
             }
@@ -753,7 +932,7 @@ impl<D: Deref<Target: DecisionEngine>> Drop for DecisionGuard<D> {
     /// handle that owes nothing says nothing and reads no clock.
     fn drop(&mut self) {
         // The common drop: the request completed, on every side.
-        if matches!((self.owed, self.decode), (Owed::Nothing, Owed::Nothing)) {
+        if !self.owes() {
             return;
         }
         self.released(ReleaseReason::Abandoned, Instant::now());
@@ -771,50 +950,48 @@ impl<D: Deref<Target: DecisionEngine>> fmt::Debug for DecisionGuard<D> {
     }
 }
 
+// The engine over worker lists stands under the feature `in-process`: the
+// cases that hold a guard over it need the feature, and so does every
+// fixture they share. The feature's gate is an attribute of its own: the
+// lints read a module of cases by its plain `cfg(test)`.
 #[cfg(test)]
+#[cfg(feature = "in-process")]
 mod tests {
     use std::{
-        cell::RefCell,
-        error::Error,
-        mem,
-        sync::{mpsc, Arc, Barrier},
+        sync::{Arc, Barrier},
         thread,
         time::{Duration, Instant},
     };
 
     use parking_lot::Mutex;
+    use smg_worker::{identity::basic::Worker, test_support::ready_worker};
 
     use super::DecisionGuard;
+    #[cfg(feature = "client")]
+    use crate::engine::decision_engine::{DecisionRefused, DecodeRefused};
     use crate::{
-        document::spec::AppliedSpec,
+        document::spec::{AppliedSpec, PolicySpec},
         engine::{
-            decision::{Decision, ShadowKind, Target, Targets},
-            decision_engine::{
-                DecideOutcome, Decided, DecisionEngine, DecisionRefused, DecodeRefused,
-                HeldDecision, Request, RequestMaker, SweepOutcome,
-            },
-            framework::{EncodeItems, EncodePlaced, Picker, TieBand},
-            prompt_hashes::{HashSeeds, PromptHashes},
-            store_backed_engine::{
-                tests::{
-                    counted, fleet, held as deciding, later_request, load_decodes, pair_counts,
-                    pair_fleet, pair_request, picking, push_fleet, request, Ends, GATEWAY,
-                    PATIENCE,
-                },
-                StoreBackedEngine,
-            },
-            view::{Candidate, Identity, RequestFacts, Session, WireModes, WorkerId},
+            decision::{Decision, Target, Targets},
+            decision_engine::{Request, RequestMaker, WorkerLists},
+            framework::{Picker, TieBand},
+            list_cell::tests::PublishedList,
+            policy_engine::PolicyEngine,
+            view::{Candidate, Constraints, RequestFacts, WorkerId},
         },
         policies::random::Random,
-        stages::lifecycle::Lifecycle,
-        store::{
-            pairing::Refusal, GatewayId, HealthSink, LeaseState, LeasesStore, MemoryStore,
-            WorkersStore,
-        },
-        tracking::lease::{
-            Dispatch, Lease, LeaseId, Outcome, ReleaseReason, Said, Side, TransportClass,
-        },
+        stages::{lifecycle::Lifecycle, registry::StageRegistry},
+        store::GatewayId,
+        tracking::lease::{EventSet, Lease, Outcome, ReleaseReason, Side, TransportClass},
     };
+
+    /// The model of the list's workers.
+    const MODEL: &str = "model-a";
+
+    /// How long a case waits for an answer it expects back. The cases of the
+    /// client's link alone read it, so it stands under their feature.
+    #[cfg(feature = "client")]
+    const PATIENCE: Duration = Duration::from_secs(20);
 
     /// What a stage heard of a lease.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -836,6 +1013,10 @@ mod tests {
     struct Hears(Heard);
 
     impl Lifecycle for Hears {
+        fn hears(&self) -> EventSet {
+            EventSet::LEASE
+        }
+
         fn on_decision_issued(&self, _: &Lease, _: &Decision) {
             self.0.lock().push(Call::Issued);
         }
@@ -873,26 +1054,77 @@ mod tests {
         }
     }
 
-    /// A door over the fleet's three ready members, whose picker keeps
-    /// what the engine tells it of leases, and what it heard.
-    fn bed() -> (StoreBackedEngine, Heard) {
-        let store = fleet(1);
-        let heard = Heard::default();
-        let kept = Arc::clone(&heard);
-        picking(&store, 2, "hears", move || {
-            Box::new(Hears(Arc::clone(&kept)))
-        });
-        (StoreBackedEngine::new(store), heard)
+    /// The engine over worker lists under the `random` preset with
+    /// [`Hears`] in its pick's place, the list of four ready workers its
+    /// host hands it, and what the picker heard.
+    struct Host {
+        engine: PolicyEngine,
+        members: PublishedList,
+        heard: Heard,
     }
 
-    /// One decision of `door` for the request `id`, held.
-    fn held<'a>(
-        door: &'a StoreBackedEngine,
-        id: &[u8],
-        now: Instant,
-    ) -> DecisionGuard<&'a StoreBackedEngine> {
-        let decided = DecisionGuard::decide(door, GATEWAY, &request(id, 7), now);
-        decided.expect("a decision")
+    impl Host {
+        /// One decision over the host's list for the request `id`, held.
+        fn held(&self, id: &[u8], now: Instant) -> DecisionGuard<&PolicyEngine> {
+            let asks = Listed(stated(id), Some(&self.members));
+            let decided = DecisionGuard::decide_under(&self.engine, GatewayId::LOCAL, &asks, now);
+            decided.expect("a decision")
+        }
+    }
+
+    /// A host with an engine, a list and a hearing picker of its own.
+    fn host() -> Host {
+        let heard = Heard::default();
+        let kept = Arc::clone(&heard);
+        let mut stages = StageRegistry::builtin();
+        let added = stages.picker("hears", move || Box::new(Hears(Arc::clone(&kept))));
+        added.expect("a free name");
+        let mut document = PolicySpec::preset("random").expect("a built-in preset");
+        document.generation = 1;
+        let profile = document.profiles.get_mut("random");
+        profile.expect("the preset's profile").pick = "hears".into();
+        let spec = AppliedSpec::validate_in(&document, &stages, &[]);
+        let engine = PolicyEngine::new(spec.expect("the stages hold the picker"));
+        let list: Arc<[Arc<dyn Worker>]> = (0..4)
+            .map(|at| ready_worker(&format!("http://worker-{at}:8000"), MODEL))
+            .collect();
+        let members = PublishedList::new(list);
+        Host {
+            engine,
+            members,
+            heard,
+        }
+    }
+
+    /// A request for [`MODEL`] under `id`, stated ahead.
+    fn stated(id: &[u8]) -> Request<'_> {
+        Request {
+            id,
+            facts: RequestFacts {
+                model: MODEL,
+                seed: 7,
+                ..RequestFacts::default()
+            },
+            constraints: Constraints::default(),
+        }
+    }
+
+    /// A request stated ahead, with the list its host hands for it.
+    struct Listed<'a>(Request<'a>, Option<&'a PublishedList>);
+
+    impl RequestMaker for Listed<'_> {
+        fn model(&self) -> &str {
+            self.0.facts.model
+        }
+
+        fn make<'w>(&'w self, _: &'w AppliedSpec) -> Request<'w> {
+            self.0
+        }
+
+        fn workers(&self) -> WorkerLists<'_> {
+            self.1
+                .map_or(WorkerLists::None, |list| WorkerLists::Single(list.lent()))
+        }
     }
 
     /// An outcome of `class` on `served`, as a host reads one.
@@ -931,100 +1163,95 @@ mod tests {
     /// read before this number moves.
     #[test]
     fn a_handle_is_the_size_it_has_in_a_build_with_no_link() {
-        const HELD: usize = 488;
-        assert_eq!(size_of::<DecisionGuard<Arc<StoreBackedEngine>>>(), HELD);
-        assert_eq!(size_of::<DecisionGuard<&StoreBackedEngine>>(), HELD);
+        const HELD: usize = 504;
+        assert_eq!(size_of::<DecisionGuard<Arc<PolicyEngine>>>(), HELD);
+        assert_eq!(size_of::<DecisionGuard<&PolicyEngine>>(), HELD);
+        // A placement is the handle and what its host reads of the answer:
+        // two worker pointers, the routing key, the profile's label, the
+        // label of a pair's decode side and one pointer to an encode
+        // request's encoders.
+        assert_eq!(size_of::<crate::tracking::Placement<'_>>(), HELD + 88);
+        // The lease the handle keeps states its request's text's two
+        // lengths beside its token count: eight bytes more, the handle's
+        // too. The second length sits in the padding the first left. The
+        // handle keeps the two lengths the decode side's words state
+        // beside that side's token count: eight bytes more.
+        assert_eq!(size_of::<Lease>(), 72);
     }
 
-    /// A request that is served: its lease is booked at the issue, moves
-    /// to dispatched at the host's word and ends at its completion, which
-    /// is written on the served worker. Each is told once: what the host
-    /// says after the end, and the drop, say nothing.
+    /// A request that is served: its lease is issued on the pick's first
+    /// target, dispatched at the host's word and ended at its completion.
+    /// Each is told once: what the host says after the end, and the drop,
+    /// say nothing.
     #[test]
     fn a_served_request_tells_its_dispatch_and_its_completion_once_each() {
-        let (door, heard) = bed();
-        let store = door.store();
+        let host = host();
         let now = Instant::now();
-        let mut handle = held(&door, b"r-1", now);
-        let lease = handle.lease().expect("a pick's lease").lease.id;
+        let mut handle = host.held(b"r-1", now);
+        let issued = handle.lease().map(|leased| leased.lease.booked);
         let first = handle.take(0).expect("the pick's first target");
-        assert_eq!(counted(store), [(first.id, 1)], "booked at the issue");
-        let sent = now + Duration::from_micros(250);
-        handle.dispatched(sent);
-        let on_file = LeasesStore::get(&**store, GATEWAY, lease);
-        let state = on_file.expect("the lease is on file").state;
-        assert_eq!(state, LeaseState::Dispatched { at: sent });
+        assert_eq!(issued, Some(first.id), "issued on the pick's first target");
+        handle.dispatched(now + Duration::from_micros(250));
         let ended = now + Duration::from_millis(5);
         handle.completed(&outcome(first.id, TransportClass::Ok), ended);
-        assert_eq!(counted(store), []);
-        assert_eq!(LeasesStore::live(&**store, GATEWAY), 0);
-        assert!(store.completed_ok_since(GATEWAY, first.id, now));
-        // Nothing more is owed: what its host says behind the end is told
-        // to nobody and written nowhere.
-        let later = ended + Duration::from_secs(1);
-        handle.dispatched(later);
-        handle.completed(&outcome(first.id, TransportClass::Ok), later);
-        handle.released(ReleaseReason::ClientGone, Instant::now());
-        drop(handle);
-        let again = store.completed_ok_since(GATEWAY, first.id, later);
-        assert!(!again, "one completion is written");
         let told = [
             Call::Issued,
             Call::Dispatched(first.id, 0, 250),
             Call::Completed(first.id, TransportClass::Ok, 5_000),
         ];
-        assert_eq!(*heard.lock(), told);
+        assert_eq!(*host.heard.lock(), told);
+        // Nothing more is owed: what its host says behind the end is told
+        // to nobody.
+        let later = ended + Duration::from_secs(1);
+        handle.dispatched(later);
+        handle.completed(&outcome(first.id, TransportClass::Ok), later);
+        handle.released(ReleaseReason::ClientGone, Instant::now());
+        drop(handle);
+        assert_eq!(*host.heard.lock(), told, "one completion is told");
     }
 
     /// A host whose commit passes over the first target takes another: a
-    /// take says nothing to the store, and the dispatch moves the lease's
-    /// booking to the target taken. A take of no target of the pick, and
-    /// one behind the dispatch, change nothing.
+    /// take says nothing, and the dispatch names the target taken under its
+    /// index in the pick. A take of no target of the pick, and one behind
+    /// the dispatch, change nothing.
     #[test]
-    fn a_dispatch_on_an_alternate_moves_the_leases_booking_there() {
-        let (door, heard) = bed();
-        let store = door.store();
+    fn a_dispatch_on_an_alternate_names_the_target_taken() {
+        let host = host();
         let now = Instant::now();
-        let mut handle = held(&door, b"r-1", now);
+        let mut handle = host.held(b"r-1", now);
         let first = handle.take(0).expect("the pick's first target");
         let second = handle.take(1).expect("an alternate of the pick");
         assert_ne!(first.id, second.id);
         assert_eq!(handle.take(9), None, "no such target");
-        assert_eq!(counted(store), [(first.id, 1)], "a take books nothing");
+        assert_eq!(*host.heard.lock(), [Call::Issued], "a take says nothing");
         // Two hours behind the decision: more microseconds than the span's
         // field holds, so it says its most.
         handle.dispatched(now + Duration::from_secs(7_200));
-        assert_eq!(counted(store), [(second.id, 1)]);
         assert_eq!(handle.take(0), None, "the dispatch named its target");
         handle.completed(&outcome(second.id, TransportClass::Ok), now);
-        assert_eq!(counted(store), []);
         let told = [
             Call::Issued,
             Call::Dispatched(second.id, 1, u32::MAX),
             Call::Completed(second.id, TransportClass::Ok, 5_000),
         ];
-        assert_eq!(*heard.lock(), told);
+        assert_eq!(*host.heard.lock(), told);
     }
 
     /// A host whose commit refuses every target releases the lease under
     /// that reason, once: nothing it says behind the release is told.
     #[test]
     fn a_commit_that_refuses_every_target_releases_the_lease_once() {
-        let (door, heard) = bed();
-        let store = door.store();
+        let host = host();
         let now = Instant::now();
-        let mut handle = held(&door, b"r-1", now);
+        let mut handle = host.held(b"r-1", now);
         let first = handle.take(0).expect("the pick's first target");
         handle.released(ReleaseReason::CommitFailed, Instant::now());
-        assert_eq!(counted(store), []);
-        assert_eq!(LeasesStore::live(&**store, GATEWAY), 0);
+        let told = [Call::Issued, Call::Released(ReleaseReason::CommitFailed)];
+        assert_eq!(*host.heard.lock(), told);
         handle.released(ReleaseReason::ClientGone, Instant::now());
         handle.completed(&outcome(first.id, TransportClass::Ok), now);
         drop(handle);
-        let written = store.completed_ok_since(GATEWAY, first.id, now);
-        assert!(!written, "no completion is written behind a release");
-        let told = [Call::Issued, Call::Released(ReleaseReason::CommitFailed)];
-        assert_eq!(*heard.lock(), told);
+        assert_eq!(*host.heard.lock(), told, "no completion behind a release");
     }
 
     /// A handle dropped with no call knows no reason for its drop: before
@@ -1032,60 +1259,51 @@ mod tests {
     /// lease nobody spoke for.
     #[test]
     fn a_handle_dropped_with_no_call_gives_its_lease_up_as_abandoned() {
-        let (door, heard) = bed();
-        let store = door.store();
-        let handle = held(&door, b"r-1", Instant::now());
-        assert_eq!(LeasesStore::live(&**store, GATEWAY), 1);
+        let host = host();
+        let handle = host.held(b"r-1", Instant::now());
+        assert_eq!(*host.heard.lock(), [Call::Issued]);
         drop(handle);
-        assert_eq!(counted(store), []);
-        assert_eq!(LeasesStore::live(&**store, GATEWAY), 0);
         let told = [Call::Issued, Call::Released(ReleaseReason::Abandoned)];
-        assert_eq!(*heard.lock(), told);
+        assert_eq!(*host.heard.lock(), told);
     }
 
     /// A host that knows its client left before any dispatch says so, and
     /// the handle's drop behind it says nothing more.
     #[test]
     fn a_host_that_knows_its_client_left_says_so_once() {
-        let (door, heard) = bed();
-        let store = door.store();
-        let mut handle = held(&door, b"r-1", Instant::now());
+        let host = host();
+        let mut handle = host.held(b"r-1", Instant::now());
         handle.released(ReleaseReason::ClientGone, Instant::now());
-        assert_eq!(LeasesStore::live(&**store, GATEWAY), 0);
-        drop(handle);
         let told = [Call::Issued, Call::Released(ReleaseReason::ClientGone)];
-        assert_eq!(*heard.lock(), told);
+        assert_eq!(*host.heard.lock(), told);
+        drop(handle);
+        assert_eq!(*host.heard.lock(), told);
     }
 
     /// After a dispatch a lease lives until its completion: a handle
     /// dropped with no outcome, and a release said there, are told as one
     /// completion of class cancelled on the dispatched target, which says
-    /// the time since the dispatch. It is no completion of class ok for
-    /// the health precedence.
+    /// the time since the dispatch.
     #[test]
     fn behind_a_dispatch_a_drop_and_a_release_are_a_cancelled_completion() {
         for released in [false, true] {
-            let (door, heard) = bed();
-            let store = door.store();
+            let host = host();
             let now = Instant::now();
-            let mut handle = held(&door, b"r-1", now);
+            let mut handle = host.held(b"r-1", now);
             let second = handle.take(1).expect("an alternate of the pick");
             handle.dispatched(now);
             thread::sleep(Duration::from_millis(1));
-            if released {
-                handle.released(ReleaseReason::ClientGone, Instant::now());
-                assert_eq!(counted(store), [], "told where it was said");
-            }
-            drop(handle);
-            assert_eq!(counted(store), []);
-            assert_eq!(LeasesStore::live(&**store, GATEWAY), 0);
-            assert!(!store.completed_ok_since(GATEWAY, second.id, now));
             let told = [
                 Call::Issued,
                 Call::Dispatched(second.id, 1, 0),
                 Call::Completed(second.id, TransportClass::Cancelled, 0),
             ];
-            assert_eq!(clocked(&heard, 1_000), told, "released: {released}");
+            if released {
+                handle.released(ReleaseReason::ClientGone, Instant::now());
+                assert_eq!(clocked(&host.heard, 1_000), told, "told where it was said");
+            }
+            drop(handle);
+            assert_eq!(clocked(&host.heard, 1_000), told, "released: {released}");
         }
     }
 
@@ -1095,49 +1313,43 @@ mod tests {
     /// their order.
     #[test]
     fn a_completion_said_with_no_dispatch_says_the_dispatch_first() {
-        let (door, heard) = bed();
+        let host = host();
         let now = Instant::now();
-        let mut handle = held(&door, b"r-1", now);
+        let mut handle = host.held(b"r-1", now);
         let second = handle.take(1).expect("an alternate of the pick");
         let failed = outcome(second.id, TransportClass::ConnectFailed);
         handle.completed(&failed, now + Duration::from_micros(400));
-        assert_eq!(counted(door.store()), []);
         let told = [
             Call::Issued,
             Call::Dispatched(second.id, 1, 400),
             Call::Completed(second.id, TransportClass::ConnectFailed, 5_000),
         ];
-        assert_eq!(*heard.lock(), told);
+        assert_eq!(*host.heard.lock(), told);
     }
 
     /// A decision that picks no worker has no lease: its handle takes no
     /// target and tells nothing, whatever its host says.
     #[test]
     fn a_decision_that_picks_no_worker_owes_no_report() {
-        let (door, heard) = bed();
-        let store = door.store();
+        let host = host();
         let now = Instant::now();
-        // A member of the fleet, by a decision that picks one: a
-        // completion on a worker the store holds no row of is written
-        // for nobody.
-        let mut picked = held(&door, b"r-0", now);
+        // A worker of the list, by a decision that picks one.
+        let mut picked = host.held(b"r-0", now);
         let member = picked.take(0).expect("the pick's first target").id;
         picked.released(ReleaseReason::CommitFailed, Instant::now());
-        heard.lock().clear();
-        let mut asked = request(b"r-1", 7);
-        asked.facts.model = "model-none";
-        let decided = DecisionGuard::decide(&door, GATEWAY, &asked, now);
+        host.heard.lock().clear();
+        // A request whose host hands no list is decided over no worker.
+        let asks = Listed(stated(b"r-1"), None);
+        let decided = DecisionGuard::decide_under(&host.engine, GatewayId::LOCAL, &asks, now);
         let mut handle = decided.expect("a decision");
-        assert!(handle.decision().pick().is_none(), "no pool, no pick");
+        assert!(handle.decision().pick().is_none(), "no list, no pick");
         assert!(handle.lease().is_none());
         assert_eq!(handle.take(0), None);
         handle.dispatched(now);
         handle.completed(&outcome(member, TransportClass::Ok), now);
         handle.released(ReleaseReason::CommitFailed, Instant::now());
         drop(handle);
-        assert_eq!(LeasesStore::live(&**store, GATEWAY), 0);
-        assert!(!store.completed_ok_since(GATEWAY, member, now));
-        assert_eq!(*heard.lock(), []);
+        assert_eq!(*host.heard.lock(), []);
     }
 
     /// A host that takes no target dispatches to the pick's first, and a
@@ -1146,78 +1358,42 @@ mod tests {
     /// said ahead of the clock has no span yet.
     #[test]
     fn a_host_that_takes_no_target_dispatches_to_the_picks_first() {
-        let (door, heard) = bed();
-        let store = door.store();
+        let host = host();
         let now = Instant::now();
-        let mut handle = held(&door, b"r-1", now);
+        let mut handle = host.held(b"r-1", now);
         let pick = handle.decision().pick();
         let first = pick.and_then(|pick| pick.targets.first().copied());
         let first = first.expect("the pick's first target");
         handle.dispatched(now + Duration::from_secs(3_600));
-        assert_eq!(counted(store), [(first.id, 1)]);
         thread::sleep(Duration::from_millis(1));
         drop(handle);
-        assert_eq!(counted(store), []);
         let told = [
             Call::Issued,
             Call::Dispatched(first.id, 0, 3_600_000_000),
             Call::Completed(first.id, TransportClass::Cancelled, 0),
         ];
-        assert_eq!(*heard.lock(), told);
+        assert_eq!(*host.heard.lock(), told);
     }
 
-    /// A handle's report holds no thread for a decision. While one
-    /// decision stands, more handles than a file's ring takes are let go:
-    /// every one returns, and their leases stay on file, the deciding
-    /// thread's to end. As that caller leaves, every lease is ended.
-    #[test]
-    fn handles_let_go_at_a_full_ring_hold_no_thread_for_a_decision() {
-        let store = fleet(1);
-        let door = Arc::new(StoreBackedEngine::new(Arc::clone(&store)));
-        let more = MemoryStore::HANDOVER + 8;
-        let now = Instant::now();
-        let asks = (0..more).map(|n| {
-            let id = n.to_le_bytes();
-            let asked = request(&id, 7);
-            let decided = DecisionGuard::decide(Arc::clone(&door), GATEWAY, &asked, now);
-            decided.expect("a decision")
-        });
-        let handles: Vec<_> = asks.collect();
-        let ends = Ends::over(&store);
-        let held = deciding(&door);
-        ends.stands("pick");
-        let (done, returned) = mpsc::channel();
-        thread::spawn(move || {
-            drop(handles);
-            done.send(()).ok();
-        });
-        let returned = returned.recv_timeout(PATIENCE).is_ok();
-        let on_file = LeasesStore::live(&*store, GATEWAY);
-        ends.go();
-        ends.stands("issue");
-        ends.go();
-        let lease = held.join().expect("the held decision's thread");
-        assert!(returned, "every handle was let go while the decision stood");
-        assert_eq!(on_file, more, "a report is the deciding thread's to apply");
-        assert!(lease.is_some(), "the held request has its lease");
-        assert_eq!(LeasesStore::live(&*store, GATEWAY), 1, "its lease alone");
-    }
-
-    /// A handle that owns its door travels with its request: dropped on
+    /// A handle that owns its engine travels with its request: dropped on
     /// another thread behind its dispatch, it ends the lease from there.
     #[test]
-    fn a_handle_that_owns_its_door_ends_its_lease_from_another_thread() {
-        let (door, heard) = bed();
-        let door = Arc::new(door);
+    fn a_handle_that_owns_its_engine_ends_its_lease_from_another_thread() {
+        let Host {
+            engine,
+            members,
+            heard,
+        } = host();
+        let engine = Arc::new(engine);
         let now = Instant::now();
-        let asked = request(b"r-1", 7);
-        let decided = DecisionGuard::decide(Arc::clone(&door), GATEWAY, &asked, now);
+        let asks = Listed(stated(b"r-1"), Some(&members));
+        let decided =
+            DecisionGuard::decide_under(Arc::clone(&engine), GatewayId::LOCAL, &asks, now);
         let mut handle = decided.expect("a decision");
         let first = handle.take(0).expect("the pick's first target");
         handle.dispatched(now);
         let ended = thread::spawn(move || drop(handle));
         ended.join().expect("the request's thread");
-        assert_eq!(counted(door.store()), []);
         let told = [
             Call::Issued,
             Call::Dispatched(first.id, 0, 0),
@@ -1229,21 +1405,20 @@ mod tests {
     /// Sixty-four hosts at once on one model, each holding its requests
     /// from the decision to the end, by turns served, dropped behind the
     /// dispatch, refused at the commit and dropped before any dispatch:
-    /// every lease is ended once, by its own path's word, none is left on
-    /// file and no count is left on a member.
+    /// every lease is ended once, by its own path's word.
     #[test]
     fn sixty_four_hosts_at_once_end_every_lease_once() {
-        let (door, heard) = bed();
+        let shared = host();
         let (hosts, each) = (64_u8, 32_u8);
         let start = Barrier::new(usize::from(hosts));
         thread::scope(|scope| {
             for host in 0..hosts {
-                let (door, start) = (&door, &start);
+                let (shared, start) = (&shared, &start);
                 scope.spawn(move || {
                     start.wait();
                     for turn in 0..each {
                         let now = Instant::now();
-                        let mut handle = held(door, &[host, turn], now);
+                        let mut handle = shared.held(&[host, turn], now);
                         match turn % 4 {
                             0 => {
                                 let first = handle.take(0).expect("the first target");
@@ -1258,10 +1433,7 @@ mod tests {
                 });
             }
         });
-        let store = door.store();
-        assert_eq!(counted(store), []);
-        assert_eq!(LeasesStore::live(&**store, GATEWAY), 0);
-        let heard = heard.lock();
+        let heard = shared.heard.lock();
         let told = |want: fn(&Call) -> bool| heard.iter().filter(|call| want(call)).count();
         let quarter = usize::from(hosts) * usize::from(each) / 4;
         let ok = |call: &Call| matches!(call, Call::Completed(_, TransportClass::Ok, _));
@@ -1280,44 +1452,33 @@ mod tests {
         );
     }
 
-    /// A completion is written on the worker its host names, which need
-    /// not be the target the handle took: the health precedence reads the
-    /// worker that served.
+    /// A completion names the worker its host names, which need not be the
+    /// target the handle took: a stage reads the worker that served.
     #[test]
-    fn a_completion_is_written_on_the_worker_its_host_names() {
-        let (door, _) = bed();
-        let store = door.store();
+    fn a_completion_names_the_worker_its_host_names() {
+        let host = host();
         let now = Instant::now();
-        let mut handle = held(&door, b"r-1", now);
+        let mut handle = host.held(b"r-1", now);
         let other = handle.take(1).expect("the pick's second target");
         let taken = handle.take(0).expect("the pick's first target");
+        assert_ne!(other.id, taken.id);
         handle.dispatched(now);
         handle.completed(&outcome(other.id, TransportClass::Ok), now);
-        assert!(store.completed_ok_since(GATEWAY, other.id, now));
-        assert!(!store.completed_ok_since(GATEWAY, taken.id, now));
-    }
-
-    /// A completion is written at the instant its host read: a host whose
-    /// instants run ahead of the clock writes there, as its dispatch did.
-    #[test]
-    fn a_completion_is_written_at_its_hosts_instant() {
-        let (door, _) = bed();
-        let store = door.store();
-        let now = Instant::now();
-        let mut handle = held(&door, b"r-1", now);
-        let first = handle.take(0).expect("the pick's first target");
-        let ahead = now + Duration::from_secs(2);
-        handle.completed(&outcome(first.id, TransportClass::Ok), ahead);
-        assert!(store.completed_ok_since(GATEWAY, first.id, ahead));
+        let told = [
+            Call::Issued,
+            Call::Dispatched(taken.id, 0, 0),
+            Call::Completed(other.id, TransportClass::Ok, 5_000),
+        ];
+        assert_eq!(*host.heard.lock(), told);
     }
 
     /// A release behind a dispatch spans its host's two instants, the
     /// dispatch's and its own: no clock is read.
     #[test]
     fn a_release_behind_a_dispatch_spans_its_hosts_instants() {
-        let (door, heard) = bed();
+        let host = host();
         let now = Instant::now();
-        let mut handle = held(&door, b"r-1", now);
+        let mut handle = host.held(b"r-1", now);
         let first = handle.take(0).expect("the pick's first target");
         let sent = now + Duration::from_secs(3_600);
         handle.dispatched(sent);
@@ -1327,995 +1488,39 @@ mod tests {
             Call::Dispatched(first.id, 0, 3_600_000_000),
             Call::Completed(first.id, TransportClass::Cancelled, 7_000),
         ];
-        assert_eq!(*heard.lock(), told);
+        assert_eq!(*host.heard.lock(), told);
     }
 
-    thread_local! {
-        static WORDS: RefCell<Vec<Said>> = const { RefCell::new(Vec::new()) };
-    }
-
-    fn words() -> Vec<Said> {
-        WORDS.with_borrow_mut(mem::take)
-    }
-
-    fn pair_door(prefills: usize, decodes: usize) -> Result<StoreBackedEngine, Box<dyn Error>> {
-        let store = pair_fleet(prefills, decodes)?;
-        store.tell_through(|_, _, _, said, _| WORDS.with_borrow_mut(|words| words.push(said)));
-        Ok(StoreBackedEngine::new(store))
-    }
-
-    fn paired(
-        door: &StoreBackedEngine,
-        now: Instant,
-    ) -> Result<DecisionGuard<&StoreBackedEngine>, DecisionRefused> {
-        DecisionGuard::decide(door, GATEWAY, &pair_request(b"pair"), now)
-    }
-
-    fn states(store: &MemoryStore, lease: LeaseId) -> Option<[LeaseState; 2]> {
-        let filed = store.sides(GATEWAY, lease)?;
-        Some([filed.record.state, filed.decode?.state])
-    }
-
-    #[test]
-    fn a_handle_of_an_encode_pair_holds_the_pairs_two_sides() -> Result<(), Box<dyn Error>> {
-        let (door, encoder) = push_fleet()?;
-        let store = door.store();
-        let now = Instant::now();
-        let items = EncodeItems {
-            keys: &[Identity::hashed(11)],
-            ..EncodeItems::default()
-        };
-        let mut placed = EncodePlaced::new();
-        let mut handle = DecisionGuard::decide_encode_pair(
-            &door,
-            GATEWAY,
-            &pair_request(b"pair"),
-            items,
-            &mut placed,
-            now,
-        )
-        .expect("a decision");
-        let lease = handle.lease().expect("the prefill's lease");
-        let id = lease.lease.id;
-        assert_eq!(lease.lease.side, Side::Prefill);
-        let target = handle.take(0).expect("the first pair");
-        let decode = target.pair.expect("the decode's target");
-        assert_eq!(placed.encoders().len(), 1);
-        assert_eq!(
-            placed.encoders().first().map(|target| target.id),
-            Some(encoder)
-        );
-        assert_eq!(states(store, id), Some([LeaseState::ISSUED; 2]));
-        handle.dispatched_decode(now);
-        assert_eq!(
-            states(store, id),
-            Some([LeaseState::ISSUED, LeaseState::Dispatched { at: now }])
-        );
-        drop(handle);
-        assert!(store.sides(GATEWAY, id).is_none());
-        assert_eq!(pair_counts(store, [target.id, decode.decode_id]), [0, 0]);
-        assert_eq!(LeasesStore::live(&**store, GATEWAY), 0);
-        Ok(())
-    }
-
-    #[test]
-    fn each_side_of_a_pair_is_dispatched_and_ended_by_its_own_word() {
-        for explicit in [true, false] {
-            let door = pair_door(1, 2).expect("a pair door");
-            let store = door.store();
-            let now = Instant::now();
-            let mut handle = paired(&door, now).expect("a pair's handle");
-            let lease = handle.lease().expect("the pair's lease").lease.id;
-            let first = handle.take(0).expect("the first target");
-            let second = handle.take(1).expect("the alternate target");
-            let d0 = first.pair.expect("the first decode").decode_id;
-            let d1 = second.pair.expect("the alternate decode").decode_id;
-            assert_ne!(d0, d1);
-            let workers = [first.id, d0, d1];
-            let (prefill_at, decode_at) = (
-                now + Duration::from_micros(100),
-                now + Duration::from_micros(200),
-            );
-            let prefill = LeaseState::Dispatched { at: prefill_at };
-            let decode = LeaseState::Dispatched { at: decode_at };
-            let issued = LeaseState::ISSUED;
-            assert_eq!(states(store, lease), Some([issued, issued]));
-            assert_eq!(pair_counts(store, workers), [1, 1, 0]);
-
-            handle.dispatched(prefill_at);
-            assert_eq!(states(store, lease), Some([prefill, issued]));
-            assert_eq!(pair_counts(store, workers), [1, 1, 0]);
-            if explicit {
-                handle.dispatched_decode(decode_at);
-                handle.dispatched_decode(decode_at);
-                assert_eq!(states(store, lease), Some([prefill, decode]));
-                assert_eq!(pair_counts(store, workers), [1, 0, 1]);
-            }
-
-            let decoded = Outcome {
-                side: Side::Decode,
-                ..outcome(d1, TransportClass::Ok)
-            };
-            handle.completed(&decoded, decode_at);
-            handle.completed(&decoded, decode_at);
-            assert_eq!(states(store, lease), Some([prefill, LeaseState::Completed]));
-            assert_eq!(pair_counts(store, workers), [1, 0, 0]);
-            let prefilled = Outcome {
-                side: Side::Prefill,
-                ..outcome(first.id, TransportClass::Ok)
-            };
-            let said = if explicit {
-                prefilled
-            } else {
-                outcome(first.id, TransportClass::Ok)
-            };
-            handle.completed(&said, decode_at);
-            drop(handle);
-            assert!(store.sides(GATEWAY, lease).is_none());
-            assert_eq!(pair_counts(store, workers), [0, 0, 0]);
-            assert_eq!(
-                words(),
-                [
-                    Said::Dispatched(
-                        Dispatch {
-                            target_index: 1,
-                            side: Side::Prefill,
-                            since_decision_micros: 100,
-                        },
-                        prefill_at
-                    ),
-                    Said::Dispatched(
-                        Dispatch {
-                            target_index: 1,
-                            side: Side::Decode,
-                            since_decision_micros: 200,
-                        },
-                        decode_at
-                    ),
-                    Said::Completed(decoded),
-                    Said::Completed(prefilled),
-                ]
-            );
-        }
-    }
-
-    #[test]
-    fn a_handle_asks_for_its_decode_once_the_prefill_went_out() {
-        let door = pair_door(1, 2).expect("a pair door");
-        let store = door.store();
-        let now = Instant::now();
-        let asked = later_request(b"pair");
-        let mut handle =
-            DecisionGuard::decide(&door, GATEWAY, &asked, now).expect("a pair's handle");
-        let lease = handle.lease().expect("the prefill lease").lease.id;
-        let first = handle.take(0).expect("the first target");
-        let other = handle.take(1).expect("the alternate target");
-        let d0 = first.pair.expect("the first decode").decode_id;
-        let d1 = other.pair.expect("the alternate decode").decode_id;
-        let workers = [first.id, d0, d1];
-        assert_eq!(
-            states(store, lease),
-            Some([LeaseState::ISSUED, LeaseState::Chosen])
-        );
-        assert_eq!(pair_counts(store, workers), [1, 0, 0]);
-        assert!(handle.decode_chosen());
-        let original = *handle.decision();
-        assert_eq!(
-            handle.decide_decode(&asked, now).err(),
-            Some(DecisionRefused::Decode(DecodeRefused::PrefillNotHeld))
-        );
-        assert_eq!(*handle.decision(), original);
-        assert_eq!(handle.index, 1);
-        assert!(
-            handle.decode_chosen(),
-            "a refused call leaves the side chosen"
-        );
-
-        let sent = now + Duration::from_micros(100);
-        handle.dispatched(sent);
-        let prefill = LeaseState::Dispatched { at: sent };
-        assert_eq!(states(store, lease), Some([prefill, LeaseState::Chosen]));
-        assert_eq!(pair_counts(store, workers), [1, 0, 0]);
-        let call = load_decodes(store, [d0, d1], sent + Duration::from_micros(50));
-        let decision = handle
-            .decide_decode(&asked, call)
-            .expect("the decode decision");
-        let new = decision
-            .pick()
-            .and_then(|pick| pick.targets.first())
-            .expect("the new first target");
-        assert_eq!(new.pair, other.pair);
-        assert_eq!((handle.index, handle.target), (0, other));
-        assert!(!handle.decode_chosen(), "the call's pick issued the side");
-        assert_eq!(
-            handle
-                .lease()
-                .map(|leased| (leased.lease.id, leased.lease.side)),
-            Some((lease, Side::Prefill))
-        );
-        assert_eq!(states(store, lease), Some([prefill, LeaseState::ISSUED]));
-        assert_eq!(pair_counts(store, workers), [1, 0, 1]);
-        assert_eq!(
-            handle.decide_decode(&asked, call).err(),
-            Some(DecisionRefused::Decode(DecodeRefused::DecodeStands))
-        );
-        assert_eq!(handle.take_decode(1), Some(first));
-        assert_eq!(states(store, lease), Some([prefill, LeaseState::ISSUED]));
-        assert_eq!(pair_counts(store, workers), [1, 0, 1]);
-        let decode_at = call + Duration::from_micros(60);
-        handle.dispatched_decode(decode_at);
-        assert_eq!(
-            states(store, lease),
-            Some([prefill, LeaseState::Dispatched { at: decode_at }])
-        );
-        assert_eq!(pair_counts(store, workers), [1, 1, 0]);
-        let decoded = Outcome {
-            side: Side::Decode,
-            ..outcome(d0, TransportClass::Ok)
-        };
-        let prefilled = Outcome {
-            side: Side::Prefill,
-            ..outcome(first.id, TransportClass::Ok)
-        };
-        handle.completed(&decoded, decode_at);
-        assert_eq!(states(store, lease), Some([prefill, LeaseState::Completed]));
-        assert_eq!(pair_counts(store, workers), [1, 0, 0]);
-        handle.completed(&prefilled, decode_at);
-        drop(handle);
-        assert_eq!(states(store, lease), None);
-        assert_eq!(pair_counts(store, workers), [0, 0, 0]);
-        assert_eq!(
-            words(),
-            [
-                Said::Dispatched(
-                    Dispatch {
-                        side: Side::Prefill,
-                        target_index: 1,
-                        since_decision_micros: 100
-                    },
-                    sent
-                ),
-                // The span since the first decision: the side's lease is
-                // dated by that decision's issue.
-                Said::Dispatched(
-                    Dispatch {
-                        side: Side::Decode,
-                        target_index: 1,
-                        since_decision_micros: super::micros(decode_at - now)
-                    },
-                    decode_at
-                ),
-                Said::Completed(decoded),
-                Said::Completed(prefilled),
-            ]
-        );
-    }
-
-    #[test]
-    fn a_handle_keeps_its_first_pick_when_the_decode_call_sheds() {
-        let door = pair_door(1, 2).expect("a pair door");
-        let store = door.store();
-        let now = Instant::now();
-        let mut asked = later_request(b"pair");
-        let mut handle =
-            DecisionGuard::decide(&door, GATEWAY, &asked, now).expect("a pair's handle");
-        let lease = handle.lease().expect("the prefill lease").lease.id;
-        let picked = handle.take(1).expect("an alternate target");
-        let original = *handle.decision();
-        handle.dispatched(now);
-        let before = store.sides(GATEWAY, lease).expect("both sides");
-        asked.constraints.subset_hint = Some(0);
-        assert_eq!(handle.decide_decode(&asked, now).ok(), Some(&original));
-        assert_eq!(*handle.decision(), original);
-        assert_eq!((handle.index, handle.target), (1, picked));
-        assert_eq!(store.sides(GATEWAY, lease), Some(before));
-        assert!(handle.decode_chosen(), "a shed leaves the side chosen");
-        handle.dispatched_decode(now);
-        assert!(!handle.decode_chosen(), "the dispatch booked the side");
-        let worker = picked.pair.expect("the alternate decode").decode_id;
-        let decode = store
-            .sides(GATEWAY, lease)
-            .and_then(|sides| sides.decode)
-            .expect("the dispatched decode");
-        assert_eq!(
-            (decode.state, decode.target),
-            (LeaseState::Dispatched { at: now }, worker)
-        );
-        drop(handle);
-        let _ = words();
-    }
-
-    /// A host that makes a pair's request with a later decode.
-    struct Later;
-
-    impl RequestMaker for Later {
-        fn model(&self) -> &str {
-            later_request(b"pair").facts.model
-        }
-
-        fn make<'w>(&'w self, _: &'w AppliedSpec) -> Request<'w> {
-            later_request(b"pair")
-        }
-    }
-
-    /// A handle asks its decode again for a request its host makes, as for
-    /// one it stated: the call's pick issues the side.
-    #[test]
-    fn a_handle_asks_its_decode_again_for_a_request_its_host_makes() {
-        let door = pair_door(1, 1).expect("a pair door");
-        let now = Instant::now();
-        let mut handle =
-            DecisionGuard::decide_under(&door, GATEWAY, &Later, now).expect("a pair's handle");
-        handle.dispatched(now);
-        assert!(handle.decode_chosen());
-        let decided = handle.decide_decode_under(&Later, now);
-        assert!(decided.is_ok_and(|decision| decision.pick().is_some()));
-        assert!(!handle.decode_chosen(), "the call's pick issued the side");
-        // An issued side takes no second call.
-        assert_eq!(
-            handle.decide_decode_under(&Later, now).err(),
-            Some(DecisionRefused::Decode(DecodeRefused::DecodeStands))
-        );
-        drop(handle);
-        let _ = words();
-    }
-
-    #[test]
-    fn a_handle_decided_under_a_maker_holds_the_decode_as_the_made_request_said() {
-        let door = pair_door(1, 1).expect("a pair door");
-        let handle = DecisionGuard::decide_under(&door, GATEWAY, &Later, Instant::now())
-            .expect("a pair's handle");
-        let _ = words();
-        drop(handle);
-        // A chosen decode is owed no word: the prefill's release alone.
-        assert_eq!(
-            words(),
-            [Said::Released(
-                Some(Side::Prefill),
-                ReleaseReason::Abandoned
-            )]
-        );
-    }
-
-    /// The decode a call issued is dated by its own dispatch. The side's
-    /// lease keeps the first decision's issue instant, and the handle
-    /// counts the dispatch's span from that decision: a stage that dates a
-    /// credit by the two keeps it past a report sampled while the prefill
-    /// ran. The handle's lease shows the call's deadline, the lease's one.
-    #[test]
-    fn a_decode_asked_later_is_dated_by_its_own_dispatch() {
-        let door = pair_door(1, 1).expect("a pair door");
-        let now = Instant::now();
-        let asked = later_request(b"pair");
-        let mut handle =
-            DecisionGuard::decide(&door, GATEWAY, &asked, now).expect("a pair's handle");
-        handle.dispatched(now + Duration::from_micros(100));
-        // The prefill ran for eight seconds.
-        let call = now + Duration::from_secs(8);
-        let decided = handle.decide_decode(&asked, call);
-        assert!(decided.is_ok_and(|decision| decision.pick().is_some()));
-        let due = handle.lease().map(|leased| leased.due);
-        assert_eq!(due, Some(call + Duration::from_secs(5)));
-        let sent = call + Duration::from_micros(60);
-        handle.dispatched_decode(sent);
-        let decode = words().into_iter().find_map(|said| match said {
-            Said::Dispatched(dispatch, at) if dispatch.side == Side::Decode => {
-                Some((dispatch.since_decision_micros, at))
-            }
-            _ => None,
-        });
-        assert_eq!(decode, Some((8_000_060, sent)));
-    }
-
-    /// What a handle lent with a word or a decode call: the word, the
-    /// index of the target taken, and whether the decode side it lent stood
-    /// chosen.
-    type Lent = Mutex<Vec<(&'static str, u8, bool)>>;
-
-    /// A door that keeps what each word and each decode call was lent.
-    struct Lends<'a>(&'a StoreBackedEngine, Lent);
-
-    impl DecisionEngine for Lends<'_> {
-        fn decide_under(
-            &self,
-            gateway: GatewayId,
-            maker: &impl RequestMaker,
-            now: Instant,
-        ) -> Result<Decided, DecisionRefused> {
-            DecisionEngine::decide_under(self.0, gateway, maker, now)
-        }
-
-        fn decide_decode_under(
-            &self,
-            gateway: GatewayId,
-            maker: &impl RequestMaker,
-            held: &HeldDecision<'_>,
-            now: Instant,
-        ) -> Result<DecideOutcome, DecisionRefused> {
-            let chosen = held.decode.chosen;
-            self.1.lock().push(("decode call", held.index, chosen));
-            DecisionEngine::decide_decode_under(self.0, gateway, maker, held, now)
-        }
-
-        fn decide_encode_pair(
-            &self,
-            gateway: GatewayId,
-            request: &Request<'_>,
-            items: EncodeItems<'_>,
-            placed: &mut EncodePlaced,
-            now: Instant,
-        ) -> Result<DecideOutcome, DecisionRefused> {
-            DecisionEngine::decide_encode_pair(self.0, gateway, request, items, placed, now)
-        }
-
-        fn say(&self, gateway: GatewayId, held: &HeldDecision<'_>, said: Said, now: Instant) {
-            let word = match said {
-                Said::Dispatched(dispatch, _) if dispatch.side == Side::Decode => "decode sent",
-                Said::Dispatched(..) => "sent",
-                Said::Completed(outcome) if outcome.side == Side::Decode => "decode ended",
-                Said::Completed(_) => "ended",
-                Said::Released(..) => "released",
-            };
-            let chosen = held.decode.chosen;
-            self.1.lock().push((word, held.index, chosen));
-            DecisionEngine::say(self.0, gateway, held, said, now);
-        }
-
-        fn sweep(&self, now: Instant) -> SweepOutcome {
-            DecisionEngine::sweep(self.0, now)
-        }
-
-        fn with_spec<R>(&self, read: impl FnOnce(&AppliedSpec) -> R) -> R {
-            DecisionEngine::with_spec(self.0, read)
-        }
-
-        fn prompt_hashes(
-            &self,
-            model: &str,
-            tokens: Option<&[u32]>,
-            text: Option<&str>,
-            seeds: HashSeeds,
-        ) -> PromptHashes {
-            DecisionEngine::prompt_hashes(self.0, model, tokens, text, seeds)
-        }
-
-        fn pair_refusal(&self, model: &str, wires: WireModes) -> Option<Refusal> {
-            DecisionEngine::pair_refusal(self.0, model, wires)
-        }
-
-        fn faults(&self) -> u64 {
-            DecisionEngine::faults(self.0)
-        }
-
-        fn shadowed(&self, binding: u32, kind: ShadowKind) -> u64 {
-            DecisionEngine::shadowed(self.0, binding, kind)
-        }
-    }
-
-    /// What a handle lends its engine is read before the word moves the
-    /// handle. An engine with no file of its leases tells its stages from
-    /// it: the index names the target taken at an end too, where the word
-    /// carries none, and a decode that stood chosen is known at its
-    /// dispatch, which is its issue. A handle lends its decode side with
-    /// every word: a single's lends no session and a side that never stood
-    /// chosen.
-    #[test]
-    fn a_handle_lends_the_index_taken_and_whether_the_decode_stood_chosen() {
-        let door = pair_door(1, 2).expect("a pair door");
-        let lends = Lends(&door, Lent::default());
-        let now = Instant::now();
-        let asked = later_request(b"pair");
-        // No decode call: the first pick's decode goes out, a side that
-        // stood chosen until its dispatch.
-        let mut handle =
-            DecisionGuard::decide(&lends, GATEWAY, &asked, now).expect("a pair's handle");
-        let taken = handle.take(1).expect("the alternate target");
-        let decode = taken.pair.expect("the alternate decode").decode_id;
-        handle.dispatched(now);
-        handle.dispatched_decode(now);
-        let decoded = Outcome {
-            side: Side::Decode,
-            ..outcome(decode, TransportClass::Ok)
-        };
-        let prefilled = Outcome {
-            side: Side::Prefill,
-            ..outcome(taken.id, TransportClass::Ok)
-        };
-        handle.completed(&decoded, now);
-        handle.completed(&prefilled, now);
-        drop(handle);
-        assert_eq!(
-            mem::take(&mut *lends.1.lock()),
-            [
-                ("sent", 1, true),
-                ("decode sent", 1, true),
-                ("decode ended", 1, false),
-                ("ended", 1, false),
-            ]
-        );
-        // A decode call's pick issues the side and takes the call's first
-        // target: the side's dispatch is lent a side that stands issued.
-        // The handle is dropped with both sides sent, and each ends.
-        let mut handle =
-            DecisionGuard::decide(&lends, GATEWAY, &asked, now).expect("a pair's handle");
-        handle.take(1).expect("the alternate target");
-        handle.dispatched(now);
-        let decided = handle.decide_decode(&asked, now);
-        assert!(decided.is_ok_and(|decision| decision.pick().is_some()));
-        handle.dispatched_decode(now);
-        drop(handle);
-        assert_eq!(
-            mem::take(&mut *lends.1.lock()),
-            [
-                ("sent", 1, true),
-                ("decode call", 1, true),
-                ("decode sent", 0, false),
-                ("ended", 0, false),
-                ("decode ended", 0, false),
-            ]
-        );
-        let _ = words();
-        // A single's handle lends no session and a side that never stood
-        // chosen: its words carry nothing of a pair's.
-        let (door, _) = bed();
-        let lends = Lends(&door, Lent::default());
-        let mut handle =
-            DecisionGuard::decide(&lends, GATEWAY, &request(b"single", 7), now).expect("a handle");
-        let lent = handle.held().expect("a leased decision").decode;
-        assert_eq!((lent.session, lent.chosen), (Session::NONE, false));
-        handle.dispatched(now);
-        drop(handle);
-        assert_eq!(
-            mem::take(&mut *lends.1.lock()),
-            [("sent", 0, false), ("ended", 0, false)]
-        );
-    }
-
-    /// A decode side given up while it stood chosen takes no call. The
-    /// handle owed no report of it, so the store still holds it chosen:
-    /// the handle refuses the call by name and asks no door. Nothing is
-    /// issued, booked or said.
-    #[test]
-    fn a_decode_given_up_while_chosen_takes_no_call() {
-        let door = pair_door(1, 1).expect("a pair door");
-        let store = door.store();
-        let now = Instant::now();
-        let asked = later_request(b"pair");
-        let mut handle =
-            DecisionGuard::decide(&door, GATEWAY, &asked, now).expect("a pair's handle");
-        let lease = handle.lease().expect("the prefill lease").lease.id;
-        let first = handle.take(0).expect("the first target");
-        let decode = first.pair.expect("the first decode").decode_id;
-        handle.dispatched(now);
-        handle.released_decode(ReleaseReason::ClientGone, now);
-        let before = store.sides(GATEWAY, lease);
-        let chosen = before.and_then(|sides| sides.decode).map(|side| side.state);
-        assert_eq!(chosen, Some(LeaseState::Chosen));
-        assert_eq!(
-            handle.decide_decode(&asked, now).err(),
-            Some(DecisionRefused::Decode(DecodeRefused::DecodeStands))
-        );
-        assert_eq!(store.sides(GATEWAY, lease), before);
-        assert_eq!(pair_counts(store, [first.id, decode]), [1, 0]);
-        let said = words();
-        assert!(
-            matches!(said.as_slice(), [Said::Dispatched(..)]),
-            "{said:?}"
-        );
-        // A single's handle answers by name too: its lease has no decode
-        // side.
-        let (single, _) = bed();
-        let mut alone = held(&single, b"r-1", now);
-        assert_eq!(
-            alone.decide_decode(&request(b"r-1", 7), now).err(),
-            Some(DecisionRefused::Decode(DecodeRefused::NotChosen))
-        );
-    }
-
-    /// A decode that left with its prefill is refused as the store refuses
-    /// it. The prefill's end took the chosen side off the file with it, so
-    /// the handle owes neither side a word and the lease is gone.
-    #[test]
-    fn a_decode_that_left_with_its_prefill_is_a_lease_that_is_gone() {
-        let door = pair_door(1, 1).expect("a pair door");
-        let store = door.store();
-        let now = Instant::now();
-        let asked = later_request(b"pair");
-        let mut handle =
-            DecisionGuard::decide(&door, GATEWAY, &asked, now).expect("a pair's handle");
-        let lease = handle.lease().expect("the prefill lease").lease.id;
-        let first = handle.take(0).expect("the first target");
-        handle.dispatched(now);
-        handle.completed(&outcome(first.id, TransportClass::Ok), now);
-        assert_eq!(store.sides(GATEWAY, lease), None);
-        assert_eq!(
-            handle.decide_decode(&asked, now).err(),
-            Some(DecisionRefused::Decode(DecodeRefused::NoLease))
-        );
-        assert_eq!(store.sides(GATEWAY, lease), None);
-    }
-
-    #[test]
-    fn a_handle_that_never_asks_sends_the_first_picks_decode() {
-        let door = pair_door(1, 1).expect("a pair door");
-        let store = door.store();
-        let now = Instant::now();
-        let asked = later_request(b"pair");
-        let mut handle =
-            DecisionGuard::decide(&door, GATEWAY, &asked, now).expect("a pair's handle");
-        let lease = handle.lease().expect("the prefill lease").lease.id;
-        let first = handle.take(0).expect("the first target");
-        let decode = first.pair.expect("the first decode").decode_id;
-        assert_eq!(handle.take_decode(0), None);
-        handle.dispatched(now);
-        assert_eq!(handle.take_decode(0), Some(first));
-        assert_eq!(pair_counts(store, [first.id, decode]), [1, 0]);
-        let at = now + Duration::from_micros(80);
-        handle.dispatched_decode(at);
-        handle.dispatched_decode(at);
-        assert_eq!(
-            states(store, lease),
-            Some([
-                LeaseState::Dispatched { at: now },
-                LeaseState::Dispatched { at }
-            ])
-        );
-        assert_eq!(pair_counts(store, [first.id, decode]), [1, 1]);
-        assert_eq!(
-            words(),
-            [
-                Said::Dispatched(
-                    Dispatch {
-                        side: Side::Prefill,
-                        target_index: 0,
-                        since_decision_micros: 0
-                    },
-                    now
-                ),
-                Said::Dispatched(
-                    Dispatch {
-                        side: Side::Decode,
-                        target_index: 0,
-                        since_decision_micros: 80
-                    },
-                    at
-                ),
-            ]
-        );
-        drop(handle);
-        let _ = words();
-    }
-
-    #[test]
-    fn a_handle_dropped_with_its_decode_still_chosen_says_nothing_of_it() {
-        for sent in [false, true] {
-            let door = pair_door(1, 1).expect("a pair door");
-            let store = door.store();
-            let now = Instant::now();
-            let asked = later_request(b"pair");
-            let mut handle =
-                DecisionGuard::decide(&door, GATEWAY, &asked, now).expect("a pair's handle");
-            let lease = handle.lease().expect("the prefill lease").lease.id;
-            let first = handle.take(0).expect("the first target");
-            let decode = first.pair.expect("the first decode").decode_id;
-            assert_eq!(
-                states(store, lease),
-                Some([LeaseState::ISSUED, LeaseState::Chosen])
-            );
-            if sent {
-                handle.dispatched(now);
-                assert_eq!(words().len(), 1);
-            }
-            drop(handle);
-            let [report]: [Said; 1] = words().try_into().expect("one prefill report");
-            if sent {
-                let Said::Completed(cancelled) = report else {
-                    panic!("the prefill completed");
-                };
-                assert_eq!(
-                    (cancelled.side, cancelled.served, cancelled.class),
-                    (Side::Prefill, first.id, TransportClass::Cancelled)
-                );
-            } else {
-                assert_eq!(
-                    report,
-                    Said::Released(Some(Side::Prefill), ReleaseReason::Abandoned)
-                );
-            }
-            assert_eq!(states(store, lease), None);
-            assert_eq!(pair_counts(store, [first.id, decode]), [0, 0]);
-        }
-
-        let door = pair_door(1, 1).expect("a pair door");
-        let store = door.store();
-        let now = Instant::now();
-        let asked = later_request(b"pair");
-        let mut handle =
-            DecisionGuard::decide(&door, GATEWAY, &asked, now).expect("a pair's handle");
-        let lease = handle.lease().expect("the prefill lease").lease.id;
-        handle.dispatched(now);
-        let _ = words();
-        // A named release would be visible while the prefill is still held.
-        let before = store.sides(GATEWAY, lease);
-        handle.released_decode(ReleaseReason::ClientGone, now);
-        assert!(words().is_empty());
-        assert_eq!(store.sides(GATEWAY, lease), before);
-        assert_eq!(handle.take_decode(0), None);
-        drop(handle);
-        assert_eq!(words().len(), 1, "the prefill's end alone");
-
-        let mut handle =
-            DecisionGuard::decide(&door, GATEWAY, &asked, now).expect("a pair's handle");
-        let lease = handle.lease().expect("the prefill lease").lease.id;
-        let prefill = handle.take(0).expect("the first target").id;
-        handle.dispatched(now);
-        let done = Outcome {
-            side: Side::Prefill,
-            ..outcome(prefill, TransportClass::Ok)
-        };
-        handle.completed(&done, now);
-        assert_eq!(handle.take_decode(0), None);
-        assert_eq!(states(store, lease), None);
-        assert_eq!(words().len(), 2);
-    }
-
-    #[test]
-    fn a_decode_taken_after_the_prefill_went_out_moves_the_decode_alone() {
-        let door = pair_door(2, 2).expect("a pair door");
-        let store = door.store();
-        let now = Instant::now();
-        let mut handle = paired(&door, now).expect("a pair's handle");
-        let lease = handle.lease().expect("the pair's lease").lease.id;
-        let first = handle.take(0).expect("the first target");
-        let alternate = handle.take(1).expect("the alternate target");
-        assert_eq!(handle.take(0), Some(first));
-        assert_eq!(
-            handle.take_decode(1),
-            None,
-            "the prefill still owes a dispatch"
-        );
-        let other = ["http://p0:8000", "http://p1:8000"]
-            .into_iter()
-            .filter_map(|key| store.by_key(key))
-            .find(|worker| worker.id != first.id)
-            .expect("another prefill");
-        // The picker lists one prefill. Add a target to exercise the handle's check.
-        let Decision::Pick(pick) = &mut handle.decided.decision else {
-            panic!("a pair pick");
-        };
-        let different = pick.targets.as_slice().len();
-        pick.targets.push(Target {
-            id: other.id,
-            ..alternate
-        });
-
-        handle.dispatched(now);
-        assert_eq!(handle.take(1), None, "the prefill has dispatched");
-        assert_eq!(handle.take_decode(different), None);
-        assert_eq!(handle.take_decode(usize::MAX), None);
-        assert_eq!(handle.take_decode(1), Some(alternate));
-        let d0 = first.pair.expect("the first decode").decode_id;
-        let d1 = alternate.pair.expect("the alternate decode").decode_id;
-        let workers = [first.id, other.id, d0, d1];
-        assert_eq!(
-            pair_counts(store, workers),
-            [1, 0, 1, 0],
-            "a take books nothing"
-        );
-        handle.dispatched_decode(now);
-        assert_eq!(handle.take_decode(0), None);
-        assert_eq!(pair_counts(store, workers), [1, 0, 0, 1]);
-        let filed = store.sides(GATEWAY, lease).expect("both sides on file");
-        let decode = filed.decode.expect("the decode side");
-        assert_eq!(filed.record.target, first.id);
-        assert_eq!((decode.target, decode.target_index), (d1, 1));
-        drop(handle);
-        let _ = words();
-    }
-
-    #[test]
-    fn a_pair_given_up_before_any_send_ends_both_sides_in_one_word() {
-        let door = pair_door(1, 1).expect("a pair door");
-        let store = door.store();
-        let now = Instant::now();
-        let mut handle = paired(&door, now).expect("a pair's handle");
-        assert!(!handle.decode_chosen(), "a pair decided whole issues both");
-        let first = handle.take(0).expect("the first target");
-        let decode = first.pair.expect("the first decode").decode_id;
-        let reason = ReleaseReason::CommitFailed;
-        handle.released(reason, now);
-        assert_eq!(pair_counts(store, [first.id, decode]), [0, 0]);
-        assert_eq!(LeasesStore::live(&**store, GATEWAY), 0);
-        drop(handle);
-        assert_eq!(words(), [Said::Released(None, reason)]);
-    }
-
-    #[test]
-    fn a_pair_dropped_with_one_side_sent_completes_it_and_gives_the_other_up() {
-        for sent in [Side::Prefill, Side::Decode] {
-            let door = pair_door(1, 2).expect("a pair door");
-            let store = door.store();
-            let now = Instant::now();
-            let mut handle = paired(&door, now).expect("a pair's handle");
-            let taken = handle.take(1).expect("the alternate target");
-            let decode = taken.pair.expect("the alternate decode").decode_id;
-            let (worker, waiting) = if sent == Side::Prefill {
-                handle.dispatched(now);
-                (taken.id, Side::Decode)
-            } else {
-                handle.dispatched_decode(now);
-                assert!(handle.take(0).is_some());
-                (decode, Side::Prefill)
-            };
-            assert_eq!(words().len(), 1);
-            drop(handle);
-            let [first, second]: [Said; 2] = words().try_into().expect("two reports");
-            let (completed, released) = if sent == Side::Prefill {
-                (first, second)
-            } else {
-                (second, first)
-            };
-            let Said::Completed(cancelled) = completed else {
-                panic!("the sent side completed");
-            };
-            assert_eq!(
-                (cancelled.side, cancelled.served, cancelled.class),
-                (sent, worker, TransportClass::Cancelled)
-            );
-            assert_eq!(
-                released,
-                Said::Released(Some(waiting), ReleaseReason::Abandoned)
-            );
-            assert_eq!(LeasesStore::live(&**store, GATEWAY), 0);
-            assert_eq!(pair_counts(store, [taken.id, decode]), [0, 0]);
-
-            let mut handle = paired(&door, now).expect("another pair's handle");
-            let lease = handle.lease().expect("the pair's lease").lease.id;
-            let first = handle.take(0).expect("the first target");
-            let decode = first.pair.expect("the first decode").decode_id;
-            let reason = ReleaseReason::ClientGone;
-            let (state, report) = if sent == Side::Decode {
-                handle.dispatched_decode(now);
-                assert_eq!(words().len(), 1);
-                let cancelled = Outcome {
-                    side: Side::Decode,
-                    served: decode,
-                    class: TransportClass::Cancelled,
-                    status: 0,
-                    ttft_micros: 0,
-                    tokens_in: 0,
-                    tokens_out: 0,
-                    duration_micros: 0,
-                };
-                (LeaseState::Completed, Said::Completed(cancelled))
-            } else {
-                (
-                    LeaseState::Released(reason),
-                    Said::Released(Some(Side::Decode), reason),
-                )
-            };
-            handle.released_decode(reason, now);
-            handle.released_decode(reason, now);
-            assert_eq!(states(store, lease), Some([LeaseState::ISSUED, state]));
-            assert_eq!(pair_counts(store, [first.id, decode]), [1, 0]);
-            assert_eq!(words(), [report]);
-            drop(handle);
-            assert_eq!(
-                words(),
-                [Said::Released(
-                    Some(Side::Prefill),
-                    ReleaseReason::Abandoned
-                )]
-            );
-        }
-    }
+    mod pairs;
 
     /// A single's handle holds no decode side: a decode's take, dispatch
     /// and release say nothing. Its lease ends under any side its host
     /// names, a decode outcome among them: a decode phase can stand under
-    /// a single plan, and the outcome its host read reaches the store.
+    /// a single plan, and the outcome its host read reaches the engine.
     #[test]
     fn a_single_handle_ends_under_a_decode_outcome_and_says_nothing_else_of_a_decode_side() {
-        let (door, heard) = bed();
-        let store = door.store();
+        let host = host();
         let now = Instant::now();
-        let mut handle = held(&door, b"single", now);
-        let lease = handle.lease().expect("the single's lease").lease.id;
+        let mut handle = host.held(b"single", now);
         let first = handle.take(0).expect("the first target");
         handle.dispatched_decode(now);
         assert_eq!(handle.take_decode(1), None);
         handle.released_decode(ReleaseReason::ClientGone, now);
-        let state = LeasesStore::get(&**store, GATEWAY, lease).map(|filed| filed.state);
-        assert_eq!(state, Some(LeaseState::ISSUED));
-        assert_eq!(counted(store), [(first.id, 1)]);
-        assert_eq!(*heard.lock(), [Call::Issued]);
+        assert!(handle.lease().is_some(), "the single's lease stands");
+        assert_eq!(*host.heard.lock(), [Call::Issued]);
         let decoded = Outcome {
             side: Side::Decode,
             ..outcome(first.id, TransportClass::Ok)
         };
         handle.completed(&decoded, now + Duration::from_micros(400));
-        assert!(LeasesStore::get(&**store, GATEWAY, lease).is_none());
-        assert_eq!(counted(store), []);
         let told = [
             Call::Issued,
             Call::Dispatched(first.id, 0, 400),
             Call::Completed(first.id, TransportClass::Ok, 5_000),
         ];
-        assert_eq!(*heard.lock(), told);
+        assert_eq!(*host.heard.lock(), told);
         drop(handle);
-        assert_eq!(*heard.lock(), told, "the drop says nothing more");
-    }
-
-    /// A pair's lease holds no encode side: an encode outcome ends no
-    /// side and says no word of the lease, and the prefill's lease stands
-    /// for its own end. The served worker's health takes the completion,
-    /// as a served controller writes it for such a frame.
-    #[test]
-    fn an_encode_outcome_on_a_pairs_handle_writes_its_workers_health_alone() {
-        let door = pair_door(1, 1).expect("a pair door");
-        let store = door.store();
-        let now = Instant::now();
-        let mut handle = paired(&door, now).expect("a pair's handle");
-        let lease = handle.lease().expect("the pair's lease").lease.id;
-        let first = handle.take(0).expect("the first target");
-        let decode = first.pair.expect("the first decode").decode_id;
-        let before = states(store, lease);
-        let encoded = Outcome {
-            side: Side::Encode,
-            ..outcome(decode, TransportClass::Ok)
-        };
-        assert!(!HealthSink::completed_ok_since(
-            &**store, GATEWAY, decode, now
-        ));
-        handle.completed(&encoded, now);
-        assert_eq!(states(store, lease), before, "neither side moved");
-        assert_eq!(pair_counts(store, [first.id, decode]), [1, 1]);
-        // The file hears the completion whole, under its own side, and a
-        // frame on that side ends no side: no stage is told of it.
-        assert_eq!(words(), [Said::Completed(encoded)]);
-        let sides = store.sides(GATEWAY, lease).expect("the lease on file");
-        assert_eq!(sides.ending(Some(Side::Encode)), [None, None]);
-        assert!(
-            HealthSink::completed_ok_since(&**store, GATEWAY, decode, now),
-            "the served worker's health takes the completion"
-        );
-        handle.completed(&outcome(first.id, TransportClass::Ok), now);
-        let ended = states(store, lease).map(|[prefill, _]| prefill);
-        assert_eq!(ended, Some(LeaseState::Completed));
-        drop(handle);
-        let _ = words();
-    }
-
-    /// A decode already sent names its prefill: a take behind it keeps
-    /// the prefill the decode was sent for.
-    #[test]
-    fn a_prefill_taken_behind_a_sent_decode_stays_on_its_prefill() {
-        let door = pair_door(2, 2).expect("a pair door");
-        let store = door.store();
-        let now = Instant::now();
-        let mut handle = paired(&door, now).expect("a pair's handle");
-        let first = handle.take(0).expect("the first target");
-        let alternate = handle.take(1).expect("the alternate target");
-        assert_eq!(handle.take(0), Some(first));
-        let other = ["http://p0:8000", "http://p1:8000"]
-            .into_iter()
-            .filter_map(|key| store.by_key(key))
-            .find(|worker| worker.id != first.id)
-            .expect("another prefill");
-        // The picker lists one prefill. Add a target to exercise the handle's check.
-        let Decision::Pick(pick) = &mut handle.decided.decision else {
-            panic!("a pair pick");
-        };
-        let different = pick.targets.as_slice().len();
-        pick.targets.push(Target {
-            id: other.id,
-            ..alternate
-        });
-        handle.dispatched_decode(now);
-        assert_eq!(handle.take(different), None, "another prefill");
-        assert_eq!(handle.take(1), Some(alternate), "the same prefill");
-        drop(handle);
-        let _ = words();
+        assert_eq!(*host.heard.lock(), told, "the drop says nothing more");
     }
 
     #[cfg(feature = "client")]
@@ -2326,8 +1531,8 @@ mod tests {
         use tokio_stream::StreamExt as _;
 
         use super::{
-            outcome, request, DecisionGuard, DecisionRefused, DecodeRefused, Duration, Instant,
-            Request, Side, StoreBackedEngine, TransportClass, WorkerId, PATIENCE,
+            outcome, stated, DecisionGuard, DecisionRefused, DecodeRefused, Duration, Instant,
+            PolicyEngine, Request, Side, TransportClass, WorkerId, PATIENCE,
         };
         use crate::{
             engine::Demands,
@@ -2373,8 +1578,8 @@ mod tests {
             peer: &mut Peer,
             told: proto::Decision,
             now: Instant,
-        ) -> Result<DecisionGuard<&'static StoreBackedEngine>, DecisionUnavailable> {
-            let mut ask = request(&[1], 7);
+        ) -> Result<DecisionGuard<&'static PolicyEngine>, DecisionUnavailable> {
+            let mut ask = stated(&[1]);
             ask.facts.budget_micros = 200_000;
             answered_to(peer, &ask, told, now).await
         }
@@ -2385,7 +1590,7 @@ mod tests {
             ask: &Request<'_>,
             told: proto::Decision,
             now: Instant,
-        ) -> Result<DecisionGuard<&'static StoreBackedEngine>, DecisionUnavailable> {
+        ) -> Result<DecisionGuard<&'static PolicyEngine>, DecisionUnavailable> {
             peer.read_hello().await;
             let link = peer.link.clone();
             let exchange = async {
@@ -2799,7 +2004,7 @@ mod tests {
         async fn a_linked_pair_asked_with_its_decode_later_is_held_as_issued_and_takes_no_call() {
             let now = Instant::now();
             let mut peer = Peer::new(1);
-            let mut ask = request(&[1], 7);
+            let mut ask = stated(&[1]);
             ask.facts.budget_micros = 200_000;
             ask.constraints.decode_later = true;
             let mut handle = answered_to(&mut peer, &ask, paired(), now)
@@ -2873,12 +2078,12 @@ mod tests {
         #[tokio::test(start_paused = true)]
         async fn a_handle_passes_the_wait_budget_to_the_link() {
             let peer = Peer::new(1);
-            let mut ask = request(&[1], 7);
+            let mut ask = stated(&[1]);
             ask.facts.budget_micros = 200_000;
             let before = tokio::time::Instant::now();
             let answer = timeout(
                 PATIENCE,
-                pin!(DecisionGuard::<&StoreBackedEngine>::asked(
+                pin!(DecisionGuard::<&PolicyEngine>::asked(
                     &peer.link,
                     &ask,
                     Instant::now(),
@@ -2901,12 +2106,12 @@ mod tests {
         #[tokio::test(start_paused = true)]
         async fn a_request_with_no_budget_is_late_before_anything_is_sent() {
             let mut peer = Peer::new(1);
-            let ask = request(&[1], 7);
+            let ask = stated(&[1]);
             assert_eq!(ask.facts.budget_micros, 0);
             let before = tokio::time::Instant::now();
             let answer = timeout(
                 PATIENCE,
-                pin!(DecisionGuard::<&StoreBackedEngine>::asked(
+                pin!(DecisionGuard::<&PolicyEngine>::asked(
                     &peer.link,
                     &ask,
                     Instant::now(),
@@ -2933,7 +2138,7 @@ mod tests {
         #[tokio::test(start_paused = true)]
         async fn a_request_that_states_a_demand_is_refused_before_anything_is_sent() {
             let mut peer = Peer::new(1);
-            let mut ask = request(&[1], 7);
+            let mut ask = stated(&[1]);
             ask.facts.budget_micros = 200_000;
             ask.constraints.demands = Demands {
                 runtime: 7,
@@ -2942,7 +2147,7 @@ mod tests {
             let before = tokio::time::Instant::now();
             let answer = timeout(
                 PATIENCE,
-                pin!(DecisionGuard::<&StoreBackedEngine>::asked(
+                pin!(DecisionGuard::<&PolicyEngine>::asked(
                     &peer.link,
                     &ask,
                     Instant::now(),

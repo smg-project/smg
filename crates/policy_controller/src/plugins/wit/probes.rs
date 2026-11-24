@@ -4,26 +4,29 @@
 //! against the descriptor in [`super::types`] (a retyped field fails the WIT
 //! test; the WIT order is the descriptor's, held by the byte-for-byte test,
 //! a struct's declaration order binding nothing). The host-only fields (a load row's
-//! resident-count flag, a candidate's position and
-//! sample instant, a request's host clock, affinity column and model fingerprint, a lease's
-//! issue instant and session verdict, a target's and a pair's positions) are named as such.
+//! resident-count flag, a candidate's position, sample instant and engine's place,
+//! a request's host clock, affinity column and model fingerprint, a lease's
+//! issue instant and session verdict, a target's and a pair's positions, a pair's decode
+//! verdict) are named as such.
 //! A `candidate` is tied to two structs, the engine's row and its entry of
 //! the request's affinity column: each is destructured whole, and the
 //! record's order, which neither struct holds, is named beside them.
 //! `dispatched` has no struct of its own: the host composes it from a lease,
 //! a target and a side.
 
+use std::sync::atomic::AtomicU64;
+
 use crate::{
     engine::{
         decision::{Pair, Target},
-        sticky_sessions::SessionVerdict,
+        sticky_sessions::{DecodeVerdict, SessionVerdict},
         view::{
             AffinityFacts, AffinityRows, Candidate, Engines, HashKind, Header, Health, Identity,
             LoadRow, MediaCounts, ModelFingerprint, OverloadRegime, Phase, PoolFacts, RequestFacts,
             Role, Session, SignalSource, WireModes, WorkerId, ZoneCapacity,
         },
     },
-    policies::consistent_hashing::PoolRing,
+    policies::consistent_hashing::LentRing,
     tracking::lease::{Lease, LeaseId, LeaseKind, Outcome, Side, TransportClass},
 };
 
@@ -73,9 +76,11 @@ wit! {
     Option<Pair> => "option<pair>",
     // A session crosses as its value.
     Session => "u64",
-    // Host-only: a lease's session verdict never reaches a guest, and a
-    // request's model crosses as its name, never as the host's fingerprint.
+    // Host-only: a lease's session verdict and a pair's decode side's never
+    // reach a guest, and a request's model crosses as its name, never as
+    // the host's fingerprint.
     SessionVerdict => "host-only",
+    DecodeVerdict => "host-only",
     ModelFingerprint => "host-only",
     // Host-only: a guest reads the request's affinity column as five fields
     // of each candidate.
@@ -92,12 +97,15 @@ wit! {
     // Host-only: the signal cells stand beside the rows of the host that
     // decides, and no contract carries them yet.
     Option<&crate::load::SignalCells> => "host-only",
+    // Host-only: the word a host keeps beside its own list of workers
+    // counts that list's turns, and a guest is shown rows.
+    Option<&AtomicU64> => "host-only",
     // Host-only: the engines a host lists beside its rows name the rows by
     // position, and a guest is shown rows.
     Engines<'_> => "host-only",
-    // Host-only: the ring of a host's own list of workers names its
-    // members by their rows' places, and a guest is shown rows.
-    Option<&PoolRing> => "host-only",
+    // Host-only: the ring a caller lends names its workers by address,
+    // and a guest is shown rows.
+    Option<&dyn LentRing> => "host-only",
 }
 
 // The spellings above that look inside a type, tied to it: an inner width that
@@ -184,16 +192,7 @@ pub(crate) fn all() -> Vec<Probe> {
     let lease = Lease::default();
     let pair = Pair::default();
     let target = Target::default();
-    let outcome = Outcome {
-        side: Side::Single,
-        served: WorkerId(0),
-        status: 0,
-        class: TransportClass::Ok,
-        ttft_micros: 0,
-        tokens_in: 0,
-        tokens_out: 0,
-        duration_micros: 0,
-    };
+    let outcome = Outcome::reported(0, TransportClass::Ok);
     vec![
         probe!("load", before [], LoadRow {
             running, queued, waiting_uncached_tokens, kv_usage_permille, active_kv_permille,
@@ -204,7 +203,7 @@ pub(crate) fn all() -> Vec<Probe> {
                 position, id, role, dp_rank, dp_size, health, wire_modes, engine_kind, connector,
                 in_flight, load, load_sampled_at_micros, session_hit, session_in_flight,
                 pair_class, has_capacity, has_room, zone, labels, ec_compatible, vision,
-                host_local, active_sessions, key,
+                host_local, active_sessions, key, engine,
             } = &candidate,
             AffinityFacts {
                 overlap_blocks, predicted_blocks, admitted_age_ms, indexed_growth, indexed_blocks,
@@ -214,33 +213,37 @@ pub(crate) fn all() -> Vec<Probe> {
                 load, overlap_blocks, predicted_blocks, session_hit, session_in_flight,
                 pair_class, has_capacity, has_room, admitted_age_ms, indexed_growth, zone,
                 labels, ec_compatible, vision, host_local, active_sessions, key, indexed_blocks,
-            ] host [position, load_sampled_at_micros]),
+            ] host [position, load_sampled_at_micros, engine]),
         probe!("media", before [], MediaCounts { images, audio, video, bytes } host [], &media),
         probe!("request", before [], RequestFacts {
             model, namespace_seed, tenant, priority, streaming, max_output_tokens,
             prompt_tokens, block_hashes, hash_kind, session_key, phase, attempt, tried,
-            budget_micros, headers, media, seed, block_size, now_micros, pinned_at,
+            budget_micros, headers, media, seed, block_size, prompt_chars, prompt_bytes, now_micros,
+            pinned_at,
             lent_in_flight, lent_session_in_flight, session_counted, affinity, named,
-            model_fingerprint, signal_cells, client_key, ring, ring_awaited,
+            model_fingerprint, signal_cells, client_key, ring, ring_positions,
         } host [
-            now_micros, pinned_at, lent_in_flight, lent_session_in_flight, session_counted,
-            affinity, named, model_fingerprint, signal_cells, client_key, ring, ring_awaited
+            prompt_chars, prompt_bytes, now_micros, pinned_at, lent_in_flight, lent_session_in_flight,
+            session_counted,
+            affinity, named, model_fingerprint, signal_cells, client_key, ring, ring_positions
         ],
         &request),
         probe!("zone-capacity", before [], ZoneCapacity { zone, healthy, total } host [], &zone),
         probe!("pool", before [], PoolFacts {
             pool_size, membership_epoch, ring_epoch, regime, generation, zones, reach,
-            reported, engines,
-        } host [reach, reported, engines], &pool),
+            reported, engines, word,
+        } host [reach, reported, engines, word], &pool),
         // The lease's session crosses under the name both contracts still
         // spell, `session-key`. A gateway's client reads it under that name.
         // A change that renames the field renames it in both contracts and
         // takes this pair out.
         probe!("lease", before [], Lease {
             id, kind, side, target_index, booked, generation, session as "session-key",
-            session_verdict, issued_micros, tokens,
-        } host [booked, session_verdict, issued_micros], &lease),
-        probe!("pair", before [], Pair { decode_position, decode_id, decode_dp_rank } host [decode_position], &pair),
+            session_verdict, issued_micros, tokens, chars, bytes,
+        } host [booked, session_verdict, issued_micros, chars, bytes], &lease),
+        probe!("pair", before [], Pair {
+            decode_position, decode_id, decode_dp_rank, decode_verdict,
+        } host [decode_position, decode_verdict], &pair),
         probe!("target", before [], Target { position, id, dp_rank, pair } host [position], &target),
         probe!("completed", before ["lease": "lease"], Outcome {
             side, served, status, class, ttft_micros, tokens_in, tokens_out, duration_micros,

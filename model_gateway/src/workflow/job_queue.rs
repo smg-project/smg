@@ -1,7 +1,11 @@
 //! Jobs the gateway runs through its control plane. The application context
 //! runs the workflows and handles their reservations and cancel marks.
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{atomic::Ordering, Arc},
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use dashmap::DashSet;
@@ -98,6 +102,10 @@ pub enum Job {
 }
 
 impl Job {
+    /// The type names of the tokenizer jobs: their status route reads them.
+    pub(crate) const ADD_TOKENIZER_TYPE: &str = "AddTokenizer";
+    pub(crate) const REMOVE_TOKENIZER_TYPE: &str = "RemoveTokenizer";
+
     /// Get job type as string for logging
     pub fn job_type(&self) -> &'static str {
         match self {
@@ -110,8 +118,8 @@ impl Job {
             Job::RegisterMcpServer { .. } => "RegisterMcpServer",
             Job::AddWasmModule { .. } => "AddWasmModule",
             Job::RemoveWasmModule { .. } => "RemoveWasmModule",
-            Job::AddTokenizer { .. } => "AddTokenizer",
-            Job::RemoveTokenizer { .. } => "RemoveTokenizer",
+            Job::AddTokenizer { .. } => Self::ADD_TOKENIZER_TYPE,
+            Job::RemoveTokenizer { .. } => Self::REMOVE_TOKENIZER_TYPE,
         }
     }
 
@@ -127,8 +135,8 @@ impl Job {
             | "RegisterMcpServer"
             | "AddWasmModule"
             | "RemoveWasmModule"
-            | "AddTokenizer"
-            | "RemoveTokenizer" => worker_url.to_string(),
+            | Self::ADD_TOKENIZER_TYPE
+            | Self::REMOVE_TOKENIZER_TYPE => worker_url.to_string(),
             _ => WorkerJob::shown_key(job_type, worker_url),
         }
     }
@@ -544,12 +552,18 @@ impl JobHost for AppContext {
                 // or discovery registration of the same URL read none, so no
                 // other kind can consume a mark meant for the POST's job.
                 if take_mark(run.cancelled_before_start, run.own_id) {
+                    run.ended_by_delete.store(true, Ordering::Relaxed);
                     return Err("Registration cancelled before it started".to_string());
                 }
                 let engines = workflow_engines(context)?;
 
-                let timeout_duration =
-                    Duration::from_secs(context.router_config.worker_startup_timeout_secs + 30);
+                // The startup delay stands ahead of the run's first probe:
+                // a wait that left it out would end that much before the run.
+                let timeout_duration = Duration::from_secs(
+                    context.router_config.worker_startup_timeout_secs
+                        + context.router_config.worker_startup_delay_secs
+                        + 30,
+                );
 
                 let workflow_data = create_worker_workflow_data(
                     (**config).clone(),
@@ -566,6 +580,9 @@ impl JobHost for AppContext {
                 // no state to cancel and left its mark: the workflow just
                 // started is cancelled here, and the wait below ends with it.
                 if take_mark(run.cancelled_before_start, run.own_id) {
+                    // The `DELETE` is answered already: whatever the cancel
+                    // and the wait below return, a `DELETE` ended this job.
+                    run.ended_by_delete.store(true, Ordering::Relaxed);
                     engines
                         .worker_registration
                         .cancel_workflow(instance_id)
@@ -582,20 +599,65 @@ impl JobHost for AppContext {
                 );
 
                 let label = Job::workflow_label(&config.url);
-                let state = engines
-                    .worker_registration
-                    .wait_for_terminal_state(instance_id, &label, timeout_duration)
-                    .await?;
-                let outcome = wfaas::completion_outcome(&state, &label);
+                let engine = &engines.worker_registration;
+                let create_only = matches!(registration_mode, WorkerRegistrationMode::CreateOnly);
+                // A POST's wait ends at the job's own deadline: the engine's
+                // timeout reclaims a state that has just ended, and the cancel
+                // below needs it. The outer `Err` is that deadline alone.
+                let waited = if create_only {
+                    tokio::time::timeout(
+                        timeout_duration,
+                        engine.wait_for_terminal_state(instance_id, &label, Duration::MAX),
+                    )
+                    .await
+                } else {
+                    Ok(engine
+                        .wait_for_terminal_state(instance_id, &label, timeout_duration)
+                        .await)
+                };
+                let (state, outcome) = match waited {
+                    Ok(Ok(state)) => {
+                        let outcome = wfaas::completion_outcome(&state, &label);
+                        (state, outcome)
+                    }
+                    // The wait's own failure. No job cleans up after a cancel
+                    // of a registration that is not a POST's, so its run is
+                    // left to finish.
+                    Ok(Err(failure)) => return Err(failure),
+                    // A POST's wait that ends first cancels its run: left
+                    // going, the run would register the worker under a job
+                    // that already failed. A cancelled run ends with the
+                    // attempt it is in, whose bound is within the wait, and
+                    // its end is read as any other. The job writes the
+                    // engine's words for the wait that ended.
+                    Err(_) => {
+                        let waited_out = format!(
+                            "Workflow timeout after {}s for {label}",
+                            timeout_duration.as_secs()
+                        );
+                        engine.cancel_workflow(instance_id).await.map_err(|e| {
+                            format!("{waited_out}; its run could not be cancelled: {e:?}")
+                        })?;
+                        let state = engine
+                            .wait_for_terminal_state(instance_id, &label, timeout_duration)
+                            .await
+                            .map_err(|e| {
+                                format!("{waited_out}; its cancelled run did not end: {e}")
+                            })?;
+                        (state, Err(format!("{waited_out}; its run was cancelled")))
+                    }
+                };
                 // A POST's registration that put its worker in the registry
                 // and did not finish (a DELETE's cancel landing after the
                 // registry step, a later step's failure) leaves no worker
                 // behind: it goes out through the removal job, as a DELETE of
                 // a live worker sends it. A startup or discovery registration
                 // is its own pass's to reconcile.
-                let create_only = matches!(registration_mode, WorkerRegistrationMode::CreateOnly);
                 match outcome {
                     Err(failure) if create_only => {
+                        if state.status == WorkflowStatus::Cancelled {
+                            run.ended_by_delete.store(true, Ordering::Relaxed);
+                        }
                         // The registry says what this registration left in it
                         // (its workers still the entries under their URLs, by
                         // id and revision): a worker registered or replaced
@@ -612,9 +674,11 @@ impl JobHost for AppContext {
                                 failure
                             }
                         } else {
-                            // Only a DELETE can cancel a registration. If a
-                            // step failed, the cleanup is part of the job
-                            // that asked for the registration.
+                            // A registration is cancelled by a DELETE, or by
+                            // its own job at its wait's end, and a POST's job
+                            // is the API's too. If a step failed, the cleanup
+                            // is part of the job that asked for the
+                            // registration.
                             let asker = if state.status == WorkflowStatus::Cancelled {
                                 WorkerJobAsker::Api
                             } else {
@@ -976,9 +1040,10 @@ fn apply_startup_worker_config(spec: &mut WorkerSpec, router_config: &RouterConf
     if let Some(runtime) = router_config.startup_worker_runtime_type {
         spec.runtime_type = runtime;
     }
-    // Grouped ZMQ worker: the handshake awaits this many DP engines on one
-    // socket set. Only ZMQ URLs — dp_size on an HTTP/gRPC startup worker would
-    // misread as dp-awareness.
+    // A ZMQ worker given an engine count: the handshake awaits this many DP
+    // engines on one socket set, and the worker registers as one worker per
+    // engine. Only ZMQ URLs — dp_size on an HTTP/gRPC startup worker would
+    // misread as a rank worker's.
     if let Some(count) = router_config.zmq_engine_count.filter(|&n| n > 1) {
         if ConnectionMode::from_url(&spec.url) == Some(ConnectionMode::Zmq) {
             spec.dp_size = Some(count);
@@ -1065,7 +1130,7 @@ pub(crate) fn recording_for_tests(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Weak;
+    use std::sync::{atomic::AtomicBool, Weak};
 
     use dashmap::DashMap;
     use openai_protocol::worker::JobStatus;
@@ -1098,6 +1163,7 @@ mod tests {
                 &JobRun {
                     cancelled_before_start,
                     own_id,
+                    ended_by_delete: &AtomicBool::new(false),
                 },
             )
             .await
@@ -1164,6 +1230,85 @@ mod tests {
         );
         assert!(context.worker_registry.get_url_by_id(&id).is_none());
         assert_eq!(queue.get_status(url).unwrap().status, "failed");
+    }
+
+    #[tokio::test]
+    async fn a_failed_registration_reads_failed_with_its_reason_at_its_id() {
+        use crate::{
+            admin::worker_service::WorkerService, endpoints::tokenize::get_tokenizer_status,
+        };
+
+        let context = create_test_app_context();
+        let queue = JobQueue::new(JobQueueConfig::default(), Arc::downgrade(&context));
+        context.worker_job_queue.set(Arc::clone(&queue)).unwrap();
+        let service = WorkerService::new(
+            Arc::clone(&context.worker_registry),
+            Arc::clone(&context.worker_job_queue),
+            context.router_config.clone(),
+        );
+        let url = "http://user:pass@worker:8000";
+        let fail = || async {
+            let id = context.worker_registry.reserve_id_for_url(url);
+            let _ = queue
+                .submit_and_wait(
+                    Job::AddWorker {
+                        config: Box::new(WorkerSpec::new(url)),
+                        registration_mode: WorkerRegistrationMode::CreateOnly,
+                        asker: WorkerJobAsker::Api,
+                    },
+                    Duration::from_secs(5),
+                )
+                .await;
+            id
+        };
+
+        let id = fail().await;
+        let read = service
+            .get_worker(id.as_str())
+            .expect("the id of a failed registration answers while its status is kept")
+            .0;
+        let status = read.job_status.expect("its job status");
+        assert_eq!(status.status, "failed");
+        assert_eq!(
+            status.message.as_deref(),
+            Some("Workflow engines not initialized")
+        );
+        // No plain address: the view writes it as the job's own lines write it.
+        assert_eq!(read.spec.url, Endpoint::redacted_str(url));
+        assert_eq!(status.worker_url, read.spec.url);
+        // The tokenizer status route takes the status of a tokenizer job alone.
+        let at_tokenizers = get_tokenizer_status(&context, id.as_str()).await;
+        assert_eq!(at_tokenizers.status().as_u16(), 404);
+
+        // A later failure of the same URL replaces the kept one.
+        let later = fail().await;
+        assert!(service.get_worker(later.as_str()).is_ok());
+        assert!(service.get_worker(id.as_str()).is_err());
+
+        // The pending view of a reserved id writes the address in that form too.
+        let held = context.worker_registry.reserve_id_for_url(url);
+        assert_eq!(
+            service.get_worker(held.as_str()).unwrap().0.spec.url,
+            read.spec.url
+        );
+
+        // A plain address reads as registered, byte for byte.
+        let plain = "http://worker:8000/";
+        let plain_id = context.worker_registry.reserve_id_for_url(plain);
+        let _ = queue
+            .submit_and_wait(
+                Job::AddWorker {
+                    config: Box::new(WorkerSpec::new(plain)),
+                    registration_mode: WorkerRegistrationMode::CreateOnly,
+                    asker: WorkerJobAsker::Api,
+                },
+                Duration::from_secs(5),
+            )
+            .await;
+        assert_eq!(
+            service.get_worker(plain_id.as_str()).unwrap().0.spec.url,
+            plain
+        );
     }
 
     #[tokio::test]
@@ -1686,6 +1831,295 @@ mod tests {
                  of five; the lines with a credential: {credentialed:#?}"
             ))
         });
+    }
+
+    /// A gateway given no setting for it registers one worker per
+    /// data-parallel rank an engine names. An HTTP engine whose server info
+    /// names four ranks stands as four rank workers and none at its base
+    /// address. An engine that names one rank, one that names no size and
+    /// one whose server info fails to read each stand as one plain worker,
+    /// and none of the four registrations fails.
+    #[tokio::test]
+    async fn a_registration_registers_one_worker_per_rank_the_engine_names() {
+        use http::StatusCode;
+        use serde_json::json;
+        use smg_worker::workflow::find_workers_by_url;
+
+        use crate::{
+            app_context::testing::live_app_context,
+            workflow::steps::local::test_support::serve_json_routes,
+        };
+
+        let context = live_app_context();
+        let registry = &context.worker_registry;
+        let marks = DashSet::new();
+        for (status, server_info, ranks) in [
+            (StatusCode::OK, json!({"dp_size": 2, "attn_dp_size": 2}), 4),
+            (StatusCode::OK, json!({"dp_size": 1}), 1),
+            (StatusCode::OK, json!({"version": "test"}), 1),
+            (StatusCode::INTERNAL_SERVER_ERROR, json!({"dp_size": 4}), 1),
+        ] {
+            // The model list names the runtime whose server info reports the
+            // size, so each of the four is read the same way.
+            let base = serve_json_routes(vec![
+                ("/health", StatusCode::OK, json!({"status": "ok"})),
+                (
+                    "/v1/models",
+                    StatusCode::OK,
+                    json!({"data": [{"id": "m", "owned_by": "sglang"}]}),
+                ),
+                (
+                    "/model_info",
+                    StatusCode::OK,
+                    json!({"model_path": "m", "is_generation": true}),
+                ),
+                ("/server_info", status, server_info.clone()),
+            ])
+            .await;
+            let job = Job::AddWorker {
+                asker: WorkerJobAsker::Api,
+                config: Box::new(WorkerSpec::new(base.as_str())),
+                registration_mode: WorkerRegistrationMode::Upsert,
+            };
+
+            let result = execute_job(&job, &context, &marks, None).await;
+
+            let case = format!("{status} {server_info}");
+            assert!(result.is_ok(), "{case}: {result:?}");
+            let mut workers = find_workers_by_url(registry, &base);
+            workers.sort_by_key(|worker| worker.dp_rank());
+            let registered: Vec<(String, Option<usize>, Option<usize>)> = workers
+                .iter()
+                .map(|worker| (worker.url().to_string(), worker.dp_rank(), worker.dp_size()))
+                .collect();
+            let expected: Vec<(String, Option<usize>, Option<usize>)> = if ranks == 1 {
+                vec![(base.clone(), None, None)]
+            } else {
+                (0..ranks)
+                    .map(|rank| (format!("{base}@{rank}"), Some(rank), Some(ranks)))
+                    .collect()
+            };
+            assert_eq!(registered, expected, "{case}");
+            assert_eq!(
+                registry.get_by_url(&base).is_some(),
+                ranks == 1,
+                "{case}: a worker stands at the base address only where the engine is one worker"
+            );
+        }
+    }
+
+    /// A second `POST` of an engine that stands as rank workers is refused as
+    /// a duplicate though its server info no longer reads. The failed read
+    /// leaves the registration no shape, and the rank workers stand at
+    /// `{base}@{rank}`, where the base address finds none. After it the two
+    /// rank workers stand alone, with no plain worker beside them.
+    #[tokio::test]
+    async fn a_repeated_create_is_refused_for_rank_workers_whose_server_info_fails() {
+        use std::sync::atomic::Ordering;
+
+        use http::StatusCode;
+        use serde_json::json;
+
+        use crate::app_context::testing::live_app_context;
+
+        let (base, failing) = engine_whose_server_info_turns(
+            (StatusCode::OK, json!({"dp_size": 2})),
+            (StatusCode::INTERNAL_SERVER_ERROR, json!({})),
+        )
+        .await;
+        let context = live_app_context();
+        let marks = DashSet::new();
+        let create = add_worker(&base, WorkerRegistrationMode::CreateOnly);
+        let ranks = vec![format!("{base}@0"), format!("{base}@1")];
+
+        let first = execute_job(&create, &context, &marks, None).await;
+        assert!(first.is_ok(), "{first:?}");
+        assert_eq!(standing_at(&context, &base), ranks);
+
+        failing.store(true, Ordering::Relaxed);
+        let second = execute_job(&create, &context, &marks, None).await;
+        assert!(
+            matches!(&second, Err(said) if said.contains("already exists")),
+            "{second:?}"
+        );
+        assert_eq!(
+            standing_at(&context, &base),
+            ranks,
+            "no plain worker beside the ranks"
+        );
+    }
+
+    /// An upsert that reads two ranks where the engine stands as one plain
+    /// worker is refused by name: the first registration's server info
+    /// failed to read. The register step replaces a worker under its own
+    /// address alone, so the rank workers would stand beside the plain one.
+    /// After the refusal the plain worker stands alone.
+    #[tokio::test]
+    async fn an_upsert_that_reads_ranks_is_refused_where_a_plain_worker_stands() {
+        use std::sync::atomic::Ordering;
+
+        use http::StatusCode;
+        use serde_json::json;
+
+        use crate::app_context::testing::live_app_context;
+
+        let (base, reads) = engine_whose_server_info_turns(
+            (StatusCode::INTERNAL_SERVER_ERROR, json!({})),
+            (StatusCode::OK, json!({"dp_size": 2})),
+        )
+        .await;
+        let context = live_app_context();
+        let marks = DashSet::new();
+        let upsert = add_worker(&base, WorkerRegistrationMode::Upsert);
+        let plain = vec![base.clone()];
+
+        let first = execute_job(&upsert, &context, &marks, None).await;
+        assert!(first.is_ok(), "{first:?}");
+        assert_eq!(standing_at(&context, &base), plain);
+
+        reads.store(true, Ordering::Relaxed);
+        let second = execute_job(&upsert, &context, &marks, None).await;
+        assert!(
+            matches!(&second, Err(said) if said.contains(
+                "stands as one worker and this registration read 2 data-parallel ranks"
+            )),
+            "{second:?}"
+        );
+        assert_eq!(
+            standing_at(&context, &base),
+            plain,
+            "no rank worker beside the plain one"
+        );
+    }
+
+    /// An upsert takes a peer's rank workers that stand at its addresses
+    /// though they state no rank: an import with no spec is built from the
+    /// address alone. The registration reads the same two ranks and claims
+    /// both under their addresses. After it the registry holds the engine
+    /// once, each worker states its rank, and this node owns both.
+    #[tokio::test]
+    async fn an_upsert_takes_a_peers_rank_workers_that_state_no_rank() {
+        use http::StatusCode;
+        use serde_json::json;
+        use smg_worker::{
+            registry::{RemoteWorkerState, WorkerOrigin},
+            workflow::find_workers_by_url,
+        };
+
+        use crate::app_context::testing::live_app_context;
+
+        let two_ranks = (StatusCode::OK, json!({"dp_size": 2}));
+        let (base, _) = engine_whose_server_info_turns(two_ranks.clone(), two_ranks).await;
+        let context = live_app_context();
+        let registry = &context.worker_registry;
+        for rank in 0..2 {
+            let url = format!("{base}@{rank}");
+            registry.on_remote_worker_state(&RemoteWorkerState {
+                worker_id: format!("peer-rank-{rank}"),
+                model_id: "m".to_string(),
+                url: url.clone(),
+                health: true,
+                version: 1,
+                spec: Vec::new(),
+            });
+            let id = registry.get_id_by_url(&url).expect("the import");
+            assert_eq!(registry.origin_of(&id), Some(WorkerOrigin::Mesh));
+            let imported = registry.get(&id).expect("the import");
+            assert_eq!(imported.dp_rank(), None, "built from the address alone");
+        }
+        let marks = DashSet::new();
+        let upsert = add_worker(&base, WorkerRegistrationMode::Upsert);
+
+        let result = execute_job(&upsert, &context, &marks, None).await;
+
+        assert!(result.is_ok(), "{result:?}");
+        let mut standing: Vec<(String, Option<usize>, Option<WorkerOrigin>)> =
+            find_workers_by_url(registry, &base)
+                .iter()
+                .map(|worker| {
+                    let id = registry.get_id_by_url(worker.url()).expect("its id");
+                    (
+                        worker.url().to_string(),
+                        worker.dp_rank(),
+                        registry.origin_of(&id),
+                    )
+                })
+                .collect();
+        standing.sort_by(|a, b| a.0.cmp(&b.0));
+        let local = Some(WorkerOrigin::Local);
+        assert_eq!(
+            standing,
+            [
+                (format!("{base}@0"), Some(0), local),
+                (format!("{base}@1"), Some(1), local)
+            ]
+        );
+    }
+
+    /// An engine stub whose server info answers `first` until the switch it
+    /// returns is set, and `then` from then on: a read that fails, or one
+    /// that comes back. Returns its base address and the switch.
+    async fn engine_whose_server_info_turns(
+        first: (http::StatusCode, serde_json::Value),
+        then: (http::StatusCode, serde_json::Value),
+    ) -> (String, Arc<AtomicBool>) {
+        use std::sync::atomic::Ordering;
+
+        use axum::{routing::get, Json};
+        use http::StatusCode;
+        use serde_json::json;
+
+        use crate::workflow::steps::local::test_support::{json_router, serve_router};
+
+        let turned = Arc::new(AtomicBool::new(false));
+        let server_info = {
+            let turned = Arc::clone(&turned);
+            move || {
+                let (status, body) = if turned.load(Ordering::Relaxed) {
+                    then.clone()
+                } else {
+                    first.clone()
+                };
+                async move { (status, Json(body)) }
+            }
+        };
+        let router = json_router(vec![
+            ("/health", StatusCode::OK, json!({"status": "ok"})),
+            (
+                "/v1/models",
+                StatusCode::OK,
+                json!({"data": [{"id": "m", "owned_by": "sglang"}]}),
+            ),
+            (
+                "/model_info",
+                StatusCode::OK,
+                json!({"model_path": "m", "is_generation": true}),
+            ),
+        ])
+        .route("/server_info", get(server_info));
+        (serve_router(router).await, turned)
+    }
+
+    /// A registration of the engine at `base` in `registration_mode`, as the
+    /// worker API asks it.
+    fn add_worker(base: &str, registration_mode: WorkerRegistrationMode) -> Job {
+        Job::AddWorker {
+            asker: WorkerJobAsker::Api,
+            config: Box::new(WorkerSpec::new(base)),
+            registration_mode,
+        }
+    }
+
+    /// The addresses of the workers that stand for `base` in the registry,
+    /// the plain one and the rank workers, in order.
+    fn standing_at(context: &AppContext, base: &str) -> Vec<String> {
+        let mut urls: Vec<String> =
+            smg_worker::workflow::find_workers_by_url(&context.worker_registry, base)
+                .iter()
+                .map(|worker| worker.url().to_string())
+                .collect();
+        urls.sort();
+        urls
     }
 
     /// The registration workflows the store holds that have not ended.
@@ -3394,6 +3828,161 @@ mod tests {
             failure.contains("leave through a queued removal"),
             "the outcome does not name the removal: {failure}"
         );
+    }
+
+    /// A `POST`'s registration job whose wait ends before its run cancels
+    /// the run: left going, the run probed on and registered a worker that
+    /// answered later, under a job that had already failed. The run of any
+    /// other registration is left to finish. The cancel finds the run's
+    /// state whatever it reads at the wait's end: in the third case a
+    /// `DELETE` cancelled the run half a second earlier with a probe still
+    /// out, a state the engine's own timeout reclaims. The worker here
+    /// accepts and never answers, so the run outlasts the wait.
+    #[tokio::test(start_paused = true)]
+    async fn only_a_posts_registration_job_ends_the_run_it_stops_waiting_for() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use crate::{
+            app_context::testing::app_context_for_tests, routers::common::snapshot::WorkerRegistry,
+            workflow::WorkflowEngines,
+        };
+
+        for (kind, registration_mode, asker, delay_secs, deleted_at, cancels) in [
+            (
+                "a POST's",
+                WorkerRegistrationMode::CreateOnly,
+                WorkerJobAsker::Api,
+                0,
+                None,
+                true,
+            ),
+            (
+                "a startup",
+                WorkerRegistrationMode::Upsert,
+                WorkerJobAsker::Startup,
+                0,
+                None,
+                false,
+            ),
+            (
+                "a POST's, cancelled by a DELETE as its wait ends,",
+                WorkerRegistrationMode::CreateOnly,
+                WorkerJobAsker::Api,
+                0,
+                Some(Duration::from_millis(49_500)),
+                true,
+            ),
+            // The engine counts a step's delay on the real clock, which the
+            // paused clock here outruns: this run is cancelled before its
+            // first probe, and the case holds the length of the wait alone.
+            (
+                "a POST's, under a startup delay,",
+                WorkerRegistrationMode::CreateOnly,
+                WorkerJobAsker::Api,
+                5,
+                None,
+                true,
+            ),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("a loopback port of the system's choice");
+            let url = format!(
+                "http://{}",
+                listener.local_addr().expect("the bound address")
+            );
+            let probes = Arc::new(AtomicUsize::new(0));
+            let seen = Arc::clone(&probes);
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "a test fixture: the stub lives as long as the test's runtime"
+            )]
+            tokio::spawn(async move {
+                let mut held = Vec::new();
+                while let Ok((connection, _)) = listener.accept().await {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    held.push(connection);
+                }
+            });
+            // A startup timeout of twenty seconds: the job waits fifty, and
+            // the case's startup delay on top.
+            let router_config = RouterConfig {
+                worker_startup_timeout_secs: 20,
+                worker_startup_check_interval_secs: 2,
+                worker_startup_delay_secs: delay_secs,
+                ..RouterConfig::default()
+            };
+            let context =
+                app_context_for_tests(router_config.clone(), Arc::new(WorkerRegistry::new()), None);
+            assert!(
+                context
+                    .workflow_engines
+                    .set(WorkflowEngines::new(&router_config))
+                    .is_ok(),
+                "the engines are set once"
+            );
+            // Each probe outlasts its step's bound of twenty seconds: with
+            // the pause of two seconds between probes, the third is out from
+            // second 44 to second 64, across the end of the wait.
+            let mut spec = WorkerSpec::new(url.as_str());
+            spec.health.timeout_secs = Some(30);
+            let job = Job::AddWorker {
+                asker,
+                config: Box::new(spec),
+                registration_mode,
+            };
+
+            let marks = DashSet::new();
+            let (job_end, ()) = tokio::join!(execute_job(&job, &context, &marks, None), async {
+                if let Some(at) = deleted_at {
+                    tokio::time::sleep(at).await;
+                    let engine = &workflow_engines(&context)
+                        .expect("set above")
+                        .worker_registration;
+                    let runs = engine
+                        .state_store()
+                        .list_all()
+                        .await
+                        .expect("the store lists its states");
+                    engine
+                        .cancel_workflow(runs.first().expect("the run's state").instance_id)
+                        .await
+                        .expect("the run is in the store");
+                }
+            });
+            let failure = job_end.expect_err("the wait ends before the run");
+
+            // A job that cancelled its run has read the run's end, and that
+            // read takes the state out of the store.
+            let runs_left = workflow_engines(&context)
+                .expect("set above")
+                .worker_registration
+                .state_store()
+                .list_all()
+                .await
+                .expect("the store lists its states")
+                .len();
+            let probes_at_the_jobs_end = probes.load(Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            let probed_on = probes.load(Ordering::SeqCst) > probes_at_the_jobs_end;
+            // The engine's words for a wait that ended first, which a POST's
+            // job writes itself.
+            let waited_out = format!(
+                "Workflow timeout after {}s for {}",
+                50 + delay_secs,
+                Job::workflow_label(&url)
+            );
+            let expected = if cancels {
+                format!("{waited_out}; its run was cancelled")
+            } else {
+                waited_out
+            };
+            assert_eq!(
+                (failure.as_str(), probed_on, runs_left),
+                (expected.as_str(), !cancels, usize::from(!cancels)),
+                "{kind} registration after its job failed"
+            );
+        }
     }
 
     /// What `a_delete_setting` builds: the context, its queue and registry,

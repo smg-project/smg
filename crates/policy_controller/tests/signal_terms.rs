@@ -380,6 +380,52 @@ fn the_requests_size_alone_under_a_signals_capacity_keeps_the_rows_it_fits() {
     );
 }
 
+/// A rule that names a signal reserves room for the answer as a rule that
+/// names none does: the request's output limit times its coefficient
+/// counts beside what the signal says a worker uses, under a capacity a
+/// signal holds.
+#[test]
+fn the_output_limit_reserves_room_in_a_rule_that_names_a_signal() {
+    let engine = has_room(&format!(
+        "used: {{signal.{USED}: 1, request.max_output_tokens: 0.25, request.prompt_tokens: 1}}, \
+         capacity: signal.{CAPACITY}"
+    ));
+    let rows = [row(0, 0), row(1, 0)];
+    let cells = rooms(&[
+        (fresh(1_000.0), fresh(700.0)),
+        (fresh(1_000.0), fresh(701.0)),
+    ]);
+    let with_limit = |limit| RequestFacts {
+        max_output_tokens: limit,
+        ..facts(Some(&cells), 100)
+    };
+    // A prompt of 100 and a quarter of an answer of 796 put the second row
+    // on its capacity.
+    assert_eq!(kept(&engine, &with_limit(796), &rows), [0, 1]);
+    // Four tokens more of answer are one token more: the second row is
+    // over its capacity, and the first on it.
+    assert_eq!(kept(&engine, &with_limit(800), &rows), [0]);
+}
+
+/// The request's output limit alone is a rule under a signal's capacity,
+/// as its size alone is: each worker's capacity bounds the answer.
+#[test]
+fn the_output_limit_alone_under_a_signals_capacity_keeps_the_rows_it_fits() {
+    let engine = has_room(&format!(
+        "used: {{request.max_output_tokens: 1}}, capacity: signal.{CAPACITY}"
+    ));
+    let rows = [row(0, 0), row(1, 0)];
+    let holds = |capacity: f64| (fresh(capacity), SignalCell::NONE);
+    let cells = rooms(&[holds(4_096.0), holds(8_192.0)]);
+    let with_limit = |limit| RequestFacts {
+        max_output_tokens: limit,
+        ..facts(Some(&cells), 0)
+    };
+    assert_eq!(kept(&engine, &with_limit(4_096), &rows), [0, 1]);
+    // An answer one token longer fits the larger capacity alone.
+    assert_eq!(kept(&engine, &with_limit(4_097), &rows), [1]);
+}
+
 #[test]
 fn a_signal_alone_under_a_number_is_a_rule_and_the_requests_size_alone_is_none() {
     // A signal reads a worker: summed alone under a number it is a rule.
@@ -396,7 +442,7 @@ fn a_signal_alone_under_a_number_is_a_rule_and_the_requests_size_alone_is_none()
     );
     assert_eq!(error.field_path(), "profiles.p.filter[1].has-room.used");
     assert!(
-        matches!(&error, SpecError::BadField { value, reason, .. } if value == "request.prompt_tokens" && *reason == "at least one field or signal of the worker beside the request's size"),
+        matches!(&error, SpecError::BadField { value, reason, .. } if value == "request.prompt_tokens" && *reason == "at least one field or signal of the worker beside the request's own values"),
         "{error}"
     );
 }

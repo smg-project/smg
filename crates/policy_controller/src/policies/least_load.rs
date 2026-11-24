@@ -29,7 +29,7 @@ use crate::{
         scorers::{normalize_costs, ReadsLoad, PENDING, TIE_EPSILON_SECS},
     },
     tracking::{
-        dispatch_credit::{DispatchCredit, DispatchCreditPass},
+        dispatch_credit::{DispatchCredit, ReportedSends, SentSettings},
         in_flight::with_counts,
         lease::{EventKind, EventSet, Lease, Membership, Side},
     },
@@ -43,6 +43,7 @@ pub(crate) fn profile() -> ProfileSpec {
         score: vec!["least-load".into()],
         pick: "best".into(),
         sent_ttl_ms: None,
+        sent_report_delay_ms: None,
     }
 }
 
@@ -71,14 +72,14 @@ impl LeastLoad {
                 kv_pressure_weight,
                 mean_prefill_tokens,
                 default_throughput,
-                Arc::new(DispatchCredit::new("", None)),
+                Arc::new(DispatchCredit::new("", SentSettings::default())),
             )
         }
     }
 
     /// The stage over its profile's count of sends, as a document builds
     /// it: the profile's other readers read the same sends, and the
-    /// profile's time limit ends them here too.
+    /// profile's time limit and report delay hold here too.
     pub(crate) fn of_profile(
         kv_pressure_weight: f32,
         mean_prefill_tokens: u32,
@@ -272,18 +273,19 @@ impl LeastLoad {
     }
 
     /// Writes each reporting row's credit work and marks each row without
-    /// a report, and says how many report. `TIMED` is whether the count
-    /// sets a time limit ([`DispatchCredit::limited`]): the pass of a count
-    /// with none reads each row by its sample alone.
+    /// a report, and says how many report. Built once for each of the
+    /// count's two passes ([`DispatchCredit::limited`]): the pass of a count
+    /// with no time limit and no report delay reads each row by its sample
+    /// alone.
     #[inline(always)]
-    fn credit_pass<const TIMED: bool>(
+    fn credit_pass(
         &self,
         facts: &RequestFacts<'_>,
         candidates: &[Candidate],
         rows: &[u32],
         out: &mut [f32],
         load: impl Fn(&Candidate) -> Option<&LoadRow> + Copy,
-        sends: &DispatchCreditPass<'_>,
+        sends: &impl ReportedSends,
     ) -> usize {
         let mean = u64::from(self.mean_prefill_tokens);
         let mut reporting = 0usize;
@@ -292,7 +294,7 @@ impl LeastLoad {
                 let c = &candidates[i as usize];
                 *slot = match load(c) {
                     Some(report) => {
-                        let sent = sends.reported::<TIMED>(c);
+                        let sent = sends.reported(c);
                         let tokens = sent.tokens + u64::from(sent.unsized_requests) * mean;
                         reporting += 1;
                         self.credit_work(report, counts(c), tokens, u64::from(sent.requests))
@@ -326,10 +328,10 @@ impl LeastLoad {
         // allocation.
         let reporting = if self.sent.limited() {
             let sends = self.sent.pass(facts);
-            self.credit_pass::<true>(facts, candidates, rows, out, load, &sends)
+            self.credit_pass(facts, candidates, rows, out, load, &sends)
         } else {
             let sends = self.sent.reads_unlimited();
-            self.credit_pass::<false>(facts, candidates, rows, out, load, &sends)
+            self.credit_pass(facts, candidates, rows, out, load, &sends)
         };
         let mut mean = None;
         let mut nominal = || *mean.get_or_insert_with(|| self.mean_rate(candidates, kept, load));
@@ -961,7 +963,7 @@ mod tests {
             pair: Some(Pair {
                 decode_position: 0,
                 decode_id: WorkerId(2),
-                decode_dp_rank: 0,
+                ..Pair::default()
             }),
         };
         scorer.on_dispatched(&lease, &target, Side::Prefill, 0);
@@ -1037,6 +1039,7 @@ mod tests {
                 decode_position: 1,
                 decode_id: WorkerId(7),
                 decode_dp_rank: 1,
+                ..Pair::default()
             }),
         };
         ll.on_dispatched(&lease, &pair, Side::Decode, 0);

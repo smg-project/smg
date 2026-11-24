@@ -6,31 +6,25 @@ use std::time::Instant;
 /// The table of counts the leases on file book and a member's place in
 /// it, named here for the store's files that write it: their home is the
 /// counts' own module.
-pub(super) use crate::tracking::in_flight::{InFlightCounts, WorkerSlot};
+pub(super) use crate::tracking::in_flight::{HostCount, InFlightCounts, WorkerSlot};
 use crate::{
     engine::{
-        decision::{Targets, MAX_TARGETS},
-        decision_engine::DecodeRefused,
+        decision::{
+            Decision, LiftedVeto, Pick, Survivors, Target, Targets, Trace, MAX_TARGETS, TRACE_TOP,
+        },
+        decision_engine::{DecodeRefused, HeldDecision, HeldDecode},
+        sticky_sessions::SessionVerdict,
         view::{Session, WorkerId},
     },
     store::GatewayId,
-    tracking::lease::{Dispatch, Lease, LeaseId, Outcome, ReleaseReason, Side},
+    tracking::lease::{Dispatch, Lease, LeaseId, Outcome, ReleaseReason, Said, Side},
 };
 
 /// The state of a single's lease or of one side of a pair's lease.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LeaseState {
-    /// Decided, not yet dispatched; the dispatch deadline bounds this. It
-    /// holds the TTL of the sessions rule the lease's decision was made
-    /// under, in microseconds, for the commit that ends the key's pin of
-    /// record by it: `u64::MAX` under a rule with no TTL and under no
-    /// rule, the session table's own form. The state has the room, so
-    /// no record grows for it. It dies at the dispatch, and no replica
-    /// is sent a lease's record: a log row of a lease's issue, when one
-    /// comes, carries it.
-    Issued {
-        session_ttl_micros: u64,
-    },
+    /// Decided, not yet dispatched; the dispatch deadline bounds this.
+    Issued,
     /// Dispatched to its target at `at`.
     Dispatched {
         at: Instant,
@@ -52,40 +46,15 @@ impl LeaseState {
     /// Whether a frame still moves a lease that stands so: issued or
     /// dispatched.
     pub const fn is_live(self) -> bool {
-        matches!(self, Self::Issued { .. } | Self::Dispatched { .. })
+        matches!(self, Self::Issued | Self::Dispatched { .. })
     }
 
-    /// Issued under no sessions rule, or under a rule with no TTL.
-    pub const ISSUED: Self = Self::Issued {
-        session_ttl_micros: u64::MAX,
-    };
-
-    /// Issued under a sessions rule of this TTL; `None`: a rule with no
-    /// TTL, or no rule.
-    pub fn issued(session_ttl_micros: Option<u64>) -> Self {
-        Self::Issued {
-            session_ttl_micros: session_ttl_micros.unwrap_or(u64::MAX),
-        }
-    }
+    /// The issued state, by the name its callers write.
+    pub const ISSUED: Self = Self::Issued;
 
     /// Whether the lease still waits for its dispatch.
     pub fn is_issued(self) -> bool {
-        matches!(self, Self::Issued { .. })
-    }
-
-    /// The TTL an issued lease's rule ends its key's pin by; `None` under
-    /// a rule with no TTL, under no rule, and once the lease left the
-    /// issued state. The pin's writer takes `None` as no end at all, so
-    /// it asks [`Self::is_issued`] first: the door tells a side's dispatch
-    /// once, with the side as it stood before its dispatch was written,
-    /// and a side past that state pins nothing by its lease's rule.
-    pub fn session_ttl_micros(self) -> Option<u64> {
-        match self {
-            Self::Issued { session_ttl_micros } if session_ttl_micros != u64::MAX => {
-                Some(session_ttl_micros)
-            }
-            _ => None,
-        }
+        matches!(self, Self::Issued)
     }
 }
 
@@ -321,7 +290,91 @@ impl Sides {
             told(lease);
         }
     }
+
+    /// Calls `told` with a single's lease as a host that held its decision
+    /// would lend it with `said` ([`HeldDecision`]): the view a request's
+    /// guard lends its engine, made from the record on file. `None`, and
+    /// no call, for a pair's lease, which is no single's, and for a
+    /// dispatch that names no target of the pick: it tells nothing of the
+    /// lease.
+    ///
+    /// The parts are read as they stood before the word:
+    ///
+    /// - **The lease** is the record's own as it stands: the lease as
+    ///   issued until a dispatch, and behind one the lease on the index and
+    ///   the worker the dispatch took, which every word behind a dispatch
+    ///   is told under.
+    /// - **The target** is the one the word is about. A dispatch names it
+    ///   by its frame's index. An end and a release name the one the lease
+    ///   books.
+    /// - **The pick** is one of no target: no word of a single carries its
+    ///   pick to a stage.
+    /// - **The decode side** is a single's, as a guard lends it: no
+    ///   session, the lease's own three sizes, never chosen.
+    ///
+    /// The view is made in this call's frame and lent there: no part of it
+    /// is moved, and no pick is built.
+    #[inline]
+    pub fn with_held_single<R>(
+        &self,
+        said: Said,
+        told: impl FnOnce(&HeldDecision<'_>) -> R,
+    ) -> Option<R> {
+        if self.decode.is_some() {
+            return None;
+        }
+        let record = &self.record;
+        let own = record.lease.target_index;
+        let (index, (id, dp_rank)) = match said {
+            Said::Dispatched(dispatch, _) => {
+                let index = dispatch.target_index;
+                (index, record.target_at(index)?)
+            }
+            // An end is of the worker the lease books, whatever its index.
+            Said::Completed(_) | Said::Released(..) => {
+                let booked = record.target_at(own);
+                (own, booked.unwrap_or((record.target, 0)))
+            }
+        };
+        let lease = record.own();
+        let target = Target {
+            id,
+            dp_rank,
+            ..Target::default()
+        };
+        Some(told(&HeldDecision {
+            decision: &EMPTY_PICK,
+            lease: &lease,
+            index,
+            target: &target,
+            decode: HeldDecode {
+                session: Session::NONE,
+                tokens: lease.tokens,
+                chars: lease.chars,
+                bytes: lease.bytes,
+                chosen: false,
+            },
+        }))
+    }
 }
+
+/// The pick lent with a single's lease ([`Sides::with_held_single`]): no
+/// target, under no trace. A file keeps of a single's pick the workers a
+/// dispatch names by its index, and lists none of them for a word: no word
+/// of a single carries its pick to a stage.
+static EMPTY_PICK: Decision = Decision::Pick(Pick {
+    targets: Targets::new(),
+    trace: Trace {
+        profile: Trace::NO_PROFILE,
+        survivors: Survivors::counted(0),
+        top: [(WorkerId(0), 0.0); TRACE_TOP],
+        top_len: 0,
+        seed: 0,
+        generation: 0,
+        lifted: LiftedVeto::None,
+    },
+    session_verdict: SessionVerdict::None,
+});
 
 /// Why a lease was not recorded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

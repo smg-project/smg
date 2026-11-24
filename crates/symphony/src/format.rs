@@ -160,7 +160,10 @@ pub enum CallSyntax {
     /// the one the family's model writes before its first call, when the table names one
     /// (`<|python_tag|>`, the token Llama 3.1's template reserves for a call): read at the output's
     /// start only and dropped as the template's wrapping, so that an output with it and one without
-    /// read the same.
+    /// read the same. A table with a row into its arguments state and no call marker (Command)
+    /// reads the same between its markers, where text in place of the calls is malformed. The
+    /// engine picks that reading for the table as a whole, as it picks the framed list for
+    /// [`Self::JsonList`]: every call of such a table reads so, one the turn starts in included.
     JsonAlone(Option<&'static str>),
     /// An XML tree of arguments: `<invoke name="…">`, then one element per argument, `<key>` to
     /// `</key>`, nested for an object and with `<item>` elements for a list, typed by the request's
@@ -919,9 +922,13 @@ impl Format {
     /// answer (the response tags, the message close) frame the answer, not the thought, and stay
     /// dropped on every row they move: the think tags the model wrote stay and the answer comes
     /// back bare, and a thought that the response tag itself ends runs straight into the answer.
-    /// A state's own text rows stay with it: a trimmed stay is still trimmed, a framing state's
-    /// text still dropped; and a tag the end cut short is still dropped, as the legacy parsers
-    /// drop it on both their paths.
+    /// A marker whose every row stays in a content state (Command's response tags) frames the
+    /// answer inside that state and is not shown here: it stays dropped, or stays shown where
+    /// [`Self::without_calls`] showed it (a call's marker on a row inside its own region). A
+    /// marker that also moves the engine (a template's one close for its answer and its thought)
+    /// is shown as before. A state's own text rows stay with it: a trimmed stay is still
+    /// trimmed, a framing state's text still dropped; and a tag the end cut short is still
+    /// dropped, as the legacy parsers drop it on both their paths.
     /// A table without a thought changes only in what it shows; the thought-first mark and the
     /// layout, which serve the tags alone, go. A marker with no row out of the thought's state is
     /// its text and counts no malformed run, as in the table (`Self::is_remade`), so an output
@@ -939,7 +946,15 @@ impl Format {
             .iter()
             .filter(|row| {
                 let answer = |state: usize| self.emits(state) == Emits::Content;
-                wrapped && ((row.from == 0 && answer(row.to)) || (row.to == 0 && answer(row.from)))
+                let stays = |on: usize| {
+                    self.transitions
+                        .iter()
+                        .filter(|other| other.on == on)
+                        .all(|other| other.from == other.to && answer(other.to))
+                };
+                (wrapped
+                    && ((row.from == 0 && answer(row.to)) || (row.to == 0 && answer(row.from))))
+                    || stays(row.on)
             })
             .map(|row| row.on)
             .collect();
@@ -1574,6 +1589,88 @@ impl Format {
     /// thinking turned off opens and closes it there.
     pub fn reasoning_open(&self, prompt: &str) -> bool {
         self.emits(self.prompt_state(prompt)) == Emits::Reasoning
+    }
+
+    /// The prompt to replay in the place of the one a caller does not have, for a whole `text`
+    /// read with no prompt, as a route that parses a text by a parser's name reads it. Where
+    /// `text` began inside a thought its prompt opened: the turn's opener and behind it the
+    /// marker that opens the thought, or the turn anchor that starts in the thought (Hy4's
+    /// prompt opens the thought, so its output holds `</think:opensource>` and nothing that
+    /// opens a thought before it). The first marker of `text` that the turn's start or a thought
+    /// has a row for tells it: the text began inside when that marker's rows all leave one
+    /// thought, and a prompt the table knows replays into that thought. Any other text starts
+    /// where the turn does, with the turn's opener: one that opens its thought or a call first,
+    /// one whose table reads the close from the turn's start too (MiniMax M3's), and one with no
+    /// such marker. A text that opens its turn itself, where the table reads the opener from an
+    /// unopened turn's start (Inkling 2's), replays the turn's end, which opens none. The answer
+    /// is a guess from the text alone: a close the model wrote as plain text ahead of every such
+    /// marker (in its answer, in a string of a JSON answer or of a call no marker opens) reads as
+    /// the end of a thought, and a text that began inside an answer the prompt opened by a marker
+    /// of its own (Kimi K3's) starts where the turn does, outside that answer, which is lost
+    /// there as it is with no prompt at all. A caller that has the prompt replays the prompt.
+    pub fn unprompted(&self, text: &str) -> String {
+        let opener = self.turn_opener().unwrap_or_default();
+        if let Some(unopened) = &self.unopened {
+            let read = |row: &Transition| {
+                row.from == unopened.state && self.terminal_text(row.on) == opener
+            };
+            if self.transitions.iter().any(read) && text.trim_start().starts_with(opener) {
+                return unopened.end.clone();
+            }
+        }
+        let start = self.prompt_state(opener);
+        let thinks = |state: usize| self.emits(state) == Emits::Reasoning;
+        let mut scanner = self.scanner();
+        let mut rest = text;
+        // In bounded parts, so that the first marker that decides ends the read.
+        loop {
+            let (part, behind) = rest.split_at(rest.floor_char_boundary(4096));
+            let scanned = if part.is_empty() {
+                scanner.finish()
+            } else {
+                scanner.feed(part)
+            };
+            for piece in scanned.pieces() {
+                let Piece::Marker(on) = piece else { continue };
+                // The rows the parser reads the marker by, its recovery rows among them.
+                let rows = || {
+                    let recovery = self.recovery_transitions.iter();
+                    self.transitions
+                        .iter()
+                        .chain(recovery.filter(move |_| !self.shown(on)))
+                        .filter(move |row| row.on == on)
+                };
+                if !rows().any(|row| row.from == start || thinks(row.from) || thinks(row.to)) {
+                    continue;
+                }
+                let thought = rows().next().map_or(start, |row| row.from);
+                if !thinks(thought) || !rows().all(|row| row.from == thought && !thinks(row.to)) {
+                    return opener.to_string();
+                }
+                let turns = self.turn_texts();
+                let inside = turns
+                    .iter()
+                    .copied()
+                    .chain(turns.is_empty().then_some(""))
+                    .find_map(|turn| {
+                        let from = self.prompt_state(turn);
+                        let prompt = if from == thought {
+                            turn.to_string()
+                        } else {
+                            let mut rows = self.transitions.iter();
+                            let opens = rows.find(|row| row.from == from && row.to == thought)?;
+                            format!("{turn}{}", self.terminal_text(opens.on))
+                        };
+                        (self.prompt_state(&prompt) == thought).then_some(prompt)
+                    });
+                return inside.unwrap_or_else(|| opener.to_string());
+            }
+            if part.is_empty() {
+                return opener.to_string();
+            }
+            scanner.reclaim(scanned);
+            rest = behind;
+        }
     }
 
     /// Whether `prompt` closed the thought itself and wrote what the template writes after the
@@ -2505,6 +2602,15 @@ mod tests {
     }
 
     #[test]
+    fn without_reasoning_shows_a_close_the_thought_and_the_answer_share() {
+        // A template's one close for its answer and its thought: its row out of the thought moves
+        // the engine, so it stays shown though its other row stays in the content.
+        let shared = two_states().transition("content", "close", "content");
+        let (content, reasoning, _) = said(&events(shared.without_reasoning(), "", "<a>Hm.</a>OK"));
+        assert_eq!((content.as_str(), reasoning.as_str()), ("<a>Hm.</a>OK", ""));
+    }
+
+    #[test]
     fn a_stop_row_names_an_arguments_state() {
         let format = Format::new("stop")
             .terminal("open", "<call>")
@@ -2835,6 +2941,64 @@ mod tests {
             said(&shown),
             ("a thought</a>an answer".to_string(), String::new(), 0)
         );
+    }
+
+    #[test]
+    fn a_text_with_no_prompt_begins_inside_the_thought_whose_close_stands_first() {
+        use crate::formats::{
+            deepseek_v3_2, hy4, inkling2, kimi_k3::kimi_k3, minimax_m3, qwen3::qwen3,
+        };
+        let qwen3 = || qwen3(CallSyntax::Json);
+        let straddling = format!("{}</think:opensource>a", "r".repeat(4094));
+        for (format, text, prompt) in [
+            // The prompt had opened the thought: its close stands first.
+            (
+                hy4(),
+                "r</think:opensource>a",
+                "<｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource>",
+            ),
+            // The same, where a turn anchor starts in the thought.
+            (
+                deepseek_v3_2(),
+                "r</think>a",
+                "<｜Assistant｜><think>",
+            ),
+            // A close the parser reads inside a thought by a recovery row stands first: it
+            // decides, and the thought's close behind it tells nothing.
+            (
+                kimi_k3(),
+                "r<|close|>response<|sep|><|close|>think<|sep|>",
+                "<|open|>message role=\"assistant\"<|sep|>",
+            ),
+            // A call stands first: the close inside its argument is the argument's text.
+            (
+                qwen3(),
+                "<tool_call>\n{\"name\": \"f\", \"arguments\": {\"x\": \"</think>\"}}\n</tool_call>",
+                "<|im_start|>assistant",
+            ),
+            // The text opens its turn itself, behind whitespace the table drops.
+            (
+                inkling2(),
+                "\n<|message_model|><|content_text|>ok<|end_message|>",
+                "<|end_message|>",
+            ),
+            // The thought's close cut in two by the end of the first part the function reads.
+            (
+                hy4(),
+                straddling.as_str(),
+                "<｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource>",
+            ),
+            // No marker that decides, to the end of the text: the turn's opener.
+            (
+                hy4(),
+                "just an answer",
+                "<｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜>",
+            ),
+            // A close the table also reads from the turn's start tells nothing.
+            (minimax_m3(), "r</mm:think>a", "]~b]ai\n"),
+        ] {
+            assert_eq!(format.unprompted(text), prompt, "{text:?}");
+        }
     }
 
     #[test]

@@ -24,6 +24,18 @@ use crate::{
 /// pick on file. One that panics at another decision's issue, or at the
 /// release of a lease its decision gives up, costs that request its
 /// decision.
+///
+/// Under a sessions rule that says so (`rule_placed: untold`), a stage in
+/// a gateway's own process hears neither the issue nor the dispatch of a
+/// single request the rule placed alone: a pin of the request's key
+/// followed, or the rule's own assignment. No stage placed that request,
+/// as a gateway's sticky map keeps a request it places from the gateway's
+/// policy. Its completion and its release are told as any request's, so a
+/// stage hears an end whose issue and dispatch it did not hear: a stage
+/// matches an end by the lease's id ([`Lease::id`]), and moves no count by
+/// an end it cannot match. A host that tells a lease's words off its file
+/// keeps no word of who placed a request: it tells such a request as it
+/// tells any other.
 pub trait Lifecycle: Send + Sync {
     /// The engine issued `decision` under `lease`. Its host filed the
     /// lease as it issued it, in process as behind a served controller:
@@ -83,15 +95,24 @@ pub trait Lifecycle: Send + Sync {
     /// that takes no lock does not.
     fn on_membership(&self, _change: &Membership<'_>) {}
 
-    fn on_signal(&self, _signal: &Signal) {}
+    /// A signal about one worker: a load row, a health change or a
+    /// gateway's veto. A load row lends its report's named values for
+    /// this call alone ([`Signal::Load`]): a stage copies out what it
+    /// keeps, and a cell is `Copy`. The word does not outlive the call.
+    fn on_signal(&self, _signal: &Signal<'_>) {}
 
     /// Whether the stage keeps a number of each rank's report, which a host
-    /// tells it before it shows a decision that report ([`Signal::Load`]
-    /// with the rank's slot and the report's sample instant). `false` by
+    /// tells it ([`Signal::Load`] with the report's sample instant, with
+    /// the rank's slot where the host keeps counts, and with the report's
+    /// named values where the host states them). The policy store tells
+    /// every report before it shows a decision that report. The engine over
+    /// a host's worker lists tells a report that is new before it keeps the
+    /// report's snapshot for its decisions, and its own doc names the
+    /// reports a decision can read first. `false` by
     /// default: a host tells no report to an engine none of whose stages
     /// keeps one, and such a stage decides the same untold. The engine asks
     /// once, at its build: the answer is the stage's for the engine's life.
-    /// A host tells such a stage under its own locks, as the policy store
+    /// A host may tell such a stage under its own locks, as the policy store
     /// does under its membership and load locks: a stage that calls from
     /// that word a door of the host that takes one of them waits on itself.
     fn keeps_loads(&self) -> bool {
@@ -107,8 +128,10 @@ pub trait Lifecycle: Send + Sync {
     /// leave, and not yet of the end of a lease whose gateway was let go: it
     /// refuses a document that names such a stage as not in this build
     /// ([`crate::document::SpecError::NotInBuild`]). A host that embeds the engine
-    /// makes every call. `false` by default: a stage that takes a call to
-    /// shed state early decides the same without it.
+    /// makes every call, and under a sessions rule that says so it leaves
+    /// out the two the trait's own note names. `false` by
+    /// default: a stage that takes a call to shed state early decides the
+    /// same without it.
     fn needs_lifecycle(&self) -> bool {
         false
     }
@@ -176,7 +199,7 @@ impl<T: Lifecycle + ?Sized> Lifecycle for Box<T> {
         (**self).on_membership(change);
     }
 
-    fn on_signal(&self, signal: &Signal) {
+    fn on_signal(&self, signal: &Signal<'_>) {
         (**self).on_signal(signal);
     }
 
@@ -214,7 +237,7 @@ mod tests {
             self.0.fetch_add(1, Ordering::Relaxed);
         }
 
-        fn on_signal(&self, _: &Signal) {
+        fn on_signal(&self, _: &Signal<'_>) {
             self.0.fetch_add(1, Ordering::Relaxed);
         }
 

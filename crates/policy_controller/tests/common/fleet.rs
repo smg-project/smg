@@ -5,10 +5,6 @@
 //! Included by path beside `common/engines.rs` and `common/net.rs` (the
 //! including binary names them `engines` and `net`).
 //!
-//! A second holder, [`Embedded`], is the same fleet under a host that
-//! embeds the engine: no controller, the store in the case's own hands,
-//! the same engines and the same stand-in prober.
-//!
 //! Every fact the store holds of an engine came from that engine, through a
 //! sink. Loads are the controller's own load driver's: the harness writes no
 //! load row. Health and KV events are the controller's own where its build
@@ -20,9 +16,8 @@
 //! that feature has no driver of either, so there each stands in for one.
 //! The dialer writes what it heard, never what the case knows, and the
 //! listener decodes each batch into the events an index applies and hands
-//! it to the sink. A host that embeds the engine ([`Embedded`]) has no
-//! controller, so its dialer writes in every build. A dial is bounded, so
-//! an engine that stops answering costs a turn that bound and no more.
+//! it to the sink. A dial is bounded, so an engine that stops answering
+//! costs a turn that bound and no more.
 //!
 //! An engine speaks the wire of its kind ([`Shape::runtime`]): the fleet's
 //! first wire, or the one whose load report counts resident tokens. The
@@ -33,10 +28,10 @@
 //! A fleet registers as an operator's does ([`Harness::register`]): an
 //! engine of one rank is an add on the control listener, under the name the
 //! harness states there. The call makes one rank, so a rank of a wider
-//! engine is still the store's membership write. The view a case reads
-//! ([`Harness::view`]) is the store's handle too, and gives way to the
-//! decisions the service answers. A case calls the handle alone, so neither
-//! move rewrites a case.
+//! engine is still the store's membership write. The rows a case reads
+//! ([`Harness::pool`]) are the store's too: its workers' table and its load
+//! table, as the controller's own writers left them. A case calls the
+//! handle alone, so a move of either rewrites no case.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -79,13 +74,14 @@ use smg_policy_controller::{
     },
     stages::StageRegistry,
     store::{
-        BatchFacts, BatchOutcome, GatewayId, HealthPolicy, HealthSink, JournalKinds, KvCursor,
-        KvEvent, KvEventSink, LaneCounts, LeaseState, MembershipChange, MembershipTail,
-        MemoryStore, ResyncReason, SequenceHash, Signals, StoredBlock, ViewBuffers, ViewQuery,
-        WorkerFacts, WorkerStatus, WorkersStore,
+        BatchFacts, BatchOutcome, GatewayId, HealthPolicy, HealthSink, KvCursor, KvEvent,
+        KvEventSink, LaneCounts, LeaseState, LoadSink, MembershipChange, MembershipTail,
+        MemoryStore, ResyncReason, SequenceHash, Signals, StoredBlock, WorkerFacts, WorkerStatus,
+        WorkersStore,
     },
-    tracking::{LeaseId, TransportClass},
+    tracking::LeaseId,
 };
+use smg_worker::load::state::LoadReceiver;
 use tokio::{
     io::{copy, sink},
     net::{TcpListener, TcpStream},
@@ -202,7 +198,7 @@ pub struct Shape {
     pub runtime: RuntimeType,
 }
 
-/// One row of a pool as a view reads it, named by the engine that
+/// One row of a pool as the store holds it, named by the engine that
 /// registered it.
 #[derive(Clone, Copy, Debug)]
 pub struct Seen {
@@ -210,9 +206,6 @@ pub struct Seen {
     pub engine: usize,
     pub rank: u16,
     pub healthy: bool,
-    /// Whether the row reads overloaded: its engine's reports against the
-    /// thresholds that stand for it.
-    pub overloaded: bool,
     pub load: Option<LoadRow>,
 }
 
@@ -413,6 +406,9 @@ pub struct Replica {
     control: SocketAddr,
     replication: SocketAddr,
     store: Arc<MemoryStore>,
+    /// The channel of the controller's load monitor: what a decision is
+    /// given of its workers' load.
+    loads: LoadReceiver,
     readiness: Readiness,
     stop: Option<oneshot::Sender<()>>,
     serve: JoinSet<Result<(), Error>>,
@@ -437,7 +433,6 @@ pub struct Harness {
     sent: u64,
     /// The spec generations applied so far.
     generation: u64,
-    buffers: ViewBuffers,
     stop_feeds: watch::Sender<bool>,
     feeds: JoinSet<()>,
     /// Whether the controller the harness asks elects over a lease file: a
@@ -648,8 +643,7 @@ async fn start_engine(ranks: u16, runtime: RuntimeType) -> Result<Engine, String
 }
 
 /// One rank written into the store by its membership write, pending: a
-/// rank of a wider engine under a controller, and every rank of a fleet
-/// that has no control listener.
+/// rank of a wider engine under a controller.
 fn written(store: &MemoryStore, endpoint: &str, shape: &Shape, rank: u16) -> WorkerId {
     store
         .upsert(WorkerFacts {
@@ -1146,6 +1140,7 @@ impl Replica {
             .of(Scope::Replication)
             .ok_or("the controller has no replication listener")?;
         let store = controller.store();
+        let loads = controller.loads();
         let readiness = controller.readiness();
         let (stop, stopped) = oneshot::channel::<()>();
         let mut serve = JoinSet::new();
@@ -1161,6 +1156,7 @@ impl Replica {
             control,
             replication,
             store,
+            loads,
             readiness,
             stop: Some(stop),
             serve,
@@ -1258,7 +1254,6 @@ impl Harness {
             held: Vec::new(),
             sent: 0,
             generation: 0,
-            buffers: ViewBuffers::default(),
             stop_feeds,
             feeds: JoinSet::new(),
             elects: false,
@@ -1303,21 +1298,24 @@ impl Harness {
         Ok((client, operator))
     }
 
-    /// How many of the fleet's ranks `standby`'s own store holds ready
-    /// with a load row beside them: what a controller that follows has of
-    /// its leader's log. A row no registration made is an error.
+    /// How many of the fleet's ranks `standby`'s own store holds ready:
+    /// what a controller that follows has of its leader's log. A row no
+    /// registration made is an error, and so is a load row: a leader sends
+    /// a standby none, and a standby polls nobody.
     pub fn followed(&self, standby: &Replica) -> Result<usize, String> {
-        let cut = standby.store.checkpoint(JournalKinds::All);
+        let cut = standby.store.checkpoint();
         let mut held = 0;
         for row in &cut.rows {
+            if standby.store.ranks(row.id) > 0 {
+                return Err(format!("the standby holds a load row: {:?}", row.id));
+            }
             if !self.members.contains_key(&row.id) {
                 return Err(format!(
                     "the standby holds a row no registration made: {:?}",
                     row.id
                 ));
             }
-            let loaded = cut.loads.iter().any(|(id, _, _)| *id == row.id);
-            if row.status == WorkerStatus::Ready && loaded {
+            if row.status == WorkerStatus::Ready {
                 held += 1;
             }
         }
@@ -1429,8 +1427,8 @@ impl Harness {
             let mut ids = Vec::with_capacity(usize::from(shape.ranks));
             for rank in 0..shape.ranks {
                 let id = self.member(&endpoint, shape, rank).await?;
-                // The build this registration owes, asked: the cases read
-                // the row at once.
+                // The build this registration owes, asked: a decision asked
+                // right behind it reads the row.
                 self.store.publish_now();
                 self.members.insert(id, (engine, rank));
                 ids.push(id);
@@ -1664,37 +1662,49 @@ impl Harness {
         Ok(())
     }
 
-    /// The pool serving `model` in `role` as a decision's view reads it at
-    /// this instant, each row named by its engine. Until the service
-    /// answers decisions this is what a case reads back.
-    pub fn view(&mut self, model: &str, role: Role) -> Result<Vec<Seen>, String> {
-        let ask = ViewQuery {
-            gateway: GatewayId::LOCAL,
-            now: Instant::now(),
-            pinned: None,
-            affinity: false,
-            signal_cells: false,
-        };
-        if self
-            .store
-            .build_view(model, role, &ask, &mut self.buffers)
-            .is_none()
-        {
-            return Ok(Vec::new());
-        }
-        self.buffers
-            .candidates
-            .iter()
+    /// Whether the controller's load monitor has published, for every row
+    /// of each of `engines`, a report sampled at or after `since`. A
+    /// decision is given the monitor's snapshot, where [`Self::pool`] reads
+    /// the store's load table: the monitor polls on its own clock.
+    pub fn monitored(&self, engines: &[usize], since: Instant) -> bool {
+        let snapshot = self.replica.loads.borrow();
+        let mut rows = self.members.iter();
+        rows.all(|(id, (engine, _))| {
+            if !engines.contains(engine) {
+                return true;
+            }
+            let row = WorkersStore::get(self.store.as_ref(), *id);
+            row.is_some_and(|row| {
+                let report = snapshot.report(&row.facts.key);
+                report.is_some_and(|(_, sampled)| sampled >= since)
+            })
+        })
+    }
+
+    /// The pool serving `model` in `role` as the store holds it at this
+    /// instant, each row named by its engine: the rows of the workers'
+    /// table that serve the model in that role. A row is healthy where its
+    /// status is ready, and its load is the row its engine's reports left
+    /// in the load table. The rows come in the table's order, by
+    /// registration key: no case reads their order. The overload verdict
+    /// is no part of a row here: a case reads a veto in the picks the
+    /// service answers.
+    pub fn pool(&self, model: &str, role: Role) -> Result<Vec<Seen>, String> {
+        let (_, mut rows) = self.store.all_rows();
+        rows.retain(|row| {
+            row.facts.role == role && row.facts.models.iter().any(|served| served == model)
+        });
+        rows.iter()
             .map(|row| {
                 let (engine, rank) = *self.members.get(&row.id).ok_or_else(|| {
-                    format!("the view holds a row no registration made: {:?}", row.id)
+                    format!("the store holds a row no registration made: {:?}", row.id)
                 })?;
+                let load = self.store.load(row.id, row.facts.dp_rank);
                 Ok(Seen {
                     engine,
                     rank,
-                    healthy: row.health.healthy,
-                    overloaded: row.health.overloaded,
-                    load: row.load,
+                    healthy: row.status == WorkerStatus::Ready,
+                    load: load.map(|sample| sample.row),
                 })
             })
             .collect()
@@ -1901,16 +1911,6 @@ impl Harness {
             .is_some_and(|record| matches!(record.state, LeaseState::Dispatched { .. }))
     }
 
-    /// The row the store's pin of record names for `session`, the value a
-    /// lease states of its request's session; `None` where the store pins
-    /// the session nowhere.
-    pub fn pinned(&self, session: u64) -> Option<(usize, u16)> {
-        // By the trait's path, as `leases` reads the file.
-        let pin =
-            smg_policy_controller::store::SessionsStore::lookup(self.store.as_ref(), session)?;
-        self.named(pin.worker.0)
-    }
-
     /// Whether the store holds a completion of class ok by the gateway named
     /// `gateway` on the first rank of the engine at `engine`, at or after
     /// `since`: the read a decision's precedence rule makes of one
@@ -2072,158 +2072,5 @@ impl Harness {
             }
         }
         self.replica.stop().await
-    }
-}
-
-/// A fleet under a host that embeds the engine: the same engines and the
-/// same stand-in prober, over a store of the case's own process with no
-/// controller beside it. A store has one host at its files, so every
-/// decision over this fleet is its door's.
-pub struct Embedded {
-    store: Arc<MemoryStore>,
-    engines: Vec<Engine>,
-    probed: Arc<Mutex<Vec<Probed>>>,
-    turns: Arc<Turns>,
-    stop_feeds: watch::Sender<bool>,
-    feeds: JoinSet<()>,
-}
-
-impl Embedded {
-    /// A store of `deciders` files of leases with `document` applied as
-    /// its first generation, and no engine yet.
-    pub fn start(deciders: usize, mut document: PolicySpec) -> Result<Self, String> {
-        let store = MemoryStore::new().with_decision_slots(deciders);
-        document.generation = 1;
-        let spec = AppliedSpec::validate(&document).map_err(|error| error.to_string())?;
-        store.apply(spec).map_err(|error| error.to_string())?;
-        let (stop_feeds, _) = watch::channel(false);
-        Ok(Self {
-            store: Arc::new(store),
-            engines: Vec::new(),
-            probed: Arc::default(),
-            turns: Arc::default(),
-            stop_feeds,
-            feeds: JoinSet::new(),
-        })
-    }
-
-    /// Register: starts one mock engine a shape and writes each of its
-    /// ranks into the store, pending: only a probe's verdict makes a rank
-    /// ready. Returns the engines' indexes, in the shapes' order.
-    pub async fn register(&mut self, shapes: &[Shape]) -> Result<Vec<usize>, String> {
-        let mut started = Vec::with_capacity(shapes.len());
-        for shape in shapes {
-            let running = start_engine(shape.ranks, shape.runtime).await?;
-            let endpoint = running.endpoint.clone();
-            let ranks = 0..shape.ranks;
-            let ids = ranks.map(|rank| written(&self.store, &endpoint, shape, rank));
-            let probed = Probed {
-                engine: self.engines.len(),
-                runtime: shape.runtime,
-                endpoint: endpoint.clone(),
-                ids: ids.collect(),
-            };
-            // The build these registrations owe, asked: the case reads
-            // the rows at once.
-            self.store.publish_now();
-            started.push(probed.engine);
-            self.probed.lock().push(probed);
-            self.engines.push(running);
-        }
-        Ok(started)
-    }
-
-    /// Feed: starts the stand-in prober over every engine registered now
-    /// and later.
-    pub fn feed(&mut self) {
-        self.feeds.spawn(probe(
-            Arc::clone(&self.store),
-            Arc::clone(&self.probed),
-            Arc::clone(&self.turns),
-            self.stop_feeds.subscribe(),
-            true,
-        ));
-    }
-
-    /// The store: the host's door decides over it.
-    pub fn store(&self) -> &Arc<MemoryStore> {
-        &self.store
-    }
-
-    /// The engine a row of the fleet stands for.
-    pub fn engine_of(&self, id: WorkerId) -> Option<usize> {
-        let probed = self.probed.lock();
-        let owner = probed.iter().find(|engine| engine.ids.contains(&id));
-        owner.map(|engine| engine.engine)
-    }
-
-    /// Each engine as a decision of `gateway` reads it in the pool that
-    /// serves `model` at this instant, in the engines' order: whether
-    /// every rank of it reads healthy, and the requests the leases on
-    /// file book on it.
-    pub fn read(&self, model: &str, gateway: GatewayId) -> Vec<(bool, u32)> {
-        let ask = ViewQuery {
-            gateway,
-            now: Instant::now(),
-            pinned: None,
-            affinity: false,
-            signal_cells: false,
-        };
-        let mut out = ViewBuffers::default();
-        self.store.deciding(|world| {
-            if let Some(built) = world.build(model, Role::Single, &ask, &mut out) {
-                world.count_in_flight(&built, &ask, &mut out.candidates);
-            }
-        });
-        let probed = self.probed.lock();
-        let engines = probed.iter().map(|engine| {
-            let rows = out.candidates.iter();
-            let own: Vec<_> = rows.filter(|row| engine.ids.contains(&row.id)).collect();
-            let healthy = own.len() == engine.ids.len() && own.iter().all(|row| row.health.healthy);
-            (healthy, own.iter().map(|row| row.in_flight).sum())
-        });
-        engines.collect()
-    }
-
-    /// Sends one short request named `id` to the engine at `engine` on the
-    /// engine's own wire and reads it to its end, as a host that committed
-    /// its pick sends one: the class the transport read and the frames
-    /// read.
-    pub async fn send(&self, engine: usize, id: &str) -> Result<(TransportClass, u32), String> {
-        let slot = self.engines.get(engine);
-        let endpoint = slot.map(|engine| engine.endpoint.clone());
-        let endpoint = endpoint.ok_or_else(|| format!("no engine {engine}"))?;
-        let (class, frames) = sent(&endpoint, id.to_owned()).await;
-        let class = match class {
-            Class::Ok => TransportClass::Ok,
-            Class::ConnectFailed => TransportClass::ConnectFailed,
-            Class::Timeout => TransportClass::Timeout,
-            _ => TransportClass::ServerError,
-        };
-        Ok((class, frames))
-    }
-
-    /// Kills the engine at `engine`: every socket of it has closed at the
-    /// return.
-    pub async fn kill(&mut self, engine: usize) -> Result<(), String> {
-        let slot = self.engines.get_mut(engine);
-        let slot = slot.ok_or_else(|| format!("no engine {engine}"))?;
-        if slot.die().await? {
-            Ok(())
-        } else {
-            Err(format!("engine {engine} is dead already"))
-        }
-    }
-
-    /// Ends the prober and the engines, each under a bound.
-    pub async fn stop(mut self) -> Result<(), String> {
-        self.stop_feeds.send_replace(true);
-        while let Some(joined) = bounded("a feed ends", ROOM, self.feeds.join_next()).await? {
-            joined.map_err(|error| error.to_string())?;
-        }
-        for engine in &mut self.engines {
-            engine.die().await?;
-        }
-        Ok(())
     }
 }

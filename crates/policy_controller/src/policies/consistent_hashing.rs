@@ -4,7 +4,8 @@
 //! The consistent-hash scorer and the ring it owns: the ring
 //! owner of a decision's key scores first and the ring's next members after
 //! it, so a commit that misses the owner falls to the member the key would
-//! walk to. The ring is the engine's. Its members are the worker ids the
+//! walk to. The ring is the engine's, unless the request's caller lends
+//! its own ([`LentRing`]). Its members are the worker ids the
 //! membership feed names (added, replaced, a snapshot) and, until every host
 //! path feeds additions, the ids a decision's candidates carry: a candidate
 //! the ring does not know joins at its first decision. Each member stands at
@@ -17,12 +18,6 @@
 //! lifecycle prunes (removed, replaced, a snapshot); positions come from the
 //! view, which carries the key. A pruned id is fenced for a while, so a
 //! decision over a stale view does not relearn it.
-//!
-//! A host that keeps its workers in lists of its own can hold the ring of
-//! one list as a value of its own ([`PoolRing`]): the same positions for the
-//! same members, built once and never changed. It lends that ring to each
-//! decision of the list ([`RequestFacts::ring`]), and the scorer then reads
-//! it in place of its own, with no lock.
 //!
 //! The key is the decision's session key: an encode item's content hash under
 //! the `epd` plan, the request's routing key elsewhere. One ring serves every
@@ -41,6 +36,9 @@
 //! the blocks the request was hashed by, text windows at four bytes a
 //! token under the text kind. A request that carries no whole block has no
 //! key, and the tokens past a request's last whole block are not in its key.
+//! On a ring the request's caller lends no block is folded: the prompt's
+//! heads are cut at the token ([`HeadRule::heads`]) and the lender says
+//! where each stands ([`LentRing::head_position`]).
 //!
 //! Under the view's boundaries the prefix is keyed at the deepest boundary
 //! the request reaches, and the form's depth serves a request that reaches
@@ -49,7 +47,7 @@
 //! request to the owner at the next boundary down, so a prompt that grew
 //! past a loaded worker still lands where its head is held.
 
-use std::{cell::RefCell, cmp::Ordering, mem, time::Instant};
+use std::{cell::RefCell, cmp::Ordering, iter, mem, time::Instant};
 
 use parking_lot::{RwLock, RwLockReadGuard};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -63,7 +61,7 @@ use crate::{
     },
     policies::{
         cache_aware::Gates,
-        prefix_hash::{prefix_key, Prefix},
+        prefix_hash::{prefix_key, HeadRule, Prefix},
         standard_filters,
     },
     stages::{lifecycle::Lifecycle, retired_workers::RetiredWorkers},
@@ -71,9 +69,11 @@ use crate::{
     Draw,
 };
 
-mod pool_ring;
+mod lent_ring;
 
-pub use pool_ring::PoolRing;
+#[cfg(test)]
+pub(crate) use lent_ring::InOrder;
+pub use lent_ring::{Head, LentRing};
 
 /// How the `consistent_hashing` policy is composed: its filters, its scorers
 /// and its picker.
@@ -87,18 +87,33 @@ pub(crate) fn profile() -> ProfileSpec {
         score: vec!["consistent-hash".into()],
         pick: "best".into(),
         sent_ttl_ms: None,
+        sent_report_delay_ms: None,
     }
 }
 
 /// The headers the `consistent_hashing` policy reads a request's routing key
-/// from, in order. `header` makes one source from a header's name and whether
-/// the header tells one client from another.
+/// from, in order, and behind them the header a request names its worker
+/// under ([`target_source`]). `header` makes one source from a header's name
+/// and whether the header tells one client from another.
 pub(crate) fn key_sources(header: impl Fn(&str, bool) -> KeySourceSpec) -> Vec<KeySourceSpec> {
     vec![
         header(MANUAL_SESSION_HEADER, false),
         header("x-forwarded-for", true),
         header("cookie", true),
+        target_source(),
     ]
+}
+
+/// The policy's target source: the header a request names its one worker
+/// under, by a number that counts the workers of the request's list
+/// ([`KeySourceSpec::target`]). The gateway's policy of this name alone
+/// reads that header, so no other policy's document names it.
+pub(crate) fn target_source() -> KeySourceSpec {
+    KeySourceSpec {
+        header: Some("x-smg-target-worker".to_string()),
+        target: true,
+        ..KeySourceSpec::default()
+    }
 }
 
 /// Positions per member: an even share of the key space per member for the
@@ -532,29 +547,6 @@ impl Ring {
     }
 }
 
-/// A ring a decision's walk goes round: the scorer's own, whose members are
-/// named by their place among its members, or the ring of one list a host
-/// lent, whose members are named by their rows' places in the list.
-trait Around {
-    /// The members at the ring's positions clockwise from the key's, once
-    /// around.
-    fn around(&self, key: u64) -> impl Iterator<Item = u32> + '_;
-}
-
-impl Around for Ring {
-    #[inline(always)]
-    fn around(&self, key: u64) -> impl Iterator<Item = u32> + '_ {
-        Ring::around(self, key)
-    }
-}
-
-impl Around for PoolRing {
-    #[inline(always)]
-    fn around(&self, key: u64) -> impl Iterator<Item = u32> + '_ {
-        PoolRing::around(self, key)
-    }
-}
-
 /// The walk of a ring: `visit` is shown each of `members` in turn until it
 /// takes one or stops.
 #[inline(always)]
@@ -570,29 +562,6 @@ fn walk<T>(
         }
     }
     None
-}
-
-/// The ring the request's host lent ([`RequestFacts::ring`]), for a decision
-/// over a list of `rows` rows: `None` where none is lent.
-///
-/// A host lends the ring of the list it hands as the candidates and no
-/// other, so a lent ring of another length is its caller's error. A debug
-/// build stops at it. Any other build passes the ring over
-/// ([`ring_of_these`]): the scorer then places by its own ring, behind its
-/// lock, and teaches it the members.
-fn lent_ring<'a>(facts: &RequestFacts<'a>, rows: usize) -> Option<&'a PoolRing> {
-    let lent = facts.ring?;
-    debug_assert_eq!(
-        lent.len(),
-        rows,
-        "a lent ring is the ring of the list the candidates are"
-    );
-    ring_of_these(lent, rows)
-}
-
-/// `lent` where it is the ring of a list of `rows` rows, by its length.
-fn ring_of_these(lent: &PoolRing, rows: usize) -> Option<&PoolRing> {
-    (lent.len() == rows).then_some(lent)
 }
 
 thread_local! {
@@ -663,13 +632,18 @@ impl Iterator for Keys<'_> {
 ///
 /// The owner must be among the rows scored, so the scorer answers for the
 /// pool whole and never row by row ([`Scorer::row_wise`]): a profile that
-/// names it runs its whole pass, with no rows drawn first and no sample.
+/// names it has no rows drawn first and no sample. Its whole pass runs but
+/// for a keyed request the plain ring places by itself, which is decided
+/// by the workers its key reaches ([`Scorer::own`],
+/// [`Scorer::own_by_place`]).
 ///
 /// The ring is the scorer's own, behind a lock its decisions share, unless
-/// the request's host lent the ring of the list the candidates are
-/// ([`RequestFacts::ring`], [`PoolRing`]). A decision under a lent ring
-/// reads that ring alone: it takes no lock, and the scorer's own ring
-/// holds no member for it and learns none. Both rings place a key alike.
+/// the request's caller lent the ring it keeps and says where the request
+/// stands on it ([`RequestFacts::ring`], [`LentRing`]). The scorer then
+/// asks that ring alone: it takes no lock, and its own ring holds no member
+/// for the decision and learns none. Under the bounded-load rule the
+/// request's places on the lent ring are tried in the order stated, as the
+/// keys of a prefix are on the scorer's own.
 #[derive(Debug)]
 pub struct ConsistentHash {
     /// `(factor, abs_margin)` of the bounded-load rule, when the spec writes
@@ -725,7 +699,7 @@ impl ConsistentHash {
     /// `bound`. `slots` is as [`Self::fill`] left it.
     fn passed_over(
         facts: &RequestFacts<'_>,
-        ring: &impl Around,
+        ring: &Ring,
         key: u64,
         candidates: &[Candidate],
         kept: &[u32],
@@ -792,7 +766,7 @@ impl ConsistentHash {
     /// One walk from the key: the members that are survivors are ranked in
     /// ring order into `out`, the owner at `1.0` and each next member a step
     /// below, at most [`MAX_TARGETS`] of them.
-    fn rank(ring: &impl Around, key: u64, survivors: usize, slots: &mut [u32], out: &mut [f32]) {
+    fn rank(ring: &Ring, key: u64, survivors: usize, slots: &mut [u32], out: &mut [f32]) {
         let mut found = 0usize;
         walk(ring.around(key), |member| {
             let slot = slots[member as usize];
@@ -815,8 +789,7 @@ impl ConsistentHash {
     /// The scores of a decision whose `slots` are filled, by `ring`: the
     /// first of the decision's keys whose owner keeps it under the
     /// bounded-load rule, with no rule the first, and that key's walk
-    /// ranked ([`Self::rank`]). One body for the scorer's own ring and for
-    /// a ring its host lent: built once for each, in the decision's path.
+    /// ranked ([`Self::rank`]).
     #[expect(
         clippy::too_many_arguments,
         reason = "the scorer's inputs, with the ring, the slots and the keys still to try"
@@ -825,7 +798,7 @@ impl ConsistentHash {
     fn rank_by(
         &self,
         facts: &RequestFacts<'_>,
-        ring: &impl Around,
+        ring: &Ring,
         candidates: &[Candidate],
         kept: &[u32],
         slots: &mut [u32],
@@ -833,18 +806,7 @@ impl ConsistentHash {
         keys: &mut Option<Keys<'_>>,
         out: &mut [f32],
     ) {
-        let bound = self.bounded.map(|(factor, margin)| {
-            // Both margins over the mean, the request being placed
-            // counted in it: the larger of the two is the bound. The
-            // product is taken as written, in 64-bit floats: an owner
-            // at the bound's edge stands or falls by its last bit.
-            let total: u64 = with_counts!(facts, |counts| kept
-                .iter()
-                .map(|&k| u64::from(counts(&candidates[k as usize])))
-                .sum());
-            let mean = (total as f64 + 1.0) / kept.len() as f64;
-            (mean * factor).max(mean + f64::from(margin))
-        });
+        let bound = self.bound(facts, candidates, kept);
         // The first key whose owner keeps it: with no rule, the first.
         let mut key = Some(first);
         if let Some(bound) = bound {
@@ -860,6 +822,114 @@ impl ConsistentHash {
         }
     }
 
+    /// The bound of the bounded-load rule over the survivors, where the
+    /// spec writes one: the larger of the rule's two margins over the mean
+    /// of the survivors' requests in flight.
+    fn bound(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+    ) -> Option<f64> {
+        self.bounded.map(|(factor, margin)| {
+            // Both margins over the mean, the request being placed
+            // counted in it: the larger of the two is the bound. The
+            // product is taken as written, in 64-bit floats: an owner
+            // at the bound's edge stands or falls by its last bit.
+            let total: u64 = with_counts!(facts, |counts| kept
+                .iter()
+                .map(|&k| u64::from(counts(&candidates[k as usize])))
+                .sum());
+            let mean = (total as f64 + 1.0) / kept.len() as f64;
+            (mean * factor).max(mean + f64::from(margin))
+        })
+    }
+
+    /// The ring the request's caller lent, with where the request stands
+    /// on it ([`RequestFacts::ring_positions`]): the first place stated,
+    /// and the ones behind it, which the bounded-load rule tries in order.
+    /// `None` where none is lent or no place is stated: the scorer's own
+    /// ring places.
+    fn lent<'a>(facts: &RequestFacts<'a>) -> Option<Lent<'a>> {
+        let (&first, behind) = facts.ring_positions.split_first()?;
+        Some((facts.ring?, first, behind))
+    }
+
+    /// The scores of a request placed on the ring its caller lent, by the
+    /// first of its places whose owner keeps it: the first place with no
+    /// bounded-load rule, and under one the first whose owner holds no more
+    /// requests than the bound ([`Self::bound`]). Where every owner is past
+    /// the bound nothing is ranked, as on the scorer's own ring.
+    ///
+    /// A place is walked once. The survivors its walk reaches are ranked in
+    /// the ring's order, the first at `1.0` and each next one a step below,
+    /// at most [`MAX_TARGETS`] of them, and the first of them is the
+    /// place's owner: the worker the bound tests is the one that leads the
+    /// ranking. A worker the ring names is the survivor that carries its
+    /// address's id ([`survivor_at`]).
+    ///
+    /// A ring that reaches no survivor holds no worker yet, or is of
+    /// another membership than the rows. Under the plain ring a place's
+    /// owner is then the survivor at the position modulo the survivors, in
+    /// their list's order, and no other is ranked, so a key keeps one
+    /// worker there too: the bound holds that owner as any other. Under
+    /// the prefix form such a place has no owner, and where no place has
+    /// one nothing is ranked: the stages behind the ring place the
+    /// request.
+    fn rank_lent(
+        &self,
+        facts: &RequestFacts<'_>,
+        (ring, first, behind): Lent<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        out: &mut [f32],
+    ) {
+        // With no rule the first place is the one read, and no count is.
+        let (bound, behind) = match self.bounded {
+            Some(_) => (self.bound(facts, candidates, kept), behind),
+            None => (None, &[][..]),
+        };
+        let most = MAX_TARGETS.min(kept.len());
+        for position in iter::once(first).chain(behind.iter().copied()) {
+            let mut ranked = [usize::MAX; MAX_TARGETS];
+            let mut found = 0usize;
+            ring.walk(position, &mut |address| {
+                if found == most {
+                    return true;
+                }
+                match survivor_at(address, candidates, kept) {
+                    // A ring asks about a worker once: one it names again
+                    // keeps the rank it has.
+                    Some(slot) if !ranked[..found].contains(&slot) => {
+                        ranked[found] = slot;
+                        found += 1;
+                        found == most
+                    }
+                    _ => false,
+                }
+            });
+            if found == 0 && self.prefix.is_none() {
+                if let Some(at) = position.checked_rem(kept.len() as u64) {
+                    ranked[0] = at as usize;
+                    found = 1;
+                }
+            }
+            let Some(&owner) = ranked[..found].first() else {
+                continue;
+            };
+            let past = bound.is_some_and(|bound| {
+                f64::from(facts.in_flight(&candidates[kept[owner] as usize])) > bound
+            });
+            if past {
+                continue;
+            }
+            for (rank, &slot) in ranked[..found].iter().enumerate() {
+                out[slot] = 1.0 - rank as f32 / MAX_TARGETS as f32;
+            }
+            return;
+        }
+    }
+
     /// The key the scorer places a request by where it places it by itself
     /// ([`Scorer::own`]), `0` for none. A client's key is the plain ring's:
     /// the prefix form places a request with no routing key by its prefix.
@@ -869,6 +939,20 @@ impl ConsistentHash {
             None => facts.ring_key(),
         }
     }
+}
+
+/// What a caller's lent ring places a request by: the ring, the first place
+/// the request states on it, and the places behind it
+/// ([`ConsistentHash::lent`]).
+type Lent<'a> = (&'a dyn LentRing, u64, &'a [u64]);
+
+/// The survivor a lent ring names by `address`, by its place among `kept`:
+/// the last of them whose row carries the address's id
+/// ([`WorkerId::from_address`]), `None` where none does.
+fn survivor_at(address: &str, candidates: &[Candidate], kept: &[u32]) -> Option<usize> {
+    let id = WorkerId::from_address(address);
+    kept.iter()
+        .rposition(|&row| candidates[row as usize].id == id)
 }
 
 /// A ring of the pool's rows alone: [`walk_pool`] reads no mark.
@@ -994,6 +1078,20 @@ impl Scorer for ConsistentHash {
         false
     }
 
+    // The ring keyed by no prefix is asked where the routing value's own
+    // text stands. The prefix form is asked where a head stands.
+    fn places_by_key_text(&self) -> bool {
+        self.prefix.is_none()
+    }
+
+    fn places_by_heads(&self) -> Option<HeadRule<'_>> {
+        let prefix = self.prefix.as_ref()?;
+        Some(HeadRule {
+            depth: prefix.tokens,
+            boundaries: &prefix.boundaries,
+        })
+    }
+
     /// The ring places a request that carries a routing key by its walk
     /// alone: under the prefix form too, where a routing key leads the
     /// prefix. The bounded-load rule reads every survivor's count, and a
@@ -1025,11 +1123,9 @@ impl Scorer for ConsistentHash {
     /// passes it by one slot, so a pool is walked whatever its share of
     /// the ring.
     ///
-    /// Where the request's host lent the ring of the list the rows are
-    /// ([`RequestFacts::ring`]), the walk is over that ring and takes no
-    /// word of the pool on trust: the ring names a member by its row's
-    /// place, in whatever order the rows stand, and holds no other pool's
-    /// members. This stage's own ring is not read and learns nothing.
+    /// `false` too where the stage places by the ring the request's caller
+    /// lent ([`RequestFacts::ring`]): the whole pass places by that ring,
+    /// and this stage's ring is not read.
     fn own(
         &self,
         facts: &RequestFacts<'_>,
@@ -1039,21 +1135,11 @@ impl Scorer for ConsistentHash {
         kept: &mut Vec<u32>,
     ) -> bool {
         let key = self.own_key(facts);
-        if key == 0 || !self.owns() || facts.ring_awaited {
+        if key == 0 || !self.owns() {
             return false;
         }
-        // The ring of the list the candidates are, where their host lent
-        // one, names each member by its row's place: no pool is shown to
-        // this stage's own ring, which learns nothing.
-        if facts.ring.is_some() {
-            let Some(lent) = lent_ring(facts, candidates.len()) else {
-                return false;
-            };
-            let mut places = [0; MAX_TARGETS];
-            let by_place = |place: u32| candidates.get(place as usize).is_some_and(&mut *keep);
-            let handed = lent.walk(key, by_place, &mut places);
-            kept.extend_from_slice(&places[..handed]);
-            return handed != 0;
+        if Self::lent(facts).is_some() {
+            return false;
         }
         if pool.membership_epoch == 0 || pool.engines.is_empty() {
             return false;
@@ -1081,22 +1167,73 @@ impl Scorer for ConsistentHash {
         }
     }
 
-    /// The walk of [`Self::own`] over the ring the request's host lent
+    /// The walk of the ring the request's caller lent
     /// ([`RequestFacts::ring`]), for a host that reads a row when the walk
-    /// asks about it. The ring names a member by its row's place, so the
-    /// walk reads no row itself. Nothing is placed where no ring is lent,
-    /// or where [`Self::own`] would place nothing.
+    /// asks about it. Each worker the ring names is found by its address's
+    /// id, asked of `keep` once, and the first [`MAX_TARGETS`] kept are
+    /// handed out in the ring's order: the rows the pass over the whole
+    /// pool ranks on that ring, in its order.
+    ///
+    /// The walk is the plain ring's, from the first place the request
+    /// states. The bounded-load rule reads every survivor's count, and the
+    /// prefix form states a place for each of its heads: the pass over the
+    /// whole pool places under both.
+    ///
+    /// `0` where the walk decides nothing and the pass over the whole pool
+    /// must: under those two forms, where no ring is lent or no place is
+    /// stated, and where a row of the pool is left not asked once
+    /// [`DRAW_BOUND`] rows were refused, which says nothing of the rows
+    /// behind them, or once the ring ended short of [`MAX_TARGETS`] kept.
+    /// The walk named no place for that row, and the pass over the whole
+    /// pool says what stands behind the ring's workers. A walk that asked
+    /// about every row of the pool decides by the rows it kept, whatever
+    /// it refused. Eleven rows are asked about at most: three kept and
+    /// seven refused ahead of the one that ends the walk.
     fn own_by_place(
         &self,
         facts: &RequestFacts<'_>,
         rows: usize,
+        place_of: &dyn Fn(WorkerId) -> Option<u32>,
         keep: &mut dyn FnMut(u32) -> bool,
-        out: &mut [u32; MAX_TARGETS],
     ) -> usize {
-        let key = self.own_key(facts);
-        match lent_ring(facts, rows) {
-            Some(lent) if key != 0 && self.owns() => lent.walk(key, keep, out),
-            _ => 0,
+        if self.bounded.is_some() || self.prefix.is_some() {
+            return 0;
+        }
+        let Some((ring, position, _)) = Self::lent(facts) else {
+            return 0;
+        };
+        // The rows met, kept or refused: a row the ring names again is not
+        // asked again.
+        let mut met = [FREE; MAX_TARGETS + DRAW_BOUND as usize];
+        let (mut asked, mut kept, mut refused) = (0usize, 0usize, 0u32);
+        // Whether the walk ended, and whether it ended decided.
+        let (mut ended, mut decided) = (false, false);
+        ring.walk(position, &mut |address| {
+            if ended {
+                return true;
+            }
+            let place = place_of(WorkerId::from_address(address));
+            let Some(place) = place.filter(|place| !met[..asked].contains(place)) else {
+                return false;
+            };
+            if let Some(slot) = met.get_mut(asked) {
+                *slot = place;
+            }
+            asked += 1;
+            if keep(place) {
+                kept += 1;
+            } else {
+                refused += 1;
+            }
+            // Every row was asked: the ring names no other.
+            decided = kept == MAX_TARGETS || asked == rows;
+            ended = decided || refused == DRAW_BOUND;
+            ended
+        });
+        if decided {
+            kept
+        } else {
+            0
         }
     }
 
@@ -1108,11 +1245,8 @@ impl Scorer for ConsistentHash {
         out: &mut [f32],
     ) -> TieBand {
         out.fill(0.0);
-        // The host keeps a ring for the candidates' list and has not built
-        // it yet ([`RequestFacts::ring_awaited`]): the request is placed as
-        // one with no key, every row alike, and this stage's own ring is
-        // neither read nor taught.
-        if facts.ring_awaited {
+        if let Some(lent) = Self::lent(facts) {
+            self.rank_lent(facts, lent, candidates, kept, out);
             return TieBand::NORMALIZED;
         }
         // A ring that names no prefix form has one key, the session's or
@@ -1129,16 +1263,6 @@ impl Scorer for ConsistentHash {
         };
         SLOTS.with(|slots| {
             let mut slots = slots.borrow_mut();
-            // The ring of the list the candidates are, where their host
-            // lent one: read with no lock, and this stage's own ring is
-            // neither read nor taught.
-            if let Some(lent) = lent_ring(facts, candidates.len()) {
-                lent.fill(kept, &mut slots);
-                self.rank_by(
-                    facts, lent, candidates, kept, &mut slots, first, &mut keys, out,
-                );
-                return;
-            }
             let mut ring = self.ring.read();
             if !Self::fill(&ring, candidates, kept, &mut slots) {
                 // A survivor the feed never named joins at its first
@@ -1158,7 +1282,7 @@ impl Scorer for ConsistentHash {
                 Self::fill(&ring, candidates, kept, &mut slots);
             }
             self.rank_by(
-                facts, &*ring, candidates, kept, &mut slots, first, &mut keys, out,
+                facts, &ring, candidates, kept, &mut slots, first, &mut keys, out,
             );
         });
         TieBand::NORMALIZED
@@ -1179,6 +1303,8 @@ impl Scorer for ConsistentHash {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{self, AtomicU32};
+
     use super::*;
     use crate::{
         engine::{
@@ -2421,275 +2547,354 @@ mod tests {
         assert_eq!(by(&ring, 8), NO_POOL, "a member the snapshot kept");
     }
 
-    /// A pool in an order of its host's own, as a gateway lists its
-    /// workers: the ids rise and fall along it, each row's stable key is
-    /// its id's low half, and a row holds up to five requests.
-    fn listed(count: u32, shape: u64) -> Vec<Candidate> {
-        let mut draw = Draw::new(shape);
+    /// A caller's ring that reaches the workers at `places` of a list in
+    /// that order: the worker at place `n` is registered at `w<n>`.
+    fn reaches(places: &[u32]) -> InOrder {
+        InOrder(places.iter().map(|place| format!("w{place}")).collect())
+    }
+
+    /// The rows of a caller's own list: each carries its address's id.
+    fn addressed(count: u32) -> Vec<Candidate> {
         (0..count)
-            .map(|position| {
-                let id = draw.next_u64() | 1;
-                Candidate {
-                    id: WorkerId(id),
-                    key: id as u32,
-                    in_flight: draw.below(6) as u32,
-                    ..candidate(position, 0)
-                }
+            .map(|place| Candidate {
+                id: WorkerId::from_address(&format!("w{place}")),
+                ..candidate(place, 0)
             })
             .collect()
     }
 
-    /// The ring of the list `rows` are.
-    fn ring_of_list(rows: &[Candidate]) -> PoolRing {
-        PoolRing::new(rows.iter().map(|row| (row.id, row.key)))
-    }
-
-    /// The forms of the scorer a document writes: the plain ring, the ring
-    /// under a bounded-load rule tight enough to pass owners over, the
-    /// prefix form, and the prefix form under boundaries and that rule.
-    fn forms() -> [fn() -> ConsistentHash; 4] {
-        [
-            || ConsistentHash::new(None),
-            || bounded(1.0, 1),
-            || prefixed(64),
-            || {
-                levelled(Some(&BoundedLoadParams {
-                    factor: Some(1.0),
-                    abs_margin: Some(1),
-                }))
-            },
-        ]
-    }
-
-    /// A scorer lent the ring of the list its rows are scores them as a
-    /// scorer that learns its own ring does: under every form, over lists
-    /// in an order of the host's own, with the rows kept whole and in part,
-    /// for a session's key, a client's key and a prefix. The scorer under
-    /// the lent ring holds no member of its own at the end.
-    #[test]
-    fn a_lent_ring_scores_the_rows_as_the_scorers_own_ring_does() {
-        let hashes: Vec<u64> = (1..=40).collect();
-        for form in forms() {
-            for (count, shape) in [(1, 1), (3, 2), (8, 3), (64, 4), (200, 5)] {
-                let rows = listed(count, shape);
-                let ring = ring_of_list(&rows);
-                let (own, lent) = (form(), form());
-                let mut draw = Draw::new(shape + 100);
-                for turn in 0..300_u64 {
-                    // Every row kept, or two rows in three.
-                    let kept: Vec<u32> = (0..count)
-                        .filter(|_| turn.is_multiple_of(2) || draw.below(3) != 0)
-                        .collect();
-                    let key = draw.next_u64() | 1;
-                    let request = match turn % 3 {
-                        0 => keyed(key),
-                        1 => RequestFacts {
-                            model: "m",
-                            client_key: key,
-                            ..RequestFacts::default()
-                        },
-                        _ => hashed(&hashes[..=(key % 40) as usize]),
-                    };
-                    let with_ring = RequestFacts {
-                        ring: Some(&ring),
-                        ..request
-                    };
-                    assert_eq!(
-                        scored_among(&lent, &with_ring, &rows, &kept),
-                        scored_among(&own, &request, &rows, &kept),
-                        "turn {turn} over {count} rows"
-                    );
-                }
-                assert!(lent.ring().is_empty(), "{count} rows: no member learned");
-            }
+    /// A keyed request whose caller lends `ring` and says where it stands
+    /// on it.
+    fn lent<'a>(ring: &'a InOrder, positions: &'a [u64]) -> RequestFacts<'a> {
+        RequestFacts {
+            ring: Some(ring),
+            ring_positions: positions,
+            ..keyed(7)
         }
     }
 
-    /// Under a lent ring the scorer's own ring holds no member, whatever is
-    /// asked of the scorer: its pass over the rows, its walk over rows
-    /// written for the decision, its walk by place, and the membership's
-    /// words, which find no member to take away. The walks hand out the
-    /// pass's best rows in its order, with the pool's engines listed or
-    /// not.
-    #[test]
-    fn a_scorer_under_lent_rings_keeps_no_ring_of_its_own() {
-        let rows = listed(64, 9);
-        let ring = ring_of_list(&rows);
+    /// The rows a lent ring ranked among `kept` for a request that stands
+    /// at its position `at`, best first.
+    fn ranked(ring: &InOrder, at: u64, rows: &[Candidate], kept: &[u32]) -> Vec<u32> {
         let scorer = ConsistentHash::new(None);
-        let facts = RequestFacts {
-            ring: Some(&ring),
-            ..keyed(77)
-        };
-        let kept: Vec<u32> = (0..64).collect();
-        let by_pass = scored_among(&scorer, &facts, &rows, &kept);
-        let best = [1.0, 0.75, 0.5, 0.25];
-        let (places, ends): (Vec<u32>, Vec<u32>) = ((0..64).collect(), (1..=64).collect());
-        for engines in [
-            view::Engines::default(),
-            view::Engines::new(1, &places, &ends),
-        ] {
-            let pool = PoolFacts {
-                membership_epoch: 3,
-                engines,
-                ..PoolFacts::default()
-            };
-            let mut walked = Vec::new();
-            assert!(scorer.own(&facts, &pool, &rows, &mut |_: &Candidate| true, &mut walked));
-            let ranked: Vec<f32> = walked.iter().map(|&row| by_pass[row as usize]).collect();
-            assert_eq!(ranked, best);
-        }
-        let mut walked = [0; MAX_TARGETS];
-        assert_eq!(
-            scorer.own_by_place(&facts, 64, &mut |_| true, &mut walked),
-            MAX_TARGETS
-        );
-        assert_eq!(walked.map(|row| by_pass[row as usize]), best);
-        for word in [
-            Membership::Removed(rows[3].id),
-            Membership::Added(rows[3].id),
-            Membership::Snapshot(&[rows[0].id]),
-        ] {
-            scorer.on_membership(&word);
-        }
-        assert!(
-            scorer.ring().is_empty(),
-            "no member learned, none taken away"
-        );
+        let scores = scored_among(&scorer, &lent(ring, &[at]), rows, kept);
+        assert!(scorer.ring().is_empty(), "its own ring learned a row");
+        let mut ranked: Vec<(f32, u32)> = scores.into_iter().zip(kept.iter().copied()).collect();
+        ranked.retain(|&(score, _)| score > 0.0);
+        ranked.sort_by(|a, b| b.0.total_cmp(&a.0));
+        ranked.into_iter().map(|(_, row)| row).collect()
     }
 
-    /// A request whose host keeps a ring for the rows' list and has not
-    /// built it yet is placed as one that carries no key, under every form
-    /// of the scorer: each row scores alike, no walk hands a row out, and
-    /// the scorer's own ring is neither read nor taught. The same request
-    /// with no such word is the scorer's own ring's, which learns the rows.
+    /// The plain ring places a key on the ring its caller lent: the first
+    /// four survivors the ring's walk reaches from the position its caller
+    /// states, in the ring's order. A worker that is no row or no survivor
+    /// is passed. The first of them is the one worker the gateway's own
+    /// policy takes, the first eligible worker its ring reaches
+    /// (`model_gateway/src/policies/consistent_hashing.rs`, lines 99 to 115
+    /// at 882be6f4f). Of two rows at one address the last kept takes the
+    /// ring's place, as that policy finds a ring's worker from its list's
+    /// end (line 103). A client's key is placed alike. The scorer's own ring
+    /// is neither read nor taught, and its walk over written rows leaves
+    /// the request to the whole pass.
     #[test]
-    fn a_request_whose_lists_ring_is_awaited_is_scored_as_one_with_no_key() {
-        let rows = listed(64, 9);
-        let kept: Vec<u32> = (0..64).collect();
-        let awaited = RequestFacts {
-            ring_awaited: true,
-            ..keyed(77)
+    fn a_lent_ring_ranks_the_survivors_its_walk_reaches_in_the_rings_order() {
+        let mut rows = addressed(8);
+        let ring = reaches(&[5, 9, 2, 0, 7, 3, 1, 6, 4]);
+        let all = [0, 1, 2, 3, 4, 5, 6, 7];
+        assert_eq!(ranked(&ring, 0, &rows, &all), [5, 2, 0, 7]);
+        assert_eq!(ranked(&ring, 5, &rows, &all), [3, 1, 6, 4]);
+        assert_eq!(ranked(&ring, 0, &rows, &[0, 1, 3, 4, 6, 7]), [0, 7, 3, 1]);
+        assert_eq!(ranked(&ring, 0, &rows, &[4, 6]), [6, 4]);
+        let scorer = ConsistentHash::new(None);
+        let client = RequestFacts {
+            session_key: Identity::NONE,
+            client_key: 9,
+            ..lent(&ring, &[0])
         };
-        for form in forms() {
-            let scorer = form();
-            let scores = scored_among(&scorer, &awaited, &rows, &kept);
-            assert!(scores.iter().all(|&score| score == 0.0), "{scores:?}");
-            let pool = PoolFacts::default();
-            let mut walked = Vec::new();
-            assert!(!scorer.own(
-                &awaited,
-                &pool,
-                &rows,
-                &mut |_: &Candidate| true,
-                &mut walked
-            ));
-            let mut places = [0; MAX_TARGETS];
-            assert_eq!(
-                scorer.own_by_place(&awaited, 64, &mut |_| true, &mut places),
-                0
-            );
-            assert!(scorer.ring().is_empty(), "no member learned");
-            let own = scored_among(&scorer, &keyed(77), &rows, &kept);
-            assert!(own.iter().any(|&score| score != 0.0), "{own:?}");
-            assert_eq!(scorer.ring().len(), 64);
+        let scores = scored(&scorer, &client, &rows);
+        let steps = (scores[5], scores[2], scores[0], scores[7]);
+        assert_eq!(steps, (1.0, 0.75, 0.5, 0.25));
+        let (places, ends): (Vec<u32>, Vec<u32>) = ((0..8).collect(), (1..=8).collect());
+        let pool = PoolFacts {
+            membership_epoch: 3,
+            engines: view::Engines::new(1, &places, &ends),
+            ..PoolFacts::default()
+        };
+        let keep = &mut |_: &Candidate| true;
+        assert!(!scorer.own(&lent(&ring, &[3]), &pool, &rows, keep, &mut Vec::new()));
+        assert!(scorer.ring().is_empty(), "no member learned");
+        // The prefix form with no rule leaves such a request to the whole
+        // pass alike.
+        let unruled = ConsistentHash::new(None).keyed_by_prefix(64, Gates::default(), &[]);
+        assert!(!unruled.own(&lent(&ring, &[3]), &pool, &rows, keep, &mut Vec::new()));
+        assert!(unruled.ring().is_empty(), "no member learned");
+        // With no place stated the scorer's own ring places, and learns
+        // the rows. Under a bounded-load rule and under the prefix form a
+        // lent ring places too, and theirs learns none.
+        let own = ConsistentHash::new(None);
+        scored(&own, &lent(&ring, &[]), &rows);
+        assert_eq!(own.ring().len(), 8);
+        for own in [bounded(1.25, 10), prefixed(64)] {
+            scored(&own, &lent(&ring, &[3]), &rows);
+            assert!(own.ring().is_empty(), "its own ring learned a row");
         }
-    }
-
-    /// A ring of another list than the rows is no ring of theirs, by its
-    /// length. A host lends the ring of the list it hands and no other, so
-    /// a debug build stops at such a ring wherever the scorer reads one:
-    /// in its pass over the rows, in its walk over rows written for the
-    /// decision, and in its walk by place.
-    #[test]
-    fn a_lent_ring_of_another_list_is_not_the_rows() {
-        let rows = listed(64, 9);
-        let (theirs, other) = (ring_of_list(&rows), ring_of_list(&rows[..63]));
-        assert!(ring_of_these(&theirs, 64).is_some());
-        assert!(ring_of_these(&other, 64).is_none());
-        if !cfg!(debug_assertions) {
-            return;
-        }
-        let astray = RequestFacts {
-            ring: Some(&other),
-            ..keyed(77)
-        };
-        let kept: Vec<u32> = (0..64).collect();
-        let stopped = |read: &dyn Fn(&ConsistentHash)| {
-            let scorer = ConsistentHash::new(None);
-            let read = std::panic::AssertUnwindSafe(|| read(&scorer));
-            assert!(std::panic::catch_unwind(read).is_err());
-            assert!(scorer.ring().is_empty(), "no member learned on the way");
-        };
-        stopped(&|scorer| {
-            scored_among(scorer, &astray, &rows, &kept);
-        });
-        stopped(&|scorer| {
-            let pool = PoolFacts::default();
-            scorer.own(
-                &astray,
-                &pool,
-                &rows,
-                &mut |_: &Candidate| true,
-                &mut Vec::new(),
-            );
-        });
-        stopped(&|scorer| {
-            scorer.own_by_place(&astray, 64, &mut |_| true, &mut [0; MAX_TARGETS]);
-        });
-    }
-
-    /// A list where two rows carry one id holds one member twice over. The
-    /// pass gives the member's score to the last of the two that is kept,
-    /// by a lent ring as by the scorer's own, and no walk hands a row out.
-    #[test]
-    fn two_rows_of_one_id_are_scored_alike_by_either_ring() {
-        let mut rows = listed(8, 13);
         rows.push(Candidate {
             position: 8,
-            ..rows[2]
+            ..rows[4]
         });
-        let ring = ring_of_list(&rows);
-        assert!(!ring.is_distinct());
-        let sets: [&[u32]; 5] = [
-            &[0, 1, 2, 3, 4, 5, 6, 7, 8],
-            &[0, 1, 2, 3],
-            &[3, 4, 8],
-            &[2, 8],
-            &[8],
-        ];
-        for kept in sets {
-            let (own, lent) = (ConsistentHash::new(None), ConsistentHash::new(None));
-            for key in 1..=200 {
-                let request = keyed(key);
-                let with_ring = RequestFacts {
-                    ring: Some(&ring),
-                    ..request
-                };
-                assert_eq!(
-                    scored_among(&lent, &with_ring, &rows, kept),
-                    scored_among(&own, &request, &rows, kept),
-                    "key {key} over {kept:?}"
-                );
-            }
-            assert!(lent.ring().is_empty());
-        }
-        let facts = RequestFacts {
-            ring: Some(&ring),
-            ..keyed(5)
-        };
-        let mut walked = [0; MAX_TARGETS];
+        assert_eq!(ranked(&ring, 0, &rows, &[4, 6, 8]), [6, 8]);
+    }
+
+    /// A lent ring that reaches no survivor places nothing by its walk: it
+    /// holds no worker yet, or is of another membership than the rows, or
+    /// its workers are not kept. The survivor at the key's position modulo
+    /// the survivors, in their list's order, then takes the key, and no
+    /// other is ranked. It is the gateway's own rule for a key no ring
+    /// places (`model_gateway/src/policies/consistent_hashing.rs`, line 139
+    /// at 882be6f4f: the eligible worker at `hash_position(key)` modulo
+    /// their count), so a key keeps one worker there too.
+    #[test]
+    fn a_lent_ring_that_reaches_no_survivor_places_by_the_position_modulo_the_survivors() {
+        let rows = addressed(8);
         let scorer = ConsistentHash::new(None);
+        for ring in [reaches(&[]), reaches(&[20, 21]), reaches(&[3])] {
+            for (position, kept) in [
+                (13_u64, vec![0, 1, 2, 4, 5, 6, 7]),
+                (13, vec![1, 4, 6]),
+                (u64::MAX, vec![2, 5]),
+            ] {
+                let at = [position];
+                let scores = scored_among(&scorer, &lent(&ring, &at), &rows, &kept);
+                let owner = (position % kept.len() as u64) as usize;
+                let alone: Vec<f32> = (0..kept.len())
+                    .map(|slot| f32::from(u8::from(slot == owner)))
+                    .collect();
+                assert_eq!(scores, alone, "{ring:?} at {position} over {kept:?}");
+            }
+        }
+        assert!(scorer.ring().is_empty(), "no member learned");
+    }
+
+    /// [`InOrder`], with a count of the workers its walks named.
+    #[derive(Debug)]
+    struct Counted(InOrder, AtomicU32);
+
+    impl LentRing for Counted {
+        fn position(&self, key: &str) -> u64 {
+            self.0.position(key)
+        }
+
+        fn walk(&self, position: u64, take: &mut dyn FnMut(&str) -> bool) {
+            self.0.walk(position, &mut |address| {
+                self.1.fetch_add(1, atomic::Ordering::Relaxed);
+                take(address)
+            });
+        }
+    }
+
+    /// A lent ring's walk is asked no further than its answer needs. It
+    /// ends at the last survivor it ranks, four at most, and over no
+    /// survivor at the first worker the ring names. With either stop gone
+    /// no score moves: the walk names one worker past its answer, or goes
+    /// round the whole ring for nobody.
+    #[test]
+    fn a_lent_rings_walk_ends_where_its_answer_stands() {
+        let rows = addressed(8);
+        let ring = Counted(reaches(&[5, 9, 2, 0, 7, 3, 1, 6, 4]), AtomicU32::new(0));
+        let named_under = |scorer: &ConsistentHash, kept: &[u32]| {
+            ring.1.store(0, atomic::Ordering::Relaxed);
+            let facts = RequestFacts {
+                ring: Some(&ring),
+                ring_positions: &[0],
+                ..keyed(7)
+            };
+            scored_among(scorer, &facts, &rows, kept);
+            ring.1.load(atomic::Ordering::Relaxed)
+        };
+        let named = |kept: &[u32]| named_under(&ConsistentHash::new(None), kept);
+        // The fourth survivor is the ring's fifth worker: `w9` is no row.
+        assert_eq!(named(&[0, 1, 2, 3, 4, 5, 6, 7]), 5);
+        // Two survivors, the ring's first and third workers.
+        assert_eq!(named(&[2, 5]), 3);
+        // Two survivors the ring names last: the walk goes round once.
+        assert_eq!(named(&[4, 6]), 9);
+        assert_eq!(named(&[]), 1, "nobody to rank");
+        // Under a bounded-load rule a place is walked once too: its owner
+        // is the first survivor of the walk that ranks.
+        let rule = bounded(1.25, 10);
+        assert_eq!(named_under(&rule, &[0, 1, 2, 3, 4, 5, 6, 7]), 5);
+    }
+
+    /// A ring stage that has placed keys by its own ring asks a lent ring
+    /// all the same: what it learned of the rows names no worker for a
+    /// request whose caller lends its ring.
+    #[test]
+    fn a_stage_that_placed_by_its_own_ring_places_by_a_lent_one() {
+        let rows = addressed(8);
+        let scorer = ConsistentHash::new(None);
+        scored(&scorer, &keyed(7), &rows);
+        assert_eq!(scorer.ring().len(), 8, "its own ring holds the rows");
+        let ring = reaches(&[5, 9, 2, 0, 7, 3, 1, 6, 4]);
+        let scores = scored(&scorer, &lent(&ring, &[0]), &rows);
+        let steps = (scores[5], scores[2], scores[0], scores[7]);
+        assert_eq!(steps, (1.0, 0.75, 0.5, 0.25));
+    }
+
+    /// Under a bounded-load rule the places a request states on the lent
+    /// ring are tried in the order stated: the first whose owner, the first
+    /// survivor the ring's walk reaches from there, holds no more requests
+    /// than the bound places the request, with the ring's next survivors
+    /// behind that owner. The owner's requests are read through the
+    /// request's facts. Where every owner is past the bound nothing is
+    /// ranked, and the stages behind the ring place the request. With no
+    /// rule the first place is the one read. A ring that reaches no
+    /// survivor ranks nothing under the prefix form, as the gateway's own
+    /// policy takes the fewest requests where no ring places a prompt
+    /// (`model_gateway/src/policies/prefix_hash.rs`, lines 338 to 340 at
+    /// 882be6f4f). Under the plain ring a place's owner is then the
+    /// survivor at its position modulo their count, held to the bound as
+    /// any owner.
+    ///
+    /// The gateway's own policy tries a prompt's heads in that order, each
+    /// at its ring's first eligible worker, and takes the first under the
+    /// same bound (the same file, lines 291 to 319 and 236 to 247). With
+    /// every one past it as it counted them, it takes the worker with the
+    /// fewest requests (lines 321 to 331), as the stage behind the ring
+    /// does under the stock document.
+    #[test]
+    fn a_lent_rings_places_are_tried_in_order_under_the_bounded_load_rule() {
+        // Rows 5 and 2 hold 40 and 30 requests and the others none: the
+        // mean is 71 / 8 and the bound 18.875.
+        let mut rows = addressed(8);
+        rows[5].in_flight = 40;
+        rows[2].in_flight = 30;
+        let ring = reaches(&[5, 2, 0, 7, 3, 1, 6, 4]);
+        let all = [0, 1, 2, 3, 4, 5, 6, 7];
+        let tried_on = |ring: &InOrder, scorer: &ConsistentHash, at: &[u64], kept: &[u32]| {
+            let scores = scored_among(scorer, &lent(ring, at), &rows, kept);
+            assert!(scorer.ring().is_empty(), "its own ring learned a row");
+            let mut ranked: Vec<(f32, u32)> =
+                scores.into_iter().zip(kept.iter().copied()).collect();
+            ranked.retain(|&(score, _)| score > 0.0);
+            ranked.sort_by(|a, b| b.0.total_cmp(&a.0));
+            ranked.into_iter().map(|(_, row)| row).collect::<Vec<u32>>()
+        };
+        let tried =
+            |scorer: &ConsistentHash, at: &[u64], kept: &[u32]| tried_on(&ring, scorer, at, kept);
+        let rule = bounded(1.25, 10);
+        // The owners at the places 0 and 1 are rows 5 and 2, past the
+        // bound. The owner at 2 is row 0.
+        assert_eq!(tried(&rule, &[0, 1, 2], &all), [0, 7, 3, 1]);
+        assert_eq!(tried(&rule, &[2, 0], &all), [0, 7, 3, 1]);
+        assert!(tried(&rule, &[0, 1], &all).is_empty());
+        // The places behind the first are tried in the order stated: the
+        // owners at 2 and 3 are rows 0 and 7, both under the bound.
+        assert_eq!(tried(&rule, &[0, 2, 3], &all), [0, 7, 3, 1]);
+        assert_eq!(tried(&rule, &[0, 3, 2], &all), [7, 3, 1, 6]);
+        // The owner's requests are the ones the request's facts state: in
+        // a table lent beside rows that each read zero, row 5 holds 40.
+        {
+            use crate::tracking::in_flight::tests::Lent;
+            let mut bare = rows.clone();
+            let counts = Lent::take(&mut bare);
+            let facts = lent(&ring, &[0, 2]);
+            let scores = scored_among(&rule, &counts.beside(&facts), &bare, &all);
+            assert_eq!((scores[5], scores[0]), (0.0, 1.0));
+        }
+        // Row 5 is no survivor: the owner at 0 is the ring's next, row 2.
+        assert_eq!(tried(&rule, &[0, 3], &[0, 1, 2, 3, 4, 6, 7]), [7, 3, 1, 6]);
+        // With no rule the first place is read, whatever its owner holds.
         assert_eq!(
-            scorer.own_by_place(&facts, 9, &mut |_| true, &mut walked),
-            0
+            tried(&ConsistentHash::new(None), &[0, 1, 2], &all),
+            [5, 2, 0, 7]
         );
-        let unsaid = PoolFacts::default();
-        assert!(!scorer.own(
-            &facts,
-            &unsaid,
-            &rows,
-            &mut |_: &Candidate| true,
-            &mut Vec::new()
-        ));
+        // The prefix form tries its places alike, and a ring that reaches
+        // no survivor ranks nothing under it.
+        let gates = Gates::default();
+        let prefix = bounded(1.25, 10).keyed_by_prefix(64, gates, &[]);
+        assert_eq!(tried(&prefix, &[0, 1, 2], &all), [0, 7, 3, 1]);
+        assert_eq!(tried(&prefix, &[0], &[1, 3]), [3, 1]);
+        // A ring that reaches no survivor. Under the prefix form no place
+        // has an owner. Under the plain ring the owners at 13 and 14 are
+        // rows 5 and 6, by the position modulo the eight: row 5 is past the
+        // bound and passed over, and with no rule it takes the key.
+        let elsewhere = reaches(&[20, 21]);
+        assert!(tried_on(&elsewhere, &prefix, &[13, 14], &all).is_empty());
+        assert!(tried_on(&elsewhere, &rule, &[13], &all).is_empty());
+        assert_eq!(tried_on(&elsewhere, &rule, &[13, 14], &all), [6]);
+        let plain = ConsistentHash::new(None);
+        assert_eq!(tried_on(&elsewhere, &plain, &[13, 14], &all), [5]);
+    }
+
+    /// The walk by place of `facts`' lent ring over `rows` rows in their
+    /// list's order, the worker `w<n>` at place `n`, where the filters
+    /// refuse the places in `refused`: the places kept, in the order asked,
+    /// and how many the walk says it hands out.
+    fn walked(facts: &RequestFacts<'_>, rows: u32, refused: &[u32]) -> (Vec<u32>, usize) {
+        let ids: Vec<WorkerId> = addressed(rows).iter().map(|row| row.id).collect();
+        let place_of = |id: WorkerId| ids.iter().position(|&own| own == id).map(|at| at as u32);
+        let (mut kept, mut asked) = (Vec::new(), Vec::new());
+        let handed =
+            ConsistentHash::new(None).own_by_place(facts, rows as usize, &place_of, &mut |place| {
+                assert!(!asked.contains(&place), "place {place} asked twice");
+                asked.push(place);
+                let keep = !refused.contains(&place);
+                if keep {
+                    kept.push(place);
+                }
+                keep
+            });
+        (kept, handed)
+    }
+
+    /// A lent ring walked by place hands out the rows the pass over the
+    /// whole pool ranks, in its order, and asks about no row behind them:
+    /// four kept end it, and so does the pool's last row. It decides
+    /// nothing, and the whole pass must, once [`DRAW_BOUND`] rows were
+    /// refused, where the ring ends with a row of the pool not asked,
+    /// where no ring is lent or no place is stated, and under a
+    /// bounded-load rule or the prefix form, which ask about no row.
+    #[test]
+    fn a_lent_ring_walked_by_place_hands_out_the_rows_the_whole_pass_ranks() {
+        let ring = reaches(&[5, 9, 2, 0, 7, 3, 1, 1, 6, 4]);
+        let facts = lent(&ring, &[0]);
+        let rows = addressed(8);
+        for refused in [&[][..], &[5, 2], &[5, 2, 0, 7, 3], &[6, 4, 1]] {
+            let kept: Vec<u32> = (0..8).filter(|row| !refused.contains(row)).collect();
+            let (places, handed) = walked(&facts, 8, refused);
+            assert_eq!(places, ranked(&ring, 0, &rows, &kept), "{refused:?}");
+            assert_eq!(handed, places.len(), "{refused:?}");
+        }
+        // Eight refused say nothing of the rows behind them. Seven do.
+        let long = reaches(&(0..20).collect::<Vec<u32>>());
+        let facts = lent(&long, &[0]);
+        assert_eq!(walked(&facts, 20, &[0, 1, 2, 3, 4, 5, 6, 7]).1, 0);
+        let kept = (vec![7, 8, 9, 10], MAX_TARGETS);
+        assert_eq!(walked(&facts, 20, &[0, 1, 2, 3, 4, 5, 6]), kept);
+        // Eight refused that are the pool's last rows leave none not
+        // asked: the one row kept is the pool's answer.
+        let nine = reaches(&(0..9).collect::<Vec<u32>>());
+        let refused = [1, 2, 3, 4, 5, 6, 7, 8];
+        assert_eq!(walked(&lent(&nine, &[0]), 9, &refused), (vec![0], 1));
+        // A refused row the ring names again is not asked again, and is
+        // counted once.
+        let again = reaches(&[0, 1, 1, 2]);
+        assert_eq!(walked(&lent(&again, &[0]), 3, &[1]), (vec![0, 2], 2));
+        // A ring of two of three rows names no third: the whole pass says
+        // what stands behind its two.
+        let short = reaches(&[2, 0]);
+        assert_eq!(walked(&lent(&short, &[0]), 3, &[]), (vec![2, 0], 0));
+        assert_eq!(walked(&lent(&short, &[0]), 3, &[1]), (vec![2, 0], 0));
+        // No place stated, no ring lent: no row is asked.
+        for facts in [lent(&ring, &[]), keyed(7)] {
+            assert_eq!(walked(&facts, 8, &[]), (vec![], 0));
+        }
+        let asks: &mut dyn FnMut(u32) -> bool = &mut |_| panic!("a row was asked");
+        for scorer in [bounded(1.25, 10), prefixed(64)] {
+            assert_eq!(
+                scorer.own_by_place(&lent(&ring, &[0]), 8, &|_| Some(0), asks),
+                0
+            );
+        }
     }
 }

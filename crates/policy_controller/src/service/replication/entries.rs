@@ -23,7 +23,7 @@ const HELLO: &str = "a gateway's own fact: it returns in the gateway's hello";
 const SUBSCRIPTION: &str = "each replica hears the engines' cache events itself";
 const DISPATCHED: &str = "a new leader reads dispatched leases from the engines' in-flight \
                           snapshots and rebuilds credits from its own tally";
-const PINS: &str = "pins, reservations and lease ends are journaled once pins have one table";
+const LEASES: &str = "no journal entry carries a reservation, an issue or a lease's end yet";
 const PUBLISHED: &str = "every replica publishes its own world";
 const REPORTED: &str = "each engine's next load report states its values again";
 
@@ -41,18 +41,17 @@ pub const ENTRIES: &[(&str, &str, EntryReplication)] = &[
     ("WorkersStore", "changes_since", EntryReplication::Read),
     // Each replica counts the snapshots it takes.
     ("WorkersStore", "history", EntryReplication::Read),
+    // A count is of the replica's own worker object: no journal names it.
+    (
+        "WorkersStore",
+        "host_count",
+        EntryReplication::Rebuilt("each replica's holder hands its own worker objects"),
+    ),
     // The status a verdict moves is journaled as the status write it makes.
     // The streak between two moves is the prober's own count: a promoted
     // standby's prober starts it again.
     ("HealthSink", "probe_outcome", EntryReplication::Journaled),
     ("HealthSink", "connected", EntryReplication::Journaled),
-    // What the leader's own worker object knows is that replica's alone: a
-    // standby holds none of it.
-    (
-        "HealthSink",
-        "leader_bits",
-        EntryReplication::Rebuilt("a new leader writes what its own worker objects know"),
-    ),
     (
         "HealthSink",
         "gateway_veto",
@@ -70,13 +69,15 @@ pub const ENTRIES: &[(&str, &str, EntryReplication)] = &[
         EntryReplication::Rebuilt("the gateways' reports of the last probe interval"),
     ),
     ("HealthSink", "completed_ok_since", EntryReplication::Read),
-    ("LoadSink", "record", EntryReplication::Journaled),
-    // A report's rows are journaled. Its word that no report came, which
-    // clears an engine's overload verdict, is in no entry and no cut: a
-    // standby holds the verdict of the engine's last rows until its own
-    // first poll.
-    ("LoadSink", "report", EntryReplication::Journaled),
-    ("LoadSink", "report_sampled", EntryReplication::Journaled),
+    // A log carries no load row: a standby holds none of its leader's and
+    // no overload verdict. Its first poll goes out at its take.
+    ("LoadSink", "record", EntryReplication::Rebuilt(REPORTED)),
+    ("LoadSink", "report", EntryReplication::Rebuilt(REPORTED)),
+    (
+        "LoadSink",
+        "report_sampled",
+        EntryReplication::Rebuilt(REPORTED),
+    ),
     ("LoadSink", "poll_mode", EntryReplication::Read),
     // The report period is the load driver's own setting, told where the
     // driver is built: every replica builds its own.
@@ -87,20 +88,12 @@ pub const ENTRIES: &[(&str, &str, EntryReplication)] = &[
     ),
     ("LoadSink", "load", EntryReplication::Read),
     ("LoadSink", "ranks", EntryReplication::Read),
-    // The load adapter of a host with no standby is the one caller.
+    // The load driver drops a replica's rows at each turn of its role: each
+    // replica's own rows, and a standby holds none.
     (
         "LoadSink",
         "evict",
-        EntryReplication::NotYet(
-            "the first host with a standby beside the load adapter brings its event",
-        ),
-    ),
-    (
-        "LoadSink",
-        "evict_unready",
-        EntryReplication::Rebuilt(
-            "each replica's collector says its own reset, under its own lead",
-        ),
+        EntryReplication::Rebuilt("each replica drops its own load rows"),
     ),
     ("LoadSink", "publish_due", EntryReplication::Read),
     ("LoadSink", "publish", EntryReplication::Rebuilt(PUBLISHED)),
@@ -152,56 +145,43 @@ pub const ENTRIES: &[(&str, &str, EntryReplication)] = &[
     (
         "ReservationStore",
         "try_reserve",
-        EntryReplication::NotYet(PINS),
+        EntryReplication::NotYet(LEASES),
     ),
     (
         "ReservationStore",
         "release",
-        EntryReplication::NotYet(PINS),
+        EntryReplication::NotYet(LEASES),
     ),
     ("ReservationStore", "held", EntryReplication::Read),
-    ("SessionsStore", "pin", EntryReplication::NotYet(PINS)),
-    (
-        "SessionsStore",
-        "pin_no_earlier",
-        EntryReplication::NotYet(PINS),
-    ),
-    ("SessionsStore", "lookup", EntryReplication::Read),
-    ("SessionsStore", "unpin", EntryReplication::NotYet(PINS)),
-    (
-        "SessionsStore",
-        "drop_workers",
-        EntryReplication::NotYet(PINS),
-    ),
-    ("SessionsStore", "expire", EntryReplication::NotYet(PINS)),
-    ("SessionsStore", "merge", EntryReplication::Rebuilt(HELLO)),
-    ("SessionsStore", "len", EntryReplication::Read),
-    ("SessionsStore", "is_empty", EntryReplication::Read),
     ("LeasesStore", "term", EntryReplication::Read),
     // The term is told to the journal: every later position is under it.
     ("LeasesStore", "set_term", EntryReplication::Journaled),
-    ("LeasesStore", "issue", EntryReplication::NotYet(PINS)),
-    ("LeasesStore", "issue_pair", EntryReplication::NotYet(PINS)),
+    ("LeasesStore", "issue", EntryReplication::NotYet(LEASES)),
+    (
+        "LeasesStore",
+        "issue_pair",
+        EntryReplication::NotYet(LEASES),
+    ),
     (
         "LeasesStore",
         "issue_decode",
-        EntryReplication::NotYet(PINS),
+        EntryReplication::NotYet(LEASES),
     ),
     (
         "LeasesStore",
         "dispatched",
         EntryReplication::Rebuilt(DISPATCHED),
     ),
-    ("LeasesStore", "completed", EntryReplication::NotYet(PINS)),
-    ("LeasesStore", "released", EntryReplication::NotYet(PINS)),
+    ("LeasesStore", "completed", EntryReplication::NotYet(LEASES)),
+    ("LeasesStore", "released", EntryReplication::NotYet(LEASES)),
     ("LeasesStore", "get", EntryReplication::Read),
     ("LeasesStore", "sides", EntryReplication::Read),
-    ("LeasesStore", "expire", EntryReplication::NotYet(PINS)),
+    ("LeasesStore", "expire", EntryReplication::NotYet(LEASES)),
     ("LeasesStore", "restore", EntryReplication::Rebuilt(HELLO)),
     (
         "LeasesStore",
         "drop_gateways",
-        EntryReplication::NotYet(PINS),
+        EntryReplication::NotYet(LEASES),
     ),
     ("LeasesStore", "live", EntryReplication::Read),
     // The store type's own entries. A generation's apply is its one write.
@@ -223,10 +203,9 @@ pub const ENTRIES: &[(&str, &str, EntryReplication)] = &[
         "watch_from",
         EntryReplication::Rebuilt("a follower takes the worker rows from a watch snapshot"),
     ),
-    // The three doors for a followed write, one a kind of the leader's
+    // The two doors for a followed write, one a kind of the leader's
     // events: each is the standby's side of a journaled write.
     ("MemoryStore", "follow", EntryReplication::Journaled),
-    ("MemoryStore", "follow_load", EntryReplication::Journaled),
     ("MemoryStore", "follow_term", EntryReplication::Journaled),
     // The generation's number is journaled, one of the watched kinds. The
     // document it runs from is its door's to hold: whoever sends the event
@@ -277,7 +256,7 @@ mod tests {
     use super::*;
 
     /// The store's ingress traits, each with its file's text.
-    const TRAITS: [(&str, &str); 8] = [
+    const TRAITS: [(&str, &str); 7] = [
         ("WorkersStore", include_str!("../../store/workers.rs")),
         ("HealthSink", include_str!("../../store/health.rs")),
         ("LoadSink", include_str!("../../store/loads.rs")),
@@ -287,7 +266,6 @@ mod tests {
             "ReservationStore",
             include_str!("../../store/reservations.rs"),
         ),
-        ("SessionsStore", include_str!("../../store/sessions.rs")),
         ("LeasesStore", include_str!("../../store/leases.rs")),
     ];
 

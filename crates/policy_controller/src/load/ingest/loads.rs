@@ -482,9 +482,10 @@ where
     /// term, the one the replica leads. It pays the store's publications
     /// either way, whoever wrote the rows: a follower's applier writes
     /// them, and the instant the store names is read again at each tick. A
-    /// turn to no term ends the run of polls, with its calls still out and
-    /// its grouping of the membership; a turn to a term starts the next
-    /// with a tick at once.
+    /// turn of the word ends the run of polls, with its calls still out and
+    /// its grouping of the membership, and drops every load row the store
+    /// holds: a lead's rows end with it. A turn to a term starts the next
+    /// run with a tick at once.
     ///
     /// The watch keeps its last word alone: a loss and the take after it,
     /// told before the loop looked, read as one word. It names another
@@ -524,6 +525,7 @@ where
                     if word != under {
                         under = word;
                         schedule = Schedule::default();
+                        self.forget_loads();
                         if under.is_some() {
                             self.tick(&mut schedule);
                         }
@@ -538,6 +540,20 @@ where
                     }
                 }
             }
+        }
+    }
+
+    /// A turn of the role's word: every load row the store holds is dropped,
+    /// with the overload verdict it made and the receipt that held a poll
+    /// back. A lead's rows end with the lead. A replica that follows is sent
+    /// no load row, so a row left here would stand for the whole follow and
+    /// be read at the next take, as old as that. The run's schedule went
+    /// first, with its calls still out: no answer of the lead before lands
+    /// behind this.
+    fn forget_loads(&self) {
+        let (_, rows) = self.store.all_rows();
+        for row in &rows {
+            self.store.evict(row.id);
         }
     }
 

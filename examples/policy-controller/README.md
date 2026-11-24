@@ -23,15 +23,17 @@ instead ([`wasm-guest-policy`](../wasm/wasm-guest-policy)).
   `pack`.
 - `main`: the crate's command line and run loop over those stages.
 - `policy.yaml`: a policy document that names `pack` as it names a built-in.
-- The tests: a store fed as the controller's ingestion feeds one
-  (registration, the prober's status, the engines' load reports) gives the
-  rows, and the decision picks the busy worker, then the idle one once the
-  prober takes the busy one out. A worker with no report yet counts as idle,
-  and an idle fleet ties. A gateway's veto takes its worker out for that
-  gateway alone. A worker whose queue reaches its overload threshold is
+- The tests: a worker list as a controller holds one (the worker crate's
+  worker objects, their status, their engines' load reports through a load
+  feed) is handed to the engine with each request, and the request goes to
+  the busy worker, then to the idle one once the busy one is taken out of
+  rotation. A worker that joins late is in force at once. A worker with no
+  report yet counts as idle, and an idle fleet ties. A route's own rule
+  takes a worker out for its requests alone. A worker judged overloaded is
   passed over, and the idle one opens. The catalog a controller is bound
   with validates the document. Handed the document as its spec file, that
-  controller decides by it over its own store, and the stock controller
+  controller runs it as its generation 1, the document decides over a
+  worker list by the controller's own stages, and the stock controller
   refuses the file by the scorer's name. The built binary's start-up line
   names `pack` among its scorers, and started on the document it runs
   generation 1. It runs on the allocator it registers, with the settings it
@@ -83,7 +85,7 @@ with no error: a stage over one ties or keeps every worker.
 
 | A stage reads | Where it comes from | In this controller today |
 |---|---|---|
-| `Candidate::health` | The prober's status of the worker, the pool's circuit breaker and the overload verdict on its engine's load reports. | The prober's status. A veto of the asking gateway is in the row only where the rows were written for the request: the stalled bit, and the breaker bit beside it where the veto holds, as the gateway's own open breaker does. Beside rows the store lends, both bits read clear and the veto stands in the constraints: the row's position in `Constraints::stalled`, and in `Constraints::held` where the veto holds. So a stage asks `Constraints::masks` beside the stalled bit, as `healthy` does. The controller keeps no breaker of its own. The overload bit reads as clear unless the store judges the engine's load reports over a threshold. |
+| `Candidate::health` | The prober's status of the worker, the pool's circuit breaker and the overload verdict on its engine's load reports. | The prober's status. A veto of the asking gateway is in the row only where the rows were written for the request: the stalled bit, and the breaker bit beside it where the veto holds, as the gateway's own open breaker does. Beside rows the store lends, both bits read clear and the veto stands in the constraints: the row's position in `Constraints::stalled`, and in `Constraints::held` where the veto holds. So a stage asks `Constraints::masks` beside the stalled bit, as `healthy` does. The controller keeps no breaker of its own. The overload bit reads as clear unless the controller's load monitor judges the engine's load reports over a threshold. |
 | `Candidate::load` (`LoadRow`) | The engine's own load report: requests running and queued, KV-cache usage, the drain rate, the report's age. A stage that reads it declares `Needs::loads`. | Fed. |
 | `Candidate::in_flight` | The requests the deciding host holds on the worker right now. | The leases on file that book the worker, read through `RequestFacts::in_flight`: beside the rows the store lends, in the row where the rows are written for the request. The field itself reads 0 beside lent rows, so a stage asks the request's facts. A decision reads one count a row. |
 | `Candidate::session_hit`, `session_in_flight` | The request's session key: whether it is pinned to this worker, and its requests in flight there. | `session_hit` is set on the worker the ask names as pinned. A key's requests in flight are the leases on file whose decisions read the key's count, read through `RequestFacts::session_in_flight`: the store lends them beside the rows for a keyed request under a rule with an in-flight cap. The field itself reads 0, so a stage asks the request's facts. For any other request none is lent and the read is 0. |
@@ -93,8 +95,9 @@ with no error: a stage over one ties or keeps every worker.
 | `RequestFacts` | The request: the model, the tenant, the session key, the prompt's size and block hashes, the allow-listed headers. | The caller's, not the store's. |
 | `PoolFacts`, at `DecisionScope::open` | The pool the model resolves to: its size, the policy's generation, the overload regime. A stage that holds a decision scope reads it when the scope opens. | The size and the generation. The overload regime is not fed yet and reads as none. |
 
-`Pack` reads `Candidate::load` and says so in `needs`. The example's test
-feeds a store through the same doors and reads the decision.
+`Pack` reads `Candidate::load` and says so in `needs`. The example's tests
+hand the engine a worker list and its engines' load reports, and read where
+a request goes.
 
 ## The policy document
 
@@ -114,13 +117,12 @@ typed parameters: the crate's README shows one. The command line is the
 crate's, and it refuses a flag it does not know.
 
 The stock `not-overloaded` filter is where `pack` stops filling a worker. It
-drops a worker whose engine the store judges overloaded: the queue or the
-KV-cache usage in its load reports stands at or over a threshold. The
-threshold is the worker's own, named at its registration, or its pool's,
-from the policy document applied to the store: 8 queued requests and a usage
-of 0.8 where the document names none. The example's tests show both: a fleet
-whose workers each name a queue threshold, and a controller handed this
-document, where the default stands.
+drops a worker judged overloaded: the queue or the KV-cache usage in its
+engine's load reports stands at or over a threshold. A started controller's
+load monitor judges each worker by the threshold its registration names, or
+by the program's: 8 queued requests and a usage of 0.8. The example's tests
+show what the verdict does: a worker judged overloaded is passed over, and
+the next one opens.
 
 The stock build's catalog refuses this document by the scorer's name. The
 published schema (`crates/policy_controller/policyspec.schema.json`) cannot
@@ -174,7 +176,7 @@ smg-policy-controller = { git = "https://github.com/smg-project/smg", features =
 ```
 
 - `controller`: the listeners, the command line and `controller::run`.
-- `worker-host`: the cache-event feed. With it a controller reads cache events from each gRPC worker whose row asks for them and names a model. The stock image is built with it. Without it a cache-aware document places by warm-up and load.
+- `worker-host`: the cache-event feed. `controller` turns it on: a controller reads cache events from each gRPC worker whose row asks for them and names a model.
 - `kubernetes`: the Lease election the Helm chart's replicas use.
 - `client`: the reference client of the protocol. The example's tests ask
   the started controller its decisions through it.

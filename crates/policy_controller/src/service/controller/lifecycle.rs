@@ -22,15 +22,15 @@
 //! applies it where it is at work or keeps its watch over the file, and
 //! the session itself where it does neither, in the order the frames
 //! were read. A `Decide` stream hands the release of a decision it stops
-//! at its send through a hand of its own ([`open`]).
+//! at its send through a hand of its own.
 //!
 //! A frame whose lease is on file tells the engine that issued it, the
 //! generation's own, what became of the decision: its dispatch, its
 //! completion or its release. A generation that no longer stands is told
 //! nothing: the stages of a later one never saw the issue. A dispatch
 //! alone goes further: it feeds the standing generation's counts of
-//! sends, whichever generation issued the lease, where the standing
-//! world still lists the worker at the rank the dispatch names.
+//! sends, whichever generation issued the lease, where the replica's
+//! worker objects still list the worker at the rank the dispatch names.
 //!
 //! A pair's lease stands under one id: its record is the prefill side,
 //! and its decode side is filed beside the record. A frame moves the
@@ -40,20 +40,22 @@
 //! pair's lease does not hold, or on a side that ended, writes nothing
 //! and tells nothing. A single's lease reads no side.
 
-use std::time::Instant;
+use std::{sync::Arc, time::Instant};
 
 use tonic::Status;
 use tracing::error;
 
+use super::lease_words;
 use crate::{
-    engine::{decision_slot::DecisionSlot, store_backed_engine, view::WorkerId},
+    engine::{decision_slot::DecisionSlot, view::WorkerId},
     service::proto::{
         self,
         completed::Class,
         released::{Reason, What},
     },
-    store::{GatewayId, Hand, MemoryStore, Sides, StoreSnapshot},
+    store::{Hand, MemoryStore, Sides, StoreSnapshot},
     tracking::lease::{Dispatch, LeaseId, Outcome, ReleaseReason, Said, Side, TransportClass},
+    worker_host::{Members, Objects},
 };
 
 /// A `Dispatched` frame: the gateway's lease moves to dispatched at `now`.
@@ -74,8 +76,8 @@ pub(crate) fn dispatched(
 
 /// A `Completed` frame: the lease's side ends with its outcome, and the
 /// gateway's completion on the worker is written for the health
-/// precedence, whether or not the lease is on file: the door's one
-/// routine says both ([`store_backed_engine::completed`]).
+/// precedence, whether or not the lease is on file: one routine says
+/// both ([`lease_words::completed`]).
 ///
 /// # Errors
 ///
@@ -87,7 +89,7 @@ pub(crate) fn completed(
     now: Instant,
 ) -> Result<(), Status> {
     let (lease, outcome) = outcome(frame)?;
-    store_backed_engine::completed(store, hand.gateway(), &outcome, now, |said| {
+    lease_words::completed(store, hand.gateway(), &outcome, now, |said| {
         store.hand(hand, lease, said);
     });
     Ok(())
@@ -113,33 +115,37 @@ pub(crate) fn released(
     Ok(())
 }
 
-/// Opens a hand at the leases' files, a session's or a `Decide` stream's:
-/// what it says of `gateway`'s leases is handed through it, and the store
-/// is given the word to the engine that whoever applies it tells with
-/// ([`tells`]).
-pub(crate) fn open(store: &MemoryStore, gateway: GatewayId) -> Hand {
-    tells(store);
-    Hand::new(gateway)
-}
-
-/// Gives the store the word to the engine of a frame applied to a lease.
-pub(crate) fn tells(store: &MemoryStore) {
-    store.tell_through(told);
+/// Gives the store the word to the engine of a frame applied to a lease:
+/// whoever applies the frame tells with it. The word holds `objects`, the
+/// replica's worker objects, and asks them whether the worker a dispatch
+/// names stands at its rank ([`Objects::lists_rank`]).
+///
+/// A replica gives it once, at the start of its deciders, and so before a
+/// session or a `Decide` stream opens a hand: the first word a store is
+/// given stays.
+pub(crate) fn tells(store: &MemoryStore, objects: &Arc<Objects<Members>>) {
+    let objects = Arc::clone(objects);
+    store.tell_through(move |store, world, found, said, by| {
+        told(store, world, found, said, by, |id, rank| {
+            objects.lists_rank(id, rank)
+        });
+    });
 }
 
 /// Tells the engine what a frame said of a lease, whoever applies the
-/// frame: the order's own word ([`store_backed_engine::told`]), which holds a
+/// frame: the lease's own word ([`lease_words::told`]), which holds a
 /// stage's call that panics and counts it on the store
 /// ([`MemoryStore::lifecycle_faults`]). A streak of faults writes one line
-/// here.
+/// here. `listed` says whether a worker stands at a rank.
 fn told(
     store: &MemoryStore,
     world: &StoreSnapshot,
     found: &Sides,
     said: Said,
     by: Option<DecisionSlot>,
+    listed: impl Fn(WorkerId, u16) -> bool,
 ) {
-    if store_backed_engine::told(store, world, found, said, by) {
+    if lease_words::told(store, world, found, said, by, listed) {
         error!(
             lease = found.record.lease.id.0,
             "a lease's lifecycle call panicked: held, and the lease's event stands as applied"
@@ -258,6 +264,9 @@ fn past(field: &'static str, number: u32, most: u32) -> Status {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    // The rule a guard's lease is told by.
+    mod lease_on_file;
+
     use std::{
         cell::RefCell,
         sync::Arc,
@@ -268,20 +277,24 @@ pub(crate) mod tests {
     use tonic::{Code, Status};
 
     use super::{
-        class, completed, dispatch, dispatched, open, outcome, reason, release, released, side,
+        class, completed, dispatch, dispatched, outcome, reason, release, released, side, tells,
+        told,
     };
     use crate::{
-        document::spec::{AppliedSpec, Assignment, PolicySpec, Recovery},
+        document::spec::{AppliedSpec, PolicySpec},
         engine::{
             decision::{Pair, Target, Targets},
             framework::{Picker, TieBand},
-            sticky_sessions::{SessionRule, SessionVerdict},
-            view::{Candidate, Health, Phase, RequestFacts, Session, WorkerId},
+            sticky_sessions::SessionVerdict,
+            view::{Candidate, Health, Phase, RequestFacts, Role, Session, WireModes, WorkerId},
             Constraints, PoolFacts, Scratch,
         },
         policies::random::Random,
         service::{
-            controller::gateways::tests::lease,
+            controller::{
+                decision_slots::tests::{holder, ready},
+                gateways::tests::lease,
+            },
             proto::{
                 self,
                 completed::Class,
@@ -290,10 +303,13 @@ pub(crate) mod tests {
         },
         stages::{lifecycle::Lifecycle, registry::StageRegistry},
         store::{
-            DecodeSide, GatewayId, HealthSink, LeaseRecord, LeaseState, LeasesStore, MemoryStore,
-            PickRecord, SessionsStore, WorkerFacts, WorkersStore,
+            DecodeSide, GatewayId, Hand, HealthSink, LeaseRecord, LeaseState, LeasesStore,
+            MemoryStore, PickRecord, WorkerFacts, WorkersStore,
         },
-        tracking::lease::{Dispatch, Lease, LeaseId, Outcome, ReleaseReason, Side, TransportClass},
+        tracking::{
+            lease::{Dispatch, Lease, LeaseId, Outcome, ReleaseReason, Side, TransportClass},
+            DispatchCredit,
+        },
     };
 
     const A: GatewayId = GatewayId(11);
@@ -307,6 +323,18 @@ pub(crate) mod tests {
         /// A case's own step inside a stage's call: the hearing stage's
         /// next release on this thread runs it once, before it returns.
         static AT_RELEASE: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+    }
+
+    /// A hand at the leases' files of a case's store, which no deciders
+    /// were started over. Where the store holds no word to the engine it
+    /// is given the engine's own ([`told`]) with no worker object to ask:
+    /// a count takes a send at a rank it does not know. The first word a
+    /// store is given stays.
+    pub(crate) fn open(store: &MemoryStore, gateway: GatewayId) -> Hand {
+        store.tell_through(|store, world, found, said, by| {
+            told(store, world, found, said, by, |_, _| true);
+        });
+        Hand::new(gateway)
     }
 
     /// A worker the store holds a row for.
@@ -858,317 +886,18 @@ pub(crate) mod tests {
         store.issue(record).expect("a lease");
     }
 
-    /// The worker the pin of record of [`KEY`] names.
-    fn pin_of_record(store: &MemoryStore) -> Option<WorkerId> {
-        SessionsStore::lookup(store, KEY.get()).map(|pin| pin.worker)
-    }
-
+    /// A lease whose generation left tells no engine of its dispatch: the
+    /// table of the generation that stands holds no key behind it.
     #[test]
-    fn a_dispatched_frame_writes_a_keyed_leases_pin_of_record() {
-        let store = MemoryStore::new();
-        let t0 = Instant::now();
-        let _heard = hearing(&store, 1);
-        keyed(&store, 1, 7, SessionVerdict::Claimed(WorkerId(7)), t0);
-        assert_eq!(pin_of_record(&store), None, "an issue pins nothing");
-        let at = t0 + Duration::from_millis(3);
-        dispatched(&store, &open(&store, A), &a_dispatched(1), at).expect("the frame reads");
-        let pin = SessionsStore::lookup(&store, KEY.get()).expect("a pin");
-        assert_eq!((pin.worker, pin.last_used), (WorkerId(7), at));
-        // A lease no sessions rule governed, and one with no key: no pin.
-        // The first has a key of its own: under the first lease's key the
-        // worker its rule prefers would be written again and hide a write.
-        let mut ungoverned = lease(A, 2, t0);
-        ungoverned.lease.generation = 1;
-        ungoverned.lease.session = Session::from_raw(77);
-        ungoverned.lease.session_verdict = SessionVerdict::None;
-        store.issue(ungoverned).expect("a lease");
-        issued(&store, 3, 1, t0);
-        for id in 2..=3 {
-            dispatched(&store, &open(&store, A), &a_dispatched(id), at).expect("the frame reads");
-        }
-        assert_eq!(pin_of_record(&store), Some(WorkerId(7)));
-        assert_eq!(SessionsStore::len(&store), 1);
-    }
-
-    #[test]
-    fn a_dispatch_on_the_failover_leaves_the_preferred_worker_pinned() {
-        let store = MemoryStore::new();
-        let t0 = Instant::now();
-        let _heard = hearing(&store, 1);
-        // The key is claimed on 1, respills to 2 and is then sent to 1
-        // again as its failover: 2 stays the worker the rule prefers.
-        let sent = [
-            (1, SessionVerdict::Claimed(WorkerId(1)), 1),
-            (2, SessionVerdict::Respill, 2),
-            (1, SessionVerdict::Pinned, 2),
-        ];
-        for (id, (target, verdict, preferred)) in (1..).zip(sent) {
-            keyed(&store, id, target, verdict, t0);
-            dispatched(&store, &open(&store, A), &a_dispatched(id), t0).expect("the frame reads");
-            assert_eq!(pin_of_record(&store), Some(WorkerId(preferred)), "{id}");
-        }
-    }
-
-    #[test]
-    fn a_lease_of_a_generation_that_left_still_writes_its_pin() {
+    fn a_lease_of_a_generation_that_left_tells_no_engine_of_its_dispatch() {
         let store = MemoryStore::new();
         let t0 = Instant::now();
         let _first = hearing(&store, 1);
         keyed(&store, 1, 7, SessionVerdict::Claimed(WorkerId(7)), t0);
         let _second = hearing(&store, 2);
         dispatched(&store, &open(&store, A), &a_dispatched(1), t0).expect("the frame reads");
-        // No engine is told, and the pin names the dispatched worker.
         let table = store.with_snapshot(|world| world.spec().engine().sessions().len());
-        assert_eq!((table, pin_of_record(&store)), (0, Some(WorkerId(7))));
-    }
-
-    /// A decision's read of [`KEY`] at `now` under a rule of `ttl_micros`,
-    /// in the table of the engine that stands.
-    fn read_under(store: &MemoryStore, ttl_micros: Option<u64>, now: Instant) {
-        let rule = SessionRule {
-            assignment: Assignment::Random,
-            inflight_cap: 0,
-            ttl_micros,
-            sweep_micros: 0,
-            recovery: Recovery::Original,
-        };
-        store.with_snapshot(|world| {
-            let table = world.spec().engine().sessions();
-            table.lookup(KEY, store.micros(now), &rule);
-        });
-    }
-
-    /// The pin of record ends where the engine's table forgets its key: the
-    /// instant the key's rule set at its last decision, and no instant
-    /// under a rule without a TTL.
-    #[test]
-    fn a_pin_of_record_ends_where_the_engines_table_forgets_its_key() {
-        let store = MemoryStore::new();
-        let t0 = Instant::now();
-        let _heard = hearing(&store, 1);
-        read_under(&store, Some(60_000_000), t0);
-        keyed(&store, 1, 7, SessionVerdict::Claimed(WorkerId(7)), t0);
-        let at = t0 + Duration::from_millis(3);
-        dispatched(&store, &open(&store, A), &a_dispatched(1), at).expect("the frame reads");
-        let pin = SessionsStore::lookup(&store, KEY.get()).expect("a pin");
-        let forgotten = store.micros(t0) + 60_000_000;
-        assert_eq!((pin.worker, pin.ends), (WorkerId(7), Some(forgotten)));
-        // The key read again under a rule without a TTL: its next dispatch
-        // moves the pin's end with it.
-        read_under(&store, None, t0);
-        keyed(&store, 2, 7, SessionVerdict::Pinned, t0);
-        dispatched(&store, &open(&store, A), &a_dispatched(2), at).expect("the frame reads");
-        let pin = SessionsStore::lookup(&store, KEY.get()).expect("a pin");
-        assert_eq!((pin.worker, pin.ends), (WorkerId(7), None));
-        // And read once more under a rule of half a minute: the table's
-        // word moves the pin's end earlier as well.
-        read_under(&store, Some(30_000_000), t0);
-        keyed(&store, 3, 7, SessionVerdict::Pinned, t0);
-        dispatched(&store, &open(&store, A), &a_dispatched(3), at).expect("the frame reads");
-        let pin = SessionsStore::lookup(&store, KEY.get()).expect("a pin");
-        let sooner = forgotten - 30_000_000;
-        assert_eq!((pin.worker, pin.ends), (WorkerId(7), Some(sooner)));
-    }
-
-    /// Files the keyed lease `id` of [`A`] on worker 7, as generation 1
-    /// issued it at `now` under a rule of `ttl_micros`.
-    fn keyed_under(store: &MemoryStore, id: u64, ttl_micros: Option<u64>, now: Instant) {
-        let mut record = lease(A, id, now);
-        record.lease.generation = 1;
-        record.lease.session = KEY;
-        record.lease.session_verdict = SessionVerdict::Claimed(WorkerId(7));
-        record.state = LeaseState::issued(ttl_micros);
-        record.lease.issued_micros = store.micros(now);
-        record.target = WorkerId(7);
-        store.issue(record).expect("a lease");
-    }
-
-    /// A dispatch whose key left the table since its decision makes the
-    /// entry anew, and no decision has read it: the pin of record ends by
-    /// the lease's own rule, not at the unread entry's instant.
-    #[test]
-    fn a_dispatch_that_makes_its_keys_entry_anew_ends_the_pin_by_its_leases_rule() {
-        let store = MemoryStore::new();
-        let t0 = Instant::now();
-        let _heard = hearing(&store, 1);
-        keyed_under(&store, 1, Some(60_000_000), t0);
-        let at = t0 + Duration::from_millis(3);
-        dispatched(&store, &open(&store, A), &a_dispatched(1), at).expect("the frame reads");
-        // The engine was told: its table holds the key again.
-        let table = store.with_snapshot(|world| world.spec().engine().sessions().len());
-        let pin = SessionsStore::lookup(&store, KEY.get()).expect("a pin");
-        let ends = store.micros(t0) + 60_000_000;
-        assert_eq!((table, pin.worker, pin.ends), (1, WorkerId(7), Some(ends)));
-    }
-
-    /// Each side of a pair carries the rule's TTL in its own issued state.
-    /// The prefill's dispatch ends the record's own issued state, and the
-    /// decode's dispatch behind it still ends its key's pin by the rule.
-    /// No plan files such a pair today, as a sessions rule runs under the
-    /// single plan alone: the record is filed by hand. No generation 7
-    /// stands, so no engine is told and each pin names its side's worker.
-    #[test]
-    fn a_pairs_second_dispatch_ends_its_keys_pin_by_its_own_sides_state() {
-        const DECODE_KEY: Session = Session::from_raw(43);
-        let store = MemoryStore::new();
-        let [p, d] = ["p", "d"].map(|key| worker(&store, key));
-        let t0 = Instant::now();
-        let mut targets = Targets::new();
-        targets.push(Target {
-            id: p,
-            pair: Some(Pair {
-                decode_id: d,
-                ..Pair::default()
-            }),
-            ..Target::default()
-        });
-        let issued = LeaseState::issued(Some(60_000_000));
-        let side = DecodeSide {
-            target: d,
-            picked: PickRecord::of_decodes(&targets),
-            session: DECODE_KEY,
-            state: issued,
-            tokens: 0,
-            target_index: 0,
-        };
-        let record = LeaseRecord {
-            lease: Lease {
-                id: LeaseId(1),
-                side: Side::Prefill,
-                generation: 7,
-                session: KEY,
-                session_verdict: SessionVerdict::Claimed(p),
-                issued_micros: store.micros(t0),
-                ..Lease::default()
-            },
-            gateway: A,
-            request: 1,
-            target: p,
-            picked: PickRecord::of(&targets),
-            decode: None,
-            term: 0,
-            issued_at: t0,
-            dispatch_deadline: t0 + Duration::from_secs(5),
-            state: issued,
-        };
-        LeasesStore::issue_pair(&store, record, side).expect("the key is free");
-        let at = t0 + Duration::from_millis(3);
-        for side in [proto::Side::Prefill, proto::Side::Decode] {
-            let frame = proto::Dispatched {
-                side: side.into(),
-                ..a_dispatched(1)
-            };
-            dispatched(&store, &open(&store, A), &frame, at).expect("the frame reads");
-        }
-        let ends = Some(store.micros(t0) + 60_000_000);
-        for (key, worker) in [(KEY, p), (DECODE_KEY, d)] {
-            let pin = SessionsStore::lookup(&store, key.get()).expect("a pin");
-            assert_eq!((pin.worker, pin.ends), (worker, ends));
-        }
-    }
-
-    /// A lease whose generation left tells no engine: its pin ends by the
-    /// TTL its own decision was made under, counted from its issue,
-    /// whatever the standing rules keep. Here one of them keeps its keys
-    /// for ever and the other an hour, and the lease's rule kept a minute.
-    #[test]
-    fn a_pin_no_engine_was_told_of_ends_by_its_leases_own_rule() {
-        let store = MemoryStore::new();
-        let t0 = Instant::now();
-        let _first = hearing(&store, 1);
-        keyed_under(&store, 1, Some(60_000_000), t0);
-        let mut document = PolicySpec::preset("manual").expect("a preset of this build");
-        document.generation = 2;
-        let mut for_ever = document.bindings[0].clone();
-        for_ever.matcher.model = "kept-for-ever".into();
-        let rule = for_ever.sessions.as_mut().expect("the preset's rule");
-        (rule.ttl_s, rule.sweep_s) = (u32::MAX, u32::MAX);
-        let rule = document.bindings[0].sessions.as_mut();
-        rule.expect("the preset's rule").ttl_s = 3_600;
-        document.bindings.insert(0, for_ever);
-        let spec = AppliedSpec::validate(&document).expect("the document validates");
-        store.apply(spec).expect("a later generation");
-        let at = t0 + Duration::from_millis(3);
-        dispatched(&store, &open(&store, A), &a_dispatched(1), at).expect("the frame reads");
-        let pin = SessionsStore::lookup(&store, KEY.get()).expect("a pin");
-        let ends = store.micros(t0) + 60_000_000;
-        assert_eq!((pin.worker, pin.ends), (WorkerId(7), Some(ends)));
-    }
-
-    /// A lease of a rule with no TTL pins with no end, though every
-    /// standing rule has one: the key was that rule's, and a standing
-    /// rule's TTL would end its pin of record early.
-    #[test]
-    fn a_pin_no_engine_was_told_of_has_no_end_under_a_lease_of_a_rule_with_no_ttl() {
-        let store = MemoryStore::new();
-        let t0 = Instant::now();
-        let _first = hearing(&store, 1);
-        keyed_under(&store, 1, None, t0);
-        // The manual preset stands as generation 2: its rule keeps a key
-        // an hour.
-        let mut document = PolicySpec::preset("manual").expect("a preset of this build");
-        document.generation = 2;
-        let rule = document.bindings[0].sessions.as_mut();
-        rule.expect("the preset's rule").ttl_s = 3_600;
-        let spec = AppliedSpec::validate(&document).expect("the document validates");
-        store.apply(spec).expect("a later generation");
-        let at = t0 + Duration::from_millis(3);
-        dispatched(&store, &open(&store, A), &a_dispatched(1), at).expect("the frame reads");
-        let pin = SessionsStore::lookup(&store, KEY.get()).expect("a pin");
-        assert_eq!((pin.worker, pin.ends), (WorkerId(7), None));
-    }
-
-    /// Two leases of one key under a rule of a second, in flight at an
-    /// apply, are dispatched in the reverse of their issues. The older
-    /// one, dispatched last, leaves the pin's end where the newer one's
-    /// rule counted it: its own count ended a tenth of a second before
-    /// its dispatch.
-    #[test]
-    fn an_older_lease_dispatched_last_never_ends_the_pin_earlier() {
-        let store = MemoryStore::new();
-        let t0 = Instant::now();
-        let ms = Duration::from_millis;
-        let _first = hearing(&store, 1);
-        keyed_under(&store, 1, Some(1_000_000), t0);
-        keyed_under(&store, 2, Some(1_000_000), t0 + ms(800));
-        let _second = hearing(&store, 2);
-        let hand = open(&store, A);
-        dispatched(&store, &hand, &a_dispatched(2), t0 + ms(1_000)).expect("the frame reads");
-        let ends = Some(store.micros(t0) + 1_800_000);
-        let pin = SessionsStore::lookup(&store, KEY.get()).expect("a pin");
-        assert_eq!(pin.ends, ends);
-        dispatched(&store, &hand, &a_dispatched(1), t0 + ms(1_100)).expect("the frame reads");
-        let pin = SessionsStore::lookup(&store, KEY.get()).expect("a pin");
-        assert_eq!((pin.last_used, pin.ends), (t0 + ms(1_100), ends));
-    }
-
-    /// A lease no engine is told of, dispatched behind a newer lease of
-    /// its key that the engine in place was told of: the end the table
-    /// gave the pin stands, though the older lease's own rule, the shorter
-    /// one, counts an earlier end.
-    #[test]
-    fn an_end_the_table_gave_stands_behind_an_older_lease_of_a_shorter_rule() {
-        let store = MemoryStore::new();
-        let t0 = Instant::now();
-        let ms = Duration::from_millis;
-        let _first = hearing(&store, 1);
-        keyed_under(&store, 1, Some(1_000_000), t0);
-        let _second = hearing(&store, 2);
-        // The generation in place reads the key under a rule of a minute,
-        // and its lease is dispatched first.
-        read_under(&store, Some(60_000_000), t0 + ms(1));
-        let mut newer = lease(A, 2, t0 + ms(1));
-        newer.lease.generation = 2;
-        newer.lease.session = KEY;
-        newer.lease.session_verdict = SessionVerdict::Claimed(WorkerId(7));
-        newer.target = WorkerId(7);
-        store.issue(newer).expect("a lease");
-        let hand = open(&store, A);
-        dispatched(&store, &hand, &a_dispatched(2), t0 + ms(2)).expect("the frame reads");
-        dispatched(&store, &hand, &a_dispatched(1), t0 + ms(3)).expect("the frame reads");
-        let pin = SessionsStore::lookup(&store, KEY.get()).expect("a pin");
-        let forgotten = store.micros(t0 + ms(1)) + 60_000_000;
-        assert_eq!((pin.last_used, pin.ends), (t0 + ms(3), Some(forgotten)));
+        assert_eq!(table, 0);
     }
 
     #[test]
@@ -1474,5 +1203,134 @@ pub(crate) mod tests {
         // completion is on file.
         assert_eq!(state(&store, A, 1), Some(LeaseState::ISSUED));
         assert!(!store.completed_ok_since(A, served, t0));
+    }
+
+    /// The model of the cases of a profile's count of sends.
+    const COUNTED: &str = "counted";
+
+    /// `generation` of the least-load preset, whose scorer reads its
+    /// profile's count of sends.
+    fn counted(generation: u64) -> AppliedSpec {
+        let mut document = PolicySpec::preset("least_load").expect("a preset of this build");
+        document.generation = generation;
+        let digest = document.digest().expect("the document digests");
+        AppliedSpec::validate_digested(&document, digest, &StageRegistry::builtin(), &[])
+            .expect("a preset of this build validates")
+    }
+
+    /// Applies [`counted`] of `generation` and hands back that generation's
+    /// count of sends.
+    fn counting(store: &MemoryStore, generation: u64) -> Arc<DispatchCredit> {
+        store
+            .apply(counted(generation))
+            .expect("a later generation");
+        store.deciding(|world| Arc::clone(&world.spec().engine().sent_credits[0]))
+    }
+
+    /// Files the lease `id` of [`A`] on `target`, as `generation` issued it.
+    fn issued_on(store: &MemoryStore, id: u64, generation: u64, target: WorkerId, now: Instant) {
+        let mut record = lease(A, id, now);
+        record.lease.generation = generation;
+        record.target = target;
+        store.issue(record).expect("a lease");
+    }
+
+    /// The sends `count` holds on the first rank of `worker`, read under no
+    /// report and at the clock's start: none is ended or aged.
+    fn sends(count: &DispatchCredit, worker: WorkerId) -> u32 {
+        let row = Candidate {
+            id: worker,
+            ..Candidate::default()
+        };
+        count.read(&RequestFacts::default(), &row).requests
+    }
+
+    /// A dispatch enters the count of sends of the generation that stands,
+    /// whichever generation issued its lease: the store tells the standing
+    /// engine of every send, and a generation that left counts no more.
+    #[test]
+    fn a_dispatch_of_an_older_generations_lease_enters_the_standing_generations_sends() {
+        let store = MemoryStore::new();
+        let t0 = Instant::now();
+        let served = ready(&store, "a", COUNTED, Role::Single, WireModes::HTTP);
+        let first = counting(&store, 1);
+        issued_on(&store, 1, 1, served, t0);
+        let standing = counting(&store, 2);
+        dispatched(&store, &open(&store, A), &a_dispatched(1), t0).expect("the frame reads");
+        assert_eq!(sends(&standing, served), 1);
+        assert_eq!(sends(&first, served), 0, "the generation that left");
+    }
+
+    /// A dispatch that comes late enters no rank of a worker that left: a
+    /// count asks the worker objects the store's word holds whether the
+    /// rank is listed, and the removal took the worker's object out
+    /// before the store was told. The lease reads dispatched all the
+    /// same, and a worker whose object stands is counted.
+    #[test]
+    fn a_late_dispatch_enters_no_rank_of_a_worker_that_left() {
+        let store = Arc::new(MemoryStore::new());
+        let objects = holder(&store);
+        tells(&store, &objects);
+        let t0 = Instant::now();
+        let left = ready(&store, "a", COUNTED, Role::Single, WireModes::HTTP);
+        let stays = ready(&store, "b", COUNTED, Role::Single, WireModes::HTTP);
+        let count = counting(&store, 1);
+        issued_on(&store, 1, 1, left, t0);
+        issued_on(&store, 2, 1, stays, t0);
+        objects.follow(&*store);
+        let row = WorkersStore::get(&*store, left).expect("the row");
+        let removed = objects.remove(&store, left, row.revision);
+        assert!(removed.is_some(), "the row leaves");
+        let hand = Hand::new(A);
+        dispatched(&store, &hand, &a_dispatched(1), t0).expect("the frame reads");
+        dispatched(&store, &hand, &a_dispatched(2), t0).expect("the frame reads");
+        assert!(matches!(
+            state(&store, A, 1),
+            Some(LeaseState::Dispatched { .. })
+        ));
+        assert_eq!(sends(&count, left), 0);
+        assert_eq!(sends(&count, stays), 1);
+    }
+
+    /// A dispatch on a worker whose object stands is counted while the
+    /// store's world lists the worker not yet: a registration's object
+    /// stands from its write, and the world lists its row at the build
+    /// its publication window ends with. The decision that sent the
+    /// request read the worker objects, and so does its count.
+    #[test]
+    fn a_dispatch_inside_a_registrations_window_is_counted() {
+        let store = Arc::new(MemoryStore::with_publish_window(Duration::from_secs(3600)));
+        let objects = holder(&store);
+        tells(&store, &objects);
+        let t0 = Instant::now();
+        let count = counting(&store, 1);
+        let joined = worker(&store, "late");
+        objects.follow(&*store);
+        issued_on(&store, 1, 1, joined, t0);
+        let listed = store.deciding(|world| world.booked_of(joined).is_some());
+        assert!(!listed, "the world lists the worker inside its window");
+        dispatched(&store, &Hand::new(A), &a_dispatched(1), t0).expect("the frame reads");
+        assert_eq!(sends(&count, joined), 1);
+    }
+
+    /// An apply hands the standing generation's sends to the generation it
+    /// takes, under the profile's name. A generation the store refuses
+    /// takes none.
+    #[test]
+    fn an_apply_hands_the_standing_sends_to_the_generation_it_takes() {
+        let store = MemoryStore::new();
+        let t0 = Instant::now();
+        let served = ready(&store, "a", COUNTED, Role::Single, WireModes::HTTP);
+        let first = counting(&store, 1);
+        issued_on(&store, 1, 1, served, t0);
+        dispatched(&store, &open(&store, A), &a_dispatched(1), t0).expect("the frame reads");
+        assert_eq!(sends(&first, served), 1);
+        // A generation no newer than the one that stands is refused.
+        let stale = counted(1);
+        let refused = Arc::clone(&stale.engine().sent_credits[0]);
+        assert!(store.apply(stale).is_err());
+        assert_eq!(sends(&refused, served), 0, "a refused generation");
+        let next = counting(&store, 2);
+        assert_eq!(sends(&next, served), 1);
     }
 }

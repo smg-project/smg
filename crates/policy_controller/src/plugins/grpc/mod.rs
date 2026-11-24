@@ -35,10 +35,12 @@
 //! native stages run while it computes; a plugin bound as the picker alone
 //! is asked at the pick, with the combined native scores. The deciding
 //! thread waits for the answer only at the first stage that needs it, under
-//! the frame's deadline: the plugin's own budget clamped to what the
-//! decision has left (one remainder per thread per decision, shared with
-//! every other plugin and side the decision opens), and the round trip is
-//! drawn from that remainder.
+//! the frame's deadline: the plugin's own budget, or the default frame where
+//! it states none
+//! ([`FrameBudget::DEFAULT_MICROS`](crate::plugins::shared::FrameBudget::DEFAULT_MICROS)),
+//! clamped to what the decision has left (one remainder per thread per
+//! decision, shared with every other plugin and side the decision opens),
+//! and the round trip is drawn from that remainder.
 //!
 //! What a failure does: a miss of the deadline takes the fallbacks, and
 //! whose miss it is has one table, the one every kind reads a run-out by. It
@@ -51,8 +53,8 @@
 //! the promise nothing says whose it is: the decision's budget spent, counted
 //! unread. Every miss but the host's is in the plugin's latency sample for
 //! the decision at what the frame was given, so a plugin that misses every
-//! deadline of a budget past half the decision's opens the breaker on its
-//! p50 whatever the table says. A `decline`
+//! deadline of its own budget opens the breaker on its p50, whatever the
+//! table says and whatever the request's budget. A `decline`
 //! takes the stage's fallback and keeps the stream (a budget decline is the
 //! plugin's Busy: the fallback at once, counted, no failure); an answer that
 //! breaks a validity rule (a repeated or out-of-range survivor, a non-finite

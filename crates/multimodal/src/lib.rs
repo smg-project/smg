@@ -16,7 +16,7 @@ mod mp4_metadata;
 mod opencv_buffer;
 mod pixel_convert;
 pub mod registry;
-pub mod tracker;
+pub(crate) mod tracker;
 pub mod types;
 mod video_seek;
 pub mod vision;

@@ -64,10 +64,7 @@ impl Scorer for ReadsTwo {
     }
 
     fn needs(&self) -> Needs {
-        Needs {
-            signal_cells: true,
-            ..Needs::default()
-        }
+        Needs::NONE.with_signal_cells()
     }
 }
 
@@ -478,10 +475,9 @@ impl Scorer for Mismatched {
     }
 
     fn needs(&self) -> Needs {
-        Needs {
-            signal_cells: self.declares,
-            ..Needs::default()
-        }
+        let mut needs = Needs::NONE;
+        needs.signal_cells = self.declares;
+        needs
     }
 }
 
@@ -545,10 +541,9 @@ impl Filter for Declares {
     }
 
     fn needs(&self) -> Needs {
-        Needs {
-            signal_cells: self.declares,
-            ..Needs::default()
-        }
+        let mut needs = Needs::NONE;
+        needs.signal_cells = self.declares;
+        needs
     }
 }
 
@@ -569,10 +564,9 @@ impl Picker for Declares {
     }
 
     fn needs(&self) -> Needs {
-        Needs {
-            signal_cells: self.declares,
-            ..Needs::default()
-        }
+        let mut needs = Needs::NONE;
+        needs.signal_cells = self.declares;
+        needs
     }
 }
 
@@ -676,10 +670,9 @@ impl Filter for AtMost {
     }
 
     fn needs(&self) -> Needs {
-        Needs {
-            signal_cells: self.declares,
-            ..Needs::default()
-        }
+        let mut needs = Needs::NONE;
+        needs.signal_cells = self.declares;
+        needs
     }
 }
 

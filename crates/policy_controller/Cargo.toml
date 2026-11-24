@@ -72,6 +72,8 @@ smg-grpc-client = { workspace = true, optional = true }
 async-trait = { workspace = true, optional = true }
 smg-worker = { workspace = true, optional = true }
 wfaas = { workspace = true, optional = true }
+# The header map a request's headers are read from (the `in-process` feature).
+http = { workspace = true, optional = true }
 # Worker discovery (the `discovery` feature): the discovery crate with its
 # four providers, each of which the controller's flags can select.
 smg-service-discovery = { workspace = true, features = ["consul", "file", "kubernetes", "slurm"], optional = true }
@@ -157,14 +159,17 @@ operator = [
 ]
 # The standalone controller: the ingestion drivers, the listeners with their
 # scopes, the protocol's generated service and client, the election, the gRPC
-# health service and the admin endpoints. The stock binary also needs
-# `worker-host` to read cache events.
+# health service and the admin endpoints. It turns on `worker-host`, so every
+# controller keeps its worker objects, probes them and reads cache events,
+# and `in-process`, the engine over worker objects.
 # Off by default: the engine alone has no server dependency. It builds on
 # Linux and macOS: the gRPC plugin kind dials a Unix socket and reads its
 # peer's user through `rustix`, which is declared for those two.
 controller = [
     "ingest",
     "operator",
+    "in-process",
+    "worker-host",
     "dep:axum",
     "dep:clap",
     "dep:hyper-util",
@@ -217,13 +222,21 @@ worker-host = [
 
 # Worker discovery on the leading controller, over the replica's worker
 # objects. Off by default.
-discovery = ["controller", "worker-host", "dep:smg-service-discovery"]
+discovery = ["controller", "dep:smg-service-discovery"]
 
 # The engine in a gateway's own process: one front over the gateway's worker
 # objects, which reads a worker's health where the worker crate keeps it. It
 # names nothing of the store. Off by default: it brings the worker crate's
-# runtime.
-in-process = ["dep:smg-worker", "smg-worker/runtime"]
+# runtime. The engine's own task takes Tokio's timer, which that runtime
+# builds already.
+in-process = [
+    "dep:http",
+    "dep:smg-worker",
+    "dep:tokio",
+    "smg-worker/runtime",
+    "tokio/macros",
+    "tokio/time",
+]
 
 default = ["wasm"]
 # The WebAssembly plugin host over the committed `smg:policy` worlds.
@@ -300,11 +313,17 @@ tikv-jemallocator = { workspace = true }
 [[bin]]
 name = "smg-policy-controller"
 path = "src/bin/smg-policy-controller.rs"
-required-features = ["controller", "worker-host"]
+required-features = ["controller"]
+
+# A program that decides in its own process: it starts the engine and
+# serves each request by the one call the engine has for a request.
+[[example]]
+name = "in_process"
+required-features = ["in-process"]
 
 [[test]]
 name = "binary"
-required-features = ["controller", "worker-host"]
+required-features = ["controller"]
 
 [[test]]
 name = "operator_door"
@@ -312,16 +331,24 @@ required-features = ["operator"]
 
 [[test]]
 name = "spec_file"
-required-features = ["controller", "worker-host"]
+required-features = ["controller"]
 
 [[test]]
 name = "spec_store"
-required-features = ["controller", "worker-host"]
+required-features = ["controller"]
 
-# Replays recorded rows through the load report conversion under `ingest`.
+# The program of the `in_process` example, driven by cases: the example's
+# own module, taken in as it stands.
+[[test]]
+name = "caller"
+required-features = ["in-process"]
+
+# Replays recorded rows through the load report conversion under `ingest`,
+# and the hard-demand rows over worker objects under `in-process`.
+# The overload rows run a host's load monitor, which `worker-host` brings.
 [[test]]
 name = "classic_rows"
-required-features = ["ingest"]
+required-features = ["ingest", "in-process", "worker-host"]
 
 [[test]]
 name = "controller"
@@ -333,7 +360,7 @@ required-features = ["kubernetes"]
 
 [[test]]
 name = "failover"
-required-features = ["client", "worker-host"]
+required-features = ["client"]
 
 [[test]]
 name = "fleet"
@@ -354,11 +381,11 @@ required-features = ["controller"]
 
 [[test]]
 name = "membership_calls"
-required-features = ["controller", "worker-host"]
+required-features = ["controller"]
 
 [[test]]
 name = "replicas"
-required-features = ["controller", "worker-host"]
+required-features = ["controller"]
 
 [[test]]
 name = "replication"
@@ -366,7 +393,7 @@ required-features = ["controller"]
 
 [[test]]
 name = "watch_workers"
-required-features = ["controller", "worker-host"]
+required-features = ["controller"]
 
 [[bench]]
 name = "decision"
@@ -429,14 +456,6 @@ name = "store_view"
 harness = false
 
 [[bench]]
-name = "store_pair"
-harness = false
-
-[[bench]]
-name = "store_lent_rows"
-harness = false
-
-[[bench]]
 name = "store"
 harness = false
 
@@ -446,10 +465,6 @@ harness = false
 
 [[bench]]
 name = "store_journal"
-harness = false
-
-[[bench]]
-name = "store_affinity_rows"
 harness = false
 
 [[bench]]

@@ -374,6 +374,7 @@ impl MessageContent {
 pub struct ChatCompletionRequest {
     /// A list of messages comprising the conversation so far
     #[validate(custom(function = "validate_messages"))]
+    #[serde(deserialize_with = "crate::message_read::read")]
     pub messages: Vec<ChatMessage>,
 
     /// ID of the model to use
@@ -1241,6 +1242,10 @@ impl Normalizable for ChatCompletionRequest {
 impl GenerationRequest for ChatCompletionRequest {
     fn rid(&self) -> Option<&str> {
         self.rid.as_deref()
+    }
+
+    fn max_output_tokens(&self) -> Option<u32> {
+        self.output_token_cap()
     }
 
     fn is_stream(&self) -> bool {

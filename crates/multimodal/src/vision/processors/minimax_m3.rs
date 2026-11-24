@@ -61,26 +61,26 @@ use crate::{
 mod sglang_video;
 
 /// Default patch size.
-pub const DEFAULT_PATCH_SIZE: usize = 14;
+pub(crate) const DEFAULT_PATCH_SIZE: usize = 14;
 
 /// Default spatial merge size (2x2 patch merge before the projector).
-pub const DEFAULT_MERGE_SIZE: usize = 2;
+pub(crate) const DEFAULT_MERGE_SIZE: usize = 2;
 
 /// Default temporal patch size (video frames are padded to a multiple of this).
-pub const DEFAULT_TEMPORAL_PATCH_SIZE: usize = 2;
+pub(crate) const DEFAULT_TEMPORAL_PATCH_SIZE: usize = 2;
 
 /// Default minimum pixels (4 * 28 * 28 = 3,136).
-pub const DEFAULT_MIN_PIXELS: usize = 4 * 28 * 28;
+pub(crate) const DEFAULT_MIN_PIXELS: usize = 4 * 28 * 28;
 
 /// Default maximum pixels for images (576 * 28 * 28 = 451,584).
 ///
 /// 576 is the model's `image_seq_length`: at the bound, an image occupies
 /// exactly `image_seq_length` tokens after the 2x2 merge (2,304 patches before
 /// it).
-pub const DEFAULT_MAX_PIXELS: usize = 576 * 28 * 28;
+pub(crate) const DEFAULT_MAX_PIXELS: usize = 576 * 28 * 28;
 
 /// Default maximum pixels per video frame (768 * 28 * 28 = 602,112), not per sampled volume.
-pub const DEFAULT_VIDEO_MAX_PIXELS: usize = 768 * 28 * 28;
+pub(crate) const DEFAULT_VIDEO_MAX_PIXELS: usize = 768 * 28 * 28;
 
 /// The config block holding M3's merge parameters.
 const COMPRESSION_CONFIG_KEY: &str = "img_token_compression_config";
@@ -104,7 +104,7 @@ impl Default for MiniMaxM3VisionProcessor {
 
 impl MiniMaxM3VisionProcessor {
     /// Create a processor with MiniMax-M3's default parameters.
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::build(
             DEFAULT_PATCH_SIZE,
             DEFAULT_MERGE_SIZE,
@@ -112,26 +112,6 @@ impl MiniMaxM3VisionProcessor {
             DEFAULT_MIN_PIXELS,
             DEFAULT_MAX_PIXELS,
             DEFAULT_VIDEO_MAX_PIXELS,
-        )
-    }
-
-    /// Create a processor with custom settings.
-    pub fn with_config(
-        patch_size: usize,
-        merge_size: usize,
-        min_pixels: usize,
-        max_pixels: usize,
-        temporal_patch_size: usize,
-    ) -> Self {
-        // The caller's `max_pixels` governs video too; flooring it at the
-        // video default would ignore a deliberate reduction.
-        Self::build(
-            patch_size,
-            merge_size,
-            temporal_patch_size,
-            min_pixels,
-            max_pixels,
-            max_pixels,
         )
     }
 
@@ -208,7 +188,9 @@ impl MiniMaxM3VisionProcessor {
     /// unusable block value is the configuration error the construction path
     /// reports, so a prompt's stamps are never paired by a default that the
     /// preprocessing of the same config refuses.
-    pub fn temporal_patch_size_from(config: &PreProcessorConfig) -> Result<usize, TransformError> {
+    pub(crate) fn temporal_patch_size_from(
+        config: &PreProcessorConfig,
+    ) -> Result<usize, TransformError> {
         Ok(Self::declared_temporal_patch_size(config)?.unwrap_or(DEFAULT_TEMPORAL_PATCH_SIZE))
     }
 
@@ -223,11 +205,6 @@ impl MiniMaxM3VisionProcessor {
     }
 
     /// Layer a config over this processor's settings.
-    ///
-    /// Values the config does not specify keep whatever this processor was
-    /// built with, so settings supplied through [`Self::with_config`] survive
-    /// into `preprocess` and `calculate_num_tokens` instead of being reset to
-    /// the checkpoint defaults.
     fn layered_over(&self, config: &PreProcessorConfig) -> Result<Self, TransformError> {
         let merge_size = config
             .merge_size
@@ -562,10 +539,10 @@ mod tests {
     }
 
     #[test]
-    fn with_config_settings_survive_request_layering() {
+    fn built_settings_survive_request_layering() {
         // A processor built with explicit settings must keep them when a
         // request config does not override them.
-        let processor = MiniMaxM3VisionProcessor::with_config(14, 2, 3136, 200_704, 2);
+        let processor = MiniMaxM3VisionProcessor::build(14, 2, 2, 3136, 200_704, 200_704);
         let mut config = m3_config();
         // The checkpoint block carries merge/temporal but no pixel bounds.
         config.max_pixels = None;

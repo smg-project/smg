@@ -6,38 +6,37 @@
 //! (design 4.4: a scorer or picker allocates nothing per decision; the host
 //! keeps one scratch per thread so the framework allocates nothing after the
 //! first). The
-//! store's pins stand beside them: a build from the store allocates nothing
-//! after the first, and two membership writes are held to each other, a
-//! write that moves an offer to one that moves none and a registration into
-//! 512 workers to one into 8. A host in process is pinned too: a request
-//! held from its decision to its completion allocates nothing after the
-//! first ones. A separate executable, so it can declare the counting
-//! allocator the pins need.
+//! store's pins stand beside them: two membership writes are held to each
+//! other, a write that moves an offer to one that moves none and a
+//! registration into 512 workers to one into 8. A lease's life at the store
+//! allocates nothing once its file is sized: its record filed, its
+//! dispatch and its completion handed to the file, the completion written
+//! for the health rule and the sweep's pass. A host in process is pinned
+//! too, in a build
+//! with the `in-process` feature: a request held from its decision to its
+//! completion allocates nothing after the first ones. A separate
+//! executable, so it can declare the counting allocator the pins need.
 
 #![expect(clippy::expect_used, reason = "tests that stop on a broken setup")]
 
 mod common;
 
-use std::{
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 
 use common::counting_alloc::{calls, Counting};
 use smg_policy_controller::{
-    document::{AppliedSpec, PolicySpec, PRESETS},
+    document::{PolicySpec, PRESETS},
     engine::{
         AffinityFacts, AffinityHolder, AffinityRows, Candidate, Constraints, Engine, Health,
-        LoadRow, PairPools, PoolFacts, Request, RequestFacts, Role, Scratch, SignalSource,
-        StoreBackedEngine, Target, WireModes, WorkerId,
+        LoadRow, PairPools, PoolFacts, RequestFacts, Role, Scratch, SignalSource, Target,
+        WireModes, WorkerId,
     },
     stages::Lifecycle,
     store::{
-        pairing::PairingDescriptor, GatewayId, HealthSink, LoadSink, LoadSource, MemoryStore,
-        PairBuffers, ViewBuffers, ViewQuery, WorkerFacts, WorkerStatus, WorkersStore,
-        PUBLISH_WINDOW,
+        GatewayId, Hand, HealthSink, LeaseRecord, LeaseState, LeasesStore, LoadSink, LoadSource,
+        MemoryStore, PickRecord, WorkerFacts, WorkerStatus, WorkersStore, PUBLISH_WINDOW,
     },
-    tracking::{DecisionGuard, Lease, Outcome, Side, TransportClass},
+    tracking::{Dispatch, Lease, LeaseId, Outcome, Said, Side, TransportClass},
 };
 
 #[global_allocator]
@@ -616,95 +615,81 @@ fn store_of(n: usize) -> (MemoryStore, Vec<WorkerId>, Instant) {
     (store, ids, opened)
 }
 
+/// A lease's life at the store, over the store's own calls and no engine:
+/// its record filed, its dispatch and its completion handed to its file as
+/// a session hands a gateway's frames, the gateway's completion written on
+/// the served worker for the health rule, and the sweep's pass a host's
+/// loop makes. The hand and the health write are the calls a served
+/// controller makes for a `Dispatched` and a `Completed` frame. The record
+/// is filed by the trait's door, under an id of the case's own: a served
+/// decision's issue mints its id and steps the deadline queue inside the
+/// crate, and no case out here reaches that call. Behind the trait's door
+/// the sweep steps the queue, so the case's clock moves a step a lease and
+/// the queue holds the places of one deadline's span.
 #[test]
-fn a_build_from_the_store_after_the_first_allocates_nothing() {
-    for n in [8usize, 64, 512] {
-        let (store, _, opened) = store_of(n);
-        let mut out = ViewBuffers::default();
-        for affinity in [false, true] {
-            let ask = ViewQuery {
-                gateway: GatewayId(1),
-                now: opened + Duration::from_secs(1),
-                pinned: None,
-                affinity,
-                signal_cells: false,
+fn a_lease_filed_dispatched_and_completed_at_the_store_allocates_nothing() {
+    const LEASES: u32 = 256;
+    const STEP: Duration = Duration::from_millis(50);
+    const SPAN: Duration = Duration::from_secs(5);
+    for n in [8usize, 64] {
+        let (store, ids, opened) = store_of(n);
+        let gateway = GatewayId(7);
+        let hand = Hand::new(gateway);
+        let term = LeasesStore::term(&store);
+        let life = |request: u32| {
+            let now = opened + STEP * request;
+            let worker = ids[request as usize % n];
+            // An id of the host's own minting: the high bit.
+            let lease = LeaseId(1 << 63 | u64::from(request));
+            let filed = store.issue(LeaseRecord {
+                lease: Lease {
+                    id: lease,
+                    ..Lease::default()
+                },
+                gateway,
+                request: u64::from(request),
+                target: worker,
+                picked: PickRecord::default(),
+                decode: None,
+                term,
+                issued_at: now,
+                dispatch_deadline: now + SPAN,
+                state: LeaseState::ISSUED,
+            });
+            assert_eq!(filed, Ok(()), "the store files the lease");
+            let dispatch = Dispatch {
+                target_index: 0,
+                side: Side::Single,
+                since_decision_micros: 100,
             };
-            // The first build sizes the host's buffers.
-            store
-                .build_view("m", Role::Single, &ask, &mut out)
-                .expect("the pool");
-            let (built, allocations) =
-                allocations_during(|| store.build_view("m", Role::Single, &ask, &mut out));
-            assert_eq!(built.map(|built| built.pool_size as usize), Some(n));
-            assert_eq!(out.affinity.len(), if affinity { n } else { 0 });
-            assert_eq!(
-                allocations, 0,
-                "{n} members, column {affinity}: a build allocated"
-            );
+            store.hand(&hand, lease, Said::Dispatched(dispatch, now));
+            let outcome =
+                Outcome::reported(200, TransportClass::Ok).with_served(Side::Single, worker);
+            store.hand(&hand, lease, Said::Completed(outcome));
+            HealthSink::completed(&store, gateway, worker, outcome.class, now);
+            let ended = store.expire(now);
+            assert!(ended.is_empty(), "no lease waited out its deadline");
+        };
+        // The first lives size the file, fill the deadline queue to its
+        // span and write each worker's first completion of this gateway.
+        for request in 0..LEASES {
+            life(request);
         }
-    }
-}
-
-#[test]
-fn a_pair_build_with_its_table_allocates_nothing_after_the_first() {
-    // Two prefills of two transports; of 64 decodes every fourth names no
-    // transport and pairs with both: three decode classes in two lists.
-    let store = MemoryStore::new();
-    let register = |key: String, role: Role, transport: Option<&str>| {
-        store.upsert(WorkerFacts {
-            key: key.clone(),
-            engine: key,
-            incarnation: 1,
-            role,
-            wire_modes: WireModes::GRPC,
-            models: vec!["m".to_string()],
-            dp_size: 1,
-            pairing: transport.map(|transport| {
-                Arc::new(PairingDescriptor {
-                    transport: Some(transport.to_string()),
-                    ..PairingDescriptor::default()
-                })
-            }),
-            ..WorkerFacts::default()
+        assert_eq!(store.live(gateway), 0, "a completed lease left the file");
+        let ((), allocations) = allocations_during(|| {
+            for request in LEASES..2 * LEASES {
+                life(request);
+            }
         });
-        store.publish_now();
-    };
-    for (index, transport) in ["tx-a", "tx-b"].into_iter().enumerate() {
-        register(
-            format!("grpc://p{index}:9000"),
-            Role::Prefill,
-            Some(transport),
+        assert_eq!(store.live(gateway), 0, "a completed lease left the file");
+        let counted = opened + STEP * LEASES;
+        assert!(
+            ids.iter()
+                .all(|worker| store.completed_ok_since(gateway, *worker, counted)),
+            "{n} members: each worker holds a completion of the counted lives"
         );
+        assert_eq!(allocations, 0, "{n} members: a lease's life allocated");
     }
-    for index in 0..64 {
-        let transport = [Some("tx-a"), Some("tx-b"), Some("tx-a"), None][index % 4];
-        register(format!("grpc://d{index}:9000"), Role::Decode, transport);
-    }
-    let ask = ViewQuery {
-        gateway: GatewayId(1),
-        now: Instant::now(),
-        pinned: None,
-        affinity: true,
-        signal_cells: false,
-    };
-    let mut out = PairBuffers::default();
-    // The first build sizes the host's buffers: the rows, the columns and
-    // the table.
-    store.build_pair("m", &ask, &mut out).expect("both pools");
-    let (built, allocations) = allocations_during(|| store.build_pair("m", &ask, &mut out));
-    let sizes = built.map(|(prefill, decode)| (prefill.pool_size, decode.pool_size));
-    assert_eq!(sizes, Some((2, 64)));
-    let pools = out.pools();
-    assert_eq!(
-        (pools.prefill_affinity.len(), pools.decode_affinity.len()),
-        (2, 64)
-    );
-    // Each prefill class lists its transport's decodes and the silent ones.
-    let world = store.snapshot();
-    let classes = world.pairs("m").expect("the model's classes");
-    assert_eq!((classes.classes(), classes.entries()), (2, 4));
-    assert_eq!(pools.table.validate(), Ok(()));
-    assert_eq!(allocations, 0, "a pair build through the door allocated");
 }
 
 #[test]
@@ -837,89 +822,313 @@ fn index_keys_that_pass_add_no_allocation_to_a_validation() {
     assert_eq!(allocations(2_000), allocations(1_000));
 }
 
-#[test]
-fn a_lent_view_from_the_store_after_the_first_allocates_nothing() {
-    for n in [8usize, 64, 512] {
-        let (store, ids, opened) = store_of(n);
-        let asker = GatewayId(1);
-        store.gateway_veto(asker, ids[1], Some(opened + Duration::from_secs(3_600)));
-        let mut out = ViewBuffers::default();
-        for affinity in [false, true] {
-            let ask = ViewQuery {
-                gateway: asker,
-                now: opened + Duration::from_secs(1),
-                pinned: Some(ids[0]),
-                affinity,
-                signal_cells: false,
-            };
-            // The first view sizes the host's buffers: the mask and the
-            // column.
-            store.with_snapshot(|world| {
-                let first = world.view("m", Role::Single, &ask, false, &mut out);
-                assert!(first.is_some());
-            });
-            let (read, allocations) = allocations_during(|| {
-                store.with_snapshot(|world| {
-                    let view = world
-                        .view("m", Role::Single, &ask, false, &mut out)
-                        .expect("the pool");
-                    let (rows, column) = (view.candidates.len(), view.affinity.len());
-                    (rows, view.stalled.len(), view.pinned_at != 0, column)
-                })
-            });
-            assert_eq!(read, (n, 1, true, if affinity { n } else { 0 }));
-            assert_eq!(
-                allocations, 0,
-                "a lent view of {n} rows allocated (affinity {affinity})"
-            );
-        }
-        assert!(out.candidates.is_empty(), "a lent view copies no row");
-    }
-}
+/// The pin of a host in process: the engine over the host's own worker
+/// list, asked through the one call a host makes for a request.
+#[cfg(feature = "in-process")]
+mod in_process {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
 
-/// A request a host in process holds from its decision to its completion
-/// allocates nothing once the first requests have sized the door's
-/// buffers and the leases' file: the decision with its lease, the take,
-/// the dispatch and the completion, each report applied where it is
-/// handed.
-#[test]
-fn a_request_held_from_its_decision_to_its_completion_allocates_nothing() {
-    for n in [8usize, 64] {
-        let (store, _, opened) = store_of(n);
-        let mut document = PolicySpec::preset("round_robin").expect("a preset of this build");
-        document.generation = 1;
-        let spec = AppliedSpec::validate(&document).expect("the preset validates");
-        store.apply(spec).expect("the first generation");
-        let door = StoreBackedEngine::new(Arc::new(store));
-        let now = opened + Duration::from_secs(1);
-        let request = Request {
-            id: b"held",
-            facts: RequestFacts {
-                model: "m",
-                ..RequestFacts::default()
-            },
-            constraints: Constraints::default(),
+    use smg_policy_controller::{
+        document::{AppliedSpec, PolicySpec, ScoreSpec},
+        engine::{
+            Candidate, Decision, LentList, ListCell, PairAdmission, PairLists, PartnerClasses,
+            PlaceRequest, PolicyEngine, RequestFacts, Scorer, Target, TieBand, WorkerLists,
+        },
+        stages::{Lifecycle, StageRegistry},
+        tracking::{
+            EventKind, EventSet, Lease, Outcome, PlacementSide, ReleaseReason, Side, TransportClass,
+        },
+    };
+    use smg_worker::{
+        identity::{basic::Worker, builder::BasicWorkerBuilder},
+        test_support::{no_health_check, ready_worker},
+        worker::{WorkerSpec, WorkerStatus, WorkerType},
+    };
+
+    use super::allocations_during;
+
+    /// The model every worker of the list serves.
+    const MODEL: &str = "m";
+
+    /// How often a stage was told each word of a lease.
+    #[derive(Debug, Default)]
+    struct Told {
+        issued: AtomicUsize,
+        dispatched: AtomicUsize,
+        completed: AtomicUsize,
+        released: AtomicUsize,
+    }
+
+    impl Told {
+        /// The four counts, in a lease's order: its issue, its dispatch, its
+        /// completion and its release.
+        fn read(&self) -> [usize; 4] {
+            [
+                &self.issued,
+                &self.dispatched,
+                &self.completed,
+                &self.released,
+            ]
+            .map(|count| count.load(Ordering::Relaxed))
+        }
+    }
+
+    /// A scorer that scores every worker alike and takes the words of a
+    /// lease it is made to take. It counts each word and allocates nothing.
+    #[derive(Debug)]
+    struct Hears(Arc<Told>, EventSet);
+
+    impl Lifecycle for Hears {
+        fn hears(&self) -> EventSet {
+            self.1
+        }
+
+        fn on_decision_issued(&self, _: &Lease, _: &Decision) {
+            self.0.issued.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn on_dispatched(&self, _: &Lease, _: &Target, _: Side, _: u32) {
+            self.0.dispatched.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn on_completed(&self, _: &Lease, _: &Outcome) {
+            self.0.completed.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn on_released(&self, _: &Lease, _: ReleaseReason) {
+            self.0.released.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    impl Scorer for Hears {
+        fn name(&self) -> &'static str {
+            "hears"
+        }
+
+        fn score(
+            &self,
+            _: &RequestFacts<'_>,
+            _: &[Candidate],
+            _: &[u32],
+            out: &mut [f32],
+        ) -> TieBand {
+            out.fill(1.0);
+            TieBand::NORMALIZED
+        }
+    }
+
+    /// The engine of the `round_robin` preset, for the life of the process:
+    /// the preset as it stands, or with a [`Hears`] that takes every word of
+    /// a lease among its scorers where `told` is handed.
+    fn engine_of(told: Option<&Arc<Told>>) -> &'static PolicyEngine {
+        let document = PolicySpec::preset("round_robin").expect("a preset of this build");
+        let hears = told.map(|told| (told, EventSet::LEASE));
+        engine_under(document, "round_robin", hears)
+    }
+
+    /// The engine of `document`, for the life of the process: the document
+    /// as it stands, or with a [`Hears`] among the scorers of its `profile`
+    /// where `hears` hands that stage's counts and the words it takes.
+    fn engine_under(
+        mut document: PolicySpec,
+        profile: &str,
+        hears: Option<(&Arc<Told>, EventSet)>,
+    ) -> &'static PolicyEngine {
+        let mut stages = StageRegistry::builtin();
+        if let Some((told, takes)) = hears {
+            let kept = Arc::clone(told);
+            let added = stages.scorer("hears", move || Box::new(Hears(Arc::clone(&kept), takes)));
+            added.expect("a free name");
+            let profile = document.profiles.get_mut(profile);
+            let scorers = &mut profile.expect("the document's profile").score;
+            scorers.push(ScoreSpec::from("hears"));
+        }
+        let spec = AppliedSpec::validate_in(&document, &stages, &[]);
+        let spec = spec.expect("the stages hold the scorer");
+        Box::leak(Box::new(PolicyEngine::new(spec)))
+    }
+
+    /// A request a host in process holds from its decision to its completion
+    /// allocates nothing once the list's first requests have sized the
+    /// thread's scratch and the list's records: the one call that places
+    /// it, the word that it went out and the word of its end. Under the
+    /// preset alone a place answers the request, and nothing is owed of it.
+    /// Under a stage that takes every word of a lease the pick is leased:
+    /// the decision with its lease, the take, the dispatch and the
+    /// completion, each word told where it is said.
+    #[test]
+    fn a_request_held_from_its_decision_to_its_completion_allocates_nothing() {
+        for leased in [false, true] {
+            for n in [8usize, 64] {
+                let told = Arc::new(Told::default());
+                let engine = engine_of(leased.then_some(&told));
+                let list: Arc<[Arc<dyn Worker>]> = (0..n)
+                    .map(|at| ready_worker(&format!("http://w{at}:8000"), MODEL))
+                    .collect();
+                let cell = ListCell::default();
+                let lent = LentList {
+                    workers: &list,
+                    cell: &cell,
+                    facts: None,
+                };
+                let request = PlaceRequest::of(MODEL, WorkerLists::Single(lent));
+                let serve = || {
+                    let mut placement = engine.place(&request).expect("a worker of the list");
+                    assert_eq!(placement.owes_events(), leased);
+                    placement.sent(Side::Single);
+                    placement.ended(Side::Single, Outcome::reported(200, TransportClass::Ok));
+                };
+                // A rotation's first round names every worker once.
+                (0..2 * n).for_each(|_| serve());
+                let before = told.read();
+                let ((), allocations) = allocations_during(|| (0..256).for_each(|_| serve()));
+                assert_eq!(
+                    allocations, 0,
+                    "{n} workers, leased {leased}: a held request allocated"
+                );
+                // What the stage was told of the 256 requests: each one's
+                // issue, dispatch and completion, and no release.
+                let (after, each) = (told.read(), if leased { 256 } else { 0 });
+                let since = [0, 1, 2, 3].map(|word| after[word] - before[word]);
+                assert_eq!(since, [each, each, each, 0], "{n} workers");
+            }
+        }
+    }
+
+    /// A ready worker of `worker_type` at `url`, with no health checker
+    /// behind it.
+    fn typed(url: &str, worker_type: WorkerType) -> Arc<dyn Worker> {
+        let spec = WorkerSpec {
+            worker_type,
+            ..WorkerSpec::new(url.to_owned())
         };
-        let serve = || {
-            let decided = DecisionGuard::decide(&door, GatewayId(1), &request, now);
-            let mut handle = decided.expect("a decision");
-            let target = handle.take(0).expect("a pick over the pool");
-            handle.dispatched(now);
-            let outcome = Outcome {
-                side: Side::Single,
-                served: target.id,
-                status: 200,
-                class: TransportClass::Ok,
-                ttft_micros: 0,
-                tokens_in: 8,
-                tokens_out: 8,
-                duration_micros: 1_000,
+        let worker = <BasicWorkerBuilder>::from_spec(spec)
+            .health_config(no_health_check())
+            .build();
+        worker.set_status(WorkerStatus::Ready);
+        Arc::new(worker)
+    }
+
+    /// A pair's host that admits every worker.
+    #[derive(Debug)]
+    struct Open;
+
+    impl PairAdmission for Open {
+        fn has_capacity(&self, _: usize) -> bool {
+            true
+        }
+
+        fn has_room(&self, _: usize) -> bool {
+            true
+        }
+    }
+
+    /// What the sides a host keeps with its sends allocate, counted from
+    /// the split of a kept placement to the last drop: each side's send, a
+    /// handle on its end, a report through the handle, and both drops.
+    /// Under a stage that takes a dispatch and no end, a single request's
+    /// side allocates nothing and a pair's two sides the one value they
+    /// share: a handle is empty, and its report is told to nobody. Under a
+    /// stage that takes an end each side allocates once more, for what it
+    /// shares with its handles, and the stage hears each reported end.
+    #[test]
+    fn a_side_allocates_nothing_for_an_end_no_stage_takes() {
+        let no_end = EventSet::NONE.with(EventKind::Dispatched);
+        let report = |side: &PlacementSide, empty: bool| {
+            let end = side.side_end();
+            assert_eq!(end.is_empty(), empty);
+            end.reported(Outcome::reported(200, TransportClass::Ok));
+        };
+        for (takes, a_side) in [(no_end, 0), (EventSet::LEASE, 1)] {
+            let empty = a_side == 0;
+            let told = Arc::new(Told::default());
+            let document = PolicySpec::preset("round_robin").expect("a preset of this build");
+            let engine = engine_under(document, "round_robin", Some((&told, takes)));
+            let list: Arc<[Arc<dyn Worker>]> = (0..8)
+                .map(|at| ready_worker(&format!("http://w{at}:8000"), MODEL))
+                .collect();
+            let cell = ListCell::default();
+            let lent = LentList {
+                workers: &list,
+                cell: &cell,
+                facts: None,
             };
-            handle.completed(&outcome, now);
-        };
-        // A rotation's first round names every member once.
-        (0..2 * n).for_each(|_| serve());
-        let ((), allocations) = allocations_during(|| (0..256).for_each(|_| serve()));
-        assert_eq!(allocations, 0, "{n} members: a held request allocated");
+            let request = PlaceRequest::of(MODEL, WorkerLists::Single(lent));
+            let serve = || {
+                let placement = engine.place(&request).expect("a worker of the list");
+                assert!(placement.owes_events(), "a stage takes its dispatch");
+                let placement = placement.kept();
+                let ((), allocations) = allocations_during(|| {
+                    let (mut side, none) = placement.sides();
+                    assert!(none.is_none());
+                    side.sent();
+                    report(&side, empty);
+                });
+                allocations
+            };
+            for _ in 0..16 {
+                serve();
+            }
+            let before = told.read();
+            let allocations: usize = (0..256).map(|_| serve()).sum();
+            assert_eq!(allocations, 256 * a_side, "a single request's side");
+            let after = told.read();
+            let since = [0, 1, 2, 3].map(|word| after[word] - before[word]);
+            let each = 256 * a_side;
+            assert_eq!(since, [each, 256, each, 0], "the words the stage takes");
+
+            let told = Arc::new(Told::default());
+            let document = PolicySpec::pair_presets("round_robin", "round_robin");
+            let document = document.expect("the pair presets");
+            let engine = engine_under(document, "decode", Some((&told, takes)));
+            let prefills: Arc<[Arc<dyn Worker>]> =
+                Arc::from([typed("grpc://prefill:9000", WorkerType::Prefill)]);
+            let decodes: Arc<[Arc<dyn Worker>]> =
+                Arc::from([typed("grpc://decode:9000", WorkerType::Decode)]);
+            let (prefill_cell, decode_cell) = (ListCell::default(), ListCell::default());
+            let classes = PartnerClasses::number(1, [&[0_u32][..]]);
+            let lists = PairLists {
+                prefill: LentList {
+                    workers: &prefills,
+                    cell: &prefill_cell,
+                    facts: None,
+                },
+                decode: LentList {
+                    workers: &decodes,
+                    cell: &decode_cell,
+                    facts: None,
+                },
+                classes: &classes,
+                admission: &Open,
+                prefill_places: None,
+                decode_places: None,
+                prefill_stalled: &[],
+                prefill_held: &[],
+                decode_stalled: &[],
+                decode_held: &[],
+            };
+            let request = PlaceRequest::of(MODEL, WorkerLists::Pair(lists));
+            let serve = || {
+                let placement = engine.place(&request).expect("a pair of the lists");
+                let placement = placement.kept();
+                let ((), allocations) = allocations_during(|| {
+                    let (mut prefill, decode) = placement.sides();
+                    let mut decode = decode.expect("a pair's decode side");
+                    prefill.sent();
+                    decode.sent();
+                    report(&prefill, empty);
+                    report(&decode, empty);
+                });
+                allocations
+            };
+            for _ in 0..16 {
+                serve();
+            }
+            let allocations: usize = (0..256).map(|_| serve()).sum();
+            assert_eq!(allocations, 256 * (1 + 2 * a_side), "a pair's two sides");
+        }
     }
 }

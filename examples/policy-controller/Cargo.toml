@@ -20,17 +20,24 @@ smg-policy-controller = { path = "../../crates/policy_controller", features = ["
 tikv-jemallocator = { workspace = true }
 
 # The tests read the example's document as the controller reads one, and
-# bind a controller as the run loop does. The started binary's cases serve
-# mock engines in their own process and hold requests on one through the
-# engine's client. They register workers through the generated client and
-# ask decisions through the crate's reference client, a feature the tests
-# alone turn on.
+# bind a controller as the run loop does. The cases over a worker list build
+# the worker crate's test workers and publish load reports through its test
+# feed: that crate's `test-util` feature, which the tests alone turn on. The
+# started binary's cases serve mock engines in their own process and hold
+# requests on one through the engine's client. They register workers
+# through the generated client and ask decisions through the crate's
+# reference client, a feature the tests alone turn on.
+#
+# `own-repository.sh` holds its own copy of this list and writes it into the
+# manifest of the copy it makes: a dependency added here must be added there
+# as well, or `cargo test` in that copy stops building.
 [dev-dependencies]
 mock-worker = { path = "../../crates/mock_worker" }
 serde_yaml = { workspace = true }
 smg-grpc-client = { workspace = true }
 smg-policy-controller = { path = "../../crates/policy_controller", features = ["client"] }
-tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+smg-worker = { workspace = true, features = ["runtime", "test-util"] }
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "sync", "test-util", "time"] }
 tonic = { workspace = true }
 
 [lints]

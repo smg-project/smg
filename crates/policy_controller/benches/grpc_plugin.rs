@@ -52,8 +52,9 @@ const SIZES: [usize; 3] = [8, 64, 512];
 /// A prompt's block hashes: the view's default cap and the contract's most.
 const HASHES: [usize; 2] = [256, 8_190];
 
-/// A budget of one second per decision: no honest round trip meets it, so
-/// every cell is an answered decision.
+/// A budget of one second per decision, which the plugin states as its own
+/// frame too: no honest round trip meets it, so every cell is an answered
+/// decision.
 const BUDGET_MICROS: u32 = 1_000_000;
 
 /// A served plugin that keeps none of the frames and events it is sent.
@@ -72,6 +73,9 @@ fn spec(served: &TestPlugin, name: &str) -> GrpcPluginSpec {
         },
     );
     spec.connect_micros = 5_000_000;
+    // A plugin that states no budget is cut at the default frame, a tenth
+    // of a decision's budget here.
+    spec.budget_micros = BUDGET_MICROS;
     spec.max_candidates = 512;
     // Every kind of event, as the `observe` cell tells one.
     spec.observes = EventSet::ALL;

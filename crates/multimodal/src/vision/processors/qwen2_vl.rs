@@ -33,33 +33,33 @@ use crate::{
 };
 
 /// CLIP normalization mean values used by Qwen2-VL models.
-pub const CLIP_MEAN: [f64; 3] = [0.48145466, 0.4578275, 0.40821073];
+pub(crate) const CLIP_MEAN: [f64; 3] = [0.48145466, 0.4578275, 0.40821073];
 
 /// CLIP normalization std values used by Qwen2-VL models.
-pub const CLIP_STD: [f64; 3] = [0.26862954, 0.26130258, 0.27577711];
+pub(crate) const CLIP_STD: [f64; 3] = [0.26862954, 0.26130258, 0.27577711];
 
 /// Default minimum pixels (256 * 28 * 28 = 200,704)
-pub const DEFAULT_MIN_PIXELS: usize = 256 * 28 * 28;
+pub(crate) const DEFAULT_MIN_PIXELS: usize = 256 * 28 * 28;
 
 /// Default maximum pixels (1280 * 28 * 28 = 1,003,520)
-pub const DEFAULT_MAX_PIXELS: usize = 1280 * 28 * 28;
+pub(crate) const DEFAULT_MAX_PIXELS: usize = 1280 * 28 * 28;
 
 /// Default patch size
-pub const DEFAULT_PATCH_SIZE: usize = 14;
+pub(crate) const DEFAULT_PATCH_SIZE: usize = 14;
 
 /// Default merge size for token reduction
-pub const DEFAULT_MERGE_SIZE: usize = 2;
+pub(crate) const DEFAULT_MERGE_SIZE: usize = 2;
 
 /// Default temporal patch size (for video frames)
-pub const DEFAULT_TEMPORAL_PATCH_SIZE: usize = 2;
+pub(crate) const DEFAULT_TEMPORAL_PATCH_SIZE: usize = 2;
 
 /// The video processor's own minimum pixels per frame, for a config that
 /// names none (128 * 28 * 28 = 100,352).
-pub const DEFAULT_VIDEO_MIN_PIXELS: usize = 128 * 28 * 28;
+pub(crate) const DEFAULT_VIDEO_MIN_PIXELS: usize = 128 * 28 * 28;
 
 /// The video processor's own maximum pixels per frame, for a config that
 /// names none (768 * 28 * 28 = 602,112).
-pub const DEFAULT_VIDEO_MAX_PIXELS: usize = 768 * 28 * 28;
+pub(crate) const DEFAULT_VIDEO_MAX_PIXELS: usize = 768 * 28 * 28;
 
 /// Qwen2-VL image processor.
 ///
@@ -108,7 +108,8 @@ impl Qwen2VLProcessor {
     }
 
     /// Create a processor with custom settings.
-    pub fn with_config(
+    #[cfg(test)]
+    fn with_config(
         patch_size: usize,
         merge_size: usize,
         min_pixels: usize,
@@ -172,7 +173,7 @@ impl Qwen2VLProcessor {
     /// shared with the image processor, which is what a checkpoint shipping
     /// one `preprocessor_config.json` gives both, else its `size` edges, else
     /// that processor's own defaults); for an image the image processor's.
-    pub fn from_config_for(config: &PreProcessorConfig, modality: Modality) -> Self {
+    pub(crate) fn from_config_for(config: &PreProcessorConfig, modality: Modality) -> Self {
         if modality == Modality::Video {
             Self::from_video_preprocessor_config(config)
         } else {
@@ -217,37 +218,6 @@ impl Qwen2VLProcessor {
         }
     }
 
-    /// Get the patch size.
-    pub fn patch_size(&self) -> usize {
-        self.inner.patch_size()
-    }
-
-    /// Get the merge size.
-    pub fn merge_size(&self) -> usize {
-        self.inner.merge_size()
-    }
-
-    /// Get the minimum pixels.
-    pub fn min_pixels(&self) -> usize {
-        self.inner.min_pixels()
-    }
-
-    /// Get the maximum pixels.
-    pub fn max_pixels(&self) -> usize {
-        self.inner.max_pixels()
-    }
-
-    /// Get the temporal patch size.
-    pub fn temporal_patch_size(&self) -> usize {
-        self.inner.temporal_patch_size()
-    }
-
-    /// Get the factor for dimension alignment.
-    #[inline]
-    pub fn get_factor(&self) -> usize {
-        self.inner.get_factor()
-    }
-
     /// Smart resize algorithm for Qwen2-VL.
     pub fn smart_resize(
         &self,
@@ -255,22 +225,6 @@ impl Qwen2VLProcessor {
         width: usize,
     ) -> Result<(usize, usize), TransformError> {
         self.inner.smart_resize(height, width)
-    }
-
-    /// Calculate the grid dimensions (T, H, W) for an image.
-    pub fn calculate_grid_thw(
-        &self,
-        height: usize,
-        width: usize,
-        num_frames: usize,
-    ) -> (usize, usize, usize) {
-        self.inner.calculate_grid_thw(height, width, num_frames)
-    }
-
-    /// Calculate the number of image tokens after merge.
-    pub fn calculate_tokens_from_grid(&self, grid_t: usize, grid_h: usize, grid_w: usize) -> usize {
-        self.inner
-            .calculate_tokens_from_grid(grid_t, grid_h, grid_w)
     }
 }
 

@@ -632,6 +632,275 @@ async fn spawned_tasks_use_weak_references() {
     );
 }
 
+/// A host that reads its workers' loads for a part of its life stops the
+/// monitor and starts it again. The stop ends every task the start made
+/// and the publisher a pushed record started, each awaited, so none holds
+/// the monitor behind it. The monitor's receivers stay subscribed and read
+/// the empty snapshot, and the sink's reset takes the overload veto off. A
+/// later start polls the registry as it stands then, a worker registered
+/// while the monitor was stopped among it.
+#[tokio::test]
+async fn a_stopped_monitor_ends_its_tasks_and_starts_again_over_the_registry() {
+    let (registry, monitor) = build_monitor();
+    let worker = ready_worker("http://w1:8080", "llama-3");
+    registry.register(Arc::clone(&worker)).unwrap();
+    let reports = monitor.subscribe();
+    monitor.start_event_loop();
+    assert_eq!(monitor.group_handles.lock().len(), 1);
+
+    // A pushed record starts the publisher of pushed reports, the one task
+    // of the monitor that its start does not make.
+    monitor.apply_pushed_load(&worker, 0, &pushed(1), Instant::now());
+    assert!(monitor.pushed_flush_task.lock().is_some());
+
+    // What a tick leaves: a published report and a veto.
+    let _ = monitor.load_state.publish_group(
+        &[],
+        vec![(Arc::clone(&worker), Arc::new(WorkerLoadResponse::default()))],
+    );
+    assert!(reports.borrow().contains(worker.url()));
+    assert!(registry.set_worker_overloaded(&worker, true));
+
+    monitor.stop().await;
+
+    assert!(monitor.group_handles.lock().is_empty());
+    for task in [
+        &monitor.event_task,
+        &monitor.eviction_flush_task,
+        &monitor.liveness_sweep_task,
+        &monitor.pushed_flush_task,
+    ] {
+        assert!(task.lock().is_none(), "a task of the monitor stands");
+    }
+    assert_eq!(
+        Arc::weak_count(&monitor),
+        0,
+        "a task of the stopped monitor still holds it"
+    );
+    assert!(
+        reports.borrow().is_empty(),
+        "a receiver subscribed before the stop reads the empty snapshot"
+    );
+    assert!(!worker.is_overloaded(), "the reset takes the veto off");
+
+    // A second stop finds nothing to end.
+    monitor.stop().await;
+
+    // A worker registered while the monitor is stopped starts no group.
+    registry
+        .register(ready_worker("http://w2:8080", "gpt-4"))
+        .unwrap();
+    tokio::task::yield_now().await;
+    assert!(monitor.group_handles.lock().is_empty());
+
+    monitor.start_event_loop();
+    assert_eq!(monitor.group_handles.lock().len(), 2);
+    assert!(monitor.event_task.lock().is_some());
+}
+
+/// A ready HTTP worker at one URL that serves `models`.
+fn serving(models: &[&str]) -> Arc<dyn Worker> {
+    let cards: Vec<ModelCard> = models.iter().copied().map(ModelCard::new).collect();
+    let worker = BasicWorkerBuilder::new("http://w:1")
+        .worker_type(WorkerType::Regular)
+        .connection_mode(ConnectionMode::Http)
+        .models(cards)
+        .health_config(crate::test_support::no_health_check())
+        .build();
+    worker.set_status(WorkerStatus::Ready);
+    Arc::new(worker)
+}
+
+/// Poll a stop once: whether it ended.
+async fn polled_once(stop: std::pin::Pin<&mut impl std::future::Future<Output = ()>>) -> bool {
+    tokio::select! {
+        biased;
+        () = stop => true,
+        () = std::future::ready(()) => false,
+    }
+}
+
+/// A start keeps the eviction flusher that stands. The flusher may have
+/// taken the one wakeup of an eviction and not applied it yet: a start
+/// that ended it there would leave that eviction queued until the next
+/// one. Behind a stop dropped at its first wait and a second start, the
+/// slot's task is the one the first start spawned.
+#[tokio::test]
+async fn a_start_keeps_the_eviction_flusher_that_stands() {
+    let (registry, monitor) = build_monitor();
+    registry
+        .register(ready_worker("http://w1:8080", "llama-3"))
+        .unwrap();
+    let flusher = || {
+        let slot = monitor.eviction_flush_task.lock();
+        slot.as_ref().map(JoinHandle::id)
+    };
+    monitor.start_event_loop();
+    let stood = flusher().expect("the first start's flusher");
+    {
+        let stop = monitor.stop();
+        tokio::pin!(stop);
+        assert!(!polled_once(stop.as_mut()).await, "the stop ended");
+    }
+
+    monitor.start_event_loop();
+    assert_eq!(
+        flusher(),
+        Some(stood),
+        "the start replaced a flusher that stood"
+    );
+    monitor.stop().await;
+}
+
+/// A group's loop that another is spawned over is told to end. Two
+/// reconciles of one group can each find no loop and each spawn one, and
+/// the second handle goes over the first: a loop with no handle would
+/// poll on behind every stop. Here the stop ends the loop that holds the
+/// handle, and no loop holds the monitor.
+#[tokio::test]
+async fn a_group_loop_another_is_spawned_over_is_told_to_end() {
+    let (_registry, monitor) = build_monitor();
+    let key = WorkerGroupKey {
+        model_id: "llama-3".to_string(),
+        worker_type: WorkerType::Regular,
+        connection_mode: ConnectionMode::Http,
+    };
+    monitor.spawn_group_loop(key.clone(), Duration::from_secs(10));
+    monitor.spawn_group_loop(key, Duration::from_secs(10));
+
+    monitor.stop().await;
+    assert_eq!(
+        Arc::weak_count(&monitor),
+        0,
+        "the loop written over outlived the stop"
+    );
+}
+
+/// A start behind a stop that was dropped at its first wait ends what it
+/// replaces of the tasks that stop left standing: the first start's
+/// liveness sweep, whose handle it writes over, and the event task whose
+/// handle the stop put back. The next stop ends every task that stands,
+/// the first start's eviction flusher among them, and no task of either
+/// start holds the monitor.
+#[tokio::test]
+async fn a_start_behind_a_dropped_stop_ends_the_tasks_it_replaces() {
+    let (registry, monitor) = build_monitor();
+    registry
+        .register(ready_worker("http://w1:8080", "llama-3"))
+        .unwrap();
+    monitor.start_event_loop();
+    {
+        let stop = monitor.stop();
+        tokio::pin!(stop);
+        assert!(!polled_once(stop.as_mut()).await, "the stop ended");
+    }
+
+    monitor.start_event_loop();
+    monitor.stop().await;
+    assert_eq!(
+        Arc::weak_count(&monitor),
+        0,
+        "a task of the first start outlived the stop"
+    );
+}
+
+/// A start made while a stop waits writes its event task's handle into the
+/// slot, and the stop, dropped then, leaves it there: the next stop ends
+/// the task that start made. The stop is polled once: the event task is
+/// told to end, and ends at its next turn.
+#[tokio::test]
+async fn a_stop_dropped_behind_a_start_leaves_the_starts_event_task_its_slot() {
+    let (registry, monitor) = build_monitor();
+    registry
+        .register(ready_worker("http://w1:8080", "llama-3"))
+        .unwrap();
+    monitor.start_event_loop();
+
+    let started = {
+        let stop = monitor.stop();
+        tokio::pin!(stop);
+        assert!(!polled_once(stop.as_mut()).await, "the stop ended");
+        monitor.start_event_loop();
+        let slot = monitor.event_task.lock();
+        slot.as_ref().map(JoinHandle::abort_handle)
+    };
+    let started = started.expect("the start's event task");
+
+    monitor.stop().await;
+    assert!(
+        started.is_finished(),
+        "the event task a start made beside a dropped stop outlived the next stop"
+    );
+}
+
+/// A stop dropped at its first wait keeps the event task's handle, so the
+/// stop behind it waits for that task's end too. The event task's poll of
+/// a replacement is held inside the sink while both stops are polled:
+/// neither takes a group's loop while that poll runs. The poll then starts
+/// the loop of the group the replacement adds, and the second stop ends it
+/// with every other task. While the poll is held the case waits on its
+/// own thread alone, and the sink lets no poll of a worker run: no timer
+/// of the runtime is needed, and no task waits for the reports.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stop_behind_one_dropped_at_its_first_wait_waits_for_the_event_task() {
+    let (entered, in_forget) = mpsc::channel();
+    let (resume, at_resume) = mpsc::channel();
+    let registry = Arc::new(WorkerRegistry::new());
+    let sink = Arc::new(StoppedAtForget {
+        classic: ClassicLoadSink::new(
+            Arc::clone(&registry),
+            Arc::new(LoadReaders::Blind),
+            Arc::new(WorkerLoadManager::new()),
+        ),
+        entered,
+        resume: Mutex::new(at_resume),
+    });
+    let monitor = Arc::new(WorkerMonitor::with_sink(
+        Arc::clone(&registry),
+        sink,
+        5,
+        false,
+        false,
+    ));
+    let id = registry.register(serving(&["a"])).unwrap();
+    monitor.start_event_loop();
+    let groups = || monitor.group_handles.lock().len();
+    assert_eq!(groups(), 1);
+
+    // The event task's poll of the replacement stands inside the sink.
+    assert!(registry.replace(&id, serving(&["a", "b"])));
+    in_forget.recv_timeout(Duration::from_secs(5)).unwrap();
+
+    {
+        let stop = monitor.stop();
+        tokio::pin!(stop);
+        assert!(!polled_once(stop.as_mut()).await, "the stop ended");
+    }
+    assert_eq!(groups(), 1, "a stop at its first wait took a group's loop");
+
+    let stop = monitor.stop();
+    tokio::pin!(stop);
+    assert!(!polled_once(stop.as_mut()).await, "the stop ended");
+    assert_eq!(
+        groups(),
+        1,
+        "the stop took a group's loop ahead of the event task's end"
+    );
+
+    // The poll goes on, and starts the loop of the group the replacement
+    // adds.
+    resume.send(()).unwrap();
+    assert!(within_two_seconds(|| groups() == 2).await);
+
+    stop.await;
+    assert_eq!(groups(), 0, "a group's loop outlived the stop");
+    assert_eq!(
+        Arc::weak_count(&monitor),
+        0,
+        "a task of the stopped monitor still holds it"
+    );
+}
+
 fn pushed(running: i32) -> PushedRecord {
     PushedRecord {
         snapshot: SchedulerLoadSnapshot {
@@ -987,48 +1256,469 @@ async fn a_pushed_record_counts_the_named_values_its_snapshot_drops() {
     );
 }
 
-/// What a rank's entry offers by name is its own record's. A count the entry
-/// keeps from a heartbeat is not offered under a later record that did not
-/// carry it, and the entry still holds it.
+/// A record that leaves a token count out keeps the count of the last
+/// record that stated it, and the rank's entry offers it by name as old as
+/// that record is at the fresh one's sample. A heartbeat, a record that is
+/// the core alone, a second one, a record that states the used count alone,
+/// one more core record and the next heartbeat: each count is offered at
+/// its own record's age, the whole time since that record's sample, and
+/// with no age where its own record states it. The entry's two figures, which `GET /loads` and the
+/// gauges read, are the kept ones throughout.
 #[tokio::test]
-async fn a_core_record_offers_no_fixed_count_the_entry_kept() {
+async fn a_kept_token_count_is_offered_by_name_as_old_as_the_record_that_stated_it() {
     let (registry, monitor) = build_monitor();
     let worker = ready_worker("grpc://w1:9000", "llama-3");
     registry.register(Arc::clone(&worker)).unwrap();
-    let names = |rank: &SchedulerLoadSnapshot| -> Vec<String> {
-        rank.named_values()
-            .map(|value| value.name.to_string())
-            .collect()
+    let start = Instant::now();
+    let push = |record: &PushedRecord, ms: u64| {
+        monitor.apply_pushed_load(&worker, 0, record, start + Duration::from_millis(ms));
+        let rank0 = published_rank0(&monitor, "grpc://w1:9000");
+        let offered: Vec<_> = rank0
+            .named_values()
+            .map(|value| (value.name.to_string(), value.value, value.age_ms))
+            .collect();
+        (offered, (rank0.num_used_tokens, rank0.max_total_num_tokens))
+    };
+    let used = |count: f64, age| ("kv_tokens_used".to_owned(), count, age);
+    let capacity = |age| ("kv_tokens_capacity".to_owned(), 8_192.0, age);
+    let heartbeat = |count| pushed(7).used_tokens(count).total_tokens(8_192);
+
+    let stated = (vec![used(2_048.0, None), capacity(None)], (2_048, 8_192));
+    assert_eq!(push(&heartbeat(2_048), 0), stated);
+    let kept = (
+        vec![used(2_048.0, Some(40)), capacity(Some(40))],
+        (2_048, 8_192),
+    );
+    assert_eq!(push(&pushed(8), 40), kept);
+    let again = (
+        vec![used(2_048.0, Some(100)), capacity(Some(100))],
+        (2_048, 8_192),
+    );
+    assert_eq!(push(&pushed(8), 100), again);
+    // The used count alone: the capacity is as old as its own record.
+    let mixed = (vec![used(300.0, None), capacity(Some(150))], (300, 8_192));
+    assert_eq!(push(&pushed(9).used_tokens(300), 150), mixed);
+    // Behind it each count is as old as its own record.
+    let each = (
+        vec![used(300.0, Some(30)), capacity(Some(180))],
+        (300, 8_192),
+    );
+    assert_eq!(push(&pushed(9), 180), each);
+    let stated = (vec![used(500.0, None), capacity(None)], (500, 8_192));
+    assert_eq!(push(&heartbeat(500), 200), stated);
+}
+
+/// A kept count nothing has stated is not offered. A rank whose records
+/// have stated no used count keeps a zero no record said: here the first
+/// record states the capacity alone, and no record behind it offers the
+/// used count.
+#[tokio::test]
+async fn a_kept_token_count_of_no_known_age_is_not_offered_by_name() {
+    let start = Instant::now();
+    let at = |ms: u64| start + Duration::from_millis(ms);
+    let offered = |monitor: &WorkerMonitor| {
+        let rank0 = published_rank0(monitor, "grpc://w1:9000");
+        let offered: Vec<_> = rank0
+            .named_values()
+            .map(|value| (value.name.to_string(), value.value, value.age_ms))
+            .collect();
+        (offered, (rank0.num_used_tokens, rank0.max_total_num_tokens))
+    };
+    let capacity = |age| ("kv_tokens_capacity".to_owned(), 8_192.0, age);
+
+    let (registry, monitor) = build_monitor();
+    let worker = ready_worker("grpc://w1:9000", "llama-3");
+    registry.register(Arc::clone(&worker)).unwrap();
+    monitor.apply_pushed_load(&worker, 0, &pushed(7).total_tokens(8_192), at(0));
+    assert_eq!(offered(&monitor), (vec![capacity(None)], (0, 8_192)));
+    for (ms, age) in [(40, 40), (100, 100)] {
+        monitor.apply_pushed_load(&worker, 0, &pushed(8), at(ms));
+        let kept = (vec![capacity(Some(age))], (0, 8_192));
+        assert_eq!(offered(&monitor), kept, "{ms} ms");
+    }
+}
+
+/// Each rank's entry of a report of several ranks states its own sample
+/// instant, and its two kept counts are as old as their statement at that
+/// instant, whatever the other ranks' records do. The report's one instant
+/// is its last record's, of whatever rank. Here rank 0's heartbeat, rank
+/// 1's, a core record of rank 0 and then one of rank 1: each rank's counts
+/// are offered at their age behind that rank's own heartbeat, and a rank
+/// whose own record states a count offers it with no age.
+#[tokio::test]
+async fn each_rank_of_a_report_of_several_states_its_own_sample_and_its_counts_ages() {
+    let (registry, monitor) = build_monitor();
+    let worker = ready_worker("grpc://w1:9000", "llama-3");
+    registry.register(Arc::clone(&worker)).unwrap();
+    let start = Instant::now();
+    let at = |ms: u64| start + Duration::from_millis(ms);
+    // A record is sampled a one-way margin ahead of its receipt.
+    let sampled = |ms: u64| Some(at(ms) - PUSHED_ONE_WAY_MARGIN);
+    let on_file = |monitor: &WorkerMonitor| {
+        let reports = monitor.pushed_reports.lock();
+        let report = &reports["grpc://w1:9000"].report;
+        let rows: Vec<_> = report
+            .loads
+            .iter()
+            .map(|row| {
+                let ages = (row.kept_used_tokens_age_ms, row.kept_total_tokens_age_ms);
+                let offered: Vec<_> = row.named_values().map(|value| value.age_ms).collect();
+                (row.dp_rank, row.sampled_at, ages, offered)
+            })
+            .collect();
+        (report.sampled_at, rows)
     };
     let heartbeat = pushed(7).used_tokens(2_048).total_tokens(8_192);
-    monitor.apply_pushed_load(&worker, 0, &heartbeat, Instant::now());
-    let rank0 = published_rank0(&monitor, "grpc://w1:9000");
-    assert_eq!(names(&rank0), ["kv_tokens_used", "kv_tokens_capacity"]);
 
-    monitor.apply_pushed_load(&worker, 0, &pushed(8), Instant::now());
-    let rank0 = published_rank0(&monitor, "grpc://w1:9000");
-    assert!(names(&rank0).is_empty());
+    monitor.apply_pushed_load(&worker, 0, &heartbeat, at(0));
+    monitor.apply_pushed_load(&worker, 1, &heartbeat, at(10));
+    monitor.apply_pushed_load(&worker, 0, &pushed(8), at(40));
+    let stated = (None, None);
+    let (report, rows) = on_file(&monitor);
     assert_eq!(
-        (rank0.num_used_tokens, rank0.max_total_num_tokens),
-        (2_048, 8_192)
+        report,
+        sampled(40),
+        "the report's instant is its last record's"
+    );
+    let kept = (Some(40), Some(40));
+    assert_eq!(
+        rows,
+        [
+            (0, sampled(40), kept, vec![Some(40), Some(40)]),
+            (1, sampled(10), stated, vec![None, None]),
+        ]
+    );
+    // Rank 1's core record moves the report's instant and not rank 0's.
+    monitor.apply_pushed_load(&worker, 1, &pushed(8), at(100));
+    let (report, rows) = on_file(&monitor);
+    assert_eq!(report, sampled(100));
+    let later = (Some(90), Some(90));
+    assert_eq!(
+        rows,
+        [
+            (0, sampled(40), kept, vec![Some(40), Some(40)]),
+            (1, sampled(100), later, vec![Some(90), Some(90)]),
+        ]
+    );
+}
+
+/// The tick's own poll dates the row it lays at the instant its report is
+/// dated at, the read, and not at the tick's instant: the row states that
+/// sample, and its two counts are stated then. Here the tick's instant
+/// stands ten seconds ahead of the read. A record that is the core alone,
+/// sampled 500 ms behind the read, offers the poll's counts 500 ms old.
+/// The clock is the real one: the slack is the time the call itself took.
+#[tokio::test]
+async fn the_ticks_own_poll_dates_the_row_it_lays_at_its_read() {
+    let (registry, monitor, _sink) =
+        build_recording(PollMode::Poll, PolledRanks::default(), true, false);
+    let worker = ready_worker("http://w:1", "m");
+    registry.register(Arc::clone(&worker)).unwrap();
+    let heartbeat = pushed(7).used_tokens(2_048).total_tokens(8_192);
+    monitor.apply_pushed_load(&worker, 0, &heartbeat, Instant::now());
+    let answer = WorkerLoadResponse {
+        dp_rank_count: 1,
+        loads: vec![SchedulerLoadSnapshot {
+            dp_rank: 0,
+            num_running_reqs: 3,
+            num_used_tokens: 4_096,
+            max_total_num_tokens: 8_192,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let mut engine = vec![(Arc::clone(&worker), Some(answer))];
+    let before = Instant::now();
+    monitor.reconcile_engine(&mut engine, before + Duration::from_secs(10));
+    let after = Instant::now();
+    let row = |monitor: &WorkerMonitor| {
+        let reports = monitor.pushed_reports.lock();
+        reports["http://w:1"].report.loads[0].clone()
+    };
+    let laid = row(&monitor);
+    assert_eq!(
+        (laid.num_used_tokens, laid.max_total_num_tokens),
+        (4_096, 8_192)
+    );
+    let read = laid.sampled_at.expect("the row states its poll's instant");
+    assert!(
+        (before..=after).contains(&read),
+        "the row is dated at the read"
     );
 
-    // A record that carries one of the two offers that one.
-    let capacity = pushed(9).total_tokens(4_096);
-    monitor.apply_pushed_load(&worker, 0, &capacity, Instant::now());
-    let rank0 = published_rank0(&monitor, "grpc://w1:9000");
-    assert_eq!(names(&rank0), ["kv_tokens_capacity"]);
+    let received = after + PUSHED_ONE_WAY_MARGIN + Duration::from_millis(500);
+    monitor.apply_pushed_load(&worker, 0, &pushed(8), received);
+    let kept = row(&monitor);
     assert_eq!(
-        (rank0.num_used_tokens, rank0.max_total_num_tokens),
-        (2_048, 4_096)
+        (kept.num_used_tokens, kept.max_total_num_tokens),
+        (4_096, 8_192)
+    );
+    let slack = u32::try_from((after - before).as_millis()).unwrap() + 1;
+    let wanted = 500..=500 + slack;
+    let used = kept.kept_used_tokens_age_ms.expect("the poll stated it");
+    let total = kept.kept_total_tokens_age_ms.expect("the poll stated it");
+    assert!(wanted.contains(&used), "{used} ms, wanted {wanted:?}");
+    assert!(wanted.contains(&total), "{total} ms, wanted {wanted:?}");
+}
+
+/// A kept count's age is the whole time since its statement, taken at each
+/// record and rounded up to a millisecond. Gaps that are no whole number of
+/// milliseconds do not shorten it, however many records stand between: four
+/// hundred records 1.5 ms apart leave the count 600 ms old. And a record
+/// 0.3 ms behind the statement reads the count one millisecond old: a count
+/// never reads younger than it is.
+#[tokio::test]
+async fn a_kept_token_counts_age_is_not_shortened_by_gaps_of_no_whole_millisecond() {
+    let (registry, monitor) = build_monitor();
+    let worker = ready_worker("grpc://w1:9000", "llama-3");
+    registry.register(Arc::clone(&worker)).unwrap();
+    let start = Instant::now();
+    let ages = |record: &PushedRecord, micros: u64| {
+        monitor.apply_pushed_load(&worker, 0, record, start + Duration::from_micros(micros));
+        let rank0 = published_rank0(&monitor, "grpc://w1:9000");
+        (
+            rank0.kept_used_tokens_age_ms,
+            rank0.kept_total_tokens_age_ms,
+        )
+    };
+    let heartbeat = pushed(7).used_tokens(2_048).total_tokens(8_192);
+
+    assert_eq!(ages(&heartbeat, 0), (None, None));
+    let mut last = (None, None);
+    for nth in 1..=400 {
+        last = ages(&pushed(8), nth * 1_500);
+    }
+    assert_eq!(last, (Some(600), Some(600)));
+
+    assert_eq!(ages(&heartbeat, 700_000), (None, None));
+    assert_eq!(ages(&pushed(8), 700_300), (Some(1), Some(1)));
+    assert_eq!(ages(&pushed(8), 700_600), (Some(1), Some(1)));
+    assert_eq!(ages(&pushed(8), 701_200), (Some(2), Some(2)));
+}
+
+/// A count a poll's answer stated is as old as that poll behind the records
+/// that follow it. The stream goes quiet, a poll's answer is laid on the
+/// file, and a record that is the core alone comes: it keeps the poll's
+/// counts and offers them at the time since the poll, not at the time since
+/// the stream's last record. A record's sample stands a one-way margin
+/// ahead of its receipt, and a poll's at the instant its report is dated.
+#[tokio::test]
+async fn a_token_count_a_polls_answer_stated_is_as_old_as_that_poll() {
+    let (registry, monitor) = build_monitor();
+    let worker = ready_worker("grpc://w1:9000", "llama-3");
+    registry.register(Arc::clone(&worker)).unwrap();
+    let start = Instant::now();
+    let at = |ms: u64| start + Duration::from_millis(ms);
+    let offered = |monitor: &WorkerMonitor| {
+        let rank0 = published_rank0(monitor, "grpc://w1:9000");
+        let offered: Vec<_> = rank0
+            .named_values()
+            .map(|value| (value.name.to_string(), value.value, value.age_ms))
+            .collect();
+        (offered, (rank0.num_used_tokens, rank0.max_total_num_tokens))
+    };
+    let polled = |age| {
+        let used = ("kv_tokens_used".to_owned(), 4_096.0, age);
+        let capacity = ("kv_tokens_capacity".to_owned(), 8_192.0, age);
+        (vec![used, capacity], (4_096, 8_192))
+    };
+
+    let heartbeat = pushed(7).used_tokens(2_048).total_tokens(8_192);
+    monitor.apply_pushed_load(&worker, 0, &heartbeat, at(0));
+    let answer = WorkerLoadResponse {
+        dp_rank_count: 1,
+        loads: vec![SchedulerLoadSnapshot {
+            dp_rank: 0,
+            num_running_reqs: 3,
+            num_used_tokens: 4_096,
+            max_total_num_tokens: 8_192,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    monitor.apply_polled_load("grpc://w1:9000", &answer, at(1_000));
+    let margin = u32::try_from(PUSHED_ONE_WAY_MARGIN.as_millis()).unwrap();
+    monitor.apply_pushed_load(&worker, 0, &pushed(8), at(1_100));
+    assert_eq!(offered(&monitor), polled(Some(100 - margin)));
+    monitor.apply_pushed_load(&worker, 0, &pushed(8), at(1_300));
+    assert_eq!(offered(&monitor), polled(Some(300 - margin)));
+}
+
+/// The instants of the two counts' statements are each rank's own, and a
+/// report that lists another rank keeps them: a second rank's record
+/// moves nothing of the first's, and a poll's answer laid on one rank's
+/// row states that row's counts alone. So once the second rank has left
+/// the file, a record of the first that is the core alone offers each
+/// count as old as the first's own last statement. A statement leaves
+/// the file with its row: a rank that comes behind one that left offers
+/// no count of the other's, and a rank that left and comes again has had
+/// nothing stated.
+#[tokio::test]
+async fn a_token_counts_statement_is_its_own_ranks_and_leaves_with_its_row() {
+    let start = Instant::now();
+    let at = |ms: u64| start + Duration::from_millis(ms);
+    let on_file = |monitor: &WorkerMonitor| {
+        let reports = monitor.pushed_reports.lock();
+        let row = reports["http://w:1"].report.loads[0].clone();
+        let ages = (row.kept_used_tokens_age_ms, row.kept_total_tokens_age_ms);
+        let offered: Vec<_> = row
+            .named_values()
+            .map(|value| (value.name.to_string(), value.age_ms))
+            .collect();
+        (row.dp_rank, ages, offered)
+    };
+    let heartbeat = pushed(7).used_tokens(2_048).total_tokens(8_192);
+
+    // Rank 0's stream is the newer at each poll. Rank 1 takes the first
+    // answer's entry, and leaves at the second, which does not name it.
+    let ranks = PolledRanks {
+        newer: vec![0],
+        leaving: vec![1],
+    };
+    let (registry, monitor, _sink) = build_recording(PollMode::Fallback, ranks, true, false);
+    let worker = ready_worker("http://w:1", "m");
+    registry.register(Arc::clone(&worker)).unwrap();
+    monitor.apply_pushed_load(&worker, 0, &heartbeat, at(0));
+    monitor.apply_pushed_load(&worker, 1, &heartbeat, at(10));
+    monitor.apply_pushed_load(&worker, 0, &heartbeat, at(50));
+    let mut both = answer_of(0, 3);
+    both.loads.push(SchedulerLoadSnapshot {
+        dp_rank: 1,
+        num_used_tokens: 4_096,
+        max_total_num_tokens: 8_192,
+        ..Default::default()
+    });
+    both.dp_rank_count = 2;
+    let mut engine = vec![(Arc::clone(&worker), Some(both))];
+    monitor.reconcile_engine(&mut engine, at(60));
+    let laid = monitor.pushed_reports.lock()["http://w:1"].report.loads[1].clone();
+    assert_eq!((laid.dp_rank, laid.num_used_tokens), (1, 4_096));
+    let mut engine = vec![(Arc::clone(&worker), Some(answer_of(0, 3)))];
+    monitor.reconcile_engine(&mut engine, at(70));
+    // Rank 0's own heartbeat of 50 ms stated both: 50 ms old at 100.
+    monitor.apply_pushed_load(&worker, 0, &pushed(8), at(100));
+    let own = vec![
+        ("kv_tokens_used".to_owned(), Some(50)),
+        ("kv_tokens_capacity".to_owned(), Some(50)),
+    ];
+    assert_eq!(on_file(&monitor), (0, (Some(50), Some(50)), own));
+    monitor.apply_pushed_load(&worker, 0, &heartbeat, at(150));
+    monitor.apply_pushed_load(&worker, 0, &pushed(8), at(190));
+    let kept = vec![
+        ("kv_tokens_used".to_owned(), Some(40)),
+        ("kv_tokens_capacity".to_owned(), Some(40)),
+    ];
+    assert_eq!(on_file(&monitor), (0, (Some(40), Some(40)), kept));
+
+    // Rank 0 leaves, and rank 1 comes with a record of the capacity alone.
+    let ranks = PolledRanks {
+        newer: Vec::new(),
+        leaving: vec![0],
+    };
+    let (registry, monitor, _sink) = build_recording(PollMode::Poll, ranks, true, false);
+    let worker = ready_worker("http://w:1", "m");
+    registry.register(Arc::clone(&worker)).unwrap();
+    monitor.apply_pushed_load(&worker, 0, &heartbeat, at(0));
+    let mut empty = vec![(Arc::clone(&worker), Some(WorkerLoadResponse::default()))];
+    monitor.reconcile_engine(&mut empty, at(10));
+    monitor.apply_pushed_load(&worker, 1, &pushed(3).total_tokens(8_192), at(100));
+    let stated = vec![("kv_tokens_capacity".to_owned(), None)];
+    assert_eq!(on_file(&monitor), (1, (None, None), stated));
+    // Rank 0 comes again with a record that is the core alone: the
+    // heartbeat it sent before it left states nothing of this row.
+    monitor.apply_pushed_load(&worker, 0, &pushed(8), at(200));
+    assert_eq!(on_file(&monitor), (0, (None, None), Vec::new()));
+
+    // Rank 0 leaves a file of two ranks. Rank 1 keeps its own statement,
+    // of 30 ms, and takes none of rank 0's place.
+    let ranks = PolledRanks {
+        newer: Vec::new(),
+        leaving: vec![0],
+    };
+    let (registry, monitor, _sink) = build_recording(PollMode::Poll, ranks, true, false);
+    let worker = ready_worker("http://w:1", "m");
+    registry.register(Arc::clone(&worker)).unwrap();
+    monitor.apply_pushed_load(&worker, 0, &heartbeat, at(0));
+    monitor.apply_pushed_load(&worker, 1, &heartbeat, at(30));
+    let mut empty = vec![(Arc::clone(&worker), Some(WorkerLoadResponse::default()))];
+    monitor.reconcile_engine(&mut empty, at(40));
+    monitor.apply_pushed_load(&worker, 1, &pushed(8), at(100));
+    let own = vec![
+        ("kv_tokens_used".to_owned(), Some(70)),
+        ("kv_tokens_capacity".to_owned(), Some(70)),
+    ];
+    assert_eq!(on_file(&monitor), (1, (Some(70), Some(70)), own));
+}
+
+/// A poll's answer laid on one rank of a file of two dates that rank's row
+/// at the poll and states its counts then, and leaves the other rank's row
+/// and statement as they were. The answer here names rank 1 alone and
+/// counts two ranks. A core record of rank 1 behind it offers the poll's
+/// counts as old as the poll, and one of rank 0 offers rank 0's own, as
+/// old as its heartbeat.
+#[tokio::test]
+async fn a_polls_answer_laid_on_one_rank_of_two_states_that_ranks_counts() {
+    let (registry, monitor) = build_monitor();
+    let worker = ready_worker("grpc://w1:9000", "llama-3");
+    registry.register(Arc::clone(&worker)).unwrap();
+    let start = Instant::now();
+    let at = |ms: u64| start + Duration::from_millis(ms);
+    let rows = |monitor: &WorkerMonitor| {
+        let reports = monitor.pushed_reports.lock();
+        let rows = reports["grpc://w1:9000"].report.loads.iter();
+        rows.map(|row| {
+            let ages = (row.kept_used_tokens_age_ms, row.kept_total_tokens_age_ms);
+            (row.dp_rank, row.sampled_at, row.num_used_tokens, ages)
+        })
+        .collect::<Vec<_>>()
+    };
+    let heartbeat = pushed(7).used_tokens(2_048).total_tokens(8_192);
+    monitor.apply_pushed_load(&worker, 0, &heartbeat, at(0));
+    monitor.apply_pushed_load(&worker, 1, &heartbeat, at(10));
+    let answer = WorkerLoadResponse {
+        dp_rank_count: 2,
+        loads: vec![SchedulerLoadSnapshot {
+            dp_rank: 1,
+            num_running_reqs: 3,
+            num_used_tokens: 4_096,
+            max_total_num_tokens: 8_192,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    monitor.apply_polled_load("grpc://w1:9000", &answer, at(1_000));
+    let margin = PUSHED_ONE_WAY_MARGIN;
+    let stated = (None, None);
+    assert_eq!(
+        rows(&monitor),
+        [
+            (0, Some(at(0) - margin), 2_048, stated),
+            (1, Some(at(1_000)), 4_096, stated),
+        ]
+    );
+    let since = |ms: u64| u32::try_from((Duration::from_millis(ms) - margin).as_millis()).ok();
+    monitor.apply_pushed_load(&worker, 1, &pushed(8), at(1_100));
+    monitor.apply_pushed_load(&worker, 0, &pushed(8), at(1_200));
+    assert_eq!(
+        rows(&monitor),
+        [
+            (
+                0,
+                Some(at(1_200) - margin),
+                2_048,
+                (Some(1_200), Some(1_200))
+            ),
+            (1, Some(at(1_100) - margin), 4_096, (since(100), since(100))),
+        ]
     );
 }
 
 /// A count its record states is offered, zero included: an engine that
-/// goes idle states zero tokens held. A record that leaves the count out
-/// offers none, and neither does a rank's first record that states none.
+/// goes idle states zero tokens held. A rank's first record that states no
+/// count offers none. A record that leaves a stated count out offers the
+/// last record's, the zero too.
 #[tokio::test]
-async fn a_record_offers_the_count_it_states_at_zero_and_none_it_leaves_out() {
+async fn a_stated_zero_is_offered_and_a_first_record_that_states_no_count_offers_none() {
     let (registry, monitor) = build_monitor();
     let worker = ready_worker("grpc://w1:9000", "llama-3");
     registry.register(Arc::clone(&worker)).unwrap();
@@ -1057,9 +1747,10 @@ async fn a_record_offers_the_count_it_states_at_zero_and_none_it_leaves_out() {
     monitor.apply_pushed_load(&worker, 0, &idle, Instant::now());
     assert_eq!(offered(&monitor), counts(0.0));
 
-    // Left out: none is offered, and the entry keeps the last counts.
+    // Left out: the entry keeps the last counts and offers them, the zero
+    // too.
     monitor.apply_pushed_load(&worker, 0, &pushed(9), Instant::now());
-    assert!(offered(&monitor).is_empty());
+    assert_eq!(offered(&monitor), counts(0.0));
     let rank0 = published_rank0(&monitor, "grpc://w1:9000");
     assert_eq!(
         (rank0.num_used_tokens, rank0.max_total_num_tokens),
@@ -1111,10 +1802,17 @@ async fn a_pushed_heartbeat_with_no_capacity_offers_neither_fixed_count() {
     );
 
     // A record that carries a held count and leaves its capacity out: the
-    // entry keeps the capacity of the record before, so the rank has one,
-    // and the count the record carried is offered.
+    // entry keeps the capacity of the record before, so the rank has one.
+    // The count the record carried is offered, and the kept capacity
+    // beside it.
     monitor.apply_pushed_load(&worker, 0, &pushed(10).used_tokens(211), Instant::now());
-    assert_eq!(offered(&monitor), [("kv_tokens_used".to_owned(), 211.0)]);
+    assert_eq!(
+        offered(&monitor),
+        [
+            ("kv_tokens_used".to_owned(), 211.0),
+            ("kv_tokens_capacity".to_owned(), 8_192.0)
+        ]
+    );
     assert_eq!(figures(&monitor), (211, 8_192));
 }
 
@@ -2491,7 +3189,9 @@ async fn a_replaced_workers_late_eviction_leaves_its_successors_report() {
 }
 
 /// The monitor's own sink with a stop inside `forget`: a case holds the
-/// collector there while another thread pushes a record.
+/// collector there while another thread pushes a record. It asks no
+/// worker for its load, so a monitor started over it runs no poll: a poll
+/// that ends while the stop stands would wait for the reports it holds.
 struct StoppedAtForget {
     classic: ClassicLoadSink<crate::test_support::Members>,
     entered: mpsc::Sender<()>,
@@ -2538,6 +3238,10 @@ impl LoadSink for StoppedAtForget {
 
     fn reset(&self) {
         self.classic.reset();
+    }
+
+    fn polls(&self, _worker: &dyn Worker) -> bool {
+        false
     }
 }
 
@@ -3842,7 +4546,7 @@ async fn a_far_rank_has_its_own_sentinel_and_no_rank_between() {
         let (registry, monitor) = build_monitor();
         let worker = ready_worker("http://w:1", "m");
         let id = registry.register(Arc::clone(&worker)).unwrap();
-        for rank in [0, 1_000] {
+        for rank in [0, 63] {
             monitor.apply_pushed_load(&worker, rank, &pushed(7), Instant::now());
         }
         registry.transition_status(&id, WorkerStatus::NotReady);
@@ -3850,10 +4554,10 @@ async fn a_far_rank_has_its_own_sentinel_and_no_rank_between() {
         monitor.evict_worker_loads(&worker);
     });
     assert!(
-        running_series_of(&rendered, 1_000).ends_with(" -1"),
+        running_series_of(&rendered, 63).ends_with(" -1"),
         "the far rank"
     );
-    assert!(!rendered.contains("dp_rank=\"999\""), "a rank between");
+    assert!(!rendered.contains("dp_rank=\"62\""), "a rank between");
 }
 
 /// A report held through a flush: the worker at `http://w:1` reported 7,

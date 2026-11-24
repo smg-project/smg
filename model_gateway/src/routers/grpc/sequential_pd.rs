@@ -12,7 +12,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use axum::response::Response;
+use axum::{http::HeaderMap, response::Response};
 use smg_grpc_client::vllm_proto as vllm;
 use smg_worker::{
     health::liveness, identity::basic::Worker, metrics::writers::Metrics as WorkerMetrics,
@@ -35,21 +35,28 @@ use crate::{
         error,
         grpc::{
             backend_client::BackendClient,
-            common::stages::request_execution::{
-                decode_silence_response, dispatch_prefill_within, first_prefill_response_within,
-                is_prefill_silence, pd_start_failure_response, prefill_silence_response,
-                retire_pd_side, PdSides, PrefillBound, PrefillWait, Retirement, SideDispatch,
-                StreamResult,
+            common::stages::{
+                request_execution::{
+                    decode_silence_response, dispatch_prefill_within,
+                    first_prefill_response_within, is_prefill_silence, pd_start_failure_response,
+                    prefill_silence_response, retire_pd_side, PdSides, PrefillBound, PrefillWait,
+                    Retirement, SideDispatch, StreamResult,
+                },
+                MovedDecode, RequestAgain, WorkerSelectionStage,
             },
-            context::{ClientSelection, ExecutionResult, PdTiming, WorkerSelection},
+            context::{
+                ClientSelection, ExecutionResult, LoadGuards, PdTiming, RoutingSnapshot,
+                WireConstraint, WorkerSelection,
+            },
             multimodal::worker_language_model_only,
             proto_wrapper::{
                 FirstItem, PrefillCachedTokens, PrefillTicket, ProtoGenerateRequest,
                 ProtoInputLogProbs, ProtoResponseVariant, ProtoStream,
             },
             utils::{
-                account_pd_side_failure, mark_error_reason, stream_failure::UpstreamClass,
-                tonic_ext::TonicStatusExt,
+                account_pd_side_failure, mark_error_reason,
+                stream_failure::UpstreamClass,
+                tonic_ext::{is_the_engines_own_report, TonicStatusExt},
             },
         },
     },
@@ -573,7 +580,7 @@ impl SequentialPlan {
 /// What the drained prefill side hands on: its completed stream, the connector
 /// params and the processed media identity its Complete frame carried, the
 /// input logprobs and the prefix-cache hit, and the side's start and end.
-struct PrefillHarvest {
+pub(crate) struct PrefillHarvest {
     stream: ProtoStream,
     kv_params: Option<String>,
     media_identity: Option<vllm::MediaIdentity>,
@@ -583,12 +590,47 @@ struct PrefillHarvest {
     done: Instant,
 }
 
+/// What the sequential dispatch of one request holds for its decode, which
+/// goes out behind its prefill. The decode's load guard was made ahead of
+/// its send ([`LoadGuards::behind_prefill`]), so the dispatch owes it two
+/// things once the prefill has answered: the decode asked again
+/// ([`WorkerSelectionStage::decode_again`]), which may move the request to
+/// another decode, and the send said on the decode the request goes to. A
+/// decode the classic policies picked is owed neither, and its dispatch
+/// holds nothing for it.
+pub(crate) struct DecodeBehindPrefill<'a> {
+    /// The selection stage, which states the request again.
+    pub stage: &'a WorkerSelectionStage,
+    /// The model the request is routed under.
+    pub model_id: &'a str,
+    /// What of the request outlived its parse.
+    pub routing: &'a RoutingSnapshot,
+    pub headers: Option<&'a HeaderMap>,
+    /// The retained plan's wire.
+    pub wire: WireConstraint,
+    /// The engines the request's failed attempts were sent to.
+    pub tried: &'a [String],
+    /// The attempt's guards, the decode's among them.
+    pub guards: &'a mut LoadGuards,
+    /// Where the dispatch leaves the selection that names the decode it
+    /// sent, where the decode moved: the response's stages and a retry
+    /// read it in the first selection's place.
+    pub moved: &'a mut Option<WorkerSelection>,
+}
+
 /// Execute vLLM PD: send to prefill with max_tokens=1 first, wait for completion,
 /// then send original request to decode.
 ///
 /// For Mooncake: injects bootstrap_host/port from prefill worker metadata into
 /// the decode request. For NIXL: tags the prefill request with do_remote_decode,
 /// then relays the kv_transfer_params returned by the prefill engine to decode.
+///
+/// `behind` is what one request's dispatch holds for its decode
+/// ([`DecodeBehindPrefill`]): once the prefill has answered the decode is
+/// asked again, and its send is said where it goes out. `None` for a
+/// dispatch that owes its decode neither: a batch's sub-request, whose
+/// decode guard said the send where it was made, and a pair the classic
+/// policies picked.
 pub(crate) async fn execute_sequential_pd(
     proto_request: ProtoGenerateRequest,
     clients: &mut ClientSelection,
@@ -596,6 +638,7 @@ pub(crate) async fn execute_sequential_pd(
     model: &str,
     prefill_guard: PrefillLoadGuard,
     ledger: &AttemptLedger,
+    behind: Option<DecodeBehindPrefill<'_>>,
 ) -> Result<ExecutionResult, Response> {
     let runtime = workers
         .disaggregated_runtime_type()
@@ -621,13 +664,67 @@ pub(crate) async fn execute_sequential_pd(
         done: prefill_done,
     } = sequential_prefill_side(
         &sides,
-        prefill_request,
-        prefill_client.clone(),
+        Box::pin({
+            let mut client = prefill_client.clone();
+            async move { client.generate(prefill_request).await }
+        }),
         prefill_guard,
     )
     .await?;
 
     debug!("vLLM PD: prefill completed, sending decode request");
+
+    // The prefill has answered: the decode is asked again, and the request
+    // goes to the decode the answer names, with that decode's client and
+    // its gate's claim.
+    let mut decode_client = decode_client.clone();
+    let mut workers = workers;
+    let mut guards = None;
+    if let Some(behind) = behind {
+        let DecodeBehindPrefill {
+            stage,
+            model_id,
+            routing,
+            headers,
+            wire,
+            tried,
+            guards: held,
+            moved: slot,
+        } = behind;
+        if let Some(first) = workers.decode() {
+            let request = RequestAgain {
+                model_id,
+                routing,
+                headers,
+                tokens: decode_request.token_ids(),
+                wire,
+                tried,
+                ledger,
+            };
+            let mut moved = None;
+            held.map_decode(|ahead| {
+                let (decode, guard) = stage.decode_again(&request, first, ahead);
+                moved = decode;
+                guard
+            });
+            if let Some(MovedDecode {
+                decode,
+                client,
+                claim,
+            }) = moved
+            {
+                held.claim_moved(claim);
+                if let Some((_, held)) = clients.disaggregated_mut() {
+                    *held = client.clone();
+                }
+                decode_client = client;
+                *slot = workers.with_decode(decode);
+                workers = slot.as_ref().unwrap_or(workers);
+            }
+        }
+        guards = Some(held);
+    }
+    let sides = PdSides { workers, ..sides };
 
     let handed_off = relay_to_decode(
         &plan,
@@ -636,14 +733,13 @@ pub(crate) async fn execute_sequential_pd(
         kv_params,
         media_identity.as_ref(),
     )?;
-    let (decode_stream, decode_sent) = sequential_decode_side(
-        &sides,
-        &plan,
-        decode_request,
-        decode_client.clone(),
-        handed_off,
-    )
-    .await?;
+    // The decode goes out: its send is said on the answer the request goes
+    // to, with the guard made ahead of it.
+    if let (Some(guards), Some(decode)) = (guards, workers.decode()) {
+        guards.map_decode(|ahead| decode.sent(ahead));
+    }
+    let (decode_stream, decode_sent) =
+        sequential_decode_side(&sides, &plan, decode_request, decode_client, handed_off).await?;
     // Decode established: record the success-only PD metrics here.
     Metrics::record_pd_kv_connector_mode(kv_connector_label);
     Metrics::record_pd_prefill_duration(
@@ -689,15 +785,14 @@ pub(crate) async fn execute_sequential_pd(
 /// its admission slot is released once it is drained. A failure anywhere is
 /// the attempt's, where the retry layer can still take the request to another
 /// prefill worker.
-async fn sequential_prefill_side(
+pub(crate) async fn sequential_prefill_side(
     sides: &PdSides<'_>,
-    prefill_request: ProtoGenerateRequest,
-    mut prefill_client: BackendClient,
+    dispatch: SideDispatch,
     prefill_guard: PrefillLoadGuard,
 ) -> Result<PrefillHarvest, Response> {
     let workers = sides.workers;
     debug!(
-        request_id = %prefill_request.request_id(),
+        request_id = %sides.request_id,
         "vLLM PD: sending prefill request (max_tokens=1)"
     );
 
@@ -724,7 +819,7 @@ async fn sequential_prefill_side(
             bound: bound.clone(),
             encode: None,
         },
-        Box::pin(async move { prefill_client.generate(prefill_request).await }),
+        dispatch,
         prefill_worker.cloned(),
         None,
         sides.prefill_label,
@@ -792,7 +887,12 @@ async fn sequential_prefill_side(
                 }
             }
             Err(e) => {
-                if let Some(status) = e.breaker_status() {
+                // A collected answer does not charge the engine's own report,
+                // as in the collector; a streamed answer charges it.
+                if let Some(status) = e
+                    .breaker_status()
+                    .filter(|_| sides.streaming || !is_the_engines_own_report(&e))
+                {
                     workers.record_outcome_prefill(sides.ledger, status);
                 }
                 UpstreamClass::account_dispatch_failure(
@@ -1203,7 +1303,7 @@ mod tests {
         let selection = WorkerSelection::Disaggregated {
             encode_assignments: None,
             prefill,
-            decode,
+            decode: decode.into(),
             runtime_type: RuntimeType::Vllm,
         };
         let prefilling = |handed_off, relay_kv_params| {
@@ -1556,7 +1656,7 @@ mod tests {
         WorkerSelection::Disaggregated {
             encode_assignments: None,
             prefill,
-            decode,
+            decode: decode.into(),
             runtime_type: RuntimeType::Vllm,
         }
     }

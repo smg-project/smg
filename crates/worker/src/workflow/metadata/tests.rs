@@ -379,10 +379,55 @@ async fn the_info_routes_read_uses_the_model_lists_identity() {
     );
 }
 
+/// A registration reads tolerantly: a server info that fails to read leaves
+/// a gap, the engine's data-parallel size in it, so the worker registers as
+/// one worker. The failure is said in one warn line that names the route.
+/// A server info the engine does not offer is no failure, and no such line
+/// is written for it.
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn a_tolerant_read_says_a_server_info_that_failed_to_read() {
+    let said = "the labels are read without it";
+    let not_offered = serve_json_routes(vec![(
+        "/model_info",
+        http::StatusCode::OK,
+        serde_json::json!({"model_path": "org/model-a"}),
+    )])
+    .await;
+    let labels = info_routes_labels(&worker_client(), &not_offered, None).await;
+    assert_eq!(
+        labels.get("model_path").map(String::as_str),
+        Some("org/model-a")
+    );
+    assert!(!logs_contain(said));
+
+    let failing = serve_json_routes(vec![
+        (
+            "/server_info",
+            http::StatusCode::INTERNAL_SERVER_ERROR,
+            serde_json::json!({"dp_size": 4}),
+        ),
+        (
+            "/model_info",
+            http::StatusCode::OK,
+            serde_json::json!({"model_path": "org/model-a"}),
+        ),
+    ])
+    .await;
+    let labels = info_routes_labels(&worker_client(), &failing, None).await;
+    assert_eq!(labels.get("dp_size"), None);
+    assert_eq!(
+        labels.get("model_path").map(String::as_str),
+        Some("org/model-a")
+    );
+    assert!(logs_contain("server_info: status 500"));
+    assert!(logs_contain(said));
+}
+
 /// A credentialed worker that answers 401 (a wrong password): the error
 /// text names the address masked, never the secret. The status error is
-/// the likeliest failure of such a worker, and it ends in the DP
-/// discovery's warning and the step's failure message.
+/// the likeliest failure of such a worker, and it ends in a registration's
+/// warning and a refresh's failure message.
 #[tokio::test]
 async fn a_status_error_names_the_address_masked() {
     use axum::{http::StatusCode, Router};
@@ -403,10 +448,11 @@ async fn a_status_error_names_the_address_masked() {
         .unwrap();
     });
 
-    let err = get_server_info(
+    let err = read_info_routes(
         &worker_client(),
         &format!("http://user:secret@127.0.0.1:{port}"),
         None,
+        true,
     )
     .await
     .expect_err("401 is a failure");
@@ -430,7 +476,7 @@ async fn a_refused_connection_goes_without_the_clients_url() {
     let refused = RefusedAddress::reserve();
     let url = format!("{}?token=s3cret", refused.http_url());
 
-    let err = get_server_info(&worker_client(), &url, None)
+    let err = read_info_routes(&worker_client(), &url, None, true)
         .await
         .expect_err("nothing listens at the address");
 
@@ -457,10 +503,11 @@ async fn an_unparsed_answer_goes_without_the_clients_url() {
         .unwrap();
     });
 
-    let err = get_server_info(
+    let err = read_info_routes(
         &worker_client(),
         &format!("http://127.0.0.1:{port}?token=s3cret"),
         None,
+        true,
     )
     .await
     .expect_err("a body that is no JSON is a failure");

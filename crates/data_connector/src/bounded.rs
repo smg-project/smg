@@ -23,9 +23,9 @@
 //! a write answered as a timeout may have been applied. Like the hooked
 //! wrappers, they forward every
 //! method of a trait: a method added to a storage trait is forwarded here too.
-//! The one exception is `get_response_chain`, left to the trait's default so
-//! that a chain walk is bounded per record: a long `previous_response_id`
-//! chain over a slow store is not refused as a whole.
+//! The exceptions are `get_response_chain` and `get_response_chain_for`, left
+//! to the trait's default so that a chain walk is bounded per record: a long
+//! `previous_response_id` chain over a slow store is not refused as a whole.
 
 use std::{future::Future, sync::Arc, time::Duration};
 
@@ -132,8 +132,9 @@ impl ResponseStorage for BoundedResponseStorage {
             .await
     }
 
-    // `get_response_chain` stays the trait's default: each record of the walk
-    // is one bounded `get_response` (see the module doc).
+    // `get_response_chain` and `get_response_chain_for` stay the trait's
+    // default: each record of a walk is one bounded `get_response` (see the
+    // module doc).
 
     async fn find_response_by_output_item(
         &self,

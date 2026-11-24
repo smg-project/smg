@@ -25,6 +25,7 @@ pub(crate) fn profile() -> ProfileSpec {
         score: vec!["least-load".into()],
         pick: "power-of-two".into(),
         sent_ttl_ms: None,
+        sent_report_delay_ms: None,
     }
 }
 

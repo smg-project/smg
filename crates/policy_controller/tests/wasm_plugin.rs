@@ -31,7 +31,7 @@ use smg_policy_controller::{
         Target, WeightedScorer, WorkerId,
     },
     plugins::{
-        shared::{BreakerSpec, Failure, OpenDecisions, Reveal},
+        shared::{BreakerSpec, Failure, FrameBudget, OpenDecisions, Reveal},
         wasm::{
             Abi, LoadError, Plugin, PluginBinding, PluginSpec, Runtime, WasmFilter, WasmPicker,
             WasmScorer, World,
@@ -1038,6 +1038,61 @@ fn an_exhausted_budget_is_a_fuel_fault_and_the_scorer_falls_back_in_a_try(made: 
     the_close_rebuilt(CASE, &plugin, held, made)
 }
 
+/// A guest that states no budget takes the default frame, under a request
+/// that states none too: a stage is shown the widest budget there, and the
+/// guest's spin is cut at the default frame's fuel, not at the request's.
+/// The fallback scorer decides, and the cut is the guest's own failure.
+#[test]
+fn a_guest_with_no_budget_is_cut_at_the_default_frame_under_a_request_with_none() {
+    tried(a_guest_with_no_budget_is_cut_at_the_default_frame_in_a_try);
+}
+
+/// One try of the case above, told its number: whether it stood.
+fn a_guest_with_no_budget_is_cut_at_the_default_frame_in_a_try(made: u32) -> bool {
+    const CASE: &str = "a guest with no budget";
+    let runtime = runtime();
+    // The slow calibration, as for an exhausted budget: the fuel ends the
+    // spin long before the frame's bound on the clock.
+    let mut unset = spec("unbudgeted", guest::record_guest(), mode::SPIN_IN_SCORE);
+    unset.fuel_per_micro = SLOW_CALIBRATION;
+    unset.budget_micros = 0;
+    let plugin = loaded(&runtime, unset);
+    let engine = single_engine(plugin_profile(
+        &plugin,
+        None,
+        Some(Box::new(LeastRequests)),
+        None,
+    ));
+    let candidates = pool(4);
+    // What a stage is shown for a request that states no budget.
+    let widest = RequestFacts {
+        budget_micros: u32::MAX,
+        ..facts(1)
+    };
+    let (wall, cpu) = (std::time::Instant::now(), bound_clock());
+    let decision = decide_with(&engine, &candidates, &widest);
+    let held = off_cpu_since(wall, cpu);
+    assert_eq!(
+        pick_ids(&decision).first().copied(),
+        Some(103),
+        "the fallback scorer decided"
+    );
+    let stats = plugin.stats();
+    // The cut is the guest's own failure: it ran out under its own frame,
+    // not under what a request's budget had left.
+    assert_eq!(
+        (stats.fuel_exhausted, stats.budget_spent, stats.traps),
+        (1, 0, 0),
+        "{stats:?}"
+    );
+    let frame = u64::from(FrameBudget::DEFAULT_MICROS) * SLOW_CALIBRATION;
+    assert!(
+        (frame..2 * frame).contains(&stats.fuel_used),
+        "the spin used the default frame's fuel and no more: {stats:?}"
+    );
+    the_close_rebuilt(CASE, &plugin, held, made)
+}
+
 #[test]
 fn an_invalid_answer_is_a_fault_of_the_plugin() {
     let runtime = runtime();
@@ -1474,14 +1529,8 @@ fn the_memory_cap_is_the_specs_and_a_growth_past_it_traps() {
 #[test]
 fn a_view_carries_block_hashes_to_a_row_that_declares_them_alone() {
     let hashes: Vec<u64> = (1..=300).collect();
-    let token = Needs {
-        token_hashes: true,
-        ..Needs::default()
-    };
-    let text = Needs {
-        text_hashes: true,
-        ..Needs::default()
-    };
+    let token = Needs::NONE.with_token_hashes();
+    let text = Needs::NONE.with_text_hashes();
     let candidates = pool(4);
     for (world, component) in guest::hash_counting_guests() {
         for (needs, handed) in [(Needs::default(), 0), (token, 300), (text, 300)] {
@@ -1548,10 +1597,10 @@ fn the_lifecycle_reaches_the_plugin_once_per_profile_on_the_hosts_clock() {
         WorkerId(1),
         WorkerId(2),
     ]));
-    engine.on_signal(&smg_policy_controller::tracking::Signal::GatewayVeto {
-        worker: WorkerId(1),
-        until_micros: 500_000,
-    });
+    engine.on_signal(&smg_policy_controller::tracking::Signal::gateway_veto(
+        WorkerId(1),
+        500_000,
+    ));
     assert_eq!(counter_value(&plugin, counter::OBSERVED), 4);
     assert_eq!(plugin.stats().observed, 4);
 }
@@ -1877,8 +1926,9 @@ fn the_decisions_budget_bounds_the_sum_of_its_calls() {
     tried(|made| {
         let runtime = runtime();
         let mut burner = spec("burner", guest::record_guest(), mode::BURN_IN_STAGES);
-        // The frame is the request's: each call may take all of what is left.
-        burner.budget_micros = 0;
+        // A frame wider than any budget below: each call may take all of
+        // what is left of the request's.
+        burner.budget_micros = u32::MAX;
         // The budgets below are burns of fuel: at the slow calibration a call
         // held off its core is still charged its fuel.
         burner.fuel_per_micro = SLOW_CALIBRATION;
@@ -2098,10 +2148,10 @@ fn a_module_hears_the_kinds_of_event_its_row_lists_and_no_other() {
             WorkerId(1),
             WorkerId(2),
         ]));
-        engine.on_signal(&smg_policy_controller::tracking::Signal::GatewayVeto {
-            worker: WorkerId(1),
-            until_micros: 500_000,
-        });
+        engine.on_signal(&smg_policy_controller::tracking::Signal::gateway_veto(
+            WorkerId(1),
+            500_000,
+        ));
     };
     let runtime = runtime();
     // The default row lists nothing.
@@ -2212,7 +2262,9 @@ fn a_bulk_memory_loop_meets_the_frames_bound_on_the_clock_in_a_try(made: u32) ->
 fn a_pair_shares_one_decision_budget() {
     let runtime = runtime();
     let mut burner = spec("pair-burner", guest::record_guest(), mode::BURN_IN_STAGES);
-    burner.budget_micros = 0;
+    // A frame wider than any budget below: the request's alone bounds a
+    // call.
+    burner.budget_micros = u32::MAX;
     // Budgets in burns of fuel, at the slow calibration.
     burner.fuel_per_micro = SLOW_CALIBRATION;
     let fuel_per_micro = burner.fuel_per_micro;
@@ -2781,7 +2833,9 @@ fn the_first_open_seeds_the_budget_and_later_opens_draw_on_it_in_a_try(made: u32
         guest::record_guest(),
         mode::BURN_IN_CONSTRUCTOR,
     );
-    spec.budget_micros = 0;
+    // A frame wider than any budget below: the request's alone bounds a
+    // call.
+    spec.budget_micros = u32::MAX;
     // Budgets in burns of fuel, at the slow calibration.
     spec.fuel_per_micro = SLOW_CALIBRATION;
     let fuel_per_micro = spec.fuel_per_micro;
@@ -5620,6 +5674,409 @@ fn a_guest_slow_in_what_fuel_does_not_price_is_opened_by_its_samples_at_the_firs
     }
 }
 
+/// What one stage's burn costs at the slow calibration, in microseconds: a
+/// decision of a gauge plugin bound as the three stages, its fuel in three
+/// parts. A call's charge there is its fuel: a part is one stage's burn and
+/// a third of the little the rest of the decision costs.
+fn one_burn_micros(runtime: &Arc<Runtime>) -> u32 {
+    let mut gauge = spec("burn-gauge", guest::record_guest(), mode::BURN_IN_STAGES);
+    gauge.fuel_per_micro = SLOW_CALIBRATION;
+    gauge.budget_micros = SLOW_FRAME_MICROS;
+    let gauge = loaded(runtime, gauge);
+    let before = gauge.stats().fuel_used;
+    let decision = plugin_engine(&gauge).decide(
+        &RequestFacts {
+            budget_micros: SLOW_FRAME_MICROS,
+            ..facts(1)
+        },
+        &four(),
+        &pool(4),
+        &Constraints::default(),
+        &mut Scratch::new(),
+    );
+    assert!(matches!(decision, Decision::Pick(_)), "{decision:?}");
+    let fuel = gauge.stats().fuel_used - before;
+    u32::try_from((fuel / 3).div_ceil(SLOW_CALIBRATION)).expect("fits")
+}
+
+/// Sixty-four decisions of `plugin`, bound as the three stages, under a
+/// request that states no budget: a stage is shown the widest one there.
+fn decide_64_with_no_budget(plugin: &Arc<Plugin>) {
+    let engine = plugin_engine(plugin);
+    for seed in 1..=64 {
+        let decision = engine.decide(
+            &RequestFacts {
+                budget_micros: u32::MAX,
+                ..facts(seed)
+            },
+            &four(),
+            &pool(4),
+            &Constraints::default(),
+            &mut Scratch::new(),
+        );
+        assert!(
+            matches!(decision, Decision::Pick(_)),
+            "decision {seed}: {decision:?}"
+        );
+    }
+}
+
+/// Under a request that states no budget a guest's time is set against the
+/// frames of its own calls, not against the widest budget. A guest whose
+/// three stages each burn nine tenths of their frame answers every call and
+/// fails none, so the failure rule counts nothing. Its decisions sample past
+/// half of their frames all the same, and the ring's first read opens the
+/// breaker.
+#[test]
+fn a_guest_near_its_frame_in_every_call_is_opened_by_its_samples_under_a_request_with_no_budget() {
+    // The opening's line is read below: the subscriber is installed before
+    // the first decision.
+    said();
+    let runtime = runtime();
+    let burn_micros = one_burn_micros(&runtime);
+    let mut near = spec(
+        "near-its-frame",
+        guest::record_guest(),
+        mode::BURN_IN_STAGES,
+    );
+    near.fuel_per_micro = SLOW_CALIBRATION;
+    near.budget_micros = burn_micros * 10 / 9;
+    let plugin = loaded(&runtime, near);
+    decide_64_with_no_budget(&plugin);
+    let stats = plugin.stats();
+    assert_eq!(
+        (stats.fuel_exhausted, stats.traps, stats.budget_spent),
+        (0, 0, 0),
+        "every call fit its frame: {stats:?}"
+    );
+    assert_eq!(
+        stats.breaker_opens, 1,
+        "the window opened at its first read: {stats:?}"
+    );
+    let lines = openings("near-its-frame");
+    assert_eq!(lines.len(), 1, "one opening, one line: {lines:?}");
+    assert!(lines[0].contains("rule=\"latency\""), "{}", lines[0]);
+}
+
+/// The frames of a decision's calls add up. A guest whose three stages each
+/// burn four tenths of their frame spends more than one frame a decision
+/// and under half of the frames of its calls: under a request that states
+/// no budget its sixty-four decisions open nothing.
+#[test]
+fn three_healthy_calls_of_a_guest_are_read_against_their_three_frames() {
+    let runtime = runtime();
+    let burn_micros = one_burn_micros(&runtime);
+    let mut healthy = spec("three-healthy", guest::record_guest(), mode::BURN_IN_STAGES);
+    healthy.fuel_per_micro = SLOW_CALIBRATION;
+    healthy.budget_micros = burn_micros * 5 / 2;
+    let plugin = loaded(&runtime, healthy);
+    decide_64_with_no_budget(&plugin);
+    let stats = plugin.stats();
+    assert_eq!(
+        (
+            stats.fuel_exhausted,
+            stats.traps,
+            stats.budget_spent,
+            stats.breaker_opens
+        ),
+        (0, 0, 0, 0),
+        "three calls at four tenths of their frames are no slow sample: {stats:?}"
+    );
+}
+
+/// A guest's constructor is a call under a frame of its own, so a guest bound
+/// as one stage is read over two frames a decision. One whose only stage
+/// burns nine tenths of its frame takes under half of its two frames: under
+/// a request that states no budget its sixty-four decisions open nothing.
+/// Bound as three stages, the same burn opens the breaker at the ring's
+/// first read.
+#[test]
+fn a_guest_bound_as_one_stage_is_read_against_its_two_frames() {
+    let runtime = runtime();
+    let burn_micros = one_burn_micros(&runtime);
+    let mut near = spec(
+        "one-stage-near",
+        guest::record_guest(),
+        mode::BURN_IN_STAGES,
+    );
+    near.fuel_per_micro = SLOW_CALIBRATION;
+    near.budget_micros = burn_micros * 10 / 9;
+    let plugin = loaded(&runtime, near);
+    let engine = single_engine(Profile {
+        name: "one-stage".into(),
+        filters: vec![],
+        scorers: vec![WeightedScorer {
+            scorer: Box::new(WasmScorer::new(plugin.bind(), None)),
+            weight: 1.0,
+        }],
+        picker: Box::new(Best),
+    });
+    for seed in 1..=64 {
+        let decision = engine.decide(
+            &RequestFacts {
+                budget_micros: u32::MAX,
+                ..facts(seed)
+            },
+            &four(),
+            &pool(4),
+            &Constraints::default(),
+            &mut Scratch::new(),
+        );
+        assert!(
+            matches!(decision, Decision::Pick(_)),
+            "decision {seed}: {decision:?}"
+        );
+    }
+    let stats = plugin.stats();
+    assert_eq!(
+        (
+            stats.fuel_exhausted,
+            stats.traps,
+            stats.budget_spent,
+            stats.breaker_opens
+        ),
+        (0, 0, 0, 0),
+        "nine tenths of one frame of two is no slow sample: {stats:?}"
+    );
+}
+
+/// A call the decision's remainder clamped is not its plugin's own, though
+/// its bound ended it: the plugin failed nothing there, so its decision's
+/// sample is still asked whether it is unread. A scorer whose constructor
+/// burns draws most of the budget in front of a scorer the host holds inside
+/// its log line for as long as the whole budget. Released, that score spins
+/// until the bound of what the decision had left ends it: the decision's
+/// budget spent, and no failure of the plugin. Its sample holds the hold,
+/// past the budget, and its fuel is far short of half: slow by time nothing
+/// read alone, it is counted with the unread calls and arms the thread, so a
+/// second hold there is read.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_held_call_its_bound_ended_under_the_remainder_is_still_an_unread_sample() {
+    // What the decision leaves the held scorer.
+    const LEFT_MICROS: u32 = 30_000;
+    let name = "held-then-spins";
+    let runtime = runtime();
+    let front = load_slow(
+        &runtime,
+        "draws-first",
+        guest::record_guest(),
+        mode::BURN_IN_CONSTRUCTOR,
+    );
+    let mut held = spec(name, guest::record_guest(), mode::LOG_THEN_SPIN);
+    // The score's log line reaches the host's subscriber, where the case
+    // holds it.
+    held.log.per_second = 1_000;
+    // A calibration no host has: the spin's fuel lasts far past its bound,
+    // so only the clock ends it. And a frame the remainder is well under.
+    held.fuel_per_micro = 20_000_000;
+    held.budget_micros = LEFT_MICROS * 4;
+    let held = loaded(&runtime, held);
+    let scorer = |plugin: &Arc<Plugin>| WeightedScorer {
+        scorer: Box::new(WasmScorer::new(plugin.bind(), None)),
+        weight: 1.0,
+    };
+    let decide_with_budget = |engine: &Engine, budget_micros: u32, seed: u64| {
+        let decision = engine.decide(
+            &RequestFacts {
+                budget_micros,
+                ..facts(seed)
+            },
+            &four(),
+            &pool(4),
+            &Constraints::default(),
+            &mut Scratch::new(),
+        );
+        assert!(
+            matches!(decision, Decision::Pick(_)),
+            "decision {seed}: {decision:?}"
+        );
+    };
+    // What a decision costs the front plugin, read off one of its own under
+    // its frame: a charge at the slow calibration is its fuel.
+    let alone = single_engine(Profile {
+        name: "front-alone".into(),
+        filters: vec![],
+        scorers: vec![scorer(&front)],
+        picker: Box::new(Best),
+    });
+    let before = front.stats().fuel_used;
+    decide_with_budget(&alone, SLOW_FRAME_MICROS, 0);
+    let front_micros =
+        u32::try_from((front.stats().fuel_used - before).div_ceil(SLOW_CALIBRATION)).expect("fits");
+    let budget_micros = front_micros + LEFT_MICROS;
+    let engine = single_engine(Profile {
+        name: "front-then-held".into(),
+        filters: vec![],
+        scorers: vec![scorer(&front), scorer(&held)],
+        picker: Box::new(Best),
+    });
+    hold(
+        name,
+        std::time::Duration::from_micros(u64::from(budget_micros)),
+        2,
+    );
+    decide_with_budget(&engine, budget_micros, 1);
+    let stats = held.stats();
+    assert_eq!(
+        (
+            stats.budget_spent,
+            stats.fuel_exhausted,
+            stats.traps,
+            stats.breaker_opens
+        ),
+        (1, 0, 0, 0),
+        "the remainder clamped the call its bound ended: the decision's budget spent, no failure of the plugin: {stats:?}"
+    );
+    assert_eq!(
+        stats.unread, 1,
+        "its sample is slow by the hold alone: counted unread, which arms the thread: {stats:?}"
+    );
+    // Armed, the thread reads its clock around the next held score: its time
+    // is what the thread had, and nothing is counted again.
+    decide_with_budget(&engine, budget_micros, 2);
+    let stats = held.stats();
+    assert_eq!(
+        (stats.budget_spent, stats.unread, stats.breaker_opens),
+        (2, 1, 0),
+        "the second hold is read: {stats:?}"
+    );
+}
+
+/// At its bound a call is the plugin's, though the host held it: a score
+/// the host holds inside its log line for two frames, which then spins
+/// until its own whole frame ends it, under a request that states no
+/// budget. The run-out is the plugin's failure. Its decision's sample holds
+/// the hold, past its two frames, and its fuel is no more than half of
+/// them: slow by time nothing read alone, and never counted unread, for the
+/// bound ended the call as the plugin's own.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_held_call_its_own_bound_ended_is_the_plugins_and_never_unread() {
+    const OWN_FRAME_MICROS: u32 = 30_000;
+    let name = "held-then-spins-alone";
+    let runtime = runtime();
+    let mut held = spec(name, guest::record_guest(), mode::LOG_THEN_SPIN);
+    // The score's log line reaches the host's subscriber, where the case
+    // holds it.
+    held.log.per_second = 1_000;
+    // A calibration no host has: the spin's fuel lasts far past its bound,
+    // so only the clock ends it.
+    held.fuel_per_micro = 20_000_000;
+    held.budget_micros = OWN_FRAME_MICROS;
+    let held = loaded(&runtime, held);
+    let engine = single_engine(Profile {
+        name: "held-alone".into(),
+        filters: vec![],
+        scorers: vec![WeightedScorer {
+            scorer: Box::new(WasmScorer::new(held.bind(), None)),
+            weight: 1.0,
+        }],
+        picker: Box::new(Best),
+    });
+    hold(
+        name,
+        std::time::Duration::from_micros(u64::from(OWN_FRAME_MICROS) * 2),
+        1,
+    );
+    let decision = engine.decide(
+        &RequestFacts {
+            budget_micros: u32::MAX,
+            ..facts(1)
+        },
+        &four(),
+        &pool(4),
+        &Constraints::default(),
+        &mut Scratch::new(),
+    );
+    assert!(matches!(decision, Decision::Pick(_)), "{decision:?}");
+    let stats = held.stats();
+    assert_eq!(
+        (stats.fuel_exhausted, stats.budget_spent, stats.traps),
+        (1, 0, 0),
+        "the plugin's own whole frame ran out on the clock: {stats:?}"
+    );
+    assert_eq!(
+        stats.unread, 0,
+        "a call its bound ended is never unread, by its verdict or through its decision's sample: {stats:?}"
+    );
+}
+
+/// A call's frame in its decision's sample is its plugin's own, whatever
+/// another plugin's draw left of its grant. A scorer whose constructor burns
+/// opens in front of a picker whose constructor burns as much, under a
+/// budget that leaves the picker three tenths more than it uses: its
+/// decisions take well under half the budget, and sixty-four of them open
+/// nothing. Read against what the remainder left of its two grants, each
+/// would be past half of them, and the window's first read would open the
+/// breaker.
+#[test]
+fn a_guest_another_plugins_draw_left_little_is_read_against_its_own_frames() {
+    let runtime = runtime();
+    let scorer = load_slow(
+        &runtime,
+        "heavy-scorer",
+        guest::record_guest(),
+        mode::BURN_IN_CONSTRUCTOR,
+    );
+    let picker = load_slow(
+        &runtime,
+        "left-little",
+        guest::record_guest(),
+        mode::BURN_IN_CONSTRUCTOR,
+    );
+    let engine = single_engine(Profile {
+        name: "two".into(),
+        filters: vec![],
+        scorers: vec![WeightedScorer {
+            scorer: Box::new(WasmScorer::new(scorer.bind(), None)),
+            weight: 1.0,
+        }],
+        picker: Box::new(WasmPicker::new(picker.bind(), None)),
+    });
+    let decide_under = |budget_micros: u32, seed: u64| {
+        let decision = engine.decide(
+            &RequestFacts {
+                budget_micros,
+                ..facts(seed)
+            },
+            &four(),
+            &pool(4),
+            &Constraints::default(),
+            &mut Scratch::new(),
+        );
+        assert!(
+            matches!(decision, Decision::Pick(_)),
+            "decision {seed}: {decision:?}"
+        );
+    };
+    // What a decision costs each plugin, read off one under the plugins'
+    // own frame: a charge at the slow calibration is its fuel.
+    let before = (scorer.stats().fuel_used, picker.stats().fuel_used);
+    decide_under(SLOW_FRAME_MICROS, 0);
+    let scorer_micros = (scorer.stats().fuel_used - before.0).div_ceil(SLOW_CALIBRATION);
+    let picker_micros = (picker.stats().fuel_used - before.1).div_ceil(SLOW_CALIBRATION);
+    // The scorer's draw, and thirteen tenths of the picker's.
+    let budget_micros = u32::try_from(scorer_micros + picker_micros * 13 / 10).expect("fits");
+    let spent_before = picker.stats().budget_spent;
+    for seed in 1..=64 {
+        decide_under(budget_micros, seed);
+    }
+    let stats = picker.stats();
+    // The picker's own calls ran in each of them: a stage the remainder
+    // left nothing would fall back, and its window would read no sample.
+    assert_eq!(
+        (
+            stats.traps,
+            stats.fuel_exhausted,
+            stats.budget_spent - spent_before,
+            stats.breaker_opens
+        ),
+        (0, 0, 0, 0),
+        "under half the budget a decision, whatever the scorer left: {stats:?}"
+    );
+}
+
 /// Reads `VmRSS` of this process, in KiB.
 fn rss_kib() -> u64 {
     std::fs::read_to_string("/proc/self/status")
@@ -6975,6 +7432,59 @@ fn a_lazy_init_slow_by_its_own_fuel_on_every_cold_slot_opens_the_window() {
     );
 }
 
+/// A lazy `init` a decision pays is in the decision's sample, and the init
+/// frame is in what the sample is taken over. Under a request that states
+/// no budget this guest pays its `init` in every one of sixty-four
+/// decisions, and its own frame is about four tenths of that `init`: against
+/// the frames of its calls alone each sample would read slow, and with the
+/// init frame beside them none does.
+#[test]
+fn a_lazy_init_is_read_against_the_init_frame_under_a_request_with_no_budget() {
+    const CALIBRATION: u64 = 10;
+    let runtime = runtime();
+    let mut gauge = spec("init-gauge", guest::record_guest(), mode::BURN_IN_INIT);
+    gauge.fuel_per_micro = CALIBRATION;
+    let gauge = loaded(&runtime, gauge);
+    // The load ran `init` once: its fuel at the calibration, the same every
+    // time.
+    let init_micros = u32::try_from(gauge.stats().fuel_used.div_ceil(CALIBRATION)).expect("fits");
+    let mut row = spec(
+        "init-under-no-budget",
+        guest::record_guest(),
+        mode::BURN_IN_INIT,
+    );
+    row.fuel_per_micro = CALIBRATION;
+    row.budget_micros = init_micros / 50 * 21;
+    let plugin = loaded(&runtime, row);
+    let engine = plugin_engine(&plugin);
+    let made = plugin.stats().lazy_instantiations;
+    for seed in 1..=64 {
+        plugin.forget_instance();
+        let decision = engine.decide(
+            &RequestFacts {
+                budget_micros: u32::MAX,
+                ..facts(seed)
+            },
+            &four(),
+            &pool(4),
+            &Constraints::default(),
+            &mut Scratch::new(),
+        );
+        assert!(matches!(decision, Decision::Pick(_)), "decision {seed}");
+    }
+    let s = plugin.stats();
+    assert_eq!(
+        s.lazy_instantiations - made,
+        64,
+        "every decision paid an `init`: {s:?}"
+    );
+    assert_eq!(
+        (s.fuel_exhausted, s.traps, s.budget_spent, s.breaker_opens),
+        (0, 0, 0, 0),
+        "no sample read slow: {s:?}"
+    );
+}
+
 /// A lazy `init` is in the sample of the decision that paid it, and in no
 /// later one. This `init` is three quarters of the decision's budget by its
 /// fuel; one cold decision pays it and sixty-four warm ones follow on the
@@ -7016,6 +7526,217 @@ fn a_lazy_inits_time_is_in_the_sample_of_the_decision_that_paid_it_alone() {
         (1, 0),
         "one decision paid the init and its sample alone is slow: {s:?}"
     );
+}
+
+/// A lazy `init`'s frame is in the frames of the decision that paid it, and
+/// in no later one. A guest whose three stages each burn nine tenths of
+/// their frame pays its `init` in one cold decision, and sixty-four warm
+/// ones follow on the thread, under a request that states no budget. Each
+/// warm sample is past half of the four frames of its own calls, and the
+/// ring's first read opens the breaker. Read over those frames and the first
+/// decision's init frame, 100 ms more, each would be under half of them, and
+/// nothing would open.
+#[test]
+fn a_lazy_inits_frame_is_in_the_frames_of_the_decision_that_paid_it_alone() {
+    let runtime = runtime();
+    // A calibration that prices one stage's burn near 30 ms: four frames of
+    // such a guest are well under the 100 ms an init frame adds to them.
+    let burn_fuel = u64::from(one_burn_micros(&runtime)) * SLOW_CALIBRATION;
+    let calibration = burn_fuel.div_ceil(30_000).max(1);
+    let burn_micros = u32::try_from(burn_fuel.div_ceil(calibration)).expect("fits");
+    let mut near = spec(
+        "near-behind-an-init",
+        guest::record_guest(),
+        mode::BURN_IN_STAGES,
+    );
+    near.fuel_per_micro = calibration;
+    near.budget_micros = burn_micros * 10 / 9;
+    let plugin = loaded(&runtime, near);
+    let engine = plugin_engine(&plugin);
+    let made = plugin.stats().lazy_instantiations;
+    plugin.forget_instance();
+    for seed in 1..=65 {
+        let decision = engine.decide(
+            &RequestFacts {
+                budget_micros: u32::MAX,
+                ..facts(seed)
+            },
+            &four(),
+            &pool(4),
+            &Constraints::default(),
+            &mut Scratch::new(),
+        );
+        assert!(
+            matches!(decision, Decision::Pick(_)),
+            "decision {seed}: {decision:?}"
+        );
+    }
+    let stats = plugin.stats();
+    assert_eq!(
+        stats.lazy_instantiations - made,
+        1,
+        "the first decision paid the one `init`: {stats:?}"
+    );
+    assert_eq!(
+        (stats.fuel_exhausted, stats.traps, stats.budget_spent),
+        (0, 0, 0),
+        "every call fit its frame: {stats:?}"
+    );
+    assert_eq!(
+        stats.breaker_opens, 1,
+        "the warm samples read slow over the frames of their own calls: {stats:?}"
+    );
+}
+
+/// A decision that pays an `init` and charges no call is read over the init
+/// frame alone, whatever the calls of an earlier decision left on its
+/// thread. One warm decision makes four calls under one-second frames. Then
+/// the `init` of sixty-four cold slots spins its frame out, the plugin's own
+/// failure each time under a threshold of a hundred: 100 ms of the init
+/// frame's 100 ms. The ring's first read opens the breaker by its latency
+/// rule. Read over the four seconds of the first decision's frames beside
+/// the init frame, no sample would be slow.
+#[test]
+fn an_inits_sample_is_read_over_the_init_frame_alone_behind_a_decision_that_charged_calls() {
+    let (clock, _runtime, plugin) = plugin_whose_init_asks(0, |row| {
+        row.fuel_per_micro = SLOW_CALIBRATION;
+        row.budget_micros = SLOW_FRAME_MICROS;
+        row.breaker = BreakerSpec {
+            failures: 100,
+            ..BreakerSpec::default()
+        };
+    });
+    let engine = plugin_engine(&plugin);
+    let decide_at = |steer: u8, seed: u64| {
+        clock.store(steer, Ordering::Relaxed);
+        let decision = engine.decide(
+            &RequestFacts {
+                budget_micros: u32::MAX,
+                ..facts(seed)
+            },
+            &four(),
+            &pool(4),
+            &Constraints::default(),
+            &mut Scratch::new(),
+        );
+        clock.store(0, Ordering::Relaxed);
+        assert!(
+            matches!(decision, Decision::Pick(_)),
+            "decision {seed}: {decision:?}"
+        );
+    };
+    decide_at(0, 0);
+    let warm = plugin.stats();
+    assert_eq!(
+        (warm.answered, warm.lazy_instantiations),
+        (4, 0),
+        "four calls on the instance the load made: {warm:?}"
+    );
+    for seed in 1..=64 {
+        plugin.forget_instance();
+        // The clock's answer of two makes the guest's `init` spin.
+        decide_at(3, seed);
+    }
+    let stats = plugin.stats();
+    assert_eq!(
+        (stats.answered, stats.lazy_instantiations),
+        (4, 0),
+        "no cold decision kept an instance or charged a call: {stats:?}"
+    );
+    assert_eq!(
+        stats.breaker_opens, 1,
+        "each `init` is the whole of its own frame, and the window reads slow: {stats:?}"
+    );
+}
+
+/// A call its own bound ended marks its decision, and no later one. A cold
+/// slot's first decision ends a score that spins at the plugin's own bound:
+/// the plugin's failure. Its sample is under half of its frames at both its
+/// ends, the init frame among them, so it arms nothing. The next decision
+/// on the thread pays an `init` the host holds past half the budget: its
+/// sample is slow by time nothing read alone, and it is counted with the
+/// unread calls. That holds where the held `init` keeps its instance and its
+/// calls follow under what the budget has left, and where it refuses and is
+/// all the decision pays. Read with the earlier decision's mark, neither
+/// would be counted.
+///
+/// The first decision's score ends on the clock. A runner that keeps its
+/// thread off the CPU as long as the plugin's frame makes that sample one
+/// slow by time nothing read, which arms the thread: such a try says so and
+/// is made again, [`TRIES`] at most.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_call_its_own_bound_ended_marks_no_later_decision() {
+    const CASE: &str = "a call its own bound ended marks no later decision";
+    const OWN_FRAME_MICROS: u32 = 100_000;
+    const BUDGET_MICROS: u32 = 50_000;
+    const WAIT: std::time::Duration = std::time::Duration::from_millis(30);
+    // The clock's answer of zero keeps the held `init`, of one refuses it.
+    for steer in [1, 2] {
+        tried(|made| {
+            let clock = Arc::new(AtomicU8::new(0));
+            let runtime = steered_runtime(&clock, WAIT);
+            let mut row = spec(
+                "ended-then-held",
+                guest::record_guest(),
+                mode::SPIN_IN_SCORE,
+            );
+            row.config.push(mode::INIT_ASKS_THE_CLOCK);
+            // No call runs out of fuel: the clock ends the score that spins.
+            row.fuel_per_micro = 20_000_000;
+            row.budget_micros = OWN_FRAME_MICROS;
+            let plugin = loaded(&runtime, row);
+            let engine = plugin_engine(&plugin);
+            let decide_cold = |seed: u64, budget_micros: u32| {
+                plugin.forget_instance();
+                let (wall, cpu) = (std::time::Instant::now(), bound_clock());
+                let decision = engine.decide(
+                    &RequestFacts {
+                        budget_micros,
+                        ..facts(seed)
+                    },
+                    &four(),
+                    &pool(4),
+                    &Constraints::default(),
+                    &mut Scratch::new(),
+                );
+                let off_the_cpu = off_cpu_since(wall, cpu);
+                assert!(
+                    matches!(decision, Decision::Pick(_)),
+                    "steer {steer}: decision {seed}: {decision:?}"
+                );
+                off_the_cpu
+            };
+            // The score spins a whole frame of its own, under a request
+            // that states no budget.
+            let off_the_cpu = decide_cold(1, u32::MAX);
+            let first = plugin.stats();
+            let frame = std::time::Duration::from_micros(u64::from(OWN_FRAME_MICROS));
+            if off_the_cpu >= frame && made < TRIES {
+                made_again(
+                    CASE,
+                    "the first decision's thread was off the CPU a whole frame of the plugin",
+                );
+                return false;
+            }
+            assert_eq!(
+                (first.fuel_exhausted, first.budget_spent, first.unread),
+                (1, 0, 0),
+                "steer {steer}: the plugin's own bound ended its score (try {made}, the thread off the CPU {off_the_cpu:?}): {first:?}"
+            );
+            // The `init` waits 30 ms on the host, of a budget of 50 ms.
+            clock.store(steer, Ordering::Relaxed);
+            decide_cold(2, BUDGET_MICROS);
+            clock.store(0, Ordering::Relaxed);
+            let s = plugin.stats();
+            assert_eq!(
+                (s.fuel_exhausted, s.unread),
+                (1, 1),
+                "steer {steer}: the held decision's sample is its own, and nothing read it (try {made}): {s:?}"
+            );
+            true
+        });
+    }
 }
 
 /// A sample slow by time nothing read is in its window as it is: the rule
@@ -7587,9 +8308,9 @@ fn a_destructors_bound_is_its_own_not_the_decisions_frame() {
     tried(|made| {
         let (runtime, born) = runtime_and_the_threads_born_with_it();
         let mut filler = spec("fill-dtor", guest::record_guest(), mode::FILL_IN_DESTRUCTOR);
-        // The frame is the request's 100 ms, and the calibration makes the
-        // destructor's fuel frame outlast it: only its bound on the clock
-        // ends the fill.
+        // The frame is 100 ms, the default of a plugin that states none and
+        // the request's too, and the calibration makes the destructor's
+        // fuel frame outlast it: only its bound on the clock ends the fill.
         filler.budget_micros = 0;
         filler.fuel_per_micro = 100_000_000;
         let plugin = loaded(&runtime, filler);
@@ -8283,10 +9004,7 @@ fn a_plugin_stages_fallback_counts_in_the_stages_needs() {
     struct ColumnReader;
 
     fn reads_the_column() -> Needs {
-        Needs {
-            affinity: true,
-            ..Needs::default()
-        }
+        Needs::NONE.with_affinity()
     }
 
     impl Lifecycle for ColumnReader {}
@@ -8631,59 +9349,107 @@ fn a_named_pair_decision_keeps_its_instance_to_the_plugins_last_close() {
 /// call there and no instance; each decider's instance hears it before its
 /// next decision, one call a change. An instance made after a telling hears
 /// the list as it stands first.
+///
+/// The second decider's instance is made by its first decision: a lazy
+/// `init`, on the wall clock. A runner that holds that thread for the init
+/// frame has the host end the `init`. The decision then falls back, to the
+/// very worker the plugin names there, and the instance the decider's next
+/// decision makes hears the changes told so far as one snapshot: one call
+/// fewer, on one instance more. A destructor's time costs an instance the
+/// same way, and the close rebuilds it. So a try that counts another
+/// instance than the two the case makes, where a decision's thread was off
+/// the CPU half the init frame, says so and is made again ([`tried`]). Each
+/// try reads its picks and its counts before it asserts any, and a try no
+/// hold reached asserts what it read.
 #[test]
 fn a_membership_told_once_reaches_every_deciders_instance_before_it_decides() {
     use smg_policy_controller::tracking::Membership;
+    const CASE: &str = "a_membership_told_once_reaches_every_deciders_instance_before_it_decides";
     let runtime = runtime();
-    let plugin = load(&runtime, "fed", guest::record_guest(), mode::COUNT_MEMBERS);
-    let engine = plugin_engine(&plugin);
-    // The guest's pick names the row at the count of members its instance
-    // heard: on a thread of its own, acting as the decider of that number.
-    let acting = |number: u8| {
-        std::thread::scope(|scope| {
-            scope
-                .spawn(|| {
-                    let _turn = DecisionSlot::new(number).enter();
-                    pick_ids(&decide(&engine, &pool(4), 1)).first().copied()
-                })
-                .join()
-                .expect("the acting thread")
-        })
-    };
-    // Told on a thread that names no decider and never decides.
-    let tell = |change: Membership<'_>| {
-        std::thread::scope(|scope| {
-            scope
-                .spawn(|| engine.on_membership(&change))
-                .join()
-                .expect("the telling thread");
-        });
-    };
-    assert_eq!(acting(0), Some(100), "no member told yet");
-    tell(Membership::Snapshot(&[WorkerId(100), WorkerId(101)]));
-    let told = plugin.stats();
-    assert_eq!(
-        (told.observed, told.instantiations, told.events_dropped),
-        (0, 1, 0),
-        "a telling calls no guest, makes no instance and drops nothing: {told:?}"
-    );
-    assert_eq!(acting(0), Some(102), "the first decider's instance heard");
-    assert_eq!(
-        acting(1),
-        Some(102),
-        "an instance made after the telling hears the list as it stands"
-    );
-    tell(Membership::Added(WorkerId(102)));
-    assert_eq!((acting(1), acting(0)), (Some(103), Some(103)));
-    tell(Membership::Removed(WorkerId(100)));
-    tell(Membership::Removed(WorkerId(101)));
-    assert_eq!((acting(0), acting(1)), (Some(101), Some(101)));
-    let stats = plugin.stats();
-    assert_eq!(
-        (stats.observed, stats.instantiations),
-        (8, 2),
-        "one call a decider a change, the snapshot among them: {stats:?}"
-    );
+    tried(|made| {
+        let plugin = load(&runtime, "fed", guest::record_guest(), mode::COUNT_MEMBERS);
+        let engine = plugin_engine(&plugin);
+        // The guest's pick names the row at the count of members its
+        // instance heard: on a thread of its own, acting as the decider of
+        // that number. The longest any such thread was off the CPU is kept.
+        let worst = std::cell::Cell::new(std::time::Duration::ZERO);
+        let acting = |number: u8| {
+            let (pick, held) = std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        let (wall, cpu) = (std::time::Instant::now(), bound_clock());
+                        let pick = {
+                            let _turn = DecisionSlot::new(number).enter();
+                            pick_ids(&decide(&engine, &pool(4), 1)).first().copied()
+                        };
+                        (pick, off_cpu_since(wall, cpu))
+                    })
+                    .join()
+                    .expect("the acting thread")
+            });
+            worst.set(worst.get().max(held));
+            pick
+        };
+        // Told on a thread that names no decider and never decides.
+        let tell = |change: Membership<'_>| {
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(|| engine.on_membership(&change))
+                    .join()
+                    .expect("the telling thread");
+            });
+        };
+        let untold = acting(0);
+        tell(Membership::Snapshot(&[WorkerId(100), WorkerId(101)]));
+        let told = plugin.stats();
+        let heard = acting(0);
+        // The second decider's first decision, and the instances made
+        // lazily by its end: its own.
+        let late = (acting(1), plugin.stats().lazy_instantiations);
+        tell(Membership::Added(WorkerId(102)));
+        let added = (acting(1), acting(0));
+        tell(Membership::Removed(WorkerId(100)));
+        tell(Membership::Removed(WorkerId(101)));
+        let removed = (acting(0), acting(1));
+        let stats = plugin.stats();
+        // The witness: the load's instance and the second decider's are the
+        // two a try makes. Another one, made or only begun, in a try where
+        // a decision's thread was off the CPU half the init frame, is the
+        // host's answer to that hold. With no such hold it is the host's
+        // own, and the try asserts.
+        let another = (stats.instantiations, stats.lazy_instantiations) != (2, 1);
+        if another && worst.get() >= INIT_FRAME / 2 && made < TRIES {
+            made_again(
+                CASE,
+                "a decision's thread was off the CPU half the init frame, the bound of a lazy init and of a close's rebuild",
+            );
+            return false;
+        }
+        assert_eq!(untold, Some(100), "no member told yet");
+        assert_eq!(
+            (told.observed, told.instantiations, told.events_dropped),
+            (0, 1, 0),
+            "a telling calls no guest, makes no instance and drops nothing: {told:?}"
+        );
+        assert_eq!(heard, Some(102), "the first decider's instance heard");
+        assert_eq!(
+            late,
+            (Some(102), 1),
+            "an instance made after the telling, by its decider's first decision, hears the list as it stands"
+        );
+        assert_eq!(added, (Some(103), Some(103)));
+        assert_eq!(removed, (Some(101), Some(101)));
+        assert_eq!(
+            (
+                stats.observed,
+                stats.instantiations,
+                stats.lazy_instantiations
+            ),
+            (8, 2, 1),
+            "one call a decider a change, the snapshot among them, on the two instances: {stats:?}"
+        );
+        true
+    });
 }
 
 /// An instance new to the feed hears the membership as it stands, as one
@@ -8752,10 +9518,7 @@ fn a_guest_level_with_the_feed_hears_the_models_a_worker_left() {
     assert_eq!(pick(), Some(102), "two members stand");
     let level = plugin.stats().observed;
     let models = ["a".to_owned()];
-    engine.on_membership(&Membership::Left {
-        id: WorkerId(100),
-        models: &models,
-    });
+    engine.on_membership(&Membership::left(WorkerId(100), &models));
     assert_eq!(pick(), Some(102), "the same two members");
     assert_eq!(plugin.stats().observed, level + 1, "one call for the word");
 }
@@ -8805,10 +9568,7 @@ fn an_instance_behind_more_than_the_feed_keeps_hears_one_snapshot() {
     assert_eq!(pick(), (Some(103), 0), "level: no call");
     // A replacement is folded into the list: an instance made after it
     // counts what stands.
-    engine.on_membership(&Membership::Replaced {
-        old: WorkerId(303),
-        new: WorkerId(304),
-    });
+    engine.on_membership(&Membership::replaced(WorkerId(303), WorkerId(304)));
     engine.on_membership(&Membership::Removed(WorkerId(304)));
     plugin.forget_instance();
     assert_eq!(
@@ -9341,10 +10101,7 @@ fn the_feeds_list_holds_a_worker_once_and_takes_an_unknown_ones_replacement() {
         engine.on_membership(&Membership::Added(WorkerId(100)));
     }
     for old in [900, 901] {
-        engine.on_membership(&Membership::Replaced {
-            old: WorkerId(old),
-            new: WorkerId(101),
-        });
+        engine.on_membership(&Membership::replaced(WorkerId(old), WorkerId(101)));
     }
     // Two members: one told twice, and one for a worker the list never
     // held, told twice. A list that held either twice, or left the second
@@ -9509,10 +10266,7 @@ fn an_instance_behind_hears_the_models_a_worker_left_ahead_of_its_relabelling() 
         engine.on_membership(&Membership::Snapshot(&[WorkerId(100), WorkerId(101)]));
         plugin.warm().expect("it warms");
         let warmed = plugin.stats().observed;
-        engine.on_membership(&Membership::Left {
-            id: WorkerId(100),
-            models: &models,
-        });
+        engine.on_membership(&Membership::left(WorkerId(100), &models));
         engine.on_membership(&Membership::Relabelled(WorkerId(100)));
         // One up each name of the word and one more up the relabelling
         // behind it: the row at three. A word not told, or told behind its
@@ -9562,10 +10316,7 @@ fn an_instance_that_hears_a_snapshot_for_what_it_missed_hears_no_left_word() {
     engine.on_membership(&Membership::Snapshot(&[WorkerId(100), WorkerId(101)]));
     plugin.warm().expect("it warms");
     let warmed = plugin.stats().observed;
-    engine.on_membership(&Membership::Left {
-        id: WorkerId(100),
-        models: &models,
-    });
+    engine.on_membership(&Membership::left(WorkerId(100), &models));
     // The feed keeps 64 changes, and the word is the oldest of 65.
     for _ in 0..64 {
         engine.on_membership(&Membership::Resized(WorkerId(101)));

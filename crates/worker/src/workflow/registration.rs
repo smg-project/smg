@@ -65,9 +65,9 @@ pub fn startup_attempts(settings: &RegistrationSettings) -> u32 {
 /// The worker side of a registration: the connection detection, polled at
 /// the startup cadence of `settings`, the runtime detection behind it with
 /// the same budget of attempts, the metadata read, the DP read, and then
-/// creation. A DP read that fails fails the workflow. It reads nothing when
-/// the settings turn it off. Creation waits on the DP read or the host's
-/// creation gate.
+/// creation. The DP read asks the worker nothing: it takes the shape from
+/// the labels the metadata read left and from the spec, on every
+/// registration. Creation waits on the DP read or the host's creation gate.
 ///
 /// The startup delay, the time a worker is left alone before its first
 /// probe, stands on the step that opens the workflow. With

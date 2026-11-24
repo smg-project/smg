@@ -495,7 +495,7 @@ impl Bed {
                     out.insert(name.into(), json!(value));
                 }
                 let decoding = WorkerDecoding::of(Some(&WorkerSelection::Single {
-                    worker: Arc::clone(worker),
+                    worker: Arc::clone(worker).into(),
                 }));
                 out.insert(
                     "policy".into(),
@@ -535,7 +535,7 @@ impl Bed {
             });
         let decided_on = request.decided_on.map(|at| {
             WorkerDecoding::of(Some(&WorkerSelection::Single {
-                worker: Arc::clone(&self.workers[at]),
+                worker: Arc::clone(&self.workers[at]).into(),
             }))
         });
         let alike =
@@ -548,6 +548,7 @@ impl Bed {
                 context,
                 media,
                 admits,
+                None,
                 None,
                 None,
                 None,

@@ -177,10 +177,10 @@ const KEYED_MODEL: &str = "acme/assistant-large-instruct-v2";
 
 /// A keyed request under the manual preset's sessions rule, at 8 candidates.
 /// The hit decides for one key on the pin its dispatch wrote. The miss
-/// decides for 64 keys in turn under an idle time of one second with the
-/// clock 20 ms on at each decision, so a key's pins have expired by its next
+/// decides for 64 keys in turn under an idle time and a sweep of one second,
+/// the clock 40 ms on at each decision, so a key is past its end by its next
 /// turn: the rule's assignment places it and the table records the claim. A
-/// sweep is due once a day of that clock and is no part of the cell. Both
+/// host's pass walks this table, and none is part of the cell. Both
 /// carry the model's fingerprint, as a host that keeps its models does.
 fn keyed(group: &mut BenchmarkGroup<'_, WallTime>) {
     let n = 8;
@@ -232,8 +232,10 @@ fn keyed(group: &mut BenchmarkGroup<'_, WallTime>) {
         .and_then(|binding| binding.sessions.as_mut())
         .expect("the preset's sessions rule");
     rule.ttl_s = 1;
-    rule.sweep_s = 86_400;
+    rule.sweep_s = 1;
     let engine = spec.validate().expect("the preset validates");
+    // A host's own pass sweeps this table from here on: no read walks it.
+    engine.sessions().sweep_due(0);
     // The clock runs on over the whole cell, the warm-up included: a turn
     // that began again at its first instant would find every key pinned.
     let mut turn = 0u64;
@@ -246,7 +248,7 @@ fn keyed(group: &mut BenchmarkGroup<'_, WallTime>) {
                 prompt_tokens: 512,
                 session_key: Identity::hashed(1 + (turn & 63)),
                 seed: turn,
-                now_micros: 1_000_000 + turn * 20_000,
+                now_micros: 1_000_000 + turn * 40_000,
                 ..RequestFacts::default()
             };
             engine.decide(&facts, &pool, black_box(&view), &cx, &mut scratch)
@@ -270,7 +272,7 @@ const SPEC_DOCUMENT: &str = r#"{
   "plans": { "pd-pair": { "pairing": "strict" } },
   "bindings": [
     { "match": { "model": "pd/*", "phase": ["prefill", "decode"] }, "plan": "pd-pair", "profiles": { "prefill": "prefill", "decode": "decode" },
-      "overload": { "enabled": true, "waiting_requests": 32, "token_usage": 0.9, "shed_when_all_vetoed": true } },
+      "overload": { "enabled": true, "shed_when_all_vetoed": true } },
     { "match": { "model": "*" }, "profile": "default", "overload": { "enabled": false }, "admission": { "enabled": false } }
   ]
 }"#;

@@ -14,6 +14,10 @@
 //!   the configured port), identified as `{pod uid}:{port}`, so a Pod
 //!   recreated at the same address is a new instance and a container restart
 //!   inside it is not.
+//! - Its pairing-protocol label, where it carries one, is the explicit
+//!   prefill/decode pairing protocol of each of its workers: an operator
+//!   that rolls both roles stamps one value on the Pods of one rollout, so a
+//!   prefill of one rollout does not pair with a decode of another.
 //!
 //! Ownership, the registry diff and the job submissions belong to the shared
 //! reconciler; nothing here reads the registry.
@@ -139,6 +143,10 @@ pub struct ServiceDiscoveryConfig {
     /// Editing the KV annotations on a live Pod updates its worker in place.
     pub kv_connector_annotation: String,
     pub kv_engine_id_annotation: String,
+    /// Pod label holding the prefill/decode pairing protocol. Trimmed; an
+    /// absent or empty label states none. Relabelling a live Pod updates its
+    /// workers in place.
+    pub pairing_protocol_label: String,
     /// Per-worker model_id override source from pod metadata.
     pub model_id_source: Option<ModelIdSource>,
 }
@@ -239,6 +247,7 @@ impl Default for ServiceDiscoveryConfig {
             worker_ports_annotation: "smg.ai/worker-ports".to_string(),
             kv_connector_annotation: "smg.ai/kv-connector".to_string(),
             kv_engine_id_annotation: "smg.ai/kv-engine-id".to_string(),
+            pairing_protocol_label: "smg.ai/pairing-protocol".to_string(),
             model_id_source: None,
         }
     }
@@ -279,6 +288,10 @@ pub struct PodInfo {
     pub bootstrap_ports: Vec<Option<u16>>,
     pub kv_connector: Option<String>,
     pub kv_engine_ids: Vec<Option<String>>,
+    /// The Pod's explicit pairing protocol: the value of the label
+    /// [`ServiceDiscoveryConfig::pairing_protocol_label`] names, trimmed.
+    /// `None` when the label is absent or empty.
+    pub pairing_protocol: Option<String>,
     pub model_id_override: Option<String>,
 }
 
@@ -354,6 +367,8 @@ impl PodInfo {
         let kv_engine_ids = config
             .map(|config| resolve_kv_engine_ids(&name, pod, config, ports.len()))
             .unwrap_or_else(|| vec![None; ports.len()]);
+        let pairing_protocol =
+            config.and_then(|config| label_value(pod, &config.pairing_protocol_label));
         let model_id_override = config
             .and_then(|config| config.model_id_source.as_ref())
             .and_then(|source| source.extract(pod));
@@ -369,6 +384,7 @@ impl PodInfo {
             bootstrap_ports,
             kv_connector,
             kv_engine_ids,
+            pairing_protocol,
             model_id_override,
         })
     }
@@ -451,6 +467,18 @@ fn annotation_value<'a>(pod: &'a Pod, key: &str) -> Option<&'a str> {
         .get(key)
         .map(|value| value.trim())
         .filter(|value| !value.is_empty())
+}
+
+/// The trimmed value of the Pod's label `key`; `None` when the label is
+/// absent or empty.
+fn label_value(pod: &Pod, key: &str) -> Option<String> {
+    pod.metadata
+        .labels
+        .as_ref()?
+        .get(key)
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 /// Resolve one unique KV engine ID per worker port; unlike bootstrap ports,
@@ -709,6 +737,7 @@ fn compute_desired_state(pods: &[Arc<Pod>], config: &ServiceDiscoveryConfig) -> 
                 // registration workflow's existing label fallback.
                 kv_role: None,
                 kv_engine_id: info.kv_engine_ids.get(index).cloned().flatten(),
+                pairing_protocol: info.pairing_protocol.clone(),
                 compat_labels: BTreeMap::from([
                     (POD_NAME_LABEL.to_string(), info.name.clone()),
                     (POD_UID_LABEL.to_string(), info.uid.clone()),

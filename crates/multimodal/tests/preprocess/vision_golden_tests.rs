@@ -36,8 +36,7 @@ use std::{
 
 use llm_multimodal::vision::{
     Llama4VisionProcessor, LlavaProcessor, ModelSpecificValue, Phi3VisionProcessor,
-    Phi4VisionProcessor, PixtralProcessor, PreProcessorConfig, Qwen2VLProcessor, Qwen3VLProcessor,
-    VisionPreProcessor,
+    PixtralProcessor, PreProcessorConfig, Qwen2VLProcessor, Qwen3VLProcessor, VisionPreProcessor,
 };
 use ndarray::{Array4, Array5};
 
@@ -650,7 +649,7 @@ fn find_max_diff_location_5d(
 /// Run a golden test of the Phi-Vision `family` (the name of its fixture folder) for a specific image.
 ///
 /// This test validates:
-/// 1. Output shape is [1, num_crops+1, 3, 336, 336] (448 for Phi4-Vision)
+/// 1. Output shape is [1, num_crops+1, 3, 336, 336]
 /// 2. image_sizes matches HuggingFace output
 /// 3. num_img_tokens matches HuggingFace output
 /// 4. Pixel values match within tolerance
@@ -814,81 +813,6 @@ fn test_phi3_vision_golden_odd_dims() {
 #[test]
 fn test_phi3_vision_golden_grayscale() {
     run_phi3_vision_golden_test("grayscale");
-}
-
-// ============================================================================
-// Phi4-Vision tests
-// ============================================================================
-
-/// Run a Phi4-Vision golden test for a specific image.
-///
-/// This test validates:
-/// 1. Output shape is [1, num_crops+1, 3, 448, 448] (note: 448 base resolution)
-/// 2. image_sizes matches HuggingFace output
-/// 3. num_img_tokens matches HuggingFace output
-/// 4. Pixel values match within tolerance
-///
-/// Key differences from Phi3-Vision:
-/// - Base resolution: 448 (vs 336)
-/// - Normalization: [0.5, 0.5, 0.5] (vs CLIP)
-/// - Default dynamic_hd: 36 (vs 16)
-fn run_phi4_vision_golden_test(image_name: &str) {
-    run_phi_vision_golden_test(
-        "phi4_vision",
-        image_name,
-        Phi4VisionProcessor::from_preprocessor_config,
-        0.05,
-    );
-}
-
-#[test]
-fn test_phi4_vision_golden_square() {
-    run_phi4_vision_golden_test("square");
-}
-
-#[test]
-fn test_phi4_vision_golden_tall() {
-    run_phi4_vision_golden_test("tall");
-}
-
-#[test]
-fn test_phi4_vision_golden_wide() {
-    run_phi4_vision_golden_test("wide");
-}
-
-#[test]
-fn test_phi4_vision_golden_small() {
-    run_phi4_vision_golden_test("small");
-}
-
-#[test]
-fn test_phi4_vision_golden_tiny() {
-    run_phi4_vision_golden_test("tiny");
-}
-
-#[test]
-fn test_phi4_vision_golden_very_tall() {
-    run_phi4_vision_golden_test("very_tall");
-}
-
-#[test]
-fn test_phi4_vision_golden_very_wide() {
-    run_phi4_vision_golden_test("very_wide");
-}
-
-#[test]
-fn test_phi4_vision_golden_large() {
-    run_phi4_vision_golden_test("large");
-}
-
-#[test]
-fn test_phi4_vision_golden_odd_dims() {
-    run_phi4_vision_golden_test("odd_dims");
-}
-
-#[test]
-fn test_phi4_vision_golden_grayscale() {
-    run_phi4_vision_golden_test("grayscale");
 }
 
 // ============================================================================

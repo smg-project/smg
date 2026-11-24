@@ -59,11 +59,13 @@ pub struct GrpcPluginSpec {
     /// Passed in the hello, opaque to the host.
     pub config: Vec<u8>,
     /// The plugin's own budget per decision, in microseconds; `0` takes the
-    /// decision's remaining budget. The host clamps it to at most the
-    /// decision's; the frame names it as the plugin's deadline. A missed
-    /// deadline of a budget no longer than the I/O thread's promise (four
-    /// milliseconds) is never counted as the plugin's failure: the latency
-    /// rule alone judges it.
+    /// default frame ([`FrameBudget::DEFAULT_MICROS`]). The host clamps it to
+    /// at most the decision's; the frame names it as the plugin's deadline. A
+    /// missed deadline of a budget no longer than the I/O thread's promise
+    /// (four milliseconds) is never counted as the plugin's failure: the
+    /// latency rule alone judges it. That rule sets the plugin's time in a
+    /// decision against the frames it was given there, at most the
+    /// decision's budget: state at least twice the plugin's usual time.
     pub budget_micros: u32,
     /// The connect and the hello run under this: at the apply, and on the
     /// I/O thread behind a cold thread's first decision, which takes its

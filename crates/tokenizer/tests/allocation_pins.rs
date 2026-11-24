@@ -698,3 +698,74 @@ fn a_merge_more_costs_a_load_no_block_for_its_tokens_bytes() {
         "allocator calls a merge adds to a load"
     );
 }
+
+/// A token and its merge more cost the load of a file whose BPE section says
+/// `byte_fallback` no string, so fewer than one allocator call each: the
+/// section's vocabulary is listed in one buffer, its merges are resolved as
+/// they are read, and the model of the `tokenizers` crate, which holds every
+/// token's text in two maps and every merge as two strings on the way, is
+/// not built (four calls each when it was). The opt-in v1 pipeline keeps the
+/// reader that builds it, so this pin is built without that feature.
+#[cfg(not(feature = "tokenizers-v1"))]
+#[test]
+fn a_token_more_costs_the_load_of_a_byte_fallback_file_no_string() {
+    let folder = tempfile::tempdir().expect("a folder");
+    let pairs: Vec<(String, String)> = ('k'..='t')
+        .flat_map(|x| ('a'..='t').map(move |y| (x.to_string(), y.to_string())))
+        .collect();
+    let more: Vec<(&str, &str)> = common::WORD_MARK_MERGES
+        .iter()
+        .copied()
+        .chain(pairs.iter().map(|(a, b)| (a.as_str(), b.as_str())))
+        .collect();
+    let load = |merges: &[(&str, &str)]| {
+        let path = folder.path().join(format!("{}.json", merges.len()));
+        let file = common::word_mark_bpe(merges)
+            .to_string(false)
+            .expect("the file's text");
+        std::fs::write(&path, file).expect("the file");
+        let path = path.to_str().expect("a path of text");
+        allocations_during(|| HuggingFaceTokenizer::from_file(path).expect("the tokenizer"))
+    };
+    let (_, few) = load(&common::WORD_MARK_MERGES);
+    let (ours, many) = load(&more);
+    assert!(
+        many < few + pairs.len(),
+        "{} tokens and their merges added {} allocator calls to a load of {few}",
+        pairs.len(),
+        many.saturating_sub(few)
+    );
+    // The model the accessor builds at its first ask is the file's, as
+    // `tokenizers` reads it alone.
+    let path = folder.path().join(format!("{}.json", more.len()));
+    let file = tokenizers::Tokenizer::from_file(&path).expect("the file by `tokenizers`");
+    assert!(
+        ours.tokenizers_pipeline().get_model() == file.get_model(),
+        "the model built at the first ask is not the file's"
+    );
+}
+
+/// A token more costs the load of a rank file no allocator call: the file's
+/// tokens are read into one buffer, and the load keeps none of them for the
+/// file's own encoder, which reads them back from the decode table.
+#[test]
+fn a_token_more_costs_the_load_of_a_rank_file_no_allocator_call() {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    let load = |pairs: u8| {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let model: String = (0..=255u8)
+            .map(|byte| vec![byte])
+            .chain((0..pairs).map(|k| vec![b'a' + k / 16, b'a' + k % 16]))
+            .zip(0u32..)
+            .map(|(token, rank)| format!("{} {rank}\n", STANDARD.encode(token)))
+            .collect();
+        std::fs::write(dir.path().join("tiktoken.model"), model).expect("the model");
+        allocations_during(|| TiktokenTokenizer::from_dir(dir.path()).expect("the load")).1
+    };
+    // No subtraction: a load of more tokens may make fewer calls.
+    let (many, few) = (load(240), load(40));
+    assert!(
+        many < few + 200,
+        "a load of 200 tokens more makes {many} allocator calls against {few}"
+    );
+}

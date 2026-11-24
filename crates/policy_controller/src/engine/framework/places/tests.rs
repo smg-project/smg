@@ -3,11 +3,16 @@
 //! no row outside the places, under profiles that list no filter and under
 //! the crate's presets as they ship.
 
-use super::super::{Binding, Engine, Picker, Plan, Profile, Scorer, WeightedScorer, DRAW_FROM};
+use std::cell::Cell;
+
+use super::super::{
+    Binding, Engine, Picker, Plan, PoolRows, Profile, Scorer, WeightedScorer, DRAW_FROM,
+};
 use crate::{
-    document::spec::{Needs, PolicySpec, PRESETS},
+    document::spec::{Assignment, Needs, PolicySpec, Recovery, RulePlaced, PRESETS},
     engine::{
         decision::{Decision, LiftedVeto, MAX_TARGETS},
+        sticky_sessions::{SessionRule, SessionVerdict},
         view::{
             AffinityHolder, AffinityRows, Candidate, Constraints, Engines, Health, Identity,
             PoolFacts, RequestFacts, WorkerId,
@@ -15,7 +20,8 @@ use crate::{
         Scratch,
     },
     policies::{consistent_hashing::ConsistentHash, power_of_two::PowerOfTwo, random::Random},
-    stages::{pickers::Best, scorers::LeastRequests},
+    stages::{lifecycle::Lifecycle, pickers::Best, scorers::LeastRequests},
+    tracking::lease::{Lease, Side},
 };
 
 /// A ready row at `position`, under an id and a stable key of its own.
@@ -411,22 +417,25 @@ fn a_scorers_own_walk_steps_aside_for_a_request_held_to_places() {
     }
 }
 
-/// A shadow is held to the places of its live decision: both profiles list
-/// no filter, and neither is handed a row outside them.
+/// A shadow is held to the places of its live decision. Both profiles list
+/// no filter, and the shadow's draws first: held to nothing its decision is
+/// the draw's. Held to places, neither is handed a row outside them.
 #[test]
 fn a_shadow_is_held_to_the_places_of_its_live_decision() {
     let profiles = vec![
-        bare("live", vec![], Box::new(Random)),
-        bare(
-            "beside",
-            vec![Box::new(LeastRequests)],
-            Box::new(PowerOfTwo),
-        ),
+        bare("live", vec![Box::new(LeastRequests)], Box::new(PowerOfTwo)),
+        bare("beside", vec![], Box::new(Random)),
     ];
     let engine = Engine::new(profiles, vec![single(Some(1))], 1, Needs::default());
     let places = [3, 40];
     let rows = pool(4 * DRAW_FROM as u32);
     for seed in 0..32 {
+        let (free, mut scratch) = (Constraints::default(), Scratch::new());
+        engine.decide_keeping(&facts(seed), &of(&rows), &rows, &free, &mut scratch);
+        let drawn = engine
+            .shadow(&facts(seed), &of(&rows), &rows, &free, &mut scratch)
+            .expect("the binding's shadow");
+        assert_eq!(by_the_pass(&drawn), None, "seed {seed}: a draw decides");
         let (cx, mut scratch) = (stating(&places), Scratch::new());
         let live = engine.decide_keeping(&facts(seed), &of(&rows), &rows, &cx, &mut scratch);
         let beside = engine
@@ -439,6 +448,63 @@ fn a_shadow_is_held_to_the_places_of_its_live_decision() {
                 named.iter().all(|place| places.contains(place)),
                 "{named:?}"
             );
+        }
+    }
+}
+
+/// A pool read one row at a time: its rows, and how many were read.
+struct Listed<'a> {
+    rows: &'a [Candidate],
+    read: Cell<u32>,
+}
+
+impl PoolRows for Listed<'_> {
+    fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    fn read(&self, place: u32) -> Option<Candidate> {
+        self.read.set(self.read.get() + 1);
+        self.rows.get(place as usize).copied()
+    }
+
+    fn place_of(&self, id: WorkerId) -> Option<u32> {
+        let at = self.rows.iter().position(|row| row.id == id)?;
+        Some(at as u32)
+    }
+
+    fn generation(&self) -> u64 {
+        1
+    }
+}
+
+/// Under the stock ring, with its filters and with none, a keyed request
+/// held to every place but its key's owner is handed the members the ring
+/// names behind the owner, in the ring's order: as many targets as a
+/// request held to nothing, and never the owner.
+#[test]
+fn a_keyed_request_held_to_places_is_handed_the_rings_next_members() {
+    for bare in [false, true] {
+        let engine = stock("consistent_hashing", bare);
+        let rows = pool(16);
+        for key in 1..=40 {
+            let request = RequestFacts {
+                session_key: Identity::hashed(key),
+                ..facts(key)
+            };
+            let (free, mut scratch) = (Constraints::default(), Scratch::new());
+            let whole = named(&engine.decide(&request, &of(&rows), &rows, &free, &mut scratch));
+            assert_eq!(whole.len(), MAX_TARGETS, "key {key}");
+            let others: Vec<u32> = (0..16).filter(|&place| place != whole[0]).collect();
+            let cx = stating(&others);
+            let part = named(&engine.decide(&request, &of(&rows), &rows, &cx, &mut scratch));
+            assert_eq!(part.len(), MAX_TARGETS, "key {key}, bare {bare}");
+            assert_eq!(
+                part[..MAX_TARGETS - 1],
+                whole[1..],
+                "key {key}, bare {bare}"
+            );
+            assert!(!part.contains(&whole[0]), "key {key}: the owner is handed");
         }
     }
 }
@@ -487,6 +553,126 @@ fn a_holder_named_outside_the_places_is_not_handed() {
             "seed {seed}: {named:?}"
         );
     }
+}
+
+/// A pin outside the places stands, and the worker picked is claimed
+/// beside it. The keyed decision answers nothing for a request held to
+/// places, to one or to none too, and reads no row. Where the places
+/// leave out the pin's worker,
+/// the rule's recovery places the request among them and claims the worker
+/// picked as the key's other pin: behind the standing pin under
+/// `original`, ahead of it under `latest`. Where the places keep the pin
+/// that leads, the whole decision follows it. A request of the key held to
+/// nothing follows that pin by one row's read.
+#[test]
+fn a_pin_outside_the_places_stands_and_the_worker_picked_is_claimed_beside_it() {
+    for recovery in [Recovery::Original, Recovery::Latest] {
+        let rule = SessionRule {
+            assignment: Assignment::Delegate,
+            inflight_cap: 0,
+            ttl_micros: Some(60_000_000),
+            // Six sweeps an idle time: a key is forgotten within ten
+            // seconds of its idle time's end.
+            sweep_micros: 10_000_000,
+            recovery,
+            rule_placed: RulePlaced::Told,
+        };
+        let profile = bare("random", vec![], Box::new(Random));
+        let binding = Binding {
+            sessions: Some(rule),
+            ..single(None)
+        };
+        let engine = Engine::new(vec![profile], vec![binding], 1, Needs::default());
+        let rows = pool(8);
+        let listed = Listed {
+            rows: &rows,
+            read: Cell::new(0),
+        };
+        let request = RequestFacts {
+            session_key: Identity::hashed(9),
+            now_micros: 1_000,
+            ..facts(3)
+        };
+        let key = request.session();
+        let free = Constraints::default();
+        // The key's first request is placed and claimed, and its dispatch
+        // makes the pin.
+        let dispatch = |decision: &Decision| {
+            let pick = decision.pick().expect("a pick");
+            let lease = Lease {
+                session: key,
+                session_verdict: pick.session_verdict,
+                issued_micros: 1_000,
+                ..Lease::default()
+            };
+            let target = pick.targets.as_slice()[0];
+            engine.on_dispatched(&lease, &target, Side::Single, 0);
+            target
+        };
+        let mut scratch = Scratch::new();
+        let placed = engine.decide(&request, &of(&rows), &rows, &free, &mut scratch);
+        let pinned = dispatch(&placed);
+        assert_eq!(engine.sessions.pins_at(key, 1_000)[0], pinned.id);
+        // Held to every place but the pin's: the pin is not followed, and
+        // its row is not read.
+        let others: Vec<u32> = (0..8).filter(|&place| place != pinned.position).collect();
+        let cx = stating(&others);
+        assert!(engine.decide_keyed(&request, &listed, &cx).is_none());
+        assert_eq!(listed.read.get(), 0, "{recovery:?}");
+        // Held to one place that is not the pin's, and to no place: the
+        // keyed decision answers neither, and reads no row.
+        let one = [others[0]];
+        for places in [&one[..], &[]] {
+            let cx = stating(places);
+            assert!(engine.decide_keyed(&request, &listed, &cx).is_none());
+            assert_eq!(listed.read.get(), 0, "{recovery:?}: {places:?}");
+        }
+        // The recovery places the request among the places and claims the
+        // worker picked beside the standing pin.
+        let moved = engine.decide(&request, &of(&rows), &rows, &cx, &mut scratch);
+        let pick = moved.pick().expect("a pick");
+        let taken = pick.targets.as_slice()[0];
+        assert!(others.contains(&taken.position), "{recovery:?}");
+        assert_eq!(pick.session_verdict, SessionVerdict::Claimed(taken.id));
+        let pins = engine.sessions.pins_at(key, 1_000);
+        let stand = match recovery {
+            Recovery::Original => [pinned.id, taken.id],
+            Recovery::Latest => [taken.id, pinned.id],
+        };
+        assert_eq!(pins, stand, "{recovery:?}");
+        dispatch(&moved);
+        assert_eq!(engine.sessions.pins_at(key, 1_000), stand, "{recovery:?}");
+        // Held to places that keep the pin that leads, half the key's idle
+        // time later: the whole decision's too, which follows the pin and
+        // renews it. Unrenewed, the key is forgotten at 70 s: it stands
+        // at 80 s.
+        let later = RequestFacts {
+            now_micros: 30_000_000,
+            ..request
+        };
+        let lead = stand_place(&rows, stand[0]);
+        let kept = [lead.min(7 - lead), lead.max(7 - lead)];
+        let cx = stating(&kept);
+        listed.read.set(0);
+        assert!(engine.decide_keyed(&later, &listed, &cx).is_none());
+        assert_eq!(listed.read.get(), 0, "{recovery:?}");
+        let held = engine.decide(&later, &of(&rows), &rows, &cx, &mut scratch);
+        assert_eq!(named(&held), [lead], "{recovery:?}");
+        let verdict = held.pick().expect("a pick").session_verdict;
+        assert_eq!(verdict, SessionVerdict::Pinned, "{recovery:?}");
+        assert_eq!(engine.sessions.pins_at(key, 80_000_000), stand);
+        // Held to nothing, the key follows the pin that leads, by one row's
+        // read.
+        let followed = engine.decide_keyed(&later, &listed, &free);
+        assert_eq!(named(&followed.expect("the pin is followed")), [lead]);
+        assert_eq!(listed.read.get(), 1, "{recovery:?}");
+    }
+}
+
+/// The place of the row whose id is `id`.
+fn stand_place(rows: &[Candidate], id: WorkerId) -> u32 {
+    let row = rows.iter().find(|row| row.id == id);
+    row.expect("a row of the pool").position
 }
 
 /// A request held to the one place it already tried is handed that place

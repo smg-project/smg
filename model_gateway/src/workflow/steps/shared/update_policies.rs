@@ -190,7 +190,8 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for UpdatePolicie
                 .on_worker_added(&model_id, policy_hint);
             // Policies learn of the request's end through the worker's load
             // guard; the registry routes it to the policy that placed it.
-            worker.set_completion_sink(Some(app_context.policy_registry.completion_sink()));
+            // Under the policy engine the worker is given no sink.
+            worker.set_completion_sink(app_context.policy_registry.worker_completion_sink());
 
             // Initialize cache-aware policy if configured
             let all_workers = app_context.worker_registry.get_by_model(&model_id);
@@ -253,6 +254,10 @@ mod tests {
         model_card::ModelCard,
         worker::{HealthCheckConfig, RuntimeType, WorkerSpec, WorkerType},
     };
+    use smg_policy_controller::{
+        document::{AppliedSpec, PolicySpec},
+        engine::PolicyEngine,
+    };
     use smg_worker::jobs::WorkerJobAsker;
     use tracing_test::traced_test;
     use wfaas::WorkflowInstanceId;
@@ -261,7 +266,9 @@ mod tests {
     use crate::{
         app_context::{testing::app_context_for_tests, AppContext},
         config::{PolicyConfig, RouterConfig},
-        policies::{as_cache_aware, kv_index::event_monitor::KvEventMonitor, PolicyFactory},
+        policies::{
+            as_cache_aware, kv_index::event_monitor::KvEventMonitor, PolicyFactory, PolicyRegistry,
+        },
         routers::{common::snapshot::WorkerRegistry, grpc::backend_client::BasicWorkerBuilder},
         workflow::{data::WorkerRegistrationMode, steps::create_worker_workflow_data},
     };
@@ -280,8 +287,13 @@ mod tests {
     /// refuses connections at once: a stream it is given reconnects in the
     /// background with no engine involved.
     fn grpc_worker(worker_type: WorkerType) -> Arc<dyn Worker> {
+        grpc_worker_at("grpc://127.0.0.1:1", worker_type)
+    }
+
+    /// [`grpc_worker`] at `url`.
+    fn grpc_worker_at(url: &str, worker_type: WorkerType) -> Arc<dyn Worker> {
         Arc::new(
-            BasicWorkerBuilder::new("grpc://127.0.0.1:1")
+            BasicWorkerBuilder::new(url)
                 .worker_type(worker_type)
                 .connection_mode(ConnectionMode::Grpc)
                 .runtime_type(RuntimeType::TokenSpeed)
@@ -341,6 +353,81 @@ mod tests {
         data.actual_workers = Some(vec![worker]);
         let mut context = WorkflowContext::new(WorkflowInstanceId::new(), data);
         UpdatePoliciesStep.execute(&mut context).await.unwrap();
+    }
+
+    /// Under the policy engine the step makes no classic policy for a
+    /// worker of any role, whatever policy its label names, and gives the
+    /// worker no completion sink. Under the classic policies the same
+    /// workers make the labelled model's policy beside the default, and
+    /// each is given the registry's sink.
+    #[tokio::test]
+    async fn under_the_policy_engine_a_worker_of_any_role_gets_no_classic_policy() {
+        let roles = [
+            ("grpc://127.0.0.1:1", WorkerType::Regular),
+            ("grpc://127.0.0.1:2", WorkerType::Prefill),
+            ("grpc://127.0.0.1:3", WorkerType::Decode),
+            ("grpc://127.0.0.1:4", WorkerType::Encode),
+        ];
+        for (policy_controller, made) in [(true, 0), (false, 2)] {
+            let mut config = RouterConfig::builder()
+                .policy(PolicyConfig::RoundRobin)
+                .build_unchecked();
+            config.policy_controller = policy_controller;
+            let mut context = AppContext::clone(&app_context_for_tests(
+                config.clone(),
+                Arc::new(WorkerRegistry::new()),
+                None,
+            ));
+            context.policy_registry = Arc::new(PolicyRegistry::of_config(&config));
+            let app_context = Arc::new(context);
+            for (url, role) in roles {
+                let worker = grpc_worker_at(url, role);
+                register(
+                    &app_context,
+                    Arc::clone(&worker),
+                    &[("policy", "power_of_two")],
+                )
+                .await;
+                assert_eq!(worker.completion_sink().is_some(), !policy_controller);
+            }
+            assert_eq!(app_context.policy_registry.classic_made_or_asked(), made);
+        }
+    }
+
+    /// Under the policy engine a worker's stream follows the document in
+    /// force, not the classic settings. The settings name `round_robin`
+    /// both times. Under a document that reads cache events the step
+    /// starts a regular worker's events stream, so its model gets an
+    /// index. Under a document that reads none it starts no such stream.
+    #[tokio::test]
+    async fn under_the_policy_engine_a_workers_events_stream_follows_the_document() {
+        for (preset, streams) in [("cache_aware", true), ("round_robin", false)] {
+            let mut config = RouterConfig::builder()
+                .policy(PolicyConfig::RoundRobin)
+                .build_unchecked();
+            config.policy_controller = true;
+            let mut context = AppContext::clone(&app_context_for_tests(
+                config.clone(),
+                Arc::new(WorkerRegistry::new()),
+                None,
+            ));
+            let policies = PolicyRegistry::of_config(&config);
+            let document = PolicySpec::preset(preset).expect("a stock preset");
+            let spec = AppliedSpec::validate(&document).expect("a valid document");
+            policies.set_engine(Box::leak(Box::new(PolicyEngine::new(spec))));
+            context.policy_registry = Arc::new(policies);
+            let monitor = Arc::new(KvEventMonitor::new());
+            context.kv_event_monitor = Some(Arc::clone(&monitor));
+            // As the app wires the pair: the add reads the registry.
+            monitor.set_worker_registry(&context.worker_registry);
+            let app_context = Arc::new(context);
+
+            register(&app_context, grpc_worker(WorkerType::Regular), &[]).await;
+
+            assert_eq!(monitor.get_indexer(MODEL).is_some(), streams, "{preset}");
+            assert_eq!(app_context.policy_registry.classic_made_or_asked(), 0);
+            monitor.stop().await;
+        }
     }
 
     #[tokio::test]

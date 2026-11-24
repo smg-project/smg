@@ -21,12 +21,14 @@ use smg_worker::{
     metrics::writers::Metrics as WorkerMetrics,
 };
 use tokio::sync::{oneshot, watch};
+use tokio_util::task::AbortOnDropHandle;
 use tracing::{debug, error, info_span, warn, Instrument};
 
 use super::{
     grouped_dp::hash_rank,
     helpers::{maybe_inject_pd_metadata, maybe_inject_pd_rendezvous},
     pd_protocol::{PdDispatch, PdProtocol},
+    worker_selection::WorkerSelectionStage,
 };
 use crate::{
     config::GroupedDpSticky,
@@ -42,13 +44,14 @@ use crate::{
             },
             pd_admission,
             pd_failure::{PdSide, SidePhase},
+            placement::Placed,
             prefill_admission::PrefillLoadGuard,
             retry::mark_non_retryable,
         },
         error,
         grpc::{
             backend_client::BackendClient,
-            common::stages::encode::EncodeDispatchPlan,
+            common::stages::{dispatch_metadata::weight_version_of, encode::EncodeDispatchPlan},
             context::{
                 stage_output, ClientSelection, DispatchContext, EncodeOutputs, ExecutionPlan,
                 ExecutionPlanKind, ExecutionResult, LoadGuards, PdTiming, WorkerSelection,
@@ -58,7 +61,7 @@ use crate::{
                 DispatchBooking, FanoutStream, FirstItem, PrefillTicket, ProtoEmbedRequest,
                 ProtoGenerateRequest, ProtoGenerateResponse, ProtoRequest, ProtoStream,
             },
-            sequential_pd::execute_sequential_pd,
+            sequential_pd::{execute_sequential_pd, DecodeBehindPrefill},
             utils::{
                 account_pd_side_failure,
                 stream_failure::UpstreamClass,
@@ -254,13 +257,16 @@ fn pd_side_labels(workers: &WorkerSelection) -> (&'static str, &'static str) {
 /// and how, a sticky request to a grouped data-parallel worker is pinned to
 /// one of its engines (see [`pin_grouped_dp_rank`]), and a disaggregated
 /// one's bootstrap room to its grouped prefill rank (see
-/// [`pin_grouped_dp_prefill_room`]).
+/// [`pin_grouped_dp_prefill_room`]). `selection` is the selection stage,
+/// which states a pair's request again where its decode is asked again
+/// behind its prefill (see [`DecodeBehindPrefill`]).
 pub(crate) async fn execute_plan(
     ctx: &mut DispatchContext,
     mut execution_plan: ExecutionPlan,
     last_attempt: bool,
     request_timeout: Option<Duration>,
     grouped_dp_sticky: GroupedDpSticky,
+    selection: &WorkerSelectionStage,
 ) -> Result<(), Response> {
     // One bootstrap room per backend request the plan will post: a batched
     // completion fans out one PD dispatch per sub-request, so admission has
@@ -306,10 +312,37 @@ pub(crate) async fn execute_plan(
     // request retried on it.
     let ledger = &ctx.ledger;
 
-    ctx.load_guards = Some(LoadGuards::admitted(
-        admission,
-        LoadGuards::scaled(workers, ctx.sticky_key.as_deref(), sub_requests),
-    ));
+    // A pair's decode goes out with the dispatch, and its guard says so
+    // where it is made. One request of a sequential dispatch is the
+    // exception, where its decode is owed anything behind its prefill: the
+    // guard is made ahead of the decode's send, and the dispatch asks the
+    // decode again and says the send once the prefill has answered. A
+    // classic pair is owed neither and takes the rule.
+    let behind_prefill = decode_is_owed_behind_its_prefill(&execution_plan, workers);
+    let sticky_key = ctx.sticky_key.as_deref();
+    let guards = if behind_prefill {
+        LoadGuards::behind_prefill(workers, sticky_key)
+    } else {
+        LoadGuards::scaled(workers, sticky_key, sub_requests)
+    };
+    let guards = ctx
+        .load_guards
+        .insert(LoadGuards::admitted(admission, guards));
+    // The selection that names the decode the dispatch sent, where a second
+    // ask moved it.
+    let mut moved = None;
+    // The dispatch below borrows this slot and a pair arm takes the hold out
+    // of it: moved in, the hold would sit in every request's dispatch future.
+    let mut behind = behind_prefill.then(|| DecodeBehindPrefill {
+        stage: selection,
+        model_id: ctx.model_id.as_str(),
+        routing: &ctx.routing,
+        headers: ctx.headers.as_ref(),
+        wire: ctx.wire,
+        tried: &ctx.tried,
+        guards,
+        moved: &mut moved,
+    });
     // A sticky request to a grouped data-parallel worker goes to its key's
     // engine.
     pin_grouped_dp_rank(
@@ -403,6 +436,7 @@ pub(crate) async fn execute_plan(
                     ledger,
                     room_residue,
                     None,
+                    behind.take(),
                 ))
                 .await
             }
@@ -421,6 +455,7 @@ pub(crate) async fn execute_plan(
                     encode_watch,
                     prefill_guard,
                     ledger,
+                    behind.take(),
                 ))
                 .await
                 .map_err(|mut response| {
@@ -454,10 +489,26 @@ pub(crate) async fn execute_plan(
     let result = match deadline {
         Some(deadline) => match tokio::time::timeout_at(deadline.at(), dispatch).await {
             Ok(result) => result,
-            Err(_) => Err(dispatch_timed_out(deadline, workers, ledger, request_id)),
+            Err(_) => {
+                // The timeout is the decode's that was waited on: the one a
+                // second ask moved the pair to, where it moved.
+                let waited_on = moved.as_ref().unwrap_or(workers);
+                Err(dispatch_timed_out(deadline, waited_on, ledger, request_id))
+            }
         },
         None => dispatch.await,
     };
+    // A pair's decode that moved behind its prefill: the attempt's selection
+    // names the decode that was sent, for the response's stages and for a
+    // retry.
+    if let Some(moved) = moved {
+        // The response states the weight version of the decode that answers
+        // it: the metadata was prepared for the decode named first.
+        if let Some(dispatch) = ctx.dispatch.as_mut() {
+            dispatch.weight_version = Some(weight_version_of(Some(&moved)));
+        }
+        ctx.workers = Some(moved);
+    }
     // The engines hold the request bodies now. An earlier attempt keeps its
     // share of the budget: the retained plan still owns the same media, and a
     // replay would send it again.
@@ -548,12 +599,35 @@ fn require_prefill_guard(guard: Option<PrefillLoadGuard>) -> Result<PrefillLoadG
     })
 }
 
+/// Whether the dispatch owes the plan's decode anything behind its prefill
+/// ([`DecodeBehindPrefill`]): one disaggregated request under a runtime
+/// whose protocol sends its two sides one behind the other, with a decode
+/// that is owed its ask and its send there
+/// ([`Placed::owed_behind_prefill`]). A batch's sub-requests, and both sides
+/// of the parallel shape, go out with the dispatch. A decode the classic
+/// policies picked goes out behind its prefill and is owed nothing there:
+/// its answer's test is made first, and is all that pair pays here.
+fn decode_is_owed_behind_its_prefill(plan: &ExecutionPlan, workers: &WorkerSelection) -> bool {
+    matches!(
+        plan,
+        ExecutionPlan::PrefillDecode(_) | ExecutionPlan::EncodePrefillDecode { .. }
+    ) && workers.decode().is_some_and(Placed::owed_behind_prefill)
+        && workers
+            .disaggregated_runtime_type()
+            .and_then(|runtime| PdProtocol::for_runtime(*runtime))
+            .is_some_and(|protocol| protocol.dispatch == PdDispatch::Sequential)
+}
+
 /// Dispatch one disaggregated request in its runtime's shape.
 /// `room_residue` is the prefill rank the request's sticky key pinned its
 /// room to ([`pin_grouped_dp_prefill_room`]), which the rooms of an n>1
 /// request's samples take too.
 /// `encode` is the watch on an EPD request's encode dispatch (see
 /// [`launch_encode_dispatch`]), `None` for every other request.
+/// `behind` is what one request of the sequential shape holds for its
+/// decode, which goes out behind its prefill (see [`DecodeBehindPrefill`]);
+/// `None` for every dispatch whose decode guard said its send where it was
+/// made.
 #[expect(clippy::too_many_arguments)]
 async fn execute_pd_dispatch(
     proto_request: ProtoGenerateRequest,
@@ -564,6 +638,7 @@ async fn execute_pd_dispatch(
     ledger: &AttemptLedger,
     room_residue: Option<RoomResidue>,
     encode: Option<EncodeWatch>,
+    behind: Option<DecodeBehindPrefill<'_>>,
 ) -> Result<ExecutionResult, Response> {
     let Some(runtime_type) = workers.disaggregated_runtime_type() else {
         error!(
@@ -599,6 +674,7 @@ async fn execute_pd_dispatch(
                 model,
                 prefill_guard,
                 ledger,
+                behind,
             )
             .await
         }
@@ -774,6 +850,7 @@ async fn execute_epd_dispatch(
     encode_watch: &mut Option<EncodeWatch>,
     prefill_guard: PrefillLoadGuard,
     ledger: &AttemptLedger,
+    behind: Option<DecodeBehindPrefill<'_>>,
 ) -> Result<ExecutionResult, Response> {
     let mut cleanup = prepare_epd_attempt(&mut proto_request, encode, encode_watch).await?;
     // An EPD request's room is left as minted: no sticky prefill rank.
@@ -786,6 +863,7 @@ async fn execute_epd_dispatch(
         ledger,
         None,
         encode_watch.clone(),
+        behind,
     )
     .await;
     if result.is_ok() {
@@ -852,12 +930,14 @@ struct EncodeRace {
 /// the moment it lands and the prefill side's wait ends on it (the dispatch
 /// phase in [`dispatch_pd_sides`], the first-response phase in
 /// [`first_prefill_response_within`]) instead of running to its silence
-/// bound. `None` for an empty plan.
+/// bound. `None` for an empty plan. The jobs end with their request, as its
+/// generate streams do: a send still in flight is dropped once nothing of
+/// the request holds the watch (see [`supervise_encode_sends`]).
 #[expect(
     clippy::disallowed_methods,
     reason = "EPD encode dispatch is intentionally supervised in the background while the prefill side blocks on embedding receive."
 )]
-fn launch_encode_dispatch(encode_dispatch: EncodeDispatchPlan) -> Option<EncodeWatch> {
+pub(super) fn launch_encode_dispatch(encode_dispatch: EncodeDispatchPlan) -> Option<EncodeWatch> {
     if encode_dispatch.is_empty() {
         return None;
     }
@@ -866,7 +946,7 @@ fn launch_encode_dispatch(encode_dispatch: EncodeDispatchPlan) -> Option<EncodeW
     let sends: FuturesUnordered<_> = encode_dispatch
         .into_jobs()
         .into_iter()
-        .map(|job| tokio::spawn(async move { job.dispatch().await }))
+        .map(|job| AbortOnDropHandle::new(tokio::spawn(async move { job.dispatch().await })))
         .collect();
 
     debug!(
@@ -895,12 +975,17 @@ fn launch_encode_dispatch(encode_dispatch: EncodeDispatchPlan) -> Option<EncodeW
 /// Supervise an EPD request's encode sends: the first failure among
 /// `outcomes` goes on `failed` the moment it lands, a sibling still in
 /// flight notwithstanding; later failures are logged. Nobody listening (the
-/// side answered, or failed on its own) is fine.
+/// side answered, or failed on its own) is fine while the request holds the
+/// watch. Once nothing holds it the request is over: the supervisor goes,
+/// and the sends still in flight are dropped with `outcomes`.
 async fn supervise_encode_sends(
     mut outcomes: impl Stream<Item = Result<(), String>> + Unpin,
     failed: watch::Sender<Option<String>>,
 ) {
-    while let Some(outcome) = outcomes.next().await {
+    while let Some(outcome) = tokio::select! {
+        () = failed.closed() => None,
+        outcome = outcomes.next() => outcome,
+    } {
         let Err(failure) = outcome else {
             continue;
         };
@@ -985,6 +1070,7 @@ async fn execute_batch_dispatch(
                             ledger,
                             None, // the room as minted: no sticky prefill rank
                             None, // no encode dispatch on this path
+                            None, // the decode's guard said its send where it was made
                         )
                         .await
                     }
@@ -1436,7 +1522,7 @@ fn batch_breaker_status<T>(
 /// the client's request streams, which gives the decode side a first token
 /// to watch for (the caller's flag: the sequential shape sends its prefill
 /// request unstreamed whatever the client asked, so the prefill request
-/// cannot say).
+/// cannot say), and whether the prefill side waits on encode workers.
 pub(crate) struct PdSides<'a> {
     pub(crate) workers: &'a WorkerSelection,
     pub(crate) ledger: &'a AttemptLedger,
@@ -1445,6 +1531,7 @@ pub(crate) struct PdSides<'a> {
     pub(crate) request_id: String,
     pub(crate) prompt_tokens: u64,
     pub(crate) streaming: bool,
+    pub(crate) awaits_encode: bool,
 }
 
 impl<'a> PdSides<'a> {
@@ -1465,6 +1552,7 @@ impl<'a> PdSides<'a> {
             request_id,
             prompt_tokens,
             streaming,
+            awaits_encode: prefill_request.awaits_encode(),
         }
     }
 }
@@ -1805,7 +1893,8 @@ async fn parallel_sides_answered(
 
 /// One side failed while its partner was still dispatching: the verdict is
 /// recorded against the side that answered and becomes the response, and the
-/// partner is retired off the request path.
+/// partner is retired off the request path, or dropped when it is a prefill
+/// side behind its request's encode watch.
 fn parallel_side_failed_first(
     sides: &PdSides<'_>,
     side: PdSide,
@@ -1816,7 +1905,8 @@ fn parallel_side_failed_first(
     let status = error.breaker_status();
     // Only the side that answered is recorded: the abandoned one has
     // said nothing about its worker yet, and `retire_pd_side` records
-    // it when it finally does.
+    // it when it finally does. A prefill partner behind an encode watch
+    // is dropped and records nothing.
     let (label, partner_label, partner_worker) = match side {
         PdSide::Prefill => {
             record_silence_outcome(workers, sides.ledger, error);
@@ -1833,7 +1923,9 @@ fn parallel_side_failed_first(
             (
                 sides.decode_label,
                 sides.prefill_label,
-                workers.prefill_worker(),
+                // A retired wait would hold the request's encode watch past
+                // the request: a prefill side behind one is dropped instead.
+                workers.prefill_worker().filter(|_| !sides.awaits_encode),
             )
         }
     };
@@ -2681,12 +2773,15 @@ fn judge_prefill_side(
 /// partner had stalled mid-stream. Without a bound or a worker to charge,
 /// the call is awaited as it is. The request's encode dispatch, when one is
 /// watched (`wait`), is raced beside both sides' dispatches by the caller
-/// ([`dispatch_pd_sides`]), bound or not, and here beside the clock: once it
+/// ([`dispatch_pd_sides`]), bound or not, and here beside the call: once it
 /// has failed the caller has given the side up and retired it off the
 /// request path, so from then on the call is awaited as it is, with no
 /// silence verdict to charge the worker for the embedding that is not
-/// coming. The first-response phase races the watch again
-/// ([`first_prefill_response_within`], through its own [`PrefillWait`]).
+/// coming, and without the watch: held by a retired call it would keep the
+/// request's other encode sends alive past the request (see
+/// [`supervise_encode_sends`]). The first-response phase races the watch
+/// again ([`first_prefill_response_within`], through its own
+/// [`PrefillWait`]).
 pub(crate) async fn dispatch_prefill_within(
     wait: PrefillWait,
     mut dispatch: SideDispatch,
@@ -2698,6 +2793,11 @@ pub(crate) async fn dispatch_prefill_within(
 ) -> StreamResult {
     let PrefillWait { bound, mut encode } = wait;
     let (Some(bound), Some(worker)) = (bound, worker) else {
+        tokio::select! {
+            biased;
+            _ = encode_dispatch_failed(encode.as_mut()) => drop(encode),
+            result = &mut dispatch => return result,
+        }
         return dispatch.await;
     };
     let mut deadline = bound.deadline;
@@ -2712,6 +2812,7 @@ pub(crate) async fn dispatch_prefill_within(
             // side up and retires it off the request path, where the call
             // is awaited as it is. A silence verdict here would charge the
             // worker with the embedding that is not coming.
+            drop(encode);
             return dispatch.await;
         };
         if let Ok(result) = timed {
@@ -2936,7 +3037,7 @@ pub(crate) mod tests {
         );
         let mut workers = tokenspeed_pair();
         if let WorkerSelection::Disaggregated { decode: side, .. } = &mut workers {
-            *side = Arc::clone(&decode);
+            *side = Arc::clone(&decode).into();
         }
         let ledger = AttemptLedger::default();
         let sides = PdSides::of(&workers, &ledger, &tokenspeed_request(1, None), false);
@@ -3014,7 +3115,7 @@ pub(crate) mod tests {
             let workers = WorkerSelection::Disaggregated {
                 encode_assignments: None,
                 prefill: side_worker(WorkerType::Prefill, pk),
-                decode: side_worker(WorkerType::Decode, dk),
+                decode: side_worker(WorkerType::Decode, dk).into(),
                 runtime_type: RuntimeType::Sglang,
             };
             assert_eq!(
@@ -3043,7 +3144,7 @@ pub(crate) mod tests {
         WorkerSelection::Disaggregated {
             encode_assignments: None,
             prefill: worker("grpc://prefill:30000", WorkerType::Prefill),
-            decode: worker("grpc://decode:30000", WorkerType::Decode),
+            decode: worker("grpc://decode:30000", WorkerType::Decode).into(),
             runtime_type: RuntimeType::TokenSpeed,
         }
     }
@@ -3069,7 +3170,7 @@ pub(crate) mod tests {
             let workers = WorkerSelection::Disaggregated {
                 encode_assignments: None,
                 prefill: worker("grpc://prefill:30000", WorkerType::Prefill, p_rank, p_size),
-                decode: worker("grpc://decode:30000", WorkerType::Decode, d_rank, d_size),
+                decode: worker("grpc://decode:30000", WorkerType::Decode, d_rank, d_size).into(),
                 runtime_type: RuntimeType::TokenSpeed,
             };
             let mut request = tokenspeed_request(1, None);
@@ -3985,6 +4086,170 @@ pub(crate) mod tests {
                 .is_err(),
             "the retired call is awaited as it is, past its bound"
         );
+        assert!(
+            supervisor.is_closed(),
+            "the retired call has let go of the watch"
+        );
+        // Without a bound the retired call lets go of the watch the same way.
+        let mut unbound = Box::pin(dispatch_prefill_within(
+            PrefillWait {
+                bound: None,
+                encode: Some(supervisor.subscribe()),
+            },
+            never_answers(),
+            None,
+            None,
+            metrics_labels::CONNECTION_GRPC,
+            "chatcmpl-encode-failed-retired".to_string(),
+            256,
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), &mut unbound)
+                .await
+                .is_err(),
+            "the retired call is awaited as it is"
+        );
+        assert!(
+            supervisor.is_closed(),
+            "without a bound the retired call has let go of the watch too"
+        );
+    }
+
+    /// The decode side fails to start while the prefill side still
+    /// dispatches behind its request's encode watch: the prefill side is
+    /// dropped, not retired. Its call is cancelled, its worker is neither
+    /// sampled nor counted for it, and the request's encode sends end once
+    /// the request lets go of the watch. With no encode stage the prefill
+    /// side is retired as before.
+    #[test]
+    fn a_prefill_side_behind_an_encode_watch_is_dropped_when_its_decode_partner_fails_first() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            rt.block_on(async {
+                let workers = tokenspeed_pair();
+                let prefill = Arc::clone(workers.prefill_worker().expect("a pair"));
+                // One failure short of opening: a sampled failure opens it.
+                for _ in 1..CircuitBreakerConfig::default().failure_threshold {
+                    prefill.record_circuit_breaker_outcome(false);
+                }
+                let ledger = AttemptLedger::default();
+                // The prefill request carries its encode rooms.
+                let request = ProtoGenerateRequest::TokenSpeed(Box::new(ts::GenerateRequest {
+                    request_id: "chatcmpl-decode-failed-first".to_string(),
+                    encode_bootstrap_info: Some(ts::EncodeBootstrapInfo {
+                        items: vec![ts::EncodeItemBootstrapInfo::default()],
+                    }),
+                    ..Default::default()
+                }));
+                let sides = PdSides::of(&workers, &ledger, &request, false);
+                // The request's encode dispatch: one send in flight.
+                let (watch, supervisor) = encode_watch();
+                let (send, mut send_ended) = oneshot::channel::<()>();
+                let mut supervised = Box::pin(supervise_encode_sends(
+                    Box::pin(futures::stream::once(async move {
+                        let _send = send;
+                        std::future::pending().await
+                    })),
+                    supervisor.clone(),
+                ));
+                // The prefill call: it fails late for whoever still awaits it.
+                let (late_failure, call) = oneshot::channel::<tonic::Status>();
+
+                let outcome = dispatch_pd_sides(
+                    Box::pin(dispatch_prefill_within(
+                        PrefillWait {
+                            bound: None,
+                            encode: Some(watch.clone()),
+                        },
+                        Box::pin(async move { Err(call.await.expect("the late failure")) }),
+                        Some(Arc::clone(&prefill)),
+                        workers.decode_worker().cloned(),
+                        metrics_labels::CONNECTION_GRPC,
+                        "chatcmpl-decode-failed-first".to_string(),
+                        256,
+                    )),
+                    Box::pin(async {
+                        tokio::task::yield_now().await;
+                        Err(tonic::Status::unavailable("decode refused"))
+                    }),
+                    None,
+                    Some(encode_race(&prefill, watch.clone())),
+                )
+                .await;
+                let PdDispatchOutcome::FailedFirst {
+                    side,
+                    error,
+                    partner,
+                } = outcome
+                else {
+                    panic!("the decode side's failure, its partner still dispatching");
+                };
+                assert_eq!(side, PdSide::Decode);
+                parallel_side_failed_first(&sides, side, &error, partner);
+
+                assert!(
+                    late_failure
+                        .send(tonic::Status::unavailable("prefill failed late"))
+                        .is_err(),
+                    "the pending prefill call is dropped: nothing awaits its late failure"
+                );
+                assert_eq!(
+                    supervisor.receiver_count(),
+                    1,
+                    "the attempt has left no copy of the watch behind"
+                );
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(10), &mut supervised)
+                        .await
+                        .is_err(),
+                    "the sends stay in flight while the request holds the watch"
+                );
+                assert!(
+                    prefill.circuit_breaker_can_execute(),
+                    "no failure is sampled on the prefill worker"
+                );
+
+                // The request is over.
+                drop(watch);
+                tokio::time::timeout(Duration::from_secs(5), supervised)
+                    .await
+                    .expect("the supervisor ends with the request");
+                assert_eq!(
+                    send_ended.try_recv(),
+                    Err(oneshot::error::TryRecvError::Closed),
+                    "the send in flight is dropped with the supervisor"
+                );
+
+                // A request with no encode stage keeps the retirement.
+                let (awaited, call) = oneshot::channel::<()>();
+                parallel_side_failed_first(
+                    &PdSides::of(&workers, &ledger, &tokenspeed_request(1, None), false),
+                    PdSide::Decode,
+                    &error,
+                    Box::pin(async move {
+                        let _call = call;
+                        std::future::pending().await
+                    }),
+                );
+                assert!(
+                    !awaited.is_closed(),
+                    "with no encode watch the prefill side is retired: its call is still awaited"
+                );
+            });
+        });
+        let rendered = handle.render();
+        assert!(
+            !rendered.lines().any(|line| {
+                line.starts_with("smg_worker_errors_total{")
+                    && line.contains(r#"worker_type="prefill""#)
+            }),
+            "no dispatch failure is counted on the prefill worker: {rendered}"
+        );
     }
 
     /// The encode verdict is its own kind: neither a prefill nor a decode
@@ -4163,7 +4428,7 @@ pub(crate) mod tests {
         let workers = WorkerSelection::Disaggregated {
             encode_assignments: None,
             prefill: worker("grpc://prefill:30000", WorkerType::Prefill),
-            decode: worker("grpc://decode:30000", WorkerType::Decode),
+            decode: worker("grpc://decode:30000", WorkerType::Decode).into(),
             runtime_type: RuntimeType::TokenSpeed,
         };
         let ledger = AttemptLedger::default();
@@ -5105,7 +5370,7 @@ pub(crate) mod tests {
             WorkerSelection::Disaggregated {
                 encode_assignments: None,
                 prefill: worker("grpc://prefill:30000", WorkerType::Prefill),
-                decode: worker("grpc://decode:30000", WorkerType::Decode),
+                decode: worker("grpc://decode:30000", WorkerType::Decode).into(),
                 runtime_type: RuntimeType::TokenSpeed,
             }
         };
@@ -5183,6 +5448,65 @@ pub(crate) mod tests {
         assert_eq!(plan_sub_requests(&batch, None), 4);
     }
 
+    /// One request of a sequential dispatch holds something for its decode
+    /// where the policy engine placed the pair: the decode is owed its ask
+    /// and its send behind the prefill. A pair the classic policies picked
+    /// is owed neither, so its dispatch holds nothing and makes the guard
+    /// it made with no engine. The parallel shape holds nothing for either.
+    #[test]
+    fn a_sequential_dispatch_holds_nothing_for_a_classic_pairs_decode() {
+        use crate::{
+            config::types::PolicyConfig,
+            policies::PolicyRegistry,
+            routers::common::placement::{
+                select_pair,
+                tests::{hearing_pairs_on, one_pair, pairs_of, MODEL},
+                PlacementInputs, Stated,
+            },
+        };
+
+        let plan = ExecutionPlan::PrefillDecode(ProtoGenerateRequest::Vllm(Box::default()));
+        let registry = one_pair();
+        let selected = |policies: &PolicyRegistry, runtime_type| {
+            let pairs = pairs_of(&registry, policies);
+            let inputs = PlacementInputs::default();
+            let pair = select_pair(
+                &registry,
+                policies,
+                MODEL,
+                &pairs,
+                None,
+                None,
+                inputs,
+                Stated::nothing,
+            );
+            let pair = pair.expect("the pair is placed");
+            WorkerSelection::Disaggregated {
+                encode_assignments: None,
+                prefill: Arc::clone(pair.prefill.worker()),
+                decode: pair.decode,
+                runtime_type,
+            }
+        };
+
+        let classic = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        assert!(!decode_is_owed_behind_its_prefill(
+            &plan,
+            &selected(&classic, RuntimeType::Vllm)
+        ));
+
+        let by_engine = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let _heard = hearing_pairs_on(&by_engine, true);
+        assert!(decode_is_owed_behind_its_prefill(
+            &plan,
+            &selected(&by_engine, RuntimeType::Vllm)
+        ));
+        assert!(
+            !decode_is_owed_behind_its_prefill(&plan, &selected(&by_engine, RuntimeType::Sglang)),
+            "both sides of the parallel shape go out with the dispatch"
+        );
+    }
+
     #[test]
     fn pd_side_labels_reflect_each_sides_transport() {
         let prefill: Arc<dyn Worker> = Arc::new(
@@ -5200,7 +5524,7 @@ pub(crate) mod tests {
         let selection = WorkerSelection::Disaggregated {
             encode_assignments: None,
             prefill,
-            decode,
+            decode: decode.into(),
             runtime_type: RuntimeType::TokenSpeed,
         };
         assert_eq!(
@@ -5738,7 +6062,8 @@ pub(crate) mod tests {
                     .connection_mode(ConnectionMode::Zmq)
                     .zmq_engine_group(size)
                     .build(),
-            ),
+            )
+            .into(),
         }
     }
 
@@ -5869,7 +6194,8 @@ pub(crate) mod tests {
                     .runtime_type(RuntimeType::TokenSpeed)
                     .connection_mode(ConnectionMode::Zmq)
                     .build(),
-            ),
+            )
+            .into(),
         };
         let hash = |ranks: usize, key: &str| {
             attempt_on(GroupedDpSticky::Hash, &workers, Some(ranks), Some(key))
@@ -5888,7 +6214,7 @@ pub(crate) mod tests {
     #[test]
     fn only_a_grouped_worker_is_pinned() {
         let single = |builder: BasicWorkerBuilder| WorkerSelection::Single {
-            worker: Arc::new(builder.connection_mode(ConnectionMode::Zmq).build()),
+            worker: Arc::new(builder.connection_mode(ConnectionMode::Zmq).build()).into(),
         };
         for workers in [
             single(BasicWorkerBuilder::new("ipc:///tmp/ranked.ipc").dp_config(1, 2)),
@@ -5948,7 +6274,7 @@ pub(crate) mod tests {
         WorkerSelection::Disaggregated {
             encode_assignments: None,
             prefill: worker("ipc:///tmp/pd-prefill.ipc", WorkerType::Prefill, prefill),
-            decode: worker("ipc:///tmp/pd-decode.ipc", WorkerType::Decode, decode),
+            decode: worker("ipc:///tmp/pd-decode.ipc", WorkerType::Decode, decode).into(),
             runtime_type: RuntimeType::TokenSpeed,
         }
     }
@@ -6125,7 +6451,7 @@ pub(crate) mod tests {
         let dp_aware = WorkerSelection::Disaggregated {
             encode_assignments: None,
             prefill: ranked("grpc://prefill:30000", WorkerType::Prefill),
-            decode: ranked("grpc://decode:30000", WorkerType::Decode),
+            decode: ranked("grpc://decode:30000", WorkerType::Decode).into(),
             runtime_type: RuntimeType::TokenSpeed,
         };
         let (residue, room) = pd_attempt(GroupedDpSticky::Hash, &dp_aware, None, Some("conv"));

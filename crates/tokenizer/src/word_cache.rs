@@ -36,7 +36,7 @@ use serde_json::Value;
 use tokenizers::{
     decoders::DecoderWrapper,
     models::{
-        bpe::{Vocab, BPE},
+        bpe::{BpeBuilder, Vocab, BPE},
         unigram::Unigram,
         wordpiece::WordPiece,
         ModelWrapper, TrainerWrapper,
@@ -47,7 +47,11 @@ use tokenizers::{
     Model, Result as TokenizersResult, Token, TokenizerImpl,
 };
 
-use crate::{huggingface::HuggingFaceTokenizer, unigram_scores};
+use crate::{
+    byte_level::{TextIndex, TextStore},
+    huggingface::HuggingFaceTokenizer,
+    unigram_scores,
+};
 
 /// A tokenizer of the crate's components over any model type: a built
 /// [`tokenizers::Tokenizer`] derefs to the one over [`ModelWrapper`], a
@@ -118,6 +122,10 @@ pub(crate) struct ReadBpe {
     /// [`Listing`]), shared with the tables built after the model moved
     /// into the built tokenizer.
     pub(crate) tokens: Option<Arc<Listing>>,
+    /// The ids by their text over `tokens`, where the section's model was
+    /// not built ([`listed_section`]): the loading model then answers from
+    /// the read, and the model it carries is empty.
+    pub(crate) index: Option<Arc<TextIndex>>,
 }
 
 /// The vocabulary's text, listed once by the read: every token's bytes in
@@ -135,6 +143,17 @@ impl Listing {
     pub(crate) fn get(&self, id: u32) -> Option<&str> {
         let &(start, end) = self.spans.get(id as usize)?;
         Some(&self.text[start as usize..end as usize])
+    }
+
+    /// How many tokens have at most `most` bytes or are taken by `longer`;
+    /// one of at most `most` bytes is counted from its span alone.
+    pub(crate) fn count(&self, most: usize, longer: impl Fn(&str) -> bool) -> usize {
+        self.spans
+            .iter()
+            .filter(|&&(start, end)| {
+                (end - start) as usize <= most || longer(&self.text[start as usize..end as usize])
+            })
+            .count()
     }
 
     /// How many ids the listing covers (`0..len`).
@@ -172,6 +191,19 @@ impl Listing {
     }
 }
 
+impl TextStore for Listing {
+    fn ids(&self) -> u32 {
+        self.len()
+    }
+
+    /// As bytes: a lookup compares bytes and needs no character boundary
+    /// checked.
+    fn bytes_of(&self, id: u32) -> Option<&[u8]> {
+        let &(start, end) = self.spans.get(id as usize)?;
+        self.text.as_bytes().get(start as usize..end as usize)
+    }
+}
+
 impl ReadBpe {
     /// What the vocabulary alone tells: the read of a section that has no
     /// merges, and the start of the read of one that has.
@@ -194,6 +226,7 @@ impl ReadBpe {
             max_id,
             dense,
             tokens,
+            index: None,
         }
     }
 
@@ -211,6 +244,7 @@ impl ReadBpe {
                 .and_then(|pieces| pieces.checked_sub(1)),
             dense: true,
             tokens: None,
+            index: None,
         }
     }
 
@@ -560,6 +594,7 @@ impl<'de, A: MapAccess<'de>> MapAccess<'de> for Replay<A> {
 /// (`ReadBpe`), read here once.
 fn bpe_section<'de, A: MapAccess<'de>>(mut map: A) -> Result<LateBoundModel, A::Error> {
     let mut builder = BPE::builder();
+    let mut prefixed = false;
     let mut vocab: Option<Vocab> = None;
     let mut merges: Option<Vec<(String, String)>> = None;
     while let Some(key) = map.next_key::<String>()? {
@@ -576,6 +611,7 @@ fn bpe_section<'de, A: MapAccess<'de>>(mut map: A) -> Result<LateBoundModel, A::
             }
             "continuing_subword_prefix" => {
                 if let Some(prefix) = map.next_value::<Option<String>>()? {
+                    prefixed = !prefix.is_empty();
                     builder = builder.continuing_subword_prefix(prefix);
                 }
             }
@@ -592,6 +628,24 @@ fn bpe_section<'de, A: MapAccess<'de>>(mut map: A) -> Result<LateBoundModel, A::
             "byte_fallback" => {
                 if let Some(fallback) = map.next_value::<Option<bool>>()? {
                     builder = builder.byte_fallback(fallback);
+                    // The rest of a section that says so before its vocabulary
+                    // is read by the listing reader (the opt-in pipeline writes
+                    // the model out again, and keeps this reader).
+                    if fallback
+                        && vocab.is_none()
+                        && merges.is_none()
+                        && !cfg!(feature = "tokenizers-v1")
+                    {
+                        match listed_entry(map, builder, prefixed)? {
+                            Listed::Model(model) => return Ok(model),
+                            Listed::Back(settings, map_vocab, texts) => {
+                                builder = settings;
+                                vocab = Some(map_vocab);
+                                merges = Some(texts);
+                                break;
+                            }
+                        }
+                    }
                 }
             }
             "ignore_merges" => {
@@ -631,6 +685,159 @@ fn bpe_section<'de, A: MapAccess<'de>>(mut map: A) -> Result<LateBoundModel, A::
         read: Some(read),
         rescore: false,
     })
+}
+
+/// The rest of a BPE section that said `byte_fallback` before its
+/// vocabulary: the vocabulary is listed, not mapped, its merges are resolved
+/// as they are read, and no model is built of them here. The loader builds
+/// one only where a path runs it (`HuggingFaceTokenizer::from_file`).
+#[inline(never)]
+fn listed_section<'de, A: MapAccess<'de>>(
+    mut map: A,
+    mut builder: BpeBuilder,
+    mut prefixed: bool,
+) -> Result<Listed, A::Error> {
+    let mut vocab: Option<VocabRead> = None;
+    let mut merges: Option<MergesRead> = None;
+    while let Some(key) = map.next_key::<String>()? {
+        match key.as_str() {
+            "dropout" => {
+                if let Some(dropout) = map.next_value::<Option<f32>>()? {
+                    builder = builder.dropout(dropout);
+                }
+            }
+            "unk_token" => {
+                if let Some(token) = map.next_value::<Option<String>>()? {
+                    builder = builder.unk_token(token);
+                }
+            }
+            "continuing_subword_prefix" => {
+                if let Some(prefix) = map.next_value::<Option<String>>()? {
+                    prefixed = !prefix.is_empty();
+                    builder = builder.continuing_subword_prefix(prefix);
+                }
+            }
+            "end_of_word_suffix" => {
+                if let Some(suffix) = map.next_value::<Option<String>>()? {
+                    builder = builder.end_of_word_suffix(suffix);
+                }
+            }
+            "fuse_unk" => {
+                if let Some(fuse) = map.next_value::<Option<bool>>()? {
+                    builder = builder.fuse_unk(fuse);
+                }
+            }
+            "byte_fallback" => {
+                if let Some(fallback) = map.next_value::<Option<bool>>()? {
+                    builder = builder.byte_fallback(fallback);
+                }
+            }
+            "ignore_merges" => {
+                if let Some(ignore) = map.next_value::<Option<bool>>()? {
+                    builder = builder.ignore_merges(ignore);
+                }
+            }
+            "vocab" => {
+                // Merges resolved in a vocabulary that another now replaces
+                // go back to their texts: the builder resolves them again.
+                if let (Some(VocabRead::Listed(listing, _)), Some(MergesRead::Ids(pairs))) =
+                    (&vocab, &merges)
+                {
+                    merges = Some(MergesRead::Texts(texts_of(listing, pairs)));
+                }
+                vocab = Some(map.next_value_seed(ListedVocab)?);
+            }
+            // The merge list is about the vocabulary's size, which the files
+            // write first: one allocation for the list, no growth copies.
+            "merges" => {
+                let listed = match &vocab {
+                    Some(VocabRead::Listed(listing, index)) => Some((&**listing, &**index)),
+                    _ => None,
+                };
+                merges = Some(map.next_value_seed(MergeIds { listed })?);
+            }
+            "type" => {
+                let kind: String = map.next_value()?;
+                if kind != "BPE" {
+                    return Err(A::Error::invalid_value(de::Unexpected::Str(&kind), &"BPE"));
+                }
+            }
+            _ => {
+                map.next_value::<IgnoredAny>()?;
+            }
+        }
+    }
+    let (Some(vocab), Some(merges)) = (vocab, merges) else {
+        return Err(A::Error::custom("Missing vocab/merges"));
+    };
+    match (vocab, merges) {
+        // The model stays empty, with the section's settings; the read
+        // answers for it while the load runs.
+        (VocabRead::Listed(listing, index), MergesRead::Ids(pairs)) if !prefixed => {
+            let model = builder
+                .cache_capacity(0)
+                .build()
+                .map_err(A::Error::custom)?;
+            Ok(Listed::Model(LateBoundModel {
+                model: ModelWrapper::BPE(model),
+                words: AtomicUsize::new(HuggingFaceTokenizer::BPE_WORDS_CACHED_PER_THREAD),
+                read: Some(ReadBpe {
+                    pairs: Some(pairs.into_boxed_slice()),
+                    max_id: listing.len().checked_sub(1),
+                    dense: true,
+                    tokens: Some(listing),
+                    index: Some(index),
+                }),
+                rescore: false,
+            }))
+        }
+        // Anything else goes back to `bpe_section` as the map and the texts
+        // it reads itself.
+        (vocab, merges) => {
+            let merges = match (&vocab, merges) {
+                (_, MergesRead::Texts(texts)) => texts,
+                (VocabRead::Listed(listing, _), MergesRead::Ids(pairs)) => {
+                    texts_of(listing, &pairs)
+                }
+                // Never: ids are resolved in a listing that is still the
+                // vocabulary.
+                (VocabRead::Map(_), MergesRead::Ids(_)) => {
+                    return Err(A::Error::custom(
+                        "merges resolved in a vocabulary that is no longer listed",
+                    ))
+                }
+            };
+            let vocab = match vocab {
+                VocabRead::Map(vocab) => vocab,
+                VocabRead::Listed(listing, _) => mapped(&listing),
+            };
+            Ok(Listed::Back(builder, vocab, merges))
+        }
+    }
+}
+
+/// What the listing reader made of a section.
+enum Listed {
+    /// The loading model of a listed section.
+    Model(LateBoundModel),
+    /// A section that is not listed: its settings, its vocabulary as a map
+    /// and its merges as texts, which [`bpe_section`] builds.
+    Back(BpeBuilder, Vocab, Vec<(String, String)>),
+}
+
+/// The way from [`bpe_section`] into the listing reader. Cold and never
+/// inlined, so that the loops of that reader compile as they do without the
+/// call: with the listing reader inlined among them, every other BPE file
+/// paid seven instructions an entry of its vocabulary. The listing reader
+/// itself reads a whole vocabulary and is not cold.
+#[cold]
+#[inline(never)]
+fn listed_entry<'de, A: MapAccess<'de>>(
+    map: A,
+    builder: BpeBuilder,
+    prefixed: bool,
+) -> Result<Listed, A::Error> {
+    listed_section(map, builder, prefixed)
 }
 
 /// The rest of a section that opened as a WordPiece section does: with
@@ -877,6 +1084,241 @@ impl<'de> Visitor<'de> for MergeSpelling {
     }
 }
 
+/// The vocabulary of a BPE section as [`ListedVocab`] reads it.
+enum VocabRead {
+    /// Every token's id is its place in the section and no text comes
+    /// twice: the tokens listed, and the ids by their text.
+    Listed(Arc<Listing>, Arc<TextIndex>),
+    /// Any other vocabulary: the map the crate's builder takes.
+    Map(Vocab),
+}
+
+/// The merges of a BPE section as [`MergeIds`] reads them.
+enum MergesRead {
+    /// Every merge names tokens of the vocabulary: left, right, product.
+    Ids(Vec<[u32; 3]>),
+    /// The merges as the crate's builder takes them.
+    Texts(Vec<(String, String)>),
+}
+
+/// The listing as the map the crate's builder takes.
+fn mapped(listing: &Listing) -> Vocab {
+    (0..listing.len())
+        .filter_map(|id| Some((listing.get(id)?.to_owned(), id)))
+        .collect()
+}
+
+/// Resolved merges as the texts the crate's builder takes.
+fn texts_of(listing: &Listing, pairs: &[[u32; 3]]) -> Vec<(String, String)> {
+    let text = |id: u32| listing.get(id).unwrap_or_default().to_owned();
+    pairs.iter().map(|&[a, b, _]| (text(a), text(b))).collect()
+}
+
+/// A string of the file appended to a buffer, no allocation a string.
+struct Appended<'a>(&'a mut String);
+
+impl<'de> DeserializeSeed<'de> for Appended<'_> {
+    type Value = ();
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
+        deserializer.deserialize_str(self)
+    }
+}
+
+impl Visitor<'_> for Appended<'_> {
+    type Value = ();
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a string")
+    }
+
+    fn visit_str<E: de::Error>(self, text: &str) -> Result<(), E> {
+        self.0.push_str(text);
+        Ok(())
+    }
+}
+
+/// Reads a `vocab` entry of a BPE section into a [`Listing`] while its ids
+/// come as `0..n` in the file's order, with the ids by their text; a
+/// vocabulary that is not so written, that spells one text twice, or whose
+/// text is longer than a span's 32 bits address, is the map the crate's
+/// builder takes.
+struct ListedVocab;
+
+impl<'de> DeserializeSeed<'de> for ListedVocab {
+    type Value = VocabRead;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<VocabRead, D::Error> {
+        deserializer.deserialize_map(self)
+    }
+}
+
+impl<'de> Visitor<'de> for ListedVocab {
+    type Value = VocabRead;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a map")
+    }
+
+    fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<VocabRead, M::Error> {
+        let mut text = String::new();
+        let mut spans: Vec<(u32, u32)> = Vec::new();
+        loop {
+            let start = text.len();
+            if map.next_key_seed(Appended(&mut text))?.is_none() {
+                break;
+            }
+            let id: u32 = map.next_value()?;
+            let end = u32::try_from(text.len())
+                .ok()
+                .filter(|_| id as usize == spans.len());
+            let Some(end) = end else {
+                let mut vocab: Vocab = spans
+                    .iter()
+                    .zip(0u32..)
+                    .map(|(&(start, end), id)| (text[start as usize..end as usize].to_owned(), id))
+                    .collect();
+                vocab.insert(text[start..].to_owned(), id);
+                // The rest by the seed of this reader: a second caller of
+                // the map read of `bpe_section` cost that reader its
+                // inlining there.
+                let mut token = String::new();
+                while map.next_key_seed(Appended(&mut token))?.is_some() {
+                    vocab.insert(std::mem::take(&mut token), map.next_value()?);
+                }
+                return Ok(VocabRead::Map(vocab));
+            };
+            spans.push((start as u32, end));
+        }
+        text.shrink_to_fit();
+        spans.shrink_to_fit();
+        let listing = Listing { text, spans };
+        let (index, twice) = TextIndex::build(&listing);
+        if twice {
+            return Ok(VocabRead::Map(mapped(&listing)));
+        }
+        Ok(VocabRead::Listed(Arc::new(listing), Arc::new(index)))
+    }
+}
+
+/// The merge list of a BPE section whose vocabulary is listed,
+/// each merge resolved in it as it is read, no string kept; from the first
+/// merge that names a text outside the vocabulary on, the texts, for the
+/// crate's builder to refuse.
+struct MergeIds<'a> {
+    /// `None`: no listed vocabulary to resolve in, the texts from the start.
+    listed: Option<(&'a Listing, &'a TextIndex)>,
+}
+
+impl<'de> DeserializeSeed<'de> for MergeIds<'_> {
+    type Value = MergesRead;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<MergesRead, D::Error> {
+        deserializer.deserialize_seq(self)
+    }
+}
+
+impl<'de> Visitor<'de> for MergeIds<'_> {
+    type Value = MergesRead;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a list of merges")
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<MergesRead, A::Error> {
+        let about = self.listed.map_or(0, |(listing, _)| listing.len() as usize);
+        let mut pairs = Vec::with_capacity(seq.size_hint().unwrap_or(about));
+        // The merges as texts, from the first that does not resolve on.
+        let mut texts: Option<Vec<(String, String)>> = self.listed.is_none().then(Vec::new);
+        let mut both = String::new();
+        loop {
+            both.clear();
+            let Some(cut) = seq.next_element_seed(MergeText(&mut both))? else {
+                break;
+            };
+            // A `#version` line.
+            let Some(cut) = cut else { continue };
+            let (left, right) = both.split_at(cut);
+            if let (None, Some((listing, index))) = (&texts, self.listed) {
+                let id = |text: &str| index.get(listing, text.as_bytes());
+                match (id(left), id(right), id(&both)) {
+                    (Some(a), Some(b), Some(product)) => {
+                        pairs.push([a, b, product]);
+                        continue;
+                    }
+                    _ => texts = Some(texts_of(listing, &pairs)),
+                }
+            }
+            if let Some(texts) = &mut texts {
+                texts.push((left.to_owned(), right.to_owned()));
+            }
+        }
+        Ok(match texts {
+            Some(texts) => MergesRead::Texts(texts),
+            None => MergesRead::Ids(pairs),
+        })
+    }
+}
+
+/// One merge as the file spells it ([`MergeSpelling`]), its two
+/// pieces appended to the buffer: where the first ends, or `None` for a
+/// `#version` line.
+struct MergeText<'a>(&'a mut String);
+
+impl<'de> DeserializeSeed<'de> for MergeText<'_> {
+    type Value = Option<usize>;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> Visitor<'de> for MergeText<'_> {
+    type Value = Option<usize>;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a merge: a pair of pieces, or one string with a space between them")
+    }
+
+    fn visit_str<E: de::Error>(self, line: &str) -> Result<Option<usize>, E> {
+        if line.starts_with("#version") {
+            return Ok(None);
+        }
+        let mut pieces = line.split(' ');
+        match (pieces.next(), pieces.next(), pieces.next()) {
+            (Some(a), Some(b), None) => {
+                self.0.push_str(a);
+                self.0.push_str(b);
+                Ok(Some(a.len()))
+            }
+            _ => Err(E::invalid_value(de::Unexpected::Str(line), &self)),
+        }
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Option<usize>, A::Error> {
+        if seq.next_element_seed(Appended(&mut *self.0))?.is_none() {
+            return Err(A::Error::invalid_length(0, &self));
+        }
+        let cut = self.0.len();
+        if seq.next_element_seed(Appended(&mut *self.0))?.is_none() {
+            return Err(A::Error::invalid_length(1, &self));
+        }
+        if seq.next_element::<IgnoredAny>()?.is_some() {
+            return Err(A::Error::invalid_length(3, &self));
+        }
+        Ok(Some(cut))
+    }
+}
+
+impl LateBoundModel {
+    /// The read that answers for the model where the section's model was
+    /// not built.
+    fn listed(&self) -> Option<(&Listing, &TextIndex)> {
+        let read = self.read.as_ref()?;
+        Some((read.tokens.as_deref()?, read.index.as_deref()?))
+    }
+}
+
 impl Serialize for LateBoundModel {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         self.model.serialize(serializer)
@@ -891,19 +1333,33 @@ impl Model for LateBoundModel {
     }
 
     fn token_to_id(&self, token: &str) -> Option<u32> {
-        self.model.token_to_id(token)
+        match self.listed() {
+            Some((listing, index)) => index.get(listing, token.as_bytes()),
+            None => self.model.token_to_id(token),
+        }
     }
 
     fn id_to_token(&self, id: u32) -> Option<String> {
-        self.model.id_to_token(id)
+        match self.listed() {
+            Some((listing, _)) => listing.get(id).map(str::to_owned),
+            None => self.model.id_to_token(id),
+        }
     }
 
     fn get_vocab(&self) -> HashMap<String, u32> {
-        self.model.get_vocab()
+        match self.listed() {
+            Some((listing, _)) => (0..listing.len())
+                .filter_map(|id| Some((listing.get(id)?.to_owned(), id)))
+                .collect(),
+            None => self.model.get_vocab(),
+        }
     }
 
     fn get_vocab_size(&self) -> usize {
-        self.model.get_vocab_size()
+        match self.listed() {
+            Some((listing, _)) => listing.len() as usize,
+            None => self.model.get_vocab_size(),
+        }
     }
 
     fn save(&self, folder: &Path, prefix: Option<&str>) -> TokenizersResult<Vec<PathBuf>> {

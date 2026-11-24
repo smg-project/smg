@@ -215,7 +215,7 @@ fn pd_bootstrap_injection_skips_non_sglang_requests() {
     let selection = WorkerSelection::Disaggregated {
         encode_assignments: None,
         prefill: worker.clone(),
-        decode: worker,
+        decode: worker.into(),
         runtime_type: RuntimeType::Sglang,
     };
 

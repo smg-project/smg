@@ -43,6 +43,7 @@ impl<'a, H: JobHost> QueueTest<'a, H> {
             next_waiter_id: 1.into(),
             kept: Arc::default(),
             cancelled_before_start: Arc::default(),
+            mark_holders: DashMap::new(),
         });
         (queue, move || rx.try_recv().ok().map(|queued| queued.job))
     }

@@ -113,17 +113,6 @@ impl std::fmt::Display for MetadataError {
 }
 
 /// GET JSON with optional bearer auth, with 404 fallback to `/get_<endpoint>`.
-async fn get_json_with_fallback<T: serde::de::DeserializeOwned>(
-    client: &Client,
-    base_url: &str,
-    endpoint: &str,
-    api_key: Option<&str>,
-) -> Result<T, String> {
-    get_json_with_fallback_classified(client, base_url, endpoint, api_key)
-        .await
-        .map_err(|e| e.to_string())
-}
-
 async fn get_json_with_fallback_classified<T: serde::de::DeserializeOwned>(
     client: &Client,
     base_url: &str,
@@ -242,14 +231,6 @@ async fn http_get_vllm_models_classified(
     })
 }
 
-pub(super) async fn get_server_info(
-    client: &Client,
-    url: &str,
-    api_key: Option<&str>,
-) -> Result<ServerInfo, String> {
-    get_json_with_fallback(client, &http_base_url(url), "server_info", api_key).await
-}
-
 /// The labels an engine reports about itself, read the way registration
 /// reads them: an HTTP engine's metadata endpoints (by runtime), or a gRPC
 /// engine's model and server info through `connector`. Callable again for a
@@ -318,7 +299,16 @@ async fn read_info_routes(
     {
         Ok(info) => labels.extend(flat_labels(&info)),
         Err(MetadataError::Failed(e)) if strict => return Err(format!("server_info: {e}")),
-        Err(_) => {}
+        Err(MetadataError::InvalidExtension(e)) => return Err(format!("server_info: {e}")),
+        // A tolerant read leaves the gap, and the engine's data-parallel
+        // size is in it: a registration that reads no size registers one
+        // worker, however many ranks the engine runs. Logged here, where
+        // the failure is known.
+        Err(MetadataError::Failed(e)) => warn!(
+            "server_info: {e}; the labels are read without it, the engine's data-parallel \
+             size among what it holds"
+        ),
+        Err(MetadataError::NotOffered) => {}
     }
     match get_json_with_fallback_classified::<ModelInfo>(client, &base, "model_info", api_key).await
     {

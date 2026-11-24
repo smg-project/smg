@@ -23,11 +23,11 @@ use local::{
     CHECK_LOCAL_WORKER_STEP, ZMQ_LABELS_STEP,
 };
 use openai_protocol::worker::WorkerSpec;
-use shared::REGISTER_WORKERS_STEP;
 pub use shared::{
     registered_entries, registered_in, ActivateWorkersStep, RegisterWorkersStep,
     UpdatePoliciesStep, WorkerList,
 };
+use shared::{ACTIVATE_WORKERS_STEP, REGISTER_WORKERS_STEP};
 use smg_worker::{
     jobs::WorkerJobAsker,
     workflow::{
@@ -236,7 +236,7 @@ pub fn create_worker_registration_workflow(
     // Step 5c: Activate workers
     .add_step(
         StepDefinition::new(
-            "activate_workers",
+            ACTIVATE_WORKERS_STEP,
             "Activate Workers",
             Arc::new(ActivateWorkersStep),
         )

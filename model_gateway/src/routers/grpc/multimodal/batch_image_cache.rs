@@ -211,11 +211,17 @@ pub(super) async fn preprocess(
                 PreprocessedEncoderInputs::concat_refs(&ordered, &layouts.model_specific)?;
             // Repoint the entries of a growing request to its assembled output
             // so its next replay can reuse it and old backing groups can leave.
-            if distinct
-                && has_misses
-                && admit_shared_batch(&mut output, &images, &layouts, &cache, fingerprint)?
-            {
-                return Ok(Some(output));
+            // A joined output is a pooled buffer: the cache keeps it at its
+            // exact length, which the allocator shrinks to in place.
+            if distinct && has_misses {
+                if let EncoderInput::Wire { bytes, .. } = &mut output.encoder_input {
+                    if bytes.len() <= cache.max_bytes() {
+                        bytes.shrink_to_fit();
+                    }
+                }
+                if admit_shared_batch(&mut output, &images, &layouts, &cache, fingerprint)? {
+                    return Ok(Some(output));
+                }
             }
             output
         };

@@ -13,14 +13,15 @@
 //! - 4.1, the view ([`engine`]): [`RequestFacts`], [`Candidate`] rows with their
 //!   [`LoadRow`], the [`AffinityFacts`] column beside the rows, [`Constraints`]
 //!   and [`PoolFacts`]. Built once per decision by the host into a reused
-//!   buffer; no handle, no callback into the host. The values a report
+//!   buffer; no handle and no callback into the host, but for the hash
+//!   ring a host may lend with a request. The values a report
 //!   states under a name the document declares stand beside the rows too
 //!   ([`load`]): a stage reads one by its [`SignalColumn`].
 //! - 4.2, the decision ([`engine`]): an ordered [`Pick`] of up to
 //!   [`MAX_TARGETS`] targets, a [`Shed`] with its reason and the stage that
 //!   emptied the pool, or a [`Queue`] ticket (specified in v1; no built-in
-//!   issues one yet). A decision books nothing by itself: its door files
-//!   the pick's lease at the issue, which books the first target, and the
+//!   issues one yet). A decision books nothing by itself: the pick's
+//!   lease is filed at the issue, which books the first target, and the
 //!   host reports the lifecycle back. One issue books another target: a
 //!   pair's decode asked for later and sent with no decode call is issued
 //!   at its dispatch, on the target that dispatch took.
@@ -35,7 +36,7 @@
 //!   membership hooks. The
 //!   prefixes sent to a model's workers without cache events are kept by
 //!   the sent-prefix predictor ([`tracking`]). A profile that reads sent
-//!   prefixes reads that record at the naming through the in-process door.
+//!   prefixes reads that record at the naming.
 //! - 4.5, the stages in code ([`stages`]): the [`StageRegistry`] of the stages
 //!   a build knows by name, the stock build's and the ones a host registers. A
 //!   document names either kind the same way, and the validator resolves every
@@ -54,10 +55,7 @@
 //!   KV events feed the index the store holds for each model
 //!   ([`store`]), which no decision reads yet. A
 //!   gateway in the embedded mode implements the same traits over its own
-//!   structures. The store publishes what a decision reads
-//!   ([`store::StoreSnapshot`]: every pool as whole candidate rows) and builds
-//!   one decision's view from it through no lock; the service that calls the
-//!   build is a later step.
+//!   structures.
 //! - 10, the election ([`service::elector`]): one [`service::elector::Elector`] over a
 //!   [`service::elector::LeaseBackend`] (the lease file and the in-process record
 //!   here, the Kubernetes `Lease` next), terms that only grow, and the
@@ -80,20 +78,15 @@
 //! - Behind the `ingest` feature, the ingestion drivers (`ingest`): the load
 //!   path (the `GetLoads` poll per engine under the store's poll
 //!   arbitration, the metrics scrape of an engine without a servicer) and
-//!   the metrics parser. The load driver and the worker host's load adapter
-//!   share the `load_report` conversion.
+//!   the metrics parser. The load driver and a worker list's records share
+//!   the `load_report` conversion.
 //!
 //! - Behind the `operator` feature, `document::operator::DocumentManager`
 //!   applies a host's start document and serves its status, document and dry
 //!   run. The feature also serves worker snapshots over the host's store.
-//! - The door ([`engine`]): the order of one decision's calls, written once
-//!   for every host. A host that embeds the engine asks
-//!   [`engine::StoreBackedEngine`], which runs the order on the caller's thread
-//!   over a [`store::MemoryStore`]: the lease is filed at the issue, the host
-//!   says what became of it ([`engine::StoreBackedEngine::report`]), itself or
-//!   through a handle, and its timer calls the door's clock
-//!   ([`engine::StoreBackedEngine::sweep`]). The standalone controller runs the
-//!   same order on its deciders' threads.
+//! - The engine ([`engine`]): an embedded host lends its worker lists to
+//!   `engine::PolicyEngine` and asks it on the caller's thread. The
+//!   standalone controller asks the same engine on its deciders' threads.
 //! - The handle ([`tracking`]): one decision held until its request ends.
 //!   A host that holds a [`tracking::DecisionGuard`] says the target it took,
 //!   the dispatch, and the completion or the release. The handle reports to the
@@ -101,8 +94,9 @@
 //! - Behind the `controller` feature, the standalone controller
 //!   (`controller`): the listeners with their credentialed scopes, the
 //!   health service on each, the admin endpoints, readiness, the drain and
-//!   the load driver over the store. The stock binary also requires the
-//!   `worker-host` feature so it can read cache events.
+//!   the load driver over the store. The feature turns on `in-process`, the
+//!   engine over worker objects, and `worker-host`, so every controller
+//!   keeps its worker objects, probes them and reads cache events.
 //! - Behind the `client` feature, the gateway's side of the controller's
 //!   protocol (`client`). The reference client (`service::client::Client`) asks
 //!   one request at a time, reports its lifecycle and watches workers'
@@ -172,11 +166,16 @@
 //! [`Needs`]: document::Needs
 //!
 
+use std::{cell::Cell, collections::hash_map::RandomState, hash::BuildHasher, thread};
+
 #[cfg(any(feature = "ingest", feature = "operator"))]
 mod address;
 pub mod document;
 pub mod engine;
 pub mod load;
+#[cfg(feature = "test-util")]
+#[doc(hidden)]
+pub mod mirrored;
 #[cfg(any(feature = "wasm", feature = "controller", feature = "in-process"))]
 mod names;
 pub mod plugins;
@@ -198,6 +197,9 @@ pub mod worker_host;
 ///   picker that draws first reads it too, and whatever follows that draw
 ///   (the order of the rows drawn, or the whole pass behind a draw that kept
 ///   nobody) reads it past those values;
+/// - the seed under a mask made of a stage's name ([`Draw::for_stage`]): the
+///   draws of a filter or a scorer that opens it, the call for one its host
+///   registers;
 /// - one value of the seed's stream, read behind the draw of a picker whose
 ///   unit is the engine: the seed of the stream that draws between equal
 ///   rows of the engine taken;
@@ -222,6 +224,32 @@ impl Draw {
     /// A draw sequence from a decision's seed.
     pub const fn new(seed: u64) -> Self {
         Self(seed)
+    }
+
+    /// A stage's own stream of the seed it is handed: the seed under a mask
+    /// made of `stage`, the name the stage answers by. It is the call for a
+    /// filter or a scorer its host registers, where that stage draws:
+    /// `Draw::for_stage(facts.seed, self.name())`. The stream of
+    /// [`Draw::new`] of the seed is the one the profile's picker reads: a
+    /// stage that drew from it would read the picker's values, one for one,
+    /// and where the picker draws, the worker it takes would follow what
+    /// the stage drew.
+    ///
+    /// The mask is the fingerprint of the name's bytes
+    /// ([`engine::fingerprint`]), which is never zero, so the stream is
+    /// never the seed's own. Two names of two fingerprints open two
+    /// streams, and a catalog of stages holds a name once
+    /// ([`stages::StageRegistry`]). The stream is another of those listed
+    /// on [`Draw`] only where two 64-bit values meet.
+    ///
+    /// The stream is that of
+    /// `Draw::new(seed ^ fingerprint(stage.as_bytes()))`: a stage may keep
+    /// its name's fingerprint from its build and open its stream with one
+    /// exclusive-or at each call. Every call opens the stream at its start:
+    /// under one seed and one name it draws the same values every time.
+    #[must_use]
+    pub fn for_stage(seed: u64, stage: &str) -> Self {
+        Self(seed ^ engine::fingerprint(stage.as_bytes()))
     }
 
     /// The next 64 bits.
@@ -250,9 +278,30 @@ impl Draw {
     }
 }
 
+/// A seed no other request of this thread was given: the one randomness a
+/// stage gets ([`engine::RequestFacts::seed`]), and what a picker
+/// that places by itself draws from. Under a constant seed a policy that
+/// draws picks the same worker of an unchanged pool every time.
+///
+/// Each thread walks a draw sequence of its own ([`Draw`]). Its start is
+/// the standard library's process-random hash of the thread's id, so two
+/// threads and two runs of a process start apart.
+pub(crate) fn fresh_seed() -> u64 {
+    thread_local! {
+        static NEXT: Cell<u64> = Cell::new(RandomState::new().hash_one(thread::current().id()));
+    }
+    NEXT.with(|next| {
+        let mut draw = Draw::new(next.get());
+        let seed = draw.next_u64();
+        next.set(draw.state());
+        seed
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::Draw;
+    use crate::engine::fingerprint;
 
     #[test]
     fn the_draw_is_deterministic_per_seed_and_stays_below_the_bound() {
@@ -264,5 +313,37 @@ mod tests {
             assert!(x < 13);
         }
         assert_eq!(Draw::new(1).below(0), 0);
+    }
+
+    /// A stage's stream shares no value, place for place, with the seed's
+    /// own stream, which the picker reads: under the empty name too. It is
+    /// the seed's stream under the fingerprint of the stage's name: the
+    /// equality a stage that keeps its fingerprint opens its stream by.
+    #[test]
+    fn a_stages_stream_is_the_seeds_under_its_names_fingerprint() {
+        for seed in [0, 1, 7, 0x9e37_79b9_7f4a_7c15, u64::MAX] {
+            for name in ["pack", "spread", "a", ""] {
+                let mut own = Draw::for_stage(seed, name);
+                let mut pickers = Draw::new(seed);
+                let mut by_hand = Draw::new(seed ^ fingerprint(name.as_bytes()));
+                for place in 0..8 {
+                    let value = own.next_u64();
+                    assert_ne!(value, pickers.next_u64(), "{name} at {seed}, {place}");
+                    assert_eq!(value, by_hand.next_u64(), "{name} at {seed}, {place}");
+                }
+            }
+        }
+    }
+
+    /// The two names, of two fingerprints, open two streams from one seed.
+    /// One name opens the same stream from one seed every time: the call
+    /// keeps nothing between two calls.
+    #[test]
+    fn two_names_open_two_streams_and_one_name_replays() {
+        for seed in 0..256u64 {
+            let first = |name| Draw::for_stage(seed, name).next_u64();
+            assert_ne!(first("pack"), first("spread"), "seed {seed}");
+            assert_eq!(first("pack"), first("pack"), "seed {seed}");
+        }
     }
 }

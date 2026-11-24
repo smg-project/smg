@@ -72,7 +72,9 @@ impl ParakeetAudioParams {
     /// refusing an encoder that does not subsample 8x with stride-2 kernel-3
     /// convolutions or a config that overrides the extractor settings this
     /// port implements.
-    pub fn from_model_config(config: &serde_json::Value) -> Result<Self, ParakeetConfigError> {
+    pub(crate) fn from_model_config(
+        config: &serde_json::Value,
+    ) -> Result<Self, ParakeetConfigError> {
         let sound = config
             .get("sound_config")
             .ok_or(ParakeetConfigError::Missing("sound_config"))?;
@@ -112,7 +114,7 @@ impl ParakeetAudioParams {
     }
 
     /// The sample counts of the clips an audio of `len` samples splits into.
-    pub fn clip_sizes(&self, len: usize) -> Vec<usize> {
+    pub(crate) fn clip_sizes(&self, len: usize) -> Vec<usize> {
         let target = (CLIP_SECONDS * self.sample_rate as f64).round() as usize;
         let tail_min = (TAIL_MIN_SECONDS * self.sample_rate as f64).round() as usize;
         let len = len.max(tail_min);
@@ -125,7 +127,7 @@ impl ParakeetAudioParams {
 }
 
 /// Encoder positions a clip of `frames` mel frames becomes after subsampling.
-pub fn parakeet_clip_tokens(frames: usize) -> usize {
+pub(crate) fn parakeet_clip_tokens(frames: usize) -> usize {
     (0..SUBSAMPLING_STAGES).fold(frames, |n, _| if n == 0 { 0 } else { (n - 1) / 2 + 1 })
 }
 
@@ -142,7 +144,7 @@ pub struct ParakeetAudioProcessor {
 }
 
 impl ParakeetAudioProcessor {
-    pub fn new(params: ParakeetAudioParams) -> Self {
+    pub(crate) fn new(params: ParakeetAudioParams) -> Self {
         Self {
             params,
             frontend: OnceLock::new(),

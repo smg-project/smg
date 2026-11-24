@@ -28,7 +28,7 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use rustc_hash::FxHashMap;
 use serde::Deserialize;
 
-use crate::traits::TokenIdType;
+use crate::{tiktoken::RankFile, traits::TokenIdType};
 
 /// The file name of the layout: a checkpoint directory ships the vocabulary
 /// under it.
@@ -44,6 +44,11 @@ pub(crate) const PAD: &str = "<pad>";
 /// encoder, so a load with it skips that check (see `SHIPPED_PATTERNS` in
 /// `tiktoken.rs`).
 pub(crate) const PATTERN: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+
+/// The most special ids a configuration may name: a bound of this reader,
+/// beyond the checks of the reference reader. A load keeps a slot for every
+/// special id the configuration names. The files in use name 1,000.
+const MAX_SPECIAL_TOKENS: usize = 1 << 16;
 
 /// The special tokens of a file that lists none: the reference reader's
 /// list for the versions up to v7, which predate the `special_tokens` block.
@@ -124,8 +129,9 @@ struct SpecialToken {
 
 /// What the file gives the tokenizer.
 pub(crate) struct Vocabulary {
-    /// Token bytes to id: the rank plus the special-token count.
-    pub(crate) ranks: FxHashMap<Vec<u8>, u32>,
+    /// The tokens in rank order, each with its id: the rank plus the
+    /// special-token count.
+    pub(crate) ranks: RankFile,
     /// The split pattern the ranks were trained under.
     pub(crate) pattern: String,
     /// Special token spellings to id: the file's list, and a filler for
@@ -374,9 +380,22 @@ impl<'a> Walk<'a> {
     }
 }
 
+/// The ids by their token. A token the file lists twice is refused here,
+/// where the map is built, as the reference reader refuses it.
+pub(crate) fn by_token(tokens: &RankFile) -> Result<FxHashMap<&[u8], TokenIdType>> {
+    let mut ranks = FxHashMap::with_capacity_and_hasher(tokens.ranks.len(), Default::default());
+    for (index, (token, id)) in tokens.tokens().enumerate() {
+        if ranks.insert(token, id).is_some() {
+            bail!("token {index} repeats an earlier token's bytes");
+        }
+    }
+    Ok(ranks)
+}
+
 /// The vocabulary of a parsed file, checked as the reference reader checks
-/// it: the ranks in order, the first 256 tokens the single bytes, no token
-/// twice, the special tokens distinct and inside their block.
+/// it: the ranks in order, the first 256 tokens the single bytes, the
+/// special tokens distinct and inside their block ([`by_token`] refuses a
+/// token listed twice).
 fn vocabulary(file: File<'_>) -> Result<Vocabulary> {
     let File {
         config,
@@ -401,7 +420,18 @@ fn vocabulary(file: File<'_>) -> Result<Vocabulary> {
     }
     let offset = TokenIdType::try_from(num_special)
         .context("default_num_special_tokens does not fit an id")?;
-    let mut ranks = FxHashMap::with_capacity_and_hasher(inner, Default::default());
+    if num_special > MAX_SPECIAL_TOKENS {
+        bail!(
+            "default_num_special_tokens {num_special} is above the bound of {MAX_SPECIAL_TOKENS}"
+        );
+    }
+    // Four characters of base64 decode to three bytes at the most.
+    let bytes = vocab
+        .iter()
+        .take(inner)
+        .map(|token| token.token_bytes.len().div_ceil(4) * 3)
+        .sum();
+    let mut ranks = RankFile::with_capacity(inner, bytes);
     for (index, token) in vocab.into_iter().take(inner).enumerate() {
         let rank = u32::try_from(index).context("more ranks than ids")?;
         if token.rank != rank {
@@ -410,18 +440,17 @@ fn vocabulary(file: File<'_>) -> Result<Vocabulary> {
                 token.rank
             );
         }
-        let bytes = STANDARD
-            .decode(token.token_bytes.as_bytes())
+        let start = ranks.bytes.len();
+        STANDARD
+            .decode_vec(token.token_bytes.as_bytes(), &mut ranks.bytes)
             .with_context(|| format!("token {index}: token_bytes is not base64"))?;
-        if u8::try_from(index).is_ok_and(|byte| bytes.as_slice() != [byte]) {
+        if u8::try_from(index).is_ok_and(|byte| ranks.bytes[start..] != [byte]) {
             bail!("token {index} is not the byte {index:#04x}");
         }
         let id = rank
             .checked_add(offset)
             .context("an id past the id range")?;
-        if ranks.insert(bytes, id).is_some() {
-            bail!("token {index} repeats an earlier token's bytes");
-        }
+        ranks.end_token(id)?;
     }
     let listed: Vec<SpecialToken> = match special_tokens {
         Some(listed) => listed,
@@ -868,6 +897,30 @@ mod tests {
         refused(
             testing::tekken_json(&testing::MERGES, Some(&[(0, "<unk>")]), 3, 300, "v13"),
             "the configuration needs 297",
+        );
+        refused(
+            testing::tekken_json(
+                &testing::MERGES,
+                Some(&[(0, "<unk>")]),
+                MAX_SPECIAL_TOKENS + 1,
+                MAX_SPECIAL_TOKENS + 261,
+                "v13",
+            ),
+            "default_num_special_tokens 65537 is above the bound of 65536",
+        );
+        // `hello` rewritten as `he`, a token the file lists already: the
+        // reader passes it; the load refuses it and names the file as the
+        // reader names it.
+        let dir = testing::dir_with(&minimal.replacen("aGVsbG8=", "aGU=", 1));
+        let path = dir.path().join(FILE_NAME);
+        let Err(error) = TiktokenTokenizer::from_tekken_file(&path) else {
+            panic!("a file that lists a token twice loaded");
+        };
+        let error = format!("{error:#}");
+        assert!(error.contains(&path.display().to_string()), "{error}");
+        assert!(
+            error.contains("repeats an earlier token's bytes"),
+            "{error}"
         );
         assert!(is_tekken_file(Path::new("/m/tekken.json")));
         assert!(is_tekken_file(Path::new("tekken_240911.json")));

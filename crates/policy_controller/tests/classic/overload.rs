@@ -3,44 +3,39 @@
 //! names for itself, and what the gateway's load monitor is handed, step by
 //! step: a poll's answer, a poll that brought no report, a record a rank
 //! pushed, the worker's loads dropped. No policy picks here. A row holds
-//! whether the gateway read the worker as overloaded after each step; its
-//! replay writes each step through the store's load sink, as this crate's
-//! driver writes it, and reads the verdict off the rows a decision is
-//! handed.
+//! whether the gateway read the worker as overloaded after each step.
 //!
-//! The store judges an engine by rules of its own, and [`APART`] names each
-//! recorded row they decide apart from the gateway, with the verdicts here.
+//! The replay hands each step to the worker crate's own load monitor, built
+//! as a host of the engine over worker lists builds it (the bed of the load
+//! sheets, [`Bed`]), and reads the verdict off the
+//! worker's object, where a decision reads it. A poll's answer goes through
+//! the monitor's one poll of a group, a pushed record through the record's
+//! own entry, and a worker's loads are dropped by the monitor's own loop
+//! when the worker's row leaves the ready set.
+//!
+//! Every row replays as recorded where the worker stands as one object for
+//! all its ranks, which is how the recording gateway held it. A row of
+//! several ranks is replayed a second time with one object for each rank,
+//! as a registration of several ranks lays them. There the monitor judges
+//! each object by its own rank's figures, and [`APART`] names each row that
+//! answers apart from the gateway, with the verdict on each rank's object.
 
-use std::{
-    cell::RefCell,
-    time::{Duration, Instant},
-};
+use std::time::Instant;
 
-use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse};
 use serde::Deserialize;
-use serde_json::Value;
-use smg_policy_controller::{
-    document::{AppliedSpec, BindingSpec, OverloadSpec, PolicySpec},
-    engine::{permille, LoadRow, Role, SignalSource, WorkerId},
-    store::{
-        GatewayId, LoadSink, LoadSource, MemoryStore, Overload, ViewBuffers, ViewQuery,
-        WorkerFacts, WorkerStatus, WorkersStore,
-    },
+use smg_policy_controller::store::Overload;
+use smg_worker::{
+    common_proto::EngineLoad,
+    health::overload::OverloadThresholds,
+    identity::{basic::Worker, builder::BasicWorkerBuilder},
+    worker::{SchedulerLoadSnapshot, WorkerLoadResponse},
 };
+
+use super::load_bed::{paused, Bed, Laid, ENGINE, STEP};
 
 /// What these rows record, as a sheet's head names it: the gateway's
 /// overload verdict of one worker.
 pub const POLICY: &str = "overload";
-
-const MODEL: &str = "m";
-
-/// The report period the replay tells the store, as this crate's driver
-/// tells its own, and the time between two steps of a row.
-const PERIOD: Duration = Duration::from_secs(10);
-
-/// The worker's engine: the key of a worker of one rank, and what the rows
-/// of a worker's ranks share.
-const ENGINE: &str = "http://w0:8000";
 
 /// A pair of thresholds as the gateway holds them: the queued requests
 /// summed over a worker's ranks and the mean KV usage over them, each at or
@@ -48,7 +43,7 @@ const ENGINE: &str = "http://w0:8000";
 #[derive(Clone, Copy, Debug, Deserialize)]
 struct Thresholds {
     waiting_requests: Option<u32>,
-    token_usage: Option<f32>,
+    token_usage: Option<f64>,
 }
 
 /// One rank's figures, in a poll's answer or a pushed record: its queued
@@ -102,318 +97,277 @@ struct Sheet {
     rows: Vec<Row>,
 }
 
-/// A recorded row this crate decides apart from the gateway, by a rule of
-/// its own that `rule` states: its replay must give `verdicts`, the verdict
-/// after each step here. The row fails the day it replays as recorded, so
-/// an entry cannot outlive its rule, and on any third outcome.
-struct Apart {
-    row: &'static str,
-    verdicts: &'static [bool],
-    rule: &'static str,
+/// A poll's answer as an engine sends it: one entry for each rank it names.
+fn answer(ranks: u16, figures: &[Option<Figures>]) -> WorkerLoadResponse {
+    WorkerLoadResponse {
+        dp_rank_count: i32::from(ranks),
+        loads: figures
+            .iter()
+            .enumerate()
+            .filter_map(|(at, figures)| {
+                figures.map(|figures| SchedulerLoadSnapshot {
+                    dp_rank: i32::try_from(at).expect("a rank fits the report's field"),
+                    num_waiting_reqs: i32::try_from(figures.waiting)
+                        .expect("a recorded count fits the report's field"),
+                    token_usage: figures.usage,
+                    active_token_usage: figures.active,
+                    ..SchedulerLoadSnapshot::default()
+                })
+            })
+            .collect(),
+        ..WorkerLoadResponse::default()
+    }
 }
 
-/// The rows decided apart. The store holds a usage and its threshold in
-/// permille and judges an engine, at every write, over every sample on
-/// file for it that lies within three report periods of the engine's
-/// newest. The gateway compares ratios, judges a poll by its answer alone
-/// and a pushed record by the worker's pushed report: the ranks that have
-/// pushed. A rank the gateway stops reading at once is read here for
-/// three periods more: a row that repeats the step that leaves a rank
-/// unheard replays as recorded from its fourth repeat on.
+/// A row's own thresholds as a worker's row states them: the usage in
+/// permille. `Err` where the row's usage is no whole permille, which a row
+/// cannot state.
+fn own(thresholds: Thresholds) -> Result<Overload, String> {
+    let kv_usage_permille = match thresholds.token_usage {
+        None => None,
+        Some(usage) => {
+            // The object reads the row's permille back as a ratio: the row
+            // states the sheet's usage where that ratio is the sheet's.
+            let permille = (usage * 1_000.0).round();
+            let stated = (0.0..=f64::from(u16::MAX)).contains(&permille)
+                && (permille / 1_000.0 - usage).abs() < f64::EPSILON;
+            if !stated {
+                return Err(format!("a usage of {usage} is no whole permille"));
+            }
+            Some(permille as u16)
+        }
+    };
+    Ok(Overload {
+        kv_usage_permille,
+        waiting_requests: thresholds.waiting_requests,
+    })
+}
+
+/// The row's worker among a host's objects, laid as `laid`: the holder
+/// states the gateway's thresholds for every worker, and each of the
+/// worker's rows states the worker's own. `Err` where the row states what a
+/// worker's row cannot.
+fn bed(row: &Row, laid: Laid) -> Result<Bed, String> {
+    let gateway = OverloadThresholds {
+        waiting_requests: row.gateway.waiting_requests.map(|waiting| waiting as usize),
+        token_usage: row.gateway.token_usage,
+    };
+    Bed::new(row.ranks, laid, gateway, own(row.worker)?)
+}
+
+/// What the host's load monitor says of the row's worker after each step:
+/// the verdict on each of the worker's objects. `Err` where the row states
+/// what a worker's row cannot.
+fn replay(row: &Row, laid: Laid) -> Result<Vec<Vec<bool>>, String> {
+    paused(async {
+        let bed = bed(row, laid)?;
+        bed.start().await;
+        let start = Instant::now();
+        let mut verdicts = Vec::with_capacity(row.steps.len());
+        for (at, step) in row.steps.iter().enumerate() {
+            let now = start + STEP * (at as u32 + 1);
+            match step {
+                Step::Poll(figures) => bed.poll(Some(answer(row.ranks, figures)), now).await,
+                Step::NoReport => bed.poll(None, now).await,
+                Step::Record { rank, figures } => {
+                    let pusher = bed.pusher(*rank).ok_or("a record of no rank's object")?;
+                    let record = EngineLoad {
+                        waiting_requests: figures.waiting,
+                        token_usage: figures.usage,
+                        active_token_usage: figures.active,
+                        ..EngineLoad::default()
+                    };
+                    bed.monitor()
+                        .apply_pushed_load(pusher, i32::from(*rank), &record, now);
+                }
+                Step::Evict => bed.evict().await?,
+            }
+            verdicts.push(bed.verdicts());
+        }
+        Ok(verdicts)
+    })
+}
+
+/// A recorded row of several ranks that a worker laid as one object a rank
+/// answers apart from the gateway: its replay under that layout must give
+/// `verdicts`, the verdict on each rank's object after each step. The row
+/// fails the day its rank objects all carry the recorded verdicts, so an
+/// entry cannot outlive the rule, and on any third outcome.
+struct Apart {
+    row: &'static str,
+    verdicts: &'static [&'static [bool]],
+}
+
+/// The one rule that holds the rows of [`APART`] apart. The gateway that
+/// recorded the sheet held one worker for all the ranks of an engine and
+/// judged it by the queue summed over its ranks and the usage averaged over
+/// them. The load monitor hands each object of an engine the answer of its
+/// own rank and judges the object by it.
+const RANK_RULE: &str = "a rank's object is judged by its own rank's figures, not by the queue \
+                         summed and the usage averaged over the engine's ranks";
+
+/// The rows a worker of one object a rank answers apart.
 const APART: &[Apart] = &[
     Apart {
-        row: "a-usage-under-the-threshold-by-less-than-half-a-permille-is-under-it",
-        verdicts: &[true, false],
-        rule: "a usage within half a permille under the threshold rounds to it",
+        row: "the-queue-vetoes-at-its-count-and-above-summed-over-two-ranks",
+        verdicts: &[
+            &[false, false],
+            &[false, false],
+            &[true, false],
+            &[false, false],
+        ],
+    },
+    Apart {
+        row: "the-usage-vetoes-at-its-mean-and-above-over-two-ranks",
+        verdicts: &[
+            &[false, true],
+            &[false, true],
+            &[true, true],
+            &[true, false],
+            &[false, true],
+        ],
+    },
+    Apart {
+        row: "two-ranks-that-trade-their-usage-in-one-answer-move-no-verdict",
+        verdicts: &[&[true, false], &[false, true], &[true, false]],
+    },
+    Apart {
+        row: "an-answer-that-names-no-rank-reads-as-no-report",
+        verdicts: &[&[true, false], &[false, false], &[true, false]],
+    },
+    Apart {
+        row: "a-pushed-record-moves-the-verdict-by-its-own-rank",
+        verdicts: &[
+            &[false, false],
+            &[false, false],
+            &[false, false],
+            &[true, false],
+            &[false, false],
+        ],
+    },
+    Apart {
+        row: "a-record-after-a-poll-is-judged-beside-the-poll-s-figures-once-every-rank-has-pushed",
+        verdicts: &[
+            &[false, false],
+            &[false, false],
+            &[false, false],
+            &[false, false],
+            &[false, false],
+        ],
+    },
+    Apart {
+        row: "a-poll-after-a-record-is-judged-by-the-poll-s-own-figures",
+        verdicts: &[&[true, false], &[false, false], &[false, false]],
     },
     Apart {
         row: "a-rank-an-answer-omits-leaves-the-sum-at-once",
-        verdicts: &[true, true, true, true, false, false],
-        rule: "a rank an answer omits keeps its sample three report periods behind its engine's newest",
+        verdicts: &[
+            &[false, true],
+            &[false, false],
+            &[false, false],
+            &[false, false],
+            &[false, false],
+            &[false, false],
+        ],
     },
     Apart {
         row: "a-rank-an-answer-omits-leaves-the-mean-at-once",
-        verdicts: &[false, false, false, false, true, true],
-        rule: "a rank an answer omits keeps its sample three report periods behind its engine's newest",
-    },
-    Apart {
-        row: "a-record-after-a-poll-is-judged-over-the-ranks-that-have-pushed",
-        verdicts: &[false, true, true, true, false, false, false],
-        rule: "a record is judged beside a poll's row of another rank until that row lies three report periods behind",
+        verdicts: &[
+            &[true, false],
+            &[true, false],
+            &[true, false],
+            &[true, false],
+            &[true, false],
+            &[true, false],
+        ],
     },
     Apart {
         row: "a-record-s-usage-is-judged-over-the-ranks-that-have-pushed",
-        verdicts: &[false, false, false, false, true, true, true],
-        rule: "a record is judged beside a poll's row of another rank until that row lies three report periods behind",
+        verdicts: &[
+            &[false, false],
+            &[true, false],
+            &[true, false],
+            &[true, false],
+            &[true, false],
+            &[true, false],
+            &[true, true],
+        ],
     },
     Apart {
         row: "an-answer-that-names-no-rank-takes-the-ranks-that-pushed-before-it-off-the-report",
-        verdicts: &[false, true, false, true, true, false, false, false, true],
-        rule: "an answer with no row changes nothing on file: a rank it names keeps its sample three report periods",
+        verdicts: &[
+            &[false, false],
+            &[false, false],
+            &[false, false],
+            &[false, false],
+            &[false, false],
+            &[false, false],
+            &[false, false],
+            &[false, false],
+            &[false, false],
+        ],
     },
 ];
 
-/// The generation whose one binding holds the gateway's thresholds: both
-/// signals, or the block switched off when the gateway holds neither. The
-/// document's block has no spelling for one signal alone, and no recorded
-/// row asks for it; the validator's words otherwise.
-fn generation(gateway: Thresholds) -> Result<AppliedSpec, String> {
-    let overload = match (gateway.waiting_requests, gateway.token_usage) {
-        (Some(waiting), Some(usage)) => OverloadSpec {
-            waiting_requests: Some(waiting),
-            token_usage: Some(usage),
-            ..OverloadSpec::default()
-        },
-        (None, None) => OverloadSpec {
-            enabled: false,
-            ..OverloadSpec::default()
-        },
-        _ => return Err("an overload block holds both signals or is switched off".to_string()),
-    };
-    let mut document = PolicySpec::preset("round_robin").expect("a preset of this build");
-    document.generation = 1;
-    let profile = document
-        .profiles
-        .keys()
-        .next()
-        .expect("the preset's profile")
-        .clone();
-    document.bindings = vec![BindingSpec {
-        profile: Some(profile),
-        overload: Some(overload),
-        ..BindingSpec::default()
-    }];
-    AppliedSpec::validate(&document).map_err(|err| err.to_string())
+/// `None` when the worker's one object carries the recorded verdict after
+/// each step; the reason otherwise.
+fn held_whole(row: &Row, here: &[Vec<bool>]) -> Option<String> {
+    let here: Vec<&[bool]> = here.iter().map(Vec::as_slice).collect();
+    let recorded: Vec<[bool; 1]> = row.outcome.verdicts.iter().map(|&v| [v]).collect();
+    let recorded: Vec<&[bool]> = recorded.iter().map(<[bool; 1]>::as_slice).collect();
+    (here != recorded).then(|| {
+        format!(
+            "recorded {:?}, replayed {here:?} on the worker's one object",
+            row.outcome.verdicts
+        )
+    })
 }
 
-/// One rank's figures as the row a host writes for the rank: through the
-/// crate's own row builder, from the report of that rank alone, read at the
-/// instant it was sampled.
-fn load_row(figures: Figures, at: Instant, source: SignalSource) -> LoadRow {
-    let wire = WorkerLoadResponse {
-        dp_rank_count: 1,
-        loads: vec![SchedulerLoadSnapshot {
-            num_waiting_reqs: i32::try_from(figures.waiting)
-                .expect("a recorded count fits the wire's field"),
-            token_usage: figures.usage,
-            active_token_usage: figures.active,
-            ..SchedulerLoadSnapshot::default()
-        }],
-        ..WorkerLoadResponse::default()
-    };
-    smg_policy_controller::load::load_row(&wire, Role::Single, at, at, source)
-}
-
-/// The store with the row's worker in it: a member row a rank, the ranks
-/// of one engine, each with the worker's own thresholds, under a generation
-/// whose one binding holds the gateway's.
-struct Bed {
-    store: MemoryStore,
-    /// The member row of each rank, by rank.
-    ids: Vec<WorkerId>,
-    /// The ranks the engine's last answer left out beside a rank it named,
-    /// by rank: the ranks the store marks, kept here by the same rule.
-    left_out: RefCell<Vec<bool>>,
-}
-
-impl Bed {
-    /// The bed, or the validator's words when this crate does not build the
-    /// row's form.
-    fn new(row: &Row) -> Result<Self, String> {
-        let applied = generation(row.gateway)?;
-        let store = MemoryStore::new();
-        let own = Overload {
-            waiting_requests: row.worker.waiting_requests,
-            // The one rounding a report's ratio takes.
-            kv_usage_permille: row
-                .worker
-                .token_usage
-                .map(|usage| permille(f64::from(usage))),
-        };
-        let ids = (0..row.ranks)
-            .map(|rank| {
-                let key = if row.ranks == 1 {
-                    ENGINE.to_string()
-                } else {
-                    format!("{ENGINE}@{rank}")
-                };
-                let id = store
-                    .upsert(WorkerFacts {
-                        key,
-                        engine: ENGINE.to_string(),
-                        incarnation: 1,
-                        models: vec![MODEL.to_string()],
-                        dp_rank: rank,
-                        dp_size: row.ranks,
-                        overload: own,
-                        ..WorkerFacts::default()
-                    })
-                    .id();
-                let revision = WorkersStore::get(&store, id).expect("the row").revision;
-                store
-                    .set_status(id, WorkerStatus::Ready, revision)
-                    .expect("ready");
-                id
-            })
-            .collect();
-        store.apply(applied).expect("the first generation applies");
-        // The driver tells its poll interval where it is built.
-        assert!(store.heard_every(PERIOD), "the first period told");
-        Ok(Self {
-            store,
-            ids,
-            left_out: RefCell::new(vec![false; usize::from(row.ranks)]),
-        })
-    }
-
-    /// One step written through the load sink at `now`, each as the crate's
-    /// driver writes it, and what waits shown: an engine's answer whole in
-    /// one report, a poll that brought no report as an answer with no row,
-    /// a record under its rank's own id, and the eviction rank by rank.
-    fn step(&self, step: &Step, now: Instant) {
-        let ranks = self.ids.iter().copied().zip(0u16..);
-        match step {
-            Step::Poll(figures) => {
-                assert_eq!(figures.len(), self.ids.len(), "an entry a rank");
-                // An answer that names a rank leaves out each rank it has
-                // no row for. One that names none says nothing of any.
-                if figures.iter().any(Option::is_some) {
-                    *self.left_out.borrow_mut() = figures.iter().map(Option::is_none).collect();
-                }
-                let answer: Vec<_> = ranks
-                    .zip(figures)
-                    .map(|((id, rank), figures)| {
-                        let row = figures.map(|figures| load_row(figures, now, SignalSource::Poll));
-                        (id, rank, row)
-                    })
-                    .collect();
-                self.store.report(&answer, now, LoadSource::Poll);
-            }
-            Step::NoReport => {
-                let answer: Vec<_> = ranks.map(|(id, rank)| (id, rank, None)).collect();
-                self.store.report(&answer, now, LoadSource::Poll);
-            }
-            Step::Record { rank, figures } => {
-                let id = *self
-                    .ids
-                    .get(usize::from(*rank))
-                    .expect("a rank of the worker");
-                let row = load_row(*figures, now, SignalSource::Events);
-                self.store.record(id, *rank, row, now, LoadSource::Stream);
-                // A record names its rank again.
-                if let Some(out) = self.left_out.borrow_mut().get_mut(usize::from(*rank)) {
-                    *out = false;
-                }
-            }
-            Step::Evict => {
-                for (id, _) in ranks {
-                    self.store.evict(id);
-                }
-                self.left_out.borrow_mut().fill(false);
-            }
-        }
-        if let Some(due) = self.store.publish_due() {
-            self.store.publish(due);
-        }
-    }
-
-    /// Whether the worker reads as overloaded to a decision at `now`: the
-    /// verdict of its rank rows as [`one_verdict`] takes it, each with whether the
-    /// engine's last answer left the rank out.
-    fn verdict(&self, now: Instant) -> Option<bool> {
-        let mut out = ViewBuffers::default();
-        let ask = ViewQuery {
-            gateway: GatewayId(1),
-            now,
-            pinned: None,
-            affinity: false,
-            signal_cells: false,
-        };
-        self.store
-            .build_view(MODEL, Role::Single, &ask, &mut out)
-            .expect("the pool");
-        let left_out = self.left_out.borrow();
-        one_verdict(out.candidates.iter().map(|row| {
-            let rank = self.ids.iter().position(|&id| id == row.id);
-            let left_out = rank.and_then(|rank| left_out.get(rank).copied());
-            (left_out.unwrap_or(false), row.health.overloaded)
-        }))
-    }
-}
-
-/// A worker's verdict off its rank rows, each as whether the engine's last
-/// answer left the rank out and whether the row carries the overload bit:
-/// the bit the named ranks' rows share. A rank left out carries the bit
-/// alone: that is the store's avoidance of the rank and no verdict of the
-/// engine. `None` where the named ranks' rows carry two verdicts, where a
-/// rank left out carries no bit, and where no rank is named.
-fn one_verdict(rows: impl IntoIterator<Item = (bool, bool)>) -> Option<bool> {
-    let mut named = None;
-    for (left_out, bit) in rows {
-        if left_out {
-            if !bit {
-                return None;
-            }
-        } else if *named.get_or_insert(bit) != bit {
-            return None;
-        }
-    }
-    named
-}
-
-#[test]
-fn a_verdict_is_the_named_ranks_own_and_a_rank_left_out_carries_the_bit() {
-    assert_eq!(one_verdict([(false, true), (false, true)]), Some(true));
-    assert_eq!(one_verdict([(false, false), (true, true)]), Some(false));
-    assert_eq!(
-        one_verdict([(false, true), (false, false)]),
-        None,
-        "two verdicts"
-    );
-    assert_eq!(one_verdict([(false, false), (true, false)]), None, "no bit");
-    assert_eq!(one_verdict([(true, true)]), None, "no rank named");
-    assert_eq!(one_verdict([]), None, "no row");
-}
-
-/// This crate's verdict after each step of the row, or why the row has
-/// none: the validator's words for a form this crate does not build, or
-/// the step after which the rank rows gave no one verdict ([`one_verdict`]).
-fn replay(row: &Row) -> Result<Vec<bool>, String> {
-    let bed = Bed::new(row)?;
-    let start = Instant::now();
-    row.steps
-        .iter()
-        .enumerate()
-        .map(|(at, step)| {
-            // A step a report period: the recorder repeats the step that
-            // leaves a rank unheard answer after answer, and no record is
-            // newer than the poll after it.
-            let now = start + PERIOD * (at as u32 + 1);
-            bed.step(step, now);
-            bed.verdict(now)
-                .ok_or_else(|| format!("after step {at} the rank rows give no one verdict"))
-        })
-        .collect()
-}
-
-/// `None` when a row's verdicts here are the recorded ones, or its entry's
-/// when [`APART`] names the row; the reason otherwise. A row decided apart
-/// that replays as recorded is a defect of its entry, whose rule decides
-/// nothing of it.
-fn held(name: &str, recorded: &[bool], here: &[bool]) -> Option<String> {
-    match APART.iter().find(|apart| apart.row == name) {
-        None => (here != recorded).then(|| format!("recorded {recorded:?}, replayed {here:?}")),
-        Some(apart) if here == recorded => Some(format!(
-            "it replays as recorded now ({}): take the row out of APART",
-            apart.rule
+/// `None` when every rank's object carries the recorded verdict after each
+/// step, or the verdicts its entry holds when [`APART`] names the row; the
+/// reason otherwise. A row held apart whose rank objects all carry the
+/// recorded verdicts is a defect of its entry.
+fn held_ranks(row: &Row, here: &[Vec<bool>]) -> Option<String> {
+    let recorded = &row.outcome.verdicts;
+    let as_recorded = here.len() == recorded.len()
+        && here
+            .iter()
+            .zip(recorded)
+            .all(|(objects, verdict)| objects.iter().all(|object| object == verdict));
+    match APART.iter().find(|apart| apart.row == row.name) {
+        None => (!as_recorded)
+            .then(|| format!("recorded {recorded:?}, replayed {here:?} on an object a rank")),
+        Some(_) if as_recorded => Some(format!(
+            "an object a rank replays as recorded now ({RANK_RULE}): take the row out of APART"
         )),
-        Some(apart) => (here != apart.verdicts).then(|| {
-            format!(
-                "recorded {recorded:?}, apart by its entry {:?}, replayed {here:?}",
-                apart.verdicts
-            )
-        }),
+        Some(apart) => {
+            let held: Vec<Vec<bool>> = apart.verdicts.iter().map(|step| step.to_vec()).collect();
+            (here != held).then(|| {
+                format!(
+                    "recorded {recorded:?}, apart by its entry {:?}, replayed {here:?} on an \
+                     object a rank",
+                    apart.verdicts
+                )
+            })
+        }
     }
+}
+
+/// What a row's replay leaves unheld: under the worker as one object, and
+/// for a worker of several ranks under one object a rank too.
+fn defects_of(row: &Row) -> Vec<String> {
+    let mut defects = Vec::new();
+    match replay(row, Laid::Whole) {
+        Ok(here) => defects.extend(held_whole(row, &here)),
+        Err(why) => defects.push(format!("refused here: {why}")),
+    }
+    if row.ranks > 1 {
+        match replay(row, Laid::Ranks) {
+            Ok(here) => defects.extend(held_ranks(row, &here)),
+            Err(why) => defects.push(format!("refused here on an object a rank: {why}")),
+        }
+    }
+    defects
 }
 
 /// The rows of a sheet replayed: how many, and what did not replay.
@@ -430,120 +384,192 @@ pub fn replay_rows(text: &str, source: &str) -> (usize, Vec<String>) {
     let defects = sheet
         .rows
         .iter()
-        .filter_map(|row| {
-            let why = match replay(row) {
-                Ok(here) => held(&row.name, &row.outcome.verdicts, &here),
-                Err(why) => Some(format!("refused here: {why}")),
-            };
-            why.map(|why| format!("{source}: {}: {why}", row.name))
+        .flat_map(|row| {
+            defects_of(row)
+                .into_iter()
+                .map(move |why| format!("{source}: {}: {why}", row.name))
         })
         .collect();
     (sheet.rows.len(), defects)
 }
 
-/// What separates the rows copied into this module from the sheet they were
-/// copied from: a copied row the sheet does not hold, or one that is not
-/// the sheet's row of its name, whole. Nothing in an overload row is drawn,
-/// so nothing may differ.
-pub fn copied_row_defects(inline: &str, sheet: &str, source: &str) -> Vec<String> {
-    let rows = |text: &str, source: &str| {
-        let rows = serde_json::from_str::<Value>(text)
-            .ok()
-            .and_then(|mut sheet| sheet.get_mut("rows").map(Value::take));
-        match rows {
-            Some(Value::Array(rows)) => Ok(rows),
-            _ => Err(format!("{source} is not a sheet of rows")),
-        }
-    };
-    let (copied, held) = match (rows(inline, "the inline rows"), rows(sheet, source)) {
-        (Ok(copied), Ok(held)) => (copied, held),
-        (Err(why), _) | (_, Err(why)) => return vec![why],
-    };
-    copied
-        .iter()
-        .filter_map(|row| {
-            let name = row.get("name").and_then(Value::as_str).unwrap_or("?");
-            let Some(sheet_row) = held.iter().find(|held| held.get("name") == row.get("name"))
-            else {
-                return Some(format!("{source}: the inline row {name} is on no sheet"));
-            };
-            (sheet_row != row)
-                .then(|| format!("{source}: the inline row {name} is not the sheet's row"))
-        })
-        .collect()
-}
-
-/// Every row decided apart is an inline row, so every run of the suite
-/// checks that its rule still decides it, and how. An entry passes on the
-/// verdicts it holds alone: the recorded ones say its rule decides nothing
-/// of the row, and any other outcome is a defect.
+/// Every row held apart is an inline row, so every run of the suite checks
+/// that the rule still decides it, and how: as recorded on the worker's one
+/// object, and by its entry on an object a rank.
 #[test]
-fn every_row_decided_apart_is_an_inline_row_held_to_its_entry() {
+fn every_row_held_apart_is_an_inline_row_held_to_its_entry() {
     let sheet: Sheet = serde_json::from_str(INLINE).expect("the inline rows");
+    assert_eq!(sheet.rows.len(), APART.len());
     for apart in APART {
-        let row = sheet.rows.iter().find(|row| row.name == apart.row);
-        let recorded = row
-            .expect("every row decided apart is an inline row")
-            .outcome
-            .verdicts
-            .as_slice();
-        assert_ne!(recorded, apart.verdicts, "{}", apart.row);
-        assert_eq!(held(apart.row, recorded, apart.verdicts), None);
-        let as_recorded = held(apart.row, recorded, recorded);
-        assert!(
-            as_recorded.is_some_and(|why| why.contains("take the row out of APART")),
-            "{}",
-            apart.row
-        );
-        let third = held(apart.row, recorded, &[]);
-        assert!(
-            third.is_some_and(|why| why.contains("apart by its entry")),
-            "{}",
-            apart.row
-        );
+        let row = sheet
+            .rows
+            .iter()
+            .find(|row| row.name == apart.row)
+            .unwrap_or_else(|| panic!("{} is no inline row", apart.row));
+        assert!(row.ranks > 1, "{}: one rank is one object", apart.row);
+        let whole = replay(row, Laid::Whole).expect("the worker as one object");
+        assert_eq!(held_whole(row, &whole), None, "{}", apart.row);
+        let ranks = replay(row, Laid::Ranks).expect("an object a rank");
+        assert_eq!(held_ranks(row, &ranks), None, "{}", apart.row);
+        let held: Vec<Vec<bool>> = apart.verdicts.iter().map(|step| step.to_vec()).collect();
+        assert_eq!(ranks, held, "{}", apart.row);
     }
 }
 
-/// A copied row is its sheet's row whole: the copy against itself is no
-/// defect, and a row the sheet lacks, another threshold and another verdict
-/// are one defect each.
+/// An entry cannot outlive the rule: rank objects that all carry a row's
+/// recorded verdicts are a defect of the row's entry. An answer that is
+/// neither the recorded one nor the entry's is a defect as well.
 #[test]
-fn a_copied_overload_row_is_its_sheets_row_whole() {
-    assert_eq!(
-        copied_row_defects(INLINE, INLINE, "sheet"),
-        Vec::<String>::new()
-    );
-    let defect_of = |change: &dyn Fn(&mut Vec<Value>)| {
-        let mut sheet: Value = serde_json::from_str(INLINE).expect("the inline sheet");
-        change(
-            sheet
-                .get_mut("rows")
-                .and_then(Value::as_array_mut)
-                .expect("its rows"),
-        );
-        let mut defects = copied_row_defects(INLINE, &sheet.to_string(), "sheet");
-        assert_eq!(defects.len(), 1, "{defects:#?}");
-        defects.remove(0)
-    };
-    assert!(defect_of(&|rows| drop(rows.remove(0))).contains("is on no sheet"));
-    assert!(defect_of(&|rows| {
-        let threshold = rows
-            .first_mut()
-            .and_then(|row| row.pointer_mut("/gateway/waiting_requests"));
-        *threshold.expect("the first row's threshold") = Value::from(9);
-    })
-    .contains("is not the sheet's row"));
-    assert!(defect_of(&|rows| {
-        let verdict = rows
-            .first_mut()
-            .and_then(|row| row.pointer_mut("/outcome/verdicts/0"));
-        *verdict.expect("the first row's first verdict") = Value::from(true);
-    })
-    .contains("is not the sheet's row"));
+fn an_entry_fails_on_the_recorded_verdicts_and_on_a_third_answer() {
+    let sheet: Sheet = serde_json::from_str(INLINE).expect("the inline rows");
+    for row in &sheet.rows {
+        let width = usize::from(row.ranks);
+        let recorded: Vec<Vec<bool>> = row
+            .outcome
+            .verdicts
+            .iter()
+            .map(|&verdict| vec![verdict; width])
+            .collect();
+        let outlived = held_ranks(row, &recorded).expect("an entry that outlived the rule");
+        assert!(outlived.contains("take the row out of APART"), "{outlived}");
+        // The entry's own verdicts less their first step: neither answer.
+        let entry = APART
+            .iter()
+            .find(|apart| apart.row == row.name)
+            .expect("the row's entry");
+        let third: Vec<Vec<bool>> = entry
+            .verdicts
+            .iter()
+            .skip(1)
+            .map(|step| step.to_vec())
+            .collect();
+        let neither = held_ranks(row, &third).expect("a third answer");
+        assert!(neither.contains("apart by its entry"), "{neither}");
+    }
 }
 
-/// Rows copied from the recorded sheet: each kind of step, and every row
-/// this crate decides apart.
+/// A row no entry names is held to what was recorded on every rank's
+/// object: a row held apart, replayed under a name no entry holds, is a
+/// defect there and none on the worker's one object.
+#[test]
+fn a_row_no_entry_names_is_held_to_what_was_recorded_on_every_rank() {
+    let mut sheet: serde_json::Value = serde_json::from_str(INLINE).expect("the inline rows");
+    let row = &mut sheet["rows"][0];
+    row["name"] = serde_json::Value::from("a-row-no-entry-names");
+    let row: Row = serde_json::from_value(row.take()).expect("a row");
+    let defects = defects_of(&row);
+    assert!(
+        matches!(defects.as_slice(), [one] if one.contains("on an object a rank")),
+        "{defects:#?}"
+    );
+}
+
+/// The sheet by the layouts that answer it: every row as recorded where the
+/// worker is one object, and of its fourteen rows of several ranks eleven
+/// apart where each rank is an object.
+/// The other three answer as recorded on every rank's object.
+#[test]
+fn the_sheet_replays_whole_and_eleven_of_its_rank_rows_stand_apart() {
+    let sheet: Sheet =
+        serde_json::from_str(include_str!("sheets/overload.json")).expect("the sheet");
+    assert_eq!(sheet.rows.len(), 25);
+    let mut several = 0;
+    let mut as_recorded = 0;
+    for row in &sheet.rows {
+        let whole = replay(row, Laid::Whole).expect("the worker as one object");
+        assert_eq!(held_whole(row, &whole), None, "{}", row.name);
+        if row.ranks > 1 {
+            several += 1;
+            let ranks = replay(row, Laid::Ranks).expect("an object a rank");
+            assert_eq!(held_ranks(row, &ranks), None, "{}", row.name);
+            as_recorded += usize::from(APART.iter().all(|apart| apart.row != row.name));
+        }
+    }
+    assert_eq!((several, APART.len(), as_recorded), (14, 11, 3));
+    for apart in APART {
+        let named = sheet.rows.iter().any(|row| row.name == apart.row);
+        assert!(named, "{} is on no sheet", apart.row);
+    }
+}
+
+/// An object the holder lays for a rank's row states what the worker
+/// crate's own builder states for a rank worker: the rank's address, the
+/// engine's address under it, the rank and the width. A gateway that
+/// registers each rank of an engine as a worker of its own builds them so.
+/// The worker as one object states the width and no rank.
+#[test]
+fn a_rank_object_states_what_a_rank_worker_of_the_builder_states() {
+    let sheet: Sheet = serde_json::from_str(INLINE).expect("the inline rows");
+    let row = sheet.rows.first().expect("an inline row");
+    let width = usize::from(row.ranks);
+    let ranks = bed(row, Laid::Ranks).expect("the rank objects");
+    assert_eq!(ranks.workers().len(), width);
+    for (rank, object) in ranks.workers().iter().enumerate() {
+        let built = <BasicWorkerBuilder>::new(ENGINE)
+            .dp_config(rank, width)
+            .build();
+        assert_eq!(object.url(), built.url());
+        assert_eq!(object.base_url(), built.base_url());
+        assert_eq!(object.dp_rank(), built.dp_rank());
+        assert_eq!(object.dp_size(), built.dp_size());
+        assert_eq!(object.is_dp_aware(), built.is_dp_aware());
+    }
+    let whole = bed(row, Laid::Whole).expect("the one object");
+    let [object] = whole.workers() else {
+        panic!("{} objects of a worker laid whole", whole.workers().len());
+    };
+    assert_eq!(
+        (object.url(), object.dp_rank(), object.dp_size()),
+        (ENGINE, None, Some(width))
+    );
+}
+
+/// A row whose own usage is no whole permille is refused: a worker's row
+/// states its usage in permille.
+#[test]
+fn a_usage_of_no_whole_permille_is_refused() {
+    let both = |token_usage| Thresholds {
+        waiting_requests: Some(2),
+        token_usage,
+    };
+    assert_eq!(
+        own(both(Some(0.5))).map(|own| (own.kv_usage_permille, own.waiting_requests)),
+        Ok((Some(500), Some(2)))
+    );
+    assert_eq!(own(both(None)).map(|own| own.kv_usage_permille), Ok(None));
+    assert!(own(both(Some(0.5005))).is_err());
+}
+
+/// A pushed record of a rank the worker has no object for is refused where
+/// each rank is an object: the replay hands it to no other rank's object.
+#[test]
+fn a_record_of_a_rank_the_worker_lacks_is_refused_on_an_object_a_rank() {
+    let mut sheet: serde_json::Value = serde_json::from_str(INLINE).expect("the inline rows");
+    let pushes = |row: &serde_json::Value| {
+        let steps = row["steps"].as_array();
+        steps.is_some_and(|steps| steps.iter().any(|step| step.get("record").is_some()))
+    };
+    let rows = sheet["rows"].as_array_mut().expect("the rows");
+    let row = rows
+        .iter_mut()
+        .find(|row| pushes(row))
+        .expect("a row that pushes");
+    let width = row["ranks"].clone();
+    for step in row["steps"].as_array_mut().expect("its steps") {
+        if let Some(record) = step.get_mut("record") {
+            record["rank"] = width.clone();
+        }
+    }
+    let row: Row = serde_json::from_value(row.take()).expect("a row");
+    assert_eq!(
+        replay(&row, Laid::Ranks),
+        Err("a record of no rank's object".to_string())
+    );
+    assert!(replay(&row, Laid::Whole).is_ok());
+}
+
+/// The rows a worker of one object a rank answers apart, copied whole from
+/// the sheet: every run of the suite replays them.
 pub const INLINE: &str = r#"{
   "recorded_from": "436f0c8c5725b0a408b990003d76eaddc72c4be4",
   "policy": "overload",
@@ -576,43 +602,28 @@ pub const INLINE: &str = r#"{
       "outcome": {"verdicts": [false, true, true, true, false]}
     },
     {
-      "name": "two-ranks-that-trade-their-queues-in-one-answer-move-no-verdict",
-      "gateway": {"waiting_requests": 8, "token_usage": 0.8},
+      "name": "two-ranks-that-trade-their-usage-in-one-answer-move-no-verdict",
+      "gateway": {"waiting_requests": 8, "token_usage": 0.5},
       "worker": {"waiting_requests": null, "token_usage": null},
       "ranks": 2,
       "steps": [
-        {"poll": [{"waiting": 6, "usage": 0.125}, {"waiting": 1, "usage": 0.125}]},
-        {"poll": [{"waiting": 1, "usage": 0.125}, {"waiting": 6, "usage": 0.125}]},
-        {"poll": [{"waiting": 6, "usage": 0.125}, {"waiting": 1, "usage": 0.125}]}
+        {"poll": [{"waiting": 0, "usage": 0.75}, {"waiting": 0, "usage": 0.125}]},
+        {"poll": [{"waiting": 0, "usage": 0.125}, {"waiting": 0, "usage": 0.75}]},
+        {"poll": [{"waiting": 0, "usage": 0.75}, {"waiting": 0, "usage": 0.125}]}
       ],
       "outcome": {"verdicts": [false, false, false]}
     },
     {
-      "name": "a-poll-that-brought-no-report-clears-the-veto",
+      "name": "an-answer-that-names-no-rank-reads-as-no-report",
       "gateway": {"waiting_requests": 8, "token_usage": 0.8},
       "worker": {"waiting_requests": null, "token_usage": null},
-      "ranks": 1,
+      "ranks": 2,
       "steps": [
-        {"poll": [{"waiting": 9, "usage": 0.125}]},
-        "no_report",
-        "no_report",
-        {"poll": [{"waiting": 9, "usage": 0.125}]},
-        {"poll": [{"waiting": 1, "usage": 0.125}]}
+        {"poll": [{"waiting": 9, "usage": 0.125}, {"waiting": 0, "usage": 0.125}]},
+        {"poll": [null, null]},
+        {"poll": [{"waiting": 9, "usage": 0.125}, {"waiting": 0, "usage": 0.125}]}
       ],
-      "outcome": {"verdicts": [true, false, false, true, false]}
-    },
-    {
-      "name": "a-worker-s-own-count-stands-over-the-gateway-s-and-the-usage-stays-the-gateway-s",
-      "gateway": {"waiting_requests": 8, "token_usage": 0.5},
-      "worker": {"waiting_requests": 3, "token_usage": null},
-      "ranks": 1,
-      "steps": [
-        {"poll": [{"waiting": 2, "usage": 0.0}]},
-        {"poll": [{"waiting": 3, "usage": 0.0}]},
-        {"poll": [{"waiting": 0, "usage": 0.25}]},
-        {"poll": [{"waiting": 0, "usage": 0.5}]}
-      ],
-      "outcome": {"verdicts": [false, true, false, true]}
+      "outcome": {"verdicts": [true, false, true]}
     },
     {
       "name": "a-pushed-record-moves-the-verdict-by-its-own-rank",
@@ -643,27 +654,16 @@ pub const INLINE: &str = r#"{
       "outcome": {"verdicts": [false, false, false, true, false]}
     },
     {
-      "name": "the-worker-s-loads-dropped-clears-the-veto",
+      "name": "a-poll-after-a-record-is-judged-by-the-poll-s-own-figures",
       "gateway": {"waiting_requests": 8, "token_usage": 0.8},
       "worker": {"waiting_requests": null, "token_usage": null},
-      "ranks": 1,
+      "ranks": 2,
       "steps": [
-        {"poll": [{"waiting": 9, "usage": 0.125}]},
-        "evict",
-        {"poll": [{"waiting": 9, "usage": 0.125}]}
+        {"record": {"rank": 0, "figures": {"waiting": 9, "usage": 0.125}}},
+        {"poll": [{"waiting": 1, "usage": 0.125}, {"waiting": 1, "usage": 0.125}]},
+        {"poll": [{"waiting": 4, "usage": 0.125}, {"waiting": 4, "usage": 0.125}]}
       ],
       "outcome": {"verdicts": [true, false, true]}
-    },
-    {
-      "name": "a-usage-under-the-threshold-by-less-than-half-a-permille-is-under-it",
-      "gateway": {"waiting_requests": 8, "token_usage": 0.5},
-      "worker": {"waiting_requests": null, "token_usage": null},
-      "ranks": 1,
-      "steps": [
-        {"poll": [{"waiting": 0, "usage": 0.4996}]},
-        {"poll": [{"waiting": 0, "usage": 0.4994}]}
-      ],
-      "outcome": {"verdicts": [false, false]}
     },
     {
       "name": "a-rank-an-answer-omits-leaves-the-sum-at-once",
@@ -694,22 +694,6 @@ pub const INLINE: &str = r#"{
         {"poll": [{"waiting": 0, "usage": 0.75}, null]}
       ],
       "outcome": {"verdicts": [false, true, true, true, true, true]}
-    },
-    {
-      "name": "a-record-after-a-poll-is-judged-over-the-ranks-that-have-pushed",
-      "gateway": {"waiting_requests": 8, "token_usage": 0.8},
-      "worker": {"waiting_requests": null, "token_usage": null},
-      "ranks": 2,
-      "steps": [
-        {"poll": [{"waiting": 4, "usage": 0.125}, {"waiting": 3, "usage": 0.125}]},
-        {"record": {"rank": 0, "figures": {"waiting": 5, "usage": 0.125}}},
-        {"record": {"rank": 0, "figures": {"waiting": 5, "usage": 0.125}}},
-        {"record": {"rank": 0, "figures": {"waiting": 5, "usage": 0.125}}},
-        {"record": {"rank": 0, "figures": {"waiting": 5, "usage": 0.125}}},
-        {"record": {"rank": 0, "figures": {"waiting": 5, "usage": 0.125}}},
-        {"record": {"rank": 1, "figures": {"waiting": 0, "usage": 0.125}}}
-      ],
-      "outcome": {"verdicts": [false, false, false, false, false, false, false]}
     },
     {
       "name": "a-record-s-usage-is-judged-over-the-ranks-that-have-pushed",
@@ -746,4 +730,5 @@ pub const INLINE: &str = r#"{
       "outcome": {"verdicts": [false, true, false, false, false, false, false, false, true]}
     }
   ]
-}"#;
+}
+"#;

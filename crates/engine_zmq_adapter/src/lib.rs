@@ -33,6 +33,7 @@ mod pin_yield;
 mod sglang;
 pub mod sglang_encode;
 mod sglang_mm_hash;
+mod sglang_v41_items;
 mod sockets;
 pub mod stops;
 mod stream;

@@ -17,7 +17,7 @@ use crate::{
     policies::standard_filters,
     stages::{
         lifecycle::Lifecycle,
-        pickers::{pool_turns, push_drawn, target_of},
+        pickers::{push_drawn, target_of},
     },
     Draw,
 };
@@ -30,6 +30,7 @@ pub(crate) fn profile() -> ProfileSpec {
         score: vec![],
         pick: "round-robin".into(),
         sent_ttl_ms: None,
+        sent_report_delay_ms: None,
     }
 }
 
@@ -147,8 +148,9 @@ impl RoundRobin {
     }
 
     /// The key of a pool's own rotation, the one a decision that draws
-    /// first turns: the model the pool serves and the request's phase, the
-    /// pool's membership epoch, the list the host names
+    /// first turns where its host lends no word of the pool
+    /// ([`PoolFacts::word`]): the model the pool serves and the request's
+    /// phase, the pool's membership epoch, the list the host names
     /// ([`PoolFacts::reach`]) and its size. No row is read for it: by the
     /// host's word one list of rows stands behind one key until the pool's
     /// membership moves. Two lists behind one key would turn one rotation
@@ -238,11 +240,14 @@ impl Picker for RoundRobin {
     }
 
     /// The pool's own turn by the pool's own word: one step of the word and
-    /// one read of the worker the turn lands on. A turn that lands on a
-    /// refused worker takes the pool's next turn, as many turns as the
-    /// pool's size earns (`pool_turns`), and the first worker kept is the
-    /// pick. No table is looked up: the caller keeps the pool's rotation
-    /// beside the pool.
+    /// one read of the worker the turn lands on, which is the pick where
+    /// the caller keeps it. A turn that lands on a refused worker picks
+    /// nobody: the caller reads the pool whole, and the workers that pass
+    /// take turns by their own rotation ([`Picker::pick_among`]). The turn
+    /// is not handed to the next worker of the list: a whole decision's
+    /// turn is not either ([`Self::draw_first`]), so a list's requests take
+    /// their workers by one rule. No table is looked up: the caller keeps
+    /// the pool's rotation beside the pool.
     fn pick_alone(
         &self,
         pool: &PoolWord<'_>,
@@ -252,13 +257,8 @@ impl Picker for RoundRobin {
         if rows == 0 {
             return None;
         }
-        for _ in 0..pool_turns(rows) {
-            let turn = pool.word.fetch_add(1, Ordering::Relaxed) as usize % rows;
-            if keep(turn) {
-                return Some(turn);
-            }
-        }
-        None
+        let turn = pool.word.fetch_add(1, Ordering::Relaxed) as usize % rows;
+        keep(turn).then_some(turn)
     }
 
     /// The set's own turn, in the table every rotation of a set lives in.
@@ -273,6 +273,22 @@ impl Picker for RoundRobin {
     /// turns the survivors' own rotation: over a turn of the pool each kept
     /// row takes its own turn and an even share of the refused rows'. With
     /// no row refused a turn of the pool visits every row once.
+    ///
+    /// The turn is counted in the pool's own word where the host lends it
+    /// ([`PoolFacts::word`]), the word a pick alone counts in
+    /// ([`Self::pick_alone`]): the list's own rotation, which no other list
+    /// turns. Where none is lent the rotation is the one the pool's name
+    /// finds: its model, the request's phase, its membership epoch, the
+    /// list the host names and its size.
+    ///
+    /// A retry takes no turn of the pool: a request whose attempt is not its
+    /// first ([`RequestFacts::attempt`]), or that names a worker it tried
+    /// ([`RequestFacts::tried`]). The workers it may take are the ones it
+    /// has not tried, and the turn is a first attempt's, whose workers are
+    /// the list whole: the whole pass turns the rotation of the workers the
+    /// retry is left. Either sign says so: a retry whose tried worker has
+    /// left the list names none and states its number alone, and a host
+    /// that states no number names the worker.
     fn draw_first(
         &self,
         facts: &RequestFacts<'_>,
@@ -283,10 +299,14 @@ impl Picker for RoundRobin {
         _: &mut Draw,
     ) -> bool {
         let rows = candidates.len();
-        if rows == 0 {
+        if rows == 0 || facts.attempt != 0 || !facts.tried.is_empty() {
             return false;
         }
-        let pick = self.advance(Self::pool_key(facts, pool, rows)) as usize % rows;
+        let turn = match pool.word {
+            Some(word) => word.fetch_add(1, Ordering::Relaxed),
+            None => self.advance(Self::pool_key(facts, pool, rows)),
+        };
+        let pick = turn as usize % rows;
         if !keep(&candidates[pick]) {
             return false;
         }
@@ -373,6 +393,35 @@ mod tests {
             &mut out,
         );
         assert!(out.first().is_some());
+    }
+
+    /// A draw counts its turn in the pool's own word where the host lends
+    /// one, and claims no rotation by the pool's name. Where none is lent
+    /// the named rotation turns and the word stands.
+    #[test]
+    fn a_draw_turns_the_lent_word_and_names_no_rotation() {
+        let rr = RoundRobin::new();
+        let pool: Vec<Candidate> = (0..16).map(|row| candidate(row, 0)).collect();
+        let facts = RequestFacts::default();
+        let word = AtomicU64::new(21);
+        let lent = PoolFacts {
+            word: Some(&word),
+            ..PoolFacts::default()
+        };
+        let drawn = |pool_facts: &PoolFacts<'_>| {
+            let mut kept = Vec::new();
+            let mut draw = Draw::new(1);
+            let mut all = |_: &Candidate| true;
+            assert!(rr.draw_first(&facts, pool_facts, &pool, &mut all, &mut kept, &mut draw));
+            kept
+        };
+        // The word's turn, 21, lands on row 5 of 16, and the next on row 6.
+        assert_eq!(drawn(&lent), [5, 6, 7, 8]);
+        assert_eq!(drawn(&lent), [6, 7, 8, 9]);
+        let read = |word: &AtomicU64| word.load(Ordering::Relaxed);
+        assert_eq!((read(&word), read(&rr.claims)), (23, 0));
+        drawn(&PoolFacts::default());
+        assert_eq!((read(&word), read(&rr.claims)), (23, 1));
     }
 
     #[test]

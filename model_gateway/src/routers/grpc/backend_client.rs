@@ -589,9 +589,10 @@ fn check_every_rank_is_pinnable(client: &BackendClient) -> Result<(), String> {
     };
     if pinnable < connected {
         return Err(format!(
-            "dp-aware routing pins a request to its rank, which reaches only {pinnable} of the \
+            "a rank worker pins a request to its rank, which reaches only {pinnable} of the \
              {connected} engines connected: their ZMQ indices do not run from 0. Launch the \
-             group at data-parallel start rank 0, or register it without --dp-aware"
+             group at data-parallel start rank 0, or register it with no engine count, as one \
+             grouped worker"
         ));
     }
     Ok(())
