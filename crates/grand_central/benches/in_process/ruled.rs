@@ -9,6 +9,10 @@
 //! this entry's count less the `place` entry's. A first decision that
 //! names the rule's workers is taken at once, and asks the rule of no
 //! list.
+//!
+//! A single request's cell, a pair's and an encode request's take both
+//! entries. An encode request's rule is its pair's: it is asked of the
+//! prefills and of the decodes, and of no encoder.
 
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -39,7 +43,7 @@ static STATED: AtomicBool = AtomicBool::new(false);
 
 /// How the address of each list's last worker ends, under a run whose rule
 /// takes that worker alone ([`HELD`]): a cell numbers the workers of each
-/// of its lists alike. Unset under every other run.
+/// list its rule is asked of alike. Unset under every other run.
 static LAST: OnceLock<String> = OnceLock::new();
 
 /// Whether `run` asks the one call with a rule stated.
