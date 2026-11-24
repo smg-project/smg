@@ -96,6 +96,7 @@ use self::{
     document::InForce,
     encode::EncodeLists,
     overlap::{Affinity, PoolAffinity},
+    place::Made,
 };
 use super::{
     decision_engine::{
@@ -822,7 +823,9 @@ impl InProcess {
     ) -> Result<Decided, DecisionRefused> {
         let mut whole = None;
         let document = self.in_force();
-        let alone = self.under(&document).decide_into(maker, clock, &mut whole);
+        let alone = self
+            .under(&document)
+            .decide_into(maker, None, clock, &mut whole);
         // The document is let go ahead of the answer's making: an answer
         // made while it is held is moved once more behind its release.
         drop(document);
@@ -844,13 +847,20 @@ impl Loaded<'_, '_> {
     /// decision written into `whole` beside whether the request stated the
     /// later decode. Its caller hands `whole` empty, and only a whole
     /// decision fills it.
-    pub(super) fn decide_into(
+    ///
+    /// `late` is the request as the engine's own call made it, where that
+    /// call asks ([`place::decide`]): the lookup that names a request's
+    /// holders asks it for the block hashes its making left to the road
+    /// that reads them ([`Made::hashed_whole`]). A host's own maker hashes
+    /// its request itself and hands none.
+    fn decide_into(
         self,
         maker: &impl RequestMaker,
+        late: Option<&Made<'_, '_>>,
         clock: impl FnOnce() -> Instant,
         whole: &mut Option<(DecideOutcome, bool)>,
     ) -> Result<Option<AlonePick>, DecisionRefused> {
-        self.caught(|| self.placed_or(maker, clock, whole))
+        self.caught(|| self.placed_or(maker, late, clock, whole))
     }
 }
 
@@ -917,7 +927,7 @@ impl InProcess {
                     // The engine's own value of the list, asked of its
                     // cell.
                     let members = own.members_of(lent);
-                    Ok(own.decide_made(maker, &mut request, members, now, &mut said))
+                    Ok(own.decide_made(maker, None, &mut request, members, now, &mut said))
                 }
                 // A pair is decided at its prefill, over its host's two
                 // lists, and so is a request that hands an encode
@@ -1023,6 +1033,7 @@ impl Loaded<'_, '_> {
     fn decide_made<'a>(
         self,
         maker: &impl RequestMaker,
+        late: Option<&Made<'_, '_>>,
         request: &mut Request<'a>,
         members: &'a PoolMembers,
         now: Instant,
@@ -1036,9 +1047,9 @@ impl Loaded<'_, '_> {
         let spec = &self.document.spec;
         let (model, phase) = (request.facts.model, request.facts.phase);
         if self.document.signals && members.reads_signal(spec, model, phase) {
-            return signals::decide(self, request, members, maker, loads, now, said);
+            return signals::decide(self, request, members, maker, late, loads, now, said);
         }
-        self.decide_with_loads(request, members, maker, loads, now, said)
+        self.decide_with_loads(request, members, maker, late, loads, now, said)
     }
 
     /// [`Self::decide_made`] behind its choice of the snapshot: the
@@ -1051,13 +1062,19 @@ impl Loaded<'_, '_> {
     /// `maker` is the request's own, handed on for its entry in a token
     /// tree its host lends. A copy that carries signal cells is decided
     /// inside that tree like the request it was made of, and hands its
-    /// maker as a trait object ([`signals::decide`]).
+    /// maker as a trait object ([`signals::decide`]). `late` is handed on
+    /// with it ([`Self::decide_into`]).
     #[inline]
-    pub(super) fn decide_with_loads(
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a made request, its list, its maker and the request its call made, the loads, the instant and the shadow's word"
+    )]
+    fn decide_with_loads(
         self,
         request: &mut Request<'_>,
         members: &PoolMembers,
         maker: &(impl RequestMaker + ?Sized),
+        late: Option<&Made<'_, '_>>,
         loads: Option<&Arc<LoadSnapshot>>,
         now: Instant,
         said: &mut Option<Shadowed>,
@@ -1068,7 +1085,7 @@ impl Loaded<'_, '_> {
             let (model, phase) = (request.facts.model, request.facts.phase);
             if let Some(binding) = members.shadow(&self.document.spec, model, phase) {
                 let (decision, shadow) =
-                    with_shadow::decide(self, request, members, maker, loads, now, binding);
+                    with_shadow::decide(self, request, members, maker, late, loads, now, binding);
                 *said = shadow;
                 return decision;
             }
@@ -1078,6 +1095,7 @@ impl Loaded<'_, '_> {
             request,
             members,
             maker,
+            late,
             loads,
             now,
             single::WithoutShadow,
@@ -1090,6 +1108,7 @@ impl Loaded<'_, '_> {
     fn placed_or(
         self,
         maker: &impl RequestMaker,
+        late: Option<&Made<'_, '_>>,
         clock: impl FnOnce() -> Instant,
         whole: &mut Option<(DecideOutcome, bool)>,
     ) -> Result<Option<AlonePick>, DecisionRefused> {
@@ -1148,7 +1167,7 @@ impl Loaded<'_, '_> {
                     _ => self.members_of(lent),
                 };
                 let mut said = None;
-                let decision = self.decide_made(maker, &mut request, members, now, &mut said);
+                let decision = self.decide_made(maker, late, &mut request, members, now, &mut said);
                 // What a shadow said is counted behind the lease's issue.
                 if let Some(said) = said {
                     let decided = with_shadow::issued(self, decision, &request, now, said);

@@ -1841,6 +1841,7 @@ fn an_answer_made_ahead_of_a_leave_gives_its_worker_no_place() {
             |_| None,
             || None,
             |_| true,
+            || None,
             leaves,
             made,
         );

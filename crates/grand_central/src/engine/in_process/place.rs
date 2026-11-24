@@ -15,8 +15,10 @@
 //! - the seed is one no other request of the thread was given
 //!   ([`fresh_seed`]);
 //! - the prompt's blocks are hashed under its cache partition, at the first
-//!   making, and never for a request a place answers
-//!   ([`RequestMaker::plain`]): such a request is not made at all.
+//!   making, or where the lookup of the request's holders reads the list
+//!   when no stage reads it itself ([`Made::hashed_whole`]), and never for
+//!   a request a place answers ([`RequestMaker::plain`]): such a request is
+//!   not made at all.
 //!
 //! One thing of the request the engine does not make: the prompt's entry in
 //! a tree its caller lends. The caller names it ([`Prompt::entry`]),
@@ -647,6 +649,42 @@ impl<'r, 'a> Made<'r, 'a> {
         self.key.get()
     }
 
+    /// Whether the request's making leaves the prompt's block hashes to the
+    /// lookup that names the request's holders ([`Self::hashed_whole`]): a
+    /// call's request of token ids that names its entry in a token tree,
+    /// over one list, under a document none of whose stages reads the
+    /// hashes itself ([`AppliedSpec::hashes_named_alone`]). That lookup
+    /// reads the list by an index of cache events and by the record of sent
+    /// prefixes, and reads none of it for a request it decides inside a
+    /// lent tree's match. Every other request is hashed at its making: a
+    /// pair's sides read the list in their columns, and a prompt of more
+    /// token ids than a request's size counts is sized by its list. The
+    /// asks of a call answer alike: its decisions are one document's.
+    fn leaves_hashes(&self, spec: &AppliedSpec) -> bool {
+        let prompt = self.request.prompt;
+        self.of_call.is_some()
+            && prompt
+                .tokens
+                .is_some_and(|tokens| u32::try_from(tokens.len()).is_ok())
+            && prompt.entry.is_some()
+            && matches!(self.request.lists, WorkerLists::Single(_))
+            && spec.hashes_named_alone()
+    }
+
+    /// The prompt's block hashes as deep as `spec` reads them, for the
+    /// lookup of a request whose making left them out
+    /// ([`Self::leaves_hashes`]), on a road that reads the list: hashed at
+    /// the call's first such ask, by the block size its making read. `None`
+    /// for a request hashed at its making: its facts hold the list. `None`
+    /// too under a document that reads no block: there is no list.
+    pub(super) fn hashed_whole(&self, spec: &AppliedSpec) -> Option<&PromptHashes> {
+        let call = self.of_call.filter(|_| self.leaves_hashes(spec))?;
+        let (tokens, made) = (self.request.prompt.tokens?, call.hashes.get()?);
+        let seeds = self.request.prompt.seeds;
+        let whole = call.whole.get_or_init(|| made.whole(spec, tokens, seeds));
+        whole.as_ref()
+    }
+
     /// The request's routing value and its client's value, by the sources
     /// its binding names in `spec`, the decision's document, with where the
     /// value a ring places it by stands on a ring, as `place` answers for
@@ -891,7 +929,12 @@ impl RequestMaker for Made<'_, '_> {
                 };
                 let model = listed.map_or(request.model, |worker| worker.model_id());
                 let size = self.engine.affinity.block_size(model);
-                PromptHashes::under_document(spec, size, tokens, text, request.prompt.seeds)
+                let seeds = request.prompt.seeds;
+                // A list the lookup alone reads is hashed where it is read.
+                match tokens.filter(|_| self.leaves_hashes(spec)) {
+                    Some(tokens) => PromptHashes::unhashed(spec, size, tokens, seeds),
+                    None => PromptHashes::under_document(spec, size, tokens, text, seeds),
+                }
             });
             hashes.write_to(&mut facts);
         }
@@ -1206,7 +1249,7 @@ pub(super) fn decide(
         dated.set(Some(now));
         now
     };
-    let alone = engine.decide_into(made, clock, whole)?;
+    let alone = engine.decide_into(made, Some(made), clock, whole)?;
     Ok((alone, dated.get()))
 }
 
@@ -1392,9 +1435,16 @@ pub(super) struct Call {
     /// decision excludes them ([`Constraints::excluded`]): the profile's
     /// `not-tried` filter passes them over while another worker remains.
     pub(super) missed: Vec<WorkerId>,
-    /// The prompt's block hashes, made at the call's first making: a prompt
-    /// is hashed once a call, however many asks the call takes.
+    /// What the call's first making states of the prompt's blocks: their
+    /// hashes, or their count alone where the making left the list to the
+    /// lookup (`whole`). A prompt is hashed once a call, however many asks
+    /// the call takes.
     hashes: OnceCell<PromptHashes>,
+    /// The prompt's whole list of block hashes, where the call's making
+    /// left the list to the lookup that reads it ([`Made::hashed_whole`]):
+    /// made where that lookup first asks, once a call, and `None` under a
+    /// document that reads no block.
+    whole: OnceCell<Option<PromptHashes>>,
     /// The asks of the call that took no target.
     spent: usize,
     /// The places of the list whose worker the route's rule takes
