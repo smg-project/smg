@@ -235,10 +235,11 @@ impl Sides {
         let keys: [Identity<'_>; ITEMS] = array::from_fn(|item| {
             let turn = (seed as usize).wrapping_mul(ITEMS).wrapping_add(item);
             let (text, hash) = &texts[turn % texts.len()];
-            Identity {
-                hash: *hash,
-                plain: Some(text),
-            }
+            // The key by its constructor, then its text: a bench stands
+            // outside the crate, where the type may gain a field.
+            let mut key = Identity::hashed(*hash);
+            key.plain = Some(text);
+            key
         });
         let ring = self.ring.as_ref().map(|ring| ring as &dyn LentRing);
         let items = EncodeItems {
