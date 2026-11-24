@@ -912,8 +912,16 @@ pub struct ConsistentHashParams {
     /// was hashed by. A host that hashes a text request by windows of the
     /// block size times four bytes gives it the checked depth in windows,
     /// as a token request has it in blocks. Under a block size
-    /// an engine published above the depth a request has no key. Absent, a
-    /// request with no routing key has none.
+    /// an engine published above the depth a request has no key. Where
+    /// the request's caller lends its ring no block is read: the request
+    /// is keyed at the token, at each boundary it reaches or else at the
+    /// depth, a shorter request whole, and a text at four characters a
+    /// token. A routing key the request's own id handed (a `rid` source)
+    /// leads no prompt under this form: it names the session alone, and
+    /// the request is keyed by its prefix as one with no routing key. That
+    /// holds in a gateway's own process: no frame states where a key came
+    /// from, so under a controller's address the id's key places as any
+    /// other. Absent, a request with no routing key has none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1))]
     pub prefix_tokens: Option<u32>,
@@ -2339,8 +2347,9 @@ fn default_inflight_cap() -> u16 {
 
 /// Where a binding's requests take their routing key from: the sources a
 /// host reads in order, and the first that holds a value is the key. A ring
-/// places by the key and a sessions rule pins it. No value enters a view,
-/// so the list is not held to `view.headers`.
+/// places by the key and a sessions rule pins it. In a gateway's own
+/// process a ring's prefix form places by a header's key alone. No value
+/// enters a view, so the list is not held to `view.headers`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RoutingKeySpec {
@@ -2364,7 +2373,11 @@ pub struct KeySourceSpec {
     /// does not list leaves as its fingerprint alone.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub header: Option<String>,
-    /// The request's own id, the `rid` of its body: `true` names it.
+    /// The request's own id, the `rid` of its body: `true` names it. Under
+    /// a ring's prefix form (`prefix_tokens`) in a gateway's own process
+    /// its key names the session alone: a sessions rule pins it, and the
+    /// ring places the request by its prompt. The plain ring places by it,
+    /// and so does a served controller's prefix ring.
     #[serde(skip_serializing_if = "is_default")]
     pub rid: bool,
     /// The most bytes of a value this source hands, 8192 at most (default

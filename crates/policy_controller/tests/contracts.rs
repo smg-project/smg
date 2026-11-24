@@ -160,6 +160,7 @@ fn request_record() -> &'static [&'static str] {
             client_key,
             ring,
             ring_positions,
+            session_key_from_rid,
         }
     )
 }
@@ -601,6 +602,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
                 "signal_cells",
                 "ring",
                 "ring_positions",
+                "session_key_from_rid",
             ],
             wire_only: &["prompt_text"],
             wire: &[
@@ -856,6 +858,7 @@ fn wit_mirrors() -> Vec<WitMirror> {
                 "client_key",
                 "ring",
                 "ring_positions",
+                "session_key_from_rid",
             ],
             before: &[],
             beside: &[],

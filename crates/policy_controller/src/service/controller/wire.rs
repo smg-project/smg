@@ -431,6 +431,9 @@ impl Checked {
             // as it learns it from the rows.
             ring: None,
             ring_positions: &[],
+            // No frame states where a key came from: a served controller's
+            // prefix ring places by any session key.
+            session_key_from_rid: false,
         }
     }
 
