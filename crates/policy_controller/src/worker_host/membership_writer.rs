@@ -882,12 +882,12 @@ pub(super) mod tests {
             view::{Role, WireModes, WorkerId},
         },
         store::{
-            index::indexed_under,
             membership::{self, FactPastBound},
             pairing::PairingDescriptor,
             MembershipChange, MembershipTail, MemoryStore, Registrant, Signals, WorkerFacts,
             WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
         },
+        worker_host::kv_tables::indexed_under,
     };
 
     const URL: &str = "http://worker:8000";

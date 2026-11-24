@@ -73,8 +73,11 @@
 //! runs it where its decisions read the snapshot, and writes no load to
 //! the store then.
 //!
-//! [`KvAdapter`] decodes the worker's KV events for the store's index, and
-//! [`KvHost`] gives each subscription its row in the store. Every replica
+//! [`KvAdapter`] decodes the worker's KV events for the index of the KV
+//! tables the host handed the holder ([`KvTables`],
+//! [`Objects::with_kv_tables`]), and [`KvHost`] gives each subscription
+//! its row. The holder makes a row's lane in the tables where it states
+//! the row, and retires it where the row leaves. Every replica
 //! runs the adapter over its own streams. The adapter keeps what a row's
 //! stream showed of its cache groups, as the gateway's index does. A row
 //! above rank 0 of a data-parallel worker gets no feed yet ([`SkipReason`]).
@@ -108,7 +111,9 @@ mod credentials;
 mod found;
 mod health;
 mod kv;
+mod kv_cursor;
 mod kv_feed;
+mod kv_tables;
 mod lead;
 mod loads;
 mod members;
@@ -127,6 +132,7 @@ pub use found::{facts, pairing_descriptor};
 pub use health::HealthAdapter;
 pub use kv::{KvAdapter, KvHost, SkipReason, SkippedSubscriptions};
 pub use kv_feed::KvFeed;
+pub use kv_tables::KvTables;
 pub use lead::{Lead, SoleLead};
 pub use loads::load_monitor;
 pub use members::Members;

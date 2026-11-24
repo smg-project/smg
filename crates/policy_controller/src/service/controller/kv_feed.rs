@@ -33,11 +33,10 @@ mod tests {
             worker_objects::{ObjectsWake, WorkerObjects},
             Controller,
         },
-        store::{
-            KvEventSink as _, MemoryStore, Registrant, Signals, WorkerFacts, WorkerStatus,
-            WorkersStore,
+        store::{MemoryStore, Registrant, Signals, WorkerFacts, WorkerStatus, WorkersStore},
+        worker_host::{
+            KvFeed, KvTables, Members, MembershipWriter as _, Objects, Precondition, StoreDoor,
         },
-        worker_host::{KvFeed, Members, MembershipWriter as _, Objects, Precondition, StoreDoor},
     };
 
     mod load_streams;
@@ -86,12 +85,13 @@ mod tests {
             let registry = Arc::new(WorkerRegistry::new());
             let objects = Objects::new(registry)
                 .with_connector(Arc::new(GrpcConnector))
-                .with_host_local_unchecked();
+                .with_host_local_unchecked()
+                .with_kv_tables(Arc::new(KvTables::default()));
             Self::over(Arc::new(MemoryStore::new()), Arc::new(objects))
         }
 
         fn over(store: Arc<MemoryStore>, objects: Arc<Objects<Members>>) -> Self {
-            let feed = KvFeed::new(Arc::clone(&store), Arc::clone(&objects));
+            let feed = KvFeed::new(Arc::clone(&objects));
             Self {
                 store,
                 objects,
@@ -510,7 +510,7 @@ mod tests {
             },
             ..MockConfig::default()
         };
-        // The row states no block size: the stream is the store's one word of it.
+        // The row states no block size: the stream is the tables' one word of it.
         let row = WorkerFacts {
             engine_kind: mock.grpc_wire.as_str().to_owned(),
             ..facts(&url, WireModes::GRPC, true)
@@ -530,6 +530,9 @@ mod tests {
             .expect("the controller binds");
         let store = controller.store();
         let objects = controller.workers.holder();
+        // The tables the controller hands a caller: the ones its holder
+        // makes lanes in and its feed writes.
+        let tables = controller.kv_tables();
         let mut spec = PolicySpec::preset("cache_aware").expect("the cache-aware preset");
         spec.generation = 1;
         let applied = AppliedSpec::validate(&spec).expect("the preset validates");
@@ -565,7 +568,7 @@ mod tests {
             let hashes = [compute_content_hash(&tokens).0];
             // The workers the model's index holds a leading block of the
             // request for, each with its count of them.
-            let holders = || store.kv().overlaps(MODEL, &hashes);
+            let holders = || tables.overlaps(MODEL, &hashes);
             assert!(holders().is_empty());
             let client = SchedulerClient::connect(&url)
                 .await
@@ -597,8 +600,12 @@ mod tests {
                 }
                 sleep(POLL).await;
             }
-            // The store learned the model's size from the engine's stored block.
-            assert_eq!(store.block_size(MODEL), Some(block_size));
+            // The tables learned the model's size from the engine's stored block.
+            assert_eq!(tables.block_size(MODEL), Some(block_size));
+            // A read through the controller's handle sees the lane its
+            // holder made and the block its feed wrote there.
+            assert_eq!(tables.indexed_blocks(id, 0), 1);
+            assert!(tables.cursor(id, 0).is_some());
             stop.send(()).expect("the controller is still serving");
         };
         let (result, ()) = timeout(Duration::from_secs(15), async { tokio::join!(serve, case) })

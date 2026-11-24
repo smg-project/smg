@@ -13,12 +13,11 @@ use std::{
 use super::{
     identity, identity_of,
     leases::{InFlightCounts, WorkerSlot},
-    AtWork, BatchFacts, BatchOutcome, ContentHash, DecodeMark, DecodeSide, GatewayId, Hand,
-    HealthSink, Journal, KvEventSink, LaneWriter, LeaseRecord, LeaseRefused, LeaseState,
-    LeasesStore, LoadSink, LoadSource, LookOutcome, MembershipChange, MembershipTail, MemoryStore,
-    PickRecord, PollMode, Position, ReservationKind, ReservationStore, ResyncReason, SequenceHash,
-    Sides, Signals, SnapshotChunk, StoreSnapshot, StoredBlock, VetoWrite, WorkerFacts, WorkerPatch,
-    WorkerRow, WorkerStatus, WorkersStore,
+    AtWork, DecodeMark, DecodeSide, GatewayId, Hand, HealthSink, Journal, LeaseRecord,
+    LeaseRefused, LeaseState, LeasesStore, LoadSink, LoadSource, LookOutcome, MembershipChange,
+    MembershipTail, MemoryStore, PickRecord, PollMode, Position, ReservationKind, ReservationStore,
+    Sides, StoreSnapshot, VetoWrite, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus,
+    WorkersStore,
 };
 use crate::{
     document::spec,
@@ -69,13 +68,6 @@ fn row(age_ms: u32) -> LoadRow {
         running: 1,
         report_age_ms: age_ms,
         ..LoadRow::default()
-    }
-}
-
-fn batch(sequence: u64) -> BatchFacts {
-    BatchFacts {
-        sequence,
-        ..BatchFacts::default()
     }
 }
 
@@ -962,254 +954,6 @@ fn a_scrape_writes_no_receipt_so_the_poll_stays() {
         PollMode::Suppressed,
         "the pushing rank's receipt is the one read"
     );
-}
-
-/// A row whose signals ask for events, at `rank`: the store indexes its
-/// blocks.
-fn publisher(store: &MemoryStore, key: &str, rank: u16) -> WorkerId {
-    let facts = WorkerFacts {
-        dp_rank: rank,
-        signals: Signals {
-            events: true,
-            ..Signals::default()
-        },
-        ..facts(key, 1)
-    };
-    store.upsert(facts).id()
-}
-
-/// What the batch of `sequence` writes in these cases, as the body its
-/// row's lane is lent to: one block of its own at a chain's start, so the
-/// blocks a rank holds count the batches applied since its last clear.
-fn one_block(sequence: u64) -> impl FnMut(&mut LaneWriter<'_>) {
-    move |lane| {
-        let block = StoredBlock {
-            seq_hash: SequenceHash(1_000 + sequence),
-            content_hash: ContentHash(2_000 + sequence),
-        };
-        let mut map = std::mem::take(lane.map());
-        let placed = lane.stored(&[block], None, &mut map);
-        *lane.map() = map;
-        placed.expect("stored");
-    }
-}
-
-#[test]
-fn a_reorder_that_moves_the_first_model_moves_the_rows_lane_with_it() {
-    let store = MemoryStore::new();
-    let sink: &dyn KvEventSink = &store;
-    let mut stated = WorkerFacts {
-        models: vec!["m".to_owned(), "n".to_owned()],
-        signals: Signals {
-            events: true,
-            ..Signals::default()
-        },
-        ..facts("w", 1)
-    };
-    let id = store.upsert(stated.clone()).id();
-    for seq in 1..=3 {
-        sink.admit_through(id, 0, batch(seq), &mut one_block(seq));
-    }
-    let held = || (store.kv().held_blocks("m"), store.kv().held_blocks("n"));
-    assert_eq!(held(), (3, 0));
-    // The same two the other way round, written in place. A row's events
-    // are keyed by its first model, and the lane moves with it in the same
-    // write: no block stays under the old key, and the lane made anew is
-    // unheard, which tells a collector to feed it from a snapshot.
-    stated.models.reverse();
-    assert_eq!(store.upsert(stated).id(), id);
-    assert_eq!(held(), (0, 0));
-    assert_eq!(sink.cursor(id, 0), None);
-    assert_eq!(
-        sink.admit_through(id, 0, batch(1), &mut one_block(1)),
-        BatchOutcome::Applied
-    );
-    assert_eq!(held(), (0, 1));
-}
-
-#[test]
-fn kv_batches_apply_in_sequence_skip_duplicates_and_ask_one_replay_per_gap() {
-    let store = MemoryStore::new();
-    let sink: &dyn KvEventSink = &store;
-    let id = publisher(&store, "w", 0);
-    assert_eq!(sink.cursor(id, 0), None, "a rank never heard from");
-    assert_eq!(
-        sink.admit_through(id, 0, batch(17), &mut one_block(17)),
-        BatchOutcome::Applied
-    );
-    assert_eq!(
-        sink.admit_through(id, 0, batch(18), &mut one_block(18)),
-        BatchOutcome::Applied
-    );
-    assert_eq!(
-        sink.admit_through(id, 0, batch(18), &mut one_block(18)),
-        BatchOutcome::Skipped,
-        "a duplicate"
-    );
-    assert_eq!(sink.cursor(id, 0).expect("heard").applied, 18);
-    assert_eq!(
-        sink.admit_through(id, 0, batch(25), &mut one_block(25)),
-        BatchOutcome::Gap {
-            expected: 19,
-            received: 25
-        }
-    );
-    assert!(sink.cursor(id, 0).expect("heard").replay_pending);
-    for seq in 19..=25 {
-        assert_eq!(
-            sink.admit_through(id, 0, batch(seq), &mut one_block(seq)),
-            BatchOutcome::Applied,
-            "the replay fills the gap"
-        );
-    }
-    assert_eq!(store.indexed_blocks(id, 0), 9);
-    assert_eq!(
-        sink.admit_through(id, 0, batch(40), &mut one_block(40)),
-        BatchOutcome::Gap {
-            expected: 26,
-            received: 40
-        }
-    );
-    assert_eq!(
-        sink.admit_through(id, 0, batch(50), &mut one_block(50)),
-        BatchOutcome::Applied,
-        "a second gap is lost history, applied"
-    );
-    let cursor = sink.cursor(id, 0).expect("heard");
-    assert!(cursor.degraded && !cursor.replay_pending);
-    assert_eq!(
-        store.indexed_blocks(id, 0),
-        10,
-        "a small gap keeps the state"
-    );
-    let second = publisher(&store, "w/1", 1);
-    assert_eq!(
-        sink.admit_through(second, 1, batch(3), &mut one_block(3)),
-        BatchOutcome::Applied
-    );
-    assert_eq!(
-        sink.cursor(second, 1).expect("heard").applied,
-        3,
-        "each rank its own counter"
-    );
-    assert_eq!(
-        sink.admit_through(id, 1, batch(3), &mut one_block(3)),
-        BatchOutcome::Skipped,
-        "a batch of a rank the row is not"
-    );
-    assert_eq!(
-        sink.admit_through(WorkerId(9), 0, batch(1), &mut one_block(1)),
-        BatchOutcome::Skipped,
-        "a batch of a worker the store holds no row for"
-    );
-}
-
-/// The same sequence below the cursor is a late duplicate on the connection
-/// that produced it and a restarted publisher on a fresh one; neither a
-/// clear nor the restart window is needed to tell them apart.
-#[test]
-fn a_fresh_connection_below_the_cursor_is_a_restart_where_a_late_duplicate_is_not() {
-    let store = MemoryStore::new();
-    let sink: &dyn KvEventSink = &store;
-    let id = publisher(&store, "w", 0);
-    for seq in 1..=5 {
-        assert_eq!(
-            sink.admit_through(id, 0, batch(seq), &mut one_block(seq)),
-            BatchOutcome::Applied
-        );
-    }
-    assert_eq!(
-        sink.admit_through(id, 0, batch(3), &mut one_block(3)),
-        BatchOutcome::Skipped,
-        "a late duplicate on the same connection"
-    );
-    assert_eq!(sink.cursor(id, 0).expect("heard").applied, 5);
-    assert_eq!(store.resyncs(ResyncReason::PublisherRestart), 0);
-    sink.reconnected(id);
-    assert_eq!(
-        sink.admit_through(id, 0, batch(3), &mut one_block(3)),
-        BatchOutcome::Applied,
-        "the same sequence on a fresh connection is a restarted publisher"
-    );
-    let cursor = sink.cursor(id, 0).expect("heard");
-    assert_eq!((cursor.applied, cursor.degraded), (3, false));
-    assert_eq!(store.indexed_blocks(id, 0), 1, "the rank was cleared first");
-    assert_eq!(store.resyncs(ResyncReason::PublisherRestart), 1);
-    assert_eq!(
-        sink.admit_through(id, 0, batch(4), &mut one_block(4)),
-        BatchOutcome::Applied,
-        "the new life continues from there"
-    );
-    assert_eq!(sink.cursor(id, 0).expect("heard").applied, 4);
-}
-
-#[test]
-fn a_publisher_restart_and_a_resync_clear_the_rank_and_a_removal_forgets_it() {
-    let store = MemoryStore::new();
-    let sink: &dyn KvEventSink = &store;
-    let id = publisher(&store, "w", 0);
-    for seq in 1..=5 {
-        assert_eq!(
-            sink.admit_through(id, 0, batch(seq), &mut one_block(seq)),
-            BatchOutcome::Applied
-        );
-    }
-    let clearing = BatchFacts {
-        sequence: 2,
-        clears: true,
-        snapshot: None,
-    };
-    assert_eq!(
-        sink.admit_through(id, 0, clearing, &mut one_block(2)),
-        BatchOutcome::Applied,
-        "a clear below the cursor is a restarted publisher"
-    );
-    assert_eq!(store.indexed_blocks(id, 0), 1, "the rank was cleared first");
-    assert_eq!(store.resyncs(ResyncReason::PublisherRestart), 1);
-    sink.reconnected(id);
-    assert_eq!(
-        sink.admit_through(id, 0, batch(1), &mut one_block(1)),
-        BatchOutcome::Applied,
-        "below the cursor on a fresh connection: a restart too"
-    );
-    assert_eq!(store.resyncs(ResyncReason::PublisherRestart), 2);
-    for seq in 2..=4 {
-        sink.admit_through(id, 0, batch(seq), &mut one_block(seq));
-    }
-    assert_eq!(store.indexed_blocks(id, 0), 4);
-    sink.resync(id, Some(0), ResyncReason::OutOfRange);
-    assert_eq!(store.indexed_blocks(id, 0), 0);
-    assert_eq!(sink.cursor(id, 0).expect("heard").applied, 0);
-    assert_eq!(store.resyncs(ResyncReason::OutOfRange), 1);
-    let chunk = BatchFacts {
-        sequence: 90,
-        clears: false,
-        snapshot: Some(SnapshotChunk {
-            unknown_before: true,
-        }),
-    };
-    sink.resync(id, Some(0), ResyncReason::Snapshot);
-    assert_eq!(
-        sink.admit_through(id, 0, chunk, &mut one_block(90)),
-        BatchOutcome::Applied
-    );
-    let cursor = sink.cursor(id, 0).expect("heard");
-    assert_eq!((cursor.applied, cursor.degraded), (90, true));
-    assert_eq!(store.resyncs(ResyncReason::Snapshot), 1);
-    assert_eq!(
-        sink.admit_through(id, 0, batch(91), &mut one_block(91)),
-        BatchOutcome::Applied,
-        "live batches continue after the snapshot's stamp"
-    );
-    assert_eq!(store.indexed_blocks(id, 0), 2);
-    sink.removed(id);
-    assert_eq!(sink.cursor(id, 0), None);
-    assert_eq!(store.indexed_blocks(id, 0), 0);
-    sink.set_block_size("m", 16);
-    sink.set_block_size("m", 8);
-    assert_eq!(sink.block_size("m"), Some(16), "only ever raised");
-    sink.set_block_size("m", 32);
-    assert_eq!(sink.block_size("m"), Some(32));
 }
 
 #[test]
@@ -3029,7 +2773,6 @@ fn a_restore_tells_each_end_under_the_decider_whose_file_holds_its_lease() {
 fn a_watch_snapshot_keeps_a_members_local_tables() {
     let store = MemoryStore::new();
     let id = ready(&store, "http://a:1");
-    assert_eq!(publisher(&store, "http://a:1", 0), id);
     store.publish_now();
     let (gateway, now) = (GatewayId(1), Instant::now());
     let lease = booking(gateway, 1, id, now);
@@ -3040,10 +2783,6 @@ fn a_watch_snapshot_keeps_a_members_local_tables() {
     store.gateway_veto(gateway, id, Some(now + Duration::from_secs(60)));
     LoadSink::record(&store, id, 0, row(0), now, LoadSource::Stream);
     let local_load = LoadSink::load(&store, id, 0).expect("the local report");
-    assert_eq!(
-        store.admit_through(id, 0, batch(1), &mut one_block(1)),
-        BatchOutcome::Applied
-    );
 
     let mut cut = store.checkpoint();
     cut.epoch += 1;
@@ -3062,14 +2801,13 @@ fn a_watch_snapshot_keeps_a_members_local_tables() {
     assert_eq!(in_flight(&store), [(id, 1)]);
     assert!(store.vetoed(gateway, id, now));
     assert_eq!(LoadSink::load(&store, id, 0), Some(local_load));
-    assert_eq!(store.kv().held_blocks("m"), 1);
     assert_eq!(WorkersStore::get(&store, id), Some(expected));
 }
 
 #[test]
 fn a_watch_snapshot_evicts_a_leavers_tables_and_its_lease_moves_no_other_count() {
     let store = MemoryStore::new();
-    let left = publisher(&store, "http://a:1", 0);
+    let left = store.upsert(facts("http://a:1", 1)).id();
     store.publish_now();
     let before = store.snapshot();
     let slot = before.booked_of(left).expect("the leaver's slot");
@@ -3080,10 +2818,6 @@ fn a_watch_snapshot_evicts_a_leavers_tables_and_its_lease_moves_no_other_count()
     leases.issue(lease).expect("filed");
     store.gateway_veto(gateway, left, Some(now + Duration::from_secs(60)));
     LoadSink::record(&store, left, 0, row(0), now, LoadSource::Stream);
-    assert_eq!(
-        store.admit_through(left, 0, batch(1), &mut one_block(1)),
-        BatchOutcome::Applied
-    );
 
     let source = MemoryStore::new();
     let joined = ready(&source, "http://b:1");
@@ -3099,7 +2833,6 @@ fn a_watch_snapshot_evicts_a_leavers_tables_and_its_lease_moves_no_other_count()
         LoadSink::load(&store, joined, 0).is_none(),
         "the cut's load is ignored"
     );
-    assert_eq!(store.kv().held_blocks("m"), 0);
     assert!(leases.released(gateway, lease.lease.id, None, ReleaseReason::ClientGone));
     assert_eq!(in_flight(&store), [(joined, 0)]);
     LoadSink::record(&store, joined, 0, row(0), now, LoadSource::Stream);
