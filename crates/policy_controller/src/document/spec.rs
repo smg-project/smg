@@ -546,7 +546,6 @@ pub enum IndexKind {
 /// [`PolicySpec::index_for`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, default)]
-#[expect(clippy::exhaustive_structs, reason = "its mark follows a field change")]
 pub struct IndexSpec {
     pub kind: IndexKind,
     /// How long a hash-index placement stays routable, in seconds.
