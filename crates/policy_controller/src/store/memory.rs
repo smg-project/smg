@@ -33,7 +33,7 @@ use crate::{
     store::{
         applied::Applied,
         health::{HealthSink, VetoWrite},
-        index::{indexed_under, KvEvent, KvTables, LaneCounts, LaneWriter},
+        index::{indexed_under, KvTables, LaneWriter},
         journal::{Journal, Position},
         kv_events::{BatchFacts, BatchOutcome, KvCursor, KvEventSink, ResyncReason},
         leases::{
@@ -1386,13 +1386,6 @@ impl MemoryStore {
         self.kv.indexed_blocks(id, rank)
     }
 
-    /// What the lane of `id` at `rank` counted beside its blocks, over its
-    /// typed batches; `None` for a row the store does not index. A batch
-    /// lent to a body moves none of them.
-    pub fn lane_counts(&self, id: WorkerId, rank: u16) -> Option<LaneCounts> {
-        self.kv.counts(id, rank)
-    }
-
     /// Rows that ask for events and hold no lane. Each was written while
     /// its model's index stood at its ceiling
     /// ([`INDEX_WORKERS`](crate::store::INDEX_WORKERS)): it holds nothing
@@ -2522,21 +2515,6 @@ impl LoadSink for MemoryStore {
 // -------------------------------------------------------------- KV events
 
 impl KvEventSink for MemoryStore {
-    /// The batch's events as its collector decoded them: the store applies
-    /// them to the index of the worker's model
-    /// (`index`).
-    type Batch = [KvEvent];
-
-    fn admit(
-        &self,
-        id: WorkerId,
-        rank: u16,
-        facts: BatchFacts,
-        batch: &Self::Batch,
-    ) -> BatchOutcome {
-        self.kv.admit(id, rank, facts, batch)
-    }
-
     fn admit_through(
         &self,
         id: WorkerId,

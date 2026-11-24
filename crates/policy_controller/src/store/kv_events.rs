@@ -133,28 +133,12 @@ pub struct KvCursor {
 /// included. A snapshot's start is a resync for [`ResyncReason::Snapshot`]
 /// before its first block, and a chunk only adds.
 pub trait KvEventSink: Send + Sync {
-    /// The batch message as the host's wire crate defines it; the store
-    /// applies its events to the index and reads nothing else of it.
-    type Batch: ?Sized;
-
-    /// Run one batch of `rank` through its cursor and, when admitted, apply
-    /// it to the worker's blocks. `facts` are the batch's header as the
-    /// cursor reads it. A load-only batch carries no events and is not
-    /// admitted: its record goes to the load sink.
-    fn admit(
-        &self,
-        id: WorkerId,
-        rank: u16,
-        facts: BatchFacts,
-        batch: &Self::Batch,
-    ) -> BatchOutcome;
-
-    /// Run one batch of `rank` through its cursor as [`Self::admit`] does
-    /// and, where the cursor admits it, lend the row's lane to `body`: once,
-    /// inside the lane's turn, behind whatever emptying the cursor asked. A
-    /// batch the cursor skips or answers with a gap runs no body. The body
-    /// is the host's own apply rules over the lane's writer: it writes what
-    /// the batch's events leave. The writer's writes are this crate's own
+    /// Run one batch of `rank` through its cursor and, where the cursor
+    /// admits it, lend the row's lane to `body`: once, inside the lane's
+    /// turn, behind whatever emptying the cursor asked. A batch the cursor
+    /// skips or answers with a gap runs no body. The body is the host's own
+    /// apply rules over the lane's writer: it writes what the batch's
+    /// events leave. The writer's writes are this crate's own
     /// ([`LaneWriter`]): the crate's worker host is the body that writes.
     ///
     /// The cursor reads `facts` alone, since it holds no batch to look

@@ -144,7 +144,7 @@ use smg_policy_controller::{
         },
         watcher::{WatchStream, WatchStreamEnd, Watcher},
     },
-    store::{LaneCounts, MemoryStore, WorkerFacts, WorkerStatus, WorkersStore},
+    store::{MemoryStore, WorkerFacts, WorkerStatus, WorkersStore},
     worker_host::{Members, Objects},
 };
 use smg_worker::{registry::WorkerRegistry, worker::WorkerStatus as ObjectStatus};
@@ -1396,11 +1396,6 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
         assert!(
             fed.indexed >= 1 && fed.indexed == fed.held,
             "the index holds each block the engine's events left it holding: {fed:?}"
-        );
-        assert_eq!(
-            fed.counts,
-            Some(LaneCounts::default()),
-            "no store came without its parent and no block was refused: {fed:?}"
         );
         // A prompt goes where its blocks are held. Under the cache-aware
         // preset an ask that states the head the busy engine's events left

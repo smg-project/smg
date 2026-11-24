@@ -19,7 +19,7 @@
 //! cursor over. A chunk only adds. A snapshot its stream did not finish
 //! starts the cursor over and keeps what its chunks showed.
 //!
-//! What a lane indexes is what its collector decoded ([`KvEvent`]): which
+//! What a lane indexes is what the body of an admitted batch writes: which
 //! blocks reach an index (their tier, their cache group, the namespace
 //! their content is hashed under) is the collector's decision. A row is
 //! indexed under its first model name, and only when its signals ask for
@@ -69,44 +69,8 @@ mod tests;
 /// finds a place; the store counts the rows that stand so.
 pub const INDEX_WORKERS: usize = 1_024;
 
-/// One event of a batch as an index applies it. A collector decodes the
-/// engine's message into these.
-#[derive(Clone, Debug)]
-pub enum KvEvent {
-    /// Blocks stored in order after `parent`, the engine's hash of the block
-    /// before the first; `None` starts a chain.
-    Stored {
-        parent: Option<SequenceHash>,
-        blocks: Vec<StoredBlock>,
-    },
-    /// Blocks evicted, by the engine's hashes.
-    Removed(Vec<SequenceHash>),
-    /// The engine emptied its cache.
-    Cleared,
-}
-
-/// What a lane counted since it was made, beside its blocks, over its
-/// typed batches. A batch lent to a body
-/// ([`KvEventSink::admit_through`](super::KvEventSink::admit_through))
-/// moves none of them: the body's rules count for themselves.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct LaneCounts {
-    /// Stores whose parent the worker did not hold (evicted, or lost with a
-    /// cleared rank): placed as a chain of their own.
-    pub parentless_stores: u64,
-    /// Blocks the index declined at one of its size caps: the engine keeps
-    /// them, the index does not route by them.
-    pub refused_blocks: u64,
-}
-
-/// One worker's blocks in an index, as a lane writes them.
+/// One worker's blocks in an index, as a lane's cursor empties them.
 trait Blocks {
-    fn stored(
-        &mut self,
-        blocks: &[StoredBlock],
-        parent: Option<SequenceHash>,
-    ) -> Result<(), ApplyError>;
-    fn removed(&mut self, hashes: &[SequenceHash]);
     fn cleared(&mut self);
 }
 
@@ -124,22 +88,6 @@ struct Held {
 }
 
 impl Blocks for Held {
-    fn stored(
-        &mut self,
-        blocks: &[StoredBlock],
-        parent: Option<SequenceHash>,
-    ) -> Result<(), ApplyError> {
-        self.index
-            .chain
-            .apply_stored(self.worker, blocks, parent, &mut self.map)
-    }
-
-    fn removed(&mut self, hashes: &[SequenceHash]) {
-        self.index
-            .chain
-            .apply_removed(self.worker, hashes, &mut self.map);
-    }
-
     fn cleared(&mut self) {
         self.index.chain.apply_cleared(self.worker, &mut self.map);
         // The row's view of its other cache groups goes with its blocks:
@@ -148,7 +96,7 @@ impl Blocks for Held {
             view.clear();
         }
         // The one routine that empties a rank says so, whoever asked: a
-        // resync, the cursor, the worker reported gone, a typed clear.
+        // resync, the cursor, the worker reported gone.
         self.emptied = emptying();
     }
 }
@@ -195,7 +143,7 @@ impl LaneWriter<'_> {
 
     /// A value that moves each time the store empties the rank, and where
     /// the lane is made: a resync, a restart or a cleared gap its cursor
-    /// read, the worker reported gone, a typed clear, a lent body that
+    /// read, the worker reported gone, a lent body that
     /// unwound. The emptying this batch's admission made has moved it. It
     /// never repeats under a row,
     /// across the lanes the store makes for it. A body that keeps state
@@ -229,7 +177,7 @@ impl LaneWriter<'_> {
     }
 
     /// Forget the named blocks of the row.
-    #[cfg(feature = "worker-host")]
+    #[cfg(any(test, feature = "worker-host"))]
     pub(crate) fn removed(&self, hashes: &[SequenceHash], map: &mut ChainBlockMap) {
         self.wrote.set(true);
         self.held
@@ -239,7 +187,7 @@ impl LaneWriter<'_> {
     }
 
     /// Forget every block of the row.
-    #[cfg(feature = "worker-host")]
+    #[cfg(any(test, feature = "worker-host"))]
     pub(crate) fn cleared(&self, map: &mut ChainBlockMap) {
         self.wrote.set(true);
         self.held.index.chain.apply_cleared(self.held.worker, map);
@@ -289,9 +237,8 @@ impl Drop for Lent<'_> {
     }
 }
 
-/// The index speaks for a row from the first admitted batch that wrote:
-/// one that carried an event, or one whose lent body wrote. A batch the
-/// cursor refuses writes no block.
+/// The index speaks for a row from the first admitted batch whose lent
+/// body wrote. A batch the cursor refuses writes no block.
 fn hear_written(held: &Held, wrote: bool) {
     if wrote && !held.index.heard(held.worker) {
         held.index.hear(held.worker, true);
@@ -332,73 +279,17 @@ fn admitted<B: Blocks>(
     }
 }
 
-/// Run one batch through `cursor` and apply what it admits to `blocks`, in
-/// the batch's order. The reason comes back when the batch emptied the rank
-/// before it was applied.
-fn admit<B: Blocks>(
-    cursor: &mut RankCursor,
-    blocks: &mut B,
-    facts: BatchFacts,
-    events: &[KvEvent],
-    counts: &mut LaneCounts,
-) -> (BatchOutcome, Option<ResyncReason>) {
-    // A clear among the events is the header's fact too, wherever it
-    // stands: what a batch that clears leaves owes nothing to what came
-    // before it, so the cursor may start over there.
-    let clears = facts.clears || events.iter().any(|e| matches!(e, KvEvent::Cleared));
-    let emptied = match admitted(cursor, blocks, facts, clears) {
-        Ok(emptied) => emptied,
-        Err(outcome) => return (outcome, None),
-    };
-    for event in events {
-        match event {
-            KvEvent::Stored {
-                parent,
-                blocks: new,
-            } => store(blocks, new, *parent, counts),
-            KvEvent::Removed(hashes) => blocks.removed(hashes),
-            KvEvent::Cleared => blocks.cleared(),
-        }
-    }
-    (BatchOutcome::Applied, emptied)
-}
-
-/// One store. A parent the worker does not hold starts a chain of its own,
-/// as the engines' first stores after a clear do; what the index declines at
-/// a size cap is counted.
-fn store<B: Blocks>(
-    held: &mut B,
-    blocks: &[StoredBlock],
-    parent: Option<SequenceHash>,
-    counts: &mut LaneCounts,
-) {
-    let mut placed = held.stored(blocks, parent);
-    if matches!(
-        placed,
-        Err(ApplyError::WorkerNotTracked | ApplyError::ParentBlockNotFound)
-    ) && parent.is_some()
-    {
-        counts.parentless_stores += 1;
-        placed = held.stored(blocks, None);
-    }
-    if let Err(ApplyError::ArenaCapReached { placed }) = placed {
-        counts.refused_blocks += blocks.len().saturating_sub(placed) as u64;
-    }
-}
-
 /// One row's writer.
 struct Lane {
     cursor: RankCursor,
     /// A batch ran through the cursor since the lane was made or its worker
     /// was reported gone. The index keeps a bit beside it
-    /// ([`Index::hear`]), set at the first such batch that carries an event
-    /// and is applied, and cleared with this word, where a decision reads
-    /// it with no lock.
+    /// ([`Index::hear`]), set at the first such batch whose body writes,
+    /// and cleared with this word.
     heard: bool,
     /// `None` once the row left: a batch that found the lane before the
     /// removal writes nothing.
     held: Option<Held>,
-    counts: LaneCounts,
 }
 
 impl Lane {
@@ -432,9 +323,9 @@ struct Index {
     /// Each row's view of its cache groups other than main attention,
     /// under the row's id: written by a lent body ([`LaneWriter::groups`]).
     groups: GroupViews,
-    /// A bit an index id: a batch that carried an event was applied
-    /// through the lane of the row that holds the id. A batch with no
-    /// event sets nothing, and neither does one the lane's cursor refuses:
+    /// A bit an index id: the body of an admitted batch wrote through the
+    /// lane of the row that holds the id. A body that writes nothing sets
+    /// nothing, and neither does a batch the lane's cursor refuses:
     /// the index holds nothing of the row yet. The lane's own word says
     /// less, that any batch ran through it
     /// ([`Lane::heard`]). The lane writes its own bit under its lock.
@@ -451,8 +342,8 @@ impl Index {
         }
     }
 
-    /// The lane that holds `id` says whether a batch that carried an event
-    /// was applied through it.
+    /// The lane that holds `id` says whether an admitted batch's body
+    /// wrote through it.
     fn hear(&self, id: u32, heard: bool) {
         let Some(word) = self.heard.get((id / 64) as usize) else {
             return;
@@ -465,7 +356,7 @@ impl Index {
         }
     }
 
-    /// Whether a batch that carried an event was applied through the lane
+    /// Whether an admitted batch's body wrote through the lane
     /// that holds `id`.
     fn heard(&self, id: u32) -> bool {
         let word = self.heard.get((id / 64) as usize);
@@ -579,7 +470,6 @@ impl KvTables {
                 map: ChainBlockMap::new(),
                 emptied: emptying(),
             }),
-            counts: LaneCounts::default(),
         };
         table.lanes.insert(
             row.id,
@@ -629,43 +519,11 @@ impl KvTables {
             .then(|| Arc::clone(&entry.lane))
     }
 
-    pub(super) fn admit(
-        &self,
-        id: WorkerId,
-        rank: u16,
-        facts: BatchFacts,
-        events: &[KvEvent],
-    ) -> BatchOutcome {
-        let Some(lane) = self.lane(id, Some(rank)) else {
-            return BatchOutcome::Skipped;
-        };
-        let mut lane = lane.lock();
-        let Lane {
-            cursor,
-            heard,
-            held,
-            counts,
-        } = &mut *lane;
-        let Some(held) = held else {
-            return BatchOutcome::Skipped;
-        };
-        *heard = true;
-        let (outcome, emptied) = admit(cursor, held, facts, events, counts);
-        // The index speaks for the row from the first batch that carried
-        // an event and was applied. A batch the cursor refuses writes no
-        // block.
-        hear_written(held, outcome == BatchOutcome::Applied && !events.is_empty());
-        if let Some(reason) = emptied {
-            self.note(reason);
-        }
-        outcome
-    }
-
-    /// [`Self::admit`] for a batch its host's own rules apply: the cursor
-    /// reads the header alone, and an admitted batch lends the lane to
-    /// `body`, once, inside the lane's turn. The lane says its row heard
-    /// behind a body that wrote, as behind a typed batch with an event. A
-    /// body that unwinds has the lane start over ([`Lent`]).
+    /// Run one batch through its row's lane, for its host's own rules to
+    /// apply: the cursor reads the header alone, and an admitted batch
+    /// lends the lane to `body`, once, inside the lane's turn. The lane
+    /// says its row heard behind a body that wrote. A body that unwinds
+    /// has the lane start over ([`Lent`]).
     pub(super) fn admit_through(
         &self,
         id: WorkerId,
@@ -781,8 +639,10 @@ impl KvTables {
             .map_or(0, |held| held.index.chain.worker_block_count(held.worker))
     }
 
-    pub(super) fn counts(&self, id: WorkerId, rank: u16) -> Option<LaneCounts> {
-        Some(self.lane(id, Some(rank))?.lock().counts)
+    /// Whether the row of `id` holds a lane at `rank`, for the cases.
+    #[cfg(test)]
+    pub(crate) fn holds_lane(&self, id: WorkerId, rank: u16) -> bool {
+        self.lane(id, Some(rank)).is_some()
     }
 
     /// The rows holding a prefix of the request's blocks in `model`'s
