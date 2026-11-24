@@ -36,8 +36,9 @@ pub(crate) fn considers(pinned: Option<usize>, dp_rank: i32) -> bool {
 /// rank the report does not consider. Where the rows are one engine's
 /// ranks (`one_engine`), a row of a rank an earlier row stated leaves as
 /// well, uncounted: it stated no rank of its own, and the first of a rank
-/// stands as the first of a name does. The kept rows keep their order. A
-/// list that holds room for [`MAX_RANKS`] rows or fewer is bound where it
+/// stands as the first of a name does. That holds past the bound too, for
+/// the first [`MAX_RANKS`] ranks that left. The kept rows keep their order.
+/// A list that holds room for [`MAX_RANKS`] rows or fewer is bound where it
 /// lies; one that holds more gives back the room past its rows.
 #[cfg(feature = "runtime")]
 pub(crate) fn bound_ranks(
@@ -46,13 +47,21 @@ pub(crate) fn bound_ranks(
     one_engine: bool,
 ) -> usize {
     let mut left = 0;
+    // The ranks the counted rows left for, the first of them.
+    let mut gone = [0_i32; MAX_RANKS];
     // Whether a kept row stated a rank: each rank below the bound, and the
     // registered one past it.
     let mut below = [false; MAX_RANKS];
     let mut past = false;
     loads.retain(|row| {
         if !considers(pinned, row.dp_rank) {
-            left += 1;
+            let again = one_engine && gone[..left.min(MAX_RANKS)].contains(&row.dp_rank);
+            if !again {
+                if let Some(rank) = gone.get_mut(left) {
+                    *rank = row.dp_rank;
+                }
+                left += 1;
+            }
             return false;
         }
         let seen = match usize::try_from(row.dp_rank) {
@@ -269,5 +278,40 @@ mod tests {
         assert_eq!(snapshot.bound_values(), 4);
         assert_eq!(names(&snapshot.values), ["depth", "rate"]);
         assert_eq!(snapshot.values[1].value, 0.5);
+    }
+
+    #[cfg(feature = "runtime")]
+    #[test]
+    fn one_engines_rank_past_the_bound_leaves_once_however_often_it_is_stated() {
+        let mut engine: Vec<_> = [0, 70, 1, 70]
+            .map(|dp_rank| SchedulerLoadSnapshot {
+                dp_rank,
+                ..Default::default()
+            })
+            .into();
+        // A rollup lists a row a worker: each of its rows still counts.
+        let mut rollup = engine.clone();
+        assert_eq!(
+            (
+                bound_ranks(&mut engine, None, true),
+                bound_ranks(&mut rollup, None, false)
+            ),
+            (1, 2)
+        );
+        // Both keep their rows of the ranks below the bound, in order.
+        for kept in [&engine, &rollup] {
+            assert!(kept.iter().map(|row| row.dp_rank).eq([0, 1]));
+        }
+        // The first 64 ranks that leave are remembered: a repeat of the
+        // first or of the 64th leaves uncounted, and each row of a 65th
+        // counts.
+        let mut long: Vec<_> = (64..128)
+            .chain([64, 127, 128, 128])
+            .map(|dp_rank| SchedulerLoadSnapshot {
+                dp_rank,
+                ..Default::default()
+            })
+            .collect();
+        assert_eq!(bound_ranks(&mut long, None, true), 66);
     }
 }
