@@ -1,7 +1,10 @@
 //! The holder of a replica's worker objects: it follows the store's
 //! membership and writes the registry. A leader's door writes a row through
 //! it, and the store follows that write ([`mod@write`]). A standby's applier
-//! hands it each event of its leader's stream ([`mod@standby`]). A host can
+//! hands it each event of its leader's stream ([`mod@standby`]). On a
+//! replica that leads an object's status leads its row's: a status is
+//! written on the object, and the holder tells the store ([`mod@status`],
+//! which says the lock order once). A host can
 //! also ask it to follow the rows' status, or to build each object with the
 //! thresholds its own load monitor judges overload by. A door reads the row
 //! that stands off it ([`mod@read`]).
@@ -21,6 +24,7 @@ use smg_worker::{
     health::overload::OverloadThresholds,
     identity::basic::Worker,
     registry::{Generation, WorkerId as ObjectId, WorkerRegistry},
+    worker::WorkerStatus as ObjectStatus,
 };
 
 #[cfg(feature = "in-process")]
@@ -50,7 +54,11 @@ use crate::{
 mod host_count;
 mod read;
 mod standby;
+mod status;
 mod write;
+
+#[cfg(all(test, feature = "controller"))]
+pub(crate) use status::tests::stand;
 
 /// The row an object stands for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -244,8 +252,10 @@ impl<G> fmt::Debug for Objects<G> {
 }
 
 impl<G> Objects<G> {
-    /// For a host that drives no health of its own: an object's status
-    /// follows its row's.
+    /// For a host that drives no health of its own and writes each row's
+    /// status into the store itself: an object's status follows its
+    /// row's. A controller's own service and a watcher do not use it: a
+    /// status is written on the object there, or laid as it is told.
     #[must_use]
     pub fn with_status_followed(mut self) -> Self {
         self.status_followed = true;
@@ -755,6 +765,20 @@ impl<G: Generation> Objects<G> {
         }
     }
 
+    /// The status the table holds for the row an object was built from,
+    /// where the row stands at that revision still: what an object takes
+    /// from the table. Read under the object's mutation lock, so of two
+    /// such reads the later one's status stands on the object.
+    fn table_status<S: WorkersStore + ?Sized>(
+        store: &S,
+        standing: RowRevision,
+    ) -> Option<ObjectStatus> {
+        store
+            .get(standing.row)
+            .filter(|row| row.revision == standing.revision)
+            .map(|row| status(row.status))
+    }
+
     /// Read the row under the lock the health adapter writes under. The
     /// object's entry must still name that row and its current revision.
     /// The registry writes the status it is handed and tells it.
@@ -769,12 +793,7 @@ impl<G: Generation> Objects<G> {
         let write = |object: &Arc<dyn Worker>| {
             let next = self
                 .standing_of(&id, object)
-                .and_then(|standing| {
-                    store
-                        .get(standing.row)
-                        .filter(|row| row.revision == standing.revision)
-                })
-                .map(|row| status(row.status));
+                .and_then(|standing| Self::table_status(store, standing));
             // The registry writes it, as it writes the adapter's: one
             // status event to its subscribers, and what goes with a
             // promotion. A status that stands writes nothing.
@@ -794,9 +813,11 @@ impl<G: Generation> Objects<G> {
         self.held.write().leave(id);
     }
 
-    /// Lay `row`'s object: one built from the row.
+    /// Lay `row`'s object: one built from the row, with the row's status
+    /// where the holder follows statuses.
     fn lay<S: WorkersStore + ?Sized>(&self, store: &S, row: &WorkerRow) {
         self.put(store, row, self.build(row));
+        self.follow_status(store, row.id);
     }
 
     /// State the entry of the object that stands for `row` again, from the
@@ -886,7 +907,6 @@ impl<G: Generation> Objects<G> {
         // takes the standing object's running state there, and with it the
         // leases the store counted on that object.
         self.counted(store, row.id);
-        self.follow_status(store, row.id);
     }
 }
 

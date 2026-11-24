@@ -98,11 +98,11 @@ use crate::{
     },
     store::{
         membership::{self, life, FactPastBound, WorkerFactsChange},
-        HealthSink, MembershipChange, MemoryStore, Position, Registrant, WorkerFacts, WorkerPatch,
-        WorkerRow, WorkerStatus, WorkersStore,
+        MembershipChange, MemoryStore, Position, Registrant, WorkerFacts, WorkerPatch, WorkerRow,
+        WorkerStatus, WorkersStore,
     },
     worker_host::{
-        drain, lay, lay_one, lay_ready, refresh, stated, stating, take, Members,
+        dial_address, drain, lay, lay_one, lay_ready, refresh, stated, stating, take, Members,
         MembershipWriteOutcome, MembershipWriteRefused, MembershipWriter, Objects, Over,
         Precondition, Ready, Remover, RowRevision, Stated, Turn,
     },
@@ -123,8 +123,8 @@ pub(crate) struct MembershipCalls {
     /// One call at a time, from its read to its read back.
     turn: Mutex<()>,
     /// The replica's worker objects: a call's write of a row is decided
-    /// over them, and a call that wrote follows the store into them before
-    /// it answers ([`Self::followed`]).
+    /// over them, and its write of a status goes through them
+    /// ([`Self::connect_row`], [`Self::drain_row`]).
     objects: Arc<Objects<Members>>,
 }
 
@@ -191,14 +191,6 @@ impl MembershipCalls {
         }
     }
 
-    /// Reads the store to its end into the worker objects. Its caller
-    /// holds neither the door's turn nor a lock of the store: the holder's
-    /// follows run one at a time by its own lock, and never inside a
-    /// notification of the store ([`Objects::follow`]).
-    fn followed(&self) {
-        self.objects.follow(&*self.store);
-    }
-
     /// The door's write of a registration's facts, in its turn: decided
     /// over the worker objects, which the store follows
     /// ([`Objects::upsert`]). `None` where another writer moved the row
@@ -222,6 +214,19 @@ impl MembershipCalls {
     /// registration.
     fn take_row(&self, id: WorkerId, revision: u64) -> Option<MembershipChange> {
         self.objects.remove(&self.store, id, revision)
+    }
+
+    /// The door's connect signal for a row whose checks are off, in its
+    /// turn: written on the row's worker object, and the store is told
+    /// ([`Objects::connect_row`]).
+    fn connect_row(&self, id: WorkerId, revision: u64) {
+        self.objects.connect_row(&self.store, id, revision);
+    }
+
+    /// The door's drain of a row, as [`Self::connect_row`] writes a
+    /// status. Whether the row moved.
+    fn drain_row(&self, id: WorkerId, revision: u64) -> bool {
+        self.objects.drain_row(&self.store, id, revision)
     }
 
     /// The door's read of the row under `id`, in its turn: the record read
@@ -282,13 +287,10 @@ impl MembershipCalls {
     /// URL.
     ///
     /// The replica's worker objects hold the write when the call answers.
-    /// A row's write was decided over them in the turn. Behind a write
-    /// that answered, with the turn let go and no lock of the store held,
-    /// the door follows the store into them for what the table still
-    /// leads, a status ([`Self::followed`]). A decision reads those
-    /// objects, so none made behind an acknowledged registration, drain or
-    /// removal reads the fleet as it stood before the call. A refused call
-    /// follows nothing.
+    /// A row's write was decided over them in the turn, and a status is
+    /// written on the object first. A decision reads those objects, so
+    /// none made behind an acknowledged registration, drain or removal
+    /// reads the fleet as it stood before the call.
     fn call(
         &self,
         call: &'static str,
@@ -299,9 +301,6 @@ impl MembershipCalls {
         let turn = self.turn.lock();
         let answer = leading().and_then(write);
         drop(turn);
-        if answer.is_ok() {
-            self.followed();
-        }
         if let Err(refusal) = &answer {
             audit_refusal(call, by, refusal.code(), refusal.message(), None);
         }
@@ -374,13 +373,14 @@ impl MembershipCalls {
         // An engine that stands as ranks takes a registration that states
         // its width: a plain row beside its ranks is the engine twice, and
         // one rank laid alone would offer what the others do not. The URL
-        // may be the engine's or a rank's own. A caller that did not make
-        // the ranks is told so first, as the wide call tells it: an add
-        // asks no maker.
+        // may be the engine's or a rank's own: the ranks are asked under
+        // the address the standing row dials, its key where it names no
+        // engine. A caller that did not make the ranks is told so first,
+        // as the wide call tells it: an add asks no maker.
         {
             let engine = standing
                 .as_ref()
-                .map_or(spec.url.as_str(), |row| row.facts.engine.as_str());
+                .map_or(spec.url.as_str(), |row| dial_address(&row.facts));
             let mut ranks = self.rows_of(engine);
             ranks.retain(|row| row.facts.key != engine);
             if !ranks.is_empty() {
@@ -438,7 +438,7 @@ impl MembershipCalls {
         // from the old incarnation. Read before the connect signal moves it.
         let carried = now.status != WorkerStatus::Pending;
         if !now.facts.health.probes {
-            self.store.connected(id, now.revision, &|| true);
+            self.connect_row(id, now.revision);
             if request.wait_ready {
                 (now, epoch, at) = (self.read(id)?, self.store.epoch(), self.place());
             }
@@ -528,9 +528,9 @@ impl MembershipCalls {
         } else if standing.status == WorkerStatus::Draining {
             (worker_wire::relabelled(&standing), false)
         } else {
-            self.store
-                .set_status(standing.id, WorkerStatus::Draining, standing.revision)
-                .ok_or_else(moved)?;
+            if !self.drain_row(standing.id, standing.revision) {
+                return Err(moved());
+            }
             let event =
                 worker_wire::status_changed(standing.id, standing.status, WorkerStatus::Draining);
             (event, true)
@@ -653,6 +653,14 @@ impl Turn for CallTurn<'_> {
 
     fn remove(&self, id: WorkerId, revision: u64) -> Option<MembershipChange> {
         self.door.take_row(id, revision)
+    }
+
+    fn connect(&self, id: WorkerId, revision: u64) {
+        self.door.connect_row(id, revision);
+    }
+
+    fn drain(&self, id: WorkerId, revision: u64) -> bool {
+        self.door.drain_row(id, revision)
     }
 
     fn check_term(&self) -> Result<(), MembershipWriteRefused> {
@@ -865,7 +873,6 @@ impl ReplicaMembershipWriter {
                 // The worker objects hold the write when the call answers,
                 // as behind a control call's ([`MembershipCalls::call`]).
                 drop(turn);
-                self.door.followed();
                 Ok(answer)
             }
             Err(refusal) => {
@@ -957,6 +964,14 @@ impl Turn for ReplicaTurn<'_> {
 
     fn remove(&self, id: WorkerId, revision: u64) -> Option<MembershipChange> {
         self.host.door.take_row(id, revision)
+    }
+
+    fn connect(&self, id: WorkerId, revision: u64) {
+        self.host.door.connect_row(id, revision);
+    }
+
+    fn drain(&self, id: WorkerId, revision: u64) -> bool {
+        self.host.door.drain_row(id, revision)
     }
 
     fn check_term(&self) -> Result<(), MembershipWriteRefused> {
@@ -1247,9 +1262,9 @@ pub(crate) mod tests {
     /// lends as the door's last call left it. A worker registered through
     /// the door is named by a decision behind the call. One whose
     /// deregistration was acknowledged is named by none behind it, and
-    /// neither is one whose drain was acknowledged. The replica's own
-    /// writer shares the door's turn and its follow: a worker it drains is
-    /// named by none behind its answer.
+    /// neither is one whose drain was acknowledged: a drain is written on
+    /// the worker object first. The replica's own writer shares the door's
+    /// turn: a worker it drains is named by none behind its answer.
     #[tokio::test]
     async fn a_decision_behind_an_acknowledged_call_reads_the_fleet_the_call_left() {
         use std::collections::BTreeSet;
@@ -1300,8 +1315,6 @@ pub(crate) mod tests {
         assert_eq!(named(), BTreeSet::from([ids[2]]));
         // The last worker is drained through the replica's own writer,
         // over the same door: no decision behind its answer names a worker.
-        // A drain is the table's write still, so the writer's follow is
-        // what takes it to the object.
         let hosted = ReplicaMembershipWriter::new(Arc::clone(&door), operator(), under(TERM));
         let last = WorkersStore::get(&*store, ids[2]).expect("the row stands");
         let by = Remover::Registrant(&last.maker);
@@ -1508,21 +1521,27 @@ pub(crate) mod tests {
     /// over any row that stands, and writes nothing.
     #[test]
     fn an_add_over_a_row_written_around_the_holder_is_refused() {
-        let (store, door) = door();
-        let facts = WorkerFacts {
-            key: URL.to_owned(),
-            incarnation: 1,
-            wire_modes: WireModes::GRPC,
-            models: vec!["model-a".to_owned()],
-            ..WorkerFacts::default()
-        };
-        store.upsert_by(facts, Registrant::Control);
-        let stood = (store.epoch(), store.by_key(URL));
-        let refused = door
-            .register(&operator(), under(TERM), &ask(spec(URL), Mode::Add))
-            .expect_err("the URL stands");
-        assert_eq!(refused.code(), Code::AlreadyExists);
-        assert_eq!((store.epoch(), store.by_key(URL)), stood);
+        // A row that names its engine, as every writer of the crate lays
+        // one, and a row that names none: its ranks are asked under its
+        // key, and it has none.
+        for engine in [URL, ""] {
+            let (store, door) = door();
+            let facts = WorkerFacts {
+                key: URL.to_owned(),
+                engine: engine.to_owned(),
+                incarnation: 1,
+                wire_modes: WireModes::GRPC,
+                models: vec!["model-a".to_owned()],
+                ..WorkerFacts::default()
+            };
+            store.upsert_by(facts, Registrant::Control);
+            let stood = (store.epoch(), store.by_key(URL));
+            let refused = door
+                .register(&operator(), under(TERM), &ask(spec(URL), Mode::Add))
+                .expect_err("the URL stands");
+            assert_eq!(refused.code(), Code::AlreadyExists, "engine {engine:?}");
+            assert_eq!((store.epoch(), store.by_key(URL)), stood);
+        }
     }
 
     #[test]
@@ -1593,7 +1612,7 @@ pub(crate) mod tests {
         door.register(&operator(), under(TERM), &ask(spec(URL), Mode::Add))
             .expect("registered");
         let old = store.get(numbered(URL, 0)).expect("the first life");
-        store.set_status(old.id, WorkerStatus::Ready, old.revision);
+        door.connect_row(old.id, old.revision);
         let old = store.get(old.id).expect("the first life, ready");
 
         let told = door

@@ -1892,7 +1892,7 @@ the worker crate's structures, and the one engine.
 |---|---|---|
 | workers | records in the store, and worker objects kept in step with them | worker objects in a worker-crate registry; beside each, the code that keeps the objects holds what a registration stated and the object does not hold as stated (10.3); the membership log that watchers and standbys read stays |
 | lists | the store's published copy; a single request's decision reads the registry's published list of the model's single workers, a pair's, at its prefill and at its decode call, the lists of its two sides, and a prefill or a decode request that stands alone the list of its own phase's workers | the registry's published lists by role and protocol, with the engine's value beside each (decision 10) |
-| health | the worker crate's health checker over the worker objects, on the leader; each outcome is copied into the store's record, an object's status follows its record's, and a decision reads the object's | the same checker; a decision reads the object's own status; a gateway's veto on a worker stays in the store |
+| health | the worker crate's health checker over the worker objects, on the leader; each outcome moves the object, the store's record is told the status that stands, and a decision reads the object's | the same checker; a decision reads the object's own status; a gateway's veto on a worker stays in the store |
 | loads | the worker crate's load monitor over the worker objects, while the replica leads: a decision is given its snapshot where the document reads reports and keeps none, and reads the overload verdict on the object; the crate's own poller runs no more, and the store's load table is written by nothing and read by no decision | the worker crate's load monitor, publishing `LoadSnapshot` (decision 10). Every worker is judged by the thresholds its object states, so the loads of every worker the controller dials are read: no new cost against classic as it runs by default, whose gateway hands each worker of an engine the same two defaults and an external worker none at its registration, as a controller's objects state them. A gateway started with `--disable-load-monitoring` polls by need, and this monitor polls every group |
 | cache events | an index of the store's own; a decision reads none yet | the kv-index crate's index, filled by the worker crate's collector |
 | sessions | the engine's session table for a single request, one for each document | the engine's session table |
@@ -1945,7 +1945,7 @@ tells the data once more:
 
 | Copy | Where | Read by |
 |---|---|---|
-| the worker record | the store's table of records (`store/memory.rs`) | the registration calls, for a record's status; the load poller, and the follower of cache events for whether a worker's events are indexed, each until it reads the worker objects; a watcher's and a standby's first copy |
+| the worker record | the store's table of records (`store/memory.rs`) | the load poller, and the follower of cache events for whether a worker's events are indexed, each until it reads the worker objects; a watcher's and a standby's first copy |
 | a copy of the record's facts | beside the worker objects (`worker_host/objects.rs`) | the code that keeps the objects, to tell a record that changed under its object |
 | the worker object | the worker-crate registry | the health checker, the follower of cache events and a decision |
 | the remainder: 17 of the 24 facts and one bit of an eighteenth, with the record's id and revision | beside each worker object (`worker_host/remainder.rs`) | a decision, for the record's id, whether the worker takes images, its wire modes and from where it is reached. A pair's classes read its engine kind and its pairing descriptor too. What the worker states for a request's hard demands is lent with the list, and no frame states a demand yet |
@@ -1953,8 +1953,8 @@ tells the data once more:
 | the membership log's event | `service/replication/log.rs` | a watcher behind its first copy; a standby |
 
 A leader's write of a record is decided over the worker object since step 1 below, and the
-table follows it. The record still leads a status and a first copy, and the
-object follows it there. After the switch the object leads: a worker's data
+table follows it. The object leads a status too since step 3, and the table is told it. The
+record still leads a first copy. After the switch the object leads: a worker's data
 stands once, as its worker object with its remainder beside it, and the log still tells it. The
 remainder is the copy that stays. The table of records and the second copy of the facts end
 with step 4 below. The published copy ends when its readers, a pick's booking and a gateway's
@@ -1981,7 +1981,7 @@ read back (step 1 below). Of the 24 facts a registration states:
 | rank and width | a width above one, and a rank unless the worker is its engine whole | a width of one or of none, and a rank stated beside either |
 | the wire modes | the one protocol the object speaks | the other protocols of the set |
 | the engine's kind | the runtime the worker crate reads the name as | a name that crate does not know, and a known name as it was written |
-| the health policy | the checks in whole seconds, off where the controller cannot dial the worker | a part of a second, and the policy of a worker built with its checks off |
+| the health policy | the checks in whole seconds, each threshold at least one, off where the controller cannot dial the worker | a part of a second, a threshold of none, and the policy of a worker built with its checks off |
 | the overload thresholds | where a program asks for them, as the controller's does, an engine's worker's own over the program's defaults and an external worker's own alone | which of them an engine's worker stated |
 | the drain window | the window in force | a window stated equal to the object's default, which reads back as none |
 
@@ -2013,10 +2013,10 @@ A fact leaves the remainder when the worker object gets a field that holds it as
    store over a write of the registry. The store takes a decided change only where the record
    it was decided over still stands at the revision the keeper read, tested under the
    membership lock: a write that landed between the two is never written over, and the keeper
-   reads the store again before it answers. Until step 3 a first copy is still cut from the table,
-   and a call reads the status of a record there. Until step 3 a status is still the
-   table's word: a drain and a connect signal write the table, the store hands a record the
-   status its table holds, and a call follows the store into the objects before it answers. A
+   reads the store again before it answers. A first copy is still cut from the table, until the
+   last part of step 2. Since step 3 a status is the object's
+   word: a drain and a connect signal write the object and tell the table, a key's next life
+   starts in the status its worker object stood in, and a call's answer waits on no follow. A
    change the store took and the registry did not get is laid by the task that follows the
    table, while that task stands. A change that moves a fact the object holds builds the object again: the
    new object takes the standing one's place under its id, with its running state, as the code
@@ -2026,7 +2026,10 @@ A fact leaves the remainder when the worker object gets a field that holds it as
    watch's events to its own worker objects **[built]**. A watcher's and a
    standby's first copy is cut from the objects and their remainders behind step 3, because a
    copy's statuses must be the ones the log last told **[planned]**.
-3. No health outcome is copied into a record: a decision reads the object's status, as a single
+3. No health outcome is judged over a record. It moves the worker object, whose status leads,
+   and the record is told the status that stands, for the log and a first copy **[built]**. A
+   connect signal and a drain are written the same way **[built]**. The store's own machine
+   for a health outcome is deleted **[planned]**. A decision reads the object's status, as a single
    request's does on main.
 4. The table of records, the second copy of the facts, the two conversions between a record
    and an object, and the task that follows the table are deleted.
@@ -2044,8 +2047,8 @@ membership event of its leader's log, and each restore, to the code that keeps t
 objects (the first part of step 2). For an event with a record that code builds the object,
 hands the store the event at its place in the log, and puts the object in the registry where
 the store took the event. A removal's object leaves the registry first. A record changed in
-place keeps the instant it was admitted at. A status is still the table's word, and it is
-copied onto the object in the same turn. A restore is the store's restore and the read of its
+place keeps the instant it was admitted at. A status the leader tells is written to the table and
+laid on the object in the same turn. A restore is the store's restore and the read of its
 records in one turn of that code. A first copy is still cut from the table: a later
 part of step 2.
 
@@ -2054,12 +2057,12 @@ before it writes: the record under an address, the record under an id, and an en
 It reads them back from the worker objects (the second part of step 2), in the turn of the code
 that keeps them and behind that code's read of the store to its end. So a call's test and the
 write behind it read the record from one copy, and a call that waited behind another writer reads what that
-writer left. A status is still the table's word, so a record read this way carries the status
-the table holds. An engine's records are found by the list of ranks kept beside the objects,
+writer left. A record read this way carries the status its worker object states (step 3).
+An engine's records are found by the list of ranks kept beside the objects,
 where the store passed over every record under the membership lock: that read of the table is
-deleted. A first copy stays on the table until step 3. Its statuses must be the ones the log
-last told at its place, and until an object's status leads the table alone holds them under
-the lock that orders the log.
+deleted. A first copy stays on the table until the last part of step 2. Its statuses must be the ones the log
+last told at its place: the table holds exactly those, under
+the lock that orders the log, and an object can stand one tell ahead of it.
 
 **A watcher's events through the worker objects [built].** A gateway's watcher hands each
 event of a controller's worker watch, and the watch's first copy at its last page, to the
@@ -2068,6 +2071,22 @@ applier does. So the object of a record stands when the event that told it retur
 host of the watcher follows nothing behind the watch. A first copy keeps the object of a
 record that stands through it. The store's two entries for a watcher, a told change and a
 first copy, have no caller in the product but that code.
+
+**An object's status leads [built].** On the replica that leads, a status is written on the
+worker object and the store is told it (the first part of step 3). A probe's outcome goes to
+the worker registry's own health machine, which moves the object. The code that keeps the
+objects then tells the store the status that stands, under the object's own lock, through one
+entry that asks the writer's lead under the membership lock. A move the store takes no word
+of is taken back in that same turn of the object's lock: the object takes the status its
+record holds. A registration call's connect signal and its drain go through
+that entry too: the store is told first, and the object moves where the store took the
+status. The locks in their order: the object's own, then the store's membership lock. No
+holder of the store's lock takes an object's, and no decision takes one. From the table to an
+object there is one way, the told one: a standby's applier and a gateway's watcher lay each
+status their leader tells, and each status of a first copy. The code that keeps a
+controller's objects copies no status from its own store's tail: with that copy, two moves in
+a row could end with the object at the older one. The store's own health machine has no
+caller in the product, and the next change deletes it.
 
 A lease keeps naming its worker by the record's id, never by a place in a list: a gateway
 reports on a lease later and across membership changes.

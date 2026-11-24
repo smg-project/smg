@@ -210,9 +210,11 @@ fn registration_line<H: WorkflowHost>(
 
 /// Build a removal that selects workers, marks their rows draining, waits
 /// for them to settle and removes their rows. The holder drops the objects
-/// when it follows the store. The drain marks the row: routing reads the
-/// row's status, and a holder built with [`Objects::with_status_followed`]
-/// mirrors it onto the held object.
+/// when it follows the store. The drain is the door's write. A door with
+/// a holder marks the worker object draining and tells its row, so a
+/// decision that reads the object's status picks it no more. Where a door
+/// marks the row alone, a holder built with
+/// [`Objects::with_status_followed`] mirrors it onto the held object.
 ///
 /// A step drops from the job's lists a worker it leaves standing, as the
 /// registry's steps do: a host step behind reads the workers the removal

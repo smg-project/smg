@@ -21,8 +21,8 @@ use crate::{
     store::{
         membership::{FactPastBound, NotRegistrant, WorkerFactsChange},
         pairing::PairingDescriptor,
-        HealthSink, MembershipChange, MemoryStore, Registrant, WorkerFacts, WorkerPatch, WorkerRow,
-        WorkerStatus, WorkersStore,
+        MembershipChange, MemoryStore, Registrant, WorkerFacts, WorkerPatch, WorkerRow,
+        WorkerStatus,
     },
 };
 
@@ -305,6 +305,18 @@ pub(crate) trait Turn {
     /// The turn's removal of a row, as [`Self::upsert`] writes a
     /// registration.
     fn remove(&self, id: WorkerId, revision: u64) -> Option<MembershipChange>;
+
+    /// The turn's connect signal for the row `id`, read at `revision`, a
+    /// row whose checks are off: ready at once, unless it drains or is
+    /// ready. A door with a holder writes it on the row's worker object,
+    /// and the store is told
+    /// ([`Objects::connect_row`](super::Objects::connect_row)).
+    fn connect(&self, id: WorkerId, revision: u64);
+
+    /// The turn's drain of the row `id`, read at `revision`, as
+    /// [`Self::connect`] writes a status. Whether the row moved: `false`
+    /// where another writer moved it under the turn.
+    fn drain(&self, id: WorkerId, revision: u64) -> bool;
 
     /// Check the term ahead of a write. A registration asks before each
     /// row it writes and each row it removes.
@@ -648,7 +660,6 @@ fn write_row(
         }
         Some((_, WorkerFactsChange::InPlace)) => {}
     }
-    let store = turn.store();
     let probes = facts.health.probes;
     let change = turn.upsert(facts, maker.clone());
     let change = change.ok_or(MembershipWriteRefused::Moved)?;
@@ -666,7 +677,7 @@ fn write_row(
     if let Some(row) = turn.row(change.id()) {
         turn.laid(&row);
         if !probes {
-            store.connected(row.id, row.revision, &|| true);
+            turn.connect(row.id, row.revision);
         }
     }
     turn.told(wrote);
@@ -734,11 +745,10 @@ pub(crate) fn drain(
     if row.status == WorkerStatus::Draining {
         return Ok(MembershipWriteOutcome::Unmoved(row.id));
     }
-    let store = turn.store();
-    changed(
-        store.set_status(row.id, WorkerStatus::Draining, row.revision),
-        MembershipWriteOutcome::Draining,
-    )
+    if !turn.drain(row.id, row.revision) {
+        return Err(MembershipWriteRefused::Moved);
+    }
+    Ok(MembershipWriteOutcome::Draining(row.id))
 }
 
 /// Remove the guarded row while the door holds its turn.
@@ -898,6 +908,19 @@ pub(super) mod tests {
 
             fn remove(&self, id: WorkerId, revision: u64) -> Option<MembershipChange> {
                 self.store().remove(id, revision)
+            }
+
+            fn connect(&self, id: WorkerId, revision: u64) {
+                let standing = self.store().get(id).map(|row| row.status);
+                if !matches!(standing, Some(WorkerStatus::Draining | WorkerStatus::Ready)) {
+                    self.store().set_status(id, WorkerStatus::Ready, revision);
+                }
+            }
+
+            fn drain(&self, id: WorkerId, revision: u64) -> bool {
+                self.store()
+                    .set_status(id, WorkerStatus::Draining, revision)
+                    .is_some()
             }
 
             fn row(&self, id: WorkerId) -> Option<WorkerRow> {
