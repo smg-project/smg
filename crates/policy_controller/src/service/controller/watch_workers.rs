@@ -841,7 +841,7 @@ pub(crate) mod tests {
         WATCHES_MAX,
     };
     use crate::{
-        engine::view::{LoadRow, WorkerId},
+        engine::view::WorkerId,
         service::{
             controller::{
                 decision_slots::tests::holder,
@@ -856,8 +856,8 @@ pub(crate) mod tests {
             proto::{self, worker_event::Event},
         },
         store::{
-            Journal, LeasesStore, LoadSink, LoadSource, MembershipChange, MemoryStore, Position,
-            WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
+            Journal, LeasesStore, MembershipChange, MemoryStore, Position, WorkerFacts,
+            WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
         },
         worker_host::{Members, Objects},
     };
@@ -1573,30 +1573,6 @@ pub(crate) mod tests {
             panic!("the next write of the watcher's model: {registered:?}");
         };
         assert_eq!(row.id, again.0);
-    }
-
-    #[tokio::test]
-    async fn a_load_write_is_no_place_of_the_log_and_wakes_no_watcher() {
-        let leader = leader();
-        let id = leader.register(0, 1, "model-a");
-        let mut stream = leader.watch(Start::Snapshot, &[]);
-        next(&mut stream).await;
-        turns().await;
-        let (woken, waker) = Woken::waker();
-        parks(&mut stream, &waker);
-        let before = (leader.head(), leader.feed.log.head());
-        let now = Instant::now();
-        for _ in 0..10_000 {
-            leader
-                .store
-                .record(id, 0, LoadRow::default(), now, LoadSource::Stream);
-        }
-        // A load write tells the journal nothing: it is no position of this
-        // log, wakes no task and hands the watcher nothing.
-        assert_eq!((leader.head(), leader.feed.log.head()), before);
-        turns().await;
-        assert_eq!(woken.wakes(), 0, "a load row woke the stream");
-        parks(&mut stream, &waker);
     }
 
     /// A watched write wakes no watch itself. Once its store has let its

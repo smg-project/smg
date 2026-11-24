@@ -31,9 +31,9 @@
 //! follower polls no engine, drops the load records its workers' event
 //! streams carry and holds no load report: the monitor is stopped where a
 //! lead ends, and its snapshot is published empty. Its first poll goes out
-//! at its promotion. No load row is written to the store. The controller
-//! keeps no ingestion driver of its own: its loads come from this monitor
-//! and its cache events from the worker host's feed.
+//! at its promotion. The store holds no load row. The controller keeps no
+//! ingestion driver of its own: its loads come from this monitor and its
+//! cache events from the worker host's feed.
 //!
 //! Every socket a listener accepts is set to send at once: a small answer
 //! never waits for the peer's acknowledgement of the write before it.
@@ -774,10 +774,7 @@ impl Controller {
         }
     }
 
-    /// The store the serve's tasks and the scopes' calls feed and read. The
-    /// serve writes no load row to it and drops none: a host that writes
-    /// load rows through this handle drops them itself where its role
-    /// turns.
+    /// The store the serve's tasks and the scopes' calls feed and read.
     pub fn store(&self) -> Arc<MemoryStore> {
         Arc::clone(&self.shared.store)
     }

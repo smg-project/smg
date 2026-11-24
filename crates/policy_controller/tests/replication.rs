@@ -37,7 +37,7 @@ use std::{
 use net::{http_get, loopback};
 use prost::Message as _;
 use smg_policy_controller::{
-    engine::{LoadRow, Role, WireModes, WorkerId},
+    engine::{Role, WireModes, WorkerId},
     service::{
         controller::{
             Config, Controller, ElectionConfig, Error, LeasePlace, Listener, Readiness, Scope,
@@ -49,9 +49,7 @@ use smg_policy_controller::{
             replication_event::Event as Sent, worker_event::Event,
         },
     },
-    store::{
-        HealthPolicy, LoadSink, LoadSource, MemoryStore, WorkerFacts, WorkerStatus, WorkersStore,
-    },
+    store::{HealthPolicy, MemoryStore, WorkerFacts, WorkerStatus, WorkersStore},
 };
 use tokio::{
     sync::{mpsc, oneshot},
@@ -460,13 +458,6 @@ fn facts(key: &str, incarnation: u64, max_running: u32) -> WorkerFacts {
     }
 }
 
-fn running(count: u32) -> LoadRow {
-    LoadRow {
-        running: count,
-        ..LoadRow::default()
-    }
-}
-
 /// One worker and `more` watched writes of it: its status, turned each
 /// time.
 fn writes(store: &MemoryStore, more: u32) -> WorkerId {
@@ -565,19 +556,13 @@ async fn a_standby_is_sent_the_log_from_its_place_and_restored_from_any_other() 
         assert_eq!(cases(&next.events), ["membership"]);
         // The first stream reads the same event: one log, two readers.
         assert_eq!(fresh.batch().await.events, next.events);
-        // A load row on the leader's own table is journaled nowhere and
-        // sent to no standby: the head stands where the status left it.
-        leader
-            .store
-            .record(id, 0, running(9), Instant::now(), LoadSource::Stream);
         // An idle second: the leader says where its head stands.
         let beat = joined.beat().await;
         assert_eq!((beat.first_seq, beat.term), (nth(7), term));
 
         // A position past the head and a position that names no term: each
         // is told to re-sync and restored on the stream it holds, at the
-        // leader's head, with no load row of the leader's table, and reads
-        // on from there.
+        // leader's head, with no load row, and reads on from there.
         for lost in [
             place(nth(70), term),
             proto::ReplicaHello {
@@ -860,8 +845,7 @@ impl Twin {
 }
 
 /// Registers, flips, refreshes, replaces and removes workers over a few
-/// keys and writes their load rows, until `stop`. A load row is a write of
-/// the store's own table: it moves no place of the log.
+/// keys, until `stop`.
 fn churn(store: &MemoryStore, stop: &AtomicBool) -> u32 {
     let mut state = 7u64;
     let mut draw = |below: u64| {
@@ -899,16 +883,8 @@ fn churn(store: &MemoryStore, stop: &AtomicBool) -> u32 {
                 };
                 store.set_status(row.id, status, row.revision);
             }
-            (Some(row), _) => {
-                let rank = draw(2) as u16;
-                store.record(
-                    row.id,
-                    rank,
-                    running(rounds),
-                    Instant::now(),
-                    LoadSource::Stream,
-                );
-            }
+            // The other half of the draws writes nothing.
+            (Some(_), _) => {}
         }
         thread::sleep(Duration::from_micros(100));
     }
@@ -947,8 +923,7 @@ async fn a_snapshot_and_the_batches_after_it_are_the_next_snapshot_under_a_write
             written_past(&leader.store, taken.replication_seq).await;
             streams.push((standby, taken));
         }
-        // The events the case counts are waited for, never timed: a load
-        // row of the writer is no event of the log.
+        // The events the case counts are waited for, never timed.
         let first = streams[0].1.replication_seq;
         written_past(&leader.store, first + 100).await;
         stop.store(true, Ordering::Relaxed);
@@ -1007,11 +982,7 @@ async fn the_snapshot_call_restores_no_standby() {
     let dir = tempfile::tempdir().expect("a temp dir");
     with_leader(shared(&dir), |leader| async move {
         let id = writes(&leader.store, 2);
-        leader
-            .store
-            .record(id, 0, running(1), Instant::now(), LoadSource::Stream);
-        // A standby's snapshot rides its stream: the row, and no load row
-        // of the leader's table.
+        // A standby's snapshot rides its stream: the row, and no load row.
         let restored = snapshot(leader.replication).await.expect("a snapshot");
         let rows: Vec<u64> = restored.workers.iter().map(|row| row.id).collect();
         assert_eq!(rows, [id.0]);
@@ -1087,9 +1058,6 @@ async fn a_store_past_one_message_restores_a_standby_whole_on_its_stream() {
                 .upsert(facts(&format!("http://{wide}-{row}:8000"), 1, 0));
         }
         let id = writes(&leader.store, 3);
-        leader
-            .store
-            .record(id, 0, running(7), Instant::now(), LoadSource::Stream);
         let mut standby = replicate(leader.replication, place(1, 0))
             .await
             .expect("a stream");
@@ -1100,8 +1068,7 @@ async fn a_store_past_one_message_restores_a_standby_whole_on_its_stream() {
         // half of what the transport reads.
         let page = 2 * 1024 * 1024 + 64;
         assert!(standby.parts.iter().all(|part| *part <= page));
-        // Every row the leader holds, at its head, and no load row of its
-        // table.
+        // Every row the leader holds, at its head, and no load row.
         let held = leader.store.checkpoint();
         let at = (restored.replication_seq, restored.replication_term);
         assert_eq!(at, (held.at.seq, held.at.term));
@@ -1718,12 +1685,6 @@ impl Replica {
         ((cut.at.seq, cut.at.term), (cut.epoch, rows))
     }
 
-    /// How many load rows the replica's own table holds.
-    fn load_rows(&self) -> usize {
-        let rows = self.store.checkpoint().rows;
-        rows.iter().map(|row| self.store.ranks(row.id)).sum()
-    }
-
     /// Waits, within 20 s, until the replica stands at `place`.
     async fn stands_at(&self, place: (u64, u64)) {
         let deadline = Instant::now() + Duration::from_secs(20);
@@ -1781,7 +1742,7 @@ async fn promoted(addr: SocketAddr) -> proto::Snapshot {
     not(target_os = "linux"),
     ignore = "the follower binds 127.0.0.2: off Linux that takes a loopback alias"
 )]
-async fn a_promoted_standby_holds_every_row_of_its_leader_and_no_load_row() {
+async fn a_promoted_standby_holds_every_row_of_its_leader() {
     let dir = tempfile::tempdir().expect("a temp dir");
     let mut leader = Replica::serve("replication-0", LEADER, 0, shared(&dir)).await;
     leader.leads().await;
@@ -1798,19 +1759,15 @@ async fn a_promoted_standby_holds_every_row_of_its_leader_and_no_load_row() {
     leader
         .store
         .set_status(polled, WorkerStatus::Ready, revision);
-    // A row nobody polls, with a load row on the leader's table.
-    let quiet = writes(&leader.store, 0);
-    leader
-        .store
-        .record(quiet, 0, running(1), Instant::now(), LoadSource::Stream);
+    // A row nobody polls.
+    writes(&leader.store, 0);
     // The leader writes while the standby follows.
     let stop = Arc::new(AtomicBool::new(false));
     let writer = {
         let (store, stop) = (Arc::clone(&leader.store), Arc::clone(&stop));
         thread::spawn(move || churn(&store, &stop))
     };
-    // The events the case counts are waited for, never timed: a load row
-    // of the writer is no event of the log.
+    // The events the case counts are waited for, never timed.
     written_past(&leader.store, began.0 + 100).await;
     stop.store(true, Ordering::Relaxed);
     let rounds = writer.join().expect("the writer");
@@ -1819,10 +1776,6 @@ async fn a_promoted_standby_holds_every_row_of_its_leader_and_no_load_row() {
     assert!(events > 100, "{rounds} rounds wrote {events} events");
     standby.stands_at(head).await;
     assert_eq!(standby.held().1, wrote, "{rounds} rounds");
-    // No load row crossed: the leader's table holds the quiet row's, and
-    // the standby's holds none.
-    assert!(leader.store.load(quiet, 0).is_some());
-    assert_eq!(standby.load_rows(), 0, "a standby is sent no load row");
     // The leader's load monitor polls the ready worker. The standby holds
     // the same row and polls nobody while it follows: a while later, its
     // counter still reads none.

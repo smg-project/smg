@@ -7,12 +7,12 @@
 
 use std::time::{Duration, Instant};
 
-use super::{super::StandingVeto, admit, facts, load, member, StoreSnapshot, ASKER, MODEL};
+use super::{super::StandingVeto, admit, facts, member, StoreSnapshot, ASKER, MODEL};
 use crate::{
     engine::view::{Role, WorkerId},
     store::{
-        GatewayId, HealthSink, LeasesStore, LoadSink, LoadSource, MemoryStore, Reachability,
-        VetoWrite, WorkerFacts, WorkersStore,
+        GatewayId, HealthSink, LeasesStore, MemoryStore, Reachability, VetoWrite, WorkerFacts,
+        WorkersStore,
     },
 };
 
@@ -212,7 +212,7 @@ fn a_veto_that_left_is_read_no_more() {
         ["http://a:8000", "http://b:8000", "http://c:8000"].map(|key| member(&store, key));
     ids.sort_unstable();
     let [leaving, ending, staying] = ids;
-    let (soon, until) = (t0 + 10 * MS, t0 + 60 * S);
+    let (soon, until) = (t0 + 10 * S, t0 + 60 * S);
     doubted(&store, ASKER, leaving, until, t0);
     doubted(&store, ASKER, ending, soon, t0);
     doubted(&store, ASKER, staying, until, t0);
@@ -231,8 +231,10 @@ fn a_veto_that_left_is_read_no_more() {
     );
 
     // A window's publication at the first veto's end takes its entry out:
-    // an ask dated before that end reads it no more.
-    store.record(staying, 0, load(1, 0), soon, LoadSource::Stream);
+    // an ask dated before that end reads it no more. A registration left
+    // the build that publication pays.
+    store.upsert(facts("http://d:8000", Role::Single, &[MODEL]));
+    store.publish(soon);
     assert_eq!(read(&store, MODEL, ASKER, t0), [doubt(staying)]);
 
     store.drop_gateways(&[ASKER]);

@@ -3,17 +3,15 @@
 //! embedded mode feeds the same store from its own process.
 //!
 //! The store holds what a decision reads and nothing a request path writes:
-//! membership, health, loads, reservations and leases. Every path that
-//! writes it today ends in one of these sinks, so the drivers that move into
-//! the controller (discovery, the handshake, the prober, the poll, the
-//! subscriptions, the relays) and the gateway's own copies of them in the
-//! embedded mode speak one set of traits:
+//! membership, health, reservations and leases. Every path that writes it
+//! today ends in one of these sinks, so the drivers that move into the
+//! controller (discovery, the handshake, the prober) and the gateway's own
+//! copies of them in the embedded mode speak one set of traits:
 //!
 //! | trait | who calls | how often |
 //! |---|---|---|
 //! | [`WorkersStore`] | discovery and the registration handshake, the control scope's register, patch and deregister calls | per membership change; a rollout of 512 workers is under one change per second |
 //! | [`HealthSink`] | every gateway's vetoes. A worker's status is its worker object's word, told by the holder of the objects | per veto a gateway sets or lifts |
-//! | [`LoadSink`] | the subscription task per record, the poll per engine per tick, the scrape per interval, a relay per frame | up to ten records per rank per second busy, one per second idle |
 //! | [`ReservationStore`] | a commit (a prefill slot, a decode room), a lease's end | two per pair dispatch |
 //! | [`LeasesStore`] | every decision, dispatch and completion report, the dispatch-deadline sweep, `Hello` pages | two to three frames per request |
 //!
@@ -26,9 +24,7 @@
 //!   registration key names the row revision it read; a stale one is refused
 //!   (`None`), never applied to the successor. The registry's status
 //!   transitions and probe completions work this way today.
-//! - **Late and duplicate records.** Load records are in stream order per
-//!   rank and replace the rank's row; a poll's row for a rank that pushed
-//!   since the poll began is dropped. A release of a lease or a reservation
+//! - **Late and duplicate records.** A release of a lease or a reservation
 //!   is idempotent.
 //! - **Instants.** The store is in-process; its instants are the host's
 //!   `Instant`. The wire carries durations only (a record's age, a lease's
@@ -40,9 +36,6 @@
 //!   gateway's `Hello` pages after a failover is. Reservations are exclusive
 //!   under one fenced leader; credits are rebuilt from `Hello`, never
 //!   replicated.
-//! - **Wire messages are the host's.** No second load message exists in
-//!   process: a load record enters as the view's [`LoadRow`] (the record's
-//!   routing core in its own names).
 //!
 //! [`MemoryStore`] is the one-process store behind every trait: the
 //! controller's own store once its drivers move in, and the double the
@@ -55,15 +48,12 @@
 //! world is published under the generation the store holds, which
 //! [`MemoryStore::apply`] alone replaces: a decision reads the world and its
 //! engine in one load.
-//!
-//! [`LoadRow`]: crate::engine::view::LoadRow
 
 pub(crate) mod applied;
 pub(crate) mod encoding;
 pub(crate) mod health;
 pub(crate) mod journal;
 pub(crate) mod leases;
-pub(crate) mod loads;
 pub mod membership;
 pub(crate) mod memory;
 pub mod pairing;
@@ -80,7 +70,6 @@ pub use journal::{Journal, Position};
 pub use leases::{
     DecodeMark, DecodeSide, LeaseRecord, LeaseRefused, LeaseState, LeasesStore, PickRecord, Sides,
 };
-pub use loads::{LoadSample, LoadSink, LoadSource, PollMode};
 #[cfg(feature = "controller")]
 pub(crate) use memory::DecodeIssue;
 pub use memory::{AtWork, Hand, LookOutcome, MemoryStore, StoreCheckpoint, StoreStats, Wake};

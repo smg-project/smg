@@ -2195,13 +2195,12 @@ pub const OVERLOAD_TOKEN_USAGE: f32 = 0.8;
 /// vetoed. The veto is evaluated per load report by the host and latched,
 /// never per request. The block names no threshold: a worker's
 /// registration states its own two, over its program's default where the
-/// program has one. The store's judge reads the switch, for each binding's
-/// pools. A gateway that runs a supplied document in its own process reads
-/// the switch where it builds its workers' default thresholds, and its
-/// routes read one shed word, both from that document: it refuses one
-/// whose bindings differ on either word. With no document supplied it
-/// reads its own two settings. A controller that judges on its worker
-/// objects does not read the switch yet.
+/// program has one. A gateway that runs a supplied document in its own
+/// process reads the switch where it builds its workers' default
+/// thresholds, and its routes read one shed word, both from that document:
+/// it refuses one whose bindings differ on either word. With no document
+/// supplied it reads its own two settings. A controller that judges on its
+/// worker objects does not read the switch yet.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct OverloadSpec {
