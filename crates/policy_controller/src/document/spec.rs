@@ -918,10 +918,11 @@ pub struct ConsistentHashParams {
     /// depth, a shorter request whole, and a text at four characters a
     /// token. A routing key the request's own id handed (a `rid` source)
     /// leads no prompt under this form: it names the session alone, and
-    /// the request is keyed by its prefix as one with no routing key. That
-    /// holds in a gateway's own process: no frame states where a key came
-    /// from, so under a controller's address the id's key places as any
-    /// other. Absent, a request with no routing key has none.
+    /// the request is keyed by its prefix as one with no routing key. A
+    /// gateway's frame states to a controller where the key came from.
+    /// The frame of a host older than that field states nothing, and
+    /// under it the id's key places as any other. Absent, a request with
+    /// no routing key has none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1))]
     pub prefix_tokens: Option<u32>,
