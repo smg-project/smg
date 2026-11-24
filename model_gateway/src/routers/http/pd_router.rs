@@ -141,7 +141,7 @@ fn own_failure(response: &Response) -> Option<PdSide> {
 /// The Prefill load is said sent where a dispatch shape hands the prefill's
 /// request to its client ([`PrefillAhead::sent`]), and released when the
 /// Prefill phase ends. A request refused on the way drops it unsent: the
-/// worker is counted no more, and the policy engine hears a release. The
+/// worker is counted no more, and Grand Central hears a release. The
 /// Decode guard rides on the response body, from the decode's send on
 /// ([`DecodeAhead::sent`]).
 struct PdLoadGuards {
@@ -156,7 +156,7 @@ struct PdLoadGuards {
 ///
 /// Each dispatch shape sends the decode's request in one place, and says so
 /// there ([`Self::sent`]): the guard a response keeps comes out of that call
-/// alone. Where the policy engine placed the pair, it hears the decode's
+/// alone. Where Grand Central placed the pair, it hears the decode's
 /// dispatch at that call and the decode's end where that guard is dropped. A
 /// decode that is never sent (its prefill failed, the request was refused on
 /// the way) is dropped whole: its worker is counted no more, and the engine
@@ -995,7 +995,7 @@ impl PDRouter {
                     tried: &tried_before,
                 },
                 sticky_key,
-                // The body's output limit, for the policy engine alone. The
+                // The body's output limit, for Grand Central alone. The
                 // selection may wait for admission, so what rides with it
                 // is the lease's reference: the body is read where the
                 // engine decides and nowhere else.
@@ -2182,7 +2182,7 @@ impl PDRouter {
                  dispatching to decode only"
             );
             // No prefill goes out: its load is let go as it was acquired,
-            // unsent, and the policy engine hears the prefill's side released.
+            // unsent, and Grand Central hears the prefill's side released.
             drop(prefill_ahead);
             None
         };
@@ -2654,7 +2654,7 @@ impl PDRouter {
 
     /// Select a PD pair and take its load. With Prefill admission enabled
     /// the selection runs at the head of the admission queue. `stated`
-    /// states what the policy engine alone reads of the request
+    /// states what Grand Central alone reads of the request
     /// ([`placement::Stated`]): the pair placement makes that call where
     /// the engine decides and nowhere else. The call rides with the
     /// selection while it waits, for a pair the classic policies pick too:
@@ -2696,8 +2696,8 @@ impl PDRouter {
     /// this router's registries, with no wire pinned and no test around it.
     /// `pairs` reads the pair index again. It is handed as a call, so that
     /// a pair the classic policies picked, which has nothing to ask, reads
-    /// nothing: the placement makes the call for an answer of the policy
-    /// engine alone.
+    /// nothing: the placement makes the call for an answer of Grand
+    /// Central alone.
     fn decode_again(
         &self,
         model_id: &str,
@@ -2844,7 +2844,7 @@ impl PDRouter {
                 upstream_sse,
                 source,
                 guard: decode_guard,
-                // The pair routes tell the policy engine no end yet, so
+                // The pair routes tell Grand Central no end yet, so
                 // the relay is handed no handle and says nothing.
                 end: placement::RequestEnd::default(),
                 headers: response_headers,
@@ -5723,13 +5723,13 @@ mod tests {
     /// The count route asks the pair's text question, and its request is
     /// decided as a single one over the prefill pool: by the model's main
     /// policy under the classic policies, by the binding of single requests
-    /// under the policy engine. Beside a cache-aware main policy with
+    /// under Grand Central. Beside a cache-aware main policy with
     /// round-robin sides the two sides read no text. So neither kind builds
     /// the count's text, and both place it on the same worker, the one that
     /// holds less.
     #[tokio::test]
     async fn a_count_beside_quiet_sides_is_placed_with_no_text_under_either_kind() {
-        use smg_policy_controller::document::AppliedSpec;
+        use smg_grand_central::document::AppliedSpec;
 
         use crate::{
             config::types::{RouterConfig, RoutingMode},
@@ -5747,7 +5747,7 @@ mod tests {
             ..Default::default()
         };
         let classic = PolicyRegistry::new(settings.policy.clone());
-        let engine = PolicyRegistry::for_policy_engine(
+        let engine = PolicyRegistry::for_engine(
             settings.policy.clone(),
             settings.routing_key_override.clone(),
         );
@@ -9402,7 +9402,7 @@ mod tests {
     }
 
     /// A router of one attempt over one healthy pair that is sent in `shape`,
-    /// with a policy engine placing its pairs, and what that engine's decode
+    /// with Grand Central placing its pairs, and what that engine's decode
     /// stage hears (`hearing_pairs_on`).
     async fn heard_pair_router(shape: Sends) -> (PDRouter, Heard) {
         let router = single_attempt_router();
@@ -9434,7 +9434,7 @@ mod tests {
         (router, heard)
     }
 
-    /// Every word the policy engine hears of one unstreamed chat request it
+    /// Every word Grand Central hears of one unstreamed chat request it
     /// placed on a healthy pair that is sent in `shape`, once the answer's
     /// body is read to its end.
     async fn heard_of_a_served_pair(shape: Sends) -> Vec<String> {
@@ -10078,7 +10078,7 @@ mod tests {
     /// not all go to one.
     #[tokio::test]
     async fn a_pair_request_keyed_by_its_bodys_id_reaches_the_engine_with_its_key() {
-        use smg_policy_controller::document::AppliedSpec;
+        use smg_grand_central::document::AppliedSpec;
 
         use crate::config::types::{RouterConfig, RoutingKeyOverrideConfig, RoutingMode};
 
@@ -10096,7 +10096,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let policies = PolicyRegistry::for_policy_engine(
+        let policies = PolicyRegistry::for_engine(
             settings.policy.clone(),
             settings.routing_key_override.clone(),
         );
@@ -10910,5 +10910,5 @@ mod tests {
         assert_eq!((prefill.load(), decode.load()), (0, 0));
     }
 
-    mod policy_engine;
+    mod grand_central;
 }

@@ -1,0 +1,16 @@
+{{- if (.Values.grandCentral).enabled }}
+{{- if .Values.grandCentral.podDisruptionBudget.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "smg.grandCentralName" . }}
+  labels:
+    {{- include "smg.labels" . | nindent 4 }}
+    app.kubernetes.io/component: grand-central
+spec:
+  minAvailable: {{ .Values.grandCentral.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "smg.grandCentralSelectorLabels" . | nindent 6 }}
+{{- end }}
+{{- end }}

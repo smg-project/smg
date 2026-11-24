@@ -116,7 +116,7 @@ pub(crate) struct Relay {
     /// The worker's load, released when the body is dropped.
     pub(crate) guard: WorkerLoadGuard,
     /// The handle the relay reports the stream's end through: its caller's
-    /// word on whether its route tells the policy engine its requests'
+    /// word on whether its route tells Grand Central its requests'
     /// ends. A route that tells them asks it of `guard`
     /// ([`RequestEnd::of`]). A route that tells none hands the empty
     /// handle, and the relay says nothing: the pair route, until it tells

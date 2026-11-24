@@ -1099,7 +1099,7 @@ impl Drop for StreamSpan {
 impl LoadGuards {
     /// The guards of an attempt whose every side goes out with the dispatch
     /// that follows: each is made from its placement's answer, which says
-    /// the dispatch where the policy engine placed the request.
+    /// the dispatch where Grand Central placed the request.
     // Always in line: on every request's path, and the call cost more than the body.
     #[inline(always)]
     pub fn new(selection: &WorkerSelection, routing_key: Option<&str>) -> Self {
@@ -1115,7 +1115,7 @@ impl LoadGuards {
 
     /// [`Self::new`] for a pair whose decode is owed its ask and its send
     /// behind its prefill ([`Placed::owed_behind_prefill`]): one request of
-    /// a sequential dispatch that the policy engine placed. A classic
+    /// a sequential dispatch that Grand Central placed. A classic
     /// pair's takes [`Self::new`]. The decode's guard is made
     /// ahead of its send ([`Placed::ahead`]): the decode is counted from
     /// here, and the dispatch says its send where the decode goes out

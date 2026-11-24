@@ -2,14 +2,14 @@
 //! of workers, what the router holds of them (the requests in flight, the
 //! routing keys with a request in flight), the policy's assignment mode, a
 //! list of steps and what the classic policy picked at each request. The
-//! policy controller crate replays the rows through its own decision
-//! (`crates/policy_controller/tests/classic/manual.rs`).
+//! Grand Central crate replays the rows through its own decision
+//! (`crates/grand_central/tests/classic/manual.rs`).
 //!
 //! This file is an ignored test of the gateway crate, kept beside the code
 //! it runs. It records from the checkout it is built in and writes the sheet
 //! under `CLASSIC_ROWS_OUT`, naming `CLASSIC_ROWS_COMMIT` as the commit it
-//! recorded from. The sheets the policy controller crate replays are in
-//! `crates/policy_controller/tests/classic/sheets`; to record this one again:
+//! recorded from. The sheets the Grand Central crate replays are in
+//! `crates/grand_central/tests/classic/sheets`; to record this one again:
 //!
 //! ```text
 //! CLASSIC_ROWS_OUT=<dir> CLASSIC_ROWS_COMMIT=<commit> \

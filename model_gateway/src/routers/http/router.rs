@@ -331,7 +331,7 @@ impl Router {
     /// Filters to workers serving the specified model. When model is "unknown"
     /// (generate endpoint without model), considers all HTTP workers. `tried`
     /// are the engines the request's failed attempts dispatched to (see
-    /// `PlacementInputs::tried`). `stated` states what the policy engine
+    /// `PlacementInputs::tried`). `stated` states what Grand Central
     /// alone reads of the request ([`placement::Stated`]): the placement
     /// calls it where the engine decides and nowhere else, so a body is read
     /// for it under the engine alone. Always inlined, as the placement's
@@ -576,7 +576,7 @@ impl Router {
                     .map(|ids| ids.iter().map(|&id| id as u32).collect())
             });
         let cache_namespace = CacheNamespace::derive(&typed_req.cache_partition());
-        // A classic policy is handed the text as before. The policy engine
+        // A classic policy is handed the text as before. Grand Central
         // is handed it where a stage of its document reads it, or where the
         // request names a cache partition, whose seed the engine states with
         // a prompt. The hint was read above and a document's answer follows
@@ -1548,7 +1548,7 @@ impl Router {
                     status,
                     upstream_sse,
                     source,
-                    // This router's routes tell the policy engine their
+                    // This router's routes tell Grand Central their
                     // requests' ends: the relay reports through the handle
                     // of the request's guard.
                     end: placement::RequestEnd::of(&load_guard),
@@ -7561,7 +7561,7 @@ mod tests {
     }
 
     /// A typed request's routing text is rendered for a classic policy, and
-    /// under the policy engine only where a stage of its document reads the
+    /// under Grand Central only where a stage of its document reads the
     /// text: the document here reads none. A request that names a cache
     /// partition is rendered there too, for its partition's seed.
     #[tokio::test]
@@ -7586,7 +7586,7 @@ mod tests {
         assert!(router.routing_derivatives(None, &salted).text.is_some());
     }
 
-    /// A typed request the policy engine placed reaches the engine by its
+    /// A typed request Grand Central placed reaches the engine by its
     /// load guard and by its answer: one dispatch where this route makes
     /// the guard, and one end with the status the attempt recorded, told
     /// through the answer the attempt keeps. No release.
@@ -7618,7 +7618,7 @@ mod tests {
         );
     }
 
-    /// A typed request states its body's output limit to the policy engine:
+    /// A typed request states its body's output limit to Grand Central:
     /// the route reads the body for it where the engine decides, through the
     /// body's own reader. A body that names no limit states none, as the
     /// case above hears.

@@ -945,7 +945,7 @@ def test_the_default_values_render_the_arguments_in_order():
 
 
 # Tags of digits alone, two workers whose tags are filled in as written, and
-# the policy controller's switch with the spec document the chart refuses it
+# Grand Central's switch with the spec document the chart refuses it
 # without.
 DIGIT_TAGS = ("1.16", "1.10", "20261115")
 WORKERS = (
@@ -953,7 +953,7 @@ WORKERS = (
     "  - name: one\n    engine: vllm\n    model: m\n    image:\n      tag: {}\n"
     "  - name: two\n    engine: vllm\n    model: m\n    image:\n      tag: {}\n"
 )
-CONTROLLER_ON = ("policyController.enabled=true", "policyController.spec.apiVersion=smg.policy/v1")
+CONTROLLER_ON = ("grandCentral.enabled=true", "grandCentral.spec.apiVersion=smg.policy/v1")
 
 
 def images(documents: list[dict]) -> set[str]:
@@ -972,7 +972,7 @@ def test_an_image_tag_written_as_a_number_is_refused_under_its_name(tmp_path):
     template prints a number as written: 1.10 is read as 1.1. The image name
     was rendered with a formatting error in the tag's place, and helm exited
     0. The schema refuses such a tag under the value's name: the router's and
-    a worker's, with the policy controller on or off, from a values file or
+    a worker's, with Grand Central on or off, from a values file or
     from ``--set``."""
     values = tmp_path / "values.yaml"
     for written in DIGIT_TAGS:

@@ -462,6 +462,7 @@ class RouterArgs:
     engine_metrics: bool = False
     epd_disaggregation: bool = False  # Enable Encode-Prefill-Decode disaggregated mode
     eviction_interval_secs: int = 120
+    grand_central: str = "off"
     # Pin a routing key's requests to one engine of a grouped data-parallel
     # worker: off (the default) or hash
     grouped_dp_sticky: str = "off"
@@ -606,7 +607,6 @@ class RouterArgs:
     # protocol: off, lenient or strict
     pd_pairing_mode: str = "lenient"
     policy: str | None = None
-    policy_controller: str = "off"
     policy_spec: str | None = None
     postgres_db_url: str | None = None
     # The bound on one Postgres history-store call (pool wait, connect and the
@@ -1025,11 +1025,11 @@ class RouterArgs:
             ),
         )
         routing_group.add_argument(
-            f"--{prefix}policy-controller",
+            f"--{prefix}grand-central",
             choices=["on", "off"],
-            default=RouterArgs.policy_controller,
+            default=RouterArgs.grand_central,
             help=(
-                "Choose off for the classic routing policies or on for the policy controller."
+                "Choose off for the classic routing policies or on for Grand Central."
                 " With on, the routing options keep their meaning through a policy document."
             ),
         )
@@ -1038,7 +1038,7 @@ class RouterArgs:
             metavar="FILE",
             default=RouterArgs.policy_spec,
             help=(
-                "Run a policy document with the policy controller."
+                "Run a policy document with Grand Central."
                 " The document replaces the routing options: one that is not at its"
                 " default is refused beside it by name. The two overload thresholds"
                 " stand beside it: the gateway builds its workers with them, unless"

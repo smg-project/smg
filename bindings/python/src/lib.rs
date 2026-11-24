@@ -589,6 +589,7 @@ struct Router {
     engine_metrics: bool,
     epd_disaggregation: bool,
     eviction_interval_secs: u64,
+    grand_central: String,
     grouped_dp_sticky: String,
     grpc_request_timeout_secs: u64,
     header_read_timeout_secs: u64,
@@ -660,7 +661,6 @@ struct Router {
     pd_admission_wait_secs: u64,
     pd_disaggregation: bool,
     pd_pairing_mode: String,
-    policy_controller: String,
     policy_spec: Option<String>,
     postgres_config: Option<PyPostgresConfig>,
     power_of_two_load_metric: String,
@@ -1053,12 +1053,12 @@ impl Router {
             })
     }
 
-    fn parse_policy_controller(&self) -> Result<bool, config::ConfigError> {
-        match self.policy_controller.as_str() {
+    fn parse_grand_central(&self) -> Result<bool, config::ConfigError> {
+        match self.grand_central.as_str() {
             "on" => Ok(true),
             "off" => Ok(false),
             other => Err(config::ConfigError::invalid_value(
-                "policy_controller",
+                "grand_central",
                 other,
                 "expected 'on' or 'off'",
             )),
@@ -1416,7 +1416,7 @@ impl Router {
 
         let pd_pairing_mode = self.parse_pd_pairing_mode()?;
         let grouped_dp_sticky = self.parse_grouped_dp_sticky()?;
-        let policy_controller = self.parse_policy_controller()?;
+        let grand_central = self.parse_grand_central()?;
 
         config::RouterConfig::builder()
             .mode(mode)
@@ -1548,7 +1548,7 @@ impl Router {
             .maybe_reasoning_parser(self.reasoning_parser.as_ref())
             .maybe_tool_call_parser(self.tool_call_parser.as_ref())
             .maybe_mcp_config_path(self.mcp_config_path.as_ref())
-            .policy_controller(policy_controller)
+            .grand_central(grand_central)
             .maybe_policy_spec_path(self.policy_spec.as_ref())
             .maybe_storage_hook_wasm_path(self.storage_hook_wasm_path.as_deref())
             .enable_wasm(self.enable_wasm)
@@ -1680,6 +1680,7 @@ impl Router {
         engine_metrics = false,
         epd_disaggregation = false,
         eviction_interval_secs = 120,
+        grand_central = String::from("off"),
         grouped_dp_sticky = String::from("off"),
         grpc_request_timeout_secs = 0,
         header_read_timeout_secs = 30,
@@ -1748,7 +1749,6 @@ impl Router {
         pd_admission_wait_secs = 30,
         pd_disaggregation = false,
         pd_pairing_mode = String::from("lenient"),
-        policy_controller = String::from("off"),
         policy_spec = None,
         postgres_config = None,
         power_of_two_load_metric = String::from("expected_wait"),
@@ -1911,6 +1911,7 @@ impl Router {
         engine_metrics: bool,
         epd_disaggregation: bool,
         eviction_interval_secs: u64,
+        grand_central: String,
         grouped_dp_sticky: String,
         grpc_request_timeout_secs: u64,
         header_read_timeout_secs: u64,
@@ -1979,7 +1980,6 @@ impl Router {
         pd_admission_wait_secs: u64,
         pd_disaggregation: bool,
         pd_pairing_mode: String,
-        policy_controller: String,
         policy_spec: Option<String>,
         postgres_config: Option<PyPostgresConfig>,
         power_of_two_load_metric: String,
@@ -2193,6 +2193,7 @@ impl Router {
             engine_metrics,
             epd_disaggregation,
             eviction_interval_secs,
+            grand_central,
             grouped_dp_sticky,
             grpc_request_timeout_secs,
             header_read_timeout_secs,
@@ -2261,7 +2262,6 @@ impl Router {
             pd_admission_wait_secs,
             pd_disaggregation,
             pd_pairing_mode,
-            policy_controller,
             policy_spec,
             postgres_config,
             power_of_two_load_metric,

@@ -9,7 +9,7 @@ use serde::{de, Deserialize, Deserializer, Serialize};
 pub use smg_data_connector::{
     HistoryBackend, MemoryConfig, OracleConfig, PostgresConfig, RedisConfig, SchemaConfig,
 };
-use smg_policy_controller::document::PolicySpec;
+use smg_grand_central::document::PolicySpec;
 use smg_service_discovery::Roles;
 pub use smg_service_discovery::{
     deserialize_discovery, ConsulDiscoveryConfig, DiscoveryConfig, FileDiscoveryConfig,
@@ -669,17 +669,17 @@ pub struct RouterConfig {
     /// When set, wraps all storage backends with hook-based interceptors.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_hook_wasm_path: Option<String>,
-    /// Select the policy controller for this process. The classic policies
+    /// Select Grand Central for this process. The classic policies
     /// are the default. Written where it is on.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub policy_controller: bool,
+    pub grand_central: bool,
     /// Path to the policy document the controller runs in place of the one
-    /// the routing settings mean. Requires the policy controller.
+    /// the routing settings mean. Requires Grand Central.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy_spec_path: Option<String>,
     /// The policy document the controller runs. The builder loads it from
-    /// `policy_spec_path`; a host may set it directly. Requires the policy
-    /// controller.
+    /// `policy_spec_path`; a host may set it directly. Requires Grand
+    /// Central.
     #[serde(skip)]
     pub policy_spec: Option<PolicySpec>,
 }
@@ -2101,7 +2101,7 @@ impl Default for RouterConfig {
             mcp_config: None,
             enable_wasm: false,
             storage_hook_wasm_path: None,
-            policy_controller: false,
+            grand_central: false,
             policy_spec_path: None,
             policy_spec: None,
             server_cert: None,
@@ -2226,18 +2226,18 @@ mod tests {
     fn the_switch_is_written_where_it_is_on() {
         let config = RouterConfig::default();
         let form = serde_json::to_value(&config).expect("a config serializes");
-        assert!(form.get("policy_controller").is_none());
+        assert!(form.get("grand_central").is_none());
         let restored: RouterConfig = serde_json::from_value(form).expect("a config reads back");
-        assert!(!restored.policy_controller);
+        assert!(!restored.grand_central);
 
         let config = RouterConfig {
-            policy_controller: true,
+            grand_central: true,
             ..config
         };
         let form = serde_json::to_value(&config).expect("a config serializes");
-        assert_eq!(form["policy_controller"], true);
+        assert_eq!(form["grand_central"], true);
         let restored: RouterConfig = serde_json::from_value(form).expect("a config reads back");
-        assert!(restored.policy_controller);
+        assert!(restored.grand_central);
     }
 
     #[test]
@@ -2249,7 +2249,7 @@ mod tests {
         assert!(restored.policy_spec_path.is_none());
 
         let config = RouterConfig {
-            policy_controller: true,
+            grand_central: true,
             policy_spec_path: Some("routing.yaml".to_owned()),
             policy_spec: Some(config.policy_document().expect("the default document")),
             ..config

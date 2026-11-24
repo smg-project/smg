@@ -1,4 +1,4 @@
-# Regression gate for `cargo bench -p smg-policy-controller --bench store_journal`, run by
+# Regression gate for `cargo bench -p smg-grand-central --bench store_journal`, run by
 # .github/workflows/benchmark-policy-store-journal.yml on pull requests through scripts/bench_gate.py.
 #
 # The gate runs the twenty-four single-threaded rows of the store's journal. Twenty-one are at 8, 64 and 512
@@ -31,7 +31,7 @@ repeats = 3
 filter = "^policy_store_journal/(load_write/(plain|journaled)|status_write|member_write|read)/"
 
 sources = [
-    "crates/policy_controller/benches/store_journal.rs",
+    "crates/grand_central/benches/store_journal.rs",
 ]
 
 [[gate]]

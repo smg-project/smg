@@ -576,13 +576,13 @@ def test_the_launcher_encode_policy_choices_are_the_cli_choices(launcher):
     assert list(launcher["--encode-policy"].choices) == cli_choices
 
 
-def test_the_launcher_policy_controller_choices_are_the_cli_choices(launcher):
+def test_the_launcher_grand_central_choices_are_the_cli_choices(launcher):
     attribute = re.search(
-        r"value_parser\s*=\s*\[([^\]]+)\][^\]]*\)\]\s*policy_controller: String,",
+        r"value_parser\s*=\s*\[([^\]]+)\][^\]]*\)\]\s*grand_central: String,",
         cli_source(),
     )
-    assert attribute, "the CLI's --policy-controller choices are missing"
-    assert list(launcher["--policy-controller"].choices) == re.findall(
+    assert attribute, "the CLI's --grand-central choices are missing"
+    assert list(launcher["--grand-central"].choices) == re.findall(
         r'"([a-z]+)"', attribute.group(1)
     )
 

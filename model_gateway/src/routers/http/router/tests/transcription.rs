@@ -15,7 +15,7 @@
 //! or the route's refusal.
 //!
 //! Each pool is asked under the classic `round_robin` policy and again with
-//! the policy engine started over the document the same settings mean: the
+//! Grand Central started over the document the same settings mean: the
 //! route holds one rule and does not ask who places.
 //!
 //! The pool the route hands on is the list of the snapshot it read, so a
@@ -26,7 +26,7 @@ use std::{collections::BTreeSet, sync::Mutex};
 
 use axum::http::{header::RETRY_AFTER, Uri};
 use openai_protocol::{model_card::ModelCard, worker::WorkerStatus};
-use smg_policy_controller::document::AppliedSpec;
+use smg_grand_central::document::AppliedSpec;
 use smg_worker::test_support::no_health_check;
 
 use super::super::*;
@@ -88,7 +88,7 @@ impl Member {
     }
 }
 
-/// Who places a request: the classic policy, or the policy engine.
+/// Who places a request: the classic policy, or Grand Central.
 #[derive(Clone, Copy, Debug)]
 enum Placer {
     Classic,
@@ -139,8 +139,8 @@ impl Bed {
         placer: Placer,
     ) -> Self {
         // The settings of a gateway under `round_robin`, and what its start
-        // makes of them: the registry's shedding, and the document the
-        // policy engine is started over.
+        // makes of them: the registry's shedding, and the document
+        // Grand Central is started over.
         let config = RouterConfig {
             policy: PolicyConfig::RoundRobin,
             worker_overload_shed: shed,
@@ -441,8 +441,8 @@ fn kinds_spread(bed: &Bed) -> (usize, usize) {
 /// A transcription takes its turn in its model's one rotation, with the
 /// model's other requests, whoever places. The route hands the pool on as
 /// the list of the snapshot it read: a classic `round_robin` is told that
-/// list by its name and turns the list's own rotation, and the policy
-/// engine keeps a list's turn with the list.
+/// list by its name and turns the list's own rotation, and Grand
+/// Central keeps a list's turn with the list.
 #[tokio::test]
 async fn a_transcription_takes_its_turn_in_its_models_rotation() {
     let pool = [plain(0), plain(1), plain(2), plain(3)];

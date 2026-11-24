@@ -190,7 +190,7 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for UpdatePolicie
                 .on_worker_added(&model_id, policy_hint);
             // Policies learn of the request's end through the worker's load
             // guard; the registry routes it to the policy that placed it.
-            // Under the policy engine the worker is given no sink.
+            // Under Grand Central the worker is given no sink.
             worker.set_completion_sink(app_context.policy_registry.worker_completion_sink());
 
             // Initialize cache-aware policy if configured
@@ -219,7 +219,7 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for UpdatePolicie
             }
         }
 
-        // Under the policy engine a `policy` label names no policy. Each
+        // Under Grand Central a `policy` label names no policy. Each
         // registration that carries one says so, behind the step's last
         // wait, so a step tried again writes no second line. The label's
         // value is free text and is not written.
@@ -269,9 +269,9 @@ mod tests {
         model_card::ModelCard,
         worker::{HealthCheckConfig, RuntimeType, WorkerSpec, WorkerType},
     };
-    use smg_policy_controller::{
+    use smg_grand_central::{
         document::{AppliedSpec, PolicySpec},
-        engine::PolicyEngine,
+        engine::InProcess,
     };
     use smg_worker::jobs::WorkerJobAsker;
     use tracing_test::traced_test;
@@ -370,7 +370,7 @@ mod tests {
         UpdatePoliciesStep.execute(&mut context).await.unwrap();
     }
 
-    /// Under the policy engine the step makes no classic policy for a
+    /// Under Grand Central the step makes no classic policy for a
     /// worker of any role, whatever policy its label names, and gives the
     /// worker no completion sink. Under the classic policies the same
     /// workers make the labelled model's policy beside the default, and
@@ -379,18 +379,18 @@ mod tests {
     /// the model's list, and the classic step, which follows it, at none.
     #[traced_test]
     #[tokio::test]
-    async fn under_the_policy_engine_a_worker_of_any_role_gets_no_classic_policy() {
+    async fn under_the_engine_a_worker_of_any_role_gets_no_classic_policy() {
         let roles = [
             ("grpc://127.0.0.1:1", WorkerType::Regular),
             ("grpc://127.0.0.1:2", WorkerType::Prefill),
             ("grpc://127.0.0.1:3", WorkerType::Decode),
             ("grpc://127.0.0.1:4", WorkerType::Encode),
         ];
-        for (policy_controller, made) in [(true, 0), (false, 2)] {
+        for (grand_central, made) in [(true, 0), (false, 2)] {
             let mut config = RouterConfig::builder()
                 .policy(PolicyConfig::RoundRobin)
                 .build_unchecked();
-            config.policy_controller = policy_controller;
+            config.grand_central = grand_central;
             let mut context = AppContext::clone(&app_context_for_tests(
                 config.clone(),
                 Arc::new(WorkerRegistry::new()),
@@ -406,14 +406,10 @@ mod tests {
                     &[("policy", "power_of_two")],
                 )
                 .await;
-                assert_eq!(worker.completion_sink().is_some(), !policy_controller);
+                assert_eq!(worker.completion_sink().is_some(), !grand_central);
                 // Each of the engine's registrations writes the line once,
                 // and the classic ones behind them add none.
-                let written = if policy_controller {
-                    nth + 1
-                } else {
-                    roles.len()
-                };
+                let written = if grand_central { nth + 1 } else { roles.len() };
                 let wanted = format!("Worker label policy of model {MODEL} names no policy");
                 logs_assert(|lines: &[&str]| {
                     let named = lines.iter().filter(|line| line.contains(&wanted));
@@ -427,18 +423,18 @@ mod tests {
         }
     }
 
-    /// Under the policy engine a worker's stream follows the document in
+    /// Under Grand Central a worker's stream follows the document in
     /// force, not the classic settings. The settings name `round_robin`
     /// both times. Under a document that reads cache events the step
     /// starts a regular worker's events stream, so its model gets an
     /// index. Under a document that reads none it starts no such stream.
     #[tokio::test]
-    async fn under_the_policy_engine_a_workers_events_stream_follows_the_document() {
+    async fn under_the_engine_a_workers_events_stream_follows_the_document() {
         for (preset, streams) in [("cache_aware", true), ("round_robin", false)] {
             let mut config = RouterConfig::builder()
                 .policy(PolicyConfig::RoundRobin)
                 .build_unchecked();
-            config.policy_controller = true;
+            config.grand_central = true;
             let mut context = AppContext::clone(&app_context_for_tests(
                 config.clone(),
                 Arc::new(WorkerRegistry::new()),
@@ -447,7 +443,7 @@ mod tests {
             let policies = PolicyRegistry::of_config(&config);
             let document = PolicySpec::preset(preset).expect("a stock preset");
             let spec = AppliedSpec::validate(&document).expect("a valid document");
-            policies.set_engine(Box::leak(Box::new(PolicyEngine::new(spec))));
+            policies.set_engine(Box::leak(Box::new(InProcess::new(spec))));
             context.policy_registry = Arc::new(policies);
             let monitor = Arc::new(KvEventMonitor::new());
             context.kv_event_monitor = Some(Arc::clone(&monitor));

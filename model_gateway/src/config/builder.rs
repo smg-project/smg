@@ -2,8 +2,8 @@ use std::{collections::HashMap, io::Read, path::Path};
 
 use llm_multimodal::jpeg_turbo::TurboJpegPolicy;
 use openai_protocol::worker::{MmProcessingMode, TransportMode};
+use smg_grand_central::document::operator::{Format, SpecRejected, MAX_DOCUMENT_BYTES};
 use smg_mcp::McpConfig;
-use smg_policy_controller::document::operator::{Format, SpecRejected, MAX_DOCUMENT_BYTES};
 use smg_worker::identity::basic::{ConnectionMode, RuntimeType};
 
 use super::{
@@ -19,7 +19,7 @@ use super::{
 /// a document ([`MAX_DOCUMENT_BYTES`]) is refused by that size, unread, in
 /// the controller's words. A file may grow behind its metadata, and a
 /// source that is no regular file states no size: the read takes one byte
-/// past the bound and no more. The policy crate's read ([`Format::read`])
+/// past the bound and no more. The Grand Central crate's read ([`Format::read`])
 /// then refuses a source that reaches past the bound, by its size.
 fn bounded_document(stated: u64, source: impl Read) -> std::io::Result<Vec<u8>> {
     if stated > MAX_DOCUMENT_BYTES {
@@ -92,9 +92,9 @@ impl RouterConfigBuilder {
         self
     }
 
-    /// Choose the policy controller for the whole process when `on`.
-    pub fn policy_controller(mut self, on: bool) -> Self {
-        self.config.policy_controller = on;
+    /// Choose Grand Central for the whole process when `on`.
+    pub fn grand_central(mut self, on: bool) -> Self {
+        self.config.grand_central = on;
         self
     }
 
@@ -1075,7 +1075,7 @@ impl RouterConfigBuilder {
         Ok(self)
     }
 
-    /// Reads the supplied policy document by the policy crate's own read
+    /// Reads the supplied policy document by the Grand Central crate's own read
     /// ([`Format::read`]), the one an apply passes too, in the form the
     /// file's name states ([`Format::of`]). A refusal names the file and
     /// stands in that read's words: the field by its path, or the line and
@@ -1083,7 +1083,7 @@ impl RouterConfigBuilder {
     fn read_policy_spec(mut self) -> ConfigResult<Self> {
         if let Some(path) = &self.config.policy_spec_path {
             let refused = |reason: String| ConfigError::ValidationFailed {
-                reason: format!("policy controller: {path}: {reason}"),
+                reason: format!("Grand Central: {path}: {reason}"),
             };
             let document = std::fs::File::open(path)
                 .and_then(|file| Ok((file.metadata()?.len(), file)))
@@ -1150,7 +1150,7 @@ impl RouterConfig {
 mod tests {
     use std::collections::HashMap;
 
-    use smg_policy_controller::document::PolicySpec;
+    use smg_grand_central::document::PolicySpec;
     use tempfile::tempdir;
 
     use super::*;
@@ -1162,7 +1162,7 @@ mod tests {
         let path = path.to_str().expect("a UTF-8 path");
         let io_error = std::fs::read_to_string(path).expect_err("the file is absent");
         let refusal = RouterConfig::builder()
-            .policy_controller(true)
+            .grand_central(true)
             .maybe_policy_spec_path(Some(path))
             .build()
             .expect_err("an unreadable file is refused");
@@ -1184,14 +1184,14 @@ mod tests {
             .read(text.as_bytes())
             .expect_err("unknown field");
         let refusal = RouterConfig::builder()
-            .policy_controller(true)
+            .grand_central(true)
             .maybe_policy_spec_path(Some(path))
             .build()
             .expect_err("an invalid document is refused");
         let ConfigError::ValidationFailed { reason } = refusal else {
             panic!("a refused document fails the validation: {refusal:?}");
         };
-        assert_eq!(reason, format!("policy controller: {path}: {read_error}"));
+        assert_eq!(reason, format!("Grand Central: {path}: {read_error}"));
         // The refusal names the field by its path.
         assert!(
             reason.contains(": not a policy spec in yaml: unknown: unknown field `unknown`"),
@@ -1207,7 +1207,7 @@ mod tests {
         let path = path.to_str().expect("a UTF-8 path");
         std::fs::write(path, text).expect("the document is written");
         let refusal = RouterConfig::builder()
-            .policy_controller(true)
+            .grand_central(true)
             .maybe_policy_spec_path(Some(path))
             .build_with_validation(false)
             .expect_err("the document is refused");
@@ -1215,12 +1215,12 @@ mod tests {
             panic!("a refused document fails the validation: {refusal:?}");
         };
         reason
-            .strip_prefix(&format!("policy controller: {path}: "))
+            .strip_prefix(&format!("Grand Central: {path}: "))
             .unwrap_or_else(|| panic!("the refusal names the file first: {reason}"))
             .to_owned()
     }
 
-    // Five kinds of document a typed YAML read took and the policy crate's
+    // Five kinds of document a typed YAML read took and the Grand Central crate's
     // read refuses. Each refusal names its place and what a writer does.
 
     #[test]
@@ -1314,7 +1314,7 @@ mod tests {
             let path = path.to_str().expect("a UTF-8 path");
             std::fs::write(path, text).expect("the document is written");
             RouterConfig::builder()
-                .policy_controller(true)
+                .grand_central(true)
                 .maybe_policy_spec_path(Some(path))
                 .build_with_validation(false)
                 .expect("the document reads")
@@ -1346,7 +1346,7 @@ mod tests {
                 let path = path.to_str().expect("a UTF-8 path");
                 std::fs::write(path, text).expect("the document is written");
                 let config = RouterConfig::builder()
-                    .policy_controller(true)
+                    .grand_central(true)
                     .maybe_policy_spec_path(Some(path))
                     .build_with_validation(false)
                     .expect("the document reads");
@@ -1378,7 +1378,7 @@ mod tests {
             refusal,
             ConfigError::InvalidValue { field, value, reason }
                 if field == "policy_spec" && value == path
-                    && reason == "a policy document is run by the policy controller: set --policy-controller on"
+                    && reason == "a policy document is run by Grand Central: set --grand-central on"
         ));
     }
 
@@ -1395,7 +1395,7 @@ mod tests {
             config.validate().expect_err("the document needs the controller"),
             ConfigError::InvalidValue { field, value, reason }
                 if field == "policy_spec" && value == "the given document"
-                    && reason == "a policy document is run by the policy controller: set --policy-controller on"
+                    && reason == "a policy document is run by Grand Central: set --grand-central on"
         ));
     }
 
@@ -1403,7 +1403,7 @@ mod tests {
     fn a_path_with_no_loaded_document_is_refused() {
         let config = RouterConfig {
             enable_igw: true,
-            policy_controller: true,
+            grand_central: true,
             policy_spec_path: Some("routing.yaml".to_owned()),
             ..RouterConfig::default()
         };
@@ -1431,7 +1431,7 @@ mod tests {
         let path = path.to_str().expect("a UTF-8 path");
         std::fs::write(path, document_of(bound)).expect("the document is written");
         let config = RouterConfig::builder()
-            .policy_controller(true)
+            .grand_central(true)
             .maybe_policy_spec_path(Some(path))
             .build_with_validation(false)
             .expect("a document at the bound is read");
@@ -1449,14 +1449,14 @@ mod tests {
         let over = bound + 5;
         std::fs::write(path, document_of(over)).expect("the document is written");
         let refusal = RouterConfig::builder()
-            .policy_controller(true)
+            .grand_central(true)
             .maybe_policy_spec_path(Some(path))
             .build_with_validation(false)
             .expect_err("a document over the bound is refused");
         assert!(matches!(
             refusal,
             ConfigError::ValidationFailed { reason } if reason == format!(
-                "policy controller: {path}: could not read the policy document (the document is {over} bytes; at most {bound})"
+                "Grand Central: {path}: could not read the policy document (the document is {over} bytes; at most {bound})"
             )
         ));
     }
@@ -1468,7 +1468,7 @@ mod tests {
         let source = std::io::repeat(b'#').take(MAX_DOCUMENT_BYTES + 10);
         let read = bounded_document(0, source).expect("the read stops by itself");
         assert_eq!(read.len(), bound + 1);
-        // The policy crate's read refuses what reached past the bound.
+        // The Grand Central crate's read refuses what reached past the bound.
         let refusal = Format::Yaml
             .read(&read)
             .expect_err("the source is past the bound");
