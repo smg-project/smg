@@ -1642,22 +1642,44 @@ mod over_lists {
     }
 
     /// A send said behind a new document, for a decision made under the
-    /// replaced one, is counted by neither document's reader: a word of a
-    /// lease reaches the stages of the document that issued it, and only
-    /// while that document is in force.
+    /// replaced one, is counted by the count in force: a send is a fact of
+    /// its worker, whatever document decided it. The later document was
+    /// validated over a catalog of its own, so its count is built new.
     #[test]
-    fn a_send_said_behind_a_new_document_for_an_earlier_decision_is_counted_by_no_reader() {
-        let (engine, members, readers) = bed();
+    fn a_send_said_behind_a_new_document_is_counted_by_the_count_in_force() {
+        let (engine, members, _readers) = bed();
         let now = Instant::now();
         let mut first = decide(&engine, &members, b"first", now);
         let sent_to = chosen(&first);
         let later = put(&engine, &next_document(None));
+        let nothing = CreditedDispatches::default();
+        assert_eq!(later.lock()[0].read(&clock(0), &sent_to), nothing);
 
         first.dispatched(now);
+        assert_eq!(later.lock()[0].read(&clock(0), &sent_to), one(TOKENS));
+    }
+
+    /// A send said behind a new document, for a decision the document
+    /// before made, is counted where the new document kept the profile's
+    /// count: both were validated over one catalog, and the profile's text
+    /// is the same. The reader the later validation built is let go and
+    /// reads nothing.
+    #[test]
+    fn a_send_said_behind_a_document_that_kept_its_count_is_counted() {
+        let (catalog, readers) = catalog();
+        let engine = PolicyEngine::new(validated(&document(None), &catalog));
+        let (_, members, _) = bed();
+        let now = Instant::now();
+        let mut first = decide(&engine, &members, b"first", now);
+        let sent_to = chosen(&first);
+        let applied = engine.apply(validated(&next_document(None), &catalog));
+        applied.expect("a number above the standing one");
+
+        first.dispatched(now);
+        let readers = readers.lock();
+        assert_eq!(readers[0].read(&clock(0), &sent_to), one(TOKENS));
         let nothing = CreditedDispatches::default();
-        for reader in [&readers.lock()[0], &later.lock()[0]] {
-            assert_eq!(reader.read(&clock(0), &sent_to), nothing);
-        }
+        assert_eq!(readers[1].read(&clock(0), &sent_to), nothing);
     }
 
     /// A handle says its dispatch once, so a second word of the same send

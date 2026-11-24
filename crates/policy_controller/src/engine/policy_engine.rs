@@ -443,17 +443,17 @@ impl PolicyEngine {
     /// never during one ([`Self::apply`]).
     fn tell(&self, change: &Membership<'_>) {
         let _held = self.telling.lock();
-        self.told(&self.document.load(), change);
+        self.told(self.document.load().spec.engine(), change);
     }
 
-    /// Tells the stages of `document` one change of membership, and not
+    /// Tells the stages of `engine` one change of membership, and not
     /// the session table. The records of sent prefixes hear it first
     /// ([`Self::hears`]). A stage that panics at it is held and counted
     /// ([`Self::word_caught`]): the registration or the removal goes on.
     /// Its caller holds the telling's lock. A decision takes that lock
     /// nowhere.
-    fn told(&self, document: &InForce, change: &Membership<'_>) {
-        self.hears(document, change, |engine| {
+    fn told(&self, engine: &Engine, change: &Membership<'_>) {
+        self.hears(engine, change, |engine| {
             self.word_caught(|| engine.membership_stages(change));
         });
     }
@@ -485,15 +485,17 @@ impl PolicyEngine {
     /// takes a record's lock and neither of the other two.
     pub(crate) fn on_membership(&self, word: &Membership<'_>) {
         let _held = self.telling.lock();
-        self.hears(&self.document.load(), word, |engine| {
+        self.hears(self.document.load().spec.engine(), word, |engine| {
             engine.on_membership(word);
         });
     }
 
     /// One change of membership as the engine hears it under either host,
     /// the one place a word of membership passes: the records of sent
-    /// prefixes first, then the engine of `document` by `core`, the host's
-    /// own way of telling it. Its caller holds the telling's lock.
+    /// prefixes first, then `engine` by `core`, the host's own way of
+    /// telling it. The engine is the document's, or the part of it a word
+    /// is told to ([`Engine::hearing`]). Its caller holds the telling's
+    /// lock.
     ///
     /// | The word | The records of sent prefixes |
     /// |---|---|
@@ -508,7 +510,7 @@ impl PolicyEngine {
     /// A worker that stands under its id and serves a model no more is
     /// forgotten whole, in every model's record: an entry is a prediction,
     /// and the next request of a prefix writes it again.
-    fn hears(&self, document: &InForce, change: &Membership<'_>, core: impl FnOnce(&Engine)) {
+    fn hears(&self, engine: &Engine, change: &Membership<'_>, core: impl FnOnce(&Engine)) {
         match *change {
             Membership::Removed(id)
             | Membership::Replaced { old: id, .. }
@@ -516,7 +518,7 @@ impl PolicyEngine {
             Membership::Snapshot(standing) => self.affinity.keep(standing),
             Membership::Added(_) | Membership::Relabelled(_) | Membership::Resized(_) => {}
         }
-        core(document.spec.engine());
+        core(engine);
     }
 
     /// The clock of the engine's decisions: a list's records are made on
@@ -1199,20 +1201,24 @@ impl DecisionEngine for PolicyEngine {
             Said::Completed(_) => EventKind::Completed,
             Said::Released(..) => EventKind::Released,
         };
-        // A word of a decision made under another document is told to
-        // nobody: its stages are not the ones in force.
+        // A word of a decision made under an earlier document goes to the
+        // stages that stood when its lease was issued, and to no stage
+        // built since. Its dispatch is counted by every count of sends in
+        // force: a send is a fact of its worker, whatever document decided
+        // it.
         let document = self.document.load();
+        let sends = document.spec.engine();
+        let mut engine = sends;
         if held.lease.generation != document.spec.generation() {
+            engine = document.stood_at(held.lease.generation);
+        } else if held.lease.side == Side::Single && !document.hears.contains(kind) {
             return;
         }
-        if held.lease.side == Side::Single && !document.hears.contains(kind) {
-            return;
-        }
-        let engine = document.spec.engine();
+        let micros = |at| self.clock.micros(at);
         let tell = || match held.lease.side {
-            Side::Single => lease_events::single(&lease_events::one_engine(engine), held, said),
+            Side::Single => lease_events::single(&lease_events::of_host(engine, sends), held, said),
             // A pair's guard holds its prefill side's lease.
-            Side::Prefill => lease_events::pair(engine, held, said, |at| self.clock.micros(at)),
+            Side::Prefill => lease_events::pair(engine, sends, held, said, micros),
             // No lease is issued for a side on its own.
             Side::Decode | Side::Encode => {}
         };

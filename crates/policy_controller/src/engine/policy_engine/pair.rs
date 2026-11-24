@@ -1028,23 +1028,24 @@ fn decode_side(facts: &RequestFacts<'_>, decision: &Decision, prefill: &Lease) -
     })
 }
 
-/// [`issue_decode`] for the decode call of `own`, dated at the call, under
-/// a catch of its own ([`PolicyEngine::word_caught`]). A stage that panics
-/// at the side's issue is held and counted, as at a later word of the
-/// lease, and the stages behind it do not hear the issue. The pick stands:
-/// the call answers the side's lease all the same, so its guard holds the
-/// side as issued and tells its dispatch and its end. A stage that heard
-/// the issue then hears the side end.
+/// [`issue_decode`] for the decode call of `own`, told to `engine`'s
+/// stages and dated at the call, under a catch of its own
+/// ([`PolicyEngine::word_caught`]). A stage that panics at the side's
+/// issue is held and counted, as at a later word of the lease, and the
+/// stages behind it do not hear the issue. The pick stands: the call
+/// answers the side's lease all the same, so its guard holds the side as
+/// issued and tells its dispatch and its end. A stage that heard the issue
+/// then hears the side end.
 ///
 /// A panic in the decision itself is not held here: it costs the call its
 /// decision, as a first decision's does.
 fn issue_decode_caught(
     own: Loaded<'_, '_>,
+    engine: &Engine,
     facts: &RequestFacts<'_>,
     decision: &Decision,
     prefill: &Lease,
 ) -> Option<Lease> {
-    let engine = own.document.spec.engine();
     let told = own.word_caught(|| issue_decode(engine, facts, decision, prefill, facts.now_micros));
     told.unwrap_or_else(|| decode_side(facts, decision, prefill))
 }
@@ -1121,9 +1122,10 @@ pub(super) fn decided(
 /// call ([`issue_decode_caught`]). Either issue is told under a catch of
 /// its own: a stage that panics at it costs the call nothing. A lease's
 /// dispatch is due as a single's. A decision that picks no pair issues
-/// nothing. Behind a held lease of another document than the one that
-/// decides, the side is leased and no stage hears its issue: no later
-/// word of that lease reaches a stage ([`PolicyEngine::apply`]).
+/// nothing. Behind a held lease of an earlier document than the one that
+/// decides, the side's issue is told as each later word of that lease
+/// is: to the stages that stood under that document, and to no stage built
+/// since ([`PolicyEngine::apply`]).
 // In line at its two callers: as a call it costs a pair's decision 33
 // instructions, counted with Callgrind.
 #[inline(always)]
@@ -1141,11 +1143,19 @@ pub(super) fn issued(
             let id = LeaseId(own.leases.0.fetch_add(1, Ordering::Relaxed) + 1);
             issue_caught(own, facts, &decision, id, later)
         }),
-        Some(held) if held.lease.generation != own.document.spec.generation() => {
-            decode_side(facts, &decision, held.lease).map(|decode| (decode, decode.session))
+        Some(held) => {
+            // Behind a held lease of an earlier document the side's issue
+            // is told as its later words are: to the stages that stood
+            // under that document.
+            let document = own.document;
+            let hearing = if held.lease.generation == document.spec.generation() {
+                document.spec.engine()
+            } else {
+                document.stood_at(held.lease.generation)
+            };
+            issue_decode_caught(own, hearing, facts, &decision, held.lease)
+                .map(|decode| (decode, decode.session))
         }
-        Some(held) => issue_decode_caught(own, facts, &decision, held.lease)
-            .map(|decode| (decode, decode.session)),
     };
     DecideOutcome {
         decision,
@@ -1320,6 +1330,28 @@ mod tests {
         let digest = document.digest().expect("a digest");
         let spec = AppliedSpec::validate_digested(&document, digest, &catalog, &[]);
         (spec.expect("a valid document"), heard)
+    }
+
+    /// [`hearing`]'s document and the same text under the next generation,
+    /// both validated over one catalog: an engine keeps the stages of the
+    /// first under the second.
+    fn hearing_and_its_next() -> ([AppliedSpec; 2], Arc<Mutex<Vec<Word>>>) {
+        let heard = Arc::new(Mutex::new(Vec::new()));
+        let kept = Arc::clone(&heard);
+        let mut catalog = StageRegistry::builtin();
+        catalog
+            .picker("hears", move || Box::new(Hears(Arc::clone(&kept))))
+            .expect("a free picker name");
+        let under = |number: u64| {
+            let mut document =
+                PolicySpec::pair_presets("round_robin", "round_robin").expect("the pair presets");
+            document.generation = number;
+            let decode = document.profiles.get_mut("decode");
+            decode.expect("the decode profile").pick = "hears".into();
+            let spec = AppliedSpec::validate_in(&document, &catalog, &[]);
+            spec.expect("a valid document")
+        };
+        ([under(3), under(4)], heard)
     }
 
     /// The host's admission as two tests of a place: the prefills', then
@@ -3072,7 +3104,7 @@ mod tests {
     /// One word of a held pair told to the stages, the clock reading 9,900
     /// and every worker still listed.
     fn tell(engine: &Engine, held: &HeldDecision<'_>, word: Said) {
-        lease_events::pair(engine, held, word, |_| 9_900);
+        lease_events::pair(engine, engine, held, word, |_| 9_900);
     }
 
     /// Each word of a pair, both sides issued with the prefill, the host
@@ -4702,6 +4734,115 @@ mod tests {
         assert_eq!(decided_under, 4, "the document in force decides");
         assert!(host.words().is_empty(), "the first document hears nothing");
         assert!(later.lock().is_empty(), "no stage is told the issue");
+    }
+
+    /// A pair's decode asked again behind a later document that kept the
+    /// first one's stages tells them the side's issue: they heard the
+    /// pair's lease issued, and they hear the side's dispatch. A stage
+    /// hears a lease's issue where it hears that lease's later words, and
+    /// nowhere else.
+    #[test]
+    fn a_decode_asked_again_behind_a_document_that_kept_its_stages_tells_them_its_issue() {
+        let ([first, next], heard) = hearing_and_its_next();
+        let host = Host::under((first, heard), 1, 1);
+        let classes = every(1, 1);
+        let asks = host.asks(&classes, true);
+        let first = leased(&host, &asks, Instant::now());
+        let target = first_target(&first.decision);
+        let lease = first.lease.expect("the prefill lease").lease;
+        let held = HeldDecision {
+            decision: &first.decision,
+            lease: &lease,
+            index: 0,
+            target: &target,
+            decode: HeldDecode {
+                session: first.decode_session,
+                tokens: lease.tokens,
+                chars: lease.chars,
+                bytes: lease.bytes,
+                chosen: false,
+            },
+        };
+        host.words();
+        let applied = host.engine.apply(next);
+        applied.expect("a number above the standing one");
+
+        let local = Default::default();
+        let now = Instant::now();
+        let again = host.engine.decide_decode_under(local, &asks, &held, now);
+        let again = again.expect("a decode decision");
+        let side = again.lease.expect("the side's lease").lease;
+        assert_eq!((side.side, side.generation), (Side::Decode, 3));
+        let decided_under = again.decision.trace().generation;
+        assert_eq!(decided_under, 4, "the document in force decides");
+        host.engine
+            .say(local, &held, dispatched(Side::Decode, 0), now);
+        let told: Vec<_> = host.words().iter().map(|word| (word.0, word.1)).collect();
+        let both = [("issued", Side::Decode), ("dispatched", Side::Decode)];
+        assert_eq!(told, both, "the stages kept hear the side whole");
+    }
+
+    /// A pair's dispatch said behind a later document, for a pair the
+    /// document before placed, is counted by the counts of sends in force.
+    /// The later document built its counts new: a send is a fact of its
+    /// worker, whatever document decided it.
+    #[test]
+    fn a_pairs_older_send_is_counted_by_the_counts_in_force() {
+        // The stock pair document whose sides count their sends. Under a
+        // later number its filters stand in another order: built new.
+        let counting = |number: u64| {
+            let document = PolicySpec::pair_presets("least_load", "least_load");
+            let mut document = document.expect("the pair presets");
+            document.generation = number;
+            if number > 3 {
+                for profile in document.profiles.values_mut() {
+                    profile.filter.reverse();
+                }
+            }
+            AppliedSpec::validate(&document).expect("a valid document")
+        };
+        let host = Host::under((counting(3), Arc::default()), 1, 1);
+        let classes = every(1, 1);
+        let asks = host.asks(&classes, false);
+        let now = Instant::now();
+        let first = leased(&host, &asks, now);
+        let target = first_target(&first.decision);
+        let lease = first.lease.expect("the prefill lease").lease;
+        let held = HeldDecision {
+            decision: &first.decision,
+            lease: &lease,
+            index: 0,
+            target: &target,
+            decode: HeldDecode {
+                session: first.decode_session,
+                tokens: lease.tokens,
+                chars: lease.chars,
+                bytes: lease.bytes,
+                chosen: false,
+            },
+        };
+        let applied = host.engine.apply(counting(4));
+        applied.expect("a number above the standing one");
+
+        // The prefill's sends, as each count in force reads them.
+        let counted = || -> Vec<u32> {
+            let row = Candidate {
+                id: target.id,
+                dp_rank: target.dp_rank,
+                ..Default::default()
+            };
+            let facts = RequestFacts::default();
+            let counts = &host.engine.standing_spec().engine().sent_credits;
+            let counts = counts.iter();
+            counts
+                .map(|count| count.read(&facts, &row).requests)
+                .collect()
+        };
+        assert_eq!(counted(), [0], "not said yet");
+        let local = Default::default();
+        host.engine
+            .say(local, &held, dispatched(Side::Prefill, 0), now);
+        assert_eq!(counted(), [1], "the count built new takes it");
     }
 
     /// A caller held to the decodes it reaches (`decode_places`) is paired

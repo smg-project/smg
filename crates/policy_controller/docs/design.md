@@ -342,11 +342,17 @@ What is planned: the gateway hands the builder its labels by classic's rule. The
 that finds the model with none decides, and the binding leaves with the model's last worker. The
 name is resolved as classic resolves it, and an unknown name adds no binding.
 
-The gateway then puts the new document in force on the running engine. A document put in force
-keeps the stages of every profile that did not change: one whose name stands in both documents
-and whose stages are built from the same text (the profile's own block, `view` and `signals`).
+The gateway then puts the new document in force on the running engine. A document put in force keeps
+the stages of a profile that did not change, under the three rules of section 5.1: its name stands
+in both documents, its stages are built from the same text (the profile's own block, `view` and
+`signals`), over one stage table, and the profiles that read its count of sends stand as they stood.
 Such a profile's stages keep what they hold, and a decision under way and a new one run the same
-stage objects. A profile that changed, and a new one, start empty. So a label's binding resets
+stage objects. A profile that changed, and a new one, start empty, and so does each profile that
+reads one count of sends with it. The document built from the routing settings puts every profile
+that reads a count under one count. So today a label that adds a profile which reads a count
+restarts the stages of each other profile that reads one, and its leaving restarts them again where
+the count bore its profile's name. Keeping each such profile by its own text is **[planned]**. A
+label whose profile reads no count resets
 nothing of another model's policy where it leaves the document's `view` and `signals` as they
 stand. A label whose binding writes into them restarts every profile's stages. A label writes
 no signal, and into the view only headers the view does not list yet: a `manual` label its key's
@@ -739,12 +745,29 @@ The engine is in `engine/`.
 ### 5.1 The engine object **[built]**
 
 A gateway has one engine object. It is built once, from the policy document in force at its start,
-and holds the document's stages and what they remember. A later document is put in force on the
-same object (`PolicyEngine::apply`): the engine holds its document as one value and replaces it
-whole, and a decision reads one document from its entry to its end. The session table and the
-record of sent prompts stand across the call. It holds no worker of its own: the registry that its
-host hands it (section 8.1) holds them. A controller builds a new engine object for each document
-it applies (section 10.2).
+and holds the document's stages and what they remember. A later document is put in force on the same
+object (`PolicyEngine::apply`): the engine holds its document as one value and replaces it whole,
+and a decision reads one document from its entry to its end. The session table and the record of
+sent prompts stand across the call. So do the stages of a profile whose name and text did not
+change, with what they remember, under three rules. A new document that changes `view` or `signals`
+builds every profile anew. Nothing is kept unless both documents were validated over one stage
+table: the stock one, or one table of the host's own that took no stage between the two validations.
+A profile is built anew too where one of its stages, built again, says otherwise of itself than the
+standing one: another name, other words of a request's life to hear, or anything else the engine
+reads of a stage when it builds a profile. A factory of the host's own may build such a stage.
+And the profiles that read one count of sends are kept together or built new together: where the new
+document adds one of them, changes one, or drops the first of them by name, each of them is built
+new, and their count takes over the sends of the standing one (`Engine::succeed`). Profiles whose
+stages read a count under the same `sent_ttl_ms` and `sent_report_delay_ms` read one count, and a
+document that states neither, as the one built from the routing settings does, puts them all under
+one. It holds no worker of its own: the registry that its host hands it (section 8.1) holds them. A
+controller builds a new engine object for each document it applies, and every stage of it new
+(section 10.2).
+
+The host says who hears a word of a lease issued under an earlier document. On a controller, behind
+a new document the engine that issued the lease is gone, and the standing one counts the send. In a
+gateway's own process the stages kept since the lease's document hear the word, every count of
+sends in force takes a dispatch, the session table hears it, and a stage built since hears nothing.
 
 ```rust
 // engine/policy_engine.rs
@@ -1238,8 +1261,9 @@ with each event (`DecisionEngine::say`). The crate has a guard for that, `Decisi
 request's lease back from that file in the guard's form, so one rule tells a single request's
 events under either host (`lease_events::single`). The host says who hears: behind a new
 document the engine that issued the lease is gone, and the standing one counts the send. In a
-gateway's own process a word of a lease issued under another document is told to nobody. A
-pair's events on a controller are told by the controller's own code.
+gateway's own process the stages a later document kept hear the word, and every count of sends
+in force takes the dispatch (section 5.1). A pair's events on a controller are told by the
+controller's own code.
 
 What an event does:
 
@@ -1353,10 +1377,11 @@ A host's start has these steps.
    snapshot where the document reads no load report and no named signal, and none of its
    policies keeps a report.
 6. **It puts a later document in force on the running engine**: `engine.apply(spec)`, refused
-   where the document's generation is not above the standing one. The next decision runs under
-   it, and a decision under way ends under the one it began under. The session table and the
-   record of sent prompts stand. The new document's policies are told the workers that stand
-   before the call returns.
+   where the document's generation is not above the standing one. The next decision runs under it,
+   and a decision under way ends under the one it began under. The session table and the record of
+   sent prompts stand, and so do the policies of a profile whose name and text did not change, under
+   the three rules of section 5.1. The policies built new are told the workers that stand before the
+   call returns.
 
 A caller that builds its engine with `PolicyEngine::new(spec)`, as the crate's own cases and
 bench do over lists made by hand, makes each hand-over itself:

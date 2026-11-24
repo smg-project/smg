@@ -3387,6 +3387,33 @@ pub(crate) mod tests {
         (spec, heard)
     }
 
+    /// A stage table whose picker `hears` takes every word of a lease and
+    /// keeps what it hears in a list of its own, and those lists in the
+    /// order the table built their pickers: a validation builds one for
+    /// each profile that names the picker. Documents validated over the
+    /// one table build the same stage under each name.
+    pub(in crate::engine::policy_engine) fn hearing_stages(
+    ) -> (StageRegistry, Arc<Mutex<Vec<Heard>>>) {
+        let built = Arc::new(Mutex::new(Vec::new()));
+        let lists = Arc::clone(&built);
+        let make = move || -> Box<dyn Picker> {
+            let heard = Heard::default();
+            lists.lock().push(Arc::clone(&heard));
+            Box::new(Hears {
+                heard,
+                panics: false,
+                alone: false,
+                takes: EventSet::LEASE,
+            })
+        };
+        let mut stages = StageRegistry::builtin();
+        let added = stages.picker("hears", make);
+        added.expect("a free name");
+        // The registration built one picker, to ask its name.
+        built.lock().clear();
+        (stages, built)
+    }
+
     /// [`hearing`] with a picker that places by itself where `alone`, and
     /// that names the words `takes`.
     fn hearing_as(panics: bool, alone: bool, takes: EventSet) -> (PolicyEngine, Heard) {

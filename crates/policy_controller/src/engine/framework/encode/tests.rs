@@ -21,6 +21,11 @@ use crate::{
     tracking::in_flight::tests::Lent,
 };
 
+/// A profile of an engine no other engine shares yet, to change in a case.
+fn own(profile: &mut Arc<Profile>) -> &mut Profile {
+    Arc::get_mut(profile).expect("a profile held once")
+}
+
 /// The `epd` plan with every side taking the row that holds fewer requests.
 fn engine() -> Engine {
     let mut spec = PolicySpec::epd_presets("power_of_two", "power_of_two", "power_of_two")
@@ -663,7 +668,7 @@ fn encoders_the_veto_left_none_of_shed_as_saturation() {
         row(1, Role::Encode, 0, 0),
     ];
     let mut behind = engine();
-    for profile in &mut behind.profiles {
+    for profile in behind.profiles.iter_mut().map(own) {
         profile
             .filters
             .push(Box::new(RefusesOne(bed.encoders[1].id)));
@@ -1059,7 +1064,7 @@ fn decide_into(bed: &Bed, engine: &Engine, placed: &mut EncodePlaced) -> Decisio
 #[test]
 fn a_decision_that_is_no_pick_holds_nothing_placed() {
     let mut engine = engine();
-    for profile in &mut engine.profiles {
+    for profile in engine.profiles.iter_mut().map(own) {
         profile.filters.push(Box::new(RefusesTheKey));
     }
     // Two items: the first is placed, the second's stage turns.
@@ -1125,7 +1130,7 @@ fn the_entry_clears_what_the_decision_before_placed() {
 #[test]
 fn the_encode_side_is_asked_under_the_encode_phase() {
     let mut engine = engine();
-    for profile in &mut engine.profiles {
+    for profile in engine.profiles.iter_mut().map(own) {
         profile.filters.push(Box::new(EncodersUnderTheirPhase));
     }
     let (decision, placed) = Bed::new().decide_with(&engine);
@@ -1163,7 +1168,7 @@ impl framework::Filter for ReadsHeld {
 fn each_admitted_row_and_each_encoder_reads_its_own_cells() {
     let read = Arc::new(parking_lot::Mutex::new(Vec::new()));
     let mut engine = engine();
-    for profile in &mut engine.profiles {
+    for profile in engine.profiles.iter_mut().map(own) {
         let held = SignalColumn::new("held", "tokens", 0, None);
         let reads = ReadsHeld(held, Arc::clone(&read));
         profile.filters.push(Box::new(reads));
@@ -1524,7 +1529,9 @@ fn an_encode_profile_that_shows_its_rows_declines_a_request_with_items() {
         })
         .expect("the epd plan");
     let shows = ShowsItsRows(Arc::clone(&asked));
-    engine.profiles[encode].filters.push(Box::new(shows));
+    own(&mut engine.profiles[encode])
+        .filters
+        .push(Box::new(shows));
     engine.marks[encode] = framework::Marks::of(&engine.profiles[encode], engine.orders[encode]);
 
     let (decision, placed) = Bed::new().decide_with(&engine);
@@ -1550,7 +1557,9 @@ fn a_mask_on_a_row_cut_out_declines_nothing_for_a_side_that_shows_its_rows() {
     let binding = engine.binding("m", Phase::Prefill).expect("the binding");
     let prefill = usize::from(binding.profile);
     let shows = ShowsItsRows(Arc::new(AtomicU32::new(0)));
-    engine.profiles[prefill].filters.push(Box::new(shows));
+    own(&mut engine.profiles[prefill])
+        .filters
+        .push(Box::new(shows));
     engine.marks[prefill] = framework::Marks::of(&engine.profiles[prefill], engine.orders[prefill]);
     // The first prefill's class holds no encoder: the pair is decided over
     // the second alone.
@@ -1636,7 +1645,7 @@ impl framework::Filter for CountsItsAsks {
 fn a_request_with_a_column_or_named_rows_declines_before_a_stage_is_asked() {
     let asked = Arc::new(AtomicU32::new(0));
     let mut engine = engine();
-    for profile in &mut engine.profiles {
+    for profile in engine.profiles.iter_mut().map(own) {
         let counts = CountsItsAsks(Arc::clone(&asked));
         profile.filters.push(Box::new(counts));
     }
@@ -1844,7 +1853,7 @@ fn a_mask_is_numbered_with_the_encoders_offered() {
             Plan::Single | Plan::PdPair => None,
         })
         .expect("the epd plan");
-    let filters = &mut engine.profiles[encode].filters;
+    let filters = &mut own(&mut engine.profiles[encode]).filters;
     filters.retain(|filter| filter.name() != "healthy");
     filters.push(Box::new(MaskedSoftly));
     engine.marks[encode] = framework::Marks::of(&engine.profiles[encode], engine.orders[encode]);
@@ -1898,7 +1907,7 @@ fn the_held_rows_of_a_mask_are_numbered_with_it() {
     let decode = binding.decode_profile.unwrap_or(binding.profile);
     for (profile, soft) in [(binding.profile, false), (decode, false), (encode, true)] {
         let profile = usize::from(profile);
-        let filters = &mut engine.profiles[profile].filters;
+        let filters = &mut own(&mut engine.profiles[profile]).filters;
         filters.retain(|filter| filter.name() != "healthy");
         filters.push(Box::new(HeldOut { soft }));
         engine.marks[profile] =
@@ -2312,7 +2321,7 @@ fn a_request_held_off_every_worker_that_takes_it_is_shed_under_the_places_name()
     // Over every encoder that is a missing endpoint: the request held to
     // the place reads the encoder there alone.
     let mut behind = engine();
-    for profile in &mut behind.profiles {
+    for profile in behind.profiles.iter_mut().map(own) {
         profile
             .filters
             .push(Box::new(RefusesOne(bed.encoders[1].id)));

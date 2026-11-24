@@ -23,6 +23,17 @@ use crate::{
     },
 };
 
+impl Affinity {
+    /// The bound, in placements, of the record of the prefixes sent to
+    /// `model`'s workers: none where no list's table asked for one yet.
+    pub(in crate::engine::policy_engine) fn bound_of(&self, model: &str) -> Option<usize> {
+        let records = self.records.lock();
+        let record = records.get(model)?;
+        let bound = record.predictor.read().bound();
+        Some(bound)
+    }
+}
+
 const MODEL: &str = "model-a";
 /// Tokens a block.
 const BLOCK: u32 = 16;
