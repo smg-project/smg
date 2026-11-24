@@ -3799,10 +3799,11 @@ mod watched_tests {
     /// A reader's own stop finds the layer that tells a stream's end under
     /// each layer a reader's stream has: the tracked layer, the watch for
     /// its client and a decode side's stamp, in a reader's order and in
-    /// another. Grand Central hears the worker's 200 each time.
+    /// another, and an item pulled ahead of its reader. Grand Central
+    /// hears the worker's 200 each time.
     #[test]
     fn a_readers_stop_tells_the_end_under_each_layer_of_its_stream() {
-        use super::FanoutStream;
+        use super::{AheadStream, FanoutStream};
         use crate::routers::common::placement::{tests::heard_request, RequestEnd};
 
         let (client, _body) = sse_channel();
@@ -3830,8 +3831,14 @@ mod watched_tests {
             stream
         };
         let watched = |end: RequestEnd| tracked(end).until_client_gone(&client, "req-stopped");
-        let shapes: [(&str, &dyn Fn(RequestEnd) -> ProtoStream); 5] = [
+        let shapes: [(&str, &dyn Fn(RequestEnd) -> ProtoStream); 6] = [
             ("the layer alone", &layered),
+            ("under an item pulled ahead", &|end| {
+                ProtoStream::Ahead(Box::new(AheadStream {
+                    inner: layered(end),
+                    first: None,
+                }))
+            }),
             ("under the tracked layer", &tracked),
             ("under the watch", &watched),
             ("under a decode side's stamp", &|end| {
@@ -3853,6 +3860,30 @@ mod watched_tests {
                 "{shape}"
             );
         }
+    }
+
+    /// The layer goes under a stream's tracked layer, so its readers still
+    /// meet a tracked stream: it names its worker, and its first item is
+    /// read ahead and held back for its reader.
+    #[tokio::test]
+    async fn the_layer_goes_under_the_tracked_layer() {
+        use super::{FanoutStream, FirstItem};
+        use crate::routers::common::placement::tests::heard_request;
+
+        let (heard, guard, end) = heard_request();
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("grpc://e:30000").build());
+        let mut stream =
+            ProtoStream::Fanout(FanoutStream::new(Vec::new())).tracked(worker, 0, false);
+        stream.report_through(end);
+        assert!(stream.worker().is_some(), "the stream names its worker");
+        assert_eq!(stream.first_response().await, FirstItem::End);
+        assert!(stream.next().await.is_none(), "the end was held back");
+
+        drop((stream, guard));
+        assert_eq!(
+            *heard.lock().expect("the stage heard"),
+            ["issued", "dispatched Single", "completed Ok 200"]
+        );
     }
 
     /// The stage puts the layer before a reader watches the stream: a debug

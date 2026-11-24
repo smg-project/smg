@@ -6740,30 +6740,28 @@ pub(crate) mod tests {
 
     /// The plan's one telling behind a failed dispatch. The answer bears
     /// the end its dispatch owes: the plan takes it off the answer and tells
-    /// it. An answer that bears none tells nothing: the deadline's, whose
-    /// end was told where the answer was made. A request the classic
-    /// policies placed and a pair owe no end, and their failure is not read
-    /// for one.
+    /// it, with the status and with who answered as the mark says them. An
+    /// answer that bears none tells nothing. A request the classic policies
+    /// placed and a pair owe no end, and their failure is not read for one.
     #[test]
     fn the_plan_takes_the_end_a_failed_dispatch_owes_off_its_answer_and_tells_it() {
         let failed = || error::internal_error("stub_failed", "the stub's answer");
 
-        let (heard, guard, end) = heard_request();
-        let mut answer = failed();
-        let owed = UntoldEnd {
-            status: 500,
-            answered: true,
-        };
-        owed.mark(&mut answer);
-        assert!(bears_untold_end(&answer));
-        let mut result = Err(answer);
-        tell_end(&mut result, end);
-        assert!(result.is_err_and(|answer| !bears_untold_end(&answer)));
-        drop(guard);
-        assert_eq!(
-            heard_of(&heard),
-            ["issued", "dispatched Single", "completed ServerError 500"]
-        );
+        for (status, answered, end_heard) in [
+            (500, true, "completed ServerError 500"),
+            (503, false, "completed ConnectFailed 503"),
+        ] {
+            let (heard, guard, end) = heard_request();
+            let mut answer = failed();
+            let owed = UntoldEnd { status, answered };
+            owed.mark(&mut answer);
+            assert!(bears_untold_end(&answer));
+            let mut result = Err(answer);
+            tell_end(&mut result, end);
+            assert!(result.is_err_and(|answer| !bears_untold_end(&answer)));
+            drop(guard);
+            assert_eq!(heard_of(&heard), ["issued", "dispatched Single", end_heard]);
+        }
 
         let (heard, guard, end) = heard_request();
         let mut result = Err(failed());
@@ -6782,6 +6780,34 @@ pub(crate) mod tests {
             assert!(!selection.tells_end());
             let owed = UntoldEnd::owed(&selection, || panic!("no end is owed"));
             assert!(owed.is_none());
+        }
+    }
+
+    /// A batch the classic policies placed is handed the empty handle, and
+    /// its streams are left as they are: none takes the layer.
+    #[test]
+    fn a_classic_batchs_streams_take_no_layer() {
+        use crate::routers::grpc::proto_wrapper::{FanoutStream, ProtoStream};
+
+        let unit = || ExecutionResult::Single {
+            stream: ProtoStream::Fanout(FanoutStream::new(Vec::new())),
+            dispatch_start: Instant::now(),
+        };
+        let mut batch = ExecutionResult::Batch {
+            results: vec![unit(), unit()],
+        };
+        batch.report_through(RequestEnd::default());
+        let ExecutionResult::Batch { results } = &batch else {
+            panic!("a batch");
+        };
+        for result in results {
+            assert!(matches!(
+                result,
+                ExecutionResult::Single {
+                    stream: ProtoStream::Fanout(_),
+                    ..
+                }
+            ));
         }
     }
 

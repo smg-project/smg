@@ -16,7 +16,10 @@ use tokio::{sync::oneshot, time::timeout};
 use super::{super::HarmonyStreamingProcessor, chunk, usage::harmony_tokens};
 use crate::{
     observability::metrics::metrics_labels,
-    routers::grpc::{context, regular::streaming::tests::eof::gated_stream, utils},
+    routers::{
+        common::placement::{tests::heard_request, RequestEnd},
+        grpc::{context, regular::streaming::tests::eof::gated_stream, utils},
+    },
 };
 
 fn complete(output_ids: Vec<u32>) -> proto::GenerateResponse {
@@ -32,12 +35,17 @@ fn complete(output_ids: Vec<u32>) -> proto::GenerateResponse {
     }
 }
 
-#[tokio::test]
-async fn a_router_stop_ends_the_read_and_the_engine_request() {
+/// The chat turn of these cases, read to its end: the engine streams on past
+/// the router's stop, and its Complete waits behind a gate that never opens.
+/// The engine's stream tells its end through `end`; an empty handle leaves it
+/// as it is. Answers the engine's tokens and the events the client read.
+async fn stopped_turn(end: RequestEnd) -> (Vec<u32>, Vec<Value>) {
     let tokens = harmony_tokens(None, "Hello STOP and on and on and on and on");
     let chunks: Vec<_> = tokens.chunks(3).map(|ids| chunk(ids.to_vec())).collect();
     let (gate_tx, gate) = oneshot::channel::<()>();
-    let (stream, server) = gated_stream(chunks, gate, vec![complete(tokens.clone())], "0").await;
+    let (mut stream, server) =
+        gated_stream(chunks, gate, vec![complete(tokens.clone())], "0").await;
+    stream.report_through(end);
     let dispatch = context::DispatchMetadata {
         request_id: "harmony-local-stop".to_string(),
         model: "harmony-test".to_string(),
@@ -73,13 +81,19 @@ async fn a_router_stop_ends_the_read_and_the_engine_request() {
     .expect("the stream's body");
     server.abort();
     drop(gate_tx);
-    let events: Vec<Value> = std::str::from_utf8(&body)
+    let events = std::str::from_utf8(&body)
         .expect("UTF-8 SSE")
         .lines()
         .filter_map(|line| line.strip_prefix("data: "))
         .filter(|data| *data != "[DONE]")
         .map(|data| serde_json::from_str(data).expect("SSE JSON"))
         .collect();
+    (tokens, events)
+}
+
+#[tokio::test]
+async fn a_router_stop_ends_the_read_and_the_engine_request() {
+    let (tokens, events) = stopped_turn(RequestEnd::default()).await;
     let content: String = events
         .iter()
         .filter_map(|event| event["choices"][0]["delta"]["content"].as_str())
@@ -108,5 +122,23 @@ async fn a_router_stop_ends_the_read_and_the_engine_request() {
         completion > 0 && completion < tokens.len() as u64,
         "{completion} of {} tokens",
         tokens.len()
+    );
+}
+
+/// The stop leaves a whole answer. The reader lets the engine go there, and
+/// Grand Central hears the worker's 200, though the stream is dropped
+/// before its own end.
+#[tokio::test]
+async fn a_router_stop_is_heard_as_the_workers_good_end() {
+    let (heard, guard, end) = heard_request();
+    let (_tokens, events) = stopped_turn(end).await;
+    assert!(events
+        .iter()
+        .any(|event| event["choices"][0]["finish_reason"] == "stop"));
+
+    drop(guard);
+    assert_eq!(
+        *heard.lock().expect("the stage heard"),
+        ["issued", "dispatched Single", "completed Ok 200"]
     );
 }

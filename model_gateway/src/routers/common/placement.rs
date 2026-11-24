@@ -583,8 +583,9 @@ impl SharedEnd {
     /// The handle for a reader that met its end, `failed` or good: the
     /// request's own for the first failure, told or not, and for the last
     /// good end, the empty one for any other. A first failure the circuit
-    /// breaker takes no sample of tells nothing, and it is the answer the
-    /// client gets: a sibling's failure behind it is not told either.
+    /// breaker takes no sample of tells nothing, and a sibling's failure
+    /// behind it is not told either: the request failed, whichever failure
+    /// its client is handed.
     pub(crate) fn take(&self, failed: bool) -> RequestEnd {
         let (end, open) = &mut *self.0.lock();
         *open = open.saturating_sub(1);

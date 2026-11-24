@@ -2777,6 +2777,65 @@ mod tests {
         assert_eq!(spy.0.lock().unwrap().len(), before + 3);
     }
 
+    /// The handle on a request's end is asked of its guard under whatever
+    /// rides with the guards: the dispatch's upstream span, an admission
+    /// claim. A request told through that handle hears its outcome.
+    #[test]
+    fn the_guards_hand_a_requests_end_under_what_rides_with_them() {
+        use smg_worker::identity::basic::WorkerType;
+
+        use crate::routers::{
+            common::{
+                pd_admission::{try_admit_decode, Tried},
+                placement::tests::heard_request,
+            },
+            grpc::backend_client::BasicWorkerBuilder,
+        };
+
+        // A ride takes the guards and hands them back under itself.
+        type Ride = Box<dyn FnOnce(LoadGuards) -> LoadGuards>;
+
+        let window = [("max_running_requests".to_string(), "1".to_string())];
+        let windowed: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://windowed")
+                .worker_type(WorkerType::Decode)
+                .labels(window.into_iter().collect())
+                .build(),
+        );
+        let Tried::Claimed(claim) = try_admit_decode(&windowed, 1) else {
+            panic!("a free room is claimed");
+        };
+        let rides: [(&str, Ride); 2] = [
+            (
+                "the upstream span",
+                Box::new(|guards| LoadGuards::traced(tracing::Span::none(), guards)),
+            ),
+            (
+                "an admission claim",
+                Box::new(move |guards| LoadGuards::admitted(Some(claim), guards)),
+            ),
+        ];
+        for (ride, under) in rides {
+            let (heard, guard, end) = heard_request();
+            drop(end);
+            let guards = under(LoadGuards::Single { _guard: guard });
+            assert!(
+                matches!(
+                    guards,
+                    LoadGuards::Traced { .. } | LoadGuards::Admitted { .. }
+                ),
+                "{ride}"
+            );
+            guards.end().report(200, || true);
+            drop(guards);
+            assert_eq!(
+                *heard.lock().expect("the stage heard"),
+                ["issued", "dispatched Single", "completed Ok 200"],
+                "{ride}"
+            );
+        }
+    }
+
     /// The client-shape mismatch answers an executor takes from the
     /// selection: one status and code per shape, whichever executor asks;
     /// a selection of the asked shape hands its clients out.

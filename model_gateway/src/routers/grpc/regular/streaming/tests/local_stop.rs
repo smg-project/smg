@@ -204,6 +204,87 @@ async fn a_local_stop_is_heard_as_the_workers_good_end() {
     );
 }
 
+/// The completion read lets the engine go at the gateway's stop as the chat
+/// read does, and Grand Central hears the same good end.
+#[tokio::test]
+async fn a_completions_local_stop_is_heard_as_the_workers_good_end() {
+    let request: openai_protocol::completion::CompletionRequest = serde_json::from_value(json!({
+        "model": "eof-test", "prompt": "test", "stream": true, "ignore_eos": true,
+        "max_tokens": 4096, "stop": "STOP"
+    }))
+    .unwrap();
+    let spec = CompletionResponseSpec::new(&request, Vec::new());
+    let (heard, guard, end) = heard_request();
+    let (gate_tx, mut stream, server) = stream_past_a_local_stop().await;
+    stream.report_through(end);
+    let (tx, rx) = sse_channel();
+    let outcome = timeout(
+        Duration::from_secs(5),
+        processor(false).process_completion_streaming_chunks(
+            stream,
+            dispatch(),
+            Arc::new(CharacterTokenizer::default()),
+            stop_string("STOP"),
+            &spec,
+            "",
+            0,
+            &tx,
+            None,
+        ),
+    )
+    .await
+    .expect("the unit ends at the stop, without the engine's tail")
+    .expect("the unit's outcome");
+    drop(tx);
+    collect_events(rx).await;
+    server.abort();
+    drop(gate_tx);
+    assert!(outcome.saw_complete);
+
+    drop(guard);
+    assert_eq!(
+        *heard.lock().expect("the stage heard"),
+        ["issued", "dispatched Single", "completed Ok 200"]
+    );
+}
+
+/// The messages read lets the engine go at the gateway's stop too, and
+/// Grand Central hears the same good end.
+#[tokio::test]
+async fn a_messages_local_stop_is_heard_as_the_workers_good_end() {
+    let (heard, guard, end) = heard_request();
+    let (gate_tx, mut stream, server) = stream_past_a_local_stop().await;
+    stream.report_through(end);
+    let (tx, rx) = sse_channel();
+    let mut spec = messages_spec(false);
+    spec.prompt_tokens = 7;
+    let result = timeout(
+        Duration::from_secs(5),
+        processor(false).process_messages_streaming_chunks(
+            stream,
+            dispatch(),
+            Arc::new(CharacterTokenizer::default()),
+            stop_string("STOP"),
+            spec,
+            &tx,
+            None,
+        ),
+    )
+    .await
+    .expect("the message ends at the stop, without the engine's tail");
+    drop(tx);
+    collect_events(rx).await;
+    server.abort();
+    drop(gate_tx);
+    assert!(result.is_ok(), "{result:?}");
+
+    drop(guard);
+    assert_eq!(
+        *heard.lock().expect("the stage heard"),
+        ["issued", "dispatched Single", "completed Ok 200"]
+    );
+}
+
 #[tokio::test]
 async fn a_batched_request_is_aborted_only_when_every_choice_has_closed() {
     // Choice 0 stops locally on its second chunk while choice 1 goes on: its
