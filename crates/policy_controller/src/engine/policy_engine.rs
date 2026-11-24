@@ -492,7 +492,12 @@ impl PolicyEngine {
 
     /// One word of a store's membership, said under the store's lock of its
     /// workers ([`Self::hears`]): the document's engine hears it whole, its
-    /// session table and then its stages ([`Lifecycle::on_membership`]).
+    /// session table and then its stages ([`Lifecycle::on_membership`]). A
+    /// stage that panics at it is held and counted, as at a gateway's word
+    /// ([`Self::word_caught`]): the session table, told ahead of the
+    /// stages, stays told, the stages behind the one that panicked do not
+    /// hear the word, and the store's write goes on with what it still
+    /// owes.
     ///
     /// It holds the telling's lock for the word, as a gateway's word does
     /// ([`Self::tell`]). The locks are taken in one order: the store's, the
@@ -501,7 +506,7 @@ impl PolicyEngine {
     pub(crate) fn on_membership(&self, word: &Membership<'_>) {
         let _held = self.telling.lock();
         self.hears(self.document.load().spec.engine(), word, |engine| {
-            engine.on_membership(word);
+            self.word_caught(|| engine.on_membership(word));
         });
     }
 
