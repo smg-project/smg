@@ -80,6 +80,18 @@
 //! made by the conversion above. A decision that was not the one to
 //! convert writes its own into a buffer of the calling thread, and where
 //! both sides do, the second side's are allocated.
+//!
+//! **A side's shadow.** A pair's binding may name a shadow profile a side.
+//! A pair's first decision made through the entry that issues its lease
+//! ([`decided`]) decides each such side once more by that profile
+//! ([`side_shadows`]), inside the calling thread's buffers and behind the
+//! live decision, which it changes nothing of. What each said is counted
+//! by its side, ahead of the pair's issue
+//! ([`PolicyEngine::shadow_counts`]). A document that names no shadow pays
+//! the test of that word at the entry and one test of the room in the
+//! decision, and no call. No other entry asks a side's shadow yet: not
+//! the decode decided again, nor the decision alone ([`decide`]), nor an
+//! encode request's.
 
 #![expect(
     clippy::exhaustive_structs,
@@ -95,17 +107,18 @@ use std::{
 
 use smg_worker::{identity::basic::Worker, load::state::LoadSnapshot};
 
-use super::{overlap, signals, single, Loaded, PolicyEngine, PoolMembers};
+use super::{overlap, signals, single, with_shadow, Loaded, PolicyEngine, PoolMembers};
 use crate::{
     engine::{
-        decision::{shed, Decision, ShedReason, Target, SUBSET_HINT, WIRES},
+        decision::{shed, Decision, ShadowKind, ShedReason, Target, SUBSET_HINT, WIRES},
         decision_engine::{DecideOutcome, HeldDecision, Leased, Request},
         demands::{Demands, UnmetDemand},
-        framework::{Engine, PairPools, Scratch},
+        framework::{Engine, PairPools, PairSide, Scratch, ShadowRows},
         lease_events,
         list_cell::LentList,
         pair_classes::PartnerClasses,
         records::{vetoes, HeldCells, Live, PoolRecords},
+        shadow::{budget_left, ShadowSide, Shadowed, SHADOW_FLOOR},
         view::{
             AffinityFacts, Candidate, Constraints, Phase, PoolFacts, RequestFacts, Role, Session,
             SessionCountedUnder, WorkerId,
@@ -405,7 +418,17 @@ impl<'a> PairLists<'a> {
         held: Option<&Target>,
     ) -> Decision {
         let counted = SessionCountedUnder::default;
-        self.decide_sides(engine, sides, loads, now, request, held, |_| true, counted)
+        self.decide_sides(
+            engine,
+            sides,
+            loads,
+            now,
+            request,
+            held,
+            |_| true,
+            counted,
+            None,
+        )
     }
 
     /// [`Self::decide_over`], and where the request's caller sends it:
@@ -417,11 +440,18 @@ impl<'a> PairLists<'a> {
     /// under a document that reads the count and under no other, and the
     /// entry above, which holds no maker, answers the key's own text.
     ///
+    /// `said` is the room an entry lends for its sides' shadows. A first
+    /// decision lent one is made out of line and leaves there what each
+    /// side's shadow said beside it ([`decide_shadowed`]), ahead of the
+    /// records of sent prefixes, which keep the live pick. A decision lent
+    /// none asks no shadow and pays one test of its room. The decode
+    /// decided again asks none, lent room or not.
+    ///
     /// [`RequestMaker::sends_to`]: crate::engine::RequestMaker::sends_to
     /// [`RequestMaker::session_counted_under`]: crate::engine::RequestMaker::session_counted_under
     #[expect(
         clippy::too_many_arguments,
-        reason = "a pair's decision over its two lists, and where its caller sends it"
+        reason = "a pair's decision over its two lists, where its caller sends it, and its shadows' room"
     )]
     fn decide_sides(
         &self,
@@ -433,6 +463,7 @@ impl<'a> PairLists<'a> {
         held: Option<&Target>,
         sends_to: impl Fn(&Target) -> bool,
         counted: impl FnOnce() -> SessionCountedUnder,
+        said: Option<&mut SidesSaid>,
     ) -> Decision {
         let (spec, clock) = (&engine.document.spec, &engine.clock);
         // The engine as the fill of a side's column takes it: the name
@@ -595,12 +626,18 @@ impl<'a> PairLists<'a> {
                 table: self.classes.table(),
                 first: self.classes.first(),
             };
-            let decision = match held {
-                None => {
+            let decision = match (held, said) {
+                (None, None) => {
                     let sides = (cx, [prefill_side, decode_side]);
                     decide_records(engine, facts, sides, &prefill_facts, pools, scratch)
                 }
-                Some(held) => {
+                // An entry that lends room for them is left what each
+                // side's shadow said beside the pair.
+                (None, Some(said)) => {
+                    let (sides, pool) = ((cx, [prefill_side, decode_side]), &prefill_facts);
+                    decide_shadowed(loaded, facts, sides, pool, pools, scratch, said)
+                }
+                (Some(held), _) => {
                     let side = (cx, decode_side);
                     decide_decode_records(engine, facts, side, &decode_facts, pools, held, scratch)
                 }
@@ -912,6 +949,130 @@ fn decide_records(
     engine.decide_pair(facts, pool, pools, &prefill_cx, &decode_cx, scratch)
 }
 
+/// What each side's shadow said beside a pair's first decision, the
+/// prefill's then the decode's ([`side_shadows`]): `None` for a side that
+/// was due none, and for one whose shadow panicked. The room an entry
+/// lends its decision for those words: an entry that counts no side's
+/// shadow lends none, and its decision asks none.
+type SidesSaid = [Option<Shadowed>; 2];
+
+/// A pair's first decision by `own` over the records of its two lists
+/// ([`decide_records`]), with what each side's shadow said beside it left
+/// in `said` ([`side_shadows`]): the shadows run on the scratch as that
+/// decision left it, ahead of anything else that writes it.
+///
+/// Out of line: the path of a decision lent no room holds no part of it.
+/// The shadows read the live decision by reference, and a decision lent
+/// so inside that path is copied once more on its way out, for every
+/// pair.
+#[inline(never)]
+fn decide_shadowed(
+    own: Loaded<'_, '_>,
+    facts: &RequestFacts<'_>,
+    sides: (&Constraints<'_>, [Beside<'_>; 2]),
+    pool: &PoolFacts<'_>,
+    pools: PairPools<'_>,
+    scratch: &mut Scratch,
+    said: &mut SidesSaid,
+) -> Decision {
+    let engine = own.document.spec.engine();
+    let decision = decide_records(engine, facts, sides, pool, pools, scratch);
+    *said = side_shadows(own, facts, sides, pool, pools, &decision, scratch);
+    decision
+}
+
+/// What each side's shadow said beside `live`, a pair's first decision
+/// over the records of its two lists ([`decide_records`]), which read the
+/// request's constraints with each side's places and mask (`sides`).
+///
+/// A side's shadow is due where the pair's binding names one for it that
+/// is free to run ([`Engine::shadows_side`]) and a profile made the live
+/// decision. A request refused ahead of the pair's profiles has no shadow,
+/// as a single's has none: no profile decided it
+/// ([`Trace::made_under`](crate::engine::decision::Trace::made_under)).
+///
+/// A side that is due is decided once more by its shadow profile
+/// ([`Engine::shadow_side`]): over the records the live decision read and
+/// the scratch it left, under that side's own places and mask. The run
+/// writes the scratch and the shadow profile's stages. It writes no record
+/// of sent prefixes, issues nothing and tells no stage.
+///
+/// A side that is due and not asked is said as skipped
+/// ([`ShadowKind::Skipped`]): beside a pair that was shed, under less than
+/// [`SHADOW_FLOOR`] of the request's stated budget, and where the engine's
+/// run says none. That run says none where the side's shadow profile would
+/// be handed another column than the side's pool carries
+/// ([`Engine::side_apart`]), and beside a pair a lifted veto placed. So
+/// the kinds a side counts add up to the decisions its pair's profiles
+/// made.
+///
+/// Each side's run stands under the engine's catch
+/// ([`PolicyEngine::caught`]): a shadow that panics costs its request
+/// nothing, is counted with the engine's faults and says nothing, and the
+/// other side is asked all the same.
+fn side_shadows(
+    own: Loaded<'_, '_>,
+    facts: &RequestFacts<'_>,
+    (cx, sides): (&Constraints<'_>, [Beside<'_>; 2]),
+    pool: &PoolFacts<'_>,
+    pools: PairPools<'_>,
+    live: &Decision,
+    scratch: &mut Scratch,
+) -> SidesSaid {
+    let engine = own.document.spec.engine();
+    let made = live.trace().made_under();
+    let word = made.and_then(|_| engine.shadow_for(facts.model, Phase::Prefill));
+    let Some((at, ShadowRows::Sides)) = word else {
+        return [None; 2];
+    };
+    let [prefills, decodes] = sides;
+    let (prefill_cx, decode_cx) = (prefills.of(cx), decodes.of(cx));
+    let left = budget_left(facts);
+    PairSide::BOTH.map(|side| {
+        if !engine.shadows_side(at, side) {
+            return None;
+        }
+        let said = |kind, first| {
+            Some(Shadowed {
+                binding: at,
+                kind,
+                first,
+            })
+        };
+        // A live pick and a budget over the floor: else the side is due
+        // and not asked.
+        let Some(pick) = live.pick().filter(|_| left >= SHADOW_FLOOR) else {
+            return said(ShadowKind::Skipped, None);
+        };
+        let ran = own.caught(|| {
+            let (cx, decode_cx) = (&prefill_cx, &decode_cx);
+            Ok(engine.shadow_side(at, side, facts, pool, pools, cx, decode_cx, pick, scratch))
+        });
+        match ran {
+            Ok(Some(shadow)) => {
+                let first = shadow.pick().and_then(|pick| pick.targets.first());
+                // A pair's first target names its prefill, with the decode
+                // beside it: a side is compared by its own row.
+                let taken = pick.targets.first().and_then(|target| match side {
+                    PairSide::Prefill => Some(target.position),
+                    PairSide::Decode => target.pair.map(|pair| pair.decode_position),
+                });
+                let kind = match first {
+                    Some(first) if Some(first.position) == taken => ShadowKind::Agreed,
+                    Some(_) => ShadowKind::OtherTarget,
+                    None => ShadowKind::OtherOutcome,
+                };
+                said(kind, first.map(|first| first.id))
+            }
+            // The engine's run says none for a profile of another column
+            // and beside a pair a lifted veto placed.
+            Ok(None) => said(ShadowKind::Skipped, None),
+            // The shadow panicked: counted where it was caught.
+            Err(_) => None,
+        }
+    })
+}
+
 /// What a pair's first pick ([`PairLists::decide`]) issues, for a first
 /// decision of `own`: the prefill side's lease under `id`, which is the
 /// answer's lease, and the request's session under the decode phase, which
@@ -1137,6 +1298,9 @@ fn issue_decode_caught(
 /// asked under a document one of whose stages reads that count, and each
 /// side's records then read it under the name of the side's own session.
 ///
+/// No side's shadow is asked here: no room is lent for what one would
+/// say, and nobody would count it.
+///
 /// [`RequestMaker::sends_to`]: crate::engine::RequestMaker::sends_to
 /// [`RequestMaker::session_counted_under`]: crate::engine::RequestMaker::session_counted_under
 #[inline]
@@ -1154,6 +1318,31 @@ pub(super) fn decide(
     sends_to: impl Fn(&Target) -> bool,
     counted: impl FnOnce() -> SessionCountedUnder,
 ) -> Decision {
+    decide_with(
+        own, lists, request, target, loads, now, sends_to, counted, None,
+    )
+}
+
+/// [`decide`], lent the room its caller has for the sides' shadows
+/// ([`SidesSaid`]): a first decision lent one leaves there what each
+/// side's shadow said beside it, for the caller to count. A request
+/// declined for its wires has no shadow: no profile decided it.
+#[inline]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a pair's decision as its entries ask it, and its shadows' room"
+)]
+fn decide_with(
+    own: Loaded<'_, '_>,
+    lists: &PairLists<'_>,
+    request: &mut Request<'_>,
+    target: Option<&Target>,
+    loads: Option<&Arc<LoadSnapshot>>,
+    now: Instant,
+    sends_to: impl Fn(&Target) -> bool,
+    counted: impl FnOnce() -> SessionCountedUnder,
+    said: Option<&mut SidesSaid>,
+) -> Decision {
     // The engine's own value of each list, asked of the list's cell once.
     let sides = (own.members_of(lists.prefill), own.members_of(lists.decode));
     let wires = request.constraints.wire_modes;
@@ -1161,7 +1350,9 @@ pub(super) fn decide(
     if !wires.is_empty() && !wires.contains(dialed) {
         return single::declined(own, request, WIRES);
     }
-    lists.decide_sides(own, sides, loads, now, request, target, sends_to, counted)
+    lists.decide_sides(
+        own, sides, loads, now, request, target, sends_to, counted, said,
+    )
 }
 
 /// One decision of a pair by `own`, the engine of a gateway's own process,
@@ -1173,6 +1364,17 @@ pub(super) fn decide(
 /// reports in `loads`: the snapshot the request gives for this call, or
 /// the newest the engine's own task keeps at hand. `sends_to` and `counted`
 /// are handed to [`decide`] as they stand.
+///
+/// Under a document that names a shadow, a pair's first decision is lent
+/// room for what its sides' shadows say ([`side_shadows`]), and each word
+/// is counted in its side's table ([`count_sides`]). The count stands
+/// ahead of the pair's issue: an outcome held across the count is copied
+/// once more for every pair, and a stage that panics at that issue is held
+/// ([`issue_caught`]), so the pair stands and its sides are counted in
+/// either order. The decision and the issue are the ones of a document
+/// that names no shadow, which pays the test of that word here and one
+/// test of the room in the decision. The decode asked again is lent the
+/// room and asks no shadow.
 #[expect(
     clippy::too_many_arguments,
     reason = "a pair's decision as its host takes it, and its maker's two words"
@@ -1188,8 +1390,30 @@ pub(super) fn decided(
     counted: impl FnOnce() -> SessionCountedUnder,
 ) -> DecideOutcome {
     let target = held.map(|held| held.target);
-    let decision = decide(own, lists, request, target, loads, now, sends_to, counted);
+    let shadowed = own.document.any_shadow;
+    let mut said: SidesSaid = [None; 2];
+    let room = shadowed.then_some(&mut said);
+    let decision = decide_with(
+        own, lists, request, target, loads, now, sends_to, counted, room,
+    );
+    if shadowed {
+        count_sides(own, said);
+    }
     issued(own, request, decision, held, now)
+}
+
+/// What each side's shadow said beside a pair's first decision by `own`
+/// ([`decided`]), counted in that side's table ([`with_shadow::count`]).
+///
+/// Out of line: the path of a document that names no shadow holds no part
+/// of it.
+#[inline(never)]
+fn count_sides(own: Loaded<'_, '_>, said: SidesSaid) {
+    for (side, said) in PairSide::BOTH.into_iter().zip(said) {
+        if let Some(said) = said {
+            with_shadow::count(own, said, ShadowSide::of_pair(side));
+        }
+    }
 }
 
 /// A pair's `decision` as its host takes it, with the lease its pick is
@@ -1281,6 +1505,7 @@ mod tests {
         },
     };
 
+    mod side_shadows;
     mod vetoed;
 
     const MODEL: &str = "model-a";
@@ -3868,19 +4093,20 @@ mod tests {
         );
     }
 
-    /// A picker that picks as [`Best`] and panics at a decode side's issue.
+    /// A picker that picks as [`Best`] and panics at the issue of the side
+    /// it names.
     #[derive(Debug)]
-    struct StopsAtDecode;
+    struct StopsAt(Side);
 
-    impl Lifecycle for StopsAtDecode {
+    impl Lifecycle for StopsAt {
         fn on_decision_issued(&self, lease: &Lease, _: &Decision) {
-            assert!(lease.side != Side::Decode, "this stage panics there");
+            assert!(lease.side != self.0, "this stage panics there");
         }
     }
 
-    impl Picker for StopsAtDecode {
+    impl Picker for StopsAt {
         fn name(&self) -> &'static str {
-            "stops-at-decode"
+            "stops-at"
         }
 
         fn pick(
@@ -3896,11 +4122,17 @@ mod tests {
         }
     }
 
-    /// [`hearing`] with a prefill side that picks through [`StopsAtDecode`].
+    /// [`hearing`] with a prefill side that picks through [`StopsAt`]: at
+    /// the decode side's issue, or at the prefill side's where `prefill`.
     /// The decode profile's stage, which keeps what it hears, is told each
     /// word ahead of it.
-    fn stopping() -> (AppliedSpec, Arc<Mutex<Vec<Word>>>) {
-        hearing_with(Some(("stops-at-decode", || Box::new(StopsAtDecode))))
+    fn stopping(prefill: bool) -> (AppliedSpec, Arc<Mutex<Vec<Word>>>) {
+        let stage: OwnPicker = if prefill {
+            ("stops-at", || Box::new(StopsAt(Side::Prefill)))
+        } else {
+            ("stops-at", || Box::new(StopsAt(Side::Decode)))
+        };
+        hearing_with(Some(stage))
     }
 
     /// A stage that panics at the issue of a decode decided again is held
@@ -3915,7 +4147,7 @@ mod tests {
     /// (`model_gateway/src/routers/common/placement.rs:1227`).
     #[test]
     fn a_stage_that_panics_at_a_decode_calls_issue_costs_the_call_nothing() {
-        let host = Host::under(stopping(), 1, 2);
+        let host = Host::under(stopping(false), 1, 2);
         let classes = every(1, 2);
         let (asks, now) = (host.asks(&classes, true), Instant::now());
         let mut guard = DecisionGuard::decide_under(&host.engine, GatewayId::LOCAL, &asks, now)
@@ -3959,7 +4191,7 @@ mod tests {
     /// (`model_gateway/src/routers/common/placement.rs:2758`, `:2820`).
     #[test]
     fn a_stage_that_panics_at_a_pairs_first_issue_costs_the_request_nothing() {
-        let host = Host::under(stopping(), 1, 2);
+        let host = Host::under(stopping(false), 1, 2);
         let classes = every(1, 2);
         // The decode is issued with its prefill: its issue is the one the
         // stage panics at, behind the prefill side's.
@@ -3987,6 +4219,41 @@ mod tests {
             ]
         );
         // The held panic alone is counted: no decision faulted.
+        assert_eq!((host.engine.faults(), host.engine.unheard()), (0, 1));
+    }
+
+    /// Where the stage panics at the prefill side's issue, the one catch
+    /// holds both issues: the stage ahead of it heard the prefill's, and
+    /// no stage hears the decode side's. The decision answers its pick and
+    /// its lease all the same, so the guard holds both sides as issued,
+    /// and a stage hears the decode side's dispatch and its end with no
+    /// issue ahead of them, as the lifecycle's doc says a stage may.
+    #[test]
+    fn a_stage_that_panics_at_a_pairs_prefill_issue_leaves_the_decode_side_untold() {
+        let host = Host::under(stopping(true), 1, 2);
+        let classes = every(1, 2);
+        let (asks, now) = (host.asks(&classes, false), Instant::now());
+        let mut guard = DecisionGuard::decide_under(&host.engine, GatewayId::LOCAL, &asks, now)
+            .expect("a decision");
+        assert!(!guard.decode_chosen(), "the pick issued both sides");
+        let first = target_at(guard.decision(), 0);
+        let decode = first.pair.expect("a pair").decode_id;
+        let at = guard.lease().expect("a lease").lease.issued_micros;
+        guard.dispatched(now);
+        guard.dispatched_decode(now);
+        guard.completed(&outcome(Side::Prefill, first.id), now);
+        guard.completed(&outcome(Side::Decode, decode), now);
+        drop(guard);
+        assert_eq!(
+            host.words(),
+            [
+                ("issued", Side::Prefill, first.id, at),
+                ("dispatched", Side::Prefill, first.id, at),
+                ("dispatched", Side::Decode, decode, at),
+                ("completed", Side::Prefill, first.id, at),
+                ("completed", Side::Decode, decode, at),
+            ]
+        );
         assert_eq!((host.engine.faults(), host.engine.unheard()), (0, 1));
     }
 

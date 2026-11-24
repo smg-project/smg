@@ -703,10 +703,10 @@ pub(crate) fn issue(
 /// until a decode call issues it ([`issue_decode`]) or a dispatch names it.
 /// Its answer carries the prefill side's lease alone.
 ///
-/// No shadow runs on a pair's side yet, so none is counted here. Each
-/// side's lease states its own session verdict: the prefill's the pick's,
-/// and the decode's the one the pick's first target states of its decode,
-/// which the store keeps with the side.
+/// A controller's decision asks no shadow of a pair's side yet, so none
+/// is counted here. Each side's lease states its own session verdict: the
+/// prefill's the pick's, and the decode's the one the pick's first target
+/// states of its decode, which the store keeps with the side.
 ///
 /// A pair's lease counts for each side's key
 /// ([`MemoryStore::issue_decided_pair`]), under any sessions rule and under

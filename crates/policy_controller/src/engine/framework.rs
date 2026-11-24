@@ -6744,37 +6744,11 @@ impl Engine {
             };
             return Some(shed(ShedReason::PolicyDeclined, AFFINITY_COLUMN, trace));
         }
-        // The place a request states on a lent ring is the live profile's
-        // kind of place. A shadow that reads a ring by the other kind is
-        // lent none: the place is not its own, and it places on its own
-        // ring. So is a shadow of the prefix form that cuts a request by
-        // another rule than the live profile's: the places stated are the
-        // live profile's heads'. A live profile that reads no ring states
-        // no place, and its shadow is apart from none.
-        let live = profile_index(&entry.binding, facts.phase).map(usize::from);
-        let apart = live.is_some_and(|live| {
-            let form = self
-                .marks
-                .get(live)
-                .is_some_and(|&live| marks.ring_apart(live));
-            let own = self.head_places.get(usize::from(index));
-            let live = self.head_places.get(live);
-            let reads = |places: Option<&HeadPlaces>| {
-                places.is_some_and(|places| *places != HeadPlaces::Unread)
-            };
-            form || (reads(own) && reads(live) && own != live)
-        });
-        let unlent;
-        let facts = if facts.ring.is_some() && apart {
-            unlent = RequestFacts {
-                ring: None,
-                ring_positions: &[],
-                ..*facts
-            };
-            &unlent
-        } else {
-            facts
-        };
+        // The place a request states on a lent ring is the live profile's:
+        // a shadow apart from it is lent none ([`Self::unlent`]).
+        let live = profile_index(&entry.binding, facts.phase);
+        let unlent = self.unlent(index, live.as_slice(), facts);
+        let facts = unlent.as_ref().unwrap_or(facts);
         // The pool's own word counts the live decision's turns alone: a
         // shadow is lent none, and its picker turns a rotation of its own.
         let pool = &PoolFacts {
@@ -6840,6 +6814,41 @@ impl Engine {
             }
         }
         Some(run_whole(self, index, facts, pool, set, cx, buf))
+    }
+
+    /// `facts` with no ring lent, where the shadow profile at `shadow`
+    /// reads a lent ring by another place than one of the live profiles at
+    /// `lives` states on it. The two read a ring by different kinds of
+    /// place ([`Marks::ring_apart`]), or both place by heads and cut a
+    /// request by different rules ([`HeadPlaces`]). The place a request
+    /// states is its live profiles', so it is no place of such a shadow,
+    /// which places on its own ring. A profile that reads no ring is apart
+    /// from none, and a live profile that reads none states no place.
+    ///
+    /// `None` where the facts stand: the request lends no ring, or the
+    /// shadow is apart from no live profile.
+    fn unlent<'a>(
+        &self,
+        shadow: u16,
+        lives: &[u16],
+        facts: &RequestFacts<'a>,
+    ) -> Option<RequestFacts<'a>> {
+        facts.ring?;
+        let marks = |at: u16| self.marks.get(usize::from(at)).copied().unwrap_or_default();
+        let reads = |at: u16| {
+            let places = self.head_places.get(usize::from(at));
+            places.filter(|places| **places != HeadPlaces::Unread)
+        };
+        let apart = |&live: &u16| {
+            let rules = (reads(shadow), reads(live));
+            let heads = matches!(rules, (Some(own), Some(live)) if own != live);
+            marks(shadow).ring_apart(marks(live)) || heads
+        };
+        lives.iter().any(apart).then_some(RequestFacts {
+            ring: None,
+            ring_positions: &[],
+            ..*facts
+        })
     }
 
     #[inline(always)]
@@ -8276,7 +8285,9 @@ impl Engine {
 
     /// Whether the pair binding at `at` names a shadow for `side` that
     /// the build found free to run beside the live profile
-    /// ([`side_shadows`]).
+    /// ([`side_shadows`]). That shadow is then due beside each decision
+    /// the pair's profiles make, and a host says one that
+    /// [`Self::shadow_side`] does not run as skipped.
     pub(crate) fn shadows_side(&self, at: u32, side: PairSide) -> bool {
         let sides = self.shadow_sides.get(at as usize);
         sides.is_some_and(|sides| sides[side.index()].is_some())
@@ -8303,12 +8314,12 @@ impl Engine {
     /// scratch and the shadow profile's stages, and nothing a commit
     /// reads.
     ///
-    /// A side's shadow is handed the ring its request lends whatever its
-    /// ring form: the rule of a single's shadow ([`Self::shadow`]) is not
-    /// asked here. No host asks a pair's shadows yet. The change that asks
-    /// them holds a side's shadow to that rule against both live sides'
-    /// marks together, as [`Self::states_key_place`] reads them: a pair is
-    /// lent one list of places for its two sides.
+    /// A side's shadow is lent the ring its request lends by the rule of a
+    /// single's shadow ([`Self::shadow`]), held against both live sides: a
+    /// pair is lent one ring and one list of places for its two sides
+    /// ([`Self::states_key_place`]). So a shadow that reads a ring by
+    /// another place than either live side states is lent none, and
+    /// places on its own ring ([`Self::unlent`]).
     ///
     /// `None` where the binding names no shadow for the side, where the
     /// build did not find that profile free to run beside the live one
@@ -8327,15 +8338,21 @@ impl Engine {
     /// the weighing lift alone placed, which the mark on the prefill's
     /// buffer says: it speaks beside a pair whose decode side alone the
     /// rule steered.
+    ///
+    /// `None` as well beside a side its binding's sessions rule or its
+    /// picker's assignment placed ([`Self::places_side`]): a shadow's run
+    /// is put to neither, and its bare profile set beside a key's pin
+    /// would say nothing true of the profile. A request with no key under
+    /// a rule is its profiles', and its sides' shadows run.
     #[expect(
         clippy::too_many_arguments,
         reason = "the pair's entry and its inputs, beside the side and the live pick"
     )]
     #[cfg_attr(
-        not(test),
+        not(any(feature = "in-process", test)),
         expect(
             dead_code,
-            reason = "no host asks a pair's shadows until the engine over worker lists does"
+            reason = "the one caller is the engine over worker lists, built under `in-process`"
         )
     )]
     pub(crate) fn shadow_side(
@@ -8355,6 +8372,20 @@ impl Engine {
             return None;
         }
         let profile = self.profiles.get(usize::from(index))?;
+        let entry = self.bindings.get(at as usize)?;
+        // The place stated on a lent ring is the two live sides'.
+        let binding = &entry.binding;
+        let lives = [
+            binding.profile,
+            binding.decode_profile.unwrap_or(binding.profile),
+        ];
+        // A side its binding's sessions rule or its picker's assignment
+        // placed: a shadow's run is put to neither.
+        if self.places_side(entry, lives[side.index()], facts) {
+            return None;
+        }
+        let unlent = self.unlent(index, &lives, facts);
+        let facts = unlent.as_ref().unwrap_or(facts);
         let (prefills, prefill_facts) = pools.side(PairSide::Prefill, facts)?;
         let (decodes, decode_facts) = pools.side(PairSide::Decode, facts)?;
         Some(match side {
@@ -8370,8 +8401,7 @@ impl Engine {
                 // answers by its fallback. The shadow's run is lifted by
                 // its own profile's word, as the live run is by the live
                 // profile's ([`Self::weighing_lift`]).
-                let rule = self.bindings.get(at as usize)?.vetoed;
-                let lifted_run = self.weighing_lift(index, rule, cx);
+                let lifted_run = self.weighing_lift(index, entry.vetoed, cx);
                 run_profile(
                     profile,
                     index,
@@ -8410,13 +8440,15 @@ impl Engine {
     /// `at` is the pair binding's position ([`Self::pair_position`]). The
     /// run writes the scratch and the shadow profile's stages, and
     /// nothing a commit reads. The shadow is handed the ring its request
-    /// lends as [`Self::shadow_side`] hands it, under the same word for
-    /// the change that asks it.
+    /// lends whatever its ring form. No host asks a later decode's shadow
+    /// yet, and the change that asks it holds it to the rule of a side's
+    /// at the pair's decision ([`Self::shadow_side`]).
     ///
     /// `None` where [`Self::shadow_side`] says none for the decode side,
     /// and where the held prefill left the rows. The same beside a decode
     /// the binding's all-vetoed rule placed, which the trace of `live`,
-    /// that call's pick, says.
+    /// that call's pick, says, and beside a decode its sessions rule or
+    /// its picker's assignment placed ([`Self::places_side`]).
     #[expect(
         clippy::too_many_arguments,
         reason = "the decode entry and its inputs, beside the binding"
@@ -8442,6 +8474,13 @@ impl Engine {
         let side = PairSide::Decode;
         let index = self.shadow_sides.get(at as usize)?[side.index()]?;
         if self.side_apart(at, side) || live.trace.lifted != LiftedVeto::None {
+            return None;
+        }
+        // A decode its binding's sessions rule or its picker's assignment
+        // placed, as at the pair's decision.
+        let entry = self.bindings.get(at as usize)?;
+        let live_decode = entry.binding.decode_profile;
+        if self.places_side(entry, live_decode.unwrap_or(entry.binding.profile), facts) {
             return None;
         }
         let profile = self.profiles.get(usize::from(index))?;
@@ -17307,10 +17346,11 @@ mod tests {
 
     /// A decode side its rule places writes the decode side's buffers, as
     /// its profile's run does, and the prefill's buffer stays as the
-    /// prefill's run left it. So the prefill's shadow speaks beside a pair
-    /// whose decode side alone was steered past the overload veto, under a
-    /// rule as under none: a lifted veto's mark on the prefill's buffer is
-    /// the prefill's own.
+    /// prefill's run left it, under a rule as under none: a lifted veto's
+    /// mark on the prefill's buffer is the prefill's own. So the prefill's
+    /// shadow speaks beside a pair whose decode side alone was steered
+    /// past the overload veto. Beside a prefill its rule placed it stands
+    /// aside, whatever the buffer says.
     #[test]
     fn a_decode_side_under_a_rule_leaves_the_prefills_buffer_to_the_prefill() {
         let engine = |sessions: Option<SessionRule>| {
@@ -17344,14 +17384,75 @@ mod tests {
             let live = engine.decide_pair(&facts, &pool, pools, &cx, &cx, &mut scratch);
             let pick = live.pick().expect("a pair");
             assert_eq!(pick.trace.lifted, LiftedVeto::Overload, "{key:?}");
+            assert_eq!(scratch.single.lifted, LiftedVeto::None, "{key:?}");
             let side = PairSide::Prefill;
             let shadow =
                 engine.shadow_side(0, side, &facts, &pool, pools, &cx, &cx, pick, &mut scratch);
-            assert!(
-                shadow.is_some_and(|shadow| shadow.pick().is_some()),
-                "{key:?}"
-            );
+            let speaks = shadow.is_some_and(|shadow| shadow.pick().is_some());
+            assert_eq!(speaks, key.is_none(), "{key:?}");
         }
+    }
+
+    /// Beside a side its binding's sessions rule placed, the engine runs
+    /// no shadow of that side, at the pair's decision and at a decode
+    /// decided again: a shadow's run is put to no rule, and its bare
+    /// profile beside a key's pin would say nothing true of the profile. A
+    /// request with no key under the same rule is its profiles', and each
+    /// run speaks. A side whose picker leaves the placement to the
+    /// assignment is placed so with a key and with none: its shadow is run
+    /// for no request, and the other side's is, by the live side's own
+    /// profile.
+    #[test]
+    fn a_side_its_sessions_rule_placed_is_run_no_shadow() {
+        let [prefills, decodes] = two_sides(&[0, 5], &[0, 5]);
+        let pools = PairPools {
+            prefills: &prefills,
+            decodes: &decodes,
+            ..PairPools::default()
+        };
+        let (pool, cx) = (PoolFacts::default(), Constraints::default());
+        // Which runs speak: each side's at the pair's decision, then the
+        // later decode's.
+        let ran = |engine: &Engine, key: Option<u64>| {
+            let facts = pair_request(key);
+            let mut scratch = Scratch::new();
+            let live = engine.decide_pair(&facts, &pool, pools, &cx, &cx, &mut scratch);
+            let pick = live.pick().expect("a pair");
+            let held = pick.targets.first().expect("the pair's first target").id;
+            let sides = PairSide::BOTH.map(|side| {
+                let shadow =
+                    engine.shadow_side(0, side, &facts, &pool, pools, &cx, &cx, pick, &mut scratch);
+                shadow.is_some()
+            });
+            let later =
+                engine.shadow_decode_later(0, &facts, &pool, pools, held, pick, &cx, &mut scratch);
+            (sides, later.is_some())
+        };
+        let rule = SessionRule {
+            inflight_cap: 0,
+            ..SESSIONS
+        };
+        let ruled = Binding {
+            shadow: Some(1),
+            decode_shadow: Some(2),
+            sessions: Some(rule),
+            ..pair_binding()
+        };
+        let profiles = (0..3).map(|_| least_requests_profile()).collect();
+        let engine = Engine::new(profiles, vec![ruled], 1, Needs::default());
+        assert_eq!(ran(&engine, Some(7)), ([false; 2], false));
+        assert_eq!(ran(&engine, None), ([true; 2], true));
+        let assigned = Binding {
+            decode_profile: Some(3),
+            shadow: Some(1),
+            decode_shadow: Some(2),
+            ..pair_binding()
+        };
+        let mut profiles = vec![manual_profile()];
+        profiles.extend((0..3).map(|_| least_requests_profile()));
+        let engine = Engine::new(profiles, vec![assigned], 1, Needs::default());
+        assert!(engine.shadows_side(0, PairSide::Prefill), "named and free");
+        assert_eq!(ran(&engine, None), ([false, true], true));
     }
 
     /// A later decode of a key follows the key's decode pin: the call

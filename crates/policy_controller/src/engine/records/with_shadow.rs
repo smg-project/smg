@@ -14,7 +14,6 @@
 use std::{
     panic::{catch_unwind, AssertUnwindSafe},
     sync::Arc,
-    time::Duration,
 };
 
 use smg_worker::identity::basic::Worker;
@@ -23,7 +22,7 @@ use super::{with_buffers, Buffers, Live, PoolRecords};
 use crate::engine::{
     decision::{Decision, ShadowKind},
     framework::{release, Engine, ShadowRows},
-    shadow::{Shadow, Shadowed, SHADOW_FLOOR},
+    shadow::{budget_left, Shadow, Shadowed, SHADOW_FLOOR},
     view::{Constraints, RequestFacts},
 };
 
@@ -91,12 +90,7 @@ pub(crate) fn decide(
             &written
         };
         let decided = engine.decide_keeping(facts, &pool_facts, rows, cx, scratch);
-        // The request's own budget, as its host states it: none stated is
-        // no floor to hold.
-        let left = match facts.budget_micros {
-            0 => Duration::MAX,
-            micros => Duration::from_micros(micros.into()),
-        };
+        let left = budget_left(facts);
         let reads = match reads {
             ShadowRows::Same | ShadowRows::Unnamed if left >= SHADOW_FLOOR => reads,
             ShadowRows::Same | ShadowRows::Unnamed | ShadowRows::Own | ShadowRows::Apart => {
