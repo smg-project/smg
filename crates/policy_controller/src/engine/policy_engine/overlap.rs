@@ -39,8 +39,8 @@
 //! - **Once a model** ([`Affinity`]): the record of the prefixes sent to the
 //!   workers the index does not speak for ([`PrefixPredictor`]), behind one
 //!   reader-writer lock. A naming takes it as a reader, and only where the
-//!   list holds such a worker. A pick writes behind the blocks its worker
-//!   already holds, sixteen blocks a turn, and takes each turn by a try: a
+//!   list holds such a worker. A pick writes behind the blocks its naming
+//!   found its worker to hold, sixteen blocks a turn, each turn by a try: a
 //!   turn that meets a held lock ends the write there, so a pick waits for
 //!   nobody. The map of the records is behind a mutex that only the read of
 //!   a list's table, a change of membership and the timer's sweep take.
@@ -427,7 +427,10 @@ impl Affinity {
     /// came down. For the engine's timer. A record a decision holds is
     /// passed over. A record of text counts the turn, and every `sweep_s`
     /// turns what it holds over its `max_size` is owed: it takes its
-    /// turn's share of that cut here, behind the map's mutex.
+    /// turn's share of that cut here, behind the map's mutex. One turn
+    /// takes [`PrefixRecord::RUN`] placements out at most, an equal part
+    /// of it for each record that owes a cut, never under one step of a
+    /// sweep.
     ///
     /// A record leaves the map here once the map alone holds it and it
     /// holds no worker's place: no list's table reads it, and every worker
@@ -466,8 +469,9 @@ impl Affinity {
         // What left is freed once the mutex is given back, so the read of a
         // list's table waits for no free, and for no cut.
         drop(records);
+        let run = (PrefixRecord::RUN / owing.len().max(1)).max(PrefixRecord::SWEEP);
         for record in owing {
-            record.cut();
+            record.cut(run);
         }
     }
 
@@ -543,7 +547,9 @@ struct PrefixRecord {
     /// record stands at that figure. The timer alone writes it.
     owed: AtomicUsize,
     /// The share of [`Self::owed`] a turn of the timer takes out: the whole
-    /// of it is out before the next cut is counted.
+    /// of it is out before the next cut is counted, but for what a turn's
+    /// bound ([`Self::RUN`]) or the work of a leave held back. The next
+    /// count counts that again.
     pace: AtomicUsize,
     /// Work waits for a sweep: a worker left, or the bound came down.
     sweeping: AtomicBool,
@@ -585,8 +591,13 @@ pub struct PrefixRead {
 }
 
 impl PrefixRead {
-    /// The deepest rows a read keeps. A pick of a row past them is written
-    /// again, which costs a write and moves nothing a reader can see.
+    /// The deepest rows a read keeps. A pick of a row past them is no
+    /// repeat: where it is written, the write is tried from the request's
+    /// first block ([`PrefixRecord::write`]). A turn of it that finds the
+    /// request held for that row as far as the turn's end adds no block:
+    /// it makes that end the newest of the record's list, its last use the
+    /// read's tick, which can change the block that leaves next at the
+    /// record's bound.
     const KEPT: usize = 8;
 }
 
@@ -609,6 +620,12 @@ impl PrefixRecord {
     /// whole between two cuts up to it, and a write past it makes its own
     /// room: what callers send grows the record no further.
     const CEILING: usize = 32;
+    /// The placements one turn of the timer takes out at most, of every
+    /// record together: the thread that runs the cut takes the load
+    /// reports and the registry's words too, and what a turn takes out
+    /// bounds how long the turn keeps it. A debt past it is spread over
+    /// more turns, and what is left at the next count is counted again.
+    const RUN: usize = 1 << 18;
 
     fn new(bound: usize, max_size: u64) -> Self {
         Self {
@@ -690,46 +707,60 @@ impl PrefixRecord {
     }
 
     /// A turn's share of the cut, on the timer's thread and outside the
-    /// map's mutex: the oldest ends leave, a sweep's step at a time, and
-    /// no step is taken where the record stands at [`Self::swept`] or
-    /// under it. A block leaves with every worker sent it, as at a write
-    /// that makes room, so the last step can end under the figure by that
-    /// block's workers less one. The placements that left another way
-    /// since the count, behind a worker's leave or a bound that moved, are
-    /// not taken again from what stays: the debt ends where nothing stands
-    /// over the figure. A decider that waits to read the record is
-    /// given the lock between two steps. A decider's write waits for no
-    /// lock, so one that meets a step is left out as one that meets
-    /// another write is ([`Self::left_out`]). The bound comes down only
-    /// while a step holds the guard, so no write meets it and none makes
-    /// room for a cut.
-    fn cut(&self) {
+    /// map's mutex, `run` placements at most: the oldest ends leave, a
+    /// sweep's step at a time, and no step is taken where the record
+    /// stands at [`Self::swept`] or under it. A block leaves with every
+    /// worker sent it, as at a write that makes room, so the last step can
+    /// end under the figure by that block's workers less one. The
+    /// placements that left another way since the count, behind a worker's
+    /// leave or a bound that moved, are not taken again from what stays.
+    /// While such work waits ([`Self::sweeping`]) the record still counts
+    /// what that work will take out, so the turn's steps go to it, at the
+    /// ceiling, and the cut lowers no bound until it is done. And the debt
+    /// ends where a step leaves nothing over the figure. A decider that
+    /// waits to read the record is given the lock between two steps. A
+    /// decider's write waits for no lock, so one that meets a step is left
+    /// out as one that meets another write is ([`Self::left_out`]). The
+    /// bound comes down only while a step holds the guard, so no write
+    /// meets it and none makes room for a cut.
+    fn cut(&self, run: usize) {
         let owed = self.owed.load(Ordering::Relaxed);
-        let mut share = self.pace.load(Ordering::Relaxed).min(owed);
+        let mut left = self.pace.load(Ordering::Relaxed).min(owed).min(run);
         let mut paid = 0;
         let mut predictor = self.predictor.write();
-        while share != 0 {
-            let (ceiling, held) = (predictor.bound(), predictor.len());
-            // The figure is read at every step: a table's read moves it
-            // between two.
-            let over = held.saturating_sub(self.swept.load(Ordering::Relaxed));
-            if over == 0 {
-                paid = owed;
-                break;
-            }
-            let step = share.min(Self::SWEEP).min(over);
-            predictor.set_bound(held.saturating_sub(step).min(ceiling));
-            let steps = predictor.sweep(Self::SWEEP);
-            predictor.set_bound(ceiling);
-            let out = held - predictor.len();
-            paid += out;
-            share = share.saturating_sub(out);
-            if steps == 0 {
-                // Nothing is left to take: the debt ends here.
-                paid = owed;
-                break;
+        while left != 0 {
+            if self.sweeping.load(Ordering::Relaxed) {
+                // A step of the work that waits counts as a step of the
+                // share: the turn holds the thread no longer for it.
+                self.sweep(&mut predictor);
+                left = left.saturating_sub(Self::SWEEP);
+            } else {
+                let (ceiling, held) = (predictor.bound(), predictor.len());
+                // The figure is read at every step: a table's read moves
+                // it between two.
+                let over = held.saturating_sub(self.swept.load(Ordering::Relaxed));
+                if over == 0 {
+                    break;
+                }
+                let step = left.min(Self::SWEEP).min(over);
+                predictor.set_bound(held.saturating_sub(step).min(ceiling));
+                let steps = predictor.sweep(Self::SWEEP);
+                predictor.set_bound(ceiling);
+                let out = held - predictor.len();
+                paid += out;
+                left = left.saturating_sub(out);
+                if steps == 0 {
+                    // Nothing is left to take: the debt ends here.
+                    paid = owed;
+                    break;
+                }
             }
             RwLockWriteGuard::bump(&mut predictor);
+        }
+        // Also where the share's last step brought the record to the
+        // figure: what is written behind it is the next count's.
+        if predictor.len() <= self.swept.load(Ordering::Relaxed) {
+            paid = owed;
         }
         self.owed
             .store(owed.saturating_sub(paid), Ordering::Relaxed);
@@ -810,10 +841,13 @@ impl PrefixRecord {
         }
     }
 
-    /// Whether a pick behind `read` is a repeat that writes nothing: the
-    /// record already holds the whole request for the picked worker, its
-    /// end used at this tick, so a write would move nothing a reader can
-    /// see. `held` says the naming found the picked worker among those
+    /// Whether a pick behind `read` is a repeat, which records nothing of
+    /// its request: by `read` the record holds the whole request for the
+    /// picked worker, its end used at this tick. While that still stands
+    /// a write would add no block and move no tick: it would make that
+    /// end the newest of the record's list again, which can change the
+    /// block that leaves next at the record's bound. A repeat gives that
+    /// up. `held` says the naming found the picked worker among those
     /// sent the request's deepest block.
     fn repeats(&self, read: RecordRead, held: bool) -> bool {
         if !(read.whole && read.fresh && held) {
@@ -833,8 +867,10 @@ impl PrefixRecord {
     /// the naming found the target among the workers sent the request's
     /// deepest recorded block.
     ///
-    /// The write begins behind the blocks the target already holds: a turn
-    /// of a conversation writes the blocks the turn added. It takes the
+    /// The write begins behind the blocks the naming found the target to
+    /// hold: a turn of a conversation writes the blocks the turn added, and
+    /// a target the naming did not find is written from the request's
+    /// first block. It takes the
     /// lock sixteen blocks a turn, each turn by a try. An entry is a
     /// prediction and a leading part of a request is a true one, so a turn
     /// that meets a held lock ends the write there and waits for no thread:
@@ -853,6 +889,9 @@ impl PrefixRecord {
         // no block to add: left undone, it leaves nothing out.
         let adds = end < keys.len();
         loop {
+            // What the target holds as the turn begins: the naming's depth,
+            // then the turns before this one.
+            let behind = end;
             end = (end + Self::SLICE).min(keys.len());
             let Some(mut predictor) = self.predictor.try_write() else {
                 if adds {
@@ -863,7 +902,7 @@ impl PrefixRecord {
             if self.left.load(Ordering::Relaxed) != read.left {
                 return;
             }
-            predictor.record(&keys[..end], target, read.tick);
+            predictor.record_behind(&keys[..end], behind, target, read.tick);
             if end == keys.len() {
                 self.sweep(&mut predictor);
                 return;

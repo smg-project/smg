@@ -805,7 +805,10 @@ pub(crate) const SUBSET_HINT: &str = "subset-hint";
 /// places cannot hold a pair's two lists. An encode request is shed under
 /// it where a list's places name workers and none of them takes the
 /// request, though a worker outside them does: it is held off every worker
-/// that takes it, which no gap of the membership says.
+/// that takes it, which no gap of the membership says. A list's places are
+/// its host's, or the places its request's demand leaves. A gap of the
+/// pairs' membership the encode pass reads (`ec-compatible`,
+/// `decode-vision`) is answered ahead of every list's places.
 pub(crate) const PLACES: &str = "places";
 
 /// A shed the deciders say in the engine's place, in the shape of the

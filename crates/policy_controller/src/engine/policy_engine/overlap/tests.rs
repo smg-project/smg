@@ -825,10 +825,13 @@ fn a_later_model_of_its_workers_shares_the_first_models_record() {
 /// blocks begin keeps theirs at every write, and a pair side's write takes
 /// the unit of a record nobody read. A cut takes no window that stands at
 /// or under `max_size`: what a worker that left gave up behind the count
-/// is not taken again from the workers that stay. Under a `sweep_s` of
-/// four the fourth turn counts, it and the three behind it take a quarter
-/// each, and a write behind the count adds nothing to them. A record of
-/// token blocks takes no cut.
+/// is not taken again from the workers that stay, and while the pass of a
+/// leave runs the turn's steps go to it and lower no bound. Under a
+/// `sweep_s` of four the fourth turn counts, it and the three behind it
+/// take a quarter each, and a write behind the count adds nothing to them.
+/// A debt ends where a turn leaves the record at `max_size`, so nothing
+/// written behind it pays for a leave. A cut takes no more than its turn
+/// hands it. A record of token blocks takes no cut.
 #[test]
 fn a_record_that_text_begins_is_cut_to_max_size_bytes_by_the_timer() {
     use crate::document::spec::IndexSpec;
@@ -924,6 +927,16 @@ fn a_record_that_text_begins_is_cut_to_max_size_bytes_by_the_timer() {
     left.affinity.forget(left.ids[2]);
     left.affinity.sweep();
     assert_eq!(left.holders(&short, NOW), [(1, 0, 1)]);
+    // A leave whose pass is longer than one step of a sweep: eighty windows
+    // of a worker that left stand behind the one window of a worker that
+    // stays, the oldest. The turn's steps go to the leave's pass and lower
+    // no bound while it runs: the window that stays is not taken for them.
+    let behind = cut_to(4, 1);
+    behind.decide(&request(&short, 7, NOW), Some(1));
+    behind.decide(&request(&long, 7, NOW), Some(3));
+    behind.affinity.forget(behind.ids[3]);
+    behind.affinity.sweep();
+    assert_eq!(behind.holders(&short, NOW), [(1, 0, 1)]);
     // Under a `sweep_s` of four, three turns leave eighty windows whole, the
     // fourth counts seventy-six over four, and it and the turn behind it
     // take nineteen each. A window written behind the count adds nothing to
@@ -941,10 +954,34 @@ fn a_record_that_text_begins_is_cut_to_max_size_bytes_by_the_timer() {
     paced.decide(&request(&short, 7, NOW), Some(1));
     assert_eq!(turns(&paced, 2), [24, 5]);
     assert_eq!(paced.holders(&short, NOW), [(1, 0, 1)]);
+    // A leave pays part of a debt. Twenty windows are sixteen over four,
+    // four a turn: the fourth turn takes four, the eight windows of a
+    // worker that then leaves go with it, and the next turn's four bring
+    // the record to its four. The debt ends there: eight windows written
+    // behind it stand whole on the two turns left, and so do the four.
+    let paid = cut_to(4, 4);
+    let twelve = "fedcba9876543210".repeat(48);
+    let twelve = PromptHashes::under_document(&spec, Some(BLOCK), None, Some(&twelve), seeds);
+    paid.decide(&request(&twelve, 7, NOW), Some(3));
+    paid.decide(&request(&worded, 7, NOW), Some(2));
+    assert_eq!(turns(&paid, 4), [20, 20, 20, 16]);
+    paid.affinity.forget(paid.ids[2]);
+    assert_eq!(turns(&paid, 1), [4]);
+    paid.decide(&request(&asked, 7, NOW), Some(1));
+    assert_eq!(turns(&paid, 2), [12, 12]);
+    assert_eq!(paid.holders(&twelve, NOW), [(3, 0, 4)]);
     // A share over one step of sixty-four is taken in two, down to four.
     let whole = cut_to(4, 1);
     whole.decide(&request(&long, 7, NOW), Some(3));
     assert_eq!(turns(&whole, 1), [4]);
+    // A turn hands a cut its part of the turn's bound: of seventy-six owed
+    // the cut takes the twelve it is handed.
+    let handed = cut_to(4, 1);
+    handed.decide(&request(&long, 7, NOW), Some(3));
+    let record = Arc::clone(&handed.affinity.records.lock()[MODEL]);
+    assert!(record.timed());
+    record.cut(12);
+    assert_eq!(placements(&handed), 68);
     // A record of token blocks takes no cut: under a bound that came down
     // the timer's turn takes its one step of sixty-four, as before.
     let blocks = cut_to(64, 1);
@@ -963,9 +1000,10 @@ fn a_record_that_text_begins_is_cut_to_max_size_bytes_by_the_timer() {
 /// lookup returns the answer it is handed either
 /// way, but for what the pick states of its first target
 /// ([`a_pick_its_rule_keeps_from_the_profile_states_nothing`]): a pin the
-/// keyed entry followed passes through it with its answer made. A profile
-/// that is named no row keeps no record of its own: its
-/// list keeps one for a shadow that is named rows, and the column shows
+/// keyed entry followed passes through it with its answer made. The live
+/// profile of the column form is named no row, and its prefix stage reads
+/// sent prefixes: the list keeps the record by that profile's own word,
+/// with a shadow beside it or none, and the column shows
 /// what that record holds. A gateway's sticky map hands a request it places
 /// to no policy, so the policy's record never takes it
 /// (`model_gateway/src/policies/registry.rs:791`, `:840`).

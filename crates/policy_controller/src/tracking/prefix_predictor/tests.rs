@@ -1095,3 +1095,32 @@ fn the_first_piece_doubles_with_its_blocks_to_a_whole_piece() {
     assert_eq!(rooms, [CHUNK, CHUNK]);
     predictor.check();
 }
+
+/// A write handed a depth leaves what a write that searches leaves, to the
+/// last link: the depth its worker holds, and any other depth, which the
+/// write does not trust.
+#[test]
+fn a_write_handed_a_depth_leaves_what_a_searching_write_leaves() {
+    let mut draws = Draws(0x5EED_1234);
+    let (mut searched, mut handed) = (PrefixPredictor::new(60), PrefixPredictor::new(60));
+    for step in 0..2_000u16 {
+        if draws.below(12) == 0 {
+            let left = worker(1 + draws.below(4));
+            searched.forget(left);
+            handed.forget(left);
+        }
+        let (sent, to) = (keys(SEED, &draws.request(12)), worker(1 + draws.below(4)));
+        let known = match (draws.below(4), searched.places.get(&to)) {
+            (1.., Some(&place)) => searched.depth(&sent, sent.len(), Ask::Holds(place)).0,
+            _ => draws.below(14) as usize,
+        };
+        searched.record(&sent, to, step);
+        handed.record_behind(&sent, known, to, step);
+        assert_eq!(
+            format!("{handed:?}"),
+            format!("{searched:?}"),
+            "step {step}: {known} of {sent:?}"
+        );
+    }
+    handed.check();
+}

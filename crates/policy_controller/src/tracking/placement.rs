@@ -441,11 +441,12 @@ impl Placement<'_> {
 
     /// One side of the request ended with the `outcome` a handle on that
     /// side's end reported at `at` ([`SideEnd`](super::SideEnd)):
-    /// [`Self::ended`], said under that instant. The placement writes one
-    /// thing more into the outcome, whatever the handle's holder wrote
-    /// there: the span from the side's dispatch to the report, as an end
-    /// with no outcome states the span to its side's drop. Zero for a side
-    /// whose send was never said.
+    /// [`Self::ended`], with one thing more written into the outcome,
+    /// whatever the handle's holder wrote there: the span from the side's
+    /// dispatch to `at`, as an end with no outcome states the span to its
+    /// side's drop. Zero for a side whose send was never said. The
+    /// in-process engine reads no instant of a word, so `at` reaches a
+    /// stage through that span alone.
     pub(super) fn reported(&mut self, side: Side, outcome: Outcome, at: Instant) {
         let Some(held) = &self.held else {
             return;

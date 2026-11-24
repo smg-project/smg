@@ -83,6 +83,11 @@ pub struct WorkerMetadata {
     /// of the model on every request, so nothing on a request path looks a
     /// label up.
     pub decoding: DecodingLabels,
+    /// The running window the labels name (`basic::running_window`), parsed
+    /// once at construction: a pair placement asks the decode workers of the
+    /// model for it on every request, so nothing on a request path looks a
+    /// label up.
+    pub running_window: Option<u16>,
 }
 
 /// A worker's constrained-decoding labels as the routers read them, parsed

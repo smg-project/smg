@@ -289,12 +289,14 @@ impl Shared {
             door: Arc::new(MembershipCalls::new(
                 Arc::clone(&store),
                 Arc::clone(&feed.log),
-                objects,
+                Arc::clone(&objects),
             )),
+            // A standby's first copy is cut from the same objects.
             replication: Replication::new(
                 Arc::clone(&store),
                 Arc::clone(&feed.log),
                 elector.fence(),
+                objects,
             )
             .telling(Arc::clone(&generations)),
             lag: Arc::new(Lag::new(standby::synced_within(Duration::ZERO))),
@@ -821,6 +823,7 @@ impl PolicyController for Service {
         let start = watch_workers::start(asked)?;
         let source = Source {
             store: Arc::clone(&self.shared.store),
+            objects: Arc::clone(&self.shared.objects),
             feed: self.shared.feed.clone(),
             fence: Arc::clone(&self.shared.fence),
             role: self.shared.role.subscribe(),
@@ -910,7 +913,7 @@ impl PolicyController for Service {
                         &shared.snapshots,
                         &shared.feed,
                         &shared.watchers,
-                        &shared.store,
+                        (&shared.objects, &shared.store),
                     )
                 },
                 &shared.generations,

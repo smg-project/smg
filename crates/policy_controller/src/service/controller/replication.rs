@@ -11,9 +11,9 @@
 //! second, at the hello and at every poll. The stream's shape gives the
 //! third: no task and no channel stand between the log and the socket, so a
 //! write of the store waits for the copy of one batch under the log's lock
-//! and for nothing else. A snapshot is one cut of the store, taken under
-//! the store's locks for the copy of its rows and held by the stream while
-//! it sends ([`Parts`]): no lock is held across a send. A leader holds
+//! and for nothing else. A snapshot is one cut of the replica's rows, taken
+//! from its worker objects in their holder's turn and held by the stream
+//! while it sends ([`Parts`]): no lock is held across a send. A leader holds
 //! [`RESTORES`] restores at once, and lets go of the cut of one whose
 //! stream took no part for [`STALLED`] ([`Hold`]).
 //!
@@ -52,6 +52,7 @@ use crate::{
         replication::{Entry, Event as Written, Log, NotLeading},
     },
     store::{Journal, MemoryStore, Position, StoreCheckpoint},
+    worker_host::{Members, Objects},
 };
 
 /// The watched kinds' ring: the membership and status events a watcher or a
@@ -175,6 +176,9 @@ pub(super) const FIRST_PLACES: u64 = 1 << 48;
 #[derive(Clone)]
 pub(crate) struct Replication {
     store: Arc<MemoryStore>,
+    /// The holder of the replica's worker objects: a standby's first
+    /// copy is cut from them.
+    objects: Arc<Objects<Members>>,
     log: Arc<Log>,
     fence: Arc<Fence>,
     cuts: Arc<Kept>,
@@ -184,9 +188,15 @@ pub(crate) struct Replication {
 }
 
 impl Replication {
-    pub(crate) fn new(store: Arc<MemoryStore>, log: Arc<Log>, fence: Arc<Fence>) -> Self {
+    pub(crate) fn new(
+        store: Arc<MemoryStore>,
+        log: Arc<Log>,
+        fence: Arc<Fence>,
+        objects: Arc<Objects<Members>>,
+    ) -> Self {
         Self {
             store,
+            objects,
             log,
             fence,
             cuts: Arc::default(),
@@ -320,7 +330,7 @@ impl Replication {
     /// ends `UNAVAILABLE`.
     pub(super) fn cut(&self, term: u64) -> Result<Arc<StoreCheckpoint>, Status> {
         self.serves(term)?;
-        let cut = self.cuts.at_head(&self.store, &self.log);
+        let cut = self.cuts.at_head(&self.objects, &self.store, &self.log);
         // A take, or another leader's event, can land between the admission
         // and the cut, whose place is then that write's.
         if cut.at.term != term {
@@ -381,7 +391,7 @@ impl Replication {
     /// it, over the cut at the head with no admission: a served case's own.
     #[cfg(test)]
     pub(super) fn stalled_since(&self, at: Instant) {
-        let cut = self.cuts.at_head(&self.store, &self.log);
+        let cut = self.cuts.at_head(&self.objects, &self.store, &self.log);
         self.cuts.holds.lock().push(Arc::new(Hold::of(cut, at)));
     }
 
@@ -393,12 +403,12 @@ impl Replication {
 }
 
 /// The watched kinds' cut at one place of the log: taken by the first stream
-/// that is restored there, under the store's locks for the copy of its
-/// rows, and shared by every stream restored at that place while one still
-/// sends it. A cut is a place's, never a standby's, as a watch's is
-/// ([`watch_workers::Source`]): standbys that lose their place together
-/// hold the store's writers once. Nothing is kept past the last stream that
-/// holds it.
+/// that is restored there, from the worker objects in their holder's turn
+/// ([`Objects::checkpoint`]), and shared by every stream restored at that
+/// place while one still sends it. A cut is a place's, never a standby's,
+/// as a watch's is ([`watch_workers::Source`]): standbys that lose their
+/// place together hold the rows' writers once. Nothing is kept past the
+/// last stream that holds it.
 ///
 /// The restores under way are counted here ([`Hold`]): a leader holds
 /// [`RESTORES`] of them at once, and lets go of one whose stream took no
@@ -488,13 +498,18 @@ impl Kept {
         self.holds.lock().retain(|hold| hold.keeps(now));
     }
 
-    fn at_head(&self, store: &MemoryStore, log: &Log) -> Arc<StoreCheckpoint> {
+    fn at_head(
+        &self,
+        objects: &Objects<Members>,
+        store: &MemoryStore,
+        log: &Log,
+    ) -> Arc<StoreCheckpoint> {
         let mut kept = self.head.lock();
         let head = log.head();
         if let Some(cut) = kept.upgrade().filter(|cut| cut.at == head) {
             return cut;
         }
-        let cut = Arc::new(store.checkpoint());
+        let cut = Arc::new(objects.checkpoint(store));
         *kept = Arc::downgrade(&cut);
         cut
     }
@@ -1061,6 +1076,7 @@ mod tests {
     use crate::{
         engine::view::{LoadRow, WorkerId},
         service::{
+            controller::decision_slots::tests::holder,
             elector::{ElectionSettings, Elector, TickOutcome},
             proto::replication_event::Event as Sent,
             replication,
@@ -1068,7 +1084,7 @@ mod tests {
         stages::registry,
         store::{
             LeasesStore, LoadSink, LoadSource, MembershipChange, WorkerFacts, WorkerRow,
-            WorkersStore,
+            WorkerStatus, WorkersStore,
         },
     };
 
@@ -1123,6 +1139,7 @@ mod tests {
                 Arc::clone(&self.store),
                 Arc::clone(&self.log),
                 self.elector.fence(),
+                holder(&self.store),
             )
         }
 
@@ -2312,7 +2329,9 @@ mod tests {
             1,
             "the release was not handed on"
         );
-        let replication = Replication::new(Arc::clone(&store), log, leader.elector.fence());
+        let cut_from = holder(&store);
+        let replication =
+            Replication::new(Arc::clone(&store), log, leader.elector.fence(), cut_from);
         // No stream holds the cut past this line: the next call takes its
         // own.
         let served = replication.cut(leader.term).expect("a cut").at;
@@ -2468,7 +2487,8 @@ mod tests {
         let (store, feed) = journaled_from(&LeasePlace::Process, 0);
         store.set_term(leader.term);
         assert!(feed.log.alone());
-        let refused = Replication::new(store, feed.log, leader.elector.fence())
+        let cut_from = holder(&store);
+        let refused = Replication::new(store, feed.log, leader.elector.fence(), cut_from)
             .cut(leader.term)
             .expect_err("no standby follows it");
         assert_eq!(refused.code(), Code::FailedPrecondition);
@@ -2487,7 +2507,8 @@ mod tests {
         // log.
         assert!(!feed.log.alone());
         let head = feed.log.head();
-        let cut = Replication::new(store, feed.log, leader.elector.fence())
+        let cut_from = holder(&store);
+        let cut = Replication::new(store, feed.log, leader.elector.fence(), cut_from)
             .cut(leader.term)
             .expect("a standby may follow it");
         assert_eq!(cut.at, head);
@@ -2569,5 +2590,76 @@ mod tests {
             part.generation.as_deref(),
             documents.standing_sent().as_ref()
         );
+    }
+
+    /// A leader's first copy as the holder of its worker objects cuts it:
+    /// its place, which is the log's head, and its rows.
+    fn first_copy(leader: &Leader, objects: &Objects<Members>) -> (Position, Vec<WorkerRow>) {
+        let cut = objects.checkpoint(&leader.store);
+        assert_eq!(cut.at, leader.log.head(), "a copy stands at the log's head");
+        (cut.at, cut.rows)
+    }
+
+    /// A first copy is cut in the turn of the worker objects' holder, which
+    /// every writer of a row's facts holds to the journal's telling. A
+    /// generation's apply moves the log's place with no turn of the holder.
+    /// It changes no row: a copy cut behind it holds every row, at the new
+    /// place.
+    #[test]
+    fn a_copy_behind_a_generations_apply_holds_every_row_at_the_new_place() {
+        use crate::service::controller::generations::{tests::LEAST_LOAD, Format};
+
+        let leader = Leader::leading();
+        leader.writes_a_page_and_one();
+        let objects = holder(&leader.store);
+        let (before, rows) = first_copy(&leader, &objects);
+        assert_eq!(rows.len(), 129);
+        door(&leader)
+            .apply(LEAST_LOAD.into(), Format::Yaml)
+            .expect("a valid document");
+        let (behind, held) = first_copy(&leader, &objects);
+        assert!(behind.seq > before.seq, "the apply moved the place");
+        assert_eq!(held, rows);
+    }
+
+    /// A term's start moves the log's place with no turn of the holder, and
+    /// changes no row either.
+    #[test]
+    fn a_copy_behind_a_terms_start_holds_every_row_under_the_new_term() {
+        let leader = Leader::leading();
+        leader.writes_a_page_and_one();
+        let objects = holder(&leader.store);
+        let (before, rows) = first_copy(&leader, &objects);
+        let later = leader.term + 1;
+        leader.store.set_term(later);
+        let (behind, held) = first_copy(&leader, &objects);
+        assert_eq!((before.term, behind.term), (leader.term, later));
+        assert_eq!(held, rows);
+    }
+
+    /// A status tell takes no turn of the holder. It changes no fact of a
+    /// row, and a copy reads the told statuses with the place in one hold of
+    /// the store's lock: a copy cut behind the tell stands at the tell's
+    /// place and holds its status.
+    #[test]
+    fn a_copy_behind_a_status_tell_holds_the_told_status_at_its_place() {
+        let leader = Leader::leading();
+        let id = leader.writes(0);
+        let objects = holder(&leader.store);
+        let (before, rows) = first_copy(&leader, &objects);
+        let [row] = rows.as_slice() else {
+            panic!("one row was written");
+        };
+        assert_eq!(row.status, WorkerStatus::Pending);
+        // The store's entry a holder's tell ends in, with no turn here.
+        let ready = WorkerStatus::Ready;
+        leader.store.status_told(id, ready, row.revision, &|| true);
+        let (behind, held) = first_copy(&leader, &objects);
+        assert!(behind.seq > before.seq, "the tell moved the place");
+        let told = WorkerRow {
+            status: ready,
+            ..row.clone()
+        };
+        assert_eq!(held, [told]);
     }
 }

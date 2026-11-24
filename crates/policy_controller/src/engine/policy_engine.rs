@@ -390,7 +390,8 @@ impl PolicyEngine {
     /// fingerprint of its address: the id every decision knew it by, where
     /// its program states none ([`FixedFacts::id`]). A stage that keeps a
     /// range, a count or a credit of the worker drops it. A dispatch said
-    /// behind the leave enters its rank in a count of sends again. The
+    /// behind the leave enters its rank in a count of sends again, until a
+    /// join of the id drops it ([`Self::joined`]). The
     /// session table is not told: a leave takes no pin away, so a
     /// session's pin stands on a worker that is gone until the session's
     /// idle time or two other workers end it, and is a routable pin again
@@ -423,6 +424,10 @@ impl PolicyEngine {
     /// says it at a registration, where it tells its classic policies. A
     /// host that hands its registry says it nowhere
     /// ([`Self::set_registry`]).
+    ///
+    /// A count of sends drops what it holds under the id: a dispatch said
+    /// behind the id's removal, and with it a send to this worker said
+    /// ahead of this word.
     pub fn joined(&self, address: &str) {
         self.came(WorkerId::from_address(address));
     }

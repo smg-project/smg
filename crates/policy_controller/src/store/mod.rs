@@ -95,10 +95,10 @@ pub use kv_events::{
 pub use leases::{
     DecodeMark, DecodeSide, LeaseRecord, LeaseRefused, LeaseState, LeasesStore, PickRecord, Sides,
 };
-pub use loads::{LoadSample, LoadSink, LoadSource, PollMode, Wake};
+pub use loads::{LoadSample, LoadSink, LoadSource, PollMode};
 #[cfg(feature = "controller")]
 pub(crate) use memory::DecodeIssue;
-pub use memory::{AtWork, Hand, LookOutcome, MemoryStore, StoreCheckpoint, StoreStats};
+pub use memory::{AtWork, Hand, LookOutcome, MemoryStore, StoreCheckpoint, StoreStats, Wake};
 pub use reservations::{ReservationKind, ReservationStore};
 pub use snapshot::{OutsideLists, StaleGeneration, StoreSnapshot, PUBLISH_WINDOW};
 pub use workers::{

@@ -1717,7 +1717,14 @@ fn the_places_a_rule_takes_are_ascending_and_hold_every_later_pick() {
     };
     let mut call = Call::default();
     call.missed.push(worker_id(list[1].as_ref()));
-    hold_to_rule(&request, Some(members.lent()), &mut call).expect("the rule takes workers");
+    hold_to_rule(
+        &request,
+        Some(members.lent()),
+        None,
+        &mut call.admitted,
+        &mut call.spent,
+    )
+    .expect("the rule takes workers");
     let places: Vec<u32> = thirds().map(|at| at as u32).collect();
     assert_eq!(call.admitted.as_deref(), Some(&places[..]));
 

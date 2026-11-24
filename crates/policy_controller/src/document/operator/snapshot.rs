@@ -72,9 +72,9 @@ pub(crate) fn unnamed(models: &[String]) -> Option<&'static str> {
 }
 
 /// Whether a row serves any named model. An empty list includes every row.
-/// The store's lone read matches by the same rule, searched in a sorted
-/// list ([`crate::store::MemoryStore::rows_serving`]): the two change
-/// together.
+/// A controller's lone read of a few rows matches by the same rule,
+/// searched in a sorted list (the `rows_serving` of its worker objects'
+/// holder): the two change together.
 pub(crate) fn serves(models: &[String], row: &WorkerRow) -> bool {
     models.is_empty() || row.facts.models.iter().any(|model| models.contains(model))
 }
@@ -83,8 +83,8 @@ pub(crate) fn serves(models: &[String], row: &WorkerRow) -> bool {
 pub enum Rows {
     /// A shared cut, ordered by registration key, before model filtering.
     Shared(Arc<StoreCheckpoint>),
-    /// The first serving rows in key order and the total that serve,
-    /// as returned by [`crate::store::MemoryStore::rows_serving`].
+    /// The first serving rows in key order and the total that serve, as
+    /// a host's lone read of a few rows returns them.
     Told(Vec<WorkerRow>, usize),
 }
 
@@ -608,7 +608,13 @@ mod tests {
                 ..WorkerFacts::default()
             });
         }
-        let read = || store.rows_serving(&asked.models, asked.limit);
+        // Every row, by key, with the count that serve: a lone read's
+        // answer for a call with no model and no limit.
+        let read = || {
+            let rows = store.checkpoint().rows;
+            let serving = rows.len();
+            (rows, serving)
+        };
         let (rows, serving) = read();
         let page = worker_rows_page(&asked, Rows::Told(rows, serving), now);
         assert_eq!(page.rows.len(), 1);
