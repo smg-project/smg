@@ -20,7 +20,7 @@ use axum::{
     response::Response,
 };
 use openai_protocol::{
-    chat::{ChatCompletionRequest, ChatMessage},
+    chat::{ChatCompletionRequest, ChatMessage, MessageContent},
     classify::ClassifyRequest,
     common::{GenerationRequest, InputIds},
     completion::{CompletionPrompt, CompletionRequest},
@@ -93,6 +93,32 @@ pub(crate) trait TenantCharge: GenerationRequest {
 /// deprecated function call, by the words of their JSON. A call's name is not
 /// counted.
 impl TenantCharge for ChatCompletionRequest {
+    /// The routing text of a request with a part that is no text carries
+    /// that part's marker, which is no word of the prompt: such a request
+    /// is counted from its body.
+    fn estimated_input_tokens(&self, routing_text: Option<&str>) -> u32 {
+        let unmarked = routing_text.filter(|_| {
+            self.messages.iter().all(|message| {
+                let content = match message {
+                    ChatMessage::System { content, .. }
+                    | ChatMessage::User { content, .. }
+                    | ChatMessage::Tool { content, .. }
+                    | ChatMessage::Developer { content, .. }
+                    | ChatMessage::Root { content, .. } => Some(content),
+                    ChatMessage::Assistant { content, .. } => content.as_ref(),
+                    ChatMessage::Function { .. } => None,
+                };
+                match content {
+                    Some(MessageContent::Parts(parts)) => {
+                        parts.iter().all(|part| part.text().is_some())
+                    }
+                    _ => true,
+                }
+            })
+        });
+        tokens_for_words(routed_words(self, unmarked) + self.unrouted_words())
+    }
+
     fn unrouted_words(&self) -> usize {
         self.messages
             .iter()
