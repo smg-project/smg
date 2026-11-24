@@ -837,7 +837,8 @@ impl MemoryStore {
     /// it is told behind the same lock, in its order. One thing does not
     /// start empty: a count of sends, which the engine takes over from
     /// the standing generation's count under the same two settings, or
-    /// else by its profile's name, before the publication
+    /// else by its profile's name, or else one that is left, before the
+    /// publication
     /// ([`Engine::succeed`](crate::engine::Engine::succeed)).
     ///
     /// The journal is told the generation's number there too, behind the

@@ -63,8 +63,8 @@ pub(crate) struct SentSettings {
 ///
 /// A new document's count takes over the rows' entries of the standing
 /// count under the same two settings, or else of the one that a profile
-/// of its maker's name made unless another count of the new document
-/// took that one, and shares them with it
+/// of its maker's name made, or else of one that no count of the new
+/// document took, and shares them with it
 /// ([`Engine::succeed`](crate::engine::Engine::succeed)). Each count reads them
 /// under its own time limit and its own report delay, and a send that one
 /// read releases has left the other count too: of two report delays, a

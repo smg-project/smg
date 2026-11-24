@@ -2068,10 +2068,11 @@ pub struct ProfileSpec {
     /// in the order of their names. A new document's count takes over the
     /// sends of the standing count under the same limit and delay,
     /// whichever profiles read that one. Where none stands under them, it
-    /// takes over those of the standing count under the same name, unless
-    /// a count of the new document took that one by its settings. The two
-    /// counts share the sends: a read under the shorter of two delays ends
-    /// such a send for both. A count that finds neither starts empty.
+    /// takes over those of the standing count under the same name, or
+    /// else of a standing count that no count of the new document took.
+    /// The two counts share the sends: a read under the shorter of two
+    /// delays ends such a send for both. A count that finds none starts
+    /// empty.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1))]
     pub sent_report_delay_ms: Option<u32>,
@@ -7817,7 +7818,8 @@ mod tests {
     /// A later document's count takes over the standing count under its
     /// two settings, whichever profile made that one. Where none stands
     /// under them it takes the count its maker's name made, unless a
-    /// count of the later document took that one.
+    /// count of the later document took that one, and then the first
+    /// standing count that none took.
     #[test]
     fn a_later_count_takes_the_standing_one_by_its_settings_then_by_its_name() {
         let both = r#"{"apiVersion":"smg.policy/v1","profiles":{"p":{"score":["least-load"],"pick":"best"},"q":{"score":["least-load"],"pick":"best"}},"bindings":[{"match":{"model":"m"},"profile":"p"},{"match":{"model":"*"},"profile":"q"}]}"#;
@@ -7839,7 +7841,7 @@ mod tests {
         };
         // The limits of the standing `p` and `q`, the later document and
         // its limits, and the sends the later counts hold, in the order
-        // of their makers' names. The send is in the last standing count.
+        // of their makers' names. The send is in every standing count.
         for (was, later, limits, want) in [
             // The same document again.
             ([None, None], both, [None, None], vec![1]),
@@ -7850,19 +7852,17 @@ mod tests {
             // `p` leaves the shared count for a limit of its own: `q`
             // keeps the send and `p` starts empty.
             ([None, None], both, [Some(43), None], vec![0, 1]),
-            // `p` takes the limit `q` had and `q` a new one: `p` holds the
-            // send of the count under its limit, and `q` does not take
-            // that count too by its name.
-            ([Some(1), Some(9)], both, [Some(9), Some(43)], vec![1, 0]),
+            // `p` takes the limit `q` had and `q` a new one: `p` takes the
+            // count under its limit, and `q` does not take that count too
+            // by its name: it takes the count `p` made, which is left.
+            ([Some(1), Some(9)], both, [Some(9), Some(43)], vec![1, 1]),
         ] {
             let standing = built(both, was);
-            let sent = standing.sent_credits.last().expect("a count");
-            sent.dispatched(
+            standing.on_dispatched(
                 &crate::tracking::Lease::default(),
                 &target,
                 crate::tracking::Side::Single,
                 0,
-                || true,
             );
             let next = built(later, limits);
             next.succeed(&standing);

@@ -3544,7 +3544,8 @@ pub struct Engine {
     keepers: Vec<Keeper>,
     /// One tally for each two send settings a profile's stages read
     /// under, in the order of the names of the profiles that made them:
-    /// a later engine finds one by its settings, then by that name
+    /// a later engine finds one by its settings, then by that name, then
+    /// takes one that is left
     /// ([`Engine::succeed`]).
     pub(crate) sent_credits: Vec<Arc<DispatchCredit>>,
     /// The kinds of event the document takes, but for its counts of sends
@@ -4930,7 +4931,9 @@ impl Engine {
     /// count has its settings, it takes the count that a profile of its
     /// maker's name made, unless another count of this engine took that
     /// one: two counts on one standing count would hold every send twice.
-    /// A count that finds neither starts empty. The two engines share
+    /// It then takes the first standing count that none took: the engine
+    /// records a send in every count, so any one of them carries the
+    /// sends. A count starts empty where none is left. The two engines share
     /// those entries from here on: a decision still running under the
     /// standing engine reads the sends a later one counts, and each count
     /// reads them under its own time limit and report delay.
@@ -4942,20 +4945,32 @@ impl Engine {
     /// is let go. A rank the standing count first hears of behind this
     /// call is entered in the standing count alone.
     pub fn succeed(&self, standing: &Engine) {
-        let under = |counts: &[Arc<DispatchCredit>], settings| {
-            counts.iter().position(|count| count.settings == settings)
-        };
-        for credit in &self.sent_credits {
-            let prior = &standing.sent_credits;
-            let by_name = || {
-                let at = prior
-                    .binary_search_by(|count| count.profile.cmp(&credit.profile))
-                    .ok()?;
-                under(&self.sent_credits, prior[at].settings)
-                    .is_none()
-                    .then_some(at)
-            };
-            if let Some(at) = under(prior, credit.settings).or_else(by_name) {
+        let prior = &standing.sent_credits;
+        // The standing count of each count. One rule at a time over every
+        // count that has none yet: by the settings, by the maker's name,
+        // then the first left. So no count's match by an earlier rule is
+        // taken by another count's later one.
+        let mut taken: Vec<Option<usize>> = vec![None; self.sent_credits.len()];
+        for rule in 0..3 {
+            for (at, credit) in self.sent_credits.iter().enumerate() {
+                if taken[at].is_some() {
+                    continue;
+                }
+                let free = |standing: &usize| !taken.contains(&Some(*standing));
+                taken[at] = match rule {
+                    0 => prior
+                        .iter()
+                        .position(|count| count.settings == credit.settings),
+                    1 => prior
+                        .binary_search_by(|count| count.profile.cmp(&credit.profile))
+                        .ok()
+                        .filter(free),
+                    _ => (0..prior.len()).find(free),
+                };
+            }
+        }
+        for (credit, at) in self.sent_credits.iter().zip(taken) {
+            if let Some(at) = at {
                 credit.succeed(&prior[at]);
             }
         }
