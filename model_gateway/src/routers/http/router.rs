@@ -73,7 +73,7 @@ use crate::{
     routers::{
         common::{
             attach_sized_body,
-            attempt_ledger::{mark_upstream_answer, AttemptLedger},
+            attempt_ledger::{is_upstream_answer, mark_upstream_answer, AttemptLedger},
             body_policy::{
                 decide_body_path, BodyPath, BodyPathInputs, BODY_PATH_BUFFERED, BODY_PATH_STREAMED,
                 REASON_MODEL_AMBIGUOUS, REASON_MODEL_SELECTION, REASON_NO_AVAILABLE_WORKER,
@@ -765,7 +765,7 @@ impl Router {
 
         events::RequestReceivedEvent {}.emit();
 
-        self.account_attempt_outcome(attempt, worker, response, head_success_recorded)
+        self.account_attempt_outcome(attempt, &placed, response, head_success_recorded)
     }
 
     /// The worker of one attempt, as the placement answered it: selected
@@ -854,10 +854,10 @@ impl Router {
     }
 
     /// The attempt's dispatch: the request's load guard, made from the
-    /// placement's answer ([`placement::Placed::guard`]), the request-sent
-    /// event, the trace headers, the relay mode, the serialized body and the
-    /// send through the relay. Once the bytes exist the lease frees the parsed
-    /// request when retries are disabled.
+    /// placement's answer ([`placement::Placed::guard_keeping_end`]), the
+    /// request-sent event, the trace headers, the relay mode, the serialized
+    /// body and the send through the relay. Once the bytes exist the lease
+    /// frees the parsed request when retries are disabled.
     async fn dispatch_attempt<T: GenerationRequest + serde::Serialize>(
         &self,
         attempt: &TypedAttempt<'_, T>,
@@ -874,8 +874,11 @@ impl Router {
             route
         };
 
-        let load_guard = lease
-            .with_view(|view| placed.guard(self.policy_registry.sticky_key(headers, view.rid_key)));
+        // The attempt's account tells the outcome through the answer, which
+        // keeps a handle on the request's end from here.
+        let load_guard = lease.with_view(|view| {
+            placed.guard_keeping_end(self.policy_registry.sticky_key(headers, view.rid_key))
+        });
 
         // Note: Using borrowed reference avoids heap allocation
         events::RequestSentEvent {
@@ -979,19 +982,24 @@ impl Router {
     /// outcome, unless a streamed head already recorded a success that the
     /// verdict kept; the retry window settled on a definitive answer; the
     /// engine on the tried list after a replayable failure; the worker error
-    /// metric on a server error.
+    /// metric on a server error. Where the breaker's outcome is recorded,
+    /// the same status is reported through `placed`, the answer the
+    /// attempt keeps ([`placement::Placed::ended`]): a streamed answer's
+    /// good head is its relay's to report, at the stream's end.
     fn account_attempt_outcome<T>(
         &self,
         attempt: &TypedAttempt<'_, T>,
-        worker: &Arc<dyn Worker>,
+        placed: &placement::Placed,
         mut response: Response,
         head_success_recorded: bool,
     ) -> Response {
+        let worker = placed.worker();
         let model_id = attempt.model_id;
         let ledger = attempt.ledger;
         let status = response.status();
         if !head_success_recorded || !status.is_success() {
             ledger.record_outcome(worker.as_ref(), status.as_u16());
+            placed.ended(status.as_u16(), || is_upstream_answer(&response));
         }
         // A definitive answer closes the retry window on this worker: the next
         // attempt goes to another available worker, or the answer stands.
@@ -1538,6 +1546,10 @@ impl Router {
                     status,
                     upstream_sse,
                     source,
+                    // This router's routes tell the policy engine their
+                    // requests' ends: the relay reports through the handle
+                    // of the request's guard.
+                    end: placement::RequestEnd::of(&load_guard),
                     guard: load_guard,
                     headers: response_headers,
                     mode: rechunker.map_or(ChunkMode::Plain, |rechunker| {
@@ -2443,7 +2455,10 @@ impl Router {
             "false",
         );
 
-        let load_guard = placed.guard(self.policy_registry.sticky_header_key(Some(req.headers())));
+        // The outcome is told through the answer where the status is
+        // recorded below, so the answer keeps a handle on the request's end.
+        let load_guard =
+            placed.guard_keeping_end(self.policy_registry.sticky_header_key(Some(req.headers())));
         events::RequestSentEvent {
             url: worker.redacted_url(),
         }
@@ -2477,9 +2492,11 @@ impl Router {
         );
         if !client_body_fault {
             // A streamed head's success was recorded before its relay task
-            // was spawned (see `forward_worker_response`).
+            // was spawned (see `forward_worker_response`), and its end is
+            // that relay's to report.
             if !head_success_recorded(&response) {
                 worker.record_outcome(status.as_u16());
+                placed.ended(status.as_u16(), || is_upstream_answer(&response));
             }
             if status.is_server_error() {
                 Metrics::record_worker_error(
@@ -7568,8 +7585,9 @@ mod tests {
     }
 
     /// A typed request the policy engine placed reaches the engine by its
-    /// load guard: one dispatch where this route makes the guard, one end
-    /// where the answer's body is read and the guard dropped, and no release.
+    /// load guard and by its answer: one dispatch where this route makes
+    /// the guard, and one end with the status the attempt recorded, told
+    /// through the answer the attempt keeps. No release.
     #[tokio::test]
     async fn the_engine_hears_a_typed_request_by_its_load_guard() {
         let url = spawn_sized_worker(r#"{"choices":[]}"#, "application/json").await;
@@ -7594,7 +7612,7 @@ mod tests {
 
         assert_eq!(
             *heard.lock().expect("the stage heard"),
-            ["issued", "dispatched Single", "completed Cancelled"]
+            ["issued", "dispatched Single", "completed Ok 200"]
         );
     }
 
@@ -7631,8 +7649,450 @@ mod tests {
                 "limit 64",
                 "issued",
                 "dispatched Single",
-                "completed Cancelled"
+                "completed Ok 200"
             ]
+        );
+    }
+
+    /// What the test stage heard of the engine's leases, in order.
+    fn heard_of(heard: &placement::tests::Heard) -> Vec<String> {
+        heard.lock().expect("the stage heard").clone()
+    }
+
+    /// [`heard_of`] once the stage heard `words` words: a stream's end is
+    /// told by its relay's task, behind the body's last byte.
+    async fn heard_after(heard: &placement::tests::Heard, words: usize) -> Vec<String> {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let said = heard_of(heard);
+                if said.len() >= words {
+                    return said;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| heard_of(heard))
+    }
+
+    /// The engine hears the status a worker answered, classed by the
+    /// gateway's one mapping: a worker's own 5xx is the server's error and
+    /// a 4xx the client's. One attempt is one end.
+    #[tokio::test]
+    async fn the_engine_hears_the_status_a_worker_answered() {
+        for (status, word) in [
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "completed ServerError 500",
+            ),
+            (StatusCode::BAD_REQUEST, "completed ClientError 400"),
+        ] {
+            let (url, hits) = fixed_status_upstream(&["/generate"], status).await;
+            let router = breaker_router(&[&url], fast_retry_config(1), 5);
+            let heard = hearing_engine_on(&router.policy_registry);
+
+            let response = generate(&router, "a prompt").await;
+            drop(response);
+
+            assert_eq!(hits.load(AtomicOrdering::SeqCst), 1, "{status}");
+            assert_eq!(
+                heard_of(&heard),
+                ["issued", "dispatched Single", word],
+                "{status}"
+            );
+        }
+    }
+
+    /// A request that reached no worker ends with a status the router
+    /// made: the engine hears a failed connection, not the server's error.
+    #[tokio::test]
+    async fn the_engine_hears_a_failed_connection_as_the_routers_status() {
+        // A port nobody listens on.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let router = breaker_router(&[&url], fast_retry_config(1), 5);
+        let heard = hearing_engine_on(&router.policy_registry);
+
+        let response = generate(&router, "a prompt").await;
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            heard_of(&heard),
+            ["issued", "dispatched Single", "completed ConnectFailed 502"]
+        );
+    }
+
+    /// The Decisions adapter reads a worker's good answer whole and puts a
+    /// 502 of its own in the place of one it cannot map. That answer keeps
+    /// the worker's mark, and the route charges the worker's breaker with
+    /// the 502. The engine hears the same status as the server's error: the
+    /// worker answered, so it is no failed connection.
+    #[tokio::test]
+    async fn the_engine_hears_a_refused_decisions_answer_as_the_servers_error() {
+        // A good status over a body that is no Decisions answer.
+        let (url, hits) = fixed_status_upstream(&[UPSTREAM_ROUTE], StatusCode::OK).await;
+        let worker = BasicWorkerBuilder::new(&url)
+            .worker_type(WorkerType::Regular)
+            .runtime_type(RuntimeType::Sglang)
+            .health_config(no_health_check())
+            .build();
+        let mut router = streaming_router(PolicyConfig::RoundRobin, 1024 * 1024, vec![worker]);
+        router.retry_config = fast_retry_config(1);
+        let heard = hearing_engine_on(&router.policy_registry);
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+        let request: DecisionsRequest = serde_json::from_value(json!({
+            "model": "m",
+            "input": "The sky is blue.",
+            "questions": [{"type": "predicate", "instructions": "Is the sky blue?"}],
+        }))
+        .unwrap();
+
+        let response = router
+            .route_decisions(None, &tenant, request, UNKNOWN_MODEL_ID)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(hits.load(AtomicOrdering::SeqCst), 1);
+        drop(response);
+        assert_eq!(
+            heard_of(&heard),
+            ["issued", "dispatched Single", "completed ServerError 502"]
+        );
+    }
+
+    /// Each attempt is a request of the engine's own: a first attempt its
+    /// worker refused and a second one served are two leases, each with the
+    /// end of its own answer.
+    #[tokio::test]
+    async fn the_engine_hears_each_attempts_own_end() {
+        // Whichever worker takes the first attempt refuses it: the two
+        // share one count of the requests they saw.
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test stub server lives for the duration of the test process"
+        )]
+        async fn refusing_first(seen: Arc<AtomicUsize>) -> String {
+            let app = axum::Router::new().route(
+                "/generate",
+                axum::routing::post(move || {
+                    let seen = Arc::clone(&seen);
+                    async move {
+                        if seen.fetch_add(1, AtomicOrdering::SeqCst) == 0 {
+                            (StatusCode::SERVICE_UNAVAILABLE, "busy").into_response()
+                        } else {
+                            (StatusCode::OK, "{}").into_response()
+                        }
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            format!("http://{addr}")
+        }
+        let seen = Arc::new(AtomicUsize::new(0));
+        let first = refusing_first(Arc::clone(&seen)).await;
+        let second = refusing_first(Arc::clone(&seen)).await;
+        let router = breaker_router(&[&first, &second], fast_retry_config(3), 5);
+        let heard = hearing_engine_on(&router.policy_registry);
+
+        let response = generate(&router, "a prompt").await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(seen.load(AtomicOrdering::SeqCst), 2);
+        assert_eq!(
+            heard_of(&heard),
+            [
+                "issued",
+                "dispatched Single",
+                "completed ServerError 503",
+                "issued",
+                "dispatched Single",
+                "completed Ok 200"
+            ]
+        );
+    }
+
+    /// A streamed answer's end is its relay's to tell. The engine hears no
+    /// end while the body stands, and the head's status once the stream
+    /// was read to its end.
+    #[tokio::test]
+    async fn the_engine_hears_a_streamed_answers_end_from_its_relay() {
+        let url = spawn_sized_worker(SIZED_DELTA_BODY, "text/event-stream").await;
+        let router = streaming_router(
+            PolicyConfig::RoundRobin,
+            1024 * 1024,
+            vec![plain_worker(&url)],
+        );
+        let heard = hearing_engine_on(&router.policy_registry);
+
+        let response = router
+            .route_typed_request(
+                None,
+                None,
+                streaming_chat_request(),
+                "/v1/chat/completions",
+                UNKNOWN_MODEL_ID,
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        // The relay may have read the whole answer by now: the guard rides
+        // in the body, and the end waits for it.
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(heard_of(&heard), ["issued", "dispatched Single"]);
+
+        let bytes = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        assert!(!bytes.is_empty());
+        assert_eq!(
+            heard_after(&heard, 3).await,
+            ["issued", "dispatched Single", "completed Ok 200"]
+        );
+    }
+
+    /// A stream the worker cut behind a good head ends with the cut's
+    /// status, which the router made: the engine hears a failed connection.
+    #[tokio::test]
+    async fn the_engine_hears_a_cut_stream_by_the_cuts_status() {
+        const BODY: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n\
+                            data: {\"choices\":[{\"delta\":{\"content\":\"b\"}}]}\n\n\
+                            data: [DONE]\n\n";
+        let first = BODY.find("\n\n").unwrap() + 2;
+        let url = test_support::spawn_sized_sse_worker_cut_after(BODY, first).await;
+        let router = streaming_router(
+            PolicyConfig::RoundRobin,
+            1024 * 1024,
+            vec![plain_worker(&url)],
+        );
+        let heard = hearing_engine_on(&router.policy_registry);
+
+        let response = router
+            .route_typed_request(
+                None,
+                None,
+                streaming_chat_request(),
+                "/v1/chat/completions",
+                UNKNOWN_MODEL_ID,
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        drop(http_body_util::BodyExt::collect(response.into_body()).await);
+
+        assert_eq!(
+            heard_after(&heard, 3).await,
+            ["issued", "dispatched Single", "completed ConnectFailed 502"]
+        );
+    }
+
+    /// A client that leaves a stream is reported by nobody: the engine
+    /// hears that end as it did before, class cancelled and no status.
+    #[tokio::test]
+    async fn the_engine_hears_a_client_that_left_as_cancelled() {
+        let resume = Arc::new(tokio::sync::Notify::new());
+        let url = spawn_parked_sse_worker(Arc::clone(&resume)).await;
+        let router = streaming_router(
+            PolicyConfig::RoundRobin,
+            1024 * 1024,
+            vec![plain_worker(&url)],
+        );
+        let heard = hearing_engine_on(&router.policy_registry);
+
+        let response = router
+            .route_typed_request(
+                None,
+                None,
+                streaming_chat_request(),
+                "/v1/chat/completions",
+                UNKNOWN_MODEL_ID,
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        drop(response);
+
+        assert_eq!(
+            heard_after(&heard, 3).await,
+            ["issued", "dispatched Single", "completed Cancelled"]
+        );
+        resume.notify_waiters();
+    }
+
+    /// A streamed answer's failed head is its route's to report, where the
+    /// route records it. The relay lets the handle it was handed go before
+    /// its task starts, so the engine hears the end at the body's drop,
+    /// with no turn of that task between.
+    #[tokio::test]
+    async fn the_engine_hears_a_streams_failed_head_from_its_route() {
+        let (url, _) =
+            fixed_status_upstream(&["/v1/chat/completions"], StatusCode::INTERNAL_SERVER_ERROR)
+                .await;
+        let router = breaker_router(&[&url], fast_retry_config(1), 5);
+        let heard = hearing_engine_on(&router.policy_registry);
+
+        let response = router
+            .route_typed_request(
+                None,
+                None,
+                streaming_chat_request(),
+                "/v1/chat/completions",
+                UNKNOWN_MODEL_ID,
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        drop(response);
+
+        assert_eq!(
+            heard_of(&heard),
+            ["issued", "dispatched Single", "completed ServerError 500"]
+        );
+    }
+
+    /// A relay whose hook ends the stream reports the end there, through
+    /// the handle it was handed: the upstream is not read to its own end.
+    #[tokio::test]
+    async fn a_relays_hook_that_ends_the_stream_reports_its_end() {
+        use crate::routers::http::stream_relay::ChunkStep;
+
+        let router = streaming_router(
+            PolicyConfig::RoundRobin,
+            1024 * 1024,
+            vec![plain_worker("http://127.0.0.1:1")],
+        );
+        let heard = hearing_engine_on(&router.policy_registry);
+        let placed = router
+            .select_worker_for_model(
+                UNKNOWN_MODEL_ID,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                &[],
+                placement::Stated::nothing,
+            )
+            .expect("the one worker");
+        let guard = placed.guard(None);
+        let hook = Box::new(|bytes: Bytes| ChunkStep {
+            last: bytes.as_ref() == b"data: [DONE]\n\n",
+            bytes,
+        });
+        // The upstream stays open behind the chunk the hook ends at.
+        let chunks: [&'static [u8]; 2] = [b"data: a\n\n", b"data: [DONE]\n\n"];
+        let upstream = stream::iter(chunks.map(|chunk| Ok(Bytes::from_static(chunk))))
+            .chain(stream::pending::<Result<Bytes, reqwest::Error>>());
+        let response = relay_streaming_body(
+            upstream,
+            Relay {
+                status: StatusCode::OK,
+                upstream_sse: true,
+                source: RelaySource::new("m", "/v1/chat/completions", Arc::clone(placed.worker())),
+                end: placement::RequestEnd::of(&guard),
+                guard,
+                headers: HeaderMap::new(),
+                mode: ChunkMode::Hook(hook),
+            },
+        );
+        drop(placed);
+        drop(http_body_util::BodyExt::collect(response.into_body()).await);
+
+        assert_eq!(
+            heard_after(&heard, 3).await,
+            ["issued", "dispatched Single", "completed Ok 200"]
+        );
+    }
+
+    /// The streamed pass-through tells the engine its ends as the typed
+    /// route does. An answer read whole is told where the route records
+    /// its status, through the answer the route keeps.
+    #[tokio::test]
+    async fn the_engine_hears_a_passed_through_answer_by_its_status() {
+        for (status, word) in [
+            (StatusCode::OK, "completed Ok 200"),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "completed ServerError 500",
+            ),
+        ] {
+            let (url, hits) = fixed_status_upstream(&["/generate"], status).await;
+            let router = streaming_router(
+                PolicyConfig::RoundRobin,
+                1024 * 1024,
+                vec![plain_worker(&url)],
+            );
+            let heard = hearing_engine_on(&router.policy_registry);
+
+            let response = router
+                .route_streaming_request(streamed_request(&[b"{}"]), "/generate", false)
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), status);
+            assert_eq!(hits.load(AtomicOrdering::SeqCst), 1, "{status}");
+            drop(response);
+            assert_eq!(
+                heard_of(&heard),
+                ["issued", "dispatched Single", word],
+                "{status}"
+            );
+        }
+    }
+
+    /// A streamed answer on the pass-through is told by its relay, at the
+    /// stream's end.
+    #[tokio::test]
+    async fn the_engine_hears_a_passed_through_streams_end_from_its_relay() {
+        let (url, _captured) = spawn_capture_stub("text/event-stream", SIZED_DELTA_BODY).await;
+        let router = streaming_router(
+            PolicyConfig::RoundRobin,
+            1024 * 1024,
+            vec![plain_worker(&url)],
+        );
+        let heard = hearing_engine_on(&router.policy_registry);
+
+        let response = router
+            .route_streaming_request(streamed_request(&[b"{}"]), "/generate", false)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        assert!(!bytes.is_empty());
+
+        assert_eq!(
+            heard_after(&heard, 3).await,
+            ["issued", "dispatched Single", "completed Ok 200"]
+        );
+    }
+
+    /// A client's own body fault on the pass-through is no worker's answer:
+    /// the route records nothing on the worker and tells the engine no
+    /// status.
+    #[tokio::test]
+    async fn the_engine_hears_no_status_of_a_clients_own_body_fault() {
+        let (url, _captured) = spawn_capture_stub("application/json", "{}").await;
+        let router = streaming_router(PolicyConfig::RoundRobin, 8, vec![plain_worker(&url)]);
+        let heard = hearing_engine_on(&router.policy_registry);
+
+        let response = router
+            .route_streaming_request(streamed_request(&[b"12345678", b"9"]), "/generate", false)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        drop(response);
+
+        assert_eq!(
+            heard_of(&heard),
+            ["issued", "dispatched Single", "completed Cancelled"]
         );
     }
 

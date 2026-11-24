@@ -1913,14 +1913,27 @@ request ──> route (HTTP or gRPC, any family)
   already keeps to the end of the response, streamed or not (decision 4).
 
   The engine hears the dispatch where the guard is made, or at the send for a guard a route makes
-  ahead of its send, and the end where the guard is dropped. Two guards are made ahead of their
-  sends, both a pair's: the decode's, behind the selection, and the prefill's, where its load is
-  acquired (with prefill admission, under the admission's lock). The prefill's is a plain guard
-  under the route's key. At the prefill's send it takes the engine's side, and counts under the
-  routing value the engine names from there on. The engine is told no outcome. A stage hears
-  the end of a request that was sent as a cancelled completion, with the time since its dispatch
-  and no other measure. It hears a guard dropped before its send as a release, abandoned. So a
-  plugin stage that learns from outcomes reads every request sent in process as cancelled.
+  ahead of its send, and the end where the guard is dropped. It hears a guard dropped before its
+  send as a release, abandoned. Two guards are made ahead of their sends, both a pair's: the
+  decode's, behind the selection, and the prefill's, where its load is acquired (with prefill
+  admission, under the admission's lock). The prefill's is a plain guard under the route's key.
+  At the prefill's send it takes the engine's side, and counts under the routing value the
+  engine names from there on.
+
+  The regular HTTP router's typed route and its streamed pass-through tell the engine that end's
+  outcome, through the handle of section 8.2: the status the route records on the worker, and its
+  class by the gateway's one mapping. An answer read whole is reported through the answer the
+  route keeps, where the route records its status. A streamed answer is reported by its relay,
+  through the handle the route asked of the guard: the head's status at the stream's end, or the
+  status of a cut behind a good head. A client that left is reported by nobody, and so is a
+  client's own body fault on the pass-through. These routes state no time to first token and no
+  tokens.
+
+  A route tells every answer of its workers or none. The other routes tell no outcome yet
+  **[planned]**: the transcription route, the gRPC stages, the pair routes. There, and for an end
+  nobody reported, a stage hears the end of a request that was sent as a cancelled completion,
+  with the time since its dispatch and no other measure. So a plugin stage that learns from
+  outcomes reads those requests as cancelled.
 
 - **Membership.** The gateway's value for a model's workers gets one cell for each list, which
   the engine fills.
@@ -1942,11 +1955,15 @@ The bar for that change:
 1. It adds no file of policy logic to the gateway and no branch on a policy's name.
 2. No route gets an engine branch. The call sites are the five functions, and one call in the two
    pair routes between a prefill's answer and its decode's dispatch, where the document asks the
-   decode again.
+   decode again. A route that tells an outcome makes one more call where it records the status
+   on the worker: on the answer it keeps, or on a handle it asked of the guard for its stream's
+   reader. A classic request makes the same call.
 3. With the engine off, a classic decision pays what rule 5 names and no more, counted in the
    gateway's decision bench.
 
    With the engine off, neither pair route makes the one call of the second point. Each route asks the pair's first answer once, where it decides how the pair is sent, and builds no ask for a decode the classic policies picked. A classic pair sent prefill first still pays that test, the holder of its decode ahead of the send, and on the HTTP route the cell a moved decode is written to. That cost is counted under Callgrind, on the lines the second point added.
+
+   With the engine off, an outcome's report through the answer returns at its first test, of the answer's engine side. A streamed answer pays the route's ask of its guard and its reader's test of an empty handle. A pair route's relay is handed an empty handle and pays its test. The decision bench's `--end` flag counts each against a cell that reports nothing.
 4. With the engine on, every classic test of the gateway passes under the settings' own document.
 
 ### 9.3 The options
@@ -2307,8 +2324,9 @@ gateway                                           controller (leader)
   stages also learn of the requests they placed from these reports (section 6). A request that
   the gateway placed by itself holds no lease on file, so it enters no count of requests in
   flight: its dispatch names no worker (decision 6). Its completion names the worker that served
-  it. Nothing counts it toward that worker's health yet **[planned]**. In process the gateway
-  tells its own engine no outcome yet (section 9.2).
+  it. Nothing counts it toward that worker's health yet **[planned]**. In process the regular HTTP
+  router's typed and pass-through routes tell the gateway's own engine the outcome, and its other
+  routes do not yet (section 9.2).
 - When no answer comes in time (no credit on the stream, a change of leader, the controller
   gone), the gateway decides by itself with the same engine, under the document the controller
   pushed, over the worker list it follows (decision 6). That list stops changing while the
