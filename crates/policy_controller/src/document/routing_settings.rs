@@ -2,6 +2,8 @@
 //! the types it is made of, and why some settings have no document
 //! ([`RoutingSettingsError`]).
 
+use std::collections::{btree_map::Entry, BTreeMap};
+
 use serde::Serialize;
 use serde_json::Value;
 
@@ -11,8 +13,8 @@ use crate::{
         ConsistentHashParams, IndexKind, IndexSpec, KeySourceSpec, KvPressureParams,
         LeastLoadParams, OverloadSpec, Pairing, PickStage, PolicySpec, PrefixAffinityParams,
         ProfileSpec, Recovery, RoutingKeySpec, RulePlaced, ScoreSpec, ScoreStage, SessionsSpec,
-        SpecError, SpillParams, WarmupSliceParams, MANUAL_SESSION_HEADER, MAX_KEY_SOURCES,
-        OVERLOAD_WAITING_REQUESTS,
+        SpecError, SpillParams, WarmupSliceParams, MANUAL_SESSION_HEADER, MAX_HEADERS,
+        MAX_KEY_SOURCES, OVERLOAD_WAITING_REQUESTS,
     },
     engine::view::Phase,
     policies::{
@@ -85,6 +87,10 @@ use crate::{
 ///   an index the configuration never sweeps. The gateway's own policy
 ///   trims an index at its sweep alone, so that index's size bound lands as
 ///   the largest too.
+/// - A worker's `policy` label is no setting, and a host hands it beside
+///   them ([`RoutingSettings::policy_document_with_labels`]). It lands as a
+///   binding of its model's single requests, ahead of the binding of every
+///   model, under the policy it names.
 ///
 /// # What is refused
 ///
@@ -130,7 +136,9 @@ pub struct RoutingSettings {
     /// The kinds of worker the gateway routes to, with each side's own policy.
     pub mode: ModeSettings,
     /// The main policy. Single workers run under it, and so does a side of
-    /// the mode that names no policy of its own.
+    /// the mode that names no policy of its own. A worker's `policy` label
+    /// names another one for its model's single requests
+    /// ([`RoutingSettings::policy_document_with_labels`]).
     pub policy: PolicySettings,
     /// The gateway runs many routers side by side, so one document plans pairs
     /// and single workers.
@@ -479,6 +487,81 @@ impl PolicySettings {
             Self::PrefixHash { .. } => "prefix_hash",
         }
     }
+
+    /// The policy a worker's `policy` label names, by the name of its
+    /// preset: that policy with the settings a gateway's own registry
+    /// builds it with from the name alone (`PolicyFactory::create_by_name`,
+    /// `model_gateway/src/policies/factory.rs:118-134`). `None` for a name
+    /// with no preset.
+    ///
+    /// A label carries a name and no setting, so the registry builds each
+    /// policy at its type's own defaults, and a labelled model runs those.
+    /// A label that names the main policy is the one exception: the
+    /// registry builds that one from the settings, and the builder never
+    /// asks this table for it. For eight names the defaults are the values
+    /// of the name's preset. For two they are not, by seven numbers:
+    ///
+    /// - `cache_aware` (`CacheAwareConfig::default`,
+    ///   `model_gateway/src/policies/mod.rs:359-385`): a cache threshold of
+    ///   0.5, a balance threshold of 32 requests and of 1.1 times the mean,
+    ///   a sweep every 30 seconds and an index trimmed to 10,000. Its preset
+    ///   runs 0.3, 64, 1.5, 120 seconds and 67,108,864.
+    /// - `bucket` (`BucketConfig::default`,
+    ///   `model_gateway/src/policies/mod.rs:394-402`): a balance rule that
+    ///   starts at a load difference of 32 booked tokens, or characters,
+    ///   and a load ratio of 1.0001. Its preset runs 64 and 1.5.
+    pub fn of_label(name: &str) -> Option<Self> {
+        Some(match name {
+            "random" => Self::Random,
+            "round_robin" => Self::RoundRobin,
+            "passthrough" => Self::Passthrough,
+            "consistent_hashing" => Self::ConsistentHashing,
+            "power_of_two" => Self::PowerOfTwo {
+                load_metric: LoadMetricSetting::ExpectedWait,
+            },
+            "least_load" => Self::LeastLoad {
+                kv_pressure_weight: 0.15,
+                mean_prefill_tokens: 1024,
+                default_throughput: 2000.0,
+            },
+            "bucket" => Self::Bucket {
+                balance_abs_threshold: 32,
+                balance_rel_threshold: 1.0001,
+                bucket_adjust_interval_secs: 5,
+            },
+            "manual" => Self::Manual {
+                eviction_interval_secs: 60,
+                max_idle_secs: 14_400,
+                assignment_mode: Assignment::Random,
+            },
+            "prefix_hash" => Self::PrefixHash {
+                prefix_token_count: 256,
+                load_factor: 1.25,
+                balance_abs_threshold: 10,
+                cache_boundaries: Vec::new(),
+            },
+            "cache_aware" => Self::CacheAware {
+                cache_threshold: 0.5,
+                balance_abs_threshold: 32,
+                balance_rel_threshold: 1.1,
+                balance_prefix_margin_tokens: 0,
+                balance_uncached_credit: false,
+                eviction_interval_secs: 30,
+                max_tree_size: 10_000,
+                block_size: 16,
+                balance_token_usage_threshold: 1.0,
+                overload_token_usage_threshold: 1.0,
+                overlap_decay: 0.0,
+                selection_temperature: 0.0,
+                cache_index: IndexKind::Tree,
+                cache_ttl_secs: 180,
+                cache_boundaries: Vec::new(),
+                selection_policy: None,
+                selection_accounting_ttl_ms: 0,
+            },
+            _ => return None,
+        })
+    }
 }
 
 /// The encode side's policy where the configuration names none: encode
@@ -529,6 +612,21 @@ pub enum RoutingSettingsError {
         /// The value from the supplied document.
         document: String,
     },
+    /// A worker's `policy` label that the document of these settings has no
+    /// binding for. The call that refuses it answers no document. The
+    /// refusal names the label alone, so a host leaves that one out and
+    /// calls again ([`RoutingSettings::policy_document_with_labels`]). It
+    /// is never a parting of the presets and this module, which is
+    /// answered as itself under a label too.
+    #[error("the policy label of model {model:?} names {policy:?}: {reason}")]
+    Label {
+        /// The model the label's worker serves.
+        model: String,
+        /// The policy the label names.
+        policy: String,
+        /// Why the document has no binding for it.
+        reason: String,
+    },
 }
 
 fn unsupported(
@@ -562,6 +660,97 @@ impl RoutingSettings {
             }
         }
         written(self, presets(self)?)
+    }
+
+    /// [`Self::policy_document`] where workers' `policy` labels name the
+    /// policy of their model, as a gateway's own registry reads them: a
+    /// labelled model's single requests are placed by the label's policy.
+    /// `labels` holds each such model's id with the name of the policy's
+    /// preset. Its host resolves a label's spelling to that name, and says
+    /// which registration's label stands for a model and until when.
+    ///
+    /// A label's binding is one, of its model alone, right ahead of the
+    /// binding of every model's single requests and behind a pair's or an
+    /// encode's, in the order of the models' ids. The binding is the one
+    /// these settings would say for single requests under that policy, at
+    /// the settings a label builds it with ([`PolicySettings::of_label`]):
+    /// the policy's own key sources and session rule, the sticky override's
+    /// rule where the override places the policy, the warm-up settings in
+    /// its profile, and the settings' overload block. The settings' own
+    /// profiles are named for a side or for the main policy, and a label's
+    /// for its policy. So one profile serves every model that names one
+    /// policy, and no name holds two.
+    ///
+    /// Models that share a profile run the same stages, so a stage that
+    /// keeps a history of its own keeps one for all of them. Two stock
+    /// stages keep one: round robin draws the start of a list it sees first
+    /// from a count of its own, and the cache-aware warm-up counts its
+    /// misses and its hits and marks a shallow hit. A model whose label
+    /// names the main policy shares the main profile's the same way. A
+    /// gateway's own registry builds a policy for each labelled model, so
+    /// there each model keeps its own. That difference stays while one
+    /// profile serves every model of a policy.
+    ///
+    /// Some labels add nothing. With no label this is
+    /// [`Self::policy_document`]. A label that names the main policy leaves
+    /// its model under the main policy's profile, with the settings'
+    /// options, whatever the model's id. And where the settings' document
+    /// binds no single request, no label is bound: a model's own binding
+    /// would place the requests that document refuses. A label's id and its
+    /// name are checked there as everywhere. What its binding would cost
+    /// the document is checked only where the binding is written.
+    ///
+    /// The document's view is one for every binding. The headers a label's
+    /// side lists there join the list behind the ones that stand in it, in
+    /// the labels' order, each once: the key headers of a `manual` label,
+    /// and the sticky override's where the override places the label's
+    /// policy. The builder writes one block size, one list of cache
+    /// boundaries and one index for the document, so a label whose policy
+    /// names another value than a side of the settings is refused, as two
+    /// sides of the settings are. A label's prefix ring counts its key in
+    /// that block size under every gateway: in a gateway of many routers
+    /// the rings of the settings' own sides stand as they stood, and a
+    /// label's is new.
+    ///
+    /// A label the document has no binding for is refused by its model and
+    /// its policy ([`RoutingSettingsError::Label`]): a model's id that is
+    /// empty or holds a `*`, a name with no preset, a policy that cannot
+    /// stand beside the settings' own, and headers that would take the
+    /// view's list past its bound. The call then answers that refusal and
+    /// no document: a host leaves the label out and calls again. The
+    /// settings' own document is decided first, with no label, so a label
+    /// never changes which families it binds. Two labels never refuse one
+    /// another: each stands or falls beside the settings alone, so every
+    /// subset of labels that build builds too. A preset this module has
+    /// parted from is no label's refusal: it is answered as itself
+    /// ([`RoutingSettingsError::NoStage`], [`RoutingSettingsError::NoPart`],
+    /// [`RoutingSettingsError::Document`]), under a label too.
+    ///
+    /// A pure function of the settings and the labels. Like
+    /// [`Self::policy_document`] it answers the document the settings mean
+    /// and reads no supplied document: where one is in force
+    /// ([`Self::policy_document_in_force`]), that document decides, and a
+    /// host hands this function no label. And like it, it does not run the
+    /// document's own check. That check judges the whole document and names
+    /// no label, so a host that adds one label at a time knows whose
+    /// document it refused.
+    pub fn policy_document_with_labels(
+        &self,
+        labels: &BTreeMap<String, String>,
+    ) -> Result<PolicySpec, RoutingSettingsError> {
+        let document = self.policy_document()?;
+        let labels = labelled(self, labels)?;
+        if labels.is_empty() {
+            return Ok(document);
+        }
+        // The plan that document was written from, written again with the
+        // labels' sides. The plan of two families binds two bindings and
+        // the mode's own plan one, so the count says which it was.
+        let plan = match both_families(self)? {
+            Some(both) if both.1.len() == document.bindings.len() => both,
+            _ => presets(self)?,
+        };
+        written_with(self, plan, &labels)
     }
 
     /// The document a gateway of these settings runs. Without a supplied
@@ -864,7 +1053,164 @@ fn both_families(config: &RoutingSettings) -> Result<Option<Planned<'_>>, Routin
 /// shed word stand for the pools of each family.
 fn written<'a>(
     config: &'a RoutingSettings,
+    planned: Planned<'a>,
+) -> Result<PolicySpec, RoutingSettingsError> {
+    written_with(config, planned, &[])
+}
+
+/// A model whose worker's `policy` label names a policy, with that policy
+/// as a label builds it ([`PolicySettings::of_label`]).
+type Labelled<'a> = (&'a str, PolicySettings);
+
+/// The labels a document binds, in the order of their models' ids. A label
+/// that names the main policy is none of them, whatever its model: that
+/// model runs the main policy's profile already, with the settings'
+/// options. Of the others, a model's id no binding can name alone is
+/// refused, and so is a name with no preset.
+fn labelled<'a>(
+    config: &RoutingSettings,
+    labels: &'a BTreeMap<String, String>,
+) -> Result<Vec<Labelled<'a>>, RoutingSettingsError> {
+    let mut bound = Vec::with_capacity(labels.len());
+    for (model, name) in labels {
+        let refused = |reason: String| RoutingSettingsError::Label {
+            model: model.clone(),
+            policy: name.clone(),
+            reason,
+        };
+        if name == config.policy.name() {
+            continue;
+        }
+        if model.is_empty() {
+            return Err(refused(
+                "a binding names its model by the model's id, and this id is empty".to_owned(),
+            ));
+        }
+        if model.contains('*') {
+            return Err(refused(
+                "a binding reads a `*` at the start or the end of a model's name as a pattern and the document refuses one anywhere else, so no binding names this model alone"
+                    .to_owned(),
+            ));
+        }
+        let policy = PolicySettings::of_label(name)
+            .ok_or_else(|| refused(SpecError::UnknownPreset(name.clone()).to_string()))?;
+        bound.push((model.as_str(), policy));
+    }
+    Ok(bound)
+}
+
+/// A label's refusal, from the builder's own for its side or its binding: a
+/// setting the document has no place for under the label's policy. A
+/// parting of the presets and this module is no label's, and passes as it
+/// is: a host leaves a refused label out and calls again, which would
+/// leave the parting unsaid.
+fn label_refused(
+    model: &str,
+    policy: &PolicySettings,
+    refusal: RoutingSettingsError,
+) -> RoutingSettingsError {
+    match refusal {
+        RoutingSettingsError::UnsupportedSetting { .. }
+        | RoutingSettingsError::Disagreement { .. } => RoutingSettingsError::Label {
+            model: model.to_owned(),
+            policy: policy.name().to_owned(),
+            reason: refusal.to_string(),
+        },
+        // Each kind is named: a new one builds once its answer is written.
+        RoutingSettingsError::NoStage { .. }
+        | RoutingSettingsError::NoPart { .. }
+        | RoutingSettingsError::Document(_)
+        | RoutingSettingsError::Label { .. } => refusal,
+    }
+}
+
+/// One label's side of the document, written as a side of the settings is:
+/// its policy's preset as a profile of the policy's name, the policy's
+/// settings in that profile and in the places the document's sides share,
+/// and what its one binding holds. Models that name one policy share its
+/// profile, which a second write leaves as the first left it.
+fn label_side<'a>(
+    policy: &'a PolicySettings,
+    config: &RoutingSettings,
+    document: &mut PolicySpec,
+    shared: &mut Shared<'a>,
+) -> Result<Bound, RoutingSettingsError> {
+    let name = policy.name();
+    let profile = match document.profiles.entry(name.to_owned()) {
+        Entry::Occupied(held) => held.into_mut(),
+        Entry::Vacant(place) => {
+            let preset = PolicySpec::preset(name)?.profiles.remove(name);
+            place.insert(preset.ok_or(RoutingSettingsError::NoPart {
+                policy: name,
+                part: "profile",
+            })?)
+        }
+    };
+    write_policy(policy, config, profile, shared)?;
+    if let Some(sources) = key_sources(policy, config)? {
+        shared.bound.keys.push((name, sources));
+    }
+    shared.bound.overridden |= override_places(policy, config);
+    Ok(std::mem::take(&mut shared.bound))
+}
+
+/// The binding of one label's model: its policy's preset binding, for that
+/// model alone, with what its side holds written as a plan of one side. The
+/// headers its side lists in the view join the view's list behind the ones
+/// that stand there, each once. The list holds a bounded count, which the
+/// document's own check holds for every model at once: a label whose
+/// headers would pass it is refused here, in that check's words, so it
+/// costs no other model its document.
+fn label_binding(
+    model: &str,
+    policy: &PolicySettings,
+    side: Bound,
+    config: &RoutingSettings,
+    view_headers: &mut Vec<String>,
+) -> Result<BindingSpec, RoutingSettingsError> {
+    let name = policy.name();
+    let mut binding =
+        PolicySpec::preset(name)?
+            .bindings
+            .pop()
+            .ok_or(RoutingSettingsError::NoPart {
+                policy: name,
+                part: "binding",
+            })?;
+    model.clone_into(&mut binding.matcher.model);
+    // A side lists each of its headers once. The ones the view holds stay
+    // where they stand, and a list the settings' own sides took past the
+    // bound is theirs: a label that adds no header is not refused for it.
+    let mut headers = Vec::new();
+    side.write(config, 1, &mut binding, &mut headers)?;
+    headers.retain(|header| !view_headers.contains(header));
+    let count = view_headers.len() + headers.len();
+    if !headers.is_empty() && count > MAX_HEADERS {
+        let bound = SpecError::TooManyHeaders {
+            count,
+            max: MAX_HEADERS,
+        };
+        return Err(RoutingSettingsError::Label {
+            model: model.to_owned(),
+            policy: policy.name().to_owned(),
+            reason: bound.to_string(),
+        });
+    }
+    view_headers.extend(headers);
+    Ok(binding)
+}
+
+/// [`written`] with the labels' sides: each label is one more side of one,
+/// written by its policy as the main policy's side is, and bound for its
+/// model alone right ahead of the binding of every model's single requests.
+/// A plan with no such binding binds no label. The settings' own sides are
+/// written first and their bindings first, so a label changes none of them
+/// but the view's headers, which it adds to. A label's ring keeps its
+/// blocks under every gateway: no document of a label's stood before it.
+fn written_with<'a>(
+    config: &'a RoutingSettings,
     (mut document, bindings): Planned<'a>,
+    labels: &'a [Labelled<'a>],
 ) -> Result<PolicySpec, RoutingSettingsError> {
     // A plan of several sides runs the pair: the pairing mode is its rule.
     if bindings.iter().any(|sides| sides.len() > 1) {
@@ -904,6 +1250,25 @@ fn written<'a>(
     if !config.enable_igw || encode_mode {
         rings_keep_their_blocks(shared.block_size, &bound)?;
     }
+    // The binding of every model's single requests: the last plan of one
+    // side. A label's side shares the document's one view with the sides
+    // above, and a label's ring keeps its blocks beside the size they
+    // name, in a gateway of many routers too: a label's ring is a new one.
+    // A label names the size a silent ring counts in, so it moves no ring
+    // of theirs and none of a label before it: its own side is the one to
+    // read.
+    let single = bindings.iter().rposition(|sides| sides.len() == 1);
+    let mut sides_of_labels = Vec::with_capacity(labels.len());
+    if single.is_some() {
+        for (model, policy) in labels {
+            let refused = |refusal: RoutingSettingsError| label_refused(model, policy, refusal);
+            let side = label_side(policy, config, &mut document, &mut shared).map_err(refused)?;
+            let side = (1, side);
+            rings_keep_their_blocks(shared.block_size, std::slice::from_ref(&side))
+                .map_err(refused)?;
+            sides_of_labels.push(side);
+        }
+    }
     shared.write(&mut document)?;
     if document.bindings.is_empty() || document.bindings.len() != bound.len() {
         return Err(RoutingSettingsError::NoPart {
@@ -913,6 +1278,13 @@ fn written<'a>(
     }
     for (binding, (sides, bound)) in document.bindings.iter_mut().zip(bound) {
         bound.write(config, sides, binding, &mut document.view.headers)?;
+    }
+    if let Some(single) = single {
+        for (at, ((model, policy), (_, side))) in labels.iter().zip(sides_of_labels).enumerate() {
+            let binding = label_binding(model, policy, side, config, &mut document.view.headers)
+                .map_err(|refusal| label_refused(model, policy, refusal))?;
+            document.bindings.insert(single + at, binding);
+        }
     }
     let overload = overload(config);
     for binding in &mut document.bindings {
@@ -1669,8 +2041,9 @@ fn key_sources(
 ///   This crate's ring does the same in a gateway's own process, where
 ///   the one call says that a key is the id's
 ///   ([`RequestFacts::session_key_from_rid`](crate::engine::RequestFacts::session_key_from_rid)).
-///   No frame says it: a served controller's ring places a request by
-///   the key its id handed.
+///   A gateway's frame says it to a served controller. The frame of a
+///   host older than that field says nothing, and its controller's ring
+///   places the request by the key its id handed.
 /// - `random` draws.
 /// - `round_robin` takes turns. The gateway asks one policy object for a
 ///   request with no key, for a key's first request and for a key at its
@@ -1802,7 +2175,7 @@ mod tests {
     use super::*;
     use crate::{
         document::spec::{AppliedSpec, PRESETS},
-        engine::framework::{InTheWay, Place},
+        engine::framework::{InTheWay, Place, Plan},
     };
 
     /// The settings of a gateway that sets none, as its configuration
@@ -3794,6 +4167,874 @@ mod tests {
             "bucket",
         ];
         assert_eq!(alone_still, keyless.map(|main| (main, ring, true)));
+    }
+
+    /// The labels of these models, each with the preset name its label
+    /// resolves to.
+    fn labels(named: &[(&str, &str)]) -> BTreeMap<String, String> {
+        named
+            .iter()
+            .map(|&(model, policy)| (model.to_owned(), policy.to_owned()))
+            .collect()
+    }
+
+    /// The settings' document with these labels.
+    fn with_labels(
+        settings: &RoutingSettings,
+        named: &[(&str, &str)],
+    ) -> Result<PolicySpec, RoutingSettingsError> {
+        settings.policy_document_with_labels(&labels(named))
+    }
+
+    /// A label's refusal, in its three parts.
+    fn label_error(model: &str, policy: &str, reason: &str) -> RoutingSettingsError {
+        RoutingSettingsError::Label {
+            model: model.to_owned(),
+            policy: policy.to_owned(),
+            reason: reason.to_owned(),
+        }
+    }
+
+    /// A main policy that is not the label's: round robin, and `random`
+    /// beside a label of round robin.
+    fn main_beside(label: &str) -> PolicySettings {
+        at_flag_defaults(if label == "round_robin" {
+            "random"
+        } else {
+            "round_robin"
+        })
+    }
+
+    /// The profile the document binds a single request of `model` to, as
+    /// the controller's check builds the document.
+    fn single_profile(document: &PolicySpec, model: &str) -> String {
+        let engine = document
+            .validate_with(&["x-smg-tenant-id"])
+            .expect("the controller's check takes the document");
+        let binding = engine
+            .binding(model, Phase::Single)
+            .expect("a binding for the model's single request");
+        engine.profiles()[usize::from(binding.profile)].name.clone()
+    }
+
+    /// A label builds each policy as the gateway's registry builds it from
+    /// a name alone. Eight of the ten are the policy at its flags' defaults,
+    /// the preset. `cache_aware` and `bucket` are not: seven numbers are the
+    /// registry's own, and tidying them to the presets' turns this case red.
+    /// A name's spelling is its host's to resolve: only a preset's name
+    /// names a policy here.
+    #[test]
+    fn a_label_builds_two_policies_at_other_numbers_than_their_presets() {
+        for name in PRESETS {
+            let by_label = PolicySettings::of_label(name).expect("a policy of each preset's name");
+            assert_eq!(by_label.name(), name);
+            let preset = by_label == at_flag_defaults(name);
+            assert_eq!(preset, !["cache_aware", "bucket"].contains(&name), "{name}");
+        }
+        assert_eq!(
+            PolicySettings::of_label("cache_aware"),
+            Some(cache_aware(0.5, 32, 1.1, 30, 10_000))
+        );
+        assert_eq!(
+            PolicySettings::of_label("bucket"),
+            Some(PolicySettings::Bucket {
+                balance_abs_threshold: 32,
+                balance_rel_threshold: 1.0001,
+                bucket_adjust_interval_secs: 5,
+            })
+        );
+        for unnamed in ["cacheaware", "Bucket", "least_loaded", ""] {
+            assert_eq!(PolicySettings::of_label(unnamed), None, "{unnamed:?}");
+        }
+        // A label's `cache_aware` names the block size a silent ring counts
+        // in: beside it no ring of the settings' sides loses its blocks.
+        let silent = usize::try_from(Gates::default().block_size).expect("a block size");
+        assert!(matches!(
+            PolicySettings::of_label("cache_aware"),
+            Some(PolicySettings::CacheAware { block_size, .. }) if block_size == silent
+        ));
+    }
+
+    /// With no label the labelled document is the settings' own, and a
+    /// label that names the main policy changes nothing: its model already
+    /// runs that profile, with the settings' options.
+    #[test]
+    fn no_label_and_a_label_of_the_main_policy_leave_the_settings_document() {
+        for name in PRESETS {
+            for settings in [
+                config(at_flag_defaults(name)),
+                round_robin_pairs_under(at_flag_defaults(name)),
+                many_routers(config(at_flag_defaults(name))),
+            ] {
+                let own = settings.policy_document();
+                assert_eq!(with_labels(&settings, &[]), own, "{name}");
+                assert_eq!(with_labels(&settings, &[("m", name)]), own, "{name}");
+            }
+        }
+    }
+
+    /// Each stock policy as a label, beside another main policy: the
+    /// label's binding stands ahead of the settings' own, which stays as it
+    /// was with its profile. The controller's check takes the document, and
+    /// its engine binds a single request of the labelled model to the
+    /// label's profile and another model's to the main policy's.
+    #[test]
+    fn each_stock_policy_as_a_label_binds_its_model_ahead_of_every_model() {
+        for name in PRESETS {
+            let settings = config(main_beside(name));
+            let main = settings.policy.name();
+            let own = settings.policy_document().expect("the settings' document");
+            let document = with_labels(&settings, &[("labelled", name)]).expect("a labelled one");
+            assert_eq!(document.bindings.len(), 2, "{name}");
+            assert_eq!(document.bindings[0].matcher.model, "labelled", "{name}");
+            assert!(document.bindings[0].matcher.phase.is_empty(), "{name}");
+            assert_eq!(document.bindings[0].profile.as_deref(), Some(name));
+            assert_eq!(document.bindings[1], own.bindings[0], "{name}");
+            assert_eq!(document.profiles[main], own.profiles[main], "{name}");
+            assert_eq!(single_profile(&document, "labelled"), name);
+            assert_eq!(single_profile(&document, "another"), main);
+        }
+    }
+
+    /// One way to set a configuration, by its name in a case's messages.
+    type Way<'a> = (&'a str, &'a dyn Fn(&mut RoutingSettings));
+
+    /// In a regular gateway of one router, a label's binding is the one its
+    /// policy would get as the main policy of the same settings: its own
+    /// profile, key sources and session rule, by the code that writes a main
+    /// policy's, and none of the main binding's. So the warm-up settings
+    /// land in a labelled `cache_aware` profile, configured headers lead a
+    /// keyed label's sources, and under the sticky override a label carries
+    /// the override's rule where the override places its policy. Where the
+    /// policy has no document as the main policy there, the label is refused
+    /// by that sentence. A mode whose side takes the main policy is no such
+    /// comparison: as the main policy the label's would place that side too.
+    #[test]
+    fn a_labels_binding_is_the_one_its_policy_gets_as_the_main_policy() {
+        let warm = |settings: &mut RoutingSettings| settings.worker_warmup_secs = 7;
+        let headed = |settings: &mut RoutingSettings| {
+            settings.routing_key_override.headers = vec!["x-session".to_owned()];
+        };
+        let sticky = |settings: &mut RoutingSettings| settings.routing_key_override.enabled = true;
+        let both = |settings: &mut RoutingSettings| {
+            settings.routing_key_override.enabled = true;
+            settings.routing_key_override.headers = vec!["x-session".to_owned()];
+        };
+        let plain = |_: &mut RoutingSettings| {};
+        let unprotected =
+            |settings: &mut RoutingSettings| settings.worker_overload_protection = false;
+        let ways: [Way<'_>; 6] = [
+            ("as set by none", &plain),
+            ("the overload protection off", &unprotected),
+            ("a warm-up of seven seconds", &warm),
+            ("a configured header", &headed),
+            ("the sticky override", &sticky),
+            ("the override over a configured header", &both),
+        ];
+        let mut refused = Vec::new();
+        for name in PRESETS {
+            for (way, set) in ways {
+                let mut settings = config(main_beside(name));
+                set(&mut settings);
+                let main = settings.policy.name();
+                let own = settings
+                    .policy_document()
+                    .expect("the main policy's document");
+                let as_main = RoutingSettings {
+                    policy: PolicySettings::of_label(name).expect("the label's policy"),
+                    ..settings.clone()
+                }
+                .policy_document();
+                let said = with_labels(&settings, &[("m", name)]);
+                let as_main = match as_main {
+                    Ok(document) => document,
+                    Err(refusal) => {
+                        let expected = label_error("m", name, &refusal.to_string());
+                        assert_eq!(said, Err(expected), "{name}, {way}");
+                        refused.push((name, way));
+                        continue;
+                    }
+                };
+                let document = said.unwrap_or_else(|refusal| panic!("{name}, {way}: {refusal}"));
+                let mut expected = as_main.bindings[0].clone();
+                expected.matcher.model = "m".to_owned();
+                assert_eq!(document.bindings[0], expected, "{name}, {way}");
+                assert_eq!(document.bindings[1], own.bindings[0], "{name}, {way}");
+                assert_eq!(
+                    document.profiles[name], as_main.profiles[name],
+                    "{name}, {way}"
+                );
+                assert_eq!(document.profiles[main], own.profiles[main], "{name}, {way}");
+                assert_eq!(document.index, as_main.index, "{name}, {way}");
+                // The view's headers: the main binding's, then the label's.
+                let mut headers = own.view.headers.clone();
+                for header in &as_main.view.headers {
+                    if !headers.contains(header) {
+                        headers.push(header.clone());
+                    }
+                }
+                assert_eq!(document.view.headers, headers, "{name}, {way}");
+                assert!(validated(&document).is_ok(), "{name}, {way}");
+            }
+        }
+        // The settings' overload block stands on a label's binding.
+        let mut exposed = config(main_beside("random"));
+        unprotected(&mut exposed);
+        let document = with_labels(&exposed, &[("m", "random")]).expect("a labelled one");
+        let switched_off = Some(OverloadSpec {
+            enabled: false,
+            ..OverloadSpec::default()
+        });
+        assert_eq!(document.bindings[0].overload, switched_off);
+        assert_eq!(document.bindings[1].overload, switched_off);
+        // The warm-up setting is in the labelled profile, not the preset's.
+        let mut warmed = config(main_beside("cache_aware"));
+        warm(&mut warmed);
+        let cold = config(main_beside("cache_aware"));
+        let profile = |settings: &RoutingSettings| {
+            let document = with_labels(settings, &[("m", "cache_aware")]).expect("a labelled one");
+            document.profiles["cache_aware"].clone()
+        };
+        assert_ne!(profile(&warmed), profile(&cold));
+        // Under the override a policy that places by the key itself reads
+        // the routing key header as sent, behind a configured header.
+        assert_eq!(
+            refused,
+            [
+                (
+                    "consistent_hashing",
+                    "the override over a configured header"
+                ),
+                ("manual", "the override over a configured header"),
+            ]
+        );
+    }
+
+    /// The session rule and the key sources are each policy's own, either
+    /// way round. Under a main policy of `manual` a round robin label's
+    /// binding names no rule and no key, so its model's keyed requests take
+    /// turns. Under round robin a `manual` label brings the manual rule and
+    /// its header to the view, and a hash ring label its own sources.
+    #[test]
+    fn a_label_reads_its_own_key_and_rule_and_not_the_main_bindings() {
+        let manual = config(at_flag_defaults("manual"));
+        let own = manual.policy_document().expect("the manual document");
+        let document = with_labels(&manual, &[("m", "round_robin")]).expect("a labelled one");
+        assert_eq!(document.bindings[0].sessions, None);
+        assert_eq!(document.bindings[0].routing_key, None);
+        assert!(own.bindings[0].sessions.is_some());
+        assert_eq!(document.bindings[1], own.bindings[0]);
+        assert_eq!(document.view, own.view);
+
+        let turns = config(at_flag_defaults("round_robin"));
+        let own = turns.policy_document().expect("the round robin document");
+        assert!(own.view.headers.is_empty());
+        let document = with_labels(&turns, &[("m", "manual")]).expect("a labelled one");
+        assert_eq!(
+            document.bindings[0].sessions,
+            preset("manual").bindings[0].sessions
+        );
+        assert_eq!(document.view.headers, ["x-smg-routing-key"]);
+        assert_eq!(document.bindings[1], own.bindings[0]);
+        let document = with_labels(&turns, &[("m", "consistent_hashing")]).expect("a labelled one");
+        assert_eq!(
+            document.bindings[0].routing_key,
+            preset("consistent_hashing").bindings[0].routing_key
+        );
+        assert_eq!(document.bindings[0].sessions, None);
+        assert_eq!(document.view, own.view);
+    }
+
+    /// A pair mode keeps its pair's binding under a label: the label's
+    /// stands behind it and ahead of the binding of every model's single
+    /// requests. The engine binds a prefill of the labelled model to the
+    /// pair plan and its single request to the label's profile.
+    #[test]
+    fn a_pair_mode_keeps_its_pair_binding_ahead_of_a_labels() {
+        for settings in [
+            round_robin_pairs_under(at_flag_defaults("least_load")),
+            many_routers(config(at_flag_defaults("least_load"))),
+        ] {
+            let own = settings
+                .policy_document()
+                .expect("a document of two families");
+            assert_eq!(own.bindings.len(), 2);
+            let document = with_labels(&settings, &[("m", "random")]).expect("a labelled one");
+            assert_eq!(document.bindings.len(), 3);
+            assert_eq!(document.bindings[0], own.bindings[0]);
+            assert_eq!(document.bindings[1].matcher.model, "m");
+            assert_eq!(document.bindings[1].profile.as_deref(), Some("random"));
+            assert_eq!(document.bindings[1].overload, own.bindings[1].overload);
+            assert_eq!(document.bindings[2], own.bindings[1]);
+            let engine = document
+                .validate_with(&["x-smg-tenant-id"])
+                .expect("the controller's check takes the document");
+            let plan = |phase| engine.binding("m", phase).map(|binding| binding.plan);
+            assert_eq!(plan(Phase::Prefill), Some(Plan::PdPair));
+            assert_eq!(plan(Phase::Decode), Some(Plan::PdPair));
+            assert_eq!(plan(Phase::Single), Some(Plan::Single));
+            assert_eq!(single_profile(&document, "m"), "random");
+            assert_eq!(single_profile(&document, "another"), "least_load");
+        }
+    }
+
+    /// Where the settings' document binds no single request, no label is
+    /// bound and the model's single requests stay refused: a pair mode of
+    /// one router over gRPC, the encode mode of one router, and a pair
+    /// planned alone for a main policy's setting no document says.
+    #[test]
+    fn a_label_adds_no_binding_where_no_single_request_is_bound() {
+        let pairs = || round_robin_pairs_under(at_flag_defaults("least_load"));
+        let mut unsaid = at_flag_defaults("cache_aware");
+        if let PolicySettings::CacheAware {
+            selection_policy, ..
+        } = &mut unsaid
+        {
+            *selection_policy = Some("another".to_owned());
+        }
+        for (settings, sides) in [
+            (
+                RoutingSettings {
+                    connection_mode: ConnectionModeSetting::Grpc,
+                    ..pairs()
+                },
+                2,
+            ),
+            (
+                RoutingSettings {
+                    mode: ModeSettings::EncodePrefillDecode {
+                        encode_policy: None,
+                        prefill_policy: None,
+                        decode_policy: None,
+                    },
+                    ..config(at_flag_defaults("round_robin"))
+                },
+                3,
+            ),
+            (round_robin_pairs_under(unsaid), 2),
+        ] {
+            let own = settings
+                .policy_document()
+                .expect("a document of the mode alone");
+            assert_eq!(own.bindings.len(), 1);
+            assert_eq!(own.bindings[0].profiles.len(), sides);
+            assert_eq!(with_labels(&settings, &[("m", "random")]), Ok(own));
+            // A label's own id and name are checked here as everywhere.
+            assert_eq!(
+                with_labels(&settings, &[("m", "none")]),
+                Err(label_error(
+                    "m",
+                    "none",
+                    &SpecError::UnknownPreset("none".to_owned()).to_string()
+                ))
+            );
+            assert!(matches!(
+                with_labels(&settings, &[("m*", "random")]),
+                Err(RoutingSettingsError::Label { model, .. }) if model == "m*"
+            ));
+        }
+        // What a label's binding would cost the document is checked only
+        // where the binding is written: a ring another block size refuses
+        // beside a single binding is passed over where there is none.
+        let blocks = round_robin_pairs_under(cache_aware_over(32));
+        assert!(matches!(
+            with_labels(&blocks, &[("m", "prefix_hash")]),
+            Err(RoutingSettingsError::Label { reason, .. }) if reason.starts_with("block_size = 16 and 32: ")
+        ));
+        let unbound = RoutingSettings {
+            connection_mode: ConnectionModeSetting::Grpc,
+            ..blocks
+        };
+        let own = unbound.policy_document().expect("the pair's document");
+        assert_eq!(own.bindings.len(), 1);
+        assert_eq!(with_labels(&unbound, &[("m", "prefix_hash")]), Ok(own));
+    }
+
+    /// Settings no document says are refused as before, whatever the
+    /// labels: the settings' own refusal comes first.
+    #[test]
+    fn settings_no_document_says_are_refused_as_before_under_a_label() {
+        let rank = RoutingSettings {
+            dp_minimum_tokens_scheduler: true,
+            ..config(at_flag_defaults("round_robin"))
+        };
+        let mut sticky_ring = config(at_flag_defaults("consistent_hashing"));
+        sticky_ring.routing_key_override.enabled = true;
+        sticky_ring.routing_key_override.headers = vec!["x-session".to_owned()];
+        for settings in [rank, sticky_ring] {
+            let refusal = settings.policy_document().expect_err("no document");
+            for named in [
+                &[("m", "random")][..],
+                &[("m*", "random")],
+                &[("m", "none")],
+            ] {
+                assert_eq!(with_labels(&settings, named).as_ref(), Err(&refusal));
+            }
+        }
+    }
+
+    /// The builder's refusal of a setting under a label's policy is the
+    /// label's, by its model and its policy. A parting of the presets and
+    /// this module is not: it passes as it is, so a host that leaves a
+    /// refused label out does not leave it unsaid.
+    #[test]
+    fn a_parting_of_the_presets_is_no_labels_refusal() {
+        let policy = PolicySettings::Random;
+        let parted = || {
+            [
+                RoutingSettingsError::NoStage {
+                    policy: "random",
+                    stage: "picker",
+                },
+                RoutingSettingsError::NoPart {
+                    policy: "random",
+                    part: "profile",
+                },
+                RoutingSettingsError::Document(SpecError::UnknownPreset("random".to_owned())),
+            ]
+        };
+        for (passed, parted) in parted().into_iter().zip(parted()) {
+            assert_eq!(label_refused("m", &policy, passed), parted);
+        }
+        let setting = || unsupported("worker_warmup_secs", 7, "no document says it");
+        assert_eq!(
+            label_refused("m", &policy, setting()),
+            label_error("m", "random", &setting().to_string())
+        );
+    }
+
+    /// A label the document has no binding for is refused by its model and
+    /// its policy: a model's id that holds a `*` or is empty, and a name
+    /// with no preset. A label of the main policy adds no binding, so its
+    /// model's id refuses nothing. That label is the main policy's name as
+    /// a preset spells it: another letter case is a name with no preset.
+    #[test]
+    fn a_label_is_refused_by_its_model_and_its_policy() {
+        let settings = config(at_flag_defaults("round_robin"));
+        let own = settings.policy_document();
+        let pattern = "a binding reads a `*` at the start or the end of a model's name as a pattern and the document refuses one anywhere else, so no binding names this model alone";
+        for model in ["*", "m*", "*m", "a*b"] {
+            assert_eq!(
+                with_labels(&settings, &[(model, "random")]),
+                Err(label_error(model, "random", pattern)),
+            );
+            assert_eq!(with_labels(&settings, &[(model, "round_robin")]), own);
+        }
+        assert_eq!(
+            with_labels(&settings, &[("", "random")]),
+            Err(label_error(
+                "",
+                "random",
+                "a binding names its model by the model's id, and this id is empty"
+            )),
+        );
+        assert_eq!(with_labels(&settings, &[("", "round_robin")]), own);
+        let unknown = |name: &str| SpecError::UnknownPreset(name.to_owned()).to_string();
+        assert_eq!(
+            with_labels(&settings, &[("a", "random"), ("m", "least_loaded")]),
+            Err(label_error("m", "least_loaded", &unknown("least_loaded"))),
+        );
+        assert_eq!(
+            with_labels(&settings, &[("m", "Round_Robin")]),
+            Err(label_error("m", "Round_Robin", &unknown("Round_Robin"))),
+        );
+        // Every label's name and id is read before a side is written, so
+        // the refusal need not be the first label's in the ids' order.
+        let blocks = config(cache_aware_over(32));
+        assert!(with_labels(&blocks, &[("a", "prefix_hash")]).is_err());
+        assert_eq!(
+            with_labels(&blocks, &[("a", "prefix_hash"), ("z", "least_loaded")]),
+            Err(label_error("z", "least_loaded", &unknown("least_loaded"))),
+        );
+    }
+
+    /// A label's policy that cannot stand beside the settings' own is
+    /// refused as two sides of the settings are, by the builder's own
+    /// sentence, and the settings' document keeps its families: the refusal
+    /// is the label's, and no family is left out for it. A prefix ring keeps
+    /// the blocks of its own document, and the builder holds one index and
+    /// one list of cache boundaries for the document. A label's ring is
+    /// held to the document's block size in a gateway of many routers too,
+    /// where the settings' own document stands as it stood: unrefused, that
+    /// label's ring would have no whole block, and the controller's check
+    /// would refuse the document of every model with no label named.
+    #[test]
+    fn a_label_that_cannot_stand_beside_the_settings_is_refused_by_name() {
+        let blocks = config(cache_aware_over(32));
+        assert_eq!(
+            with_labels(&blocks, &[("m", "prefix_hash")]),
+            Err(label_error(
+                "m",
+                "prefix_hash",
+                "block_size = 16 and 32: a prefix ring counts its key in the document's one block size, and another binding's policy names another size than the ring's own"
+            )),
+        );
+        let fleet = many_routers(config(cache_aware_over(512)));
+        let own = fleet.policy_document().expect("the fleet's own document");
+        assert_eq!(own.bindings.len(), 2);
+        assert_eq!(
+            with_labels(&fleet, &[("m", "prefix_hash")]),
+            Err(label_error(
+                "m",
+                "prefix_hash",
+                "block_size = 16 and 512: a prefix ring counts its key in the document's one block size, and another binding's policy names another size than the ring's own"
+            )),
+        );
+        assert_eq!(
+            with_labels(&fleet, &[("m", "random")]).map(|document| document.bindings.len()),
+            Ok(3)
+        );
+
+        let mut cut = at_flag_defaults("prefix_hash");
+        if let PolicySettings::PrefixHash {
+            cache_boundaries, ..
+        } = &mut cut
+        {
+            *cache_boundaries = vec![64];
+        }
+        let cut = config(cut);
+        assert!(cut.policy_document().is_ok());
+        match with_labels(&cut, &[("m", "cache_aware")]) {
+            Err(RoutingSettingsError::Label {
+                model,
+                policy,
+                reason,
+            }) => {
+                assert_eq!((model.as_str(), policy.as_str()), ("m", "cache_aware"));
+                assert!(reason.starts_with("cache_boundaries = "), "{reason}");
+            }
+            other => panic!("expected the label refused by its boundaries, got {other:?}"),
+        }
+
+        let indexed = |decode: Option<PolicySettings>| RoutingSettings {
+            mode: pair_mode(Some(at_flag_defaults("cache_aware")), decode),
+            ..config(at_flag_defaults("round_robin"))
+        };
+        let two_sides = indexed(PolicySettings::of_label("cache_aware"))
+            .policy_document()
+            .expect_err("two sides of two indexes");
+        let settings = indexed(None);
+        assert_eq!(
+            settings.policy_document().map(|own| own.bindings.len()),
+            Ok(2)
+        );
+        assert_eq!(
+            with_labels(&settings, &[("m", "cache_aware")]),
+            Err(label_error("m", "cache_aware", &two_sides.to_string())),
+        );
+    }
+
+    /// A refused label fails alone. Two labels never refuse one another, so
+    /// each stands or falls beside the settings alone: the refusal names the
+    /// one that falls, and every subset of the labels that build builds. A
+    /// subset's document holds its labels' bindings as the whole one holds
+    /// them, in their order, ahead of the settings' own, and no other.
+    #[test]
+    fn labels_stand_or_fall_alone_beside_the_settings() {
+        let settings = config(cache_aware_over(32));
+        let named = [
+            ("a", "random"),
+            ("b", "prefix_hash"),
+            ("c", "manual"),
+            ("d", "cache_aware"),
+            ("e", "bucket"),
+        ];
+        let falls = |label: &(&str, &str)| with_labels(&settings, &[*label]).is_err();
+        let fallen: Vec<_> = named.iter().filter(|label| falls(label)).collect();
+        assert_eq!(fallen, [&("b", "prefix_hash")]);
+        match with_labels(&settings, &named) {
+            Err(RoutingSettingsError::Label { model, policy, .. }) => {
+                assert_eq!((model.as_str(), policy.as_str()), ("b", "prefix_hash"));
+            }
+            other => panic!("expected the ring's label refused, got {other:?}"),
+        }
+        // The main policy is `cache_aware`: its own label adds nothing.
+        let built = [named[0], named[2], named[3], named[4]];
+        let whole = with_labels(&settings, &built).expect("the labels that build");
+        let models = |document: &PolicySpec| -> Vec<String> {
+            document
+                .bindings
+                .iter()
+                .map(|binding| binding.matcher.model.clone())
+                .collect()
+        };
+        assert_eq!(models(&whole), ["a", "c", "e", "*"]);
+        let own = settings.policy_document().expect("the settings' document");
+        for picked in 0..(1_u32 << built.len()) {
+            let subset: Vec<_> = built
+                .iter()
+                .enumerate()
+                .filter(|(at, _)| picked & (1 << at) != 0)
+                .map(|(_, label)| *label)
+                .collect();
+            let document = with_labels(&settings, &subset).expect("a subset builds");
+            let of_subset = |binding: &&BindingSpec| {
+                subset
+                    .iter()
+                    .any(|(model, _)| binding.matcher.model == *model)
+            };
+            let mut expected: Vec<_> = whole.bindings.iter().filter(of_subset).cloned().collect();
+            expected.extend(own.bindings.iter().cloned());
+            assert_eq!(document.bindings, expected, "{subset:?}");
+            for (name, profile) in &document.profiles {
+                assert_eq!(whole.profiles.get(name), Some(profile), "{subset:?}");
+            }
+        }
+    }
+
+    /// A label whose binding would pass a bound of the document is refused
+    /// by its model and its policy, in the words of that bound. A key block
+    /// names eight sources at most: the builder's own sentence, as for a
+    /// main policy. The view lists 256 headers at most, which the
+    /// controller's check holds for the whole document and for no model by
+    /// name: a label that would list the 257th is refused here, and the
+    /// settings' own document and every other label stand.
+    #[test]
+    fn a_label_past_a_bound_of_the_document_is_refused_by_name() {
+        let headed = |count: usize| {
+            let mut settings = config(at_flag_defaults("round_robin"));
+            settings.routing_key_override.headers =
+                (0..count).map(|at| format!("x-k{at}")).collect();
+            settings
+        };
+        let eight = headed(8);
+        let as_main = RoutingSettings {
+            policy: at_flag_defaults("consistent_hashing"),
+            ..eight.clone()
+        }
+        .policy_document()
+        .expect_err("a ninth source of the ring's key");
+        assert_eq!(
+            with_labels(&eight, &[("m", "consistent_hashing")]),
+            Err(label_error("m", "consistent_hashing", &as_main.to_string())),
+        );
+        assert!(with_labels(&headed(7), &[("m", "consistent_hashing")]).is_ok());
+
+        // The manual rule names its headers by the rule's own fields, which
+        // no key block bounds: its headers are the view's.
+        let full = headed(255);
+        let document =
+            with_labels(&full, &[("b", "manual"), ("m", "manual")]).expect("256 headers");
+        assert_eq!(document.view.headers.len(), 256);
+        assert!(validated(&document).is_ok());
+        let over = headed(256);
+        let own = over.policy_document().expect("the settings' own document");
+        assert!(own.view.headers.is_empty());
+        let too_many = SpecError::TooManyHeaders {
+            count: 257,
+            max: 256,
+        };
+        assert_eq!(
+            with_labels(&over, &[("a", "random"), ("m", "manual")]),
+            Err(label_error("m", "manual", &too_many.to_string())),
+        );
+        assert_eq!(
+            with_labels(&over, &[("a", "random")]).map(|document| document.bindings.len()),
+            Ok(2)
+        );
+        // A list the settings' own policy took past the bound is the
+        // settings': a label that adds no header is not refused for it.
+        let own_over = RoutingSettings {
+            policy: at_flag_defaults("manual"),
+            ..headed(256)
+        };
+        let headers = |document: PolicySpec| document.view.headers.len();
+        assert_eq!(own_over.policy_document().map(headers), Ok(257));
+        assert_eq!(
+            with_labels(&own_over, &[("m", "random")]).map(headers),
+            Ok(257)
+        );
+    }
+
+    /// Models in the order of their ids, and one profile for each policy:
+    /// two models that name one policy share its profile, and the same
+    /// labels give the same document.
+    #[test]
+    fn labelled_models_stand_in_id_order_and_share_a_policys_profile() {
+        let settings = config(at_flag_defaults("round_robin"));
+        let named = [
+            ("zeta", "random"),
+            ("alpha", "least_load"),
+            ("mid", "random"),
+        ];
+        let document = with_labels(&settings, &named).expect("a labelled document");
+        let bound: Vec<_> = document
+            .bindings
+            .iter()
+            .map(|binding| (binding.matcher.model.as_str(), binding.profile.as_deref()))
+            .collect();
+        assert_eq!(
+            bound,
+            [
+                ("alpha", Some("least_load")),
+                ("mid", Some("random")),
+                ("zeta", Some("random")),
+                ("*", Some("round_robin")),
+            ]
+        );
+        let profiles: Vec<_> = document.profiles.keys().map(String::as_str).collect();
+        assert_eq!(profiles, ["least_load", "random", "round_robin"]);
+        let again = [named[2], named[0], named[1]];
+        assert_eq!(with_labels(&settings, &again), Ok(document.clone()));
+        assert!(validated(&document).is_ok());
+        assert_eq!(single_profile(&document, "mid"), "random");
+        assert_eq!(single_profile(&document, "alpha"), "least_load");
+        // A policy's profile is written once for each model that names it,
+        // and a second write leaves it as the first left it.
+        for name in PRESETS {
+            let settings = config(main_beside(name));
+            let once = with_labels(&settings, &[("a", name)]).expect("one model");
+            let twice = with_labels(&settings, &[("a", name), ("b", name)]).expect("two models");
+            assert_eq!(twice.bindings.len(), 3, "{name}");
+            assert_eq!(twice.profiles, once.profiles, "{name}");
+            assert_eq!(twice.view, once.view, "{name}");
+            assert_eq!(twice.index, once.index, "{name}");
+            // The second model's binding is the first's but for its model:
+            // its key sources and its session rule are written again.
+            assert_eq!(twice.bindings[0], once.bindings[0], "{name}");
+            let mut second = twice.bindings[1].clone();
+            assert_eq!(second.matcher.model, "b", "{name}");
+            second.matcher.model = "a".to_owned();
+            assert_eq!(second, twice.bindings[0], "{name}");
+        }
+    }
+
+    /// Two models that name one policy by their labels are bound to one
+    /// profile, so a stage that keeps a history of its own keeps one for
+    /// both. Round robin draws the start of a list it sees first from a
+    /// count of its own. In one labelled document the second model's first
+    /// turn starts where that count stands behind the first model's. In a
+    /// document that labels it alone, it starts where the first model's
+    /// did: a gateway's own registry builds a policy for each labelled
+    /// model, so there every labelled model starts as the first.
+    #[test]
+    fn labelled_models_of_one_policy_share_what_its_stages_count() {
+        use crate::engine::{
+            framework::{Engine, Scratch},
+            view::{Candidate, Constraints, Health, PoolFacts, RequestFacts, WorkerId},
+        };
+        let settings = config(at_flag_defaults("random"));
+        let engine = |named: &[(&str, &str)]| {
+            with_labels(&settings, named)
+                .expect("a labelled document")
+                .validate_with(&["x-smg-tenant-id"])
+                .expect("the controller's check takes the document")
+        };
+        let pool: Vec<Candidate> = (0..32)
+            .map(|position| Candidate {
+                position,
+                id: WorkerId(100 + u64::from(position)),
+                key: 100 + position,
+                health: Health {
+                    healthy: true,
+                    ..Health::default()
+                },
+                ..Candidate::default()
+            })
+            .collect();
+        let first_turn = |engine: &Engine, model: &'static str| {
+            let facts = RequestFacts {
+                model,
+                ..RequestFacts::default()
+            };
+            let decision = engine.decide(
+                &facts,
+                &PoolFacts::default(),
+                &pool,
+                &Constraints::default(),
+                &mut Scratch::new(),
+            );
+            let pick = decision.pick().expect("a pick");
+            pick.targets.iter().next().expect("a target").position
+        };
+        let both = engine(&[("a", "round_robin"), ("b", "round_robin")]);
+        let a_first = first_turn(&both, "a");
+        let b_behind_a = first_turn(&both, "b");
+        let alone = engine(&[("b", "round_robin")]);
+        let b_alone = first_turn(&alone, "b");
+        assert_eq!(b_alone, a_first);
+        assert_ne!(b_behind_a, b_alone);
+    }
+
+    /// No name holds two profiles. A pair's sides are named for the side,
+    /// so a `bucket` label beside a pair whose prefill policy is `bucket`
+    /// adds a profile of its own name, at the numbers a label builds it
+    /// with, and leaves the side's at the settings'.
+    #[test]
+    fn a_labels_profile_stands_beside_a_side_of_the_same_policy() {
+        let settings = RoutingSettings {
+            mode: pair_mode(Some(at_flag_defaults("bucket")), None),
+            ..config(at_flag_defaults("round_robin"))
+        };
+        let own = settings
+            .policy_document()
+            .expect("the pair mode's document");
+        let document = with_labels(&settings, &[("m", "bucket")]).expect("a labelled one");
+        let profiles: Vec<_> = document.profiles.keys().map(String::as_str).collect();
+        assert_eq!(profiles, ["bucket", "decode", "prefill", "round_robin"]);
+        for side in ["decode", "prefill", "round_robin"] {
+            assert_eq!(document.profiles[side], own.profiles[side], "{side}");
+        }
+        let by_label = config(PolicySettings::of_label("bucket").expect("the label's policy"))
+            .policy_document()
+            .expect("the label's policy as a main policy");
+        assert_eq!(document.profiles["bucket"], by_label.profiles["bucket"]);
+        assert_ne!(
+            document.profiles["bucket"].score,
+            own.profiles["prefill"].score
+        );
+    }
+
+    /// What a label changes outside its own profile and binding. Under
+    /// settings that set nothing, `manual` alone changes the view, by its
+    /// header, and `cache_aware` alone writes the index block, at the size
+    /// and sweep a label builds it with. No label writes a signal. Under
+    /// the sticky override beside a main policy of the hash ring, whose
+    /// binding lists no header, a label the override places adds the
+    /// override's headers to the view.
+    #[test]
+    fn a_label_changes_the_view_for_its_headers_alone() {
+        let mut changed = Vec::new();
+        for name in PRESETS {
+            let settings = config(main_beside(name));
+            let own = settings.policy_document().expect("the settings' document");
+            let document = with_labels(&settings, &[("m", name)]).expect("a labelled one");
+            assert_eq!(document.signals, own.signals, "{name}");
+            assert_eq!(document.plans, own.plans, "{name}");
+            if document.view != own.view {
+                let mut view = own.view.clone();
+                view.headers.clone_from(&document.view.headers);
+                assert_eq!(document.view, view, "{name}: the headers alone");
+                changed.push(("view", name));
+            }
+            if document.index != own.index {
+                changed.push(("index", name));
+            }
+        }
+        assert_eq!(changed, [("view", "manual"), ("index", "cache_aware")]);
+        let labelled = with_labels(
+            &config(at_flag_defaults("round_robin")),
+            &[("m", "cache_aware")],
+        )
+        .expect("a labelled one");
+        let index = IndexSpec {
+            max_size: 10_000,
+            sweep_s: 30,
+            ..IndexSpec::default()
+        };
+        assert_eq!(
+            labelled.index.into_iter().collect::<Vec<_>>(),
+            [("*".to_owned(), index)]
+        );
+
+        let mut ring = config(at_flag_defaults("consistent_hashing"));
+        ring.routing_key_override.enabled = true;
+        let own = ring.policy_document().expect("the ring's document");
+        assert!(own.view.headers.is_empty());
+        for name in PLACED.into_iter().chain(["prefix_hash"]) {
+            let document = with_labels(&ring, &[("m", name)]).expect("a labelled one");
+            assert_eq!(document.view.headers, ["x-smg-routing-key"], "{name}");
+        }
     }
 
     /// A pair configuration with round robin on both sides, under `main`.

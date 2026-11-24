@@ -220,6 +220,11 @@ struct Held {
     id: WorkerId,
     object: Weak<dyn Worker>,
     state: Option<Weak<WorkerRuntime>>,
+    /// The model ids the object named where the follow took it, none
+    /// where its code panicked at the ask: a whole read that finds another
+    /// object of this life asks that one for each. A model the object's
+    /// cards gained in place since is not among them, and is not asked.
+    models: Option<Vec<String>>,
     /// What a telling of load reports reads of the worker: none where the
     /// document has no stage that keeps them, and nothing is read for it.
     joined: Option<Joined>,
@@ -260,12 +265,18 @@ impl Joined {
 }
 
 impl Held {
-    fn of(id: WorkerId, worker: &Arc<dyn Worker>, keeps_loads: bool) -> Self {
+    fn of(
+        id: WorkerId,
+        worker: &Arc<dyn Worker>,
+        models: Option<Vec<String>>,
+        keeps_loads: bool,
+    ) -> Self {
         let state = worker.runtime_state();
         Self {
             id,
             object: Arc::downgrade(worker),
             state: state.as_ref().map(Arc::downgrade),
+            models,
             joined: keeps_loads.then(|| Joined::of(worker.as_ref())),
         }
     }
@@ -539,7 +550,9 @@ impl PolicyEngine {
     /// models, by its cards of this minute. It is asked behind the word's
     /// telling and under a catch of its own: a panic of its code is held
     /// and counted ([`Self::upkeep_faults`]) and costs that worker's fills
-    /// alone, so no stage loses a word for a fill.
+    /// alone, so no stage loses a word for a fill. An object the follow
+    /// takes is not asked here: [`Self::stands`] owes its lists by the one
+    /// ask of its record.
     fn owes(&self, follow: &mut Follow, worker: &Arc<dyn Worker>) {
         if self.lists.get().is_none() {
             return;
@@ -595,7 +608,6 @@ impl PolicyEngine {
             Ok(WorkerEvent::Registered { worker_id, worker }) => {
                 let id = follow.id_of(&worker);
                 self.stands(follow, worker_id, &worker, id, false);
-                self.owes(follow, &worker);
             }
             Ok(WorkerEvent::Replaced {
                 worker_id,
@@ -606,7 +618,8 @@ impl PolicyEngine {
                 // older than a read that found a later one, or its worker's
                 // removal was heard ahead: it tells nothing.
                 let held = follow.told.get(&worker_id);
-                if held.is_some_and(|held| held.holds(&old)) {
+                let takes = held.is_some_and(|held| held.holds(&old));
+                if takes {
                     let was = held.map(|held| held.id);
                     let id = follow.id_of(&new);
                     self.stands(follow, worker_id, &new, id, true);
@@ -623,9 +636,12 @@ impl PolicyEngine {
                     }
                 }
                 // The lists of both objects' models were published again,
-                // told or not.
+                // told or not: the new object's are owed above where the
+                // follow took it.
                 self.owes(follow, &old);
-                self.owes(follow, &new);
+                if !takes {
+                    self.owes(follow, &new);
+                }
             }
             Ok(WorkerEvent::Removed { worker_id, worker }) => {
                 self.gone(follow, &worker_id, Some(&worker));
@@ -660,6 +676,13 @@ impl PolicyEngine {
     /// A join no leave comes ahead of starts with no sent prefixes all the
     /// same: the records forget the id first, so the worker inherits
     /// nothing of a life the channel dropped whole.
+    ///
+    /// The worker's object names its models once, ahead of the telling and
+    /// under a catch of its own: the follow keeps them for a later whole
+    /// read, and under an engine handed its program's lists the lists of
+    /// those models are owed a fill, as [`Self::owes`] owes them. A panic
+    /// of the object's code is held and counted ([`Self::upkeep_faults`])
+    /// and costs the models kept and that worker's fills alone.
     fn stands(
         &self,
         follow: &mut Follow,
@@ -668,7 +691,14 @@ impl PolicyEngine {
         id: WorkerId,
         replaced: bool,
     ) {
-        let record = Held::of(id, worker, self.document.load().spec.engine().keeps_loads());
+        let models = self.held(|| worker_model_ids(worker));
+        // Its lists were published again, or stand behind a whole read and
+        // may be ones the task did not ask yet.
+        if self.lists.get().is_some() {
+            follow.owed.extend(models.iter().flatten().cloned());
+        }
+        let keeps_loads = self.document.load().spec.engine().keeps_loads();
+        let record = Held::of(id, worker, models, keeps_loads);
         if let Some(was) = follow.told.insert(object, record) {
             if was.id == id && (replaced || was.is(worker)) {
                 return;
@@ -724,8 +754,12 @@ impl PolicyEngine {
     /// registry id the follow holds is the worker held where it is the
     /// object held or keeps its state, and the worker's next life
     /// otherwise: a worker that keeps no state and was replaced inside the
-    /// dropped events is told as a next life. The host is asked of every
-    /// worker ahead of the first word.
+    /// dropped events is told as a next life. One that keeps its state and
+    /// was replaced there is told to no stage, and the records of sent
+    /// prefixes forget it where the object found serves a model of the
+    /// object held no more: one of the models that object named where the
+    /// follow took it, so a model its cards gained in place since is not
+    /// judged. The host is asked of every worker ahead of the first word.
     fn read_whole(&self, follow: &mut Follow) {
         let standing = follow.registry.standing().into_iter();
         let stands: FxHashMap<ObjectId, (WorkerId, Arc<dyn Worker>)> = standing
@@ -740,9 +774,20 @@ impl PolicyEngine {
             self.gone(follow, object, None);
         }
         for (object, (id, worker)) in stands {
+            // Another object of the life held, with no word of its
+            // replacement: the read found it ahead of the word, or the word
+            // was dropped. It is asked for the models the worker was held
+            // with, as the word's arm asks: a panic is read as a model lost.
+            let left = |model: &String| !worker.supports_model(model);
+            let lost = |was: &Held| {
+                let asked = || was.models.as_ref().is_none_or(|ids| ids.iter().any(left));
+                let found = was.id == id && !was.holds(&worker) && was.is(&worker);
+                found && self.held(asked).unwrap_or(true)
+            };
+            if follow.told.get(&object).is_some_and(lost) {
+                self.affinity.forget(id);
+            }
             self.stands(follow, object, &worker, id, false);
-            // Every list that stands may be one the task did not ask yet.
-            self.owes(follow, &worker);
         }
         let standing: Vec<WorkerId> = follow.under.keys().copied().collect();
         self.affinity.keep(&standing);

@@ -12,7 +12,6 @@ use tokio::sync::watch;
 use super::{ElectedLead, WorkerObjects};
 use crate::{
     service::elector::Fence,
-    store::MemoryStore,
     worker_host::{HealthAdapter, Lead, Members},
 };
 
@@ -114,7 +113,7 @@ impl Prober {
 
     /// The health adapter of `term`: what writes an outcome judged under
     /// the term onto its row.
-    fn adapter(&self, lead: Arc<dyn Lead>, term: u64) -> Arc<HealthAdapter<Members, MemoryStore>> {
+    fn adapter(&self, lead: Arc<dyn Lead>, term: u64) -> Arc<HealthAdapter<Members>> {
         Arc::new(HealthAdapter::new(
             self.workers.holder(),
             self.workers.store(),
@@ -148,7 +147,10 @@ mod tests {
     use crate::{
         engine::view::{WireModes, WorkerId},
         service::elector::{ElectError, Elector},
-        store::{GatewayId, HealthPolicy, Reachability, WorkerFacts, WorkerStatus, WorkersStore},
+        store::{
+            GatewayId, HealthPolicy, MemoryStore, Reachability, WorkerFacts, WorkerStatus,
+            WorkersStore,
+        },
     };
 
     const A: &str = "grpc://a:9000";
@@ -282,7 +284,7 @@ mod tests {
         /// `row` as it stands.
         fn judged(
             &self,
-            adapter: &HealthAdapter<Members, MemoryStore>,
+            adapter: &HealthAdapter<Members>,
             row: WorkerId,
             passed: bool,
         ) -> Option<ProbeAnswer> {

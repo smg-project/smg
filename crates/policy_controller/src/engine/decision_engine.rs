@@ -38,7 +38,7 @@ use std::{borrow::Cow, fmt, sync::Arc};
 use smg_worker::load::state::LoadSnapshot;
 
 use super::{
-    decision::{Decision, Pick, ShadowKind, Survivors, Target, Targets, Trace},
+    decision::{Decision, Pick, Survivors, Target, Targets, Trace},
     prompt_hashes::{HashSeeds, PromptHashes},
     sticky_sessions::SessionVerdict,
     view::{Constraints, Phase, RequestFacts, Session, SessionCountedUnder, WireModes, WorkerId},
@@ -666,10 +666,6 @@ pub trait DecisionEngine {
     /// How many decisions panicked, a shadow's beside a live decision that
     /// stood among them.
     fn faults(&self) -> u64;
-
-    /// How many shadows said `kind` beside a single decision of the
-    /// binding at position `binding`.
-    fn shadowed(&self, binding: u32, kind: ShadowKind) -> u64;
 }
 
 /// A request and its constraints as the host holds them. A door reads

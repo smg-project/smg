@@ -1919,19 +1919,12 @@ impl Table {
             return self.decide_in_tree(walk, sends_to, workers, facts, places, buffers, decide);
         }
         let read = self.name(facts, places, buffers);
-        let named = AffinityRows {
-            holders: &buffers.holders,
-            warming: &buffers.warming,
-            thin: self.ruled.thin,
-            mean_in_flight: None,
-        };
+        let named = self.named_rows(buffers);
         let mut decision = decide(&mut RequestFacts {
             named: Some(named),
             ..*facts
         });
-        if self.states {
-            state(&mut decision, Feed::Named(named), facts, self.block);
-        }
+        self.state_named(&mut decision, named, facts);
         let (Some(read), Some(record)) = (read, self.record.as_deref()) else {
             return decision;
         };
@@ -1946,6 +1939,37 @@ impl Table {
             record.write(&buffers.keys, read, held, target.id);
         }
         decision
+    }
+
+    /// The rows named into `buffers`, as a decision is handed them in the
+    /// affinity column's place.
+    fn named_rows<'b>(&self, buffers: &'b Buffers) -> AffinityRows<'b> {
+        AffinityRows {
+            holders: &buffers.holders,
+            warming: &buffers.warming,
+            thin: self.ruled.thin,
+            mean_in_flight: None,
+        }
+    }
+
+    /// States the pick of a decision made over `named` rows: its first
+    /// target's entry of them ([`state`]), where the request's own profile
+    /// reads affinity. One function for the two paths that name rows, the
+    /// table's own naming ([`Self::name`]) and a tree's match
+    /// ([`Self::name_sent`]), so both state by one rule.
+    // Each path makes its decision in its own place and states it there:
+    // handed back by one function that also decides, a decision over the
+    // table's own rows costs a copy more, 30 instructions, counted with
+    // Callgrind.
+    fn state_named(
+        &self,
+        decision: &mut Decision,
+        named: AffinityRows<'_>,
+        facts: &RequestFacts<'_>,
+    ) {
+        if self.states {
+            state(decision, Feed::Named(named), facts, self.block);
+        }
     }
 
     /// How many of the request's blocks a token tree's match of `tokens`
@@ -2001,19 +2025,12 @@ impl Table {
     ) -> Decision {
         let mut decide_over = |holders: &[TenantId], blocks: u32| {
             self.name_sent(holders, blocks, workers, facts, places, buffers);
-            let named = AffinityRows {
-                holders: &buffers.holders,
-                warming: &buffers.warming,
-                thin: self.ruled.thin,
-                mean_in_flight: None,
-            };
+            let named = self.named_rows(buffers);
             let mut decision = decide(&mut RequestFacts {
                 named: Some(named),
                 ..*facts
             });
-            if self.states {
-                state(&mut decision, Feed::Named(named), facts, self.block);
-            }
+            self.state_named(&mut decision, named, facts);
             decision
         };
         let mut decided = None;

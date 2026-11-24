@@ -56,7 +56,7 @@ pub use framework::{
     WeightedScorer, DRAW_BOUND, DRAW_FROM, RANK_FROM,
 };
 #[cfg(feature = "in-process")]
-pub use list_cell::{LentList, ListCell, ModelLists};
+pub use list_cell::{LentList, ListCell, ModelLists, PublishedList};
 pub use pair_classes::PartnerClasses;
 #[cfg(feature = "in-process")]
 pub use policy_engine::encode::EncodeLists;
@@ -79,7 +79,7 @@ pub use policy_engine::{PolicyEngine, SpecHandle};
 pub use prompt_hashes::{HashSeeds, PromptHashes};
 #[cfg(feature = "in-process")]
 pub use records::{decide, worker_id, worker_rank, DecisionClock, Live, PoolRecords};
-pub use shadow::SHADOW_ROWS;
+pub use shadow::{ShadowCount, ShadowSide, SHADOW_ROWS};
 pub use sticky_sessions::{
     DecodeVerdict, SessionExpiry, SessionPins, SessionRule, SessionTable, SessionVerdict,
     ABSENT_WORKER_PIN_TTL_MICROS,

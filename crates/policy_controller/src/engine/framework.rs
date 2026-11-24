@@ -5741,8 +5741,8 @@ impl Engine {
     /// stage of it reads them, in the rows its decisions are named
     /// ([`Self::affinity_rows_cap`]) or, where it is named no row, in the
     /// column it is handed whole. The answer is of what the
-    /// build kept: a membership write asks it of every pool, and no stage
-    /// is asked again.
+    /// build kept: the in-process engine asks it as it reads a pool's
+    /// table, and no stage is asked again.
     #[cfg(any(test, feature = "in-process"))]
     pub(crate) fn reads_sent_for(&self, model: &str, phase: Phase) -> bool {
         self.needs.sent_prefixes
@@ -16423,6 +16423,62 @@ mod tests {
         prefills[0].health.healthy = false;
         let (answer, shown) = placed(8, &prefills, &decodes, &mut scratch);
         assert_eq!((answer, shown), (((1, 1), claimed(101)), vec![1, 2]));
+    }
+
+    /// Where a host states no first partners, a rule's prefill run is
+    /// shown the prefills of the classes that have an open partner, as
+    /// the profile's run is. A key pinned to a prefill whose class lost
+    /// its last open partner stands outside them: the rule places the key
+    /// again among the prefills that pair, and a new key is not placed on
+    /// that prefill though it is the idle one. Shown every class, the
+    /// rule would follow the pin to a prefill no decode partners, and the
+    /// key would find no pair.
+    ///
+    /// The classic router hands its policy the prefills with an open
+    /// partner alone (the candidates of `pair_pass` in
+    /// `model_gateway/src/routers/common/placement.rs`).
+    #[test]
+    fn a_rule_places_a_pairs_prefill_among_the_classes_with_an_open_partner() {
+        let engine = pair_session_engine(vec![least_requests_profile()], Assignment::Delegate);
+        let mut scratch = Scratch::new();
+        // Each prefill class pairs with the decode class of its own number.
+        let table = PairTable::new(&[1, 2], &[1, 2]);
+        // A side's two workers, of class 1 and of class 2, under ids from
+        // `first_id` on and the loads given.
+        let rows = |loads: [u32; 2], first_id: u64| -> Vec<Candidate> {
+            let mut rows = classed_rows(&[1, 2]);
+            for (row, load) in rows.iter_mut().zip(loads) {
+                (row.id, row.in_flight) = (WorkerId(first_id + u64::from(row.position)), load);
+            }
+            rows
+        };
+        // The idle worker of each side is the one of class 1.
+        let (prefills, mut decodes) = (rows([0, 5], 100), rows([0, 5], 200));
+        // The pair of `key`'s next request with its two verdicts, and the
+        // classes its prefill side was shown.
+        let placed = |key, decodes: &[Candidate], scratch: &mut Scratch| {
+            let pools = PairPools {
+                prefills: &prefills,
+                decodes,
+                table,
+                ..PairPools::default()
+            };
+            let answer = pair_placed_in(&engine, &pair_request(Some(key)), pools, scratch);
+            (answer, scratch.classes.clone())
+        };
+        let claim = DecodeVerdict::CLAIMED;
+        let claimed = |id| (SessionVerdict::Claimed(WorkerId(id)), claim);
+        // Both classes pair: the key is placed on the idle pair.
+        let (answer, shown) = placed(7, &decodes, &mut scratch);
+        assert_eq!((answer, shown), (((0, 0), claimed(100)), vec![1, 2]));
+        // Class 1 loses its one decode: its prefill is shown no more, and
+        // the key's pin stands on it.
+        decodes[0].health.healthy = false;
+        let (answer, shown) = placed(7, &decodes, &mut scratch);
+        assert_eq!((answer, shown), (((1, 1), claimed(101)), vec![2]));
+        // A new key is placed among the prefills that pair too.
+        let (answer, shown) = placed(8, &decodes, &mut scratch);
+        assert_eq!((answer, shown), (((1, 1), claimed(101)), vec![2]));
     }
 
     /// A side of a pair takes no turn of a list. Its request with no

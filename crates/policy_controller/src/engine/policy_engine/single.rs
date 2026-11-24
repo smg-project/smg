@@ -656,7 +656,7 @@ pub(crate) mod tests {
             },
             demands::{DemandFacts, Demands},
             framework::{Picker, Place, PoolWord, TieBand, DRAW_FROM},
-            list_cell::tests::PublishedList,
+            list_cell::PublishedList,
             prompt_hashes::HashSeeds,
             records::worker_id,
             view::{

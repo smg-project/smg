@@ -81,10 +81,9 @@ const ENCODE_SCOPE: &str = "encode-scope";
 /// its host states it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct EncoderFacts {
-    /// The encoder's encode class; `0` when it states no end. The store
-    /// numbers the classes from 1 over the whole pool as their first
-    /// encoder stands, and a gateway's view keeps the numbers of its rows:
-    /// a class may stand above the count of the rows a decision is handed.
+    /// The encoder's encode class; `0` when it states no end. Its host
+    /// numbers the classes from 1 over the encoders it lends, as their
+    /// first encoder stands.
     pub class: u32,
     /// Its registration states the pushing form, with its role or without.
     pub pushes: bool,

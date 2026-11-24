@@ -20,7 +20,7 @@ use crate::{
     engine::view::{Health, LoadRow, Role, WireModes, WorkerId},
     store::{
         identity, pairing::PairingDescriptor, BatchFacts, BatchOutcome, ContentHash, GatewayId,
-        HealthSink, Journal, KvEvent, KvEventSink, LeasesStore, LoadSink, LoadSource,
+        HealthSink, Journal, KvEventSink, LaneWriter, LeasesStore, LoadSink, LoadSource,
         MembershipChange, MembershipTail, MemoryStore, OutsideLists, Position, SequenceHash,
         Signals, StoreCheckpoint, StoredBlock, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus,
         WorkersStore,
@@ -148,12 +148,14 @@ fn every_journaled_entry_tells_one_event_in_the_stores_order() {
     store.set_term(5);
     let replaced = WorkersStore::get(&store, a).expect("the row");
     let b = store.upsert(facts(KEY, 2)).id();
-    // Three failed probes take a ready worker out; the first two move no
-    // status and tell nothing.
-    for _ in 0..3 {
-        store.probe_outcome(b, false, revision(&store, b), &|| true);
+    // A status write: one the row holds already tells nothing.
+    for status in [
+        WorkerStatus::Ready,
+        WorkerStatus::NotReady,
+        WorkerStatus::Ready,
+    ] {
+        store.set_status(b, status, revision(&store, b));
     }
-    store.connected(b, revision(&store, b), &|| true);
     let found = WorkersStore::get(&store, b).expect("the row");
     store.remove(b, found.revision);
 
@@ -344,14 +346,11 @@ fn a_watched_write_is_told_once_the_store_let_its_locks_go() {
     tells("a status", 1);
     let b = store.upsert(facts(KEY, 2)).id();
     tells("a replacement", 1);
-    // Three failed probes take a ready worker out: the first two move no
-    // status.
-    for _ in 0..3 {
-        store.probe_outcome(b, false, revision(&store, b), &|| true);
-    }
-    tells("a probe's outcome", 1);
-    store.connected(b, revision(&store, b), &|| true);
-    tells("a connection", 1);
+    // A status the row holds already tells nothing.
+    store.set_status(b, WorkerStatus::Ready, revision(&store, b));
+    tells("a status that stands", 0);
+    store.set_status(b, WorkerStatus::NotReady, revision(&store, b));
+    tells("a status that moves", 1);
     let stale = revision(&store, b) + 1;
     assert_eq!(store.remove(b, stale), None);
     store.set_term(1);
@@ -836,7 +835,7 @@ fn a_standbys_index_holds_a_lane_for_each_row_that_asks_for_events() {
     let b = leader.upsert(asks("http://b:8000", 1)).id();
     let quiet = leader.upsert(facts("http://quiet:8000", 1)).id();
     let lanes = |store: &MemoryStore, ids: &[WorkerId]| -> Vec<bool> {
-        let lane = |id: &WorkerId| store.lane_counts(*id, 0).is_some();
+        let lane = |id: &WorkerId| store.kv().holds_lane(*id, 0);
         ids.iter().map(lane).collect()
     };
     // Each read: the standby follows what the leader wrote since the last,
@@ -872,19 +871,25 @@ fn a_standbys_index_holds_a_lane_for_each_row_that_asks_for_events() {
     assert_eq!(lanes(&other, &[own, again, a]), [false, true, false]);
     // A row that stays through a restore keeps what this replica heard for
     // it: its lane's blocks are the replica's own, in no cut.
-    let heard: &dyn KvEventSink<Batch = [KvEvent]> = &other;
-    let block = [KvEvent::Stored {
-        parent: None,
-        blocks: vec![StoredBlock {
-            seq_hash: SequenceHash(1),
-            content_hash: ContentHash(2),
-        }],
+    let heard: &dyn KvEventSink = &other;
+    let block = [StoredBlock {
+        seq_hash: SequenceHash(1),
+        content_hash: ContentHash(2),
     }];
     let first = BatchFacts {
         sequence: 1,
         ..BatchFacts::default()
     };
-    assert_eq!(heard.admit(again, 0, first, &block), BatchOutcome::Applied);
+    let mut body = |lane: &mut LaneWriter<'_>| {
+        let mut map = std::mem::take(lane.map());
+        let placed = lane.stored(&block, None, &mut map);
+        *lane.map() = map;
+        placed.expect("stored");
+    };
+    assert_eq!(
+        heard.admit_through(again, 0, first, &mut body),
+        BatchOutcome::Applied
+    );
     assert_eq!(other.indexed_blocks(again, 0), 1);
     assert!(other.restore_from(leader.checkpoint()));
     assert_eq!(other.indexed_blocks(again, 0), 1, "the lane was made again");

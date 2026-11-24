@@ -1437,7 +1437,7 @@ mod over_lists {
         document::{AppliedSpec, PolicySpec, API_VERSION},
         engine::{
             decision_engine::{Request, RequestMaker, WorkerLists},
-            list_cell::tests::PublishedList,
+            list_cell::PublishedList,
             policy_engine::PolicyEngine,
             Candidate, Constraints, Live, RequestFacts,
         },

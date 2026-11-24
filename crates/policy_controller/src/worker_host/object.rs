@@ -257,8 +257,6 @@ mod tests {
         assert_eq!(thresholds(&Overload::default()), OverloadUpdate::default());
     }
 
-    /// The table, row by row: each fact the object carries reads back from
-    /// the field the table names, and what no row states stays unsaid.
     /// A threshold a row states as none is one on the object: its state
     /// machine moves a worker at the first outcome there, and never by a
     /// count of zero.
@@ -273,6 +271,8 @@ mod tests {
         assert_eq!((checks.failure_threshold, checks.success_threshold), (1, 1));
     }
 
+    /// The table, row by row: each fact the object carries reads back from
+    /// the field the table names, and what no row states stays unsaid.
     #[test]
     fn every_fact_the_table_carries_reads_back_from_the_objects_field() {
         let facts = WorkerFacts {
