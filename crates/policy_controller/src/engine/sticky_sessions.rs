@@ -595,12 +595,25 @@ impl SessionTable {
     /// moved. Two decisions that read one pin at its cap both front, the
     /// later one last, as their two commits do. No entry is made: a key
     /// the table holds no more, as an empty key, is left to the commit.
+    /// A move on an id its worker had before it was registered again
+    /// fronts the id that stands ([`Self::standing`]), as a dispatch on
+    /// that id does.
     pub(crate) fn respilled(&self, key: Session, target: WorkerId) {
         let key = key.get();
         if target == WorkerId(0) {
             return;
         }
         if let Some(entry) = self.shard(key).lock().get_mut(&key) {
+            // The decision read its rows ahead of this write. In neither
+            // pin, its worker may have been registered again between the
+            // two: the dispatch behind this move finds the worker pinned
+            // and asks the renames no more, so the move asks them here.
+            let renamed = self.renamed_len.load(Ordering::Relaxed) != 0;
+            let target = if renamed && !entry.pins.contains(&target) {
+                self.standing(target)
+            } else {
+                target
+            };
             entry.front(target);
         }
     }
@@ -2081,6 +2094,51 @@ mod tests {
         table.dispatched(s(2), SessionVerdict::Pinned, WorkerId(11));
         assert_eq!(table.pins(s(2)), Some([WorkerId(1), WorkerId(2)]));
         assert_eq!(table.renamed(), 2, "the two ids it left behind");
+    }
+
+    /// A decision reads its rows ahead of its move, and a worker may be
+    /// registered again between the two. The move fronts the id that
+    /// stands where the rename is over and where its walk has not reached
+    /// the key. A pin the walk has yet to rename leads under the id it
+    /// had, and the walk renames it there, as it renames a move made
+    /// ahead of the whole rename. The dispatch on the id the worker had
+    /// finds the pins in place, and no pin names an id no row holds.
+    #[test]
+    fn a_respills_move_on_the_id_a_worker_had_fronts_the_id_that_stands() {
+        let table = SessionTable::new(RULE.sweep_micros);
+        for key in [1, 2, 4] {
+            table.lookup(s(key), 10, &RULE);
+            table.dispatched(s(key), SessionVerdict::Pinned, WorkerId(2));
+        }
+        table.lookup(s(3), 10, &RULE);
+        table.dispatched(s(3), SessionVerdict::Pinned, WorkerId(4));
+        table.dispatched(s(3), SessionVerdict::Pinned, WorkerId(2));
+        assert_eq!(table.pins(s(3)), Some([WorkerId(2), WorkerId(4)]));
+        // The whole rename is ahead of the move.
+        table.rename_worker(WorkerId(1), WorkerId(11));
+        table.respilled(s(1), WorkerId(1));
+        assert_eq!(table.pins(s(1)), Some([WorkerId(11), WorkerId(2)]));
+        // The rename's first half: remembered, the shards not yet walked.
+        table.remember(WorkerId(3), WorkerId(13));
+        table.respilled(s(2), WorkerId(3));
+        assert_eq!(table.pins(s(2)), Some([WorkerId(13), WorkerId(2)]));
+        // The same half where the worker is the key's failover: its pin
+        // leads as it stands, and the walk renames it.
+        table.remember(WorkerId(4), WorkerId(14));
+        table.respilled(s(3), WorkerId(4));
+        assert_eq!(table.pins(s(3)), Some([WorkerId(4), WorkerId(2)]));
+        // The move is ahead of the whole rename.
+        table.respilled(s(4), WorkerId(5));
+        assert_eq!(table.pins(s(4)), Some([WorkerId(5), WorkerId(2)]));
+        for (had, stands) in [(3, 13), (4, 14), (5, 15)] {
+            table.rename_worker(WorkerId(had), WorkerId(stands));
+        }
+        for (key, had, stands) in [(1, 1, 11), (2, 3, 13), (3, 4, 14), (4, 5, 15)] {
+            let led = Some([WorkerId(stands), WorkerId(2)]);
+            assert_eq!(table.pins(s(key)), led, "key {key} behind the renames");
+            table.dispatched(s(key), SessionVerdict::Respill, WorkerId(had));
+            assert_eq!(table.pins(s(key)), led, "key {key} behind its dispatch");
+        }
     }
 
     /// A claim's commit elsewhere withdraws it inside a rename's walk too:

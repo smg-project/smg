@@ -20,7 +20,7 @@ use crate::{
         sticky_sessions::{self, Claim, SessionRule, SessionTable, SessionVerdict},
         view::{
             mean_in_flight, AffinityFacts, AffinityRows, Candidate, Constraints, LoadReportCutoff,
-            Phase, PoolFacts, RequestFacts, WorkerId,
+            Phase, PoolFacts, RequestFacts, Session, WorkerId,
         },
         warm_up::WarmUpRule,
     },
@@ -6377,7 +6377,7 @@ impl Engine {
                 if let Some(respilled) = self.respill(
                     profile, index, rule, placing, facts, pool, candidates, cx, buf, c.id,
                 ) {
-                    return self.moved::<WRITE_SESSIONS>(facts, respilled);
+                    return self.moved::<WRITE_SESSIONS>(key, respilled);
                 }
             }
             let mut targets = Targets::new();
@@ -6456,7 +6456,7 @@ impl Engine {
                             profile, index, rule, placing, facts, pool, set, cx, buf, all_vetoed,
                             first,
                         ) {
-                            return self.moved::<WRITE_SESSIONS>(facts, handed);
+                            return self.moved::<WRITE_SESSIONS>(key, handed);
                         }
                     }
                     return decision;
@@ -6522,7 +6522,7 @@ impl Engine {
                                     profile, index, rule, placing, facts, pool, set, cx, buf,
                                     all_vetoed, owner,
                                 ) {
-                                    return self.moved::<WRITE_SESSIONS>(facts, handed);
+                                    return self.moved::<WRITE_SESSIONS>(key, handed);
                                 }
                             }
                         }
@@ -6541,18 +6541,15 @@ impl Engine {
     /// follows the move there too. The live decision's alone: with
     /// `WRITE_SESSIONS` off the decision is a shadow's and writes no pin.
     /// A placement on the pin again, and one on another worker at the cap,
-    /// move no pin ([`Self::respill`]).
+    /// move no pin ([`Self::respill`]). `key` is the key the decision
+    /// looked up.
     #[inline]
-    fn moved<const WRITE_SESSIONS: bool>(
-        &self,
-        facts: &RequestFacts<'_>,
-        handed: Decision,
-    ) -> Decision {
+    fn moved<const WRITE_SESSIONS: bool>(&self, key: Session, handed: Decision) -> Decision {
         if WRITE_SESSIONS {
             if let Decision::Pick(pick) = &handed {
                 if pick.session_verdict == SessionVerdict::Respill {
                     if let Some(first) = pick.targets.first() {
-                        self.sessions.respilled(facts.session(), first.id);
+                        self.sessions.respilled(key, first.id);
                     }
                 }
             }
