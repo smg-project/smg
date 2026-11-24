@@ -558,6 +558,7 @@ pub(crate) mod tests {
             target: d0,
             picked: PickRecord::of_decodes(&targets),
             session: Session::NONE,
+            session_verdict: SessionVerdict::None,
             state: LeaseState::ISSUED,
             tokens: 0,
             target_index: 0,

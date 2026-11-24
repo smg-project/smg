@@ -3124,7 +3124,8 @@ struct Held {
     /// Whether the lease's sides book their keys' requests in flight, each
     /// on its worker's count ([`InFlightCounts::book`]): said once, where
     /// the lease is filed, so an end frees what the filing booked. A
-    /// decision's lease counts where [`MemoryStore::issue_keyed`] files it. A
+    /// decision's lease counts where [`MemoryStore::issue_keyed`] files it,
+    /// and a pair's decision always (`issue_decided_pair`). A
     /// record filed whole carries no such word and counts wherever it has
     /// a key: more than a cap reads, never less.
     keyed: bool,
@@ -4055,6 +4056,14 @@ impl MemoryStore {
     /// book, the prefill's first. `issued` hears the prefill and then the
     /// decode if it was issued. `Ok` is the prefill side's lease.
     ///
+    /// The lease counts for each side's key, under any sessions rule and
+    /// under none, as a keyed single's lease counts for its key
+    /// ([`Self::issue_keyed`]): each side books one request of its own
+    /// session on its worker while it lives, and a side with no session
+    /// books none. A decode side filed chosen books none until its issue
+    /// or its dispatch, and a decode call's side books the session its own
+    /// frame states, whatever the pair's first frame stated.
+    ///
     /// # Errors
     ///
     /// Those of [`Self::issue_decided`].
@@ -4066,7 +4075,7 @@ impl MemoryStore {
         [booked, decode]: [Option<WorkerSlot>; 2],
         issued: impl Fn(&crate::tracking::Lease),
     ) -> Result<crate::tracking::Lease, LeaseRefused> {
-        self.issue_minted(record, booked, Some((side, decode)), false, issued)
+        self.issue_minted(record, booked, Some((side, decode)), true, issued)
     }
 
     /// [`LeasesStore::issue_decode`] with the slot from the decision's world.
@@ -4091,8 +4100,9 @@ impl MemoryStore {
     /// sessions rule and under none: the lease books one request of its key
     /// on its worker until it leaves the file, whatever the decision did
     /// with the key's pin, and the worker's count of the key's requests
-    /// steps with the lease's own ([`InFlightCounts::book`]). The lease of
-    /// any other decision books no key.
+    /// steps with the lease's own ([`InFlightCounts::book`]). A pair's
+    /// decision counts for each side's key (`issue_decided_pair`). The
+    /// lease of any other decision books no key.
     ///
     /// # Errors
     ///

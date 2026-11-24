@@ -2018,9 +2018,9 @@ The asking gateway's reach, its wires and its standing vetoes are stated to the 
 of the list. A new document is a new engine object: its session pins and its record of sent
 prompts start empty, and that record is told no worker's leave. A sessions rule's cap reads a
 key's requests on the worker object too: the store steps that count for the lease of each keyed
-single request on file, with a sessions rule or with none, under the session's number written as
-text. The object's count of keys with a request in flight follows the same leases. A pair's lease
-counts for no key. A
+request on file, a single's on its worker and a pair's on each side's worker, with a sessions rule
+or with none, under the session's number written as text. The object's count of keys with a
+request in flight follows the same leases. A
 registration, a drain or a deregistration is on the worker objects when its call answers: a
 decision behind the acknowledgment reads the fleet the call left. A controller that starts over
 standing rows holds their worker objects before it serves.
@@ -2309,9 +2309,7 @@ Five things follow, and they are the first work of section 16.
    (decision 3). The other measures which tokens are in a prompt's head, which is then the
    caller's recipe: it is proven at stage 3, by a gateway test of classic's own function. The
    1 of `manual` replays as classic recorded now: a sessions rule with no cap runs on the two
-   sides of a pair, each side by its own session, where the host decides in process. A served
-   controller refuses the rule under a pair: its file of leases keeps one session verdict for
-   a pair's two sides. Each
+   sides of a pair, each side by its own session. Each
    of the 23 is made equal to classic or named as an accepted difference: two in stage 1, one
    at stage 3, the 20 in stage 4.
 3. **Five policies have no sheet over a healthy pool**: `round_robin`, `random`, `passthrough`,

@@ -2134,6 +2134,52 @@ fn a_call_issues_the_chosen_side_afresh_and_books_it_once() {
     );
 }
 
+/// A pair's decode side keeps its own session verdict on file, beside the
+/// prefill side's on the record's lease, and the side's lease states the
+/// side's own. A dispatch that moves the side to another target leaves the
+/// verdict as it was: a claim names the worker claimed at the issue. A
+/// call's issue files the call's verdict with its side.
+#[test]
+fn a_decode_side_keeps_its_own_session_verdict_on_file() {
+    let store = MemoryStore::new();
+    let [p, d0, d1] = ["http://p:1", "http://d0:1", "http://d1:1"].map(|key| ready(&store, key));
+    let leases: &dyn LeasesStore = &store;
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    leases.set_term(1);
+    let claimed = |id| Some(SessionVerdict::Claimed(id));
+    // What the file holds of the lease `id`: the side's verdict, then the
+    // one each side's lease states.
+    let verdicts = |id: u64| {
+        let filed = leases.sides(gateway, LeaseId(id)).expect("on file");
+        let stated = |side| filed.side(side).map(|(lease, _)| lease.session_verdict);
+        let kept = filed.decode.map(|side| side.session_verdict);
+        [kept, stated(Side::Prefill), stated(Side::Decode)]
+    };
+    let (mut record, mut decode) = pair(1, p, &[d0, d1], now);
+    record.lease.session_verdict = SessionVerdict::Claimed(p);
+    decode.session_verdict = SessionVerdict::Claimed(d0);
+    issue_pair(leases, (record, decode)).expect("the key is free");
+    let own = [claimed(d0), claimed(p), claimed(d0)];
+    assert_eq!(verdicts(1), own);
+    assert!(leases.dispatched(gateway, LeaseId(1), on(Side::Decode, 1), now));
+    let moved = leases.sides(gateway, LeaseId(1)).expect("on file").decode;
+    assert_eq!(moved.map(|side| side.target), Some(d1));
+    assert_eq!(verdicts(1), own, "the worker claimed at the issue");
+
+    let (mut record, mut chosen) = chosen_pair(2, p, &[d0], now);
+    record.lease.session_verdict = SessionVerdict::Claimed(p);
+    chosen.session_verdict = SessionVerdict::Claimed(d0);
+    issue_pair(leases, (record, chosen)).expect("the key is free");
+    assert!(leases.dispatched(gateway, LeaseId(2), on(Side::Prefill, 0), now));
+    let call = DecodeSide {
+        session_verdict: SessionVerdict::Pinned,
+        ..decode_side(d0)
+    };
+    assert_eq!(leases.issue_decode(gateway, LeaseId(2), call, now), Ok(()));
+    let pinned = Some(SessionVerdict::Pinned);
+    assert_eq!(verdicts(2), [pinned, claimed(p), pinned]);
+}
+
 #[test]
 fn the_call_starts_the_dispatch_deadline_again() {
     let store = MemoryStore::new();
@@ -3018,6 +3064,7 @@ fn decode_side(target: WorkerId) -> DecodeSide {
         target,
         picked: PickRecord::default(),
         session: Session::NONE,
+        session_verdict: SessionVerdict::None,
         state: LeaseState::ISSUED,
         tokens: 0,
         target_index: 0,
