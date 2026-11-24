@@ -63,7 +63,9 @@ pub(crate) mod with_shadow;
 use std::{
     cell::{Cell, RefCell},
     collections::BTreeMap,
-    mem, ptr,
+    mem,
+    num::NonZeroU64,
+    ptr,
     rc::Rc,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -483,6 +485,9 @@ struct Reported {
     /// document declares, by position. Empty under a document none of
     /// whose stages reads a signal.
     cells: SignalCells,
+    /// The number these rows are known by ([`serial`]): what a thread's
+    /// rows name them by where they were copied from them ([`Standing`]).
+    serial: NonZeroU64,
 }
 
 impl Reported {
@@ -566,6 +571,8 @@ pub struct PoolRecords {
     /// How many times the list's reports were converted: once a snapshot
     /// a decision wrote every record under, or the list's draws paid for.
     conversions: AtomicU64,
+    /// The number the list's fixed rows are known by ([`serial`]).
+    serial: NonZeroU64,
 }
 
 impl PoolRecords {
@@ -686,6 +693,7 @@ impl PoolRecords {
             reported: ArcSwapOption::empty(),
             converting: Mutex::new(LookUps::default()),
             conversions: AtomicU64::new(0),
+            serial: serial(),
         }
     }
 
@@ -919,12 +927,41 @@ impl PoolRecords {
         live: &Live<'f>,
         rows: &'a mut Vec<Candidate>,
     ) -> (&'a mut [Candidate], PoolFacts<'f>) {
+        // A caller's own buffer: no rows stand in it.
+        self.write_over::<false>(workers, live, rows, &mut Standing::default())
+    }
+
+    /// [`Self::write`] into `rows`, where `stands` says which rows they
+    /// hold since the write before ([`Standing`]).
+    ///
+    /// Where they are this decision's own, copied from the rows it would
+    /// copy now and carrying the counts it reads, the copied half stands:
+    /// what the worker object says and the report's age are written over
+    /// it in place, and no row is copied. Every other write is the whole
+    /// one, and names its rows in `stands` before it writes them: rows cut
+    /// short by an unwinding read are too few for their list, and are
+    /// written whole again.
+    ///
+    /// `KEEPS` is whether the buffer keeps its rows between writes. One
+    /// that does not is never asked what stands in it: its write is
+    /// compiled as the whole one alone.
+    fn write_over<'a, 'f, const KEEPS: bool>(
+        &'f self,
+        workers: &[Arc<dyn Worker>],
+        live: &Live<'f>,
+        rows: &'a mut Vec<Candidate>,
+        stands: &mut Standing,
+    ) -> (&'a mut [Candidate], PoolFacts<'f>) {
         debug_assert_eq!(
             workers.len(),
             self.fixed.len(),
             "the records are those of the list they are written from"
         );
-        rows.clear();
+        let of = |source| Standing {
+            source: Some(source),
+            keyed: live.counted_key.is_some(),
+            sessions: live.sessions,
+        };
         let reported = match live.loads {
             Some(loads) => {
                 let held = self.reported.load();
@@ -940,18 +977,33 @@ impl PoolRecords {
                 };
                 match reported {
                     Some(reported) => {
-                        rows.extend(reported.rows.iter().zip(workers).map(|(reported, worker)| {
-                            let mut row = *reported;
-                            live.object(worker.as_ref(), &mut row);
-                            live.age(&mut row);
-                            row
-                        }));
+                        let of = of(reported.serial);
+                        if KEEPS && *stands == of && rows.len() == workers.len() {
+                            for (row, worker) in rows.iter_mut().zip(workers) {
+                                live.object(worker.as_ref(), row);
+                                live.age(row);
+                            }
+                        } else {
+                            *stands = of;
+                            rows.clear();
+                            rows.extend(reported.rows.iter().zip(workers).map(
+                                |(reported, worker)| {
+                                    let mut row = *reported;
+                                    live.object(worker.as_ref(), &mut row);
+                                    live.age(&mut row);
+                                    row
+                                },
+                            ));
+                        }
                         reported.all
                     }
                     // Another decision is converting, or this one holds a
                     // snapshot no newer than the list's rows: its own
-                    // snapshot's reports, read worker by worker.
+                    // snapshot's reports, read worker by worker. They are
+                    // no rows another decision copies from: none stand.
                     None => {
+                        *stands = Standing::default();
+                        rows.clear();
                         let mut all = true;
                         rows.extend(self.fixed.iter().zip(workers).map(|(fixed, worker)| {
                             let mut row = *fixed;
@@ -964,11 +1016,20 @@ impl PoolRecords {
             }
             // No snapshot: no worker carries a report.
             None => {
-                rows.extend(self.fixed.iter().zip(workers).map(|(fixed, worker)| {
-                    let mut row = *fixed;
-                    live.object(worker.as_ref(), &mut row);
-                    row
-                }));
+                let of = of(self.serial);
+                if KEEPS && *stands == of && rows.len() == workers.len() {
+                    for (row, worker) in rows.iter_mut().zip(workers) {
+                        live.object(worker.as_ref(), row);
+                    }
+                } else {
+                    *stands = of;
+                    rows.clear();
+                    rows.extend(self.fixed.iter().zip(workers).map(|(fixed, worker)| {
+                        let mut row = *fixed;
+                        live.object(worker.as_ref(), &mut row);
+                        row
+                    }));
+                }
                 self.fixed.is_empty()
             }
         };
@@ -1052,6 +1113,7 @@ impl PoolRecords {
             rows,
             all,
             cells,
+            serial: serial(),
         });
         self.reported.store(Some(Arc::clone(&converted)));
         self.conversions.fetch_add(1, Ordering::Relaxed);
@@ -1399,11 +1461,43 @@ fn engines_of(workers: &[Arc<dyn Worker>], fixed: &mut [Candidate]) -> (Box<[u32
     (rows.into(), ends.into())
 }
 
+/// A number no other rows of the process are known by: a list's fixed rows
+/// take one where the list is made, and its rows of one snapshot take one
+/// where they are converted. Never on the way of a decision that converts
+/// nothing.
+fn serial() -> NonZeroU64 {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    NonZeroU64::MIN.saturating_add(NEXT.fetch_add(1, Ordering::Relaxed))
+}
+
+/// Which rows a buffer holds since the whole write before
+/// ([`PoolRecords::write_over`]): the rows they were copied from, and the
+/// counts of sessions they carry. A decision that would copy from the same
+/// rows and reads the same counts writes what the worker objects say over
+/// them, and copies nothing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Standing {
+    /// The rows they were copied from, by their number ([`serial`]): a
+    /// list's fixed rows or its rows of one snapshot. None where no rows
+    /// stand.
+    source: Option<NonZeroU64>,
+    /// Whether they carry the session key's count of requests in flight,
+    /// and the count of session keys: a decision that reads neither is
+    /// handed zero in both, which only the copy puts back.
+    keyed: bool,
+    sessions: bool,
+}
+
 /// What one thread keeps for its decisions over records: the records and
 /// the engine's scratch.
 #[derive(Debug, Default)]
 struct Buffers {
+    /// The rows a draw asks about, written one by one.
     rows: Vec<Candidate>,
+    /// Every row of the list the thread wrote whole last, kept between its
+    /// decisions, and which rows they are.
+    whole: Vec<Candidate>,
+    stands: Standing,
     scratch: Scratch,
 }
 
@@ -1459,7 +1553,12 @@ pub fn decide(
     facts.now_micros = live.now_micros;
     let facts = &*facts;
     let decide = |buffers: &mut Buffers| {
-        let Buffers { rows, scratch } = buffers;
+        let Buffers {
+            rows,
+            whole,
+            stands,
+            scratch,
+        } = buffers;
         // No record says yet whether it carries a report: a draw reads that
         // fact of no pool.
         let unsaid = pool.facts(live, false);
@@ -1483,7 +1582,7 @@ pub fn decide(
             singly.paid();
             return decision;
         }
-        let (rows, pool_facts) = pool.write(workers, live, rows);
+        let (rows, pool_facts) = pool.write_over::<true>(workers, live, whole, stands);
         let written;
         let cx = if cx.stalled.is_empty() {
             cx
