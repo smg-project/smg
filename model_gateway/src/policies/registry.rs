@@ -300,7 +300,7 @@ pub struct PolicyRegistry {
     engine: Arc<OnceLock<&'static InProcess>>,
 
     /// The token trees Grand Central is lent, where its start asked
-    /// for them ([`Self::lend_token_trees`]). A worker the registry lost is
+    /// for them ([`Self::lend_trees`]). A worker the registry lost is
     /// taken out of them by their own task
     /// ([`LentTrees::follow_removals`]).
     lent_trees: Arc<OnceLock<Arc<LentTrees>>>,
@@ -916,7 +916,7 @@ impl PolicyRegistry {
         self.supplied_document
     }
 
-    /// The token trees Grand Central is lent, made at the first call
+    /// The trees Grand Central is lent, made at the first call
     /// under the numbers of `document`, the document the engine runs, whose
     /// block size is `page` tokens ([`LentTrees::of_document`]), and kept
     /// here. The engine's start calls it, and only where its document reads
@@ -928,7 +928,7 @@ impl PolicyRegistry {
     /// call is made on. The start runs on one, the engine's own task needs
     /// it. Where none is entered no task is started, nothing takes a worker
     /// out of the trees, and a debug line says so.
-    pub(crate) fn lend_token_trees(
+    pub(crate) fn lend_trees(
         &self,
         document: &PolicySpec,
         page: u32,
@@ -938,7 +938,7 @@ impl PolicyRegistry {
             let trees = Arc::new(LentTrees::of_document(document.clone(), page));
             match tokio::runtime::Handle::try_current() {
                 Ok(runtime) => trees.follow_removals(workers, &runtime),
-                Err(_) => debug!("No runtime is entered: no task takes a worker that leaves out of the lent token trees"),
+                Err(_) => debug!("No runtime is entered: no task takes a worker that leaves out of the lent trees"),
             }
             trees
         };
@@ -3736,10 +3736,10 @@ mod tests {
             workers.register(ready_worker(url, "llama-3"));
         }
         assert!(registry.lent_trees().is_none());
-        let trees = registry.lend_token_trees(&document, 8, &workers);
+        let trees = registry.lend_trees(&document, 8, &workers);
         assert!(Arc::ptr_eq(
             &trees,
-            &registry.lend_token_trees(&document, 8, &workers)
+            &registry.lend_trees(&document, 8, &workers)
         ));
         let tokens: Vec<u32> = (0..64).collect();
         let tree = trees.token_tree("llama-3");

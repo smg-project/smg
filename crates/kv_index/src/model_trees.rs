@@ -105,6 +105,15 @@ impl ModelTrees {
             .collect()
     }
 
+    /// Every model's string tree, copied out as [`Self::token_trees`]
+    /// copies the token trees.
+    pub fn string_trees(&self) -> Vec<Arc<Tree>> {
+        self.string_trees
+            .iter()
+            .map(|tree| Arc::clone(tree.value()))
+            .collect()
+    }
+
     /// Inserts the empty prompt for `tenant` in the two trees of `model_id`,
     /// making them where the model is new. The string tree then holds the
     /// tenant at its root and routes to it before it has served a request.
@@ -210,6 +219,20 @@ mod tests {
         let made = [trees.token_tree_or_new("a"), trees.token_tree_or_new("b")];
 
         let handed = trees.token_trees();
+        assert_eq!(handed.len(), 2);
+        for tree in &made {
+            assert!(handed.iter().any(|other| Arc::ptr_eq(other, tree)));
+        }
+    }
+
+    #[test]
+    fn every_models_string_tree_is_handed_out_and_no_token_tree() {
+        let trees = ModelTrees::new(4);
+        assert!(trees.string_trees().is_empty());
+        trees.token_tree_or_new("c");
+        let made = [trees.string_tree_or_new("a"), trees.string_tree_or_new("b")];
+
+        let handed = trees.string_trees();
         assert_eq!(handed.len(), 2);
         for tree in &made {
             assert!(handed.iter().any(|other| Arc::ptr_eq(other, tree)));

@@ -118,6 +118,8 @@ use smg_worker::{
 };
 use tracing::{debug, error, warn};
 
+#[cfg(test)]
+use super::TEXT_MARKER_LEN;
 use super::{
     cost::{
         self, CandidateInputs, OptimisticAccounting, Pick, RequestInputs, WorkerSelectionPolicy,
@@ -126,7 +128,7 @@ use super::{
     prefix_hash::CHARS_PER_TOKEN,
     utils::PeriodicTask,
     CacheAwareConfig, CacheNamespace, LeastLoadPolicy, LoadBalancingPolicy, NamedList,
-    SelectWorkerInfo, WorkerRole, TEXT_MARKER_LEN,
+    SelectWorkerInfo, WorkerRole,
 };
 use crate::{
     config::CacheIndexKind,
@@ -499,13 +501,11 @@ impl CacheAwarePolicy {
     }
 
     /// The string tree's key for `text` and the length of the marker at its
-    /// head: the rule of [`Self::keyed_tokens`], in chars.
+    /// head: the one rule ([`CacheNamespace::keyed_text`]), which the
+    /// placement inputs name a request's entry in a lent string tree by.
     #[inline]
-    fn keyed_text<'a>(info: &SelectWorkerInfo, text: &'a str) -> (Cow<'a, str>, usize) {
-        match info.cache_namespace {
-            Some(namespace) => (Cow::Owned(namespace.prefixed_text(text)), TEXT_MARKER_LEN),
-            None => (Cow::Borrowed(CacheNamespace::unpartitioned_text(text)), 0),
-        }
+    pub(crate) fn keyed_text<'a>(info: &SelectWorkerInfo, text: &'a str) -> (Cow<'a, str>, usize) {
+        CacheNamespace::keyed_text(info.cache_namespace, text)
     }
 
     /// Hash mode's key material: a namespaced request's tokens as sent (its

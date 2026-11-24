@@ -117,8 +117,8 @@ use parking_lot::{Condvar, Mutex};
 use smg_grand_central::{
     document::{AppliedSpec, PolicySpec, RulePlaced, ShadowSpec},
     engine::{
-        Constraints, Decided, FixedFacts, Identity, InProcess, Phase, Plain, PublishedList,
-        Request, RequestFacts, RequestMaker, TokenEntry, TokenKey, WorkerId, WorkerLists,
+        Constraints, Decided, FixedFacts, Identity, InProcess, Phase, Plain, PromptEntry,
+        PublishedList, Request, RequestFacts, RequestMaker, TokenKey, WorkerId, WorkerLists,
     },
     policies::{
         consistent_hashing::{Head, LentRing},

@@ -382,6 +382,44 @@ pub mod bench_support {
         Some(went)
     }
 
+    /// [`route_classic`] for a request that holds its prompt as text and no
+    /// token ids, as a request the HTTP router did not tokenize does. A
+    /// function of its own, so that a request of token ids runs the code it
+    /// ran before this one.
+    pub fn route_text(
+        registry: &WorkerRegistry,
+        policies: &PolicyRegistry,
+        model: &str,
+        route: Route,
+        text: &str,
+        headers: Option<&HeaderMap>,
+    ) -> Option<usize> {
+        let pool = route.pool();
+        let inputs = PlacementInputs {
+            text: Some(text),
+            headers,
+            ..Default::default()
+        };
+        let worker = select_single(
+            registry,
+            policies,
+            model,
+            pool,
+            None,
+            inputs,
+            Stated::nothing,
+        )?;
+        let shed =
+            overload::shed_if_worker_overloaded(&*worker, model, registry.overload_shed_enabled());
+        if shed.is_some() {
+            return None;
+        }
+        let went = placed_on(worker.worker());
+        let guard = worker.into_guard(policies.sticky_key(headers, None));
+        drop(guard);
+        Some(went)
+    }
+
     /// One request's routing through a pair gateway's classic placement
     /// on the gRPC wire: the pair index of the model's snapshot, the pair
     /// placed over it by the registry's two side policies, and each side's

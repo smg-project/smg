@@ -33,7 +33,7 @@ impl<'a> Entry<'a> {
     }
 }
 
-impl TokenEntry for Entry<'_> {
+impl PromptEntry for Entry<'_> {
     fn token_key(&self, _: usize) -> Option<TokenKey<'_>> {
         self.asked.set(self.asked.get() + 1);
         Some(TokenKey {
@@ -51,7 +51,7 @@ struct Words<'a> {
     asked: Cell<u32>,
 }
 
-impl TokenEntry for Words<'_> {
+impl PromptEntry for Words<'_> {
     fn token_key(&self, _: usize) -> Option<TokenKey<'_>> {
         None
     }

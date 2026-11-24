@@ -1,4 +1,5 @@
-//! The token trees a gateway lends Grand Central.
+//! The trees a gateway lends Grand Central: a model's token tree, and
+//! its string tree for the prompts sent as text.
 //!
 //! Where Grand Central places every request no classic policy object is
 //! made, so no policy keeps the trees of the prompts this process sent. The
@@ -6,9 +7,12 @@
 //! ([`LentTrees`]), and only where the document in force reads the prefixes
 //! sent to each worker. The owner keeps the trees in the store type the
 //! classic policy keeps its own in, under the document's own numbers: its
-//! block size is a tree's page, and a model's `index` entry states the size
-//! its tree is held to and how often. The classic policy's own pass holds a
-//! tree to that size. A worker the registry lost is taken out of the trees
+//! block size is a token tree's page, and a model's `index` entry states
+//! the size its trees are held to and how often. The one size holds a token
+//! tree in tokens and a string tree in its own unit, its chars and a weight
+//! for each node a worker stands on, as the classic policy's one setting
+//! does, and the classic policy's own pass holds a tree to it. A
+//! worker the registry lost is taken out of the trees
 //! by the owner's own task, which follows the registry's events
 //! ([`LentTrees::follow_removals`]): the registry sends one for every
 //! removal, so a worker a mesh peer's word took away leaves the trees as
@@ -17,11 +21,11 @@
 //!
 //! The engine is handed one object for what this process knows of its
 //! workers' caches ([`EngineCaches`]): the cache-event monitor's indexes and
-//! these trees.
+//! these trees, each to a single request's decision alone.
 
 use std::sync::Arc;
 
-use kv_index::{ModelTrees, TenantId, TokenTree};
+use kv_index::{ModelTrees, TenantId, TokenTree, Tree as StringTree};
 use parking_lot::Mutex;
 use smg_grand_central::{
     document::{IndexSpec, PolicySpec},
@@ -40,13 +44,14 @@ use super::{
 };
 use crate::routers::common::snapshot::WorkerRegistry;
 
-/// The owner of the token trees Grand Central is lent, one a model.
+/// The owner of the trees Grand Central is lent: a token tree and a
+/// string tree a model.
 #[derive(Debug)]
 pub(crate) struct LentTrees {
     /// The document the engine runs: a model's `index` entry sizes its
-    /// tree ([`PolicySpec::index_for`]).
+    /// trees ([`PolicySpec::index_for`]).
     document: PolicySpec,
-    /// A tree's page in tokens: the document's block size.
+    /// A token tree's page in tokens: the document's block size.
     page: usize,
     /// One store for each size and cadence the models asked so far take.
     stores: Mutex<Vec<SizedTrees>>,
@@ -64,8 +69,10 @@ struct SizedTrees {
 }
 
 impl SizedTrees {
-    /// A store of trees of `page` tokens a page, held to `max_size` tokens
-    /// by the classic policy's pass every `sweep_s` seconds. The document's
+    /// A store of trees, a token tree of `page` tokens a page, each held to
+    /// `max_size` by the classic policy's pass every `sweep_s` seconds: a
+    /// token tree to that many tokens, a string tree to that size in its
+    /// own unit (its chars and a weight for each node). The document's
     /// longest cadence spawns no pass: it says a tree that is never trimmed,
     /// which the routing settings' interval of zero is written as, and the
     /// classic policy runs no pass at that interval.
@@ -102,10 +109,27 @@ impl LentTrees {
 
     /// The token tree of `model`, made at its first ask: every later ask is
     /// handed the same tree. It stands with the trees of its size and its
-    /// cadence: the model's `index` entry of the document, or the entry's
-    /// defaults where the document writes none for it. The engine asks when
-    /// it builds a model's table, not for a request.
+    /// cadence ([`Self::store_of`]). The engine asks when it builds a
+    /// model's table, not for a request.
     pub(crate) fn token_tree(&self, model: &str) -> Arc<TokenTree> {
+        self.store_of(model)
+            .token_tree_or_new(normalize_model_key(model))
+    }
+
+    /// The string tree of `model`, for the prompts sent as text: made at
+    /// its first ask, handed again at every later one, and kept in the
+    /// store that keeps the model's token tree. The engine asks when it
+    /// builds a model's table, whatever the model's index holds.
+    pub(crate) fn string_tree(&self, model: &str) -> Arc<StringTree> {
+        self.store_of(model)
+            .string_tree_or_new(normalize_model_key(model))
+    }
+
+    /// The store of the trees of `model`'s size and cadence, made at the
+    /// first ask for a tree of that size and cadence: the model's `index`
+    /// entry of the document, or the entry's defaults where the document
+    /// writes none for it.
+    fn store_of(&self, model: &str) -> Arc<ModelTrees> {
         let entry = self.document.index_for(model);
         let (max_size, sweep_s) = entry.map_or_else(
             || {
@@ -122,9 +146,7 @@ impl LentTrees {
             stores.push(SizedTrees::new(self.page, max_size, sweep_s));
             stores.len() - 1
         });
-        stores[at]
-            .trees
-            .token_tree_or_new(normalize_model_key(model))
+        Arc::clone(&stores[at].trees)
     }
 
     /// Starts the task that takes a worker the registry lost out of the
@@ -171,7 +193,7 @@ impl LentTrees {
                 // alone bounds the trees from here on.
                 if let Err(ended) = purge.await {
                     if ended.is_panic() {
-                        error!("A purge of the lent token trees panicked: no worker that leaves is taken out of them from here on");
+                        error!("A purge of the lent trees panicked: no worker that leaves is taken out of them from here on");
                     }
                     return;
                 }
@@ -195,7 +217,8 @@ impl LentTrees {
     /// that was heard tells the two apart: the registry's word keeps no
     /// address. The trees fill again from the requests that follow.
     ///
-    /// The trees are emptied by the size pass's own call, at no size
+    /// The trees are emptied by the size pass's own call, at no size, of
+    /// one name on a token tree and on a string tree
     /// ([`TokenTree::evict_tenant_by_size`]): one pass, where a purge by
     /// name walks a tree once for each address. The call takes one leaf
     /// out at a time and debits it from its worker. A prompt a request
@@ -208,7 +231,7 @@ impl LentTrees {
     fn forget_the_removed(&self, left: &Left) {
         if left.unheard > 0 {
             warn!(
-                "{} events of the worker registry went unheard: the lent token trees are emptied, and cache_aware remembers no prompt until they fill again",
+                "{} events of the worker registry went unheard: the lent trees are emptied, and cache_aware remembers no prompt until they fill again",
                 left.unheard
             );
         }
@@ -223,17 +246,16 @@ impl LentTrees {
             .map(|store| Arc::clone(&store.trees))
             .collect();
         for tree in stores.iter().flat_map(|trees| trees.token_trees()) {
-            if left.unheard > 0 {
-                // A tree's own `clear` asks for no writer beside it. This
-                // call may run beside the size pass's own: the second of
-                // the two to take a worker out of a node debits nothing.
-                tree.evict_tenant_by_size(0);
-            }
-            // Behind an eviction a named address's count reads zero, and
-            // the purge drops its entries alone.
-            for address in &left.addresses {
-                tree.remove_tenant_all(&TenantId::from(address.as_str()));
-            }
+            left.purge(
+                || tree.evict_tenant_by_size(0),
+                |worker| tree.remove_tenant_all(worker),
+            );
+        }
+        for tree in stores.iter().flat_map(|trees| trees.string_trees()) {
+            left.purge(
+                || tree.evict_tenant_by_size(0),
+                |worker| tree.remove_tenant_all(worker),
+            );
         }
     }
 }
@@ -262,11 +284,26 @@ impl Left {
     fn asks_for_a_purge(&self) -> bool {
         self.unheard > 0 || !self.addresses.is_empty()
     }
+
+    /// The purge of one tree, of either kind: `empty` is the tree's size
+    /// pass at no size, and `forget` its purge of one worker by name.
+    fn purge(&self, empty: impl FnOnce(), forget: impl Fn(&TenantId)) {
+        if self.unheard > 0 {
+            // A tree's own `clear` asks for no writer beside it. This
+            // call may run beside the size pass's own: the second of
+            // the two to take a worker out of a node debits nothing.
+            empty();
+        }
+        // Behind an eviction a named address's count reads zero, and
+        // the purge drops its entries alone.
+        for address in &self.addresses {
+            forget(&TenantId::from(address.as_str()));
+        }
+    }
 }
 
 /// What a gateway answers Grand Central of its workers' caches, as one
-/// object: the indexes of the cache-event monitor, and the token trees it
-/// lends.
+/// object: the indexes of the cache-event monitor, and the trees it lends.
 pub(crate) struct EngineCaches {
     /// The cache-event monitor, where the process keeps one.
     events: Option<Arc<KvEventMonitor>>,
@@ -299,6 +336,16 @@ impl CacheIndexes for EngineCaches {
     fn token_tree(&self, model: &str, phase: Phase) -> Option<Arc<TokenTree>> {
         match phase {
             Phase::Single => Some(self.trees.as_ref()?.token_tree(model)),
+            Phase::Prefill | Phase::Decode | Phase::Encode => None,
+        }
+    }
+
+    /// The string tree of a single request's model, for a request this
+    /// gateway holds as text. A pair's sides are lent none, as they are
+    /// lent no token tree.
+    fn string_tree(&self, model: &str, phase: Phase) -> Option<Arc<StringTree>> {
+        match phase {
+            Phase::Single => Some(self.trees.as_ref()?.string_tree(model)),
             Phase::Prefill | Phase::Decode | Phase::Encode => None,
         }
     }
@@ -351,16 +398,19 @@ mod tests {
         }
     }
 
-    /// The workers `model`'s tree holds a prompt for, sorted: a worker it
-    /// lists at no tokens holds none.
-    fn held(trees: &LentTrees, model: &str) -> Vec<String> {
-        let counts = trees.token_tree(model).get_tenant_token_counts();
-        let mut workers: Vec<String> = counts
-            .into_iter()
-            .filter_map(|(worker, tokens)| (tokens > 0).then_some(worker))
-            .collect();
-        workers.sort();
-        workers
+    /// Whether each of `model`'s two trees holds a prompt for `workers` and
+    /// for no other worker: one a tree lists at no size holds none.
+    fn holds(trees: &LentTrees, model: &str, workers: &[&str]) -> bool {
+        let named = |sizes: HashMap<String, usize>| {
+            let mut held: Vec<String> = sizes
+                .into_iter()
+                .filter_map(|(worker, size)| (size > 0).then_some(worker))
+                .collect();
+            held.sort();
+            held == workers
+        };
+        named(trees.token_tree(model).get_tenant_token_counts())
+            && named(trees.string_tree(model).get_tenant_char_count())
     }
 
     /// Eight prompts of 64 tokens for one worker: 512 tokens in `model`'s
@@ -375,6 +425,21 @@ mod tests {
         tree
     }
 
+    /// What one of `worded`'s texts counts in a string tree: its 64 chars
+    /// and 1,024 for the node it makes.
+    const TEXT_NODE: usize = 1_088;
+
+    /// Eight texts of 64 chars for one worker, none beginning as another:
+    /// eight nodes in `model`'s string tree.
+    fn worded(trees: &LentTrees, model: &str) -> Arc<StringTree> {
+        let tree = trees.string_tree(model);
+        for text in 0..8_u32 {
+            tree.insert_text(&format!("{text}{}", "x".repeat(63)), "http://a:1");
+        }
+        assert_eq!(tree.total_char_size(), 8 * TEXT_NODE);
+        tree
+    }
+
     /// A tree's page is the block size the owner was made with: the
     /// document's, as the start reads it.
     #[test]
@@ -384,14 +449,25 @@ mod tests {
         assert_eq!(trees.token_tree("another").page_size(), 8);
     }
 
-    /// A model is handed one tree, at its first ask and at every later one,
-    /// and another model another.
+    /// A model is handed one tree of each kind, at its first ask and at
+    /// every later one, and another model another. The two trees of a model
+    /// stand in one store.
     #[test]
     fn a_model_is_handed_one_tree() {
         let trees = owner(document(1_000, 0));
         let first = trees.token_tree(MODEL);
         assert!(Arc::ptr_eq(&first, &trees.token_tree(MODEL)));
         assert!(!Arc::ptr_eq(&first, &trees.token_tree("another")));
+        let words = trees.string_tree(MODEL);
+        assert!(Arc::ptr_eq(&words, &trees.string_tree(MODEL)));
+        assert!(!Arc::ptr_eq(&words, &trees.string_tree("another")));
+        let stores = trees.stores.lock();
+        assert_eq!(stores.len(), 1, "one size and one cadence");
+        let counts = &stores[0].trees;
+        assert_eq!(
+            (counts.token_tree_count(), counts.string_tree_count()),
+            (2, 2)
+        );
     }
 
     /// A model named by the empty name is kept under the name the classic
@@ -401,10 +477,15 @@ mod tests {
         let trees = owner(document(1_000, 0));
         let unnamed = trees.token_tree("");
         assert!(Arc::ptr_eq(&unnamed, &trees.token_tree(UNKNOWN_MODEL_ID)));
+        let words = trees.string_tree("");
+        assert!(Arc::ptr_eq(&words, &trees.string_tree(UNKNOWN_MODEL_ID)));
         let stores = trees.stores.lock();
         let kept = stores[0].trees.token_tree(UNKNOWN_MODEL_ID);
         assert!(Arc::ptr_eq(&unnamed, &kept.expect("under the normal name")));
         assert!(stores[0].trees.token_tree("").is_none());
+        let kept = stores[0].trees.string_tree(UNKNOWN_MODEL_ID);
+        assert!(Arc::ptr_eq(&words, &kept.expect("under the normal name")));
+        assert!(stores[0].trees.string_tree("").is_none());
     }
 
     /// A model the document writes no `index` entry for takes the entry's
@@ -494,12 +575,17 @@ mod tests {
         assert!(!Left::default().asks_for_a_purge());
     }
 
-    /// One prompt of 64 tokens sent to each of `workers`, in `model`'s tree.
+    /// A text of 64 chars, as a prompt sent as text.
+    const TEXT: &str = "a prompt of sixty-four chars, sent as text to the workers named.";
+
+    /// One prompt of 64 tokens sent to each of `workers` in `model`'s token
+    /// tree, and one text of 64 chars in its string tree.
     fn sent(trees: &LentTrees, model: &str, workers: &[&str]) {
         let tokens: Vec<u32> = (0..64).collect();
-        let tree = trees.token_tree(model);
+        let (tree, words) = (trees.token_tree(model), trees.string_tree(model));
         for worker in workers {
             tree.insert_tokens(&tokens, worker);
+            words.insert_text(TEXT, worker);
         }
     }
 
@@ -543,15 +629,16 @@ mod tests {
 
         let tombstone = registry.remove_remote(&imported);
         tombstone.expect("the removal a peer's tombstone makes");
+        assert!(holds(&trees, MODEL, &all) && holds(&trees, "another", &all));
         let left = ["http://a:1", "http://b:1"];
         until("the purge behind a peer's tombstone", || {
-            held(&trees, MODEL) == left && held(&trees, "another") == left
+            holds(&trees, MODEL, &left) && holds(&trees, "another", &left)
         })
         .await;
 
         registry.remove_by_url("http://b:1").expect("the removal");
         until("the purge behind a removal of this process's", || {
-            held(&trees, MODEL) == ["http://a:1"] && held(&trees, "another") == ["http://a:1"]
+            holds(&trees, MODEL, &["http://a:1"]) && holds(&trees, "another", &["http://a:1"])
         })
         .await;
     }
@@ -575,7 +662,7 @@ mod tests {
         registry.remove_by_url("http://b:1").expect("the removal");
         worker_at(&registry, "http://b:1");
         until("the purge of the address that rejoined", || {
-            held(&trees, MODEL) == ["http://a:1"]
+            holds(&trees, MODEL, &["http://a:1"])
         })
         .await;
         assert!(registry.get_by_url("http://b:1").is_some(), "it rejoined");
@@ -645,6 +732,21 @@ mod tests {
         // The root's own entry lists the addresses, and is no prompt.
         let prompts = tree.iter_entries().filter(|(prompt, _)| !prompt.is_empty());
         assert_eq!(prompts.count(), 0, "no prompt is left");
+        // The string tree is emptied by the same purge, behind the token
+        // tree: each worker that stands is listed at no chars.
+        let words = trees.string_tree(MODEL);
+        let listed = || {
+            let mut listed: Vec<(String, usize)> =
+                words.get_tenant_char_count().into_iter().collect();
+            listed.sort();
+            listed
+        };
+        until("the string trees emptied behind unheard events", || {
+            listed() == debited
+        })
+        .await;
+        let texts = words.iter_entries().filter(|(text, _)| !text.is_empty());
+        assert_eq!(texts.count(), 0, "no text is left");
         for stands in ["http://a:1", "http://b:1"] {
             assert!(registry.get_by_url(stands).is_some(), "{stands} stands");
         }
@@ -732,7 +834,11 @@ mod tests {
     /// The size pass holds a model's tree to the size of the model's own
     /// `index` entry, on that entry's timer: the settings' numbers under the
     /// document the settings mean, and a narrower entry's for the models it
-    /// names. The settings' interval of zero runs no pass.
+    /// names. The same pass holds a model's string tree to its entry's size,
+    /// in the string tree's own unit. A node counts 1,024 beside its chars
+    /// there, so the string trees stand under a document of their own, whose
+    /// two sizes lie some nodes apart. The settings' interval of zero runs
+    /// no pass.
     #[test]
     fn the_size_pass_holds_a_tree_to_its_index_entrys_size() {
         let mut stated = document(128, 1);
@@ -740,8 +846,17 @@ mod tests {
         stated.index.insert("roomy*".to_owned(), roomier);
         let trees = owner(stated);
         let (small, large) = (filled(&trees, MODEL), filled(&trees, "roomy-a"));
+        let mut worded_by = document(3_000, 1);
+        worded_by.index.insert("roomy*".to_owned(), entry(6_000, 1));
+        let texts = owner(worded_by);
+        let (few, more) = (worded(&texts, MODEL), worded(&texts, "roomy-a"));
         let until = Instant::now() + Duration::from_secs(20);
-        let over = || small.total_token_size() > 128 || large.total_token_size() > 256;
+        let over = || {
+            small.total_token_size() > 128
+                || large.total_token_size() > 256
+                || few.total_char_size() > 3_000
+                || more.total_char_size() > 6_000
+        };
         while over() && Instant::now() < until {
             thread::sleep(Duration::from_millis(20));
         }
@@ -749,6 +864,12 @@ mod tests {
         // The other entry's pass ran too, and cut its tree to its own size.
         let kept = large.total_token_size();
         assert!(kept <= 256 && kept > 128, "its own entry's size: {kept}");
+        // Each string tree is held to its own entry's size: as many nodes
+        // as fit under it, and no node fewer.
+        let (held, roomy) = (few.total_char_size(), more.total_char_size());
+        let fits = |chars: usize, size: usize| chars <= size && chars + TEXT_NODE > size;
+        assert!(fits(held, 3_000), "the settings' size: {held}");
+        assert!(fits(roomy, 6_000), "its own entry's size: {roomy}");
 
         let unheld = owner(document(128, 0));
         unheld.token_tree(MODEL);
@@ -759,17 +880,20 @@ mod tests {
         );
     }
 
-    /// The engine is lent the tree of a single request's model, the owner's
-    /// own, and none for a pair's side or an encode request. Where no
-    /// owner stands it is lent none.
+    /// The engine is lent the two trees of a single request's model, the
+    /// owner's own, and none for a pair's side or an encode request. Where
+    /// no owner stands it is lent none.
     #[test]
     fn the_engine_is_lent_a_single_requests_tree_and_no_sides() {
         let trees = Arc::new(owner(document(1_000, 0)));
         let caches = EngineCaches::of(None, Some(Arc::clone(&trees))).expect("the trees");
         let lent = caches.token_tree(MODEL, Phase::Single).expect("a tree");
         assert!(Arc::ptr_eq(&lent, &trees.token_tree(MODEL)));
+        let lent = caches.string_tree(MODEL, Phase::Single).expect("a tree");
+        assert!(Arc::ptr_eq(&lent, &trees.string_tree(MODEL)));
         for side in [Phase::Prefill, Phase::Decode, Phase::Encode] {
             assert!(caches.token_tree(MODEL, side).is_none(), "{side:?}");
+            assert!(caches.string_tree(MODEL, side).is_none(), "{side:?}");
         }
         // No monitor stands behind this object: no index and no block size.
         assert!(caches.index(MODEL).is_none() && caches.block_size(MODEL).is_none());
@@ -777,6 +901,7 @@ mod tests {
         let monitor = Arc::new(KvEventMonitor::new());
         let caches = EngineCaches::of(Some(monitor), None).expect("the monitor");
         assert!(caches.token_tree(MODEL, Phase::Single).is_none());
+        assert!(caches.string_tree(MODEL, Phase::Single).is_none());
         assert!(EngineCaches::of(None, None).is_none());
     }
 

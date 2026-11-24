@@ -165,12 +165,11 @@ impl HeaderRead for http::HeaderMap {
 /// ([`Prompt::entry`]), as a maker written by hand answers
 /// [`RequestMaker::token_key`] and [`RequestMaker::text_key`].
 ///
-/// The trait is named for its first question. A caller that keeps no
-/// string tree answers that one alone.
+/// A caller that keeps no string tree answers the first alone.
 ///
 /// [`CacheIndexes::token_tree`]: crate::engine::CacheIndexes::token_tree
 /// [`CacheIndexes::string_tree`]: crate::engine::CacheIndexes::string_tree
-pub trait TokenEntry {
+pub trait PromptEntry {
     /// The entry by token ids for a tree whose page is `page` tokens
     /// ([`TokenKey`]): `None` where the caller holds no token ids of the
     /// prompt. The marker of a cache partition fills whole pages, which is
@@ -222,7 +221,7 @@ pub struct Prompt<'a> {
     ///
     /// [`CacheIndexes::token_tree`]: crate::engine::CacheIndexes::token_tree
     /// [`CacheIndexes::string_tree`]: crate::engine::CacheIndexes::string_tree
-    pub entry: Option<&'a dyn TokenEntry>,
+    pub entry: Option<&'a dyn PromptEntry>,
 }
 
 impl Prompt<'_> {
