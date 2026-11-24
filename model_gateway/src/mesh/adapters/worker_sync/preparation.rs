@@ -4,8 +4,9 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use smg_mesh::WorkerState;
 use smg_worker::{
-    identity::basic::Worker,
+    identity::{basic::Worker, endpoint::Scheme},
     registry::{worker_model_ids, WorkerId, WorkerOrigin},
+    worker::WorkerSpec,
 };
 use tracing::{info, warn};
 use wfaas::WorkflowResult;
@@ -44,6 +45,18 @@ impl PendingImports {
         self.urls_by_key.insert(pending.key_id.clone(), url.clone());
         self.by_url.insert(url.clone(), pending);
         previous
+    }
+}
+
+/// A legacy envelope can omit the transport that its worker spec declares.
+pub(super) fn resolve_legacy_url(state: &mut WorkerState) {
+    if state.spec.is_empty() || Scheme::split_from(&state.url).is_some() {
+        return;
+    }
+    if let Ok(spec) = serde_json::from_slice::<WorkerSpec>(&state.spec) {
+        if Scheme::qualifies_bare_url(&spec.url, &state.url) {
+            state.url = spec.url;
+        }
     }
 }
 
@@ -104,13 +117,16 @@ impl WorkerSyncAdapter {
         }
         // The first live publisher preparing this endpoint owns its pending
         // import. Another key cannot slip in after that load warms the cache.
-        if self
-            .preparing
-            .lock()
-            .by_url
-            .get(&state.url)
-            .is_some_and(|pending| pending.key_id != worker_id)
-        {
+        let claimed_by_other = {
+            let preparing = self.preparing.lock();
+            WorkerRegistry::any_matching_url(&state.url, |url| {
+                preparing
+                    .by_url
+                    .get(url)
+                    .is_some_and(|pending| pending.key_id != worker_id)
+            })
+        };
+        if claimed_by_other {
             return;
         }
         let scope = TokenizerPreparation::new(&app_context);

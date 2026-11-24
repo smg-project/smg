@@ -531,7 +531,7 @@ impl<G: Generation> WorkerRegistry<G> {
 
     /// A legacy bare URL can refer to any network transport. Two explicitly
     /// schemed URLs match only when they name the same transport.
-    fn any_matching_url(url: &str, matches: impl Fn(&str) -> bool) -> bool {
+    pub fn any_matching_url(url: &str, matches: impl Fn(&str) -> bool) -> bool {
         matches(url)
             || match Scheme::split_from(url) {
                 Some((Scheme::Http | Scheme::Https | Scheme::Grpc | Scheme::Grpcs, bare)) => {
@@ -2916,7 +2916,7 @@ impl<G: Generation> WorkerRegistry<G> {
             // higher one, and a local claim in between is never written
             // over.
             if self.is_newer_publication_of_import(&existing_id, state) {
-                match Self::importable_spec(state) {
+                match Self::importable_spec(state, respect_reservations) {
                     PublishedSpec::HostLocal => return None,
                     PublishedSpec::Spec(spec) => {
                         let replacement: Arc<dyn Worker> =
@@ -3012,7 +3012,7 @@ impl<G: Generation> WorkerRegistry<G> {
         // id reservation below would outlive it and a legitimate worker
         // later arriving at this URL would silently inherit the rejected
         // publisher's id — breaking tombstone routing for it.
-        let spec = match Self::importable_spec(state) {
+        let spec = match Self::importable_spec(state, respect_reservations) {
             PublishedSpec::HostLocal => return None,
             PublishedSpec::Spec(spec) => Some(*spec),
             PublishedSpec::Absent => None,
@@ -3219,12 +3219,12 @@ impl<G: Generation> WorkerRegistry<G> {
     /// transport gate it declares. The caller says what it does without one:
     /// the import path builds the minimal worker, the rebuild keeps an
     /// import built from a spec as built and rebuilds a minimal one.
-    fn importable_spec(state: &RemoteWorkerState) -> PublishedSpec {
+    fn importable_spec(state: &RemoteWorkerState, guarded: bool) -> PublishedSpec {
         if state.spec.is_empty() {
             return PublishedSpec::Absent;
         }
         match serde_json::from_slice::<crate::worker::WorkerSpec>(&state.spec) {
-            Ok(spec) => {
+            Ok(mut spec) => {
                 // Same-host transport declared by the spec rather than by
                 // the URL scheme — not routable from this node.
                 if spec.connection_mode == ConnectionMode::Zmq {
@@ -3233,6 +3233,11 @@ impl<G: Generation> WorkerRegistry<G> {
                         "Ignoring mesh state for host-local ZMQ worker"
                     );
                     return PublishedSpec::HostLocal;
+                }
+                // A legacy spec can omit the envelope's transport. Guarded claims
+                // and the worker they publish must use the same explicit URL.
+                if guarded && Scheme::qualifies_bare_url(&state.url, &spec.url) {
+                    spec.url.clone_from(&state.url);
                 }
                 PublishedSpec::Spec(Box::new(spec))
             }

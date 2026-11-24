@@ -89,7 +89,7 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for ActivateWorke
                 Some((_, Some(_))) => activated += 1,
                 Some((_, None)) => {}
                 None => {
-                    debug!(worker_id = %worker_id.as_str(), "Worker removed or replaced before activation")
+                    debug!(worker_id = %worker_id.as_str(), "Worker removed or replaced before activation");
                 }
             }
         }

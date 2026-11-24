@@ -338,7 +338,9 @@ impl WorkerSyncAdapter {
             }
         }
         for (key, worker_id) in live {
-            self.sync_key_from_store(&key, &worker_id);
+            if let Some(url) = self.sync_key_from_store(&key, &worker_id) {
+                self.reimport_endpoint(&url);
+            }
         }
     }
 
@@ -403,10 +405,7 @@ impl WorkerSyncAdapter {
     fn sync_key_from_store_inner(self: &Arc<Self>, key: &str, worker_id: &str) -> Option<String> {
         match self.workers.get(key) {
             Some(bytes) => match decode_worker_state(&bytes) {
-                Ok(state) => {
-                    self.apply_state_inner(worker_id, state);
-                    None
-                }
+                Ok(state) => self.apply_state_inner(worker_id, state),
                 Err(err) => {
                     warn!(worker_id, %err, "failed to decode WorkerState");
                     self.cancel_preparation(worker_id)
@@ -455,21 +454,38 @@ impl WorkerSyncAdapter {
     /// an endpoint removes it. Each key's value is decoded once, and the
     /// walk ends at the first key whose import lands.
     fn reimport_endpoint(self: &Arc<Self>, url: &str) {
-        for key in self.workers.keys("") {
-            let Some(worker_id) = key.strip_prefix(PREFIX).filter(|s| !s.is_empty()) else {
-                continue;
-            };
-            let Some(state) = self
-                .workers
-                .get(&key)
-                .and_then(|bytes| decode_worker_state(&bytes).ok())
-                .filter(|state| state.url == url)
-            else {
-                continue;
-            };
-            self.apply_state(worker_id, state);
-            if self.worker_registry.get_by_url(url).is_some() {
-                return;
+        let guarded = self.waits_for_import_tokenizers();
+        // Applying a publisher that moved here can release its previous
+        // endpoint. Drain those refills after each key has released the intake lock.
+        let mut released = vec![url.to_owned()];
+        while let Some(url) = released.pop() {
+            for key in self.workers.keys("") {
+                let Some(worker_id) = key.strip_prefix(PREFIX).filter(|s| !s.is_empty()) else {
+                    continue;
+                };
+                let Some(mut state) = self
+                    .workers
+                    .get(&key)
+                    .and_then(|bytes| decode_worker_state(&bytes).ok())
+                else {
+                    continue;
+                };
+                if guarded {
+                    preparation::resolve_legacy_url(&mut state);
+                    if !WorkerRegistry::any_matching_url(&state.url, |candidate| {
+                        candidate == url.as_str()
+                    }) {
+                        continue;
+                    }
+                } else if state.url != url {
+                    continue;
+                }
+                if let Some(previous) = self.apply_state(worker_id, state) {
+                    released.push(previous);
+                }
+                if self.worker_registry.get_by_url(&url).is_some() {
+                    break;
+                }
             }
         }
     }
@@ -664,28 +680,37 @@ impl WorkerSyncAdapter {
     /// is published over, a dead owner's import dropped, a gone owner's left
     /// alone inside the grace, a live owner's imported or refreshed unless
     /// this node retired the endpoint.
-    fn apply_state(self: &Arc<Self>, worker_id: &str, state: WorkerState) {
+    fn apply_state(self: &Arc<Self>, worker_id: &str, state: WorkerState) -> Option<String> {
         let _intake = self.intake.lock();
         if self.app_context.upgrade().is_some() {
             // Reimport/backfill can have read an old value before waiting
             // for this lock. A preparation completion reads under it too.
-            self.sync_key_from_store_inner(&format!("{PREFIX}{worker_id}"), worker_id);
+            self.sync_key_from_store_inner(&format!("{PREFIX}{worker_id}"), worker_id)
         } else {
-            self.apply_state_inner(worker_id, state);
+            self.apply_state_inner(worker_id, state)
         }
     }
 
-    fn apply_state_inner(self: &Arc<Self>, worker_id: &str, mut state: WorkerState) {
+    fn waits_for_import_tokenizers(&self) -> bool {
+        self.app_context.upgrade().is_some_and(|app| {
+            app.router_config.wait_for_tokenizer && !app.router_config.disable_tokenizer_autoload
+        })
+    }
+
+    fn apply_state_inner(
+        self: &Arc<Self>,
+        worker_id: &str,
+        mut state: WorkerState,
+    ) -> Option<String> {
         // Resolve legacy empty payload IDs at the inbound boundary, before
         // owner liveness and endpoint retirement can cancel a preparation.
         // Default imports retain their existing identity behavior.
-        if state.worker_id.is_empty()
-            && self.app_context.upgrade().is_some_and(|app| {
-                app.router_config.wait_for_tokenizer
-                    && !app.router_config.disable_tokenizer_autoload
-            })
-        {
-            worker_id.clone_into(&mut state.worker_id);
+        let guarded = self.waits_for_import_tokenizers();
+        if guarded {
+            preparation::resolve_legacy_url(&mut state);
+            if state.worker_id.is_empty() {
+                worker_id.clone_into(&mut state.worker_id);
+            }
         }
         if self.is_own_orphan(worker_id, &state) {
             info!(
@@ -695,10 +720,10 @@ impl WorkerSyncAdapter {
                  another id: left by an earlier life of the node"
             );
             self.on_worker_removed(worker_id);
-            return;
+            return None;
         }
         if self.republish_above_own_key(worker_id, &state) {
-            return;
+            return None;
         }
         match self.owner_liveness(&state.owner) {
             OwnerLiveness::Dead => self.drop_dead_owner_import(&state),
@@ -715,10 +740,26 @@ impl WorkerSyncAdapter {
                 if self.holds_back(&state) {
                     self.drop_held_back_import(&state);
                 } else {
+                    // A new publication under the same key can move to a different
+                    // transport, even if its old envelope used the same bare URL.
+                    let moved = guarded
+                        && self
+                            .preparing
+                            .lock()
+                            .urls_by_key
+                            .get(worker_id)
+                            .is_some_and(|previous| previous != &state.url);
+                    let released = if moved {
+                        self.cancel_preparation(worker_id)
+                    } else {
+                        None
+                    };
                     self.import_prepared_state(worker_id, state);
+                    return released;
                 }
             }
         }
+        None
     }
 
     /// Remember an endpoint this gateway removed locally, with the instance
@@ -1353,9 +1394,15 @@ mod tests {
             OwnerDown,
             Tombstone,
             InvalidState,
+            MoveToHttp,
         }
         let tokenizer = tokenizer_dir();
-        for change in [Change::OwnerDown, Change::Tombstone, Change::InvalidState] {
+        for change in [
+            Change::OwnerDown,
+            Change::Tombstone,
+            Change::InvalidState,
+            Change::MoveToHttp,
+        ] {
             let ns = worker_namespace(&MeshKV::new("node-a".into()));
             let registry = Arc::new(WorkerRegistry::new());
             let cluster =
@@ -1375,7 +1422,9 @@ mod tests {
                 Arc::downgrade(&app),
             );
             let url = "grpc://shared:8080";
-            let mut first = owned_state("w1", url, "node-b");
+            let bare = "shared:8080";
+            let http = "http://shared:8080";
+            let mut first = owned_state("w1", bare, "node-b");
             first.model_id = "new-model".into();
             first.spec = serde_json::to_vec(&serde_json::json!({
                 "url": url, "connection_mode": "grpc", "runtime_type": "sglang",
@@ -1384,10 +1433,25 @@ mod tests {
             .unwrap();
             ns.put("worker:w1", bincode::serialize(&first).unwrap());
             adapter.sync_key_from_store("worker:w1", "w1");
-            ns.put(
-                "worker:w2",
-                bincode::serialize(&owned_state("w2", url, "node-c")).unwrap(),
-            );
+            // An old peer without a spec cannot displace a pending import by
+            // omitting the scheme. A separately advertised HTTP transport can join.
+            let legacy = owned_state("legacy", bare, "node-c");
+            ns.put("worker:legacy", bincode::serialize(&legacy).unwrap());
+            adapter.sync_key_from_store("worker:legacy", "legacy");
+            assert!(registry.get_all().is_empty());
+            ns.delete("worker:legacy");
+            let mut separate_http = owned_state("http", http, "node-c");
+            separate_http.spec = serde_json::to_vec(&serde_json::json!({"url": bare})).unwrap();
+            ns.put("worker:http", bincode::serialize(&separate_http).unwrap());
+            adapter.sync_key_from_store("worker:http", "http");
+            assert_eq!(registry.get_id_by_url(http).unwrap().as_str(), "http");
+
+            let mut second = owned_state("w2", url, "node-c");
+            if matches!(change, Change::Tombstone) {
+                second.url = bare.into();
+                second.spec = serde_json::to_vec(&serde_json::json!({"url": url})).unwrap();
+            }
+            ns.put("worker:w2", bincode::serialize(&second).unwrap());
             adapter.sync_key_from_store("worker:w2", "w2");
             assert!(registry.get_by_url(url).is_none());
             assert!(adapter.preparing.lock().by_url.contains_key(url));
@@ -1401,6 +1465,15 @@ mod tests {
                 }
                 Change::Tombstone => ns.delete("worker:w1"),
                 Change::InvalidState => ns.put("worker:w1", vec![0xff]),
+                Change::MoveToHttp => {
+                    first.version += 1;
+                    first.spec = serde_json::to_vec(&serde_json::json!({"url": http})).unwrap();
+                    ns.put("worker:w1", bincode::serialize(&first).unwrap());
+                    // A refill sees the move before the subscription or tokenizer task.
+                    ns.delete("worker:http");
+                    adapter.reimport_endpoint(http);
+                    assert_eq!(registry.get_id_by_url(url).unwrap().as_str(), "w2");
+                }
             }
             assert!(
                 wait_for(|| app.tokenizer_preparations.lock().is_empty()).await,
@@ -1414,6 +1487,8 @@ mod tests {
                     "the competing key must wait through grace"
                 );
                 set_status(&cluster, "node-b", NodeStatus::Alive);
+                first.url = url.into();
+                ns.put("worker:w1", bincode::serialize(&first).unwrap());
                 adapter.sync_key_from_store("worker:w1", "w1");
                 assert!(
                     wait_for(|| registry
@@ -1429,6 +1504,7 @@ mod tests {
                     "completion refills the released endpoint immediately"
                 );
             }
+            assert_eq!(registry.get_id_by_url(http).unwrap().as_str(), "http");
             assert!(adapter.preparing.lock().urls_by_key.is_empty());
         }
     }

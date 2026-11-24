@@ -70,6 +70,12 @@ impl Scheme {
         })
     }
 
+    /// Whether an explicit network URL adds only a transport to a legacy bare address.
+    pub fn qualifies_bare_url(url: &str, bare: &str) -> bool {
+        matches!(Self::split_from(url),
+            Some((Self::Http | Self::Https | Self::Grpc | Self::Grpcs, rest)) if rest == bare)
+    }
+
     /// Whether this scheme carries a socket path rather than a host and port.
     fn is_ipc(self) -> bool {
         matches!(self, Scheme::Ipc)
