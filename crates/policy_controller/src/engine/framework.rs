@@ -4924,9 +4924,10 @@ impl Engine {
     }
 
     /// Takes over what the standing engine's counts of sends hold: each
-    /// profile's count takes the rows' entries of the standing profile of
-    /// the same name, where both have a stage that reads sends. A profile
-    /// under a new name starts empty. The two engines share those entries
+    /// count takes the rows' entries of the standing count that a profile
+    /// of the same name made. Profiles that share a count carry it under
+    /// the name of the first of them, so a count starts empty where that
+    /// name made no standing count. The two engines share those entries
     /// from here on: a decision still running under the standing engine
     /// reads the sends a later one counts, and each count reads them under
     /// its own time limit and report delay.
