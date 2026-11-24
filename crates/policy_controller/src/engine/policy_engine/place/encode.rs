@@ -41,7 +41,6 @@ use super::{
 };
 use crate::{
     engine::{
-        decision_engine::Decided,
         framework::{EncodeItems, EncodePlaced},
         policy_engine::Loaded,
         prefills_full, EncodeLists,
@@ -117,8 +116,8 @@ fn asked<'a>(
     // The route's rule panicked inside the decision, at the question of
     // where the prompt goes: the panic is the caller's, as a pair's is.
     if let Some(panic) = made.panicked.take() {
-        let whole = decided.map(|(decided, later)| (Decided::Whole(decided, later), dated.get()));
-        raise(engine.object, panic, whole);
+        // An encode decision is whole: no place answers it.
+        raise(engine.object, panic, decided.ok(), Ok((None, dated.get())));
     }
     let (decided, later) = decided.map_err(Unplaced::Refused)?;
     let (key, kept) = (made.key(), [made.sent.get(), made.decodes.get()]);
