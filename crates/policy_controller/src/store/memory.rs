@@ -26,7 +26,6 @@ use crate::{
     document::spec::AppliedSpec,
     engine::{
         decision_engine::DecodeRefused,
-        prompt_hashes::{block_size_and_depth, HashSeeds, PromptHashes},
         view::{LoadRow, Session, WorkerId, LOAD_REPORT_CLOCK_HISTORY_MS},
     },
     load::signals::{in_range, SignalCell, SignalColumn},
@@ -963,28 +962,6 @@ impl MemoryStore {
     /// returns.
     pub fn deciding<R>(&self, decide: impl FnOnce(&StoreSnapshot) -> R) -> R {
         decide(&self.world.load())
-    }
-
-    /// The block hashes of a request's prompt for `model`: those of its
-    /// token ids where the caller holds them, else those of its text, else
-    /// none ([`PromptHashes::under_document`]). The document is the
-    /// generation in force, and the block size of record is the one the
-    /// model's workers reported here.
-    ///
-    /// A caller hashes a request once and calls this on its request path.
-    /// The block size is read under the cache index's lock, the one lock
-    /// this takes. The world is borrowed for the two reads alone, and the
-    /// hashing runs after it. A request with no prompt reads nothing.
-    pub fn prompt_hashes(
-        &self,
-        model: &str,
-        tokens: Option<&[u32]>,
-        text: Option<&str>,
-        seeds: HashSeeds,
-    ) -> PromptHashes {
-        PromptHashes::of_prompt(tokens, text, seeds, |kind| {
-            self.deciding(|world| block_size_and_depth(world.spec(), self.block_size(model), kind))
-        })
     }
 
     /// `at` in the rows' clock: microseconds since the store's origin.
