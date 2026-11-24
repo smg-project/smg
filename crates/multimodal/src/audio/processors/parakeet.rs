@@ -22,7 +22,7 @@ use rustfft::{num_complex::Complex32, Fft, FftPlanner};
 
 use crate::{
     audio::{
-        transforms::{bandlimited_resample, mel_bands, mel_basis},
+        transforms::{bandlimited_resample, mel_bands, mel_basis, resampled_len},
         AudioPreProcessor, DecodedAudio,
     },
     encoder_inputs::{ModelSpecificValue, PreprocessedEncoderInputs},
@@ -114,14 +114,21 @@ impl ParakeetAudioParams {
         })
     }
 
-    /// The sample counts of the clips an audio of `len` samples splits into.
-    pub(crate) fn clip_sizes(&self, len: usize) -> Vec<usize> {
+    fn clip_layout(&self, len: usize) -> (usize, usize, Option<usize>) {
         let target = (CLIP_SECONDS * self.sample_rate as f64).round() as usize;
         let tail_min = (TAIL_MIN_SECONDS * self.sample_rate as f64).round() as usize;
         let len = len.max(tail_min);
-        let mut sizes = vec![target; len / target];
-        if !len.is_multiple_of(target) {
-            sizes.push((len % target).max(tail_min));
+        let tail = (!len.is_multiple_of(target)).then(|| (len % target).max(tail_min));
+        (target, len / target, tail)
+    }
+
+    /// The sample counts of the clips an audio of `len` samples splits into.
+    #[cfg(test)]
+    fn clip_sizes(&self, len: usize) -> Vec<usize> {
+        let (target, full, tail) = self.clip_layout(len);
+        let mut sizes = vec![target; full];
+        if let Some(tail) = tail {
+            sizes.push(tail);
         }
         sizes
     }
@@ -169,24 +176,35 @@ impl ParakeetAudioProcessor {
             ));
         }
         let max_samples = MAX_AUDIO_SECONDS.saturating_mul(self.params.sample_rate);
-        let mut prepared = Vec::with_capacity(audios.len());
+        let overflow = || TransformError::ShapeError("Parakeet audio size overflow".to_string());
         let (mut total_clips, mut total_frames) = (0usize, 0usize);
         for audio in audios {
-            let samples = self.resampled(audio)?;
-            if samples.len() > max_samples {
+            if audio.sample_rate == 0 {
+                return Err(TransformError::ShapeError(
+                    "decoded audio sample rate must be positive".to_string(),
+                ));
+            }
+            if audio.samples.len() > (MAX_AUDIO_SECONDS + 1).saturating_mul(audio.sample_rate) {
                 return Err(too_long());
             }
-            let sizes = self.params.clip_sizes(samples.len());
-            let frames: usize = sizes.iter().map(|s| s / HOP_LENGTH).sum();
-            total_clips += sizes.len();
-            total_frames = total_frames.checked_add(frames).ok_or_else(|| {
-                TransformError::ShapeError("Parakeet's frame count overflows usize".to_string())
-            })?;
-            prepared.push((samples, sizes, frames));
+            let len = resampled_len(
+                audio.samples.len(),
+                audio.sample_rate,
+                self.params.sample_rate,
+            )?;
+            if len > max_samples {
+                return Err(too_long());
+            }
+            let (target, full, tail) = self.params.clip_layout(len);
+            let clips = full + usize::from(tail.is_some());
+            let frames = full
+                .checked_mul(target / HOP_LENGTH)
+                .and_then(|n| n.checked_add(tail.map_or(0, |t| t / HOP_LENGTH)))
+                .ok_or_else(overflow)?;
+            total_clips = total_clips.checked_add(clips).ok_or_else(overflow)?;
+            total_frames = total_frames.checked_add(frames).ok_or_else(overflow)?;
         }
-        let total_elems = total_frames.checked_mul(n_mels).ok_or_else(|| {
-            TransformError::ShapeError("Parakeet's feature count overflows usize".to_string())
-        })?;
+        let total_elems = total_frames.checked_mul(n_mels).ok_or_else(overflow)?;
         let mut rows = Vec::new();
         rows.try_reserve_exact(total_elems).map_err(|error| {
             TransformError::ShapeError(format!(
@@ -204,23 +222,41 @@ impl ParakeetAudioProcessor {
         let mut clip_frames = Vec::with_capacity(total_clips);
         let mut clips_per_item = Vec::with_capacity(audios.len());
         let mut frames_per_item = Vec::with_capacity(audios.len());
-        let mut row_cursor = 0;
-        for (samples, sizes, frames) in &prepared {
-            let (n, mut start, mut tokens) = (samples.len(), 0, 0);
-            for &size in sizes {
+        let mut row_cursor = 0usize;
+        for audio in audios {
+            let samples = self.resampled(audio)?;
+            if samples.len() > max_samples {
+                return Err(too_long());
+            }
+            let (target, full, tail) = self.params.clip_layout(samples.len());
+            let clips = full + usize::from(tail.is_some());
+            let (n, mut start, mut frames, mut tokens) = (samples.len(), 0, 0, 0);
+            for size in std::iter::repeat_n(target, full).chain(tail) {
                 let actual = &samples[start.min(n)..start.saturating_add(size).min(n)];
                 let valid = size / HOP_LENGTH;
-                let next_row = row_cursor + valid * n_mels;
-                frontend.log_mel_into(actual, size, &mut scratch, &mut rows[row_cursor..next_row]);
+                let next_row = valid
+                    .checked_mul(n_mels)
+                    .and_then(|count| row_cursor.checked_add(count))
+                    .ok_or_else(overflow)?;
+                let slice = rows.get_mut(row_cursor..next_row).ok_or_else(|| {
+                    TransformError::ShapeError("resampled audio exceeds reserved rows".to_string())
+                })?;
+                frontend.log_mel_into(actual, size, &mut scratch, slice);
                 start += size;
                 row_cursor = next_row;
                 clip_frames.push(valid as i64);
+                frames += valid;
                 tokens += parakeet_clip_tokens(valid);
             }
             token_counts.push(tokens);
-            item_sizes.push((n_mels as u32, *frames as u32));
-            clips_per_item.push(sizes.len() as i64);
-            frames_per_item.push(*frames as i64);
+            item_sizes.push((n_mels as u32, frames as u32));
+            clips_per_item.push(clips as i64);
+            frames_per_item.push(frames as i64);
+        }
+        if row_cursor != total_elems {
+            return Err(TransformError::ShapeError(
+                "resampled audio length differs from reserved rows".to_string(),
+            ));
         }
 
         let encoder_input = Array2::from_shape_vec((total_frames, n_mels), rows).map_err(|e| {
@@ -754,7 +790,16 @@ mod tests {
     #[test]
     fn a_batch_equals_each_audio_alone_in_order() {
         let processor = ParakeetAudioProcessor::default();
-        let corpus = waveform_corpus();
+        let mut corpus = waveform_corpus();
+        for (rate, len) in [(8_000, 1_001), (44_100, 4_411), (48_000, 4_801)] {
+            corpus.push((
+                format!("resampled_{rate}_{len}"),
+                DecodedAudio {
+                    samples: (0..len).map(|i| (i as f32 * 0.02).sin() * 0.4).collect(),
+                    sample_rate: rate,
+                },
+            ));
+        }
         let batch: Vec<&DecodedAudio> = corpus.iter().map(|(_, clip)| clip).collect();
         let rows = rows_of(&processor, &batch);
         let mut offset = 0;
@@ -792,6 +837,27 @@ mod tests {
         let actual = rows_of(&processor, &[&mixed]);
         let expected = frame_by_frame_reference(&processor, &mixed);
         assert_same_bits("mixed chunk", &actual, &expected);
+
+        let fe = LogMelFrontend::build(&processor.params);
+        let n_mels = processor.params.n_mels;
+        let mut sc = LogMelScratch::new(&fe, n_mels);
+        let mut raw = vec![0.0_f32; FRAMES_PER_CHUNK * n_mels];
+        let s = &mixed.samples;
+        fill_chunk_frames(s, s.len(), &fe.window, 0, &mut sc.signal, &mut sc.frames);
+        fe.fft
+            .process_with_scratch(&mut sc.frames, &mut sc.fft_scratch);
+        power_and_mel_chunk(
+            &sc.frames,
+            &mut sc.power,
+            &fe.filters,
+            &fe.bands,
+            &mut raw,
+            &mut sc.sums,
+        );
+        let expected_raw = frame_by_frame_log_mel(s, &fe.filters, n_mels);
+        assert!(raw[..n_mels].iter().any(|v| v.is_nan()));
+        assert!(raw[3 * n_mels..].iter().all(|v| v.is_finite()));
+        assert_same_bits("mixed raw", &raw, &expected_raw[..raw.len()]);
     }
 
     #[test]

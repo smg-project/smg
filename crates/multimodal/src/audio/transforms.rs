@@ -299,6 +299,24 @@ fn resample_kernel_size(
     Ok((kernel_len, kernel_values))
 }
 
+pub(super) fn resampled_len(
+    samples: usize,
+    src_sample_rate: usize,
+    dst_sample_rate: usize,
+) -> Result<usize, TransformError> {
+    if src_sample_rate == 0 || dst_sample_rate == 0 {
+        return Err(TransformError::ShapeError(
+            "audio resampling rates must be positive".to_string(),
+        ));
+    }
+    if samples == 0 || src_sample_rate == dst_sample_rate {
+        return Ok(samples);
+    }
+    let len = (samples as u128 * dst_sample_rate as u128).div_ceil(src_sample_rate as u128);
+    usize::try_from(len)
+        .map_err(|_| TransformError::ShapeError("resampled audio length exceeds usize".to_string()))
+}
+
 /// Match torchaudio's default `functional.resample`: band-limited sinc
 /// interpolation with a Hann window, filter width 6, and rolloff 0.99.
 pub(super) fn bandlimited_resample(
@@ -355,10 +373,7 @@ pub(super) fn bandlimited_resample(
         )
     })?;
 
-    let target_len_u128 = (samples.len() as u128 * new_freq as u128).div_ceil(orig_freq as u128);
-    let target_len = usize::try_from(target_len_u128).map_err(|_| {
-        TransformError::ShapeError("resampled audio length exceeds usize".to_string())
-    })?;
+    let target_len = resampled_len(samples.len(), src_sample_rate, dst_sample_rate)?;
     let mut output = Vec::new();
     output.try_reserve_exact(target_len).map_err(|error| {
         TransformError::ShapeError(format!("failed to allocate resampled audio: {error}"))
