@@ -1382,6 +1382,9 @@ impl<'a> Singly<'a> {
     /// Pays the decision's look-ups toward the conversion of its list's
     /// reports ([`LookUps`]): the draw that pays the last of the list's
     /// length converts them, and the draws behind it copy the rows.
+    // In line at its two callers, a draw and a draw that claims: as a call
+    // it costs a draw 20 instructions, counted with Callgrind.
+    #[inline(always)]
     fn paid(&self) {
         let looked_up = self.looked_up.get();
         if let (Some(loads), true) = (self.live.loads, looked_up > 0) {
@@ -1562,7 +1565,8 @@ pub fn decide(
         // No record says yet whether it carries a report: a draw reads that
         // fact of no pool.
         let unsaid = pool.facts(live, false);
-        if let Some(drawn) = engine.drawn_for(facts, &unsaid, pool.len()) {
+        let drawn = engine.drawn_for(facts, &unsaid, pool.len());
+        if let Some(drawn) = drawn.filter(|drawn| !drawn.claims()) {
             if rows.len() < pool.len() {
                 rows.resize(pool.len(), Candidate::default());
             }
@@ -1580,6 +1584,15 @@ pub fn decide(
                 scratch,
             );
             singly.paid();
+            return decision;
+        } else if let Some(decision) = drawn.and_then(|drawn| {
+            // A key with no pin takes the list's turn, and the turn's
+            // worker is claimed for it. Where the whole decision answers
+            // by another way it is asked below, over every record.
+            claimed(
+                engine, drawn, pool, workers, live, facts, &unsaid, cx, rows, scratch,
+            )
+        }) {
             return decision;
         }
         let (rows, pool_facts) = pool.write_over::<true>(workers, live, whole, stands);
@@ -1609,6 +1622,54 @@ fn with_buffers<T>(decide: impl FnOnce(&mut Buffers) -> T) -> T {
         return decide(&mut Buffers::default());
     };
     decide(&mut buffers)
+}
+
+/// [`decide`]'s draw for a key with no pin under a sessions rule
+/// ([`Engine::decide_claimed`]), as the plain draw runs: a worker's record
+/// is written when the draw asks about the worker, and the look-ups are
+/// paid at its end. `None` where the whole decision answers, as it does
+/// over a list where two rows carry one id ([`PoolRecords::place_of`]): the
+/// rule's cap is asked of every row of an id, and a draw keeps a few rows.
+///
+/// Out of line: a draw that claims nothing holds none of this.
+#[inline(never)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one decision's inputs and the calling thread's two buffers"
+)]
+fn claimed(
+    engine: &Engine,
+    drawn: super::framework::Drawn,
+    pool: &PoolRecords,
+    workers: &[Arc<dyn Worker>],
+    live: &Live<'_>,
+    facts: &RequestFacts<'_>,
+    unsaid: &PoolFacts<'_>,
+    cx: &Constraints<'_>,
+    rows: &mut Vec<Candidate>,
+    scratch: &mut Scratch,
+) -> Option<Decision> {
+    if pool.places.is_empty() {
+        return None;
+    }
+    if rows.len() < pool.len() {
+        rows.resize(pool.len(), Candidate::default());
+    }
+    let rows = &mut rows[..pool.len()];
+    let singly = Singly::new(pool, workers, live);
+    let mut write = |fixed: &Candidate, row: &mut Candidate| singly.write(fixed, row);
+    let claimed = engine.decide_claimed(
+        drawn,
+        facts,
+        unsaid,
+        &pool.fixed,
+        rows,
+        &mut write,
+        cx,
+        scratch,
+    );
+    singly.paid();
+    claimed
 }
 
 #[cfg(test)]

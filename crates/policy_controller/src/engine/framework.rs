@@ -2828,6 +2828,18 @@ const DRAWS_BY_ITS_TEST: [&str; 6] = [
 pub(crate) struct Drawn {
     index: u16,
     vetoed: AllVetoed,
+    /// Whether the draw places a keyed request under a sessions rule and
+    /// claims its worker for the key ([`Engine::decide_claimed`]).
+    claims: bool,
+}
+
+#[cfg(feature = "in-process")]
+impl Drawn {
+    /// Whether the draw is a keyed request's under a sessions rule: its
+    /// host asks [`Engine::decide_claimed`], which claims behind the draw.
+    pub(crate) const fn claims(self) -> bool {
+        self.claims
+    }
 }
 
 /// A record no decision wrote, as a debug build leaves every row before a
@@ -2877,7 +2889,8 @@ fn unwritten(fixed: &Candidate) -> Candidate {
 #[inline(never)]
 fn run_drawn_written(
     engine: &Engine,
-    drawn: Drawn,
+    index: u16,
+    vetoed: AllVetoed,
     facts: &RequestFacts<'_>,
     pool: &PoolFacts<'_>,
     fixed: &[Candidate],
@@ -2886,7 +2899,6 @@ fn run_drawn_written(
     cx: &Constraints<'_>,
     buf: &mut Buffers,
 ) -> Decision {
-    let Drawn { index, vetoed } = drawn;
     let at = usize::from(index);
     let (profile, tests) = (&engine.profiles[at], engine.row_tests[at]);
     debug_assert_eq!(fixed.len(), rows.len(), "one buffer row a fixed row");
@@ -6011,7 +6023,10 @@ impl Engine {
     /// under, in its order: the binding the request resolves to; no column
     /// of affinity facts, which is one entry a written row; no scope to
     /// open, no assignment that places and no key that lifts a veto; no
-    /// sessions rule over a keyed request; no encode item; no list of the
+    /// sessions rule over a keyed request, but one that leaves a key with
+    /// no pin to a profile that takes turns and whose filters are one test
+    /// of a row: that draw claims ([`Drawn::claims`]), and its host asks
+    /// [`Self::decide_claimed`]; no encode item; no list of the
     /// pool's engines for a profile that decides over them; a pool of
     /// [`DRAW_FROM`] rows or more; and a profile that draws for every
     /// request, or for this one, which names rows. A smaller pool is
@@ -6042,7 +6057,7 @@ impl Engine {
             (binding.plan, facts.phase),
             (Plan::Epd { .. }, Phase::Encode)
         );
-        if !marks.asks_nothing_first() || keyed || encode {
+        if !marks.asks_nothing_first() || encode {
             return None;
         }
         if marks.first() & (Marks::ENGINES | Marks::OWNS) != 0 && !pool.engines.is_empty() {
@@ -6051,9 +6066,26 @@ impl Engine {
         let ahead = marks.ahead();
         let draws =
             ahead == Marks::DRAWS_FIRST || (facts.named.is_some() && ahead & Marks::JOINED != 0);
-        draws.then_some(Drawn {
+        if !draws {
+            return None;
+        }
+        // Under a rule that leaves a key with no pin to the profile, the
+        // whole decision places such a key by the list's own turn behind
+        // its pass ([`Self::pool_turn`]): that turn is this draw. Held to
+        // a profile whose filters fold into one test of a row, which says
+        // of a row what the pass says of it. The key is asked about last:
+        // a request with none pays the tests it paid before.
+        if keyed
+            && !(marks.turns()
+                && entry.placing == Assignment::Delegate
+                && self.row_tests[at].is_some())
+        {
+            return None;
+        }
+        Some(Drawn {
             index,
             vetoed: entry.vetoed,
+            claims: keyed,
         })
     }
 
@@ -6092,9 +6124,12 @@ impl Engine {
         {
             scratch.kept_last = false;
         }
+        // The draw's two words go apart, a register each: the three
+        // fields of a `Drawn` are handed as one packed word.
         run_drawn_written(
             self,
-            drawn,
+            drawn.index,
+            drawn.vetoed,
             facts,
             pool,
             fixed,
@@ -6103,6 +6138,144 @@ impl Engine {
             cx,
             &mut scratch.single,
         )
+    }
+
+    /// [`Self::decide_drawn`] for a draw that claims ([`Drawn::claims`]): a
+    /// keyed request under a sessions rule that leaves a key with no pin to
+    /// a profile that takes turns. The steps are the whole decision's, in
+    /// its order ([`Self::decide`]), with the row the list's word points at
+    /// in the place of the pass over the pool: that row is read with
+    /// nothing added to the word, and where the profile's filters keep it
+    /// the pool is not emptied; the key is read, which starts its idle
+    /// time; the draw takes the list's turn; and the worker the draw leads
+    /// with is claimed for the key. A claim another request took first is
+    /// settled as the whole decision settles it: its worker leads where
+    /// the filters keep its row, and no alternate at the rule's cap stands
+    /// behind it.
+    ///
+    /// `None` where the whole decision answers by another way, with no
+    /// turn taken and nothing written that it does not write again at the
+    /// same instant: a pool that lends no word, a retry, a request held to
+    /// places, a key that holds a pin, and a turn whose row is refused,
+    /// which says nothing of the pool. The host asks it over rows that each
+    /// carry an id of their own: behind a standing claim the rule's cap is
+    /// asked of the rows the draw kept. `None` too, behind the draw, where
+    /// the standing claim's worker is at the rule's cap: the whole decision
+    /// hands the key on by one more placement. The host then writes every
+    /// row and asks [`Self::decide`].
+    ///
+    /// Out of line: a draw that claims nothing holds one test and none of
+    /// this.
+    #[cfg(feature = "in-process")]
+    #[inline(never)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one decision's inputs, and the host's two halves of a row, as decide_drawn takes them"
+    )]
+    pub(crate) fn decide_claimed(
+        &self,
+        drawn: Drawn,
+        facts: &RequestFacts<'_>,
+        pool: &PoolFacts<'_>,
+        fixed: &[Candidate],
+        rows: &mut [Candidate],
+        write: &mut dyn FnMut(&Candidate, &mut Candidate),
+        cx: &Constraints<'_>,
+        scratch: &mut Scratch,
+    ) -> Option<Decision> {
+        use std::sync::atomic::Ordering;
+
+        let (word, tests) = (pool.word?, self.row_tests[usize::from(drawn.index)]?);
+        if facts.attempt != 0 || !facts.tried.is_empty() || places::stated(cx) {
+            return None;
+        }
+        let (entry, ..) = self.resolve(facts.model, facts.phase)?;
+        let rule = entry.binding.sessions.as_ref()?;
+        let key = facts.session();
+        let free = [WorkerId(0); 2];
+        // A pin that is down, at its cap or moved is the whole decision's.
+        if self.sessions.pins_at(key, facts.now_micros) != free {
+            return None;
+        }
+        let keeps = |row: &Candidate| {
+            tests.keeps(facts, row, cx) && !(tests.masked(cx) && cx.masks(row.position))
+        };
+        let place = word.load(Ordering::Relaxed) as usize % fixed.len().max(1);
+        let (head, row) = (fixed.get(place)?, rows.get_mut(place)?);
+        write(head, row);
+        let turned = *row;
+        if !keeps(&turned) {
+            return None;
+        }
+        // The whole decision reads the key behind a pass that kept a row.
+        let pins = self.sessions.lookup(key, facts.now_micros, rule);
+        if pins != free {
+            return None;
+        }
+        // One read a row: the draw is handed the record read above.
+        let mut once = |fixed: &Candidate, row: &mut Candidate| {
+            if fixed.position == head.position {
+                *row = turned;
+            } else {
+                write(fixed, row);
+            }
+        };
+        let mut decision =
+            self.decide_drawn(drawn, facts, pool, fixed, rows, &mut once, cx, scratch);
+        // A shed and the all-vetoed rule's pick claim nothing.
+        let Decision::Pick(pick) = &mut decision else {
+            return Some(decision);
+        };
+        let first = pick.targets.first().map(|target| target.id);
+        let (Some(first), LiftedVeto::None) = (first, pick.trace.lifted) else {
+            return Some(decision);
+        };
+        pick.session_verdict = SessionVerdict::Pinned;
+        match self.sessions.claim(key, pins, first) {
+            Claim::Made(id) => pick.session_verdict = SessionVerdict::Claimed(id),
+            // A full table records nothing of the key.
+            Claim::NoRoom => {}
+            Claim::Standing(owner, _) => {
+                // The first row of the standing worker the pass kept, in
+                // the pool's order. Behind a draw that widened the rows
+                // kept are every survivor. Behind a draw they are the rows
+                // drawn: each row of the worker is found by its id, read
+                // where the draw did not keep it, and asked the draw's
+                // test.
+                let kept = &scratch.single.kept;
+                let stands = if pick.trace.drew_first() {
+                    let of_owner = fixed.iter().filter(|head| head.id == owner);
+                    of_owner
+                        .filter_map(|head| {
+                            let row = rows.get_mut(head.position as usize)?;
+                            if !kept.contains(&head.position) {
+                                once(head, row);
+                            }
+                            Some(*row)
+                        })
+                        .find(keeps)
+                } else {
+                    kept.iter()
+                        .map(|&row| rows[row as usize])
+                        .find(|row| row.id == owner)
+                };
+                if let Some(row) = stands {
+                    if Self::at_cap(rule, &row) {
+                        return None;
+                    }
+                    if owner != first {
+                        pick.targets.lead(Target {
+                            position: row.position,
+                            id: row.id,
+                            dp_rank: row.dp_rank,
+                            pair: None,
+                        });
+                    }
+                    Self::drop_alternates_at_cap(rule, rows, kept, &mut pick.targets);
+                }
+            }
+        }
+        Some(decision)
     }
 
     /// The body of the two entries. `KEEPS` is the keeping entry's form.
@@ -17801,6 +17974,76 @@ mod tests {
             let places: Vec<usize> = keys.into_iter().map(&mut turn).collect();
             let in_turn: Vec<usize> = (1..6).map(|step| (first + step) % rows).collect();
             assert_eq!(places, in_turn, "{phase:?}");
+        }
+    }
+
+    /// A claim another request of the session took between a draw's read of
+    /// the key and its own claim, as `decide_claimed` settles it: the
+    /// claimed worker leads the draw's own turn, a worker of that turn at
+    /// the rule's cap is dropped behind it, and with the claimed worker at
+    /// the cap the draw answers nothing, so the whole decision hands the
+    /// key on.
+    #[cfg(feature = "in-process")]
+    #[test]
+    fn a_draw_that_loses_its_claim_leads_with_the_claimed_worker_or_answers_nothing() {
+        let rule = SessionRule {
+            inflight_cap: 1,
+            ..SESSIONS
+        };
+        let fixed = pool_of(20, |_| false);
+        let other = fixed[12].id;
+        // The key's requests in flight on the claimed worker, a worker of
+        // the turn at the cap, and the places the draw hands out.
+        let cases = [
+            (0, None, Some(vec![12, 3, 4, 5])),
+            (0, Some(5), Some(vec![12, 3, 4])),
+            (1, None, None),
+        ];
+        for (in_flight, capped, placed) in cases {
+            let engine = session_engine_of(round_robin_profile(), rule);
+            let word = AtomicU64::new(3);
+            let pool = PoolFacts {
+                word: Some(&word),
+                ..PoolFacts::default()
+            };
+            let facts = RequestFacts {
+                session_key: Identity::hashed(41),
+                ..request(0)
+            };
+            let key = facts.session();
+            let drawn = engine.drawn_for(&facts, &pool, fixed.len());
+            let mut rows = vec![Candidate::default(); fixed.len()];
+            let mut asked = 0;
+            // The other request claims behind this one's read of the key:
+            // at the second row the draw asks about.
+            let mut write = |head: &Candidate, row: &mut Candidate| {
+                *row = *head;
+                if head.id == other {
+                    row.session_in_flight = in_flight;
+                }
+                if Some(head.position) == capped {
+                    row.session_in_flight = 1;
+                }
+                asked += 1;
+                if asked == 2 {
+                    let claim = engine.sessions.claim(key, [WorkerId(0); 2], other);
+                    assert_eq!(claim, Claim::Made(other));
+                }
+            };
+            let decision = engine.decide_claimed(
+                drawn.expect("a draw that claims"),
+                &facts,
+                &pool,
+                &fixed,
+                &mut rows,
+                &mut write,
+                &Constraints::default(),
+                &mut Scratch::new(),
+            );
+            assert_eq!(decision.as_ref().map(positions), placed);
+            if let Some(Decision::Pick(pick)) = &decision {
+                assert_eq!(pick.session_verdict, SessionVerdict::Pinned);
+            }
         }
     }
 
