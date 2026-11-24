@@ -14,12 +14,9 @@
 //! waited behind it reads the object that writer left, and never the
 //! registry one write behind the table.
 //!
-//! A status is the table's word until a worker object's leads: a drain and
-//! a connect signal write the table, and an object trails it by the status
-//! writes its holder has not followed. So a record a door reads carries
-//! the status its table holds ([`Objects::with_table_status`]), read by
-//! the store's own read of a row. That read goes when an object's status
-//! leads: the helper is then the record as the object states it.
+//! A worker object's status leads its row's ([`mod@super::status`]): a
+//! record a door reads carries the status its object states, and no read
+//! here asks the store's table for a row.
 //!
 //! An engine's rows are found by the holder's index of ranks. It lists a
 //! row under the address it dials: every row that names the engine, and
@@ -32,7 +29,7 @@ use smg_worker::registry::Generation;
 use super::{Objects, Place};
 use crate::{
     engine::view::WorkerId,
-    store::{MemoryStore, WorkerRow, WorkersStore},
+    store::{MemoryStore, WorkerRow},
 };
 
 #[cfg_attr(
@@ -45,14 +42,14 @@ impl<G: Generation> Objects<G> {
     /// object stands for the row.
     pub(crate) fn record(&self, store: &MemoryStore, id: WorkerId) -> Option<WorkerRow> {
         let _turn = self.turn(store);
-        Self::with_table_status(store, self.row(id)?)
+        self.row(id)
     }
 
     /// The record under the registration key `key`, as [`Self::record`]
     /// reads one.
     pub(crate) fn record_under(&self, store: &MemoryStore, key: &str) -> Option<WorkerRow> {
         let _turn = self.turn(store);
-        Self::with_table_status(store, self.row_under(key)?)
+        self.row_under(key)
     }
 
     /// Every record whose facts name `engine`, as [`Self::record`] reads
@@ -69,7 +66,6 @@ impl<G: Generation> Objects<G> {
             .into_iter()
             .filter_map(|row| self.row(row))
             .filter(|row| row.facts.engine == engine)
-            .filter_map(|row| Self::with_table_status(store, row))
             .collect()
     }
 
@@ -96,15 +92,6 @@ impl<G: Generation> Objects<G> {
         let object = self.registry.get_id_by_url_or_reservation(key)?;
         self.row_of(&object)
     }
-
-    /// `row` with the status the table holds, and `None` where the table
-    /// holds no row under its id. A status is the table's word until an
-    /// object's leads. Then this is `Some(row)`: the status the object
-    /// states.
-    fn with_table_status(store: &MemoryStore, mut row: WorkerRow) -> Option<WorkerRow> {
-        row.status = store.get(row.id)?.status;
-        Some(row)
-    }
 }
 
 #[cfg(test)]
@@ -118,7 +105,7 @@ mod tests {
         *,
     };
     use crate::{
-        store::{identity, Registrant, WorkerFacts, WorkerPatch, WorkerStatus},
+        store::{identity, Registrant, WorkerFacts, WorkerPatch, WorkerStatus, WorkersStore},
         worker_host::Members,
     };
 
@@ -228,31 +215,30 @@ mod tests {
         assert!(read(A).is_empty(), "the row under it names no engine");
     }
 
-    /// A record a door reads carries the status the table holds, whatever
-    /// the object states: here a holder that follows no status, whose
-    /// object stays pending behind a status the table took.
+    /// A record a door reads carries the status its object states, by id,
+    /// by key and among its engine's records: here an object the holder
+    /// readied, and then a status written into the table around the
+    /// object, which no read carries.
     #[test]
-    fn a_record_carries_the_status_the_table_holds() {
+    fn a_record_carries_the_status_its_object_states() {
         let store = MemoryStore::default();
         let objects: Objects<Members> = Objects::new(Arc::new(WorkerRegistry::new()));
         let change = objects.upsert(&store, facts(1, "gold"), Registrant::Control);
         let id = change.expect("registered").id();
+        objects.connect_row(&store, id, 1);
+        let read = || {
+            let by_id = objects.record(&store, id);
+            let by_key = objects.record_under(&store, A);
+            let by_engine = objects.records_of(&store, A).pop();
+            [by_id, by_key, by_engine].map(|row| row.map(|row| row.status))
+        };
+        assert_eq!(read(), [Some(WorkerStatus::Ready); 3]);
+        let told = store.get(id).map(|row| row.status);
+        assert_eq!(told, Some(WorkerStatus::Ready), "the table is told");
+        // A status written into the table around the object.
         store
-            .set_status(id, WorkerStatus::Ready, 1)
+            .set_status(id, WorkerStatus::NotReady, 1)
             .expect("a status");
-        let object = objects.object(id).expect("the object");
-        let stated = objects.row_of(&object).expect("the object's row");
-        assert_eq!(
-            stated.status,
-            WorkerStatus::Pending,
-            "the object is not told"
-        );
-        let record = objects.record(&store, id).expect("the record");
-        assert_eq!(record.status, WorkerStatus::Ready);
-        assert_eq!(
-            Some(record),
-            store.get(id),
-            "the table's row, status and all"
-        );
+        assert_eq!(read(), [Some(WorkerStatus::Ready); 3]);
     }
 }

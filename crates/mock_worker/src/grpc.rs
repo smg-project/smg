@@ -1922,42 +1922,51 @@ struct LoadRecordsOnly {
     clocks: Vec<RankClock>,
     like: LoadsLike,
     step_reports: bool,
-    pending: VecDeque<common::KvEventBatch>,
+    /// The ranks the current look has still to visit, one batch per poll: a
+    /// rank's record is read, judged and numbered as its batch goes out, so
+    /// the load-mute hook holds from the batch after it was set.
+    to_visit: std::ops::Range<usize>,
     next_tick: Instant,
     sample: u64,
 }
 
 impl LoadRecordsOnly {
-    fn collect_due(&mut self, now: Instant) {
-        for (index, (source, clock)) in self.ranks.iter().zip(&mut self.clocks).enumerate() {
-            let mut record = source.record(self.like, self.step_reports, 0);
-            if !clock.due(&record, now) {
-                continue;
-            }
-            self.sample += 1;
-            record.sample = self.sample;
-            record.load_only = true;
-            clock.sent(&record, now);
-            self.pending.push_back(common::KvEventBatch {
-                sequence_number: 0,
-                timestamp: engine::unix_seconds(),
-                events: Vec::new(),
-                dp_rank: Some(i32::try_from(index).unwrap_or(i32::MAX)),
-                snapshot: None,
-                load: Some(record),
-            });
+    /// The `load_only` batch of rank `index` if its record is due now.
+    /// Under the load-mute hook the rank sends none and its clock stands.
+    fn due_batch(&mut self, index: usize) -> Option<common::KvEventBatch> {
+        let (source, clock) = (self.ranks.get(index)?, self.clocks.get_mut(index)?);
+        if source.engine.load_muted() {
+            return None;
         }
+        let now = Instant::now();
+        let mut record = source.record(self.like, self.step_reports, 0);
+        if !clock.due(&record, now) {
+            return None;
+        }
+        self.sample += 1;
+        record.sample = self.sample;
+        record.load_only = true;
+        clock.sent(&record, now);
+        Some(common::KvEventBatch {
+            sequence_number: 0,
+            timestamp: engine::unix_seconds(),
+            events: Vec::new(),
+            dp_rank: Some(i32::try_from(index).unwrap_or(i32::MAX)),
+            snapshot: None,
+            load: Some(record),
+        })
     }
 
     async fn next(&mut self) -> common::KvEventBatch {
         loop {
-            if let Some(batch) = self.pending.pop_front() {
-                return batch;
+            while let Some(index) = self.to_visit.next() {
+                if let Some(batch) = self.due_batch(index) {
+                    return batch;
+                }
             }
             tokio::time::sleep_until(self.next_tick.into()).await;
-            let now = Instant::now();
-            self.next_tick = now + LOAD_TICK;
-            self.collect_due(now);
+            self.next_tick = Instant::now() + LOAD_TICK;
+            self.to_visit = 0..self.ranks.len();
         }
     }
 }
@@ -1972,7 +1981,7 @@ fn load_records_only(
         ranks,
         like,
         step_reports,
-        pending: VecDeque::new(),
+        to_visit: 0..0,
         next_tick: Instant::now(),
         sample: 0,
     };
@@ -1997,8 +2006,10 @@ struct LoadRecords {
     /// batches repeat (`None` before the rank's first batch; a stream that
     /// resumed starts at its cursor), and the rank's record clock.
     beats: Vec<(Option<u64>, RankClock)>,
-    /// The `load_only` batches a tick found due, sent one per poll.
-    due: VecDeque<common::KvEventBatch>,
+    /// The ranks the current look has still to visit, one `load_only` batch
+    /// per poll: a rank is judged as its batch goes out, so the load-mute
+    /// hook holds from the batch after it was set.
+    to_visit: std::ops::Range<usize>,
     /// When the records are looked at next: a deadline kept across batches,
     /// as the Rust relay's.
     next_tick: Instant,
@@ -2040,22 +2051,26 @@ impl LoadRecords {
         record
     }
 
-    /// A batch of `rank`'s events goes out numbered `sequence` with `record`
-    /// on it: the rank's silence starts over. As [`source`](Self::source),
-    /// a batch that names no rank or one past the ranks counts for rank 0.
-    fn published(&mut self, rank: Option<i32>, sequence: u64, record: &common::EngineLoad) {
+    /// A batch of `rank`'s events goes out numbered `sequence`, with
+    /// `record` on it unless the load-mute hook withholds it: the rank's
+    /// `load_only` batches repeat that sequence, and with a record the
+    /// rank's silence starts over. As [`source`](Self::source), a batch that
+    /// names no rank or one past the ranks counts for rank 0.
+    fn published(&mut self, rank: Option<i32>, sequence: u64, record: Option<&common::EngineLoad>) {
         let index = rank
             .and_then(|rank| usize::try_from(rank).ok())
             .filter(|&index| index < self.beats.len())
             .unwrap_or(0);
         if let Some((last, clock)) = self.beats.get_mut(index) {
             *last = Some(sequence);
-            clock.idle_heartbeats = 0;
-            clock.sent(record, Instant::now());
+            if let Some(record) = record {
+                clock.idle_heartbeats = 0;
+                clock.sent(record, Instant::now());
+            }
         }
     }
 
-    /// Queue a `load_only` batch for every rank whose record moved since the
+    /// The `load_only` batch of rank `index` if its record moved since the
     /// rank's last one sent, or after the heartbeat interval of the rank's
     /// silence (the backoff interval after two unchanged heartbeats): each
     /// rank on its own clock, as the Rust relay. A batch repeats the rank's
@@ -2063,37 +2078,38 @@ impl LoadRecords {
     /// gateway expects. With neither there is none to repeat: as the Rust
     /// relay, the mock sends one numbered 0 only to a subscriber that asked
     /// for records before the first batch, and keeps an older subscriber
-    /// waiting for that batch.
-    fn queue_due_records(&mut self) {
+    /// waiting for that batch. Under the load-mute hook the rank sends none
+    /// and its clock stands.
+    fn due_batch(&mut self, index: usize) -> Option<common::KvEventBatch> {
         let now = Instant::now();
-        for index in 0..self.beats.len() {
-            let rank = i32::try_from(index).ok();
-            let Some(sequence_number) = self.beats.get(index).and_then(|(last, _)| {
-                last.or_else(|| self.records_before_first_batch.then_some(0))
-            }) else {
-                continue;
-            };
-            let current = self.current(rank, 0);
-            let due = self
-                .beats
-                .get_mut(index)
-                .is_some_and(|(_, clock)| clock.due(&current, now));
-            if !due {
-                continue;
-            }
-            let record = self.record(rank, true);
-            if let Some((_, clock)) = self.beats.get_mut(index) {
-                clock.sent(&record, now);
-            }
-            self.due.push_back(common::KvEventBatch {
-                sequence_number,
-                timestamp: engine::unix_seconds(),
-                events: Vec::new(),
-                dp_rank: rank,
-                snapshot: None,
-                load: Some(record),
-            });
+        let rank = i32::try_from(index).ok();
+        let sequence_number = self
+            .beats
+            .get(index)
+            .and_then(|(last, _)| last.or_else(|| self.records_before_first_batch.then_some(0)))?;
+        if self.source(rank).engine.load_muted() {
+            return None;
         }
+        let current = self.current(rank, 0);
+        let due = self
+            .beats
+            .get_mut(index)
+            .is_some_and(|(_, clock)| clock.due(&current, now));
+        if !due {
+            return None;
+        }
+        let record = self.record(rank, true);
+        if let Some((_, clock)) = self.beats.get_mut(index) {
+            clock.sent(&record, now);
+        }
+        Some(common::KvEventBatch {
+            sequence_number,
+            timestamp: engine::unix_seconds(),
+            events: Vec::new(),
+            dp_rank: rank,
+            snapshot: None,
+            load: Some(record),
+        })
     }
 }
 
@@ -2132,14 +2148,16 @@ fn with_load_records(
         like,
         step_reports,
         records_before_first_batch,
-        due: VecDeque::new(),
+        to_visit: 0..0,
         next_tick: Instant::now() + LOAD_TICK,
         sample: 0,
     };
     Box::pin(stream::unfold(records, |mut records| async move {
         loop {
-            if let Some(batch) = records.due.pop_front() {
-                return Some((Ok(batch), records));
+            while let Some(index) = records.to_visit.next() {
+                if let Some(batch) = records.due_batch(index) {
+                    return Some((Ok(batch), records));
+                }
             }
             let waited = tokio::select! {
                 item = records.stream.next() => Waited::Item(item),
@@ -2149,14 +2167,17 @@ fn with_load_records(
                 Waited::Item(None) => return None,
                 Waited::Item(Some(Err(status))) => return Some((Err(status), records)),
                 Waited::Item(Some(Ok(mut batch))) => {
-                    let record = records.record(batch.dp_rank, false);
-                    records.published(batch.dp_rank, batch.sequence_number, &record);
-                    batch.load = Some(record);
+                    // As a relay whose load source knows nothing: the
+                    // events of a rank under the load-mute hook go out
+                    // without a record.
+                    let muted = records.source(batch.dp_rank).engine.load_muted();
+                    batch.load = (!muted).then(|| records.record(batch.dp_rank, false));
+                    records.published(batch.dp_rank, batch.sequence_number, batch.load.as_ref());
                     return Some((Ok(batch), records));
                 }
                 Waited::Tick => {
                     records.next_tick = Instant::now() + LOAD_TICK;
-                    records.queue_due_records();
+                    records.to_visit = 0..records.beats.len();
                 }
             }
         }
@@ -3511,6 +3532,69 @@ mod tests {
                 "asked: {asked}"
             );
         }
+    }
+
+    /// A rank under the load-mute hook pushes no load record. Its batch of
+    /// events goes out without one and counts as the rank's last: cleared,
+    /// the rank's `load_only` batch repeats that sequence. A hook set
+    /// between two batches of one look holds: the next batch is the next
+    /// rank's.
+    #[tokio::test]
+    async fn a_load_mute_withholds_a_ranks_pushed_record() {
+        let engines: Vec<Engine> = (0..3)
+            .map(|_| Engine::spawn(engine::EngineParams::default()))
+            .collect();
+        let source = |rank: usize| RankLoadSource {
+            engine: engines[rank].clone(),
+            prefill_pending: Arc::new(AtomicU64::new(0)),
+            counts_resident: false,
+            values: Vec::new(),
+        };
+        engines[1].fault_load_mute(true);
+        let seventh = common::KvEventBatch {
+            sequence_number: 7,
+            events: vec![common::KvCacheEvent::default()],
+            ..Default::default()
+        };
+        let mut events = with_load_records(
+            vec![source(1)],
+            LoadsLike::Mock,
+            false,
+            true,
+            0,
+            Box::pin(stream::iter([Ok::<_, Status>(seventh)]).chain(stream::pending())),
+        );
+        let live = events.next().await.expect("the batch").expect("a batch");
+        assert_eq!(
+            (live.sequence_number, live.events.len(), live.load),
+            (7, 1, None),
+            "the events go out without a record"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(400), events.next())
+                .await
+                .is_err(),
+            "no heartbeat goes out under the hook"
+        );
+        engines[1].fault_load_mute(false);
+        let beat = tokio::time::timeout(Duration::from_millis(500), events.next())
+            .await
+            .expect("a heartbeat once the hook is cleared")
+            .expect("an item")
+            .expect("a batch");
+        assert!(beat.load.as_ref().is_some_and(|load| load.load_only));
+        assert_eq!(beat.sequence_number, 7, "the batch under the hook counts");
+
+        let mut records = load_records_only(
+            vec![source(0), source(1), source(2)],
+            LoadsLike::Mock,
+            false,
+        );
+        let first = records.next().await.expect("an item").expect("a batch");
+        assert_eq!(first.dp_rank, Some(0));
+        engines[1].fault_load_mute(true);
+        let second = records.next().await.expect("an item").expect("a batch");
+        assert_eq!(second.dp_rank, Some(2), "the look skips the muted rank");
     }
 
     #[tokio::test]

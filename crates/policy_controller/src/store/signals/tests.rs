@@ -267,6 +267,34 @@ fn a_value_stated_for_another_rank_of_a_member_is_taken() {
     assert_eq!(taken, SignalWriteOutcome::Written);
 }
 
+/// A value that is taken goes on file and asks the store for no
+/// publication: no world is made for it, and none is due at the window's
+/// end. Neither does the eviction of a member that holds values alone.
+#[test]
+fn a_value_that_is_taken_asks_for_no_publication() {
+    use crate::store::LoadSink;
+
+    let stages = stages();
+    let (store, [a, ..]) = fleet(&stages);
+    let published = store.publications();
+    assert_eq!(store.publish_due(), None);
+    assert_eq!(
+        write(&store, a, 5.0, Instant::now()),
+        SignalWriteOutcome::Written
+    );
+    assert_eq!(
+        (store.publications(), store.publish_due()),
+        (published, None)
+    );
+    // The member holds a value and no load record: its eviction moves no
+    // row a publication shows.
+    store.evict(a);
+    assert_eq!(
+        (store.publications(), store.publish_due()),
+        (published, None)
+    );
+}
+
 #[test]
 fn of_two_sources_the_newer_sample_stands_whichever_arrives_last() {
     let stages = stages();

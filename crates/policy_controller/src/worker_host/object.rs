@@ -130,7 +130,7 @@ pub(super) fn role(worker_type: WorkerType) -> Role {
 
 /// The address the row's object dials, as written. A row that names no
 /// engine dials its key.
-pub(super) fn dial_address(facts: &WorkerFacts) -> &str {
+pub(crate) fn dial_address(facts: &WorkerFacts) -> &str {
     if facts.engine.is_empty() {
         &facts.key
     } else {
@@ -153,13 +153,16 @@ fn wire(modes: WireModes) -> ConnectionMode {
 
 /// The object's health checks under the row's policy, with the row's drain
 /// window where it states one: else the window is the object's default.
+/// A threshold is at least one: the object's state machine judges a row
+/// that states none as one that states one, and no probe moves a worker by
+/// a count of zero.
 fn checks(policy: &HealthPolicy, drain_settle_secs: Option<u32>) -> HealthCheckConfig {
     let default = HealthCheckConfig::default();
     HealthCheckConfig {
         timeout_secs: seconds(policy.timeout_ms),
         check_interval_secs: seconds(policy.check_interval_ms),
-        success_threshold: policy.success_threshold,
-        failure_threshold: policy.failure_threshold,
+        success_threshold: policy.success_threshold.max(1),
+        failure_threshold: policy.failure_threshold.max(1),
         disable_health_check: !policy.probes,
         drain_settle_secs: drain_settle_secs.map_or(default.drain_settle_secs, u64::from),
     }
@@ -256,6 +259,20 @@ mod tests {
 
     /// The table, row by row: each fact the object carries reads back from
     /// the field the table names, and what no row states stays unsaid.
+    /// A threshold a row states as none is one on the object: its state
+    /// machine moves a worker at the first outcome there, and never by a
+    /// count of zero.
+    #[test]
+    fn a_threshold_of_none_is_one_on_the_object() {
+        let policy = HealthPolicy {
+            failure_threshold: 0,
+            success_threshold: 0,
+            ..HealthPolicy::default()
+        };
+        let checks = checks(&policy, None);
+        assert_eq!((checks.failure_threshold, checks.success_threshold), (1, 1));
+    }
+
     #[test]
     fn every_fact_the_table_carries_reads_back_from_the_objects_field() {
         let facts = WorkerFacts {

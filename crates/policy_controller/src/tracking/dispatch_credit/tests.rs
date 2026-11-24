@@ -1098,14 +1098,14 @@ fn a_new_documents_least_load_keeps_the_sends_of_the_standing_one() {
 }
 
 #[test]
-fn least_load_under_a_new_profile_name_starts_with_no_sends() {
+fn least_load_under_a_new_profile_name_keeps_the_sends_under_its_settings() {
     let standing = load_engine(POOL, None);
     let rows = reporting();
     send(&standing, &rows[0], START, TOKENS);
     let next = load_engine("renamed", None);
     next.succeed(&standing);
     let [sent_to, other] = scores(&next, &rows, START + 700);
-    assert_eq!(sent_to, other);
+    assert!(sent_to < other, "{sent_to} against {other}");
 }
 
 #[test]

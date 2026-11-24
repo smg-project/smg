@@ -1084,6 +1084,80 @@ mod tests {
     }
 
     #[test]
+    fn a_rows_eight_flags_are_one_word() {
+        use std::{array, mem::offset_of};
+        // Every flag of the health record is named: one it gains does not
+        // compile here until `row_word`'s packing and the masks are looked
+        // at again.
+        let none = Health::default();
+        let Health {
+            healthy: _,
+            breaker_open: _,
+            stalled: _,
+            draining: _,
+            overloaded: _,
+        } = none;
+        // `row_word` is one load only while these eight bytes sit side by
+        // side in the row, in the word's order.
+        let at = offset_of!(Candidate, health);
+        assert_eq!(
+            [
+                at + offset_of!(Health, healthy),
+                at + offset_of!(Health, breaker_open),
+                at + offset_of!(Health, stalled),
+                at + offset_of!(Health, draining),
+                at + offset_of!(Health, overloaded),
+                offset_of!(Candidate, session_hit),
+                offset_of!(Candidate, has_capacity),
+                offset_of!(Candidate, has_room),
+            ],
+            array::from_fn::<usize, 8, _>(|i| at + i),
+        );
+        // And the word holds each flag in its own byte, in that order.
+        let health = |health| Candidate {
+            health,
+            ..Candidate::default()
+        };
+        let alone = [
+            health(Health {
+                healthy: true,
+                ..none
+            }),
+            health(Health {
+                breaker_open: true,
+                ..none
+            }),
+            health(Health {
+                stalled: true,
+                ..none
+            }),
+            health(Health {
+                draining: true,
+                ..none
+            }),
+            health(Health {
+                overloaded: true,
+                ..none
+            }),
+            Candidate {
+                session_hit: true,
+                ..Candidate::default()
+            },
+            Candidate {
+                has_capacity: true,
+                ..Candidate::default()
+            },
+            Candidate {
+                has_room: true,
+                ..Candidate::default()
+            },
+        ];
+        for (place, row) in alone.iter().enumerate() {
+            assert_eq!(row_word(row), 1 << (8 * place), "flag {place}");
+        }
+    }
+
+    #[test]
     fn a_filter_of_a_hosts_folds_its_profile_into_no_row_test() {
         /// A host's filter around the health filter: the same word on every
         /// row, and a type the engine does not hold.

@@ -42,8 +42,8 @@
 //! health from the rows can use [`Objects::with_status_followed`] to copy
 //! their status on tail changes and snapshots, for objects kept or laid
 //! again. The holder checks the row's revision under the object's
-//! mutation lock and hands the registry the status, as the health
-//! adapter does: the registry's subscribers hear the change, and a
+//! mutation lock and hands the registry the status: the registry's
+//! subscribers hear the change, and a
 //! promotion comes back as any promotion does. The host's vetoes stand.
 //! The id and the revision stand beside the object in the
 //! holder ([`RowRevision`]), with every fact of the row the object does not
@@ -60,8 +60,10 @@
 //!
 //! # The adapters
 //!
-//! [`HealthAdapter`] writes probe outcomes and connect signals to the store
-//! and sets the object's status to the status that stands there. The host
+//! [`HealthAdapter`] hands a probe's outcome to the registry's own health
+//! machine, which moves the object, and tells the store the status that
+//! stands on it. A connect signal is written the same way: the object's
+//! status leads its row's. The host
 //! supplies the [`Lead`] and the term the adapter writes under.
 //!
 //! [`load_monitor`] is the worker crate's own load monitor over the
@@ -142,7 +144,11 @@ pub(crate) use membership_writer::{
 pub use membership_writer::{
     MembershipWriteOutcome, MembershipWriteRefused, MembershipWriter, Over, Precondition, Remover,
 };
+#[cfg(feature = "controller")]
+pub(crate) use object::dial_address;
 pub use object::object;
+#[cfg(all(test, feature = "controller"))]
+pub(crate) use objects::stand;
 pub use objects::{Objects, RowRevision};
 pub use steps::{
     registrant_of, registration_into_store, registration_into_store_keeping_credentials,

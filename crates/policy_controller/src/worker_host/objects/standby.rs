@@ -22,9 +22,15 @@
 //! an event changes in place keeps the instant its entry holds, as the
 //! store keeps its own row's.
 //!
-//! A status is the table's word still. A status event is handed to the
-//! store, and the holder copies the status onto the object in the same
-//! turn, where it follows statuses ([`Objects::with_status_followed`]).
+//! A told status is the leader's word. A status event is handed to the
+//! store, and the holder lays the status on the object in the same turn.
+//! So are the statuses of a cut laid whole, each on its row's object. A
+//! told row lays its status too: an object laid in another's place takes
+//! the standing object's, and a probe of a term that ended can have moved
+//! that one ahead of the row's event. This is the one
+//! way from a table's status to an object's where the objects lead
+//! ([`mod@super::status`]): a holder lays a told status whatever it
+//! follows of its store's own tail.
 //!
 //! A restore is the store's restore and the read of its rows in one turn
 //! of the holder: nothing that takes the turn finds the objects of one
@@ -59,8 +65,9 @@ impl<G: Generation> Objects<G> {
     /// One membership event of the leader's stream, at its place `at` in
     /// the leader's log: the write of [`MemoryStore::follow`], laid here.
     /// `epoch`, `change` and `row` are the event's, as that write takes
-    /// them. The applier reads whether the event landed off the log's
-    /// guard of its place.
+    /// them. Whether the store took the event: a gateway's watcher reads
+    /// it here, and a standby's applier off the log's guard of the
+    /// event's place.
     pub(crate) fn follow_at(
         &self,
         store: &MemoryStore,
@@ -68,16 +75,18 @@ impl<G: Generation> Objects<G> {
         epoch: u64,
         change: MembershipChange,
         row: Option<WorkerRow>,
-    ) {
+    ) -> bool {
         let mut place = self.read_to.lock();
         self.follow_from(store, &mut place);
         match (change, row) {
             // The object leaves the registry, then the store is told.
             (MembershipChange::Removed { id }, None) => {
                 self.end(id);
-                if !store.follow_landed(at, epoch, change, None) {
+                let landed = store.follow_landed(at, epoch, change, None);
+                if !landed {
                     self.settle(store, id);
                 }
+                landed
             }
             (change, Some(mut row)) => {
                 if matches!(
@@ -90,17 +99,21 @@ impl<G: Generation> Objects<G> {
                     }
                 }
                 let built = self.build(&row);
-                if store.follow_landed(at, epoch, change, Some(row.clone())) {
+                let landed = store.follow_landed(at, epoch, change, Some(row.clone()));
+                if landed {
                     self.put(store, &row, built);
+                    // The row's status is the leader's word too.
+                    self.copy_status(store, row.id);
                 }
+                landed
             }
-            // A status, which the table keeps: the object follows it.
+            // A told status: the table takes it, and the object behind it.
             (change, None) => {
-                if store.follow_landed(at, epoch, change, None) {
-                    if let MembershipChange::StatusChanged { id, .. } = change {
-                        self.follow_status(store, id);
-                    }
+                let landed = store.follow_landed(at, epoch, change, None);
+                if let (true, MembershipChange::StatusChanged { id, .. }) = (landed, change) {
+                    self.copy_status(store, id);
                 }
+                landed
             }
         }
     }
@@ -141,6 +154,11 @@ impl<G: Generation> Objects<G> {
             return false;
         }
         self.follow_from(store, &mut place);
+        // A cut's statuses are told ones, as a status event's is.
+        let rows: Vec<_> = self.held.read().objects.keys().copied().collect();
+        for row in rows {
+            self.copy_status(store, row);
+        }
         true
     }
 }
@@ -149,11 +167,16 @@ impl<G: Generation> Objects<G> {
 mod tests {
     use std::{cell::Cell, rc::Rc, sync::Arc, time::Duration};
 
+    use smg_worker::{identity::basic::Worker, worker::WorkerStatus as ObjectStatus};
+
     use super::{
         super::write::tests::{facts, Replica, A},
         *,
     };
-    use crate::store::{memory::seam, WorkerFacts, WorkerStatus, WorkersStore};
+    use crate::{
+        store::{memory::seam, WorkerFacts, WorkerStatus, WorkersStore},
+        worker_host::Members,
+    };
 
     const B: &str = "http://b:8000";
 
@@ -171,11 +194,16 @@ mod tests {
     }
 
     /// Hand `standby`'s holder one event, at the epoch `ahead` of the
-    /// standby's own: the next one is one ahead.
-    fn hand(standby: &Replica, ahead: u64, change: MembershipChange, row: Option<WorkerRow>) {
+    /// standby's own: the next one is one ahead. The holder's answer.
+    fn hand(
+        standby: &Replica,
+        ahead: u64,
+        change: MembershipChange,
+        row: Option<WorkerRow>,
+    ) -> bool {
         let epoch = standby.store.epoch() + ahead;
         let (store, objects) = (&standby.store, &standby.objects);
-        objects.follow_at(store, at(epoch), epoch, change, row);
+        objects.follow_at(store, at(epoch), epoch, change, row)
     }
 
     /// Hand `standby`'s holder the leader's last write as its next event.
@@ -306,8 +334,31 @@ mod tests {
         assert_eq!(standby.objects.row_of(&object), Some(row));
     }
 
-    /// A status the leader tells is the table's word, and the object
-    /// follows it in the event's own turn: no follow reads it.
+    /// The holder answers whether the store took an event, by each kind: a
+    /// row, a status and a removal answer yes at the next epoch, and no at
+    /// the epoch the store holds already, where nothing fits.
+    #[test]
+    fn a_told_change_answers_whether_the_store_took_it() {
+        let (leader, standby) = (Replica::new(), Replica::new());
+        leader.upsert(facts(1, "gold"));
+        let (change, row) = told(&leader);
+        assert!(hand(&standby, 1, change, row.clone()), "a row");
+        assert!(!hand(&standby, 0, change, row), "a row told again");
+        let id = standby.store.by_key(A).expect("the row stands").id;
+        let (from, to) = (WorkerStatus::Pending, WorkerStatus::Ready);
+        let status = MembershipChange::StatusChanged { id, from, to };
+        assert!(hand(&standby, 1, status, None), "a status");
+        assert!(!hand(&standby, 0, status, None), "a status told again");
+        let removal = MembershipChange::Removed { id };
+        assert!(!hand(&standby, 0, removal, None), "a removal out of place");
+        assert!(standby.object(A).is_some(), "the row stands, laid anew");
+        assert!(hand(&standby, 1, removal, None), "a removal");
+        assert!(standby.objects.is_empty());
+    }
+
+    /// A status the leader tells is laid on the object in the event's own
+    /// turn, by a holder that follows no status of its store's tail: no
+    /// follow reads it.
     #[test]
     fn a_told_status_is_on_the_object_when_the_event_returns() {
         let (leader, standby) = (Replica::new(), Replica::new());
@@ -326,6 +377,73 @@ mod tests {
         let object = standby.object(A).expect("the row's object");
         assert_eq!(standby.objects.row_of(&object), Some(table));
         assert_eq!(standby.objects.read_to(), Some(1), "no follow read it");
+    }
+
+    /// A tell the store takes no word of leaves the object at the status
+    /// its row holds. A probe's move ahead of a tell whose term ended is
+    /// taken back to the row's status. Where the standby's applier laid a
+    /// status its new leader told since the move, the object keeps the
+    /// leader's word: the status the probe saw it leave is not put back.
+    #[test]
+    fn a_refused_tell_leaves_the_object_at_the_status_its_row_holds() {
+        let replica = Replica::new();
+        replica.upsert(facts(1, "gold"));
+        let row = replica.one_row(A).id;
+        let id = replica.object(A).expect("the row's object");
+        let registry = replica.objects.registry();
+        let revision = registry.get(&id).expect("it stands").revision();
+        let statuses = || {
+            let object = registry.get(&id).expect("it stands").status();
+            let table = replica.store.by_key(A).expect("the row stands");
+            (object, table.status)
+        };
+        // The registry's state machine moves the object ahead of a tell,
+        // and the tell's term ended: the store takes no word.
+        let moved = (ObjectStatus::Pending, ObjectStatus::Ready);
+        let moves = || {
+            let ready = |_: &Arc<dyn Worker>| ((), Some(moved.1));
+            registry.apply_if_revision(&id, revision, ready);
+        };
+        let refused = || {
+            let (store, objects) = (&replica.store, &replica.objects);
+            objects
+                .tell_status(store, &id, revision, moved, &|| false)
+                .stands()
+        };
+        moves();
+        assert_eq!(refused(), None);
+        assert_eq!(statuses(), (ObjectStatus::Pending, WorkerStatus::Pending));
+        // The same, with the new leader's word laid between the two.
+        moves();
+        let (from, to) = (WorkerStatus::Pending, WorkerStatus::Ready);
+        let told = MembershipChange::StatusChanged { id: row, from, to };
+        assert!(hand(&replica, 1, told, None));
+        assert_eq!(refused(), None);
+        assert_eq!(statuses(), (ObjectStatus::Ready, WorkerStatus::Ready));
+    }
+
+    /// A told row lays its status too. Its object is laid in the standing
+    /// one's place and takes that one's status, which a probe of a term
+    /// that ended can have moved ahead of the row's event: the leader's
+    /// word stands on the object the event leaves.
+    #[test]
+    fn a_told_row_lays_the_status_its_leader_holds() {
+        let (leader, standby) = (Replica::new(), Replica::new());
+        leader.upsert(facts(1, "gold"));
+        follow(&standby, &leader);
+        let id = standby.object(A).expect("the row's object");
+        let registry = standby.objects.registry();
+        let revision = registry.get(&id).expect("it stands").revision();
+        // The ended term's probe moves the object, and its tell has not run.
+        let ready = |_: &Arc<dyn Worker>| ((), Some(ObjectStatus::Ready));
+        registry.apply_if_revision(&id, revision, ready);
+        // The leader's next word of the row, in place.
+        leader.upsert(facts(1, "iron"));
+        follow(&standby, &leader);
+        let laid = standby.object(A).expect("the row's object");
+        let object = registry.get(&laid).expect("it stands");
+        assert_eq!(object.status(), ObjectStatus::Pending);
+        assert_eq!(standby.one_row(A), leader.one_row(A));
     }
 
     /// A restore lays the cut's rows in its own turn: each has its object
@@ -349,6 +467,39 @@ mod tests {
         assert_eq!(standby.object(B), None, "a row the cut drops");
         assert_eq!(standby.objects.len(), 1);
         assert_eq!(standby.objects.read_to(), Some(leader.store.epoch()));
+    }
+
+    /// A cut's statuses are told ones. Each object states the status its
+    /// row holds in the cut when the cut is laid, by a restore and by a
+    /// watch's snapshot: here the object of a row that stood through it,
+    /// which no lay builds anew. The holder follows no status of its
+    /// store's tail.
+    #[test]
+    fn a_cuts_statuses_are_on_the_objects_when_it_is_laid() {
+        type Lay = fn(&Objects<Members>, &MemoryStore, StoreCheckpoint) -> bool;
+        let lays: [(&str, Lay); 2] = [
+            ("a restore", |objects, store, cut| {
+                objects.restore_from(store, cut)
+            }),
+            ("a watch's snapshot", |objects, store, cut| {
+                objects.watch_from(store, cut)
+            }),
+        ];
+        for (name, lay) in lays {
+            let (leader, standby) = (Replica::new(), Replica::new());
+            leader.upsert(facts(1, "gold"));
+            follow(&standby, &leader);
+            let stood = standby.object(A).expect("the row's object");
+            // The leader readies the row, and the standby is not told.
+            let id = leader.one_row(A).id;
+            leader.objects.connect_row(&leader.store, id, 1);
+            let cut = leader.store.checkpoint();
+            assert!(lay(&standby.objects, &standby.store, cut), "{name}");
+            assert_eq!(standby.object(A).as_ref(), Some(&stood), "{name}");
+            let row = standby.objects.row_of(&stood).expect("its row");
+            assert_eq!(row.status, WorkerStatus::Ready, "{name}");
+            assert_eq!(Some(row), leader.store.by_key(A), "{name}");
+        }
     }
 
     /// A watch's snapshot is laid as a restore is, by the store's door for

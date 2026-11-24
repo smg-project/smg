@@ -10,7 +10,8 @@
 //! ([`sides`]), and the encoders stand beside whichever is taken.
 //!
 //! An item has one encoder and no second. Each is read once, by the one
-//! read a single request's worker gets ([`ready`]), inside the walk: what
+//! read a single request's worker gets ([`ready`]), inside the walk or
+//! inside the decision: what
 //! is read of a host's worker under a lease stands under the walk's catch.
 //! The route's own rule is
 //! asked of the pair's two workers and of no encoder. Where an encoder
@@ -18,8 +19,15 @@
 //! name, and the encoder joins the workers the call's next decision leaves
 //! out, with each side of the pair that cannot be sent to either.
 //!
+//! The decision reads an encoder where it writes where the prompt went: it
+//! asks its maker of each encoder it placed ahead of that write
+//! ([`RequestMaker::sends_to_encoder`]), and records no pair behind one
+//! that cannot be sent to. The walk takes the answer given there.
+//!
 //! Three lists with no item stated are placed as their pair
 //! ([`super::pair`]), and name no encoder.
+//!
+//! [`RequestMaker::sends_to_encoder`]: crate::engine::decision_engine::RequestMaker::sends_to_encoder
 
 use std::{
     cell::{Cell, OnceCell, RefCell},
@@ -29,7 +37,7 @@ use std::{
 
 use super::{
     pair::{self, decode_label, sides},
-    ready, walk, Call, Made, PlaceRequest, Unplaced,
+    raise, ready, walk, Call, Made, PlaceRequest, Unplaced,
 };
 use crate::{
     engine::{
@@ -97,7 +105,7 @@ fn asked<'a>(
     call: &mut Call,
     placed: &mut EncodePlaced,
 ) -> Result<Option<Placement<'a>>, Unplaced> {
-    let made = Made::asked(engine.object, request, call);
+    let mut made = Made::asked(engine.object, request, call);
     let dated = Cell::new(None);
     let clock = || {
         let now = Instant::now();
@@ -105,31 +113,41 @@ fn asked<'a>(
         now
     };
     let decided = engine.decide_encode_at(&made, items, placed, clock);
+    // The route's rule panicked inside the decision, at the question of
+    // where the prompt goes: the panic is the caller's, as a pair's is.
+    if let Some(panic) = made.panicked.take() {
+        // An encode decision is whole: no place answers it.
+        raise(engine.object, panic, decided.ok(), Ok((None, dated.get())));
+    }
     let (decided, later) = decided.map_err(Unplaced::Refused)?;
     let (key, kept) = (made.key(), [made.sent.get(), made.decodes.get()]);
+    // What the decision was answered on the encoders it asked of.
+    let answered = made.encoders.take();
     if prefills_full(&decided.decision) {
         return Err(Unplaced::PrefillsFull);
     }
     let now = dated.get().unwrap_or_else(Instant::now);
     // Each item's encoder, and the id of each one that cannot be sent to.
-    // A decision that placed nothing names none.
+    // A decision that placed nothing names none. An encoder the decision
+    // asked of is taken by the answer it was given there, and read no more.
     let encoders = || {
         let mut workers = Vec::with_capacity(placed.encoders().len());
         let mut down = Vec::new();
         for encoder in placed.encoders() {
             let worker = lists.encoders.workers.get(encoder.position as usize);
-            match worker.filter(|worker| ready(worker.as_ref())) {
+            let held = answered.answer(encoder.position);
+            match worker.filter(|worker| held.unwrap_or_else(|| ready(worker.as_ref()))) {
                 Some(worker) => workers.push(Arc::clone(worker)),
                 None => down.push(encoder.id),
             }
         }
         (workers, down)
     };
-    // The encoders are read once, at the walk's first target, so under its
-    // catch: a leased decision is given up as a panic passes. Behind an
-    // encoder that cannot be sent to no target is taken: the walk reads
-    // each target's sides all the same, notes the ones that cannot be sent
-    // to, and gives the decision up.
+    // The other encoders are read once, at the walk's first target, so
+    // under its catch: a leased decision is given up as a panic passes.
+    // Behind an encoder that cannot be sent to no target is taken: the walk
+    // reads each target's sides all the same, notes the ones that cannot be
+    // sent to, and gives the decision up.
     let read = OnceCell::new();
     let taken = walk(engine, decided, later, now, &mut call.missed, |target| {
         let (_, down) = read.get_or_init(&encoders);

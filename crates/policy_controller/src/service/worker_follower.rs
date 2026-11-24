@@ -378,29 +378,39 @@ mod tests {
         }
     }
 
+    /// What a follower's owner found at its calls: the calls that found
+    /// the worker objects standing, one object for each row the store
+    /// holds and no other, and the calls that did not.
+    #[derive(Default)]
+    struct Calls {
+        settled: AtomicUsize,
+        missed: AtomicUsize,
+    }
+
     /// A follower of `settings` over `store` and a holder of its own, and
-    /// the number of times it called its owner with the worker objects
-    /// standing: one object for each row the store holds, and no other.
-    /// The owner lays nothing, so a call that finds a row without its
-    /// object is not counted.
+    /// what its owner found at each call. The owner lays nothing, so a
+    /// call that finds a row without its object is a miss.
     fn following(
         settings: WorkerFollowerSettings,
         store: &Arc<MemoryStore>,
-    ) -> (WorkerFollower, Arc<AtomicUsize>) {
-        let settled = Arc::new(AtomicUsize::new(0));
+    ) -> (WorkerFollower, Arc<Calls>) {
+        let calls = Arc::new(Calls::default());
         let registry = Arc::new(WorkerRegistry::new());
-        let objects = Arc::new(Objects::<Members>::new(registry).with_status_followed());
+        let objects = Arc::new(Objects::<Members>::new(registry));
         let follower = WorkerFollower::start(settings, Arc::clone(store), Arc::clone(&objects), {
-            let (settled, store) = (Arc::clone(&settled), Arc::clone(store));
+            let (calls, store) = (Arc::clone(&calls), Arc::clone(store));
             move || {
                 let (_, rows) = store.all_rows();
                 let stand = rows.iter().all(|row| objects.object(row.id).is_some());
-                if stand && objects.len() == rows.len() {
-                    settled.fetch_add(1, Relaxed);
-                }
+                let found = if stand && objects.len() == rows.len() {
+                    &calls.settled
+                } else {
+                    &calls.missed
+                };
+                found.fetch_add(1, Relaxed);
             }
         });
-        (follower, settled)
+        (follower, calls)
     }
 
     fn operator<T>(body: T) -> Request<T> {
@@ -516,12 +526,13 @@ mod tests {
             .bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
             .unwrap();
         let store = Arc::new(MemoryStore::new());
-        let (follower, settled) = following(settings(socket.local_addr().unwrap()), &store);
+        let (follower, calls) = following(settings(socket.local_addr().unwrap()), &store);
         let progress = follower.first_snapshot.clone();
         time::sleep(Duration::from_millis(300)).await;
         assert!(!follower.has_first_snapshot());
         assert!(rows(&store).is_empty());
-        assert_eq!(settled.load(Relaxed), 0);
+        let called = calls.settled.load(Relaxed) + calls.missed.load(Relaxed);
+        assert_eq!(called, 0, "no call at all");
         time::timeout(Duration::from_secs(1), follower.stop())
             .await
             .unwrap();
@@ -540,9 +551,9 @@ mod tests {
             .unwrap();
         let expected = rows(&controller.store);
         let store = Arc::new(MemoryStore::new());
-        let (follower, settled) = following(settings(controller.address), &store);
+        let (follower, calls) = following(settings(controller.address), &store);
         until("the first snapshot", || follower.has_first_snapshot()).await;
-        assert!(settled.load(Relaxed) > 0);
+        assert!(calls.settled.load(Relaxed) > 0);
         assert!(store.get(WorkerId(row.id)).is_some());
 
         controller.stop().await;
@@ -552,6 +563,7 @@ mod tests {
         time::timeout(Duration::from_secs(1), follower.stop())
             .await
             .unwrap();
+        assert_eq!(calls.missed.load(Relaxed), 0, "each call found them");
     }
 
     /// A leader a replica names is dialed at once, and so is the leader that

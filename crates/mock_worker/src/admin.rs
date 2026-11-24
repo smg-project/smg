@@ -15,11 +15,13 @@
 //!   cache and publish `AllBlocksCleared` (an engine restart, to the index).
 //! - `POST /admin/fault/{worker}/drop?batches=N`, `.../duplicate?batches=N`,
 //!   `.../swap?pairs=N`, `.../cut-streams`, `.../delay?ms=D`,
-//!   `.../restart-publisher`, `.../pause`, `.../resume`,
+//!   `.../load-lag?ms=D`, `.../restart-publisher`, `.../pause`, `.../resume`,
 //!   `.../fail?status=S[&count=N|&secs=T][&after_tokens=K][&stall_ms=M]` and
 //!   `GET /admin/fault/{worker}`: the fault hooks (see the README).
 //! - `POST /admin/fault/{worker}/load-fail?status=S`: the worker's load
 //!   polls are answered with S instead of a report (see the README).
+//! - `POST /admin/fault/{worker}/load-mute?on=B`: the worker pushes no
+//!   load report while B is `true` (see the README).
 //! - `GET /admin/ops/{worker}`: what the gateway's admin fan-out reached on
 //!   the worker: its flushes, its profiling runs and the last trace written
 //!   (`all`: every worker).
@@ -91,6 +93,7 @@ fn router(state: Arc<AdminState>) -> Router {
         .route("/admin/fault/{worker}/admit-delay", post(fault_admit_delay))
         .route("/admin/fault/{worker}/admit-rate", post(fault_admit_rate))
         .route("/admin/fault/{worker}/cold-shape", post(fault_cold_shape))
+        .route("/admin/fault/{worker}/load-lag", post(fault_load_lag))
         .route(
             "/admin/fault/{worker}/restart-publisher",
             post(fault_restart_publisher),
@@ -99,6 +102,7 @@ fn router(state: Arc<AdminState>) -> Router {
         .route("/admin/fault/{worker}/resume", post(fault_resume))
         .route("/admin/fault/{worker}/fail", post(fault_fail))
         .route("/admin/fault/{worker}/load-fail", post(fault_load_fail))
+        .route("/admin/fault/{worker}/load-mute", post(fault_load_mute))
         .route("/admin/ops/{worker}", get(ops_status))
         .route("/admin/truth", get(truth_served))
         .route("/admin/truth/{worker}", post(truth_prompt))
@@ -250,14 +254,25 @@ fn find(name: &str) -> Option<Engine> {
         .find(|e| e.name() == name)
 }
 
-/// The engines a `{worker}` path segment addresses: one by name, or `all`.
+/// Whether the engine named `engine` is `worker`'s: its own engine, or one
+/// of its data-parallel ranks (`<worker>:r<k>`).
+fn is_engine_of(worker: &str, engine: &str) -> bool {
+    engine
+        .strip_prefix(worker)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(":r"))
+}
+
+/// The engines a `{worker}` path segment addresses: one by name, each rank
+/// of a data-parallel worker by the worker's name, or `all`.
 fn select(worker: &str) -> Result<Vec<Engine>, Response> {
-    if worker == "all" {
-        return Ok(engine::fleet_engines());
+    let mut engines = engine::fleet_engines();
+    if worker != "all" {
+        engines.retain(|e| is_engine_of(worker, e.name()));
+        if engines.is_empty() {
+            return Err((StatusCode::NOT_FOUND, "unknown worker").into_response());
+        }
     }
-    find(worker)
-        .map(|e| vec![e])
-        .ok_or_else(|| (StatusCode::NOT_FOUND, "unknown worker").into_response())
+    Ok(engines)
 }
 
 fn status_json(e: &Engine) -> Value {
@@ -285,6 +300,7 @@ fn status_json(e: &Engine) -> Value {
         "admit_delay_ms": s.admit_delay_ms,
         "admit_per_sec": s.admit_per_sec,
         "cold_shape_ms": s.cold_shape_ms,
+        "load_lag_ms": s.load_lag_ms,
         "paused": s.paused,
         "generation": s.generation,
         "restarts": s.restarts,
@@ -298,6 +314,7 @@ fn status_json(e: &Engine) -> Value {
         "cut_total": s.cut_total,
         "stalled_total": s.stalled_total,
         "load_fail_status": s.load_fail_status,
+        "load_muted": s.load_muted,
     })
 }
 
@@ -408,11 +425,7 @@ fn fleet_rows(cfg: &Config) -> Vec<Value> {
     for worker in script::registered() {
         let mut found = false;
         for (index, e) in engines.iter().enumerate() {
-            let rank_of_worker = e
-                .name()
-                .strip_prefix(worker.as_str())
-                .is_some_and(|rest| rest.starts_with(":r"));
-            if e.name() == worker || rank_of_worker {
+            if is_engine_of(&worker, e.name()) {
                 rows.push(engine_row(e, cfg));
                 listed[index] = true;
                 found = true;
@@ -431,7 +444,7 @@ fn fleet_rows(cfg: &Config) -> Vec<Value> {
 }
 
 fn engine_row(e: &Engine, cfg: &Config) -> Value {
-    let load = e.load();
+    let load = e.load_truth();
     json!({
         "worker": e.name(),
         "engine": "realistic",
@@ -655,6 +668,18 @@ async fn fault_cold_shape(
     apply(&worker, |e| e.fault_cold_shape_ms(ms))
 }
 
+/// The worker's load reports state its counts of `ms` milliseconds ago.
+async fn fault_load_lag(
+    Path(worker): Path<String>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let ms: u64 = match param(&q, "ms") {
+        Ok(v) => v,
+        Err(response) => return response,
+    };
+    apply(&worker, |e| e.fault_load_lag_ms(ms))
+}
+
 async fn fault_admit_rate(
     Path(worker): Path<String>,
     Query(q): Query<HashMap<String, String>>,
@@ -708,6 +733,19 @@ async fn fault_load_fail(
         return (StatusCode::BAD_REQUEST, why).into_response();
     }
     apply(&worker, |e| e.fault_load_fail(status))
+}
+
+/// The worker pushes no load report (`on=true`), or pushes it again
+/// (`on=false`).
+async fn fault_load_mute(
+    Path(worker): Path<String>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let on: bool = match param(&q, "on") {
+        Ok(v) => v,
+        Err(response) => return response,
+    };
+    apply(&worker, |e| e.fault_load_mute(on))
 }
 
 async fn fault_resume(Path(worker): Path<String>) -> Response {
@@ -933,6 +971,32 @@ mod tests {
         .await
         .expect("the server stops at the bind");
         drop(taken);
+    }
+
+    /// A hook addressed to a data-parallel worker by the worker's own name
+    /// reaches each of its ranks, and a rank's name that rank alone.
+    #[tokio::test]
+    async fn a_workers_name_addresses_each_of_its_ranks() {
+        // The fleet is process-wide; the names below are this test's own.
+        let ranks = ["grpc:hooked-dp:r0", "grpc:hooked-dp:r1"]
+            .map(|name| Engine::spawn_named(engine::EngineParams::default(), name.into(), true));
+        let paused = || ranks.each_ref().map(|rank| rank.fault_status().paused);
+        let answer = fault_pause(Path("grpc:hooked-dp".to_string())).await;
+        assert_eq!(
+            answer.status(),
+            StatusCode::OK,
+            "the name of the worker reaches its ranks"
+        );
+        assert_eq!(paused(), [true, true]);
+        let answer = fault_resume(Path("grpc:hooked-dp:r1".to_string())).await;
+        assert_eq!(answer.status(), StatusCode::OK);
+        assert_eq!(paused(), [true, false]);
+        // A name that only begins like the worker's addresses none of them.
+        let answer = fault_resume(Path("grpc:hooked".to_string())).await;
+        assert_eq!(answer.status(), StatusCode::NOT_FOUND);
+        assert_eq!(paused(), [true, false]);
+        fault_resume(Path("grpc:hooked-dp".to_string())).await;
+        assert_eq!(paused(), [false, false]);
     }
 
     #[tokio::test]

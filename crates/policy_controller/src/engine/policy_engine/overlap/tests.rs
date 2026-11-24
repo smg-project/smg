@@ -569,6 +569,82 @@ fn the_record_names_the_worker_a_prefix_was_sent_to() {
     assert_eq!(bed.affinity.left_out(), 0);
 }
 
+/// A model's record of sent prefixes is its workers' model's, and so is its
+/// bound: the index settings of the id the workers registered under,
+/// whatever name a request gives the model.
+#[test]
+fn a_request_under_another_name_leaves_the_records_bound() {
+    use crate::document::spec::IndexSpec;
+    let (affinity, _, _) = hosted(false);
+    let mut document = PolicySpec::preset("cache_aware").expect("the preset");
+    document.generation = 1;
+    // One placement under any other name, the default under the workers'.
+    let one = IndexSpec {
+        max_size: u64::from(BLOCK),
+        ..IndexSpec::default()
+    };
+    document.index.insert("*".into(), one);
+    document.index.insert(MODEL.into(), IndexSpec::default());
+    let spec = AppliedSpec::validate(&document).expect("the document validates");
+    let bed = Bed::new(affinity, spec, 4);
+    let asked = prompt(1_000, 4);
+    bed.decide(&request(&asked, 7, NOW), Some(1));
+    assert_eq!(bed.holders(&asked, NOW), [(1, 0, 4)]);
+    // A request with no prompt that names the model by another name.
+    let other = RequestFacts {
+        model: "another-name",
+        seed: 7,
+        now_micros: NOW,
+        ..RequestFacts::default()
+    };
+    bed.decide(&other, None);
+    bed.affinity.sweep();
+    assert_eq!(bed.holders(&asked, NOW), [(1, 0, 4)]);
+}
+
+/// A model its workers registered after their first shares the record of
+/// the id they registered first, and that id's index settings bound it: a
+/// request for the later model reads them, before a request for the first
+/// model and after one.
+#[test]
+fn a_later_model_of_its_workers_shares_the_first_models_record() {
+    use smg_worker::{
+        identity::builder::BasicWorkerBuilder, model_card::ModelCard, test_support::no_health_check,
+    };
+
+    use crate::document::spec::IndexSpec;
+    const LATER: &str = "model-b";
+    let (affinity, _, _) = hosted(false);
+    let mut document = PolicySpec::preset("cache_aware").expect("the preset");
+    document.generation = 1;
+    // One placement under the later model's name, the default under the first's.
+    let one = IndexSpec {
+        max_size: u64::from(BLOCK),
+        ..IndexSpec::default()
+    };
+    document.index.insert(LATER.into(), one);
+    document.index.insert(MODEL.into(), IndexSpec::default());
+    let spec = AppliedSpec::validate(&document).expect("the document validates");
+    let mut bed = Bed::new(affinity, spec, 4);
+    for (at, worker) in bed.workers.iter_mut().enumerate() {
+        let models = vec![ModelCard::new(MODEL), ModelCard::new(LATER)];
+        let built = <BasicWorkerBuilder>::new(address(at)).models(models);
+        *worker = Arc::new(built.health_config(no_health_check()).build());
+    }
+    let asked = prompt(1_000, 4);
+    let later = RequestFacts {
+        model: LATER,
+        ..request(&asked, 7, NOW)
+    };
+    bed.decide(&later, Some(1));
+    bed.affinity.sweep();
+    // The holders are asked under the first model's name.
+    assert_eq!(bed.holders(&asked, NOW), [(1, 0, 4)]);
+    bed.decide(&later, None);
+    bed.affinity.sweep();
+    assert_eq!(bed.holders(&asked, NOW), [(1, 0, 4)]);
+}
+
 /// A pick the binding's sessions rule placed alone is recorded by the
 /// rule's own word of it, at both of the record's writes: the one behind a
 /// decision named its rows, and the one behind a decision handed the column
@@ -1089,6 +1165,37 @@ fn a_worker_that_leaves_under_its_first_pick_is_given_no_place() {
     assert!(holders_behind(&|| bed.affinity.forget(bed.ids[2])).is_empty());
     let standing = [bed.ids[0], bed.ids[1], bed.ids[3]];
     assert!(holders_behind(&|| bed.affinity.keep(&standing)).is_empty());
+}
+
+/// A pin's answer made ahead of a leave and handed through the lookup
+/// behind it gives its worker no place; with no leave between it writes.
+#[test]
+fn an_answer_made_ahead_of_a_leave_gives_its_worker_no_place() {
+    let (affinity, _, _) = hosted(false);
+    let bed = Bed::new(affinity, preset("cache_aware"), 4);
+    let asked = prompt(1_000, 4);
+    let holders_behind = |leave: &dyn Fn()| {
+        let (leaves, made) = (bed.affinity.leaves(), picked(2, bed.ids[2]));
+        leave();
+        let decision = decide_behind(
+            &bed.affinity,
+            &bed.pool,
+            &bed.spec,
+            &bed.workers,
+            &bed.ids,
+            &mut request(&asked, 7, NOW),
+            |_| None,
+            |_| true,
+            leaves,
+            made,
+        );
+        assert!(decision.pick().is_some());
+        bed.holders(&asked, NOW)
+    };
+    assert_eq!(holders_behind(&|| bed.affinity.forget(bed.ids[2])), []);
+    let standing = [bed.ids[0], bed.ids[1], bed.ids[3]];
+    assert_eq!(holders_behind(&|| bed.affinity.keep(&standing)), []);
+    assert_eq!(holders_behind(&|| ()), [(2, 0, 4)]);
 }
 
 /// A list of no worker is read no table: its request is named no holder, no
@@ -3167,4 +3274,25 @@ fn a_holder_is_lowered_to_what_its_groups_serve_before_the_deepest_are_kept() {
     let mut wanted = [(deep, 3), (shallow, 2)];
     wanted.sort_unstable();
     assert_eq!(kept, wanted);
+
+    // Of the depth the cap cuts, the draw says who stays. Workers 0 and 3
+    // serve both of the request's first two blocks, and the cap leaves one.
+    let cut = |drawn: u32| {
+        let mut kept = Vec::new();
+        let mut below = |_: u32| drawn;
+        deepest_within_groups(
+            &index,
+            &groups,
+            &request[..2],
+            BLOCK,
+            &within,
+            1,
+            &mut below,
+            &mut kept,
+        );
+        kept
+    };
+    let mut both = [cut(0), cut(1)].concat();
+    both.sort_unstable();
+    assert_eq!(both, [(all[0], 2), (all[3], 2)]);
 }

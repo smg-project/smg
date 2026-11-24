@@ -2980,10 +2980,10 @@ async fn the_client_at_a_replica_that_does_not_lead_is_told_the_leader() {
         .expect("the case ends inside its outer bound");
 }
 
-/// A watcher of `store` over worker objects of its own, which follow their
-/// rows' status as a gateway's do.
+/// A watcher of `store` over worker objects of its own. The holder follows
+/// no status of the store's tail: it lays each status the watch tells.
 fn watcher_of(store: Arc<MemoryStore>) -> Watcher<Members> {
-    let objects = Objects::new(Arc::new(WorkerRegistry::new())).with_status_followed();
+    let objects = Objects::new(Arc::new(WorkerRegistry::new()));
     Watcher::new(store, Arc::new(objects))
 }
 

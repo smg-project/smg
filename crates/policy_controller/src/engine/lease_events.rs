@@ -7,6 +7,13 @@
 //! is told under: [`single`] for a single request and [`pair`] for a pair,
 //! a side at a time. They take no lock and keep nothing.
 //!
+//! A controller keeps a file of leases and lends a single's back from it
+//! in the same form (`Sides::with_held_single`), so [`single`] is the one
+//! rule of a single's words under either host. The host says who hears
+//! ([`Hearers`]): a controller's word may come behind a later document's
+//! start, where the engine that issued the lease is gone and the standing
+//! one counts the send.
+//!
 //! A single request its binding's sessions rule keeps from the profile is
 //! told to the session table at its dispatch, and to no stage ahead of its
 //! end ([`stages_hear`]).
@@ -17,7 +24,7 @@ use super::{
     decision::{Decision, Target},
     decision_engine::HeldDecision,
     framework::Engine,
-    view::Session,
+    view::{Session, WorkerId},
 };
 use crate::{
     stages::Lifecycle,
@@ -52,8 +59,10 @@ use crate::{
 /// the lease's record: the dispatch it tells off its file later follows it
 /// (`LeaseRecord::untold`).
 ///
-/// A pair's sides are not read here: each side keeps a verdict of its own,
-/// and a pick's one word does not say which side the rule placed.
+/// A pair's pick is read here by its one word, ahead of both sides' writes
+/// of where the prompt went (`policy_engine::pair`). No side's own word is
+/// read: each side keeps a verdict of its own, and a pick's one word does
+/// not say which side the rule placed.
 ///
 /// [`RulePlaced::Untold`]: crate::document::spec::RulePlaced::Untold
 #[inline]
@@ -61,14 +70,53 @@ pub(crate) fn stages_hear(decision: &Decision) -> bool {
     decision.pick().is_none_or(|pick| !pick.untold())
 }
 
-/// Tells `engine`'s stages one word of a single's lease, from what the
-/// request's guard lends back, as a file of leases tells it: a dispatch
-/// under the lease as issued with the index the word names, on the target
-/// taken, by its id and rank; an end under the lease moved to that target;
-/// a release under the lease as issued. The dispatch of a pick its
-/// sessions rule keeps from the profile is told to the session table and
-/// to no stage ([`stages_hear`]).
-pub(crate) fn single(engine: &Engine, held: &HeldDecision<'_>, said: Said) {
+/// Who hears a single's words, as the lease's host says it. The rule tells
+/// them in its one order ([`single`]): a host says which engine is which.
+pub(crate) struct Hearers<'a, L> {
+    /// The engine the lease was issued under, where it still stands: its
+    /// session table and its stages hear the lease's words. `None` behind
+    /// a later document's start: that document's stages never heard the
+    /// issue, and hear no word of the lease.
+    pub issuing: Option<&'a Engine>,
+    /// The engine whose counts of sends take a dispatch. A send is its
+    /// host's, whatever document decided it: the standing engine counts
+    /// it.
+    pub sends: &'a Engine,
+    /// Whether a worker stands at a rank. A count of sends asks it of a
+    /// rank it does not know ([`Engine::dispatched_sent`]).
+    pub listed: L,
+}
+
+/// The hearers of a host that holds its decisions, which has one engine: it
+/// issued the lease and counts its send, and a count takes a send at a rank
+/// it does not know yet. The test is a type of no size: such a host pays
+/// for none.
+pub(crate) fn one_engine(engine: &Engine) -> Hearers<'_, impl Fn(WorkerId, u16) -> bool + Copy> {
+    Hearers {
+        issuing: Some(engine),
+        sends: engine,
+        listed: |_, _| true,
+    }
+}
+
+/// Tells one word of a single's lease to those who hear it, from what the
+/// lease's host lends back: a request's guard, or a controller's file of
+/// leases. A dispatch is told under the lease as issued with the index the
+/// word names, on the target taken, by its id and rank; an end under the
+/// lease moved to that target; a release under the lease as issued.
+///
+/// A dispatch is told in one order: the counts of sends, the session
+/// table, then the stages. A stage's call that unwinds leaves the count
+/// and the table's entry written. The dispatch of a pick its sessions rule
+/// keeps from the profile is told to the session table alone
+/// ([`stages_hear`]): no count takes it and no stage hears it. An end and
+/// a release are told to the stages of the engine that issued the lease,
+/// and to no other.
+pub(crate) fn single<L: Fn(WorkerId, u16) -> bool + Copy>(
+    hearers: &Hearers<'_, L>,
+    held: &HeldDecision<'_>,
+    said: Said,
+) {
     match said {
         Said::Dispatched(dispatch, _) => {
             let lease = Lease {
@@ -80,18 +128,30 @@ pub(crate) fn single(engine: &Engine, held: &HeldDecision<'_>, said: Said) {
                 dp_rank: held.target.dp_rank,
                 ..Target::default()
             };
-            if stages_hear(held.decision) {
-                engine.on_dispatched(
-                    &lease,
-                    &target,
-                    dispatch.side,
-                    dispatch.since_decision_micros,
-                );
-            } else {
-                engine.dispatched_table(&lease, &target, dispatch.side);
+            let (side, since) = (dispatch.side, dispatch.since_decision_micros);
+            let own = stages_hear(held.decision);
+            if own {
+                // The test goes to the count by value, with the worker and
+                // the rank it is asked of: a test of no size leaves the
+                // count no hearer to reach.
+                let (listed, id, dp_rank) = (hearers.listed, target.id, target.dp_rank);
+                let listed = move || listed(id, dp_rank);
+                hearers
+                    .sends
+                    .dispatched_sent(&lease, &target, side, since, listed);
+            }
+            let Some(engine) = hearers.issuing else {
+                return;
+            };
+            engine.dispatched_table(&lease, &target, side);
+            if own {
+                engine.dispatched_stages(&lease, &target, side, since);
             }
         }
         Said::Completed(outcome) => {
+            let Some(engine) = hearers.issuing else {
+                return;
+            };
             let lease = Lease {
                 target_index: held.index,
                 booked: held.target.id,
@@ -99,7 +159,11 @@ pub(crate) fn single(engine: &Engine, held: &HeldDecision<'_>, said: Said) {
             };
             engine.on_completed(&lease, &outcome);
         }
-        Said::Released(_, reason) => engine.on_released(held.lease, reason),
+        Said::Released(_, reason) => {
+            if let Some(engine) = hearers.issuing {
+                engine.on_released(held.lease, reason);
+            }
+        }
     }
 }
 

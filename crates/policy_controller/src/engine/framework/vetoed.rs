@@ -32,7 +32,10 @@
 //! A pair's prefill profile that weighs load against affinity reads the
 //! word the same way ([`Engine::weighing_lift`]): where the binding steers,
 //! its run has the veto lifted, so a session keeps the prefill that holds
-//! its prefix while that prefill is over its thresholds.
+//! its prefix while that prefill is over its thresholds. A profile weighs
+//! where one of its scorers says so of itself
+//! ([`Scorer::balances_load_against_affinity`]): a stage that reads the
+//! affinity column and has no gate of its own lifts nothing.
 //!
 //! The mark of such a lifted run has one meaning. Where the veto as it
 //! stands leaves the pool nobody ([`all_vetoed`]), the pick exists by the
@@ -721,7 +724,8 @@ impl<'a> Half<'a> {
 /// The pair's default: the pair a refused pool goes to, where every usable
 /// worker of the pool that failed is vetoed. It is the steering default of
 /// the gateway's own pair selection
-/// (`model_gateway/src/routers/common/placement.rs:1084-1172` on main). Each
+/// (`model_gateway/src/routers/common/placement.rs:1084-1172`, at main
+/// `b8c15d40a` as every line of that file cited here). Each
 /// usable prefill stands with the usable partner that holds the fewest
 /// requests, and the pair of the least load is taken: the prefill's load
 /// first, then its partner's. Equal pairs are drawn by the prefill side's
@@ -743,7 +747,8 @@ impl<'a> Half<'a> {
 /// It answers `None`, and the caller's refusal stands, where:
 /// - a prefill with an open partner stands with its limit aside, under the
 ///   constraints its profile's own run read. Under a prefill profile that
-///   reads affinity (`weighs`) and a binding that steers, that run had the
+///   weighs load against affinity (`weighs`, [`Engine::weighs`]) and a
+///   binding that steers, that run had the
 ///   overload veto lifted ([`Engine::weighing_lift`]), so a prefill over
 ///   its thresholds alone stands there (`:1327-1346`): the run's own
 ///   refusal is the answer, its admission limit's among them;
@@ -841,7 +846,7 @@ pub(super) fn paired(
             .retain(|&at| classed(classes, decode.rows[at as usize].pair_class));
         let mut pair = steered(decode.index, decode.facts, pool, decode.rows, buf);
         if let Decision::Pick(pick) = &mut pair {
-            pick.targets.pair_under(&first);
+            pick.targets.pair_under(&first, SessionVerdict::None);
             pick.trace = taken.trace;
         }
         return Some(pair);
@@ -857,7 +862,10 @@ mod tests {
     };
 
     use crate::{
-        document::spec::{Assignment, Needs, OverloadSpec, PolicySpec, Recovery, RulePlaced},
+        document::spec::{
+            AppliedSpec, Assignment, Needs, OverloadSpec, PolicySpec, PrefixAffinityParams,
+            Recovery, RulePlaced,
+        },
         engine::{
             decision::{Decision, LiftedVeto, ShedReason, Survivors},
             framework::{
@@ -867,15 +875,20 @@ mod tests {
             },
             sticky_sessions::{SessionRule, SessionVerdict},
             view::{
-                AffinityHolder, AffinityRows, Candidate, Constraints, Engines, Health, Identity,
-                Phase, PoolFacts, RequestFacts, WorkerId,
+                AffinityFacts, AffinityHolder, AffinityRows, Candidate, Constraints, Engines,
+                Health, Identity, Phase, PoolFacts, RequestFacts, WorkerId,
             },
         },
-        policies::{consistent_hashing::ConsistentHash, manual::Manual},
+        policies::{
+            cache_aware::{Gates, PrefixAffinity},
+            consistent_hashing::ConsistentHash,
+            manual::Manual,
+        },
         stages::{
             filters::{HasCapacity, HasRoom, Healthy, NotOverloaded, NotTried},
             lifecycle::Lifecycle,
             pickers::Best,
+            registry::StageRegistry,
         },
         tracking::{
             in_flight::tests::Lent,
@@ -1569,13 +1582,16 @@ mod tests {
         pair_engine_holding(shed, [prefill, decode], [None, None])
     }
 
-    /// A scorer that stands in for a stage that weighs load against
-    /// affinity. The row at `holder` scores highest, as the worker that
-    /// holds a session's prefix does, and `weighs` says whether the stage
-    /// declares that it reads affinity.
+    /// A scorer that stands in for a stage that prefers the worker that
+    /// holds a session's prefix: the row at `holder` scores highest. Two
+    /// words of the stage are apart here. `reads` says whether it declares
+    /// that it reads affinity ([`Needs::affinity`]), and `weighs` whether
+    /// it says that it weighs load against affinity by a gate of its own
+    /// ([`Scorer::balances_load_against_affinity`]).
     #[derive(Clone, Copy, Debug)]
     struct Holds {
         holder: u32,
+        reads: bool,
         weighs: bool,
     }
 
@@ -1602,9 +1618,13 @@ mod tests {
 
         fn needs(&self) -> Needs {
             Needs {
-                affinity: self.weighs,
+                affinity: self.reads,
                 ..Needs::default()
             }
+        }
+
+        fn balances_load_against_affinity(&self) -> bool {
+            self.weighs
         }
     }
 
@@ -2175,20 +2195,24 @@ mod tests {
         panic!("first partners outside the table answered {again:?}");
     }
 
-    /// A prefill profile that reads affinity is taken to weigh load against
-    /// it itself. Under a binding that steers, its run has the overload
-    /// veto lifted: a prefill over its thresholds alone with an open
-    /// partner is placed by the profile, where a pick by load would move a
-    /// session off the worker that holds its prefix. No prefill stood
-    /// without the lift here, so the pair's trace names the lifted veto.
-    /// The default answers for such a profile everywhere else: under a
-    /// binding that sheds, and where every prefill is doubted. The gateway
-    /// keeps its default from such a policy's prefill the same way, and
-    /// places that prefill by the policy with the veto lifted
-    /// (`model_gateway/src/routers/common/placement.rs:1327-1346`, at main
-    /// `b8c15d40a`).
+    /// The lift rests on a scorer's own word, and on nothing a stage is
+    /// fed. The busy prefill holds the session's prefix and a free one
+    /// stands beside it. A scorer that says it weighs load against affinity
+    /// is lifted and keeps its holder, whether it declares that it reads
+    /// affinity or not. A scorer that reads affinity and says no such word
+    /// keeps the veto, and the request moves to the free prefill: a stage
+    /// that is fed the column has not said that a gate of its own answers
+    /// a holder loaded too far. So does a profile whose filter declares the
+    /// need. The gateway lifts on its policy's own word the same way, and
+    /// on nothing the policy reads
+    /// (`model_gateway/src/routers/common/placement.rs:2575-2577`, at main
+    /// `82a135b1b`).
+    ///
+    /// The default answers for a weighing profile wherever its lifted run
+    /// sheds. Where every prefill is doubted, the pair goes to the least
+    /// loaded past the doubt, as under any profile.
     #[test]
-    fn a_profile_that_reads_affinity_places_a_busy_prefill_itself() {
+    fn the_lift_rests_on_a_scorers_own_word_and_on_no_need() {
         #[derive(Debug)]
         struct ReadsAffinity;
         impl Filter for ReadsAffinity {
@@ -2205,29 +2229,46 @@ mod tests {
                 }
             }
         }
-        let weighing = |shed| {
-            let mut filters = vetoes();
-            filters.push(Box::new(ReadsAffinity));
-            pair_engine_of(shed, [filters, vetoes()])
-        };
         let decodes = [classed(free(0, 0), 1)];
-        let busy = [classed(over(0, 1), 1), classed(doubted(1, 0), 1)];
-        let placed = decide_pair(&weighing(false), &busy, &decodes);
-        assert_eq!(pair_of(&placed), (0, 0));
-        assert_eq!(placed.trace().lifted, LiftedVeto::Overload);
-        let suspect = [classed(doubted(0, 2), 1), busy[1]];
-        for (engine, prefills) in [(weighing(true), &busy), (weighing(false), &suspect)] {
-            let paired = decide_pair(&engine, prefills, &decodes);
-            assert_eq!(pair_of(&paired), (1, 0));
-            assert_eq!(paired.trace().lifted, LiftedVeto::Liveness);
-        }
+        let prefills = [classed(over(0, 3), 1), classed(free(1, 0), 1)];
+        let pair = |reads: bool, weighs: bool, filter_reads: bool| {
+            let mut filters = vetoes();
+            if filter_reads {
+                filters.push(Box::new(ReadsAffinity));
+            }
+            let holder = 0;
+            let live = Some(Holds {
+                holder,
+                reads,
+                weighs,
+            });
+            let engine = pair_engine_holding(false, [filters, vetoes()], [live, None]);
+            let placed = decide_pair(&engine, &prefills, &decodes);
+            assert_eq!(placed.trace().lifted, LiftedVeto::None);
+            pair_of(&placed)
+        };
+        // The word lifts, beside the need and without it.
+        assert_eq!(pair(true, true, false), (0, 0));
+        assert_eq!(pair(false, true, false), (0, 0));
+        // The need lifts nothing, a scorer's or a filter's.
+        assert_eq!(pair(true, false, false), (1, 0));
+        assert_eq!(pair(false, false, true), (1, 0));
+        let suspect = [classed(doubted(0, 2), 1), classed(doubted(1, 0), 1)];
+        let paired = decide_pair(&holding(false, 0, true), &suspect, &decodes);
+        assert_eq!(pair_of(&paired), (1, 0));
+        assert_eq!(paired.trace().lifted, LiftedVeto::Liveness);
     }
 
     /// A pair engine whose prefill profile holds the two vetoes and a stage
-    /// that prefers the prefill at `holder` ([`Holds`]): `weighs` says
-    /// whether that stage reads affinity. `shed` makes its binding shed.
+    /// that prefers the prefill at `holder` and reads affinity ([`Holds`]):
+    /// `weighs` is that stage's word on a gate of its own. `shed` makes its
+    /// binding shed.
     fn holding(shed: bool, holder: u32, weighs: bool) -> Engine {
-        let live = Some(Holds { holder, weighs });
+        let live = Some(Holds {
+            holder,
+            reads: true,
+            weighs,
+        });
         pair_engine_holding(shed, [vetoes(), vetoes()], [live, None])
     }
 
@@ -2237,9 +2278,9 @@ mod tests {
     /// prefill too: its run has the overload veto lifted, and its own
     /// stages weigh the load. The pick stands beside a prefill under its
     /// thresholds, so the pair's trace names no lifted veto. A binding that
-    /// sheds keeps the veto, and so does a profile none of whose stages
-    /// reads affinity: each passes the busy holder over. The gateway's own
-    /// pair selection lifts the veto so
+    /// sheds keeps the veto, and so does a profile whose stage reads
+    /// affinity and says no word of a gate: each passes the busy holder
+    /// over. The gateway's own pair selection lifts the veto so
     /// (`model_gateway/src/routers/common/placement.rs:2375-2394`; its case
     /// `an_overloaded_prefill_holding_the_prefix_keeps_the_session_under_cache_aware`
     /// at `:5881`, at main `55c35100d`).
@@ -2261,9 +2302,10 @@ mod tests {
     /// a binding that steers places the pair itself: the prefill its stages
     /// prefer, not the least loaded. No prefill stood without the lift, so
     /// the pair's trace says the lifted overload veto, as a kept key's pick
-    /// does over a pool vetoed on every worker. A profile that reads no
-    /// affinity leaves such a pool to the pair's default, which takes the
-    /// least loaded, and a binding that sheds sheds it as saturated. The
+    /// does over a pool vetoed on every worker. A profile whose stage says
+    /// no word of a gate leaves such a pool to the pair's default, which
+    /// takes the least loaded, and a binding that sheds sheds it as
+    /// saturated. The
     /// gateway's own selection places such a pool by its prefill policy
     /// (`model_gateway/src/routers/common/placement.rs:5853`, the case
     /// `an_all_overloaded_prefill_pool_is_placed_by_the_prefill_policy`, at
@@ -2324,6 +2366,7 @@ mod tests {
         filters.push(Box::new(HasCapacity));
         let live = Some(Holds {
             holder: 0,
+            reads: true,
             weighs: true,
         });
         let engine = pair_engine_holding(false, [filters, vetoes()], [live, None]);
@@ -2340,20 +2383,62 @@ mod tests {
         assert_eq!(shed_of(&alone), (ShedReason::NoEndpoints, "healthy"));
     }
 
+    /// The pair's default is told the prefill profile's word, and judges a
+    /// weighing profile's refusal under the lift its run read. Both
+    /// prefills are over their thresholds. The busier one stands at its
+    /// admission limit with an open partner. The other has a slot, and its
+    /// one partner is over its thresholds beside a free decode, so no rule
+    /// opened it. A weighing profile's lifted run ends at the limit, and
+    /// the default leaves that refusal: the shed names the limit, and no
+    /// veto was lifted for a request. A profile whose scorer says no such
+    /// word ran with the veto standing, so the default pairs the pool by
+    /// load, past the prefill at its limit.
+    #[test]
+    fn the_pairs_default_is_told_the_prefill_profiles_word() {
+        let limited = |weighs: bool| {
+            let mut filters = vetoes();
+            filters.push(Box::new(HasCapacity));
+            let live = Some(Holds {
+                holder: 0,
+                reads: true,
+                weighs,
+            });
+            pair_engine_holding(false, [filters, vetoes()], [live, None])
+        };
+        let mut slot = classed(over(1, 0), 2);
+        slot.has_capacity = true;
+        let prefills = [classed(over(0, 4), 1), slot];
+        let decodes = [classed(free(0, 0), 1), classed(over(1, 0), 2)];
+        let full = decide_pair(&limited(true), &prefills, &decodes);
+        assert_eq!(shed_of(&full), (ShedReason::NoEndpoints, "has-capacity"));
+        assert_eq!(full.trace().lifted, LiftedVeto::None);
+        let paired = decide_pair(&limited(false), &prefills, &decodes);
+        assert_eq!(pair_of(&paired), (1, 1));
+        assert_eq!(paired.trace().lifted, LiftedVeto::Overload);
+    }
+
     /// The prefill's shadow is lifted by its own profile's word, as the
     /// live run is by the live profile's: a shadow that weighs load against
     /// affinity keeps the busy holder beside a live profile that passes it
-    /// over, and a shadow that reads no affinity passes it over beside a
-    /// live profile that keeps it. A pair the weighing lift alone placed
-    /// gets no shadow on either side: its trace names the lifted veto, and
-    /// the prefill buffer carries the mark.
+    /// over, and a shadow whose stage says no such word passes it over
+    /// beside a live profile that keeps it. The binding's word stands for
+    /// the shadow as for the live run: under a binding that sheds neither
+    /// is lifted. A pair the weighing lift alone placed gets no shadow on
+    /// either side: its trace names the lifted veto, and the prefill buffer
+    /// carries the mark.
     #[test]
     fn a_prefills_shadow_is_lifted_by_its_own_profiles_word() {
         let (req, pool, cx) = (facts(1), PoolFacts::default(), Constraints::default());
         let decodes = [classed(free(0, 0), 1)];
-        let said = |prefills: &[Candidate], live: bool, shadow: bool| {
-            let sides = [live, shadow].map(|weighs| Some(Holds { holder: 0, weighs }));
-            let engine = pair_engine_holding(false, [vetoes(), vetoes()], sides);
+        let said_under = |shed: bool, prefills: &[Candidate], live: bool, shadow: bool| {
+            let sides = [live, shadow].map(|weighs| {
+                Some(Holds {
+                    holder: 0,
+                    reads: true,
+                    weighs,
+                })
+            });
+            let engine = pair_engine_holding(shed, [vetoes(), vetoes()], sides);
             let pools = PairPools {
                 prefills,
                 decodes: &decodes,
@@ -2368,6 +2453,7 @@ mod tests {
             });
             (pair_of(&pair).0, pick.trace.lifted, twins)
         };
+        let said = |prefills: &[Candidate], live, shadow| said_under(false, prefills, live, shadow);
         // A busy holder beside a free prefill: no pick exists by the lift.
         let beside = [classed(over(0, 3), 1), classed(free(1, 0), 1)];
         let none = LiftedVeto::None;
@@ -2375,11 +2461,113 @@ mod tests {
         assert_eq!(said(&beside, true, false), (0, none, [Some(1), Some(0)]));
         assert_eq!(said(&beside, false, true), (1, none, [Some(0), Some(0)]));
         assert_eq!(said(&beside, false, false), (1, none, [Some(1), Some(0)]));
+        // Under a binding that sheds the live run passes the busy holder
+        // over, and so does the shadow's.
+        let shed = said_under(true, &beside, true, true);
+        assert_eq!(shed, (1, none, [Some(1), Some(0)]));
         // Every prefill over: the pick exists by the lift, and no shadow
         // is said beside it.
         let alone = [classed(over(0, 3), 1)];
         let lifted = LiftedVeto::Overload;
         assert_eq!(said(&alone, true, true), (0, lifted, [None, None]));
+    }
+
+    /// The engine's own affinity stage says the word itself, so its prefill
+    /// profile is lifted in every engine that holds it: in one built by
+    /// hand, with no validator in the way, and in one a document built,
+    /// behind the view's report age limit too, where the stage stands
+    /// behind the limit's wrapper. The busy prefill holds eight of the
+    /// request's sixteen blocks and stands under the stage's own gate, and
+    /// a free prefill holds none: the session keeps its holder.
+    ///
+    /// A registered scorer answers for itself the same way. One that
+    /// prefers the holder, reads affinity and says no word is passed over
+    /// at the busy holder, and beside the affinity stage its profile is
+    /// lifted by that stage's word.
+    #[test]
+    fn the_affinity_stage_lifts_its_prefill_profile_in_every_engine() {
+        static HASHES: [u64; 16] = [0; 16];
+        let request = RequestFacts {
+            block_hashes: &HASHES,
+            prompt_tokens: 256,
+            ..facts(1)
+        };
+        let held = |overlap_blocks| AffinityFacts {
+            overlap_blocks,
+            admitted_age_ms: u32::MAX,
+            ..AffinityFacts::default()
+        };
+        let column = [held(8), held(0)];
+        let prefills = [classed(over(0, 0), 1), classed(free(1, 0), 1)];
+        let decodes = [classed(free(0, 0), 1)];
+        let pair = |engine: &Engine| {
+            let pools = PairPools {
+                prefills: &prefills,
+                decodes: &decodes,
+                prefill_affinity: &column,
+                ..PairPools::default()
+            };
+            let cx = Constraints::default();
+            let scratch = &mut Scratch::new();
+            let placed =
+                engine.decide_pair(&request, &PoolFacts::default(), pools, &cx, &cx, scratch);
+            assert_eq!(placed.trace().lifted, LiftedVeto::None);
+            pair_of(&placed)
+        };
+        let params = PrefixAffinityParams::default();
+        let stage = PrefixAffinity::new(&params, Gates::of(Some(&params), None, None));
+        let side = |name: &str, scorers| Profile {
+            name: name.into(),
+            filters: vetoes(),
+            scorers,
+            picker: Box::new(Best),
+        };
+        let weighted = WeightedScorer {
+            scorer: Box::new(stage),
+            weight: 1.0,
+        };
+        let by_hand = Engine::new(
+            vec![side("prefill", vec![weighted]), side("decode", vec![])],
+            vec![Binding {
+                model: "*".into(),
+                phases: vec![],
+                plan: Plan::PdPair,
+                profile: 0,
+                decode_profile: Some(1),
+                shadow: None,
+                decode_shadow: None,
+                sessions: None,
+                overload: None,
+            }],
+            1,
+            Needs::default(),
+        );
+        assert_eq!(pair(&by_hand), (0, 0));
+        let mut catalog = StageRegistry::builtin();
+        let reads_alone = || -> Box<dyn Scorer> {
+            Box::new(Holds {
+                holder: 0,
+                reads: true,
+                weighs: false,
+            })
+        };
+        catalog.scorer("holds", reads_alone).expect("a free name");
+        let built = |score: &str, view: &str| {
+            let stages = r#""filter":["healthy","not-overloaded"]"#;
+            let text = format!(
+                r#"{{"apiVersion":"smg.policy/v1","view":{view},"profiles":{{"decode":{{{stages},"pick":"best"}},"prefill":{{{stages},"score":[{score}],"pick":"best"}}}},"bindings":[{{"match":{{"model":"*","phase":["prefill","decode"]}},"plan":"pd-pair","profiles":{{"prefill":"prefill","decode":"decode"}}}}]}}"#
+            );
+            let document: PolicySpec = serde_json::from_str(&text).expect("a well-formed document");
+            AppliedSpec::validate_in(&document, &catalog, &[]).expect("the document validates")
+        };
+        for view in ["{}", r#"{"max_report_age_ms":500}"#] {
+            let own = built(r#""prefix-affinity""#, view);
+            assert_eq!(pair(own.engine()), (0, 0), "{view}");
+            let registered = built(r#""holds""#, view);
+            assert_eq!(pair(registered.engine()), (1, 0), "{view}");
+            let both = built(r#""holds","prefix-affinity""#, view);
+            assert_eq!(pair(both.engine()), (0, 0), "{view}");
+        }
     }
 
     /// The pair's default asks each side's hard filters alone

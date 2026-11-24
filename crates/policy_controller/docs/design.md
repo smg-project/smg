@@ -174,7 +174,7 @@ pub struct ProfileSpec {
     pub filter: Vec<FilterSpec>,  // the filters, in order: each removes workers
     pub score: Vec<ScoreSpec>,    // the scorers, each with a weight
     pub pick: PickSpec,           // exactly one picker
-    pub sent_ttl_ms: Option<u32>, // how long a dispatched request counts in the profile's records
+    pub sent_ttl_ms: Option<u32>, // how long a send stays in the count of sends the profile reads
     pub sent_report_delay_ms: Option<u32>, // how long behind a dispatch a load report ends its count
 }
 
@@ -359,11 +359,13 @@ What a policy remembers lives in several places, among them:
 generations. It can keep the last eight generations in a folder, one file each, and roll back to
 one of them.
 
+A gateway reads the supplied file by the crate's one read of a document (`Format::read`), the read an apply and a controller's file pass. A file named `.json` is read as JSON, any other name as YAML (`Format::of`). A YAML document reads as JSON does: text that looks like a number, a boolean or a null is written in quotes, a key with nothing under it is refused where a list or a map stands, and a tag is refused. A refusal names the field by its path, or the line and column where the file itself does not read.
+
 ### 3.5 The stage interfaces
 
 A filter, a scorer and a picker are three traits (`engine/framework.rs`). Each has two required
-methods, shown here. The others have default bodies and are not shown: most are switches and
-short paths that the built-in stages use.
+methods, shown here. The others have default bodies, and all but one are not shown: most are
+switches and short paths that the built-in stages use.
 
 ```rust
 pub trait Filter {
@@ -377,6 +379,8 @@ pub trait Scorer: Lifecycle {
     // write one score for each surviving worker
     fn score(&self, facts: &RequestFacts<'_>, candidates: &[Candidate], kept: &[u32],
              out: &mut [f32]) -> TieBand;
+    // a gate of the scorer's own weighs load against cache affinity
+    fn balances_load_against_affinity(&self) -> bool { false }
 }
 
 pub trait Picker: Lifecycle {
@@ -402,6 +406,21 @@ The built-in stages:
 
 A program that embeds the crate can add stages of its own under new names
 (`StageRegistry::filter`, `scorer`, `picker`) and validate documents against that table.
+
+**[built]** One default method is shown, `balances_load_against_affinity`: a scorer of a program's
+own that weighs load against affinity must answer it, because a pair's lift rests on it. A scorer
+that answers yes places a request by who holds the prompt's beginning, and a gate of its own bounds
+where it sends the request by the workers' load: `prefix-affinity` moves a request off that worker
+once it is loaded well past the others. Under a binding that steers, a pair's prefill profile with
+such a scorer is decided with the overload filter lifted, so a prompt stays on the prefill that
+holds its beginning while that worker is over its thresholds. The lift rests on that answer alone,
+as classic's rests on its policy's answer of the same name:
+`LoadBalancingPolicy::balances_load_against_affinity` (`model_gateway/src/policies/mod.rs`), read
+where `select_pair` places a pair (`model_gateway/src/routers/common/placement.rs`).
+`prefix-affinity` and `warmup-slice` answer yes, by their spill gate. What a stage reads says
+nothing of a gate: a stage that reads the cache records and answers no keeps the filter for its
+profile, a scorer a program adds answers for itself, and a plugin's stage answers no. A filter or a
+picker has no such word: one that reads the cache records keeps the filter for its profile.
 
 **[built]** Such a stage keeps building when the crate grows. For each type below, the table says
 whether it is marked non-exhaustive and how code writes it:
@@ -457,8 +476,8 @@ Beside a pair's two lists it hands their pair classes (`Objects::pair_classes`):
 class by its place in the list as lent, under the store's own pairing rule over what the rows
 state. Those classes state no first partner, so a controller makes no pair on one known runtime
 ahead of another. A row whose facts change gets a new worker object, so the registry builds a
-new list and a new `G` for it. The classes are derived once for a `G` and a pairing mode, at the
-first ask, and stand with it.
+new list and a new `G` for each model the worker serves. The classes are derived once for a `G`
+and a pairing mode, at the first ask, and stand with it.
 
 A controller knows no admission window of a gateway. So it reads a pair's admission open
 (`OpenAdmission`), as the rows its store builds state it. The gateway that asks is to gate
@@ -637,7 +656,9 @@ request goes to.
   cache events reads the index and the hash table together, as today.
 - **[built]** A prefill-decode pair decided over worker lists reads the hash table and the
   host's index of cache events for each side, by the side's own list, and writes each side's
-  pick into the hash table. An encode request's first decision reads neither yet. Classic keeps
+  pick into the hash table, where the index does not speak for the picked worker. An encode
+  request's first decision does the same for its pair. It writes neither side where its caller
+  cannot send to an encoder the decision placed (`RequestMaker::sends_to_encoder`). Classic keeps
   trees for each side. **[planned]** The engine reads the host's trees for each side.
 
 A decision of the engine publishes no insert to other gateways.
@@ -646,11 +667,15 @@ A decision of the engine publishes no insert to other gateways.
 events they push fill the index and nothing else. Records B and C are the deciding process's own
 account of the prompts it sent, written by its policy at each decision. No worker pushes them and
 no worker's stream carries them. In classic the gateway's policy keeps them. With the engine in
-the gateway the gateway keeps them and lends them to the engine. On main it lends none yet
-(section 9.2). Until it does, a request under the engine reads the hash table, and the index
-beside it where its model has one. A prefill-decode pair is lent no tree: each of its sides
+the gateway the gateway keeps them and lends them to the engine. On main it lends the token tree
+alone, to a single request, under a document that reads the prefixes sent to each worker (section
+9.2). A single request with token ids is decided inside that tree, by classic's own key. That
+holds where its model has no index of cache events and its profile reads sent prefixes and names
+the holders' rows. A request given as text names no entry and still reads the hash table. A
+request of a model that has an index still reads the index and the hash table together.
+A prefill-decode pair is lent no tree: each of its sides
 reads the hash table, and the index where its model has one, by the side's own list. An encode
-request's first decision reads neither yet. A controller is to
+request's pair reads them the same way. A controller is to
 keep trees of its own **[planned]**, and section 11 says what its contract must hold for that. On
 main a controller's engine reads its hash table alone (section 10.1).
 
@@ -791,7 +816,9 @@ pub struct Candidate {
 
 The identity half is filled once for a list and cached (`PoolRecords`, `engine/records.rs`). The
 live half is read from the worker object once for each decision. The load report comes from the
-load snapshot; a snapshot's reports are converted once for a list and cached.
+load snapshot; a snapshot's reports are converted once for a list and cached. Until the list
+holds them, a record written alone takes its report by one look-up in the snapshot: a drawn
+worker's, a worker's that a routing key names, and the held prefill's of a decode decided again.
 
 The field `engine` numbers the list's data-parallel engines: records that state one number are
 ranks of one engine. `PolicyEngine` writes the numbers once for a list, where it finds the list's
@@ -836,7 +863,8 @@ pub struct RequestFacts<'a> {
     pub now_micros: u64,           // the host's clock at the decision
     pub ring: Option<&'a dyn LentRing>, // the hash ring the host keeps, lent to this decision
     pub ring_positions: &'a [u64], // where the request stands on that ring, as the host states it
-    // eight more fields: `affinity`, `named` and `signal_cells`, and the five that 5.8 removes
+    // eight more fields: `affinity`, `named`, `signal_cells`, `session_counted` and
+    // `session_key_from_rid`, and the three that 5.8 removes
 }
 
 pub struct Constraints<'a> {
@@ -1138,19 +1166,23 @@ pub enum Said {
 decide ──> lease issued ──> Dispatched ──> Completed
                 │                └───────> Released (client gone, send failed, worker removed)
                 └── never dispatched ──> Released when the host drops its guard
-                                         (the old engine releases it 5 s after issue)
+                                         (a controller releases one on its file 5 s after issue)
 ```
 
 The kept engine stores nothing about a lease. The host keeps what it was handed and hands it back
 with each event (`DecisionEngine::say`). The crate has a guard for that, `DecisionGuard`
 (`tracking/decision_guard.rs`): it holds one decision's lease, has `dispatched`, `completed` and
-`released`, and releases at its drop.
+`released`, and releases at its drop. A controller keeps its leases in a file. It lends a single
+request's lease back from that file in the guard's form, so one rule tells a single request's
+events under either host (`lease_events::single`). The host says who hears: behind a new
+document the engine that issued the lease is gone, and the standing one counts the send. A pair's
+events on a controller are told by the controller's own code.
 
 What an event does:
 
 | Event | What the stages do with it |
 |---|---|
-| Dispatched | the session's pin follows the worker the request went to; each profile counts what it sent since the worker's last load report; scorers and pickers that asked hear it. A pick a sessions rule keeps from the profile moves the pin alone. A pin at its rule's cap moved already, where the request that met the cap was decided, to the worker it was placed on: the dispatch finds it there, or fronts the later target the request went to |
+| Dispatched | the session's pin follows the worker the request went to; every count of sends takes it: a count holds what was dispatched to each worker since the worker's last load report, whichever profile placed the request; scorers and pickers that asked hear it. A pick a sessions rule keeps from the profile moves the pin alone. A pin at its rule's cap moved already, where the request that met the cap was decided, to the worker it was placed on: the dispatch finds it there, or fronts the later target the request went to |
 | Completed | scorers and pickers that asked hear the outcome (status, time to first token, tokens in and out, duration) |
 | Released | the same stages hear the reason |
 
@@ -1158,10 +1190,10 @@ A sessions rule places some requests alone, behind the profile's filters and wit
 picker of the profile asked: it follows a pin of the request's key, or its own assignment places
 the key. The rule says whether such a request is the profile's own (`rule_placed`). Under `told`,
 the default, it is: the stages hear its issue and its dispatch,
-the profile counts it among its sends, and its prompt is recorded as behind any pick. Under
-`untold` it is kept from the profile: no stage hears its issue or its dispatch, no profile counts
-it, and neither the engine's record of sent prefixes nor a lent token tree takes its prompt. The
-session's pin still follows its dispatch, and its completion and its release are told as any
+every count of sends takes it, and its prompt is recorded as behind any pick. Under
+`untold` it is kept from the profile: no stage hears its issue or its dispatch, no count of sends
+takes it, and neither the engine's record of sent prefixes nor a lent token tree takes its prompt.
+The session's pin still follows its dispatch, and its completion and its release are told as any
 request's, so a stage matches an end by the lease's id. The routing settings write `untold` for
 the sticky override's rule alone: a gateway's sticky map keeps a request it places from the
 gateway's policy. The kept engine keeps the word on the pick, and one function reads it
@@ -1173,6 +1205,9 @@ a pick's lease, and keeps the answer on the lease's record (`LeaseRecord::untold
 that issue, and the dispatch it tells off the file moves the session's pin and reaches no stage
 and no count of sends. Its decision is the engine's own, so its record of sent prefixes follows the
 word too.
+
+The session table takes no new key once it holds 4,194,304 keys. A request of such a key is
+placed with no pin, until keys leave the table.
 
 Upkeep, about once a second (`sweep`): expired session keys are removed, and the record of sent
 prefixes gets a bounded step of clean-up. A record leaves the engine's map once no list's table
@@ -1304,6 +1339,7 @@ pub trait RequestMaker {
     fn loads(&self) -> Option<&Arc<LoadSnapshot>>;    // a request's snapshot of the host's own; without one the engine reads its own
     fn token_key(&self, page: usize) -> Option<TokenKey<'_>>; // the prompt's entry in the host's token tree, where the host lends one
     fn sends_to(&self, target: &Target) -> bool;      // whether its caller sends to this target of a pick: the prompt is stored for the first such
+    fn sends_to_encoder(&self, position: u32) -> bool; // whether its caller sends to this encoder of an encode request's pick: the prompt is stored for no target behind one it does not
 }
 
 pub enum WorkerLists<'a> {
@@ -1351,7 +1387,10 @@ for a head of the request, each by the lender's own recipe.
 A caller of the one call states the ring alone (`PlaceRequest::ring`). The engine reads where the
 routing value stands on it with the request's keys, under a profile whose ring stage places a value
 by its own text. Under `prefix_hash` the engine cuts the request into the heads classic cuts it
-into, a routing value first, and asks the ring where each stands (`LentRing::head_position`). A
+into and asks the ring where each stands (`LentRing::head_position`): the routing value where a
+header handed the request one, else the prompt's heads. Where a document names the request's own
+id as a source, the value it hands is no head: it names the session alone, as classic hashes a
+header's key and never the id's. A
 ring whose lender places no head answers nothing: such a request is lent no ring, the lender is
 asked about no further head, and the stage's own ring places the request. A request that has no
 head states no place and is lent no ring either.
@@ -1582,7 +1621,9 @@ list by wire.
 Two things keep the short path of section 5.6 as cheap as it is today. The route's rule is asked
 of the one picked worker, and of a single request's whole list only behind a decision all of whose ready picks it refuses; a rule that is the same for every request of a
 route belongs to the list itself. And a plain request touches neither the load snapshot nor the
-other fields of the request.
+other fields of the request, with one exception in a gateway's own process. Where a stage needs
+lease events, the lease states the text's bytes, and its characters where a stage reads a size.
+Counting the characters is the one pass over a plain request's text.
 
 A request decided inside a lent token tree has the rule asked inside the tree's walk, of the
 pick's targets best first, so the tree stores the prompt for a worker the rule takes. The call
@@ -1630,7 +1671,9 @@ makes one itself.
    and decides under the binding of the model stated there. Every fact of the decode's decision
    is that request's: the pair's two lists as they stand then, the request's size, its routing
    value and the workers it tried among them. The engine decides the decode on the records of
-   that instant, behind the prefill that was sent.
+   that instant, behind the prefill that was sent. Of the prefills it writes that one's record
+   alone and reads no other prefill's worker. Where the list names no place of that prefill,
+   it writes every prefill's.
 4. The placement takes the first decode the engine names that can be sent to. Its routing key
    and its two profile labels stay as the first call wrote them.
 
@@ -1882,8 +1925,10 @@ its phase: it is decided as a single request is, over the registry's list of its
 workers, and its lease is a single's. The token count of a prefill-decode mode (section 3.3) is
 not decided this way: it is a single request over the prefill workers, the wire cannot say so,
 and a controller reads the single workers' list for it, which such a fleet does not have. An
-encode request, and a decode request that names no lease under a pair plan, are answered `Busy`,
-and their gateway decides them.
+encode request, and a decode request that names no lease under a pair plan, are answered `Busy`.
+By the contract the gateway decides such a request locally
+(`crates/policy_controller/contracts/policy_controller.proto`) **[planned]**: no gateway calls a
+controller yet.
 
 ### 10.2 As designed **[partly]**
 
@@ -1894,7 +1939,7 @@ the worker crate's structures, and the one engine.
 |---|---|---|
 | workers | records in the store, and worker objects kept in step with them | worker objects in a worker-crate registry; beside each, the code that keeps the objects holds what a registration stated and the object does not hold as stated (10.3); the membership log that watchers and standbys read stays |
 | lists | the store's published copy; a single request's decision reads the registry's published list of the model's single workers, a pair's, at its prefill and at its decode call, the lists of its two sides, and a prefill or a decode request that stands alone the list of its own phase's workers | the registry's published lists by role and protocol, with the engine's value beside each (decision 10) |
-| health | the worker crate's health checker over the worker objects, on the leader; each outcome is copied into the store's record, an object's status follows its record's, and a decision reads the object's | the same checker; a decision reads the object's own status; a gateway's veto on a worker stays in the store |
+| health | the worker crate's health checker over the worker objects, on the leader; each outcome moves the object, the store's record is told the status that stands, and a decision reads the object's | the same checker; a decision reads the object's own status; a gateway's veto on a worker stays in the store |
 | loads | the worker crate's load monitor over the worker objects, while the replica leads: a decision is given its snapshot where the document reads reports and keeps none, and reads the overload verdict on the object; the crate's own poller runs no more, and the store's load table is written by nothing and read by no decision | the worker crate's load monitor, publishing `LoadSnapshot` (decision 10). Every worker is judged by the thresholds its object states, so the loads of every worker the controller dials are read: no new cost against classic as it runs by default, whose gateway hands each worker of an engine the same two defaults and an external worker none at its registration, as a controller's objects state them. A gateway started with `--disable-load-monitoring` polls by need, and this monitor polls every group |
 | cache events | an index of the store's own; a decision reads none yet | the kv-index crate's index, filled by the worker crate's collector |
 | sessions | the engine's session table for a single request, one for each document | the engine's session table |
@@ -1947,7 +1992,7 @@ tells the data once more:
 
 | Copy | Where | Read by |
 |---|---|---|
-| the worker record | the store's table of records (`store/memory.rs`) | the registration calls, for a record's status; the load poller, and the follower of cache events for whether a worker's events are indexed, each until it reads the worker objects; a watcher's and a standby's first copy |
+| the worker record | the store's table of records (`store/memory.rs`) | the load poller, and the follower of cache events for whether a worker's events are indexed, each until it reads the worker objects; a watcher's and a standby's first copy |
 | a copy of the record's facts | beside the worker objects (`worker_host/objects.rs`) | the code that keeps the objects, to tell a record that changed under its object |
 | the worker object | the worker-crate registry | the health checker, the follower of cache events and a decision |
 | the remainder: 17 of the 24 facts and one bit of an eighteenth, with the record's id and revision | beside each worker object (`worker_host/remainder.rs`) | a decision, for the record's id, whether the worker takes images, its wire modes and from where it is reached. A pair's classes read its engine kind and its pairing descriptor too. What the worker states for a request's hard demands is lent with the list, and no frame states a demand yet |
@@ -1955,8 +2000,8 @@ tells the data once more:
 | the membership log's event | `service/replication/log.rs` | a watcher behind its first copy; a standby |
 
 A leader's write of a record is decided over the worker object since step 1 below, and the
-table follows it. The record still leads a status and a first copy, and the
-object follows it there. After the switch the object leads: a worker's data
+table follows it. The object leads a status too since step 3, and the table is told it. The
+record still leads a first copy. After the switch the object leads: a worker's data
 stands once, as its worker object with its remainder beside it, and the log still tells it. The
 remainder is the copy that stays. The table of records and the second copy of the facts end
 with step 4 below. The published copy ends when its readers, a pick's booking and a gateway's
@@ -1983,7 +2028,7 @@ read back (step 1 below). Of the 24 facts a registration states:
 | rank and width | a width above one, and a rank unless the worker is its engine whole | a width of one or of none, and a rank stated beside either |
 | the wire modes | the one protocol the object speaks | the other protocols of the set |
 | the engine's kind | the runtime the worker crate reads the name as | a name that crate does not know, and a known name as it was written |
-| the health policy | the checks in whole seconds, off where the controller cannot dial the worker | a part of a second, and the policy of a worker built with its checks off |
+| the health policy | the checks in whole seconds, each threshold at least one, off where the controller cannot dial the worker | a part of a second, a threshold of none, and the policy of a worker built with its checks off |
 | the overload thresholds | where a program asks for them, as the controller's does, an engine's worker's own over the program's defaults and an external worker's own alone | which of them an engine's worker stated |
 | the drain window | the window in force | a window stated equal to the object's default, which reads back as none |
 
@@ -2015,10 +2060,10 @@ A fact leaves the remainder when the worker object gets a field that holds it as
    store over a write of the registry. The store takes a decided change only where the record
    it was decided over still stands at the revision the keeper read, tested under the
    membership lock: a write that landed between the two is never written over, and the keeper
-   reads the store again before it answers. Until step 3 a first copy is still cut from the table,
-   and a call reads the status of a record there. Until step 3 a status is still the
-   table's word: a drain and a connect signal write the table, the store hands a record the
-   status its table holds, and a call follows the store into the objects before it answers. A
+   reads the store again before it answers. A first copy is still cut from the table, until the
+   last part of step 2. Since step 3 a status is the object's
+   word: a drain and a connect signal write the object and tell the table, a key's next life
+   starts in the status its worker object stood in, and a call's answer waits on no follow. A
    change the store took and the registry did not get is laid by the task that follows the
    table, while that task stands. A change that moves a fact the object holds builds the object again: the
    new object takes the standing one's place under its id, with its running state, as the code
@@ -2028,7 +2073,10 @@ A fact leaves the remainder when the worker object gets a field that holds it as
    watch's events to its own worker objects **[built]**. A watcher's and a
    standby's first copy is cut from the objects and their remainders behind step 3, because a
    copy's statuses must be the ones the log last told **[planned]**.
-3. No health outcome is copied into a record: a decision reads the object's status, as a single
+3. No health outcome is judged over a record. It moves the worker object, whose status leads,
+   and the record is told the status that stands, for the log and a first copy **[built]**. A
+   connect signal and a drain are written the same way **[built]**. The store's own machine
+   for a health outcome is deleted **[planned]**. A decision reads the object's status, as a single
    request's does on main.
 4. The table of records, the second copy of the facts, the two conversions between a record
    and an object, and the task that follows the table are deleted.
@@ -2046,8 +2094,8 @@ membership event of its leader's log, and each restore, to the code that keeps t
 objects (the first part of step 2). For an event with a record that code builds the object,
 hands the store the event at its place in the log, and puts the object in the registry where
 the store took the event. A removal's object leaves the registry first. A record changed in
-place keeps the instant it was admitted at. A status is still the table's word, and it is
-copied onto the object in the same turn. A restore is the store's restore and the read of its
+place keeps the instant it was admitted at. A status the leader tells is written to the table and
+laid on the object in the same turn. A restore is the store's restore and the read of its
 records in one turn of that code. A first copy is still cut from the table: a later
 part of step 2.
 
@@ -2056,12 +2104,12 @@ before it writes: the record under an address, the record under an id, and an en
 It reads them back from the worker objects (the second part of step 2), in the turn of the code
 that keeps them and behind that code's read of the store to its end. So a call's test and the
 write behind it read the record from one copy, and a call that waited behind another writer reads what that
-writer left. A status is still the table's word, so a record read this way carries the status
-the table holds. An engine's records are found by the list of ranks kept beside the objects,
+writer left. A record read this way carries the status its worker object states (step 3).
+An engine's records are found by the list of ranks kept beside the objects,
 where the store passed over every record under the membership lock: that read of the table is
-deleted. A first copy stays on the table until step 3. Its statuses must be the ones the log
-last told at its place, and until an object's status leads the table alone holds them under
-the lock that orders the log.
+deleted. A first copy stays on the table until the last part of step 2. Its statuses must be the ones the log
+last told at its place: the table holds exactly those, under
+the lock that orders the log, and an object can stand one tell ahead of it.
 
 **A watcher's events through the worker objects [built].** A gateway's watcher hands each
 event of a controller's worker watch, and the watch's first copy at its last page, to the
@@ -2070,6 +2118,22 @@ applier does. So the object of a record stands when the event that told it retur
 host of the watcher follows nothing behind the watch. A first copy keeps the object of a
 record that stands through it. The store's two entries for a watcher, a told change and a
 first copy, have no caller in the product but that code.
+
+**An object's status leads [built].** On the replica that leads, a status is written on the
+worker object and the store is told it (the first part of step 3). A probe's outcome goes to
+the worker registry's own health machine, which moves the object. The code that keeps the
+objects then tells the store the status that stands, under the object's own lock, through one
+entry that asks the writer's lead under the membership lock. A move the store takes no word
+of is taken back in that same turn of the object's lock: the object takes the status its
+record holds. A registration call's connect signal and its drain go through
+that entry too: the store is told first, and the object moves where the store took the
+status. The locks in their order: the object's own, then the store's membership lock. No
+holder of the store's lock takes an object's, and no decision takes one. From the table to an
+object there is one way, the told one: a standby's applier and a gateway's watcher lay each
+status their leader tells, and each status of a first copy. The code that keeps a
+controller's objects copies no status from its own store's tail: with that copy, two moves in
+a row could end with the object at the older one. The store's own health machine has no
+caller in the product, and the next change deletes it.
 
 A lease keeps naming its worker by the record's id, never by a place in a list: a gateway
 reports on a lease later and across membership changes.
@@ -2172,7 +2236,7 @@ On main: 19 sheets, 489 lines.
 | replayed and passing | 18 | 484 |
 | recorded, replayed by nothing (`constraint_decider`) | 1 | 5 |
 | replayed through the engine that stays (`PolicyEngine`) | **4**, and 31 lines of `prefix_hash` | **65** |
-| replayed lines held to an answer of the crate's own, not classic's | | 8 |
+| replayed lines held to an answer of the crate's own, not classic's | | 7 |
 
 A replay of all fifteen decision sheets through `PolicyEngine` over worker objects is in work and not on main yet: on main the three hard-demand sheets (`retry_wire`, `media_refs`, `context_window`; 26 lines), `sticky_rank` (8 lines) and 31 lines of `prefix_hash` replay through it. Measured
 with it locally on 2026-11-22, on main (`096c0f5ea`): of the 408 lines that recorded a decision
@@ -2201,7 +2265,10 @@ Five things follow, and they are the first work of section 16.
    key folds whole blocks). One of them turns in the crate on a ring its caller lends
    (decision 3). The other measures which tokens are in a prompt's head, which is then the
    caller's recipe: it is proven at stage 3, by a gateway test of classic's own function. The
-   1 of `manual` cannot be asked (validation refuses a sessions rule under a pair plan). Each
+   1 of `manual` replays as classic recorded now: a sessions rule with no cap runs on the two
+   sides of a pair, each side by its own session, where the host decides in process. A served
+   controller refuses the rule under a pair: its file of leases keeps one session verdict for
+   a pair's two sides. Each
    of the 23 is made equal to classic or named as an accepted difference: two in stage 1, one
    at stage 3, the 20 in stage 4.
 3. **Five policies have no sheet over a healthy pool**: `round_robin`, `random`, `passthrough`,
@@ -2508,9 +2575,9 @@ policies have it. What that leaves of a binding's block:
 - **Its two numbers [built].** A block names none. A document that names one is refused when it
   is applied, by the number's path, and the refusal says where a number is stated: a worker's
   registration, or its program's default. The two that a gateway's routing settings state are
-  the defaults its worker objects are built with, and the crate's translation of those settings
-  writes neither onto a binding. A gateway states them on its command line, beside a supplied
-  document too.
+  the defaults its worker objects are built with where the switch below is on, and the crate's
+  translation of those settings writes neither onto a binding. A gateway states them on its
+  command line, beside a supplied document too.
 - **Its shed word [built].** A binding keeps whether a request is shed when every worker is
   vetoed. A decision reads it.
 - **Its switch [partly].** Whether the program's default vetoes at all is one word for the

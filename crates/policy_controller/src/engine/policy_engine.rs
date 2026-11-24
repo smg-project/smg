@@ -499,8 +499,6 @@ impl PolicyEngine {
     /// its cost does not grow with the list. Under this value every worker
     /// states nothing: none takes images, none meets a demand for a runtime
     /// or for media by reference, and each holds a request of any size.
-    /// Whether a worker registered a data-parallel rank is read off its
-    /// object under either.
     #[must_use]
     pub(crate) fn pool_members(&self, pool: &Arc<[Arc<dyn Worker>]>) -> PoolMembers {
         let epoch = self.epochs.fetch_add(1, Ordering::Relaxed) + 1;
@@ -1118,7 +1116,7 @@ impl DecisionEngine for PolicyEngine {
         }
         let engine = self.document.spec.engine();
         let tell = || match held.lease.side {
-            Side::Single => lease_events::single(engine, held, said),
+            Side::Single => lease_events::single(&lease_events::one_engine(engine), held, said),
             // A pair's guard holds its prefill side's lease.
             Side::Prefill => lease_events::pair(engine, held, said, |at| self.clock.micros(at)),
             // No lease is issued for a side on its own.

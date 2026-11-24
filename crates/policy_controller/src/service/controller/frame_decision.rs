@@ -563,7 +563,9 @@ pub(crate) fn issue(
 ///
 /// No shadow runs on a pair's side yet, so none is counted here. The
 /// decode side's lease states the prefill side's session verdict: the
-/// store's decode side keeps none of its own yet.
+/// store's decode side keeps none of its own yet. So a document that
+/// binds a sessions rule under the pair plan is refused at its apply, as
+/// not in this build.
 ///
 /// # Errors
 ///

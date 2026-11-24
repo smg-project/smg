@@ -834,9 +834,11 @@ impl MemoryStore {
     /// ([`Membership::Snapshot`]), under the workers lock and with the load
     /// lock let go: its stages start empty, and each membership write after
     /// it is told behind the same lock, in its order. One thing does not
-    /// start empty: a profile's count of sends, which the engine takes
-    /// over from the standing generation's profile of the same name
-    /// before the publication ([`Engine::succeed`](crate::engine::Engine::succeed)).
+    /// start empty: a count of sends, which the engine takes over from
+    /// the standing generation's count under the same two settings, or
+    /// else by its profile's name, or else one that is left, before the
+    /// publication
+    /// ([`Engine::succeed`](crate::engine::Engine::succeed)).
     ///
     /// The journal is told the generation's number there too, behind the
     /// publication ([`Journal::generation`]).
@@ -921,9 +923,8 @@ impl MemoryStore {
                 return Ok(false);
             }
             let Loads { ranks, writer } = &mut *loads;
-            // The cells on file go under the generation's own columns
-            // before the writer reads them. A generation the writer refuses
-            // moves none.
+            // The cells on file go under the generation's own columns. A
+            // generation the writer refuses moves none.
             let standing = writer.spec();
             if generation > standing.generation() {
                 carry_cells(ranks, standing.signal_columns(), spec.signal_columns());
@@ -968,8 +969,7 @@ impl MemoryStore {
     ///
     /// A world kept across two publications of a pool keeps the rows it
     /// lists as they are: the second publication writes over other rows,
-    /// and allocates that pool's rows when the writer holds none alone
-    /// ([`publication_allocations`](Self::publication_allocations)).
+    /// and allocates that pool's rows when the writer holds none alone.
     pub fn snapshot(&self) -> Arc<StoreSnapshot> {
         self.world.load_full()
     }
@@ -1438,22 +1438,6 @@ impl MemoryStore {
         Duration::from_micros(self.world.load().spec().engine().pins_absence_micros())
     }
 
-    /// How many times a publication allocated a pool's rows since the store
-    /// was made. A publication writes a pool's rows over rows no world
-    /// lists any more: the ones the pool published before its last, else
-    /// any of its length that left a pool. It allocates when it finds
-    /// none: at a pool's first publication after a membership build,
-    /// unless rows that build retired fit it, and past that only while a
-    /// reader holds a world from before the pool's last publication. A
-    /// membership build's own rows are not counted.
-    ///
-    /// A pool's signal cells count with its rows, by the same rule: a
-    /// publication writes them over the block the pool published before
-    /// its last, and a membership build's own cells are not counted.
-    pub fn publication_allocations(&self) -> u64 {
-        self.loads.lock().writer.allocations()
-    }
-
     /// How many worlds the store published since it was made. A write that
     /// changes nothing publishes none, and the gateways one sweep lets go
     /// leave in one.
@@ -1873,12 +1857,12 @@ impl MemoryStore {
     /// call: a caller of the store's own registration, patch or removal
     /// takes no turn of the holder.
     ///
-    /// A status is the table's word until a worker object's leads. The
-    /// holder read `row`'s off an object, which trails the table by the
-    /// status writes it has not followed. So a row changed in place keeps
-    /// the status the table holds, and a key's next life is handed the
-    /// table's by the rule every writer decides by
-    /// ([`WorkerRow::hands_on`]). The holder copies it onto the object.
+    /// A worker object's status leads its row's. The holder read `row`'s
+    /// off the object, and the rule every writer decides by handed it on
+    /// to a key's next life ([`WorkerRow::hands_on`]): the store takes
+    /// that. A row changed in place keeps the status the table holds: a
+    /// status moves by its own event alone, and the holder tells the
+    /// object's behind the write ([`Self::status_told`]).
     ///
     /// Whether the store took the change. One it does not take writes
     /// nothing: another writer moved the row under the holder's turn, or
@@ -1898,19 +1882,61 @@ impl MemoryStore {
             MembershipChange::Relabelled { id }
             | MembershipChange::Resized { id }
             | MembershipChange::Removed { id } => table(id),
-            // No holder decides a status: it is the table's own write.
+            // A status is told by its own entry.
             MembershipChange::StatusChanged { .. } => return false,
         };
         if over.map(|over| over.revision) != seen {
             return false;
         }
         if let (Some(row), Some(over)) = (&mut row, over) {
-            row.status = match change {
-                MembershipChange::Replaced { .. } => over.hands_on(&row.facts),
-                _ => over.status,
-            };
+            if !matches!(change, MembershipChange::Replaced { .. }) {
+                row.status = over.status;
+            }
         }
         self.decided(workers, Instant::now(), change, row)
+    }
+
+    /// The status this replica's worker object states for the row `id`,
+    /// told by the holder of the objects: a leader's side of a told status
+    /// ([`Self::follow`]). The object's status leads. Its holder tells each
+    /// move here: a probe's verdict, a connect signal and a drain. The
+    /// store steps its own epoch and journals the write as its own.
+    ///
+    /// `revision` is the row's revision the object was built from. The
+    /// table's row must stand at it still, under this hold of the
+    /// membership lock: a stale status is dropped, never written onto a
+    /// successor.
+    ///
+    /// `leads` is the writer's last word. The store asks it behind the
+    /// lock the write waits for. Where it says no, the status is stale: a
+    /// term that ended while the write waited there moves no status and
+    /// tells the journal nothing. It is asked under the store's lock and
+    /// takes none of the store's: a lock it takes is never held by its
+    /// writer across a write of the store. A writer with no term to end
+    /// hands a word that always holds.
+    ///
+    /// What the write found: the status moved; it stood, because the row
+    /// holds it already; the row left `revision`; or no row stands.
+    pub(crate) fn status_told(
+        &self,
+        id: WorkerId,
+        status: WorkerStatus,
+        revision: u64,
+        leads: &dyn Fn() -> bool,
+    ) -> HealthWrite {
+        let mut workers = self.writing();
+        let Some(row) = workers.guarded(id, revision) else {
+            return workers.unjudged(id);
+        };
+        if !leads() {
+            return HealthWrite::Stale;
+        }
+        let from = row.row.status;
+        if workers.set_status(id, status).is_none() {
+            return HealthWrite::Stood(from);
+        }
+        self.show_status(id, status);
+        HealthWrite::Moved { from, to: status }
     }
 }
 
@@ -2329,10 +2355,6 @@ struct OnTable<'a>(&'a FxHashMap<WorkerId, Ranks>);
 impl OnFile for OnTable<'_> {
     fn sample(&self, id: WorkerId, rank: u16) -> Option<LoadSample> {
         self.0.get(&id)?.samples.get(&rank).copied()
-    }
-
-    fn cells(&self, id: WorkerId, rank: u16) -> Option<&[SignalCell]> {
-        self.0.get(&id)?.cells.get(&rank).map(|cells| &**cells)
     }
 }
 
@@ -2778,7 +2800,6 @@ impl LoadSink for MemoryStore {
                 folded = writer.fold_load(id, rank, None).or(folded);
             }
             // The member's values go with its samples.
-            let unsaid = !ranks.cells.is_empty() && writer.forget_signals(id);
             *ranks = Ranks::default();
             // The member's marks go with its rows: a rank with nothing on
             // file is a rank again, and its engine is judged for it.
@@ -2788,7 +2809,7 @@ impl LoadSink for MemoryStore {
                 None if forgot => writer.engine_of(id),
                 None => None,
             };
-            if folded.is_some() || forgot || unsaid {
+            if folded.is_some() || forgot {
                 if let Some(engine) = engine {
                     writer.judged(engine, false);
                 }
@@ -2835,9 +2856,7 @@ impl SignalSink for MemoryStore {
         self.world.load().spec().shared_signal_columns()
     }
 
-    /// A value that is taken is shown as a load write with no instant of
-    /// its own is: with the window's next publication, or at once in a
-    /// store that publishes no window.
+    /// A value that is taken goes on file and asks for no publication.
     fn signal_value(
         &self,
         id: WorkerId,
@@ -2941,10 +2960,6 @@ impl MemoryStore {
             return SignalWriteOutcome::Older;
         }
         *held = cell;
-        if writer.fold_signal(id, rank, column, cell) {
-            let world = writer.folded();
-            self.show(writer, world);
-        }
         SignalWriteOutcome::Written
     }
 }
