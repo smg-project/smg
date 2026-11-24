@@ -128,7 +128,6 @@ use smg_worker::{
 };
 
 use super::{
-    kv_cursor,
     kv_tables::{
         ApplyError, ChainBlockMap, KvTables, LaneWriter, SequenceHash, StoredBlock, WorkerGroups,
     },
@@ -570,13 +569,6 @@ impl KvEventSink for KvAdapter {
         // The stream's worker, as its series name it.
         let url = self.urls.lock().get(&id).cloned();
         let snapshot = facts.snapshot.is_some();
-        let facts = kv_cursor::BatchFacts {
-            sequence: facts.sequence,
-            clears: facts.clears,
-            snapshot: facts.snapshot.map(|chunk| kv_cursor::SnapshotChunk {
-                unknown_before: chunk.unknown_before,
-            }),
-        };
         // A batch that carries a store names the model's block size.
         let stores = batch
             .events
@@ -637,7 +629,7 @@ impl KvEventSink for KvAdapter {
             record = state.block_of_record();
         });
         match outcome {
-            kv_cursor::BatchOutcome::Applied => {
+            BatchOutcome::Applied => {
                 if !kept {
                     self.keep(id, applied);
                 }
@@ -652,25 +644,23 @@ impl KvEventSink for KvAdapter {
                     }
                     Metrics::set_kv_index_blocks(url, self.held(id));
                 }
-                BatchOutcome::Applied
             }
-            kv_cursor::BatchOutcome::Skipped => {
+            BatchOutcome::Skipped => {
                 // A batch behind its lane's cursor. A row with no lane
                 // skips every batch and counts none.
                 let behind = || self.tables.cursor(row, rank).is_some();
                 if let Some(url) = url.as_ref().filter(|_| behind()) {
                     Metrics::record_kv_event_batch(url, "stale");
                 }
-                BatchOutcome::Skipped
             }
-            kv_cursor::BatchOutcome::Gap { expected, received } => {
+            BatchOutcome::Gap { .. } => {
                 // The collector asks the publisher to replay from here.
                 if let Some(url) = &url {
                     Metrics::record_kv_event_gap(url, "replay_requested", 0);
                 }
-                BatchOutcome::Gap { expected, received }
             }
         }
+        outcome
     }
 
     fn reconnected(&self, id: WorkerId) {
@@ -683,14 +673,6 @@ impl KvEventSink for KvAdapter {
         if let Some(url) = self.urls.lock().get(&id) {
             Metrics::record_kv_event_resync(url, reason.as_str());
         }
-        let reason = match reason {
-            ResyncReason::OutOfRange => kv_cursor::ResyncReason::OutOfRange,
-            ResyncReason::DataLoss => kv_cursor::ResyncReason::DataLoss,
-            ResyncReason::SnapshotAbandoned => kv_cursor::ResyncReason::SnapshotAbandoned,
-            ResyncReason::PublisherRestart => kv_cursor::ResyncReason::PublisherRestart,
-            ResyncReason::GapCleared => kv_cursor::ResyncReason::GapCleared,
-            ResyncReason::Snapshot => kv_cursor::ResyncReason::Snapshot,
-        };
         match rank {
             // One rank's reset is its own row's, and a rank with no row
             // holds nothing to reset.
@@ -711,11 +693,7 @@ impl KvEventSink for KvAdapter {
 
     fn cursor(&self, id: WorkerId, rank: u16) -> Option<KvCursor> {
         let row = self.routed(id, rank)?;
-        self.tables.cursor(row, rank).map(|cursor| KvCursor {
-            applied: cursor.applied,
-            replay_pending: cursor.replay_pending,
-            degraded: cursor.degraded,
-        })
+        self.tables.cursor(row, rank)
     }
 
     fn removed(&self, id: WorkerId) {
@@ -1765,8 +1743,7 @@ mod tests {
             1,
             &batch([Data::Stored(stored(1)), Data::Stored(stored(1))]),
         );
-        f.tables
-            .resync(f.row, Some(RANK), kv_cursor::ResyncReason::DataLoss);
+        f.tables.resync(f.row, Some(RANK), ResyncReason::DataLoss);
         assert_eq!(f.blocks(), 0);
         f.applied(5, &batch([Data::Stored(stored(1))]));
         assert_eq!(f.blocks(), 1);
@@ -1798,8 +1775,7 @@ mod tests {
     fn a_rank_the_store_emptied_forgets_its_block_of_record() {
         let f = Fixture::new();
         f.applied(1, &wide(1, 32));
-        f.tables
-            .resync(f.row, Some(RANK), kv_cursor::ResyncReason::DataLoss);
+        f.tables.resync(f.row, Some(RANK), ResyncReason::DataLoss);
         f.applied(5, &wide(2, 16));
         assert_eq!(f.blocks(), 1, "the narrower block is the row's block now");
     }
@@ -1807,15 +1783,13 @@ mod tests {
     /// The row's view in the tables' index, read by a lent batch with no
     /// event at `sequence`.
     fn view(f: &Fixture, sequence: u64) -> Arc<WorkerGroups> {
-        let facts = kv_cursor::BatchFacts {
-            sequence,
-            ..kv_cursor::BatchFacts::default()
-        };
         let mut view = None;
         let outcome = f
             .tables
-            .admit_through(f.row, RANK, facts, &mut |lane| view = Some(lane.groups()));
-        assert_eq!(outcome, kv_cursor::BatchOutcome::Applied);
+            .admit_through(f.row, RANK, facts(sequence), &mut |lane| {
+                view = Some(lane.groups());
+            });
+        assert_eq!(outcome, BatchOutcome::Applied);
         view.expect("the body ran")
     }
 
@@ -1984,7 +1958,7 @@ mod tests {
             );
             assert_eq!(
                 f.tables.cursor(f.row, RANK),
-                Some(kv_cursor::KvCursor {
+                Some(KvCursor {
                     applied: sequence,
                     degraded: unknown_before,
                     replay_pending: false
@@ -1995,20 +1969,18 @@ mod tests {
 
     #[test]
     fn each_reason_reaches_the_store_under_its_own_name() {
-        use kv_cursor::ResyncReason as To;
-
         let f = Fixture::new();
         let store = batch([Data::Stored(stored(1))]);
-        for (reason, expected) in [
-            (ResyncReason::OutOfRange, To::OutOfRange),
-            (ResyncReason::DataLoss, To::DataLoss),
-            (ResyncReason::SnapshotAbandoned, To::SnapshotAbandoned),
-            (ResyncReason::PublisherRestart, To::PublisherRestart),
-            (ResyncReason::GapCleared, To::GapCleared),
-            (ResyncReason::Snapshot, To::Snapshot),
+        for reason in [
+            ResyncReason::OutOfRange,
+            ResyncReason::DataLoss,
+            ResyncReason::SnapshotAbandoned,
+            ResyncReason::PublisherRestart,
+            ResyncReason::GapCleared,
+            ResyncReason::Snapshot,
         ] {
             f.sink.resync(f.row, Some(RANK), reason);
-            assert_eq!(f.tables.resyncs(expected), 1, "{reason:?}");
+            assert_eq!(f.tables.resyncs(reason), 1, "{reason:?}");
 
             f.applied(7, &store);
             f.sink.resync(f.row, Some(0), reason);
@@ -2032,10 +2004,10 @@ mod tests {
         f.tables.admit_through(
             f.row,
             RANK,
-            kv_cursor::BatchFacts {
+            BatchFacts {
                 sequence: 41,
                 clears: false,
-                snapshot: Some(kv_cursor::SnapshotChunk {
+                snapshot: Some(SnapshotChunk {
                     unknown_before: true,
                 }),
             },
@@ -2044,22 +2016,15 @@ mod tests {
         f.tables.admit_through(
             f.row,
             RANK,
-            kv_cursor::BatchFacts {
+            BatchFacts {
                 sequence: 43,
                 ..Default::default()
             },
             &mut |_| {},
         );
-        let expected = f.tables.cursor(f.row, RANK).expect("the store's cursor");
+        let expected = f.tables.cursor(f.row, RANK).expect("the tables' cursor");
         assert!(expected.replay_pending && expected.degraded);
-        assert_eq!(
-            f.sink.cursor(f.row, RANK),
-            Some(KvCursor {
-                applied: expected.applied,
-                replay_pending: expected.replay_pending,
-                degraded: expected.degraded,
-            })
-        );
+        assert_eq!(f.sink.cursor(f.row, RANK), Some(expected));
         assert_eq!(f.sink.cursor(f.row, 0), None);
     }
 
@@ -2799,13 +2764,13 @@ mod tests {
         f.sink.resync(f.lower, Some(1), ResyncReason::GapCleared);
         assert_eq!(f.blocks(upper), (1, 0));
         f.sink.resync(f.lower, Some(2), ResyncReason::GapCleared);
-        assert_eq!(f.tables.resyncs(kv_cursor::ResyncReason::GapCleared), 1);
+        assert_eq!(f.tables.resyncs(ResyncReason::GapCleared), 1);
 
         assert_eq!(f.admit(1, 8, store(3)), BatchOutcome::Applied);
         assert_eq!(f.blocks(upper), (1, 1));
         f.sink.resync(f.lower, None, ResyncReason::OutOfRange);
         assert_eq!(f.blocks(upper), (0, 0));
-        assert_eq!(f.tables.resyncs(kv_cursor::ResyncReason::OutOfRange), 2);
+        assert_eq!(f.tables.resyncs(ResyncReason::OutOfRange), 2);
     }
 
     /// An engine that leaves clears every rank its stream fed, and the
@@ -3117,11 +3082,11 @@ mod tests {
         let (release, held) = mpsc::channel::<()>();
         std::thread::scope(|scope| {
             scope.spawn(move || {
-                let outcome = tables.admit_through(row, 0, cursor_facts(sequence), &mut |_| {
+                let outcome = tables.admit_through(row, 0, facts(sequence), &mut |_| {
                     entered.send(()).expect("the case waits for the body");
                     held.recv().expect("the case lets the body go");
                 });
-                assert_eq!(outcome, kv_cursor::BatchOutcome::Applied);
+                assert_eq!(outcome, BatchOutcome::Applied);
             });
             at_body.recv().expect("the body holds the lane");
             let stepping = scope.spawn(step);
@@ -3141,13 +3106,6 @@ mod tests {
             stepping.join().expect("the step ends");
             read.expect("the step never showed what the case waits for")
         })
-    }
-
-    fn cursor_facts(sequence: u64) -> kv_cursor::BatchFacts {
-        kv_cursor::BatchFacts {
-            sequence,
-            ..kv_cursor::BatchFacts::default()
-        }
     }
 
     /// A row's first clear runs in the hold that writes its entry, at a

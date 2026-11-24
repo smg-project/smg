@@ -77,9 +77,12 @@ use smg_policy_controller::{
         Signals, WorkerFacts, WorkerStatus, WorkersStore,
     },
     tracking::LeaseId,
-    worker_host::{KvCursor, KvTables, ResyncReason},
+    worker_host::KvTables,
 };
-use smg_worker::load::state::LoadReceiver;
+use smg_worker::{
+    kv_events::port::{KvCursor, ResyncReason},
+    load::state::LoadReceiver,
+};
 use tokio::{
     io::{copy, sink},
     net::{TcpListener, TcpStream},

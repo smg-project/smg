@@ -131,7 +131,6 @@ pub(crate) use found::stated;
 pub use found::{facts, pairing_descriptor};
 pub use health::HealthAdapter;
 pub use kv::{KvAdapter, KvHost, SkipReason, SkippedSubscriptions};
-pub use kv_cursor::{KvCursor, ResyncReason};
 pub use kv_feed::KvFeed;
 pub use kv_tables::KvTables;
 pub use lead::{Lead, SoleLead};

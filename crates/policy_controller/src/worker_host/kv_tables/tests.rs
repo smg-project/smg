@@ -5,6 +5,9 @@
 use std::{collections::BTreeMap, ops::Deref};
 
 use kv_index::{chain_prefix_hash, ApplyError, ContentHash, GroupKind, ReferenceIndexer};
+use smg_worker::kv_events::port::{
+    BatchFacts, BatchOutcome, KvCursor, ResyncReason, SnapshotChunk,
+};
 
 use super::{
     admitted as by_cursor, indexed_under, Blocks, ChainBlockMap, KvTables, LaneWriter,
@@ -13,10 +16,7 @@ use super::{
 use crate::{
     engine::view::WorkerId,
     store::{MembershipChange, MemoryStore, Signals, WorkerFacts, WorkersStore},
-    worker_host::kv_cursor::{
-        BatchFacts, BatchOutcome, KvCursor, RankCursor, ResyncReason, SnapshotChunk,
-        GAP_CLEAR_THRESHOLD,
-    },
+    worker_host::kv_cursor::{RankCursor, GAP_CLEAR_THRESHOLD},
 };
 
 const MODEL: &str = "m";

@@ -1257,6 +1257,7 @@ mod tests {
             port::HealthSink as _,
         },
         identity::builder::BasicWorkerBuilder,
+        kv_events::port::{BatchFacts, BatchOutcome},
         registry::event::WorkerEvent,
         runtime::StallReason,
         worker::WorkerStatus as ObjectStatus,
@@ -1268,9 +1269,7 @@ mod tests {
         store::{
             GatewayId, MemoryStore, Overload, Registrant, WorkerFacts, WorkerPatch, WorkerStatus,
         },
-        worker_host::{
-            kv_cursor, kv_tables, object, HealthAdapter, KeptCredential, Members, SoleLead,
-        },
+        worker_host::{kv_tables, object, HealthAdapter, KeptCredential, Members, SoleLead},
     };
 
     const A: &str = "http://a:8000";
@@ -1942,14 +1941,14 @@ mod tests {
 
     /// One block of `row`'s own written through its lane at rank 0, as the
     /// body of an admitted batch writes it.
-    fn one_block(tables: &KvTables, row: WorkerId, sequence: u64) -> kv_cursor::BatchOutcome {
+    fn one_block(tables: &KvTables, row: WorkerId, sequence: u64) -> BatchOutcome {
         let block = [kv_tables::StoredBlock {
             seq_hash: kv_tables::SequenceHash(1_000 + sequence),
             content_hash: kv_index::ContentHash(2_000 + sequence),
         }];
-        let facts = kv_cursor::BatchFacts {
+        let facts = BatchFacts {
             sequence,
-            ..kv_cursor::BatchFacts::default()
+            ..BatchFacts::default()
         };
         tables.admit_through(row, 0, facts, &mut |lane| {
             let mut map = std::mem::take(lane.map());
@@ -1978,7 +1977,7 @@ mod tests {
         assert_eq!(lanes(&tables, &[a, b, quiet]), [false, true, true]);
         // A replaced row's lane leaves with it, blocks and all, and its
         // next life under the same URL starts with an empty lane, unheard.
-        assert_eq!(one_block(&tables, b, 1), kv_cursor::BatchOutcome::Applied);
+        assert_eq!(one_block(&tables, b, 1), BatchOutcome::Applied);
         assert_eq!(tables.indexed_blocks(b, 0), 1);
         let again = store.upsert(asking(B, 2)).id();
         objects.follow(&store);
@@ -1992,10 +1991,7 @@ mod tests {
         assert_eq!(lanes(&tables, &[quiet, again]), [false, true]);
         // A row that stays keeps what was heard for it through a later
         // follow that changes nothing of it.
-        assert_eq!(
-            one_block(&tables, again, 1),
-            kv_cursor::BatchOutcome::Applied
-        );
+        assert_eq!(one_block(&tables, again, 1), BatchOutcome::Applied);
         store.upsert(asking(D, 1));
         objects.follow(&store);
         assert_eq!(tables.indexed_blocks(again, 0), 1);

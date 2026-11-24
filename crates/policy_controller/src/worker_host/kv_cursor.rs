@@ -20,112 +20,14 @@
 //! collector says to each row of the engine, the rows a snapshot holds
 //! nothing for included. A snapshot's start is a resync for
 //! [`ResyncReason::Snapshot`] before its first block, and a chunk only adds.
+//!
+//! The facts that cross a batch's admission, its outcome, a reason and the
+//! cursor a subscriber reads are the worker crate's port types
+//! ([`smg_worker::kv_events::port`]): the tables state none of their own.
+//!
+//! [`ResyncReason::Snapshot`]: smg_worker::kv_events::port::ResyncReason::Snapshot
 
-#![expect(
-    clippy::exhaustive_enums,
-    clippy::exhaustive_structs,
-    reason = "the store's index of cache events moves to the worker's side, which decides its types"
-)]
-
-/// The header facts of one batch, read by the cursor; the batch itself (the
-/// servicer's message, with the blocks the index applies) rides beside them
-/// as the host's own type.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct BatchFacts {
-    /// The publisher's sequence number: monotonic per rank, each rank its
-    /// own counter.
-    pub sequence: u64,
-    /// The batch carries the engine's own cache clear, wherever it stands
-    /// among the events: the cursor's fact (a batch below the cursor that
-    /// clears is a restarted publisher, since what such a batch leaves
-    /// owes nothing to what came before it). The clear itself is the
-    /// batch's: a collector sets this when a clear stands among what it
-    /// decoded, and a sink empties the rank there.
-    pub clears: bool,
-    /// The batch is one chunk of a relay's state snapshot, not a batch the
-    /// publisher sent.
-    pub snapshot: Option<SnapshotChunk>,
-}
-
-/// One chunk of a relay's in-band snapshot, stamped with a sequence the
-/// relay chose so live batches continue after the last one. A chunk only
-/// adds to its rank: the snapshot's start is a resync
-/// ([`ResyncReason::Snapshot`]) the collector says before the first block.
-/// Where a chunk stands in the relay's count over the engine is the
-/// collector's to read: no sink reads it, so none is handed it.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct SnapshotChunk {
-    /// The snapshot could not cover the engine's whole life: the rank's
-    /// blocks are a partial set until the next resync.
-    pub unknown_before: bool,
-}
-
-/// What the sink did with a batch.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BatchOutcome {
-    /// Applied to the index; the cursor advanced to it.
-    Applied,
-    /// A duplicate below the cursor, a chunk of a snapshot still arriving,
-    /// another rank's batch, or a batch for a row that holds no lane: not
-    /// applied.
-    Skipped,
-    /// A gap with no replay asked yet: the caller reconnects asking for a
-    /// replay from `expected`; the batch is not applied (the replay resends
-    /// it). A second gap on the same rank is applied as lost history (see
-    /// [`KvCursor::degraded`]).
-    Gap { expected: u64, received: u64 },
-}
-
-/// Why a rank's cursor was reset or its blocks replaced. The first two are
-/// the server's own status codes; the third the collector's word for a
-/// snapshot its stream did not finish; the next two the cursor's own
-/// findings; the last the collector's word at a snapshot's start.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ResyncReason {
-    /// The server's history no longer reaches the cursor.
-    OutOfRange,
-    /// The server lost batches it cannot name.
-    DataLoss,
-    /// The stream ended with a snapshot still arriving: a partial live set,
-    /// kept until the next snapshot's start.
-    SnapshotAbandoned,
-    /// A sequence far below the cursor, or a clear below it: the publisher
-    /// started over and its cache is empty.
-    PublisherRestart,
-    /// A gap the server could not replay, too large to keep the state.
-    GapCleared,
-    /// A relay served a state snapshot in place of history: the live set it
-    /// carries replaces the blocks of every rank of the engine. The
-    /// collector says it to each row before the snapshot's first block.
-    Snapshot,
-}
-
-impl ResyncReason {
-    /// The metric label of the reason.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::OutOfRange => "out_of_range",
-            Self::DataLoss => "data_loss",
-            Self::SnapshotAbandoned => "snapshot_abandoned",
-            Self::PublisherRestart => "publisher_restart",
-            Self::GapCleared => "gap_cleared",
-            Self::Snapshot => "snapshot",
-        }
-    }
-}
-
-/// One rank's cursor as a subscriber reads it before it (re)subscribes.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct KvCursor {
-    /// The last sequence applied, `0` for none: servers resume strictly
-    /// after it.
-    pub applied: u64,
-    /// A replay was asked for and its batches have not arrived.
-    pub replay_pending: bool,
-    /// A gap could not be recovered: the rank's blocks are a partial set
-    /// until a resync.
-    pub degraded: bool,
-}
+use smg_worker::kv_events::port::KvCursor;
 
 /// A sequence this far below the cursor is a restarted publisher, not a late
 /// duplicate: replays start at the sequence asked for, so a legitimate

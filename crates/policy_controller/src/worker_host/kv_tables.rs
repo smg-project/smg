@@ -55,10 +55,9 @@ pub(super) use kv_index::{ApplyError, ChainBlockMap, SequenceHash, StoredBlock, 
 use kv_index::{ChainIndex, GroupViews};
 use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
+use smg_worker::kv_events::port::{BatchFacts, BatchOutcome, KvCursor, ResyncReason};
 
-use super::kv_cursor::{
-    BatchAdmission, BatchFacts, BatchOutcome, KvCursor, RankCursor, ResyncReason,
-};
+use super::kv_cursor::{BatchAdmission, RankCursor};
 use crate::{engine::view::WorkerId, store::workers::WorkerRow};
 
 #[cfg(test)]
