@@ -115,7 +115,7 @@ use crate::{
 /// rooms. The two overload thresholds are the gateway's too: the default it
 /// builds its worker objects with, under each worker's own registration. No
 /// document carries a threshold, so one off its default means the same
-/// document. Both at none leave nothing to veto by, and the settings' own
+/// document. Both at none leave no default to veto by, and the settings' own
 /// document switches the block off. Beside a supplied document the two are
 /// no difference, whatever they are: its host says what a block that is on
 /// means over no threshold. The pin of a sticky key to one engine of a
@@ -573,10 +573,13 @@ impl RoutingSettings {
     /// another value. A conflict names the first difference and the two
     /// values.
     ///
-    /// The two overload thresholds are no part of the comparison: no
-    /// document carries one, so they stand beside a supplied document
-    /// whatever they are, both at none too. What a supplied document's
-    /// switch means over no threshold is its host's to say.
+    /// The two overload thresholds are no part of the comparison with the
+    /// document of `defaults`: no document carries one, so beside settings
+    /// that state nothing else they stand beside a supplied document
+    /// whatever they are, both at none too. Settings that state a policy of
+    /// their own are held to their whole document, whose block is off for
+    /// both at none. What a supplied document's switch means over no
+    /// threshold is its host's to say.
     ///
     /// Both launchers refuse a routing setting beside a document before
     /// this runs, so the comparison judges a configuration built by hand.
@@ -2947,6 +2950,21 @@ mod tests {
             worker_overload_token_usage: None,
             ..defaults()
         };
+        // A host whose own defaults state no threshold: the settings' two
+        // stand beside a supplied document all the same.
+        for (waiting, usage) in [(Some(8), None), (None, Some(0.8)), (Some(8), Some(0.8))] {
+            let beside = RoutingSettings {
+                policy_spec: Some(on.clone()),
+                worker_overload_waiting_requests: waiting,
+                worker_overload_token_usage: usage,
+                ..defaults()
+            };
+            assert_eq!(
+                beside.policy_document_in_force(&own),
+                Ok(on.clone()),
+                "{waiting:?} and {usage:?} over a host's defaults at none"
+            );
+        }
         let block = |document: PolicySpec| {
             document
                 .bindings

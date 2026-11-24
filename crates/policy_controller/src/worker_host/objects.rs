@@ -294,7 +294,7 @@ impl<G> Objects<G> {
     /// worker, for its own decisions, and the holder does not copy its
     /// verdict onto the object's flag.
     ///
-    /// The monitor and the store do not read the same thresholds. The
+    /// The monitor and the store read their thresholds from two places. The
     /// crate's two defaults, which the store reads under a binding whose
     /// block is on for each signal a row names none for, are not read here:
     /// `defaults` stands in their place, and with no signal in `defaults`

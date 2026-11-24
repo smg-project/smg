@@ -112,9 +112,8 @@ impl RouterConfig {
     /// objects are built with one default and the routes read one shed
     /// word, and the document's words are the ones they are built and read
     /// under. Everywhere else they are the configuration's own two
-    /// settings, which the document the routing settings mean states too.
-    /// They are those two as well for a document this gateway refuses,
-    /// which no start runs.
+    /// settings. They are those two as well for a document whose two words
+    /// this gateway refuses, which no start runs.
     pub(crate) fn overload_words_in_force(&self) -> OverloadWords {
         let own = OverloadWords {
             protection: self.worker_overload_protection,
@@ -170,7 +169,7 @@ impl RouterConfig {
             && self.worker_overload_waiting_requests.is_none()
             && self.worker_overload_token_usage.is_none()
         {
-            return Err("worker_overload_waiting_requests and worker_overload_token_usage are both none beside a policy document whose overload block is on: a gateway with no default threshold vetoes by none; state a threshold, or switch the block off in the document".to_owned());
+            return Err("worker_overload_waiting_requests and worker_overload_token_usage are both none beside a policy document whose overload block is on: the block has no default threshold to switch on, and a worker's own thresholds veto either way; state a threshold, or switch the block off in the document".to_owned());
         }
         Ok(Some(OverloadWords {
             protection: first.enabled,
@@ -638,6 +637,16 @@ mod tests {
             refused(&[Some(block(false, false)), Some(block(false, false)), None]),
             "bindings[2].overload.enabled = true is not the false bindings[0] says, by its block or the block's default: a gateway builds its workers with one default set of overload thresholds, so the bindings of its document say one word"
         );
+        // The shed word differs either way round: set first, dropped later.
+        assert_eq!(
+            refused(&[Some(block(true, true)), None]),
+            "bindings[1].overload.shed_when_all_vetoed = false is not the true bindings[0] says, by its block or the block's default: a gateway's routes read one shed word for the process, so the bindings of its document say one word"
+        );
+        // A binding that differs on both words is named by its switch.
+        assert_eq!(
+            refused(&[None, Some(block(false, true))]),
+            "bindings[1].overload.enabled = false is not the true bindings[0] says, by its block or the block's default: a gateway builds its workers with one default set of overload thresholds, so the bindings of its document say one word"
+        );
         let differs = RouterConfig {
             worker_overload_shed: true,
             ..supplied(bound(&[Some(block(false, false)), None]))
@@ -651,7 +660,8 @@ mod tests {
         );
     }
 
-    /// Both thresholds at none leave a gateway nothing to veto by. They stand
+    /// Both thresholds at none leave a gateway no default threshold to veto
+    /// by, and a worker's own thresholds veto either way. They stand
     /// beside a supplied document as every threshold does, so the comparison
     /// takes the document, whatever it is. This gateway then refuses one
     /// whose block is on, by the two settings' names and with the two ways
@@ -670,7 +680,7 @@ mod tests {
         assert_eq!(on.policy_document_in_force(), Ok(preset("round_robin")));
         assert_eq!(
             on.supplied_overload_words(),
-            Err("worker_overload_waiting_requests and worker_overload_token_usage are both none beside a policy document whose overload block is on: a gateway with no default threshold vetoes by none; state a threshold, or switch the block off in the document".to_owned())
+            Err("worker_overload_waiting_requests and worker_overload_token_usage are both none beside a policy document whose overload block is on: the block has no default threshold to switch on, and a worker's own thresholds veto either way; state a threshold, or switch the block off in the document".to_owned())
         );
 
         let off = bound(&[Some(block(false, false)), Some(block(false, false))]);
@@ -691,6 +701,20 @@ mod tests {
         assert_eq!(one.policy_document_in_force(), Ok(preset("round_robin")));
         assert_eq!(
             one.supplied_overload_words(),
+            Ok(Some(OverloadWords {
+                protection: true,
+                shed: false
+            }))
+        );
+
+        // The count alone at none leaves the usage to veto by.
+        let other = RouterConfig {
+            worker_overload_waiting_requests: None,
+            ..supplied(preset("round_robin"))
+        };
+        assert_eq!(other.policy_document_in_force(), Ok(preset("round_robin")));
+        assert_eq!(
+            other.supplied_overload_words(),
             Ok(Some(OverloadWords {
                 protection: true,
                 shed: false

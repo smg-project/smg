@@ -478,8 +478,7 @@ const HEADINGS: [&str; 2] = ["Routing Policy", "PD Disaggregation"];
 
 const POOLS: &str = "the pools and their addresses are the gateway's";
 const ADMISSION: &str = "the prefill queue and its limits are the gateway's admission";
-const THRESHOLDS: &str =
-    "the gateway builds its worker objects with the two overload thresholds, and no document carries one";
+const THRESHOLDS: &str = "the gateway builds its worker objects with the two overload thresholds unless the document switches its block off, and no document carries one";
 
 const EPD: &[&str] = &[
     "--epd-disaggregation",
