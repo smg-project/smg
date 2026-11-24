@@ -420,7 +420,9 @@ fn handed_on(
         members.workers(),
         records.ids(),
         facts,
-        // No places: the answer is made, and nobody reads the rows named.
+        // No places: a request held to places never comes here. The keyed
+        // entry answers nothing for it (`Engine::decide_keyed_among`), so
+        // its decision hands the naming its places itself.
         None,
         |page| maker.token_key(page),
         |target| maker.sends_to(target),
