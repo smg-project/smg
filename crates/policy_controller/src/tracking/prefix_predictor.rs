@@ -657,8 +657,7 @@ impl PrefixPredictor {
             } else if span < CHUNK {
                 let first = self.chunks.first_mut();
                 if let Some(first) = first.filter(|first| first.len() == span) {
-                    let mut grown = Vec::with_capacity(span * 2);
-                    grown.extend_from_slice(first);
+                    let mut grown = mem::take(first).into_vec();
                     grown.resize(span * 2, Block::BLANK);
                     *first = grown.into_boxed_slice();
                 }
