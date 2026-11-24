@@ -13,7 +13,8 @@ use crate::{
     document::{AppliedSpec, PolicySpec, SpecError, API_VERSION},
     engine::{
         decision, decision_engine::DecisionEngine, framework, Candidate, Constraints, Engine,
-        Filter, LoadRow, Pair, PoolFacts, RequestFacts, Scorer, Scratch, Target, TieBand, WorkerId,
+        Filter, LoadRow, Pair, PoolFacts, RequestFacts, Scorer, Scratch, SignalSource, Target,
+        TieBand, WorkerId,
     },
     stages::{
         pickers,
@@ -488,21 +489,22 @@ fn a_report_that_repeats_the_one_before_it_ends_no_send_where_the_profile_says_s
     let mut a = row(251, 3);
     let sent_at = START + u64::from(DELAY);
     // Each report: the milliseconds its sample is behind the first send,
-    // the requests it says run, then the sends that count under it with
-    // the key and without. A second send lands 21 ms behind the first.
-    for (behind_ms, running, with_key, without) in [
+    // the requests it says run, how the host got it, then the sends that
+    // count under it with the key and without. A second send lands 21 ms
+    // behind the first.
+    for (behind_ms, running, source, with_key, without) in [
         // The report the send was decided under: the count has read none
         // before it.
-        (0, 2, 1, 1),
-        // One that repeats it, the delay behind the send: it ends the
-        // send where the key is unset.
-        (REPORT_DELAY_MS, 2, 1, 0),
+        (0, 2, SignalSource::Events, 1, 1),
+        // One that repeats it, the delay behind the send, got another
+        // way: it ends the send where the key is unset.
+        (REPORT_DELAY_MS, 2, SignalSource::Poll, 1, 0),
         // One that differs ends the first send. It is sampled 2 ms behind
         // the second, sooner than the delay.
-        (23, 3, 1, 1),
+        (23, 3, SignalSource::Poll, 1, 1),
         // A repeat 19 ms behind the second send ends it without the key.
-        (40, 3, 1, 0),
-        (41, 4, 0, 0),
+        (40, 3, SignalSource::Events, 1, 0),
+        (41, 4, SignalSource::Events, 0, 0),
     ] {
         for engine in [&by_read, &by_counts, &by_sends, &plain] {
             if behind_ms == 0 {
@@ -511,10 +513,12 @@ fn a_report_that_repeats_the_one_before_it_ends_no_send_where_the_profile_says_s
                 send(engine, &a, START + 21_000, TOKENS);
             }
         }
-        // The age differs at every report: it is no part of the compare.
+        // The age differs at every report and the source at each repeat:
+        // neither is part of the compare.
         a.load = Some(LoadRow {
             running,
             report_age_ms: behind_ms,
+            source,
             ..LoadRow::default()
         });
         a.load_sampled_at_micros = sent_at + u64::from(behind_ms) * 1000;

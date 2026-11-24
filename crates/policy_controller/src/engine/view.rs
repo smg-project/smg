@@ -858,7 +858,9 @@ pub struct Candidate {
     /// The sample instant of `load` on the host's clock, in microseconds since
     /// the host's origin: dispatches made at or before it are the engine's by
     /// now and leave a load scorer's credit, or those made a profile's
-    /// `sent_report_delay_ms` before it where the profile sets one.
+    /// `sent_report_delay_ms` before it where the profile sets one. Under
+    /// a profile's `sent_until_report_changes` they leave only at a report
+    /// that differs from the one before it.
     /// In-process only; the wire carries the row's age.
     pub load_sampled_at_micros: u64,
     /// The session key of the request is pinned to this worker. A host

@@ -2090,19 +2090,19 @@ pub struct ProfileSpec {
     pub sent_report_delay_ms: Option<u32>,
     /// Whether a load report ends a send only where it differs from the
     /// report the count read of the worker before it, by anything but its
-    /// age. Set, a report that repeats the one before it ends no send,
-    /// and neither does the first report the count reads of a worker: for
-    /// an engine that shows a new request in its reports late and repeats
-    /// its last report meanwhile. The delay applies as it does unset: the
-    /// report that ends a send differs from the one before it and is
-    /// sampled the delay behind the send, or longer. The limit ends a
-    /// send whatever its worker's reports say, so a profile sets one
-    /// beside this where a worker's reports can stand still for good.
-    /// The count compares the reports its decisions read, at each
-    /// decision that reads the sends of a worker that holds one: a report
-    /// that no decision of the profile read is not compared, and the next
-    /// one is compared with the last that was. A profile whose stages do
-    /// not read its count of sends is refused if it sets this.
+    /// age and how the host got it. Set, a report that repeats the one
+    /// before it ends no send, and neither does the first report the count
+    /// reads of a worker: for an engine that shows a new request in its
+    /// reports late and repeats its last report meanwhile. The delay
+    /// applies as it does unset: the report that ends a send differs from
+    /// the one before it and is sampled the delay behind the send, or
+    /// longer. The limit ends a send whatever its worker's reports say, so
+    /// a profile sets one beside this where a worker's reports can stand
+    /// still for good. The count compares the reports its decisions read,
+    /// at each decision that reads the sends of a worker that holds one: a
+    /// report that no decision of the profile read is not compared, and the
+    /// next one is compared with the last that was. A profile whose stages
+    /// do not read its count of sends is refused if it sets this.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub sent_until_report_changes: bool,
 }

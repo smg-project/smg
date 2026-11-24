@@ -1206,11 +1206,12 @@ What an event does:
 | Released | the same stages hear the reason |
 
 A count of sends holds a send until one of four ends: a load report of the worker sampled at or
-after the send (later by `sent_report_delay_ms`, where the profile sets it), the age `sent_ttl_ms`
-where the profile sets it, a newer send once the worker's rank holds 8,192, or a membership
-change the count is told. The changes that end a worker's sends are its removal, its replacement
-under another id and a change of its data-parallel width. A list of the ids that stand
-(section 8.1) ends the sends of each worker it leaves out.
+after the send (later by `sent_report_delay_ms`, where the profile sets it, and one that differs
+from the report before it, where the profile sets `sent_until_report_changes`), the age
+`sent_ttl_ms` where the profile sets it, a newer send once the worker's rank holds 8,192, or a
+membership change the count is told. The changes that end a worker's sends are its removal, its
+replacement under another id and a change of its data-parallel width. A list of the ids that
+stand (section 8.1) ends the sends of each worker it leaves out.
 
 A sessions rule places some requests alone, behind the profile's filters and with no scorer or
 picker of the profile asked: it follows a pin of the request's key, or its own assignment places

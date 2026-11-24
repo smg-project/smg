@@ -95,7 +95,8 @@ pub(crate) struct ComparedReports {
     /// The sample instant of the last report that differed from one
     /// compared before it, zero where none has.
     changed_at: AtomicU64,
-    /// The newest report compared, its age left out, with the sample
+    /// The newest report compared, its age and its source left out: what
+    /// the host says of how the report reached it. With it, the sample
     /// instant it was first kept at: a repeat moves `seen_at` and leaves
     /// that instant. A report's first read holds it for the one compare.
     seen: Mutex<Option<(LoadRow, u64)>>,
@@ -118,7 +119,7 @@ impl ComparedReports {
     /// one before it, or `sample` where the read shows an earlier report,
     /// and `None` where no report has differed. The first report compared
     /// has none before it and ends no send, and neither does one that
-    /// repeats the report before it, whatever its age.
+    /// repeats the report before it, whatever its age and its source.
     ///
     /// A read may show a report sampled before the one kept: a decision
     /// that holds an earlier snapshot. Where the two differ, the instant
@@ -141,6 +142,7 @@ impl ComparedReports {
         if self.seen_at.load(Ordering::Acquire) != sample && holds() {
             let rest = LoadRow {
                 report_age_ms: 0,
+                source: crate::engine::SignalSource::None,
                 ..*report
             };
             let mut seen = self.seen.lock();
@@ -195,15 +197,15 @@ impl ComparedReports {
 /// a send is one sampled that long after the send, or longer: a report
 /// sampled sooner behind it leaves it counted. Under
 /// `sent_until_report_changes` the report that ends a send also differs
-/// from the report the count read of the row before it, by anything but
-/// its age: a report that repeats the one before it ends no send, and
-/// neither does the first the count reads of a row. The count compares at
-/// each read of a row that holds a send, so every such read takes the
-/// release's path. Under a request clock of zero it compares only where
-/// the row's sample, less the delay, reaches a send: a report is then
+/// from the report the count read of the row before it, by anything but its
+/// age and its source: a report that repeats the one before it ends no
+/// send, and neither does the first the count reads of a row. The count
+/// compares at each read of a row that holds a send, so every such read
+/// takes the release's path. Under a request clock of zero it compares only
+/// where the row's sample, less the delay, reaches a send: a report is then
 /// compared with the last one such a read showed. When a send arrives with
-/// 8,192 already held on a row, the tally lets the row's oldest go to
-/// bound the count. This threshold applies at any age.
+/// 8,192 already held on a row, the tally lets the row's oldest go to bound
+/// the count. This threshold applies at any age.
 #[derive(Debug)]
 pub struct DispatchCredit {
     pub(crate) credits: Credits,
@@ -221,7 +223,8 @@ pub struct DispatchCredit {
     /// before its sample, or longer. Zero where the profile sets none: a
     /// report then ends the sends made at its sample and before.
     report_delay_micros: u64,
-    /// Whether the profile sets either of the two: what a pass asks once
+    /// Whether the profile sets either of the two, or ends its sends
+    /// only at a changed report: what a pass asks once
     /// ([`Self::limited`]).
     limited: bool,
     /// What a read of a row's totals runs where its instant reaches a
@@ -363,7 +366,8 @@ impl DispatchCredit {
     }
 
     /// Whether the profile sets a time limit or a report delay on its
-    /// sends, or ends them only at a changed report. The pass a stage's row loop makes over a count with neither
+    /// sends, or ends them only at a changed report. The pass a stage's
+    /// row loop makes over a count with none of the three
     /// ([`Self::reads_unlimited`]) compares no cutoff and takes no delay
     /// off a sample.
     #[inline(always)]
@@ -389,11 +393,15 @@ impl DispatchCredit {
     }
 
     /// [`Self::pass`] for a count that sets no time limit and no report
-    /// delay ([`Self::limited`]): the pass holds the tally map alone, and
-    /// neither a cutoff nor a delay is worked out or kept.
+    /// delay and ends its sends at any report ([`Self::limited`]): the
+    /// pass holds the tally map alone, and neither a cutoff nor a delay
+    /// is worked out or kept.
     #[inline(always)]
     pub(crate) fn reads_unlimited(&self) -> UnlimitedPass<'_> {
-        debug_assert!(!self.limited(), "the count sets no limit and no delay");
+        debug_assert!(
+            !self.limited(),
+            "the count sets no limit, no delay and no compare"
+        );
         UnlimitedPass {
             tally: self.credits.tally.load(),
             credit: PhantomData,
@@ -415,10 +423,13 @@ pub struct DispatchCreditPass<'a> {
 impl DispatchCreditPass<'_> {
     /// The instant a row's read releases through, where the row's report
     /// was sampled at `sample`: the sample less the count's report delay,
-    /// or the time cutoff where that is later. The one place the delay is
-    /// applied, so every reader of the count follows it. A sample sooner
-    /// than the delay behind the clock's start releases through instant
-    /// zero, as a row without a report does.
+    /// or the time cutoff where that is later. Every read of the count
+    /// takes the delay off here. A sample sooner than the delay behind
+    /// the clock's start releases through instant zero, as a row without
+    /// a report does. A count that ends its sends only at a changed
+    /// report takes the delay off the instant of that report too
+    /// ([`DispatchCredit::changed_through`]), and there an instant sooner
+    /// than the delay behind the clock's start ends no send.
     #[inline(always)]
     fn through(&self, sample: u64) -> u64 {
         sample.saturating_sub(self.delay).max(self.cutoff)
