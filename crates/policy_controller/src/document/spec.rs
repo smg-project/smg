@@ -3527,7 +3527,8 @@ fn built_scorer(scorer: impl Scorer + 'static) -> Resolved<Box<dyn Scorer>> {
 
 /// The gates a profile's affinity stages share: the spill gate of its
 /// `prefix-affinity` entry, the fleet gate of its `kv-pressure` entry and
-/// the view's block size.
+/// the view's block size. Of two entries of a kind the last one's stands
+/// here; a `prefix-affinity` scorer spills by its own entry's gate.
 fn gates_of(p: &ProfileSpec, view: &ViewSpec) -> Gates {
     let mut affinity = None;
     let mut kv = None;
@@ -3578,10 +3579,21 @@ fn scorer_of(
         {
             Resolved::NotInBuild("the prefix-affinity uncached credit")
         }
-        ScoreStage::PrefixAffinity(p) => Resolved::Built(with_load_report_age_limit(
-            PrefixAffinity::new(p, gates),
-            max_age,
-        )),
+        ScoreStage::PrefixAffinity(p) => {
+            // The entry spills by the gate it writes itself. The KV gate
+            // and the block size stay the profile's.
+            let own = Gates::of(Some(p), None, None);
+            let gates = Gates {
+                rel: own.rel,
+                abs: own.abs,
+                prefix_margin_tokens: own.prefix_margin_tokens,
+                ..gates
+            };
+            Resolved::Built(with_load_report_age_limit(
+                PrefixAffinity::new(p, gates),
+                max_age,
+            ))
+        }
         ScoreStage::KvPressure(_) => built_scorer(KvPressure),
         ScoreStage::WarmupSlice(p) => Resolved::Built(with_load_report_age_limit(
             WarmupSlice::new(p, gates),
@@ -9475,7 +9487,8 @@ mod tests {
     /// The spill parameters of a prefix-affinity entry reach the gates the
     /// profile's stages share: under a relative threshold of four a holder
     /// three times as loaded as the mean keeps its request; under the
-    /// default (1.5, plus the margin) it spills.
+    /// default (1.5, plus the margin) it spills. Of two entries each spills
+    /// by its own gate.
     #[test]
     fn the_spill_parameters_of_the_spec_reach_the_profiles_gates() {
         use crate::engine::{
@@ -9532,6 +9545,13 @@ mod tests {
             0,
             "under the default gate the loaded holder spills"
         );
+        // Two entries, each under its own gate: the heavier one keeps the
+        // holder whichever is written first.
+        let heavy = r#"{"prefix-affinity":{"weight":4.0,"spill":{"rel":4.0}}}"#;
+        let light = r#"{"prefix-affinity":{"weight":1.0}}"#;
+        for score in [format!("{light},{heavy}"), format!("{heavy},{light}")] {
+            assert_eq!(leader(&score), 0, "{score}");
+        }
     }
 
     /// The digest names the document, not the file: the form (YAML or JSON,
