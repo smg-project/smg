@@ -170,8 +170,8 @@ pub(crate) struct Shared {
     /// How long a `Session` stream may stand with no `Hello`.
     pub(crate) hello_deadline: Duration,
     /// The membership door over that store: the control scope's
-    /// registration calls.
-    pub(crate) door: MembershipCalls,
+    /// registration calls, and the writes of the replica's own discovery.
+    pub(crate) door: Arc<MembershipCalls>,
     /// The replica's worker objects: what a standby's applier lays its
     /// leader's rows as, and what the door decides a row's write over.
     pub(crate) objects: Arc<Objects<Members>>,
@@ -277,7 +277,11 @@ impl Shared {
             objects: Arc::clone(&objects),
             // The door decides a row's write over the worker objects its
             // deciding threads read.
-            door: MembershipCalls::new(Arc::clone(&store), Arc::clone(&feed.log), objects),
+            door: Arc::new(MembershipCalls::new(
+                Arc::clone(&store),
+                Arc::clone(&feed.log),
+                objects,
+            )),
             replication: Replication::new(
                 Arc::clone(&store),
                 Arc::clone(&feed.log),

@@ -29,6 +29,7 @@ mod tests {
         engine::view::{WireModes, WorkerId as RowId},
         service::controller::{
             config::tests::valid,
+            readiness::State,
             worker_objects::{ObjectsWake, WorkerObjects},
             Controller,
         },
@@ -288,7 +289,7 @@ mod tests {
                 false,
                 by_need,
             ));
-            f.feed.set_load_sink(&monitor);
+            f.feed.set_loads_wanted(&monitor);
             f.check(async {
                 f.lay(facts(FIRST, WireModes::GRPC, false));
                 f.lay(facts(SECOND, WireModes::GRPC, true));
@@ -336,7 +337,7 @@ mod tests {
             false,
             false,
         ));
-        f.feed.set_load_sink(&monitor);
+        f.feed.set_loads_wanted(&monitor);
         assert_eq!(stream(FIRST), Some(SubscriptionKind::Events));
         assert_eq!(stream(UPPER), Some(SubscriptionKind::Loads));
     }
@@ -601,6 +602,99 @@ mod tests {
         let (result, ()) = timeout(Duration::from_secs(15), async { tokio::join!(serve, case) })
             .await
             .expect("the feed names the stored block and the controller stops");
+        result.expect("the controller stops cleanly");
+        stop_mock
+            .send(())
+            .expect("the mock worker is still serving");
+        timeout(WAIT, tasks.join_next())
+            .await
+            .expect("the mock worker stops")
+            .expect("the mock worker's task")
+            .expect("the mock worker stops cleanly");
+    }
+
+    /// The serve hands its feed the sink of the load records its streams
+    /// carry: a record on a worker's event stream reaches the load monitor
+    /// of the replica that leads, which marks the worker as one whose
+    /// stream pushes its load.
+    #[tokio::test]
+    async fn a_load_record_on_an_event_stream_reaches_the_leaders_monitor() {
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("the mock worker's listener binds");
+        let addr = listener.local_addr().expect("the mock worker's address");
+        let url = format!("grpc://{addr}");
+        // An engine that keeps a prefix cache serves the event stream, and
+        // its load records ride that stream from the subscription on.
+        let mock = MockConfig {
+            model_id: MODEL.to_owned(),
+            realistic: true,
+            engine: EngineParams {
+                prefix_cache: true,
+                ..EngineParams::default()
+            },
+            ..MockConfig::default()
+        };
+        let row = WorkerFacts {
+            engine_kind: mock.grpc_wire.as_str().to_owned(),
+            ..facts(&url, WireModes::GRPC, true)
+        };
+        let (stop_mock, mock_stopped) = oneshot::channel();
+        let mut tasks = JoinSet::new();
+        tasks.spawn(grpc::serve_with_listener_until(
+            Arc::new(mock),
+            listener,
+            async {
+                let _ = mock_stopped.await;
+            },
+        ));
+
+        let controller = Controller::bind(valid())
+            .await
+            .expect("the controller binds");
+        let (store, objects) = (controller.store(), controller.workers.holder());
+        let readiness = controller.readiness();
+        let (stop, stopped) = oneshot::channel();
+        let serve = Box::pin(controller.serve(async {
+            let _ = stopped.await;
+        }));
+        let case = async {
+            // The worker is laid behind the take: a quiet stream's first
+            // records come inside its first seconds, and a standby drops
+            // them.
+            timeout(WAIT, async {
+                while readiness.state() != State::Leader {
+                    sleep(POLL).await;
+                }
+            })
+            .await
+            .expect("the replica takes the lead");
+            let id = store.upsert(row).id();
+            let revision = store.get(id).expect("the row").revision;
+            store
+                .set_status(id, WorkerStatus::Ready, revision)
+                .expect("the worker is ready");
+            store.publish_now();
+
+            // The monitor marks a worker at the first record it takes, and
+            // a poll marks none.
+            let pushes = || {
+                let worker = objects.registry().get_by_url(&url);
+                let state = worker.and_then(|worker| worker.runtime_state());
+                state.is_some_and(|state| state.pushes_load_records())
+            };
+            timeout(WAIT, async {
+                while !pushes() {
+                    sleep(POLL).await;
+                }
+            })
+            .await
+            .expect("a record on the stream reaches the leader's monitor");
+            stop.send(()).expect("the controller is still serving");
+        };
+        let (result, ()) = timeout(Duration::from_secs(15), async { tokio::join!(serve, case) })
+            .await
+            .expect("the record reaches the monitor and the controller stops");
         result.expect("the controller stops cleanly");
         stop_mock
             .send(())

@@ -138,8 +138,8 @@ use smg_policy_controller::{
         controller::{State, PROTOCOL_VERSION},
         proto::{
             self, busy, completed::Class, decision::Outcome, gateway_frame, identity::Form,
-            principal, released, worker_event, Completed, DecideRequest, Decision, Dispatched,
-            Hello, Identity, Lease, OverloadThresholds, Released, RequestFacts, ShedReason, Side,
+            principal, released, worker_event, DecideRequest, Decision, Dispatched, Hello,
+            Identity, Lease, OverloadThresholds, Released, RequestFacts, ShedReason, Side,
             WatchWorkersRequest,
         },
         watcher::{WatchStream, WatchStreamEnd, Watcher},
@@ -2121,20 +2121,12 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
         );
 
         // The reports. A gateway that decides by itself tells the controller
-        // each request's life on its session, and the store holds what a
-        // decision's precedence rule reads of it: one gateway's own
-        // completions of class ok, a worker at a time.
+        // each request's life on its session. No leader issued such a
+        // request's lease, so its reports name no lease on file and write
+        // nothing: each holds the class its transport read.
         let live = engines[0];
-        let asked = Instant::now();
         let class = harness.send(live).await.expect("a live engine is sent");
         assert_eq!(class, Class::Ok, "a live engine answers to the end");
-        within(
-            "the live engine's row holds this gateway's completion",
-            PROBE_INTERVAL + ROOM,
-            || harness.completed_ok(GATEWAY, live, asked),
-        )
-        .await
-        .expect("the completion is read");
         let class = harness.send(dead).await.expect("a dead engine is sent");
         assert_eq!(class, Class::ConnectFailed, "a dead engine connects none");
         let class = tokio::time::timeout(ROOM, harness.send(hung))
@@ -2143,7 +2135,9 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             .expect("a hung engine is sent");
         assert_eq!(class, Class::Timeout, "a hung engine answers nothing");
         // A lease no leader issued is given up: not on file, no error, and
-        // the session outlives it: the next request's reports are applied.
+        // the session outlives it. One session's frames are applied in
+        // their order: a lease the controller files next, given up on the
+        // same session, leaves the file behind every report before it.
         harness
             .client()
             .released(Released {
@@ -2153,34 +2147,9 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             })
             .await
             .expect("a release is reported");
-        let again = Instant::now();
-        let class = harness.send(live).await.expect("a live engine is sent");
-        assert_eq!(class, Class::Ok, "a live engine answers a second time");
-        within(
-            "the session outlives a release of a lease not on file",
-            PROBE_INTERVAL + ROOM,
-            || harness.completed_ok(GATEWAY, live, again),
-        )
-        .await
-        .expect("the second completion is read");
-        // One session's frames are applied in their order, so the dead and
-        // the hung engine's reports were read by now: neither wrote a
-        // completion of class ok for this gateway. A completion of another
-        // class writes nothing, so these hold the class each frame carries
-        // and nothing more.
-        assert!(
-            !harness.completed_ok(GATEWAY, dead, asked),
-            "a dead engine's row holds no completion of class ok"
-        );
-        assert!(
-            !harness.completed_ok(GATEWAY, hung, asked),
-            "a hung engine's row holds no completion of class ok"
-        );
-        // One gateway's completions are its own.
-        assert!(
-            !harness.completed_ok("another-gateway", live, asked),
-            "another gateway reads none of this gateway's completions"
-        );
+        picked(&mut harness, nth("reports", 0))
+            .await
+            .expect("the session outlives a release of a lease not on file");
         // A frame that reads wrong ends the session of the gateway that sent
         // it, by its field's name: a second gateway gives up neither a
         // lease nor a ticket.
@@ -2217,42 +2186,42 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             matches!(&told, client::Error::Status(status) if status.code() == Code::InvalidArgument),
             "a report into the ended session tells the status it ended with: {told:?}"
         );
-        // The first gateway's session stands: its next reports are applied.
-        let last = Instant::now();
-        let class = harness.send(live).await.expect("a live engine is sent");
-        assert_eq!(class, Class::Ok, "a live engine answers a third time");
-        within(
-            "the first gateway's session stands",
-            PROBE_INTERVAL + ROOM,
-            || harness.completed_ok(GATEWAY, live, last),
-        )
-        .await
-        .expect("the third completion is read");
+        // The first gateway's session stands: its next frames are applied.
+        picked(&mut harness, nth("reports", 1))
+            .await
+            .expect("the first gateway's session stands");
 
         // The blocking form's report leaves with no call after it: its
         // runtime drives the connection between calls. The client is held,
-        // and asked nothing more, until the store has read its completion:
-        // its drop would not wait for a report still queued.
-        let served = harness.worker(live).expect("the live engine's row").0;
+        // and asked nothing more, until the store has read its report: its
+        // drop would not wait for a report still queued. The report names
+        // the dispatch of a lease the controller filed for that client, so
+        // the file shows that it was read.
         let address = format!("http://{}", harness.gateway());
-        let reported = Instant::now();
         let (hold, held) = mpsc::channel::<()>();
         let (told, reporting) = oneshot::channel();
         std::thread::spawn(move || {
             let report =
                 blocking::Client::connect(&address, "blocking-gateway").and_then(|mut client| {
-                    client.completed(Completed {
-                        lease_id: 1,
-                        side: Side::Single.into(),
-                        served,
-                        class: Class::Ok.into(),
-                        ..Completed::default()
-                    })?;
-                    Ok(client)
+                    let lease = match client.decide(ask(b"blocking-report"))? {
+                        Answer::Decision(Decision { leases, .. }) => {
+                            leases.first().map(|lease| lease.id)
+                        }
+                        Answer::Busy(_) => None,
+                    };
+                    if let Some(lease_id) = lease {
+                        client.dispatched(Dispatched {
+                            lease_id,
+                            target_index: 0,
+                            side: Side::Single.into(),
+                            since_decision_micros: 0,
+                        })?;
+                    }
+                    Ok((client, lease))
                 });
             match report {
-                Ok(client) => {
-                    let _ = told.send(Ok(()));
+                Ok((client, lease)) => {
+                    let _ = told.send(Ok(lease));
                     let _ = held.recv();
                     drop(client);
                 }
@@ -2261,18 +2230,19 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
                 }
             }
         });
-        tokio::time::timeout(ROOM, reporting)
+        let lease = tokio::time::timeout(ROOM, reporting)
             .await
             .expect("the blocking client reports inside its bound")
             .expect("the client's thread sends its answer")
-            .expect("the blocking client's report");
+            .expect("the blocking client's report")
+            .expect("the controller files a lease for the blocking client");
         within(
             "the blocking form's report leaves with no call after it",
             PROBE_INTERVAL + ROOM,
-            || harness.completed_ok("blocking-gateway", live, reported),
+            || harness.dispatched("blocking-gateway", lease),
         )
         .await
-        .expect("the blocking gateway's completion is read");
+        .expect("the blocking gateway's dispatch is read");
         drop(hold);
 
         // The Numbers: one process holds the controller, the engines and
@@ -2849,7 +2819,7 @@ async fn a_link_refuses_a_frame_out_of_the_calls_ranges_and_stands() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_handle_over_a_link_ends_each_lease_on_the_worker_that_served() {
+async fn a_handle_over_a_link_ends_a_lease_its_alternate_served() {
     use smg_policy_controller::{
         engine::{PolicyEngine, Request, RequestFacts},
         tracking::{DecisionGuard, Outcome, Side, TransportClass},
@@ -2905,14 +2875,6 @@ async fn a_handle_over_a_link_ends_each_lease_on_the_worker_that_served() {
             leases_before_expiry(&harness, &link, GATEWAY, 0, started)
                 .await
                 .expect("the completion ends the lease");
-            within(
-                "the completion is written on the served worker",
-                ROOM,
-                || harness.completed_ok(GATEWAY, served, started),
-            )
-            .await
-            .expect("the controller records the named worker's completion");
-            assert!(!harness.completed_ok(GATEWAY, picked, started));
         }
         assert!(link.stands());
         drop(link);

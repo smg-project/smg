@@ -33,7 +33,7 @@ use crate::{
 /// This crate's constant is 32 bits wide: widened, it reads just above
 /// the 0.8 an engine reports, and a worker at the threshold would not be
 /// over it.
-const OVERLOAD_DEFAULTS: OverloadThresholds = OverloadThresholds {
+pub(crate) const OVERLOAD_DEFAULTS: OverloadThresholds = OverloadThresholds {
     waiting_requests: Some(DEFAULT_WAITING_REQUESTS),
     token_usage: Some(DEFAULT_TOKEN_USAGE_CEILING),
 };
@@ -127,7 +127,7 @@ impl WorkerObjects {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::{collections::BTreeMap, time::Instant};
 
     use smg_worker::{
@@ -495,7 +495,7 @@ mod tests {
 
     /// A mock engine that serves `model` behind a port of its own: its
     /// address, what stops it and its task.
-    async fn engine(model: &str) -> (String, oneshot::Sender<()>, JoinSet<()>) {
+    pub(crate) async fn engine(model: &str) -> (String, oneshot::Sender<()>, JoinSet<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("a port");
         let addr = listener.local_addr().expect("the port's address");
         let config = mock_worker::config::Config {

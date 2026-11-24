@@ -823,7 +823,10 @@ impl MembershipCalls {
 
 /// A controller replica's own membership writer: the same calls for the
 /// program's own writers, sharing the turn of its control calls.
-#[cfg_attr(not(test), expect(dead_code, reason = "the host owns the door"))]
+#[cfg_attr(
+    not(any(test, feature = "discovery")),
+    expect(dead_code, reason = "the replica's discovery owns the door")
+)]
 pub(crate) struct ReplicaMembershipWriter {
     door: Arc<MembershipCalls>,
     by: Principal,
@@ -831,7 +834,7 @@ pub(crate) struct ReplicaMembershipWriter {
 }
 
 #[cfg_attr(
-    not(test),
+    not(any(test, feature = "discovery")),
     expect(dead_code, reason = "the host supplies the principal and fence")
 )]
 impl ReplicaMembershipWriter {
@@ -929,7 +932,7 @@ impl ReplicaMembershipWriter {
 }
 
 #[cfg_attr(
-    not(test),
+    not(any(test, feature = "discovery")),
     expect(dead_code, reason = "the host reads the term for each registration")
 )]
 struct ReplicaTurn<'a> {

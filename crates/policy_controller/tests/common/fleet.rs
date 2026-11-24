@@ -1916,17 +1916,6 @@ impl Harness {
             .is_some_and(|record| matches!(record.state, LeaseState::Dispatched { .. }))
     }
 
-    /// Whether the store holds a completion of class ok by the gateway named
-    /// `gateway` on the first rank of the engine at `engine`, at or after
-    /// `since`: the read a decision's precedence rule makes of one
-    /// gateway's own dispatches.
-    pub fn completed_ok(&self, gateway: &str, engine: usize, since: Instant) -> bool {
-        self.worker(engine).is_ok_and(|served| {
-            let gateway = GatewayId(fingerprint(gateway.as_bytes()));
-            self.store.completed_ok_since(gateway, served, since)
-        })
-    }
-
     /// The row id of the first rank of the engine at `engine`.
     pub fn worker(&self, engine: usize) -> Result<WorkerId, String> {
         self.members

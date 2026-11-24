@@ -712,16 +712,15 @@ impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
     }
 
     /// The request ended with `outcome`, as its host read it at `now`: the
-    /// lease ends, and the completion is written on the served worker for
-    /// the health precedence by the door or controller that decided it.
+    /// lease ends.
     /// A completion said with no dispatch says the dispatch first, at
     /// `now`: a request whose send failed was sent, and the engine hears a
     /// lease's events in their order. That dispatch carries the
     /// completion's instant, so a stage that times a request from its
     /// dispatch reads a span of zero for it. On a pair's handle a decode
     /// outcome ends the decode side. An encode outcome is said whole
-    /// there and ends no side, since the lease holds none such: the
-    /// served worker's health takes it, and what the handle owes stands.
+    /// there and ends no side, since the lease holds none such: what the
+    /// handle owes stands.
     /// Any other outcome ends the handle's own side, and a single's lease
     /// ends under any side its host names. A side's end is said once. An
     /// encode outcome on a pair's handle is said at each call.
@@ -734,7 +733,7 @@ impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
             }
             // A side the pair's lease does not hold: the completion is said
             // whole, as a served controller says such a frame. The file ends
-            // no side of the lease, and the served worker's health takes it.
+            // no side of the lease.
             Side::Encode if pair => {
                 if let Some(leased) = self.decided.lease {
                     self.say(

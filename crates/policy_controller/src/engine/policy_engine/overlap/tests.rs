@@ -328,6 +328,25 @@ impl Bed {
         key: Option<TokenKey<'_>>,
         target: Option<u32>,
     ) -> Option<Named> {
+        self.decide_among(facts, None, key, target)
+    }
+
+    /// What a request its host holds to `places` is named, decided by a
+    /// shed.
+    fn held_to(&self, facts: &RequestFacts<'_>, places: &[u32]) -> Named {
+        let named = self.decide_among(facts, Some(places), None, None);
+        named.expect("rows named")
+    }
+
+    /// [`Self::decide_keyed`] for a request its host holds to `places`,
+    /// where it states any.
+    fn decide_among(
+        &self,
+        facts: &RequestFacts<'_>,
+        places: Option<&[u32]>,
+        key: Option<TokenKey<'_>>,
+        target: Option<u32>,
+    ) -> Option<Named> {
         let mut named = None;
         let decision = decide(
             &self.affinity,
@@ -336,6 +355,7 @@ impl Bed {
             &self.workers,
             &self.ids,
             &mut { *facts },
+            places,
             |_| key,
             |_| true,
             |facts| {
@@ -375,6 +395,7 @@ impl Bed {
             &self.workers,
             &self.ids,
             &mut { *facts },
+            None,
             |_| key,
             |_| true,
             |_| answer,
@@ -533,6 +554,155 @@ fn a_holder_outside_the_list_takes_no_place_of_the_cap() {
     let spec = AppliedSpec::validate(&document).expect("the document validates");
     let bed = Bed::new(affinity, spec, 4);
     assert_eq!(bed.holders(&asked, NOW), [(2, 2, 0)]);
+}
+
+/// A request its host holds to places is named its holders among the
+/// places: the index is asked within them, so holders outside cannot fill
+/// the sample. Of twenty workers that hold the whole prompt, a request held
+/// to two is named both under every seed, where the sample of sixteen
+/// would leave each out for some. The classic policy narrows its workers
+/// first (`model_gateway/src/routers/common/placement.rs:474-484`) and
+/// gathers the deepest holders among them, one or both by its cap's draw
+/// (`model_gateway/src/policies/cache_aware.rs:2916-2939`, `:2951-2957`).
+#[test]
+fn a_held_request_is_named_its_holders_among_its_places() {
+    let (affinity, _, index) = hosted(true);
+    let index = index.expect("the index");
+    let asked = prompt(1_000, 2);
+    for at in 0..20 {
+        store(&index, at, &hashes_of(&asked));
+    }
+    let bed = Bed::new(affinity, preset("cache_aware"), 20);
+    for seed in 0..32 {
+        let named = bed.held_to(&request(&asked, seed, NOW), &[3, 17]);
+        assert_eq!(named.holders, [(3, 2, 0), (17, 2, 0)], "seed {seed}");
+    }
+    // A request that states no places is named the sample of the list.
+    let named = bed.decide(&request(&asked, 7, NOW), None).expect("rows");
+    assert_eq!(named.holders.len(), 16);
+}
+
+/// A shorter beginning held among the places is named where deeper holders
+/// outside them are more than the sample: it is the deepest among the
+/// places. The classic policy's whole gather finds it where none of its
+/// drawn holders is a candidate
+/// (`model_gateway/src/policies/cache_aware.rs:2931-2938`).
+#[test]
+fn a_held_request_is_named_the_deepest_holder_among_its_places() {
+    let (affinity, _, index) = hosted(true);
+    let index = index.expect("the index");
+    let asked = prompt(1_000, 8);
+    let hashes = hashes_of(&asked);
+    for at in 0..17 {
+        store(&index, at, &hashes);
+    }
+    store(&index, 19, &hashes[..3]);
+    // The index knows the other place by a number alone.
+    index.intern_worker(&address(18)).expect("a number");
+    let bed = Bed::new(affinity, preset("cache_aware"), 20);
+    for seed in 0..32 {
+        let named = bed.held_to(&request(&asked, seed, NOW), &[18, 19]);
+        assert_eq!(named.holders, [(19, 3, 0)], "seed {seed}");
+        // Stated to no place, the seventeen deeper holders fill the sample.
+        let named = bed.decide(&request(&asked, seed, NOW), None).expect("rows");
+        assert!(named
+            .holders
+            .iter()
+            .all(|&(row, held, _)| row < 17 && held == 8));
+    }
+    // The request's mask is the table's, kept to the places: a worker that
+    // gains its first blocks while the table stands is not the index's to
+    // name in that second, for a request held to it as for any other.
+    store(&index, 18, &hashes);
+    let named = bed.held_to(&request(&asked, 0, NOW), &[18, 19]);
+    assert_eq!(named.holders, [(19, 3, 0)]);
+    let named = bed.decide(&request(&asked, 0, NOW), None).expect("rows");
+    assert!(named.holders.iter().all(|&(row, _, _)| row < 17));
+}
+
+/// A request held to places is named its warming rows among the places,
+/// before the sample cuts them. Of twenty warming workers, a request held
+/// to one is named it under every seed. The classic policy takes its
+/// pool's warming workers whole and passes over each that is no candidate
+/// (`model_gateway/src/policies/cache_aware.rs:2065-2069`).
+#[test]
+fn a_held_request_is_named_its_warming_rows_among_its_places() {
+    let (affinity, _, index) = hosted(true);
+    let index = index.expect("the index");
+    let first = hashes_of(&prompt(1_000, 8));
+    for at in 0..24 {
+        store(&index, at, &first);
+    }
+    let bed = Bed::new(affinity, warming_by(1), 24);
+    let other = prompt(50_000, 2);
+    // The table's first read admits the workers, as a decision does.
+    assert!(bed
+        .held_to(&request(&other, 7, NOW), &[9])
+        .warming
+        .is_empty());
+    // Four workers gain their first blocks, and twenty stay short of them.
+    let second = hashes_of(&prompt(2_000, 8));
+    for at in 20..24 {
+        store(&index, at, &second);
+    }
+    thread::sleep(Duration::from_millis(3));
+    for seed in 0..32 {
+        let named = bed.held_to(&request(&other, seed, NOW + SECOND), &[9, 22]);
+        assert_eq!(named.warming, [9], "seed {seed}");
+        // Stated to no place, the sample cuts the twenty to sixteen.
+        let named = bed.decide(&request(&other, seed, NOW + SECOND), None);
+        assert_eq!(named.expect("rows").warming.len(), 16);
+    }
+}
+
+/// The workers sent a prefix are named among the places too. Twenty
+/// workers were sent the prompt, and a request held to two of them is named
+/// both under every seed, by the blocks they were sent. The classic policy
+/// takes every candidate among its tree's matched workers, with no cut
+/// (`model_gateway/src/policies/cache_aware.rs:2541-2552`).
+#[test]
+fn a_held_request_is_named_the_workers_sent_its_prefix_among_its_places() {
+    let (affinity, _, _) = hosted(false);
+    let bed = Bed::new(affinity, preset("cache_aware"), 20);
+    let asked = prompt(1_000, 4);
+    for at in 0..20 {
+        bed.decide(&request(&asked, 7, NOW), Some(at));
+    }
+    for seed in 0..32 {
+        let named = bed.held_to(&request(&asked, seed, NOW), &[3, 17]);
+        assert_eq!(named.holders, [(3, 0, 4), (17, 0, 4)], "seed {seed}");
+    }
+    // Stated to no place, the sample cuts the twenty to sixteen.
+    assert_eq!(bed.holders(&asked, NOW).len(), 16);
+}
+
+/// A token tree's workers are named among the places too. A tree hands the
+/// eight workers of its deepest node at most, so the built-in sample of
+/// sixteen never cuts them: under a sample of four, a request held to two of
+/// the eight is named both under every seed. The classic policy takes every
+/// candidate among the workers its tree hands
+/// (`model_gateway/src/policies/cache_aware.rs:2541-2552`).
+#[test]
+fn a_held_request_is_named_a_trees_workers_among_its_places() {
+    let (affinity, _) = lending(false);
+    let bed = Bed::new(affinity, sampled(4), 20);
+    let asked = tokens(1_000, 4);
+    for at in 0..8 {
+        bed.keyed(&asked, 0, Some(at));
+    }
+    let hashes = hashed(&asked);
+    let key = || TokenKey {
+        tokens: Cow::Borrowed(&asked),
+        marker: 0,
+    };
+    for seed in 0..32 {
+        let facts = request(&hashes, seed, NOW);
+        let named = bed.decide_among(&facts, Some(&[2, 5]), Some(key()), None);
+        let named = named.expect("rows named");
+        assert_eq!(named.holders, [(2, 0, 4), (5, 0, 4)], "seed {seed}");
+    }
+    // Stated to no place, the sample cuts the eight to four.
+    assert_eq!(bed.keyed(&asked, 0, None).len(), 4);
 }
 
 /// With no index the record of sent prefixes speaks for every worker: a
@@ -707,6 +877,7 @@ fn a_pick_the_sessions_rule_placed_is_recorded_by_the_rules_word_at_both_writes(
                 &bed.workers,
                 &bed.ids,
                 &mut request(asked, 7, NOW),
+                None,
                 |_| None,
                 // The caller sends to every worker but the one at 3.
                 |target| target.position != 3,
@@ -806,6 +977,7 @@ fn a_pick_the_sessions_rule_placed_is_written_to_a_tree_by_the_rules_word() {
             &bed.workers,
             &bed.ids,
             &mut request(&hashes, 7, NOW),
+            None,
             |_| Some(key),
             |_| true,
             |_| answer,
@@ -1038,6 +1210,7 @@ fn a_tree_stores_a_prompt_for_the_first_target_its_caller_sends_to() {
             &bed.workers,
             &bed.ids,
             &mut request(&hashes, 7, NOW),
+            None,
             |_| Some(entry),
             |target| {
                 asked.borrow_mut().push(target.position);
@@ -1092,6 +1265,7 @@ fn the_entry_is_asked_for_once_and_only_where_the_host_lends_a_tree() {
                 list,
                 ids,
                 facts,
+                None,
                 asks,
                 |_| true,
                 |_| shed(),
@@ -1152,6 +1326,7 @@ fn a_worker_that_leaves_under_its_first_pick_is_given_no_place() {
             &bed.workers,
             &bed.ids,
             &mut request(&asked, 7, NOW),
+            None,
             |_| None,
             |_| true,
             |_| {
@@ -1547,6 +1722,7 @@ fn the_engine_decides_by_the_rows_named() {
                 &bed.workers,
                 &bed.ids,
                 &mut request,
+                None,
                 |_| None,
                 |_| true,
                 |request| {
@@ -1697,6 +1873,7 @@ fn a_profile_named_no_row_is_handed_the_column() {
         &bed.workers,
         &bed.ids,
         &mut request(&asked, 7, NOW),
+        None,
         |_| None,
         |_| true,
         |facts| {
@@ -1726,6 +1903,7 @@ fn a_profile_named_no_row_is_handed_the_prefix_its_pick_sent() {
         &bed.workers,
         &bed.ids,
         &mut request(&asked, 7, NOW),
+        None,
         |_| None,
         |_| true,
         |facts| {
@@ -1987,6 +2165,7 @@ fn a_shadow_that_reads_affinity_states_nothing_of_the_live_pick() {
             &bed.workers,
             &bed.ids,
             &mut { *facts },
+            None,
             |_| None,
             |_| true,
             |facts| {
@@ -2061,6 +2240,7 @@ fn a_worker_that_asks_for_events_and_publishes_none_keeps_its_prompt() {
             &bed.workers,
             &bed.ids,
             &mut request(&asked, 7, now),
+            None,
             |_| None,
             |_| true,
             |facts| {
@@ -2261,6 +2441,7 @@ fn a_decision_that_names_no_row_writes_nothing_of_the_one_before() {
         &bed.workers,
         &bed.ids,
         &mut other,
+        None,
         |_| None,
         |_| true,
         |facts| {
@@ -2331,6 +2512,7 @@ fn a_cap_the_records_holders_fill_is_not_read_past() {
         &bed.workers,
         &bed.ids,
         &mut facts,
+        None,
         |_| None,
         |_| true,
         |facts| {
@@ -2441,6 +2623,7 @@ fn a_naming_the_record_fills_stands_whole_where_every_holder_is_refused() {
             &bed.workers,
             &bed.ids,
             &mut request(&asked, 0, NOW),
+            None,
             |_| None,
             |_| true,
             |facts| {
@@ -2507,7 +2690,7 @@ fn a_pool_whose_workers_are_all_heard_reads_no_record() {
         let placements = record.predictor.read().len();
 
         let mut buffers = Buffers::new();
-        let read = table.name(&facts, &mut buffers);
+        let read = table.name(&facts, None, &mut buffers);
         assert_eq!(read.is_some(), reads, "record read at {now}");
         let blocks = if reads { 4 } else { 0 };
         assert_eq!(buffers.keys.len(), blocks, "folded keys at {now}");
@@ -2764,6 +2947,7 @@ fn a_removal_waits_for_no_decider_of_another_model() {
             model: READER_MODEL,
             ..facts
         },
+        None,
         |_| None,
         |_| true,
         |_| picked(0, reader_id),

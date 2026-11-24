@@ -1541,16 +1541,16 @@ impl<G: Generation> WorkerMonitor<G> {
     /// group that ended, changed its interval or had another loop spawned
     /// over it ahead of the call. It was
     /// told to end there, and a tick of it that is past its fetch can
-    /// still publish. Last the
+    /// still publish. Every pusher is evicted then. Last the
     /// monitor resets as its rebuild from the registry does: the shared
     /// snapshot is published empty, the probe memo goes, and the sink is
     /// told the reset ([`LoadSink::reset`]). The monitor's own sink takes
     /// every overload veto off the registry's workers there.
     ///
     /// The monitor then runs no task: its snapshot is empty, its probe memo
-    /// is gone and its sink was told the reset. A pusher that is still the
-    /// registry's `Ready` worker at its URL keeps its report on file, and
-    /// the sink its receipts. The receivers stay subscribed and read the
+    /// is gone and its sink was told the reset. No pusher has a report on
+    /// file, and the sink was told to forget each one that had
+    /// ([`LoadSink::forget`]). The receivers stay subscribed and read the
     /// empty snapshot, and [`Self::start_event_loop`] starts the monitor
     /// again over the registry as it stands at that call.
     ///
@@ -1565,6 +1565,24 @@ impl<G: Generation> WorkerMonitor<G> {
     /// So a worker whose stream pushes can carry an overload veto with no
     /// poll behind it, until the next start: its rebuild from the registry
     /// tells the sink the reset.
+    ///
+    /// No pusher's file outlives a stop. Behind the tasks' end and ahead of
+    /// the reset, the stop evicts every pusher, whatever its worker's
+    /// status: the report on file with every rank it holds, the publish it
+    /// queued or held, and what the sink keeps of the worker
+    /// ([`LoadSink::forget`]). The engine series of a pusher that stays
+    /// `Ready` keep their last value, as a polled worker's do through a
+    /// stop: the sentinel is written where the worker is no longer the
+    /// registry's `Ready` worker at its URL. The reset alone keeps the
+    /// file of a pusher that stays `Ready`: behind a rebuild the monitor's
+    /// tasks and the pusher's stream both go on, and the file is that
+    /// worker's newest word. A stop ends the run, and a host may hand a
+    /// stopped monitor no record. A file kept through the stop would then be as
+    /// old as the stop at the next start, where a publish it queued or its
+    /// worker's next record would publish every rank it held. So a host
+    /// that stops and starts its monitor in turn starts each worker from no
+    /// report: the start polls it as a worker that never pushed, and its
+    /// file starts again at its stream's next record.
     ///
     /// A stop dropped at its first wait puts the event task's handle back.
     /// That task was told to end, and a poll of it that still runs can
@@ -1604,6 +1622,17 @@ impl<G: Generation> WorkerMonitor<G> {
         }
         for mut task in ending {
             ended(&mut task).await;
+        }
+        // Every pusher goes ahead of the reset, which by itself keeps the
+        // file of a worker that stays `Ready`: no file outlives the stop.
+        let pushers: Vec<Arc<dyn Worker>> = self
+            .pushed_reports
+            .lock()
+            .values()
+            .map(|file| Arc::clone(&file.pusher))
+            .collect();
+        for pusher in &pushers {
+            self.evict_worker_loads(pusher);
         }
         self.stop_all_groups();
     }
@@ -3991,6 +4020,109 @@ mod native_loads_tests {
             1,
             "a loop's poll still holds the monitor"
         );
+    }
+
+    /// A stop evicts every pusher ahead of its reset, so no rank of a file
+    /// outlives it. A worker's two ranks pushed and were published. Behind
+    /// the stop and the next start, one record of rank 0 publishes that
+    /// rank alone: the other rank's record went with the file. The reset
+    /// alone would keep the file, and the window would publish both ranks.
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_keeps_no_rank_of_a_pushers_file() {
+        let (registry, monitor) = monitor_with_readers(LoadReaders::Aware);
+        let worker = silent_worker("grpc://engine-a.invalid:50051", "a");
+        registry.register(Arc::clone(&worker)).unwrap();
+        let published = || -> Vec<(i32, i32)> {
+            let snapshot = monitor.load_state.snapshot();
+            let ranks = snapshot.get(worker.url()).map(|report| &report.loads);
+            ranks
+                .into_iter()
+                .flatten()
+                .map(|rank| (rank.dp_rank, rank.num_running_reqs))
+                .collect()
+        };
+        monitor.start_event_loop();
+        monitor.apply_pushed_load(&worker, 0, &PushedRecord::requests(8, 0), Instant::now());
+        monitor.apply_pushed_load(&worker, 1, &PushedRecord::requests(5, 0), Instant::now());
+        tokio::time::sleep(PUSHED_PUBLISH_WINDOW * 2).await;
+        assert_eq!(published(), vec![(0, 8), (1, 5)]);
+
+        monitor.stop().await;
+        assert_eq!(published(), vec![], "published while stopped");
+        monitor.start_event_loop();
+        monitor.apply_pushed_load(&worker, 0, &PushedRecord::requests(1, 0), Instant::now());
+        tokio::time::sleep(PUSHED_PUBLISH_WINDOW * 2).await;
+        assert_eq!(published(), vec![(0, 1)], "the ranks behind the next start");
+        monitor.stop().await;
+    }
+
+    /// A stop evicts the publish a pusher queued or held. One worker's
+    /// report is held, taken while the worker was not `Ready`, which it is
+    /// again by the stop. Another's record comes inside the last window.
+    /// The reset alone would keep both files, queued. The next start's
+    /// first window, which a third worker's record opens, publishes that
+    /// worker alone.
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_keeps_no_publish_a_pusher_queued_or_held() {
+        let (registry, monitor) = monitor_with_readers(LoadReaders::Aware);
+        let [held, queued, later] = ["a", "b", "c"]
+            .map(|at| silent_worker(&format!("grpc://engine-{at}.invalid:50051"), "a"));
+        held.set_status(WorkerStatus::NotReady);
+        for worker in [&held, &queued, &later] {
+            registry.register(Arc::clone(worker)).unwrap();
+        }
+        monitor.start_event_loop();
+        let record = PushedRecord::requests(8, 0);
+        monitor.apply_pushed_load(&held, 0, &record, Instant::now());
+        // Held: a flush that finds its worker not `Ready` keeps its place.
+        monitor.flush_pushed();
+        assert_eq!(monitor.pending_pushed_len(), 1, "the held report");
+        held.set_status(WorkerStatus::Ready);
+        monitor.apply_pushed_load(&queued, 0, &record, Instant::now());
+        assert_eq!(monitor.pending_pushed_len(), 2);
+
+        // Inside the second record's window: no flush has published it.
+        monitor.stop().await;
+        assert_eq!(monitor.pending_pushed_len(), 0, "queued behind the stop");
+
+        monitor.start_event_loop();
+        monitor.apply_pushed_load(&later, 0, &record, Instant::now());
+        tokio::time::sleep(PUSHED_PUBLISH_WINDOW * 2).await;
+        let snapshot = monitor.load_state.snapshot();
+        assert!(
+            snapshot.get(later.url()).is_some(),
+            "the start's own record"
+        );
+        for worker in [&held, &queued] {
+            assert!(
+                snapshot.get(worker.url()).is_none(),
+                "{} is published from ahead of the stop",
+                worker.url()
+            );
+        }
+        monitor.stop().await;
+    }
+
+    /// A stop evicts what the sink keeps of a pusher with its file: a
+    /// worker that pushed ahead of the stop is polled at the next start, as
+    /// one that never pushed. Its receipt, kept as the reset alone keeps
+    /// it, would leave the worker to its stream for that start's first
+    /// interval.
+    #[tokio::test(start_paused = true)]
+    async fn a_worker_that_pushed_ahead_of_a_stop_is_polled_at_the_next_start() {
+        let (connector, monitor) = polled_every(Duration::from_secs(1), &[None]);
+        monitor.start_event_loop();
+        // Between the start's poll and the next tick.
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(connector.calls(), 1);
+        let worker = monitor.worker_registry.get_all().pop().expect("the worker");
+        monitor.apply_pushed_load(&worker, 0, &PushedRecord::requests(8, 0), Instant::now());
+
+        monitor.stop().await;
+        monitor.start_event_loop();
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(connector.calls(), 2, "the next start's poll");
+        monitor.stop().await;
     }
 
     /// A monitor told `interval` as its own, over one group of HTTP workers

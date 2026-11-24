@@ -161,7 +161,9 @@ pub trait LoadSink: Send + Sync {
     /// The worker's loads are forgotten: it left the registry, was
     /// replaced, or its status left `Ready`. It is also said for a worker
     /// whose pushed report a record of the registry's worker at the URL
-    /// replaced. It is not said at the eviction of a worker whose URL holds
+    /// replaced, and for every worker whose pushed report the collector
+    /// holds where its host stops it, whatever the worker's status. It is
+    /// not said at the eviction of a worker whose URL holds
     /// another worker's report: what the sink holds at the URL is that
     /// worker's since its first record. A worker that never pushed is then
     /// not said at all: a sink that keys its rows by the worker and not by
@@ -176,7 +178,9 @@ pub trait LoadSink: Send + Sync {
     /// says [`Self::forget`] for every worker whose pushed report it held
     /// and that is no longer the registry's `Ready` worker at its URL. So a
     /// sink may keep what it knows of a stream, as the collector keeps the
-    /// report of a pusher that stays. A polled worker that left while
+    /// report of a pusher that stays. A stop says it for every worker whose
+    /// pushed report the collector held, ahead of this call: no pusher's
+    /// report outlives a stop. A polled worker that left while
     /// events were lost is never said: in a sink that keeps rows of its
     /// own, nothing of a polled worker outlives this call. A sink whose
     /// rows end with the write that removes their worker keeps them: no row

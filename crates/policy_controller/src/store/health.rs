@@ -1,13 +1,11 @@
 //! The health sink: the prober's verdicts, the connect signal and the
-//! gateways' standing masks (design 5.1, the health row and the precedence
-//! rule).
+//! gateways' standing masks (design 10.2, the health row).
 
 use std::time::Instant;
 
 use crate::{
     engine::view::WorkerId,
     store::{workers::WorkerStatus, GatewayId},
-    tracking::lease::TransportClass,
 };
 
 /// What a noted write of a gateway's veto found
@@ -69,11 +67,6 @@ impl HealthWrite {
 /// Where health is written. The pool's view is the prober's and the reports';
 /// a gateway's breaker and liveness vetoes are its own and mask the worker
 /// for that gateway alone.
-///
-/// The precedence rule a view builder applies: a worker the prober cannot
-/// reach stays routable for the gateways whose completed dispatches on it
-/// succeeded within the last probe interval and is excluded for the others;
-/// a worker every gateway vetoes is unhealthy whatever the prober says.
 pub trait HealthSink: Send + Sync {
     /// The prober's verdict for one probe of the worker, under the row's
     /// [`HealthPolicy`](crate::store::HealthPolicy): the status machine moves
@@ -158,15 +151,4 @@ pub trait HealthSink: Send + Sync {
 
     /// Whether `gateway` vetoes the worker at `now`.
     fn vetoed(&self, gateway: GatewayId, id: WorkerId, now: Instant) -> bool;
-
-    /// A gateway's completed dispatch on the worker with its transport
-    /// class: the precedence rule's second input beside the prober. A
-    /// completion for a worker without a row (never registered, or removed)
-    /// writes nothing.
-    fn completed(&self, gateway: GatewayId, id: WorkerId, class: TransportClass, at: Instant);
-
-    /// Whether `gateway` completed a dispatch of class `Ok` on the worker at
-    /// or after `since`: the precedence rule reads one gateway's own
-    /// dispatches, never another's.
-    fn completed_ok_since(&self, gateway: GatewayId, id: WorkerId, since: Instant) -> bool;
 }
