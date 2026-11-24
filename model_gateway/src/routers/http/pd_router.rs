@@ -2650,19 +2650,27 @@ impl PDRouter {
         sticky_key: Option<&str>,
         stated: impl Fn() -> placement::Stated + Send + Sync,
     ) -> Result<(PdPair, PdLoadGuards), Box<PdSelectionFailure>> {
-        let ((prefill, decode), prefill_guard) = acquire_prefill(
+        let ((prefill, decode), prefill_ahead) = acquire_prefill(
             self.prefill_admission.as_deref(),
             sticky_key,
             |(prefill, _): &(Placed, Placed)| prefill,
             |capacity| self.select_pd_pair(model_id, inputs, capacity, &stated),
+            // The prefill's worker goes on behind its load, and what its
+            // answer owes its send goes with that load.
+            |(prefill, decode)| {
+                let (prefill, unsent) = prefill.unsent();
+                ((prefill, decode), unsent)
+            },
         )
         .await
         .map_err(|error| Box::new(PdSelectionFailure::from(error)))?;
-        // The prefill's side went into its guard. The decode's guard is made
+        // The prefill's send is said here, where this route said it before
+        // the load was held ahead of the send: every shape of this route
+        // still takes its prefill's load as sent. The decode's guard is made
         // ahead of its send, and its side stays with its answer until then.
-        let pair = (prefill.into_guarded_worker(), Arc::clone(decode.worker()));
+        let pair = (prefill, Arc::clone(decode.worker()));
         let guards = PdLoadGuards {
-            prefill: prefill_guard,
+            prefill: prefill_ahead.sent(),
             decode: DecodeAhead::new(decode, sticky_key),
         };
         Ok((pair, guards))

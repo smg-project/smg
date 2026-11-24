@@ -1913,7 +1913,11 @@ request ──> route (HTTP or gRPC, any family)
   already keeps to the end of the response, streamed or not (decision 4).
 
   The engine hears the dispatch where the guard is made, or at the send for a guard a route makes
-  ahead of its send, and the end where the guard is dropped. It is told no outcome. A stage hears
+  ahead of its send, and the end where the guard is dropped. Two guards are made ahead of their
+  sends, both a pair's: the decode's, behind the selection, and the prefill's, where its load is
+  acquired (with prefill admission, under the admission's lock). The prefill's is a plain guard
+  under the route's key. At the prefill's send it takes the engine's side, and counts under the
+  routing value the engine names from there on. The engine is told no outcome. A stage hears
   the end of a request that was sent as a cancelled completion, with the time since its dispatch
   and no other measure. It hears a guard dropped before its send as a release, abandoned. So a
   plugin stage that learns from outcomes reads every request sent in process as cancelled.

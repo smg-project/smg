@@ -387,10 +387,13 @@ pub(crate) struct Pair {
 }
 
 /// A selected prefill/decode pair as the pair placement answers it
-/// ([`select_pair`]): each worker as a [`Placed`]. A route makes each
-/// side's load guard from that side's answer, in the place it made one from
-/// the worker: the prefill's by [`Placed::guard`], and the decode's, which
-/// it makes ahead of the decode's send, by [`Placed::ahead`] with
+/// ([`select_pair`]): each worker as a [`Placed`]. A route holds each
+/// side's load in the place it held one before. The prefill's is a plain
+/// guard of its worker under the route's key, made where the prefill's
+/// load is acquired, ahead of its send: what the prefill's answer owes
+/// that send goes with the load ([`Placed::unsent`]) and is said where the
+/// prefill goes out ([`Unsent::sent`]). The decode's, which a route makes
+/// ahead of the decode's send, is made by [`Placed::ahead`] with
 /// [`Placed::sent`] at that send.
 ///
 /// Under the classic policies the two guards are the ones a route made
@@ -500,6 +503,10 @@ pub(crate) fn accepted_by(
 /// none. It keeps the engine's placement to the request's end: the engine
 /// hears the dispatch where the guard is made and the end where the guard
 /// is dropped. It is told no outcome: the worker object has it.
+///
+/// A pair's prefill is the one answer whose guard is made of its worker
+/// alone, ahead of its send and under the route's key: what the answer
+/// owes that send goes on apart from the worker ([`Placed::unsent`]).
 ///
 /// A classic answer is the worker's handle and one empty word: that word is
 /// all a classic placement pays for the engine's side of this type.
@@ -694,6 +701,16 @@ impl Placed {
         self.engine.is_some()
     }
 
+    /// This answer's worker, and what the answer still owes its send
+    /// ([`Unsent`]): for a pair's prefill, whose load is made ahead of its
+    /// send as a plain guard under the route's key, and whose handle goes
+    /// on behind that load. A move, with no test of the answer: a classic
+    /// answer owes nothing.
+    #[inline]
+    pub(crate) fn unsent(self) -> (Arc<dyn Worker>, Option<Unsent>) {
+        (self.worker, self.engine.map(Unsent))
+    }
+
     /// The worker alone, for a caller that sends it no request: a bench's
     /// placement, a test. An engine's side of the request is let go here,
     /// which the engine hears as a release. A route never calls this: it
@@ -707,7 +724,7 @@ impl Placed {
     /// The worker of an answer whose load guard was made: the engine's
     /// side of the request is the guard's by now, so the answer has nothing
     /// left to give up, and the worker's handle moves on with no count. For
-    /// a route that hands a pair's prefill on behind its guard. A debug
+    /// a route that hands a pair's decode on behind its guard. A debug
     /// build stops where the answer still holds its side: the request
     /// would go out under no guard of its own, and the engine would hear a
     /// release.
@@ -720,6 +737,32 @@ impl Placed {
             "a worker is handed on behind its guard"
         );
         self.worker
+    }
+}
+
+/// What is left of an answer's engine side when its worker's handle goes on
+/// ahead of the send ([`Placed::unsent`]): the engine's side of the request
+/// and the routing value the engine names. [`Self::sent`] says the send.
+/// Dropped unsent, it lets the side go, which the engine hears as a
+/// release.
+#[derive(Debug)]
+pub(crate) struct Unsent(Box<ByEngine>);
+
+impl Unsent {
+    /// The request went out under `guard`, a plain guard of the answer's
+    /// worker, made ahead of the send under its route's own key. The engine
+    /// hears the dispatch now, and the guard keeps the side, so the guard's
+    /// drop is the side's end. From here on the guard counts under the
+    /// routing value the engine names, where the engine names one: up to
+    /// the send the worker counted the request under the route's key. Out
+    /// of line: a classic answer leaves nothing unsent.
+    #[inline(never)]
+    pub(crate) fn sent(self, guard: WorkerLoadGuard) -> WorkerLoadGuard {
+        let guard = match self.0.routing_key.as_deref() {
+            Some(key) => guard.under_key(key),
+            None => guard,
+        };
+        self.0.sent(guard)
     }
 }
 
@@ -8964,6 +9007,24 @@ pub(crate) mod tests {
         let spec = AppliedSpec::validate_in(&document, &stages, &[]);
         engine_on(policies, spec.expect("the stages hold the scorer"));
         heard
+    }
+
+    /// Hands `policies` an engine under the stock pair document, with a
+    /// request's routing value read from the body's own id, which the
+    /// engine keeps in the clear: the engine names that value for a pair.
+    pub(crate) fn keyed_pairs_on(policies: &PolicyRegistry) {
+        let document = PolicySpec::pair_presets("round_robin", "round_robin");
+        let mut document = document.expect("the pair presets");
+        document.generation = 1;
+        document.bindings[0].routing_key = Some(RoutingKeySpec {
+            sources: vec![KeySourceSpec {
+                rid: true,
+                ..KeySourceSpec::default()
+            }],
+            strip_lineage: false,
+        });
+        let spec = AppliedSpec::validate(&document);
+        engine_on(policies, spec.expect("a valid document"));
     }
 
     /// With an engine handed to the registry the pair placement asks it,

@@ -404,7 +404,7 @@ fn sequential_pd_decode_form(
 /// What the sequential dispatch decides before either side is sent: the pair's
 /// KV connector mode, whether the KV handoff is relayed through the router,
 /// the transfer id the router mints for Mooncake, and the decode side's form.
-struct SequentialPlan {
+pub(crate) struct SequentialPlan {
     mode: KvConnectorMode,
     /// The KV handoff is single-consumer: with n>1 each fan-out child on decode
     /// would pull, and the first completion frees the prefill blocks under its
@@ -426,8 +426,10 @@ impl SequentialPlan {
     /// Decide the plan from the pair and the request; a pairing this pipeline
     /// cannot serve (a MoRI-IO decode, a language-model-only decode the
     /// request's multimodal payload needs more of) is refused here, before
-    /// either side is sent.
-    fn decide(
+    /// either side is sent. The dispatch decides it ahead of
+    /// [`execute_sequential_pd`], so a refused request's prefill was never
+    /// said to be sent.
+    pub(crate) fn decide(
         proto_request: &ProtoGenerateRequest,
         workers: &WorkerSelection,
     ) -> Result<Self, Response> {
@@ -625,13 +627,19 @@ pub(crate) struct DecodeBehindPrefill<'a> {
 /// the decode request. For NIXL: tags the prefill request with do_remote_decode,
 /// then relays the kv_transfer_params returned by the prefill engine to decode.
 ///
+/// `plan` is the pair's plan as the dispatch decided it
+/// ([`SequentialPlan::decide`]), and `prefill_guard` the prefill's load with
+/// its send said: the dispatch says it behind the plan's refusals.
+///
 /// `behind` is what one request's dispatch holds for its decode
 /// ([`DecodeBehindPrefill`]): once the prefill has answered the decode is
 /// asked again, and its send is said where it goes out. `None` for a
 /// dispatch that owes its decode neither: a batch's sub-request, whose
 /// decode guard said the send where it was made, and a pair the classic
 /// policies picked.
+#[expect(clippy::too_many_arguments)]
 pub(crate) async fn execute_sequential_pd(
+    plan: SequentialPlan,
     proto_request: ProtoGenerateRequest,
     clients: &mut ClientSelection,
     workers: &WorkerSelection,
@@ -647,7 +655,6 @@ pub(crate) async fn execute_sequential_pd(
     let (prefill_client, decode_client) =
         clients.disaggregated_or_mismatch("execute_sequential_pd")?;
 
-    let plan = SequentialPlan::decide(&proto_request, workers)?;
     // Recorded on the success path (after decode established) so failed
     // requests don't pollute success metrics; captured here before use of mode.
     let kv_connector_label = plan.mode.metrics_label();
