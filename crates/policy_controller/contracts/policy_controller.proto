@@ -491,10 +491,14 @@ message DecideRequest {
   // Such a frame is its pair's one request. It is decided at the prefill
   // phase, whatever its facts' phase says, for both sides of the pair and
   // for each item's encoder, and its again and its decode_later read as on
-  // a pair's frame. A frame of the encode phase that carries none has no
-  // decision: it is answered Busy with no reason. A decode asked again
-  // names its lease and states no items: a frame that carries decode_of
-  // and this field is out of range, whatever its facts' phase says.
+  // a pair's frame. The hash form of its facts' session_key is the
+  // session's value under the phase the facts state, encode: the key is
+  // read back under that phase, and the pair's session is the key's at
+  // the prefill phase. A frame of the encode phase that does not state
+  // this field has no decision: it is answered Busy with no reason. A
+  // decode asked again names its lease and states no items: a frame that
+  // carries decode_of and this field is out of range, whatever its facts'
+  // phase says.
   EncodeItems encode = 7;
 }
 
@@ -502,6 +506,8 @@ message DecideRequest {
 message EncodeItems {
   // Each item's key, the caller's content hash, in the request's order. At
   // most 256: a longer list is out of range, and its frame is refused whole.
+  // A key with no form reads as no key: its item keeps its place, and its
+  // encoder is picked with no affinity.
   repeated Identity keys = 1;
   // The items taken as one: the caller's digest over them. A class of
   // encoders that takes them as one places it in the items' stead, so

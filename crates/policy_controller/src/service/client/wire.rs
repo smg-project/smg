@@ -12,7 +12,8 @@ use crate::{
             Trace, MAX_TARGETS, TRACE_TOP,
         },
         decision_engine::{DecideOutcome, Leased, Request},
-        view::{HashKind, Identity, Phase, Session, WorkerId},
+        framework::{EncodeItems, EncodePlaced},
+        view::{HashKind, Identity, Phase, RequestFacts, Session, WorkerId},
     },
     service::{
         client::MAX_HASHES,
@@ -97,26 +98,73 @@ pub(crate) fn request(request: &Request<'_>) -> (proto::DecideRequest, usize) {
         // No link asks its decode later: the controller issues both sides.
         decode_later: false,
         decode_of: None,
-        // No link states an encode request's items yet.
+        // An encode request's frame states its items ([`encode_request`]).
         encode: None,
     };
     (asked, facts.block_hashes.len() - held)
 }
 
+/// An encode request as the wire carries it: its pair's one request, with
+/// its `items` stated (`DecideRequest.encode`), and the block hashes left
+/// out of the copy ([`request`]).
+///
+/// `request` is the request as the door in process takes it, at the
+/// prefill phase. The frame states the encode phase, where the contract
+/// reads items. A session key in its hash form crosses as the session's
+/// value under that phase: the controller reads the key back under the
+/// phase the facts state and decides at the prefill phase, so both doors
+/// hold one session. The one formula makes the value
+/// ([`RequestFacts::session`]), on the facts as the frame states them.
+///
+/// Each item's key crosses by the rule of a frame's key, with the key's
+/// own fingerprint as its hash form. A key that is none keeps its place,
+/// as an identity with no form: the answer's encoders stand in the keys'
+/// order.
+pub(crate) fn encode_request(
+    request: &Request<'_>,
+    items: EncodeItems<'_>,
+) -> (proto::DecideRequest, usize) {
+    let stated = Request {
+        facts: RequestFacts {
+            phase: Phase::Encode,
+            ..request.facts
+        },
+        ..*request
+    };
+    let (mut asked, left_out) = self::request(&stated);
+    asked.encode = Some(proto::EncodeItems {
+        keys: items
+            .keys
+            .iter()
+            .map(|key| proto::Identity {
+                form: form(*key, || key.hash),
+            })
+            .collect(),
+        one: items.one.and_then(|one| identity(one, || one.hash)),
+        references: items.references,
+        decode_images: items.decode_images,
+    });
+    (asked, left_out)
+}
+
 /// The hash form carries a tenant's fingerprint or the value of a session
 /// within its model and phase.
 fn identity(key: Identity<'_>, hash: impl FnOnce() -> u64) -> Option<proto::Identity> {
+    form(key, hash).map(|form| proto::Identity { form: Some(form) })
+}
+
+/// The form a key crosses in; none for the absent key.
+fn form(key: Identity<'_>, hash: impl FnOnce() -> u64) -> Option<Form> {
     if key.is_none() {
         return None;
     }
     // The controller reads an empty text as no key, and the door in process
     // reads it as a key. So the empty key crosses as its hash, and the two
     // doors decide alike.
-    let form = match key.plain {
+    Some(match key.plain {
         Some(plain) if !plain.is_empty() => Form::Plain(plain.to_owned()),
         _ => Form::Hash(hash()),
-    };
-    Some(proto::Identity { form: Some(form) })
+    })
 }
 
 /// Why an answer cannot be read, and where in the answer it failed.
@@ -178,6 +226,66 @@ pub(crate) fn decided(told: &proto::Decision, now: Instant) -> Result<DecideOutc
         decision,
         lease,
         decode_session: Session::NONE,
+    })
+}
+
+/// Where an encode request's answer puts its items, read onto `placed`,
+/// the host's room, emptied first: the encoder of each placed key in the
+/// keys' order, as the engine's entry writes them in process
+/// ([`EncodePlaced::encoders`]). Only a pick places items: beside any
+/// other decision `placed` stays empty and `told` is not read.
+///
+/// By the contract the encoders are one where the answer says `one`, else
+/// one a key, and an encoder names no pair. An answer that says otherwise
+/// cannot be read. Neither can one that says `one` to a request that
+/// stated no key for its items as one, nor a pick of a request with keys
+/// that names no encoders: its host could send no item. `placed` is left
+/// empty then.
+pub(crate) fn placed(
+    told: Option<&proto::EncodePlaced>,
+    decision: &Decision,
+    items: &EncodeItems<'_>,
+    placed: &mut EncodePlaced,
+) -> Result<(), Unread> {
+    placed.clear();
+    if decision.pick().is_none() {
+        return Ok(());
+    }
+    let Some(told) = told else {
+        return match items.keys {
+            [] => Ok(()),
+            _ => Err(unread("encode", "a pick names no encoder for its keys")),
+        };
+    };
+    if told.one && items.one.is_none() {
+        return Err(unread("encode.one", "the request stated no one key"));
+    }
+    let count = if told.one { 1 } else { items.keys.len() };
+    if told.encoders.len() != count {
+        return Err(unread("encode.encoders", "encoder count out of range"));
+    }
+    let room = placed.room(told.one);
+    let read = told
+        .encoders
+        .iter()
+        .try_for_each(|told| encoder(told).map(|encoder| room.push(encoder)));
+    if read.is_err() {
+        placed.clear();
+    }
+    read
+}
+
+/// One key's encoder as an answer names it: its worker and its rank. Its
+/// row in the encode pool stays with the controller.
+fn encoder(told: &proto::Target) -> Result<Target, Unread> {
+    if told.pair.is_some() {
+        return Err(unread("encode.encoders.pair", "an encoder names no pair"));
+    }
+    Ok(Target {
+        position: 0,
+        id: WorkerId(told.id),
+        dp_rank: narrow(told.dp_rank, "encode.encoders.dp_rank")?,
+        pair: None,
     })
 }
 
@@ -369,7 +477,7 @@ pub(crate) fn frame(lease: LeaseId, side: Side, said: Said) -> Frame {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use super::{decided, frame, request};
+    use super::{decided, encode_request, frame, placed, request};
     use crate::{
         engine::{
             decision,
@@ -378,6 +486,7 @@ mod tests {
                 Targets, Trace,
             },
             decision_engine::Request,
+            framework::{EncodeItems, EncodePlaced},
             view,
             view::{
                 Constraints, HashKind, Header, Identity, MediaCounts, Phase, RequestFacts, WorkerId,
@@ -630,6 +739,110 @@ mod tests {
             assert_eq!(facts.tenant.hash, want.tenant.hash);
             assert_eq!(facts.session().get(), want.session().get());
         });
+    }
+
+    /// A request at the prefill phase, as the engine's entry for an encode
+    /// request takes it, under `session`.
+    fn at_prefill(session: Identity<'_>) -> Request<'_> {
+        Request {
+            id: b"a request",
+            facts: RequestFacts {
+                model: "model-a",
+                session_key: session,
+                phase: Phase::Prefill,
+                budget_micros: 2_000,
+                ..RequestFacts::default()
+            },
+            constraints: Constraints::default(),
+        }
+    }
+
+    /// An encode request's frame states the encode phase and the items,
+    /// and the controller reads it at the prefill phase with the items its
+    /// host stated, in their order: a plain key, an empty text as the key
+    /// it is, a key that is none at its place, and a fingerprint. A
+    /// request that states no item at all is an encode request all the
+    /// same.
+    #[test]
+    fn the_controller_reads_an_encode_requests_items_as_the_host_stated_them() {
+        let keys = [
+            Identity::plain("image-a"),
+            Identity::plain(""),
+            Identity::NONE,
+            Identity::hashed(31),
+        ];
+        let items = EncodeItems {
+            keys: &keys,
+            one: Some(Identity::plain("digest")),
+            references: true,
+            decode_images: true,
+            ..EncodeItems::default()
+        };
+        let asked = at_prefill(Identity::NONE);
+        let (sent, left_out) = encode_request(&asked, items);
+        assert_eq!(left_out, 0);
+        let stated = sent.facts.as_ref().map(|facts| facts.phase);
+        assert_eq!(stated, Some(proto::Phase::Encode.into()));
+        let checked = Checked::new(sent).expect("the controller reads the request");
+        assert!(checked.carries_items());
+        assert_eq!(checked.phase(), Phase::Prefill);
+        let read = checked.item_keys(Vec::new());
+        let hashes = |keys: &[Identity<'_>]| keys.iter().map(|key| key.hash).collect::<Vec<_>>();
+        assert_eq!(hashes(&read), hashes(&keys));
+        assert!(read[2].is_none() && !read[1].is_none());
+        let read = checked.items(&read);
+        assert_eq!(read.one.map(|one| one.hash), items.one.map(|one| one.hash));
+        assert!(read.references && read.decode_images);
+
+        let (sent, _) = encode_request(&asked, EncodeItems::default());
+        let checked = Checked::new(sent).expect("the controller reads the request");
+        assert!(checked.carries_items() && checked.item_keys(Vec::new()).is_empty());
+        let read = checked.items(&[]);
+        assert!(read.one.is_none() && !read.references && !read.decode_images);
+    }
+
+    /// The frame of an encode request states the encode phase, and the
+    /// controller decides it at the prefill phase. A session key in its
+    /// hash form crosses as the session's value under the phase the frame
+    /// states, so the controller reads back the key its host holds: the
+    /// encode frame and the plain pair's frame of one request name one
+    /// session to the engine, under each form of the key.
+    #[test]
+    fn an_encode_frame_and_a_pairs_frame_of_one_key_name_one_session() {
+        for session in [
+            Identity::hashed(17),
+            Identity::plain("session-a"),
+            Identity::plain(""),
+        ] {
+            let asked = at_prefill(session);
+            let want = asked.facts.session();
+            assert!(!want.is_none());
+            let read = |sent: proto::DecideRequest| {
+                let checked = Checked::new(sent).expect("the controller reads the request");
+                assert_eq!(checked.phase(), Phase::Prefill);
+                made(&checked, &mut Lists::default(), LEFT, |facts, _| {
+                    (facts.session(), facts.session_key.hash)
+                })
+            };
+            let (encode, _) = encode_request(&asked, EncodeItems::default());
+            let stated = encode.facts.as_ref().and_then(|facts| {
+                let key = facts.session_key.as_ref();
+                key.and_then(|key| key.form.clone())
+            });
+            let pair = read(request(&asked).0);
+            assert_eq!(pair, (want, session.hash));
+            assert_eq!(read(encode), pair, "{session:?}");
+            // The hash form on the encode frame is the session's value
+            // under the encode phase, which is not the pair's session.
+            let at_encode = RequestFacts {
+                phase: Phase::Encode,
+                ..asked.facts
+            };
+            assert_ne!(at_encode.session(), want);
+            if session.plain.is_none_or(str::is_empty) {
+                assert_eq!(stated, Some(Form::Hash(at_encode.session().get())));
+            }
+        }
     }
 
     fn trace(survivors: Survivors) -> Trace {
@@ -903,6 +1116,127 @@ mod tests {
         );
         let error = decided(&told, last).expect_err("the span runs past the clock's range");
         assert_eq!(error.path, "leases.dispatch_ttl_ms");
+    }
+
+    /// An encoder as an answer names it.
+    fn encoder(id: u64, dp_rank: u32) -> proto::Target {
+        proto::Target {
+            id,
+            dp_rank,
+            ..proto::Target::default()
+        }
+    }
+
+    /// The encoders an answer names are read onto the host's room in the
+    /// keys' order, each by its worker and its rank, at position 0. The
+    /// one key's encoder is read alone, and the room says so. A decision
+    /// that picks nothing places nothing, whatever stands beside it, and a
+    /// pick of a request with no key wants no encoder. Each read empties
+    /// what the room held.
+    #[test]
+    fn an_answers_encoders_are_read_in_the_keys_order() {
+        let keys = [Identity::hashed(1), Identity::NONE, Identity::hashed(3)];
+        let items = EncodeItems {
+            keys: &keys,
+            one: Some(Identity::hashed(5)),
+            ..EncodeItems::default()
+        };
+        let picked = pick(1, true, Survivors::counted(2));
+        let named = |id, dp_rank| Target {
+            id: WorkerId(id),
+            dp_rank,
+            ..Target::default()
+        };
+        let mut room = EncodePlaced::new();
+        let each = proto::EncodePlaced {
+            encoders: vec![encoder(9, 2), encoder(4, 0), encoder(9, 1)],
+            one: false,
+        };
+        placed(Some(&each), &picked, &items, &mut room).expect("an encoder a key");
+        assert_eq!(room.encoders(), [named(9, 2), named(4, 0), named(9, 1)]);
+        assert!(!room.one());
+
+        let one = proto::EncodePlaced {
+            encoders: vec![encoder(4, 6)],
+            one: true,
+        };
+        placed(Some(&one), &picked, &items, &mut room).expect("the one key's encoder");
+        assert_eq!(room.encoders(), [named(4, 6)]);
+        assert!(room.one());
+
+        let shed = Decision::Shed(Shed {
+            reason: ShedReason::NoEndpoints,
+            emptied_by: "controller",
+            retry_after_secs: 0,
+            wait_allowed: false,
+            trace: trace(Survivors::counted(0)),
+        });
+        placed(Some(&one), &shed, &items, &mut room).expect("a shed places nothing");
+        assert!(room.encoders().is_empty() && !room.one());
+
+        placed(Some(&one), &picked, &items, &mut room).expect("the one key's encoder");
+        let keyless = EncodeItems::default();
+        placed(None, &picked, &keyless, &mut room).expect("no key, no encoder");
+        assert!(room.encoders().is_empty() && !room.one());
+    }
+
+    /// By the contract the encoders are one where the answer says so, else
+    /// one a key, and an encoder names no pair. An answer that says
+    /// otherwise is named by its field and leaves the room empty, also
+    /// where the room held an earlier answer's encoders. So are a pick
+    /// that names no encoder for its keys, and an answer that says the one
+    /// key was placed where the request stated none.
+    #[test]
+    fn an_answer_whose_encoders_do_not_fit_its_request_is_unreadable() {
+        let keys = [Identity::hashed(1), Identity::hashed(2)];
+        let items = EncodeItems {
+            keys: &keys,
+            one: Some(Identity::hashed(5)),
+            ..EncodeItems::default()
+        };
+        let each_alone = EncodeItems { one: None, ..items };
+        let picked = pick(1, true, Survivors::counted(2));
+        let told = |ids: &[u64], one| proto::EncodePlaced {
+            encoders: ids.iter().map(|&id| encoder(id, 0)).collect(),
+            one,
+        };
+        let paired = proto::EncodePlaced {
+            encoders: vec![
+                encoder(9, 0),
+                proto::Target {
+                    pair: Some(proto::Pair::default()),
+                    ..encoder(4, 0)
+                },
+            ],
+            one: false,
+        };
+        let ranked = proto::EncodePlaced {
+            encoders: vec![encoder(9, 0), encoder(4, 65_536)],
+            one: false,
+        };
+        let cases = [
+            (None, items, "encode"),
+            (Some(told(&[9], false)), items, "encode.encoders"),
+            (Some(told(&[9, 4, 7], false)), items, "encode.encoders"),
+            (Some(told(&[], false)), items, "encode.encoders"),
+            (Some(told(&[9, 4], true)), items, "encode.encoders"),
+            (Some(told(&[9], true)), each_alone, "encode.one"),
+            (Some(paired), items, "encode.encoders.pair"),
+            (Some(ranked), items, "encode.encoders.dp_rank"),
+        ];
+        let mut room = EncodePlaced::new();
+        for (told, items, path) in cases {
+            let whole = proto::EncodePlaced {
+                encoders: vec![encoder(9, 0), encoder(4, 0)],
+                one: false,
+            };
+            placed(Some(&whole), &picked, &items, &mut room).expect("an encoder a key");
+            let error = placed(told.as_ref(), &picked, &items, &mut room)
+                .expect_err("the answer does not fit its request");
+            assert_eq!(error.path, path, "{told:?}");
+            assert!(!error.why.is_empty());
+            assert!(room.encoders().is_empty() && !room.one(), "{path}");
+        }
     }
 
     #[test]

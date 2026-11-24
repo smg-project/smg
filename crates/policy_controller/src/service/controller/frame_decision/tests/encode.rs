@@ -18,9 +18,10 @@ use super::{
 use crate::{
     document::spec::PolicySpec,
     engine::{
-        decision::{Decision, ShedReason, SUBSET_HINT, WIRES},
+        decision::{Decision, ShedReason, Targets, SUBSET_HINT, WIRES},
         decision_slot::DecisionSlot,
-        view::{Role, WireModes, WorkerId},
+        framework::{Picker, TieBand},
+        view::{Candidate, RequestFacts, Role, WireModes, WorkerId},
     },
     service::{
         controller::{
@@ -32,7 +33,7 @@ use crate::{
         },
         proto,
     },
-    stages::registry::StageRegistry,
+    stages::{lifecycle::Lifecycle, pickers::target_of, registry::StageRegistry},
     store::{
         GatewayId, HealthSink, LeaseState, LeasesStore, LookOutcome, MemoryStore, WorkersStore,
     },
@@ -368,6 +369,78 @@ fn a_frame_with_items_under_a_plan_with_no_encode_side_is_declined_by_its_bindin
             assert_eq!(placed, None, "{plan}, {keys} keys");
         }
     }
+}
+
+/// A picker that reads the request's key: of the candidates kept, the one
+/// at the key's fingerprint over their count. An item's facts state the
+/// item's own key, so two keys' encoders are told apart.
+#[derive(Debug)]
+struct ByKey;
+
+impl Lifecycle for ByKey {}
+
+impl Picker for ByKey {
+    fn name(&self) -> &'static str {
+        "by-key"
+    }
+
+    fn pick(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        _: &[f32],
+        _: TieBand,
+        out: &mut Targets,
+    ) {
+        let count = u64::try_from(kept.len()).expect("a count of candidates");
+        let at = usize::try_from(facts.session_key.hash % count).expect("a place among them");
+        out.push(target_of(&candidates[kept[at] as usize]));
+    }
+
+    fn refuses_by_reports(&self) -> bool {
+        false
+    }
+}
+
+/// The answer names each key's encoder in the keys' order. Under a pick
+/// that reads an item's key, two keys go to two encoders. Asked for both,
+/// the answer names the first key's encoder first, and asked for them the
+/// other way round it names that encoder last.
+#[test]
+fn an_answer_names_its_encoders_in_the_order_of_the_frames_keys() {
+    let mut catalog = StageRegistry::builtin();
+    catalog
+        .picker("by-key", || Box::new(ByKey))
+        .expect("a free name");
+    let store = Arc::new(MemoryStore::new());
+    let plan = encode_plan_in(&catalog, 1, ["by-key", "random", "random"]);
+    store.apply(plan).expect("above the unbound start");
+    member(&store, "p0", Role::Prefill, PUSHING);
+    member(&store, "d0", Role::Decode, PUSHING);
+    member(&store, "e0", Role::Encode, PUSHING);
+    member(&store, "e1", Role::Encode, PUSHING);
+    let objects = holder(&store);
+    let now = Instant::now();
+    let asked = |n, keys: &[u64]| {
+        let mut frame = encode_frame(n, 0);
+        let stated = frame.encode.as_mut().expect("an encode request's frame");
+        stated.keys = keys
+            .iter()
+            .map(|&key| proto::Identity {
+                form: Some(proto::identity::Form::Hash(key)),
+            })
+            .collect();
+        let (answer, placed) = served_encode(&store, &objects, frame, GATEWAY, now);
+        assert!(matches!(answer, Decision::Pick(_)), "{keys:?}: {answer:?}");
+        encoders_of(placed.as_ref())
+    };
+    let (a, b) = (6, 7);
+    let (of_a, of_b) = (asked(1, &[a])[0], asked(2, &[b])[0]);
+    assert_ne!(of_a, of_b, "the two keys' encoders are told apart");
+    assert_eq!(asked(3, &[a, b]), [of_a, of_b]);
+    assert_eq!(asked(4, &[b, a]), [of_b, of_a]);
+    assert_eq!(asked(5, &[b, a, a]), [of_b, of_a, of_a]);
 }
 
 /// A deciding thread keeps where its last encode request's items went, and

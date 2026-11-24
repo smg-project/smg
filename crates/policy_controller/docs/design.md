@@ -2211,10 +2211,20 @@ three lists of its model, with the holder's pair classes and its encode columns.
 issued as a pair's is, with no lease for an encoder, and its answer names each item's encoder
 beside the decision (`DecideAnswer.encode`). The answers come in a pair's order, and a request
 with a key takes its encoders' list as a third list in it. A decode asked again names its lease
-and states no items. A frame of the encode phase that carries no items, and a decode request that
-names no lease under a pair plan, are answered `Busy`. By the contract the gateway decides such a
-request locally (`crates/policy_controller/contracts/policy_controller.proto`) **[planned]**: no
-gateway calls a controller yet.
+and states no items. A frame of the encode phase that does not state `DecideRequest.encode`, and a
+decode request that names no lease under a pair plan, are answered `Busy`. By the contract the
+gateway decides such a request locally
+(`crates/policy_controller/contracts/policy_controller.proto`) **[planned]**: no gateway calls a
+controller yet.
+
+The crate's own client states the items. A handle asked over a link takes an encode request at the
+prefill phase, as the engine's entry takes it in process, with its items
+(`DecisionGuard::asked_encode`), and its frame states the encode phase. A session key in its hash
+form crosses as the session's value under the encode phase. The controller reads the key back under
+that phase, so the pair's session is the one the request has in process. The handle is a pair's,
+and it reads each item's encoder from the answer, in the keys' order. The link refuses a frame whose
+items are out of range by the controller's own check and sends nothing, so no such frame ends its
+stream.
 
 A frame states whether the request's own id handed its session key. Where it says so, a
 controller's prefix ring places that request by its prompt, as a gateway's own process does
@@ -2235,7 +2245,7 @@ the worker crate's structures, and the one engine.
 | cache events | an index in the worker host's KV tables; a decision reads none yet | the kv-index crate's index, filled by the worker crate's collector |
 | sessions | the engine's session table for a single request, one for each document | the engine's session table |
 | leases | the store's lease tables, in memory, one for each deciding thread | stay: a controller must remember what it issued to gateways |
-| decisions | a single request, a pair at its prefill, its decode call, an encode request that carries its items, and a prefill or a decode request that stands alone: `PolicyEngine` over the registry's lists; a frame of the encode phase that carries no items, and a decode request that names no lease under a pair plan: none, the request is answered `Busy` | `PolicyEngine::decide_without_lease` over the registry's lists, and `decide_encode_without_lease` over an encode request's three |
+| decisions | a single request, a pair at its prefill, its decode call, an encode request that carries its items, and a prefill or a decode request that stands alone: `PolicyEngine` over the registry's lists; a frame of the encode phase that does not state `DecideRequest.encode`, and a decode request that names no lease under a pair plan: none, the request is answered `Busy` | `PolicyEngine::decide_without_lease` over the registry's lists, and `decide_encode_without_lease` over an encode request's three |
 | discovery | the discovery crate through its host interface, registering and removing through the worker crate's job queue while the replica leads; behind a feature the image leaves out; a worker's API key is refused at the start, since no replica keeps one | the same in the image, with a worker's API key; how a replica comes by the key of a worker found before it led is open, as a gateway's way to a key is (section 11) |
 
 **Who sends a worker's data.** Nothing changes for a worker. It pushes its load records and its
@@ -2745,7 +2755,7 @@ bursts. It is bounded by the tree's size bound and the time between two eviction
 | The crate's bench of the kept engine | **[planned]** | |
 | The gateway as a host | **[partly]** | section 9, behind `--policy-controller on`, which is off by default: single requests and pairs on the HTTP and gRPC routes, a pair's decode asked again, a host's table of stages at the start; an encode request that carries an item is refused by name until the gateway hands the engine its three lists; every classic test of the gateway with the engine on (the bar's fourth point) is not met yet |
 | The controller: service, election, replication, document apply and roll back | **[partly]** | a session never pushes the document and refuses a gateway's replay; a standby serves neither the worker list nor the snapshot (section 10.1) |
-| The controller on the one engine and the worker crate's structures | **[partly]** | a single request, a pair at its prefill, its decode call and an encode request that carries its items are decided by `PolicyEngine` over the registry's lists; the crate's own client states no items yet; a decision reads no cache event, and no load report under a document that holds a stage that keeps reports, as no stock stage does (section 10.2) |
+| The controller on the one engine and the worker crate's structures | **[partly]** | a single request, a pair at its prefill, its decode call and an encode request that carries its items are decided by `PolicyEngine` over the registry's lists; a decision reads no cache event, and no load report under a document that holds a stage that keeps reports, as no stock stage does (section 10.2) |
 | The controller finding its own workers | **[partly]** | the image leaves the feature out; a worker's API key is refused; no flag sets a registration's timing |
 | A gateway under a controller | **[planned]** | section 11 |
 | User stages in WebAssembly and over gRPC | **[partly]** | library code that no document reaches |

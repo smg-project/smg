@@ -213,7 +213,9 @@ impl EncodePlaced {
 
     /// The encoder of each placed key, in the keys' order: one for the one
     /// key, else one an item. A target's position is its row in the encode
-    /// pool. Empty unless the decision is a pick.
+    /// pool, and 0 in an answer read from a link: a linked target names
+    /// its worker and its rank, and its row stays with the controller.
+    /// Empty unless the decision is a pick.
     pub fn encoders(&self) -> &[Target] {
         &self.encoders
     }
@@ -229,6 +231,16 @@ impl EncodePlaced {
     pub(crate) fn clear(&mut self) {
         self.encoders.clear();
         self.one = false;
+    }
+
+    /// The room for the encoders an answer read from a link names, with
+    /// what that answer says of the one key. Its reader empties it first
+    /// ([`Self::clear`]) and writes them in the keys' order, as a decision
+    /// in process does.
+    #[cfg(feature = "client")]
+    pub(crate) fn room(&mut self, one: bool) -> &mut Vec<Target> {
+        self.one = one;
+        &mut self.encoders
     }
 }
 
