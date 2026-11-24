@@ -536,8 +536,9 @@ struct RoutingArgs {
     eviction_interval: u64,
 
     /// Maximum total size of each model's approximation tree for cache-aware
-    /// routing (chars for HTTP, tokens for gRPC), shared across all workers;
-    /// eviction keeps every tree at or under this bound
+    /// routing, shared across all workers: for HTTP the chars of its texts
+    /// plus 1024 for each node a worker stands on, for gRPC tokens; eviction
+    /// keeps every tree at or under this bound
     #[arg(long, default_value_t = 67108864, help_heading = "Routing Policy")]
     max_tree_size: usize,
 
