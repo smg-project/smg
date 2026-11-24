@@ -39,10 +39,6 @@ pub enum Scope {
     /// TLS, or a per-gateway bearer whose verified subject is the gateway id
     /// that keys its leases.
     Gateway,
-    /// `PushLoad` and `PushKvEvents`: the relays' calls, a per-relay
-    /// credential. Mounted beside the gateway scope by default: a relay is a
-    /// gateway in front of a host-local worker.
-    Ingestion,
     /// The unary operator calls and `WatchRegime`: the control-plane keys and
     /// roles, `user` reads and `admin` writes, every call audited.
     Control,
@@ -52,18 +48,12 @@ pub enum Scope {
 
 impl Scope {
     /// Every scope, in the order the design lists them.
-    pub const ALL: [Scope; 4] = [
-        Scope::Gateway,
-        Scope::Ingestion,
-        Scope::Control,
-        Scope::Replication,
-    ];
+    pub const ALL: [Scope; 3] = [Scope::Gateway, Scope::Control, Scope::Replication];
 
     /// The scope's name on the command line, in log lines and in refusals.
     pub const fn as_str(self) -> &'static str {
         match self {
             Scope::Gateway => "gateway",
-            Scope::Ingestion => "ingestion",
             Scope::Control => "control",
             Scope::Replication => "replication",
         }
@@ -95,7 +85,7 @@ pub struct Tls {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Listener {
     /// The listener's name in log lines and refusals; the binary names each
-    /// after its flag (`gateway`, `control`, `replication`, `ingestion`).
+    /// after its flag (`gateway`, `control`, `replication`).
     pub name: String,
     /// The address it binds. Port `0` takes an ephemeral port, reported by
     /// [`Controller::addresses`](super::Controller::addresses). A replica
@@ -118,8 +108,8 @@ pub struct Config {
     /// (design 10, `controller-id@host:port`) and the name on its log lines.
     /// One token of letters, digits, `.`, `_` and `-`.
     pub controller_id: String,
-    /// The gRPC listeners. The binary mounts the gateway and ingestion
-    /// scopes on one and the control and replication scopes on one each.
+    /// The gRPC listeners. The binary mounts each scope on a listener of
+    /// its own.
     pub listeners: Vec<Listener>,
     /// The HTTP admin listener: the probes, the version and the metrics.
     pub admin: SocketAddr,
@@ -459,29 +449,6 @@ pub enum ConfigError {
     /// A client authority for a scope while no server certificate is set.
     #[error("a client CA for the {0} scope without a server certificate: mutual TLS needs TLS")]
     ClientCaWithoutTls(Scope),
-    /// Two scopes on one listener, one with a client authority and one
-    /// without: a listener has one credential rule.
-    #[error("listener {listener} mounts {with} with a client CA and {without} without one: give the two their own listeners")]
-    ScopesDisagreeOnClientCa {
-        /// The listener.
-        listener: String,
-        /// The scope with a client authority.
-        with: Scope,
-        /// The scope without one.
-        without: Scope,
-    },
-    /// Two scopes on one listener naming different client authorities: a
-    /// listener verifies against one, and taking the first would admit the
-    /// second scope's clients on neither.
-    #[error("listener {listener} mounts {first} and {second} with different client CAs: give the two their own listeners")]
-    ScopesNameDifferentClientCas {
-        /// The listener.
-        listener: String,
-        /// The scope whose authority was read first.
-        first: Scope,
-        /// The scope naming another.
-        second: Scope,
-    },
     /// A discovery flag was refused.
     #[error("{flag}: {reason}")]
     DiscoveryFlag {
@@ -524,7 +491,7 @@ pub(crate) mod tests {
         Config {
             controller_id: "controller-0".to_owned(),
             listeners: vec![
-                listener("gateway", 0, &[Scope::Gateway, Scope::Ingestion]),
+                listener("gateway", 0, &[Scope::Gateway]),
                 listener("control", 0, &[Scope::Control]),
                 listener("replication", 0, &[Scope::Replication]),
             ],
@@ -691,18 +658,16 @@ pub(crate) mod tests {
         );
 
         let mut config = valid();
-        config.listeners[0].scopes = vec![Scope::Gateway];
+        config.listeners.pop();
         assert_eq!(
             config.validate(),
-            Err(ConfigError::ScopeUnmounted(Scope::Ingestion))
+            Err(ConfigError::ScopeUnmounted(Scope::Replication))
         );
 
         let mut config = valid();
-        config
-            .listeners
-            .push(listener("relays", 0, &[Scope::Ingestion]));
-        config.listeners[0].scopes = vec![Scope::Gateway];
-        assert_eq!(config.validate(), Ok(()), "the relays split onto a fourth");
+        config.listeners.pop();
+        config.listeners[1].scopes.push(Scope::Replication);
+        assert_eq!(config.validate(), Ok(()), "two scopes share a listener");
     }
 
     #[test]

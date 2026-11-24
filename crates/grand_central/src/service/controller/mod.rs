@@ -6,7 +6,7 @@
 //! controller's deciding threads, and, on the leader, the control scope's
 //! registration calls and the gateway scope's watch of the worker rows, and
 //! the run loop sweeps the gateways that are gone; the scopes' other call
-//! bodies arrive with the gateway, ingestion and control scope PRs. In the
+//! bodies arrive with the gateway and control scope PRs. In the
 //! `elected` mode the gateway runs this same loop inside its process. A
 //! controller given a spec file runs its document, watches the file and
 //! answers `GetPolicySpec` and a dry run of `ApplyPolicySpec`

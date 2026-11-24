@@ -466,7 +466,7 @@ mod tests {
         Config {
             controller_id: "example-0".to_owned(),
             listeners: vec![
-                listener("gateway", &[Scope::Gateway, Scope::Ingestion]),
+                listener("gateway", &[Scope::Gateway]),
                 listener("control", &[Scope::Control]),
                 listener("replication", &[Scope::Replication]),
             ],

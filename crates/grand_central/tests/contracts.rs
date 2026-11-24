@@ -39,7 +39,6 @@ use wit_parser::{InterfaceId, PackageId, Resolve, TypeDefKind, WorldId, WorldIte
 
 const PLUGIN_PROTO: &str = "policy_plugin.proto";
 const CONTROLLER_PROTO: &str = "grand_central.proto";
-const ENGINE_WIRE_PROTO: &str = "common.proto";
 const WORLD_WIT: &str = "smg-policy.wit";
 const PACKAGE: &str = "smg.policy.v1";
 const WIT_NAMESPACE: &str = "smg";
@@ -933,8 +932,6 @@ const CONTROLLER_RPCS: &[Rpc] = &[
         false,
         true,
     ),
-    ("PushLoad", "LoadReport", "Ack", true, false),
-    ("PushKvEvents", "RelayKvFrame", "Ack", true, false),
     (
         "RegisterWorker",
         "RegisterWorkerRequest",
@@ -1080,12 +1077,6 @@ const ONEOFS: &[(&str, &str, &str, &[&str])] = &[
         "made",
         &["registered", "replaced", "removed", "relabelled"],
     ),
-    (
-        CONTROLLER_PROTO,
-        "RelayKvFrame",
-        "frame",
-        &["batch", "subscribed", "resync", "ended"],
-    ),
     (CONTROLLER_PROTO, "ReplicaFrame", "frame", &["hello", "ack"]),
     (
         CONTROLLER_PROTO,
@@ -1139,12 +1130,6 @@ fn contracts_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("contracts")
 }
 
-/// The engine wire's protos (`smg.grpc.common`): the controller protocol
-/// imports the load record and the event batch a relay forwards unchanged.
-fn engine_wire_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../worker/proto")
-}
-
 fn compile_protocol() -> io::Result<FileDescriptorSet> {
     let dir = contracts_dir();
     let mut config = prost_build::Config::new();
@@ -1153,7 +1138,7 @@ fn compile_protocol() -> io::Result<FileDescriptorSet> {
     config.protoc_arg("--experimental_allow_proto3_optional");
     config.load_fds(
         &[dir.join(PLUGIN_PROTO), dir.join(CONTROLLER_PROTO)],
-        &[dir, engine_wire_dir()],
+        &[dir],
     )
 }
 
@@ -1424,8 +1409,8 @@ fn the_protocol_compiles_and_mirrors_the_engine_record() {
     assert_eq!(controller.package(), PACKAGE);
     assert_eq!(
         controller.dependency,
-        strings(&[PLUGIN_PROTO, ENGINE_WIRE_PROTO]),
-        "the controller protocol imports the plugin vocabulary and the engine wire"
+        strings(&[PLUGIN_PROTO]),
+        "the controller protocol imports the plugin vocabulary alone"
     );
 
     for mirror in proto_mirrors() {
@@ -1982,6 +1967,34 @@ fn the_membership_fields_are_pinned() {
             &["Pending", "Ready", "NotReady", "Draining", "Failed"]
         ))
     );
+}
+
+/// The ingestion scope left the principal's scopes with its two relay calls:
+/// its number and its name stay reserved, so a later scope takes neither.
+#[test]
+fn the_principals_scopes_keep_the_ingestion_scopes_number_and_name_reserved() {
+    let set = compile_protocol().expect("protoc compiles the two protocol files");
+    let controller =
+        file(&set, CONTROLLER_PROTO).expect("the controller file is in the descriptor set");
+    assert_eq!(
+        enum_values(controller, "Principal.Scope"),
+        Some(vec![
+            ("SCOPE_UNSPECIFIED".to_owned(), 0),
+            ("SCOPE_GATEWAY".to_owned(), 1),
+            ("SCOPE_CONTROL".to_owned(), 3),
+            ("SCOPE_REPLICATION".to_owned(), 4),
+        ])
+    );
+    let scopes = message(controller, "Principal")
+        .and_then(|principal| principal.enum_type.iter().find(|e| e.name() == "Scope"))
+        .expect("Principal.Scope is in the controller file");
+    let reserved: Vec<i32> = scopes
+        .reserved_range
+        .iter()
+        .flat_map(|range| range.start()..=range.end())
+        .collect();
+    assert_eq!(reserved, [2], "the reserved number");
+    assert_eq!(scopes.reserved_name, strings(&["SCOPE_INGESTION"]));
 }
 
 /// The packed request block's layout as the world's comment states it: an

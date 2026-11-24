@@ -1,9 +1,7 @@
 //! The controller's protocol as Rust (package `smg.policy.v1`): the messages
 //! of the two contract files, the service ([`grand_central_server`]) and
 //! its client ([`grand_central_client`]), written by the build script
-//! from `contracts/` in one step. The engine wire's messages a relay forwards
-//! are the worker crate's, re-exported by the gRPC client crate
-//! (`smg_grpc_client::common_proto`).
+//! from `contracts/` in one step.
 
 #![allow(
     clippy::all,
