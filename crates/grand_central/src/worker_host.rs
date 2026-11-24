@@ -82,7 +82,7 @@
 //! above rank 0 of a data-parallel worker gets no feed yet ([`SkipReason`]).
 //! The module `kv` names the decode's limits.
 //!
-//! The stock controller lends its engines the tables' indexes through the
+//! The stock controller lends its engine the tables' indexes through the
 //! engine's own traits: the index the streams write, with no second copy
 //! (the module `kv_read`). A worker's number there is its row's place in
 //! its model's index, found from the worker's address through the registry

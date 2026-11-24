@@ -519,8 +519,9 @@ impl InProcess {
     /// a caller that asks a list's value outside a decision of the engine,
     /// as the engine's own task does ahead of a list's requests. Such a
     /// caller reads one document here and at the decision it asks beside
-    /// this call only where no document is put in force between the two: a
-    /// store's engine takes none.
+    /// this call only where no document is put in force between the two. A
+    /// controller's deciding thread asks the value under its world's
+    /// document, which its decision runs under ([`Loaded::members_of`]).
     #[inline]
     pub(crate) fn members_of<'a>(&self, lent: LentList<'a>) -> &'a PoolMembers {
         let document = self.in_force();

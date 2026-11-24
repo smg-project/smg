@@ -1,5 +1,6 @@
-//! What a served controller's stages keep across a document it applies, and
-//! which of them hear of a lease issued under an earlier one.
+//! What a served controller's stages keep across a document it applies,
+//! which of them hear of a lease issued under an earlier one, and which
+//! document a word of a lease is told by.
 //!
 //! A controller validates every document of its life over one stage table,
 //! so a bed here validates its documents over one. Every case goes through
@@ -9,11 +10,12 @@
 //! kept, or one it built new.
 
 use std::{
+    mem,
     sync::{
         atomic::{AtomicU32, Ordering},
         mpsc, Arc,
     },
-    thread,
+    thread::{self, ThreadId},
     time::{Duration, Instant},
 };
 
@@ -21,7 +23,7 @@ use parking_lot::Mutex;
 
 use super::{
     super::{completed, dispatched, released, told},
-    a_completed, a_dispatched, a_released, issued, keyed, open, worker, A, KEY,
+    a_completed, a_dispatched, a_released, counted, issued, issued_on, keyed, open, worker, A, KEY,
 };
 use crate::{
     document::spec::{AppliedSpec, PolicySpec},
@@ -34,7 +36,10 @@ use crate::{
     policies::random::Random,
     service::proto::{self, released::Reason},
     stages::{lifecycle::Lifecycle, registry::StageRegistry},
-    store::{DecodeSide, LeaseRecord, LeaseState, LeasesStore, MemoryStore, PickRecord, Position},
+    store::{
+        memory::seam, DecodeSide, LeaseRecord, LeaseState, LeasesStore, MemoryStore, PickRecord,
+        Position, StoreSnapshot,
+    },
     tracking::lease::{Dispatch, Lease, LeaseId, Membership, Outcome, ReleaseReason, Said, Side},
 };
 
@@ -125,7 +130,7 @@ impl Picker for Notes {
 /// A store, the one stage table its documents are validated over, and what
 /// the stages of its documents' two profiles heard.
 struct Bed {
-    store: MemoryStore,
+    store: Arc<MemoryStore>,
     catalog: StageRegistry,
     /// What the objects of the profile `kept` heard.
     kept: Log,
@@ -148,7 +153,7 @@ impl Bed {
             catalog.picker(name, build).expect("a free name");
         }
         Self {
-            store: MemoryStore::new(),
+            store: Arc::new(MemoryStore::new()),
             catalog,
             kept,
             moved,
@@ -240,7 +245,7 @@ impl Bed {
             dispatch_deadline: self.now + Duration::from_secs(5),
             state: LeaseState::ISSUED,
         };
-        LeasesStore::issue_pair(&self.store, record, side).expect("the key is free");
+        LeasesStore::issue_pair(&*self.store, record, side).expect("the key is free");
     }
 
     /// A `Dispatched` frame of the lease `id` on `side`, to its first
@@ -355,42 +360,45 @@ fn a_singles_lease_of_an_earlier_document_is_told_to_the_stage_kept_and_to_none_
     assert!(lease_words(&bed.moved, replaced).is_empty());
 }
 
-/// A keyed lease of an earlier document is told to the stage kept, and to
-/// no session table. The standing document's table is new with it, and the
-/// claim the lease names was made in the one that left. A table matches a
-/// claim by its worker alone: told there, the lease would withdraw a later
-/// request's claim of the same key on the same worker. That claim stands
-/// behind the earlier lease's commit that refused every target, and behind
-/// its dispatch on another worker.
+/// A keyed lease of an earlier document is told to the stage kept and to
+/// the session table. The table is the store's engine's, one for every
+/// document, so the claim the lease names was made in it: the claim stands
+/// across the apply. The earlier lease's commit that refused every target
+/// takes its claim back, and an earlier lease's dispatch on another worker
+/// than it claimed pins the key where the request went, as in a gateway's
+/// own process.
 #[test]
-fn a_keyed_lease_of_an_earlier_document_is_told_to_the_stage_kept_and_to_no_session_table() {
+fn a_keyed_lease_of_an_earlier_document_is_told_to_the_stage_kept_and_to_the_session_table() {
     let bed = Bed::new();
     let claimed = SessionVerdict::Claimed(WorkerId(7));
-    bed.applied_twice(|bed| {
-        keyed(&bed.store, 1, 7, claimed, bed.now);
-        // The second lease's commit goes to another worker than it claimed.
-        keyed(&bed.store, 2, 8, claimed, bed.now);
-    });
-    // A request of the standing document claims the key on that worker.
-    let made = bed.store.with_snapshot(|world| {
-        let table = world.spec().engine().sessions();
-        table.claim(KEY, [WorkerId(0); 2], WorkerId(7))
-    });
-    assert_eq!(made, Claim::Made(WorkerId(7)));
     let pins = || {
         bed.store
             .with_snapshot(|world| world.spec().engine().sessions().pins(KEY))
     };
+    bed.applied_twice(|bed| {
+        // The first lease's decision claims the key, under the earlier
+        // document.
+        let made = bed.store.with_snapshot(|world| {
+            let table = world.spec().engine().sessions();
+            table.claim(KEY, [WorkerId(0); 2], WorkerId(7))
+        });
+        assert_eq!(made, Claim::Made(WorkerId(7)));
+        keyed(&bed.store, 1, 7, claimed, bed.now);
+        // The second lease's commit goes to another worker than it claimed.
+        keyed(&bed.store, 2, 8, claimed, bed.now);
+    });
     let claim = Some([WorkerId(7), WorkerId(0)]);
-    assert_eq!(pins(), claim, "the later request's claim");
+    assert_eq!(pins(), claim, "the claim stands across the apply");
     let refused = proto::Released {
         reason: Reason::CommitFailed.into(),
         ..a_released(1)
     };
     released(&bed.store, &open(&bed.store, A), &refused).expect("the frame reads");
-    assert_eq!(pins(), claim, "behind the earlier lease's refusal");
+    let none = Some([WorkerId(0), WorkerId(0)]);
+    assert_eq!(pins(), none, "the refusal took the claim back");
     bed.dispatched(2, proto::Side::Single);
-    assert_eq!(pins(), claim, "behind the earlier lease's dispatch");
+    let served = Some([WorkerId(8), WorkerId(0)]);
+    assert_eq!(pins(), served, "the dispatch pinned the key where it went");
     let (kept, replaced, built) = kept_replaced_built(&bed);
     let words = [
         Word::Released(1, Side::Single),
@@ -558,49 +566,276 @@ fn an_apply_that_waited_for_another_keeps_from_the_document_that_one_applied() {
     );
 }
 
-/// A word told under a world older than its lease reaches no stage: that
-/// world's engine never issued the lease. A teller that loaded its world
-/// ahead of an apply meets it for a lease issued behind the apply.
-#[test]
-fn a_word_told_under_a_world_older_than_its_lease_reaches_no_stage() {
-    let bed = Bed::new();
-    bed.store.apply(bed.spec(1, "")).expect("the first");
-    let older = bed.store.snapshot();
-    bed.store
-        .apply(bed.spec(2, ""))
-        .expect("a later generation");
-    issued(&bed.store, 1, 2, bed.now);
-    let found = LeasesStore::sides(&bed.store, A, LeaseId(1)).expect("a lease on file");
+/// One single's dispatch, to its first target.
+fn a_dispatch(at: Instant) -> Said {
     let dispatch = Dispatch {
         side: Side::Single,
         target_index: 0,
         since_decision_micros: 0,
     };
+    Said::Dispatched(dispatch, at)
+}
+
+/// A word is told by the generation in force at the word, whatever world
+/// its teller is handed. A run of words loads its world once, so a word of
+/// that run behind an apply is handed the world of the generation before.
+/// It is told by the generation that stands all the same: a lease issued
+/// behind the apply reaches the stage that generation built new and the
+/// stage it kept, and not the stage that left with the generation before.
+#[test]
+fn a_word_handed_a_world_of_the_generation_before_is_told_by_the_generation_in_force() {
+    let bed = Bed::new();
+    bed.store.apply(bed.spec(1, "")).expect("the first");
+    let older = bed.store.snapshot();
+    let next = bed.spec(2, FILTERED);
+    bed.store.apply(next).expect("a later generation");
+    issued(&bed.store, 1, 2, bed.now);
+    let found = LeasesStore::sides(&*bed.store, A, LeaseId(1)).expect("a lease on file");
     told(
         &bed.store,
         &older,
         &found,
-        Said::Dispatched(dispatch, bed.now),
+        a_dispatch(bed.now),
         None,
         |_, _| true,
     );
-    for log in [&bed.kept, &bed.moved] {
-        let made = objects(log);
-        assert_eq!(made.len(), 1, "both profiles stand as they were built");
-        assert!(lease_words(log, made[0]).is_empty());
+    let (kept, replaced, built) = kept_replaced_built(&bed);
+    let word = [Word::Dispatched(1, WorkerId(7))];
+    assert_eq!(lease_words(&bed.kept, kept), word);
+    assert_eq!(lease_words(&bed.moved, built), word);
+    assert!(lease_words(&bed.moved, replaced).is_empty());
+}
+
+/// Inside an apply, between the engine's turn and the publication of the
+/// generation's world, the generation in force is still the one the
+/// standing world holds: no lease of the new one exists before its world
+/// is published. A dispatch said there is told by the generation before,
+/// and the lease's end, said behind the publication, by the new one. The
+/// stage both generations hold hears each word once. The stage that leaves
+/// hears the dispatch, and the stage built new hears neither word: the
+/// lease is of the generation before its own.
+#[test]
+fn a_word_said_inside_an_apply_is_told_by_the_generation_the_standing_world_holds() {
+    let bed = Bed::new();
+    let served = worker(&bed.store, "http://a:8000");
+    bed.store.apply(bed.spec(1, "")).expect("the first");
+    issued(&bed.store, 1, 1, bed.now);
+    let (store, at) = (Arc::clone(&bed.store), bed.now);
+    seam::on_turn(move || {
+        let turned = store.deciding(|world| !world.front().still_in_force());
+        assert!(
+            turned,
+            "the engine holds the generation, the world does not"
+        );
+        dispatched(&store, &open(&store, A), &a_dispatched(1), at).expect("the frame reads");
+    });
+    let next = bed.spec(2, FILTERED);
+    bed.store.apply(next).expect("a later generation");
+    bed.completed(1, proto::Side::Single, served);
+    let (kept, replaced, built) = kept_replaced_built(&bed);
+    let words = [Word::Dispatched(1, WorkerId(7)), Word::Completed(1)];
+    assert_eq!(lease_words(&bed.kept, kept), words);
+    assert_eq!(lease_words(&bed.moved, replaced), words[..1]);
+    assert!(lease_words(&bed.moved, built).is_empty());
+}
+
+/// What a case reads of the stage objects one factory built: the thread
+/// each was dropped on, and a gate the first of them to hear a dispatch
+/// waits at.
+#[derive(Debug, Default)]
+struct Left {
+    /// The thread each object was dropped on, under the object's number.
+    dropped: Mutex<Vec<(u32, ThreadId)>>,
+    /// Taken by the first dispatch a stage hears: the stage says its
+    /// number from inside its call, then waits for the case's word.
+    gate: Mutex<Option<(mpsc::Sender<u32>, mpsc::Receiver<()>)>>,
+}
+
+impl Left {
+    /// The thread the object `made` was dropped on, where it was.
+    fn dropped_on(&self, made: u32) -> Option<ThreadId> {
+        let dropped = self.dropped.lock();
+        let own = dropped.iter().find(|(object, _)| *object == made);
+        own.map(|&(_, thread)| thread)
     }
-    // Under the world that stands the same word reaches both.
-    let stands = bed.store.snapshot();
-    told(
-        &bed.store,
-        &stands,
-        &found,
-        Said::Dispatched(dispatch, bed.now),
-        None,
-        |_, _| true,
-    );
-    for log in [&bed.kept, &bed.moved] {
-        let made = objects(log)[0];
-        assert_eq!(lease_words(log, made), [Word::Dispatched(1, WorkerId(7))]);
+}
+
+/// The `random` picker under a number of its own, whose drop names its
+/// thread and whose first dispatch waits at the case's gate.
+#[derive(Debug)]
+struct Leaves {
+    made: u32,
+    left: Arc<Left>,
+}
+
+impl Drop for Leaves {
+    fn drop(&mut self) {
+        let thread = thread::current().id();
+        self.left.dropped.lock().push((self.made, thread));
+    }
+}
+
+impl Lifecycle for Leaves {
+    fn on_dispatched(&self, _: &Lease, _: &Target, _: Side, _: u32) {
+        let gate = self.left.gate.lock().take();
+        if let Some((inside, go)) = gate {
+            inside.send(self.made).expect("the case waits for it");
+            // A case that failed lets the gate go by dropping its end.
+            let _gone = go.recv();
+        }
+    }
+}
+
+impl Picker for Leaves {
+    fn name(&self) -> &'static str {
+        "leaves"
+    }
+
+    fn pick(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        scores: &[f32],
+        band: TieBand,
+        out: &mut Targets,
+    ) {
+        Random.pick(facts, candidates, kept, scores, band, out);
+    }
+}
+
+/// A telling lets no stage go on its own thread, however many generations
+/// start while it runs. The word here is handed a world of the generation
+/// before, so its teller loads the standing world itself, and a stage of
+/// that world's generation holds the telling inside its call while two
+/// more generations start. The second of them hands back the generation
+/// the word is told by, and the writer still keeps the world the telling
+/// loaded: the telling's end frees nothing. The next publication finds no
+/// reader on that world and lets the stage go, on the thread that writes.
+#[test]
+fn a_telling_that_outlasts_two_applies_lets_no_stage_go_on_its_own_thread() {
+    let left = Arc::new(Left::default());
+    let mut catalog = StageRegistry::builtin();
+    let (built, kept) = (AtomicU32::new(0), Arc::clone(&left));
+    let build = move || -> Box<dyn Picker> {
+        let made = built.fetch_add(1, Ordering::Relaxed);
+        let left = Arc::clone(&kept);
+        Box::new(Leaves { made, left })
+    };
+    catalog.picker("leaves", build).expect("a free name");
+    // Each generation states its one profile another way than the one
+    // before, so each builds its stage anew.
+    let spec = |generation: u64| {
+        let filters = if generation.is_multiple_of(2) {
+            FILTERED
+        } else {
+            ""
+        };
+        let text = format!(
+            r#"{{
+              "apiVersion": "smg.policy/v1",
+              "profiles": {{ "only": {{ "filter": [{filters}], "pick": "leaves" }} }},
+              "bindings": [ {{ "match": {{ "model": "*" }}, "profile": "only" }} ]
+            }}"#
+        );
+        let mut document: PolicySpec = serde_json::from_str(&text).expect("a document");
+        document.generation = generation;
+        let digest = document.digest().expect("the document digests");
+        AppliedSpec::validate_digested(&document, digest, &catalog, &[])
+            .expect("the table holds the stage")
+    };
+    let (store, now) = (MemoryStore::new(), Instant::now());
+    store.apply(spec(1)).expect("the first");
+    let older = store.snapshot();
+    store.apply(spec(2)).expect("a later generation");
+    issued(&store, 1, 2, now);
+    let found = LeasesStore::sides(&store, A, LeaseId(1)).expect("a lease on file");
+    let (inside, entered) = mpsc::channel();
+    let (go, gone) = mpsc::channel();
+    *left.gate.lock() = Some((inside, gone));
+    let (third, fourth) = (spec(3), spec(4));
+    // The stage the telling stood in, and the telling's thread.
+    let (stage, telling) = thread::scope(|scope| {
+        // Dropped where this closure unwinds: a stage at the gate goes on.
+        let go = go;
+        let telling = scope.spawn(|| {
+            told(&store, &older, &found, a_dispatch(now), None, |_, _| true);
+            thread::current().id()
+        });
+        let entered = entered.recv_timeout(Duration::from_secs(30));
+        let stage = entered.expect("a stage of the standing generation hears the word");
+        store.apply(third).expect("a later generation");
+        store.apply(fourth).expect("a later generation");
+        go.send(()).expect("the stage waits for it");
+        (stage, telling.join().expect("the telling's thread"))
+    });
+    let freed = left.dropped_on(stage);
+    assert_eq!(freed, None, "the telling's end freed no stage");
+    store.apply(spec(5)).expect("a later generation");
+    assert_eq!(left.dropped_on(stage), Some(thread::current().id()));
+    let dropped = left.dropped.lock();
+    let on_the_telling = dropped.iter().filter(|(_, thread)| *thread == telling);
+    assert_eq!(on_the_telling.count(), 0, "{dropped:?}");
+}
+
+/// What a word of a lease costs its teller in each of its three states,
+/// measured: handed a world that holds the generation in force, handed a
+/// world of the generation before, and said inside an apply. The word is a
+/// single's dispatch under the least-load preset, told with no file's turn
+/// around it, and each span holds two reads of the clock. The first state
+/// loads nothing. The other two load the store's standing world for the
+/// word: what they cost more is that load.
+#[test]
+#[ignore = "a measurement for the Numbers table, run by name"]
+fn a_words_cost_in_its_three_states_measured() {
+    use std::io::Write as _;
+
+    const WORDS: u64 = 2_000;
+    /// One dispatch of `lease` told under `world`, in nanoseconds.
+    fn timed(store: &MemoryStore, world: &StoreSnapshot, lease: u64, at: Instant) -> u128 {
+        let found = LeasesStore::sides(store, A, LeaseId(lease)).expect("a lease on file");
+        let began = Instant::now();
+        told(store, world, &found, a_dispatch(at), None, |_, _| true);
+        began.elapsed().as_nanos()
+    }
+    let (store, now) = (Arc::new(MemoryStore::new()), Instant::now());
+    let served = worker(&store, "http://a:8000");
+    store.apply(counted(1)).expect("the first");
+    for lease in 1..=3 * WORDS {
+        issued_on(&store, lease, 1, served, now);
+    }
+    let current = store.snapshot();
+    let in_force = (1..=WORDS).map(|lease| timed(&store, &current, lease, now));
+    let in_force: Vec<u128> = in_force.collect();
+    let window = Arc::new(Mutex::new(Vec::new()));
+    let (inside, kept) = (Arc::clone(&store), Arc::clone(&window));
+    seam::on_turn(move || {
+        let standing = inside.snapshot();
+        let leases = WORDS + 1..=2 * WORDS;
+        let spans = leases.map(|lease| timed(&inside, &standing, lease, now));
+        kept.lock().extend(spans);
+    });
+    store.apply(counted(2)).expect("a later generation");
+    let behind = (2 * WORDS + 1..=3 * WORDS).map(|lease| timed(&store, &current, lease, now));
+    let behind: Vec<u128> = behind.collect();
+    let window = mem::take(&mut *window.lock());
+    let states = [
+        (
+            "handed a world that holds the generation in force",
+            in_force,
+        ),
+        ("handed a world of the generation before", behind),
+        ("said inside an apply", window),
+    ];
+    let mut out = std::io::stdout();
+    for (state, mut spans) in states {
+        assert_eq!(spans.len() as u64, WORDS, "{state}");
+        spans.sort_unstable();
+        let (middle, ninth) = (spans[spans.len() / 2], spans[spans.len() * 9 / 10]);
+        writeln!(
+            out,
+            "a word {state}, {WORDS} dispatches, ns (middle, ninth tenth): {middle} {ninth}"
+        )
+        .expect("stdout");
     }
 }

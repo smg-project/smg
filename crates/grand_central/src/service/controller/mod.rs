@@ -475,9 +475,9 @@ impl Controller {
             config.worker_overload,
         ));
         let kv_feed = KvFeed::new(workers.holder());
-        // The engines read the index the feed's streams write: the store is
-        // lent it once, ahead of the first decision, and hands it to the
-        // engine of each policy spec it applies.
+        // The engine reads the index the feed's streams write: the store is
+        // lent it once, ahead of the first decision, and its one engine
+        // holds it under every policy spec it applies.
         journal.0.lend_cache_indexes(workers.cache_indexes());
         let prober = worker_objects::Prober::new(Arc::clone(&workers), elector.fence());
         // The load monitor is built stopped, ahead of the deciding threads:

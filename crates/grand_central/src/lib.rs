@@ -54,7 +54,7 @@
 //!   [`store::MemoryStore`] behind them and the contract tests over it. KV
 //!   events are the worker host's: they feed the index its tables hold for
 //!   each model (`worker_host::KvTables`), which a controller lends its
-//!   engines. A gateway in the embedded mode implements the same traits over
+//!   engine. A gateway in the embedded mode implements the same traits over
 //!   its own structures.
 //! - 10, the election ([`service::elector`]): one [`service::elector::Elector`] over a
 //!   [`service::elector::LeaseBackend`] (the lease file and the in-process record

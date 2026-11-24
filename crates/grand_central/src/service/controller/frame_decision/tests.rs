@@ -16,7 +16,10 @@ use std::{
     collections::BTreeSet,
     mem,
     panic::resume_unwind,
-    sync::{Arc, Weak},
+    sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc, Weak,
+    },
     time::{Duration, Instant},
 };
 
@@ -24,8 +27,8 @@ use parking_lot::Mutex;
 use smg_worker::load::state::{one_rank_load, LoadSnapshot};
 
 use super::{
-    decide, decide_alone, decide_decode, decide_pair, hands_reports, issue_decode, issue_pair,
-    Booked, FrameBuffers,
+    decide, decide_alone, decide_decode, decide_pair, hands_reports, issue, issue_decode,
+    issue_pair, Booked, FrameBuffers,
 };
 use crate::{
     document::spec::{AppliedSpec, Assignment, PolicySpec},
@@ -559,6 +562,109 @@ fn a_served_decision_is_handed_its_gateways_vetoes_its_instant_and_the_budget_le
     let (nobody, asked) = handed("model-nobody-serves", GATEWAY, now);
     assert_eq!(first(&nobody), None, "no worker to name");
     assert_eq!(asked, None, "decided over no worker");
+}
+
+/// What a picker's object did, under the object's number: a pick, or the
+/// issue of a lease it heard, with the lease's generation.
+type Did = (u32, &'static str, u64);
+
+/// The `random` picker under a number of its own, keeping each pick it
+/// makes and each issue it hears.
+#[derive(Debug)]
+struct Which {
+    made: u32,
+    did: Arc<Mutex<Vec<Did>>>,
+}
+
+impl Lifecycle for Which {
+    fn on_decision_issued(&self, lease: &Lease, _: &Decision) {
+        self.did
+            .lock()
+            .push((self.made, "issued", lease.generation));
+    }
+}
+
+impl Picker for Which {
+    fn name(&self) -> &'static str {
+        "which"
+    }
+
+    fn pick(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        scores: &[f32],
+        band: TieBand,
+        out: &mut Targets,
+    ) {
+        self.did.lock().push((self.made, "picked", 0));
+        Random.pick(facts, candidates, kept, scores, band, out);
+    }
+}
+
+/// A decision runs under the generation of the world it read, whatever
+/// generation the store applies meanwhile. The store keeps one engine, and
+/// that engine holds the later generation by the time this decision asks:
+/// the decision is made by its world's stage all the same, its lease is
+/// filed under its world's generation, and the stage that made the pick
+/// hears the issue. The later generation's stage is asked nothing.
+#[test]
+fn a_decision_whose_world_a_generation_replaced_is_decided_and_filed_under_its_worlds() {
+    let did = Arc::new(Mutex::new(Vec::new()));
+    let mut catalog = StageRegistry::builtin();
+    let (built, kept) = (AtomicU32::new(0), Arc::clone(&did));
+    let stage = move || -> Box<dyn Picker> {
+        let made = built.fetch_add(1, Ordering::Relaxed);
+        let did = Arc::clone(&kept);
+        Box::new(Which { made, did })
+    };
+    catalog.picker("which", stage).expect("a free name");
+    // The second generation states the profile another way, so its picker
+    // is an object of its own.
+    let spec = |generation: u64, filters: &str| {
+        let text = format!(
+            r#"{{
+              "apiVersion": "smg.policy/v1",
+              "profiles": {{ "only": {{ "filter": [{filters}], "pick": "which" }} }},
+              "bindings": [ {{ "match": {{ "model": "*" }}, "profile": "only" }} ]
+            }}"#
+        );
+        let mut document: PolicySpec = serde_json::from_str(&text).expect("a document");
+        document.generation = generation;
+        staged(&document, &catalog)
+    };
+    let store = Arc::new(MemoryStore::new());
+    fleet(&store);
+    store.apply(spec(1, "")).expect("above the unbound start");
+    LeasesStore::set_term(&*store, 1);
+    let objects = holder(&store);
+    let now = Instant::now();
+    let request = Checked::new(frame_for(MODEL, 1, 1)).expect("a frame the record holds");
+    let taken = taken_at(&request, GATEWAY, (now, now), None);
+    objects.follow(&*store);
+    let (mut frames, own) = (FrameBuffers::default(), Part::default());
+    let loads = Arc::new(LoadSnapshot::default());
+    let next = spec(2, r#""healthy""#);
+    let (decision, lease) = store.deciding(|world| {
+        // A generation starts while the decision holds its world.
+        store.apply(next).expect("a later generation");
+        let decided = decide(world, &objects, &taken, &mut frames, &loads, &own);
+        let (decision, booked) = decided.expect("the engine decides");
+        let filed = issue(&store, world, &taken, 1, &decision, booked);
+        let lease = filed.expect("the store files it");
+        (decision, lease.expect("a pick's lease"))
+    });
+    let pick = decision.pick().expect("a pick");
+    assert_eq!(pick.trace.generation, 1, "decided under its world's");
+    assert_eq!(lease.generation, 1, "and filed under it");
+    let did = did.lock();
+    let [(picker, "picked", _), (hearer, "issued", 1)] = did[..] else {
+        panic!("one pick and the issue of its lease: {did:?}");
+    };
+    assert_eq!(picker, hearer, "the stage that picked heard the issue");
+    let standing = store.deciding(|world| world.spec().generation());
+    assert_eq!(standing, 2, "the later generation stands");
 }
 
 /// A frame's request with its host's own word of what the workers hold of

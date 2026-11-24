@@ -180,10 +180,11 @@ use crate::{
 };
 
 /// What tells the engine of a frame applied to a lease on file: the world
-/// the frame is told under, the lease as it stood before the frame, both
-/// its parts, what the frame said, and the decider whose file the lease is
-/// on, where the store's host named its deciders. It holds what its host
-/// gave it: a served controller's holds the replica's worker objects.
+/// the frame's run loaded ([`OneLoad`]), the lease as it stood before the
+/// frame, both its parts, what the frame said, and the decider whose file
+/// the lease is on, where the store's host named its deciders. It holds
+/// what its host gave it: a served controller's holds the replica's worker
+/// objects.
 type Teller =
     Arc<dyn Fn(&MemoryStore, &StoreSnapshot, &Sides, Said, Option<DecisionSlot>) + Send + Sync>;
 
@@ -191,14 +192,13 @@ type Teller =
 /// world, loaded at the run's first word and held to its last. A run is
 /// one loop's words: the frames an apply finds in the ring, the leases an
 /// issue ends, the leases a sweep ends in a file. So a run that tells
-/// nothing loads no world, and one that tells many loads one: each word
-/// of a run is told under the generation that stood at the run's first.
-/// Each run builds its own where it tells, so one hold of a turn may load
-/// twice: the leases an issue ends may be told under a later world than
-/// the frames its apply found. Where a generation starts between the two,
-/// the stages that issued those leases hear their ends only where the new
-/// generation kept them. That is
-/// a limit of this form, not its aim: one load for both runs undoes it.
+/// nothing loads no world, and one that tells many loads one. Each run
+/// builds its own where it tells, so one hold of a turn may load twice.
+/// The load is the world a teller is handed, and it does not say who
+/// hears a word: a served controller's teller tells each word by the
+/// generation that stands at that word, and loads the standing world
+/// itself where a generation started behind the run's load
+/// (`lease_words::told`).
 /// None is passed in by a caller: that cost every take a holder's
 /// building and its drop, whatever the take found.
 #[derive(Default)]
