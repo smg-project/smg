@@ -3,11 +3,21 @@
 //! list of worker objects and the worker crate's registry, and none polls
 //! the engine's task.
 
-use std::{cell::Cell, sync::Arc, time::Instant};
+use std::{
+    cell::Cell,
+    panic::{catch_unwind, AssertUnwindSafe},
+    rc::Rc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    thread,
+    time::Instant,
+};
 
 use parking_lot::Mutex;
 
-use super::Loaded;
+use super::{Loaded, SpecHandle};
 use crate::{
     document::spec::{AppliedSpec, BindingSpec, Match, PolicySpec},
     engine::{
@@ -29,7 +39,7 @@ use crate::{
     policies::random::Random,
     stages::{registry::StageRegistry, Lifecycle},
     store::{GatewayId, StaleGeneration},
-    tracking::{lease::Membership, DecisionGuard},
+    tracking::{lease::Membership, DecisionGuard, Placement, PlacementSide},
 };
 
 impl PolicyEngine {
@@ -578,4 +588,250 @@ fn a_later_document_that_changes_its_index_alone_keeps_its_stages() {
     assert_eq!(engine.affinity().bound_of(MODEL), whole, "no list read yet");
     sent(2);
     assert_eq!(engine.affinity().bound_of(MODEL), Some(1), "the new bound");
+}
+
+thread_local! {
+    /// What a thread holds from ahead of its first read of an engine, and
+    /// what it holds from behind it ([`AsksAtItsEnd`]): whichever way round
+    /// the thread's own storage is torn down, one of the two is dropped
+    /// behind the document the thread kept.
+    static AHEAD: Cell<Option<AsksAtItsEnd>> = const { Cell::new(None) };
+    static BEHIND: Cell<Option<AsksAtItsEnd>> = const { Cell::new(None) };
+}
+
+/// Asks its engine for the generation in force where it is dropped, as a
+/// host's value that says a word of a lease from a destructor does, and
+/// writes down what the entry answered: `None` where it panicked.
+struct AsksAtItsEnd(&'static PolicyEngine, Arc<Mutex<Vec<Option<u64>>>>);
+
+impl Drop for AsksAtItsEnd {
+    fn drop(&mut self) {
+        let asked = || self.0.with_spec(AppliedSpec::generation);
+        let answered = catch_unwind(AssertUnwindSafe(asked));
+        self.1.lock().push(answered.ok());
+    }
+}
+
+/// A thread keeps one counted reference of the document it read last, and
+/// an entry compares that document's number with the engine's. An entry
+/// that finds it takes no reference of the document. The first entry
+/// behind a new document reads the engine's cell, and the thread lets the
+/// replaced document go there: until then the thread holds it.
+#[test]
+fn an_entry_behind_a_new_document_reads_it_and_lets_the_replaced_one_go() {
+    let engine = PolicyEngine::new(stock("random", 1));
+    let first = engine.spec();
+    let held = || Arc::strong_count(&first.0);
+    assert_eq!(held(), 2, "the handle and the engine's cell");
+    assert_eq!(engine.in_force().spec.generation(), 1);
+    assert_eq!(held(), 3, "and this thread, from its first entry on");
+    let again = engine.in_force();
+    assert_eq!(held(), 3, "a later entry takes none");
+    drop(again);
+
+    let applied = engine.apply(stock("least_load", 2));
+    applied.expect("a number above the standing one");
+    assert_eq!(held(), 2, "the handle, and the thread that read it last");
+    assert_eq!(engine.in_force().spec.generation(), 2, "the next entry");
+    assert_eq!(held(), 1, "the handle alone");
+}
+
+/// An entry made inside another on one thread counts on the reference the
+/// thread keeps: it reads no cell and takes no reference of the document.
+#[test]
+fn an_entry_inside_another_counts_on_the_threads_reference() {
+    let engine = PolicyEngine::new(stock("random", 1));
+    let handle = engine.spec();
+    let outer = engine.in_force();
+    let counted = Arc::strong_count(&handle.0);
+    let inner = engine.in_force();
+    assert!(Rc::ptr_eq(&outer.0, &inner.0), "the thread's one reference");
+    assert_eq!(engine.with_spec(AppliedSpec::generation), 1);
+    assert_eq!(
+        Arc::strong_count(&handle.0),
+        counted,
+        "none of the document"
+    );
+}
+
+/// A thread keeps one document, of the engine it asked last. A thread that
+/// asks two engines by turns reads each one's cell at each turn, and each
+/// engine is answered its own document: the numbers are compared, and no
+/// two documents of the process share one.
+#[test]
+fn a_thread_that_asks_two_engines_by_turns_reads_each_ones_own_document() {
+    let one = PolicyEngine::new(stock("random", 7));
+    let two = PolicyEngine::new(stock("least_load", 9));
+    for _ in 0..3 {
+        let first = one.in_force();
+        assert_eq!(first.spec.generation(), 7);
+        assert_eq!(two.in_force().spec.generation(), 9);
+        let back = one.in_force();
+        assert!(!Rc::ptr_eq(&first.0, &back.0), "the cell is read again");
+        assert_eq!(back.applied, first.applied, "the one document");
+    }
+}
+
+/// A panic that unwinds through an entry lets the entry's count go and
+/// leaves the thread its reference: the next entry counts on it.
+#[test]
+fn a_panic_through_an_entry_leaves_the_thread_its_reference() {
+    let engine = PolicyEngine::new(stock("random", 1));
+    let before = engine.in_force();
+    let unwound = catch_unwind(AssertUnwindSafe(|| {
+        let _held = engine.in_force();
+        panic!("a decision's panic");
+    }));
+    assert!(unwound.is_err());
+    let after = engine.in_force();
+    assert!(Rc::ptr_eq(&before.0, &after.0));
+    let counts = Rc::strong_count(&after.0);
+    assert_eq!(counts, 3, "the thread's and the two held here");
+}
+
+/// A picker of a host's own build whose drop panics while its flag is set.
+#[derive(Debug)]
+struct PanicsAtItsDrop(Arc<AtomicBool>);
+
+impl Lifecycle for PanicsAtItsDrop {}
+
+impl Picker for PanicsAtItsDrop {
+    fn name(&self) -> &'static str {
+        "panics-at-its-drop"
+    }
+
+    fn pick(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        scores: &[f32],
+        band: TieBand,
+        out: &mut Targets,
+    ) {
+        Random.pick(facts, candidates, kept, scores, band, out);
+    }
+}
+
+impl Drop for PanicsAtItsDrop {
+    fn drop(&mut self) {
+        assert!(!self.0.load(Ordering::Relaxed), "a stage's drop");
+    }
+}
+
+/// The stages of a replaced document that the new one did not keep are
+/// dropped where its last reference goes: as a rule at the next entry of
+/// a thread that read it last. A stage's drop that panics there unwinds
+/// out of that entry. The thread is left no document, and its next entry
+/// reads the engine's cell.
+#[test]
+fn a_stages_drop_that_panics_at_an_entry_unwinds_out_of_it() {
+    let armed = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&armed);
+    let make = move || -> Box<dyn Picker> { Box::new(PanicsAtItsDrop(Arc::clone(&flag))) };
+    let mut stages = StageRegistry::builtin();
+    stages
+        .picker("panics-at-its-drop", make)
+        .expect("a free name");
+    let mut document = PolicySpec::preset("random").expect("a built-in preset");
+    document.generation = 1;
+    let profile = document.profiles.get_mut("random");
+    profile.expect("the preset's profile").pick = "panics-at-its-drop".into();
+    let first = AppliedSpec::validate_in(&document, &stages, &[]);
+    let engine = PolicyEngine::new(first.expect("the stages hold the picker"));
+    assert_eq!(
+        engine.in_force().spec.generation(),
+        1,
+        "the thread keeps it"
+    );
+
+    // The next document is the stock table's: it keeps no stage of the
+    // first, and this thread holds the first's last reference.
+    let applied = engine.apply(stock("random", 2));
+    applied.expect("a number above the standing one");
+    armed.store(true, Ordering::Relaxed);
+    let unwound = catch_unwind(AssertUnwindSafe(|| engine.in_force().spec.generation()));
+    armed.store(false, Ordering::Relaxed);
+    assert!(unwound.is_err(), "the drop's panic leaves the entry");
+    assert_eq!(
+        engine.in_force().spec.generation(),
+        2,
+        "the cell, read again"
+    );
+}
+
+/// A thread lets the document it read last go at its end.
+#[test]
+fn a_thread_lets_the_document_it_read_last_go_at_its_end() {
+    let engine = PolicyEngine::new(stock("random", 1));
+    let handle = engine.spec();
+    let held = || Arc::strong_count(&handle.0);
+    assert_eq!(held(), 2, "the handle and the engine's cell");
+    let while_it_ran = thread::scope(|scope| {
+        let read = scope.spawn(|| {
+            assert_eq!(engine.in_force().spec.generation(), 1);
+            held()
+        });
+        // The join returns behind the end of the thread's own storage.
+        read.join().expect("the thread's read")
+    });
+    assert_eq!(while_it_ran, 3, "the thread kept one");
+    assert_eq!(held(), 2, "and let it go at its end");
+}
+
+/// The call that puts a document in force stores the document and then
+/// its number. An entry made between the two reads a document the engine
+/// held: a thread that kept the standing one decides under it once more,
+/// as a decision that began ahead of the call does, and a thread that
+/// kept none reads the new one of the cell. Once the number stands, every
+/// entry reads the new document.
+#[test]
+fn an_entry_between_an_applys_two_stores_reads_a_document_the_engine_held() {
+    let engine = PolicyEngine::new(stock("random", 1));
+    let standing = engine.in_force().applied;
+    let applied = engine.apply(stock("least_load", 2));
+    applied.expect("a number above the standing one");
+    // The engine as it stands between the two stores: the new document in
+    // its cell, under the standing number.
+    let next = engine.applied.swap(standing, Ordering::Release);
+    assert_eq!(engine.in_force().spec.generation(), 1, "the one it kept");
+    let fresh = thread::scope(|scope| {
+        let read = scope.spawn(|| engine.in_force().spec.generation());
+        read.join().expect("the thread's read")
+    });
+    assert_eq!(fresh, 2, "a thread that kept none reads the cell");
+
+    engine.applied.store(next, Ordering::Release);
+    assert_eq!(engine.in_force().spec.generation(), 2, "the number stands");
+}
+
+/// An entry made while a thread's own storage is torn down answers, and
+/// does not panic: where the thread's kept document is gone already, the
+/// entry reads the engine's cell. A value the thread holds from ahead of
+/// its first read and one it holds from behind it each ask at their drop.
+#[test]
+fn an_entry_made_while_a_threads_storage_is_torn_down_reads_the_cell() {
+    let engine: &'static PolicyEngine = Box::leak(Box::new(PolicyEngine::new(stock("random", 4))));
+    let answers = Arc::new(Mutex::new(Vec::new()));
+    let told = Arc::clone(&answers);
+    let asking = thread::spawn(move || {
+        AHEAD.set(Some(AsksAtItsEnd(engine, Arc::clone(&told))));
+        assert_eq!(engine.in_force().spec.generation(), 4);
+        BEHIND.set(Some(AsksAtItsEnd(engine, told)));
+    });
+    asking.join().expect("the thread ends");
+    assert_eq!(*answers.lock(), [Some(4), Some(4)]);
+}
+
+/// The read stays on its thread, and no public value holds one: each
+/// public value that holds or hands a reference of a document is `Send`
+/// and `Sync`, as it was before a thread kept its document.
+#[test]
+fn a_public_value_that_holds_a_document_is_send_and_sync() {
+    fn sent<T: Send + Sync>() {}
+    sent::<PolicyEngine>();
+    sent::<SpecHandle>();
+    sent::<Placement<'static>>();
+    sent::<PlacementSide>();
+    sent::<DecisionGuard<&'static PolicyEngine>>();
 }

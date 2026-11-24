@@ -41,6 +41,10 @@
 //! hold each request to the first runtime, and state two runtimes where
 //! the run names no count: half the list then takes the request, and
 //! under `--runtimes 1` the whole list does.
+//! `--engines 2` builds a second engine under the cell's document, and each
+//! turn asks it one word of that document ahead of its decision: a caller's
+//! thread then asks two engines by turns, and reads each one's document
+//! anew at each turn. A pair's cell and an encode request's take one engine.
 //! `--callers` threads each
 //! make `--decisions` timed decisions behind untimed first ones. The result
 //! is one line.
@@ -617,6 +621,8 @@ struct Run {
     callers: usize,
     cell: Cell,
     decisions: u64,
+    /// How many engines a caller asks by turns: one, or two.
+    engines: u64,
     /// The entry asked for a request: the bench's `place` file reads it.
     entry: String,
     overloaded: bool,
@@ -636,6 +642,7 @@ fn run() -> Run {
         callers: 1,
         cell: Cell::named("round_robin"),
         decisions: 1_000_000,
+        engines: 1,
         entry: "decide_at".to_owned(),
         overloaded: false,
         publish_ms: 0,
@@ -656,6 +663,7 @@ fn run() -> Run {
             "--callers" => run.callers = number() as usize,
             "--cell" => run.cell = Cell::named(&value),
             "--decisions" => run.decisions = number(),
+            "--engines" => run.engines = number(),
             "--entry" => run.entry = place::named(&value),
             "--runtimes" => RUNTIMES.store(number() as u32, Ordering::Relaxed),
             "--overloaded" => run.overloaded = number() != 0,
@@ -835,6 +843,16 @@ impl Host {
     }
 }
 
+/// The word a turn asks of the second engine ahead of its decision, where
+/// the run asks two engines by turns (`--engines 2`).
+#[inline(always)]
+fn ask(beside: Option<&PolicyEngine>) {
+    use smg_policy_controller::engine::DecisionEngine;
+    if let Some(engine) = beside {
+        black_box(engine.with_spec(AppliedSpec::generation));
+    }
+}
+
 /// One caller's turns by `turn`: its first untimed, then, behind the start
 /// every caller waits at, its timed ones as one stretch. Says how many of
 /// those were placed, the stretch in nanoseconds and its allocations.
@@ -906,6 +924,11 @@ fn main() {
     let spec = AppliedSpec::validate(&document).expect("a valid document");
     let engine: &'static PolicyEngine = Box::leak(Box::new(PolicyEngine::new(spec)));
     behind(engine);
+    assert!(matches!(run.engines, 1 | 2), "one engine or two");
+    let beside = (run.engines == 2).then(|| -> &'static PolicyEngine {
+        let spec = AppliedSpec::validate(&document).expect("a valid document");
+        Box::leak(Box::new(PolicyEngine::new(spec)))
+    });
     let mut receiver = None;
     let feed = TestFeed::attached_to(|loads| receiver = loads);
     let mut loads = reports(&workers);
@@ -930,16 +953,19 @@ fn main() {
         let (rule, ring) = (ruled::stated(&run), place::lent(&host));
         if worded::stated(&run) {
             measure(&run, &host, upkeep, publish, converted, |_| {
+                ask(beside);
                 worded::one(&host, ring)
             });
             return;
         }
         measure(&run, &host, upkeep, publish, converted, |_| {
+            ask(beside);
             place::one(&host, rule, ring)
         });
         return;
     }
     measure(&run, &host, upkeep, publish, converted, |seed| {
+        ask(beside);
         host.place(seed, None)
     });
 }
