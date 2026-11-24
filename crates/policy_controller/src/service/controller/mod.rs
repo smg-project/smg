@@ -485,19 +485,29 @@ impl Controller {
         shared.lag = Arc::new(Lag::new(standby::synced_within(config.load_poll_interval)));
         let (phase, readiness) =
             readiness::channel(elector.fence(), steps, Arc::clone(&shared.lag));
-        #[cfg(feature = "discovery")]
-        let discovery = config.discovery.as_ref().map(|settings| {
-            let host = Arc::new(discovery::Host::new(
-                Arc::clone(workers.holder().registry()),
-                settings.credential().cloned(),
-            ));
-            Box::new(discovery::Discovery::new(
-                settings.runtime().clone(),
-                host,
-                Arc::clone(&shared.fence),
-            ))
-        });
         let shared = Arc::new(shared);
+        #[cfg(feature = "discovery")]
+        let discovery = config
+            .discovery
+            .as_ref()
+            .map(|settings| {
+                // The replica's own writes are admitted as a control call's
+                // are: under the term its store leads, read at each write.
+                let own = Service::new(Vec::new(), Arc::clone(&shared));
+                let door = membership::ReplicaMembershipWriter::new(
+                    Arc::clone(&shared.door),
+                    principal::Principal::replica(&config.controller_id),
+                    move || own.leading(std::time::Instant::now()),
+                );
+                discovery::Discovery::registering(
+                    settings,
+                    &workers.holder(),
+                    Arc::new(door),
+                    Arc::clone(&shared.fence),
+                )
+                .map(Box::new)
+            })
+            .transpose()?;
         Ok(Self {
             config,
             catalog,

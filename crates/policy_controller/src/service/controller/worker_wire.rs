@@ -388,7 +388,7 @@ fn maker_weight(maker: &Registrant) -> usize {
 /// written as the log writes them and read back as a standby reads them, so
 /// a fact the wire gains is taken here with no second list.
 #[cfg_attr(
-    not(test),
+    not(any(test, feature = "discovery")),
     expect(dead_code, reason = "the host's door asks it of each registration")
 )]
 pub(crate) fn carried(facts: &WorkerFacts) -> Result<(), Refused> {

@@ -547,7 +547,7 @@ pub(super) fn refuse_settings(
     refuse(flag, error.to_string())
 }
 
-fn refuse(flag: &'static str, reason: impl Into<String>) -> ConfigError {
+pub(super) fn refuse(flag: &'static str, reason: impl Into<String>) -> ConfigError {
     ConfigError::DiscoveryFlag {
         flag,
         reason: reason.into(),

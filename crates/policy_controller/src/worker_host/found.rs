@@ -116,7 +116,7 @@ fn thresholds(spec: &WorkerSpec) -> Overload {
 /// state, so a threshold it leaves out is cleared. An add finds no row to
 /// keep one from. An upsert and an update keep the standing row's.
 #[cfg_attr(
-    not(test),
+    not(any(test, feature = "discovery")),
     expect(dead_code, reason = "the replica's own door reads a worker so")
 )]
 pub(crate) fn stated(

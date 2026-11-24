@@ -13,12 +13,12 @@ use crate::{
     service::{
         controller::{
             config::tests::valid,
-            worker_objects::{ObjectsWake, WorkerObjects},
-            Controller,
+            worker_objects::{engine, ObjectsWake, WorkerObjects},
+            Controller, Error as BindError,
         },
         elector::{ElectError, ElectionSettings, Elector},
     },
-    store::{MemoryStore, WorkerFacts, WorkerRow, WorkersStore},
+    store::{MemoryStore, Registrant, WorkerFacts, WorkerRow, WorkersStore},
 };
 
 const WORKER: &str = "http://worker:8000";
@@ -27,6 +27,9 @@ const KEY: &str = "discovery-key";
 const INTERVAL: Duration = Duration::from_secs(1);
 const WAIT: Duration = Duration::from_secs(5);
 const PASS: Duration = Duration::from_millis(1250);
+/// What a served registration and a served removal each end within: a pass,
+/// the worker's dial and, for a removal, its settle window.
+const SERVED: Duration = Duration::from_secs(30);
 
 struct ManifestFile(TempDir);
 
@@ -169,6 +172,13 @@ impl Bed {
     }
 }
 
+/// A mock engine that serves `model` over gRPC, under the address a source
+/// names it by: the scheme tells a registration how to dial the worker.
+pub(super) async fn grpc_engine(model: &str) -> (String, oneshot::Sender<()>, JoinSet<()>) {
+    let (url, stop, task) = engine(model).await;
+    (url.replacen("http://", "grpc://", 1), stop, task)
+}
+
 async fn until<T>(bound: Duration, mut read: impl FnMut() -> Option<T>) -> Option<T> {
     time::timeout(bound, async {
         let mut tick = time::interval(Duration::from_millis(10));
@@ -183,11 +193,57 @@ async fn until<T>(bound: Duration, mut read: impl FnMut() -> Option<T>) -> Optio
     .ok()
 }
 
+/// A controller that leads registers the worker its source names: the row
+/// stands, made by the provider `discovery`. Once the source lists the
+/// worker no more, the row is drained and taken out.
 #[tokio::test]
-async fn a_replica_that_leads_runs_the_provider_and_its_worker_reaches_the_queue(
+async fn a_leading_controller_registers_what_its_source_names_and_removes_what_it_drops(
 ) -> Result<(), Box<dyn Error>> {
-    use smg_worker::jobs::WorkerRegistrationMode;
+    use smg_service_discovery::DiscoveryHost;
 
+    let (url, _engine_stop, _engine) = grpc_engine("served").await;
+    let file = ManifestFile(tempfile::tempdir()?);
+    file.publish(&[url.as_str()])?;
+    let mut config = valid();
+    config.discovery = Some(DiscoverySettings::new(file.settings(), None, None)?);
+    let controller = Controller::bind(config).await?;
+    let discovery = controller.discovery.as_ref().expect("configured discovery");
+    assert!(Arc::ptr_eq(&discovery.fence, &controller.shared.fence));
+    assert!(discovery.host.jobs().is_some(), "the bind hands no queue");
+    let store = Arc::clone(&controller.shared.store);
+
+    let (stop, stopped) = oneshot::channel();
+    let serve = controller.serve(async {
+        let _ = stopped.await;
+    });
+    let passes = async {
+        let found = until(SERVED, || store.by_key(&url)).await;
+        let dropped = file.publish(&[]);
+        let gone = until(SERVED, || store.by_key(&url).is_none().then_some(())).await;
+        let _ = stop.send(());
+        (found, dropped, gone)
+    };
+    let (served, (found, dropped, gone)) = tokio::join!(serve, passes);
+    served?;
+    dropped?;
+    let row = found.expect("the leader registered the manifest's worker");
+    assert!(
+        matches!(&row.maker, Registrant::Provider(by) if by.provider() == "discovery"),
+        "{:?}",
+        row.maker
+    );
+    assert_eq!(row.facts.models, ["served"]);
+    assert!(
+        gone.is_some(),
+        "the worker the manifest dropped still stands"
+    );
+    Ok(())
+}
+
+/// The replica keeps no key of a worker it finds yet, so a controller that
+/// is configured with one does not start: the key is not dropped in silence.
+#[tokio::test]
+async fn a_configured_worker_key_is_refused_at_the_bind() -> Result<(), Box<dyn Error>> {
     let file = ManifestFile(tempfile::tempdir()?);
     file.publish(&[WORKER])?;
     let mut config = valid();
@@ -196,33 +252,51 @@ async fn a_replica_that_leads_runs_the_provider_and_its_worker_reaches_the_queue
         None,
         Some(Credential::for_test(KEY)),
     )?);
+    let refused = Controller::bind(config).await.err();
+    assert!(
+        matches!(
+            &refused,
+            Some(BindError::Config(ConfigError::DiscoveryFlag {
+                flag: "--api-key",
+                ..
+            }))
+        ),
+        "{refused:?}"
+    );
+    Ok(())
+}
+
+/// The queue's jobs write under the term the replica leads, read at each
+/// write as a control call's is. A controller that was bound and not served
+/// leads no term: a registration its queue is asked dials the worker, and
+/// its write is refused. No row is written.
+#[tokio::test]
+async fn a_job_of_a_replica_that_leads_no_term_writes_nothing() -> Result<(), Box<dyn Error>> {
+    use smg_service_discovery::DiscoveryHost;
+    use smg_worker::{
+        jobs::{WorkerJobAsker, WorkerRegistrationMode},
+        worker::WorkerSpec,
+    };
+
+    let (url, _engine_stop, _engine) = grpc_engine("served").await;
+    let file = ManifestFile(tempfile::tempdir()?);
+    let mut config = valid();
+    config.discovery = Some(DiscoverySettings::new(file.settings(), None, None)?);
     let controller = Controller::bind(config).await?;
     let discovery = controller.discovery.as_ref().expect("configured discovery");
-    assert!(Arc::ptr_eq(&discovery.fence, &controller.shared.fence));
-    let jobs = Arc::new(RecordedJobs::default());
-    assert!(discovery.host.set_jobs(jobs.clone()));
+    let jobs = discovery.host.jobs().expect("the queue of the bind");
+    let written = controller.shared.store.epoch();
 
-    let (stop, stopped) = oneshot::channel();
-    let serve = controller.serve(async {
-        let _ = stopped.await;
-    });
-    let registered = async {
-        let added = until(WAIT, || jobs.queued().into_iter().next()).await;
-        let _ = stop.send(());
-        added
-    };
-    let (served, added) = tokio::join!(serve, registered);
-    served?;
-    let Some(Queued::Add { spec, mode, .. }) = added else {
-        panic!("the leader did not queue the manifest worker");
-    };
-    assert_eq!(spec.url, WORKER);
-    assert!(
-        spec.api_key.as_deref() == Some(KEY),
-        "the worker key was not stamped"
+    let asked = jobs.add_worker(
+        WorkerSpec::new(url.as_str()),
+        WorkerRegistrationMode::Upsert,
+        WorkerJobAsker::Discovery,
     );
-    assert_eq!(mode, WorkerRegistrationMode::Upsert);
-    assert_eq!(jobs.queued().len(), 1);
+    assert_eq!(asked.await, Ok(true));
+    let ended = until(SERVED, || (!jobs.job_in_flight(&url)).then_some(())).await;
+    assert!(ended.is_some(), "the registration did not end");
+    assert!(controller.shared.store.by_key(&url).is_none());
+    assert_eq!(controller.shared.store.epoch(), written);
     Ok(())
 }
 
@@ -361,6 +435,7 @@ async fn a_second_take_starts_the_provider_again() -> Result<(), Box<dyn Error>>
 async fn with_no_queue_a_pass_asks_nothing_and_asks_once_a_queue_stands(
 ) -> Result<(), Box<dyn Error>> {
     use smg_service_discovery::DiscoveryHost;
+    use smg_worker::jobs::WorkerRegistrationMode::Upsert;
 
     let mut bed = Bed::new()?;
     bed.file.publish(&[WORKER])?;
@@ -374,10 +449,15 @@ async fn with_no_queue_a_pass_asks_nothing_and_asks_once_a_queue_stands(
     assert!(bed.stays_at(0).await);
     assert!(bed.host.jobs().is_none());
     assert!(bed.install_queue());
-    let Some(Queued::Add { spec, .. }) = bed.wait_for_job(0).await else {
+    let Some(Queued::Add { spec, mode, .. }) = bed.wait_for_job(0).await else {
         panic!("the next pass did not use the installed queue");
     };
     assert_eq!(spec.url, WORKER);
+    assert!(
+        spec.api_key.as_deref() == Some(KEY),
+        "the worker key was not stamped"
+    );
+    assert_eq!(mode, Upsert);
     bed.stop().await?;
     assert_eq!(bed.jobs.queued().len(), 1);
     Ok(())
