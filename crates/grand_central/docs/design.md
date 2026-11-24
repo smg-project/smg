@@ -379,7 +379,7 @@ What a policy remembers lives in several places, among them:
 
 | What | Where |
 |---|---|
-| what a stage remembers | its stage object, inside the `AppliedSpec`: it belongs to one generation of the document |
+| what a stage remembers | its stage object, inside the `AppliedSpec`. It belongs to one generation of the document, or to several where a document put in force on the same engine object keeps an unchanged profile's stages (section 5.1) |
 | what belongs to one worker list (round robin's counter) | the engine's value for that list (section 5.2) |
 | the record of sent prefixes | the engine object (section 5.1) |
 | a sessions rule's pins | the engine object: one table for the engine's life |
@@ -1106,7 +1106,7 @@ pub enum ShedReason {
 }
 pub struct Trace {
     pub profile: u16,                      // which profile decided
-    pub survivors: Survivors,              // how many workers passed the filters
+    pub survivors: Survivors,              // how many workers passed the filters, or none behind a draw
     pub top: [(WorkerId, f32); TRACE_TOP], // the best workers and their scores
     pub top_len: u8,                       // how many of `top` are set
     pub seed: u64,
@@ -1172,6 +1172,11 @@ On main three pickers say so: round robin, `random` and `passthrough`.
 7. **Records.** One `Candidate` for each worker is written into the thread's buffer. Over a list
    of 16 workers or more, a profile whose picker draws first (`random`, `round-robin`,
    `passthrough`, power of two, `best` with a sample) has only the drawn workers' records written.
+   A request whose session key holds no pin is decided on a draw too, where its sessions rule
+   leaves a new key to a profile whose picker takes turns and whose filters are one test of a
+   worker's record: the worker at the list's turn and the workers drawn behind it have their
+   records written, and so has a worker that another request claimed for the key meanwhile
+   (decision 15).
    For a request held to places no worker is drawn first: every worker's record is written.
    Under a binding that names a shadow every worker's record is written, for the two decisions.
 8. **Filters.** Each filter removes records. If a filter leaves nothing, the binding's rule for a
@@ -2143,7 +2148,7 @@ The bar for that change:
 3. With the engine off, a classic decision pays what rule 5 names and no more, counted in the
    gateway's decision bench.
 
-   With the engine off, neither pair route makes the one call of the second point. Each route asks the pair's first answer once, where it decides how the pair is sent, and builds no ask for a decode the classic policies picked. A classic pair sent prefill first still pays that test, the holder of its decode ahead of the send, and on the HTTP route the cell a moved decode is written to. That cost is counted under Callgrind, on the lines the second point added.
+   With the engine off, neither pair route makes the one call of the second point. Each route asks the pair's first answer once, where it decides how the pair is sent, and builds no ask for a decode the classic policies picked. A classic pair sent prefill first still pays that test, the holder of its decode ahead of the send, and on the HTTP route the cell a moved decode is written to. The decision bench runs no route's attempt, so it does not count that cost. It was counted once by a program built for the count, under Callgrind, on the lines the second point added.
 
    With the engine off, an outcome's report through the answer returns at its first test, of the answer's engine side. A streamed answer pays the route's ask of its guard and its reader's test of an empty handle. A pair route's relay is handed an empty handle and pays its test. The decision bench's `--end` flag counts each against a cell that reports nothing.
 4. With the engine on, every classic test of the gateway passes under the settings' own document.
@@ -2655,13 +2660,8 @@ Five things follow, and they are the first work of section 16.
    caller's recipe: it is proven at stage 3, by a gateway test of classic's own function. The
    1 of `manual` replays as classic recorded now: a sessions rule runs on the two sides of a
    pair, each side by its own session and under its own cap.
-   One answer under a cap differs from classic's and stands open under rule 6. Classic's sticky
-   map moves a prefill side's pin at its cap where it selects the prefill
-   (`select_sticky`, `model_gateway/src/policies/registry.rs:816-818`, on main `bd55beae5`),
-   and a pair that fails behind that selection keeps the move
-   (`pair_pass`, `model_gateway/src/routers/common/placement.rs:3072-3078`). The engine moves the pin where
-   the pair forms, to the prefill the pair formed on, and a decision that forms no pair moves
-   none. Each
+   One answer under a cap differs from classic's, by decision 13 (section 15): the engine moves a
+   prefill side's pin where the pair forms, and classic where it selects the prefill. Each
    of the 23 is made equal to classic or named as an accepted difference: two in stage 1, one
    at stage 3, the 20 in stage 4.
 3. **Five policies have no sheet over a healthy pool**: `round_robin`, `random`, `passthrough`,
@@ -2818,7 +2818,7 @@ and it has served traffic on a cluster beside classic.
 
 Each is the maintainer's. Work inside the crate goes on where a decision is not needed for it.
 
-All twelve at a glance. An answer can be as short as the numbers with their letters.
+All fifteen at a glance. An answer can be as short as the numbers with their letters.
 
 | # | Decision | Recommended | Needed for |
 |---|---|---|---|
@@ -2834,6 +2834,9 @@ All twelve at a glance. An answer can be as short as the numbers with their lett
 | 10 | What the controller needs in the worker crate | one list type, and a load monitor that can be stopped; the other worker facts are kept beside the object; recommended: one set of overload thresholds for each worker | stage 4 |
 | 11 | The crate in CI and in the published set | closed inside the crate: the feature `controller` takes the engine's feature; (a) out of the published set until stage 3 | CI's run of the kept engine's tests; stage 0 |
 | 12 | The last report of a worker whose load call fails | (a) the engine alone reads it, about 40 seconds at most at the default poll | rule 6, for the documents whose stages read load reports |
+| 13 | Where a capped sessions rule moves a pair's prefill pin | (a) where the pair forms | rule 6, for a pair under a sessions rule that states a cap |
+| 14 | Round robin's order across deciding threads | recorded, the answer is open: (a) a thread takes a list's turns in runs | rule 6, for `round_robin` where several threads decide |
+| 15 | The workers a session's first request reads | recorded, the answer is open: (a) the workers its turn asks about | rule 6, for a sessions rule that leaves a new key to round robin |
 
 ### Decision 1: the name of a cache partition
 
@@ -2842,7 +2845,7 @@ request's entry in a tree must be named as classic names it.
 
 | Option | Cost |
 |---|---|
-| (a) The host hands the entry already named, with the length of the partition's marker at its start. The engine takes it as it takes the prompt's hash seeds today. | About 70 lines in the crate, and about 15 lines (an estimate) in the gateway's one integration, calling classic's own two naming functions. The naming is then the host's to keep: a host that hands a plain entry for a partitioned request lets two tenants' prompts match. |
+| (a) The host hands the entry already named, with the length of the partition's marker at its start. The engine takes it as it takes the prompt's hash seeds today. | About 70 lines in the crate, and about 15 lines (an estimate) in the gateway's one integration, calling classic's own two naming functions, one for each tree. The naming is then the host's to keep: a host that hands a plain entry for a partitioned request lets two tenants' prompts match. |
 | (b) Classic's naming (336 lines) and its two functions move into the kv-index crate. | A move across 12 files, 10 of them in the gateway. No behaviour changes. |
 
 Under (a) the engine also states for itself which of the three records a request reads (the rule
@@ -3039,6 +3042,98 @@ bounded by its own sample, and classic stays as recorded.
 
 **As taken.** (a) is on main: the monitor keeps the report, the engine's rows and signal cells take
 it, and classic's reads are as they were.
+
+### Decision 13: where a capped sessions rule moves a pair's prefill pin
+
+*Needed for:* rule 6 (section 1), for a pair under a sessions rule that states a cap.
+
+A key whose pin is at its rule's cap is placed again, and the pin moves where the request lands on
+another worker under the cap. For a single request and for a pair's decode side, classic and the
+engine both write that move where the side is decided. They differ on a pair's prefill side.
+
+Classic selects a pair's prefill first, and its sticky map moves the pin at that selection
+(`select_sticky` in `model_gateway/src/policies/registry.rs`). The pair can still fail behind it, as
+where the decode's policy declines (`pair_pass` in `model_gateway/src/routers/common/placement.rs`).
+The move stays, on a prefill that took no request.
+
+The engine's prefill side places the request again and moves no pin. A prefill whose partners
+leave no decode is passed over. The pin moves where the pair forms, to the prefill the pair formed
+on and ahead of any dispatch (`Engine::decide_pair` in `engine/framework.rs`). A decision that forms
+no pair moves none.
+
+So behind a pair that fails past its prefill's selection, the key's next request finds the pin
+moved under classic and where it stood under the engine.
+
+| Option | Cost |
+|---|---|
+| (a) The engine moves the pin where the pair forms. | Behind a pair that fails past its prefill's selection the engine differs from classic on the key's next request, by this decision. Classic's answers do not move. |
+| (b) The engine moves the pin at its prefill side's run, as classic does. | The key's next request finds the pin as classic's does. A prefill that is passed over then holds the pin while the decision runs. A request of the key decided in that time follows it there, and the pin is taken back from under that request or stays on a prefill the pair never formed on. |
+
+**Recommendation: (a).** A pin says where a session's requests went. A move for a pair that never
+formed names a prefill that took none.
+
+**As taken.** (a) is on main: the prefill side's run moves no pin, and the pair's decision moves it
+where the pair forms.
+
+### Decision 14: round robin's order across deciding threads
+
+*Needed for:* rule 6 (section 1), for `round_robin` where several threads decide.
+
+Classic's round robin takes one step of its list's counter at every pick
+(`model_gateway/src/policies/round_robin.rs`). Requests decided on any threads then take the list's
+workers in one order. Where every worker can take a request, the picks of two workers differ by one
+at most.
+
+The engine's round robin takes single steps too for a thread's first turns of a list, 64 for each
+worker. Past them the thread takes a run of the counter's turns in one write, 61 as a rule, and
+plays them in order (section 5.6; `row_of` in `policies/round_robin.rs`). Between two such writes a
+pick writes no word that the deciding threads share.
+
+So where several threads decide, the engine's picks follow no one order: inside a run a thread
+takes the list's workers one after the other. Where the filters keep every worker and the counter
+has not wrapped, the picks of two workers differ by one at most, and by one more for each run that
+is not played out: the run a deciding thread holds, and each run that was left behind. A thread
+that decides alone takes the list's workers in the order single steps give, for as long as the list
+keeps its place among the thread's four.
+
+| Option | Cost |
+|---|---|
+| (a) A thread takes a list's turns in runs. | Where several threads decide, the order of the picks differs from classic's, and the even share is bounded as above and not exact. |
+| (b) Every pick takes one step of the counter, as classic does. | The two agree. Every pick writes one word that all deciding threads share, and a decision slows as deciding threads are added, by the count of the change that took the runs. |
+
+**Recorded, not decided.** (a) is on main. The maintainer's answer is open.
+
+### Decision 15: the workers a session's first request reads
+
+*Needed for:* rule 6 (section 1), for a sessions rule that leaves a new key to a round robin
+profile.
+
+A routing read of a worker moves its open circuit breaker to half-open once the breaker's timeout
+has passed (`CircuitBreaker::state` in the worker crate). So the workers a request reads decide
+when a tripped worker is tried again.
+
+For a key with no pin, classic's sticky map first lists the workers that can take the request, and
+reads every worker of the list for it (`select_sticky` in `model_gateway/src/policies/registry.rs`).
+Then its policy picks.
+
+The engine reads fewer workers where it draws for such a request. Over a list of 16 workers or
+more it reads the worker the list's turn lands on and, where the filters keep that worker, the
+workers drawn behind it, and a worker that another request claimed for the key meanwhile
+(`Engine::decide_claimed` in `engine/framework.rs`). The decision's cost then does not grow with
+the list.
+
+So a tripped worker whose timeout has passed turns half-open at any session's first request under
+classic, and under the engine at the first request that asks about that worker. An answer can
+differ. Behind a session's first request, a failure of an older request on such a worker opens its
+breaker again under classic and changes nothing under the engine. A request pinned to that worker
+is then placed on another worker by classic and on its pin by the engine.
+
+| Option | Cost |
+|---|---|
+| (a) The engine reads the workers its turn asks about. | A tripped worker is tried again at another request than under classic, by this decision. |
+| (b) The engine reads every worker, as classic does. | The two agree. The decision grows with the list: every worker's record is written and filtered before the profile takes its turn. |
+
+**Recorded, not decided.** (a) is on main. The maintainer's answer is open.
 
 ## 16. The order of work
 
