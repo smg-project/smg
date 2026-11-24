@@ -436,8 +436,8 @@ pub(super) fn emptied(
         .iter()
         .any(|row| doubted_alone(row.health) && cx.held.binary_search(&row.position).is_err());
     // The two lengths answer for the rows only where every held row is a
-    // row of the mask, named once: the store's view keeps that, and a host
-    // that fills the constraints by hand owes it.
+    // row of the mask, named once: a host that fills the constraints
+    // owes it.
     debug_assert!(
         cx.held.iter().all(|held| cx.stalled.contains(held)),
         "a held row is no row of the mask"
