@@ -26,6 +26,17 @@
 //! states no wire asks nothing of an encoder's. The pair's two sides are
 //! held to no wire here: their host hands them on the request's wires.
 //!
+//! A hard demand the encode side's constraints state
+//! ([`Constraints::demands`]) is kept by that one test, a part at a time,
+//! against what each encoder states beside its record
+//! ([`EncodePool::demands`]). Its runtime is the rest of the request's
+//! wire, its references and their pipeline stand with the items'
+//! references, and its vision with the request's pixels. So an encoder
+//! that fails a part is no member of its class, and what a fleet lacks is
+//! named in this pass's own order, whether the request states a fact as a
+//! demand or as its own. An encoder is held to no window and to no way of
+//! deciding a constraint: it runs neither the prompt nor the completion.
+//!
 //! A request held to places of a list takes a worker at one of them, on
 //! each of the three lists ([`Constraints::places`]). An encoder outside the
 //! encoders' places is not open to the request: no item is placed on it,
@@ -46,6 +57,7 @@ use super::{
 use crate::{
     engine::{
         decision::{Decision, ShedReason, Target, Targets, Trace, PLACES},
+        demands::{DemandFacts, Demands, References},
         view::{
             AffinityFacts, Candidate, Constraints, Identity, Phase, PoolFacts, RequestFacts,
             WireModes,
@@ -66,18 +78,14 @@ mod tests;
 const ENCODERS: &str = "encoders";
 /// The stage named when the request holds pixels, an image or a video, and
 /// none of the registered encoders that would take it otherwise takes
-/// images. A demand for vision the request states says this word too where
-/// it leaves no encoder
-/// ([`UnmetDemand::encoders_stage`](crate::engine::demands::UnmetDemand::encoders_stage)).
-pub(crate) const ENCODE_VISION: &str = "encode-vision";
+/// images. A demand for vision the request states is the same test.
+const ENCODE_VISION: &str = "encode-vision";
 /// The stage named when no registered encoder hands to a prefill of a pair:
 /// a pushing encoder states no role, or no prefill states its end.
 const EC_COMPATIBLE: &str = "ec-compatible";
-/// The stage named when no registered encoder takes the request's media.
-/// A demand for media by reference the request states says this word too
-/// where it leaves no encoder
-/// ([`UnmetDemand::encoders_stage`](crate::engine::demands::UnmetDemand::encoders_stage)).
-pub(crate) const ENCODE_MEDIA: &str = "encode-media";
+/// The stage named when no registered encoder takes the request's media,
+/// by the request's own facts or by the media a demand of it names.
+const ENCODE_MEDIA: &str = "encode-media";
 /// The stage named when the decode must take images and no decode of a pair
 /// an encoder serves does.
 const DECODE_VISION: &str = "decode-vision";
@@ -118,6 +126,13 @@ pub struct EncodePool<'a> {
     /// The encoders' signal cells: what the encode side's stages find in
     /// [`RequestFacts::signal_cells`]. `None` where they read no signal.
     pub signal_cells: Option<&'a SignalCells>,
+    /// What each encoder states for a request's hard demands, one entry an
+    /// encoder ([`FixedFacts::demands`](crate::engine::view::FixedFacts::demands)):
+    /// read for a request whose encode side states a demand
+    /// ([`Constraints::demands`]), and by no other. An encoder with no
+    /// entry states nothing, so it meets no demand for a runtime or for
+    /// media by reference: an empty column says that of every encoder.
+    pub demands: &'a [DemandFacts],
 }
 
 /// The encode items of a request and what it asks for them.
@@ -447,33 +462,141 @@ impl EncodeScratch {
     }
 }
 
+/// What a request wants of an encoder: its media, its wire, and its part
+/// of a hard demand ([`Constraints::demands`] of the encode side). One
+/// value for every test of the pass, so each reads one request.
+///
+/// The three things stand apart, as the gap's name lifts one at a time
+/// ([`encode_gap`]): the references ([`Self::references`]), vision
+/// ([`Self::vision`]) and the wire ([`Self::on_wire`]). A demand adds to
+/// each. Its runtime is the rest of the request's wire. Its references and
+/// their pipeline are asked beside the items' references. Its vision and
+/// the request's pixels are one test of the encoder's vision bit.
+struct Wanted<'a> {
+    /// The items are references an encoder processes itself.
+    references: bool,
+    /// The request holds an image or a video, or demands vision.
+    pixels: bool,
+    /// The wires the request's host states: none asks nothing.
+    wires: WireModes,
+    /// The demand's runtime and its references. Its vision stands in
+    /// `pixels`, and nothing else of it is an encoder's to meet.
+    demands: Demands,
+    /// Whether the demand names a runtime or references: a request that
+    /// names neither reads no entry of `stated`.
+    held: bool,
+    /// What each encoder states for a demand, by its place
+    /// ([`EncodePool::demands`]).
+    stated: &'a [DemandFacts],
+}
+
+impl<'a> Wanted<'a> {
+    /// What the request wants, read once: `pixels` says whether it holds
+    /// an image or a video.
+    fn of(
+        items: &EncodeItems<'_>,
+        pixels: bool,
+        cx: &Constraints<'_>,
+        encode: &EncodePool<'a>,
+    ) -> Self {
+        let demands = cx.demands;
+        Self {
+            references: items.references,
+            pixels: pixels || demands.vision,
+            wires: cx.wire_modes,
+            demands,
+            held: demands.runtime != 0 || demands.references != References::None,
+            stated: encode.demands,
+        }
+    }
+
+    /// What the encoder at `at` states for a demand: nothing, where its
+    /// host handed no entry for it.
+    #[inline(always)]
+    fn stated_at(&self, at: usize) -> DemandFacts {
+        self.stated.get(at).copied().unwrap_or_default()
+    }
+
+    /// Whether the encoder processes the request's references: the items'
+    /// own, and the ones a demand names with their pipeline.
+    #[inline(always)]
+    fn references(&self, at: usize, of: EncoderFacts) -> bool {
+        (!self.references || of.references)
+            && (!self.held
+                || self
+                    .demands
+                    .references_unmet_by(self.stated_at(at))
+                    .is_none())
+    }
+
+    /// Whether the encoder takes the request's images, where it holds
+    /// pixels or demands vision.
+    #[inline(always)]
+    fn vision(&self, row: &Candidate) -> bool {
+        !self.pixels || row.vision
+    }
+
+    /// Whether the encoder is on the request's wire: dialed on a wire its
+    /// host states, and on the runtime its demand names.
+    #[inline(always)]
+    fn on_wire(&self, at: usize, row: &Candidate) -> bool {
+        dialed(self.wires, row) && (!self.held || self.demands.on_runtime(self.stated_at(at)))
+    }
+
+    /// Whether the encoder takes the request: its references, its vision
+    /// and its wire. The one test of an encoder for a request, so an
+    /// encoder it refuses is left out of every pass. Inlined by force: each
+    /// pass asks it once an encoder, and its tests cost less than a call. A
+    /// request that states no demand pays one test for it, behind the
+    /// others.
+    #[inline(always)]
+    fn takes(&self, at: usize, row: &Candidate, of: EncoderFacts) -> bool {
+        (!self.references || of.references)
+            && self.vision(row)
+            && dialed(self.wires, row)
+            && (!self.held || self.meets(at))
+    }
+
+    /// Whether the encoder meets the demand's runtime and its references.
+    /// Out of line: a request that states no demand never comes here.
+    #[inline(never)]
+    fn meets(&self, at: usize) -> bool {
+        let stated = self.stated_at(at);
+        self.demands.on_runtime(stated) && self.demands.references_unmet_by(stated).is_none()
+    }
+
+    /// Whether the request names media: by its own facts, or by a demand.
+    fn names_media(&self) -> bool {
+        self.references || self.pixels || self.demands.references != References::None
+    }
+}
+
 /// The name of the gap when no encoder is open for the request, read from
 /// membership: `any_member` says a registered encoder takes the request and
-/// states an end. `wires` are the wires the request's host states: an
-/// encoder dialed on none of them would not take the request with its
-/// pixels either.
-fn encode_gap(
-    encode: &EncodePool<'_>,
-    items: &EncodeItems<'_>,
-    pixels: bool,
-    wires: WireModes,
-    any_member: bool,
-) -> &'static str {
+/// states an end. Else the name lifts one thing at a time, in this order.
+/// Vision: an encoder that states an end would take the request but for
+/// its images, with its references and its wire as they stand. The role:
+/// a pushing encoder takes the media, whatever its wire. The media: the
+/// request names some and no encoder takes it.
+fn encode_gap(encode: &EncodePool<'_>, wanted: &Wanted<'_>, any_member: bool) -> &'static str {
     if any_member {
         return ENCODERS;
     }
-    let references = |of: &EncoderFacts| !items.references || of.references;
-    let rows = || encode.encoders.iter().zip(encode.facts);
-    if pixels && rows().any(|(row, of)| of.class != 0 && references(of) && dialed(wires, row)) {
+    let rows = || encode.encoders.iter().zip(encode.facts).enumerate();
+    let but_vision = |(at, (row, of)): (usize, (&Candidate, &EncoderFacts))| {
+        of.class != 0 && wanted.references(at, *of) && wanted.on_wire(at, row)
+    };
+    if wanted.pixels && rows().any(but_vision) {
         return ENCODE_VISION;
     }
     // A pushing encoder that takes the media and is not counted above lacks
     // its role: one that states no end, and one that states an end and is
-    // dialed on no stated wire. This test reads no wire.
-    if rows().any(|(row, of)| of.pushes && references(of) && (!pixels || row.vision)) {
+    // off the request's wire. This test reads no wire, and so no runtime
+    // of a demand.
+    if rows().any(|(at, (row, of))| of.pushes && wanted.references(at, *of) && wanted.vision(row)) {
         return EC_COMPATIBLE;
     }
-    if !encode.encoders.is_empty() && (items.references || pixels) {
+    if !encode.encoders.is_empty() && wanted.names_media() {
         return ENCODE_MEDIA;
     }
     ENCODERS
@@ -486,30 +609,13 @@ fn dialed(wires: WireModes, row: &Candidate) -> bool {
     wires.is_empty() || row.wire_modes.intersects(wires)
 }
 
-/// Whether an encoder takes the request: its media, references when its
-/// items are references and pixels when it holds an image or a video, on a
-/// wire its host states (`wires`). The one test of an encoder for a
-/// request, so an encoder it refuses is left out of every pass. Inlined by
-/// force: each pass asks it once an encoder, and its tests cost less than a
-/// call.
-#[inline(always)]
-fn takes_request(
-    items: &EncodeItems<'_>,
-    pixels: bool,
-    wires: WireModes,
-    row: &Candidate,
-    of: &EncoderFacts,
-) -> bool {
-    (!items.references || of.references) && (!pixels || row.vision) && dialed(wires, row)
-}
-
-/// The encoders a request may take, each with its facts: every encoder of
-/// the pool, or the ones at the places its host holds it to
-/// ([`Constraints::places`]). A place past the pool's end names none.
+/// The encoders a request may take, each with its place and its facts:
+/// every encoder of the pool, or the ones at the places its host holds it
+/// to ([`Constraints::places`]). A place past the pool's end names none.
 fn reached<'a>(
     encode: &EncodePool<'a>,
     places: Option<&'a [u32]>,
-) -> impl Iterator<Item = (&'a Candidate, &'a EncoderFacts)> {
+) -> impl Iterator<Item = (usize, &'a Candidate, &'a EncoderFacts)> {
     let (encoders, facts) = (encode.encoders, encode.facts);
     let (every, held): (u32, &[u32]) = match places {
         None => (encoders.len() as u32, &[]),
@@ -519,7 +625,7 @@ fn reached<'a>(
         .chain(held.iter().copied())
         .filter_map(move |at| {
             let at = at as usize;
-            Some((encoders.get(at)?, facts.get(at)?))
+            Some((at, encoders.get(at)?, facts.get(at)?))
         })
 }
 
@@ -540,15 +646,14 @@ fn saturation(
     facts: &RequestFacts<'_>,
     cx: &Constraints<'_>,
     encode: &EncodePool<'_>,
-    items: &EncodeItems<'_>,
-    pixels: bool,
+    wanted: &Wanted<'_>,
 ) -> Option<&'static str> {
     let hard = || profile.filters.iter().filter(|f| !f.soft());
     // Where each of them is refused, counted over the hard filters: the
     // farthest of those places is the stage that left none.
     let last = reached(encode, cx.places)
-        .filter(|(row, of)| of.class != 0 && takes_request(items, pixels, cx.wire_modes, row, of))
-        .filter_map(|(row, _)| hard().position(|f| !f.keep(facts, row, cx)))
+        .filter(|(at, row, of)| of.class != 0 && wanted.takes(*at, row, **of))
+        .filter_map(|(_, row, _)| hard().position(|f| !f.keep(facts, row, cx)))
         .max()?;
     let stage = hard().nth(last)?.name();
     (reason_of(stage) == ShedReason::Saturated).then_some(stage)
@@ -603,6 +708,17 @@ impl Engine {
     /// them is left out, as one that takes none of the media is, and a
     /// host that states no wire leaves none out. The pair's two sides are
     /// held to no wire here.
+    ///
+    /// An encoder is held to the hard demand `encode_cx` states
+    /// ([`Constraints::demands`]) by the same one test, against what it
+    /// states beside its record ([`EncodePool::demands`]): to the runtime
+    /// as to a wire, to the references and their pipeline with the items'
+    /// references, to vision with the request's pixels, and to no window
+    /// and no way of deciding a constraint. One that fails a part is left
+    /// out, and the gaps below name what the encoders lack by lifting one
+    /// thing at a time, a demand's part with the request's own. The pair's
+    /// two sides are held to no demand here: their caller judges them
+    /// ahead of this call.
     ///
     /// Before the pair, the gaps no retry closes are named by membership:
     /// no registered encoder takes the request (`encode-vision`,
@@ -668,6 +784,7 @@ impl Engine {
         clippy::too_many_arguments,
         reason = "the pair entry's inputs and the encode side's"
     )]
+    #[inline]
     pub fn decide_encode_pair(
         &self,
         facts: &RequestFacts<'_>,
@@ -681,12 +798,45 @@ impl Engine {
         scratch: &mut Scratch,
         placed: &mut EncodePlaced,
     ) -> Decision {
+        self.decide_encode_pair_judged(
+            facts, pool, pools, encode, items, cx, decode_cx, encode_cx, None, scratch, placed,
+        )
+    }
+
+    /// [`Self::decide_encode_pair`] for a caller that judged a hard demand
+    /// of the pair's two sides ahead of this call, each among its own
+    /// places. `unmet` is the stage of the demand that left a side nobody,
+    /// where one did: a request with items is shed under it with no
+    /// endpoint, behind every answer for its encoders (a gap of their
+    /// membership, none open, a saturated fleet) and ahead of the pair's.
+    /// The encoders' answers stand first, whatever its pair lacks. A
+    /// request with no item reads no encoder: its caller sheds it ahead of
+    /// this call, and `unmet` is not read for it.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the pair entry's inputs and the encode side's"
+    )]
+    pub(crate) fn decide_encode_pair_judged(
+        &self,
+        facts: &RequestFacts<'_>,
+        pool: &PoolFacts<'_>,
+        pools: PairPools<'_>,
+        encode: EncodePool<'_>,
+        items: EncodeItems<'_>,
+        cx: &Constraints<'_>,
+        decode_cx: &Constraints<'_>,
+        encode_cx: &Constraints<'_>,
+        unmet: Option<&'static str>,
+        scratch: &mut Scratch,
+        placed: &mut EncodePlaced,
+    ) -> Decision {
         placed.clear();
         // The encode side's buffers leave the scratch for the decision: the
         // pair entry takes the scratch whole while they hold its pools.
         let mut side = scratch.encode.take().unwrap_or_default();
         let decision = self.encode_pair(
-            facts, pool, pools, encode, items, cx, decode_cx, encode_cx, scratch, &mut side, placed,
+            facts, pool, pools, encode, items, cx, decode_cx, encode_cx, unmet, scratch, &mut side,
+            placed,
         );
         scratch.encode = Some(side);
         if decision.pick().is_none() {
@@ -709,6 +859,7 @@ impl Engine {
         cx: &Constraints<'_>,
         decode_cx: &Constraints<'_>,
         encode_cx: &Constraints<'_>,
+        unmet: Option<&'static str>,
         scratch: &mut Scratch,
         side: &mut EncodeScratch,
         placed: &mut EncodePlaced,
@@ -805,7 +956,9 @@ impl Engine {
             session_key_from_rid: false,
             ..*facts
         };
-        let wires = encode_cx.wire_modes;
+        // What the request wants of an encoder: its media, its wires and
+        // its part of a hard demand, read by every test below.
+        let wanted = Wanted::of(&items, pixels, encode_cx, &encode);
         // What a key's run reads of the encode side's constraints: no place,
         // where the request is held to some. The encoders offered to a key
         // stand at the request's places already.
@@ -816,8 +969,6 @@ impl Engine {
         // membership below: such a gap stands whatever the places are,
         // and no other place closes it.
         let mut held_off = false;
-        let takes =
-            |row: &Candidate, of: &EncoderFacts| takes_request(&items, pixels, wires, row, of);
         let open = |row: &Candidate| {
             let hard = profile.filters.iter().filter(|f| !f.soft());
             hard.into_iter()
@@ -837,7 +988,7 @@ impl Engine {
             let mut any_member = false;
             side.opened.clear();
             for (at, (row, of)) in (0u32..).zip(encode.encoders.iter().zip(encode.facts)) {
-                if of.class != 0 && takes(row, of) {
+                if of.class != 0 && wanted.takes(at as usize, row, *of) {
                     any_member = true;
                     if !side.member.insert(of.class) {
                         side.far_member.push(of.class);
@@ -864,7 +1015,7 @@ impl Engine {
                 let named = at_places.peek().is_some();
                 held_off = any_member
                     && named
-                    && !at_places.any(|(row, of)| of.class != 0 && takes(row, of));
+                    && !at_places.any(|(at, row, of)| of.class != 0 && wanted.takes(at, row, *of));
                 side.hold_opened(encode.facts, width, places);
                 any_open = !side.opened.is_empty();
                 unplaced = Constraints {
@@ -878,15 +1029,21 @@ impl Engine {
             if !any_open && !held_off {
                 // Encoders the overload veto left none of are a saturated
                 // fleet, and the shed says so.
-                if let Some(stage) =
-                    saturation(profile, &encode_facts, encode_cx, &encode, &items, pixels)
+                if let Some(stage) = saturation(profile, &encode_facts, encode_cx, &encode, &wanted)
                 {
                     return turned_away(ShedReason::Saturated, stage, bare);
                 }
-                return gap(encode_gap(&encode, &items, pixels, wires, any_member));
+                return gap(encode_gap(&encode, &wanted, any_member));
             }
             side.far_open.sort_unstable();
             side.far_member.sort_unstable();
+            // A side of the pair that a hard demand left nobody, as this
+            // call's caller judged it: said behind the encoders' own
+            // answers above and ahead of the pair's, under no profile, as
+            // the judge itself says it for a request with no item.
+            if let Some(stage) = unmet {
+                return turned_away(ShedReason::NoEndpoints, stage, unbound);
+            }
         }
         // The pairs by membership: one at all, one an encoder serves, and
         // one whose decode takes images. The request with no item that asks

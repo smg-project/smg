@@ -1584,10 +1584,14 @@ pub struct Constraints<'a> {
     /// that meet them. Over a pair's two worker lists each side is held
     /// to the workers that meet them as its role is held to them
     /// ([`Demands::held_by`](crate::engine::Demands::held_by)). An encode
-    /// request's three lists are held a list at a time too. Where it has
+    /// request's pair is held a side at a time too. Where it has
     /// items its encoders are held to the runtime and the media's demands
     /// ([`Demands::beside_pair`](crate::engine::Demands::beside_pair)),
-    /// and its pair's two sides to the rest.
+    /// and its pair's two sides to the rest. The encoders' part is the one
+    /// demand an entry of the engine keeps itself: the encode pass holds
+    /// each encoder to what its encode side's constraints state, against
+    /// what the encoder states beside its row
+    /// ([`EncodePool::demands`](crate::engine::EncodePool::demands)).
     /// In-process only: this protocol version
     /// states no demand, and a handle refuses a request that states one
     /// before it sends it over a link (`DecisionGuard::asked`).

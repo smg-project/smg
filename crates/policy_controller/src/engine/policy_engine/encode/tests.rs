@@ -678,6 +678,146 @@ fn on(runtime: u32) -> FixedFacts {
     }
 }
 
+/// An encoder as a case of the demands states it, once. What its host says
+/// of it beside its list ([`Self::fixed`]) and of its handoff
+/// ([`Self::facts`]) are both read from this, so the two say one thing of
+/// its references.
+#[derive(Clone, Copy)]
+struct Enc {
+    /// The runtime it is on.
+    runtime: u32,
+    /// It takes images.
+    vision: bool,
+    /// It processes media by reference: by its caller's pipeline
+    /// (`Some(true)`), or by its own.
+    references: Option<bool>,
+    /// It pushes, with its role. Else it is a rendezvous encoder.
+    pushes: bool,
+}
+
+impl Enc {
+    /// A rendezvous encoder on `runtime` that takes no image and processes
+    /// no reference.
+    const fn on(runtime: u32) -> Self {
+        Self {
+            runtime,
+            vision: false,
+            references: None,
+            pushes: false,
+        }
+    }
+
+    /// The same encoder, taking images.
+    const fn seeing(self) -> Self {
+        Self {
+            vision: true,
+            ..self
+        }
+    }
+
+    /// The same encoder, pushing with its role.
+    const fn pushing(self) -> Self {
+        Self {
+            pushes: true,
+            ..self
+        }
+    }
+
+    /// The same encoder, processing media by reference: by its caller's
+    /// pipeline where `callers`, else by its own.
+    const fn processing(self, callers: bool) -> Self {
+        Self {
+            references: Some(callers),
+            ..self
+        }
+    }
+
+    /// What its host says of it beside its list.
+    fn fixed(self) -> FixedFacts {
+        FixedFacts {
+            vision: self.vision,
+            demands: DemandFacts {
+                runtime: self.runtime,
+                references: self.references.is_some(),
+                host_pipeline: self.references == Some(true),
+                ..DemandFacts::default()
+            },
+            ..FixedFacts::default()
+        }
+    }
+
+    /// What its host says of its handoff: an encoder of class 1.
+    fn facts(self) -> EncoderFacts {
+        EncoderFacts {
+            pushes: self.pushes,
+            references: self.references.is_some(),
+            ..of(1)
+        }
+    }
+}
+
+/// A fleet for a case of the demands, and what its host says of each
+/// encoder's handoff.
+type Fleet = (Host, [EncoderFacts; 2]);
+
+/// One prefill and one decode, on the two runtimes given, and two encoders
+/// as stated.
+fn fleet((prefill, decode): (u32, u32), encoders: [Enc; 2]) -> Fleet {
+    let mut host = Host::of(1, 1, 2);
+    host.says(0, |_| on(prefill));
+    host.says(1, |_| on(decode));
+    host.says(2, |place| encoders[place].fixed());
+    (host, encoders.map(Enc::facts))
+}
+
+/// What a first encode request of one item is answered over a fleet's
+/// lists: the place of its item's encoder, or the stage it is shed under
+/// for want of a worker. `image` says it holds an image, `reference` that
+/// its item is a reference, and `demands` are the hard demands it states.
+fn answered(
+    (host, said): &Fleet,
+    (image, reference): (bool, bool),
+    demands: Demands,
+) -> Result<usize, &'static str> {
+    let keys = [Identity::plain("item")];
+    let mut request = Request {
+        id: b"",
+        facts: RequestFacts {
+            model: "model-a",
+            phase: Phase::Prefill,
+            media: MediaCounts {
+                images: u16::from(image),
+                ..MediaCounts::NONE
+            },
+            ..RequestFacts::default()
+        },
+        constraints: Constraints {
+            demands,
+            ..Constraints::default()
+        },
+    };
+    let items = EncodeItems {
+        keys: &keys,
+        references: reference,
+        ..EncodeItems::default()
+    };
+    let mut placed = EncodePlaced::new();
+    let lists = host.lists((&said[..], &[1][..]));
+    let now = Instant::now();
+    let decision = lists.decide(&host.engine, None, now, &mut request, items, &mut placed);
+    let encoders = placed.encoders();
+    match gap(&decision) {
+        Some(stage) => {
+            assert!(encoders.is_empty(), "no key stays placed");
+            Err(stage)
+        }
+        None => {
+            assert!(decision.pick().is_some(), "no pick: {decision:?}");
+            Ok(encoders[0].position as usize)
+        }
+    }
+}
+
 /// An encode request that states a hard demand is held to it a list at a
 /// time, as a pair's own request is a side at a time
 /// ([`PairLists::decide`]). The request stays on runtime 7. The worker at
@@ -727,9 +867,10 @@ fn an_encode_request_that_states_a_demand_is_held_to_it_a_list_at_a_time() {
 }
 
 /// Each list is held to its part of the demand, and a list the demand
-/// leaves nobody sheds the request with no endpoint under the stage of the
-/// demand that took the list's last worker: the encoders' first, then the
-/// prefills', then the decodes'. No key stays placed.
+/// leaves nobody sheds the request with no endpoint: the encoders' first,
+/// under the encode pass's own word, then a side of the pair under the
+/// stage of the demand that took its last worker, the prefills' and then
+/// the decodes'. No key stays placed.
 ///
 /// The request carries an item. Its references are its encoders' to meet
 /// and no side's of its pair: an encoder takes the media. Its windows are
@@ -922,11 +1063,10 @@ fn a_requests_vision_is_its_encoders_to_meet_where_it_has_items() {
 
 /// A host hears the encode pass's own two words for the encoders' media,
 /// whether it states the demand or not. The encode pass tests an encoder's
-/// vision and its media from the request's own facts, and a demand for
-/// either that leaves no encoder says the pass's word
-/// ([`UnmetDemand::encoders_stage`]): `encode-vision` where no encoder takes
-/// images, `encode-media` where none processes media by reference. Every
-/// encoder of this fleet lacks the same thing, so the two judges agree.
+/// vision and its media from the request's own facts, and holds an encoder
+/// to a demand for either by the same one test: `encode-vision` where no
+/// encoder takes images, `encode-media` where none processes media by
+/// reference.
 ///
 /// The classic router has one refusal for each of the two, read from its
 /// encoders' membership
@@ -1001,118 +1141,300 @@ fn an_unmet_demand_of_the_media_says_the_encode_passs_own_word() {
     assert_eq!(word(&host, callers, true), Some("encode-media"));
 }
 
-/// Which of the pass's two words a fleet hears follows the order of the one
-/// that judged it. The first encoder here processes media by reference and
-/// takes no images, and the second takes images and processes no
-/// reference: neither takes a request of an image whose items are
-/// references. The encode pass names the images first, since an encoder
-/// would take the request but for them. The demand names the last demand
-/// a worker failed, in a host's order: the references. Both words say that
-/// no registered encoder takes the request's media.
+/// An encoder off the runtime a request stays on is no encoder of that
+/// request: the encode pass keeps the runtime in its one test of an
+/// encoder, as the rest of the request's wire. What the fleet lacks is
+/// then named in the pass's own order over the encoders, and no place of
+/// the encoder list is cut ahead of the pass.
 ///
-/// The classic router tests the images first too
-/// (`model_gateway/src/routers/grpc/common/stages/worker_selection.rs:2520-2531`,
-/// ahead of `:2538-2539`, on main 6ac213f53).
+/// The classic router holds an encoder to the request's wire in its one
+/// test of an encoder
+/// (`model_gateway/src/routers/grpc/common/stages/worker_selection.rs:2576`
+/// on main ccc411cf0) and names what its encoders lack a rung at a time
+/// (`:2587-2613`). Each state below names its rung.
 #[test]
-fn where_encoders_lack_different_things_the_word_follows_its_judges_order() {
-    let mut host = Host::of(1, 1, 2);
-    host.says(2, |place| FixedFacts {
-        vision: place == 1,
-        demands: DemandFacts {
-            references: place == 0,
-            ..DemandFacts::default()
-        },
-        ..FixedFacts::default()
-    });
-    let processes = EncoderFacts {
-        references: true,
-        ..of(1)
+fn an_encoder_off_the_requests_runtime_is_no_encoder_of_the_request() {
+    let seven = Demands {
+        runtime: 7,
+        ..Demands::default()
     };
-    let said = (&[processes, of(1)][..], &[1][..]);
-    let keys = [Identity::plain("item")];
-    let (mut placed, now) = (EncodePlaced::new(), Instant::now());
-    let mut word = |demands: Demands| {
-        let mut request = Request {
-            id: b"",
-            facts: RequestFacts {
-                model: "model-a",
-                phase: Phase::Prefill,
-                media: MediaCounts {
-                    images: 1,
-                    ..MediaCounts::NONE
-                },
-                ..RequestFacts::default()
-            },
-            constraints: Constraints {
-                demands,
-                ..Constraints::default()
-            },
-        };
-        let items = EncodeItems {
-            keys: &keys,
-            references: true,
-            ..EncodeItems::default()
-        };
-        let lists = host.lists(said);
-        let decision = lists.decide(&host.engine, None, now, &mut request, items, &mut placed);
-        assert!(placed.encoders().is_empty(), "no key is placed");
-        gap(&decision)
-    };
-    assert_eq!(word(Demands::default()), Some("encode-vision"));
+    let (image, reference, both) = ((true, false), (false, true), (true, true));
+    // Rung 2 (`:2591-2602`): the encoder on the runtime would take the
+    // request but for its image. The one that takes images is on another
+    // runtime.
+    let blind = fleet((7, 7), [Enc::on(7), Enc::on(8).seeing()]);
+    assert_eq!(answered(&blind, image, seven), Err("encode-vision"));
+    // The same rung where no encoder takes images.
+    let blind = fleet((7, 7), [Enc::on(7), Enc::on(8)]);
+    assert_eq!(answered(&blind, image, seven), Err("encode-vision"));
+    // Both on the runtime: the item goes to the one that takes images.
+    let seeing = fleet((7, 7), [Enc::on(7), Enc::on(7).seeing()]);
+    assert_eq!(answered(&seeing, image, seven), Ok(1));
+    // Rung 4 (`:2609-2610`), for an image whose item is a reference. The
+    // encoder on the runtime lacks more than vision: it processes no
+    // reference. The pushing encoder on another runtime processes them and
+    // takes no image, so it does not take the media (`:2606`).
+    let far = fleet((7, 7), [Enc::on(7), Enc::on(8).pushing().processing(false)]);
+    assert_eq!(answered(&far, both, seven), Err("encode-media"));
+    // Rung 3 (`:2603-2608`), for a reference alone: that pushing encoder
+    // takes the media, and the rung reads no wire.
+    assert_eq!(answered(&far, reference, seven), Err("ec-compatible"));
+    // Rung 4: an encoder that processes references and does not push is no
+    // pushing encoder for rung 3. The classic router's rendezvous encoder
+    // takes no reference, whatever it states (`:2580`).
+    let far = fleet((7, 7), [Enc::on(7), Enc::on(8).processing(false)]);
+    assert_eq!(answered(&far, reference, seven), Err("encode-media"));
+}
+
+/// A demand for the media is named in the pass's order, each part of it
+/// with the request's own facts: where an encoder would take the request
+/// but for its images, the images are named, whether the request states
+/// its vision and its references as demands or not.
+///
+/// The classic router lifts vision first
+/// (`model_gateway/src/routers/grpc/common/stages/worker_selection.rs:2591-2602`
+/// on main ccc411cf0), ahead of its refusal for the media (`:2609-2610`).
+/// Its test of the media asks the references, the pipeline's pin and then
+/// vision (`MediaDemands::accepts`, `:1566-1568` and `:1575-1577`).
+#[test]
+fn a_demand_for_the_media_is_named_in_the_passs_order() {
+    let both = (true, true);
+    // The first encoder pushes with its role, processes references and
+    // takes no image. The second is a rendezvous encoder that takes
+    // images: it takes no reference (`:2580`).
+    let apart = fleet(
+        (0, 0),
+        [Enc::on(0).pushing().processing(false), Enc::on(0).seeing()],
+    );
     let stated = Demands {
         vision: true,
         references: References::Any,
         ..Demands::default()
     };
-    assert_eq!(word(stated), Some("encode-media"));
+    let none = Demands::default();
+    assert_eq!(answered(&apart, both, none), Err("encode-vision"));
+    assert_eq!(answered(&apart, both, stated), Err("encode-vision"));
+    // THE PIN. Both encoders push with their role and process references:
+    // the first by its own pipeline, and it takes images, the second by
+    // its caller's, and it takes none. A request whose references are held
+    // to its caller's pipeline (the classic router's `PipelinePin::Only`,
+    // `:1586`) leaves the second alone, which would take it but for its
+    // image (`:1567`, then `:1576`).
+    let pinned = fleet(
+        (0, 0),
+        [
+            Enc::on(0).pushing().processing(false).seeing(),
+            Enc::on(0).pushing().processing(true),
+        ],
+    );
+    let callers = Demands {
+        references: References::Caller,
+        ..Demands::default()
+    };
+    assert_eq!(answered(&pinned, both, callers), Err("encode-vision"));
+    // Under no pin the first takes the request.
+    let any = Demands {
+        references: References::Any,
+        ..Demands::default()
+    };
+    assert_eq!(answered(&pinned, both, any), Ok(0));
+    // No encoder on the pin's side: the one that processes references by
+    // its own pipeline would not take the request with its image lifted
+    // either, and it does not take the media. Rung 4 (`:2609-2610`).
+    let own = fleet((0, 0), [Enc::on(0).pushing().processing(false), Enc::on(0)]);
+    assert_eq!(answered(&own, both, callers), Err("encode-media"));
 }
 
-/// A demand is judged among the places a list's host states, and ahead of
-/// the engine's pass, which reads the places that meet it as the list's
-/// own. So encoders that meet the demand and take no such request, beside
-/// one that takes it and does not meet the demand, hold the request off
-/// every encoder that takes it: it is shed under the places' name. The
-/// places are its host's, or the ones its demand leaves.
+/// Where no encoder is on the runtime a request stays on, the gap is named
+/// by the rest of the pass's order, which reads no wire: a pushing encoder
+/// that takes the media, then the media the request names, then the
+/// encoders.
 ///
-/// The classic router answers that fleet by membership: an encoder off the
-/// request's wire is no encoder of it
-/// (`model_gateway/src/routers/grpc/common/stages/worker_selection.rs:2504-2512`
-/// on main 6ac213f53), so it names the fact the wire's encoders lack
-/// (`:2516-2541`). The engine names the wire's hold, as it names a host's
-/// places.
+/// The classic router's last three rungs
+/// (`model_gateway/src/routers/grpc/common/stages/worker_selection.rs:2603-2613`
+/// on main ccc411cf0). Its rung for a pushing encoder asks whether the
+/// encoder takes the media (`:2606`, `MediaDemands::accepts`,
+/// `:1575-1577`), and reads no wire and no role.
 #[test]
-fn the_places_that_meet_a_demand_are_a_lists_places_for_the_pass() {
-    let mut host = Host::of(1, 1, 2);
-    host.images = true;
+fn no_encoder_on_the_requests_runtime_is_named_by_what_stands_registered() {
+    let seven = Demands {
+        runtime: 7,
+        ..Demands::default()
+    };
+    let (image, reference, bare) = ((true, false), (false, true), (false, false));
+    // No encoder pushes. Rung 4 (`:2609-2610`) for a request of an image,
+    // and rung 5 (`:2611-2612`) for one that names no media: it holds no
+    // image, its item is no reference, and it states no pin.
+    let plain = fleet((7, 7), [Enc::on(8).seeing(), Enc::on(8)]);
+    assert_eq!(answered(&plain, image, seven), Err("encode-media"));
+    assert_eq!(answered(&plain, bare, seven), Err("encoders"));
+    // An encoder pushes and takes images. Rung 3 (`:2603-2608`) for the
+    // image, and for the request that names no media too: under no pin
+    // every encoder takes such a request (`:1566-1568`, `:1575-1577`).
+    let pushing = fleet((7, 7), [Enc::on(8).seeing().pushing(), Enc::on(8)]);
+    assert_eq!(answered(&pushing, image, seven), Err("ec-compatible"));
+    assert_eq!(answered(&pushing, bare, seven), Err("ec-compatible"));
+    // UNDER A PIN, the request's references held to its caller's pipeline
+    // (the classic router's `PipelinePin::Only`, `:1586`), a pushing
+    // encoder answers rung 3 on the pin's side alone (`:1567`).
+    let pinned = Demands {
+        references: References::Caller,
+        ..seven
+    };
+    let callers = fleet((7, 7), [Enc::on(8).pushing().processing(true), Enc::on(8)]);
+    assert_eq!(answered(&callers, reference, pinned), Err("ec-compatible"));
+    // On the other side it takes no such media, and the request names
+    // some: rung 4 (`:1570-1572`).
+    let own = fleet((7, 7), [Enc::on(8).pushing().processing(false), Enc::on(8)]);
+    assert_eq!(answered(&own, reference, pinned), Err("encode-media"));
+}
+
+/// A side of the pair that a demand leaves nobody is said behind every
+/// answer for the encoders and ahead of the pair's own: a gap of the
+/// encoders' membership first, then encoders none of which is open, then
+/// the side's stage. No key is placed.
+///
+/// The classic router answers its encoders
+/// (`model_gateway/src/routers/grpc/common/stages/worker_selection.rs:2587-2613`
+/// on main ccc411cf0) ahead of the pairs (`:2635-2645`) and of the pair's
+/// pick (`:2655`).
+#[test]
+fn a_side_its_demand_leaves_nobody_is_said_behind_the_encoders_answers() {
+    let seven = Demands {
+        runtime: 7,
+        ..Demands::default()
+    };
+    let image = (true, false);
+    // The one prefill is on another runtime than the request's. Rung 2
+    // (`:2591-2602`): the encoders on the runtime take no image.
+    let blind = fleet((8, 7), [Enc::on(7), Enc::on(7)]);
+    assert_eq!(answered(&blind, image, seven), Err("encode-vision"));
+    // Rung 4 (`:2609-2610`): no encoder is on the runtime either.
+    let far = fleet((8, 7), [Enc::on(8).seeing(), Enc::on(8)]);
+    assert_eq!(answered(&far, image, seven), Err("encode-media"));
+    // Rung 1 (`:2589-2590`): the encoders on the runtime take the request
+    // and none is ready.
+    let down = fleet((8, 7), [Enc::on(7).seeing(), Enc::on(7).seeing()]);
+    for place in 0..2 {
+        down.0.worker(2, place).set_status(WorkerStatus::NotReady);
+    }
+    assert_eq!(answered(&down, image, seven), Err("encoders"));
+    // An encoder is open: the side's stage, the prefills' and the decodes'.
+    for pair in [(8, 7), (7, 8)] {
+        let open = fleet(pair, [Enc::on(7).seeing(), Enc::on(7)]);
+        assert_eq!(answered(&open, image, seven), Err("wires"), "{pair:?}");
+    }
+    // Both sides on the runtime: the item goes to the open encoder.
+    let whole = fleet((7, 7), [Enc::on(7).seeing(), Enc::on(7)]);
+    assert_eq!(answered(&whole, image, seven), Ok(0));
+}
+
+/// A host's places for the encoders stand beside a demand as beside none.
+/// The pass reads every encoder for what the model takes, and the places
+/// for what this request may reach. An encoder at the places that does not
+/// meet the demand, beside one outside them that meets it and takes the
+/// request, holds the request off every encoder that takes it. Where no
+/// encoder meets the demand, the gap of the membership stands whatever the
+/// places are.
+///
+/// The classic router states no places of an encoder list, so it has no
+/// line for the first state. The last is its rung 4
+/// (`model_gateway/src/routers/grpc/common/stages/worker_selection.rs:2609-2610`
+/// on main ccc411cf0).
+#[test]
+fn a_hosts_places_for_the_encoders_stand_beside_a_demand() {
+    let seven = Demands {
+        runtime: 7,
+        ..Demands::default()
+    };
+    let image = (true, false);
+    // The host holds the request to the first encoder, which takes images
+    // on another runtime. The second takes them on the request's.
+    let mut held = fleet((7, 7), [Enc::on(8).seeing(), Enc::on(7).seeing()]);
+    held.0.encoder_places = Some(vec![0]);
+    assert_eq!(answered(&held, image, seven), Err("places"));
+    // Held to the second, the item goes there.
+    held.0.encoder_places = Some(vec![1]);
+    assert_eq!(answered(&held, image, seven), Ok(1));
+    // No encoder is on the request's runtime.
+    let mut far = fleet((7, 7), [Enc::on(8), Enc::on(8).seeing()]);
+    far.0.encoder_places = Some(vec![0]);
+    assert_eq!(answered(&far, image, seven), Err("encode-media"));
+}
+
+/// A demand leaves what a host states beside each list as it stands. The
+/// encoders' mask and the decodes' are read under a demand as under none,
+/// and the decodes are judged among the places their host states. The
+/// worker at place 0 of each list reports the shorter queue, so with no
+/// veto the pair and the encoder are of that place.
+#[test]
+fn a_demand_leaves_what_a_host_states_beside_each_list_as_it_stands() {
+    let mut host = Host::of(2, 2, 2);
+    host.loads = Some(reports(0));
     host.demands = Demands {
         runtime: 7,
         ..Demands::default()
     };
+    for list in 0..3 {
+        host.says(list, |_| on(7));
+    }
+    let said = (&[of(1), of(1)][..], &[1, 1][..]);
+    let keys = [Identity::plain("item")];
+    let mut placed = EncodePlaced::new();
+    let mut at = |host: &Host| {
+        let (decision, prefill, encoders) = host.decide(said, &keys, None, &mut placed);
+        ((prefill, decode_of(&decision)), encoders)
+    };
+    assert_eq!(at(&host), ((Some(0), Some(0)), vec![0]));
+    // The first encoder is masked: the key moves alone.
+    host.encoder_vetoes = [vec![0], Vec::new()];
+    assert_eq!(at(&host), ((Some(0), Some(0)), vec![1]));
+    host.encoder_vetoes = Default::default();
+    // The first decode is masked: the decode moves alone.
+    host.vetoes = [Default::default(), [vec![0], Vec::new()]];
+    assert_eq!(at(&host), ((Some(0), Some(1)), vec![0]));
+    host.vetoes = Default::default();
+    // The host holds the request to the first decode, and the second alone
+    // is on its runtime: no decode at its places meets the demand.
+    host.says(1, |place| on(if place == 0 { 8 } else { 7 }));
+    host.places = [None, Some(vec![0])];
+    let (decision, _, encoders) = host.decide(said, &keys, None, &mut placed);
+    assert_eq!((gap(&decision), encoders.len()), (Some("wires"), 0));
+}
+
+/// A stage of the encode profile is handed the encoders' mask and their
+/// hold under a demand as under none. No stock stage of the encode side
+/// reads a hold, so a filter of the host's own build notes what it is
+/// handed.
+#[test]
+fn a_stage_of_the_encode_profile_reads_the_encoders_hold_under_a_demand() {
+    let handed = Handed::default();
+    let kept = (Arc::clone(&handed), Arc::new(Mutex::new(false)));
+    let mut catalog = StageRegistry::builtin();
+    catalog
+        .filter("reads-vetoes", move || {
+            Box::new(ReadsVetoes(Arc::clone(&kept.0), Arc::clone(&kept.1)))
+        })
+        .expect("a free filter name");
     let said = (&[of(1), of(1)][..], &[1][..]);
     let keys = [Identity::plain("item")];
     let mut placed = EncodePlaced::new();
-    for list in 0..2 {
+    let mut host = filtering("reads-vetoes", true, &catalog, 2);
+    for list in 0..3 {
         host.says(list, |_| on(7));
     }
-    // The first encoder is on the request's runtime and takes no image.
-    // The second takes images, on another runtime.
-    let encoder = |place: usize, runtimes: [u32; 2]| FixedFacts {
-        vision: place == 1,
-        ..on(runtimes[place])
+    host.encoder_vetoes = [vec![1], vec![1]];
+    let seven = Demands {
+        runtime: 7,
+        ..Demands::default()
     };
-    host.says(2, |place| encoder(place, [7, 8]));
-    let (decision, _, encoders) = host.decide(said, &keys, None, &mut placed);
-    assert_eq!((gap(&decision), encoders.len()), (Some("places"), 0));
-    // Both on the request's runtime: the item goes to the second.
-    host.says(2, |place| encoder(place, [7, 7]));
-    let (_, prefill, encoders) = host.decide(said, &keys, None, &mut placed);
-    assert_eq!((prefill, encoders), (Some(0), vec![1]));
-    // The host holds the request to the first encoder, and the second
-    // alone is on its runtime: no encoder at its places meets the demand.
-    host.says(2, |place| encoder(place, [8, 7]));
-    host.encoder_places = Some(vec![0]);
-    let (decision, _, encoders) = host.decide(said, &keys, None, &mut placed);
-    assert_eq!((gap(&decision), encoders.len()), (Some("wires"), 0));
+    for demands in [Demands::default(), seven] {
+        host.demands = demands;
+        let (_, _, encoders) = host.decide(said, &keys, None, &mut placed);
+        assert_eq!(encoders.len(), 1, "{demands:?}");
+        let read = std::mem::take(&mut *handed.lock());
+        assert_eq!(read, [(vec![1], vec![1])], "{demands:?}");
+    }
 }
 
 /// What an encode request's lists do not decide stands beside a demand as
