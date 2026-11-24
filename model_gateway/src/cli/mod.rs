@@ -536,8 +536,9 @@ struct RoutingArgs {
     eviction_interval: u64,
 
     /// Maximum total size of each model's approximation tree for cache-aware
-    /// routing (chars for HTTP, tokens for gRPC), shared across all workers;
-    /// eviction keeps every tree at or under this bound
+    /// routing, shared across all workers: for HTTP the chars of its texts
+    /// plus 1024 for each node a worker stands on, for gRPC tokens; eviction
+    /// keeps every tree at or under this bound
     #[arg(long, default_value_t = 67108864, help_heading = "Routing Policy")]
     max_tree_size: usize,
 
@@ -1322,8 +1323,9 @@ struct ServingArgs {
     /// streams to the worker verbatim — forfeiting router-level retries. A
     /// streamed request reaches the worker as the client sent it: JSON
     /// validation defers to the worker, and the provider profile's request
-    /// normalization (which the buffered path applies) is skipped. 0 never
-    /// buffers for retries
+    /// normalization (which the buffered path applies) is skipped. This also
+    /// bounds the transcription audio held for one resend after a pre-response
+    /// connection failure; 0 disables both kinds of buffering.
     #[arg(long, default_value_t = 1_048_576, help_heading = "Request Handling")]
     max_buffered_request_bytes: u64,
 

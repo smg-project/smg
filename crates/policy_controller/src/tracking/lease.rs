@@ -180,7 +180,9 @@ impl Outcome {
     /// A placement that is told an end (`Placement::ended`, with the feature
     /// `in-process`) writes the side and the served worker over: its caller
     /// leaves both as made here. A guard's caller states both
-    /// ([`Outcome::with_served`]).
+    /// ([`Outcome::with_served`]). Through a handle on a side's end
+    /// (`SideEnd::reported`) the span is written over too: the side counts
+    /// it from its own dispatch.
     ///
     /// The class has no default: a plugin is shown it and a session's
     /// frame carries it, and an end whose caller forgot it must not read

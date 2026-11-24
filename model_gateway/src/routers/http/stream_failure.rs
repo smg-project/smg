@@ -81,6 +81,11 @@ impl UpstreamCut {
             code: is_request_timeout(error).then_some(REQUEST_TIMEOUT_CODE),
         }
     }
+
+    /// The status the cut is accounted and answered under.
+    pub(crate) fn status(&self) -> StatusCode {
+        self.status
+    }
 }
 
 /// `error` and its sources, outermost first, without the request's URL: a

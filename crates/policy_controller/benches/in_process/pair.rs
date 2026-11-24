@@ -8,6 +8,13 @@
 //! side's end. A request that states the later decode has it decided again
 //! behind the prefill's dispatch (`pair_round_robin_later`).
 //!
+//! `--entry place` asks the one call a host makes for a request instead
+//! ([`PolicyEngine::place`]): the model, the two lists and a prompt of the
+//! plain request's size, with both dispatches and each side's end said of
+//! the placement. Such a request states no later decode, and its run
+//! refuses no pair. `--entry place_ruled` and `--entry place_held` state a
+//! route's rule with it (the bench's `ruled` file).
+//!
 //! Every worker has a load report, and a prefill states its rate as its
 //! measured input rate too: the one drain a prefill's record reads. Under
 //! a document that declares the signal of the `signal_cost` cells, each
@@ -25,8 +32,8 @@ use std::{cell::OnceCell, ops::Deref, sync::Arc, time::Instant};
 use smg_policy_controller::{
     document::{AppliedSpec, PolicySpec},
     engine::{
-        prefills_full, Decided, PairAdmission, PairLists, PartnerClasses, Phase, Plain,
-        PolicyEngine, PublishedList, Request, RequestMaker, WorkerLists,
+        prefills_full, Decided, PairAdmission, PairLists, PartnerClasses, Phase, PlaceRequest,
+        Plain, PolicyEngine, Prompt, PublishedList, Request, RequestMaker, WorkerLists,
     },
     store::GatewayId,
     tracking::{DecisionGuard, Outcome, Side, TransportClass},
@@ -40,7 +47,8 @@ use smg_worker::{
 use tokio::runtime::Builder;
 
 use super::{
-    measure, plain, published, reports, signals, Cell, Host, Run, Shadowed, Stated, MODEL,
+    encode, measure, place, plain, published, reports, ruled, signals, Cell, Host, Run, Shadowed,
+    Stated, MODEL,
 };
 
 /// The pair document of the preset `name` on both sides.
@@ -161,18 +169,7 @@ impl RequestMaker for StatedPair<'_> {
     }
 
     fn workers(&self) -> WorkerLists<'_> {
-        WorkerLists::Pair(PairLists {
-            prefill: self.stated.host.list.lent(),
-            decode: self.decodes.list.lent(),
-            classes: &self.decodes.classes,
-            admission: self.decodes.admission,
-            prefill_places: None,
-            decode_places: None,
-            prefill_stalled: &[],
-            prefill_held: &[],
-            decode_stalled: &[],
-            decode_held: &[],
-        })
+        self.decodes.lists(self.stated.host)
     }
 }
 
@@ -191,6 +188,46 @@ impl Deref for PairsEngine<'_> {
 }
 
 impl Decodes {
+    /// The pair's two lists as `host` hands them for one request: its own
+    /// list as the prefills, and these decodes.
+    fn lists<'a>(&'a self, host: &'a Host) -> WorkerLists<'a> {
+        WorkerLists::Pair(PairLists {
+            prefill: host.list.lent(),
+            decode: self.list.lent(),
+            classes: &self.classes,
+            admission: self.admission,
+            prefill_places: None,
+            decode_places: None,
+            prefill_stalled: &[],
+            prefill_held: &[],
+            decode_stalled: &[],
+            decode_held: &[],
+        })
+    }
+
+    /// One pair request of `host` by the one call: the model, the two
+    /// lists and a prompt of the plain request's size, with both sides'
+    /// dispatch and end said of the placement. With `rule` the request
+    /// states the run's rule of its route ([`ruled::admits`]). The call
+    /// answers workers and no place of a list, so the place this says is
+    /// the first.
+    fn called(&self, host: &Host, rule: bool) -> Option<u32> {
+        let request = PlaceRequest {
+            prompt: Prompt {
+                tokens: Some(&place::PROMPT),
+                ..Prompt::NONE
+            },
+            admits: ruled::admits(rule),
+            ..PlaceRequest::of(MODEL, self.lists(host))
+        };
+        let mut answer = host.engine.place(&request);
+        let placement = answer.as_mut().ok()?;
+        if placement.owes_events() {
+            encode::said(placement);
+        }
+        Some(0)
+    }
+
     /// One pair request of `host` by the engine's one entry: the prefill's
     /// place in its list, with both dispatches and each side's end told
     /// where the decision is leased.
@@ -336,6 +373,16 @@ pub(super) fn runs(run: &Run) -> bool {
     };
     // A pair's reports are converted a list: its two lists' counts together.
     let converted = || host.conversions() + engine.conversions(decode_side.list.lent());
+    // The one call a host makes for a request, where the run asks it.
+    if place::asked_with_lists(run, true) {
+        assert!(run.refused == Refused::No, "the one call's pair is open");
+        let rule = ruled::stated(run);
+        let publish = || feed.publish(&loads);
+        measure(run, &host, upkeep, publish, converted, |_| {
+            decode_side.called(&host, rule)
+        });
+        return true;
+    }
     measure(
         run,
         &host,

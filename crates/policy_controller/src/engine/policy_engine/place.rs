@@ -29,26 +29,30 @@
 //! can be sent to: ready ([`ready`]), and admitted by its route's own rule
 //! ([`PlaceRequest::admits`]). Where no target of a decision can be sent
 //! to, the engine decides again with the workers it could not send to
-//! excluded, three decisions a call ([`ASKS`]). Behind a single request's
-//! decision none of whose targets can be sent to, where the rule refused
-//! one that was ready, the later decisions are held to the workers of the
-//! list the rule takes ([`hold_to_rule`]), and the call makes one decision
-//! among them at least: a fourth where its third found them. The caller is
-//! answered a [`Placement`], which it keeps with the request, or the reason
-//! there is none ([`Unplaced`]).
+//! excluded, three decisions a call ([`ASKS`]). Behind a decision none of
+//! whose targets can be sent to, the later decisions of a request that
+//! states a rule are held to the workers the rule takes
+//! ([`hold_to_rule`]): those of a single request's list, where the rule
+//! refused a worker that was ready, and those of each of a pair's two,
+//! whatever kept its targets from being sent to, and where its first
+//! decision shed the request as saturated. A single request's call
+//! makes one decision among them at least: a fourth where its third found
+//! them. The caller is answered a [`Placement`], which it keeps with the
+//! request, or the reason there is none ([`Unplaced`]).
 //!
 //! A single request that names its worker, under a document whose binding
 //! says which header names it, is held to that one worker and goes to no
 //! other ([`target`]).
 //!
 //! A request with a pair's two lists is placed a target at a time over both
-//! its workers ([`pair`]), three decisions a call at most. Its later
-//! decisions are not held to the workers the rule takes.
+//! its workers ([`pair`]). Its later decisions are held to the workers the
+//! rule takes on each list, as a single request's are to those of its one.
 //!
 //! A request with an encode request's three lists is placed the same way:
 //! a decision names its pair and each item's encoder, and the request is
 //! placed where its pair's two workers and every encoder can be sent to
-//! ([`encode`]).
+//! ([`encode`]), three decisions a call at most. Where it carries items,
+//! its later decisions are not held to the workers the rule takes.
 //!
 //! A pair's decode decided again behind its prefill is placed by the same
 //! read of a worker, over the decodes that decision names
@@ -72,7 +76,10 @@ use std::{
 
 use smg_worker::identity::basic::Worker;
 
-use super::{encode::EncodeLists, Loaded, PolicyEngine};
+use super::{
+    encode::{splits, EncodeLists},
+    Loaded, PolicyEngine,
+};
 use crate::{
     document::{
         spec::{AppliedSpec, DecodePick},
@@ -282,7 +289,10 @@ pub struct PlaceRequest<'a> {
     /// encode request whose decode is held to the workers that take images
     /// ([`EncodeItems::decode_images`], or references beside an image or a
     /// video) books its decode with its prefill whatever it states here: a
-    /// decode asked again reads no image fact.
+    /// decode asked again reads no image fact. So does one with items
+    /// that demands vision or a way of processing its references
+    /// ([`Self::demands`]): its encoders meet that part of the demand, and
+    /// a decode asked again would hold the decode to it.
     pub decode_again: bool,
     /// Whether the caller counts this request on the decode its first
     /// decision named while it asks that decode again: one of that
@@ -323,31 +333,34 @@ pub struct PlaceRequest<'a> {
     /// decision: it asks the engine nothing, and where it panics the prompt
     /// is stored for no worker and the panic reaches the caller behind the
     /// decision.
-    /// Behind
-    /// a single request's decision none of whose picks can be sent to,
-    /// where it refused one that was ready, it is asked of every worker of
-    /// the list, once a call, and the call decides again among the workers
-    /// it takes ([`PolicyEngine::place`]). A pick it is asked of is ready.
-    /// A worker of the list it is asked of may not be: it answers for a
-    /// worker in any state. No request is sent to a worker it refuses when
-    /// it is asked of that worker as a pick, whatever it said of the
-    /// worker before. It is asked of no pair's list: a pair's worker it
-    /// refuses is passed over like one that is not ready. A rule that
-    /// holds for every request of a route belongs to the list its caller
-    /// hands. For a single request that names its worker
-    /// ([`PolicyEngine::place`]) it is asked ahead of the call's decision
-    /// too, of each available worker the request's number counts.
+    /// Behind a decision none of whose picks can be sent to, it is asked
+    /// of every worker of the list, once a call, and the call decides
+    /// again among the workers it takes ([`PolicyEngine::place`]): those
+    /// of a single request's list, where it refused a pick that was
+    /// ready, and those of each of a pair's two, among the places its
+    /// caller states for that side, whether it refused the picks or they
+    /// were not ready. A first call may ask the rule of any worker
+    /// of its lists, picked or not. A pick it is asked of is ready. A
+    /// worker of a list it is asked of may not be: it answers for a worker
+    /// in any state. No request is sent to a worker it refuses when it is
+    /// asked of that worker as a pick, whatever it said of the worker
+    /// before. A rule that holds for every request of a route belongs to
+    /// the list its caller hands. For a single request that names its
+    /// worker ([`PolicyEngine::place`]) it is asked ahead of the call's
+    /// decision too, of each available worker the request's number counts.
     ///
     /// Where a pair's decode is decided again on its decode side
     /// ([`PlacementSide::decode_again`](crate::tracking::PlacementSide::decode_again)),
-    /// the rule is asked under the lock the pair's two sides share. It
-    /// must leave both sides alone: the send or the drop of one, from
-    /// inside the rule, waits on that lock and never returns. That
-    /// decision asks the request's headers, its ring and its lists'
-    /// admission under the same lock, and each is held to the same.
+    /// the rule is asked of that decision's picks and of no other worker,
+    /// under the lock the pair's two sides share. It must leave both sides
+    /// alone: the send or the drop of one, from inside the rule, waits on
+    /// that lock and never returns. That decision asks the request's
+    /// headers, its ring and its lists' admission under the same lock, and
+    /// each is held to the same.
     ///
     /// For an encode request the rule is its pair's: it is asked of the
-    /// pair's two workers and of no encoder.
+    /// pair's two workers and of no encoder, and of no list where the
+    /// request carries items.
     pub admits: Option<WorkerRule<'a>>,
 }
 
@@ -411,9 +424,15 @@ pub(super) struct Made<'r, 'a> {
     /// The targets earlier decisions of this call named that could not be
     /// sent to.
     missed: &'r [WorkerId],
-    /// The places of the list the decision is held to: the workers the
-    /// route's rule takes, for an ask behind the decision that had the
-    /// rule asked of the list ([`Call::admitted`]). `None`: every place.
+    /// The lists the decision is lent ([`RequestMaker::workers`]): the
+    /// request's own. A pair's ask behind the decision that had the rule
+    /// asked of its two lists is lent the same lists with each side's
+    /// places beside it ([`pair`]).
+    lists: &'r WorkerLists<'r>,
+    /// The places of a single request's list the decision is held to: the
+    /// workers the route's rule takes, for an ask behind the decision that
+    /// had the rule asked of the list ([`Call::admitted`]). `None`: every
+    /// place, and for a pair, whose places stand beside its lent lists.
     places: Option<&'r [u32]>,
     /// The time left for the decision, in microseconds: the request's own
     /// budget, or what its call has left of it ([`Call::left`]).
@@ -538,6 +557,7 @@ impl<'r, 'a> Made<'r, 'a> {
             engine,
             request,
             missed,
+            lists: &request.lists,
             places: None,
             budget_micros: request.budget_micros,
             hashes: OnceCell::new(),
@@ -835,13 +855,16 @@ impl RequestMaker for Made<'_, '_> {
         // the plain test reads it. An encode request whose decode is held
         // to the ones that take images, by its demand or by the preference
         // of references beside pixels, states none either: a decode asked
-        // again reads no image fact. The hold is read last, so a request
-        // that asks no decode again reads none of it.
+        // again reads no image fact. Nor does one that leaves a part of
+        // its hard demand to its encoders: a decode asked again takes no
+        // items and would hold the decode to the whole. Both are read
+        // last, so a request that asks no decode again reads neither.
         let later = request.asks_decode_again()
             && spec.decode_pick() == DecodePick::AfterPrefill
-            && !request
-                .encode
-                .is_some_and(|items| items.holds_decode_to_images(request.media.holds_pixels()));
+            && !request.encode.is_some_and(|items| {
+                items.holds_decode_to_images(request.media.holds_pixels())
+                    || splits(&items, request.demands)
+            });
         Request {
             id: request.request_id.map_or(&[], str::as_bytes),
             facts,
@@ -888,8 +911,10 @@ impl RequestMaker for Made<'_, '_> {
         prompt_bytes_of(prompt.tokens, prompt.text)
     }
 
+    // The lists the ask is lent: the request's own, but for a pair's ask
+    // that is held to its route's rule ([`pair`]).
     fn workers(&self) -> WorkerLists<'_> {
-        self.request.lists
+        *self.lists
     }
 
     // The caller's own naming, handed on: nothing else reads the field.
@@ -1030,19 +1055,19 @@ pub enum Unplaced {
     /// circuit breaker and admitted by its route's rule. A caller answers
     /// that it has no worker for the request.
     ///
-    /// For a single request, a rule that answers each worker one way
-    /// within a call is not the cause: a request whose rule takes no
-    /// worker of its list is shed under the rule's name (`admits`), and
-    /// one whose rule takes some is decided among them. Under a profile
-    /// that filters by health a list with no ready worker is shed by that
-    /// filter. So this answer is left for a worker that stopped being
-    /// ready between a decision's read of it and the send, for a profile
-    /// that lists no such filter, and for a rule that refused as a pick a
-    /// worker it took when it was asked of the list.
+    /// For a single request and for a pair, a rule that answers each
+    /// worker one way within a call is not the cause: a request whose rule
+    /// takes no worker of a list is shed under the rule's name (`admits`),
+    /// and one whose rule takes some is decided among them. Under a
+    /// profile that filters by health a list with no ready worker is shed
+    /// by that filter. So this answer is left for a worker that stopped
+    /// being ready between a decision's read of it and the send, for a
+    /// profile that lists no such filter, and for a rule that refused as a
+    /// pick a worker it took when it was asked of the list.
     ///
-    /// For a pair, the answer does not say whether the rule refused the
-    /// picks or they were not ready: a caller that answers the two apart
-    /// reads its lists itself.
+    /// For an encode request that carries items, the answer does not say
+    /// whether the rule refused the picks or they were not ready: a caller
+    /// that answers the two apart reads its lists itself.
     ///
     /// An encode request has no worker also where each decision of its
     /// call named an encoder that could not be sent to.
@@ -1219,16 +1244,24 @@ pub(super) fn give_up(
     }
 }
 
-/// Holds the later asks of `call` to the workers of the list its route's
-/// rule takes. The rule is asked of every worker of `list`, ready or
-/// not, in the list's order, and the places it takes are kept, ascending,
-/// each once ([`Call::admitted`]). It is asked of the list once a call:
-/// behind the first decision none of whose targets can be sent to, where
-/// it refused one that was ready, and while the call holds no decision. A
-/// rule that panics here leaves no lease behind. Out of line: a request
-/// whose picks the rule admits runs none of it. A single request's ask
-/// alone comes here: a pair's later decisions are made over its two lists
-/// whole.
+/// Holds the later asks of a call to the workers of `list` its route's
+/// rule takes: a single request's one list, or one of a pair's two, a
+/// list at a time. The rule is asked of every worker of `list`, ready or
+/// not, in the list's order, among the places its caller states for the
+/// list (`stated`, and every place for `None`). The places it takes are
+/// kept in `held`, ascending, each once: a single request's in its call
+/// ([`Call::admitted`]), and each of a pair's two beside the asks that
+/// are lent them ([`pair`]). It is asked of a list once a call, while the
+/// call holds no decision: behind a single request's first decision none
+/// of whose targets can be sent to where it refused a worker that was
+/// ready, and behind a pair's first decision no target of which holds,
+/// whether it refused a side or the side was not ready, or that sheds
+/// the request as saturated. A request that states no rule keeps no
+/// places: its later asks are made over its lists whole. A rule that
+/// panics here leaves no lease behind. Out of line: a
+/// request whose first decision takes a target runs none of it. An encode
+/// request that carries items comes here for no list: this call hands
+/// its decision no places of the rule's.
 ///
 /// A worker that is not ready is asked too. A rule that takes no worker
 /// is so told from a rule whose workers are not ready: the first is the
@@ -1237,8 +1270,10 @@ pub(super) fn give_up(
 ///
 /// The ask that finds the rule's workers is followed by one decision
 /// among them at least. Where it is the call's last ([`ASKS`]), the call
-/// is given one more: no ask behind that one finds them again, so a call
-/// makes four decisions at most.
+/// is given one more (`spent`, the call's own): no ask behind that one
+/// finds them again, so a call makes four decisions at most. A pair's
+/// are found behind its call's first ask that takes no target, so a
+/// pair's call makes three.
 ///
 /// # Errors
 ///
@@ -1250,16 +1285,28 @@ pub(super) fn give_up(
 fn hold_to_rule(
     request: &PlaceRequest<'_>,
     list: Option<LentList<'_>>,
-    call: &mut Call,
+    stated: Option<&[u32]>,
+    held: &mut Option<Vec<u32>>,
+    spent: &mut usize,
 ) -> Result<(), Unplaced> {
-    if call.admitted.is_some() {
+    if held.is_some() || request.admits.is_none() {
         return Ok(());
     }
     let workers = list.map_or(&[][..], |list| &list.workers[..]);
-    let places: Vec<u32> = (0..)
-        .zip(workers)
-        .filter_map(|(place, worker)| admitted(request, worker.as_ref()).then_some(place))
-        .collect();
+    let takes = |worker: &Arc<dyn Worker>| admitted(request, worker.as_ref());
+    let places: Vec<u32> = match stated {
+        None => (0..)
+            .zip(workers)
+            .filter_map(|(place, worker)| takes(worker).then_some(place))
+            .collect(),
+        // A place past the list's end names no worker: the caller's
+        // places may be those of an older list.
+        Some(stated) => stated
+            .iter()
+            .copied()
+            .filter(|&place| workers.get(place as usize).is_some_and(takes))
+            .collect(),
+    };
     if places.is_empty() {
         return Err(Unplaced::Shed {
             reason: ShedReason::NoEndpoints,
@@ -1267,9 +1314,9 @@ fn hold_to_rule(
             retry_after_secs: 1,
         });
     }
-    call.admitted = Some(places);
+    *held = Some(places);
     // One ask is left behind this one, whichever of the call's it is.
-    call.spent = call.spent.min(ASKS - 2);
+    *spent = (*spent).min(ASKS - 2);
     Ok(())
 }
 
@@ -1302,7 +1349,8 @@ pub(super) struct Call {
     /// that decision, and for a request with no rule. For a request that
     /// names its worker they are that worker's one place, from ahead of
     /// the call's first ask ([`target`]), and the rule is not asked of
-    /// the list again.
+    /// the list again. A single request's alone: the places of a pair's
+    /// two lists stand beside its later asks ([`pair`]).
     admitted: Option<Vec<u32>>,
     /// Whether the call's requests are made with no routing value and no
     /// client's value: a request that names its worker over a list none of
@@ -1450,7 +1498,7 @@ fn single<'a>(
                 call.missed.push(id);
                 // The pick read the worker ready, and a place holds no
                 // decision: the rule is asked of the list at once.
-                hold_to_rule(request, list, call)?;
+                hold_to_rule(request, list, None, &mut call.admitted, &mut call.spent)?;
                 return call.again(|call| single(engine, request, list, call));
             }
             let mut placement = Placement::alone(Arc::clone(worker), engine.label_at(pick.profile));
@@ -1497,7 +1545,7 @@ fn single<'a>(
                     // The walk gave the decision up: the rule is asked of
                     // the list while the call holds none.
                     if refused.get() {
-                        hold_to_rule(request, list, call)?;
+                        hold_to_rule(request, list, None, &mut call.admitted, &mut call.spent)?;
                     }
                     call.again(|call| single(engine, request, list, call))
                 }
@@ -1535,20 +1583,30 @@ impl PolicyEngine {
     /// A worker the rule refuses is left out like one that is not ready.
     /// The rule is asked of a decision's picks first: a request whose
     /// first pick it admits pays one call of it, inside the decision where
-    /// that stores the prompt for a worker. Behind the first decision
-    /// none of whose picks can be sent to, where the rule refused one that
-    /// was ready, the decision is given up and the rule is asked of every
-    /// worker of the list, ready or not, once a call. The call's later
-    /// decisions are held to the places of the workers it takes
-    /// ([`Constraints::places`]): the one such worker of a long list is
+    /// that stores the prompt for a worker. Behind a decision none of
+    /// whose picks can be sent to, it is given up and the rule is asked of
+    /// every worker of the list, ready or not, once a call: of a single
+    /// request's list, behind the first such decision in which the rule
+    /// refused a pick that was ready, and of each of a pair's two, among
+    /// the places its caller states for that side, behind the first such
+    /// decision, whether the rule refused its picks or they were not
+    /// ready. The call's later decisions are held
+    /// to the places of the workers it takes ([`Constraints::places`], and
+    /// a pair's a side each,
+    /// [`PairLists::prefill_places`](crate::engine::PairLists::prefill_places)
+    /// and [`PairLists::decode_places`](crate::engine::PairLists::decode_places)):
+    /// the one such worker of a long list is
     /// found, one over its overload thresholds is answered by the
     /// binding's rule for a list wholly over them, and one an earlier
-    /// attempt tried is handed again where no other is left. The call
-    /// makes one decision among them at least, a fourth where its third
-    /// found them. A request whose rule takes no worker of the list is
-    /// shed with no endpoint, under `admits`. One whose rule takes workers
-    /// none of which is ready is answered by the decision held to them,
-    /// which names the filter that left nobody.
+    /// attempt tried is handed again where no other is left. A single
+    /// request's call makes one decision among them at least, a fourth
+    /// where its third found them, and a pair's makes three decisions.
+    /// A request whose rule takes no worker of a list is shed
+    /// with no endpoint, under `admits`. One whose rule takes workers none
+    /// of which is ready, or workers of a pair's two lists no two of which
+    /// pair, is answered by the decision held to them, which names what
+    /// left nobody. An encode request that carries items is held to no
+    /// such places: its decisions are made over its three lists whole.
     ///
     /// A decision that is given up has written what its stages write as
     /// they decide, and its release takes none of that back: the tokens a
@@ -1574,13 +1632,11 @@ impl PolicyEngine {
     /// prefill as its worker and the decode beside it. Where no target
     /// holds, the sides that could not be sent to are excluded, each by
     /// its own id, and a side that held stays a candidate of the next
-    /// decision: three decisions a call at most, each given the request's
-    /// whole budget. The rule is asked of a pair's picks and never of its
-    /// lists, so a pair can be answered no worker while its lists hold
-    /// workers the rule takes: where three decisions' picks are all
-    /// refused, where such a worker is overloaded and a worker the rule
-    /// refuses is not, and where an earlier attempt of the request tried
-    /// it.
+    /// decision, each given the request's whole budget. Behind the first
+    /// decision no target of which holds, or that sheds the request as
+    /// saturated, the later decisions of a pair that states a rule are
+    /// held to the workers the rule takes on each of its two lists, as a
+    /// single request's are to those of its one: three decisions a call.
     /// Which workers pair is the caller's word, in the classes its lists
     /// carry: no pair is tested here again. Prefills with an open partner
     /// that are all at the caller's limit answer
@@ -1594,11 +1650,16 @@ impl PolicyEngine {
     /// ([`Placement::encoders`]). An item has one encoder: where it cannot
     /// be sent to, the decision is given up and the engine decides again
     /// with that encoder excluded, and with each side of the pair that
-    /// could not be sent to either. Its call is a pair's in what follows a
-    /// decision given up: three decisions at most, each given the
-    /// request's whole budget, and the rule asked of no list. An encoder
-    /// is read by its state alone: the route's rule is asked of the pair's
-    /// two workers. With no item the three lists are placed as their pair.
+    /// could not be sent to either. Behind a decision given up its call
+    /// makes three decisions at most, each given the request's whole
+    /// budget, and the rule is asked of no list. So such a request can be
+    /// answered no worker while its pair's lists hold workers the rule
+    /// takes: where three decisions' picks are all refused, where such a
+    /// worker is overloaded and a worker the rule refuses is not, and
+    /// where an earlier attempt of the request tried it. An encoder is
+    /// read by its state alone: the route's rule is asked of the pair's
+    /// two workers. With no item the three lists are placed as their
+    /// pair, and held to the rule's workers as a pair is.
     ///
     /// A single request may name its worker. Under a document whose
     /// binding names a target source
@@ -1627,10 +1688,10 @@ impl PolicyEngine {
     ///
     /// Declined by name ([`ShedReason::PolicyDeclined`]): a request that
     /// carries encode items over other lists than an encode request's
-    /// three (`encode-items`). A pair that states a demand is shed with no
-    /// worker for it ([`ShedReason::NoEndpoints`], under `wires`) where
-    /// each of its lists holds a worker: a pair's decision narrows neither
-    /// list by a demand.
+    /// three (`encode-items`). A request that states a demand is held to
+    /// the workers of each list that meet it ([`PlaceRequest::demands`]):
+    /// a list the demand leaves nobody sheds it with no endpoint
+    /// ([`ShedReason::NoEndpoints`]), under that demand's stage.
     ///
     /// Its caller counts each request it sends under the placement's
     /// routing value on the request's worker, as that worker's load guard

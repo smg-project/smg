@@ -53,23 +53,19 @@ pub enum BatchOutcome {
     Gap { expected: u64, received: u64 },
 }
 
-/// Why a rank's cursor was reset or its blocks replaced. The first six are
-/// the servicer's own stream status codes, forwarded by a relay as frames so
-/// the store tells a relay restart from an engine restart; the next two the
-/// cursor's own findings; the last the collector's word at a snapshot's
-/// start.
+/// Why a rank's cursor was reset or its blocks replaced. The first two are
+/// the server's own status codes; the third the collector's word for a
+/// snapshot its stream did not finish; the next two the cursor's own
+/// findings; the last the collector's word at a snapshot's start.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResyncReason {
     /// The server's history no longer reaches the cursor.
     OutOfRange,
     /// The server lost batches it cannot name.
     DataLoss,
-    StreamEnded,
     /// The stream ended with a snapshot still arriving: a partial live set,
     /// kept until the next snapshot's start.
     SnapshotAbandoned,
-    RelayRestart,
-    EngineReplaced,
     /// A sequence far below the cursor, or a clear below it: the publisher
     /// started over and its cache is empty.
     PublisherRestart,
@@ -87,10 +83,7 @@ impl ResyncReason {
         match self {
             Self::OutOfRange => "out_of_range",
             Self::DataLoss => "data_loss",
-            Self::StreamEnded => "stream_ended",
             Self::SnapshotAbandoned => "snapshot_abandoned",
-            Self::RelayRestart => "relay_restart",
-            Self::EngineReplaced => "engine_replaced",
             Self::PublisherRestart => "publisher_restart",
             Self::GapCleared => "gap_cleared",
             Self::Snapshot => "snapshot",
@@ -133,28 +126,12 @@ pub struct KvCursor {
 /// included. A snapshot's start is a resync for [`ResyncReason::Snapshot`]
 /// before its first block, and a chunk only adds.
 pub trait KvEventSink: Send + Sync {
-    /// The batch message as the host's wire crate defines it; the store
-    /// applies its events to the index and reads nothing else of it.
-    type Batch: ?Sized;
-
-    /// Run one batch of `rank` through its cursor and, when admitted, apply
-    /// it to the worker's blocks. `facts` are the batch's header as the
-    /// cursor reads it. A load-only batch carries no events and is not
-    /// admitted: its record goes to the load sink.
-    fn admit(
-        &self,
-        id: WorkerId,
-        rank: u16,
-        facts: BatchFacts,
-        batch: &Self::Batch,
-    ) -> BatchOutcome;
-
-    /// Run one batch of `rank` through its cursor as [`Self::admit`] does
-    /// and, where the cursor admits it, lend the row's lane to `body`: once,
-    /// inside the lane's turn, behind whatever emptying the cursor asked. A
-    /// batch the cursor skips or answers with a gap runs no body. The body
-    /// is the host's own apply rules over the lane's writer: it writes what
-    /// the batch's events leave. The writer's writes are this crate's own
+    /// Run one batch of `rank` through its cursor and, where the cursor
+    /// admits it, lend the row's lane to `body`: once, inside the lane's
+    /// turn, behind whatever emptying the cursor asked. A batch the cursor
+    /// skips or answers with a gap runs no body. The body is the host's own
+    /// apply rules over the lane's writer: it writes what the batch's
+    /// events leave. The writer's writes are this crate's own
     /// ([`LaneWriter`]): the crate's worker host is the body that writes.
     ///
     /// The cursor reads `facts` alone, since it holds no batch to look

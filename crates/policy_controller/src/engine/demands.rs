@@ -166,6 +166,37 @@ impl Demands {
         }
     }
 
+    /// What an encoder is held to where a pair takes the request beside
+    /// it: these demands less both windows and the way the constraint was
+    /// decided. Such an encoder runs neither the input nor the completion:
+    /// it takes the request's media, and the pair's two workers hold the
+    /// rest ([`Self::beside_encoders`]). An encode request that stands
+    /// alone has no pair beside it, and its one list is held as its role
+    /// is ([`Self::held_by`]).
+    #[must_use]
+    pub const fn beside_pair(self) -> Self {
+        Self {
+            input_window: 0,
+            output_window: 0,
+            decoding: 0,
+            ..self
+        }
+    }
+
+    /// What a side of a pair is held to where an encoder takes the
+    /// request's media: these demands less the media's. Whether the request
+    /// needs vision and where its references may be processed are the
+    /// encoders' to meet ([`Self::beside_pair`]): the pair's two workers
+    /// take what the encoders hand on.
+    #[must_use]
+    pub const fn beside_encoders(self) -> Self {
+        Self {
+            vision: false,
+            references: References::None,
+            ..self
+        }
+    }
+
     /// Whether a worker meets every demand ([`Self::unmet_by`]).
     #[must_use]
     pub const fn met_by(self, vision: bool, facts: DemandFacts) -> bool {
@@ -266,6 +297,24 @@ impl UnmetDemand {
             Self::Pipeline => PIPELINE,
             Self::Window => CONTEXT_WINDOW,
             Self::Decoding => DECODING,
+        }
+    }
+
+    /// The stage an encode request is shed under where this demand left
+    /// its encoders nobody. The encode pass tests an encoder's vision and
+    /// its media from the request's own facts, under two words of its own.
+    /// A stated demand that leaves no encoder says one of the two as well.
+    /// Which of them a fleet hears follows the order of the one that
+    /// judged it: where its encoders lack different things, the pass names
+    /// the images first and the demand the last it judged. A runtime keeps
+    /// its own stage, for which the pass has no word, and so does what no
+    /// encoder beside a pair is held to ([`Demands::beside_pair`]).
+    #[must_use]
+    pub const fn encoders_stage(self) -> &'static str {
+        match self {
+            Self::Vision => framework::ENCODE_VISION,
+            Self::References | Self::Pipeline => framework::ENCODE_MEDIA,
+            Self::Runtime | Self::Window | Self::Decoding => self.stage(),
         }
     }
 }
@@ -546,6 +595,53 @@ mod tests {
         assert!(budget.held_by(Role::Prefill).is_none());
     }
 
+    /// Where an encoder takes a request's media beside a pair, the demand
+    /// is split between them. The encoder is held to neither window and to
+    /// no way of deciding a constraint: it is held to the runtime and to
+    /// the media's demands. A side of the pair is held to no demand of the
+    /// media, and to every other as it was stated. An encode request that
+    /// stands alone has no pair beside it: its role is held to all of it.
+    #[test]
+    fn an_encoder_and_a_pair_beside_it_split_a_requests_demand() {
+        let asked = Demands {
+            runtime: 7,
+            vision: true,
+            references: References::Worker,
+            input_window: 40,
+            output_window: 400,
+            decoding: 5,
+        };
+        let the_media = Demands {
+            input_window: 0,
+            output_window: 0,
+            decoding: 0,
+            ..asked
+        };
+        assert_eq!(asked.beside_pair(), the_media);
+        let the_rest = Demands {
+            vision: false,
+            references: References::None,
+            ..asked
+        };
+        assert_eq!(asked.beside_encoders(), the_rest);
+        assert_eq!(asked.held_by(Role::Encode), asked);
+        let media = Demands {
+            vision: true,
+            references: References::Any,
+            ..Demands::default()
+        };
+        assert!(media.beside_encoders().is_none());
+        assert_eq!(media.beside_pair(), media);
+        let bounds = Demands {
+            input_window: 40,
+            output_window: 400,
+            decoding: 5,
+            ..Demands::default()
+        };
+        assert!(bounds.beside_pair().is_none());
+        assert_eq!(bounds.beside_encoders(), bounds);
+    }
+
     /// The demands stand in the order a host answers for them, and each has
     /// the stage its pool is shed under.
     #[test]
@@ -566,6 +662,19 @@ mod tests {
                 "vision",
                 "references",
                 "pipeline",
+                "context-window",
+                "decoding"
+            ]
+        );
+        // An encode request's encoders say the encode pass's own word for
+        // the two facts the pass tests itself.
+        assert_eq!(
+            order.map(UnmetDemand::encoders_stage),
+            [
+                "wires",
+                "encode-vision",
+                "encode-media",
+                "encode-media",
                 "context-window",
                 "decoding"
             ]

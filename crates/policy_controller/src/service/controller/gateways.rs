@@ -598,7 +598,9 @@ impl Gateways {
     /// The sweep's task: a pass every tenth of the grace period until
     /// `stop`, on no stream's path. The leases' due ends ride it too
     /// ([`LeasesStore::expire`]): a file of leases whose decider waits for
-    /// a job issues nothing, so nothing else would end its due leases.
+    /// a job issues nothing, so nothing else would end its due leases. So
+    /// does the upkeep of the engine that decides under the store's
+    /// standing document: that engine runs no task of its own.
     pub(crate) async fn run(&self, mut stop: watch::Receiver<bool>) {
         let mut tick = tokio::time::interval((self.grace / 10).max(Duration::from_millis(1)));
         tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -614,6 +616,13 @@ impl Gateways {
                     // a file whose decider waits for a job: one at work
                     // ends its own file's at its issues.
                     drop(LeasesStore::expire(&*self.store, now));
+                    // So does the upkeep of the standing document's engine,
+                    // which that engine's own task runs in a gateway's
+                    // process: a session key past its end leaves its
+                    // table, and so does the record of sent prefixes of a
+                    // model no worker is left in. A replica runs it
+                    // whether it leads or not.
+                    self.store.deciding(|world| world.applied().sweep(now));
                 }
                 _ = stop.wait_for(|stop| *stop) => break,
             }
@@ -906,9 +915,9 @@ pub(crate) mod tests {
         over_kinds, DropPause, Gateways, Refused, SessionPlace, Vetoed, KINDS_MAX, VETOES_MAX,
     };
     use crate::{
-        document::spec::{AppliedSpec, PolicySpec},
+        document::spec::{AppliedSpec, Assignment, PolicySpec, Recovery, RulePlaced},
         engine::{
-            sticky_sessions::SessionVerdict,
+            sticky_sessions::{SessionRule, SessionVerdict},
             view::{Role, Session, WorkerId},
         },
         service::{
@@ -1580,7 +1589,11 @@ pub(crate) mod tests {
 
     /// The names that left ride the sweeps' task: one that stays away past
     /// the absence's time takes its session pins with it by the task's own
-    /// tick, which no other caller of the store's tick stands in for.
+    /// tick, and no sooner, which no other caller of the store's tick
+    /// stands in for. The engine's upkeep rides the same tick and takes
+    /// this key out by nothing of its own. The key is read behind the
+    /// leave, so the engine's table filed no absence, and under a rule that
+    /// never ends it.
     #[tokio::test]
     async fn the_sweeps_task_ends_the_absence_of_a_key_that_stays_away() {
         let (_elector, store, gateways, _t0) = leading(Duration::from_millis(60));
@@ -1600,24 +1613,37 @@ pub(crate) mod tests {
             let table = world.spec().engine().sessions();
             table.pins(key).map(|pins| pins[0])
         };
-        let world = store.snapshot();
-        let table = world.spec().engine().sessions();
-        table.dispatched(key, SessionVerdict::Pinned, w);
+        let left = Instant::now();
         let revision = WorkersStore::get(&*store, w).expect("the row").revision;
         WorkersStore::remove(&*store, w, revision).expect("removed");
+        let never = SessionRule {
+            assignment: Assignment::default(),
+            inflight_cap: 0,
+            ttl_micros: None,
+            sweep_micros: 0,
+            recovery: Recovery::default(),
+            rule_placed: RulePlaced::default(),
+        };
+        let world = store.snapshot();
+        let table = world.spec().engine().sessions();
+        table.lookup(key, store.micros(left), &never);
+        table.dispatched(key, SessionVerdict::Pinned, w);
         assert_eq!(held(), Some(w), "inside its time");
         let (stop, stopped) = watch::channel(false);
         let mut task = JoinSet::new();
         let sweeper = Arc::clone(&gateways);
         task.spawn(async move { sweeper.run(stopped).await });
-        let started = Instant::now();
         while held().is_some() {
             assert!(
-                started.elapsed() < Duration::from_secs(20),
+                left.elapsed() < Duration::from_secs(20),
                 "the task ended no absence in 20 s"
             );
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
+        assert!(
+            left.elapsed() >= Duration::from_secs(1),
+            "the pin left inside the absence's time"
+        );
         stop.send_replace(true);
         timeout(Duration::from_secs(20), task.join_next())
             .await
@@ -1701,7 +1727,7 @@ pub(crate) mod tests {
         // asks for one.
         store.publish_now();
         let world = store.snapshot();
-        assert!(world.first_row_of(worker).is_some(), "the worker's row");
+        assert!(world.booked_of(worker).is_some(), "the worker is published");
         let vetoes = world.gateway_vetoes("m", Role::Single, gateway);
         let veto = vetoes.standing_at(now).find(|veto| veto.id == worker);
         veto.map_or((false, false), |veto| (veto.held, true))

@@ -213,6 +213,15 @@ impl DecodeAhead {
 type DecodeAsk<'a> =
     dyn Fn(&Placed, WorkerLoadGuard) -> (Option<Placed>, WorkerLoadGuard) + Sync + 'a;
 
+/// Whether the attempt of a pair sent prefill first hands its dispatch the
+/// ask for `decode` ([`DecodeAsk`]): the decode is owed it behind its
+/// prefill's answer ([`DecodeAhead::owed_behind_prefill`]), and the pair's
+/// connector is not MoRI-IO, whose prefill was told of its decode. A decode
+/// the classic policies picked is owed none: its attempt builds no ask.
+fn asks_decode_again(mode: &KvConnectorMode, decode: &DecodeAhead) -> bool {
+    *mode != KvConnectorMode::MoriIo && decode.owed_behind_prefill()
+}
+
 /// What every dispatch body sets up before its first side goes out: the two
 /// serialized sides and the two load guards taken apart (the decode's still
 /// ahead of its send), the request headers as every side is sent them (the
@@ -1189,34 +1198,41 @@ impl PDRouter {
             // decode takes the transfer its prefill was told of, and this
             // prefill was told of none. So the ask is held to a decode that
             // is no such engine, beside the retry's rule.
-            let keeps_the_shape = |worker: &dyn Worker| {
-                !is_moriio_worker(worker) && candidate_filter.is_none_or(|accepts| accepts(worker))
-            };
+            //
+            // The ask and its rule are built where the decode is asked again
+            // and nowhere else ([`asks_decode_again`]): the attempt of a
+            // pair the classic policies picked makes that test, builds
+            // neither and hands its dispatch no ask.
             let moved_to = parking_lot::Mutex::new(None);
-            let ask = |first: &Placed, ahead: WorkerLoadGuard| {
-                let inputs = PlacementInputs {
-                    text: text.as_deref(),
-                    tokens: tokens.as_deref(),
-                    headers,
-                    rid_key: rid_key.as_deref(),
-                    // The derived key again, as the selection stated it.
-                    rid: rid_key.as_deref(),
-                    cache_namespace,
-                    candidate_filter: Some(&keeps_the_shape),
-                    tried: &tried_before,
+            let (keeps_the_shape, ask);
+            let again: Option<&DecodeAsk<'_>> = if asks_decode_again(&mode, &guards.decode) {
+                keeps_the_shape = |worker: &dyn Worker| {
+                    !is_moriio_worker(worker)
+                        && candidate_filter.is_none_or(|accepts| accepts(worker))
                 };
-                let pairs = || self.pd_pairs(model_id);
-                let (moved, guard) = self.decode_again(model_id, &pairs, inputs, first, ahead);
-                if let Some(moved) = &moved {
-                    *moved_to.lock() = Some(Arc::clone(moved.worker()));
-                }
-                (moved, guard)
+                ask = |first: &Placed, ahead: WorkerLoadGuard| {
+                    let inputs = PlacementInputs {
+                        text: text.as_deref(),
+                        tokens: tokens.as_deref(),
+                        headers,
+                        rid_key: rid_key.as_deref(),
+                        // The derived key again, as the selection stated it.
+                        rid: rid_key.as_deref(),
+                        cache_namespace,
+                        candidate_filter: Some(&keeps_the_shape),
+                        tried: &tried_before,
+                    };
+                    let pairs = || self.pd_pairs(model_id);
+                    let (moved, guard) = self.decode_again(model_id, &pairs, inputs, first, ahead);
+                    if let Some(moved) = &moved {
+                        *moved_to.lock() = Some(Arc::clone(moved.worker()));
+                    }
+                    (moved, guard)
+                };
+                Some(&ask)
+            } else {
+                None
             };
-            let ask: &DecodeAsk<'_> = &ask;
-            // A decode the classic policies picked is owed no ask either:
-            // its answer's one test is all that pair pays behind its prefill.
-            let again = (mode != KvConnectorMode::MoriIo && guards.decode.owed_behind_prefill())
-                .then_some(ask);
 
             // Outcome accounting happens per-side inside the sequential path:
             // a prefill-only failure must not feed the decode worker's
@@ -2634,19 +2650,27 @@ impl PDRouter {
         sticky_key: Option<&str>,
         stated: impl Fn() -> placement::Stated + Send + Sync,
     ) -> Result<(PdPair, PdLoadGuards), Box<PdSelectionFailure>> {
-        let ((prefill, decode), prefill_guard) = acquire_prefill(
+        let ((prefill, decode), prefill_ahead) = acquire_prefill(
             self.prefill_admission.as_deref(),
             sticky_key,
             |(prefill, _): &(Placed, Placed)| prefill,
             |capacity| self.select_pd_pair(model_id, inputs, capacity, &stated),
+            // The prefill's worker goes on behind its load, and what its
+            // answer owes its send goes with that load.
+            |(prefill, decode)| {
+                let (prefill, unsent) = prefill.unsent();
+                ((prefill, decode), unsent)
+            },
         )
         .await
         .map_err(|error| Box::new(PdSelectionFailure::from(error)))?;
-        // The prefill's side went into its guard. The decode's guard is made
+        // The prefill's send is said here, where this route said it before
+        // the load was held ahead of the send: every shape of this route
+        // still takes its prefill's load as sent. The decode's guard is made
         // ahead of its send, and its side stays with its answer until then.
-        let pair = (prefill.into_guarded_worker(), Arc::clone(decode.worker()));
+        let pair = (prefill, Arc::clone(decode.worker()));
         let guards = PdLoadGuards {
-            prefill: prefill_guard,
+            prefill: prefill_ahead.sent(),
             decode: DecodeAhead::new(decode, sticky_key),
         };
         Ok((pair, guards))
@@ -2805,6 +2829,9 @@ impl PDRouter {
                 upstream_sse,
                 source,
                 guard: decode_guard,
+                // The pair routes tell the policy engine no end yet, so
+                // the relay is handed no handle and says nothing.
+                end: placement::RequestEnd::default(),
                 headers: response_headers,
                 mode: ChunkMode::Hook(hook),
             },
@@ -9454,6 +9481,41 @@ mod tests {
     async fn the_engine_hears_both_sides_of_a_pair_written_concurrently() {
         assert_eq!(
             heard_of_a_served_pair(Sends::ConcurrentWrite).await,
+            [
+                "issued",
+                "issued",
+                "dispatched Prefill",
+                "dispatched Decode",
+                "completed Cancelled",
+                "completed Cancelled",
+            ]
+        );
+    }
+
+    /// A streamed pair tells the engine no outcome yet. The decode's answer
+    /// goes through the relay that the regular router's streams go through,
+    /// and this route hands that relay no handle: under a stage that takes
+    /// an end the decode's guard holds one, and both sides still end with
+    /// class cancelled and no status.
+    #[tokio::test]
+    async fn the_engine_hears_no_outcome_of_a_pairs_streamed_decode() {
+        let (router, heard) = heard_pair_router(Sends::BothAtOnce).await;
+        let response = chat_through(&router, true).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        // A relay that held a handle would tell the end from its task,
+        // behind the body's last byte.
+        let said = || heard.lock().expect("the stage heard").clone();
+        for _ in 0..1024 {
+            if said().len() >= 6 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            said(),
             [
                 "issued",
                 "issued",

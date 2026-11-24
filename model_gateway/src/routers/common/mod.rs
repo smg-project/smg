@@ -228,7 +228,7 @@ pub(crate) fn attach_sized_body(
 /// and whether the process captures every request's cache trace.
 #[cfg(any(test, feature = "test-util"))]
 pub mod bench_support {
-    use std::sync::Arc;
+    use std::{hint::black_box, sync::Arc};
 
     use axum::http::HeaderMap;
     use smg_worker::{identity::basic::Worker, load::state::LoadReceiver};
@@ -236,7 +236,10 @@ pub mod bench_support {
     use super::{
         attempt_ledger::AttemptLedger,
         overload,
-        placement::{select_pair, select_single, Placed, PlacementInputs, Stated},
+        placement::{
+            select_pair, select_single, Placed, PlacedPair, PlacementInputs, RequestEnd, Stated,
+        },
+        prefill_admission::hold_unbounded,
     };
     use crate::{
         config::RouterConfig,
@@ -265,6 +268,30 @@ pub mod bench_support {
                 Self::Grpc => RoutingPool::GrpcPipelineRegular,
             }
         }
+    }
+
+    /// What a bench route does with its request's end where its route tells
+    /// that end ([`route_classic_ended`], [`route_pair_ended`]). A form that
+    /// reports is counted against the form named with it, which holds the
+    /// guard or the answer as it does and reports nothing: the difference
+    /// is the report alone. Each shows what it holds to an opaque reader,
+    /// as a route hands it to another function or task.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Ended {
+        /// The guard is shown to an opaque reader and nobody reports: what
+        /// [`Self::Streamed`] is counted against.
+        Passed,
+        /// A streamed answer: its route asks the guard a handle on the
+        /// request's end, and the stream's reader reports through it while
+        /// the guard stands. A pair route tells no end yet: its decode's
+        /// reader is handed an empty handle and tests it.
+        Streamed,
+        /// The route keeps its answer past the guard and nobody reports:
+        /// what [`Self::Answer`] is counted against.
+        Kept,
+        /// An answer read whole: the route keeps its answer and reports
+        /// through it.
+        Answer,
     }
 
     /// Bytes the calling thread has allocated since it started, by the
@@ -387,12 +414,131 @@ pub mod bench_support {
         .ok()?;
         let went = placed_on(pair.prefill.worker());
         let key = policies.sticky_key(None, None);
-        let prefill = pair.prefill.into_guard(key);
+        // The prefill's load as a pair route holds it with admission
+        // disabled: a plain guard of its worker under the route's key, made
+        // ahead of the send, and the send said where the prefill goes out.
+        let handed_on = |pair: PlacedPair| {
+            let (prefill, unsent) = pair.prefill.unsent();
+            ((prefill, pair.decode), unsent)
+        };
+        let ((_prefill, decode), ahead) =
+            hold_unbounded(pair, key, |pair| &pair.prefill, handed_on);
+        let prefill = ahead.sent();
         // The decode's guard as a pair route makes it: ahead of the decode's
         // send, and sent behind the prefill.
-        let decode = pair.decode.ahead(key);
-        let decode = pair.decode.sent(decode);
-        drop((prefill, decode));
+        let decode_guard = decode.ahead(key);
+        let decode_guard = decode.sent(decode_guard);
+        drop((prefill, decode_guard));
+        Some(went)
+    }
+
+    /// [`route_classic`] on a route that tells the request's end: the same
+    /// placement and overload read, and then `end`'s form of the request's
+    /// end where [`route_classic`] drops its guard at once.
+    pub fn route_classic_ended(
+        registry: &WorkerRegistry,
+        policies: &PolicyRegistry,
+        model: &str,
+        route: Route,
+        tokens: Option<&[u32]>,
+        headers: Option<&HeaderMap>,
+        end: Ended,
+    ) -> Option<usize> {
+        let pool = route.pool();
+        let inputs = PlacementInputs {
+            tokens,
+            headers,
+            ..Default::default()
+        };
+        let worker = select_single(
+            registry,
+            policies,
+            model,
+            pool,
+            None,
+            inputs,
+            Stated::nothing,
+        )?;
+        let shed =
+            overload::shed_if_worker_overloaded(&*worker, model, registry.overload_shed_enabled());
+        if shed.is_some() {
+            return None;
+        }
+        let went = placed_on(worker.worker());
+        let key = policies.sticky_key(headers, None);
+        match end {
+            Ended::Passed => {
+                let guard = worker.into_guard(key);
+                black_box(&guard);
+                drop(guard);
+            }
+            Ended::Streamed => {
+                let guard = worker.into_guard(key);
+                let reader = black_box(RequestEnd::of(black_box(&guard)));
+                reader.report(200, || true);
+                drop(reader);
+                drop(guard);
+            }
+            Ended::Kept | Ended::Answer => {
+                let guard = worker.guard_keeping_end(key);
+                black_box(&guard);
+                drop(guard);
+                let worker = black_box(&worker);
+                if end == Ended::Answer {
+                    worker.ended(200, || true);
+                }
+            }
+        }
+        Some(went)
+    }
+
+    /// [`route_pair`] with both guards standing where they are, shown to an
+    /// opaque reader. Under [`Ended::Streamed`] the decode's reader tests
+    /// the empty handle a pair route hands its relay. A pair route keeps no
+    /// answer to report through: [`Ended::Kept`] and [`Ended::Answer`] end
+    /// as [`Ended::Passed`] does.
+    pub fn route_pair_ended(
+        registry: &WorkerRegistry,
+        policies: &PolicyRegistry,
+        model: &str,
+        tokens: Option<&[u32]>,
+        end: Ended,
+    ) -> Option<usize> {
+        let pairs = registry
+            .get_routing_snapshot(model)
+            .pd_pairs(PdWire::Grpc, policies.pd_pairing_mode());
+        let inputs = PlacementInputs {
+            tokens,
+            ..Default::default()
+        };
+        let pair = select_pair(
+            registry,
+            policies,
+            model,
+            &pairs,
+            None,
+            None,
+            inputs,
+            Stated::nothing,
+        )
+        .ok()?;
+        let went = placed_on(pair.prefill.worker());
+        let key = policies.sticky_key(None, None);
+        // The two loads as [`route_pair`] holds them.
+        let handed_on = |pair: PlacedPair| {
+            let (prefill, unsent) = pair.prefill.unsent();
+            ((prefill, pair.decode), unsent)
+        };
+        let ((_prefill, decode), ahead) =
+            hold_unbounded(pair, key, |pair| &pair.prefill, handed_on);
+        let prefill = ahead.sent();
+        let decode_guard = decode.ahead(key);
+        let decode_guard = decode.sent(decode_guard);
+        black_box((&prefill, &decode_guard));
+        if end == Ended::Streamed {
+            let reader = black_box(RequestEnd::default());
+            reader.report(200, || true);
+        }
         Some(went)
     }
 

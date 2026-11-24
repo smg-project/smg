@@ -389,7 +389,9 @@ impl<'a> Live<'a> {
 /// instant on `clock`, and says whether the snapshot holds a report of the
 /// worker: one look-up of the worker's address, one conversion
 /// ([`load_row`]). The report's age is left at rest: it is a decision's to
-/// state ([`Live::age`]).
+/// state ([`Live::age`]). The report is the snapshot's own, or the last
+/// one it keeps of a worker whose load fetch fails
+/// ([`LoadSnapshot::report_or_kept`]): as old as its sample.
 #[inline]
 fn report_into(
     worker: &dyn Worker,
@@ -397,7 +399,7 @@ fn report_into(
     clock: &DecisionClock,
     row: &mut Candidate,
 ) -> bool {
-    let Some((report, sampled_at)) = loads.report(worker.url()) else {
+    let Some((report, sampled_at)) = loads.report_or_kept(worker.url()) else {
         return false;
     };
     let (load, sampled_at_micros) = stated_report(report, sampled_at, row.role, clock);
@@ -1300,7 +1302,7 @@ impl PoolRecords {
     ) {
         cells.blank(self.fixed.len(), self.signals.len());
         for (fixed, worker) in self.fixed.iter().zip(workers) {
-            let Some((report, sampled_at)) = loads.report(worker.url()) else {
+            let Some((report, sampled_at)) = loads.report_or_kept(worker.url()) else {
                 continue;
             };
             let ranks = || stated_ranks(&worker.metadata().spec);

@@ -39,8 +39,8 @@
 //! - **Once a model** ([`Affinity`]): the record of the prefixes sent to the
 //!   workers the index does not speak for ([`PrefixPredictor`]), behind one
 //!   reader-writer lock. A naming takes it as a reader, and only where the
-//!   list holds such a worker. A pick writes behind the blocks its worker
-//!   already holds, sixteen blocks a turn, and takes each turn by a try: a
+//!   list holds such a worker. A pick writes behind the blocks its naming
+//!   found its worker to hold, sixteen blocks a turn, each turn by a try: a
 //!   turn that meets a held lock ends the write there, so a pick waits for
 //!   nobody. The map of the records is behind a mutex that only the read of
 //!   a list's table, a change of membership and the timer's sweep take.
@@ -412,7 +412,8 @@ impl Affinity {
     /// The workers that stand, said whole behind a read of the host's
     /// registry: every record forgets each worker it holds a place for
     /// that is not among them, so a worker whose leave was never told
-    /// keeps no place. Takes what [`Self::forget`] takes.
+    /// keeps no place. Takes what [`Self::forget`] takes. A store that
+    /// took its membership whole says them too.
     pub(super) fn keep(&self, standing: &[WorkerId]) {
         self.leaves.fetch_add(1, Ordering::Relaxed);
         let standing: FxHashSet<WorkerId> = standing.iter().copied().collect();
@@ -470,6 +471,18 @@ impl Affinity {
         let records = self.records.lock();
         let left_out = |record: &Arc<PrefixRecord>| record.left_out.load(Ordering::Relaxed);
         self.left_out.load(Ordering::Relaxed) + records.values().map(left_out).sum::<u64>()
+    }
+
+    /// The workers each record holds a place for, by its model, for the
+    /// cases of a served controller.
+    #[cfg(all(test, feature = "controller"))]
+    pub(crate) fn held(&self) -> Vec<(Box<str>, Vec<WorkerId>)> {
+        let records = self.records.lock();
+        let held = |record: &Arc<PrefixRecord>| record.predictor.read().held().collect();
+        records
+            .iter()
+            .map(|(model, record)| (model.clone(), held(record)))
+            .collect()
     }
 
     /// The record of `model`, made at its first asking and held to `bound`
@@ -538,8 +551,13 @@ pub struct PrefixRead {
 }
 
 impl PrefixRead {
-    /// The deepest rows a read keeps. A pick of a row past them is written
-    /// again, which costs a write and moves nothing a reader can see.
+    /// The deepest rows a read keeps. A pick of a row past them is no
+    /// repeat: where it is written, the write is tried from the request's
+    /// first block ([`PrefixRecord::write`]). A turn of it that finds the
+    /// request held for that row as far as the turn's end adds no block:
+    /// it makes that end the newest of the record's list, its last use the
+    /// read's tick, which can change the block that leaves next at the
+    /// record's bound.
     const KEPT: usize = 8;
 }
 
@@ -614,10 +632,13 @@ impl PrefixRecord {
         }
     }
 
-    /// Whether a pick behind `read` is a repeat that writes nothing: the
-    /// record already holds the whole request for the picked worker, its
-    /// end used at this tick, so a write would move nothing a reader can
-    /// see. `held` says the naming found the picked worker among those
+    /// Whether a pick behind `read` is a repeat, which records nothing of
+    /// its request: by `read` the record holds the whole request for the
+    /// picked worker, its end used at this tick. While that still stands
+    /// a write would add no block and move no tick: it would make that
+    /// end the newest of the record's list again, which can change the
+    /// block that leaves next at the record's bound. A repeat gives that
+    /// up. `held` says the naming found the picked worker among those
     /// sent the request's deepest block.
     fn repeats(&self, read: RecordRead, held: bool) -> bool {
         if !(read.whole && read.fresh && held) {
@@ -637,8 +658,10 @@ impl PrefixRecord {
     /// the naming found the target among the workers sent the request's
     /// deepest recorded block.
     ///
-    /// The write begins behind the blocks the target already holds: a turn
-    /// of a conversation writes the blocks the turn added. It takes the
+    /// The write begins behind the blocks the naming found the target to
+    /// hold: a turn of a conversation writes the blocks the turn added, and
+    /// a target the naming did not find is written from the request's
+    /// first block. It takes the
     /// lock sixteen blocks a turn, each turn by a try. An entry is a
     /// prediction and a leading part of a request is a true one, so a turn
     /// that meets a held lock ends the write there and waits for no thread:
@@ -657,6 +680,9 @@ impl PrefixRecord {
         // no block to add: left undone, it leaves nothing out.
         let adds = end < keys.len();
         loop {
+            // What the target holds as the turn begins: the naming's depth,
+            // then the turns before this one.
+            let behind = end;
             end = (end + Self::SLICE).min(keys.len());
             let Some(mut predictor) = self.predictor.try_write() else {
                 if adds {
@@ -667,7 +693,7 @@ impl PrefixRecord {
             if self.left.load(Ordering::Relaxed) != read.left {
                 return;
             }
-            predictor.record(&keys[..end], target, read.tick);
+            predictor.record_behind(&keys[..end], behind, target, read.tick);
             if end == keys.len() {
                 self.sweep(&mut predictor);
                 return;
@@ -1837,19 +1863,12 @@ impl Table {
             );
         }
         let read = self.name(facts, places, buffers);
-        let named = AffinityRows {
-            holders: &buffers.holders,
-            warming: &buffers.warming,
-            thin: self.ruled.thin,
-            mean_in_flight: None,
-        };
+        let named = self.named_rows(buffers);
         let mut decision = decide(&mut RequestFacts {
             named: Some(named),
             ..*facts
         });
-        if self.states {
-            state(&mut decision, Feed::Named(named), facts, self.block);
-        }
+        self.state_named(&mut decision, named, facts);
         let (Some(read), Some(record)) = (read, self.record.as_deref()) else {
             return decision;
         };
@@ -1864,6 +1883,37 @@ impl Table {
             record.write(&buffers.keys, read, held, target.id);
         }
         decision
+    }
+
+    /// The rows named into `buffers`, as a decision is handed them in the
+    /// affinity column's place.
+    fn named_rows<'b>(&self, buffers: &'b Buffers) -> AffinityRows<'b> {
+        AffinityRows {
+            holders: &buffers.holders,
+            warming: &buffers.warming,
+            thin: self.ruled.thin,
+            mean_in_flight: None,
+        }
+    }
+
+    /// States the pick of a decision made over `named` rows: its first
+    /// target's entry of them ([`state`]), where the request's own profile
+    /// reads affinity. One function for the two paths that name rows, the
+    /// table's own naming ([`Self::name`]) and a tree's match
+    /// ([`Self::name_sent`]), so both state by one rule.
+    // Each path makes its decision in its own place and states it there:
+    // handed back by one function that also decides, a decision over the
+    // table's own rows costs a copy more, 30 instructions, counted with
+    // Callgrind.
+    fn state_named(
+        &self,
+        decision: &mut Decision,
+        named: AffinityRows<'_>,
+        facts: &RequestFacts<'_>,
+    ) {
+        if self.states {
+            state(decision, Feed::Named(named), facts, self.block);
+        }
     }
 
     /// How many of the request's blocks a token tree's match of `tokens`
@@ -1907,19 +1957,12 @@ impl Table {
     ) -> Decision {
         let mut decide_over = |holders: &[TenantId], blocks: u32| {
             self.name_sent(holders, blocks, workers, facts, places, buffers);
-            let named = AffinityRows {
-                holders: &buffers.holders,
-                warming: &buffers.warming,
-                thin: self.ruled.thin,
-                mean_in_flight: None,
-            };
+            let named = self.named_rows(buffers);
             let mut decision = decide(&mut RequestFacts {
                 named: Some(named),
                 ..*facts
             });
-            if self.states {
-                state(&mut decision, Feed::Named(named), facts, self.block);
-            }
+            self.state_named(&mut decision, named, facts);
             decision
         };
         let mut decided = None;

@@ -118,6 +118,10 @@ use classic_sink::ClassicLoadSink;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// The bytes of a load answer the monitor reads, over HTTP. A longer answer
+/// is a failed fetch.
+const MAX_LOAD_ANSWER_BYTES: usize = 64 * 1024 * 1024;
+
 /// The rank loads by worker as the update line writes them: each address
 /// masked. A worker's address may hold a credential in its userinfo or a
 /// token in its query. The address is read when the line is written, so
@@ -1150,12 +1154,14 @@ impl<G: Generation> WorkerMonitor<G> {
     /// are written behind the publish's own fence, read under the hold:
     /// an answer for a worker that left during the fetch writes none. A
     /// row the publish takes from a worker that left ends under the same
-    /// hold ([`Self::publish_rows`]).
+    /// hold ([`Self::publish_rows`]). `failed` are the polled workers whose
+    /// fetch failed.
     fn publish_polled(
         &self,
         model_id: &str,
         polled_urls: &[String],
         group_loads: Vec<(Arc<dyn Worker>, WorkerLoadResponse, bool)>,
+        failed: &[Arc<dyn Worker>],
     ) {
         let reports = self.pushed_reports.lock();
         // Every successful load poll is also the canonical observability
@@ -1178,13 +1184,14 @@ impl<G: Generation> WorkerMonitor<G> {
         // paired with the worker that produced it so the incarnation fence
         // can drop reports that raced a removal or replacement. Workers that
         // failed this tick get their stale entries pruned along with the
-        // rest. The responses move (no deep clones): the metrics pass above
+        // rest: what the snapshot keeps of one is `LoadState::publish`'s to
+        // say. The responses move (no deep clones): the metrics pass above
         // took its references.
         let fresh: Vec<(Arc<dyn Worker>, Arc<WorkerLoadResponse>)> = group_loads
             .into_iter()
             .map(|(worker, load, _)| (worker, Arc::new(load)))
             .collect();
-        self.publish_rows(&reports, polled_urls, fresh);
+        self.publish_rows(&reports, polled_urls, fresh, failed);
     }
 
     /// Publish rows, and end each row the publish took away from a worker
@@ -1194,15 +1201,19 @@ impl<G: Generation> WorkerMonitor<G> {
     /// rank the row held past the worker's width, or finds no row at the
     /// URL and writes nothing. The row's series end here instead, but for
     /// the ones a live writer writes ([`Self::clear_series`]). A row taken
-    /// from the URL's `Ready` worker, whose fetch failed this tick, ends
-    /// nothing. `reports` is the locked map of the pushed reports.
+    /// from the URL's `Ready` worker, whose fetch failed this tick or
+    /// answered with no row for it, ends nothing: the row leaves the
+    /// snapshot's entries, and where the fetch failed (`failed`) the
+    /// snapshot keeps it beside them ([`LoadState::publish`]). `reports`
+    /// is the locked map of the pushed reports.
     fn publish_rows(
         &self,
         reports: &FxHashMap<String, PushedFile>,
         group_urls: &[String],
         fresh: Vec<(Arc<dyn Worker>, Arc<WorkerLoadResponse>)>,
+        failed: &[Arc<dyn Worker>],
     ) {
-        for (worker, row) in self.load_state.publish_group(group_urls, fresh) {
+        for (worker, row) in self.load_state.publish(group_urls, fresh, failed) {
             self.clear_series(reports, &worker, Some(&row));
         }
     }
@@ -1421,7 +1432,7 @@ impl<G: Generation> WorkerMonitor<G> {
             // worker's row, and a row of another worker it overwrites ends
             // there. A refused one leaves the row to the eviction, which
             // writes the sentinel of the series with it.
-            self.publish_rows(&reports, &[], fresh);
+            self.publish_rows(&reports, &[], fresh, &[]);
         }
     }
 
@@ -1541,7 +1552,8 @@ impl<G: Generation> WorkerMonitor<G> {
     /// group that ended, changed its interval or had another loop spawned
     /// over it ahead of the call. It was
     /// told to end there, and a tick of it that is past its fetch can
-    /// still publish. Every pusher is evicted then. Last the
+    /// still publish. Every pusher is evicted then, and the mark of a
+    /// stream that pushes goes off every registered worker. Last the
     /// monitor resets as its rebuild from the registry does: the shared
     /// snapshot is published empty, the probe memo goes, and the sink is
     /// told the reset ([`LoadSink::reset`]). The monitor's own sink takes
@@ -1584,6 +1596,17 @@ impl<G: Generation> WorkerMonitor<G> {
     /// report: the start polls it as a worker that never pushed, and its
     /// file starts again at its stream's next record.
     ///
+    /// The liveness sweep reads such a worker as one that never pushed too.
+    /// Behind the tasks' end the stop takes the mark of a stream that
+    /// pushes off every registered worker, whether a report of it was on
+    /// file or not. Left marked, a worker that its host heard on no channel
+    /// for the stale threshold would read unreachable from the next start's
+    /// first sweep to its first contact. A stopped monitor polls nothing,
+    /// so that silence says nothing of the worker. Its stream's next record
+    /// marks it again. An eviction alone keeps the mark: a worker that
+    /// leaves `Ready` and stays registered is judged by its stream's
+    /// silence still.
+    ///
     /// A stop dropped at its first wait puts the event task's handle back.
     /// That task was told to end, and a poll of it that still runs can
     /// start a group: the next stop waits for the task's end ahead of the
@@ -1623,8 +1646,18 @@ impl<G: Generation> WorkerMonitor<G> {
         for mut task in ending {
             ended(&mut task).await;
         }
+        // The mark of a stream that pushes goes off every registered worker,
+        // with a report on file or without: the next start's sweep judges
+        // a worker by its stream's silence from that stream's next record.
+        for worker in self.worker_registry.global_generation().members().iter() {
+            if let Some(state) = worker.runtime_state() {
+                state.forget_load_records();
+            }
+        }
         // Every pusher goes ahead of the reset, which by itself keeps the
         // file of a worker that stays `Ready`: no file outlives the stop.
+        // The reset's flush takes the evictions queued here, so a stopped
+        // monitor holds none of its pushers.
         let pushers: Vec<Arc<dyn Worker>> = self
             .pushed_reports
             .lock()
@@ -1803,8 +1836,9 @@ impl<G: Generation> WorkerMonitor<G> {
     }
 
     /// Evict a single worker's cached loads. Used by the event loop on
-    /// `Removed`, `Replaced`, and `StatusChanged` away from `Ready`, and by
-    /// a reset for a pusher whose event was lost.
+    /// `Removed`, `Replaced`, and `StatusChanged` away from `Ready`, by a
+    /// reset for a pusher whose event was lost, and by a stop for every
+    /// pusher.
     ///
     /// The probe memo, the pushed report and what the sink holds of the
     /// worker (its overload flag, its receipts, its cached rank loads) are
@@ -1815,7 +1849,9 @@ impl<G: Generation> WorkerMonitor<G> {
     /// and the series the report fed are set to the sentinel with it
     /// ([`Self::clear_series`]). A report another worker started ahead of
     /// this eviction stays, with what the sink holds at the URL: both are
-    /// that worker's.
+    /// that worker's. The worker's mark of a stream that pushes stays too:
+    /// the stale rule still judges a worker that stays registered, and the
+    /// stop alone takes the mark off ([`Self::stop`]).
     fn evict_worker_loads(&self, worker: &Arc<dyn Worker>) {
         let url = worker.url();
         self.native_loads_memo.remove(url);
@@ -2191,8 +2227,11 @@ impl<G: Generation> WorkerMonitor<G> {
         // deadline's, and a body that is no load response is the engine's
         // answer. Whether the route is absent is the caller's to say: it
         // knows if the route ever answered.
-        let body = match resp.bytes().await {
-            Ok(body) => body,
+        let body = match Self::load_answer(resp, MAX_LOAD_ANSWER_BYTES).await {
+            Ok(Some(body)) => body,
+            // An answer past the size is a condition, no fact about the
+            // route, as an answer of 5xx is.
+            Ok(None) => return NativeLoads::Inconclusive(FetchFailure::Answer),
             Err(error) => return NativeLoads::Unreadable(Self::request_failure(&error)),
         };
         match serde_json::from_slice::<NativeResponse>(&body) {
@@ -2245,9 +2284,9 @@ impl<G: Generation> WorkerMonitor<G> {
     }
 
     /// The body of a shared authenticated GET with the standard timeout. A
-    /// status that is no success is the engine's answer. A request the
-    /// timeout ended is a deadline, at the send or in the body. Any other
-    /// failure is the transport's.
+    /// status that is no success, or a body past [`MAX_LOAD_ANSWER_BYTES`],
+    /// is the engine's answer. A request the timeout ended is a deadline, at
+    /// the send or in the body. Any other failure is the transport's.
     async fn authed_text(worker: &Arc<dyn Worker>, url: &str) -> Result<String, FetchFailure> {
         let failed = |error: reqwest::Error| Self::request_failure(&error);
         let response = Self::authed_request(worker, url)
@@ -2257,7 +2296,42 @@ impl<G: Generation> WorkerMonitor<G> {
         if !response.status().is_success() {
             return Err(FetchFailure::Answer);
         }
-        response.text().await.map_err(failed)
+        // Bytes that are no UTF-8 read as the replacement character, as in
+        // the client's own text read.
+        let Some(body) = Self::load_answer(response, MAX_LOAD_ANSWER_BYTES)
+            .await
+            .map_err(failed)?
+        else {
+            return Err(FetchFailure::Answer);
+        };
+        Ok(String::from_utf8(body)
+            .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned()))
+    }
+
+    /// The body of a load answer, read in pieces up to `size` bytes, or none
+    /// for a longer one. The length an answer declares is judged ahead of its
+    /// read, and an answer with no length piece by piece. A read that fails
+    /// ends on its own error.
+    async fn load_answer(
+        mut response: reqwest::Response,
+        size: usize,
+    ) -> Result<Option<Vec<u8>>, reqwest::Error> {
+        let declared = usize::try_from(response.content_length().unwrap_or(0))
+            .ok()
+            .filter(|&length| length <= size);
+        let Some(declared) = declared else {
+            return Ok(None);
+        };
+        // A declared length reserves a first piece at most: the rest grows
+        // as its bytes arrive.
+        let mut body = Vec::with_capacity(declared.min(64 * 1024));
+        while let Some(piece) = response.chunk().await? {
+            if piece.len() > size - body.len() {
+                return Ok(None);
+            }
+            body.extend_from_slice(&piece);
+        }
+        Ok(Some(body))
     }
 
     /// Why a request brought no answer: the deadline's where its timeout
@@ -2786,6 +2860,13 @@ async fn run_event_loop<G: Generation>(
 /// How long a backend load poll may take before the tick moves on without it.
 const LOAD_POLL_DEADLINE: Duration = Duration::from_secs(3);
 
+/// How long the last report of a worker whose load fetch fails is kept
+/// beside the snapshot's entries ([`LoadSnapshot::report_or_kept`]), from
+/// the report's own sample, as the ticks of its group judge it: ten
+/// deadlines of a load poll.
+pub(super) const KEPT_REPORT_LIFE: Duration =
+    Duration::from_secs(10 * LOAD_POLL_DEADLINE.as_secs());
+
 /// Run [`liveness::sweep`] over every registered worker every quarter second.
 ///
 /// A tick reads the registry's immutable membership snapshot: one pointer
@@ -2918,14 +2999,22 @@ async fn poll_group_once<G: Generation>(
     };
 
     let mut group_loads: Vec<(Arc<dyn Worker>, WorkerLoadResponse, bool)> = Vec::new();
+    // The polled workers whose fetch failed, apart from those whose engine
+    // answered with no row: the publish keeps a failed one's last report
+    // beside the entries.
+    let mut failed: Vec<Arc<dyn Worker>> = Vec::new();
     for mut engine in engines {
         let carries_rank_capacity = monitor.reconcile_engine(&mut engine, now);
         for ((worker, response), carries_rank_capacity) in
             engine.into_iter().zip(carries_rank_capacity)
         {
-            let Some(load) = response.filter(|load| !load.loads.is_empty()) else {
+            let Some(load) = response else {
+                failed.push(worker);
                 continue;
             };
+            if load.loads.is_empty() {
+                continue;
+            }
             // The wedged rule reads the queue depth off every report.
             let waiting: i64 = load
                 .loads
@@ -2953,7 +3042,7 @@ async fn poll_group_once<G: Generation>(
 
     if group_loads.is_empty() {
         debug!("No loads fetched for group {group_key}, pruning stale entries");
-        monitor.publish_polled(&group_key.model_id, &polled_urls, Vec::new());
+        monitor.publish_polled(&group_key.model_id, &polled_urls, Vec::new(), &failed);
         return;
     }
 
@@ -2965,7 +3054,7 @@ async fn poll_group_once<G: Generation>(
 
     let rows = group_loads.iter().map(|(_, load, _)| load.loads.len());
     monitor.poll_counts.published(rows.sum());
-    monitor.publish_polled(&group_key.model_id, &polled_urls, group_loads);
+    monitor.publish_polled(&group_key.model_id, &polled_urls, group_loads, &failed);
 }
 
 /// `poll_group_once` for a host's tests: one tick over engines the host's own
@@ -2995,6 +3084,7 @@ mod native_loads_tests {
         connection::engine::{EngineConnection, EngineConnector, ZmqLink},
         identity::basic::{ConnectionMode, WorkerLoadGuard, WorkerType},
         model_card::ModelCard,
+        runtime::StallReason,
         test_support::{
             assert_metric, render_with_recorder, BasicWorkerBuilder, LoadReaders, WorkerMonitor,
             WorkerRegistry,
@@ -4125,6 +4215,218 @@ mod native_loads_tests {
         monitor.stop().await;
     }
 
+    /// A stop takes the mark of a stream that pushes off every registered
+    /// worker: the next start's sweep reads a worker that pushed ahead of
+    /// the stop as one that never pushed, and judges no silence of it. The
+    /// worker here is heard from on no channel for longer than the stale
+    /// threshold its sweep is given. Left marked, it would read unreachable
+    /// until its first contact. Its stream's next record marks it again,
+    /// and the same silence is a verdict then.
+    #[tokio::test(start_paused = true)]
+    async fn a_worker_that_pushed_ahead_of_a_stop_is_judged_by_no_silence_at_the_next_start() {
+        let stale = Duration::from_millis(20);
+        // A sweep behind a silence longer than `stale`, by the stale rule
+        // alone: the other two are out of reach and off.
+        let swept = |worker: &Arc<dyn Worker>| {
+            std::thread::sleep(stale * 2);
+            liveness::sweep_with(worker, Duration::MAX, Duration::ZERO, stale);
+            worker.stall_reason()
+        };
+        let (registry, monitor) = monitor_with_readers(LoadReaders::Aware);
+        let worker = silent_worker("grpc://engine-a.invalid:50051", "a");
+        registry.register(Arc::clone(&worker)).unwrap();
+        let record = PushedRecord::requests(8, 0);
+        monitor.start_event_loop();
+        monitor.apply_pushed_load(&worker, 0, &record, Instant::now());
+
+        monitor.stop().await;
+        monitor.start_event_loop();
+        assert_eq!(swept(&worker), None, "judged by its stream's silence");
+
+        monitor.apply_pushed_load(&worker, 0, &record, Instant::now());
+        assert_eq!(
+            swept(&worker),
+            Some(StallReason::Unreachable),
+            "the next record's mark"
+        );
+        monitor.stop().await;
+    }
+
+    /// A host's connector whose gRPC connect never returns, and that runs a
+    /// case's step where the connect is dropped unanswered, as a stop drops
+    /// a poll in flight.
+    #[derive(Default)]
+    struct CutConnect {
+        at_cut: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    }
+
+    impl Debug for CutConnect {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("CutConnect")
+        }
+    }
+
+    /// A connect in flight: dropped, it runs its connector's step.
+    struct InFlight<'a>(&'a CutConnect);
+
+    impl Drop for InFlight<'_> {
+        fn drop(&mut self) {
+            if let Some(step) = self.0.at_cut.lock().as_ref() {
+                step();
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl EngineConnector for CutConnect {
+        async fn connect_grpc(
+            &self,
+            _base_url: &str,
+            _runtime: RuntimeType,
+        ) -> Result<Arc<dyn EngineConnection>, String> {
+            let _in_flight = InFlight(self);
+            std::future::pending().await
+        }
+
+        async fn connect_zmq(&self, _link: ZmqLink) -> Result<Arc<dyn EngineConnection>, String> {
+            Err("a gRPC worker runs no handshake".to_string())
+        }
+
+        async fn dial_grpc(&self, _base_url: &str, _timeout: Duration) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    /// A stop takes what a record leaves that comes inside its wait for the
+    /// tasks' end: the eviction and the mark's clearing stand behind that
+    /// wait. A poll is in flight where the stop begins, and the record
+    /// comes where the stop drops it. Behind the stop its worker has no
+    /// report on file, no publish queued and no mark of a stream that
+    /// pushes.
+    #[tokio::test(start_paused = true)]
+    async fn a_record_inside_a_stops_wait_leaves_no_file_and_no_mark() {
+        let (registry, monitor) = monitor_with_readers(LoadReaders::Aware);
+        let connector = Arc::new(CutConnect::default());
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://engine-a.invalid:50051")
+                .worker_type(WorkerType::Regular)
+                .connection_mode(ConnectionMode::Grpc)
+                .model(ModelCard::new("a"))
+                .engine_connector(Arc::clone(&connector) as Arc<dyn EngineConnector>)
+                .health_config(HealthCheckConfig {
+                    disable_health_check: true,
+                    ..Default::default()
+                })
+                .build(),
+        );
+        registry.register(Arc::clone(&worker)).unwrap();
+        monitor.start_event_loop();
+        // The start's poll is in flight.
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        let came = Arc::new(AtomicUsize::new(0));
+        let (records, taker, pusher) = (
+            Arc::clone(&came),
+            Arc::downgrade(&monitor),
+            Arc::clone(&worker),
+        );
+        *connector.at_cut.lock() = Some(Box::new(move || {
+            let monitor = taker.upgrade().expect("the monitor stands in its stop");
+            monitor.apply_pushed_load(&pusher, 0, &PushedRecord::requests(8, 0), Instant::now());
+            records.fetch_add(1, Ordering::SeqCst);
+        }));
+
+        monitor.stop().await;
+        assert_eq!(came.load(Ordering::SeqCst), 1, "the record inside the stop");
+        let runtime = worker.runtime_state().expect("the worker's running state");
+        assert!(
+            !runtime.pushes_load_records(),
+            "the mark of a record that came inside the stop"
+        );
+        assert!(
+            monitor.pushed_reports.lock().is_empty(),
+            "the file of a record that came inside the stop"
+        );
+        assert_eq!(monitor.pending_pushed_len(), 0, "its queued publish");
+        // The step holds the worker, and the worker's connector the step.
+        connector.at_cut.lock().take();
+    }
+
+    /// A stop takes the mark off a registered worker that has no report on
+    /// file. This worker pushed and then left `Ready`: the eviction took
+    /// its file and kept its mark, since a worker that stays registered is
+    /// still judged by its stream's silence. The stop reads the registry's
+    /// workers, not the files.
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_takes_the_mark_off_a_worker_whose_file_an_eviction_took() {
+        let (registry, monitor) = monitor_with_readers(LoadReaders::Aware);
+        let worker = silent_worker("grpc://engine-a.invalid:50051", "a");
+        registry.register(Arc::clone(&worker)).unwrap();
+        monitor.start_event_loop();
+        monitor.apply_pushed_load(&worker, 0, &PushedRecord::requests(8, 0), Instant::now());
+        worker.set_status(WorkerStatus::NotReady);
+        monitor.evict_worker_loads(&worker);
+        let runtime = worker.runtime_state().expect("the worker's running state");
+        assert!(
+            monitor.pushed_reports.lock().is_empty(),
+            "the eviction left the worker's file"
+        );
+        assert!(runtime.pushes_load_records(), "the eviction took the mark");
+
+        monitor.stop().await;
+        assert!(
+            !runtime.pushes_load_records(),
+            "the mark of a worker with no report on file"
+        );
+    }
+
+    /// A rebuild from the registry keeps the mark of a stream that pushes:
+    /// the stop alone takes it off. The rebuild keeps the file of a pusher
+    /// that stays `Ready`, whose stream serves it still, and the stale rule
+    /// judges that stream's silence still.
+    #[tokio::test(start_paused = true)]
+    async fn a_rebuild_from_the_registry_keeps_the_mark_of_a_pusher_that_stays() {
+        let (registry, monitor) = monitor_with_readers(LoadReaders::Aware);
+        let worker = silent_worker("grpc://engine-a.invalid:50051", "a");
+        registry.register(Arc::clone(&worker)).unwrap();
+        monitor.start_event_loop();
+        monitor.apply_pushed_load(&worker, 0, &PushedRecord::requests(8, 0), Instant::now());
+
+        // The lag recovery's own call.
+        monitor.reconcile_from_registry();
+        let runtime = worker.runtime_state().expect("the worker's running state");
+        assert!(
+            monitor.pushed_reports.lock().contains_key(worker.url()),
+            "the rebuild took the file of a pusher that stays"
+        );
+        assert!(runtime.pushes_load_records(), "the rebuild took the mark");
+        monitor.stop().await;
+    }
+
+    /// A stopped monitor holds none of its pushers. The stop evicts each
+    /// one ahead of its reset, and the reset's flush takes the evictions
+    /// queued there. With the reset ahead of them, each pusher would stay
+    /// queued until the next start.
+    #[tokio::test(start_paused = true)]
+    async fn a_stopped_monitor_holds_none_of_its_pushers() {
+        let (registry, monitor) = monitor_with_readers(LoadReaders::Aware);
+        let worker = silent_worker("grpc://engine-a.invalid:50051", "a");
+        registry.register(Arc::clone(&worker)).unwrap();
+        // The registry's own handles, with the generation it publishes for
+        // its first reader: the stop is one.
+        drop(registry.global_generation());
+        let handles = Arc::strong_count(&worker);
+        monitor.start_event_loop();
+        monitor.apply_pushed_load(&worker, 0, &PushedRecord::requests(8, 0), Instant::now());
+        assert!(Arc::strong_count(&worker) > handles, "the file's handle");
+
+        monitor.stop().await;
+        assert_eq!(
+            Arc::strong_count(&worker),
+            handles,
+            "the handles of a pusher behind the stop"
+        );
+    }
+
     /// A monitor told `interval` as its own, over one group of HTTP workers
     /// whose host keeps one load source for them all. Each entry of `own`
     /// is a worker: the whole seconds it states for itself, or nothing. The
@@ -4461,6 +4763,82 @@ mod native_loads_tests {
             memo.get(worker.url()).and_then(|hit| hit.answered()),
             Some(NativeLoadsPath::Engine)
         );
+    }
+
+    /// A load answer is read up to a size: one of that size is read, and one
+    /// a byte longer is none, whether the answer declares its length or not.
+    /// On the native route and on the gauges' route an answer that declares
+    /// a length past [`MAX_LOAD_ANSWER_BYTES`] is a failed fetch ahead of
+    /// its body.
+    #[tokio::test]
+    async fn a_load_answer_past_the_size_is_a_failed_fetch() {
+        const SIZE: usize = 64;
+        // An answer of blanks that declares its length or sends them with
+        // none, in two pieces: the size, then the rest. Past the size it
+        // withholds what its reader must not wait for: its body where it
+        // declares its length, else its end.
+        let answer = |declared: bool, length: usize| async move {
+            let past = length > SIZE;
+            let blanks = " ".repeat(if declared && past { 0 } else { length });
+            let (first, rest) = blanks.split_at(blanks.len().min(SIZE));
+            let pieces =
+                [first, rest].map(|piece| Ok::<_, std::convert::Infallible>(piece.to_string()));
+            let end = futures::stream::poll_fn(move |_| {
+                if past {
+                    std::task::Poll::Pending
+                } else {
+                    std::task::Poll::Ready(None)
+                }
+            });
+            let pieces = futures::stream::iter(pieces);
+            (
+                declared.then(|| [(http::header::CONTENT_LENGTH, length.to_string())]),
+                axum::body::Body::from_stream(futures::StreamExt::chain(pieces, end)),
+            )
+        };
+        let sized =
+            move |axum::extract::Path((declared, length)): axum::extract::Path<(bool, usize)>| {
+                answer(declared, length)
+            };
+        let past = move || answer(true, MAX_LOAD_ANSWER_BYTES + 1);
+        let app = axum::Router::new()
+            .route("/answer/{declared}/{length}", axum::routing::get(sized))
+            .route("/v1/loads", axum::routing::get(past))
+            .route("/metrics", axum::routing::get(past));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stub");
+        let url = format!("http://{}", listener.local_addr().expect("stub address"));
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test stub server lives for the duration of the test process"
+        )]
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("stub serve");
+        });
+        let worker = gauge_worker(&url);
+        let read = |declared: bool, length: usize| {
+            let url = format!("{url}/answer/{declared}/{length}");
+            let request = WorkerMonitor::authed_request(&worker, &url);
+            async move {
+                let answer = request.send().await.expect("the answer's head");
+                let body = WorkerMonitor::load_answer(answer, SIZE).await;
+                body.expect("the answer is read").map(|body| body.len())
+            }
+        };
+
+        for declared in [false, true] {
+            assert_eq!(read(declared, SIZE).await, Some(SIZE));
+            assert_eq!(read(declared, SIZE + 1).await, None);
+        }
+        assert!(matches!(
+            WorkerMonitor::probe_native_loads(&worker, NativeLoadsPath::Engine).await,
+            NativeLoads::Inconclusive(FetchFailure::Answer)
+        ));
+        assert!(matches!(
+            WorkerMonitor::fetch_http_load_vllm(&worker).await,
+            Err(FetchFailure::Answer)
+        ));
     }
 
     /// The load probe of a dp-aware HTTP worker goes to its engine's address:
@@ -5736,6 +6114,156 @@ mod native_loads_tests {
             (2048, 4096),
             "the report takes the record's token count"
         );
+    }
+
+    /// A worker whose load fetch fails loses its entry, as it always has:
+    /// the snapshot's own reads give none. The report it stated work in
+    /// stands beside the entries, as old as its sample, for
+    /// [`LoadSnapshot::report_or_kept`]: through a second failed tick, and
+    /// until its engine answers, with no row or with a fresh one. A report
+    /// that states no request is not kept, nor one sampled
+    /// [`KEPT_REPORT_LIFE`] ago, nor
+    /// the report of the worker a replacement took the URL from; and a
+    /// kept one ends with its worker's eviction.
+    #[tokio::test]
+    async fn a_failed_fetch_keeps_a_working_report_beside_the_entries() {
+        const WORKING: (StatusCode, &str) = (
+            StatusCode::OK,
+            r#"{"loads":[{"dp_rank":0,"num_running_reqs":8,"num_waiting_reqs":8}]}"#,
+        );
+        const IDLE: (StatusCode, &str) = (
+            StatusCode::OK,
+            r#"{"loads":[{"dp_rank":0,"num_running_reqs":0,"num_waiting_reqs":0}]}"#,
+        );
+        const NO_ROW: (StatusCode, &str) = (StatusCode::OK, r#"{"loads":[]}"#);
+        const DOWN: (StatusCode, &str) = (StatusCode::INTERNAL_SERVER_ERROR, "");
+        let answers = [
+            WORKING, DOWN, DOWN, NO_ROW, WORKING, DOWN, IDLE, DOWN, WORKING, DOWN, WORKING, DOWN,
+            WORKING, DOWN,
+        ];
+        let stub = spawn_backend(&[(StatusCode::NOT_FOUND, "")], &answers).await;
+        let (registry, monitor) = monitor_with_readers(LoadReaders::Blind);
+        // A runtime with no gauge table: the native route is its one load
+        // read, so an answer of 500 fails the fetch.
+        let engine = || -> Arc<dyn Worker> {
+            let worker = BasicWorkerBuilder::new(&stub.url)
+                .worker_type(WorkerType::Regular)
+                .connection_mode(ConnectionMode::Http)
+                .runtime_type(RuntimeType::Generic)
+                .model(ModelCard::new("a"))
+                .health_config(HealthCheckConfig {
+                    disable_health_check: true,
+                    ..Default::default()
+                })
+                .build();
+            worker.set_status(WorkerStatus::Ready);
+            Arc::new(worker)
+        };
+        let worker = engine();
+        let id = registry.register(Arc::clone(&worker)).unwrap();
+        let key = WorkerGroupKey {
+            model_id: "a".to_string(),
+            worker_type: WorkerType::Regular,
+            connection_mode: ConnectionMode::Http,
+        };
+        let tick = || poll_group_once(&monitor, &key, Duration::from_secs(10), Instant::now());
+        // The running requests and the sample instant of the worker's
+        // report: by the snapshot's own read, and by the read that reaches
+        // a kept report.
+        let reads = || {
+            let snapshot = monitor.load_state.snapshot();
+            let stated = |(report, at): (&WorkerLoadResponse, Instant)| {
+                (report.loads[0].num_running_reqs, at)
+            };
+            assert_eq!(
+                snapshot.get(&stub.url).is_some(),
+                snapshot.report(&stub.url).is_some()
+            );
+            (
+                snapshot.report(&stub.url).map(stated),
+                snapshot.report_or_kept(&stub.url).map(stated),
+            )
+        };
+
+        tick().await;
+        let (own, either) = reads();
+        let (_, sampled) = own.expect("the engine answered");
+        assert_eq!(either, Some((8, sampled)));
+
+        tick().await;
+        assert_eq!(
+            reads(),
+            (None, Some((8, sampled))),
+            "a failed fetch prunes the entry and keeps the report beside it, as old as its sample"
+        );
+        let publishes = monitor.load_state.publish_count();
+        tick().await;
+        assert_eq!(reads(), (None, Some((8, sampled))));
+        assert_eq!(
+            monitor.load_state.publish_count(),
+            publishes,
+            "a second failed tick publishes nothing"
+        );
+        tick().await;
+        assert_eq!(
+            reads(),
+            (None, None),
+            "an answer with no row ends the kept report"
+        );
+
+        tick().await;
+        tick().await;
+        assert_eq!(reads().1.map(|(running, _)| running), Some(8));
+        tick().await;
+        let (own, either) = reads();
+        assert_eq!(own.map(|(running, _)| running), Some(0));
+        assert_eq!(either, own, "a fresh row takes the kept report's place");
+        tick().await;
+        assert_eq!(
+            reads(),
+            (None, None),
+            "a fresh row ends the kept report, and one that states no request is not kept"
+        );
+
+        tick().await;
+        let mut aged = monitor
+            .load_state
+            .snapshot()
+            .get(&stub.url)
+            .expect("the engine answered")
+            .clone();
+        aged.sampled_at = Instant::now().checked_sub(KEPT_REPORT_LIFE);
+        assert!(
+            aged.sampled_at.is_some(),
+            "the clock is older than the bound"
+        );
+        let _ = monitor
+            .load_state
+            .publish_group(&[], vec![(Arc::clone(&worker), Arc::new(aged))]);
+        tick().await;
+        assert_eq!(
+            reads(),
+            (None, None),
+            "a report sampled the bound ago is not kept"
+        );
+
+        tick().await;
+        let next = engine();
+        assert!(registry.replace(&id, Arc::clone(&next)));
+        tick().await;
+        assert_eq!(
+            reads(),
+            (None, None),
+            "a replacement keeps nothing of the worker it took the URL from"
+        );
+
+        tick().await;
+        tick().await;
+        assert!(reads().1.is_some(), "the replacement's own report is kept");
+        registry.remove(&id);
+        monitor.evict_worker_loads(&next);
+        monitor.flush_pending_evictions();
+        assert_eq!(reads(), (None, None), "a kept report ends with its worker");
     }
 }
 

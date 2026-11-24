@@ -911,8 +911,9 @@ impl Runtime {
 
     /// Holds the I/O thread off its work for `hold` and returns once the
     /// hold began: a case's stand-in for a host that takes the thread's
-    /// core. The package's own tests build it (`test-util`); no build of a
-    /// product has it.
+    /// core. The package's own tests build it (`test-util`), and the
+    /// gateway's `test-util` turns it on for the gateway's tests. A build
+    /// of the gateway's package alone leaves it off.
     #[cfg(feature = "test-util")]
     #[doc(hidden)]
     pub fn hold_io(&self, hold: Duration) {

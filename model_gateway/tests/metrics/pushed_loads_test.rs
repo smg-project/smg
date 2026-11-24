@@ -52,9 +52,10 @@ async fn start_realistic_worker() -> u16 {
 #[tokio::test]
 async fn eight_workers_loads_reach_the_gateway_through_the_event_streams() {
     let handle = recorder();
-    let (metrics_addr, _metrics_server) = start_metrics_server(handle, "127.0.0.1".to_string(), 0)
-        .await
-        .expect("metrics server binds an ephemeral port");
+    let (metrics_addr, _metrics_server) =
+        start_metrics_server(handle, "127.0.0.1".to_string(), 0, None)
+            .await
+            .expect("metrics server binds an ephemeral port");
 
     let mut ports = Vec::with_capacity(WORKERS);
     for _ in 0..WORKERS {

@@ -9,53 +9,82 @@
 
 use std::{sync::atomic::AtomicU64, time::Duration};
 
-use super::{decision::ShadowKind, framework::PairSide, view::WorkerId};
+use super::{decision::ShadowKind, view::WorkerId};
 
 /// How many of a generation's bindings count their shadows in a row of
-/// their own ([`DecisionEngine::shadowed`]). The bindings behind them count
-/// in the last row. A host that shows the counts walks this many rows.
-///
-/// [`DecisionEngine::shadowed`]: super::decision_engine::DecisionEngine::shadowed
+/// their own ([`ShadowCount::binding`]). The bindings behind them count in
+/// the last row.
 pub const SHADOW_ROWS: usize = 16;
 
 /// One decider's counts of its shadows, on lines of their own: a row a
 /// binding by its position in its generation, a count a kind. A table
-/// for each place a shadow is asked ([`Counted`]).
+/// for each place a shadow is asked ([`ShadowSide`]).
 #[derive(Debug, Default)]
 #[repr(align(128))]
 pub(crate) struct ShadowCounts([[[AtomicU64; ShadowKind::COUNT]; SHADOW_ROWS]; 4]);
 
 impl ShadowCounts {
-    pub(crate) fn of(&self, binding: u32, table: Counted, kind: ShadowKind) -> &AtomicU64 {
-        let table = match table {
-            Counted::Single => 0,
-            Counted::Side(side) => 1 + side.index(),
-            Counted::Later => 3,
+    pub(crate) fn of(&self, binding: u32, side: ShadowSide, kind: ShadowKind) -> &AtomicU64 {
+        let table = match side {
+            ShadowSide::Single => 0,
+            ShadowSide::Prefill => 1,
+            ShadowSide::Decode => 2,
+            ShadowSide::DecodeAgain => 3,
         };
         let row = (binding as usize).min(SHADOW_ROWS - 1);
         &self.0[table][row][kind.index()]
     }
 }
 
-/// Where a shadow was asked: the table it is counted in.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Counted {
-    /// Beside a single's decision.
+/// Where a shadow is asked: the table it is counted in, and the side a
+/// host shows its counts by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ShadowSide {
+    /// Beside a single request's decision.
     Single,
-    /// Beside this side of a pair, at the pair's decision.
-    #[expect(
-        dead_code,
-        reason = "no host asks a pair's shadows until the engine over worker lists does"
-    )]
-    Side(PairSide),
+    /// Beside the prefill side of a pair, at the pair's first decision.
+    Prefill,
+    /// Beside the decode side of a pair, at the pair's first decision.
+    Decode,
     /// Beside a decode decided after its prefill, at that second
     /// decision. The pair's first decision counted its decode side
     /// beside the decode it named first: the two are never one count.
-    #[expect(
-        dead_code,
-        reason = "no host asks a later decode's shadow until the engine over worker lists does"
-    )]
-    Later,
+    DecodeAgain,
+}
+
+impl ShadowSide {
+    /// Every side, in the order a host is told a binding's counts.
+    pub(crate) const ALL: [Self; 4] =
+        [Self::Single, Self::Prefill, Self::Decode, Self::DecodeAgain];
+
+    /// The side's label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Single => "single",
+            Self::Prefill => "prefill",
+            Self::Decode => "decode",
+            Self::DecodeAgain => "decode-again",
+        }
+    }
+}
+
+/// One count of an engine's shadow decisions, as a host is told it
+/// (`PolicyEngine::shadow_counts`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ShadowCount {
+    /// The row of the binding the shadow is of: the binding's position in
+    /// its document, from 0. Every binding from the last row on is told as
+    /// that row, [`SHADOW_ROWS`] less one.
+    pub binding: u32,
+    /// Where the shadow was asked.
+    pub side: ShadowSide,
+    /// How the shadow's decision stood beside the live one.
+    pub kind: ShadowKind,
+    /// How many shadow decisions the engine counted so, under its document.
+    pub count: u64,
 }
 
 /// What a request's budget must still hold at the end of its live

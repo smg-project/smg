@@ -47,7 +47,7 @@ use crate::{
             },
             prefill_admission::{
                 acquire_prefill, PrefillAcquireError, PrefillAdmission, PrefillAdmissionRejection,
-                PrefillCandidateError, PrefillLoadGuard, PrefillSelectionContext,
+                PrefillAhead, PrefillCandidateError, PrefillSelectionContext,
             },
             retry::mark_non_retryable,
             snapshot::{ModelWorkerSnapshot, RoutingPool, WorkerRegistry, WorkerRegistryExt},
@@ -75,8 +75,9 @@ type PdWorkerPair = (Arc<dyn Worker>, Arc<dyn Worker>, RuntimeType);
 type PlacedPdPair = (Placed, Placed, RuntimeType);
 
 /// A PD pair the Prefill admission seated: the prefill's handle, whose
-/// guard the admission made from its answer, and the decode as its
-/// placement answered it, which the dispatch makes its guard from.
+/// load the admission holds ahead of its send ([`PrefillAhead`]), and the
+/// decode as its placement answered it, which the dispatch makes its
+/// guard from.
 type AdmittedPdPair = (Arc<dyn Worker>, Placed, RuntimeType);
 
 /// The candidate predicate of a request carrying media references with no
@@ -322,10 +323,10 @@ impl WorkerSelectionStage {
         ctx: &'a RequestContext,
         accepted: Option<Instant>,
         admission: F,
-    ) -> impl Future<Output = Result<(T, PrefillLoadGuard), Response>> + 'a
+    ) -> impl Future<Output = Result<(T, PrefillAhead), Response>> + 'a
     where
         T: 'a,
-        F: Future<Output = Result<(T, PrefillLoadGuard), Response>> + 'a,
+        F: Future<Output = Result<(T, PrefillAhead), Response>> + 'a,
     {
         self.admit_within_budget(ctx, accepted, admission)
             .map(move |admitted| {
@@ -1052,7 +1053,9 @@ impl WorkerSelectionStage {
 
     /// Select a PD pair and take its Prefill admission slot. With admission
     /// enabled the selection runs at the head of the admission queue, so a
-    /// queued request commits to a worker only once it is admitted.
+    /// queued request commits to a worker only once it is admitted. The
+    /// prefill's load is held ahead of its send ([`PrefillAhead`]): the
+    /// dispatch says the send where the prefill goes out.
     async fn admit_pd_pair(
         &self,
         model_id: &str,
@@ -1061,19 +1064,21 @@ impl WorkerSelectionStage {
         wire: Option<WireConstraint>,
         media: MediaDemands,
         demand: PairDemands,
-    ) -> Result<(AdmittedPdPair, PrefillLoadGuard), Response> {
+    ) -> Result<(AdmittedPdPair, PrefillAhead), Response> {
         acquire_prefill(
             self.prefill_admission.as_deref(),
             sticky_key,
             |(prefill, _, _): &PlacedPdPair| prefill,
             |capacity| self.placed_pd_pair(model_id, inputs, wire, capacity, demand),
+            // The prefill's worker goes on behind its load, and what its
+            // answer owes its send goes with that load. The dispatch makes
+            // the decode's guard from its answer.
+            |(prefill, decode, runtime)| {
+                let (prefill, unsent) = prefill.unsent();
+                ((prefill, decode, runtime), unsent)
+            },
         )
         .await
-        // The prefill's side went into its guard. The dispatch makes the
-        // decode's guard from its answer.
-        .map(|((prefill, decode, runtime), guard)| {
-            ((prefill.into_guarded_worker(), decode, runtime), guard)
-        })
         .map_err(|error| {
             Self::acquire_failure(model_id, error, |failure| {
                 self.pd_selection_failure(model_id, failure, media)
@@ -1093,7 +1098,7 @@ impl WorkerSelectionStage {
         encode_item_hashes: &[Vec<u8>],
         demand: EpdDemands,
         stated: impl Fn() -> placement::Stated + Sync,
-    ) -> Result<(AdmittedEpdSelection, PrefillLoadGuard), Response> {
+    ) -> Result<(AdmittedEpdSelection, PrefillAhead), Response> {
         acquire_prefill(
             self.prefill_admission.as_deref(),
             sticky_key,
@@ -1108,14 +1113,15 @@ impl WorkerSelectionStage {
                     &stated,
                 )
             },
+            // As for a PD pair: what the prefill's answer owes its send goes
+            // with its load, and the dispatch makes the decode's guard from
+            // its answer.
+            |(assignments, prefill, decode, runtime)| {
+                let (prefill, unsent) = prefill.unsent();
+                ((assignments, prefill, decode, runtime), unsent)
+            },
         )
         .await
-        // As for a PD pair: the prefill's side went into its guard, and the
-        // dispatch makes the decode's guard from its answer.
-        .map(|((assignments, prefill, decode, runtime), guard)| {
-            let prefill = prefill.into_guarded_worker();
-            ((assignments, prefill, decode, runtime), guard)
-        })
         .map_err(|error| {
             Self::acquire_failure(model_id, error, |failure| {
                 match failure {
@@ -2914,7 +2920,9 @@ mod tests {
         routers::{
             common::{
                 attempt_ledger::{mark_upstream_answer, AttemptLedger},
-                prefill_admission::{test_support::select_worker, PrefillReservation},
+                prefill_admission::{
+                    test_support::select_worker, PrefillLoadGuard, PrefillReservation,
+                },
                 retry::is_retryable_response,
             },
             grpc::{
@@ -8443,9 +8451,9 @@ mod tests {
         .with_queue_timeout(Duration::from_millis(50));
         let ctx = prepared_ctx(Arc::clone(&registry), None);
         let accepted = Some(Instant::now() - Duration::from_millis(100));
-        let guard = PrefillLoadGuard::Unbounded {
+        let guard = PrefillAhead::classic(PrefillLoadGuard::Unbounded {
             _guard: WorkerLoadGuard::with_key(Arc::clone(&prefill), None),
-        };
+        });
         assert_eq!(prefill.load(), 1, "the admission holds its claim");
 
         let Err(refused) = stage

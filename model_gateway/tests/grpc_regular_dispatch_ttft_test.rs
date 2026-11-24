@@ -6,14 +6,17 @@
 //! current-thread runtime, as the PD TTFT regressions do.
 //!
 //! The request's wait ahead of that dispatch
-//! (`smg_router_dispatch_wait_seconds`) is recorded with a streamed route's
-//! time to first token: once, under its labels, counted from the entry stamp
-//! the request's handler runs under, so a failed attempt is inside it. The
-//! body is read outside the stamp, as the connection reads it.
+//! (`smg_router_dispatch_wait_seconds`) is recorded once per answer, under
+//! the labels of its other records, counted from the entry stamp the
+//! request's handler runs under, so a failed attempt is inside it: with a
+//! streamed route's time to first token, and alone for a collected answer,
+//! which has no first token. The body is read outside the stamp, as the
+//! connection reads it.
 //!
-//! A streamed Responses tool loop dispatches one chat generation per turn,
-//! from a task of its own. Every turn records a wait with its TTFT: the first
-//! from the request's entry stamp, a later one from where that turn starts.
+//! A Responses tool loop dispatches one chat generation per turn (the
+//! streamed loop from a task of its own). Every turn records a wait, a
+//! streamed turn with its TTFT: the first from the request's entry stamp, a
+//! later one from where that turn starts.
 
 use std::{
     sync::{
@@ -444,17 +447,17 @@ fn held_headers_are_included(route: Route, streaming: bool) {
     }
     if streaming {
         assert_stream_records(&rendered, endpoint, generation, route.output_tokens());
-        // The request ran outside an entry stamp: its TTFT is recorded alone,
-        // the dispatch wait has no start to count from.
-        assert!(
-            sample(&rendered, DISPATCH_WAIT, "count", endpoint).is_none(),
-            "{endpoint}: a dispatch wait outside an entry stamp:\n{rendered}"
-        );
     } else {
-        // Collected responses retain their existing generation-only semantics.
+        // A collected response shows no first token: no TTFT and no TPOT.
         assert!(ttft.is_none(), "{endpoint}: collected TTFT {ttft:?}");
         assert!(tpot.is_none(), "{endpoint}: collected TPOT {tpot:?}");
     }
+    // The request ran outside an entry stamp: its other records are made
+    // alone, the dispatch wait has no start to count from.
+    assert!(
+        sample(&rendered, DISPATCH_WAIT, "count", endpoint).is_none(),
+        "{endpoint}: a dispatch wait outside an entry stamp:\n{rendered}"
+    );
 }
 
 #[test]
@@ -564,34 +567,60 @@ fn dispatch_waits_beside_the_ttfts(rendered: &str, labels: &[&str], streams: u32
 /// A streamed answer records its dispatch wait once, with its TTFT and under
 /// its labels: the wait reaches the stamp's lead, and the two add up to the
 /// time to first token from the request's entry, the worker's hold included.
-/// A collected answer records no first token and so no wait.
+/// A collected answer records its wait once too, under its generation
+/// record's labels and with no first token: the wait reaches the stamp's lead
+/// and ends where the generation clock starts, so the two add up to no more
+/// than the request's own time since its entry. A wait read after the
+/// worker's hold, or where the answer is built, counts that time twice and
+/// passes it.
 #[expect(
     clippy::print_stderr,
     reason = "report the measured intervals alongside the regression result"
 )]
 fn under_an_entry_stamp(route: Route, streaming: bool) {
+    let mut since_entry = Duration::ZERO;
     let rendered = render_after(|| async {
         let router = route.router().await;
+        let entered = std::time::Instant::now() - ENTRY_LEAD;
         request_entered(
             router.as_ref(),
             route,
             streaming,
-            Some(entered_a_lead_ago()),
+            Some(RequestStarted::at(entered)),
         )
         .await;
+        since_entry = entered.elapsed();
     });
     let endpoint = route.endpoint();
-    if !streaming {
-        for family in [DISPATCH_WAIT, "smg_router_ttft_seconds"] {
-            assert!(
-                sample(&rendered, family, "count", endpoint).is_none(),
-                "{endpoint}: a collected answer recorded {family}:\n{rendered}"
-            );
-        }
-        return;
-    }
     let endpoint_label = format!("endpoint=\"{endpoint}\"");
     let labels = ["backend_type=\"regular\"", endpoint_label.as_str()];
+    if !streaming {
+        assert!(
+            sample(&rendered, "smg_router_ttft_seconds", "count", endpoint).is_none(),
+            "{endpoint}: a collected answer recorded a first token:\n{rendered}"
+        );
+        let generation_family = "smg_router_generation_duration_seconds";
+        let wait = observation(&rendered, DISPATCH_WAIT, endpoint);
+        let generation = observation(&rendered, generation_family, endpoint);
+        assert_eq!(
+            count_labels(&rendered, DISPATCH_WAIT, &labels),
+            count_labels(&rendered, generation_family, &labels),
+            "{endpoint}: the dispatch wait carries the generation record's labels:\n{rendered}"
+        );
+        let since_entry = since_entry.as_secs_f64();
+        eprintln!(
+            "regular {endpoint} (collected): dispatch wait={wait} generation={generation} since entry={since_entry}"
+        );
+        assert!(
+            wait >= ENTRY_LEAD.as_secs_f64(),
+            "{endpoint}: dispatch wait {wait} runs from the entry stamp ({ENTRY_LEAD:?} before the handler)"
+        );
+        assert!(
+            wait + generation <= since_entry,
+            "{endpoint}: dispatch wait {wait} ends where the generation clock ({generation}) starts: the two fit in the request's time since its entry ({since_entry})"
+        );
+        return;
+    }
     let wait = dispatch_wait_beside_the_ttft(&rendered, &labels);
     let ttft = observation(&rendered, "smg_router_ttft_seconds", endpoint);
     eprintln!("regular {endpoint}: dispatch wait={wait} ttft={ttft}");
@@ -639,13 +668,36 @@ fn streaming_batched_completions_records_one_dispatch_wait() {
 }
 
 #[test]
-fn collected_chat_records_no_dispatch_wait() {
+fn collected_chat_records_its_dispatch_wait_and_no_ttft() {
     under_an_entry_stamp(Route::Chat, false);
 }
 
 #[test]
-fn collected_completions_records_no_dispatch_wait() {
+fn collected_messages_records_its_dispatch_wait_and_no_ttft() {
+    under_an_entry_stamp(Route::Messages, false);
+}
+
+#[test]
+fn collected_generate_records_its_dispatch_wait_and_no_ttft() {
+    under_an_entry_stamp(Route::Generate, false);
+}
+
+#[test]
+fn collected_completions_records_its_dispatch_wait_and_no_ttft() {
     under_an_entry_stamp(Route::Completions, false);
+}
+
+/// A collected batch has one wait, ahead of its earliest dispatch.
+#[test]
+fn collected_batched_completions_records_one_dispatch_wait() {
+    under_an_entry_stamp(Route::BatchedCompletions, false);
+}
+
+/// A transcription decodes through the generate processor and records its
+/// wait under its own endpoint label.
+#[test]
+fn collected_transcription_records_its_dispatch_wait_and_no_ttft() {
+    under_an_entry_stamp(Route::Transcriptions, false);
 }
 
 /// The ids of one Harmony final-channel turn, as the engine streams them.
@@ -659,23 +711,30 @@ fn harmony_output_ids() -> Vec<u32> {
 
 /// A Harmony collected chat anchors its generation at the dispatch: the
 /// Harmony pipeline's processor reads the attempt's dispatch, not its own
-/// entry.
+/// entry. Its handler runs under an entry stamp, and it records its dispatch
+/// wait once, with no first token, under the Harmony pipeline's backend
+/// label: the wait ends where the generation clock starts, so the two fit in
+/// the request's time since its entry.
 #[test]
 fn harmony_collected_chat_includes_the_held_header_delay() {
     let ids = harmony_output_ids();
     let tokens = u64::try_from(ids.len()).expect("a small count");
+    let mut since_entry = Duration::ZERO;
     let rendered = render_after(|| async {
         let port = serve_engine(held_headers_engine(Some(ids)).into_server()).await;
         let router = router_over(&[port], HARMONY_MODEL, None).await;
         let request =
             serde_json::from_value(chat_request(HARMONY_MODEL, false)).expect("chat request");
-        let response = router
-            .route_chat(None, &tenant(), Arc::new(request), HARMONY_MODEL)
+        let tenant = tenant();
+        let entered = std::time::Instant::now() - ENTRY_LEAD;
+        let response = RequestStarted::at(entered)
+            .scope(router.route_chat(None, &tenant, Arc::new(request), HARMONY_MODEL))
             .await;
         let status = response.status();
         let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
             .await
             .expect("response body");
+        since_entry = entered.elapsed();
         let body: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON response");
         assert_eq!(status, http::StatusCode::OK, "{body}");
         assert_eq!(
@@ -698,6 +757,27 @@ fn harmony_collected_chat_includes_the_held_header_delay() {
     assert!(
         generation >= (HELD_HEADERS_DELAY + POST_FIRST_DELAY).as_secs_f64(),
         "harmony chat: generation {generation} must include the held-header and decode delays"
+    );
+    assert_eq!(
+        metrics_capture::sample(&rendered, DISPATCH_WAIT, "count", &labels),
+        Some(1.0),
+        "harmony chat: one dispatch wait:\n{rendered}"
+    );
+    assert_eq!(
+        metrics_capture::sample(&rendered, "smg_router_ttft_seconds", "count", &labels),
+        None,
+        "harmony chat: a collected answer recorded a first token:\n{rendered}"
+    );
+    let wait =
+        metrics_capture::sample(&rendered, DISPATCH_WAIT, "sum", &labels).expect("histogram sum");
+    assert!(
+        wait >= ENTRY_LEAD.as_secs_f64(),
+        "harmony chat: dispatch wait {wait} runs from the entry stamp ({ENTRY_LEAD:?} before the handler)"
+    );
+    let since_entry = since_entry.as_secs_f64();
+    assert!(
+        wait + generation <= since_entry,
+        "harmony chat: dispatch wait {wait} ends where the generation clock ({generation}) starts: the two fit in the request's time since its entry ({since_entry})"
     );
 }
 
@@ -814,7 +894,8 @@ fn a_retried_dispatch_anchors_at_the_answering_attempt() {
 
 /// A client that leaves after the first chunk records nothing: no TTFT,
 /// generation or TPOT sample for the route, and no dispatch wait though its
-/// handler ran under an entry stamp (the wait is recorded with the TTFT).
+/// handler ran under an entry stamp (the wait is recorded with the answer's
+/// other records, at the stream's end, and this stream makes none).
 #[test]
 fn a_client_leaving_after_the_first_chunk_records_no_stream_metrics() {
     let rendered = render_after(|| async {
@@ -884,20 +965,21 @@ async fn tool_loop_router() -> Box<dyn RouterTrait> {
     .await
 }
 
-/// One streamed Responses request, read to its end: the body. Its handler
-/// runs under the entry stamp `entered`, and the body is read outside it, as
-/// the connection reads it. With `mcp_server` the request names the MCP
-/// server at that URL as its tool, which makes it a tool loop.
+/// One Responses request, read to its end: the body. Its handler runs under
+/// the entry stamp `entered`, and the body is read outside it, as the
+/// connection reads it. With `mcp_server` the request names the MCP server
+/// at that URL as its tool, which makes it a tool loop.
 #[expect(clippy::expect_used, reason = "test helper")]
-async fn streamed_responses(
+async fn responses_request(
     router: &dyn RouterTrait,
     mcp_server: Option<&str>,
+    streaming: bool,
     entered: RequestStarted,
 ) -> String {
     let mut request = serde_json::json!({
         "model": MODEL,
         "input": "Hello",
-        "stream": true,
+        "stream": streaming,
         "max_output_tokens": 16,
     });
     if let Some(server_url) = mcp_server {
@@ -919,19 +1001,35 @@ async fn streamed_responses(
         .expect("response body");
     let body = String::from_utf8(bytes.to_vec()).expect("UTF-8 body");
     assert_eq!(status, http::StatusCode::OK, "{body}");
+    body
+}
+
+/// One streamed Responses request, read to its end (see [`responses_request`]).
+async fn streamed_responses(
+    router: &dyn RouterTrait,
+    mcp_server: Option<&str>,
+    entered: RequestStarted,
+) -> String {
+    let body = responses_request(router, mcp_server, true, entered).await;
     assert!(body.contains("event: response.completed"), "{body}");
     body
 }
 
-/// One streamed Responses tool loop of two turns against `mcp`, read to its
-/// end: the first generation calls the server's tool once, the second answers.
-async fn streamed_tool_loop(
+/// One Responses tool loop of two turns against `mcp`, streamed or collected,
+/// read to its end: the first generation calls the server's tool once, the
+/// second answers.
+async fn tool_loop(
     router: &dyn RouterTrait,
     mcp: &MockMCPServer,
+    streaming: bool,
     entered: RequestStarted,
 ) {
     let calls = mcp.call_count();
-    let body = streamed_responses(router, Some(&mcp.url()), entered).await;
+    let body = if streaming {
+        streamed_responses(router, Some(&mcp.url()), entered).await
+    } else {
+        responses_request(router, Some(&mcp.url()), false, entered).await
+    };
     assert_eq!(
         mcp.call_count(),
         calls + 1,
@@ -959,7 +1057,7 @@ fn a_streamed_tool_loop_records_a_dispatch_wait_with_every_turn_s_ttft() {
     let rendered = render_after(|| async {
         let router = tool_loop_router().await;
         let mut mcp = MockMCPServer::start().await.expect("the MCP server");
-        streamed_tool_loop(router.as_ref(), &mcp, entered_a_lead_ago()).await;
+        tool_loop(router.as_ref(), &mcp, true, entered_a_lead_ago()).await;
         mcp.stop().await;
     });
     // A turn of the loop is a chat generation: it records under the chat
@@ -1005,9 +1103,57 @@ fn chat_and_responses_streams_record_as_many_dispatch_waits_as_ttfts() {
         )
         .await;
         streamed_responses(router.as_ref(), None, entered_a_lead_ago()).await;
-        streamed_tool_loop(router.as_ref(), &mcp, entered_a_lead_ago()).await;
+        tool_loop(router.as_ref(), &mcp, true, entered_a_lead_ago()).await;
         mcp.stop().await;
     });
     let labels = ["backend_type=\"regular\"", "endpoint=\"chat\""];
     dispatch_waits_beside_the_ttfts(&rendered, &labels, 4);
+}
+
+/// A collected Responses request whose tool loop runs two turns records a
+/// dispatch wait for each turn's generation, under the chat route's labels,
+/// and no first token. The first turn's wait counts from the request's entry
+/// stamp. The second turn's counts from where that turn starts: counted from
+/// the request's entry it would hold the whole first generation and the tool
+/// call, and the two waits together stay under the first generation alone.
+#[expect(
+    clippy::print_stderr,
+    reason = "report the measured intervals alongside the regression result"
+)]
+#[test]
+fn a_collected_tool_loop_records_a_dispatch_wait_for_every_turn() {
+    let rendered = render_after(|| async {
+        let router = tool_loop_router().await;
+        let mut mcp = MockMCPServer::start().await.expect("the MCP server");
+        tool_loop(router.as_ref(), &mcp, false, entered_a_lead_ago()).await;
+        mcp.stop().await;
+    });
+    let labels = ["backend_type=\"regular\"", "endpoint=\"chat\""];
+    for (family, observations) in [
+        (DISPATCH_WAIT, Some(2.0)),
+        ("smg_router_generation_duration_seconds", Some(2.0)),
+        ("smg_router_ttft_seconds", None),
+    ] {
+        assert_eq!(
+            metrics_capture::sample(&rendered, family, "count", &labels),
+            observations,
+            "{family}: one record per collected turn, and no first token:\n{rendered}"
+        );
+    }
+    let waits =
+        metrics_capture::sample(&rendered, DISPATCH_WAIT, "sum", &labels).expect("histogram sum");
+    eprintln!("collected tool loop, two turns: dispatch waits={waits}");
+    let lead = ENTRY_LEAD.as_secs_f64();
+    assert!(
+        waits >= lead,
+        "the first turn's dispatch wait runs from the request's entry stamp ({ENTRY_LEAD:?} before the handler): {waits}"
+    );
+    // The first turn's wait is the stamp's lead at least, so the rest of the
+    // sum bounds the second turn's from above.
+    let second_turn_at_most = waits - lead;
+    let first_generation = (HELD_HEADERS_DELAY + POST_FIRST_DELAY).as_secs_f64();
+    assert!(
+        second_turn_at_most < first_generation,
+        "the second turn's dispatch wait (at most {second_turn_at_most}) runs from that turn's start, not from the request's entry: the first generation alone took {first_generation}"
+    );
 }

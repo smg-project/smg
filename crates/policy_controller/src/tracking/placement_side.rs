@@ -39,11 +39,14 @@
 //! ([`PlacementSide::decode_again`]), so whatever the request lends that
 //! decision is asked under it: its route's rule
 //! ([`PlaceRequest::admits`]), its headers ([`PlaceRequest::headers`]),
-//! its ring ([`PlaceRequest::ring`]) and its lists' admission. None of
-//! them may send or drop a side of the pair, or report through or drop a
-//! handle on a side's end: it would wait on a lock it is asked under and
-//! never return. A single request's side owns its placement and takes no
-//! lock, but the one it shares the placement with its handles behind.
+//! its ring ([`PlaceRequest::ring`]), its lists' admission
+//! ([`PairLists::admission`](crate::engine::PairLists::admission)) and its
+//! lists' workers, by their own calls ([`Worker::routing_state`] among
+//! them). None of them may send or drop a side of the pair, or report
+//! through or drop a handle on a side's end: it would wait on a lock it is
+//! asked under and never return. A single request's side owns its
+//! placement and takes no lock, but the one it shares the placement with
+//! its handles behind.
 //!
 //! **The order of a pair's words** is kept here, in whatever order its
 //! host lets the two sides go. A decode that still stands chosen leaves
@@ -184,15 +187,16 @@ impl Pair {
     /// the decode's. The release of a prefill that never went out takes a
     /// chosen decode as an end does, and is held back the same.
     ///
-    /// An outcome says that its side went out: a send never said is said
-    /// here first, at the report's instant, as a placement's own end says
-    /// it ([`Placement::ended`]). So a prefill reported with no send is
-    /// held back like any other while its decode stands chosen.
+    /// An outcome says that its side went out. A prefill's send never said
+    /// is said here first, at the report's instant, as a placement's own
+    /// end says it ([`Placement::ended`]). So a prefill reported with no
+    /// send is held back like any other while its decode stands chosen. A
+    /// decode needs no such word: its end says its own send, at the same
+    /// instant.
     fn ended(&mut self, side: Side, end: End) {
-        if let (Some(_), Some(held)) = (end.outcome, &mut self.placement.held) {
-            match side {
-                Side::Decode => held.dispatched_decode(end.at),
-                _ => held.dispatched(end.at),
+        if side != Side::Decode {
+            if let (Some(_), Some(held)) = (end.outcome, &mut self.placement.held) {
+                held.dispatched(end.at);
             }
         }
         let lease = self.placement.held.as_ref();
@@ -235,7 +239,7 @@ impl Of {
             return Err(Unplaced::Refused(refused));
         };
         let mut pair = pair.lock();
-        let decode = pair.placement.decode_taken(request)?;
+        let decode = Arc::clone(pair.placement.decode_taken(request)?);
         // The decode no longer stands chosen: a prefill's end that waited
         // for this side's word is said behind the decode the call took.
         pair.end_held_prefill();
@@ -396,9 +400,9 @@ impl PlacementSide {
     ///
     /// `request` states the request again, as [`Placement::decode_again`]
     /// reads it. What it lends the decision (its rule, its headers, its
-    /// ring and its lists' admission) is asked under the pair's lock and
-    /// must leave the pair's sides and the handles on their ends alone
-    /// (the module's words on the lock).
+    /// ring, its lists' admission and their workers' own calls) is asked
+    /// under the pair's lock and must leave the pair's sides and the
+    /// handles on their ends alone (the module's words on the lock).
     ///
     /// **The order.** The call is made once the prefill side's send was
     /// said. Its host may let the prefill side go before the call or

@@ -1354,8 +1354,9 @@ pub struct RequestFacts<'a> {
     /// where it derives the key
     /// ([`DerivedKey::source`](crate::document::DerivedKey)). An encode
     /// item's facts state it as false: the key they carry is the item's
-    /// own. In-process only: no frame states it, so under a controller's
-    /// address the prefix form places by any session key.
+    /// own. A gateway's frame states it to a controller, and a plugin's
+    /// frame states false. A frame of a host older than the field reads
+    /// false: under that host the prefix form places by any session key.
     pub session_key_from_rid: bool,
 }
 
@@ -1586,8 +1587,10 @@ pub struct Constraints<'a> {
     /// that meet them. Over a pair's two worker lists each side is held
     /// to the workers that meet them as its role is held to them
     /// ([`Demands::held_by`](crate::engine::Demands::held_by)). An encode
-    /// request's three lists keep none yet: such a request that states a
-    /// demand is shed under the stage `wires`, whatever its lists state.
+    /// request's three lists are held a list at a time too. Where it has
+    /// items its encoders are held to the runtime and the media's demands
+    /// ([`Demands::beside_pair`](crate::engine::Demands::beside_pair)),
+    /// and its pair's two sides to the rest.
     /// In-process only: this protocol version
     /// states no demand, and a handle refuses a request that states one
     /// before it sends it over a link (`DecisionGuard::asked`).

@@ -40,7 +40,7 @@ async fn protection_retry_and_breaker_families_start_at_zero() {
         host: "127.0.0.1".to_string(),
         duration_buckets: None,
     });
-    let (addr, _server) = start_metrics_server(handle, "127.0.0.1".to_string(), 0)
+    let (addr, _server) = start_metrics_server(handle, "127.0.0.1".to_string(), 0, None)
         .await
         .expect("metrics server binds an ephemeral port");
     init_startup_series();
