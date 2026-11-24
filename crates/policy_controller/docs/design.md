@@ -2077,9 +2077,10 @@ names no lease under a pair plan, are answered `Busy`. By the contract the gatew
 request locally (`crates/policy_controller/contracts/policy_controller.proto`) **[planned]**: no
 gateway calls a controller yet.
 
-A frame states no source of a key. So a controller's prefix ring places by any session key, also
-one the request's own id handed, where a gateway's own process places that request by its prompt
-(section 8.1).
+A frame states whether the request's own id handed its session key. Where it says so, a
+controller's prefix ring places that request by its prompt, as a gateway's own process does
+(section 8.1). The frame of a host older than that field says nothing, and under it the id's key
+places as any other.
 
 ### 10.2 As designed **[partly]**
 
