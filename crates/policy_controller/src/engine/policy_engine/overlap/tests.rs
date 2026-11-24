@@ -1059,6 +1059,38 @@ fn a_pick_that_meets_a_held_record_leaves_its_prefix_out() {
     assert_eq!(bed.affinity.left_out(), 1);
 }
 
+/// A worker that leaves behind a decision's read of the record and ahead
+/// of its write is given no place: the record held none for it at the
+/// leave, and the pick's write gives it none. So where the worker is told
+/// gone, and where the standing workers are said whole without it.
+#[test]
+fn a_worker_that_leaves_under_its_first_pick_is_given_no_place() {
+    let (affinity, _, _) = hosted(false);
+    let bed = Bed::new(affinity, preset("cache_aware"), 4);
+    let asked = prompt(1_000, 4);
+    let holders_behind = |leave: &dyn Fn()| {
+        let decision = decide(
+            &bed.affinity,
+            &bed.pool,
+            &bed.spec,
+            &bed.workers,
+            &bed.ids,
+            &mut request(&asked, 7, NOW),
+            |_| None,
+            |_| true,
+            |_| {
+                leave();
+                picked(2, bed.ids[2])
+            },
+        );
+        assert!(decision.pick().is_some());
+        bed.holders(&asked, NOW)
+    };
+    assert!(holders_behind(&|| bed.affinity.forget(bed.ids[2])).is_empty());
+    let standing = [bed.ids[0], bed.ids[1], bed.ids[3]];
+    assert!(holders_behind(&|| bed.affinity.keep(&standing)).is_empty());
+}
+
 /// A list of no worker is read no table: its request is named no holder, no
 /// record of sent prefixes is made, and the host is asked for no index and
 /// no tree.
