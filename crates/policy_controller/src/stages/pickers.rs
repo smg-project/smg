@@ -66,9 +66,10 @@ fn draw_in_band(
 /// band's best where it was: the band is counted once, each slot draws its
 /// row among the band's rows left as [`draw_in_band`] would (one value of
 /// `draw` while two rows are left, none for the last), and one more pass
-/// finds the rows drawn. Returns how many of `picks` it filled, in slot
-/// order: none where the band is not flat, and the slots it leaves are drawn
-/// one by one.
+/// finds the rows drawn, or none where every row is of the band: a rank is
+/// its row there. Returns how many of `picks` it filled, in slot order:
+/// none where the band is not flat, and the slots it leaves are drawn one
+/// by one.
 ///
 /// Inlined into the ranked push's two bodies, a pass's and a draw's, as it
 /// was into the one body before a draw had its own.
@@ -111,6 +112,13 @@ fn draw_flat(
         slots.copy_within(at..slot, at + 1);
         ranks[at] = rank;
         slots[at] = slot;
+    }
+    // Where every row is of the band, a row's rank is its place.
+    if rows == scores.len() {
+        for (&rank, &slot) in ranks.iter().zip(&slots).take(fills) {
+            picks[slot] = rank;
+        }
+        return fills;
     }
     let (mut next, mut seen) = (0usize, 0usize);
     for (i, &s) in scores.iter().enumerate() {
