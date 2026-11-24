@@ -270,6 +270,7 @@ impl Admitted {
         }
         self.places.clear();
         if let Some(places) = places {
+            super::places::debug_assert_ascending(places);
             self.places.reserve(self.rows.len());
             number(&self.from, places, &mut self.places);
         }
@@ -367,6 +368,7 @@ impl EncodeScratch {
     #[cold]
     #[inline(never)]
     fn hold_opened(&mut self, facts: &[EncoderFacts], width: usize, places: &[u32]) {
+        super::places::debug_assert_ascending(places);
         self.reached.clear();
         number(&self.opened, places, &mut self.reached);
         // Both lists ascend, so a kept encoder moves to a slot at or ahead
@@ -594,10 +596,13 @@ impl Engine {
     /// the same. Where a list's places name workers and none of them takes
     /// the request, though a worker outside them does, the request is held
     /// off every worker that takes it: it is shed under the places' name
-    /// (`places`), which no gap says. Places that name no worker of a list
-    /// are no such case. Such places of a side shed the request as they
-    /// shed its pair alone, and such places of the encoders shed it as a
-    /// pool with no open encoder does.
+    /// (`places`), which no gap says. A gap this pass reads is answered
+    /// ahead of every list's places: no other place closes it. What the
+    /// pair's own decision answers stays behind the pass, under places as
+    /// under none. Places that name no worker of a list are no such case.
+    /// Such places of a side shed the request as they shed its pair alone,
+    /// and such places of the encoders shed it as a pool with no open
+    /// encoder does.
     #[expect(
         clippy::too_many_arguments,
         reason = "the pair entry's inputs and the encode side's"
@@ -747,6 +752,11 @@ impl Engine {
         // stand at the request's places already.
         let unplaced;
         let mut key_cx = encode_cx;
+        // Whether the encoders' places hold the request off every encoder
+        // that takes it. The word waits behind the gaps of the pairs'
+        // membership below: such a gap stands whatever the places are,
+        // and no other place closes it.
+        let mut held_off = false;
         let takes =
             |row: &Candidate, of: &EncoderFacts| takes_request(&items, pixels, wires, row, of);
         let open = |row: &Candidate| {
@@ -788,17 +798,15 @@ impl Engine {
             // encoder: it says what the model takes, and a place says what
             // this request may reach. Encoders at the places that take no
             // such request, beside one outside them that does, hold it off
-            // every encoder that takes it. Places that name no encoder
-            // leave the request none, and the gap below says so.
+            // every encoder that takes it: the pass says so behind the
+            // pair's gaps. Places that name no encoder leave the request
+            // none, and the gap below says so.
             if let Some(places) = encode_cx.places {
                 let mut at_places = reached(&encode, Some(places)).peekable();
                 let named = at_places.peek().is_some();
-                if any_member
+                held_off = any_member
                     && named
-                    && !at_places.any(|(row, of)| of.class != 0 && takes(row, of))
-                {
-                    return gap(PLACES);
-                }
+                    && !at_places.any(|(row, of)| of.class != 0 && takes(row, of));
                 side.hold_opened(encode.facts, width, places);
                 any_open = !side.opened.is_empty();
                 unplaced = Constraints {
@@ -807,7 +815,9 @@ impl Engine {
                 };
                 key_cx = &unplaced;
             }
-            if !any_open {
+            // A request the places hold off has no open encoder at them, and
+            // its answer waits: the gap of no open encoder is not its own.
+            if !any_open && !held_off {
                 // Encoders the overload veto left none of are a saturated
                 // fleet, and the shed says so.
                 if let Some(stage) =
@@ -887,6 +897,11 @@ impl Engine {
         }
         if items.decode_images && any_served && !any_vision {
             return gap(DECODE_VISION);
+        }
+        // No gap this pass reads stands, and the encoders' places hold
+        // the request off every encoder that takes it.
+        if held_off {
+            return gap(PLACES);
         }
         let vision = items.decode_images || (items.references && pixels && any_vision);
         // The rows the pair is picked among. With every row admitted the

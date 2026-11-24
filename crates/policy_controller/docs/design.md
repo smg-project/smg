@@ -909,9 +909,11 @@ numbers a mask: a place whose worker it left out opens none. An item's encoder i
 encoders' places, and a prefill that only other encoders hand to is not the pair's. Where a list's
 places name workers and none of them takes the request, though a worker outside them does, the
 request is shed under `places`: it is held off every worker that takes it. No gap of the membership
-says that, and the gaps stay read over every worker. Places that name no worker of a list are no
-such case. Such places of a side shed the request as they shed its pair alone, and such places of
-the encoders shed it as a list with no open encoder does.
+says that, and the gaps stay read over every worker. A gap the encode pass reads is answered ahead
+of every list's `places`: no other place closes it. What the pair's own decision answers stays
+behind the pass, under places as under none. Places that name no worker of a list are no such
+case. Such places of a side shed the request as they shed its pair alone, and such places of the
+encoders shed it as a list with no open encoder does.
 A pair's host states its standing vetoes the same way, the places each list's vetoes mask and those
 a hold stands on (`PairLists::prefill_stalled`, `prefill_held`, `decode_stalled`, `decode_held`).
 Each side reads its own, under an encode request too, and a pair's or an encode request's own mask
