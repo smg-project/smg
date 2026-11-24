@@ -412,7 +412,8 @@ impl Affinity {
     /// The workers that stand, said whole behind a read of the host's
     /// registry: every record forgets each worker it holds a place for
     /// that is not among them, so a worker whose leave was never told
-    /// keeps no place. Takes what [`Self::forget`] takes.
+    /// keeps no place. Takes what [`Self::forget`] takes. A store that
+    /// took its membership whole says them too.
     pub(super) fn keep(&self, standing: &[WorkerId]) {
         self.leaves.fetch_add(1, Ordering::Relaxed);
         let standing: FxHashSet<WorkerId> = standing.iter().copied().collect();
@@ -470,6 +471,18 @@ impl Affinity {
         let records = self.records.lock();
         let left_out = |record: &Arc<PrefixRecord>| record.left_out.load(Ordering::Relaxed);
         self.left_out.load(Ordering::Relaxed) + records.values().map(left_out).sum::<u64>()
+    }
+
+    /// The workers each record holds a place for, by its model, for the
+    /// cases of a served controller.
+    #[cfg(all(test, feature = "controller"))]
+    pub(crate) fn held(&self) -> Vec<(Box<str>, Vec<WorkerId>)> {
+        let records = self.records.lock();
+        let held = |record: &Arc<PrefixRecord>| record.predictor.read().held().collect();
+        records
+            .iter()
+            .map(|(model, record)| (model.clone(), held(record)))
+            .collect()
     }
 
     /// The record of `model`, made at its first asking and held to `bound`

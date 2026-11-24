@@ -28,7 +28,6 @@ use crate::{
         decision_engine::DecodeRefused,
         view::{LoadRow, Session, WorkerId, LOAD_REPORT_CLOCK_HISTORY_MS},
     },
-    stages::lifecycle::Lifecycle,
     store::{
         applied::Applied,
         health::{HealthSink, VetoWrite},
@@ -989,7 +988,7 @@ impl MemoryStore {
     /// Tell the engine of the world the store shows one membership word:
     /// under the workers lock, with the load lock let go.
     fn tell_engine(&self, word: &Membership<'_>) {
-        self.world.load().spec().engine().on_membership(word);
+        self.world.load().applied().on_membership(word);
     }
 
     /// Tell the standing generation's engine what `change` is to it
@@ -1003,9 +1002,10 @@ impl MemoryStore {
     /// returns, whoever wrote. A join is told when the store takes it, and
     /// the world that lists its row follows at its window's build. A
     /// decision takes neither lock and meets the call at a stage's own lock
-    /// alone. One that read its world before a leave's swap may still name
-    /// the worker: a stage answers that from its own state, as the ring
-    /// fences a pruned id ([`crate::stages::RETIRED_WORKER_TTL`]).
+    /// or at a record of sent prefixes' own, and nowhere else. One that
+    /// read its world before a leave's swap may still name the worker: a
+    /// stage answers that from its own state, as the ring fences a pruned
+    /// id ([`crate::stages::RETIRED_WORKER_TTL`]).
     fn tell_membership(&self, change: MembershipChange) {
         if let Some(change) = change.as_lifecycle() {
             self.tell_engine(&change);

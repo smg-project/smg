@@ -693,6 +693,12 @@ impl StoreSnapshot {
         &self.spec
     }
 
+    /// This publication's document as its store holds it ([`Applied`]):
+    /// what a word of the store's membership and its host's tick reach.
+    pub(crate) fn applied(&self) -> &Applied {
+        &self.spec
+    }
+
     /// The front that decides under this publication's document: the
     /// engine object whose stages the store tells the words of a lease
     /// ([`Applied`]). Handed under the borrow of the world, as the document
