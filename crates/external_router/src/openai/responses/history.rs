@@ -9,15 +9,15 @@ use axum::response::Response;
 use openai_protocol::{
     event_types::ItemType,
     responses::{
-        from_turn_boundary, without_outputs_of_missing_calls, ResponseContentPart, ResponseInput,
-        ResponseInputOutputItem, ResponsesRequest,
+        from_turn_boundary, without_calls_answered_by, without_outputs_of_missing_calls,
+        ResponseContentPart, ResponseInput, ResponseInputOutputItem, ResponsesRequest,
     },
 };
 use serde::Deserialize;
 use serde_json::Value;
 use smg_data_connector::{
-    is_unstored, visible_chain, ConversationId, ConversationItem, ListParams, ResponseId,
-    ResponseStorageError, SortOrder, StorageFailure, StoredResponse,
+    ConversationId, ConversationItem, ListParams, ResponseId, ResponseStorageError, SortOrder,
+    StorageFailure, StoredResponse,
 };
 use tracing::warn;
 
@@ -69,7 +69,7 @@ pub(crate) async fn load_input_history(
     if let Some(conv_id_str) = conversation {
         let conv_id = ConversationId::from(conv_id_str);
         check_conversation_visible(components, &conv_id, tenant, model).await?;
-        let mut items = conversation_window_items(components, &conv_id, model).await?;
+        let mut items = conversation_window_items(components, &conv_id, tenant, model).await?;
         let own_input =
             std::mem::replace(&mut request_body.input, ResponseInput::Items(Vec::new()));
         append_current_input(&mut items, own_input, conv_id_str);
@@ -127,18 +127,10 @@ async fn visible_previous_chain(
     let prev_id = ResponseId::from(prev_id_str);
     match components
         .response_storage
-        .get_response_chain(&prev_id, None)
+        .get_response_chain_for(&prev_id, tenant)
         .await
-        .map(|chain| visible_chain(chain.responses, tenant))
     {
-        Ok(responses)
-            if !responses.is_empty()
-                && !responses
-                    .last()
-                    .is_some_and(|response| is_unstored(response)) =>
-        {
-            Ok(responses)
-        }
+        Ok(chain) if !chain.responses.is_empty() => Ok(chain.responses),
         Ok(_) | Err(ResponseStorageError::ResponseNotFound(_)) => {
             super::record_error(
                 model,
@@ -219,6 +211,7 @@ async fn check_conversation_visible(
 async fn conversation_window_items(
     components: &ResponsesComponents,
     conv_id: &ConversationId,
+    tenant: Option<&str>,
     model: &str,
 ) -> Result<Vec<ResponseInputOutputItem>, Response> {
     let params = ListParams {
@@ -246,12 +239,29 @@ async fn conversation_window_items(
     if cut {
         stored_items.drain(..stored_items.len() - MAX_CONVERSATION_HISTORY_ITEMS);
     }
-    let mut items: Vec<ResponseInputOutputItem> = stored_items
+    let mut hidden = false;
+    // The rows the rule hid, converted: the call of an output among them is
+    // not replayed either.
+    let mut skipped = Vec::new();
+    let items: Vec<ResponseInputOutputItem> = stored_items
         .into_iter()
-        .filter_map(stored_item_as_input)
+        .filter_map(|row| {
+            let visible = row.is_visible_to(tenant);
+            hidden |= !visible;
+            let item = stored_item_as_input(row)?;
+            if !visible {
+                skipped.push(item);
+                return None;
+            }
+            Some(item)
+        })
         .collect();
+    let mut items = without_calls_answered_by(items, &skipped);
     if cut {
         items = without_outputs_of_missing_calls(from_turn_boundary(items));
+    } else if hidden {
+        // The output of a call the rule hid is no history, as after a cut.
+        items = without_outputs_of_missing_calls(items);
     }
     Ok(items)
 }
@@ -553,6 +563,46 @@ mod tests {
             .map(|n| format!("{}:item {n}", if n % 2 == 1 { "user" } else { "assistant" }))
             .collect();
         assert_eq!(shape(&items), expected);
+    }
+
+    /// A call and its output replay together or not at all: when the caller
+    /// may not see one of the two, the other goes with it. A second output
+    /// of the call takes nothing with it: the call keeps the output the
+    /// caller may see.
+    #[tokio::test]
+    async fn a_tool_row_the_caller_may_not_see_takes_its_pair_out_of_the_replay() {
+        for hide_call in [true, false] {
+            let components = components().await;
+            let (mut call, mut output) = (call_row("call_other"), output_row("call_other"));
+            let hidden = if hide_call { &mut call } else { &mut output };
+            hidden.tenant = Some("other".into());
+            link_rows(&components, vec![message_row(1), call, output]).await;
+            assert_eq!(
+                shape(&loaded_input(&components, "item 2").await),
+                ["user:item 1", "user:item 2"],
+                "hide_call {hide_call}"
+            );
+        }
+
+        let components = components().await;
+        let mut second = output_row("call_own");
+        second.tenant = Some("other".into());
+        let rows = vec![
+            message_row(1),
+            call_row("call_own"),
+            output_row("call_own"),
+            second,
+        ];
+        link_rows(&components, rows).await;
+        assert_eq!(
+            shape(&loaded_input(&components, "item 2").await),
+            [
+                "user:item 1",
+                "function_call:call_own",
+                "function_call_output:call_own",
+                "user:item 2"
+            ]
+        );
     }
 
     /// A conversation one item longer than the limit, whose first items are

@@ -47,6 +47,7 @@ use crate::{
         translate_request_sglang, RankPlacement, SglangGenerateStream, SglangProfileStart,
     },
     sglang_encode::{EncodeDispatchRequest, EncodeNotice, SglangEncodeDispatcher},
+    sglang_v41_items::V41Vision,
     sockets::{ensure_ipc_socket_dir, zmq_socket_addresses, Handshake},
     stream::{RequestDeadline, ZmqGenerateStream},
     structured_outputs::{
@@ -1221,6 +1222,10 @@ impl ZmqEngineClient {
         } else {
             RankPlacement::RoomResidue
         };
+        // The served DeepSeek-V4.1 model's patch geometry, as every rank
+        // declared it at its handshake: a request without a pin is placed on
+        // a rank at submit, by load, after this translation.
+        let v41_vision = V41Vision::from_handshakes(client.engines());
         let mut streams = Vec::new();
         // Fan-out clones share identical media; cache only within this request.
         let mut shared_hashes = None;
@@ -1232,6 +1237,7 @@ impl ZmqEngineClient {
                 ranks,
                 placement,
                 &self.meta.pin_yield,
+                v41_vision,
             )
             .map_err(tonic::Status::invalid_argument)?;
             request.trace_headers.clone_from(&trace_headers);

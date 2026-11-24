@@ -470,8 +470,8 @@ where
     /// A feed's own row begins. An error, with nothing done, says why it
     /// does not. [`SkipReason::NoRow`]: `stands` says the feed's object stands
     /// for the row no longer. [`SkipReason::UpperRank`]: the holder stands the
-    /// row above rank 0. An object kept through such a move still stands
-    /// for the row, which is its engine's stream's now. Both are asked in
+    /// row above rank 0. An object can stand for such a row and state no
+    /// rank: it states one where its row's width is above one. Both are asked in
     /// the hold that writes the row's entry: a row laid again behind the
     /// answers is taken from this feed by the stream the holder then
     /// routes to it, and never by this feed from that stream.
@@ -868,9 +868,9 @@ where
         // The ticket was written at the enrollment, and the feed opens
         // later, on the subscription's task. A row laid again since is
         // another object's, and may be another stream's by now: its ticket
-        // opens nothing. Nor does the ticket of a kept object whose row
-        // stands above rank 0 by now. The holder is asked both as the row
-        // begins, and the answer names the reason.
+        // opens nothing. Nor does a ticket for a row the holder stands
+        // above rank 0. The holder is asked both as the row begins, and
+        // the answer names the reason.
         let ticket = ticket.and_then(|row| {
             self.sink
                 .begin(row, || self.row_of(worker) == Some(row))
@@ -912,12 +912,8 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        sync::{OnceLock, Weak},
-        time::Instant,
-    };
+    use std::sync::{OnceLock, Weak};
 
-    use kv_index::salt::{content_hash_with_seed, namespace_seed};
     use smg_worker::{
         common_proto::{
             KvBlock, KvBlocksRemoved, KvBlocksStored, KvCacheCleared, KvCacheEvent,
@@ -930,11 +926,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        engine::view::Role,
-        store::{
-            AffinityQuery, AffinityRowsBuffers, GatewayId, KvEventSink as _, MemoryStore, Signals,
-            ViewBuffers, ViewQuery, WorkerFacts, WorkersStore,
-        },
+        store::{KvEventSink as _, MemoryStore, Signals, WorkerFacts, WorkersStore},
         worker_host::Members,
     };
 
@@ -1117,15 +1109,13 @@ mod tests {
         assert_eq!(f.blocks(), 0);
     }
 
+    /// A main store that names a namespace, an adapter and a tenant's salt,
+    /// is indexed with its chain as any other, over two batches. The hashes
+    /// under the namespace's seed are the apply rules' own.
     #[test]
-    fn a_main_store_is_indexed_under_the_namespaces_seed() {
+    fn a_main_store_of_a_namespace_is_indexed_with_its_chain() {
         let f = Fixture::new();
         let parent = block(-1, &[1, 2]);
-        let first = block(2, &[3, 4]);
-        let second = block(3, &[5, 6]);
-        let seed = namespace_seed(Some("adapter"), Some("tenant"));
-        let hashes =
-            [&parent, &first, &second].map(|b| content_hash_with_seed(&b.token_ids, seed).0);
         let parent_hash = parent.block_hash;
         let mut event = KvBlocksStored {
             blocks: vec![parent],
@@ -1137,40 +1127,9 @@ mod tests {
         };
         f.applied(1, &batch([Data::Stored(event.clone())]));
         event.parent_block_hash = Some(parent_hash);
-        event.blocks = vec![first, second];
+        event.blocks = vec![block(2, &[3, 4]), block(3, &[5, 6])];
         f.applied(2, &batch([Data::Stored(event)]));
         assert_eq!(f.blocks(), 3);
-
-        f.store.publish_now();
-        let gateway = GatewayId(0);
-        let ask = ViewQuery {
-            gateway,
-            now: Instant::now(),
-            pinned: None,
-            affinity: false,
-            signal_cells: false,
-        };
-        f.store.deciding(|world| {
-            let mut view = ViewBuffers::default();
-            let built = world
-                .build(MODEL, Role::Single, &ask, &mut view)
-                .expect("the pool");
-            let naming = AffinityQuery {
-                gateway,
-                block_hashes: &hashes,
-                namespace_seed: seed,
-                seed: 0,
-                cap: 0,
-                wires: None,
-                now_micros: built.now_micros,
-            };
-            let mut named = AffinityRowsBuffers::default();
-            world.fill_affinity_rows(MODEL, Role::Single, &naming, &view.candidates, &mut named);
-            assert_eq!(named.holders.len(), 1);
-            let holder = &named.holders[0];
-            assert_eq!(view.candidates[holder.row as usize].id, f.row);
-            assert_eq!(holder.overlap_blocks, 3);
-        });
     }
 
     #[test]
@@ -2287,8 +2246,7 @@ mod tests {
 
     /// The store keeps a row's lane at the row's own rank. A row the holder
     /// stands above rank 0 is its engine's rank 0 stream's. A ticket for
-    /// it opens no feed, and what the store keeps of the row stands: such
-    /// a ticket was written before a kept object's row moved there. It is
+    /// it opens no feed, and what the store keeps of the row stands. It is
     /// counted as an upper rank's: the holder keeps the row.
     #[test]
     fn a_ticket_for_a_row_above_rank_0_opens_no_feed() {

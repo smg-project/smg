@@ -128,9 +128,6 @@ pub struct RegistrationSettings {
     pub startup_delay_secs: u64,
     /// The pause between two probes of a starting worker, in seconds.
     pub startup_check_interval_secs: u64,
-    /// Whether a registration reads how many data-parallel (DP) ranks a
-    /// worker runs. A host that addresses each rank on its own turns it on.
-    pub dp_aware: bool,
     /// Model identity for a ZMQ worker whose spec and labels name no model.
     pub model_path: Option<String>,
     /// Aliases to add to the card of the canonical model they name.

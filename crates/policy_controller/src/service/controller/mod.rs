@@ -28,9 +28,10 @@
 //! the shutdown future resolves, then gives the lease up, settles, drains
 //! and returns.
 //!
-//! Every replica runs the same loop, the load driver included: a follower
-//! that waited for a leader's log nobody writes yet would be cold at its
-//! promotion. The standby turns a follower's polls into that log.
+//! Every replica runs the same loop, the load driver included. A follower
+//! polls no engine, is sent no load row and holds none: the rows of a lead
+//! are dropped where the lead ends. Its first poll goes out at its
+//! promotion. A decision reads none of the store's load rows yet.
 //!
 //! Every socket a listener accepts is set to send at once: a small answer
 //! never waits for the peer's acknowledgement of the write before it.
@@ -43,10 +44,15 @@ mod decision_slots;
 mod discovery;
 pub(crate) mod election;
 mod floor;
+mod frame_decision;
+mod frame_loads;
+mod frame_request;
+mod gateway_places;
 mod gateways;
 mod generations;
-#[cfg(all(test, feature = "worker-host"))]
+#[cfg(test)]
 mod kv_feed;
+mod lease_words;
 mod lifecycle;
 mod membership;
 pub mod metrics;
@@ -71,6 +77,7 @@ use std::{
 };
 
 use axum::serve::{ListenerExt as _, TapIo};
+use smg_worker::load::state::LoadReceiver;
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::watch,
@@ -104,8 +111,6 @@ use self::{
     spec_store::SpecStore,
     standby::{Lag, Standby},
 };
-#[cfg(feature = "worker-host")]
-use crate::worker_host::{KvFeed, Members};
 use crate::{
     load::ingest::{
         loads::{LoadDriver, LoadDriverConfig},
@@ -114,6 +119,7 @@ use crate::{
     service::elector::{Elector, Fence},
     stages::registry::StageRegistry,
     store::{MemoryStore, WorkersStore},
+    worker_host::{KvFeed, Members},
 };
 
 /// The protobuf package of the controller's API.
@@ -160,14 +166,15 @@ pub struct Controller {
     admin_addr: SocketAddr,
     /// The replica's worker objects: one object of the worker crate a row
     /// of the store, followed by one task of the serve.
-    #[cfg(feature = "worker-host")]
     workers: Arc<worker_objects::WorkerObjects>,
-    #[cfg(feature = "worker-host")]
     kv_feed: KvFeed<Members>,
     /// The health probes of the replica's workers: one task of the serve,
     /// which probes while this replica leads.
-    #[cfg(feature = "worker-host")]
     prober: worker_objects::Prober,
+    /// The load reports of the replica's workers: one task of the serve,
+    /// which polls while this replica leads. The deciding threads hold its
+    /// channel from the bind.
+    monitor: worker_objects::LoadMonitor,
     /// Worker discovery, where the configuration names a provider: one task
     /// of the serve, which runs the provider while this replica leads.
     #[cfg(feature = "discovery")]
@@ -455,27 +462,26 @@ impl Controller {
         let (standing, stood) = watch::channel(ElectionObservation::default());
         let steps = stood.clone();
         // What a watched write wakes beside the feed: the follower of the
-        // replica's worker objects, where the build has one.
+        // replica's worker objects.
         let objects = worker_objects::ObjectsWake::default();
-        #[cfg(feature = "worker-host")]
         let woken = objects.clone();
         let journal =
             replication::journaled_waking(&config.election.lease, config.decide_shards, objects);
-        #[cfg(feature = "worker-host")]
         let workers = Arc::new(worker_objects::WorkerObjects::new(
             Arc::clone(&journal.0),
             woken,
         ));
-        #[cfg(feature = "worker-host")]
         let kv_feed = KvFeed::new(Arc::clone(&journal.0), workers.holder());
-        #[cfg(feature = "worker-host")]
         let prober = worker_objects::Prober::new(Arc::clone(&workers), elector.fence());
+        // The load monitor is built stopped, ahead of the deciding threads:
+        // each takes its channel at its start, and the serve runs its task.
+        let monitor = worker_objects::LoadMonitor::new(&workers, config.load_poll_interval);
         let mut shared = Shared::new(
             config.controller_id.clone(),
             address.unwrap_or_default(),
             &elector,
             stood,
-            journal,
+            (journal.0, journal.1, workers.holder(), monitor.loads()),
             Arc::clone(&catalog),
             config.decide_shards,
         )
@@ -511,12 +517,10 @@ impl Controller {
             listeners,
             admin,
             admin_addr,
-            #[cfg(feature = "worker-host")]
             workers,
-            #[cfg(feature = "worker-host")]
             kv_feed,
-            #[cfg(feature = "worker-host")]
             prober,
+            monitor,
             #[cfg(feature = "discovery")]
             discovery,
         })
@@ -770,6 +774,14 @@ impl Controller {
         Arc::clone(&self.shared.fence)
     }
 
+    /// The load reports of this replica's workers as its decisions are
+    /// given them: the channel its load monitor publishes on, valid across
+    /// [`Self::serve`]. The monitor publishes a snapshot at each poll while
+    /// the replica leads, and an empty one at each lead's end.
+    pub fn loads(&self) -> LoadReceiver {
+        self.monitor.loads()
+    }
+
     /// Serves until `shutdown` resolves, then drains. The listeners answer
     /// from the start; the load driver polls the store's engines from the
     /// first tick (idle while the store has no rows); the election thread
@@ -834,17 +846,19 @@ impl Controller {
             spec_file,
             listeners,
             admin,
-            #[cfg(feature = "worker-host")]
             workers,
-            #[cfg(feature = "worker-host")]
             kv_feed,
-            #[cfg(feature = "worker-host")]
             prober,
+            monitor,
             #[cfg(feature = "discovery")]
             discovery,
             ..
         } = self;
         let store = Arc::clone(&shared.store);
+        // The worker objects stand at the store's end before a listener
+        // serves: a controller that starts over standing rows decides its
+        // first request over them. The follower's task goes on from here.
+        workers.holder().follow(&*store);
         // The listeners' close is one word, and an open decide stream hears
         // it too: the word is `Shared`'s.
         let stop = shared.stop.clone();
@@ -917,11 +931,11 @@ impl Controller {
         ));
         let loads = driver.stats();
         let driver_stop = stop.subscribe();
-        // A replica that follows polls no engine: its applier is the load
-        // table's one writer then, and a poll's row between two of the
-        // leader's would take the place of the log the leader's next event
-        // needs. The loop itself runs on every replica: it pays the store's
-        // publications, so a followed row reaches the published world.
+        // A replica that follows polls no engine: it decides no request, and
+        // it is sent no load row. The driver drops the rows of its own lead
+        // at the word that the lead ended. The loop itself runs on every
+        // replica: it pays the store's publications, so a followed row
+        // reaches the published world.
         let polls = follows.map(|_| shared.role.subscribe());
         tasks.spawn(async move {
             match polls {
@@ -950,7 +964,6 @@ impl Controller {
         }
         // The worker objects follow the store on every replica alike: a
         // standby holds the objects its leader's rows make, there at a take.
-        #[cfg(feature = "worker-host")]
         {
             let workers_stop = stop.subscribe();
             tasks.spawn(async move {
@@ -968,6 +981,15 @@ impl Controller {
             let (probes_stop, led) = (stop.subscribe(), shared.role.subscribe());
             tasks.spawn(async move {
                 prober.run(probes_stop, led).await;
+                Ok(())
+            });
+            // The load monitor runs under the same word: a replica that
+            // does not lead asks no engine for its load either. Its stop
+            // publishes the snapshot empty for the deciding threads, but
+            // for the one loop `LoadMonitor::run` names.
+            let (loads_stop, led) = (stop.subscribe(), shared.role.subscribe());
+            tasks.spawn(async move {
+                monitor.run(loads_stop, led).await;
                 Ok(())
             });
         }
@@ -1369,7 +1391,7 @@ mod tests {
 
     use super::{
         config::tests::valid,
-        decision_slots::tests as bed,
+        decision_slots::{tests as bed, TERM_MARK},
         election::{self, ElectionObservation},
         following,
         membership::tests::Logged,
@@ -1379,10 +1401,7 @@ mod tests {
         tell_readiness, tell_role, unnamed_port, Bound, ConfigError, Controller, EngineProbe,
         Error, NoFollow, Scope,
     };
-    #[cfg(feature = "worker-host")]
-    use crate::store::{HealthPolicy, WorkerFacts, WorkerStatus, WorkersStore};
     use crate::{
-        engine::store_backed_engine::TERM_MARK,
         load::ingest::{
             loads::{LoadProbe, ReadError},
             probe::unbuildable,
@@ -1391,7 +1410,7 @@ mod tests {
             ConditionalWriteOutcome, ElectError, ElectionSettings, Elector, LeaseBackend,
             LeaseRecord, MemoryLease, TickOutcome,
         },
-        store::JournalKinds,
+        store::{HealthPolicy, WorkerFacts, WorkerStatus, WorkersStore},
     };
 
     /// A lease that stores `writes` writes: the thread that steps it panics
@@ -1516,10 +1535,39 @@ mod tests {
         let mut starts = Vec::new();
         for _ in 0..2 {
             let controller = Controller::bind(valid()).await.expect("the listeners bind");
-            starts.push(controller.shared.feed.log.head(JournalKinds::Watched));
+            starts.push(controller.shared.feed.log.head());
         }
         assert_ne!(starts[0].seq, starts[1].seq, "two runs start apart");
         assert!(starts.iter().all(|start| start.seq != 0 && start.term == 0));
+    }
+
+    /// A controller that starts over standing rows holds their worker
+    /// objects before a listener serves. The serve follows the store to its
+    /// end ahead of its listeners' tasks: one poll of it, which runs no task
+    /// it spawned, leaves the holder with the standing worker, and a
+    /// decision over the list the holder lends names it. Left to the
+    /// follower's task alone, a start over a large fleet answered its first
+    /// requests no worker.
+    #[tokio::test]
+    async fn a_start_over_standing_rows_holds_their_worker_objects_before_it_serves() {
+        use crate::engine::view::{Role, WireModes};
+
+        let controller = Controller::bind(valid()).await.expect("the listeners bind");
+        let store = Arc::clone(&controller.shared.store);
+        let objects = controller.workers.holder();
+        store
+            .apply(bed::preset("round_robin", 1))
+            .expect("above the unbound start");
+        let standing = bed::ready(&store, "w0", bed::MODEL, Role::Single, WireModes::NONE);
+        assert!(objects.is_empty(), "no object stands before the serve");
+        let mut serve = std::pin::pin!(controller.serve(pending()));
+        tokio::select! {
+            biased;
+            served = &mut serve => panic!("the serve stands: {served:?}"),
+            () = std::future::ready(()) => {}
+        }
+        let named = bed::lent_pick(&store, &objects, bed::frame(1, 1));
+        assert_eq!(named, Some(standing));
     }
 
     /// The thread gone at its take, before the serve read ready, and at its
@@ -1595,7 +1643,6 @@ mod tests {
     /// The serve starts the follower of the replica's worker objects, on
     /// the wake the store's log tells: a row written while the controller
     /// leads has its object, and a row removed has none.
-    #[cfg(feature = "worker-host")]
     #[tokio::test]
     async fn a_served_controller_holds_the_worker_objects_of_its_stores_rows() {
         let controller = Controller::bind(valid()).await.expect("the listeners bind");
@@ -1642,7 +1689,6 @@ mod tests {
     /// The serve starts the probes of the replica's workers: a row written
     /// while the controller leads is readied by the first probe its engine
     /// passes, with no hand on its status.
-    #[cfg(feature = "worker-host")]
     #[tokio::test]
     async fn a_served_controller_probes_its_rows_while_it_leads() {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("a port");

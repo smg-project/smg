@@ -438,6 +438,7 @@ let session = McpToolSession::new(
         server_key: "my-server".to_string(),
         allowed_tools: None,
         list_error: None,
+        pool_key: None,
     }],
     "req-123",
 );
@@ -475,6 +476,7 @@ let binding = McpServerBinding {
     server_key: "my-server".to_string(),
     allowed_tools: None,
     list_error: None,
+    pool_key: None,
 };
 
 // Only expose specific tools from this server
@@ -483,6 +485,7 @@ let binding = McpServerBinding {
     server_key: "my-server".to_string(),
     allowed_tools: Some(vec!["tool_a".to_string(), "tool_b".to_string()]),
     list_error: None,
+    pool_key: None,
 };
 
 let session = McpToolSession::new(&orchestrator, vec![binding], "req-123");

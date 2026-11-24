@@ -13,7 +13,7 @@ pub(crate) mod stream_failure;
 pub(crate) mod tonic_ext;
 
 // Re-export all public items so consumer imports stay unchanged.
-pub use aliases::{answering_to, ALIASES, UNANSWERED};
+pub use aliases::{answering_to, gives_way, ALIASES, UNANSWERED};
 pub(crate) use chat_utils::{
     completion_finish_reason, decode_ids_blocking, encode_blocking, encode_blocking_in_batch,
     encode_prompt_blocking, encode_texts_blocking, filter_chat_request_by_tool_choice,
@@ -21,7 +21,7 @@ pub(crate) use chat_utils::{
     keep_first_tool_call_items, missing_tokenizer_response, parse_finish_reason,
     parse_json_schema_response, process_chat_messages_with_placeholders, resolve_tokenizer,
     send_error_sse, validate_chat_content_parts, validate_chat_template_content_parts,
-    CallIdFamily, InPlaceBudget,
+    CallIdFamily, InPlaceBudget, PromptError,
 };
 pub use chat_utils::{
     create_stop_decoder, process_chat_messages, process_chat_messages_with_encoding,

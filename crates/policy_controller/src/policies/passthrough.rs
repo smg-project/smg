@@ -20,6 +20,7 @@ pub(crate) fn profile() -> ProfileSpec {
         score: vec![],
         pick: "passthrough".into(),
         sent_ttl_ms: None,
+        sent_report_delay_ms: None,
     }
 }
 

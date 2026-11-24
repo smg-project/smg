@@ -38,7 +38,7 @@ use super::{
     worker_wire::{self, Refused},
 };
 use crate::{
-    engine::view::{fingerprint, WorkerId},
+    engine::view::fingerprint,
     service::{
         proto::{
             self, policy_controller_client::PolicyControllerClient, replica_frame::Frame,
@@ -46,9 +46,7 @@ use crate::{
         },
         replication::{Log, LogPositionLost},
     },
-    store::{
-        JournalKinds, LeasesStore, LoadSample, MemoryStore, Position, StoreCheckpoint, WorkerRow,
-    },
+    store::{LeasesStore, MemoryStore, Position, StoreCheckpoint, WorkerRow},
 };
 
 /// Why a standby stopped applying its leader's stream.
@@ -104,8 +102,8 @@ impl Follower {
     /// log stands at the place its own run drew, and its leader continues
     /// it from the leader's first write.
     pub(crate) fn place(&self) -> Position {
-        let head = self.log.head(JournalKinds::All);
-        if self.log.first(JournalKinds::All) == Some(head) {
+        let head = self.log.head();
+        if self.log.first() == Some(head) {
             Position::default()
         } else {
             head
@@ -119,7 +117,7 @@ impl Follower {
     /// is the place of a standby that applied nothing.
     pub(crate) fn asking(&self) -> Position {
         Position {
-            seq: self.log.head(JournalKinds::All).seq.max(1),
+            seq: self.log.head().seq.max(1),
             term: 0,
         }
     }
@@ -156,7 +154,8 @@ impl Follower {
     /// batch's term, by the store's door for a followed write of its kind,
     /// which alone lands there: a write of the store's own that comes
     /// between takes no part in it, and the event does not land. A load row
-    /// stands with the instant of its apply. The first event that does not
+    /// is an older leader's: the store keeps none, and its place alone is
+    /// journaled. The first event that does not
     /// land stops the batch; the events before it stand, each at its place.
     /// A standby that applied nothing takes its leader's first position, a
     /// term's start, wherever the leader's run drew it ([`Log::join`]); no
@@ -199,11 +198,10 @@ impl Follower {
                         worker_wire::told_change(told, now).map_err(Halt::Unread)?;
                     self.store.follow(at, epoch, change, row);
                 }
-                Some(Sent::Load(told)) => {
-                    let (id, rank, row, source) =
-                        worker_wire::told_load(told).map_err(Halt::Unread)?;
-                    self.store.follow_load(at, id, rank, row, now, source);
-                }
+                // A leader of this build sends no load row: this one is an
+                // older leader's. The store keeps none of its leader's, so
+                // the place alone is journaled and the next event follows.
+                Some(Sent::Load(_)) => adopting.mark(),
                 Some(Sent::TermStart(_)) => self.store.follow_term(at),
                 // Through the replica's door, which journals the place: the
                 // document's pass runs here, on the applier's own task.
@@ -227,8 +225,9 @@ impl Follower {
     }
 }
 
-/// A leader's snapshot as its parts arrive: the rows and the load rows,
-/// held apart from the store until the last part. The store is restored
+/// A leader's snapshot as its parts arrive: the rows, held apart from the
+/// store until the last part. A part's load rows are an older leader's and
+/// are read past. The store is restored
 /// from all of them or from none: a stream that ends inside a snapshot
 /// leaves it as it was.
 #[derive(Debug, Default)]
@@ -239,7 +238,6 @@ pub(crate) struct Staged {
     /// The next part's number.
     part: u32,
     rows: Vec<WorkerRow>,
-    loads: Vec<(WorkerId, u16, LoadSample)>,
     /// The leader's standing generation, as the first part that states one
     /// said it.
     generation: Option<proto::GenerationEvent>,
@@ -288,12 +286,11 @@ impl Staged {
         if self.generation.is_none() {
             self.generation = part.generation.as_deref().cloned();
         }
-        worker_wire::told_part(part, now, &mut self.rows, &mut self.loads)?;
+        worker_wire::told_part(part, now, &mut self.rows)?;
         Ok(part.last.then(|| StoreCheckpoint {
             at,
             epoch: part.membership_epoch,
             rows: std::mem::take(&mut self.rows),
-            loads: std::mem::take(&mut self.loads),
         }))
     }
 }
@@ -436,9 +433,9 @@ impl Lag {
     }
 }
 
-/// The lag a standby reads synced under: one load poll interval, the
-/// period its load rows are no staler than then, and never under two of
-/// the leader's heartbeats, which an idle stream's lag reaches by itself.
+/// The lag a standby reads synced under: one load poll interval, and never
+/// under two of the leader's heartbeats, which an idle stream's lag reaches
+/// by itself.
 /// The lag is the first of the counts synced reads (design 5.4): the live
 /// ranks and the generation narrow the same bit with their steps.
 pub(crate) fn synced_within(load_poll_interval: Duration) -> Duration {
@@ -994,9 +991,10 @@ mod tests {
 
     use super::*;
     use crate::{
-        engine::view::{LoadRow, WireModes},
+        engine::view::{LoadRow, WireModes, WorkerId},
         service::{
             controller::{
+                decision_slots::tests::followed,
                 election::LeasePlace,
                 replication::{journaled, journaled_from, parts, Replication},
             },
@@ -1020,8 +1018,7 @@ mod tests {
     /// The place before a log's first write, where a standby that applied
     /// nothing is continued from.
     fn start(log: &Log) -> Position {
-        log.first(JournalKinds::All)
-            .expect("every write is retained")
+        log.first().expect("every write is retained")
     }
 
     /// A leader's store and log under term 1, and a standby's applier over
@@ -1046,6 +1043,14 @@ mod tests {
         }
     }
 
+    /// Rows for a snapshot of two parts: one more than a page of rows
+    /// holds, which is 128.
+    fn a_page_and_one(leader: &MemoryStore) {
+        for n in 0..129 {
+            leader.upsert(facts(&format!("http://w{n:03}:8000"), 1));
+        }
+    }
+
     fn running(count: u32) -> LoadRow {
         LoadRow {
             running: count,
@@ -1057,8 +1062,7 @@ mod tests {
     fn entries(log: &Log, mut place: Position) -> Vec<Entry> {
         let (mut all, mut out) = (Vec::new(), Vec::new());
         loop {
-            log.read(JournalKinds::All, place, 64, &mut out)
-                .expect("the place is held");
+            log.read(place, 64, &mut out).expect("the place is held");
             let Some(last) = out.last() else {
                 return all;
             };
@@ -1067,22 +1071,19 @@ mod tests {
         }
     }
 
-    /// One entry as the batch a leader sends it in at `now`, the last its
-    /// log holds.
-    fn batch(entry: &Entry, now: Instant) -> proto::ReplicationBatch {
-        batch_of(std::slice::from_ref(entry), entry.at.seq, now)
+    /// One entry as the batch a leader sends it in, the last its log
+    /// holds.
+    fn batch(entry: &Entry) -> proto::ReplicationBatch {
+        batch_of(std::slice::from_ref(entry), entry.at.seq)
     }
 
     /// `entries`, written under one term, as the batch a leader sends them
-    /// in at `now` while its log's head stands at `head`.
-    fn batch_of(entries: &[Entry], head: u64, now: Instant) -> proto::ReplicationBatch {
+    /// in while its log's head stands at `head`.
+    fn batch_of(entries: &[Entry], head: u64) -> proto::ReplicationBatch {
         proto::ReplicationBatch {
             first_seq: entries[0].at.seq,
             term: entries[0].at.term,
-            events: entries
-                .iter()
-                .map(|entry| worker_wire::replication(entry, now))
-                .collect(),
+            events: entries.iter().map(worker_wire::replication).collect(),
             resync_required: false,
             snapshot: None,
             head_seq: head,
@@ -1097,29 +1098,20 @@ mod tests {
             place => place,
         };
         for entry in entries(leader, place) {
-            assert_eq!(
-                follower.apply(&batch(&entry, now), now),
-                Ok(()),
-                "{entry:?}"
-            );
+            assert_eq!(follower.apply(&batch(&entry), now), Ok(()), "{entry:?}");
         }
     }
 
-    /// What a replica holds, without the instants: its place, its epoch,
-    /// its rows and its load rows.
+    /// What a replica holds, without the instants: its place, its epoch
+    /// and its rows.
     fn held(store: &MemoryStore) -> impl PartialEq + std::fmt::Debug {
-        let cut = store.checkpoint(JournalKinds::All);
+        let cut = store.checkpoint();
         let rows: Vec<_> = cut
             .rows
             .into_iter()
             .map(|row| (row.id, row.facts, row.status, row.revision))
             .collect();
-        let loads: Vec<_> = cut
-            .loads
-            .into_iter()
-            .map(|(id, rank, sample)| (id, rank, sample.row))
-            .collect();
-        (cut.at, cut.epoch, rows, loads, store.term())
+        (cut.at, cut.epoch, rows, store.term())
     }
 
     /// A log's entries by place, each as its kind and what it names.
@@ -1129,7 +1121,6 @@ mod tests {
             .map(|entry| {
                 let what = match entry.event {
                     Event::Member { epoch, change, .. } => format!("{epoch} {change:?}"),
-                    Event::Load { id, rank, .. } => format!("load {id:?} {rank}"),
                     Event::Term => "term".to_owned(),
                     Event::Generation { generation } => format!("generation {generation}"),
                 };
@@ -1139,7 +1130,7 @@ mod tests {
     }
 
     /// Writes under the first term: registrations, a status change, a load
-    /// row of each source, a relabel and a resize.
+    /// row of each source on the leader's own table, a relabel and a resize.
     fn first(leader: &MemoryStore, at: Instant) {
         let revision = |id| WorkersStore::get(leader, id).expect("the row").revision;
         let a = leader.upsert(facts("http://a:8000", 1)).id();
@@ -1174,7 +1165,7 @@ mod tests {
         // It applied nothing: it names no place of any run, and its log
         // stands where its own run drew.
         assert_eq!(follower.place(), Position::default());
-        assert_eq!(start(&followed), followed.head(JournalKinds::All));
+        assert_eq!(start(&followed), followed.head());
         let at = Instant::now();
         first(&leader, at);
         follow(&follower, &led, at);
@@ -1194,8 +1185,8 @@ mod tests {
             format!("{:?}", held(&leader))
         );
         assert_eq!(told(&followed), told(&led));
-        assert_eq!(follower.place(), led.head(JournalKinds::All));
-        assert!(told(&led).len() > 10, "{:?}", told(&led));
+        assert_eq!(follower.place(), led.head());
+        assert!(told(&led).len() > 8, "{:?}", told(&led));
     }
 
     /// The parts of the leader's snapshot at `at`, as its replication scope
@@ -1225,6 +1216,82 @@ mod tests {
         cut.expect("the last part")
     }
 
+    /// A load row as an older leader's stream told it: a leader of this
+    /// build sends none.
+    fn told_load(id: WorkerId) -> proto::ReplicationEvent {
+        proto::ReplicationEvent {
+            event: Some(Sent::Load(proto::LoadSample {
+                worker_id: id.0,
+                load: Some(proto::LoadRow {
+                    running: 3,
+                    ..proto::LoadRow::default()
+                }),
+                ..proto::LoadSample::default()
+            })),
+        }
+    }
+
+    #[test]
+    fn a_load_row_an_older_leader_tells_takes_its_place_and_writes_nothing() {
+        let ((leader, led), follower, (standby, followed)) = pair();
+        let at = Instant::now();
+        let a = leader.upsert(facts("http://a:8000", 1)).id();
+        leader.upsert(facts("http://b:8000", 1));
+        let sent = entries(&led, start(&led));
+        let [term, first, second] = &sent[..] else {
+            panic!("the term's start and two registrations, not {sent:?}");
+        };
+        // An older leader's history: a load row of the first worker stands
+        // between the two registrations, at a place of its own.
+        let event = |entry: &Entry| worker_wire::replication(entry);
+        let older = proto::ReplicationBatch {
+            first_seq: term.at.seq,
+            term: term.at.term,
+            events: vec![event(term), event(first), told_load(a), event(second)],
+            resync_required: false,
+            snapshot: None,
+            head_seq: term.at.seq + 3,
+        };
+        assert_eq!(follower.apply(&older, at), Ok(()));
+        // The standby went on with the next watched event: it holds both
+        // rows, and no load row of its leader's.
+        assert_eq!(standby.all_rows().1.len(), 2);
+        assert!(standby.load(a, 0).is_none(), "no load row is kept");
+        // The load row's place is journaled alone, so the next event
+        // followed it and the standby stands at the batch's last place.
+        let last = Position {
+            seq: term.at.seq + 3,
+            term: term.at.term,
+        };
+        assert_eq!(follower.place(), last);
+        let kinds: Vec<String> = told(&followed).into_iter().map(|(_, what)| what).collect();
+        assert_eq!(kinds[2], "term", "{kinds:?}");
+        assert_eq!(kinds.len(), 4, "{kinds:?}");
+    }
+
+    #[test]
+    fn a_restores_load_part_is_read_past() {
+        let (leader, _follower, (standby, _followed)) = pair();
+        let at = Instant::now();
+        let a = leader.0.upsert(facts("http://a:8000", 1)).id();
+        // An older leader's snapshot: its last part carries a load row, and
+        // one this build could not read were it read.
+        let mut parts = snapshot(&leader, at);
+        let last = parts.last_mut().and_then(|batch| batch.snapshot.as_mut());
+        let last = last.expect("the snapshot's one part");
+        let mut unread = told_load(a);
+        if let Some(Sent::Load(load)) = &mut unread.event {
+            load.dp_rank = 65_536;
+            last.loads.push(*load);
+        }
+        assert_eq!(last.loads.len(), 1);
+        let cut = staged(&parts, at);
+        assert_eq!(cut.rows.len(), 1);
+        assert!(standby.restore_from(cut));
+        assert_eq!(standby.all_rows().1.len(), 1);
+        assert!(standby.load(a, 0).is_none(), "no load row is kept");
+    }
+
     #[test]
     fn a_standby_restored_from_the_snapshot_continues_from_its_place() {
         let (leader, follower, (standby, _followed)) = pair();
@@ -1234,7 +1301,7 @@ mod tests {
         standby.upsert(facts("http://stale:8000", 1));
         let first = snapshot(&leader, at);
         assert_eq!(follower.restore(staged(&first, at), None), Ok(true));
-        assert_eq!(follower.place(), leader.1.head(JournalKinds::All));
+        assert_eq!(follower.place(), leader.1.head());
         assert_eq!(held(&standby), held(&leader.0));
         rest(&leader.0, at);
         follow(&follower, &leader.1, at);
@@ -1252,9 +1319,10 @@ mod tests {
         let (leader, ..) = pair();
         let at = Instant::now();
         first(&leader.0, at);
+        a_page_and_one(&leader.0);
         let parts = snapshot(&leader, at);
-        assert_eq!(parts.len(), 2, "the rows' part and the load rows'");
-        let events = batch(&entries(&leader.1, start(&leader.1)).remove(0), at);
+        assert_eq!(parts.len(), 2, "two parts of rows");
+        let events = batch(&entries(&leader.1, start(&leader.1)).remove(0));
         let next = parts[1].clone();
         let part = next.snapshot.clone().expect("a part");
         // Each after the snapshot's first part, which is staged.
@@ -1352,31 +1420,32 @@ mod tests {
         let ((leader, led), follower, (standby, _followed)) = pair();
         let at = Instant::now();
         let a = leader.upsert(facts("http://a:8000", 1)).id();
-        leader.record(a, 0, running(1), at, LoadSource::Stream);
+        let revision = WorkersStore::get(&*leader, a).expect("the row").revision;
+        leader.set_status(a, WorkerStatus::Ready, revision);
         let sent = entries(&led, start(&led));
-        let [term, registered, load] = &sent[..] else {
-            panic!("the term's start, a registration and a load row, not {sent:?}");
+        let [term, registered, readied] = &sent[..] else {
+            panic!("the term's start, a registration and a status change, not {sent:?}");
         };
         // A history starts with its term's start: the registration before
         // it is no place a standby that applied nothing joins at.
         let lost = Err(Halt::Lost(registered.at));
-        assert_eq!(follower.apply(&batch(registered, at), at), lost);
+        assert_eq!(follower.apply(&batch(registered), at), lost);
         assert_eq!(follower.place(), Position::default());
-        assert_eq!(follower.apply(&batch(term, at), at), Ok(()));
+        assert_eq!(follower.apply(&batch(term), at), Ok(()));
         // The term's start again: a replay, and no second join.
         let replay = Err(Halt::Lost(term.at));
-        assert_eq!(follower.apply(&batch(term, at), at), replay);
-        // A load row of a worker the standby does not hold.
+        assert_eq!(follower.apply(&batch(term), at), replay);
+        // A status change of a worker the standby does not hold.
         let stray = proto::ReplicationBatch {
             first_seq: registered.at.seq,
-            ..batch(load, at)
+            ..batch(readied)
         };
         assert_eq!(follower.apply(&stray, at), lost);
         // An event of no kind, and one of a kind this build does not apply.
         for event in [None, Some(Sent::Health(proto::HealthRow::default()))] {
             let unread = proto::ReplicationBatch {
                 events: vec![proto::ReplicationEvent { event }],
-                ..batch(registered, at)
+                ..batch(registered)
             };
             assert!(matches!(
                 follower.apply(&unread, at),
@@ -1384,7 +1453,7 @@ mod tests {
             ));
         }
         // A row this build cannot read is refused by its path.
-        let mut unknown = batch(registered, at);
+        let mut unknown = batch(registered);
         if let Some(Sent::Membership(member)) = &mut unknown.events[0].event {
             if let Some(proto::worker_event::Event::Registered(row)) = &mut member.event {
                 row.status = 99;
@@ -1399,10 +1468,10 @@ mod tests {
         // The first event of a batch lands and the second does not fit:
         // the first stands at its place.
         let twice = proto::ReplicationBatch {
-            events: vec![worker_wire::replication(registered, at); 2],
-            ..batch(registered, at)
+            events: vec![worker_wire::replication(registered); 2],
+            ..batch(registered)
         };
-        assert_eq!(follower.apply(&twice, at), Err(Halt::Lost(load.at)));
+        assert_eq!(follower.apply(&twice, at), Err(Halt::Lost(readied.at)));
         assert_eq!((follower.place(), standby.epoch()), (registered.at, 1));
     }
 
@@ -1621,11 +1690,10 @@ mod tests {
     }
 
     /// A measurement, run by name with `--ignored --nocapture` in the
-    /// release profile: what the applier costs an event (a load row, a
-    /// status change) in batches of 256 as the leader sends them, and what a
-    /// restore from the snapshot's parts costs at 512 and 4,096 workers of
-    /// eight load rows each. The wire's own decode is the transport's and
-    /// is not in it.
+    /// release profile: what the applier costs a status change in batches
+    /// of 256 as the leader sends them, and what a restore from the
+    /// snapshot's parts costs at 512 and 4,096 workers. The wire's own
+    /// decode is the transport's and is not in it.
     #[test]
     #[ignore = "a measurement: run by name"]
     fn the_standbys_numbers() {
@@ -1637,13 +1705,6 @@ mod tests {
             let ids: Vec<_> = (0..workers)
                 .map(|n| leader.0.upsert(facts(&format!("http://w{n}:8000"), 1)).id())
                 .collect();
-            for rank in 0..8 {
-                for id in &ids {
-                    leader
-                        .0
-                        .record(*id, rank, running(3), at, LoadSource::Stream);
-                }
-            }
             let parts = snapshot(&leader, at);
             let mut micros: Vec<u128> = (0..21)
                 .map(|_| {
@@ -1657,12 +1718,10 @@ mod tests {
                 })
                 .collect();
             micros.sort_unstable();
-            let told = parts.iter().filter_map(|part| part.snapshot.as_ref());
-            let load_rows: usize = told.map(|part| part.loads.len()).sum();
             let bytes: usize = parts.iter().map(prost::Message::encoded_len).sum();
             writeln!(
                 out,
-                "RESTORE workers={workers} load_rows={load_rows} parts={} bytes={bytes} median_us={}",
+                "RESTORE workers={workers} parts={} bytes={bytes} median_us={}",
                 parts.len(),
                 micros[10]
             )
@@ -1670,13 +1729,9 @@ mod tests {
             if workers != 512 {
                 continue;
             }
-            // The tail after the snapshot: 50,000 load rows, then 3,000
-            // status changes, each kind in batches of 256.
+            // The tail after the snapshot: 3,000 status changes, in
+            // batches of 256.
             let place = follower.place();
-            for turn in 0..50_000usize {
-                let id = ids[turn % ids.len()];
-                leader.0.record(id, 0, running(4), at, LoadSource::Stream);
-            }
             let id = ids[0];
             for turn in 1..=3_000 {
                 let status = if turn % 2 == 1 {
@@ -1688,35 +1743,30 @@ mod tests {
                 leader.0.set_status(id, status, row.revision);
             }
             let sent = entries(&leader.1, place);
-            assert_eq!(sent.len(), 53_000, "each write is one event");
-            for (kind, events) in [("load", &sent[..50_000]), ("status", &sent[50_000..])] {
-                let batches: Vec<_> = events
-                    .chunks(256)
-                    .map(|chunk| proto::ReplicationBatch {
-                        first_seq: chunk[0].at.seq,
-                        term: chunk[0].at.term,
-                        events: chunk
-                            .iter()
-                            .map(|entry| worker_wire::replication(entry, at))
-                            .collect(),
-                        resync_required: false,
-                        snapshot: None,
-                        head_seq: 0,
-                    })
-                    .collect();
-                let began = Instant::now();
-                for batch in &batches {
-                    follower.apply(batch, at).expect("a batch that lands");
-                }
-                let nanos = began.elapsed().as_nanos();
-                writeln!(
-                    out,
-                    "APPLY kind={kind} events={} ns_an_event={}",
-                    events.len(),
-                    nanos / events.len() as u128
-                )
-                .expect("stdout");
+            assert_eq!(sent.len(), 3_000, "each write is one event");
+            let batches: Vec<_> = sent
+                .chunks(256)
+                .map(|chunk| proto::ReplicationBatch {
+                    first_seq: chunk[0].at.seq,
+                    term: chunk[0].at.term,
+                    events: chunk.iter().map(worker_wire::replication).collect(),
+                    resync_required: false,
+                    snapshot: None,
+                    head_seq: 0,
+                })
+                .collect();
+            let began = Instant::now();
+            for batch in &batches {
+                follower.apply(batch, at).expect("a batch that lands");
             }
+            let nanos = began.elapsed().as_nanos();
+            writeln!(
+                out,
+                "APPLY kind=status events={} ns_an_event={}",
+                sent.len(),
+                nanos / sent.len() as u128
+            )
+            .expect("stdout");
         }
     }
 
@@ -1893,6 +1943,7 @@ mod tests {
         let journal = journaled(&LeasePlace::File("shared".into()), 1);
         let (id, address) = ("standby-0".to_owned(), "127.0.0.1:1".to_owned());
         let catalog = Arc::new(crate::stages::StageRegistry::builtin());
+        let journal = followed(journal);
         let shared = Shared::new(id, address, &elector, stood, journal, catalog, 1)
             .expect("the deciders start");
         let mut standby = Standby::new(Arc::new(shared), bed.addr.port());
@@ -1948,7 +1999,7 @@ mod tests {
             leader.0.upsert(facts("http://b:8000", 1));
             leader.0.upsert(facts("http://c:8000", 1));
             for entry in entries(&leader.1, place) {
-                opened.says(batch(&entry, now)).await;
+                opened.says(batch(&entry)).await;
                 let seq = entry.at.seq;
                 let ack = Frame::Ack(proto::ReplicationAck { seq });
                 assert_eq!(opened.frame().await, Some(ack));
@@ -1958,7 +2009,7 @@ mod tests {
         let (ended, ()) = tokio::join!(standby.stream(&named, &applied), script);
         assert_eq!((ended.next, ended.applied), (Next::Lease, true));
         assert_eq!(ended.why.as_deref(), Some("Aborted: deposed"));
-        assert_eq!(standby.follower.place(), leader.1.head(JournalKinds::All));
+        assert_eq!(standby.follower.place(), leader.1.head());
         assert_eq!(*bed.names.lock(), ["standby-0"]);
     }
 
@@ -1979,11 +2030,7 @@ mod tests {
                 leader.0.upsert(facts(key, 1));
             }
             let tail = entries(&leader.1, place);
-            let head = if stated {
-                leader.1.head(JournalKinds::All).seq
-            } else {
-                0
-            };
+            let head = if stated { leader.1.head().seq } else { 0 };
             standing.send_replace(bed.holds("leader-1", 1));
             let named = standby.shared.leader(None);
             let applied = AtomicBool::new(false);
@@ -1998,11 +2045,11 @@ mod tests {
                 };
                 // The replay's first frame ends short of the head it
                 // states: the standby applied it and stands behind.
-                opened.says(batch_of(&tail[..1], head, now)).await;
+                opened.says(batch_of(&tail[..1], head)).await;
                 assert_eq!(opened.frame().await, ack(&tail[0]));
                 assert_eq!(synced(), !stated, "a frame short of the head");
                 // The frame that ends there leaves it at the head.
-                opened.says(batch_of(&tail[1..], head, now)).await;
+                opened.says(batch_of(&tail[1..], head)).await;
                 assert_eq!(opened.frame().await, ack(&tail[2]));
                 assert!(synced(), "the frame that reached the head");
                 opened.refuses(Status::aborted("deposed")).await;
@@ -2020,21 +2067,18 @@ mod tests {
         // store's own stands past every place its log drew: it takes the
         // next number where the leader's places lie above the standby's
         // own. This leader's start there.
-        let drawn = standby.follower.log.head(JournalKinds::All);
+        let drawn = standby.follower.log.head();
         let above = journaled_from(&LeasePlace::File("shared".into()), drawn.seq + 1);
         let leader: Replica = (above.0, above.1.log);
         leader.0.set_term(1);
         leader.0.upsert(facts("http://a:8000", 1));
         let now = Instant::now();
-        let id = leader.0.upsert(facts("http://b:8000", 1)).id();
+        leader.0.upsert(facts("http://b:8000", 1));
         follow(&standby.follower, &leader.1, now);
         let followed = standby.follower.place();
-        // A poll's late answer lands as a row of the standby's own: at the
-        // next number, under no term.
-        standby
-            .follower
-            .store
-            .record(id, 0, running(1), now, LoadSource::Stream);
+        // A write of the standby's own lands at the next number, under no
+        // term.
+        standby.follower.store.upsert(facts("http://own:8000", 1));
         let own = standby.follower.place();
         assert_eq!((own.seq, own.term), (followed.seq + 1, 0));
         standing.send_replace(bed.holds("leader-1", 1));
@@ -2068,12 +2112,12 @@ mod tests {
             let leader = led();
             let now = Instant::now();
             let parts = snapshot(&leader, now);
-            let place = leader.1.head(JournalKinds::All);
+            let place = leader.1.head();
             // A row written while the snapshot was sent: the last part
             // states a head one past the snapshot's place.
             leader.0.upsert(facts("http://b:8000", 1));
             let written = entries(&leader.1, place);
-            let head = leader.1.head(JournalKinds::All).seq;
+            let head = leader.1.head().seq;
             standing.send_replace(bed.holds("leader-1", 1));
             let named = standby.shared.leader(None);
             let applied = AtomicBool::new(false);
@@ -2087,7 +2131,7 @@ mod tests {
                     opened.says(part).await;
                 }
                 if tail {
-                    opened.says(batch_of(&written, head, now)).await;
+                    opened.says(batch_of(&written, head)).await;
                     let ack = Frame::Ack(proto::ReplicationAck { seq: head });
                     assert_eq!(opened.frame().await, Some(ack));
                 }
@@ -2107,7 +2151,6 @@ mod tests {
         let mut bed = Bed::new().await;
         let (_elector, standing, standby) = standing_by(&bed, FIVE);
         let leader = led();
-        let now = Instant::now();
         standing.send_replace(bed.holds("leader-1", 1));
         let named = standby.shared.leader(None);
         let applied = AtomicBool::new(false);
@@ -2125,7 +2168,7 @@ mod tests {
             // The leader's log from its first write, a term's start at the
             // position after the place the leader's run drew.
             for entry in entries(&leader.1, start(&leader.1)) {
-                opened.says(batch(&entry, now)).await;
+                opened.says(batch(&entry)).await;
                 let seq = entry.at.seq;
                 let ack = Frame::Ack(proto::ReplicationAck { seq });
                 assert_eq!(opened.frame().await, Some(ack));
@@ -2134,7 +2177,7 @@ mod tests {
         };
         let (ended, ()) = tokio::join!(standby.stream(&named, &applied), script);
         assert_eq!((ended.next, ended.applied), (Next::Lease, true));
-        assert_eq!(standby.follower.place(), leader.1.head(JournalKinds::All));
+        assert_eq!(standby.follower.place(), leader.1.head());
         assert_eq!(start(&standby.shared.feed.log), start(&leader.1));
     }
 
@@ -2144,11 +2187,10 @@ mod tests {
         let (_elector, standing, standby) = standing_by(&bed, FIVE);
         let leader = led();
         let now = Instant::now();
-        let b = leader.0.upsert(facts("http://b:8000", 1)).id();
-        leader.0.record(b, 0, running(1), now, LoadSource::Stream);
+        a_page_and_one(&leader.0);
         let parts = snapshot(&leader, now);
-        assert_eq!(parts.len(), 2, "the rows' part and the load rows'");
-        let place = leader.1.head(JournalKinds::All);
+        assert_eq!(parts.len(), 2, "two parts of rows");
+        let place = leader.1.head();
         standing.send_replace(bed.holds("leader-1", 1));
         let named = standby.shared.leader(None);
         let applied = AtomicBool::new(false);
@@ -2164,7 +2206,7 @@ mod tests {
             // standby applies it there and acknowledges it.
             leader.0.upsert(facts("http://c:8000", 1));
             for entry in entries(&leader.1, place) {
-                opened.says(batch(&entry, now)).await;
+                opened.says(batch(&entry)).await;
                 let seq = entry.at.seq;
                 let ack = Frame::Ack(proto::ReplicationAck { seq });
                 assert_eq!(opened.frame().await, Some(ack));
@@ -2173,7 +2215,7 @@ mod tests {
         };
         let (ended, ()) = tokio::join!(standby.stream(&named, &applied), script);
         assert_eq!((ended.next, ended.applied), (Next::Lease, true));
-        assert_eq!(standby.follower.place(), leader.1.head(JournalKinds::All));
+        assert_eq!(standby.follower.place(), leader.1.head());
         assert_eq!(held(&standby.shared.store), held(&leader.0));
         let lag = standby.shared.lag.age(Instant::now());
         assert!(lag.is_some(), "a restore is a frame applied");
@@ -2194,8 +2236,7 @@ mod tests {
         let place = standby.follower.place();
         let before = held(&standby.shared.store);
         // The leader moves on, and its snapshot is two parts.
-        let b = leader.0.upsert(facts("http://b:8000", 1)).id();
-        leader.0.record(b, 0, running(1), now, LoadSource::Stream);
+        a_page_and_one(&leader.0);
         let parts = snapshot(&leader, now);
         assert_eq!(parts.len(), 2);
         let elsewhere = proto::ReplicationBatch {
@@ -2209,7 +2250,7 @@ mod tests {
             ("the stream ends", Err(Status::unavailable("gone"))),
             ("a part out of its order", Ok(parts[0].clone())),
             ("a part at another place", Ok(elsewhere)),
-            ("a batch of events", Ok(batch(&event, now))),
+            ("a batch of events", Ok(batch(&event))),
         ];
         standing.send_replace(bed.holds("leader-1", 1));
         let named = standby.shared.leader(None);
@@ -2273,7 +2314,7 @@ mod tests {
             let turned = timeout(FIVE, turns.changed()).await;
             assert!(matches!(turned, Ok(Ok(()))), "the heartbeat's turn");
             assert!(synced(), "at the heartbeat");
-            opened.says(batch(&past, now)).await;
+            opened.says(batch(&past)).await;
             opened
         };
         let (ended, _opened) = tokio::join!(standby.stream(&named, &applied), script);
@@ -2298,7 +2339,7 @@ mod tests {
                 .0
                 .upsert(facts(&format!("http://h{}:8000", after.seq), 1));
             let past = entries(&leader.1, after).pop().expect("the leader wrote");
-            batch(&past, now)
+            batch(&past)
         };
         standing.send_replace(bed.holds("leader-1", 7));
         let named = standby.shared.leader(None);
@@ -2331,7 +2372,7 @@ mod tests {
         // it saw as it is. The leader answers its snapshot, and the event
         // after it again does not land: a streak's wait, not a stream.
         let parts = snapshot(&leader, now);
-        let restored = leader.1.head(JournalKinds::All);
+        let restored = leader.1.head();
         let lost = gap(&leader, restored);
         let applied = AtomicBool::new(false);
         let script = async {
@@ -2366,7 +2407,7 @@ mod tests {
         // A restore, an event that lands, then one that does not: the pair
         // is over, and the next stream opens at once.
         let parts = snapshot(&leader, now);
-        let restored = leader.1.head(JournalKinds::All);
+        let restored = leader.1.head();
         leader.0.upsert(facts("http://landed:8000", 1));
         let lands = entries(&leader.1, restored).remove(0);
         let lost = gap(&leader, lands.at);
@@ -2378,7 +2419,7 @@ mod tests {
             for part in &parts {
                 opened.says(part.clone()).await;
             }
-            opened.says(batch(&lands, now)).await;
+            opened.says(batch(&lands)).await;
             opened.says(lost).await;
             opened
         };
@@ -2390,12 +2431,12 @@ mod tests {
         // A restore, then one batch whose first event lands and whose
         // second does not: an event landed since the restore all the same.
         let parts = snapshot(&leader, now);
-        let restored = leader.1.head(JournalKinds::All);
+        let restored = leader.1.head();
         leader.0.upsert(facts("http://halved:8000", 1));
         let lands = entries(&leader.1, restored).remove(0);
         let halved = proto::ReplicationBatch {
-            events: vec![worker_wire::replication(&lands, now); 2],
-            ..batch(&lands, now)
+            events: vec![worker_wire::replication(&lands); 2],
+            ..batch(&lands)
         };
         let applied = AtomicBool::new(false);
         let script = async {
@@ -2434,8 +2475,8 @@ mod tests {
         leader.0.upsert(facts("http://halved:8000", 1));
         let lands = entries(&leader.1, place).remove(0);
         let halved = proto::ReplicationBatch {
-            events: vec![worker_wire::replication(&lands, now); 2],
-            ..batch(&lands, now)
+            events: vec![worker_wire::replication(&lands); 2],
+            ..batch(&lands)
         };
         let applied = AtomicBool::new(false);
         let script = async {
@@ -2490,7 +2531,7 @@ mod tests {
         let leader = led();
         let now = Instant::now();
         let parts = snapshot(&leader, now);
-        let restored = leader.1.head(JournalKinds::All);
+        let restored = leader.1.head();
         standing.send_replace(bed.holds("leader-1", 1));
         let named = standby.shared.leader(None);
         let hello = |place: Position| {
@@ -2714,7 +2755,7 @@ mod tests {
         assert!(hello(first.frame().await));
         let mut place = start(&leader.1);
         for entry in entries(&leader.1, place) {
-            first.says(batch(&entry, Instant::now())).await;
+            first.says(batch(&entry)).await;
             place = entry.at;
             let ack = Frame::Ack(proto::ReplicationAck { seq: place.seq });
             assert_eq!(first.frame().await, Some(ack));
@@ -2731,7 +2772,7 @@ mod tests {
         assert!(!held(), "no frame of its present leader yet");
         leader.0.upsert(facts("http://b:8000", 1));
         for entry in entries(&leader.1, place) {
-            second.says(batch(&entry, Instant::now())).await;
+            second.says(batch(&entry)).await;
             place = entry.at;
             let ack = Frame::Ack(proto::ReplicationAck { seq: place.seq });
             assert_eq!(second.frame().await, Some(ack));
@@ -2759,7 +2800,7 @@ mod tests {
         assert!(!held(), "no frame of its present leader yet");
         leader.0.upsert(facts("http://c:8000", 1));
         for entry in entries(&leader.1, place) {
-            third.says(batch(&entry, Instant::now())).await;
+            third.says(batch(&entry)).await;
             let ack = Frame::Ack(proto::ReplicationAck { seq: entry.at.seq });
             assert_eq!(third.frame().await, Some(ack));
         }
@@ -2928,10 +2969,10 @@ mod tests {
         Follower::new(Arc::clone(store), Arc::clone(log)).through(Arc::clone(door))
     }
 
-    /// One entry as a leader's stream sends it at `now`: a generation with
-    /// the document `documents` holds for it at the send.
-    fn sent(documents: &Generations, entry: &Entry, now: Instant) -> proto::ReplicationBatch {
-        let mut batch = batch(entry, now);
+    /// One entry as a leader's stream sends it: a generation with the
+    /// document `documents` holds for it at the send.
+    fn sent(documents: &Generations, entry: &Entry) -> proto::ReplicationBatch {
+        let mut batch = batch(entry);
         if let Event::Generation { generation } = entry.event {
             batch.events[0].event = Some(Sent::Generation(documents.sent(generation)));
         }
@@ -2960,7 +3001,7 @@ mod tests {
         // door holds at the send: the first stands no longer.
         let led = entries(&leader.1, start(&leader.1));
         for entry in &led {
-            let batch = sent(&leading, entry, at);
+            let batch = sent(&leading, entry);
             assert_eq!(follower.apply(&batch, at), Ok(()), "{entry:?}");
         }
         assert_eq!(told(&standby.1), told(&leader.1), "one history");
@@ -2975,9 +3016,9 @@ mod tests {
         // leaves the synced state at that place, the term's start applied.
         let other = replica();
         let bare = Follower::new(Arc::clone(&other.0), Arc::clone(&other.1));
-        assert_eq!(bare.apply(&batch(&led[0], at), at), Ok(()));
+        assert_eq!(bare.apply(&batch(&led[0]), at), Ok(()));
         assert_eq!(
-            bare.apply(&sent(&leading, &led[1], at), at),
+            bare.apply(&sent(&leading, &led[1]), at),
             Err(Halt::Unread(UNAPPLIED))
         );
     }
@@ -3024,7 +3065,7 @@ mod tests {
         assert_eq!(following.generation(), 0);
         // The generation lands behind the restore, at no place of its own.
         assert_eq!(follower.restore(stage().0, stated.as_ref()), Ok(true));
-        assert_eq!(follower.place(), leader.1.head(JournalKinds::All));
+        assert_eq!(follower.place(), leader.1.head());
         assert_eq!(held(&standby.0), held(&leader.0));
         assert_eq!(
             spec_document(following.document(0).expect("held")),

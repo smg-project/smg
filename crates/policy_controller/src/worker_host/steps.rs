@@ -157,9 +157,7 @@ pub fn registration_into_store<H: WorkflowHost>(
 /// replacement by id is refused as moved, ahead of its keep, where another
 /// object stands under its URL by then.
 ///
-/// A holder built with no keeper is refused ([`NoCredentials`]). A holder that
-/// keeps built objects ([`Objects::with_built_kept`]) is one: a built
-/// object holds its own credential.
+/// A holder built with no keeper is refused ([`NoCredentials`]).
 pub fn registration_into_store_keeping_credentials<H: WorkflowHost>(
     settings: &RegistrationSettings,
     gates: RegistrationGates,
@@ -389,9 +387,7 @@ impl<G: Generation> WriteWorkersToStore<G> {
     /// ([`Objects::keeping`]): the keep, the door's write, the keeper's
     /// answer and the lay-again that answer asks for. A guarded write is
     /// refused there as moved, ahead of its keep, where another object
-    /// stands under the URL by then. The plain line takes no turn here:
-    /// where its holder keeps built objects, its door hands in under that
-    /// turn.
+    /// stands under the URL by then. The plain line takes no turn here.
     ///
     /// The workers are the ranks of one engine and dial one address, where
     /// one registration is in flight. So the keep is the registration's:
@@ -780,8 +776,9 @@ mod tests {
             WorkersStore,
         },
         worker_host::{
-            facts, Members, MembershipWriteOutcome, MembershipWriteRefused, MembershipWriter,
-            Objects, Over, Precondition, Remover, RowRevision, StoreMembershipWriter,
+            facts, membership_writer::tests::StoreDoor, Members, MembershipWriteOutcome,
+            MembershipWriteRefused, MembershipWriter, Objects, Over, Precondition, Remover,
+            RowRevision,
         },
     };
 
@@ -851,7 +848,7 @@ mod tests {
             let registry = Arc::new(WorkerRegistry::new());
             let objects = Arc::new(Objects::new(Arc::clone(&registry)));
             let store = Arc::new(MemoryStore::default());
-            let door = Arc::new(StoreMembershipWriter::new(Arc::clone(&store)));
+            let door = Arc::new(StoreDoor::new(Arc::clone(&store)));
             let host = Arc::new(Host {
                 registry,
                 settings: RegistrationSettings {
@@ -860,7 +857,6 @@ mod tests {
                     startup_timeout_secs: 67,
                     startup_delay_secs: 11,
                     startup_check_interval_secs: 7,
-                    dp_aware: false,
                     model_path: None,
                     model_aliases: Default::default(),
                     retry: Default::default(),
@@ -1561,9 +1557,7 @@ mod tests {
     }
 
     /// The line that keeps reads the keeper from its holder, where the line
-    /// is built. A holder built with none is refused. A holder takes a
-    /// keeper or kept objects, never both, and the later call stands: so a
-    /// holder that keeps built objects has no keeper, and is refused too.
+    /// is built. A holder built with none is refused.
     #[test]
     fn the_line_that_keeps_is_not_built_over_a_holder_with_no_keeper() {
         let f = Fixture::new();
@@ -1582,15 +1576,7 @@ mod tests {
         let keeper = Arc::new(Credentials::new());
         assert!(matches!(line(Objects::new(registry())), Err(NoCredentials)));
 
-        let built_kept = Objects::new(registry())
-            .with_credentials(Arc::clone(&keeper))
-            .with_built_kept();
-        assert!(built_kept.credentials().is_none());
-        assert!(matches!(line(built_kept), Err(NoCredentials)));
-
-        let keeping = Objects::new(registry())
-            .with_built_kept()
-            .with_credentials(keeper);
+        let keeping = Objects::new(registry()).with_credentials(keeper);
         assert!(keeping.credentials().is_some());
         assert!(line(keeping).is_ok());
     }

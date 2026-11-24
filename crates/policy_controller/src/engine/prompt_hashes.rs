@@ -69,6 +69,11 @@ pub struct PromptHashes {
     block_size: u32,
     namespace_seed: u64,
     prompt_tokens: u32,
+    /// The length of a prompt of text in characters, where the document
+    /// reads a request's size: `0` otherwise, and for token ids.
+    prompt_chars: u32,
+    /// The length of a prompt of text in bytes: `0` for token ids.
+    prompt_bytes: u32,
 }
 
 impl PromptHashes {
@@ -90,15 +95,21 @@ impl PromptHashes {
             kind: HashKind::Token,
             block_size,
             namespace_seed: seeds.partition,
-            prompt_tokens: prompt_token_count(tokens.len()),
+            prompt_tokens: prompt_tokens_of(Some(tokens)),
+            prompt_chars: 0,
+            prompt_bytes: 0,
         }
     }
 
     /// The hashes of a prompt its caller holds as text: one for each whole
     /// window of `window` bytes, `depth` windows at most. The text is hashed
     /// as it stands, under [`HashSeeds::partition`]. No worker hashes text,
-    /// so the event seed is not read.
-    fn of_text(text: &str, window: u32, depth: usize, seeds: HashSeeds) -> Self {
+    /// so the event seed is not read. A prompt of text states no count of
+    /// tokens. Its length in bytes is at hand and is always stated. Its
+    /// length in characters is counted where `sized` says a stage of the
+    /// document reads a request's size: the one pass over the text is made
+    /// for such a document alone.
+    fn of_text(text: &str, window: u32, depth: usize, sized: bool, seeds: HashSeeds) -> Self {
         let bytes = text.as_bytes();
         let size = window as usize;
         let end = bytes.len().min(depth.saturating_mul(size));
@@ -111,7 +122,9 @@ impl PromptHashes {
             kind: HashKind::Text,
             block_size: window,
             namespace_seed: seeds.partition,
-            prompt_tokens: prompt_token_count(bytes.len() / TEXT_BYTES_PER_TOKEN as usize),
+            prompt_tokens: 0,
+            prompt_chars: prompt_chars_of(None, Some(text), sized),
+            prompt_bytes: prompt_bytes_of(None, Some(text)),
         }
     }
 
@@ -141,22 +154,22 @@ impl PromptHashes {
     /// The hashes of a prompt by what its caller holds of it: its token ids
     /// win, else its text is hashed, else it has none. `read` is asked once,
     /// for the kind that is hashed: the size of one block of that kind and
-    /// how many blocks are read ([`block_size_and_depth`]). A prompt with
-    /// neither asks nothing.
+    /// how many blocks are read, and whether the document reads a request's
+    /// size ([`block_size_and_depth`]). A prompt with neither asks nothing.
     pub(crate) fn of_prompt(
         tokens: Option<&[u32]>,
         text: Option<&str>,
         seeds: HashSeeds,
-        read: impl FnOnce(HashKind) -> (u32, usize),
+        read: impl FnOnce(HashKind) -> (u32, usize, bool),
     ) -> Self {
         match (tokens, text) {
             (Some(tokens), _) => {
-                let (block_size, depth) = read(HashKind::Token);
+                let (block_size, depth, _) = read(HashKind::Token);
                 Self::of_tokens(tokens, block_size, depth, seeds)
             }
             (None, Some(text)) => {
-                let (window, depth) = read(HashKind::Text);
-                Self::of_text(text, window, depth, seeds)
+                let (window, depth, sized) = read(HashKind::Text);
+                Self::of_text(text, window, depth, sized, seeds)
             }
             (None, None) => Self::default(),
         }
@@ -165,7 +178,8 @@ impl PromptHashes {
     /// Writes the hashes into a request's facts: the blocks, what they
     /// hash, the size of one and the partition's seed. The facts borrow the
     /// blocks. A prompt size the facts already hold stays: the hashing's own
-    /// count is written only where they hold none.
+    /// count is written only where they hold none, and so is each length of
+    /// its text.
     ///
     /// Every decision of the request calls this from the caller's crate, so
     /// it is `#[inline]`: its body can be inlined across the crate boundary.
@@ -176,6 +190,12 @@ impl PromptHashes {
         facts.block_size = self.block_size;
         facts.namespace_seed = self.namespace_seed;
         facts.prompt_tokens = self.prompt_tokens_or(facts.prompt_tokens);
+        if facts.prompt_chars == 0 {
+            facts.prompt_chars = self.prompt_chars;
+        }
+        if facts.prompt_bytes == 0 {
+            facts.prompt_bytes = self.prompt_bytes;
+        }
     }
 
     /// The size in tokens of a prompt whose request states `stated`: the
@@ -193,25 +213,58 @@ impl PromptHashes {
     }
 }
 
-/// The size of one block of a model's prompt under `spec`, and how many
-/// blocks of it the document reads. A token block is the model's block size:
-/// its size of record, and the document's where it has none. A window of
-/// text is that many tokens in bytes.
+/// The size of one block of a model's prompt under `spec`, how many blocks
+/// of it the document reads, and whether a stage of the document reads a
+/// request's size ([`Needs::prompt_size`](crate::document::Needs::prompt_size)).
+/// A token block is the model's block size: its size of record, and the
+/// document's where it has none. A window of text is that many tokens in
+/// bytes.
 pub(crate) fn block_size_and_depth(
     spec: &AppliedSpec,
     block_size_of_record: Option<u32>,
     kind: HashKind,
-) -> (u32, usize) {
+) -> (u32, usize, bool) {
     let block_size = block_size_of_record.unwrap_or_else(|| spec.block_size());
     let size = match kind {
         HashKind::Token => block_size,
         HashKind::Text => block_size.saturating_mul(TEXT_BYTES_PER_TOKEN),
     };
-    (size, spec.block_hashes_read(kind, size))
+    let sized = spec.needs().prompt_size;
+    (size, spec.block_hashes_read(kind, size), sized)
 }
 
 fn prompt_token_count(count: usize) -> u32 {
     u32::try_from(count).unwrap_or(u32::MAX)
+}
+
+/// The count of the token ids of a prompt its caller holds as `tokens`,
+/// with no hash made: zero for a prompt it holds as text, or not at all.
+/// [`PromptHashes`] keeps this count of it.
+pub(crate) fn prompt_tokens_of(tokens: Option<&[u32]>) -> u32 {
+    tokens.map_or(0, |tokens| prompt_token_count(tokens.len()))
+}
+
+/// The length in characters of a prompt its caller holds as `text` and not
+/// as `tokens`, with no hash made, where `sized` says a stage of the
+/// document reads a request's size; zero otherwise. Token ids win, as they
+/// do where the prompt is hashed, and the text is passed over for such a
+/// document alone. [`PromptHashes`] keeps this length of it.
+pub(crate) fn prompt_chars_of(tokens: Option<&[u32]>, text: Option<&str>, sized: bool) -> u32 {
+    match (tokens, text) {
+        (None, Some(text)) if sized => prompt_token_count(text.chars().count()),
+        _ => 0,
+    }
+}
+
+/// The length in bytes of a prompt its caller holds as `text` and not as
+/// `tokens`, with no hash made and no pass over the text; zero otherwise.
+/// Token ids win, as they do where the prompt is hashed.
+/// [`PromptHashes`] keeps this length of it.
+pub(crate) fn prompt_bytes_of(tokens: Option<&[u32]>, text: Option<&str>) -> u32 {
+    match (tokens, text) {
+        (None, Some(text)) => prompt_token_count(text.len()),
+        _ => 0,
+    }
 }
 
 #[cfg(test)]
@@ -290,7 +343,10 @@ mod tests {
         let windows = store.prompt_hashes(MODEL, None, Some(RECORDED_TEXT), HashSeeds::PLAIN);
         let facts = written(&windows);
         assert_eq!(facts.block_hashes, RECORDED_WINDOWS);
-        assert_eq!(facts.prompt_tokens, RECORDED_TEXT.len() as u32 / 4);
+        // A text states no count of tokens. Its length is counted in
+        // characters: a stage of this document reads a request's size.
+        let chars = RECORDED_TEXT.chars().count() as u32;
+        assert_eq!((facts.prompt_tokens, facts.prompt_chars), (0, chars));
     }
 
     /// A model whose workers state no block size is hashed by the
@@ -350,7 +406,8 @@ mod tests {
 
     /// A prompt that holds no whole block states one block, the hash of
     /// what it has, as the classic's prefix policy keys a short prompt. Two
-    /// short prompts are two blocks, and an empty prompt states none.
+    /// short prompts are two blocks, and an empty prompt states none. The
+    /// token prompt states its ids' count, and the text its 25 characters.
     #[test]
     fn a_prompt_under_one_block_states_one_block_of_what_it_has() {
         let store = store();
@@ -359,30 +416,28 @@ mod tests {
             |tokens: &[u32]| store.prompt_hashes(MODEL, Some(tokens), None, HashSeeds::PLAIN);
         let text = |text: &str| store.prompt_hashes(MODEL, None, Some(text), HashSeeds::PLAIN);
         let (sevens, eights) = ([7; BLOCK_SIZE as usize - 1], [8; 3]);
-        for (short, again, other, block_size, prompt_tokens) in [
+        for (short, again, other, block_size, sizes) in [
             (
                 tokens(&sevens),
                 tokens(&sevens),
                 tokens(&eights),
                 BLOCK_SIZE,
-                BLOCK_SIZE - 1,
+                (BLOCK_SIZE - 1, 0),
             ),
             (
                 text("a prompt under one window"),
                 text("a prompt under one window"),
                 text("another"),
                 BLOCK_SIZE * TEXT_BYTES_PER_TOKEN,
-                6,
+                (0, 25),
             ),
         ] {
             let facts = written(&short);
             assert_eq!(facts.block_hashes.len(), 1, "{short:?}");
             assert_eq!(facts.block_hashes, written(&again).block_hashes);
             assert_ne!(facts.block_hashes, written(&other).block_hashes);
-            assert_eq!(
-                (facts.block_size, facts.prompt_tokens),
-                (block_size, prompt_tokens)
-            );
+            assert_eq!(facts.block_size, block_size);
+            assert_eq!((facts.prompt_tokens, facts.prompt_chars), sizes);
         }
         for empty in [tokens(&[]), text("")] {
             assert!(written(&empty).block_hashes.is_empty(), "{empty:?}");
@@ -390,7 +445,8 @@ mod tests {
     }
 
     /// The hashes write their five facts into a request that holds no
-    /// prompt size. A size the request already holds stays.
+    /// prompt size. A size the request already holds stays, and so does
+    /// each length of its text it holds.
     #[test]
     fn a_prompt_size_the_facts_hold_wins_over_the_hashings_count() {
         let store = store();
@@ -418,6 +474,43 @@ mod tests {
         hashes.write_to(&mut sized);
         assert_eq!(sized.prompt_tokens, 37);
         assert_eq!(sized.block_hashes, facts.block_hashes);
+        let worded = store.prompt_hashes(MODEL, None, Some("a text of its own"), seeds);
+        let mut stated = RequestFacts {
+            prompt_chars: 5,
+            prompt_bytes: 6,
+            ..RequestFacts::default()
+        };
+        worded.write_to(&mut stated);
+        let lengths = (stated.prompt_chars, stated.prompt_bytes);
+        assert_eq!((stated.prompt_tokens, lengths), (0, (5, 6)));
+    }
+
+    /// A prompt of text alone states no count of tokens. Its length in
+    /// bytes is at hand and is stated under any document. Its length in
+    /// characters is counted only under a document a stage of which reads
+    /// a request's size: under any other the text is not passed over.
+    /// Token ids win: a prompt that holds both states its ids' count and no
+    /// length. The text here is of two-byte characters: a reader that sizes
+    /// it by the one rule reads its bytes over four, 20 tokens, under
+    /// either document.
+    #[test]
+    fn a_text_alone_states_its_length_in_characters_where_a_stage_reads_a_size() {
+        let sized = document();
+        let plain = PolicySpec::preset("round_robin").expect("the preset");
+        let plain = AppliedSpec::validate(&plain).expect("the preset validates");
+        assert!(sized.needs().prompt_size && !plain.needs().prompt_size);
+        let text = "\u{e9}".repeat(40);
+        assert_eq!(text.len(), 80);
+        let sizes = |document: &AppliedSpec, tokens: Option<&[u32]>| {
+            let (size, seeds) = (Some(BLOCK_SIZE), HashSeeds::PLAIN);
+            let hashes = PromptHashes::under_document(document, size, tokens, Some(&text), seeds);
+            let facts = written(&hashes);
+            let lengths = (facts.prompt_chars, facts.prompt_bytes);
+            (facts.prompt_tokens, lengths, facts.prompt_size())
+        };
+        assert_eq!(sizes(&sized, None), (0, (40, 80), 20));
+        assert_eq!(sizes(&plain, None), (0, (0, 80), 20));
+        assert_eq!(sizes(&sized, Some(&[3; 9])), (9, (0, 0), 9));
     }
 
     /// No block is hashed past the depth the document reads, of token
@@ -501,9 +594,10 @@ mod tests {
             (Vec::new(), HashKind::Token, BLOCK_SIZE, XXH3_SEED, 40)
         );
         let window = BLOCK_SIZE * TEXT_BYTES_PER_TOKEN;
-        let whole = PromptHashes::of_text(RECORDED_TEXT, window, usize::MAX, HashSeeds::PLAIN);
+        let whole =
+            PromptHashes::of_text(RECORDED_TEXT, window, usize::MAX, false, HashSeeds::PLAIN);
         assert_eq!(written(&whole).block_hashes, RECORDED_WINDOWS);
-        let first = PromptHashes::of_text(RECORDED_TEXT, window, 1, HashSeeds::PLAIN);
+        let first = PromptHashes::of_text(RECORDED_TEXT, window, 1, false, HashSeeds::PLAIN);
         assert_eq!(written(&first).block_hashes, &RECORDED_WINDOWS[..1]);
     }
 

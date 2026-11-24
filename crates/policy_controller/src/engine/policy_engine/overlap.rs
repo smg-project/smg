@@ -11,6 +11,20 @@
 //! the rows' place ([`AffinityFacts`]): [`column()`] fills one from the same
 //! data, and [`record_prefix`] writes the record behind the pair's pick.
 //!
+//! Behind a single decision the pick states what its first target holds of
+//! the request ([`Overlap`]): the worker's entry of the rows the decision was
+//! given, whoever named them. No stage is asked for it. It is stated where
+//! the request's own profile reads affinity: rows named for a binding's
+//! shadow alone state nothing of the live pick.
+//!
+//! A request whose host names its entry in a token tree ([`TokenKey`]) is
+//! decided another way where the host lends the tree of the request's place
+//! ([`CacheIndexes::token_tree`]) and the model has no index of cache
+//! events: inside the tree's match ([`TokenTree`]). The match names the
+//! workers sent the deepest prefix of the request, and the same descent
+//! writes the request for the worker picked. The tree is the host's own,
+//! the one its policy reads and writes: the engine keeps none.
+//!
 //! What is kept, and what guards it:
 //!
 //! - **Once a list of workers** ([`PoolAffinity`]): each worker's number in
@@ -27,12 +41,15 @@
 //!   already holds, sixteen blocks a turn, and takes each turn by a try: a
 //!   turn that meets a held lock ends the write there, so a pick waits for
 //!   nobody. The map of the records is behind a mutex that only the read of
-//!   a list's table, a removed worker and the timer's sweep take.
+//!   a list's table, a change of membership and the timer's sweep take.
 //! - **Once a thread**: the buffers a naming writes into. A decision
-//!   allocates nothing once they have grown.
+//!   allocates nothing once they have grown, but what a tree's own match
+//!   and write allocate.
 //!
 //! No decision holds a lock across its stages: the naming ends before the
-//! decision runs, and the record is written after it answered.
+//! decision runs, and the record is written after it answered. A decision
+//! inside a tree's match runs between the tree's read and its write, which
+//! hold no lock across it.
 //!
 //! [`WarmUpRule`]: crate::engine::WarmUpRule
 
@@ -47,17 +64,20 @@ use std::{
 };
 
 use arc_swap::ArcSwapOption;
-use kv_index::ChainIndex;
+use kv_index::{ChainIndex, TenantId, TokenTree};
 use parking_lot::{Mutex, RwLock, RwLockWriteGuard};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use smg_worker::identity::basic::Worker;
 
 use crate::{
     document::spec::{AppliedSpec, IndexKind},
     engine::{
-        decision::Decision,
+        decision::{Decision, Overlap, Target},
+        decision_engine::TokenKey,
+        lease_events,
         view::{
-            AffinityFacts, AffinityHolder, AffinityRows, HashKind, Phase, RequestFacts, WorkerId,
+            blocks_within, fingerprint, AffinityFacts, AffinityHolder, AffinityRows, Feed,
+            HashKind, Phase, RequestFacts, WorkerId,
         },
         warm_up::WarmUpState,
     },
@@ -142,15 +162,34 @@ impl CacheIndex for ChainIndex {
     }
 }
 
-/// Where a host keeps its models' indexes of cache events.
+/// Where a host keeps its models' indexes of cache events, and its trees
+/// of the prompts it sent.
 pub trait CacheIndexes: Send + Sync {
     /// The index of `model`, the model id its workers registered under.
-    /// `None` where no worker of the model streams cache events.
+    /// `None` where no worker of the model streams cache events, and while
+    /// the index holds no block: a request is then decided by the host's
+    /// token tree, where it lends one ([`Self::token_tree`]).
     fn index(&self, model: &str) -> Option<Arc<dyn CacheIndex>>;
 
     /// The size of one cache block of `model` in tokens, as its workers'
     /// events taught it. `None` where the host knows none.
     fn block_size(&self, model: &str) -> Option<u32>;
+
+    /// The host's own token tree of the prompts sent to the workers that
+    /// serve `model` at `phase`: the tree its policy reads and writes for
+    /// such a request, with a worker a tenant by its address. A request
+    /// whose host names its entry ([`TokenKey`]) is decided inside this
+    /// tree's match, which writes the request for the worker picked. The
+    /// engine calls the match alone: the host bounds the tree and takes a
+    /// worker that left out of it. A host never makes a tree for the engine
+    /// alone where it has one. `None`, the default, where the host keeps
+    /// none: the request is named its rows from the record of hashed
+    /// prefixes. This question lends the one tree a tokenized request
+    /// reads. A host's other records of the prompts it sent are not lent.
+    fn token_tree(&self, model: &str, phase: Phase) -> Option<Arc<TokenTree>> {
+        let _ = (model, phase);
+        None
+    }
 }
 
 /// What the engine keeps for the affinity stages across decisions: the
@@ -160,8 +199,8 @@ pub trait CacheIndexes: Send + Sync {
 pub struct Affinity {
     indexes: OnceLock<Arc<dyn CacheIndexes>>,
     /// The record of sent prefixes of each model, by the model id its
-    /// workers registered under. Locked where a list's table is read, where
-    /// a worker left and at the timer's sweep: never by a decision's naming
+    /// workers registered under. Locked where a list's table is read, at a
+    /// change of membership and at the timer's sweep: never by a decision's naming
     /// or its write, which hold their record by the list's table.
     records: Mutex<FxHashMap<Box<str>, Arc<PrefixRecord>>>,
 }
@@ -191,12 +230,24 @@ impl Affinity {
         self.indexes.get()?.block_size(model)
     }
 
-    /// A worker left the pool or was replaced: every record of sent
-    /// prefixes forgets it. Takes the records' map and, for a record that
-    /// holds the worker, that record's lock as a writer.
+    /// A worker left the pool, was replaced, or joins with no leave told
+    /// ahead: every record of sent prefixes forgets it. Takes the records'
+    /// map and, for a record that holds the worker, that record's lock as
+    /// a writer.
     pub fn forget(&self, worker: WorkerId) {
         for record in self.records.lock().values() {
             record.forget(worker);
+        }
+    }
+
+    /// The workers that stand, said whole behind a read of the host's
+    /// registry: every record forgets each worker it holds a place for
+    /// that is not among them, so a worker whose leave was never told
+    /// keeps no place. Takes what [`Self::forget`] takes.
+    pub(super) fn keep(&self, standing: &[WorkerId]) {
+        let standing: FxHashSet<WorkerId> = standing.iter().copied().collect();
+        for record in self.records.lock().values() {
+            record.keep(&standing);
         }
     }
 
@@ -334,6 +385,20 @@ impl PrefixRecord {
         self.sweeping.store(true, Ordering::Relaxed);
     }
 
+    /// Forgets every worker the record holds a place for that is not in
+    /// `standing` ([`Self::forget`]).
+    fn keep(&self, standing: &FxHashSet<WorkerId>) {
+        let held = self.predictor.read();
+        let gone: Vec<WorkerId> = held
+            .held()
+            .filter(|worker| !standing.contains(worker))
+            .collect();
+        drop(held);
+        for worker in gone {
+            self.forget(worker);
+        }
+    }
+
     /// One step of the work that waits, under the writer's guard.
     fn sweep(&self, predictor: &mut PrefixPredictor) {
         if self.sweeping.load(Ordering::Relaxed) && predictor.sweep(Self::SWEEP) < Self::SWEEP {
@@ -448,6 +513,13 @@ struct Table {
     /// The place's stages read affinity. Where they do and the profile is
     /// named no row, a single decision is handed the column whole.
     reads: bool,
+    /// The place's own profile reads affinity
+    /// ([`Engine::profile_reads_affinity`]): a pick states its worker's
+    /// entry. Where the binding's shadow alone reads it, the rows are the
+    /// shadow's and the live pick states nothing.
+    ///
+    /// [`Engine::profile_reads_affinity`]: crate::engine::Engine::profile_reads_affinity
+    states: bool,
     /// One entry a worker of the list, in the list's order: its age at the
     /// read, the blocks the index held for it and what they gained since
     /// its admission, and nothing held. A decision that takes a column
@@ -476,6 +548,20 @@ struct Table {
     /// The record's holders are named ahead of the index's: no prefix stage
     /// of the profile reads cache events.
     ahead: bool,
+    /// The host's token tree for the place, where it lends one, the
+    /// profile reads a record and the model has no index of cache events: a
+    /// request whose host names its entry is decided inside the tree's
+    /// match. The handle is the host's own tree, kept while the table
+    /// stands.
+    sent: Option<Arc<TokenTree>>,
+    /// The document's block size, in tokens: what a tree's match is
+    /// counted by for a request its host counted with none
+    /// ([`Self::blocks_of`]).
+    block: u32,
+    /// The list's workers by the fingerprint of their address, each with
+    /// its row: where a worker a tree names stands. Empty where the host
+    /// lends the list no tree.
+    by_address: Box<[(u64, u32)]>,
     /// The list's workers by id, each with its row: where a worker of the
     /// record stands. Empty where the list keeps no record.
     by_id: Box<[(WorkerId, u32)]>,
@@ -539,6 +625,7 @@ impl Table {
             read_at: now,
             cap,
             reads,
+            states: engine.profile_reads_affinity(model, phase),
             column: Box::default(),
             index: None,
             row_of: Box::default(),
@@ -548,17 +635,22 @@ impl Table {
             unheard_any: false,
             record: None,
             ahead: false,
+            sent: None,
+            block: spec.block_size(),
+            by_address: Box::default(),
             by_id: Box::default(),
             warming: Box::default(),
             ruled: WarmUpState::default(),
             first_end: u64::MAX,
         };
-        if !reads {
+        // A list of no worker names no holder and writes no prefix, and its
+        // model would be the request's own word: nothing is read for it.
+        let Some(first) = workers.first().filter(|_| reads) else {
             return table;
-        }
+        };
         // The index is its workers' model's, by the id they registered
         // under: a request may name the model by another.
-        let registered = workers.first().map_or(model, |worker| worker.model_id());
+        let registered = first.model_id();
         let index = affinity
             .indexes
             .get()
@@ -634,6 +726,17 @@ impl Table {
             let bound = usize::try_from(bound).unwrap_or(usize::MAX);
             table.record = Some(affinity.record_of(registered, bound));
             table.ahead = ahead;
+            if table.index.is_none() && cap != 0 {
+                let lent = affinity.indexes.get();
+                table.sent = lent.and_then(|indexes| indexes.token_tree(registered, phase));
+            }
+            if table.sent.is_some() {
+                let print = |worker: &Arc<dyn Worker>| fingerprint(worker.url().as_bytes());
+                let mut by_address: Vec<(u64, u32)> =
+                    workers.iter().map(print).zip(0u32..).collect();
+                by_address.sort_unstable();
+                table.by_address = by_address.into();
+            }
             let mut by_id: Vec<(WorkerId, u32)> = ids.iter().copied().zip(0u32..).collect();
             by_id.sort_unstable_by_key(|&(id, _)| id);
             table.by_id = by_id.into();
@@ -657,6 +760,69 @@ impl Table {
         let at = self.by_id.binary_search_by_key(&id, |&(id, _)| id).ok()?;
         let row = self.by_id[at].1;
         (!self.heard(row)).then_some(row)
+    }
+
+    /// Calls `each` with the row of every worker of the list at `address`,
+    /// the address a tree names a worker by: found by the address's
+    /// fingerprint and held to the address itself.
+    fn rows_at(&self, workers: &[Arc<dyn Worker>], address: &str, mut each: impl FnMut(u32)) {
+        let print = fingerprint(address.as_bytes());
+        let from = self.by_address.partition_point(|&(other, _)| other < print);
+        for &(other, row) in self.by_address.iter().skip(from) {
+            if other != print {
+                break;
+            }
+            let worker = workers.get(row as usize);
+            if worker.is_some_and(|worker| worker.url() == address) {
+                each(row);
+            }
+        }
+    }
+
+    /// Names a request's rows into `buffers` from a tree's match: the
+    /// workers of the list among `sent`, the tenants of the deepest node the
+    /// request's prefix reaches, each holding its first `blocks` blocks, and
+    /// the list's warming rows. Each list is at most the cap, ascending by
+    /// row: past the cap the holders are a draw. A match under one block
+    /// names no holder.
+    fn name_sent(
+        &self,
+        sent: &[TenantId],
+        blocks: u32,
+        workers: &[Arc<dyn Worker>],
+        facts: &RequestFacts<'_>,
+        buffers: &mut Buffers,
+    ) {
+        let Buffers {
+            holders,
+            warming,
+            picked,
+            live,
+            ..
+        } = buffers;
+        holders.clear();
+        warming.clear();
+        let mut draw = Draw::new(facts.seed ^ HOLDERS_STREAM);
+        let mut seen = 0usize;
+        for address in sent.iter().filter(|_| blocks > 0) {
+            self.rows_at(workers, address, |row| {
+                let holder = AffinityHolder {
+                    row,
+                    overlap_blocks: 0,
+                    predicted_blocks: blocks,
+                };
+                seen += 1;
+                if seen <= self.cap {
+                    holders.push(holder);
+                } else if let Some(slot) = holders.get_mut(below(&mut draw, count(seen)) as usize) {
+                    // Past the cap each worker is as likely to stand as
+                    // another.
+                    *slot = holder;
+                }
+            });
+        }
+        holders.sort_unstable_by_key(|holder| holder.row);
+        self.name_warming(facts, warming, picked, live);
     }
 
     /// Names a request's rows into `buffers`: its deepest holders and the
@@ -807,6 +973,8 @@ impl Table {
     }
 
     /// The list's warming rows at the request's instant, into `warming`.
+    /// In place in both namings: a list with none costs a test, not a call.
+    #[inline(always)]
     fn name_warming(
         &self,
         facts: &RequestFacts<'_>,
@@ -1011,27 +1179,79 @@ struct Asked<'a> {
 /// decision's instant ([`RequestFacts::now_micros`]) on the one clock of the
 /// engine's decisions.
 ///
-/// A profile whose stages read no affinity, and a request whose host filled
-/// a column or named rows itself, pass straight to `decide`. A profile that
-/// reads affinity and is named no row (it shows its rows to a plugin, whose
-/// stage reads the column whole) is handed the column [`column()`] fills, in
+/// A request whose host filled a column or named rows itself passes straight
+/// to `decide`. So does every request of a phase none of whose bindings
+/// reads affinity ([`Engine::needs_for_phase`]): that is one test, and the
+/// list keeps no table for it. Under a document where another binding of
+/// the phase reads affinity, a profile that reads none passes on behind its
+/// list's table, which says so. A profile that reads affinity and is named
+/// no row (it shows its rows to a plugin, whose stage reads the column
+/// whole) is handed the column [`column()`] fills, in
 /// [`RequestFacts::affinity`].
+///
+/// `token_key` names the request's entry in the host's token tree of sent
+/// prefixes ([`TokenKey`]), given the tree's page in tokens. It is called
+/// at most once, and only where the host lends the place such a tree
+/// ([`CacheIndexes::token_tree`]): its profile reads a record of sent
+/// prefixes and is named rows, and the model has no index of cache events.
+/// A request it names an entry for is decided inside the tree's match.
+/// `decide` is called once either way.
+///
+/// `sends_to` says whether the request's caller sends it to a target of the
+/// pick ([`RequestMaker::sends_to`]). A decision made inside the tree's
+/// match asks it of the pick's targets, best first, and the tree stores the
+/// request's pages for the first one it takes. No other decision asks it.
+///
+/// A pick states what its first target holds of the request ([`Overlap`]),
+/// from the rows its decision was given: the rows named here, the column
+/// filled here, a column its host filled or the rows its host named. A
+/// request decided inside a tree's match states nothing: a match is a count
+/// of tokens and no entry of blocks. Neither does a decision whose own
+/// profile reads no affinity, whether it is given no rows or the rows of
+/// its binding's shadow.
 ///
 /// The rows live in the calling thread's buffers until this returns:
 /// `decide` reads them and keeps nothing of them. Nothing is allocated once
-/// the buffers have grown, but where a table is read: once a list, and then
-/// by one decision a second.
-pub fn decide(
+/// the buffers have grown, but where a table is read (once a list, and then
+/// by one decision a second) and by a tree's own match and write.
+///
+/// [`Engine::needs_for_phase`]: crate::engine::Engine::needs_for_phase
+/// [`RequestMaker::sends_to`]: crate::engine::RequestMaker::sends_to
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the list, what is kept beside it, the request's facts, its entry in a tree and the target its caller takes, and the decision"
+)]
+pub fn decide<'p>(
     affinity: &Affinity,
     pool: &PoolAffinity,
     spec: &AppliedSpec,
     workers: &[Arc<dyn Worker>],
     ids: &[WorkerId],
     facts: &mut RequestFacts<'_>,
-    decide: impl FnOnce(&mut RequestFacts<'_>) -> Decision,
+    token_key: impl FnOnce(usize) -> Option<TokenKey<'p>>,
+    sends_to: impl Fn(&Target) -> bool,
+    mut decide: impl FnMut(&mut RequestFacts<'_>) -> Decision,
 ) -> Decision {
-    if !facts.affinity.is_empty() || facts.named.is_some() {
+    // No binding of the phase reads affinity: one test, and no table.
+    let unread = !spec.engine().needs_for_phase(facts.phase).affinity;
+    debug_assert!(
+        !unread || !spec.engine().needs_for(facts.model, facts.phase).affinity,
+        "a phase's needs hold the needs of each of its decisions"
+    );
+    if unread {
         return decide(facts);
+    }
+    if !facts.affinity.is_empty() || facts.named.is_some() {
+        // Its host fed the decision itself. The pick states what that feed
+        // says, where the request's own profile reads it.
+        let mut decision = decide(facts);
+        if spec
+            .engine()
+            .profile_reads_affinity(facts.model, facts.phase)
+        {
+            state(&mut decision, facts.feed(), facts, spec.block_size());
+        }
+        return decision;
     }
     debug_assert_eq!(workers.len(), ids.len(), "one id a worker of the list");
     let asked = Asked {
@@ -1043,7 +1263,11 @@ pub fn decide(
         phase: facts.phase,
         now: facts.now_micros,
     };
-    with_buffers(|buffers| pool.with_table(&asked, |table| table.decide(facts, buffers, decide)))
+    with_buffers(|buffers| {
+        pool.with_table(&asked, |table| {
+            table.decide(workers, facts, buffers, token_key, sends_to, decide)
+        })
+    })
 }
 
 /// One list's column for a decision that reads a column in the rows' place:
@@ -1092,6 +1316,59 @@ pub fn column(
     // reads as holding nothing, just admitted.
     column.resize(workers.len(), AffinityFacts::default());
     read
+}
+
+/// States in a decision's pick what its first target holds of the request
+/// ([`Overlap`]): that worker's entry of `feed`, the rows the decision was
+/// given. They are the rows named or the column filled here, a column the
+/// request's host filled, or the rows that host named
+/// ([`RequestFacts::feed`]): whoever named them, the entry is read the same
+/// way, and no stage is asked. A worker the rows do not name holds nothing,
+/// as it did to the stages: the pick then states a miss of the request's
+/// blocks. `facts` are the request's own, which say its size, and `block`
+/// is the document's block size, by which the request is counted where its
+/// host counted with none.
+///
+/// The feed is handed by itself, and not the facts the decision was made
+/// over: a decision that reads no fact, as a pin's answer handed through
+/// here, then makes no copy of them for this statement.
+///
+/// Nothing is stated where the decision picked nobody, and for a pick the
+/// binding's sessions rule placed alone and keeps from the profile
+/// ([`told_target`]): such a request is none of the profile's, as a
+/// gateway's sticky map hands a request it places to no policy. The one
+/// place a pick's overlap is stated. Its callers ask it where the
+/// request's own profile reads affinity, and not for a shadow's rows.
+fn state(decision: &mut Decision, feed: Feed<'_>, facts: &RequestFacts<'_>, block: u32) {
+    let Some(row) = told_target(decision).map(|target| target.position) else {
+        return;
+    };
+    let held = feed.entry_or_default(row);
+    if let Decision::Pick(pick) = decision {
+        pick.targets.state(Overlap::held(held, facts.blocks(block)));
+    }
+}
+
+/// The worker a decision sent its request to, where the profile is told of
+/// the request: the pick's first target, and none for a pick the binding's
+/// sessions rule placed alone and keeps from the profile
+/// ([`lease_events::stages_hear`]). The one test in front of every write
+/// that keeps where a prompt went.
+///
+/// The rule's word is read through that one function at five places: the
+/// words of a single's lease, the record's two writes here, the store of a
+/// prompt in a lent token tree ([`sent_address`]), the hand-over of a pin
+/// the keyed entry followed to this lookup, and a pair's two writes behind
+/// its pick, a side at a time. Under the rule's default word a request it
+/// places is the profile's own, and its prompt is kept as any pick's. Under
+/// the other the rule keeps the request from the profile, as a gateway's
+/// sticky map hands a request it places to no policy: the policy's record
+/// never sees that request's prompt.
+pub(super) fn told_target(decision: &Decision) -> Option<&Target> {
+    if !lease_events::stages_hear(decision) {
+        return None;
+    }
+    decision.pick()?.targets.first()
 }
 
 /// Behind a pick made over a column ([`column()`]): records the request's
@@ -1163,14 +1440,37 @@ impl PoolAffinity {
     }
 }
 
+/// The address of the worker a decision's request goes to, in the list it
+/// was made over: the first target of a pick the profile is told of
+/// ([`told_target`]) that the request's caller sends to (`sends_to`),
+/// asked best first. It is the worker a tree's match writes the request's
+/// prefix for. `None` where the decision picked nobody, the binding's
+/// sessions rule keeps the request from the profile, or the caller sends
+/// to none of the pick's targets, and the tree stores nothing.
+fn sent_address<'w>(
+    workers: &'w [Arc<dyn Worker>],
+    decision: &Decision,
+    sends_to: impl Fn(&Target) -> bool,
+) -> Option<&'w str> {
+    told_target(decision)?;
+    let mut targets = decision.pick()?.targets.iter();
+    let target = targets.find(|target| sends_to(target))?;
+    Some(workers.get(target.position as usize)?.url())
+}
+
 impl Table {
     /// One decision by this table: the naming, the decision, and the
-    /// record's write behind a pick.
-    fn decide(
+    /// record's write behind a pick. A request whose host names its entry
+    /// in the token tree it lends is decided inside the tree's match
+    /// ([`Self::decide_in_tree`]).
+    fn decide<'p>(
         &self,
+        workers: &[Arc<dyn Worker>],
         facts: &mut RequestFacts<'_>,
         buffers: &mut Buffers,
-        decide: impl FnOnce(&mut RequestFacts<'_>) -> Decision,
+        token_key: impl FnOnce(usize) -> Option<TokenKey<'p>>,
+        sends_to: impl Fn(&Target) -> bool,
+        mut decide: impl FnMut(&mut RequestFacts<'_>) -> Decision,
     ) -> Decision {
         if !self.reads {
             return decide(facts);
@@ -1178,23 +1478,33 @@ impl Table {
         if self.cap == 0 {
             return self.decide_by_column(facts, buffers, decide);
         }
+        // The entry is asked for where the host lends the place a tree,
+        // once, by the tree's own page.
+        let sent = self.sent.as_deref();
+        let keyed = sent.and_then(|sent| Some((sent, token_key(sent.page_size())?)));
+        if let Some((sent, key)) = keyed {
+            return self.decide_in_tree((sent, &key), sends_to, workers, facts, buffers, decide);
+        }
         let read = self.name(facts, buffers);
-        let decision = decide(&mut RequestFacts {
-            named: Some(AffinityRows {
-                holders: &buffers.holders,
-                warming: &buffers.warming,
-                thin: self.ruled.thin,
-                mean_in_flight: None,
-            }),
+        let named = AffinityRows {
+            holders: &buffers.holders,
+            warming: &buffers.warming,
+            thin: self.ruled.thin,
+            mean_in_flight: None,
+        };
+        let mut decision = decide(&mut RequestFacts {
+            named: Some(named),
             ..*facts
         });
+        if self.states {
+            state(&mut decision, Feed::Named(named), facts, self.block);
+        }
         let (Some(read), Some(record)) = (read, self.record.as_deref()) else {
             return decision;
         };
-        let target = decision.pick().and_then(|pick| pick.targets.first());
         // The index speaks for a worker whose cache events are heard: the
         // record takes no entry for it.
-        let Some(target) = target.filter(|target| !self.heard(target.position)) else {
+        let Some(target) = told_target(&decision).filter(|to| !self.heard(to.position)) else {
             return decision;
         };
         let held = buffers.deepest.contains(&target.id);
@@ -1202,6 +1512,63 @@ impl Table {
             record.write(&buffers.keys, read, held, target.id);
         }
         decision
+    }
+
+    /// How many of the request's blocks a token tree's match of `tokens`
+    /// tokens holds, counted as the stages count the request
+    /// ([`blocks_within`]): by the size its host counted it with, and by the
+    /// document's where the host counted with none. The tree's page is no
+    /// unit of the request: a match is a count of tokens, whatever the page
+    /// the tree walked them by.
+    fn blocks_of(&self, tokens: usize, facts: &RequestFacts<'_>) -> u32 {
+        let block = facts.block_size_or(self.block);
+        blocks_within(count(tokens), facts.hash_kind, block)
+    }
+
+    /// One decision of a request inside the match of the host's token tree
+    /// for its place, by the tree and the request's entry in it. The match
+    /// names the workers sent the deepest prefix of the request, the
+    /// decision is made over them, and the same descent writes the
+    /// request's whole pages for the worker the request goes to: the first
+    /// target of the pick its caller sends to (`sends_to`). A decision that
+    /// picks nobody, or none of whose targets its caller sends to, stores
+    /// nothing: the match has marked the path it walked as used, as every
+    /// match of the tree does. The record of hashed prefixes is neither
+    /// read nor written.
+    fn decide_in_tree(
+        &self,
+        (sent, key): (&TokenTree, &TokenKey<'_>),
+        sends_to: impl Fn(&Target) -> bool,
+        workers: &[Arc<dyn Worker>],
+        facts: &RequestFacts<'_>,
+        buffers: &mut Buffers,
+        mut decide: impl FnMut(&mut RequestFacts<'_>) -> Decision,
+    ) -> Decision {
+        let mut decide_over = |holders: &[TenantId], blocks: u32| {
+            self.name_sent(holders, blocks, workers, facts, buffers);
+            decide(&mut RequestFacts {
+                named: Some(AffinityRows {
+                    holders: &buffers.holders,
+                    warming: &buffers.warming,
+                    thin: self.ruled.thin,
+                    mean_in_flight: None,
+                }),
+                ..*facts
+            })
+        };
+        let mut decided = None;
+        sent.match_and_insert_with(&key.tokens, |found| {
+            // The marker is no part of the prompt.
+            let matched = found.matched_token_count.saturating_sub(key.marker);
+            let decision = decide_over(&found.matched_tenants, self.blocks_of(matched, facts));
+            let to = sent_address(workers, &decision, &sends_to);
+            decided = Some(decision);
+            to
+        });
+        // The tree asks for the worker once, so the decision was made
+        // there. Were it not asked, the request is decided here, with no
+        // holder named and nothing written.
+        decided.unwrap_or_else(|| decide_over(&[], 0))
     }
 
     /// One decision of a profile that reads the column whole: the fill, the
@@ -1215,16 +1582,18 @@ impl Table {
         // The column leaves the buffers while the fill writes the others.
         let mut column = mem::take(&mut buffers.column);
         let read = self.fill(facts, buffers, &mut column);
-        let decision = decide(&mut RequestFacts {
+        let mut decision = decide(&mut RequestFacts {
             affinity: &column,
             ..*facts
         });
+        if self.states {
+            state(&mut decision, Feed::Column(&column), facts, self.block);
+        }
         buffers.column = column;
         let (Some(read), Some(record)) = (read, self.record.as_deref()) else {
             return decision;
         };
-        let target = decision.pick().and_then(|pick| pick.targets.first());
-        let Some(target) = target.filter(|target| !self.heard(target.position)) else {
+        let Some(target) = told_target(&decision).filter(|to| !self.heard(to.position)) else {
             return decision;
         };
         let held = read.deepest.contains(&target.position);

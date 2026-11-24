@@ -63,7 +63,8 @@ use super::{
 use crate::{
     engine::view::WorkerId,
     service::proto::{self, controller_frame, gateway_frame::Frame},
-    store::{leases::DISPATCH_TTL, Hand},
+    store::Hand,
+    tracking::lease::DISPATCH_TTL,
 };
 
 /// The stream rule's grace period (design 4.3): how long a gateway stays
@@ -389,7 +390,7 @@ async fn session(
 
     // The session's hand-over at the leases' file: what its frames say of
     // a lease is handed there, and applied before the session leaves.
-    let hand = lifecycle::open(&shared.store, gateway);
+    let hand = Hand::new(gateway);
     let status = loop {
         tokio::select! {
             frame = inbound.message() => {
@@ -638,6 +639,7 @@ mod tests {
         service::{
             controller::{
                 config::Scope,
+                decision_slots::tests::followed,
                 election::{ElectionObservation, LeasePlace, Said},
                 floor::{FLOORS_SPENT_MAX, FLOOR_BELIEVED, FLOOR_REACH},
                 gateways::{
@@ -694,7 +696,7 @@ mod tests {
             ADDRESS.to_owned(),
             &elector,
             stood,
-            journaled_for(&LeasePlace::Process, 0, 2),
+            followed(journaled_for(&LeasePlace::Process, 0, 2)),
             Arc::new(crate::stages::StageRegistry::builtin()),
             2,
         )
@@ -1548,7 +1550,7 @@ mod tests {
         assert!(judge(
             &bed.shared,
             GATEWAY,
-            &super::lifecycle::open(&bed.shared.store, gateway),
+            &super::Hand::new(gateway),
             1,
             &seat,
             &report,
@@ -1567,7 +1569,7 @@ mod tests {
         let status = judge(
             &bed.shared,
             GATEWAY,
-            &super::lifecycle::open(&bed.shared.store, gateway),
+            &super::Hand::new(gateway),
             1,
             &seat,
             &late,
@@ -1593,7 +1595,7 @@ mod tests {
         assert!(judge(
             &bed.shared,
             GATEWAY,
-            &super::lifecycle::open(&bed.shared.store, gateway),
+            &super::Hand::new(gateway),
             1,
             &newer,
             &report,

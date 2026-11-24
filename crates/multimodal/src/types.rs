@@ -320,7 +320,7 @@ impl DecodedRgbVideo {
             .collect()
     }
 
-    pub fn to_dynamic_images(&self) -> Result<Vec<DynamicImage>, String> {
+    pub(crate) fn to_dynamic_images(&self) -> Result<Vec<DynamicImage>, String> {
         let mut images = Vec::with_capacity(self.frames.len());
         for frame in &self.frames {
             let end = frame
@@ -382,7 +382,7 @@ impl VideoClip {
         Self::new_rgb_with_sample_fps(rgb_video, raw_bytes, source, hash, 2.0)
     }
 
-    pub fn new_rgb_with_sample_fps(
+    pub(crate) fn new_rgb_with_sample_fps(
         rgb_video: DecodedRgbVideo,
         raw_bytes: bytes::Bytes,
         source: VideoSource,
@@ -443,14 +443,6 @@ impl VideoClip {
             .ok_or_else(|| "video clip has no decoded frames".to_string())?
             .to_dynamic_images()
             .map(Cow::Owned)
-    }
-
-    pub fn raw_bytes(&self) -> &[u8] {
-        &self.raw_bytes
-    }
-
-    pub fn source(&self) -> &VideoSource {
-        &self.source
     }
 }
 
@@ -739,7 +731,7 @@ impl EncoderFieldLayouts {
     ///
     /// Existing vision specs use `pixel_values` for the primary encoder input.
     /// New specs should construct [`Self`] directly instead.
-    pub fn from_legacy_fields(mut fields: HashMap<String, FieldLayout>) -> Self {
+    pub(crate) fn from_legacy_fields(mut fields: HashMap<String, FieldLayout>) -> Self {
         let encoder_input = fields
             .remove("pixel_values")
             .unwrap_or(FieldLayout::Batched);
@@ -795,7 +787,7 @@ pub struct PromptReplacement {
 }
 
 impl PromptReplacement {
-    pub fn repeated(
+    pub(crate) fn repeated(
         modality: Modality,
         placeholder_token: &str,
         token_id: TokenId,
@@ -853,7 +845,7 @@ impl PromptReplacement {
     /// placeholder and should be included in its reported range. See
     /// [`Self::structural_prefix`].
     #[must_use]
-    pub fn with_structural_prefix(mut self, n: usize) -> Self {
+    pub(crate) fn with_structural_prefix(mut self, n: usize) -> Self {
         self.structural_prefix = n;
         self
     }

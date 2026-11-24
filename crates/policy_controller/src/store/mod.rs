@@ -4,7 +4,7 @@
 //!
 //! The store holds what a decision reads and nothing a request path writes:
 //! membership, health, loads, the KV index behind its event cursors,
-//! reservations, session pins and leases. Every path that writes it today
+//! reservations and leases. Every path that writes it today
 //! ends in one of these sinks (the step-3 inventory counted thirteen paths
 //! into six writes), so the drivers that move into the controller (discovery,
 //! the handshake, the prober, the poll, the subscriptions, the relays) and the
@@ -13,11 +13,10 @@
 //! | trait | who calls | how often |
 //! |---|---|---|
 //! | [`WorkersStore`] | discovery and the registration handshake, the control scope's register, patch and deregister calls | per membership change; a rollout of 512 workers is under one change per second |
-//! | [`HealthSink`] | the prober (one probe per worker per interval, 128 in flight), the connect signal, the leader's own doubt of a worker, every gateway's vetoes and completed dispatches | per probe; two frames per request |
+//! | [`HealthSink`] | the prober (one probe per worker per interval, 128 in flight), the connect signal, every gateway's vetoes and completed dispatches | per probe; two frames per request |
 //! | [`LoadSink`] | the subscription task per record, the poll per engine per tick, the scrape per interval, a relay per frame | up to ten records per rank per second busy, one per second idle |
 //! | [`KvEventSink`] | the subscription task per batch, a relay per frame | one batch per scheduler step that moved blocks |
 //! | [`ReservationStore`] | a commit (a prefill slot, a decode room), a lease's end | two per pair dispatch |
-//! | [`SessionsStore`] | a keyed commit, the TTL sweep, a gateway's `Hello` pages | per keyed decision |
 //! | [`LeasesStore`] | every decision, dispatch and completion report, the dispatch-deadline sweep, `Hello` pages | two to three frames per request |
 //!
 //! Rules every implementation keeps:
@@ -65,6 +64,7 @@
 //!
 //! [`LoadRow`]: crate::engine::view::LoadRow
 
+pub(crate) mod applied;
 pub(crate) mod encoding;
 pub(crate) mod health;
 pub(crate) mod index;
@@ -85,25 +85,24 @@ pub(crate) mod workers;
 mod tests;
 
 pub use encoding::{hands_to, EncodeClasses, EncodeHandoff, EncodeMember, EncodeOffer};
-pub use health::{HealthSink, HealthWrite, LeaderBits, VetoWrite};
+pub use health::{HealthSink, HealthWrite, VetoWrite};
 pub use index::{
     AffinityRowsBuffers, ApplyError, ChainBlockMap, ContentHash, KvEvent, LaneCounts, LaneWriter,
     SequenceHash, StoredBlock, WorkerGroups, INDEX_WORKERS,
 };
-pub use journal::{Journal, JournalKinds, Position};
+pub use journal::{Journal, Position};
 pub use kv_events::{
     BatchAdmission, BatchFacts, BatchOutcome, KvCursor, KvEventSink, RankCursor, ResyncReason,
     SnapshotChunk, GAP_CLEAR_THRESHOLD, RESTART_WINDOW,
 };
 pub use leases::{
-    DecodeMark, DecodeRefused, DecodeSide, Dispatch, LeaseRecord, LeaseRefused, LeaseState,
-    LeasesStore, PickRecord, Said, Sides,
+    DecodeMark, DecodeSide, LeaseRecord, LeaseRefused, LeaseState, LeasesStore, PickRecord, Sides,
 };
 pub use loads::{LoadSample, LoadSink, LoadSource, PollMode, Wake};
+#[cfg(feature = "controller")]
 pub(crate) use memory::DecodeIssue;
 pub use memory::{AtWork, Hand, LookOutcome, MemoryStore, StoreCheckpoint, StoreStats};
 pub use reservations::{ReservationKind, ReservationStore};
-pub use sessions::{Pin, SessionsStore};
 pub use signals::{SignalSink, SignalWriteOutcome};
 pub use snapshot::{
     AffinityQuery, EncodePairBuffers, OutsideLists, PairBuffers, PoolView, StaleGeneration,

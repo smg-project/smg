@@ -3,33 +3,44 @@
 
 use std::{
     cell::{Cell, RefCell},
-    sync::{mpsc, Arc, Mutex},
+    sync::{
+        atomic::{AtomicU32, Ordering},
+        mpsc, Arc, Mutex,
+    },
     time::{Duration, Instant},
 };
 
 use super::{
     identity, identity_of,
-    leases::{InFlightCounts, WorkerSlot, DISPATCH_TTL},
-    AtWork, BatchFacts, BatchOutcome, ContentHash, DecodeMark, DecodeRefused, DecodeSide, Dispatch,
-    GatewayId, Hand, HealthSink, HealthWrite, Journal, JournalKinds, KvEvent, KvEventSink,
-    LeaseRecord, LeaseRefused, LeaseState, LeasesStore, LoadSample, LoadSink, LoadSource,
-    LookOutcome, MembershipChange, MembershipTail, MemoryStore, PickRecord, Pin, PollMode,
-    Position, Reachability, ReservationKind, ReservationStore, ResyncReason, Said, SequenceHash,
-    SessionsStore, Sides, Signals, SnapshotChunk, StoreSnapshot, StoredBlock, VetoWrite,
-    ViewBuffers, ViewQuery, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
+    leases::{InFlightCounts, WorkerSlot},
+    AtWork, BatchFacts, BatchOutcome, ContentHash, DecodeMark, DecodeSide, GatewayId, Hand,
+    HealthSink, HealthWrite, Journal, KvEvent, KvEventSink, LeaseRecord, LeaseRefused, LeaseState,
+    LeasesStore, LoadSink, LoadSource, LookOutcome, MembershipChange, MembershipTail, MemoryStore,
+    PickRecord, PollMode, Position, ReservationKind, ReservationStore, ResyncReason, SequenceHash,
+    Sides, Signals, SnapshotChunk, StoreSnapshot, StoredBlock, VetoWrite, WorkerFacts, WorkerPatch,
+    WorkerRow, WorkerStatus, WorkersStore,
 };
 use crate::{
     document::spec,
     engine::{
         decision::{self, Target, Targets},
+        decision_engine::DecodeRefused,
         decision_slot::DecisionSlot,
         demands::DemandFacts,
-        sticky_sessions::{self, SessionVerdict},
+        sticky_sessions::SessionVerdict,
         view::{fingerprint, LoadRow, Role, Session, SignalSource, WorkerId},
     },
     service::replication::Log,
-    tracking::lease::{Lease, LeaseId, Membership, Outcome, ReleaseReason, Side, TransportClass},
+    tracking::{
+        lease::{
+            Dispatch, Lease, LeaseId, Membership, Outcome, ReleaseReason, Said, Side,
+            TransportClass, DISPATCH_TTL,
+        },
+        HostCount,
+    },
 };
+
+mod host_count;
 
 fn facts(key: &str, incarnation: u64) -> WorkerFacts {
     WorkerFacts {
@@ -1549,137 +1560,41 @@ fn manual_ruled(generation: u64, ttl_s: u32, sweep_s: u32) -> spec::AppliedSpec 
     AppliedSpec::validate(&document).expect("the document validates")
 }
 
-#[test]
-fn the_pins_sweep_drops_each_pin_past_its_own_end_once_an_interval() {
-    let store = MemoryStore::new();
-    let now = Instant::now();
-    let t = |seconds: u64| now + Duration::from_secs(seconds);
-    let sessions: &dyn SessionsStore = &store;
-    // No sessions rule ever stood: no pass runs, whatever the end of a
-    // pin.
-    sessions.pin(1, WorkerId(1), now, Some(store.micros(t(60))));
-    assert_eq!(store.sweep_pins(t(1_000_000)), 0);
-    store
-        .apply(manual_ruled(1, 60, 30))
-        .expect("a first generation");
-    for key in 2..=1_001 {
-        sessions.pin(key, WorkerId(1), t(10), Some(store.micros(t(70))));
-    }
-    // One key its rule keeps with no TTL.
-    sessions.pin(1_002, WorkerId(1), t(10), None);
-    assert_eq!(sessions.len(), 1_002);
-    // The first pass: the pin that ends at second 60 is past it at 61.
-    assert_eq!(store.sweep_pins(t(61)), 1);
-    // A tick inside the interval walks nothing, though a thousand pins
-    // ended.
-    assert_eq!(store.sweep_pins(t(80)), 0);
-    assert_eq!(sessions.len(), 1_001);
-    // The next pass due: the thousand pins that ended at second 70 leave
-    // together, and the pin with no end stays.
-    assert_eq!(store.sweep_pins(t(91)), 1_000);
-    assert_eq!(sessions.len(), 1);
-    // A later generation whose one rule keeps its keys for ever sweeps
-    // nothing of its own: the earlier interval stands, and a pin an
-    // earlier rule ended still leaves.
-    store
-        .apply(manual_ruled(2, u32::MAX, u32::MAX))
-        .expect("a later generation");
-    sessions.pin(1, WorkerId(1), t(100), Some(store.micros(t(110))));
-    assert_eq!(store.sweep_pins(t(121)), 1);
-    assert_eq!(sessions.len(), 1);
+/// Pins `key` to `worker` in the session table of `store`'s standing
+/// engine, as a keyed dispatch does.
+fn pinned(store: &MemoryStore, key: u64, worker: WorkerId) {
+    let world = store.snapshot();
+    let table = world.spec().engine().sessions();
+    table.dispatched(Session::from_raw(key), SessionVerdict::Pinned, worker);
 }
 
-/// The pins outlive generations, and the interval read at a tick is the
-/// standing generation's: an apply that shortens the sweep waits out no
-/// earlier interval, however long the one the last pass ran under.
-#[test]
-fn a_shorter_sweep_applied_waits_out_no_earlier_interval() {
-    let store = MemoryStore::new();
-    let now = Instant::now();
-    let t = |seconds: u64| now + Duration::from_secs(seconds);
-    let sessions: &dyn SessionsStore = &store;
-    store
-        .apply(manual_ruled(1, 7_200, 3_600))
-        .expect("a first generation");
-    sessions.pin(1, WorkerId(1), now, Some(store.micros(t(60))));
-    // The first pass runs at once and finds no pin past its end.
-    assert_eq!(store.sweep_pins(t(1)), 0);
-    // A generation that sweeps every thirty seconds: its pass is due
-    // thirty seconds after the last one, not an hour after it.
-    store
-        .apply(manual_ruled(2, 60, 30))
-        .expect("a later generation");
-    assert_eq!(store.sweep_pins(t(30)), 0, "inside the standing interval");
-    assert_eq!(store.sweep_pins(t(61)), 1);
-    assert!(sessions.is_empty());
+/// The worker `key`'s first pin names in that table.
+fn pin_of(store: &MemoryStore, key: u64) -> Option<WorkerId> {
+    let world = store.snapshot();
+    let table = world.spec().engine().sessions();
+    table.pins(Session::from_raw(key)).map(|pins| pins[0])
 }
 
-/// A generation that sweeps, replaced before the sweep ticked once: its
-/// interval was learned at its apply, so the pins it ended still leave
-/// under a generation that sweeps nothing.
-#[test]
-fn a_generation_replaced_before_any_pass_still_leaves_its_interval() {
-    let store = MemoryStore::new();
-    let now = Instant::now();
-    let t = |seconds: u64| now + Duration::from_secs(seconds);
-    let sessions: &dyn SessionsStore = &store;
-    store
-        .apply(manual_ruled(1, 60, 30))
-        .expect("a first generation");
-    sessions.pin(1, WorkerId(1), now, Some(store.micros(t(60))));
-    store
-        .apply(manual_ruled(2, u32::MAX, u32::MAX))
-        .expect("a later generation");
-    assert_eq!(store.sweep_pins(t(61)), 1);
-    assert!(sessions.is_empty());
+/// How many keys that table holds.
+fn pins_held(store: &MemoryStore) -> usize {
+    store.snapshot().spec().engine().sessions().len()
 }
 
-/// Two standing rules, one that keeps its keys for ever and one that ends
-/// them: the sweep runs at the interval of the rule that sweeps, each pin
-/// leaves at its own end, and a pin with none stays.
-#[test]
-fn a_pin_past_its_own_end_leaves_where_another_rule_keeps_its_keys_for_ever() {
-    use crate::document::spec::{AppliedSpec, PolicySpec};
-
-    let store = MemoryStore::new();
-    let now = Instant::now();
-    let t = |seconds: u64| now + Duration::from_secs(seconds);
-    let sessions: &dyn SessionsStore = &store;
-    let mut document = PolicySpec::preset("manual").expect("a preset of this build");
-    let mut for_ever = document.bindings[0].clone();
-    for_ever.matcher.model = "kept-for-ever".into();
-    let rule = for_ever.sessions.as_mut().expect("the preset's rule");
-    (rule.ttl_s, rule.sweep_s) = (u32::MAX, u32::MAX);
-    let rule = document.bindings[0].sessions.as_mut();
-    let rule = rule.expect("the preset's rule");
-    (rule.ttl_s, rule.sweep_s) = (60, 30);
-    document.bindings.insert(0, for_ever);
-    let spec = AppliedSpec::validate(&document).expect("the document validates");
-    store.apply(spec).expect("a first generation");
-    sessions.pin(1, WorkerId(1), now, Some(store.micros(t(60))));
-    sessions.pin(2, WorkerId(1), now, None);
-    assert_eq!(store.sweep_pins(t(61)), 1);
-    assert_eq!(sessions.lookup(1), None);
-    assert!(sessions.lookup(2).is_some());
-}
-
-/// A removed worker's pins of record stand through its absence, and the
+/// A removed worker's session pins stand through its absence, and the
 /// worker it was takes them back where its key is registered again, under
 /// the id the registration makes. A new life of the same worker in place
 /// keeps its own. Another worker under the key takes none.
 #[test]
-fn a_key_registered_again_as_the_worker_it_was_takes_its_pins_of_record() {
+fn a_key_registered_again_as_the_worker_it_was_takes_its_pins() {
     let store = MemoryStore::new();
     let (a, b) = (
         ready(&store, "http://a:8000"),
         ready(&store, "http://b:8000"),
     );
-    let sessions: &dyn SessionsStore = &store;
-    let now = Instant::now();
-    sessions.pin(11, a, now, None);
-    sessions.pin(12, b, now, None);
-    sessions.pin(13, a, now, None);
-    let of = |key: u64| sessions.lookup(key).map(|pin| pin.worker);
+    pinned(&store, 11, a);
+    pinned(&store, 12, b);
+    pinned(&store, 13, a);
+    let of = |key: u64| pin_of(&store, key);
     let revision = WorkersStore::get(&store, a).expect("the row").revision;
     store.remove(a, revision).expect("removed");
     // The removal drops none: the key may be registered again.
@@ -1699,28 +1614,26 @@ fn a_key_registered_again_as_the_worker_it_was_takes_its_pins_of_record() {
         ..facts("http://a:8000", 3)
     });
     assert_eq!((of(11), of(13)), (None, None));
-    assert_eq!(sessions.len(), 1);
+    assert_eq!(pins_held(&store), 1);
     // A new life in another role, in place: another worker too.
     store.upsert(WorkerFacts {
         role: Role::Prefill,
         ..facts("http://b:8000", 3)
     });
-    assert!(sessions.is_empty(), "the old worker's pin");
+    assert_eq!(pins_held(&store), 0, "the old worker's pin");
 }
 
-/// Two registrations of one key rename its pins of record in their order.
+/// Two registrations of one key rename its session pins in their order.
 /// The second lands where the first has let the workers lock go, and the
 /// pin names the last life: in place, and for a key that left.
 #[test]
-fn registrations_of_one_key_rename_its_pins_of_record_in_their_order() {
+fn registrations_of_one_key_rename_its_pins_in_their_order() {
     use std::{cell::Cell, rc::Rc};
 
     use super::memory::seam;
 
     let store = Rc::new(MemoryStore::new());
-    let sessions: &dyn SessionsStore = &*store;
-    let of = |key: u64| sessions.lookup(key).map(|pin| pin.worker);
-    let now = Instant::now();
+    let of = |key: u64| pin_of(&store, key);
     // The third life of `key`, registered behind the next registration.
     let third_behind = |key: &'static str| {
         let third = Rc::new(Cell::new(None));
@@ -1730,14 +1643,14 @@ fn registrations_of_one_key_rename_its_pins_of_record_in_their_order() {
     };
     // In place: the key's second life is replaced by its third at once.
     let a = ready(&store, "http://a:8000");
-    sessions.pin(11, a, now, None);
+    pinned(&store, 11, a);
     let third = third_behind("http://a:8000");
     store.upsert(facts("http://a:8000", 2));
     assert!(third.get().is_some(), "the hook ran");
     assert_eq!(of(11), third.get());
     // A key that left: registered again, and that life replaced at once.
     let b = ready(&store, "http://b:8000");
-    sessions.pin(12, b, now, None);
+    pinned(&store, 12, b);
     let revision = WorkersStore::get(&*store, b).expect("the row").revision;
     store.remove(b, revision).expect("removed");
     let third = third_behind("http://b:8000");
@@ -1754,37 +1667,30 @@ fn a_key_registered_again_past_the_absences_time_takes_no_pin() {
     let ruled = manual_ruled(1, 1, 1);
     store.apply(ruled).expect("above the unbound start");
     let a = ready(&store, "http://a:8000");
-    let sessions: &dyn SessionsStore = &store;
-    sessions.pin(11, a, Instant::now(), None);
+    pinned(&store, 11, a);
     let revision = WorkersStore::get(&store, a).expect("the row").revision;
     store.remove(a, revision).expect("removed");
-    assert!(sessions.lookup(11).is_some(), "inside its time");
+    assert_eq!(pin_of(&store, 11), Some(a), "inside its time");
     std::thread::sleep(Duration::from_millis(1_100));
     store.upsert(facts("http://a:8000", 2));
-    assert_eq!(sessions.lookup(11), None);
+    assert_eq!(pin_of(&store, 11), None);
 }
 
 /// A key that stays away is forgotten at the store's tick, in the engine's
-/// table and of record: no membership write and no decision has to follow.
+/// table: no membership write and no decision has to follow.
 #[test]
 fn the_tick_ends_the_absence_of_a_key_that_stays_away() {
     let store = MemoryStore::new();
     let ruled = manual_ruled(1, 1, 1);
     store.apply(ruled).expect("above the unbound start");
     let a = ready(&store, "http://a:8000");
-    let sessions: &dyn SessionsStore = &store;
-    sessions.pin(11, a, Instant::now(), None);
-    let key = Session::from_raw(21);
-    let world = store.snapshot();
-    let table = world.spec().engine().sessions();
-    table.dispatched(key, SessionVerdict::Pinned, a);
+    pinned(&store, 21, a);
     let revision = WorkersStore::get(&store, a).expect("the row").revision;
     store.remove(a, revision).expect("removed");
-    store.sweep_pins(Instant::now());
-    assert!(sessions.lookup(11).is_some(), "inside its time");
-    assert_eq!(table.pins(key).map(|pins| pins[0]), Some(a));
-    store.sweep_pins(Instant::now() + Duration::from_millis(1_100));
-    assert_eq!((sessions.lookup(11), table.pins(key)), (None, None));
+    store.end_gone(Instant::now());
+    assert_eq!(pin_of(&store, 21), Some(a), "inside its time");
+    store.end_gone(Instant::now() + Duration::from_millis(1_100));
+    assert_eq!(pin_of(&store, 21), None);
 }
 
 /// `follower` takes `change`, a write `leader` just made, by the door a
@@ -1802,10 +1708,10 @@ fn followed(leader: &MemoryStore, follower: &MemoryStore, change: MembershipChan
 }
 
 /// A follower takes its leader's steps for a key's session pins, in its
-/// engine's table and of record. A followed removal drops none. The worker
-/// it was takes them back at its followed registration, under the id that
-/// registration made. A followed new life of the same worker keeps its
-/// own. Another worker under the key takes none.
+/// engine's table. A followed removal drops none. The worker it was takes
+/// them back at its followed registration, under the id that registration
+/// made. A followed new life of the same worker keeps its own. Another
+/// worker under the key takes none.
 #[test]
 fn a_followed_key_registered_again_as_the_worker_it_was_takes_its_pins() {
     let (leader, follower) = (MemoryStore::new(), MemoryStore::new());
@@ -1823,22 +1729,14 @@ fn a_followed_key_registered_again_as_the_worker_it_was_takes_its_pins() {
         join(facts("http://a:8000", 1)),
         join(facts("http://b:8000", 1)),
     );
-    let sessions: &dyn SessionsStore = &follower;
-    let now = Instant::now();
-    sessions.pin(11, a, now, None);
-    sessions.pin(12, b, now, None);
-    let of = |key: u64| sessions.lookup(key).map(|pin| pin.worker);
-    // The follower's engine holds a pin of its own.
-    let key = Session::from_raw(21);
-    let world = follower.snapshot();
-    let table = world.spec().engine().sessions();
-    table.dispatched(key, SessionVerdict::Pinned, a);
-    let held = || table.pins(key).map(|pins| pins[0]);
+    pinned(&follower, 11, a);
+    pinned(&follower, 12, b);
+    let of = |key: u64| pin_of(&follower, key);
     leave(a);
-    assert_eq!((of(11), held()), (Some(a), Some(a)), "none is dropped");
+    assert_eq!(of(11), Some(a), "none is dropped");
     let again = join(facts("http://a:8000", 2));
     assert_ne!(again, a);
-    assert_eq!((of(11), held()), (Some(again), Some(again)));
+    assert_eq!(of(11), Some(again));
     assert_eq!(of(12), Some(b));
     let life = join(facts("http://b:8000", 2));
     assert_ne!(life, b);
@@ -1849,14 +1747,14 @@ fn a_followed_key_registered_again_as_the_worker_it_was_takes_its_pins() {
         role: Role::Decode,
         ..facts("http://a:8000", 3)
     });
-    assert_eq!((of(11), held()), (None, None));
-    assert_eq!(sessions.len(), 1);
+    assert_eq!(of(11), None);
+    assert_eq!(pins_held(&follower), 1);
     // A new life in another role, in place: another worker too.
     join(WorkerFacts {
         role: Role::Prefill,
         ..facts("http://b:8000", 3)
     });
-    assert!(sessions.is_empty(), "the old worker's pin");
+    assert_eq!(pins_held(&follower), 0, "the old worker's pin");
 }
 
 /// A follower counts a key's absence by its own clock, from the removal
@@ -1873,21 +1771,20 @@ fn a_followed_key_registered_again_past_the_absences_time_takes_no_pin() {
             .apply(manual_ruled(1, 1, 1))
             .expect("above the unbound start");
         followed(&leader, follower, joined);
-        SessionsStore::pin(follower, 11, joined.id(), Instant::now(), None);
+        pinned(follower, 11, joined.id());
     }
     let removed = leader.remove(joined.id(), revision.revision);
     let removed = removed.expect("removed");
     for follower in &followers {
         followed(&leader, follower, removed);
-        let pin = SessionsStore::lookup(follower, 11);
-        assert!(pin.is_some(), "inside its time");
+        assert_eq!(pin_of(follower, 11), Some(joined.id()), "inside its time");
     }
     std::thread::sleep(Duration::from_millis(1_100));
     let again = leader.upsert(facts("http://a:8000", 2));
     followed(&leader, &followers[0], again);
-    assert!(followers[1].watch_from(leader.checkpoint(JournalKinds::Watched)));
+    assert!(followers[1].watch_from(leader.checkpoint()));
     for follower in &followers {
-        assert_eq!(SessionsStore::lookup(follower, 11), None);
+        assert_eq!(pin_of(follower, 11), None);
     }
 }
 
@@ -1898,18 +1795,17 @@ fn a_key_a_follower_saw_leave_takes_its_pins_at_the_followers_own_write() {
     let (leader, follower) = (MemoryStore::new(), MemoryStore::new());
     let joined = leader.upsert(facts("http://a:8000", 1));
     followed(&leader, &follower, joined);
-    let sessions: &dyn SessionsStore = &follower;
-    sessions.pin(11, joined.id(), Instant::now(), None);
+    pinned(&follower, 11, joined.id());
     let revision = WorkersStore::get(&leader, joined.id()).expect("the row");
     let removed = leader.remove(joined.id(), revision.revision);
     followed(&leader, &follower, removed.expect("removed"));
     let again = follower.upsert(facts("http://a:8000", 2)).id();
-    assert_eq!(sessions.lookup(11).map(|pin| pin.worker), Some(again));
+    assert_eq!(pin_of(&follower, 11), Some(again));
 }
 
 /// A snapshot's rows move a key's session pins as the writes it stands
-/// for would have, in the engine's table and of record, at a gateway's
-/// watch and at a standby's restore. A key the cut holds under a new id
+/// for would have, in the engine's table, at a gateway's watch and at a
+/// standby's restore. A key the cut holds under a new id
 /// takes its pins where it is the worker it was. Another worker's pins
 /// leave. A key the cut drops keeps its pins on file, and takes them at
 /// its followed registration.
@@ -1918,7 +1814,7 @@ fn a_snapshot_moves_the_pins_of_the_rows_it_drops() {
     for restore in [false, true] {
         let (leader, follower) = (MemoryStore::new(), MemoryStore::new());
         let lay = || {
-            let cut = leader.checkpoint(JournalKinds::All);
+            let cut = leader.checkpoint();
             if restore {
                 follower.restore_from(cut)
             } else {
@@ -1933,18 +1829,10 @@ fn a_snapshot_moves_the_pins_of_the_rows_it_drops() {
         ];
         let [a, b, c, d] = keys.map(|key| leader.upsert(facts(key, 1)).id());
         assert!(lay());
-        let sessions: &dyn SessionsStore = &follower;
-        let now = Instant::now();
         for (key, worker) in [(11, a), (12, b), (13, c), (14, d)] {
-            sessions.pin(key, worker, now, None);
+            pinned(&follower, key, worker);
         }
-        let of = |key: u64| sessions.lookup(key).map(|pin| pin.worker);
-        // The follower's engine holds a pin of its own.
-        let key = Session::from_raw(21);
-        let world = follower.snapshot();
-        let table = world.spec().engine().sessions();
-        table.dispatched(key, SessionVerdict::Pinned, a);
-        let held = || table.pins(key).map(|pins| pins[0]);
+        let of = |key: u64| pin_of(&follower, key);
         // The follower hears none of these writes.
         let leave = |id: WorkerId| {
             let revision = WorkersStore::get(&leader, id).expect("the row").revision;
@@ -1959,7 +1847,7 @@ fn a_snapshot_moves_the_pins_of_the_rows_it_drops() {
         });
         leave(c);
         assert!(lay());
-        assert_eq!((of(11), held()), (Some(again), Some(again)));
+        assert_eq!(of(11), Some(again));
         assert_eq!(of(12), None, "another worker under the key");
         assert_eq!((of(13), of(14)), (Some(c), Some(d)), "none is dropped");
         let back = leader.upsert(facts("http://c:8000", 2));
@@ -1979,20 +1867,18 @@ fn a_snapshot_returns_a_key_that_had_left_to_its_pins() {
         followed(&leader, &follower, change);
         change.id()
     });
-    let sessions: &dyn SessionsStore = &follower;
-    let now = Instant::now();
-    sessions.pin(11, a, now, None);
-    sessions.pin(12, b, now, None);
-    let of = |key: u64| sessions.lookup(key).map(|pin| pin.worker);
+    pinned(&follower, 11, a);
+    pinned(&follower, 12, b);
+    let of = |key: u64| pin_of(&follower, key);
     for id in [a, b] {
         let revision = WorkersStore::get(&leader, id).expect("the row").revision;
         let change = leader.remove(id, revision).expect("removed");
         followed(&leader, &follower, change);
     }
-    assert!(follower.watch_from(leader.checkpoint(JournalKinds::Watched)));
+    assert!(follower.watch_from(leader.checkpoint()));
     assert_eq!((of(11), of(12)), (Some(a), Some(b)), "both stay on file");
     let again = leader.upsert(facts("http://a:8000", 2)).id();
-    assert!(follower.watch_from(leader.checkpoint(JournalKinds::Watched)));
+    assert!(follower.watch_from(leader.checkpoint()));
     assert_eq!((of(11), of(12)), (Some(again), Some(b)));
     let back = leader.upsert(facts("http://b:8000", 2));
     followed(&leader, &follower, back);
@@ -2008,99 +1894,12 @@ fn a_snapshot_files_no_more_keys_than_the_list_holds() {
     let ids: Vec<WorkerId> = (0..GONE_KEYS + 2)
         .map(|at| leader.upsert(facts(&format!("http://w{at}:8000"), 1)).id())
         .collect();
-    assert!(follower.watch_from(leader.checkpoint(JournalKinds::Watched)));
-    let sessions: &dyn SessionsStore = &follower;
-    let now = Instant::now();
+    assert!(follower.watch_from(leader.checkpoint()));
     for (key, &id) in (1..).zip(&ids) {
-        sessions.pin(key, id, now, None);
+        pinned(&follower, key, id);
     }
-    assert!(follower.watch_from(MemoryStore::new().checkpoint(JournalKinds::Watched)));
-    assert_eq!(sessions.len(), GONE_KEYS);
-}
-
-/// The door of a writer that knows a key's rule by its lease alone: the
-/// worker and the last use move as at the plain door, and the end that
-/// stood stays where it is the later one. No end is later than any
-/// instant.
-#[test]
-fn a_pin_by_a_leases_own_rule_never_ends_earlier_than_the_pin_that_stood() {
-    let store = MemoryStore::new();
-    let sessions: &dyn SessionsStore = &store;
-    let now = Instant::now();
-    let later = now + Duration::from_secs(1);
-    let ends = |seconds: u64| Some(store.micros(now + Duration::from_secs(seconds)));
-    let pin = |worker, last_used, ends| {
-        Some(Pin {
-            worker: WorkerId(worker),
-            last_used,
-            ends,
-        })
-    };
-    sessions.pin_no_earlier(0, WorkerId(1), now, ends(5));
-    assert!(sessions.is_empty(), "the absent key is never pinned");
-    // No pin stood: the end is the writer's own.
-    sessions.pin_no_earlier(11, WorkerId(1), now, ends(5));
-    assert_eq!(sessions.lookup(11), pin(1, now, ends(5)));
-    // An earlier end leaves the later one, and the pin moves.
-    sessions.pin_no_earlier(11, WorkerId(2), later, ends(3));
-    assert_eq!(sessions.lookup(11), pin(2, later, ends(5)));
-    // A later end is taken.
-    sessions.pin_no_earlier(11, WorkerId(3), now, ends(7));
-    assert_eq!(sessions.lookup(11), pin(3, now, ends(7)));
-    // No end is the latest: it is taken, and then it stays.
-    sessions.pin_no_earlier(11, WorkerId(4), now, None);
-    assert_eq!(sessions.lookup(11), pin(4, now, None));
-    sessions.pin_no_earlier(11, WorkerId(5), now, ends(9));
-    assert_eq!(sessions.lookup(11), pin(5, now, None));
-    // The plain door moves a pin's end either way.
-    sessions.pin(11, WorkerId(6), now, ends(1));
-    assert_eq!(sessions.lookup(11), pin(6, now, ends(1)));
-}
-
-#[test]
-fn a_pin_is_written_at_the_commit_and_leaves_with_its_worker_or_at_its_end() {
-    let store = MemoryStore::new();
-    let sessions: &dyn SessionsStore = &store;
-    let now = Instant::now();
-    let ends = |seconds: u64| Some(store.micros(now + Duration::from_secs(seconds)));
-    sessions.pin(0, WorkerId(1), now, ends(1));
-    assert!(sessions.is_empty(), "the absent key is never pinned");
-    sessions.pin(11, WorkerId(1), now, ends(1));
-    sessions.pin(12, WorkerId(2), now + Duration::from_secs(5), ends(6));
-    sessions.pin(11, WorkerId(3), now + Duration::from_secs(1), ends(2));
-    assert_eq!(
-        sessions.lookup(11).map(|pin| pin.worker),
-        Some(WorkerId(3)),
-        "a re-pin moves"
-    );
-    sessions.merge(
-        12,
-        Pin {
-            worker: WorkerId(9),
-            last_used: now,
-            ends: None,
-        },
-    );
-    assert_eq!(
-        sessions.lookup(12).map(|pin| pin.worker),
-        Some(WorkerId(2)),
-        "a merge keeps the later use"
-    );
-    sessions.merge(
-        13,
-        Pin {
-            worker: WorkerId(9),
-            last_used: now,
-            ends: None,
-        },
-    );
-    assert_eq!(sessions.len(), 3);
-    assert_eq!(sessions.drop_workers(&[WorkerId(9)]), 1);
-    let two = store.micros(now + Duration::from_secs(2));
-    assert_eq!(sessions.expire(two), 1);
-    assert_eq!(sessions.lookup(11), None);
-    sessions.unpin(12);
-    assert!(sessions.is_empty());
+    assert!(follower.watch_from(MemoryStore::new().checkpoint()));
+    assert_eq!(pins_held(&follower), GONE_KEYS);
 }
 
 #[test]
@@ -2279,11 +2078,9 @@ fn a_chosen_decode_side_books_nothing_and_waits_under_no_deadline() {
     let leases: &dyn LeasesStore = &store;
     let (gateway, id, now) = (GatewayId(1), LeaseId(1), Instant::now());
     leases.set_term(1);
-    let (record, mut decode) = chosen_pair(1, p, &[d], now);
-    decode.session = Session::from_raw(41);
+    let (record, decode) = chosen_pair(1, p, &[d], now);
     issue_pair(leases, (record, decode)).expect("the key is free");
     assert_eq!(booked(&store, &[p, d]), [1, 0]);
-    assert!(carried(&store, decode.session).is_empty());
     assert!(decode.state.is_chosen());
     assert!(!decode.state.is_live());
     assert!(!decode.state.is_issued());
@@ -2306,7 +2103,6 @@ fn a_call_issues_the_chosen_side_afresh_and_books_it_once() {
     let (_, mut decode) = pair(0, p, &[d1, d0], now);
     decode.session = Session::from_raw(42);
     decode.tokens = 24;
-    decode.state = LeaseState::issued(Some(9_000_000));
     decode.target_index = 1;
 
     let id = LeaseId(1);
@@ -2326,9 +2122,7 @@ fn a_call_issues_the_chosen_side_afresh_and_books_it_once() {
     assert_eq!(filed.target_of(Side::Decode, 0), Some((d1, 0)));
     assert_eq!(filed.target_of(Side::Decode, 1), Some((d0, 0)));
     assert_eq!(booked(&store, &[p, d0, d1]), [1, 0, 1]);
-    assert_eq!(carried(&store, decode.session), [(d1, 1)]);
     assert!(leases.released(gateway, id, None, ReleaseReason::ClientGone));
-    assert!(carried(&store, decode.session).is_empty());
 
     // A lease of an older term in block one names the second file.
     let id = LeaseId(1 << 20 | 2);
@@ -2472,8 +2266,7 @@ fn a_dispatch_on_a_chosen_side_books_it_once_as_it_lands() {
         [(1, d1, 1, [1, 0, 1]), (u8::MAX, d0, 0, [1, 1, 0])]
     {
         let id = LeaseId(u64::from(index));
-        let (record, mut decode) = chosen_pair(id.0, p, &[d0, d1], now);
-        decode.session = Session::from_raw(41);
+        let (record, decode) = chosen_pair(id.0, p, &[d0, d1], now);
         issue_pair(leases, (record, decode)).expect("the key is free");
         assert!(leases.dispatched(gateway, id, on(Side::Prefill, 0), now));
         assert!(leases.expire(now + DISPATCH_TTL).is_empty());
@@ -2491,15 +2284,12 @@ fn a_dispatch_on_a_chosen_side_books_it_once_as_it_lands() {
             })
         );
         assert_eq!(booked(&store, &[p, d0, d1]), counts);
-        assert_eq!(carried(&store, decode.session), [(target, 1)]);
         assert_eq!(store.queued(), 0);
         assert!(leases.dispatched(gateway, id, on(Side::Decode, 0), now));
         assert_eq!(leases.sides(gateway, id), Some(filed));
         assert_eq!(booked(&store, &[p, d0, d1]), counts);
-        assert_eq!(carried(&store, decode.session), [(target, 1)]);
         assert!(leases.released(gateway, id, None, ReleaseReason::ClientGone));
         assert_eq!(booked(&store, &[p, d0, d1]), [0, 0, 0]);
-        assert!(carried(&store, decode.session).is_empty());
     }
 }
 
@@ -2625,6 +2415,7 @@ fn the_sweep_s_answer_tells_a_decode_side_that_completed_from_one_it_abandoned()
     );
 }
 
+#[cfg(feature = "controller")]
 #[test]
 fn a_pair_s_decode_side_is_told_issued_on_the_decode_worker() {
     let store = MemoryStore::new();
@@ -2915,36 +2706,24 @@ fn the_dispatch_deadline_ends_each_side_that_waits_and_a_dispatched_side_stands(
     assert_eq!(sides(&store, 3), Some((abandoned, at)));
 }
 
-/// A pair under a sessions rule with a TTL stands and ends as any pair:
-/// each side's issued state carries the TTL, and what tests a side that
-/// waits asks the state, not an equality with the bare one. No plan
-/// files such a pair today, as a sessions rule runs under the single
-/// plan alone: the records are filed by hand.
+/// A pair's sides are dispatched one by one. A decode side that waits
+/// behind its dispatched prefill ends at the dispatch deadline, at a later
+/// issue and at the store's own sweep, and the dispatched prefill stands.
 #[test]
-fn a_pair_issued_under_a_rule_with_a_ttl_stands_and_ends_as_any_pair() {
+fn the_dispatch_deadline_ends_a_decode_side_that_waits_behind_its_dispatched_prefill() {
     let store = MemoryStore::new();
     let (p, d) = (ready(&store, "http://p:1"), ready(&store, "http://d:1"));
     let leases: &dyn LeasesStore = &store;
     let (gateway, now) = (GatewayId(1), Instant::now());
     leases.set_term(1);
-    let under = LeaseState::issued(Some(60_000_000));
-    let keyed = |id: u64, at: Instant| {
-        let (mut record, side) = pair(id, p, &[d], at);
-        record.state = under;
-        let side = DecodeSide {
-            state: under,
-            ..side
-        };
-        (record, side)
-    };
     // The first pair's sides are dispatched one by one, the second's
     // prefill alone.
     for id in [1, 2] {
-        issue_pair(leases, keyed(id, now)).expect("the key is free");
+        issue_pair(leases, pair(id, p, &[d], now)).expect("the key is free");
     }
     let dispatched = LeaseState::Dispatched { at: now };
     assert!(leases.dispatched(gateway, LeaseId(1), on(Side::Prefill, 0), now));
-    assert_eq!(sides(&store, 1), Some((dispatched, under)));
+    assert_eq!(sides(&store, 1), Some((dispatched, LeaseState::ISSUED)));
     assert!(leases.dispatched(gateway, LeaseId(1), on(Side::Decode, 0), now));
     assert_eq!(sides(&store, 1), Some((dispatched, dispatched)));
     assert!(leases.dispatched(gateway, LeaseId(2), on(Side::Prefill, 0), now));
@@ -2960,7 +2739,7 @@ fn a_pair_issued_under_a_rule_with_a_ttl_stands_and_ends_as_any_pair() {
     assert_eq!(sides(&store, 2), Some((dispatched, abandoned)));
     // The store's own sweep returns the prefill as it stood and the
     // decode side as the sweep left it.
-    issue_pair(leases, keyed(3, later)).expect("the key is free");
+    issue_pair(leases, pair(3, p, &[d], later)).expect("the key is free");
     assert!(leases.dispatched(gateway, LeaseId(3), on(Side::Prefill, 0), later));
     let swept = leases.expire(later + Duration::from_secs(9));
     let at = LeaseState::Dispatched { at: later };
@@ -3148,46 +2927,52 @@ fn gateways_dropped_together_leave_whole_and_say_their_leases_in_the_order_asked
 /// No lease's counter: what an issue that ended nothing hands back.
 const NONE: [u64; 0] = [];
 
-/// Each member's requests in flight as a view of the cases' model reads
-/// them for `gateway`, in the view's order: by worker id.
-fn in_flight_for(store: &MemoryStore, gateway: GatewayId) -> Vec<(WorkerId, u32)> {
-    let ask = ViewQuery {
-        gateway,
-        now: Instant::now(),
-        pinned: None,
-        affinity: false,
-        signal_cells: false,
-    };
-    let mut out = ViewBuffers::default();
-    store.deciding(|world| {
-        if let Some(built) = world.build("m", Role::Single, &ask, &mut out) {
-            world.count_in_flight(&built, &ask, &mut out.candidates);
-        }
-    });
-    let rows = out.candidates.iter();
-    let written: Vec<(WorkerId, u32)> = rows.map(|row| (row.id, row.in_flight)).collect();
-    // The store's view reads the same counts: beside the rows it lends,
-    // each at its row's position, and in the rows it writes.
-    let mut viewed = ViewBuffers::default();
-    let read: Vec<(WorkerId, u32)> = store.deciding(|world| {
-        let view = world.view("m", Role::Single, &ask, false, &mut viewed);
-        view.map_or_else(Vec::new, |view| {
-            let rows = view.candidates.iter();
-            let lent = view.in_flight;
-            rows.map(|row| {
-                let own = row.in_flight;
-                (row.id, lent.map_or(own, |lent| lent.at(row.position)))
-            })
-            .collect()
-        })
-    });
-    assert_eq!(read, written, "the view's counts are the door's");
-    written
+/// One worker's requests in flight as its host counts them: a number the
+/// store steps ([`HostCount`]).
+struct Tally(Arc<AtomicU32>);
+
+impl HostCount for Tally {
+    fn booked(&self) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn freed(&self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
-/// [`in_flight_for`] the gateway the cases issue their leases to.
+/// The count a host keeps of the row `id` from here on: handed to the
+/// store, which steps it with each lease that books the row and each that
+/// books it no longer ([`WorkersStore::host_count`]). A count handed for a
+/// row takes a step for each lease that books the row by then. `None` for
+/// a row that left: the store takes no count for it.
+fn handed_count(store: &MemoryStore, id: WorkerId) -> Option<Arc<AtomicU32>> {
+    let count = Arc::new(AtomicU32::new(0));
+    let handed = store.host_count(id, Box::new(Tally(Arc::clone(&count))));
+    handed.then_some(count)
+}
+
+/// The count a host keeps of the row `id`, which stands in the store.
+fn standing(store: &MemoryStore, id: WorkerId) -> Arc<AtomicU32> {
+    handed_count(store, id).expect("the row stands in the store")
+}
+
+/// What the leases on file book on the row `id`, as a host that asks now
+/// counts it ([`handed_count`]).
+fn booked_on(store: &MemoryStore, id: WorkerId) -> Option<u32> {
+    Some(handed_count(store, id)?.load(Ordering::Relaxed))
+}
+
+/// Each member's requests in flight, by worker id: what the leases on
+/// file book on each row that serves the cases' model ([`booked_on`]).
 pub(super) fn in_flight(store: &MemoryStore) -> Vec<(WorkerId, u32)> {
-    in_flight_for(store, GatewayId(1))
+    let (_, mut rows) = store.all_rows();
+    rows.retain(|row| row.facts.models.iter().any(|model| model == "m"));
+    rows.sort_by_key(|row| row.id);
+    let counted = rows
+        .iter()
+        .filter_map(|row| Some((row.id, booked_on(store, row.id)?)));
+    counted.collect()
 }
 
 /// A pair's decode side on `target`: issued, with no alternate behind it.
@@ -3211,7 +2996,7 @@ pub(super) fn booking(gateway: GatewayId, id: u64, target: WorkerId, now: Instan
 }
 
 #[test]
-fn a_views_row_reads_the_leases_on_file_that_book_its_worker() {
+fn a_rows_count_reads_the_leases_on_file_that_book_its_worker() {
     let store = MemoryStore::new();
     let (a, b) = (ready(&store, "http://a:1"), ready(&store, "http://b:1"));
     let (first, second) = (a.min(b), a.max(b));
@@ -3282,7 +3067,7 @@ fn a_restore_empties_the_lease_file_and_a_hello_books_what_it_lists_once() {
     let theirs = (ready(&leader, "http://a:1"), ready(&leader, "http://b:1"));
     assert_eq!(theirs, (a, b));
     drop(told());
-    assert!(store.restore_from(leader.checkpoint(JournalKinds::All)));
+    assert!(store.restore_from(leader.checkpoint()));
     let leases: &dyn LeasesStore = &store;
     assert_eq!(leases.live(gateway), 0, "a lease stood behind the restore");
     assert!(leases.get(gateway, LeaseId(1)).is_none());
@@ -3301,7 +3086,7 @@ fn a_restore_empties_the_lease_file_and_a_hello_books_what_it_lists_once() {
     ended.sort_unstable();
     assert_eq!(ended, [1, 2, 3]);
     // The file is empty: a second restore tells no end.
-    assert!(store.restore_from(leader.checkpoint(JournalKinds::All)));
+    assert!(store.restore_from(leader.checkpoint()));
     assert!(told().is_empty(), "a lease was told twice");
     // The lead taken again: the gateway lists the two leases it still
     // holds, one a worker.
@@ -3339,7 +3124,7 @@ fn a_restore_tells_each_end_under_the_decider_whose_file_holds_its_lease() {
     // its cut on a thread that names none.
     let leader = MemoryStore::new();
     assert_eq!(ready(&leader, "http://a:1"), a);
-    assert!(store.restore_from(leader.checkpoint(JournalKinds::All)));
+    assert!(store.restore_from(leader.checkpoint()));
     let mut ended: Vec<(u64, Option<DecisionSlot>)> = told()
         .into_iter()
         .map(|(record, _)| record.lease.id.0)
@@ -3364,8 +3149,6 @@ fn a_watch_snapshot_keeps_a_members_local_tables() {
     leases.set_term(1);
     leases.issue(lease).expect("filed");
     let slot = store.snapshot().booked_of(id).expect("the member's slot");
-    let sessions: &dyn SessionsStore = &store;
-    sessions.pin(1, id, now, None);
     store.gateway_veto(gateway, id, Some(now + Duration::from_secs(60)));
     HealthSink::completed(&store, gateway, id, TransportClass::Ok, now);
     LoadSink::record(&store, id, 0, row(0), now, LoadSource::Stream);
@@ -3376,13 +3159,12 @@ fn a_watch_snapshot_keeps_a_members_local_tables() {
     );
     store.probed(id, 2, 0, 0);
 
-    let mut cut = store.checkpoint(JournalKinds::All);
+    let mut cut = store.checkpoint();
     cut.epoch += 1;
     cut.at.term = 7;
     cut.rows[0].admitted_at += Duration::from_secs(1);
     cut.rows[0].revision += 1;
     cut.rows[0].facts.priority = 8;
-    cut.loads[0].2.row.running = 9;
     let mut expected = cut.rows[0].clone();
     expected.admitted_at = WorkersStore::get(&store, id).expect("the row").admitted_at;
     let revision = expected.revision;
@@ -3393,32 +3175,8 @@ fn a_watch_snapshot_keeps_a_members_local_tables() {
     assert_eq!(leases.term(), 1);
     assert_eq!(store.snapshot().booked_of(id), Some(slot));
     assert_eq!(in_flight(&store), [(id, 1)]);
-    assert_eq!(
-        sessions.lookup(1),
-        Some(Pin {
-            worker: id,
-            last_used: now,
-            ends: None
-        })
-    );
     assert!(store.vetoed(gateway, id, now));
     assert!(store.completed_ok_since(gateway, id, now));
-    let ask = ViewQuery {
-        gateway,
-        now,
-        pinned: None,
-        affinity: false,
-        signal_cells: false,
-    };
-    let mut out = ViewBuffers::default();
-    store
-        .build_view("m", Role::Single, &ask, &mut out)
-        .expect("the pool");
-    let health = out.candidates[0].health;
-    assert!(
-        health.stalled && health.breaker_open,
-        "the decision reads the veto"
-    );
     assert_eq!(LoadSink::load(&store, id, 0), Some(local_load));
     assert_eq!(store.kv().held_blocks("m"), 1);
     assert_eq!(WorkersStore::get(&store, id), Some(expected));
@@ -3431,25 +3189,8 @@ fn a_watch_snapshot_keeps_a_members_local_tables() {
     );
 }
 
-/// The count in a one-member world held across a snapshot. Its slot still
-/// reads the live count after the worker leaves the current world.
-fn held_count(world: &StoreSnapshot, gateway: GatewayId, now: Instant) -> u32 {
-    let ask = ViewQuery {
-        gateway,
-        now,
-        pinned: None,
-        affinity: false,
-        signal_cells: false,
-    };
-    let mut out = ViewBuffers::default();
-    let view = world
-        .view("m", Role::Single, &ask, false, &mut out)
-        .expect("the old pool");
-    view.in_flight.expect("the old slot is lent").at(0)
-}
-
 #[test]
-fn a_watch_snapshot_evicts_a_leavers_tables_and_its_lease_ends_on_its_own_count() {
+fn a_watch_snapshot_evicts_a_leavers_tables_and_its_lease_moves_no_other_count() {
     let store = MemoryStore::new();
     let left = publisher(&store, "http://a:1", 0);
     store.publish_now();
@@ -3462,7 +3203,6 @@ fn a_watch_snapshot_evicts_a_leavers_tables_and_its_lease_ends_on_its_own_count(
     leases.issue(lease).expect("filed");
     store.gateway_veto(gateway, left, Some(now + Duration::from_secs(60)));
     HealthSink::completed(&store, gateway, left, TransportClass::Ok, now);
-    SessionsStore::pin(&store, 1, left, now, None);
     LoadSink::record(&store, left, 0, row(0), now, LoadSource::Stream);
     assert_eq!(
         store.admit(left, 0, batch(1), &one_block(1)),
@@ -3472,9 +3212,8 @@ fn a_watch_snapshot_evicts_a_leavers_tables_and_its_lease_ends_on_its_own_count(
     let source = MemoryStore::new();
     let joined = ready(&source, "http://b:1");
     LoadSink::record(&source, joined, 0, row(0), now, LoadSource::Stream);
-    assert!(store.watch_from(source.checkpoint(JournalKinds::All)));
+    assert!(store.watch_from(source.checkpoint()));
     assert_eq!(leases.get(gateway, lease.lease.id), Some(lease));
-    assert_eq!(held_count(&before, gateway, now), 1);
     assert_ne!(store.snapshot().booked_of(joined), Some(slot));
     assert_eq!(in_flight(&store), [(joined, 0)]);
     assert!(WorkersStore::by_key(&store, "http://a:1").is_none());
@@ -3486,12 +3225,7 @@ fn a_watch_snapshot_evicts_a_leavers_tables_and_its_lease_ends_on_its_own_count(
         "the cut's load is ignored"
     );
     assert_eq!(store.kv().held_blocks("m"), 0);
-    assert_eq!(
-        SessionsStore::lookup(&store, 1).map(|pin| pin.worker),
-        Some(left)
-    );
     assert!(leases.released(gateway, lease.lease.id, None, ReleaseReason::ClientGone));
-    assert_eq!(held_count(&before, gateway, now), 0);
     assert_eq!(in_flight(&store), [(joined, 0)]);
     LoadSink::record(&store, joined, 0, row(0), now, LoadSource::Stream);
     assert!(LoadSink::load(&store, joined, 0).is_some());
@@ -3502,7 +3236,6 @@ fn a_watch_snapshot_gives_a_new_incarnation_its_own_count() {
     let store = MemoryStore::new();
     let key = "http://a:1";
     let old = ready(&store, key);
-    let before = store.snapshot();
     let (gateway, now) = (GatewayId(1), Instant::now());
     let lease = booking(gateway, 1, old, now);
     let leases: &dyn LeasesStore = &store;
@@ -3512,13 +3245,11 @@ fn a_watch_snapshot_gives_a_new_incarnation_its_own_count() {
     let source = MemoryStore::new();
     assert_eq!(ready(&source, key), old);
     let new = source.upsert(facts(key, 2)).id();
-    assert!(store.watch_from(source.checkpoint(JournalKinds::Watched)));
+    assert!(store.watch_from(source.checkpoint()));
     assert_eq!(store.by_key(key).map(|row| row.id), Some(new));
     assert!(WorkersStore::get(&store, old).is_none());
     assert_eq!(in_flight(&store), [(new, 0)]);
-    assert_eq!(held_count(&before, gateway, now), 1);
     assert!(leases.released(gateway, lease.lease.id, None, ReleaseReason::ClientGone));
-    assert_eq!(held_count(&before, gateway, now), 0);
     assert_eq!(in_flight(&store), [(new, 0)]);
 }
 
@@ -3578,7 +3309,7 @@ fn a_watch_snapshot_publishes_the_cut_at_once_and_tells_the_members_once() {
         AppliedSpec::validate_digested(&document, digest, &catalog, &[]).expect("a generation");
     store.apply(spec).expect("the generation is applied");
 
-    let mut cut = store.checkpoint(JournalKinds::Watched);
+    let mut cut = store.checkpoint();
     let earlier = cut.epoch;
     // The same revision can name other facts in another history.
     cut.rows[0]
@@ -3601,21 +3332,12 @@ fn a_watch_snapshot_publishes_the_cut_at_once_and_tells_the_members_once() {
     );
     assert_eq!(store.publish_due(), None);
     assert_eq!(store.filed_members(), 0);
-    let ask = ViewQuery {
-        gateway: GatewayId(1),
-        now: Instant::now(),
-        pinned: None,
-        affinity: false,
-        signal_cells: false,
-    };
-    let mut out = ViewBuffers::default();
-    store
-        .build_view("m", Role::Single, &ask, &mut out)
-        .expect("the pool");
-    assert_eq!(out.candidates.len(), 1);
-    assert_eq!(out.candidates[0].id, id);
-    assert_eq!(out.candidates[0].labels, 1, "the cut's labels");
-    assert!(out.candidates[0].health.draining, "the cut's status");
+    let (_, rows) = store.all_rows();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, id);
+    let zone = rows[0].facts.labels.get("zone").map(String::as_str);
+    assert_eq!(zone, Some("b"), "the cut's labels");
+    assert_eq!(rows[0].status, WorkerStatus::Draining, "the cut's status");
     let snapshot = Membership::Snapshot(&[id]);
     assert_eq!(
         *heard.lock().expect("the stage heard"),
@@ -3625,17 +3347,17 @@ fn a_watch_snapshot_publishes_the_cut_at_once_and_tells_the_members_once() {
 
 #[test]
 fn a_watch_snapshot_the_journal_refuses_changes_nothing() {
-    let store = MemoryStore::journaled(Arc::new(Log::new(8, 8)));
+    let store = MemoryStore::journaled(Arc::new(Log::new(8)));
     let id = ready(&store, "http://a:1");
     store.set_term(3);
-    let before = store.checkpoint(JournalKinds::Watched);
+    let before = store.checkpoint();
     let world = store.snapshot();
     let source = MemoryStore::new();
     ready(&source, "http://b:1");
-    let mut cut = source.checkpoint(JournalKinds::Watched);
+    let mut cut = source.checkpoint();
     cut.at = Position { seq: 1, term: 2 };
     assert!(!store.watch_from(cut));
-    let after = store.checkpoint(JournalKinds::Watched);
+    let after = store.checkpoint();
     assert_eq!(
         (after.at, after.epoch, after.rows),
         (before.at, before.epoch, before.rows)
@@ -3664,19 +3386,13 @@ impl Journal for WaitsAtRestart {
     ) {
     }
 
-    fn load(&self, _: Option<Position>, _: WorkerId, _: u16, _: &LoadSample) {}
-
     fn term_rose(&self, _: u64) {}
 
     fn generation(&self, _: Option<Position>, _: u64) {}
 
     fn term_followed(&self, _: Position) {}
 
-    fn carries_loads(&self) -> bool {
-        false
-    }
-
-    fn head(&self, _: JournalKinds) -> Position {
+    fn head(&self) -> Position {
         Position::default()
     }
 
@@ -3716,7 +3432,7 @@ fn a_take_beside_a_restore_files_its_first_lease_behind_it() {
     // its cut.
     let leader = MemoryStore::new();
     assert_eq!(ready(&leader, "http://a:1"), a);
-    let cut = leader.checkpoint(JournalKinds::All);
+    let cut = leader.checkpoint();
     let store = &store;
     let (inside, restored, filed) = std::thread::scope(move |scope| {
         let restore = scope.spawn(move || store.restore_from(cut));
@@ -3758,60 +3474,6 @@ fn a_take_beside_a_restore_files_its_first_lease_behind_it() {
     assert_eq!(in_flight(store), [(a, 1)]);
 }
 
-/// A pool that holds another gateway's host-local row is walked as its
-/// build walks it: each row the asking gateway reaches reads its own
-/// worker's count, and a build alone writes none.
-#[test]
-fn a_count_is_written_on_its_own_workers_row_past_another_gateways_local_row() {
-    let store = MemoryStore::new();
-    let (gateway, now) = (GatewayId(1), Instant::now());
-    store.set_term(1);
-    let member = |key: &str, reachable_from| {
-        let id = store
-            .upsert(WorkerFacts {
-                reachable_from,
-                ..facts(key, 1)
-            })
-            .id();
-        store.publish_now();
-        let revision = WorkersStore::get(&store, id).expect("the row").revision;
-        store
-            .set_status(id, WorkerStatus::Ready, revision)
-            .expect("ready");
-        id
-    };
-    let open = member("http://a:1", Reachability::Any);
-    let theirs = member("unix:///b", Reachability::Gateway(GatewayId(2)));
-    let ours = member("unix:///c", Reachability::Gateway(gateway));
-    let last = member("http://d:1", Reachability::Any);
-    // No two workers hold the same count.
-    let mut id = 0;
-    for (count, target) in [(1, open), (2, theirs), (3, ours), (4, last)] {
-        for _ in 0..count {
-            id += 1;
-            LeasesStore::issue(&store, booking(gateway, id, target, now)).expect("filed");
-        }
-    }
-    let by_id = |mut rows: Vec<(WorkerId, u32)>| {
-        rows.sort_unstable();
-        rows
-    };
-    let seen = |asker: u64| in_flight_for(&store, GatewayId(asker));
-    assert_eq!(seen(1), by_id(vec![(open, 1), (ours, 3), (last, 4)]));
-    assert_eq!(seen(2), by_id(vec![(open, 1), (theirs, 2), (last, 4)]));
-    assert_eq!(seen(3), by_id(vec![(open, 1), (last, 4)]));
-    let mut built = ViewBuffers::default();
-    let ask = ViewQuery {
-        gateway,
-        now,
-        pinned: None,
-        affinity: false,
-        signal_cells: false,
-    };
-    store.build_view("m", Role::Single, &ask, &mut built);
-    assert!(built.candidates.iter().all(|row| row.in_flight == 0));
-}
-
 /// The counts are one table in pieces that never move: every slot names a
 /// cell of its own in whichever piece holds it, a run of slots is read in
 /// its order across the pieces, and the slot that names no cell reads zero
@@ -3823,20 +3485,20 @@ fn a_count_is_found_by_its_slot_in_whichever_piece_holds_it() {
     // more stands in the third.
     let slots: Vec<WorkerSlot> = (0..3_073).map(|_| counts.claim()).collect();
     for &slot in &slots {
-        counts.book(slot);
+        counts.book(slot, Session::NONE);
     }
     assert!(counts.of(&slots).all(|count| count == 1), "a cell a slot");
     for &slot in &slots {
-        counts.free(slot);
+        counts.free(slot, Session::NONE);
     }
     // Both ends of each piece, a count of its own on each.
     let marked = [0, 1, 1_023, 1_024, 3_071, 3_072];
     for (times, &at) in (1..).zip(&marked) {
         for _ in 0..times {
-            counts.book(slots[at]);
+            counts.book(slots[at], Session::NONE);
         }
     }
-    counts.book(WorkerSlot::NONE);
+    counts.book(WorkerSlot::NONE, Session::NONE);
     let ends = marked.iter().rev().map(|&at| slots[at]);
     let run: Vec<WorkerSlot> = ends.chain([WorkerSlot::NONE, slots[2]]).collect();
     assert_eq!(
@@ -3845,7 +3507,7 @@ fn a_count_is_found_by_its_slot_in_whichever_piece_holds_it() {
     );
     // A lease that leaves gives one back, and a count at zero stays there.
     for slot in [slots[1_024], slots[2], WorkerSlot::NONE] {
-        counts.free(slot);
+        counts.free(slot, Session::NONE);
     }
     let read: Vec<u32> = counts.of(&[slots[1_024], slots[2]]).collect();
     assert_eq!(read, [3, 0]);
@@ -3894,8 +3556,9 @@ fn a_member_keeps_its_slot_and_a_leavers_slot_is_given_to_no_one() {
 
 /// Two leases filed through `file`, one on a member that is built and one
 /// on a member whose first build is owed to the window. Each books its
-/// worker's count and asks for no build: the row the window's build lists
-/// reads its lease, and each lease ends on the count it booked.
+/// worker's count and asks for no build: its host's count reads the lease
+/// inside the window and behind the window's build, and each lease ends
+/// on the count it booked.
 fn filed_ahead_of_a_first_build(file: fn(&dyn LeasesStore, GatewayId, &[LeaseRecord; 2])) {
     let store = MemoryStore::new();
     let built = ready(&store, "http://a:1");
@@ -3921,12 +3584,13 @@ fn filed_ahead_of_a_first_build(file: fn(&dyn LeasesStore, GatewayId, &[LeaseRec
         (builds, true),
         "a lease asked for the build"
     );
-    store.publish_now();
     let of = |count| {
         let mut rows = [(built, count), (owed, count)];
         rows.sort_unstable();
         rows
     };
+    assert_eq!(in_flight(&store), of(1), "inside the window");
+    store.publish_now();
     assert_eq!(in_flight(&store), of(1));
     for id in [1, 2] {
         assert!(leases.released(gateway, LeaseId(id), None, ReleaseReason::ClientGone));
@@ -3986,8 +3650,8 @@ fn a_lease_issued_leaves_an_owed_build_to_its_window() {
 
 /// A first dispatch that moves a lease onto a worker inside its
 /// registration window books that worker's count and asks for no build:
-/// the row the window's build lists reads the lease, and the lease ends on
-/// the count it booked.
+/// its host's count reads the lease inside the window and behind the
+/// window's build, and the lease ends on the count it booked.
 #[test]
 fn a_lease_dispatched_onto_a_worker_inside_its_window_books_its_count() {
     let store = MemoryStore::new();
@@ -4023,12 +3687,13 @@ fn a_lease_dispatched_onto_a_worker_inside_its_window_books_its_count() {
         (builds, true),
         "the dispatch asked for the build"
     );
-    store.publish_now();
     let of = |count| {
         let mut rows = [(built, 0), (owed, count)];
         rows.sort_unstable();
         rows
     };
+    assert_eq!(in_flight(&store), of(1), "inside the window");
+    store.publish_now();
     assert_eq!(in_flight(&store), of(1));
     assert!(leases.released(gateway, LeaseId(1), None, ReleaseReason::ClientGone));
     assert_eq!(in_flight(&store), of(0));
@@ -4135,10 +3800,10 @@ fn a_member_given_its_first_model_books_a_lease_inside_that_window() {
 }
 
 /// A lease on a member that offers no model books its count all the same:
-/// the world behind the member's first build names its slot, and the row
-/// reads the count at the build that first lists the member in a pool.
+/// its host's count reads the lease while the member stands in no pool,
+/// and through the write that gives it its first model.
 #[test]
-fn a_lease_on_a_member_in_no_pool_is_counted_once_a_build_lists_it() {
+fn a_lease_on_a_member_in_no_pool_books_its_count() {
     let store = MemoryStore::new();
     let built = ready(&store, "http://a:1");
     let bare = WorkerFacts {
@@ -4152,7 +3817,8 @@ fn a_lease_on_a_member_in_no_pool_is_counted_once_a_build_lists_it() {
     let (gateway, now) = (GatewayId(1), Instant::now());
     leases.set_term(1);
     assert_eq!(leases.issue(booking(gateway, 1, owed, now)), Ok(()));
-    assert_eq!(in_flight(&store), [(built, 0)], "it stands in no pool");
+    assert_eq!(in_flight(&store), [(built, 0)], "it serves no model");
+    assert_eq!(booked_on(&store, owed), Some(1), "booked, in no pool");
     assert_eq!(store.upsert(facts("http://b:1", 1)).id(), owed);
     let revision = WorkersStore::get(&store, owed).expect("the row").revision;
     store
@@ -4240,7 +3906,7 @@ fn a_lease_books_on_a_standby_behind_a_followed_refresh() {
         .expect("ready");
     leader.publish_now();
     let standby = MemoryStore::new();
-    assert!(standby.restore_from(leader.checkpoint(JournalKinds::All)));
+    assert!(standby.restore_from(leader.checkpoint()));
     assert_eq!(standby.filed_members(), 0, "the restore built its world");
     // The leader gives the member its first model and the standby follows.
     let unjournaled = Position::default();
@@ -4529,19 +4195,16 @@ fn a_decode_side_is_on_file_for_each_record_that_carries_the_mark_and_for_no_oth
     assert!(leases.released(gateway, LeaseId(3), Some(Side::Prefill), gone));
     filed.remove(&3);
     read("the last side's release", &filed);
-    // A decision's issue, a pair's and a single's, under ids the store
-    // mints; a release of the pair whole.
-    let world = store.snapshot();
-    let slots = [world.booked_of(p), world.booked_of(d0)];
-    let (record, side) = pair(0, p, &[d0], now);
-    let decided = store.issue_decided_pair(record, side, slots, |_| ());
-    let decided = decided.expect("minted under the store's term").id;
-    let single = store.issue_decided(booking(gateway, 0, p, now), slots[0], |_| ());
+    // A decision's issue of a single, under an id the store mints, beside
+    // a pair; a release of the pair whole.
+    let slot = store.snapshot().booked_of(p);
+    let single = store.issue_decided(booking(gateway, 0, p, now), slot, |_| ());
     let single = single.expect("minted under the store's term").id;
-    filed.extend([(decided.0, true), (single.0, false)]);
+    issue_pair(leases, pair(10, p, &[d0], now)).expect("free");
+    filed.extend([(single.0, false), (10, true)]);
     read("a decision's issue", &filed);
-    assert!(leases.released(gateway, decided, None, gone));
-    filed.remove(&decided.0);
+    assert!(leases.released(gateway, LeaseId(10), None, gone));
+    filed.remove(&10);
     read("a pair's release whole", &filed);
     // The dispatch deadline: a pair that waits whole leaves, and one with
     // a dispatched side stands with its decode side ended.
@@ -4629,240 +4292,6 @@ fn every_door_that_takes_a_lease_off_the_file_gives_its_count_back() {
     assert_eq!(in_flight(&store), [(a, 2)]);
     assert_eq!(leases.restore(gateway, &pages[..1]), 1);
     assert_eq!(in_flight(&store), [(a, 1)]);
-}
-
-/// The workers that carry requests of `session` in flight, each with its
-/// count, as a keyed decision reads them, here in the order of their ids.
-fn carried(store: &MemoryStore, session: Session) -> Vec<(WorkerId, u32)> {
-    let mut carried = Vec::new();
-    store.keyed(session, &mut carried);
-    carried.sort_unstable();
-    carried
-}
-
-/// A lease of the cases' gateway on `target` for a request of `session`,
-/// which a sessions rule governed.
-fn keyed(id: u64, target: WorkerId, session: Session, now: Instant) -> LeaseRecord {
-    let mut record = booking(GatewayId(1), id, target, now);
-    record.lease.session = session;
-    record.lease.session_verdict = SessionVerdict::Pinned;
-    record
-}
-
-/// A lease a sessions rule governed counts one request of its key on its
-/// worker from its issue to its end, by whichever door takes it off the
-/// file, and the key leaves the table with its last request.
-#[test]
-fn a_keyed_lease_counts_for_its_key_until_a_door_takes_it_off_the_file() {
-    let store = MemoryStore::new();
-    let a = ready(&store, "http://a:1");
-    let leases: &dyn LeasesStore = &store;
-    let (gateway, id, now) = (GatewayId(1), LeaseId(1), Instant::now());
-    leases.set_term(1);
-    let key = Session::from_raw(41);
-    let doors: [(&str, &dyn Fn()); 5] = [
-        ("a completion", &|| {
-            assert!(leases.completed(gateway, id, &done(Side::Single)));
-        }),
-        ("a release", &|| {
-            assert!(leases.released(gateway, id, None, ReleaseReason::ClientGone));
-        }),
-        ("the dispatch deadline", &|| {
-            assert_eq!(leases.expire(now + Duration::from_secs(2)).len(), 1);
-        }),
-        ("a restore that omits it", &|| {
-            assert_eq!(leases.restore(gateway, &[]), 0);
-        }),
-        ("its gateway's end", &|| {
-            assert_eq!(leases.drop_gateways(&[gateway]), [1]);
-        }),
-    ];
-    for (door, through) in doors {
-        leases.issue(keyed(1, a, key, now)).expect("the id is free");
-        assert_eq!(carried(&store, key), [(a, 1)], "{door}: the lease counts");
-        through();
-        assert_eq!(carried(&store, key), [], "{door}: the count is back");
-        assert_eq!(store.keys_in_flight(), 0, "{door}: the key left");
-    }
-    // A restore lays the pages' leases on file, each on its key's count,
-    // and a lease written again under its id counts once.
-    let pages = [keyed(1, a, key, now), keyed(2, a, key, now)];
-    assert_eq!(leases.restore(gateway, &pages), 2);
-    assert_eq!(carried(&store, key), [(a, 2)]);
-    assert_eq!(leases.restore(gateway, &pages[..1]), 1);
-    assert_eq!(carried(&store, key), [(a, 1)]);
-    assert_eq!(store.keys_in_flight(), 1);
-}
-
-/// A key counts each worker that carries a request of it, and each key
-/// counts alone. A worker leaves a key's count with its last request
-/// there, whichever worker the key's first request stood on.
-#[test]
-fn a_key_counts_each_worker_that_carries_its_requests() {
-    let store = MemoryStore::new();
-    let [a, b, c] = ["http://a:1", "http://b:1", "http://c:1"].map(|key| ready(&store, key));
-    let leases: &dyn LeasesStore = &store;
-    let (gateway, now) = (GatewayId(1), Instant::now());
-    leases.set_term(1);
-    let (key, other) = (Session::from_raw(41), Session::from_raw(42));
-    let mut filed = 0;
-    let mut issue = |target, session| {
-        filed += 1;
-        leases
-            .issue(keyed(filed, target, session, now))
-            .expect("filed");
-        LeaseId(filed)
-    };
-    let end = |id| assert!(leases.released(gateway, id, None, ReleaseReason::ClientGone));
-    let first = issue(a, key);
-    let second = issue(b, key);
-    let third = issue(a, key);
-    let fourth = issue(c, key);
-    let alone = issue(a, other);
-    assert_eq!(carried(&store, key), [(a, 2), (b, 1), (c, 1)]);
-    assert_eq!(carried(&store, other), [(a, 1)]);
-    assert_eq!(store.keys_in_flight(), 2);
-    // The worker the key's first request stood on leaves with its last.
-    end(first);
-    assert_eq!(carried(&store, key), [(a, 1), (b, 1), (c, 1)]);
-    end(third);
-    assert_eq!(carried(&store, key), [(b, 1), (c, 1)]);
-    end(second);
-    assert_eq!(carried(&store, key), [(c, 1)]);
-    assert_eq!(
-        carried(&store, other),
-        [(a, 1)],
-        "another key's count stands"
-    );
-    end(fourth);
-    end(alone);
-    assert_eq!(store.keys_in_flight(), 0);
-}
-
-/// A lease counts for its key by the word of the door that issued it, and
-/// by nothing its pick did with the key's pin. A decision that read no
-/// count files a lease that books no key, whatever key its request
-/// carried. A decision that read the count files one that books its key
-/// under any verdict: a request placed on a worker at its cap moves no
-/// pin and is one more of the key's requests there. A lease with no key
-/// counts nothing.
-#[test]
-fn a_lease_counts_for_its_key_by_its_issue_and_not_by_its_verdict() {
-    let store = MemoryStore::new();
-    let a = ready(&store, "http://a:1");
-    let leases: &dyn LeasesStore = &store;
-    let (gateway, now) = (GatewayId(1), Instant::now());
-    leases.set_term(1);
-    let key = Session::from_raw(41);
-    let world = store.snapshot();
-    let decided = |session, verdict| {
-        let mut record = keyed(0, a, session, now);
-        record.lease.session_verdict = verdict;
-        (record, world.booked_of(a))
-    };
-    let minted = "minted under the store's term";
-    // A decision that read no count: its lease books its worker alone.
-    let (record, slot) = decided(key, SessionVerdict::Pinned);
-    let unread = store.issue_decided(record, slot, |_| ()).expect(minted).id;
-    assert_eq!(in_flight(&store), [(a, 1)]);
-    assert_eq!(store.keys_in_flight(), 0);
-    // Decisions that read the count: one that kept the pin, and one placed
-    // on a worker at its cap, which carries no verdict.
-    let (record, slot) = decided(key, SessionVerdict::Pinned);
-    let kept = store.issue_keyed(record, slot, |_| ()).expect(minted).id;
-    let (record, slot) = decided(key, SessionVerdict::None);
-    store.issue_keyed(record, slot, |_| ()).expect(minted);
-    assert_eq!(carried(&store, key), [(a, 2)]);
-    // A request with no key counts nothing, read or not.
-    let (record, slot) = decided(Session::NONE, SessionVerdict::None);
-    store.issue_keyed(record, slot, |_| ()).expect(minted);
-    assert_eq!(carried(&store, key), [(a, 2)]);
-    assert_eq!(store.keys_in_flight(), 1);
-    // The end of the lease that books no key takes nothing off, and the
-    // end of the one that kept the pin leaves the request at the cap.
-    let gone = ReleaseReason::ClientGone;
-    assert!(leases.released(gateway, unread, None, gone));
-    assert_eq!(carried(&store, key), [(a, 2)]);
-    assert!(leases.released(gateway, kept, None, gone));
-    assert_eq!(carried(&store, key), [(a, 1)]);
-}
-
-/// A dispatch on another target of the pick moves the key's count with
-/// the lease's booking, and the lease ends on the count it moved to.
-#[test]
-fn a_dispatch_on_another_target_of_the_pick_moves_the_keys_count() {
-    let store = MemoryStore::new();
-    let (a, b) = (ready(&store, "http://a:1"), ready(&store, "http://b:1"));
-    let leases: &dyn LeasesStore = &store;
-    let (gateway, id, now) = (GatewayId(1), LeaseId(1), Instant::now());
-    leases.set_term(1);
-    let key = Session::from_raw(41);
-    let mut targets = Targets::new();
-    for id in [a, b] {
-        targets.push(Target {
-            id,
-            ..Target::default()
-        });
-    }
-    let picked = LeaseRecord {
-        picked: PickRecord::of(&targets),
-        ..keyed(1, a, key, now)
-    };
-    leases.issue(picked).expect("filed");
-    assert_eq!(carried(&store, key), [(a, 1)]);
-    assert!(leases.dispatched(gateway, id, on(Side::Single, 1), now));
-    assert_eq!(carried(&store, key), [(b, 1)]);
-    // A second dispatch of one lease, on the first target, moves nothing.
-    assert!(leases.dispatched(gateway, id, on(Side::Single, 0), now));
-    assert_eq!(carried(&store, key), [(b, 1)]);
-    assert!(leases.completed(gateway, id, &done(Side::Single)));
-    assert_eq!(store.keys_in_flight(), 0);
-}
-
-/// Each side of a pair's lease counts for its own session on its own
-/// worker, where a rule governed the pair: a side's end takes its count
-/// alone, and the decode's dispatch on an alternate moves the decode's.
-/// No plan files such a pair yet: a sessions rule runs under the single
-/// plan alone, and the file counts by the record whichever plan laid it.
-#[test]
-fn a_pairs_sides_count_each_for_its_own_key() {
-    let store = MemoryStore::new();
-    let [p, d0, d1] = ["http://p:1", "http://d0:1", "http://d1:1"].map(|key| ready(&store, key));
-    let leases: &dyn LeasesStore = &store;
-    let (gateway, id, now) = (GatewayId(1), LeaseId(1), Instant::now());
-    leases.set_term(1);
-    let (prefill, decode) = (Session::from_raw(41), Session::from_raw(42));
-    let under = |id| {
-        let (mut record, mut side) = pair(id, p, &[d0, d1], now);
-        record.lease.session = prefill;
-        record.lease.session_verdict = SessionVerdict::Pinned;
-        side.session = decode;
-        (record, side)
-    };
-    issue_pair(leases, under(1)).expect("filed");
-    assert_eq!(carried(&store, prefill), [(p, 1)]);
-    assert_eq!(carried(&store, decode), [(d0, 1)]);
-    assert!(leases.dispatched(gateway, id, on(Side::Decode, 1), now));
-    assert_eq!(carried(&store, decode), [(d1, 1)]);
-    assert_eq!(carried(&store, prefill), [(p, 1)]);
-    // The prefill's end takes its key's count, and the decode's stands.
-    assert!(leases.completed(gateway, id, &done(Side::Prefill)));
-    assert_eq!(carried(&store, prefill), []);
-    assert_eq!(carried(&store, decode), [(d1, 1)]);
-    assert!(leases.completed(gateway, id, &done(Side::Decode)));
-    assert_eq!(store.keys_in_flight(), 0);
-    // A release with no side ends both, and frees both keys' counts.
-    issue_pair(leases, under(2)).expect("filed");
-    assert_eq!(store.keys_in_flight(), 2);
-    let gone = ReleaseReason::ClientGone;
-    assert!(leases.released(gateway, LeaseId(2), None, gone));
-    assert_eq!(store.keys_in_flight(), 0);
-    // A pair filed with an ended side counts the side that lives.
-    let (mut half, side) = under(3);
-    half.state = LeaseState::Completed;
-    issue_pair(leases, (half, side)).expect("filed");
-    assert_eq!(carried(&store, prefill), []);
-    assert_eq!(carried(&store, decode), [(d0, 1)]);
 }
 
 #[test]
@@ -4961,7 +4390,7 @@ fn a_restore_that_raises_the_term_starts_the_blocks_under_it() {
     let (gateway, now) = (GatewayId(1), Instant::now());
     let held = standby.issue_decided(lease(gateway, 0, 3, now), None, |_| ());
     held.expect("minted under the term the standby stood at");
-    let mut cut = MemoryStore::new().checkpoint(JournalKinds::All);
+    let mut cut = MemoryStore::new().checkpoint();
     cut.at.term = 7;
     assert!(standby.restore_from(cut));
     assert_eq!(term.term(), 7);
@@ -5011,20 +4440,9 @@ fn told_sides() -> Vec<(Sides, Said)> {
 /// counter of its id, and the counters of the leases it ended, as the
 /// store told their end.
 fn issued_at(store: &MemoryStore, target: WorkerId, at: Instant) -> (u64, Vec<u64>) {
-    issued_in(store, target, at, LeaseState::ISSUED)
-}
-
-/// [`issued_at`] for a lease in `state`.
-fn issued_in(
-    store: &MemoryStore,
-    target: WorkerId,
-    at: Instant,
-    state: LeaseState,
-) -> (u64, Vec<u64>) {
     let counter = |id: LeaseId| id.0 & 0xffff_ffff;
     let record = LeaseRecord {
         dispatch_deadline: at + Duration::from_secs(5),
-        state,
         ..booking(GatewayId(1), 0, target, at)
     };
     let world = store.snapshot();
@@ -5080,34 +4498,6 @@ fn an_issue_ends_two_leases_past_their_dispatch_deadline_at_most() {
     // the three late ones, each on its worker's count.
     assert_eq!(leases.live(gateway), 5);
     assert_eq!(in_flight(&store), [(a, 5)]);
-}
-
-#[test]
-fn a_lease_issued_under_a_rule_with_a_ttl_stands_and_ends_as_any_issued_lease() {
-    let store = MemoryStore::new();
-    let a = ready(&store, "http://a:1");
-    let leases: &dyn LeasesStore = &store;
-    let (gateway, t0) = (GatewayId(1), Instant::now());
-    leases.set_term(1);
-    let id = |counter: u64| LeaseId(1 << 32 | counter);
-    let state = |id| leases.get(gateway, id).map(|record| record.state);
-    // Two leases under a sessions rule with a TTL: each is live and on
-    // its worker's count, as a lease under no rule is.
-    let under = LeaseState::issued(Some(60_000_000));
-    assert_eq!(issued_in(&store, a, t0, under), (1, vec![]));
-    assert_eq!(issued_in(&store, a, t0, under), (2, vec![]));
-    assert_eq!(state(id(2)), Some(under));
-    assert_eq!(leases.live(gateway), 2);
-    assert_eq!(in_flight(&store), [(a, 2)]);
-    // A dispatch moves the first.
-    assert!(leases.dispatched(gateway, id(1), Dispatch::default(), t0));
-    assert_eq!(state(id(1)), Some(LeaseState::Dispatched { at: t0 }));
-    // An issue past the deadline ends the second as abandoned, and the
-    // dispatched one stands.
-    let late = t0 + Duration::from_secs(6);
-    assert_eq!(issued_at(&store, a, late).1, [2]);
-    assert_eq!(state(id(2)), None);
-    assert_eq!(leases.live(gateway), 2);
 }
 
 #[test]
@@ -5202,37 +4592,6 @@ fn the_dispatch_deadlines_fall_due_in_their_own_order_whatever_order_they_were_f
     assert_eq!(due(8), NONE, "the first lease left at the restore");
     assert_eq!(due(9), [3]);
     assert_eq!(leases.live(gateway), 0);
-}
-
-/// The pins of record sit in shards by key. A worker's removal and a sweep
-/// reach every shard, each under that shard's own hold, and the count is
-/// the shards' together.
-#[test]
-fn a_removal_and_a_sweep_reach_the_pins_of_every_shard() {
-    let shards = sticky_sessions::SHARDS;
-    let store = MemoryStore::new();
-    let sessions: &dyn SessionsStore = &store;
-    let now = Instant::now();
-    let later = now + Duration::from_secs(1);
-    // Four keys a shard: two of the first worker used now, two of the
-    // second used later.
-    let keys = 4 * shards;
-    let first = |i: usize| (i / shards).is_multiple_of(2);
-    for (i, key) in (1_u64..).take(keys).enumerate() {
-        if first(i) {
-            sessions.pin(key, WorkerId(1), now, Some(store.micros(now)));
-        } else {
-            sessions.pin(key, WorkerId(2), later, Some(store.micros(later)));
-        }
-    }
-    assert_eq!(sessions.len(), keys);
-    assert_eq!(sessions.drop_workers(&[WorkerId(1)]), keys / 2);
-    assert_eq!(sessions.len(), keys / 2);
-    for (i, key) in (1_u64..).take(keys).enumerate() {
-        assert_eq!(sessions.lookup(key).is_some(), !first(i), "key {key}");
-    }
-    assert_eq!(sessions.expire(store.micros(later) + 1_000_000), keys / 2);
-    assert!(sessions.is_empty());
 }
 
 /// A gateway's release of a lease: what the frames of these cases say.
@@ -5786,27 +5145,11 @@ fn a_places_apply_applies_what_was_handed_at_its_own_file() {
     assert_eq!(in_flight(&store), [(a, 0)]);
 }
 
-/// The rows' counts read once, as a decision reads them.
-fn in_flight_once(store: &MemoryStore, out: &mut ViewBuffers) -> u32 {
-    let ask = ViewQuery {
-        gateway: GatewayId(1),
-        now: Instant::now(),
-        pinned: None,
-        affinity: false,
-        signal_cells: false,
-    };
-    store.deciding(|world| {
-        if let Some(built) = world.build("m", Role::Single, &ask, &mut *out) {
-            world.count_in_flight(&built, &ask, &mut out.candidates);
-        }
-    });
-    out.candidates.iter().map(|row| row.in_flight).sum()
-}
-
 /// A place's apply reads behind what a watch kept, whatever the watching
 /// thread does meanwhile. A hand leaves a release under the second
 /// file's watch and returns; this place then applies what waits at the
-/// other files and reads the rows' count once, as a decision does. In
+/// other files and reads the worker's count once, as a decision over
+/// worker lists does: the count its host keeps, with no lock taken. In
 /// every other round the second file's thread takes up a job as that
 /// read is made: it says it works under its turn, with its apply behind
 /// the mark, so the read finds the release applied, by this place or by
@@ -5897,7 +5240,7 @@ fn a_places_apply_reads_behind_a_watchs_frames_beside_a_job_that_begins() {
                 std::thread::yield_now();
             }
         };
-        let mut rows = ViewBuffers::default();
+        let counted = standing(store, a);
         for round in 1..=ROUNDS {
             wait_for(WATCHES);
             drop(told());
@@ -5912,9 +5255,9 @@ fn a_places_apply_reads_behind_a_watchs_frames_beside_a_job_that_begins() {
                 }
             }
             place.apply_waiting();
-            let counted = in_flight_once(store, &mut rows);
             assert_eq!(
-                counted, 0,
+                counted.load(Ordering::Relaxed),
+                0,
                 "round {round}: the read is behind the release's apply"
             );
             if !begins {
@@ -6627,7 +5970,7 @@ fn a_restore_leaves_a_working_deciders_leases_to_its_next_take() {
     let (store, a, ids) = handed_bed(2, now);
     let leader = MemoryStore::new();
     assert_eq!(ready(&leader, "http://a:1"), a);
-    let cut = leader.checkpoint(JournalKinds::All);
+    let cut = leader.checkpoint();
     let (began, working) = mpsc::sync_channel(1);
     let (look, asked) = mpsc::sync_channel::<()>(1);
     let (looked, seen) = mpsc::sync_channel(1);

@@ -17,6 +17,10 @@ Usage:
     # Use specific image
     python crates/multimodal/scripts/generate_vision_golden.py \
         --image crates/multimodal/tests/fixtures/images/square.jpg
+
+Requires transformers==5.20.2, torch==2.15.0, torchvision==0.29.2, pillow==13.0.0,
+numpy==2.5.4 and scipy==1.18.1: the versions the CI step "Generate vision golden
+fixtures" of .github/workflows/pr-test-rust.yml installs. Change both together.
 """
 
 import argparse
@@ -59,11 +63,6 @@ MODELS = {
         "model_id": "microsoft/Phi-3-vision-128k-instruct",
         "processor_class": "Phi3VImageProcessor",
         "description": "Dynamic HD transform with 336x336 tiles",
-    },
-    "phi4_vision": {
-        "model_id": "microsoft/Phi-4-multimodal-instruct",
-        "processor_class": "Phi4MMImageProcessor",
-        "description": "Dynamic HD transform with 448x448 tiles and SiGLIP encoder",
     },
     "llama4_vision": {
         "model_id": "meta-llama/Llama-4-Scout-17B-16E-Instruct",
@@ -459,65 +458,6 @@ def generate_golden_phi3_vision(image_path: str, output_dir: str) -> dict:
     return result
 
 
-def generate_golden_phi4_vision(image_path: str, output_dir: str) -> dict:
-    """Generate golden output for Phi4-Vision (Phi-4-multimodal).
-
-    Phi4-Vision uses Dynamic HD transform similar to Phi3 but with:
-    - Base resolution: 448 (vs 336 in Phi3)
-    - Normalization: [0.5, 0.5, 0.5] mean/std (vs CLIP in Phi3)
-    - Default dynamic_hd: 36 (vs 16 num_crops in Phi3)
-    - Uses SiGLIP vision encoder (vs CLIP in Phi3)
-    - Has per-crop attention masks
-
-    Token count formula:
-    256 + 1 + mask_sum + mask_col0_sum + 16
-
-    Note: Phi4 uses 'input_image_embeds' key instead of 'pixel_values'
-    """
-    from transformers import AutoImageProcessor
-
-    # Image fixtures do not need the tokenizer or its model configuration.
-    processor = AutoImageProcessor.from_pretrained(
-        "microsoft/Phi-4-multimodal-instruct",
-        revision="93f923e1a7727d1c4f446756212d9d3e8fcc5d81",
-        trust_remote_code=True,
-    )
-    image = Image.open(image_path).convert("RGB")
-    original_size = image.size
-
-    # Process image using the image processor directly
-    outputs = processor(images=image, return_tensors="np")
-
-    # Phi4 uses 'input_image_embeds' instead of 'pixel_values'
-    pixel_values = outputs.get("input_image_embeds")
-    pixel_attention_mask = outputs.get("image_attention_mask")
-    image_sizes = outputs.get("image_sizes")
-    num_img_tokens = outputs.get("num_img_tokens")
-
-    result = {
-        "pixel_values": pixel_values,
-        "original_size": original_size,
-        "processor_config": processor.to_dict(),
-    }
-
-    if pixel_attention_mask is not None:
-        result["pixel_attention_mask"] = np.array(pixel_attention_mask)
-
-    if image_sizes is not None:
-        result["image_sizes"] = np.array(image_sizes)
-
-    if num_img_tokens is not None:
-        result["num_img_tokens"] = np.array(num_img_tokens)
-
-    # Add debug info
-    result["config_info"] = {
-        "dynamic_hd": getattr(processor, "dynamic_hd", 36),
-        "base_resolution": 448,
-    }
-
-    return result
-
-
 def generate_golden_llama4_vision(image_path: str, output_dir: str) -> dict:
     """Generate golden output for LLaMA 4 Vision.
 
@@ -651,7 +591,6 @@ def generate_for_model(model_key: str, image_paths: list, output_dir: str) -> in
         "qwen2_vl": generate_golden_qwen2_vl,
         "qwen3_vl": generate_golden_qwen3_vl,
         "phi3_vision": generate_golden_phi3_vision,
-        "phi4_vision": generate_golden_phi4_vision,
         "llama4_vision": generate_golden_llama4_vision,
         "pixtral": generate_golden_pixtral,
     }.get(model_key)

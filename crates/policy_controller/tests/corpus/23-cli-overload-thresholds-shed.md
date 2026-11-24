@@ -27,8 +27,5 @@ profiles:
 bindings:
   - match: { model: "*" }
     profile: cache_aware
-    overload:
-      waiting_requests: 32
-      token_usage: 0.9
-      shed_when_all_vetoed: true
+    overload: { shed_when_all_vetoed: true }
 ```

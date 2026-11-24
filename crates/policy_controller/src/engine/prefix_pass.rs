@@ -2,8 +2,9 @@
 //! until the stage says its word of the pick.
 //!
 //! The `prefix-affinity` stage of the `cache_aware` policy keeps it and takes
-//! it through the four calls of this file, and nothing else reads or writes
-//! it. The engine clears it ahead of a decision whose overlap it states.
+//! it through the calls of this file, and nothing else reads or writes it.
+//! No entry of the engine asks the stage's word now, so the slot is written
+//! and not read outside the stage's own cases.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -34,7 +35,7 @@ impl PrefixStageId {
 ///
 /// The slot and this type are private to the file. A stage reaches the slot
 /// by three calls ([`keep_prefix_pass`], [`withdraw_prefix_pass`],
-/// [`take_prefix_pass`]) and the engine by one ([`forget_prefix_pass`]). A
+/// [`take_prefix_pass`]). A
 /// pass keeps its numbers only where it prices the held prefix, and one that
 /// orders nothing under the fleet's KV gate withdraws them, so what the slot
 /// holds is of the stage's last pass.
@@ -65,18 +66,19 @@ thread_local! {
     static LAST_PASS: std::cell::Cell<PrefixPass> = const { std::cell::Cell::new(PrefixPass::NONE) };
 }
 
-/// Forgets what a pass on this thread measured. The engine calls it ahead of
-/// a decision whose overlap it states: a decision no pass measured for then
-/// says that no margin held.
+/// Forgets what a pass on this thread measured: a case's way to a slot no
+/// earlier case wrote.
+#[cfg(test)]
 pub(crate) fn forget_prefix_pass() {
     LAST_PASS.set(PrefixPass::NONE);
 }
 
 /// Keeps what a pass of `stage` measured: the deepest match of its rows, in
-/// blocks, and the mean in flight its spill gate read. The first stage of a
-/// decision to keep holds the slot: the engine asks a profile's first prefix
-/// stage, and a later stage's pass says nothing of that one. A later pass of
-/// the same stage writes over its own numbers.
+/// blocks, and the mean in flight its spill gate read. The first stage to
+/// keep on a thread holds the slot until it withdraws its pass or its word
+/// is taken, and a later stage's pass says nothing of that one: no entry of
+/// the engine empties the slot between decisions now. A later pass of the
+/// same stage writes over its own numbers.
 #[inline]
 pub(crate) fn keep_prefix_pass(stage: PrefixStageId, deepest: u32, mean_in_flight: f32) {
     let stands = LAST_PASS.get().stage;

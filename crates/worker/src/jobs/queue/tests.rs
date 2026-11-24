@@ -302,6 +302,33 @@ async fn a_failed_job_calls_the_hosts_failed_hook_before_its_status_turns_termin
     assert_eq!(queue.get_status(job.key()).unwrap().job_type, "Removal");
 }
 
+#[tokio::test]
+async fn a_mark_takes_the_failure_kept_under_its_id() {
+    type Queue = JobQueue<Script<Work>>;
+    let statuses = DashMap::new();
+    let queue = ScriptQueue::<Work>::new(false).queue;
+    let marks = &queue.cancelled_before_start;
+    let id = WorkerId::new();
+    // A mark set before the job's end: no failure is kept.
+    queue.set_cancel_mark(&id);
+    Queue::keep_own_failure(&statuses, marks, &id, false, "Other", "one-key", "refused");
+    assert!(statuses.is_empty());
+    // A mark set after the failure was kept, by a `DELETE` answered while
+    // the job ends: the job's end takes the failure with the mark. A second
+    // `DELETE` beside it that takes its own mark back leaves the first one's.
+    queue.clear_cancel_mark(&id);
+    Queue::keep_own_failure(&statuses, marks, &id, false, "Other", "one-key", "refused");
+    assert!(statuses.contains_key(id.as_str()));
+    queue.set_cancel_mark(&id);
+    queue.set_cancel_mark(&id);
+    queue.clear_cancel_mark(&id);
+    Queue::end_mark(&statuses, marks, &id);
+    assert!(statuses.is_empty() && marks.is_empty());
+    // The count of a mark that is gone goes when the next mark is set.
+    queue.set_cancel_mark(&WorkerId::new());
+    assert_eq!(queue.mark_holders.len(), 1);
+}
+
 #[tokio::test(start_paused = true)]
 async fn the_port_states_the_callers_asker_on_the_job() {
     let ScriptQueue {

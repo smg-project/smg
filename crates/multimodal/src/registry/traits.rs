@@ -176,7 +176,7 @@ pub struct ModelMetadata<'a> {
 }
 
 impl<'a> ModelMetadata<'a> {
-    pub fn token_id(&self, token: &str) -> RegistryResult<TokenId> {
+    pub(crate) fn token_id(&self, token: &str) -> RegistryResult<TokenId> {
         self.tokenizer
             .token_to_id(token)
             .map(|id| id as TokenId)
@@ -190,7 +190,11 @@ impl<'a> ModelMetadata<'a> {
     /// tokenizer that cannot encode it is the request's error, never an
     /// empty splice: a replacement missing a stamp would reach the engine
     /// with a layout its reference processor does not write.
-    pub fn encode_plain(&self, spec: &'static str, text: &str) -> RegistryResult<Vec<TokenId>> {
+    pub(crate) fn encode_plain(
+        &self,
+        spec: &'static str,
+        text: &str,
+    ) -> RegistryResult<Vec<TokenId>> {
         let ids = self.tokenizer.encode_text(text).ok_or_else(|| {
             ModelRegistryError::TextEncodingFailed {
                 spec,
@@ -200,7 +204,7 @@ impl<'a> ModelMetadata<'a> {
         Ok(ids.into_iter().map(|id| id as TokenId).collect())
     }
 
-    pub fn config_u32(&self, path: &[&str]) -> Option<u32> {
+    pub(crate) fn config_u32(&self, path: &[&str]) -> Option<u32> {
         Self::find_value(self.config, path).and_then(|value| value.as_u64().map(|v| v as u32))
     }
 
@@ -211,7 +215,7 @@ impl<'a> ModelMetadata<'a> {
     /// value that is not a token id (negative, fractional, quoted, or above
     /// the id range) is `InvalidConfigField` naming what was found, so the
     /// operator reads the fault that is there.
-    pub fn config_token_id(&self, field: &str) -> RegistryResult<TokenId> {
+    pub(crate) fn config_token_id(&self, field: &str) -> RegistryResult<TokenId> {
         let value = Self::find_value(self.config, &[field])
             .filter(|value| !value.is_null())
             .ok_or_else(|| ModelRegistryError::MissingConfigField {
@@ -234,7 +238,7 @@ impl<'a> ModelMetadata<'a> {
         })
     }
 
-    pub fn config_model_type(&self) -> Option<&str> {
+    pub(crate) fn config_model_type(&self) -> Option<&str> {
         Self::find_value(self.config, &["model_type"]).and_then(Value::as_str)
     }
 

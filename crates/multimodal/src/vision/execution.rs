@@ -135,7 +135,7 @@ fn pool(threads: NonZeroUsize) -> Option<&'static rayon::ThreadPool> {
 }
 
 /// Spawns the tasks of one `scope`: onto the pool, or inline in order.
-pub struct Spawner<'a, 'scope> {
+pub(crate) struct Spawner<'a, 'scope> {
     inner: SpawnerInner<'a, 'scope>,
 }
 
@@ -147,7 +147,7 @@ enum SpawnerInner<'a, 'scope> {
 impl<'scope> Spawner<'_, 'scope> {
     /// Run `task` within the scope: concurrently on the pool, or right now
     /// inline. The scope ends when every task has.
-    pub fn spawn<F>(&self, task: F)
+    pub(crate) fn spawn<F>(&self, task: F)
     where
         F: FnOnce(&Spawner<'_, 'scope>) + Send + 'scope,
     {

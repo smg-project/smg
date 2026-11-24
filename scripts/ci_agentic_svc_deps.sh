@@ -158,12 +158,13 @@ cmd_create_postgres_db() {
     local postgres_host="${1:-postgres-db}"
     local admin_url="postgresql://postgres:postgres@${postgres_host}:5432/postgres"
 
-    bash "$(dirname "${BASH_SOURCE[0]}")/ci_apt_install.sh" sudo -y -qq postgresql-client
+    # Retry prerequisite installation as one unit and propagate real failures.
+    bash "$(dirname "${BASH_SOURCE[0]}")/ci_apt_install.sh" --strict-mirror sudo -y -qq postgresql-client || return "$?"
 
     TEST_DB="$(ci_postgres_dbname)"
     echo "Creating Postgres test database: $TEST_DB"
 
-    psql "$admin_url" -v ON_ERROR_STOP=1 -c "CREATE DATABASE \"$TEST_DB\";"
+    psql "$admin_url" -v ON_ERROR_STOP=1 -c "CREATE DATABASE \"$TEST_DB\";" || return "$?"
 
     append_github_env "CI_POSTGRES_TEST_DB=$TEST_DB"
     append_github_env "DATA_CONNECTOR_TEST_POSTGRES_URL=postgresql://postgres:postgres@${postgres_host}:5432/${TEST_DB}"

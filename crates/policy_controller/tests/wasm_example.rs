@@ -314,16 +314,7 @@ fn the_example_sheds_an_unusable_pool_and_counts_completions() {
     assert_eq!(completed(), 0);
     engine.on_completed(
         &Lease::default(),
-        &Outcome {
-            side: Side::Single,
-            served: WorkerId(102),
-            status: 200,
-            class: TransportClass::Ok,
-            ttft_micros: 0,
-            tokens_in: 0,
-            tokens_out: 0,
-            duration_micros: 0,
-        },
+        &Outcome::reported(200, TransportClass::Ok).with_served(Side::Single, WorkerId(102)),
     );
     assert_eq!(completed(), 1);
     assert_eq!(plugin.stats().observed, 1, "the completion was told");

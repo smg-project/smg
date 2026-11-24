@@ -53,6 +53,14 @@ impl ModelProcessorSpec for Phi3VisionSpec {
         modality: Modality,
     ) -> RegistryResult<Box<dyn VisionPreProcessor>> {
         match modality {
+            // No crop is no tile: the size rule would refuse every image.
+            Modality::Image if preprocessor_config.num_crops == Some(0) => {
+                Err(ModelRegistryError::InvalidPreprocessorConfig {
+                    spec: self.name(),
+                    modality,
+                    reason: "num_crops must be at least 1".to_string(),
+                })
+            }
             Modality::Image => Ok(Box::new(Phi3VisionProcessor::from_preprocessor_config(
                 preprocessor_config,
             ))),
@@ -168,6 +176,11 @@ mod tests {
             "(2 * 2 + 1) * 144 + 1 + (2 + 1) * 12"
         );
         assert_eq!(processor.calculate_num_tokens(256, 256).unwrap(), 757);
+        // No crop takes no image: it builds no processor.
+        let no_crop = PreProcessorConfig::from_json(r#"{"num_crops": 0}"#).unwrap();
+        assert!(spec
+            .vision_processor(&config, &no_crop, Modality::Image)
+            .is_err());
     }
 
     /// A checkpoint whose config names no crop count keeps the family's

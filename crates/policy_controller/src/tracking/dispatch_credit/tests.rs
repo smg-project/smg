@@ -1,4 +1,10 @@
-use std::{sync::Arc, time::Instant};
+use std::{
+    ops::Deref,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
 
 use parking_lot::Mutex;
 use serde_json::json;
@@ -6,15 +12,10 @@ use serde_json::json;
 use crate::{
     document::{AppliedSpec, PolicySpec, SpecError, API_VERSION},
     engine::{
-        decision, decision_engine::Request, framework, store_backed_engine::StoreBackedEngine,
-        Candidate, Constraints, Engine, Filter, LoadRow, Pair, PoolFacts, RequestFacts, Scorer,
-        Scratch, Target, TieBand, WorkerId,
+        decision, decision_engine::DecisionEngine, framework, Candidate, Constraints, Engine,
+        Filter, LoadRow, Pair, PoolFacts, RequestFacts, Scorer, Scratch, Target, TieBand, WorkerId,
     },
-    stages::{pickers, Lifecycle, StageRegistry},
-    store::{
-        Dispatch, GatewayId, LeaseState, LeasesStore, MemoryStore, Said, StaleGeneration,
-        WorkerFacts, WorkerStatus, WorkersStore,
-    },
+    stages::{pickers, scorers::take_lane, Lifecycle, StageRegistry},
     tracking::{
         decision_guard::DecisionGuard, CreditedDispatches, DispatchCounts, DispatchCredit, Lease,
         Membership, Side,
@@ -22,11 +23,9 @@ use crate::{
 };
 
 const POOL: &str = "work";
-const GATEWAY: GatewayId = GatewayId(37);
 const START: u64 = 91_300;
 const DELAY: u32 = 47;
 const TOKENS: u32 = 317;
-const NEXT_GENERATION: u64 = 43;
 
 fn one(tokens: u32) -> CreditedDispatches {
     CreditedDispatches {
@@ -93,12 +92,34 @@ fn document(limit: Option<u32>) -> PolicySpec {
 }
 
 fn built(limit: Option<u32>) -> (Engine, Arc<DispatchCredit>) {
+    counting(document(limit))
+}
+
+/// The engine of `document` over the catalog with the registered reader,
+/// and the count that reader was handed.
+fn counting(document: PolicySpec) -> (Engine, Arc<DispatchCredit>) {
     let (catalog, readers) = catalog();
-    let engine = document(limit)
+    let engine = document
         .validate_in(&catalog, &[])
         .expect("the profile validates");
     let sent = Arc::clone(&readers.lock()[0]);
     (engine, sent)
+}
+
+/// The report delay most cases set: five milliseconds, as a profile
+/// writes it and as the count's clock reads it.
+const REPORT_DELAY_MS: u32 = 5;
+const REPORT_DELAY: u64 = 5_000;
+
+/// [`document`] with a report delay of `delay` milliseconds on its profile.
+fn delayed(limit: Option<u32>, delay: u32) -> PolicySpec {
+    let mut document = document(limit);
+    document
+        .profiles
+        .get_mut(POOL)
+        .expect("the profile")
+        .sent_report_delay_ms = Some(delay);
+    document
 }
 
 fn row(id: u64, dp_rank: u16) -> Candidate {
@@ -286,6 +307,262 @@ fn the_limit_ends_sends_at_its_cutoff_and_earlier() {
 }
 
 #[test]
+fn a_report_sampled_sooner_than_the_delay_behind_a_send_leaves_it_counted() {
+    let (engine, sent) = counting(delayed(None, REPORT_DELAY_MS));
+    // One row is read whole and the other by its two numbers.
+    let mut rows = [row(211, 3), row(223, 3)];
+    for row in &mut rows {
+        send(&engine, row, START, TOKENS);
+        row.load = Some(LoadRow::default());
+    }
+    let sent_at = START + u64::from(DELAY);
+    let facts = clock(sent_at + 9_000);
+    // Three milliseconds behind the send, a microsecond short of the
+    // delay, and the delay itself.
+    for (behind, counted) in [(3_000, 1), (REPORT_DELAY - 1, 1), (REPORT_DELAY, 0)] {
+        for row in &mut rows {
+            row.load_sampled_at_micros = sent_at + behind;
+        }
+        assert_eq!(sent.read(&facts, &rows[0]).requests, counted, "{behind}");
+        let numbers = sent.pass(&facts).counts(&rows[1]);
+        assert_eq!(numbers.requests, counted, "{behind}");
+    }
+}
+
+#[test]
+fn a_delayed_report_ends_the_sends_its_delay_reaches_and_keeps_the_newer() {
+    let (engine, sent) = counting(delayed(None, REPORT_DELAY_MS));
+    let mut a = row(227, 3);
+    send(&engine, &a, START, 281);
+    send(&engine, &a, START + 4_000, TOKENS);
+    // Six milliseconds behind the first send and two behind the second.
+    a.load = Some(LoadRow::default());
+    a.load_sampled_at_micros = START + u64::from(DELAY) + 6_000;
+    assert_eq!(sent.read(&clock(0), &a), one(TOKENS));
+}
+
+#[test]
+fn a_sample_earlier_on_the_clock_than_the_delay_ends_no_send() {
+    let (engine, sent) = counting(delayed(None, REPORT_DELAY_MS));
+    let mut a = row(229, 3);
+    send(&engine, &a, 0, TOKENS);
+    a.load = Some(LoadRow::default());
+    a.load_sampled_at_micros = REPORT_DELAY - 2_000;
+    assert_eq!(sent.read(&clock(0), &a), one(TOKENS));
+}
+
+#[test]
+fn the_limit_ends_a_send_whose_report_is_too_soon_for_the_delay() {
+    let (engine, sent) = counting(delayed(Some(2), REPORT_DELAY_MS));
+    let mut a = row(233, 3);
+    send(&engine, &a, START, TOKENS);
+    let sent_at = START + u64::from(DELAY);
+    a.load = Some(LoadRow::default());
+    a.load_sampled_at_micros = sent_at + 1_000;
+    assert_eq!(sent.read(&clock(sent_at + 1_999), &a), one(TOKENS));
+    assert_eq!(
+        sent.read(&clock(sent_at + 2_000), &a),
+        CreditedDispatches::default()
+    );
+}
+
+#[test]
+fn a_read_under_the_shorter_of_two_documents_delays_ends_a_send_for_both() {
+    let (standing, long) = counting(delayed(None, 9));
+    let mut a = row(239, 3);
+    send(&standing, &a, START, TOKENS);
+    let (next, short) = counting(delayed(None, REPORT_DELAY_MS));
+    next.succeed(&standing);
+    // Six milliseconds behind the send: under the delay of nine and past
+    // the delay of five.
+    a.load = Some(LoadRow::default());
+    a.load_sampled_at_micros = START + u64::from(DELAY) + 6_000;
+    let facts = clock(0);
+    assert_eq!(long.read(&facts, &a), one(TOKENS));
+    assert_eq!(short.read(&facts, &a), CreditedDispatches::default());
+    assert_eq!(long.read(&facts, &a), CreditedDispatches::default());
+}
+
+#[test]
+fn a_delay_longer_than_a_u32_of_microseconds_holds_to_its_end() {
+    // 705 microseconds past the most a `u32` of microseconds holds.
+    const LONG_MS: u32 = 4_294_968;
+    let (engine, sent) = counting(delayed(None, LONG_MS));
+    let mut a = row(241, 3);
+    send(&engine, &a, START, TOKENS);
+    a.load = Some(LoadRow::default());
+    a.load_sampled_at_micros = START + u64::from(DELAY) + u64::from(LONG_MS) * 1000 - 1;
+    assert_eq!(sent.read(&clock(0), &a), one(TOKENS));
+    a.load_sampled_at_micros += 1;
+    assert_eq!(sent.read(&clock(0), &a), CreditedDispatches::default());
+}
+
+/// What [`DispatchCreditPass::sends`](super::DispatchCreditPass::sends)
+/// hands of `row` under `facts`: each send's instant and its stated tokens,
+/// in the order handed.
+fn instants(sent: &DispatchCredit, facts: &RequestFacts<'_>, row: &Candidate) -> Vec<(u64, u32)> {
+    let mut handed = Vec::new();
+    let each = |at_micros, tokens| handed.push((at_micros, tokens));
+    sent.pass(facts).sends(row, each);
+    handed
+}
+
+/// The instant the count keeps of a send whose lease was issued at
+/// `issued_micros`: [`send`] reports it [`DELAY`] microseconds later.
+fn sent_at(issued_micros: u64) -> u64 {
+    issued_micros + u64::from(DELAY)
+}
+
+/// The sends a stage reads one by one are the sends the two numbers count,
+/// to the send, across a release: each with its own instant and its stated
+/// tokens, none for a send of no stated size. A report ends the sends it
+/// reaches for both reads, and the read of the instants lets them go
+/// itself. Each rank of a worker hands its own sends, and a row the count
+/// holds nothing of hands nothing.
+#[test]
+fn the_instants_read_are_the_sends_the_two_numbers_count_across_a_release() {
+    let (engine, sent) = built(None);
+    let mut a = row(251, 3);
+    send(&engine, &a, START, TOKENS);
+    send(&engine, &a, START + 1, 0);
+    send(&engine, &a, START + 20, 293);
+    // Another rank of the worker holds a send of its own.
+    let other = row(a.id.0, 7);
+    send(&engine, &other, START + 40, 17);
+    let facts = clock(0);
+    let all = [
+        (sent_at(START), TOKENS),
+        (sent_at(START + 1), 0),
+        (sent_at(START + 20), 293),
+    ];
+    assert_eq!(instants(&sent, &facts, &a), all);
+    let others = [(sent_at(START + 40), 17)];
+    assert_eq!(instants(&sent, &facts, &other), others);
+    let counts = DispatchCounts {
+        requests: 3,
+        tokens: u64::from(TOKENS) + 293,
+    };
+    assert_eq!(sent.pass(&facts).counts(&a), counts);
+    // A sample instant on a row that holds no report ends nothing.
+    a.load_sampled_at_micros = sent_at(START + 1);
+    assert_eq!(instants(&sent, &facts, &a), all);
+    // A report that reflects the first two sends: the read of the
+    // instants lets them go, with no other read ahead of it.
+    a.load = Some(LoadRow::default());
+    assert_eq!(instants(&sent, &facts, &a), all[2..]);
+    assert_eq!(sent.credits.held_at(a.id, a.dp_rank), 1);
+    let counts = DispatchCounts {
+        requests: 1,
+        tokens: 293,
+    };
+    assert_eq!(sent.pass(&facts).counts(&a), counts);
+    assert!(instants(&sent, &facts, &row(257, 3)).is_empty());
+}
+
+/// The read of the instants follows the pass's rule, as the totals do.
+/// Under a report delay a report sampled sooner behind a send leaves the
+/// send handed, and one sampled the delay behind it ends it. The profile's
+/// time limit ends a send that no report reaches.
+#[test]
+fn the_instants_follow_the_profiles_report_delay_and_its_time_limit() {
+    let (engine, sent) = counting(delayed(None, REPORT_DELAY_MS));
+    let mut a = row(263, 3);
+    send(&engine, &a, START, TOKENS);
+    a.load = Some(LoadRow::default());
+    a.load_sampled_at_micros = sent_at(START) + REPORT_DELAY - 1;
+    assert_eq!(instants(&sent, &clock(0), &a), [(sent_at(START), TOKENS)]);
+    a.load_sampled_at_micros += 1;
+    assert!(instants(&sent, &clock(0), &a).is_empty());
+
+    let (engine, sent) = built(Some(2));
+    let a = row(269, 3);
+    send(&engine, &a, START, TOKENS);
+    let within = clock(sent_at(START) + 1_999);
+    assert_eq!(instants(&sent, &within, &a), [(sent_at(START), TOKENS)]);
+    assert!(instants(&sent, &clock(sent_at(START) + 2_000), &a).is_empty());
+}
+
+/// The sends come lane by lane as the count keeps them, oldest first
+/// within a lane. Two threads' sends are not merged by instant, so a stage
+/// that wants one order sorts.
+#[test]
+fn the_instants_come_lane_by_lane_and_oldest_first_within_a_lane() {
+    let (engine, sent) = built(None);
+    let a = row(271, 3);
+    std::thread::scope(|scope| {
+        let first = scope.spawn(|| {
+            take_lane(0);
+            // The later send is recorded first: its lane keeps the two by
+            // instant.
+            send(&engine, &a, START + 30, 13);
+            send(&engine, &a, START, 11);
+        });
+        first.join().expect("the first lane's sends");
+        let second = scope.spawn(|| {
+            take_lane(1);
+            send(&engine, &a, START + 20, 17);
+        });
+        second.join().expect("the second lane's send");
+    });
+    let handed = [
+        (sent_at(START), 11),
+        (sent_at(START + 30), 13),
+        (sent_at(START + 20), 17),
+    ];
+    assert_eq!(instants(&sent, &clock(0), &a), handed);
+}
+
+/// A send reported while the instants are read is not lost. The read holds
+/// every lane of the row while it calls, so the send's record waits and
+/// lands behind the read: the read hands the sends that stood before it,
+/// and the next read hands the new one too. The read stays in its first
+/// call until the sender's thread runs, and a thousand turns of the
+/// scheduler more: the send is under way while the read runs and has not
+/// landed when the read goes on.
+#[test]
+fn a_send_reported_while_the_instants_are_read_lands_behind_the_read() {
+    let (engine, sent) = built(None);
+    let a = row(277, 3);
+    send(&engine, &a, START, TOKENS);
+    send(&engine, &a, START + 3, 281);
+    let entry = sent.credits.tally.load().get(&(a.id, a.dp_rank)).cloned();
+    let entry = entry.expect("the row's entry");
+    let facts = clock(0);
+    let (started, landed) = (AtomicBool::new(false), AtomicBool::new(false));
+    let (mut read, mut held, mut waited) = (Vec::new(), true, true);
+    std::thread::scope(|scope| {
+        let mut sender = None;
+        sent.pass(&facts).sends(&a, |at_micros, tokens| {
+            held &= entry.lanes_held_for_test();
+            // The first call starts a send to the row on another thread.
+            sender.get_or_insert_with(|| {
+                let sender = scope.spawn(|| {
+                    started.store(true, Ordering::Release);
+                    send(&engine, &a, START + 9, 331);
+                    landed.store(true, Ordering::Release);
+                });
+                while !started.load(Ordering::Acquire) {
+                    std::hint::spin_loop();
+                }
+                (0..1_000).for_each(|_| std::thread::yield_now());
+                sender
+            });
+            waited &= !landed.load(Ordering::Acquire);
+            read.push((at_micros, tokens));
+        });
+    });
+    assert!(held, "the read holds every lane of the row while it calls");
+    assert!(waited, "the send has not landed while the read runs");
+    let before = [(sent_at(START), TOKENS), (sent_at(START + 3), 281)];
+    assert_eq!(read, before);
+    let mut all = instants(&sent, &facts, &a);
+    all.sort_unstable();
+    assert_eq!(all[..2], before);
+    assert_eq!(all[2..], [(sent_at(START + 9), 331)]);
+    assert_eq!(sent.pass(&facts).counts(&a).requests, 3);
+}
+
+#[test]
 fn the_two_number_read_says_the_requests_and_stated_tokens_of_the_whole_read() {
     let (engine, sent) = built(None);
     let a = row(331, 3);
@@ -409,312 +686,34 @@ fn removing_a_worker_clears_its_ranks_sends() {
     assert_eq!(reads.of(&b), one(TOKENS));
 }
 
+#[cfg_attr(
+    not(feature = "in-process"),
+    expect(
+        dead_code,
+        reason = "the cases that read it are built under `in-process`"
+    )
+)]
 fn validated(document: &PolicySpec, catalog: &StageRegistry) -> AppliedSpec {
     let digest = document.digest().expect("a digest");
     AppliedSpec::validate_digested(document, digest, catalog, &[]).expect("the policy validates")
 }
 
-fn apply(store: &MemoryStore, document: &PolicySpec, catalog: &StageRegistry) {
-    store
-        .apply(validated(document, catalog))
-        .expect("a newer generation");
-}
-
-fn next_document(limit: Option<u32>) -> PolicySpec {
-    let mut next = document(limit);
-    next.generation = NEXT_GENERATION;
-    next
-}
-
-fn door() -> (StoreBackedEngine, StageRegistry, Readers) {
-    let (catalog, readers) = catalog();
-    let store = Arc::new(MemoryStore::new());
-    for name in ["http://first:8000", "http://second:8000"] {
-        let id = store
-            .upsert(WorkerFacts {
-                key: name.to_owned(),
-                engine: name.to_owned(),
-                incarnation: 1,
-                models: vec![POOL.to_owned()],
-                dp_size: 1,
-                ..WorkerFacts::default()
-            })
-            .id();
-        let revision = WorkersStore::get(&*store, id).expect("the row").revision;
-        store.set_status(id, WorkerStatus::Ready, revision);
-    }
-    store.publish_now();
-    apply(&store, &document(None), &catalog);
-    (StoreBackedEngine::new(store), catalog, readers)
-}
-
-fn decide<'a>(
-    door: &'a StoreBackedEngine,
-    id: &[u8],
-    now: Instant,
-) -> DecisionGuard<&'a StoreBackedEngine> {
-    DecisionGuard::decide(
-        door,
-        GATEWAY,
-        &Request {
-            id,
-            facts: RequestFacts {
-                model: POOL,
-                prompt_tokens: TOKENS,
-                ..RequestFacts::default()
-            },
-            constraints: Constraints::default(),
-        },
-        now,
+/// The first target of a held decision, as the candidate a reader is asked
+/// of, whichever engine decided it.
+#[cfg_attr(
+    not(feature = "in-process"),
+    expect(
+        dead_code,
+        reason = "the cases that read it are built under `in-process`"
     )
-    .expect("a decision")
-}
-
-fn chosen(decision: &DecisionGuard<&StoreBackedEngine>) -> Candidate {
+)]
+fn chosen<D: Deref<Target: DecisionEngine>>(decision: &DecisionGuard<D>) -> Candidate {
     let target = decision
         .decision()
         .pick()
         .and_then(|pick| pick.targets.first())
         .expect("a pick");
     row(target.id.0, target.dp_rank)
-}
-
-#[test]
-fn a_handle_dispatch_changes_the_next_in_process_pick() {
-    let (door, _, readers) = door();
-    let now = Instant::now();
-    let mut first = decide(&door, b"first", now);
-    let sent_to = chosen(&first);
-    let sent = Arc::clone(&readers.lock()[0]);
-    assert_eq!(
-        sent.read(&clock(0), &sent_to),
-        CreditedDispatches::default()
-    );
-    first.dispatched(now);
-    let second = decide(&door, b"second", now);
-    assert_ne!(chosen(&second).id, sent_to.id);
-    assert_eq!(sent.read(&clock(0), &sent_to), one(TOKENS));
-}
-
-#[test]
-fn a_dispatch_of_an_older_lease_reaches_the_standing_generation() {
-    let (door, catalog, readers) = door();
-    let now = Instant::now();
-    let mut first = decide(&door, b"first", now);
-    let sent_to = chosen(&first);
-    let mut next = document(None);
-    next.generation = 7;
-    apply(door.store(), &next, &catalog);
-
-    first.dispatched(now);
-    let readers = readers.lock();
-    assert_eq!(readers[1].read(&clock(0), &sent_to), one(TOKENS));
-    assert_eq!(
-        readers[0].read(&clock(0), &sent_to),
-        CreditedDispatches::default()
-    );
-}
-
-#[test]
-fn a_decision_reads_the_sends_carried_to_its_profile() {
-    let (door, catalog, readers) = door();
-    let now = Instant::now();
-    let mut first = decide(&door, b"choose", now);
-    let sent_to = chosen(&first);
-    first.dispatched(now);
-
-    apply(door.store(), &next_document(None), &catalog);
-    let next = decide(&door, b"choose", now);
-    assert_eq!(readers.lock()[1].read(&clock(0), &sent_to), one(TOKENS));
-    assert_ne!(chosen(&next).id, sent_to.id);
-}
-
-#[test]
-fn a_profile_under_a_new_name_starts_with_no_sends() {
-    let (door, catalog, readers) = door();
-    let now = Instant::now();
-    let mut first = decide(&door, b"before", now);
-    let sent_to = chosen(&first);
-    first.dispatched(now);
-
-    let mut next = next_document(None);
-    let profile = next.profiles.remove(POOL).expect("the standing profile");
-    next.profiles.insert("new".into(), profile);
-    apply(door.store(), &next, &catalog);
-    let readers = readers.lock();
-    assert_eq!(
-        readers[1].read(&clock(0), &sent_to),
-        CreditedDispatches::default()
-    );
-    assert_eq!(readers[0].read(&clock(0), &sent_to), one(TOKENS));
-}
-
-#[test]
-fn the_new_profiles_limit_applies_to_carried_sends() {
-    let (door, catalog, readers) = door();
-    let now = Instant::now();
-    let mut first = decide(&door, b"before", now);
-    let sent_to = chosen(&first);
-    let issued = first.lease().expect("the pick's lease").lease.issued_micros;
-    first.dispatched(now);
-
-    let limit = 29;
-    apply(door.store(), &next_document(Some(limit)), &catalog);
-    let edge = issued + u64::from(limit) * 1000;
-    let readers = readers.lock();
-    assert_eq!(readers[1].read(&clock(edge - 1), &sent_to), one(TOKENS));
-    assert_eq!(readers[0].read(&clock(edge), &sent_to), one(TOKENS));
-    assert_eq!(
-        readers[1].read(&clock(edge), &sent_to),
-        CreditedDispatches::default()
-    );
-}
-
-#[test]
-fn a_refused_generation_takes_no_sends_from_the_standing_profile() {
-    let (door, catalog, readers) = door();
-    let now = Instant::now();
-    let mut first = decide(&door, b"before", now);
-    let sent_to = chosen(&first);
-    first.dispatched(now);
-
-    let stale = document(None);
-    assert_eq!(
-        door.store().apply(validated(&stale, &catalog)),
-        Err(StaleGeneration {
-            standing: stale.generation,
-            offered: stale.generation,
-        })
-    );
-    let readers = readers.lock();
-    assert_eq!(
-        readers[1].read(&clock(0), &sent_to),
-        CreditedDispatches::default()
-    );
-    assert_eq!(readers[0].read(&clock(0), &sent_to), one(TOKENS));
-}
-
-#[test]
-fn a_decision_holding_the_standing_world_reads_the_same_carried_entry() {
-    let (door, catalog, _) = door();
-    let now = Instant::now();
-    let mut first = decide(&door, b"choose", now);
-    let mut second = decide(&door, b"choose", now);
-    let sent_to = chosen(&first);
-    assert_eq!(chosen(&second).id, sent_to.id);
-    first.dispatched(now);
-
-    let store = door.store();
-    store.deciding(|world| {
-        let standing = &world.spec().engine().sent_credits[0];
-        apply(store, &next_document(None), &catalog);
-        second.dispatched(now);
-
-        let both = CreditedDispatches {
-            requests: 2,
-            tokens: 2 * u64::from(TOKENS),
-            ..CreditedDispatches::default()
-        };
-        assert_eq!(standing.read(&clock(0), &sent_to), both);
-        store.deciding(|next| {
-            let carried = &next.spec().engine().sent_credits[0];
-            assert_eq!(carried.read(&clock(0), &sent_to), both);
-        });
-    });
-}
-
-#[test]
-fn a_late_dispatch_adds_no_entry_for_a_row_that_left() {
-    for resize in [false, true] {
-        let (door, _, readers) = door();
-        let now = Instant::now();
-        let mut first = decide(&door, b"before", now);
-        let sent_to = chosen(&first);
-        let lease = first.lease().expect("the pick's lease").lease;
-        let store = door.store();
-        let worker = WorkersStore::get(&**store, sent_to.id).expect("the worker");
-        if resize {
-            let facts = WorkerFacts {
-                dp_rank: 6,
-                dp_size: 9,
-                ..worker.facts
-            };
-            assert_eq!(store.upsert(facts).id(), sent_to.id);
-            store.publish_now();
-        } else {
-            store.remove(sent_to.id, worker.revision).expect("removal");
-        }
-        first.dispatched(now);
-
-        let record = LeasesStore::get(&**store, GATEWAY, lease.id).expect("the filed lease");
-        assert!(matches!(record.state, LeaseState::Dispatched { .. }));
-        let tally = readers.lock()[0].credits.tally.load();
-        assert!(!tally.contains_key(&(sent_to.id, sent_to.dp_rank)));
-    }
-}
-
-#[test]
-fn a_generation_with_no_readers_leaves_sends_behind() {
-    let (door, catalog, readers) = door();
-    let now = Instant::now();
-    let mut first = decide(&door, b"before", now);
-    let sent_to = chosen(&first);
-    first.dispatched(now);
-
-    let mut next: PolicySpec = serde_json::from_value(json!({
-        "apiVersion": API_VERSION,
-        "generation": NEXT_GENERATION,
-        "profiles": { (POOL): { "pick": "random" } }
-    }))
-    .expect("a document");
-    apply(door.store(), &next, &catalog);
-    door.store().deciding(|world| {
-        let engine = world.spec().engine();
-        assert!(engine.sent_credits.is_empty());
-        engine.dispatched_sent(
-            &Lease::default(),
-            &Target::default(),
-            Side::Single,
-            0,
-            || {
-                panic!("a dispatch with no readers checked membership");
-            },
-        );
-    });
-
-    next = next_document(None);
-    next.generation += 5;
-    apply(door.store(), &next, &catalog);
-    let readers = readers.lock();
-    assert_eq!(readers.len(), 2);
-    assert_eq!(readers[0].read(&clock(0), &sent_to), one(TOKENS));
-    assert_eq!(
-        readers[1].read(&clock(0), &sent_to),
-        CreditedDispatches::default()
-    );
-}
-
-#[test]
-fn a_second_dispatch_report_of_the_same_side_counts_nothing() {
-    let (door, _, readers) = door();
-    let now = Instant::now();
-    let mut first = decide(&door, b"first", now);
-    let sent_to = chosen(&first);
-    let lease = first.lease().expect("the pick's lease").lease;
-    first.dispatched(now);
-    door.report(
-        GATEWAY,
-        lease.id,
-        Said::Dispatched(
-            Dispatch {
-                target_index: lease.target_index,
-                side: lease.side,
-                since_decision_micros: DELAY,
-            },
-            now,
-        ),
-    );
-    assert_eq!(readers.lock()[0].read(&clock(0), &sent_to), one(TOKENS));
 }
 
 #[test]
@@ -926,6 +925,62 @@ fn the_profiles_limit_ends_least_loads_credit() {
     assert_eq!(sent_to, other);
 }
 
+/// [`load_engine`] under the report delay and the time limit `limit`.
+fn delayed_load_engine(limit: Option<u32>) -> Engine {
+    let mut document = load_document(POOL, limit, false);
+    document
+        .profiles
+        .get_mut(POOL)
+        .expect("the profile")
+        .sent_report_delay_ms = Some(REPORT_DELAY_MS);
+    document.validate().expect("the profile validates")
+}
+
+/// [`reporting`]'s rows, their reports sampled `behind` microseconds after
+/// the send [`send`] makes of a lease issued at [`START`].
+fn sampled(behind: u64) -> [Candidate; 2] {
+    reporting().map(|row| Candidate {
+        load_sampled_at_micros: START + u64::from(DELAY) + behind,
+        ..row
+    })
+}
+
+#[test]
+fn the_profiles_report_delay_keeps_least_loads_credit_past_a_report_sampled_sooner() {
+    let delayed = delayed_load_engine(None);
+    let plain = load_engine(POOL, None);
+    let rows = reporting();
+    for engine in [&delayed, &plain] {
+        send(engine, &rows[0], START, TOKENS);
+    }
+    let now = START + u64::from(DELAY) + 9_000;
+    // A report three milliseconds behind the send reflects it where the
+    // profile sets no delay, and leaves the credit under a delay of five.
+    let [sent_to, other] = scores(&plain, &sampled(3_000), now);
+    assert_eq!(sent_to, other);
+    let [sent_to, other] = scores(&delayed, &sampled(3_000), now);
+    assert!(sent_to < other, "{sent_to} against {other}");
+    // A report five behind it ends the credit.
+    let [sent_to, other] = scores(&delayed, &sampled(REPORT_DELAY), now);
+    assert_eq!(sent_to, other);
+}
+
+#[test]
+fn least_load_under_a_limit_and_a_delay_follows_both() {
+    let engine = delayed_load_engine(Some(20));
+    send(&engine, &reporting()[0], START, TOKENS);
+    let sent_at = START + u64::from(DELAY);
+    // A report three milliseconds behind the send: the delay keeps the
+    // credit.
+    let [sent_to, other] = scores(&engine, &sampled(3_000), sent_at + 4_000);
+    assert!(sent_to < other, "{sent_to} against {other}");
+    // The limit ends it at twenty, under the same report.
+    let [sent_to, other] = scores(&engine, &sampled(3_000), sent_at + 19_999);
+    assert!(sent_to < other, "{sent_to} against {other}");
+    let [sent_to, other] = scores(&engine, &sampled(3_000), sent_at + 20_000);
+    assert_eq!(sent_to, other);
+}
+
 #[test]
 fn a_new_documents_least_load_keeps_the_sends_of_the_standing_one() {
     let standing = load_engine(POOL, None);
@@ -1006,6 +1061,37 @@ fn a_limit_without_a_reader_is_refused_at_the_profiles_field() {
 }
 
 #[test]
+fn a_zero_report_delay_is_refused_at_the_profiles_field() {
+    let (catalog, _) = catalog();
+    assert_eq!(
+        delayed(None, 0).validate_in(&catalog, &[]).err(),
+        Some(SpecError::BadField {
+            path: "profiles.work.sent_report_delay_ms".into(),
+            value: "0".into(),
+            reason: "above zero",
+        })
+    );
+}
+
+#[test]
+fn a_report_delay_without_a_reader_is_refused_at_the_profiles_field() {
+    let mut document = PolicySpec::preset("random").expect("a preset");
+    document
+        .profiles
+        .get_mut("random")
+        .expect("the profile")
+        .sent_report_delay_ms = Some(71);
+    assert_eq!(
+        document.validate().err(),
+        Some(SpecError::BadField {
+            path: "profiles.random.sent_report_delay_ms".into(),
+            value: "71".into(),
+            reason: "a delay any stage of this profile reads",
+        })
+    );
+}
+
+#[test]
 fn a_document_with_no_reader_keeps_no_send_tallies() {
     let engine = PolicySpec::preset("random")
         .expect("a preset")
@@ -1030,6 +1116,35 @@ fn an_unset_limit_leaves_a_documents_canonical_form_and_digest_intact() {
         document.digest().expect("a digest").to_string(),
         "sha256:5d615ed114ca79046283cd72596dd3428baa2ec110170a5bb72ea4bc525b1ade"
     );
+}
+
+#[test]
+fn a_written_report_delay_stands_in_a_documents_canonical_form() {
+    let canonical = format!(
+        r#"{{"apiVersion":"{API_VERSION}","generation":0,"profiles":{{"work":{{"filter":["healthy"],"score":["least-load"],"pick":"best","sent_report_delay_ms":5}}}},"bindings":[]}}"#
+    );
+    let document: PolicySpec = serde_json::from_str(&canonical).expect("a document");
+    assert_eq!(
+        serde_json::to_string(&document).expect("the form"),
+        canonical
+    );
+    let profile = document.profiles.get(POOL).expect("the profile");
+    assert_eq!(profile.sent_report_delay_ms, Some(5));
+}
+
+/// Holds `sent` to a report delay of nine milliseconds, over the two
+/// sends [`send`] made `row` at [`START`]: the count a stage's factory was
+/// handed is under its profile's delay, whichever kind of stage asked.
+fn held_to_a_delay_of_nine(sent: &DispatchCredit, row: &Candidate) {
+    let sent_at = START + u64::from(DELAY);
+    let reported = |behind: u64| Candidate {
+        load: Some(LoadRow::default()),
+        load_sampled_at_micros: sent_at + behind,
+        ..*row
+    };
+    let facts = clock(sent_at + 9_700);
+    assert_eq!(sent.read(&facts, &reported(8_999)).requests, 2);
+    assert_eq!(sent.read(&facts, &reported(9_000)).requests, 0);
 }
 
 /// Keeps the rows its profile sent fewer than `most` requests.
@@ -1080,6 +1195,7 @@ fn a_registered_filter_reads_the_sends_of_its_profile() {
         "profiles": {
             "work": {
                 "sent_ttl_ms": 24_001,
+                "sent_report_delay_ms": 9,
                 "filter": [{ "sent-under": { "requests": 2 } }],
                 "pick": "random"
             }
@@ -1110,6 +1226,7 @@ fn a_registered_filter_reads_the_sends_of_its_profile() {
             ..CreditedDispatches::default()
         }
     );
+    held_to_a_delay_of_nine(&readers.lock()[0], &a);
 }
 
 /// Picks the kept row its profile sent the fewest requests, the first of
@@ -1164,6 +1281,7 @@ fn a_registered_picker_reads_the_sends_of_its_profile() {
         "profiles": {
             "work": {
                 "sent_ttl_ms": 24_001,
+                "sent_report_delay_ms": 9,
                 "filter": ["healthy"],
                 "score": ["least-requests"],
                 "pick": "least-sent"
@@ -1188,4 +1306,162 @@ fn a_registered_picker_reads_the_sends_of_its_profile() {
             ..CreditedDispatches::default()
         }
     );
+    held_to_a_delay_of_nine(&readers.lock()[0], &a);
+}
+
+/// A send told through a decision's handle, over the engine that decides
+/// over worker lists.
+#[cfg(feature = "in-process")]
+mod over_lists {
+    use std::{
+        sync::Arc,
+        time::{Duration, Instant},
+    };
+
+    use smg_worker::{
+        identity::basic::Worker,
+        load::state::{one_rank_load, LoadSnapshot},
+        test_support::ready_worker,
+    };
+
+    use super::{
+        catalog, chosen, clock, document, one, send, validated, Readers, DELAY, POOL, TOKENS,
+    };
+    use crate::{
+        document::AppliedSpec,
+        engine::{
+            decision_engine::{Request, RequestMaker, WorkerLists},
+            list_cell::tests::PublishedList,
+            policy_engine::PolicyEngine,
+            Constraints, Live, RequestFacts,
+        },
+        store::GatewayId,
+        tracking::{decision_guard::DecisionGuard, CreditedDispatches},
+    };
+
+    /// A request stated ahead, with the list its host hands for it.
+    struct Asks<'a>(Request<'a>, &'a PublishedList);
+
+    impl RequestMaker for Asks<'_> {
+        fn model(&self) -> &str {
+            self.0.facts.model
+        }
+
+        fn make<'w>(&'w self, _: &'w AppliedSpec) -> Request<'w> {
+            self.0
+        }
+
+        fn workers(&self) -> WorkerLists<'_> {
+            WorkerLists::Single(self.1.lent())
+        }
+    }
+
+    /// The engine of the standing document, two ready workers as it reads
+    /// their list, and the document's readers.
+    fn bed() -> (PolicyEngine, PublishedList, Readers) {
+        let (catalog, readers) = catalog();
+        let engine = PolicyEngine::new(validated(&document(None), &catalog));
+        let list: Arc<[Arc<dyn Worker>]> = ["http://first:8000", "http://second:8000"]
+            .iter()
+            .map(|url| ready_worker(url, POOL))
+            .collect();
+        let members = PublishedList::new(list);
+        (engine, members, readers)
+    }
+
+    /// A decision for a request of [`TOKENS`] tokens over `members`, held
+    /// by its handle.
+    fn decide<'a>(
+        engine: &'a PolicyEngine,
+        members: &PublishedList,
+        id: &[u8],
+        now: Instant,
+    ) -> DecisionGuard<&'a PolicyEngine> {
+        let request = Request {
+            id,
+            facts: RequestFacts {
+                model: POOL,
+                prompt_tokens: TOKENS,
+                ..RequestFacts::default()
+            },
+            constraints: Constraints::default(),
+        };
+        let asks = Asks(request, members);
+        DecisionGuard::decide_under(engine, GatewayId::LOCAL, &asks, now).expect("a decision")
+    }
+
+    /// A send told through a decision's handle is read by the profile's
+    /// reader, and the engine's next decision goes to the other worker.
+    #[test]
+    fn a_handle_dispatch_changes_the_next_in_process_pick() {
+        let (engine, members, readers) = bed();
+        let now = Instant::now();
+        let mut first = decide(&engine, &members, b"first", now);
+        let sent_to = chosen(&first);
+        let sent = Arc::clone(&readers.lock()[0]);
+        assert_eq!(
+            sent.read(&clock(0), &sent_to),
+            CreditedDispatches::default()
+        );
+        first.dispatched(now);
+        let second = decide(&engine, &members, b"second", now);
+        assert_ne!(chosen(&second).id, sent_to.id);
+        assert_eq!(sent.read(&clock(0), &sent_to), one(TOKENS));
+    }
+
+    /// A handle says its dispatch once, so a second word of the same send
+    /// counts nothing. The engine files no lease: the handle is the one
+    /// that tells it a word, and no entry takes a report by a lease's id.
+    #[test]
+    fn a_second_dispatch_word_of_one_handle_counts_nothing() {
+        let (engine, members, readers) = bed();
+        let now = Instant::now();
+        let mut first = decide(&engine, &members, b"first", now);
+        let sent_to = chosen(&first);
+        first.dispatched(now);
+        first.dispatched(now);
+        assert_eq!(readers.lock()[0].read(&clock(0), &sent_to), one(TOKENS));
+    }
+
+    /// A report sampled behind a send ends the send's credit. A report
+    /// sampled ahead of the send, read later, leaves the credit ended: no
+    /// older report brings a send back.
+    #[test]
+    fn a_released_send_stays_retired_when_an_older_report_arrives() {
+        let (engine, members, readers) = bed();
+        let sent = Arc::clone(&readers.lock()[0]);
+        let url = "http://first:8000";
+        let time = engine.clock();
+        let records = engine
+            .members_of(members.lent())
+            .records(engine.spec(), time);
+        let stages = engine.spec().engine();
+
+        let issued = Instant::now();
+        let dispatched = issued + Duration::from_micros(u64::from(DELAY));
+        let newer = dispatched + Duration::from_millis(13);
+        let later = newer + Duration::from_millis(1);
+        send(stages, &records.fixed()[0], time.micros(issued), TOKENS);
+
+        // The first worker's report, sampled at `sampled_at` and read at
+        // `now`: what the profile's reader counts for the worker then.
+        let read = |sampled_at, running: u16, now| {
+            let mut report = one_rank_load(0, 0.0, 0.0);
+            report.loads[0].num_running_reqs = i32::from(running);
+            report.sampled_at = Some(sampled_at);
+            let loads = LoadSnapshot::from_loads_for_test(vec![(url.to_owned(), report)]);
+            let live = Live::at(stages, time, now, Some(&loads), None);
+            let row = records
+                .read(members.workers(), &live, 0)
+                .expect("the worker record");
+            assert_eq!(row.load.expect("the report").running, u32::from(running));
+            assert_eq!(row.load_sampled_at_micros, time.micros(sampled_at));
+            sent.read(&clock(live.now_micros()), &row)
+        };
+
+        let empty = CreditedDispatches::default();
+        assert_eq!(read(issued, 19, dispatched), one(TOKENS));
+        assert_eq!(read(newer, 7, newer), empty);
+        assert_eq!(read(issued, 19, later), empty, "the send stays retired");
+    }
 }

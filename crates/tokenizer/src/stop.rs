@@ -111,9 +111,6 @@ pub struct StopRules {
     /// gateway's per-request context, which holds a decoder, one allocator
     /// class up.
     matcher: Option<Arc<Matcher>>,
-    /// True when there are no string stop sequences (only token-level stops).
-    /// In this mode the jail buffer is bypassed entirely for lower overhead.
-    token_only: bool,
     /// The config's hidden stop token ids, sorted: every token is checked
     /// against them, and a search of a few sorted ids costs no hashing.
     hidden_stop_ids: StopIds,
@@ -174,7 +171,6 @@ impl StopRules {
         });
 
         Self {
-            token_only: matcher.is_none(),
             visible_boundary_idx,
             matcher,
             hidden_stop_ids: StopIds::new(&stop_tokens),
@@ -317,7 +313,7 @@ impl StopSequenceDecoder {
     /// to a buffer of the caller's instead.
     pub fn process_token(&mut self, token_id: TokenIdType) -> Result<SequenceDecoderOutput> {
         if !self.stopped
-            && self.rules.token_only
+            && self.rules.matcher.is_none()
             && !self.rules.hidden_stop_ids.contains(token_id)
             && !self.rules.visible_stop_ids.contains(token_id)
         {
@@ -376,7 +372,7 @@ impl StopSequenceDecoder {
 
         let hidden_stop = self.rules.hidden_stop_ids.contains(token_id);
         let visible_stop = self.rules.visible_stop_ids.contains(token_id);
-        if self.rules.token_only && !hidden_stop && !visible_stop {
+        if self.rules.matcher.is_none() && !hidden_stop && !visible_stop {
             // The common path: no string stops and not a stop token, so the
             // decoded text goes out as it is, with no jail to run.
             let before = out.len();
@@ -482,34 +478,32 @@ impl StopSequenceDecoder {
     /// longest suffix that is still a partial stop sequence.
     fn release(&mut self, out: &mut String) -> SequenceDecoderStep {
         // Token-only fast path: no string stops means no jail is needed.
-        if self.rules.token_only {
+        let Some(matcher) = &self.rules.matcher else {
             if self.jail_buffer.is_empty() {
                 return SequenceDecoderStep::Held;
             }
             out.push_str(&self.jail_buffer);
             self.jail_buffer.clear();
             return SequenceDecoderStep::Text;
-        }
+        };
 
         // Check for stop sequences using Aho-Corasick. The jail only ever retains a
         // proper prefix of some pattern, so the buffer is bounded by
         // `longest_pattern + one token of text` and scanning it whole is cheap.
-        if let Some(matcher) = &self.rules.matcher {
-            if let Some(mat) = matcher.automaton.find(Input::new(&self.jail_buffer)) {
-                self.stopped = true;
-                self.matched_stop = Some(self.jail_buffer[mat.start()..mat.end()].to_string());
-                let is_visible = mat.pattern().as_usize() >= self.rules.visible_boundary_idx;
-                // A visible stop sequence is included in the output, a hidden
-                // one excluded.
-                let end = if is_visible { mat.end() } else { mat.start() };
-                out.push_str(&self.jail_buffer[..end]);
-                self.jail_buffer.clear();
-                return if end == 0 {
-                    SequenceDecoderStep::Stopped
-                } else {
-                    SequenceDecoderStep::StoppedWithText
-                };
-            }
+        if let Some(mat) = matcher.automaton.find(Input::new(&self.jail_buffer)) {
+            self.stopped = true;
+            self.matched_stop = Some(self.jail_buffer[mat.start()..mat.end()].to_string());
+            let is_visible = mat.pattern().as_usize() >= self.rules.visible_boundary_idx;
+            // A visible stop sequence is included in the output, a hidden
+            // one excluded.
+            let end = if is_visible { mat.end() } else { mat.start() };
+            out.push_str(&self.jail_buffer[..end]);
+            self.jail_buffer.clear();
+            return if end == 0 {
+                SequenceDecoderStep::Stopped
+            } else {
+                SequenceDecoderStep::StoppedWithText
+            };
         }
 
         // Withhold only the longest suffix that is still a *partial* stop sequence.
@@ -682,57 +676,11 @@ impl StopIds {
     }
 }
 
-/// Builder for StopSequenceDecoder
-pub struct StopSequenceDecoderBuilder {
-    tokenizer: Arc<dyn traits::Tokenizer>,
-    config: StopSequenceConfig,
-    skip_special_tokens: bool,
-}
-
-impl StopSequenceDecoderBuilder {
-    pub fn new(tokenizer: Arc<dyn traits::Tokenizer>) -> Self {
-        StopSequenceDecoderBuilder {
-            tokenizer,
-            config: StopSequenceConfig::default(),
-            skip_special_tokens: true,
-        }
-    }
-
-    pub fn stop_token(mut self, token_id: TokenIdType) -> Self {
-        self.config.stop_tokens.insert(token_id);
-        self
-    }
-
-    pub fn stop_sequence(mut self, sequence: impl Into<String>) -> Self {
-        self.config.stop_sequences.push(sequence.into());
-        self
-    }
-
-    pub fn visible_stop_token(mut self, token_id: TokenIdType) -> Self {
-        self.config.visible_stop_tokens.insert(token_id);
-        self
-    }
-
-    pub fn visible_stop_sequence(mut self, sequence: impl Into<String>) -> Self {
-        self.config.visible_stop_sequences.push(sequence.into());
-        self
-    }
-
-    pub fn skip_special_tokens(mut self, skip: bool) -> Self {
-        self.skip_special_tokens = skip;
-        self
-    }
-
-    pub fn build(self) -> StopSequenceDecoder {
-        StopSequenceDecoder::new(self.tokenizer, self.config, self.skip_special_tokens)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::{collections::HashSet, sync::Arc};
 
-    use super::{SequenceDecoderStep, StopIds, StopSequenceDecoderBuilder, INLINE_STOP_IDS};
+    use super::{SequenceDecoderStep, StopIds, INLINE_STOP_IDS};
     use crate::{
         mock::MockTokenizer, SequenceDecoderOutput, StopSequenceConfig, StopSequenceDecoder,
     };
@@ -973,20 +921,6 @@ mod tests {
 
         let result = decoder.process_token(999).unwrap();
         assert!(matches!(result, SequenceDecoderOutput::StoppedWithText(_)));
-    }
-
-    #[test]
-    fn test_builder_pattern() {
-        let tokenizer = Arc::new(MockTokenizer::new());
-
-        let decoder = StopSequenceDecoderBuilder::new(tokenizer)
-            .stop_token(999)
-            .stop_sequence("STOP")
-            .visible_stop_token(1000)
-            .skip_special_tokens(true)
-            .build();
-
-        assert!(!decoder.is_stopped());
     }
 
     #[test]
@@ -1416,131 +1350,22 @@ mod tests {
     }
 
     #[test]
-    fn test_utf8_multibyte_character_boundaries() {
-        // This test verifies the fix for the UTF-8 boundary panic
-        // The panic occurred when trying to slice jail_buffer at a byte index
-        // that was in the middle of a multi-byte UTF-8 character (e.g., '×')
-        use crate::mock::MockTokenizer;
-
-        let tokenizer = Arc::new(MockTokenizer::new());
-
-        // Configure stop sequence with a multi-byte character
-        let config = StopSequenceConfig::default().with_stop_sequence(" ×");
-
+    fn a_multibyte_character_that_begins_a_stop_is_held_at_a_tokens_end() {
+        let tokenizer = Arc::new(MockTokenizer::new().with_tokens(&[("aΔ", 5000)]));
+        let config = StopSequenceConfig::default().with_stop_sequence("Δ world");
         let mut decoder = StopSequenceDecoder::new(tokenizer, config, false);
 
-        // Simulate the scenario: jail_buffer will contain " ×" (space + multiplication sign)
-        // The '×' character is UTF-8 encoded as bytes [0xC3, 0x97] (2 bytes)
-        // When checking for partial matches, we must not slice in the middle of these bytes
-
-        // This should not panic - the fix ensures we only slice at char boundaries
-        let result = decoder.process_token(1); // Will add some text to jail_buffer
-        assert!(result.is_ok());
-
-        // Even with multi-byte UTF-8 characters in the buffer, processing should work
-        let result = decoder.process_token(2);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_utf8_multibyte_delta_character() {
-        // Test for: byte index 1 is not a char boundary; it is inside 'Δ' (bytes 0..2) of `Δ`
-        // 'Δ' (U+0394 GREEK CAPITAL LETTER DELTA) is encoded as [0xCE, 0x94] (2 bytes)
-        let tokenizer = Arc::new(MockTokenizer::new());
-        let config = StopSequenceConfig::default().with_stop_sequence("Δ");
-
-        let mut decoder = StopSequenceDecoder::new(tokenizer, config, false);
-
-        // Process tokens - should not panic when checking partial matches
-        let result = decoder.process_token(1);
-        assert!(result.is_ok());
-        let result = decoder.process_token(2);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_utf8_multibyte_degree_character() {
-        // Test for: byte index 1 is not a char boundary; it is inside '°' (bytes 0..2) of `°`
-        // '°' (U+00B0 DEGREE SIGN) is encoded as [0xC2, 0xB0] (2 bytes)
-        let tokenizer = Arc::new(MockTokenizer::new());
-        let config = StopSequenceConfig::default().with_stop_sequence("°");
-
-        let mut decoder = StopSequenceDecoder::new(tokenizer, config, false);
-
-        // Process tokens - should not panic when checking partial matches
-        let result = decoder.process_token(1);
-        assert!(result.is_ok());
-        let result = decoder.process_token(2);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_utf8_multibyte_triangle_character() {
-        // Test for: byte index 4 is not a char boundary; it is inside '∆' (bytes 2..5) of ` (∆`
-        // '∆' (U+2206 INCREMENT) is encoded as [0xE2, 0x88, 0x86] (3 bytes)
-        let tokenizer = Arc::new(MockTokenizer::new());
-        let config = StopSequenceConfig::default().with_stop_sequence(" (∆");
-
-        let mut decoder = StopSequenceDecoder::new(tokenizer, config, false);
-
-        // Process tokens - should not panic when checking partial matches
-        let result = decoder.process_token(1);
-        assert!(result.is_ok());
-        let result = decoder.process_token(2);
-        assert!(result.is_ok());
-        let result = decoder.process_token(3);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_utf8_multibyte_en_dash_character() {
-        // Test for: byte index 3 is not a char boundary; it is inside '–' (bytes 1..4) of ` –`
-        // '–' (U+2013 EN DASH) is encoded as [0xE2, 0x80, 0x93] (3 bytes)
-        let tokenizer = Arc::new(MockTokenizer::new());
-        let config = StopSequenceConfig::default().with_stop_sequence(" –");
-
-        let mut decoder = StopSequenceDecoder::new(tokenizer, config, false);
-
-        // Process tokens - should not panic when checking partial matches
-        let result = decoder.process_token(1);
-        assert!(result.is_ok());
-        let result = decoder.process_token(2);
-        assert!(result.is_ok());
-        let result = decoder.process_token(3);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_utf8_multibyte_various_characters() {
-        // Comprehensive test with multiple multi-byte UTF-8 characters
-        // Tests 2-byte, 3-byte, and 4-byte UTF-8 sequences
-        let test_cases = vec![
-            ("×", "multiplication sign - 2 bytes"),
-            ("Δ", "Greek Delta - 2 bytes"),
-            ("°", "degree sign - 2 bytes"),
-            ("∆", "increment - 3 bytes"),
-            ("–", "en dash - 3 bytes"),
-            ("€", "euro sign - 3 bytes"),
-            ("中", "Chinese character - 3 bytes"),
-            ("🚀", "rocket emoji - 4 bytes"),
-            ("💡", "lightbulb emoji - 4 bytes"),
-        ];
-
-        for (stop_char, description) in test_cases {
-            let tokenizer = Arc::new(MockTokenizer::new());
-            let config = StopSequenceConfig::default().with_stop_sequence(stop_char);
-
-            let mut decoder = StopSequenceDecoder::new(tokenizer, config, false);
-
-            // Process multiple tokens - should not panic
-            for token_id in 1..=5 {
-                let result = decoder.process_token(token_id);
-                assert!(
-                    result.is_ok(),
-                    "Failed on {description} with token {token_id}"
-                );
-            }
-        }
+        // "aΔ" ends in the stop's first character: "a" goes out and the two
+        // bytes of "Δ" are held.
+        assert_eq!(
+            decoder.process_token(5000).unwrap(),
+            SequenceDecoderOutput::Text("a".to_string())
+        );
+        assert_eq!(
+            decoder.process_token(2).unwrap(),
+            SequenceDecoderOutput::Stopped
+        );
+        assert_eq!(decoder.matched_stop(), Some("Δ world"));
     }
 
     /// The append form and the owned form of every step agree on the text and on what

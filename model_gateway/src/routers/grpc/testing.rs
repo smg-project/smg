@@ -147,7 +147,7 @@ pub(crate) fn worker(labels: &[(&str, &str)]) -> WorkerSelection {
         builder = builder.label(*key, *value);
     }
     WorkerSelection::Single {
-        worker: Arc::new(builder.build()),
+        worker: Arc::new(builder.build()).into(),
     }
 }
 

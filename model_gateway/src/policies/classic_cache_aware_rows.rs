@@ -378,6 +378,7 @@ impl Bed {
             RoutingPool::HttpRegular,
             None,
             inputs,
+            placement::Stated::nothing,
         );
         let place = match picked {
             Some(worker) => {

@@ -108,10 +108,12 @@ fn check_batch(
             }
             Ok(())
         }
-        // One ID replaces one worker. `PUT` is refused up front when the
-        // router runs data-parallel, which is the only expansion that turns
-        // one spec into several workers; the check keeps a future caller from
-        // writing a partial batch.
+        // One ID replaces one worker. `PUT` is refused up front for a rank
+        // worker. A plain worker whose engine reports several ranks by now
+        // is the one other spec that turns into several workers: the
+        // creation step refuses its `PUT` first, since the ranks would
+        // stand beside the plain worker, and this check stands behind it,
+        // before any of them is written.
         WorkerRegistrationMode::ReplaceById { worker_id, .. } if workers.len() != 1 => {
             Err(step_failed(format!(
                 "Replacing worker {worker_id} needs exactly one worker, got {}",
@@ -139,13 +141,18 @@ fn register_worker(
             let worker_id = WorkerId::from_string(worker_id.clone());
             let address = worker.redacted_url().to_string();
             // Fails when the ID is gone or the worker moved on, which covers
-            // the concurrent DELETE, DELETE + POST, and second-PUT cases.
-            if registry.replace_claiming_local(&worker_id, worker, *expected_revision) {
+            // the concurrent DELETE, DELETE + POST, and second-PUT cases, and
+            // when a removal is draining the worker.
+            if registry.replace_claiming_local_unless_draining(
+                &worker_id,
+                worker,
+                *expected_revision,
+            ) {
                 Ok(worker_id)
             } else {
                 Err(step_failed(format!(
-                    "Worker {} at {address} is no longer at revision {expected_revision}, \
-                     so the replacement was dropped",
+                    "Worker {} at {address} is no longer at revision {expected_revision} or \
+                     is being removed, so the replacement was dropped",
                     worker_id.as_str()
                 )))
             }

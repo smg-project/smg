@@ -46,7 +46,12 @@
 //! the leftmost of equal ranks: equal ranks are one token, formed at two
 //! positions by the same or by different splits).
 
-use std::{borrow::Cow, cmp::Reverse, collections::BinaryHeap};
+use std::{
+    borrow::{Borrow, Cow},
+    cmp::Reverse,
+    collections::BinaryHeap,
+    hash::Hash,
+};
 
 use rustc_hash::FxHashMap;
 use serde::Deserialize;
@@ -58,7 +63,7 @@ use tokenizers::{
 use crate::{
     encode_path::Declined,
     tiktoken::MAX_BYTE_LEVEL_TABLE_IDS,
-    word_cache::{entries_of, Listing, ReadBpe},
+    word_cache::{entries_of, Listing, ModelView, ReadBpe},
 };
 
 mod preformed;
@@ -79,27 +84,33 @@ const SHORT_PIECE_SYMBOLS: usize = 128;
 const SHORT_PIECE_SMALL: usize = 32;
 /// The smallest arrays of a short merge: a word.
 const SHORT_PIECE_TINY: usize = 16;
-/// Bits of a position in a short merge's key, `rank << SHORT_KEY_BITS |
-/// position`: a minimum over the keys is the least rank and, among its
-/// repeats, the leftmost position. A key is a signed word that is never
-/// negative ([`MAX_RANKS`] leaves the sign bit clear): the baseline vector
-/// instructions have no minimum of words and compare them signed only, so
-/// a signed minimum is a compare and a blend and an unsigned one paid two
-/// sign flips more for every eight keys.
+/// Bits of a position in a short merge's key, the pair's [`Merge`] word over
+/// its position (`merge << SHORT_KEY_BITS | position`: rank, product,
+/// position). A minimum over the keys is the least rank and, among its
+/// repeats, the leftmost position (pairs of one rank have one product), and
+/// the key it picks carries the product. The key is one 64-bit word because
+/// the next merge waits on that minimum: a tree of scalar minima over eight
+/// keys is three deep, where 32-bit keys cost a vector compare and blend per
+/// group and a fold of the lanes on the baseline instruction set.
 const SHORT_KEY_BITS: u32 = SHORT_PIECE_SYMBOLS.trailing_zeros();
 /// The position bits of a short merge's key.
 const SHORT_KEY_MASK: u32 = (1 << SHORT_KEY_BITS) - 1;
-/// The key of a live symbol whose pair is no merge, past every packed key.
-const NO_KEY: i32 = i32::MAX;
-/// Ranks a short merge's key carries with its sign bit clear; a model with
+/// The key of a slot without a pair (padding, a dead symbol), past every key.
+const NO_KEY: u64 = u64::MAX;
+/// The least key that reads as no merge: the top bit, which [`Merge::NONE`]
+/// keeps under the shift and no merge's rank reaches (see [`MAX_RANKS`]).
+const NO_MERGE: u64 = 1 << (u64::BITS - 1);
+/// Ranks a short merge's key carries with its top bit clear; a model with
 /// more merges declines the table (a vocabulary has some hundred thousand).
-const MAX_RANKS: usize = 1 << (i32::BITS - 1 - SHORT_KEY_BITS);
-// The greatest key a table makes is under `NO_KEY`: a table's last rank is
+const MAX_RANKS: usize = 1 << (u32::BITS - 1 - SHORT_KEY_BITS);
+// The greatest key a table makes is under `NO_MERGE`: a table's last rank is
 // `MAX_RANKS - 2` at the most (`from_model` declines a model of `MAX_RANKS`
 // merges, and the ranks of a byte-level table end under `MAX_RANKS`, by the
 // assertion in `from_ranks`), and that rank at the last position is under it.
-const _: () =
-    assert!(((MAX_RANKS as u64 - 2) << SHORT_KEY_BITS | SHORT_KEY_MASK as u64) < NO_KEY as u64);
+const _: () = assert!(
+    (((MAX_RANKS as u64 - 2) << 32 | u32::MAX as u64) << SHORT_KEY_BITS | SHORT_KEY_MASK as u64)
+        < NO_MERGE
+);
 /// The rank of a pair that is no merge.
 const NO_RANK: u32 = u32::MAX;
 /// The id of a byte the vocabulary has no token for. On the byte-level path
@@ -139,7 +150,9 @@ const NONE: u32 = u32::MAX;
 /// One merge as the table stores it, in one word: the rank in the high half
 /// and the id the merge produces in the low half, so that a pair's lookup
 /// answers both with the one load. [`Merge::NONE`] stands for a pair that is
-/// no merge; its rank reads [`NO_RANK`].
+/// no merge; its rank reads [`NO_RANK`]. A table gives one rank one product:
+/// a short merge's key orders by both before the position (see
+/// [`SHORT_KEY_BITS`]).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct Merge(u64);
 
@@ -281,6 +294,9 @@ pub(super) struct MergeTable {
     /// The model's `ignore_merges`: a piece that is a token is that token,
     /// looked up before any merge (by the caller, in the model's vocabulary).
     pub(super) ignore_merges: bool,
+    /// The calls of [`Self::read_through`], for the test of who reads.
+    #[cfg(test)]
+    pub(super) reads: super::AtomicUsize,
 }
 
 /// The model's `merges` field read back: `[[a, b], ...]` in rank order.
@@ -296,11 +312,14 @@ impl MergeTable {
     /// `read` is what the file's one-pass read saw of the model (its merges
     /// as ids, its largest id), so that neither is read back from the built
     /// model; `None` for a model built in memory.
-    pub(super) fn from_model(
-        model: &ModelWrapper,
+    pub(super) fn from_model<M: Model + ModelView>(
+        view: &M,
         tokens: ByteTokens,
         read: Option<&ReadBpe>,
     ) -> Result<Self, Declined> {
+        // The view answers for the byte tokens where the section's model was
+        // not built.
+        let model = view.wrapper();
         let ModelWrapper::BPE(bpe) = model else {
             return Err(Declined::from("the model is not BPE"));
         };
@@ -328,7 +347,7 @@ impl MergeTable {
             // here; the character symbols' table spells a byte only for a
             // character that is no token, and declines a missing byte that
             // could be reached (`CharSymbols::from_model`).
-            byte_ids[byte] = match model.token_to_id(&spelling) {
+            byte_ids[byte] = match view.token_to_id(&spelling) {
                 Some(id) => id,
                 None => {
                     missing.get_or_insert_with(|| Box::new([false; 256]))[byte] = true;
@@ -458,7 +477,9 @@ impl MergeTable {
     /// The table pre-forms characters as a model's does (see `preformed`):
     /// the tokens are raw bytes already, and an id's least operand rank is
     /// the least rank of a split that takes it as either half.
-    pub(super) fn from_ranks(ranks: &FxHashMap<Vec<u8>, u32>) -> Result<Self, Declined> {
+    pub(super) fn from_ranks<K: Borrow<[u8]> + Eq + Hash>(
+        ranks: &FxHashMap<K, u32>,
+    ) -> Result<Self, Declined> {
         let mut byte_ids = [0u32; 256];
         for (byte, id) in byte_ids.iter_mut().enumerate() {
             *id = ranks
@@ -486,6 +507,7 @@ impl MergeTable {
         let mut root = vec![UNSET; ranks_end];
         let mut splits = Vec::with_capacity(ranks.len() * 2);
         for (token, &rank) in ranks {
+            let token: &[u8] = token.borrow();
             if token.len() < 2 {
                 continue;
             }
@@ -577,6 +599,7 @@ impl MergeTable {
         }
         let mut ids = Vec::new();
         for (token, &rank) in ranks {
+            let token: &[u8] = token.borrow();
             if token.len() < 2 {
                 continue;
             }
@@ -612,7 +635,7 @@ impl MergeTable {
         // The tokens in rank order, placed and not sorted: the analysis
         // orders them by id, one pass where they come in order. A token
         // another of its rank displaces goes after the placed ones.
-        let mut by_rank: Vec<Option<&Vec<u8>>> = vec![None; ranks_end];
+        let mut by_rank: Vec<Option<&K>> = vec![None; ranks_end];
         let mut twice = Vec::new();
         for (token, &rank) in ranks {
             if let Some(first) = by_rank[rank as usize].replace(token) {
@@ -623,9 +646,12 @@ impl MergeTable {
             .iter()
             .enumerate()
             .filter_map(|(rank, token)| token.map(|token| (rank as u32, token)));
-        let mut raws = Raws::for_tokens(ranks.len(), ranks.keys().map(Vec::len).sum());
+        let mut raws = Raws::for_tokens(
+            ranks.len(),
+            ranks.keys().map(|token| token.borrow().len()).sum(),
+        );
         for (rank, token) in placed.chain(twice) {
-            raws.push(rank, token.iter().copied().map(Some), |_| true);
+            raws.push(rank, token.borrow().iter().copied().map(Some), |_| true);
         }
         table.preformed = Box::new(Preformed::analyse(&table, raws, &min_operand));
         Ok(table)
@@ -660,6 +686,8 @@ impl MergeTable {
             merges,
             preformed: Box::new(Preformed::empty()),
             ignore_merges,
+            #[cfg(test)]
+            reads: Default::default(),
         }
     }
 
@@ -804,10 +832,33 @@ impl MergeTable {
         }
     }
 
+    /// Every merge of a table without the grid, as its operands, in rank
+    /// order: what the model's own merge map holds, read back from the
+    /// buckets for a model that is built after the load.
+    pub(super) fn pairs_by_rank(&self) -> Vec<[u32; 2]> {
+        debug_assert!(
+            self.hot.is_empty(),
+            "a table with the grid keeps pairs there"
+        );
+        let mut ranked: Vec<(u32, u64)> = self
+            .buckets
+            .iter()
+            .flat_map(|bucket| bucket.0.iter())
+            .filter(|entry| entry.key != EMPTY_KEY)
+            .map(|entry| (entry.merge.rank(), entry.key))
+            .collect();
+        ranked.sort_unstable();
+        ranked
+            .into_iter()
+            .map(|(_, key)| [(key >> 32) as u32, key as u32])
+            .collect()
+    }
+
     /// Reads one word of every line of the table, the buckets first, then
     /// the grid and the filter (the small, hot tables last, so they stay in
-    /// the nearer caches), and keeps nothing: an early encode of a thread with
-    /// the encoder calls it so that the table's lines come in as one stream
+    /// the nearer caches), and keeps nothing: the end of a load
+    /// (`NativeEncoder::rehearse`) and an early encode of a thread with
+    /// the encoder call it so that the table's lines come in as one stream
     /// then rather than one dependent probe at a time during the first-sight
     /// pieces of the texts after it. In a fresh process the table was built
     /// at load and the rest of the load pushed it out; measured on the
@@ -815,11 +866,13 @@ impl MergeTable {
     /// memory per token against 0.16 from the last-level cache, and this read
     /// takes 10-20 % off those cells (16 % by median) and 8 % by median off
     /// the 2 KB ones, nothing measurable from 32 KB up, against a parent that
-    /// has the pair filter, for 0.3-0.5 ms once per thread per encoder on a
-    /// 128-151k-merge table.
+    /// has the pair filter, for 0.3-0.5 ms at the load and at most once per
+    /// thread per encoder on a 128-151k-merge table.
     #[inline(never)]
     pub(super) fn read_through(&self) {
         const GRID_STEP: usize = 64 / size_of::<Merge>();
+        #[cfg(test)]
+        self.reads.fetch_add(1, super::Ordering::Relaxed);
         let mut sum = 0u64;
         for bucket in &self.buckets {
             sum = sum.wrapping_add(bucket.0[0].key);
@@ -1162,22 +1215,21 @@ fn push_symbol(
 /// The merge of a short piece: the live symbols as a linked list over arrays
 /// of `N` (a multiple of eight, at most [`SHORT_PIECE_SYMBOLS`]), and for
 /// each live symbol the key of the pair it starts with its right neighbour,
-/// its rank over its position ([`NO_KEY`] for no merge), so that the least
+/// its merge over its position (no merge from [`NO_MERGE`]), so that the least
 /// key names the next merge: the least rank and, among its repeats, the
 /// leftmost position (the rule of the module documentation). A merge unlinks
 /// the right symbol, writes the product, looks up the two pairs the product
 /// now forms, and takes the minimum over the other keys while those lookups
 /// are in flight (their latency is the merge's critical path otherwise); the
-/// minimum runs eight lanes wide, vector instructions without a branch per
+/// minimum of eight keys is a tree of seven minima, without a branch per
 /// key. This replaces a scan over the ranks of arrays of sixteen that moved
 /// the symbols past each merge down by one: a run of six CJK ideographs or
 /// a word of a script without word spaces took the heap path, with its two
 /// allocations.
 struct ShortMerge<const N: usize> {
     symbols: [u32; N],
-    /// The id the pair each live symbol starts produces, when it is a merge.
-    products: [u32; N],
-    keys: [i32; N],
+    /// The key of the pair each live symbol starts (see [`Self::set_pair`]).
+    keys: [u64; N],
     /// The live neighbours by position: `next` of the last symbol is `n`,
     /// `prev` of the first is 255, both past every position.
     next: [u8; N],
@@ -1194,7 +1246,6 @@ impl<const N: usize> ShortMerge<N> {
         debug_assert!(0 < n && n <= N);
         let mut merge = Self {
             symbols: [0; N],
-            products: [0; N],
             keys: [NO_KEY; N],
             next: [0; N],
             prev: [0; N],
@@ -1224,9 +1275,9 @@ impl<const N: usize> ShortMerge<N> {
     /// pair is a merge, and appends the ids to `ids`. It borrows the state:
     /// taken by value it is copied here, even with both functions inlined.
     #[inline(always)]
-    fn settle(&mut self, table: &MergeTable, mut best: i32, ids: &mut Vec<u32>) {
-        while best != NO_KEY {
-            best = self.merge_at(table, (best as u32 & SHORT_KEY_MASK) as usize);
+    fn settle(&mut self, table: &MergeTable, mut best: u64, ids: &mut Vec<u32>) {
+        while best < NO_MERGE {
+            best = self.merge_at(table, best);
         }
         let mut at = 0;
         while at < self.n {
@@ -1235,11 +1286,12 @@ impl<const N: usize> ShortMerge<N> {
         }
     }
 
-    /// Merges the pair the symbol at `at` starts, and answers the least key
-    /// after it.
+    /// Merges the pair `key` names, by its position and its product, and
+    /// answers the least key after it.
     #[inline(always)]
-    fn merge_at(&mut self, table: &MergeTable, at: usize) -> i32 {
-        self.symbols[at] = self.products[at];
+    fn merge_at(&mut self, table: &MergeTable, key: u64) -> u64 {
+        let at = (key & u64::from(SHORT_KEY_MASK)) as usize;
+        self.symbols[at] = (key >> SHORT_KEY_BITS) as u32;
         let dead = self.next[at] as usize;
         let right = self.next[dead] as usize;
         self.next[at] = right as u8;
@@ -1270,34 +1322,37 @@ impl<const N: usize> ShortMerge<N> {
         others.min(key_at).min(key_left)
     }
 
-    /// Records the pair the symbol at `at` starts as `merge` (its key and
-    /// its product; no key for [`Merge::NONE`]) and answers the key.
+    /// Records the pair the symbol at `at` starts as `merge` over `at`, a
+    /// key from [`NO_MERGE`] up for [`Merge::NONE`], and answers the key.
     #[inline(always)]
-    fn set_pair(&mut self, at: usize, merge: Merge) -> i32 {
-        let key = if merge == Merge::NONE {
-            NO_KEY
-        } else {
-            self.products[at] = merge.product();
-            (merge.rank() << SHORT_KEY_BITS | at as u32) as i32
-        };
+    fn set_pair(&mut self, at: usize, merge: Merge) -> u64 {
+        let key = merge.0 << SHORT_KEY_BITS | at as u64;
         self.keys[at] = key;
         key
     }
 
-    /// The least of the first `len` keys, eight lanes at a time (the keys
-    /// past the live pairs are [`NO_KEY`], so the lanes may run on to the
-    /// next eight).
+    /// The least of the first `len` keys, a group of eight at a time (the
+    /// slots from `len` on stay [`NO_KEY`], so a group is read whole).
+    /// The first group stands before the loop: most pieces have no second.
     #[inline(always)]
-    fn least(&self, len: usize) -> i32 {
-        let lim = (len + 7) & !7;
-        let mut lanes = [NO_KEY; 8];
-        for chunk in self.keys[..lim].as_chunks::<8>().0 {
-            for (lane, &key) in lanes.iter_mut().zip(chunk) {
-                *lane = (*lane).min(key);
+    fn least(&self, len: usize) -> u64 {
+        let (first, rest) = self.keys.as_chunks::<8>().0.split_at(1);
+        let mut best = least_of_eight(&first[0]);
+        if len > 8 {
+            for chunk in &rest[..(len - 1) / 8] {
+                best = best.min(least_of_eight(chunk));
             }
         }
-        lanes.into_iter().min().unwrap_or(NO_KEY)
+        best
     }
+}
+
+/// The least of eight keys, as a tree of minima three deep rather than a
+/// chain of seven: the next merge waits on it (see [`SHORT_KEY_BITS`]).
+#[inline(always)]
+fn least_of_eight(keys: &[u64; 8]) -> u64 {
+    let [a, b, c, d, e, f, g, h] = *keys;
+    a.min(b).min(c.min(d)).min(e.min(f).min(g.min(h)))
 }
 
 /// One symbol of a long piece's merge: its token id ([`NONE`] once merged

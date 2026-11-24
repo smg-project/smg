@@ -991,6 +991,7 @@ impl Recorded for Table {
             | Self::DeepSeekV4
             | Self::DeepSeekV4_1
             | Self::KimiK2
+            | Self::Kimi
             | Self::Lfm2_5
             | Self::MinimaxM2
             | Self::MiniCpm5

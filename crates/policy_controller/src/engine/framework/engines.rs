@@ -10,7 +10,9 @@
 //!
 //! [`Picker::unit`]: super::Picker::unit
 
-use super::{combine, run_single, trace_ordered, Buffers, Engine, Profile, Set, DRAW_BOUND};
+use super::{
+    combine, places, run_single, trace_ordered, Buffers, Engine, Profile, Set, DRAW_BOUND,
+};
 use crate::{
     engine::{
         decision::{Decision, Pick, Targets, MAX_TARGETS},
@@ -51,7 +53,9 @@ const ENGINE_TARGETS: usize = 2;
 /// Where no row is kept the draw says nothing of the pool: the decision
 /// widens to the whole pass on the stream continued, which alone sheds,
 /// names a stage and asks the all-vetoed rule. The trace keeps the
-/// request's seed, from which the whole decision replays.
+/// request's seed, from which the whole decision replays. No engine is
+/// drawn for a request its host holds to places ([`places`]): the staged
+/// pass decides it.
 ///
 /// Out of line, so a decision of any other profile keeps the engine's
 /// decision path as it was.
@@ -73,6 +77,9 @@ pub(super) fn run_engines(
     buf.reserve(candidates.len());
     let mut draw = Draw::new(facts.seed);
     let decided = match rows {
+        // A request held to places is the staged pass's, which opens its
+        // set with them: no engine is drawn, and the pass below decides.
+        _ if places::stated(cx) => None,
         Some(tests) if tests.masked(cx) => {
             let keep = |c: &Candidate| tests.keeps(facts, c, cx) && !cx.masks(c.position);
             by_engines(
@@ -115,8 +122,9 @@ pub(super) fn run_engines(
 /// of the profile about each row it reads, as a draw asks; its rows are
 /// the targets in its order, the ones the profile's run would hand out,
 /// and the trace names them best first. `None` where the scorer places
-/// nothing: the profile's run decides, on the request's seed as it stands,
-/// since the scorer reads no value of its stream.
+/// nothing, and for a request its host holds to places ([`places`]): the
+/// profile's run decides, on the request's seed as it stands, since the
+/// scorer reads no value of its stream.
 ///
 /// Out of line, as [`run_engines`] is.
 ///
@@ -131,9 +139,15 @@ pub(super) fn run_owned(
     cx: &Constraints<'_>,
     buf: &mut Buffers,
 ) -> Option<Decision> {
+    // A request held to places is the profile's run's, which opens its
+    // set with them: the scorer's walk would name rows of its own.
+    if places::stated(cx) {
+        return None;
+    }
     let at = usize::from(index);
     let (profile, rows) = (&engine.profiles[at], engine.row_tests[at]);
-    let stage = &profile.scorers.first()?.scorer;
+    let weighted = profile.scorers.first()?;
+    let stage = &weighted.scorer;
     buf.reserve(candidates.len());
     buf.kept.clear();
     let kept = &mut buf.kept;
@@ -155,15 +169,18 @@ pub(super) fn run_owned(
         return None;
     }
     // The scorer's order is the targets': each row a step under the one
-    // before it, as the scores of a ring's walk stand.
+    // before it, as the scores of a ring's walk stand, by the stage's
+    // share of the profile's weights. The whole pass folds that share
+    // into a score, and a weight's share of itself need not be one.
     let mut targets = Targets::new();
     kept.truncate(MAX_TARGETS);
     for &row in kept.iter() {
         targets.push(target_of(&candidates[row as usize]));
     }
+    let share = weighted.sole_share();
     let steps = kept.iter().enumerate().map(|(place, &row)| {
         let step = 1.0 - place as f32 / MAX_TARGETS as f32;
-        (candidates[row as usize].id, step)
+        (candidates[row as usize].id, share * step)
     });
     let trace = trace_ordered(index, facts, pool, steps);
     Some(Decision::Pick(Pick {

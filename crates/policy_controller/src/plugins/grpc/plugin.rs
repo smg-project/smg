@@ -762,6 +762,12 @@ impl PluginBinding {
         shown: Option<&[u32]>,
     ) {
         let inner = &self.plugin.inner;
+        // The round trip's frame in the decision's sample: the plugin's own
+        // under the decision's budget, whatever the decision had left at
+        // the send. A frame that others' draws starved is not read against
+        // the little it was left.
+        let seed = u32::try_from(budget.seed_micros).unwrap_or(u32::MAX);
+        let frame = u64::from(inner.frame.frame_micros(seed));
         match wait {
             Wait::Answered(arrived, decision) => {
                 budget.remaining_micros = budget
@@ -776,6 +782,7 @@ impl PluginBinding {
                     inner.unit.charge(
                         open.stamp,
                         micros(arrived.saturating_duration_since(ticket.at)).max(1),
+                        frame,
                     );
                 }
                 let read = view::read(decision, open.asked, open.count, inner.declared).and_then(
@@ -830,8 +837,7 @@ impl PluginBinding {
                 // kind asks: the plugin's own where the frame had its whole
                 // budget, or where the plugin's spend in the decision so
                 // far and this grant reach the decision's budget.
-                let seed = u32::try_from(budget.seed_micros).unwrap_or(u32::MAX);
-                let whole = given == u64::from(inner.frame.frame_micros(seed));
+                let whole = given == frame;
                 let spent = inner.unit.charged(open.stamp);
                 let own = own_bound(whole, spent, given, budget.seed_micros);
                 let miss = Miss::of(stalled, own, given);
@@ -840,7 +846,7 @@ impl PluginBinding {
                     // what it was given and used up: never the wait this
                     // thread measured, whose part past the deadline is the
                     // thread's own lateness.
-                    inner.unit.charge(open.stamp, given.max(1));
+                    inner.unit.charge(open.stamp, given.max(1), frame);
                 }
                 match miss {
                     Miss::Own => {
@@ -991,7 +997,8 @@ impl PluginBinding {
                 self.plugin.lane().forget(ticket.decision_id);
             }
             // The plugin's last close of the decision takes its sample: its
-            // round trips in it, over the decision's budget.
+            // round trips in it, over the decision's budget or over their
+            // frames where those are the lesser.
             inner.unit.leave(stamp, budget.seed_micros, || inner.now());
         }
     }
@@ -1215,7 +1222,7 @@ impl BoundPlugin for PluginBinding {
         inner.observe(|| view::membership(change));
     }
 
-    fn observe_signal(&self, signal: &Signal) {
+    fn observe_signal(&self, signal: &Signal<'_>) {
         let inner = &self.plugin.inner;
         inner.observe(|| view::signal(signal, inner.now()));
     }

@@ -336,7 +336,7 @@ impl Records {
 /// change to the table changes these numbers and the test that pins them.
 pub mod layout {
     /// One candidate row, with the five affinity facts in it. The fields of
-    /// the engine's own row take 103 bytes WITHOUT them: the two numbers
+    /// the engine's own row take 107 bytes WITHOUT them: the two numbers
     /// are near by accident, each pinned in its own file, and nothing ties
     /// one to the other.
     pub const ROW: usize = 104;
@@ -920,7 +920,7 @@ pub(crate) fn lease(l: &Lease, exposure: &Exposure) -> wit::Lease {
             Reveal::None => 0,
             Reveal::Hash | Reveal::Plain => l.session.get(),
         },
-        tokens: l.tokens,
+        tokens: l.prompt_size(),
     }
 }
 
@@ -1017,7 +1017,7 @@ pub(crate) fn membership<'a>(
 
 /// A signal; a veto's instant on the host's clock becomes the microseconds
 /// it has left at `now_micros` on that clock (`0` when none).
-pub(crate) fn signal(s: &Signal, now_micros: u64) -> wit::Signal {
+pub(crate) fn signal(s: &Signal<'_>, now_micros: u64) -> wit::Signal {
     match s {
         Signal::Load {
             worker,
@@ -1087,6 +1087,7 @@ mod tests {
             host_local: true,
             active_sessions: 24,
             key: 25,
+            engine: 27,
         }
     }
 
@@ -1475,6 +1476,15 @@ mod tests {
                 "{needs:?}"
             );
         }
+        // A request of text alone is shown its text's bytes over four:
+        // 1,024 two-byte characters are 2,048 bytes.
+        let worded = RequestFacts {
+            prompt_chars: 1_024,
+            prompt_bytes: 2_048,
+            ..RequestFacts::default()
+        };
+        let record = request(&worded, &Exposure::default(), sized, &[], &[]);
+        assert_eq!(record.prompt_tokens, 512);
     }
 
     /// The two u64 sections are written a section at a time: every hash and
@@ -1557,6 +1567,8 @@ mod tests {
             },
             seed: 9,
             block_size: 16,
+            prompt_chars: 0,
+            prompt_bytes: 0,
             now_micros: 0,
             pinned_at: 0,
             lent_in_flight: None,
@@ -1569,7 +1581,7 @@ mod tests {
             signal_cells: None,
             client_key: 0,
             ring: None,
-            ring_awaited: false,
+            ring_positions: &[],
         };
         let exposure = Exposure {
             tenant: Reveal::Plain,
@@ -1802,6 +1814,39 @@ mod tests {
             ..Lease::default()
         };
         assert_eq!(lease(&told, &Exposure::default()).target_index, 1);
+    }
+
+    /// The guest's lease record states the size its request record stated:
+    /// the count of the request's token ids, and for a request of text
+    /// alone its text's bytes over four, whatever its characters. A text
+    /// of 400 two-byte characters reads 200 in the request record and in
+    /// the lease record: a guest that books by the one and frees by the
+    /// other keeps its books.
+    #[test]
+    fn a_lease_record_states_the_size_its_request_record_stated() {
+        let size = |tokens, chars, bytes| {
+            let told = Lease {
+                tokens,
+                chars,
+                bytes,
+                ..Lease::default()
+            };
+            lease(&told, &Exposure::default()).tokens
+        };
+        let sizes = (size(7, 400, 800), size(0, 400, 800), size(0, 0, 0));
+        assert_eq!(sizes, (7, 200, 0));
+        let worded = RequestFacts {
+            prompt_chars: 400,
+            prompt_bytes: 800,
+            ..RequestFacts::default()
+        };
+        let sized = Needs {
+            prompt_size: true,
+            ..Needs::default()
+        };
+        let record = request(&worded, &Exposure::default(), sized, &[], &[]);
+        let held = size(0, worded.prompt_chars, worded.prompt_bytes);
+        assert_eq!((record.prompt_tokens, held), (200, 200));
     }
 
     /// The guest's world carries the models a worker left as the case

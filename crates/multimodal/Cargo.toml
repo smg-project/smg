@@ -59,6 +59,9 @@ futures.workspace = true
 # Workspace crates
 anyhow.workspace = true
 blake3.workspace = true
+# On every target, for the buffer pool's fallible zeroed allocation; the
+# x86-64 table below adds `must_cast` for the vector paths.
+bytemuck = { workspace = true, features = ["extern_crate_alloc"] }
 
 # The x86-64 vector paths: `multiversion` dispatches a function to its
 # feature-specific clone from safe code, and `bytemuck` moves vector words in

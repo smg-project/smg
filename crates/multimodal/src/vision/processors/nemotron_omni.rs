@@ -68,7 +68,10 @@ use crate::{
             PreprocessedEncoderInputs, VideoClipOptions, VisionPreProcessor,
             VisionPreprocessingContext,
         },
-        transforms::{resize_bicubic_torch_aa_f32, rgb_bytes, TransformError},
+        transforms::{
+            resize_bicubic_torch_aa_f32, resize_bicubic_torch_aa_f32_strips, rgb_bytes,
+            TransformError,
+        },
     },
 };
 
@@ -371,7 +374,7 @@ impl NemotronOmniProcessor {
 
     /// The checkpoint config field, as a JSON pointer, whose value differs from
     /// the geometry this port implements, if any.
-    pub fn mismatched_config_field(config: &Value) -> Option<&'static str> {
+    pub(crate) fn mismatched_config_field(config: &Value) -> Option<&'static str> {
         [
             ("/patch_size", json!(PATCH_SIZE)),
             ("/downsample_ratio", json!(0.5)),
@@ -416,7 +419,7 @@ impl NemotronOmniProcessor {
     /// `process_media` plans it at the per-image maximum; `None` for a strip so
     /// thin it rounds to no patches, which the engine fails on too, or for a
     /// tiling geometry.
-    pub fn plan_grid(&self, width: u32, height: u32) -> Option<(usize, usize)> {
+    pub(crate) fn plan_grid(&self, width: u32, height: u32) -> Option<(usize, usize)> {
         let (_, max) = self.geometry.dynamic?;
         self.plan_grid_within(width, height, max)
     }
@@ -628,16 +631,17 @@ impl NemotronOmniProcessor {
     ) -> Result<(), TransformError> {
         let p = PATCH_SIZE;
         let (out_w, out_h) = (cols * p, rows * p);
-        let resized = resize_bicubic_torch_aa_f32(raw, width, height, out_w as u32, out_h as u32)?;
         let scale = CLIP_STD.map(|s| s as f32);
         let mean = CLIP_MEAN.map(|m| m as f32);
-        let (pixels, _) = resized.as_chunks::<3>();
-        for i in 0..rows {
+        // The resize hands over one row of patches at a time, so the resized
+        // image never stands whole in memory.
+        let patch_row = move |strip: &[f32]| {
+            let (pixels, _) = strip.as_chunks::<3>();
             for j in 0..cols {
                 for c in 0..3 {
                     let (mean, scale) = (mean[c], scale[c]);
-                    for dy in 0..p {
-                        let row = &pixels[(i * p + dy) * out_w + j * p..][..p];
+                    for dy in 0..PATCH_SIZE {
+                        let row = &pixels[dy * out_w + j * PATCH_SIZE..][..PATCH_SIZE];
                         // One channel of a patch row is gathered into a fixed array,
                         // then normalized there with that channel's mean and scale:
                         // the resized image is read once, and the sixteen divisions
@@ -655,7 +659,9 @@ impl NemotronOmniProcessor {
                     }
                 }
             }
-        }
+        };
+        let (w, h) = (out_w as u32, out_h as u32);
+        resize_bicubic_torch_aa_f32_strips(raw, width, height, w, h, p, patch_row)?;
         Ok(())
     }
 

@@ -385,9 +385,10 @@ def trtllm_runs_engines_own_servicer() -> bool:
 def get_zmq_engine_count() -> int:
     """DP engines per ZMQ worker (grouped vLLM/TokenSpeed launch).
 
-    Set ``E2E_ZMQ_ENGINE_COUNT`` to run a ZMQ lane with grouped workers: the
-    worker launches that many engines on one socket set and the gateway's
-    handshake awaits them all. Unset/blank means one engine per worker.
+    Set ``E2E_ZMQ_ENGINE_COUNT`` to run a ZMQ lane over engine groups: the
+    worker launches that many engines on one socket set, and the gateway's
+    handshake awaits them all and registers one worker per engine.
+    Unset/blank means one engine per worker.
     """
     value = os.environ.get(ENV_ZMQ_ENGINE_COUNT, "").strip()
     if not value:

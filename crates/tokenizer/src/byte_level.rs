@@ -112,6 +112,7 @@ impl Piece<'_> {
 /// in a text store, so the decoder reads each as `&str` with no validation
 /// per token; the others live in a byte store. About 9 bytes per id plus the
 /// token bytes themselves.
+#[derive(Default)]
 pub(crate) struct ByteLevelTable {
     /// `spans[id]` indexes the store `kind[id]` names for token `id`.
     spans: Vec<(u32, u32)>,
@@ -429,11 +430,32 @@ impl ByteLevelTable {
     }
 }
 
-/// The ids of a [`ByteLevelTable`] by their bytes, the table being the store
-/// of every id's bytes: one array of 32-bit slots, open-addressed, a slot the
-/// id and, in the bits the ids leave free, bits of the hash of its bytes, so
-/// that a probe reads the table only where those bits agree. Six bytes an id,
-/// where a map by text holds every text a second time.
+/// A store of every id's bytes that a [`TextIndex`] is built over and asked
+/// through: a [`ByteLevelTable`], the listing of a vocabulary.
+pub(crate) trait TextStore {
+    /// How many ids the store covers (`0..ids`).
+    fn ids(&self) -> u32;
+
+    /// The bytes of `id`; `None` for an id the store lacks.
+    fn bytes_of(&self, id: u32) -> Option<&[u8]>;
+}
+
+impl TextStore for ByteLevelTable {
+    fn ids(&self) -> u32 {
+        self.kind.len() as u32
+    }
+
+    #[inline]
+    fn bytes_of(&self, id: u32) -> Option<&[u8]> {
+        self.token_bytes(id).map(|(bytes, _)| bytes)
+    }
+}
+
+/// The ids of a [`TextStore`] by their bytes, the store holding every id's
+/// bytes: one array of 32-bit slots, open-addressed, a slot the id and, in
+/// the bits the ids leave free, bits of the hash of its bytes, so that a
+/// probe reads the store only where those bits agree. Six bytes an id, where
+/// a map by text holds every text a second time.
 pub(crate) struct TextIndex {
     slots: Box<[u32]>,
     /// Bits of a slot the id takes: enough for the count of ids itself, so
@@ -445,10 +467,10 @@ pub(crate) struct TextIndex {
 impl TextIndex {
     const EMPTY: u32 = u32::MAX;
 
-    /// The index of every id `table` has bytes for; of two ids with the same
-    /// bytes the lower.
-    pub(crate) fn build(table: &ByteLevelTable) -> Self {
-        let ids = table.kind.len() as u32;
+    /// The index of every id `store` has bytes for, of two ids with the same
+    /// bytes the lower; and whether two ids had the same bytes.
+    pub(crate) fn build<S: TextStore>(store: &S) -> (Self, bool) {
+        let ids = store.ids();
         // Two thirds full: a miss walks about five slots, a hit two.
         let room = ids as usize + ids as usize / 2 + 1;
         let mut index = Self {
@@ -456,8 +478,9 @@ impl TextIndex {
             id_bits: u32::BITS - ids.leading_zeros(),
         };
         let mask = index.id_mask();
+        let mut twice = false;
         for id in 0..ids {
-            let Some((bytes, _)) = table.token_bytes(id) else {
+            let Some(bytes) = store.bytes_of(id) else {
                 continue;
             };
             let (mut at, tag) = index.place(bytes);
@@ -467,17 +490,18 @@ impl TextIndex {
                     index.slots[at] = tag | id;
                     break;
                 }
-                if slot & !mask == tag && Self::holds(table, slot & mask, bytes) {
+                if slot & !mask == tag && store.bytes_of(slot & mask) == Some(bytes) {
+                    twice = true;
                     break;
                 }
                 at = index.after(at);
             }
         }
-        index
+        (index, twice)
     }
 
-    /// The id whose bytes in `table`, the table of the build, are `bytes`.
-    pub(crate) fn get(&self, table: &ByteLevelTable, bytes: &[u8]) -> Option<TokenIdType> {
+    /// The id whose bytes in `store`, the store of the build, are `bytes`.
+    pub(crate) fn get<S: TextStore>(&self, store: &S, bytes: &[u8]) -> Option<TokenIdType> {
         let (mut at, tag) = self.place(bytes);
         let mask = self.id_mask();
         loop {
@@ -485,15 +509,11 @@ impl TextIndex {
             if slot == Self::EMPTY {
                 return None;
             }
-            if slot & !mask == tag && Self::holds(table, slot & mask, bytes) {
+            if slot & !mask == tag && store.bytes_of(slot & mask) == Some(bytes) {
                 return Some(slot & mask);
             }
             at = self.after(at);
         }
-    }
-
-    fn holds(table: &ByteLevelTable, id: TokenIdType, bytes: &[u8]) -> bool {
-        table.token_bytes(id).is_some_and(|(held, _)| held == bytes)
     }
 
     fn id_mask(&self) -> u32 {
@@ -1011,9 +1031,9 @@ pub(crate) mod tests {
                 lowest.entry(bytes).or_insert(id);
             }
             let table = builder.finish();
-            let index = TextIndex::build(&table);
+            let (index, _) = TextIndex::build(&*table);
             for (bytes, &id) in &lowest {
-                assert_eq!(index.get(&table, bytes), Some(id), "of {ids} ids");
+                assert_eq!(index.get(&*table, bytes), Some(id), "of {ids} ids");
                 let at = index
                     .slots
                     .iter()
@@ -1021,7 +1041,7 @@ pub(crate) mod tests {
                 wrapped |= at.is_some_and(|at| at < index.place(bytes).0);
             }
             for miss in [&b""[..], b"t1", &[0xFF]] {
-                assert_eq!(index.get(&table, miss), None, "of {ids} ids");
+                assert_eq!(index.get(&*table, miss), None, "of {ids} ids");
             }
         }
         assert!(wrapped, "no probe went round the end of its slots");

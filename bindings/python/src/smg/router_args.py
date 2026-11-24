@@ -46,6 +46,59 @@ PREFILL_POLICY_CHOICES = [*COMMON_POLICY_CHOICES, "bucket"]
 ENCODE_POLICY_CHOICES = ["random", "round_robin", "consistent_hashing"]
 # Worker discovery providers --discovery-provider accepts.
 DISCOVERY_PROVIDER_CHOICES = ["kubernetes", "file", "slurm", "consul"]
+# The routing options a policy document replaces: the command line's
+# DOCUMENT_REPLACES (model_gateway/src/cli/mod.rs) under this launcher's
+# names. Beside a document, one that is not at its default is refused by its
+# name.
+DOCUMENT_REPLACES = (
+    "policy",
+    "cache_threshold",
+    "balance_abs_threshold",
+    "balance_rel_threshold",
+    "balance_prefix_margin_tokens",
+    "balance_uncached_credit",
+    "bucket_adjust_interval_secs",
+    "balance_token_usage_threshold",
+    "overload_token_usage_threshold",
+    "worker_overload_protection",
+    "worker_overload_shed",
+    "overlap_decay",
+    "selection_temperature",
+    "selection_policy",
+    "selection_accounting_ttl_ms",
+    "eviction_interval_secs",
+    "max_tree_size",
+    "block_size",
+    "cache_boundaries",
+    "cache_index",
+    "cache_ttl_secs",
+    "max_idle_secs",
+    "assignment_mode",
+    "prefix_token_count",
+    "prefix_hash_load_factor",
+    "prefix_hash_balance_abs_threshold",
+    "least_load_kv_pressure_weight",
+    "least_load_default_throughput",
+    "least_load_mean_prefill_tokens",
+    "power_of_two_load_metric",
+    "routing_key_override",
+    "pd_pairing_mode",
+    "grouped_dp_sticky",
+    "dp_minimum_tokens_scheduler",
+    "worker_warmup_secs",
+    "worker_warmup_share",
+    "worker_warmup_blocks",
+    "worker_warmup_thin_ratio",
+    "worker_warmup_divert_every",
+    "prefill_policy",
+    "decode_policy",
+    "encode_policy",
+)
+
+
+def _policy_name(policy: str | None) -> str:
+    """Name the policy used without a document when the flag is unset."""
+    return "cache_aware" if policy is None else policy
 
 
 def _parse_int_csv(value: str) -> list[int]:
@@ -378,11 +431,14 @@ class RouterArgs:
     # The worker discovery provider. service_discovery=True is the legacy
     # spelling of discovery_provider="kubernetes"; set one or the other.
     discovery_provider: str | None = None
+    # Deprecated, accepted and ignored: every registration reads an engine's
+    # data-parallel size and registers one worker per rank (warned at start-up)
     dp_aware: bool = False
     # Choose a data-parallel rank per request from the ranks' reported token
     # loads: the HTTP prefill-decode router, for an engine registered as one
-    # worker. Under dp_aware the ranks are workers and the policy's pick among
-    # them is the rank choice, so this chooses nothing there (warned at start-up)
+    # worker. An engine that reports its data-parallel size registers as one
+    # worker per rank and the policy's pick among them is the rank choice, so
+    # this chooses nothing there (warned at start-up)
     dp_minimum_tokens_scheduler: bool = False
     # Seconds a Ready worker is kept in Draining before it leaves the registry,
     # on every removal (a discovery deletion, an unhealthy worker's removal, the
@@ -454,6 +510,9 @@ class RouterArgs:
     least_load_kv_pressure_weight: float = 0.15
     least_load_mean_prefill_tokens: int = 1024
     load_monitor_interval: int = 10
+    # The interval in milliseconds, 100 at the least; set, it is the interval
+    # and load_monitor_interval is not read for it
+    load_monitor_interval_ms: int | None = None
     log_dir: str | None = None
     log_json: bool = False
     log_level: str | None = None
@@ -530,6 +589,8 @@ class RouterArgs:
     otlp_traces_endpoint: str = "localhost:4317"
     overlap_decay: float = 0.0
     overload_token_usage_threshold: float = 1.0
+    # Kubernetes Pod label containing the worker's prefill/decode pairing protocol
+    pairing_protocol_label: str = "smg.ai/pairing-protocol"
     # Which parser reads a chat completion's reasoning and tool calls: Symphony ("symphony",
     # the default) for the models its registry knows, or the per-model parsers ("legacy"); a
     # request's X-SMG-Parser header overrides it
@@ -542,7 +603,9 @@ class RouterArgs:
     # How strictly a prefill is paired with a decode on their KV transfer
     # protocol: off, lenient or strict
     pd_pairing_mode: str = "lenient"
-    policy: str = "cache_aware"
+    policy: str | None = None
+    policy_controller: str = "off"
+    policy_spec: str | None = None
     postgres_db_url: str | None = None
     # The bound on one Postgres history-store call (pool wait, connect and the
     # operation included)
@@ -716,7 +779,8 @@ class RouterArgs:
     worker_warmup_thin_ratio: float = 0.5
     # Liveness: seconds without progress before a loaded worker is wedged
     worker_wedge_secs: int = 3
-    # DP engines per startup ZMQ worker (grouped worker; None/1 = ungrouped)
+    # DP engines per startup ZMQ worker, registered as one worker per engine
+    # (None = one worker, whose engines declare their count)
     zmq_engine_count: int | None = None
     # Seconds any one stage of a ZMQ engine's startup handshake may stay silent;
     # it alone covers the engine's init between its HELLO and its READY
@@ -884,6 +948,10 @@ class RouterArgs:
                 "Idle timeout in seconds for pooled upstream connections. Must"
                 " stay below the backend HTTP server's keep-alive timeout (vLLM"
                 " and SGLang default to 5). 0 keeps idle connections forever."
+                " While a nonzero value is below the load monitor interval, an"
+                " idle HTTP worker is connected anew for every load poll; where"
+                " the server's keep-alive can be raised above that interval, a"
+                " value between the two keeps the connection."
                 " Defaults to 3."
             ),
         )
@@ -946,11 +1014,32 @@ class RouterArgs:
         routing_group.add_argument(
             f"--{prefix}policy",
             type=str,
-            default=RouterArgs.policy,
+            default=None,
             choices=PREFILL_POLICY_CHOICES,
             help=(
                 "Load balancing policy to use. In PD mode, this is used for both prefill and decode"
-                " unless overridden"
+                " unless overridden. Defaults to cache_aware."
+                " A policy document replaces the routing flags, and --policy is refused beside one."
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}policy-controller",
+            choices=["on", "off"],
+            default=RouterArgs.policy_controller,
+            help=(
+                "Choose off for the classic routing policies or on for the policy controller."
+                " With on, the routing options keep their meaning through a policy document."
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}policy-spec",
+            metavar="FILE",
+            default=RouterArgs.policy_spec,
+            help=(
+                "Run a policy document with the policy controller."
+                " The document replaces the routing options: one that is not at its"
+                " default is refused beside it by name. The two overload thresholds"
+                " stand beside it: the gateway builds its workers with them."
             ),
         )
         routing_group.add_argument(
@@ -1506,7 +1595,10 @@ class RouterArgs:
         routing_group.add_argument(
             f"--{prefix}dp-aware",
             action="store_true",
-            help="Enable data parallelism aware schedule",
+            help=(
+                "Deprecated, accepted and ignored: every registration reads an engine's"
+                " data-parallel size and registers one worker per rank (warned at start-up)"
+            ),
         )
         routing_group.add_argument(
             f"--{prefix}routing-key-override",
@@ -1535,9 +1627,11 @@ class RouterArgs:
             default=RouterArgs.grouped_dp_sticky,
             help=(
                 "Whether, and how, a request that carries a routing key is pinned to one"
-                " engine of a grouped data-parallel worker (a ZMQ worker several engines"
-                " dial, as many as --zmq-engine-count says or its engines declare), so a"
-                " conversation keeps one engine's prefix cache. The key is the first valid"
+                " engine of a grouped data-parallel worker (a ZMQ worker given no engine"
+                " count, whose socket set as many engines dial as they declare), so a"
+                " conversation keeps one engine's prefix cache. A worker given"
+                " --zmq-engine-count registers as one worker per engine, where the routing"
+                " policy picks the engine and this option does nothing. The key is the first valid"
                 " --routing-key-headers header, or the body rid under --routing-key-override."
                 " hash sends a key's requests to the engine its hash picks; off leaves each"
                 " request to the least-loaded engine"
@@ -1549,9 +1643,9 @@ class RouterArgs:
             help=(
                 "Choose a data-parallel rank per request from the ranks' reported token"
                 " loads: the HTTP prefill-decode router, for an engine registered as one"
-                " worker. Under --dp-aware the engine's ranks are workers and the policy's"
-                " pick among them is the rank choice, so this flag chooses nothing there"
-                " (warned at start-up)"
+                " worker. An engine that reports its data-parallel size registers as one"
+                " worker per rank and the policy's pick among them is the rank choice, so"
+                " this flag chooses nothing there (warned at start-up)"
             ),
         )
         routing_group.add_argument(
@@ -1661,6 +1755,16 @@ class RouterArgs:
             type=int,
             default=RouterArgs.load_monitor_interval,
             help="Interval in seconds between load monitor checks for PowerOfTwo routing (default: 10)",
+        )
+        parser.add_argument(
+            f"--{prefix}load-monitor-interval-ms",
+            type=int,
+            default=RouterArgs.load_monitor_interval_ms,
+            help=(
+                "Interval in milliseconds between load monitor checks, 100 at the least."
+                " When set it is the interval, and --load-monitor-interval is not read for it"
+                " (default: unset)"
+            ),
         )
         parser.add_argument(
             f"--{prefix}disable-load-monitoring",
@@ -2026,6 +2130,16 @@ class RouterArgs:
             type=str,
             default=RouterArgs.kv_engine_id_annotation,
             help="Per-worker KV engine ID Pod annotation (default: smg.ai/kv-engine-id)",
+        )
+        k8s_group.add_argument(
+            f"--{prefix}pairing-protocol-label",
+            type=str,
+            default=RouterArgs.pairing_protocol_label,
+            help=(
+                "Pod label containing the worker's prefill/decode pairing protocol: a prefill"
+                " and a decode pair only when their protocols are equal"
+                " (default: smg.ai/pairing-protocol)"
+            ),
         )
         k8s_group.add_argument(
             f"--{prefix}encode-selector",
@@ -2458,7 +2572,10 @@ class RouterArgs:
             f"--{prefix}cb-window-duration-secs",
             type=int,
             default=RouterArgs.cb_window_duration_secs,
-            help="Sliding window duration in seconds for tracking failures",
+            help=(
+                "While the circuit is closed, a failed request more than this many seconds"
+                " after the last one starts the count anew (at least 1)"
+            ),
         )
         cb_group.add_argument(
             f"--{prefix}disable-circuit-breaker",
@@ -2718,12 +2835,12 @@ class RouterArgs:
             type=int,
             default=RouterArgs.zmq_engine_count,
             help=(
-                "DP engines per startup ZMQ worker: each ipc:// or tcp:// worker becomes "
-                "a grouped worker whose handshake awaits this many engines on one "
-                "socket set (vLLM and TokenSpeed; default: as many as the first "
-                "engine to dial declares, one for an engine that declares none). "
-                "Under --dp-aware a worker given this count registers as one worker "
-                "per engine, which share the socket set"
+                "DP engines per startup ZMQ worker: each ipc:// or tcp:// worker given "
+                "a count above one registers as one worker per engine, which share one "
+                "socket set whose handshake awaits this many engines (vLLM and "
+                "TokenSpeed; default: one worker, whose handshake awaits as many "
+                "engines as the first to dial declares, one for an engine that "
+                "declares none)"
             ),
         )
         backend_group.add_argument(
@@ -3419,6 +3536,17 @@ class RouterArgs:
             return self.discovery_provider
         return "kubernetes" if self.service_discovery else None
 
+    def options_a_document_replaces(self) -> list[str]:
+        """Name the routing options set beside a policy document.
+
+        argparse does not say whether an option was typed, so an option at
+        its default stands.
+        """
+        if self.policy_spec is None:
+            return []
+        plain = RouterArgs()
+        return [name for name in DOCUMENT_REPLACES if getattr(self, name) != getattr(plain, name)]
+
     def _validate_router_args(self):
         # Validate configuration based on mode
         if self.epd_disaggregation:
@@ -3426,20 +3554,23 @@ class RouterArgs:
                 logger.info(f"Using --encode-policy '{self.encode_policy}' for encode nodes.")
 
         if self.pd_disaggregation:
+            if self.policy is None and self.policy_spec is not None:
+                return
+            policy = _policy_name(self.policy)
             # Warn about policy usage in PD mode
-            if self.prefill_policy and self.decode_policy and self.policy:
+            if self.prefill_policy and self.decode_policy and policy:
                 logger.warning(
                     "Both --prefill-policy and --decode-policy are specified. "
                     "The main --policy flag will be ignored for PD mode."
                 )
-            elif self.prefill_policy and not self.decode_policy and self.policy:
+            elif self.prefill_policy and not self.decode_policy and policy:
                 logger.info(
                     f"Using --prefill-policy '{self.prefill_policy}' for prefill nodes "
-                    f"and --policy '{self.policy}' for decode nodes."
+                    f"and --policy '{policy}' for decode nodes."
                 )
-            elif self.decode_policy and not self.prefill_policy and self.policy:
+            elif self.decode_policy and not self.prefill_policy and policy:
                 logger.info(
-                    f"Using --policy '{self.policy}' for prefill nodes "
+                    f"Using --policy '{policy}' for prefill nodes "
                     f"and --decode-policy '{self.decode_policy}' for decode nodes."
                 )
 

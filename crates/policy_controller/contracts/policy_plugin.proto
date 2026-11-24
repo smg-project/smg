@@ -179,7 +179,9 @@ message LoadRow {
   uint32 kv_usage_permille = 4;  // u16
   // The share of the KV cache the running requests hold.
   uint32 active_kv_permille = 5;  // u16
-  uint32 live_rate = 6;  // tokens per second; 0 when unknown
+  // Tokens per second; 0 when unknown, and a known rate under one reads
+  // as 1.
+  uint32 live_rate = 6;
   // 0 when the engine holds none and when it does not count them: this
   // version does not tell the two apart.
   uint32 resident_tokens = 7;

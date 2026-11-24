@@ -682,8 +682,8 @@ pub(crate) fn restamp_plan_for_attempt(
 /// flow unchanged.
 fn sampling_defaults_for_request(workers: Option<&WorkerSelection>) -> Option<SamplingDefaults> {
     let worker = match workers? {
-        WorkerSelection::Single { worker } => worker,
-        WorkerSelection::Disaggregated { decode, .. } => decode,
+        WorkerSelection::Single { worker } => worker.worker(),
+        WorkerSelection::Disaggregated { decode, .. } => decode.worker(),
     };
     let json = worker
         .metadata()

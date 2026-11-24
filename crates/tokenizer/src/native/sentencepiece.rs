@@ -21,7 +21,7 @@
 //! time is written in the vocabulary's form for the merge alone.
 
 use rustc_hash::FxHashMap;
-use tokenizers::models::ModelWrapper;
+use tokenizers::{models::ModelWrapper, Model};
 
 use super::{
     merge::{ByteTokens, MergeTable},
@@ -29,7 +29,7 @@ use super::{
 };
 use crate::{
     encode_path::Declined,
-    word_cache::{entries_of, ReadBpe},
+    word_cache::{entries_of, ModelView, ReadBpe},
 };
 
 /// The word marker of a sentencepiece vocabulary.
@@ -102,12 +102,12 @@ impl CharSymbols {
     /// it says the ids are the range of the vocabulary (else through the
     /// vocabulary map, as without a read); `None` for a model built in
     /// memory.
-    pub(super) fn from_model(
-        model: &ModelWrapper,
+    pub(super) fn from_model<M: Model + ModelView>(
+        model: &M,
         marker: Marker,
         read: Option<&ReadBpe>,
     ) -> Result<Self, Declined> {
-        let ModelWrapper::BPE(bpe) = model else {
+        let ModelWrapper::BPE(bpe) = model.wrapper() else {
             return Err(Declined::from("the model is not BPE"));
         };
         if bpe.ignore_merges {
@@ -209,6 +209,11 @@ impl CharSymbols {
     /// Merges the table holds.
     pub(super) fn merges(&self) -> usize {
         self.merges.merges()
+    }
+
+    /// The merges' operands in rank order ([`MergeTable::pairs_by_rank`]).
+    pub(super) fn pairs_by_rank(&self) -> Vec<[u32; 2]> {
+        self.merges.pairs_by_rank()
     }
 
     /// Bytes the vocabulary has no token for (none the fallback reaches,

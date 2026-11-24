@@ -34,9 +34,6 @@ impl Scorer for ReadsTwo {
     }
 
     fn needs(&self) -> Needs {
-        Needs {
-            signal_cells: true,
-            ..Needs::default()
-        }
+        Needs::NONE.with_signal_cells()
     }
 }

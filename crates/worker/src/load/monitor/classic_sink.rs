@@ -238,8 +238,8 @@ impl<G: Generation> ClassicLoadSink<G> {
     }
 
     /// One polled member of an engine's answer: rows are merged, an answer
-    /// without a row retracts, and either that or a failed fetch clears the
-    /// overload veto, since absent means no opinion.
+    /// without a row retracts unless it counts ranks, and either that or a
+    /// failed fetch clears the overload veto, since absent means no opinion.
     fn member(&self, member: &PolledMember<'_>, polled_at: Instant, ranks: &mut PolledRanks) {
         let worker = member.worker;
         let url = worker.url();
@@ -247,19 +247,23 @@ impl<G: Generation> ClassicLoadSink<G> {
             Some(load) if !load.loads.is_empty() => {
                 self.merge(url, load, member.on_file, polled_at, ranks);
             }
-            Some(_) => {
+            Some(load) => {
                 self.apply_overload_verdict(worker, None, "poll");
                 // A successful native poll can retract a rank. A failed poll
                 // leaves the last-known DP cache alone; an explicit omission
                 // of a rank that pushed nothing since the tick began must not
                 // keep that rank selectable or be published as an idle load.
-                self.retract(
-                    url,
-                    worker.dp_rank(),
-                    member.on_file,
-                    polled_at,
-                    &mut ranks.leaving,
-                );
+                // An answer that counts ranks and lists none is short by its
+                // own count, as in `merge`: it retracts no rank from the file.
+                if load.dp_rank_count <= 0 {
+                    self.retract(
+                        url,
+                        worker.dp_rank(),
+                        member.on_file,
+                        polled_at,
+                        &mut ranks.leaving,
+                    );
+                }
                 if let Some(rank) = worker.dp_rank() {
                     self.worker_load_manager.remove_rank(url, rank);
                 } else {
@@ -354,6 +358,10 @@ impl<G: Generation> LoadSink for ClassicLoadSink<G> {
 
     fn needs_loads(&self) -> bool {
         self.load_consumer.needs_loads()
+    }
+
+    fn polls(&self, worker: &dyn Worker) -> bool {
+        self.load_consumer.polls(worker)
     }
 
     fn tick(&self, tick: &GroupTick<'_>) {

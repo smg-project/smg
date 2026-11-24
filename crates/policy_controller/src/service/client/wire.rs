@@ -24,8 +24,7 @@ use crate::{
             released::{Reason, What},
         },
     },
-    store::Said,
-    tracking::lease::{self, Lease, LeaseId, LeaseKind, Side},
+    tracking::lease::{self, Lease, LeaseId, LeaseKind, Said, Side},
 };
 
 /// A request as the wire carries it, and the block hashes left out of the
@@ -47,7 +46,10 @@ pub(crate) fn request(request: &Request<'_>) -> (proto::DecideRequest, usize) {
             priority: facts.priority,
             streaming: facts.streaming,
             max_output_tokens: facts.max_output_tokens,
-            prompt_tokens: facts.prompt_tokens,
+            // A frame states one count: a request of text alone states
+            // its text's bytes over four, the number a frame stated before
+            // a request told its sizes apart.
+            prompt_tokens: facts.prompt_size(),
             block_hashes: facts.block_hashes[..held].to_vec(),
             hash_kind: match facts.hash_kind {
                 HashKind::Token => proto::HashKind::Token,
@@ -186,12 +188,12 @@ fn targets(told: &[proto::Target]) -> Result<Targets, Unread> {
             .pair
             .map(|pair| {
                 Ok(Pair {
-                    decode_position: 0,
                     decode_id: WorkerId(pair.decode_id),
                     decode_dp_rank: narrow(
                         pair.decode_dp_rank,
                         "pick.targets.pair.decode_dp_rank",
                     )?,
+                    ..Pair::default()
                 })
             })
             .transpose()?;
@@ -373,26 +375,37 @@ mod tests {
                 Targets, Trace,
             },
             decision_engine::Request,
-            store_backed_engine, view,
+            view,
             view::{
                 Constraints, HashKind, Header, Identity, MediaCounts, Phase, RequestFacts, WorkerId,
             },
         },
         service::{
             client::MAX_HASHES,
-            controller::wire::{Beside, Checked, Decided, Leased, Lists, Viewed},
+            controller::wire::{tests::made, Beside, Checked, Decided, Leased, Lists},
             proto::{
                 self, decide_answer::Answer, decision::Outcome, gateway_frame::Frame,
                 identity::Form,
             },
         },
-        store::Said,
         tracking::{
             lease,
-            lease::{Lease, LeaseId, ReleaseReason, Side, TransportClass},
+            lease::{Lease, LeaseId, ReleaseReason, Said, Side, TransportClass},
         },
     };
 
+    /// What a controller has left of a request's budget where it makes the
+    /// request of a frame.
+    const LEFT: Duration = Duration::from_micros(1_500);
+
+    /// Every field a host states of a request crosses the wire, and the
+    /// controller makes its request of the frame. Four things of that
+    /// request are the controller's own. Its budget is what the controller
+    /// has left. It says no wire: the wires the host states are read on
+    /// the frame, where it is checked. Its block hashes are cut at the
+    /// depth the deciding document reads, and of a subset hint it states
+    /// a 0 alone. The case's three hashes and its hint of 0 are inside
+    /// both, and the frame is read for each as it crossed.
     #[test]
     fn the_controller_reads_every_request_field_as_the_host_stated_it() {
         let mut asked = Request {
@@ -494,21 +507,13 @@ mod tests {
             assert_eq!(checked.budget().as_micros(), u128::from(want.budget_micros));
             assert!(!checked.has_text());
             assert!(!checked.again());
-            let view = Viewed {
-                now_micros: 88,
-                budget_micros: 1_500,
-                affinity: &[],
-                stalled: &[],
-                held: &[],
-                in_flight: None,
-                max_block_hashes: want.block_hashes.len(),
-                pins: None,
-                signal_cells: None,
-            };
-            checked.read(
+            assert_eq!(checked.wires(), Some(asked.constraints.wire_modes));
+            assert_eq!(checked.block_hashes(), want.block_hashes);
+            assert_eq!(checked.subset(), asked.constraints.subset_hint);
+            made(
+                &checked,
                 &mut Lists::default(),
-                view,
-                store_backed_engine::unnamed,
+                LEFT,
                 |facts, constraints| {
                     assert_eq!(facts.model, want.model);
                     assert_eq!(facts.namespace_seed, want.namespace_seed);
@@ -523,13 +528,14 @@ mod tests {
                     assert_eq!(facts.phase, want.phase);
                     assert_eq!(facts.attempt, want.attempt);
                     assert_eq!(facts.tried, want.tried);
-                    assert_eq!(facts.budget_micros, view.budget_micros);
+                    assert_eq!(u128::from(facts.budget_micros), LEFT.as_micros());
                     assert_eq!(facts.headers, want.headers);
                     assert_eq!(facts.media, want.media);
                     assert_eq!(facts.seed, want.seed);
                     assert_eq!(facts.block_size, want.block_size);
+                    assert_eq!(facts.client_key, want.client_key);
                     assert_eq!(constraints.excluded, asked.constraints.excluded);
-                    assert_eq!(constraints.wire_modes, asked.constraints.wire_modes);
+                    assert_eq!(constraints.wire_modes, crate::engine::WireModes::NONE);
                     assert_eq!(
                         constraints.overload_lifted,
                         asked.constraints.overload_lifted
@@ -538,6 +544,37 @@ mod tests {
                 },
             );
         }
+    }
+
+    /// A frame states one count. A request of text alone states its text's
+    /// length and no count of tokens: it is sent as its bytes over four,
+    /// the count a frame stated before a request told its sizes apart. A
+    /// text of two-byte characters is sent by its bytes, and so is a text
+    /// whose characters nothing counted. A stated count of tokens is sent
+    /// as stated, whatever length stands beside it.
+    #[test]
+    fn a_frame_states_the_length_of_a_request_of_text_as_its_count() {
+        let sent = |prompt_tokens, (prompt_chars, prompt_bytes): (u32, u32)| {
+            let asked = Request {
+                id: b"a request",
+                facts: RequestFacts {
+                    model: "model-a",
+                    prompt_tokens,
+                    prompt_chars,
+                    prompt_bytes,
+                    ..RequestFacts::default()
+                },
+                constraints: Constraints::default(),
+            };
+            let facts = request(&asked).0.facts.expect("the frame's facts");
+            facts.prompt_tokens
+        };
+        // 52 one-byte characters, 26 two-byte characters, a text of 52
+        // bytes under a document that counts no characters, a count of
+        // tokens beside a text, and nothing.
+        let texts = [sent(0, (52, 52)), sent(0, (26, 52)), sent(0, (0, 52))];
+        assert_eq!(texts, [13, 13, 13]);
+        assert_eq!((sent(13, (400, 400)), sent(0, (0, 0))), (13, 0));
     }
 
     /// A list longer than a frame holds is copied no further than a frame's
@@ -581,26 +618,10 @@ mod tests {
         assert!(!want.tenant.is_none() && !want.session_key.is_none());
         let (sent, _) = request(&asked);
         let checked = Checked::new(sent).expect("the controller reads the request");
-        let view = Viewed {
-            now_micros: 88,
-            budget_micros: 1_500,
-            affinity: &[],
-            stalled: &[],
-            held: &[],
-            in_flight: None,
-            max_block_hashes: 0,
-            pins: None,
-            signal_cells: None,
-        };
-        checked.read(
-            &mut Lists::default(),
-            view,
-            store_backed_engine::unnamed,
-            |facts, _| {
-                assert_eq!(facts.tenant.hash, want.tenant.hash);
-                assert_eq!(facts.session().get(), want.session().get());
-            },
-        );
+        made(&checked, &mut Lists::default(), LEFT, |facts, _| {
+            assert_eq!(facts.tenant.hash, want.tenant.hash);
+            assert_eq!(facts.session().get(), want.session().get());
+        });
     }
 
     fn trace(survivors: Survivors) -> Trace {
@@ -988,7 +1009,7 @@ mod tests {
             (Side::Encode, proto::Side::Encode),
         ] {
             let dispatch = Said::Dispatched(
-                crate::store::Dispatch {
+                lease::Dispatch {
                     target_index: 2,
                     side,
                     since_decision_micros: 250,

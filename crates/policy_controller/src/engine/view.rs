@@ -7,12 +7,34 @@
 //! into the spec's declared lists (zones, engine kinds, connectors, labels,
 //! headers) are the same positions here.
 
-use crate::{load::signals, policies::consistent_hashing::PoolRing, tracking::in_flight};
+use std::sync::atomic::AtomicU64;
 
-/// The stable identity of a candidate: a hash of the registration key and the
-/// incarnation, never a URL. A same-URL replacement is a new id.
+use super::demands::DemandFacts;
+use crate::{load::signals, policies::consistent_hashing::LentRing, tracking::in_flight};
+
+/// The identity of a candidate, as its host states it. A controller's
+/// membership states a hash of the registration key and the incarnation
+/// ([`identity`](crate::store::identity)): a same-URL replacement is a new
+/// id. A gateway's worker list states the fingerprint of the worker's
+/// address ([`WorkerId::from_address`]), one id for a worker and the one
+/// that replaces it there, unless its program states ids of its own
+/// ([`FixedFacts::id`]). A hash ring a caller lends finds a worker's row
+/// by the address's fingerprint alone.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct WorkerId(pub u64);
+
+impl WorkerId {
+    /// The id a gateway's worker list states for the worker registered at
+    /// `address`: the address's fingerprint, the same for every worker
+    /// object registered there. A hash ring a caller lends names its
+    /// workers by address ([`LentRing`]), and a decision finds a named
+    /// worker's row by this: the ring serves rows whose ids are stated
+    /// this way.
+    #[must_use]
+    pub fn from_address(address: &str) -> Self {
+        Self(fingerprint(address.as_bytes()))
+    }
+}
 
 /// A worker's role in the fleet.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -85,19 +107,39 @@ pub enum HashKind {
 
 /// Bytes of a request's text a token, for a host with no tokenizer. A text
 /// window is this many times the model's block size in bytes, and a text's
-/// size in tokens is its bytes over this.
+/// size in tokens is its bytes over this (`tokens_or_text`).
 pub const TEXT_BYTES_PER_TOKEN: u32 = 4;
+
+/// A request's size in tokens for a reader that prices a request of text
+/// by its length: `tokens`, the count of its token ids, and where it states
+/// none its text's `length` in bytes at [`TEXT_BYTES_PER_TOKEN`] a token.
+/// The one statement of the rule: a request's facts read it
+/// ([`RequestFacts::prompt_size`]), and so does a held decision's record,
+/// by the bytes its lease keeps
+/// ([`Lease::prompt_size`](crate::tracking::lease::Lease::prompt_size)).
+pub(crate) const fn tokens_or_text(tokens: u32, length: u32) -> u32 {
+    if tokens == 0 {
+        length / TEXT_BYTES_PER_TOKEN
+    } else {
+        tokens
+    }
+}
+
+/// The first `tokens` tokens of a request hashed in `kind`, in the unit its
+/// blocks are sized in: tokens, and under the text kind their bytes.
+pub(crate) fn units_within(tokens: u32, kind: HashKind) -> u32 {
+    match kind {
+        HashKind::Token => tokens,
+        HashKind::Text => tokens.saturating_mul(TEXT_BYTES_PER_TOKEN),
+    }
+}
 
 /// How many whole blocks of `block_size` lie within the first `tokens`
 /// tokens of a request hashed in `kind`: the tokens over the block size,
 /// under the text kind their bytes over the window's size in bytes. A
 /// block size is one at least.
 pub(crate) fn blocks_within(tokens: u32, kind: HashKind, block_size: u32) -> u32 {
-    let units = match kind {
-        HashKind::Token => tokens,
-        HashKind::Text => tokens.saturating_mul(TEXT_BYTES_PER_TOKEN),
-    };
-    units / block_size
+    units_within(tokens, kind) / block_size
 }
 
 /// Where a candidate's load row came from.
@@ -196,11 +238,8 @@ pub struct Health {
     /// breaker bit too. A host writes it into a row it copies for the
     /// decision. Over a publication's own rows the asking host's vetoes
     /// stand beside the rows instead, and a reader of this bit asks both
-    /// ([`Constraints::masks`]). A store's own rows carry the bit for one
-    /// doubt, the leader's own, whoever asks
-    /// ([`HealthSink::leader_bits`](crate::store::HealthSink::leader_bits)).
-    /// The all-vetoed rule lifts it as its last resort, on a row whose
-    /// breaker bit is clear.
+    /// ([`Constraints::masks`]). The all-vetoed rule lifts it as its last
+    /// resort, on a row whose breaker bit is clear.
     pub stalled: bool,
     /// Being drained; nothing new goes there.
     pub draining: bool,
@@ -230,8 +269,8 @@ impl Health {
 }
 
 /// A ratio as a permille field: the one rounding a report's ratio and a
-/// spec's usage threshold both take, so one rank's usage at or above a
-/// threshold in the document's unit is never read as under it. A mean of
+/// usage threshold both take, so one rank's usage at or above a threshold
+/// stated as a ratio is never read as under it. A mean of
 /// several ranks' rounded usages within a permille of the threshold can
 /// read on either side of it.
 pub fn permille(ratio: f64) -> u16 {
@@ -250,6 +289,9 @@ pub(crate) fn threshold_permille(usage: f64) -> u16 {
 /// One load row as the view carries it: the engine load record's routing
 /// core, in the record's own names, rounded to narrow fields by the host.
 /// Permille fields are the record's ratios times 1000.
+///
+/// The record gains fields: code outside this crate that builds one writes the
+/// rest as `..LoadRow::default()`, and a pattern of it ends with `..`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LoadRow {
     /// Requests running on the engine.
@@ -263,7 +305,8 @@ pub struct LoadRow {
     pub kv_usage_permille: u16,
     /// The share of the KV cache the running requests hold, in permille.
     pub active_kv_permille: u16,
-    /// Tokens per second the worker drains; `0` when unknown.
+    /// Tokens per second the worker drains; `0` when unknown, and a known
+    /// rate under one reads as `1`.
     pub live_rate: u32,
     /// Context tokens resident for the running requests; `0` too when the
     /// engine does not count them.
@@ -407,6 +450,28 @@ impl Session {
         self.0
     }
 
+    /// The bytes [`Self::text`] writes: a `u64` in sixteen hexadecimal
+    /// digits.
+    pub const TEXT_LEN: usize = 16;
+
+    /// The session's number as text, written into `buffer`: sixteen
+    /// lower-case hexadecimal digits, the highest first. A worker object
+    /// counts a key's requests under a text, and where held decisions on
+    /// file count a session's requests there, this is that text
+    /// ([`HostCount::session_booked`](crate::tracking::HostCount::session_booked)).
+    /// It is the one writer of it: what moves a held decision's count onto
+    /// a worker object and what reads a record's count both call it, so
+    /// the two name one entry. Nothing is allocated: the buffer is the
+    /// caller's, on its stack.
+    pub fn text(self, buffer: &mut [u8; Self::TEXT_LEN]) -> &str {
+        for (at, digit) in buffer.iter_mut().enumerate() {
+            let nibble = (self.0 >> (60 - 4 * at)) & 0xf;
+            *digit = b"0123456789abcdef"[nibble as usize];
+        }
+        // Sixteen ASCII digits: the conversion cannot fail.
+        std::str::from_utf8(buffer).unwrap_or_default()
+    }
+
     /// A session from the scoped value a lease carries on the wire.
     #[cfg(any(test, feature = "client"))]
     pub(crate) const fn from_raw(value: u64) -> Self {
@@ -422,6 +487,9 @@ impl Session {
 /// held by a worker just admitted, which is what every candidate reads as
 /// when the column is empty. On a wire the five are fields of the
 /// candidate's own record, at the numbers they were given.
+///
+/// The record gains fields: code outside this crate that builds one writes the
+/// rest as `..AffinityFacts::default()`, and a pattern of it ends with `..`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AffinityFacts {
     /// Prefix blocks of the request this worker holds, by the event index.
@@ -645,6 +713,18 @@ impl Feed<'_> {
         }
     }
 
+    /// Row `index`'s entry behind a decision: a row past a column holds
+    /// nothing, as a row no host named. Only what is stated of a pick reads
+    /// this way: it orders nothing, and the decision may have read no entry
+    /// of that row. A pass reads [`Self::entry`].
+    #[inline]
+    pub(crate) fn entry_or_default(self, index: u32) -> AffinityFacts {
+        match self {
+            Self::Column(column) => column.get(index as usize).copied().unwrap_or_default(),
+            Self::Named(named) => named.entry(index),
+        }
+    }
+
     /// Row `index`'s entry as one pass reads it: by the pass's own `reads`
     /// where the pool is read whole, and by a search behind a draw
     /// (`DRAWN`), where the rows stand in the draw's order and a pass
@@ -694,7 +774,7 @@ impl Reads<'_> {
 }
 
 /// One candidate row: a worker, or one DP rank of a data-parallel worker:
-/// what every decision reads. Its fields take 103 bytes, and the row is
+/// what every decision reads. Its fields take 107 bytes, and the row is
 /// aligned to a 64-byte cache line: 128 bytes in memory, every row on a
 /// line's start.
 ///
@@ -708,6 +788,9 @@ impl Reads<'_> {
 /// The wire form drops the position and the sample instant, carries the
 /// candidate's [`AffinityFacts`] in the same record and encodes to about 76
 /// bytes with its load row.
+///
+/// The record gains fields: code outside this crate that builds one writes the
+/// rest as `..Candidate::default()`, and a pattern of it ends with `..`.
 #[derive(Clone, Copy, Debug, Default)]
 #[repr(align(64))]
 pub struct Candidate {
@@ -724,6 +807,11 @@ pub struct Candidate {
     /// ([`RequestFacts::in_flight`]): the row's place in the host's pool,
     /// whatever its index.
     pub position: u32,
+    /// The worker's id ([`WorkerId`]). Each rank of a data-parallel engine
+    /// is a row of its own with an id of its own: a rank's worker object
+    /// stands at an address of its own, and its id is that address's
+    /// fingerprint. The rows of one engine are joined by
+    /// [`Self::engine`], and never by this id.
     pub id: WorkerId,
     pub role: Role,
     pub dp_rank: u16,
@@ -741,13 +829,21 @@ pub struct Candidate {
     /// that lends its counts beside the rows
     /// ([`RequestFacts::lent_in_flight`]) leaves this zero, so a reader
     /// asks [`RequestFacts::in_flight`].
+    ///
+    /// The in-process front reads it off the worker object at every
+    /// decision: the object's own counter, which a host raises where it
+    /// makes the worker's load guard and lowers where the guard is
+    /// dropped. A guard can be made ahead of its send. The decode of a
+    /// pair named at the first decision is so counted on its row before
+    /// it is sent, and the classic policies count it the same way.
     pub in_flight: u32,
     /// The latest load row, when the host has a report for the worker.
     pub load: Option<LoadRow>,
     /// The sample instant of `load` on the host's clock, in microseconds since
     /// the host's origin: dispatches made at or before it are the engine's by
-    /// now and leave a load scorer's credit. In-process only; the wire carries
-    /// the row's age.
+    /// now and leave a load scorer's credit, or those made a profile's
+    /// `sent_report_delay_ms` before it where the profile sets one.
+    /// In-process only; the wire carries the row's age.
     pub load_sampled_at_micros: u64,
     /// The session key of the request is pinned to this worker. A host
     /// writes it into a row it copies for the decision. Over a publication's
@@ -786,7 +882,9 @@ pub struct Candidate {
     pub labels: u64,
     /// Encode-side compatibility for an encode-prefill-decode dispatch.
     pub ec_compatible: bool,
-    /// The worker takes images.
+    /// The worker takes pixel media: an image or a video
+    /// ([`MediaCounts::holds_pixels`]). The crate's docs say of such a
+    /// worker that it takes images.
     pub vision: bool,
     /// Reachable from one gateway only (a host-local wire).
     pub host_local: bool,
@@ -806,6 +904,105 @@ pub struct Candidate {
     /// Zero when the host carries none. After the contract's first cut (the
     /// wire numbers its fields in the record's order).
     pub key: u32,
+    /// The place of the row's engine among the engines of its list, in the
+    /// order each engine's first row stands in the list: the rows that
+    /// state one place are the ranks of one data-parallel engine, and a
+    /// worker that stands alone states a place no other row states. Where
+    /// the list lists its engines ([`Engines`]) it is the place
+    /// [`Engines::rows`] takes. The number holds within one generation of
+    /// one list and is no id beyond it.
+    ///
+    /// The engine in a gateway's own process writes it, once a list, where
+    /// it finds the list's engines. The engine over the policy store and a
+    /// default record leave `0` on every row, which would read as one
+    /// engine: a stage reads the field under the engine in a gateway's own
+    /// process alone, until that engine is the one engine. In-process
+    /// only: no wire form carries it. After the contract's first cut (the
+    /// wire numbers its fields in the record's order).
+    pub engine: u32,
+}
+
+impl Candidate {
+    /// A record of a worker that can be sent to, for a caller that makes
+    /// records by hand: its status is ready and no other health bit is set,
+    /// both admission bits are open, and it is an engine of its own
+    /// ([`Self::engine`] is its position). Every other field is the
+    /// default's, and a caller writes what its stage reads over it:
+    /// `Candidate { in_flight: 3, ..Candidate::ready(0, id, Role::Single) }`.
+    ///
+    /// An engine states its place among the engines of its list, so the
+    /// position is that place only while every record before it is an
+    /// engine of its own. A caller that makes several records the ranks of
+    /// one engine writes the engine of each record behind them too.
+    ///
+    /// A default record is no such record. It is not ready and both of its
+    /// admission bits are closed, so the health and admission filters drop
+    /// it, and every default record states engine `0`.
+    #[must_use]
+    pub fn ready(position: u32, id: WorkerId, role: Role) -> Self {
+        Self {
+            position,
+            id,
+            role,
+            health: Health {
+                healthy: true,
+                ..Health::default()
+            },
+            has_capacity: true,
+            has_room: true,
+            engine: position,
+            ..Self::default()
+        }
+    }
+}
+
+/// What a program says of a worker for the half of its record that no
+/// request changes, where the worker object holds no such fact: whether
+/// the worker takes images, the id the program knows the worker by where
+/// it keeps ids of its own, and what the worker states for a request's
+/// hard demands. A host that keeps such a fact beside its workers tells it
+/// to what writes the workers' records, once a list: a gateway of its own
+/// registrations, a controller of the stored worker an object stands for.
+/// The default says nothing. Further facts add their fields, so a host
+/// starts from the default and sets what it knows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct FixedFacts {
+    /// Whether the worker takes pixel media, an image or a video
+    /// ([`Candidate::vision`]).
+    pub vision: bool,
+    /// The id the program knows the worker by ([`Candidate::id`]): a
+    /// controller's id of the stored worker an object stands for. A
+    /// decision's targets name the worker by it, and so does every state
+    /// the engine writes from a decision. `None` for the fingerprint of
+    /// the worker's address, which a gateway's own process names a worker
+    /// by. A program states an id for every worker of its lists or for
+    /// none: one id space a program. A stated id is never `WorkerId(0)`:
+    /// zero reads as absent wherever an id travels (a lease, a trace, a
+    /// session's pins), so a zero stated here states none. A program that
+    /// states ids lends no hash ring ([`RequestFacts::ring`]): a lent ring
+    /// finds a worker's row by the fingerprint of its address, so it would
+    /// find none and every key would go by its position alone.
+    pub id: Option<WorkerId>,
+    /// What the worker states for a request's hard demands: its entry of
+    /// the column beside the records. Whether the worker registered a
+    /// rank ([`DemandFacts::ranked`]) is not said here: the worker's
+    /// object holds it, and the records read it there.
+    pub demands: DemandFacts,
+}
+
+impl FixedFacts {
+    /// The id the engine knows the worker by: the one stated
+    /// ([`Self::id`]), or `address`, the fingerprint of the worker's
+    /// address, where none is stated or the one stated is zero. A list's
+    /// records are written by it, so no record carries zero for an id.
+    #[must_use]
+    pub fn id_or(&self, address: WorkerId) -> WorkerId {
+        match self.id {
+            Some(id) if id != WorkerId(0) => id,
+            _ => address,
+        }
+    }
 }
 
 /// How far back the store's decision clock starts.
@@ -851,6 +1048,15 @@ impl MediaCounts {
         video: 0,
         bytes: 0,
     };
+
+    /// Whether the request holds pixels: an image or a video. Only a
+    /// worker with a vision encoder takes such media, so a test of vision
+    /// by these counts reads this, never the image count alone. A host
+    /// states each count as it is.
+    #[must_use]
+    pub const fn holds_pixels(&self) -> bool {
+        (self.images | self.video) != 0
+    }
 }
 
 /// An allow-listed header: its name as a position into the spec's declared
@@ -920,8 +1126,57 @@ pub struct KeyedRow {
     pub in_flight: u16,
 }
 
+/// Where a worker's object counts the requests of a request's session
+/// key: the name the count stands under there. A request's maker states it
+/// ([`RequestMaker::session_counted_under`](super::decision_engine::RequestMaker::session_counted_under)),
+/// and the reader of a record's count asks under that name.
+///
+/// One worker object stands in one process, which counts by its own guards
+/// or by the decisions it holds on file and never by both, so the two
+/// names do not meet on one object.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SessionCountedUnder {
+    /// The key's own text: the caller's own guard counts each request on
+    /// the worker it sends it to, for as long as the request runs. What a
+    /// process that serves its requests itself does.
+    #[default]
+    KeyText,
+    /// The session's number written as text ([`Session::text`]): the
+    /// decisions held on file count them, one a lease that books the
+    /// worker
+    /// ([`HostCount::session_booked`](crate::tracking::HostCount::session_booked)).
+    /// What a controller does, which serves no request. Its frame carries
+    /// the key in the clear or hashed: the lease carries the number alone.
+    SessionNumber,
+}
+
+impl SessionCountedUnder {
+    /// The name the count of `facts`' session key stands under on a
+    /// worker's object: the key's text as the request carries it, or the
+    /// session's number as [`Session::text`] writes it into `buffer`.
+    /// `None` for a request with no such name: no key in the clear under
+    /// the first, no key at all under the second. The one place that turns
+    /// the statement into the name.
+    pub fn name<'a: 'b, 'b>(
+        self,
+        facts: &RequestFacts<'a>,
+        buffer: &'b mut [u8; Session::TEXT_LEN],
+    ) -> Option<&'b str> {
+        match self {
+            Self::KeyText => facts.session_key.plain,
+            Self::SessionNumber => {
+                let session = facts.session();
+                (!session.is_none()).then(|| session.text(buffer))
+            }
+        }
+    }
+}
+
 /// One request as a decision sees it. Borrowed from the host for the
 /// duration of the decision.
+///
+/// The record gains fields: code outside this crate that builds one writes the
+/// rest as `..RequestFacts::default()`, and a pattern of it ends with `..`.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RequestFacts<'a> {
     /// The resolved model id, after aliasing.
@@ -934,7 +1189,12 @@ pub struct RequestFacts<'a> {
     pub priority: i32,
     pub streaming: bool,
     pub max_output_tokens: u32,
-    /// The host's token count or estimate. A stage that reads it declares
+    /// The count of the request's token ids, or the count its host states,
+    /// and zero where the request gives no ids: a request of text alone
+    /// states its text's length ([`Self::prompt_bytes`],
+    /// [`Self::prompt_chars`]) and no count, so
+    /// a stage that prices a request of no stated size prices it by its
+    /// own rule. A stage that reads the size declares
     /// [`Needs::prompt_size`](crate::document::Needs::prompt_size): a host
     /// that sends a request on without reading its prompt states zero
     /// where no stage does. Nothing masks the field for a stage of a
@@ -966,7 +1226,11 @@ pub struct RequestFacts<'a> {
     pub headers: &'a [Header<'a>],
     pub media: MediaCounts,
     /// The per-decision seed, recorded in the trace: the only randomness a
-    /// stage gets.
+    /// stage gets. The seed's own stream is the one the profile's picker
+    /// reads. A filter or a scorer its host registers is to draw from the
+    /// stream of its own name
+    /// ([`Draw::for_stage`](crate::Draw::for_stage)), whose values are not
+    /// the picker's.
     pub seed: u64,
     /// The size of one of the request's blocks as the host counted them.
     /// Under the token kind it is in tokens: an index's learned block size
@@ -976,6 +1240,25 @@ pub struct RequestFacts<'a> {
     /// that carries hashes and states none. Last on the wire (the
     /// numbering follows the record's order).
     pub block_size: u32,
+    /// The length of the request's text in characters, where the request
+    /// gives text and no token ids and a stage of the document reads a
+    /// request's size ([`Needs::prompt_size`](crate::document::Needs::prompt_size));
+    /// `0` otherwise. Its reader at a decision is a stage that sizes a
+    /// request of text by its characters, as `bucket` does, and a lease
+    /// keeps it ([`Lease::chars`](crate::tracking::lease::Lease::chars)).
+    /// Counting it is one pass over the text, made once a request.
+    /// In-process only: a frame states a count.
+    pub prompt_chars: u32,
+    /// The length of the request's text in bytes, where the request gives
+    /// text and no token ids; `0` otherwise. It is written wherever the
+    /// text is at hand and costs no pass. [`Self::prompt_size`] makes a
+    /// count of it, which every reader that prices a request of text by
+    /// its length takes: the room rule, a plugin's view of a request, the
+    /// prefix stages, whose windows of text are bytes, and a frame. A
+    /// lease keeps it ([`Lease::bytes`](crate::tracking::lease::Lease::bytes)),
+    /// so a held decision reads the same count.
+    /// In-process only: a frame states a count.
+    pub prompt_bytes: u32,
     /// The host's clock at the decision, in microseconds since its origin.
     /// In-process only; no absolute instant crosses the wire.
     pub now_micros: u64,
@@ -1017,7 +1300,9 @@ pub struct RequestFacts<'a> {
     /// rule's in-flight cap reads the count either way. A key kept on its
     /// worker over the overload veto is kept under a capped rule only
     /// where this is set: with no count the cap could not hand the key on,
-    /// so the veto stands for it as for any request. In-process only.
+    /// so the veto stands for it as for any request. Where the count
+    /// stands on a worker's object is the request's maker's to say
+    /// ([`SessionCountedUnder`]). In-process only.
     pub session_counted: bool,
     /// The candidates' affinity facts, by index in the candidate slice the
     /// decision is made over: the one column the affinity stages read, in
@@ -1055,7 +1340,10 @@ pub struct RequestFacts<'a> {
     /// The signal cells beside the rows of this decision, by the row's
     /// position: handed by a host for a profile whose stages read a signal
     /// ([`Needs::signal_cells`](crate::document::Needs::signal_cells)), and for no
-    /// other. `None` reads as no value for every row. A pair decision takes
+    /// other. The engine over worker lists takes none from its host: it
+    /// makes a list's cells from the load snapshot its decision holds, and
+    /// cells a caller put here are not read by a single request's decision.
+    /// `None` reads as no value for every row. A pair decision takes
     /// each side's cells from its pool ([`PairPools`](crate::engine::PairPools)),
     /// and an encode pair its encoders' from theirs: cells here are not
     /// read there. One word for every signal the document declares: a
@@ -1069,25 +1357,41 @@ pub struct RequestFacts<'a> {
     /// The wire's request facts carry it to a controller, and a plugin's
     /// frame keeps `0` under every exposure.
     pub client_key: u64,
-    /// The hash ring of the list the candidates are, where the host keeps
-    /// one a list ([`PoolRing`]): a stage that places by a ring reads this
-    /// one, with no lock, and its own ring learns nothing of the decision.
-    /// `None` where the host keeps none: such a stage then places by its
-    /// own ring, which learns its members from the candidates. A host
-    /// lends the ring of the list it hands as the candidates and never the
-    /// ring of another list: a ring of another length than the candidates
-    /// is its caller's error, which a debug build stops at and any other
-    /// build passes over, placing by the stage's own ring. A pair takes
-    /// none: each side is a list of its own. In-process only.
-    pub ring: Option<&'a PoolRing>,
-    /// The host keeps a ring for the candidates' list and that ring is not
-    /// built yet, so [`Self::ring`] is `None`. Such a host builds a list's
-    /// ring off the path of a request, and a request that comes first
-    /// neither builds it nor waits for it. A stage that places by a ring
-    /// places such a request as one that carries no key, by its profile's
-    /// draw, and neither reads its own ring nor teaches it. In-process
-    /// only.
-    pub ring_awaited: bool,
+    /// The hash ring the request's caller keeps of the model's workers,
+    /// lent to this decision ([`LentRing`]): the ring stage places the
+    /// request where this ring's walk reaches, and its own ring learns
+    /// nothing of the decision. The rows of such a decision carry the ids
+    /// of their workers' addresses ([`WorkerId::from_address`]): a program
+    /// that states ids of its own lends none ([`FixedFacts::id`]). A caller
+    /// that keeps rings lends one with every such request, an empty one
+    /// for a model whose ring it has not built: a key its walk hands to no
+    /// kept worker goes to the kept worker at the key's position modulo
+    /// their count, and under the prefix form to the worker the stages
+    /// behind the ring take. `None` from a caller that keeps no ring, as a
+    /// controller: the stage places by its own. Both sides of a pair take
+    /// the one ring, each over its own list: a side takes a worker of the
+    /// ring only where its list keeps that worker, and a key no kept
+    /// worker of the side takes goes by the same rule over that side's
+    /// kept workers. An encode request's items take none: the place stated
+    /// is the request's routing value's, and an item is placed by its own
+    /// key on the stage's ring. In-process only.
+    pub ring: Option<&'a dyn LentRing>,
+    /// Where the request stands on the lent ring, as its caller states it:
+    /// the position of the value it is placed by ([`LentRing::position`]).
+    /// A routing value gives one entry. Empty where the request states
+    /// nothing to place by, and the lent ring is then not asked. A caller
+    /// states a key's position with every ring it lends, an empty ring
+    /// too. The list stands as long as the request does: a caller that
+    /// finds a position while it makes the request, with the request's
+    /// keys ([`KeySources::derive_keys`](crate::document::KeySources::derive_keys)),
+    /// keeps it beside the request. A prompt gives one entry for each of
+    /// its heads the caller's ring places it by, the deepest first: a stage
+    /// under a bounded-load rule tries the entries in that order, and any
+    /// other reads the first. The one call states them by the profile's
+    /// word: a routing value's own entry under the plain ring, and under
+    /// the prefix form what the lender answers for each head
+    /// ([`LentRing::head_position`]). In-process only: no frame carries it.
+    pub ring_positions: &'a [u64],
 }
 
 /// The multiplier that spreads a session's model and phase over its key.
@@ -1131,6 +1435,18 @@ pub const fn key_of_session(session: u64, model: u64, phase: Phase) -> u64 {
 }
 
 impl<'a> RequestFacts<'a> {
+    /// The request's size in tokens for a reader that prices a request of
+    /// text by its length (`tokens_or_text`): the count of its token ids
+    /// ([`Self::prompt_tokens`]), and where it states none its text's
+    /// bytes at [`TEXT_BYTES_PER_TOKEN`] a token ([`Self::prompt_bytes`]).
+    /// Zero where it states neither. A window of text is bytes, so a
+    /// prefix stage divides one unit by the same unit.
+    #[inline]
+    #[must_use]
+    pub const fn prompt_size(&self) -> u32 {
+        tokens_or_text(self.prompt_tokens, self.prompt_bytes)
+    }
+
     /// The rows the host named, where they answer: beside an empty column.
     /// The column is asked first, so a host that fills one pays nothing for
     /// the rows it does not name.
@@ -1149,6 +1465,33 @@ impl<'a> RequestFacts<'a> {
         match self.named_alone() {
             Some(named) => Feed::Named(named),
             None => Feed::Column(self.affinity),
+        }
+    }
+
+    /// The request's size in blocks: its token count over the block size
+    /// (the text kind's bytes over the window's size in bytes), never under
+    /// one and never under the block hashes the host sent. The host caps
+    /// that list, so a long request's hashes alone would understate it and
+    /// overstate every holder's share. The block size is the request's
+    /// ([`Self::block_size_or`]), and the count is the request's size
+    /// ([`Self::prompt_size`]): a request of text states its length and no
+    /// count of tokens. The prefix stage's gates and the overlap a pick
+    /// states both count here.
+    pub(crate) fn blocks(&self, view_block: u32) -> u32 {
+        let block = self.block_size_or(view_block);
+        let from_tokens = blocks_within(self.prompt_size(), self.hash_kind, block).max(1);
+        let from_hashes = u32::try_from(self.block_hashes.len()).unwrap_or(u32::MAX);
+        from_tokens.max(from_hashes)
+    }
+
+    /// The size of one of the request's blocks: the request's own where its
+    /// host counted with one (an index's learned size), else `view_block`,
+    /// the view's.
+    pub(crate) fn block_size_or(&self, view_block: u32) -> u32 {
+        if self.block_size > 0 {
+            self.block_size
+        } else {
+            view_block
         }
     }
 
@@ -1256,21 +1599,12 @@ impl<'a> RequestFacts<'a> {
     }
 }
 
-/// A table of session pins that outlives an engine's own (design 5.1, the
-/// sessions row), lent by the deciding host among a decision's
-/// [`Constraints`]. A sessions rule asks it once a decision, for a key its
-/// engine's table holds no pin of: the table goes with its generation, the
-/// pins of record do not.
-pub trait PinSource: std::fmt::Debug + Sync {
-    /// The worker `key` is pinned to, where that pin has not ended by the
-    /// host's record and was last used less than `ttl_micros` ago (`None`:
-    /// a pin of any age). The host answers by its own clock.
-    fn pinned(&self, key: Session, ttl_micros: Option<u64>) -> Option<WorkerId>;
-}
-
 /// What only the deciding host knows now: its standing vetoes, the wires it
 /// speaks and the request-level lifts around the profile. The admission bits
 /// of a prefill window and a decode room ride the candidate rows.
+///
+/// The record gains fields: code outside this crate that builds one writes the
+/// rest as `..Constraints::default()`, and a pattern of it ends with `..`.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Constraints<'a> {
     /// Candidates this host just failed to reach.
@@ -1298,9 +1632,12 @@ pub struct Constraints<'a> {
     /// ([`Demands`](crate::engine::Demands)). A door keeps the demands before any
     /// stage runs, where it keeps its gateway's wires, and no stage reads
     /// them: an engine handed rows by a host of its own is handed rows
-    /// that meet them. A pair's sides keep none yet: a door sheds a
-    /// pair's request that states a demand, under the stage `wires`,
-    /// whatever its sides state. In-process only: this protocol version
+    /// that meet them. Over a pair's two worker lists each side is held
+    /// to the workers that meet them as its role is held to them
+    /// ([`Demands::held_by`](crate::engine::Demands::held_by)). An encode
+    /// request's three lists keep none yet: such a request that states a
+    /// demand is shed under the stage `wires`, whatever its lists state.
+    /// In-process only: this protocol version
     /// states no demand, and a handle refuses a request that states one
     /// before it sends it over a link (`DecisionGuard::asked`).
     pub demands: crate::engine::Demands,
@@ -1309,6 +1646,13 @@ pub struct Constraints<'a> {
     /// publication's own rows hands them here, and a reader of a row's
     /// stalled bit asks both ([`Constraints::masks`]). Empty where the rows
     /// were written for the decision. In-process only.
+    ///
+    /// They are positions of the one list a set is opened over, as
+    /// [`Self::places`] are. A pair's host states each side's beside its
+    /// two lists, with the rows a hold stands on. A pair's request that
+    /// states either of its own, and an encode request's, is declined by
+    /// the engine over worker lists, by name, as one that states places
+    /// of its own is.
     pub stalled: &'a [u32],
     /// The rows of [`Self::stalled`] a hold of this host stands on, in
     /// order, each once: a veto no rule lifts, as an open breaker's is. The
@@ -1317,12 +1661,6 @@ pub struct Constraints<'a> {
     /// there a held row carries the breaker bit beside the stalled one.
     /// In-process only.
     pub held: &'a [u32],
-    /// The pins of record, where the host keeps a table that outlives the
-    /// engine's ([`PinSource`]): a sessions rule asks it for a key its own
-    /// table holds no pin of, and no other stage reads it. `None` where
-    /// the engine's table is the only one, as in a host that embeds the
-    /// engine. In-process only.
-    pub pins: Option<&'a dyn PinSource>,
     /// The places of the pool's list the request may take, ascending, each
     /// once, where its host holds it to a part of the pool: the workers a
     /// retry may still take, the worker a request names, the workers that
@@ -1331,12 +1669,13 @@ pub struct Constraints<'a> {
     /// The request's own fact and no veto of a worker: no stage reads it,
     /// and a profile that lists no filter is held to it like any other. A
     /// decision's staged pass opens its set with these places and hands no
-    /// target outside them. A pass that draws from the pool and a keyed
-    /// request's reads by place do not ask them yet: until they do, the
-    /// engine over worker lists declines a request that states places,
-    /// by name. They are places of the one list a single request is
-    /// decided over, and one set of places cannot hold a pair's two
-    /// lists: a pair that states any is declined the same way, and the
+    /// target outside them. A pass that draws from the pool leaves such a
+    /// request to it, and so does a keyed request's read of a row by its
+    /// place. They are places of the one list a set is opened over: a
+    /// single request's, or one side's of a pair, whose entry takes one
+    /// set of constraints a side. A pair's host states each side's places
+    /// beside its two lists. A pair's request that states places of its
+    /// own is declined by the engine over worker lists, by name, and the
     /// served controller states none.
     ///
     /// A request held to places whose every worker it already tried is
@@ -1435,6 +1774,9 @@ impl<'a> Engines<'a> {
 }
 
 /// Pool-wide facts beside the candidates.
+///
+/// The record gains fields: code outside this crate that builds one writes the
+/// rest as `..PoolFacts::default()`, and a pattern of it ends with `..`.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PoolFacts<'a> {
     /// Pool size before any narrowing.
@@ -1480,6 +1822,16 @@ pub struct PoolFacts<'a> {
     /// candidates are then the rows the list's positions name. Empty by
     /// default, and every decision then reads rows alone.
     pub engines: Engines<'a>,
+    /// The pool's own word, where the host keeps one beside the list of
+    /// workers the candidates are and lends it to the decision: the word a
+    /// pick over that list alone counts its turns in
+    /// ([`PoolWord::word`](crate::engine::PoolWord::word)). A picker that
+    /// takes turns counts a draw's turn in it too, and looks no rotation up
+    /// by the pool's name. That pick and that draw over one list then turn
+    /// one rotation, and two lists turn two, whatever else they share. `None`:
+    /// such a picker finds its rotation by the pool's name, with
+    /// [`Self::reach`] in it. In-process only.
+    pub word: Option<&'a AtomicU64>,
 }
 
 #[cfg(test)]
@@ -1546,19 +1898,61 @@ mod tests {
         assert_eq!(size_of::<AffinityFacts>(), 20);
     }
 
+    /// A record made ready is one the health and admission filters keep
+    /// and an engine of its own, and every field it does not write is the
+    /// default's. A default record is dropped by three of those filters.
+    #[test]
+    fn a_ready_record_can_be_sent_to_and_is_an_engine_of_its_own() {
+        use crate::{
+            engine::framework::Filter,
+            stages::{HasCapacity, HasRoom, Healthy, NotOverloaded},
+        };
+
+        let made = Candidate::ready(3, WorkerId(9), Role::Decode);
+        assert_eq!(
+            (made.position, made.id, made.role, made.engine),
+            (3, WorkerId(9), Role::Decode, 3)
+        );
+        let (facts, cx) = (RequestFacts::default(), Constraints::default());
+        let stock: [&dyn Filter; 4] = [&Healthy, &NotOverloaded, &HasCapacity, &HasRoom];
+        let dropped = |record: &Candidate| {
+            let refuses = stock
+                .iter()
+                .filter(|stage| !stage.keep(&facts, record, &cx));
+            refuses.map(|stage| stage.name()).collect::<Vec<_>>()
+        };
+        assert!(dropped(&made).is_empty(), "{:?}", dropped(&made));
+        let unset = Candidate::default();
+        assert_eq!(dropped(&unset), ["healthy", "has-capacity", "has-room"]);
+
+        let rest = Candidate {
+            position: 0,
+            id: WorkerId::default(),
+            role: Role::default(),
+            health: Health::default(),
+            has_capacity: false,
+            has_room: false,
+            engine: 0,
+            ..made
+        };
+        assert_eq!(format!("{rest:?}"), format!("{unset:?}"));
+    }
+
     /// A request's facts are copied where a decision narrows or resumes
     /// them, so their size is a cost of those decisions: the pin is exact.
-    /// The signal cells are one word, for every signal, the client's key
-    /// is one word more and the lent ring another: a field the facts gain
-    /// moves this number and carries the decision bench's cells that copy
-    /// the facts (`benches/decision.rs`).
+    /// The signal cells are one word, for every signal, and the client's
+    /// key is one word more. The ring a caller lends is two words, and
+    /// where the request stands on it two more. A text's two lengths are
+    /// one word: its characters fill what was spare, and its bytes take
+    /// the word. A field the facts gain moves this number and carries the
+    /// decision bench's cells that copy the facts (`benches/decision.rs`).
     #[test]
     fn a_requests_facts_take_the_pinned_bytes() {
-        assert_eq!(size_of::<RequestFacts<'_>>(), 304);
+        assert_eq!(size_of::<RequestFacts<'_>>(), 336);
     }
 
     #[test]
-    fn a_candidate_rows_fields_take_103_bytes() {
+    fn a_candidate_rows_fields_take_107_bytes() {
         // The row is written once per candidate per decision, so what its
         // fields take is a cost every policy pays. The alignment leaves
         // spare bytes, so the row's size no longer says it, and a field
@@ -1602,8 +1996,46 @@ mod tests {
             host_local,
             active_sessions,
             key,
+            engine,
         );
-        assert_eq!(ends.into_iter().max(), Some(103));
+        assert_eq!(ends.into_iter().max(), Some(107));
+    }
+
+    /// A request's size in blocks is its tokens over its block size: the size
+    /// its host counted with where the request states one, the view's where
+    /// it states none. It is never under one, and never under the block
+    /// hashes the host sent. A request of text states its length and no
+    /// count of tokens: its windows are bytes.
+    #[test]
+    fn a_requests_blocks_are_its_tokens_over_its_block_size_and_never_under_its_hashes() {
+        let hashes = [1u64, 2, 3];
+        let sized = |prompt_tokens: u32, block_size: u32, hashed: usize| RequestFacts {
+            prompt_tokens,
+            block_size,
+            block_hashes: &hashes[..hashed],
+            ..RequestFacts::default()
+        };
+        // 100 tokens at the view's 16 are six whole blocks.
+        assert_eq!(sized(100, 0, 0).blocks(16), 6);
+        assert_eq!(sized(100, 0, 0).block_size_or(16), 16);
+        // At the size its host counted with, the view's is not read.
+        assert_eq!(sized(100, 32, 0).blocks(16), 3);
+        assert_eq!(sized(100, 32, 0).block_size_or(16), 32);
+        // Under one block, and with no token counted: one block.
+        assert_eq!(sized(5, 0, 0).blocks(16), 1);
+        assert_eq!(sized(0, 0, 0).blocks(16), 1);
+        // Never under the hashes the host sent, and over them by its tokens.
+        assert_eq!(sized(20, 0, 3).blocks(16), 3);
+        assert_eq!(sized(100, 0, 3).blocks(16), 6);
+        // A text of 200 two-byte characters is 400 bytes: six windows of 64.
+        // Read by its characters it would be three.
+        let text = RequestFacts {
+            hash_kind: HashKind::Text,
+            prompt_chars: 200,
+            prompt_bytes: 400,
+            ..sized(0, 64, 0)
+        };
+        assert_eq!(text.blocks(16), 6);
     }
 
     #[test]
@@ -1928,6 +2360,53 @@ mod tests {
             ..plain
         };
         assert!(keyless.session().is_none());
+    }
+
+    /// A session key's count stands on a worker's object under one of two
+    /// names. Under the key's text the name is the text the request
+    /// carries, and a key carried as its fingerprint alone has none. Under
+    /// the session's number it is the number's sixteen digits: one name for
+    /// the key in either form, another for another model. A request with
+    /// no key has no name under either.
+    #[test]
+    fn a_sessions_count_is_named_by_where_it_stands() {
+        let plain = RequestFacts {
+            model: "model-a",
+            session_key: Identity::plain("conversation-7"),
+            ..RequestFacts::default()
+        };
+        let hashed = RequestFacts {
+            session_key: Identity::hashed(plain.session_key.hash),
+            ..plain
+        };
+        let named = |under: SessionCountedUnder, facts: &RequestFacts<'_>| {
+            let mut buffer = [0; Session::TEXT_LEN];
+            under.name(facts, &mut buffer).map(str::to_owned)
+        };
+        let text = SessionCountedUnder::KeyText;
+        let number = SessionCountedUnder::SessionNumber;
+        assert_eq!(SessionCountedUnder::default(), text);
+        assert_eq!(named(text, &plain).as_deref(), Some("conversation-7"));
+        assert_eq!(named(text, &hashed), None);
+        let digits = format!("{:016x}", plain.session().get());
+        assert_eq!(named(number, &plain).as_deref(), Some(digits.as_str()));
+        assert_eq!(named(number, &hashed).as_deref(), Some(digits.as_str()));
+        let other = RequestFacts {
+            model: "model-b",
+            ..plain
+        };
+        assert_ne!(named(number, &other), Some(digits));
+        let keyless = RequestFacts::default();
+        assert_eq!(named(text, &keyless), None);
+        assert_eq!(named(number, &keyless), None);
+        // The number's text: every digit, the highest first.
+        let text_of = |value| {
+            let mut buffer = [0; Session::TEXT_LEN];
+            Session::from_raw(value).text(&mut buffer).to_owned()
+        };
+        assert_eq!(text_of(0x1f), "000000000000001f");
+        assert_eq!(text_of(u64::MAX), "ffffffffffffffff");
+        assert_eq!(text_of(0x0123_4567_89ab_cdef), "0123456789abcdef");
     }
 
     /// A carried fingerprint is the host's word that it is the name's. A

@@ -4,7 +4,7 @@
 //! ([`Engine::decide`]). A host that keeps its workers where it always kept
 //! them pays for each row it writes, and a keyed request asks about few of
 //! them: its key's pin is one row, and a ring's walk is the key's owner and
-//! the members behind it. Here such a request is decided over rows its host
+//! the workers behind it. Here such a request is decided over rows its host
 //! reads when the decision asks for one ([`PoolRows`]), and no other row is
 //! read.
 //!
@@ -16,7 +16,7 @@
 //! is refused here and none is shed.
 
 use super::{
-    shadow_index, slot, trace_ordered, vetoed, Engine, Entry, Filter, Marks, Plan, Profile,
+    places, shadow_index, slot, trace_ordered, vetoed, Engine, Entry, Filter, Marks, Plan, Profile,
 };
 use crate::{
     engine::{
@@ -24,7 +24,6 @@ use crate::{
         sticky_sessions::{SessionRule, SessionVerdict},
         view::{Candidate, Constraints, PoolFacts, RequestFacts, WorkerId},
     },
-    policies::consistent_hashing::PoolRing,
     stages::{filters::NotOverloaded, pickers::target_of},
 };
 
@@ -34,10 +33,7 @@ use crate::{
 /// A row read here is the row a whole decision of the same instant is handed
 /// at that place: its fixed fields, its health and its counts as they stand,
 /// and `position` its place.
-///
-/// `'p` is how long the pool's list stands: the ring it lends
-/// ([`Self::ring`]) is borrowed that long, whatever holds the rows' reader.
-pub trait PoolRows<'p> {
+pub trait PoolRows {
     /// How many rows the pool holds.
     fn len(&self) -> usize;
 
@@ -59,25 +55,6 @@ pub trait PoolRows<'p> {
     /// The generation of the document the rows are read under: the trace's
     /// ([`Trace::generation`]).
     fn generation(&self) -> u64;
-
-    /// The hash ring of the pool's list, where the host keeps one a list:
-    /// asked for a request whose binding places by a ring, and for no
-    /// other. It is the ring of this pool's rows and of no other list
-    /// ([`RequestFacts::ring`]). `None` where the host keeps none, and the
-    /// ring stage then places by its own ring, over every row; `None` too
-    /// where the host keeps one a list and this list's is not built yet
-    /// ([`Self::keeps_a_ring`]).
-    fn ring(&self) -> Option<&'p PoolRing>;
-
-    /// Whether the host keeps a ring for each of its lists, built off the
-    /// path of a request. Under such a host a list whose ring is not built
-    /// yet hands none ([`Self::ring`]), and a request that reads a ring
-    /// there is placed as one that carries no key
-    /// ([`RequestFacts::ring_awaited`]): no decision builds a ring, and
-    /// none waits for one.
-    fn keeps_a_ring(&self) -> bool {
-        false
-    }
 }
 
 impl Engine {
@@ -90,48 +67,63 @@ impl Engine {
     /// - **A session's pin.** Under a binding's sessions rule, a request
     ///   whose key holds a pin goes to the pin's worker: the first of the
     ///   key's pins whose row every filter of the profile keeps, where that
-    ///   row is under the rule's cap. One row is read for a pin.
+    ///   row is under the rule's cap. One row is read for a pin, whatever
+    ///   the profile's scorers are: the whole decision takes a standing
+    ///   pin behind its filters and asks no scorer.
     /// - **A ring's walk.** Under a profile whose one scorer places a keyed
     ///   request by itself ([`Scorer::own_by_place`]), the request goes to
-    ///   its key's owner and the members behind it, over the ring of the
-    ///   pool's list. Where the binding steers and the request carries a
-    ///   session key, the walk reads the overload veto as lifted, as the
-    ///   whole decision does for a kept key.
+    ///   the workers its key reaches on the ring its caller lent
+    ///   ([`RequestFacts::ring`]), the owner first. A key the whole
+    ///   decision keeps on its worker over the overload veto is walked
+    ///   with that veto read as lifted: the binding steers, the request
+    ///   carries a session key and the profile is of the one shape that
+    ///   keeps a key.
     ///
-    /// A request of the single plan whose profile reads a ring, or whose
-    /// shadow's does, is lent the pool's ([`PoolRows::ring`]) where its
-    /// facts carry none: it is written into `facts`
-    /// ([`RequestFacts::ring`]) and stands there for the whole decision
-    /// and the shadow that follow a `None`, which then read that ring too.
+    /// A session key under a sessions rule is the rule's alone: with no pin
+    /// that stands it is left to the whole decision, which may claim it,
+    /// and no ring is walked for it.
     ///
     /// `None` wherever the whole decision would answer from more than these
     /// rows, and the host then asks it ([`Self::decide`]): a key with no pin
-    /// that stands, a pin at its cap, a walk that met too many refused
-    /// rows, a kept key whose every row read is over its thresholds (the
-    /// whole decision says whether the veto left the pool nobody), a
-    /// binding with a shadow, a profile that opens a scope or draws, a
-    /// profile whose filters cannot be asked of one row alone
-    /// ([`Filter::row_wise`]) or whose scorer states what its pick holds
-    /// of the request ([`Self::decide_stated`]), a request that carries an
-    /// affinity column, and every plan but the single one.
+    /// that stands, a pin at its cap, a request that is lent no ring or
+    /// states no place on it, a walk whose scorer says its rule ran out
+    /// (the stock ring's does with a row of the pool not asked, once eight
+    /// rows were refused or its ring ended short of four kept), a kept key
+    /// whose every row read is over its thresholds (the whole decision
+    /// says whether the veto left the pool nobody), a binding with a shadow,
+    /// a profile that opens a scope or draws, a profile whose filters
+    /// cannot be asked of one row alone ([`Filter::row_wise`]), a request
+    /// that carries an affinity column, a request its host holds to places
+    /// of the pool ([`Constraints::places`]), and every plan but the single
+    /// one.
+    ///
+    /// A row is read here by its place, a pin's and a walk's alike,
+    /// whatever places the request may take. The whole decision opens its
+    /// set with those places, so a request held to any is its to answer.
+    ///
+    /// A pick made here states no holding, as [`Self::decide`]'s states
+    /// none. A host that feeds a scorer the request's holders, and keeps
+    /// for each pick the worker a prompt was sent to, does both around the
+    /// whole decision. For a pin followed here it asks no scorer, and what
+    /// it keeps is by the rule's own word of a request it places
+    /// (`rule_placed`): nothing where the rule keeps the request from the
+    /// profile, as a gateway's own sticky map keeps a pinned request from
+    /// its policy, and where the request is the profile's own, what it
+    /// keeps behind the whole decision's pick.
     ///
     /// The session table is read as the whole decision reads it: a pin
     /// followed renews its key's idle time, and a request not decided here
     /// writes nothing.
     ///
     /// [`Scorer::own_by_place`]: super::Scorer::own_by_place
-    pub fn decide_keyed<'a, R: PoolRows<'a>>(
+    pub fn decide_keyed<R: PoolRows>(
         &self,
-        facts: &mut RequestFacts<'a>,
+        facts: &RequestFacts<'_>,
         rows: &R,
         cx: &Constraints<'_>,
     ) -> Option<Decision> {
-        // No binding of the phase pins a key or reads a ring: one test.
+        // No binding of the phase pins a key or walks a ring: one test.
         if !self.keyed[slot(facts.phase)] {
-            return None;
-        }
-        // A column of another length is refused by the whole decision.
-        if !facts.affinity.is_empty() {
             return None;
         }
         let (entry, index, profile) = self.resolve(facts.model, facts.phase)?;
@@ -143,30 +135,25 @@ impl Engine {
         if binding.plan != Plan::Single {
             return None;
         }
-        // The ring a stage of the binding reads, its profile's or its
-        // shadow's: the pool's own, from here on and for the decisions
-        // that follow.
-        let shadow = shadow_index(binding, facts.phase);
-        let reads_ring = |profile: u16| {
-            let needs = self.profile_needs.get(usize::from(profile));
-            needs.is_some_and(|needs| needs.ring)
-        };
-        if facts.ring.is_none() && (reads_ring(index) || shadow.is_some_and(reads_ring)) {
-            facts.ring = rows.ring();
-            // A host that keeps a ring a list and hands none has not built
-            // this list's yet: the ring stage draws, here and in the whole
-            // decision that follows.
-            facts.ring_awaited = facts.ring.is_none() && rows.keeps_a_ring();
-        }
-        let at = usize::from(index);
-        let marks = self.marks[at];
-        // A shadow reads the rows its live decision was handed, a stage's
-        // scope is opened over them, and a scorer that states what its
-        // pick holds reads them for it: the whole decision's, each one.
-        if shadow.is_some() || marks.scoped() || self.stating[at].is_some() {
+        // A column of another length is refused by the whole decision. It
+        // is asked behind the binding: beside the first test the two fold
+        // into one branch, and every request then reads its column's length.
+        if !facts.affinity.is_empty() {
             return None;
         }
-        let facts = &*facts;
+        let shadow = shadow_index(binding, facts.phase);
+        let at = usize::from(index);
+        let marks = self.marks[at];
+        // A shadow reads the rows its live decision was handed, and a
+        // stage's scope is opened over them: the whole decision's, each.
+        if shadow.is_some() || marks.scoped() {
+            return None;
+        }
+        // A request held to places is the whole decision's, which opens
+        // its set with them: no row is read by its place here.
+        if places::stated(cx) {
+            return None;
+        }
         if let Some(rule) = &binding.sessions {
             if !facts.session_key.is_none() {
                 return self.follow_pin(index, rule, facts, rows, cx);
@@ -175,9 +162,11 @@ impl Engine {
         // No rule governs the key. A picker that leaves the placement to
         // its rule's assignment places over every row, and so does a
         // profile whose scorer places nothing by itself. A profile that
-        // draws is the draw's, over rows or over engines.
+        // draws is the draw's, over rows or over engines. A request that is
+        // lent no ring, or states no place on it, is placed over every row.
         let draws = marks.first() & (Marks::DRAWS_FIRST | Marks::JOINED | Marks::ENGINES) != 0;
-        if marks.by_assignment() || !marks.owns() || draws || facts.ring_key() == 0 {
+        let unplaced = facts.ring.is_none() || facts.ring_positions.is_empty();
+        if marks.by_assignment() || !marks.owns() || draws || unplaced {
             return None;
         }
         // The kept key's form: its walk reads the overload veto as lifted.
@@ -198,7 +187,7 @@ impl Engine {
     /// whole decision makes it too: behind filters that kept a row. Pins
     /// that moved between the two reads are the whole decision's to read
     /// again.
-    fn follow_pin<'p, R: PoolRows<'p>>(
+    fn follow_pin<R: PoolRows>(
         &self,
         index: u16,
         rule: &SessionRule,
@@ -224,6 +213,13 @@ impl Engine {
         }
         let mut targets = Targets::new();
         targets.push(target_of(&pinned));
+        // The rule's pin placed the request, as in the whole decision, and
+        // the pick carries the rule's word of it on both paths. The engine
+        // over worker lists reads that word behind this entry's answer as
+        // behind the whole decision's: by it a followed pin is told to the
+        // stages or kept from them, and its prompt handed to the record or
+        // not, the same on both.
+        targets.by_rule(rule.rule_placed);
         Some(Decision::Pick(Pick {
             targets,
             trace: trace(index, facts, rows.generation(), [(pinned.id, 1.0)]),
@@ -232,10 +228,13 @@ impl Engine {
     }
 
     /// A keyed request of a profile whose one scorer places it by itself:
-    /// the scorer's walk over the rows it names by place, every filter of
-    /// the profile asked about each row read, and the rows kept handed out
-    /// in the walk's order, each a step under the one before it, as the
-    /// whole decision's scores of a ring's walk stand.
+    /// the scorer's walk over the workers it names, each found in the pool
+    /// by its id, every filter of the profile asked about each row read,
+    /// and the rows kept handed out in the walk's order. The trace scores
+    /// each a step under the one before it, by the scorer's share of the
+    /// profile's weights: the whole decision's scores of the stock ring's
+    /// walk, to the bit. How many rows are read is the scorer's rule: the
+    /// stock ring's walk reads eleven at most.
     ///
     /// `kept` is the form of a key kept on its worker over the overload
     /// veto ([`Engine::keep`]): the filters read that veto as lifted. The
@@ -243,7 +242,7 @@ impl Engine {
     /// it knows by a pass over every row. A row handed out here that stands
     /// under the veto as it is says the pool was not emptied, and the pick
     /// carries no mark. Where none does, the whole decision answers.
-    fn walk_ring<'p, R: PoolRows<'p>>(
+    fn walk_ring<R: PoolRows>(
         &self,
         index: u16,
         profile: &Profile,
@@ -252,7 +251,12 @@ impl Engine {
         cx: &Constraints<'_>,
         kept: bool,
     ) -> Option<Decision> {
-        let stage = &profile.scorers.first()?.scorer;
+        let weighted = profile.scorers.first()?;
+        let stage = &weighted.scorer;
+        // The stage's share of the profile's weights, as the whole pass
+        // folds it into a score: a weight's share of itself need not be
+        // one.
+        let share = weighted.sole_share();
         let lifted = Constraints {
             overload_lifted: true,
             ..*cx
@@ -270,14 +274,15 @@ impl Engine {
                 return false;
             }
             if let Some(step) = steps.get_mut(targets.len()) {
-                *step = (row.id, 1.0 - targets.len() as f32 / MAX_TARGETS as f32);
+                let rank = targets.len() as f32 / MAX_TARGETS as f32;
+                *step = (row.id, share * (1.0 - rank));
             }
             stands |= NotOverloaded.keep(facts, &row, cx);
             targets.push(target_of(&row));
             true
         };
-        let mut places = [0; MAX_TARGETS];
-        let handed = stage.own_by_place(facts, rows.len(), &mut keep, &mut places);
+        let place_of = |id| rows.place_of(id);
+        let handed = stage.own_by_place(facts, rows.len(), &place_of, &mut keep);
         if handed == 0 || handed != targets.len() || (kept && !stands) {
             return None;
         }

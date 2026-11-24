@@ -3,21 +3,18 @@
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        collections::HashSet,
-        future::Future,
-        sync::Arc,
-        time::{Duration, Instant},
-    };
+    use std::{collections::HashSet, future::Future, sync::Arc, time::Duration};
 
     use kv_index::compute_content_hash;
     use mock_worker::{config::Config as MockConfig, engine::EngineParams, grpc};
     use smg_grpc_client::{
+        engine_port::GrpcConnector,
         tokenspeed_proto::{GenerateRequest, SamplingParams, TokenizedInput},
         TokenSpeedSchedulerClient as SchedulerClient,
     };
     use smg_worker::{
-        kv_events::SubscriptionKind, load::monitor::WorkerMonitor, test_support::LoadReaders,
+        kv_events::SubscriptionKind, load::monitor::WorkerMonitor, registry::WorkerRegistry,
+        test_support::LoadReaders,
     };
     use tokio::{
         net::TcpListener,
@@ -29,19 +26,17 @@ mod tests {
 
     use crate::{
         document::{AppliedSpec, PolicySpec},
-        engine::view::{Role, WireModes, WorkerId as RowId},
+        engine::view::{WireModes, WorkerId as RowId},
         service::controller::{
             config::tests::valid,
             worker_objects::{ObjectsWake, WorkerObjects},
             Controller,
         },
         store::{
-            AffinityQuery, AffinityRowsBuffers, GatewayId, KvEventSink as _, MemoryStore,
-            Registrant, Signals, ViewBuffers, ViewQuery, WorkerFacts, WorkerStatus, WorkersStore,
+            KvEventSink as _, MemoryStore, Registrant, Signals, WorkerFacts, WorkerStatus,
+            WorkersStore,
         },
-        worker_host::{
-            KvFeed, Members, MembershipWriter as _, Objects, Precondition, StoreMembershipWriter,
-        },
+        worker_host::{KvFeed, Members, MembershipWriter as _, Objects, Precondition, StoreDoor},
     };
 
     const MODEL: &str = "m";
@@ -78,6 +73,21 @@ mod tests {
         fn new() -> Self {
             let store = Arc::new(MemoryStore::new());
             let objects = WorkerObjects::new(Arc::clone(&store), ObjectsWake::default()).holder();
+            Self::over(store, objects)
+        }
+
+        /// [`Self::new`] over a holder whose objects state no overload
+        /// threshold, where the stock controller's state the program's
+        /// default.
+        fn unjudged() -> Self {
+            let registry = Arc::new(WorkerRegistry::new());
+            let objects = Objects::new(registry)
+                .with_connector(Arc::new(GrpcConnector))
+                .with_host_local_unchecked();
+            Self::over(Arc::new(MemoryStore::new()), Arc::new(objects))
+        }
+
+        fn over(store: Arc<MemoryStore>, objects: Arc<Objects<Members>>) -> Self {
             let feed = KvFeed::new(Arc::clone(&store), Arc::clone(&objects));
             Self {
                 store,
@@ -223,7 +233,7 @@ mod tests {
         f.store
             .apply(AppliedSpec::validate(&spec).expect("the preset validates"))
             .expect("the first generation");
-        let door = StoreMembershipWriter::new(Arc::clone(&f.store));
+        let door = StoreDoor::new(Arc::clone(&f.store));
         f.check(async {
             door.found(&Registrant::Control, Precondition::Absent, FIRST, &|_| {
                 facts(FIRST, WireModes::GRPC, false)
@@ -251,13 +261,26 @@ mod tests {
 
     /// A gRPC row that is not indexed streams its load records alone once
     /// the host hands a monitor that wants its loads, and has no stream
-    /// under a monitor that wants none.
+    /// under a monitor that wants none. A monitor that polls by need wants
+    /// the loads of a worker whose object states overload thresholds: it
+    /// judges the worker by them. Every object of the stock controller
+    /// states them, so there the row streams under such a monitor too.
     #[tokio::test]
     async fn a_row_that_is_not_indexed_streams_its_loads_where_the_monitor_wants_them() {
-        // Whether the monitor polls by need alone, and whether the row streams:
-        // a monitor with no reader of loads wants none of a worker's.
-        for (by_need, streams) in [(false, true), (true, false)] {
-            let f = Fixture::new();
+        // Whether the objects state thresholds, whether the monitor polls by
+        // need alone, and whether the row streams: a monitor with no reader
+        // of loads wants none of a worker that states no threshold.
+        let arms = [
+            (false, false, true),
+            (false, true, false),
+            (true, true, true),
+        ];
+        for (judged, by_need, streams) in arms {
+            let f = if judged {
+                Fixture::new()
+            } else {
+                Fixture::unjudged()
+            };
             let monitor = Arc::new(WorkerMonitor::new(
                 Arc::clone(f.objects.registry()),
                 Arc::new(LoadReaders::Blind),
@@ -271,7 +294,8 @@ mod tests {
                 f.lay(facts(SECOND, WireModes::GRPC, true));
                 f.new_slot(SECOND, None).await;
                 let (slot, _) = f.feed.collector().slot_ids(FIRST).await;
-                assert_eq!(slot.is_some(), streams, "by need: {by_need}");
+                let arm = format!("thresholds stated: {judged}, by need: {by_need}");
+                assert_eq!(slot.is_some(), streams, "{arm}");
             })
             .await
             .expect("the feed processes the indexed worker behind the other");
@@ -536,44 +560,9 @@ mod tests {
             .expect("the feed dials through the worker object's connector");
 
             let hashes = [compute_content_hash(&tokens).0];
-            let holders = || {
-                store.deciding(|world| {
-                    let gateway = GatewayId(0);
-                    let ask = ViewQuery {
-                        gateway,
-                        now: Instant::now(),
-                        pinned: None,
-                        affinity: false,
-                        signal_cells: false,
-                    };
-                    let mut view = ViewBuffers::default();
-                    let built = world
-                        .build(MODEL, Role::Single, &ask, &mut view)
-                        .expect("the worker's pool");
-                    let naming = AffinityQuery {
-                        gateway,
-                        block_hashes: &hashes,
-                        namespace_seed: 0,
-                        seed: 0,
-                        cap: 0,
-                        wires: None,
-                        now_micros: built.now_micros,
-                    };
-                    let mut named = AffinityRowsBuffers::default();
-                    world.fill_affinity_rows(
-                        MODEL,
-                        Role::Single,
-                        &naming,
-                        &view.candidates,
-                        &mut named,
-                    );
-                    named
-                        .holders
-                        .iter()
-                        .map(|h| (view.candidates[h.row as usize].id, h.overlap_blocks))
-                        .collect::<Vec<_>>()
-                })
-            };
+            // The workers the model's index holds a leading block of the
+            // request for, each with its count of them.
+            let holders = || store.kv().overlaps(MODEL, &hashes);
             assert!(holders().is_empty());
             let client = SchedulerClient::connect(&url)
                 .await

@@ -97,7 +97,8 @@ pub struct PolledReport<'a> {
 /// collector has laid the stream's rows over each answer.
 #[derive(Clone, Copy)]
 pub struct GroupTick<'a> {
-    /// Every `Ready` worker of the group, polled or served by its stream.
+    /// Every `Ready` worker of the group the sink says yes of
+    /// ([`LoadSink::polls`]), polled or served by its stream.
     pub workers: &'a [Arc<dyn Worker>],
     /// The polled members that answered with rows.
     pub reports: &'a [PolledReport<'a>],
@@ -118,9 +119,10 @@ pub struct GroupTick<'a> {
 /// sink that judges an engine reads the answer whole.
 ///
 /// Seven calls have no default: each is a fact a sink takes or a question it
-/// answers. Two have one, where doing nothing is a true answer: a sink
-/// whose readers always read loads says yes at [`Self::needs_loads`], and a
-/// sink that keeps no rank cache and trims nothing has no work at
+/// answers. Three have one, where doing nothing is a true answer: a sink
+/// whose readers always read loads says yes at [`Self::needs_loads`], one
+/// whose host asks every worker for its load says yes at [`Self::polls`],
+/// and a sink that keeps no rank cache and trims nothing has no work at
 /// [`Self::tick`].
 pub trait LoadSink: Send + Sync {
     /// A record pushed on the worker's stream for `rank`, received at
@@ -167,18 +169,18 @@ pub trait LoadSink: Send + Sync {
     fn forget(&self, worker: &Arc<dyn Worker>);
 
     /// The collector reset itself: it stopped its groups and dropped every
-    /// load it published. It does so on two paths: at its start and after
-    /// it lost registry events. What the sink derived from loads and
-    /// cannot tie to a standing worker by itself is void: its verdicts and
-    /// its rows. Just before this call the collector says [`Self::forget`]
-    /// for every worker whose pushed report it held and that is no longer
-    /// the registry's `Ready` worker at its URL. So a sink may keep what it
-    /// knows of a stream, as the collector keeps the report of a pusher
-    /// that stays. A polled worker that left while events were lost is
-    /// never said: in a sink that keeps rows of its own, nothing of a
-    /// polled worker outlives this call. A sink whose rows end with the
-    /// write that removes their worker keeps them: no row of a worker that
-    /// left stands there.
+    /// load it published. It does so on three paths: at its start, after
+    /// it lost registry events, and when its host stops it. What the sink
+    /// derived from loads and cannot tie to a standing worker by itself is
+    /// void: its verdicts and its rows. Just before this call the collector
+    /// says [`Self::forget`] for every worker whose pushed report it held
+    /// and that is no longer the registry's `Ready` worker at its URL. So a
+    /// sink may keep what it knows of a stream, as the collector keeps the
+    /// report of a pusher that stays. A polled worker that left while
+    /// events were lost is never said: in a sink that keeps rows of its
+    /// own, nothing of a polled worker outlives this call. A sink whose
+    /// rows end with the write that removes their worker keeps them: no row
+    /// of a worker that left stands there.
     ///
     /// A dropped collector says nothing: its drop stops its tasks and calls
     /// no sink. The host that drops a collector owns the sink too: it voids
@@ -190,6 +192,20 @@ pub trait LoadSink: Send + Sync {
     /// told to fetch them on demand alone. A sink whose readers always read
     /// them keeps this answer.
     fn needs_loads(&self) -> bool {
+        true
+    }
+
+    /// Whether the collector asks `worker` for its load. A worker the sink
+    /// says no of is no member of a tick: it is not polled, no load stream
+    /// is wanted for it, and [`Self::tick`] does not name it. A sink whose
+    /// host can dial every worker keeps this answer.
+    ///
+    /// The collector says nothing where a worker's answer turns from yes to
+    /// no: the worker keeps its last published report, and the sink what it
+    /// judged of it, until [`Self::forget`] or [`Self::reset`]. A record
+    /// pushed for a worker the sink says no of still reaches
+    /// [`Self::record`]: the push asks nothing here.
+    fn polls(&self, _worker: &dyn Worker) -> bool {
         true
     }
 

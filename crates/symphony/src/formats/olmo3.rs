@@ -24,7 +24,13 @@ pub fn olmo3() -> Format {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{engine::Engine, event::Event, testing::drive, Declared};
+    use crate::{
+        engine::Engine,
+        event::{Event, MalformedReason},
+        formats::{lfm2_5, llama4},
+        testing::drive,
+        Declared,
+    };
 
     fn run(prompt: &str, output: &str) -> Vec<Event<'static>> {
         drive(
@@ -57,5 +63,65 @@ mod tests {
         assert!(!events
             .iter()
             .any(|event| matches!(event, Event::ToolCallStart { .. })));
+    }
+
+    #[test]
+    fn a_stray_sentence_where_a_call_belongs_is_text_between_calls() {
+        // Words no call follows are prose, the reason a sentence between calls has in every
+        // table; a name alone on its line still names a tool and writes no call. One reader
+        // serves the three pythonic tables, so each has a row.
+        let text = MalformedReason::TextBetweenCalls;
+        let name = MalformedReason::NameWithoutACall;
+        let chatml = "<|im_start|>assistant\n";
+        let rows = [
+            (
+                olmo3(),
+                chatml,
+                "<function_calls>\nParis is sunny today.\n</function_calls>",
+                vec![text; 4],
+            ),
+            (
+                olmo3(),
+                chatml,
+                "<function_calls>\nget_weather\n</function_calls>",
+                vec![name],
+            ),
+            // The prose ends with its line: the name on the next line stands alone again.
+            (
+                olmo3(),
+                chatml,
+                "<function_calls>\nParis is sunny\nget_weather\n</function_calls>",
+                vec![text, text, text, name],
+            ),
+            // The list of LFM2.5: the last word ends at the `]`, not at a newline.
+            (
+                lfm2_5(),
+                chatml,
+                "<|tool_call_start|>[Paris is sunny today.]<|tool_call_end|>",
+                vec![text; 4],
+            ),
+            // The bare list of Llama 4, once a call opened it.
+            (
+                llama4(),
+                "<|header_start|>assistant<|header_end|>\n\n",
+                "[get_weather(city=\"Paris\"), Paris is sunny]",
+                vec![text; 3],
+            ),
+        ];
+        for (format, prompt, output, expected) in rows {
+            let events = drive(
+                &mut Engine::new(format, Declared::default()),
+                prompt,
+                &[output],
+            );
+            let reasons: Vec<MalformedReason> = events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Malformed { why, .. } => Some(*why),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(reasons, expected, "{output}");
+        }
     }
 }

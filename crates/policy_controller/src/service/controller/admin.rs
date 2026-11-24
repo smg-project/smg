@@ -121,10 +121,7 @@ mod tests {
 
     use super::{router, Admin, VERSION};
     use crate::{
-        document::{
-            spec::{BindingSpec, OverloadSpec},
-            AppliedSpec, PolicySpec,
-        },
+        document::{spec::BindingSpec, AppliedSpec, PolicySpec},
         engine::view::{LoadRow, Role},
         load::ingest::loads::Stats,
         service::controller::{
@@ -255,13 +252,10 @@ mod tests {
             .keys()
             .next()
             .expect("the preset's profile");
+        // The binding's overload block stands switched on: its pools are
+        // judged at the crate's count of eight queued requests.
         document.bindings = vec![BindingSpec {
             profile: Some(profile.clone()),
-            overload: Some(OverloadSpec {
-                waiting_requests: Some(8),
-                token_usage: Some(1.0),
-                ..OverloadSpec::default()
-            }),
             ..BindingSpec::default()
         }];
         let lists = AppliedSpec::validate(&document).expect("the document validates");

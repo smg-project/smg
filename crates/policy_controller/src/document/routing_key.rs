@@ -12,13 +12,24 @@
 //! carries no session key, and nothing else reads it
 //! ([`RequestFacts::client_key`]).
 //!
-//! [`RequestFacts::client_key`]: crate::engine::RequestFacts::client_key
+//! A caller that lends its hash ring to a decision says where the request
+//! stands on it ([`RequestFacts::ring_positions`]). The key's text is read
+//! here and leaves in no other form, so its position is taken here, with
+//! the two keys, by one read of the sources ([`KeySources::derive_keys`]).
 //!
+//! A source can name the one worker a request goes to, by a number that
+//! counts the workers of the request's list. It hands no key: its number
+//! is read apart ([`KeySources::target`]), by the one call that places a
+//! request in process.
+//!
+//! [`RequestFacts::client_key`]: crate::engine::RequestFacts::client_key
+//! [`RequestFacts::ring_positions`]: crate::engine::RequestFacts::ring_positions
 //! [`RequestFacts::session_key`]: crate::engine::RequestFacts::session_key
 
 use crate::{
     document::spec::{BindingSpec, RoutingKeySpec, SessionsSpec, ViewSpec, KEY_BYTES},
     engine::view::{fingerprint, Identity},
+    policies::consistent_hashing::LentRing,
 };
 
 /// The sources a binding's requests take their routing key from, as a host
@@ -30,6 +41,9 @@ use crate::{
 pub struct KeySources {
     sources: Box<[Source]>,
     strip_lineage: bool,
+    /// The header of the block's target source, where it names one
+    /// ([`Self::target`]): no source of a key.
+    target: Option<Box<str>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -67,6 +81,35 @@ pub struct DerivedKey<'a> {
     pub source: KeySource<'a>,
 }
 
+/// A request's keys by the sources its binding names
+/// ([`KeySources::derive_keys`]). The default holds none.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DerivedKeys<'a> {
+    /// Its routing key ([`KeySources::derive`]), `None` where it carries
+    /// none.
+    pub session: Option<DerivedKey<'a>>,
+    /// Its client's key ([`KeySources::derive_client`]), read where it
+    /// carries no routing key: `0` under a routing key, which a ring places
+    /// by ahead of it, and where it carries none.
+    pub client_key: u64,
+    /// Where the key a ring places the request by stands on the ring its
+    /// caller lends: that ring's own hash ([`LentRing::position`]) of the
+    /// routing key's text as its source handed it, and of the client's
+    /// value where the request carries no routing key. Under the plain
+    /// ring it is the one entry the caller states as the request's place
+    /// on the ring
+    /// ([`RequestFacts::ring_positions`](crate::engine::RequestFacts::ring_positions)).
+    /// A caller whose own policy asks its ring for another text than the
+    /// key's states that text's position itself: under the gateway's
+    /// `prefix_hash` the text is sixteen hex digits of a hash of the key's
+    /// bytes, which the one call leaves to the lender
+    /// ([`LentRing::head_position`]).
+    ///
+    /// `None` where the request carries neither key, and where no ring is
+    /// lent: nothing is hashed for such a request.
+    pub ring_position: Option<u64>,
+}
+
 impl KeySources {
     /// The sources of `binding`: its `routing_key` block, or the headers of
     /// its sessions rule where the rule names them. `None` where the
@@ -80,9 +123,12 @@ impl KeySources {
     }
 
     fn of_block(block: &RoutingKeySpec, view: &ViewSpec) -> Self {
+        let mut target = block.sources.iter().filter(|source| source.target);
+        let target = target.find_map(|source| source.header.as_deref());
         let sources = block
             .sources
             .iter()
+            .filter(|source| !source.target)
             .map(|source| Source {
                 plain: source
                     .header
@@ -96,6 +142,7 @@ impl KeySources {
         Self {
             sources,
             strip_lineage: block.strip_lineage,
+            target: target.map(Box::from),
         }
     }
 
@@ -119,6 +166,7 @@ impl KeySources {
         Self {
             sources,
             strip_lineage: false,
+            target: None,
         }
     }
 
@@ -151,6 +199,16 @@ impl KeySources {
         header: impl Fn(&str) -> Option<&'a [u8]>,
         rid: Option<&'a str>,
     ) -> Option<DerivedKey<'a>> {
+        self.session(&header, rid).map(|(key, _)| key)
+    }
+
+    /// [`Self::derive`], with the key's text as its source handed it: the
+    /// text a lent ring places the request by.
+    fn session<'a>(
+        &'a self,
+        header: &impl Fn(&str) -> Option<&'a [u8]>,
+        rid: Option<&'a str>,
+    ) -> Option<(DerivedKey<'a>, &'a str)> {
         let lineage = |key| {
             if self.strip_lineage {
                 strip_lineage(key)
@@ -179,14 +237,15 @@ impl KeySources {
                     (key, KeySource::Rid)
                 }
             };
-            Some(DerivedKey {
+            let derived = DerivedKey {
                 key: if source.plain {
                     Identity::plain(key)
                 } else {
                     Identity::hashed(fingerprint(key.as_bytes()))
                 },
                 source: from,
-            })
+            };
+            Some((derived, key))
         })
     }
 
@@ -197,18 +256,95 @@ impl KeySources {
     /// text is. It is read whole, with any suffix, and no source behind it
     /// is read. Its text leaves in no form.
     pub fn derive_client<'a>(&self, header: impl Fn(&str) -> Option<&'a [u8]>) -> u64 {
-        self.sources
-            .iter()
-            .filter(|source| source.client)
-            .find_map(|source| header(source.header.as_deref()?))
-            .filter(|value| {
-                !value.is_empty()
-                    && value
-                        .iter()
-                        .all(|&byte| matches!(byte, b'\t' | b' '..=b'~'))
-            })
-            .map_or(0, fingerprint)
+        self.client(&header)
+            .map_or(0, |value| fingerprint(value.as_bytes()))
     }
+
+    /// The value [`Self::derive_client`] takes the client's key of, where
+    /// it can be handed: visible ASCII, and so text.
+    fn client<'a>(&self, header: &impl Fn(&str) -> Option<&'a [u8]>) -> Option<&'a str> {
+        let mut clients = self.sources.iter().filter(|source| source.client);
+        text(clients.find_map(|source| header(source.header.as_deref()?))?)
+    }
+
+    /// Whether the block names a target source: a host reads
+    /// [`Self::target`] for its requests where it does.
+    pub fn names_target(&self) -> bool {
+        self.target.is_some()
+    }
+
+    /// The number a request names its worker by, under the block's target
+    /// source: `Some(None)` where the request names a worker and its text
+    /// is no number, so it reaches no worker of any list. `None` where the
+    /// request names no worker: the block has no target source, or the
+    /// request carries no text under its header, a value that is empty or
+    /// not visible ASCII among them. A number is decimal digits, with one
+    /// `+` ahead of them or none. Which workers it counts, and so which
+    /// worker it reaches, is its reader's to say.
+    pub fn target<'a>(&self, header: impl Fn(&str) -> Option<&'a [u8]>) -> Option<Option<u32>> {
+        let named = text(header(self.target.as_deref()?)?)?;
+        Some(named.parse().ok())
+    }
+
+    /// The request's keys, by one read of the sources: its routing key
+    /// ([`Self::derive`]), its client's key where it carries no routing
+    /// key ([`Self::derive_client`]), and where the key a ring places it by
+    /// stands on `ring` ([`DerivedKeys::ring_position`]).
+    ///
+    /// `ring` is the ring the request's caller lends to its decision
+    /// ([`RequestFacts::ring`](crate::engine::RequestFacts::ring)): the
+    /// position is that ring's own hash of the key's text, so the key has
+    /// the owner the caller's own walk finds where that walk starts from
+    /// the key's text too. A caller hands it for a request a ring places,
+    /// where
+    /// [`Engine::states_key_place`](crate::engine::Engine::states_key_place)
+    /// answers `true` for the request's model and phase, and `None` for any
+    /// other: the ring is asked nothing then.
+    pub fn derive_keys<'a>(
+        &'a self,
+        header: impl Fn(&str) -> Option<&'a [u8]>,
+        rid: Option<&'a str>,
+        ring: Option<&dyn LentRing>,
+    ) -> DerivedKeys<'a> {
+        self.derive_keys_by(header, rid, |text, _| ring.map(|ring| ring.position(text)))
+    }
+
+    /// [`Self::derive_keys`] with the place asked of `place`: it is handed
+    /// the text of the value a ring places the request by and whether that
+    /// value is the client's, once, and is not asked where the request
+    /// carries neither value. The prefix form of a ring is asked where a
+    /// routing value's text stands as a head does, and nothing of a
+    /// client's.
+    pub(crate) fn derive_keys_by<'a>(
+        &'a self,
+        header: impl Fn(&str) -> Option<&'a [u8]>,
+        rid: Option<&'a str>,
+        place: impl FnOnce(&str, bool) -> Option<u64>,
+    ) -> DerivedKeys<'a> {
+        match self.session(&header, rid) {
+            Some((key, text)) => DerivedKeys {
+                session: Some(key),
+                client_key: 0,
+                ring_position: place(text, false),
+            },
+            None => {
+                let client = self.client(&header);
+                DerivedKeys {
+                    session: None,
+                    client_key: client.map_or(0, |value| fingerprint(value.as_bytes())),
+                    ring_position: client.and_then(|value| place(value, true)),
+                }
+            }
+        }
+    }
+}
+
+/// A header's value as its text, where it can be handed: not empty, and
+/// visible ASCII.
+fn text(value: &[u8]) -> Option<&str> {
+    let visible = |&byte: &u8| matches!(byte, b'\t' | b' '..=b'~');
+    let value = Some(value).filter(|value| !value.is_empty() && value.iter().all(visible))?;
+    std::str::from_utf8(value).ok()
 }
 
 /// A document's byte count as a length.
@@ -430,6 +566,115 @@ mod tests {
             sources.headers().collect::<Vec<_>>(),
             ["x-smg-routing-key", "x-forwarded-for", "cookie"]
         );
+    }
+
+    /// A target source names the request's worker by a number and hands no
+    /// key: neither read of a key takes its header, and a host is told no
+    /// header of it to keep for a key. A number is decimal digits, with one
+    /// `+` ahead of them or none, as large as a place can be. A text that
+    /// is no such number names a worker that is no place of any list. A
+    /// header that is absent, empty or not visible ASCII names no worker,
+    /// and neither does any header under a block with no target source.
+    ///
+    /// The gateway's own policy takes the header's value where it is text
+    /// and not empty (`crates/external_router/src/header_utils.rs`, lines
+    /// 94 to 103) and reads it as a number
+    /// (`model_gateway/src/policies/consistent_hashing.rs`, lines 154 and
+    /// 155).
+    #[test]
+    fn a_target_source_names_a_place_and_hands_no_key() {
+        let block = sources(
+            r#"{"sources":[{"header":"x-smg-routing-key"},{"header":"x-smg-target-worker","target":true},{"header":"cookie","client":true}]}"#,
+        );
+        assert!(block.names_target());
+        let named = |value: &[u8]| block.target(request(&[("x-smg-target-worker", value)]));
+        for (text, place) in [("0", 0), ("7", 7), ("+7", 7), ("007", 7)] {
+            assert_eq!(named(text.as_bytes()), Some(Some(place)), "{text}");
+        }
+        assert_eq!(named(b"4294967295"), Some(Some(u32::MAX)));
+        for text in ["4294967296", "-1", "1.5", " 1", "1 ", "one", "+", "0x1"] {
+            assert_eq!(named(text.as_bytes()), Some(None), "{text:?}");
+        }
+        for unusable in [&b""[..], &[0xc3, 0xa9][..], &b"1\x00"[..]] {
+            assert_eq!(named(unusable), None, "{unusable:?}");
+        }
+        assert_eq!(block.target(request(&[])), None, "absent");
+
+        let only: [(&str, &[u8]); 1] = [("x-smg-target-worker", b"7")];
+        assert_eq!(block.derive(request(&only), None), None);
+        assert_eq!(block.derive_client(request(&only)), 0);
+        assert_eq!(
+            block.headers().collect::<Vec<_>>(),
+            ["x-smg-routing-key", "cookie"]
+        );
+
+        let unnamed = sources(ORDERED);
+        assert!(!unnamed.names_target());
+        assert_eq!(unnamed.target(request(&only)), None);
+    }
+
+    /// A ring for these cases: a key stands at its text's fingerprint.
+    #[derive(Debug)]
+    struct Stands;
+
+    impl LentRing for Stands {
+        fn position(&self, key: &str) -> u64 {
+            fingerprint(key.as_bytes())
+        }
+
+        fn walk(&self, _: u64, _: &mut dyn FnMut(&str) -> bool) {}
+    }
+
+    /// The keys of a request are its two keys, as each is derived alone,
+    /// and where the key a ring places it by stands on the ring its caller
+    /// lends: that ring's own hash of the routing key's text as its source
+    /// handed it, with no lineage where the block strips it, and of the
+    /// client's value where the request carries no routing key. With no
+    /// ring lent the two keys are read and no position is taken.
+    ///
+    /// The gateway's own policy asks its ring for the same text: the
+    /// routing key's header value, or the request id behind it, each
+    /// without its lineage under the override
+    /// (`model_gateway/src/policies/registry.rs`, lines 534 to 541 and 497
+    /// to 503 at 882be6f4f; `consistent_hashing.rs`, lines 170 to 174), and
+    /// with neither the client's `x-forwarded-for` or `cookie`, whole
+    /// (lines 206 to 222). Its ring hashes the text it is asked for
+    /// (`hash_ring.rs`, line 268).
+    #[test]
+    fn the_keys_of_a_request_state_where_its_key_stands_on_the_lent_ring() {
+        let sources = sources(
+            r#"{"sources":[{"header":"x-smg-routing-key"},{"rid":true},{"header":"x-forwarded-for","client":true},{"header":"cookie","client":true}],"strip_lineage":true}"#,
+        );
+        let lent: Option<&dyn LentRing> = Some(&Stands);
+        let stands = |text: &str| Some(fingerprint(text.as_bytes()));
+        let keyed: [(&str, &[u8]); 2] = [
+            ("x-forwarded-for", b"10.0.0.1"),
+            ("x-smg-routing-key", b"conv-1_t2_r1"),
+        ];
+        let keys = sources.derive_keys(request(&keyed), Some("rid-9"), lent);
+        assert_eq!(keys.session, sources.derive(request(&keyed), Some("rid-9")));
+        assert_eq!((keys.client_key, keys.ring_position), (0, stands("conv-1")));
+        // No routing key header: the request's own id, without its lineage.
+        let keys = sources.derive_keys(request(&keyed[..1]), Some("rid-9_r3"), lent);
+        assert_eq!(keys.session.map(|key| key.source), Some(KeySource::Rid));
+        assert_eq!(keys.ring_position, stands("rid-9"));
+        // No session key: the client's value, whole.
+        let keys = sources.derive_keys(request(&keyed[..1]), None, lent);
+        let client = sources.derive_client(request(&keyed[..1]));
+        assert_eq!((keys.session, keys.client_key), (None, client));
+        assert_eq!(keys.ring_position, stands("10.0.0.1"));
+        // No key at all: no position.
+        let none = sources.derive_keys(request(&[]), None, lent);
+        assert_eq!(
+            (none.session, none.client_key, none.ring_position),
+            (None, 0, None)
+        );
+        // No ring lent: the two keys, and nothing hashed for a position.
+        let keys = sources.derive_keys(request(&keyed), None, None);
+        assert_eq!(keys.session, sources.derive(request(&keyed), None));
+        assert_eq!(keys.ring_position, None);
+        let keys = sources.derive_keys(request(&keyed[..1]), None, None);
+        assert_eq!((keys.client_key, keys.ring_position), (client, None));
     }
 
     /// A key from a header the view does not list leaves as its fingerprint

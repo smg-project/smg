@@ -22,10 +22,12 @@
 //! num_tokens = (grid_t * grid_h * grid_w) / merge_size²
 //! ```
 
-use std::borrow::Cow;
+use std::{borrow::Cow, collections::TryReserveError};
 
 use image::{imageops::FilterType, DynamicImage, GenericImageView};
-use ndarray::{Array2, Array3};
+use ndarray::Array2;
+#[cfg(test)]
+use ndarray::Array3;
 
 use crate::{
     buffer_pool,
@@ -49,7 +51,7 @@ use crate::{
 
 /// Configuration for a Qwen VL processor variant.
 #[derive(Debug, Clone)]
-pub struct QwenVLConfig {
+pub(crate) struct QwenVLConfig {
     /// Vision encoder patch size
     pub patch_size: usize,
     /// Merge size for token reduction
@@ -84,7 +86,7 @@ impl QwenVLConfig {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum QwenVideoResizeMode {
+pub(crate) enum QwenVideoResizeMode {
     TotalVolume,
     PerFrame,
 }
@@ -92,7 +94,7 @@ pub enum QwenVideoResizeMode {
 /// What a clip's `video_second_per_grid`, the time one temporal patch spans
 /// in the position ids, divides the temporal patch size by.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum QwenVideoTiming {
+pub(crate) enum QwenVideoTiming {
     /// The rate the clip was sampled at, which the Qwen2-VL line's
     /// processors read from the video metadata.
     SampledRate,
@@ -396,14 +398,17 @@ impl QwenTransforms {
 impl QwenVLProcessorBase {
     /// Create a new processor with the given configuration and the default
     /// preprocessor config's transforms.
-    pub fn new(config: QwenVLConfig) -> Self {
+    pub(crate) fn new(config: QwenVLConfig) -> Self {
         Self::from_configs(config, &PreProcessorConfig::default())
     }
 
     /// Create a processor with the given configuration and the transforms
     /// `preprocessor_config` sets (resize filter, resize switch,
     /// normalization).
-    pub fn from_configs(config: QwenVLConfig, preprocessor_config: &PreProcessorConfig) -> Self {
+    pub(crate) fn from_configs(
+        config: QwenVLConfig,
+        preprocessor_config: &PreProcessorConfig,
+    ) -> Self {
         Self {
             transforms: QwenTransforms::resolve(&config, preprocessor_config),
             config,
@@ -415,7 +420,7 @@ impl QwenVLProcessorBase {
 
     /// Resolve the transforms from `config`, keeping this processor's
     /// geometry.
-    pub fn with_preprocessor_config(mut self, config: &PreProcessorConfig) -> Self {
+    pub(crate) fn with_preprocessor_config(mut self, config: &PreProcessorConfig) -> Self {
         self.transforms = QwenTransforms::resolve(&self.config, config);
         self
     }
@@ -464,7 +469,7 @@ impl QwenVLProcessorBase {
     /// Some model families upscale these inputs to the minimum aligned size,
     /// while Qwen processors reject them. This opt-in preserves the Qwen
     /// default and lets wrappers select the model-specific behavior.
-    pub fn allow_video_dimensions_below_factor(mut self) -> Self {
+    pub(crate) fn allow_video_dimensions_below_factor(mut self) -> Self {
         self.allow_video_dimensions_below_factor = true;
         self
     }
@@ -478,7 +483,7 @@ impl QwenVLProcessorBase {
     /// MiniMax-M3 reference takes `max(factor, round(...))` on each side first,
     /// so such an image keeps its rounded long side (28x112) and skips the
     /// scale-up. This opt-in selects the latter; the default is the Qwen rule.
-    pub fn raise_rounded_sides_to_factor(mut self) -> Self {
+    pub(crate) fn raise_rounded_sides_to_factor(mut self) -> Self {
         self.raise_rounded_sides_to_factor = true;
         self
     }
@@ -503,15 +508,17 @@ impl QwenVLProcessorBase {
         self.config.max_pixels
     }
 
-    pub fn video_min_pixels(&self) -> usize {
+    #[cfg(test)]
+    pub(crate) fn video_min_pixels(&self) -> usize {
         self.config.video_min_pixels
     }
 
-    pub fn video_max_pixels(&self) -> usize {
+    pub(crate) fn video_max_pixels(&self) -> usize {
         self.config.video_max_pixels
     }
 
-    pub fn video_resize_mode(&self) -> QwenVideoResizeMode {
+    #[cfg(test)]
+    pub(crate) fn video_resize_mode(&self) -> QwenVideoResizeMode {
         self.config.video_resize_mode
     }
 
@@ -531,7 +538,7 @@ impl QwenVLProcessorBase {
 
     /// Divide a clip's temporal patch size by `timing`'s rate for its
     /// `video_second_per_grid`, rather than by the rate it was sampled at.
-    pub fn with_video_timing(mut self, timing: QwenVideoTiming) -> Self {
+    pub(crate) fn with_video_timing(mut self, timing: QwenVideoTiming) -> Self {
         self.video_timing = timing;
         self
     }
@@ -664,7 +671,7 @@ impl QwenVLProcessorBase {
     /// # Errors
     /// - If height or width is zero
     /// - If aspect ratio exceeds 200:1
-    pub fn smart_resize(
+    pub(crate) fn smart_resize(
         &self,
         height: usize,
         width: usize,
@@ -737,7 +744,7 @@ impl QwenVLProcessorBase {
     /// `TotalVolume` applies the pixel budget to the padded sampled video
     /// volume (`T * H * W`), while `PerFrame` applies it to each frame's
     /// spatial area (`H * W`).
-    pub fn smart_resize_video(
+    pub(crate) fn smart_resize_video(
         &self,
         num_frames: usize,
         height: usize,
@@ -839,15 +846,18 @@ impl QwenVLProcessorBase {
         (grid_t * grid_h * grid_w) / (self.config.merge_size * self.config.merge_size)
     }
 
-    /// Patchify tensor directly into an output buffer (avoids intermediate Vec allocation).
     /// Patchify a [C, H, W] tensor and append the patches to `output`.
+    ///
+    /// Test-only reference: the plain tensor form that the RGB-byte fast paths
+    /// (`preprocess`, `patchify_image_rgb_block_band`) are compared with bit for bit.
     ///
     /// Output layout per image:
     ///   `[grid_t, patch_rows, patch_cols, merge_h, merge_w, C, temporal, patch_h, patch_w]`
     ///
     /// Each "merged patch" covers a `(merge_size * patch_size)²` spatial region.
     /// Within it, `merge_size²` sub-patches are emitted, each containing all channels.
-    pub fn patchify_into(
+    #[cfg(test)]
+    fn patchify_into(
         &self,
         tensor: &Array3<f32>,
         grid_t: usize,
@@ -917,6 +927,7 @@ impl QwenVLProcessorBase {
     /// `[block_start, block_start + band.len()/block_out)` in (gt, pr, pc)
     /// row-major order. Pure gather/copy from `planes`; deterministic and
     /// independent per block (safe to call concurrently on disjoint bands).
+    #[cfg(test)]
     #[expect(
         clippy::too_many_arguments,
         reason = "block-band patchifier: planes + grid dims + output band"
@@ -964,10 +975,14 @@ impl QwenVLProcessorBase {
 
     /// Patchify a sequence of frame tensors into Qwen's video patch layout.
     ///
+    /// Test-only reference: the plain tensor form that the RGB-byte video path
+    /// (`preprocess_video`) is compared with bit for bit.
+    ///
     /// `tensors` must already be resized and normalized to the same spatial
     /// shape. If the frame count is not divisible by `temporal_patch_size`,
     /// the caller should pad by repeating the final frame before calling this.
-    pub fn patchify_video_into(
+    #[cfg(test)]
+    fn patchify_video_into(
         &self,
         tensors: &[Array3<f32>],
         grid_t: usize,
@@ -1334,6 +1349,14 @@ impl ImageBatchPlan {
 }
 
 impl QwenVLProcessorBase {
+    /// The request's error for a patch buffer the allocator refuses.
+    fn refused(&self, error: TryReserveError) -> TransformError {
+        TransformError::ReserveRefused(format!(
+            "cannot reserve {} patch output: {error}",
+            self.config.model_name
+        ))
+    }
+
     /// The plan of a batch: every image's target size, grid and patch count
     /// (checked against overflow), the batch totals, the filter and the
     /// normalization the patch bytes carry.
@@ -1424,7 +1447,10 @@ impl QwenVLProcessorBase {
         let wire_len = batch.total_patch_values * element_size;
         // A pooled buffer: its bytes are a previous request's until the
         // bands below, which cover it exactly, are written.
-        let mut wire: Vec<u8> = buffer_pool::take(wire_len);
+        let mut wire: Vec<u8> = match buffer_pool::try_take(wire_len) {
+            Ok(wire) => wire,
+            Err(error) => return Some(Err(self.refused(error))),
+        };
         let mut bands = Vec::with_capacity(images.len());
         let mut remaining = wire.as_mut_slice();
         for plan in &batch.plans {
@@ -1677,7 +1703,8 @@ impl VisionPreProcessor for QwenVLProcessorBase {
         // resize and patchify in parallel. A pooled buffer: its bytes are a
         // previous request's until the bands, which cover it exactly, are
         // written.
-        let mut all_patches: Vec<u8> = buffer_pool::take(total_patch_values);
+        let mut all_patches: Vec<u8> =
+            buffer_pool::try_take(total_patch_values).map_err(|error| self.refused(error))?;
         let mut bands = Vec::with_capacity(images.len());
         let mut remaining = all_patches.as_mut_slice();
         for plan in image_plans {
@@ -1786,7 +1813,8 @@ impl VisionPreProcessor for QwenVLProcessorBase {
         let plan = self.plan_video(frames.len(), width, height, clip)?;
         let temporal_patch_size = self.config.temporal_patch_size;
         // A pooled buffer, written end to end by the chunks below.
-        let mut all_patches = buffer_pool::take(plan.output_values);
+        let mut all_patches =
+            buffer_pool::try_take(plan.output_values).map_err(|error| self.refused(error))?;
         let mut out_idx = 0;
         let mut frame_rgbs = Vec::with_capacity(temporal_patch_size);
         for gt in 0..plan.grid_t {
@@ -1845,7 +1873,8 @@ impl VisionPreProcessor for QwenVLProcessorBase {
         let plan = self.plan_video(frames.len(), frames[0].width, frames[0].height, clip)?;
         let temporal_patch_size = self.config.temporal_patch_size;
         // A pooled buffer, written end to end by the bands below.
-        let mut all_patches = buffer_pool::take(plan.output_values);
+        let mut all_patches =
+            buffer_pool::try_take(plan.output_values).map_err(|error| self.refused(error))?;
         for frame in frames {
             let expected_len = (frame.width as usize)
                 .checked_mul(frame.height as usize)

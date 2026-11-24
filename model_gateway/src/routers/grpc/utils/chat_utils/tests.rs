@@ -858,6 +858,101 @@ fn test_tml_preserves_authored_multipart_order_openai() {
     assert_eq!(result[0]["content"], expected);
 }
 
+/// Long media text stays out of the template value, which the content
+/// transform writes without it: the value is the one a short URL gives, and
+/// building it allocates less than the text is long.
+#[cfg(all(
+    feature = "jemalloc-stats",
+    not(target_env = "msvc"),
+    not(target_env = "musl")
+))]
+#[test]
+fn the_template_value_leaves_long_media_text_out() {
+    use crate::routers::grpc::testing::bytes_allocated_during;
+
+    let url = format!("data:image/jpeg;base64,{}", "A".repeat(1 << 20));
+    let messages = vec![ChatMessage::User {
+        ext: Default::default(),
+        content: MessageContent::Parts(vec![
+            ContentPart::Text {
+                text: "question".to_string(),
+            },
+            ContentPart::ImageUrl {
+                image_url: ImageUrl {
+                    url: url.into(),
+                    detail: None,
+                    max_long_side_pixel: None,
+                },
+            },
+        ]),
+        name: None,
+    }];
+    let mut result = Vec::new();
+    let allocated = bytes_allocated_during(|| {
+        result = process_content_format_with_order(
+            &messages,
+            ChatTemplateContentFormat::OpenAI,
+            None,
+            MediaPartOrder::Authored,
+        )
+        .unwrap();
+    });
+    assert_eq!(
+        result[0]["content"],
+        json!([{"type": "text", "text": "question"}, {"type": "image"}])
+    );
+    assert!(allocated < 1 << 20, "{allocated} bytes allocated");
+}
+
+/// The string format with placeholders gives long media text the value short
+/// media text gives, in either media order; without placeholders a media-only
+/// message keeps its URL, long or not.
+#[test]
+fn long_media_text_changes_no_string_format_value() {
+    let message = |url: &str, text: Option<&str>| {
+        let mut parts = Vec::new();
+        if let Some(text) = text {
+            parts.push(ContentPart::Text {
+                text: text.to_string(),
+            });
+        }
+        parts.push(ContentPart::ImageUrl {
+            image_url: ImageUrl {
+                url: url.to_string().into(),
+                detail: None,
+                max_long_side_pixel: None,
+            },
+        });
+        vec![ChatMessage::User {
+            ext: Default::default(),
+            content: MessageContent::Parts(parts),
+            name: None,
+        }]
+    };
+    let long = format!("data:image/jpeg;base64,{}", "A".repeat(MEDIA_TEXT_LEFT_OUT));
+    let tokens = placeholders(&[(Modality::Image, "<|image|>")]);
+    for order in [MediaPartOrder::MediaFirst, MediaPartOrder::Authored] {
+        let value = |url: &str| {
+            process_content_format_with_order(
+                &message(url, Some("question")),
+                ChatTemplateContentFormat::String,
+                Some(&tokens),
+                order,
+            )
+            .unwrap()
+        };
+        assert_eq!(value(&long), value("data:image/jpeg;base64,AAAA"));
+    }
+    let kept = process_content_format_with_order(
+        &message(&long, None),
+        ChatTemplateContentFormat::String,
+        None,
+        MediaPartOrder::Authored,
+    )
+    .unwrap();
+    assert!(kept[0].to_string().contains(&long));
+}
+
 // --- an assistant turn without content on the render path ----------------
 
 /// A template of the string format that tests and splits every assistant

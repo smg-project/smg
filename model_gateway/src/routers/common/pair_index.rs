@@ -6,14 +6,15 @@
 //! Placement then reads a prefill's partner list instead of comparing
 //! descriptors on the request path.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
+use smg_policy_controller::engine::{LentList, ListCell, PartnerClasses};
 use smg_worker::{
     identity::basic::Worker,
     pd::pairing::{PairingMismatch, PdPairing, PdPairingMode},
 };
 
-use crate::routers::common::snapshot::RoutingPool;
+use crate::routers::common::{pair_classes, snapshot::RoutingPool};
 
 /// A shared, immutable list of workers, as the routing snapshot holds them.
 type Workers = Arc<[Arc<dyn Worker>]>;
@@ -103,6 +104,12 @@ pub(crate) struct PdPairIndex {
     pub partners: Vec<Arc<[Arc<dyn Worker>]>>,
     /// Set when both pools have workers and no pair is compatible.
     pub refusal: Option<PairingRefusal>,
+    /// The pair classes of the two pools ([`Self::classes`]): empty until
+    /// the policy engine first places a pair over this index.
+    classes: OnceLock<PartnerClasses>,
+    /// The cells the two pools are lent to the policy engine with
+    /// ([`Self::lent`]): the prefill pool's, then the decode pool's.
+    cells: [ListCell; 2],
 }
 
 impl PdPairIndex {
@@ -158,7 +165,37 @@ impl PdPairIndex {
             prefill: prefill.into(),
             partners,
             refusal,
+            classes: OnceLock::new(),
+            cells: Default::default(),
         }
+    }
+
+    /// The class of every worker of the two pools, in each pool's order,
+    /// and the table of the classes that pair: these partner lists, as the
+    /// policy engine's pair decision reads them. Numbered at the first call
+    /// and kept with the index, so a membership pays for it once and a
+    /// gateway whose pairs no engine places never does. A call that arrives
+    /// during the first waits for it.
+    pub(crate) fn classes(&self) -> &PartnerClasses {
+        self.classes.get_or_init(|| pair_classes::of(self))
+    }
+
+    /// The two pools as the policy engine is lent them, the prefill pool
+    /// and then the decode pool: each with a cell that stands beside it in
+    /// this index. The engine keeps its value of the list in that cell from
+    /// the index's first pair on, and the value falls with the index, as
+    /// the lists do.
+    pub(crate) fn lent(&self) -> [LentList<'_>; 2] {
+        let [prefill, decode] = &self.cells;
+        let lent = |workers, cell| LentList {
+            workers,
+            cell,
+            facts: None,
+        };
+        [
+            lent(&self.prefill_pool, prefill),
+            lent(&self.decode_pool, decode),
+        ]
     }
 
     /// Whether some prefill can pair at all: both pools have workers and at
@@ -176,6 +213,8 @@ impl PdPairIndex {
             prefill: Arc::from([]),
             partners: Vec::new(),
             refusal: None,
+            classes: OnceLock::new(),
+            cells: Default::default(),
         }
     }
 }

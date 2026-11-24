@@ -409,7 +409,8 @@ fn encode<F: RgbSource>(
         "GLM features",
     )?;
     let expected = product(&[count, features], "GLM patch output size")?;
-    let refused = |error| shape(format!("cannot reserve GLM patch output: {error}"));
+    let refused =
+        |error| TransformError::ReserveRefused(format!("cannot reserve GLM patch output: {error}"));
     if values.capacity() == 0 {
         *values = buffer_pool::take_empty(expected).map_err(refused)?;
     }
@@ -576,7 +577,7 @@ impl Glm53FlashProcessor {
         clippy::expect_used,
         reason = "the default config sets the checkpoint geometry and CLIP normalization"
     )]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::from_config_for(&PreProcessorConfig::default(), Modality::Image)
             .expect("the default preprocessor config is valid")
     }
@@ -600,10 +601,16 @@ impl Glm53FlashProcessor {
             }
         };
         let params = Params::from_config(config, video)?;
+        let pixels = Pixels::from_config(config, params)?;
+        // With resizing on, the smallest canvas is one aligned patch: a
+        // budget under it takes no input, whatever its size.
+        if pixels.do_resize && params.max_pixels < params.factor * params.factor * params.temporal {
+            return Err(shape("GLM max_pixels is smaller than one aligned patch"));
+        }
         Ok(Self {
             modality,
             params,
-            pixels: Pixels::from_config(config, params)?,
+            pixels,
         })
     }
 
@@ -682,8 +689,9 @@ impl VisionPreProcessor for Glm53FlashProcessor {
                 .checked_add(self.image_elements(image.width(), image.height())?)
                 .ok_or_else(|| shape("GLM image batch size overflow"))
         })?;
-        let mut values = buffer_pool::take_empty(expected)
-            .map_err(|error| shape(format!("cannot reserve GLM image batch: {error}")))?;
+        let mut values = buffer_pool::take_empty(expected).map_err(|error| {
+            TransformError::ReserveRefused(format!("cannot reserve GLM image batch: {error}"))
+        })?;
         let mut grids = Vec::with_capacity(images.len() * 3);
         let mut counts = Vec::with_capacity(images.len());
         let mut tokens = Vec::with_capacity(images.len());
@@ -1356,6 +1364,9 @@ mod tests {
         let params = Params::from_config(&tiny, false).unwrap();
         let err = params.geometry(1, 100, 100).unwrap_err();
         assert!(err.to_string().contains("aligned patch"), "{err}");
+        // With resizing on, such a budget builds no processor.
+        assert!(Glm53FlashProcessor::from_config_for(&tiny, Modality::Image)
+            .is_err_and(|err| err.to_string().contains("aligned patch")));
 
         // do_resize=false hands the canvas alignment burden to the caller.
         let mut no_resize = config(MAX_IMAGE_TOKENS);

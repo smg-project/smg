@@ -4,6 +4,7 @@
 //! not, until the request ends.
 
 use std::{
+    any::Any,
     fmt,
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -15,11 +16,12 @@ use dashmap::mapref::entry::Entry;
 
 use crate::{
     identity::{basic::Worker, endpoint::Endpoint},
-    metrics::writers::Metrics,
+    metrics::writers::{Metrics, WorkerHandles},
 };
 
 pub struct WorkerRoutingKeyLoad {
-    url: String,
+    /// The handles of the gauge it sets; they carry the worker URL.
+    metrics: WorkerHandles,
     /// Built by the first keyed request: the map takes four shards a CPU up
     /// front, and a worker that serves no sticky session never reads it.
     active_routing_keys: OnceLock<dashmap::DashMap<String, usize>>,
@@ -31,7 +33,7 @@ pub struct WorkerRoutingKeyLoad {
 impl WorkerRoutingKeyLoad {
     pub fn new(url: impl Into<String>) -> Self {
         Self {
-            url: url.into(),
+            metrics: WorkerHandles::new(url),
             active_routing_keys: OnceLock::new(),
             active_keys: AtomicUsize::new(0),
         }
@@ -90,14 +92,14 @@ impl WorkerRoutingKeyLoad {
             Some(1..) => {}
             Some(0) => {
                 tracing::warn!(
-                    worker_url = %Endpoint::redacted_str(&self.url),
+                    worker_url = %Endpoint::redacted_str(self.metrics.url()),
                     routing_key = %routing_key,
                     "Attempted to decrement routing key counter that is already at 0"
                 );
             }
             None => {
                 tracing::warn!(
-                    worker_url = %Endpoint::redacted_str(&self.url),
+                    worker_url = %Endpoint::redacted_str(self.metrics.url()),
                     routing_key = %routing_key,
                     "Attempted to decrement non-existent routing key"
                 );
@@ -107,14 +109,14 @@ impl WorkerRoutingKeyLoad {
     }
 
     fn update_metrics(&self) {
-        Metrics::set_worker_routing_keys_active(&self.url, self.value());
+        Metrics::set_worker_routing_keys_active(&self.metrics, self.value());
     }
 }
 
 impl fmt::Debug for WorkerRoutingKeyLoad {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("WorkerRoutingKeyLoad")
-            .field("url", &self.url)
+            .field("url", &self.metrics.url())
             .field("active_routing_keys", &self.value())
             .finish()
     }
@@ -126,9 +128,17 @@ impl fmt::Debug for WorkerRoutingKeyLoad {
 /// returns at once and keeps producing from a task, so it hands the guard
 /// to the response body's own stream (the routers' guarded stream), which drops it
 /// when the body is dropped: at the stream's end or the client's disconnect.
+///
+/// A guard can keep one value of its maker's to the request's end
+/// ([`WorkerLoadGuard::keeping`]). The guard never reads it: it lets it go
+/// where the guard is dropped, behind the worker's load.
 pub struct WorkerLoadGuard {
     worker: Arc<dyn Worker>,
     routing_key: Option<String>,
+    /// What the guard's maker left with it ([`Self::keeping`]). The last
+    /// field: it is dropped behind the load's release and the worker's
+    /// handle.
+    kept: Option<Box<dyn Any + Send + Sync>>,
 }
 
 impl WorkerLoadGuard {
@@ -172,6 +182,7 @@ impl WorkerLoadGuard {
         Self {
             worker: Arc::clone(&self.worker),
             routing_key: self.routing_key.clone(),
+            kept: None,
         }
     }
 
@@ -190,7 +201,25 @@ impl WorkerLoadGuard {
         Self {
             worker,
             routing_key,
+            kept: None,
         }
+    }
+
+    /// This guard, keeping `kept` until the guard is dropped: a value whose
+    /// own drop tells the guard's maker that the request ended. The guard
+    /// never reads it. It is let go behind the worker's load, which the
+    /// guard's drop lowers first. A guard made of this one
+    /// ([`Self::replicate`], [`Self::onto`]) keeps nothing.
+    #[must_use]
+    pub fn keeping(mut self, kept: Box<dyn Any + Send + Sync>) -> Self {
+        self.kept = Some(kept);
+        self
+    }
+
+    /// Whether this guard counts `worker`'s load: the same worker object.
+    #[must_use]
+    pub fn counts(&self, worker: &Arc<dyn Worker>) -> bool {
+        Arc::ptr_eq(&self.worker, worker)
     }
 }
 
@@ -484,5 +513,36 @@ mod tests {
         worker.set_completion_sink(None);
         drop(WorkerLoadGuard::with_key(Arc::clone(&worker), None));
         assert_eq!(spy.0.lock().unwrap().len(), 2);
+    }
+
+    /// Writes down, where it is dropped, its worker's load plus one hundred.
+    struct LoadAtDrop(Arc<dyn Worker>, Arc<AtomicUsize>);
+
+    impl Drop for LoadAtDrop {
+        fn drop(&mut self) {
+            self.1.store(self.0.load() + 100, Ordering::Relaxed);
+        }
+    }
+
+    /// A guard keeps what its maker left with it until the guard is dropped,
+    /// and lets it go behind the worker's load: the value reads a load the
+    /// guard no longer holds. A guard made of that one keeps nothing.
+    #[test]
+    fn a_guard_lets_what_it_keeps_go_behind_its_load() {
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://w1:8000")
+                .worker_type(WorkerType::Regular)
+                .build(),
+        );
+        let seen = Arc::new(AtomicUsize::new(0));
+        let kept = LoadAtDrop(Arc::clone(&worker), Arc::clone(&seen));
+        let guard = WorkerLoadGuard::with_key(Arc::clone(&worker), None).keeping(Box::new(kept));
+        let twin = guard.replicate();
+        assert_eq!((worker.load(), seen.load(Ordering::Relaxed)), (2, 0));
+        drop(guard);
+        assert_eq!(seen.load(Ordering::Relaxed), 101, "behind the load");
+        seen.store(0, Ordering::Relaxed);
+        drop(twin);
+        assert_eq!((worker.load(), seen.load(Ordering::Relaxed)), (0, 0));
     }
 }

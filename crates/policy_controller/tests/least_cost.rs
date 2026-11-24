@@ -195,6 +195,29 @@ fn a_report_sampled_after_a_send_ends_its_charge() {
 }
 
 #[test]
+fn a_report_sampled_sooner_than_the_profiles_delay_leaves_a_sends_charge() {
+    let mut spec = document("terms: {sent.requests: 1000}");
+    spec.profiles
+        .get_mut("p")
+        .expect("the profile")
+        .sent_report_delay_ms = Some(5);
+    let engine = spec.validate().expect("a reader of sends under a delay");
+    let mut rows = reports([(0, 0), (0, 0)]);
+    send(&engine, &rows[1], 317);
+    // Three milliseconds behind the send: the charge stands.
+    rows[1].load_sampled_at_micros = SENT_AT + 3_000;
+    assert_eq!(
+        scores_at(&engine, &rows, SENT_AT + 9_000),
+        [(1, 1.0), (2, 0.0)]
+    );
+    // Five behind it: the report ends the charge.
+    rows[1].load_sampled_at_micros = SENT_AT + 5_000;
+    let mut tied = scores_at(&engine, &rows, SENT_AT + 9_000);
+    tied.sort_unstable_by_key(|&(id, _)| id);
+    assert_eq!(tied, [(1, 1.0), (2, 1.0)]);
+}
+
+#[test]
 fn a_report_past_the_age_limit_still_ends_the_sends_before_it() {
     const NOW: u64 = SENT_AT + 2_000_000;
     let mut spec =

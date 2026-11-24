@@ -6,8 +6,9 @@
 //! for a rank and books its estimated tokens on the rank it takes. The
 //! gateway's minimum-tokens policy forwards a request to that select and
 //! adds nothing. A request that finds no rank records `null`. The policy
-//! controller crate replays the rows through its store
-//! (`crates/policy_controller/tests/classic/minimum_tokens.rs`).
+//! controller crate holds the sheet as owed (`OWED_SHEETS`,
+//! `crates/policy_controller/tests/classic_rows.rs`) until the rank choice
+//! is asked of the host a controller runs.
 //!
 //! This file is an ignored test of the worker crate, kept beside the code
 //! it runs. It records from the checkout it is built in and writes the sheet

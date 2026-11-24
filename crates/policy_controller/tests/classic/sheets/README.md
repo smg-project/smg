@@ -31,12 +31,12 @@ Two sheets record a rank of one worker and no worker: `minimum_tokens.json` hold
 minimum-tokens policy gives each request after each thing its rank cache is handed about the worker, and
 `sticky_rank.json` holds the rank the gateway pins each request of one grouped worker to by its sticky key.
 
-Five sheets record no policy: each holds one of the gateway's hard demands, what a request must have of the worker
+Four sheets record no policy: each holds one of the gateway's hard demands, what a request must have of the worker
 that takes it, kept before any policy runs. `retry_wire.json` holds the runtime and the transport a retry stays on,
 `media_refs.json` where a request's forwarded media references and its pixel media may go, `context_window.json`
-the two bounds a worker's context window puts on a request, `constraint_decider.json` the workers a retry may take
-once the request's constraint was decided on its first worker, and `rank_pin.json` the workers a route that pins no
-data-parallel rank leaves out. Each also holds the gateway's refusal where a demand leaves the pool nobody.
+the two bounds a worker's context window puts on a request, and `constraint_decider.json` the workers a retry may
+take once the request's constraint was decided on its first worker. Each also holds the gateway's refusal where a
+demand leaves the pool nobody.
 
 ```
 crates/policy_controller/tests/classic/sheets/
@@ -57,7 +57,6 @@ crates/policy_controller/tests/classic/sheets/
   media_refs.json
   context_window.json
   constraint_decider.json
-  rank_pin.json
 model_gateway/src/         the gateway's recorders, each a test module beside the code it runs
   policies/classic_rows.rs                                                  power_of_two.json
   policies/classic_manual_rows.rs                                           manual.json
@@ -72,7 +71,6 @@ model_gateway/src/         the gateway's recorders, each a test module beside th
   routers/grpc/common/stages/worker_selection/classic_hard_demand_rows.rs   media_refs.json
   routers/grpc/common/stages/worker_selection/classic_hard_demand_rows.rs   context_window.json
   routers/grpc/common/stages/worker_selection/classic_hard_demand_rows.rs   constraint_decider.json
-  routers/http/router/classic_rank_rows.rs                                  rank_pin.json
   policies/classic_cache_aware_rows.rs                                      cache_aware.json
   policies/classic_sticky_override_rows.rs                                  sticky_override.json
 crates/worker/src/         the worker crate's recorders, test modules beside the load monitor
@@ -142,10 +140,8 @@ written at every pick: the picked worker holds the prompt from then on. The inde
 `removed` steps alone, and a row under it stores a block before its first pick, since over an empty index the
 policy reads its tree of token ids. The replay hands the engine what each worker holds as the affinity column a
 host lends: under the index every worker's own depth, and under a tree the depth of the deepest holders alone,
-since the gateway's tree names nobody else. A row under the index is replayed twice: by the replay's own count of
-the blocks each worker stored, and by the crate's store, whose index the same reports write and which names the
-request's holders. A drawn row's second replay is one draw: it holds the two columns equal entry for entry, and
-the row's counts are the first replay's. The replay builds a row's profile from the crate's `cache_aware` preset.
+since the gateway's tree names nobody else. A row under the index is replayed by the replay's own count of
+the blocks each worker stored. The replay builds a row's profile from the crate's `cache_aware` preset.
 It sets on the preset each number of the row's configuration that differs from the gateway's command line
 default, and a tree row names its source. So a row recorded under those defaults asks the preset as it is named.
 The sheet records none of these yet: the hash index, a cache namespace, a pool over 32 workers, the trees'
@@ -258,19 +254,18 @@ pool, which is the pool's order and no rule of the policy.
   `key-0` upward: a pairs row (`pairs` true) asks each twice and counts the keys whose two requests took one rank,
   then the others, and a spread row counts what each rank took, the largest count first. Nothing in a row draws:
   a key's rank is its hash, and the recorder runs each row twice and stops if the two runs differ.
-- **demand row of the five demand sheets:** a pool of regular workers under `round_robin`, whether a pool over on
-  every worker is shed (`shed`), and a list of requests. A worker has its `state` (`free`, `over` or `down`) and, on
-  the four sheets of the gRPC pipeline, its `runtime` and its `transport` (`grpc` or `zmq`). Each sheet adds the
+- **demand row of the four demand sheets:** a pool of regular workers under `round_robin`, whether a pool over on
+  every worker is shed (`shed`), and a list of requests. A worker has its `state` (`free`, `over` or `down`), its
+  `runtime` and its `transport` (`grpc` or `zmq`). Each sheet adds the
   registration's own words for its demand and, beside them, what the gateway reads of those words. On
   `media_refs.json`: the `mm_processor` label and a `supports_vision` label of `false`, then
   `processes_references`, `gateway_pipeline` and `vision`. On `context_window.json`: the `window` the model card
   states, absent where it states none. On `constraint_decider.json`: the three decoding labels, then `policy`,
-  `whole_turn` and `vocabulary`. On `rank_pin.json`: the `dp_rank` and `dp_size` of a registration that names a
-  rank, then `rank_registered`. A request states its demands, each absent where it has none: the `wire` of a
+  `whole_turn` and `vocabulary`. A request states its demands, each absent where it has none: the `wire` of a
   retry (a runtime and a transport), `references` with the pipeline pin of its plan (`any`, `only` the gateway's
   own pipeline, `never` it), `pixels`, `input_tokens` with `scoring_position` and `output_tokens`, and
-  `decided_on`, the place of the worker the first attempt's constraint was decided on. A row of `rank_pin.json`
-  lists no request: its one answer is a transcription's. The recorder places a request sixteen times the pool's size,
+  `decided_on`, the place of the worker the first attempt's constraint was decided on. The recorder places a
+  request sixteen times the pool's size,
   so the rotation walks every worker the demands leave it. An answer is `placed`, the places of those workers in
   the row's list, or `refused`: the response's `status`, its `code`, whether it carries `retry_after`, and its
   `message`. Nothing draws: the recorder runs each row twenty times, each time from a fresh pool and a fresh
@@ -309,7 +304,6 @@ directory. The sha256 is of the file as committed.
 | `media_refs.json` | media by reference and pixel media: the workers that process references, the pipeline a plan pins, the vision encoder, and each refusal where a demand leaves nobody | `a4935a5acd15151641b1988e234016a95fd172da` | 10 demand rows | `5c624c90b8b3195fa18b73390fb07e822b94876134c088aaccf359da6bdc7990` | `classic_hard_demand_rows.rs` |
 | `context_window.json` | the context window: the input and the completion budget each against the window, a scoring position, an unknown window, the widest window a refusal names | `a4935a5acd15151641b1988e234016a95fd172da` | 8 demand rows | `bf49bf479afab2621fa118ea07c35ff21cbbd0b06dcb499fa1d1318bd60e0f62` | `classic_hard_demand_rows.rs` |
 | `constraint_decider.json` | the constraint's decider on a retry: the workers that decide a constraint as the first attempt's worker did, and the pool's answer where none is left | `a4935a5acd15151641b1988e234016a95fd172da` | 5 demand rows | `5008922d28db1276f4a202de44b24935b8f10fe8d3581a0e9483d597358493c0` | `classic_hard_demand_rows.rs` |
-| `rank_pin.json` | the rank rule of a route that pins no rank: the workers that registered a data-parallel rank are left out, and the refusal where every worker registered one | `a4935a5acd15151641b1988e234016a95fd172da` | 11 demand rows | `774c494485af59153ef9579acde444459bc37f001741b7da95903679151c59f7` | `classic_rank_rows.rs` |
 | `cache_aware.json` | cache aware in single placement, under each of its three matchers: a holder kept, the count gate and its spill, its factor under the command line's defaults, a margin under its floor, a miss, a match at the threshold, a holder tried or not usable, the two KV gates, a request that ends, the blocks a worker stores and removes | `bfe189b332349c44cf7e3b6e1102a9b5a2699d9d` | 28: 26 sequence, 2 drawn | `f13a642dc9252e0328f8092b3ff322a03f270d918311c3b5c5dd29979ab8f085` | `classic_cache_aware_rows.rs` |
 | `sticky_override.json` | the routing-key override over a policy that reads no key: a pin under the cap and under its model, a key seen first under the map's modes and under `delegate`, each pin order after a failover, and at the cap a pin that follows, a pick on the pinned worker again, a pick on a worker at the cap, every worker at the cap, no other worker routable | `26f90083091e4dd791420febd88beda3bef3faac` | 18: 14 sequence, 4 drawn | `d74b5e3c8a31b4f1c8cd55cef5629acad0659658c830d937f94b056e9580562b` | `classic_sticky_override_rows.rs` |
 
@@ -344,7 +338,6 @@ The overload and minimum-tokens sheets' recorders are tests of the worker crate:
 | `media_refs.json` | `worker_selection::classic_hard_demand_rows` |
 | `context_window.json` | `worker_selection::classic_hard_demand_rows` |
 | `constraint_decider.json` | `worker_selection::classic_hard_demand_rows` |
-| `rank_pin.json` | `router::classic_rank_rows` |
 | `cache_aware.json` | `policies::classic_cache_aware_rows` |
 | `sticky_override.json` | `policies::classic_sticky_override_rows` |
 
@@ -362,8 +355,7 @@ recorder's own repeat of the hand-over the monitor's poll loop makes, and each r
 which the policy forwards to. The sticky rank sheet's recorder is a child of the stage that sends a request to its
 worker, and calls the stage's own pin. The four demand sheets of the gRPC pipeline share one recorder, a child of the
 worker selection stage: it calls the two functions a first attempt and a retry both call for a single worker, the
-selection and the refusal where it names nobody, and writes one sheet a demand. The rank sheet's recorder is a
-child of the HTTP router and calls the transcription route's own selection.
+selection and the refusal where it names nobody, and writes one sheet a demand.
 
 A sheet is never edited by hand. A new recording replaces the whole sheet and its row in the table above, in one
 pull request that names the commit and says which rows moved: a sequence row moves only when the policy's
@@ -371,13 +363,24 @@ behavior did, and the drawn rows are a new sample.
 
 ## Reading
 
-The crate's replay reads this directory, every run of its suite with the `ingest` feature:
+The crate's replay reads this directory, every run of its suite with the `ingest`, `in-process` and `worker-host`
+features:
 
 ```bash
-cargo test -p smg-policy-controller --features ingest --test classic_rows
+cargo test -p smg-policy-controller --features ingest,in-process,worker-host --test classic_rows
 ```
 
-A few rows of each sheet are also copied into the crate's test source, and the replay holds each copy to its sheet.
+A few rows of each sheet a module replays are also copied into the crate's test source, and the replay holds each
+copy to its sheet.
+
+`retry_wire.json`, `media_refs.json`, `context_window.json`, `sticky_rank.json` and
+`encode_pair.json` replay over worker objects, which the `in-process` feature brings. The encode sheet's fleets are
+decided by the engine's entry for an encode request over three lists of worker objects.
+
+`overload.json` replays through the worker crate's load monitor, built as a host of the engine over worker lists
+builds it, which the `worker-host` feature brings.
+
+`minimum_tokens.json` replays through the rank cache of that load monitor, behind the same feature.
 
 ## Limits left
 
@@ -387,25 +390,31 @@ fails once the reason no longer holds.
 - `power_of_two.json`: none. All 44 rows replay.
 - `all_vetoed.json`: none. All 104 rows replay.
 - `pair_index.json`: none. All 23 rows replay.
-- `encode_pair.json`: none is recorded yet. The module that replays it arrives with the crate's encoder lists
-  and its rule for encode items; until then the replay owes this sheet.
-- `pair_select.json`: none is recorded yet. The module that replays it arrives with the crate's pair
-  decision; until then the replay owes this sheet.
-- `overload.json`: six rows are decided apart, each by a rule of the crate's store that the replay names with the
-  verdicts the store gives. The store holds a usage and its threshold in permille, so a usage within half a permille
-  under the threshold reads at it (`a-usage-under-the-threshold-by-less-than-half-a-permille-is-under-it`). The
-  gateway stops reading a rank at once. The store judges every write over every sample it holds for the worker that
-  lies within three report periods of the worker's newest, and the replay sets one period between two steps. So a
-  rank an answer omits is read for three periods more (`a-rank-an-answer-omits-leaves-the-sum-at-once`,
-  `a-rank-an-answer-omits-leaves-the-mean-at-once`). A pushed record is judged beside a poll's figures for a rank
-  that never pushed until those lie three periods behind
-  (`a-record-after-a-poll-is-judged-over-the-ranks-that-have-pushed`,
-  `a-record-s-usage-is-judged-over-the-ranks-that-have-pushed`). An answer with no entry changes nothing the store
-  holds (`an-answer-that-names-no-rank-takes-the-ranks-that-pushed-before-it-off-the-report`). Each of these five
-  rows repeats the step that leaves a rank unheard, and replays as recorded from its fourth repeat on. A rank an
-  answer leaves out beside a named one carries the overload bit alone, as the store's avoidance of that rank: the
-  replay reads a worker's verdict off the rows of the ranks its last answer named. It fails where those rows carry
-  two verdicts, and where a rank left out carries no bit. The other 19 rows replay.
+- `encode_pair.json`: all 52 rows replay. In the nine that place items by consistent hashing a key's encoder is
+  not held to the recorded one: two rings place no key alike. The replay holds each key to the encoders it was
+  offered and equal keys to one encoder.
+- `pair_select.json`: one row is decided apart, named by the replay with the answer the pair's decision gives. It
+  is a refusal's reason: where the only ready prefill's partners are all over their thresholds beside a free decode
+  of another transport, the gateway answers unavailable and the pair's decision names the overload veto. The other
+  39 rows replay, the four of a prefill policy that weighs load against cache affinity itself (`cache_aware`)
+  among them: the gateway lifts the overload veto for such a policy and lets it place, and a prefill profile that
+  reads affinity runs with that veto lifted under a binding that steers.
+- `overload.json`: none where the worker is one object for all its ranks, as the recording gateway held it. All 25
+  rows replay there, verdict for verdict, through the worker crate's load monitor. The replay builds the holder of
+  worker objects with the calls a controller builds its own with, and writes the row's worker into the store the
+  holder follows. It hands the monitor each step: a poll through the monitor's poll of the worker's group, a pushed
+  record through the record's own entry, and an eviction as the worker's row leaving the ready set. It reads the
+  verdict off the worker object, where the engine reads it: the engine judges no load.
+  Eleven of the 14 rows of several ranks answer apart where each rank is a worker object of its own, as a
+  registration of several ranks lays them. The replay runs those 14 rows a second time in that layout and names
+  the eleven, each with the verdict on each rank's object. One rule holds all eleven: there the monitor judges a
+  rank's object by its own rank's figures, not by the queue summed and the usage averaged over the engine's ranks.
+  Two ranks that queue 4 requests each under a threshold of 8 are vetoed as one worker and not as two
+  (`the-queue-vetoes-at-its-count-and-above-summed-over-two-ranks`). Under a usage threshold of 0.5 a rank at 0.5
+  is vetoed alone where the mean over both ranks is 0.375 and the one worker is not vetoed
+  (`the-usage-vetoes-at-its-mean-and-above-over-two-ranks`). A rank's object states the address, the engine's
+  address, the rank and the width that the worker crate's builder gives a rank worker, which a gateway that
+  registers each data-parallel rank as a worker builds its workers with.
 - `manual.json`: one row is owed, `manual-one-key-pins-apart-under-the-prefill-and-the-decode-role`. The gateway
   keeps a key's pins apart under each role of a prefill and decode pair. The crate refuses a sessions rule under a
   pair plan today, so it cannot build the row; the other 13 rows replay.
@@ -418,26 +427,27 @@ fails once the reason no longer holds.
 - `bucket.json`: none. All 19 rows replay.
 - `cache_aware.json`: none. All 28 rows replay.
 - `sticky_override.json`: none. All 18 rows replay.
-- `minimum_tokens.json`: ten rows are decided apart, each by a rule of the crate's store or scorer that the
-  replay names with the ranks the crate gives. The gateway reads the tokens a rank's cache uses, and only from an
-  entry that carries token capacity. The crate scores a rank by the context tokens of the requests it holds
-  (`the-used-tokens-decide-where-a-rank-holds-fewer-context-tokens`), whatever capacity its entry carries
-  (`a-row-with-no-token-capacity-is-no-rank`, `an-answer-with-no-token-capacity-drops-the-worker-s-ranks`). Where no
-  rank counts its context tokens the requests in flight decide
-  (`a-rank-that-reports-no-context-tokens-is-a-rank-by-its-used-tokens`). The gateway forgets a worker's ranks at an
-  answer with no entry. The store reads that answer as the word that no report came and keeps what is on file
-  (`an-answer-with-no-row-drops-the-worker-s-ranks`). A rank an answer leaves out beside a rank it names is avoided
-  on both sides from that answer on, and its two rows replay pick for pick
-  (`a-rank-an-answer-omits-is-no-rank-at-once`, `a-rank-five-answers-omit-is-no-rank-after-any-of-them`). The
-  gateway has no rank for a worker it holds no answer of. The crate hands a decision every rank row of the worker,
-  and one with nothing on file scores beside its peers (`a-worker-never-polled-has-no-rank`,
-  `an-evicted-worker-has-no-rank-until-its-next-answer`), so a worker of one rank row answers with it
-  (`a-worker-of-one-rank-the-answer-omits-has-none`, `an-answer-with-no-row-drops-the-one-rank-of-its-worker`). The
-  gateway takes the lowest of equal ranks, and the crate draws among them (`equal-ranks-go-to-the-lowest-rank`).
-  The other eight rows replay.
+- `minimum_tokens.json`: none through the load monitor's rank cache. All 18 rows replay there, rank for rank.
+  A row records the rank the load monitor's rank cache gives a request
+  on a worker that stands for several ranks: an answer of the host's own code, asked after the pick. The crate's
+  store listed a row a rank and decided these rows by rules of its own, eight as recorded and ten apart, until the
+  replay stopped reading that store.
+  The replay builds the monitor as the overload sheet's replay does and hands it each poll, failed poll and
+  eviction. It asks the monitor's rank cache for each request's rank, with the worker as one object for all its
+  ranks, or as the object of its one rank in the three rows that say so.
+  It does not replay the engine's pick among rank objects, and these rows are not that pick's answers. The engine
+  serves no rank option: `refuse_unsupported` in `src/document/routing_settings.rs` refuses the gateway's, and
+  where each rank is a worker object the engine picks among them by its profile.
+  Three of the ten rows answer apart under the engine's pick among rank objects,
+  by rules of its scorer and picker. There a rank is scored by the
+  context tokens of its requests, not by the tokens its cache uses
+  (`the-used-tokens-decide-where-a-rank-holds-fewer-context-tokens`,
+  `a-rank-that-reports-no-context-tokens-is-a-rank-by-its-used-tokens`), and equal ranks are drawn, where the
+  gateway takes the lowest (`equal-ranks-go-to-the-lowest-rank`).
 - `sticky_rank.json`: four rows are decided apart. The gateway sets no rank on a request with no sticky key, on a
   worker of one engine or of no count it knows, and on a key whose hash rank its connection places no pin on: the
-  connection then places the request on any engine. The crate gives every request a rank row of the worker, a
+  connection then places the request on any engine. The replay lists a worker object a rank, and the engine over
+  worker lists gives every request one of them, a
   key's owner on the ring of the ranks its host lists and the picker's draw for a request with no key
   (`a-request-with-no-key-takes-no-rank`, `a-worker-of-one-engine-takes-no-rank`,
   `a-worker-that-names-no-count-takes-no-rank-where-its-connection-says-none`,
@@ -447,10 +457,12 @@ fails once the reason no longer holds.
   row share for share.
 - `retry_wire.json`: every row replays. A worker states its runtime as a number of its registering host's, and
   a retry demands the number of its plan's runtime, so the replay numbers a row's runtimes itself, one a
-  spelling. A refusal replays by its `status` and its `code`. The crate sheds under a reason and a stage's
+  spelling on each transport: a retry stays on its wire by that number alone, and its pool is one list
+  whatever transports its workers dial.
+  A refusal replays by its `status` and its `code`. The crate sheds under a reason and a stage's
   name, and the replay keeps the gateway's words for each: a model no worker serves and a wire no worker is on
   are no model, a pool over its thresholds on every worker of the wire is overloaded where shedding is on, and
   any other pool left nobody is unavailable. The `message` and `retry_after` are no part of a decision.
-- `media_refs.json`, `context_window.json`, `constraint_decider.json`, `rank_pin.json`: owed whole. Of a
-  request's hard demands the crate keeps the wire of a retry alone yet, so no module replays these sheets, and
-  the replay names each as owed until the change that keeps its demand brings its module.
+- `media_refs.json`, `context_window.json`: every row replays.
+- `constraint_decider.json`: owed whole. No module replays this sheet yet, and the replay names it as owed
+  until the change that brings its module.

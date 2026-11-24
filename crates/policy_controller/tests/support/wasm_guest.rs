@@ -130,6 +130,9 @@ pub mod mode {
     pub const NAN_BAND: u8 = SCORE_BAND + 1;
     /// `score` answers a tie band above one.
     pub const ABOVE_ONE_BAND: u8 = NAN_BAND + 1;
+    /// `score` writes a log line, then spins: a call a test can hold the
+    /// thread in, which then runs until its fuel or its bound ends it.
+    pub const LOG_THEN_SPIN: u8 = ABOVE_ONE_BAND + 1;
     /// A second config byte: `init` asks the host's live clock once. An
     /// answer of zero lets it go on, of one makes it refuse, of two spin
     /// without end, of three trap at once.
@@ -626,6 +629,10 @@ fn guest_wat_with_band(guest: Guest, band: f32) -> String {
         (if (i32.eq (local.get $len) (i32.const 3)) (then unreachable))))
     (if (i32.or (i32.eq (global.get $mode) (i32.const {log_then_burn})) (i32.eq (global.get $mode) (i32.const {log_then_decline})))
       (then (call $log (i32.const 2) (i32.const 32) (i32.const 8))))
+    (if (i32.eq (global.get $mode) (i32.const {log_then_spin}))
+      (then
+        (call $log (i32.const 2) (i32.const 32) (i32.const 8))
+        (loop $spin (br $spin))))
     (if (i32.or (i32.or (i32.eq (global.get $mode) (i32.const {fill})) (i32.eq (global.get $mode) (i32.const {fill_then_fill}))) (i32.eq (global.get $mode) (i32.const {fill_briefly})))
       (then
         ;; The filter of the second mode grew the memory already: a second
@@ -842,6 +849,7 @@ fn guest_wat_with_band(guest: Guest, band: f32) -> String {
         log_dtor = mode::LOG_IN_DESTRUCTOR,
         log_then_burn = mode::LOG_THEN_BURN,
         log_then_decline = mode::LOG_THEN_DECLINE,
+        log_then_spin = mode::LOG_THEN_SPIN,
         fill_briefly = mode::FILL_BRIEFLY_THEN_FILL,
         count_dispatches = mode::COUNT_DISPATCHES,
         count_members = mode::COUNT_MEMBERS,

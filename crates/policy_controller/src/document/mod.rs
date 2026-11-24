@@ -8,10 +8,10 @@ pub(crate) mod routing_key;
 pub(crate) mod routing_settings;
 pub(crate) mod spec;
 
-pub use routing_key::{strip_lineage, DerivedKey, KeySource, KeySources};
+pub use routing_key::{strip_lineage, DerivedKey, DerivedKeys, KeySource, KeySources};
 pub use routing_settings::{
-    LoadMetricSetting, ModeSettings, PolicySettings, RoutingKeyOverrideSettings, RoutingSettings,
-    RoutingSettingsError,
+    ConnectionModeSetting, LoadMetricSetting, ModeSettings, PolicySettings,
+    RoutingKeyOverrideSettings, RoutingSettings, RoutingSettingsError,
 };
 pub use spec::{
     AcrossRanks, AdmissionSpec, AffinitySource, AppliedSpec, Assignment, BestParams,
@@ -20,10 +20,11 @@ pub use spec::{
     FilterStage, HasRoomParams, HeaderMatch, IndexKind, IndexSpec, KeySourceSpec, KvPressureParams,
     LeastCostParams, LeastLoadParams, Match, Needs, OverloadSpec, Override, Pairing,
     PdPairPlanSpec, PickSpec, PickStage, PlanName, PlansSpec, PolicySpec, PrefixAffinityParams,
-    ProfileSpec, Recovery, ResidentWorkParams, RoutingKeySpec, ScoreSpec, ScoreStage, SessionsSpec,
-    ShadowSpec, SignalSpec, SpecError, SpillParams, Unreported, ViewListPositions, ViewLists,
-    ViewSpec, WarmupSliceParams, Weight, API_VERSION, DENIED_HEADERS, DENIED_KEY_HEADERS, FILTERS,
-    KEY_BYTES, MANUAL_SESSION_HEADER, MAX_BLOCK_HASHES, MAX_CLIENT_SOURCES, MAX_ENGINES,
-    MAX_HEADERS, MAX_KEY_BYTES, MAX_KEY_SOURCES, MAX_LABELS, MAX_SIGNALS, MAX_ZONES,
-    OVERLOAD_TOKEN_USAGE, OVERLOAD_WAITING_REQUESTS, PICKERS, PRESETS, SCORERS,
+    ProfileSpec, Recovery, ResidentWorkParams, RoutingKeySpec, RulePlaced, ScoreSpec, ScoreStage,
+    SessionsSpec, ShadowSpec, SignalSpec, SpecError, SpillParams, Unreported, ViewListPositions,
+    ViewLists, ViewSpec, WarmupSliceParams, Weight, API_VERSION, DENIED_HEADERS,
+    DENIED_KEY_HEADERS, FILTERS, KEY_BYTES, MANUAL_SESSION_HEADER, MAX_BLOCK_HASHES,
+    MAX_CLIENT_SOURCES, MAX_ENGINES, MAX_HEADERS, MAX_KEY_BYTES, MAX_KEY_SOURCES, MAX_LABELS,
+    MAX_SIGNALS, MAX_ZONES, OVERLOAD_TOKEN_USAGE, OVERLOAD_WAITING_REQUESTS, PICKERS, PRESETS,
+    SCORERS,
 };

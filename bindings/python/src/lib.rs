@@ -519,7 +519,7 @@ impl PyPostgresConfig {
 struct Router {
     // The constructor's positional parameters, in their order.
     worker_urls: Vec<String>,
-    policy: PolicyType,
+    policy: Option<PolicyType>,
     host: String,
     port: u16,
     // The keyword-only parameters, in alphabetical order, as the `#[pyo3(signature)]`
@@ -612,6 +612,7 @@ struct Router {
     least_load_kv_pressure_weight: f64,
     least_load_mean_prefill_tokens: u32,
     load_monitor_interval: u64,
+    load_monitor_interval_ms: Option<u64>,
     log_dir: Option<String>,
     log_json: bool,
     log_level: Option<String>,
@@ -653,11 +654,14 @@ struct Router {
     otlp_traces_endpoint: String,
     overlap_decay: f32,
     overload_token_usage_threshold: f32,
+    pairing_protocol_label: String,
     /// `symphony` (the default) or `legacy`: which parser reads a chat completion's output.
     parser: String,
     pd_admission_wait_secs: u64,
     pd_disaggregation: bool,
     pd_pairing_mode: String,
+    policy_controller: String,
+    policy_spec: Option<String>,
     postgres_config: Option<PyPostgresConfig>,
     power_of_two_load_metric: String,
     prefill_expected_workers: Option<usize>,
@@ -1049,6 +1053,18 @@ impl Router {
             })
     }
 
+    fn parse_policy_controller(&self) -> Result<bool, config::ConfigError> {
+        match self.policy_controller.as_str() {
+            "on" => Ok(true),
+            "off" => Ok(false),
+            other => Err(config::ConfigError::invalid_value(
+                "policy_controller",
+                other,
+                "expected 'on' or 'off'",
+            )),
+        }
+    }
+
     fn parse_assignment_mode(
         &self,
         default: config::ManualAssignmentMode,
@@ -1281,7 +1297,11 @@ impl Router {
             }
         };
 
-        let policy = convert_policy(&self.policy)?;
+        let policy = match self.policy.as_ref() {
+            Some(policy) => convert_policy(policy)?,
+            None if self.policy_spec.is_some() => config::RouterConfig::default().policy,
+            None => convert_policy(&PolicyType::CacheAware)?,
+        };
 
         let discovery = if self.service_discovery {
             Some(DiscoveryConfig::Kubernetes(KubernetesDiscoveryConfig {
@@ -1298,6 +1318,7 @@ impl Router {
                 worker_ports_annotation: self.worker_ports_annotation.clone(),
                 kv_connector_annotation: self.kv_connector_annotation.clone(),
                 kv_engine_id_annotation: self.kv_engine_id_annotation.clone(),
+                pairing_protocol_label: self.pairing_protocol_label.clone(),
                 router_selector: self.router_selector.clone(),
                 router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
                 model_id_source: self.model_id_from.clone(),
@@ -1395,6 +1416,7 @@ impl Router {
 
         let pd_pairing_mode = self.parse_pd_pairing_mode()?;
         let grouped_dp_sticky = self.parse_grouped_dp_sticky()?;
+        let policy_controller = self.parse_policy_controller()?;
 
         config::RouterConfig::builder()
             .mode(mode)
@@ -1434,6 +1456,7 @@ impl Router {
             )
             .disable_load_monitoring(self.disable_load_monitoring)
             .load_monitor_interval_secs(self.load_monitor_interval)
+            .load_monitor_interval_ms(self.load_monitor_interval_ms)
             .pd_admission_wait_secs(self.pd_admission_wait_secs)
             .max_concurrent_requests(self.max_concurrent_requests)
             .queue_size(self.queue_size)
@@ -1525,6 +1548,8 @@ impl Router {
             .maybe_reasoning_parser(self.reasoning_parser.as_ref())
             .maybe_tool_call_parser(self.tool_call_parser.as_ref())
             .maybe_mcp_config_path(self.mcp_config_path.as_ref())
+            .policy_controller(policy_controller)
+            .maybe_policy_spec_path(self.policy_spec.as_ref())
             .maybe_storage_hook_wasm_path(self.storage_hook_wasm_path.as_deref())
             .enable_wasm(self.enable_wasm)
             .dp_aware(self.dp_aware)
@@ -1591,7 +1616,7 @@ impl Router {
     #[new]
     #[pyo3(signature = (
         worker_urls,
-        policy = PolicyType::CacheAware,
+        policy = None,
         host = String::from("0.0.0.0"),
         port = 30000,
         // Every other parameter is keyword-only, in alphabetical order (the struct's
@@ -1678,6 +1703,7 @@ impl Router {
         least_load_kv_pressure_weight = 0.15,
         least_load_mean_prefill_tokens = 1024,
         load_monitor_interval = 10,
+        load_monitor_interval_ms = None,
         log_dir = None,
         log_json = false,
         log_level = None,
@@ -1717,10 +1743,13 @@ impl Router {
         otlp_traces_endpoint = String::from("localhost:4317"),
         overlap_decay = 0.0,
         overload_token_usage_threshold = 1.0,
+        pairing_protocol_label = String::from("smg.ai/pairing-protocol"),
         parser = String::from("symphony"),
         pd_admission_wait_secs = 30,
         pd_disaggregation = false,
         pd_pairing_mode = String::from("lenient"),
+        policy_controller = String::from("off"),
+        policy_spec = None,
         postgres_config = None,
         power_of_two_load_metric = String::from("expected_wait"),
         prefill_expected_workers = None,
@@ -1820,7 +1849,7 @@ impl Router {
     /// Store launcher settings; configuration validation runs before the server starts.
     fn new(
         worker_urls: Vec<String>,
-        policy: PolicyType,
+        policy: Option<PolicyType>,
         host: String,
         port: u16,
         // Keyword-only, in the signature's order (pyo3 wants the two orders to agree).
@@ -1905,6 +1934,7 @@ impl Router {
         least_load_kv_pressure_weight: f64,
         least_load_mean_prefill_tokens: u32,
         load_monitor_interval: u64,
+        load_monitor_interval_ms: Option<u64>,
         log_dir: Option<String>,
         log_json: bool,
         log_level: Option<String>,
@@ -1944,10 +1974,13 @@ impl Router {
         otlp_traces_endpoint: String,
         overlap_decay: f32,
         overload_token_usage_threshold: f32,
+        pairing_protocol_label: String,
         parser: String,
         pd_admission_wait_secs: u64,
         pd_disaggregation: bool,
         pd_pairing_mode: String,
+        policy_controller: String,
+        policy_spec: Option<String>,
         postgres_config: Option<PyPostgresConfig>,
         power_of_two_load_metric: String,
         prefill_expected_workers: Option<usize>,
@@ -2183,6 +2216,7 @@ impl Router {
             least_load_kv_pressure_weight,
             least_load_mean_prefill_tokens,
             load_monitor_interval,
+            load_monitor_interval_ms,
             log_dir,
             log_json,
             log_level,
@@ -2222,10 +2256,13 @@ impl Router {
             otlp_traces_endpoint,
             overlap_decay,
             overload_token_usage_threshold,
+            pairing_protocol_label,
             parser,
             pd_admission_wait_secs,
             pd_disaggregation,
             pd_pairing_mode,
+            policy_controller,
+            policy_spec,
             postgres_config,
             power_of_two_load_metric,
             prefill_expected_workers,
@@ -2333,6 +2370,78 @@ impl Router {
             PrometheusConfig::validate_duration_buckets(buckets).map_err(|e| {
                 pyo3::exceptions::PyValueError::new_err(format!("Configuration error: {e}"))
             })?;
+        }
+
+        // A policy document replaces the routing settings, and the
+        // configuration would drop most of them in silence. Each one that is
+        // not at the constructor's own default is refused by name, in one
+        // list, as the launcher refuses it. A policy name has no default, so
+        // one that was given is in the list whatever it names.
+        if self.policy_spec.is_some() {
+            let plain: Self = py
+                .get_type::<Self>()
+                .call1((Vec::<String>::new(),))?
+                .extract()?;
+            macro_rules! moved {
+                ($($setting:ident),* $(,)?) => {
+                    [$((stringify!($setting), self.$setting != plain.$setting)),*]
+                };
+            }
+            // The launcher's list of the settings a document replaces, in its
+            // order.
+            let moved: Vec<&str> = moved![
+                policy,
+                cache_threshold,
+                balance_abs_threshold,
+                balance_rel_threshold,
+                balance_prefix_margin_tokens,
+                balance_uncached_credit,
+                bucket_adjust_interval_secs,
+                balance_token_usage_threshold,
+                overload_token_usage_threshold,
+                worker_overload_protection,
+                worker_overload_shed,
+                overlap_decay,
+                selection_temperature,
+                selection_policy,
+                selection_accounting_ttl_ms,
+                eviction_interval_secs,
+                max_tree_size,
+                block_size,
+                cache_boundaries,
+                cache_index,
+                cache_ttl_secs,
+                max_idle_secs,
+                assignment_mode,
+                prefix_token_count,
+                prefix_hash_load_factor,
+                prefix_hash_balance_abs_threshold,
+                least_load_kv_pressure_weight,
+                least_load_default_throughput,
+                least_load_mean_prefill_tokens,
+                power_of_two_load_metric,
+                routing_key_override,
+                pd_pairing_mode,
+                grouped_dp_sticky,
+                dp_minimum_tokens_scheduler,
+                worker_warmup_secs,
+                worker_warmup_share,
+                worker_warmup_blocks,
+                worker_warmup_thin_ratio,
+                worker_warmup_divert_every,
+                prefill_policy,
+                decode_policy,
+                encode_policy,
+            ]
+            .into_iter()
+            .filter_map(|(name, moved)| moved.then_some(name))
+            .collect();
+            if !moved.is_empty() {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "Configuration error: a policy document replaces the routing settings, and these are set beside it: {}",
+                    moved.join(", ")
+                )));
+            }
         }
 
         // Validated once, by the builder's `build()` inside `to_router_config`;

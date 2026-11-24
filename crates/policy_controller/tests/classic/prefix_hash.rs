@@ -16,6 +16,13 @@
 //! and idle, then with the members found so far down. A request that has no
 //! key on this side has no ring order, and its row is read in its own order.
 //!
+//! A row that says where each of its requests stands on a ring is replayed
+//! a second time on a ring its caller lends, built from the row
+//! ([`replay_on_a_lent_ring`]): the ring reaches the row's workers in the
+//! row's order from where the ring request stands, and in a level's order
+//! from where the request's head at that level does. Its requests state
+//! those places and no block hash.
+//!
 //! A pairs row places pairs of prompts on an idle pool and counts the pairs
 //! whose two prompts took one worker, then the pairs that took two. Prompt
 //! `i` of such a row is `tokens` ids from `1_000_000 + 1_000 * i` on, and
@@ -32,6 +39,7 @@ use smg_policy_controller::{
         fingerprint, Candidate, Constraints, Engine, HashKind, Health, Identity, PoolFacts,
         RequestFacts, Scratch, WorkerId,
     },
+    policies::consistent_hashing::LentRing,
 };
 
 use crate::{same_outcome, Outcome};
@@ -180,6 +188,9 @@ struct Hashed {
     kind: HashKind,
     tokens: u32,
     tried: Vec<usize>,
+    /// Where the request stands on the ring its caller lends, for a row
+    /// replayed on one.
+    places: Vec<u64>,
 }
 
 impl Hashed {
@@ -192,6 +203,7 @@ impl Hashed {
             kind: HashKind::Token,
             tokens: ids.len() as u32,
             tried: Vec::new(),
+            places: Vec::new(),
         }
     }
 
@@ -205,6 +217,7 @@ impl Hashed {
             kind: HashKind::Text,
             tokens: ids.len() as u32,
             tried: Vec::new(),
+            places: Vec::new(),
         }
     }
 
@@ -228,6 +241,28 @@ impl Hashed {
     }
 }
 
+/// The address of the worker a row lists at `i`, under a lent ring.
+fn address(i: usize) -> String {
+    format!("worker-{i}")
+}
+
+/// A caller's hash ring over a row's workers, built from the row: the walk
+/// from the place `n` reaches them in the `n`th of these orders, as the
+/// recorder found them on the gateway's ring.
+#[derive(Debug)]
+struct ByOrders(Vec<Vec<usize>>);
+
+impl LentRing for ByOrders {
+    fn position(&self, _: &str) -> u64 {
+        0
+    }
+
+    fn walk(&self, position: u64, take: &mut dyn FnMut(&str) -> bool) {
+        let order = self.0.get(position as usize).map_or(&[][..], Vec::as_slice);
+        let _ = order.iter().any(|&i| take(&address(i)));
+    }
+}
+
 /// The engine of the row's configuration over the row's pool. `places[i]`
 /// is where the row's worker `i` stands in the pool: the row's own order,
 /// or the ring order of a ring row's request.
@@ -235,6 +270,8 @@ struct Bed {
     engine: Engine,
     pool: Vec<Candidate>,
     places: Vec<usize>,
+    /// The ring the row's requests are lent, for a row replayed on one.
+    lent: Option<ByOrders>,
     scratch: Scratch,
     /// The seed of the next decision: each has its own.
     seed: u64,
@@ -262,11 +299,22 @@ impl Bed {
             engine,
             pool,
             places: places.to_vec(),
+            lent: None,
             scratch: Scratch::new(),
             seed: u64::from(run) * 1_000_000,
         };
         bed.loads(loads);
         Ok(bed)
+    }
+
+    /// The bed with `ring` lent to its requests: the pool's rows then
+    /// carry their addresses' ids.
+    fn lend(mut self, ring: ByOrders) -> Self {
+        for row in &mut self.pool {
+            row.id = WorkerId::from_address(&address(row.position as usize));
+        }
+        self.lent = Some(ring);
+        self
     }
 
     fn loads(&mut self, loads: &[u32]) {
@@ -292,6 +340,7 @@ impl Bed {
             .iter()
             .map(|&i| self.pool[self.places[i]].id)
             .collect();
+        let ring = self.lent.as_ref().map(|ring| ring as &dyn LentRing);
         let facts = RequestFacts {
             model: "m",
             session_key: request
@@ -299,10 +348,14 @@ impl Bed {
                 .as_deref()
                 .map_or(Identity::NONE, Identity::plain),
             prompt_tokens: request.tokens,
-            block_hashes: &request.hashes,
+            // A caller that lends its ring states where the request stands
+            // on it: the stage is handed no block hash.
+            block_hashes: if ring.is_some() { &[] } else { &request.hashes },
             hash_kind: request.kind,
             tried: &tried,
             seed: self.seed,
+            ring,
+            ring_positions: &request.places,
             ..RequestFacts::default()
         };
         let pool_facts = PoolFacts {
@@ -427,19 +480,64 @@ impl Row {
         Err("no prompt among a thousand stands as the row's levels do".to_string())
     }
 
+    /// Where `request` stands on the ring this row's caller lends: at the
+    /// place `0` with the row's ring request where it shares that request's
+    /// key or its head, the first tokens the configuration keys a prompt
+    /// by, and behind it at the place of each of the row's levels. A
+    /// request with nothing to hash stands nowhere. `None` where the row
+    /// does not say: the request's key or head is another one.
+    fn stands(&self, request: &Request) -> Option<Vec<u64>> {
+        let head = |request: &Request| {
+            let (runs, text) = match (&request.tokens, &request.text) {
+                (Some(runs), _) => (runs, false),
+                (None, Some(runs)) => (runs, true),
+                (None, None) => return None,
+            };
+            let mut ids = ids(runs);
+            ids.truncate(self.config.prefix_token_count as usize);
+            // A prompt of no token has nothing to hash, as in classic.
+            (!ids.is_empty()).then_some((ids, text))
+        };
+        if request.key.is_none() && head(request).is_none() {
+            return Some(Vec::new());
+        }
+        let ring = self.ring.as_ref()?;
+        if request.key.is_some() {
+            return (request.key == ring.key).then(|| vec![0]);
+        }
+        (ring.key.is_none() && head(request) == head(ring))
+            .then(|| (0..=self.levels.len() as u64).collect())
+    }
+
     /// The row's steps decided once from a fresh engine: the worker each
-    /// request went to. `own` stands in for a level row's request.
-    fn run(&self, places: &[usize], own: Option<&Hashed>, run: u32) -> Result<Vec<usize>, String> {
+    /// request went to. `own` stands in for a level row's request. Under
+    /// `lent` the requests are lent a ring built from the row and state
+    /// where they stand on it.
+    fn run(
+        &self,
+        places: &[usize],
+        own: Option<&Hashed>,
+        run: u32,
+        lent: bool,
+    ) -> Result<Vec<usize>, String> {
         let mut bed = Bed::new(&self.config, &self.workers, places, run)?;
+        if lent {
+            let levels = self.levels.iter().map(|level| level.order.clone());
+            let orders = std::iter::once(places.to_vec()).chain(levels);
+            bed = bed.lend(ByOrders(orders.collect()));
+        }
         let mut answers = Vec::new();
         for step in &self.steps {
             match step {
                 Step::Pick(request) => {
-                    let request = match own {
+                    let mut hashed = match own {
                         Some(own) if Some(request) == self.ring.as_ref() => own.clone(),
                         _ => Hashed::of(request),
                     };
-                    answers.push(bed.place(&request));
+                    if lent {
+                        hashed.places = self.stands(request).unwrap_or_default();
+                    }
+                    answers.push(bed.place(&hashed));
                 }
                 Step::Loads(loads) => bed.loads(loads),
                 Step::Ready(ready) => bed.ready(ready),
@@ -451,13 +549,17 @@ impl Row {
     /// A row of steps: the one sequence every run gives. Where a draw
     /// decides, the runs differ, and the outcome is how often each worker
     /// took the row's last request, a shape no recorded sequence has.
-    fn sequence(&self) -> Result<Outcome, String> {
-        let (places, own) = self.places()?;
-        let first = self.run(&places, own.as_ref(), 0)?;
+    fn sequence(&self, lent: bool) -> Result<Outcome, String> {
+        let (places, own) = if lent {
+            (in_order(self.workers.len()), None)
+        } else {
+            self.places()?
+        };
+        let first = self.run(&places, own.as_ref(), 0, lent)?;
         let mut counts = vec![0u32; self.workers.len()];
         let mut one = true;
         for run in 0..RUNS {
-            let answers = self.run(&places, own.as_ref(), run)?;
+            let answers = self.run(&places, own.as_ref(), run, lent)?;
             one &= answers == first;
             if let Some(&last) = answers.last() {
                 counts[last] += 1;
@@ -513,8 +615,19 @@ impl Row {
     fn replay(&self) -> Result<Outcome, String> {
         match self.prompts {
             Some(prompts) => self.counted(prompts),
-            None => self.sequence(),
+            None => self.sequence(false),
         }
+    }
+
+    /// The row's outcome on a ring its caller lends, for a row that says
+    /// where each of its requests stands on one ([`Self::stands`]). `None`
+    /// for any other: a pairs row, a spread row.
+    fn on_a_lent_ring(&self) -> Option<Result<Outcome, String>> {
+        let stated = self.steps.iter().all(|step| match step {
+            Step::Pick(request) => self.stands(request).is_some(),
+            Step::Loads(_) | Step::Ready(_) => true,
+        });
+        (self.prompts.is_none() && stated).then(|| self.sequence(true))
     }
 }
 
@@ -613,6 +726,256 @@ pub fn replay_rows(text: &str, source: &str) -> (usize, Vec<String>) {
         })
         .collect();
     (sheet.rows.len(), defects)
+}
+
+/// The rows of a sheet that say where their requests stand on a ring,
+/// replayed on a ring their caller lends: how many they are, and each one
+/// whose answer is not the recorded one. No row is decided apart there: a
+/// request's place on the ring is its caller's to state, whatever its
+/// length.
+pub fn replay_on_a_lent_ring(text: &str) -> (usize, Vec<String>) {
+    let sheet: Sheet = serde_json::from_str(text).expect("a sheet of these rows");
+    let replayed: Vec<(&Row, Result<Outcome, String>)> = sheet
+        .rows
+        .iter()
+        .filter_map(|row| Some((row, row.on_a_lent_ring()?)))
+        .collect();
+    let defects = replayed.iter().filter_map(|(row, here)| match here {
+        Ok(here) if same_outcome(&row.outcome, here) => None,
+        Ok(here) => Some(format!(
+            "{}: recorded {:?}, replayed {here:?}",
+            row.name, row.outcome
+        )),
+        Err(why) => Some(format!("{}: refused here: {why}", row.name)),
+    });
+    (replayed.len(), defects.collect())
+}
+
+/// The rows that say where their requests stand on a ring, played through
+/// the one call a gateway asks, over worker objects
+/// ([`PolicyEngine::place`](smg_policy_controller::engine::PolicyEngine::place)).
+/// The caller lends the row's ring and states no place: the engine cuts
+/// each request into its heads and asks the lender where each stands.
+#[cfg(feature = "in-process")]
+pub mod through_the_one_call {
+    use std::sync::Arc;
+
+    use openai_protocol::worker::WorkerStatus;
+    use smg_policy_controller::{
+        document::AppliedSpec,
+        engine::{
+            HeaderRead, LentList, ListCell, PlaceRequest, PolicyEngine, Prompt, WorkerId,
+            WorkerLists,
+        },
+        policies::consistent_hashing::{Head, LentRing},
+    };
+    use smg_worker::{identity::basic::Worker, test_support::ready_worker};
+
+    use super::{ids, in_order, same_outcome, Outcome, Request, Row, Sheet, Step};
+
+    const MODEL: &str = "m";
+
+    /// The address of the worker a row lists at `i`.
+    fn url(i: usize) -> String {
+        format!("http://worker-{i}:8000")
+    }
+
+    /// A prompt carried as text: each id spelled as four hex digits.
+    fn spelled(ids: &[u32]) -> String {
+        ids.iter().map(|id| format!("{id:04x}")).collect()
+    }
+
+    /// A head as a row's lender keeps it.
+    #[derive(Debug)]
+    enum Kept {
+        Tokens(Vec<u32>),
+        Text(String),
+    }
+
+    /// A row's ring as its caller lends it. The head `heads[n]` stands at
+    /// the place `n`, and the walk from there reaches the row's workers in
+    /// the order `orders[n]`, as the recorder found them on the gateway's
+    /// ring. A head the row says nothing of is no head of its requests.
+    #[derive(Debug)]
+    struct Lender {
+        heads: Vec<Kept>,
+        orders: Vec<Vec<usize>>,
+    }
+
+    impl LentRing for Lender {
+        // The prefix form reads no place of a key's own text: a request
+        // stated this one stands where the row's walk reaches no worker.
+        fn position(&self, _: &str) -> u64 {
+            u64::MAX
+        }
+
+        fn head_position(&self, head: Head<'_>) -> Option<u64> {
+            let stands = |kept: &Kept| match (kept, head) {
+                (Kept::Tokens(kept), Head::Tokens(ids)) => kept == ids,
+                (Kept::Text(kept), Head::Text(text)) => kept == text,
+                _ => false,
+            };
+            let at = self.heads.iter().position(stands);
+            Some(at.expect("a head the row places") as u64)
+        }
+
+        fn walk(&self, position: u64, take: &mut dyn FnMut(&str) -> bool) {
+            let order = self.orders.get(position as usize);
+            let _ = order.is_some_and(|order| order.iter().any(|&i| take(&url(i))));
+        }
+    }
+
+    impl Row {
+        /// The first `tokens` tokens of `request` as its lender keeps a
+        /// head: its routing key whole, else its ids, else its text at
+        /// four characters a token.
+        fn kept(request: &Request, tokens: usize) -> Option<Kept> {
+            if let Some(key) = &request.key {
+                return Some(Kept::Text(key.clone()));
+            }
+            let cut = |runs: &[[u32; 2]]| {
+                let mut ids = ids(runs);
+                ids.truncate(tokens);
+                ids
+            };
+            // Token ids lead a text, and an empty list of them leaves it.
+            let ids_stated = |runs: &&Vec<[u32; 2]>| !runs.is_empty();
+            match (request.tokens.as_ref().filter(ids_stated), &request.text) {
+                (Some(runs), _) => Some(Kept::Tokens(cut(runs))),
+                (None, Some(runs)) => Some(Kept::Text(spelled(&cut(runs)))),
+                (None, None) => None,
+            }
+        }
+
+        /// The ring the row's caller lends: the ring request's deepest
+        /// head at the place `0`, where the walk reaches the workers in
+        /// the row's own order, and its head at each level's boundary
+        /// behind it. The deepest head is cut at the deepest boundary the
+        /// request reaches, and at the configuration's depth where it
+        /// reaches none.
+        fn lender(&self) -> Lender {
+            let mut heads = Vec::new();
+            if let Some(ring) = &self.ring {
+                // Token ids lead a text, and an empty list of them leaves
+                // it, as in `kept`.
+                let stated = ring.tokens.as_ref().filter(|runs| !runs.is_empty());
+                let runs = stated.or(ring.text.as_ref());
+                let length = runs.map_or(0, |runs| ids(runs).len());
+                let reached = |&&at: &&u32| at as usize <= length;
+                let boundaries = self.config.cache_boundaries.iter();
+                let deepest = boundaries.filter(reached).max();
+                let depth = deepest.unwrap_or(&self.config.prefix_token_count);
+                heads.extend(Self::kept(ring, *depth as usize));
+                for level in &self.levels {
+                    heads.extend(Self::kept(ring, level.boundary as usize));
+                }
+            }
+            let levels = self.levels.iter().map(|level| level.order.clone());
+            let orders = std::iter::once(in_order(self.workers.len())).chain(levels);
+            Lender {
+                heads,
+                orders: orders.collect(),
+            }
+        }
+
+        /// The row's steps through the one call, once, from a fresh
+        /// engine: the worker each request went to.
+        fn through(&self) -> Result<Vec<usize>, String> {
+            let spec = AppliedSpec::validate(&self.config.spec()).map_err(|err| err.to_string())?;
+            // An engine as its host holds it: for the life of the process.
+            let engine: &'static PolicyEngine = Box::leak(Box::new(PolicyEngine::new(spec)));
+            let list: Arc<[Arc<dyn Worker>]> = (0..self.workers.len())
+                .map(|i| ready_worker(&url(i), MODEL))
+                .collect();
+            // The list as its host lends it: with the cell it keeps beside it.
+            let cell = ListCell::default();
+            let members = LentList {
+                workers: &list,
+                cell: &cell,
+                facts: None,
+            };
+            let hold = |loads: &[u32]| {
+                for (worker, &load) in list.iter().zip(loads) {
+                    while worker.load() < load as usize {
+                        worker.increment_load();
+                    }
+                    while worker.load() > load as usize {
+                        worker.decrement_load();
+                    }
+                }
+            };
+            hold(&self.workers);
+            let lender = self.lender();
+            let mut answers = Vec::new();
+            for step in &self.steps {
+                let request = match step {
+                    Step::Pick(request) => request,
+                    Step::Loads(loads) => {
+                        hold(loads);
+                        continue;
+                    }
+                    Step::Ready(ready) => {
+                        for (worker, &ready) in list.iter().zip(ready) {
+                            worker.set_status(if ready {
+                                WorkerStatus::Ready
+                            } else {
+                                WorkerStatus::NotReady
+                            });
+                        }
+                        continue;
+                    }
+                };
+                let tokens = request.tokens.as_deref().map(ids);
+                let text = request.text.as_deref().map(|runs| spelled(&ids(runs)));
+                let keyed = request
+                    .key
+                    .as_deref()
+                    .map(|key| [("x-smg-routing-key", key)]);
+                let headers: &dyn HeaderRead = keyed.as_ref().map_or(&(), |keyed| keyed);
+                let tried = request
+                    .tried
+                    .iter()
+                    .map(|&i| WorkerId::from_address(&url(i)));
+                let tried: Vec<WorkerId> = tried.collect();
+                let asked = PlaceRequest {
+                    prompt: Prompt {
+                        tokens: tokens.as_deref(),
+                        text: text.as_deref(),
+                        ..Prompt::NONE
+                    },
+                    headers,
+                    tried: &tried,
+                    ring: Some(&lender),
+                    ..PlaceRequest::of(MODEL, WorkerLists::Single(members))
+                };
+                let placement = engine.place(&asked).map_err(|why| format!("{why:?}"))?;
+                let went = |held: &Arc<dyn Worker>| Arc::ptr_eq(held, &placement.worker);
+                answers.push(list.iter().position(went).expect("a worker of the row"));
+            }
+            Ok(answers)
+        }
+    }
+
+    /// The rows of a sheet that say where their requests stand on a ring
+    /// ([`Row::stands`]), each played four times through the one call: how
+    /// many they are, and each one whose answer is not the recorded one
+    /// every time.
+    pub fn replay(text: &str) -> (usize, Vec<String>) {
+        let sheet: Sheet = serde_json::from_str(text).expect("a sheet of these rows");
+        let stated = |row: &&Row| row.on_a_lent_ring().is_some();
+        let rows: Vec<&Row> = sheet.rows.iter().filter(stated).collect();
+        let defect = |row: &&Row| {
+            (0..4).find_map(|_| match row.through() {
+                Ok(picks) if same_outcome(&row.outcome, &Outcome::Sequence(picks.clone())) => None,
+                Ok(picks) => Some(format!(
+                    "{}: recorded {:?}, through the one call {picks:?}",
+                    row.name, row.outcome
+                )),
+                Err(why) => Some(format!("{}: refused here: {why}", row.name)),
+            })
+        };
+        (rows.len(), rows.iter().filter_map(defect).collect())
+    }
 }
 
 /// Rows copied from the recorded sheet: one or more of each kind, and every

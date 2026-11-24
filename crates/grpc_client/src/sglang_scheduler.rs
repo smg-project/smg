@@ -765,6 +765,9 @@ impl From<proto::SchedulerLoad> for openai_protocol::worker::SchedulerLoadSnapsh
             // A polled answer states its own figures: none is kept from an
             // older record.
             kept: Default::default(),
+            kept_used_tokens_age_ms: None,
+            kept_total_tokens_age_ms: None,
+            sampled_at: None,
         }
     }
 }
