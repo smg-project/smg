@@ -745,7 +745,7 @@ The stock controller counts a key's requests by the leases it holds. A request c
 
 **When the table is full.** A session table holds 4,194,304 keys at most. A full table records no new key: the rule places each request of such a key with no pin. The keys the table holds keep their pins. The table records keys again once keys leave it: at the sweep after their `ttl_s` ends, or with a worker the table forgets. A gateway's own engine tells its table of no worker that left, so there keys leave at their end alone: a table full of keys whose rule has no expiry stays full.
 
-**Where the key comes from.** A binding names the sources of its requests' key under `routing_key`. The host reads them in order, and the first that holds a value is the key. A ring places by that key, and a sessions rule pins it. An entry marked `client` is read apart, for a request the other entries give no key.
+**Where the key comes from.** A binding names the sources of its requests' key under `routing_key`. The host reads them in order, and the first that holds a value is the key. A ring places by that key, and a sessions rule pins it. In a gateway's own process a ring's prefix form places by a header's key alone. An entry marked `client` is read apart, for a request the other entries give no key.
 
 ```yaml
 apiVersion: smg.policy/v1

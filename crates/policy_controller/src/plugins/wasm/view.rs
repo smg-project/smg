@@ -1555,6 +1555,7 @@ mod tests {
             client_key: 0,
             ring: None,
             ring_positions: &[],
+            session_key_from_rid: false,
         };
         let exposure = Exposure {
             tenant: Reveal::Plain,

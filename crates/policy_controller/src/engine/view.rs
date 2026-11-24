@@ -1352,6 +1352,18 @@ pub struct RequestFacts<'a> {
     /// the prefix form what the lender answers for each head
     /// ([`LentRing::head_position`]). In-process only: no frame carries it.
     pub ring_positions: &'a [u64],
+    /// The request's own id handed [`Self::session_key`]: a `rid` source
+    /// of the binding's `routing_key` block, and no header. The prefix
+    /// form of a ring places no request by such a key. It names the
+    /// session alone: a sessions rule pins it, and the ring places the
+    /// request by its prompt, as one that carries no routing key. The
+    /// plain ring places by it as by any session key. The one call sets it
+    /// where it derives the key
+    /// ([`DerivedKey::source`](crate::document::DerivedKey)). An encode
+    /// item's facts state it as false: the key they carry is the item's
+    /// own. In-process only: no frame states it, so under a controller's
+    /// address the prefix form places by any session key.
+    pub session_key_from_rid: bool,
 }
 
 /// The multiplier that spreads a session's model and phase over its key.
@@ -1887,8 +1899,10 @@ mod tests {
     /// key is one word more. The ring a caller lends is two words, and
     /// where the request stands on it two more. A text's two lengths are
     /// one word: its characters fill what was spare, and its bytes take
-    /// the word. A field the facts gain moves this number and carries the
-    /// decision bench's cells that copy the facts (`benches/decision.rs`).
+    /// the word. The word that says the request's own id handed its
+    /// session key is one byte of what is spare. A field the facts gain
+    /// beyond the spare bytes moves this number and carries the decision
+    /// bench's cells that copy the facts (`benches/decision.rs`).
     #[test]
     fn a_requests_facts_take_the_pinned_bytes() {
         assert_eq!(size_of::<RequestFacts<'_>>(), 320);

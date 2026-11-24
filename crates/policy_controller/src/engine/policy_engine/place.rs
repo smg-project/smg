@@ -76,7 +76,7 @@ use super::{encode::EncodeLists, Loaded, PolicyEngine};
 use crate::{
     document::{
         spec::{AppliedSpec, DecodePick},
-        DerivedKeys,
+        DerivedKeys, KeySource,
     },
     engine::{
         decision::{Decision, Pick, ShedReason, Target, MAX_TARGETS},
@@ -543,14 +543,17 @@ impl<'r, 'a> Made<'r, 'a> {
     /// The request's routing value and its client's value, by the sources
     /// its binding names in the engine's document, with where the value a
     /// ring places it by stands on a ring, as `place` answers for that
-    /// value's text and for whether it is the client's
+    /// value's text and its source, `None` for the client's value
     /// ([`KeySources::derive_keys`](crate::document::KeySources::derive_keys)).
     /// The routing value is the first source that holds one; none where
     /// the binding names no source or none holds a value. The client's
     /// value is read only where the request has no routing value: it
     /// places where no session does. A request its call makes with no key
     /// has neither ([`Call::unkeyed`]).
-    fn keys(&self, place: impl FnOnce(&str, bool) -> Option<u64>) -> DerivedKeys<'a> {
+    fn keys(
+        &self,
+        place: impl FnOnce(&str, Option<KeySource<'a>>) -> Option<u64>,
+    ) -> DerivedKeys<'a> {
         let request = self.request;
         let spec = self.engine.spec();
         let sources = spec.key_sources_for(request.model, request.phase());
@@ -571,8 +574,10 @@ impl<'r, 'a> Made<'r, 'a> {
     /// the ring
     /// ([`Engine::states_head_places`](crate::engine::Engine::states_head_places))
     /// is stated where the lender puts each head of the request
-    /// ([`LentRing::head_position`]): the routing value where the request
-    /// carries one, else the prompt's heads, the deepest first. A lender
+    /// ([`LentRing::head_position`]): the routing value where a header
+    /// handed the request one, else the prompt's heads, the deepest first.
+    /// A value the request's own id handed names the session alone
+    /// ([`RequestFacts::session_key_from_rid`]). A lender
     /// that places no head lends no ring, a request that has no head is
     /// lent none, and a request under any other profile lends none: its
     /// stage places by its own. The lender is asked at the first making
@@ -600,12 +605,14 @@ impl<'r, 'a> Made<'r, 'a> {
         let Some(rule) = engine.head_rule_of(profiles) else {
             return (self.keys(|_, _| None), None, &[]);
         };
-        // A routing value leads the prompt: its text is the one head. A
-        // client's value places nothing under this form.
+        // A routing value a header handed leads the prompt: its text is the
+        // one head. A client's value places nothing under this form, and
+        // neither does a value the request's own id handed: that request
+        // is placed by its prompt's heads.
         let key_at = Cell::new(None);
         let first = self.heads.get().is_none();
-        let keys = self.keys(|text, client| {
-            if first && !client {
+        let keys = self.keys(|text, source| {
+            if first && source.is_some_and(leads_a_prompt) {
                 key_at.set(Some(ring.head_position(Head::Text(text))));
             }
             None
@@ -633,6 +640,16 @@ impl<'r, 'a> Made<'r, 'a> {
         let ring = (!places.is_empty()).then_some(ring);
         (keys, ring, places)
     }
+}
+
+/// Whether a routing value from `source` leads a request's prompt under a
+/// ring's prefix form: every source but the request's own id, whose value
+/// names the session alone. One test for the place the one call states on
+/// a lent ring ([`Made::stated`]) and for the word its request carries
+/// ([`RequestFacts::session_key_from_rid`]), so the stated place and the
+/// stage's own key cannot part where a source gains a kind.
+fn leads_a_prompt(source: KeySource<'_>) -> bool {
+    source != KeySource::Rid
 }
 
 /// How many of a request's places on a lent ring its maker keeps in the
@@ -734,6 +751,11 @@ impl RequestMaker for Made<'_, '_> {
             // count a capped sessions rule reads off the list's records.
             session_counted: session_key.plain.is_some(),
             session_key,
+            // The one place the word is set: the prefix form of a ring
+            // reads it, and places such a request by its prompt.
+            session_key_from_rid: keys
+                .session
+                .is_some_and(|derived| !leads_a_prompt(derived.source)),
             client_key: keys.client_key,
             ring,
             ring_positions: places,

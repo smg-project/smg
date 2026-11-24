@@ -767,3 +767,55 @@ fn an_encode_request_waits_for_a_prefills_room_and_a_panic_costs_it_alone() {
     let placement = placement.expect("a placement");
     assert_eq!(three.places(&placement), (0, 0, vec![0]));
 }
+
+/// An item is placed by its own key, whatever handed its request's key.
+/// Under a ring's prefix form a routing value the request's own id handed
+/// leads no prompt ([`RequestFacts::session_key_from_rid`]). That word says
+/// how the REQUEST's key came, and an item's facts carry the item's key in
+/// its place: so under a prefix ring on the encode side each item of an
+/// id-keyed request goes to the encoder its key goes to with no id, beside
+/// a prompt and under two ids. The keys have two encoders among them, so
+/// items placed by the one prompt would not all be at home.
+#[test]
+fn an_id_keyed_requests_item_goes_where_its_key_goes_under_a_prefix_ring() {
+    let side = "round_robin";
+    let mut document = PolicySpec::epd_presets("prefix_hash", side, side).expect("the presets");
+    // The request's own id is its routing value.
+    let rid = KeySourceSpec {
+        rid: true,
+        ..KeySourceSpec::default()
+    };
+    document.bindings[0].routing_key = Some(RoutingKeySpec {
+        sources: vec![rid],
+        strip_lineage: false,
+    });
+    let spec = AppliedSpec::validate(&document).expect("a valid document");
+    let engine = hosted(PolicyEngine::new(spec));
+    let three = Three::of([1, 1, 8], |_, _| false);
+    let ids: Vec<u32> = (500..800).collect();
+    // The encoder of the one item `key` of a request whose own id is `id`.
+    let encoder_of = |key: Identity<'_>, id: Option<&str>| {
+        let keys = [key];
+        let items = EncodeItems {
+            keys: &keys,
+            ..EncodeItems::default()
+        };
+        let request = PlaceRequest {
+            prompt: Prompt {
+                tokens: Some(&ids),
+                ..Prompt::NONE
+            },
+            request_id: id,
+            ..asking(three.lists((&[PLAIN; 8], &[1])), items)
+        };
+        let placement = engine.place(&request).expect("a placement");
+        assert_eq!(placement.routing_key, id);
+        three.places(&placement).2[0]
+    };
+    let keys = ["a", "b", "c", "d", "e", "f"].map(Identity::plain);
+    let homes = keys.map(|key| encoder_of(key, None));
+    assert!(homes.iter().any(|home| *home != homes[0]), "{homes:?}");
+    for id in ["conv-1", "conv-2"] {
+        assert_eq!(keys.map(|key| encoder_of(key, Some(id))), homes, "{id}");
+    }
+}
