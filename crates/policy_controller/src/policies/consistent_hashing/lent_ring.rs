@@ -8,6 +8,8 @@
 
 use std::fmt;
 
+use crate::engine::WorkerId;
+
 /// What a lender's ring is asked the place of under the prefix form of the
 /// ring ([`LentRing::head_position`]): a head of the request's prompt, or
 /// its routing value. A head is a part of the request's own ids or text:
@@ -81,6 +83,18 @@ pub trait LentRing: fmt::Debug + Send + Sync {
     /// each by its address and each once, in the ring's order clockwise
     /// from the position, until it takes one or every worker was asked.
     fn walk(&self, position: u64, take: &mut dyn FnMut(&str) -> bool);
+
+    /// The walk of [`Self::walk`] with each worker named by its address's
+    /// id ([`WorkerId::from_address`]), which a decision finds the worker's
+    /// row by. As provided, the id is hashed from the address at each
+    /// worker asked about. A ring that keeps its workers' ids answers from
+    /// them, the workers and the order those of [`Self::walk`], and a
+    /// decision then hashes no address.
+    fn walk_ids(&self, position: u64, take: &mut dyn FnMut(WorkerId) -> bool) {
+        self.walk(position, &mut |address| {
+            take(WorkerId::from_address(address))
+        });
+    }
 }
 
 /// A ring for the crate's cases, of the addresses it holds in the order

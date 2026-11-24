@@ -1,9 +1,13 @@
 //! The elected controller's discovery task. The election wakes it, and
 //! the fence tells it which term the replica leads under. A lead the
 //! election renews no more ends by the fence's clock, with no further word.
+//!
+//! What a pass finds is registered through the host's job queue, and what
+//! its source lists no more is removed through it ([`jobs`]).
 
 mod flags;
 mod host;
+mod jobs;
 
 use std::{
     error::Error,
@@ -20,10 +24,17 @@ use smg_service_discovery::{
 use tokio::{sync::watch, task::JoinHandle, time};
 use tracing::error;
 
-use self::flags::{refuse_settings, Credential};
-pub(super) use self::{flags::DiscoveryFlags, host::Host};
+pub(super) use self::flags::DiscoveryFlags;
+use self::{
+    flags::{refuse, refuse_settings, Credential},
+    host::Host,
+    jobs::Jobs,
+};
 use super::{election::ElectionObservation, readiness::reached, ConfigError};
-use crate::service::elector::Fence;
+use crate::{
+    service::elector::Fence,
+    worker_host::{Members, MembershipWriter, Objects},
+};
 
 /// The selected worker discovery provider and the credential it stamps.
 #[derive(Clone)]
@@ -91,9 +102,16 @@ pub(crate) struct Discovery {
     settings: RuntimeDiscoveryConfig,
     host: Arc<Host>,
     fence: Arc<Fence>,
+    /// The host of the queue the provider's passes ask, where this replica
+    /// registers what they find ([`Self::registering`]). The queue holds it
+    /// weakly, so the discovery keeps it.
+    _jobs: Option<Arc<Jobs>>,
 }
 
 impl Discovery {
+    /// A discovery over a host its case built, which hands that host a
+    /// queue of its own.
+    #[cfg(test)]
     pub(crate) fn new(
         settings: RuntimeDiscoveryConfig,
         host: Arc<Host>,
@@ -103,7 +121,46 @@ impl Discovery {
             settings,
             host,
             fence,
+            _jobs: None,
         }
+    }
+
+    /// The discovery of a replica that registers what its passes find. The
+    /// host reads the registry of `objects`, and its queue runs each job
+    /// with the store's write at `door` ([`Jobs`]): the door reads the term
+    /// this replica leads under at each write.
+    ///
+    /// A configured worker key is refused. The replica keeps no key of a
+    /// worker it finds yet: dropped, it would leave the worker's object
+    /// calling its engine with none.
+    pub(crate) fn registering(
+        settings: &DiscoverySettings,
+        objects: &Arc<Objects<Members>>,
+        door: Arc<dyn MembershipWriter>,
+        fence: Arc<Fence>,
+    ) -> Result<Self, ConfigError> {
+        if settings.credential().is_some() {
+            return Err(refuse(
+                "--api-key",
+                "a controller keeps no key of a worker its discovery finds yet: start it with no \
+                 worker key",
+            ));
+        }
+        let host = Arc::new(Host::new(Arc::clone(objects.registry()), None));
+        let jobs = Jobs::new(objects, door).map_err(|error| {
+            refuse(
+                "--discovery-provider",
+                format!("the jobs of a pass do not run: {error}"),
+            )
+        })?;
+        // A host made here has no queue yet: it takes this one.
+        let _first = host.set_jobs(jobs.queue());
+        Ok(Self {
+            settings: settings.runtime().clone(),
+            host,
+            fence,
+            _jobs: Some(jobs),
+        })
     }
 
     /// Runs the provider while this replica leads, until the stop. The

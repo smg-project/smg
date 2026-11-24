@@ -1,13 +1,11 @@
-//! What each word of a single's lease on file carries to the stages, told
-//! two ways and written down whole: the lease, the target, the side and
-//! the outcome.
+//! What each word of a single's lease on file carries to the stages,
+//! written down whole: the lease, the target, the side and the outcome.
 //!
-//! One way is the store-reading engine's own word, the one a served
-//! controller gives its store, here with no worker object to ask
-//! ([`open`]). The other is the rule a guard's
-//! lease is told by ([`lease_events::single`]), over the lease as the file
-//! lends it ([`Sides::with_held_single`]). A case runs one order of frames
-//! over a store told each way: the stages are handed the same.
+//! A served controller tells a single's words by the rule a guard's lease
+//! is told by (`lease_events::single`), over the lease as the file lends
+//! it ([`Sides::with_held_single`]). A case runs one order of frames over
+//! a store that holds the controller's word, here with no worker object to
+//! ask ([`open`]), and reads what the stages were handed.
 //!
 //! Some orders are a host's that holds its decision: a dispatch and then
 //! an end, or a release before any dispatch. Others only a file of leases
@@ -31,9 +29,7 @@ use crate::{
     engine::{
         decision::{Target, Targets},
         decision_engine::HeldDecode,
-        decision_slot::DecisionSlot,
         framework::{Picker, TieBand},
-        lease_events,
         sticky_sessions::SessionVerdict,
         view::{Candidate, RequestFacts, Session, WorkerId},
     },
@@ -106,31 +102,6 @@ impl Picker for Records {
     }
 }
 
-/// Who tells the stages of a frame applied to a lease.
-#[derive(Clone, Copy, Debug)]
-enum Way {
-    /// The store-reading engine's own word, as a served controller gives
-    /// it to its store.
-    Engine,
-    /// The rule a guard's lease is told by, over the lease as the file
-    /// lends it.
-    Lent,
-}
-
-/// The word of [`Way::Lent`]: the lease as it stood before the frame, lent
-/// as a guard lends its decision, and told by the rule a guard's lease is
-/// told by, to the engine of the standing generation.
-fn told_as_lent(
-    _: &MemoryStore,
-    world: &StoreSnapshot,
-    found: &Sides,
-    said: Said,
-    _: Option<DecisionSlot>,
-) {
-    let engine = world.spec().engine();
-    found.with_held_single(said, |held| lease_events::single(engine, held, said));
-}
-
 /// A store whose standing generation keeps every word its stages are told
 /// of a lease.
 struct Bed {
@@ -140,7 +111,7 @@ struct Bed {
 }
 
 impl Bed {
-    fn new(way: Way) -> Self {
+    fn new() -> Self {
         let store = MemoryStore::new();
         let events = Arc::new(Mutex::new(Vec::new()));
         let kept = Arc::clone(&events);
@@ -156,13 +127,6 @@ impl Bed {
         let spec = AppliedSpec::validate_digested(&document, digest, &catalog, &[])
             .expect("the catalog holds the stage");
         store.apply(spec).expect("a later generation");
-        // The first word a store is given stays: a hand opened later gives
-        // the engine's own where the store holds none, and changes nothing
-        // where it holds one.
-        match way {
-            Way::Engine => {}
-            Way::Lent => store.tell_through(told_as_lent),
-        }
         Self {
             store,
             events,
@@ -188,7 +152,7 @@ impl Bed {
     /// A `Completed` frame, served by `served`.
     fn completed(&self, lease: u64, served: WorkerId) {
         let (hand, frame) = (open(&self.store, GATEWAY), a_completed(lease, served));
-        completed(&self.store, &hand, &frame, self.now).expect("the frame reads");
+        completed(&self.store, &hand, &frame).expect("the frame reads");
     }
 
     /// A `Released` frame that names no side. Its reason is
@@ -287,15 +251,11 @@ fn ended(lease: u64, served: WorkerId) -> Outcome {
     stated
 }
 
-/// Runs `frames` over a store told each way and answers what the stages
-/// were handed, which is the same both ways.
-fn told_both_ways(frames: impl Fn(&Bed)) -> Vec<Event> {
-    let (engine, lent) = (Bed::new(Way::Engine), Bed::new(Way::Lent));
-    frames(&engine);
-    frames(&lent);
-    let told = engine.told();
-    assert_eq!(lent.told(), told, "the lease as lent tells the same");
-    told
+/// Runs `frames` over a store and answers what the stages were handed.
+fn told_of(frames: impl FnOnce(&Bed)) -> Vec<Event> {
+    let bed = Bed::new();
+    frames(&bed);
+    bed.told()
 }
 
 /// A single's dispatch is told under the lease as issued with the index
@@ -303,7 +263,7 @@ fn told_both_ways(frames: impl Fn(&Bed)) -> Vec<Event> {
 /// lease moved to that target.
 #[test]
 fn a_singles_dispatch_and_end_name_the_target_the_dispatch_took() {
-    let told = told_both_ways(|bed| {
+    let told = told_of(|bed| {
         bed.file_single(1);
         bed.dispatched(1, 0);
         bed.completed(1, WorkerId(7));
@@ -339,7 +299,7 @@ fn a_singles_dispatch_and_end_name_the_target_the_dispatch_took() {
 /// pick tells nothing and moves nothing.
 #[test]
 fn a_singles_words_with_no_dispatch_carry_the_lease_as_issued() {
-    let told = told_both_ways(|bed| {
+    let told = told_of(|bed| {
         bed.file_single(1);
         bed.released(1);
         bed.file_single(2);
@@ -359,14 +319,14 @@ fn a_singles_words_with_no_dispatch_carry_the_lease_as_issued() {
 }
 
 /// A single's lease whose request its sessions rule keeps from the profile
-/// tells no stage its dispatch, told either way: the store's own word reads
-/// the record ([`LeaseRecord::untold`]), and the lease as lent carries a
-/// pick that says the same. The session table hears the dispatch, and the
-/// session's pin follows the worker it took. The end and the release are
-/// told as any lease's.
+/// tells no stage its dispatch: the record says so
+/// ([`LeaseRecord::untold`]), the lease as lent carries a pick that says
+/// the same, and the rule reads that pick. The session table hears the
+/// dispatch, and the session's pin follows the worker it took. The end and
+/// the release are told as any lease's.
 #[test]
 fn a_kept_singles_dispatch_moves_its_pin_and_reaches_no_stage() {
-    let told = told_both_ways(|bed| {
+    let told = told_of(|bed| {
         bed.file_kept(1);
         assert_eq!(bed.pinned(), None);
         bed.dispatched(1, 1);
@@ -394,7 +354,7 @@ fn a_kept_singles_dispatch_moves_its_pin_and_reaches_no_stage() {
 /// names the index and the worker the dispatch took.
 #[test]
 fn a_singles_release_behind_its_dispatch_names_the_target_it_went_to() {
-    let told = told_both_ways(|bed| {
+    let told = told_of(|bed| {
         bed.file_single(1);
         bed.dispatched(1, 1);
         bed.released(1);
@@ -418,7 +378,7 @@ fn a_singles_release_behind_its_dispatch_names_the_target_it_went_to() {
 /// side, as it lends its token count.
 #[test]
 fn a_singles_lease_is_lent_as_it_stood_before_the_word() {
-    let bed = Bed::new(Way::Engine);
+    let bed = Bed::new();
     bed.file_single(1);
     let lent = |sides: Sides, said| {
         sides.with_held_single(said, |held| {
@@ -494,13 +454,14 @@ fn a_singles_lease_is_lent_as_it_stood_before_the_word() {
 /// it lends nothing here, whatever the word.
 #[test]
 fn a_pairs_lease_lends_nothing_as_a_singles() {
-    let bed = Bed::new(Way::Engine);
+    let bed = Bed::new();
     bed.file_single(1);
     let record = bed.sides(1).record;
     let decode = DecodeSide {
         target: WorkerId(8),
         picked: PickRecord::default(),
         session: Session::NONE,
+        session_verdict: SessionVerdict::None,
         state: LeaseState::ISSUED,
         tokens: TOKENS,
         target_index: 0,

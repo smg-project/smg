@@ -32,7 +32,7 @@ use crate::{
 };
 
 /// The label of the profile that picks a pair's decode side under the
-/// engine's document: the decode profile of the binding `model` resolves
+/// decision's document: the decode profile of the binding `model` resolves
 /// to, and that binding's one profile where it names no other. The empty
 /// label where no binding matches.
 pub(super) fn decode_label(engine: Loaded<'_, '_>, model: &str) -> &'static str {
@@ -69,7 +69,7 @@ pub(super) fn ask<'a>(
     lists: &PairLists<'_>,
     call: &mut Call,
 ) -> Result<Option<Placement<'a>>, Unplaced> {
-    let mut made = Made::asked(engine.object, request, call);
+    let mut made = Made::asked(engine, request, call);
     let mut whole = None;
     let decided = decide(engine, &made, &mut whole);
     // The route's rule panicked inside the decision, at the question of

@@ -1,9 +1,10 @@
 //! The facts a worker object states of its row.
 
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 use smg_worker::{
     identity::basic::Worker,
+    pd::pairing::PAIRING_PROTOCOL_LABEL,
     worker::{HealthCheckConfig, WorkerSpec},
 };
 
@@ -35,7 +36,10 @@ pub(super) fn engine_of(worker: &dyn Worker) -> &str {
 ///
 /// The pairing descriptor is the standing row's here too. A host that
 /// states the worker's own reads it of the worker ([`pairing_descriptor`]).
-/// The controller's door states none: its log carries no descriptor.
+/// The controller's door states none: its log carries no descriptor. A row
+/// that states none pairs by what its labels report, so the row's labels
+/// hold every pairing fact the worker's spec holds: its pairing protocol
+/// and its KV connector are laid among them.
 pub fn facts(worker: &dyn Worker, standing: Option<&WorkerFacts>) -> WorkerFacts {
     let defaults = WorkerFacts::default();
     let standing = standing.unwrap_or(&defaults);
@@ -57,11 +61,7 @@ pub fn facts(worker: &dyn Worker, standing: Option<&WorkerFacts>) -> WorkerFacts
         // Values wider than a row's fields take the largest value they hold.
         dp_rank: u16::try_from(spec.dp_rank.unwrap_or(0)).unwrap_or(u16::MAX),
         dp_size: u16::try_from(spec.dp_size.unwrap_or(1)).unwrap_or(u16::MAX),
-        labels: spec
-            .labels
-            .iter()
-            .map(|(name, value)| (name.clone(), value.clone()))
-            .collect(),
+        labels: labels(spec),
         zone: standing.zone.clone(),
         pairing: standing.pairing.clone(),
         encode: standing.encode.clone(),
@@ -99,6 +99,39 @@ pub fn facts(worker: &dyn Worker, standing: Option<&WorkerFacts>) -> WorkerFacts
     }
 }
 
+/// The label a worker's KV connector is read from where its spec names
+/// none.
+const KV_CONNECTOR_LABEL: &str = "kv_connector";
+
+/// The labels a row takes of a worker: the worker's own, and among them the
+/// two pairing facts its spec may hold, its operator's pairing protocol and
+/// its KV connector, each under the label a worker's pairing facts read it
+/// from. A worker reads its spec ahead of that label, so the spec's value
+/// stands over a label of the name, and a blank protocol on the spec, which
+/// a worker reads as none, takes the label out. The object a holder builds
+/// of the row holds the labels alone, and offers a partner what this worker
+/// offers ([`pairing_descriptor`]).
+fn labels(spec: &WorkerSpec) -> BTreeMap<String, String> {
+    let mut labels: BTreeMap<String, String> = spec
+        .labels
+        .iter()
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect();
+    match spec.pairing_protocol.as_deref().map(str::trim) {
+        Some("") => {
+            labels.remove(PAIRING_PROTOCOL_LABEL);
+        }
+        Some(protocol) => {
+            labels.insert(PAIRING_PROTOCOL_LABEL.to_owned(), protocol.to_owned());
+        }
+        None => {}
+    }
+    if let Some(connector) = spec.kv_connector.as_deref().filter(|name| !name.is_empty()) {
+        labels.insert(KV_CONNECTOR_LABEL.to_owned(), connector.to_owned());
+    }
+    labels
+}
+
 /// The thresholds a worker's own registration states.
 fn thresholds(spec: &WorkerSpec) -> Overload {
     Overload {
@@ -116,7 +149,7 @@ fn thresholds(spec: &WorkerSpec) -> Overload {
 /// state, so a threshold it leaves out is cleared. An add finds no row to
 /// keep one from. An upsert and an update keep the standing row's.
 #[cfg_attr(
-    not(test),
+    not(any(test, feature = "discovery")),
     expect(dead_code, reason = "the replica's own door reads a worker so")
 )]
 pub(crate) fn stated(
@@ -398,6 +431,53 @@ mod tests {
         // The table states the standing row's descriptor, and none of its own.
         assert_eq!(facts(&worker, None).pairing, None);
         assert_eq!(facts(&silent, Some(&standing)).pairing, standing.pairing);
+    }
+
+    /// The two pairing facts a worker's spec may hold reach the row among
+    /// its labels, each under the label a worker's pairing facts read it
+    /// from, the spec's value over a label of the name. So the object built
+    /// of the row offers a partner what the worker offers. A blank protocol
+    /// on the spec, which a worker reads as none, takes the label out, and
+    /// an empty connector leaves the label's.
+    #[test]
+    fn a_specs_pairing_facts_are_laid_among_the_rows_labels() {
+        let found = |protocol: Option<&str>, connector: Option<&str>| {
+            let mut spec = WorkerSpec::new(URL.to_owned());
+            spec.runtime_type = RuntimeType::Vllm;
+            spec.pairing_protocol = protocol.map(str::to_owned);
+            spec.kv_connector = connector.map(str::to_owned);
+            spec.labels = [
+                ("pairing_protocol", "green"),
+                ("kv_connector", "MooncakeConnector"),
+                ("tier", "gold"),
+            ]
+            .into_iter()
+            .map(|(name, value)| (name.to_owned(), value.to_owned()))
+            .collect();
+            <BasicWorkerBuilder>::from_spec(spec).build()
+        };
+        let label = |facts: &WorkerFacts, name: &str| facts.labels.get(name).cloned();
+        for (protocol, connector, labelled) in [
+            (
+                Some(" blue "),
+                Some("NixlConnector"),
+                [Some("blue"), Some("NixlConnector")],
+            ),
+            (None, None, [Some("green"), Some("MooncakeConnector")]),
+            (Some(" "), Some(""), [None, Some("MooncakeConnector")]),
+        ] {
+            let worker = found(protocol, connector);
+            let stated = facts(&worker, None);
+            let laid = ["pairing_protocol", "kv_connector"].map(|name| label(&stated, name));
+            assert_eq!(laid, labelled.map(|value| value.map(str::to_owned)));
+            assert_eq!(label(&stated, "tier").as_deref(), Some("gold"));
+            let built = object(&row(stated));
+            assert_eq!(
+                pairing_descriptor(built.as_ref()),
+                pairing_descriptor(&worker),
+                "{protocol:?} {connector:?}"
+            );
+        }
     }
 
     /// The store's layout facts are the worker crate's, name for name and in

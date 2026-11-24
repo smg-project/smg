@@ -16,11 +16,12 @@ use crate::{
         decision::{Decision, Pair, Pick, Target, Targets, Trace},
         decision_slot::DecisionSlot,
         framework::{release, Engine},
+        lease_events::{self, Hearers},
         view::WorkerId,
     },
     stages::lifecycle::Lifecycle,
-    store::{GatewayId, HealthSink, MemoryStore, Sides, StoreSnapshot},
-    tracking::lease::{Dispatch, Lease, Outcome, Said, Side},
+    store::{MemoryStore, Sides, StoreSnapshot},
+    tracking::lease::{Dispatch, Lease, Said, Side},
 };
 
 /// Tells the engine what was said of a lease: one function of the record
@@ -55,12 +56,14 @@ use crate::{
 /// side the lease held live, the frame's side or with none every side
 /// ([`Sides::ending`]).
 ///
-/// The dispatch of a single request its sessions rule keeps from the
-/// profile ([`LeaseRecord::untold`]) is told to the session table alone,
-/// where the key's pin moves. No count of sends takes it, under whichever
-/// generation `world` holds, and no stage hears it, as under a host that
-/// holds its decisions (`lease_events::single`). Its end and its release
-/// are told as any lease's.
+/// A single's words are told by the rule a host that holds its decisions
+/// tells them by ([`lease_events::single`]), over the lease as the file
+/// lends it ([`Sides::with_held_single`]). So the dispatch of a single
+/// request its sessions rule keeps from the profile
+/// ([`LeaseRecord::untold`]) is told to the session table alone, where the
+/// key's pin moves. No count of sends takes it, under whichever generation
+/// `world` holds, and no stage hears it. Its end and its release are told
+/// as any lease's.
 ///
 /// Its caller is whoever applies the report, under the turn of the leases'
 /// file: what it calls is bounded and takes no door of the leases. It
@@ -108,10 +111,23 @@ pub(crate) fn issuing<'a>(spec: &'a AppliedSpec, lease: &Lease) -> Option<&'a En
     (spec.generation() == lease.generation).then(|| spec.engine())
 }
 
-/// What [`told`] tells, under its catch.
+/// What [`told`] tells, under its catch. A single's words go by the
+/// engine's one rule over the lease as the file lends it
+/// ([`lease_events::single`], [`Sides::with_held_single`]): this function
+/// says which engines hear and nothing more. A pair's words are told here,
+/// by side.
 fn tell(world: &StoreSnapshot, found: &Sides, said: Said, listed: &impl Fn(WorkerId, u16) -> bool) {
     let spec = world.spec();
     let issuing = || issuing(spec, &found.record.lease);
+    if found.decode.is_none() {
+        let hearers = Hearers {
+            issuing: issuing(),
+            sends: spec.engine(),
+            listed,
+        };
+        found.with_held_single(said, |held| lease_events::single(&hearers, held, said));
+        return;
+    }
     match said {
         Said::Dispatched(dispatch, at) => {
             // The side the frame names: its lease, and its worker at
@@ -135,18 +151,13 @@ fn tell(world: &StoreSnapshot, found: &Sides, said: Said, listed: &impl Fn(Worke
                 target_index: dispatch.target_index,
                 ..lease
             };
-            // A request its sessions rule keeps from the profile is none
-            // of the profile's sends, and no stage hears its dispatch.
-            let own = !found.record.untold;
-            if own {
-                spec.engine().dispatched_sent(
-                    &lease,
-                    &target,
-                    dispatch.side,
-                    dispatch.since_decision_micros,
-                    || listed(id, dp_rank),
-                );
-            }
+            spec.engine().dispatched_sent(
+                &lease,
+                &target,
+                dispatch.side,
+                dispatch.since_decision_micros,
+                || listed(id, dp_rank),
+            );
             // The table hears first and the stages last. A stage's call
             // that unwinds there leaves the table's entry written.
             if let Some(engine) = issuing() {
@@ -156,7 +167,7 @@ fn tell(world: &StoreSnapshot, found: &Sides, said: Said, listed: &impl Fn(Worke
                     // pick's, and this dispatch books it: the stages hear
                     // its issue first, as they hear every side's.
                     chosen_dispatched(world, engine, found, &lease, &target, dispatch, at);
-                } else if own {
+                } else {
                     engine.dispatched_stages(
                         &lease,
                         &target,
@@ -272,20 +283,4 @@ fn chosen_dispatched(
     };
     issued_later(world, engine, &sent, &decision, at);
     engine.dispatched_stages(&sent, target, dispatch.side, dispatch.since_decision_micros);
-}
-
-/// A completion, said whole: the lease's word goes where `hand` takes it, a
-/// session's hand at the file, and the gateway's completion is written on
-/// the served worker for the health precedence, whether or not the lease
-/// is on file.
-pub(crate) fn completed(
-    store: &MemoryStore,
-    gateway: GatewayId,
-    outcome: &Outcome,
-    now: Instant,
-    hand: impl FnOnce(Said),
-) {
-    hand(Said::Completed(*outcome));
-    // The sink writes for a worker it holds a row for and for no other.
-    HealthSink::completed(store, gateway, outcome.served, outcome.class, now);
 }

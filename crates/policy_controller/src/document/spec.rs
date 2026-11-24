@@ -544,8 +544,9 @@ pub struct IndexSpec {
     /// How long a hash-index placement stays routable, in seconds.
     #[schemars(range(min = 1))]
     pub ttl_s: u32,
-    /// The size bound of a tree index: characters on a text host, tokens
-    /// otherwise. The crate's own store reads it for a pool whose profile
+    /// The size bound of a tree index: on a text host its characters plus
+    /// 1024 for each node a worker stands on, tokens otherwise.
+    /// The crate's own store reads it for a pool whose profile
     /// reads sent prefixes: the model's record is bound to `max_size` over
     /// the block size placements, never under one, one a block a worker
     /// was sent. A lowered bound is met by sweeps at the record's next
@@ -918,10 +919,11 @@ pub struct ConsistentHashParams {
     /// depth, a shorter request whole, and a text at four characters a
     /// token. A routing key the request's own id handed (a `rid` source)
     /// leads no prompt under this form: it names the session alone, and
-    /// the request is keyed by its prefix as one with no routing key. That
-    /// holds in a gateway's own process: no frame states where a key came
-    /// from, so under a controller's address the id's key places as any
-    /// other. Absent, a request with no routing key has none.
+    /// the request is keyed by its prefix as one with no routing key. A
+    /// gateway's frame states to a controller where the key came from.
+    /// The frame of a host older than that field states nothing, and
+    /// under it the id's key places as any other. Absent, a request with
+    /// no routing key has none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1))]
     pub prefix_tokens: Option<u32>,
@@ -954,8 +956,8 @@ pub struct ResidentWorkParams {
     pub request_tokens: u32,
 }
 
-/// The largest magnitude of a cost rule's parameter. The signal sink holds
-/// a value it takes to the same bound.
+/// The largest magnitude of a cost rule's parameter. A signal's value is
+/// held to the same bound where its cell is written.
 pub(crate) const COST_PARAMETER_LIMIT: f64 = 1e15;
 const RELATIVE_MARGIN_LIMIT: f64 = 1e6;
 
@@ -2077,11 +2079,13 @@ pub struct ProfileSpec {
     /// profiles of a document that set the same limit and the same delay
     /// read one count, under the name of the first of them that reads it,
     /// in the order of their names. A new document's count takes over the
-    /// sends the standing count under the same name holds and shares them:
-    /// a read under the shorter of the two delays ends such a send for
-    /// both. A count under a name with no standing count starts empty: a
-    /// document that drops that first profile, or groups it apart from the
-    /// others, starts the count of the others empty, once.
+    /// sends of the standing count under the same limit and delay,
+    /// whichever profiles read that one. Where none stands under them, it
+    /// takes over those of the standing count under the same name, unless
+    /// a count of the new document took that one by its settings, or else
+    /// of a standing count that no count of the new document took. The
+    /// two counts share the sends: a read under the shorter of two delays
+    /// ends such a send for both. A count that finds none starts empty.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1))]
     pub sent_report_delay_ms: Option<u32>,
@@ -2170,11 +2174,12 @@ pub const OVERLOAD_TOKEN_USAGE: f32 = 0.8;
 /// never per request. The block names no threshold: a worker's
 /// registration states its own two, over its program's default where the
 /// program has one. The store's judge reads the switch, for each binding's
-/// pools. A gateway that runs the document in its own process reads the
-/// switch once, where it builds its workers' default thresholds, and its
-/// routes read one shed word: it refuses a document whose bindings differ
-/// on either word. A controller that judges on its worker objects does not
-/// read the switch yet.
+/// pools. A gateway that runs a supplied document in its own process reads
+/// the switch where it builds its workers' default thresholds, and its
+/// routes read one shed word, both from that document: it refuses one
+/// whose bindings differ on either word. With no document supplied it
+/// reads its own two settings. A controller that judges on its worker
+/// objects does not read the switch yet.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct OverloadSpec {
@@ -2374,10 +2379,10 @@ pub struct KeySourceSpec {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub header: Option<String>,
     /// The request's own id, the `rid` of its body: `true` names it. Under
-    /// a ring's prefix form (`prefix_tokens`) in a gateway's own process
-    /// its key names the session alone: a sessions rule pins it, and the
-    /// ring places the request by its prompt. The plain ring places by it,
-    /// and so does a served controller's prefix ring.
+    /// a ring's prefix form (`prefix_tokens`) its key names the session
+    /// alone: a sessions rule pins it, and the ring places the request by
+    /// its prompt. The plain ring places by it, and so does a controller's
+    /// prefix ring where its host's frame does not say the id handed it.
     #[serde(skip_serializing_if = "is_default")]
     pub rid: bool,
     /// The most bytes of a value this source hands, 8192 at most (default
@@ -3540,7 +3545,8 @@ fn built_scorer(scorer: impl Scorer + 'static) -> Resolved<Box<dyn Scorer>> {
 
 /// The gates a profile's affinity stages share: the spill gate of its
 /// `prefix-affinity` entry, the fleet gate of its `kv-pressure` entry and
-/// the view's block size.
+/// the view's block size. Of two entries of a kind the last one's stands
+/// here; a `prefix-affinity` scorer spills by its own entry's gate.
 fn gates_of(p: &ProfileSpec, view: &ViewSpec) -> Gates {
     let mut affinity = None;
     let mut kv = None;
@@ -3591,10 +3597,21 @@ fn scorer_of(
         {
             Resolved::NotInBuild("the prefix-affinity uncached credit")
         }
-        ScoreStage::PrefixAffinity(p) => Resolved::Built(with_load_report_age_limit(
-            PrefixAffinity::new(p, gates),
-            max_age,
-        )),
+        ScoreStage::PrefixAffinity(p) => {
+            // The entry spills by the gate it writes itself. The KV gate
+            // and the block size stay the profile's.
+            let own = Gates::of(Some(p), None, None);
+            let gates = Gates {
+                rel: own.rel,
+                abs: own.abs,
+                prefix_margin_tokens: own.prefix_margin_tokens,
+                ..gates
+            };
+            Resolved::Built(with_load_report_age_limit(
+                PrefixAffinity::new(p, gates),
+                max_age,
+            ))
+        }
         ScoreStage::KvPressure(_) => built_scorer(KvPressure),
         ScoreStage::WarmupSlice(p) => Resolved::Built(with_load_report_age_limit(
             WarmupSlice::new(p, gates),
@@ -4898,15 +4915,15 @@ fn check_binding(
     let shadow = check_binding_rules(b, cx, &at, deferred)?;
     let mut built = resolve_plan(b, cx, shadow)?;
     // A picker that leaves the placement to a sessions rule, and a rule runs
-    // under the single plan alone: on a side of a pair or of `epd` nothing
-    // would place its requests. The built picker answers, as it answers the
-    // engine.
-    if b.plan.unwrap_or_default() != PlanName::Single {
+    // under the single plan and on the two sides of a pair: on a side of
+    // `epd` nothing would place its requests. The built picker answers, as
+    // it answers the engine.
+    if b.plan.unwrap_or_default() == PlanName::Epd {
         for (side, name) in &b.profiles {
             if cx.by_assignment.contains(&name.as_str()) {
                 deferred.note(
                     at.sub("profiles").field(side),
-                    "a picker that places by the sessions rule outside the single plan",
+                    "a picker that places by the sessions rule under the epd plan",
                 );
             }
         }
@@ -4923,18 +4940,32 @@ fn check_binding(
 /// The sessions rule as the engine runs it: the schema's largest cap is no
 /// cap, its largest idle time or sweep is for ever (a sweep for ever under a
 /// finite idle time is refused, as nothing would forget the keys; an idle
-/// time for ever sweeps nothing), and the rule runs under the `single` plan
-/// alone.
+/// time for ever sweeps nothing). The rule runs under the `single` plan, and
+/// on the two sides of a `pd-pair` plan where it states no cap and tells
+/// its stages: a pair's side reads no count of a key's requests in flight,
+/// and a pair's pick has one word for whether its stages hear of it, not
+/// one a side.
 fn session_rule(
     sessions: &SessionsSpec,
     index: usize,
     plan: Plan,
 ) -> Result<SessionRule, SpecError> {
-    if plan != Plan::Single {
+    let refused = match plan {
+        Plan::Single => None,
+        Plan::PdPair if sessions.inflight_cap != u16::MAX => {
+            Some(("inflight_cap", "65535 (no cap) under the pd-pair plan"))
+        }
+        Plan::PdPair if sessions.rule_placed != RulePlaced::Told => {
+            Some(("rule_placed", "`told` under the pd-pair plan"))
+        }
+        Plan::PdPair => None,
+        Plan::Epd { .. } => Some(("plan", "`single` or `pd-pair`")),
+    };
+    if let Some((name, reason)) = refused {
         return Err(SpecError::BadSessions {
             index,
-            name: "plan",
-            reason: "sessions run under the single plan",
+            name,
+            reason,
         });
     }
     let forever = |secs: u32| secs == u32::MAX;
@@ -5295,8 +5326,8 @@ impl PolicySpec {
         needs.headers |= !self.view.headers.is_empty();
         let mut engine = Engine::new(profiles, bindings, self.generation, needs);
         // In the order of the profiles' names, as the map walks them: a
-        // later engine finds a count by the name of the profile that made
-        // it.
+        // later engine that finds no count under its settings searches
+        // this order for the name of the profile that made one.
         debug_assert!(sent_credits
             .windows(2)
             .all(|pair| pair[0].profile < pair[1].profile));
@@ -5505,7 +5536,9 @@ pub struct AppliedSpec {
     max_block_hashes: u32,
     /// The view's block size: a request that names none is counted by it.
     block_size: u32,
-    /// The index settings a model takes at a membership write or apply.
+    /// The index settings a model takes where the in-process engine reads
+    /// a pool's table.
+    #[cfg(feature = "in-process")]
     index: BTreeMap<String, IndexSpec>,
     pairing: Pairing,
     /// The document's `plans.pd-pair.decode`.
@@ -5592,6 +5625,7 @@ impl AppliedSpec {
             signal_columns,
             max_block_hashes: document.view.max_block_hashes,
             block_size: Gates::of(None, None, document.view.block_size).block_size,
+            #[cfg(feature = "in-process")]
             index: document.index.clone(),
             pairing: document.plans.pd_pair.pairing,
             decode_pick: document.plans.pd_pair.decode,
@@ -5622,6 +5656,7 @@ impl AppliedSpec {
             signal_columns: Arc::default(),
             max_block_hashes: ViewSpec::default().max_block_hashes,
             block_size: Gates::default().block_size,
+            #[cfg(feature = "in-process")]
             index: BTreeMap::new(),
             pairing: Pairing::default(),
             decode_pick: DecodePick::default(),
@@ -5637,14 +5672,16 @@ impl AppliedSpec {
     /// The document's signals, resolved, in column order: a signal's place
     /// here is its column's number. What a stage's build answered from
     /// ([`StageBuild::signal_column`](crate::stages::StageBuild::signal_column)),
-    /// and the one reading of the names for a store that keeps the cells.
+    /// and the one reading of the names for whoever makes the cells: the
+    /// engine over worker lists, or a host that builds its own.
     /// Empty for a document that declares none and for the unbound start.
     pub fn signal_columns(&self) -> &[SignalColumn] {
         &self.signal_columns
     }
 
-    /// [`Self::signal_columns`] as the list is shared: what the store's
-    /// signal sink hands a report's conversion.
+    /// [`Self::signal_columns`] as the list is shared: what a worker list's
+    /// records keep for a report's conversion.
+    #[cfg(feature = "in-process")]
     pub(crate) fn shared_signal_columns(&self) -> Arc<[SignalColumn]> {
         Arc::clone(&self.signal_columns)
     }
@@ -5704,6 +5741,7 @@ impl AppliedSpec {
     }
 
     /// The most specific matching index settings, or the default.
+    #[cfg(feature = "in-process")]
     pub(crate) fn index_for(&self, model: &str) -> IndexSpec {
         index_matching(&self.index, model)
             .map(|(_, spec)| spec.clone())
@@ -6235,6 +6273,69 @@ mod tests {
         );
     }
 
+    /// A registered scorer that reads the affinity column and says nothing
+    /// of a gate of its own.
+    #[derive(Debug)]
+    struct ReadsColumn;
+
+    impl Lifecycle for ReadsColumn {}
+
+    impl Scorer for ReadsColumn {
+        fn name(&self) -> &'static str {
+            "reads-column"
+        }
+
+        fn score(
+            &self,
+            _: &RequestFacts<'_>,
+            _: &[Candidate],
+            _: &[u32],
+            out: &mut [f32],
+        ) -> TieBand {
+            out.fill(0.0);
+            TieBand::NORMALIZED
+        }
+
+        fn needs(&self) -> Needs {
+            Needs {
+                affinity: true,
+                ..Needs::default()
+            }
+        }
+    }
+
+    /// A profile weighs load against affinity where one of its scorers says
+    /// so of itself, and by nothing a stage is fed. Each of the two
+    /// affinity stages says so, behind the view's report age limit too. A
+    /// registered scorer that reads the column and says nothing leaves its
+    /// profile's need standing and its profile unmarked, and beside one of
+    /// the two it changes nothing.
+    #[test]
+    fn a_profile_weighs_by_a_scorers_own_word_and_by_no_need() {
+        let mut catalog = StageRegistry::builtin();
+        catalog
+            .scorer("reads-column", || Box::new(ReadsColumn))
+            .expect("a free name");
+        // The profile's need for the column, then its word.
+        let said = |score: &str, view: &str| {
+            let document = doc(&format!(
+                r#"{{"apiVersion":"smg.policy/v1","view":{view},"profiles":{{"p":{{"score":[{score}],"pick":"best"}}}}}}"#
+            ));
+            let (engine, ..) = document
+                .built(&catalog, &[])
+                .expect("the document validates");
+            (engine.profiles()[0].needs().affinity, engine.weighs(0))
+        };
+        for view in ["{}", r#"{"max_report_age_ms":500}"#] {
+            assert_eq!(said(r#""prefix-affinity""#, view), (true, true), "{view}");
+            assert_eq!(said(r#""warmup-slice""#, view), (true, true), "{view}");
+            assert_eq!(said(r#""reads-column""#, view), (true, false), "{view}");
+            let both = r#""reads-column","warmup-slice""#;
+            assert_eq!(said(both, view), (true, true), "{view}");
+            assert_eq!(said(r#""least-load""#, view), (false, false), "{view}");
+        }
+    }
+
     fn doc(text: &str) -> PolicySpec {
         serde_json::from_str(text).expect("a well-formed document")
     }
@@ -6647,6 +6748,9 @@ mod tests {
             // The affinity column is fed where an affinity stage reads it
             // and nowhere else: a preset without one declares no column.
             assert_eq!(engine.needs().affinity, name == "cache_aware", "{name}");
+            // The same preset alone weighs load against affinity: its two
+            // affinity stages say so of themselves, and no other stage does.
+            assert_eq!(engine.weighs(0), name == "cache_aware", "{name}");
             assert_eq!(engine.needs().headers, name == "manual", "{name}");
             assert!(!engine.needs().active_sessions, "{name}");
             assert!(!engine.needs().session_in_flight, "{name}");
@@ -7855,12 +7959,13 @@ mod tests {
         }
     }
 
-    /// A later document takes over a shared count by the name of the
-    /// profile that made it: the same profiles again keep its sends, and
-    /// where that profile is gone the count of the one that stays starts
-    /// empty.
+    /// A later document's count takes over the standing count under its
+    /// two settings, whichever profile made that one. Where none stands
+    /// under them it takes the count its maker's name made, unless a
+    /// count of the later document took that one, and then the first
+    /// standing count that none took.
     #[test]
-    fn a_later_document_takes_a_shared_count_by_the_name_of_its_maker() {
+    fn a_later_count_takes_the_standing_one_by_its_settings_then_by_its_name() {
         let both = r#"{"apiVersion":"smg.policy/v1","profiles":{"p":{"score":["least-load"],"pick":"best"},"q":{"score":["least-load"],"pick":"best"}},"bindings":[{"match":{"model":"m"},"profile":"p"},{"match":{"model":"*"},"profile":"q"}]}"#;
         let q_alone = r#"{"apiVersion":"smg.policy/v1","profiles":{"q":{"score":["least-load"],"pick":"best"}},"bindings":[{"match":{"model":"*"},"profile":"q"}]}"#;
         let worker = crate::engine::WorkerId(7);
@@ -7868,23 +7973,49 @@ mod tests {
             id: worker,
             ..Default::default()
         };
-        // The later document, and the sends its one count holds.
-        for (later, want) in [(both, 1), (q_alone, 0)] {
-            let standing = doc(both).validate().expect("a valid document");
+        // A document with the limits its `p` and its `q` set.
+        let built = |document: &str, limits: [Option<u32>; 2]| {
+            let mut spec = doc(document);
+            for (name, limit) in ["p", "q"].into_iter().zip(limits) {
+                if let Some(profile) = spec.profiles.get_mut(name) {
+                    profile.sent_ttl_ms = limit;
+                }
+            }
+            spec.validate().expect("a valid document")
+        };
+        // The limits of the standing `p` and `q`, the later document and
+        // its limits, and the sends the later counts hold, in the order
+        // of their makers' names. The send is in every standing count.
+        for (was, later, limits, want) in [
+            // The same document again.
+            ([None, None], both, [None, None], vec![1]),
+            // `p` made the shared count and leaves: `q` keeps the send.
+            ([None, None], q_alone, [None, None], vec![1]),
+            // Both under a new limit: the name `p` carries the count.
+            ([None, None], both, [Some(43), Some(43)], vec![1]),
+            // `p` leaves the shared count for a limit of its own: `q`
+            // keeps the send and `p` starts empty.
+            ([None, None], both, [Some(43), None], vec![0, 1]),
+            // `p` takes the limit `q` had and `q` a new one: `p` takes the
+            // count under its limit, and `q` does not take that count too
+            // by its name: it takes the count `p` made, which is left.
+            ([Some(1), Some(9)], both, [Some(9), Some(43)], vec![1, 1]),
+        ] {
+            let standing = built(both, was);
             standing.on_dispatched(
                 &crate::tracking::Lease::default(),
                 &target,
                 crate::tracking::Side::Single,
                 0,
             );
-            let next = doc(later).validate().expect("a valid document");
+            let next = built(later, limits);
             next.succeed(&standing);
             let held: Vec<_> = next
                 .sent_credits
                 .iter()
                 .map(|count| count.credits.held(worker))
                 .collect();
-            assert_eq!(held, [want], "{later}");
+            assert_eq!(held, want, "{was:?}, then {later} under {limits:?}");
         }
     }
 
@@ -8149,22 +8280,12 @@ mod tests {
     }
 
     /// The manual picker places by a sessions rule, and a rule runs under
-    /// the single plan alone: on a side of a pair or of `epd` the profile is
-    /// refused, with the side that names it. The built picker answers, so
-    /// any picker that leaves the placement to the rule is refused the same
-    /// way.
+    /// the single plan and on the two sides of a pair: on a side of `epd`
+    /// the profile is refused, with the side that names it. The built
+    /// picker answers, so any picker that leaves the placement to the rule
+    /// is refused the same way.
     #[test]
-    fn the_manual_picker_outside_the_single_plan_is_not_in_this_build() {
-        let spec = doc(
-            r#"{"apiVersion":"smg.policy/v1","profiles":{"q":{"pick":"random"},"sticky":{"pick":"manual"}},"bindings":[{"plan":"pd-pair","profiles":{"prefill":"q","decode":"sticky"}}]}"#,
-        );
-        assert_eq!(
-            not_in_build(&spec),
-            (
-                "bindings[0].profiles.decode".to_string(),
-                "a picker that places by the sessions rule outside the single plan"
-            )
-        );
+    fn the_manual_picker_under_the_epd_plan_is_not_in_this_build() {
         let epd = doc(
             r#"{"apiVersion":"smg.policy/v1","profiles":{"q":{"pick":"random"},"sticky":{"pick":"manual"}},"bindings":[{"plan":"epd","profiles":{"encode":"sticky","prefill":"q","decode":"q"}}]}"#,
         );
@@ -8172,15 +8293,99 @@ mod tests {
             not_in_build(&epd),
             (
                 "bindings[0].profiles.encode".to_string(),
-                "a picker that places by the sessions rule outside the single plan"
+                "a picker that places by the sessions rule under the epd plan"
             )
         );
-        // Under the single plan the same profile validates, here with no
-        // rule; the preset is the profile with one.
+        // On a side of a pair the same profile validates, and so it does
+        // under the single plan, here with no rule; the preset is the
+        // profile with one.
+        let pair = doc(
+            r#"{"apiVersion":"smg.policy/v1","profiles":{"q":{"pick":"random"},"sticky":{"pick":"manual"}},"bindings":[{"plan":"pd-pair","profiles":{"prefill":"q","decode":"sticky"}}]}"#,
+        );
+        assert!(pair.validate().is_ok());
         let single = doc(
             r#"{"apiVersion":"smg.policy/v1","profiles":{"sticky":{"pick":"manual"}},"bindings":[{"profile":"sticky"}]}"#,
         );
         assert!(single.validate().is_ok());
+    }
+
+    /// A sessions rule under the pair plan is in the build of a host that
+    /// makes some lifecycle calls only, as of one that makes them all: a
+    /// file of leases keeps each side's own session verdict.
+    #[test]
+    fn a_pairs_sessions_rule_is_in_the_build_of_a_host_that_makes_some_lifecycle_calls() {
+        let rule = r#"{"sticky_header":"x-session-id","inflight_cap":65535}"#;
+        let pair = format!(
+            r#"{{"plan":"pd-pair","profiles":{{"prefill":"q","decode":"q"}},"sessions":{rule}}}"#
+        );
+        let pair = spec_with_binding(&pair);
+        let some = StageRegistry::builtin().without_lifecycle();
+        for catalog in [StageRegistry::builtin(), some] {
+            assert!(pair.validate_in(&catalog, &[]).is_ok());
+        }
+    }
+
+    /// A sessions rule runs under the single plan, and on the two sides of
+    /// a pair where it states no cap and tells its stages. A cap under the
+    /// pair is refused by its own name, the schema's default cap as one
+    /// that is written. A rule that keeps what it places from the profile
+    /// is refused by that field's name, and a rule under `epd` by the
+    /// plan's.
+    #[test]
+    fn a_sessions_rule_runs_under_a_pair_with_no_cap_and_not_under_epd() {
+        let under = |plan: &str, profiles: &str, sessions: &str| {
+            spec_with_binding(&format!(
+                r#"{{"plan":"{plan}","profiles":{profiles},"sessions":{sessions}}}"#
+            ))
+            .validate()
+            .err()
+        };
+        let pair = r#"{"prefill":"q","decode":"q"}"#;
+        let uncapped = r#"{"sticky_header":"x-session-id","inflight_cap":65535}"#;
+        assert_eq!(under("pd-pair", pair, uncapped), None);
+        for capped in [
+            r#"{"sticky_header":"x-session-id"}"#,
+            r#"{"sticky_header":"x-session-id","inflight_cap":4}"#,
+        ] {
+            assert_eq!(
+                under("pd-pair", pair, capped),
+                Some(SpecError::BadSessions {
+                    index: 0,
+                    name: "inflight_cap",
+                    reason: "65535 (no cap) under the pd-pair plan",
+                }),
+                "{capped}"
+            );
+        }
+        let untold =
+            r#"{"sticky_header":"x-session-id","inflight_cap":65535,"rule_placed":"untold"}"#;
+        assert_eq!(
+            under("pd-pair", pair, untold),
+            Some(SpecError::BadSessions {
+                index: 0,
+                name: "rule_placed",
+                reason: "`told` under the pd-pair plan",
+            })
+        );
+        // The single plan takes each of the three.
+        for rule in [uncapped, untold, r#"{"sticky_header":"x-session-id"}"#] {
+            let single = spec_with_binding(&format!(r#"{{"profile":"q","sessions":{rule}}}"#));
+            assert_eq!(single.validate().err(), None, "{rule}");
+        }
+        let epd = r#"{"encode":"q","prefill":"q","decode":"q"}"#;
+        let refused = under("epd", epd, uncapped);
+        assert_eq!(
+            refused,
+            Some(SpecError::BadSessions {
+                index: 0,
+                name: "plan",
+                reason: "`single` or `pd-pair`",
+            })
+        );
+        assert_eq!(
+            refused.map(|err| err.to_string()),
+            Some("binding 0: sessions plan is not `single` or `pd-pair`".to_string())
+        );
     }
 
     #[test]
@@ -9488,7 +9693,8 @@ mod tests {
     /// The spill parameters of a prefix-affinity entry reach the gates the
     /// profile's stages share: under a relative threshold of four a holder
     /// three times as loaded as the mean keeps its request; under the
-    /// default (1.5, plus the margin) it spills.
+    /// default (1.5, plus the margin) it spills. Of two entries each spills
+    /// by its own gate.
     #[test]
     fn the_spill_parameters_of_the_spec_reach_the_profiles_gates() {
         use crate::engine::{
@@ -9545,6 +9751,13 @@ mod tests {
             0,
             "under the default gate the loaded holder spills"
         );
+        // Two entries, each under its own gate: the heavier one keeps the
+        // holder whichever is written first.
+        let heavy = r#"{"prefix-affinity":{"weight":4.0,"spill":{"rel":4.0}}}"#;
+        let light = r#"{"prefix-affinity":{"weight":1.0}}"#;
+        for score in [format!("{light},{heavy}"), format!("{heavy},{light}")] {
+            assert_eq!(leader(&score), 0, "{score}");
+        }
     }
 
     /// The digest names the document, not the file: the form (YAML or JSON,

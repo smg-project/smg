@@ -38,7 +38,7 @@ use std::{borrow::Cow, fmt, sync::Arc};
 use smg_worker::load::state::LoadSnapshot;
 
 use super::{
-    decision::{Decision, Pick, ShadowKind, Survivors, Target, Targets, Trace},
+    decision::{Decision, Pick, Survivors, Target, Targets, Trace},
     prompt_hashes::{HashSeeds, PromptHashes},
     sticky_sessions::SessionVerdict,
     view::{Constraints, Phase, RequestFacts, Session, SessionCountedUnder, WireModes, WorkerId},
@@ -199,6 +199,27 @@ pub trait RequestMaker {
     #[cfg(feature = "in-process")]
     fn sends_to(&self, target: &Target) -> bool {
         let _ = target;
+        true
+    }
+
+    /// Whether the request's caller sends to the encoder at `position` of
+    /// its encoders' list, one an encode request's decision placed an item
+    /// on. A caller that cannot send to such an encoder sends the request
+    /// to no target of that pick. So a decision that stores where its
+    /// prompt went asks it of the placed encoders first, a place once, and
+    /// stores the prompt for no target where one is answered `false`: it
+    /// asks of no encoder behind that answer.
+    ///
+    /// It is asked where [`Self::sends_to`] is, ahead of that question:
+    /// inside the decision, where an answer asks the engine nothing.
+    ///
+    /// `true` from a maker that does not say. The call that places a
+    /// request answers by whether the encoder can be sent to now, and
+    /// keeps the answer for its own read of that encoder. It asks its
+    /// route's rule of no encoder.
+    #[cfg(feature = "in-process")]
+    fn sends_to_encoder(&self, position: u32) -> bool {
+        let _ = position;
         true
     }
 }
@@ -595,10 +616,6 @@ pub trait DecisionEngine {
     /// How many decisions panicked, a shadow's beside a live decision that
     /// stood among them.
     fn faults(&self) -> u64;
-
-    /// How many shadows said `kind` beside a single decision of the
-    /// binding at position `binding`.
-    fn shadowed(&self, binding: u32, kind: ShadowKind) -> u64;
 }
 
 /// A request and its constraints as the host holds them. A door reads

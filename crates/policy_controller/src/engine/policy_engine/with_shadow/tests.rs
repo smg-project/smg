@@ -40,11 +40,11 @@ use crate::{
         decision_engine::{Decided, DecisionEngine, Request},
         demands::Demands,
         framework::{Picker, ShadowRows, TieBand},
-        list_cell::tests::PublishedList,
+        list_cell::PublishedList,
         policy_engine::PolicyEngine,
         prompt_hashes::HashSeeds,
         records::worker_id,
-        shadow::{Shadowed, SHADOW_FLOOR},
+        shadow::{ShadowCount, ShadowCounts, ShadowSide, Shadowed, SHADOW_FLOOR},
         sticky_sessions::SessionVerdict,
         view::{Candidate, Identity, Phase, RequestFacts, WorkerId},
     },
@@ -83,14 +83,35 @@ fn kinds(engine: &PolicyEngine) -> [u64; 4] {
 
 /// [`kinds`] of the binding at `binding`.
 fn kinds_at(engine: &PolicyEngine, binding: u32) -> [u64; 4] {
-    ShadowKind::ALL.map(|kind| engine.shadowed(binding, kind))
+    engine.shadow_kinds(binding)
+}
+
+impl PolicyEngine {
+    /// The counts of the shadows beside the single requests of the binding
+    /// at `binding`, read as a host is told them ([`Self::shadow_counts`]):
+    /// agreed, another target, another outcome, skipped. Zeros for a
+    /// binding that names no shadow. The one helper of the crate's cases.
+    pub(crate) fn shadow_kinds(&self, binding: u32) -> [u64; 4] {
+        let mut kinds = [0; 4];
+        let _ = self.shadow_counts(|count| {
+            if (count.binding, count.side) == (binding, ShadowSide::Single) {
+                kinds[count.kind.index()] = count.count;
+            }
+        });
+        kinds
+    }
 }
 
 /// The engine of `document`, under the first generation.
-fn engine_of(mut document: PolicySpec, stages: &StageRegistry) -> PolicyEngine {
-    document.generation = 1;
+fn engine_of(document: PolicySpec, stages: &StageRegistry) -> PolicyEngine {
+    PolicyEngine::new(spec_at(1, document, stages))
+}
+
+/// `document` as applied under the generation `number`.
+fn spec_at(number: u64, mut document: PolicySpec, stages: &StageRegistry) -> AppliedSpec {
+    document.generation = number;
     let spec = AppliedSpec::validate_in(&document, stages, &[]);
-    PolicyEngine::new(spec.expect("the document validates"))
+    spec.expect("the document validates")
 }
 
 /// `preset`'s document with the profile `twin` named as its binding's
@@ -233,6 +254,18 @@ fn bed_of(
     shadow: Option<Rule>,
     edit: impl FnOnce(&mut PolicySpec),
 ) -> (PolicyEngine, Seen) {
+    let (document, stages, seen) = bed_document(preset, live, shadow, edit);
+    (engine_of(document, &stages), seen)
+}
+
+/// The document of [`bed_of`]'s engine, the stages it names, and what they
+/// see.
+fn bed_document(
+    preset: &str,
+    live: Rule,
+    shadow: Option<Rule>,
+    edit: impl FnOnce(&mut PolicySpec),
+) -> (PolicySpec, StageRegistry, Seen) {
     let seen = Seen::default();
     let stages = seen.stages(live, shadow.unwrap_or(Rule::Nobody));
     let mut profile = profile_of(preset);
@@ -246,7 +279,7 @@ fn bed_of(
     let own = document.profiles.get_mut(preset);
     *own.expect("the preset's profile") = profile;
     edit(&mut document);
-    (engine_of(document, &stages), seen)
+    (document, stages, seen)
 }
 
 /// [`bed_of`] under the `random` preset's stages, with a shadow.
@@ -282,6 +315,25 @@ fn a_shadow_that_picks_another_worker_is_counted_and_the_live_answer_served() {
     assert_eq!(placed(&unshadowed, &list, request(7)), answer.decision);
     assert_eq!(kinds(&unshadowed), [0; 4]);
     assert_eq!(seen.shadows(), 0);
+}
+
+/// The shadow decisions are counted under the document that made them: a
+/// document put in force on the running engine starts its count at zero,
+/// and counts its own.
+#[test]
+fn the_shadow_counts_start_at_zero_under_a_new_document() {
+    let list = pool(3);
+    let (engine, _) = bed(Rule::Place(0), Rule::Place(1));
+    let _ = placed(&engine, &list, request(7));
+    assert_eq!(kinds(&engine), [0, 1, 0, 0]);
+
+    let (live, shadow) = (Rule::Place(0), Some(Rule::Place(0)));
+    let (document, stages, _) = bed_document("random", live, shadow, |_| {});
+    let applied = engine.apply(spec_at(2, document, &stages));
+    applied.expect("a number above the standing one");
+    assert_eq!(kinds(&engine), [0; 4], "the new document's own count");
+    let _ = placed(&engine, &list, request(7));
+    assert_eq!(kinds(&engine), [1, 0, 0, 0]);
 }
 
 /// A shadow that sheds leaves the live pick as it was decided. A live
@@ -451,7 +503,7 @@ fn a_shadow_beside_a_decision_without_a_lease_is_counted_by_its_caller() {
     let (_, said) = answer.expect("a decision");
     assert!(said.is_some(), "the shadow's word");
     assert!(
-        engine.document.shadow_counts.get().is_none(),
+        engine.in_force().shadow_counts.get().is_none(),
         "nothing counted yet"
     );
     assert_eq!(kinds(&engine), [0; 4]);
@@ -473,7 +525,7 @@ fn a_shadow_beside_a_decision_without_a_lease_is_counted_by_its_caller() {
     assert_eq!(none, None);
     unshadowed.count_shadow(none);
     assert_eq!(seen.shadows(), 0);
-    assert!(unshadowed.document.shadow_counts.get().is_none());
+    assert!(unshadowed.in_force().shadow_counts.get().is_none());
 }
 
 /// A live decision that sheds files no lease, and the entry still answers
@@ -928,7 +980,7 @@ fn the_shadow_counts_of_every_thread_are_read_as_one() {
     let list = pool(3);
     let (engine, seen) = bed(Rule::Place(0), Rule::Place(1));
     assert!(
-        engine.document.shadow_counts.get().is_none(),
+        engine.in_force().shadow_counts.get().is_none(),
         "no count yet"
     );
     thread::scope(|scope| {
@@ -947,5 +999,140 @@ fn the_shadow_counts_of_every_thread_are_read_as_one() {
 
     let (unshadowed, _) = bed_of("random", Rule::Place(0), None, |_| {});
     let _ = placed(&unshadowed, &list, request(7));
-    assert!(unshadowed.document.shadow_counts.get().is_none());
+    assert!(unshadowed.in_force().shadow_counts.get().is_none());
+}
+
+/// Every count a host is told of `engine` ([`PolicyEngine::shadow_counts`]),
+/// in the order it is told them.
+fn told(engine: &PolicyEngine) -> Vec<ShadowCount> {
+    let mut told = Vec::new();
+    let number = engine.shadow_counts(|count| told.push(count));
+    assert_eq!(number, engine.applied(), "the document's own number");
+    told
+}
+
+/// The four counts of one row and side, as a host is told them.
+fn counts_of(binding: u32, side: ShadowSide, counts: [u64; 4]) -> Vec<ShadowCount> {
+    let counts = ShadowKind::ALL.into_iter().zip(counts);
+    let count = |(kind, count)| ShadowCount {
+        binding,
+        side,
+        kind,
+        count,
+    };
+    counts.map(count).collect()
+}
+
+/// What a host is told of the counts: the four kinds of the one binding
+/// that names a shadow, by its position and beside a single request. They
+/// are zeros before the first decision, and reading them allocates no
+/// table. Behind three decisions they are the engine's counts. The binding
+/// ahead, which names no shadow, is in no count, and a document that names
+/// none tells nothing. Each engine answers its own document's number.
+#[test]
+fn a_host_is_told_each_count_of_a_binding_that_names_a_shadow_and_zeros_too() {
+    let list = pool(3);
+    let ahead = |document: &mut PolicySpec| {
+        let mut ahead = document.bindings[0].clone();
+        ahead.matcher.model = "another-model".into();
+        ahead.shadow = None;
+        document.bindings.insert(0, ahead);
+    };
+    let (engine, _) = bed_of("random", Rule::Place(0), Some(Rule::Place(1)), ahead);
+    assert_eq!(told(&engine), counts_of(1, ShadowSide::Single, [0; 4]));
+    assert!(engine.in_force().shadow_counts.get().is_none(), "no table");
+    for seed in 0..3 {
+        let _ = placed(&engine, &list, request(seed));
+    }
+    assert_eq!(
+        told(&engine),
+        counts_of(1, ShadowSide::Single, [0, 3, 0, 0])
+    );
+    assert_eq!(kinds_at(&engine, 1), [0, 3, 0, 0]);
+
+    let (unshadowed, _) = bed_of("random", Rule::Place(0), None, |_| {});
+    let _ = placed(&unshadowed, &list, request(7));
+    assert_eq!(told(&unshadowed), []);
+    let number = |engine: &PolicyEngine| engine.shadow_counts(|_| {});
+    assert_eq!(number(&engine), number(&engine));
+    assert_ne!(number(&engine), number(&unshadowed));
+}
+
+/// A pair's binding is told by the sides that name a shadow. Its prefill
+/// side is one table. Its decode side is two: beside the pair's first
+/// decision, and beside a decode decided again. Each table's counts are
+/// told under its own side and kind: here every count of the three tables
+/// is written with a number of its own. The four sides are labelled
+/// `single`, `prefill`, `decode` and `decode-again`.
+#[test]
+fn a_pairs_binding_is_told_by_each_side_that_names_a_shadow() {
+    let shadowing = |named: &[(&str, &str)]| {
+        let pair = PolicySpec::pair_presets("round_robin", "round_robin");
+        let mut document = pair.expect("the pair presets");
+        for (side, twin) in named {
+            let twin_of = document.profiles[*side].clone();
+            document.profiles.insert((*twin).into(), twin_of);
+        }
+        let sides = named
+            .iter()
+            .map(|(side, twin)| ((*side).into(), (*twin).into()));
+        document.bindings[0].shadow = Some(ShadowSpec::Sides(sides.collect()));
+        engine_of(document, &StageRegistry::builtin())
+    };
+    let zeros = |sides: &[ShadowSide]| {
+        let rows = sides.iter().map(|side| counts_of(0, *side, [0; 4]));
+        rows.collect::<Vec<_>>().concat()
+    };
+    let (prefill, decode) = (("prefill", "twin"), ("decode", "other-twin"));
+    let later = [ShadowSide::Decode, ShadowSide::DecodeAgain];
+    assert_eq!(told(&shadowing(&[prefill])), zeros(&[ShadowSide::Prefill]));
+    assert_eq!(told(&shadowing(&[decode])), zeros(&later));
+    let both = [ShadowSide::Prefill, later[0], later[1]];
+    let engine = shadowing(&[prefill, decode]);
+    assert_eq!(told(&engine), zeros(&both));
+
+    let document = engine.in_force();
+    let tables = &document.shadow_counts;
+    let tables = tables.get_or_init(Box::<ShadowCounts>::default);
+    let mut written = Vec::new();
+    for (side, tens) in both.into_iter().zip([10, 20, 30]) {
+        for (kind, count) in ShadowKind::ALL.into_iter().zip(tens..) {
+            tables.of(0, side, kind).store(count, Ordering::Relaxed);
+        }
+        written.push(counts_of(0, side, [tens, tens + 1, tens + 2, tens + 3]));
+    }
+    assert_eq!(told(&engine), written.concat());
+    let labels = ShadowSide::ALL.map(ShadowSide::as_str);
+    assert_eq!(labels, ["single", "prefill", "decode", "decode-again"]);
+}
+
+/// The bindings from the sixteenth on count in the last row, and a host is
+/// told that row once, behind the rows ahead of it. Here the third, the
+/// sixteenth and the seventeenth binding name a shadow, the eighteenth
+/// names none, and the requests are the seventeenth's.
+#[test]
+fn the_bindings_from_the_sixteenth_on_are_told_as_one_row() {
+    let list = pool(3);
+    let eighteen = |document: &mut PolicySpec| {
+        let shadowed = document.bindings.pop().expect("the preset's binding");
+        for at in 0..18 {
+            let mut binding = shadowed.clone();
+            if at != 16 {
+                binding.matcher.model = format!("model-{at}");
+            }
+            if ![2, 15, 16].contains(&at) {
+                binding.shadow = None;
+            }
+            document.bindings.push(binding);
+        }
+    };
+    let (engine, _) = bed_of("random", Rule::Place(0), Some(Rule::Place(1)), eighteen);
+    for seed in 0..2 {
+        let _ = placed(&engine, &list, request(seed));
+    }
+    let rows = [
+        counts_of(2, ShadowSide::Single, [0; 4]),
+        counts_of(15, ShadowSide::Single, [0, 2, 0, 0]),
+    ];
+    assert_eq!(told(&engine), rows.concat());
 }

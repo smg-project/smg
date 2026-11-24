@@ -6,11 +6,17 @@
 //! theirs too.
 
 use std::{
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, Instant},
 };
 
-use openai_protocol::{model_card::ModelCard, worker::HealthCheckConfig};
+use axum::http::{header::CONTENT_TYPE, StatusCode};
+use openai_protocol::{
+    generate::GenerateRequest, model_card::ModelCard, worker::HealthCheckConfig,
+};
 use smg_grpc_client::common_proto::{
     kv_cache_event::Data, KvBlock, KvBlocksStored, KvCacheEvent, KvEventBatch,
 };
@@ -22,7 +28,7 @@ use smg_policy_controller::{
 };
 use smg_worker::{
     health::overload::OverloadThresholds,
-    identity::basic::{ConnectionMode, WorkerType},
+    identity::basic::{ConnectionMode, Worker, WorkerType},
 };
 
 use super::super::{build_app_context, Extensions, ServerConfig};
@@ -35,7 +41,9 @@ use crate::{
             placement::{select_single, PlacementInputs, Stated},
             snapshot::RoutingPool,
         },
+        error,
         grpc::backend_client::BasicWorkerBuilder,
+        http::router::Router,
     },
 };
 
@@ -163,8 +171,9 @@ async fn the_started_engine_tells_a_stage_a_worker_that_joins_and_one_that_leave
 }
 
 /// No document names an overload threshold: a gateway started under a
-/// supplied document builds its worker objects with the two of its own
-/// settings. A threshold off its default beside the document does not end
+/// supplied document whose overload block is on builds its worker objects
+/// with the two of its own settings. A threshold off its default beside
+/// the document does not end
 /// the start, and the registration settings every worker object is built
 /// from hold the two.
 #[tokio::test]
@@ -263,6 +272,20 @@ async fn the_started_gateway_reads_its_documents_overload_switch_and_shed_word()
         );
         assert!(!app.worker_registry.overload_shed_enabled());
     }
+
+    // A block that is on and sheds: the thresholds stand and the routes shed.
+    let on_and_shed = bound(&[said(true, true)]);
+    let app = build_app_context(&under(on_and_shed, Some(32), Some(0.9)), Extensions::new())
+        .await
+        .expect("the gateway starts");
+    assert_eq!(
+        app.registration_settings.overload_defaults,
+        OverloadThresholds {
+            waiting_requests: Some(32),
+            token_usage: Some(0.9),
+        }
+    );
+    assert!(app.worker_registry.overload_shed_enabled());
 }
 
 /// A worker object has one default set of thresholds. A supplied document
@@ -288,7 +311,7 @@ async fn a_document_whose_overload_words_this_gateway_refuses_ends_the_start() {
         (
             vec![said(true, false)],
             (None, None),
-            "policy controller: worker_overload_waiting_requests and worker_overload_token_usage are both none beside a policy document whose overload block is on: a gateway with no default threshold vetoes by none; state a threshold, or switch the block off in the document",
+            "policy controller: worker_overload_waiting_requests and worker_overload_token_usage are both none beside a policy document whose overload block is on: the block has no default threshold to switch on, and a worker's own thresholds veto either way; state a threshold, or switch the block off in the document",
         ),
     ] {
         let refused = build_app_context(&under(bound(&blocks), waiting, usage), Extensions::new())
@@ -392,5 +415,121 @@ async fn the_started_engine_places_by_the_cache_events_the_monitor_applied() {
         )
         .expect("a worker is selectable");
         assert_eq!(placed.worker().url(), HOLDER);
+    }
+}
+
+/// A loopback worker that answers every `/generate`, and the count of the
+/// requests it was sent.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "test stub server lives for the duration of the test process"
+)]
+async fn counting_worker() -> (String, Arc<AtomicUsize>) {
+    let count = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::clone(&count);
+    let answers = axum::Router::new().route(
+        "/generate",
+        axum::routing::post(move || {
+            seen.fetch_add(1, Ordering::SeqCst);
+            async { ([(CONTENT_TYPE, "application/json")], r#"{"text":"ok"}"#) }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("a loopback port");
+    let address = listener.local_addr().expect("the port's address");
+    tokio::spawn(async move {
+        axum::serve(listener, answers)
+            .await
+            .expect("the stub serves");
+    });
+    (format!("http://{address}"), count)
+}
+
+/// Under a supplied document whose shed word is on, the route's own check at
+/// dispatch sheds a request whose chosen worker is overloaded: it answers
+/// 503 by the overload shed's code, sends the request to no worker and
+/// picks no second one, though one stands clear. A profile with no
+/// `not-overloaded` stage lets the engine choose such a worker. Under the
+/// same document with the shed word off both requests are sent.
+#[tokio::test]
+async fn a_pick_overloaded_at_dispatch_is_shed_under_a_documents_shed_word() {
+    for shed in [true, false] {
+        let mut document = bound(&[said(true, shed)]);
+        for profile in document.profiles.values_mut() {
+            profile
+                .filter
+                .retain(|stage| stage.name() != "not-overloaded");
+        }
+        let app = build_app_context(&under(document, Some(32), Some(0.9)), Extensions::new())
+            .await
+            .expect("the gateway starts");
+        assert_eq!(app.worker_registry.overload_shed_enabled(), shed);
+
+        // Two HTTP workers of the model, the first over its thresholds.
+        let mut sent = Vec::new();
+        for overloaded in [true, false] {
+            let (url, count) = counting_worker().await;
+            let worker: Arc<dyn Worker> = Arc::new(
+                BasicWorkerBuilder::new(&url)
+                    .model(ModelCard::new(MODEL))
+                    .worker_type(WorkerType::Regular)
+                    .health_config(HealthCheckConfig {
+                        disable_health_check: true,
+                        ..Default::default()
+                    })
+                    .build(),
+            );
+            app.worker_registry
+                .register(Arc::clone(&worker))
+                .expect("the worker registers");
+            assert_eq!(
+                app.worker_registry
+                    .set_worker_overloaded(&worker, overloaded),
+                overloaded
+            );
+            sent.push(count);
+        }
+
+        // Round robin gives each of the two workers one of two requests.
+        let router = Router::new(&app).await.expect("the HTTP router");
+        let mut answers = Vec::new();
+        for _ in 0..2 {
+            let request: GenerateRequest =
+                serde_json::from_value(serde_json::json!({ "text": "hello", "model": MODEL }))
+                    .expect("a generate request");
+            let response = router
+                .route_typed_request(None, None, request, "/generate", MODEL)
+                .await;
+            let code = response
+                .headers()
+                .get(error::HEADER_X_SMG_ERROR_CODE)
+                .and_then(|code| code.to_str().ok())
+                .map(str::to_owned);
+            answers.push((response.status(), code));
+        }
+        answers.sort();
+        let sent: Vec<usize> = sent
+            .iter()
+            .map(|count| count.load(Ordering::SeqCst))
+            .collect();
+        if shed {
+            assert_eq!(
+                answers,
+                [
+                    (StatusCode::OK, None),
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Some("worker_overload_protection_shed".to_owned())
+                    ),
+                ]
+            );
+            // The overloaded worker was sent nothing, and its request went
+            // to no other worker.
+            assert_eq!(sent, [0, 1]);
+        } else {
+            assert_eq!(answers, [(StatusCode::OK, None), (StatusCode::OK, None)]);
+            assert_eq!(sent, [1, 1]);
+        }
     }
 }

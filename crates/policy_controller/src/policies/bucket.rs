@@ -2462,6 +2462,7 @@ mod tests {
             target: pool[1].id,
             picked,
             session: view::Session::NONE,
+            session_verdict: crate::engine::SessionVerdict::None,
             state: crate::store::LeaseState::ISSUED,
             tokens: 300,
             target_index: 0,
@@ -3040,6 +3041,10 @@ mod tests {
         scorer.on_membership(&Membership::Added(gone));
         led(&scorer, &pool, 0, 2 * SECOND);
         assert_eq!(loads(&scorer), (vec![100, 0], 140), "named again");
+        // A join told again of a worker that stands changes nothing.
+        scorer.on_membership(&Membership::Added(gone));
+        led(&scorer, &pool, 0, 2 * SECOND);
+        assert_eq!(loads(&scorer), (vec![100, 0], 140), "named twice");
 
         // A replacing handle: the id comes back as the new handle of a
         // worker this model never listed.

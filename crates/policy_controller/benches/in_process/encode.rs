@@ -41,9 +41,9 @@ use std::{
 use smg_policy_controller::{
     document::{AppliedSpec, PolicySpec},
     engine::{
-        EncodeItems, EncodeLists, EncodePlaced, EncoderFacts, FixedFacts, Identity, LentList,
-        MediaCounts, PairLists, PartnerClasses, PlaceRequest, Plain, PolicyEngine, Prompt, Request,
-        RequestMaker, WorkerId, WorkerLists,
+        EncodeItems, EncodeLists, EncodePlaced, EncoderFacts, FixedFacts, Identity, MediaCounts,
+        PairLists, PartnerClasses, PlaceRequest, Plain, PolicyEngine, Prompt, PublishedList,
+        Request, RequestMaker, WorkerId, WorkerLists,
     },
     store::GatewayId,
     tracking::{DecisionGuard, Outcome, Placement, Side, TransportClass},
@@ -54,7 +54,7 @@ use tokio::runtime::Builder;
 use super::{
     measure, mix,
     pair::{self, typed, Open},
-    place, reports, signals, Cell, Host, Published, Run, Shadowed, Stated, MODEL,
+    place, published, reports, signals, Cell, Host, Run, Shadowed, Stated, MODEL,
 };
 
 /// The images one request carries, each an item of its own.
@@ -110,12 +110,11 @@ fn end(side: Side, served: WorkerId) -> Outcome {
 /// list): its decodes with every worker's pair class, and its encoders with
 /// what it says of each.
 struct Sides {
-    decodes: Published,
+    decodes: PublishedList,
     classes: PartnerClasses,
-    encoders: Published,
-    /// What the host says of each encoder beside its object: it takes
-    /// images.
-    sees: Vec<FixedFacts>,
+    /// The encoders, published with what the host says of each beside its
+    /// object: it takes images.
+    encoders: PublishedList,
     /// Each encoder's encode facts: the one class, which hands to a prefill
     /// by no push.
     facts: Vec<EncoderFacts>,
@@ -188,13 +187,9 @@ impl Sides {
             decode_stalled: &[],
             decode_held: &[],
         };
-        let encoders = LentList {
-            facts: Some(&self.sees),
-            ..self.encoders.lent()
-        };
         EncodeLists {
             pair,
-            encoders,
+            encoders: self.encoders.lent(),
             encoders_places: places(2),
             encoders_stalled: &[],
             encoders_held: &[],
@@ -333,9 +328,8 @@ pub(super) fn runs(run: &Run) -> bool {
     };
     let sides = Sides {
         classes: PartnerClasses::number(decodes.len(), every),
-        decodes: Published::of(&decodes),
-        encoders: Published::of(&encoders),
-        sees: vec![sees; encoders.len()],
+        decodes: published(&decodes),
+        encoders: PublishedList::with_facts(Arc::clone(&encoders), |_| sees),
         facts: vec![class; encoders.len()],
         prefill_classes: vec![class.class; prefills.len()],
         places: name.starts_with("encode_held_").then(|| {
@@ -364,7 +358,7 @@ pub(super) fn runs(run: &Run) -> bool {
     upkeep.spawn(engine.run());
     let host = Host {
         engine,
-        list: Published::of(&prefills),
+        list: published(&prefills),
         request,
         plain: request(0).plain(),
     };

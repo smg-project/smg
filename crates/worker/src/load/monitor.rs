@@ -118,6 +118,10 @@ use classic_sink::ClassicLoadSink;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// The bytes of a load answer the monitor reads, over HTTP. A longer answer
+/// is a failed fetch.
+const MAX_LOAD_ANSWER_BYTES: usize = 64 * 1024 * 1024;
+
 /// The rank loads by worker as the update line writes them: each address
 /// masked. A worker's address may hold a credential in its userinfo or a
 /// token in its query. The address is read when the line is written, so
@@ -1541,16 +1545,17 @@ impl<G: Generation> WorkerMonitor<G> {
     /// group that ended, changed its interval or had another loop spawned
     /// over it ahead of the call. It was
     /// told to end there, and a tick of it that is past its fetch can
-    /// still publish. Last the
+    /// still publish. Every pusher is evicted then, and the mark of a
+    /// stream that pushes goes off every registered worker. Last the
     /// monitor resets as its rebuild from the registry does: the shared
     /// snapshot is published empty, the probe memo goes, and the sink is
     /// told the reset ([`LoadSink::reset`]). The monitor's own sink takes
     /// every overload veto off the registry's workers there.
     ///
     /// The monitor then runs no task: its snapshot is empty, its probe memo
-    /// is gone and its sink was told the reset. A pusher that is still the
-    /// registry's `Ready` worker at its URL keeps its report on file, and
-    /// the sink its receipts. The receivers stay subscribed and read the
+    /// is gone and its sink was told the reset. No pusher has a report on
+    /// file, and the sink was told to forget each one that had
+    /// ([`LoadSink::forget`]). The receivers stay subscribed and read the
     /// empty snapshot, and [`Self::start_event_loop`] starts the monitor
     /// again over the registry as it stands at that call.
     ///
@@ -1565,6 +1570,35 @@ impl<G: Generation> WorkerMonitor<G> {
     /// So a worker whose stream pushes can carry an overload veto with no
     /// poll behind it, until the next start: its rebuild from the registry
     /// tells the sink the reset.
+    ///
+    /// No pusher's file outlives a stop. Behind the tasks' end and ahead of
+    /// the reset, the stop evicts every pusher, whatever its worker's
+    /// status: the report on file with every rank it holds, the publish it
+    /// queued or held, and what the sink keeps of the worker
+    /// ([`LoadSink::forget`]). The engine series of a pusher that stays
+    /// `Ready` keep their last value, as a polled worker's do through a
+    /// stop: the sentinel is written where the worker is no longer the
+    /// registry's `Ready` worker at its URL. The reset alone keeps the
+    /// file of a pusher that stays `Ready`: behind a rebuild the monitor's
+    /// tasks and the pusher's stream both go on, and the file is that
+    /// worker's newest word. A stop ends the run, and a host may hand a
+    /// stopped monitor no record. A file kept through the stop would then be as
+    /// old as the stop at the next start, where a publish it queued or its
+    /// worker's next record would publish every rank it held. So a host
+    /// that stops and starts its monitor in turn starts each worker from no
+    /// report: the start polls it as a worker that never pushed, and its
+    /// file starts again at its stream's next record.
+    ///
+    /// The liveness sweep reads such a worker as one that never pushed too.
+    /// Behind the tasks' end the stop takes the mark of a stream that
+    /// pushes off every registered worker, whether a report of it was on
+    /// file or not. Left marked, a worker that its host heard on no channel
+    /// for the stale threshold would read unreachable from the next start's
+    /// first sweep to its first contact. A stopped monitor polls nothing,
+    /// so that silence says nothing of the worker. Its stream's next record
+    /// marks it again. An eviction alone keeps the mark: a worker that
+    /// leaves `Ready` and stays registered is judged by its stream's
+    /// silence still.
     ///
     /// A stop dropped at its first wait puts the event task's handle back.
     /// That task was told to end, and a poll of it that still runs can
@@ -1604,6 +1638,27 @@ impl<G: Generation> WorkerMonitor<G> {
         }
         for mut task in ending {
             ended(&mut task).await;
+        }
+        // The mark of a stream that pushes goes off every registered worker,
+        // with a report on file or without: the next start's sweep judges
+        // a worker by its stream's silence from that stream's next record.
+        for worker in self.worker_registry.global_generation().members().iter() {
+            if let Some(state) = worker.runtime_state() {
+                state.forget_load_records();
+            }
+        }
+        // Every pusher goes ahead of the reset, which by itself keeps the
+        // file of a worker that stays `Ready`: no file outlives the stop.
+        // The reset's flush takes the evictions queued here, so a stopped
+        // monitor holds none of its pushers.
+        let pushers: Vec<Arc<dyn Worker>> = self
+            .pushed_reports
+            .lock()
+            .values()
+            .map(|file| Arc::clone(&file.pusher))
+            .collect();
+        for pusher in &pushers {
+            self.evict_worker_loads(pusher);
         }
         self.stop_all_groups();
     }
@@ -1774,8 +1829,9 @@ impl<G: Generation> WorkerMonitor<G> {
     }
 
     /// Evict a single worker's cached loads. Used by the event loop on
-    /// `Removed`, `Replaced`, and `StatusChanged` away from `Ready`, and by
-    /// a reset for a pusher whose event was lost.
+    /// `Removed`, `Replaced`, and `StatusChanged` away from `Ready`, by a
+    /// reset for a pusher whose event was lost, and by a stop for every
+    /// pusher.
     ///
     /// The probe memo, the pushed report and what the sink holds of the
     /// worker (its overload flag, its receipts, its cached rank loads) are
@@ -1786,7 +1842,9 @@ impl<G: Generation> WorkerMonitor<G> {
     /// and the series the report fed are set to the sentinel with it
     /// ([`Self::clear_series`]). A report another worker started ahead of
     /// this eviction stays, with what the sink holds at the URL: both are
-    /// that worker's.
+    /// that worker's. The worker's mark of a stream that pushes stays too:
+    /// the stale rule still judges a worker that stays registered, and the
+    /// stop alone takes the mark off ([`Self::stop`]).
     fn evict_worker_loads(&self, worker: &Arc<dyn Worker>) {
         let url = worker.url();
         self.native_loads_memo.remove(url);
@@ -2162,8 +2220,11 @@ impl<G: Generation> WorkerMonitor<G> {
         // deadline's, and a body that is no load response is the engine's
         // answer. Whether the route is absent is the caller's to say: it
         // knows if the route ever answered.
-        let body = match resp.bytes().await {
-            Ok(body) => body,
+        let body = match Self::load_answer(resp, MAX_LOAD_ANSWER_BYTES).await {
+            Ok(Some(body)) => body,
+            // An answer past the size is a condition, no fact about the
+            // route, as an answer of 5xx is.
+            Ok(None) => return NativeLoads::Inconclusive(FetchFailure::Answer),
             Err(error) => return NativeLoads::Unreadable(Self::request_failure(&error)),
         };
         match serde_json::from_slice::<NativeResponse>(&body) {
@@ -2216,9 +2277,9 @@ impl<G: Generation> WorkerMonitor<G> {
     }
 
     /// The body of a shared authenticated GET with the standard timeout. A
-    /// status that is no success is the engine's answer. A request the
-    /// timeout ended is a deadline, at the send or in the body. Any other
-    /// failure is the transport's.
+    /// status that is no success, or a body past [`MAX_LOAD_ANSWER_BYTES`],
+    /// is the engine's answer. A request the timeout ended is a deadline, at
+    /// the send or in the body. Any other failure is the transport's.
     async fn authed_text(worker: &Arc<dyn Worker>, url: &str) -> Result<String, FetchFailure> {
         let failed = |error: reqwest::Error| Self::request_failure(&error);
         let response = Self::authed_request(worker, url)
@@ -2228,7 +2289,42 @@ impl<G: Generation> WorkerMonitor<G> {
         if !response.status().is_success() {
             return Err(FetchFailure::Answer);
         }
-        response.text().await.map_err(failed)
+        // Bytes that are no UTF-8 read as the replacement character, as in
+        // the client's own text read.
+        let Some(body) = Self::load_answer(response, MAX_LOAD_ANSWER_BYTES)
+            .await
+            .map_err(failed)?
+        else {
+            return Err(FetchFailure::Answer);
+        };
+        Ok(String::from_utf8(body)
+            .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned()))
+    }
+
+    /// The body of a load answer, read in pieces up to `size` bytes, or none
+    /// for a longer one. The length an answer declares is judged ahead of its
+    /// read, and an answer with no length piece by piece. A read that fails
+    /// ends on its own error.
+    async fn load_answer(
+        mut response: reqwest::Response,
+        size: usize,
+    ) -> Result<Option<Vec<u8>>, reqwest::Error> {
+        let declared = usize::try_from(response.content_length().unwrap_or(0))
+            .ok()
+            .filter(|&length| length <= size);
+        let Some(declared) = declared else {
+            return Ok(None);
+        };
+        // A declared length reserves a first piece at most: the rest grows
+        // as its bytes arrive.
+        let mut body = Vec::with_capacity(declared.min(64 * 1024));
+        while let Some(piece) = response.chunk().await? {
+            if piece.len() > size - body.len() {
+                return Ok(None);
+            }
+            body.extend_from_slice(&piece);
+        }
+        Ok(Some(body))
     }
 
     /// Why a request brought no answer: the deadline's where its timeout
@@ -2966,6 +3062,7 @@ mod native_loads_tests {
         connection::engine::{EngineConnection, EngineConnector, ZmqLink},
         identity::basic::{ConnectionMode, WorkerLoadGuard, WorkerType},
         model_card::ModelCard,
+        runtime::StallReason,
         test_support::{
             assert_metric, render_with_recorder, BasicWorkerBuilder, LoadReaders, WorkerMonitor,
             WorkerRegistry,
@@ -3993,6 +4090,321 @@ mod native_loads_tests {
         );
     }
 
+    /// A stop evicts every pusher ahead of its reset, so no rank of a file
+    /// outlives it. A worker's two ranks pushed and were published. Behind
+    /// the stop and the next start, one record of rank 0 publishes that
+    /// rank alone: the other rank's record went with the file. The reset
+    /// alone would keep the file, and the window would publish both ranks.
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_keeps_no_rank_of_a_pushers_file() {
+        let (registry, monitor) = monitor_with_readers(LoadReaders::Aware);
+        let worker = silent_worker("grpc://engine-a.invalid:50051", "a");
+        registry.register(Arc::clone(&worker)).unwrap();
+        let published = || -> Vec<(i32, i32)> {
+            let snapshot = monitor.load_state.snapshot();
+            let ranks = snapshot.get(worker.url()).map(|report| &report.loads);
+            ranks
+                .into_iter()
+                .flatten()
+                .map(|rank| (rank.dp_rank, rank.num_running_reqs))
+                .collect()
+        };
+        monitor.start_event_loop();
+        monitor.apply_pushed_load(&worker, 0, &PushedRecord::requests(8, 0), Instant::now());
+        monitor.apply_pushed_load(&worker, 1, &PushedRecord::requests(5, 0), Instant::now());
+        tokio::time::sleep(PUSHED_PUBLISH_WINDOW * 2).await;
+        assert_eq!(published(), vec![(0, 8), (1, 5)]);
+
+        monitor.stop().await;
+        assert_eq!(published(), vec![], "published while stopped");
+        monitor.start_event_loop();
+        monitor.apply_pushed_load(&worker, 0, &PushedRecord::requests(1, 0), Instant::now());
+        tokio::time::sleep(PUSHED_PUBLISH_WINDOW * 2).await;
+        assert_eq!(published(), vec![(0, 1)], "the ranks behind the next start");
+        monitor.stop().await;
+    }
+
+    /// A stop evicts the publish a pusher queued or held. One worker's
+    /// report is held, taken while the worker was not `Ready`, which it is
+    /// again by the stop. Another's record comes inside the last window.
+    /// The reset alone would keep both files, queued. The next start's
+    /// first window, which a third worker's record opens, publishes that
+    /// worker alone.
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_keeps_no_publish_a_pusher_queued_or_held() {
+        let (registry, monitor) = monitor_with_readers(LoadReaders::Aware);
+        let [held, queued, later] = ["a", "b", "c"]
+            .map(|at| silent_worker(&format!("grpc://engine-{at}.invalid:50051"), "a"));
+        held.set_status(WorkerStatus::NotReady);
+        for worker in [&held, &queued, &later] {
+            registry.register(Arc::clone(worker)).unwrap();
+        }
+        monitor.start_event_loop();
+        let record = PushedRecord::requests(8, 0);
+        monitor.apply_pushed_load(&held, 0, &record, Instant::now());
+        // Held: a flush that finds its worker not `Ready` keeps its place.
+        monitor.flush_pushed();
+        assert_eq!(monitor.pending_pushed_len(), 1, "the held report");
+        held.set_status(WorkerStatus::Ready);
+        monitor.apply_pushed_load(&queued, 0, &record, Instant::now());
+        assert_eq!(monitor.pending_pushed_len(), 2);
+
+        // Inside the second record's window: no flush has published it.
+        monitor.stop().await;
+        assert_eq!(monitor.pending_pushed_len(), 0, "queued behind the stop");
+
+        monitor.start_event_loop();
+        monitor.apply_pushed_load(&later, 0, &record, Instant::now());
+        tokio::time::sleep(PUSHED_PUBLISH_WINDOW * 2).await;
+        let snapshot = monitor.load_state.snapshot();
+        assert!(
+            snapshot.get(later.url()).is_some(),
+            "the start's own record"
+        );
+        for worker in [&held, &queued] {
+            assert!(
+                snapshot.get(worker.url()).is_none(),
+                "{} is published from ahead of the stop",
+                worker.url()
+            );
+        }
+        monitor.stop().await;
+    }
+
+    /// A stop evicts what the sink keeps of a pusher with its file: a
+    /// worker that pushed ahead of the stop is polled at the next start, as
+    /// one that never pushed. Its receipt, kept as the reset alone keeps
+    /// it, would leave the worker to its stream for that start's first
+    /// interval.
+    #[tokio::test(start_paused = true)]
+    async fn a_worker_that_pushed_ahead_of_a_stop_is_polled_at_the_next_start() {
+        let (connector, monitor) = polled_every(Duration::from_secs(1), &[None]);
+        monitor.start_event_loop();
+        // Between the start's poll and the next tick.
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(connector.calls(), 1);
+        let worker = monitor.worker_registry.get_all().pop().expect("the worker");
+        monitor.apply_pushed_load(&worker, 0, &PushedRecord::requests(8, 0), Instant::now());
+
+        monitor.stop().await;
+        monitor.start_event_loop();
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(connector.calls(), 2, "the next start's poll");
+        monitor.stop().await;
+    }
+
+    /// A stop takes the mark of a stream that pushes off every registered
+    /// worker: the next start's sweep reads a worker that pushed ahead of
+    /// the stop as one that never pushed, and judges no silence of it. The
+    /// worker here is heard from on no channel for longer than the stale
+    /// threshold its sweep is given. Left marked, it would read unreachable
+    /// until its first contact. Its stream's next record marks it again,
+    /// and the same silence is a verdict then.
+    #[tokio::test(start_paused = true)]
+    async fn a_worker_that_pushed_ahead_of_a_stop_is_judged_by_no_silence_at_the_next_start() {
+        let stale = Duration::from_millis(20);
+        // A sweep behind a silence longer than `stale`, by the stale rule
+        // alone: the other two are out of reach and off.
+        let swept = |worker: &Arc<dyn Worker>| {
+            std::thread::sleep(stale * 2);
+            liveness::sweep_with(worker, Duration::MAX, Duration::ZERO, stale);
+            worker.stall_reason()
+        };
+        let (registry, monitor) = monitor_with_readers(LoadReaders::Aware);
+        let worker = silent_worker("grpc://engine-a.invalid:50051", "a");
+        registry.register(Arc::clone(&worker)).unwrap();
+        let record = PushedRecord::requests(8, 0);
+        monitor.start_event_loop();
+        monitor.apply_pushed_load(&worker, 0, &record, Instant::now());
+
+        monitor.stop().await;
+        monitor.start_event_loop();
+        assert_eq!(swept(&worker), None, "judged by its stream's silence");
+
+        monitor.apply_pushed_load(&worker, 0, &record, Instant::now());
+        assert_eq!(
+            swept(&worker),
+            Some(StallReason::Unreachable),
+            "the next record's mark"
+        );
+        monitor.stop().await;
+    }
+
+    /// A host's connector whose gRPC connect never returns, and that runs a
+    /// case's step where the connect is dropped unanswered, as a stop drops
+    /// a poll in flight.
+    #[derive(Default)]
+    struct CutConnect {
+        at_cut: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    }
+
+    impl Debug for CutConnect {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("CutConnect")
+        }
+    }
+
+    /// A connect in flight: dropped, it runs its connector's step.
+    struct InFlight<'a>(&'a CutConnect);
+
+    impl Drop for InFlight<'_> {
+        fn drop(&mut self) {
+            if let Some(step) = self.0.at_cut.lock().as_ref() {
+                step();
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl EngineConnector for CutConnect {
+        async fn connect_grpc(
+            &self,
+            _base_url: &str,
+            _runtime: RuntimeType,
+        ) -> Result<Arc<dyn EngineConnection>, String> {
+            let _in_flight = InFlight(self);
+            std::future::pending().await
+        }
+
+        async fn connect_zmq(&self, _link: ZmqLink) -> Result<Arc<dyn EngineConnection>, String> {
+            Err("a gRPC worker runs no handshake".to_string())
+        }
+
+        async fn dial_grpc(&self, _base_url: &str, _timeout: Duration) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    /// A stop takes what a record leaves that comes inside its wait for the
+    /// tasks' end: the eviction and the mark's clearing stand behind that
+    /// wait. A poll is in flight where the stop begins, and the record
+    /// comes where the stop drops it. Behind the stop its worker has no
+    /// report on file, no publish queued and no mark of a stream that
+    /// pushes.
+    #[tokio::test(start_paused = true)]
+    async fn a_record_inside_a_stops_wait_leaves_no_file_and_no_mark() {
+        let (registry, monitor) = monitor_with_readers(LoadReaders::Aware);
+        let connector = Arc::new(CutConnect::default());
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://engine-a.invalid:50051")
+                .worker_type(WorkerType::Regular)
+                .connection_mode(ConnectionMode::Grpc)
+                .model(ModelCard::new("a"))
+                .engine_connector(Arc::clone(&connector) as Arc<dyn EngineConnector>)
+                .health_config(HealthCheckConfig {
+                    disable_health_check: true,
+                    ..Default::default()
+                })
+                .build(),
+        );
+        registry.register(Arc::clone(&worker)).unwrap();
+        monitor.start_event_loop();
+        // The start's poll is in flight.
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        let came = Arc::new(AtomicUsize::new(0));
+        let (records, taker, pusher) = (
+            Arc::clone(&came),
+            Arc::downgrade(&monitor),
+            Arc::clone(&worker),
+        );
+        *connector.at_cut.lock() = Some(Box::new(move || {
+            let monitor = taker.upgrade().expect("the monitor stands in its stop");
+            monitor.apply_pushed_load(&pusher, 0, &PushedRecord::requests(8, 0), Instant::now());
+            records.fetch_add(1, Ordering::SeqCst);
+        }));
+
+        monitor.stop().await;
+        assert_eq!(came.load(Ordering::SeqCst), 1, "the record inside the stop");
+        let runtime = worker.runtime_state().expect("the worker's running state");
+        assert!(
+            !runtime.pushes_load_records(),
+            "the mark of a record that came inside the stop"
+        );
+        assert!(
+            monitor.pushed_reports.lock().is_empty(),
+            "the file of a record that came inside the stop"
+        );
+        assert_eq!(monitor.pending_pushed_len(), 0, "its queued publish");
+        // The step holds the worker, and the worker's connector the step.
+        connector.at_cut.lock().take();
+    }
+
+    /// A stop takes the mark off a registered worker that has no report on
+    /// file. This worker pushed and then left `Ready`: the eviction took
+    /// its file and kept its mark, since a worker that stays registered is
+    /// still judged by its stream's silence. The stop reads the registry's
+    /// workers, not the files.
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_takes_the_mark_off_a_worker_whose_file_an_eviction_took() {
+        let (registry, monitor) = monitor_with_readers(LoadReaders::Aware);
+        let worker = silent_worker("grpc://engine-a.invalid:50051", "a");
+        registry.register(Arc::clone(&worker)).unwrap();
+        monitor.start_event_loop();
+        monitor.apply_pushed_load(&worker, 0, &PushedRecord::requests(8, 0), Instant::now());
+        worker.set_status(WorkerStatus::NotReady);
+        monitor.evict_worker_loads(&worker);
+        let runtime = worker.runtime_state().expect("the worker's running state");
+        assert!(
+            monitor.pushed_reports.lock().is_empty(),
+            "the eviction left the worker's file"
+        );
+        assert!(runtime.pushes_load_records(), "the eviction took the mark");
+
+        monitor.stop().await;
+        assert!(
+            !runtime.pushes_load_records(),
+            "the mark of a worker with no report on file"
+        );
+    }
+
+    /// A rebuild from the registry keeps the mark of a stream that pushes:
+    /// the stop alone takes it off. The rebuild keeps the file of a pusher
+    /// that stays `Ready`, whose stream serves it still, and the stale rule
+    /// judges that stream's silence still.
+    #[tokio::test(start_paused = true)]
+    async fn a_rebuild_from_the_registry_keeps_the_mark_of_a_pusher_that_stays() {
+        let (registry, monitor) = monitor_with_readers(LoadReaders::Aware);
+        let worker = silent_worker("grpc://engine-a.invalid:50051", "a");
+        registry.register(Arc::clone(&worker)).unwrap();
+        monitor.start_event_loop();
+        monitor.apply_pushed_load(&worker, 0, &PushedRecord::requests(8, 0), Instant::now());
+
+        // The lag recovery's own call.
+        monitor.reconcile_from_registry();
+        let runtime = worker.runtime_state().expect("the worker's running state");
+        assert!(
+            monitor.pushed_reports.lock().contains_key(worker.url()),
+            "the rebuild took the file of a pusher that stays"
+        );
+        assert!(runtime.pushes_load_records(), "the rebuild took the mark");
+        monitor.stop().await;
+    }
+
+    /// A stopped monitor holds none of its pushers. The stop evicts each
+    /// one ahead of its reset, and the reset's flush takes the evictions
+    /// queued there. With the reset ahead of them, each pusher would stay
+    /// queued until the next start.
+    #[tokio::test(start_paused = true)]
+    async fn a_stopped_monitor_holds_none_of_its_pushers() {
+        let (registry, monitor) = monitor_with_readers(LoadReaders::Aware);
+        let worker = silent_worker("grpc://engine-a.invalid:50051", "a");
+        registry.register(Arc::clone(&worker)).unwrap();
+        // The registry's own handles, with the generation it publishes for
+        // its first reader: the stop is one.
+        drop(registry.global_generation());
+        let handles = Arc::strong_count(&worker);
+        monitor.start_event_loop();
+        monitor.apply_pushed_load(&worker, 0, &PushedRecord::requests(8, 0), Instant::now());
+        assert!(Arc::strong_count(&worker) > handles, "the file's handle");
+
+        monitor.stop().await;
+        assert_eq!(
+            Arc::strong_count(&worker),
+            handles,
+            "the handles of a pusher behind the stop"
+        );
+    }
+
     /// A monitor told `interval` as its own, over one group of HTTP workers
     /// whose host keeps one load source for them all. Each entry of `own`
     /// is a worker: the whole seconds it states for itself, or nothing. The
@@ -4329,6 +4741,82 @@ mod native_loads_tests {
             memo.get(worker.url()).and_then(|hit| hit.answered()),
             Some(NativeLoadsPath::Engine)
         );
+    }
+
+    /// A load answer is read up to a size: one of that size is read, and one
+    /// a byte longer is none, whether the answer declares its length or not.
+    /// On the native route and on the gauges' route an answer that declares
+    /// a length past [`MAX_LOAD_ANSWER_BYTES`] is a failed fetch ahead of
+    /// its body.
+    #[tokio::test]
+    async fn a_load_answer_past_the_size_is_a_failed_fetch() {
+        const SIZE: usize = 64;
+        // An answer of blanks that declares its length or sends them with
+        // none, in two pieces: the size, then the rest. Past the size it
+        // withholds what its reader must not wait for: its body where it
+        // declares its length, else its end.
+        let answer = |declared: bool, length: usize| async move {
+            let past = length > SIZE;
+            let blanks = " ".repeat(if declared && past { 0 } else { length });
+            let (first, rest) = blanks.split_at(blanks.len().min(SIZE));
+            let pieces =
+                [first, rest].map(|piece| Ok::<_, std::convert::Infallible>(piece.to_string()));
+            let end = futures::stream::poll_fn(move |_| {
+                if past {
+                    std::task::Poll::Pending
+                } else {
+                    std::task::Poll::Ready(None)
+                }
+            });
+            let pieces = futures::stream::iter(pieces);
+            (
+                declared.then(|| [(http::header::CONTENT_LENGTH, length.to_string())]),
+                axum::body::Body::from_stream(futures::StreamExt::chain(pieces, end)),
+            )
+        };
+        let sized =
+            move |axum::extract::Path((declared, length)): axum::extract::Path<(bool, usize)>| {
+                answer(declared, length)
+            };
+        let past = move || answer(true, MAX_LOAD_ANSWER_BYTES + 1);
+        let app = axum::Router::new()
+            .route("/answer/{declared}/{length}", axum::routing::get(sized))
+            .route("/v1/loads", axum::routing::get(past))
+            .route("/metrics", axum::routing::get(past));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stub");
+        let url = format!("http://{}", listener.local_addr().expect("stub address"));
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test stub server lives for the duration of the test process"
+        )]
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("stub serve");
+        });
+        let worker = gauge_worker(&url);
+        let read = |declared: bool, length: usize| {
+            let url = format!("{url}/answer/{declared}/{length}");
+            let request = WorkerMonitor::authed_request(&worker, &url);
+            async move {
+                let answer = request.send().await.expect("the answer's head");
+                let body = WorkerMonitor::load_answer(answer, SIZE).await;
+                body.expect("the answer is read").map(|body| body.len())
+            }
+        };
+
+        for declared in [false, true] {
+            assert_eq!(read(declared, SIZE).await, Some(SIZE));
+            assert_eq!(read(declared, SIZE + 1).await, None);
+        }
+        assert!(matches!(
+            WorkerMonitor::probe_native_loads(&worker, NativeLoadsPath::Engine).await,
+            NativeLoads::Inconclusive(FetchFailure::Answer)
+        ));
+        assert!(matches!(
+            WorkerMonitor::fetch_http_load_vllm(&worker).await,
+            Err(FetchFailure::Answer)
+        ));
     }
 
     /// The load probe of a dp-aware HTTP worker goes to its engine's address:

@@ -2,7 +2,7 @@
 //! its `Welcome` until its grace period ends with no new `Hello`, one
 //! period more at most while a session a newer one replaced still runs,
 //! and what the store holds under its key lives exactly that long: its
-//! lease records, its vetoes and its completions.
+//! lease records and its vetoes.
 //!
 //! Presence is read from the clock at the instant of the question, as the
 //! fence is: a gateway is present while a session of it stands and for the
@@ -598,7 +598,9 @@ impl Gateways {
     /// The sweep's task: a pass every tenth of the grace period until
     /// `stop`, on no stream's path. The leases' due ends ride it too
     /// ([`LeasesStore::expire`]): a file of leases whose decider waits for
-    /// a job issues nothing, so nothing else would end its due leases.
+    /// a job issues nothing, so nothing else would end its due leases. So
+    /// does the upkeep of the engine that decides under the store's
+    /// standing document: that engine runs no task of its own.
     pub(crate) async fn run(&self, mut stop: watch::Receiver<bool>) {
         let mut tick = tokio::time::interval((self.grace / 10).max(Duration::from_millis(1)));
         tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -614,6 +616,13 @@ impl Gateways {
                     // a file whose decider waits for a job: one at work
                     // ends its own file's at its issues.
                     drop(LeasesStore::expire(&*self.store, now));
+                    // So does the upkeep of the standing document's engine,
+                    // which that engine's own task runs in a gateway's
+                    // process: a session key past its end leaves its
+                    // table, and so does the record of sent prefixes of a
+                    // model no worker is left in. A replica runs it
+                    // whether it leads or not.
+                    self.store.deciding(|world| world.applied().sweep(now));
                 }
                 _ = stop.wait_for(|stop| *stop) => break,
             }
@@ -856,10 +865,9 @@ impl Gateways {
     }
 
     /// The end of presences, under the table's lock: what the store holds
-    /// for each gateway (its lease records, its vetoes and its completions)
-    /// is let go through the store's one door for a gone gateway, in one
-    /// write for them all, then the rows go and their decide streams are
-    /// told.
+    /// for each gateway (its lease records and its vetoes) is let go
+    /// through the store's one door for a gone gateway, in one write for
+    /// them all, then the rows go and their decide streams are told.
     fn end(&self, gone: Vec<(GatewayId, Row)>) {
         let gateways: Vec<GatewayId> = gone.iter().map(|(gateway, _)| *gateway).collect();
         let leases = self.store.drop_gateways(&gateways);
@@ -907,16 +915,13 @@ pub(crate) mod tests {
         over_kinds, DropPause, Gateways, Refused, SessionPlace, Vetoed, KINDS_MAX, VETOES_MAX,
     };
     use crate::{
-        document::spec::{AppliedSpec, PolicySpec},
+        document::spec::{AppliedSpec, Assignment, PolicySpec, Recovery, RulePlaced},
         engine::{
-            sticky_sessions::SessionVerdict,
+            sticky_sessions::{SessionRule, SessionVerdict},
             view::{Role, Session, WorkerId},
         },
         service::{
-            controller::lifecycle::{
-                self,
-                tests::{a_completed, worker},
-            },
+            controller::lifecycle::tests::worker,
             elector::{ElectionSettings, Elector, TickOutcome},
         },
         store::{
@@ -1100,74 +1105,12 @@ pub(crate) mod tests {
         );
     }
 
-    /// What the store holds under a gateway's key ends with its presence:
-    /// its completions with its lease records, and no other gateway's.
-    #[test]
-    fn a_gateway_let_go_leaves_no_completion_in_the_store() {
-        let (_elector, store, gateways, t0) = leading(GRACE);
-        let served = worker(&store, "http://a:8000");
-        let gone = welcomed(&gateways, A, "gateway-a", TERM, t0);
-        let _stands = welcomed(&gateways, B, "gateway-b", TERM, t0);
-        for gateway in [A, B] {
-            lifecycle::completed(
-                &store,
-                &lifecycle::tests::open(&store, gateway),
-                &a_completed(1, served),
-                t0,
-            )
-            .expect("the frame reads");
-        }
-        gone.end(t0);
-
-        assert_eq!(gateways.sweep(t0 + GRACE - MS), 0);
-        assert!(
-            store.completed_ok_since(A, served, t0),
-            "inside the period nothing is let go"
-        );
-        assert_eq!(gateways.sweep(t0 + GRACE), 1);
-        assert!(
-            !store.completed_ok_since(A, served, t0),
-            "the gateway's completion went with it"
-        );
-        assert!(
-            store.completed_ok_since(B, served, t0),
-            "another gateway's stands"
-        );
-    }
-
-    /// A `Hello` past the grace period lets the gateway go before it is
-    /// welcomed anew, with no pass of the sweep between: the new presence
-    /// starts with no completion of the one that ended.
-    #[test]
-    fn a_gateway_welcomed_anew_past_its_grace_period_starts_with_no_completion() {
-        let (_elector, store, gateways, t0) = leading(GRACE);
-        let served = worker(&store, "http://a:8000");
-        let gone = welcomed(&gateways, A, "gateway-a", TERM, t0);
-        lifecycle::completed(
-            &store,
-            &lifecycle::tests::open(&store, A),
-            &a_completed(1, served),
-            t0,
-        )
-        .expect("the frame reads");
-        gone.end(t0);
-
-        let _anew = welcomed(&gateways, A, "gateway-a", TERM, t0 + GRACE);
-        assert!(
-            !store.completed_ok_since(A, served, t0),
-            "the completion ended with the presence that wrote it"
-        );
-        assert_eq!(store.health_entries(), 0);
-    }
-
     /// A frame of a replaced session that is past the seat's question may
     /// still be written. The gateway is not let go while that session
-    /// runs: what the frame writes lands under the row it was read for and
-    /// leaves with it.
+    /// runs.
     #[test]
     fn a_gateway_is_not_let_go_while_a_session_it_replaced_still_runs() {
-        let (_elector, store, gateways, t0) = leading(GRACE);
-        let served = worker(&store, "http://a:8000");
+        let (_elector, _store, gateways, t0) = leading(GRACE);
         let first = welcomed(&gateways, A, "gateway-a", TERM, t0);
         let second = welcomed(&gateways, A, "gateway-a", TERM, t0);
         welcomed(&gateways, A, "gateway-a", TERM, t0).end(t0);
@@ -1178,21 +1121,8 @@ pub(crate) mod tests {
         // The later of the two ends first: the earlier one holds the row.
         drop(second);
         assert_eq!(gateways.sweep(t0 + GRACE), 0, "a replaced session runs");
-        // Its late frame, then its end.
-        lifecycle::completed(
-            &store,
-            &lifecycle::tests::open(&store, A),
-            &a_completed(1, served),
-            t0 + GRACE,
-        )
-        .expect("the frame reads");
         drop(first);
         assert_eq!(gateways.sweep(t0 + GRACE), 1);
-        assert!(
-            !store.completed_ok_since(A, served, t0),
-            "the late frame's completion left with the row"
-        );
-        assert_eq!(store.health_entries(), 0);
 
         // The other order, on a second gateway: the earlier of the two ends
         // first, and the later one holds the row alone.
@@ -1261,35 +1191,6 @@ pub(crate) mod tests {
         }
         assert_eq!(gateways.noted(A), 0, "no ended session remains");
         drop(stands);
-    }
-
-    /// The completions on file are bounded by who is present, never by who
-    /// was ever welcomed: waves of gateways under the table's ceiling, each
-    /// reporting a completion and let go, leave nothing behind.
-    #[test]
-    fn the_completions_on_file_do_not_grow_with_the_gateways_ever_welcomed() {
-        let (_elector, store, gateways, t0) = ceiled(GRACE, 8);
-        let served = worker(&store, "http://a:8000");
-        let mut now = t0;
-        for wave in 0..5_u64 {
-            for n in 0..8_u64 {
-                let gateway = GatewayId(100 + wave * 8 + n);
-                let subject = format!("gateway-{wave}-{n}");
-                let seat = welcomed(&gateways, gateway, &subject, TERM, now);
-                lifecycle::completed(
-                    &store,
-                    &lifecycle::tests::open(&store, gateway),
-                    &a_completed(1, served),
-                    now,
-                )
-                .expect("the frame reads");
-                seat.end(now);
-            }
-            assert_eq!(store.health_entries(), 8, "a completion a gateway");
-            now += GRACE;
-            assert_eq!(gateways.sweep(now), 8);
-            assert_eq!(store.health_entries(), 0, "wave {wave}");
-        }
     }
 
     /// A welcome and a letting-go of one gateway at one instant are
@@ -1688,7 +1589,11 @@ pub(crate) mod tests {
 
     /// The names that left ride the sweeps' task: one that stays away past
     /// the absence's time takes its session pins with it by the task's own
-    /// tick, which no other caller of the store's tick stands in for.
+    /// tick, and no sooner, which no other caller of the store's tick
+    /// stands in for. The engine's upkeep rides the same tick and takes
+    /// this key out by nothing of its own. The key is read behind the
+    /// leave, so the engine's table filed no absence, and under a rule that
+    /// never ends it.
     #[tokio::test]
     async fn the_sweeps_task_ends_the_absence_of_a_key_that_stays_away() {
         let (_elector, store, gateways, _t0) = leading(Duration::from_millis(60));
@@ -1708,24 +1613,37 @@ pub(crate) mod tests {
             let table = world.spec().engine().sessions();
             table.pins(key).map(|pins| pins[0])
         };
-        let world = store.snapshot();
-        let table = world.spec().engine().sessions();
-        table.dispatched(key, SessionVerdict::Pinned, w);
+        let left = Instant::now();
         let revision = WorkersStore::get(&*store, w).expect("the row").revision;
         WorkersStore::remove(&*store, w, revision).expect("removed");
+        let never = SessionRule {
+            assignment: Assignment::default(),
+            inflight_cap: 0,
+            ttl_micros: None,
+            sweep_micros: 0,
+            recovery: Recovery::default(),
+            rule_placed: RulePlaced::default(),
+        };
+        let world = store.snapshot();
+        let table = world.spec().engine().sessions();
+        table.lookup(key, store.micros(left), &never);
+        table.dispatched(key, SessionVerdict::Pinned, w);
         assert_eq!(held(), Some(w), "inside its time");
         let (stop, stopped) = watch::channel(false);
         let mut task = JoinSet::new();
         let sweeper = Arc::clone(&gateways);
         task.spawn(async move { sweeper.run(stopped).await });
-        let started = Instant::now();
         while held().is_some() {
             assert!(
-                started.elapsed() < Duration::from_secs(20),
+                left.elapsed() < Duration::from_secs(20),
                 "the task ended no absence in 20 s"
             );
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
+        assert!(
+            left.elapsed() >= Duration::from_secs(1),
+            "the pin left inside the absence's time"
+        );
         stop.send_replace(true);
         timeout(Duration::from_secs(20), task.join_next())
             .await
@@ -1809,7 +1727,7 @@ pub(crate) mod tests {
         // asks for one.
         store.publish_now();
         let world = store.snapshot();
-        assert!(world.first_row_of(worker).is_some(), "the worker's row");
+        assert!(world.booked_of(worker).is_some(), "the worker is published");
         let vetoes = world.gateway_vetoes("m", Role::Single, gateway);
         let veto = vetoes.standing_at(now).find(|veto| veto.id == worker);
         veto.map_or((false, false), |veto| (veto.held, true))

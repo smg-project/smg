@@ -868,8 +868,9 @@ async fn a_worker_added_over_the_wire_is_decided_with_no_ask_for_a_build() {
             .expect("a present gateway's stream opens")
             .into_inner();
 
-        // The add, then its status at the store's door. No call asks for a
-        // build: the served loop pays it.
+        // The add of a worker whose policy turns its probes off: the call's
+        // connect signal readies it. No call asks for a build: the served
+        // loop pays it.
         let builds = store.membership_builds();
         let request = RegisterWorkerRequest {
             spec: Some(WorkerSpec {
@@ -877,6 +878,10 @@ async fn a_worker_added_over_the_wire_is_decided_with_no_ask_for_a_build() {
                 wire: WireMode::Grpc as i32,
                 role: proto::Role::Single as i32,
                 models: vec![MODEL.to_owned()],
+                health_policy: Some(proto::HealthPolicy {
+                    disabled: true,
+                    ..Default::default()
+                }),
                 ..WorkerSpec::default()
             }),
             mode: Mode::Add as i32,
@@ -892,8 +897,6 @@ async fn a_worker_added_over_the_wire_is_decided_with_no_ask_for_a_build() {
             other => panic!("a registration's answer: {other:?}"),
         };
         let answered = Instant::now();
-        let revision = WorkersStore::get(&*store, id).expect("the row").revision;
-        store.set_status(id, WorkerStatus::Ready, revision);
 
         // One request at a time, until a pick names the worker.
         let mut asked = 0u32;

@@ -19,7 +19,7 @@ use crate::{
     engine::{
         decision::{Decision, ShedReason, MAX_TARGETS, SUBSET_HINT},
         decision_engine::{Decided, Plain, Request, RequestMaker, WorkerLists},
-        list_cell::tests::PublishedList,
+        list_cell::PublishedList,
         pair_classes::PartnerClasses,
         policy_engine::PolicyEngine,
         view::{
@@ -260,6 +260,8 @@ fn every_field_of_a_frame_reaches_the_request_its_maker_makes() {
     assert_eq!(facts.media, media);
     assert_eq!((facts.seed, facts.block_size), (24, 25));
     assert_eq!(facts.client_key, 29);
+    // The frame says its id handed the key, and the request says so.
+    assert!(facts.session_key_from_rid);
     // The frame's budget of 2,000 is not what the engine is told is left,
     // and the decision's instant is the engine's to write.
     assert_eq!((facts.budget_micros, facts.now_micros), (1_500, 0));

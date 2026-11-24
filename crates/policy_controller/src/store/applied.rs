@@ -13,6 +13,10 @@
 //! A new document is a new engine object, built by the front's constructor.
 //! Its session table and its record of sent prompts start empty.
 //!
+//! The front a store builds runs no task of its own. The store tells it
+//! each word of its membership ([`Applied::on_membership`]), and the store's
+//! host runs its upkeep on a tick of its own ([`Applied::sweep`]).
+//!
 //! Every engine a store builds reads the store's own clock: the store hands
 //! it its origin. An apply hands a profile's count of sends from the
 //! standing engine to the next, and a lease is dated where the store reads
@@ -20,9 +24,11 @@
 
 use std::{ops::Deref, time::Instant};
 
-use crate::document::spec::AppliedSpec;
 #[cfg(feature = "in-process")]
-use crate::engine::policy_engine::PolicyEngine;
+use crate::engine::policy_engine::{PolicyEngine, SpecHandle};
+#[cfg(not(feature = "in-process"))]
+use crate::stages::Lifecycle;
+use crate::{document::spec::AppliedSpec, tracking::lease::Membership};
 
 /// One applied document as its store holds it: the engine that decides
 /// under it, where the build holds the in-process front, and the document
@@ -31,6 +37,10 @@ use crate::engine::policy_engine::PolicyEngine;
 pub(crate) struct Applied {
     #[cfg(feature = "in-process")]
     engine: PolicyEngine,
+    /// The engine's document, held for as long as the engine: a store
+    /// puts no second document in force on it.
+    #[cfg(feature = "in-process")]
+    spec: SpecHandle,
     #[cfg(not(feature = "in-process"))]
     spec: AppliedSpec,
 }
@@ -41,8 +51,10 @@ impl Applied {
     /// reads that clock.
     pub(crate) fn new(spec: AppliedSpec, origin: Instant) -> Self {
         #[cfg(feature = "in-process")]
-        let applied = Self {
-            engine: PolicyEngine::with_origin(spec, origin),
+        let applied = {
+            let engine = PolicyEngine::with_origin(spec, origin);
+            let spec = engine.spec();
+            Self { engine, spec }
         };
         #[cfg(not(feature = "in-process"))]
         let applied = {
@@ -63,17 +75,41 @@ impl Applied {
     pub(crate) fn front(&self) -> &PolicyEngine {
         &self.engine
     }
+
+    /// One word of the store's membership to the engine that decides under
+    /// the document, said under the store's lock of its workers. Where the
+    /// build holds the front, the front hears it: its records of sent
+    /// prefixes, then the document's engine
+    /// ([`PolicyEngine::on_membership`]). Else the document's engine hears
+    /// it alone.
+    pub(crate) fn on_membership(&self, word: &Membership<'_>) {
+        #[cfg(feature = "in-process")]
+        self.engine.on_membership(word);
+        #[cfg(not(feature = "in-process"))]
+        self.spec.engine().on_membership(word);
+    }
+
+    /// The upkeep of the engine that decides under the document, at `now`,
+    /// under the engine's own catch ([`PolicyEngine::upkeep`]): the session
+    /// keys past their end leave its table, and its records of sent prefixes
+    /// take a step of the work they left waiting. A controller asks it at
+    /// each pass of its presence sweep, a tenth of the grace period: once a
+    /// second, the period of the engine's own task in a gateway's process.
+    #[cfg(feature = "in-process")]
+    #[cfg_attr(
+        not(feature = "controller"),
+        expect(dead_code, reason = "a controller's tick asks it")
+    )]
+    pub(crate) fn sweep(&self, now: Instant) {
+        self.engine.upkeep(now);
+    }
 }
 
 impl Deref for Applied {
     type Target = AppliedSpec;
 
     fn deref(&self) -> &AppliedSpec {
-        #[cfg(feature = "in-process")]
-        let spec = self.engine.spec();
-        #[cfg(not(feature = "in-process"))]
-        let spec = &self.spec;
-        spec
+        &self.spec
     }
 }
 

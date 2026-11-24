@@ -124,10 +124,8 @@ impl Lease {
     }
 }
 
-/// The transport outcome of a dispatch, beside its status: what a health
-/// rule reads when it weighs a prober's verdict against the gateways'
-/// reports. Further classes add their cases: a `match` outside this crate
-/// keeps an arm for the rest.
+/// The transport outcome of a dispatch, beside its status. Further classes
+/// add their cases: a `match` outside this crate keeps an arm for the rest.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum TransportClass {
@@ -184,8 +182,9 @@ impl Outcome {
     /// leaves both as made here. A guard's caller states both
     /// ([`Outcome::with_served`]).
     ///
-    /// The class has no default: it feeds a worker's health, and an end
-    /// whose caller forgot it must not read as [`TransportClass::Ok`].
+    /// The class has no default: a plugin is shown it and a session's
+    /// frame carries it, and an end whose caller forgot it must not read
+    /// as [`TransportClass::Ok`].
     #[must_use]
     pub const fn reported(status: u16, class: TransportClass) -> Self {
         Self {
@@ -263,6 +262,11 @@ pub enum Said {
 /// A membership change the host reports. A host tells a join when it takes
 /// it, and a view that lists the row may follow: a stage that lists by the
 /// feed treats a member its candidates do not hold as one a filter took.
+///
+/// A join may be told again of a worker that stands, and a leave may name
+/// a worker the stage did not hear join: a new document's stages are told
+/// the workers that stand, beside the words of the host's registry. A
+/// stage takes each word as a statement of what stands.
 ///
 /// Further changes add their cases, and a case with named fields may gain
 /// one: a `match` outside this crate keeps an arm for the rest and ends

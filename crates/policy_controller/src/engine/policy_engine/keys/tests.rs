@@ -18,7 +18,7 @@ use crate::{
     engine::{
         decision::Decision,
         decision_engine::{DecideOutcome, DecisionEngine, Request, RequestMaker, WorkerLists},
-        list_cell::tests::PublishedList,
+        list_cell::PublishedList,
         policy_engine::PolicyEngine,
         records,
         sticky_sessions::{shards_for_this_host, SessionVerdict},
@@ -36,9 +36,14 @@ const MODEL: &str = "model-a";
 
 /// The engine of a stock document.
 fn preset(name: &str) -> PolicyEngine {
+    PolicyEngine::new(stock(name, 1))
+}
+
+/// The stock document `name` as applied under the generation `number`.
+fn stock(name: &str, number: u64) -> AppliedSpec {
     let mut document = PolicySpec::preset(name).expect("a built-in preset");
-    document.generation = 1;
-    PolicyEngine::new(AppliedSpec::validate(&document).expect("the document validates"))
+    document.generation = number;
+    AppliedSpec::validate(&document).expect("the document validates")
 }
 
 fn pool(workers: usize) -> Arc<[Arc<dyn Worker>]> {
@@ -466,6 +471,33 @@ fn a_sessions_pin_is_made_at_the_dispatch_and_followed_with_no_pass_over_the_lis
     assert!(pick.targets.iter().all(|target| target.id != pinned.id));
 }
 
+/// A session's pin stands across a new document: the session table is the
+/// engine's, and the document put in force reads and writes it. A key
+/// pinned under one document follows its pin under the next, by one
+/// worker's record.
+#[test]
+fn a_sessions_pin_stands_across_a_new_document() {
+    let engine = preset("manual");
+    let list = pool(16);
+    let members = PublishedList::new(Arc::clone(&list));
+    let now = Instant::now();
+    let asks = keyed(41, &members);
+    let mut first =
+        DecisionGuard::decide_under(&engine, GatewayId::LOCAL, &asks, now).expect("a decision");
+    let pinned = first.take(0).expect("the first target");
+    first.dispatched(now);
+    first.completed(&served(pinned.id), now);
+    drop(first);
+
+    let applied = engine.apply(stock("manual", 2));
+    applied.expect("a number above the standing one");
+    let followed = decided(&engine, &asks).decision;
+    let pick = followed.pick().expect("a pick");
+    assert_eq!(pick.trace.generation, 2, "under the new document");
+    assert_eq!(pick.session_verdict, SessionVerdict::Pinned);
+    assert_eq!(targets(&followed), [(pinned.position, pinned.id)]);
+}
+
 /// The engine's own pass drops the session keys past their end, off the
 /// path of a request: a pin made at a dispatch is held through the rule's
 /// idle time and gone after it.
@@ -482,7 +514,7 @@ fn the_engines_pass_drops_the_session_keys_past_their_end() {
     first.dispatched(now);
     first.completed(&served(pinned.id), now);
     drop(first);
-    let sessions = engine.spec().engine().sessions();
+    let sessions = engine.standing_spec().engine().sessions();
     assert_eq!(sessions.len(), 1);
     // The stock rule forgets a key at its first sweep, one a minute, four
     // hours after its last request.

@@ -20,6 +20,16 @@
 //! it off ([`runtime_specific`]): where a pair's requests are built for one
 //! runtime, two known runtimes never pair.
 //!
+//! On such a wire a pair one of whose workers names no runtime goes behind
+//! every other pair. The classes state it beside their table, as the
+//! decode classes each prefill class is paired with first
+//! ([`FirstPartners`]): its partners in every other pair. A pair decision
+//! then makes a pair with a worker of unknown runtime only while no first
+//! pair is open. One table holds the pairs of both sides of the wire's
+//! fact, so a pair of the plain side is a first pair too: that order
+//! stands inside the runtime-specific side, and none between the two. Two
+//! workers share a class where they pair alike and pair first alike.
+//!
 //! The derivation ([`PairClasses::derive`]) is a function of the membership
 //! and the mode and of nothing else. It numbers each side's classes in the
 //! order that side's workers are given, which the store makes the workers'
@@ -48,7 +58,7 @@ use rustc_hash::{FxBuildHasher, FxHashMap};
 use crate::{
     document::spec::Pairing,
     engine::{
-        framework::PairTable,
+        framework::{FirstPartners, PairTable},
         view::{WireModes, WorkerId},
         PartnerClasses,
     },
@@ -412,8 +422,8 @@ pub struct Refusal {
     pub mismatches: Vec<String>,
 }
 
-/// The pair classes of one model's prefill and decode pools, and which of
-/// them pair.
+/// The pair classes of one model's prefill and decode pools, which of them
+/// pair, and which of those first.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PairClasses {
     /// Each prefill with its class, in the order given.
@@ -425,6 +435,12 @@ pub struct PairClasses {
     /// The lists one after another: the decode classes each prefill class
     /// pairs with, ascending.
     listed: Box<[u32]>,
+    /// Where prefill class `k`'s first partners end in `first_listed`, at
+    /// `k - 1`. Empty where no pair goes ahead of another.
+    first_ends: Box<[u32]>,
+    /// The first partners' lists one after another: the decode classes
+    /// each prefill class is paired with first, ascending.
+    first_listed: Box<[u32]>,
     /// The refusal on each side of [`runtime_specific`]: the plain side
     /// first.
     refusals: [Option<Refusal>; 2],
@@ -435,25 +451,33 @@ impl PairClasses {
     /// under `mode`.
     ///
     /// A prefill pairs with every decode on its side of
-    /// [`runtime_specific`] that [`wire_mismatch`] does not refuse. The
-    /// prefills that pair with the same decodes are one prefill class, and
-    /// the decodes that pair with the same prefills are one decode class:
+    /// [`runtime_specific`] that [`wire_mismatch`] does not refuse. It
+    /// pairs first with each of them but one that leaves the pair's
+    /// runtime unknown on the runtime-specific side: there a first pair's
+    /// two workers name one runtime. The prefills that pair with the same
+    /// decodes, and first with the same of them, are one prefill class, and
+    /// the decodes that pair so with the same prefills are one decode class:
     /// workers of two descriptors that pair alike share a class. Each
     /// side's classes are numbered from `1` in the order their first worker
     /// is given, and a worker that pairs with nobody is class `0` and takes
     /// no number. The table lists, for each prefill class, the decode
     /// classes it pairs with: every decode class is named by some list, so
     /// the table numbers densely, as the engine asks of a host
-    /// ([`PairTable::new`]). Where both pools hold workers on one side of
-    /// the wire's fact and no pair is made there, that side's [`Refusal`]
-    /// names the two pools' keys and what they disagree on.
+    /// ([`PairTable::new`]). The first partners list, for each prefill
+    /// class, the decode classes it pairs with first: whole classes of its
+    /// own list ([`FirstPartners::within`]). None is kept where every pair
+    /// goes first and where none does: no pair then goes ahead of another.
+    /// Where both pools hold workers on one side of the wire's fact and no
+    /// pair is made there, that side's [`Refusal`] names the two pools'
+    /// keys and what they disagree on.
     pub fn derive(prefills: &[Member<'_>], decodes: &[Member<'_>], mode: Pairing) -> Self {
         Derivation::default().whole(prefills, decodes, mode)
     }
 
     /// The classes as an engine over worker lists reads them
     /// ([`PartnerClasses`]): each worker's class by its place in the
-    /// caller's list, with this derivation's table, which they take.
+    /// caller's list, with this derivation's table and its first partners,
+    /// which they take.
     ///
     /// `prefills` and `decodes` say, for each place of the caller's two
     /// lists in order, whether the worker there was among the members
@@ -475,8 +499,8 @@ impl PairClasses {
         PartnerClasses::derived(
             side(&self.prefills, prefills),
             side(&self.decodes, decodes),
-            self.ends,
-            self.listed,
+            [self.ends, self.listed],
+            [self.first_ends, self.first_listed],
         )
     }
 
@@ -506,6 +530,17 @@ impl PairClasses {
     /// Which classes pair, as a pair decision reads it beside its rows.
     pub fn table(&self) -> PairTable<'_> {
         PairTable::new(&self.ends, &self.listed)
+    }
+
+    /// The table and, behind it, the first partners, as a derivation
+    /// compares and carries them.
+    fn tables(&self) -> Tables<'_> {
+        [
+            &self.ends,
+            &self.listed,
+            &self.first_ends,
+            &self.first_listed,
+        ]
     }
 
     /// The partner list of prefill class `class`: the decodes of the
@@ -814,9 +849,11 @@ impl Offered {
 #[derive(Default)]
 struct Work {
     numbering: Numbering,
-    /// A row a prefill offer: the decode offers it pairs with.
+    /// A row a prefill offer: the decode offers it pairs with, each beside
+    /// whether the pair goes first ([`named`]).
     rows: Vec<Vec<u32>>,
-    /// A column a decode offer: the prefill classes it pairs with.
+    /// A column a decode offer: the prefill classes it pairs with, each
+    /// beside the same.
     columns: Vec<Vec<u32>>,
     /// Each row's class, and where the first row of each class stands.
     row_class: Vec<u32>,
@@ -829,8 +866,34 @@ struct Work {
     /// The table: where each prefill class's list ends, and the lists.
     ends: Vec<u32>,
     listed: Vec<u32>,
+    /// The first partners, laid out as the table is.
+    first_ends: Vec<u32>,
+    first_listed: Vec<u32>,
     /// What one side's refusal names, before it is sorted.
     refused: Vec<Mismatch>,
+}
+
+/// A derivation's table and, behind it, its first partners: the ends and
+/// the lists of each.
+type Tables<'t> = [&'t [u32]; 4];
+
+impl Work {
+    /// The tables of the last classing.
+    fn tables(&self) -> Tables<'_> {
+        [
+            &self.ends,
+            &self.listed,
+            &self.first_ends,
+            &self.first_listed,
+        ]
+    }
+}
+
+/// What a row names: the thing at `at` (a decode offer, or a prefill class
+/// in a column), and whether its pair goes first. Two rows are then one
+/// class only where they pair first alike.
+fn named(at: u32, first: bool) -> u32 {
+    at << 1 | u32::from(first)
 }
 
 /// One model's derivation as the store's writer keeps it from one
@@ -883,13 +946,12 @@ impl Derivation {
             row.extend(firsts.iter().map(judged));
         }
         let (refusals, _) = self.class(prefills, decodes);
-        let table = (&*self.work.ends, &*self.work.listed);
-        self.classes(prefills, decodes, table, refusals)
+        self.classes(prefills, decodes, self.work.tables(), refusals)
     }
 
-    /// Class the offers as they stand: each slot's class, the table into
-    /// the working lists and each side's refusal. Whether a class moved
-    /// that a slot had.
+    /// Class the offers as they stand: each slot's class, the table and
+    /// the first partners into the working lists, and each side's refusal.
+    /// Whether a class moved that a slot had.
     fn class<'a, P: Pool<'a> + ?Sized>(
         &mut self,
         prefills: &P,
@@ -907,47 +969,67 @@ impl Derivation {
             order.sort_unstable_by_key(|&slot| slots[slot as usize].first);
         }
         // One row a prefill offer: the decode offers it pairs with, by
-        // their place in that order. One prefill class a distinct row.
+        // their place in that order, each beside whether the pair goes
+        // first. One prefill class a distinct row.
         let rows = cleared(&mut work.rows, prefill.order.len());
         for (row, &slot) in rows.iter_mut().zip(&prefill.order) {
             let verdicts = &verdicts[slot as usize];
-            let pairs = |&(_, &beside): &(u32, &u32)| verdicts[beside as usize] == Verdict::Pairs;
-            let offers = (0u32..).zip(&decode.order).filter(pairs);
-            row.extend(offers.map(|(at, _)| at));
+            let paired = |(at, &beside): (u32, &u32)| match verdicts[beside as usize] {
+                Verdict::Pairs => Some(named(at, true)),
+                Verdict::Behind => Some(named(at, false)),
+                Verdict::Apart | Verdict::Refused(_) => None,
+            };
+            row.extend((0u32..).zip(&decode.order).filter_map(paired));
         }
         let numbering = &mut work.numbering;
         numbered(rows, numbering, &mut work.row_class, &mut work.row_firsts);
         // One column a decode offer: the prefill classes it pairs with,
-        // ascending as the classes are walked. One decode class a distinct
-        // column.
+        // ascending as the classes are walked, each beside whether it
+        // pairs with the offer first. One decode class a distinct column:
+        // the offers a class takes first stand apart from its others.
         let columns = cleared(&mut work.columns, decode.order.len());
         for (class, &first) in (1u32..).zip(&work.row_firsts) {
             for &offer in &rows[first] {
-                columns[offer as usize].push(class);
+                columns[(offer >> 1) as usize].push(named(class, offer & 1 != 0));
             }
         }
         let firsts = &mut work.column_firsts;
         numbered(columns, numbering, &mut work.column_class, firsts);
         // The table: a prefill class lists the classes of the decode
-        // offers its row names, each once.
-        let (list, ends, listed) = (&mut work.list, &mut work.ends, &mut work.listed);
-        ends.clear();
-        listed.clear();
-        for &first in &work.row_firsts {
-            list.clear();
-            list.extend(
-                rows[first]
-                    .iter()
-                    .map(|&offer| work.column_class[offer as usize]),
-            );
-            list.sort_unstable();
-            list.dedup();
-            listed.extend_from_slice(list);
-            ends.push(listed.len() as u32);
+        // offers its row names, each once. Then the first partners, laid
+        // out so: the classes of the offers its row names first.
+        let list = &mut work.list;
+        let class_of = |offer: &u32| work.column_class[(offer >> 1) as usize];
+        let tables = [
+            (&mut work.ends, &mut work.listed, false),
+            (&mut work.first_ends, &mut work.first_listed, true),
+        ];
+        for (ends, listed, first_alone) in tables {
+            ends.clear();
+            listed.clear();
+            for &first in &work.row_firsts {
+                let offers = rows[first].iter();
+                let offers = offers.filter(|&&offer| !first_alone || offer & 1 != 0);
+                list.clear();
+                list.extend(offers.map(class_of));
+                list.sort_unstable();
+                list.dedup();
+                listed.extend_from_slice(list);
+                ends.push(listed.len() as u32);
+            }
+        }
+        // Every pair first is no pair first, and neither is none.
+        if work.first_listed.is_empty() || work.first_listed == work.listed {
+            work.first_ends.clear();
+            work.first_listed.clear();
         }
         // The table is valid by construction, every decode class named by
-        // some list: the question a host asks where it builds one.
-        debug_assert_eq!(PairTable::new(ends, listed).validate(), Ok(()));
+        // some list, and the first partners stand within it: the questions
+        // a host asks where it builds the two.
+        let table = PairTable::new(&work.ends, &work.listed);
+        debug_assert_eq!(table.validate(), Ok(()));
+        let partners = FirstPartners::new(&work.first_ends, &work.first_listed);
+        debug_assert_eq!(partners.within(&table), Ok(()));
         let mut moved = false;
         let classed = [
             (&mut *prefill, &work.row_class),
@@ -1033,21 +1115,21 @@ impl Derivation {
             _ => false,
         };
         if !moved {
-            // No offer came or went: the table and the refusals stand, and
-            // the worker took the class of an offer its pool held.
+            // No offer came or went: the tables and the refusals stand,
+            // and the worker took the class of an offer its pool held.
             if stands(self) {
                 return None;
             }
-            let table = (&*last.ends, &*last.listed);
-            return Some(self.classes(prefills, decodes, table, last.refusals.clone()));
+            let refusals = last.refusals.clone();
+            return Some(self.classes(prefills, decodes, last.tables(), refusals));
         }
         let (refusals, reclassed) = self.class(prefills, decodes);
-        let table = (&*self.work.ends, &*self.work.listed);
-        let same = !reclassed && table == (&*last.ends, &*last.listed) && refusals == last.refusals;
+        let tables = self.work.tables();
+        let same = !reclassed && tables == last.tables() && refusals == last.refusals;
         if same && stands(self) {
             return None;
         }
-        Some(self.classes(prefills, decodes, table, refusals))
+        Some(self.classes(prefills, decodes, tables, refusals))
     }
 
     /// Ask the rule about the new offer of `slot` on `side` (`0` the
@@ -1091,12 +1173,12 @@ impl Derivation {
     }
 
     /// The classes as they stand: each worker of the two pools with its
-    /// offer's class, beside `table` and `refusals`.
+    /// offer's class, beside `tables` and `refusals`.
     fn classes<'a, P: Pool<'a> + ?Sized>(
         &self,
         prefills: &P,
         decodes: &P,
-        (ends, listed): (&[u32], &[u32]),
+        [ends, listed, first_ends, first_listed]: Tables<'_>,
         refusals: [Option<Refusal>; 2],
     ) -> PairClasses {
         let classed = |offered: &Offered, pool: &P| {
@@ -1108,6 +1190,8 @@ impl Derivation {
             decodes: classed(&self.sides[1], decodes),
             ends: ends.into(),
             listed: listed.into(),
+            first_ends: first_ends.into(),
+            first_listed: first_listed.into(),
             refusals,
         }
     }
@@ -1158,7 +1242,20 @@ impl Derivation {
 /// The rule's verdict on one prefill offer beside one decode offer.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Verdict {
+    /// The two pair, and no pair goes ahead of theirs: a first pair.
     Pairs,
+    /// The two pair on the runtime-specific side, and one of them names no
+    /// runtime: such a pair goes behind every first pair.
+    ///
+    /// The verdict marks the pair that goes behind and not the one that
+    /// goes ahead, because one table holds both sides of the wire's fact
+    /// and a pair decision makes every pair that is not first only while
+    /// no first pair is open. A pair of the plain side, which builds no
+    /// request for a runtime, is so a first pair, as a pair on one known
+    /// runtime is: a gateway that speaks both wires is held to neither,
+    /// and a model none of whose workers leaves its runtime unknown keeps
+    /// no first partner at all.
+    Behind,
     /// The two stand on two sides of the wire's fact: no pair is drawn
     /// across it, and nothing is compared.
     Apart,
@@ -1167,10 +1264,19 @@ enum Verdict {
 
 impl Verdict {
     fn of(prefill: &Member<'_>, decode: &Member<'_>, mode: Pairing) -> Self {
-        if runtime_specific(prefill.wires) != runtime_specific(decode.wires) {
+        let specific = runtime_specific(prefill.wires);
+        if specific != runtime_specific(decode.wires) {
             return Self::Apart;
         }
-        wire_mismatch(prefill, decode, mode).map_or(Self::Pairs, Self::Refused)
+        // On the runtime-specific side the wire's fact has refused two known
+        // runtimes that differ, so a pair that stands there goes behind
+        // where either runtime is unknown: none is compared a second time.
+        let unknown = || prefill.known_runtime().is_none() || decode.known_runtime().is_none();
+        match wire_mismatch(prefill, decode, mode) {
+            Some(mismatch) => Self::Refused(mismatch),
+            None if specific && unknown() => Self::Behind,
+            None => Self::Pairs,
+        }
     }
 }
 
@@ -1200,7 +1306,7 @@ fn refusal<'a, P: Pool<'a> + ?Sized>(
     for slot in on_side(prefill, side) {
         for &beside in &decode.order {
             match verdicts[slot as usize][beside as usize] {
-                Verdict::Pairs => return None,
+                Verdict::Pairs | Verdict::Behind => return None,
                 Verdict::Refused(mismatch) => refused.push(mismatch),
                 Verdict::Apart => {}
             }

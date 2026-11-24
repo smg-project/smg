@@ -1,7 +1,10 @@
 //! The holder of a replica's worker objects: it follows the store's
 //! membership and writes the registry. A leader's door writes a row through
 //! it, and the store follows that write ([`mod@write`]). A standby's applier
-//! hands it each event of its leader's stream ([`mod@standby`]). A host can
+//! hands it each event of its leader's stream ([`mod@standby`]). On a
+//! replica that leads an object's status leads its row's: a status is
+//! written on the object, and the holder tells the store ([`mod@status`],
+//! which says the lock order once). A host can
 //! also ask it to follow the rows' status, or to build each object with the
 //! thresholds its own load monitor judges overload by. A door reads the row
 //! that stands off it ([`mod@read`]).
@@ -21,8 +24,11 @@ use smg_worker::{
     health::overload::OverloadThresholds,
     identity::basic::Worker,
     registry::{Generation, WorkerId as ObjectId, WorkerRegistry},
+    worker::WorkerStatus as ObjectStatus,
 };
 
+#[cfg(feature = "in-process")]
+use super::found::pairing_descriptor;
 #[cfg(feature = "in-process")]
 use super::members::{EncodeColumns, Members, Stated};
 #[cfg(feature = "in-process")]
@@ -39,7 +45,7 @@ use crate::{
     engine::{FixedFacts, LentList, PartnerClasses, Role},
     store::{
         encoding::{EncodeClasses, EncodeMember, EncodeOffer},
-        pairing::{Member, PairClasses},
+        pairing::{Member, PairClasses, PairingDescriptor},
     },
 };
 use crate::{
@@ -50,7 +56,11 @@ use crate::{
 mod host_count;
 mod read;
 mod standby;
+mod status;
 mod write;
+
+#[cfg(all(test, feature = "controller"))]
+pub(crate) use status::tests::stand;
 
 /// The row an object stands for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -244,8 +254,10 @@ impl<G> fmt::Debug for Objects<G> {
 }
 
 impl<G> Objects<G> {
-    /// For a host that drives no health of its own: an object's status
-    /// follows its row's.
+    /// For a host that drives no health of its own and writes each row's
+    /// status into the store itself: an object's status follows its
+    /// row's. A controller's own service and a watcher do not use it: a
+    /// status is written on the object there, or laid as it is told.
     #[must_use]
     pub fn with_status_followed(mut self) -> Self {
         self.status_followed = true;
@@ -284,7 +296,7 @@ impl<G> Objects<G> {
     /// worker, for its own decisions, and the holder does not copy its
     /// verdict onto the object's flag.
     ///
-    /// The monitor and the store do not read the same thresholds. The
+    /// The monitor and the store read their thresholds from two places. The
     /// crate's two defaults, which the store reads under a binding whose
     /// block is on for each signal a row names none for, are not read here:
     /// `defaults` stands in their place, and with no signal in `defaults`
@@ -755,6 +767,20 @@ impl<G: Generation> Objects<G> {
         }
     }
 
+    /// The status the table holds for the row an object was built from,
+    /// where the row stands at that revision still: what an object takes
+    /// from the table. Read under the object's mutation lock, so of two
+    /// such reads the later one's status stands on the object.
+    fn table_status<S: WorkersStore + ?Sized>(
+        store: &S,
+        standing: RowRevision,
+    ) -> Option<ObjectStatus> {
+        store
+            .get(standing.row)
+            .filter(|row| row.revision == standing.revision)
+            .map(|row| status(row.status))
+    }
+
     /// Read the row under the lock the health adapter writes under. The
     /// object's entry must still name that row and its current revision.
     /// The registry writes the status it is handed and tells it.
@@ -769,12 +795,7 @@ impl<G: Generation> Objects<G> {
         let write = |object: &Arc<dyn Worker>| {
             let next = self
                 .standing_of(&id, object)
-                .and_then(|standing| {
-                    store
-                        .get(standing.row)
-                        .filter(|row| row.revision == standing.revision)
-                })
-                .map(|row| status(row.status));
+                .and_then(|standing| Self::table_status(store, standing));
             // The registry writes it, as it writes the adapter's: one
             // status event to its subscribers, and what goes with a
             // promotion. A status that stands writes nothing.
@@ -794,9 +815,11 @@ impl<G: Generation> Objects<G> {
         self.held.write().leave(id);
     }
 
-    /// Lay `row`'s object: one built from the row.
+    /// Lay `row`'s object: one built from the row, with the row's status
+    /// where the holder follows statuses.
     fn lay<S: WorkersStore + ?Sized>(&self, store: &S, row: &WorkerRow) {
         self.put(store, row, self.build(row));
+        self.follow_status(store, row.id);
     }
 
     /// State the entry of the object that stands for `row` again, from the
@@ -886,7 +909,6 @@ impl<G: Generation> Objects<G> {
         // takes the standing object's running state there, and with it the
         // leases the store counted on that object.
         self.counted(store, row.id);
-        self.follow_status(store, row.id);
     }
 }
 
@@ -981,9 +1003,7 @@ impl Objects<Members> {
                 facts: FixedFacts {
                     vision: laid.remainder.vision,
                     id: Some(laid.remainder.standing.row),
-                    // The row's statement whole. Whether the worker
-                    // registered a rank is the object's to say: a list's
-                    // records read it there, whatever is lent here.
+                    // The row's statement whole.
                     demands: laid.remainder.demand_facts,
                 },
                 reach: Reach::of(&laid.remainder),
@@ -1004,7 +1024,12 @@ impl Objects<Members> {
     /// The verdicts are the store's own pairing rule and no other
     /// ([`PairClasses::derive`]), over one member for each lent worker,
     /// made of what the worker's row states: its wires, its engine kind and
-    /// its pairing descriptor. A lent worker whose row's object was
+    /// its pairing descriptor. A row that states no descriptor is read by
+    /// what its worker object offers a partner ([`pairing_descriptor`]):
+    /// the object was built of the row, so those are the pairing facts of
+    /// the row's labels and engine kind, as a gateway reads them of its
+    /// own worker. A controller's door lays no descriptor in a row, so its
+    /// workers pair by their labels. A lent worker whose row's object was
     /// replaced or ended before a set is derived pairs with nobody in that
     /// set: class `0`. A set that stands is not derived again for a worker
     /// that goes later. The generation is the registry's old one by then,
@@ -1013,8 +1038,9 @@ impl Objects<Members> {
     /// A generation keeps one set of classes a pairing mode, derived at
     /// the first ask under the mode. What a set is derived from does not
     /// move under a generation: a write that moves a row's wires, its
-    /// engine kind or its descriptor gets the row a new object, in place
-    /// or as another life, and a new object publishes another generation.
+    /// engine kind, its labels or its descriptor gets the row a new object,
+    /// in place or as another life, and a new object publishes another
+    /// generation.
     /// The first ask derives the set behind the cut of the lists: it reads
     /// the holder's entry once, under its read lock, and runs the rule
     /// with that lock let go. Its work grows with the two lists and with
@@ -1031,9 +1057,13 @@ impl Objects<Members> {
 
     /// The classes of `generation`'s two lists as lent, derived now.
     fn derive_pairs(&self, generation: &Members, mode: Pairing) -> PartnerClasses {
-        /// A row as the rule reads it.
-        fn member(row: &Arc<RowRemainder>) -> Member<'_> {
-            let descriptor = row.pairing.as_deref();
+        /// A row as the rule reads it: by the descriptor it states, else by
+        /// `own`, what its worker object offers a partner.
+        fn member<'a>(
+            row: &'a Arc<RowRemainder>,
+            own: Option<&'a PairingDescriptor>,
+        ) -> Member<'a> {
+            let descriptor = row.pairing.as_deref().or(own);
             Member::new(
                 row.standing.row,
                 row.wire_modes,
@@ -1043,8 +1073,24 @@ impl Objects<Members> {
         }
         let lists = [Role::Prefill, Role::Decode].map(|role| self.lent(generation, role));
         let stated = self.remainders(lists);
-        let members = [&stated[0], &stated[1]]
-            .map(|side| side.iter().flatten().map(member).collect::<Vec<_>>());
+        // What each lent worker offers by itself, where its row states no
+        // descriptor. The object was built of the row, so these are the
+        // row's labels and engine kind under the worker's own rule.
+        let own = [0, 1].map(|side| {
+            let offered = |(worker, row): (&Arc<dyn Worker>, &Option<Arc<RowRemainder>>)| {
+                let silent = row.as_ref().is_some_and(|row| row.pairing.is_none());
+                silent
+                    .then(|| pairing_descriptor(worker.as_ref()))
+                    .flatten()
+            };
+            let side = lists[side].workers.iter().zip(&stated[side]);
+            side.map(offered).collect::<Vec<_>>()
+        });
+        let members = [0, 1].map(|side| {
+            let rows = stated[side].iter().zip(&own[side]);
+            rows.filter_map(|(row, own)| Some(member(row.as_ref()?, own.as_deref())))
+                .collect::<Vec<_>>()
+        });
         let derived = PairClasses::derive(&members[0], &members[1], mode);
         let stands = |side: usize| stated[side].iter().map(Option::is_some);
         derived.by_place(stands(0), stands(1))
@@ -1158,8 +1204,7 @@ mod tests {
     use super::*;
     use crate::{
         store::{
-            GatewayId, HealthSink, MemoryStore, Overload, Registrant, WorkerFacts, WorkerPatch,
-            WorkerStatus,
+            GatewayId, MemoryStore, Overload, Registrant, WorkerFacts, WorkerPatch, WorkerStatus,
         },
         worker_host::{object, HealthAdapter, KeptCredential, Members, SoleLead},
     };
@@ -2263,7 +2308,7 @@ mod tests {
         }
     }
 
-    /// By default a health or status write leaves the object alone.
+    /// By default a status write leaves the object alone.
     #[test]
     fn a_write_that_moves_no_fact_leaves_the_same_object() {
         let mut replica = Replica::new();
@@ -2273,7 +2318,6 @@ mod tests {
         let standing = replica.objects.standing(&id);
         replica.told();
         let revision = replica.row(A).revision;
-        replica.store.probe_outcome(row, true, revision, &|| true);
         let moved = replica.store.set_status(row, WorkerStatus::Ready, revision);
         assert!(moved.is_some());
         assert_eq!(replica.row(A).revision, revision);

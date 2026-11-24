@@ -25,9 +25,10 @@ use crate::{
         decision::{LiftedVeto, ShedReason, Targets, SUBSET_HINT},
         decision_engine::{DecisionEngine, HeldDecision, HeldDecode},
         framework::{DecisionScope, Filter, Picker, TieBand},
-        list_cell::tests::PublishedList,
+        list_cell::PublishedList,
         pair_classes::PartnerClasses,
         policy_engine::pair::PairAdmission,
+        prompt_hashes::{HashSeeds, PromptHashes},
         records::worker_id,
         view::{
             Candidate, Constraints, FixedFacts, Identity, MediaCounts, PoolFacts, RequestFacts,
@@ -71,6 +72,12 @@ impl PairAdmission for Gates {
 /// encoder list. `own` is a mask the request states itself: its stalled
 /// places, and those a hold stands on. `tried` are the workers a retry says
 /// its failed attempts were sent to, and `seed` is the request's seed.
+///
+/// `prompt` is the request's prompt as its host hashed it, where a case
+/// states one.
+///
+/// `asked` takes the place of each encoder a decision asks its caller of,
+/// where a case counts those questions: that caller answers yes to each.
 struct Host {
     engine: PolicyEngine,
     lists: [PublishedList; 3],
@@ -87,6 +94,8 @@ struct Host {
     own: [Vec<u32>; 2],
     tried: Vec<WorkerId>,
     seed: u64,
+    prompt: Option<PromptHashes>,
+    asked: Option<Mutex<Vec<u32>>>,
 }
 
 /// Where the worker at `place` of a host's list `list` answers.
@@ -185,6 +194,8 @@ impl Host {
             own: Default::default(),
             tried: Vec::new(),
             seed: 0,
+            prompt: None,
+            asked: None,
         }
     }
 
@@ -267,7 +278,7 @@ impl Host {
         placed: &mut EncodePlaced,
     ) -> (Decision, Option<usize>, Vec<usize>) {
         let lists = self.lists(said);
-        let facts = RequestFacts {
+        let mut facts = RequestFacts {
             model: "model-a",
             phase: Phase::Prefill,
             media: MediaCounts {
@@ -280,6 +291,9 @@ impl Host {
             seed: self.seed,
             ..RequestFacts::default()
         };
+        if let Some(prompt) = &self.prompt {
+            prompt.write_to(&mut facts);
+        }
         let constraints = Constraints {
             subset_hint: hint,
             excluded: &self.excluded,
@@ -298,7 +312,31 @@ impl Host {
         };
         let (engine, now) = (&self.engine, Instant::now());
         let loads = self.loads.as_ref();
-        let decision = lists.decide(engine, loads, now, &mut request, items, placed);
+        let decision = match &self.asked {
+            None => lists.decide(engine, loads, now, &mut request, items, placed),
+            // A case that counts the questions of the encoders answers them
+            // itself, through the entry that takes its caller's answers.
+            Some(asked) => {
+                let own = engine.loaded();
+                let noted = |place| {
+                    asked.lock().push(place);
+                    true
+                };
+                let sides = lists.asked(own);
+                lists.decide_over(
+                    own,
+                    sides,
+                    None,
+                    loads,
+                    now,
+                    &mut request,
+                    items,
+                    placed,
+                    |_| true,
+                    noted,
+                )
+            }
+        };
         assert_eq!(request.facts.now_micros, engine.clock().micros(now));
         let named = |list: usize, place: u32, id| {
             assert_eq!(worker_id(self.worker(list, place as usize).as_ref()), id);
@@ -374,6 +412,81 @@ fn the_three_lists_records_read_the_load_reports_their_host_hands() {
     host.images = true;
     let (_, _, encoders) = host.decide(said, &keys, None, &mut placed);
     assert_eq!(encoders, vec![0]);
+}
+
+/// A prompt of four whole blocks as its host hashes it under `engine`'s
+/// document, its tokens counted from `first`.
+fn prompt(engine: &PolicyEngine, first: u32) -> PromptHashes {
+    let tokens: Vec<u32> = (first..first + 64).collect();
+    let seeds = HashSeeds::PLAIN;
+    PromptHashes::under_document(&engine.spec(), Some(16), Some(&tokens), None, seeds)
+}
+
+/// Under `cache_aware` on the pair's two sides, a prompt sent to an encode
+/// request's pair goes to that pair again under any draw: each side reads
+/// its own list's column of who was sent the prompt, and its pick is
+/// written behind the decision, as a pair's first decision does. The lists
+/// are of two sizes, and the engine admits two of the four prefills: a
+/// column's entries stay beside the rows admitted. Prompts nobody was sent
+/// are placed by their draws, on more than one pair.
+#[test]
+fn a_prompt_sent_to_an_encode_requests_pair_goes_to_that_pair_again() {
+    use std::collections::BTreeSet;
+
+    let aware = "cache_aware";
+    let document = PolicySpec::epd_presets("power_of_two", aware, aware).expect("the presets");
+    let spec = AppliedSpec::validate(&document).expect("a valid document");
+    let mut host = Host::under(spec, 4, 3, 2);
+    // The second encoder is not ready, so the prefills of its class, the
+    // second and the fourth, are not admitted.
+    let said = (&[of(1), of(2)][..], &[1, 2, 1, 2][..]);
+    host.worker(2, 1).set_status(WorkerStatus::NotReady);
+    let keys = [Identity::plain("item")];
+    let mut placed = EncodePlaced::new();
+    let mut pair_of = |first: u32, seed: u64| {
+        host.prompt = Some(prompt(&host.engine, first));
+        host.seed = seed;
+        let (decision, prefill, _) = host.decide(said, &keys, None, &mut placed);
+        (
+            prefill.expect("a pick"),
+            decode_of(&decision).expect("a pair"),
+        )
+    };
+    let sent = pair_of(1_000, 1);
+    for seed in 2..34 {
+        assert_eq!(pair_of(1_000, seed), sent, "seed {seed}");
+    }
+    let fresh: BTreeSet<_> = (0..32_u32)
+        .map(|at| pair_of(100_000 + 1_000 * at, u64::from(at)))
+        .collect();
+    assert!(fresh.len() > 1, "{fresh:?}");
+    assert!(
+        fresh.iter().all(|&(prefill, _)| prefill % 2 == 0),
+        "{fresh:?}"
+    );
+}
+
+/// A decision that writes where its prompt went asks its caller of an
+/// encoder once, however many of the request's items it placed there: two
+/// items on the one encoder that is ready are one question, of that
+/// encoder's place.
+#[test]
+fn an_encoder_two_items_are_placed_on_is_asked_of_once() {
+    let aware = "cache_aware";
+    let document = PolicySpec::epd_presets("power_of_two", aware, aware).expect("the presets");
+    let spec = AppliedSpec::validate(&document).expect("a valid document");
+    let mut host = Host::under(spec, 2, 2, 2);
+    // The first encoder is not ready: both items take the second.
+    host.worker(2, 0).set_status(WorkerStatus::NotReady);
+    host.prompt = Some(prompt(&host.engine, 1_000));
+    host.asked = Some(Mutex::default());
+    let said = (&[of(1), of(1)][..], &[1, 1][..]);
+    let keys = [Identity::plain("item-a"), Identity::plain("item-b")];
+    let mut placed = EncodePlaced::new();
+    let (_, prefill, encoders) = host.decide(said, &keys, None, &mut placed);
+    assert_eq!((prefill.is_some(), encoders), (true, vec![1, 1]));
+    let asked = host.asked.as_ref().expect("the questions are counted");
+    assert_eq!(*asked.lock(), [1]);
 }
 
 /// A request whose media is video alone asks vision of its encoder as one
@@ -2156,7 +2269,7 @@ fn equal_keys_are_placed_on_one_encoder() {
     let lists = host.lists(said);
     let asks = host.asks(said);
     let (engine, now) = (&host.engine, Instant::now());
-    let spec = engine.spec();
+    let spec = engine.standing_spec();
     let ids = [0, 1].map(|at| worker_id(host.worker(2, at).as_ref()));
     let mut placed = EncodePlaced::new();
     let mut seen = BTreeSet::new();

@@ -328,6 +328,25 @@ impl Bed {
         key: Option<TokenKey<'_>>,
         target: Option<u32>,
     ) -> Option<Named> {
+        self.decide_among(facts, None, key, target)
+    }
+
+    /// What a request its host holds to `places` is named, decided by a
+    /// shed.
+    fn held_to(&self, facts: &RequestFacts<'_>, places: &[u32]) -> Named {
+        let named = self.decide_among(facts, Some(places), None, None);
+        named.expect("rows named")
+    }
+
+    /// [`Self::decide_keyed`] for a request its host holds to `places`,
+    /// where it states any.
+    fn decide_among(
+        &self,
+        facts: &RequestFacts<'_>,
+        places: Option<&[u32]>,
+        key: Option<TokenKey<'_>>,
+        target: Option<u32>,
+    ) -> Option<Named> {
         let mut named = None;
         let decision = decide(
             &self.affinity,
@@ -336,6 +355,7 @@ impl Bed {
             &self.workers,
             &self.ids,
             &mut { *facts },
+            places,
             |_| key,
             |_| true,
             |facts| {
@@ -375,6 +395,7 @@ impl Bed {
             &self.workers,
             &self.ids,
             &mut { *facts },
+            None,
             |_| key,
             |_| true,
             |_| answer,
@@ -535,6 +556,155 @@ fn a_holder_outside_the_list_takes_no_place_of_the_cap() {
     assert_eq!(bed.holders(&asked, NOW), [(2, 2, 0)]);
 }
 
+/// A request its host holds to places is named its holders among the
+/// places: the index is asked within them, so holders outside cannot fill
+/// the sample. Of twenty workers that hold the whole prompt, a request held
+/// to two is named both under every seed, where the sample of sixteen
+/// would leave each out for some. The classic policy narrows its workers
+/// first (`model_gateway/src/routers/common/placement.rs:474-484`) and
+/// gathers the deepest holders among them, one or both by its cap's draw
+/// (`model_gateway/src/policies/cache_aware.rs:2916-2939`, `:2951-2957`).
+#[test]
+fn a_held_request_is_named_its_holders_among_its_places() {
+    let (affinity, _, index) = hosted(true);
+    let index = index.expect("the index");
+    let asked = prompt(1_000, 2);
+    for at in 0..20 {
+        store(&index, at, &hashes_of(&asked));
+    }
+    let bed = Bed::new(affinity, preset("cache_aware"), 20);
+    for seed in 0..32 {
+        let named = bed.held_to(&request(&asked, seed, NOW), &[3, 17]);
+        assert_eq!(named.holders, [(3, 2, 0), (17, 2, 0)], "seed {seed}");
+    }
+    // A request that states no places is named the sample of the list.
+    let named = bed.decide(&request(&asked, 7, NOW), None).expect("rows");
+    assert_eq!(named.holders.len(), 16);
+}
+
+/// A shorter beginning held among the places is named where deeper holders
+/// outside them are more than the sample: it is the deepest among the
+/// places. The classic policy's whole gather finds it where none of its
+/// drawn holders is a candidate
+/// (`model_gateway/src/policies/cache_aware.rs:2931-2938`).
+#[test]
+fn a_held_request_is_named_the_deepest_holder_among_its_places() {
+    let (affinity, _, index) = hosted(true);
+    let index = index.expect("the index");
+    let asked = prompt(1_000, 8);
+    let hashes = hashes_of(&asked);
+    for at in 0..17 {
+        store(&index, at, &hashes);
+    }
+    store(&index, 19, &hashes[..3]);
+    // The index knows the other place by a number alone.
+    index.intern_worker(&address(18)).expect("a number");
+    let bed = Bed::new(affinity, preset("cache_aware"), 20);
+    for seed in 0..32 {
+        let named = bed.held_to(&request(&asked, seed, NOW), &[18, 19]);
+        assert_eq!(named.holders, [(19, 3, 0)], "seed {seed}");
+        // Stated to no place, the seventeen deeper holders fill the sample.
+        let named = bed.decide(&request(&asked, seed, NOW), None).expect("rows");
+        assert!(named
+            .holders
+            .iter()
+            .all(|&(row, held, _)| row < 17 && held == 8));
+    }
+    // The request's mask is the table's, kept to the places: a worker that
+    // gains its first blocks while the table stands is not the index's to
+    // name in that second, for a request held to it as for any other.
+    store(&index, 18, &hashes);
+    let named = bed.held_to(&request(&asked, 0, NOW), &[18, 19]);
+    assert_eq!(named.holders, [(19, 3, 0)]);
+    let named = bed.decide(&request(&asked, 0, NOW), None).expect("rows");
+    assert!(named.holders.iter().all(|&(row, _, _)| row < 17));
+}
+
+/// A request held to places is named its warming rows among the places,
+/// before the sample cuts them. Of twenty warming workers, a request held
+/// to one is named it under every seed. The classic policy takes its
+/// pool's warming workers whole and passes over each that is no candidate
+/// (`model_gateway/src/policies/cache_aware.rs:2065-2069`).
+#[test]
+fn a_held_request_is_named_its_warming_rows_among_its_places() {
+    let (affinity, _, index) = hosted(true);
+    let index = index.expect("the index");
+    let first = hashes_of(&prompt(1_000, 8));
+    for at in 0..24 {
+        store(&index, at, &first);
+    }
+    let bed = Bed::new(affinity, warming_by(1), 24);
+    let other = prompt(50_000, 2);
+    // The table's first read admits the workers, as a decision does.
+    assert!(bed
+        .held_to(&request(&other, 7, NOW), &[9])
+        .warming
+        .is_empty());
+    // Four workers gain their first blocks, and twenty stay short of them.
+    let second = hashes_of(&prompt(2_000, 8));
+    for at in 20..24 {
+        store(&index, at, &second);
+    }
+    thread::sleep(Duration::from_millis(3));
+    for seed in 0..32 {
+        let named = bed.held_to(&request(&other, seed, NOW + SECOND), &[9, 22]);
+        assert_eq!(named.warming, [9], "seed {seed}");
+        // Stated to no place, the sample cuts the twenty to sixteen.
+        let named = bed.decide(&request(&other, seed, NOW + SECOND), None);
+        assert_eq!(named.expect("rows").warming.len(), 16);
+    }
+}
+
+/// The workers sent a prefix are named among the places too. Twenty
+/// workers were sent the prompt, and a request held to two of them is named
+/// both under every seed, by the blocks they were sent. The classic policy
+/// takes every candidate among its tree's matched workers, with no cut
+/// (`model_gateway/src/policies/cache_aware.rs:2541-2552`).
+#[test]
+fn a_held_request_is_named_the_workers_sent_its_prefix_among_its_places() {
+    let (affinity, _, _) = hosted(false);
+    let bed = Bed::new(affinity, preset("cache_aware"), 20);
+    let asked = prompt(1_000, 4);
+    for at in 0..20 {
+        bed.decide(&request(&asked, 7, NOW), Some(at));
+    }
+    for seed in 0..32 {
+        let named = bed.held_to(&request(&asked, seed, NOW), &[3, 17]);
+        assert_eq!(named.holders, [(3, 0, 4), (17, 0, 4)], "seed {seed}");
+    }
+    // Stated to no place, the sample cuts the twenty to sixteen.
+    assert_eq!(bed.holders(&asked, NOW).len(), 16);
+}
+
+/// A token tree's workers are named among the places too. A tree hands the
+/// eight workers of its deepest node at most, so the built-in sample of
+/// sixteen never cuts them: under a sample of four, a request held to two of
+/// the eight is named both under every seed. The classic policy takes every
+/// candidate among the workers its tree hands
+/// (`model_gateway/src/policies/cache_aware.rs:2541-2552`).
+#[test]
+fn a_held_request_is_named_a_trees_workers_among_its_places() {
+    let (affinity, _) = lending(false);
+    let bed = Bed::new(affinity, sampled(4), 20);
+    let asked = tokens(1_000, 4);
+    for at in 0..8 {
+        bed.keyed(&asked, 0, Some(at));
+    }
+    let hashes = hashed(&asked);
+    let key = || TokenKey {
+        tokens: Cow::Borrowed(&asked),
+        marker: 0,
+    };
+    for seed in 0..32 {
+        let facts = request(&hashes, seed, NOW);
+        let named = bed.decide_among(&facts, Some(&[2, 5]), Some(key()), None);
+        let named = named.expect("rows named");
+        assert_eq!(named.holders, [(2, 0, 4), (5, 0, 4)], "seed {seed}");
+    }
+    // Stated to no place, the sample cuts the eight to four.
+    assert_eq!(bed.keyed(&asked, 0, None).len(), 4);
+}
+
 /// With no index the record of sent prefixes speaks for every worker: a
 /// pick writes the request's prefix for its worker, a later request that
 /// begins alike names that worker by the blocks it was sent, and a worker
@@ -569,6 +739,82 @@ fn the_record_names_the_worker_a_prefix_was_sent_to() {
     assert_eq!(bed.affinity.left_out(), 0);
 }
 
+/// A model's record of sent prefixes is its workers' model's, and so is its
+/// bound: the index settings of the id the workers registered under,
+/// whatever name a request gives the model.
+#[test]
+fn a_request_under_another_name_leaves_the_records_bound() {
+    use crate::document::spec::IndexSpec;
+    let (affinity, _, _) = hosted(false);
+    let mut document = PolicySpec::preset("cache_aware").expect("the preset");
+    document.generation = 1;
+    // One placement under any other name, the default under the workers'.
+    let one = IndexSpec {
+        max_size: u64::from(BLOCK),
+        ..IndexSpec::default()
+    };
+    document.index.insert("*".into(), one);
+    document.index.insert(MODEL.into(), IndexSpec::default());
+    let spec = AppliedSpec::validate(&document).expect("the document validates");
+    let bed = Bed::new(affinity, spec, 4);
+    let asked = prompt(1_000, 4);
+    bed.decide(&request(&asked, 7, NOW), Some(1));
+    assert_eq!(bed.holders(&asked, NOW), [(1, 0, 4)]);
+    // A request with no prompt that names the model by another name.
+    let other = RequestFacts {
+        model: "another-name",
+        seed: 7,
+        now_micros: NOW,
+        ..RequestFacts::default()
+    };
+    bed.decide(&other, None);
+    bed.affinity.sweep();
+    assert_eq!(bed.holders(&asked, NOW), [(1, 0, 4)]);
+}
+
+/// A model its workers registered after their first shares the record of
+/// the id they registered first, and that id's index settings bound it: a
+/// request for the later model reads them, before a request for the first
+/// model and after one.
+#[test]
+fn a_later_model_of_its_workers_shares_the_first_models_record() {
+    use smg_worker::{
+        identity::builder::BasicWorkerBuilder, model_card::ModelCard, test_support::no_health_check,
+    };
+
+    use crate::document::spec::IndexSpec;
+    const LATER: &str = "model-b";
+    let (affinity, _, _) = hosted(false);
+    let mut document = PolicySpec::preset("cache_aware").expect("the preset");
+    document.generation = 1;
+    // One placement under the later model's name, the default under the first's.
+    let one = IndexSpec {
+        max_size: u64::from(BLOCK),
+        ..IndexSpec::default()
+    };
+    document.index.insert(LATER.into(), one);
+    document.index.insert(MODEL.into(), IndexSpec::default());
+    let spec = AppliedSpec::validate(&document).expect("the document validates");
+    let mut bed = Bed::new(affinity, spec, 4);
+    for (at, worker) in bed.workers.iter_mut().enumerate() {
+        let models = vec![ModelCard::new(MODEL), ModelCard::new(LATER)];
+        let built = <BasicWorkerBuilder>::new(address(at)).models(models);
+        *worker = Arc::new(built.health_config(no_health_check()).build());
+    }
+    let asked = prompt(1_000, 4);
+    let later = RequestFacts {
+        model: LATER,
+        ..request(&asked, 7, NOW)
+    };
+    bed.decide(&later, Some(1));
+    bed.affinity.sweep();
+    // The holders are asked under the first model's name.
+    assert_eq!(bed.holders(&asked, NOW), [(1, 0, 4)]);
+    bed.decide(&later, None);
+    bed.affinity.sweep();
+    assert_eq!(bed.holders(&asked, NOW), [(1, 0, 4)]);
+}
+
 /// A pick the binding's sessions rule placed alone is recorded by the
 /// rule's own word of it, at both of the record's writes: the one behind a
 /// decision named its rows, and the one behind a decision handed the column
@@ -584,7 +830,7 @@ fn the_record_names_the_worker_a_prefix_was_sent_to() {
 /// list keeps one for a shadow that is named rows, and the column shows
 /// what that record holds. A gateway's sticky map hands a request it places
 /// to no policy, so the policy's record never takes it
-/// (`model_gateway/src/policies/registry.rs:736-739`, `:782-783`).
+/// (`model_gateway/src/policies/registry.rs:791`, `:840`).
 #[test]
 fn a_pick_the_sessions_rule_placed_is_recorded_by_the_rules_word_at_both_writes() {
     for whole in [false, true] {
@@ -631,6 +877,7 @@ fn a_pick_the_sessions_rule_placed_is_recorded_by_the_rules_word_at_both_writes(
                 &bed.workers,
                 &bed.ids,
                 &mut request(asked, 7, NOW),
+                None,
                 |_| None,
                 // The caller sends to every worker but the one at 3.
                 |target| target.position != 3,
@@ -708,43 +955,28 @@ fn an_entrys_debug_form_holds_no_token() {
 /// ([`a_pick_the_sessions_rule_placed_is_recorded_by_the_rules_word_at_both_writes`]).
 /// A pick the rule keeps from the profile leaves no prompt in the tree. One
 /// that is the profile's own is written as a pick by the profile's stages
-/// is. The lookup returns the answer it is handed either way. A gateway's
-/// sticky map hands a request it places to no policy, so the policy's tree
-/// never takes that request's prompt
-/// (`model_gateway/src/policies/registry.rs:736-739`, `:782-783`).
+/// is. The lookup returns the answer it is handed either way, but for what
+/// it states of the pick: nothing of one kept from the profile, and its
+/// worker's entry of the match's rows of one that is the profile's own. A
+/// gateway's sticky map hands a request it places to no policy, so the
+/// policy's tree never takes that request's prompt
+/// (`model_gateway/src/policies/registry.rs:791`, `:840`).
 #[test]
 fn a_pick_the_sessions_rule_placed_is_written_to_a_tree_by_the_rules_word() {
     let (affinity, _tree) = lending(false);
     let bed = Bed::new(affinity, preset("cache_aware"), 4);
-    // One decision of the prompt answered `answer`, inside the host's tree.
-    let decided = |asked: &[u32], answer: Decision| {
-        let hashes = hashed(asked);
-        let key = TokenKey {
-            tokens: Cow::Borrowed(asked),
-            marker: 0,
-        };
-        let returned = decide(
-            &bed.affinity,
-            &bed.pool,
-            &bed.spec,
-            &bed.workers,
-            &bed.ids,
-            &mut request(&hashes, 7, NOW),
-            |_| Some(key),
-            |_| true,
-            |_| answer,
-        );
-        assert_eq!(returned, answer, "the answer handed");
-    };
     let (kept, own) = (tokens(1_000, 4), tokens(2_000, 4));
-    decided(&kept, ruled(1, bed.ids[1], RulePlaced::Untold));
+    let miss = holds(0, 4, OverlapSource::None);
+    let untold = ruled(1, bed.ids[1], RulePlaced::Untold);
+    assert_eq!(answered_in_tree(&bed, &kept, untold), Overlap::NONE);
     assert!(
         bed.keyed(&kept, 0, None).is_empty(),
         "kept from the profile"
     );
-    decided(&own, ruled(1, bed.ids[1], RulePlaced::Told));
+    let told = ruled(1, bed.ids[1], RulePlaced::Told);
+    assert_eq!(answered_in_tree(&bed, &own, told), miss);
     assert_eq!(bed.keyed(&own, 0, None), [(1, 0, 4)], "the rule's, told");
-    decided(&kept, picked(2, bed.ids[2]));
+    assert_eq!(stated_in_tree(&bed, &kept, 2), miss);
     assert_eq!(bed.keyed(&kept, 0, None), [(2, 0, 4)], "the stages'");
 }
 
@@ -962,6 +1194,7 @@ fn a_tree_stores_a_prompt_for_the_first_target_its_caller_sends_to() {
             &bed.workers,
             &bed.ids,
             &mut request(&hashes, 7, NOW),
+            None,
             |_| Some(entry),
             |target| {
                 asked.borrow_mut().push(target.position);
@@ -1016,6 +1249,7 @@ fn the_entry_is_asked_for_once_and_only_where_the_host_lends_a_tree() {
                 list,
                 ids,
                 facts,
+                None,
                 asks,
                 |_| true,
                 |_| shed(),
@@ -1076,6 +1310,7 @@ fn a_worker_that_leaves_under_its_first_pick_is_given_no_place() {
             &bed.workers,
             &bed.ids,
             &mut request(&asked, 7, NOW),
+            None,
             |_| None,
             |_| true,
             |_| {
@@ -1089,6 +1324,37 @@ fn a_worker_that_leaves_under_its_first_pick_is_given_no_place() {
     assert!(holders_behind(&|| bed.affinity.forget(bed.ids[2])).is_empty());
     let standing = [bed.ids[0], bed.ids[1], bed.ids[3]];
     assert!(holders_behind(&|| bed.affinity.keep(&standing)).is_empty());
+}
+
+/// A pin's answer made ahead of a leave and handed through the lookup
+/// behind it gives its worker no place; with no leave between it writes.
+#[test]
+fn an_answer_made_ahead_of_a_leave_gives_its_worker_no_place() {
+    let (affinity, _, _) = hosted(false);
+    let bed = Bed::new(affinity, preset("cache_aware"), 4);
+    let asked = prompt(1_000, 4);
+    let holders_behind = |leave: &dyn Fn()| {
+        let (leaves, made) = (bed.affinity.leaves(), picked(2, bed.ids[2]));
+        leave();
+        let decision = decide_behind(
+            &bed.affinity,
+            &bed.pool,
+            &bed.spec,
+            &bed.workers,
+            &bed.ids,
+            &mut request(&asked, 7, NOW),
+            |_| None,
+            |_| true,
+            leaves,
+            made,
+        );
+        assert!(decision.pick().is_some());
+        bed.holders(&asked, NOW)
+    };
+    assert_eq!(holders_behind(&|| bed.affinity.forget(bed.ids[2])), []);
+    let standing = [bed.ids[0], bed.ids[1], bed.ids[3]];
+    assert_eq!(holders_behind(&|| bed.affinity.keep(&standing)), []);
+    assert_eq!(holders_behind(&|| ()), [(2, 0, 4)]);
 }
 
 /// A list of no worker is read no table: its request is named no holder, no
@@ -1440,6 +1706,7 @@ fn the_engine_decides_by_the_rows_named() {
                 &bed.workers,
                 &bed.ids,
                 &mut request,
+                None,
                 |_| None,
                 |_| true,
                 |request| {
@@ -1590,6 +1857,7 @@ fn a_profile_named_no_row_is_handed_the_column() {
         &bed.workers,
         &bed.ids,
         &mut request(&asked, 7, NOW),
+        None,
         |_| None,
         |_| true,
         |facts| {
@@ -1619,6 +1887,7 @@ fn a_profile_named_no_row_is_handed_the_prefix_its_pick_sent() {
         &bed.workers,
         &bed.ids,
         &mut request(&asked, 7, NOW),
+        None,
         |_| None,
         |_| true,
         |facts| {
@@ -1737,28 +2006,193 @@ fn a_pick_states_its_workers_entry_of_the_column_the_engine_filled() {
     assert_eq!(bed.states(&facts, 1), holds(0, 4, OverlapSource::None));
 }
 
-/// A request decided inside its host's token tree states nothing of its
-/// pick: the tree's match is a count of tokens and no entry of blocks. The
-/// match names the worker all the same. The same request with no entry
-/// named is decided over the rows the engine names, and states.
+/// What the lookup states of `answer`'s first target, for a request of
+/// `key`'s tokens whose host names them as its entry in the token tree it
+/// lends: the request is decided inside the tree's match, and its descent
+/// writes the prompt for the worker a pick the profile is told of goes to.
+/// The lookup returns the answer it was handed but for that statement.
+fn answered_in_tree(bed: &Bed, key: &[u32], answer: Decision) -> Overlap {
+    let hashes = hashed(key);
+    let entry = TokenKey {
+        tokens: Cow::Borrowed(key),
+        marker: 0,
+    };
+    bed.stated(&request(&hashes, 7, NOW), Some(entry), answer)
+}
+
+/// [`answered_in_tree`] behind a pick of the worker at `row` by the
+/// profile's stages.
+fn stated_in_tree(bed: &Bed, key: &[u32], row: u32) -> Overlap {
+    answered_in_tree(bed, key, picked(row, bed.ids[row as usize]))
+}
+
+/// A request decided inside its host's token tree states its pick's entry
+/// of the rows the tree's match named, as a pick over the engine's own rows
+/// does. A prompt the tree holds for nobody is a miss of the request's
+/// blocks. Once the tree holds it for a worker, a pick of that worker states
+/// the match's tokens counted in the request's blocks, read as sent. A
+/// longer prompt that begins with it states the blocks the two share, of
+/// its own.
 #[test]
-fn a_pick_made_inside_a_hosts_token_tree_states_nothing() {
+fn a_pick_made_inside_a_hosts_token_tree_states_the_matchs_blocks() {
     let (affinity, _tree) = lending(false);
     let bed = Bed::new(affinity, preset("cache_aware"), 4);
     let asked = tokens(1_000, 4);
+    let miss = holds(0, 4, OverlapSource::None);
+    assert_eq!(stated_in_tree(&bed, &asked, 1), miss);
+    // That pick wrote the prompt for its worker, and the match names it.
+    assert_eq!(bed.keyed(&asked, 0, None), [(1, 0, 4)]);
+    let sent = holds(4, 4, OverlapSource::Predictor);
+    assert_eq!(stated_in_tree(&bed, &asked, 1), sent);
+    let longer = tokens(1_000, 6);
+    let shared = holds(4, 6, OverlapSource::Predictor);
+    assert_eq!(stated_in_tree(&bed, &longer, 1), shared);
+    // No entry named: the record of hashed prefixes, which nothing wrote.
     let hashes = hashed(&asked);
-    let facts = request(&hashes, 7, NOW);
+    assert_eq!(bed.states(&request(&hashes, 7, NOW), 1), miss);
+}
+
+/// A pick that is none of the match's holders states a miss of the
+/// request's blocks, whatever the match holds for another worker: the pick
+/// states its own worker's entry. A gateway's classic policy observes the
+/// match's share of such a request, whoever it chose
+/// (`model_gateway/src/policies/cache_aware.rs:3103-3123`).
+#[test]
+fn a_pick_that_is_no_holder_of_a_trees_match_states_a_miss() {
+    let (affinity, _tree) = lending(false);
+    let bed = Bed::new(affinity, preset("cache_aware"), 4);
+    let asked = tokens(1_000, 4);
+    let miss = holds(0, 4, OverlapSource::None);
+    assert_eq!(stated_in_tree(&bed, &asked, 1), miss);
+    assert_eq!(bed.keyed(&asked, 0, None), [(1, 0, 4)]);
+    // The match names the first worker alone, and the pick is the second.
+    assert_eq!(stated_in_tree(&bed, &asked, 2), miss);
+    // The descent wrote the prompt for the second too: both hold it now.
+    assert_eq!(bed.keyed(&asked, 0, None), [(1, 0, 4), (2, 0, 4)]);
+    let sent = holds(4, 4, OverlapSource::Predictor);
+    assert_eq!(stated_in_tree(&bed, &asked, 2), sent);
+    assert_eq!(stated_in_tree(&bed, &asked, 1), sent);
+}
+
+/// A match under one block states a miss: the match is counted in the
+/// request's blocks, and a match of less than one names no holder. Under a
+/// tree of four-token pages, a prompt that shares its first eight tokens
+/// with one the tree holds states a miss of its own four blocks. A prompt
+/// shorter than one block always states a miss, even once the tree holds
+/// every token of it for the worker picked. A gateway's classic policy
+/// divides the tokens matched by the prompt's tokens, and observes that
+/// last request whole (`model_gateway/src/policies/cache_aware.rs:3103-3123`).
+#[test]
+fn a_trees_match_under_one_block_states_a_miss() {
+    const PAGE: usize = 4;
+    let (affinity, tree) = lending_by(PAGE, false);
+    let bed = Bed::new(affinity, preset("cache_aware"), 4);
+    let asked = tokens(1_000, 4);
+    assert_eq!(
+        stated_in_tree(&bed, &asked, 1),
+        holds(0, 4, OverlapSource::None)
+    );
+    // Eight tokens of the prompt held, and then another prompt's.
+    let mut branch = asked[..2 * PAGE].to_vec();
+    branch.extend(tokens(5_000, 4).into_iter().skip(2 * PAGE));
+    assert!(bed.keyed(&branch, 0, None).is_empty(), "no holder is named");
+    assert_eq!(
+        stated_in_tree(&bed, &branch, 1),
+        holds(0, 4, OverlapSource::None)
+    );
+    // Three whole pages, and under one block.
+    let short = &asked[..3 * PAGE];
+    let none = holds(0, 1, OverlapSource::None);
+    assert_eq!(stated_in_tree(&bed, short, 3), none);
+    let held = tree.get_tenant_token_counts();
+    assert!(held
+        .get(&address(3))
+        .is_some_and(|&held| held >= short.len()));
+    assert_eq!(stated_in_tree(&bed, short, 3), none);
+}
+
+/// A holder the sample's draw leaves out states a miss. Eight workers hold
+/// the prompt in the tree, and under a sample of four a decision is named
+/// four of them. A pick of one of the four states the match's blocks. A
+/// pick of one the draw left out states a miss of the request's blocks,
+/// though the tree holds the prompt for it. A gateway's classic policy
+/// counts every tenant of the match
+/// (`model_gateway/src/policies/cache_aware.rs:3103-3123`).
+#[test]
+fn a_holder_the_samples_draw_leaves_out_states_a_miss() {
+    let (affinity, _tree) = lending(false);
+    let bed = Bed::new(affinity, sampled(4), 20);
+    let asked = tokens(1_000, 4);
+    for at in 0..8 {
+        bed.keyed(&asked, 0, Some(at));
+    }
+    let hashes = hashed(&asked);
+    let (mut named_picks, mut left_out) = (0, 0);
+    for seed in 0..32 {
+        for row in 0..8 {
+            let key = TokenKey {
+                tokens: Cow::Borrowed(asked.as_slice()),
+                marker: 0,
+            };
+            let mut named = Vec::new();
+            let returned = decide(
+                &bed.affinity,
+                &bed.pool,
+                &bed.spec,
+                &bed.workers,
+                &bed.ids,
+                &mut request(&hashes, seed, NOW),
+                None,
+                |_| Some(key),
+                |_| true,
+                |facts| {
+                    let rows = facts.named.expect("rows named");
+                    named = rows.holders.iter().map(|holder| holder.row).collect();
+                    picked(row, bed.ids[row as usize])
+                },
+            );
+            let stated = returned.pick().map(Pick::overlap).unwrap_or_default();
+            assert_eq!(named.len(), 4, "seed {seed}: the sample");
+            if named.contains(&row) {
+                let sent = holds(4, 4, OverlapSource::Predictor);
+                assert_eq!(stated, sent, "seed {seed}, row {row}: named");
+                named_picks += 1;
+            } else {
+                let miss = holds(0, 4, OverlapSource::None);
+                assert_eq!(stated, miss, "seed {seed}, row {row}: left out");
+                left_out += 1;
+            }
+        }
+    }
+    assert!(named_picks > 0 && left_out > 0, "both kinds were picked");
+}
+
+/// A tree pick is counted by the document's block size where the request
+/// states its tokens and no hash of them: the match in the request's
+/// blocks, and the request itself. Sixty-four tokens are four blocks of
+/// sixteen. Once the tree holds the prompt for a worker, a pick of it
+/// states four of four.
+#[test]
+fn a_tree_pick_of_a_request_with_no_hashes_is_counted_by_the_documents_block() {
+    let (affinity, _tree) = lending(false);
+    let bed = Bed::new(affinity, preset("cache_aware"), 4);
+    let asked = tokens(1_000, 4);
+    let facts = RequestFacts {
+        model: MODEL,
+        seed: 7,
+        now_micros: NOW,
+        prompt_tokens: 4 * BLOCK,
+        ..RequestFacts::default()
+    };
     let key = || TokenKey {
         tokens: Cow::Borrowed(asked.as_slice()),
         marker: 0,
     };
     let answer = picked(1, bed.ids[1]);
-    assert_eq!(bed.stated(&facts, Some(key()), answer), Overlap::NONE);
-    // The tree holds the prompt for that worker now, and its match names it.
-    assert_eq!(bed.keyed(&asked, 0, None), [(1, 0, 4)]);
-    assert_eq!(bed.stated(&facts, Some(key()), answer), Overlap::NONE);
-    // No entry named: the record of hashed prefixes, which nothing wrote.
-    assert_eq!(bed.states(&facts, 1), holds(0, 4, OverlapSource::None));
+    let miss = holds(0, 4, OverlapSource::None);
+    assert_eq!(bed.stated(&facts, Some(key()), answer), miss);
+    let sent = holds(4, 4, OverlapSource::Predictor);
+    assert_eq!(bed.stated(&facts, Some(key()), answer), sent);
 }
 
 /// A pick the binding's sessions rule placed alone and keeps from the
@@ -1767,7 +2201,7 @@ fn a_pick_made_inside_a_hosts_token_tree_states_nothing() {
 /// under its default word is the profile's own, and states its worker's
 /// entry as a pick by the profile's stages does. A gateway's sticky map
 /// hands a request it places to no policy, so the policy observes nothing
-/// of it (`model_gateway/src/policies/registry.rs:736-739`, `:782-783`).
+/// of it (`model_gateway/src/policies/registry.rs:791`, `:840`).
 #[test]
 fn a_pick_its_rule_keeps_from_the_profile_states_nothing() {
     let (affinity, _, index) = hosted(true);
@@ -1798,6 +2232,8 @@ fn a_pick_its_rule_keeps_from_the_profile_states_nothing() {
 /// A decision whose profile reads no affinity states nothing, whatever its
 /// host fed: under a document none of whose bindings reads affinity, and
 /// under one where another model's profile does. The reader's pick states.
+/// Nor does it state where its host lends a token tree and names the
+/// request's entry: such a profile is decided inside no tree.
 #[test]
 fn a_profile_that_reads_no_affinity_states_nothing() {
     let asked = prompt(1_000, 4);
@@ -1814,6 +2250,14 @@ fn a_profile_that_reads_no_affinity_states_nothing() {
     let bed = Bed::new(affinity, preset("least_load"), 4);
     assert_eq!(bed.states(&plain, 1), Overlap::NONE);
     assert_eq!(bed.states(&fed, 1), Overlap::NONE);
+    let (affinity, tree) = lending(false);
+    let bed = Bed::new(affinity, preset("least_load"), 4);
+    let key = tokens(1_000, 4);
+    assert_eq!(stated_in_tree(&bed, &key, 1), Overlap::NONE);
+    assert!(
+        tree.get_tenant_token_counts().is_empty(),
+        "nothing is written"
+    );
     // One model's profile reads affinity in the single phase. Another
     // model's reads none there.
     let mut document = PolicySpec::preset("least_load").expect("the preset");
@@ -1880,6 +2324,7 @@ fn a_shadow_that_reads_affinity_states_nothing_of_the_live_pick() {
             &bed.workers,
             &bed.ids,
             &mut { *facts },
+            None,
             |_| None,
             |_| true,
             |facts| {
@@ -1954,6 +2399,7 @@ fn a_worker_that_asks_for_events_and_publishes_none_keeps_its_prompt() {
             &bed.workers,
             &bed.ids,
             &mut request(&asked, 7, now),
+            None,
             |_| None,
             |_| true,
             |facts| {
@@ -2154,6 +2600,7 @@ fn a_decision_that_names_no_row_writes_nothing_of_the_one_before() {
         &bed.workers,
         &bed.ids,
         &mut other,
+        None,
         |_| None,
         |_| true,
         |facts| {
@@ -2224,6 +2671,7 @@ fn a_cap_the_records_holders_fill_is_not_read_past() {
         &bed.workers,
         &bed.ids,
         &mut facts,
+        None,
         |_| None,
         |_| true,
         |facts| {
@@ -2334,6 +2782,7 @@ fn a_naming_the_record_fills_stands_whole_where_every_holder_is_refused() {
             &bed.workers,
             &bed.ids,
             &mut request(&asked, 0, NOW),
+            None,
             |_| None,
             |_| true,
             |facts| {
@@ -2400,7 +2849,7 @@ fn a_pool_whose_workers_are_all_heard_reads_no_record() {
         let placements = record.predictor.read().len();
 
         let mut buffers = Buffers::new();
-        let read = table.name(&facts, &mut buffers);
+        let read = table.name(&facts, None, &mut buffers);
         assert_eq!(read.is_some(), reads, "record read at {now}");
         let blocks = if reads { 4 } else { 0 };
         assert_eq!(buffers.keys.len(), blocks, "folded keys at {now}");
@@ -2657,6 +3106,7 @@ fn a_removal_waits_for_no_decider_of_another_model() {
             model: READER_MODEL,
             ..facts
         },
+        None,
         |_| None,
         |_| true,
         |_| picked(0, reader_id),
@@ -3167,4 +3617,25 @@ fn a_holder_is_lowered_to_what_its_groups_serve_before_the_deepest_are_kept() {
     let mut wanted = [(deep, 3), (shallow, 2)];
     wanted.sort_unstable();
     assert_eq!(kept, wanted);
+
+    // Of the depth the cap cuts, the draw says who stays. Workers 0 and 3
+    // serve both of the request's first two blocks, and the cap leaves one.
+    let cut = |drawn: u32| {
+        let mut kept = Vec::new();
+        let mut below = |_: u32| drawn;
+        deepest_within_groups(
+            &index,
+            &groups,
+            &request[..2],
+            BLOCK,
+            &within,
+            1,
+            &mut below,
+            &mut kept,
+        );
+        kept
+    };
+    let mut both = [cut(0), cut(1)].concat();
+    both.sort_unstable();
+    assert_eq!(both, [(all[0], 2), (all[3], 2)]);
 }

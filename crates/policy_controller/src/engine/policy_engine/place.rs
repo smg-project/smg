@@ -63,7 +63,7 @@ mod target;
 
 use std::{
     any::Any,
-    cell::{Cell, OnceCell},
+    cell::{Cell, OnceCell, RefCell},
     fmt,
     panic::{catch_unwind, resume_unwind, AssertUnwindSafe},
     sync::Arc,
@@ -81,8 +81,8 @@ use crate::{
     engine::{
         decision::{Decision, Pick, ShedReason, Target, MAX_TARGETS},
         decision_engine::{
-            AlonePick, DecideOutcome, DecisionEngine, DecisionRefused, Plain, Request,
-            RequestMaker, TokenKey, WorkerLists,
+            AlonePick, DecideOutcome, DecisionRefused, Plain, Request, RequestMaker, TokenKey,
+            WorkerLists,
         },
         demands::Demands,
         framework::EncodeItems,
@@ -284,6 +284,18 @@ pub struct PlaceRequest<'a> {
     /// video) books its decode with its prefill whatever it states here: a
     /// decode asked again reads no image fact.
     pub decode_again: bool,
+    /// Whether the caller counts this request on the decode its first
+    /// decision named while it asks that decode again: one of that
+    /// decode's requests in flight, as a guard the caller holds on that
+    /// decode across the call counts it. The decode asked again then reads
+    /// that decode with one request less in flight
+    /// ([`Constraints::counted_on_decode`]), and every other decode as it
+    /// stands. That decode is the worker of its id in the list handed at
+    /// this call, and its count of session keys is read as the worker
+    /// states it. A caller that states nothing here is read as it counts:
+    /// a request it counted on that decode stands among that decode's
+    /// requests. A first decision reads nothing here.
+    pub counted_on_decode: bool,
     /// The hash ring the caller keeps of the model's workers, lent to the
     /// request's decision ([`LentRing`]): one ring for a pair's two lists,
     /// and no part of a list. Under a document whose ring stage places a
@@ -343,7 +355,7 @@ impl<'a> PlaceRequest<'a> {
     /// A first attempt for `model` over `lists` that states no other fact:
     /// no prompt, no header, no id, no tenant, no media, no demand, no
     /// encode item, nothing tried, no budget, no second ask of a decode, no
-    /// ring and no rule of its route.
+    /// count on a decode, no ring and no rule of its route.
     #[must_use]
     pub fn of(model: &'a str, lists: WorkerLists<'a>) -> Self {
         Self {
@@ -363,6 +375,7 @@ impl<'a> PlaceRequest<'a> {
             tried: &[],
             budget_micros: 0,
             decode_again: false,
+            counted_on_decode: false,
             ring: None,
             admits: None,
         }
@@ -390,8 +403,9 @@ impl<'a> PlaceRequest<'a> {
 /// One request as the engine makes it of what its caller stated: the one
 /// place a fact of a request is made.
 pub(super) struct Made<'r, 'a> {
-    /// The engine that decides. Its one document names the sources of the
-    /// request's routing value.
+    /// The engine that decides: the size of a cache block of the request's
+    /// model is read of its record of cache events. The document is the
+    /// one each making is handed.
     engine: &'a PolicyEngine,
     request: &'r PlaceRequest<'a>,
     /// The targets earlier decisions of this call named that could not be
@@ -437,9 +451,18 @@ pub(super) struct Made<'r, 'a> {
     /// The same on the decodes of a pair's targets, by their places in the
     /// decode list: `sent` holds the prefills' then.
     decodes: Cell<Sent>,
+    /// What a decision was answered on the encoders it placed
+    /// ([`RequestMaker::sends_to_encoder`]): the call takes these answers,
+    /// and reads none of those encoders again.
+    encoders: RefCell<Answered>,
     /// Whether the request is a pair's decode decided again: a target's
     /// prefill was sent already, and its decode alone is asked.
     decode_alone: bool,
+    /// Whether a stage of the document the request's decisions run under
+    /// reads a request's size: a plain pick's lease sizes the text by it
+    /// ([`RequestMaker::prompt_chars`]). A call says it ([`Made::asked`]).
+    /// False outside one: the decode entry leases no plain pick.
+    sized: bool,
 }
 
 /// What a call's maker answered on a decision's targets where the decision
@@ -488,6 +511,22 @@ impl Sent {
     }
 }
 
+/// What a call's maker answered on the encoders an encode request's
+/// decision placed, by their places in the encoders' list: each place
+/// asked, and whether the call sends to it. A request's items have no
+/// ceiling, so the list grows with the encoders asked of.
+#[derive(Default)]
+struct Answered(Vec<(u32, bool)>);
+
+impl Answered {
+    /// The answer on the encoder at `place`: whether the call sends to it.
+    /// `None` where the decision did not ask of it.
+    fn answer(&self, place: u32) -> Option<bool> {
+        let kept = self.0.iter().find(|(asked, _)| *asked == place);
+        kept.map(|&(_, sendable)| sendable)
+    }
+}
+
 impl<'r, 'a> Made<'r, 'a> {
     /// `request` for a decision of `engine` that leaves `missed` out.
     pub(super) const fn new(
@@ -510,7 +549,9 @@ impl<'r, 'a> Made<'r, 'a> {
             panicked: OnceCell::new(),
             sent: Cell::new(Sent::NONE),
             decodes: Cell::new(Sent::NONE),
+            encoders: RefCell::new(Answered(Vec::new())),
             decode_alone: false,
+            sized: false,
         }
     }
 
@@ -520,16 +561,19 @@ impl<'r, 'a> Made<'r, 'a> {
     /// earlier ask of the call made them. The headers of the document's
     /// view and the key's place on a lent ring, or the heads' places, are
     /// made again by each ask that makes the request: a later ask is the
-    /// call's cold path.
+    /// call's cold path. `engine` is the engine as the call's decisions
+    /// read it: whether its document sizes a request is kept of it, so
+    /// the maker reads no document the engine holds in force later.
     pub(super) fn asked(
-        engine: &'a PolicyEngine,
+        engine: Loaded<'a, '_>,
         request: &'r PlaceRequest<'a>,
         call: &'r Call,
     ) -> Self {
         Self {
             of_call: Some(call),
             places: call.admitted.as_deref(),
-            ..Self::new(engine, request, call.missed.as_slice())
+            sized: engine.document.spec.needs().prompt_size,
+            ..Self::new(engine.object, request, call.missed.as_slice())
         }
     }
 
@@ -541,9 +585,9 @@ impl<'r, 'a> Made<'r, 'a> {
     }
 
     /// The request's routing value and its client's value, by the sources
-    /// its binding names in the engine's document, with where the value a
-    /// ring places it by stands on a ring, as `place` answers for that
-    /// value's text and its source, `None` for the client's value
+    /// its binding names in `spec`, the decision's document, with where the
+    /// value a ring places it by stands on a ring, as `place` answers for
+    /// that value's text and its source, `None` for the client's value
     /// ([`KeySources::derive_keys`](crate::document::KeySources::derive_keys)).
     /// The routing value is the first source that holds one; none where
     /// the binding names no source or none holds a value. The client's
@@ -552,10 +596,10 @@ impl<'r, 'a> Made<'r, 'a> {
     /// has neither ([`Call::unkeyed`]).
     fn keys(
         &self,
+        spec: &AppliedSpec,
         place: impl FnOnce(&str, Option<KeySource<'a>>) -> Option<u64>,
     ) -> DerivedKeys<'a> {
         let request = self.request;
-        let spec = self.engine.spec();
         let sources = spec.key_sources_for(request.model, request.phase());
         let unkeyed = || self.of_call.is_some_and(|call| call.unkeyed);
         let Some(sources) = sources.filter(|_| !unkeyed()) else {
@@ -591,19 +635,19 @@ impl<'r, 'a> Made<'r, 'a> {
         let request = self.request;
         let (model, phase) = (request.model, request.phase());
         let Some(ring) = request.ring else {
-            return (self.keys(|_, _| None), None, &[]);
+            return (self.keys(spec, |_, _| None), None, &[]);
         };
         // The two questions are asked of one lookup of the binding.
         let engine = spec.engine();
         let profiles = engine.ring_profiles(model, phase);
         if engine.key_place_of(profiles) {
             let first = self.place.get().is_none();
-            let keys = self.keys(|text, _| first.then(|| ring.position(text)));
+            let keys = self.keys(spec, |text, _| first.then(|| ring.position(text)));
             let place = self.place.get_or_init(|| keys.ring_position);
             return (keys, Some(ring), place.as_slice());
         }
         let Some(rule) = engine.head_rule_of(profiles) else {
-            return (self.keys(|_, _| None), None, &[]);
+            return (self.keys(spec, |_, _| None), None, &[]);
         };
         // A routing value a header handed leads the prompt: its text is the
         // one head. A client's value places nothing under this form, and
@@ -611,7 +655,7 @@ impl<'r, 'a> Made<'r, 'a> {
         // is placed by its prompt's heads.
         let key_at = Cell::new(None);
         let first = self.heads.get().is_none();
-        let keys = self.keys(|text, source| {
+        let keys = self.keys(spec, |text, source| {
             if first && source.is_some_and(leads_a_prompt) {
                 key_at.set(Some(ring.head_position(Head::Text(text))));
             }
@@ -720,8 +764,6 @@ impl RequestMaker for Made<'_, '_> {
 
     fn make<'w>(&'w self, spec: &'w AppliedSpec) -> Request<'w> {
         let request = self.request;
-        // The engine decides under its one document, the one it hands here.
-        debug_assert!(std::ptr::eq(spec, self.engine.spec()));
         // The request's place is taken at the first making: a later one
         // asks the ring nothing, and nothing is hashed again.
         let (keys, ring, places) = self.stated(spec);
@@ -769,6 +811,7 @@ impl RequestMaker for Made<'_, '_> {
         };
         let (tokens, text) = (request.prompt.tokens, request.prompt.text);
         if tokens.is_some() || text.is_some() {
+            // Under the decision's own document, as the keys are.
             let cell = self.of_call.map_or(&self.hashes, |call| &call.hashes);
             let hashes = cell.get_or_init(|| {
                 // By the id the list's workers registered under, as their
@@ -781,8 +824,8 @@ impl RequestMaker for Made<'_, '_> {
                     WorkerLists::Encode(lists) => lists.pair.prefill.workers.first(),
                 };
                 let model = listed.map_or(request.model, |worker| worker.model_id());
-                self.engine
-                    .prompt_hashes(model, tokens, text, request.prompt.seeds)
+                let size = self.engine.affinity.block_size(model);
+                PromptHashes::under_document(spec, size, tokens, text, request.prompt.seeds)
             });
             hashes.write_to(&mut facts);
         }
@@ -806,6 +849,7 @@ impl RequestMaker for Made<'_, '_> {
                 excluded: self.missed,
                 places: self.places,
                 decode_later: later,
+                counted_on_decode: request.counted_on_decode,
                 demands: request.demands,
                 ..Constraints::default()
             },
@@ -831,11 +875,11 @@ impl RequestMaker for Made<'_, '_> {
 
     // Asked where a plain request's pick is leased, ahead of its making:
     // the hashing counts the text of a request that is made, so a text is
-    // passed over once.
+    // passed over once. The lease is its decision's document's, and so is
+    // the flag: the engine may hold another document in force by now.
     fn prompt_chars(&self) -> u32 {
         let prompt = self.request.prompt;
-        let sized = self.engine.spec().needs().prompt_size;
-        prompt_chars_of(prompt.tokens, prompt.text, sized)
+        prompt_chars_of(prompt.tokens, prompt.text, self.sized)
     }
 
     // The text's bytes, for the same lease: its length is at hand.
@@ -886,6 +930,24 @@ impl RequestMaker for Made<'_, '_> {
                 })
             }
         }
+    }
+
+    // The call's own read of an encoder a decision placed, made ahead of
+    // that read for the write of where the prompt went: ready, on one read
+    // of its state. The route's rule is asked of no encoder. The answer is
+    // kept ([`Answered`]) and the call takes it, so an encoder is read once
+    // a decision, however many the request's items are placed on.
+    fn sends_to_encoder(&self, position: u32) -> bool {
+        let WorkerLists::Encode(lists) = &self.request.lists else {
+            return true;
+        };
+        let kept = self.encoders.borrow().answer(position);
+        kept.unwrap_or_else(|| {
+            let worker = lists.encoders.workers.get(position as usize);
+            let sendable = worker.is_some_and(|worker| ready(worker.as_ref()));
+            self.encoders.borrow_mut().0.push((position, sendable));
+            sendable
+        })
     }
 }
 
@@ -1357,7 +1419,7 @@ fn single<'a>(
 ) -> Result<Placement<'a>, Unplaced> {
     let mut made = Made {
         budget_micros: call.left(request)?,
-        ..Made::asked(engine.object, request, call)
+        ..Made::asked(engine, request, call)
     };
     let mut whole = None;
     let decided = decide(engine, &made, &mut whole);
@@ -1599,6 +1661,10 @@ impl PolicyEngine {
     /// build fails a request placed on a worker its list's records name
     /// otherwise.
     ///
+    /// Every decision of one call runs under the document in force where
+    /// the call began. A document put in force during the call decides
+    /// the next call ([`PolicyEngine::apply`]).
+    ///
     /// # Errors
     ///
     /// [`Unplaced`]: why the request has no worker. Where a decision
@@ -1610,7 +1676,8 @@ impl PolicyEngine {
         if request.encode.is_some() && !matches!(request.lists, WorkerLists::Encode(_)) {
             return Err(declined(ENCODE_ITEMS));
         }
-        let own = self.loaded();
+        let document = self.in_force();
+        let own = self.under(&document);
         match request.lists {
             WorkerLists::Pair(ref lists) => pair::place(own, request, lists, &mut Call::default()),
             // Whether a binding names a target source was decided when the

@@ -1461,20 +1461,6 @@ impl framework::Filter for ShowsItsRows {
     }
 }
 
-/// A filter that refuses an encoder to a request that carries a pin.
-#[derive(Debug)]
-struct NoEncoderUnderAPin;
-
-impl framework::Filter for NoEncoderUnderAPin {
-    fn name(&self) -> &'static str {
-        "no-encoder-under-a-pin"
-    }
-
-    fn keep(&self, facts: &RequestFacts<'_>, row: &Candidate, _: &Constraints<'_>) -> bool {
-        !matches!(row.role, Role::Encode) || facts.pinned_at == 0
-    }
-}
-
 /// The bed's decision over `pools` under `facts` and each side's
 /// constraints: the prefill's, the decode's and the encode's.
 fn decide_under(
@@ -1584,25 +1570,6 @@ fn a_mask_on_a_row_cut_out_declines_nothing_for_a_side_that_shows_its_rows() {
         shed_of(&decide(&[1])),
         (ShedReason::PolicyDeclined, "written-rows")
     );
-}
-
-/// A pin is a position in another pool, and the encode side's stages are
-/// handed none.
-#[test]
-fn the_encode_side_is_handed_no_pin() {
-    let mut engine = engine();
-    for profile in &mut engine.profiles {
-        profile.filters.push(Box::new(NoEncoderUnderAPin));
-    }
-    let bed = Bed::new();
-    let pinned = RequestFacts {
-        pinned_at: 1,
-        ..bed.asked().0
-    };
-    let cx = Constraints::default();
-    let (decision, placed) = decide_under(&bed, &engine, &pinned, bed.pools(), [&cx; 3]);
-    assert!(decision.pick().is_some(), "a pick, not {decision:?}");
-    assert_eq!(placed.encoders().len(), 1);
 }
 
 /// A pair column of another length than its pool declines as the pair
@@ -2243,8 +2210,11 @@ fn a_request_held_off_every_worker_that_takes_it_is_shed_under_the_places_name()
     let open = Constraints::default();
     let held_off = (ShedReason::NoEndpoints, "places");
     let first = holding(&[0]);
-    // No place, and a place past every list's end.
-    let nobody = [holding(&[]), holding(&[7])];
+    // No place, the place at the end of a list of two, and a place past
+    // it.
+    let nobody = [holding(&[]), holding(&[2]), holding(&[7])];
+    // The first place, which names a worker, and a place that names none.
+    let first_and_nobody = holding(&[0, 7]);
     let shed = |bed: &Bed, sides: [&Constraints<'_>; 3]| {
         let (facts, _) = bed.asked();
         shed_of(&decide_under(bed, &stock, &facts, bed.pools(), sides).0)
@@ -2263,6 +2233,7 @@ fn a_request_held_off_every_worker_that_takes_it_is_shed_under_the_places_name()
     bed.decodes[0].vision = false;
     bed.decode_images = true;
     assert_eq!(shed(&bed, [&open, &first, &open]), held_off);
+    assert_eq!(shed(&bed, [&open, &first_and_nobody, &open]), held_off);
     for nobody in &nobody {
         let pair = alone(&bed, [&open, nobody]);
         assert_ne!(pair.1, "places");
@@ -2278,6 +2249,7 @@ fn a_request_held_off_every_worker_that_takes_it_is_shed_under_the_places_name()
     bed.prefills = vec![row(0, Role::Prefill, 1, 0), row(1, Role::Prefill, 1, 0)];
     bed.prefill_classes = vec![2, 1];
     assert_eq!(shed(&bed, [&first, &open, &open]), held_off);
+    assert_eq!(shed(&bed, [&first_and_nobody, &open, &open]), held_off);
     for nobody in &nobody {
         let pair = alone(&bed, [nobody, &open]);
         assert_ne!(pair.1, "places");
@@ -2302,6 +2274,26 @@ fn a_request_held_off_every_worker_that_takes_it_is_shed_under_the_places_name()
     bed.encoders[1].vision = false;
     assert_eq!(shed(&bed, [&open, &open, &first]).1, "encode-vision");
     assert_eq!(shed(&bed, [&open; 3]).1, "encode-vision");
+    // The encoder at the place states no end: it takes no request,
+    // whatever its row says, and the one outside the place takes this one.
+    bed.encoders[1].vision = true;
+    bed.encoders[0].vision = true;
+    bed.facts = vec![pushing(0), pushing(1)];
+    assert_eq!(shed(&bed, [&open, &open, &first]), held_off);
+
+    // A side that admits nobody leaves nobody out: its places are the
+    // pair's to answer, as without them. The prefill's class has one
+    // encoder, which is not ready, beside a ready encoder of a class no
+    // prefill names.
+    let mut bed = Bed::new();
+    bed.encoders = vec![
+        unready(row(0, Role::Encode, 0, 0)),
+        row(1, Role::Encode, 0, 0),
+    ];
+    bed.facts = vec![pushing(1), pushing(2)];
+    let unheld = shed(&bed, [&open; 3]);
+    assert_ne!(unheld.1, "places");
+    assert_eq!(shed(&bed, [&first, &open, &open]), unheld);
 
     // The encoder at the place takes the request and is not ready: the
     // shed is the encode side's, by state. Over its thresholds it is a
@@ -2331,6 +2323,141 @@ fn a_request_held_off_every_worker_that_takes_it_is_shed_under_the_places_name()
     };
     assert_eq!(under([&open; 3]), by_state);
     assert_eq!(under([&open, &open, &first]), saturated);
+}
+
+/// A gap the pass reads of the pairs' membership is answered ahead of the
+/// encoders' places: the model's workers say it whatever the places are,
+/// and no other place closes it. So a request that its encoders' places
+/// hold off every encoder that takes it is shed under the gap where one
+/// stands, as it is with no place and with a side's places. An encoder
+/// outside the places that is not ready changes nothing: the places hold
+/// the request off it. What the pair's own decision answers stays behind
+/// the pass, under places as under none.
+#[test]
+fn a_gap_of_the_pairs_membership_stands_ahead_of_the_encoders_places() {
+    let stock = engine();
+    let open = Constraints::default();
+    let first = holding(&[0]);
+    let shed = |bed: &Bed, sides: [&Constraints<'_>; 3]| {
+        let (facts, _) = bed.asked();
+        shed_of(&decide_under(bed, &stock, &facts, bed.pools(), sides).0)
+    };
+    // The first encoder takes no image, and the request states one: the
+    // encoders' place holds it off the one encoder that takes it.
+    let held_off = || {
+        let mut bed = Bed::new();
+        bed.encoders = vec![row(0, Role::Encode, 0, 0), row(1, Role::Encode, 0, 0)];
+        bed.encoders[0].vision = false;
+        bed.facts = vec![pushing(1), pushing(1)];
+        bed
+    };
+    let mut bed = held_off();
+    assert_eq!(shed(&bed, [&open, &open, &first]).1, "places");
+    // No decode takes images, and the request asks images of its decode.
+    bed.decodes[0].vision = false;
+    bed.decode_images = true;
+    for sides in [[&open; 3], [&open, &first, &open], [&open, &open, &first]] {
+        assert_eq!(shed(&bed, sides).1, "decode-vision");
+    }
+    // The encoders hand to a class that no prefill names.
+    let mut bed = held_off();
+    bed.prefill_classes = vec![2];
+    for sides in [[&open; 3], [&first, &open, &open], [&open, &open, &first]] {
+        assert_eq!(shed(&bed, sides).1, "ec-compatible");
+    }
+    // The one encoder that takes the request is not ready. With no place
+    // the request has no open encoder, and under the place it is held off
+    // the encoder all the same.
+    let mut bed = held_off();
+    bed.encoders[1] = unready(bed.encoders[1]);
+    assert_eq!(shed(&bed, [&open; 3]).1, "encoders");
+    assert_eq!(shed(&bed, [&open, &open, &first]).1, "places");
+    // No prefill pairs with a decode: the pair's own decision says so, and
+    // it is asked behind the pass.
+    let mut bed = held_off();
+    bed.decodes = vec![row(0, Role::Decode, 2, 0)];
+    assert_eq!(shed(&bed, [&open; 3]).1, "partnered");
+    assert_eq!(shed(&bed, [&open, &open, &first]).1, "places");
+}
+
+/// The encoders' places are numbered anew by each decision, as a side's
+/// are: the next decision of one scratch holds its item to its own places
+/// and to none of the last decision's.
+#[test]
+fn the_encoders_places_are_forgotten_by_the_next_decision() {
+    let engine = engine();
+    // Two encoders of the pair's class.
+    let mut bed = Bed::new();
+    bed.encoders = vec![row(0, Role::Encode, 0, 0), row(1, Role::Encode, 0, 0)];
+    bed.facts = vec![pushing(1), pushing(1)];
+    let (facts, pool) = bed.asked();
+    let encode = EncodePool {
+        encoders: &bed.encoders,
+        facts: &bed.facts,
+        prefill_classes: &bed.prefill_classes,
+        affinity: &bed.encode_affinity,
+        ..EncodePool::default()
+    };
+    let items = EncodeItems {
+        keys: &bed.keys,
+        one: bed.one,
+        references: bed.references,
+        decode_images: bed.decode_images,
+    };
+    let open = Constraints::default();
+    let (mut scratch, mut placed) = (Scratch::new(), EncodePlaced::new());
+    let mut encoder = |held: &Constraints<'_>| {
+        let decision = engine.decide_encode_pair(
+            &facts,
+            &pool,
+            bed.pools(),
+            encode,
+            items,
+            &open,
+            &open,
+            held,
+            &mut scratch,
+            &mut placed,
+        );
+        assert!(decision.pick().is_some(), "a pick, not {decision:?}");
+        placed.encoders().first().map(|target| target.position)
+    };
+    assert_eq!(encoder(&holding(&[1])), Some(1));
+    assert_eq!(encoder(&holding(&[0])), Some(0));
+    assert_eq!(encoder(&holding(&[1])), Some(1));
+}
+
+/// A debug build refuses places that do not ascend where the encode pass
+/// numbers them beside a list it narrowed. Read by one walk beside rows
+/// that ascend, the places of the last two rows stated backwards would
+/// hold the request to the last row alone and say nothing.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "the places are ascending, each once")]
+fn a_debug_build_refuses_a_narrowed_sides_places_out_of_order() {
+    // The first prefill's class has no encoder: the side is narrowed.
+    let mut bed = Bed::new();
+    bed.prefills = (0..3).map(|at| row(at, Role::Prefill, 1, 0)).collect();
+    bed.prefill_classes = vec![2, 1, 1];
+    let (facts, _) = bed.asked();
+    let open = Constraints::default();
+    let sides = [&holding(&[2, 1]), &open, &open];
+    let _ = decide_under(&bed, &engine(), &facts, bed.pools(), sides);
+}
+
+/// The encoders' places are refused the same way where the pass holds the
+/// open encoders to them.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "the places are ascending, each once")]
+fn a_debug_build_refuses_the_encoders_places_out_of_order() {
+    let mut bed = Bed::new();
+    bed.encoders = vec![row(0, Role::Encode, 0, 0), row(1, Role::Encode, 0, 0)];
+    bed.facts = vec![pushing(1), pushing(1)];
+    let (facts, _) = bed.asked();
+    let open = Constraints::default();
+    let sides = [&open, &open, &holding(&[1, 0])];
+    let _ = decide_under(&bed, &engine(), &facts, bed.pools(), sides);
 }
 
 /// The `epd` plan with every side turning its pool's rotation.

@@ -9,7 +9,8 @@
 //! snapshot at hand. So a report told at the first snapshot that holds it
 //! is told before a decision can read it in the engine's snapshot. A report
 //! whose worker is told as joined behind that snapshot is told at the next
-//! one the task takes: a decision can read it first. A decision that runs
+//! one the task takes, or at the upkeep of a whole read that was put off
+//! (below): a decision can read it first. A decision that runs
 //! during a telling reads the snapshot before it, beside what the stages
 //! have kept of the new one so far. A request that gives a snapshot of its
 //! own ([`RequestMaker::loads`](crate::engine::RequestMaker::loads)) is
@@ -29,7 +30,10 @@
 //! of it, is told the worker's reports all the same. An engine handed no
 //! registry, or no channel, tells no report. A registry handed behind the
 //! channel is followed from the task's next upkeep, and its workers are
-//! told their reports at the first snapshot behind it.
+//! told their reports at the first snapshot behind it. A whole read that a
+//! panic of the host's own code put off to a later upkeep tells its workers
+//! the snapshot at hand at that upkeep: a channel's hand-over the earlier
+//! upkeep took was told ahead of the read.
 //!
 //! **Which reports.** The follow keeps, with each worker it holds, the
 //! sample instant of the report told last ([`Joined::told_at`]). A report is
@@ -81,8 +85,10 @@
 //! and nothing counts them. A report whose counts change under a sample
 //! instant that stands is not told again: the worker crate states one
 //! instant for a worker object's several ranks. The task tells at a
-//! snapshot alone: a worker told as joined behind the last snapshot of a
-//! channel that publishes no more is told no report. Of two workers held
+//! snapshot, and at the upkeep behind a whole read that was put off: a
+//! worker told as joined behind the last snapshot of a channel that
+//! publishes no more is told no report, unless such an upkeep tells the
+//! snapshot at hand. Of two workers held
 //! under one id, the one that stays when the other goes is told from its
 //! next new sample on: a report told ahead of the other's join is not told
 //! again.
@@ -97,9 +103,11 @@
 //!
 //! **What it costs.** A document none of whose stages keeps a report looks
 //! up no report and hears no word at a snapshot, and its follow reads
-//! nothing of a worker for a telling. A document that reads no load report
-//! and no named signal keeps the channel for such a stage alone, and no
-//! decision of it reads the engine's snapshot. Where a stage keeps reports,
+//! nothing of a worker for a telling. Under a document that reads no load
+//! report and no named signal the task keeps a snapshot for such a stage
+//! alone, and no decision under it reads the engine's snapshot. A new
+//! document owes a whole read of the registry ([`PolicyEngine::apply`]),
+//! so each worker's report is told to its stages. Where a stage keeps reports,
 //! a snapshot is at hand for decisions behind its telling: the registry's
 //! ready words, one look-up for each joined worker, one conversion of each
 //! new report, its named values where a stage reads them, and the stages'
@@ -108,6 +116,7 @@
 use smg_worker::load::state::LoadSnapshot;
 
 use super::{
+    document::InForce,
     membership::{Follow, Joined},
     PolicyEngine,
 };
@@ -141,7 +150,8 @@ impl PolicyEngine {
         cells: &mut SignalCells,
         newest: &LoadSnapshot,
     ) {
-        let engine = self.document.spec.engine();
+        let document = self.document.load();
+        let engine = document.spec.engine();
         if !engine.keeps_loads() {
             return;
         }
@@ -150,7 +160,7 @@ impl PolicyEngine {
             return;
         };
         for (id, worker) in follow.joined() {
-            let Some(report) = self.new_report(id, worker, newest, cells) else {
+            let Some(report) = self.new_report(&document, id, worker, newest, cells) else {
                 continue;
             };
             engine.tell_loads(|tell| {
@@ -169,6 +179,7 @@ impl PolicyEngine {
     /// ([`Self::upkeep_faults`]), and its report is told to no stage.
     fn new_report<'c>(
         &self,
+        document: &InForce,
         id: WorkerId,
         worker: &Joined,
         newest: &LoadSnapshot,
@@ -181,8 +192,8 @@ impl PolicyEngine {
         self.held(move || {
             let clock = &self.clock;
             let (row, sampled_at_micros) = stated_report(report, sampled_at, worker.role, clock);
-            let signals = if self.document.signals {
-                let columns = self.document.spec.signal_columns();
+            let signals = if document.signals {
+                let columns = document.spec.signal_columns();
                 stated_signals(report, sampled_at, worker.ranks, columns, clock, cells)
             } else {
                 ReportSignals::NONE

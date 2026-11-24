@@ -160,7 +160,7 @@
           "default": 180
         },
         "max_size": {
-          "description": "The size bound of a tree index: characters on a text host, tokens\notherwise. The crate's own store reads it for a pool whose profile\nreads sent prefixes: the model's record is bound to `max_size` over\nthe block size placements, never under one, one a block a worker\nwas sent. A lowered bound is met by sweeps at the record's next\nwrites, and a pool whose lanes are all heard writes none.",
+          "description": "The size bound of a tree index: on a text host its characters plus\n1024 for each node a worker stands on, tokens otherwise.\nThe crate's own store reads it for a pool whose profile\nreads sent prefixes: the model's record is bound to `max_size` over\nthe block size placements, never under one, one a block a worker\nwas sent. A lowered bound is met by sweeps at the record's next\nwrites, and a pool whose lanes are all heard writes none.",
           "type": "integer",
           "format": "uint64",
           "minimum": 1,
@@ -281,7 +281,7 @@
           "minimum": 1
         },
         "sent_report_delay_ms": {
-          "description": "The least number of milliseconds between a send and the sample of a\nload report that ends it: a report sampled less than that long after\na send leaves the send counted. Unset, a report sampled at or after\na send ends it. A written zero is refused, as a zero limit is. A\nprofile whose stages do not read its count of sends is refused if it\nsets a delay. The limit ends a send whatever the delay. The\nprofiles of a document that set the same limit and the same delay\nread one count, under the name of the first of them that reads it,\nin the order of their names. A new document's count takes over the\nsends the standing count under the same name holds and shares them:\na read under the shorter of the two delays ends such a send for\nboth. A count under a name with no standing count starts empty: a\ndocument that drops that first profile, or groups it apart from the\nothers, starts the count of the others empty, once.",
+          "description": "The least number of milliseconds between a send and the sample of a\nload report that ends it: a report sampled less than that long after\na send leaves the send counted. Unset, a report sampled at or after\na send ends it. A written zero is refused, as a zero limit is. A\nprofile whose stages do not read its count of sends is refused if it\nsets a delay. The limit ends a send whatever the delay. The\nprofiles of a document that set the same limit and the same delay\nread one count, under the name of the first of them that reads it,\nin the order of their names. A new document's count takes over the\nsends of the standing count under the same limit and delay,\nwhichever profiles read that one. Where none stands under them, it\ntakes over those of the standing count under the same name, unless\na count of the new document took that one by its settings, or else\nof a standing count that no count of the new document took. The\ntwo counts share the sends: a read under the shorter of two delays\nends such a send for both. A count that finds none starts empty.",
           "type": [
             "integer",
             "null"
@@ -936,7 +936,7 @@
           "exclusiveMinimum": 0
         },
         "prefix_tokens": {
-          "description": "The depth in tokens at which a request with no routing key is keyed\nby its prefix through the last whole block at or under the depth, so at\nleast one block of the view's block size and at most the blocks a\nrequest carries. Under the view's `boundaries` a request that reaches\none is keyed there instead, at the deepest it reaches. The depth is\nchecked in the view's token blocks and read in the blocks a request\nwas hashed by. A host that hashes a text request by windows of the\nblock size times four bytes gives it the checked depth in windows,\nas a token request has it in blocks. Under a block size\nan engine published above the depth a request has no key. Where\nthe request's caller lends its ring no block is read: the request\nis keyed at the token, at each boundary it reaches or else at the\ndepth, a shorter request whole, and a text at four characters a\ntoken. A routing key the request's own id handed (a `rid` source)\nleads no prompt under this form: it names the session alone, and\nthe request is keyed by its prefix as one with no routing key. That\nholds in a gateway's own process: no frame states where a key came\nfrom, so under a controller's address the id's key places as any\nother. Absent, a request with no routing key has none.",
+          "description": "The depth in tokens at which a request with no routing key is keyed\nby its prefix through the last whole block at or under the depth, so at\nleast one block of the view's block size and at most the blocks a\nrequest carries. Under the view's `boundaries` a request that reaches\none is keyed there instead, at the deepest it reaches. The depth is\nchecked in the view's token blocks and read in the blocks a request\nwas hashed by. A host that hashes a text request by windows of the\nblock size times four bytes gives it the checked depth in windows,\nas a token request has it in blocks. Under a block size\nan engine published above the depth a request has no key. Where\nthe request's caller lends its ring no block is read: the request\nis keyed at the token, at each boundary it reaches or else at the\ndepth, a shorter request whole, and a text at four characters a\ntoken. A routing key the request's own id handed (a `rid` source)\nleads no prompt under this form: it names the session alone, and\nthe request is keyed by its prefix as one with no routing key. A\ngateway's frame states to a controller where the key came from.\nThe frame of a host older than that field states nothing, and\nunder it the id's key places as any other. Absent, a request with\nno routing key has none.",
           "type": [
             "integer",
             "null"
@@ -1582,7 +1582,7 @@
       ]
     },
     "OverloadSpec": {
-      "description": "What a binding says of the overload veto on the workers of the pools\ndecided under it, as its `overload` field: whether the default\nthresholds veto at all, and what a decision does where every worker is\nvetoed. The veto is evaluated per load report by the host and latched,\nnever per request. The block names no threshold: a worker's\nregistration states its own two, over its program's default where the\nprogram has one. The store's judge reads the switch, for each binding's\npools. A gateway that runs the document in its own process reads the\nswitch once, where it builds its workers' default thresholds, and its\nroutes read one shed word: it refuses a document whose bindings differ\non either word. A controller that judges on its worker objects does not\nread the switch yet.",
+      "description": "What a binding says of the overload veto on the workers of the pools\ndecided under it, as its `overload` field: whether the default\nthresholds veto at all, and what a decision does where every worker is\nvetoed. The veto is evaluated per load report by the host and latched,\nnever per request. The block names no threshold: a worker's\nregistration states its own two, over its program's default where the\nprogram has one. The store's judge reads the switch, for each binding's\npools. A gateway that runs a supplied document in its own process reads\nthe switch where it builds its workers' default thresholds, and its\nroutes read one shed word, both from that document: it refuses one\nwhose bindings differ on either word. With no document supplied it\nreads its own two settings. A controller that judges on its worker\nobjects does not read the switch yet.",
       "type": "object",
       "properties": {
         "enabled": {
@@ -1641,7 +1641,7 @@
           ]
         },
         "rid": {
-          "description": "The request's own id, the `rid` of its body: `true` names it. Under\na ring's prefix form (`prefix_tokens`) in a gateway's own process\nits key names the session alone: a sessions rule pins it, and the\nring places the request by its prompt. The plain ring places by it,\nand so does a served controller's prefix ring.",
+          "description": "The request's own id, the `rid` of its body: `true` names it. Under\na ring's prefix form (`prefix_tokens`) its key names the session\nalone: a sessions rule pins it, and the ring places the request by\nits prompt. The plain ring places by it, and so does a controller's\nprefix ring where its host's frame does not say the id handed it.",
           "type": "boolean"
         },
         "max_bytes": {

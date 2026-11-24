@@ -1,5 +1,5 @@
-//! The index's cases: a lane's life with its row, and the store's apply
-//! path held to the `kv-index` crate's reference index over streams with
+//! The index's cases: a lane's life with its row, and a lane's admission
+//! held to the `kv-index` crate's reference index over streams with
 //! holes, clears, restarts, gaps and snapshots.
 
 use std::collections::BTreeMap;
@@ -7,8 +7,8 @@ use std::collections::BTreeMap;
 use kv_index::{chain_prefix_hash, ApplyError, GroupKind, ReferenceIndexer};
 
 use super::{
-    admit, Blocks, ContentHash, KvEvent, LaneCounts, LaneWriter, SequenceHash, StoredBlock,
-    INDEX_WORKERS,
+    admitted as by_cursor, Blocks, ChainBlockMap, ContentHash, LaneWriter, SequenceHash,
+    StoredBlock, INDEX_WORKERS,
 };
 use crate::{
     engine::view::WorkerId,
@@ -45,42 +45,6 @@ fn admitted(store: &MemoryStore, key: &str) -> WorkerId {
     id
 }
 
-/// A membership write that moves no member, no lane, no block size of
-/// record and no row's word to record walks no pool: each stands in its
-/// model's index as it did. A registration refreshed with the offer it had
-/// is such a write, and it stays one under the default source, where the
-/// pools hold a record of sent prefixes. A worker more makes a lane, and
-/// the pools are walked.
-#[test]
-fn a_write_that_moves_no_member_walks_no_pool() {
-    use crate::document::{AppliedSpec, PolicySpec};
-
-    let store = MemoryStore::new();
-    admitted(&store, "a");
-    admitted(&store, "b");
-    let refresh = |priority| {
-        store.upsert(WorkerFacts {
-            priority,
-            ..publisher("a", &[MODEL])
-        });
-        store.publish_now();
-    };
-    let walks = store.pool_walks();
-    refresh(7);
-    assert_eq!(store.pool_walks(), walks, "every pool stands as it did");
-    let preset =
-        PolicySpec::preset("cache_aware").and_then(|document| AppliedSpec::validate(&document));
-    store
-        .apply(preset.expect("the preset validates"))
-        .expect("the store takes the preset");
-    store.publish_now();
-    let walks = store.pool_walks();
-    refresh(8);
-    assert_eq!(store.pool_walks(), walks, "with a record to keep too");
-    admitted(&store, "c");
-    assert_eq!(store.pool_walks(), walks + 1, "a lane was made");
-}
-
 /// The facts of the row of `engine` at `rank` of `ranks`.
 fn ranked(engine: &str, rank: u16, ranks: u16) -> WorkerFacts {
     WorkerFacts {
@@ -108,8 +72,116 @@ fn chain(contents: &[u64]) -> Vec<StoredBlock> {
     blocks
 }
 
-fn stored(parent: Option<SequenceHash>, blocks: &[StoredBlock]) -> Vec<KvEvent> {
-    vec![KvEvent::Stored {
+/// One event of a batch as the cases write it.
+#[derive(Clone, Debug)]
+enum Event {
+    /// Blocks stored in order after `parent`, the engine's hash of the block
+    /// before the first; `None` starts a chain.
+    Stored {
+        parent: Option<SequenceHash>,
+        blocks: Vec<StoredBlock>,
+    },
+    /// Blocks evicted, by the engine's hashes.
+    Removed(Vec<SequenceHash>),
+    /// The engine emptied its cache.
+    Cleared,
+}
+
+/// One worker's blocks as a batch's events write them: a lent lane over its
+/// map, or a worker of the reference index.
+trait Written {
+    fn stored(
+        &mut self,
+        blocks: &[StoredBlock],
+        parent: Option<SequenceHash>,
+    ) -> Result<(), ApplyError>;
+    fn removed(&mut self, hashes: &[SequenceHash]);
+    fn cleared(&mut self);
+}
+
+/// A lent lane's writes over its map, which the body took for the batch.
+struct Writes<'a, 'w> {
+    writer: &'a LaneWriter<'w>,
+    map: &'a mut ChainBlockMap,
+}
+
+impl Written for Writes<'_, '_> {
+    fn stored(
+        &mut self,
+        blocks: &[StoredBlock],
+        parent: Option<SequenceHash>,
+    ) -> Result<(), ApplyError> {
+        self.writer.stored(blocks, parent, self.map)
+    }
+
+    fn removed(&mut self, hashes: &[SequenceHash]) {
+        self.writer.removed(hashes, self.map);
+    }
+
+    fn cleared(&mut self) {
+        self.writer.cleared(self.map);
+    }
+}
+
+/// Writes `events` in their order and counts the stores that came under a
+/// parent the worker does not hold. Such a store starts a chain of its own,
+/// as an engine's first stores behind lost history do.
+fn write(blocks: &mut impl Written, events: &[Event]) -> u64 {
+    let mut parentless = 0;
+    for event in events {
+        match event {
+            Event::Stored {
+                parent,
+                blocks: new,
+            } => {
+                let mut placed = blocks.stored(new, *parent);
+                if matches!(
+                    placed,
+                    Err(ApplyError::WorkerNotTracked | ApplyError::ParentBlockNotFound)
+                ) && parent.is_some()
+                {
+                    parentless += 1;
+                    placed = blocks.stored(new, None);
+                }
+                let _ = placed;
+            }
+            Event::Removed(hashes) => blocks.removed(hashes),
+            Event::Cleared => blocks.cleared(),
+        }
+    }
+    parentless
+}
+
+/// The cases' way to a row's lane: one batch of the cases' events through
+/// the lent way in.
+trait Drive {
+    /// The cursor reads `facts`, with a clear that stands among `events`
+    /// said in the header as a collector says it. An admitted batch's body
+    /// writes the events over the lane's map, taken for the batch and put
+    /// back.
+    fn drive(&self, id: WorkerId, rank: u16, facts: BatchFacts, events: &[Event]) -> BatchOutcome;
+}
+
+impl Drive for MemoryStore {
+    fn drive(&self, id: WorkerId, rank: u16, facts: BatchFacts, events: &[Event]) -> BatchOutcome {
+        let clears = facts.clears || events.iter().any(|e| matches!(e, Event::Cleared));
+        let facts = BatchFacts { clears, ..facts };
+        self.admit_through(id, rank, facts, &mut |writer| {
+            let mut map = std::mem::take(writer.map());
+            write(
+                &mut Writes {
+                    writer,
+                    map: &mut map,
+                },
+                events,
+            );
+            *writer.map() = map;
+        })
+    }
+}
+
+fn stored(parent: Option<SequenceHash>, blocks: &[StoredBlock]) -> Vec<Event> {
+    vec![Event::Stored {
         parent,
         blocks: blocks.to_vec(),
     }]
@@ -134,11 +206,11 @@ fn a_members_blocks_reach_its_models_index_and_a_removal_leaves_a_hole() {
     let long = chain(&[1, 2, 3, 4]);
     let fork = chain(&[1, 2, 9]);
     assert_eq!(
-        store.admit(a, 0, batch(1), &stored(None, &long)),
+        store.drive(a, 0, batch(1), &stored(None, &long)),
         BatchOutcome::Applied
     );
     assert_eq!(
-        store.admit(b, 0, batch(1), &stored(None, &fork)),
+        store.drive(b, 0, batch(1), &stored(None, &fork)),
         BatchOutcome::Applied
     );
     assert_eq!(
@@ -159,8 +231,8 @@ fn a_members_blocks_reach_its_models_index_and_a_removal_leaves_a_hole() {
         (4, 3)
     );
     // The third block goes: the fourth stays held and stops counting.
-    let evicted = vec![KvEvent::Removed(vec![long[2].seq_hash])];
-    assert_eq!(store.admit(a, 0, batch(2), &evicted), BatchOutcome::Applied);
+    let evicted = vec![Event::Removed(vec![long[2].seq_hash])];
+    assert_eq!(store.drive(a, 0, batch(2), &evicted), BatchOutcome::Applied);
     assert_eq!(
         held(&store, MODEL, &[1, 2, 3, 4]),
         BTreeMap::from([(a, 2), (b, 2)])
@@ -168,9 +240,8 @@ fn a_members_blocks_reach_its_models_index_and_a_removal_leaves_a_hole() {
     assert_eq!(store.indexed_blocks(a, 0), 3);
     // Stored again under its parent, the chain is whole again.
     let again = stored(Some(long[1].seq_hash), &long[2..3]);
-    assert_eq!(store.admit(a, 0, batch(3), &again), BatchOutcome::Applied);
+    assert_eq!(store.drive(a, 0, batch(3), &again), BatchOutcome::Applied);
     assert_eq!(held(&store, MODEL, &[1, 2, 3, 4])[&a], 4);
-    assert_eq!(store.lane_counts(a, 0), Some(LaneCounts::default()));
 }
 
 #[test]
@@ -178,8 +249,8 @@ fn a_row_leaves_with_its_blocks_and_its_successor_starts_empty() {
     let store = MemoryStore::new();
     let (a, b) = (admitted(&store, "a"), admitted(&store, "b"));
     let blocks = chain(&[1, 2, 3]);
-    store.admit(a, 0, batch(1), &stored(None, &blocks));
-    store.admit(b, 0, batch(1), &stored(None, &blocks[..1]));
+    store.drive(a, 0, batch(1), &stored(None, &blocks));
+    store.drive(b, 0, batch(1), &stored(None, &blocks[..1]));
     assert_eq!(
         held(&store, MODEL, &[1, 2, 3]),
         BTreeMap::from([(a, 3), (b, 1)])
@@ -200,7 +271,7 @@ fn a_row_leaves_with_its_blocks_and_its_successor_starts_empty() {
         "the old id's blocks left the index"
     );
     assert_eq!(
-        store.admit(a, 0, batch(2), &stored(None, &blocks)),
+        store.drive(a, 0, batch(2), &stored(None, &blocks)),
         BatchOutcome::Skipped,
         "a late batch of the old incarnation writes nothing"
     );
@@ -209,7 +280,7 @@ fn a_row_leaves_with_its_blocks_and_its_successor_starts_empty() {
         None,
         "the successor was not heard yet"
     );
-    store.admit(successor, 0, batch(7), &stored(None, &blocks[..2]));
+    store.drive(successor, 0, batch(7), &stored(None, &blocks[..2]));
     assert_eq!(
         held(&store, MODEL, &[1, 2, 3]),
         BTreeMap::from([(successor, 2), (b, 1)])
@@ -225,7 +296,7 @@ fn a_row_leaves_with_its_blocks_and_its_successor_starts_empty() {
     assert_eq!(store.indexed_blocks(successor, 0), 0);
     assert_eq!(store.kv().indexes(), 1);
     assert_eq!(
-        store.admit(successor, 0, batch(8), &stored(None, &blocks)),
+        store.drive(successor, 0, batch(8), &stored(None, &blocks)),
         BatchOutcome::Skipped
     );
     remove(b);
@@ -239,7 +310,7 @@ fn a_row_is_indexed_under_its_first_model_at_its_own_rank_when_it_asks_for_event
     // No row: nothing is heard and nothing is written.
     let stranger = WorkerId(9);
     assert_eq!(
-        store.admit(stranger, 0, batch(1), &stored(None, &blocks)),
+        store.drive(stranger, 0, batch(1), &stored(None, &blocks)),
         BatchOutcome::Skipped
     );
     assert_eq!(store.cursor(stranger, 0), None);
@@ -253,7 +324,7 @@ fn a_row_is_indexed_under_its_first_model_at_its_own_rank_when_it_asks_for_event
     let nameless = store.upsert(publisher("nameless", &[])).id();
     for id in [quiet, nameless] {
         assert_eq!(
-            store.admit(id, 0, batch(1), &stored(None, &blocks)),
+            store.drive(id, 0, batch(1), &stored(None, &blocks)),
             BatchOutcome::Skipped
         );
     }
@@ -261,7 +332,7 @@ fn a_row_is_indexed_under_its_first_model_at_its_own_rank_when_it_asks_for_event
     assert_eq!(store.unindexed_rows(), 0, "neither asks for a lane");
     // Two names: the first holds the blocks.
     let two = store.upsert(publisher("two", &["first", "second"])).id();
-    store.admit(two, 0, batch(1), &stored(None, &blocks));
+    store.drive(two, 0, batch(1), &stored(None, &blocks));
     assert_eq!(held(&store, "first", &[1, 2]), BTreeMap::from([(two, 2)]));
     assert_eq!(held(&store, "second", &[1, 2]), BTreeMap::new());
     // A rank's row takes its own rank's batches alone.
@@ -273,12 +344,12 @@ fn a_row_is_indexed_under_its_first_model_at_its_own_rank_when_it_asks_for_event
         })
         .id();
     assert_eq!(
-        store.admit(ranked, 0, batch(1), &stored(None, &blocks)),
+        store.drive(ranked, 0, batch(1), &stored(None, &blocks)),
         BatchOutcome::Skipped,
         "another rank's batch"
     );
     assert_eq!(
-        store.admit(ranked, 1, batch(1), &stored(None, &blocks)),
+        store.drive(ranked, 1, batch(1), &stored(None, &blocks)),
         BatchOutcome::Applied
     );
     assert_eq!(store.cursor(ranked, 1).expect("heard").applied, 1);
@@ -292,26 +363,8 @@ fn a_row_is_indexed_under_its_first_model_at_its_own_rank_when_it_asks_for_event
     store.upsert(publisher("two", &["second", "first"]));
     assert_eq!(held(&store, "first", &[1, 2]), BTreeMap::new());
     assert_eq!(store.indexed_blocks(two, 0), 0);
-    store.admit(two, 0, batch(1), &stored(None, &blocks));
+    store.drive(two, 0, batch(1), &stored(None, &blocks));
     assert_eq!(held(&store, "second", &[1, 2]), BTreeMap::from([(two, 2)]));
-}
-
-#[test]
-fn a_store_under_a_parent_the_worker_does_not_hold_starts_a_chain_and_is_counted() {
-    let store = MemoryStore::new();
-    let a = admitted(&store, "a");
-    let blocks = chain(&[1, 2, 3, 4]);
-    // The first half was never heard: the second half names a parent the
-    // index does not hold for this worker.
-    let tail = stored(Some(blocks[1].seq_hash), &blocks[2..]);
-    assert_eq!(store.admit(a, 0, batch(5), &tail), BatchOutcome::Applied);
-    assert_eq!(
-        store.lane_counts(a, 0).expect("a lane").parentless_stores,
-        1
-    );
-    assert_eq!(held(&store, MODEL, &[1, 2, 3, 4]), BTreeMap::new());
-    assert_eq!(held(&store, MODEL, &[3, 4]), BTreeMap::from([(a, 2)]));
-    assert_eq!(store.indexed_blocks(a, 0), 2);
 }
 
 #[test]
@@ -325,7 +378,7 @@ fn a_row_past_the_ceiling_stands_counted_until_its_own_write_finds_a_place() {
     let over = admitted(&store, "over");
     assert_eq!(store.unindexed_rows(), 1);
     assert_eq!(
-        store.admit(over, 0, batch(1), &stored(None, &blocks)),
+        store.drive(over, 0, batch(1), &stored(None, &blocks)),
         BatchOutcome::Skipped
     );
     // Written again while the index is full: one row stands out, however
@@ -351,12 +404,12 @@ fn a_row_past_the_ceiling_stands_counted_until_its_own_write_finds_a_place() {
     leave(ids[3]);
     assert_eq!(store.unindexed_rows(), 1);
     assert_eq!(
-        store.admit(over, 0, batch(1), &stored(None, &blocks)),
+        store.drive(over, 0, batch(1), &stored(None, &blocks)),
         BatchOutcome::Skipped
     );
     let next = admitted(&store, "next");
     assert_eq!(
-        store.admit(next, 0, batch(1), &stored(None, &blocks)),
+        store.drive(next, 0, batch(1), &stored(None, &blocks)),
         BatchOutcome::Applied
     );
     assert_eq!(rewritten(3), over);
@@ -366,7 +419,7 @@ fn a_row_past_the_ceiling_stands_counted_until_its_own_write_finds_a_place() {
     assert_eq!(rewritten(4), over);
     assert_eq!(store.unindexed_rows(), 0);
     assert_eq!(
-        store.admit(over, 0, batch(1), &stored(None, &blocks)),
+        store.drive(over, 0, batch(1), &stored(None, &blocks)),
         BatchOutcome::Applied
     );
     assert_eq!(
@@ -384,10 +437,10 @@ fn write_lent(lane: &mut LaneWriter<'_>, blocks: &[StoredBlock]) {
     placed.expect("stored");
 }
 
-/// A lent batch runs through the row's cursor as a typed one does. An
-/// admitted batch runs its body once, inside the lane's turn, and what the
-/// body writes is the row's. A batch the cursor skips or answers with a gap
-/// runs no body, and the typed admit goes on from the same cursor and map.
+/// A lent batch runs through the row's cursor. An admitted batch runs its
+/// body once, inside the lane's turn, and what the body writes is the
+/// row's. A batch the cursor skips or answers with a gap runs no body, and
+/// the next batch goes on from the same cursor and map.
 #[test]
 fn a_lent_batch_runs_its_body_where_the_cursor_admits_it() {
     let store = MemoryStore::new();
@@ -427,15 +480,15 @@ fn a_lent_batch_runs_its_body_where_the_cursor_admits_it() {
     assert_eq!(held(&store, MODEL, &[1, 2, 3]), BTreeMap::from([(a, 3)]));
     assert_eq!(store.indexed_blocks(a, 0), 3);
 
-    let evicted = [KvEvent::Removed(vec![blocks[2].seq_hash])];
-    assert_eq!(store.admit(a, 0, batch(2), &evicted), BatchOutcome::Applied);
+    let evicted = [Event::Removed(vec![blocks[2].seq_hash])];
+    assert_eq!(store.drive(a, 0, batch(2), &evicted), BatchOutcome::Applied);
     assert_eq!(held(&store, MODEL, &[1, 2, 3]), BTreeMap::from([(a, 2)]));
 }
 
 /// A lent body reads a value that moves each time the store empties the
-/// rank: a resync, a restart its cursor reads, the worker reported gone, a
-/// typed batch's clear. It stands still between them, and the body reads it
-/// over a map that is empty by then.
+/// rank: a resync, a restart its cursor reads, the worker reported gone.
+/// It stands still between them, and the body reads it over a map that is
+/// empty by then.
 #[test]
 fn a_lent_body_reads_each_emptying_of_its_rank() {
     let store = MemoryStore::new();
@@ -472,14 +525,6 @@ fn a_lent_body_reads_each_emptying_of_its_rank() {
     let (gone, held) = lent(1, false);
     assert_eq!(held, 0);
     assert_ne!(gone, restarted);
-    // A typed batch's clear empties the rank through the same routine.
-    assert_eq!(
-        store.admit(a, 0, batch(2), &[KvEvent::Cleared]),
-        BatchOutcome::Applied
-    );
-    let (cleared, held) = lent(3, false);
-    assert_eq!(held, 0);
-    assert_ne!(cleared, gone);
 }
 
 /// The store makes a row's lane again under the row's id: here the row
@@ -594,71 +639,13 @@ fn a_lent_body_that_unwinds_starts_its_lane_over() {
     assert_ne!(Some(next), first);
 }
 
-/// A stand-in for an index at a size cap: it places `room` blocks more and
-/// declines the rest.
-struct Capped {
-    room: usize,
-}
-
-impl Blocks for Capped {
-    fn stored(
-        &mut self,
-        blocks: &[StoredBlock],
-        _parent: Option<SequenceHash>,
-    ) -> Result<(), ApplyError> {
-        let placed = blocks.len().min(self.room);
-        self.room -= placed;
-        if placed < blocks.len() {
-            return Err(ApplyError::ArenaCapReached { placed });
-        }
-        Ok(())
-    }
-
-    fn removed(&mut self, _hashes: &[SequenceHash]) {}
-
-    fn cleared(&mut self) {}
-}
-
-#[test]
-fn blocks_an_index_declines_at_a_size_cap_are_counted() {
-    let mut cursor = RankCursor::default();
-    let mut capped = Capped { room: 3 };
-    let mut counts = LaneCounts::default();
-    // Five blocks where three fit: two are declined.
-    let (outcome, _) = admit(
-        &mut cursor,
-        &mut capped,
-        batch(1),
-        &stored(None, &chain(&[1, 2, 3, 4, 5])),
-        &mut counts,
-    );
-    assert_eq!(outcome, BatchOutcome::Applied);
-    assert_eq!(counts.refused_blocks, 2);
-    // No room is left: every block of the next store is declined.
-    let (outcome, _) = admit(
-        &mut cursor,
-        &mut capped,
-        batch(2),
-        &stored(None, &chain(&[6, 7, 8, 9])),
-        &mut counts,
-    );
-    assert_eq!(outcome, BatchOutcome::Applied);
-    assert_eq!(
-        counts,
-        LaneCounts {
-            parentless_stores: 0,
-            refused_blocks: 6,
-        }
-    );
-}
-
 #[test]
 fn a_snapshots_start_a_long_gap_and_a_clear_among_the_events_each_empty_the_rank() {
     let store = MemoryStore::new();
     let a = admitted(&store, "a");
     let old = chain(&[1, 2, 3]);
     let new = chain(&[7, 8]);
-    store.admit(a, 0, batch(1), &stored(None, &old));
+    store.drive(a, 0, batch(1), &stored(None, &old));
     // A snapshot's start empties the rank, and each of its chunks adds.
     let chunk = BatchFacts {
         sequence: 40,
@@ -670,16 +657,16 @@ fn a_snapshots_start_a_long_gap_and_a_clear_among_the_events_each_empty_the_rank
     store.resync(a, None, ResyncReason::Snapshot);
     assert_eq!(held(&store, MODEL, &[1, 2, 3]), BTreeMap::new());
     assert_eq!(
-        store.admit(a, 0, chunk, &stored(None, &new[..1])),
+        store.drive(a, 0, chunk, &stored(None, &new[..1])),
         BatchOutcome::Applied
     );
     let rest = stored(Some(new[0].seq_hash), &new[1..]);
-    assert_eq!(store.admit(a, 0, chunk, &rest), BatchOutcome::Applied);
+    assert_eq!(store.drive(a, 0, chunk, &rest), BatchOutcome::Applied);
     assert_eq!(held(&store, MODEL, &[7, 8]), BTreeMap::from([(a, 2)]));
     assert_eq!(store.resyncs(ResyncReason::Snapshot), 1);
     // A gap no replay fills, longer than the state is kept across.
     assert_eq!(
-        store.admit(a, 0, batch(50), &stored(None, &old)),
+        store.drive(a, 0, batch(50), &stored(None, &old)),
         BatchOutcome::Gap {
             expected: 41,
             received: 50
@@ -687,23 +674,23 @@ fn a_snapshots_start_a_long_gap_and_a_clear_among_the_events_each_empty_the_rank
     );
     let far = 42 + GAP_CLEAR_THRESHOLD;
     assert_eq!(
-        store.admit(a, 0, batch(far), &stored(None, &old[..1])),
+        store.drive(a, 0, batch(far), &stored(None, &old[..1])),
         BatchOutcome::Applied
     );
     assert_eq!(held(&store, MODEL, &[7, 8]), BTreeMap::new());
     assert_eq!(held(&store, MODEL, &[1]), BTreeMap::from([(a, 1)]));
     assert_eq!(store.resyncs(ResyncReason::GapCleared), 1);
     // A clear among the events of a batch below the cursor is a restarted
-    // publisher, whatever the header says: the blocks stored after it stay.
+    // publisher, said in the header: the blocks stored after it stay.
     let restarted = vec![
-        KvEvent::Cleared,
-        KvEvent::Stored {
+        Event::Cleared,
+        Event::Stored {
             parent: None,
             blocks: new.clone(),
         },
     ];
     assert_eq!(
-        store.admit(a, 0, batch(far - 5), &restarted),
+        store.drive(a, 0, batch(far - 5), &restarted),
         BatchOutcome::Applied
     );
     assert_eq!(held(&store, MODEL, &[1]), BTreeMap::new());
@@ -712,13 +699,20 @@ fn a_snapshots_start_a_long_gap_and_a_clear_among_the_events_each_empty_the_rank
     assert_eq!(store.cursor(a, 0).expect("heard").applied, far - 5);
 }
 
-/// One worker of the reference index, written by the lane's own admission.
+/// One worker of the reference index, emptied by the lane's own admission
+/// and written by the cases' events.
 struct Reference<'a> {
     index: &'a mut ReferenceIndexer,
     worker: u32,
 }
 
 impl Blocks for Reference<'_> {
+    fn cleared(&mut self) {
+        self.index.apply_cleared(self.worker);
+    }
+}
+
+impl Written for Reference<'_> {
     fn stored(
         &mut self,
         blocks: &[StoredBlock],
@@ -732,7 +726,7 @@ impl Blocks for Reference<'_> {
     }
 
     fn cleared(&mut self) {
-        self.index.apply_cleared(self.worker);
+        Blocks::cleared(self);
     }
 }
 
@@ -788,7 +782,7 @@ struct Engine {
 impl Engine {
     /// Serve the first `upto` blocks of `prompt`: every block not held is
     /// stored, each run of them under the block before it.
-    fn serve(&mut self, prompt: &[u64], upto: usize) -> Vec<KvEvent> {
+    fn serve(&mut self, prompt: &[u64], upto: usize) -> Vec<Event> {
         let blocks = chain(&prompt[..upto]);
         let mut events = Vec::new();
         let mut run: Vec<StoredBlock> = Vec::new();
@@ -797,7 +791,7 @@ impl Engine {
             let parent = depth.checked_sub(1).map(|at| blocks[at].seq_hash);
             if self.held.contains_key(&block.seq_hash) {
                 if !run.is_empty() {
-                    events.push(KvEvent::Stored {
+                    events.push(Event::Stored {
                         parent: run_parent,
                         blocks: std::mem::take(&mut run),
                     });
@@ -812,7 +806,7 @@ impl Engine {
             run.push(*block);
         }
         if !run.is_empty() {
-            events.push(KvEvent::Stored {
+            events.push(Event::Stored {
                 parent: run_parent,
                 blocks: run,
             });
@@ -821,7 +815,7 @@ impl Engine {
     }
 
     /// Evict up to `count` blocks, wherever they sit in their chains.
-    fn evict(&mut self, mix: &mut Mix, count: usize) -> Vec<KvEvent> {
+    fn evict(&mut self, mix: &mut Mix, count: usize) -> Vec<Event> {
         let mut names = Vec::new();
         for _ in 0..count.min(self.held.len()) {
             let at = mix.below(self.held.len());
@@ -833,19 +827,19 @@ impl Engine {
         if names.is_empty() {
             Vec::new()
         } else {
-            vec![KvEvent::Removed(names)]
+            vec![Event::Removed(names)]
         }
     }
 
     /// The cache as a relay retells it: every block under its parent,
     /// parents first, in two chunks.
-    fn snapshot(&self) -> [Vec<KvEvent>; 2] {
+    fn snapshot(&self) -> [Vec<Event>; 2] {
         let mut blocks: Vec<_> = self.held.iter().collect();
         blocks.sort_by_key(|(name, (_, _, depth))| (*depth, **name));
         let half = blocks.len().div_ceil(2);
         let mut chunks = [Vec::new(), Vec::new()];
         for (n, (name, (parent, content, _))) in blocks.into_iter().enumerate() {
-            chunks[usize::from(n >= half)].push(KvEvent::Stored {
+            chunks[usize::from(n >= half)].push(Event::Stored {
                 parent: *parent,
                 blocks: vec![StoredBlock {
                     seq_hash: *name,
@@ -861,11 +855,32 @@ impl Engine {
 enum Wire {
     Live,
     /// A batch held back: the next reveals the gap and the replay fills it.
-    Held(BatchFacts, Vec<KvEvent>),
+    Held(BatchFacts, Vec<Event>),
     /// A batch lost for good: the next reveals the gap and is lost with it.
     Lost,
     /// The gap was revealed and no replay comes: the next is lost history.
     Revealed,
+}
+
+/// One batch on the reference index as a lane takes it: through the lane's
+/// own admission, with a clear among the events said in the header, and the
+/// events written where the cursor admits the batch. The stores that came
+/// under a parent the worker does not hold are added to `parentless`.
+fn refer(
+    cursor: &mut RankCursor,
+    blocks: &mut Reference<'_>,
+    facts: BatchFacts,
+    events: &[Event],
+    parentless: &mut u64,
+) -> BatchOutcome {
+    let clears = facts.clears || events.iter().any(|e| matches!(e, Event::Cleared));
+    match by_cursor(cursor, blocks, facts, clears) {
+        Ok(_) => {
+            *parentless += write(blocks, events);
+            BatchOutcome::Applied
+        }
+        Err(outcome) => outcome,
+    }
 }
 
 /// The store's index answers every lookup as the reference index does when
@@ -883,20 +898,19 @@ fn the_sinks_apply_path_holds_the_index_to_the_reference_over_lossy_streams() {
             .collect();
         let mut reference = ReferenceIndexer::new();
         let mut cursors = [RankCursor::default(); WORKERS];
-        let mut counts = [LaneCounts::default(); WORKERS];
+        let mut parentless = 0u64;
         let mut engines: Vec<Engine> = (0..WORKERS).map(|_| Engine::default()).collect();
         let mut wires: Vec<Wire> = (0..WORKERS).map(|_| Wire::Live).collect();
         let mut compared = 0u64;
         for step in 0..STEPS {
             let w = mix.below(WORKERS);
-            let mut deliver = |facts: BatchFacts, events: &[KvEvent]| {
-                let outcome = store.admit(ids[w], 0, facts, events);
+            let mut deliver = |facts: BatchFacts, events: &[Event]| {
+                let outcome = store.drive(ids[w], 0, facts, events);
                 let mut blocks = Reference {
                     index: &mut reference,
                     worker: w as u32,
                 };
-                let (expected, _) =
-                    admit(&mut cursors[w], &mut blocks, facts, events, &mut counts[w]);
+                let expected = refer(&mut cursors[w], &mut blocks, facts, events, &mut parentless);
                 assert_eq!(outcome, expected, "seed {seed} step {step}");
             };
             let engine = &mut engines[w];
@@ -904,7 +918,7 @@ fn the_sinks_apply_path_holds_the_index_to_the_reference_over_lossy_streams() {
                 0 | 1 => engine.evict(&mut mix, 1 + step % 4),
                 2 if mix.below(6) == 0 => {
                     engine.held.clear();
-                    vec![KvEvent::Cleared]
+                    vec![Event::Cleared]
                 }
                 _ => {
                     let prompt = &prompts[mix.below(PROMPTS)];
@@ -957,7 +971,7 @@ fn the_sinks_apply_path_holds_the_index_to_the_reference_over_lossy_streams() {
                             index: &mut reference,
                             worker: w as u32,
                         };
-                        blocks.cleared();
+                        Blocks::cleared(&mut blocks);
                         let facts = BatchFacts {
                             snapshot: Some(SnapshotChunk {
                                 unknown_before: false,
@@ -965,9 +979,9 @@ fn the_sinks_apply_path_holds_the_index_to_the_reference_over_lossy_streams() {
                             ..facts
                         };
                         for chunk in &engine.snapshot() {
-                            let outcome = store.admit(ids[w], 0, facts, chunk);
-                            let (expected, _) =
-                                admit(&mut cursors[w], &mut blocks, facts, chunk, &mut counts[w]);
+                            let outcome = store.drive(ids[w], 0, facts, chunk);
+                            let expected =
+                                refer(&mut cursors[w], &mut blocks, facts, chunk, &mut parentless);
                             assert_eq!(outcome, expected, "seed {seed} step {step}");
                         }
                         // The engine's own cache is the answer the reference
@@ -1009,7 +1023,6 @@ fn the_sinks_apply_path_holds_the_index_to_the_reference_over_lossy_streams() {
                     reference.worker_block_count(worker as u32),
                     "seed {seed} step {step}: the blocks of worker {worker}"
                 );
-                assert_eq!(store.lane_counts(*id, 0), Some(counts[worker]));
             }
         }
         assert!(
@@ -1017,7 +1030,7 @@ fn the_sinks_apply_path_holds_the_index_to_the_reference_over_lossy_streams() {
             "seed {seed}: {compared} lookups found a holder"
         );
         assert!(
-            counts.iter().any(|count| count.parentless_stores > 0),
+            parentless > 0,
             "seed {seed}: no store met a parent the index had lost"
         );
     }
@@ -1041,12 +1054,12 @@ fn rows_apply_at_once_beside_a_reader() {
             scope.spawn(move || {
                 let mut contents = head.to_vec();
                 let mut blocks = chain(&contents);
-                store.admit(id, 0, batch(1), &stored(None, &blocks));
+                store.drive(id, 0, batch(1), &stored(None, &blocks));
                 for sequence in 2..=BATCHES {
                     contents.push(1_000 * (row as u64 + 1) + sequence);
                     let next = chain(&contents);
                     let parent = blocks.last().map(|block| block.seq_hash);
-                    let outcome = store.admit(
+                    let outcome = store.drive(
                         id,
                         0,
                         batch(sequence),
@@ -1083,34 +1096,12 @@ fn rows_apply_at_once_beside_a_reader() {
 }
 
 #[test]
-fn a_worker_that_holds_blocks_stores_under_a_parent_it_does_not_hold() {
-    let store = MemoryStore::new();
-    let a = admitted(&store, "a");
-    let first = chain(&[1, 2]);
-    assert_eq!(
-        store.admit(a, 0, batch(1), &stored(None, &first)),
-        BatchOutcome::Applied
-    );
-    // The worker holds blocks; the next store names a parent it never heard.
-    let other = chain(&[7, 8, 9, 10]);
-    let tail = stored(Some(other[1].seq_hash), &other[2..]);
-    assert_eq!(store.admit(a, 0, batch(2), &tail), BatchOutcome::Applied);
-    assert_eq!(
-        store.lane_counts(a, 0).expect("a lane").parentless_stores,
-        1
-    );
-    assert_eq!(store.indexed_blocks(a, 0), 4);
-    assert_eq!(held(&store, MODEL, &[9, 10]), BTreeMap::from([(a, 2)]));
-    assert_eq!(held(&store, MODEL, &[1, 2]), BTreeMap::from([(a, 2)]));
-}
-
-#[test]
 fn a_row_that_stops_asking_for_events_leaves_its_lane_and_its_blocks() {
     let store = MemoryStore::new();
     let a = admitted(&store, "a");
     let blocks = chain(&[1, 2, 3]);
     assert_eq!(
-        store.admit(a, 0, batch(1), &stored(None, &blocks)),
+        store.drive(a, 0, batch(1), &stored(None, &blocks)),
         BatchOutcome::Applied
     );
     assert_eq!(
@@ -1130,7 +1121,7 @@ fn a_row_that_stops_asking_for_events_leaves_its_lane_and_its_blocks() {
         (0, 0)
     );
     assert_eq!(
-        store.admit(a, 0, batch(2), &stored(None, &blocks)),
+        store.drive(a, 0, batch(2), &stored(None, &blocks)),
         BatchOutcome::Skipped
     );
 }
@@ -1140,7 +1131,7 @@ fn a_row_moved_to_another_first_model_leaves_nothing_in_the_old_index() {
     let store = MemoryStore::new();
     let two = store.upsert(publisher("two", &["first", "second"])).id();
     let blocks = chain(&[1, 2]);
-    store.admit(two, 0, batch(1), &stored(None, &blocks));
+    store.drive(two, 0, batch(1), &stored(None, &blocks));
     assert_eq!(
         (store.kv().indexes(), store.kv().held_blocks("first")),
         (1, 2)
@@ -1171,7 +1162,7 @@ fn a_snapshot_said_to_every_rank_of_its_engine_leaves_each_what_the_snapshot_hol
     let old = chain(&[1, 2, 3]);
     for (rank, &row) in (0u16..).zip(&ranks) {
         assert_eq!(
-            store.admit(row, rank, batch(5), &stored(None, &old)),
+            store.drive(row, rank, batch(5), &stored(None, &old)),
             BatchOutcome::Applied
         );
     }
@@ -1189,18 +1180,18 @@ fn a_snapshot_said_to_every_rank_of_its_engine_leaves_each_what_the_snapshot_hol
     };
     let new = chain(&[7, 8]);
     let first = vec![
-        KvEvent::Cleared,
-        KvEvent::Stored {
+        Event::Cleared,
+        Event::Stored {
             parent: None,
             blocks: new.clone(),
         },
     ];
     assert_eq!(
-        store.admit(ranks[0], 0, chunk, &first),
+        store.drive(ranks[0], 0, chunk, &first),
         BatchOutcome::Applied
     );
     assert_eq!(
-        store.admit(ranks[1], 1, chunk, &stored(None, &new)),
+        store.drive(ranks[1], 1, chunk, &stored(None, &new)),
         BatchOutcome::Applied
     );
     let blocks: Vec<usize> = (0u16..)
@@ -1212,7 +1203,7 @@ fn a_snapshot_said_to_every_rank_of_its_engine_leaves_each_what_the_snapshot_hol
     // The rank the snapshot left out starts over: a batch below where it
     // stood is its first, not a late one.
     assert_eq!(
-        store.admit(ranks[2], 2, batch(3), &stored(None, &old[..1])),
+        store.drive(ranks[2], 2, batch(3), &stored(None, &old[..1])),
         BatchOutcome::Applied
     );
     assert_eq!(store.indexed_blocks(ranks[2], 2), 1);
@@ -1235,18 +1226,18 @@ fn a_second_snapshot_leaves_nothing_of_the_first_and_a_chunk_alone_only_adds() {
     let (first, second) = (chain(&[1, 2, 3]), chain(&[7, 8]));
     store.resync(a, None, ResyncReason::Snapshot);
     assert_eq!(
-        store.admit(a, 0, chunk(40), &stored(None, &first)),
+        store.drive(a, 0, chunk(40), &stored(None, &first)),
         BatchOutcome::Applied
     );
     store.resync(a, None, ResyncReason::Snapshot);
     assert_eq!(
-        store.admit(a, 0, chunk(40), &stored(None, &second)),
+        store.drive(a, 0, chunk(40), &stored(None, &second)),
         BatchOutcome::Applied
     );
     assert_eq!(held(&store, MODEL, &[1, 2, 3]), BTreeMap::new());
     assert_eq!(held(&store, MODEL, &[7, 8]), BTreeMap::from([(a, 2)]));
     assert_eq!(
-        store.admit(a, 0, chunk(41), &stored(None, &first)),
+        store.drive(a, 0, chunk(41), &stored(None, &first)),
         BatchOutcome::Applied
     );
     assert_eq!(store.indexed_blocks(a, 0), 5);
@@ -1273,7 +1264,7 @@ fn an_abandoned_snapshot_keeps_its_blocks_and_starts_its_cursor_over() {
     let (first, second) = (chain(&[1, 2, 3]), chain(&[7, 8]));
     store.resync(a, None, ResyncReason::Snapshot);
     assert_eq!(
-        store.admit(a, 0, chunk(9), &stored(None, &first)),
+        store.drive(a, 0, chunk(9), &stored(None, &first)),
         BatchOutcome::Applied
     );
     store.resync(a, Some(1), ResyncReason::DataLoss);
@@ -1289,7 +1280,7 @@ fn an_abandoned_snapshot_keeps_its_blocks_and_starts_its_cursor_over() {
     store.resync(a, None, ResyncReason::Snapshot);
     assert_eq!(store.indexed_blocks(a, 0), 0);
     assert_eq!(
-        store.admit(a, 0, chunk(4), &stored(None, &second)),
+        store.drive(a, 0, chunk(4), &stored(None, &second)),
         BatchOutcome::Applied
     );
     assert_eq!(held(&store, MODEL, &[7, 8]), BTreeMap::from([(a, 2)]));
@@ -1308,26 +1299,26 @@ fn a_clear_in_the_middle_of_a_batch_below_the_cursor_is_a_restart() {
     let store = MemoryStore::new();
     let a = admitted(&store, "a");
     let (old, new) = (chain(&[1, 2, 3]), chain(&[7, 8]));
-    store.admit(a, 0, batch(9), &stored(None, &old));
+    store.drive(a, 0, batch(9), &stored(None, &old));
     let middle = vec![
-        KvEvent::Stored {
+        Event::Stored {
             parent: None,
             blocks: chain(&[5]),
         },
-        KvEvent::Cleared,
-        KvEvent::Stored {
+        Event::Cleared,
+        Event::Stored {
             parent: None,
             blocks: new,
         },
     ];
-    assert_eq!(store.admit(a, 0, batch(4), &middle), BatchOutcome::Applied);
+    assert_eq!(store.drive(a, 0, batch(4), &middle), BatchOutcome::Applied);
     assert_eq!(held(&store, MODEL, &[1, 2, 3]), BTreeMap::new());
     assert_eq!(held(&store, MODEL, &[7, 8]), BTreeMap::from([(a, 2)]));
     assert_eq!(store.indexed_blocks(a, 0), 2);
     assert_eq!(store.resyncs(ResyncReason::PublisherRestart), 1);
     assert_eq!(store.cursor(a, 0).expect("heard").applied, 4);
     assert_eq!(
-        store.admit(a, 0, batch(5), &stored(None, &old[..1])),
+        store.drive(a, 0, batch(5), &stored(None, &old[..1])),
         BatchOutcome::Applied
     );
 }
@@ -1340,7 +1331,7 @@ fn a_row_written_at_another_rank_starts_over_there() {
     let row = store.upsert(ranked("e", 0, 2)).id();
     let blocks = chain(&[1, 2, 3]);
     assert_eq!(
-        store.admit(row, 0, batch(1), &stored(None, &blocks)),
+        store.drive(row, 0, batch(1), &stored(None, &blocks)),
         BatchOutcome::Applied
     );
     let moved = WorkerFacts {
@@ -1350,215 +1341,14 @@ fn a_row_written_at_another_rank_starts_over_there() {
     assert_eq!(store.upsert(moved).id(), row, "the same row");
     assert_eq!(held(&store, MODEL, &[1, 2, 3]), BTreeMap::new());
     assert_eq!(
-        store.admit(row, 0, batch(2), &stored(None, &blocks)),
+        store.drive(row, 0, batch(2), &stored(None, &blocks)),
         BatchOutcome::Skipped,
         "its old rank"
     );
     assert_eq!(store.cursor(row, 1), None, "unheard at its new rank");
     assert_eq!(
-        store.admit(row, 1, batch(1), &stored(None, &blocks[..1])),
+        store.drive(row, 1, batch(1), &stored(None, &blocks[..1])),
         BatchOutcome::Applied
     );
     assert_eq!(store.indexed_blocks(row, 1), 1);
-}
-
-/// A pool's standing in its model's index: what a write keeps of it, and
-/// what moves it.
-mod named {
-    use std::{
-        sync::{atomic::Ordering, Arc},
-        time::Duration,
-    };
-
-    use super::{admitted, publisher, MODEL};
-    use crate::{
-        document::{AppliedSpec, PolicySpec},
-        engine::view::{Role, WorkerId},
-        store::{index::PoolIndex, MemoryStore, Signals, WorkerFacts, WorkersStore},
-    };
-
-    /// The preset whose picker takes a sample of sixteen, as a generation:
-    /// its warm-up stage rules who warms (a level of 1,024 blocks, half of
-    /// it thin, sixty seconds young).
-    fn sampled(generation: u64) -> AppliedSpec {
-        let mut document = PolicySpec::preset("cache_aware").expect("a preset of this build");
-        document.generation = generation;
-        AppliedSpec::validate(&document).expect("a preset validates")
-    }
-
-    /// `facts` registered: the row's id.
-    fn registered(store: &MemoryStore, facts: WorkerFacts) -> WorkerId {
-        let id = store.upsert(facts).id();
-        // The build this registration owes, asked: the cases read the row
-        // at once.
-        store.publish_now();
-        id
-    }
-
-    /// A row that joins another pool of the model takes an id of the
-    /// model's index, and the write that admits it keeps this pool's
-    /// standing. It tells the standing whole at the index's new count, so a
-    /// decision on it still asks its one question and looks up once.
-    #[test]
-    fn a_standing_kept_through_another_pools_take_is_whole_at_the_new_count() {
-        let store = MemoryStore::new();
-        store.apply(sampled(1)).expect("above the unbound start");
-        admitted(&store, "a");
-        admitted(&store, "b");
-        // The pool's standing, the count its tables are whole at, and the
-        // index's count of takes.
-        let stood = || {
-            store.deciding(|world| {
-                let standing = world.standing(MODEL, Role::Single).expect("the pool's");
-                let whole_at = standing.tables.taken.load(Ordering::Relaxed);
-                let index = standing.tables.index.as_ref().expect("an index");
-                (Arc::clone(&standing), whole_at, index.taken())
-            })
-        };
-        let (before, whole_at, taken) = stood();
-        assert_eq!(whole_at, taken);
-        let other = WorkerFacts {
-            role: Role::Decode,
-            ..publisher("d", &[MODEL])
-        };
-        registered(&store, other);
-        let (after, whole_at, taken_now) = stood();
-        assert!(Arc::ptr_eq(&before, &after), "the standing was kept");
-        assert_eq!(taken_now, taken + 1, "the other pool's row took an id");
-        assert_eq!(whole_at, taken_now);
-    }
-
-    /// A pool's standing in its model's index, as a world holds it.
-    type Standing = Arc<PoolIndex>;
-
-    /// A pool's standing goes with the pool where a write moves its place:
-    /// models that come one after another move the pools about, with a lane
-    /// and without one, and each pool that was there keeps its standing.
-    #[test]
-    fn a_pool_keeps_its_standing_where_a_write_moves_its_place() {
-        let store = MemoryStore::new();
-        store.apply(sampled(1)).expect("above the unbound start");
-        admitted(&store, "a");
-        let standing = |model: &str| {
-            store.deciding(|world| {
-                let standing = world.standing(model, Role::Single).expect("the pool's");
-                let held = |held: &Option<Standing>| {
-                    held.as_ref()
-                        .is_some_and(|held| Arc::ptr_eq(held, &standing))
-                };
-                let place = world.standings().iter().position(held);
-                (standing, place.expect("it stands in the list"))
-            })
-        };
-        let mut known = vec![(MODEL.to_string(), standing(MODEL))];
-        let mut moved = 0;
-        for n in 0..12 {
-            let model = format!("model-{n}");
-            let mut facts = publisher(&format!("w{n}"), &[model.as_str()]);
-            if n % 2 == 1 {
-                facts.signals = Signals::default();
-            }
-            registered(&store, facts);
-            for (model, (was, place)) in &mut known {
-                let (now, at) = standing(model);
-                assert!(Arc::ptr_eq(was, &now), "{model} after model-{n}");
-                moved += usize::from(at != *place);
-                *place = at;
-            }
-            known.push((model.clone(), standing(&model)));
-        }
-        // The case is of pools that moved: their order is the map's.
-        assert!(moved > 0);
-    }
-
-    /// A kept pool is found at its place among as many pools. A worker that
-    /// is the last of one model and comes back as the first of another
-    /// takes a pool out and brings one in: the pools are as many, the map
-    /// lays them in another order, and each pool that was there is read by
-    /// its own standing at the place the write gave it.
-    #[test]
-    fn a_kept_pool_is_found_at_its_place_among_as_many_pools() {
-        let store = MemoryStore::new();
-        store.apply(sampled(1)).expect("above the unbound start");
-        let standing = |model: &str| {
-            store.deciding(|world| {
-                let standing = world.standing(model, Role::Single).expect("the pool's");
-                let held = |held: &Option<Standing>| {
-                    held.as_ref()
-                        .is_some_and(|held| Arc::ptr_eq(held, &standing))
-                };
-                let place = world.standings().iter().position(held);
-                (standing, place.expect("it stands in the list"))
-            })
-        };
-        let mut known = Vec::new();
-        for n in 0..8 {
-            let model = format!("fixed-{n}");
-            registered(&store, publisher(&format!("f{n}"), &[model.as_str()]));
-            known.push(model);
-        }
-        registered(&store, publisher("hop", &["hop-0"]));
-        let pools = store.deciding(|world| world.standings().len());
-        let mut known: Vec<(String, (Standing, usize))> = known
-            .into_iter()
-            .map(|model| {
-                let at = standing(&model);
-                (model, at)
-            })
-            .collect();
-        let mut moved = 0;
-        for n in 1..=24 {
-            let model = format!("hop-{n}");
-            registered(&store, publisher("hop", &[model.as_str()]));
-            let now = store.deciding(|world| world.standings().len());
-            assert_eq!(now, pools, "as many pools after {model}");
-            for (model, (was, place)) in &mut known {
-                let (now, at) = standing(model);
-                assert!(Arc::ptr_eq(was, &now), "{model} after hop-{n}");
-                moved += usize::from(at != *place);
-                *place = at;
-            }
-        }
-        // The case is of pools that moved while their count stood.
-        assert!(moved > 0);
-    }
-
-    /// A lane's row admitted again under a new incarnation is a row of its
-    /// own id, and its lane takes the index id the one before it held. Of
-    /// the incarnations that follow one another, one whose id stands where
-    /// its row stood leaves as many rows, the same wires and the same ids
-    /// at the same places: its admission alone says the pool moved, and the
-    /// pool stands again by it.
-    #[test]
-    fn a_lanes_row_admitted_again_moves_its_pool_by_the_admission_alone() {
-        let store = MemoryStore::new();
-        store.apply(sampled(1)).expect("above the unbound start");
-        let (mut last, _) = (admitted(&store, "a"), admitted(&store, "b"));
-        let standing =
-            || store.deciding(|world| world.standing(MODEL, Role::Single).expect("the pool's"));
-        let mut held = 0;
-        for incarnation in 2..=16 {
-            let before = standing();
-            std::thread::sleep(Duration::from_millis(2));
-            let again = registered(
-                &store,
-                WorkerFacts {
-                    incarnation,
-                    ..publisher("a", &[MODEL])
-                },
-            );
-            assert_ne!(again, last);
-            last = again;
-            let after = standing();
-            // An id that stands elsewhere among the rows moves the places.
-            if before.tables.id_of != after.tables.id_of {
-                continue;
-            }
-            held += 1;
-            assert_ne!(before.tables.admitted, after.tables.admitted);
-            assert!(!Arc::ptr_eq(&before, &after));
-        }
-        // The case is of a row that took its place again.
-        assert!(held > 0);
-    }
 }

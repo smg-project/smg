@@ -7,9 +7,11 @@
 //! rooms of it the decode admission has claimed, and a row may run behind
 //! the prefill admission, which lets one prefill hold a bound of requests.
 //! A worker that is not on the sheet's one runtime names its own, a second
-//! known runtime or none: two workers of two known runtimes never pair. A
-//! row placed on the wire that carries one runtime's request (`grpc`) pairs
-//! a prefill of a known runtime first with its partners on that runtime
+//! known runtime or none: two workers of two known runtimes never pair, on
+//! either wire, because the recorder builds its index under the lenient
+//! pairing mode, which refuses a known runtime difference. A row placed on
+//! the wire that carries one runtime's request (`grpc`) pairs a prefill of
+//! a known runtime first with its partners on that runtime
 //! ([`FirstPartners`]).
 //!
 //! A row's requests are placed one after another and none changes what the
@@ -27,16 +29,22 @@
 //!
 //! [`APART`] names each recorded row this crate decides apart from the
 //! gateway, with its answer here.
+//!
+//! A row's pair classes are numbered by the replay from the row itself
+//! ([`pairing`]). A sheet replays a second way over the classes a
+//! controller derives for the same workers, by the store's pairing rule
+//! ([`replay_rows_by_rule`]).
 
 use serde::Deserialize;
 use serde_json::Value;
 use smg_policy_controller::{
-    document::{OverloadSpec, PolicySpec},
+    document::{self, OverloadSpec, PolicySpec},
     engine::{
         Candidate, Constraints, Decision, Engine, FirstPartners, Health, PairPools, PairTable,
-        PoolFacts, RequestFacts, Role, Scratch, ShedReason, WorkerId,
+        PartnerClasses, PoolFacts, RequestFacts, Role, Scratch, ShedReason, WireModes, WorkerId,
     },
     policies::power_of_two::PowerOfTwoMetric,
+    store::pairing::{Member, PairClasses, PairingDescriptor},
 };
 
 use crate::{same_shares, shares};
@@ -207,6 +215,15 @@ fn candidate(at: usize, first: u64, role: Role, worker: &Worker) -> Candidate {
     }
 }
 
+/// A row's pair classes as its decision reads them: each prefill's class
+/// and each decode's by its place, the table, and the first partners.
+struct Classes<'a> {
+    prefills: &'a [u32],
+    decodes: &'a [u32],
+    table: PairTable<'a>,
+    first: FirstPartners<'a>,
+}
+
 /// The pair classes of a row: each prefill is a class of its own, each
 /// decode a class numbered as the prefills' lists first name it (`0` for a
 /// decode no prefill pairs with), and the table's two slices follow. The
@@ -214,11 +231,64 @@ fn candidate(at: usize, first: u64, role: Role, worker: &Worker) -> Candidate {
 /// table's: its partners on its own known runtime, on the wire that carries
 /// one runtime's request. They are empty where no prefill has one.
 struct Pairing {
+    prefill_classes: Vec<u32>,
     decode_classes: Vec<u32>,
     ends: Vec<u32>,
     listed: Vec<u32>,
     first_ends: Vec<u32>,
     first_listed: Vec<u32>,
+}
+
+impl Pairing {
+    fn read(&self) -> Classes<'_> {
+        Classes {
+            prefills: &self.prefill_classes,
+            decodes: &self.decode_classes,
+            table: PairTable::new(&self.ends, &self.listed),
+            first: FirstPartners::new(&self.first_ends, &self.first_listed),
+        }
+    }
+}
+
+/// The pair classes of a row as a controller derives them: the store's
+/// pairing rule ([`PairClasses::derive`]) over what the row states of each
+/// worker, the wire it is placed on, its runtime and its transport, under
+/// the lenient mode the recorder builds its index under. Nothing of the
+/// replay's own numbering is read ([`pairing`]).
+fn derived(row: &Row) -> PartnerClasses {
+    fn members<'a>(
+        pool: &'a [Worker],
+        offers: &'a [PairingDescriptor],
+        wires: WireModes,
+        first: u64,
+    ) -> Vec<Member<'a>> {
+        (pool.iter().zip(offers).zip(first..))
+            .map(|((worker, offer), id)| {
+                let runtime = worker.runtime().unwrap_or("");
+                Member::new(WorkerId(id), wires, runtime, Some(offer))
+            })
+            .collect()
+    }
+    let offers = |pool: &[Worker]| -> Vec<PairingDescriptor> {
+        let offer = |worker: &Worker| {
+            let mut offer = PairingDescriptor {
+                transport: worker.transport.clone(),
+                ..PairingDescriptor::default()
+            };
+            offer.normalize();
+            offer
+        };
+        pool.iter().map(offer).collect()
+    };
+    let wires = match row.wire.as_deref() {
+        Some("grpc") => WireModes::GRPC,
+        _ => WireModes::HTTP,
+    };
+    let (of_prefills, of_decodes) = (offers(&row.prefills), offers(&row.decodes));
+    let prefills = members(&row.prefills, &of_prefills, wires, 1_000);
+    let decodes = members(&row.decodes, &of_decodes, wires, 2_000);
+    let classes = PairClasses::derive(&prefills, &decodes, document::Pairing::Lenient);
+    classes.by_place(prefills.iter().map(|_| true), decodes.iter().map(|_| true))
 }
 
 fn pairing(row: &Row) -> Pairing {
@@ -262,6 +332,7 @@ fn pairing(row: &Row) -> Pairing {
         first_ends.clear();
     }
     Pairing {
+        prefill_classes: (1..=row.prefills.len() as u32).collect(),
         decode_classes,
         ends,
         listed,
@@ -290,29 +361,27 @@ enum Here {
     None(&'static str, &'static str),
 }
 
-/// The row's requests decided one after another, with `draw` separating the
-/// seeds of a drawn row's runs.
-fn run(row: &Row, engine: &Engine, draw: u64) -> Result<Vec<Here>, String> {
-    let paired = pairing(row);
+/// The row's requests decided one after another over `classes`, with
+/// `draw` separating the seeds of a drawn row's runs.
+fn run(row: &Row, engine: &Engine, draw: u64, classes: &Classes<'_>) -> Result<Vec<Here>, String> {
     let prefills: Vec<Candidate> = (row.prefills.iter().enumerate())
         .map(|(at, worker)| Candidate {
-            pair_class: at as u32 + 1,
+            pair_class: classes.prefills[at],
             has_capacity: (row.prefill_bound).is_none_or(|bound| worker.in_flight < bound),
             ..candidate(at, 1_000, Role::Prefill, worker)
         })
         .collect();
     let decodes: Vec<Candidate> = (row.decodes.iter().enumerate())
         .map(|(at, worker)| Candidate {
-            pair_class: paired.decode_classes[at],
+            pair_class: classes.decodes[at],
             has_room: (worker.rooms).is_none_or(|rooms| rooms.admitted < rooms.window),
             ..candidate(at, 2_000, Role::Decode, worker)
         })
         .collect();
-    let table = PairTable::new(&paired.ends, &paired.listed);
+    let Classes { table, first, .. } = *classes;
     table
         .validate()
         .map_err(|clause| format!("the row's pair table: {clause}"))?;
-    let first = FirstPartners::new(&paired.first_ends, &paired.first_listed);
     first
         .within(&table)
         .map_err(|clause| format!("the row's first partners: {clause}"))?;
@@ -367,15 +436,30 @@ enum Replayed {
 }
 
 /// The row replayed in the form its outcome was recorded in, or the words
-/// this crate refuses its form in.
-fn replayed(row: &Row) -> Result<Replayed, String> {
+/// this crate refuses its form in. Its pair classes are the replay's own
+/// numbering of the row, or the pairing rule's where `by_rule` is set
+/// ([`derived`]).
+fn replayed(row: &Row, by_rule: bool) -> Result<Replayed, String> {
     let engine = engine(row)?;
+    let (own, ruled);
+    let classes = if by_rule {
+        ruled = derived(row);
+        Classes {
+            prefills: ruled.prefills(),
+            decodes: ruled.decodes(),
+            table: ruled.table(),
+            first: ruled.first(),
+        }
+    } else {
+        own = pairing(row);
+        own.read()
+    };
     let Outcome::Counts { draws, .. } = &row.outcome else {
-        return run(row, &engine, 0).map(Replayed::Sequence);
+        return run(row, &engine, 0, &classes).map(Replayed::Sequence);
     };
     let mut counts: Vec<(Here, u32)> = Vec::new();
     for draw in 0..u64::from(*draws) {
-        let [here] = run(row, &engine, draw)?[..] else {
+        let [here] = run(row, &engine, draw, &classes)?[..] else {
             return Err("a drawn row places one request".to_string());
         };
         match counts.iter_mut().find(|(answer, _)| *answer == here) {
@@ -474,8 +558,9 @@ struct Apart {
 ///
 /// The four rows of a prefill policy that weighs load against cache
 /// affinity itself replay as recorded: the gateway lifts the overload veto
-/// for such a policy while shedding is off, and a prefill profile that
-/// reads affinity runs with that veto lifted under a binding that steers.
+/// for such a policy while shedding is off, and a prefill profile one of
+/// whose scorers says the same of itself runs with that veto lifted under
+/// a binding that steers.
 const APART: &[Apart] = &[Apart {
     row: "pair-the-only-ready-prefills-partners-over-beside-a-free-decode",
     here: Held("overloaded"),
@@ -486,8 +571,8 @@ const APART: &[Apart] = &[Apart {
 /// answers are the recorded ones, or when [`APART`] names the row and its
 /// answers are its entry's. A row decided apart that replays as recorded is
 /// a defect too: its rule no longer decides it.
-fn replay(row: &Row) -> Vec<String> {
-    let here = match replayed(row) {
+fn replay(row: &Row, by_rule: bool) -> Vec<String> {
+    let here = match replayed(row, by_rule) {
         Ok(here) => here,
         Err(refused) => return vec![format!("refused here: {refused}")],
     };
@@ -508,6 +593,17 @@ fn replay(row: &Row) -> Vec<String> {
 
 /// The rows of a sheet replayed: how many, and what did not replay.
 pub fn replay_rows(text: &str, source: &str) -> (usize, Vec<String>) {
+    replay_by(text, source, false)
+}
+
+/// [`replay_rows`] over the pair classes a controller derives for each
+/// row's workers by the store's pairing rule ([`derived`]), where that
+/// replay numbers them from the row itself.
+pub fn replay_rows_by_rule(text: &str, source: &str) -> (usize, Vec<String>) {
+    replay_by(text, source, true)
+}
+
+fn replay_by(text: &str, source: &str, by_rule: bool) -> (usize, Vec<String>) {
     let sheet: Sheet = match serde_json::from_str(text) {
         Ok(sheet) => sheet,
         Err(err) => {
@@ -522,7 +618,7 @@ pub fn replay_rows(text: &str, source: &str) -> (usize, Vec<String>) {
         .iter()
         .flat_map(|row| {
             let name = &row.name;
-            replay(row)
+            replay(row, by_rule)
                 .into_iter()
                 .map(move |why| format!("{source}: {name}: {why}"))
         })

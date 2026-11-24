@@ -127,7 +127,10 @@
 //!   cleared by the first contact like any other. Workers that never pushed
 //!   a record (HTTP workers, older servicers, a stream still connecting)
 //!   are not judged by their silence: a poll every ten seconds and a probe
-//!   every minute is all that is expected of them. Tokens are contact too,
+//!   every minute is all that is expected of them. Nor is a worker whose
+//!   load monitor stopped, until its stream's next record: the stop takes
+//!   the mark of a stream that pushes off its workers, since a stopped
+//!   monitor polls nothing and may be handed no record. Tokens are contact too,
 //!   so a worker that still streams is never stale. A zero threshold turns
 //!   the rule off.
 //!
@@ -832,7 +835,12 @@ pub(crate) fn sweep(worker: &Arc<dyn Worker>) {
 }
 
 /// [`sweep`] at the given thresholds.
-fn sweep_with(worker: &Arc<dyn Worker>, stall: Duration, wedge: Duration, stale: Duration) {
+pub(crate) fn sweep_with(
+    worker: &Arc<dyn Worker>,
+    stall: Duration,
+    wedge: Duration,
+    stale: Duration,
+) {
     let state = worker.runtime_state();
     let state = state.as_deref();
     let load = state.map_or(0, WorkerRuntime::tracked_load);

@@ -315,13 +315,14 @@ impl<S> Answers<S> {
     /// each under the reasons a decider gives where its own last read
     /// finds the same.
     fn fenced(&self, decided: wire::Decided) -> proto::DecideAnswer {
-        let (id, term, decision, lease) = match decided {
+        let (id, term, decision, lease, encode) = match decided {
             wire::Decided::Decision {
                 id,
                 term,
                 decision,
                 lease,
-            } => (id, term, decision, lease),
+                encode,
+            } => (id, term, decision, lease, encode),
             wire::Decided::Frame(frame) => return frame,
         };
         let deciders = &self.shared.deciders;
@@ -335,7 +336,7 @@ impl<S> Answers<S> {
             None
         };
         let Some((reason, release)) = stopped else {
-            return wire::decided(id, term, &decision, lease.as_ref());
+            return wire::decided(id, term, &decision, lease.as_ref(), encode);
         };
         if let Some(leased) = lease {
             leased.given_up(&self.shared.store, &self.hand, release);
@@ -569,14 +570,16 @@ mod tests {
 
     use super::{serve, Answers, Streams, CLOSING, MAX_STREAMS, NO_SESSION, WINDOW};
     use crate::{
-        engine::view::WorkerId,
+        engine::view::{Role, WireModes, WorkerId},
         service::{
             controller::{
                 config::Scope,
                 decision_slots::{
                     tests::{
-                        busy, fleet, followed, frame, frame_for, gone, hearing, holder, lease_of,
-                        picked, preset, settled, Script, Step, BUDGET, PATIENCE,
+                        busy,
+                        encode::{encode_plan_in, frame_of, member_of, ENCODED, PUSHING},
+                        fleet, followed, frame, frame_for, gone, hearing, lease_of, picked, preset,
+                        settled, Script, Step, BUDGET, PATIENCE,
                     },
                     Clock, DecideStats, DecisionSlots, Job, Reads,
                 },
@@ -591,8 +594,9 @@ mod tests {
                 wire::{Checked, Decided, MAX_FRAME},
             },
             elector::{Elector, TickOutcome},
-            proto::{self, busy::Reason, decide_answer::Answer, identity::Form},
+            proto::{self, busy::Reason, decide_answer::Answer, decision::Outcome, identity::Form},
         },
+        stages::StageRegistry,
         store::{HealthSink, LeasesStore},
         tracking::lease::{LeaseId, ReleaseReason, DISPATCH_TTL},
     };
@@ -693,18 +697,21 @@ mod tests {
                 }
             })
         };
+        // One holder for the service's calls, the store's word to the engine
+        // and the bed's own deciders, as a replica has one.
+        let (store, feed, objects, loads) = followed((store, feed));
         let mut shared = Shared::new(
             ID.to_owned(),
             ADDRESS.to_owned(),
             &elector,
             stood.clone(),
-            followed((Arc::clone(&store), feed)),
-            Arc::new(crate::stages::StageRegistry::builtin()),
+            (Arc::clone(&store), feed, Arc::clone(&objects), loads),
+            Arc::new(StageRegistry::builtin()),
             deciders,
         )
         .expect("the deciders start");
         let reads = Reads {
-            objects: holder(&store),
+            objects,
             loads: frame_loads::silent(),
             store,
             fence: elector.fence(),
@@ -2031,6 +2038,62 @@ mod tests {
             (Reason::Unspecified, &[2][..])
         );
         bed.decides(&mut stream, 3, 1).await;
+    }
+
+    /// An encode request crosses the stream whole. A frame of the encode
+    /// phase that carries its items is answered its pair's pick, a lease a
+    /// side of the pair and each item's encoder beside them, as the wire
+    /// carries the three. A frame of another phase that carries items is out
+    /// of the field's range: it ends the stream by the field's name, and is
+    /// never decided without its items.
+    #[tokio::test]
+    async fn an_encode_requests_frame_is_answered_its_items_encoders_on_the_stream() {
+        let bed = bed().await;
+        let store = &bed.shared.store;
+        let later = encode_plan_in(&StageRegistry::builtin(), 2, ["random"; 3]);
+        store.apply(later).expect("a later generation");
+        let member = |name: &str, role| member_of(store, ENCODED, name, role, PUSHING);
+        let p = member("ep0", Role::Prefill);
+        let d = member("ed0", Role::Decode);
+        let e = member("ee0", Role::Encode);
+        let _seat = bed.welcomed(NAME, 1);
+        let mut stream = bed.opened(NAME).await;
+        stream
+            .send(frame_of(ENCODED, 1, 2, WireModes::NONE, None))
+            .await;
+        let answer = stream.answer().await;
+        assert_eq!((answer.request_id.as_slice(), answer.term), (&[1][..], 1));
+        let Some(Answer::Decision(decision)) = &answer.answer else {
+            panic!("a decision: {answer:?}");
+        };
+        let Some(Outcome::Pick(pick)) = &decision.outcome else {
+            panic!("a pick: {answer:?}");
+        };
+        let decode = |target: &proto::Target| target.pair.as_ref().map(|pair| pair.decode_id);
+        let named: Vec<_> = pick.targets.iter().map(|at| (at.id, decode(at))).collect();
+        assert_eq!(named, [(p.0, Some(d.0))]);
+        assert_eq!(
+            decision.leases.len(),
+            2,
+            "a lease a side, none for an encoder"
+        );
+        let placed = answer.encode.as_ref().expect("where the items go");
+        let encoders: Vec<u64> = placed.encoders.iter().map(|encoder| encoder.id).collect();
+        assert_eq!((encoders, placed.one), (vec![e.0, e.0], false));
+
+        let mut odd = frame_of(ENCODED, 2, 1, WireModes::NONE, None);
+        odd.facts
+            .as_mut()
+            .expect("the case's frame has facts")
+            .phase = proto::Phase::Prefill.into();
+        stream.send(odd).await;
+        assert_eq!(
+            stream.status().await,
+            (
+                Code::InvalidArgument,
+                "encode is out of its range in this protocol version".to_owned()
+            )
+        );
     }
 
     /// An answer carries its request's id back, and the id is its request's

@@ -61,9 +61,9 @@ pub(crate) fn view_headers() -> Vec<String> {
 /// keyed request with no routable pin and a keyless one alike: a random
 /// worker, the fewest requests in flight or the fewest session keys. With
 /// no stages of its own to delegate to, `delegate` and a binding without a
-/// rule read the fewest requests in flight. The picker itself ranks
-/// nothing: asked to pick (a side of a pair, where no sessions rule runs),
-/// it declines.
+/// rule read the fewest requests in flight. A side of a pair is placed the
+/// same way. The picker itself ranks nothing: asked to pick, as a side's
+/// shadow asks its profile, it declines.
 #[derive(Debug, Default)]
 pub struct Manual;
 

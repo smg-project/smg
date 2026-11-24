@@ -29,6 +29,7 @@
 use crate::{
     document::spec::{BindingSpec, RoutingKeySpec, SessionsSpec, ViewSpec, KEY_BYTES},
     engine::view::{fingerprint, Identity},
+    names::intern,
     policies::consistent_hashing::LentRing,
 };
 
@@ -48,8 +49,10 @@ pub struct KeySources {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Source {
-    /// The header's name; `None` for the request's own id.
-    header: Option<Box<str>>,
+    /// The header's name, kept for the life of the process: a key names
+    /// its source past the document it was derived under. `None` for the
+    /// request's own id.
+    header: Option<&'static str>,
     /// The most bytes of a value this source hands.
     max_bytes: usize,
     /// Whether the key leaves in the clear: the document lets a stage read
@@ -134,7 +137,7 @@ impl KeySources {
                     .header
                     .as_ref()
                     .is_none_or(|name| view.headers.contains(name)),
-                header: source.header.as_deref().map(Box::from),
+                header: source.header.as_deref().map(intern),
                 max_bytes: bytes(source.max_bytes.unwrap_or(KEY_BYTES)),
                 client: source.client,
             })
@@ -157,7 +160,7 @@ impl KeySources {
         let sources = named
             .iter()
             .map(|name| Source {
-                header: Some(name.as_str().into()),
+                header: Some(intern(name)),
                 max_bytes: bytes(KEY_BYTES),
                 plain: true,
                 client: false,
@@ -173,9 +176,7 @@ impl KeySources {
     /// The headers these sources read, in order: what a host keeps of a
     /// request for [`Self::derive`].
     pub fn headers(&self) -> impl Iterator<Item = &str> {
-        self.sources
-            .iter()
-            .filter_map(|source| source.header.as_deref())
+        self.sources.iter().filter_map(|source| source.header)
     }
 
     /// Whether a source is the request's own id: a host that reads it keeps
@@ -195,7 +196,7 @@ impl KeySources {
     /// measured as sent, and the request's id without them. `None` where no
     /// source holds a value: the request carries no key.
     pub fn derive<'a>(
-        &'a self,
+        &self,
         header: impl Fn(&str) -> Option<&'a [u8]>,
         rid: Option<&'a str>,
     ) -> Option<DerivedKey<'a>> {
@@ -205,7 +206,7 @@ impl KeySources {
     /// [`Self::derive`], with the key's text as its source handed it: the
     /// text a lent ring places the request by.
     fn session<'a>(
-        &'a self,
+        &self,
         header: &impl Fn(&str) -> Option<&'a [u8]>,
         rid: Option<&'a str>,
     ) -> Option<(DerivedKey<'a>, &'a str)> {
@@ -218,7 +219,7 @@ impl KeySources {
         };
         let mut session = self.sources.iter().filter(|source| !source.client);
         session.find_map(|source| {
-            let (key, from) = match &source.header {
+            let (key, from) = match source.header {
                 Some(name) => {
                     let value = header(name)?;
                     if value.is_empty() || value.len() > source.max_bytes {
@@ -264,7 +265,7 @@ impl KeySources {
     /// it can be handed: visible ASCII, and so text.
     fn client<'a>(&self, header: &impl Fn(&str) -> Option<&'a [u8]>) -> Option<&'a str> {
         let mut clients = self.sources.iter().filter(|source| source.client);
-        text(clients.find_map(|source| header(source.header.as_deref()?))?)
+        text(clients.find_map(|source| header(source.header?))?)
     }
 
     /// Whether the block names a target source: a host reads
@@ -301,7 +302,7 @@ impl KeySources {
     /// answers `true` for the request's model and phase, and `None` for any
     /// other: the ring is asked nothing then.
     pub fn derive_keys<'a>(
-        &'a self,
+        &self,
         header: impl Fn(&str) -> Option<&'a [u8]>,
         rid: Option<&'a str>,
         ring: Option<&dyn LentRing>,
@@ -317,7 +318,7 @@ impl KeySources {
     /// does where a header handed it, and nothing of a client's value or
     /// of one the request's own id handed.
     pub(crate) fn derive_keys_by<'a>(
-        &'a self,
+        &self,
         header: impl Fn(&str) -> Option<&'a [u8]>,
         rid: Option<&'a str>,
         place: impl FnOnce(&str, Option<KeySource<'a>>) -> Option<u64>,

@@ -11,11 +11,7 @@
 //! refused by its field's name and writes nothing. A lease the store does
 //! not hold is no error: its dispatch deadline may have ended it, or the
 //! gateway decided that request itself. Nor is a ticket: this build
-//! issues none, so the one a `Released` names is one it does not hold. A
-//! completion is written for a worker the store holds a row for and for
-//! no other, under the stream's own gateway, and a gateway's completions
-//! end with its presence: the health table grows with the rows and with
-//! who is present, never with what a frame names.
+//! issues none, so the one a `Released` names is one it does not hold.
 //!
 //! What a frame says of a lease is handed to the leases' file, never
 //! written by its session ([`MemoryStore::hand`]): the file's decider
@@ -74,10 +70,7 @@ pub(crate) fn dispatched(
     Ok(())
 }
 
-/// A `Completed` frame: the lease's side ends with its outcome, and the
-/// gateway's completion on the worker is written for the health
-/// precedence, whether or not the lease is on file: one routine says
-/// both ([`lease_words::completed`]).
+/// A `Completed` frame: the lease's side ends with its outcome.
 ///
 /// # Errors
 ///
@@ -86,12 +79,9 @@ pub(crate) fn completed(
     store: &MemoryStore,
     hand: &Hand,
     frame: &proto::Completed,
-    now: Instant,
 ) -> Result<(), Status> {
     let (lease, outcome) = outcome(frame)?;
-    lease_words::completed(store, hand.gateway(), &outcome, now, |said| {
-        store.hand(hand, lease, said);
-    });
+    store.hand(hand, lease, Said::Completed(outcome));
     Ok(())
 }
 
@@ -120,16 +110,17 @@ pub(crate) fn released(
 /// replica's worker objects, and asks them whether the worker a dispatch
 /// names stands at its rank ([`Objects::lists_rank`]).
 ///
-/// A replica gives it once, at the start of its deciders, and so before a
-/// session or a `Decide` stream opens a hand: the first word a store is
-/// given stays.
-pub(crate) fn tells(store: &MemoryStore, objects: &Arc<Objects<Members>>) {
+/// A replica gives it where its shared state is built, ahead of its
+/// deciders' start and so before a session or a `Decide` stream opens a
+/// hand. The first word a store is given stays, and the answer says
+/// whether this one was kept: a replica's own must be.
+pub(crate) fn tells(store: &MemoryStore, objects: &Arc<Objects<Members>>) -> bool {
     let objects = Arc::clone(objects);
     store.tell_through(move |store, world, found, said, by| {
         told(store, world, found, said, by, |id, rank| {
             objects.lists_rank(id, rank)
         });
-    });
+    })
 }
 
 /// Tells the engine what a frame said of a lease, whoever applies the
@@ -303,8 +294,8 @@ pub(crate) mod tests {
         },
         stages::{lifecycle::Lifecycle, registry::StageRegistry},
         store::{
-            DecodeSide, GatewayId, Hand, HealthSink, LeaseRecord, LeaseState, LeasesStore,
-            MemoryStore, PickRecord, WorkerFacts, WorkersStore,
+            DecodeSide, GatewayId, Hand, LeaseRecord, LeaseState, LeasesStore, MemoryStore,
+            PickRecord, WorkerFacts, WorkersStore,
         },
         tracking::{
             lease::{Dispatch, Lease, LeaseId, Outcome, ReleaseReason, Side, TransportClass},
@@ -493,7 +484,7 @@ pub(crate) mod tests {
         dispatched(&store, &open(&store, A), &a_dispatched(1), t0).expect("the frame reads");
         // The dispatch names the worker the lease books.
         assert_eq!(*heard.lock(), [("dispatched", 1, WorkerId(7))]);
-        completed(&store, &open(&store, A), &a_completed(1, served), t0).expect("the frame reads");
+        completed(&store, &open(&store, A), &a_completed(1, served)).expect("the frame reads");
         released(&store, &open(&store, A), &a_released(2)).expect("the frame reads");
         assert_eq!(
             heard.lock()[1..],
@@ -568,6 +559,7 @@ pub(crate) mod tests {
             target: d0,
             picked: PickRecord::of_decodes(&targets),
             session: Session::NONE,
+            session_verdict: SessionVerdict::None,
             state: LeaseState::ISSUED,
             tokens: 0,
             target_index: 0,
@@ -615,13 +607,8 @@ pub(crate) mod tests {
             ..a_completed(1, served)
         };
         for _ in 0..2 {
-            completed(
-                &store,
-                &open(&store, A),
-                &ended(proto::Side::Prefill, p),
-                now,
-            )
-            .expect("the frame reads");
+            completed(&store, &open(&store, A), &ended(proto::Side::Prefill, p))
+                .expect("the frame reads");
         }
         assert_eq!(heard.lock()[2..], [("completed", 1, p)]);
         // A release with no side ends what stands: the decode alone.
@@ -912,39 +899,13 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_completed_frame_ends_the_lease_and_writes_the_gateways_completion() {
+    fn a_completed_frame_ends_the_lease() {
         let store = MemoryStore::new();
         let t0 = Instant::now();
         let served = worker(&store, "http://a:8000");
         store.issue(lease(A, 1, t0)).expect("a lease");
-        completed(&store, &open(&store, A), &a_completed(1, served), t0).expect("the frame reads");
+        completed(&store, &open(&store, A), &a_completed(1, served)).expect("the frame reads");
         assert_eq!(state(&store, A, 1), None, "the lease ended");
-        assert!(store.completed_ok_since(A, served, t0));
-        assert!(
-            !store.completed_ok_since(B, served, t0),
-            "a completion is its gateway's own"
-        );
-    }
-
-    /// The gateway reports every request, the ones it decided itself among
-    /// them: the completion is a fact of the worker and the gateway.
-    #[test]
-    fn a_completed_frame_for_a_lease_not_on_file_still_writes_the_completion() {
-        let store = MemoryStore::new();
-        let t0 = Instant::now();
-        let served = worker(&store, "http://a:8000");
-        completed(&store, &open(&store, A), &a_completed(9, served), t0).expect("no error");
-        assert!(store.completed_ok_since(A, served, t0));
-    }
-
-    /// The health table grows with the rows, never with what a frame names.
-    #[test]
-    fn a_completion_for_a_worker_on_no_file_writes_nothing() {
-        let store = MemoryStore::new();
-        let t0 = Instant::now();
-        let gone = WorkerId(999_999);
-        completed(&store, &open(&store, A), &a_completed(9, gone), t0).expect("no error");
-        assert!(!store.completed_ok_since(A, gone, t0));
     }
 
     #[test]
@@ -962,7 +923,7 @@ pub(crate) mod tests {
         let t0 = Instant::now();
         store.issue(lease(A, 1, t0)).expect("a lease");
         dispatched(&store, &open(&store, A), &a_dispatched(2), t0).expect("no error");
-        completed(&store, &open(&store, A), &a_completed(2, WorkerId(7)), t0).expect("no error");
+        completed(&store, &open(&store, A), &a_completed(2, WorkerId(7))).expect("no error");
         released(&store, &open(&store, A), &a_released(2)).expect("no error");
         assert_eq!(state(&store, A, 1), Some(LeaseState::ISSUED));
         assert_eq!(store.live(A), 1);
@@ -1008,7 +969,7 @@ pub(crate) mod tests {
         let t0 = Instant::now();
         store.issue(lease(B, 1, t0)).expect("a lease");
         dispatched(&store, &open(&store, A), &a_dispatched(1), t0).expect("no error");
-        completed(&store, &open(&store, A), &a_completed(1, WorkerId(7)), t0).expect("no error");
+        completed(&store, &open(&store, A), &a_completed(1, WorkerId(7))).expect("no error");
         released(&store, &open(&store, A), &a_released(1)).expect("no error");
         assert_eq!(state(&store, B, 1), Some(LeaseState::ISSUED));
     }
@@ -1141,7 +1102,7 @@ pub(crate) mod tests {
                 ..a_completed(1, served)
             };
             refused(
-                completed(&store, &open(&store, A), &frame, t0),
+                completed(&store, &open(&store, A), &frame),
                 Code::InvalidArgument,
                 &none("Completed.side", number),
             );
@@ -1150,7 +1111,7 @@ pub(crate) mod tests {
                 ..a_completed(1, served)
             };
             refused(
-                completed(&store, &open(&store, A), &frame, t0),
+                completed(&store, &open(&store, A), &frame),
                 Code::InvalidArgument,
                 &none("Completed.class", number),
             );
@@ -1187,7 +1148,7 @@ pub(crate) mod tests {
             ..a_completed(1, served)
         };
         refused(
-            completed(&store, &open(&store, A), &frame, t0),
+            completed(&store, &open(&store, A), &frame),
             Code::InvalidArgument,
             "Completed.status is 65536: 65535 is the most it holds",
         );
@@ -1200,10 +1161,8 @@ pub(crate) mod tests {
             Code::InvalidArgument,
             "Released.what names neither a lease nor a ticket",
         );
-        // Nothing was written: the lease stands as issued and no
-        // completion is on file.
+        // Nothing was written: the lease stands as issued.
         assert_eq!(state(&store, A, 1), Some(LeaseState::ISSUED));
-        assert!(!store.completed_ok_since(A, served, t0));
     }
 
     /// The model of the cases of a profile's count of sends.
@@ -1260,6 +1219,69 @@ pub(crate) mod tests {
         dispatched(&store, &open(&store, A), &a_dispatched(1), t0).expect("the frame reads");
         assert_eq!(sends(&standing, served), 1);
         assert_eq!(sends(&first, served), 0, "the generation that left");
+    }
+
+    /// The `random` picker, whose call at a dispatch panics.
+    #[derive(Debug)]
+    struct Bursts;
+
+    impl Lifecycle for Bursts {
+        fn on_dispatched(&self, lease: &Lease, _: &Target, _: Side, _: u32) {
+            assert_eq!(lease.id.0, 0, "the stage's call panics");
+        }
+    }
+
+    impl Picker for Bursts {
+        fn name(&self) -> &'static str {
+            "bursts"
+        }
+
+        fn pick(
+            &self,
+            facts: &RequestFacts<'_>,
+            candidates: &[Candidate],
+            kept: &[u32],
+            scores: &[f32],
+            band: TieBand,
+            out: &mut Targets,
+        ) {
+            Random.pick(facts, candidates, kept, scores, band, out);
+        }
+    }
+
+    /// A single's dispatch is told in one order: the count of sends, the
+    /// session table, then the stages. A stage whose call panics at the
+    /// dispatch is held and counted as a fault, and the send is counted and
+    /// the session's pin moved all the same.
+    #[test]
+    fn a_stage_that_panics_at_a_dispatch_leaves_the_send_counted_and_the_pin_moved() {
+        let store = MemoryStore::new();
+        let t0 = Instant::now();
+        let served = ready(&store, "a", COUNTED, Role::Single, WireModes::HTTP);
+        let mut catalog = StageRegistry::builtin();
+        catalog
+            .picker("bursts", || Box::new(Bursts))
+            .expect("a free name");
+        let mut document = PolicySpec::preset("least_load").expect("a preset of this build");
+        document.generation = 1;
+        let profile = document.profiles.get_mut("least_load");
+        profile.expect("the preset's profile").pick = "bursts".into();
+        let digest = document.digest().expect("the document digests");
+        let spec = AppliedSpec::validate_digested(&document, digest, &catalog, &[])
+            .expect("the catalog holds the stage");
+        store.apply(spec).expect("a later generation");
+        let count = store.deciding(|world| Arc::clone(&world.spec().engine().sent_credits[0]));
+        let mut record = lease(A, 1, t0);
+        record.lease.generation = 1;
+        record.lease.session = KEY;
+        record.lease.session_verdict = SessionVerdict::Claimed(served);
+        record.target = served;
+        store.issue(record).expect("a lease");
+        dispatched(&store, &open(&store, A), &a_dispatched(1), t0).expect("the frame reads");
+        assert_eq!(store.lifecycle_faults(), 1, "the stage's call panicked");
+        assert_eq!(sends(&count, served), 1);
+        let pins = store.with_snapshot(|world| world.spec().engine().sessions().pins(KEY));
+        assert_eq!(pins.map(|pins| pins[0]), Some(served));
     }
 
     /// A dispatch that comes late enters no rank of a worker that left: a

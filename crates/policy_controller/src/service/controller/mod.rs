@@ -6,8 +6,7 @@
 //! controller's deciding threads, and, on the leader, the control scope's
 //! registration calls and the gateway scope's watch of the worker rows, and
 //! the run loop sweeps the gateways that are gone; the scopes' other call
-//! bodies arrive with the gateway, ingestion and control scope PRs, the
-//! ingestion drivers with their move out of the gateway. In the
+//! bodies arrive with the gateway, ingestion and control scope PRs. In the
 //! `elected` mode the gateway runs this same loop inside its process. A
 //! controller given a spec file runs its document, watches the file and
 //! answers `GetPolicySpec` and a dry run of `ApplyPolicySpec`
@@ -29,10 +28,12 @@
 //! and returns.
 //!
 //! Every replica runs the same loop, the load monitor's task included. A
-//! follower polls no engine and holds no load report: the monitor is
-//! stopped where a lead ends, and its snapshot is published empty. Its
-//! first poll goes out at its promotion. No load row is written to the
-//! store.
+//! follower polls no engine, drops the load records its workers' event
+//! streams carry and holds no load report: the monitor is stopped where a
+//! lead ends, and its snapshot is published empty. Its first poll goes out
+//! at its promotion. No load row is written to the store. The controller
+//! keeps no ingestion driver of its own: its loads come from this monitor
+//! and its cache events from the worker host's feed.
 //!
 //! Every socket a listener accepts is set to send at once: a small answer
 //! never waits for the peer's acknowledgement of the write before it.
@@ -472,6 +473,10 @@ impl Controller {
         // The load monitor is built stopped, ahead of the deciding threads:
         // each takes its channel at its start, and the serve runs its task.
         let monitor = worker_objects::LoadMonitor::new(&workers, config.load_poll_interval);
+        // The load records that ride the workers' event streams go to the
+        // monitor while this replica leads: the feed takes their sink
+        // ahead of its first stream.
+        kv_feed.set_load_sink(monitor.pushed());
         let mut shared = Shared::new(
             config.controller_id.clone(),
             address.unwrap_or_default(),
@@ -485,19 +490,29 @@ impl Controller {
         shared.lag = Arc::new(Lag::new(standby::synced_within(config.load_poll_interval)));
         let (phase, readiness) =
             readiness::channel(elector.fence(), steps, Arc::clone(&shared.lag));
-        #[cfg(feature = "discovery")]
-        let discovery = config.discovery.as_ref().map(|settings| {
-            let host = Arc::new(discovery::Host::new(
-                Arc::clone(workers.holder().registry()),
-                settings.credential().cloned(),
-            ));
-            Box::new(discovery::Discovery::new(
-                settings.runtime().clone(),
-                host,
-                Arc::clone(&shared.fence),
-            ))
-        });
         let shared = Arc::new(shared);
+        #[cfg(feature = "discovery")]
+        let discovery = config
+            .discovery
+            .as_ref()
+            .map(|settings| {
+                // The replica's own writes are admitted as a control call's
+                // are: under the term its store leads, read at each write.
+                let own = Service::new(Vec::new(), Arc::clone(&shared));
+                let door = membership::ReplicaMembershipWriter::new(
+                    Arc::clone(&shared.door),
+                    principal::Principal::replica(&config.controller_id),
+                    move || own.leading(std::time::Instant::now()),
+                );
+                discovery::Discovery::registering(
+                    settings,
+                    &workers.holder(),
+                    Arc::new(door),
+                    Arc::clone(&shared.fence),
+                )
+                .map(Box::new)
+            })
+            .transpose()?;
         Ok(Self {
             config,
             catalog,
@@ -1576,6 +1591,54 @@ mod tests {
             }
             terms.dedup();
             assert_eq!(terms, [1, 2], "the term of the mark, then the next");
+            stop.send(()).expect("the serve waits for its stop");
+        };
+        let (served, ()) = timeout(Duration::from_secs(60), async { tokio::join!(serve, case) })
+            .await
+            .expect("the serve ends at its stop");
+        served.expect("a serve that leaves by its signal");
+    }
+
+    /// The serve's presence sweep runs the upkeep of the engine its store
+    /// decides by, which runs no task of its own, and the store tells that
+    /// engine each worker that leaves. Served picks write the record of the
+    /// prefixes sent for their model. Once the model's last worker left,
+    /// the record is gone within the sweep's period, with no request behind
+    /// the leaves.
+    #[tokio::test]
+    async fn a_served_controller_keeps_no_sent_prefixes_of_a_model_whose_workers_left() {
+        let controller = Controller::bind(valid()).await.expect("the listeners bind");
+        let (shared, store) = (Arc::clone(&controller.shared), controller.store());
+        let (stop, stopped) = oneshot::channel::<()>();
+        let serve = controller.serve(async {
+            let _ = stopped.await;
+        });
+        let case = async {
+            let (wait, begun) = (Duration::from_secs(20), Instant::now());
+            while shared.fence.leader_term(Instant::now()).is_none() {
+                assert!(begun.elapsed() < wait, "no first take");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            let (singles, sides) = bed::fleet(&store);
+            let applied = store.apply(bed::preset("cache_aware", 1));
+            applied.expect("above the unbound start");
+            let records = || store.deciding(|world| world.front().affinity().held());
+            let (sender, mut answers) = mpsc::channel(64);
+            let read = bed::burst_of(&shared.deciders, &sender, &mut answers, bed::hashed).await;
+            assert!(read.iter().any(Result::is_ok), "no pick: {read:?}");
+            let sent = records();
+            assert!(
+                matches!(sent.as_slice(), [(_, workers)] if !workers.is_empty()),
+                "one model's record, of the workers its picks named: {sent:?}"
+            );
+            for id in singles.into_iter().chain(sides.map(|(_, id)| id)) {
+                let revision = store.get(id).expect("the row").revision;
+                store.remove(id, revision).expect("a removal");
+            }
+            while !records().is_empty() {
+                assert!(begun.elapsed() < wait, "a record no worker is left in");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
             stop.send(()).expect("the serve waits for its stop");
         };
         let (served, ()) = timeout(Duration::from_secs(60), async { tokio::join!(serve, case) })

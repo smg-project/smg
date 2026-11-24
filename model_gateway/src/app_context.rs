@@ -15,7 +15,7 @@ use smg_data_connector::{
 use smg_external_router::realtime::webrtc::default_bind_addr;
 use smg_mcp::McpOrchestrator;
 use smg_policy_controller::{
-    document::AppliedSpec,
+    document::{AppliedSpec, PolicySpec},
     engine::{CacheIndexes, Members, PolicyEngine, WorkerData},
     stages::StageRegistry,
 };
@@ -42,7 +42,7 @@ use crate::{
     config::{ParserChoice, RouterConfig},
     middleware::{AuthConfig, TokenBucket},
     observability::inflight_tracker::InFlightRequestTracker,
-    policies::{kv_index::event_monitor::KvEventMonitor, PolicyRegistry},
+    policies::{kv_index::event_monitor::KvEventMonitor, EngineCaches, PolicyRegistry},
     rate_limit::RateLimitManager,
     rl_adapter,
     routers::{
@@ -1026,11 +1026,11 @@ impl AppContextBuilder {
     }
 
     /// The policy document this process runs under the policy controller
-    /// (`policy_controller: on`), checked: the document in force, which is
-    /// the one the routing settings mean or a supplied one, validated
-    /// against `stages`. A host's table holds the stock stages and the
-    /// host's own, so a supplied document may name both. With no table the
-    /// document is validated against the stock one. `None` where the
+    /// (`policy_controller: on`), with its checked form: the document in
+    /// force, which is the one the routing settings mean or a supplied one,
+    /// validated against `stages`. A host's table holds the stock stages and
+    /// the host's own, so a supplied document may name both. With no table
+    /// the document is validated against the stock one. `None` where the
     /// configuration leaves the classic policies in place.
     ///
     /// A document that is refused ends the start with the refusal's own
@@ -1049,7 +1049,7 @@ impl AppContextBuilder {
     fn policy_in_force(
         config: &RouterConfig,
         stages: Option<&StageRegistry>,
-    ) -> Result<Option<AppliedSpec>, String> {
+    ) -> Result<Option<(PolicySpec, AppliedSpec)>, String> {
         if !config.policy_controller {
             return Ok(None);
         }
@@ -1077,17 +1077,19 @@ impl AppContextBuilder {
             None => config.hosted_policy(&document, &StageRegistry::builtin()),
         };
         checked
-            .map(Some)
+            .map(|spec| Some((document, spec)))
             .map_err(|refused| format!("policy controller: {refused}"))
     }
 
     /// Starts the policy engine over `policy`, where the configuration runs
-    /// the policy controller: the checked document [`Self::policy_in_force`]
-    /// answered. It is the last step of the start, so the engine is handed
-    /// where this process keeps its workers' data, each once: the worker
-    /// registry, the load monitor's channel and the cache-event monitor.
-    fn with_policy_engine(self, policy: Option<AppliedSpec>) -> Result<Self, String> {
-        let Some(spec) = policy else {
+    /// the policy controller: the document [`Self::policy_in_force`]
+    /// answered, with its checked form. It is the last step of the start,
+    /// so the engine is handed where this process keeps its workers' data,
+    /// each once: the worker registry, the load monitor's channel, and the
+    /// cache-event monitor with the token trees the engine is lent
+    /// ([`Self::engine_caches`]).
+    fn with_policy_engine(self, policy: Option<(PolicySpec, AppliedSpec)>) -> Result<Self, String> {
+        let Some((document, spec)) = policy else {
             return Ok(self);
         };
         let unset = |field: &str| format!("{field} must be set before the policy engine");
@@ -1107,13 +1109,43 @@ impl AppContextBuilder {
             .kv_event_monitor
             .as_ref()
             .ok_or_else(|| unset("kv_event_monitor"))?;
+        let events = Some(cache_events);
         let data = WorkerData {
             registry: Arc::clone(registry) as Arc<dyn Members>,
             loads: Some(monitor.subscribe()),
-            cache_indexes: Some(Arc::clone(cache_events) as Arc<dyn CacheIndexes>),
+            cache_indexes: Self::engine_caches(&document, &spec, events, policies, registry),
         };
         Self::start_policy_engine(spec, data, policies)?;
         Ok(self)
+    }
+
+    /// What the engine is handed of this process's caches, as one object
+    /// ([`EngineCaches`]): `events`, the cache-event monitor where the
+    /// process keeps one, and the token trees the engine is lent.
+    ///
+    /// With the engine on no classic policy object is built, so no policy
+    /// keeps the trees of the prompts this process sent. The start asks the
+    /// registry for them in a policy's place
+    /// ([`PolicyRegistry::lend_token_trees`]), and only where `spec`, the
+    /// checked form of `document`, reads the prefixes sent to each worker:
+    /// the document's own word, whatever the settings name the policy. The
+    /// trees take the document's numbers too: its block size, and each
+    /// model's `index` entry. They follow `workers`, the registry the engine
+    /// is handed: a worker it lost is taken out of them. `None` where the
+    /// process keeps neither a monitor nor trees.
+    fn engine_caches(
+        document: &PolicySpec,
+        spec: &AppliedSpec,
+        events: Option<&Arc<KvEventMonitor>>,
+        policies: &PolicyRegistry,
+        workers: &WorkerRegistry,
+    ) -> Option<Arc<dyn CacheIndexes>> {
+        let trees = spec
+            .needs()
+            .sent_prefixes
+            .then(|| policies.lend_token_trees(document, spec.block_size(), workers));
+        let caches = EngineCaches::of(events.cloned(), trees)?;
+        Some(Arc::new(caches) as Arc<dyn CacheIndexes>)
     }
 
     /// Starts the policy engine that places every request of this process:
@@ -1150,7 +1182,8 @@ impl AppContextBuilder {
     /// configuration that leaves the policy controller off starts nothing.
     /// The engine is handed the test's worker registry and its load
     /// monitor's channel. Such a context keeps no cache-event monitor, so
-    /// the engine is handed none.
+    /// the engine is handed none, and the token trees it is lent where its
+    /// document reads them (`engine_caches`).
     #[cfg(any(test, feature = "test-util"))]
     pub fn start_policy_engine_by_hand(
         config: &RouterConfig,
@@ -1159,11 +1192,11 @@ impl AppContextBuilder {
         registry: &Arc<WorkerRegistry>,
         monitor: &WorkerMonitor,
     ) -> Result<(), String> {
-        if let Some(spec) = Self::policy_in_force(config, stages)? {
+        if let Some((document, spec)) = Self::policy_in_force(config, stages)? {
             let data = WorkerData {
                 registry: Arc::clone(registry) as Arc<dyn Members>,
                 loads: Some(monitor.subscribe()),
-                cache_indexes: None,
+                cache_indexes: Self::engine_caches(&document, &spec, None, policies, registry),
             };
             Self::start_policy_engine(spec, data, policies)?;
         }
@@ -1177,8 +1210,9 @@ impl AppContextBuilder {
     /// them for a test. The engine is handed the bench's worker registry and
     /// `loads`, the channel of the load feed the bench publishes where a
     /// monitor would. A bench keeps no cache-event monitor, so the engine is
-    /// handed none. A configuration that leaves the policy controller off
-    /// starts nothing.
+    /// handed none, and the token trees it is lent where its document reads
+    /// them (`engine_caches`). A configuration that leaves the policy
+    /// controller off starts nothing.
     #[cfg(any(test, feature = "test-util"))]
     pub fn start_policy_engine_for_bench(
         config: &RouterConfig,
@@ -1186,11 +1220,11 @@ impl AppContextBuilder {
         registry: &Arc<WorkerRegistry>,
         loads: Option<LoadReceiver>,
     ) -> Result<(), String> {
-        if let Some(spec) = Self::policy_in_force(config, None)? {
+        if let Some((document, spec)) = Self::policy_in_force(config, None)? {
             let data = WorkerData {
                 registry: Arc::clone(registry) as Arc<dyn Members>,
                 loads,
-                cache_indexes: None,
+                cache_indexes: Self::engine_caches(&document, &spec, None, policies, registry),
             };
             Self::start_policy_engine(spec, data, policies)?;
         }
@@ -1662,6 +1696,217 @@ mod tests {
             monitor.upgrade().is_none(),
             "the worker monitor outlives its context"
         );
+    }
+
+    /// The start lends the policy engine the gateway's own token trees
+    /// where the document in force reads the prefixes sent to each worker,
+    /// and makes none under a document that reads none. Under `cache_aware`
+    /// a conversation's next turns then go back to the worker its first turn
+    /// was sent to, and the model's tree holds the conversation for that
+    /// worker alone.
+    ///
+    /// The classic policy keeps such a tree itself and reads it the same
+    /// way (`model_gateway/src/policies/cache_aware.rs`,
+    /// `select_worker_with_tokens`).
+    #[tokio::test]
+    async fn the_start_lends_the_engine_the_token_trees_its_document_reads() {
+        use std::time::Instant;
+
+        use openai_protocol::worker::RuntimeType;
+
+        use crate::routers::common::{
+            placement::{select_single, PlacementInputs, Stated},
+            snapshot::{test_support::grpc_worker, RoutingPool},
+        };
+
+        let started = |policy: PolicyConfig| async {
+            let mut config = config_with_policy(policy);
+            config.policy_controller = true;
+            config.health_check.disable_health_check = true;
+            let context = AppContext::from_config(config, 30, None, None).await;
+            context.expect("a context")
+        };
+        let plain = started(PolicyConfig::RoundRobin).await;
+        assert!(plain.policy_registry.engine().is_some());
+        assert!(plain.policy_registry.lent_trees().is_none());
+
+        let context = started(PolicyConfig::cache_aware(0.5, 32, 1.1, 0, 4096)).await;
+        let trees = context.policy_registry.lent_trees();
+        let trees = trees.expect("the start made the trees");
+        for at in 0..4 {
+            let url = format!("grpc://w{at}:9000");
+            let worker = grpc_worker(&url, "m", RuntimeType::Vllm, &[]);
+            context.worker_registry.register(worker).expect("a worker");
+        }
+        let turn = |said: &[u32]| {
+            let inputs = PlacementInputs {
+                tokens: Some(said),
+                ..PlacementInputs::default()
+            };
+            let placed = select_single(
+                &context.worker_registry,
+                &context.policy_registry,
+                "m",
+                RoutingPool::GrpcPipelineRegular,
+                None,
+                inputs,
+                Stated::nothing,
+            );
+            placed.expect("a worker").into_worker().url().to_owned()
+        };
+        let mut said: Vec<u32> = (0..256).collect();
+        let first = turn(&said);
+        for next in 1..8_u32 {
+            said.extend(next * 1_000_000..next * 1_000_000 + 16);
+            assert_eq!(turn(&said), first, "turn {next}");
+        }
+        let tree = trees.token_tree("m");
+        let held: Vec<String> = tree.get_tenant_token_counts().into_keys().collect();
+        assert_eq!(held, [first.as_str()]);
+
+        // The start made the trees with the task that follows the context's
+        // own registry: the worker that leaves it is taken out of them.
+        let registry = &context.worker_registry;
+        registry.remove_by_url(&first).expect("the removal");
+        let bound = Instant::now() + Duration::from_secs(60);
+        while !tree.get_tenant_token_counts().is_empty() {
+            assert!(Instant::now() < bound, "the trees' task never purged");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+
+        // The trees take the document's numbers. The document the settings
+        // mean states the settings' block size. A supplied document states
+        // its own, whatever policy the settings name.
+        let mut paged = PolicyConfig::cache_aware(0.5, 32, 1.1, 0, 4096);
+        if let PolicyConfig::CacheAware { block_size, .. } = &mut paged {
+            *block_size = 8;
+        }
+        let supplied = config_with_policy(paged.clone()).policy_document();
+        let by_settings = started(paged).await.policy_registry.lent_trees();
+        let by_settings = by_settings.expect("the start made the trees");
+        assert_eq!(by_settings.token_tree("m").page_size(), 8);
+        let mut config = RouterConfig {
+            policy_controller: true,
+            policy_spec: Some(supplied.expect("the settings' document")),
+            ..RouterConfig::default()
+        };
+        config.health_check.disable_health_check = true;
+        let context = AppContext::from_config(config, 30, None, None).await;
+        let by_document = context.expect("a context").policy_registry.lent_trees();
+        let by_document = by_document.expect("the supplied document reads sent prefixes");
+        assert_eq!(by_document.token_tree("m").page_size(), 8);
+
+        // The start a test makes by hand lends the trees by the same rule.
+        let mut config = config_with_policy(PolicyConfig::cache_aware(0.5, 32, 1.1, 0, 4096));
+        config.policy_controller = true;
+        let policies = Arc::new(PolicyRegistry::of_config(&config));
+        let registry = Arc::new(WorkerRegistry::new());
+        let monitor =
+            WorkerMonitor::new(Arc::clone(&registry), Arc::clone(&policies), 1, false, true);
+        let by_hand = AppContextBuilder::start_policy_engine_by_hand(
+            &config, None, &policies, &registry, &monitor,
+        );
+        by_hand.expect("the settings' own document");
+        assert!(policies.lent_trees().is_some());
+    }
+
+    /// A model whose index of cache events holds no block is decided in the
+    /// token tree the gateway lends, and its list leaves the tree once the
+    /// index holds a block. A gRPC model's index stands from the enrolment
+    /// of its first worker, so the gateway answers the engine no index
+    /// while it holds none (`KvEventMonitor`'s `CacheIndexes::index`).
+    /// Until the first cache event a conversation's turns are stored in the
+    /// tree and return by it. The engine reads the index again when it
+    /// reads its table of the list again, a second at most behind the
+    /// block, and from then on no prompt is written to the tree.
+    ///
+    /// The classic policy reads an index that holds no block as no index
+    /// and then reads its own token tree
+    /// (`model_gateway/src/policies/cache_aware.rs:1800`, `event_index_for`).
+    /// It asks at each request, so it leaves its tree with the block.
+    #[tokio::test]
+    async fn a_model_whose_index_holds_no_block_is_decided_in_the_lent_tree() {
+        use std::time::Instant;
+
+        use kv_index::{ContentHash, SequenceHash, StoredBlock};
+        use openai_protocol::worker::RuntimeType;
+
+        use crate::{
+            policies::kv_index::index_backend::{KvIndex, WorkerBlocks},
+            routers::common::{
+                placement::{select_single, PlacementInputs, Stated},
+                snapshot::{test_support::grpc_worker, RoutingPool},
+            },
+        };
+
+        let mut config = config_with_policy(PolicyConfig::cache_aware(0.5, 32, 1.1, 0, 4096));
+        config.policy_controller = true;
+        config.health_check.disable_health_check = true;
+        let context = AppContext::from_config(config, 30, None, None).await;
+        let context = context.expect("a context");
+        let trees = context.policy_registry.lent_trees();
+        let tree = trees.expect("the start made the trees").token_tree("m");
+        // The model's index as the enrolment of its first worker leaves it.
+        let monitor = context.kv_event_monitor.as_ref();
+        let index = Arc::new(KvIndex::chain());
+        monitor
+            .expect("the monitor")
+            .set_index("m", Arc::clone(&index));
+        for at in 0..4 {
+            let url = format!("grpc://w{at}:9000");
+            let worker = grpc_worker(&url, "m", RuntimeType::Vllm, &[]);
+            context.worker_registry.register(worker).expect("a worker");
+        }
+        let turn = |said: &[u32]| {
+            let inputs = PlacementInputs {
+                tokens: Some(said),
+                ..PlacementInputs::default()
+            };
+            let placed = select_single(
+                &context.worker_registry,
+                &context.policy_registry,
+                "m",
+                RoutingPool::GrpcPipelineRegular,
+                None,
+                inputs,
+                Stated::nothing,
+            );
+            placed.expect("a worker").into_worker().url().to_owned()
+        };
+        let mut said: Vec<u32> = (0..256).collect();
+        let first = turn(&said);
+        for next in 1..8_u32 {
+            said.extend(next * 1_000_000..next * 1_000_000 + 16);
+            assert_eq!(turn(&said), first, "turn {next}");
+        }
+        let held: Vec<String> = tree.get_tenant_token_counts().into_keys().collect();
+        assert_eq!(held, [first.as_str()]);
+
+        // A worker's first event stores a block.
+        let worker = index.intern_worker("grpc://w0:9000").expect("a number");
+        let block = StoredBlock {
+            seq_hash: SequenceHash(1),
+            content_hash: ContentHash(101),
+        };
+        let stored = index.apply_stored(worker, &[block], None, &mut WorkerBlocks::default());
+        stored.expect("a block stored");
+        // Each prompt is one no worker was sent. While the list reads the
+        // tree the prompt is written there, and once the list left the tree
+        // no count moves.
+        let counted = || tree.get_tenant_token_counts().into_values().sum::<usize>();
+        let bound = Instant::now() + Duration::from_secs(60);
+        let mut prompt = 100_u32;
+        loop {
+            let before = counted();
+            prompt += 1;
+            let fresh: Vec<u32> = (prompt * 1_000_000..prompt * 1_000_000 + 64).collect();
+            turn(&fresh);
+            if counted() == before {
+                break;
+            }
+            assert!(Instant::now() < bound, "the list never left the tree");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
 
     /// A context built on a runtime starts the task that fills the hash

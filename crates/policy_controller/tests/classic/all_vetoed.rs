@@ -381,7 +381,7 @@ pub fn replay_on_a_lent_ring(text: &str) -> (usize, Vec<String>) {
     let sheet: Rows<Row> = serde_json::from_str(text).expect("a sheet of these rows");
     let ring_rows = sheet.rows.iter().filter(|row| row.ring_key.is_some());
     let verdicts: Vec<Option<String>> = ring_rows
-        .map(|row| verdict(&row.name, &row.outcome, &replay(row, true)))
+        .map(|row| verdict(&row.outcome, &replay(row, true)))
         .collect();
     (verdicts.len(), verdicts.into_iter().flatten().collect())
 }

@@ -30,11 +30,21 @@
 //! request's frame is, over the list of its own phase's role
 //! ([`decide_alone`]).
 //!
-//! An encode request has no decision here yet, and a decode frame that
-//! names no lease has none under a plan that pairs its phase: their
-//! deciding thread answers them `Busy` and reads no list for them.
+//! An encode request is its pair's one request, read at the prefill phase
+//! ([`Checked::carries_items`]): [`decide_encode`] decides it over its
+//! model's three lists, the pair's two and the encoders', by the engine's
+//! entry for the three ([`PolicyEngine::decide_encode_without_lease`]).
+//! Its pick is issued as a pair's is ([`issue_pair`]), with no lease for an
+//! encoder, and its answer names each item's encoder
+//! ([`FrameBuffers::answered`]).
+//!
+//! A frame of the encode phase that carries no items has no decision here,
+//! and a decode frame that names no lease has none under a plan that pairs
+//! its phase: their deciding thread answers them `Busy` and reads no list
+//! for them.
 
 use std::{
+    mem,
     panic::{catch_unwind, AssertUnwindSafe},
     sync::{atomic::Ordering, Arc},
 };
@@ -45,21 +55,21 @@ use tracing::error;
 use super::{
     decision_slots::{DecisionCall, Part},
     frame_request::FrameRequest,
-    gateway_places::{Asking, GatewayPlaces, Taken},
+    gateway_places::{Asking, GatewayPlaces, Held, Taken},
     lease_words::{issued_later, issuing},
-    wire::{Checked, Lists},
+    wire::{spent_keys, Checked, ItemsPlaced, Lists},
 };
 use crate::{
     document::spec::AppliedSpec,
     engine::{
         decision::{shed, Decision, Pair, Pick, ShedReason, Target},
         decision_engine::{DecisionRefused, DecodeRefused, WorkerLists},
-        framework::release,
+        framework::{release, EncodeItems, EncodePlaced},
         lease_events,
         policy_engine::PolicyEngine,
         shadow::Shadowed,
-        view::{fingerprint, Phase, RequestFacts, Role, Session, WorkerId},
-        PairLists,
+        view::{fingerprint, Identity, Phase, RequestFacts, Role, Session, WorkerId},
+        EncodeLists, PairLists,
     },
     stages::lifecycle::Lifecycle,
     store::{
@@ -72,13 +82,35 @@ use crate::{
 
 /// A deciding thread's buffers for its frames, kept from frame to frame: a
 /// frame's lists in the engine's form, and the places its gateway may take
-/// of a single request's list or of a pair's prefills, and of a pair's
-/// decodes.
+/// of a single request's list or of a pair's prefills, of a pair's
+/// decodes, and of an encode request's encoders, with that request's keys
+/// in the engine's form and where its decision put its items.
 #[derive(Debug, Default)]
 pub(crate) struct FrameBuffers {
     lists: Lists,
     places: GatewayPlaces,
     decode_places: GatewayPlaces,
+    encoder_places: GatewayPlaces,
+    /// Empty between frames: an item's key borrows its frame.
+    keys: Vec<Identity<'static>>,
+    placed: EncodePlaced,
+}
+
+impl FrameBuffers {
+    /// What the answer of `request`, an encode request, takes of its
+    /// frame: the frame's id and, where `decision` is a pick, each item's
+    /// encoder as the thread's last encode decision placed it
+    /// ([`Checked::into_answer`]). `decision` is that decision, the
+    /// thread's one decision of `request`: a pick of an encode request is
+    /// the engine's, which writes where the items go at each decision.
+    /// Asked where the answer leaves.
+    pub(crate) fn answered(
+        &self,
+        request: Checked,
+        decision: &Decision,
+    ) -> (Vec<u8>, Option<ItemsPlaced>) {
+        request.into_answer(decision, &self.placed)
+    }
 }
 
 /// What a pick's lease takes of its frame, beside the decision: the
@@ -183,7 +215,7 @@ fn decide_at(
         ..
     } = *taken;
     let front = world.front();
-    let spec = front.spec();
+    let spec = world.spec();
     let model = frame.model();
     if frame.hashes() > frame.hashes_read(spec) {
         own.hashes_cut.fetch_add(1, Ordering::Relaxed);
@@ -200,6 +232,9 @@ fn decide_at(
     let (decision, said) = match generation.as_deref() {
         Some(generation) => {
             let lent = objects.lent(generation, role);
+            // The list's value is asked under the document in force at this
+            // call, and the decision below loads that document again. The
+            // two read one document: a store's engine takes no new one.
             let members = front.members_of(lent);
             let records = members.records(spec, front.clock());
             let reach = objects.reach(generation, role);
@@ -257,7 +292,8 @@ fn decide_at(
 /// ahead of the snapshot that task keeps, and a snapshot a request gives is
 /// outside that order ([`RequestMaker::loads`]). A controller runs no such
 /// task yet: a document that holds such a stage is given none here, and its
-/// decisions read no report.
+/// decisions read no report. No stage of this build keeps reports: such a
+/// stage is one a host registers.
 ///
 /// [`RequestMaker::loads`]: crate::engine::RequestMaker::loads
 fn hands_reports(spec: &AppliedSpec) -> bool {
@@ -299,6 +335,70 @@ pub(crate) fn decide_pair(
     loads: &Arc<LoadSnapshot>,
     own: &Part,
 ) -> Result<(Decision, PairBooked), DecisionRefused> {
+    decide_sides(None, world, objects, taken, buffers, loads, own)
+}
+
+/// The decision of an encode request's frame, in the world of one load as
+/// [`decide_pair`] takes it: the pair and each item's encoder, over the
+/// three lists the worker objects' registry holds for the frame's model,
+/// with the pair's classes and the holder's encode columns
+/// ([`Objects::encode_columns`]). The engine's entry for the three lists
+/// decides it ([`PolicyEngine::decide_encode_without_lease`]), the one a
+/// gateway's own engine runs under its leasing entry. Where the decision
+/// puts the items stays in `buffers` for the frame's answer
+/// ([`FrameBuffers::answered`]).
+///
+/// The answers come in a pair's order, and a request with a key takes its
+/// encoders' list as a third list in it: what the asking gateway may take
+/// of the encoders is stated by their own reach, wires and vetoes
+/// ([`GatewayPlaces::taken`]). A model the registry holds no worker of, and
+/// a side of the pair with no worker at all, are decided over no worker.
+/// Else a list the gateway dials and can take nothing of sheds the frame
+/// under that stage. Else a list the gateway dials no worker of is decided
+/// over no worker. Only then is the engine asked. A model with no encoder
+/// at all is the engine's to answer, under the encode side's own name for
+/// it. A request with no key takes no encoder, so nothing is read of the
+/// encoders' reach for it.
+///
+/// Each of the three profiles that holds a stage that may refuse by a
+/// report of leases asks the apply a pair's frame asks.
+///
+/// Out of line: a pair's decision holds no part of it.
+///
+/// # Errors
+///
+/// Those of [`decide_pair`]. The engine's entry refuses no frame this
+/// function hands it: a frame with items is read at the prefill phase.
+#[inline(never)]
+pub(crate) fn decide_encode(
+    world: &StoreSnapshot,
+    objects: &Objects<Members>,
+    taken: &DecisionCall<'_, Checked>,
+    buffers: &mut FrameBuffers,
+    loads: &Arc<LoadSnapshot>,
+    own: &Part,
+) -> Result<(Decision, PairBooked), DecisionRefused> {
+    // The keys in the engine's form, on the thread's buffer for them.
+    let keys = taken.request.item_keys(mem::take(&mut buffers.keys));
+    let items = taken.request.items(&keys);
+    let decided = decide_sides(Some(items), world, objects, taken, buffers, loads, own);
+    buffers.keys = spent_keys(keys);
+    decided
+}
+
+/// [`decide_pair`], and with `items` [`decide_encode`]: one order of
+/// answers for both. In line in both its callers, so a pair's decision
+/// stays the code it was: with no items every test of them is gone.
+#[inline(always)]
+fn decide_sides(
+    items: Option<EncodeItems<'_>>,
+    world: &StoreSnapshot,
+    objects: &Objects<Members>,
+    taken: &DecisionCall<'_, Checked>,
+    buffers: &mut FrameBuffers,
+    loads: &Arc<LoadSnapshot>,
+    own: &Part,
+) -> Result<(Decision, PairBooked), DecisionRefused> {
     let DecisionCall {
         request: frame,
         gateway,
@@ -308,15 +408,16 @@ pub(crate) fn decide_pair(
         ..
     } = *taken;
     let front = world.front();
-    let spec = front.spec();
+    let spec = world.spec();
     let model = frame.model();
     if frame.hashes() > frame.hashes_read(spec) {
         own.hashes_cut.fetch_add(1, Ordering::Relaxed);
     }
-    // The decode phase's word carries the pair's decode side.
-    let by_reports = [Phase::Prefill, Phase::Decode]
-        .into_iter()
-        .any(|phase| spec.engine().reads_for(model, phase).2);
+    // The decode phase's word carries the pair's decode side, and the
+    // encode phase's the encode side of an encode request's pair.
+    let refuses = |phase| spec.engine().reads_for(model, phase).2;
+    let by_reports = [Phase::Prefill, Phase::Decode].into_iter().any(refuses)
+        || (items.is_some() && refuses(Phase::Encode));
     if let Some(place) = place.filter(|_| by_reports) {
         place.apply_waiting();
     }
@@ -324,7 +425,12 @@ pub(crate) fn decide_pair(
         lists,
         places,
         decode_places,
+        encoder_places,
+        placed,
+        ..
     } = buffers;
+    // An encode request with a key takes its encoders' list as a third.
+    let keyed = items.is_some_and(|items| !items.keys.is_empty());
     let read = lists.of(frame);
     let over_none = || FrameRequest::new(frame, &read, left, WorkerLists::None);
     let generation = objects.registry().model_generation(model);
@@ -349,8 +455,21 @@ pub(crate) fn decide_pair(
                 let prefills = places.taken(prefill_reach, prefill_records, asking, vetoes);
                 let vetoes = decode_vetoes.standing_at(now);
                 let decodes = decode_places.taken(decode_reach, decode_records, asking, vetoes);
-                let decided = match (prefills, decodes) {
-                    (Taken::Held(prefills), Taken::Held(decodes)) => {
+                // The encoders as a request with a key reads them. Any
+                // other request reads none: every place, and no veto.
+                let encoders = if keyed {
+                    let (_, records, reach, vetoes) = side(Role::Encode);
+                    let vetoes = vetoes.standing_at(now);
+                    encoder_places.taken(reach, records, asking, vetoes)
+                } else {
+                    Taken::Held(Held {
+                        places: None,
+                        stalled: &[],
+                        held: &[],
+                    })
+                };
+                let decided = match (prefills, decodes, encoders) {
+                    (Taken::Held(prefills), Taken::Held(decodes), Taken::Held(encoders)) => {
                         let pair = PairLists {
                             prefill,
                             decode,
@@ -363,24 +482,47 @@ pub(crate) fn decide_pair(
                             decode_stalled: decodes.stalled,
                             decode_held: decodes.held,
                         };
-                        let maker = FrameRequest::new(frame, &read, left, WorkerLists::Pair(pair));
+                        let lists = match items {
+                            Some(_) => {
+                                let columns = objects.encode_columns(generation);
+                                WorkerLists::Encode(EncodeLists {
+                                    pair,
+                                    encoders: objects.lent(generation, Role::Encode),
+                                    encoders_places: encoders.places,
+                                    encoders_stalled: encoders.stalled,
+                                    encoders_held: encoders.held,
+                                    facts: columns.facts(),
+                                    prefill_classes: columns.prefill_classes(),
+                                })
+                            }
+                            None => WorkerLists::Pair(pair),
+                        };
+                        let maker = FrameRequest::new(frame, &read, left, lists);
                         let maker = if hands_reports(spec) {
                             maker.reading(loads)
                         } else {
                             maker
                         };
-                        front.decide_without_lease(&maker, now)
+                        match items {
+                            Some(items) => front
+                                .decide_encode_without_lease(&maker, items, placed, now)
+                                .map(|decision| (decision, None)),
+                            None => front.decide_without_lease(&maker, now),
+                        }
                     }
-                    (Taken::Emptied(stage), _) | (_, Taken::Emptied(stage)) => {
+                    (Taken::Emptied(stage), ..)
+                    | (_, Taken::Emptied(stage), _)
+                    | (.., Taken::Emptied(stage)) => {
                         let (seed, generation) = (frame.seed(), spec.generation());
                         Ok((shed(ShedReason::NoEndpoints, stage, seed, generation), None))
                     }
-                    (Taken::Unreached, _) | (_, Taken::Unreached) => {
+                    (Taken::Unreached, ..) | (_, Taken::Unreached, _) | (.., Taken::Unreached) => {
                         front.decide_without_lease(&over_none(), now)
                     }
                 };
                 // Counted whatever the decision came to.
-                let undialed = places.undialed() + decode_places.undialed();
+                let encoders_undialed = if keyed { encoder_places.undialed() } else { 0 };
+                let undialed = places.undialed() + decode_places.undialed() + encoders_undialed;
                 if undialed > 0 {
                     own.undialed.fetch_add(undialed, Ordering::Relaxed);
                 }
@@ -512,7 +654,7 @@ pub(crate) fn issue(
         front.count_shadow(said);
         return Ok(None);
     };
-    let stages = front.spec().engine();
+    let stages = world.spec().engine();
     let sized = (session, tokens);
     // The stages hear of every pick but one the binding's sessions rule
     // keeps from the profile: that one's lease is filed under the word.
@@ -561,9 +703,18 @@ pub(crate) fn issue(
 /// until a decode call issues it ([`issue_decode`]) or a dispatch names it.
 /// Its answer carries the prefill side's lease alone.
 ///
-/// No shadow runs on a pair's side yet, so none is counted here. The
-/// decode side's lease states the prefill side's session verdict: the
-/// store's decode side keeps none of its own yet.
+/// No shadow runs on a pair's side yet, so none is counted here. Each
+/// side's lease states its own session verdict: the prefill's the pick's,
+/// and the decode's the one the pick's first target states of its decode,
+/// which the store keeps with the side.
+///
+/// A pair's lease counts for each side's key
+/// ([`MemoryStore::issue_decided_pair`]), under any sessions rule and under
+/// none, as a single's keyed pick does ([`issue`]): one request more of a
+/// side's session stands on the side's worker while the side lives. A
+/// rule or a scorer that places by the fewest keys reads a pair's keys
+/// there. A decode call's side counts the key its own frame states
+/// ([`issue_decode`]), whatever the pair's first frame stated.
 ///
 /// # Errors
 ///
@@ -593,7 +744,7 @@ pub(crate) fn issue_pair(
         debug_assert!(decision.pick().is_none(), "a pair's pick: {decision:?}");
         return Ok(None);
     };
-    let stages = front.spec().engine();
+    let stages = world.spec().engine();
     let sized = (session, tokens);
     let record = record_of(front, taken, term, (pick, first), Side::Prefill, sized);
     let later = taken.request.decode_later();
@@ -601,6 +752,7 @@ pub(crate) fn issue_pair(
         target: chosen.decode_id,
         picked: PickRecord::of_decodes(&pick.targets),
         session: decode_session,
+        session_verdict: chosen.decode_verdict.on(chosen.decode_id),
         state: if later {
             LeaseState::Chosen
         } else {
@@ -670,7 +822,7 @@ pub(crate) fn decide_decode(
         ..
     } = *taken;
     let front = world.front();
-    let spec = front.spec();
+    let spec = world.spec();
     let model = frame.model();
     if frame.hashes() > frame.hashes_read(spec) {
         own.hashes_cut.fetch_add(1, Ordering::Relaxed);
@@ -764,8 +916,9 @@ pub(crate) fn decide_decode(
 /// Files a decode call's pick under `lease`, the pair's own lease, and
 /// tells the engine, under one hold of the file: the decode side on the
 /// pick's first decode, under the request's session of the decode phase,
-/// booking that decode's count. The side's lease comes with its issue's
-/// count, for an answer that does not leave
+/// booking that decode's count. The side keeps the call's own session
+/// verdict, in place of the one its first decision stated. The side's
+/// lease comes with its issue's count, for an answer that does not leave
 /// ([`MemoryStore::unissue_decode`]). `None` for a shed, which files none.
 ///
 /// The engine told is the one of the lease's own generation ([`issuing`]):
@@ -802,6 +955,7 @@ pub(crate) fn issue_decode(
         target: chosen.decode_id,
         picked: PickRecord::of_decodes(&pick.targets),
         session,
+        session_verdict: chosen.decode_verdict.on(chosen.decode_id),
         state: LeaseState::ISSUED,
         tokens,
         target_index: 0,

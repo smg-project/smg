@@ -1366,6 +1366,29 @@ mod tests {
         }
     }
 
+    /// The controller's file of leases keeps each side's own session
+    /// verdict of a pair. So its own start takes a spec file that binds a
+    /// sessions rule under the pair plan, as it takes the same file with
+    /// no rule.
+    #[tokio::test]
+    async fn a_spec_file_that_binds_a_sessions_rule_under_a_pair_starts() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let path = dir.path().join("policy.yaml");
+        let pair = "apiVersion: smg.policy/v1\nview:\n  headers: [x-session-id]\nprofiles:\n  q:\n    pick: random\nbindings:\n  - plan: pd-pair\n    profiles:\n      prefill: q\n      decode: q\n";
+        let rule = "    sessions:\n      sticky_header: x-session-id\n      inflight_cap: 65535\n";
+        let start = |document: String| {
+            std::fs::write(&path, document).expect("the file");
+            let config = parse(&EPHEMERAL).config().expect("the flags are in order");
+            let stages = StageRegistry::builtin();
+            bind(config, stages, &[], SpecSource::File(path.clone()))
+        };
+        for document in [pair.to_string(), format!("{pair}{rule}")] {
+            let started = start(document).await;
+            let controller = started.expect("a pair starts, under a rule and under none");
+            assert_eq!(controller.store().snapshot().spec().generation(), 1);
+        }
+    }
+
     /// A served decision writes the record of sent prefixes at its lease's
     /// issue: a spec file starts under each source of prefix affinity, and
     /// one that names none reads the prefixes sent, as `merged` does.

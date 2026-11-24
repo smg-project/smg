@@ -71,7 +71,7 @@ struct Listed<'a> {
 /// prefill of no known runtime.
 ///
 /// Called once an index, at the policy engine's first pair decision over it
-/// ([`PdPairIndex::classes`]). Prefills of one descriptor share one partner
+/// ([`PdPairIndex::lent`]). Prefills of one descriptor share one partner
 /// list, so a list is turned into places once, however many prefills hold
 /// it.
 pub(super) fn of(index: &PdPairIndex) -> PartnerClasses {
@@ -237,7 +237,7 @@ mod tests {
             PdWire::Grpc,
             PdPairingMode::Lenient,
         );
-        let classes = index.classes();
+        let (_, classes) = index.lent();
         assert_eq!(classes.prefills(), [1, 1]);
         assert_eq!(classes.decodes(), [1, 1]);
         assert_eq!(classed(classes), indexed(&index));
@@ -281,7 +281,7 @@ mod tests {
             (PdPairingMode::Off, "off"),
         ] {
             let specific = index(PdWire::Grpc, mode);
-            let classes = specific.classes();
+            let (_, classes) = specific.lent();
             assert_eq!(indexed(&specific), [(0, 0), (0, 1), (1, 0), (1, 1)]);
             assert_eq!(classed(classes), indexed(&specific), "{name}");
             assert_eq!(classes.prefills(), [1, 2], "{name}");
@@ -292,9 +292,9 @@ mod tests {
         // The wire that forwards one body to both sides tells no runtime
         // apart: the same pairs, and none of them first.
         let plain = index(PdWire::Http, PdPairingMode::Lenient);
-        assert_eq!(classed(plain.classes()), indexed(&plain));
-        assert_eq!(plain.classes().prefills(), [1, 1]);
-        assert!(first(plain.classes()).is_empty());
+        assert_eq!(classed(plain.lent().1), indexed(&plain));
+        assert_eq!(plain.lent().1.prefills(), [1, 1]);
+        assert!(first(plain.lent().1).is_empty());
     }
 
     /// Two transports and a prefill that reports none: under the lenient
@@ -315,7 +315,7 @@ mod tests {
             PdWire::Grpc,
             PdPairingMode::Lenient,
         );
-        let classes = index.classes();
+        let (_, classes) = index.lent();
         assert_eq!(classes.prefills(), [1, 2, 3]);
         assert_eq!(classes.decodes(), [1, 2]);
         assert_eq!(indexed(&index), [(0, 0), (1, 1), (2, 0), (2, 1)]);
@@ -337,7 +337,7 @@ mod tests {
             PdWire::Grpc,
             PdPairingMode::Lenient,
         );
-        let classes = index.classes();
+        let (_, classes) = index.lent();
         assert_eq!(classes.prefills(), [0, 1, 1]);
         assert_eq!(classes.decodes(), [1]);
         assert_eq!(indexed(&index), [(1, 0), (2, 0)]);
@@ -352,7 +352,7 @@ mod tests {
             PdWire::Grpc,
             PdPairingMode::Lenient,
         );
-        let classes = index.classes();
+        let (_, classes) = index.lent();
         assert_eq!(classes.prefills(), [1]);
         assert_eq!(classes.decodes(), [0, 1]);
         assert_eq!(classed(classes), indexed(&index));
@@ -375,7 +375,7 @@ mod tests {
             PdPairingMode::Off,
         );
         assert!(Arc::ptr_eq(&index.partners[0], &index.decode_pool));
-        let classes = index.classes();
+        let (_, classes) = index.lent();
         assert_eq!(classes.prefills(), [1, 1]);
         assert_eq!(classes.decodes(), [1, 1]);
         assert_eq!(classed(classes), indexed(&index));
@@ -384,7 +384,7 @@ mod tests {
     #[test]
     fn two_empty_pools_have_no_class() {
         let index = PdPairIndex::empty(PdWire::Http);
-        let classes = index.classes();
+        let (_, classes) = index.lent();
         assert!(classes.prefills().is_empty());
         assert!(classes.decodes().is_empty());
         assert!(classed(classes).is_empty());
@@ -399,6 +399,6 @@ mod tests {
             PdWire::Grpc,
             PdPairingMode::Off,
         );
-        assert!(ptr::eq(index.classes(), index.classes()));
+        assert!(ptr::eq(index.lent().1, index.lent().1));
     }
 }

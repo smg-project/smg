@@ -85,6 +85,7 @@ pub(crate) fn request(request: &Request<'_>) -> (proto::DecideRequest, usize) {
             prompt_text: Vec::new(),
             block_size: facts.block_size,
             client_key: facts.client_key,
+            session_key_from_rid: facts.session_key_from_rid,
         }),
         constraints: Some(proto::Constraints {
             excluded: constraints.excluded.iter().map(|id| id.0).collect(),
@@ -96,6 +97,8 @@ pub(crate) fn request(request: &Request<'_>) -> (proto::DecideRequest, usize) {
         // No link asks its decode later: the controller issues both sides.
         decode_later: false,
         decode_of: None,
+        // No link states an encode request's items yet.
+        encode: None,
     };
     (asked, facts.block_hashes.len() - held)
 }
@@ -482,6 +485,9 @@ mod tests {
         ] {
             asked.facts.tenant = tenant;
             asked.facts.session_key = session;
+            // The request's own id handed the first turn's key, and no
+            // other turn's.
+            asked.facts.session_key_from_rid = session == Identity::hashed(17);
             asked.facts.phase = phase;
             asked.facts.hash_kind = hash_kind;
             let want = &asked.facts;
@@ -489,6 +495,7 @@ mod tests {
             assert_eq!(left_out, 0);
             let facts = sent.facts.as_ref().expect("request facts");
             assert_eq!(facts.client_key, want.client_key);
+            assert_eq!(facts.session_key_from_rid, want.session_key_from_rid);
             if tenant.is_none() {
                 assert!(facts.tenant.is_none());
             }
@@ -534,6 +541,7 @@ mod tests {
                     assert_eq!(facts.seed, want.seed);
                     assert_eq!(facts.block_size, want.block_size);
                     assert_eq!(facts.client_key, want.client_key);
+                    assert_eq!(facts.session_key_from_rid, want.session_key_from_rid);
                     assert_eq!(constraints.excluded, asked.constraints.excluded);
                     assert_eq!(constraints.wire_modes, crate::engine::WireModes::NONE);
                     assert_eq!(
@@ -667,6 +675,7 @@ mod tests {
             term: 3,
             decision,
             lease,
+            encode: None,
         }
         .frame();
         let Some(Answer::Decision(told)) = answer.answer else {

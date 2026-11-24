@@ -222,8 +222,13 @@ default = ["wasm"]
 wasm = ["dep:wasmtime", "dep:thread_local", "dep:tracing", "dep:rustix"]
 # A case's hold of the gRPC plugin runtime's I/O thread, the stand-in for a
 # host that takes the thread's core. The package's own tests and benches
-# turn it on through the dev-dependency on the package itself; no build of
-# a product has it.
+# turn it on through the dev-dependency on the package itself, and the
+# gateway's `test-util` turns it on for the gateway's tests. A build of the
+# gateway's package alone leaves it off.
+#
+# It also builds the lookup over holders a host scored
+# (`overlap::deepest_of_within_groups`), which the gateway's reference index
+# calls in its cases.
 test-util = ["smg-worker?/test-util"]
 
 [dev-dependencies]
@@ -373,6 +378,12 @@ required-features = ["controller"]
 name = "watch_workers"
 required-features = ["controller"]
 
+# One case in a process of its own: another bind or TLS call of the process
+# would install the crypto provider first.
+[[test]]
+name = "crypto_provider"
+required-features = ["controller"]
+
 [[bench]]
 name = "decision"
 harness = false
@@ -438,15 +449,7 @@ name = "store"
 harness = false
 
 [[bench]]
-name = "store_kv"
-harness = false
-
-[[bench]]
 name = "store_journal"
-harness = false
-
-[[bench]]
-name = "store_signals"
 harness = false
 
 [[bench]]

@@ -13,7 +13,7 @@
 //! | trait | who calls | how often |
 //! |---|---|---|
 //! | [`WorkersStore`] | discovery and the registration handshake, the control scope's register, patch and deregister calls | per membership change; a rollout of 512 workers is under one change per second |
-//! | [`HealthSink`] | the prober (one probe per worker per interval, 128 in flight), the connect signal, every gateway's vetoes and completed dispatches | per probe; two frames per request |
+//! | [`HealthSink`] | every gateway's vetoes. A worker's status is its worker object's word, told by the holder of the objects | per veto a gateway sets or lifts |
 //! | [`LoadSink`] | the subscription task per record, the poll per engine per tick, the scrape per interval, a relay per frame | up to ten records per rank per second busy, one per second idle |
 //! | [`KvEventSink`] | the subscription task per batch, a relay per frame | one batch per scheduler step that moved blocks |
 //! | [`ReservationStore`] | a commit (a prefill slot, a decode room), a lease's end | two per pair dispatch |
@@ -44,11 +44,10 @@
 //!   replicated.
 //! - **Wire messages are the host's.** No second load or event message exists
 //!   in process: a load record enters as the view's [`LoadRow`] (the record's
-//!   routing core in its own names) and a KV batch as the host's own message
-//!   behind [`KvEventSink::Batch`], with the header facts the cursor reads
-//!   beside it. [`MemoryStore`] takes a batch as the events its collector
-//!   decoded ([`KvEvent`]) and applies them to the index of the worker's
-//!   model (`index`).
+//!   routing core in its own names) and a KV batch stays the host's own
+//!   message: the cursor reads the header facts beside it, and the host's
+//!   own rules write an admitted batch through its row's lane
+//!   ([`KvEventSink::admit_through`]).
 //!
 //! [`MemoryStore`] is the one-process store behind every trait: the
 //! controller's own store once its drivers move in, and the double the
@@ -76,7 +75,6 @@ pub mod membership;
 pub(crate) mod memory;
 pub mod pairing;
 pub(crate) mod reservations;
-pub(crate) mod signals;
 pub(crate) mod snapshot;
 pub(crate) mod workers;
 
@@ -86,8 +84,8 @@ mod tests;
 pub use encoding::{hands_to, EncodeClasses, EncodeHandoff, EncodeMember, EncodeOffer};
 pub use health::{HealthSink, HealthWrite, VetoWrite};
 pub use index::{
-    ApplyError, ChainBlockMap, ContentHash, KvEvent, LaneCounts, LaneWriter, SequenceHash,
-    StoredBlock, WorkerGroups, INDEX_WORKERS,
+    ApplyError, ChainBlockMap, ContentHash, LaneWriter, SequenceHash, StoredBlock, WorkerGroups,
+    INDEX_WORKERS,
 };
 pub use journal::{Journal, Position};
 pub use kv_events::{
@@ -102,7 +100,6 @@ pub use loads::{LoadSample, LoadSink, LoadSource, PollMode, Wake};
 pub(crate) use memory::DecodeIssue;
 pub use memory::{AtWork, Hand, LookOutcome, MemoryStore, StoreCheckpoint, StoreStats};
 pub use reservations::{ReservationKind, ReservationStore};
-pub use signals::{SignalSink, SignalWriteOutcome};
 pub use snapshot::{OutsideLists, StaleGeneration, StoreSnapshot, PUBLISH_WINDOW};
 pub use workers::{
     identity, identity_of, token, HealthPolicy, MembershipChange, MembershipTail, Overload,

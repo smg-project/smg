@@ -1,7 +1,7 @@
 //! The membership writer: a host's writes of worker rows into the store.
 
 #![cfg_attr(
-    not(test),
+    not(any(test, feature = "discovery")),
     expect(
         dead_code,
         reason = "A drain's, a removal's and a refresh's rules run at the replica's own door, which the host owns."
@@ -21,8 +21,8 @@ use crate::{
     store::{
         membership::{FactPastBound, NotRegistrant, WorkerFactsChange},
         pairing::PairingDescriptor,
-        HealthSink, MembershipChange, MemoryStore, Registrant, WorkerFacts, WorkerPatch, WorkerRow,
-        WorkerStatus, WorkersStore,
+        MembershipChange, MemoryStore, Registrant, WorkerFacts, WorkerPatch, WorkerRow,
+        WorkerStatus,
     },
 };
 
@@ -305,6 +305,18 @@ pub(crate) trait Turn {
     /// The turn's removal of a row, as [`Self::upsert`] writes a
     /// registration.
     fn remove(&self, id: WorkerId, revision: u64) -> Option<MembershipChange>;
+
+    /// The turn's connect signal for the row `id`, read at `revision`, a
+    /// row whose checks are off: ready at once, unless it drains or is
+    /// ready. A door with a holder writes it on the row's worker object,
+    /// and the store is told
+    /// ([`Objects::connect_row`](super::Objects::connect_row)).
+    fn connect(&self, id: WorkerId, revision: u64);
+
+    /// The turn's drain of the row `id`, read at `revision`, as
+    /// [`Self::connect`] writes a status. Whether the row moved: `false`
+    /// where another writer moved it under the turn.
+    fn drain(&self, id: WorkerId, revision: u64) -> bool;
 
     /// Check the term ahead of a write. A registration asks before each
     /// row it writes and each row it removes.
@@ -648,7 +660,6 @@ fn write_row(
         }
         Some((_, WorkerFactsChange::InPlace)) => {}
     }
-    let store = turn.store();
     let probes = facts.health.probes;
     let change = turn.upsert(facts, maker.clone());
     let change = change.ok_or(MembershipWriteRefused::Moved)?;
@@ -666,7 +677,7 @@ fn write_row(
     if let Some(row) = turn.row(change.id()) {
         turn.laid(&row);
         if !probes {
-            store.connected(row.id, row.revision, &|| true);
+            turn.connect(row.id, row.revision);
         }
     }
     turn.told(wrote);
@@ -734,11 +745,10 @@ pub(crate) fn drain(
     if row.status == WorkerStatus::Draining {
         return Ok(MembershipWriteOutcome::Unmoved(row.id));
     }
-    let store = turn.store();
-    changed(
-        store.set_status(row.id, WorkerStatus::Draining, row.revision),
-        MembershipWriteOutcome::Draining,
-    )
+    if !turn.drain(row.id, row.revision) {
+        return Err(MembershipWriteRefused::Moved);
+    }
+    Ok(MembershipWriteOutcome::Draining(row.id))
 }
 
 /// Remove the guarded row while the door holds its turn.
@@ -898,6 +908,19 @@ pub(super) mod tests {
 
             fn remove(&self, id: WorkerId, revision: u64) -> Option<MembershipChange> {
                 self.store().remove(id, revision)
+            }
+
+            fn connect(&self, id: WorkerId, revision: u64) {
+                let standing = self.store().get(id).map(|row| row.status);
+                if !matches!(standing, Some(WorkerStatus::Draining | WorkerStatus::Ready)) {
+                    self.store().set_status(id, WorkerStatus::Ready, revision);
+                }
+            }
+
+            fn drain(&self, id: WorkerId, revision: u64) -> bool {
+                self.store()
+                    .set_status(id, WorkerStatus::Draining, revision)
+                    .is_some()
             }
 
             fn row(&self, id: WorkerId) -> Option<WorkerRow> {
@@ -2837,8 +2860,9 @@ pub(super) mod tests {
         use smg_worker::{
             identity::{basic::Worker, builder::BasicWorkerBuilder},
             model_card::ModelCard,
+            pd::pairing::PdPairingMode,
             registry::WorkerRegistry,
-            worker::{RuntimeType, WorkerType},
+            worker::{RuntimeType, WorkerSpec, WorkerType},
         };
 
         use super::{door, stated, URL};
@@ -3031,6 +3055,109 @@ pub(super) mod tests {
             let wrote = state(&followed, Precondition::Any);
             assert_eq!(wrote, Ok(MembershipWriteOutcome::InPlace(first.id)));
             assert_eq!(placed(), (true, the_pair));
+        }
+
+        /// A pair's worker as a provider's pass finds it, at `url` in
+        /// `role`: its operator's pairing protocol stands on its spec, where
+        /// the Kubernetes provider writes a pod's label, and a label names
+        /// its transfer backend.
+        fn found_side(
+            url: &str,
+            role: WorkerType,
+            protocol: Option<&str>,
+            transport: &str,
+        ) -> Arc<dyn Worker> {
+            let mut spec = WorkerSpec::new(url);
+            spec.worker_type = role;
+            spec.runtime_type = RuntimeType::Sglang;
+            spec.pairing_protocol = protocol.map(str::to_owned);
+            Arc::new(
+                <BasicWorkerBuilder>::from_spec(spec)
+                    .model(ModelCard::new(MODEL))
+                    .label("disaggregation_transfer_backend", transport)
+                    .build(),
+            )
+        }
+
+        /// Two found workers pair as their own pairing facts do. A door that
+        /// reads a built worker alone lays no descriptor in its row, and
+        /// lays the protocol the worker's spec holds among the row's labels.
+        /// The holder's classes read what the object built of each row
+        /// offers. So under the lenient rule a prefill and a decode whose
+        /// operators' protocols differ pair with nobody, and neither do two
+        /// of unlike transports: a pair's request is shed. One protocol on
+        /// both sides settles a pair of two transports, as the workers' own
+        /// rule has it, and the request is placed on the two.
+        #[test]
+        fn two_found_workers_pair_as_their_own_pairing_facts_do() {
+            const DECODE: &str = "http://decode:8000";
+            let mut lenient =
+                PolicySpec::pair_presets("least_load", "least_load").expect("the pair presets");
+            lenient.generation = 1;
+            lenient.plans.pd_pair.pairing = Pairing::Lenient;
+            let applied = AppliedSpec::validate(&lenient).expect("the document validates");
+            let engine = PolicyEngine::new(applied);
+            let sides = [
+                ((Some("blue"), "nixl"), (Some("green"), "nixl")),
+                ((None, "nixl"), (None, "mooncake")),
+                ((Some("blue"), "nixl"), (Some("blue"), "mooncake")),
+                ((None, "nixl"), (None, "nixl")),
+            ];
+            let mut paired = Vec::new();
+            for ((protocol, transport), (other_protocol, other_transport)) in sides {
+                let (store, door) = door();
+                let prefill = found_side(URL, WorkerType::Prefill, protocol, transport);
+                let decode =
+                    found_side(DECODE, WorkerType::Decode, other_protocol, other_transport);
+                let own = prefill
+                    .pd_pairing()
+                    .mismatch(decode.pd_pairing(), PdPairingMode::Lenient)
+                    .is_none();
+                let mut rows = Vec::new();
+                for built in [&prefill, &decode] {
+                    let maker = Registrant::Control;
+                    let wrote = door.found_built(&maker, Precondition::Absent, built, None);
+                    assert!(wrote.is_ok(), "{wrote:?}");
+                    let laid = store.by_key(built.url()).expect("the registered row");
+                    assert_eq!(laid.facts.pairing, None, "the row states no descriptor");
+                    let stated = laid.facts.labels.get("pairing_protocol");
+                    assert_eq!(stated.map(String::as_str), built.pd_pairing().explicit());
+                    let _ = store.set_status(laid.id, WorkerStatus::Ready, laid.revision);
+                    rows.push(laid.id);
+                }
+                let holder = holder();
+                holder.follow::<MemoryStore>(&store);
+                let registry = holder.registry();
+                let generation = registry.model_generation(MODEL).expect("a generation");
+                let classes = holder.pair_classes(&generation, Pairing::Lenient);
+                assert_eq!(classes.pairs(0, 0), own, "as the workers' own facts pair");
+                let lists = PairLists {
+                    prefill: holder.lent(&generation, Role::Prefill),
+                    decode: holder.lent(&generation, Role::Decode),
+                    classes,
+                    admission: &OpenAdmission,
+                    prefill_places: None,
+                    decode_places: None,
+                    prefill_stalled: &[],
+                    prefill_held: &[],
+                    decode_stalled: &[],
+                    decode_held: &[],
+                };
+                let asked = request(Phase::Prefill);
+                let placed = match decided(&engine, asked, WorkerLists::Pair(lists)).decision {
+                    Decision::Pick(pick) => {
+                        let target = pick.targets.first().expect("a target");
+                        Ok((target.id, target.pair.map(|pair| pair.decode_id)))
+                    }
+                    Decision::Shed(shed) => Err((shed.reason, shed.emptied_by)),
+                    Decision::Queue(_) => panic!("a pair's request is not queued"),
+                };
+                let the_pair = Ok((rows[0], Some(rows[1])));
+                let shed = Err((ShedReason::NoEndpoints, "partnered"));
+                assert_eq!(placed, if own { the_pair } else { shed });
+                paired.push(own);
+            }
+            assert_eq!(paired, [false, false, true, true]);
         }
 
         /// A refresh that turns a worker's vision off starts another life,

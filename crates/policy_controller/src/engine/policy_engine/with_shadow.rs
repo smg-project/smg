@@ -31,7 +31,8 @@
 //! its shadow is counted. The entry that issues none answers what the
 //! shadow said, and its caller counts it behind its own filing
 //! ([`PolicyEngine::count_shadow`]): a decision whose filing fails counts
-//! none.
+//! none. A host reads every count in one call
+//! ([`PolicyEngine::shadow_counts`]).
 
 use std::{
     sync::{atomic::Ordering, Arc},
@@ -45,11 +46,11 @@ use super::{
     Loaded, PolicyEngine, PoolMembers,
 };
 use crate::engine::{
-    decision::Decision,
+    decision::{Decision, ShadowKind},
     decision_engine::{DecideOutcome, Request, RequestMaker},
-    framework::{Engine, ShadowRows},
+    framework::{Engine, PairSide, ShadowRows},
     records,
-    shadow::{Counted, Shadow, ShadowCounts, Shadowed},
+    shadow::{Shadow, ShadowCount, ShadowCounts, ShadowSide, Shadowed, SHADOW_ROWS},
     view::{Constraints, RequestFacts},
 };
 
@@ -116,8 +117,62 @@ impl PolicyEngine {
     )]
     pub(crate) fn count_shadow(&self, said: Option<Shadowed>) {
         if let Some(said) = said {
-            count(self.loaded(), said);
+            let document = self.in_force();
+            count(self.under(&document), said);
         }
+    }
+
+    /// Tells `each` every count of the shadow decisions made under the
+    /// document in force, and answers that document's number, which no
+    /// other applied document of the process has. A host that adds up what
+    /// a count grew by between two reads takes a count under another
+    /// number whole.
+    ///
+    /// The counts are of each binding that names a shadow, by where its
+    /// plan asks one ([`ShadowSide`]) and by each kind, a count of zero
+    /// too. A binding of one profile counts beside its single requests. A
+    /// pair's binding counts beside each side that names a shadow, and
+    /// its decode side beside a decode decided again as well. No decision
+    /// counts a pair's shadow yet: a host that takes such a document is
+    /// told zeros under those three sides. A row is told once, in the
+    /// order of the rows: the bindings from the last row on share it
+    /// ([`SHADOW_ROWS`]). A shadow that panicked is in no count here: it
+    /// is one of the engine's faults
+    /// ([`DecisionEngine::faults`](crate::engine::DecisionEngine::faults)).
+    ///
+    /// The document is read once, so every count told is of the number
+    /// answered. The call takes no lock and allocates nothing: a count is
+    /// one read of its cell, and a document no shadow was counted under
+    /// yet reads as zeros.
+    pub fn shadow_counts(&self, mut each: impl FnMut(ShadowCount)) -> u64 {
+        let document = self.in_force();
+        let (engine, counts) = (document.spec.engine(), document.shadow_counts.get());
+        // Which sides each row counts by, in the order of `ShadowSide::ALL`.
+        let mut due = [[false; 4]; SHADOW_ROWS];
+        for at in (0..).take_while(|&at| engine.binding_at(at).is_some()) {
+            let word = engine.shadow_at(at);
+            let single = word.is_some_and(|(_, rows)| rows != ShadowRows::Sides);
+            let [prefill, decode] = PairSide::BOTH.map(|side| engine.shadows_side(at, side));
+            let row = &mut due[(at as usize).min(SHADOW_ROWS - 1)];
+            for (due, named) in row.iter_mut().zip([single, prefill, decode, decode]) {
+                *due |= named;
+            }
+        }
+        for (binding, due) in (0..).zip(due) {
+            for (side, _) in ShadowSide::ALL.into_iter().zip(due).filter(|(_, due)| *due) {
+                for kind in ShadowKind::ALL {
+                    let cell = counts.map(|counts| counts.of(binding, side, kind));
+                    let count = cell.map_or(0, |cell| cell.load(Ordering::Relaxed));
+                    each(ShadowCount {
+                        binding,
+                        side,
+                        kind,
+                        count,
+                    });
+                }
+            }
+        }
+        document.applied
     }
 }
 
@@ -168,7 +223,7 @@ pub(super) fn decide(
 fn count(own: Loaded<'_, '_>, said: Shadowed) {
     let counts = &own.document.shadow_counts;
     let counts = counts.get_or_init(Box::<ShadowCounts>::default);
-    let count = counts.of(said.binding, Counted::Single, said.kind);
+    let count = counts.of(said.binding, ShadowSide::Single, said.kind);
     count.fetch_add(1, Ordering::Relaxed);
 }
 

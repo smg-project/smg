@@ -216,6 +216,7 @@ pub struct WorkerRuntime {
     transport_failed: AtomicBool,
     /// The worker's KV-event stream has pushed a load record: silence is
     /// then judged by the stream's cadence (see [`super::health::liveness`]).
+    /// A load monitor's stop takes the mark off.
     pushed_loads: AtomicBool,
     /// The latest pushed load record reports the engine silent on its
     /// in-flight requests past the wedge bound (see [`super::health::liveness`]).
@@ -875,6 +876,13 @@ impl WorkerRuntime {
 
     pub fn note_load_record(&self) {
         self.pushed_loads.store(true, Ordering::Relaxed);
+    }
+
+    /// The monitor that took this worker's load records stopped: the worker
+    /// reads as one whose stream never pushed, until that stream's next
+    /// record ([`Self::note_load_record`]).
+    pub(crate) fn forget_load_records(&self) {
+        self.pushed_loads.store(false, Ordering::Relaxed);
     }
 
     pub fn pushes_load_records(&self) -> bool {

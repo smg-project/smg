@@ -896,11 +896,11 @@ impl ConsistentHash {
         for position in iter::once(first).chain(behind.iter().copied()) {
             let mut ranked = [usize::MAX; MAX_TARGETS];
             let mut found = 0usize;
-            ring.walk(position, &mut |address| {
+            ring.walk_ids(position, &mut |id| {
                 if found == most {
                     return true;
                 }
-                match survivor_at(address, candidates, kept) {
+                match survivor_at(id, candidates, kept) {
                     // A ring asks about a worker once: one it names again
                     // keeps the rank it has.
                     Some(slot) if !ranked[..found].contains(&slot) => {
@@ -967,11 +967,10 @@ impl ConsistentHash {
 /// ([`ConsistentHash::lent`]).
 type Lent<'a> = (&'a dyn LentRing, u64, &'a [u64]);
 
-/// The survivor a lent ring names by `address`, by its place among `kept`:
-/// the last of them whose row carries the address's id
-/// ([`WorkerId::from_address`]), `None` where none does.
-fn survivor_at(address: &str, candidates: &[Candidate], kept: &[u32]) -> Option<usize> {
-    let id = WorkerId::from_address(address);
+/// The survivor a lent ring names by its address's `id`
+/// ([`LentRing::walk_ids`]), by its place among `kept`: the last of them
+/// whose row carries the id, `None` where none does.
+fn survivor_at(id: WorkerId, candidates: &[Candidate], kept: &[u32]) -> Option<usize> {
     kept.iter()
         .rposition(|&row| candidates[row as usize].id == id)
 }
@@ -1229,11 +1228,11 @@ impl Scorer for ConsistentHash {
         let (mut asked, mut kept, mut refused) = (0usize, 0usize, 0u32);
         // Whether the walk ended, and whether it ended decided.
         let (mut ended, mut decided) = (false, false);
-        ring.walk(position, &mut |address| {
+        ring.walk_ids(position, &mut |id| {
             if ended {
                 return true;
             }
-            let place = place_of(WorkerId::from_address(address));
+            let place = place_of(id);
             let Some(place) = place.filter(|place| !met[..asked].contains(place)) else {
                 return false;
             };
@@ -1766,6 +1765,11 @@ mod tests {
             "and the next view brings it back"
         );
         assert_eq!(scorer.ring().len(), 4);
+        // A join told again of a member that stands changes no score.
+        let before = out.clone();
+        scorer.on_membership(&Membership::Added(gone));
+        scorer.score(&keyed(3), &pool, &kept, &mut out);
+        assert_eq!((scorer.ring().len(), &out), (4, &before), "told twice");
         // A replacing handle is named too: the old id leaves, the new one
         // is admitted even when it repeats the old (a reused address).
         scorer.on_membership(&Membership::Replaced {

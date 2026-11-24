@@ -485,6 +485,33 @@ message DecideRequest {
   // behind either the gateway sends the decode the first pick named, and
   // that Dispatched books the side. An id of 0 is out of range.
   optional fixed64 decode_of = 6;
+  // The items of an encode request. Its presence says that the request is
+  // one, with a key or with none. Read on a frame of the encode phase, and
+  // on no other: a frame of another phase that carries it is out of range.
+  // Such a frame is its pair's one request. It is decided at the prefill
+  // phase, whatever its facts' phase says, for both sides of the pair and
+  // for each item's encoder, and its again and its decode_later read as on
+  // a pair's frame. A frame of the encode phase that carries none has no
+  // decision: it is answered Busy with no reason. A decode asked again
+  // names its lease and states no items: a frame that carries decode_of
+  // and this field is out of range, whatever its facts' phase says.
+  EncodeItems encode = 7;
+}
+
+// The encode items of a request and what it asks for them.
+message EncodeItems {
+  // Each item's key, the caller's content hash, in the request's order. At
+  // most 256: a longer list is out of range, and its frame is refused whole.
+  repeated Identity keys = 1;
+  // The items taken as one: the caller's digest over them. A class of
+  // encoders that takes them as one places it in the items' stead, so
+  // callers that share a fleet agree on it. Absent where each item is
+  // encoded on its own.
+  Identity one = 2;
+  // The items are references an encoder processes itself.
+  bool references = 3;
+  // The decode of the pair must take images.
+  bool decode_images = 4;
 }
 
 message DecideAnswer {
@@ -496,6 +523,20 @@ message DecideAnswer {
     Busy busy = 4;
     Credit credit = 5;
   }
+  // Beside a pick of a request that carried encode items: where its items
+  // go. Absent on every other answer. No lease is issued for an encoder: the
+  // pick's leases are its pair's.
+  EncodePlaced encode = 6;
+}
+
+// Where an encode request's decision puts its items.
+message EncodePlaced {
+  // The encoder of each placed key, in the keys' order: one for the one key,
+  // else one an item. A target here names no pair.
+  repeated Target encoders = 1;
+  // The one key was placed in the items' stead. The answer says it: the
+  // list's length does not, since one item reads the same either way.
+  bool one = 2;
 }
 
 // Credit added to this Decide stream, a delta as HTTP/2's WINDOW_UPDATE:
@@ -1058,14 +1099,14 @@ message Snapshot {
   uint64 membership_epoch = 19;
 }
 
-// The health precedence's inputs.
+// What the controller holds of a worker's health.
 message HealthRow {
   fixed64 worker_id = 1;
   uint32 health = 2;
   uint32 probe_failures = 3;
   // Gateways with a standing veto on the worker.
   uint32 vetoing_gateways = 4;
-  // Gateways whose Completed reports succeeded within the last probe interval.
+  // Zero: the controller keeps no count of a gateway's Completed reports.
   uint32 reporting_ok = 5;
   uint32 since_ms = 6;
 }
