@@ -543,8 +543,9 @@ is. A controller's decision of a pair, at its prefill and at its decode call, re
 Beside its encoder list and its prefill list the holder hands the two columns an encode request's
 decision reads (`Objects::encode_columns`). They are what the encode side reads of each encoder
 and the encode class each prefill names, by a worker's place in the list as lent. The classes are
-the store's own encode rule over what the rows state. The columns stand in the same build. A
-controller's decision of an encode request that carries its items reads them (section 10.1).
+the engine's encode rule (`EncodeClasses::derive`) over what the rows state. The columns stand in
+the same build. A controller's decision of an encode request that carries its items reads them
+(section 10.1).
 
 ### 4.2 The worker object **[built]** (`smg-worker`)
 

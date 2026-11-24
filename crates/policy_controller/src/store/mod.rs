@@ -74,7 +74,7 @@ pub(crate) mod workers;
 #[cfg(test)]
 mod tests;
 
-pub use encoding::{hands_to, EncodeClasses, EncodeHandoff, EncodeMember, EncodeOffer};
+pub use encoding::{EncodeHandoff, EncodeOffer};
 pub use health::{HealthSink, HealthWrite, VetoWrite};
 pub use journal::{Journal, Position};
 pub use leases::{
