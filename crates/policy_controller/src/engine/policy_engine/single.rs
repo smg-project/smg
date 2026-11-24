@@ -362,13 +362,16 @@ fn by_facts<const RETRY: bool>(
     let (engine, workers) = (spec.engine(), members.workers());
     // A keyed request is decided by the rows its key names, where they say
     // what the whole pass would: its key's pin, or its ring's walk.
+    // Read ahead of the keyed entry: a leave told behind a pin's choice is
+    // seen where the pin is handed on.
+    let leaves = own.affinity.leaves();
     match keys::decide(engine, records, workers, live, facts, cx) {
         // A pin its rule keeps from the profile: no holder is named for it
         // and nothing is kept of where its prompt went.
         Some(keyed) if !lease_events::stages_hear(&keyed) => keyed,
         // A pin that is the profile's own goes through the same lookup with
         // its answer made.
-        Some(keyed) => handed_on(own, members, records, facts, maker, keyed),
+        Some(keyed) => handed_on(own, members, records, facts, maker, keyed, leaves),
         // A profile whose stages read who holds the prompt is named its
         // rows from the gateway's own data, at the decision's instant the
         // keyed entry wrote, and its pick is recorded behind it; any other
@@ -411,8 +414,9 @@ fn handed_on(
     facts: &mut RequestFacts<'_>,
     maker: &(impl RequestMaker + ?Sized),
     keyed: Decision,
+    leaves: u64,
 ) -> Decision {
-    overlap::decide(
+    overlap::decide_behind(
         &own.affinity,
         members.affinity(),
         &own.document.spec,
@@ -421,7 +425,8 @@ fn handed_on(
         facts,
         |page| maker.token_key(page),
         |target| maker.sends_to(target),
-        |_| keyed,
+        leaves,
+        keyed,
     )
 }
 
