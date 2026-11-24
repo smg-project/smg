@@ -132,6 +132,7 @@ pub const DEFAULT_WARMUP_DIVERT_EVERY: u64 = 8;
 /// `prefix-affinity`, the fleet KV gate of `kv-pressure`, and the block size
 /// a held prefix is priced by.
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct Gates {
     /// A holder loaded past this multiple of the mean in flight (the kept
     /// rows', or the drawn rows' behind a draw) AND past the absolute
@@ -833,6 +834,7 @@ impl ReadsLoad for PrefixAffinity {
 /// of the profile reads (affinity yields to load past the usage spread or the
 /// ceiling), and the stage itself orders nothing.
 #[derive(Debug)]
+#[expect(clippy::exhaustive_structs, reason = "no field: its name is its value")]
 pub struct KvPressure;
 
 impl Lifecycle for KvPressure {}

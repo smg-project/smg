@@ -30,6 +30,12 @@
 //!   decisions that meet at a list's first ask wait for the one that fills
 //!   its cell (`ListCell`).
 
+#![expect(
+    clippy::exhaustive_enums,
+    clippy::exhaustive_structs,
+    reason = "a caller still builds or matches these types whole: each mark comes with its call"
+)]
+
 use std::time::Instant;
 #[cfg(feature = "in-process")]
 use std::{borrow::Cow, fmt, sync::Arc};
@@ -270,6 +276,7 @@ impl RequestMaker for Request<'_> {
 /// A lease issued for a plain request that was never made states no
 /// session: no rule of a place picked by its picker alone reads one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Plain {
     /// The request's phase
     /// ([`RequestFacts::phase`](super::view::RequestFacts::phase)).
@@ -298,6 +305,7 @@ pub struct Plain {
 /// target's position in the list it lent, with no lookup by id.
 #[cfg(feature = "in-process")]
 #[derive(Clone, Copy, Debug, Default)]
+#[non_exhaustive]
 pub enum WorkerLists<'a> {
     /// The host hands no list.
     #[default]
@@ -466,6 +474,7 @@ impl Decided {
 /// issued, no id is taken and nothing is dated. The host sends to the
 /// worker and owes the engine no word of the request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct AlonePick {
     /// The worker's place in the list.
     pub place: u32,
@@ -636,6 +645,7 @@ pub struct Request<'a> {
 
 /// A decision as its host takes it.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct DecideOutcome {
     /// The engine's decision.
     pub decision: Decision,
@@ -664,6 +674,7 @@ impl DecideOutcome {
 
 /// A pick's lease as its host receives it, with its dispatch deadline.
 #[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
 pub struct Leased {
     /// The lease issued for the pick.
     pub lease: Lease,
@@ -675,6 +686,7 @@ pub struct Leased {
 
 /// Why a door has no decision for a request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DecisionRefused {
     /// The request is a decode or encode side sent on its own. A pair is
     /// asked at its prefill, and that one request decides both sides.
@@ -692,6 +704,7 @@ pub enum DecisionRefused {
 
 /// Why a call could not issue the decode side of a pair's lease.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DecodeRefused {
     /// No lease of the gateway under that id.
     NoLease,

@@ -452,8 +452,18 @@ whether it is marked non-exhaustive and how code writes it:
 | the answers a stage gives as an enum | `ScoreSpread`, `ScoreFront`, `DrawUnit` | yes | as the events are |
 | the records a caller builds | `Needs`, `Outcome` | yes | a stage writes its `Needs` as one chain from `Needs::NONE`, a call a flag. A host makes an `Outcome` by `Outcome::reported` |
 | the records a stage answers with | `Shortlist`, `HeadRule` | yes | each is made by its call |
-| the records a stage only reads | `RequestFacts`, `Candidate`, `Constraints`, `PoolFacts`, `LoadRow`, `AffinityFacts`, `Demands`, `DemandFacts`, `Target`, `Pair`, `Pick`, `Overlap`, `Lease` | not yet | each gains fields, so code that builds one writes the rest as `..Default::default()` and never matches it whole |
-| the enums closed by design | `Decision`, `ShedReason`, `Side`, `Phase`, `Role`, `Said` | no | a caller answers every case of them, and a new case must stop its build |
+| the records a stage only reads | `RequestFacts`, `Candidate`, `Constraints`, `PoolFacts`, `LoadRow`, `AffinityFacts`, `Demands`, `DemandFacts`, `Target`, `Pair`, `Lease` | not yet | each gains fields, so code that builds one writes the rest as `..Default::default()` and never matches it whole |
+| what no caller builds or matches whole | `Pick`, `Overlap`, and every other public enum or record that no program outside the crate builds or matches whole | yes | a caller reads one by its fields, and starts one from its `Default` or its call where it has one. A `match` on one keeps an arm for the rest, and a pattern on one ends with `..` |
+| what a caller builds or matches whole | the lists a request lends, the settings, the parts of a decision, of a lease and of a binding | not yet | each takes its mark with a call to start from, and its module says so at its head |
+| the enums closed by design | `Decision`, `ShedReason`, `Side`, `Phase`, `Role`, `Said`, `Pairing`, `Head` | no | a caller answers every case of them, and a new case must stop its build |
+| the records closed by their shape | a record of one value: `WorkerId`, `LeaseId`, `GatewayId`, `TieBand`. A record with no field, as the stage `Best` | no | its one value, or its name, is the whole record |
+| a record closed by its own doc | `DispatchCounts` | no | a further number goes on `CreditedDispatches` |
+
+The crate's lint lines hold the table. `clippy::exhaustive_enums` and `clippy::exhaustive_structs` are
+on at the crate's root. A public enum, or a public record whose fields are all public, fails them
+unless it carries the mark or says at its declaration why it does not. The store's modules that leave
+the crate, and its index of cache events, take no mark: each says why at its head. No lint reads a
+case's own named fields: beyond the events above, such a case carries no mark yet.
 
 ## 4. The data the engine reads
 

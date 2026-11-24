@@ -21,6 +21,11 @@
 //! [`PolicyEngine::decide_encode_at`]: the three lists' decision, with the
 //! pair's lease a pick is issued. No lease is issued for an encoder.
 
+#![expect(
+    clippy::exhaustive_structs,
+    reason = "a caller still builds or matches these types whole: each mark comes with its call"
+)]
+
 use std::{cell::OnceCell, sync::Arc, time::Instant};
 
 use smg_worker::load::state::LoadSnapshot;

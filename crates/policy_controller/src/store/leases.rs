@@ -1,6 +1,11 @@
 //! The leases store: every issued decision, per gateway, with the term of
 //! the leader that issued it (design 4.3, 5.1 the leases row, 5.3 fencing).
 
+#![expect(
+    clippy::exhaustive_structs,
+    reason = "a caller still builds or matches these types whole: each mark comes with its call"
+)]
+
 use std::time::Instant;
 
 /// The table of counts the leases on file book and a member's place in
@@ -22,6 +27,7 @@ use crate::{
 
 /// The state of a single's lease or of one side of a pair's lease.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum LeaseState {
     /// Decided, not yet dispatched; the dispatch deadline bounds this.
     Issued,
@@ -175,6 +181,7 @@ impl DecodeSide {
 /// worker: the side's own target is the one place its worker is read
 /// ([`Sides`]), and a dispatch that moves the side moves it there.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[expect(clippy::exhaustive_structs, reason = "no field: its name is its value")]
 pub struct DecodeMark;
 
 /// One lease as the store holds it: a single's whole, or the prefill part
@@ -257,6 +264,7 @@ impl LeaseRecord {
 /// its decode side. The prefill side of a pair is the record's own lease,
 /// target and state. What a frame on a side names is read here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Sides {
     pub record: LeaseRecord,
     /// The decode side of a pair's lease; `None` for a single's.
@@ -422,6 +430,7 @@ const fn lent_pick(targets: Targets) -> Decision {
 
 /// Why a lease was not recorded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum LeaseRefused {
     /// The record's term is above the store's: the issuer has not noticed it
     /// lost, or this replica has not noticed it won.

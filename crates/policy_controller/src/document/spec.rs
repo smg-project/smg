@@ -15,6 +15,11 @@
 //! schema validates the day its stage lands. [`PolicySpec::schema`] is that
 //! schema; the field documentation of this module is its descriptions.
 
+#![expect(
+    clippy::exhaustive_structs,
+    reason = "a caller still builds or matches these types whole: each mark comes with its call"
+)]
+
 #[cfg(feature = "controller")]
 use std::sync::atomic::{self, AtomicBool};
 use std::{
@@ -448,6 +453,7 @@ fn is_default<T: Default + PartialEq>(value: &T) -> bool {
 /// by.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, default)]
+#[non_exhaustive]
 pub struct ViewSpec {
     /// The request headers a stage may read, lowercase, in the order their
     /// positions take on the wire. A name on the deny-list (`authorization`,
@@ -524,6 +530,7 @@ impl Default for ViewSpec {
 /// The under-layer of a model's prefix index.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum IndexKind {
     /// Radix trees over the prefixes seen.
     #[default]
@@ -539,6 +546,7 @@ pub enum IndexKind {
 /// [`PolicySpec::index_for`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, default)]
+#[expect(clippy::exhaustive_structs, reason = "its mark follows a field change")]
 pub struct IndexSpec {
     pub kind: IndexKind,
     /// How long a hash-index placement stays routable, in seconds.
@@ -573,6 +581,7 @@ impl Default for IndexSpec {
 /// descriptor. A descriptor component an engine does not report is unknown.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
+#[expect(clippy::exhaustive_enums, reason = "a caller answers every case")]
 pub enum Pairing {
     /// Pair on nothing, as if no descriptor existed.
     Off,
@@ -588,6 +597,7 @@ pub enum Pairing {
 /// When a pair's decode side is picked.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum DecodePick {
     /// With the prefill, in the pair's one decision.
     #[default]
@@ -604,6 +614,7 @@ pub enum DecodePick {
 /// The `pd-pair` plan's rules.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, default)]
+#[non_exhaustive]
 pub struct PdPairPlanSpec {
     pub pairing: Pairing,
     /// When a pair's decode side is picked: `with-prefill` (the default)
@@ -614,6 +625,7 @@ pub struct PdPairPlanSpec {
 /// The plans' rules, by plan name.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, default)]
+#[non_exhaustive]
 pub struct PlansSpec {
     #[serde(rename = "pd-pair")]
     pub pd_pair: PdPairPlanSpec,
@@ -626,6 +638,7 @@ fn one() -> f32 {
 /// A scorer with no parameters of its own: its weight alone.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct Weight {
     /// The scorer's weight in the profile's combined score.
     #[serde(default = "one")]
@@ -643,6 +656,7 @@ impl Default for Weight {
 /// rate, with a convex KV-pressure barrier.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct LeastLoadParams {
     /// The scorer's weight in the profile's combined score.
     #[serde(default = "one")]
@@ -679,6 +693,7 @@ impl Default for LeastLoadParams {
 /// Where prefix affinity reads placements from.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum AffinitySource {
     /// The index of cache events alone.
     Index,
@@ -694,6 +709,7 @@ pub enum AffinitySource {
 /// far past the least-loaded one, the request spills to the latter.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct SpillParams {
     /// The absolute part of the gate, in requests (default 64).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -714,6 +730,7 @@ pub struct SpillParams {
 /// the match threshold, the spill gate and the placement source.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct PrefixAffinityParams {
     /// The scorer's weight in the profile's combined score.
     #[serde(default = "one")]
@@ -759,6 +776,7 @@ impl Default for PrefixAffinityParams {
 /// yield to load. The stage orders nothing itself.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct KvPressureParams {
     /// The scorer's weight in the profile's combined score.
     #[serde(default = "one")]
@@ -790,6 +808,7 @@ impl Default for KvPressureParams {
 /// still thin.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct WarmupSliceParams {
     /// The scorer's weight in the profile's combined score.
     #[serde(default = "one")]
@@ -884,6 +903,7 @@ impl Default for BucketParams {
 /// draws among every candidate, the passed owner among them.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct BoundedLoadParams {
     /// The relative part of the rule; at least 1 (default 1.25).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -899,6 +919,7 @@ pub struct BoundedLoadParams {
 /// with a bounded-load rule.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct ConsistentHashParams {
     /// The scorer's weight in the profile's combined score.
     #[serde(default = "one")]
@@ -1435,6 +1456,7 @@ impl From<String> for FilterSpec {
 /// the catalog adds at weight one), or the name mapped to its weight and
 /// parameters ([`ScoreStage`]).
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum ScoreSpec {
     Name(String),
     Params(ScoreStage),
@@ -1873,6 +1895,7 @@ impl JsonSchema for ScoreSpec {
 /// A picker with its parameters, keyed by the picker's name.
 #[derive(Clone, Debug, PartialEq, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum PickStage {
     Best(BestParams),
     BestWithTemperature(BestWithTemperatureParams),
@@ -2051,6 +2074,7 @@ impl JsonSchema for PickSpec {
 /// picker.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[expect(clippy::exhaustive_structs, reason = "its mark follows a field change")]
 pub struct ProfileSpec {
     /// The hard filters, in order: each a name, or the name of a filter the
     /// catalog adds mapped to its parameters. Which workers the hard
@@ -2239,6 +2263,7 @@ impl Default for OverloadSpec {
 /// every request by `min_load`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum Assignment {
     /// A random worker.
     Random,
@@ -2257,6 +2282,7 @@ pub enum Assignment {
 /// one it was dispatched to (the sticky override's under `delegate`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum Recovery {
     #[default]
     Original,
@@ -2268,6 +2294,7 @@ pub enum Recovery {
 /// No stage of the profile placed such a request.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum RulePlaced {
     /// The profile's own: its stages hear the request's issue and its
     /// dispatch, it counts among the profile's sends, and its prompt is
@@ -2445,6 +2472,7 @@ pub struct CanarySpec {
 /// Whether a request may name its profile through the override header.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum Override {
     /// The override header is honoured.
     Allowed,
@@ -2456,6 +2484,7 @@ pub enum Override {
 /// Fairness admission on the binding; reserved in v1 and off.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, default)]
+#[non_exhaustive]
 pub struct AdmissionSpec {
     pub enabled: bool,
 }
@@ -2463,6 +2492,7 @@ pub struct AdmissionSpec {
 /// The plan a binding runs.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum PlanName {
     /// One profile over one pool.
     #[default]
@@ -2602,6 +2632,7 @@ pub struct BindingSpec {
 /// Which decisions a decider keeps for explain.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct ExplainSpec {
     /// Keep every Nth pick or shed per decider under this generation. Zero
     /// turns sampling off and one keeps every pick and shed.
@@ -5893,6 +5924,7 @@ struct LabelSelector {
 
 /// What one worker's registration reads as under a generation's lists.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ViewListPositions {
     /// The position of the worker's engine family, from 1; `0` when the
     /// list does not name it.

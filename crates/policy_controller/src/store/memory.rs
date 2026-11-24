@@ -70,6 +70,7 @@ const CHANGE_LOG: usize = 1_024;
 /// The store's counts one scrape reports: the first two of one state of
 /// the store.
 #[derive(Clone, Copy, Debug, Default)]
+#[non_exhaustive]
 pub struct StoreStats {
     /// The members outside the standing generation's lists.
     pub outside: OutsideLists,
@@ -145,6 +146,7 @@ pub struct MemoryStore {
 /// ([`MemoryStore::checkpoint`]). The contract's three snapshot messages are
 /// built from it: the operator's, the watch's and the replication's.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct StoreCheckpoint {
     /// The last journaled write that the tables hold, with its term; the
     /// default for a store with no journal.

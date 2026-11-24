@@ -13,6 +13,11 @@
 //! follows the move ahead of that dispatch, as a gateway's sticky map moves
 //! a pin where it selects the worker.
 
+#![expect(
+    clippy::exhaustive_structs,
+    reason = "a caller still builds or matches these types whole: each mark comes with its call"
+)]
+
 use std::{
     collections::hash_map,
     sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -72,6 +77,7 @@ impl SessionRule {
 /// pick and the lease, so a commit moves the pins by its own decision's
 /// verdict and no other request's reading of the key can erase it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SessionVerdict {
     /// No sessions rule governed the decision, or its rule placed a request
     /// of a key at its cap on another worker at the cap: its commit pins
@@ -146,6 +152,7 @@ pub type SessionPins = [WorkerId; 2];
 
 /// When a table forgets a key it holds, on the decision clock.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SessionExpiry {
     /// At this instant: the key's rule has a TTL.
     At(u64),

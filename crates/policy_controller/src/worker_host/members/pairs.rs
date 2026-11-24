@@ -45,6 +45,7 @@ impl Members {
 /// bits open, as the rows its store builds state them, and the gateway that
 /// asks gates capacity at its own commit.
 #[derive(Clone, Copy, Debug, Default)]
+#[expect(clippy::exhaustive_structs, reason = "no field: its name is its value")]
 pub struct OpenAdmission;
 
 impl PairAdmission for OpenAdmission {

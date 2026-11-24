@@ -57,6 +57,7 @@ const KEY: usize = size_of::<String>() + 4 * size_of::<usize>();
 
 /// A document's form.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum Format {
     /// A document in YAML.
     Yaml,

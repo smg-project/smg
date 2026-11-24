@@ -134,6 +134,12 @@
 //! from a stranger's by the record the elector attempted, and is adopted as
 //! its own.
 
+#![expect(
+    clippy::exhaustive_enums,
+    clippy::exhaustive_structs,
+    reason = "a caller still builds or matches these types whole: each mark comes with its call"
+)]
+
 mod file;
 #[cfg(feature = "kubernetes")]
 mod kubernetes;
@@ -234,6 +240,7 @@ impl LeaseRecord {
 
 /// What a backend did with a conditional write.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ConditionalWriteOutcome {
     /// The record was replaced.
     Done,
@@ -281,6 +288,7 @@ pub const TERM_CEILING: u64 = 1 << 24;
 
 /// Why an election step failed.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ElectError {
     #[error("election settings: {0}")]
     Settings(&'static str),

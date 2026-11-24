@@ -46,6 +46,11 @@
 //! fact are compared for equality and never interpreted. Deriving a
 //! descriptor from what an engine reports is the registration handshake's.
 
+#![expect(
+    clippy::exhaustive_structs,
+    reason = "a caller still builds or matches these types whole: each mark comes with its call"
+)]
+
 use std::{
     cmp::Ordering,
     collections::hash_map::Entry,
@@ -141,6 +146,7 @@ static NO_DESCRIPTOR: PairingDescriptor = PairingDescriptor {
 
 /// One prefill or decode worker as the pairing rule reads it.
 #[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
 pub struct Member<'a> {
     pub id: WorkerId,
     /// The wires the worker serves.
@@ -208,6 +214,7 @@ impl<'a> Member<'a> {
 
 /// The component two workers cannot pair on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
 pub enum Mismatch {
     /// Two known runtimes differ.
     Runtime,
@@ -416,6 +423,7 @@ pub fn key(member: &Member<'_>) -> String {
 /// decode on it: each pool's distinct pairing keys and the components the
 /// two pools disagree on, each list sorted.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Refusal {
     pub prefill: Vec<String>,
     pub decode: Vec<String>,

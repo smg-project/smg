@@ -221,6 +221,7 @@ struct Bound {
 
 /// Where a bound controller listens.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct Addresses {
     /// The gRPC listeners, in configuration order.
     pub listeners: Vec<ListenerAddress>,
@@ -230,6 +231,7 @@ pub struct Addresses {
 
 /// One bound gRPC listener.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct ListenerAddress {
     /// The listener's name.
     pub name: String,
@@ -253,6 +255,7 @@ impl Addresses {
 
 /// A controller that did not start or did not serve.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     /// The configuration was refused.
     #[error("configuration: {0}")]

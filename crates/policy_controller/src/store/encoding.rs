@@ -40,6 +40,11 @@
 //! the store's door normalizes once a write ([`EncodeOffer::normalized`]),
 //! so a blank one states no connector.
 
+#![expect(
+    clippy::exhaustive_structs,
+    reason = "a caller still builds or matches these types whole: each mark comes with its call"
+)]
+
 use rustc_hash::FxHashMap;
 
 use super::pairing::{known, normalize};
@@ -50,6 +55,7 @@ mod tests;
 
 /// The form a worker's registration states for the encode handoff.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum EncodeHandoff {
     /// No form is stated: the worker has no end of an encode handoff.
     #[default]

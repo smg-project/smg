@@ -466,6 +466,7 @@ impl DerefMut for Turn<'_> {
 /// stands, and whether the look applied a frame. Its host sets the time
 /// to its next look by it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum LookOutcome {
     /// The thread keeps no watch: the file holds no lease, and a watch
     /// it kept has ended, by its word first and one more look behind it.

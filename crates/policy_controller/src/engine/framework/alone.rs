@@ -18,6 +18,7 @@ pub struct AloneProfile(pub(crate) u16);
 /// What a document holds for one place a caller builds a policy for: a
 /// model and a phase ([`Engine::place_for`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Place<'a> {
     /// No binding names the model for the phase.
     Unbound,
@@ -42,6 +43,7 @@ pub enum Place<'a> {
 /// A place a binding of a document names that asks more of a decision than
 /// one pick of its profile's picker ([`Engine::not_alone`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct NotAlone<'a> {
     /// The model pattern of the binding that names the place.
     pub model: &'a str,

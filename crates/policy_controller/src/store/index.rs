@@ -37,6 +37,12 @@
 //! behind them. The cases' reader of overlaps takes each lane's lock under
 //! the table's, an order no path inverts.
 
+#![expect(
+    clippy::exhaustive_enums,
+    clippy::exhaustive_structs,
+    reason = "the store's index of cache events moves to the worker's side, which decides its types"
+)]
+
 use std::{
     cell::Cell,
     collections::HashMap,

@@ -2,6 +2,12 @@
 //! controller's door uses them behind the wire. A host can use them over
 //! a store it holds in its own process.
 
+#![expect(
+    clippy::exhaustive_enums,
+    clippy::exhaustive_structs,
+    reason = "the store's table of worker records leaves the crate, and its types with it"
+)]
+
 use std::{collections::hash_map::RandomState, fmt, hash::BuildHasher, sync::Arc, time::Instant};
 
 use super::workers::{

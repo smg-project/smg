@@ -64,6 +64,7 @@ pub(crate) use status::tests::stand;
 
 /// The row an object stands for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct RowRevision {
     /// The row's id in the store: where a write about the object's worker
     /// lands.

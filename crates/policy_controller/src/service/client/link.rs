@@ -64,6 +64,7 @@ pub struct Link {
 /// Why an ask has no usable decision from the controller. The host can
 /// decide the request itself.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum DecisionUnavailable {
     /// The stream holds no credit. Nothing was sent.
     NoCredit,

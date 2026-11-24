@@ -9,6 +9,12 @@
 //! calls the lifecycle once per side. Every stateful built-in keeps its state
 //! behind these events alone.
 
+#![expect(
+    clippy::exhaustive_enums,
+    clippy::exhaustive_structs,
+    reason = "a caller still builds or matches these types whole: each mark comes with its call"
+)]
+
 use std::{fmt, time::Instant};
 
 use crate::{
@@ -21,6 +27,7 @@ use crate::{
 };
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[expect(clippy::exhaustive_structs, reason = "its one value is the record")]
 pub struct LeaseId(pub u64);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -36,6 +43,7 @@ pub enum LeaseKind {
 
 /// Which side of a dispatch a lease or an event is about.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[expect(clippy::exhaustive_enums, reason = "a caller answers every case")]
 pub enum Side {
     #[default]
     Single,
@@ -250,6 +258,7 @@ pub struct Dispatch {
 /// ([`DecisionEngine::say`](crate::engine::DecisionEngine::say)): a side's
 /// dispatch, a side's end, or a release.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[expect(clippy::exhaustive_enums, reason = "a caller answers every case")]
 pub enum Said {
     /// The dispatch the frame names, and the instant the frame was read.
     Dispatched(Dispatch, Instant),

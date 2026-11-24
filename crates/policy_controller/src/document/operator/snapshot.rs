@@ -8,6 +8,11 @@
 //! A page writes itself as JSON ([`WorkerRowsPage`]): a host in process serves
 //! the rows an operator reads with no mapping of its own.
 
+#![expect(
+    clippy::exhaustive_structs,
+    reason = "a caller still builds or matches these types whole: each mark comes with its call"
+)]
+
 use std::{borrow::Cow, collections::BTreeMap, sync::Arc, time::Instant};
 
 use serde::{Serialize, Serializer};
@@ -80,6 +85,7 @@ pub(crate) fn serves(models: &[String], row: &WorkerRow) -> bool {
 }
 
 /// The store rows read for a snapshot.
+#[non_exhaustive]
 pub enum Rows {
     /// A shared cut, ordered by registration key, before model filtering.
     Shared(Arc<StoreCheckpoint>),
@@ -90,6 +96,7 @@ pub enum Rows {
 
 /// A page of worker rows as an operator reads it.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct WorkerRowsPage {
     /// The matching rows in registration key order, with addresses redacted.
     pub rows: Vec<WorkerRow>,

@@ -7,6 +7,7 @@
 /// How a host reads the rows a ruling named ([`WarmUpRule::list_warming_rows`])
 /// at an instant of the ruling's clock.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct WarmUpState {
     /// The rows named are the thin.
     pub thin: bool,

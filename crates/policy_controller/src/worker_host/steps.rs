@@ -35,6 +35,7 @@ pub const DISCOVERY: &str = "discovery";
 
 /// Why a job's asker cannot make a registration.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum RegistrantError {
     /// Health checks ask for removals.
     #[error("health checks do not register workers")]
@@ -94,6 +95,7 @@ struct Keeping {
 /// would hold nothing of what the registration kept.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 #[error("the holder was built with no keeper, so its registration line can keep no credential")]
+#[expect(clippy::exhaustive_structs, reason = "no field: its name is its value")]
 pub struct NoCredentials;
 
 /// Mark the rows that still stand for the workers this removal names.
