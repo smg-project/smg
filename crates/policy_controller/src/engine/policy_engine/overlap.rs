@@ -690,6 +690,10 @@ struct Table {
     /// A bit an index number: a row of the list the index speaks for. The
     /// index's lookup is kept within these.
     within: Box<[u64]>,
+    /// Row of the list -> its number in the index, `NONE` where it has
+    /// none: the bits a request held to places is kept within
+    /// ([`Self::mask`]).
+    numbers: Box<[u32]>,
     /// A bit a row: the index speaks for the row. It holds a number in the
     /// index and a block or more there. The record of sent prefixes speaks
     /// for every other row.
@@ -784,6 +788,7 @@ impl Table {
             index: None,
             row_of: Box::default(),
             within: Box::default(),
+            numbers: Box::default(),
             heard: Box::default(),
             heard_any: false,
             unheard_any: false,
@@ -856,6 +861,7 @@ impl Table {
         table.index = index;
         table.row_of = row_of.into();
         table.within = within.into();
+        table.numbers = numbers.into();
         table.heard = heard.into();
         if let Some(rule) = engine.pool_rule_for(model, phase) {
             let (mut level, mut warming) = (Vec::new(), Vec::new());
@@ -938,13 +944,15 @@ impl Table {
     /// request's prefix reaches, each holding its first `blocks` blocks, and
     /// the list's warming rows. Each list is at most the cap, ascending by
     /// row: past the cap the holders are a draw. A match under one block
-    /// names no holder.
+    /// names no holder. A request held to `places` is named the rows among
+    /// them, and the cap counts no other.
     fn name_sent(
         &self,
         sent: &[TenantId],
         blocks: u32,
         workers: &[Arc<dyn Worker>],
         facts: &RequestFacts<'_>,
+        places: Option<&[u32]>,
         buffers: &mut Buffers,
     ) {
         let Buffers {
@@ -960,6 +968,9 @@ impl Table {
         let mut seen = 0usize;
         for address in sent.iter().filter(|_| blocks > 0) {
             self.rows_at(workers, address, |row| {
+                if !among(places, row) {
+                    return;
+                }
                 let holder = AffinityHolder {
                     row,
                     overlap_blocks: 0,
@@ -976,7 +987,26 @@ impl Table {
             });
         }
         holders.sort_unstable_by_key(|holder| holder.row);
-        self.name_warming(facts, warming, picked, live);
+        self.name_warming(facts, places, warming, picked, live);
+    }
+
+    /// The mask the index's lookup is kept within for a request: the
+    /// table's, and for a request held to `places` the table's bits of the
+    /// rows among them, written into `own`. A request that states no places
+    /// is handed the table's by one test and no write.
+    fn mask<'m>(&'m self, places: Option<&[u32]>, own: &'m mut Vec<u64>) -> &'m [u64] {
+        let Some(places) = places else {
+            return &self.within;
+        };
+        own.clear();
+        own.resize(self.within.len(), 0);
+        for &row in places {
+            let number = self.numbers.get(row as usize).copied().unwrap_or(NONE);
+            if number != NONE && is_set(&self.within, number as usize) {
+                set(own, number as usize);
+            }
+        }
+        own
     }
 
     /// Names a request's rows into `buffers`: its deepest holders and the
@@ -992,9 +1022,19 @@ impl Table {
     /// The warming rows are the table's whose naming has not ended at the
     /// request's instant: whole within the cap, a draw of the cap past it.
     ///
+    /// A request held to `places` is named the rows among them: the index
+    /// is asked within them ([`Self::mask`]), and the record's holders and
+    /// the warming rows outside them are passed over before a cap counts.
+    /// So a row outside the places takes no room from one among them.
+    ///
     /// Returns what was read of the record, where it was read: the pick's
     /// write stands on it.
-    fn name(&self, facts: &RequestFacts<'_>, buffers: &mut Buffers) -> Option<RecordRead> {
+    fn name(
+        &self,
+        facts: &RequestFacts<'_>,
+        places: Option<&[u32]>,
+        buffers: &mut Buffers,
+    ) -> Option<RecordRead> {
         let Buffers {
             holders,
             warming,
@@ -1003,6 +1043,7 @@ impl Table {
             deepest,
             picked,
             live,
+            within,
             ..
         } = buffers;
         holders.clear();
@@ -1017,8 +1058,9 @@ impl Table {
             .filter(|_| hashed && self.unheard_any);
         let mut read = None;
         if self.ahead {
-            read = record
-                .map(|record| self.name_recorded(record, facts, keys, deepest, holders, &mut draw));
+            read = record.map(|record| {
+                self.name_recorded(record, facts, places, keys, deepest, holders, &mut draw)
+            });
         }
         let room = cap.saturating_sub(holders.len());
         // An engine's events are token blocks: a request hashed by windows
@@ -1029,7 +1071,7 @@ impl Table {
             index.deepest_into(
                 facts.block_hashes,
                 facts.block_size,
-                &self.within,
+                self.mask(places, within),
                 room,
                 &mut |under| below(&mut draw, under),
                 kept,
@@ -1046,11 +1088,12 @@ impl Table {
             }
         }
         if !self.ahead {
-            read = record
-                .map(|record| self.name_recorded(record, facts, keys, deepest, holders, &mut draw));
+            read = record.map(|record| {
+                self.name_recorded(record, facts, places, keys, deepest, holders, &mut draw)
+            });
         }
         holders.sort_unstable_by_key(|holder| holder.row);
-        self.name_warming(facts, warming, picked, live);
+        self.name_warming(facts, places, warming, picked, live);
         read
     }
 
@@ -1086,11 +1129,18 @@ impl Table {
     /// The record's holders of the request, behind the holders already
     /// named and in the room the cap leaves: the workers sent the deepest
     /// block of it that a worker the record speaks for was sent, a draw of
-    /// them where they would fill more than the room.
+    /// them where they would fill more than the room. The deepest block is
+    /// the list's, as a tree's walk finds it: a request held to `places` is
+    /// named the workers sent it among them, and none sent a shorter one.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the record, the request and its places, the read's two buffers, and the naming's list and draw"
+    )]
     fn name_recorded(
         &self,
         record: &PrefixRecord,
         facts: &RequestFacts<'_>,
+        places: Option<&[u32]>,
         keys: &mut Vec<u64>,
         deepest: &mut Vec<WorkerId>,
         holders: &mut Vec<AffinityHolder>,
@@ -1104,7 +1154,7 @@ impl Table {
         }
         let mut seen = 0usize;
         for &id in deepest.iter() {
-            let Some(row) = self.spoken_row(id) else {
+            let Some(row) = self.spoken_row(id).filter(|&row| among(places, row)) else {
                 continue;
             };
             let holder = AffinityHolder {
@@ -1132,6 +1182,7 @@ impl Table {
     fn name_warming(
         &self,
         facts: &RequestFacts<'_>,
+        places: Option<&[u32]>,
         warming: &mut Vec<u32>,
         picked: &mut Vec<u32>,
         live: &mut Vec<(u32, u64)>,
@@ -1142,9 +1193,12 @@ impl Table {
             return;
         }
         let mut rows: &[(u32, u64)] = &self.warming;
-        if now >= self.first_end {
+        if now >= self.first_end || places.is_some() {
+            // A request held to places is named the rows among them, before
+            // the cap cuts.
             live.clear();
-            live.extend(rows.iter().filter(|&&(_, until)| now < until).copied());
+            let live_among = |&&(row, until): &&(u32, u64)| now < until && among(places, row);
+            live.extend(rows.iter().filter(live_among).copied());
             rows = live;
         }
         if rows.len() <= self.cap {
@@ -1252,6 +1306,12 @@ fn is_set(mask: &[u64], at: usize) -> bool {
         .is_some_and(|word| word & (1 << (at % 64)) != 0)
 }
 
+/// Whether `row` is among the places a request is held to, which ascend:
+/// every row is, for a request that states none.
+fn among(places: Option<&[u32]>, row: u32) -> bool {
+    places.is_none_or(|places| places.binary_search(&row).is_ok())
+}
+
 /// A naming's buffers, the calling thread's own across decisions.
 #[derive(Default)]
 struct Buffers {
@@ -1267,6 +1327,8 @@ struct Buffers {
     deepest: Vec<WorkerId>,
     picked: Vec<u32>,
     live: Vec<(u32, u64)>,
+    /// The mask of a request held to places, for the index's lookup.
+    within: Vec<u64>,
     /// The column a single decision is handed where its profile is named
     /// no row.
     column: Vec<AffinityFacts>,
@@ -1282,6 +1344,7 @@ impl Buffers {
             deepest: Vec::new(),
             picked: Vec::new(),
             live: Vec::new(),
+            within: Vec::new(),
             column: Vec::new(),
         }
     }
@@ -1384,6 +1447,7 @@ pub fn decide<'p>(
     workers: &[Arc<dyn Worker>],
     ids: &[WorkerId],
     facts: &mut RequestFacts<'_>,
+    places: Option<&[u32]>,
     token_key: impl FnOnce(usize) -> Option<TokenKey<'p>>,
     sends_to: impl Fn(&Target) -> bool,
     mut decide: impl FnMut(&mut RequestFacts<'_>) -> Decision,
@@ -1421,7 +1485,7 @@ pub fn decide<'p>(
     };
     with_buffers(|buffers| {
         pool.with_table(&asked, |table| {
-            table.decide(workers, facts, buffers, token_key, sends_to, decide)
+            table.decide(workers, facts, places, buffers, token_key, sends_to, decide)
         })
     })
 }
@@ -1630,10 +1694,15 @@ impl Table {
     /// record's write behind a pick. A request whose host names its entry
     /// in the token tree it lends is decided inside the tree's match
     /// ([`Self::decide_in_tree`]).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the list, the request's facts and its places, the buffers, its entry in a tree and the target its caller takes, and the decision"
+    )]
     fn decide<'p>(
         &self,
         workers: &[Arc<dyn Worker>],
         facts: &mut RequestFacts<'_>,
+        places: Option<&[u32]>,
         buffers: &mut Buffers,
         token_key: impl FnOnce(usize) -> Option<TokenKey<'p>>,
         sends_to: impl Fn(&Target) -> bool,
@@ -1650,9 +1719,17 @@ impl Table {
         let sent = self.sent.as_deref();
         let keyed = sent.and_then(|sent| Some((sent, token_key(sent.page_size())?)));
         if let Some((sent, key)) = keyed {
-            return self.decide_in_tree((sent, &key), sends_to, workers, facts, buffers, decide);
+            return self.decide_in_tree(
+                (sent, &key),
+                sends_to,
+                workers,
+                facts,
+                places,
+                buffers,
+                decide,
+            );
         }
-        let read = self.name(facts, buffers);
+        let read = self.name(facts, places, buffers);
         let named = AffinityRows {
             holders: &buffers.holders,
             warming: &buffers.warming,
@@ -1703,17 +1780,22 @@ impl Table {
     /// nothing: the match has marked the path it walked as used, as every
     /// match of the tree does. The record of hashed prefixes is neither
     /// read nor written.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the tree and the entry, the target the caller takes, the list, the request's facts and its places, the buffers, and the decision"
+    )]
     fn decide_in_tree(
         &self,
         (sent, key): (&TokenTree, &TokenKey<'_>),
         sends_to: impl Fn(&Target) -> bool,
         workers: &[Arc<dyn Worker>],
         facts: &RequestFacts<'_>,
+        places: Option<&[u32]>,
         buffers: &mut Buffers,
         mut decide: impl FnMut(&mut RequestFacts<'_>) -> Decision,
     ) -> Decision {
         let mut decide_over = |holders: &[TenantId], blocks: u32| {
-            self.name_sent(holders, blocks, workers, facts, buffers);
+            self.name_sent(holders, blocks, workers, facts, places, buffers);
             decide(&mut RequestFacts {
                 named: Some(AffinityRows {
                     holders: &buffers.holders,
