@@ -453,7 +453,7 @@ async fn dial_leader(
 
 /// What the controller answered one ask.
 #[derive(Clone, Debug, PartialEq)]
-#[non_exhaustive]
+#[expect(clippy::exhaustive_enums, reason = "a caller still matches it whole")]
 pub enum Answer {
     /// The controller's decision as the wire says it: a pick, a shed or a
     /// queue, with the leases it booked and its trace. One with no outcome
