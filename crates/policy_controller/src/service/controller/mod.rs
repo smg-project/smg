@@ -784,11 +784,10 @@ impl Controller {
 
     /// The KV tables of this replica: the ones its holder of worker objects
     /// makes lanes in and its cache-event feed writes. A caller reads a
-    /// row's cursor, its indexed blocks and the resync counts through it,
-    /// and writes nothing.
+    /// row's cursor, its indexed blocks, the resync counts and a model's
+    /// block size through it, and writes nothing.
     pub fn kv_tables(&self) -> Arc<KvTables> {
-        // The holder built for a controller is always handed its tables.
-        self.workers.holder().kv_tables().unwrap_or_default()
+        self.workers.kv_tables()
     }
 
     /// A read handle on the controller's state, valid across [`Self::serve`].
