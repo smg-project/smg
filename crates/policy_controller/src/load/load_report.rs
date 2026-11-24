@@ -22,6 +22,8 @@ use crate::{
 /// the scorer prices the worker at the fleet's nominal rate. Any other
 /// role's drain is the generation rate of the ranks with a request running.
 /// A known rate under one token a second reads as one, zero being unknown.
+/// The resident tokens are counted by such a complete report alone: a
+/// rank the report leaves out holds tokens no sum of the others states.
 /// `source` is where the report came from; `report_age_ms` is `now` less
 /// `sampled_at`.
 pub fn load_row(
@@ -38,10 +40,9 @@ pub fn load_row(
     let mut kv_usage = 0.0f64;
     let mut active_kv = 0.0f64;
     let mut live_rate = 0.0f64;
-    let complete = !report.loads.is_empty()
-        && report.loads.len() >= usize::try_from(report.dp_rank_count).unwrap_or(0);
+    let complete = report.lists_every_rank();
     let mut prefill_rate: Option<f64> = complete.then_some(0.0);
-    let mut resident: Option<i64> = Some(0);
+    let mut resident: Option<i64> = complete.then_some(0);
     for rank in &report.loads {
         running += i64::from(rank.num_running_reqs);
         queued += i64::from(rank.num_waiting_reqs);
@@ -81,8 +82,8 @@ pub fn load_row(
             0
         },
         resident_tokens: resident.map_or(0, narrow),
-        // Counted when the report has ranks and every one of them sends it.
-        resident_counted: resident.is_some() && !report.loads.is_empty(),
+        // Counted when the report is complete and every rank it lists sends it.
+        resident_counted: resident.is_some(),
         report_age_ms: u32::try_from(now.saturating_duration_since(sampled_at).as_millis())
             .unwrap_or(u32::MAX),
         source,
@@ -335,8 +336,10 @@ mod tests {
         assert_eq!(row.report_age_ms, 0);
     }
 
-    /// One rank without the count, or a report with no rank, is a report
-    /// that does not count resident tokens, not a count of zero.
+    /// One rank without the count, a report that lists fewer ranks than it
+    /// states, or a report with no rank, is a report that does not count
+    /// resident tokens, not a count of zero: so reads the gateway's own
+    /// total of the same report.
     #[test]
     fn resident_tokens_are_counted_only_when_every_rank_sends_them() {
         let now = Instant::now();
@@ -345,6 +348,11 @@ mod tests {
         let one_silent = report(vec![rank(1, 0, 0.1, 40.0, None), silent]);
         let row = load_row(&one_silent, Role::Single, now, now, SignalSource::Poll);
         assert_eq!((row.resident_tokens, row.resident_counted), (0, false));
+        let mut one_missing = report(vec![rank(1, 0, 0.1, 40.0, None)]);
+        one_missing.dp_rank_count = 2;
+        let row = load_row(&one_missing, Role::Single, now, now, SignalSource::Poll);
+        assert_eq!((row.resident_tokens, row.resident_counted), (0, false));
+        assert_eq!(one_missing.total_resident_tokens(), None);
         let no_rank = load_row(&report(vec![]), Role::Single, now, now, SignalSource::Poll);
         assert_eq!(
             (no_rank.resident_tokens, no_rank.resident_counted),

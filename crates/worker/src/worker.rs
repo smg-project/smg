@@ -2157,14 +2157,22 @@ impl WorkerLoadResponse {
             .sum()
     }
 
+    /// Whether the report lists at least one entry and as many as the ranks it
+    /// states: a report short of a rank states no whole-worker sum.
+    pub fn lists_every_rank(&self) -> bool {
+        !self.loads.is_empty()
+            && self.loads.len() >= usize::try_from(self.dp_rank_count).unwrap_or(0)
+    }
+
     /// Resident context tokens summed across all DP ranks; `None` unless
-    /// every rank reports them.
+    /// every rank reports them. A report that lists fewer entries than the
+    /// ranks it states answers `None` too, ahead of any sum: the ranks it
+    /// leaves out are in none.
     pub fn total_resident_tokens(&self) -> Option<i64> {
-        self.loads
-            .iter()
-            .map(|l| l.num_resident_tokens)
-            .sum::<Option<i64>>()
-            .filter(|_| !self.loads.is_empty())
+        if !self.lists_every_rank() {
+            return None;
+        }
+        self.loads.iter().map(|l| l.num_resident_tokens).sum()
     }
 
     /// Total running requests summed across all DP ranks.
