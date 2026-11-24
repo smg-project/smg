@@ -2068,11 +2068,11 @@ pub struct ProfileSpec {
     /// in the order of their names. A new document's count takes over the
     /// sends of the standing count under the same limit and delay,
     /// whichever profiles read that one. Where none stands under them, it
-    /// takes over those of the standing count under the same name, or
-    /// else of a standing count that no count of the new document took.
-    /// The two counts share the sends: a read under the shorter of two
-    /// delays ends such a send for both. A count that finds none starts
-    /// empty.
+    /// takes over those of the standing count under the same name, unless
+    /// a count of the new document took that one by its settings, or else
+    /// of a standing count that no count of the new document took. The
+    /// two counts share the sends: a read under the shorter of two delays
+    /// ends such a send for both. A count that finds none starts empty.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1))]
     pub sent_report_delay_ms: Option<u32>,

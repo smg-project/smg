@@ -4951,12 +4951,14 @@ impl Engine {
         // then the first left. So no count's match by an earlier rule is
         // taken by another count's later one.
         let mut taken: Vec<Option<usize>> = vec![None; self.sent_credits.len()];
+        let mut free = vec![true; prior.len()];
+        // The third rule's place among the standing counts: it only moves on.
+        let mut left = 0..prior.len();
         for rule in 0..3 {
             for (at, credit) in self.sent_credits.iter().enumerate() {
                 if taken[at].is_some() {
                     continue;
                 }
-                let free = |standing: &usize| !taken.contains(&Some(*standing));
                 taken[at] = match rule {
                     0 => prior
                         .iter()
@@ -4964,9 +4966,12 @@ impl Engine {
                     1 => prior
                         .binary_search_by(|count| count.profile.cmp(&credit.profile))
                         .ok()
-                        .filter(free),
-                    _ => (0..prior.len()).find(free),
+                        .filter(|&standing| free[standing]),
+                    _ => left.find(|&standing| free[standing]),
                 };
+                if let Some(standing) = taken[at] {
+                    free[standing] = false;
+                }
             }
         }
         for (credit, at) in self.sent_credits.iter().zip(taken) {
