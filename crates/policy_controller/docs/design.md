@@ -148,7 +148,7 @@ their tests. The record writer and its tests are 3,354 more.
 ## 3. The policy document **[built]**
 
 A policy document says how workers are chosen. It has a generation number. A new document
-replaces the old one whole, under the next number.
+replaces the old one whole, under a number above the old one's.
 
 ### 3.1 Its shape
 
@@ -529,7 +529,8 @@ such a worker, as a gateway does on that wire (section 9.2). The classes hold a 
 of both wires in one table, so a pair of the HTTP wire is a first pair too: no order stands
 between the wires, and a frame decided over both has no twin in a gateway's own placement,
 which places each request on one wire. A row whose facts change gets a new worker object, so
-the registry builds a new list and a new `G` for each model the worker serves. The classes are
+the registry builds a new list and a new `G` for each model the worker serves, and for each model
+it leaves. The classes are
 derived once for a `G` and a pairing mode, at the first ask, and stand with it.
 
 A controller knows no admission window of a gateway. So it reads a pair's admission open
@@ -629,7 +630,8 @@ records while the replica leads, and a standby drops them (section 10.2).
 ### 4.4 The in-flight counters **[built]** (`smg-worker`)
 
 A route creates one `WorkerLoadGuard` for the worker it chose. The guard adds one to the worker's
-in-flight counter, and to its routing key's counter. It lives as long as the request. At its drop
+in-flight counter, and to its routing key's counter. It lives as long as the request is on that
+worker. At its drop
 it takes one off and tells the worker's `RequestCompletionSink` that a request ended. Every path
 passes through it: success, error and a client that went away.
 
@@ -1248,7 +1250,7 @@ The types the two engines shared stay where they were moved ahead of the deletio
 
 ### 5.8 What changes in the kept engine **[planned]**
 
-- It honours what it refuses today: an encode request's pair held to some workers of its two
+- It honours what it once refused: an encode request's pair held to some workers of its two
   lists, and its encoders held to some of theirs (`EncodeLists::decide` decides the request
   among the places its host states for each of the three lists, section 5.4, which is
   built); an encode request's demands, kept a list at a time as a single request's and a pair's
@@ -1263,9 +1265,11 @@ The types the two engines shared stay where they were moved ahead of the deletio
   whose own load guard counts, and under the session's number for a controller, which counts
   by the leases it holds (10.2).
   `Constraints::pins`, the session pins a host kept outside the engine, is removed with
-  its trait `PinSource`: no host lent any. A session's worker is to outlive a document in the
-  engine's own table, which the front shares with its document's engine
-  (`Engine::share_sessions`), once a running engine takes a new document.
+  its trait `PinSource`: no host lent any. A session's worker outlives a document on the same
+  engine object, which is built. The call that puts a later document in force there shares
+  the engine's table with the new document's engine (`Engine::share_sessions`, section 5.1).
+  A controller builds a new engine object for each document, and its pins start empty
+  (section 10.2).
 - The trait's method that the kept engine answers with a constant, `decide_encode_pair`, is built
   or removed. It is removed, and the guard's maker of that name with it, which is done: a host
   asks the engine's own entry with its three lists (`PolicyEngine::decide_encode_at`) and holds
@@ -1609,8 +1613,9 @@ The start answers the task, and the host spawns it on a runtime of its choice: t
 nothing. The call is marked `#[must_use]`, with the reason that the task does nothing until it is
 spawned. So the compiler warns a caller that drops the whole answer. It does not warn a caller
 that keeps the engine and drops the task. That caller's engine keeps no load snapshot, runs no
-upkeep, tells the policies no worker, tells no policy a load report and fills no cell ahead of a
-request.
+upkeep, tells no policy a load report and fills no cell ahead of a request. It tells the
+policies no worker either, with one exception: a later document put in force has the policies it
+builds new told the workers that stand (section 8.1, step 6).
 
 The start takes no worker lists. Each request gives its own. The engine's task asks only the
 lists a host hands it beside the start, to fill their cells (the fifth job below).
@@ -1673,7 +1678,8 @@ request otherwise:
 These faults are held and counted with the task's faults (`PolicyEngine::upkeep_faults`):
 
 - a panic of the host's own code where a worker names its models, which costs that worker's
-  fills alone;
+  fills and, where the worker was replaced under its id, its record of sent prefixes and the
+  stages' word of the models it left;
 - a list refused for its facts, which costs its own fill alone;
 - a panic of the host's own code where it hands a model's lists, which costs the lists of that
   model not yet handed.
@@ -1886,7 +1892,7 @@ impl Placement<'_> {
 
 What a placement holds, and so what these calls do, depends on the request:
 
-- **A single request.** Where the document's stages want no events, its placement holds nothing
+- **A single request.** Where the document's stages want no events, its placement holds no lease
   and these calls do nothing.
 - **A pair.** Its placement always holds a lease (section 6).
 - **An encode request.** Its placement always holds a lease too: it reports its pair's two sides
@@ -2043,7 +2049,7 @@ request ──> route (HTTP or gRPC, any family)
               │
               └─ engine on  ──> engine.place(request) ──> Placement
               ▼
-        the load guard for the chosen worker   (exists today; lives as long as the request)
+        the load guard for the chosen worker   (exists today; lives while the request is on it)
               ▼
         send ──> response ──> the guard is dropped ──> the engine hears: ended, or released
 ```
@@ -2068,7 +2074,7 @@ request ──> route (HTTP or gRPC, any family)
   A retry held to its wire is placed over the pool's whole list and stays on the wire by its demand (section 8.2) **[built]**. The gateway gives each runtime and transport it dials one number. It states that number of each worker where a list is first lent to the engine, and a retry states its wire's number as its demand, as does a first attempt its route pins to a wire. A request pinned to no wire states none. The route's own rule for a worker still holds beside the demand. An encode request that states a demand is held to it a list at a time (section 5.4). The gateway hands the engine no such request yet: its encode entry waits until the two refusals of section 5.4 are named as classic names them **[planned]**.
 
 - **The request's end.** The placement stays with the request's load guard, which every route
-  already keeps to the end of the response, streamed or not (decision 4).
+  already keeps for as long as the request is on its worker, streamed or not (decision 4).
 
   The engine hears the dispatch where the guard is made, or at the send for a guard a route makes
   ahead of its send, and the end where the guard is dropped. It hears a guard dropped before its
@@ -2240,7 +2246,8 @@ the controller already opens the workers' streams with that collector, on every 
 runs that load monitor while it leads. The load records on the streams are handed to that
 monitor while the replica leads, and a standby drops them. A gRPC worker that is not indexed
 streams its load records alone: the leader reads its load from that stream, and polls it only
-while its records are not fresh. A standby holds that stream too, so a take finds it open.
+while its records are not fresh. A worker that refuses that stream has none, and the leader polls
+it at every interval. A standby holds that stream too, so a take finds it open.
 
 The contract has two calls that would push the same data to a controller, `PushLoad` and
 `PushKvEvents`. They are a relay's calls, not a worker's. A relay is a gateway in front of a
@@ -2331,8 +2338,8 @@ whole record read back (step 1 below). Of the 24 facts a worker's record holds:
   encode offer, vision, the admission window, the priority, from where the worker is reached,
   how its signals arrive and the demand facts. Three of them have a place of the object's own
   that a record does not fill: the object's priority is unsigned where a record's is signed,
-  the object derives its pairing facts when it is built, and it reads its admission window
-  from a label. The remainder holds the ten, with the record's id and revision, who registered
+  the object derives its pairing facts when it is built, and its admission window too, from
+  a label. The remainder holds the ten, with the record's id and revision, who registered
   it and when.
 
 A fact leaves the remainder when the worker object gets a field that holds it as stated
@@ -2775,7 +2782,7 @@ request's entry in a tree must be named as classic names it.
 
 | Option | Cost |
 |---|---|
-| (a) The host hands the entry already named, with the length of the partition's marker at its start. The engine takes it as it takes the prompt's hash seeds today. | About 70 lines in the crate. Nothing outside it now; about 15 lines (an estimate) in the gateway's one integration, calling classic's own two naming functions. The naming is then the host's to keep: a host that hands a plain entry for a partitioned request lets two tenants' prompts match. |
+| (a) The host hands the entry already named, with the length of the partition's marker at its start. The engine takes it as it takes the prompt's hash seeds today. | About 70 lines in the crate, and about 15 lines (an estimate) in the gateway's one integration, calling classic's own two naming functions. The naming is then the host's to keep: a host that hands a plain entry for a partitioned request lets two tenants' prompts match. |
 | (b) Classic's naming (336 lines) and its two functions move into the kv-index crate. | A move across 12 files, 10 of them in the gateway. No behaviour changes. |
 
 Under (a) the engine also states for itself which of the three records a request reads (the rule
@@ -2784,8 +2791,9 @@ Classic's `cache_aware` sheet has lines for all three records (12, 13 and 3) and
 engine's rule equal to classic's. The other way is one function in the kv-index crate that
 classic calls too: about 90 lines, and it touches the gateway.
 
-**Recommendation: (a).** Nothing is copied and nothing moves. Work has started on it, inside the
-crate only.
+**Recommendation: (a).** Nothing is copied and nothing moves. Work on it is on main, in the crate
+and in the gateway: the gateway hands a tokenized request's entry already named, by classic's own
+naming function, and lends its token tree.
 
 ### Decision 2: recorders for the sheets that are missing
 
@@ -2823,7 +2831,7 @@ request's heads.
 
 | Option | Cost |
 |---|---|
-| (a) Inside the load guard: the worker crate's `WorkerLoadGuard` gets one optional field. | One small addition to the worker crate. No route gets a new value to keep: every route already keeps the guard to the end of the response. |
+| (a) Inside the load guard: the worker crate's `WorkerLoadGuard` gets one optional field. | One small addition to the worker crate. No route keeps the placement itself: every route already keeps the guard for as long as the request is on its worker. A route that tells an outcome keeps a handle on the request's end as well, in its answer or with its stream's reader (section 9.2). |
 | (b) Each route keeps the placement beside its guard. | No change to the worker crate. Every route changes, which is what made the earlier integration wide. |
 
 **Recommendation: (a).** Taken with the integration, not before.
@@ -2898,7 +2906,7 @@ controller (section 11) brings `--policy-controller-address` and three TLS optio
 |---|---|---|
 | A model's lists by role and protocol, with the engine's value beside each | one type in the worker crate that the gateway and the controller both use | 279 lines added; the gateway moves onto it at its integration |
 | A load monitor that a controller can stop when it stops leading, and start again | one public `stop()` on the worker crate's monitor | about 110 lines with its test |
-| The facts of a worker that a decision reads and a worker object does not hold today (zone, the encode offer, vision, the admission window, the demand facts, pairing) | the controller keeps them beside the object (10.3, built); a fact moves to a field of the worker crate's object when that crate has one that holds it as stated, checked against the crate first | 245 lines of code for what is kept beside the object |
+| The facts of a worker that a decision reads and a worker object does not hold as its record states them (zone, the encode offer, vision, the admission window, the demand facts, pairing) | the controller keeps them beside the object (10.3, built); a fact moves to a field of the worker crate's object when that crate has one that holds it as stated, checked against the crate first | 245 lines of code for what is kept beside the object |
 
 One more point under this decision. A document can write an `overload` block for each binding, and
 a worker may state thresholds of its own. A worker object holds one set. **Recommendation:** one
@@ -2956,15 +2964,15 @@ report's sample. Classic scores it as a worker with no report.
 
 | Option | Cost |
 |---|---|
-| (a) The engine alone reads the kept report. | Classic's answers do not move. With the option on, a worker whose load call fails while it serves is charged its last report for up to about 40 seconds, and can be under-used that long. In that window the engine differs from classic, by this decision. |
+| (a) The engine alone reads the kept report. | Classic's answers do not move. With the option on, a worker whose load call fails while it serves is charged its last report for up to about 40 seconds at the default poll, and can be under-used that long. In that window the engine differs from classic, by this decision. |
 | (b) Classic's reads take the kept report too. | The two agree. Classic's answers change for every policy that reads a report, and each of those reads pays a second look-up where a worker has no entry. |
-| (c) No stage reads it. | The two agree, and nothing changes. A worker that stated a full queue is scored from its peers at the first failed load call, and can be drawn again. |
+| (c) No stage reads it. | The two agree, and classic's answers do not move. A worker that stated a full queue is scored from its peers at the first failed load call, and can be drawn again. |
 
 **Recommendation: (a).** A failed call is not a worker that never reported. The kept report is
 bounded by its own sample, and classic stays as recorded.
 
-**As taken.** (a) is on main: the monitor keeps the report, the engine's two reads take it, and
-classic's reads are as they were.
+**As taken.** (a) is on main: the monitor keeps the report, the engine's rows and signal cells take
+it, and classic's reads are as they were.
 
 ## 16. The order of work
 
@@ -2976,7 +2984,7 @@ The crate first (rule 7). Each stage ends with a test, and the next does not sta
 | 1 | **The policies, proven in the crate.** Each classic policy decided by `PolicyEngine` over worker objects: its sheet replays through that engine, and its bench cell meets classic's count. | Every line of the 15 sheets that record a decision (415 of section 13.1's 489) replays through the kept engine over worker objects. Each difference from classic is fixed or accepted as a named difference. Under decision 3 (a) the 16 `prefix_hash` lines that measure a key's tokens or a spread of prompts replay there with no ring lent, and their proof for a gateway is stage 3's. |
 | 2 | **The host contract.** `place`, `Placement`, the engine's own upkeep and membership events (section 8.2). | A test host in the crate serves every plan through `place` alone. |
 | 3 | **The gateway, one change** (section 9), off by default. | The four points of section 9.2's bar; under decision 3 (a), the 47 `prefix_hash` lines and the 12 ring lines of `all_vetoed` read as recorded, count for count, through the gateway's own entry with the engine on and the recorder's own workers and prompts; a cluster run beside classic. |
-| 4 | **The controller on the one engine** (section 10.2); the old engine is deleted. | The controller's own tests pass on `PolicyEngine`; the store-backed engine is gone; each of the 74 lines of the four host sheets (section 13.1) is answered by the host's code that the controller takes from the worker crate, or by a rule of the crate's with its differences named. One difference is named so far, and 11 `overload` lines answer by it: where ranks are worker objects, a threshold that judged an engine's summed queue judges each rank's own queue, and a usage threshold each rank's own usage in place of the mean (two ranks that queue 4 requests each under a threshold of 8 are vetoed as one worker and not as two). The 18 `minimum_tokens` lines are answered as recorded by the worker crate's rank cache behind that monitor, which no code of a controller asks. They are not answers of the engine: it serves no rank option (`refuse_unsupported` in `src/document/routing_settings.rs` refuses classic's at the start), and where ranks are worker objects it picks among them by its profile. That pick was measured once, on 2026-11-23 over `55c35100d`, outside the tests: under a resident-work profile with a picker of two it names the recorded ranks on 5 of the 18 lines and other ranks on 13, by four rules. On 6 lines classic finds no rank on a worker its cache holds nothing of, and the engine places on a ready object that has no report (`with_no_survivor_reporting_resident_tokens_the_in_flight_count_decides`). On 3 a rank that the answer omits or reports with no token capacity is no rank to classic, and the engine scores it from its best reporting peer (`a_worker_without_resident_tokens_scores_from_the_best_reporting_peer`). On 3 the engine reads resident tokens and draws among equal ranks, where classic reads used tokens and takes the lowest rank (`equal_resident_work_ties_and_a_token_apart_does_not`). On 1 classic keeps a worker's last answer and its bookings behind a failed poll, and the monitor publishes no report of that worker (`publish_polled` in the worker crate's load monitor). It keeps none for the engine either: the line's report states no running or waiting request (decision 12). Three of the lines move with how the caller counts a pick in flight and with the picker, and the count stays at 5 or 6. |
+| 4 | **The controller on the one engine** (section 10.2); the old engine is deleted. | The controller's own tests pass on `PolicyEngine`; the store-backed engine is gone; each of the 74 lines of the four host sheets (section 13.1) is answered by the host's code that the controller takes from the worker crate, or by a rule of the crate's with its differences named. Differences are named so far on two of the sheets. The `sticky_rank` lines that the crate decides apart answer by the ring and the picker, where the gateway sets no rank (section 13.1). 11 `overload` lines answer by one rule: where ranks are worker objects, a threshold that judged an engine's summed queue judges each rank's own queue, and a usage threshold each rank's own usage in place of the mean (two ranks that queue 4 requests each under a threshold of 8 are vetoed as one worker and not as two). The 18 `minimum_tokens` lines are answered as recorded by the worker crate's rank cache behind that monitor, which no code of a controller asks. They are not answers of the engine: it serves no rank option (`refuse_unsupported` in `document/routing_settings.rs` refuses classic's at the start), and where ranks are worker objects it picks among them by its profile. That pick was measured once, on 2026-11-23 over `55c35100d`, outside the tests: under a resident-work profile with a picker of two it names the recorded ranks on 5 of the 18 lines and other ranks on 13, by four rules. On 6 lines classic finds no rank on a worker its cache holds nothing of, and the engine places on a ready object: one that has no report (`with_no_survivor_reporting_resident_tokens_the_in_flight_count_decides`) or, where the answer states no token capacity, one it scores by its resident tokens. On 3 a rank that the answer omits or reports with no token capacity is no rank to classic. The engine scores an omitted rank from its best reporting peer (`a_worker_without_resident_tokens_scores_from_the_best_reporting_peer`) and a rank with no token capacity by its resident tokens. On 3 the engine reads resident tokens and draws among equal ranks, where classic reads used tokens and takes the lowest rank (`equal_resident_work_ties_and_a_token_apart_does_not`). On 1 classic keeps a worker's last answer and its bookings behind a failed poll, and the monitor publishes no report of that worker (`publish_polled` in the worker crate's load monitor). It keeps none for the engine either: the line's report states no running or waiting request (decision 12). Three of the lines move with how the caller counts a pick in flight and with the picker, and the count stays at 5 or 6. |
 | 5 | **A gateway under a controller** (section 11). | A cluster run: gateways under a controller beside classic, with the controller stopped and started under load. |
 
 ### Stage 1, the first changes
