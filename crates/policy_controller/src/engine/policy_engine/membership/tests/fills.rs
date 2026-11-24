@@ -28,7 +28,7 @@ use crate::{
         decision_engine::{DecisionEngine, DecisionRefused, Request, RequestMaker, WorkerLists},
         list_cell::{LentList, ListCell, ModelLists},
         policy_engine::{
-            single::tests::{hearing, request, Heard},
+            single::tests::{hearing, hearing_spec_at, request, Heard},
             PolicyEngine,
         },
         view::FixedFacts,
@@ -261,6 +261,29 @@ fn the_start_and_each_word_of_a_registration_fill_a_models_cell_ahead_of_its_req
     assert_eq!(engine.values_made(), 2, "the requests read the cell");
     assert_eq!(engine.upkeep_faults(), 0);
     assert!(later.asked().is_empty(), "the first hand-over stands");
+}
+
+/// A new document's value of each list that stands is made ahead of the
+/// list's requests too. The follow owes a whole read behind the document,
+/// and that read fills the cells under it: the program is asked for the
+/// model again, and a request over the list then makes no value.
+#[test]
+fn a_new_documents_lists_are_filled_at_the_follows_next_upkeep() {
+    let program = Program::of(2);
+    let (engine, _heard, mut follow) = filling(&program);
+    assert_eq!(program.asked(), [MODEL]);
+    assert_eq!(engine.values_made(), 1);
+
+    let (next, _) = hearing_spec_at(2);
+    let applied = engine.apply(next);
+    applied.expect("a number above the standing one");
+    engine.follow_registry(&mut follow);
+    assert_eq!(program.asked(), [MODEL], "the model is asked again");
+    assert_eq!(engine.values_made(), 2, "its value under the new document");
+    let standing = program.published();
+    assert_eq!(answered(&engine, &program, &standing), [true; 2]);
+    assert_eq!(engine.values_made(), 2, "the requests read the cell");
+    assert_eq!(engine.upkeep_faults(), 0);
 }
 
 /// A removal and a replacement publish the model's list again, and each

@@ -263,6 +263,11 @@ pub enum Said {
 /// it, and a view that lists the row may follow: a stage that lists by the
 /// feed treats a member its candidates do not hold as one a filter took.
 ///
+/// A join may be told again of a worker that stands, and a leave may name
+/// a worker the stage did not hear join: a new document's stages are told
+/// the workers that stand, beside the words of the host's registry. A
+/// stage takes each word as a statement of what stands.
+///
 /// Further changes add their cases, and a case with named fields may gain
 /// one: a `match` outside this crate keeps an arm for the rest and ends
 /// such a case's pattern with `..`. It makes those two cases by their

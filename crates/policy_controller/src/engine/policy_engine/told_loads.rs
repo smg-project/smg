@@ -97,9 +97,11 @@
 //!
 //! **What it costs.** A document none of whose stages keeps a report looks
 //! up no report and hears no word at a snapshot, and its follow reads
-//! nothing of a worker for a telling. A document that reads no load report
-//! and no named signal keeps the channel for such a stage alone, and no
-//! decision of it reads the engine's snapshot. Where a stage keeps reports,
+//! nothing of a worker for a telling. Under a document that reads no load
+//! report and no named signal the task keeps a snapshot for such a stage
+//! alone, and no decision under it reads the engine's snapshot. A new
+//! document owes a whole read of the registry ([`PolicyEngine::apply`]),
+//! so each worker's report is told to its stages. Where a stage keeps reports,
 //! a snapshot is at hand for decisions behind its telling: the registry's
 //! ready words, one look-up for each joined worker, one conversion of each
 //! new report, its named values where a stage reads them, and the stages'
@@ -108,6 +110,7 @@
 use smg_worker::load::state::LoadSnapshot;
 
 use super::{
+    document::InForce,
     membership::{Follow, Joined},
     PolicyEngine,
 };
@@ -141,7 +144,8 @@ impl PolicyEngine {
         cells: &mut SignalCells,
         newest: &LoadSnapshot,
     ) {
-        let engine = self.document.spec.engine();
+        let document = self.document.load();
+        let engine = document.spec.engine();
         if !engine.keeps_loads() {
             return;
         }
@@ -150,7 +154,7 @@ impl PolicyEngine {
             return;
         };
         for (id, worker) in follow.joined() {
-            let Some(report) = self.new_report(id, worker, newest, cells) else {
+            let Some(report) = self.new_report(&document, id, worker, newest, cells) else {
                 continue;
             };
             engine.tell_loads(|tell| {
@@ -169,6 +173,7 @@ impl PolicyEngine {
     /// ([`Self::upkeep_faults`]), and its report is told to no stage.
     fn new_report<'c>(
         &self,
+        document: &InForce,
         id: WorkerId,
         worker: &Joined,
         newest: &LoadSnapshot,
@@ -181,8 +186,8 @@ impl PolicyEngine {
         self.held(move || {
             let clock = &self.clock;
             let (row, sampled_at_micros) = stated_report(report, sampled_at, worker.role, clock);
-            let signals = if self.document.signals {
-                let columns = self.document.spec.signal_columns();
+            let signals = if document.signals {
+                let columns = document.spec.signal_columns();
                 stated_signals(report, sampled_at, worker.ranks, columns, clock, cells)
             } else {
                 ReportSignals::NONE

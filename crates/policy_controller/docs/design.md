@@ -708,15 +708,18 @@ The engine is in `engine/`.
 
 ### 5.1 The engine object **[built]**
 
-A gateway has one engine object. It is built once from the policy document and holds the
-document's stages and what they remember. It holds no worker of its own: the registry that its
+A gateway has one engine object. It is built once, from the policy document in force at its start,
+and holds the document's stages and what they remember. A later document is put in force on the
+same object (`PolicyEngine::apply`): the engine holds its document as one value and replaces it
+whole, and a decision reads one document from its entry to its end. The session table and the
+record of sent prompts stand across the call. It holds no worker of its own: the registry that its
 host hands it (section 8.1) holds them. A controller builds a new engine object for each document
 it applies (section 10.2).
 
 ```rust
 // engine/policy_engine.rs
 pub struct PolicyEngine {
-    document: InForce,    // the validated document (profiles, bindings, stage objects and their state), its
+    document: ArcSwap<InForce>, // the validated document (profiles, bindings, stage objects and their state), its
                           // number, what is read of it once (which lease events its stages need) and its
                           // shadow counts
     clock: DecisionClock, // one clock for every decision and every load report's age
@@ -1193,8 +1196,9 @@ with each event (`DecisionEngine::say`). The crate has a guard for that, `Decisi
 `released`, and releases at its drop. A controller keeps its leases in a file. It lends a single
 request's lease back from that file in the guard's form, so one rule tells a single request's
 events under either host (`lease_events::single`). The host says who hears: behind a new
-document the engine that issued the lease is gone, and the standing one counts the send. A pair's
-events on a controller are told by the controller's own code.
+document the engine that issued the lease is gone, and the standing one counts the send. In a
+gateway's own process a word of a lease issued under another document is told to nobody. A
+pair's events on a controller are told by the controller's own code.
 
 What an event does:
 
@@ -1302,8 +1306,14 @@ A host's start has these steps.
    task fills a list's cell behind the registry's word of the membership change. A later call is
    ignored.
 5. **It hands its load monitor's channel again where it builds another monitor**:
-   `engine.set_loads(channel)`. An engine keeps no channel where its document reads no load
-   report and no named signal, and none of its policies keeps a report.
+   `engine.set_loads(channel)`. The engine keeps the channel under any document. Its task keeps no
+   snapshot where the document reads no load report and no named signal, and none of its
+   policies keeps a report.
+6. **It puts a later document in force on the running engine**: `engine.apply(spec)`, refused
+   where the document's generation is not above the standing one. The next decision runs under
+   it, and a decision under way ends under the one it began under. The session table and the
+   record of sent prompts stand. The new document's policies are told the workers that stand
+   before the call returns.
 
 A caller that builds its engine with `PolicyEngine::new(spec)`, as the crate's own cases and
 bench do over lists made by hand, makes each hand-over itself:
@@ -1471,7 +1481,8 @@ channel. So a host relies on both once the task has been polled once, not when t
 returns.
 
 The fourth job serves a policy that keeps a number of each worker's load report
-(`Lifecycle::keeps_loads`). At each load snapshot the task takes, it tells such a policy the
+(`Lifecycle::keeps_loads`). No stock policy keeps one: the job serves a policy a host registers.
+At each load snapshot the task takes, it tells such a policy the
 reports that are new in it, for the workers it follows in the host's registry, and only then keeps
 the snapshot at hand. A report is new where its sample instant is not the one the task told last
 of its worker. The channel keeps one snapshot, so of two reports of one worker the task took no
@@ -2449,7 +2460,7 @@ bursts. It is bounded by the tree's size bound and the time between two eviction
 | The crate's bench of the kept engine | **[planned]** | |
 | The gateway as a host | **[partly]** | section 9, behind `--policy-controller on`, which is off by default: single requests and pairs on the HTTP and gRPC routes, a pair's decode asked again, a host's table of stages at the start; an encode request that carries an item is refused by name until the gateway hands the engine its three lists; every classic test of the gateway with the engine on (the bar's fourth point) is not met yet |
 | The controller: service, election, replication, document apply and roll back | **[partly]** | a session never pushes the document and refuses a gateway's replay; a standby serves neither the worker list nor the snapshot (section 10.1) |
-| The controller on the one engine and the worker crate's structures | **[partly]** | a single request, a pair at its prefill and its decode call are decided by `PolicyEngine` over the registry's lists; an encode request is answered `Busy`; a decision reads no cache event, and no load report under a document that holds a stage that keeps reports (section 10.2) |
+| The controller on the one engine and the worker crate's structures | **[partly]** | a single request, a pair at its prefill and its decode call are decided by `PolicyEngine` over the registry's lists; an encode request is answered `Busy`; a decision reads no cache event, and no load report under a document that holds a stage that keeps reports, as no stock stage does (section 10.2) |
 | The controller finding its own workers | **[partly]** | the image leaves the feature out; a worker's API key is refused; no flag sets a registration's timing |
 | A gateway under a controller | **[planned]** | section 11 |
 | User stages in WebAssembly and over gRPC | **[partly]** | library code that no document reaches |

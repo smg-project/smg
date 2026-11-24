@@ -23,8 +23,8 @@ use rand::RngExt;
 use smg_policy_controller::{
     document::DecodePick,
     engine::{
-        LentList, PairAdmission, PairLists, Phase, PlaceRequest, PolicyEngine, ShedReason,
-        Unplaced, WorkerLists,
+        DecisionEngine, LentList, PairAdmission, PairLists, Phase, PlaceRequest, PolicyEngine,
+        ShedReason, Unplaced, WorkerLists,
     },
     policies::consistent_hashing::LentRing,
     tracking::{Placement, PlacementSide},
@@ -865,7 +865,8 @@ impl<'a> ModelRing<'a> {
         model_id: &str,
         generation: &'a ModelWorkerSnapshot,
     ) -> Self {
-        if !engine.spec().needs().ring {
+        // One word of the document, read with no counted reference of it.
+        if !engine.with_spec(|spec| spec.needs().ring) {
             return Self::Unread;
         }
         match generation.hash_ring() {
@@ -883,7 +884,7 @@ impl<'a> ModelRing<'a> {
         registry: &WorkerRegistry,
         model_id: &str,
     ) -> Self {
-        if !engine.spec().needs().ring {
+        if !engine.with_spec(|spec| spec.needs().ring) {
             return Self::Unread;
         }
         Self::standing(policies.hash_ring(registry, model_id))
@@ -2588,7 +2589,7 @@ fn pair_by_engine(
         // A decode the document picks behind its prefill may be decided
         // again after the record is written: no row names the one decided
         // first.
-        let later = || engine.spec().decode_pick() == DecodePick::AfterPrefill;
+        let later = || engine.with_spec(|spec| spec.decode_pick()) == DecodePick::AfterPrefill;
         let seen = seen.filter(|_| side != DECODE_ROW || !later());
         engine_row(seen, || side_row(side, label), Some(worker.worker()));
     }

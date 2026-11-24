@@ -185,7 +185,8 @@ impl EncodeLists<'_> {
         items: EncodeItems<'_>,
         placed: &mut EncodePlaced,
     ) -> Decision {
-        let engine = engine.loaded();
+        let document = engine.in_force();
+        let engine = engine.under(&document);
         let sides = self.asked(engine);
         self.decide_over(
             engine,
@@ -418,7 +419,9 @@ impl PolicyEngine {
         placed: &mut EncodePlaced,
         clock: impl FnOnce() -> Instant,
     ) -> Result<(DecideOutcome, bool), DecisionRefused> {
-        self.loaded().decide_encode_at(maker, items, placed, clock)
+        let document = self.in_force();
+        self.under(&document)
+            .decide_encode_at(maker, items, placed, clock)
     }
 
     /// [`Self::decide_encode_at`] with nothing its host hears of later: no
@@ -444,7 +447,8 @@ impl PolicyEngine {
         placed: &mut EncodePlaced,
         now: Instant,
     ) -> Result<Decision, DecisionRefused> {
-        let own = self.loaded();
+        let document = self.in_force();
+        let own = self.under(&document);
         own.over_three(maker, placed, |lists, request, loads, placed| {
             let sends_to = |target: &_| maker.sends_to(target);
             let encoder = |place| maker.sends_to_encoder(place);
@@ -487,9 +491,9 @@ impl Loaded<'_, '_> {
 
     /// The request `maker` makes, decided by `decide` over the three lists
     /// the maker hands, with the load reports a pair's first decision
-    /// reads ([`PolicyEngine::loads_read`]), under the engine's catch. A request of
-    /// another phase than `Prefill`, or other lists, is a side sent on its
-    /// own. `placed` is left empty where no decision is made.
+    /// reads ([`Self::loads_read`]), under the engine's catch. A request
+    /// of another phase than `Prefill`, or other lists, is a side sent on
+    /// its own. `placed` is left empty where no decision is made.
     fn over_three<R>(
         self,
         maker: &impl RequestMaker,

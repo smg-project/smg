@@ -116,7 +116,8 @@ impl PolicyEngine {
     )]
     pub(crate) fn count_shadow(&self, said: Option<Shadowed>) {
         if let Some(said) = said {
-            count(self.loaded(), said);
+            let document = self.in_force();
+            count(self.under(&document), said);
         }
     }
 }

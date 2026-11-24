@@ -17,8 +17,8 @@
 //!   ([`PolicyEngine::set_lists`]), and the engine's own task fills a
 //!   model's cells through it, ahead of the model's requests.
 //! - [`PolicyEngine::members_of`] is the engine's read of a lent list: the
-//!   value the cell holds under the engine's document, made first where it
-//!   holds none.
+//!   value the cell holds under the document in force, made first where
+//!   it holds none.
 //!
 //! The engine keeps no list and no value of one. A value made here lives in
 //! its cell, and falls with the list that the cell stands beside.
@@ -288,7 +288,7 @@ impl Loaded<'_, '_> {
     /// A value the cell took first costs one read and one compare of the
     /// document's number, in the caller's own code. One made behind it is
     /// found out of line, at one more of both for each value before it.
-    /// Where the cell holds none under the engine's document, the value is
+    /// Where the cell holds none under that document, the value is
     /// made here, as [`Self::pool_members_with_fixed_facts`] makes it, of
     /// the facts lent with the list, each worker's at its place, and of the
     /// default where the list is lent with none. The fill reads the lent
@@ -368,16 +368,20 @@ impl Loaded<'_, '_> {
 }
 
 impl PolicyEngine {
-    /// [`Loaded::members_of`] under the engine's document: for a caller
-    /// that asks a list's value outside a decision of the engine, as the
-    /// engine's own task does ahead of a list's requests.
+    /// [`Loaded::members_of`] under the document in force at the call: for
+    /// a caller that asks a list's value outside a decision of the engine,
+    /// as the engine's own task does ahead of a list's requests. Such a
+    /// caller reads one document here and at the decision it asks beside
+    /// this call only where no document is put in force between the two: a
+    /// store's engine takes none.
     #[inline]
     pub(crate) fn members_of<'a>(&self, lent: LentList<'a>) -> &'a PoolMembers {
-        self.loaded().members_of(lent)
+        let document = self.in_force();
+        self.under(&document).members_of(lent)
     }
 
     /// The bench's count: how many times the reports of `lent`'s list were
-    /// converted under this engine's document so far. It makes no value: a
+    /// converted under the document in force so far. It makes no value: a
     /// list the engine made no value of counts zero.
     #[doc(hidden)]
     #[must_use]
@@ -594,7 +598,7 @@ pub(crate) mod tests {
     /// Whether each worker takes images, as the list's records under
     /// `engine` say it, by the worker's place.
     fn take_images(engine: &PolicyEngine, members: &PoolMembers) -> Vec<bool> {
-        let records = members.records(engine.spec(), engine.clock());
+        let records = members.records(engine.standing_spec(), engine.clock());
         records.fixed().iter().map(|row| row.vision).collect()
     }
 

@@ -15,10 +15,7 @@ use std::{
     fmt,
     future::pending,
     panic::{catch_unwind, AssertUnwindSafe},
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
+    sync::{atomic::Ordering, Arc},
     time::{Duration, Instant},
 };
 
@@ -29,7 +26,7 @@ use tokio::time::{self, MissedTickBehavior};
 
 use super::{
     membership::{self, Follow},
-    PolicyEngine,
+    Loaded, PolicyEngine,
 };
 use crate::{
     engine::{
@@ -50,9 +47,6 @@ pub(super) struct Loads {
     /// ([`PolicyEngine::set_loads`]). The task takes the lock once a
     /// second, and no decision takes it.
     feed: Mutex<(u64, Option<LoadReceiver>)>,
-    /// Whether the host ever handed a channel that decisions read: a
-    /// decision of an engine handed none reads this one word.
-    handed: AtomicBool,
     /// The newest snapshot the engine's task kept at hand, behind its
     /// telling to the stages that keep reports. The task alone writes it
     /// ([`PolicyEngine::run`]).
@@ -69,13 +63,18 @@ impl fmt::Debug for Loads {
 }
 
 impl Loads {
-    /// The newest snapshot at hand, for a decision whose request gives
-    /// none: none where the host handed no channel, the document reads no
-    /// load report and no named signal, or the task has not read it yet.
+    /// The newest snapshot the task has at hand: none where the host handed
+    /// no channel, the document in force has no use for one, or the task
+    /// has not read it yet.
     #[inline]
-    pub(super) fn newest(&self) -> Option<Guard<Option<Arc<LoadSnapshot>>>> {
-        let handed = self.handed.load(Ordering::Relaxed);
-        handed.then(|| self.newest.load())
+    pub(super) fn newest(&self) -> Guard<Option<Arc<LoadSnapshot>>> {
+        self.newest.load()
+    }
+
+    /// Counts one more hand-over of the channel that stands: the task
+    /// takes it again at its next step, as behind a new document.
+    pub(super) fn handed_again(&self) {
+        self.feed.lock().0 += 1;
     }
 
     /// The channel the host handed last and its count, where the task took
@@ -98,7 +97,7 @@ impl Loads {
 }
 
 /// The snapshot one decision reads, held for as long as the decision reads
-/// it ([`PolicyEngine::loads_read`]).
+/// it ([`Loaded::loads_read`]).
 pub(super) enum LoadsRead<'a> {
     /// The snapshot the request gives.
     Given(&'a Arc<LoadSnapshot>),
@@ -132,16 +131,19 @@ impl PolicyEngine {
     /// subscription. A host hands it at its start, and again where it
     /// builds another monitor: a channel ends with its monitor. Of two
     /// hand-overs the newest stands: a later one replaces the one before.
-    /// An engine whose document reads no load report
+    /// The engine keeps the channel whatever its document, so a document
+    /// put in force later reads it ([`Self::apply`]). What the task does
+    /// with it is read of the document in force. Under a document that
+    /// reads no load report
     /// ([`Needs::loads`](crate::document::spec::Needs::loads)) and no named
     /// signal
     /// ([`Needs::signal_cells`](crate::document::spec::Needs::signal_cells))
-    /// keeps the channel only for its stages that keep reports
-    /// ([`Lifecycle::keeps_loads`]), which the task tells them
-    /// ([`Self::run`]), and keeps none where it has no such stage. No
-    /// decision of it reads a report. A named signal's
-    /// values stand in the same reports, so a document that reads one keeps
-    /// the channel as one that reads a report does.
+    /// the task keeps a snapshot only for the stages that keep reports
+    /// ([`Lifecycle::keeps_loads`]), which it tells them ([`Self::run`]),
+    /// and none where the document has no such stage. No decision under
+    /// such a document reads a report. A named signal's values stand in
+    /// the same reports, so a document that reads one reads the channel as
+    /// one that reads a report does.
     ///
     /// The engine's task reads the channel ([`Self::run`]). A decision
     /// reads the snapshot its request gives where it gives one
@@ -149,29 +151,8 @@ impl PolicyEngine {
     /// the newest the task keeps at hand otherwise: a single request's, a
     /// pair's first, and a pair's decode decided again.
     pub fn set_loads(&self, loads: LoadReceiver) {
-        let needs = self.document.spec.needs();
-        let read = needs.loads || needs.signal_cells;
-        if read || self.document.spec.engine().keeps_loads() {
-            let mut feed = self.loads.feed.lock();
-            *feed = (feed.0 + 1, Some(loads));
-            // A channel kept for the telling alone is read by no decision.
-            if read {
-                self.loads.handed.store(true, Ordering::Relaxed);
-            }
-        }
-    }
-
-    /// The snapshot a made request's decision reads, held for the
-    /// decision ([`LoadsRead`]): the one the request gives where it gives
-    /// one, and the newest the task keeps at hand otherwise. A single
-    /// request's decision, a pair's first and a pair's decode decided again
-    /// all read theirs here.
-    #[inline]
-    pub(super) fn loads_read<'a>(&self, maker: &'a impl RequestMaker) -> LoadsRead<'a> {
-        match maker.loads() {
-            Some(given) => LoadsRead::Given(given),
-            None => LoadsRead::Kept(self.loads.newest()),
-        }
+        let mut feed = self.loads.feed.lock();
+        *feed = (feed.0 + 1, Some(loads));
     }
 
     /// The engine's own task: what its host no longer does by hand. The
@@ -190,6 +171,8 @@ impl PolicyEngine {
     /// - The newest load snapshot kept at hand: read from the host's
     ///   channel at the first upkeep behind its hand-over, so within a
     ///   second of it, and swapped when the load monitor publishes one.
+    ///   The channel is taken again at the first upkeep behind a new
+    ///   document ([`Self::apply`]).
     ///   Until then, and for an engine handed no channel, a decision whose
     ///   request gives no snapshot reads no report. A monitor that ended
     ///   leaves its last snapshot standing until another is handed.
@@ -214,7 +197,8 @@ impl PolicyEngine {
     ///   worker: followed from the first upkeep behind the hand-over, so
     ///   within a second of it, with the workers that stand then told as
     ///   joined. The registry is read whole again where its channel
-    ///   dropped events or closed. A panic of the host's own code in the
+    ///   dropped events or closed, and at the first upkeep behind a new
+    ///   document. A panic of the host's own code in the
     ///   follow is held and counted ([`Self::upkeep_faults`]): the task
     ///   goes on, and reads the registry whole again at its next upkeep.
     /// - The cells of a model's worker lists filled ahead of the model's
@@ -287,8 +271,7 @@ impl PolicyEngine {
                 }
                 went_on = published(feed.as_mut()) => {
                     if went_on {
-                        let tell = |newest: &_| self.tell_loads(&mut members, &mut told, newest);
-                        self.loads.keep(feed.as_mut(), tell);
+                        self.keep_loads(&mut members, &mut told, feed.as_mut());
                     } else {
                         feed = None;
                     }
@@ -298,13 +281,38 @@ impl PolicyEngine {
         }
     }
 
+    /// Keeps the channel's newest snapshot and tells it to the stages that
+    /// keep reports, where the document in force has a use for it: it
+    /// reads a load report or a named signal, or a stage of it keeps
+    /// reports. Under any other document the task keeps no snapshot.
+    /// `told` is the row a telling states a report's named values in.
+    fn keep_loads(
+        &self,
+        members: &mut Option<Follow>,
+        told: &mut SignalCells,
+        feed: Option<&mut LoadReceiver>,
+    ) {
+        let document = self.document.load();
+        if document.reads_loads || document.spec.engine().keeps_loads() {
+            drop(document);
+            let tell = |newest: &_| self.tell_loads(members, told, newest);
+            self.loads.keep(feed, tell);
+        } else {
+            self.loads.newest.store(None);
+        }
+    }
+
     /// One upkeep of the task, at its first poll and then once a second:
     /// `upkeep` under a catch of its own, then what the host handed since
     /// the upkeep before. That is the follow of the registry the host
     /// handed ([`Self::follow_registry`]), then the host's load channel,
     /// where it handed one the task has not taken: `taken` counts the
-    /// hand-over `feed` came with. `told` is the row the task keeps for
-    /// the named values of the report a telling tells.
+    /// hand-over `feed` came with. The hand-over is read ahead of the
+    /// follow and told behind it: a new document owes its whole read of
+    /// the registry ahead of its hand-over ([`Self::apply`]), so a
+    /// hand-over the step reads finds that read made by its telling,
+    /// whenever the document came in. `told` is the row the task keeps
+    /// for the named values of the report a telling tells.
     fn step(
         &self,
         upkeep: &impl Fn(Instant),
@@ -316,13 +324,29 @@ impl PolicyEngine {
         // Dated at this run, not at the second its tick was due.
         let now = time::Instant::now().into_std();
         let _swept = self.held(|| upkeep(now));
+        let handed = self.loads.handed_past(*taken);
         // Ahead of a hand-over's telling: it tells the reports of the
         // workers the follow told as joined.
         self.follow_registry(members);
-        if let Some(handed) = self.loads.handed_past(*taken) {
+        if let Some(handed) = handed {
             (*taken, *feed) = handed;
-            let tell = |newest: &_| self.tell_loads(members, told, newest);
-            self.loads.keep(feed.as_mut(), tell);
+            self.keep_loads(members, told, feed.as_mut());
+        }
+    }
+}
+
+impl Loaded<'_, '_> {
+    /// The snapshot a made request's decision reads, held for the
+    /// decision ([`LoadsRead`]): the one the request gives where it gives
+    /// one. Otherwise the newest the task keeps at hand, where the
+    /// decision's document reads a load report or a named signal, and none
+    /// under any other document. A single request's decision, a pair's
+    /// first and a pair's decode decided again all read theirs here.
+    #[inline]
+    pub(super) fn loads_read<'a>(self, maker: &'a impl RequestMaker) -> LoadsRead<'a> {
+        match maker.loads() {
+            Some(given) => LoadsRead::Given(given),
+            None => LoadsRead::Kept(self.document.reads_loads.then(|| self.loads.newest())),
         }
     }
 }
