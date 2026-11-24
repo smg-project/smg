@@ -2115,16 +2115,16 @@ tells the data once more:
 
 | Copy | Where | Read by |
 |---|---|---|
-| the worker record | the store's table of records (`store/memory.rs`) | the load poller, and the follower of cache events for whether a worker's events are indexed, each until it reads the worker objects; a watcher's and a standby's first copy |
+| the worker record | the store's table of records (`store/memory.rs`) | the load poller, and the follower of cache events for whether a worker's events are indexed, each until it reads the worker objects; a first copy, for the status the log told of each record |
 | a copy of the record's facts | beside the worker objects (`worker_host/objects.rs`) | the code that keeps the objects, to tell a record that changed under its object |
-| the worker object | the worker-crate registry | the health checker, the follower of cache events and a decision |
+| the worker object | the worker-crate registry | the health checker, the follower of cache events, a decision, and a watcher's, a standby's and an operator's first copy |
 | the remainder: 17 of the 24 facts and one bit of an eighteenth, with the record's id and revision | beside each worker object (`worker_host/remainder.rs`) | a decision, for the record's id, whether the worker takes images, its wire modes and from where it is reached. A pair's classes read the worker's engine kind and its pairing descriptor too, and for a record that states no descriptor the pairing facts its worker object derives of its labels. What the worker states for a request's hard demands is lent with the list, and no frame states a demand yet |
 | the published copy of the records | the store | a pick's booking and a gateway's vetoes, among others; no request is decided over it |
 | the membership log's event | `service/replication/log.rs` | a watcher behind its first copy; a standby |
 
 A leader's write of a record is decided over the worker object since step 1 below, and the
 table follows it. The object leads a status too since step 3, and the table is told it. The
-record still leads a first copy. After the switch the object leads: a worker's data
+object leads a first copy's facts since the last part of step 2, and the log its statuses. After the switch the object leads: a worker's data
 stands once, as its worker object with its remainder beside it, and the log still tells it. The
 remainder is the copy that stays. The table of records and the second copy of the facts end
 with step 4 below. The published copy ends when its readers, a pick's booking and a gateway's
@@ -2189,8 +2189,8 @@ A fact leaves the remainder when the worker object gets a field that holds it as
    store over a write of the registry. The store takes a decided change only where the record
    it was decided over still stands at the revision the keeper read, tested under the
    membership lock: a write that landed between the two is never written over, and the keeper
-   reads the store again before it answers. A first copy is still cut from the table, until the
-   last part of step 2. Since step 3 a status is the object's
+   reads the store again before it answers. A first copy is cut from the objects in the
+   keeper's turn, the last part of step 2. Since step 3 a status is the object's
    word: a drain and a connect signal write the object and tell the table, a key's next life
    starts in the status its worker object stood in, and a call's answer waits on no follow. A
    change the store took and the registry did not get is laid by the task that follows the
@@ -2199,9 +2199,9 @@ A fact leaves the remainder when the worker object gets a field that holds it as
    that keeps the objects does today for a record that changed.
 2. A standby applies the leader's events to its own worker objects **[built]**. A call reads the
    record that stands from the worker objects **[built]**. A gateway's watcher hands its
-   watch's events to its own worker objects **[built]**. A watcher's and a
-   standby's first copy is cut from the objects and their remainders behind step 3, because a
-   copy's statuses must be the ones the log last told **[planned]**.
+   watch's events to its own worker objects **[built]**. A watcher's, a standby's and an
+   operator's first copy is cut from the objects and their remainders, with the status the
+   log last told of each record **[built]**.
 3. No health outcome is judged over a record. It moves the worker object, whose status leads,
    and the record is told the status that stands, for the log and a first copy **[built]**. A
    connect signal and a drain are written the same way **[built]**. The store's own machine
@@ -2225,7 +2225,7 @@ hands the store the event at its place in the log, and puts the object in the re
 the store took the event. A removal's object leaves the registry first. A record changed in
 place keeps the instant it was admitted at. A status the leader tells is written to the table and
 laid on the object in the same turn. A restore is the store's restore and the read of its
-records in one turn of that code. A first copy is still cut from the table: a later
+records in one turn of that code. A first copy is cut from the objects, by the last
 part of step 2.
 
 **A call reads the worker objects [built].** A registration call reads the record that stands
@@ -2236,9 +2236,30 @@ write behind it read the record from one copy, and a call that waited behind ano
 writer left. A record read this way carries the status its worker object states (step 3).
 An engine's records are found by the list of ranks kept beside the objects,
 where the store passed over every record under the membership lock: that read of the table is
-deleted. A first copy stays on the table until the last part of step 2. Its statuses must be the ones the log
-last told at its place: the table holds exactly those, under
-the lock that orders the log, and an object can stand one tell ahead of it.
+deleted.
+
+**A first copy from the worker objects [built].** What a watcher starts from, what a standby
+is restored from and what an operator reads are cut from the worker objects and their
+remainders (the last part of step 2), in the turn of the code that keeps them. Every writer
+of a record's facts holds that turn from its decision to the log's telling. The store's own
+entries for a registration, a patch and a removal take no such turn: no product code calls
+them, and they end with step 4. A copy reads the log's place, the store's epoch and its
+history in one hold, and the code that keeps the objects reads the store again where the
+epoch or the history moved since its own read ended: every write of a record moves the one,
+a restore the other. So a copy holds
+each record the log told at the copy's place, and none it did not, beside any writer. A copy's statuses are the
+ones the log last told at its place, and not the objects': an object can stand one tell
+ahead of the log. The store keeps what the log last told of each record's status, beside its
+epoch and its tail. A copy reads the log's place, the epoch, the history and those statuses in one hold
+of the membership lock, which it holds for one status a record and for no record. A copy
+takes no object's lock. Three writes move the log's place outside the keeper's turn, and a
+copy stays whole beside each: a status tell changes no fact, and a generation's apply and a
+term's start change no record. The told status has five readers: the next status event, for
+the status a record moved from, the event of a record changed in place, which carries it, a
+first copy, a tell the store refused, whose object takes it back, and a standby's applier or
+a watcher, which lays it on the object. No decision reads it. An operator's read of a few
+records is read the same way, and the store's own read for it is deleted. The store's own
+cut of its table has no caller in the product and ends with step 4.
 
 **A watcher's events through the worker objects [built].** A gateway's watcher hands each
 event of a controller's worker watch, and the watch's first copy at its last page, to the

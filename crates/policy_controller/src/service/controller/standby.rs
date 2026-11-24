@@ -1017,7 +1017,7 @@ mod tests {
         engine::view::{LoadRow, Role, WireModes, WorkerId},
         service::{
             controller::{
-                decision_slots::tests::{followed, frame_for, lent_pick, preset},
+                decision_slots::tests::{followed, frame_for, holder, lent_pick, preset},
                 election::LeasePlace,
                 replication::{journaled, journaled_from, parts, Replication},
                 worker_objects::{ObjectsWake, WorkerObjects},
@@ -1324,9 +1324,15 @@ mod tests {
         let Ok(TickOutcome::Acquired { term }) = elector.tick(at) else {
             panic!("a free lease is taken at the first tick");
         };
-        let cut = Replication::new(Arc::clone(store), Arc::clone(log), elector.fence())
-            .cut(term)
-            .expect("a cut");
+        let cut_from = holder(store);
+        let cut = Replication::new(
+            Arc::clone(store),
+            Arc::clone(log),
+            elector.fence(),
+            cut_from,
+        )
+        .cut(term)
+        .expect("a cut");
         parts(cut, at)
     }
 
