@@ -64,6 +64,7 @@ use std::{
     cell::{Cell, RefCell},
     collections::BTreeMap,
     mem, ptr,
+    rc::Rc,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Weak,
@@ -1409,7 +1410,7 @@ struct Buffers {
 thread_local! {
     /// The calling thread's own buffers, so a decision allocates nothing
     /// after a thread's first decisions of a pool's size.
-    static BUFFERS: RefCell<Buffers> = RefCell::new(Buffers::default());
+    static BUFFERS: Rc<RefCell<Buffers>> = Rc::new(RefCell::new(Buffers::default()));
 }
 
 /// One decision of a single request over a gateway's own data: the records
@@ -1500,12 +1501,15 @@ pub fn decide(
 /// followed by its binding's shadow profile ([`with_shadow::decide`]).
 #[inline]
 fn with_buffers<T>(decide: impl FnOnce(&mut Buffers) -> T) -> T {
-    BUFFERS.with(|buffers| match buffers.try_borrow_mut() {
-        Ok(mut buffers) => decide(&mut buffers),
+    // The key's own call hands out the pointer alone: what a decision
+    // answers through that call is copied on its way out of it.
+    let buffers = BUFFERS.with(Rc::clone);
+    let Ok(mut buffers) = buffers.try_borrow_mut() else {
         // A stage asked for a decision from inside its own, on this
         // thread: that decision takes buffers of its own.
-        Err(_) => decide(&mut Buffers::default()),
-    })
+        return decide(&mut Buffers::default());
+    };
+    decide(&mut buffers)
 }
 
 #[cfg(test)]

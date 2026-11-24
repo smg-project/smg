@@ -933,7 +933,9 @@ fn issue_decode_caught(
 /// `sends_to` says whether the request's caller sends it to a target of
 /// the pick ([`RequestMaker::sends_to`]): each side's record of sent
 /// prefixes is written for the first target it takes. A decode decided
-/// again is handed `|_| true` and writes for its first target.
+/// again is asked the same of its decode, and writes the decodes' record
+/// for the first decode it takes. The entry its first decision wrote, for
+/// the decode chosen then, stands beside it.
 ///
 /// [`RequestMaker::sends_to`]: crate::engine::RequestMaker::sends_to
 #[inline]

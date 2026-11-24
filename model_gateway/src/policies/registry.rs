@@ -341,6 +341,9 @@ pub struct PolicyRegistry {
     routing_key_headers: Arc<Vec<HeaderName>>,
     /// How strictly PD placement pairs prefill and decode descriptors.
     pd_pairing_mode: PdPairingMode,
+    /// The policy engine decides under a document the gateway was supplied
+    /// ([`Self::runs_supplied_document`]).
+    supplied_document: bool,
     /// The hash rings kept between membership generations ([`KeptRings`]).
     rings: Arc<KeptRings>,
 }
@@ -467,16 +470,20 @@ impl PolicyRegistry {
     /// (`RouterConfig::policy_engine_decides`, [`Self::for_policy_engine`]),
     /// under the pairing mode in force
     /// (`RouterConfig::pd_pairing_in_force`): a supplied document's own
-    /// where the policy controller runs one, else the configuration's. The
-    /// one place that reads the option for the registry.
+    /// where the policy controller runs one, else the configuration's. It
+    /// knows whether the engine decides under a supplied document
+    /// (`Self::runs_supplied_document`). The one place that reads the
+    /// option for the registry.
     pub fn of_config(config: &RouterConfig) -> Self {
         let (policy, routing_key_override) =
             (config.policy.clone(), config.routing_key_override.clone());
-        let registry = if config.policy_engine_decides() {
+        let decides = config.policy_engine_decides();
+        let mut registry = if decides {
             Self::for_policy_engine(policy, routing_key_override)
         } else {
             Self::with_override(policy, routing_key_override)
         };
+        registry.supplied_document = decides && config.policy_spec.is_some();
         registry.with_pd_pairing_mode(config.pd_pairing_in_force())
     }
 
@@ -527,6 +534,7 @@ impl PolicyRegistry {
             side_names: Arc::default(),
             routing_key_headers: Arc::new(routing_key_headers),
             pd_pairing_mode: PdPairingMode::default(),
+            supplied_document: false,
             rings: Arc::new(KeptRings::default()),
         }
     }
@@ -894,6 +902,18 @@ impl PolicyRegistry {
             self.pair_text_needs.store(pairs.0, Ordering::Release);
         }
         self.refresh_text_needs();
+    }
+
+    /// Whether the policy engine decides under a document the gateway was
+    /// supplied, and not under the one its routing settings mean. The names
+    /// the settings give the policies ([`Self::policy_name`],
+    /// [`Self::side_policy_name`]) then name nothing that runs: a row of a
+    /// traced request's decision record reads none of them. False for a
+    /// registry made of settings alone, as a classic one is, and beside a
+    /// document's path whose document was not loaded: that configuration
+    /// runs the settings' document.
+    pub(crate) fn runs_supplied_document(&self) -> bool {
+        self.supplied_document
     }
 
     /// The token trees the policy engine is lent, made at the first call
@@ -1936,6 +1956,49 @@ mod tests {
             PolicyRegistry::of_config(&settings).pd_pairing_mode(),
             PdPairingMode::Strict
         );
+    }
+
+    /// The registry of a gateway that was supplied a policy document knows
+    /// it ([`PolicyRegistry::runs_supplied_document`]), with the document's
+    /// path beside it or without. One made of the routing settings alone
+    /// does not, with the policy controller on or off. Neither does one
+    /// beside a document that the option leaves unread, nor one beside a
+    /// path whose document was not loaded: the document in force there is
+    /// the one the routing settings mean.
+    #[test]
+    fn a_registry_knows_whether_its_gateway_runs_a_supplied_document() {
+        let on = RouterConfig {
+            policy_controller: true,
+            ..RouterConfig::default()
+        };
+        let supplied = RouterConfig {
+            policy_spec: Some(PolicySpec::preset("round_robin").expect("a stock preset")),
+            ..on.clone()
+        };
+        let path = || Some("policy.yaml".to_owned());
+        let read_from_its_path = RouterConfig {
+            policy_spec_path: path(),
+            ..supplied.clone()
+        };
+        let not_loaded = RouterConfig {
+            policy_spec_path: path(),
+            ..on.clone()
+        };
+        assert_eq!(
+            not_loaded.policy_document_in_force(),
+            not_loaded.policy_document(),
+            "the settings' document"
+        );
+        let unread = RouterConfig {
+            policy_controller: false,
+            ..supplied.clone()
+        };
+        let knows =
+            |config: &RouterConfig| PolicyRegistry::of_config(config).runs_supplied_document();
+        assert_eq!([&supplied, &read_from_its_path].map(knows), [true, true]);
+        let settings_alone = [&on, &RouterConfig::default(), &unread, &not_loaded].map(knows);
+        assert_eq!(settings_alone, [false; 4]);
+        assert!(!PolicyRegistry::new(PolicyConfig::RoundRobin).runs_supplied_document());
     }
 
     /// The static needs the host answers before any request exists: a

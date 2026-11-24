@@ -21,8 +21,10 @@ use axum::{
 use parking_lot::Mutex;
 use rand::RngExt;
 use smg_policy_controller::{
+    document::DecodePick,
     engine::{
-        LentList, PairAdmission, PairLists, PlaceRequest, PolicyEngine, Unplaced, WorkerLists,
+        LentList, PairAdmission, PairLists, Phase, PlaceRequest, PolicyEngine, Unplaced,
+        WorkerLists,
     },
     policies::consistent_hashing::LentRing,
     tracking::{Placement, PlacementSide},
@@ -40,6 +42,7 @@ use tracing::{debug, warn};
 use crate::{
     middleware::ReportedRefusal,
     observability::{
+        cache_trace,
         log_throttle::KeyedLogThrottle,
         metrics::{metrics_labels, Metrics},
     },
@@ -928,6 +931,65 @@ fn report_unplaced(model_id: &str, unplaced: &Unplaced, placed_none: &'static st
     }
 }
 
+/// The origin a row of a traced request's decision record states where the
+/// policy engine picked. The gateway writes such a row behind the engine's
+/// answer, and it holds no prediction, score or gate: the engine's stages
+/// write none into the record.
+const BY_ENGINE: &str = "engine";
+
+/// One row of a traced request's decision record for a list the policy
+/// engine was asked over: `seen`, the list as it stood ahead of the engine's
+/// call ([`cache_trace::observe`]), under the name `policy` answers, with
+/// the worker the engine picked from it, or none. Where the request is not
+/// traced nothing is written and the name is not asked.
+fn engine_row(
+    seen: Option<cache_trace::Observed>,
+    policy: impl FnOnce() -> &'static str,
+    picked: Option<&Arc<dyn Worker>>,
+) {
+    if let Some(seen) = seen {
+        cache_trace::selection_of(policy(), BY_ENGINE, seen, picked);
+    }
+}
+
+/// A pair's side as a row of the decision record names it: the side as the
+/// settings name its policy, and the side as a document names it.
+type RowSide = (crate::policies::Side, Phase);
+
+/// The prefill side of a pair's rows.
+const PREFILL_ROW: RowSide = (crate::policies::Side::Prefill, Phase::Prefill);
+
+/// The decode side of a pair's rows.
+const DECODE_ROW: RowSide = (crate::policies::Side::Decode, Phase::Decode);
+
+/// The name a row of a traced request's decision record states: `label`,
+/// the label of the profile that picked. `side` is the pair's side the row
+/// is of, `None` for a single request's row.
+///
+/// Where the gateway runs the document its routing settings mean, a row
+/// reads as a classic one in two cases. The engine names no profile: the
+/// row is under the name the settings give the main policy, or the side's
+/// ([`PolicyRegistry::policy_name`], [`PolicyRegistry::side_policy_name`]).
+/// The profile is named for its side, as that document names a pair's two
+/// profiles, each the side's policy as the settings write it: the row is
+/// under the side's policy too.
+///
+/// Under a supplied document ([`PolicyRegistry::runs_supplied_document`])
+/// the settings name nothing that runs: the label stands as the engine
+/// gives it, and a row whose profile the engine does not name states no
+/// policy. The selection metric is not renamed here: it counts a pick
+/// under its profile's label.
+fn row_name(policies: &PolicyRegistry, side: Option<RowSide>, label: &'static str) -> &'static str {
+    let for_its_side = side.is_some_and(|(_, own)| label == own.name());
+    if policies.runs_supplied_document() || !(label.is_empty() || for_its_side) {
+        return label;
+    }
+    side.map_or_else(
+        || policies.policy_name(),
+        |(side, _)| policies.side_policy_name(side),
+    )
+}
+
 /// The policy engine's answer for a single request over `lent`, the
 /// request's list with its cell: what `inputs` state of the request
 /// is handed as the engine reads it ([`place_request`]), with `ring`, the
@@ -941,6 +1003,12 @@ fn report_unplaced(model_id: &str, unplaced: &Unplaced, placed_none: &'static st
 /// ([`PolicyRegistry::policy_name`]), which is what a classic selection
 /// counts a request under. The name is read off the settings: no policy
 /// object is asked.
+///
+/// A traced request's decision record takes one row, as a classic
+/// selection's does ([`PolicyRegistry::select_worker_for_model`]): the
+/// list as it stands ahead of the engine's call, and the worker picked, or
+/// no worker, under the row's name ([`row_name`]). Its origin is
+/// [`BY_ENGINE`].
 fn placed_by_engine(
     engine: &'static PolicyEngine,
     policies: &PolicyRegistry,
@@ -954,11 +1022,13 @@ fn placed_by_engine(
     tried_ids(lent.workers, inputs.tried, &mut tried);
     let mut request = place_request(model_id, WorkerLists::Single(lent), &inputs, &tried, stated);
     request.ring = ring;
+    let seen = cache_trace::observe(lent.workers);
     let answer = engine.place(&request);
     let placement = match &answer {
         Ok(placement) => placement,
         Err(unplaced) => {
             report_unplaced(model_id, unplaced, "The policy engine placed no worker");
+            engine_row(seen, || row_name(policies, None, ""), None);
             return None;
         }
     };
@@ -973,6 +1043,8 @@ fn placed_by_engine(
         model_id,
         counted_under,
     );
+    let named = || row_name(policies, None, placement.profile);
+    engine_row(seen, named, Some(&placement.worker));
     // A placement is moved whole only where the engine is owed the request's
     // events and keeps its side: of every other the worker is taken in place.
     let owed = placement.owes_events();
@@ -2322,6 +2394,19 @@ fn with_pair_request<R>(
 ///
 /// The route's call that states the request ([`Stated`]) is made here,
 /// for a pair that can be placed.
+///
+/// A traced request's decision record takes the rows a classic pair's two
+/// selections write, the prefill's and then the decode's: each pool as it
+/// stands ahead of the engine's first call, and the side's worker under the
+/// row's name ([`row_name`]). Under a document that picks the decode behind
+/// its prefill the decode's row is not written: that decode may be decided
+/// again behind the prefill's answer ([`decode_again`]), after the route
+/// wrote the record, so the record holds the prefill's row alone. A pair
+/// the engine did not place leaves one row, with no worker: the side
+/// judged to have nobody. Prefills all at the admission limit leave none,
+/// as a classic pass leaves none where they leave its candidates ahead of
+/// its policy: the route asks again for every slot it waits for. An
+/// untraced pair pays one lookup for both.
 #[inline(never)]
 #[expect(
     clippy::too_many_arguments,
@@ -2395,6 +2480,11 @@ fn pair_by_engine(
         }
         false
     };
+    let side_row = |side: RowSide, label| row_name(policies, Some(side), label);
+    let prefill_seen = cache_trace::observe(&pairs.prefill_pool);
+    let decode_seen = prefill_seen
+        .as_ref()
+        .and_then(|_| cache_trace::observe(&pairs.decode_pool));
     let placed = match place(None) {
         Err(Unplaced::NoWorkers) if inputs.candidate_filter.is_some() && takes_a_pair() => {
             place(inputs.candidate_filter)
@@ -2414,8 +2504,10 @@ fn pair_by_engine(
             let open =
                 |pool: &[Arc<dyn Worker>]| pool.iter().any(|w| admitted(w) && w.is_available());
             let (role, pool) = if open(&pairs.prefill) {
+                engine_row(decode_seen, || side_row(DECODE_ROW, ""), None);
                 (WorkerRole::Decode, &pairs.decode_pool)
             } else {
+                engine_row(prefill_seen, || side_row(PREFILL_ROW, ""), None);
                 (WorkerRole::Prefill, &pairs.prefill)
             };
             let judged = admitted_pool(pool, wire, &inputs);
@@ -2428,26 +2520,31 @@ fn pair_by_engine(
     };
     let configured =
         |label: &'static str, policy: &'static str| if label.is_empty() { policy } else { label };
-    for (role, worker, label) in [
+    for (role, worker, side, label, seen) in [
         (
             metrics_labels::WORKER_PREFILL,
             &pair.prefill,
-            configured(
-                labels.0,
-                policies.side_policy_name(crate::policies::Side::Prefill),
-            ),
+            PREFILL_ROW,
+            labels.0,
+            prefill_seen,
         ),
         (
             metrics_labels::WORKER_DECODE,
             &pair.decode,
-            configured(
-                labels.1,
-                policies.side_policy_name(crate::policies::Side::Decode),
-            ),
+            DECODE_ROW,
+            labels.1,
+            decode_seen,
         ),
     ] {
         let transport = worker.connection_mode().as_metric_label();
-        Metrics::record_worker_selection(role, transport, model_id, label);
+        let counted_under = configured(label, policies.side_policy_name(side.0));
+        Metrics::record_worker_selection(role, transport, model_id, counted_under);
+        // A decode the document picks behind its prefill may be decided
+        // again after the record is written: no row names the one decided
+        // first.
+        let later = || engine.spec().decode_pick() == DecodePick::AfterPrefill;
+        let seen = seen.filter(|_| side != DECODE_ROW || !later());
+        engine_row(seen, || side_row(side, label), Some(worker.worker()));
     }
     debug!(
         prefill = %pair.prefill.redacted_url(),
@@ -7529,6 +7626,419 @@ pub(crate) mod tests {
         );
     }
 
+    /// The classic `prefix_hash` policy's registry beside one whose engine
+    /// decides under the document the same settings mean, with the cache
+    /// boundaries given.
+    fn prefix_policies(cache_boundaries: &[usize]) -> (PolicyRegistry, PolicyRegistry) {
+        use crate::config::RouterConfig;
+
+        let settings = RouterConfig {
+            policy: PolicyConfig::PrefixHash {
+                prefix_token_count: 256,
+                load_factor: 1.25,
+                balance_abs_threshold: 10,
+                cache_boundaries: cache_boundaries.to_vec(),
+            },
+            ..Default::default()
+        };
+        let engine = PolicyRegistry::for_policy_engine(
+            settings.policy.clone(),
+            settings.routing_key_override.clone(),
+        );
+        let document = settings.policy_document().expect("the settings' document");
+        let spec = AppliedSpec::validate(&document).expect("a valid document");
+        engine_on(&engine, spec);
+        (PolicyRegistry::new(settings.policy), engine)
+    }
+
+    /// A request the `prefix_hash` policy places by a ring: its name, its
+    /// token ids, its text and its headers.
+    type Prefixed = (String, Option<Vec<u32>>, Option<String>, HeaderMap);
+
+    /// The requests the `prefix_hash` policy places by a ring. Prompts of
+    /// token ids: the policy's own recorded set of 70 to 400, and four
+    /// around the first boundary. Prompts of text alone, measured at four
+    /// characters a token, around both boundaries. A routing key over a
+    /// prompt, which the key leads.
+    fn prefix_placed() -> Vec<Prefixed> {
+        let mut requests = Vec::new();
+        for p in 0..32u32 {
+            let len = 70 + (p * 37) % 331;
+            let step = 1 + p % 3;
+            let tokens: Vec<u32> = (0..len).map(|i| (p / 4) * 1_000 + i * step).collect();
+            requests.push((
+                format!("{len} tokens"),
+                Some(tokens),
+                None,
+                HeaderMap::new(),
+            ));
+        }
+        for len in [5u32, 40, 63, 64] {
+            let tokens: Vec<u32> = (0..len).map(|i| 9_000 + i).collect();
+            requests.push((
+                format!("{len} tokens"),
+                Some(tokens),
+                None,
+                HeaderMap::new(),
+            ));
+        }
+        let lengths = [100usize, 255, 256, 300, 1_023, 1_024, 1_500];
+        for (at, len) in lengths.into_iter().enumerate() {
+            let letters = "abcdefghijklmnopqrstuvwxy\u{e9}".chars().cycle();
+            let text: String = letters.skip(at).take(len).collect();
+            requests.push((
+                format!("a text of {len}"),
+                None,
+                Some(text),
+                HeaderMap::new(),
+            ));
+        }
+        for at in 0..6 {
+            let mut headers = HeaderMap::new();
+            let key = format!("session-{at}").parse().expect("a header value");
+            headers.insert("x-smg-routing-key", key);
+            let tokens: Vec<u32> = (0..300).collect();
+            requests.push((format!("key {at}"), Some(tokens), None, headers));
+        }
+        requests
+    }
+
+    /// Under the engine a request the `prefix_hash` policy places by a
+    /// ring goes to the worker that policy sends it to. The gateway's ring
+    /// answers the engine where each head of the request stands, by the
+    /// policy's own recipe (`PrefixHashPolicy::head_position`), and the
+    /// engine cuts the request into the heads the policy cuts it into: a
+    /// prompt at each cache boundary it reaches, else at the policy's
+    /// depth, and a routing key whole. So does the request's retry, which
+    /// leaves the worker it tried for the next one the ring reaches, and a
+    /// request placed while three workers are not ready. With and without
+    /// cache boundaries.
+    #[test]
+    fn the_engine_places_a_prompt_where_the_classic_prefix_ring_does() {
+        let urls: Vec<String> = (0..16).map(|at| format!("http://w{at:02}:8000")).collect();
+        let urls: Vec<&str> = urls.iter().map(String::as_str).collect();
+        let down = ["http://w03:8000", "http://w07:8000", "http://w11:8000"];
+        for boundaries in [&[64usize, 256][..], &[][..]] {
+            let registry = http_registry(&urls);
+            let (classic, engine) = prefix_policies(boundaries);
+            let compared = |round: &str| {
+                let mut owners = BTreeMap::new();
+                for (name, tokens, text, headers) in prefix_placed() {
+                    let inputs = PlacementInputs {
+                        tokens: tokens.as_deref(),
+                        text: text.as_deref(),
+                        headers: Some(&headers),
+                        ..Default::default()
+                    };
+                    let owner = pick(&registry, &classic, inputs);
+                    let placed = pick(&registry, &engine, inputs);
+                    assert_eq!(placed.url(), owner.url(), "{name}, {round}");
+                    *owners.entry(owner.url().to_owned()).or_insert(0) += 1;
+
+                    let tried = vec![owner.base_url().to_string()];
+                    let retry = PlacementInputs {
+                        tried: &tried,
+                        ..inputs
+                    };
+                    let next = pick(&registry, &classic, retry);
+                    assert_ne!(next.url(), owner.url(), "{name}, {round}");
+                    let placed = pick(&registry, &engine, retry);
+                    assert_eq!(placed.url(), next.url(), "{name}, {round}, its retry");
+                }
+                owners
+            };
+            let owners = compared("every worker ready");
+            assert!(owners.len() > 8, "the requests spread: {owners:?}");
+            for url in down {
+                let worker = registry.get_by_url(url).expect("registered");
+                worker.set_status(WorkerStatus::NotReady);
+            }
+            let owners = compared("three workers not ready");
+            assert!(owners.len() > 8, "the requests spread: {owners:?}");
+            assert!(down.iter().all(|url| !owners.contains_key(*url)));
+            assert!(registry.get_routing_snapshot(MODEL).hash_ring_is_filled());
+            // The model's ring was read from the registry's kept rings: no
+            // classic policy object was made for it, and none was asked.
+            assert_eq!(engine.classic_made_or_asked(), 0);
+        }
+    }
+
+    /// A request the `prefix_hash` policy places keeps classic's worker
+    /// through a change of the model's workers: one that leaves, one that
+    /// joins, and one replaced by a new worker at its address. The engine
+    /// walks the ring the gateway keeps for the model, so after each change
+    /// it is lent the ring the classic policy reads. A request whose worker
+    /// stayed keeps it, a new worker takes requests from the others and
+    /// moves none between them, and a worker replaced at its address hands
+    /// its requests to the new one.
+    #[test]
+    fn the_engine_follows_the_classic_prefix_ring_through_a_membership_change() {
+        let urls: Vec<String> = (0..16).map(|at| format!("http://w{at:02}:8000")).collect();
+        let urls: Vec<&str> = urls.iter().map(String::as_str).collect();
+        let registry = http_registry(&urls);
+        let (classic, engine) = prefix_policies(&[64, 256]);
+        let register = |url: &str| {
+            let worker = BasicWorkerBuilder::new(url)
+                .model(ModelCard::new(MODEL))
+                .worker_type(WorkerType::Regular)
+                .connection_mode(ConnectionMode::Http)
+                .runtime_type(RuntimeType::Sglang)
+                .health_config(HealthCheckConfig {
+                    disable_health_check: true,
+                    ..Default::default()
+                })
+                .build();
+            registry
+                .register(Arc::new(worker))
+                .expect("worker registers");
+        };
+        // Each request's worker under the engine, which is classic's.
+        let placed = |round: &str| -> Vec<Arc<dyn Worker>> {
+            let place = |(name, tokens, text, headers): Prefixed| {
+                let inputs = PlacementInputs {
+                    tokens: tokens.as_deref(),
+                    text: text.as_deref(),
+                    headers: Some(&headers),
+                    ..Default::default()
+                };
+                let owner = pick(&registry, &classic, inputs);
+                let by_engine = pick(&registry, &engine, inputs);
+                assert_eq!(by_engine.url(), owner.url(), "{name}, {round}");
+                assert!(Arc::ptr_eq(&by_engine, &owner), "{name}, {round}");
+                by_engine
+            };
+            prefix_placed().into_iter().map(place).collect()
+        };
+        let first = placed("sixteen workers");
+
+        // The first request's worker leaves: its requests move, no other's.
+        let left = first[0].url().to_owned();
+        registry.remove_by_url(&left).expect("registered");
+        let without = placed("one worker left");
+        for (before, after) in first.iter().zip(&without) {
+            assert_ne!(after.url(), left);
+            let stays = before.url() == left || Arc::ptr_eq(after, before);
+            assert!(stays, "{} to {}", before.url(), after.url());
+        }
+
+        let joined = "http://w16:8000";
+        register(joined);
+        let with = placed("one worker joined");
+        let takes = with.iter().filter(|after| after.url() == joined).count();
+        assert!(takes > 0, "the new worker takes a request");
+        for (before, after) in without.iter().zip(&with) {
+            let stays = after.url() == joined || Arc::ptr_eq(after, before);
+            assert!(stays, "{} to {}", before.url(), after.url());
+        }
+
+        // A new worker at the second request's address: each request stays
+        // at its address, and that address's go to the new worker.
+        let old = registry.remove_by_url(with[1].url()).expect("registered");
+        register(old.url());
+        let again = placed("one worker replaced at its address");
+        for (before, after) in with.iter().zip(&again) {
+            assert_eq!(after.url(), before.url());
+            let kept = Arc::ptr_eq(after, before);
+            assert_eq!(kept, !Arc::ptr_eq(before, &old), "{}", before.url());
+        }
+        assert_eq!(engine.classic_made_or_asked(), 0);
+    }
+
+    /// The bounded-load rule under the engine is the classic policy's. A
+    /// prompt whose deepest head's owner holds more requests than the bound
+    /// goes to the owner of its next head: classic tries the next boundary's
+    /// key, and the engine the next place its request states. Where every
+    /// head's owner is past the bound, it goes to the worker with the
+    /// fewest requests, which the loads here leave one of.
+    #[test]
+    fn the_engine_steps_past_a_loaded_owner_as_the_classic_prefix_ring_does() {
+        let urls: Vec<String> = (0..16).map(|at| format!("http://w{at:02}:8000")).collect();
+        let urls: Vec<&str> = urls.iter().map(String::as_str).collect();
+        let idle = "http://w09:8000";
+        let mut stepped = 0;
+        for (name, tokens, _, headers) in prefix_placed() {
+            // A prompt that reaches both boundaries has two heads, and no
+            // routing key leads it.
+            let Some(tokens) = tokens.filter(|tokens| tokens.len() >= 256 && headers.is_empty())
+            else {
+                continue;
+            };
+            let registry = http_registry(&urls);
+            let (classic, engine) = prefix_policies(&[64, 256]);
+            let placed = |tokens: &[u32], round: &str| {
+                let inputs = PlacementInputs {
+                    tokens: Some(tokens),
+                    ..Default::default()
+                };
+                let owner = pick(&registry, &classic, inputs);
+                let by_engine = pick(&registry, &engine, inputs);
+                assert!(Arc::ptr_eq(&by_engine, &owner), "{name}, {round}");
+                owner
+            };
+            let load = |worker: &Arc<dyn Worker>, requests: usize| {
+                for _ in worker.load()..requests {
+                    worker.increment_load();
+                }
+            };
+            // With no request in flight the deepest head's owner takes the
+            // prompt, and its first boundary's owner takes that head alone.
+            let owner = placed(&tokens, "no load");
+            let next = placed(&tokens[..64], "the first boundary alone");
+            if Arc::ptr_eq(&owner, &next) || owner.url() == idle || next.url() == idle {
+                continue;
+            }
+            // Eleven requests on the owner are past the bound of sixteen
+            // workers: the mean with this request, and ten.
+            load(&owner, 11);
+            let after = placed(&tokens, "the deepest head's owner past the bound");
+            assert!(Arc::ptr_eq(&after, &next), "{name}: {}", after.url());
+            // Both owners past the bound, and every other worker but one
+            // holds a request.
+            for worker in &registry.get_all() {
+                let own = Arc::ptr_eq(worker, &owner) || Arc::ptr_eq(worker, &next);
+                load(
+                    worker,
+                    if own {
+                        13
+                    } else {
+                        usize::from(worker.url() != idle)
+                    },
+                );
+            }
+            let after = placed(&tokens, "every head's owner past the bound");
+            assert_eq!(after.url(), idle, "{name}");
+            assert_eq!(engine.classic_made_or_asked(), 0);
+            stepped += 1;
+        }
+        assert!(stepped >= 8, "{stepped} prompts stepped past their owner");
+    }
+
+    /// A pair under the engine is placed where the classic `prefix_hash`
+    /// policies place its two sides. The gateway lends a pair's decision
+    /// the model's ring as it lends a single request's, and the ring
+    /// answers for the pair's heads too: each side is found among its own
+    /// role's workers from the place the classic policy of that role
+    /// starts at.
+    #[test]
+    fn the_engine_places_a_pair_where_the_classic_prefix_ring_does() {
+        use crate::{
+            config::{RouterConfig, RoutingMode},
+            policies::PolicyFactory,
+        };
+
+        let prefix = PolicyConfig::PrefixHash {
+            prefix_token_count: 256,
+            load_factor: 1.25,
+            balance_abs_threshold: 10,
+            cache_boundaries: vec![64, 256],
+        };
+        let settings = RouterConfig {
+            mode: RoutingMode::PrefillDecode {
+                prefill_urls: vec![],
+                decode_urls: vec![],
+                prefill_policy: Some(prefix.clone()),
+                decode_policy: Some(prefix.clone()),
+            },
+            policy: prefix.clone(),
+            ..Default::default()
+        };
+        let fleet: Vec<(String, WorkerType)> = (0..8)
+            .flat_map(|at| {
+                [
+                    (format!("grpc://p{at}:1"), WorkerType::Prefill),
+                    (format!("grpc://d{at}:1"), WorkerType::Decode),
+                ]
+            })
+            .collect();
+        let listed: Vec<_> = fleet
+            .iter()
+            .map(|(url, role)| (url.as_str(), *role, Some("NixlConnector")))
+            .collect();
+        let registry = pd_registry(&listed);
+        let classic = PolicyRegistry::new(prefix.clone());
+        classic.set_prefill_policy(PolicyFactory::create_from_config(&prefix));
+        classic.set_decode_policy(PolicyFactory::create_from_config(&prefix));
+        let engine = PolicyRegistry::for_policy_engine(
+            settings.policy.clone(),
+            settings.routing_key_override.clone(),
+        );
+        let document = settings.policy_document().expect("the settings' document");
+        let spec = AppliedSpec::validate(&document).expect("a valid document");
+        engine_on(&engine, spec);
+        let placed = |policies: &PolicyRegistry, inputs: PlacementInputs<'_>| {
+            let pairs = pairs_of(&registry, policies);
+            let pair = select_pair(
+                &registry,
+                policies,
+                MODEL,
+                &pairs,
+                None,
+                None,
+                inputs,
+                Stated::nothing,
+            );
+            let pair = pair.expect("a pair is open");
+            (pair.prefill.url().to_owned(), pair.decode.url().to_owned())
+        };
+        let mut sides = std::collections::BTreeSet::new();
+        for (name, tokens, text, headers) in prefix_placed() {
+            let inputs = PlacementInputs {
+                tokens: tokens.as_deref(),
+                text: text.as_deref(),
+                headers: Some(&headers),
+                ..Default::default()
+            };
+            let by_classic = placed(&classic, inputs);
+            assert_eq!(placed(&engine, inputs), by_classic, "{name}");
+            sides.insert(by_classic);
+        }
+        assert!(sides.len() > 8, "the pairs spread: {sides:?}");
+        assert!(registry.get_routing_snapshot(MODEL).hash_ring_is_filled());
+        assert_eq!(engine.classic_made_or_asked(), 0);
+    }
+
+    /// A model's first prompts, before a ring is kept for it, go where the
+    /// `prefix_hash` policy sends them with no ring: to the worker with the
+    /// fewest requests. The engine is lent a ring that holds no worker and
+    /// places a head ([`Unfilled`](crate::policies::hash_ring::Unfilled)),
+    /// so its ring stage ranks nobody and the fewest requests decide. The
+    /// task that fills the rings lives here and never runs: nothing drives
+    /// its runtime.
+    #[test]
+    fn the_engine_places_a_models_first_prompts_by_the_fewest_requests() {
+        let urls: Vec<String> = (0..8).map(|at| format!("http://w{at:02}:8000")).collect();
+        let urls: Vec<&str> = urls.iter().map(String::as_str).collect();
+        let registry = Arc::new(http_registry(&urls));
+        let (classic, engine) = prefix_policies(&[64, 256]);
+        let runtime = tokio::runtime::Builder::new_current_thread().build();
+        let runtime = runtime.expect("a runtime");
+        classic.keep_rings_warm(&registry, runtime.handle());
+        engine.keep_rings_warm(&registry, runtime.handle());
+        // Every worker but one holds a request.
+        let idle = "http://w05:8000";
+        for worker in &registry.get_all() {
+            if worker.url() != idle {
+                worker.increment_load();
+            }
+        }
+
+        for (name, tokens, text, headers) in prefix_placed() {
+            let inputs = PlacementInputs {
+                tokens: tokens.as_deref(),
+                text: text.as_deref(),
+                headers: Some(&headers),
+                ..Default::default()
+            };
+            assert_eq!(pick(&registry, &classic, inputs).url(), idle, "{name}");
+            assert_eq!(pick(&registry, &engine, inputs).url(), idle, "{name}");
+        }
+        assert!(
+            !registry.get_routing_snapshot(MODEL).hash_ring_is_filled(),
+            "no request fills a ring while the task lives"
+        );
+        assert_eq!(engine.classic_made_or_asked(), 0);
+    }
+
     /// The engine's request reads the model's ring only under a document
     /// that places by one, as a classic placement reads it only for a
     /// policy that walks it: a ring nobody walks is not filled.
@@ -7618,6 +8128,278 @@ pub(crate) mod tests {
             let counted = selections_by_policy(&handle.render());
             assert_eq!(counted, BTreeMap::from([(name.to_owned(), 2)]), "{name}");
             assert_eq!(policies.classic_made_or_asked(), 0, "{name}");
+        }
+    }
+
+    // ---- a traced request under the policy engine --------------------------------------------
+
+    /// One row of a decision record as these cases read it: its policy, its
+    /// origin, its worker (empty where the row names none) and its
+    /// candidates.
+    type TracedRow = (String, String, String, Vec<String>);
+
+    /// The rows of the decision record in scope.
+    fn traced_rows() -> Vec<TracedRow> {
+        let text = |value: &serde_json::Value| value.as_str().unwrap_or_default().to_owned();
+        let rows = cache_trace::captured_selections();
+        rows.iter()
+            .map(|row| {
+                let candidates = row["candidates"].as_array().into_iter().flatten();
+                let candidates = candidates.map(|candidate| text(&candidate["worker"]));
+                (
+                    text(&row["policy"]),
+                    text(&row["origin"]),
+                    text(&row["worker"]),
+                    candidates.collect(),
+                )
+            })
+            .collect()
+    }
+
+    /// A row the policy engine's placement writes: under `policy`, with
+    /// `worker` picked from `candidates`.
+    fn by_engine(policy: &str, worker: &str, candidates: &[&str]) -> TracedRow {
+        let candidates = candidates.iter().map(|&url| url.to_owned()).collect();
+        (
+            policy.to_owned(),
+            "engine".to_owned(),
+            worker.to_owned(),
+            candidates,
+        )
+    }
+
+    /// The registry of a gateway that was supplied `document` beside its
+    /// default settings, as its start makes it of that configuration
+    /// (`PolicyRegistry::of_config`); `pair` makes the configuration a pair
+    /// gateway's.
+    fn supplied_with(document: &PolicySpec, pair: bool) -> PolicyRegistry {
+        use crate::config::{RouterConfig, RoutingMode};
+
+        let mut config = RouterConfig {
+            policy_controller: true,
+            policy_spec: Some(document.clone()),
+            ..Default::default()
+        };
+        if pair {
+            config.mode = RoutingMode::PrefillDecode {
+                prefill_urls: Vec::new(),
+                decode_urls: Vec::new(),
+                prefill_policy: None,
+                decode_policy: None,
+            };
+        }
+        let policies = PolicyRegistry::of_config(&config);
+        assert!(policies.runs_supplied_document());
+        policies
+    }
+
+    /// A traced single request the policy engine placed records one row, as
+    /// a classic selection does (`PolicyRegistry::select_worker_for_model`,
+    /// `model_gateway/src/policies/registry.rs:711-716`): the pool's list as
+    /// the engine was lent it, and the worker picked under the label of the
+    /// profile that picked. A request the engine places nowhere records a
+    /// row with no worker, where classic writes its policy's row with no
+    /// worker: under the name the settings give the main policy in a
+    /// gateway of settings alone, and under no name in one that was
+    /// supplied its document, where the settings name nothing that runs.
+    /// The rows' origin is `engine`, where classic writes `policy`, and
+    /// they hold no prediction, score or gate.
+    #[tokio::test]
+    async fn a_traced_single_of_the_engine_records_its_pick_under_its_profiles_label() {
+        let (one, two) = ("http://h:1", "http://h:2");
+        let of_settings = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        assert!(!of_settings.runs_supplied_document());
+        let document = PolicySpec::preset("round_robin").expect("a stock preset");
+        let supplied = supplied_with(&document, false);
+        assert_ne!(
+            supplied.policy_name(),
+            "round_robin",
+            "the default settings"
+        );
+        for (policies, preset, unnamed) in [
+            (of_settings, "random", "round_robin"),
+            (supplied, "round_robin", ""),
+        ] {
+            let registry = http_registry(&[one, two]);
+            preset_on(&policies, preset);
+            let nobody = |_: &dyn Worker| false;
+            let refused = PlacementInputs {
+                candidate_filter: Some(&nobody),
+                ..Default::default()
+            };
+            let (picked, rows, whole) = cache_trace::scope(true, async {
+                let picked = pick(&registry, &policies, PlacementInputs::default());
+                let pool = RoutingPool::HttpRegular;
+                let stated = Stated::nothing;
+                let none = select_single(&registry, &policies, MODEL, pool, None, refused, stated);
+                assert!(none.is_none(), "the request's rule takes no worker");
+                (picked, traced_rows(), cache_trace::captured_selections())
+            })
+            .await;
+            assert_eq!(
+                rows,
+                [
+                    by_engine(preset, picked.url(), &[one, two]),
+                    by_engine(unnamed, "", &[one, two]),
+                ],
+                "{preset}"
+            );
+            for row in &whole {
+                let stated = (&row["prediction"], &row["scores"], &row["gates"]);
+                let nothing = serde_json::json!([]);
+                assert_eq!(stated, (&serde_json::Value::Null, &nothing, &nothing));
+            }
+        }
+    }
+
+    /// A traced pair the policy engine placed records the two rows a
+    /// classic pair's selections write, the prefill's and then the decode's
+    /// (`PolicyRegistry::select_worker_for_model`,
+    /// `model_gateway/src/policies/registry.rs:711-716`, asked once a side):
+    /// each side's pool as it stood ahead of the engine's call, and the
+    /// side's worker. The rows' origin is `engine`, where classic writes
+    /// `policy`.
+    ///
+    /// In a gateway of settings alone the document is the one the settings
+    /// mean, whose two profiles are named for their sides: each row is
+    /// under the name the settings give its side's policy, as classic's.
+    /// Under profiles with names of their own, each row is under its
+    /// profile's name. In a gateway that was supplied its document, the
+    /// same profiles named for their sides stand under their own labels:
+    /// the settings name nothing that runs. Under a supplied document that
+    /// picks the decode behind its prefill the record holds the prefill's
+    /// row alone, because that decode may be decided again after the record
+    /// is written.
+    #[tokio::test]
+    async fn a_traced_pair_of_the_engine_records_both_picks_each_under_its_sides_policy() {
+        use crate::{
+            config::{RouterConfig, RoutingMode},
+            policies::Side as PairSide,
+        };
+
+        let settings = RouterConfig {
+            mode: RoutingMode::PrefillDecode {
+                prefill_urls: Vec::new(),
+                decode_urls: Vec::new(),
+                prefill_policy: Some(PolicyConfig::Random),
+                decode_policy: Some(PolicyConfig::RoundRobin),
+            },
+            ..Default::default()
+        };
+        // A gateway of these settings, its sides named as its routers name
+        // them at their build.
+        let of_settings = || {
+            let (main, mode) = (&settings.policy, &settings.mode);
+            let policies = PolicyRegistry::new(main.clone());
+            policies.set_side_policy(PairSide::Prefill, mode.get_prefill_policy(main));
+            policies.set_side_policy(PairSide::Decode, mode.get_decode_policy(main));
+            assert!(!policies.runs_supplied_document());
+            policies
+        };
+        let stock = settings.policy_document().expect("the settings' document");
+        let mut renamed = stock.clone();
+        for (side, name) in [("prefill", "first"), ("decode", "second")] {
+            let profile = renamed.profiles.remove(side).expect("the side's profile");
+            renamed.profiles.insert(name.to_owned(), profile);
+            for binding in &mut renamed.bindings {
+                if let Some(of_side) = binding.profiles.get_mut(side) {
+                    name.clone_into(of_side);
+                }
+            }
+        }
+        let mut later = stock.clone();
+        later.plans.pd_pair.decode = DecodePick::AfterPrefill;
+        let (prefill, decode) = ("grpc://p:1", "grpc://d:1");
+        let both = |names: [&str; 2]| {
+            vec![
+                by_engine(names[0], prefill, &[prefill]),
+                by_engine(names[1], decode, &[decode]),
+            ]
+        };
+        for (document, policies, expected) in [
+            (&stock, of_settings(), both(["random", "round_robin"])),
+            (&renamed, of_settings(), both(["first", "second"])),
+            (
+                &stock,
+                supplied_with(&stock, true),
+                both(["prefill", "decode"]),
+            ),
+            (
+                &later,
+                supplied_with(&later, true),
+                vec![by_engine("prefill", prefill, &[prefill])],
+            ),
+        ] {
+            let registry = one_pair();
+            let spec = AppliedSpec::validate(document);
+            engine_on(&policies, spec.expect("a valid document"));
+            registry
+                .get_by_url(prefill)
+                .expect("registered")
+                .increment_load();
+            let (rows, whole) = cache_trace::scope(true, async {
+                let pair = pair_from(&registry, &policies).expect("the engine places the pair");
+                assert_eq!((pair.prefill.url(), pair.decode.url()), (prefill, decode));
+                (traced_rows(), cache_trace::captured_selections())
+            })
+            .await;
+            assert_eq!(rows, expected);
+            let loads = whole.iter().map(|row| row["candidates"][0]["load"].clone());
+            let loads: Vec<_> = loads.collect();
+            assert_eq!(loads, [1, 0][..expected.len()], "each pool as it stood");
+        }
+    }
+
+    /// A traced pair the policy engine did not place records one row, with
+    /// no worker: the pool of the side judged to have nobody the request
+    /// may use. In a gateway of settings alone it is under the name the
+    /// settings give that side's policy, and in one that was supplied its
+    /// document under no name. A classic pair whose decode selection names
+    /// nobody leaves the prefill's row and then the decode's
+    /// (`model_gateway/src/policies/registry.rs:711-716`, once a side): the
+    /// engine's call names no prefill where it names no pair.
+    #[tokio::test]
+    async fn a_traced_pair_the_engine_did_not_place_records_the_side_that_had_nobody() {
+        let (prefill, decode) = ("grpc://p:1", "grpc://d:1");
+        let document = PolicySpec::pair_presets("random", "round_robin");
+        let document = document.expect("the pair presets");
+        let of_settings = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        of_settings.set_side_policy(crate::policies::Side::Prefill, &PolicyConfig::Random);
+        for (policies, names) in [
+            (of_settings, ["round_robin", "random"]),
+            (supplied_with(&document, true), ["", ""]),
+        ] {
+            let registry = one_pair();
+            let spec = AppliedSpec::validate(&document);
+            engine_on(&policies, spec.expect("a valid document"));
+            let no_decode = |worker: &dyn Worker| worker.url() != decode;
+            let no_prefill = |worker: &dyn Worker| worker.url() != prefill;
+            let refused = |rule: CandidateFilter<'_>| {
+                let inputs = PlacementInputs {
+                    candidate_filter: Some(rule),
+                    ..Default::default()
+                };
+                let pairs = pairs_of(&registry, &policies);
+                let stated = Stated::nothing;
+                let placed = select_pair(
+                    &registry, &policies, MODEL, &pairs, None, None, inputs, stated,
+                );
+                placed.err().expect("the engine places no pair").role
+            };
+            let (roles, rows) = cache_trace::scope(true, async {
+                let roles = [refused(&no_decode), refused(&no_prefill)];
+                (roles, traced_rows())
+            })
+            .await;
+            assert_eq!(roles, [WorkerRole::Decode, WorkerRole::Prefill]);
+            assert_eq!(
+                rows,
+                [
+                    by_engine(names[0], "", &[decode]),
+                    by_engine(names[1], "", &[prefill]),
+                ],
+                "{names:?}"
+            );
         }
     }
 

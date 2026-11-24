@@ -821,8 +821,9 @@ impl PolicyEngine {
                 WorkerLists::Pair(lists) | WorkerLists::Encode(EncodeLists { pair: lists, .. }) => {
                     let read = self.loads_read(maker);
                     let loads = read.snapshot();
-                    // The decode asked again writes for its first target.
-                    pair::decide(own, &lists, &mut request, Some(held), loads, now, |_| true)
+                    // The decode asked again is asked which decode it is sent to.
+                    let sends_to = |target: &_| maker.sends_to(target);
+                    pair::decide(own, &lists, &mut request, Some(held), loads, now, sends_to)
                 }
                 _ => single::over_none(own, &request),
             })
@@ -1040,8 +1041,9 @@ impl DecisionEngine for PolicyEngine {
                 WorkerLists::Pair(lists) | WorkerLists::Encode(EncodeLists { pair: lists, .. }) => {
                     let read = self.loads_read(maker);
                     let loads = read.snapshot();
-                    // The decode asked again writes for its first target.
-                    pair::decided(own, &lists, &mut request, Some(held), loads, now, |_| true)
+                    // The decode asked again is asked which decode it is sent to.
+                    let sends_to = |target: &_| maker.sends_to(target);
+                    pair::decided(own, &lists, &mut request, Some(held), loads, now, sends_to)
                 }
                 _ => single::issued(own, single::over_none(own, &request), &request, now),
             })
