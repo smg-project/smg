@@ -1823,7 +1823,10 @@ impl TokenTree {
     /// and a split hands the tenant's prefix to a new node: a count dropped
     /// whole left such a node standing uncounted, so the total read short
     /// by it and the tenant's next purge returned at a count of zero. A
-    /// node a split makes between the walk and its child's removal stays
+    /// node a split makes between a walk and its child's removal names the
+    /// tenant, counted, behind that walk: while the count reads above zero
+    /// the purge walks the whole tree again, `PURGE_PASSES` passes at most,
+    /// until a walk finds no node. What the last walk leaves stays
     /// the tenant's, counted, until its next purge. What can still drift is
     /// a count with no node behind it: a node attached ahead of the walk
     /// whose insert counts behind the debit. Such a count stays with the
@@ -1848,13 +1851,34 @@ impl TokenTree {
             nodes.clear();
             self.collect_tenant_nodes(&self.root, tenant_id, &mut nodes);
         }
-        let mut removed = 0;
-        for node in &nodes {
-            removed += self.remove_tenant_and_cleanup(node, tenant_id).0;
+        let mut passes = 1;
+        loop {
+            let mut removed = 0;
+            for node in &nodes {
+                removed += self.remove_tenant_and_cleanup(node, tenant_id).0;
+            }
+            self.sub_tenant_tokens(tenant_id, removed);
+            // Another tenant's insert that split a node between the walk and
+            // that node's removal left the tenant's prefix on a node the walk
+            // never saw, under ancestors this pass cleared: the count still
+            // holds it, and only the complete walk reaches it.
+            if passes == Self::PURGE_PASSES || self.tenant_token_size(tenant_id) == 0 {
+                break;
+            }
+            passes += 1;
+            nodes.clear();
+            self.collect_tenant_nodes(&self.root, tenant_id, &mut nodes);
+            if nodes.is_empty() {
+                break;
+            }
         }
-        self.sub_tenant_tokens(tenant_id, removed);
         self.drop_count_at_zero(tenant_id);
     }
+
+    /// The passes one purge makes at most: its first, and one more for each
+    /// pass that ends with the tenant's count above zero. The first pass
+    /// walks the tree twice where its pruned walk and the count disagree.
+    const PURGE_PASSES: usize = 3;
 
     /// Drops a tenant's count entry where it reads zero, and only there: an
     /// insert may have counted since the entry was last read.

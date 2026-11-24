@@ -2945,3 +2945,84 @@ fn a_removal_beside_a_split_leaves_no_count_without_a_node() {
         tree.tenant_token_size(&purged)
     );
 }
+
+/// A purge leaves the purged tenant nothing counted, in the token tree and in
+/// the string tree alike, where another tenant's inserts split its nodes
+/// meanwhile. `worker-a` holds `GROUPS` heads with `FAN` keys of two more
+/// parts under each. While it is purged, a second thread inserts for
+/// `worker-b` a key that shares two parts with each of them and differs in
+/// the third: every such insert splits one node of `worker-a`. A split
+/// between the purge's walk and that node's removal hands `worker-a`'s
+/// second part to a new node the walk never saw, under a first part the
+/// purge cleared: one walk left it standing, counted, to the tenant's next
+/// purge, and the pruned walk does not reach it. The size is the read
+/// because no insert for `worker-a` runs beside the purge: every node that
+/// still names it is counted.
+#[test]
+fn a_purge_beside_splits_by_another_tenant_leaves_the_purged_nothing_counted() {
+    const GROUPS: u32 = 2_000;
+    const FAN: u32 = 10;
+    /// A tree by its name: its insert of the key `(group, leaf, third)` for
+    /// a tenant, its purge of `worker-a`, and what it then counts for it.
+    type Row<'a> = (
+        &'a str,
+        &'a (dyn Fn(u32, u32, u32, &str) + Sync),
+        &'a dyn Fn(),
+        &'a dyn Fn() -> usize,
+    );
+    let purged = tenant("worker-a");
+    let (tokens, texts) = (TokenTree::new(), crate::string_tree::Tree::new());
+    let prompt = |group: u32, leaf: u32, third: u32| {
+        let second = group * 100_000 + (leaf + 1) * 1_000;
+        let mut prompt = make_tokens(group * 100_000, 1);
+        prompt.extend(make_tokens(second, 1));
+        prompt.extend(make_tokens(second + third, 1));
+        prompt
+    };
+    let text = |group: u32, leaf: u32, third: u32| {
+        format!("group {group:04} of the head, leaf {leaf:02} of the middle, the tail {third}")
+    };
+    let rows: [Row<'_>; 2] = [
+        (
+            "token tree",
+            &|group, leaf, third, tenant| tokens.insert_tokens(&prompt(group, leaf, third), tenant),
+            &|| tokens.remove_tenant_all(&purged),
+            &|| tokens.tenant_token_size(&purged),
+        ),
+        (
+            "string tree",
+            &|group, leaf, third, tenant| texts.insert_text(&text(group, leaf, third), tenant),
+            &|| texts.remove_tenant_all(&purged),
+            &|| texts.tenant_char_size(&purged),
+        ),
+    ];
+
+    let left = rows.map(|(tree, insert, purge, counted)| {
+        for group in 0..GROUPS {
+            for leaf in 0..FAN {
+                insert(group, leaf, 100, "worker-a");
+            }
+        }
+        let splitting = AtomicBool::new(false);
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                for group in 0..GROUPS {
+                    for leaf in 0..FAN {
+                        insert(group, leaf, 200, "worker-b");
+                        splitting.store(true, Ordering::Relaxed);
+                    }
+                }
+            });
+            while !splitting.load(Ordering::Relaxed) {
+                thread::yield_now();
+            }
+            purge();
+        });
+        (tree, counted())
+    });
+    assert_eq!(
+        left,
+        [("token tree", 0), ("string tree", 0)],
+        "what each tree still counts for the purged tenant"
+    );
+}

@@ -119,11 +119,18 @@ impl ModelTrees {
     /// worker's tenant count never grows again, so size-based eviction alone
     /// would retain its subtree forever.
     pub fn remove_tenant(&self, tenant: &TenantId) {
-        for tree_ref in &self.string_trees {
-            tree_ref.value().remove_tenant_all(tenant);
+        // Copied out, as `token_trees` copies: a purge can make three passes
+        // over a tree, and it runs under no lock of this store.
+        let string_trees: Vec<Arc<Tree>> = self
+            .string_trees
+            .iter()
+            .map(|tree| Arc::clone(tree.value()))
+            .collect();
+        for tree in string_trees {
+            tree.remove_tenant_all(tenant);
         }
-        for tree_ref in &self.token_trees {
-            tree_ref.value().remove_tenant_all(tenant);
+        for tree in self.token_trees() {
+            tree.remove_tenant_all(tenant);
         }
     }
 
