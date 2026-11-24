@@ -1140,7 +1140,8 @@ impl PolicyRegistry {
     /// Reconcile the policy that places requests on `worker` against the
     /// router's live in-flight count there (see
     /// [`LoadBalancingPolicy::reconcile_in_flight`]). The worker monitor
-    /// calls this once per load poll for every polled worker.
+    /// calls this at every batch of a group's load answers, for every
+    /// worker of the group.
     pub fn reconcile_in_flight(&self, worker: &dyn Worker) {
         if !self.classic {
             return;
