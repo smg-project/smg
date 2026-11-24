@@ -246,6 +246,13 @@ const CELLS: &[Cell] = &[
         ..Cell::PLAIN
     },
     Cell {
+        name: "encode_signal_cost",
+        document: signals::encode_document,
+        request: encode::request,
+        words: encode::words,
+        ..Cell::PLAIN
+    },
+    Cell {
         name: "least_load",
         document: || preset("least_load"),
         ..Cell::PLAIN

@@ -4064,6 +4064,11 @@ struct Entry {
     vetoed: AllVetoed,
 }
 
+/// The sides of a pair that run under the pair's binding whatever binding
+/// covers their phase first: the decode side of every pair, and the encode
+/// side of an `epd` pair. The prefill side is the lookup's own.
+const PAIR_SIDES: [Phase; 2] = [Phase::Decode, Phase::Encode];
+
 /// Every phase, in the order [`Engine::phase_needs`] keeps them.
 const PHASES: [Phase; 4] = [Phase::Single, Phase::Prefill, Phase::Decode, Phase::Encode];
 
@@ -4853,27 +4858,30 @@ impl Engine {
                 }
             }
         }
-        // A pair's decode side is decided by the binding its prefill lookup
-        // resolves to ([`Self::decide_pair`]), not by the first binding that
-        // covers the decode phase: the decode slot also carries the decode
-        // profile of every pair binding a prefill lookup can reach.
-        let decode_slot = slot(Phase::Decode);
+        // A pair's decode side, and an `epd` pair's encode side, are decided
+        // by the binding the prefill lookup resolves to
+        // ([`Self::decide_pair`], [`Self::decide_encode_pair`]), not by the
+        // first binding that covers the side's phase: each side's slot also
+        // carries that side's profile of every pair binding a prefill
+        // lookup can reach. A `pd-pair` binding names no encode side.
         for binding in bindings
             .iter()
             .filter(|b| b.phases.is_empty() || b.phases.contains(&Phase::Prefill))
         {
             if matches!(binding.plan, Plan::PdPair | Plan::Epd { .. }) {
-                if let Some(&own) = profile_index(binding, Phase::Decode)
-                    .and_then(|i| profile_needs.get(usize::from(i)))
-                {
-                    // The decode side's shadow reads what its profile
-                    // needs, beside the live one.
-                    let shadow = binding
-                        .decode_shadow
-                        .and_then(|i| profile_needs.get(usize::from(i)))
-                        .copied()
-                        .unwrap_or_default();
-                    phase_needs[decode_slot] = phase_needs[decode_slot].or(own).or(shadow);
+                for side in PAIR_SIDES {
+                    if let Some(&own) =
+                        profile_index(binding, side).and_then(|i| profile_needs.get(usize::from(i)))
+                    {
+                        // The side's shadow reads what its profile needs,
+                        // beside the live one. An encode side names none.
+                        let shadow = shadow_index(binding, side)
+                            .and_then(|i| profile_needs.get(usize::from(i)))
+                            .copied()
+                            .unwrap_or_default();
+                        let needs = &mut phase_needs[slot(side)];
+                        *needs = needs.or(own).or(shadow);
+                    }
                 }
             }
             if binding.model == "*" {
@@ -5119,8 +5127,11 @@ impl Engine {
     /// of its live and shadow profiles and of the binding's sessions rule,
     /// nothing when no binding matches. The decode answer also carries the
     /// needs of the pair's decode profile where the prefill lookup names a
-    /// pair ([`Self::decide_pair`]). The host reads it at registration to
-    /// choose the worker's stream.
+    /// pair ([`Self::decide_pair`]), and the encode answer those of the
+    /// pair's encode profile where that lookup names an `epd` pair
+    /// ([`Self::decide_encode_pair`]): both sides run under the pair's
+    /// binding, whatever binding covers their phase first. The host reads
+    /// it at registration to choose the worker's stream.
     pub fn needs_for(&self, model: &str, phase: Phase) -> Needs {
         self.reads_for(model, phase).0
     }
@@ -5134,13 +5145,14 @@ impl Engine {
     /// [`RequestFacts::pinned_at`]). [`Self::decide_pair`] declines a mask
     /// beside a side that shows its rows: for a decode decision of a model
     /// that also pairs, the word carries the pair's decode side too, as the
-    /// needs do. Written rows are the safe side.
+    /// needs do, and for an encode decision the encode side of its `epd`
+    /// pair. Written rows are the safe side.
     ///
     /// The last word says whether that profile holds a stage that may
     /// refuse a request by a report of leases
     /// ([`Filter::refuses_by_reports`]): a host that applies its gateways'
     /// reports late applies them first for such a decision. It carries a
-    /// pair's decode side as the second word does. A profile kept its
+    /// pair's side as the second word does. A profile kept its
     /// word when the engine was built, so a decision under no such stage
     /// reads nothing more for it.
     pub fn reads_for(&self, model: &str, phase: Phase) -> (Needs, bool, bool) {
@@ -5156,15 +5168,15 @@ impl Engine {
             })
             .unwrap_or_default();
         match phase {
-            Phase::Decode => {
-                let pair = self.pair_decode_marks(model);
+            Phase::Decode | Phase::Encode => {
+                let (needs, pair) = self.pair_side(model, phase);
                 (
-                    own.or(self.pair_decode_needs(model)),
+                    own.or(needs),
                     marks.scoped() || pair.scoped(),
                     marks.by_reports() || pair.by_reports(),
                 )
             }
-            _ => (own, marks.scoped(), marks.by_reports()),
+            Phase::Single | Phase::Prefill => (own, marks.scoped(), marks.by_reports()),
         }
     }
 
@@ -5297,27 +5309,19 @@ impl Engine {
         self.head_rule_of(self.ring_profiles(model, phase))
     }
 
-    /// The marks of the decode profile of `model`'s pair binding, none
-    /// where the model has no such binding.
-    fn pair_decode_marks(&self, model: &str) -> Marks {
-        self.pair_binding(model)
-            .and_then(|b| profile_index(b, Phase::Decode))
-            .and_then(|i| self.marks.get(usize::from(i)))
-            .copied()
-            .unwrap_or_default()
-    }
-
-    /// The needs of the decode profile of `model`'s pair binding
-    /// ([`Self::pair_binding`]), nothing where the model has none.
-    fn pair_decode_needs(&self, model: &str) -> Needs {
-        let Some(binding) = self.pair_binding(model) else {
-            return Needs::default();
-        };
-        profile_index(binding, Phase::Decode)
-            .and_then(|i| self.profile_needs.get(usize::from(i)))
-            .copied()
-            .unwrap_or_default()
-            .or(self.shadow_needs(binding, Phase::Decode))
+    /// What `model`'s pair binding ([`Self::pair_binding`]) holds for
+    /// `side`, one of [`PAIR_SIDES`]: the needs of that side's profile with
+    /// its shadow's, and the profile's marks. Nothing where the model has
+    /// no pair binding, and for the encode side of a `pd-pair` binding,
+    /// which names none. One lookup of the binding answers both.
+    fn pair_side(&self, model: &str, side: Phase) -> (Needs, Marks) {
+        let held = self.pair_binding(model).and_then(|binding| {
+            let index = usize::from(profile_index(binding, side)?);
+            let needs = self.profile_needs.get(index).copied().unwrap_or_default();
+            let marks = self.marks.get(index).copied().unwrap_or_default();
+            Some((needs.or(self.shadow_needs(binding, side)), marks))
+        });
+        held.unwrap_or_default()
     }
 
     /// The pair binding of `model`: the binding its prefill lookup resolves
@@ -5337,14 +5341,19 @@ impl Engine {
 
     /// The binding a `phase` pool of `model` is decided under, whose
     /// overload block judges the pool. Every decision resolves by its own
-    /// phase but a pair's decode side, which runs under the pair binding:
-    /// a decode pool is that binding's wherever the model has one. A
-    /// decode-phase binding ahead of it still decides a decode request
-    /// asked alone, and its block is not read for the pool.
+    /// phase but a pair's decode side and an `epd` pair's encode side,
+    /// which run under the pair binding: a decode pool is that binding's
+    /// wherever the model has one, and an encode pool wherever the model
+    /// has one of the `epd` plan. A binding of the side's phase ahead of
+    /// it still decides a request of that phase asked alone, and its block
+    /// is not read for the pool.
     pub fn pool_binding(&self, model: &str, phase: Phase) -> Option<&Binding> {
         let pair = match phase {
             Phase::Decode => self.pair_binding(model),
-            Phase::Single | Phase::Prefill | Phase::Encode => None,
+            Phase::Encode => self
+                .pair_binding(model)
+                .filter(|pair| matches!(pair.plan, Plan::Epd { .. })),
+            Phase::Single | Phase::Prefill => None,
         };
         pair.or_else(|| self.binding(model, phase))
     }
@@ -5370,7 +5379,8 @@ impl Engine {
     ///
     /// A binding's row is its live and shadow stages and its sessions rule,
     /// for each phase it covers. A pair's decode profile is a decode row of the
-    /// pair binding's glob, whichever binding a decode lookup resolves to.
+    /// pair binding's glob, whichever binding a decode lookup resolves to,
+    /// and an `epd` pair's encode profile an encode row of it the same way.
     /// Two bindings of one glob write one row a phase.
     pub fn needs_rows(&self) -> Vec<(&str, Phase, Needs)> {
         let mut rows: Vec<(&str, Phase, Needs)> = Vec::new();
@@ -5392,8 +5402,9 @@ impl Engine {
                         .or(session_needs(binding));
                 }
                 // The decode side of every pair this binding's prefill
-                // lookup starts, with that side's shadow.
-                if phase == Phase::Decode && pairs && covers(Phase::Prefill) {
+                // lookup starts, and the encode side of an `epd` pair, each
+                // with that side's shadow.
+                if PAIR_SIDES.contains(&phase) && pairs && covers(Phase::Prefill) {
                     needs = needs
                         .or(own(phase).unwrap_or_default())
                         .or(self.shadow_needs(binding, phase));
@@ -10169,8 +10180,11 @@ mod tests {
 
     /// A pair's decode side runs under the model's pair binding, so the
     /// pool's lookup names that binding for a decode pool whatever covers
-    /// the decode phase first. Every other pool is its own phase's: an
-    /// encode item resolves by the encode phase under `epd` too.
+    /// the decode phase first. An `epd` pair's encode side runs under it
+    /// too, so an encode pool is that binding's the same way. An encode
+    /// pool of a model whose pair is of the `pd-pair` plan is the encode
+    /// phase's own: that plan names no encode side. Every other pool is
+    /// its own phase's.
     #[test]
     fn a_decode_pool_is_decided_under_its_models_pair_binding() {
         let phase_first = |phase: Phase| Binding {
@@ -10227,10 +10241,22 @@ mod tests {
             pair(epd),
         ]);
         assert_eq!(plan_of(&with_encoders, "m", Phase::Decode), Some(epd));
+        // An encode item asked alone still resolves to the phase's first
+        // binding. The pool follows the pair, whose one call decides over
+        // it.
         assert_eq!(
-            plan_of(&with_encoders, "m", Phase::Encode),
+            with_encoders.binding("m", Phase::Encode).map(|b| b.plan),
             Some(Plan::Single)
         );
+        assert_eq!(plan_of(&with_encoders, "m", Phase::Encode), Some(epd));
+        assert_eq!(
+            plan_of(&with_encoders, "n", Phase::Encode),
+            Some(Plan::Single)
+        );
+        // A pair of two sides names no encode side: its model's encode
+        // pool is the encode phase's own.
+        let two_sides = engine(vec![phase_first(Phase::Encode), pair(Plan::PdPair)]);
+        assert_eq!(plan_of(&two_sides, "m", Phase::Encode), Some(Plan::Single));
     }
 
     /// One profile that keeps the healthy rows and leads with the deepest
@@ -10789,6 +10815,30 @@ mod tests {
         );
         assert!(!ahead.reads_for("m", Phase::Prefill).2);
         assert!(ahead.reads_for("m", Phase::Decode).2);
+        // An encode binding of a profile with no such stage stands ahead of
+        // an `epd` binding whose encode side holds one: the encode decision
+        // carries the pair's word the same way. A pair of two sides names
+        // no encode side and adds none.
+        let encode = || Binding {
+            phases: vec![Phase::Encode],
+            ..single_binding()
+        };
+        let behind = |plan: Plan| {
+            let pair = Binding {
+                plan,
+                ..pair_binding()
+            };
+            Engine::new(
+                vec![least_requests_profile(), filtered()],
+                vec![encode(), pair],
+                1,
+                Needs::default(),
+            )
+        };
+        let three = behind(Plan::Epd { encode: 1 });
+        assert!(three.reads_for("m", Phase::Encode).2);
+        assert!(!three.reads_for("m", Phase::Decode).2);
+        assert!(!behind(Plan::PdPair).reads_for("m", Phase::Encode).2);
     }
 
     /// A profile that shows its rows to a plugin says so by the engine's one
@@ -10896,7 +10946,8 @@ mod tests {
     /// and rows that carry the veto in their own field are shown with it. A
     /// mask beside a side that shows nothing is read by that side's filters.
     /// The host is told of the pair's decode side where a decode binding of
-    /// another profile stands ahead of it, as it is told that side's needs.
+    /// another profile stands ahead of it, as it is told that side's needs,
+    /// and of an `epd` pair's encode side the same way.
     #[test]
     fn a_pair_side_that_shows_its_rows_declines_a_mask_beside_them() {
         /// The scopes opened, and the rows they were shown stalled.
@@ -11037,6 +11088,27 @@ mod tests {
         );
         assert!(!ahead.reads_for("m", Phase::Prefill).1);
         assert!(ahead.reads_for("m", Phase::Decode).1);
+        // An encode binding of a profile that shows nothing stands ahead of
+        // an `epd` binding whose encode profile shows its rows: the encode
+        // side of the pair's one call runs under the pair binding, and the
+        // host is told so too.
+        let encoders = Engine::new(
+            vec![least_requests_profile(), shows()],
+            vec![
+                Binding {
+                    phases: vec![Phase::Encode],
+                    ..single_binding()
+                },
+                Binding {
+                    plan: Plan::Epd { encode: 1 },
+                    ..pair_binding()
+                },
+            ],
+            1,
+            Needs::default(),
+        );
+        assert!(!encoders.reads_for("m", Phase::Decode).1);
+        assert!(encoders.reads_for("m", Phase::Encode).1);
     }
 
     /// A stage that reads the affinity column as a filter alone, or as the
@@ -11741,6 +11813,34 @@ mod tests {
         );
         assert_eq!(engine.needs_for("pd/x", Phase::Decode), decode);
         assert_eq!(engine.needs_rows(), [("pd/*", Phase::Decode, decode)]);
+        // An `epd` pair's encode profile is an encode row of the glob the
+        // same way: an encode decision of the model carries it, and so
+        // does the encode phase's own answer.
+        let fed = Profile {
+            filters: vec![Box::new(Fed)],
+            ..least_requests_profile()
+        };
+        let engine = Engine::new(
+            vec![least_requests_profile(), fed],
+            vec![Binding {
+                model: "pd/*".into(),
+                phases: vec![Phase::Prefill],
+                plan: Plan::Epd { encode: 1 },
+                profile: 0,
+                decode_profile: Some(0),
+                shadow: None,
+                decode_shadow: None,
+                sessions: None,
+                overload: None,
+            }],
+            1,
+            Needs::default(),
+        );
+        let encode = decode;
+        assert_eq!(engine.needs_for("pd/x", Phase::Encode), encode);
+        assert_eq!(engine.needs_for_phase(Phase::Encode), encode);
+        assert_eq!(engine.needs_for("pd/x", Phase::Decode), Needs::default());
+        assert_eq!(engine.needs_rows(), [("pd/*", Phase::Encode, encode)]);
         // No prefill lookup resolves to a pair bound for another phase.
         let fed = Profile {
             filters: vec![Box::new(Fed)],

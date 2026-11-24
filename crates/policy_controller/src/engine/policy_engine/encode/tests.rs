@@ -39,6 +39,8 @@ use crate::{
     tracking::lease::{EventSet, Lease, Side},
 };
 
+mod signals;
+
 /// A host's reads of its own admission, as two tests of a place: whether
 /// the prefill there has capacity, then whether the decode there has a room.
 #[derive(Debug)]

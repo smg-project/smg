@@ -2,7 +2,9 @@
 //!
 //! A cell's document declares one signal and costs each worker by it, so
 //! every decision is lent its list's signal cells: a single request's in
-//! `signal_cost`, and a pair's decode side in `pair_signal_cost`. Under
+//! `signal_cost`, a pair's decode side in `pair_signal_cost`, and the
+//! decode side of an encode request decided over its three lists in
+//! `encode_signal_cost`. Under
 //! such a document each worker's load report states a value of the signal,
 //! beside what every cell's report states. Any other cell's document
 //! declares no signal, and its reports are left as they were made.
@@ -33,6 +35,17 @@ pub(super) fn document() -> PolicySpec {
 /// its decode list's signal cells and no cell of its prefill list.
 pub(super) fn pair_document() -> PolicySpec {
     let mut document = super::pair::of("least_load");
+    costed(&mut document, "decode");
+    document
+}
+
+/// The `encode_signal_cost` cell's document: the encode document of
+/// `least_load` presets with another scorer on its decode side
+/// ([`costed`]). The decode side reads a signal and the two other sides
+/// none, so each decision reads its decode list's signal cells and no cell
+/// of its prefill list or of its encoders.
+pub(super) fn encode_document() -> PolicySpec {
+    let mut document = super::encode::of("least_load");
     costed(&mut document, "decode");
     document
 }

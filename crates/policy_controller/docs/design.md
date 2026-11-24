@@ -1021,15 +1021,19 @@ it lists as many ranks as the object's registration states it stands for, its wi
 of its own: a pushed report counts the rows it holds, so the object's word is what says a rank is
 still to report. A report of several ranks is read of no other object, and a report that lists
 fewer ranks than it counts gives no value. A report of one rank is read as the worker's whole, so
-the first record of an object of several ranks stands for it until a second rank's record. An
-encode request decided over its three lists is not lent cells yet: neither its encoders nor the
-two sides of its pair.
+the first record of an object of several ranks stands for it until a second rank's record.
 
 A pair is lent them a side. Where the prefill profile reads a named signal, the prefill side
 reads its prefill list's cells, and the decode side reads its decode list's where the decode
 profile reads one. Both are of the snapshot the decision holds, and a decode decided again
 reads those of its own call. The pair's pools carry each side's cells
 (`PairPools::prefill_signal_cells`, `decode_signal_cells`), so the request is not copied.
+
+An encode request decided over its three lists is lent them a side too. The two sides of its
+pair are lent as a pair's first decision's. Its encode side reads its encoder list's cells
+(`EncodePool::signal_cells`) where the encode profile of its pair's binding reads a named signal:
+that side runs under the binding the prefill lookup resolves to, whatever binding covers the
+encode phase first, and the engine's answer for an encode decision carries that profile's needs.
 
 ## 6. The lease and its events **[built]**
 
