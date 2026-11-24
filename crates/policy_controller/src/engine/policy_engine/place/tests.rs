@@ -29,7 +29,7 @@ use crate::{
         MANUAL_SESSION_HEADER,
     },
     engine::{
-        decision::{Overlap, OverlapSource, Queue, ShadowKind, Shed, Target, Targets, Trace},
+        decision::{Queue, ShadowKind, Shed, Target, Targets, Trace},
         decision_engine::Decided,
         framework::{Filter, Picker, Place, Scorer, TieBand, DRAW_FROM},
         list_cell::tests::PublishedList,
@@ -940,6 +940,8 @@ fn placing_a_request_asks_the_table_of_names_for_nothing() {
 /// each by its own policy.
 #[test]
 fn a_placement_states_what_its_pick_states_of_the_worker_taken() {
+    use crate::engine::decision::{Overlap, OverlapSource};
+
     let engine = hosted(preset("cache_aware"));
     let list = pool(4);
     let members = PublishedList::new(Arc::clone(&list));
