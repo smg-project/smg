@@ -1385,10 +1385,9 @@ fn a_class_number_above_the_fleet_sizes_no_set() {
 
 #[test]
 fn an_encode_class_above_the_rows_handed_is_a_class_still() {
-    // The store numbers the encode classes over the whole pool and hands a
-    // gateway its view, the rows of another gateway's host left out. A
-    // class then stands above the count of the rows handed: it is a class
-    // still, from the first number the sets' bits do not hold on.
+    // A host states each encoder's class, and the framework does not hold
+    // it to the count of the rows handed. A class above that count is a
+    // class still, from the first number the sets' bits do not hold on.
     let none = PairTable::default();
     for class in [63, 64, 65, 4096] {
         let mut bed = Bed::new();

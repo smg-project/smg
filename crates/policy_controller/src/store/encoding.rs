@@ -1,8 +1,7 @@
 //! The encode classes: which encoders hand an encoded item to which
-//! prefills, decided where a membership write moves a member or an offer
-//! and again where a generation moves the pairing mode. A decision that
-//! carries encode items reads them as the class its chosen prefill names
-//! and that class's list of encoders.
+//! prefills. A worker host derives them over the lists it lends, once for
+//! a generation of its lists. A decision that carries encode items reads
+//! them as the class its chosen prefill names and that class's encoders.
 //!
 //! One invariant: **a worker states its own end of the encode handoff, and
 //! an encoder hands to the prefills that state the same end.** An end is
@@ -18,17 +17,15 @@
 //! role, each on a connector, and a rendezvous asks for neither.
 //!
 //! The derivation ([`EncodeClasses::derive`]) is a function of the
-//! membership and of nothing else. A worker stands in it at its place in
-//! the order given, and the classes are numbered as their first encoder
-//! comes. The store gives each side as the rows of its pool: a membership
-//! write puts a side in id order before it derives a class and builds the
-//! pool's rows in that order, so a place here is a row there, and two
-//! stores that hold one membership number the classes alike.
+//! members it is given and of nothing else. A worker stands in it at its
+//! place in the order given, and the classes are numbered as their first
+//! encoder comes. A worker host gives each side as the list it lends, in
+//! that list's order, so a place here is a place of the list lent.
 //!
-//! **A class's number is a name inside one publication.** A write that
-//! takes a class's first encoder away numbers the classes again, so a
-//! number is read with its list under one borrow of the publication, never
-//! compared across two and never kept.
+//! **A class's number is a name inside one derivation.** A list that
+//! loses a class's first encoder is numbered again at its next
+//! derivation, so a number is read with the classes of one derivation,
+//! never compared across two and never kept.
 //!
 //! Every value here is opaque text: a runtime and a connector are compared
 //! for equality and never interpreted. Deriving an offer from what an
@@ -141,10 +138,9 @@ pub fn hands_to(encoder: &EncodeMember<'_>, prefill: &EncodeMember<'_>) -> bool 
 /// class at its place in the order the derivation was given, and each
 /// class's encoders.
 ///
-/// A class's number is a name inside the publication that holds these
-/// classes. A later write may number the classes again, so a number is read
-/// with its list under one borrow, never compared across two publications
-/// and never kept.
+/// A class's number is a name inside the derivation that made these
+/// classes. A later one may number the classes again, so a number is read
+/// with its list, never compared across two derivations and never kept.
 ///
 /// The default holds no class and no table, and names class `0` at every
 /// place.

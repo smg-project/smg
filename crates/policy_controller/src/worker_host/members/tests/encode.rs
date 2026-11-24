@@ -167,8 +167,6 @@ fn the_columns_hold_one_entry_a_worker_where_no_encoder_states_an_end() {
 
 /// The rule runs over whatever is lent. With no prefill lent, an encoder
 /// keeps the class of the end it states and the prefill column is empty.
-/// The store derives no class for such a model, and its pools read class
-/// `0` on every encoder.
 #[test]
 fn an_encoder_keeps_the_class_of_its_end_where_no_prefill_is_lent() {
     let replica = Replica::new();
