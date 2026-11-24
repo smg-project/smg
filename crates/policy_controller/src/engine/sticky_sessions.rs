@@ -380,11 +380,12 @@ pub struct SessionTable {
     /// the id that stands for it ([`Self::rename_worker`]). A dispatch
     /// names the id its lease was issued on, and one that lands behind
     /// the rename is the standing worker's. [`RENAMED_WORKERS`] at most.
-    /// A dispatch reads this lock under its shard's. A rename writes it
-    /// with no shard held.
+    /// A dispatch and a respill's move read this lock under their shard's.
+    /// A rename writes it with no shard held.
     renamed: RwLock<FxHashMap<WorkerId, WorkerId>>,
-    /// How many ids the list holds: what a dispatch reads ahead of the
-    /// lock, so a table that renamed no worker asks nothing.
+    /// How many ids the list holds: what a dispatch and a respill's move
+    /// read ahead of the lock, so a table that renamed no worker asks
+    /// nothing.
     renamed_len: AtomicUsize,
     /// Whether a pass of the table's host sweeps it ([`Self::sweep_due`]):
     /// set at the first such pass, for good. A read of a key then runs no
@@ -797,9 +798,10 @@ impl SessionTable {
     }
 
     /// The id that stands for `target`, the id a dispatch's lease was
-    /// issued on: its worker's own where the worker was registered again
-    /// since. Out of line: a dispatch asks only where its target is in
-    /// neither pin and the table renamed a worker.
+    /// issued on or a respill's decision read: its worker's own where the
+    /// worker was registered again since. Out of line: a dispatch and a
+    /// respill's move ask only where their target is in neither pin and
+    /// the table renamed a worker.
     #[cold]
     #[inline(never)]
     fn standing(&self, target: WorkerId) -> WorkerId {
