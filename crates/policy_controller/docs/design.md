@@ -1144,7 +1144,11 @@ decide ──> lease issued ──> Dispatched ──> Completed
 The kept engine stores nothing about a lease. The host keeps what it was handed and hands it back
 with each event (`DecisionEngine::say`). The crate has a guard for that, `DecisionGuard`
 (`tracking/decision_guard.rs`): it holds one decision's lease, has `dispatched`, `completed` and
-`released`, and releases at its drop.
+`released`, and releases at its drop. A controller keeps its leases in a file. It lends a single
+request's lease back from that file in the guard's form, so one rule tells a single request's
+events under either host (`lease_events::single`). The host says who hears: behind a new
+document the engine that issued the lease is gone, and the standing one counts the send. A pair's
+events on a controller are told by the controller's own code.
 
 What an event does:
 
