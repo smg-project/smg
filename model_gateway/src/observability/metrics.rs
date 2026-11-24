@@ -17,7 +17,7 @@ pub use smg_external_router::metrics::{
     bool_to_static_str, error_reason_from_status, intern_model_label, intern_tool_label,
     metrics_labels, STREAMING_FALSE, STREAMING_TRUE,
 };
-use smg_policy_controller::engine::{DecisionEngine, PolicyEngine, ShadowKind, ShadowSide};
+use smg_grand_central::engine::{DecisionEngine, InProcess, ShadowKind, ShadowSide};
 use smg_worker::metrics::{
     series as worker_series,
     series::{WorkerSeries, WorkerSeriesRecorder},
@@ -884,14 +884,14 @@ pub(crate) fn init_metrics() {
     );
     describe_counter!(
         "smg_policy_shadow_decisions_total",
-        "Shadow decisions of the policy engine beside live ones, by the binding's place in the \
+        "Shadow decisions of Grand Central beside live ones, by the binding's place in the \
          policy document from 0 (15 stands for every binding from the sixteenth on), by the side \
          the shadow is asked beside (single, prefill, decode, decode-again) and by kind \
          (agreed, other-target, other-outcome, skipped); a shadow that panicked is not counted"
     );
     describe_counter!(
         "smg_policy_faults_total",
-        "Panics the policy engine held and counted, by kind: decision (a decision that \
+        "Panics Grand Central held and counted, by kind: decision (a decision that \
          panicked, a shadow's beside a live decision among them), event (a stage at a lease \
          event or a change of membership), upkeep (a step of the engine's upkeep: its sweep, \
          the registry's follow, a load report, a fill of worker lists)"
@@ -899,7 +899,7 @@ pub(crate) fn init_metrics() {
     describe_histogram!(
         "smg_cache_aware_match_ratio",
         "The predicted overlap of a cache-aware routing decision as a ratio (0..1), one observation per decision: in tree mode the best prefix match in the tree (matched/input units, whatever branch the decision took); in event mode the chosen worker's overlap in blocks over the request's blocks (0 where the chosen worker holds none: a miss, a spill, a warm-up placement). \
-         With --policy-controller on: the share of the request's blocks that the policy \
+         With --grand-central on: the share of the request's blocks that the policy \
          engine's placement states the chosen worker holds, one observation per placement \
          that states a share"
     );
@@ -1135,7 +1135,7 @@ pub(super) fn record_tokenizer_encode_activity() {
     }
 }
 
-/// What the scrapes so far published of the policy engine's shadow counts
+/// What the scrapes so far published of Grand Central's shadow counts
 /// ([`record_policy_shadow_activity`]), under one lock.
 #[derive(Default)]
 pub(super) struct ShadowsPublished(Mutex<LastRead>);
@@ -1159,7 +1159,7 @@ struct LastRead {
 /// the old one. What the document before it counted behind its last scrape
 /// is not published. The read and the adds are one turn of `published`'s
 /// lock, so two scrapes at once add a growth once.
-pub(super) fn record_policy_shadow_activity(engine: &PolicyEngine, published: &ShadowsPublished) {
+pub(super) fn record_policy_shadow_activity(engine: &InProcess, published: &ShadowsPublished) {
     let mut published = published.0.lock();
     let mut counts = Vec::new();
     let read_under = engine.shadow_counts(|count| counts.push(count));
@@ -1189,7 +1189,7 @@ pub(super) fn record_policy_shadow_activity(engine: &PolicyEngine, published: &S
 /// its whole life, under every policy document, and nothing sets one back:
 /// each series is set to its count as read, with no record of the scrapes
 /// before, and of two scrapes at once the larger read stands.
-pub(super) fn record_policy_fault_activity(engine: &PolicyEngine) {
+pub(super) fn record_policy_fault_activity(engine: &InProcess) {
     for (kind, held) in [
         ("decision", engine.faults()),
         ("event", engine.unheard()),
@@ -2523,8 +2523,8 @@ impl Metrics {
 
     /// Record the predicted overlap ratio (0..1) of a cache-aware routing
     /// decision: the tree's best prefix match in tree mode, the chosen
-    /// worker's overlap over the request's blocks in event mode. Where the
-    /// policy engine decides, the share of the request's blocks that its
+    /// worker's overlap over the request's blocks in event mode. Where
+    /// Grand Central decides, the share of the request's blocks that its
     /// placement states the chosen worker holds.
     pub fn record_cache_aware_match_ratio(ratio: f64) {
         handles::with_single(
@@ -2590,7 +2590,7 @@ pub(crate) mod test_support {
     use std::sync::OnceLock;
 
     use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
-    use smg_policy_controller::document::{AppliedSpec, PolicySpec, ShadowSpec};
+    use smg_grand_central::document::{AppliedSpec, PolicySpec, ShadowSpec};
 
     /// The lib test binary's one process-wide recorder, for records made on
     /// threads no local recorder covers (the blocking pool). Installed once;
@@ -2648,7 +2648,7 @@ pub(crate) mod test_support {
         })
     }
 
-    /// The series of the panics the policy engine held and counted in a
+    /// The series of the panics Grand Central held and counted in a
     /// scrape, by kind: decision, event, upkeep. `None` where the scrape
     /// holds no such series.
     pub(crate) fn fault_kinds(rendered: &str) -> [Option<u64>; 3] {

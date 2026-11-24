@@ -23,8 +23,8 @@ impl RouterConfig {
     /// [`DEFAULT_TOKEN_USAGE_CEILING`]. The overload switch in force
     /// (`RouterConfig::overload_words_in_force`) switches both off whatever
     /// the thresholds say: `--disable-worker-overload-protection`
-    /// (`worker_overload_protection: false`), or, where the policy
-    /// controller runs a supplied document, that document's
+    /// (`worker_overload_protection: false`), or, where Grand
+    /// Central runs a supplied document, that document's
     /// `overload.enabled: false`. Per-worker `overload` blocks still apply
     /// on top.
     ///
@@ -104,7 +104,7 @@ mod tests {
     use std::sync::Arc;
 
     use openai_protocol::worker::HttpPoolConfig;
-    use smg_policy_controller::document::{OverloadSpec, PolicySpec};
+    use smg_grand_central::document::{OverloadSpec, PolicySpec};
     use smg_worker::{
         connection::http_client::WorkerHttpClientCache,
         health::overload::{DEFAULT_TOKEN_USAGE_CEILING, DEFAULT_WAITING_REQUESTS},
@@ -236,7 +236,7 @@ mod tests {
         assert!(!off.is_enabled());
     }
 
-    /// Where the policy controller runs a supplied document, the document's
+    /// Where Grand Central runs a supplied document, the document's
     /// switch decides the default thresholds. Bindings that switch the
     /// overload block off leave the worker objects no default threshold
     /// whatever the two threshold settings say, as disabling protection
@@ -244,14 +244,14 @@ mod tests {
     /// settings standing. With the option off the document is not read.
     #[test]
     fn a_supplied_documents_switch_decides_the_default_thresholds() {
-        let under = |enabled: bool, policy_controller: bool| {
+        let under = |enabled: bool, grand_central: bool| {
             let mut document = PolicySpec::preset("round_robin").expect("a stock policy");
             document.bindings[0].overload = Some(OverloadSpec {
                 enabled,
                 ..OverloadSpec::default()
             });
             RouterConfig {
-                policy_controller,
+                grand_central,
                 policy_spec: Some(document),
                 ..gateway_config(true, Some(32), Some(0.9))
             }

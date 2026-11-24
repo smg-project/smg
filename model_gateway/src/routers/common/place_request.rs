@@ -1,4 +1,4 @@
-//! What a placement function states of its request to the policy engine.
+//! What a placement function states of its request to Grand Central.
 //!
 //! The placement functions take one [`PlacementInputs`] from their route:
 //! what a classic policy reads of a request. Where the engine decides, they
@@ -16,7 +16,7 @@
 
 use std::sync::Arc;
 
-use smg_policy_controller::engine::{
+use smg_grand_central::engine::{
     worker_id, Demands, FixedFacts, HashSeeds, HeaderRead, PlaceRequest, Prompt, TokenEntry,
     TokenKey, WorkerId, WorkerLists, WorkerRule,
 };
@@ -64,7 +64,7 @@ impl TokenEntry for PlacementInputs<'_> {
     }
 }
 
-/// The number the policy engine knows a runtime and transport by: one for
+/// The number Grand Central knows a runtime and transport by: one for
 /// each pair this gateway dials, and never zero, which states none. Two
 /// workers have one number exactly where a retained plan's wire holds them
 /// alike ([`WireConstraint::admits`]): the engine compares the numbers and
@@ -200,7 +200,7 @@ fn seeds(namespace: Option<CacheNamespace>) -> HashSeeds {
 mod tests {
     use axum::http::{HeaderMap, HeaderValue};
     use openai_protocol::common::CachePartition;
-    use smg_policy_controller::engine::{LentList, ListCell};
+    use smg_grand_central::engine::{LentList, ListCell};
 
     use super::*;
     use crate::routers::{

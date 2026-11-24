@@ -7,8 +7,8 @@ use std::collections::HashMap;
 
 use rand::{distr::Alphanumeric, RngExt};
 use smg_auth::{ApiKeyEntry, ControlPlaneAuthConfig, JwtConfig, Role};
+use smg_grand_central::stages::StageRegistry;
 use smg_mesh::{MTLSConfig, MeshServerConfig};
-use smg_policy_controller::stages::StageRegistry;
 use smg_service_discovery::RuntimeDiscoveryConfig;
 use smg_worker::identity::{
     basic::{ConnectionMode, RuntimeType},
@@ -1350,7 +1350,7 @@ impl CliArgs {
             .maybe_reasoning_parser(self.model.reasoning_parser.as_ref())
             .maybe_tool_call_parser(self.model.tool_call_parser.as_ref())
             .maybe_mcp_config_path(self.model.mcp_config_path.as_ref())
-            .policy_controller(self.routing.policy_controller == "on")
+            .grand_central(self.routing.grand_central == "on")
             .maybe_policy_spec_path(self.routing.policy_spec.as_ref())
             .retries(!self.serving.disable_retries)
             .upstream_http2(self.routing.upstream_http2)

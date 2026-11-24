@@ -8,7 +8,7 @@
 
 use std::sync::{Arc, OnceLock};
 
-use smg_policy_controller::engine::{LentList, PartnerClasses, PublishedList};
+use smg_grand_central::engine::{LentList, PartnerClasses, PublishedList};
 use smg_worker::{
     identity::basic::Worker,
     pd::pairing::{PairingMismatch, PdPairing, PdPairingMode},
@@ -104,12 +104,12 @@ pub(crate) struct PdPairIndex {
     pub partners: Vec<Arc<[Arc<dyn Worker>]>>,
     /// Set when both pools have workers and no pair is compatible.
     pub refusal: Option<PairingRefusal>,
-    /// What the policy engine is lent of this index ([`Published`]): empty
+    /// What Grand Central is lent of this index ([`Published`]): empty
     /// until the engine first places a pair over it.
     published: OnceLock<Published>,
 }
 
-/// What the policy engine is lent of an index ([`PdPairIndex::lent`]): the
+/// What Grand Central is lent of an index ([`PdPairIndex::lent`]): the
 /// two pools as the engine's published lists, the prefill pool's and then
 /// the decode pool's, and their pair classes. Each list holds its pool, the
 /// cell the engine keeps its value of the pool in, and what this gateway
@@ -189,7 +189,7 @@ impl PdPairIndex {
         })
     }
 
-    /// The two pools as the policy engine is lent them, the prefill pool
+    /// The two pools as Grand Central is lent them, the prefill pool
     /// and then the decode pool, and their pair classes: the class of every
     /// worker of the two pools, in each pool's order, and the table of the
     /// classes that pair, which are these partner lists as the engine's
@@ -260,7 +260,7 @@ fn pairing_mismatches(
 #[cfg(test)]
 mod tests {
     use openai_protocol::model_card::ModelCard;
-    use smg_policy_controller::engine::FixedFacts;
+    use smg_grand_central::engine::FixedFacts;
     use smg_worker::{
         identity::basic::{ConnectionMode, RuntimeType, WorkerType},
         test_support::no_health_check,

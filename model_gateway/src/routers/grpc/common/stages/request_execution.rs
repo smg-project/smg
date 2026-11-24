@@ -5500,7 +5500,7 @@ pub(crate) mod tests {
     }
 
     /// One request of a sequential dispatch holds something for its decode
-    /// where the policy engine placed the pair: the decode is owed its ask
+    /// where Grand Central placed the pair: the decode is owed its ask
     /// and its send behind the prefill. A pair the classic policies picked
     /// is owed neither, so its dispatch holds nothing and makes the guard
     /// it made with no engine. The parallel shape holds nothing for either,

@@ -1,6 +1,6 @@
-//! The token trees a gateway lends the policy engine.
+//! The token trees a gateway lends Grand Central.
 //!
-//! Where the policy engine places every request no classic policy object is
+//! Where Grand Central places every request no classic policy object is
 //! made, so no policy keeps the trees of the prompts this process sent. The
 //! engine's start makes an owner of them in a policy's place
 //! ([`LentTrees`]), and only where the document in force reads the prefixes
@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use kv_index::{ModelTrees, TenantId, TokenTree};
 use parking_lot::Mutex;
-use smg_policy_controller::{
+use smg_grand_central::{
     document::{IndexSpec, PolicySpec},
     engine::{CacheIndex, CacheIndexes, Phase},
 };
@@ -40,7 +40,7 @@ use super::{
 };
 use crate::routers::common::snapshot::WorkerRegistry;
 
-/// The owner of the token trees the policy engine is lent, one a model.
+/// The owner of the token trees Grand Central is lent, one a model.
 #[derive(Debug)]
 pub(crate) struct LentTrees {
     /// The document the engine runs: a model's `index` entry sizes its
@@ -264,7 +264,7 @@ impl Left {
     }
 }
 
-/// What a gateway answers the policy engine of its workers' caches, as one
+/// What a gateway answers Grand Central of its workers' caches, as one
 /// object: the indexes of the cache-event monitor, and the token trees it
 /// lends.
 pub(crate) struct EngineCaches {

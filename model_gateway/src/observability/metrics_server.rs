@@ -5,7 +5,7 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use axum::{extract::State, response::IntoResponse, routing::get, Router};
 use metrics_exporter_prometheus::PrometheusHandle;
-use smg_policy_controller::engine::PolicyEngine;
+use smg_grand_central::engine::InProcess;
 use smg_worker::metrics::series as worker_series;
 use tokio::task::JoinHandle;
 use tracing::{error, info};
@@ -16,10 +16,10 @@ use crate::config::bind_socket_addr;
 #[derive(Clone)]
 struct MetricsState {
     handle: PrometheusHandle,
-    /// The policy engine, where the gateway started one, and what the
+    /// Grand Central, where the gateway started one, and what the
     /// scrapes so far published of its shadow counts. A scrape reads the
     /// engine's fault counts too, and keeps nothing of them.
-    shadows: Option<(&'static PolicyEngine, Arc<ShadowsPublished>)>,
+    shadows: Option<(&'static InProcess, Arc<ShadowsPublished>)>,
 }
 
 async fn prometheus_handler(State(state): State<MetricsState>) -> impl IntoResponse {
@@ -51,7 +51,7 @@ async fn bind_metrics_listener(addr: SocketAddr) -> Result<tokio::net::TcpListen
 /// port conflicts or bad addresses; port 0 binds an OS-assigned ephemeral
 /// port. Returns the bound address and the server task handle.
 ///
-/// `engine` is the policy engine the gateway started, where it started one:
+/// `engine` is the Grand Central the gateway started, where it started one:
 /// each scrape publishes that engine's shadow counts too
 /// (`smg_policy_shadow_decisions_total`), and the panics it held and counted
 /// (`smg_policy_faults_total`). With no engine neither family is published.
@@ -59,7 +59,7 @@ pub async fn start_metrics_server(
     handle: PrometheusHandle,
     host: String,
     port: u16,
-    engine: Option<&'static PolicyEngine>,
+    engine: Option<&'static InProcess>,
 ) -> Result<(SocketAddr, JoinHandle<()>), String> {
     // The same spellings as `--host` (`::` and `[::]` both bind IPv6), and a
     // bad host is a startup error: a silent fallback to 0.0.0.0 would hide a
@@ -111,7 +111,7 @@ pub async fn start_metrics_server(
 mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
-    use smg_policy_controller::document::{AppliedSpec, PolicySpec};
+    use smg_grand_central::document::{AppliedSpec, PolicySpec};
 
     use super::*;
     use crate::{
@@ -121,7 +121,7 @@ mod tests {
 
     /// One scrape of an endpoint started with `engine`, under a recorder of
     /// its own.
-    async fn scraped(engine: Option<&'static PolicyEngine>) -> String {
+    async fn scraped(engine: Option<&'static InProcess>) -> String {
         let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
         let _guard = metrics::set_default_local_recorder(&recorder);
         let (handle, host) = (recorder.handle(), "127.0.0.1".to_string());
@@ -131,15 +131,14 @@ mod tests {
         scrape.text().await.unwrap()
     }
 
-    /// A scrape of a gateway that started a policy engine publishes that
+    /// A scrape of a gateway that started Grand Central publishes that
     /// engine's shadow counts: a zero series of each kind for the binding
     /// that names a shadow, before any request. A gateway that started no
     /// engine publishes no such family, and neither does an engine whose
     /// policy document names no shadow.
     #[tokio::test]
     async fn a_scrape_publishes_the_shadow_counts_of_the_engine_it_was_started_with() {
-        let engine =
-            |spec| -> &'static PolicyEngine { Box::leak(Box::new(PolicyEngine::new(spec))) };
+        let engine = |spec| -> &'static InProcess { Box::leak(Box::new(InProcess::new(spec))) };
         let shadowing = scraped(Some(engine(shadowing_spec()))).await;
         assert_eq!(shadow_kinds(&shadowing), [Some(0); 4], "{shadowing}");
 
@@ -154,7 +153,7 @@ mod tests {
         }
     }
 
-    /// A scrape of a gateway that started a policy engine publishes the
+    /// A scrape of a gateway that started Grand Central publishes the
     /// panics that engine held and counted: a series of each kind, at zero
     /// before any panic. A gateway that started no engine publishes no such
     /// family.
@@ -162,7 +161,7 @@ mod tests {
     async fn a_scrape_publishes_the_fault_counts_of_the_engine_it_was_started_with() {
         let preset = PolicySpec::preset("round_robin").expect("a stock preset");
         let plain = AppliedSpec::validate(&preset).expect("a valid policy document");
-        let engine: &'static PolicyEngine = Box::leak(Box::new(PolicyEngine::new(plain)));
+        let engine: &'static InProcess = Box::leak(Box::new(InProcess::new(plain)));
         let started = scraped(Some(engine)).await;
         assert_eq!(fault_kinds(&started), [Some(0); 3], "{started}");
 

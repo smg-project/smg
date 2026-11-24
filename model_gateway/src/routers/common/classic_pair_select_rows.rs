@@ -4,8 +4,8 @@
 //! overload thresholds or doubted by the liveness tracker), the KV transport
 //! each worker names, the policy each pool runs under, whether shedding is
 //! on, and what the gateway's pair placement answered at each request. The
-//! policy controller crate replays the rows through its own pair decision
-//! (`crates/policy_controller/tests/classic_rows.rs`).
+//! Grand Central crate replays the rows through its own pair decision
+//! (`crates/grand_central/tests/classic_rows.rs`).
 //!
 //! A request's answer is the pair it was placed on, each worker by its place
 //! in its pool's list, or no pair with the role the placement named and why.
@@ -24,8 +24,8 @@
 //! This file is an ignored test of the gateway crate, kept beside the code
 //! it runs. It records from the checkout it is built in and writes the sheet
 //! under `CLASSIC_ROWS_OUT`, naming `CLASSIC_ROWS_COMMIT` as the commit it
-//! recorded from. The sheets the policy controller crate replays are in
-//! `crates/policy_controller/tests/classic/sheets`; to record this one again:
+//! recorded from. The sheets the Grand Central crate replays are in
+//! `crates/grand_central/tests/classic/sheets`; to record this one again:
 //!
 //! ```text
 //! CLASSIC_ROWS_OUT=<dir> CLASSIC_ROWS_COMMIT=<commit> \

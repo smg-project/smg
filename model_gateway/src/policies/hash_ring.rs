@@ -17,7 +17,7 @@ use std::{
     sync::Arc,
 };
 
-use smg_policy_controller::{
+use smg_grand_central::{
     engine::WorkerId,
     policies::consistent_hashing::{Head, LentRing},
 };
@@ -86,7 +86,7 @@ pub struct HashRing {
     /// Unique worker URLs, indexed by the entries.
     urls: Arc<[Arc<str>]>,
     /// Each URL's worker id ([`WorkerId::from_address`]), hashed once where
-    /// the URL joins the ring: the policy engine's walk reads it
+    /// the URL joins the ring: Grand Central's walk reads it
     /// ([`LentRing::walk_ids`]).
     ids: Arc<[WorkerId]>,
 }
@@ -284,7 +284,7 @@ impl HashRing {
     /// `position`, each asked once by its place among the URLs and its URL
     /// until `take` takes one. The URL taken, `None` where the ring is
     /// empty or none is taken. [`Self::find_healthy_url`] starts it where
-    /// its key stands, and the policy engine starts it at the place a
+    /// its key stands, and Grand Central starts it at the place a
     /// request states and reads the id kept at a worker's place
     /// ([`LentRing::walk_ids`]): one walk, so the two visit the workers in
     /// one order.
@@ -332,7 +332,7 @@ impl HashRing {
     }
 }
 
-/// The ring as the policy engine asks it, for a request its caller lends
+/// The ring as Grand Central asks it, for a request its caller lends
 /// the ring with: where a key's text stands, where a head of a request
 /// stands, and the walk from a stated place. Nothing of the ring is copied.
 /// The position is the one a lookup starts from and the walk is the
@@ -358,7 +358,7 @@ impl LentRing for HashRing {
     }
 }
 
-/// A model's ring before it is filled, as the policy engine is lent it: a
+/// A model's ring before it is filled, as Grand Central is lent it: a
 /// key has its position and no worker to walk to. The engine then places
 /// the key at that position over the workers it keeps, as a ring policy
 /// does with no ring (`ConsistentHashingPolicy::find_by_consistent_hash`:

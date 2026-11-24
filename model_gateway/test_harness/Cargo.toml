@@ -17,8 +17,8 @@ smg-worker.workspace = true
 smg-grpc-client.workspace = true
 smg-data-connector.workspace = true
 smg-mcp.workspace = true
-# The table of stages a test lends the policy engine it starts.
-smg-policy-controller.workspace = true
+# The table of stages a test lends the Grand Central it starts.
+smg-grand-central.workspace = true
 smg-auth.workspace = true
 openai-protocol = { workspace = true, features = ["axum"] }
 llm-tokenizer.workspace = true

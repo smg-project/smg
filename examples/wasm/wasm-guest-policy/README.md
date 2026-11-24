@@ -1,8 +1,8 @@
 # WASM Guest Policy Example
 
 A routing policy written as a WebAssembly component: a filter, a scorer and a
-picker for the policy controller's plugin host
-(`crates/policy_controller/src/plugins/wasm`).
+picker for Grand Central's plugin host
+(`crates/grand_central/src/plugins/wasm`).
 
 The policy: among the healthy workers that have capacity, prefer the one with
 the fewest requests in flight, with a bonus for the worker that already holds
@@ -46,7 +46,7 @@ learns from the lifecycle is a different example.
 ## The contract
 
 The plugin implements the `policy` world of
-[`smg-policy.wit`](../../../crates/policy_controller/contracts/smg-policy.wit),
+[`smg-policy.wit`](../../../crates/grand_central/contracts/smg-policy.wit),
 the record form: the view arrives as typed records. The same file defines a
 second world, `policy-packed`, where the view arrives as bytes the guest reads
 in place. It is the form for a hot path: on the host's bench a three-stage
@@ -115,7 +115,7 @@ stages of a profile:
 ```rust
 use std::sync::Arc;
 
-use smg_policy_controller::{
+use smg_grand_central::{
     plugins::shared::OpenDecisions,
     plugins::wasm::{EventKind, EventSet, Plugin, PluginSpec, Runtime, WasmFilter, WasmPicker, WasmScorer},
 };
@@ -137,7 +137,7 @@ let scorer = WasmScorer::new(Arc::clone(&bound), None);
 let picker = WasmPicker::new(bound, None);
 ```
 
-`crates/policy_controller/tests/wasm_example.rs` is the runnable form: it
+`crates/grand_central/tests/wasm_example.rs` is the runnable form: it
 loads this component into an engine and decides over a small pool. The policy
 document does not name a plugin yet, so a host builds the `PluginSpec` itself.
 
@@ -147,7 +147,7 @@ From the repository root (the example's directory is a workspace of its own):
 
 ```bash
 examples/wasm/wasm-guest-policy/build.sh
-cargo test -p smg-policy-controller --test wasm_example
+cargo test -p smg-grand-central --test wasm_example
 ```
 
 The tests skip, and say so, when the component is not built. With

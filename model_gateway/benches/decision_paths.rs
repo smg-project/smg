@@ -1,10 +1,10 @@
-//! One request's routing under the classic policies or under the policy
-//! engine, over one fleet of workers a model, every one ready unless the
+//! One request's routing under the classic policies or under Grand
+//! Central, over one fleet of workers a model, every one ready unless the
 //! cell says otherwise.
 //!
 //! `--path classic`, the default, routes by the classic policies over the
-//! worker registry. `--path engine` routes the same cell by the policy
-//! engine, over what a gateway builds with the policy controller on: a
+//! worker registry. `--path engine` routes the same cell by Grand
+//! Central, over what a gateway builds with Grand Central on: a
 //! registry that makes no classic policy object, workers with no
 //! completion sink, and the engine of the document the cell's routing
 //! settings mean, started by the gateway's own start over the cell's
@@ -82,7 +82,7 @@
 //! requests of a gateway that serves many models do, so no two requests in
 //! a row are for one model.
 //!
-//! `--end FORM` runs the cell on a route that tells the policy engine the
+//! `--end FORM` runs the cell on a route that tells Grand Central the
 //! request's end, and names what that route does behind the making of its
 //! load guard. Without it the route drops its guard at once and reports no
 //! outcome. `streamed` is a streamed answer: the route asks the guard a
@@ -515,7 +515,7 @@ struct Feed {
 struct Built {
     routing: Routing,
     feed: Option<Feed>,
-    /// The runtime the policy engine's task runs on, kept for the cell's
+    /// The runtime Grand Central's task runs on, kept for the cell's
     /// life: `None` on the classic path, which starts no engine.
     runtime: Option<tokio::runtime::Runtime>,
 }
@@ -554,10 +554,10 @@ fn build(cell: &Cell) -> Built {
             Arc::new(policies)
         }
         "engine" => {
-            // The registry a gateway builds with the policy controller on:
+            // The registry a gateway builds with Grand Central on:
             // it makes no classic policy object, and a pair's two side
             // policies are not set on it.
-            config.policy_controller = true;
+            config.grand_central = true;
             Arc::new(PolicyRegistry::of_config(&config))
         }
         gone @ ("object" | "records") => {
@@ -608,13 +608,13 @@ fn build(cell: &Cell) -> Built {
     if cell.reports {
         attach_loads(&policies, receiver);
     }
-    // The engine path: the gateway's own start, with the policy controller
+    // The engine path: the gateway's own start, with Grand Central
     // on in the cell's settings, behind the fleet's registration and, where
     // the cell publishes reports, the feed's first publication. The engine's
     // task runs on a runtime of its own thread, kept for the cell's life,
     // and its first step is not waited for.
     let runtime = (cell.path == "engine").then(|| {
-        config.policy_controller = true;
+        config.grand_central = true;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .enable_all()
@@ -622,13 +622,8 @@ fn build(cell: &Cell) -> Built {
             .unwrap();
         {
             let _entered = runtime.enter();
-            AppContextBuilder::start_policy_engine_for_bench(
-                &config,
-                &policies,
-                &registry,
-                engine_loads,
-            )
-            .unwrap();
+            AppContextBuilder::start_engine_for_bench(&config, &policies, &registry, engine_loads)
+                .unwrap();
         }
         runtime
     });
