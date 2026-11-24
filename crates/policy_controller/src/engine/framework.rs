@@ -7329,12 +7329,20 @@ impl Engine {
         let mut firsts = pools
             .first
             .open(&pools.table, &scratch.marks, &mut scratch.firsts);
+        let shown: &[u32] = if firsts {
+            &scratch.firsts
+        } else {
+            &scratch.classes
+        };
         // The prefill side's run over the classes it is shown, the first
         // partners' or every open partner's: by its rule or its picker's
         // assignment where one places the side ([`Self::placed_prefill`]),
-        // else by its profile.
-        let placed = self.places_side(entry, binding.profile, &prefill_facts);
-        let mut prefill = if placed {
+        // else by its profile. The classes are chosen ahead of that test,
+        // where the first partners' answer stands, and the test is asked
+        // again where the second run needs it. Chosen behind the test, the
+        // classes were chosen by value, and a pair under no rule paid 9
+        // instructions for it.
+        let mut prefill = if self.places_side(entry, binding.profile, &prefill_facts) {
             self.placed_prefill(
                 firsts,
                 binding,
@@ -7346,11 +7354,6 @@ impl Engine {
                 scratch,
             )
         } else {
-            let shown: &[u32] = if firsts {
-                &scratch.firsts
-            } else {
-                &scratch.classes
-            };
             run_profile(
                 prefill_profile,
                 binding.profile,
@@ -7393,7 +7396,7 @@ impl Engine {
                 std::mem::swap(&mut scratch.classes, &mut scratch.firsts);
             } else {
                 firsts = false;
-                prefill = if placed {
+                prefill = if self.places_side(entry, binding.profile, &prefill_facts) {
                     self.placed_prefill(
                         false,
                         binding,
