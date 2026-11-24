@@ -945,6 +945,24 @@ async fn a_worker_added_over_the_wire_is_decided_with_no_ask_for_a_build() {
                 break;
             }
         }
+        // A decision can use a newly registered object before the served
+        // publication loop has paid its membership build. Let that loop run
+        // within the original bound; never force a publication in the test.
+        tokio::time::timeout_at(
+            tokio::time::Instant::from_std(answered) + Config::DEFAULT_LOAD_POLL_INTERVAL / 4,
+            async {
+                while store.membership_builds() == builds {
+                    tokio::task::yield_now().await;
+                }
+            },
+        )
+        .await
+        .expect("the served membership loop builds within the same bound");
+        assert!(
+            answered.elapsed() < Config::DEFAULT_LOAD_POLL_INTERVAL / 4,
+            "membership not published {:?} after its answer",
+            answered.elapsed()
+        );
         assert_eq!(store.membership_builds(), builds + 1);
 
         stop.send(()).expect("the serve is listening for the stop");

@@ -496,6 +496,15 @@ pub(crate) struct DispatchContext {
     pub response: ResponseState,
 }
 
+// Enforce the allocator size class in production builds as well as in
+// the unit test.
+#[cfg(all(not(test), target_pointer_width = "64"))]
+const _: () = {
+    use std::mem::size_of;
+
+    assert!(size_of::<DispatchContext>() <= 2560);
+};
+
 impl DispatchContext {
     /// Cached tokenizer (cheap Arc clone).
     pub fn tokenizer_arc(&self) -> Option<Arc<dyn Tokenizer>> {

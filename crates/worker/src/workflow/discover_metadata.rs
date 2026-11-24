@@ -1,6 +1,6 @@
 //! Metadata discovery step for local workers.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Duration};
 
 use async_trait::async_trait;
 use tracing::{debug, warn};
@@ -9,15 +9,17 @@ use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowRe
 use super::{
     data::{WorkerKind, WorkerRegistrationWorkflowData},
     host::{require_host, WorkflowHost},
-    metadata::{discover_engine_labels, fetch_grpc_metadata},
+    metadata::{discover_engine_labels, fetch_grpc_metadata, read_model_list_and_path_into},
     registration::DISCOVER_METADATA_STEP,
-    runtimes::DEFAULT_RUNTIME,
+    runtimes::{http_runtime, DEFAULT_RUNTIME},
 };
 use crate::identity::{basic::ConnectionMode, endpoint::Endpoint};
 
 /// Reads what a local worker's engine reports about itself into
 /// `discovered_labels`, over HTTP or gRPC. A read that fails leaves the
-/// labels empty and does not fail the registration.
+/// labels empty and does not fail the registration. Explicitly invalid SMG
+/// metadata fails registration before creation; a slow optional read preserves
+/// validated labels inside the workflow's outer step timeout.
 ///
 /// A ZMQ engine reports its metadata at the handshake, which runs after this
 /// step: nothing is read for it here, and what a host knows of such a worker
@@ -46,57 +48,97 @@ impl<H: WorkflowHost> StepExecutor<WorkerRegistrationWorkflowData<H>> for Discov
             connection_mode
         );
 
-        let (discovered_labels, detected_runtime) = match connection_mode {
-            ConnectionMode::Http => {
-                let runtime = context
-                    .data
-                    .detected_runtime_type
-                    .as_deref()
-                    .unwrap_or_else(|| {
-                        warn!(
-                            "No detected_runtime_type for {}, defaulting to {}",
-                            Endpoint::redacted_str(&config.url),
-                            DEFAULT_RUNTIME
-                        );
-                        DEFAULT_RUNTIME.as_str()
-                    });
-                let client = context.data.http_client(DISCOVER_METADATA_STEP)?;
-                let connector = require_host(context.data.host.as_ref())?.engine_connector();
-                discover_engine_labels(
-                    &client,
-                    connector.as_ref(),
-                    &config.url,
-                    ConnectionMode::Http,
-                    runtime,
-                    config.api_key.as_deref(),
-                    false,
-                )
-                .await
-            }
-            ConnectionMode::Grpc => {
-                let config_runtime = config.runtime_type.to_string();
-                let runtime_type = context
-                    .data
-                    .detected_runtime_type
-                    .as_deref()
-                    .unwrap_or(&config_runtime);
-                let connector = require_host(context.data.host.as_ref())?.engine_connector();
-                fetch_grpc_metadata(connector.as_ref(), &config.url, runtime_type, false)
-                    .await
-                    .map(|(labels, rt)| (labels, Some(rt)))
-            }
-            // A ZMQ engine reports its metadata at the handshake, which runs
-            // after this step: nothing is read here.
-            ConnectionMode::Zmq => return Ok(StepResult::Success),
+        if matches!(connection_mode, ConnectionMode::Zmq) {
+            return Ok(StepResult::Success);
         }
-        .unwrap_or_else(|e| {
-            warn!(
-                "Failed to fetch metadata for {}: {}",
-                Endpoint::redacted_str(&config.url),
-                e
-            );
-            (HashMap::new(), None)
-        });
+        // Keep validated facts outside the cancelled optional future: a slow
+        // version read must not erase a model's already-validated protocol.
+        let mut partial_labels = HashMap::new();
+        let discovery = async {
+            let metadata = match connection_mode {
+                ConnectionMode::Http => {
+                    let runtime = context
+                        .data
+                        .detected_runtime_type
+                        .as_deref()
+                        .unwrap_or_else(|| {
+                            warn!(
+                                "No detected_runtime_type for {}, defaulting to {}",
+                                Endpoint::redacted_str(&config.url),
+                                DEFAULT_RUNTIME
+                            );
+                            DEFAULT_RUNTIME.as_str()
+                        });
+                    let client = context.data.http_client(DISCOVER_METADATA_STEP)?;
+                    if runtime == "vllm" {
+                        let row = http_runtime(runtime).ok_or_else(|| {
+                            WorkflowError::ContextValueNotFound("vllm metadata row".to_string())
+                        })?;
+                        read_model_list_and_path_into(
+                            &client,
+                            &config.url,
+                            config.api_key.as_deref(),
+                            false,
+                            row.path,
+                            &mut partial_labels,
+                        )
+                        .await
+                        .map_err(|message| WorkflowError::StepFailed {
+                            step_id: wfaas::StepId::new(DISCOVER_METADATA_STEP),
+                            message,
+                        })?;
+                        Ok((partial_labels.clone(), None))
+                    } else {
+                        let connector =
+                            require_host(context.data.host.as_ref())?.engine_connector();
+                        discover_engine_labels(
+                            &client,
+                            connector.as_ref(),
+                            &config.url,
+                            ConnectionMode::Http,
+                            runtime,
+                            config.api_key.as_deref(),
+                            false,
+                        )
+                        .await
+                    }
+                }
+                ConnectionMode::Grpc => {
+                    let config_runtime = config.runtime_type.to_string();
+                    let runtime_type = context
+                        .data
+                        .detected_runtime_type
+                        .as_deref()
+                        .unwrap_or(&config_runtime);
+                    let connector = require_host(context.data.host.as_ref())?.engine_connector();
+                    fetch_grpc_metadata(connector.as_ref(), &config.url, runtime_type, false)
+                        .await
+                        .map(|(labels, rt)| (labels, Some(rt)))
+                }
+                // Already handled above; retain the host's existing labels.
+                ConnectionMode::Zmq => Ok((context.data.discovered_labels.clone(), None)),
+            }
+            .unwrap_or_else(|error| {
+                warn!(
+                    "Failed to fetch metadata for {}: {}",
+                    Endpoint::redacted_str(&config.url),
+                    error
+                );
+                (HashMap::new(), None)
+            });
+            Ok::<_, WorkflowError>(metadata)
+        };
+        let (discovered_labels, detected_runtime) =
+            match tokio::time::timeout(Duration::from_secs(9), discovery).await {
+                Ok(result) => result?,
+                Err(_) => {
+                    warn!(
+                        "Optional registration metadata budget expired for {}",
+                        Endpoint::redacted_str(&config.url)
+                    );
+                    (partial_labels, None)
+                }
+            };
 
         debug!(
             "Discovered {} labels for {}",

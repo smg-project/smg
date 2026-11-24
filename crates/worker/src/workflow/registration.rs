@@ -137,7 +137,7 @@ pub fn worker_registration_workflow<H: WorkflowHost>(
                 backoff: BackoffStrategy::Fixed(Duration::from_secs(1)),
             })
             .with_timeout(Duration::from_secs(10))
-            .with_failure_action(FailureAction::ContinueNextStep)
+            .with_failure_action(FailureAction::FailWorkflow)
             .depends_on(&[DETECT_RUNTIME_STEP]),
         )
         .add_step(

@@ -64,6 +64,8 @@ pub use dp_min_token::MinimumTokensPolicy;
 pub use factory::PolicyFactory;
 pub use least_load::LeastLoadPolicy;
 pub(crate) use lent_trees::{EngineCaches, LentTrees};
+#[cfg(test)]
+pub(crate) use manual::PinState;
 pub use manual::{ManualConfig, ManualPolicy};
 pub use passthrough::PassthroughPolicy;
 pub use power_of_two::PowerOfTwoPolicy;

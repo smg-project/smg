@@ -46,7 +46,9 @@ Usage:
 
 from __future__ import annotations
 
+import importlib.metadata
 import importlib.util
+import json
 import logging
 import os
 import re
@@ -62,15 +64,25 @@ from urllib.parse import urlparse
 
 import httpx
 import pytest
-from infra import ConnectionMode, Gateway, WorkerType, cleanup_pool, start_workers, stop_workers
+from infra import (
+    ConnectionMode,
+    Gateway,
+    WorkerType,
+    cleanup_pool,
+    process_utils,
+    start_workers,
+    stop_workers,
+)
 from infra.constants import (
     DEFAULT_STARTUP_TIMEOUT,
     get_gpu_vendor,
     get_runtime,
     is_sglang,
     vllm_kv_backend,
+    vllm_moriio_backend,
     vllm_moriio_mode,
 )
+from infra.http_pd_stream_fault import assert_http_fault_outcomes, wait_for_fault_streams
 from infra.model_specs import get_model_spec
 from infra.pd_logs import (
     LOG_FLUSH_TIMEOUT_S,
@@ -116,17 +128,123 @@ def _moriio_lane() -> bool:
     return get_runtime() == "vllm" and vllm_kv_backend() == "moriio"
 
 
+def _moriio_read_image_verifier():
+    path = Path(__file__).resolve().parents[2] / "scripts/ci_moriio_read_image.py"
+    spec = importlib.util.spec_from_file_location("_pd_moriio_read_image", path)
+    if spec is None or spec.loader is None:
+        raise OSError(f"Cannot load READ source verifier: {path}")
+    verifier = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(verifier)
+    return verifier
+
+
+def _moriio_asymmetric_tp_supported() -> bool:
+    """Only the installed reviewed AMD READ/RDMA cohort supports split KV heads."""
+    if not (
+        _moriio_lane()
+        and get_gpu_vendor() == "amd"
+        and vllm_moriio_mode() == "read"
+        and vllm_moriio_backend() == "rdma"
+    ):
+        return False
+    try:
+        _moriio_read_image_verifier().verify_installed()
+    except (ValueError, OSError, importlib.metadata.PackageNotFoundError):
+        # Legacy/local collection keeps the unsupported skip. Normal READ CI
+        # already fails the same mandatory source preflight before any workers.
+        return False
+    return True
+
+
 def _moriio_holds_memory_of(role: str) -> bool:
     """Whether the other role keeps a stopped ``role`` worker's GPU memory in use.
 
-    On one node the role that moves the KV (decode in READ, prefill in WRITE)
-    keeps the memory of each worker it moved KV with until it exits itself,
-    over RDMA as over XGMI, so a worker restarted on that GPU fails vLLM's
-    startup memory check.
+    Preserve the legacy #60425 protection. Its v0.31/MoRI1.0 observation is
+    not a result for the reviewed f9 strict-RDMA cohort. Only a successful
+    preflight's first-qualification invocation may attempt those original
+    restart oracles; this does not assert that MR release already works.
     """
     if not _moriio_lane():
         return False
+    if os.environ.get("E2E_MORIIO_READ_QUALIFICATION"):
+        try:
+            if _moriio_read_image_verifier().qualification_attempt(dict(os.environ)):
+                return False
+        except (ValueError, OSError, importlib.metadata.PackageNotFoundError):
+            # Missing, forged or stale intent never relaxes the legacy skip.
+            pass
     return role == ("prefill" if vllm_moriio_mode() == "read" else "decode")
+
+
+def _assert_strict_read_gpu_reclaimed(victim, role: str, movers) -> None:
+    """Measure allocation release, not MR count or DMA quiescence, before reload."""
+    if role != "prefill" or not os.environ.get("E2E_MORIIO_READ_QUALIFICATION"):
+        return
+    if not _moriio_read_image_verifier().qualification_attempt(dict(os.environ)):
+        return
+    gpu_ids = list(victim.gpu_ids)
+    assert gpu_ids and all(type(gpu) is int and gpu >= 0 for gpu in gpu_ids), (
+        "strict READ reclaim needs valid victim GPU IDs"
+    )
+    assert len(set(gpu_ids)) == len(gpu_ids), "duplicate victim GPU IDs"
+
+    def complete_reading(reading):
+        return (
+            isinstance(reading, dict)
+            and all(type(gpu) is int for gpu in reading)
+            and set(reading) == set(gpu_ids)
+            and all(type(value) is int and value >= 0 for value in reading.values())
+        )
+
+    baseline = victim._gpu_mem_baseline
+    assert complete_reading(baseline), f"missing/invalid all-GPU baseline: {baseline!r}"
+    baseline = dict(baseline)
+    movers = list(movers)
+    assert movers, "strict READ reclaim needs a live decode mover"
+    identities = []
+    for mover in movers:
+        assert mover.is_alive(), "decode mover exited before reclaim measurement"
+        pid = mover.process.pid
+        assert type(pid) is int and pid > 0, "invalid decode mover PID"
+        identities.append((mover, pid, tuple(mover.gpu_ids)))
+
+    def assert_same_movers():
+        for mover, pid, gpus in identities:
+            assert mover.is_alive() and mover.process.pid == pid, (
+                "decode mover exited/replaced during reclaim measurement"
+            )
+            assert tuple(mover.gpu_ids) == gpus, "decode mover GPU assignment changed"
+        assert list(victim.gpu_ids) == gpu_ids, "victim GPU assignment changed"
+
+    deadline = time.monotonic() + 30.0
+    while True:
+        assert_same_movers()
+        remaining = deadline - time.monotonic()
+        assert remaining > 0, "strict READ GPU allocation reclaim exceeded 30 seconds"
+        final = process_utils.gpu_memory_used_mib(gpu_ids, timeout=remaining)
+        assert_same_movers()
+        logger.info(
+            "strict READ allocation reclaim (not MR/DMA proof): %s",
+            json.dumps(
+                {
+                    "role": role,
+                    "victim_gpu_ids": gpu_ids,
+                    "victim_pid": victim.process.pid if victim.process else None,
+                    "baseline_mib": baseline,
+                    "final_mib": final,
+                    "movers": [{"pid": pid, "gpu_ids": gpus} for _, pid, gpus in identities],
+                    "slack_mib": 64,
+                },
+                sort_keys=True,
+            ),
+        )
+        assert complete_reading(final), f"missing/invalid all-GPU final readback: {final!r}"
+        assert time.monotonic() < deadline, "strict READ GPU readback exceeded 30 seconds"
+        if all(final[gpu] <= baseline[gpu] + 64 for gpu in gpu_ids):
+            return
+        remaining = deadline - time.monotonic()
+        assert remaining > 0, f"strict READ GPU allocation still held: {final!r} vs {baseline!r}"
+        time.sleep(min(0.5, remaining))
 
 
 _MORIIO_HELD_MEMORY = (
@@ -193,9 +311,10 @@ _TOPOLOGIES = (
             ("pd_grpc", (p, d, ptp, dtp)),
             id=f"{p}p{d}d-ptp{ptp}-dtp{dtp}",
             marks=pytest.mark.skipif(
-                _moriio_lane(),
-                reason="vLLM's MoRI-IO connector pairs unequal TP sizes only when every "
-                "rank holds all KV heads (vllm-project/vllm#46332); the model's 8 are split",
+                _moriio_lane() and not _moriio_asymmetric_tp_supported(),
+                reason="split KV heads require the installed reviewed AMD MoRI READ/RDMA "
+                "source cohort; legacy, WRITE and XGMI retain the unequal-TP restriction "
+                "(vllm-project/vllm#46332)",
             ),
         )
         for p, d, ptp, dtp in ([(1, 2, 2, 1), (2, 1, 1, 2)] if get_runtime() != "mock" else [])
@@ -950,17 +1069,6 @@ class TestPDTopology:
         # the gateway's dispatch log is read below.
         for _ in range(4):
             mock_answers.enqueue("red, yellow and blue.", prompt_contains="primary colors")
-        if _moriio_lane():
-            # One MoRI-IO handoff moves one request's KV, so SMG refuses n>1
-            # rather than letting the samples share a prefill.
-            resp = httpx.post(
-                f"{gateway.base_url}/v1/completions",
-                json={"model": model, "prompt": "The three primary colors are", "n": 4},
-                timeout=60.0,
-            )
-            assert resp.status_code == 400, f"{resp.status_code} {resp.text[:300]}"
-            assert _error_code(resp) == "moriio_fanout_unsupported", resp.text[:300]
-            return
         if mode == "pd_http" and is_sglang():
             # The shape the gRPC fan-out fixed: the HTTP PD router mints one
             # room for a single-prompt request whatever ``n`` is, the engine
@@ -989,6 +1097,7 @@ class TestPDTopology:
         assert resp.status_code == 200, f"{resp.status_code} {resp.text[:300]}"
         choices = resp.json().get("choices", [])
         assert len(choices) == 4, f"expected 4 choices, got {len(choices)}"
+        assert sorted(c.get("index") for c in choices) == list(range(4)), choices
         assert all(c.get("text", "").strip() for c in choices), f"empty choice in {choices}"
         if get_runtime() == "mock" and mode != "pd_http":
             # The fan-out itself: one single-sample child per choice under
@@ -997,6 +1106,19 @@ class TestPDTopology:
             # sample, the shape above); the mock's decode side has the
             # prompt and serves the four choices itself.
             _wait_for_fanout(resp.json()["id"], 4)
+
+    def test_moriio_streaming_fanout_is_explicitly_refused(self, setup_backend):
+        """Streaming fanout remains unsupported; buffered choices are tested above."""
+        if not _moriio_lane():
+            pytest.skip("MoRI-IO capability contract only")
+        _, model, _, gateway = setup_backend
+        resp = httpx.post(
+            f"{gateway.base_url}/v1/completions",
+            json={"model": model, "prompt": "The three primary colors are", "n": 4, "stream": True},
+            timeout=60.0,
+        )
+        assert resp.status_code == 400, f"{resp.status_code} {resp.text[:300]}"
+        assert _error_code(resp) == "moriio_fanout_unsupported", resp.text[:300]
 
     # -- failure -----------------------------------------------------------
 
@@ -1011,16 +1133,19 @@ class TestPDTopology:
         peers = {w.base_url for w in workers[:-1]}
 
         victim.stop()
-        _wait_for_status(gateway, victim.base_url, "unhealthy", timeout=30.0)
-        before = len(_pairs_logged())
-        for i in range(6):
-            _ask(client, model, f"Reply with the number {i}.", max_tokens=8)
-        pairs = _wait_for_pairs(before + 6)[before:]
-        used = {p for p, _ in pairs} if role == "prefill" else {d for _, d in pairs}
-        assert victim.base_url not in used, f"gateway kept routing to the dead {role} worker"
-        assert used <= peers, f"unknown {role} workers in placement: {used - peers}"
+        try:
+            _wait_for_status(gateway, victim.base_url, "unhealthy", timeout=30.0)
+            before = len(_pairs_logged())
+            for i in range(6):
+                _ask(client, model, f"Reply with the number {i}.", max_tokens=8)
+            pairs = _wait_for_pairs(before + 6)[before:]
+            used = {p for p, _ in pairs} if role == "prefill" else {d for _, d in pairs}
+            assert victim.base_url not in used, f"gateway kept routing to the dead {role} worker"
+            assert used <= peers, f"unknown {role} workers in placement: {used - peers}"
 
-        victim.start(timeout=_RESTART_TIMEOUT)
+            _assert_strict_read_gpu_reclaimed(victim, role, gateway.decode_workers)
+        finally:
+            victim.start(timeout=_RESTART_TIMEOUT)
         # start() blocked on the worker's own health; the gateway's monitor
         # notices within a few of its 1 s intervals.
         _wait_for_status(gateway, victim.base_url, "healthy", timeout=60.0)
@@ -1196,6 +1321,7 @@ class TestPDTopology:
                 f"no_{role}_servers",
                 f"{role}_unavailable",
             ), f"outage answer carried an unexpected code: {code!r} {resp.text[:200]}"
+            _assert_strict_read_gpu_reclaimed(victim, role, gateway.decode_workers)
         finally:
             # Whatever the verdict, the class's later tests need the pool back.
             victim.start(timeout=_RESTART_TIMEOUT)
@@ -1314,7 +1440,7 @@ class TestPDMismatchedTransport:
     [
         pytest.param(
             (
-                "pd_grpc",
+                "pd_http" if _moriio_lane() else "pd_grpc",
                 (
                     1,
                     1,
@@ -1328,10 +1454,6 @@ class TestPDMismatchedTransport:
         )
     ],
     indirect=True,
-)
-@pytest.mark.skipif(
-    _moriio_lane(),
-    reason="the gRPC servicer reports SMG_PAIRING_PROTOCOL; a MoRI-IO lane's workers are HTTP",
 )
 class TestPDMismatchedProtocol:
     """A pairing protocol set in the engine's environment reaches placement.
@@ -1356,6 +1478,71 @@ class TestPDMismatchedProtocol:
         resp = _raw_chat(gateway, model, "Say hello.", timeout=60.0)
         assert resp.status_code == 503, resp.text
         assert _error_code(resp) == "no_compatible_pd_pair", resp.text
+
+
+@pytest.mark.engine("sglang", "vllm", "tokenspeed", "mock")
+@pytest.mark.gpu(4)
+@pytest.mark.e2e
+@pytest.mark.model(_MODEL, tokenspeed=_MODEL_BY_ENGINE["tokenspeed"], mock=_MODEL_BY_ENGINE["mock"])
+@pytest.mark.workers(parallel_start=True)
+@pytest.mark.gateway(log_level="debug", log_dir=str(_LOG_DIR), extra_args=_GATEWAY_ARGS)
+@pytest.mark.parametrize(
+    "setup_backend",
+    [
+        pytest.param(
+            (
+                "pd_http" if _moriio_lane() else "pd_grpc",
+                (
+                    1,
+                    1,
+                    {
+                        "prefill_env": {"SMG_PAIRING_PROTOCOL": "kv-v1"},
+                        "decode_env": {"SMG_PAIRING_PROTOCOL": "kv-v1"},
+                    },
+                ),
+            ),
+            id="1p1d-protocol-match",
+        )
+    ],
+    indirect=True,
+)
+class TestPDMatchingProtocol:
+    """Equal engine environments pair without operator protocol labels."""
+
+    def test_workers_with_equal_engine_protocols_answer(self, setup_backend, mock_answers):
+        _, model, _, gateway = setup_backend
+        _wait_for_healthy_workers(gateway, 2, timeout=120.0)
+        keys = _pairing_keys(gateway)
+        roles = _workers_by_role(gateway)
+        by_url = {worker.url: role for role, workers in roles.items() for worker in workers}
+        assert {by_url.get(url, url): key for url, key in keys.items()} == {
+            "prefill": "kv-v1",
+            "decode": "kv-v1",
+        }, keys
+        nonce = f"pair{time.time_ns():x}"
+        prompt = f"Repeat exactly this code and nothing else: {nonce}"
+        mock_answers.enqueue(nonce, prompt_contains=nonce)
+        before = len(_pairs_logged())
+        response = httpx.post(
+            f"{gateway.base_url}/v1/chat/completions",
+            json={
+                "model": model,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 48,
+                "temperature": 0,
+            },
+            timeout=60.0,
+        )
+        assert response.status_code == 200, response.text[:500]
+        choices = response.json().get("choices", [])
+        assert len(choices) == 1, response.text[:500]
+        assert nonce in (choices[0].get("message", {}).get("content") or ""), response.text[:500]
+        pairs = _wait_for_pairs(before + 1)[before:]
+        assert pairs and all(
+            prefill in {worker.url for worker in roles["prefill"]}
+            and decode in {worker.url for worker in roles["decode"]}
+            for prefill, decode in pairs
+        ), pairs
 
 
 # ---------------------------------------------------------------------------
@@ -1556,3 +1743,155 @@ class TestPDAssembledAtRuntime:
             gateway.shutdown()
             stop_workers(prefill + decode)
             logger.info("router logs kept at %s", _LOG_DIR)
+
+
+@pytest.mark.engine("vllm")
+@pytest.mark.gpu(4)
+@pytest.mark.e2e
+@pytest.mark.model(_MODEL)
+@pytest.mark.workers(parallel_start=True)
+@pytest.mark.gateway(log_level="debug", log_dir=str(_LOG_DIR), extra_args=_GATEWAY_ARGS)
+@pytest.mark.parametrize(
+    "setup_backend",
+    [
+        pytest.param(("pd_grpc", (p, d)), id=f"{p}p{d}d-http-mori-fault")
+        for p, d in [(1, 2), (1, 3), (2, 2)]
+    ],
+    indirect=True,
+)
+@pytest.mark.skipif(not _moriio_lane(), reason="HTTP MoRI relay fault contract only")
+class TestHTTPMoRIDecodeStreamFault:
+    """One isolated fleet per topology; no same-GPU restart or KV-release claim."""
+
+    @pytest.mark.flaky(reruns=0)
+    def test_http_decode_death_terminates_streams_and_survivor_serves(self, setup_backend):
+        mode, model, client, gateway = setup_backend
+        assert mode == "pd_http", "MoRI must use the HTTP PD relay"
+        decodes = gateway.decode_workers
+        assert len(decodes) >= 2
+        victim = decodes[-1]
+        peers = {worker.base_url for worker in decodes[:-1]}
+        owned = [*gateway.prefill_workers, *decodes]
+        outcomes: list[_StreamOutcome] = []
+        first_chunks = [threading.Event() for _ in range(4 * len(decodes))]
+
+        def stream(event):
+            outcomes.append(_stream_chat(gateway, model, max_tokens=600, first_token=event))
+
+        threads = [
+            threading.Thread(target=stream, args=(event,), daemon=True) for event in first_chunks
+        ]
+        try:
+            before = len(_pairs_logged())
+            for thread in threads:
+                thread.start()
+            deadline = time.monotonic() + 60.0
+            for event in first_chunks:
+                assert event.wait(max(0.0, deadline - time.monotonic())), (
+                    "HTTP stream did not produce a chunk within 60s"
+                )
+            pairs = _wait_for_pairs(before + len(threads))[before:]
+            assert victim.base_url in {decode for _, decode in pairs}, (
+                f"no live traffic reached victim {victim.base_url}: {pairs}"
+            )
+            assert all(thread.is_alive() for thread in threads), (
+                "a stream finished before fault injection; live-fault coverage is ambiguous"
+            )
+            killed = victim.kill_engine()
+            assert killed, "no victim engine process was killed"
+            wait_for_fault_streams(threads, timeout=120.0)
+            assert len(outcomes) == len(threads)
+            kinds = assert_http_fault_outcomes(outcomes)
+            logger.info("HTTP MoRI engine-fault outcomes (interruptions are failures): %s", kinds)
+            _wait_for_status(gateway, victim.base_url, "unhealthy", timeout=30.0)
+            before = len(_pairs_logged())
+            for i in range(6):
+                response = _ask(client, model, f"Reply with the number {i}.", max_tokens=8)
+                assert _answer_text(response).strip(), "survivor returned an empty answer"
+            pairs = _wait_for_pairs(before + 6)[before:]
+            used = {decode for _, decode in pairs}
+            assert used and used <= peers, f"fresh traffic did not stay on survivors: {used}"
+        finally:
+            # This class owns its complete fixture. Stop both roles without
+            # reloading the victim while MoRI peers may still map its memory.
+            # The fixture's repeated teardown is idempotent. No shared resources
+            # outside this explicitly owned fleet are touched.
+            try:
+                gateway.shutdown()
+            finally:
+                stop_workers(owned)
+            for thread in threads:
+                if thread.ident is not None:
+                    thread.join(timeout=1.0)
+
+
+def _wait_for_pairing_protocols(gateway: Gateway, expected: dict[str, str], timeout: float) -> None:
+    """Wait for effective pairing keys, not merely accepted operator labels."""
+    deadline = time.monotonic() + timeout
+    observed = _pairing_keys(gateway)
+    while observed != expected and time.monotonic() < deadline:
+        time.sleep(0.1)
+        observed = _pairing_keys(gateway)
+    assert observed == expected, f"effective pairing keys {observed}, expected {expected}"
+
+
+@pytest.mark.engine("vllm")
+@pytest.mark.gpu(4)
+@pytest.mark.e2e
+@pytest.mark.model(_MODEL)
+@pytest.mark.workers(parallel_start=True)
+@pytest.mark.gateway(log_level="debug", log_dir=str(_LOG_DIR), extra_args=_GATEWAY_ARGS)
+@pytest.mark.parametrize(
+    "setup_backend",
+    [pytest.param(("pd_grpc", (1, 1)), id="1p1d-http-mori-label-protocol")],
+    indirect=True,
+)
+@pytest.mark.skipif(not _moriio_lane(), reason="HTTP MoRI operator-label contract only")
+class TestHTTPMoRILabelPairingProtocol:
+    """Operator labels enforce HTTP pairing; engine env reporting remains separate."""
+
+    def test_operator_protocol_mismatch_refuses_and_matching_pair_serves(self, setup_backend):
+        mode, model, client, gateway = setup_backend
+        assert mode == "pd_http"
+        prefills, decodes = gateway.prefill_workers, gateway.decode_workers
+        assert len(prefills) == len(decodes) == 1
+        owned = [*prefills, *decodes]
+        try:
+            _wait_for_healthy_workers(gateway, 2, timeout=120.0)
+            baseline = _ask(client, model, "Reply only with the number 10837.", max_tokens=32)
+            assert "10837" in _answer_text(baseline), "baseline request did not return its nonce"
+            gateway.label_workers(prefills, {"pairing_protocol": "http-mori-v1"})
+            gateway.label_workers(decodes, {"pairing_protocol": "http-mori-v2"})
+            _wait_for_pairing_protocols(
+                gateway,
+                {
+                    prefills[0].base_url: "http-mori-v1",
+                    decodes[0].base_url: "http-mori-v2",
+                },
+                timeout=10.0,
+            )
+            response = _raw_chat(gateway, model, "Say hello.", timeout=30.0)
+            assert response.status_code == 503, response.text
+            assert _error_code(response) == "no_compatible_pd_pair", response.text
+
+            # No engine restarts or env changes: repair only the operator label,
+            # then require the effective metadata and a new useful model answer.
+            gateway.label_workers(decodes, {"pairing_protocol": "http-mori-v1"})
+            _wait_for_pairing_protocols(
+                gateway,
+                {
+                    prefills[0].base_url: "http-mori-v1",
+                    decodes[0].base_url: "http-mori-v1",
+                },
+                timeout=10.0,
+            )
+            before = len(_pairs_logged())
+            answer = _ask(client, model, "Reply only with the number 59281.", max_tokens=32)
+            assert "59281" in _answer_text(answer), "matching pair failed the fresh nonce request"
+            pairs = _wait_for_pairs(before + 1)[before:]
+            assert (prefills[0].base_url, decodes[0].base_url) in pairs, pairs
+        finally:
+            try:
+                gateway.shutdown()
+            finally:
+                stop_workers(owned)
