@@ -92,7 +92,8 @@ const KEYS: u64 = 64;
 const LEADER: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 const STANDBY: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2));
 
-/// How often each replica's driver polls an engine: the flag's one second.
+/// How often each replica's load monitor polls an engine: the flag's one
+/// second.
 const POLL: Duration = Duration::from_secs(1);
 
 /// A wait's step.
@@ -599,7 +600,10 @@ async fn a_killed_leaders_standby_answers_each_routing_key_on_its_worker() {
                 .all(|(engine, before)| polls(*engine) >= before + 2)
         })
         .await;
-        assert!(polled, "a promoted standby's own driver polls every engine");
+        assert!(
+            polled,
+            "a promoted standby's own load monitor polls every engine"
+        );
 
         standby.terminate().expect("the stop's signal");
         let stopped = standby.exited().expect("the promoted standby stops");

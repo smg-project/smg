@@ -212,6 +212,29 @@ fn a_signal_term_closes_the_sum_behind_the_sends() {
     assert!(engine.needs().loads, "the sends need the reports");
 }
 
+/// The two stages that name a signal ask for each request's size where a
+/// term prices the sends by their tokens, as the stages that name no signal
+/// do: a send of text alone is counted by its text's bytes, which a host
+/// that can send a request on without reading its prompt states only where
+/// a stage asks. A term that counts the sends asks for no size.
+#[test]
+fn a_stage_that_names_a_signal_asks_for_each_requests_size_where_it_prices_the_sends() {
+    let priced = |sent: &str| {
+        least_cost(&format!(
+            "terms: {{{sent}: 1, signal.{PENDING}: 1}}, unreported: missing-as-zero"
+        ))
+    };
+    assert!(priced("sent.tokens").needs().prompt_size);
+    assert!(!priced("sent.requests").needs().prompt_size);
+    let bounded = |sent: &str| {
+        has_room(&format!(
+            "used: {{{sent}: 1, signal.{PENDING}: 1}}, capacity: 1000"
+        ))
+    };
+    assert!(bounded("sent.tokens").needs().prompt_size);
+    assert!(!bounded("sent.requests").needs().prompt_size);
+}
+
 #[test]
 fn a_row_with_no_value_for_a_named_signal_is_unreported_for_the_scorer() {
     let rows = [row(0, 0), row(1, 1), row(2, 0)];

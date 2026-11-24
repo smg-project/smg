@@ -587,3 +587,86 @@ async fn a_decode_asked_again_does_not_move_to_a_moriio_engine() {
         "{order:?}"
     );
 }
+
+// ---- the request's output limit ------------------------------------------------------------
+
+/// A scorer that writes down the output limit of each request it is shown.
+#[derive(Debug)]
+struct NotesLimit(Said);
+
+impl Lifecycle for NotesLimit {}
+
+impl Scorer for NotesLimit {
+    fn name(&self) -> &'static str {
+        STAGE
+    }
+
+    fn score(
+        &self,
+        facts: &RequestFacts<'_>,
+        _: &[Candidate],
+        _: &[u32],
+        out: &mut [f32],
+    ) -> TieBand {
+        say(&self.0, format!("limit {}", facts.max_output_tokens));
+        out.fill(1.0);
+        TieBand::NORMALIZED
+    }
+}
+
+/// The pair route states the body's output limit to the engine. A chat
+/// that asks for at most 50 tokens goes out prefill first under a document
+/// that picks its decode behind the prefill. The decode side's scorer is
+/// asked at the pair's first decision and again behind the prefill's
+/// answer, and the request it is shown states 50 both times: the attempt
+/// reads the leased body for the first, and the decode's answer keeps the
+/// limit for the second. How often one decision asks its scorer is the
+/// engine's own, so each side of the prefill's answer holds one ask or
+/// more.
+///
+/// The same holds under prefill admission, where the selection runs inside
+/// the admission's own lock, once a pass: the reading is made there.
+#[tokio::test]
+async fn the_engine_reads_the_output_limit_a_pair_request_states() {
+    for admission in [false, true] {
+        let said = Said::default();
+        let prefill_url = spawn_saying(
+            &said,
+            "the prefill answers",
+            r#"{"kv_transfer_params":{"remote_engine_id":"eng0","remote_block_ids":[1,2]}}"#,
+            None,
+        )
+        .await;
+        let chat_completion = r#"{"object":"chat.completion"}"#;
+        let one_url = spawn_saying(&said, "a decode is asked", chat_completion, None).await;
+        let other_url = spawn_saying(&said, "a decode is asked", chat_completion, None).await;
+        let heard = Arc::clone(&said);
+        let stages = table_with(move || Box::new(NotesLimit(Arc::clone(&heard))));
+        let (mut router, _monitor) = pair_router_under(&stages, DecodePick::AfterPrefill);
+        if admission {
+            router.prefill_admission = Some(Arc::new(PrefillAdmission::new(1, 1, PENDING_ANSWER)));
+        }
+        let [prefill, one] = sequential_pair(prefill_url, one_url);
+        let other = sequential_row(&other_url, WorkerType::Decode, None, 1);
+        for worker in [prefill, one, other] {
+            router.worker_registry.register_or_replace(worker);
+        }
+
+        one_chat(&router).await;
+
+        let order = said.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        let answered_at = order.iter().position(|word| word == "the prefill answers");
+        let (before, behind) = order.split_at(answered_at.expect("the prefill went first"));
+        for side in [before, behind] {
+            let limits: Vec<&String> = side
+                .iter()
+                .filter(|word| word.starts_with("limit"))
+                .collect();
+            assert!(!limits.is_empty(), "admission {admission}: {order:?}");
+            assert!(
+                limits.iter().all(|word| *word == "limit 50"),
+                "admission {admission}: {order:?}"
+            );
+        }
+    }
+}

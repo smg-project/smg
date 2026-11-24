@@ -18,8 +18,9 @@
 //!
 //! A write the store does not take answers `None`: another writer moved
 //! the row under the holder's turn. The store tests that under its own
-//! lock, by the revision the holder read: a replica that just took the
-//! lead may still apply its last leader's last event, outside every turn.
+//! lock, by the revision the holder read: a door and a standby's applier
+//! write in the holder's turn, and a caller of the store's own writes
+//! takes none.
 //! The holder then reads the store to its end again before it answers, so
 //! the registry holds what that writer left. A removal has taken its
 //! object out by then, and the row that writer left gets an object anew.
@@ -77,11 +78,7 @@ impl<G: Generation> Objects<G> {
     ) -> Option<MembershipChange> {
         let mut place = self.read_to.lock();
         self.follow_from(store, &mut place);
-        // Under the exact key, as the store's table finds a row. The
-        // registry's other lookup also finds a bare address under the form
-        // with its scheme, and that is another key.
-        let standing = self.registry.get_id_by_url_or_reservation(&facts.key);
-        let standing = standing.and_then(|object| self.row_of(&object));
+        let standing = self.row_under(&facts.key);
         let seen = standing.as_ref().map(|row| row.revision);
         let (change, row) = facts.laid_over(standing.as_ref(), maker, Instant::now());
         self.lay_decided(store, &mut place, change, &row, seen)
@@ -130,7 +127,7 @@ impl<G: Generation> Objects<G> {
     /// The row `id` as its object and what stands beside it state it,
     /// where the object was built at `revision`.
     fn guarded(&self, id: WorkerId, revision: u64) -> Option<WorkerRow> {
-        let row = self.row_of(&self.object(id)?)?;
+        let row = self.row(id)?;
         (row.revision == revision).then_some(row)
     }
 
@@ -554,8 +551,8 @@ pub(super) mod tests {
             objects.follow_from(store, &mut place);
             let read = replica.object(A).and_then(|object| objects.row_of(&object));
             let read = read.expect("the row read");
-            // Another writer, outside the holder's turn: a last leader's
-            // late event lands as a write of the store's own.
+            // Another writer, outside the holder's turn: a write of the
+            // store's own, which takes no turn of the holder.
             let late = WorkerPatch {
                 labels: Some(BTreeMap::from([("tier".to_owned(), "late".to_owned())])),
                 ..WorkerPatch::default()

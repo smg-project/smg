@@ -39,6 +39,8 @@ use crate::{
     tracking::lease::{EventSet, Lease, Side},
 };
 
+mod signals;
+
 /// A host's reads of its own admission, as two tests of a place: whether
 /// the prefill there has capacity, then whether the decode there has a room.
 #[derive(Debug)]
@@ -399,6 +401,32 @@ fn a_request_of_video_alone_takes_the_encoder_that_takes_images() {
     host.lists[2] = PublishedList::with_facts(encoders, |_| FixedFacts::default());
     let (decision, _, encoders) = host.decide(said, &keys, None, &mut placed);
     assert_eq!((gap(&decision), encoders.len()), (Some("encode-vision"), 0));
+}
+
+/// An encode request's pair is made among first partners while one is
+/// ready, as a pair's own request is: the entry hands the pair's decision
+/// the first partners its host numbered
+/// ([`PartnerClasses::number_first`]). The stock document takes the shorter
+/// queue of each list, and the pair that goes first is taken past it.
+#[test]
+fn an_encode_requests_pair_is_made_among_its_first_partners() {
+    let mut host = Host::of(2, 2, 2);
+    // Each prefill has an encoder of its own class, and the first worker
+    // of each list reports the shorter queue.
+    let said = (&[of(1), of(2)][..], &[1, 2][..]);
+    let keys = [Identity::plain("item")];
+    let mut placed = EncodePlaced::new();
+    host.loads = Some(reports(0));
+    let (decision, prefill, encoders) = host.decide(said, &keys, None, &mut placed);
+    assert_eq!((prefill, encoders), (Some(0), vec![0]));
+    assert_eq!(decode_of(&decision), Some(0));
+    // Both prefills pair with both decodes, and prefill 1 with decode 1
+    // first.
+    let both: &[u32] = &[0, 1];
+    host.partners = PartnerClasses::number_first(2, [(both, &[][..]), (both, &[1][..])]);
+    let (decision, prefill, encoders) = host.decide(said, &keys, None, &mut placed);
+    assert_eq!((prefill, encoders), (Some(1), vec![1]));
+    assert_eq!(decode_of(&decision), Some(1));
 }
 
 /// A pair's lists are narrowed by no subset hint: the pair's own decision

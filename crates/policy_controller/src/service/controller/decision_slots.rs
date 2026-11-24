@@ -30,7 +30,9 @@
 //!    gateway may take by its reach, its wires and its standing vetoes
 //!    ([`frame_decision::decide`]). A pair at its prefill is read its
 //!    model's two lists, its prefills and its decodes, each with its own
-//!    places ([`frame_decision::decide_pair`]);
+//!    places ([`frame_decision::decide_pair`]). A prefill or a decode frame
+//!    that stands alone is read the list of its own phase's role
+//!    ([`frame_decision::decide_alone`]);
 //! 5. the engine's decision over that list, at its entry that issues no
 //!    lease, told what is left of the budget;
 //! 6. the lease, for a pick: one a decision, a credit on the pick's first
@@ -95,10 +97,14 @@
 //! decision reads no count of that lease.
 //!
 //! A single request, a pair at its prefill and a decode call behind a
-//! pair's held prefill are decided here. An encode request, a decode frame
-//! that names no lease and a prefill whose model's plan pairs no side have
-//! no decision over worker lists yet: each is answered `Busy` with no
-//! reason, and its gateway decides it. A decode call its lease refuses is
+//! pair's held prefill are decided here. So is a frame that stands alone
+//! at a side's phase: a prefill frame, or a decode frame that names no
+//! lease, whose plan pairs no side of its phase. The binding of its own
+//! phase decides it over that phase's list, and its pick is filed a
+//! single's lease. An encode request has no decision over worker lists
+//! yet, and a decode frame that names no lease under a plan that pairs it
+//! has none at all: each is answered `Busy` with no reason, and its
+//! gateway decides it. A decode call its lease refuses is
 //! answered `Busy` under that refusal's own reason: at the call's first
 //! test of the lease, ahead of every stage its decision runs, or at its
 //! issue, where the lease moved under the decision.
@@ -149,8 +155,8 @@
 //! and its gateway decides it locally at once: a shed is a policy's word
 //! and reaches the client, and no policy spoke. Four arms, each counted
 //! by its cause ([`DecideStats`]): a decision that panics, an encode
-//! request, a decode frame that names no lease or a prefill whose model's
-//! plan pairs no side, a request that carries its prompt as text
+//! request or a decode frame that names no lease under a plan that pairs
+//! it, a request that carries its prompt as text
 //! (the controller is to hash it, and a decision made as if the request
 //! carried no prefix would be another request's), and a pick the store
 //! mints no lease for, its term's ids being spent. A text is said
@@ -174,9 +180,9 @@
 //! and counts that request as one its own catch held.
 //!
 //! What this step leaves to the next ones. A decision reads no load report
-//! under a document with a stage that keeps reports. An encode request, a
-//! decode frame that names no lease and a prefill whose model's plan pairs
-//! no side have no decision.
+//! under a document with a stage that keeps reports. An encode request has
+//! no decision, and neither has a decode frame that names no lease under a
+//! plan that pairs the decode phase.
 
 use std::{
     io, mem,
@@ -307,9 +313,9 @@ pub(crate) struct DecideStats {
     pub(crate) busy: [AtomicU64; 9],
     /// Decisions that panicked.
     pub(crate) faults: AtomicU64,
-    /// Requests that have no decision over worker lists yet: an encode
-    /// request, a decode frame that names no lease, and a prefill whose
-    /// model's plan pairs no side.
+    /// Requests that have no decision over worker lists: an encode
+    /// request, which has none yet, and a decode frame that names no
+    /// lease under a plan that pairs the decode phase.
     pub(crate) pair_sides: AtomicU64,
     /// Requests that carried their prompt as text.
     pub(crate) texts: AtomicU64,
@@ -1086,23 +1092,24 @@ impl Deciding {
             at_work.apply();
         }
         let (term, taken) = judged?;
-        // A single request, a pair at its prefill and a decode call behind
-        // a pair's held prefill have a decision over worker lists. An
-        // encode request and a decode frame that names no lease have none
-        // yet: they are answered `Busy` with no reason before anything is
-        // read for them, and their gateway decides them locally. A frame
-        // that names a lease is read at the decode phase, so a single
-        // request and a pair at its prefill are asked for none.
+        // A single request, a pair at its prefill, a decode call behind a
+        // pair's held prefill and a prefill or a decode frame that stands
+        // alone have a decision over worker lists. An encode request has
+        // none yet: it is answered `Busy` with no reason before anything
+        // is read for it, and its gateway decides it locally. A frame that
+        // names a lease is read at the decode phase, so a single request
+        // and a prefill are asked for none.
         let entry = match request.phase() {
             Phase::Single => Entry::Single,
-            Phase::Prefill => Entry::Pair,
-            Phase::Decode | Phase::Encode => match request.decode_of() {
+            Phase::Prefill => Entry::Prefill,
+            Phase::Decode => match request.decode_of() {
                 Some(lease) => Entry::Decode(lease),
-                None => {
-                    counts.pair_sides.fetch_add(1, Ordering::Relaxed);
-                    return Err(Reason::Unspecified);
-                }
+                None => Entry::DecodeAlone,
             },
+            Phase::Encode => {
+                counts.pair_sides.fetch_add(1, Ordering::Relaxed);
+                return Err(Reason::Unspecified);
+            }
         };
         let taken = taken.placed(self.working.as_ref());
         let (frames, own) = (&mut self.frames, counts.part(self.index));
@@ -1123,7 +1130,8 @@ impl Deciding {
             // lets the answer leave. That read judges the store's write
             // and a stage's call with the decision before them. A pair's
             // pick is filed its decode side's lease beside it, and a decode
-            // call's pick is filed under the pair's own lease.
+            // call's pick is filed under the pair's own lease. A frame
+            // that stands alone is filed as a single request's is.
             let (decision, filed, beside) = match entry {
                 Entry::Single => {
                     let decided =
@@ -1133,13 +1141,17 @@ impl Deciding {
                         frame_decision::issue(store, world, &taken, term, &decision, booked);
                     (decision, filed, FiledBeside::Alone)
                 }
-                Entry::Pair => {
-                    let theirs = (&mut *frames, loads, own, counts.as_ref());
-                    pair(store, world, objects, &taken, term, theirs, caught)?
+                Entry::Prefill => {
+                    let theirs = (&mut *frames, loads, own);
+                    prefill(store, world, objects, &taken, term, theirs, caught)?
                 }
                 Entry::Decode(lease) => {
                     let theirs = (&mut *frames, loads, own);
                     decode_call(store, world, objects, &taken, lease, theirs, caught)?
+                }
+                Entry::DecodeAlone => {
+                    let theirs = (&mut *frames, loads, own, counts.as_ref());
+                    decode_alone(store, world, objects, &taken, term, theirs, caught)?
                 }
             };
             // No pick, while the start's document of a replica under a
@@ -1314,10 +1326,14 @@ fn made<T>(decided: Result<T, DecisionRefused>, caught: &mut bool) -> Result<T, 
 enum Entry {
     /// A single request.
     Single,
-    /// A pair's one request, at its prefill.
-    Pair,
+    /// A prefill frame: a pair's one request where its plan pairs, and a
+    /// frame that stands alone where it pairs no side.
+    Prefill,
     /// The decode call that names this lease.
     Decode(LeaseId),
+    /// A decode frame that names no lease: one that stands alone where
+    /// its plan pairs no side, and one with no decision where it does.
+    DecodeAlone,
 }
 
 /// What a deciding thread files for a pick: the store's answer for the
@@ -1339,33 +1355,42 @@ enum FiledBeside {
     Issue(DecodeIssue),
 }
 
-/// A pair's decision and its leases, for the frame that enters a pair plan
-/// at its prefill: decided for both sides ([`frame_decision::decide_pair`])
-/// and, for a pick, issued a lease a side
+/// A prefill frame's decision and its leases. A frame that enters a pair
+/// plan at its prefill is its pair's one request: decided for both sides
+/// ([`frame_decision::decide_pair`]) and, for a pick, issued a lease a side
 /// ([`frame_decision::issue_pair`]). The prefill side's lease is the one
 /// filed, as a single's is, and the decode side's comes beside it where it
 /// was issued. A decode side its frame asked for later is chosen and not
 /// issued: none comes, and the answer carries the prefill's lease alone.
 ///
-/// A prefill whose model's plan pairs no side has no decision here yet: it
-/// is answered `Busy` with no reason and counted with the sides, and its
-/// gateway decides it locally.
+/// A prefill whose model's plan pairs no side stands alone
+/// ([`stands_alone`]).
 ///
 /// Out of line: a single's decision carries no part of a pair's.
 #[inline(never)]
-fn pair(
+fn prefill(
     store: &MemoryStore,
     world: &StoreSnapshot,
     objects: &Objects<Members>,
     taken: &DecisionCall<'_, Checked>,
     term: u64,
-    (frames, loads, own, counts): (&mut FrameBuffers, &Arc<LoadSnapshot>, &Part, &DecideStats),
+    (frames, loads, own): (&mut FrameBuffers, &Arc<LoadSnapshot>, &Part),
     caught: &mut bool,
 ) -> Result<(Decision, Filed, FiledBeside), Reason> {
-    let pairs = world.spec().engine().pair_position(taken.request.model());
-    if pairs.is_none() {
-        counts.pair_sides.fetch_add(1, Ordering::Relaxed);
-        return Err(Reason::Unspecified);
+    if !world
+        .spec()
+        .engine()
+        .pairs(taken.request.model(), Phase::Prefill)
+    {
+        return stands_alone(
+            store,
+            world,
+            objects,
+            taken,
+            term,
+            (frames, loads, own),
+            caught,
+        );
     }
     let decided = frame_decision::decide_pair(world, objects, taken, frames, loads, own);
     let (decision, booked) = made(decided, caught)?;
@@ -1377,6 +1402,65 @@ fn pair(
             Err(refused) => (Err(refused), FiledBeside::Alone),
         };
     Ok((decision, filed, beside))
+}
+
+/// The decision and the lease of a frame that stands alone at a side's
+/// phase: a prefill frame, or a decode frame that names no lease, whose
+/// plan pairs no side of its phase. The binding of its own phase decides
+/// it over that phase's list ([`frame_decision::decide_alone`]), and a
+/// pick is filed one lease, as a single request's is
+/// ([`frame_decision::issue`]).
+fn stands_alone(
+    store: &MemoryStore,
+    world: &StoreSnapshot,
+    objects: &Objects<Members>,
+    taken: &DecisionCall<'_, Checked>,
+    term: u64,
+    (frames, loads, own): (&mut FrameBuffers, &Arc<LoadSnapshot>, &Part),
+    caught: &mut bool,
+) -> Result<(Decision, Filed, FiledBeside), Reason> {
+    let decided = frame_decision::decide_alone(world, objects, taken, frames, loads, own);
+    let (decision, booked) = made(decided, caught)?;
+    let filed = frame_decision::issue(store, world, taken, term, &decision, booked);
+    Ok((decision, filed, FiledBeside::Alone))
+}
+
+/// The decision of a decode frame that names no lease. Where the decode
+/// phase's own lookup resolves to a plan that pairs it, the frame is a
+/// pair's side with no lease to decide behind: it has no decision, is
+/// answered `Busy` with no reason and counted with the sides, and its
+/// gateway decides it locally. Under any other plan it stands alone
+/// ([`stands_alone`]): a binding of one profile listed ahead of the pair's
+/// for the decode phase so decides it.
+///
+/// Out of line: no other request carries a part of it.
+#[inline(never)]
+fn decode_alone(
+    store: &MemoryStore,
+    world: &StoreSnapshot,
+    objects: &Objects<Members>,
+    taken: &DecisionCall<'_, Checked>,
+    term: u64,
+    (frames, loads, own, counts): (&mut FrameBuffers, &Arc<LoadSnapshot>, &Part, &DecideStats),
+    caught: &mut bool,
+) -> Result<(Decision, Filed, FiledBeside), Reason> {
+    if world
+        .spec()
+        .engine()
+        .pairs(taken.request.model(), Phase::Decode)
+    {
+        counts.pair_sides.fetch_add(1, Ordering::Relaxed);
+        return Err(Reason::Unspecified);
+    }
+    stands_alone(
+        store,
+        world,
+        objects,
+        taken,
+        term,
+        (frames, loads, own),
+        caught,
+    )
 }
 
 /// A decode call's decision and its side's issue, for the frame that names
@@ -4998,8 +5082,8 @@ pub(crate) mod tests {
     }
 
     /// A controller decides a single request, a pair at its prefill and a
-    /// decode call. A request of the decode phase that names no lease, and
-    /// one of the encode phase, have no decision here: `Busy` with no
+    /// decode call. Under a pair plan a request of the decode phase that
+    /// names no lease, and one of the encode phase, have no decision: `Busy` with no
     /// reason, counted by its cause, never one side's decision and never a
     /// shed, which is a policy's word. Its gateway decides it. A prompt
     /// carried as text is never decided as a request with no prefix.
@@ -5167,16 +5251,111 @@ pub(crate) mod tests {
         assert_eq!((bed.counts.undialed(), bed.counts.hashes_cut()), (2, 1));
     }
 
-    /// A prefill whose model's plan pairs no side has no decision here yet:
-    /// `Busy` with no reason, counted with the sides, never a shed. Its
-    /// gateway decides it locally, as it does an encode request.
+    /// A prefill frame, and a decode frame that names no lease, stand alone
+    /// under a plan that pairs no side. Each is decided over the list of its
+    /// own phase's role, here the fleet's one worker of that role and none
+    /// of its three single workers. Its pick is filed a single's lease: one
+    /// lease of the single side on the wire, one record with no decode side
+    /// on file, and its worker booked. Neither frame is counted with the
+    /// sides. An encode frame has no decision under this plan either:
+    /// `Busy` with no reason, counted, and nothing filed. A model that has
+    /// no worker of the frame's role is shed with no endpoint, as a single
+    /// request of a model nobody serves is.
     #[tokio::test]
-    async fn a_prefill_whose_plan_pairs_no_side_has_no_decision_and_is_counted() {
+    async fn a_prefill_or_a_decode_frame_that_stands_alone_is_decided_over_its_own_phases_list() {
         let mut bed = leading([]);
-        let answer = bed.ask(phased(frame(1, 1), proto::Phase::Prefill)).await;
-        assert_eq!(busy(&answer), Reason::Unspecified);
+        let id = |count: u64| 1 << 32 | count;
+        let sides = [
+            (proto::Phase::Prefill, Role::Prefill),
+            (proto::Phase::Decode, Role::Decode),
+        ];
+        for (n, (phase, role)) in (1..).zip(sides) {
+            let worker = side_of(&bed, role);
+            let answer = bed.ask(phased(frame(n, 1), phase)).await;
+            assert_eq!(picked(&answer), worker, "{phase:?}");
+            let lease = id(u64::from(n));
+            assert_eq!(sides_of(&answer), [(lease, proto::Side::Single, 0)]);
+            let store: &dyn LeasesStore = bed.store.as_ref();
+            let filed = store.sides(GATEWAY, LeaseId(lease)).expect("on file");
+            let no_decode = filed.record.decode.is_none() && filed.decode.is_none();
+            assert_eq!(
+                (filed.record.target, no_decode),
+                (worker, true),
+                "{phase:?}: a single's record"
+            );
+            assert_eq!(booked(&bed, [worker]), [1], "{phase:?}");
+        }
+        assert_eq!(bed.store.live(GATEWAY), 2);
+        assert_eq!(bed.counts.pair_sides.load(Ordering::Relaxed), 0);
+        let encode = phased(frame(3, 1), proto::Phase::Encode);
+        assert_eq!(busy(&bed.ask(encode).await), Reason::Unspecified);
         assert_eq!(bed.counts.pair_sides.load(Ordering::Relaxed), 1);
-        assert_eq!(bed.store.live(GATEWAY), 0);
+        // A model served by a single worker alone: no prefill of it stands
+        // in the registry's lists.
+        serving(
+            &bed.store,
+            "s9",
+            &["model-of-singles"],
+            Role::Single,
+            WireModes::NONE,
+        );
+        let lone = phased(frame_for("model-of-singles", 9, 9), proto::Phase::Prefill);
+        let none = declined(proto::ShedReason::NoEndpoints, "none");
+        assert_eq!(*outcome(&bed.ask(lone).await), none);
+        assert_eq!(bed.counts.pair_sides.load(Ordering::Relaxed), 1);
+        assert_eq!(bed.store.live(GATEWAY), 2);
+    }
+
+    /// The decode phase's own lookup says whether a decode frame that names
+    /// no lease stands alone. Under the pair plan it is a pair's side with
+    /// no lease to decide behind: `Busy` with no reason, counted with the
+    /// sides. With a binding of one profile listed ahead of the pair's for
+    /// the decode phase, the same frame is decided alone over the decodes
+    /// and filed a single's lease, and the model's prefill frame is still
+    /// its pair's one request.
+    #[tokio::test]
+    async fn a_binding_of_one_profile_ahead_of_the_pairs_decides_a_decode_frame_alone() {
+        let ahead = |alone: &str| {
+            let document = format!(
+                r#"{{
+                  "apiVersion": "smg.policy/v1",
+                  "generation": 1,
+                  "profiles": {{ "p": {{ "pick": "random" }} }},
+                  "bindings": [
+                    {alone}
+                    {{ "match": {{ "phase": ["prefill", "decode"] }}, "plan": "pd-pair",
+                      "profiles": {{ "prefill": "p", "decode": "p" }} }},
+                    {{ "profile": "p" }}
+                  ]
+                }}"#
+            );
+            let document: PolicySpec =
+                serde_json::from_str(&document).expect("a document of this build");
+            applied(&document)
+        };
+        let decode = phased(frame(1, 1), proto::Phase::Decode);
+        let mut paired = bed(Some(ahead("")), true, (2, 8), []);
+        assert_eq!(busy(&paired.ask(decode.clone()).await), Reason::Unspecified);
+        assert_eq!(paired.counts.pair_sides.load(Ordering::Relaxed), 1);
+
+        let alone = r#"{ "match": { "phase": ["decode"] }, "profile": "p" },"#;
+        let mut bed = bed(Some(ahead(alone)), true, (2, 8), []);
+        let (prefill, decoder) = (side_of(&bed, Role::Prefill), side_of(&bed, Role::Decode));
+        let answer = bed.ask(decode).await;
+        assert_eq!(picked(&answer), decoder);
+        let id = |count: u64| 1 << 32 | count;
+        assert_eq!(sides_of(&answer), [(id(1), proto::Side::Single, 0)]);
+        assert_eq!(bed.counts.pair_sides.load(Ordering::Relaxed), 0);
+        // The prefill lookup resolves to the pair still: both sides run
+        // under the pair binding, whatever binding the decode phase names
+        // first.
+        let answer = bed.ask(phased(frame(2, 2), proto::Phase::Prefill)).await;
+        let pair = [
+            (id(2), proto::Side::Prefill, 0),
+            (id(2), proto::Side::Decode, 0),
+        ];
+        assert_eq!(sides_of(&answer), pair);
+        assert_eq!(booked(&bed, [prefill, decoder]), [1, 2]);
     }
 
     /// What the engine told a stage of a lease's sides: an issue and a
@@ -5656,9 +5835,9 @@ pub(crate) mod tests {
         assert_eq!(told.lock().len(), heard, "no stage heard an issue");
     }
 
-    /// A decode frame that names no lease has no decision yet: `Busy` with
-    /// no reason, counted with the sides, and nothing of a pair's lease on
-    /// file moves.
+    /// A decode frame that names no lease has no decision under a plan that
+    /// pairs the decode phase: `Busy` with no reason, counted with the
+    /// sides, and nothing of a pair's lease on file moves.
     #[tokio::test]
     async fn a_decode_frame_that_names_no_lease_has_no_decision_and_is_counted() {
         let (mut bed, told, prefill) = later_bed();

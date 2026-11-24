@@ -876,21 +876,6 @@ pub struct Profile {
 }
 
 impl Profile {
-    /// Whether a pick of this profile stands while its worker does: the
-    /// profile holds no scorer, and each pick of its picker takes a turn
-    /// ([`Picker::takes_turns`]). Decided again, such a profile would spend
-    /// a second turn for one request, and move the request by nothing its
-    /// workers show. So a pair's decode decided again keeps the decode of
-    /// its first decision ([`Engine::decide_decode`]). The engine keeps it
-    /// too under a scorer the picker does not read
-    /// ([`Picker::picks_alone`]): this answer is the unscored profile's
-    /// alone. Every other profile decides again, on the workers as they
-    /// stand at that call.
-    #[must_use]
-    pub fn keeps_its_pick(&self) -> bool {
-        self.scorers.is_empty() && self.picker.takes_turns()
-    }
-
     /// What this profile's stages read from the host beyond the facts every
     /// view carries: every stage of every kind, so a stage that reads the
     /// affinity column as a filter or as the picker counts as one that
@@ -1140,6 +1125,10 @@ pub struct Scratch {
     /// decode the decode profile keeps, then the ones the routable prefills
     /// pair with.
     marks: ClassBits,
+    /// The prefill classes with an open first partner, sorted
+    /// ([`FirstPartners`]). Where the pair is made among them they stand in
+    /// `classes`, and this holds every class with a partner.
+    firsts: Vec<u32>,
     /// The encode side of an encode-pair decision, boxed: the entry moves
     /// one pointer out of the scratch while the pair entry holds the rest.
     encode: Option<Box<encode::EncodeScratch>>,
@@ -3036,6 +3025,20 @@ pub enum Plan {
     },
 }
 
+impl Plan {
+    /// Whether `phase` is one of the sides this plan decides together, at
+    /// the pair's prefill. A request of any other phase stands alone: one
+    /// profile over the one list of its phase.
+    #[cfg(feature = "in-process")]
+    pub(crate) const fn pairs(self, phase: Phase) -> bool {
+        match self {
+            Self::Single => false,
+            Self::PdPair => matches!(phase, Phase::Prefill | Phase::Decode),
+            Self::Epd { .. } => !matches!(phase, Phase::Single),
+        }
+    }
+}
+
 /// The profile a binding resolves a phase to, by position; `None` when the
 /// binding's plan has no side for the phase: a single or an encode request
 /// under the pair plan, a single request under `epd`. The host and the spec
@@ -4061,6 +4064,11 @@ struct Entry {
     vetoed: AllVetoed,
 }
 
+/// The sides of a pair that run under the pair's binding whatever binding
+/// covers their phase first: the decode side of every pair, and the encode
+/// side of an `epd` pair. The prefill side is the lookup's own.
+const PAIR_SIDES: [Phase; 2] = [Phase::Decode, Phase::Encode];
+
 /// Every phase, in the order [`Engine::phase_needs`] keeps them.
 const PHASES: [Phase; 4] = [Phase::Single, Phase::Prefill, Phase::Decode, Phase::Encode];
 
@@ -4172,6 +4180,9 @@ pub struct PairPools<'a> {
     /// The decode classes each prefill class pairs with. Left at its
     /// default, classes pair by their number.
     pub table: PairTable<'a>,
+    /// The partners each prefill class is paired with first. Left at its
+    /// default, no partner goes first.
+    pub first: FirstPartners<'a>,
 }
 
 /// Which pair classes pair: for each prefill class, the decode classes it
@@ -4335,6 +4346,13 @@ impl<'a> PairTable<'a> {
     /// table, in every build, and a debug build asks it where a decision
     /// takes one.
     pub fn validate(&self) -> Result<(), PairTableError> {
+        self.laid_out(true)
+    }
+
+    /// The clauses of [`Self::validate`], the last of them only where
+    /// `counted`: lists that name some of a table's classes hold numbers
+    /// above their own count ([`FirstPartners::within`]).
+    fn laid_out(&self, counted: bool) -> Result<(), PairTableError> {
         if !self.ends.windows(2).all(|pair| pair[0] <= pair[1]) {
             return Err(PairTableError::EndsDescend);
         }
@@ -4355,7 +4373,7 @@ impl<'a> PairTable<'a> {
             if list.first() == Some(&0) {
                 return Err(PairTableError::ClassZero);
             }
-            if list.last().is_some_and(|&last| last as usize > entries) {
+            if counted && list.last().is_some_and(|&last| last as usize > entries) {
                 return Err(PairTableError::NumberAboveCount);
             }
         }
@@ -4430,6 +4448,97 @@ pub enum PairTableError {
     NumberAboveCount,
 }
 
+/// The partners each prefill class is paired with first: for each prefill
+/// class, a part of the decode classes its list in the pair table names
+/// ([`PairTable`]). While one of them is open, the pair is made among the
+/// prefills that have one open and their first partners, and a request
+/// waits where such a prefill is held back by its admission limit alone.
+/// Every other pair is made only while no prefill has a first partner
+/// open ([`Engine::decide_pair`]). The default is none: every partner
+/// stands alike.
+///
+/// The lists name classes of the pair table and not all of them, so they
+/// are no table of their own. A host asks once, where it builds the two,
+/// whether they stand within its table ([`FirstPartners::within`]).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FirstPartners<'a> {
+    /// The lists in a table's storage, read as the host handed them.
+    lists: PairTable<'a>,
+}
+
+impl<'a> FirstPartners<'a> {
+    /// The first partners over the host's two slices, laid out as a pair
+    /// table's are ([`PairTable::new`]): `classes` holds the lists one
+    /// after another, prefill class 1's first, and `ends[k - 1]` is where
+    /// prefill class `k`'s list ends in it. A list names decode classes in
+    /// ascending order. Nothing is checked here.
+    pub const fn new(ends: &'a [u32], classes: &'a [u32]) -> Self {
+        Self {
+            lists: PairTable::new(ends, classes),
+        }
+    }
+
+    /// The first partners of prefill class `class`, as the host handed
+    /// them: none for class 0 and for a class the lists do not reach.
+    pub(crate) fn of(&self, class: u32) -> &'a [u32] {
+        match class.checked_sub(1) {
+            Some(at) => self.lists.list(at as usize),
+            None => &[],
+        }
+    }
+
+    /// The prefill classes with an open first partner, ascending, into
+    /// `classes`, and whether there is one. `marks` holds the open decode
+    /// classes as `table`'s own pass left them ([`PairTable::partnered`]).
+    /// Under no table that pass marks nothing, and no first partner is
+    /// read.
+    fn open(&self, table: &PairTable<'_>, marks: &ClassBits, classes: &mut Vec<u32>) -> bool {
+        if table.is_empty() {
+            return false;
+        }
+        classes.clear();
+        let open = |class: &u32| self.of(*class).iter().any(|&listed| marks.has(listed));
+        classes.extend(self.lists.prefill_classes().filter(open));
+        !classes.is_empty()
+    }
+
+    /// Whether these are first partners of `table`, and the first clause
+    /// they fail when they are not. The lists are laid out as a table's
+    /// are, by the table's own clauses but for its count
+    /// ([`PairTable::validate`]): the ends ascend and the last stands where
+    /// the lists end, and each list names its classes in ascending order,
+    /// none of them class 0. Then each class a list names is a partner of
+    /// its prefill class in `table`. The default, none, stands within
+    /// every table.
+    ///
+    /// A host asks it once where it builds the two, and a debug build asks
+    /// it where a decision takes them.
+    pub fn within(&self, table: &PairTable<'_>) -> Result<(), FirstPartnersError> {
+        self.lists
+            .laid_out(false)
+            .map_err(FirstPartnersError::Lists)?;
+        let partners = |class: u32| {
+            let listed = table.of(&class);
+            let partner = |named: &u32| listed.binary_search(named).is_ok();
+            self.of(class).iter().all(partner)
+        };
+        if self.lists.prefill_classes().all(partners) {
+            Ok(())
+        } else {
+            Err(FirstPartnersError::NoPartner)
+        }
+    }
+}
+
+/// The clause of [`FirstPartners::within`] a host's first partners fail.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum FirstPartnersError {
+    #[error("the first partners' lists: {0}")]
+    Lists(PairTableError),
+    #[error("a first partner is no partner of its prefill class in the pair table")]
+    NoPartner,
+}
+
 /// One side of a pair decision.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PairSide {
@@ -4471,6 +4580,29 @@ impl<'a> PairPools<'a> {
             decodes,
             ..Self::default()
         }
+    }
+
+    /// The decode classes a prefill of `class` is paired among: its first
+    /// partners where the pair is made among those (`firsts`), else every
+    /// class its list in the table names.
+    fn partners<'c>(&self, class: &'c u32, firsts: bool) -> &'c [u32]
+    where
+        'a: 'c,
+    {
+        if firsts {
+            self.first.of(*class)
+        } else {
+            self.table.of(class)
+        }
+    }
+
+    /// Whether the pair `live` names was made among first partners: its
+    /// decode is a first partner of its prefill's class `class`. A side's
+    /// shadow is shown the partners its live side was shown.
+    fn made_first(&self, class: u32, live: &Pick) -> bool {
+        let decode = live.targets.first().and_then(|target| target.pair);
+        let decode = decode.and_then(|pair| self.decodes.get(pair.decode_position as usize));
+        decode.is_some_and(|decode| classed(self.first.of(class), decode.pair_class))
     }
 
     /// One side of the pair as its stages read it: the side's pool, and the
@@ -4592,22 +4724,6 @@ fn debug_assert_named(facts: &RequestFacts<'_>, pool: &[Candidate]) {
                 && named.warming.last().is_none_or(|&row| under(row))
         }),
         "rows named in the column's place stand ascending and under the pool's size, beside an empty column and no mean in flight"
-    );
-}
-
-/// A debug build asserts that the rows a host lent its key's counts for
-/// ([`RequestFacts::lent_session_in_flight`]) stand for `pool`, once where
-/// a decision takes its inputs: ascending by row, a row once, and under
-/// the pool's size. A list out of order hides a row's count from the
-/// cap's search. A release build does not check what the host derived.
-fn debug_assert_keyed(facts: &RequestFacts<'_>, pool: &[Candidate]) {
-    let under = |row: u32| (row as usize) < pool.len();
-    debug_assert!(
-        facts.lent_session_in_flight.is_none_or(|lent| {
-            lent.is_sorted_by(|a, b| a.row < b.row)
-                && lent.last().is_none_or(|keyed| under(keyed.row))
-        }),
-        "the rows lent a key's counts stand ascending and under the pool's size"
     );
 }
 
@@ -4742,27 +4858,30 @@ impl Engine {
                 }
             }
         }
-        // A pair's decode side is decided by the binding its prefill lookup
-        // resolves to ([`Self::decide_pair`]), not by the first binding that
-        // covers the decode phase: the decode slot also carries the decode
-        // profile of every pair binding a prefill lookup can reach.
-        let decode_slot = slot(Phase::Decode);
+        // A pair's decode side, and an `epd` pair's encode side, are decided
+        // by the binding the prefill lookup resolves to
+        // ([`Self::decide_pair`], [`Self::decide_encode_pair`]), not by the
+        // first binding that covers the side's phase: each side's slot also
+        // carries that side's profile of every pair binding a prefill
+        // lookup can reach. A `pd-pair` binding names no encode side.
         for binding in bindings
             .iter()
             .filter(|b| b.phases.is_empty() || b.phases.contains(&Phase::Prefill))
         {
             if matches!(binding.plan, Plan::PdPair | Plan::Epd { .. }) {
-                if let Some(&own) = profile_index(binding, Phase::Decode)
-                    .and_then(|i| profile_needs.get(usize::from(i)))
-                {
-                    // The decode side's shadow reads what its profile
-                    // needs, beside the live one.
-                    let shadow = binding
-                        .decode_shadow
-                        .and_then(|i| profile_needs.get(usize::from(i)))
-                        .copied()
-                        .unwrap_or_default();
-                    phase_needs[decode_slot] = phase_needs[decode_slot].or(own).or(shadow);
+                for side in PAIR_SIDES {
+                    if let Some(&own) =
+                        profile_index(binding, side).and_then(|i| profile_needs.get(usize::from(i)))
+                    {
+                        // The side's shadow reads what its profile needs,
+                        // beside the live one. An encode side names none.
+                        let shadow = shadow_index(binding, side)
+                            .and_then(|i| profile_needs.get(usize::from(i)))
+                            .copied()
+                            .unwrap_or_default();
+                        let needs = &mut phase_needs[slot(side)];
+                        *needs = needs.or(own).or(shadow);
+                    }
                 }
             }
             if binding.model == "*" {
@@ -4949,7 +5068,8 @@ impl Engine {
         }
     }
 
-    /// The session table: the pins of every key a sessions rule placed.
+    /// The session table: the pins of the keys it holds, each placed by a
+    /// sessions rule.
     pub fn sessions(&self) -> &SessionTable {
         &self.sessions
     }
@@ -5007,8 +5127,11 @@ impl Engine {
     /// of its live and shadow profiles and of the binding's sessions rule,
     /// nothing when no binding matches. The decode answer also carries the
     /// needs of the pair's decode profile where the prefill lookup names a
-    /// pair ([`Self::decide_pair`]). The host reads it at registration to
-    /// choose the worker's stream.
+    /// pair ([`Self::decide_pair`]), and the encode answer those of the
+    /// pair's encode profile where that lookup names an `epd` pair
+    /// ([`Self::decide_encode_pair`]): both sides run under the pair's
+    /// binding, whatever binding covers their phase first. The host reads
+    /// it at registration to choose the worker's stream.
     pub fn needs_for(&self, model: &str, phase: Phase) -> Needs {
         self.reads_for(model, phase).0
     }
@@ -5022,13 +5145,14 @@ impl Engine {
     /// [`RequestFacts::pinned_at`]). [`Self::decide_pair`] declines a mask
     /// beside a side that shows its rows: for a decode decision of a model
     /// that also pairs, the word carries the pair's decode side too, as the
-    /// needs do. Written rows are the safe side.
+    /// needs do, and for an encode decision the encode side of its `epd`
+    /// pair. Written rows are the safe side.
     ///
     /// The last word says whether that profile holds a stage that may
     /// refuse a request by a report of leases
     /// ([`Filter::refuses_by_reports`]): a host that applies its gateways'
     /// reports late applies them first for such a decision. It carries a
-    /// pair's decode side as the second word does. A profile kept its
+    /// pair's side as the second word does. A profile kept its
     /// word when the engine was built, so a decision under no such stage
     /// reads nothing more for it.
     pub fn reads_for(&self, model: &str, phase: Phase) -> (Needs, bool, bool) {
@@ -5044,15 +5168,15 @@ impl Engine {
             })
             .unwrap_or_default();
         match phase {
-            Phase::Decode => {
-                let pair = self.pair_decode_marks(model);
+            Phase::Decode | Phase::Encode => {
+                let (needs, pair) = self.pair_side(model, phase);
                 (
-                    own.or(self.pair_decode_needs(model)),
+                    own.or(needs),
                     marks.scoped() || pair.scoped(),
                     marks.by_reports() || pair.by_reports(),
                 )
             }
-            _ => (own, marks.scoped(), marks.by_reports()),
+            Phase::Single | Phase::Prefill => (own, marks.scoped(), marks.by_reports()),
         }
     }
 
@@ -5185,27 +5309,19 @@ impl Engine {
         self.head_rule_of(self.ring_profiles(model, phase))
     }
 
-    /// The marks of the decode profile of `model`'s pair binding, none
-    /// where the model has no such binding.
-    fn pair_decode_marks(&self, model: &str) -> Marks {
-        self.pair_binding(model)
-            .and_then(|b| profile_index(b, Phase::Decode))
-            .and_then(|i| self.marks.get(usize::from(i)))
-            .copied()
-            .unwrap_or_default()
-    }
-
-    /// The needs of the decode profile of `model`'s pair binding
-    /// ([`Self::pair_binding`]), nothing where the model has none.
-    fn pair_decode_needs(&self, model: &str) -> Needs {
-        let Some(binding) = self.pair_binding(model) else {
-            return Needs::default();
-        };
-        profile_index(binding, Phase::Decode)
-            .and_then(|i| self.profile_needs.get(usize::from(i)))
-            .copied()
-            .unwrap_or_default()
-            .or(self.shadow_needs(binding, Phase::Decode))
+    /// What `model`'s pair binding ([`Self::pair_binding`]) holds for
+    /// `side`, one of [`PAIR_SIDES`]: the needs of that side's profile with
+    /// its shadow's, and the profile's marks. Nothing where the model has
+    /// no pair binding, and for the encode side of a `pd-pair` binding,
+    /// which names none. One lookup of the binding answers both.
+    fn pair_side(&self, model: &str, side: Phase) -> (Needs, Marks) {
+        let held = self.pair_binding(model).and_then(|binding| {
+            let index = usize::from(profile_index(binding, side)?);
+            let needs = self.profile_needs.get(index).copied().unwrap_or_default();
+            let marks = self.marks.get(index).copied().unwrap_or_default();
+            Some((needs.or(self.shadow_needs(binding, side)), marks))
+        });
+        held.unwrap_or_default()
     }
 
     /// The pair binding of `model`: the binding its prefill lookup resolves
@@ -5225,14 +5341,19 @@ impl Engine {
 
     /// The binding a `phase` pool of `model` is decided under, whose
     /// overload block judges the pool. Every decision resolves by its own
-    /// phase but a pair's decode side, which runs under the pair binding:
-    /// a decode pool is that binding's wherever the model has one. A
-    /// decode-phase binding ahead of it still decides a decode request
-    /// asked alone, and its block is not read for the pool.
+    /// phase but a pair's decode side and an `epd` pair's encode side,
+    /// which run under the pair binding: a decode pool is that binding's
+    /// wherever the model has one, and an encode pool wherever the model
+    /// has one of the `epd` plan. A binding of the side's phase ahead of
+    /// it still decides a request of that phase asked alone, and its block
+    /// is not read for the pool.
     pub fn pool_binding(&self, model: &str, phase: Phase) -> Option<&Binding> {
         let pair = match phase {
             Phase::Decode => self.pair_binding(model),
-            Phase::Single | Phase::Prefill | Phase::Encode => None,
+            Phase::Encode => self
+                .pair_binding(model)
+                .filter(|pair| matches!(pair.plan, Plan::Epd { .. })),
+            Phase::Single | Phase::Prefill => None,
         };
         pair.or_else(|| self.binding(model, phase))
     }
@@ -5258,7 +5379,8 @@ impl Engine {
     ///
     /// A binding's row is its live and shadow stages and its sessions rule,
     /// for each phase it covers. A pair's decode profile is a decode row of the
-    /// pair binding's glob, whichever binding a decode lookup resolves to.
+    /// pair binding's glob, whichever binding a decode lookup resolves to,
+    /// and an `epd` pair's encode profile an encode row of it the same way.
     /// Two bindings of one glob write one row a phase.
     pub fn needs_rows(&self) -> Vec<(&str, Phase, Needs)> {
         let mut rows: Vec<(&str, Phase, Needs)> = Vec::new();
@@ -5280,8 +5402,9 @@ impl Engine {
                         .or(session_needs(binding));
                 }
                 // The decode side of every pair this binding's prefill
-                // lookup starts, with that side's shadow.
-                if phase == Phase::Decode && pairs && covers(Phase::Prefill) {
+                // lookup starts, and the encode side of an `epd` pair, each
+                // with that side's shadow.
+                if PAIR_SIDES.contains(&phase) && pairs && covers(Phase::Prefill) {
                     needs = needs
                         .or(own(phase).unwrap_or_default())
                         .or(self.shadow_needs(binding, phase));
@@ -5380,6 +5503,19 @@ impl Engine {
         let at = self.binding_position(model, Phase::Prefill)?;
         let pairs = matches!(self.binding_at(at)?.plan, Plan::PdPair | Plan::Epd { .. });
         pairs.then_some(at)
+    }
+
+    /// Whether a request of `model` at `phase` is a side of a pair: the
+    /// first binding that matches, by the phase's own lookup, states a plan
+    /// that decides the phase with its pair ([`Plan::pairs`]). Any other
+    /// request stands alone, and one that no binding matches does too: one
+    /// profile decides it over the one list of its phase. A binding of one
+    /// profile listed ahead of the pair's for the decode phase so decides
+    /// a decode asked alone.
+    #[cfg(feature = "in-process")]
+    pub(crate) fn pairs(&self, model: &str, phase: Phase) -> bool {
+        self.binding(model, phase)
+            .is_some_and(|binding| binding.plan.pairs(phase))
     }
 
     /// The shadow word of the binding at `at`, where its shadow is asked
@@ -5833,7 +5969,6 @@ impl Engine {
         debug_assert_indexed(candidates);
         debug_assert_cells(facts.signal_cells, candidates);
         debug_assert_named(facts, candidates);
-        debug_assert_keyed(facts, candidates);
         if !column_fits(facts.affinity, candidates) {
             return shed(ShedReason::PolicyDeclined, AFFINITY_COLUMN, bare);
         }
@@ -6042,7 +6177,6 @@ impl Engine {
         debug_assert_indexed(candidates);
         debug_assert_cells(facts.signal_cells, candidates);
         debug_assert_named(facts, candidates);
-        debug_assert_keyed(facts, candidates);
         if !column_fits(facts.affinity, candidates) {
             let trace = Trace {
                 seed: facts.seed,
@@ -6272,7 +6406,7 @@ impl Engine {
             .copied();
         if let Some(i) = owner {
             let c = &candidates[i as usize];
-            if Self::at_cap(rule, facts, c) {
+            if Self::at_cap(rule, c) {
                 // At the cap: the stages place the request again, over every
                 // candidate the filters kept.
                 if let Some(respilled) = self.respill(
@@ -6342,13 +6476,7 @@ impl Engine {
                     // A dispatch on an alternate writes that worker among
                     // the key's pins: none at the rule's cap stands behind
                     // the pin.
-                    Self::drop_alternates_at_cap(
-                        rule,
-                        facts,
-                        candidates,
-                        &buf.kept,
-                        &mut pick.targets,
-                    );
+                    Self::drop_alternates_at_cap(rule, candidates, &buf.kept, &mut pick.targets);
                     // The followed pin is put to the rule's cap as the pin
                     // read first is: the lift is of the overload veto alone.
                     // A rule with no cap asks no walk for the pin's row.
@@ -6357,7 +6485,7 @@ impl Engine {
                             .kept
                             .iter()
                             .find(|&&i| candidates[i as usize].id == first)
-                            .is_some_and(|&i| Self::at_cap(rule, facts, &candidates[i as usize]));
+                            .is_some_and(|&i| Self::at_cap(rule, &candidates[i as usize]));
                     if capped {
                         if let Some(handed) = self.hand_on::<KEPT>(
                             profile, index, rule, placing, facts, pool, set, cx, buf, all_vetoed,
@@ -6385,6 +6513,9 @@ impl Engine {
                 };
                 match claim {
                     Claim::Made(id) => pick.session_verdict = SessionVerdict::Claimed(id),
+                    // A full table records nothing of the key: the
+                    // placement stands as the profile made it.
+                    Claim::NoRoom => {}
                     // The table took no claim of this decision's: another
                     // request's stands, or the pins moved under the
                     // decision. The worker it names is a pin of the key
@@ -6417,12 +6548,11 @@ impl Engine {
                             // over the buffers.
                             Self::drop_alternates_at_cap(
                                 rule,
-                                facts,
                                 candidates,
                                 &buf.kept,
                                 &mut pick.targets,
                             );
-                            if Self::at_cap(rule, facts, c) {
+                            if Self::at_cap(rule, c) {
                                 if let Some(handed) = self.hand_on::<KEPT>(
                                     profile, index, rule, placing, facts, pool, set, cx, buf,
                                     all_vetoed, owner,
@@ -6469,10 +6599,10 @@ impl Engine {
     }
 
     /// Whether a pin carries its rule's in-flight cap of the key's requests,
-    /// by the count the request's facts read for the pin's row
-    /// ([`RequestFacts::session_in_flight`]). A cap of zero is none.
-    fn at_cap(rule: &SessionRule, facts: &RequestFacts<'_>, pin: &Candidate) -> bool {
-        rule.inflight_cap != 0 && facts.session_in_flight(pin) >= rule.inflight_cap
+    /// by the count its row carries ([`Candidate::session_in_flight`]). A
+    /// cap of zero is none.
+    fn at_cap(rule: &SessionRule, pin: &Candidate) -> bool {
+        rule.inflight_cap != 0 && pin.session_in_flight >= rule.inflight_cap
     }
 
     /// Drops the targets behind the first that carry the rule's cap of the
@@ -6483,7 +6613,6 @@ impl Engine {
     /// asks no walk.
     fn drop_alternates_at_cap(
         rule: &SessionRule,
-        facts: &RequestFacts<'_>,
         candidates: &[Candidate],
         kept: &[u32],
         targets: &mut Targets,
@@ -6497,7 +6626,7 @@ impl Engine {
             let capped = nth > 0
                 && kept.iter().any(|&k| {
                     let c = &candidates[k as usize];
-                    c.id == target.id && Self::at_cap(rule, facts, c)
+                    c.id == target.id && Self::at_cap(rule, c)
                 });
             if !capped {
                 targets.push(*target);
@@ -6546,7 +6675,7 @@ impl Engine {
             let under_the_cap = |id: WorkerId| {
                 buf.kept.iter().any(|&k| {
                     let c = &candidates[k as usize];
-                    c.id == id && !Self::at_cap(rule, facts, c)
+                    c.id == id && !Self::at_cap(rule, c)
                 })
             };
             pick.session_verdict = match taken {
@@ -6561,13 +6690,7 @@ impl Engine {
             // with no verdict keeps its alternates: its commit moves no pin.
             match pick.session_verdict {
                 SessionVerdict::Respill => {
-                    Self::drop_alternates_at_cap(
-                        rule,
-                        facts,
-                        candidates,
-                        &buf.kept,
-                        &mut pick.targets,
-                    );
+                    Self::drop_alternates_at_cap(rule, candidates, &buf.kept, &mut pick.targets);
                 }
                 SessionVerdict::Pinned => {
                     let placed = pick.targets;
@@ -6865,6 +6988,19 @@ impl Engine {
     /// pair's default, a prefill at its limit with no open partner makes no
     /// request wait: its refusal is named by what its partners' own stages
     /// say, as the refusal of a prefill under its limit is.
+    ///
+    /// Where the host states first partners ([`PairPools::first`]), the
+    /// pair is made among the prefills with a first partner open and those
+    /// partners, while there is one. The prefill profile is shown those
+    /// prefills alone, the admission limit is judged over them, and the
+    /// decode is one of the pick's first partners. Where the profile's own
+    /// stages refuse each such prefill, the pair is made among every
+    /// prefill with an open partner, as it is where no first partner is
+    /// open. The pair's default reads every partner alike. The gateway's
+    /// own pair selection orders its candidates so
+    /// (`model_gateway/src/routers/common/placement.rs:2479-2502`,
+    /// `:2532-2545`, `:2615-2618`, and its default at `:1804-1813`, on main
+    /// `30f636706`).
     pub fn decide_pair(
         &self,
         facts: &RequestFacts<'_>,
@@ -7005,22 +7141,81 @@ impl Engine {
         // ([`Self::shadow_side`]).
         scratch.single.lifted = LiftedVeto::None;
         // A prefill profile that weighs load against affinity runs with the
-        // overload veto lifted ([`Self::weighing_lift`]): its run and the
-        // count of its routable prefills read `run_cx`. The lifted
-        // constraints are a second value beside the stated ones, which the
-        // pair's default still reads: it judges the pool as it stands with
-        // no lift.
+        // overload veto lifted ([`Self::weighing_lift`]): its run, the
+        // admission limit's tests and the count of its routable prefills
+        // read `run_cx`. The lifted constraints are a second value beside
+        // the stated ones, which the pair's default still reads: it judges
+        // the pool as it stands with no lift.
         let lifted_run = self.weighing_lift(binding.profile, vetoed, cx);
         let run_cx = lifted_run.as_ref().unwrap_or(cx);
-        let prefill = run_profile(
+        debug_assert!(
+            pools.first.within(&pools.table).is_ok(),
+            "the first partners do not stand within the pair table: {:?}",
+            pools.first.within(&pools.table)
+        );
+        // While a prefill has a first partner open, the pair is made among
+        // those prefills and their first partners ([`FirstPartners`]): the
+        // prefill profile is shown their classes alone.
+        let mut firsts = pools
+            .first
+            .open(&pools.table, &scratch.marks, &mut scratch.firsts);
+        let shown: &[u32] = if firsts {
+            &scratch.firsts
+        } else {
+            &scratch.classes
+        };
+        let mut prefill = run_profile(
             prefill_profile,
             binding.profile,
             &prefill_facts,
             pool,
-            Set::side(prefills, None, Some(&scratch.classes)),
+            Set::side(prefills, None, Some(shown)),
             run_cx,
             &mut scratch.single,
         );
+        if firsts {
+            let stands = match &prefill {
+                Decision::Pick(_) => true,
+                // One of those prefills that stands but for its admission
+                // limit keeps the request for them: it waits, though a
+                // prefill with no first partner open has room. Where none
+                // stands, the pairs with any open partner are next.
+                Decision::Shed(refused) if refused.reason != ShedReason::PolicyDeclined => {
+                    let takes = Half::new(
+                        prefill_profile,
+                        binding.profile,
+                        &prefill_facts,
+                        prefills,
+                        run_cx,
+                    );
+                    let listed = |c: &&Candidate| classed(&scratch.firsts, c.pair_class);
+                    let mut among = takes.places().filter(listed);
+                    if among.any(|c| takes.but_for_the_limit(c)) {
+                        let limit = HasCapacity.name();
+                        return shed(reason_of(limit), limit, refused.trace);
+                    }
+                    false
+                }
+                // A picker's decline passes through.
+                _ => return prefill,
+            };
+            if stands {
+                // The classes the prefill profile was shown stand in
+                // `classes`, as a side's shadow reads them.
+                std::mem::swap(&mut scratch.classes, &mut scratch.firsts);
+            } else {
+                firsts = false;
+                prefill = run_profile(
+                    prefill_profile,
+                    binding.profile,
+                    &prefill_facts,
+                    pool,
+                    Set::side(prefills, None, Some(&scratch.classes)),
+                    run_cx,
+                    &mut scratch.single,
+                );
+            }
+        }
         // The prefill's pick is read where its decision stands: a pick is
         // 256 bytes, and taking it out copies them.
         let Decision::Pick(prefill_pick) = &prefill else {
@@ -7147,7 +7342,7 @@ impl Engine {
                 decode_index,
                 &decode_facts,
                 pool,
-                Set::side(decodes, Some(pools.table.of(&class)), None).ruled(vetoed),
+                Set::side(decodes, Some(pools.partners(&class, firsts)), None).ruled(vetoed),
                 decode_cx,
                 &mut scratch.decode,
             );
@@ -7333,12 +7528,13 @@ impl Engine {
                 // The partners of the live pair's prefill.
                 let prefill = live.targets.first()?;
                 let class = prefills.get(prefill.position as usize)?.pair_class;
+                let firsts = pools.made_first(class, live);
                 run_profile(
                     profile,
                     index,
                     &decode_facts,
                     pool,
-                    Set::side(decodes, Some(pools.table.of(&class)), None),
+                    Set::side(decodes, Some(pools.partners(&class, firsts)), None),
                     decode_cx,
                     &mut scratch.decode,
                 )
@@ -7392,12 +7588,14 @@ impl Engine {
         let prefill = pools.prefills.iter().find(|row| row.id == prefill)?;
         // The call's own draw sequence, as its live decode's.
         decode_facts.seed = facts.seed;
+        let class = prefill.pair_class;
+        let firsts = pools.made_first(class, live);
         Some(run_profile(
             profile,
             index,
             &decode_facts,
             pool,
-            Set::side(decodes, Some(pools.table.of(&prefill.pair_class)), None),
+            Set::side(decodes, Some(pools.partners(&class, firsts)), None),
             decode_cx,
             &mut scratch.decode,
         ))
@@ -7423,9 +7621,14 @@ impl Engine {
     /// ([`Self::decide_pair`]). Here the prefill has run, and a refusal
     /// fails its request.
     ///
+    /// Where the host states first partners ([`PairPools::first`]), the
+    /// partners are the held prefill's first partners while one of them is
+    /// open at this call's instant, by the test a first decision makes, and
+    /// every partner of the prefill else.
+    ///
     /// `first_decode` is the worker and the rank of the decode the pair's
     /// first decision named, where the caller holds them. Under a decode
-    /// profile that keeps its pick ([`Profile::keeps_its_pick`]) the call
+    /// profile that holds no scorer and whose picker takes turns, the call
     /// answers that decode first while the profile's filters keep it, the
     /// decodes they keep behind it as its alternates, and the picker is not
     /// asked: a second pick would turn a rotation a second time for one
@@ -7487,9 +7690,41 @@ impl Engine {
         // This call has one draw sequence, seeded by its own request.
         decode_facts.seed = facts.seed;
         let _opened = shown.then(|| profile.open(&decode_facts, decodes, pool));
+        debug_assert!(
+            pools.first.within(&pools.table).is_ok(),
+            "the first partners do not stand within the pair table: {:?}",
+            pools.first.within(&pools.table)
+        );
         // The held prefill's partners are put to the binding's all-vetoed
-        // rule, its liveness tier included.
-        let partners = Set::side(decodes, Some(pools.table.of(&prefill.pair_class)), None);
+        // rule, its liveness tier included. They are its first partners
+        // while one of those is open at this instant, by the test a pair's
+        // first decision makes ([`FirstPartners`]): one the profile's hard
+        // filters keep, or, where they keep no partner of the prefill, one
+        // they keep with the overload veto lifted as the rule lifts it.
+        // Else every partner.
+        let class = prefill.pair_class;
+        let first = pools.first.of(class);
+        let firsts = !first.is_empty() && {
+            let hard = || profile.filters.iter().filter(|f| !f.soft());
+            let open = |among: &[u32], facts: &RequestFacts<'_>, cx: &Constraints<'_>| {
+                let kept = |d: &Candidate| hard().all(|f| f.keep(facts, d, cx));
+                places::rows(decodes, decode_cx).any(|d| classed(among, d.pair_class) && kept(d))
+            };
+            // The facts and the constraints of the rule's own pass
+            // ([`vetoed::emptied`]).
+            let all = RequestFacts {
+                tried: &[],
+                ..decode_facts
+            };
+            let pass = Constraints {
+                overload_lifted: true,
+                ..*decode_cx
+            };
+            open(first, &decode_facts, decode_cx)
+                || (!open(pools.table.of(&class), &decode_facts, decode_cx)
+                    && open(first, &all, &pass))
+        };
+        let partners = Set::side(decodes, Some(pools.partners(&class, firsts)), None);
         let mut decision = run_side(
             profile,
             index,
@@ -8954,30 +9189,6 @@ mod tests {
         }
     }
 
-    /// The shadow's entry takes its inputs as the live one does: a debug
-    /// build stops on a list of the key's counts out of its rows' order.
-    #[cfg(debug_assertions)]
-    #[test]
-    #[should_panic(expected = "the rows lent a key's counts stand ascending")]
-    fn shadow_rows_lent_out_of_order_stop_a_debug_build() {
-        let engine = with_shadow(least_requests_profile(), Some(SESSIONS));
-        let rows = [candidate(0, 0), candidate(1, 3)];
-        let keyed = |row, in_flight| crate::engine::KeyedRow { row, in_flight };
-        let lent = [keyed(1, 2), keyed(0, 2)];
-        let facts = RequestFacts {
-            lent_session_in_flight: Some(&lent),
-            ..keyed_at(61, 71)
-        };
-        let answer = engine.shadow(
-            &facts,
-            &PoolFacts::default(),
-            &rows,
-            &Constraints::default(),
-            &mut Scratch::new(),
-        );
-        panic!("a list out of order answered {answer:?}");
-    }
-
     #[test]
     fn shadow_uses_session_pins_without_claiming_touching_or_sweeping() {
         let rule = SessionRule {
@@ -9969,8 +10180,11 @@ mod tests {
 
     /// A pair's decode side runs under the model's pair binding, so the
     /// pool's lookup names that binding for a decode pool whatever covers
-    /// the decode phase first. Every other pool is its own phase's: an
-    /// encode item resolves by the encode phase under `epd` too.
+    /// the decode phase first. An `epd` pair's encode side runs under it
+    /// too, so an encode pool is that binding's the same way. An encode
+    /// pool of a model whose pair is of the `pd-pair` plan is the encode
+    /// phase's own: that plan names no encode side. Every other pool is
+    /// its own phase's.
     #[test]
     fn a_decode_pool_is_decided_under_its_models_pair_binding() {
         let phase_first = |phase: Phase| Binding {
@@ -10027,10 +10241,22 @@ mod tests {
             pair(epd),
         ]);
         assert_eq!(plan_of(&with_encoders, "m", Phase::Decode), Some(epd));
+        // An encode item asked alone still resolves to the phase's first
+        // binding. The pool follows the pair, whose one call decides over
+        // it.
         assert_eq!(
-            plan_of(&with_encoders, "m", Phase::Encode),
+            with_encoders.binding("m", Phase::Encode).map(|b| b.plan),
             Some(Plan::Single)
         );
+        assert_eq!(plan_of(&with_encoders, "m", Phase::Encode), Some(epd));
+        assert_eq!(
+            plan_of(&with_encoders, "n", Phase::Encode),
+            Some(Plan::Single)
+        );
+        // A pair of two sides names no encode side: its model's encode
+        // pool is the encode phase's own.
+        let two_sides = engine(vec![phase_first(Phase::Encode), pair(Plan::PdPair)]);
+        assert_eq!(plan_of(&two_sides, "m", Phase::Encode), Some(Plan::Single));
     }
 
     /// One profile that keeps the healthy rows and leads with the deepest
@@ -10589,6 +10815,30 @@ mod tests {
         );
         assert!(!ahead.reads_for("m", Phase::Prefill).2);
         assert!(ahead.reads_for("m", Phase::Decode).2);
+        // An encode binding of a profile with no such stage stands ahead of
+        // an `epd` binding whose encode side holds one: the encode decision
+        // carries the pair's word the same way. A pair of two sides names
+        // no encode side and adds none.
+        let encode = || Binding {
+            phases: vec![Phase::Encode],
+            ..single_binding()
+        };
+        let behind = |plan: Plan| {
+            let pair = Binding {
+                plan,
+                ..pair_binding()
+            };
+            Engine::new(
+                vec![least_requests_profile(), filtered()],
+                vec![encode(), pair],
+                1,
+                Needs::default(),
+            )
+        };
+        let three = behind(Plan::Epd { encode: 1 });
+        assert!(three.reads_for("m", Phase::Encode).2);
+        assert!(!three.reads_for("m", Phase::Decode).2);
+        assert!(!behind(Plan::PdPair).reads_for("m", Phase::Encode).2);
     }
 
     /// A profile that shows its rows to a plugin says so by the engine's one
@@ -10696,7 +10946,8 @@ mod tests {
     /// and rows that carry the veto in their own field are shown with it. A
     /// mask beside a side that shows nothing is read by that side's filters.
     /// The host is told of the pair's decode side where a decode binding of
-    /// another profile stands ahead of it, as it is told that side's needs.
+    /// another profile stands ahead of it, as it is told that side's needs,
+    /// and of an `epd` pair's encode side the same way.
     #[test]
     fn a_pair_side_that_shows_its_rows_declines_a_mask_beside_them() {
         /// The scopes opened, and the rows they were shown stalled.
@@ -10837,6 +11088,27 @@ mod tests {
         );
         assert!(!ahead.reads_for("m", Phase::Prefill).1);
         assert!(ahead.reads_for("m", Phase::Decode).1);
+        // An encode binding of a profile that shows nothing stands ahead of
+        // an `epd` binding whose encode profile shows its rows: the encode
+        // side of the pair's one call runs under the pair binding, and the
+        // host is told so too.
+        let encoders = Engine::new(
+            vec![least_requests_profile(), shows()],
+            vec![
+                Binding {
+                    phases: vec![Phase::Encode],
+                    ..single_binding()
+                },
+                Binding {
+                    plan: Plan::Epd { encode: 1 },
+                    ..pair_binding()
+                },
+            ],
+            1,
+            Needs::default(),
+        );
+        assert!(!encoders.reads_for("m", Phase::Decode).1);
+        assert!(encoders.reads_for("m", Phase::Encode).1);
     }
 
     /// A stage that reads the affinity column as a filter alone, or as the
@@ -11541,6 +11813,34 @@ mod tests {
         );
         assert_eq!(engine.needs_for("pd/x", Phase::Decode), decode);
         assert_eq!(engine.needs_rows(), [("pd/*", Phase::Decode, decode)]);
+        // An `epd` pair's encode profile is an encode row of the glob the
+        // same way: an encode decision of the model carries it, and so
+        // does the encode phase's own answer.
+        let fed = Profile {
+            filters: vec![Box::new(Fed)],
+            ..least_requests_profile()
+        };
+        let engine = Engine::new(
+            vec![least_requests_profile(), fed],
+            vec![Binding {
+                model: "pd/*".into(),
+                phases: vec![Phase::Prefill],
+                plan: Plan::Epd { encode: 1 },
+                profile: 0,
+                decode_profile: Some(0),
+                shadow: None,
+                decode_shadow: None,
+                sessions: None,
+                overload: None,
+            }],
+            1,
+            Needs::default(),
+        );
+        let encode = decode;
+        assert_eq!(engine.needs_for("pd/x", Phase::Encode), encode);
+        assert_eq!(engine.needs_for_phase(Phase::Encode), encode);
+        assert_eq!(engine.needs_for("pd/x", Phase::Decode), Needs::default());
+        assert_eq!(engine.needs_rows(), [("pd/*", Phase::Encode, encode)]);
         // No prefill lookup resolves to a pair bound for another phase.
         let fed = Profile {
             filters: vec![Box::new(Fed)],
@@ -12928,6 +13228,46 @@ mod tests {
         assert_eq!(
             PairTableError::NumberAboveCount.to_string(),
             "a list names a number above the count of the lists' entries"
+        );
+    }
+
+    /// The question a host asks once where it builds first partners
+    /// beside its table: each clause is refused by its name, the first
+    /// they fail.
+    #[test]
+    fn a_hosts_question_names_the_clause_first_partners_fail() {
+        // Two prefill classes that pair with decode classes 1 and 2, and a
+        // third with class 3 alone.
+        let table = PairTable::new(&[2, 4, 5], &[1, 2, 1, 2, 3]);
+        let within =
+            |ends: &[u32], classes: &[u32]| FirstPartners::new(ends, classes).within(&table);
+        let lists = |clause| Err(FirstPartnersError::Lists(clause));
+        assert_eq!(FirstPartners::default().within(&table), Ok(()), "none");
+        assert_eq!(within(&[1, 1], &[1]), Ok(()), "one class's alone");
+        assert_eq!(within(&[2, 3, 4], &[1, 2, 2, 3]), Ok(()), "every partner");
+        // A list names classes of the table, so a number above the lists'
+        // own count stands.
+        assert_eq!(within(&[0, 0, 1], &[3]), Ok(()), "above the count");
+        assert_eq!(within(&[1, 0], &[1]), lists(PairTableError::EndsDescend));
+        assert_eq!(within(&[2], &[1]), lists(PairTableError::EndPastLists));
+        assert_eq!(
+            within(&[1], &[1, 2]),
+            lists(PairTableError::EntriesPastEnds)
+        );
+        assert_eq!(within(&[2], &[2, 1]), lists(PairTableError::ListOutOfOrder));
+        assert_eq!(within(&[1], &[0]), lists(PairTableError::ClassZero));
+        // A class of the table that is no partner of the list's prefill
+        // class, and a list for a prefill class the table does not hold.
+        let no_partner = Err(FirstPartnersError::NoPartner);
+        assert_eq!(within(&[1], &[3]), no_partner);
+        assert_eq!(within(&[0, 0, 0, 1], &[1]), no_partner);
+        // Under no table a class pairs with its own number.
+        let none = PairTable::default();
+        assert_eq!(FirstPartners::new(&[1], &[1]).within(&none), Ok(()));
+        assert_eq!(FirstPartners::new(&[1], &[2]).within(&none), no_partner);
+        assert_eq!(
+            FirstPartnersError::NoPartner.to_string(),
+            "a first partner is no partner of its prefill class in the pair table"
         );
     }
 
@@ -14361,73 +14701,6 @@ mod tests {
         assert_eq!(placed, [0], "the pin alone");
     }
 
-    /// The key's count as a keyed decision of the capped cases reads it for
-    /// the pool: the pick's row and what the rule did with the key. `lent`
-    /// is the list a host hands beside its rows, where it hands one.
-    fn capped(
-        engine: &Engine,
-        pool: &[Candidate],
-        lent: Option<&[crate::engine::KeyedRow]>,
-    ) -> (u32, SessionVerdict) {
-        let facts = RequestFacts {
-            model: "m",
-            session_key: Identity::hashed(7),
-            now_micros: 20,
-            lent_session_in_flight: lent,
-            session_counted: true,
-            ..RequestFacts::default()
-        };
-        let mut scratch = Scratch::new();
-        let cx = Constraints::default();
-        let decision = engine.decide(&facts, &PoolFacts::default(), pool, &cx, &mut scratch);
-        let pick = decision.pick().expect("a pick");
-        let first = pick.targets.first().expect("a target");
-        (first.position, pick.session_verdict)
-    }
-
-    /// The cap reads the key's count where the request's facts hold it. The
-    /// rows a host lends beside its pool answer as the rows' own count
-    /// does: under the cap the pin keeps the key, and at the cap the stages
-    /// place the request again, where a pick under the cap takes the pin
-    /// and a pick at the cap leaves it. Beside a lent list the rows' own
-    /// counts are not read.
-    #[test]
-    fn the_cap_reads_a_count_lent_beside_the_rows_as_it_reads_the_rows_own() {
-        use SessionVerdict::{Pinned, Respill};
-        let engine = session_engine(SESSIONS);
-        let mut pool = vec![candidate(0, 0), candidate(1, 3), candidate(2, 5)];
-        assert_eq!(place_keyed(&engine, &pool, 7, 10).position, 0);
-        // The key's worker carries the most requests from here: the stages
-        // place a request of the key at its cap on the second row.
-        pool[0].in_flight = 9;
-        let keyed = |row, in_flight| crate::engine::KeyedRow { row, in_flight };
-        let lent = |rows: &[crate::engine::KeyedRow]| capped(&engine, &pool, Some(rows));
-        assert_eq!(lent(&[]), (0, Pinned), "no request of the key in flight");
-        assert_eq!(lent(&[keyed(0, 1)]), (0, Pinned), "under the cap");
-        assert_eq!(lent(&[keyed(0, 2)]), (1, Respill), "at the cap");
-        let (both, unmoved) = ([keyed(0, 2), keyed(1, 2)], (1, SessionVerdict::None));
-        assert_eq!(lent(&both), unmoved, "the pick at its cap");
-        // The rows' own counts answer where no list stands, and are not
-        // read beside one.
-        pool[0].session_in_flight = 2;
-        assert_eq!(capped(&engine, &pool, None), (1, Respill));
-        assert_eq!(capped(&engine, &pool, Some(&[])), (0, Pinned));
-        assert_eq!(capped(&engine, &pool, Some(&[keyed(1, 2)])), (0, Pinned));
-    }
-
-    /// A list out of its rows' order hides a row's count from the cap's
-    /// search, so a debug build stops where the decision takes its inputs.
-    #[cfg(debug_assertions)]
-    #[test]
-    #[should_panic(expected = "the rows lent a key's counts stand ascending")]
-    fn rows_lent_out_of_order_stop_a_debug_build() {
-        let engine = session_engine(SESSIONS);
-        let pool = vec![candidate(0, 0), candidate(1, 3)];
-        let keyed = |row, in_flight| crate::engine::KeyedRow { row, in_flight };
-        let answer = capped(&engine, &pool, Some(&[keyed(1, 2), keyed(0, 2)]));
-        panic!("a list out of order answered {answer:?}");
-    }
-
     /// A key with no routable pin is placed by the rule's assignment: the
     /// profile's own stages under `delegate`, the fewest requests under
     /// `min_load`, the fewest sessions under `min_group`, any routable worker
@@ -15118,12 +15391,30 @@ mod tests {
         prefill.pair_class = 1;
         let mut decode = candidate(0, 0);
         decode.pair_class = 1;
-        match decide_pair(&engine, &[prefill], &[decode]) {
-            Decision::Shed(shed) => {
-                assert_eq!(shed.reason, ShedReason::PolicyDeclined);
-                assert_eq!(shed.emptied_by, "manual");
+        // Among first partners too: the decline passes through, and no
+        // request waits for a prefill the picker was shown.
+        let (prefills, decodes) = ([prefill], [decode]);
+        let first = PairPools {
+            prefills: &prefills,
+            decodes: &decodes,
+            table: PairTable::new(&[1], &[1]),
+            first: FirstPartners::new(&[1], &[1]),
+            ..PairPools::default()
+        };
+        let facts = RequestFacts {
+            model: "m",
+            ..RequestFacts::default()
+        };
+        let (pool, cx) = (PoolFacts::default(), Constraints::default());
+        let among = engine.decide_pair(&facts, &pool, first, &cx, &cx, &mut Scratch::new());
+        for decision in [decide_pair(&engine, &prefills, &decodes), among] {
+            match decision {
+                Decision::Shed(shed) => {
+                    assert_eq!(shed.reason, ShedReason::PolicyDeclined);
+                    assert_eq!(shed.emptied_by, "manual");
+                }
+                other => panic!("a manual side of a pair answered {other:?}"),
             }
-            other => panic!("a manual side of a pair answered {other:?}"),
         }
     }
 

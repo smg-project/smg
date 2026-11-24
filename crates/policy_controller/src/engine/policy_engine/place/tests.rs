@@ -24,8 +24,9 @@ use tokio::time::sleep;
 use super::*;
 use crate::{
     document::spec::{
-        BoundedLoadParams, ConsistentHashParams, FilterSpec, KeySourceSpec, Needs, OverloadSpec,
-        PolicySpec, RoutingKeySpec, ScoreStage, ShadowSpec, MANUAL_SESSION_HEADER,
+        Assignment, BoundedLoadParams, ConsistentHashParams, FilterSpec, KeySourceSpec, Needs,
+        OverloadSpec, PolicySpec, Recovery, RoutingKeySpec, ScoreStage, SessionsSpec, ShadowSpec,
+        MANUAL_SESSION_HEADER,
     },
     engine::{
         decision::{Queue, ShadowKind, Shed, Target, Targets, Trace},
@@ -636,23 +637,43 @@ fn a_plain_request_says_so_and_is_answered_a_place() {
 /// again and the document picks the decode after the prefill. Under a
 /// document that picks both sides at once it states none, and so does a
 /// caller that asks no decode again.
+///
+/// The word is a pair's, over its two lists or an encode request's three.
+/// Over one list, and over none, a request that carries it states no
+/// later decode: the request made is as plain as its plain test says.
 #[test]
 fn the_later_decode_is_stated_where_the_document_picks_it_so() {
     let mut document = PolicySpec::pair_presets("round_robin", "round_robin").expect("presets");
     let at_once = engine_of(&document);
     document.plans.pd_pair.decode = DecodePick::AfterPrefill;
     let after = engine_of(&document);
-    let later = |engine: &PolicyEngine, decode_again| {
+    let members = PublishedList::new(pool(2));
+    let classes = PartnerClasses::number(2, [&[0_u32, 1][..], &[0, 1][..]]);
+    let pair = pair_of(&members, &classes);
+    let later = |engine: &PolicyEngine, lists: WorkerLists<'_>, decode_again| {
         let request = PlaceRequest {
             decode_again,
-            ..PlaceRequest::of(MODEL, WorkerLists::None)
+            ..PlaceRequest::of(MODEL, lists)
         };
         let made = Made::new(engine, &request, &[]);
         made.make(engine.spec()).constraints.decode_later
     };
-    assert!(later(&after, true));
-    assert!(!later(&after, false));
-    assert!(!later(&at_once, true));
+    for lists in [WorkerLists::Pair(pair), three_of(pair)] {
+        assert!(later(&after, lists, true));
+        assert!(!later(&after, lists, false));
+        assert!(!later(&at_once, lists, true));
+    }
+    for lists in [WorkerLists::Single(members.lent()), WorkerLists::None] {
+        let request = PlaceRequest {
+            decode_again: true,
+            ..PlaceRequest::of(MODEL, lists)
+        };
+        let made = Made::new(&after, &request, &[]);
+        let stated = made.make(after.spec());
+        assert!(!stated.constraints.decode_later);
+        assert!(made.plain().is_some());
+        assert_eq!(stated.plain(), made.plain());
+    }
 }
 
 /// A worker can be sent to while it is ready and its circuit breaker lets
@@ -2237,6 +2258,147 @@ fn a_request_under_the_prefix_form_states_where_its_heads_stand() {
     assert_eq!(stated(None, None, &client), [0_u64; 0]);
 }
 
+/// The `prefix_hash` preset over a view of `boundaries`, whose binding
+/// reads a routing value from the header `x-smg-routing-key` and then from
+/// the request's own id, the turn and retry suffixes off: the sources a
+/// gateway's sticky override names. The view lists the header, so its
+/// value leaves in the clear as the id's does. `rule` is the binding's
+/// sessions rule.
+fn prefixed_by_id(boundaries: &[u32], rule: Option<SessionsSpec>) -> PolicyEngine {
+    let mut document = PolicySpec::preset("prefix_hash").expect("a built-in preset");
+    document.view.boundaries = boundaries.to_vec();
+    document.view.headers.push("x-smg-routing-key".to_owned());
+    let header = KeySourceSpec {
+        header: Some("x-smg-routing-key".to_owned()),
+        ..KeySourceSpec::default()
+    };
+    let rid = KeySourceSpec {
+        rid: true,
+        ..KeySourceSpec::default()
+    };
+    let binding = &mut document.bindings[0];
+    binding.routing_key = Some(RoutingKeySpec {
+        sources: vec![header, rid],
+        strip_lineage: true,
+    });
+    binding.sessions = rule;
+    engine_of(&document)
+}
+
+/// Under the prefix form a routing value leads the prompt only where a
+/// header handed it. The gateway's own policy hashes a header's value
+/// (`model_gateway/src/policies/prefix_hash.rs:358`) and places every other
+/// request by its prompt (`:360-372`), one keyed by its own id among them.
+/// So a request whose value its own id handed states its prompt's heads,
+/// and lands where the same prompt lands with no value, on a lent ring and
+/// on the stage's own. The value is still the request's session key, and
+/// the one call says where it came from.
+#[test]
+fn a_value_the_requests_own_id_handed_leads_no_prompt_under_the_prefix_form() {
+    let engine = hosted(prefixed_by_id(&[64, 256], None));
+    let list = pool(8);
+    let members = PublishedList::new(Arc::clone(&list));
+    let order = [6, 1, 4, 0, 7, 2, 5, 3];
+    let urls = order.iter().map(|&at| list[at].url().to_owned());
+    let ring = Lent(urls.collect());
+    let at = |head: Head<'_>| ring.head_position(head).expect("a lender of heads");
+    let ids: Vec<u32> = (500..800).collect();
+    // The request's places, whether its own id handed its value, the value
+    // in the clear, and the worker of the list it went to.
+    let stated = |headers: &dyn HeaderRead, id: Option<&str>, lent: bool| {
+        let request = PlaceRequest {
+            prompt: Prompt {
+                tokens: Some(&ids),
+                ..Prompt::NONE
+            },
+            headers,
+            request_id: id,
+            ring: lent.then_some(&ring as &dyn LentRing),
+            ..PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()))
+        };
+        let made = Made::new(engine, &request, &[]);
+        let facts = made.make(engine.spec()).facts;
+        let (places, by_id) = (facts.ring_positions.to_vec(), facts.session_key_from_rid);
+        let key = facts.session_key.plain.map(str::to_owned);
+        let placement = engine.place(&request).expect("a placement");
+        let worker = |held: &Arc<dyn Worker>| Arc::ptr_eq(held, &placement.worker);
+        let went = list.iter().position(worker).expect("a worker of the list");
+        (places, by_id, key, went)
+    };
+    let heads = vec![at(Head::Tokens(&ids[..256])), at(Head::Tokens(&ids[..64]))];
+    let keyed = [("x-smg-routing-key", "conv-1")];
+    for lent in [true, false] {
+        let places = |heads: &[u64]| if lent { heads.to_vec() } else { Vec::new() };
+        let unkeyed = stated(&(), None, lent);
+        assert_eq!(unkeyed, (places(&heads), false, None, unkeyed.3));
+        // The id's value, its turn and retry suffixes off: the prompt's
+        // heads and the prompt's worker, under two ids.
+        for id in ["conv-1_t2_r1", "conv-2"] {
+            let key = id.split('_').next().map(str::to_owned);
+            let by_id = stated(&(), Some(id), lent);
+            assert_eq!(by_id, (places(&heads), true, key, unkeyed.3), "{id}");
+        }
+        // A header's value leads: its text is the one head, whatever the
+        // request's id.
+        let led = stated(&keyed, Some("conv-9"), lent);
+        let head = [at(Head::Text("conv-1"))];
+        assert_eq!(led.0, places(&head));
+        assert_eq!((led.1, led.2.as_deref()), (false, Some("conv-1")));
+    }
+    assert_ne!(heads[0], at(Head::Text("conv-1")), "two places");
+}
+
+/// A sessions rule pins the value the request's own id handed, as it pins
+/// a header's: the key's next request follows the pin, whatever its
+/// prompt. The ring placed the key's first request by its prompt, where a
+/// request of that prompt with no value lands, and another id's request of
+/// the second prompt lands on that prompt's worker.
+#[test]
+fn a_sessions_rule_pins_the_value_the_requests_own_id_handed() {
+    let rule = SessionsSpec {
+        sticky_header: String::new(),
+        assignment: Assignment::Delegate,
+        recovery: Recovery::Latest,
+        ..PolicySpec::preset("manual")
+            .expect("a built-in preset")
+            .bindings
+            .remove(0)
+            .sessions
+            .expect("the manual preset's rule")
+    };
+    let engine = hosted(prefixed_by_id(&[], Some(rule)));
+    let list = pool(8);
+    let members = PublishedList::new(Arc::clone(&list));
+    let went = |tokens: &[u32], id: Option<&str>| {
+        let request = PlaceRequest {
+            prompt: Prompt {
+                tokens: Some(tokens),
+                ..Prompt::NONE
+            },
+            request_id: id,
+            ..PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()))
+        };
+        let placement = engine.place(&request).expect("a placement");
+        let worker = |held: &Arc<dyn Worker>| Arc::ptr_eq(held, &placement.worker);
+        list.iter().position(worker).expect("a worker of the list")
+    };
+    let prompt = |from: u32| (from..from + 256).collect::<Vec<u32>>();
+    let first = prompt(500);
+    let home = went(&first, None);
+    // A second prompt whose worker is another.
+    let (second, other) = (1..)
+        .map(|n| prompt(n * 1000))
+        .map(|tokens| {
+            let worker = went(&tokens, None);
+            (tokens, worker)
+        })
+        .find(|&(_, worker)| worker != home)
+        .expect("a prompt with another worker");
+    assert_eq!(went(&first, Some("conv-1_t1")), home, "by its prompt");
+    assert_eq!(went(&second, Some("conv-1_t2")), home, "by its pin");
+    assert_eq!(went(&second, Some("conv-2_t1")), other, "another id");
+}
+
 /// A ring that places a head of token ids at its length in tokens. Its walk
 /// reaches one worker from the place of a head of sixteen tokens and
 /// another from every other place.
@@ -2529,6 +2691,34 @@ fn a_pairs_request_is_lent_the_ring_a_side_of_it_places_by() {
     assert_eq!(depths(pair(prefixed, plain)), [Some(256), None]);
     assert_eq!(depths(pair(plain, prefixed)), [Some(256), Some(256)]);
     assert_eq!(depths(pair(prefixed, ringed)), [None, None]);
+}
+
+/// An `epd` binding pairs its prefill and its decode as a `pd-pair`
+/// binding does: asked at its prefill, the engine answers the lent ring's
+/// two questions for the decode profile too. Here the decode profile alone
+/// reads the ring, by a routing value's own text and then by heads.
+#[test]
+fn an_epd_models_prefill_is_answered_for_its_decode_profile_on_a_lent_ring() {
+    let epd = |prefill: &str, decode: &str| {
+        PolicySpec::epd_presets("round_robin", prefill, decode).expect("the epd presets")
+    };
+    let (ringed, prefixed, plain) = ("consistent_hashing", "prefix_hash", "round_robin");
+    let phases = [Phase::Prefill, Phase::Decode];
+    let by_text = |document: PolicySpec| {
+        let engine = engine_of(&document);
+        phases.map(|phase| engine.spec().engine().states_key_place(MODEL, phase))
+    };
+    assert_eq!(by_text(epd(plain, ringed)), [true, true]);
+    assert_eq!(by_text(epd(ringed, plain)), [true, false]);
+    assert_eq!(by_text(epd(plain, plain)), [false, false]);
+    let depths = |document: PolicySpec| {
+        let engine = engine_of(&document);
+        let rule = |phase| engine.spec().engine().states_head_places(MODEL, phase);
+        phases.map(|phase| rule(phase).map(|rule| rule.depth))
+    };
+    assert_eq!(depths(epd(plain, prefixed)), [Some(256), Some(256)]);
+    assert_eq!(depths(epd(prefixed, plain)), [Some(256), None]);
+    assert_eq!(depths(epd(plain, plain)), [None, None]);
 }
 
 /// A filter of the host's own. It keeps a worker for a request that is

@@ -457,8 +457,9 @@ struct PrefixRecord {
     bound: AtomicUsize,
     /// Work waits for a sweep: a worker left, or the bound came down.
     sweeping: AtomicBool,
-    /// How many workers were told gone. Written under the record's write
-    /// guard: a write in parts stops where it moved since its naming.
+    /// How many leaves were told. Written under the record's guard, a
+    /// reader's where the leave takes no place out: a write in parts stops
+    /// where it moved since its naming.
     left: AtomicU64,
     /// How many writes ended before the request's last block, a turn of
     /// theirs having met a held lock. Written by such a write alone, so a
@@ -529,10 +530,18 @@ impl PrefixRecord {
         }
     }
 
+    /// Counts the leave also where the record holds no place for `worker`:
+    /// a pick named ahead of the leave would give the worker its first
+    /// place, and its write stops where the count moved. The count moves
+    /// under the guard that reads or clears the place, so no read pairs
+    /// the count behind a leave with the place ahead of it.
     fn forget(&self, worker: WorkerId) {
-        if !self.predictor.read().holds(worker) {
+        let held = self.predictor.read();
+        if !held.holds(worker) {
+            self.left.fetch_add(1, Ordering::Relaxed);
             return;
         }
+        drop(held);
         let mut predictor = self.predictor.write();
         self.left.fetch_add(1, Ordering::Relaxed);
         predictor.forget(worker);
@@ -540,9 +549,11 @@ impl PrefixRecord {
     }
 
     /// Forgets every worker the record holds a place for that is not in
-    /// `standing` ([`Self::forget`]).
+    /// `standing` ([`Self::forget`]), and counts one leave ahead of them: a
+    /// worker `standing` names no more may be under its first pick.
     fn keep(&self, standing: &FxHashSet<WorkerId>) {
         let held = self.predictor.read();
+        self.left.fetch_add(1, Ordering::Relaxed);
         let gone: Vec<WorkerId> = held
             .held()
             .filter(|worker| !standing.contains(worker))

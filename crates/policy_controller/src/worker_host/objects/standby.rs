@@ -30,11 +30,18 @@
 //! of the holder: nothing that takes the turn finds the objects of one
 //! history beside the place of another.
 //!
+//! A gateway's watcher hands the holder the same two: each change of its
+//! watch's tail ([`Objects::follow_at`]), and the watch's snapshot at its
+//! last page ([`Objects::watch_from`]). The snapshot is laid as a restore
+//! is, by the store's own door for it.
+//!
 //! The locks, in their order: the applier's hold of its event's place in
 //! the log, which is a mark and no lock, then the holder's turn, then the
 //! store's membership lock inside the store's write. No lock of the store
 //! is held over a write of the registry: the store's write has returned
-//! when the object is put.
+//! when the object is put. A restore that carries a generation takes the
+//! turn under the lock of the document's door, which its applier holds
+//! from the generation's pass: nothing under the turn takes that door.
 
 use smg_worker::registry::Generation;
 
@@ -45,7 +52,7 @@ use crate::store::{MembershipChange, MemoryStore, Position, StoreCheckpoint, Wor
     not(any(test, feature = "controller")),
     expect(
         dead_code,
-        reason = "a controller's standby follows its leader through the holder"
+        reason = "a controller's standby and a gateway's watcher follow through the holder"
     )
 )]
 impl<G: Generation> Objects<G> {
@@ -104,8 +111,33 @@ impl<G: Generation> Objects<G> {
     /// stand when this returns. `false`, with the store and the objects as
     /// they were, where the store refuses the cut's place.
     pub(crate) fn restore_from(&self, store: &MemoryStore, cut: StoreCheckpoint) -> bool {
+        self.laid_whole(store, cut, MemoryStore::restore_from)
+    }
+
+    /// A watch's snapshot whole, at its last page: the write of
+    /// [`MemoryStore::watch_from`], laid here as a restore is. The objects
+    /// of the snapshot's rows stand when this returns, and a row the
+    /// snapshot drops has none. `false`, with the store and the objects as
+    /// they were, where the store refuses the snapshot's place.
+    #[cfg_attr(
+        not(any(test, feature = "client")),
+        expect(dead_code, reason = "a gateway's watcher lays its snapshot here")
+    )]
+    pub(crate) fn watch_from(&self, store: &MemoryStore, cut: StoreCheckpoint) -> bool {
+        self.laid_whole(store, cut, MemoryStore::watch_from)
+    }
+
+    /// One body for a cut the store takes whole: `door` is the store's own
+    /// entry for it. The store's write and the read of its rows are one
+    /// turn of the holder.
+    fn laid_whole(
+        &self,
+        store: &MemoryStore,
+        cut: StoreCheckpoint,
+        door: impl FnOnce(&MemoryStore, StoreCheckpoint) -> bool,
+    ) -> bool {
         let mut place = self.read_to.lock();
-        if !store.restore_from(cut) {
+        if !door(store, cut) {
             return false;
         }
         self.follow_from(store, &mut place);
@@ -209,21 +241,29 @@ mod tests {
 
     /// The wire tells a row's age, so each event's row comes with an
     /// instant of its own. A row told in place keeps the instant it was
-    /// admitted at: the table's row and the row read back from the object
-    /// state the first one.
+    /// admitted at, by a relabel and by a resize: the table's row and the
+    /// row read back from the object state the first one.
     #[test]
     fn a_row_told_in_place_keeps_the_instant_it_was_admitted_at() {
         let (leader, standby) = (Replica::new(), Replica::new());
         leader.upsert(facts(1, "gold"));
         follow(&standby, &leader);
         let admitted = standby.one_row(A).admitted_at;
-        leader.upsert(facts(1, "iron"));
-        let (change, row) = told(&leader);
-        let mut row = row.expect("a row changed in place is told");
-        row.admitted_at += Duration::from_secs(5);
-        hand(&standby, 1, change, Some(row));
-        let row = standby.one_row(A);
-        assert_eq!((row.revision, row.admitted_at), (2, admitted));
+        let wider = WorkerFacts {
+            dp_size: 2,
+            ..facts(1, "iron")
+        };
+        for (revision, stated, resizes) in [(2, facts(1, "iron"), false), (3, wider, true)] {
+            leader.upsert(stated);
+            let (change, row) = told(&leader);
+            let resized = matches!(change, MembershipChange::Resized { .. });
+            assert_eq!(resized, resizes, "{change:?}");
+            let mut row = row.expect("a row changed in place is told");
+            row.admitted_at += Duration::from_secs(5);
+            hand(&standby, 1, change, Some(row));
+            let row = standby.one_row(A);
+            assert_eq!((row.revision, row.admitted_at), (revision, admitted));
+        }
     }
 
     /// An event the store does not take lays nothing: here one at an epoch
@@ -309,5 +349,43 @@ mod tests {
         assert_eq!(standby.object(B), None, "a row the cut drops");
         assert_eq!(standby.objects.len(), 1);
         assert_eq!(standby.objects.read_to(), Some(leader.store.epoch()));
+    }
+
+    /// A watch's snapshot is laid as a restore is, by the store's door for
+    /// a watch: its rows have their objects when it returns, and a row it
+    /// drops has none. A row that stands through a second snapshot keeps
+    /// the object it had.
+    #[test]
+    fn a_watch_snapshots_rows_have_their_objects_when_it_returns() {
+        let (told, watching) = (Replica::new(), Replica::new());
+        let other = || WorkerFacts {
+            key: B.to_owned(),
+            engine: B.to_owned(),
+            ..facts(1, "gold")
+        };
+        watching.upsert(other());
+        told.upsert(facts(1, "gold"));
+        let (store, objects) = (&watching.store, &watching.objects);
+        assert!(objects.watch_from(store, told.store.checkpoint()));
+        let stands = || {
+            let id = watching
+                .object(A)
+                .expect("the snapshot's row has its object");
+            (
+                objects.row_of(&id),
+                objects.registry().get(&id).expect("it stands"),
+            )
+        };
+        let (row, stood) = stands();
+        assert_eq!(row, told.store.by_key(A));
+        assert_eq!(watching.object(B), None, "a row the snapshot drops");
+        assert_eq!(objects.len(), 1);
+        // A second snapshot, with one row more.
+        told.upsert(other());
+        assert!(objects.watch_from(store, told.store.checkpoint()));
+        assert!(Arc::ptr_eq(&stood, &stands().1), "the object that stood");
+        assert!(watching.object(B).is_some(), "the row the snapshot brings");
+        assert_eq!(objects.len(), 2);
+        assert_eq!(objects.read_to(), Some(told.store.epoch()));
     }
 }

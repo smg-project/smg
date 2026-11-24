@@ -10,13 +10,13 @@
 //!
 //! The sheets live beside this target, in `tests/classic/sheets`, with the
 //! notes on their rows, and each recorder is a test module of the gateway
-//! crate beside the code it runs. Every run of the suite with the `ingest`,
+//! crate beside the code it runs. Every run of the suite with the
 //! `in-process` and `worker-host` features replays every row of each sheet
 //! that has a
 //! module here. A few rows of each form are copied into the policy's module
 //! from its sheet as well, and the replay holds every copied row to the
 //! sheet's row of its name. A row's reports reach the view through the
-//! `ingest` feature's row builder, and the three hard-demand modules decide
+//! crate's row builder, and the three hard-demand modules decide
 //! over worker objects, which `in-process` brings: a bare test run of the
 //! crate builds no part of this target and replays no recorded row.
 //!
@@ -53,6 +53,10 @@
 //! where a prefill that holds the admission's bound has an open partner or
 //! has none. Its sheet is its own and its replay the pair-select module's,
 //! answer for answer.
+//! A pair-runtime row is a pair-select row on the wire that carries one
+//! runtime's request, where the workers of one known runtime stand beside
+//! workers of another or of none. Its sheet is its own too, and its replay
+//! the pair-select module's, answer for answer.
 //! No row is decided differently but where its module names it. The prefix
 //! hash module holds a recorded row that a key of whole blocks cannot
 //! decide as recorded to the outcome its entry gives. The sticky rank
@@ -96,6 +100,7 @@ mod classic {
     pub mod overload;
     pub mod pair_bound;
     pub mod pair_index;
+    pub mod pair_runtime;
     pub mod pair_select;
     pub mod power_of_two;
     pub mod prefix_hash;
@@ -316,10 +321,10 @@ const fn module<R: Recorded>(inline: &'static str) -> Module {
 /// workers a request may take or its refusal, so each module brings its
 /// own replay too, over one bed; their copied rows name each runtime by a
 /// token, or name none, and the pair index's rule holds them as well.
-/// A pair-bound row has the pair-select row's shape: its module names its
-/// own sheet and replays it by the pair-select module's replay, and holds a
-/// copied row whole.
-const MODULES: [Module; 17] = [
+/// A pair-bound row and a pair-runtime row have the pair-select row's
+/// shape: each module names its own sheet and replays it by the pair-select
+/// module's replay, and holds a copied row whole.
+const MODULES: [Module; 18] = [
     module::<classic::all_vetoed::Row>(classic::all_vetoed::INLINE),
     module::<classic::bucket::Row>(classic::bucket::INLINE),
     module::<classic::cache_aware::Row>(classic::cache_aware::INLINE),
@@ -365,6 +370,12 @@ const MODULES: [Module; 17] = [
         inline: classic::pair_index::INLINE,
         replay: classic::pair_index::replay_rows,
         copied: classic::pair_index::copied_row_defects,
+    },
+    Module {
+        policy: classic::pair_runtime::POLICY,
+        inline: classic::pair_runtime::INLINE,
+        replay: classic::pair_runtime::replay_rows,
+        copied: whole_row_defects,
     },
     Module {
         policy: classic::pair_select::POLICY,
@@ -1335,6 +1346,7 @@ fn every_json_file_of_the_directory_is_a_sheet_to_answer_for() {
             "overload.json",
             "pair-bound.json",
             "pair-index.json",
+            "pair-runtime.json",
             "pair-select.json",
             "power_of_two.json",
             "prefix_hash.json",

@@ -296,7 +296,10 @@ fn a_row_that_lacks_a_named_value_has_no_room() {
 
 /// The rule asks for load reports where a term reads one, or where it reads
 /// the sends a report ends. It asks for the request's size where it names
-/// it, and for nothing where it names the output limit, which a request
+/// it, and where a term prices the sends by their tokens: a send of text
+/// alone is counted by its text's bytes, which a host that can send a
+/// request on without reading its prompt states only where a stage asks.
+/// It asks for nothing where it names the output limit, which a request
 /// states. It is soft and row-wise, and it refuses by nothing a late report
 /// writes.
 #[test]
@@ -304,6 +307,8 @@ fn the_rule_needs_reports_where_a_term_reads_them_or_the_sends() {
     for (used, loads) in [
         (r#"{"load.resident_tokens":1}"#, true),
         (r#"{"sent.requests":1}"#, true),
+        (r#"{"sent.tokens":1}"#, true),
+        (r#"{"load.resident_tokens":1,"sent.tokens":1}"#, true),
         (
             r#"{"candidate.in_flight":1,"request.prompt_tokens":1}"#,
             false,
@@ -318,8 +323,9 @@ fn the_rule_needs_reports_where_a_term_reads_them_or_the_sends() {
         ));
         let filter = &policy.profiles()[0].filters[0];
         assert_eq!(filter.needs().loads, loads, "{used}");
-        let sized = used.contains("request.prompt_tokens");
+        let sized = used.contains("request.prompt_tokens") || used.contains("sent.tokens");
         assert_eq!(filter.needs().prompt_size, sized, "{used}");
+        assert_eq!(policy.needs().prompt_size, sized, "{used}, the document");
         assert!(filter.soft() && filter.row_wise() && !filter.refuses_by_reports());
     }
 }
@@ -478,6 +484,72 @@ fn a_sends_request_and_its_tokens_each_take_room_by_their_own_coefficient() {
     // Two hold 200 and 100. Under the tokens' coefficient the two requests
     // would hold 2, and the row would stay.
     send();
+    assert_eq!(kept(&policy, 0, &request(0), &rows), [1]);
+}
+
+/// A send of text alone takes room by its bytes over four, the size the
+/// request's own term reads of such a request. The rule is the guide's:
+/// what the row holds, what was sent to it, and what the request brings.
+#[test]
+fn a_send_of_text_alone_takes_room_by_its_bytes_over_four() {
+    let policy = policy(
+        r#"{"has-room":{"used":{"load.resident_tokens":1,"sent.tokens":1,
+            "request.prompt_tokens":1},"capacity":1000}}"#,
+    );
+    let rows = [row(0, 800), row(1, 0)];
+    // A request of text alone states no token count: its 404 bytes read
+    // as 101, and 800 resident with them are under the thousand.
+    let text = RequestFacts {
+        prompt_bytes: 404,
+        ..request(0)
+    };
+    assert_eq!(kept(&policy, 0, &text, &rows), [0, 1]);
+    // The same text is sent to the first row, behind its report's sample.
+    let lease = Lease {
+        issued_micros: NOW + 1,
+        bytes: 404,
+        ..Lease::default()
+    };
+    let target = Target {
+        id: rows[0].id,
+        ..Target::default()
+    };
+    policy.on_dispatched(&lease, &target, Side::Single, 0);
+    // 800 resident, the send's 101 and the request's 101 are over it.
+    assert_eq!(kept(&policy, 0, &text, &rows), [1]);
+}
+
+/// A rule that prices the sends by their tokens and names no size of the
+/// request still asks its host for each request's size: the send of a
+/// request of text alone is counted by its text's bytes, and a host that
+/// can send a request on without reading its prompt states them only where
+/// a stage of the document asks. Under such a rule a send of text takes
+/// room, and a rule that counts the sends alone asks for no size.
+#[test]
+fn a_rule_that_prices_the_sends_by_their_tokens_asks_for_each_requests_size() {
+    let policy = policy(
+        r#"{"has-room":{"used":{"load.resident_tokens":1,"sent.tokens":1},"capacity":1000}}"#,
+    );
+    assert!(policy.needs().prompt_size, "the document asks for the size");
+    let counted = self::policy(r#"{"has-room":{"used":{"sent.requests":1},"capacity":10}}"#);
+    assert!(
+        !counted.needs().prompt_size,
+        "a count of sends reads no size"
+    );
+    let rows = [row(0, 900), row(1, 0)];
+    assert_eq!(kept(&policy, 0, &request(0), &rows), [0, 1]);
+    // 404 bytes of text are sent to the first row: 900 resident and the
+    // send's 101 are over the thousand.
+    let lease = Lease {
+        issued_micros: NOW + 1,
+        bytes: 404,
+        ..Lease::default()
+    };
+    let target = Target {
+        id: rows[0].id,
+        ..Target::default()
+    };
+    policy.on_dispatched(&lease, &target, Side::Single, 0);
     assert_eq!(kept(&policy, 0, &request(0), &rows), [1]);
 }
 

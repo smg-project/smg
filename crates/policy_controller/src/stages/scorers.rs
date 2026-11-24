@@ -32,7 +32,7 @@ use crate::{
         lifecycle::Lifecycle,
     },
     tracking::{
-        dispatch_credit::{CreditedDispatches, DispatchCounts, DispatchCredit},
+        dispatch_credit::{DispatchCounts, DispatchCredit},
         in_flight::{with_counts, Pieces, PoolInFlightCounts, WorkerSlot},
         lease::{EventKind, EventSet, Lease, Membership, Outcome, ReleaseReason, Side, Signal},
     },
@@ -404,6 +404,20 @@ pub(crate) struct RankCredit {
     /// one without the other for the dispatch in flight, and across a
     /// retirement for its batch.
     unsized_held: AtomicU16,
+    /// The estimates of the held dispatches that stated no size, summed:
+    /// what a reader that prices such a send by its text adds to the
+    /// stated token-work ([`Self::counts_through`]). A word of its own,
+    /// kept as the count beside it is: raised behind the held word at a
+    /// record, and lowered ahead of it at a release and at a retirement,
+    /// whose subtraction from the held word is a `Release`. A read loads
+    /// the held word with `Acquire` and this one behind it. Across a
+    /// record it may see a dispatch in one word and not in the other: its
+    /// request without its estimate, or the estimate of a dispatch that
+    /// landed behind the read of the held word. Across a release or a
+    /// retirement it may miss the estimate of a dispatch the held word
+    /// still counts, and reads that send at no tokens: it never adds the
+    /// estimate of a dispatch the held word has let go.
+    estimated_held: AtomicU64,
     /// The lowest of the lanes' front instants; `u64::MAX` when none. A
     /// dispatch lowers it under its lane's lock; a release recomputes it
     /// under every lane's lock, so it never reads above any lane's front.
@@ -460,14 +474,85 @@ impl Default for Told {
     }
 }
 
-/// A lane's dispatches: the instant and the token-work of each, oldest
-/// first. The one type that holds them: a record holds a dispatch here, and
-/// a release and a retirement let the oldest go. Its lane's lock guards it.
+/// What a lane holds of one dispatch's size: the tokens its lease stated,
+/// or, for a lease that stated none, an estimate of them. The mark of an
+/// estimate is the top bit of the size's own 32, so a size is held under
+/// that bit at the write, stated or estimated: a size of 2^31 and more is
+/// held as the largest under it. A stated one is then neither read as an
+/// estimate nor taken out of the estimates' word.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SendSize(u32);
+
+impl SendSize {
+    /// The mark of an estimate.
+    const ESTIMATE: u32 = 1 << 31;
+    /// The largest size held, stated or estimated.
+    const MOST: u32 = Self::ESTIMATE - 1;
+
+    /// A dispatch whose lease stated `tokens`. One of no tokens stated no
+    /// size: it is held as an estimate of none.
+    pub(crate) const fn stated(tokens: u32) -> Self {
+        match tokens {
+            0 => Self(Self::ESTIMATE),
+            tokens if tokens > Self::MOST => Self(Self::MOST),
+            tokens => Self(tokens),
+        }
+    }
+
+    /// A dispatch whose lease stated no token count, at `estimate` tokens.
+    pub(crate) const fn estimated(estimate: u32) -> Self {
+        let held = if estimate > Self::MOST {
+            Self::MOST
+        } else {
+            estimate
+        };
+        Self(Self::ESTIMATE | held)
+    }
+
+    /// The size of `lease`'s dispatch in a count of sends: the tokens it
+    /// states, and for a lease that states none its text's bytes over four
+    /// as an estimate ([`Lease::prompt_size`]). A lease a frame's one count
+    /// made states that count.
+    pub(crate) const fn of(lease: &Lease) -> Self {
+        match lease.tokens {
+            0 => Self::estimated(lease.prompt_size()),
+            tokens => Self::stated(tokens),
+        }
+    }
+
+    /// Whether the dispatch stated no size.
+    const fn is_unsized(self) -> bool {
+        self.0 & Self::ESTIMATE != 0
+    }
+
+    /// The tokens the dispatch stated: none for one that stated no size.
+    const fn tokens(self) -> u32 {
+        if self.is_unsized() {
+            0
+        } else {
+            self.0
+        }
+    }
+
+    /// The estimate of a dispatch that stated no size: none for one that
+    /// stated its size.
+    const fn estimate(self) -> u32 {
+        if self.is_unsized() {
+            self.0 & Self::MOST
+        } else {
+            0
+        }
+    }
+}
+
+/// A lane's dispatches: the instant and the size of each, oldest first.
+/// The one type that holds them: a record holds a dispatch here, and a
+/// release and a retirement let the oldest go. Its lane's lock guards it.
 #[derive(Debug, Default)]
-struct Dispatches(VecDeque<(u64, u32)>);
+struct Dispatches(VecDeque<(u64, SendSize)>);
 
 impl Dispatches {
-    /// Holds one dispatch of `tokens` made at `at_micros`, and says whether
+    /// Holds one dispatch of `size` made at `at_micros`, and says whether
     /// it is the oldest held now.
     ///
     /// It lands at its instant's place: a dispatch that waited for a
@@ -476,14 +561,14 @@ impl Dispatches {
     /// lane from its oldest. Instants mostly rise, so the newest is asked
     /// first: a dispatch no older than it is a push, and the place is
     /// searched for the one that is.
-    fn hold(&mut self, at_micros: u64, tokens: u32) -> bool {
+    fn hold(&mut self, at_micros: u64, size: SendSize) -> bool {
         let newest = self.0.back().map(|&(held_at, _)| held_at);
         if newest.is_some_and(|newest| newest > at_micros) {
             let at = self.0.partition_point(|&(held_at, _)| held_at <= at_micros);
-            self.0.insert(at, (at_micros, tokens));
+            self.0.insert(at, (at_micros, size));
             at == 0
         } else {
-            self.0.push_back((at_micros, tokens));
+            self.0.push_back((at_micros, size));
             newest.is_none()
         }
     }
@@ -494,15 +579,15 @@ impl Dispatches {
     }
 
     /// Lets the oldest dispatch go where it was made at or before
-    /// `through_micros`, and hands back its token-work. A retirement lets
-    /// it go whenever it was made.
-    fn let_go(&mut self, through_micros: u64) -> Option<u32> {
-        let &(at, tokens) = self.0.front()?;
+    /// `through_micros`, and hands back its size. A retirement lets it go
+    /// whenever it was made.
+    fn let_go(&mut self, through_micros: u64) -> Option<SendSize> {
+        let &(at, size) = self.0.front()?;
         if at > through_micros {
             return None;
         }
         self.0.pop_front();
-        Some(tokens)
+        Some(size)
     }
 
     /// How many dispatches it holds.
@@ -569,19 +654,18 @@ impl HeldCredit {
         tokens: 0,
         requests: 0,
     };
+}
 
-    /// The pair a stage reads ([`DispatchCreditPass::counts`]). The requests
-    /// are the word's low [`REQUEST_BITS`] bits, so the narrower type cuts none
-    /// of them.
-    ///
-    /// [`DispatchCreditPass::counts`]: crate::tracking::dispatch_credit::DispatchCreditPass::counts
-    #[inline(always)]
-    pub(crate) const fn counts(self) -> DispatchCounts {
-        DispatchCounts {
-            requests: self.requests as u32,
-            tokens: self.tokens,
-        }
-    }
+/// The three numbers a row's read hands a stage that prices a send of no
+/// stated size itself ([`RankCredit::sent_through`]): three loads a row.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SentCredit {
+    /// The held dispatches.
+    pub(crate) requests: u32,
+    /// The token-work of the held dispatches that stated a size.
+    pub(crate) tokens: u64,
+    /// How many of the held dispatches stated no size.
+    pub(crate) unsized_requests: u32,
 }
 
 thread_local! {
@@ -629,6 +713,7 @@ impl Default for RankCredit {
         Self {
             held: AtomicU64::new(0),
             unsized_held: AtomicU16::new(0),
+            estimated_held: AtomicU64::new(0),
             oldest_micros: AtomicU64::new(u64::MAX),
             retiring: Mutex::new(()),
             lanes: Default::default(),
@@ -644,9 +729,10 @@ impl RankCredit {
         u64::from(tokens) << REQUEST_BITS | 1
     }
 
-    /// Holds one dispatch of `tokens` made at `at_micros`. A dispatch of no
-    /// tokens is counted as a send of no stated size.
-    pub(crate) fn record(&self, at_micros: u64, tokens: u32) {
+    /// Holds one dispatch of `size` made at `at_micros`. A dispatch that
+    /// stated no size is counted as one, and its estimate is kept beside
+    /// the stated token-work.
+    pub(crate) fn record(&self, at_micros: u64, size: SendSize) {
         // Past the bound the row's oldest batch retires before this dispatch
         // lands, by instant across the lanes: the newest credits stay,
         // whichever lane holds them, past a partial release.
@@ -656,10 +742,13 @@ impl RankCredit {
         let lane = &self.lanes[lane_of_this_thread()];
         let mut dispatches = lane.dispatches.lock();
         // The lane's front moves only where the dispatch lands there.
-        let front = dispatches.hold(at_micros, tokens);
-        self.held.fetch_add(Self::weight(tokens), Ordering::Relaxed);
-        if tokens == 0 {
+        let front = dispatches.hold(at_micros, size);
+        self.held
+            .fetch_add(Self::weight(size.tokens()), Ordering::Relaxed);
+        if size.is_unsized() {
             self.unsized_held.fetch_add(1, Ordering::Relaxed);
+            self.estimated_held
+                .fetch_add(u64::from(size.estimate()), Ordering::Relaxed);
         }
         if front {
             lane.publish_oldest(&dispatches);
@@ -722,6 +811,7 @@ impl RankCredit {
         }
         let mut retired = 0;
         let mut unsized_retired = 0;
+        let mut estimates_retired = 0;
         for _ in 0..RETIRE_BATCH {
             // The lane whose front is the oldest; none when every lane is
             // empty.
@@ -733,13 +823,21 @@ impl RankCredit {
             let Some((_, i)) = oldest else {
                 break;
             };
-            if let Some(tokens) = held_lanes[i].let_go(u64::MAX) {
-                retired += Self::weight(tokens);
-                unsized_retired += u16::from(tokens == 0);
+            if let Some(size) = held_lanes[i].let_go(u64::MAX) {
+                retired += Self::weight(size.tokens());
+                unsized_retired += u16::from(size.is_unsized());
+                estimates_retired += u64::from(size.estimate());
             }
         }
+        self.estimated_held
+            .fetch_sub(estimates_retired, Ordering::Relaxed);
         self.unsized_held
             .fetch_sub(unsized_retired, Ordering::Relaxed);
+        // A case reads the row here, between the two writes.
+        #[cfg(test)]
+        if let Some(read) = tests::BETWEEN_A_RETIREMENTS_WRITES.get() {
+            read(self);
+        }
         // A `Release`, as a release's subtraction is: see `take_out`.
         self.held.fetch_sub(retired, Ordering::Release);
         for (dispatches, lane) in held_lanes.iter().zip(&self.lanes) {
@@ -755,43 +853,61 @@ impl RankCredit {
         sampled_at_micros > self.kept_of.load(Ordering::Acquire)
     }
 
-    /// The held token-work and requests once the dispatches made at or
-    /// before `through_micros` are released: a report sampled then
-    /// reflects them, or a time limit ends them. An instant that reaches
-    /// none of them reads the word alone. Inlined into a reader's row
-    /// loop: two loads and a compare a row, the release behind a call
-    /// that hands the held word back, so the loop keeps nothing of the
-    /// row across it.
+    /// The held requests and their tokens, stated or estimated, once the
+    /// dispatches made at or before `through_micros` are released: a
+    /// report sampled then reflects them, or a time limit ends them. What
+    /// a document's `sent.` terms read: a send that stated no token count
+    /// adds its estimate. Inlined into a reader's row loop: three loads
+    /// and a compare a row, the row's oldest instant, the held word and
+    /// the estimates' word, with the release behind a call. The held word
+    /// is loaded with `Acquire`, against the `Release` of a release's and
+    /// a retirement's subtraction: the estimates are read as they stood at
+    /// that write or later, so no read adds the estimate of a dispatch
+    /// the held word has let go, on any target.
     #[inline(always)]
-    pub(crate) fn credit_through(&self, through_micros: u64) -> HeldCredit {
-        if self.reaches(through_micros) {
-            return Self::credit_of(self.release_through(through_micros));
-        }
-        self.held_credit()
-    }
-
-    /// [`Self::credit_through`] with the count of the held dispatches of
-    /// no tokens: a third load. The held word is loaded with `Acquire`,
-    /// against the `Release` of a release's and a retirement's
-    /// subtraction: the count is read as it stood at that write or later,
-    /// so no read finds more dispatches of no tokens than dispatches
-    /// across a release, on any target.
-    #[inline(always)]
-    pub(crate) fn sent_through(&self, through_micros: u64) -> CreditedDispatches {
+    pub(crate) fn counts_through(&self, through_micros: u64) -> DispatchCounts {
         if self.reaches(through_micros) {
             self.release_through(through_micros);
         }
         let held = self.held.load(Ordering::Acquire);
-        CreditedDispatches {
+        DispatchCounts {
+            // The word's low bits: the narrower type cuts none of them.
+            requests: (held & REQUEST_MASK) as u32,
+            tokens: (held >> REQUEST_BITS) + self.estimated(),
+        }
+    }
+
+    /// The held requests and stated token-work of [`Self::counts_through`]
+    /// with the count of the held dispatches of no tokens in the
+    /// estimates' place: three loads too. The held word is loaded with
+    /// `Acquire`, against the `Release` of a release's and a retirement's
+    /// subtraction: the count is read as it stood at that write or later,
+    /// so no read finds more dispatches of no tokens than dispatches
+    /// across a release, on any target.
+    #[inline(always)]
+    pub(crate) fn sent_through(&self, through_micros: u64) -> SentCredit {
+        if self.reaches(through_micros) {
+            self.release_through(through_micros);
+        }
+        let held = self.held.load(Ordering::Acquire);
+        SentCredit {
             requests: (held & REQUEST_MASK) as u32,
             tokens: held >> REQUEST_BITS,
             unsized_requests: u32::from(self.unsized_held.load(Ordering::Relaxed)),
         }
     }
 
-    /// Calls `each` with the instant and the tokens of every dispatch the
-    /// row holds once those made at or before `through_micros` are
-    /// released: the dispatches [`Self::credit_through`] counts. Lane by
+    /// The estimates of the held dispatches that stated no size, as the
+    /// word stands: read behind the held word ([`Self::estimated_held`]).
+    #[inline(always)]
+    pub(crate) fn estimated(&self) -> u64 {
+        self.estimated_held.load(Ordering::Relaxed)
+    }
+
+    /// Calls `each` with the instant and the stated tokens of every
+    /// dispatch the row holds once those made at or before
+    /// `through_micros` are released: the dispatches
+    /// [`Self::counts_through`] counts. Lane by
     /// lane, oldest first within a lane. The release and the calls run
     /// under one hold of every lane's lock, so the row stands still from
     /// the release on: no dispatch made at or before the instant lands
@@ -809,8 +925,8 @@ impl RankCredit {
         if self.reaches(through_micros) {
             self.release_held(&mut held_lanes, through_micros);
         }
-        for &(at_micros, tokens) in held_lanes.iter().flat_map(|dispatches| &dispatches.0) {
-            each(at_micros, tokens);
+        for &(at_micros, size) in held_lanes.iter().flat_map(|dispatches| &dispatches.0) {
+            each(at_micros, size.tokens());
         }
     }
 
@@ -872,8 +988,8 @@ impl RankCredit {
             self.release_marked(held_lanes, sampled_at_micros);
         } else {
             for (dispatches, lane) in held_lanes.iter_mut().zip(&self.lanes) {
-                while let Some(tokens) = dispatches.let_go(sampled_at_micros) {
-                    self.take_out(tokens);
+                while let Some(size) = dispatches.let_go(sampled_at_micros) {
+                    self.take_out(size.tokens());
                 }
                 lane.publish_oldest(dispatches);
             }
@@ -888,9 +1004,9 @@ impl RankCredit {
     }
 
     /// The release of a row that holds a dispatch of no tokens: each one
-    /// that goes leaves that count first and the held word next, so a
-    /// read that crosses the release misses the price of one dispatch at
-    /// most.
+    /// that goes leaves the estimates' word and that count first and the
+    /// held word next, so a read that crosses the release misses the
+    /// price of one dispatch at most.
     #[cold]
     #[inline(never)]
     fn release_marked(
@@ -899,11 +1015,13 @@ impl RankCredit {
         sampled_at_micros: u64,
     ) {
         for (dispatches, lane) in held_lanes.iter_mut().zip(&self.lanes) {
-            while let Some(tokens) = dispatches.let_go(sampled_at_micros) {
-                if tokens == 0 {
+            while let Some(size) = dispatches.let_go(sampled_at_micros) {
+                if size.is_unsized() {
+                    self.estimated_held
+                        .fetch_sub(u64::from(size.estimate()), Ordering::Relaxed);
                     self.unsized_held.fetch_sub(1, Ordering::Relaxed);
                 }
-                self.take_out(tokens);
+                self.take_out(size.tokens());
             }
             lane.publish_oldest(dispatches);
         }
@@ -928,6 +1046,13 @@ impl RankCredit {
             self.held_credit(),
             self.unsized_held.load(Ordering::Relaxed),
         )
+    }
+
+    /// The row's three words as they stand: the stated token-work, the
+    /// requests, the sends of no stated size and their estimates.
+    pub(crate) fn words_for_test(&self) -> (u64, u64, u16, u64) {
+        let (HeldCredit { tokens, requests }, unsized_held) = self.held_for_test();
+        (tokens, requests, unsized_held, self.estimated())
     }
 
     /// One retirement, as a dispatch that read the bound runs it.
@@ -1036,14 +1161,16 @@ impl Credits {
     }
 
     /// Credits the rank a dispatch landed on. `credit` is handed the
-    /// rank's entry with the dispatch's instant and the tokens its lease
-    /// states, zero where it states none, and records it
-    /// ([`RankCredit::record`]). A count of sends records the zero, a
-    /// profile's and the one a `least-load` built by hand keeps: the
-    /// entry counts the send as one of no stated size, and each reader
-    /// prices it. `resident-work` keeps a tally of its own and records its
-    /// mean there: a credit of no tokens would read its worker as free
-    /// until that worker's next report. It records the dispatch under the
+    /// rank's entry with the dispatch's instant and its size
+    /// ([`SendSize::of`]): the tokens its lease states, and where it
+    /// states none its text's bytes over four as an estimate. `credit`
+    /// records it ([`RankCredit::record`]). A count of sends records the
+    /// size as it is, a profile's and the one a `least-load` built by
+    /// hand keeps: the entry counts a send of no stated tokens as one of
+    /// no stated size and keeps its estimate, and each reader prices it.
+    /// `resident-work` keeps a tally of its own and records its mean
+    /// there: a credit of no tokens would read its worker as free until
+    /// that worker's next report. It records the dispatch under the
     /// report it was told, as it keeps the rank's number.
     ///
     /// A rank the tally does not know is entered only where `present`
@@ -1057,7 +1184,7 @@ impl Credits {
         side: Side,
         since_decision_micros: u32,
         present: impl FnOnce() -> bool,
-        credit: impl FnOnce(&RankCredit, u64, u32),
+        credit: impl FnOnce(&RankCredit, u64, SendSize),
     ) {
         // The decode side of a pair target is the pair's decode rank; the
         // target itself is the prefill. The credit dates from the dispatch,
@@ -1074,14 +1201,14 @@ impl Credits {
         // dispatch to a rank enters it (another dispatch may have entered it
         // meanwhile: the entry the map holds is the one credited).
         if let Some(since) = self.tally.load().get(&rank) {
-            credit(since, dispatched_micros, lease.tokens);
+            credit(since, dispatched_micros, SendSize::of(lease));
             return;
         }
         if !present() {
             return;
         }
         if let Some(since) = self.entry(rank) {
-            credit(&since, dispatched_micros, lease.tokens);
+            credit(&since, dispatched_micros, SendSize::of(lease));
         }
     }
 
@@ -1674,15 +1801,15 @@ impl Lifecycle for ResidentWork {
             side,
             since_decision_micros,
             || true,
-            |since, at_micros, stated| {
+            |since, at_micros, size| {
                 // The stage's own tally holds a send of no stated size at
                 // the stage's mean.
-                let tokens = match stated {
+                let tokens = match size.tokens() {
                     0 => self.mean_prefill_tokens,
                     stated => stated,
                 };
                 let told = since.told.lock();
-                since.record(at_micros, tokens);
+                since.record(at_micros, SendSize::stated(tokens));
                 // A number is kept from its report's first decision on:
                 // ahead of it a dispatch writes none.
                 if since.kept_of.load(Ordering::Relaxed) == u64::MAX {
@@ -2091,10 +2218,13 @@ impl Scorer for LeastCostWithDispatches {
     }
 
     // A report ends the sends before it, so the sends need the reports
-    // though no term may read one.
+    // though no term may read one. A term that prices the sends by their
+    // tokens needs each request's size stated: a send of text alone is
+    // counted by its text's bytes.
     fn needs(&self) -> Needs {
         Needs {
             loads: true,
+            prompt_size: self.cost.terms.sizes_sends(),
             ..Needs::default()
         }
     }
@@ -2188,11 +2318,13 @@ impl Scorer for LeastCostSignals {
     }
 
     // A report ends the sends before it, so the sends need the reports
-    // though no term may read one. The cells stand beside the rows of a
-    // profile whose stage says it reads a signal.
+    // though no term may read one. A term that prices the sends by their
+    // tokens needs each request's size stated. The cells stand beside the
+    // rows of a profile whose stage says it reads a signal.
     fn needs(&self) -> Needs {
         Needs {
             loads: self.cost.loads || self.sent.is_some(),
+            prompt_size: self.cost.terms.sizes_sends(),
             signal_cells: true,
             ..Needs::default()
         }
@@ -2361,6 +2493,14 @@ pub(crate) mod tests {
     /// The dispatches that waited for a retirement in progress; the retire
     /// path counts them under test alone.
     pub(crate) static RETIRE_WAITS: AtomicUsize = AtomicUsize::new(0);
+
+    thread_local! {
+        /// What a case runs on its own thread between a retirement's two
+        /// writes, behind the estimates' and the count's and ahead of the
+        /// held word's: the row as a read finds it there.
+        pub(crate) static BETWEEN_A_RETIREMENTS_WRITES: Cell<Option<fn(&RankCredit)>> =
+            const { Cell::new(None) };
+    }
 
     use std::sync::atomic::AtomicBool;
 
@@ -3021,6 +3161,31 @@ pub(crate) mod tests {
         );
     }
 
+    /// A dispatch of text alone states no size to the resident-work stage
+    /// either: it is credited at the stage's mean prefill, and nothing is
+    /// read of its text's bytes.
+    #[test]
+    fn resident_work_credits_a_dispatch_of_text_alone_at_its_mean_prefill() {
+        let rw = ResidentWork::new(1_000);
+        let mut pool = [candidate(0, 0), candidate(1, 0)];
+        pool[0].load = Some(resident(1, 2_000));
+        pool[0].load_sampled_at_micros = 1_000;
+        pool[1].load = Some(resident(1, 4_000));
+        pool[1].load_sampled_at_micros = 1_000;
+        // 40 bytes of text: 10 tokens by the bytes over four.
+        let text = Lease {
+            issued_micros: 2_000,
+            bytes: 40,
+            ..Lease::default()
+        };
+        rw.on_dispatched(&text, &target_of(&pool[0]), Side::Single, 0);
+        assert_eq!(
+            resident_scores(&rw, &pool),
+            [0.0, 1.0],
+            "2,000 + the mean's 1,024 + 1,000 for each of two requests, against 5,000"
+        );
+    }
+
     /// A report releases the dispatches it reflects whether or not the score
     /// reads their credit. A rank whose report counts no resident tokens
     /// scores from its peers, and holds a dispatch only until a report
@@ -3063,22 +3228,24 @@ pub(crate) mod tests {
         let mut dispatches = Dispatches::default();
         assert_eq!(dispatches.oldest(), None);
         // The first held is the oldest. A later one is not.
-        assert!(dispatches.hold(20, 2));
-        assert!(!dispatches.hold(30, 3));
+        assert!(dispatches.hold(20, SendSize::stated(2)));
+        assert!(!dispatches.hold(30, SendSize::stated(3)));
         // One dated earlier is the oldest now.
-        assert!(dispatches.hold(10, 1));
+        assert!(dispatches.hold(10, SendSize::stated(1)));
         // One dated between lands between, one at a held instant behind it.
-        assert!(!dispatches.hold(25, 4));
-        assert!(!dispatches.hold(20, 5));
+        assert!(!dispatches.hold(25, SendSize::stated(4)));
+        assert!(!dispatches.hold(20, SendSize::stated(5)));
         assert_eq!((dispatches.oldest(), dispatches.len()), (Some(10), 5));
         // The oldest stays while the instant is before it and goes at its
         // own instant. The next stays one microsecond short of its own.
         assert_eq!(dispatches.let_go(9), None);
-        assert_eq!(dispatches.let_go(10), Some(1));
+        assert_eq!(dispatches.let_go(10), Some(SendSize::stated(1)));
         assert_eq!(dispatches.let_go(19), None);
         assert_eq!(dispatches.oldest(), Some(20));
         // Oldest first, and of one instant the earlier held first.
-        let gone: Vec<u32> = std::iter::from_fn(|| dispatches.let_go(u64::MAX)).collect();
+        let gone: Vec<u32> = std::iter::from_fn(|| dispatches.let_go(u64::MAX))
+            .map(SendSize::tokens)
+            .collect();
         assert_eq!(gone, [2, 5, 4, 3]);
         assert_eq!((dispatches.oldest(), dispatches.len()), (None, 0));
     }
@@ -3285,7 +3452,7 @@ pub(crate) mod tests {
         for _ in 0..32 {
             let row = RankCredit::default();
             for at in 1..=HELD {
-                row.record(at, 0);
+                row.record(at, SendSize::stated(0));
             }
             let crossed = std::thread::scope(|s| {
                 let release = s.spawn(|| row.sent_through(HELD));
@@ -3309,6 +3476,163 @@ pub(crate) mod tests {
         }
     }
 
+    /// The estimates' word goes down ahead of the held word at each
+    /// dispatch a release lets go, so a read of the documents' two numbers
+    /// that crosses the release adds no estimate of a dispatch the held
+    /// word has let go. Every dispatch here is an estimate of three
+    /// tokens: no read finds more than three tokens a dispatch. The rounds
+    /// go on until a read lands inside a release, a few at most.
+    #[test]
+    fn a_read_across_a_release_adds_no_estimate_of_a_dispatch_let_go() {
+        const HELD: u64 = 6_000;
+        const EACH: u32 = 3;
+        for _ in 0..32 {
+            let row = RankCredit::default();
+            for at in 1..=HELD {
+                row.record(at, SendSize::estimated(EACH));
+            }
+            let crossed = std::thread::scope(|s| {
+                let release = s.spawn(|| row.counts_through(HELD));
+                let mut crossed = false;
+                while !release.is_finished() {
+                    // An instant ahead of every dispatch releases none.
+                    let read = row.counts_through(0);
+                    assert!(
+                        read.tokens <= u64::from(EACH) * u64::from(read.requests),
+                        "{} estimated tokens beside {} dispatches",
+                        read.tokens,
+                        read.requests
+                    );
+                    crossed |= read.requests != 0 && u64::from(read.requests) != HELD;
+                }
+                crossed
+            });
+            if crossed {
+                return;
+            }
+        }
+    }
+
+    /// The estimates' word goes down ahead of the held word at a
+    /// retirement too. Every dispatch here is an estimate of three tokens,
+    /// and the dispatch past the row's bound retires a batch. A read of
+    /// the documents' two numbers between the retirement's two writes
+    /// finds the held word still counting the batch and no more than three
+    /// tokens a dispatch: it adds no estimate of a dispatch the held word
+    /// has let go.
+    #[test]
+    fn a_read_between_a_retirements_writes_adds_no_estimate_of_a_dispatch_let_go() {
+        const EACH: u32 = 3;
+        thread_local!(static READS: Cell<u32> = const { Cell::new(0) });
+        fn read(row: &RankCredit) {
+            // An instant ahead of every dispatch releases none.
+            let read = row.counts_through(0);
+            assert!(
+                read.tokens <= u64::from(EACH) * u64::from(read.requests),
+                "{} estimated tokens beside {} dispatches",
+                read.tokens,
+                read.requests
+            );
+            READS.set(READS.get() + 1);
+        }
+        let row = RankCredit::default();
+        for at in 1..=RANK_CREDIT_KEPT {
+            row.record(at, SendSize::estimated(EACH));
+        }
+        BETWEEN_A_RETIREMENTS_WRITES.set(Some(read));
+        row.record(RANK_CREDIT_KEPT + 1, SendSize::estimated(EACH));
+        BETWEEN_A_RETIREMENTS_WRITES.set(None);
+        assert_eq!(READS.get(), 1, "one retirement, read between its writes");
+        let kept = RANK_CREDIT_KEPT - RETIRE_BATCH as u64 + 1;
+        let words = (0, kept, kept as u16, u64::from(EACH) * kept);
+        assert_eq!(row.words_for_test(), words);
+    }
+
+    /// A dispatch that states no tokens states no size: it is held as an
+    /// estimate of none, among the sends of no stated size.
+    #[test]
+    fn a_stated_size_of_no_tokens_is_held_as_a_send_of_no_stated_size() {
+        assert_eq!(SendSize::stated(0), SendSize::estimated(0));
+        let row = RankCredit::default();
+        row.record(1, SendSize::stated(0));
+        assert_eq!(row.words_for_test(), (0, 1, 1, 0));
+    }
+
+    /// A size is held under the mark of an estimate, stated or estimated:
+    /// one at the mark's bit and one past it are held as the largest
+    /// under it. A stated one stays a stated one. It is not read as an
+    /// estimate, and its release takes it out of the held word and
+    /// leaves the estimates' word as it stands.
+    #[test]
+    fn a_size_at_the_marks_bit_is_held_under_it_and_in_its_own_word() {
+        const MOST: u64 = (1 << 31) - 1;
+        for size in [1u32 << 31, u32::MAX] {
+            let row = RankCredit::default();
+            row.record(1, SendSize::stated(size));
+            assert_eq!(row.words_for_test(), (MOST, 1, 0, 0), "stated {size}");
+            row.record(2, SendSize::estimated(size));
+            assert_eq!(row.words_for_test(), (MOST, 2, 1, MOST), "{size}");
+            // A report sampled at the first lets the stated one go alone.
+            let read = row.counts_through(1);
+            assert_eq!((read.requests, read.tokens), (1, MOST), "{size}");
+            assert_eq!(row.words_for_test(), (0, 1, 1, MOST), "{size}");
+            row.counts_through(2);
+            assert_eq!(row.words_for_test(), (0, 0, 0, 0), "{size}");
+        }
+    }
+
+    /// A lane that holds a stated size, an estimate and a stated size
+    /// reads back to nothing in each of the row's words, by a release and
+    /// by a retirement: an estimate goes with its dispatch. The
+    /// documents' read adds the estimate to the stated token-work, and
+    /// the read of a stage that prices such a send itself counts it and
+    /// adds none.
+    #[test]
+    fn a_mixed_lane_reads_back_to_nothing_by_a_release_and_by_a_retirement() {
+        let mixed = [
+            SendSize::stated(7),
+            SendSize::estimated(101),
+            SendSize::stated(5),
+        ];
+        let row = RankCredit::default();
+        for (at, size) in (1..).zip(mixed) {
+            row.record(at, size);
+        }
+        assert_eq!(row.words_for_test(), (12, 3, 1, 101));
+        // An instant ahead of every dispatch releases none.
+        let read = row.counts_through(0);
+        assert_eq!((read.requests, read.tokens), (3, 113));
+        let sent = row.sent_through(0);
+        assert_eq!((sent.requests, sent.tokens), (3, 12));
+        assert_eq!(sent.unsized_requests, 1);
+        // A release, one dispatch at a time.
+        row.counts_through(1);
+        assert_eq!(row.words_for_test(), (5, 2, 1, 101));
+        row.counts_through(2);
+        assert_eq!(row.words_for_test(), (5, 1, 0, 0));
+        row.counts_through(3);
+        assert_eq!(row.words_for_test(), (0, 0, 0, 0));
+
+        // A retirement: the row at its bound lets its oldest batch go, 86
+        // of the first size and 85 of each of the other two.
+        let row = RankCredit::default();
+        for at in 0..RANK_CREDIT_KEPT {
+            row.record(at + 1, mixed[(at % 3) as usize]);
+        }
+        assert_eq!(
+            row.words_for_test(),
+            (2_731 * 7 + 2_730 * 5, 8_192, 2_731, 2_731 * 101)
+        );
+        row.retire_for_test();
+        assert_eq!(
+            row.words_for_test(),
+            (2_645 * 12, 7_936, 2_646, 2_646 * 101),
+            "the oldest 256 went, each with its own word's share"
+        );
+        row.counts_through(u64::MAX);
+        assert_eq!(row.words_for_test(), (0, 0, 0, 0));
+    }
+
     /// A read of a row's dispatches whose instant is short of the row's
     /// oldest writes nothing of the row. A retirement leaves that instant
     /// where it was, below the oldest dispatch the row still holds: a read
@@ -3322,7 +3646,7 @@ pub(crate) mod tests {
         // batch ahead of its own landing.
         let (first, last) = (10, 10 + RANK_CREDIT_KEPT);
         for at in first..=last {
-            row.record(at, 1);
+            row.record(at, SendSize::stated(1));
         }
         let oldest_held = first + RETIRE_BATCH as u64;
         let held: Vec<u64> = (oldest_held..=last).collect();

@@ -19,6 +19,8 @@ use smg_policy_controller::{
     engine::{CacheIndexes, Members, PolicyEngine, WorkerData},
     stages::StageRegistry,
 };
+#[cfg(any(test, feature = "test-util"))]
+use smg_worker::load::state::LoadReceiver;
 use smg_worker::{
     connection::{
         engine::EngineConnector,
@@ -1161,6 +1163,33 @@ impl AppContextBuilder {
             let data = WorkerData {
                 registry: Arc::clone(registry) as Arc<dyn Members>,
                 loads: Some(monitor.subscribe()),
+                cache_indexes: None,
+            };
+            Self::start_policy_engine(spec, data, policies)?;
+        }
+        Ok(())
+    }
+
+    /// The policy engine's start for a bench, which builds no context and
+    /// keeps no load monitor: the start's own two steps, in their order and
+    /// with nothing added (`policy_in_force` over the stock stages, then
+    /// `start_policy_engine`), as [`Self::start_policy_engine_by_hand`] runs
+    /// them for a test. The engine is handed the bench's worker registry and
+    /// `loads`, the channel of the load feed the bench publishes where a
+    /// monitor would. A bench keeps no cache-event monitor, so the engine is
+    /// handed none. A configuration that leaves the policy controller off
+    /// starts nothing.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn start_policy_engine_for_bench(
+        config: &RouterConfig,
+        policies: &PolicyRegistry,
+        registry: &Arc<WorkerRegistry>,
+        loads: Option<LoadReceiver>,
+    ) -> Result<(), String> {
+        if let Some(spec) = Self::policy_in_force(config, None)? {
+            let data = WorkerData {
+                registry: Arc::clone(registry) as Arc<dyn Members>,
+                loads,
                 cache_indexes: None,
             };
             Self::start_policy_engine(spec, data, policies)?;

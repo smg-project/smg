@@ -1,5 +1,5 @@
 //! The standalone policy controller: its server, protocol and clients, leader
-//! election, replication to standbys and the drivers that read load from
+//! election, replication to standbys and the load monitor over its
 //! workers.
 //!
 //! `worker_follower` is the task a gateway follows a controller's worker

@@ -284,6 +284,7 @@ impl PairBuffers {
             prefill_signal_cells: self.prefill.cells(),
             decode_signal_cells: self.decode.cells(),
             table: PairTable::new(&self.ends, &self.listed),
+            ..PairPools::default()
         }
     }
 
@@ -2926,7 +2927,8 @@ impl Writer {
     /// Each pool's thresholds under the standing generation: those of the
     /// binding the pool is decided under, which is the first to match its
     /// model and its role's phase, or the model's pair binding for a
-    /// decode pool
+    /// decode pool, and for an encode pool where that binding's plan is
+    /// `epd`
     /// ([`Engine::pool_binding`](crate::engine::framework::Engine::pool_binding)).
     /// Whether any pool has a pair.
     fn bind(&mut self) -> bool {

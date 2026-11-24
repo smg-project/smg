@@ -254,12 +254,13 @@ impl HasRoomRule {
     }
 
     /// Whether a row has room, by its report as `load` hands it and its
-    /// sends as `sent` counts them: the requests and the stated tokens
-    /// ([`DispatchCreditPass::counts`]), or `None` where the rule reads no
-    /// count. The sum runs in name order: the count in flight, the report's
-    /// fields, the request's part as `asked` ([`Self::asked`]), the sends.
-    /// `within` says whether that sum is within the row's bound: the rule's own
-    /// test, or the signal form's behind its signals.
+    /// sends as `sent` counts them: the requests and their tokens, stated
+    /// or estimated ([`DispatchCreditPass::counts`]), or `None` where the
+    /// rule reads no count. The sum runs in name order: the count in
+    /// flight, the report's fields, the request's part as `asked`
+    /// ([`Self::asked`]), the sends. `within` says whether that sum is
+    /// within the row's bound: the rule's own test, or the signal form's
+    /// behind its signals.
     ///
     /// [`DispatchCreditPass::counts`]: crate::tracking::dispatch_credit::DispatchCreditPass::counts
     #[inline(always)]
@@ -394,12 +395,14 @@ impl Filter for HasRoomRule {
 
     // A report ends the sends before it, so the sends need the reports
     // though no term may read one. A rule that names the request's size
-    // needs it counted. The output limit asks nothing of a host: a request
-    // states it, or zero for none.
+    // needs it counted, and so does one that prices the sends by their
+    // tokens: a send of text alone is counted by its text's bytes. The
+    // output limit asks nothing of a host: a request states it, or zero
+    // for none.
     fn needs(&self) -> Needs {
         Needs {
             loads: self.loads || self.sent.is_some(),
-            prompt_size: self.request_tokens != 0.0,
+            prompt_size: self.request_tokens != 0.0 || self.terms.sizes_sends(),
             ..Needs::default()
         }
     }
@@ -763,15 +766,24 @@ impl Filter for NotTried {
 /// asks it about each row drawn: one call a row, where the filters' own
 /// `keep`s are a call a filter. A whole pass asks it about every row of
 /// the single plan's pool, in one loop where the filters are a loop each.
+///
+/// The set is the word a row is tested by. Each filter that reads a row's
+/// own bits names the bytes of the row's word ([`row_word`]) it refuses a
+/// row by, so the set asks all of them of a row in one compare.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct RowTests(u8);
+pub(crate) struct RowTests(u64);
 
 impl RowTests {
-    const HEALTHY: u8 = 1;
-    const NOT_OVERLOADED: u8 = 1 << 1;
-    const HAS_CAPACITY: u8 = 1 << 2;
-    const HAS_ROOM: u8 = 1 << 3;
-    const NOT_TRIED: u8 = 1 << 4;
+    /// Not healthy, the breaker open, stalled or draining: a byte each.
+    const HEALTHY: u64 = 0x0101_0101;
+    const NOT_OVERLOADED: u64 = 1 << 32;
+    const HAS_CAPACITY: u64 = 1 << 48;
+    const HAS_ROOM: u64 = 1 << 56;
+    /// A bit no row's word holds: this test reads the request's lists.
+    const NOT_TRIED: u64 = 1 << 1;
+    /// The bits of a row's word a row is kept by: a filter's other bits
+    /// refuse.
+    const KEPT_BY: u64 = 1 | Self::HAS_CAPACITY | Self::HAS_ROOM;
 
     /// `filters` as one set, where each is a filter of this file, known by
     /// its type. A host's own filter is no test the engine holds, one that
@@ -869,8 +881,10 @@ impl RowTests {
         self.0 & Self::HEALTHY != 0 && !cx.stalled.is_empty()
     }
 
-    /// Whether every filter of the set keeps the row, each by its own
-    /// `keep`. The health filter answers here for the row's own bits: the
+    /// Whether every filter of the set keeps the row, as each one's own
+    /// `keep` answers. The four that read a row's own bits are asked in
+    /// one compare of the row's word with the set, whatever the set holds.
+    /// The health filter answers here for the row's own bits: the
     /// host's mask, its other half, is the caller's to ask where
     /// [`RowTests::masked`] says a veto stands.
     #[inline(always)]
@@ -880,13 +894,30 @@ impl RowTests {
         c: &Candidate,
         cx: &Constraints<'_>,
     ) -> bool {
-        let holds = |test: u8| self.0 & test != 0;
-        (!holds(Self::HEALTHY) || OwnBits.keep(facts, c, cx))
-            && (!holds(Self::NOT_OVERLOADED) || NotOverloaded.keep(facts, c, cx))
-            && (!holds(Self::HAS_CAPACITY) || HasCapacity.keep(facts, c, cx))
-            && (!holds(Self::HAS_ROOM) || HasRoom.keep(facts, c, cx))
-            && (!holds(Self::NOT_TRIED) || NotTried.keep(facts, c, cx))
+        // The overload test asks nothing where the host lifted that veto.
+        let lifted = if cx.overload_lifted {
+            Self::NOT_OVERLOADED
+        } else {
+            0
+        };
+        (row_word(c) ^ Self::KEPT_BY) & self.0 & !lifted == 0
+            && (self.0 & Self::NOT_TRIED == 0 || NotTried.keep(facts, c, cx))
     }
+}
+
+/// The bits of a row that four filters of this file read, as one word: a
+/// byte a bit, in the row's own order. The byte between them that none of
+/// the four reads is read with them: the eight are one load.
+#[inline(always)]
+fn row_word(c: &Candidate) -> u64 {
+    u64::from(c.health.healthy)
+        | u64::from(c.health.breaker_open) << 8
+        | u64::from(c.health.stalled) << 16
+        | u64::from(c.health.draining) << 24
+        | u64::from(c.health.overloaded) << 32
+        | u64::from(c.session_hit) << 40
+        | u64::from(c.has_capacity) << 48
+        | u64::from(c.has_room) << 56
 }
 
 /// The five filters of this file a set names, by bit: what the cases of the
@@ -992,6 +1023,9 @@ mod tests {
                 ..candidate(position, 0)
             })
             .collect();
+        // The ready row holds the session hit: a flag of the row's word that
+        // none of these filters reads.
+        pool[0].session_hit = true;
         pool[1].health.healthy = false;
         pool[2].health.breaker_open = true;
         pool[3].health.stalled = true;

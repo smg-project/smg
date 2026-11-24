@@ -5,15 +5,15 @@
 
 use std::path::{Path, PathBuf};
 
+use rustls::crypto::ring;
 use tonic::transport::{Certificate, Identity, ServerTlsConfig};
 
 use super::config::Tls;
-use crate::load::ingest::probe;
 
-/// The process crypto provider, the one the HTTP client of the load driver's
-/// probe installs too: whichever comes first installs it, the other finds it.
+/// Installs the process crypto provider (ring) where none is installed yet:
+/// whichever caller comes first installs it, and the others find it.
 pub(crate) fn install_crypto_provider() {
-    probe::install_crypto_provider();
+    let _ = ring::default_provider().install_default();
 }
 
 /// A listener's TLS material, read.

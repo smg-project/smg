@@ -1,5 +1,4 @@
-//! A worker's load row from its report, shared by the load driver and a
-//! worker list's records.
+//! A worker's load row from its report, for a worker list's records.
 
 use std::{
     sync::Arc,

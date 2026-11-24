@@ -184,7 +184,9 @@ pub trait RequestMaker {
     /// record of sent prefixes, asks it of the pick's targets, best first,
     /// and stores the prompt for the first one answered `true`: for none
     /// where each is answered `false`, so neither names a worker the
-    /// request was not sent to.
+    /// request was not sent to. A pair's decode decided again asks it of
+    /// each target, and its maker answers for the target's decode alone:
+    /// the prefill a target names was sent already.
     ///
     /// It is asked behind the pick and ahead of the decision's lease,
     /// inside the decision: an answer asks the engine nothing. No other
@@ -279,7 +281,8 @@ pub enum WorkerLists<'a> {
     /// The host hands no list.
     #[default]
     None,
-    /// A single request's list.
+    /// A single request's list, and the one list of a request of another
+    /// phase that stands alone.
     Single(super::list_cell::LentList<'a>),
     /// A pair's two lists, its prefills and its decodes, with the pair
     /// classes of their workers and the host's reads of its admission.

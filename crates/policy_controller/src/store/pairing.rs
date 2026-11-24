@@ -154,8 +154,8 @@ type Offer<'a> = (bool, Option<&'a str>, &'a PairingDescriptor);
 /// never as strings: the C library's compare of two empty strings that
 /// hold no buffer takes a slow path (about 200 ns by a probe, where two
 /// strings of four bytes take 3). An engine kind is a kind's name, which
-/// the load ingest parses as written too, so it is read as written: a
-/// descriptor's free text is what the door normalizes.
+/// a worker object's builder parses as written too, so it is read as
+/// written: a descriptor's free text is what the door normalizes.
 pub(crate) fn known(runtime: &str) -> Option<&str> {
     (!runtime.is_empty()).then_some(runtime)
 }

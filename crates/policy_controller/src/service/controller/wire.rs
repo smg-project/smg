@@ -418,10 +418,6 @@ impl Checked {
             // What the leases book stands beside rows a view lent: no
             // frame carries it.
             lent_in_flight: None,
-            // The frame carries no count of the key's requests: the
-            // door hands the store's beside the rows, for a request
-            // whose rule has an in-flight cap.
-            lent_session_in_flight: None,
             session_counted: false,
             // The frame carries no signal cells: they stand beside the
             // candidates of the program that decides.
@@ -431,6 +427,9 @@ impl Checked {
             // as it learns it from the rows.
             ring: None,
             ring_positions: &[],
+            // No frame states where a key came from: a served controller's
+            // prefix ring places by any session key.
+            session_key_from_rid: false,
         }
     }
 

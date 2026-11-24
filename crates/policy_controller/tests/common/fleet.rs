@@ -6,8 +6,8 @@
 //! including binary names them `engines` and `net`).
 //!
 //! Every fact the store holds of an engine came from that engine, through a
-//! sink. Loads are the controller's own load driver's: the harness writes no
-//! load row. Health and KV events are the controller's own where its build
+//! sink. Loads are the controller's own load monitor's: the harness writes
+//! none. Health and KV events are the controller's own where its build
 //! has the `worker-host` feature: its prober and its feed are then the
 //! store's one writer of each, and the harness only listens. Its dialer
 //! ([`probe`]) asks each engine its wire's health check once an interval
@@ -21,7 +21,7 @@
 //!
 //! An engine speaks the wire of its kind ([`Shape::runtime`]): the fleet's
 //! first wire, or the one whose load report counts resident tokens. The
-//! controller's load driver polls each through that kind's own arm, the
+//! controller's load monitor polls each through that kind's own arm, the
 //! prober asks each its own health check, and the subscriber speaks the
 //! first wire alone.
 //!
@@ -59,7 +59,8 @@ use smg_grpc_client::{
 };
 use smg_policy_controller::{
     document::{AppliedSpec, PolicySpec},
-    engine::{fingerprint, LoadRow, Role, WireModes, WorkerId},
+    engine::{fingerprint, LoadRow, Role, SignalSource, WireModes, WorkerId},
+    load::load_row,
     service::{
         client::Client,
         controller::{
@@ -75,9 +76,8 @@ use smg_policy_controller::{
     stages::StageRegistry,
     store::{
         BatchFacts, BatchOutcome, GatewayId, HealthPolicy, HealthSink, KvCursor, KvEvent,
-        KvEventSink, LaneCounts, LeaseState, LoadSink, MembershipChange, MembershipTail,
-        MemoryStore, ResyncReason, SequenceHash, Signals, StoredBlock, WorkerFacts, WorkerStatus,
-        WorkersStore,
+        KvEventSink, LaneCounts, LeaseState, MembershipChange, MembershipTail, MemoryStore,
+        ResyncReason, SequenceHash, Signals, StoredBlock, WorkerFacts, WorkerStatus, WorkersStore,
     },
     tracking::LeaseId,
 };
@@ -114,7 +114,7 @@ pub const PROBE_INTERVAL: Duration = Duration::from_millis(500);
 /// every registration.
 pub const DIAL_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// How often the controller's load driver polls an engine.
+/// How often the controller's load monitor polls an engine.
 pub const POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Room for a loaded host on top of a wait's own timing.
@@ -206,6 +206,7 @@ pub struct Seen {
     pub engine: usize,
     pub rank: u16,
     pub healthy: bool,
+    /// The load monitor's newest report of the row, where it has one.
     pub load: Option<LoadRow>,
 }
 
@@ -866,7 +867,7 @@ fn decode(batch: &KvEventBatch) -> Vec<KvEvent> {
 /// through its rank's cursor into its row's index, with the header the
 /// batch carries, and a batch the sink did not apply leaves the blocks as
 /// they were. A batch that carries a load record alone is passed by, and
-/// its record is not written here: loads are the driver's. A snapshot chunk
+/// its record is not written here: loads are the monitor's. A snapshot chunk
 /// is a relay's: its start is a collector's word to every row of the
 /// engine, which this listener does not say, so a chunk is counted and
 /// passed by. Returns `false` at a gap the sink named.
@@ -1300,14 +1301,15 @@ impl Harness {
 
     /// How many of the fleet's ranks `standby`'s own store holds ready:
     /// what a controller that follows has of its leader's log. A row no
-    /// registration made is an error, and so is a load row: a leader sends
-    /// a standby none, and a standby polls nobody.
+    /// registration made is an error, and so is a load report: a leader
+    /// sends a standby none, and a standby polls nobody.
     pub fn followed(&self, standby: &Replica) -> Result<usize, String> {
         let cut = standby.store.checkpoint();
+        let reports = standby.loads.borrow();
         let mut held = 0;
         for row in &cut.rows {
-            if standby.store.ranks(row.id) > 0 {
-                return Err(format!("the standby holds a load row: {:?}", row.id));
+            if reports.report(&row.facts.key).is_some() {
+                return Err(format!("the standby holds a load report: {:?}", row.id));
             }
             if !self.members.contains_key(&row.id) {
                 return Err(format!(
@@ -1517,7 +1519,7 @@ impl Harness {
     /// Feed: starts the dialer and one subscriber an engine, over every
     /// engine registered now and later. Each stands in for a driver the
     /// controller's build does not have. Loads need no start: the
-    /// controller's own driver polls every ready engine.
+    /// controller's own load monitor polls every ready engine.
     pub fn feed(&mut self) {
         self.feeds.spawn(probe(
             Arc::clone(&self.store),
@@ -1664,8 +1666,8 @@ impl Harness {
 
     /// Whether the controller's load monitor has published, for every row
     /// of each of `engines`, a report sampled at or after `since`. A
-    /// decision is given the monitor's snapshot, where [`Self::pool`] reads
-    /// the store's load table: the monitor polls on its own clock.
+    /// decision is given the monitor's snapshot, and [`Self::pool`] reads
+    /// the same one: the monitor polls on its own clock.
     pub fn monitored(&self, engines: &[usize], since: Instant) -> bool {
         let snapshot = self.replica.loads.borrow();
         let mut rows = self.members.iter();
@@ -1684,27 +1686,30 @@ impl Harness {
     /// The pool serving `model` in `role` as the store holds it at this
     /// instant, each row named by its engine: the rows of the workers'
     /// table that serve the model in that role. A row is healthy where its
-    /// status is ready, and its load is the row its engine's reports left
-    /// in the load table. The rows come in the table's order, by
-    /// registration key: no case reads their order. The overload verdict
-    /// is no part of a row here: a case reads a veto in the picks the
-    /// service answers.
+    /// status is ready, and its load is the load monitor's newest report
+    /// of it, as a decision's record states it. The rows come in the
+    /// table's order, by registration key: no case reads their order. The
+    /// overload verdict is no part of a row here: a case reads a veto in
+    /// the picks the service answers.
     pub fn pool(&self, model: &str, role: Role) -> Result<Vec<Seen>, String> {
         let (_, mut rows) = self.store.all_rows();
         rows.retain(|row| {
             row.facts.role == role && row.facts.models.iter().any(|served| served == model)
         });
+        let reports = self.replica.loads.borrow();
         rows.iter()
             .map(|row| {
                 let (engine, rank) = *self.members.get(&row.id).ok_or_else(|| {
                     format!("the store holds a row no registration made: {:?}", row.id)
                 })?;
-                let load = self.store.load(row.id, row.facts.dp_rank);
+                let load = reports.report(&row.facts.key).map(|(report, sampled)| {
+                    load_row(report, row.facts.role, sampled, sampled, SignalSource::Poll)
+                });
                 Ok(Seen {
                     engine,
                     rank,
                     healthy: row.status == WorkerStatus::Ready,
-                    load: load.map(|sample| sample.row),
+                    load,
                 })
             })
             .collect()

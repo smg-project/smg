@@ -23,6 +23,12 @@
 //! apply on a replica that also serves) breaks a mode's test: it and the
 //! door then go through a compare-and-write of the store.
 //!
+//! **A call reads the record that stands off the worker objects.** The row
+//! under a URL, the row under an id and an engine's rows are read back from
+//! the objects in their holder's turn, behind its read of the store to its
+//! end ([`Objects::record`]). A status is the store's word still, so a
+//! record read carries the status the table holds.
+//!
 //! **A call writes under the term it reads once it holds the door's turn.**
 //! The fence is read under the lock, first: a call that waited its turn
 //! behind another writes under the term of its own minute, or is refused as
@@ -218,6 +224,24 @@ impl MembershipCalls {
         self.objects.remove(&self.store, id, revision)
     }
 
+    /// The door's read of the row under `id`, in its turn: the record read
+    /// back from the worker object that stands, with the status the table
+    /// holds ([`Objects::record`]).
+    fn row(&self, id: WorkerId) -> Option<WorkerRow> {
+        self.objects.record(&self.store, id)
+    }
+
+    /// The door's read of the row under `url`, as [`Self::row`] reads one.
+    fn row_under(&self, url: &str) -> Option<WorkerRow> {
+        self.objects.record_under(&self.store, url)
+    }
+
+    /// The door's read of the rows that name `engine`, as [`Self::row`]
+    /// reads one.
+    fn rows_of(&self, engine: &str) -> Vec<WorkerRow> {
+        self.objects.records_of(&self.store, engine)
+    }
+
     /// The log's place: read after a call's write, that write's own or one
     /// past it.
     fn place(&self) -> Position {
@@ -340,7 +364,7 @@ impl MembershipCalls {
         // that does not stand is not found, whatever it leaves unsaid. The
         // conversion tells a new row's names after every field's own rule,
         // so a field past its bound is refused as itself here too.
-        let read = worker_wire::registration(spec, |url| self.store.by_key(url));
+        let read = worker_wire::registration(spec, |url| self.row_under(url));
         let (mut facts, standing) = match read {
             Err(unnamed) if mode == Mode::Replace && worker_wire::of_a_new_row(&unnamed) => {
                 return Err(absent());
@@ -357,7 +381,7 @@ impl MembershipCalls {
             let engine = standing
                 .as_ref()
                 .map_or(spec.url.as_str(), |row| row.facts.engine.as_str());
-            let mut ranks = self.store.of_engine(engine);
+            let mut ranks = self.rows_of(engine);
             ranks.retain(|row| row.facts.key != engine);
             if !ranks.is_empty() {
                 if mode != Mode::Add {
@@ -520,8 +544,7 @@ impl MembershipCalls {
     /// row is told so whatever revision it read.
     fn guarded(&self, maker: &Registrant, id: u64, revision: u64) -> Result<WorkerRow, Status> {
         let row = self
-            .store
-            .get(WorkerId(id))
+            .row(WorkerId(id))
             .ok_or_else(|| Status::not_found("no worker has the id"))?;
         made_by(&row, maker)?;
         if row.revision == revision {
@@ -535,7 +558,7 @@ impl MembershipCalls {
     }
 
     fn read(&self, id: WorkerId) -> Result<WorkerRow, Status> {
-        self.store.get(id).ok_or_else(moved)
+        self.row(id).ok_or_else(moved)
     }
 }
 
@@ -608,6 +631,18 @@ impl Turn for CallTurn<'_> {
         &self.door.store
     }
 
+    fn row(&self, id: WorkerId) -> Option<WorkerRow> {
+        self.door.row(id)
+    }
+
+    fn row_under(&self, url: &str) -> Option<WorkerRow> {
+        self.door.row_under(url)
+    }
+
+    fn rows_of(&self, engine: &str) -> Vec<WorkerRow> {
+        self.door.rows_of(engine)
+    }
+
     fn upsert(&self, facts: WorkerFacts, maker: Registrant) -> Option<MembershipChange> {
         self.door.lay_row(facts, maker)
     }
@@ -673,7 +708,7 @@ impl MembershipCalls {
         for rank in 0..width {
             let url = rank_url(&spec.url, usize::from(rank));
             let read = worker_wire::rank_registration(spec, (&url, rank, width), |url| {
-                self.store.by_key(url)
+                self.row_under(url)
             });
             let (facts, standing) = match read {
                 Err(unnamed) if mode == Mode::Replace && worker_wire::of_a_new_row(&unnamed) => {
@@ -706,7 +741,7 @@ impl MembershipCalls {
         }
         // The engine's rows as they stand, read before any leaves: the
         // answer tells the last of each row that left.
-        let before = self.store.of_engine(&spec.url);
+        let before = self.rows_of(&spec.url);
         let turn = CallTurn {
             door: self,
             by,
@@ -900,6 +935,18 @@ impl Turn for ReplicaTurn<'_> {
         &self.host.door.store
     }
 
+    fn row(&self, id: WorkerId) -> Option<WorkerRow> {
+        self.host.door.row(id)
+    }
+
+    fn row_under(&self, url: &str) -> Option<WorkerRow> {
+        self.host.door.row_under(url)
+    }
+
+    fn rows_of(&self, engine: &str) -> Vec<WorkerRow> {
+        self.host.door.rows_of(engine)
+    }
+
     fn upsert(&self, facts: WorkerFacts, maker: Registrant) -> Option<MembershipChange> {
         self.host.door.lay_row(facts, maker)
     }
@@ -974,8 +1021,8 @@ impl MembershipWriter for ReplicaMembershipWriter {
         url: &str,
         seen: RowRevision,
     ) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
-        self.removal("worker drain", by, |_| {
-            drain(&self.door.store, by, url, seen)
+        self.removal("worker drain", by, |term| {
+            drain(&ReplicaTurn { host: self, term }, by, url, seen)
         })
     }
 
@@ -1453,6 +1500,29 @@ pub(crate) mod tests {
         );
         assert!(!refused.message().contains("10.0.0.5"));
         assert_eq!(store.epoch(), 1);
+    }
+
+    /// A call reads the row that stands off the worker objects, behind
+    /// their holder's read of the store to its end. An add over a row that
+    /// a writer outside the holder left in the table is refused as an add
+    /// over any row that stands, and writes nothing.
+    #[test]
+    fn an_add_over_a_row_written_around_the_holder_is_refused() {
+        let (store, door) = door();
+        let facts = WorkerFacts {
+            key: URL.to_owned(),
+            incarnation: 1,
+            wire_modes: WireModes::GRPC,
+            models: vec!["model-a".to_owned()],
+            ..WorkerFacts::default()
+        };
+        store.upsert_by(facts, Registrant::Control);
+        let stood = (store.epoch(), store.by_key(URL));
+        let refused = door
+            .register(&operator(), under(TERM), &ask(spec(URL), Mode::Add))
+            .expect_err("the URL stands");
+        assert_eq!(refused.code(), Code::AlreadyExists);
+        assert_eq!((store.epoch(), store.by_key(URL)), stood);
     }
 
     #[test]

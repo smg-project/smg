@@ -625,6 +625,10 @@ impl Engine {
             // it.
             ring: None,
             ring_positions: &[],
+            // The word says how the request's own key came. An item's key
+            // is its content's, whatever handed the request's: it leads
+            // the item under every form of the ring.
+            session_key_from_rid: false,
             ..*facts
         };
         let wires = encode_cx.wire_modes;
