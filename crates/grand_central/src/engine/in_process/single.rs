@@ -409,7 +409,7 @@ fn by_facts<const RETRY: bool>(
     match keys::decide(engine, records, workers, live, facts, cx) {
         // A pin its rule keeps from the profile: no holder is named for it
         // and nothing is kept of where its prompt went.
-        Some(keyed) if !lease_events::stages_hear(&keyed) => keyed,
+        Some(keyed) if !lease_events::stages_hear(&keyed, Side::Single) => keyed,
         // A pin that is the profile's own goes through the same lookup with
         // its answer made.
         Some(keyed) => handed_on(own, members, records, facts, maker, late, keyed, leaves),
@@ -684,7 +684,7 @@ pub(super) fn issued(
     if let Some(lease) = lease.as_ref().filter(|_| issue) {
         // Asked behind the document's own word: a document whose stages
         // take no issue reads nothing of the pick here.
-        if lease_events::stages_hear(&decision) {
+        if lease_events::stages_hear(&decision, Side::Single) {
             own.word_caught(|| document.spec.engine().on_decision_issued(lease, &decision));
         }
     }

@@ -992,7 +992,7 @@ pub(crate) fn issue(
     let sized = (session, tokens);
     // The stages hear of every pick but one the binding's sessions rule
     // keeps from the profile: that one's lease is filed under the word.
-    let hears = lease_events::stages_hear(decision);
+    let hears = lease_events::stages_hear(decision, Side::Single);
     let record = LeaseRecord {
         untold: !hears,
         ..record_of(front, taken, term, (pick, first), Side::Single, sized)

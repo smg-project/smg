@@ -1464,6 +1464,19 @@ that issue, and the dispatch it tells off the file moves the session's pin and r
 and no count of sends. Its decision is the engine's own, so its record of sent prefixes follows the
 word too.
 
+Each side of a pair is placed by a decision of its own, under its own session, so the rule may
+place one side alone beside a side its stages placed. A pair's pick states a word for each side:
+its own for the prefill side, and its pairs' for the decode side (`Pair::decode_placing`). The same
+function reads the side's word at a pair's dispatch, at its two issues and a later decode's, and at
+each side's write of where the prompt went. A decode asked again states its own word of the decode
+side. Where it names the decode its pair holds, by worker and rank, it keeps that pair's word: the
+decision that put the request there stands, and the call placed nothing, whether it followed the
+claim that decision made or its own stages found the decode again. Its pick keeps the first
+decision's word of the prefill side for its guard and its host: the stages that hear the decode's
+issue are handed the pick ahead of that word. A controller's file keeps one word a lease, a
+single's, so a controller refuses a document whose rule states `untold` under `pd-pair`, by that
+field's name.
+
 The session table takes no new key once it holds 4,194,304 keys. A request of such a key is
 placed with no pin, until keys leave the table.
 

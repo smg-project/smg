@@ -2335,9 +2335,10 @@ pub enum Recovery {
     Latest,
 }
 
-/// Whether a single request a sessions rule placed alone is the profile's
-/// own: a pin of the request's key followed, or the rule's own assignment.
-/// No stage of the profile placed such a request.
+/// Whether a request a sessions rule placed alone is the profile's own: a
+/// pin of the request's key followed, or the rule's own assignment. No
+/// stage of the profile placed such a request. A single request is such a
+/// request, and so is a side of a pair, each side by its own decision.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
@@ -2399,14 +2400,18 @@ pub struct SessionsSpec {
     /// `original`).
     #[serde(default)]
     pub recovery: Recovery,
-    /// Whether a single request this rule placed alone is the profile's
-    /// own (default `told`). Under `untold` no stage hears that request's
+    /// Whether a request this rule placed alone is the profile's own
+    /// (default `told`). Under `untold` no stage hears that request's
     /// issue or its dispatch, it is none of the profile's sends, and
     /// neither the engine's record of sent prefixes nor a lent tree
     /// takes its prompt. The session table still hears its dispatch,
-    /// and the stages its completion and its release. A pair's sides are
-    /// told under either word. A controller keeps the word on the lease it
-    /// files, and tells such a request off its file by it all the same.
+    /// and the stages its completion and its release. Under the `pd-pair`
+    /// plan each side of a pair follows the word on its own: a side the
+    /// rule placed alone is kept from that side's profile, beside a side
+    /// the stages placed, which is told. A controller keeps the word on
+    /// the lease it files for a single request, and tells such a request
+    /// off its file by it all the same. Its file keeps no word of a pair's
+    /// side: a controller takes `told` alone under the `pd-pair` plan.
     #[serde(default, skip_serializing_if = "is_default")]
     pub rule_placed: RulePlaced,
 }
@@ -4524,6 +4529,10 @@ struct BindingContext<'a> {
     /// The profiles whose built picker leaves the placement to a sessions
     /// rule ([`Picker::by_assignment`]), by name.
     by_assignment: &'a [&'a str],
+    /// Whether the host makes the lifecycle's calls
+    /// ([`StageRegistry::makes_lifecycle_calls`]). One that makes some
+    /// only tells a lease's words off a file of leases.
+    lifecycle: bool,
 }
 
 fn check_bounds<T>(bounds: &Bounds<T>, at: &At) -> Result<(), SpecError>
@@ -5058,7 +5067,7 @@ fn check_binding(
         }
     }
     if let (Some(binding), Some(sessions)) = (built.as_mut(), &b.sessions) {
-        let rule = session_rule(sessions, cx.index, binding.plan)?;
+        let rule = session_rule(sessions, cx.index, binding.plan, cx.lifecycle)?;
         needs.active_sessions |= rule.assignment == Assignment::MinGroup;
         needs.session_in_flight |= rule.inflight_cap > 0;
         binding.sessions = Some(rule);
@@ -5066,23 +5075,36 @@ fn check_binding(
     Ok(built)
 }
 
+/// Why a sessions rule that keeps what it places from the profile is refused
+/// under the `pd-pair` plan in the build of a host that makes some of the
+/// lifecycle's calls only ([`session_rule`]), as the refusal prints it
+/// behind "is not".
+const UNTOLD_ON_FILE: &str =
+    "`told` under the pd-pair plan in this build: a file of leases keeps no side's word";
+
 /// The sessions rule as the engine runs it: the schema's largest cap is no
 /// cap, its largest idle time or sweep is for ever (a sweep for ever under a
 /// finite idle time is refused, as nothing would forget the keys; an idle
 /// time for ever sweeps nothing). The rule runs under the `single` plan, and
-/// on the two sides of a `pd-pair` plan where it tells its stages: a pair's
-/// pick has one word for whether its stages hear of it, not one a side.
+/// on the two sides of a `pd-pair` plan: each side of a pair's pick states
+/// its own word for whether its stages hear of it. A rule that keeps what
+/// it places from the profile is in the build of a host that makes the
+/// lifecycle's calls (`lifecycle`), which tells each side by the pick in
+/// its hand. It is refused by the field's name in the build of a host that
+/// makes some only: that host tells a lease's words off a file, and its
+/// file keeps no word of a pair's side.
 /// Under a cap each side's records carry the count of its key's requests
 /// in flight, as a single's do.
 fn session_rule(
     sessions: &SessionsSpec,
     index: usize,
     plan: Plan,
+    lifecycle: bool,
 ) -> Result<SessionRule, SpecError> {
     let refused = match plan {
         Plan::Single => None,
-        Plan::PdPair if sessions.rule_placed != RulePlaced::Told => {
-            Some(("rule_placed", "`told` under the pd-pair plan"))
+        Plan::PdPair if sessions.rule_placed != RulePlaced::Told && !lifecycle => {
+            Some(("rule_placed", UNTOLD_ON_FILE))
         }
         Plan::PdPair => None,
         Plan::Epd { .. } => Some(("plan", "`single` or `pd-pair`")),
@@ -5409,6 +5431,7 @@ impl PolicySpec {
                 live_profiles: &live_profiles,
                 scoped_stages: &scoped_stages,
                 by_assignment: &by_assignment,
+                lifecycle: catalog.makes_lifecycle_calls(),
             };
             if let Some(built) = check_binding(binding, &cx, &mut needs, &mut deferred)? {
                 if binding
@@ -9096,13 +9119,21 @@ mod tests {
     }
 
     /// A sessions rule runs under the single plan, and on the two sides of
-    /// a pair where it tells its stages, under a cap or under none. A cap
-    /// under the pair makes the document's engine read a worker's count of
-    /// a key's requests, the schema's default cap as one that is written.
-    /// A rule that keeps what it places from the profile is refused by
-    /// that field's name, and a rule under `epd` by the plan's.
+    /// a pair, under a cap or under none. A cap under the pair makes the
+    /// document's engine read a worker's count of a key's requests, the
+    /// schema's default cap as one that is written. A rule that keeps what
+    /// it places from the profile runs under a pair in the build of a host
+    /// that makes the lifecycle's calls, where each side of a pick states
+    /// its own word. In the build of a host that makes some only it is
+    /// refused by that field's name, and the refusal says why: that host
+    /// tells a lease's words off a file, which keeps no word of a pair's
+    /// side. A rule under `epd` is refused by the plan's name.
+    ///
+    /// A gateway's sticky map places each role of a pair under that role's
+    /// own key, and hands its policy no request it placed
+    /// (`model_gateway/src/policies/registry.rs:762-769`, `:794-797`).
     #[test]
-    fn a_sessions_rule_runs_under_a_pair_that_tells_its_stages_and_not_under_epd() {
+    fn a_sessions_rule_runs_under_a_pair_by_its_hosts_calls_and_not_under_epd() {
         let built = |plan: &str, profiles: &str, sessions: &str| {
             spec_with_binding(&format!(
                 r#"{{"plan":"{plan}","profiles":{profiles},"sessions":{sessions}}}"#
@@ -9126,18 +9157,37 @@ mod tests {
         }
         let untold =
             r#"{"sticky_header":"x-session-id","inflight_cap":65535,"rule_placed":"untold"}"#;
+        assert_eq!(under("pd-pair", pair, untold), None);
+        let some = StageRegistry::builtin().without_lifecycle();
+        let on_file = |sessions: &str| {
+            spec_with_binding(&format!(
+                r#"{{"plan":"pd-pair","profiles":{pair},"sessions":{sessions}}}"#
+            ))
+            .validate_in(&some, &[])
+            .err()
+        };
+        assert_eq!(on_file(uncapped), None, "a rule that tells its stages");
+        let refused = on_file(untold);
         assert_eq!(
-            under("pd-pair", pair, untold),
+            refused,
             Some(SpecError::BadSessions {
                 index: 0,
                 name: "rule_placed",
-                reason: "`told` under the pd-pair plan",
+                reason: UNTOLD_ON_FILE,
             })
         );
-        // The single plan takes each of the three.
+        assert_eq!(
+            refused.map(|err| err.to_string()),
+            Some(format!(
+                "binding 0: sessions rule_placed is not {UNTOLD_ON_FILE}"
+            ))
+        );
+        assert!(UNTOLD_ON_FILE.ends_with("a file of leases keeps no side's word"));
+        // The single plan takes each of the three, under either host.
         for rule in [uncapped, untold, r#"{"sticky_header":"x-session-id"}"#] {
             let single = spec_with_binding(&format!(r#"{{"profile":"q","sessions":{rule}}}"#));
             assert_eq!(single.validate().err(), None, "{rule}");
+            assert_eq!(single.validate_in(&some, &[]).err(), None, "{rule}");
         }
         let epd = r#"{"encode":"q","prefill":"q","decode":"q"}"#;
         let refused = under("epd", epd, uncapped);

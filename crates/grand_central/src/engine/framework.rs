@@ -19,8 +19,8 @@ use crate::{
     document::spec::{Assignment, Needs},
     engine::{
         decision::{
-            Decision, LiftedVeto, Overlap, Pick, Shed, ShedReason, Survivors, Target, Targets,
-            Trace, MAX_TARGETS, TARGET_WORKER, TRACE_TOP,
+            Decision, LiftedVeto, Overlap, Pick, Placing, Shed, ShedReason, Survivors, Target,
+            Targets, Trace, MAX_TARGETS, TARGET_WORKER, TRACE_TOP,
         },
         sticky_sessions::{self, Claim, SessionRule, SessionTable, SessionVerdict},
         view::{
@@ -8552,9 +8552,12 @@ impl Engine {
                         trace,
                         session_verdict,
                     } = paired;
-                    // Each side's own verdict: the decode side's in the
-                    // first target's pair, the prefill side's as the pick's.
-                    targets.pair_under(prefill_target, *session_verdict);
+                    // Each side's own verdict and its own word of who
+                    // placed it: the decode side's verdict in the first
+                    // target's pair and its word in every pair, the
+                    // prefill side's as the pick's.
+                    let placed = prefill_pick.targets.placing();
+                    targets.pair_under(prefill_target, *session_verdict, placed);
                     // The pair's trace is the prefill's, with the mark of
                     // the veto the rule lifted for the decode side, or of
                     // the overload veto the prefill's own run was placed
@@ -9096,11 +9099,15 @@ impl Engine {
         // targets of a pair's first decision do. They are turned where the
         // decision stands, and its trace stays the decode's: taken out and
         // built beside it, the pick was copied twice. The decode side's
-        // verdict goes into the first target's pair, and the pick states
-        // none: this call decided no prefill.
+        // verdict goes into the first target's pair and its word of who
+        // placed it into every pair, and the pick states neither of a
+        // prefill: this call decided none. A host that holds the pair's
+        // first pick keeps that pick's word of the prefill side beside
+        // this one.
         if let Decision::Pick(pick) = &mut decision {
             let decode = std::mem::take(&mut pick.session_verdict);
-            pick.targets.pair_under(&target_of(prefill), decode);
+            pick.targets
+                .pair_under(&target_of(prefill), decode, Placing::Stages);
         } else if decode_cx.target_worker.is_some() {
             return target_missed(decision);
         }
@@ -9206,6 +9213,9 @@ impl Engine {
 
     /// The stages' part of a dispatch: each profile's scorers and its
     /// picker hear it.
+    // In line at its callers: as a call it costs a pair's decision 41
+    // instructions, counted with Callgrind.
+    #[inline(always)]
     pub(crate) fn dispatched_stages(
         &self,
         lease: &Lease,
@@ -18307,6 +18317,121 @@ mod tests {
             (pair.decode_position, pair.decode_verdict),
             (2, DecodeVerdict::NONE)
         );
+    }
+
+    /// Under a sessions rule each side of a pair states who placed it, by
+    /// its own decision, and under the rule's word `untold` that it is
+    /// kept from the profile. A new key's pair is the stages' on both
+    /// sides under `delegate`. A key pinned on both sides follows both
+    /// pins, and its pair is the rule's on both. With the worker of its
+    /// prefill pin down the stages place the prefill beside a decode the
+    /// rule placed, and the other way round with the worker of its decode
+    /// pin down. A decode asked again states its own side's word in its
+    /// pairs and the stages for the prefill: the call decided none. A
+    /// request with no key is the stages' on both sides. Under the rule's
+    /// default word the same sides are the rule's, and none is kept from
+    /// the profile.
+    ///
+    /// A gateway's sticky map tags a key by its role
+    /// (`model_gateway/src/policies/registry.rs:762-769`) and selects a
+    /// pair's two roles apart
+    /// (`model_gateway/src/routers/common/placement.rs:3026`, `:3088`): a
+    /// role whose pin stands under its cap asks its policy nothing
+    /// (`registry.rs:794-797`), beside a role its policy places.
+    #[test]
+    fn each_side_of_a_pair_states_who_placed_it_under_the_rules_word() {
+        use decision::PlacedBy;
+
+        // Each side's word of a pick: the prefill side's, then the decode
+        // side's, which every pair of the pick states.
+        let words = |decision: &Decision| {
+            let pick = decision.pick().expect("a pair");
+            let mut pairs = pick.targets.iter().filter_map(|target| target.pair);
+            let decode = pairs.next().expect("a decode").decode_placing;
+            assert!(pairs.all(|pair| pair.decode_placing == decode));
+            assert_eq!(pick.decode_untold(), decode.untold());
+            [
+                (pick.placed_by(), pick.untold()),
+                (decode.placed_by(), decode.untold()),
+            ]
+        };
+        for kept in [RulePlaced::Untold, RulePlaced::Told] {
+            let rule = SessionRule {
+                rule_placed: kept,
+                inflight_cap: 0,
+                ..SESSIONS
+            };
+            let binding = Binding {
+                sessions: Some(rule),
+                ..pair_binding()
+            };
+            let profiles = vec![least_requests_profile()];
+            let engine = Engine::new(profiles, vec![binding], 1, Needs::default());
+            let mut scratch = Scratch::new();
+            let (pool, cx) = (PoolFacts::default(), Constraints::default());
+            let stages = (PlacedBy::Stages, false);
+            let ruled = (PlacedBy::Rule, kept == RulePlaced::Untold);
+            // The least loaded prefill is the second, the least loaded
+            // decode the third.
+            let mut rows = two_sides(&[5, 0, 5], &[5, 5, 0]);
+            let new = pair_request(Some(6));
+            let [prefills, decodes] = &rows;
+            let pools = PairPools {
+                prefills,
+                decodes,
+                ..PairPools::default()
+            };
+            let first = engine.decide_pair(&new, &pool, pools, &cx, &cx, &mut scratch);
+            assert_eq!(words(&first), [stages; 2], "{kept:?}: a new key");
+            // What each side states for a key pinned on both sides, with
+            // the worker of one side's pin down where `down` names one:
+            // of the key's next pair, and of its decode asked again
+            // behind the pinned prefill. Each form under a key of its own:
+            // a side the stages place is claimed for its key.
+            let downs = [None, Some(0), Some(1)];
+            let forms = downs
+                .into_iter()
+                .flat_map(|down| [(down, false), (down, true)]);
+            for (nth, (down, again)) in forms.enumerate() {
+                let case = format!("{kept:?}, side {down:?} down, again {again}");
+                let keyed = pair_request(Some(7 + nth as u64));
+                let (pinned, _) = pair_placed(&engine, &keyed, &rows, &mut scratch);
+                assert_eq!(pinned, (1, 2), "{case}");
+                if let Some(side) = down {
+                    rows[side][[1, 2][side]].health.healthy = false;
+                }
+                let [prefills, decodes] = &rows;
+                let pools = PairPools {
+                    prefills,
+                    decodes,
+                    ..PairPools::default()
+                };
+                let by = |side: usize| if down == Some(side) { stages } else { ruled };
+                let (held, scratch) = (prefills[1].id, &mut scratch);
+                let (decided, prefill) = if again {
+                    // The call decided no prefill: the stages' word.
+                    let decided =
+                        engine.decide_decode(&keyed, &pool, pools, held, None, &cx, scratch);
+                    (decided, stages)
+                } else {
+                    let decided = engine.decide_pair(&keyed, &pool, pools, &cx, &cx, scratch);
+                    (decided, by(0))
+                };
+                assert_eq!(words(&decided), [prefill, by(1)], "{case}");
+                if let Some(side) = down {
+                    rows[side][[1, 2][side]].health.healthy = true;
+                }
+            }
+            let [prefills, decodes] = &rows;
+            let pools = PairPools {
+                prefills,
+                decodes,
+                ..PairPools::default()
+            };
+            let plain = pair_request(None);
+            let unkeyed = engine.decide_pair(&plain, &pool, pools, &cx, &cx, &mut scratch);
+            assert_eq!(words(&unkeyed), [stages; 2], "{kept:?}: no key");
+        }
     }
 
     /// The profile's filters narrow the pool before the assignment places a
