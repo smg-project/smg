@@ -1378,7 +1378,7 @@ lists name it by. A worker whose host states none is named by the fingerprint of
 |---|---|
 | `Registered` | a join |
 | `Removed` | a leave, under the id told at the worker's join |
-| `Replaced` | nothing where the host states the same id of the new object; a leave of the old id and a join of the new one where it states another; nothing of an object the task does not hold |
+| `Replaced` | nothing where the host states the same id of the new object and that object serves every model of the old one; the models it left where it serves one of them no more; a leave of the old id and a join of the new one where the host states another id; nothing of an object the task does not hold |
 | `StatusChanged` | nothing: a decision reads a worker's status on its object |
 
 Three cases need more words:
