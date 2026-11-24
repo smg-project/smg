@@ -15253,6 +15253,66 @@ mod tests {
         assert_eq!(pins(), Some([rows[0].id, WorkerId(0)]), "confirmed");
     }
 
+    /// A key pinned on a worker and decided on rows read before the worker
+    /// was registered again: the pin names the id that stands, no row
+    /// read holds it, and the rotation's turn lands on the worker under
+    /// the id it had. The table answers that the worker is a pin of the
+    /// key already, and the decision takes its pick as the pin it is:
+    /// nothing is claimed, and the rule's cap holds for it. At the cap the
+    /// key is handed on to the rotation's next turn, as from a pin read
+    /// first, and that worker leads the pins ahead of the dispatch.
+    #[test]
+    fn a_pick_answered_as_a_pin_already_is_put_to_the_rules_cap() {
+        let engine = session_engine_of(round_robin_profile(), SESSIONS);
+        let read = [
+            candidate(0, 0),
+            candidate(1, 0),
+            candidate(2, 0),
+            candidate(3, 0),
+        ];
+        let home = place_keyed(&engine, &read, 7, 10);
+        let stands = WorkerId(900);
+        engine.on_membership(&Membership::Replaced {
+            old: home.id,
+            new: stands,
+        });
+        engine.pins_follow(home.id, stands);
+        let pins = || engine.sessions.pins(session(7));
+        assert_eq!(pins(), Some([stands, WorkerId(0)]));
+        // A request with no key takes one turn of the rotation.
+        let turn = |now: u64| {
+            let facts = RequestFacts {
+                model: "m",
+                now_micros: now,
+                ..RequestFacts::default()
+            };
+            let (shared, cx) = (PoolFacts::default(), Constraints::default());
+            let decision = engine.decide(&facts, &shared, &read, &cx, &mut Scratch::new());
+            let pick = decision.pick().expect("a pick");
+            pick.targets.first().expect("a target").position
+        };
+        // Three turns bring the rotation back to the key's worker. Under
+        // the cap its turn is the pin: no claim, and nothing is written.
+        let behind: Vec<u32> = (0..3).map(|step| turn(20 + step)).collect();
+        assert!(!behind.contains(&home.position), "{behind:?}");
+        let under = decide_keyed(&engine, &read, 7, 30);
+        let pick = under.pick().expect("a pick");
+        assert_eq!(pick.targets.first().map(|t| t.id), Some(home.id));
+        assert_eq!(pick.session_verdict, SessionVerdict::Pinned, "no claim");
+        assert_eq!(pins(), Some([stands, WorkerId(0)]), "nothing is written");
+        // At the cap, a rotation later: the key is handed on.
+        let behind: Vec<u32> = (0..3).map(|step| turn(40 + step)).collect();
+        assert!(!behind.contains(&home.position), "{behind:?}");
+        let mut capped = read;
+        capped[home.position as usize].session_in_flight = SESSIONS.inflight_cap;
+        let handed = decide_keyed(&engine, &capped, 7, 50);
+        let pick = handed.pick().expect("a pick");
+        assert_eq!(pick.session_verdict, SessionVerdict::Respill);
+        let taken = *pick.targets.first().expect("a target");
+        assert_ne!(taken.id, home.id);
+        assert_eq!(pins(), Some([taken.id, stands]), "ahead of its dispatch");
+    }
+
     #[test]
     fn two_first_decisions_of_a_fresh_key_agree_on_the_first_claim() {
         let engine = session_engine(SESSIONS);
