@@ -8694,6 +8694,34 @@ impl Engine {
         }
     }
 
+    /// The session table's part of a release ([`Lifecycle::on_released`]): a
+    /// commit that refused every target leaves the decision's claim no
+    /// worker to move to, and the claim goes with it. A release is told in
+    /// parts, as a dispatch is: this table, then the stages
+    /// ([`Self::released_stages`]). An engine in its host's process tells
+    /// the table each side a pair's release ends ahead of any stage, a
+    /// decode stated for later among them: no stage hears that side's end,
+    /// and the pair's first decision made its claim.
+    pub(crate) fn released_table(&self, lease: &Lease, reason: ReleaseReason) {
+        if reason == ReleaseReason::CommitFailed {
+            if let SessionVerdict::Claimed(claimed) = lease.session_verdict {
+                self.sessions
+                    .move_claim(lease.session, claimed, WorkerId(0));
+            }
+        }
+    }
+
+    /// The stages' part of a release, behind the table's
+    /// ([`Self::released_table`]).
+    pub(crate) fn released_stages(&self, lease: &Lease, reason: ReleaseReason) {
+        for profile in &self.profiles {
+            for w in &profile.scorers {
+                w.scorer.on_released(lease, reason);
+            }
+            profile.picker.on_released(lease, reason);
+        }
+    }
+
     /// Records a dispatch in each profile tally that stages read. A tally
     /// asks `present` only where the send would enter a rank it does not
     /// know: a served controller asks its worker objects there, so a late
@@ -8832,21 +8860,8 @@ impl Lifecycle for Engine {
     }
 
     fn on_released(&self, lease: &Lease, reason: ReleaseReason) {
-        // The table hears first and the stages last, as at a dispatch: a
-        // commit that refused every target leaves the decision's claim no
-        // worker to move to.
-        if reason == ReleaseReason::CommitFailed {
-            if let SessionVerdict::Claimed(claimed) = lease.session_verdict {
-                self.sessions
-                    .move_claim(lease.session, claimed, WorkerId(0));
-            }
-        }
-        for profile in &self.profiles {
-            for w in &profile.scorers {
-                w.scorer.on_released(lease, reason);
-            }
-            profile.picker.on_released(lease, reason);
-        }
+        self.released_table(lease, reason);
+        self.released_stages(lease, reason);
     }
 
     fn on_membership(&self, change: &Membership<'_>) {
@@ -17081,6 +17096,104 @@ mod tests {
         let (places, verdicts) = pair_placed(&engine, &keyed, &sides, &mut scratch);
         assert_eq!(places, (1, 1));
         assert_eq!(verdicts.0, SessionVerdict::Claimed(sides[0][1].id));
+    }
+
+    /// A pair's release tells the session table both sides it ends ahead
+    /// of any stage: where a stage unwinds at the prefill's release under
+    /// a commit that refused every target, neither side keeps the worker
+    /// its decision claimed.
+    #[cfg(feature = "in-process")]
+    #[test]
+    fn a_stage_that_unwinds_at_a_pairs_release_leaves_no_claim_behind() {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        use crate::{
+            engine::{
+                decision_engine::{HeldDecision, HeldDecode},
+                lease_events,
+            },
+            tracking::lease::Said,
+        };
+
+        #[derive(Debug)]
+        struct Unwinds;
+
+        impl Lifecycle for Unwinds {
+            fn on_released(&self, _: &Lease, _: ReleaseReason) {
+                panic!("this stage unwinds at a release");
+            }
+        }
+
+        impl Scorer for Unwinds {
+            fn name(&self) -> &'static str {
+                "unwinds"
+            }
+
+            fn score(
+                &self,
+                _: &RequestFacts<'_>,
+                _: &[Candidate],
+                kept: &[u32],
+                out: &mut [f32],
+            ) -> TieBand {
+                for (score, _) in out.iter_mut().zip(kept) {
+                    *score = 1.0;
+                }
+                TieBand::NORMALIZED
+            }
+        }
+
+        let sides = two_sides(&[5, 0, 5], &[5, 5, 0]);
+        let profile = Profile {
+            scorers: vec![WeightedScorer {
+                scorer: Box::new(Unwinds),
+                weight: 1.0,
+            }],
+            ..least_requests_profile()
+        };
+        let engine = pair_session_engine(vec![profile], Assignment::Delegate);
+        let keyed = pair_request(Some(7));
+        let sessions = side_sessions(&keyed);
+        let pools = PairPools {
+            prefills: &sides[0],
+            decodes: &sides[1],
+            ..PairPools::default()
+        };
+        let (pool, cx) = (PoolFacts::default(), Constraints::default());
+        let mut scratch = Scratch::new();
+        let decision = engine.decide_pair(&keyed, &pool, pools, &cx, &cx, &mut scratch);
+        let pick = decision.pick().expect("a pair");
+        let target = *pick.targets.first().expect("a target");
+        let pins = || sessions.map(|side| engine.sessions.pins(side));
+        let none = Some([WorkerId(0); 2]);
+        assert!(pins().iter().all(|side| *side != none), "each side claims");
+        // Both sides are issued: the decode's lease is the target's.
+        let prefill = Lease {
+            side: Side::Prefill,
+            session: sessions[0],
+            session_verdict: pick.session_verdict,
+            ..Lease::default()
+        };
+        let held = HeldDecision {
+            decision: &decision,
+            lease: &prefill,
+            index: 0,
+            target: &target,
+            decode: HeldDecode {
+                session: sessions[1],
+                tokens: 0,
+                chars: 0,
+                bytes: 0,
+                chosen: false,
+            },
+        };
+        let refused = Said::Released(None, ReleaseReason::CommitFailed);
+        let told = catch_unwind(AssertUnwindSafe(|| {
+            let hearers = lease_events::of_host(&engine, &engine);
+            lease_events::pair(&hearers, &held, refused, |_| 0);
+        }));
+        assert!(told.is_err(), "the stage unwound");
+        assert_eq!(pins(), [none; 2]);
     }
 
     /// [`pair_session_engine`] under the rule's cap of two, where the

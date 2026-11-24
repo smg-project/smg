@@ -209,11 +209,17 @@ pub(crate) fn decode_as_issued(prefill: &Lease, first: &Target, session: Session
 ///   under its lease as issued: every target of a pair's pick names the one
 ///   prefill. The decode's names the decode it went to.
 /// - A release ends the side it names, as issued, and with none both sides:
-///   the prefill's first. It states no index of its own: the decode's
-///   names the decode its host lends as the pick's first, under index 0.
+///   the session table hears each side it ends, then the stages do, the
+///   prefill's first. It states no index of its own: the decode's names
+///   the decode its host lends as the pick's first, under index 0.
 ///
-/// A word on a side a pair's lease does not hold tells nothing, and so
-/// does an end of a decode that stood chosen: no stage heard of that side.
+/// A word on a side a pair's lease does not hold tells nothing. A decode
+/// that stood chosen has no word of its own and no stage heard of that
+/// side: it leaves with its prefill. The prefill's release ends it for the
+/// session table, where the pair's first decision made that side's claim
+/// and the host lends that word the pick: a request's guard does. A
+/// controller's file lends a prefill's word a pick of no target, and the
+/// side keeps its claim there.
 ///
 /// The hearers are a single's ([`Hearers`]). The counts of sends are those
 /// of the engine that counts its host's sends, and a count asks the host's
@@ -323,12 +329,26 @@ pub(crate) fn pair<L: Fn(WorkerId, u16) -> bool + Copy>(
             let Some(engine) = hearers.issuing else {
                 return;
             };
-            if matches!(side, None | Some(Side::Prefill)) {
-                engine.on_released(prefill, reason);
+            let ends_prefill = matches!(side, None | Some(Side::Prefill));
+            // A decode that stood chosen leaves with its prefill: its host
+            // says the prefill's word alone of the two.
+            let ends_decode = if chosen {
+                ends_prefill
+            } else {
+                matches!(side, None | Some(Side::Decode))
+            };
+            let decode = decode.filter(|_| ends_decode);
+            if ends_prefill {
+                engine.released_table(prefill, reason);
             }
-            let ends_decode = matches!(side, None | Some(Side::Decode)) && !chosen;
-            if let Some(decode) = decode.filter(|_| ends_decode) {
-                engine.on_released(&decode, reason);
+            if let Some(decode) = &decode {
+                engine.released_table(decode, reason);
+            }
+            if ends_prefill {
+                engine.released_stages(prefill, reason);
+            }
+            if let Some(decode) = decode.filter(|_| !chosen) {
+                engine.released_stages(&decode, reason);
             }
         }
     }

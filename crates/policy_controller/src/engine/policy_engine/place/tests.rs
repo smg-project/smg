@@ -3241,3 +3241,78 @@ fn the_picker_is_told_the_budget_a_request_states() {
     assert!(placement.owes_events(), "the pick has a lease");
     assert_eq!(budgets.lock().as_slice(), [5_000]);
 }
+
+/// A dispatch settles its decision's claim across a new document: the
+/// session table is the engine's own, and a document put in force between
+/// a decision and its dispatch reads the pin that dispatch wrote. A fresh
+/// key whose claimed worker the route's rule refuses is sent to the
+/// decision's next worker, and the key's request with no rule lands there:
+/// a single request, and a pair's decode.
+#[test]
+fn a_dispatch_across_a_new_document_settles_its_decisions_claim() {
+    let stated = |pair, generation| {
+        let mut document = PolicySpec::preset("manual").expect("a built-in preset");
+        let mut rule = document.bindings[0]
+            .sessions
+            .take()
+            .expect("the stock rule");
+        rule.assignment = Assignment::MinLoad;
+        if pair {
+            document = PolicySpec::pair_presets("manual", "manual").expect("the pair presets");
+        }
+        document.generation = generation;
+        document.bindings[0].sessions = Some(rule);
+        AppliedSpec::validate(&document).expect("the document validates")
+    };
+    let members = PublishedList::new(pool(4));
+    let decodes = (0..4).map(|at| ready_worker(&format!("http://decode-{at}:8000"), MODEL));
+    let decodes = PublishedList::new(decodes.collect());
+    let classes = PartnerClasses::number(4, [&[0_u32, 1, 2, 3][..]; 4]);
+    let pair = PairLists {
+        decode: decodes.lent(),
+        ..pair_of(&members, &classes)
+    };
+    for (lists, sides) in [
+        (WorkerLists::Single(members.lent()), &[Side::Single][..]),
+        (WorkerLists::Pair(pair), &[Side::Prefill, Side::Decode][..]),
+    ] {
+        let paired = sides.len() == 2;
+        let engine = hosted(PolicyEngine::new(stated(paired, 1)));
+        // The rule refuses the worker it is asked of first, a pair's decode
+        // first: the one the decision claimed. A second document is in
+        // force from that call.
+        let refused = Cell::new(None);
+        let admits = |worker: &dyn Worker| {
+            let id = worker_id(worker);
+            if refused.get().is_none() && worker.url().contains("decode") == paired {
+                refused.set(Some(id));
+                let applied = engine.apply(stated(paired, 2));
+                applied.expect("a number above the standing one");
+            }
+            refused.get() != Some(id)
+        };
+        let headers = [(MANUAL_SESSION_HEADER, "talk-across")];
+        let keyed = PlaceRequest {
+            headers: &headers,
+            ..PlaceRequest::of(MODEL, lists)
+        };
+        let ruled = PlaceRequest {
+            admits: Some(&admits),
+            ..keyed
+        };
+        let mut placement = engine.place(&ruled).expect("a placement");
+        for side in sides {
+            placement.sent(*side);
+        }
+        let sent = (placement.id(), placement.decode_id());
+        assert!(refused
+            .get()
+            .is_some_and(|id| id != sent.0 && Some(id) != sent.1));
+        let next = engine.place(&keyed).expect("a placement");
+        assert_eq!(
+            (next.id(), next.decode_id()),
+            sent,
+            "the pins are the workers the request was sent to"
+        );
+    }
+}

@@ -641,6 +641,58 @@ fn a_pair_whose_caller_asks_its_decode_again_books_its_prefill_alone() {
     }
 }
 
+/// A keyed pair whose commit refused every target keeps no claim on either
+/// side, its decode issued with its prefill or stated for later: the key's
+/// next request is placed anew, on the worker of each side that is the
+/// lighter by then. A decode stated for later is issued no lease, and its
+/// claim goes with the prefill's release.
+#[test]
+fn a_refused_pair_keeps_no_claim_on_either_side() {
+    for pick in [DecodePick::WithPrefill, DecodePick::AfterPrefill] {
+        let mut document = PolicySpec::pair_presets("manual", "manual").expect("presets");
+        document.generation = 1;
+        document.plans.pd_pair.decode = pick;
+        let manual = PolicySpec::preset("manual").expect("a built-in preset");
+        let mut rule = manual.bindings[0].sessions.clone().expect("its rule");
+        rule.assignment = Assignment::MinLoad;
+        document.bindings[0].sessions = Some(rule);
+        let engine = hosted(engine_of(&document));
+        // The second worker of each side is the busier: the key's first
+        // decision claims the first of each.
+        let lists = Lists::of(2, 2);
+        lists.prefills[1].increment_load();
+        lists.decodes[1].increment_load();
+        let classes = lists.every();
+        let pair = lists.under(&classes, &Open);
+        let headers = [(MANUAL_SESSION_HEADER, "talk-pair")];
+        let keyed = PlaceRequest {
+            decode_again: true,
+            headers: &headers,
+            ..PlaceRequest::of(MODEL, WorkerLists::Pair(pair))
+        };
+        // The rule refuses both prefills: every target of each decision.
+        let prefills = [lists.prefill_id(0), lists.prefill_id(1)];
+        let admits = |worker: &dyn Worker| !prefills.contains(&worker_id(worker));
+        let ruled = PlaceRequest {
+            admits: Some(&admits),
+            ..keyed
+        };
+        let shed = Unplaced::Shed {
+            reason: ShedReason::NoEndpoints,
+            emptied_by: "admits",
+            retry_after_secs: 1,
+        };
+        assert_eq!(engine.place(&ruled).err(), Some(shed));
+        // The workers the first decision claimed are the busier by now.
+        for claimed in [&lists.prefills[0], &lists.decodes[0]] {
+            claimed.increment_load();
+            claimed.increment_load();
+        }
+        let placement = engine.place(&keyed).expect("a placement");
+        assert_eq!(lists.places(&placement), (1, 1), "{pick:?}");
+    }
+}
+
 /// A pair's decision that panics is refused, as a single request's is, and
 /// costs its request alone: the next request over the same lists is placed.
 #[test]
