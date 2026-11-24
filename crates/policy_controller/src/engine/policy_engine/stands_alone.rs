@@ -69,7 +69,7 @@ mod tests {
                 DecideOutcome, DecisionEngine, DecisionRefused, Request, RequestMaker, WorkerLists,
             },
             demands::{DemandFacts, Demands},
-            list_cell::tests::PublishedList,
+            list_cell::PublishedList,
             pair_classes::PartnerClasses,
             view::{FixedFacts, Phase},
         },

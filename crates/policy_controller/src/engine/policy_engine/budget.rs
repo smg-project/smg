@@ -49,7 +49,7 @@ mod tests {
         engine::{
             decision_engine::{DecisionEngine, Request, RequestMaker, WorkerLists},
             framework::{DecisionScope, Filter},
-            list_cell::tests::PublishedList,
+            list_cell::PublishedList,
             view::{Candidate, Constraints, Identity, Phase, PoolFacts, RequestFacts},
             EncodeItems, EncodeLists, EncodePlaced, EncoderFacts, PairAdmission, PairLists,
             PartnerClasses, PlaceRequest, PolicyEngine,

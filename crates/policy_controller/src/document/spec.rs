@@ -954,8 +954,8 @@ pub struct ResidentWorkParams {
     pub request_tokens: u32,
 }
 
-/// The largest magnitude of a cost rule's parameter. The signal sink holds
-/// a value it takes to the same bound.
+/// The largest magnitude of a cost rule's parameter. A signal's value is
+/// held to the same bound where its cell is written.
 pub(crate) const COST_PARAMETER_LIMIT: f64 = 1e15;
 const RELATIVE_MARGIN_LIMIT: f64 = 1e6;
 
@@ -2172,11 +2172,12 @@ pub const OVERLOAD_TOKEN_USAGE: f32 = 0.8;
 /// never per request. The block names no threshold: a worker's
 /// registration states its own two, over its program's default where the
 /// program has one. The store's judge reads the switch, for each binding's
-/// pools. A gateway that runs the document in its own process reads the
-/// switch where it builds its workers' default thresholds, from the
-/// document it starts with, and its routes read one shed word: it refuses
-/// a document whose bindings differ on either word. A controller that
-/// judges on its worker objects does not read the switch yet.
+/// pools. A gateway that runs a supplied document in its own process reads
+/// the switch where it builds its workers' default thresholds, and its
+/// routes read one shed word, both from that document: it refuses one
+/// whose bindings differ on either word. With no document supplied it
+/// reads its own two settings. A controller that judges on its worker
+/// objects does not read the switch yet.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct OverloadSpec {
@@ -4376,9 +4377,6 @@ struct BindingContext<'a> {
     /// The profiles whose built picker leaves the placement to a sessions
     /// rule ([`Picker::by_assignment`]), by name.
     by_assignment: &'a [&'a str],
-    /// Whether the host makes the lifecycle's calls
-    /// ([`StageRegistry::makes_lifecycle_calls`]).
-    lifecycle: bool,
 }
 
 fn check_bounds<T>(bounds: &Bounds<T>, at: &At) -> Result<(), SpecError>
@@ -4928,20 +4926,6 @@ fn check_binding(
             }
         }
     }
-    // The store's file of leases keeps no session verdict of a pair's
-    // decode side: that side's lease states the prefill side's
-    // (`store::DecodeSide::lease`). A controller that serves from the file
-    // would settle a decode side's claim by the prefill side's word, so a
-    // rule under the pair plan is not in its build. The catalog's word is
-    // how the validator knows such a controller today: it makes some
-    // lifecycle calls only. The change that makes the file keep that
-    // verdict takes this refusal out.
-    if b.sessions.is_some() && b.plan.unwrap_or_default() == PlanName::PdPair && !cx.lifecycle {
-        deferred.note(
-            at.field("sessions"),
-            "the session verdict a pair's decode side keeps of its own",
-        );
-    }
     if let (Some(binding), Some(sessions)) = (built.as_mut(), &b.sessions) {
         let rule = session_rule(sessions, cx.index, binding.plan)?;
         needs.active_sessions |= rule.assignment == Assignment::MinGroup;
@@ -5295,7 +5279,6 @@ impl PolicySpec {
                 live_profiles: &live_profiles,
                 scoped_stages: &scoped_stages,
                 by_assignment: &by_assignment,
-                lifecycle: catalog.makes_lifecycle_calls(),
             };
             if let Some(built) = check_binding(binding, &cx, &mut needs, &mut deferred)? {
                 if binding
@@ -5686,14 +5669,16 @@ impl AppliedSpec {
     /// The document's signals, resolved, in column order: a signal's place
     /// here is its column's number. What a stage's build answered from
     /// ([`StageBuild::signal_column`](crate::stages::StageBuild::signal_column)),
-    /// and the one reading of the names for a store that keeps the cells.
+    /// and the one reading of the names for whoever makes the cells: the
+    /// engine over worker lists, or a host that builds its own.
     /// Empty for a document that declares none and for the unbound start.
     pub fn signal_columns(&self) -> &[SignalColumn] {
         &self.signal_columns
     }
 
-    /// [`Self::signal_columns`] as the list is shared: what the store's
-    /// signal sink hands a report's conversion.
+    /// [`Self::signal_columns`] as the list is shared: what a worker list's
+    /// records keep for a report's conversion.
+    #[cfg(feature = "in-process")]
     pub(crate) fn shared_signal_columns(&self) -> Arc<[SignalColumn]> {
         Arc::clone(&self.signal_columns)
     }
@@ -8321,34 +8306,20 @@ mod tests {
         assert!(single.validate().is_ok());
     }
 
-    /// A host that makes some lifecycle calls only keeps one session
-    /// verdict for the two sides of a pair's lease. A sessions rule under
-    /// the pair plan is not in its build, by the rule's place. The same
-    /// rule under the single plan is, and so is a pair under no rule.
+    /// A sessions rule under the pair plan is in the build of a host that
+    /// makes some lifecycle calls only, as of one that makes them all: a
+    /// file of leases keeps each side's own session verdict.
     #[test]
-    fn a_pairs_sessions_rule_is_not_in_the_build_of_a_host_with_one_verdict_a_lease() {
-        let (whole, some) = (
-            StageRegistry::builtin(),
-            StageRegistry::builtin().without_lifecycle(),
-        );
+    fn a_pairs_sessions_rule_is_in_the_build_of_a_host_that_makes_some_lifecycle_calls() {
         let rule = r#"{"sticky_header":"x-session-id","inflight_cap":65535}"#;
         let pair = format!(
             r#"{{"plan":"pd-pair","profiles":{{"prefill":"q","decode":"q"}},"sessions":{rule}}}"#
         );
         let pair = spec_with_binding(&pair);
-        assert!(pair.validate_in(&whole, &[]).is_ok());
-        assert_eq!(
-            pair.validate_in(&some, &[]).err(),
-            Some(SpecError::NotInBuild {
-                path: "bindings[0].sessions".to_string(),
-                what: "the session verdict a pair's decode side keeps of its own",
-            })
-        );
-        let single = spec_with_binding(&format!(r#"{{"profile":"q","sessions":{rule}}}"#));
-        assert!(single.validate_in(&some, &[]).is_ok());
-        let unruled =
-            spec_with_binding(r#"{"plan":"pd-pair","profiles":{"prefill":"q","decode":"q"}}"#);
-        assert!(unruled.validate_in(&some, &[]).is_ok());
+        let some = StageRegistry::builtin().without_lifecycle();
+        for catalog in [StageRegistry::builtin(), some] {
+            assert!(pair.validate_in(&catalog, &[]).is_ok());
+        }
     }
 
     /// A sessions rule runs under the single plan, and on the two sides of

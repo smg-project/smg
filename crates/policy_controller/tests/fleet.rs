@@ -124,7 +124,7 @@ use std::{
 use engines::cpu_seconds;
 use fleet::{
     within, DialEnd, Harness, Replica, Shape, DIAL_TIMEOUT, GATEWAY, POLL_INTERVAL, PROBE_INTERVAL,
-    PRODUCT_PROBES, ROOM,
+    ROOM,
 };
 use net::vm_rss_kib;
 use openai_protocol::worker::RuntimeType;
@@ -731,12 +731,6 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             .sum();
         let pool = harness.pool(MODEL, Role::Single).expect("the pool");
         assert_eq!(pool.len(), ranks, "every rank is a row: {pool:?}");
-        // A controller that probes by itself asks an engine as its row
-        // arrives: nothing is asked yet only where the stand-in probes.
-        assert!(
-            PRODUCT_PROBES || pool.iter().all(|row| !row.healthy && row.load.is_none()),
-            "nothing is known of an engine nobody asked: {pool:?}"
-        );
 
         // Feed. The probe's verdict makes a rank ready and the controller's
         // own load monitor then polls its engine.
@@ -1967,39 +1961,6 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             ranks,
             "a dead engine's rows stay rows: {pool:?}"
         );
-        // Where the stand-in probes, its turns tell which dial wrote: the
-        // first that heard the engine dead, a turn in flight at the kill
-        // or the first one begun after the death.
-        if !PRODUCT_PROBES {
-            let first = harness
-                .first_unhealthy(dead, death.asked)
-                .expect("a dial heard the engine dead");
-            assert!(
-                first <= death.turn + 1,
-                "the first turn after the death dialed it: turn {first} after {death:?}"
-            );
-            let wrote: Vec<_> = harness
-                .verdicts()
-                .into_iter()
-                .filter(|verdict| {
-                    verdict.engine == dead
-                        && verdict.at >= death.at
-                        && verdict.to != WorkerStatus::Failed
-                })
-                .collect();
-            assert_eq!(wrote.len(), 2, "one verdict a rank: {wrote:?}");
-            for verdict in &wrote {
-                assert_eq!(
-                    (verdict.from, verdict.to),
-                    (WorkerStatus::Ready, WorkerStatus::NotReady),
-                    "{verdict:?}"
-                );
-                assert_eq!(
-                    verdict.turn, first,
-                    "the first dial that heard the engine dead wrote it: {verdict:?} after {death:?}"
-                );
-            }
-        }
         // No decision names the dead engine: from the probe that heard it
         // dead its rows are no candidates.
         harness
@@ -3019,9 +2980,8 @@ async fn a_watcher_holds_the_fleets_rows_as_the_controller_tells_them() {
             status_of(watcher, id).is_some_and(|status| status != ObjectStatus::Ready)
         };
 
-        // The snapshot tells the fleet as it registered. Where the stand-in
-        // probes, no prober has started yet and every row is pending. A
-        // controller that probes by itself may have readied a row already.
+        // The snapshot tells the fleet as it registered: the controller's
+        // prober may have readied a row already.
         let mut watcher = watcher_of(Arc::new(MemoryStore::new()));
         let opened = watcher.open(harness.client()).await;
         let mut stream = opened.expect("the watch opens");
@@ -3030,8 +2990,7 @@ async fn a_watcher_holds_the_fleets_rows_as_the_controller_tells_them() {
         for id in &ids {
             let status = status_of(stream.watcher(), *id);
             assert!(
-                status == Some(ObjectStatus::Pending)
-                    || (PRODUCT_PROBES && status == Some(ObjectStatus::Ready)),
+                status == Some(ObjectStatus::Pending) || status == Some(ObjectStatus::Ready),
                 "a row of the snapshot reads {status:?}"
             );
         }

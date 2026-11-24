@@ -25,9 +25,10 @@
 //! object takes the status its row holds, and where no row stands for it
 //! the status it left.
 //!
-//! Table to object is the told path alone ([`mod@super::standby`]): a
-//! standby's applier and a gateway's watcher lay the status their
-//! leader's log tells.
+//! From the table to an object there are two ways, both of a told status.
+//! A standby's applier and a gateway's watcher lay the status their
+//! leader's log tells ([`mod@super::standby`]). And a tell the store
+//! refuses gives the object the status its row holds, as said above.
 
 use std::sync::Arc;
 
@@ -445,6 +446,43 @@ pub(crate) mod tests {
         let ready = ProbeAnswer::Stood(ObjectStatus::Ready);
         assert_eq!(leader.probe(false), ready, "one failure of two");
         assert!(matches!(leader.probe(false), ProbeAnswer::Moved { .. }));
+    }
+
+    /// A connect signal on an object that stands leaves its counters with
+    /// it: a failure counted before the signal still counts behind it.
+    #[test]
+    fn a_connect_signal_on_an_object_that_stands_keeps_its_count() {
+        let leader = Leader::with(2, 2);
+        let (store, objects, row) = (&leader.store, &leader.objects, leader.row);
+        objects.connect_row(store, row, 1);
+        let ready = ProbeAnswer::Stood(ObjectStatus::Ready);
+        assert_eq!(leader.probe(false), ready, "one failure of two");
+        // The object stands ready: the signal moves nothing and counts on.
+        objects.connect_row(store, row, 1);
+        let second = leader.probe(false);
+        assert!(matches!(second, ProbeAnswer::Moved { .. }), "{second:?}");
+    }
+
+    /// Where no row stands for it, a tell the store takes no word of takes
+    /// its driver's move back only where the object stands in the moved
+    /// status still. Here the object moved again ahead of the tell, and its
+    /// row left: nothing is taken back, and the later move stands.
+    #[test]
+    fn a_refused_tell_behind_a_second_move_takes_nothing_back() {
+        let leader = Leader::new();
+        assert!(matches!(leader.probe(true), ProbeAnswer::Moved { .. }));
+        let first = (ObjectStatus::Pending, ObjectStatus::Ready);
+        assert!(matches!(leader.probe(false), ProbeAnswer::Moved { .. }));
+        // The store's own removal: the holder's object stands a while yet.
+        WorkersStore::remove(&leader.store, leader.row, 1).expect("removed");
+        let (store, objects) = (&leader.store, &leader.objects);
+        let told = objects.tell_status(store, &leader.id, leader.revision, first, &|| true);
+        assert_eq!(told, HealthWrite::NoRow);
+        let stands = objects
+            .registry()
+            .get(&leader.id)
+            .map(|object| object.status());
+        assert_eq!(stands, Some(ObjectStatus::NotReady), "the later move");
     }
 
     /// A row changed in place keeps its object's status. The registry lays

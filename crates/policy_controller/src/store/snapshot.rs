@@ -189,10 +189,10 @@ struct Derived {
     /// status (a status change is a health signal and moves no position).
     by_model: FxHashMap<Box<str>, [Option<u32>; ROLES]>,
     pools: Box<[PoolShape]>,
-    /// The members in no pool, by id, each with its slot in the counts:
-    /// a member that offers no model. With the pools' rows they are every
-    /// member the build read ([`StoreSnapshot::unpooled_of`]).
-    unpooled: Box<[(WorkerId, WorkerSlot)]>,
+    /// Every member the build read, by id, each with its slot in the
+    /// counts: a member a pool lists, and one that offers no model
+    /// ([`StoreSnapshot::booked_of`]).
+    slots: Box<[(WorkerId, WorkerSlot)]>,
 }
 
 impl Derived {
@@ -814,13 +814,15 @@ impl StoreSnapshot {
         Some(self.derived.by_model.get(model)?[role_slot(role)]? as usize)
     }
 
-    /// The slot of worker `id`'s count wherever this world lists it: a
-    /// member's rows name one. `None` for a worker in no pool: a member
-    /// there is read apart ([`StoreSnapshot::unpooled_of`]). It searches every
-    /// pool, for a lease written outside a decision.
+    /// The slot of worker `id`'s count, where the worker was a member
+    /// when this world's membership was built: in a pool, or in none
+    /// where it offers no model. `None` for a worker that was no member
+    /// then. One binary search of the members by id, whatever the pools:
+    /// a lease written outside a decision reads it too.
     pub(crate) fn booked_of(&self, id: WorkerId) -> Option<WorkerSlot> {
-        let (pool, row) = self.pooled_row(id)?;
-        self.derived.pools.get(pool)?.booked.get(row).copied()
+        let slots = &self.derived.slots;
+        let at = slots.binary_search_by_key(&id, |&(of, _)| of).ok()?;
+        slots.get(at).map(|&(_, slot)| slot)
     }
 
     /// The first pool that lists `id`, with the member's row there: one
@@ -830,17 +832,6 @@ impl StoreSnapshot {
             let row = rows.binary_search_by_key(&id, |row| row.id).ok()?;
             Some((pool, row))
         })
-    }
-
-    /// The slot of worker `id`'s count where the worker is a member in no
-    /// pool of this world: one that offers no model. `None` for a member
-    /// a pool lists, and for a worker that was no member when this
-    /// world's membership was built. A lease's door reads it behind the
-    /// pools and the table, off the path of a listed target.
-    pub(crate) fn unpooled_of(&self, id: WorkerId) -> Option<WorkerSlot> {
-        let unpooled = &self.derived.unpooled;
-        let at = unpooled.binary_search_by_key(&id, |&(of, _)| of).ok()?;
-        unpooled.get(at).map(|&(_, slot)| slot)
     }
 
     /// `gateway`'s vetoes on the workers of `model`'s `role` pool, lent
@@ -1958,12 +1949,6 @@ impl Writer {
         }
     }
 
-    /// The standing generation: the one every world is published under
-    /// until the next is applied.
-    pub(super) fn spec(&self) -> &AppliedSpec {
-        &self.spec
-    }
-
     /// Every ready rank is heard once a `period` from here on: a judgment
     /// counts a rank only while its receipt lies within three periods of
     /// its engine's newest, and every engine with a threshold is judged
@@ -2171,10 +2156,6 @@ impl Writer {
         // Each model's members a side, by their place in `entries`: a
         // member's entry is written once, whatever it offers.
         let mut groups: FxHashMap<Box<str>, [Vec<u32>; ROLES]> = FxHashMap::default();
-        // The members that offer no model, by their place in `members`: in
-        // no pool, and named by the world all the same. None in most
-        // fleets.
-        let mut bare: Vec<u32> = Vec::new();
         // The members' ids are read by the vetoes alone: a membership build
         // with no veto standing does not collect them.
         let standing = !self.vetoes.by_gateway.is_empty();
@@ -2276,7 +2257,6 @@ impl Writer {
             entries.push(entry);
             if facts.models.is_empty() {
                 // In no pool, and done: the loop below starts on a model.
-                bare.push(at);
                 continue;
             }
             let side = role_slot(facts.role);
@@ -2566,19 +2546,15 @@ impl Writer {
         self.engines = engines;
         self.silenced = silenced;
         self.epoch = epoch;
-        // In id order, as the walk above pushed them.
-        // A place names its member's id and slot: the list stands by id, as
-        // the walk read the members.
-        let unpooled: Box<[(WorkerId, WorkerSlot)]> = bare
-            .iter()
-            .filter_map(|&at| members.get(at as usize))
-            .map(|&(id, _, slot)| (id, slot))
-            .collect();
-        debug_assert!(unpooled.is_sorted_by(|a, b| a.0 < b.0));
+        // Every member's id and slot, in the id order of this write's one
+        // sort: a member in a pool, and one that offers no model.
+        let slots: Box<[(WorkerId, WorkerSlot)]> =
+            members.iter().map(|&(id, _, slot)| (id, slot)).collect();
+        debug_assert!(slots.is_sorted_by(|a, b| a.0 < b.0));
         self.derived = Arc::new(Derived {
             by_model,
             pools: pools.into_boxed_slice(),
-            unpooled,
+            slots,
         });
         // A worker's vetoes leave with its row, in this write's own hold:
         // no publication shows the row without them. The ids stand in

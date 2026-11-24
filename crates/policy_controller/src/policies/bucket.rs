@@ -2462,6 +2462,7 @@ mod tests {
             target: pool[1].id,
             picked,
             session: view::Session::NONE,
+            session_verdict: crate::engine::SessionVerdict::None,
             state: crate::store::LeaseState::ISSUED,
             tokens: 300,
             target_index: 0,

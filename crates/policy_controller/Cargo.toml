@@ -457,10 +457,6 @@ name = "store_journal"
 harness = false
 
 [[bench]]
-name = "store_signals"
-harness = false
-
-[[bench]]
 name = "power_of_two"
 harness = false
 

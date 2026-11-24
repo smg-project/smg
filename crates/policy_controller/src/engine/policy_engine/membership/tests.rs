@@ -34,7 +34,7 @@ use crate::{
     document::spec::{AppliedSpec, PolicySpec},
     engine::{
         decision_engine::DecisionEngine,
-        list_cell::tests::PublishedList,
+        list_cell::PublishedList,
         policy_engine::{
             single::tests::{decided, hearing, pool, request, Asks, Heard},
             PolicyEngine,

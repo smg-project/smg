@@ -26,7 +26,7 @@ use smg_policy_controller::{
     document::{AppliedSpec, PolicySpec},
     engine::{
         prefills_full, Decided, PairAdmission, PairLists, PartnerClasses, Phase, Plain,
-        PolicyEngine, Request, RequestMaker, WorkerLists,
+        PolicyEngine, PublishedList, Request, RequestMaker, WorkerLists,
     },
     store::GatewayId,
     tracking::{DecisionGuard, Outcome, Side, TransportClass},
@@ -40,7 +40,7 @@ use smg_worker::{
 use tokio::runtime::Builder;
 
 use super::{
-    measure, plain, reports, signals, Cell, Host, Published, Run, Shadowed, Stated, MODEL,
+    measure, plain, published, reports, signals, Cell, Host, Run, Shadowed, Stated, MODEL,
 };
 
 /// The pair document of the preset `name` on both sides.
@@ -134,7 +134,7 @@ impl Refused {
 /// own list), with every worker's pair class, the host's admission and
 /// what the run states refuses every pair.
 struct Decodes {
-    list: Published,
+    list: PublishedList,
     classes: PartnerClasses,
     admission: &'static (dyn PairAdmission + Sync),
     refused: Refused,
@@ -302,7 +302,7 @@ pub(super) fn runs(run: &Run) -> bool {
     let every = (0..prefills.len()).map(|_| partners.as_slice());
     let decode_side = Decodes {
         classes: PartnerClasses::number(decodes.len(), every),
-        list: Published::of(&decodes),
+        list: published(&decodes),
         admission: if run.refused == Refused::Limit {
             &Full
         } else {
@@ -330,7 +330,7 @@ pub(super) fn runs(run: &Run) -> bool {
     upkeep.spawn(engine.run());
     let host = Host {
         engine,
-        list: Published::of(&prefills),
+        list: published(&prefills),
         request,
         plain: request(0).plain(),
     };

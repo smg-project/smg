@@ -14,7 +14,7 @@ use crate::{
         decision::{Target, Targets},
         decision_engine::{DecisionEngine, Request, RequestMaker, WorkerLists},
         framework::{Picker, TieBand},
-        list_cell::tests::PublishedList,
+        list_cell::PublishedList,
         policy_engine::{
             membership::tests::{handed, id, registry, remove},
             single::tests::{decided, hearing_spec_at, pool, request, Asks, MODEL},

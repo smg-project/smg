@@ -146,6 +146,70 @@ fn a_pairs_classes_read_each_rows_wires_and_engine_kind() {
     );
 }
 
+/// A row that states no pairing descriptor pairs by what its worker object
+/// offers: the pairing facts of the row's labels and engine kind, as the
+/// worker's own rule reads them. A row that states a descriptor is read by
+/// it, whatever its labels say. A row that is relabelled pairs by its new
+/// labels in the generation its new object publishes.
+#[test]
+fn a_row_that_states_no_descriptor_pairs_by_its_labels() {
+    let replica = Replica::new();
+    let labelled = |transport: &str| -> WorkerFacts {
+        let label = "disaggregation_transfer_backend".to_string();
+        WorkerFacts {
+            engine_kind: "sglang".to_string(),
+            labels: [(label, transport.to_string())].into(),
+            ..WorkerFacts::default()
+        }
+    };
+    let silent = |url: &str, role: Role, transport: &str| WorkerFacts {
+        pairing: None,
+        ..WorkerFacts {
+            engine_kind: labelled(transport).engine_kind,
+            labels: labelled(transport).labels,
+            ..pair_side(url, role, "stated")
+        }
+    };
+    state(&replica, silent(PREFILL, Role::Prefill, "nixl"));
+    state(&replica, silent(PREFILL_1, Role::Prefill, "mooncake"));
+    state(&replica, silent(DECODE, Role::Decode, "mooncake"));
+    // This decode's labels name one transport and its descriptor another.
+    let stated = WorkerFacts {
+        engine_kind: labelled("mooncake").engine_kind,
+        labels: labelled("mooncake").labels,
+        ..pair_side(DECODE_1, Role::Decode, "nixl")
+    };
+    state(&replica, stated);
+    let generation = replica.generation();
+    let lenient = replica.objects.pair_classes(&generation, Pairing::Lenient);
+    let partners = |prefill: usize| -> Vec<usize> {
+        let pairs = |decode: &usize| lenient.pairs(prefill, *decode);
+        (0..2).filter(pairs).collect()
+    };
+    assert_eq!([partners(0), partners(1)], [[1], [0]]);
+    // Strict reads the same facts: each side reports its transport.
+    let strict = replica.objects.pair_classes(&generation, Pairing::Strict);
+    assert!(
+        strict.pairs(1, 0),
+        "two rows whose labels report one transport"
+    );
+    assert!(!strict.pairs(0, 0), "two transports that differ");
+
+    // A relabel gets the row a new object, and the model another
+    // generation. There the two prefills report one transport and have one
+    // partner, the same one. The set derived before stands as it was.
+    state(&replica, silent(PREFILL, Role::Prefill, "mooncake"));
+    let relabelled = replica.generation();
+    let moved = replica.objects.pair_classes(&relabelled, Pairing::Lenient);
+    let now = |prefill: usize| -> Vec<usize> {
+        let pairs = |decode: &usize| moved.pairs(prefill, *decode);
+        (0..2).filter(pairs).collect()
+    };
+    assert_eq!(now(0), now(1), "one transport, one partner");
+    assert_eq!(now(0).len(), 1);
+    assert_eq!([partners(0), partners(1)], [[1], [0]]);
+}
+
 /// A generation asked for its pair classes once the objects of workers it
 /// lends were replaced reads no row for those workers: each pairs with
 /// nobody, at its place on either side, and the workers that stand pair as
