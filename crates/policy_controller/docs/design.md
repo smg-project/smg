@@ -1980,7 +1980,8 @@ with no report, change nothing.
 
 Under a document none of whose stages takes an end, a handle is empty and costs nothing: no
 allocation and no lock. Under one that does, a side shares its placement with its handles: one
-allocation a side.
+allocation a side. The document asked is the one the placement was decided under, whichever is
+in force when its host splits it.
 
 A pair's two sides share the pair's one placement behind a lock of that one request. The
 crate keeps the order of a pair's words itself: a prefill side let go while the decode still

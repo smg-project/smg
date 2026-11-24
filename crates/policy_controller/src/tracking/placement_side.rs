@@ -24,13 +24,15 @@
 //! nothing: the end is said at the side's drop.
 //!
 //! A handle reaches a stage only under a document one of whose stages
-//! takes an end ([`EventKind::Completed`]). Under any other document a
-//! side keeps its placement by itself, as it does with no handle: the
-//! handle it hands out is empty, allocates nothing and takes no lock, and
-//! a report through it says nothing. Under a document that takes an end,
-//! a side shares its placement with its handles: one allocation a side,
-//! and a lock of the side's own at its send, at each report and at its
-//! drop.
+//! takes an end
+//! ([`EventKind::Completed`](super::lease::EventKind::Completed)). Under
+//! any other document a side keeps its placement by itself, as it does
+//! with no handle: the handle it hands out is empty, allocates nothing and
+//! takes no lock, and a report through it says nothing. Under a document
+//! that takes an end, a side shares its placement with its handles: one
+//! allocation a side, and a lock of the side's own at its send, at each
+//! report and at its drop. The document asked is the one the placement
+//! was decided under, whichever is in force when its host splits it.
 //!
 //! **A pair's two sides** share the pair's one placement behind a lock.
 //! The lock is one request's own: its two sides alone take it, each for
@@ -72,7 +74,7 @@ use parking_lot::Mutex;
 use smg_worker::identity::basic::Worker;
 
 use super::{
-    lease::{EventKind, Outcome, ReleaseReason, Side},
+    lease::{Outcome, ReleaseReason, Side},
     placement::Placement,
 };
 use crate::engine::{
@@ -289,10 +291,12 @@ impl Placement<'static> {
     /// placement whose decode worker was taken out, and on any other that
     /// a decode worker was written into.
     ///
-    /// Where a stage of the document in force at this call takes an end,
-    /// each side shares the placement with the handles on its end
-    /// ([`PlacementSide::side_end`]): one allocation a side. Under any
-    /// other document a side keeps it by itself.
+    /// Where a stage of the document the placement was decided under
+    /// takes an end, each side shares the placement with the handles on
+    /// its end ([`PlacementSide::side_end`]): one allocation a side. Under
+    /// any other document a side keeps it by itself. A document put in
+    /// force since the decision changes neither: a word of the placement's
+    /// lease goes to the stages that stood at its issue.
     #[must_use]
     pub fn sides(self) -> (PlacementSide, Option<PlacementSide>) {
         let profile = self.profile;
@@ -303,9 +307,7 @@ impl Placement<'static> {
             self.decode.is_some(),
             "a placement names a decode worker where it is a pair's, and nowhere else"
         );
-        let told = lease
-            .and_then(|held| held.door())
-            .is_some_and(|engine| engine.takes(EventKind::Completed));
+        let told = lease.is_some_and(|held| held.takes_end());
         if !pair {
             if !told {
                 // One expression, so that a build can write the side where
@@ -550,7 +552,7 @@ mod tests {
         },
         stages::{pickers::push_drawn, registry::StageRegistry, Lifecycle},
         store::GatewayId,
-        tracking::lease::{EventSet, Lease, TransportClass},
+        tracking::lease::{EventKind, EventSet, Lease, TransportClass},
     };
 
     const MODEL: &str = "model-a";
@@ -1753,6 +1755,61 @@ mod tests {
         let alone = Placement::alone(Arc::clone(&host.workers[0]), "round_robin");
         let (side, none) = alone.sides();
         assert!(none.is_none() && side.side_end().is_empty());
+    }
+
+    /// A split asks the document its placement was decided under whether a
+    /// stage takes an end, whichever document is in force at the split. A
+    /// request placed under a document that takes an end, and split behind
+    /// one that takes none, shares its placement with its handles. A
+    /// request placed under a document that takes none, and split behind
+    /// one that takes an end, keeps its placement by itself.
+    #[test]
+    fn a_split_asks_the_document_its_placement_was_decided_under() {
+        // A document over a stage table of its own, whose picker takes
+        // `takes`: a document that follows it keeps none of its stages.
+        let under = |generation: u64, takes: EventSet| {
+            let mut stages = StageRegistry::builtin();
+            let added = stages.picker("hears", move || {
+                Box::new(Hears {
+                    takes,
+                    words: Arc::default(),
+                    ends: Arc::default(),
+                })
+            });
+            added.expect("a free name");
+            let mut document = PolicySpec::preset("round_robin").expect("a built-in preset");
+            document.generation = generation;
+            let profile = document.profiles.get_mut("round_robin");
+            profile.expect("the preset's profile").pick = "hears".into();
+            let spec = AppliedSpec::validate_in(&document, &stages, &[]);
+            spec.expect("the stages hold the picker")
+        };
+        let workers = [
+            worker("prefill", WorkerType::Prefill),
+            worker("decode", WorkerType::Decode),
+        ];
+        let list = PublishedList::new(Arc::from([Arc::clone(&workers[0])]));
+        let cases = [
+            (EventSet::LEASE, NO_END, true),
+            (NO_END, EventSet::LEASE, false),
+        ];
+        for (first, next, shared) in cases {
+            let engine = PolicyEngine::new(under(1, first));
+            let engine: &'static PolicyEngine = Box::leak(Box::new(engine));
+            let lists = WorkerLists::Single(list.lent());
+            let placement = placed(engine, &workers, lists, false);
+            assert!(placement.owes_events());
+            let applied = engine.apply(under(2, next));
+            applied.expect("a number above the standing one");
+            let (side, none) = placement.sides();
+            assert!(none.is_none(), "a single request has one side");
+            let told = matches!(side.kept, Kept::Told(_));
+            assert_eq!(
+                told, shared,
+                "the document that decided takes an end: {shared}"
+            );
+            assert_eq!(side.side_end().is_empty(), !shared);
+        }
     }
 
     /// A handle travels with its holder: to the task that reads the
