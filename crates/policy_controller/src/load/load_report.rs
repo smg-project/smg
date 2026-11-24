@@ -23,6 +23,8 @@ use crate::{
 /// A known rate under one token a second reads as one, zero being unknown.
 /// The resident tokens are counted by such a complete report alone: a
 /// rank the report leaves out holds tokens no sum of the others states.
+/// Their sum over the ranks saturates: counts past what one sum holds read
+/// as the most the row states, and never wrap.
 /// `source` is where the report came from; `report_age_ms` is `now` less
 /// `sampled_at`.
 pub fn load_row(
@@ -61,7 +63,9 @@ pub fn load_row(
             _ if rank.num_running_reqs > 0 => live_rate += rank.gen_throughput,
             _ => {}
         }
-        resident = resident.zip(rank.num_resident_tokens).map(|(a, b)| a + b);
+        resident = resident
+            .zip(rank.num_resident_tokens)
+            .map(|(sum, count)| sum.saturating_add(count));
     }
     if role == Role::Prefill {
         live_rate = prefill_rate.unwrap_or(0.0);
@@ -357,6 +361,29 @@ mod tests {
             (no_rank.resident_tokens, no_rank.resident_counted),
             (0, false)
         );
+    }
+
+    /// Ranks that state counts past what one sum holds make a counted row
+    /// of the most its field states: the sum over the ranks saturates and
+    /// never wraps. Under the least count it saturates too, and the row
+    /// reads none.
+    #[test]
+    fn resident_tokens_past_what_one_sum_holds_saturate() {
+        let now = Instant::now();
+        let stating = |count: i64| {
+            let mut stated = rank(1, 0, 0.1, 40.0, None);
+            stated.num_resident_tokens = Some(count);
+            stated
+        };
+        let most = report(vec![stating(i64::MAX), stating(i64::MAX)]);
+        let row = load_row(&most, Role::Single, now, now, SignalSource::Poll);
+        assert_eq!(
+            (row.resident_tokens, row.resident_counted),
+            (u32::MAX, true)
+        );
+        let least = report(vec![stating(i64::MIN), stating(i64::MIN)]);
+        let row = load_row(&least, Role::Single, now, now, SignalSource::Poll);
+        assert_eq!((row.resident_tokens, row.resident_counted), (0, true));
     }
 
     #[test]
