@@ -646,17 +646,18 @@ fn the_doors_of_a_chosen_decode_side_step_its_sessions_count() {
     assert!(counts.iter().all(|kept| kept.held() == 0));
 }
 
-/// A lease that counts for no key steps no session's count at any door,
-/// whatever session it carries. A pair that the door of a keyless
-/// decision issues: at its
-/// filing, at its decode side's dispatch on another target and at its
-/// end. A single's lease whose decision read no count: at its dispatch on
-/// another target. Each books and moves its worker's count alone. One
-/// lease that counts for the key stands on each worker throughout, so a
-/// step under the key that no door owes reads as a count off one.
+/// A pair that a decision issues counts for each side's key, as a pair
+/// filed whole does: at its filing, at its decode side's dispatch on
+/// another target and at its end, each side's session steps with the
+/// side's own count. A single's lease that counts for no key steps no
+/// session's count at any door, whatever session it carries: at its
+/// filing, at its dispatch on another target and at its completion it
+/// books and moves its worker's count alone. One lease that counts for the
+/// key stands on each worker throughout, so a step under the key that no
+/// door owes reads as a count off one.
 #[cfg(feature = "controller")]
 #[test]
-fn a_lease_that_counts_for_no_key_steps_no_sessions_count() {
+fn a_decided_pair_counts_each_sides_key_and_an_unkeyed_single_counts_none() {
     let store = MemoryStore::new();
     let workers = ["http://p:1", "http://d:1", "http://e:1"].map(|key| ready(&store, key));
     let counts = workers.map(|id| handed(&store, id));
@@ -681,11 +682,11 @@ fn a_lease_that_counts_for_no_key_steps_no_sessions_count() {
     let slots = [world.booked_of(p), world.booked_of(d)];
     let lease = store.issue_decided_pair(record, decode, slots, |_| ());
     let lease = lease.expect(minted).id;
-    assert_eq!(read(), [(1, 2), (1, 2), (1, 1)], "a pair's filing");
+    assert_eq!(read(), [(2, 2), (2, 2), (1, 1)], "a pair's filing");
     assert!(leases.dispatched(gateway, lease, on(Side::Decode, 1), now));
     assert_eq!(
         read(),
-        [(1, 2), (1, 1), (1, 2)],
+        [(2, 2), (1, 1), (2, 2)],
         "its decode on another target"
     );
     assert!(leases.released(gateway, lease, None, ReleaseReason::ClientGone));

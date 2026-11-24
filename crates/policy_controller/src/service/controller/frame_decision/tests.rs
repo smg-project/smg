@@ -2492,36 +2492,46 @@ fn a_served_pairs_keyed_lease_counts_its_key_on_each_sides_worker() {
 /// issues the side: a side that stands chosen carries no request. The
 /// decode the pair chose is not ready at the call, so the call picks the
 /// other, and the key counts on the decode the call picked. The issue's
-/// undo gives the decode's count up, and the prefill's stands.
+/// undo gives the decode's count up, and the prefill's stands. A pair
+/// whose first frame states no key counts none of its own, and its call's
+/// key counts all the same: each side counts the key its own frame states.
 #[test]
 fn a_served_pairs_later_decode_counts_its_key_from_its_calls_issue() {
-    let store = Arc::new(MemoryStore::new());
-    store
-        .apply(ruled_pair_plan())
-        .expect("above the unbound start");
-    let p = side_member(&store, "p0", Role::Prefill, None);
-    let decodes = ["d0", "d1"].map(|name| side_member(&store, name, Role::Decode, None));
-    LeasesStore::set_term(&*store, 1);
-    let objects = holder(&store);
-    let now = Instant::now();
-    let keys = || keys_on(&objects, ["p0", "d0", "d1"]);
-    let mut frame = keyed(at_prefill(1, WireModes::NONE, None), 7);
-    frame.decode_later = true;
-    let (decision, prefill, decode) = leased_pair(&store, &objects, frame, now);
-    assert_eq!((decode, keys()), (None, [1, 0, 0]), "a chosen side");
-    let hand = open(&store, GATEWAY);
-    let own = sent(&prefill, proto::Side::Prefill, 0);
-    lifecycle::dispatched(&store, &hand, &own, now).expect("the frame reads");
-    let first = pairs_of(&decision)[0].1;
-    stand(&objects, &store, first, WorkerStatus::NotReady);
-    let call = keyed(at_call(2, prefill.id, WireModes::NONE, None), 7);
-    let (again, issued) = leased_call(&store, &objects, call, now);
-    let other = if first == decodes[0] { 1 } else { 0 };
-    assert_eq!(pairs_of(&again), [(p, decodes[other])], "it picks again");
-    let (_, issue) = issued.expect("a pick's issue");
-    let mut counted = [1, 0, 0];
-    counted[1 + other] = 1;
-    assert_eq!(keys(), counted, "the call's issue, on the decode it picked");
-    assert!(store.unissue_decode(GATEWAY, prefill.id, issue));
-    assert_eq!(keys(), [1, 0, 0], "the issue taken back");
+    for first_key in [Some(7), None] {
+        let store = Arc::new(MemoryStore::new());
+        store
+            .apply(ruled_pair_plan())
+            .expect("above the unbound start");
+        let p = side_member(&store, "p0", Role::Prefill, None);
+        let decodes = ["d0", "d1"].map(|name| side_member(&store, name, Role::Decode, None));
+        LeasesStore::set_term(&*store, 1);
+        let objects = holder(&store);
+        let now = Instant::now();
+        let keys = || keys_on(&objects, ["p0", "d0", "d1"]);
+        let frame = at_prefill(1, WireModes::NONE, None);
+        let mut frame = match first_key {
+            Some(key) => keyed(frame, key),
+            None => frame,
+        };
+        frame.decode_later = true;
+        let (decision, prefill, decode) = leased_pair(&store, &objects, frame, now);
+        // The prefill's worker carries the first frame's key, where it states one.
+        let held = usize::from(first_key.is_some());
+        assert_eq!((decode, keys()), (None, [held, 0, 0]), "a chosen side");
+        let hand = open(&store, GATEWAY);
+        let own = sent(&prefill, proto::Side::Prefill, 0);
+        lifecycle::dispatched(&store, &hand, &own, now).expect("the frame reads");
+        let first = pairs_of(&decision)[0].1;
+        stand(&objects, &store, first, WorkerStatus::NotReady);
+        let call = keyed(at_call(2, prefill.id, WireModes::NONE, None), 7);
+        let (again, issued) = leased_call(&store, &objects, call, now);
+        let other = if first == decodes[0] { 1 } else { 0 };
+        assert_eq!(pairs_of(&again), [(p, decodes[other])], "it picks again");
+        let (_, issue) = issued.expect("a pick's issue");
+        let mut counted = [held, 0, 0];
+        counted[1 + other] = 1;
+        assert_eq!(keys(), counted, "the call's issue, on the decode it picked");
+        assert!(store.unissue_decode(GATEWAY, prefill.id, issue));
+        assert_eq!(keys(), [held, 0, 0], "the issue taken back");
+    }
 }
