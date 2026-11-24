@@ -82,8 +82,9 @@
                              prompt (default off; decode picks keep the whole prompt)
     balance_rel_threshold:   Relative margin of the spill gate (multiple of the fleet mean)
     eviction_interval_secs:  Interval between LRU eviction / TTL sweep cycles
-    max_tree_size:           Max total size (chars/tokens) of each model's approximate tree,
-                             shared across all workers; enforced by eviction
+    max_tree_size:           Max total size of each model's approximate tree (chars plus
+                             1024 for each node a worker stands on, or tokens), shared
+                             across all workers; enforced by eviction
     block_size:              Backend KV cache block size for event-driven routing
     cache_index:             Under-layer: tree (radix trees) or hash (placement map)
     cache_ttl_secs:          Seconds a hash-index placement stays routable
@@ -317,8 +318,9 @@ fn hash_token_head(namespace: Option<CacheNamespace>, head: &[u32]) -> u64 {
     }
 }
 
-/// Total cached characters across tenants and the tenant count for one
-/// model's string tree. O(tenants): sums the tree's maintained counters.
+/// Total size across tenants (cached characters plus 1024 for each node)
+/// and the tenant count for one model's string tree. O(tenants): sums the
+/// tree's maintained counters.
 fn string_tree_totals(tree: &Tree) -> (usize, usize) {
     let counts = tree.get_tenant_char_count();
     (counts.values().sum(), counts.len())

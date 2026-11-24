@@ -544,8 +544,9 @@ pub struct IndexSpec {
     /// How long a hash-index placement stays routable, in seconds.
     #[schemars(range(min = 1))]
     pub ttl_s: u32,
-    /// The size bound of a tree index: characters on a text host, tokens
-    /// otherwise. The crate's own store reads it for a pool whose profile
+    /// The size bound of a tree index: on a text host its characters plus
+    /// 1024 for each node a worker stands on, tokens otherwise.
+    /// The crate's own store reads it for a pool whose profile
     /// reads sent prefixes: the model's record is bound to `max_size` over
     /// the block size placements, never under one, one a block a worker
     /// was sent. A lowered bound is met by sweeps at the record's next
