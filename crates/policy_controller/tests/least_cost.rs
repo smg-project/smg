@@ -153,6 +153,27 @@ fn sent_terms_alone_need_the_reports_and_no_rule_for_a_row_without_one() {
     assert!(!engine.profiles()[0].scoped());
 }
 
+/// A term that prices the sends by their tokens asks its host for each
+/// request's size: the send of a request of text alone is counted by its
+/// text's bytes, and a host that can send a request on without reading its
+/// prompt states them only where a stage of the document asks. A term that
+/// counts the sends asks for no size, and neither does a document that
+/// names no send.
+#[test]
+fn a_term_that_prices_the_sends_by_their_tokens_asks_for_each_requests_size() {
+    for (terms, sized) in [
+        ("terms: {sent.requests: 3, sent.tokens: 1}", true),
+        ("terms: {candidate.in_flight: 100, sent.tokens: 2}", true),
+        ("terms: {sent.requests: 1000}", false),
+        ("terms: {candidate.in_flight: 3}", false),
+    ] {
+        let engine = engine(terms);
+        assert_eq!(engine.needs().prompt_size, sized, "{terms}");
+        let stage = &engine.profiles()[0].scorers[0].scorer;
+        assert_eq!(stage.needs().prompt_size, sized, "{terms}, the stage");
+    }
+}
+
 #[test]
 fn sent_tokens_adds_the_tokens_the_sends_stated() {
     let engine = engine("terms: {candidate.in_flight: 100, sent.tokens: 2}");

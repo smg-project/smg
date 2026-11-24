@@ -254,12 +254,13 @@ impl HasRoomRule {
     }
 
     /// Whether a row has room, by its report as `load` hands it and its
-    /// sends as `sent` counts them: the requests and the stated tokens
-    /// ([`DispatchCreditPass::counts`]), or `None` where the rule reads no
-    /// count. The sum runs in name order: the count in flight, the report's
-    /// fields, the request's part as `asked` ([`Self::asked`]), the sends.
-    /// `within` says whether that sum is within the row's bound: the rule's own
-    /// test, or the signal form's behind its signals.
+    /// sends as `sent` counts them: the requests and their tokens, stated
+    /// or estimated ([`DispatchCreditPass::counts`]), or `None` where the
+    /// rule reads no count. The sum runs in name order: the count in
+    /// flight, the report's fields, the request's part as `asked`
+    /// ([`Self::asked`]), the sends. `within` says whether that sum is
+    /// within the row's bound: the rule's own test, or the signal form's
+    /// behind its signals.
     ///
     /// [`DispatchCreditPass::counts`]: crate::tracking::dispatch_credit::DispatchCreditPass::counts
     #[inline(always)]
@@ -394,12 +395,14 @@ impl Filter for HasRoomRule {
 
     // A report ends the sends before it, so the sends need the reports
     // though no term may read one. A rule that names the request's size
-    // needs it counted. The output limit asks nothing of a host: a request
-    // states it, or zero for none.
+    // needs it counted, and so does one that prices the sends by their
+    // tokens: a send of text alone is counted by its text's bytes. The
+    // output limit asks nothing of a host: a request states it, or zero
+    // for none.
     fn needs(&self) -> Needs {
         Needs {
             loads: self.loads || self.sent.is_some(),
-            prompt_size: self.request_tokens != 0.0,
+            prompt_size: self.request_tokens != 0.0 || self.terms.sizes_sends(),
             ..Needs::default()
         }
     }

@@ -87,7 +87,10 @@ pub struct Lease {
     /// The prompt size the request stated, in tokens: 0 where it stated
     /// none, as a request of text alone does. The `least-load` and
     /// `resident-work` stages credit a dispatch of no stated size at their
-    /// own mean prefill; every other reader takes the 0 as stated.
+    /// own mean prefill. A profile's count of sends keeps such a dispatch
+    /// by the estimate of its text ([`Self::prompt_size`]), which a
+    /// document's `sent.tokens` term adds. Every other reader takes the 0
+    /// as stated.
     pub tokens: u32,
     /// The length of the request's text in characters
     /// ([`crate::engine::RequestFacts::prompt_chars`]): 0 where the request
