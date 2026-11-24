@@ -386,6 +386,57 @@ async fn a_sequential_pair_whose_decode_moves_is_served_by_the_decode_it_moved_t
     assert_eq!((decode_a.load(), decode_b.load()), (0, 0));
 }
 
+/// A decode asked again behind its prefill is not counted against itself.
+/// Decode B holds one request and decode A none, under a decode side that
+/// takes the decode with the fewer requests in flight (`power_of_two`):
+/// each request is A's by its first decision. The route asks the decode
+/// again while it counts the request on A, and the request stays A's: the
+/// engine reads A without the request it is asked for.
+#[tokio::test]
+async fn a_decode_asked_again_is_not_counted_against_itself() {
+    let heard = Heard::default();
+    let prefill = Prefill {
+        heard: Arc::clone(&heard),
+        preferred: Preferred::default(),
+        then: None,
+    };
+    let prefill = serve_engine(prefill.into_server()).await;
+    let decode_a = serve_engine(Decode(Arc::clone(&heard), "decode A").into_server()).await;
+    let decode_b = serve_engine(Decode(Arc::clone(&heard), "decode B").into_server()).await;
+    let [decode_a, decode_b] = [decode_a, decode_b].map(|port| worker(port, WorkerType::Decode));
+    let workers = vec![
+        worker(prefill, WorkerType::Prefill),
+        Arc::clone(&decode_a),
+        Arc::clone(&decode_b),
+    ];
+    let mut config = pair_config(DecodePick::AfterPrefill);
+    let document = PolicySpec::pair_presets("round_robin", "power_of_two");
+    let mut document = document.expect("the pair presets");
+    document.generation = 1;
+    document.plans.pd_pair.decode = DecodePick::AfterPrefill;
+    config.policy_spec = Some(document);
+    let router = build_grpc_router(config, MODEL, workers).await;
+    // The route moves a request only to a decode whose client the gateway
+    // holds, which it does from the first decision that names the decode:
+    // one request names each decode first.
+    for busy in [&decode_a, &decode_b] {
+        busy.increment_load();
+        chat(router.as_ref(), &heard).await;
+        busy.decrement_load();
+    }
+    heard.lock().expect("the record").clear();
+
+    decode_b.increment_load();
+    for _ in 0..8 {
+        chat(router.as_ref(), &heard).await;
+    }
+    decode_b.decrement_load();
+
+    let said = heard.lock().expect("the record").clone();
+    let moved = said.iter().filter(|word| *word == "decode B was asked");
+    assert_eq!(moved.count(), 0, "{said:?}");
+}
+
 /// A pair whose decode moved states the weight version of the decode that
 /// answered. Decode A and decode B carry a version each, and a chat
 /// answer's `system_fingerprint` is its worker's. The first request is

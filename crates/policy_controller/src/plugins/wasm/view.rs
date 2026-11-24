@@ -1544,7 +1544,6 @@ mod tests {
             prompt_chars: 0,
             prompt_bytes: 0,
             now_micros: 0,
-            pinned_at: 0,
             lent_in_flight: None,
             session_counted: false,
             // Host-only: the request block carries no affinity column and

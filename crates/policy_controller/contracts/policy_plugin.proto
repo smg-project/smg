@@ -580,7 +580,7 @@ message Completed {
   fixed64 served = 3;
   // The HTTP status or the gRPC code the request ended with.
   uint32 status = 4;  // u16
-  // The transport outcome the health precedence reads.
+  // The transport outcome of the request.
   enum Class {
     CLASS_UNSPECIFIED = 0;
     CLASS_OK = 1;

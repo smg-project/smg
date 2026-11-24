@@ -532,7 +532,9 @@ fn a_prompt_is_hashed_by_the_block_size_of_its_workers_id() {
 /// the size its request would state. The engine then answers it a place where one pick decides its
 /// place: no clock is read for it. Each fact that asks more than a worker
 /// of the list takes the request off that path. A decode asked again
-/// does not: over one list the word asks nothing.
+/// does not: over one list the word asks nothing. Neither does a list
+/// whose host states facts of its workers: a request that demands nothing
+/// reads none of them.
 #[test]
 fn a_plain_request_says_so_and_is_answered_a_place() {
     let engine = preset("round_robin");
@@ -592,6 +594,22 @@ fn a_plain_request_says_so_and_is_answered_a_place() {
         Instant::now()
     };
     let decided = engine.decide_at(&Made::new(&engine, &plain, &[]), clock);
+    assert!(matches!(decided, Ok(Decided::Alone(pick)) if pick.place < 4));
+    assert_eq!(read.get(), 0, "a place dates nothing");
+    // A list whose host states a fact of each worker, as a host that dials
+    // several runtimes does: the fill of the list's cell takes the facts,
+    // and the plain request is answered a place as over the silent list.
+    let stating = PublishedList::with_facts(Arc::clone(&list), |_| {
+        let mut facts = FixedFacts::default();
+        facts.demands.runtime = 7;
+        facts
+    });
+    let stated = PlaceRequest {
+        prompt: plain.prompt,
+        ..PlaceRequest::of(MODEL, WorkerLists::Single(stating.lent()))
+    };
+    assert_eq!(Made::new(&engine, &stated, &[]).plain(), said);
+    let decided = engine.decide_at(&Made::new(&engine, &stated, &[]), clock);
     assert!(matches!(decided, Ok(Decided::Alone(pick)) if pick.place < 4));
     assert_eq!(read.get(), 0, "a place dates nothing");
 

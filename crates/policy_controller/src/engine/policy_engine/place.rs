@@ -299,6 +299,18 @@ pub struct PlaceRequest<'a> {
     /// video) books its decode with its prefill whatever it states here: a
     /// decode asked again reads no image fact.
     pub decode_again: bool,
+    /// Whether the caller counts this request on the decode its first
+    /// decision named while it asks that decode again: one of that
+    /// decode's requests in flight, as a guard the caller holds on that
+    /// decode across the call counts it. The decode asked again then reads
+    /// that decode with one request less in flight
+    /// ([`Constraints::counted_on_decode`]), and every other decode as it
+    /// stands. That decode is the worker of its id in the list handed at
+    /// this call, and its count of session keys is read as the worker
+    /// states it. A caller that states nothing here is read as it counts:
+    /// a request it counted on that decode stands among that decode's
+    /// requests. A first decision reads nothing here.
+    pub counted_on_decode: bool,
     /// The hash ring the caller keeps of the model's workers, lent to the
     /// request's decision ([`LentRing`]): one ring for a pair's two lists,
     /// and no part of a list. Under a document whose ring stage places a
@@ -358,7 +370,7 @@ impl<'a> PlaceRequest<'a> {
     /// A first attempt for `model` over `lists` that states no other fact:
     /// no prompt, no header, no id, no tenant, no media, no demand, no
     /// encode item, nothing tried, no budget, no second ask of a decode, no
-    /// ring and no rule of its route.
+    /// count on a decode, no ring and no rule of its route.
     #[must_use]
     pub fn of(model: &'a str, lists: WorkerLists<'a>) -> Self {
         Self {
@@ -378,6 +390,7 @@ impl<'a> PlaceRequest<'a> {
             tried: &[],
             budget_micros: 0,
             decode_again: false,
+            counted_on_decode: false,
             ring: None,
             admits: None,
         }
@@ -842,6 +855,7 @@ impl RequestMaker for Made<'_, '_> {
                 excluded: self.missed,
                 places: self.places,
                 decode_later: later,
+                counted_on_decode: request.counted_on_decode,
                 demands: request.demands,
                 ..Constraints::default()
             },

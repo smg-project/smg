@@ -596,7 +596,7 @@ async fn judge(
             lifecycle::dispatched(&shared.store, hand, dispatched, now).err()
         }
         Some(Frame::Completed(completed)) => {
-            lifecycle::completed(&shared.store, hand, completed, now).err()
+            lifecycle::completed(&shared.store, hand, completed).err()
         }
         Some(Frame::Released(released)) => lifecycle::released(&shared.store, hand, released).err(),
         Some(Frame::Veto(veto)) => vetoed(seat, veto, now),
@@ -1493,7 +1493,6 @@ mod tests {
         assert!(matches!(state(1), Some(LeaseState::Dispatched { .. })));
         assert_eq!(state(2), None);
         assert_eq!(state(3), None);
-        assert!(store.completed_ok_since(gateway, served, t0));
     }
 
     /// The session's rule holds for the lifecycle: a frame under a closed
@@ -1532,11 +1531,15 @@ mod tests {
         bed.leads(1);
         let gateway = told(GATEWAY).gateway();
         let store = Arc::clone(&bed.shared.store);
-        let (first, second) = (
-            worker(&store, "http://a:8000"),
-            worker(&store, "http://b:8000"),
-        );
+        let served = worker(&store, "http://a:8000");
         let now = Instant::now();
+        // A lease each frame ends where it is applied, under the led term.
+        store.set_term(1);
+        for id in 1..=3 {
+            store.issue(lease(gateway, id, now)).expect("a lease");
+        }
+        let state =
+            |id: u64| LeasesStore::get(&*store, gateway, LeaseId(id)).map(|record| record.state);
         let seat = bed
             .shared
             .gateways
@@ -1546,7 +1549,7 @@ mod tests {
         let mut answers = Answers { sender, seq: 0 };
 
         // While its seat stands the session's frame is applied.
-        let report = frame(1, Some(Frame::Completed(a_completed(1, first))));
+        let report = frame(1, Some(Frame::Completed(a_completed(1, served))));
         assert!(judge(
             &bed.shared,
             GATEWAY,
@@ -1558,14 +1561,14 @@ mod tests {
         )
         .await
         .is_none());
-        assert!(store.completed_ok_since(gateway, first, now));
+        assert_eq!(state(1), None, "the frame ended its lease");
 
         let newer = bed
             .shared
             .gateways
             .welcome(gateway, GATEWAY, 1, now)
             .expect("a seat");
-        let late = frame(1, Some(Frame::Completed(a_completed(1, second))));
+        let late = frame(1, Some(Frame::Completed(a_completed(2, served))));
         let status = judge(
             &bed.shared,
             GATEWAY,
@@ -1584,14 +1587,14 @@ mod tests {
                 "a newer session of this gateway took this one's place"
             )
         );
-        assert!(
-            !store.completed_ok_since(gateway, second, now),
+        assert_eq!(
+            state(2),
+            Some(LeaseState::ISSUED),
             "a replaced session writes nothing"
         );
 
         // The session that replaced it was never told: its frame is applied.
-        let third = worker(&store, "http://c:8000");
-        let report = frame(1, Some(Frame::Completed(a_completed(1, third))));
+        let report = frame(1, Some(Frame::Completed(a_completed(3, served))));
         assert!(judge(
             &bed.shared,
             GATEWAY,
@@ -1603,7 +1606,7 @@ mod tests {
         )
         .await
         .is_none());
-        assert!(store.completed_ok_since(gateway, third, now));
+        assert_eq!(state(3), None, "the frame ended its lease");
     }
 
     /// And for the floor: a lifecycle frame whose floor is above the term

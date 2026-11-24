@@ -1,10 +1,11 @@
 //! A host reads its workers' cache events into its own store's index: every
 //! replica of the controller, and a gateway that decides in its own process.
-//! A host that hands the follow its worker monitor
-//! ([`KvFeed::set_load_sink`]) reads the load records the streams carry as
-//! well. A gRPC worker whose row is not indexed then streams its load
-//! records alone, and so does a rank above 0 of a data-parallel worker,
-//! which opens no events feed.
+//! A host that hands the follow a sink ([`KvFeed::set_load_sink`]) reads
+//! the load records the streams carry as well. Under a host that hands it
+//! the monitor that says whose loads are wanted
+//! ([`KvFeed::set_loads_wanted`]), a gRPC worker whose row is not indexed
+//! streams its load records alone, and so does a rank above 0 of a
+//! data-parallel worker, which opens no events feed.
 //!
 //! # Limits
 //!
@@ -22,7 +23,7 @@ use std::{
 
 use smg_worker::{
     identity::basic::Worker,
-    kv_events::{KvEventCollector, SubscriptionKind},
+    kv_events::{KvEventCollector, PushedLoadSink, SubscriptionKind},
     load::monitor::WorkerMonitor,
     registry::{event::WorkerEvent, Generation, WorkerId, WorkerRegistry},
     worker::ConnectionMode,
@@ -46,8 +47,8 @@ pub struct KvFeed<G: Generation> {
     store: Arc<MemoryStore>,
     objects: Arc<Objects<G>>,
     /// The host's worker monitor, once handed: it says whether a worker's
-    /// loads are wanted. The collector keeps its own hold of it, for the
-    /// records.
+    /// loads are wanted. The collector keeps its own weak hold of the
+    /// records' sink.
     loads: OnceLock<Weak<WorkerMonitor<G>>>,
 }
 
@@ -70,14 +71,24 @@ impl<G: Generation> KvFeed<G> {
         }
     }
 
-    /// Hand the follow the host's worker monitor (once; a later call is
-    /// ignored). The load records every stream carries then reach the
-    /// monitor, and a gRPC worker whose row is not indexed gets a stream
-    /// for its load records alone where the monitor wants them
-    /// ([`WorkerMonitor::loads_wanted`]). A worker already told keeps the
-    /// stream it has, so a host calls this before [`Self::run`].
-    pub fn set_load_sink(&self, monitor: &Arc<WorkerMonitor<G>>) {
-        self.collector.set_load_sink(monitor);
+    /// Hand the follow where the load records on its streams go (once; a
+    /// later call is ignored): the host's worker monitor, or a sink of the
+    /// host's own, which hands a record on to its monitor or drops it. No
+    /// stream is opened for the records' sake: they ride the streams the
+    /// follow opens. The follow holds the sink weakly, and the caller keeps
+    /// it alive for as long as records should reach it ([`PushedLoadSink`]).
+    pub fn set_load_sink<S: PushedLoadSink + 'static>(&self, sink: &Arc<S>) {
+        self.collector.set_load_sink(sink);
+    }
+
+    /// Hand the follow the monitor that says whose loads are wanted (once;
+    /// a later call is ignored). A gRPC worker whose row is not indexed
+    /// then gets a stream for its load records alone where the monitor
+    /// wants them ([`WorkerMonitor::loads_wanted`]). A worker already told
+    /// keeps the stream it has, so a host calls this before [`Self::run`].
+    /// No program calls it yet: which replica of a controller opens such
+    /// a stream, and when, is a later change's to decide.
+    pub fn set_loads_wanted(&self, monitor: &Arc<WorkerMonitor<G>>) {
         let _ = self.loads.set(Arc::downgrade(monitor));
     }
 

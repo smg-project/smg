@@ -5552,6 +5552,7 @@ pub struct AppliedSpec {
     /// The view's block size: a request that names none is counted by it.
     block_size: u32,
     /// The index settings a model takes at a membership write or apply.
+    #[cfg(feature = "in-process")]
     index: BTreeMap<String, IndexSpec>,
     pairing: Pairing,
     /// The document's `plans.pd-pair.decode`.
@@ -5638,6 +5639,7 @@ impl AppliedSpec {
             signal_columns,
             max_block_hashes: document.view.max_block_hashes,
             block_size: Gates::of(None, None, document.view.block_size).block_size,
+            #[cfg(feature = "in-process")]
             index: document.index.clone(),
             pairing: document.plans.pd_pair.pairing,
             decode_pick: document.plans.pd_pair.decode,
@@ -5668,6 +5670,7 @@ impl AppliedSpec {
             signal_columns: Arc::default(),
             max_block_hashes: ViewSpec::default().max_block_hashes,
             block_size: Gates::default().block_size,
+            #[cfg(feature = "in-process")]
             index: BTreeMap::new(),
             pairing: Pairing::default(),
             decode_pick: DecodePick::default(),
@@ -5750,6 +5753,7 @@ impl AppliedSpec {
     }
 
     /// The most specific matching index settings, or the default.
+    #[cfg(feature = "in-process")]
     pub(crate) fn index_for(&self, model: &str) -> IndexSpec {
         index_matching(&self.index, model)
             .map(|(_, spec)| spec.clone())

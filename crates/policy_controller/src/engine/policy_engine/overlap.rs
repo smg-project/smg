@@ -22,11 +22,13 @@
 //! ([`CacheIndexes::token_tree`]) and the model has no index of cache
 //! events: inside the tree's match ([`TokenTree`]). The match names the
 //! workers sent the deepest prefix of the request, and the same descent
-//! writes the request for the worker picked. The tree is the host's own,
-//! the one its policy reads and writes: the engine keeps none. A request
-//! its host holds as text is decided the same way inside the host's string
-//! tree ([`CacheIndexes::string_tree`], [`TextKey`]), whether or not the
-//! model has an index: an index speaks of token blocks.
+//! writes the request for the worker picked. The pick states its first
+//! target's entry of the rows the match named, as every other pick states
+//! its rows'. The tree is the host's own, the one its policy reads and
+//! writes: the engine keeps none. A request its host holds as text is
+//! decided the same way inside the host's string tree
+//! ([`CacheIndexes::string_tree`], [`TextKey`]), whether or not the model
+//! has an index: an index speaks of token blocks.
 //!
 //! What is kept, and what guards it:
 //!
@@ -1517,12 +1519,22 @@ struct Asked<'a> {
 /// its prefix, for the first one it takes. No other decision asks it.
 ///
 /// A pick states what its first target holds of the request ([`Overlap`]),
-/// from the rows its decision was given: the rows named here, the column
-/// filled here, a column its host filled or the rows its host named. A
-/// request decided inside a tree's match states nothing: a match is a count
-/// of tokens and no entry of blocks. Neither does a decision whose own
-/// profile reads no affinity, whether it is given no rows or the rows of
-/// its binding's shadow.
+/// from the rows its decision was given: the rows named here, from the
+/// host's data or from a tree's match, the column filled here, a column its
+/// host filled or the rows its host named. A decision whose own profile
+/// reads no affinity states nothing, whether it is given no rows or the
+/// rows of its binding's shadow.
+///
+/// A request decided inside a tree's match states what the match's rows
+/// say: the match's tokens counted in the request's blocks for a worker
+/// named among its holders, and a miss for any other. A gateway's classic
+/// cache-aware policy observes another thing of such a request, the match's
+/// share of the prompt's tokens whoever it chose, so the two differ in
+/// three places. A match under one block states a miss: a prompt shorter
+/// than one block always does, where the classic policy may observe it
+/// whole. A pick that is none of the match's holders states a miss, where
+/// the classic policy observes the match's share. Past the cap the holders
+/// named are a draw, so a holder the draw left out states a miss too.
 ///
 /// The rows live in the calling thread's buffers until this returns:
 /// `decide` reads them and keeps nothing of them. Nothing is allocated once
@@ -1968,6 +1980,10 @@ impl Table {
     /// sends to, stores nothing: the match has marked the path it walked as
     /// used, as every match of a tree does. The record of hashed prefixes
     /// is neither read nor written.
+    ///
+    /// The pick states its first target's entry of the rows the match named
+    /// ([`state`]), where the request's own profile reads affinity: the
+    /// match's blocks for a holder named, and a miss for any other worker.
     #[expect(
         clippy::too_many_arguments,
         reason = "the tree's walk, the target the caller takes, the list, the request's facts and its places, the buffers, and the decision"
@@ -1984,15 +2000,20 @@ impl Table {
     ) -> Decision {
         let mut decide_over = |holders: &[TenantId], blocks: u32| {
             self.name_sent(holders, blocks, workers, facts, places, buffers);
-            decide(&mut RequestFacts {
-                named: Some(AffinityRows {
-                    holders: &buffers.holders,
-                    warming: &buffers.warming,
-                    thin: self.ruled.thin,
-                    mean_in_flight: None,
-                }),
+            let named = AffinityRows {
+                holders: &buffers.holders,
+                warming: &buffers.warming,
+                thin: self.ruled.thin,
+                mean_in_flight: None,
+            };
+            let mut decision = decide(&mut RequestFacts {
+                named: Some(named),
                 ..*facts
-            })
+            });
+            if self.states {
+                state(&mut decision, Feed::Named(named), facts, self.block);
+            }
+            decision
         };
         let mut decided = None;
         walk(&mut |holders, blocks| {
@@ -2003,7 +2024,7 @@ impl Table {
         });
         // The tree asks for the worker once, so the decision was made
         // there. Were it not asked, the request is decided here, with no
-        // holder named and nothing written.
+        // holder named and nothing written: its pick states a miss.
         decided.unwrap_or_else(|| decide_over(&[], 0))
     }
 

@@ -2273,6 +2273,9 @@ pub(crate) mod tests {
                 heard.push((pinned, None));
             }
             heard.push((pinned, Some(ReleaseReason::ClientGone)));
+            // The hand leaves the release to a decider still at work
+            // behind its answer, which tells it as it leaves that work.
+            settled(|| told.lock().len() >= heard.len()).await;
             assert_eq!(*told.lock(), heard, "{kept:?}");
         }
     }
@@ -2419,7 +2422,7 @@ pub(crate) mod tests {
             );
             given_up(&bed, &plain);
             let ended = a_completed(lease_of(&pinned).id, near);
-            lifecycle::completed(&bed.store, &hand, &ended, at).expect("the frame reads");
+            lifecycle::completed(&bed.store, &hand, &ended).expect("the frame reads");
             let plain = bed.ask(sized(frame(5, 1_005), 1_000)).await;
             assert_eq!(
                 picked(&plain),
@@ -4195,7 +4198,7 @@ pub(crate) mod tests {
         let at = Instant::now();
         lifecycle::dispatched(&bed.store, &hand, &a_dispatched(lease), at)
             .expect("the frame reads");
-        lifecycle::completed(&bed.store, &hand, &a_completed(lease, picked(&answer)), at)
+        lifecycle::completed(&bed.store, &hand, &a_completed(lease, picked(&answer)))
             .expect("the frame reads");
         // The other model's decision, at the other file, right behind the
         // completion: it reads no request in flight.
@@ -4432,8 +4435,7 @@ pub(crate) mod tests {
                         .expect("the frame reads");
                     pause(served);
                     let completed = a_completed(lease, picked(&answer));
-                    lifecycle::completed(&bed.store, &hand, &completed, Instant::now())
-                        .expect("the frame reads");
+                    lifecycle::completed(&bed.store, &hand, &completed).expect("the frame reads");
                     pause(think);
                 }
                 // The first decision of a cell stands behind the cell

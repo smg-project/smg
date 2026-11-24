@@ -1,10 +1,10 @@
-//! The in-memory store's health tables per call: a completed dispatch and a
-//! gateway veto written for a registered worker, a veto read, and a removal
+//! The in-memory store's health table per call: a gateway veto written for a
+//! registered worker, a veto read, and a removal
 //! that clears a worker's entries across two gateways, with 64 workers
 //! registered. Ids: `policy_store/health/<op>` and
-//! `policy_store/remove_with_health`. The writers take the workers lock
+//! `policy_store/remove_with_health`. The writer takes the workers lock
 //! before the health lock, so a write landing after the worker's removal
-//! lands nowhere; this bench prices that lock on the completion path.
+//! lands nowhere.
 //!
 //! `policy_store/load_answer` is one poll's answer for one of the workers
 //! inside the publication window, with no build owed: the answer door as
@@ -26,7 +26,6 @@ use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
 use smg_policy_controller::{
     engine::{LoadRow, Role, WorkerId},
     store::{GatewayId, HealthSink, LoadSink, LoadSource, MemoryStore, WorkerFacts, WorkersStore},
-    tracking::TransportClass,
 };
 
 const WORKERS: u64 = 64;
@@ -61,13 +60,6 @@ fn health(c: &mut Criterion) {
     let gateway = GatewayId(1);
     let now = Instant::now();
     let mut turn = 0usize;
-    group.bench_function("completed", |b| {
-        b.iter(|| {
-            let id = ids[turn % ids.len()];
-            turn += 1;
-            sink.completed(black_box(gateway), black_box(id), TransportClass::Ok, now);
-        });
-    });
     group.bench_function("gateway_veto", |b| {
         b.iter(|| {
             let id = ids[turn % ids.len()];
@@ -100,7 +92,6 @@ fn remove(c: &mut Criterion) {
                 for id in &ids {
                     for gateway in [GatewayId(1), GatewayId(2)] {
                         sink.gateway_veto(gateway, *id, Some(now + Duration::from_secs(60)));
-                        sink.completed(gateway, *id, TransportClass::Ok, now);
                     }
                 }
                 let id = ids[ids.len() / 2];

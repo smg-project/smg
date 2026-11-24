@@ -460,6 +460,22 @@ impl<'a> PairLists<'a> {
             };
             let (workers, decode_records) = (decode.workers(), decode.records(spec, clock));
             let (decodes, decode_facts) = decode_records.write(workers, &live, decodes);
+            // A host that counts the request on its first decode
+            // ([`Constraints::counted_on_decode`]) is answered over that
+            // decode's record without the request. The decode is read at
+            // its first place, and looked for where the list moved.
+            if let Some(first) = held
+                .filter(|_| cx.counted_on_decode)
+                .and_then(|held| held.pair)
+            {
+                let is_first = |row: &Candidate| row.id == first.decode_id;
+                let place = Some(first.decode_position as usize)
+                    .filter(|&place| decodes.get(place).is_some_and(is_first))
+                    .or_else(|| decodes.iter().position(is_first));
+                if let Some(row) = place.and_then(|place| decodes.get_mut(place)) {
+                    row.in_flight = row.in_flight.saturating_sub(1);
+                }
+            }
             stamp(prefills, decodes, self.classes, self.admission);
             let (engine, scratch) = (spec.engine(), &mut buffers.scratch);
             let [prefill_side, decode_side] = sides;
