@@ -323,16 +323,11 @@ impl<G> Objects<G> {
     /// the object states, at each load report of its worker.
     ///
     /// Without it an object built from a row states no threshold, and a
-    /// load monitor writes no verdict on it: the store alone judges such a
-    /// worker, for its own decisions, and the holder does not copy its
-    /// verdict onto the object's flag.
+    /// load monitor writes no verdict on it: nothing judges such a worker.
     ///
-    /// The monitor and the store read their thresholds from two places. The
-    /// crate's two defaults, which the store reads under a binding whose
-    /// block is on for each signal a row names none for, are not read here:
-    /// `defaults` stands in their place, and with no signal in `defaults`
-    /// the monitor does not judge a row that names none. No document names
-    /// a threshold. The store judges an engine's ranks together, and the
+    /// The crate's two defaults are not read here: `defaults` stands in
+    /// their place, and with no signal in `defaults` the monitor does not
+    /// judge a row that names none. No document names a threshold. The
     /// monitor judges each object by its own report.
     #[must_use]
     pub fn with_overload_thresholds(mut self, defaults: OverloadThresholds) -> Self {

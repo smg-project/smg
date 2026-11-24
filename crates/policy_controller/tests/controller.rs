@@ -31,7 +31,7 @@ use rcgen::{
 };
 use smg_policy_controller::{
     document::{AppliedSpec, PolicySpec},
-    engine::{fingerprint, LoadRow, Role, WireModes, WorkerId},
+    engine::{fingerprint, Role, WireModes, WorkerId},
     service::{
         controller::{
             Config, ConfigError, Controller, ElectionConfig, Error, LeasePlace, Listener, Scope,
@@ -46,8 +46,8 @@ use smg_policy_controller::{
         },
     },
     store::{
-        GatewayId, LeaseRecord, LeaseState, LeasesStore, LoadSink, LoadSource, MemoryStore,
-        Overload, PickRecord, WorkerFacts, WorkerStatus, WorkersStore,
+        GatewayId, LeaseRecord, LeaseState, LeasesStore, MemoryStore, Overload, PickRecord,
+        WorkerFacts, WorkerStatus, WorkersStore,
     },
     tracking::{Lease, LeaseId},
 };
@@ -1453,8 +1453,8 @@ async fn mutual_tls_admits_the_authoritys_clients_and_refuses_the_rest() {
 
 /// `VmRSS` of this process, in KiB; `0` where `/proc` has no answer.
 /// The Numbers table's resident rows: the controller serving idle, then with
-/// a thousand workers and their load rows in its store. A measurement, run
-/// by name with `--ignored`; it prints and asserts only that the feed landed.
+/// a thousand workers in its store. A measurement, run by name with
+/// `--ignored`; it prints and asserts only that the feed landed.
 #[tokio::test]
 #[ignore = "a measurement for the Numbers table, run by name"]
 async fn rss_idle_and_with_a_thousand_workers_in_the_store() {
@@ -1469,10 +1469,9 @@ async fn rss_idle_and_with_a_thousand_workers_in_the_store() {
         assert_eq!(readiness.wait_for(State::Leader).await, Some(State::Leader));
         tokio::time::sleep(Duration::from_millis(200)).await;
         let idle = vm_rss_kib();
-        let now = Instant::now();
         for i in 0..1_000u32 {
             let key = format!("http://worker-{i}.fleet:8000");
-            let change = store.upsert(WorkerFacts {
+            store.upsert(WorkerFacts {
                 key: key.clone(),
                 engine: key,
                 incarnation: 1,
@@ -1482,19 +1481,6 @@ async fn rss_idle_and_with_a_thousand_workers_in_the_store() {
                 max_running: Some(256),
                 ..WorkerFacts::default()
             });
-            let id = change.id();
-            store.record(
-                id,
-                0,
-                LoadRow {
-                    running: i % 64,
-                    queued: i % 8,
-                    max_running: 256,
-                    ..LoadRow::default()
-                },
-                now,
-                LoadSource::Stream,
-            );
         }
         // The fleet arrived inside one window: its one build, asked here so
         // the figure holds the world a decision reads.
@@ -1798,8 +1784,7 @@ fn series(page: &str, name: &str) -> Option<u64> {
 /// that serves no stream of its load records is polled, and a worker with
 /// a gauge page alone is read over HTTP. The monitor publishes a report of
 /// each. The second's states its page's gauges, over the queue bound its
-/// row states: one overload verdict moves, once. The store holds no load
-/// row: the serve writes none.
+/// row states: one overload verdict moves, once.
 #[tokio::test]
 async fn the_serve_runs_the_load_monitor_and_renders_its_counts() {
     const PATIENCE: Duration = Duration::from_secs(30);
@@ -1817,10 +1802,8 @@ async fn the_serve_runs_the_load_monitor_and_renders_its_counts() {
     .expect("the controller binds");
     let admin = controller.addresses().admin;
     let (store, loads) = (controller.store(), controller.loads());
-    let rows = [
-        ready_row(&store, &polled, WireModes::GRPC, None).expect("the polled row"),
-        ready_row(&store, &read, WireModes::HTTP, Some(4)).expect("the read row"),
-    ];
+    ready_row(&store, &polled, WireModes::GRPC, None).expect("the polled row");
+    ready_row(&store, &read, WireModes::HTTP, Some(4)).expect("the read row");
     let (stop, stopped) = oneshot::channel::<()>();
     let serve = controller.serve(async {
         let _ = stopped.await;
@@ -1865,10 +1848,6 @@ async fn the_serve_runs_the_load_monitor_and_renders_its_counts() {
             Some((rank.num_running_reqs, rank.num_waiting_reqs))
         });
         assert_eq!(gauges, Some((3, 5)), "the report states the page's gauges");
-        assert!(
-            rows.iter().all(|row| store.load(*row, 0).is_none()),
-            "the serve writes no load row"
-        );
         stop.send(()).expect("the serve is listening for the stop");
     };
     let (served, ()) = tokio::join!(serve, probe);

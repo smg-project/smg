@@ -4,7 +4,7 @@
 
 use super::StoreSnapshot;
 use crate::{
-    engine::view::{LoadRow, Role, WorkerId},
+    engine::view::{Role, WorkerId},
     store::{GatewayId, MemoryStore, WorkerFacts, WorkersStore},
 };
 
@@ -36,12 +36,4 @@ fn admit(store: &MemoryStore, facts: WorkerFacts) -> WorkerId {
 /// A worker of the model, registered and not yet ready.
 fn member(store: &MemoryStore, key: &str) -> WorkerId {
     admit(store, facts(key, Role::Single, &[MODEL]))
-}
-
-fn load(running: u32, age_ms: u32) -> LoadRow {
-    LoadRow {
-        running,
-        report_age_ms: age_ms,
-        ..LoadRow::default()
-    }
 }

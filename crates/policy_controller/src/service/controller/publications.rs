@@ -72,8 +72,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        engine::view::{LoadRow, Role, WireModes, WorkerId},
-        store::{LoadSink, LoadSource, WorkerFacts, WorkersStore, PUBLISH_WINDOW},
+        engine::view::{Role, WireModes, WorkerId},
+        store::{WorkerFacts, WorkersStore},
     };
 
     /// A store with the loop running over it, and the loop's stop.
@@ -148,36 +148,24 @@ mod tests {
     }
 
     /// A write that wakes nobody is shown at the loop's next tick, a second
-    /// behind the loop's start: a load record that lands inside a window
-    /// waits for the window's end, the loop sleeps through it, and the tick
-    /// behind it publishes.
+    /// behind the loop's start: a registration leaves its build owed with
+    /// the store's wake put out, the loop sleeps through the instant the
+    /// store names, and the tick behind it pays the build.
     #[tokio::test(start_paused = true)]
     async fn a_write_that_wakes_nobody_is_shown_at_the_next_tick() {
         let (store, stop, tasks) = served();
         tokio::time::sleep(Duration::from_millis(1)).await;
-        let id = register(&store, "http://a:1");
-        store.publish_now();
         let started = now();
-        let record = |running: u32| {
-            let row = LoadRow {
-                running,
-                ..LoadRow::default()
-            };
-            store.record(id, 0, row, now(), LoadSource::Stream);
-        };
+        // The loop's wake is replaced by one that wakes nobody.
+        store.wake_with(Box::new(|| {}));
+        register(&store, "http://a:1");
+        let due = store.publish_due().expect("a build is owed");
 
-        // The first record lands behind a quiet window and is shown by its
-        // own write. The second lands inside the window it opened.
-        record(1);
-        tokio::time::sleep(Duration::from_millis(1)).await;
-        record(2);
-        assert!(store.publish_due().is_some(), "the second record waits");
-
-        // No wake came: the window's end passes and the record still waits.
-        tokio::time::sleep(PUBLISH_WINDOW * 2).await;
-        assert!(store.publish_due().is_some(), "the loop was woken");
-        after(started + Duration::from_secs(1)).await;
-        assert_eq!(store.publish_due(), None, "the tick published it");
+        // No wake came: the instant passes and the build is still owed.
+        after(due).await;
+        assert_eq!(store.membership_builds(), 0, "the loop was woken");
+        after(started.max(due) + TICK).await;
+        assert_eq!((store.membership_builds(), store.publish_due()), (1, None));
 
         stop.send_replace(true);
         ended(tasks).await;

@@ -347,8 +347,7 @@ impl Log {
     pub const BATCH: usize = 256;
 
     /// A log that retains the last `watched` writes (at least one). It
-    /// carries no load row: a store that journals to it pays nothing at a
-    /// load write.
+    /// carries no load row.
     pub fn new(watched: usize) -> Self {
         let watched = watched.max(1);
         Self {
@@ -830,8 +829,8 @@ impl AdoptionGuard<'_> {
     /// Applies a leader's event that writes nothing to this store, the
     /// first position of a term: the place alone is journaled, and the next
     /// event follows it. A standby marks the place of a load row too: its
-    /// store keeps no load row of its leader's. The listener is told at
-    /// its end, under no lock of the log.
+    /// store keeps no load row. The listener is told at its end, under no
+    /// lock of the log.
     pub fn mark(&self) {
         let mut ring = self.log.ring.lock();
         if let Some(at) = self.pending(&mut ring) {
