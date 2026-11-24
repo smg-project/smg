@@ -1705,11 +1705,11 @@ fn a_held_request_of_text_is_named_a_trees_workers_among_its_places() {
     assert_eq!(bed.worded(&asked, 0, None).len(), 4);
 }
 
-/// A pick that meets a held record waits for nobody: it writes nothing, the
-/// record counts what it left out, and the next request of the prefix
-/// writes it.
+/// A pick that meets a held record waits for nobody and leaves nothing out:
+/// its thread keeps the write, reads it at its own namings and writes it on
+/// behind its next pick. Until then another thread reads the record alone.
 #[test]
-fn a_pick_that_meets_a_held_record_leaves_its_prefix_out() {
+fn a_pick_that_meets_a_held_record_keeps_its_prefix_for_its_thread() {
     let (affinity, _, _) = hosted(false);
     let bed = Bed::new(affinity, preset("cache_aware"), 4);
     let asked = prompt(1_000, 4);
@@ -1718,21 +1718,48 @@ fn a_pick_that_meets_a_held_record_leaves_its_prefix_out() {
         let records = bed.affinity.records.lock();
         Arc::clone(records.get(MODEL).expect("the model's record"))
     };
+    // What a thread that keeps no write reads.
+    let elsewhere = || {
+        thread::scope(|scope| {
+            let reader = scope.spawn(|| bed.holders(&asked, NOW));
+            reader.join().expect("a reader")
+        })
+    };
     {
         let _reader = record.predictor.read();
         bed.decide(&request(&asked, 7, NOW), Some(2));
     }
-    assert_eq!(bed.affinity.left_out(), 1);
-    assert!(bed.holders(&asked, NOW).is_empty());
-    bed.decide(&request(&asked, 7, NOW), Some(2));
+    assert_eq!(bed.affinity.left_out(), 0);
     assert_eq!(bed.holders(&asked, NOW), [(2, 0, 4)]);
+    assert!(elsewhere().is_empty());
+    // The thread's next pick writes the kept prefix on.
+    bed.decide(&request(&asked, 7, NOW), Some(2));
+    assert_eq!(elsewhere(), [(2, 0, 4)]);
     // The whole prompt again, its last use a second old: the write that
     // would move it meets a held record and leaves nothing out.
     {
         let _reader = record.predictor.read();
         bed.decide(&request(&asked, 7, NOW + 2 * SECOND), Some(2));
     }
-    assert_eq!(bed.affinity.left_out(), 1);
+    assert_eq!(bed.affinity.left_out(), 0);
+    // A leave stops a write a thread keeps: the thread names the worker no
+    // more, and the write goes uncounted with the thread's buffers.
+    let longer = prompt(1_000, 6);
+    thread::scope(|scope| {
+        let keeper = scope.spawn(|| {
+            {
+                let _reader = record.predictor.read();
+                bed.decide(&request(&longer, 7, NOW + 2 * SECOND), Some(2));
+            }
+            let kept = bed.holders(&longer, NOW + 2 * SECOND);
+            bed.affinity.forget(bed.ids[2]);
+            (kept, bed.holders(&longer, NOW + 2 * SECOND))
+        });
+        let (kept, left) = keeper.join().expect("a keeper");
+        assert_eq!(kept, [(2, 0, 6)]);
+        assert!(left.is_empty());
+    });
+    assert_eq!(bed.affinity.left_out(), 0);
 }
 
 /// A pick of a worker the record holds the whole request for leaves nothing

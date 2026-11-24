@@ -45,11 +45,14 @@
 //!   list holds such a worker. A pick writes behind the blocks its naming
 //!   found its worker to hold, sixteen blocks a turn, each turn by a try: a
 //!   turn that meets a held lock ends the write there, so a pick waits for
-//!   nobody. The map of the records is behind a mutex that only the read of
-//!   a list's table, a change of membership and the timer's sweep take.
-//! - **Once a thread**: the buffers a naming writes into. A decision
-//!   allocates nothing once they have grown, but what a tree's own match
-//!   and write allocate.
+//!   nobody. Its thread keeps the rest, reads it at its own namings and
+//!   writes it on behind its next picks. The map of the records is behind a
+//!   mutex that only the read of a list's table, a change of membership and
+//!   the timer's sweep take.
+//! - **Once a thread**: the buffers a naming writes into, and the writes
+//!   of a record that met a held lock, eight at most. A decision allocates
+//!   nothing once they have grown, but what a tree's own match and write
+//!   allocate.
 //!
 //! No decision holds a lock across its stages: the naming ends before the
 //! decision runs, and the record is written after it answered. A decision
@@ -376,7 +379,8 @@ pub struct Affinity {
     /// The record of sent prefixes of each model, by the model id its
     /// workers registered under. Locked where a list's table is read, at a
     /// change of membership and at the timer's sweep: never by a decision's naming
-    /// or its write, which hold their record by the list's table.
+    /// or its write, which hold their record by the list's table. A write
+    /// a thread keeps holds its record itself ([`Waiting`]).
     records: Mutex<FxHashMap<Box<str>, Arc<PrefixRecord>>>,
     /// What the records that left the map had left out
     /// ([`Self::left_out`]). Written under the map's mutex.
@@ -448,18 +452,23 @@ impl Affinity {
     /// passed over.
     ///
     /// A record leaves the map here once the map alone holds it and it
-    /// holds no worker's place: no list's table reads it, and every worker
-    /// it was written for was forgotten. So a model's record goes behind
-    /// its last worker, and a record with no placement yet can go between
-    /// two tables of its list. The model's next table read makes a fresh
-    /// record. A pick named from a record that left writes to the fresh
-    /// one or writes nothing: an entry is a prediction, and the next
-    /// request of the prefix writes it.
+    /// holds no worker's place: no list's table reads it, no thread keeps
+    /// a write for it, and every worker it was written for was forgotten.
+    /// So a model's record goes behind its last worker, and a record with
+    /// no placement yet can go between two tables of its list. The model's
+    /// next table read makes a fresh record. A pick named from a record
+    /// that left writes to the fresh one or writes nothing: an entry is a
+    /// prediction, and the next request of the prefix writes it.
+    ///
+    /// A write a thread keeps holds its record until the thread writes it
+    /// on behind a pick, or until the thread ends. The record stays in the
+    /// map that long and is stepped here like any other, so its placements
+    /// of workers that left still go.
     pub fn sweep(&self) {
         let mut records = self.records.lock();
         // Nobody takes a record from the map but by a clone under this
-        // mutex, so one the map alone holds is read by no table and written
-        // by no pick.
+        // mutex, so one the map alone holds is read by no table, written
+        // by no pick and kept by no thread.
         let left: Vec<_> = records
             .extract_if(|_, record| {
                 let lone = Arc::get_mut(record)
@@ -484,9 +493,9 @@ impl Affinity {
 
     /// How many picks' prefixes the records left out in whole or in part,
     /// every model's together, those of the records that left the map among
-    /// them: a write that meets a held record ends there and waits for
-    /// nobody. For a host's own count beside its count of decisions, never
-    /// for a decision.
+    /// them: a write that meets a held record waits for nobody and is kept
+    /// by its thread, and one the thread no longer keeps is left out. For a
+    /// host's own count beside its count of decisions, never for a decision.
     pub fn left_out(&self) -> u64 {
         let records = self.records.lock();
         let left_out = |record: &Arc<PrefixRecord>| record.left_out.load(Ordering::Relaxed);
@@ -537,9 +546,10 @@ struct PrefixRecord {
     /// reader's where the leave takes no place out: a write in parts stops
     /// where it moved since its naming.
     left: AtomicU64,
-    /// How many writes ended before the request's last block, a turn of
-    /// theirs having met a held lock. Written by such a write alone, so a
-    /// pick that records whole writes no shared word for it.
+    /// How many writes ended before the request's last block: a turn of
+    /// theirs met a held lock, and their thread kept them no longer
+    /// ([`Waiting`]). Written for such a write alone, so a pick that
+    /// records whole writes no shared word for it.
     left_out: AtomicU64,
 }
 
@@ -556,6 +566,9 @@ struct RecordRead {
     fresh: bool,
     /// [`PrefixRecord::left`] at the read.
     left: u64,
+    /// The depth is a write's the reading thread keeps ([`Waiting`]), past
+    /// what the record holds.
+    waits: bool,
 }
 
 /// What the fill of a column read of the record of sent prefixes
@@ -575,11 +588,12 @@ impl PrefixRead {
     /// The deepest rows a read keeps, for a write handed no column
     /// ([`record_prefix`]). There a pick of a row past them is no
     /// repeat: where it is written, the write is tried from the request's
-    /// first block ([`PrefixRecord::write`]). A turn of it that finds the
-    /// request held for that row as far as the turn's end adds no block:
-    /// it makes that end the newest of the record's list, its last use the
-    /// read's tick, which can change the block that leaves next at the
-    /// record's bound.
+    /// first block, or on from where a write of the request's leading part
+    /// that its thread keeps for that row stands ([`write_behind`]). A turn
+    /// of it that finds the request held for that row as far as the turn's
+    /// end adds no block: it makes that end the newest of the record's
+    /// list, its last use the read's tick, which can change the block that
+    /// leaves next at the record's bound.
     const KEPT: usize = 8;
 
     /// Whether the fill found the worker of `entry`, an entry of the column
@@ -682,51 +696,46 @@ impl PrefixRecord {
         true
     }
 
-    /// Records the request of `keys` as sent to `target`, behind the naming
-    /// that read `read`. Not for a repeat ([`Self::repeats`]). `held` says
-    /// the naming found the target among the workers sent the request's
-    /// deepest recorded block.
+    /// Records the request of `keys` as sent to `target`, on from its first
+    /// `done` blocks, behind a naming that read the record at `tick` with
+    /// `left` leaves told. Not for a repeat ([`Self::repeats`]).
     ///
-    /// The write begins behind the blocks the naming found the target to
-    /// hold: a turn of a conversation writes the blocks the turn added, and
-    /// a target the naming did not find is written from the request's
-    /// first block. It takes the
-    /// lock sixteen blocks a turn, each turn by a try. An entry is a
-    /// prediction and a leading part of a request is a true one, so a turn
-    /// that meets a held lock ends the write there and waits for no thread:
-    /// the next request of the prefix writes on from where this one
-    /// stopped. A worker that left since the naming stops the write too:
-    /// the record gives no place to a worker told gone.
-    fn write(&self, keys: &[u64], read: RecordRead, held: bool, target: WorkerId) {
+    /// It takes the lock sixteen blocks a turn, each turn by a try, and
+    /// waits for no thread. A turn that meets a held lock ends the write
+    /// there and returns how many leading blocks stand: the thread keeps
+    /// the rest and writes on behind its next picks ([`Waiting`]). `None`
+    /// where nothing is left to write: the request stands whole, or a
+    /// worker left since the naming, and the record gives no place to a
+    /// worker told gone.
+    fn write(
+        &self,
+        keys: &[u64],
+        done: usize,
+        target: WorkerId,
+        tick: u16,
+        left: u64,
+    ) -> Option<usize> {
         if keys.is_empty() {
-            return;
+            return None;
         }
-        // The target holds the naming's depth where the naming found it
-        // there, and nothing the naming knows of otherwise.
-        let known = if held { read.blocks as usize } else { 0 };
-        let mut end = known.min(keys.len());
-        // A request the target holds whole has its last use to move and
-        // no block to add: left undone, it leaves nothing out.
-        let adds = end < keys.len();
+        let mut done = done.min(keys.len());
         loop {
-            // What the target holds as the turn begins: the naming's depth,
-            // then the turns before this one.
-            let behind = end;
-            end = (end + Self::SLICE).min(keys.len());
+            // What the target holds as the turn begins is `done`: the
+            // naming's depth or where a kept write stood, then the turns
+            // before this one.
+            let end = (done + Self::SLICE).min(keys.len());
             let Some(mut predictor) = self.predictor.try_write() else {
-                if adds {
-                    self.left_out.fetch_add(1, Ordering::Relaxed);
-                }
-                return;
+                return Some(done);
             };
-            if self.left.load(Ordering::Relaxed) != read.left {
-                return;
+            if self.left.load(Ordering::Relaxed) != left {
+                return None;
             }
-            predictor.record_behind(&keys[..end], behind, target, read.tick);
+            predictor.record_behind(&keys[..end], done, target, tick);
             if end == keys.len() {
                 self.sweep(&mut predictor);
-                return;
+                return None;
             }
+            done = end;
             RwLockWriteGuard::unlock_fair(predictor);
         }
     }
@@ -1166,6 +1175,7 @@ impl Table {
             picked,
             live,
             within,
+            waiting,
             ..
         } = buffers;
         holders.clear();
@@ -1181,7 +1191,9 @@ impl Table {
         let mut read = None;
         if self.ahead {
             read = record.map(|record| {
-                self.name_recorded(record, facts, places, keys, deepest, holders, &mut draw)
+                self.name_recorded(
+                    record, facts, places, keys, deepest, waiting, holders, &mut draw,
+                )
             });
         }
         let room = cap.saturating_sub(holders.len());
@@ -1211,7 +1223,9 @@ impl Table {
         }
         if !self.ahead {
             read = record.map(|record| {
-                self.name_recorded(record, facts, places, keys, deepest, holders, &mut draw)
+                self.name_recorded(
+                    record, facts, places, keys, deepest, waiting, holders, &mut draw,
+                )
             });
         }
         holders.sort_unstable_by_key(|holder| holder.row);
@@ -1246,8 +1260,50 @@ impl Table {
             // Acquire against the leaves' Release: a raise read here was
             // made behind the holder's own, which a hand-on's compare reads.
             left: record.left.load(Ordering::Acquire),
+            waits: false,
         };
         (found.blocks(), read)
+    }
+
+    /// Reads the record for the request ([`Self::read_record`]) and, beside
+    /// it, the writes the calling thread keeps for the record (`waiting`),
+    /// each as the record will hold it: a thread reads what it wrote.
+    fn read_written(
+        &self,
+        record: &PrefixRecord,
+        facts: &RequestFacts<'_>,
+        (keys, deepest): (&mut Vec<u64>, &mut Vec<WorkerId>),
+        waiting: &Waiting,
+    ) -> (u32, RecordRead) {
+        let (_, mut read) = self.read_record(record, facts, keys, deepest);
+        for write in &waiting.writes {
+            // A leave told since stops the write, so it names nobody.
+            let stands = std::ptr::eq(&*write.record, record) && write.left == read.left;
+            if !stands || self.spoken_row(write.target).is_none() {
+                continue;
+            }
+            let blocks = shared(&write.keys, keys) as u32;
+            // A waiting write speaks where it is deeper than the record. At
+            // the record's own depth the record's holders stand alone, so a
+            // pick's write starts from what the record holds for its worker.
+            if blocks < read.blocks || (blocks == read.blocks && !read.waits) {
+                continue;
+            }
+            if blocks > read.blocks {
+                deepest.clear();
+                read = RecordRead {
+                    blocks,
+                    whole: blocks as usize == keys.len(),
+                    fresh: false,
+                    waits: true,
+                    ..read
+                };
+            }
+            if !deepest.contains(&write.target) {
+                deepest.push(write.target);
+            }
+        }
+        (read.blocks, read)
     }
 
     /// The record's holders of the request, behind the holders already
@@ -1258,7 +1314,7 @@ impl Table {
     /// named the workers sent it among them, and none sent a shorter one.
     #[expect(
         clippy::too_many_arguments,
-        reason = "the record, the request and its places, the read's two buffers, and the naming's list and draw"
+        reason = "the record, the request and its places, the read's two buffers and the thread's kept writes, and the naming's list and draw"
     )]
     fn name_recorded(
         &self,
@@ -1267,10 +1323,11 @@ impl Table {
         places: Option<&[u32]>,
         keys: &mut Vec<u64>,
         deepest: &mut Vec<WorkerId>,
+        waiting: &Waiting,
         holders: &mut Vec<AffinityHolder>,
         draw: &mut Draw,
     ) -> RecordRead {
-        let (blocks, read) = self.read_record(record, facts, keys, deepest);
+        let (blocks, read) = self.read_written(record, facts, (keys, deepest), waiting);
         let base = holders.len();
         let room = self.cap.saturating_sub(base);
         if room == 0 {
@@ -1368,6 +1425,7 @@ impl Table {
             kept,
             keys,
             deepest,
+            waiting,
             ..
         } = buffers;
         column.clear();
@@ -1402,7 +1460,7 @@ impl Table {
         }
         // The record is read where it speaks for a row of the list.
         let record = self.record.as_deref().filter(|_| self.unheard_any)?;
-        let (blocks, found) = self.read_record(record, facts, keys, deepest);
+        let (blocks, found) = self.read_written(record, facts, (keys, deepest), waiting);
         let mut read = PrefixRead {
             read: found,
             deepest: [NONE; PrefixRead::KEPT],
@@ -1456,6 +1514,7 @@ struct Buffers {
     /// The column a single decision is handed where its profile is named
     /// no row.
     column: Vec<AffinityFacts>,
+    waiting: Waiting,
 }
 
 impl Buffers {
@@ -1470,7 +1529,183 @@ impl Buffers {
             live: Vec::new(),
             within: Vec::new(),
             column: Vec::new(),
+            waiting: Waiting::new(),
         }
+    }
+}
+
+/// A write of a record that met a held lock, kept by its thread.
+struct WaitingWrite {
+    record: Arc<PrefixRecord>,
+    /// The request's keys, and how many of its leading blocks stand in the
+    /// record.
+    keys: Vec<u64>,
+    done: usize,
+    target: WorkerId,
+    left: u64,
+}
+
+impl WaitingWrite {
+    /// The write ends unwritten and is counted as left out. One that a
+    /// leave told since its naming had stopped is not: it would have
+    /// written nothing ([`PrefixRecord::write`]).
+    fn leave_out(&self) {
+        if self.record.left.load(Ordering::Relaxed) == self.left {
+            self.record.left_out.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// The writes of the calling thread that met a held lock
+/// ([`PrefixRecord::write`]). No decision waits for a record's lock: a write
+/// that met it held is kept here and written on behind the thread's next
+/// picks, the oldest first. Until it stands the thread's own namings read it
+/// beside the record ([`Table::read_written`]), so the next turn of a
+/// conversation the thread decides is named the worker of the turn before.
+/// Another thread reads it once it stands.
+///
+/// A thread keeps the newest eight, each as long as its request's blocks. A
+/// write that eight newer ones push out, or that is kept as its thread's
+/// buffers go, is left out and counted ([`Affinity::left_out`]), unless a
+/// leave had stopped it.
+#[derive(Default)]
+struct Waiting {
+    writes: Vec<WaitingWrite>,
+    /// The key buffers of the writes that ended, for the next that wait: a
+    /// kept write allocates nothing once they have grown.
+    spare: Vec<Vec<u64>>,
+}
+
+impl Waiting {
+    /// The most writes a thread keeps.
+    const MOST: usize = 8;
+
+    const fn new() -> Self {
+        Self {
+            writes: Vec::new(),
+            spare: Vec::new(),
+        }
+    }
+
+    /// Takes out the write that waits for `target` with a leading part of
+    /// the request of `keys`, which that request's own write continues, and
+    /// returns how many of its blocks stand. A write named before a leave
+    /// told since (`left`) hands on no progress: the worker may be a new one.
+    fn take_leading(
+        &mut self,
+        record: &PrefixRecord,
+        keys: &[u64],
+        target: WorkerId,
+        left: u64,
+    ) -> Option<usize> {
+        let at = self.writes.iter().position(|write| {
+            // A key folds every block up to its own: the last one says all.
+            let last = write.keys.last();
+            let leads = last.is_some_and(|key| keys.get(write.keys.len() - 1) == Some(key));
+            leads && write.target == target && std::ptr::eq(&*write.record, record)
+        })?;
+        let write = self.writes.remove(at);
+        self.spare.push(write.keys);
+        (write.left == left).then_some(write.done)
+    }
+
+    /// Keeps the write of `keys` for `target`, `done` of its leading blocks
+    /// standing. The buffer goes with the write and `keys` takes a spare
+    /// one. Where the thread keeps the most, the oldest leaves for it.
+    fn keep(
+        &mut self,
+        record: &Arc<PrefixRecord>,
+        keys: &mut Vec<u64>,
+        done: usize,
+        target: WorkerId,
+        read: RecordRead,
+    ) {
+        if self.writes.len() >= Self::MOST {
+            let oldest = self.writes.remove(0);
+            oldest.leave_out();
+            self.spare.push(oldest.keys);
+        }
+        let mut kept = self.spare.pop().unwrap_or_default();
+        mem::swap(keys, &mut kept);
+        self.writes.push(WaitingWrite {
+            record: Arc::clone(record),
+            keys: kept,
+            done,
+            target,
+            left: read.left,
+        });
+    }
+
+    /// Writes on, the oldest first, until a turn meets a held lock. A write
+    /// that waited is a use at `tick`, the tick of the pick that writes it
+    /// on: it sets no block's last use back.
+    fn write_on(&mut self, tick: u16) {
+        while let Some(write) = self.writes.first_mut() {
+            let (record, keys) = (&write.record, &write.keys);
+            let done = record.write(keys, write.done, write.target, tick, write.left);
+            if let Some(done) = done {
+                write.done = done;
+                return;
+            }
+            let write = self.writes.remove(0);
+            self.spare.push(write.keys);
+        }
+    }
+}
+
+impl Drop for Waiting {
+    fn drop(&mut self) {
+        for write in &self.writes {
+            write.leave_out();
+        }
+    }
+}
+
+/// How many leading blocks two requests share, by their keys. A key folds
+/// every block up to its own, so the keys part once.
+fn shared(one: &[u64], other: &[u64]) -> usize {
+    let (mut low, mut high) = (0, one.len().min(other.len()));
+    while low < high {
+        let middle = low + (high - low) / 2;
+        if one.get(middle) == other.get(middle) {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    low
+}
+
+/// The record's write behind a pick of `target` that `read` named: the
+/// request of the thread's keys, on from the blocks the target holds, then
+/// the writes the thread keeps ([`Waiting`]). `held` says the naming found
+/// the target among the workers sent the request's deepest block. A request
+/// that meets the lock held is kept, with whatever waits behind it.
+fn write_behind(
+    record: &Arc<PrefixRecord>,
+    buffers: &mut Buffers,
+    read: RecordRead,
+    held: bool,
+    target: WorkerId,
+) {
+    let Buffers { keys, waiting, .. } = buffers;
+    // The target holds the naming's depth where the naming found it there
+    // in the record, and what a waiting write of the request's leading part
+    // had written of it.
+    let waited = waiting.take_leading(record, keys, target, read.left);
+    let named = if held && !read.waits {
+        read.blocks as usize
+    } else {
+        0
+    };
+    let known = named.max(waited.unwrap_or(0));
+    let done = record.write(keys, known, target, read.tick, read.left);
+    // A request the target holds whole has its last use to move and no
+    // block to add: left undone, it leaves nothing out.
+    if let Some(done) = done.filter(|&done| done < keys.len()) {
+        waiting.keep(record, keys, done, target, read);
+    } else {
+        waiting.write_on(read.tick);
     }
 }
 
@@ -1789,7 +2024,8 @@ pub(super) fn told_target(decision: &Decision) -> Option<&Target> {
 ///
 /// Whether the picked worker was sent the request's deepest block is read
 /// here from the rows `read` kept, the first eight of them: a holder past
-/// them is written from the request's first block. The engine's own
+/// them is written from the request's first block, or on from where a
+/// write the calling thread keeps for it stands. The engine's own
 /// decisions read it from their column.
 pub fn record_prefix(
     pool: &PoolAffinity,
@@ -1818,7 +2054,7 @@ pub(super) fn record_by_column(
     let Some(table) = table.filter(|table| table.is_of(facts.model, phase)) else {
         return;
     };
-    let (Some(record), Some(row)) = (table.record.as_deref(), table.spoken_row(id)) else {
+    let (Some(record), Some(row)) = (table.record.as_ref(), table.spoken_row(id)) else {
         return;
     };
     let held = match column.and_then(|column| column.get(row as usize)) {
@@ -1826,12 +2062,12 @@ pub(super) fn record_by_column(
         None => read.deepest.contains(&row),
     };
     if record.repeats(read.read, held) {
-        return;
+        return with_buffers(|buffers| buffers.waiting.write_on(read.read.tick));
     }
     with_buffers(|buffers| {
         // The keys are the request's own, whichever list was filled last.
         PrefixPredictor::fold_into(&mut buffers.keys, facts.namespace_seed, facts.block_hashes);
-        record.write(&buffers.keys, read.read, held, id);
+        write_behind(record, buffers, read.read, held, id);
     });
 }
 
@@ -1983,7 +2219,7 @@ impl Table {
             ..*facts
         });
         self.state_named(&mut decision, named, facts);
-        let (Some(read), Some(record)) = (read, self.record.as_deref()) else {
+        let (Some(read), Some(record)) = (read, self.record.as_ref()) else {
             return decision;
         };
         // The index speaks for a worker whose cache events are heard: the
@@ -1993,8 +2229,10 @@ impl Table {
             return decision;
         };
         let held = buffers.deepest.contains(&target.id);
-        if !record.repeats(read, held) {
-            record.write(&buffers.keys, read, held, target.id);
+        if record.repeats(read, held) {
+            buffers.waiting.write_on(read.tick);
+        } else {
+            write_behind(record, buffers, read, held, target.id);
         }
         decision
     }
@@ -2124,7 +2362,7 @@ impl Table {
             state(&mut decision, Feed::Column(&column), facts, self.block);
         }
         buffers.column = column;
-        let (Some(read), Some(record)) = (read, self.record.as_deref()) else {
+        let (Some(read), Some(record)) = (read, self.record.as_ref()) else {
             return decision;
         };
         let sent = sent_target(&decision, sends_to);
@@ -2133,8 +2371,10 @@ impl Table {
         };
         let sent = buffers.column.get(target.position as usize);
         let held = sent.is_some_and(|sent| read.found(sent));
-        if !record.repeats(read.read, held) {
-            record.write(&buffers.keys, read.read, held, target.id);
+        if record.repeats(read.read, held) {
+            buffers.waiting.write_on(read.read.tick);
+        } else {
+            write_behind(record, buffers, read.read, held, target.id);
         }
         decision
     }
