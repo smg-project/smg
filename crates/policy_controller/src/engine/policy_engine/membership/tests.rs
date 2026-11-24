@@ -909,8 +909,9 @@ fn a_whole_read_forgets_the_sent_prefixes_of_an_id_that_stands_no_more() {
 /// serves the first model no more: the records of sent prefixes forget it,
 /// as at a leave. A prompt of the first model the records named it for is
 /// placed by its request's seed again. A replacement that keeps the model
-/// keeps what the worker was sent. The lists name eight workers by their
-/// addresses, whatever the registry holds.
+/// keeps what the worker was sent. One the channel dropped is judged the
+/// same way by the whole read that finds its object. The lists name eight
+/// workers by their addresses, whatever the registry holds.
 #[test]
 fn a_replacement_that_takes_a_model_forgets_the_workers_sent_prefixes() {
     let mut document = PolicySpec::preset("cache_aware").expect("a built-in preset");
@@ -964,6 +965,24 @@ fn a_replacement_that_takes_a_model_forgets_the_workers_sent_prefixes() {
         first,
         "a worker that left the model keeps no sent prefix of it"
     );
+
+    // Each worker serves the first model again. Then the channel drops its
+    // replacement, and a whole read finds the new object: one of the model
+    // held keeps what the worker was sent, one of another model does not.
+    for at in 0..8 {
+        replace(&registry, at);
+    }
+    drain(&engine, &mut follow);
+    let second = places(250);
+    for (model, kept) in [(MODEL, true), ("model-b", false)] {
+        for at in 0..8 {
+            let standing = object(&registry, at);
+            assert!(registry.replace(&standing, ready_worker(&url(at), model)));
+        }
+        flood(&registry, 0);
+        drain(&engine, &mut follow);
+        assert_eq!(places(300) == second, kept, "found serving {model}");
+    }
 }
 
 /// The engine's own task follows the registry its host handed: the workers
