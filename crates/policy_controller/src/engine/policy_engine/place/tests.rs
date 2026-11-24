@@ -391,6 +391,26 @@ fn a_request_is_made_of_what_its_caller_states() {
     assert!(!shown.contains("secret"), "{shown}");
 }
 
+/// A request states its id with no making. An engine that keeps a sample of
+/// its decisions asks it of a plain request, which is never made. A request
+/// with no id states an empty one.
+#[test]
+fn a_request_states_its_id_with_no_making() {
+    let engine = preset("round_robin");
+    let request = PlaceRequest {
+        request_id: Some("request-1"),
+        ..PlaceRequest::of(MODEL, WorkerLists::None)
+    };
+    let made = Made::new(&engine, &request, &[]);
+    assert_eq!(made.request_id(engine.standing_spec()), b"request-1");
+    assert!(made.headers.get().is_none(), "the request was not made");
+    let _ = made.make(engine.standing_spec());
+    assert!(made.headers.get().is_some(), "a making fills its headers");
+    let bare = PlaceRequest::of(MODEL, WorkerLists::None);
+    let made = Made::new(&engine, &bare, &[]);
+    assert!(made.request_id(engine.standing_spec()).is_empty());
+}
+
 /// Each making draws a seed no other making of the thread drew, and a
 /// second thread draws others.
 #[test]

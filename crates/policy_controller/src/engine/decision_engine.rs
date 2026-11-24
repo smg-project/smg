@@ -114,6 +114,23 @@ pub trait RequestMaker {
         0
     }
 
+    /// The request's id, as the request made would state it
+    /// ([`Request::id`]): empty for a request that states none.
+    ///
+    /// An engine that decides over its host's lists asks this under a
+    /// document that keeps a sample of its decisions (`explain.sample`),
+    /// for a plain request one pick decided, and under no other document.
+    /// A kept decision is found by its request's id. A request that states
+    /// none is not counted and not kept: a host states an id for a request
+    /// it wants found.
+    ///
+    /// The trait's answer makes the request to read its id. A maker that
+    /// holds the id answers with no making, as the call that places a
+    /// request does.
+    fn request_id<'w>(&'w self, spec: &'w AppliedSpec) -> &'w [u8] {
+        self.make(spec).id
+    }
+
     /// Where a worker's object counts the requests of the request's
     /// session key ([`SessionCountedUnder`]). The trait's answer is the
     /// key's own text, where the caller's own guard counts each request it
@@ -256,6 +273,10 @@ impl RequestMaker for Request<'_> {
 
     fn prompt_bytes(&self) -> u32 {
         self.facts.prompt_bytes
+    }
+
+    fn request_id<'w>(&'w self, _: &'w AppliedSpec) -> &'w [u8] {
+        self.id
     }
 }
 
@@ -465,6 +486,11 @@ impl Decided {
 /// eligible at this call. No request was made for the pick, no lease is
 /// issued, no id is taken and nothing is dated. The host sends to the
 /// worker and owes the engine no word of the request.
+///
+/// Under a document that keeps a sample of its decisions the answer is the
+/// same place. The engine keeps every Nth such pick as a decision of one
+/// target ([`Self::decision`]), under the id its maker states
+/// ([`RequestMaker::request_id`]) and dated for its record alone.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AlonePick {
     /// The worker's place in the list.

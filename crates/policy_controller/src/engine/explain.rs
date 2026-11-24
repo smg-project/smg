@@ -1,11 +1,14 @@
 //! A seat's holder counts picks and sheds before it takes the ring lock.
 //! The lock holds a push or a scan of the seat's recent decisions.
+//!
+//! The engine in a gateway's own process counts on each calling thread and
+//! keeps one ring a document (`PolicyEngine::explained`).
 
 #![cfg_attr(
-    not(any(test, feature = "controller")),
+    not(any(test, feature = "in-process")),
     expect(
         dead_code,
-        reason = "Only the served controller keeps sampled records."
+        reason = "Only an engine built under `in-process` keeps sampled records: a served controller's, and the one in a gateway's own process."
     )
 )]
 
@@ -28,7 +31,10 @@ const SLOTS: usize = 1_024;
 /// The decision a door returned, kept by gateway and request fingerprint.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DecisionRecord {
-    /// The decision and its trace, which carries the generation.
+    /// The decision and its trace, which carries the generation. A request
+    /// that one pick of a picker decided in a gateway's own process is kept
+    /// as that pick: its trace is a drawn pick's, with one target and no
+    /// survivor counted.
     pub decision: Decision,
     /// The position in that generation of the binding the decision ran
     /// under, if one matched. A decode decided after its prefill ran
@@ -110,8 +116,9 @@ impl DecisionRecord {
 }
 
 /// A decider's count toward its next sample, kept under one term and
-/// generation.
-#[derive(Default)]
+/// generation. An engine that has no term counts under the number of its
+/// document.
+#[derive(Clone, Copy, Default)]
 pub(crate) struct SampleCount {
     term: u64,
     generation: u64,
@@ -119,12 +126,24 @@ pub(crate) struct SampleCount {
 }
 
 impl SampleCount {
+    /// A count that has counted nothing: what a thread's own count starts
+    /// as.
+    #[cfg(feature = "in-process")]
+    pub(crate) const NEW: Self = Self {
+        term: 0,
+        generation: 0,
+        count: 0,
+    };
+
     /// Counts a pick or shed, restarting under a new term or generation.
     /// Returns true when the count reaches the sampling rate.
     pub(crate) fn keeps(&mut self, term: u64, engine: &Engine, decision: &Decision) -> bool {
-        if !matches!(decision, Decision::Pick(_) | Decision::Shed(_)) {
-            return false;
-        }
+        matches!(decision, Decision::Pick(_) | Decision::Shed(_)) && self.steps(term, engine)
+    }
+
+    /// Counts one pick or shed its caller holds, as [`Self::keeps`] counts
+    /// one: for a pick that is counted ahead of the decision that names it.
+    pub(crate) fn steps(&mut self, term: u64, engine: &Engine) -> bool {
         let generation = engine.generation();
         if self.term != term || self.generation != generation {
             *self = Self {
@@ -144,7 +163,7 @@ impl SampleCount {
 
 /// A seat's recent decisions. The seat's holder counts separately and
 /// takes the ring lock to push. A reader takes it for one scan.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub(crate) struct Samples {
     records: VecDeque<DecisionRecord>,
     term: u64,
@@ -153,8 +172,9 @@ pub(crate) struct Samples {
 impl Samples {
     /// Pushes one record, allocating the ring on its first write. A new
     /// lead starts with an empty ring. `binding` is the position of the
-    /// binding the decision ran under. `taken` is the instant the request
-    /// was taken, the gateway that asked and the request's id as stated.
+    /// binding the decision ran under. The argument behind it is the
+    /// instant the request was taken, the gateway that asked and the
+    /// request's id as stated.
     #[cold]
     pub(crate) fn push(
         &mut self,
