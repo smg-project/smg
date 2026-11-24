@@ -2506,9 +2506,9 @@ policies have it. What that leaves of a binding's block:
 - **Its two numbers [built].** A block names none. A document that names one is refused when it
   is applied, by the number's path, and the refusal says where a number is stated: a worker's
   registration, or its program's default. The two that a gateway's routing settings state are
-  the defaults its worker objects are built with, and the crate's translation of those settings
-  writes neither onto a binding. A gateway states them on its command line, beside a supplied
-  document too.
+  the defaults its worker objects are built with where the switch below is on, and the crate's
+  translation of those settings writes neither onto a binding. A gateway states them on its
+  command line, beside a supplied document too.
 - **Its shed word [built].** A binding keeps whether a request is shed when every worker is
   vetoed. A decision reads it.
 - **Its switch [partly].** Whether the program's default vetoes at all is one word for the

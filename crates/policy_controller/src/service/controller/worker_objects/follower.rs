@@ -19,10 +19,10 @@ use crate::{
 
 /// The overload thresholds an object states for each signal its row names
 /// none for: the worker crate's two default numbers, which a gateway hands
-/// each worker of an engine too. An external row's object takes none, as a
-/// gateway's external worker takes none at its registration. They are this
-/// crate's own two defaults, by which the store judges under a binding
-/// whose block is on
+/// each worker of an engine too where its overload switch is on. An
+/// external row's object takes none, as a gateway's external worker takes
+/// none at its registration. They are this crate's own two defaults, by
+/// which the store judges under a binding whose block is on
 /// ([`OVERLOAD_WAITING_REQUESTS`](crate::document::spec::OVERLOAD_WAITING_REQUESTS),
 /// [`OVERLOAD_TOKEN_USAGE`](crate::document::spec::OVERLOAD_TOKEN_USAGE)):
 /// no document names a threshold.

@@ -761,7 +761,8 @@ class TestPolicyDocument:
 
     def test_the_overload_thresholds_stand_beside_a_document(self, policy_document):
         # No document names an overload threshold: the gateway builds its
-        # worker objects with the two, so both stand beside a document.
+        # worker objects with the two unless the document switches its overload
+        # block off, so both stand beside a document.
         flags = ["--worker-overload-waiting-requests", "32", "--worker-overload-token-usage", "0.9"]
         path = policy_document("round_robin")
         args = parse_router_args(["--policy-controller", "on", "--policy-spec", str(path), *flags])
