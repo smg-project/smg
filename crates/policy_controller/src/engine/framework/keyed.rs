@@ -149,6 +149,7 @@ impl Engine {
             binding,
             placing,
             vetoed,
+            sides_placed: _,
         } = entry;
         if binding.plan != Plan::Single {
             return None;

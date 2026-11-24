@@ -2172,7 +2172,7 @@ On main: 19 sheets, 489 lines.
 | replayed and passing | 18 | 484 |
 | recorded, replayed by nothing (`constraint_decider`) | 1 | 5 |
 | replayed through the engine that stays (`PolicyEngine`) | **4**, and 31 lines of `prefix_hash` | **65** |
-| replayed lines held to an answer of the crate's own, not classic's | | 8 |
+| replayed lines held to an answer of the crate's own, not classic's | | 7 |
 
 A replay of all fifteen decision sheets through `PolicyEngine` over worker objects is in work and not on main yet: on main the three hard-demand sheets (`retry_wire`, `media_refs`, `context_window`; 26 lines), `sticky_rank` (8 lines) and 31 lines of `prefix_hash` replay through it. Measured
 with it locally on 2026-11-22, on main (`096c0f5ea`): of the 408 lines that recorded a decision
@@ -2201,7 +2201,10 @@ Five things follow, and they are the first work of section 16.
    key folds whole blocks). One of them turns in the crate on a ring its caller lends
    (decision 3). The other measures which tokens are in a prompt's head, which is then the
    caller's recipe: it is proven at stage 3, by a gateway test of classic's own function. The
-   1 of `manual` cannot be asked (validation refuses a sessions rule under a pair plan). Each
+   1 of `manual` replays as classic recorded now: a sessions rule with no cap runs on the two
+   sides of a pair, each side by its own session, where the host decides in process. A served
+   controller refuses the rule under a pair: its file of leases keeps one session verdict for
+   a pair's two sides. Each
    of the 23 is made equal to classic or named as an accepted difference: two in stage 1, one
    at stage 3, the 20 in stage 4.
 3. **Five policies have no sheet over a healthy pool**: `round_robin`, `random`, `passthrough`,

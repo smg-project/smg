@@ -4374,6 +4374,9 @@ struct BindingContext<'a> {
     /// The profiles whose built picker leaves the placement to a sessions
     /// rule ([`Picker::by_assignment`]), by name.
     by_assignment: &'a [&'a str],
+    /// Whether the host makes the lifecycle's calls
+    /// ([`StageRegistry::makes_lifecycle_calls`]).
+    lifecycle: bool,
 }
 
 fn check_bounds<T>(bounds: &Bounds<T>, at: &At) -> Result<(), SpecError>
@@ -4910,18 +4913,32 @@ fn check_binding(
     let shadow = check_binding_rules(b, cx, &at, deferred)?;
     let mut built = resolve_plan(b, cx, shadow)?;
     // A picker that leaves the placement to a sessions rule, and a rule runs
-    // under the single plan alone: on a side of a pair or of `epd` nothing
-    // would place its requests. The built picker answers, as it answers the
-    // engine.
-    if b.plan.unwrap_or_default() != PlanName::Single {
+    // under the single plan and on the two sides of a pair: on a side of
+    // `epd` nothing would place its requests. The built picker answers, as
+    // it answers the engine.
+    if b.plan.unwrap_or_default() == PlanName::Epd {
         for (side, name) in &b.profiles {
             if cx.by_assignment.contains(&name.as_str()) {
                 deferred.note(
                     at.sub("profiles").field(side),
-                    "a picker that places by the sessions rule outside the single plan",
+                    "a picker that places by the sessions rule under the epd plan",
                 );
             }
         }
+    }
+    // The store's file of leases keeps no session verdict of a pair's
+    // decode side: that side's lease states the prefill side's
+    // (`store::DecodeSide::lease`). A controller that serves from the file
+    // would settle a decode side's claim by the prefill side's word, so a
+    // rule under the pair plan is not in its build. The catalog's word is
+    // how the validator knows such a controller today: it makes some
+    // lifecycle calls only. The change that makes the file keep that
+    // verdict takes this refusal out.
+    if b.sessions.is_some() && b.plan.unwrap_or_default() == PlanName::PdPair && !cx.lifecycle {
+        deferred.note(
+            at.field("sessions"),
+            "the session verdict a pair's decode side keeps of its own",
+        );
     }
     if let (Some(binding), Some(sessions)) = (built.as_mut(), &b.sessions) {
         let rule = session_rule(sessions, cx.index, binding.plan)?;
@@ -4935,18 +4952,32 @@ fn check_binding(
 /// The sessions rule as the engine runs it: the schema's largest cap is no
 /// cap, its largest idle time or sweep is for ever (a sweep for ever under a
 /// finite idle time is refused, as nothing would forget the keys; an idle
-/// time for ever sweeps nothing), and the rule runs under the `single` plan
-/// alone.
+/// time for ever sweeps nothing). The rule runs under the `single` plan, and
+/// on the two sides of a `pd-pair` plan where it states no cap and tells
+/// its stages: a pair's side reads no count of a key's requests in flight,
+/// and a pair's pick has one word for whether its stages hear of it, not
+/// one a side.
 fn session_rule(
     sessions: &SessionsSpec,
     index: usize,
     plan: Plan,
 ) -> Result<SessionRule, SpecError> {
-    if plan != Plan::Single {
+    let refused = match plan {
+        Plan::Single => None,
+        Plan::PdPair if sessions.inflight_cap != u16::MAX => {
+            Some(("inflight_cap", "65535 (no cap) under the pd-pair plan"))
+        }
+        Plan::PdPair if sessions.rule_placed != RulePlaced::Told => {
+            Some(("rule_placed", "`told` under the pd-pair plan"))
+        }
+        Plan::PdPair => None,
+        Plan::Epd { .. } => Some(("plan", "`single` or `pd-pair`")),
+    };
+    if let Some((name, reason)) = refused {
         return Err(SpecError::BadSessions {
             index,
-            name: "plan",
-            reason: "sessions run under the single plan",
+            name,
+            reason,
         });
     }
     let forever = |secs: u32| secs == u32::MAX;
@@ -5262,6 +5293,7 @@ impl PolicySpec {
                 live_profiles: &live_profiles,
                 scoped_stages: &scoped_stages,
                 by_assignment: &by_assignment,
+                lifecycle: catalog.makes_lifecycle_calls(),
             };
             if let Some(built) = check_binding(binding, &cx, &mut needs, &mut deferred)? {
                 if binding
@@ -8161,22 +8193,12 @@ mod tests {
     }
 
     /// The manual picker places by a sessions rule, and a rule runs under
-    /// the single plan alone: on a side of a pair or of `epd` the profile is
-    /// refused, with the side that names it. The built picker answers, so
-    /// any picker that leaves the placement to the rule is refused the same
-    /// way.
+    /// the single plan and on the two sides of a pair: on a side of `epd`
+    /// the profile is refused, with the side that names it. The built
+    /// picker answers, so any picker that leaves the placement to the rule
+    /// is refused the same way.
     #[test]
-    fn the_manual_picker_outside_the_single_plan_is_not_in_this_build() {
-        let spec = doc(
-            r#"{"apiVersion":"smg.policy/v1","profiles":{"q":{"pick":"random"},"sticky":{"pick":"manual"}},"bindings":[{"plan":"pd-pair","profiles":{"prefill":"q","decode":"sticky"}}]}"#,
-        );
-        assert_eq!(
-            not_in_build(&spec),
-            (
-                "bindings[0].profiles.decode".to_string(),
-                "a picker that places by the sessions rule outside the single plan"
-            )
-        );
+    fn the_manual_picker_under_the_epd_plan_is_not_in_this_build() {
         let epd = doc(
             r#"{"apiVersion":"smg.policy/v1","profiles":{"q":{"pick":"random"},"sticky":{"pick":"manual"}},"bindings":[{"plan":"epd","profiles":{"encode":"sticky","prefill":"q","decode":"q"}}]}"#,
         );
@@ -8184,15 +8206,113 @@ mod tests {
             not_in_build(&epd),
             (
                 "bindings[0].profiles.encode".to_string(),
-                "a picker that places by the sessions rule outside the single plan"
+                "a picker that places by the sessions rule under the epd plan"
             )
         );
-        // Under the single plan the same profile validates, here with no
-        // rule; the preset is the profile with one.
+        // On a side of a pair the same profile validates, and so it does
+        // under the single plan, here with no rule; the preset is the
+        // profile with one.
+        let pair = doc(
+            r#"{"apiVersion":"smg.policy/v1","profiles":{"q":{"pick":"random"},"sticky":{"pick":"manual"}},"bindings":[{"plan":"pd-pair","profiles":{"prefill":"q","decode":"sticky"}}]}"#,
+        );
+        assert!(pair.validate().is_ok());
         let single = doc(
             r#"{"apiVersion":"smg.policy/v1","profiles":{"sticky":{"pick":"manual"}},"bindings":[{"profile":"sticky"}]}"#,
         );
         assert!(single.validate().is_ok());
+    }
+
+    /// A host that makes some lifecycle calls only keeps one session
+    /// verdict for the two sides of a pair's lease. A sessions rule under
+    /// the pair plan is not in its build, by the rule's place. The same
+    /// rule under the single plan is, and so is a pair under no rule.
+    #[test]
+    fn a_pairs_sessions_rule_is_not_in_the_build_of_a_host_with_one_verdict_a_lease() {
+        let (whole, some) = (
+            StageRegistry::builtin(),
+            StageRegistry::builtin().without_lifecycle(),
+        );
+        let rule = r#"{"sticky_header":"x-session-id","inflight_cap":65535}"#;
+        let pair = format!(
+            r#"{{"plan":"pd-pair","profiles":{{"prefill":"q","decode":"q"}},"sessions":{rule}}}"#
+        );
+        let pair = spec_with_binding(&pair);
+        assert!(pair.validate_in(&whole, &[]).is_ok());
+        assert_eq!(
+            pair.validate_in(&some, &[]).err(),
+            Some(SpecError::NotInBuild {
+                path: "bindings[0].sessions".to_string(),
+                what: "the session verdict a pair's decode side keeps of its own",
+            })
+        );
+        let single = spec_with_binding(&format!(r#"{{"profile":"q","sessions":{rule}}}"#));
+        assert!(single.validate_in(&some, &[]).is_ok());
+        let unruled =
+            spec_with_binding(r#"{"plan":"pd-pair","profiles":{"prefill":"q","decode":"q"}}"#);
+        assert!(unruled.validate_in(&some, &[]).is_ok());
+    }
+
+    /// A sessions rule runs under the single plan, and on the two sides of
+    /// a pair where it states no cap and tells its stages. A cap under the
+    /// pair is refused by its own name, the schema's default cap as one
+    /// that is written. A rule that keeps what it places from the profile
+    /// is refused by that field's name, and a rule under `epd` by the
+    /// plan's.
+    #[test]
+    fn a_sessions_rule_runs_under_a_pair_with_no_cap_and_not_under_epd() {
+        let under = |plan: &str, profiles: &str, sessions: &str| {
+            spec_with_binding(&format!(
+                r#"{{"plan":"{plan}","profiles":{profiles},"sessions":{sessions}}}"#
+            ))
+            .validate()
+            .err()
+        };
+        let pair = r#"{"prefill":"q","decode":"q"}"#;
+        let uncapped = r#"{"sticky_header":"x-session-id","inflight_cap":65535}"#;
+        assert_eq!(under("pd-pair", pair, uncapped), None);
+        for capped in [
+            r#"{"sticky_header":"x-session-id"}"#,
+            r#"{"sticky_header":"x-session-id","inflight_cap":4}"#,
+        ] {
+            assert_eq!(
+                under("pd-pair", pair, capped),
+                Some(SpecError::BadSessions {
+                    index: 0,
+                    name: "inflight_cap",
+                    reason: "65535 (no cap) under the pd-pair plan",
+                }),
+                "{capped}"
+            );
+        }
+        let untold =
+            r#"{"sticky_header":"x-session-id","inflight_cap":65535,"rule_placed":"untold"}"#;
+        assert_eq!(
+            under("pd-pair", pair, untold),
+            Some(SpecError::BadSessions {
+                index: 0,
+                name: "rule_placed",
+                reason: "`told` under the pd-pair plan",
+            })
+        );
+        // The single plan takes each of the three.
+        for rule in [uncapped, untold, r#"{"sticky_header":"x-session-id"}"#] {
+            let single = spec_with_binding(&format!(r#"{{"profile":"q","sessions":{rule}}}"#));
+            assert_eq!(single.validate().err(), None, "{rule}");
+        }
+        let epd = r#"{"encode":"q","prefill":"q","decode":"q"}"#;
+        let refused = under("epd", epd, uncapped);
+        assert_eq!(
+            refused,
+            Some(SpecError::BadSessions {
+                index: 0,
+                name: "plan",
+                reason: "`single` or `pd-pair`",
+            })
+        );
+        assert_eq!(
+            refused.map(|err| err.to_string()),
+            Some("binding 0: sessions plan is not `single` or `pd-pair`".to_string())
+        );
     }
 
     #[test]

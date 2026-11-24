@@ -841,7 +841,7 @@ pub(super) fn paired(
             .retain(|&at| classed(classes, decode.rows[at as usize].pair_class));
         let mut pair = steered(decode.index, decode.facts, pool, decode.rows, buf);
         if let Decision::Pick(pick) = &mut pair {
-            pick.targets.pair_under(&first);
+            pick.targets.pair_under(&first, SessionVerdict::None);
             pick.trace = taken.trace;
         }
         return Some(pair);

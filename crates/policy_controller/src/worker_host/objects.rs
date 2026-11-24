@@ -981,9 +981,7 @@ impl Objects<Members> {
                 facts: FixedFacts {
                     vision: laid.remainder.vision,
                     id: Some(laid.remainder.standing.row),
-                    // The row's statement whole. Whether the worker
-                    // registered a rank is the object's to say: a list's
-                    // records read it there, whatever is lent here.
+                    // The row's statement whole.
                     demands: laid.remainder.demand_facts,
                 },
                 reach: Reach::of(&laid.remainder),
