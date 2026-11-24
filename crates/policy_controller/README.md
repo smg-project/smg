@@ -295,7 +295,7 @@ Linked targets carry worker ids and ranks. Candidate positions stay with the con
 
 ### Following a controller's workers
 
-With the `client` feature, a host can keep a copy of the controller's worker rows in a `MemoryStore` through a `Watcher`. Use `Watcher::open_on(&link)` to take the snapshot and the changes that follow it over the link's channel. The watch opens within the same five-second bound as `Client::watch_workers`. Once open, it has its own stream, so the link can answer asks and carry reports while the watch waits. Use one link for the gateway id. A second session with that id takes the first one's place.
+With the `client` feature, a host can keep a copy of the controller's worker rows in a `MemoryStore` through a `Watcher`. `Watcher::new(store, objects)` takes the store and the host's `Objects`, and the watcher writes each row through them. So a row's worker object stands when the event that told it returns, and the host calls no `Objects::follow` behind the watch. Use `Watcher::open_on(&link)` to take the snapshot and the changes that follow it over the link's channel. The watch opens within the same five-second bound as `Client::watch_workers`. Once open, it has its own stream, so the link can answer asks and carry reports while the watch waits. Use one link for the gateway id. A second session with that id takes the first one's place.
 
 A watch can outlive the link. A host that follows only while the link stands can wait for either to end.
 
@@ -317,7 +317,7 @@ let end = loop {
 
 Drop the stream before opening the watch again. The watcher asks for changes after the last event it took, or for a snapshot if it has no place. When a link ends, the host dials a new one. An ended link lets its channel go, and `Link::watch_workers` on it answers `Error::LinkEnded`.
 
-When the watch starts from a snapshot, its last page puts the rows into use through `MemoryStore::watch_from`. The watch carries worker rows and their status. The store keeps its own load reports for workers still present.
+When the watch starts from a snapshot, its last page puts the rows into use through `MemoryStore::watch_from`, and their worker objects with them. A worker still present keeps its object. The watch carries worker rows and their status. The store keeps its own load reports for workers still present.
 
 For example, if the watch starts again while a request is running, its lease stays on file. If its worker is still present, the request still counts toward that worker's in-flight total and the worker keeps its gateway vetoes. If the worker has left, the lease ends when the host reports the request's end. The store keeps its session pins through the snapshot.
 

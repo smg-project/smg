@@ -12,6 +12,15 @@
 //! took, and its next stream goes on after it ([`Watcher::open`],
 //! [`Watcher::open_on`]).
 //!
+//! **Through the worker objects.** The watcher writes its store through
+//! the holder of its host's worker objects ([`Objects`]), as a standby's
+//! applier writes its own. The holder builds the object of the row an
+//! event tells, hands the store the event, and puts the object in the
+//! registry where the store took it. A snapshot's last page is the
+//! store's write and the read of its rows in one turn of the holder. So
+//! the object of each row stands when the event that told it returns, and
+//! the host follows nothing behind the watch.
+//!
 //! **One stream at a time.** A stream is followed through the watcher
 //! ([`WatchStream`]), which borrows it: the watcher takes that stream's
 //! events and no other's, and opens its next stream only once this one is
@@ -36,6 +45,8 @@
 
 use std::{future::Future, mem, sync::Arc, time::Instant};
 
+use smg_worker::registry::Generation;
+
 use crate::{
     service::{
         client::{self, Client, Link, Watch},
@@ -43,6 +54,7 @@ use crate::{
         proto::{self, worker_event::Event},
     },
     store::{MemoryStore, Position, StoreCheckpoint, WorkerRow, WorkersStore},
+    worker_host::Objects,
 };
 
 /// Why a watcher lost its place in the watch.
@@ -88,10 +100,13 @@ enum Stands {
     LetGo,
 }
 
-/// One store, written as a controller's watch tells it.
+/// One store and its host's worker objects, written as a controller's
+/// watch tells them.
 #[derive(Debug)]
-pub struct Watcher {
+pub struct Watcher<G> {
     store: Arc<MemoryStore>,
+    /// The holder each event and each snapshot is handed to.
+    objects: Arc<Objects<G>>,
     stands: Stands,
     /// The snapshots applied so far.
     snapshots: u64,
@@ -102,8 +117,8 @@ pub struct Watcher {
 /// watcher: the watcher takes this stream's events and no other's, and
 /// opens its next stream only once this one is dropped.
 #[derive(Debug)]
-pub struct WatchStream<'w> {
-    watcher: &'w mut Watcher,
+pub struct WatchStream<'w, G> {
+    watcher: &'w mut Watcher<G>,
     watch: Watch,
 }
 
@@ -118,7 +133,7 @@ pub enum WatchStreamEnd {
     Client(client::Error),
 }
 
-impl WatchStream<'_> {
+impl<G: Generation> WatchStream<'_, G> {
     /// Takes the stream's next event into the store, at the instant it is
     /// read. `Ok(true)`: an event was taken. `Ok(false)`: the controller
     /// ended the stream with no error, and the place stands. The wait
@@ -142,7 +157,7 @@ impl WatchStream<'_> {
 
     /// The watcher that follows the stream.
     #[must_use]
-    pub fn watcher(&self) -> &Watcher {
+    pub fn watcher(&self) -> &Watcher<G> {
         self.watcher
     }
 }
@@ -154,17 +169,23 @@ fn unread(refused: Refused) -> WatchPositionLost {
     }
 }
 
-impl Watcher {
-    /// A watcher of `store`, whose worker rows come from the controller.
+impl<G: Generation> Watcher<G> {
+    /// A watcher of `store`, whose worker rows come from the controller,
+    /// and of `objects`, the holder of the host's worker objects over that
+    /// store. The watch alone writes the store's rows, and through the
+    /// holder: the object of a row stands when its event returns. The
+    /// watch tells each status, so the holder is one whose objects follow
+    /// their rows' status ([`Objects::with_status_followed`]).
     /// A snapshot keeps the store's leases and session pins, and gateway
     /// vetoes for workers still present. Use a store with no journal, since
     /// the places in a watch can skip. A journaled store takes a snapshot
     /// only at a place its journal accepts ([`WatchPositionLost::Apart`]
     /// otherwise).
     #[must_use]
-    pub fn new(store: Arc<MemoryStore>) -> Self {
+    pub fn new(store: Arc<MemoryStore>, objects: Arc<Objects<G>>) -> Self {
         Self {
             store,
+            objects,
             stands: Stands::Nowhere,
             snapshots: 0,
         }
@@ -174,6 +195,12 @@ impl Watcher {
     #[must_use]
     pub fn store(&self) -> &Arc<MemoryStore> {
         &self.store
+    }
+
+    /// The holder of the worker objects the watcher lays.
+    #[must_use]
+    pub fn objects(&self) -> &Arc<Objects<G>> {
+        &self.objects
     }
 
     /// The place of the last event taken: none before a snapshot's last
@@ -202,20 +229,20 @@ impl Watcher {
     ///
     /// The client's: the open had no answer inside its bound, or the
     /// controller refused it.
-    pub async fn open(&mut self, client: &mut Client) -> Result<WatchStream<'_>, client::Error> {
+    pub async fn open(&mut self, client: &mut Client) -> Result<WatchStream<'_, G>, client::Error> {
         self.open_with(move |request| client.watch_workers(request))
             .await
     }
 
     /// Opens the watch as [`Self::open`] does, on the link's channel.
-    pub async fn open_on(&mut self, link: &Link) -> Result<WatchStream<'_>, client::Error> {
+    pub async fn open_on(&mut self, link: &Link) -> Result<WatchStream<'_, G>, client::Error> {
         self.open_with(|request| link.watch_workers(request)).await
     }
 
     async fn open_with<F: Future<Output = Result<Watch, client::Error>>>(
         &mut self,
         open: impl FnOnce(proto::WatchWorkersRequest) -> F,
-    ) -> Result<WatchStream<'_>, client::Error> {
+    ) -> Result<WatchStream<'_, G>, client::Error> {
         let watch = open(self.request()).await?;
         Ok(WatchStream {
             watcher: self,
@@ -281,7 +308,7 @@ impl Watcher {
                     let (epoch, change, row) =
                         worker_wire::told_change(told, now).map_err(unread)?;
                     let before = WorkersStore::epoch(&*self.store);
-                    self.store.follow(at, epoch, change, row);
+                    self.objects.follow_at(&self.store, at, epoch, change, row);
                     // A change that does not fit writes nothing and says
                     // nothing: it landed where the epoch moved to its own.
                     // One at the epoch the store held already moves none.
@@ -336,7 +363,7 @@ impl Watcher {
             epoch,
             rows: staged.rows,
         };
-        if !self.store.watch_from(cut) {
+        if !self.objects.watch_from(&self.store, cut) {
             return Err(WatchPositionLost::Apart);
         }
         self.snapshots += 1;
@@ -353,6 +380,8 @@ mod tests {
         time::{Duration, Instant},
     };
 
+    use smg_worker::registry::WorkerRegistry;
+
     use super::{WatchPositionLost, Watcher};
     use crate::{
         engine::view::WorkerId,
@@ -366,6 +395,7 @@ mod tests {
             PickRecord, Position, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
         },
         tracking::lease::{Lease, LeaseId},
+        worker_host::{Members, Objects},
     };
 
     const TERM: u64 = 1;
@@ -462,8 +492,33 @@ mod tests {
         (epoch, rows)
     }
 
-    fn watching(told: &Told, rows: usize) -> Watcher {
-        let mut watcher = Watcher::new(Arc::new(MemoryStore::new()));
+    /// A watcher of `store` over a holder of its own, whose objects follow
+    /// their rows' status as a gateway's do.
+    fn over(store: Arc<MemoryStore>) -> Watcher<Members> {
+        let objects = Objects::new(Arc::new(WorkerRegistry::new())).with_status_followed();
+        Watcher::new(store, Arc::new(objects))
+    }
+
+    /// The watcher's worker objects state the rows its store holds, each
+    /// read back from its object, and no other object stands. Nothing
+    /// follows the store here: the watcher's own writes laid them.
+    #[track_caller]
+    fn laid(watcher: &Watcher<Members>) {
+        let (_, mut rows) = WorkersStore::all_rows(&**watcher.store());
+        rows.sort_by_key(|row| row.id.0);
+        let objects = watcher.objects();
+        let read = |row: &WorkerRow| {
+            let object = objects.object(row.id)?;
+            objects.row_of(&object)
+        };
+        let stated: Vec<_> = rows.iter().map(read).collect();
+        let rows: Vec<_> = rows.into_iter().map(Some).collect();
+        assert_eq!(stated, rows, "each row's object states it");
+        assert_eq!(objects.len(), rows.len(), "no other object stands");
+    }
+
+    fn watching(told: &Told, rows: usize) -> Watcher<Members> {
+        let mut watcher = over(Arc::new(MemoryStore::new()));
         let request = watcher.request();
         assert_eq!((request.resume_seq, request.resume_term), (0, 0));
         assert!(request.models.is_empty(), "every model");
@@ -472,12 +527,14 @@ mod tests {
             assert_eq!(watcher.take(&page, Instant::now()), Ok(()));
         }
         assert_eq!(held(watcher.store()), held(&told.store));
+        laid(&watcher);
         watcher
     }
 
     /// A watcher holds the controller's rows after a snapshot in pages and
     /// after each kind of change the tail tells, and its next request asks
-    /// for the tail after the last place it took.
+    /// for the tail after the last place it took. Its worker objects state
+    /// the same rows when the snapshot's last page and each change return.
     #[test]
     fn a_watcher_follows_a_fleet_from_a_snapshot_through_every_kind_of_change() {
         let mut told = Told::new();
@@ -490,6 +547,7 @@ mod tests {
                 let event = told.event(change, before);
                 assert_eq!(watcher.take(&event, now), Ok(()), "{change:?}");
                 assert_eq!(held(watcher.store()), held(&told.store), "{change:?}");
+                laid(&watcher);
             };
 
         let change = WorkersStore::upsert(&told.store, facts("grpc://10.0.0.3:8000", 1));
@@ -531,12 +589,20 @@ mod tests {
     }
 
     /// An event that does not land where the store stands loses the
-    /// watcher its place, and the next snapshot restores it.
+    /// watcher its place, and the next snapshot restores it. The event
+    /// lays no object, and the snapshot keeps the object of a row that
+    /// stands through it.
     #[test]
     fn a_change_that_does_not_land_loses_the_place_and_a_snapshot_restores_it() {
         let mut told = Told::new();
-        WorkersStore::upsert(&told.store, facts("grpc://10.0.0.1:8000", 1));
+        let first = WorkersStore::upsert(&told.store, facts("grpc://10.0.0.1:8000", 1)).id();
         let mut watcher = watching(&told, 8);
+        let object = |watcher: &Watcher<Members>| {
+            let objects = watcher.objects();
+            let id = objects.object(first).expect("the first row's object");
+            objects.registry().get(&id).expect("it stands")
+        };
+        let stood = object(&watcher);
         let now = Instant::now();
         // The watcher is not told this one.
         let change = WorkersStore::upsert(&told.store, facts("grpc://10.0.0.2:8000", 1));
@@ -545,11 +611,17 @@ mod tests {
         let event = told.event(change, None);
         assert_eq!(watcher.take(&event, now), Err(WatchPositionLost::Apart));
         assert_eq!(watcher.at(), None);
+        laid(&watcher);
         assert_eq!(watcher.request().resume_seq, 0);
         for page in told.pages(2) {
             assert_eq!(watcher.take(&page, now), Ok(()));
         }
         assert_eq!(held(watcher.store()), held(&told.store));
+        laid(&watcher);
+        assert!(
+            Arc::ptr_eq(&stood, &object(&watcher)),
+            "the object that stood"
+        );
         assert_eq!(watcher.request().resume_seq, told.seq);
         assert_eq!(watcher.snapshots(), 2);
     }
@@ -605,7 +677,7 @@ mod tests {
         let change = WorkersStore::upsert(&told.store, facts("grpc://10.0.0.3:8000", 1));
         let event = told.event(change, None);
 
-        let mut watcher = Watcher::new(Arc::new(MemoryStore::new()));
+        let mut watcher = over(Arc::new(MemoryStore::new()));
         assert_eq!(
             watcher.take(&event, now),
             Err(WatchPositionLost::Order),
@@ -688,7 +760,7 @@ mod tests {
         WorkersStore::upsert(&told.store, facts("grpc://10.0.0.1:8000", 1));
         WorkersStore::upsert(&told.store, facts("grpc://10.0.0.2:8000", 1));
         let now = Instant::now();
-        let mut watcher = Watcher::new(Arc::new(MemoryStore::new()));
+        let mut watcher = over(Arc::new(MemoryStore::new()));
         assert_eq!(watcher.take(&told.pages(1)[0], now), Ok(()));
         assert_eq!(watcher.request().resume_seq, 0);
         let change = WorkersStore::upsert(&told.store, facts("grpc://10.0.0.3:8000", 1));
@@ -742,7 +814,7 @@ mod tests {
             WorkersStore::upsert(&told.store, facts(&format!("grpc://10.0.0.{n}:8000"), 1));
         }
         let now = Instant::now();
-        let mut watcher = Watcher::new(Arc::new(MemoryStore::new()));
+        let mut watcher = over(Arc::new(MemoryStore::new()));
         WorkersStore::upsert(&told.store, facts("grpc://10.0.0.4:8000", 1));
         let before = held(watcher.store());
         let pages = told.pages(1);
@@ -778,7 +850,7 @@ mod tests {
         let told = Told::new();
         WorkersStore::upsert(&told.store, facts("grpc://10.0.0.1:8000", 1));
         let store = Arc::new(MemoryStore::journaled(Arc::new(Log::new(8))));
-        let mut watcher = Watcher::new(Arc::clone(&store));
+        let mut watcher = over(Arc::clone(&store));
         // A place under no term, which a log takes from nobody.
         let mut page = told.pages(8).remove(0);
         page.term = 0;
@@ -788,11 +860,12 @@ mod tests {
         );
         assert_eq!(watcher.at(), None);
         assert_eq!(held(&store).1, Vec::new(), "the store stays empty");
+        assert!(watcher.objects().is_empty(), "and no object is laid");
     }
 
     /// A watcher that followed one registration behind its snapshot, with
     /// the controller's side and that event.
-    fn followed() -> (Told, Watcher, proto::WorkerEvent) {
+    fn followed() -> (Told, Watcher<Members>, proto::WorkerEvent) {
         let mut told = Told::new();
         WorkersStore::upsert(&told.store, facts("grpc://10.0.0.1:8000", 1));
         let mut watcher = watching(&told, 8);
@@ -810,13 +883,15 @@ mod tests {
     #[test]
     fn a_place_not_past_the_last_and_an_epoch_held_already_lose_the_place() {
         let now = Instant::now();
-        let lost = |watcher: &mut Watcher, event: &proto::WorkerEvent, by: WatchPositionLost| {
-            let rows = held(watcher.store());
-            assert_eq!(watcher.take(event, now), Err(by));
-            assert_eq!(watcher.at(), None);
-            assert_eq!(held(watcher.store()), rows, "the rows stand");
-            assert_eq!(watcher.request().resume_seq, 0);
-        };
+        let lost =
+            |watcher: &mut Watcher<Members>, event: &proto::WorkerEvent, by: WatchPositionLost| {
+                let rows = held(watcher.store());
+                assert_eq!(watcher.take(event, now), Err(by));
+                assert_eq!(watcher.at(), None);
+                assert_eq!(held(watcher.store()), rows, "the rows stand");
+                laid(watcher);
+                assert_eq!(watcher.request().resume_seq, 0);
+            };
 
         let (_, mut watcher, event) = followed();
         lost(&mut watcher, &event, WatchPositionLost::Order);
