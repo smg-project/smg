@@ -21,7 +21,8 @@ pub(crate) enum FetchFailure {
     /// way: no answer of the engine's.
     Transport,
     /// The engine, or the host's load source in its place, answered with an
-    /// error or with a body that is no load report.
+    /// error or with a body that is no load report, one past the size the
+    /// monitor reads among them.
     Answer,
     /// The poll's deadline, or the request's own, ended the fetch.
     Deadline,
@@ -45,7 +46,8 @@ pub struct FailureTotals {
     /// way.
     pub transport: u64,
     /// The engine, or the host's load source in its place, answered with an
-    /// error or with a body that is no load report.
+    /// error or with a body that is no load report, one past the size the
+    /// monitor reads among them.
     pub answer: u64,
     /// The poll's deadline, or the request's own, ended the fetch.
     pub deadline: u64,
