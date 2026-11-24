@@ -35,7 +35,10 @@ use smg_worker::{health::liveness, identity::basic::Worker, runtime::WorkerRunti
 use tokio::time::error::Elapsed;
 
 use crate::routers::{
-    common::{placement::RequestEnd, sse::SseSender},
+    common::{
+        placement::{RequestEnd, SharedEnd},
+        sse::SseSender,
+    },
     grpc::{
         multimodal::{log_mm_timing_enabled, mm_rdma_exporter},
         utils::tonic_ext::TonicStatusExt,
@@ -743,10 +746,14 @@ pub enum ProtoStream {
 /// tells the same good end where it lets the engine go
 /// ([`ProtoStream::abort_past_stop`]). A stream dropped before its end
 /// tells nothing: a client that left, a reading the gateway gave up. The
-/// engine then hears that end as it did before.
+/// engine then hears that end as it did before. A stream that is one of a
+/// batch's tells through the end the batch shares ([`SharedEnd`]).
 pub struct ReportedStream {
     inner: ProtoStream,
     end: RequestEnd,
+    /// The end a batch's streams share, where this is one of them: its own
+    /// handle is empty then.
+    among: Option<Arc<SharedEnd>>,
 }
 
 impl ReportedStream {
@@ -758,7 +765,10 @@ impl ReportedStream {
             Some(Err(status)) => Some(status),
             None => None,
         };
-        let end = std::mem::take(&mut self.end);
+        let mut end = std::mem::take(&mut self.end);
+        if let Some(shared) = self.among.take() {
+            end = shared.take(failure.is_some());
+        }
         match failure {
             Some(status) => end.report_with(|| status.end_status()),
             None => end.report(200, || true),
@@ -2043,20 +2053,21 @@ impl ProtoStream {
     #[inline]
     pub(crate) fn report_through(&mut self, end: RequestEnd) {
         if !end.is_empty() {
-            self.put_report_layer(end);
+            self.put_report_layer(end, None);
         }
     }
 
     /// [`Self::report_through`] behind its test of the handle: the layer is
     /// made whatever `end` holds. It goes under the stream's tracked layer,
     /// where it has one. The decision bench counts the layer through this,
-    /// on an empty handle.
+    /// on an empty handle. One of a batch's streams takes `among`, the end
+    /// the batch shares, and tells through it.
     ///
     /// The stage puts the layer before a reader watches the stream for its
     /// client: over a watch the layer would read a client's leaving as the
     /// worker's end. A debug build stops at a stream watched already.
     #[inline(never)]
-    pub(crate) fn put_report_layer(&mut self, end: RequestEnd) {
+    pub(crate) fn put_report_layer(&mut self, end: RequestEnd, among: Option<Arc<SharedEnd>>) {
         debug_assert!(
             !matches!(self, Self::Watched(_)),
             "the layer is put before the stream is watched"
@@ -2068,7 +2079,7 @@ impl ProtoStream {
         // Nothing unwinds between the take and the write that follows it.
         let empty = Self::Fanout(FanoutStream::new(Vec::new()));
         let inner = std::mem::replace(over, empty);
-        *over = Self::Reported(Box::new(ReportedStream { inner, end }));
+        *over = Self::Reported(Box::new(ReportedStream { inner, end, among }));
     }
 
     /// The reader's own stop ended the generation while the engine streamed
@@ -2140,7 +2151,13 @@ impl ProtoStream {
             Self::DecodeSide(side) => side.inner.reported(),
             Self::Ahead(ahead) => ahead.inner.reported(),
             Self::Watched(watched) => watched.inner.as_mut()?.reported(),
-            _ => None,
+            Self::Sglang(_)
+            | Self::Vllm(_)
+            | Self::Trtllm(_)
+            | Self::Mlx(_)
+            | Self::TokenSpeed(_)
+            | Self::Zmq(_)
+            | Self::Fanout(_) => None,
         }
     }
 
@@ -2476,11 +2493,9 @@ impl ProtoStream {
                 }))
             }
             Self::Reported(reported) => {
-                let ReportedStream { inner, end } = *reported;
-                Self::Reported(Box::new(ReportedStream {
-                    inner: inner.defer_abort_within(bound),
-                    end,
-                }))
+                let ReportedStream { inner, end, among } = *reported;
+                let inner = inner.defer_abort_within(bound);
+                Self::Reported(Box::new(ReportedStream { inner, end, among }))
             }
         }
     }
@@ -3852,7 +3867,7 @@ mod watched_tests {
         let (client, _body) = sse_channel();
         let mut stream = ProtoStream::Fanout(FanoutStream::new(Vec::new()))
             .until_client_gone(&client, "req-watched");
-        stream.put_report_layer(RequestEnd::default());
+        stream.put_report_layer(RequestEnd::default(), None);
     }
 
     /// A client that stays reads the stream as it is: every response, a gap

@@ -2195,11 +2195,13 @@ request ──> route (HTTP or gRPC, any family)
   opened. The stream tells a clean end as the worker's 200, and a failed one by the status the
   circuit breaker samples for it. A reader whose own stop ends the generation tells that good end
   where it lets the engine go. The stage tells an attempt that opened no stream: a call that
-  failed, a deadline that passed before the call answered, an embedding's one sample. A batch of
-  prompts is one placement, told as one status, the last told. Nobody tells a client that left, a
-  reading the gateway gave up, or a failure the breaker takes no sample of: the request's media, a
-  constraint the engine could not continue under, a constraint the worker refused. This wire
-  states no time to first token and no tokens yet.
+  failed, a deadline that passed before the call answered, an embedding's one sample. Where an
+  embedding's inputs fail in different ways, its status is that sample and its class the first
+  failure's. A batch of prompts is one placement, told as one status: the first failure one of its
+  streams meets, or the worker's 200 once every stream ended well. Nobody tells a client that
+  left, a reading the gateway gave up, or a failure the breaker takes no sample of: the request's
+  media, a constraint the engine could not continue under, a constraint the worker refused. This
+  wire states no time to first token and no tokens yet.
 
   A route tells every answer of its workers or none. The other routes tell no outcome yet
   **[planned]**: the transcription route, the pair routes. There, and for an end

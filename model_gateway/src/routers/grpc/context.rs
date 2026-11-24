@@ -63,7 +63,7 @@ use crate::{
         common::{
             attempt_ledger::AttemptLedger,
             pd_admission::PdAdmissionGuard,
-            placement::{Placed, RequestEnd},
+            placement::{Placed, RequestEnd, SharedEnd},
             prefill_admission::{PrefillAhead, PrefillLoadGuard},
             snapshot::WorkerRegistry,
             sse::SseSender,
@@ -2012,9 +2012,10 @@ impl ExecutionResult {
     /// From here on the result tells Grand Central its request's end
     /// through `end`, the handle the execution plan asked of the attempt's
     /// guards ([`WorkerSelection::end`]). The one worker's stream tells its
-    /// own end ([`ProtoStream::report_through`]). Each result of a batch
-    /// takes a handle of the batch's one placement, so the engine hears one
-    /// end, with the status told last. An embedding is its answers, in hand
+    /// own end ([`ProtoStream::report_through`]). The streams of a batch
+    /// share its one placement's end ([`SharedEnd`]): the first failure one
+    /// of them meets stands, and the worker's 200 is told once every stream
+    /// ended well. An embedding is its answers, in hand
     /// and all good: the worker's 200 is told here, the status the circuit
     /// breaker sampled for them, and nothing for an embedding of no answer,
     /// which the breaker took no sample of.
@@ -2029,11 +2030,23 @@ impl ExecutionResult {
                     end.report(200, || true);
                 }
             }
-            Self::Batch { results } => {
+            Self::Batch { results } if !end.is_empty() => {
+                let shared = SharedEnd::among(end);
                 for result in results {
-                    result.report_through(end.clone());
+                    match result {
+                        Self::Single { stream, .. } => {
+                            stream.put_report_layer(RequestEnd::default(), Some(shared.reader()));
+                        }
+                        // A single request's batch holds its streams alone.
+                        // A result of another kind takes no share of the
+                        // end: the batch's good end does not wait on it.
+                        Self::PrefillDecode { .. }
+                        | Self::Embedding { .. }
+                        | Self::Batch { .. } => {}
+                    }
                 }
             }
+            Self::Batch { .. } => {}
         }
     }
 }

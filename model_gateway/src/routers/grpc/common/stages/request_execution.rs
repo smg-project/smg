@@ -493,10 +493,7 @@ pub(crate) async fn execute_plan(
                 // The timeout is the decode's that was waited on: the one a
                 // second ask moved the pair to, where it moved.
                 let waited_on = moved.as_ref().unwrap_or(workers);
-                let guards = ctx.load_guards.as_ref();
-                Err(dispatch_timed_out(
-                    deadline, waited_on, ledger, request_id, guards,
-                ))
+                Err(dispatch_timed_out(deadline, waited_on, ledger, request_id))
             }
         },
         None => dispatch.await,
@@ -561,7 +558,8 @@ pub(crate) async fn execute_plan(
 /// own end from here on ([`ExecutionResult::report_through`]). A dispatch
 /// that failed opened no stream to tell it: its answer bears the end it
 /// owes ([`UntoldEnd`]), which is taken off the answer and told. The
-/// deadline's answer bears none: [`dispatch_timed_out`] told that end.
+/// deadline's answer bears its timeout the same way
+/// ([`dispatch_timed_out`]).
 #[inline(never)]
 fn tell_end(result: &mut Result<ExecutionResult, Response>, end: RequestEnd) {
     match result {
@@ -630,16 +628,14 @@ impl UntoldEnd {
 /// prefill side's first response waits for the decode side; a prefill side
 /// that is itself silent is the prefill silence bound's to charge, which
 /// fires before this deadline when it is on. The dropped call is what
-/// cancels the request on the worker(s). A single request tells Grand
-/// Central the timeout here, where the breaker samples it: the dropped call
-/// left no answer to mark ([`UntoldEnd`]), so the plan hands in `guards`,
-/// the attempt's, and the handle is asked of them.
+/// cancels the request on the worker(s). The answer bears the end a single
+/// request owes Grand Central, the timeout as the breaker samples it
+/// ([`UntoldEnd`]): the plan takes it off the answer and tells it.
 fn dispatch_timed_out(
     deadline: RequestDeadline,
     workers: &WorkerSelection,
     ledger: &AttemptLedger,
     request_id: &str,
-    guards: Option<&LoadGuards>,
 ) -> Response {
     let status = deadline.status();
     let urls: Vec<&str> = workers
@@ -656,17 +652,20 @@ fn dispatch_timed_out(
         if let Some(sample) = status.breaker_status() {
             ledger.record_outcome(worker.as_ref(), sample);
         }
-        workers.end(guards).report_with(|| status.end_status());
         UpstreamClass::account_dispatch_failure(
             worker.worker_type().as_metric_label(),
             worker.connection_mode().as_metric_label(),
             &status,
         );
     }
-    status.to_http_error(
+    let mut response = status.to_http_error(
         "start_generation_failed",
         format!("Failed to start generation: {}", status.message()),
-    )
+    );
+    if let Some(untold) = UntoldEnd::owed(workers, || status.end_status()) {
+        untold.mark(&mut response);
+    }
+    response
 }
 
 /// A disaggregated dispatch without the Prefill admission slot worker
@@ -1582,8 +1581,8 @@ where
 /// the worker's reading ([`batch_breaker_status`]). The request opens no
 /// stream, so that sample is the end Grand Central hears, and the plan
 /// tells it ([`tell_end`]): a request that fails marks its answer with it
-/// ([`UntoldEnd`]), and one whose answers are all good is told as the
-/// worker's 200, which is its sample.
+/// ([`embed_end_owed`]), on its failure path alone, and one whose answers
+/// are all good is told as the worker's 200, which is its sample.
 async fn execute_embed(
     requests: Vec<ProtoEmbedRequest>,
     clients: &mut ClientSelection,
@@ -1614,20 +1613,9 @@ async fn execute_embed(
     };
     // One breaker sample for the request, read from every answer: a worker
     // failure on any input counts whatever its place in the batch.
-    let mut untold = None;
-    if let Some(status) = worker.and_then(|worker| batch_breaker_status(&answers, worker.as_ref()))
-    {
+    let sample = worker.and_then(|worker| batch_breaker_status(&answers, worker.as_ref()));
+    if let Some(status) = sample {
         workers.record_outcome(ledger, status);
-        // The end a request that fails owes Grand Central: the sample,
-        // and whether the worker itself answered it, by an answer of that
-        // status that is no failure of the call under it.
-        untold = UntoldEnd::owed(workers, || {
-            let answered = answers.iter().any(|answer| match answer {
-                Ok(_) => status == 200,
-                Err(failure) => failure.end_status() == Some((status, true)),
-            });
-            Some((status, answered))
-        });
     }
     let result: Result<Vec<_>, _> = answers.into_iter().collect();
 
@@ -1645,13 +1633,24 @@ async fn execute_embed(
             "Failed to start embedding",
             "start_embedding_failed",
         );
-        if let Some(untold) = untold {
+        if let Some(untold) = UntoldEnd::owed(workers, || embed_end_owed(sample, &e)) {
             untold.mark(&mut response);
         }
         response
     })?;
 
     Ok(ExecutionResult::Embedding { responses })
+}
+
+/// The end a failed embedding owes Grand Central. Its status is
+/// `sample`, the breaker's one sample for the request: a sample of 200 is
+/// the good answers' alone, and it or none owes nothing. Who answered is
+/// the word of `first`, the failure the client's answer is made of. Where
+/// the inputs of one request fail in different ways and the first failure
+/// is not the sample's, the class told is the first failure's.
+fn embed_end_owed(sample: Option<u16>, first: &tonic::Status) -> Option<(u16, bool)> {
+    let status = sample.filter(|&status| status != 200)?;
+    Some((status, !first.is_no_answer()))
 }
 
 /// The circuit breaker's one sample for a request the gateway dispatched as
@@ -6784,6 +6783,75 @@ pub(crate) mod tests {
             let owed = UntoldEnd::owed(&selection, || panic!("no end is owed"));
             assert!(owed.is_none());
         }
+    }
+
+    /// A batch's streams tell one end, its one placement's. The first
+    /// failure one of them meets stands against a sibling's good end behind
+    /// it: a streaming reader waits on its flush behind a failure, and a
+    /// sibling may reach its end meanwhile. The worker's 200 is told once
+    /// every stream ended well, so a batch whose client left one of them
+    /// unread is told by nobody.
+    #[tokio::test]
+    async fn a_batchs_streams_tell_one_end_and_its_first_failure_stands() {
+        // Each stream's gRPC status (13: the engine's own report), the
+        // streams read to their end, in that order, and the end heard.
+        let orders: [([&'static str; 2], &[usize], &str); 4] = [
+            (["13", "0"], &[0, 1], "completed ServerError 500"),
+            (["0", "13"], &[0, 1], "completed ServerError 500"),
+            (["0", "0"], &[0, 1], "completed Ok 200"),
+            (["0", "0"], &[1], "completed Cancelled"),
+        ];
+        for (statuses, read, end_heard) in orders {
+            let (heard, guard, end) = heard_request();
+            let mut results = Vec::new();
+            let mut servers = Vec::new();
+            for status in statuses {
+                let (stream, server) = scripted_stream(vec![complete(0, "stop")], status).await;
+                servers.push(server);
+                results.push(ExecutionResult::Single {
+                    stream,
+                    dispatch_start: Instant::now(),
+                });
+            }
+            let mut batch = ExecutionResult::Batch { results };
+            batch.report_through(end);
+            let ExecutionResult::Batch { results } = &mut batch else {
+                panic!("a batch");
+            };
+            for &index in read {
+                let ExecutionResult::Single { stream, .. } = &mut results[index] else {
+                    panic!("a single request's result");
+                };
+                while stream.next().await.is_some() {}
+            }
+            drop((batch, guard));
+            assert_eq!(
+                heard_of(&heard),
+                ["issued", "dispatched Single", end_heard],
+                "{statuses:?}, read {read:?}"
+            );
+        }
+    }
+
+    /// A failed embedding owes Grand Central the breaker's one sample,
+    /// and for who answered the word of its first failure, the one the
+    /// client's answer is made of. Where a request's inputs fail in
+    /// different ways and the first failure is not the sample's, the class
+    /// told is the first failure's: a failed connection's 502 reads as the
+    /// server's error behind an input the worker refused itself. A sample
+    /// of 200 or none owes nothing.
+    #[test]
+    fn a_failed_embedding_owes_its_sample_and_its_first_failures_word() {
+        let engine = tonic::Status::internal("the engine failed");
+        assert_eq!(embed_end_owed(Some(500), &engine), Some((500, true)));
+        let ended = tonic::Status::cancelled("the worker's side ended the call");
+        assert_eq!(embed_end_owed(Some(502), &ended), Some((502, false)));
+        // The worker refused the first input itself, and a later input's
+        // connection failed: that failure is the sample.
+        let refused = tonic::Status::invalid_argument("a bad input");
+        assert_eq!(embed_end_owed(Some(502), &refused), Some((502, true)));
+        assert_eq!(embed_end_owed(Some(200), &refused), None);
+        assert_eq!(embed_end_owed(None, &refused), None);
     }
 
     /// What a result in hand tells once the plan hands it the handle. An

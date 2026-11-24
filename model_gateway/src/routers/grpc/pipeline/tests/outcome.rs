@@ -304,10 +304,10 @@ async fn the_engine_hears_a_client_that_left_as_cancelled() {
 }
 
 /// A batch of prompts is one placement, and the stream of each prompt tells
-/// its end through that placement's one handle. The engine hears one end,
-/// with the status last told. A prompt that fails ends the batch there, so
-/// its status is the last: behind a prompt that ended well, and at a call
-/// that opened no stream.
+/// its end through the one end the batch's streams share. The engine hears
+/// one end: the worker's 200 once every stream ended well, or the first
+/// failure one of them meets, behind a prompt that ended well too. A call
+/// that opened no stream is told by the stage.
 #[tokio::test]
 async fn the_engine_hears_a_batch_as_its_one_placement() {
     let batch = |stream: bool| -> Arc<CompletionRequest> {

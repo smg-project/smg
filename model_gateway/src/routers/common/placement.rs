@@ -558,6 +558,44 @@ impl RequestEnd {
     }
 }
 
+/// One request's end as several readers of its answers tell it: the streams
+/// of a batch, which is one placement. The first failure one of them meets
+/// takes the handle, told or not, so it stands against whatever a sibling
+/// meets behind it. A good end takes the handle for the last reader alone:
+/// the request ended well once every reader's stream did, and a stream
+/// dropped unread leaves the request untold, as a client that left does.
+pub(crate) struct SharedEnd(Mutex<(RequestEnd, usize)>);
+
+impl SharedEnd {
+    /// `end` for the readers of one request's answers. Each reader takes
+    /// its share by [`Self::reader`].
+    pub(crate) fn among(end: RequestEnd) -> Arc<Self> {
+        Arc::new(Self(Mutex::new((end, 0))))
+    }
+
+    /// One more reader's share of the end. The readers counted are the
+    /// ones that tell: a good end waits on each of them and on no other.
+    pub(crate) fn reader(self: &Arc<Self>) -> Arc<Self> {
+        self.0.lock().1 += 1;
+        Arc::clone(self)
+    }
+
+    /// The handle for a reader that met its end, `failed` or good: the
+    /// request's own for the first failure, told or not, and for the last
+    /// good end, the empty one for any other. A first failure the circuit
+    /// breaker takes no sample of tells nothing, and it is the answer the
+    /// client gets: a sibling's failure behind it is not told either.
+    pub(crate) fn take(&self, failed: bool) -> RequestEnd {
+        let (end, open) = &mut *self.0.lock();
+        *open = open.saturating_sub(1);
+        if failed || *open == 0 {
+            std::mem::take(end)
+        } else {
+            RequestEnd::default()
+        }
+    }
+}
+
 /// [`RequestEnd::of`] for a guard that keeps something, out of line: a
 /// classic guard never comes here.
 #[inline(never)]

@@ -369,10 +369,8 @@ pub mod bench_support {
     /// count run the same code around the read: whether it handed an item.
     #[inline(never)]
     fn read_once(stream: &mut ProtoStream) -> bool {
-        matches!(
-            futures::FutureExt::now_or_never(stream.next()),
-            Some(Some(_))
-        )
+        let item = futures::FutureExt::now_or_never(stream.next());
+        matches!(item, Some(Some(_)))
     }
 
     /// Bytes the calling thread has allocated since it started, by the
@@ -569,18 +567,17 @@ pub mod bench_support {
                     worker.ended(200, || true);
                 }
             }
-            // The gRPC execution stage's forms run one body, so that a form
-            // and its control differ by the form's own calls alone: the
-            // stream and the guards stand in the same places for each.
-            Ended::Told
-            | Ended::Walked
-            | Ended::Dispatched
-            | Ended::Read
-            | Ended::Watched
-            | Ended::Stopped
-            | Ended::Layered
-            | Ended::LayeredRead => {
+            // Every other form is the gRPC execution stage's. They run one
+            // body, so that a form and its control differ by the form's own
+            // calls alone: the stream and the guards stand in the same
+            // places for each.
+            _ => {
                 let (selection, guards, mut stream) = dispatched(worker, key);
+                // The stage's plan reads the selection's address out of its
+                // future's frame behind the dispatch. Here it stands in
+                // memory as well, and the form that asks it loads it.
+                let mut held = &selection;
+                black_box(&mut held);
                 // Whether the stream was read stands in memory from here. In a
                 // register it is set again at the head of a form's own block,
                 // and the form's cell would count that beside its own calls.
@@ -588,13 +585,13 @@ pub mod bench_support {
                 let read = black_box(&mut read);
                 match end {
                     Ended::Told => {
-                        if selection.tells_end() {
-                            stream.report_through(selection.end(Some(&guards)));
+                        if held.tells_end() {
+                            stream.report_through(held.end(Some(&guards)));
                         }
                     }
                     Ended::Walked => stream.report_through(guards.end()),
                     Ended::Layered | Ended::LayeredRead => {
-                        stream.put_report_layer(RequestEnd::default());
+                        stream.put_report_layer(RequestEnd::default(), None);
                     }
                     _ => {}
                 }
