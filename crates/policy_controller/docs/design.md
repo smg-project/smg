@@ -300,8 +300,10 @@ neither threshold (decision 10). A supplied document that binds no single reques
 single request, in any gateway. For a prefill-decode mode of one router over HTTP that is the
 token count.
 
-**A worker's `policy` label [planned].** With the classic policies a registration can name its
-model's policy. The engine follows no such label today.
+**A worker's `policy` label [partly].** With the classic policies a registration can name its
+model's policy. The engine follows no such label today: the document's builder takes one, no
+gateway hands it one yet, and a registration that states one is answered with a warning that it
+names no policy (`model_gateway/src/workflow/steps/shared/update_policies.rs`).
 
 What classic does: the registry builds a model's policy at the registration that finds the model
 with none, from that worker's `policy` label, for the worker's primary model. Where two such
@@ -315,15 +317,30 @@ are placed by their side's policy. A label names a policy in any letter case, wi
 underscores or with none. A label that names the default policy's own type takes the settings'
 options, any other name takes that policy's defaults, and an unknown name leaves the default.
 
-What is planned: the label becomes one more input of the document built from the routing
-settings (`RoutingSettings::policy_document()`), by classic's rule. The registration that finds
-the model with none decides: its label adds a binding of that model's single requests, ahead of
-the binding of every model (section 5.6, step 4), and the binding leaves with the model's last
-worker. Where the document binds no single request, a label adds no binding, and the model's
-single requests stay refused. The name is resolved as classic resolves it. The default policy's
-own type gives the profile the settings state. Any other name gives the binding the settings
-would write for a single request under that policy, with the policy at the defaults classic
-builds it with by name. An unknown name adds no binding.
+What is built: the label is one more input of the document built from the routing settings
+(`RoutingSettings::policy_document_with_labels`), which takes each labelled model's id with the
+name of its policy. A label adds a binding of that model's single requests, ahead of the binding
+of every model (section 5.6, step 4). Where the document binds no single request, a label adds no
+binding, and the model's single requests stay refused. The default policy's own type gives the
+profile the settings state. Any other name gives the binding the settings would write for a
+single request under that policy, with the policy at the defaults classic builds it with by name
+(`PolicySettings::of_label`). A label whose binding the document cannot hold beside the
+settings' own is refused by its model and its policy. The call then answers no document: its host
+leaves that label out and calls again, and the other labels build without it. A label that names
+another policy for a model whose id is empty or holds a `*` is refused the same way: a binding
+reads a `*` at its start or its end as a pattern, and the document refuses one anywhere else.
+Classic keeps a model's policy under the id as written, so there such a model follows its label.
+
+One difference from classic stays. Models that name one policy by their labels are bound to one
+profile, so a stage that keeps a history of its own keeps one for all of them: the count round
+robin draws a new list's start from, and the warm-up's counts of misses and hits with its
+shallow mark. A model whose label names the default policy shares the main profile's the same
+way. Classic builds a policy object for each such model, so there each keeps its own. A profile
+for each labelled model would end the difference.
+
+What is planned: the gateway hands the builder its labels by classic's rule. The registration
+that finds the model with none decides, and the binding leaves with the model's last worker. The
+name is resolved as classic resolves it, and an unknown name adds no binding.
 
 The gateway then puts the new document in force on the running engine. A document put in force
 keeps the stages of every profile that did not change: one whose name stands in both documents
@@ -331,14 +348,18 @@ and whose stages are built from the same text (the profile's own block, `view` a
 Such a profile's stages keep what they hold, and a decision under way and a new one run the same
 stage objects. A profile that changed, and a new one, start empty. So a label's binding resets
 nothing of another model's policy where it leaves the document's `view` and `signals` as they
-stand. A label whose binding writes into them, as `manual` writes its header into the view,
-restarts every profile's stages. Where the new document cannot be built, the document in force
-stays and the registration is answered with a warning.
+stand. A label whose binding writes into them restarts every profile's stages. A label writes
+no signal, and into the view only headers the view does not list yet: a `manual` label its key's
+headers, and under the sticky override a label of a policy the override places adds the
+override's headers, beside a main policy whose binding lists none (`consistent_hashing`). A
+`cache_aware` label also writes the document's `index` block where the settings wrote none.
+Where the new document cannot be built, the document in force stays and the registration is
+answered with a warning.
 
 That holds where the document is built from the routing settings. Where the operator supplies a
 document, and on a controller, the document decides, and a registration whose label names
-another policy is answered with a warning. As a first step the gateway warns at a registration
-whose label it does not follow.
+another policy is answered with a warning. The gateway takes that first step today: with the
+engine on, it warns at each registration that states a label.
 
 ### 3.4 A validated document
 
@@ -2407,7 +2428,7 @@ bursts. It is bounded by the tree's size bound and the time between two eviction
 | `canary`, `override: allowed`, `admission` | **[planned]** | in the schema; a document that writes one is refused, and the error names the field |
 | `shadow`, `explain.sample` | **[partly]** | the kept engine runs a single request's shadow, but not one that reads affinity rows of its own; a pair's shadows run in no engine, and `explain.sample` is kept by the served controller alone (decision 7) |
 | The ten presets and the conversion from routing settings | **[built]** | |
-| A worker's `policy` label names its model's policy | **[planned]** | section 3.3: a warning at a registration first, then a binding for the model in the document built from the routing settings; a document put in force keeps the stages of a profile that did not change |
+| A worker's `policy` label names its model's policy | **[partly]** | section 3.3: built: the builder of the settings' document takes a label and binds its model, and a registration that states a label is answered with a warning; planned: the gateway hands the builder its labels, and a document put in force keeps the stages of a profile that did not change |
 | The stage interfaces and a builder's own stages | **[built]** | |
 | The engine over worker lists (`PolicyEngine`) | **[partly]** | refuses a subset hint, an encode request's demand, mixed protocols; of the recorded lines only the three hard-demand sheets and `sticky_rank` (34), and 31 lines of `prefix_hash`, replay through it |
 | `round_robin`, `random`, `passthrough`, `least_load`, `power_of_two` on that engine | **[partly]** | no sheet over a healthy pool for four of them |
