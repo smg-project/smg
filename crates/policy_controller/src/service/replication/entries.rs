@@ -174,7 +174,6 @@ pub const ENTRIES: &[(&str, &str, EntryReplication)] = &[
     ("MemoryStore", "journaled", EntryReplication::Read),
     ("MemoryStore", "followed", EntryReplication::Read),
     ("MemoryStore", "checkpoint", EntryReplication::Read),
-    ("MemoryStore", "rows_serving", EntryReplication::Read),
     (
         "MemoryStore",
         "restore_from",

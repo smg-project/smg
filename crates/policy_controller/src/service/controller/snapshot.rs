@@ -22,25 +22,25 @@
 //! last watched write is shared with no copy, as a watch's start shares it
 //! ([`Feed::rows_at_head`](super::watch_workers::Feed::rows_at_head)).
 //! Where another call is let in or a watch is open, the first read at a
-//! place copies every row under the membership lock and keeps the copy,
-//! and each read that starts there shares it: calls that come together
-//! hold that lock once a write, as watches do. A call with no limit and no
+//! place cuts every row from the worker objects and keeps the copy, and
+//! each read that starts there shares it: calls that come together take the
+//! holder's turn once a write, as watches do. A call with no limit and no
 //! models takes that road too, alone or not: it would copy every row
 //! anyway, and a call let in while it runs shares the copy. The last call
 //! out lets the copy go where no watch is open to share it ([`SerialTurn`],
 //! [`Watchers::unshared`](super::watch_workers::Watchers::unshared)): a
 //! copy of every row is held only while a reader can share it. Any other
-//! call that is alone with no watch open copies the rows it may tell and
-//! keeps nothing ([`MemoryStore::rows_serving`]): its limit's worth, or
-//! every row its models serve where it states no limit.
+//! call that is alone with no watch open reads the rows it may tell and
+//! keeps nothing ([`Objects::rows_serving`]): its limit's worth, or every
+//! row its models serve where it states no limit.
 //!
-//! A decision reads the published world and does not wait on that lock.
-//! Whatever takes it waits for a copy, on the thread that brought it.
-//! Among the store's writes, these take it each time: a membership write,
-//! a probe's outcome, a veto that is set, a gateway's report of a request
-//! that completed well, and a generation's apply. One takes it only in a
-//! corner: the world's publication where a build is owed and due. Among
-//! the reads: a watch's open where it copies and a standby's base.
+//! A copy holds two locks, one after the other taken. The holder's turn
+//! is held for the rows: a registration call's write, a standby's applier
+//! and a door's read of a row wait for the copy there. The store's
+//! membership lock is held inside it for the log's place and one status a
+//! row: a status tell and the store's other writes of that lock wait for
+//! that alone. No decision takes either. Whatever waits does so on the
+//! thread that brought it.
 //! **One snapshot is taken at a time, off the runtime's workers**
 //! ([`SerialTurn`]): one operator's copy is made at a time, and the take itself
 //! holds no thread a stream of the listener runs on. A watch's open and a
@@ -62,6 +62,7 @@ use crate::{
     },
     service::proto::{self, snapshot_request::Slice},
     store::MemoryStore,
+    worker_host::{Members, Objects},
 };
 
 /// Every slice of the contract, in its order.
@@ -213,22 +214,23 @@ pub(crate) fn asked(request: proto::SnapshotRequest) -> Result<SnapshotQuery, St
 /// feed's cut is taken and kept: somebody can share it. A call with no
 /// limit and no models takes it too: it would copy every row anyway, and a
 /// call let in while it runs shares the copy. Any other call that is alone
-/// with no watch open reads the rows it may tell and keeps nothing.
+/// with no watch open reads the rows it may tell and keeps nothing. Each
+/// read is the worker objects': their holder cuts it.
 pub(crate) fn read(
     asked: &SnapshotQuery,
     turn: &SerialTurn,
     feed: &watch_workers::Feed,
     watchers: &watch_workers::Watchers,
-    store: &MemoryStore,
+    (objects, store): (&Objects<Members>, &MemoryStore),
 ) -> Rows {
     if let Some(cut) = feed.kept_at_head() {
         return Rows::Shared(cut);
     }
     let every = asked.rows.limit == usize::MAX && asked.rows.models.is_empty();
     if every || turn.let_in() > 1 || watchers.open() {
-        return Rows::Shared(feed.rows_at_head(store));
+        return Rows::Shared(feed.rows_at_head(objects, store));
     }
-    let (rows, serving) = store.rows_serving(&asked.rows.models, asked.rows.limit);
+    let (rows, serving) = objects.rows_serving(store, &asked.rows.models, asked.rows.limit);
     Rows::Told(rows, serving)
 }
 
@@ -315,6 +317,7 @@ mod tests {
         },
         stages::registry::StageRegistry,
         store::{MemoryStore, StoreCheckpoint, WorkerFacts, WorkerRow, WorkersStore},
+        worker_host::{Members, Objects},
     };
 
     /// The rows slice alone: every model, no limit.
@@ -361,6 +364,13 @@ mod tests {
             })
             .id()
             .0
+    }
+
+    /// The rows a lone call reads of `store`, as the service reads them:
+    /// off the worker objects, whose holder follows the store first.
+    fn lone(store: &MemoryStore, models: &[String], limit: usize) -> (Vec<WorkerRow>, usize) {
+        let objects: Objects<Members> = Objects::new(Arc::default());
+        objects.rows_serving(store, models, limit)
     }
 
     /// The address of row `n`.
@@ -686,7 +696,7 @@ mod tests {
             models: Vec::new(),
             limit: 3,
         };
-        let (read, serving) = store.rows_serving(&asked.models, asked.limit);
+        let (read, serving) = lone(&store, &asked.models, asked.limit);
         let (page, truncated) = super::rows(&asked, Rows::Told(read, serving), Instant::now());
         assert_eq!((page.len(), truncated), (1, true));
         assert!(page[0].url.starts_with("grpc://0."));
@@ -767,7 +777,7 @@ mod tests {
                     ..ROWS
                 };
                 let now = Instant::now();
-                let (read, serving) = store.rows_serving(&asked.rows.models, asked.rows.limit);
+                let (read, serving) = lone(&store, &asked.rows.models, asked.rows.limit);
                 assert!(read.len() <= limit, "models {models:?}, limit {limit}");
                 assert_eq!(
                     super::rows(&asked.rows, Rows::Told(read, serving), now),
@@ -1107,8 +1117,7 @@ mod tests {
                     models: models.clone(),
                     limit,
                 };
-                let read = || store.rows_serving(&models, limit);
-                let (rows, serving) = read();
+                let (rows, serving) = lone(&store, &models, limit);
                 let expected = legacy_rows(&cut.rows, &models, limit, now);
                 for read in [
                     ReadRows::Shared(Arc::clone(&cut)),

@@ -199,6 +199,20 @@ impl Held {
 /// The holder is the registry's one writer: an object any other writer left
 /// under a row's URL is replaced by the row's.
 ///
+/// Every writer of a row's facts holds the holder's turn from its decision
+/// to the journal's telling: a door's write, a standby's applier, a
+/// watcher's, and a restore. So a first copy cut in that turn states each
+/// row the journal told at the copy's place, and none it did not. Three
+/// writes move the journal's place with no turn of the holder, and a copy
+/// stays whole beside each. A status tell changes no row's facts, and a
+/// copy reads the told statuses with the place in one hold of the store's
+/// membership lock. A generation's apply and a term's start change no row.
+/// A caller of the store's own registration, patch or removal takes no
+/// turn either: no product code calls those, and they go with the store's
+/// table. A copy's told read carries the store's epoch and history, and
+/// the holder reads the store again where either moved since its own
+/// read, so a copy holds such a write too.
+///
 /// A row takes the place of its own object alone: an object another row
 /// holds under its URL is dropped first.
 ///

@@ -6,8 +6,8 @@
 //! No writer waits for a watcher. A stream has no task and no queue of its
 //! own: the transport polls it, on the task of its call, and each poll
 //! reads the stream's place. It starts from the cut of its place (taken
-//! once at a place, under the membership lock for the copy of the rows,
-//! and shared), then reads the log, at most [`HELD`] entries a read, when
+//! once at a place, from the worker objects in their holder's turn, and
+//! shared), then reads the log, at most [`HELD`] entries a read, when
 //! a watched write landed or the role's word was told, never for a load
 //! row. An event is built when the transport takes it: what a watcher has
 //! not taken waits in the log, and one the log's ring let go is told to
@@ -76,6 +76,7 @@ use crate::{
         replication::{Entry, Event, Log, ReadStamp},
     },
     store::{GatewayId, MemoryStore, Position, StoreCheckpoint, WorkerRow},
+    worker_host::{Members, Objects},
 };
 
 /// The rows of one snapshot page.
@@ -196,21 +197,26 @@ impl Feed {
     }
 
     /// The rows at the log's last watched write. A cut is a write's, not a
-    /// reader's: the first read that starts at a place takes it from
-    /// `store`, under the membership lock for the copy, and every read that
-    /// starts there shares it: a watch's start, and the operators'
-    /// snapshot. Reads that come together or in a loop hold that lock once
-    /// a write, and the feed keeps one copy of the rows while a reader can
-    /// share it ([`Feed::let_go`], [`WatchPlace`], [`Watchers::unshared`]). The
+    /// reader's: the first read that starts at a place cuts it from
+    /// `objects`, in their holder's turn for the copy
+    /// ([`Objects::checkpoint`]), and every read that starts there shares
+    /// it: a watch's start, and the operators' snapshot. Reads that come
+    /// together or in a loop take that turn once a write, and the feed
+    /// keeps one copy of the rows while a reader can share it
+    /// ([`Feed::let_go`], [`WatchPlace`], [`Watchers::unshared`]). The
     /// kept cut is named by its place with its term, never by a sequence
     /// alone: a restore can leave one sequence over other rows.
-    pub(crate) fn rows_at_head(&self, store: &MemoryStore) -> Arc<StoreCheckpoint> {
+    pub(crate) fn rows_at_head(
+        &self,
+        objects: &Objects<Members>,
+        store: &MemoryStore,
+    ) -> Arc<StoreCheckpoint> {
         let mut kept = self.rows.lock();
         let head = self.log.head();
         if let Some(cut) = kept.as_ref().filter(|cut| cut.at == head) {
             return Arc::clone(cut);
         }
-        let cut = Arc::new(store.checkpoint());
+        let cut = Arc::new(objects.checkpoint(store));
         #[cfg(test)]
         self.cuts.fetch_add(1, Ordering::Relaxed);
         *kept = Some(Arc::clone(&cut));
@@ -302,6 +308,9 @@ pub(crate) fn start(request: &proto::WatchWorkersRequest) -> Result<Start, Statu
 #[derive(Debug)]
 pub(crate) struct Source {
     pub(crate) store: Arc<MemoryStore>,
+    /// The holder of the replica's worker objects: a watch's first copy
+    /// is cut from them.
+    pub(crate) objects: Arc<Objects<Members>>,
     pub(crate) feed: Feed,
     pub(crate) fence: Arc<Fence>,
     /// The term this replica leads, if it leads one. A term is told at its
@@ -327,7 +336,7 @@ impl Source {
     /// The rows a watch starts from: the feed's cut at the log's last
     /// watched write ([`Feed::rows_at_head`]).
     fn rows(&self) -> Arc<StoreCheckpoint> {
-        self.feed.rows_at_head(&self.store)
+        self.feed.rows_at_head(&self.objects, &self.store)
     }
 }
 
@@ -835,6 +844,7 @@ pub(crate) mod tests {
         engine::view::{LoadRow, WorkerId},
         service::{
             controller::{
+                decision_slots::tests::holder,
                 election::LeasePlace,
                 gateways::tests::PATIENT,
                 membership::tests::Logged,
@@ -849,11 +859,15 @@ pub(crate) mod tests {
             Journal, LeasesStore, LoadSink, LoadSource, MembershipChange, MemoryStore, Position,
             WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
         },
+        worker_host::{Members, Objects},
     };
 
     /// A replica that leads under term 1, its store standing in that term.
     struct Leader {
         store: Arc<MemoryStore>,
+        /// The holder a watch's first copy is cut from: it follows the
+        /// store, which a case writes itself.
+        objects: Arc<Objects<Members>>,
         feed: Feed,
         elector: Elector,
         role: watch::Sender<Option<u64>>,
@@ -880,6 +894,7 @@ pub(crate) mod tests {
         store.set_term(1);
         let (role, _) = watch::channel(Some(1));
         Leader {
+            objects: holder(&store),
             store,
             feed,
             elector,
@@ -901,6 +916,7 @@ pub(crate) mod tests {
         fn watch_as(&self, by: &str, start: Start, models: &[&str]) -> Result<Watching, Status> {
             let source = Source {
                 store: Arc::clone(&self.store),
+                objects: Arc::clone(&self.objects),
                 feed: self.feed.clone(),
                 fence: self.elector.fence(),
                 role: self.role.subscribe(),

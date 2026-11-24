@@ -142,9 +142,11 @@ pub struct MemoryStore {
     wake: Mutex<Option<Wake>>,
 }
 
-/// The store's replicated tables at one place of its history
-/// ([`MemoryStore::checkpoint`]). The contract's three snapshot messages are
-/// built from it: the operator's, the watch's and the replication's.
+/// The replicated rows at one place of the log's history. A controller's is
+/// cut from its worker objects by their holder, and the store's own entry
+/// cuts one from its table ([`MemoryStore::checkpoint`]). The contract's
+/// three snapshot messages are built from it: the operator's, the watch's
+/// and the replication's.
 #[derive(Clone, Debug)]
 pub struct StoreCheckpoint {
     /// The last journaled write that the tables hold, with its term; the
@@ -254,13 +256,17 @@ impl MemoryStore {
         self.journal.as_ref().and_then(|journal| journal.followed())
     }
 
-    /// The rows as one journaled write left them, with that write's
-    /// position. What a watcher of the rows starts from, and what a standby
-    /// is restored from. Taken under the membership lock: every journaled
+    /// The table's rows as one journaled write left them, with that
+    /// write's position. Taken under the membership lock: every journaled
     /// write holds its table's lock from its apply to its telling, so none
-    /// stands half told here. A writer of the rows waits for the copy; a
-    /// decision reads the published world and does not, and a cut leaves
-    /// the load writers be.
+    /// stands half told here. A writer of the rows waits for the copy,
+    /// and a cut leaves the load writers be.
+    ///
+    /// No product code calls it. What a watcher of the rows starts from,
+    /// what a standby is restored from and what an operator reads are cut
+    /// from the worker objects by their holder, with the status the
+    /// journal told (`MemoryStore::told`, under the `worker-host`
+    /// feature). This cut goes with the table.
     pub fn checkpoint(&self) -> StoreCheckpoint {
         // Copied under the lock, sorted after it: a writer waits for the
         // copy alone.
@@ -275,52 +281,6 @@ impl MemoryStore {
         };
         rows.sort_by(|a, b| a.facts.key.cmp(&b.facts.key));
         StoreCheckpoint { at, epoch, rows }
-    }
-
-    /// The first `limit` rows in key order of the ones that serve one of
-    /// `models`, with the count that serve one; no model asked is every
-    /// row. What a read that tells a few rows copies, where
-    /// [`MemoryStore::checkpoint`] copies every row. The rows are visited under
-    /// the membership lock and the ones told are cloned there, so a writer
-    /// waits for those alone: a selection puts the limit's worth in front,
-    /// and they are sorted after the lock. The models are put in order
-    /// ahead of the lock, and under it each model of a row is searched in
-    /// that list, so the count asked adds little to a writer's wait. No
-    /// code of the caller runs under the lock. A model matches by the rule
-    /// a watch and a shared snapshot filter by, an equal id (`serves`, in
-    /// the operators' snapshot rules): the two change together. The rows
-    /// name no write of the journal: no reader starts a tail from them.
-    pub fn rows_serving(&self, models: &[String], limit: usize) -> (Vec<WorkerRow>, usize) {
-        let mut asked: Vec<&str> = models.iter().map(String::as_str).collect();
-        asked.sort_unstable();
-        let serves = |row: &WorkerRow| {
-            asked.is_empty()
-                || row
-                    .facts
-                    .models
-                    .iter()
-                    .any(|model| asked.binary_search(&model.as_str()).is_ok())
-        };
-        let (mut rows, serving) = {
-            let workers = self.workers.lock();
-            let mut serving: Vec<&WorkerRow> = workers
-                .rows
-                .values()
-                .map(|row| &row.row)
-                .filter(|row| serves(row))
-                .collect();
-            let count = serving.len();
-            if limit < count {
-                if let Some(last) = limit.checked_sub(1) {
-                    serving.select_nth_unstable_by(last, |a, b| a.facts.key.cmp(&b.facts.key));
-                }
-                serving.truncate(limit);
-            }
-            let rows: Vec<WorkerRow> = serving.into_iter().cloned().collect();
-            (rows, count)
-        };
-        rows.sort_by(|a, b| a.facts.key.cmp(&b.facts.key));
-        (rows, serving)
     }
 
     /// The tables replaced by `cut`, a leader's snapshot whole: what a
@@ -1724,8 +1684,79 @@ impl MemoryStore {
 #[cfg(feature = "worker-host")]
 use super::health::HealthWrite;
 
+/// The status the journal last told of each row, at one place of the log
+/// ([`MemoryStore::told`]).
+#[cfg(feature = "worker-host")]
+#[derive(Debug)]
+pub(crate) struct Told {
+    /// The last journaled write the statuses hold, with its term; the
+    /// default for a store with no journal.
+    pub(crate) at: Position,
+    /// The membership epoch.
+    pub(crate) epoch: u64,
+    /// The history the epoch stands in ([`WorkersStore::history`]).
+    pub(crate) history: u64,
+    statuses: FxHashMap<WorkerId, WorkerStatus>,
+}
+
+#[cfg(feature = "worker-host")]
+impl Told {
+    /// The status the journal last told of the row `id`. `None` for a
+    /// row that does not stand at that place.
+    pub(crate) fn status(&self, id: WorkerId) -> Option<WorkerStatus> {
+        self.statuses.get(&id).copied()
+    }
+}
+
 #[cfg(feature = "worker-host")]
 impl MemoryStore {
+    /// The told status of every row: what the journal last told of its
+    /// id, with the journal's place, the membership epoch and the history
+    /// the epoch stands in, all read in one hold of the membership lock.
+    /// A status write holds that lock from its apply to its telling, so
+    /// no status stands half told here. The hold copies a place and one
+    /// status a row, and no row. The epoch and the history say whether
+    /// the store moved since a reader's own read of its rows: the holder
+    /// of the worker objects reads the store again where it did.
+    ///
+    /// The told status is the log's own word, kept beside the epoch and
+    /// the tail: no copy of what a decision reads. A decision reads a
+    /// worker's status on its object. The told status has five readers:
+    ///
+    /// - the next status event, which says the status its row moved from
+    ///   ([`Self::status_told`]);
+    /// - the event of a row changed in place, which carries it: a status
+    ///   moves by its own event alone ([`Self::follow_objects`]);
+    /// - a first copy, which the holder of the worker objects cuts with
+    ///   each row's told status (`Objects::checkpoint`,
+    ///   `Objects::rows_serving`), by this read;
+    /// - a tell the store refused, whose object takes the told status
+    ///   back (`Objects::table_status`);
+    /// - a holder that follows its leader's log, which lays on an object
+    ///   the status the log told of its row (`Objects::copy_status`).
+    ///
+    /// What else reads a row's status reads the table's whole row and
+    /// goes with the table: the holder's follow, for a row a writer left
+    /// outside the holder's turn, and the store's own reads of a row.
+    pub(crate) fn told(&self) -> Told {
+        let workers = self.workers.lock();
+        let at = self
+            .journal
+            .as_ref()
+            .map_or_else(Position::default, |journal| journal.head());
+        let statuses = workers
+            .rows
+            .iter()
+            .map(|(id, held)| (*id, held.row.status))
+            .collect();
+        Told {
+            at,
+            epoch: workers.epoch,
+            history: workers.history,
+            statuses,
+        }
+    }
+
     /// One membership write this replica's worker objects decided, applied
     /// as their holder tells it: a leader's side of [`Self::follow`], over
     /// the one body ([`Self::decided`]). The holder decided the change over

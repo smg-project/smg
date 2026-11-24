@@ -15,7 +15,10 @@
 //! holder of the store's lock takes an object's. So the read of an
 //! object's status and its telling are one critical section. Of two tells
 //! the later read stands, and the table ends where the object does. No
-//! decision takes an object's mutation lock.
+//! decision takes an object's mutation lock. Nor does a first copy's cut
+//! ([`mod@super::read`]): it holds the holder's turn and, inside it, the
+//! store's lock. A holder's write of a row holds that turn, then an
+//! object's lock, then the store's: one order for the three.
 //!
 //! A tell the store refuses writes nothing, and the call does not try it
 //! again: the row left the revision the object was built from, no row
