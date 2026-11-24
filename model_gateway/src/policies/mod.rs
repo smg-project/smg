@@ -190,8 +190,9 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     ///
     /// Every request end reaches [`Self::on_request_complete`] through the
     /// worker's load guard; this is the safety net behind it. The worker
-    /// monitor calls it once per load poll with the requests the router still
-    /// holds on the worker. A dispatch books once and a completion releases
+    /// monitor calls it at every batch of a group's load answers, for every
+    /// worker of the group, with the requests the router still holds on the
+    /// worker. A dispatch books once and a completion releases
     /// once, so whatever a policy holds beyond `in_flight` is a completion
     /// that never arrived (a worker that moved under another policy, a sink
     /// never installed) and is released here rather than kept for good.
