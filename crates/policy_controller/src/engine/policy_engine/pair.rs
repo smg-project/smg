@@ -36,8 +36,8 @@
 //! leaves nobody sheds the pair with no endpoint, under the stage of the
 //! demand that took that side's last worker, the prefills' first. The
 //! decode asked again judges its decodes alone. An encode request's three
-//! lists are held to no demand: such a request is shed under the wires'
-//! name.
+//! lists are held a list at a time too, its pair's two by this rule
+//! ([`PairLists::sides_meeting`], [`super::encode`]).
 //!
 //! **The words.** A side is told its issue once: with the prefill's
 //! ([`issue_caught`]), or, where its decode is sent later, at the decode
@@ -297,6 +297,40 @@ impl<'a> PairLists<'a> {
         ]
     }
 
+    /// [`Self::sides_of`] for a request that states a hard demand: each
+    /// side held to the places of its list whose worker meets `demands` as
+    /// that side's role is held to it, among the places its host states
+    /// ([`Beside::meeting`]). `kept` takes the places, the prefills' first.
+    /// `Err` names the demand that left a side nobody, the prefills'
+    /// first. An encode request's decision judges its pair's two lists
+    /// here, so a side is held one way under a pair's decision and under
+    /// its.
+    pub(super) fn sides_meeting<'s>(
+        &self,
+        cx: &Constraints<'s>,
+        demands: Demands,
+        (prefill, decode): (&PoolRecords, &PoolRecords),
+        [prefill_kept, decode_kept]: [&'s mut Vec<u32>; 2],
+    ) -> Result<[Constraints<'s>; 2], UnmetDemand>
+    where
+        'a: 's,
+    {
+        let side = |places, stalled, held| Beside {
+            places,
+            stalled,
+            held,
+            unmet: None,
+        };
+        let prefills = side(self.prefill_places, self.prefill_stalled, self.prefill_held);
+        let prefills = prefills.meeting(prefill, demands.held_by(Role::Prefill), prefill_kept);
+        let decodes = side(self.decode_places, self.decode_stalled, self.decode_held);
+        let decodes = decodes.meeting(decode, demands.held_by(Role::Decode), decode_kept);
+        match prefills.unmet.or(decodes.unmet) {
+            Some(unmet) => Err(unmet),
+            None => Ok([prefills.of(cx), decodes.of(cx)]),
+        }
+    }
+
     /// One decision for a pair at `now`, over records written for it from
     /// both lists' worker objects and from `loads`, the host's snapshot of
     /// its workers' reports, with each record's pair class and its side's
@@ -366,35 +400,18 @@ impl<'a> PairLists<'a> {
         request: &mut Request<'_>,
         held: Option<&Target>,
     ) -> Decision {
-        self.decide_sides(engine, sides, loads, now, request, held, true, |_| true)
+        self.decide_sides(engine, sides, loads, now, request, held, |_| true)
     }
 
-    /// A pair's first decision with a hard demand its request states left
-    /// to the records' decision, which sheds it ([`not_decided`]): what an
-    /// encode request's entry asks for a request its three lists do not
-    /// decide. Those lists are held to no demand.
-    pub(super) fn decide_unjudged(
-        &self,
-        engine: Loaded<'_, '_>,
-        sides: (&PoolMembers, &PoolMembers),
-        loads: Option<&Arc<LoadSnapshot>>,
-        now: Instant,
-        request: &mut Request<'_>,
-    ) -> Decision {
-        self.decide_sides(engine, sides, loads, now, request, None, false, |_| true)
-    }
-
-    /// [`Self::decide_over`], and whether a hard demand the request states
-    /// is `judged` over the two lists: each side is then held to the
-    /// places whose worker meets it, and the records' decision is handed
-    /// none. `sends_to` says whether the request's caller sends it to a
-    /// target of the pick ([`RequestMaker::sends_to`]): each side's record
-    /// of sent prefixes is written for the first target it takes.
+    /// [`Self::decide_over`], and where the request's caller sends it:
+    /// `sends_to` says whether it sends to a target of the pick
+    /// ([`RequestMaker::sends_to`]), and each side's record of sent
+    /// prefixes is written for the first target it takes.
     ///
     /// [`RequestMaker::sends_to`]: crate::engine::RequestMaker::sends_to
     #[expect(
         clippy::too_many_arguments,
-        reason = "a pair's decision over its two lists, and how it reads a demand"
+        reason = "a pair's decision over its two lists, and where its caller sends it"
     )]
     fn decide_sides(
         &self,
@@ -404,7 +421,6 @@ impl<'a> PairLists<'a> {
         now: Instant,
         request: &mut Request<'_>,
         held: Option<&Target>,
-        judged: bool,
         sends_to: impl Fn(&Target) -> bool,
     ) -> Decision {
         let (spec, clock) = (&engine.document.spec, &engine.clock);
@@ -486,8 +502,9 @@ impl<'a> PairLists<'a> {
             // decision is handed the places and no demand. The decode
             // asked again judges no prefill: the held one ran already.
             let spent;
-            let (cx, prefill_side, decode_side) = if judged && !cx.demands.is_none() {
-                let [prefill_kept, decode_kept] = &mut buffers.meeting;
+            let demanded = !cx.demands.is_none();
+            let (cx, prefill_side, decode_side) = if demanded {
+                let [prefill_kept, decode_kept, _] = &mut buffers.meeting;
                 let demands = cx.demands;
                 let prefill_side = match held {
                     None => {
@@ -713,8 +730,9 @@ fn held_prefill<'a, 'f>(
 /// prefills' first, and the engine's scratch. An encode request's decision
 /// keeps its encoders' records here too ([`super::encode`]): a pair's
 /// leaves them as they were. A pair that states a hard demand keeps each
-/// side's places that meet it here, the prefills' first: such a request
-/// allocates nothing once each list has grown to its side.
+/// side's places that meet it here, the prefills' first, and an encode
+/// request its encoders' in the third list: such a request allocates
+/// nothing once each list has grown to its side.
 /// A side whose phase reads who holds the prompt keeps its list's column
 /// here, the prefills' first.
 #[derive(Debug, Default)]
@@ -722,7 +740,7 @@ pub(super) struct Buffers {
     pub(super) rows: [Vec<Candidate>; 2],
     pub(super) encoders: Vec<Candidate>,
     pub(super) scratch: Scratch,
-    meeting: [Vec<u32>; 2],
+    pub(super) meeting: [Vec<u32>; 3],
     pub(super) columns: [Vec<AffinityFacts>; 2],
 }
 
@@ -761,8 +779,8 @@ pub(super) fn stamp(
 /// not narrowed by, and the stage it is shed under: a subset hint, a hard
 /// demand, or places of its list. A pair's records keep no demand fact. A
 /// pair's own decision judges a demand ahead of them, a side at a time
-/// ([`PairLists::decide`]), and hands them none. A demand that reaches
-/// them is an encode request's, whose three lists are held to none: it is
+/// ([`PairLists::decide`]), and hands them none, and so does an encode
+/// request's. A demand that reaches them was judged by no decision: it is
 /// shed, and the request is never placed past its demand. A hint of some
 /// records is declined: no stage here takes a part of a list. So are
 /// places the request states itself ([`single::PLACES`]): one set cannot
@@ -1087,7 +1105,7 @@ pub(super) fn decide(
     if !wires.is_empty() && !wires.contains(dialed) {
         return single::declined(own, request, WIRES);
     }
-    lists.decide_sides(own, sides, loads, now, request, target, true, sends_to)
+    lists.decide_sides(own, sides, loads, now, request, target, sends_to)
 }
 
 /// One decision of a pair by `own`, the engine of a gateway's own process,

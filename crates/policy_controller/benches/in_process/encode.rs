@@ -271,11 +271,11 @@ impl Sides {
     }
 }
 
-/// Both sides' dispatch and end, as a host says them of an encode request's
-/// placement. Out of line, so a count by function reads it apart. Nothing
-/// is said of an encoder.
+/// Both sides' dispatch and end, as a host says them of the placement of
+/// an encode request or of a pair. Out of line, so a count by function
+/// reads it apart. Nothing is said of an encoder.
 #[inline(never)]
-fn said(placement: &mut Placement<'_>) {
+pub(super) fn said(placement: &mut Placement<'_>) {
     let (prefill, decode) = (placement.id(), placement.decode_id());
     placement.sent(Side::Prefill);
     placement.sent(Side::Decode);
@@ -303,7 +303,7 @@ pub(super) fn runs(run: &Run) -> bool {
     // rule for a list over its thresholds is a pair's cell's to run.
     assert!(run.shadow == Shadowed::No, "an encode cell runs no shadow");
     assert!(!run.overloaded, "an encode cell's lists are open");
-    let one_call = place::asked_with_lists(run);
+    let one_call = place::asked_with_lists(run, false);
     let side = |side: &str, count: usize, worker_type| -> Arc<[Arc<dyn Worker>]> {
         let url = |at: usize| format!("http://{side}-{at:04}:8000");
         (0..count).map(|at| typed(url(at), worker_type)).collect()

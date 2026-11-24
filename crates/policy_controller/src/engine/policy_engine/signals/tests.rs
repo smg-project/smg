@@ -33,7 +33,7 @@ use tokio::{net::TcpListener, task::JoinSet};
 use crate::{
     document::spec::{AcrossRanks, AppliedSpec, Needs, PolicySpec, ShadowSpec, SignalSpec},
     engine::{
-        decision::{Decision, ShadowKind},
+        decision::Decision,
         decision_engine::{DecisionEngine, Request, RequestMaker, WorkerLists},
         framework::{Scorer, TieBand},
         list_cell::PublishedList,
@@ -1034,7 +1034,7 @@ fn a_shadow_profile_reads_the_cells_its_live_decision_was_lent() {
     let loads = stepped(4, 10.0);
     let read = read_at(&built, &asks(7, &members, Some(&loads)), Instant::now());
     assert_eq!(read, stepped_values(10.0), "what the shadow's stage read");
-    let counted = ShadowKind::ALL.map(|kind| built.engine.shadowed(0, kind));
+    let counted = built.engine.shadow_kinds(0);
     assert_eq!(counted.iter().sum::<u64>(), 1, "{counted:?}");
 }
 

@@ -491,8 +491,9 @@ pub enum OverlapSource {
 ///
 /// A request decided inside a token tree its host lends is given the rows
 /// the tree's match names, and its pick states by them: the match's tokens
-/// counted in the request's blocks for a worker among the match's holders,
-/// and a miss for any other. A match under one block is a miss.
+/// counted in the request's blocks for a worker named among the match's
+/// holders, and a miss for any other. Past the profile's sample the holders
+/// named are a draw. A match under one block is a miss.
 ///
 /// Six bytes, in bytes a pick's targets had spare behind their count: a
 /// pick is no larger for it ([`Pick::overlap`]).
@@ -804,7 +805,10 @@ pub(crate) const SUBSET_HINT: &str = "subset-hint";
 /// places cannot hold a pair's two lists. An encode request is shed under
 /// it where a list's places name workers and none of them takes the
 /// request, though a worker outside them does: it is held off every worker
-/// that takes it, which no gap of the membership says.
+/// that takes it, which no gap of the membership says. A list's places are
+/// its host's, or the places its request's demand leaves. A gap of the
+/// pairs' membership the encode pass reads (`ec-compatible`,
+/// `decode-vision`) is answered ahead of every list's places.
 pub(crate) const PLACES: &str = "places";
 
 /// A shed the deciders say in the engine's place, in the shape of the

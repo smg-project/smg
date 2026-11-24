@@ -3,7 +3,7 @@
 //! entry.
 //!
 //! It is asked for a cell whose request is plain and carries no key, and
-//! for an encode request's cell, whose own file states its three lists
+//! for a cell that hands lists of its own, a pair's or an encode request's
 //! ([`asked_with_lists`]). For a plain cell the caller states the model,
 //! its list and a prompt of the size the plain request states, and says
 //! the dispatch and the end of the placement it is answered. It lends no
@@ -49,10 +49,10 @@ impl TokenEntry for Whole {
 }
 
 /// The entry `value` names: `decide_at`, the engine's entry, `place`,
-/// `place` with a rule ([`ruled::ENTRY`]), or `place` with a prompt of text
+/// `place` with a rule ([`ruled::names`]), or `place` with a prompt of text
 /// ([`worded::ENTRY`]).
 pub(super) fn named(value: &str) -> String {
-    let known = matches!(value, "decide_at" | "place" | ruled::ENTRY | worded::ENTRY);
+    let known = matches!(value, "decide_at" | "place" | worded::ENTRY) || ruled::names(value);
     assert!(known, "no entry {value}");
     value.to_owned()
 }
@@ -65,7 +65,7 @@ static ASKED: AtomicBool = AtomicBool::new(false);
 /// model, a list and a prompt's size: a cell whose request carries a key is
 /// not asked through it, and the run stops on one.
 pub(super) fn asked(run: &Run, host: &Host) -> bool {
-    if !matches!(&*run.entry, "place" | ruled::ENTRY | worded::ENTRY) {
+    if !(matches!(&*run.entry, "place" | worded::ENTRY) || ruled::names(&run.entry)) {
         return false;
     }
     let keyed = (host.request)(0).facts.session_key != Identity::NONE;
@@ -169,12 +169,14 @@ pub(super) fn word() -> &'static str {
 }
 
 /// Whether `run` asks the one call of a cell that hands lists of its own,
-/// which its own file runs: an encode request's. Such a cell states no
-/// route's rule, and the run stops on one. The result line's word says the
-/// entry asked.
-pub(super) fn asked_with_lists(run: &Run) -> bool {
-    assert!(run.entry != ruled::ENTRY, "such a cell states no rule");
-    let asked = run.entry == "place";
+/// which its own file runs: a pair's, or an encode request's. A pair's
+/// cell takes a route's rule (`takes_rule`), which its file then states
+/// ([`ruled::stated`]). An encode request's takes none, and the run stops
+/// on one. The result line's word says the entry asked.
+pub(super) fn asked_with_lists(run: &Run, takes_rule: bool) -> bool {
+    let rule = ruled::names(&run.entry);
+    assert!(takes_rule || !rule, "such a cell states no rule");
+    let asked = rule || run.entry == "place";
     ASKED.store(asked, Ordering::Relaxed);
     asked
 }

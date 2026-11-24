@@ -21,11 +21,11 @@
 //!
 //! What a membership build derives (where each pool stands, each pool's
 //! shape) is built once and shared by every world until the next membership
-//! build. A world's epoch is the membership's at its build and is the one
-//! thing to compare between two worlds' pools: a world's identity moves
-//! with every publication. The pair classes are derived with the shapes
-//! where a write moved a member or an offer, and once more where a
-//! generation moves the pairing mode: a new world of the same epoch.
+//! build. A world's epoch is the membership's at its build: a world's
+//! identity moves with every publication. The pair classes are derived
+//! with the shapes where a write moved a member or an offer, and once more
+//! where a generation moves the pairing mode: a new world of the same
+//! epoch.
 //! Between two membership builds a publication derives nothing: it is one
 //! small object, a pointer per pool, and new rows for each pool a write was
 //! folded into.
@@ -74,7 +74,7 @@
 //! waits for an owed build, and else publishes by itself when the last
 //! window is a window old; one that lands inside the window waits, and the
 //! sink names the instant it is due
-//! ([`LoadSink::publish_due`](crate::store::LoadSink::publish_due)).
+//! ([`MemoryStore::publish_due`](crate::store::MemoryStore::publish_due)).
 //!
 //! **A veto is published in its gateway's run.** The writer keeps
 //! each gateway's list and publishes each pool's standing vetoes as one run
@@ -146,9 +146,9 @@ struct PoolShape {
     /// as they were ([`Classes::Written`]).
     pairs: Option<Arc<PairClasses>>,
     /// The encode classes of the pool's model, on its prefill pool where an
-    /// encoder of the model states an end: a decision that carries encode
-    /// items reads its chosen prefill's class beside the pool it chose in.
-    /// Counted and carried as the pair classes are.
+    /// encoder of the model states an end. No reader of a world hands them
+    /// out: a build derives them and carries them to the next. Counted and
+    /// carried as the pair classes are.
     encodes: Option<Arc<EncodeClasses>>,
 }
 
@@ -210,12 +210,6 @@ impl Derived {
     /// The pair classes of `model`, where it has a prefill and a decode.
     fn pairs(&self, model: &str) -> Option<&Arc<PairClasses>> {
         self.prefill(model)?.pairs.as_ref()
-    }
-
-    /// The encode classes of `model`, where it has a prefill and an encoder
-    /// that states an end.
-    fn encodes(&self, model: &str) -> Option<&Arc<EncodeClasses>> {
-        self.prefill(model)?.encodes.as_ref()
     }
 
     /// The shapes of `model`'s encode pool and of its prefill pool, each
@@ -640,6 +634,8 @@ pub struct OutsideLists {
 /// engine of its generation and its gateway's standing vetoes. A world never
 /// changes once published.
 pub struct StoreSnapshot {
+    /// The store's epoch at the membership write this world's pools were
+    /// derived by. A status change moves the store's epoch and no world's.
     epoch: u64,
     origin: Instant,
     derived: Arc<Derived>,
@@ -668,16 +664,6 @@ impl std::fmt::Debug for StoreSnapshot {
 }
 
 impl StoreSnapshot {
-    /// The store's epoch at the membership write this world's pools were
-    /// derived by: the one thing to compare between two worlds' pools. A
-    /// status change moves the store's epoch and no world's, and a
-    /// publication between two membership writes is a new world of the same
-    /// epoch. The pair classes move once more, at a generation of another
-    /// pairing mode ([`StoreSnapshot::pairs`]).
-    pub fn epoch(&self) -> u64 {
-        self.epoch
-    }
-
     /// The generation this world was published under: the engine a decision
     /// over these rows runs, and its number. The store starts under the
     /// unbound generation ([`AppliedSpec::unbound`]), and a reader that saw
@@ -690,6 +676,12 @@ impl StoreSnapshot {
     /// hands the engine under a borrow of the world, never an owned world,
     /// whose shared count a deciding thread would write.
     pub fn spec(&self) -> &AppliedSpec {
+        &self.spec
+    }
+
+    /// This publication's document as its store holds it ([`Applied`]):
+    /// what a word of the store's membership and its host's tick reach.
+    pub(crate) fn applied(&self) -> &Applied {
         &self.spec
     }
 
@@ -786,23 +778,9 @@ impl StoreSnapshot {
     /// the table a pair decision reads beside the two pools
     /// ([`PairClasses::table`]); `None` when the model has no prefill or no
     /// decode. A membership write derives them, and so does a generation of
-    /// another pairing mode at the same epoch: the epoch alone does not key
-    /// the classes a reader keeps across worlds.
+    /// another pairing mode at the same epoch.
     pub fn pairs(&self, model: &str) -> Option<&PairClasses> {
         self.derived.pairs(model).map(|classes| &**classes)
-    }
-
-    /// The encode classes of `model` as this world's pools were derived: the
-    /// class each row of its prefill pool names and each
-    /// class's encoders by their rows in its encode pool, another gateway's
-    /// host-local rows counted ([`EncodeClasses`]). A class's number is read
-    /// under this world's borrow and never kept. `None` when the model has
-    /// no prefill or no encoder that states an end. A membership write that
-    /// moves one of the model's encoders or prefills derives them, and so
-    /// does a generation of another pairing mode at the same epoch, as it
-    /// does the pair classes ([`StoreSnapshot::pairs`]).
-    pub fn encodes(&self, model: &str) -> Option<&EncodeClasses> {
-        self.derived.encodes(model).map(|classes| &**classes)
     }
 
     fn pool(&self, model: &str, role: Role) -> Option<(&[Candidate], &PoolShape)> {

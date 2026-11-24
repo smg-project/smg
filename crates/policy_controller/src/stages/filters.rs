@@ -128,7 +128,8 @@ impl Filter for HasCapacity {
     }
 }
 
-/// The decode's running window has a free room (a host-supplied bit). Soft:
+/// The decode's running window has a room for the request: a free one, or
+/// the room the request holds there already (a host-supplied bit). Soft:
 /// with every candidate full the list stands and the dispatch waits at its
 /// pick's gate, as today.
 #[derive(Debug)]

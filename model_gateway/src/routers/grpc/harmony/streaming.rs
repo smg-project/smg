@@ -1605,8 +1605,8 @@ impl ResponsesDecode {
 struct ChatDecode {
     // Timing for metrics
     start_time: Instant,
-    /// The request's wait ahead of the dispatch at `start_time`, recorded with the TTFT (see
-    /// [`context::dispatch_wait`]).
+    /// The request's wait ahead of the dispatch at `start_time`, recorded at the stream's end
+    /// (see [`context::dispatch_wait`]).
     dispatch_wait: context::DispatchWait,
     first_token_time: Option<Instant>,
     /// The PD dispatch instants, in PD mode: the first token records the PD pair against

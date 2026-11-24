@@ -48,6 +48,7 @@ mod vetoed;
 
 pub use alone::{AloneProfile, InTheWay, NotAlone, Place};
 pub use encode::{EncodeItems, EncodePlaced, EncodePool, EncoderFacts};
+pub(crate) use encode::{ENCODE_MEDIA, ENCODE_VISION};
 use engines::{run_engines, run_owned};
 pub use keyed::PoolRows;
 use vetoed::{AllVetoed, Half};
@@ -5741,8 +5742,8 @@ impl Engine {
     /// stage of it reads them, in the rows its decisions are named
     /// ([`Self::affinity_rows_cap`]) or, where it is named no row, in the
     /// column it is handed whole. The answer is of what the
-    /// build kept: a membership write asks it of every pool, and no stage
-    /// is asked again.
+    /// build kept: the in-process engine asks it as it reads a pool's
+    /// table, and no stage is asked again.
     #[cfg(any(test, feature = "in-process"))]
     pub(crate) fn reads_sent_for(&self, model: &str, phase: Phase) -> bool {
         self.needs.sent_prefixes

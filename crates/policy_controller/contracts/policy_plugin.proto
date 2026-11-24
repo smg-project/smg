@@ -330,6 +330,15 @@ message RequestFacts {
   // counted under no key. Host to controller alone: a plugin's frame carries
   // 0 under every exposure.
   fixed64 client_key = 20;
+  // The request's own id handed `session_key`: the host sets it where it
+  // derives the key, true where the key came from a `rid` source of its
+  // binding's routing key and from no header. The prefix form of a ring alone
+  // reads it: it places such a request by its prompt and by no key. A
+  // sessions rule pins the key either way, and the plain ring places by it as
+  // by any session key. An absent field is false: the frame of a host older
+  // than the field places by its key, as it did. Host to controller alone: a
+  // plugin's frame carries false under every exposure.
+  bool session_key_from_rid = 21;
 }
 
 // What only the deciding gateway knows now. Its standing vetoes are not here:

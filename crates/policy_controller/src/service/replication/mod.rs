@@ -40,8 +40,8 @@
 //! after a snapshot), so a position and its term name one history on every
 //! replica that holds them. A write never waits on a reader: a reader whose
 //! place the log let go is told so ([`LogPositionLost`]) and starts again from
-//! a cut ([`MemoryStore::checkpoint`](crate::store::MemoryStore::checkpoint):
-//! the rows and the log's place, as one).
+//! a cut ([`StoreCheckpoint`](crate::store::StoreCheckpoint): the rows and
+//! the log's place, as one).
 //!
 //! The stream that serves the log to a standby, the standby that follows
 //! it and the watch are later steps of the controller.

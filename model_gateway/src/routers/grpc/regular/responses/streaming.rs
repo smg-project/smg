@@ -975,9 +975,8 @@ impl Turns {
 ///
 /// `entered` is the request's entry stamp, when it came in under one. Every
 /// turn's generation is dispatched under a stamp, so its dispatch wait is
-/// recorded with its time to first token (see `context::dispatch_wait`): the
-/// first turn's under `entered`, a later turn's under one taken where that
-/// turn starts.
+/// recorded (see `context::dispatch_wait`): the first turn's under
+/// `entered`, a later turn's under one taken where that turn starts.
 #[expect(
     clippy::too_many_arguments,
     reason = "the streamed loop needs the request state, the channel, the startup barrier and the entry stamp"

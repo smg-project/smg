@@ -483,7 +483,7 @@ struct GenerateStreamContext {
     /// only partial usage, not authoritative usage for the whole request.
     expected_choices: u32,
     /// The request's wait ahead of the dispatch the stream's clocks start
-    /// at, recorded with the TTFT (see [`context::dispatch_wait`]).
+    /// at, recorded at the stream's end (see [`context::dispatch_wait`]).
     dispatch_wait: context::DispatchWait,
 }
 
@@ -3520,7 +3520,7 @@ struct ChatStream<'a> {
     // Metrics timing
     start_time: Instant,
     /// The request's wait ahead of the dispatch at `start_time`, recorded
-    /// with the TTFT (see [`context::dispatch_wait`]).
+    /// at the stream's end (see [`context::dispatch_wait`]).
     dispatch_wait: context::DispatchWait,
     first_token_time: Option<Instant>,
 
@@ -5224,7 +5224,7 @@ struct MessagesStream<'a> {
     // Metrics timing
     start_time: Instant,
     /// The request's wait ahead of the dispatch at `start_time`, recorded
-    /// with the TTFT (see [`context::dispatch_wait`]).
+    /// at the stream's end (see [`context::dispatch_wait`]).
     dispatch_wait: context::DispatchWait,
     first_token_time: Option<Instant>,
     /// Whether the frame carrying the first token has left: until it has,

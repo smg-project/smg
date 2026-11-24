@@ -186,11 +186,10 @@ impl RouterConfig {
     /// hands in, which holds the stages that build added. A document that
     /// names a stage the table does not hold is refused by the stage's name.
     ///
-    /// A binding's shadows by side are refused as not in this build: the
-    /// engine this gateway hosts decides a shadow beside a single request
-    /// alone, so a pair's would load and never run. So would the shadow of
-    /// a binding whose phase list is not empty and leaves out `single`, and
-    /// it is refused too.
+    /// A binding's shadows by side are refused as not in this build: this
+    /// gateway takes a shadow of a single request's binding alone. The
+    /// shadow of a binding whose phase list is not empty and leaves out
+    /// `single` would load and never run, and it is refused too.
     pub fn hosted_policy(
         &self,
         document: &PolicySpec,

@@ -85,14 +85,6 @@ pub const ENTRIES: &[(&str, &str, EntryReplication)] = &[
         "evict",
         EntryReplication::Rebuilt("each replica drops its own load rows"),
     ),
-    ("LoadSink", "publish_due", EntryReplication::Read),
-    ("LoadSink", "publish", EntryReplication::Rebuilt(PUBLISHED)),
-    ("LoadSink", "wake_with", EntryReplication::Read),
-    (
-        "KvEventSink",
-        "admit",
-        EntryReplication::Rebuilt(SUBSCRIPTION),
-    ),
     (
         "KvEventSink",
         "admit_through",
@@ -174,7 +166,6 @@ pub const ENTRIES: &[(&str, &str, EntryReplication)] = &[
     ("MemoryStore", "journaled", EntryReplication::Read),
     ("MemoryStore", "followed", EntryReplication::Read),
     ("MemoryStore", "checkpoint", EntryReplication::Read),
-    ("MemoryStore", "rows_serving", EntryReplication::Read),
     (
         "MemoryStore",
         "restore_from",
@@ -209,13 +200,19 @@ pub const ENTRIES: &[(&str, &str, EntryReplication)] = &[
     ("MemoryStore", "snapshot", EntryReplication::Read),
     ("MemoryStore", "with_snapshot", EntryReplication::Read),
     ("MemoryStore", "deciding", EntryReplication::Read),
-    ("MemoryStore", "prompt_hashes", EntryReplication::Read),
     ("MemoryStore", "micros", EntryReplication::Read),
     (
         "MemoryStore",
         "publish_now",
         EntryReplication::Rebuilt(PUBLISHED),
     ),
+    ("MemoryStore", "publish_due", EntryReplication::Read),
+    (
+        "MemoryStore",
+        "publish",
+        EntryReplication::Rebuilt(PUBLISHED),
+    ),
+    ("MemoryStore", "wake_with", EntryReplication::Read),
     ("MemoryStore", "stats", EntryReplication::Read),
     ("MemoryStore", "overload_flips", EntryReplication::Read),
     ("MemoryStore", "outside_lists", EntryReplication::Read),
@@ -223,7 +220,6 @@ pub const ENTRIES: &[(&str, &str, EntryReplication)] = &[
     ("MemoryStore", "membership_builds", EntryReplication::Read),
     ("MemoryStore", "resyncs", EntryReplication::Read),
     ("MemoryStore", "indexed_blocks", EntryReplication::Read),
-    ("MemoryStore", "lane_counts", EntryReplication::Read),
     ("MemoryStore", "unindexed_rows", EntryReplication::Read),
 ];
 

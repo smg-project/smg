@@ -544,8 +544,9 @@ pub struct IndexSpec {
     /// How long a hash-index placement stays routable, in seconds.
     #[schemars(range(min = 1))]
     pub ttl_s: u32,
-    /// The size bound of a tree index: characters on a text host, tokens
-    /// otherwise. The crate's own store reads it for a pool whose profile
+    /// The size bound of a tree index: on a text host its characters plus
+    /// 1024 for each node a worker stands on, tokens otherwise.
+    /// The crate's own store reads it for a pool whose profile
     /// reads sent prefixes: the model's record is bound to `max_size` over
     /// the block size placements, never under one, one a block a worker
     /// was sent. A lowered bound is met by sweeps at the record's next
@@ -918,10 +919,11 @@ pub struct ConsistentHashParams {
     /// depth, a shorter request whole, and a text at four characters a
     /// token. A routing key the request's own id handed (a `rid` source)
     /// leads no prompt under this form: it names the session alone, and
-    /// the request is keyed by its prefix as one with no routing key. That
-    /// holds in a gateway's own process: no frame states where a key came
-    /// from, so under a controller's address the id's key places as any
-    /// other. Absent, a request with no routing key has none.
+    /// the request is keyed by its prefix as one with no routing key. A
+    /// gateway's frame states to a controller where the key came from.
+    /// The frame of a host older than that field states nothing, and
+    /// under it the id's key places as any other. Absent, a request with
+    /// no routing key has none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1))]
     pub prefix_tokens: Option<u32>,
@@ -2377,10 +2379,10 @@ pub struct KeySourceSpec {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub header: Option<String>,
     /// The request's own id, the `rid` of its body: `true` names it. Under
-    /// a ring's prefix form (`prefix_tokens`) in a gateway's own process
-    /// its key names the session alone: a sessions rule pins it, and the
-    /// ring places the request by its prompt. The plain ring places by it,
-    /// and so does a served controller's prefix ring.
+    /// a ring's prefix form (`prefix_tokens`) its key names the session
+    /// alone: a sessions rule pins it, and the ring places the request by
+    /// its prompt. The plain ring places by it, and so does a controller's
+    /// prefix ring where its host's frame does not say the id handed it.
     #[serde(skip_serializing_if = "is_default")]
     pub rid: bool,
     /// The most bytes of a value this source hands, 8192 at most (default
@@ -5534,7 +5536,8 @@ pub struct AppliedSpec {
     max_block_hashes: u32,
     /// The view's block size: a request that names none is counted by it.
     block_size: u32,
-    /// The index settings a model takes at a membership write or apply.
+    /// The index settings a model takes where the in-process engine reads
+    /// a pool's table.
     #[cfg(feature = "in-process")]
     index: BTreeMap<String, IndexSpec>,
     pairing: Pairing,

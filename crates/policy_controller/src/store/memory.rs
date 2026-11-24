@@ -26,21 +26,19 @@ use crate::{
     document::spec::AppliedSpec,
     engine::{
         decision_engine::DecodeRefused,
-        prompt_hashes::{block_size_and_depth, HashSeeds, PromptHashes},
         view::{LoadRow, Session, WorkerId, LOAD_REPORT_CLOCK_HISTORY_MS},
     },
-    stages::lifecycle::Lifecycle,
     store::{
         applied::Applied,
         health::{HealthSink, VetoWrite},
-        index::{indexed_under, KvEvent, KvTables, LaneCounts, LaneWriter},
+        index::{indexed_under, KvTables, LaneWriter},
         journal::{Journal, Position},
         kv_events::{BatchFacts, BatchOutcome, KvCursor, KvEventSink, ResyncReason},
         leases::{
             DecodeMark, DecodeSide, HostCount, InFlightCounts, LeaseRecord, LeaseRefused,
             LeaseState, LeasesStore, Sides, WorkerSlot,
         },
-        loads::{LoadSample, LoadSink, LoadSource, PollMode, Wake},
+        loads::{LoadSample, LoadSink, LoadSource, PollMode},
         membership::same_worker,
         reservations::{ReservationKind, ReservationStore},
         snapshot::{
@@ -67,6 +65,11 @@ pub use turn::{AtWork, Hand, LookOutcome};
 /// Membership changes kept for watchers; a watcher further behind snapshots
 /// again (the registry's broadcast is sized the same today).
 const CHANGE_LOG: usize = 1_024;
+
+/// The host's wake: what the store calls to have its host read
+/// [`MemoryStore::publish_due`] again. It is called under the writer's
+/// locks: it sets a flag or a notification and returns.
+pub type Wake = Box<dyn Fn() + Send + Sync>;
 
 /// The store's counts one scrape reports: the first two of one state of
 /// the store.
@@ -135,16 +138,18 @@ pub struct MemoryStore {
     /// for a store nobody follows. The membership writes tell through
     /// their table's own handle.
     journal: Option<Arc<dyn Journal>>,
-    /// The host's wake, once its loop handed one ([`LoadSink::wake_with`]):
+    /// The host's wake, once its loop handed one ([`MemoryStore::wake_with`]):
     /// called where a membership write leaves a build owed and none was,
     /// the one instant the host's loop cannot have read. A lock of its own,
     /// the last taken and held for the call alone.
     wake: Mutex<Option<Wake>>,
 }
 
-/// The store's replicated tables at one place of its history
-/// ([`MemoryStore::checkpoint`]). The contract's three snapshot messages are
-/// built from it: the operator's, the watch's and the replication's.
+/// The replicated rows at one place of the log's history. A controller's is
+/// cut from its worker objects by their holder, and the store's own entry
+/// cuts one from its table ([`MemoryStore::checkpoint`]). The contract's
+/// three snapshot messages are built from it: the operator's, the watch's
+/// and the replication's.
 #[derive(Clone, Debug)]
 pub struct StoreCheckpoint {
     /// The last journaled write that the tables hold, with its term; the
@@ -254,13 +259,17 @@ impl MemoryStore {
         self.journal.as_ref().and_then(|journal| journal.followed())
     }
 
-    /// The rows as one journaled write left them, with that write's
-    /// position. What a watcher of the rows starts from, and what a standby
-    /// is restored from. Taken under the membership lock: every journaled
+    /// The table's rows as one journaled write left them, with that
+    /// write's position. Taken under the membership lock: every journaled
     /// write holds its table's lock from its apply to its telling, so none
-    /// stands half told here. A writer of the rows waits for the copy; a
-    /// decision reads the published world and does not, and a cut leaves
-    /// the load writers be.
+    /// stands half told here. A writer of the rows waits for the copy,
+    /// and a cut leaves the load writers be.
+    ///
+    /// No product code calls it. What a watcher of the rows starts from,
+    /// what a standby is restored from and what an operator reads are cut
+    /// from the worker objects by their holder, with the status the
+    /// journal told (`MemoryStore::told`, under the `worker-host`
+    /// feature). This cut goes with the table.
     pub fn checkpoint(&self) -> StoreCheckpoint {
         // Copied under the lock, sorted after it: a writer waits for the
         // copy alone.
@@ -275,52 +284,6 @@ impl MemoryStore {
         };
         rows.sort_by(|a, b| a.facts.key.cmp(&b.facts.key));
         StoreCheckpoint { at, epoch, rows }
-    }
-
-    /// The first `limit` rows in key order of the ones that serve one of
-    /// `models`, with the count that serve one; no model asked is every
-    /// row. What a read that tells a few rows copies, where
-    /// [`MemoryStore::checkpoint`] copies every row. The rows are visited under
-    /// the membership lock and the ones told are cloned there, so a writer
-    /// waits for those alone: a selection puts the limit's worth in front,
-    /// and they are sorted after the lock. The models are put in order
-    /// ahead of the lock, and under it each model of a row is searched in
-    /// that list, so the count asked adds little to a writer's wait. No
-    /// code of the caller runs under the lock. A model matches by the rule
-    /// a watch and a shared snapshot filter by, an equal id (`serves`, in
-    /// the operators' snapshot rules): the two change together. The rows
-    /// name no write of the journal: no reader starts a tail from them.
-    pub fn rows_serving(&self, models: &[String], limit: usize) -> (Vec<WorkerRow>, usize) {
-        let mut asked: Vec<&str> = models.iter().map(String::as_str).collect();
-        asked.sort_unstable();
-        let serves = |row: &WorkerRow| {
-            asked.is_empty()
-                || row
-                    .facts
-                    .models
-                    .iter()
-                    .any(|model| asked.binary_search(&model.as_str()).is_ok())
-        };
-        let (mut rows, serving) = {
-            let workers = self.workers.lock();
-            let mut serving: Vec<&WorkerRow> = workers
-                .rows
-                .values()
-                .map(|row| &row.row)
-                .filter(|row| serves(row))
-                .collect();
-            let count = serving.len();
-            if limit < count {
-                if let Some(last) = limit.checked_sub(1) {
-                    serving.select_nth_unstable_by(last, |a, b| a.facts.key.cmp(&b.facts.key));
-                }
-                serving.truncate(limit);
-            }
-            let rows: Vec<WorkerRow> = serving.into_iter().cloned().collect();
-            (rows, count)
-        };
-        rows.sort_by(|a, b| a.facts.key.cmp(&b.facts.key));
-        (rows, serving)
     }
 
     /// The tables replaced by `cut`, a leader's snapshot whole: what a
@@ -912,8 +875,7 @@ impl MemoryStore {
     }
 
     /// The snapshot as the last publication left it, taken through no lock.
-    /// Its identity moves with every publication: [`StoreSnapshot::epoch`] says
-    /// whether the membership moved.
+    /// Its identity moves with every publication.
     ///
     /// This door hands an owned pointer, for a reader that keeps a world
     /// across calls. Taking it and dropping it each write the count every
@@ -950,28 +912,6 @@ impl MemoryStore {
     /// returns.
     pub fn deciding<R>(&self, decide: impl FnOnce(&StoreSnapshot) -> R) -> R {
         decide(&self.world.load())
-    }
-
-    /// The block hashes of a request's prompt for `model`: those of its
-    /// token ids where the caller holds them, else those of its text, else
-    /// none ([`PromptHashes::under_document`]). The document is the
-    /// generation in force, and the block size of record is the one the
-    /// model's workers reported here.
-    ///
-    /// A caller hashes a request once and calls this on its request path.
-    /// The block size is read under the cache index's lock, the one lock
-    /// this takes. The world is borrowed for the two reads alone, and the
-    /// hashing runs after it. A request with no prompt reads nothing.
-    pub fn prompt_hashes(
-        &self,
-        model: &str,
-        tokens: Option<&[u32]>,
-        text: Option<&str>,
-        seeds: HashSeeds,
-    ) -> PromptHashes {
-        PromptHashes::of_prompt(tokens, text, seeds, |kind| {
-            self.deciding(|world| block_size_and_depth(world.spec(), self.block_size(model), kind))
-        })
     }
 
     /// `at` in the rows' clock: microseconds since the store's origin.
@@ -1012,7 +952,7 @@ impl MemoryStore {
     /// Tell the engine of the world the store shows one membership word:
     /// under the workers lock, with the load lock let go.
     fn tell_engine(&self, word: &Membership<'_>) {
-        self.world.load().spec().engine().on_membership(word);
+        self.world.load().applied().on_membership(word);
     }
 
     /// Tell the standing generation's engine what `change` is to it
@@ -1026,9 +966,10 @@ impl MemoryStore {
     /// returns, whoever wrote. A join is told when the store takes it, and
     /// the world that lists its row follows at its window's build. A
     /// decision takes neither lock and meets the call at a stage's own lock
-    /// alone. One that read its world before a leave's swap may still name
-    /// the worker: a stage answers that from its own state, as the ring
-    /// fences a pruned id ([`crate::stages::RETIRED_WORKER_TTL`]).
+    /// or at a record of sent prefixes' own, and nowhere else. One that
+    /// read its world before a leave's swap may still name the worker: a
+    /// stage answers that from its own state, as the ring fences a pruned
+    /// id ([`crate::stages::RETIRED_WORKER_TTL`]).
     fn tell_membership(&self, change: MembershipChange) {
         if let Some(change) = change.as_lifecycle() {
             self.tell_engine(&change);
@@ -1152,7 +1093,7 @@ impl MemoryStore {
     ///
     /// The build of a registration, a refresh and a patch starts within one
     /// publication window of their answer, when the store's host pays the
-    /// due instant ([`LoadSink::publish_due`]), and they are in force for
+    /// due instant ([`Self::publish_due`]), and they are in force for
     /// decisions when it ends; a registration that takes its worker off a
     /// model has paid its own. A caller that needs its own write in force
     /// at once asks here: a test, a bench's fill, a host with no loop. The
@@ -1163,6 +1104,49 @@ impl MemoryStore {
     pub fn publish_now(&self) {
         let workers = self.workers.lock();
         self.pay(&workers, None);
+    }
+
+    /// When the writes the store took and has not yet shown its readers are
+    /// due to be shown; `None` when nothing waits. The controller's serve
+    /// keeps the instant; a host that writes from a task of its own reads
+    /// it after a write and calls [`Self::publish`] at it. A host that does
+    /// neither shows a waiting write with its next one, and the row's age
+    /// says so meanwhile.
+    ///
+    /// The instant is named for one thing more: the build the membership
+    /// writes owe. The store pays that build ahead of the instant for one
+    /// load write alone, a poll's answer for a rank that has no row yet,
+    /// and no load write is shown before it, so a host with no loop asks
+    /// for it ([`Self::publish_now`]).
+    pub fn publish_due(&self) -> Option<Instant> {
+        self.loads.lock().writer.due()
+    }
+
+    /// Show the readers what waits, when `now` is at or past the instant
+    /// [`Self::publish_due`] names; a call before it shows nothing.
+    pub fn publish(&self, now: Instant) {
+        {
+            let mut loads = self.loads.lock();
+            if !loads.writer.build_due(now) {
+                let world = loads.writer.publish_if_due(now);
+                self.show(&mut loads.writer, world);
+                return;
+            }
+        }
+        // A build is owed and due. The workers lock comes first, as every
+        // membership write takes it, and the build is asked again under
+        // both: another call may have paid it meanwhile.
+        let workers = self.workers.lock();
+        self.pay(&workers, Some(now));
+    }
+
+    /// Hand the store the host's wake. The store calls it, on the writing
+    /// thread, where a write that is no load call leaves an instant for
+    /// [`Self::publish_due`] to name and none stood: the build a
+    /// membership write owes. The host's loop reads the instant again at
+    /// each call. The last wake handed stands.
+    pub fn wake_with(&self, wake: Wake) {
+        *self.wake.lock() = Some(wake);
     }
 
     /// Show the deciders the world a write made, when it made one. Called
@@ -1384,13 +1368,6 @@ impl MemoryStore {
     /// the store does not index.
     pub fn indexed_blocks(&self, id: WorkerId, rank: u16) -> usize {
         self.kv.indexed_blocks(id, rank)
-    }
-
-    /// What the lane of `id` at `rank` counted beside its blocks, over its
-    /// typed batches; `None` for a row the store does not index. A batch
-    /// lent to a body moves none of them.
-    pub fn lane_counts(&self, id: WorkerId, rank: u16) -> Option<LaneCounts> {
-        self.kv.counts(id, rank)
     }
 
     /// Rows that ask for events and hold no lane. Each was written while
@@ -1724,8 +1701,79 @@ impl MemoryStore {
 #[cfg(feature = "worker-host")]
 use super::health::HealthWrite;
 
+/// The status the journal last told of each row, at one place of the log
+/// ([`MemoryStore::told`]).
+#[cfg(feature = "worker-host")]
+#[derive(Debug)]
+pub(crate) struct Told {
+    /// The last journaled write the statuses hold, with its term; the
+    /// default for a store with no journal.
+    pub(crate) at: Position,
+    /// The membership epoch.
+    pub(crate) epoch: u64,
+    /// The history the epoch stands in ([`WorkersStore::history`]).
+    pub(crate) history: u64,
+    statuses: FxHashMap<WorkerId, WorkerStatus>,
+}
+
+#[cfg(feature = "worker-host")]
+impl Told {
+    /// The status the journal last told of the row `id`. `None` for a
+    /// row that does not stand at that place.
+    pub(crate) fn status(&self, id: WorkerId) -> Option<WorkerStatus> {
+        self.statuses.get(&id).copied()
+    }
+}
+
 #[cfg(feature = "worker-host")]
 impl MemoryStore {
+    /// The told status of every row: what the journal last told of its
+    /// id, with the journal's place, the membership epoch and the history
+    /// the epoch stands in, all read in one hold of the membership lock.
+    /// A status write holds that lock from its apply to its telling, so
+    /// no status stands half told here. The hold copies a place and one
+    /// status a row, and no row. The epoch and the history say whether
+    /// the store moved since a reader's own read of its rows: the holder
+    /// of the worker objects reads the store again where it did.
+    ///
+    /// The told status is the log's own word, kept beside the epoch and
+    /// the tail: no copy of what a decision reads. A decision reads a
+    /// worker's status on its object. The told status has five readers:
+    ///
+    /// - the next status event, which says the status its row moved from
+    ///   ([`Self::status_told`]);
+    /// - the event of a row changed in place, which carries it: a status
+    ///   moves by its own event alone ([`Self::follow_objects`]);
+    /// - a first copy, which the holder of the worker objects cuts with
+    ///   each row's told status (`Objects::checkpoint`,
+    ///   `Objects::rows_serving`), by this read;
+    /// - a tell the store refused, whose object takes the told status
+    ///   back (`Objects::table_status`);
+    /// - a holder that follows its leader's log, which lays on an object
+    ///   the status the log told of its row (`Objects::copy_status`).
+    ///
+    /// What else reads a row's status reads the table's whole row and
+    /// goes with the table: the holder's follow, for a row a writer left
+    /// outside the holder's turn, and the store's own reads of a row.
+    pub(crate) fn told(&self) -> Told {
+        let workers = self.workers.lock();
+        let at = self
+            .journal
+            .as_ref()
+            .map_or_else(Position::default, |journal| journal.head());
+        let statuses = workers
+            .rows
+            .iter()
+            .map(|(id, held)| (*id, held.row.status))
+            .collect();
+        Told {
+            at,
+            epoch: workers.epoch,
+            history: workers.history,
+            statuses,
+        }
+    }
+
     /// One membership write this replica's worker objects decided, applied
     /// as their holder tells it: a leader's side of [`Self::follow`], over
     /// the one body ([`Self::decided`]). The holder decided the change over
@@ -2493,50 +2541,11 @@ impl LoadSink for MemoryStore {
             }
         }
     }
-
-    fn publish_due(&self) -> Option<Instant> {
-        self.loads.lock().writer.due()
-    }
-
-    fn publish(&self, now: Instant) {
-        {
-            let mut loads = self.loads.lock();
-            if !loads.writer.build_due(now) {
-                let world = loads.writer.publish_if_due(now);
-                self.show(&mut loads.writer, world);
-                return;
-            }
-        }
-        // A build is owed and due. The workers lock comes first, as every
-        // membership write takes it, and the build is asked again under
-        // both: another call may have paid it meanwhile.
-        let workers = self.workers.lock();
-        self.pay(&workers, Some(now));
-    }
-
-    fn wake_with(&self, wake: Wake) {
-        *self.wake.lock() = Some(wake);
-    }
 }
 
 // -------------------------------------------------------------- KV events
 
 impl KvEventSink for MemoryStore {
-    /// The batch's events as its collector decoded them: the store applies
-    /// them to the index of the worker's model
-    /// (`index`).
-    type Batch = [KvEvent];
-
-    fn admit(
-        &self,
-        id: WorkerId,
-        rank: u16,
-        facts: BatchFacts,
-        batch: &Self::Batch,
-    ) -> BatchOutcome {
-        self.kv.admit(id, rank, facts, batch)
-    }
-
     fn admit_through(
         &self,
         id: WorkerId,

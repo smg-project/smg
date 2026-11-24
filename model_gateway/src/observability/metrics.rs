@@ -11,11 +11,13 @@ use metrics_exporter_prometheus::{
     DistributionBuilder, Matcher, PrometheusBuilder, PrometheusHandle,
 };
 use metrics_util::parse_quantiles;
+use parking_lot::Mutex;
 use smg_external_router::metrics::Metrics as RouterMetrics;
 pub use smg_external_router::metrics::{
     bool_to_static_str, error_reason_from_status, intern_model_label, intern_tool_label,
     metrics_labels, STREAMING_FALSE, STREAMING_TRUE,
 };
+use smg_policy_controller::engine::{PolicyEngine, ShadowKind, ShadowSide};
 use smg_worker::metrics::{
     series as worker_series,
     series::{WorkerSeries, WorkerSeriesRecorder},
@@ -332,12 +334,14 @@ pub(crate) const TIME_TO_FIRST_TOKEN_SECONDS: &str = "smg_router_time_to_first_t
 pub(crate) const REQUEST_TIME_PER_OUTPUT_TOKEN_SECONDS: &str =
     "smg_router_request_time_per_output_token_seconds";
 
-/// The wait ahead of the dispatch the first-token clock starts at: from the
+/// The wait ahead of the dispatch an answer's clocks start at: from the
 /// request's entry at the edge to the answering attempt's RPC dispatch.
-/// Observed with `smg_router_ttft_seconds`, for the same requests and under
-/// the same labels, so the two add up to the time to first token from the
-/// request's receipt. A streamed Responses tool loop observes one per turn,
-/// a later turn's from that turn's start.
+/// Observed once per answer, streamed or collected, under the labels of
+/// `smg_router_ttft_seconds`. For a streamed answer the two add up to the
+/// time to first token from the request's receipt; a collected answer has no
+/// first token, so this family's count also holds the collected answers and
+/// is not the count of `smg_router_ttft_seconds`. A Responses tool loop
+/// observes one per turn, a later turn's from that turn's start.
 pub(crate) const DISPATCH_WAIT_SECONDS: &str = "smg_router_dispatch_wait_seconds";
 
 /// Histogram buckets for `smg_router_time_to_first_token_seconds`: six per
@@ -677,15 +681,16 @@ pub(crate) fn init_metrics() {
     // per-token families hold streamed answers alone: a collected answer is
     // built from the drained stream and sees no first token, and a streamed
     // Responses answer on the Harmony pipeline records only the prefill-decode
-    // first-token pair, none of these four. The dispatch wait is observed with
-    // the first token: it ends where the first-token clock starts.
+    // first-token pair, none of these four. The dispatch wait needs no first
+    // token (it ends at the dispatch, where the first-token clock starts), so
+    // it holds collected answers as well.
     describe_histogram!(
         "smg_router_ttft_seconds",
         "Time to first token of streamed answers by router_type, backend_type, model, endpoint (gRPC only; a collected answer records no first token, nor does a streamed Responses answer on the Harmony pipeline); the clock starts at the answering attempt's RPC dispatch (the prefill dispatch of a prefill-decode pair, after the encode call when encode pushes), so a refused attempt's wait and its backoff are in smg_router_request_duration_seconds, the backoff alone in smg_worker_retry_backoff_seconds, and the refused attempt counted by smg_worker_retries_total, not here"
     );
     describe_histogram!(
         DISPATCH_WAIT_SECONDS,
-        "Dispatch wait of streamed answers by router_type, backend_type, model, endpoint (gRPC only; a collected answer records no first token, nor does a streamed Responses answer on the Harmony pipeline, so no wait): from the request's entry at the edge to the answering attempt's RPC dispatch (the prefill dispatch of a prefill-decode pair, after the encode call when encode pushes), where the clock of smg_router_ttft_seconds starts, so the body read, admission, tokenizing, templating, worker selection, a refused attempt's wait and its backoff are here; observed with smg_router_ttft_seconds, once per observation of it and under the same labels, so the two add up to the time to first token from the request's receipt; a streamed Responses tool loop observes one per turn, as it observes smg_router_ttft_seconds: the first turn's from the request's entry, a later turn's from that turn's start, after the generations and tool calls before it, so a later turn's two add up to the time to first token from the turn's start"
+        "Dispatch wait of streamed and collected answers by router_type, backend_type, model, endpoint (gRPC only; a Responses answer on the Harmony pipeline records none, streamed or collected, nor does a background Responses request that is not streamed): from the request's entry at the edge to the answering attempt's RPC dispatch (the prefill dispatch of a prefill-decode pair, after the encode call when encode pushes), where the clock of smg_router_ttft_seconds starts, so the body read, admission, tokenizing, templating, worker selection, a refused attempt's wait and its backoff are here; observed once per answer, under the labels of smg_router_ttft_seconds; for a streamed answer the two add up to the time to first token from the request's receipt; a collected answer records no first token, so this family's count also holds the collected answers and is not the count of smg_router_ttft_seconds; a Responses tool loop observes one per turn, streamed or collected: the first turn's from the request's entry, a later turn's from that turn's start, after the generations and tool calls before it, so a later streamed turn's two add up to the time to first token from the turn's start"
     );
     describe_histogram!(
         "smg_router_tpot_seconds",
@@ -848,7 +853,7 @@ pub(crate) fn init_metrics() {
     );
     describe_gauge!(
         "smg_cache_tree_chars",
-        "Cache-aware string tree cached characters by model (summed across tenants)"
+        "Cache-aware string tree size by model: cached characters plus 1024 for each node, summed across tenants"
     );
     describe_gauge!(
         "smg_cache_tree_tokens",
@@ -877,9 +882,19 @@ pub(crate) fn init_metrics() {
         "Policy bookings released at the per-poll in-flight reconciliation because their \
          completion never arrived, by policy"
     );
+    describe_counter!(
+        "smg_policy_shadow_decisions_total",
+        "Shadow decisions of the policy engine beside live ones, by the binding's place in the \
+         policy document from 0 (15 stands for every binding from the sixteenth on), by the side \
+         the shadow is asked beside (single, prefill, decode, decode-again) and by kind \
+         (agreed, other-target, other-outcome, skipped); a shadow that panicked is not counted"
+    );
     describe_histogram!(
         "smg_cache_aware_match_ratio",
-        "The predicted overlap of a cache-aware routing decision as a ratio (0..1), one observation per decision: in tree mode the best prefix match in the tree (matched/input units, whatever branch the decision took); in event mode the chosen worker's overlap in blocks over the request's blocks (0 where the chosen worker holds none: a miss, a spill, a warm-up placement)"
+        "The predicted overlap of a cache-aware routing decision as a ratio (0..1), one observation per decision: in tree mode the best prefix match in the tree (matched/input units, whatever branch the decision took); in event mode the chosen worker's overlap in blocks over the request's blocks (0 where the chosen worker holds none: a miss, a spill, a warm-up placement). \
+         With --policy-controller on: the share of the request's blocks that the policy \
+         engine's placement states the chosen worker holds, one observation per placement \
+         that states a share"
     );
 
     // Layer 3: Worker resilience metrics (retry)
@@ -1110,6 +1125,53 @@ pub(super) fn record_tokenizer_encode_activity() {
     for stats in encode_fallbacks() {
         counter!("smg_tokenizer_encode_fallbacks_total", "reason" => stats.reason)
             .absolute(stats.encodes);
+    }
+}
+
+/// What the scrapes so far published of the policy engine's shadow counts
+/// ([`record_policy_shadow_activity`]), under one lock.
+#[derive(Default)]
+pub(super) struct ShadowsPublished(Mutex<LastRead>);
+
+/// The number of the policy document the shadow counts were last read
+/// under, and each count as it was read then, by its binding's place, its
+/// side and its kind.
+#[derive(Default)]
+struct LastRead {
+    document: u64,
+    counts: HashMap<(u32, ShadowSide, ShadowKind), u64>,
+}
+
+/// Publish the shadow decisions `engine` counted, read at the scrape and on
+/// no request's path: every binding that names a shadow, by its place in the
+/// policy document, by the side the shadow is asked beside and by kind, as a
+/// zero series from the first scrape. Each count's growth since the last
+/// scrape is added, and a count read under another policy document is added
+/// whole: a document put in force later starts its counts at zero, and a
+/// series set to such a count would stand still until the new count passed
+/// the old one. What the document before it counted behind its last scrape
+/// is not published. The read and the adds are one turn of `published`'s
+/// lock, so two scrapes at once add a growth once.
+pub(super) fn record_policy_shadow_activity(engine: &PolicyEngine, published: &ShadowsPublished) {
+    let mut published = published.0.lock();
+    let mut counts = Vec::new();
+    let read_under = engine.shadow_counts(|count| counts.push(count));
+    if published.document != read_under {
+        published.document = read_under;
+        published.counts.clear();
+    }
+    for count in counts {
+        let key = (count.binding, count.side, count.kind);
+        let last = published.counts.entry(key).or_default();
+        let grew = count.count.saturating_sub(*last);
+        *last = count.count;
+        counter!(
+            "smg_policy_shadow_decisions_total",
+            "binding" => count.binding.to_string(),
+            "side" => count.side.as_str(),
+            "kind" => count.kind.as_str()
+        )
+        .increment(grew);
     }
 }
 
@@ -1402,11 +1464,12 @@ pub struct StreamingMetricsParams<'a> {
     pub endpoint: &'static str,
     /// Time to first token (None if no tokens were generated)
     pub ttft: Option<Duration>,
-    /// The request's wait ahead of the dispatch `ttft` runs from: its entry
-    /// at the edge to that dispatch (for a later turn of a streamed tool
-    /// loop, that turn's start to its dispatch). Recorded only with `ttft`.
-    /// None for a generation dispatched under no entry stamp, and for a
-    /// collected answer.
+    /// The request's wait ahead of the dispatch the answer's clocks run
+    /// from: its entry at the edge to that dispatch (for a later turn of a
+    /// tool loop, that turn's start to its dispatch). Recorded whenever it
+    /// is given, with or without `ttft`: a collected answer carries one and
+    /// no first token. None for a generation dispatched under no entry
+    /// stamp.
     pub dispatch_wait: Option<Duration>,
     /// Total generation time
     pub generation_duration: Duration,
@@ -1968,8 +2031,10 @@ impl Metrics {
     /// TTFT, TPOT, generation duration and the token counters, with the TPOT
     /// computed here. A streamed answer records at its end; a collected one
     /// when its response is built, with no TTFT (no first token is seen on
-    /// that path) and so no TPOT. The dispatch wait is recorded where the
-    /// TTFT is and only with it, so the two families count the same requests.
+    /// that path) and so no TPOT. The dispatch wait is recorded whenever the
+    /// answer carries one: it ends at the dispatch and needs no first token,
+    /// so its family counts the collected answers too, and a stream that
+    /// ends with no first token.
     pub fn record_streaming_metrics(params: StreamingMetricsParams<'_>) {
         let StreamingMetricsParams {
             router_type,
@@ -2028,9 +2093,9 @@ impl Metrics {
                 let seconds = ttft.as_secs_f64();
                 ttft_histogram().record(seconds);
                 first_token_histogram().record(seconds);
-                if let Some(wait) = dispatch_wait {
-                    dispatch_wait_histogram().record(wait.as_secs_f64());
-                }
+            }
+            if let Some(wait) = dispatch_wait {
+                dispatch_wait_histogram().record(wait.as_secs_f64());
             }
             if let Some(tpot) = tpot {
                 let seconds = tpot.as_secs_f64();
@@ -2065,11 +2130,11 @@ impl Metrics {
                         kept.first_token
                             .get_or_init(first_token_histogram)
                             .record(seconds);
-                        if let Some(wait) = dispatch_wait {
-                            kept.dispatch_wait
-                                .get_or_init(dispatch_wait_histogram)
-                                .record(wait.as_secs_f64());
-                        }
+                    }
+                    if let Some(wait) = dispatch_wait {
+                        kept.dispatch_wait
+                            .get_or_init(dispatch_wait_histogram)
+                            .record(wait.as_secs_f64());
                     }
                     if let Some(tpot) = tpot {
                         let seconds = tpot.as_secs_f64();
@@ -2381,7 +2446,7 @@ impl Metrics {
         );
     }
 
-    /// Set cache-aware string-tree cached characters for a model
+    /// Set the cache-aware string-tree size for a model
     pub fn set_cache_tree_chars(model_id: &str, chars: usize) {
         let model = intern_model_label(model_id);
         gauge!("smg_cache_tree_chars", "model" => model).set(chars as f64);
@@ -2434,7 +2499,9 @@ impl Metrics {
 
     /// Record the predicted overlap ratio (0..1) of a cache-aware routing
     /// decision: the tree's best prefix match in tree mode, the chosen
-    /// worker's overlap over the request's blocks in event mode.
+    /// worker's overlap over the request's blocks in event mode. Where the
+    /// policy engine decides, the share of the request's blocks that its
+    /// placement states the chosen worker holds.
     pub fn record_cache_aware_match_ratio(ratio: f64) {
         handles::with_single(
             &handles::CACHE_AWARE_MATCH_RATIO,
@@ -2499,6 +2566,7 @@ pub(crate) mod test_support {
     use std::sync::OnceLock;
 
     use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+    use smg_policy_controller::document::{AppliedSpec, PolicySpec, ShadowSpec};
 
     /// The lib test binary's one process-wide recorder, for records made on
     /// threads no local recorder covers (the blocking pool). Installed once;
@@ -2517,6 +2585,44 @@ pub(crate) mod test_support {
     /// readers of it: the worker's test support owns them.
     pub(crate) use smg_worker::test_support::assert_metric;
     pub(crate) use smg_worker::test_support::{render_with_recorder, sorted_series};
+
+    /// A policy document of two bindings. The first is of another model
+    /// and names no shadow. The second is the `round_robin` preset's, of
+    /// every model, with the `random` preset's profile as its shadow.
+    pub(crate) fn shadowing_document() -> PolicySpec {
+        let preset = |name| PolicySpec::preset(name).expect("a stock preset");
+        let mut document = preset("round_robin");
+        document.profiles.extend(preset("random").profiles);
+        let mut ahead = document.bindings[0].clone();
+        ahead.matcher.model = "another-model".to_owned();
+        document.bindings[0].shadow = Some(ShadowSpec::Profile("random".to_owned()));
+        document.bindings.insert(0, ahead);
+        document
+    }
+
+    /// [`shadowing_document`], as an engine is built from it.
+    pub(crate) fn shadowing_spec() -> AppliedSpec {
+        AppliedSpec::validate(&shadowing_document()).expect("a valid policy document")
+    }
+
+    /// The shadow series of the second binding's single requests in a
+    /// scrape, by kind: agreed, other target, other outcome, skipped.
+    /// `None` where the scrape holds no such series.
+    pub(crate) fn shadow_kinds(rendered: &str) -> [Option<u64>; 4] {
+        ["agreed", "other-target", "other-outcome", "skipped"].map(|kind| {
+            let labels = [
+                r#"binding="1""#,
+                r#"side="single""#,
+                &format!(r#"kind="{kind}""#),
+            ];
+            let of_kind = |line: &&str| {
+                line.starts_with("smg_policy_shadow_decisions_total{")
+                    && labels.iter().all(|label| line.contains(label))
+            };
+            let line = rendered.lines().find(of_kind)?;
+            line.rsplit(' ').next()?.parse().ok()
+        })
+    }
 }
 
 #[cfg(test)]

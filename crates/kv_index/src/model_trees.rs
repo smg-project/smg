@@ -142,7 +142,7 @@ impl ModelTrees {
         }
     }
 
-    /// Evicts every model's string tree down to `max_size` characters
+    /// Evicts every model's string tree down to the size `max_size`
     /// ([`Tree::evict_tenant_by_size`]) and hands each tree to `each` once
     /// its own eviction is done. `each` runs under the read guard of the
     /// model's map entry: it must not make a tree of this store.
@@ -168,6 +168,7 @@ impl ModelTrees {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::string_tree::NODE_WEIGHT;
 
     fn tenant(name: &str) -> TenantId {
         TenantId::from(name)
@@ -269,7 +270,7 @@ mod tests {
                     .map(|worker| (worker.to_string(), size))
                     .collect()
             };
-            assert_eq!(chars, sized(6), "model {model}");
+            assert_eq!(chars, sized(6 + NODE_WEIGHT), "model {model}");
             assert_eq!(tokens, sized(2), "model {model}");
         }
     }
@@ -288,14 +289,15 @@ mod tests {
         trees.string_tree_or_new("c").insert_text("short", "w1");
 
         let mut strings = Vec::new();
-        trees.evict_string_trees(13, |model, tree| {
+        trees.evict_string_trees(13 + NODE_WEIGHT, |model, tree| {
             strings.push((model.to_string(), tree.total_char_size()));
         });
         strings.sort();
-        // 25 characters a model before: the older prompt leaves, and a tree
-        // under the bound keeps what it holds.
-        let named =
-            |sizes: [(&str, usize); 3]| sizes.map(|(model, size)| (model.to_string(), size));
+        // Two prompts of 25 characters a model before, one node each: the
+        // older prompt leaves, and a tree under the bound keeps what it holds.
+        let named = |sizes: [(&str, usize); 3]| {
+            sizes.map(|(model, chars)| (model.to_string(), chars + NODE_WEIGHT))
+        };
         assert_eq!(strings, named([("a", 13), ("b", 13), ("c", 5)]));
 
         let mut tokens = Vec::new();
@@ -305,6 +307,9 @@ mod tests {
         tokens.sort();
         assert_eq!(tokens, [("a".to_string(), 4), ("b".to_string(), 4)]);
         // The token trees' pass left the string trees alone.
-        assert_eq!(trees.string_tree("a").unwrap().total_char_size(), 13);
+        assert_eq!(
+            trees.string_tree("a").unwrap().total_char_size(),
+            13 + NODE_WEIGHT
+        );
     }
 }

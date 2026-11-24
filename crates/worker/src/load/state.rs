@@ -28,6 +28,13 @@
 //!   engine's state behind it was sampled (the report's own instant, else
 //!   the publish instant), so a policy that books dispatches locally can
 //!   release the ones a report already reflects when it reads the report.
+//! - **A failed fetch keeps a report beside the entries.** A tick prunes
+//!   the entry of a worker whose load fetch failed, as of one that answered
+//!   with no row. Where that entry states a running or waiting request it
+//!   is kept in a side table, with its own sample instant, until the worker
+//!   answers again or leaves, and no further than the first tick of its
+//!   group that finds the sample 30 seconds old: the policy controller's
+//!   read ([`LoadSnapshot::report_or_kept`]) and no other reaches it.
 
 use std::{
     collections::{hash_map::Entry, HashMap},
@@ -39,9 +46,10 @@ use std::{
 };
 
 use parking_lot::Mutex;
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use tokio::sync::{watch, Notify};
 
+use super::monitor::KEPT_REPORT_LIFE;
 #[cfg(any(test, feature = "test-util"))]
 use crate::identity::basic::BasicWorker;
 use crate::{
@@ -81,6 +89,9 @@ struct LoadEntry {
 #[derive(Default)]
 pub struct LoadSnapshot {
     entries: HashMap<Arc<str>, LoadEntry>,
+    /// The last report of each worker whose load fetch fails, beside the
+    /// entries: [`Self::report_or_kept`] alone reads it.
+    kept: FxHashMap<Arc<str>, LoadEntry>,
 }
 
 impl std::fmt::Debug for LoadSnapshot {
@@ -100,6 +111,22 @@ impl LoadSnapshot {
     pub fn report(&self, url: &str) -> Option<(&WorkerLoadResponse, Instant)> {
         self.entries
             .get(url)
+            .map(|entry| (&*entry.load, entry.sampled_at))
+    }
+
+    /// A worker's report as [`Self::report`] gives it, and where the
+    /// snapshot holds none, the last report of a worker whose load fetch
+    /// fails, with the instant of that report's own sample. The monitor
+    /// keeps such a report while it states a running or waiting request,
+    /// until the worker answers again or leaves, and no further than the
+    /// first poll tick of its group that finds the sample 30 seconds old:
+    /// the age is judged at the ticks, not at this read. The policy
+    /// controller's read: its stages age a report by its sample.
+    /// [`Self::report`] and [`Self::get`] give no kept report.
+    pub fn report_or_kept(&self, url: &str) -> Option<(&WorkerLoadResponse, Instant)> {
+        self.entries
+            .get(url)
+            .or_else(|| self.kept.get(url))
             .map(|entry| (&*entry.load, entry.sampled_at))
     }
 
@@ -135,7 +162,10 @@ impl LoadSnapshot {
                 (Arc::<str>::from(url.as_str()), entry)
             })
             .collect();
-        Arc::new(Self { entries })
+        Arc::new(Self {
+            entries,
+            kept: FxHashMap::default(),
+        })
     }
 }
 
@@ -235,8 +265,29 @@ impl<G: Generation> LoadState<G> {
         self.tx.borrow().clone()
     }
 
+    /// [`Self::publish`] where no fetch failed.
+    #[cfg(test)]
+    pub(crate) fn publish_group(
+        &self,
+        group_urls: &[String],
+        fresh: Vec<(Arc<dyn Worker>, Arc<WorkerLoadResponse>)>,
+    ) -> Vec<Replaced> {
+        self.publish(group_urls, fresh, &[])
+    }
+
     /// Publish one group's polling tick: prune every entry for the group's
     /// URLs, then insert the fresh reports that pass the incarnation fence.
+    ///
+    /// `failed` are the group's workers whose fetch failed this tick. The
+    /// entry each loses is kept beside the entries, for
+    /// [`LoadSnapshot::report_or_kept`] alone, while it is that worker's
+    /// own, the worker is its URL's `Ready` worker, the report states a
+    /// running or waiting request and its sample is younger than
+    /// [`KEPT_REPORT_LIFE`]: a worker with no report reads as an idle one,
+    /// so a report that states no request is worth no keeping. A kept
+    /// report ends at the first tick that finds one of those untrue, at a
+    /// tick whose fetch answers, with a fresh row or with none, and with
+    /// its worker's eviction.
     ///
     /// The fence admits a report only while the registry still holds the
     /// exact worker (`Arc` identity) that produced it, and holds it Ready. A
@@ -252,10 +303,11 @@ impl<G: Generation> LoadState<G> {
     /// no fresh one. Whether such a row's worker has left is the caller's
     /// to ask the registry: the read here is by pointer alone.
     #[must_use = "a returned row's series end only where the caller ends them"]
-    pub(crate) fn publish_group(
+    pub(crate) fn publish(
         &self,
         group_urls: &[String],
         fresh: Vec<(Arc<dyn Worker>, Arc<WorkerLoadResponse>)>,
+        failed: &[Arc<dyn Worker>],
     ) -> Vec<Replaced> {
         let published_at = Instant::now();
         let admitted: Vec<(Arc<str>, LoadEntry)> = fresh
@@ -273,9 +325,25 @@ impl<G: Generation> LoadState<G> {
 
         let mut replaced = Vec::new();
         let ended = &mut replaced;
-        self.rebuild(move |entries| {
+        self.rebuild(move |entries, kept| {
             let mut changed = false;
             {
+                // Whether the entry a URL loses, or the one kept of it at
+                // an earlier tick, is kept past this tick.
+                let failed: FxHashMap<&str, &Arc<dyn Worker>> =
+                    failed.iter().map(|worker| (worker.url(), worker)).collect();
+                let keeps =
+                    |url: &str, entry: &LoadEntry| {
+                        failed.get(url).is_some_and(|worker| {
+                            Weak::ptr_eq(&entry.source, &Arc::downgrade(worker))
+                                && self.is_current_incarnation(worker)
+                                && entry.load.loads.iter().any(|rank| {
+                                    rank.num_running_reqs > 0 || rank.num_waiting_reqs > 0
+                                })
+                                && published_at.saturating_duration_since(entry.sampled_at)
+                                    < KEPT_REPORT_LIFE
+                        })
+                    };
                 // A URL with a fresh row keeps its entry for the insert
                 // below, which reads whose row it replaces. The fresh rows
                 // come in the URLs' order, less the ones that failed, so
@@ -299,13 +367,27 @@ impl<G: Generation> LoadState<G> {
                     if fresh_urls.contains(url.as_str()) {
                         continue;
                     }
-                    if let Some(old) = entries.remove(url.as_str()) {
+                    if let Some((url, old)) = entries.remove_entry(url.as_str()) {
                         changed = true;
-                        ended.extend(old.source.upgrade().map(|worker| (worker, old.load)));
+                        ended.extend(
+                            old.source
+                                .upgrade()
+                                .map(|worker| (worker, Arc::clone(&old.load))),
+                        );
+                        if keeps(&url, &old) {
+                            kept.insert(url, old);
+                        }
+                    } else if kept.get(url.as_str()).is_some_and(|old| !keeps(url, old)) {
+                        kept.remove(url.as_str());
+                        changed = true;
                     }
                 }
             }
             for (url, entry) in admitted {
+                // No look-up of a fresh row's URL while nothing is kept.
+                if !kept.is_empty() {
+                    kept.remove(&url);
+                }
                 match entries.entry(url) {
                     Entry::Occupied(mut slot) => {
                         let old = slot.insert(entry);
@@ -390,13 +472,21 @@ impl<G: Generation> LoadState<G> {
         }
 
         let mut ended = Vec::new();
-        self.rebuild(|entries| {
+        self.rebuild(|entries, kept| {
             let mut changed = false;
             for worker in &pending {
                 // Read under the publishers' lock. A worker that leaves
                 // behind this read queues an eviction of its own.
                 if self.is_current_incarnation(worker) {
                     continue;
+                }
+                // A kept report ends with its own worker's leave.
+                if kept
+                    .get(worker.url())
+                    .is_some_and(|entry| Weak::ptr_eq(&entry.source, &Arc::downgrade(worker)))
+                {
+                    kept.remove(worker.url());
+                    changed = true;
                 }
                 let own = entries.get(worker.url()).map(|entry| {
                     match entry.source.upgrade() {
@@ -429,9 +519,10 @@ impl<G: Generation> LoadState<G> {
     /// shutdown and lag-recovery rebuilds).
     pub(crate) fn clear(&self) {
         self.pending_evictions.lock().clear();
-        self.rebuild(|entries| {
-            let changed = !entries.is_empty();
+        self.rebuild(|entries, kept| {
+            let changed = !entries.is_empty() || !kept.is_empty();
             entries.clear();
+            kept.clear();
             changed
         });
     }
@@ -447,12 +538,19 @@ impl<G: Generation> LoadState<G> {
     /// let `mutate` edit it, and publish a fresh `Arc` only when something
     /// changed. Publishers serialize on the watch channel's internal lock;
     /// readers holding older `Arc`s are unaffected.
-    fn rebuild(&self, mutate: impl FnOnce(&mut HashMap<Arc<str>, LoadEntry>) -> bool) {
+    fn rebuild(
+        &self,
+        mutate: impl FnOnce(
+            &mut HashMap<Arc<str>, LoadEntry>,
+            &mut FxHashMap<Arc<str>, LoadEntry>,
+        ) -> bool,
+    ) {
         self.tx.send_if_modified(|snapshot| {
             let mut entries = snapshot.entries.clone();
-            let changed = mutate(&mut entries);
+            let mut kept = snapshot.kept.clone();
+            let changed = mutate(&mut entries, &mut kept);
             if changed {
-                *snapshot = Arc::new(LoadSnapshot { entries });
+                *snapshot = Arc::new(LoadSnapshot { entries, kept });
                 self.publishes.fetch_add(1, Ordering::Relaxed);
             }
             changed

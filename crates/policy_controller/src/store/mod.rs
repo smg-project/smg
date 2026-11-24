@@ -44,11 +44,10 @@
 //!   replicated.
 //! - **Wire messages are the host's.** No second load or event message exists
 //!   in process: a load record enters as the view's [`LoadRow`] (the record's
-//!   routing core in its own names) and a KV batch as the host's own message
-//!   behind [`KvEventSink::Batch`], with the header facts the cursor reads
-//!   beside it. [`MemoryStore`] takes a batch as the events its collector
-//!   decoded ([`KvEvent`]) and applies them to the index of the worker's
-//!   model (`index`).
+//!   routing core in its own names) and a KV batch stays the host's own
+//!   message: the cursor reads the header facts beside it, and the host's
+//!   own rules write an admitted batch through its row's lane
+//!   ([`KvEventSink::admit_through`]).
 //!
 //! [`MemoryStore`] is the one-process store behind every trait: the
 //! controller's own store once its drivers move in, and the double the
@@ -85,8 +84,8 @@ mod tests;
 pub use encoding::{hands_to, EncodeClasses, EncodeHandoff, EncodeMember, EncodeOffer};
 pub use health::{HealthSink, HealthWrite, VetoWrite};
 pub use index::{
-    ApplyError, ChainBlockMap, ContentHash, KvEvent, LaneCounts, LaneWriter, SequenceHash,
-    StoredBlock, WorkerGroups, INDEX_WORKERS,
+    ApplyError, ChainBlockMap, ContentHash, LaneWriter, SequenceHash, StoredBlock, WorkerGroups,
+    INDEX_WORKERS,
 };
 pub use journal::{Journal, Position};
 pub use kv_events::{
@@ -96,10 +95,10 @@ pub use kv_events::{
 pub use leases::{
     DecodeMark, DecodeSide, LeaseRecord, LeaseRefused, LeaseState, LeasesStore, PickRecord, Sides,
 };
-pub use loads::{LoadSample, LoadSink, LoadSource, PollMode, Wake};
+pub use loads::{LoadSample, LoadSink, LoadSource, PollMode};
 #[cfg(feature = "controller")]
 pub(crate) use memory::DecodeIssue;
-pub use memory::{AtWork, Hand, LookOutcome, MemoryStore, StoreCheckpoint, StoreStats};
+pub use memory::{AtWork, Hand, LookOutcome, MemoryStore, StoreCheckpoint, StoreStats, Wake};
 pub use reservations::{ReservationKind, ReservationStore};
 pub use snapshot::{OutsideLists, StaleGeneration, StoreSnapshot, PUBLISH_WINDOW};
 pub use workers::{

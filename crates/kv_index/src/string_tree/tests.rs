@@ -447,7 +447,8 @@ fn test_utf8_split_concurrent() {
 #[test]
 fn test_simple_eviction() {
     let tree = Tree::new();
-    let max_size = 5;
+    // Room for one node of five chars.
+    let max_size = 5 + NODE_WEIGHT;
 
     // Insert strings for both tenants
     tree.insert_text("hello", "tenant1"); // size 5
@@ -459,18 +460,21 @@ fn test_simple_eviction() {
     tree.pretty_print();
 
     let sizes_before = tree.get_used_size_per_tenant();
-    assert_eq!(sizes_before.get("tenant1").unwrap(), &5); // "hello" = 5
-    assert_eq!(sizes_before.get("tenant2").unwrap(), &10); // "hello" + "world" = 10
+    assert_eq!(sizes_before.get("tenant1").unwrap(), &(5 + NODE_WEIGHT)); // "hello" = 5
+    assert_eq!(
+        sizes_before.get("tenant2").unwrap(),
+        &(10 + 2 * NODE_WEIGHT) // "hello" + "world" = 10, a node each
+    );
 
-    // Evict: the tree-wide total (15) exceeds max_size, so LRU leaves go
-    // first - tenant1's "hello" (oldest), then tenant2's "hello"
+    // Evict: the tree-wide total (15 chars on three nodes) exceeds max_size,
+    // so LRU leaves go first - tenant1's "hello" (oldest), then tenant2's "hello"
     tree.evict_tenant_by_size(max_size);
 
     tree.pretty_print();
 
     let sizes_after = tree.get_used_size_per_tenant();
     assert_eq!(*sizes_after.get("tenant1").unwrap_or(&0), 0); // Oldest, evicted
-    assert_eq!(sizes_after.get("tenant2").unwrap(), &5); // Only "world" remains
+    assert_eq!(sizes_after.get("tenant2").unwrap(), &(5 + NODE_WEIGHT)); // Only "world" remains
 
     let (matched, tenant) = tree.prefix_match_legacy("world");
     assert_eq!(matched, "world");
@@ -621,7 +625,7 @@ fn test_get_used_size_per_tenant() {
 
     tree.pretty_print();
     println!("{sizes:?}");
-    assert_eq!(sizes.get("tenant1").unwrap(), &10); // "hello" + "world"
+    assert_eq!(sizes.get("tenant1").unwrap(), &(10 + 2 * NODE_WEIGHT)); // "hello" + "world"
 
     // Multiple tenants sharing nodes
     tree.insert_text("hello", "tenant2");
@@ -630,15 +634,16 @@ fn test_get_used_size_per_tenant() {
 
     tree.pretty_print();
     println!("{sizes:?}");
-    assert_eq!(sizes.get("tenant1").unwrap(), &10);
-    assert_eq!(sizes.get("tenant2").unwrap(), &6); // "hello" + "p"
+    // "help" split "hello": both tenants stand on "hel" and "lo".
+    assert_eq!(sizes.get("tenant1").unwrap(), &(10 + 3 * NODE_WEIGHT));
+    assert_eq!(sizes.get("tenant2").unwrap(), &(6 + 3 * NODE_WEIGHT)); // "hello" + "p"
 
     // UTF-8 characters
     tree.insert_text("你好", "tenant3");
     let sizes = tree.get_used_size_per_tenant();
     tree.pretty_print();
     println!("{sizes:?}");
-    assert_eq!(sizes.get("tenant3").unwrap(), &2); // 2 Chinese characters
+    assert_eq!(sizes.get("tenant3").unwrap(), &(2 + NODE_WEIGHT)); // 2 Chinese characters
 
     tree.pretty_print();
 }
@@ -1268,6 +1273,12 @@ fn test_snapshot_round_trip_shared_prefixes() {
     let r3 = restored.match_prefix_with_counts("Goodbye");
     assert_eq!(r3.matched_char_count, 7);
     assert_eq!(r3.tenant.as_ref(), "worker-3");
+
+    // A restored tree counts what its source counts.
+    assert_eq!(
+        restored.get_tenant_char_count(),
+        tree.get_tenant_char_count()
+    );
 }
 
 #[test]
@@ -1350,9 +1361,14 @@ fn merge_keeps_a_remote_edge_that_shares_only_its_first_char_with_a_local_child(
     assert_eq!(world.matched_char_count, 11);
     assert_eq!(world.tenant.as_ref(), "w1");
     let counts = local.get_tenant_char_count();
-    assert_eq!(counts["w2"], 12, "w2 owns `Hello ` + `wo` + `nder`");
     assert_eq!(
-        counts["w1"], 16,
+        counts["w2"],
+        12 + 3 * NODE_WEIGHT,
+        "w2 owns `Hello ` + `wo` + `nder`"
+    );
+    assert_eq!(
+        counts["w1"],
+        16 + 4 * NODE_WEIGHT,
         "w1 owns `Hello ` + `wo` + `rld` + `there`"
     );
 }
@@ -1376,8 +1392,16 @@ fn merge_keeps_the_children_of_a_remote_edge_that_is_a_prefix_of_a_local_edge() 
     let world = local.match_prefix_with_counts("Hello world");
     assert_eq!(world.matched_char_count, 11);
     let counts = local.get_tenant_char_count();
-    assert_eq!(counts["w2"], 16, "w2 owns `Hello ` + `world` + `there`");
-    assert_eq!(counts["w1"], 11, "w1 owns `Hello ` + `world`");
+    assert_eq!(
+        counts["w2"],
+        16 + 3 * NODE_WEIGHT,
+        "w2 owns `Hello ` + `world` + `there`"
+    );
+    assert_eq!(
+        counts["w1"],
+        11 + 2 * NODE_WEIGHT,
+        "w1 owns `Hello ` + `world`"
+    );
 
     let local = Tree::new();
     local.insert_text("Hello world", "w1");
@@ -1395,11 +1419,13 @@ fn merge_keeps_the_children_of_a_remote_edge_that_is_a_prefix_of_a_local_edge() 
     }
     let counts = local.get_tenant_char_count();
     assert_eq!(
-        counts["w2"], 16,
+        counts["w2"],
+        16 + 4 * NODE_WEIGHT,
         "w2 owns `Hello ` + `wo` + `nder` + `mbat`"
     );
     assert_eq!(
-        counts["w1"], 16,
+        counts["w1"],
+        16 + 4 * NODE_WEIGHT,
         "w1 owns `Hello ` + `wo` + `rld` + `there`"
     );
 }
@@ -1422,7 +1448,7 @@ fn merge_grafts_or_joins_a_remote_remainder_below_a_local_child() {
     assert_eq!(world.tenant.as_ref(), "w2");
     assert_eq!(
         local.get_tenant_char_count()["w2"],
-        11,
+        11 + 2 * NODE_WEIGHT,
         "w2 owns `Hello ` + `world`"
     );
 
@@ -1444,8 +1470,12 @@ fn merge_grafts_or_joins_a_remote_remainder_below_a_local_child() {
         "w2 is on `world`"
     );
     let counts = local.get_tenant_char_count();
-    assert_eq!(counts["w2"], 11, "w2 owns `Hello ` + `world`, each once");
-    assert_eq!(counts["w1"], 16);
+    assert_eq!(
+        counts["w2"],
+        11 + 2 * NODE_WEIGHT,
+        "w2 owns `Hello ` + `world`, each once"
+    );
+    assert_eq!(counts["w1"], 16 + 3 * NODE_WEIGHT);
 }
 
 #[test]
@@ -1660,16 +1690,17 @@ fn test_string_match_and_insert_with_select_and_skip() {
 fn test_evict_by_size_shared_budget_lru_tenants() {
     let tree = Tree::new();
 
-    // 8 tenants, 10 chars each: every tenant is under the budget on its
-    // own, but the tree-wide total is double the budget.
+    // 8 tenants, one node of 10 chars each: every tenant is under the
+    // budget on its own, but the tree-wide total is double the budget.
+    let leaf = 10 + NODE_WEIGHT;
     for t in 0..8 {
         tree.insert_text(&format!("{t}aaaaaaaaa"), &format!("tenant{t}"));
     }
-    assert_eq!(tree.total_char_size(), 80);
+    assert_eq!(tree.total_char_size(), 8 * leaf);
 
-    tree.evict_tenant_by_size(40);
+    tree.evict_tenant_by_size(4 * leaf);
 
-    assert!(tree.total_char_size() <= 40);
+    assert!(tree.total_char_size() <= 4 * leaf);
     // Least-recently-used tenants are evicted first.
     let sizes = tree.get_used_size_per_tenant();
     for t in 0..4 {
@@ -1682,7 +1713,7 @@ fn test_evict_by_size_shared_budget_lru_tenants() {
     for t in 4..8 {
         assert_eq!(
             *sizes.get(&format!("tenant{t}")).unwrap(),
-            10,
+            leaf,
             "tenant{t} should survive"
         );
     }
@@ -1695,14 +1726,15 @@ fn test_evict_by_size_under_budget_is_noop() {
         tree.insert_text(&format!("{t}aaaaaaaaa"), &format!("tenant{t}"));
     }
     let counts_before = tree.get_tenant_char_count();
-    assert_eq!(tree.total_char_size(), 40);
+    let total = 4 * (10 + NODE_WEIGHT);
+    assert_eq!(tree.total_char_size(), total);
 
     // At and above the budget: nothing may change.
-    tree.evict_tenant_by_size(40);
+    tree.evict_tenant_by_size(total);
     tree.evict_tenant_by_size(usize::MAX);
 
     assert_eq!(tree.get_tenant_char_count(), counts_before);
-    assert_eq!(tree.total_char_size(), 40);
+    assert_eq!(tree.total_char_size(), total);
     assert_eq!(tree.get_used_size_per_tenant(), counts_before);
     for t in 0..4 {
         let text = format!("{t}aaaaaaaaa");
@@ -1815,13 +1847,16 @@ fn test_concurrent_match_and_insert_count_and_route_integrity() {
     // Exact, concurrency-independent count: each tenant owns its full path
     // exactly once regardless of iteration count or interleaving
     // (first-attach is atomic, split-vs-replay ordered by the text lock).
+    // Its nodes: one for each step of its head and one for its tail; the
+    // longest prefix keeps its last step and its tail in one node.
     let counts = tree.get_tenant_char_count();
     for j in 0..N_PREFIXES {
+        let expected = lens[j] + (j + 2).min(N_PREFIXES) * NODE_WEIGHT;
         let actual = counts.get(&tenants[j]).copied().unwrap_or(0);
         assert_eq!(
-            actual, lens[j],
-            "tenant {} char count diverged under concurrency: expected {}, got {actual}",
-            tenants[j], lens[j]
+            actual, expected,
+            "tenant {} count diverged under concurrency: expected {expected}, got {actual}",
+            tenants[j]
         );
     }
 
@@ -1891,7 +1926,7 @@ fn test_remove_tenant_all_falls_back_after_non_prefix_closed_eviction() {
     // Targeted string eviction can remove an older ancestor before a
     // newer descendant. The optimized purge must detect that shape and
     // fall back to a complete walk.
-    tree.evict_by_tenant(&Arc::from("tenant1"), 3);
+    tree.evict_by_tenant(&Arc::from("tenant1"), 3 + NODE_WEIGHT);
     tree.remove_tenant_all(&Arc::from("tenant1"));
 
     assert!(!tree.get_tenant_char_count().contains_key("tenant1"));
@@ -1919,8 +1954,8 @@ fn test_remove_tenant_all_sole_owner_detaches_subtree() {
     assert_eq!(r.matched_char_count, 0);
 }
 
-/// The chars `tenant` holds on nodes the root still reaches: what an
-/// eviction can find and subtract, and what a match can return.
+/// The size `tenant` holds on nodes the root still reaches (their chars
+/// and `NODE_WEIGHT` each): what an eviction can find and subtract.
 fn reachable_chars(tree: &Tree, tenant: &str) -> usize {
     fn walk(node: &NodeRef, tenant: &str) -> usize {
         node.children
@@ -1928,7 +1963,7 @@ fn reachable_chars(tree: &Tree, tenant: &str) -> usize {
             .map(|child| {
                 let child = child.value();
                 let owned = if child.tenant_last_access_time.contains_key(tenant) {
-                    child.text.read().char_count()
+                    child.text.read().char_count() + NODE_WEIGHT
                 } else {
                     0
                 };
@@ -2043,7 +2078,8 @@ fn test_match_and_insert_with_counts_stay_reachable_under_injected_evictions() {
         }
         let route = &names[(next(&mut rng) % TENANTS as u64) as usize];
         let victim = intern_tenant(&names[(next(&mut rng) % TENANTS as u64) as usize]);
-        let budget = (next(&mut rng) % 5) as usize * WORD_CHARS;
+        // Room for none to four nodes of one word.
+        let budget = (next(&mut rng) % 5) as usize * (WORD_CHARS + NODE_WEIGHT);
         let eviction = next(&mut rng) % 4;
 
         tree.match_and_insert_with(&prompt, |_| {
@@ -2143,13 +2179,13 @@ fn a_hashed_insert_resolves_by_hash_and_attaches_along_the_whole_path() {
     assert_eq!(tree.hashed_paths(), 1);
 
     assert!(tree.insert_tenant_by_hash(hash, "t2"));
-    assert_eq!(tree.tenant_char_size(&tenant("t2")), 11);
+    assert_eq!(tree.tenant_char_size(&tenant("t2")), 11 + NODE_WEIGHT);
     let matched = tree.match_prefix_with_counts("hello world");
     assert_eq!(matched.matched_char_count, 11);
     assert!(matched.matched_tenants.iter().any(|t| &**t == "t2"));
 
     assert!(!tree.insert_tenant_by_hash(crate::hash_node_path("hello there"), "t2"));
-    assert_eq!(tree.tenant_char_size(&tenant("t2")), 11);
+    assert_eq!(tree.tenant_char_size(&tenant("t2")), 11 + NODE_WEIGHT);
     assert_hashes_name_live_nodes(&tree);
 }
 
@@ -2187,7 +2223,7 @@ fn the_fused_walk_records_the_hash_at_the_node_the_path_ends_at() {
     }
     // "hello" + " " + "world" + "there": the first split lands after the space,
     // the second (for `c`) before it.
-    assert_eq!(tree.tenant_char_size(&tenant("t3")), 16);
+    assert_eq!(tree.tenant_char_size(&tenant("t3")), 16 + 4 * NODE_WEIGHT);
 }
 
 #[test]
@@ -2199,7 +2235,7 @@ fn a_split_leaves_the_hash_on_the_node_that_keeps_the_path() {
     tree.insert_text("hello there", "t1");
     assert_eq!(tree.hashed_paths(), 1);
     assert!(tree.insert_tenant_by_hash(hash, "t2"));
-    assert_eq!(tree.tenant_char_size(&tenant("t2")), 11);
+    assert_eq!(tree.tenant_char_size(&tenant("t2")), 11 + 2 * NODE_WEIGHT);
     assert_hashes_name_live_nodes(&tree);
 }
 
@@ -2212,7 +2248,7 @@ fn eviction_forgets_a_hash_with_its_node_oldest_first() {
     tree.insert_text_with_hash("bravo path", "t1", newer);
 
     // Room for one of the two ten-char paths: the older leaf goes.
-    tree.evict_tenant_by_size(10);
+    tree.evict_tenant_by_size(10 + NODE_WEIGHT);
     assert_eq!(tree.hashed_paths(), 1);
     assert!(!tree.insert_tenant_by_hash(older, "t2"));
     assert!(tree.insert_tenant_by_hash(newer, "t2"));
@@ -2250,7 +2286,7 @@ fn a_repaired_path_leaves_a_requests_hash_in_place_and_names_an_unnamed_node() {
     tree.insert_text_with_hash("hello world", "t1", request);
     tree.insert_text_with_hash_unless_named("hello world", "t2", repair);
     assert_eq!(tree.hashed_paths(), 1);
-    assert_eq!(tree.tenant_char_size(&tenant("t2")), 11);
+    assert_eq!(tree.tenant_char_size(&tenant("t2")), 11 + NODE_WEIGHT);
     assert!(tree.insert_tenant_by_hash(request, "t3"));
     assert!(!tree.insert_tenant_by_hash(repair, "t3"));
 
@@ -2329,7 +2365,7 @@ fn re_inserting_a_path_keeps_one_entry() {
     assert!(tree.insert_tenant_by_hash(hash, "t3"));
     assert!(tree.insert_tenant_by_hash(hash, "t3"));
     assert_eq!(tree.hashed_paths(), 1);
-    assert_eq!(tree.tenant_char_size(&tenant("t3")), 9);
+    assert_eq!(tree.tenant_char_size(&tenant("t3")), 9 + NODE_WEIGHT);
     assert_hashes_name_live_nodes(&tree);
 }
 
@@ -2341,7 +2377,11 @@ fn a_multi_byte_path_reads_back_as_its_own_text() {
     // The split lands inside multi-byte text.
     tree.insert_text_with_hash(b, "t1", crate::hash_node_path(b));
     assert!(tree.insert_tenant_by_hash(crate::hash_node_path(a), "t2"));
-    assert_eq!(tree.tenant_char_size(&tenant("t2")), a.chars().count());
+    // The split left `a` on two nodes.
+    assert_eq!(
+        tree.tenant_char_size(&tenant("t2")),
+        a.chars().count() + 2 * NODE_WEIGHT
+    );
     let matched = tree.match_prefix_with_counts(a);
     assert_eq!(matched.matched_char_count, a.chars().count());
     assert!(matched.matched_tenants.iter().any(|t| &**t == "t2"));
@@ -2713,7 +2753,7 @@ fn test_remove_tenant_all_beside_inserts_keeps_texts_counted() {
                 done.store(true, Ordering::Relaxed);
                 panic!("no purge ran beside 50 inserts");
             }
-            if tree.tenant_char_size(&purged) < 500 * 64 {
+            if tree.tenant_char_size(&purged) < 500 * (64 + NODE_WEIGHT) {
                 thread::yield_now();
                 continue;
             }
@@ -2726,15 +2766,17 @@ fn test_remove_tenant_all_beside_inserts_keeps_texts_counted() {
         done.store(true, Ordering::Relaxed);
     });
 
-    // At rest. The root's own entry is no text.
+    // At rest. The root's own entry is no text and counts no weight; every
+    // other entry is one text on a node of its own.
     let standing: usize = tree
         .iter_entries()
-        .map(|(text, _)| text.chars().count())
+        .filter(|(text, _)| !text.is_empty())
+        .map(|(text, _)| text.chars().count() + NODE_WEIGHT)
         .sum();
     let counted = tree.tenant_char_size(&purged);
     assert!(
         counted >= standing,
-        "{standing} chars stand in the tree, {counted} are counted"
+        "{standing} stand in the tree, {counted} are counted"
     );
 }
 
