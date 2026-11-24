@@ -412,7 +412,8 @@ impl Affinity {
     /// The workers that stand, said whole behind a read of the host's
     /// registry: every record forgets each worker it holds a place for
     /// that is not among them, so a worker whose leave was never told
-    /// keeps no place. Takes what [`Self::forget`] takes.
+    /// keeps no place. Takes what [`Self::forget`] takes. A store that
+    /// took its membership whole says them too.
     pub(super) fn keep(&self, standing: &[WorkerId]) {
         self.leaves.fetch_add(1, Ordering::Relaxed);
         let standing: FxHashSet<WorkerId> = standing.iter().copied().collect();
@@ -481,6 +482,18 @@ impl Affinity {
         self.left_out.load(Ordering::Relaxed) + records.values().map(left_out).sum::<u64>()
     }
 
+    /// The workers each record holds a place for, by its model, for the
+    /// cases of a served controller.
+    #[cfg(all(test, feature = "controller"))]
+    pub(crate) fn held(&self) -> Vec<(Box<str>, Vec<WorkerId>)> {
+        let records = self.records.lock();
+        let held = |record: &Arc<PrefixRecord>| record.predictor.read().held().collect();
+        records
+            .iter()
+            .map(|(model, record)| (model.clone(), held(record)))
+            .collect()
+    }
+
     /// The record of `model`, made at its first asking and held to `bound`
     /// placements of token blocks, or to `max_size` bytes where it counts
     /// text ([`PrefixRecord::hold`]).
@@ -526,7 +539,8 @@ struct PrefixRecord {
     swept: AtomicUsize,
     /// The placements the running cut has still to take out: what the
     /// record held over [`Self::swept`] at the timer's `sweep_s`th turn. A
-    /// write behind that turn adds nothing to it. The timer alone writes it.
+    /// write behind that turn adds nothing to it, and it ends where the
+    /// record stands at that figure. The timer alone writes it.
     owed: AtomicUsize,
     /// The share of [`Self::owed`] a turn of the timer takes out: the whole
     /// of it is out before the next cut is counted.
@@ -651,9 +665,15 @@ impl PrefixRecord {
     }
 
     /// The timer's turn, once a second, under the map's mutex. Every
-    /// `sweep_s` turns what the record holds over [`Self::swept`] is owed,
-    /// a turn's share of it at a time. Whether a cut is owed.
+    /// `sweep_s` turns what a record of text holds over [`Self::swept`] is
+    /// owed, a turn's share of it at a time. A record of token blocks is
+    /// held at every write, and one no request read holds nothing: neither
+    /// counts a turn. Whether a cut is owed.
     fn timed(&self) -> bool {
+        let unit = self.window.load(Ordering::Relaxed);
+        if unit == Self::UNREAD || unit == Self::TOKENS {
+            return false;
+        }
         let every = self.sweep_s.load(Ordering::Relaxed).max(1);
         let turns = self.turns.load(Ordering::Relaxed).saturating_add(1);
         if turns < every {
@@ -671,9 +691,18 @@ impl PrefixRecord {
 
     /// A turn's share of the cut, on the timer's thread and outside the
     /// map's mutex: the oldest ends leave, a sweep's step at a time, and
-    /// the lock is given to a waiting decider between two steps. The bound
-    /// comes down only while a step holds the guard, so no write meets it
-    /// and no request pays for a cut.
+    /// no step is taken where the record stands at [`Self::swept`] or
+    /// under it. A block leaves with every worker sent it, as at a write
+    /// that makes room, so the last step can end under the figure by that
+    /// block's workers less one. The placements that left another way
+    /// since the count, behind a worker's leave or a bound that moved, are
+    /// not taken again from what stays: the debt ends where nothing stands
+    /// over the figure. A decider that waits to read the record is
+    /// given the lock between two steps. A decider's write waits for no
+    /// lock, so one that meets a step is left out as one that meets
+    /// another write is ([`Self::left_out`]). The bound comes down only
+    /// while a step holds the guard, so no write meets it and none makes
+    /// room for a cut.
     fn cut(&self) {
         let owed = self.owed.load(Ordering::Relaxed);
         let mut share = self.pace.load(Ordering::Relaxed).min(owed);
@@ -681,7 +710,14 @@ impl PrefixRecord {
         let mut predictor = self.predictor.write();
         while share != 0 {
             let (ceiling, held) = (predictor.bound(), predictor.len());
-            let step = share.min(Self::SWEEP);
+            // The figure is read at every step: a table's read moves it
+            // between two.
+            let over = held.saturating_sub(self.swept.load(Ordering::Relaxed));
+            if over == 0 {
+                paid = owed;
+                break;
+            }
+            let step = share.min(Self::SWEEP).min(over);
             predictor.set_bound(held.saturating_sub(step).min(ceiling));
             let steps = predictor.sweep(Self::SWEEP);
             predictor.set_bound(ceiling);
@@ -2002,19 +2038,12 @@ impl Table {
             );
         }
         let read = self.name(facts, places, buffers);
-        let named = AffinityRows {
-            holders: &buffers.holders,
-            warming: &buffers.warming,
-            thin: self.ruled.thin,
-            mean_in_flight: None,
-        };
+        let named = self.named_rows(buffers);
         let mut decision = decide(&mut RequestFacts {
             named: Some(named),
             ..*facts
         });
-        if self.states {
-            state(&mut decision, Feed::Named(named), facts, self.block);
-        }
+        self.state_named(&mut decision, named, facts);
         let (Some(read), Some(record)) = (read, self.record.as_deref()) else {
             return decision;
         };
@@ -2029,6 +2058,37 @@ impl Table {
             record.write(&buffers.keys, read, held, target.id);
         }
         decision
+    }
+
+    /// The rows named into `buffers`, as a decision is handed them in the
+    /// affinity column's place.
+    fn named_rows<'b>(&self, buffers: &'b Buffers) -> AffinityRows<'b> {
+        AffinityRows {
+            holders: &buffers.holders,
+            warming: &buffers.warming,
+            thin: self.ruled.thin,
+            mean_in_flight: None,
+        }
+    }
+
+    /// States the pick of a decision made over `named` rows: its first
+    /// target's entry of them ([`state`]), where the request's own profile
+    /// reads affinity. One function for the two paths that name rows, the
+    /// table's own naming ([`Self::name`]) and a tree's match
+    /// ([`Self::name_sent`]), so both state by one rule.
+    // Each path makes its decision in its own place and states it there:
+    // handed back by one function that also decides, a decision over the
+    // table's own rows costs a copy more, 30 instructions, counted with
+    // Callgrind.
+    fn state_named(
+        &self,
+        decision: &mut Decision,
+        named: AffinityRows<'_>,
+        facts: &RequestFacts<'_>,
+    ) {
+        if self.states {
+            state(decision, Feed::Named(named), facts, self.block);
+        }
     }
 
     /// How many of the request's blocks a token tree's match of `tokens`
@@ -2072,19 +2132,12 @@ impl Table {
     ) -> Decision {
         let mut decide_over = |holders: &[TenantId], blocks: u32| {
             self.name_sent(holders, blocks, workers, facts, places, buffers);
-            let named = AffinityRows {
-                holders: &buffers.holders,
-                warming: &buffers.warming,
-                thin: self.ruled.thin,
-                mean_in_flight: None,
-            };
+            let named = self.named_rows(buffers);
             let mut decision = decide(&mut RequestFacts {
                 named: Some(named),
                 ..*facts
             });
-            if self.states {
-                state(&mut decision, Feed::Named(named), facts, self.block);
-            }
+            self.state_named(&mut decision, named, facts);
             decision
         };
         let mut decided = None;

@@ -11,11 +11,13 @@ use metrics_exporter_prometheus::{
     DistributionBuilder, Matcher, PrometheusBuilder, PrometheusHandle,
 };
 use metrics_util::parse_quantiles;
+use parking_lot::Mutex;
 use smg_external_router::metrics::Metrics as RouterMetrics;
 pub use smg_external_router::metrics::{
     bool_to_static_str, error_reason_from_status, intern_model_label, intern_tool_label,
     metrics_labels, STREAMING_FALSE, STREAMING_TRUE,
 };
+use smg_policy_controller::engine::{PolicyEngine, ShadowKind, ShadowSide};
 use smg_worker::metrics::{
     series as worker_series,
     series::{WorkerSeries, WorkerSeriesRecorder},
@@ -877,9 +879,19 @@ pub(crate) fn init_metrics() {
         "Policy bookings released at the per-poll in-flight reconciliation because their \
          completion never arrived, by policy"
     );
+    describe_counter!(
+        "smg_policy_shadow_decisions_total",
+        "Shadow decisions of the policy engine beside live ones, by the binding's place in the \
+         policy document from 0 (15 stands for every binding from the sixteenth on), by the side \
+         the shadow is asked beside (single, prefill, decode, decode-again) and by kind \
+         (agreed, other-target, other-outcome, skipped); a shadow that panicked is not counted"
+    );
     describe_histogram!(
         "smg_cache_aware_match_ratio",
-        "The predicted overlap of a cache-aware routing decision as a ratio (0..1), one observation per decision: in tree mode the best prefix match in the tree (matched/input units, whatever branch the decision took); in event mode the chosen worker's overlap in blocks over the request's blocks (0 where the chosen worker holds none: a miss, a spill, a warm-up placement)"
+        "The predicted overlap of a cache-aware routing decision as a ratio (0..1), one observation per decision: in tree mode the best prefix match in the tree (matched/input units, whatever branch the decision took); in event mode the chosen worker's overlap in blocks over the request's blocks (0 where the chosen worker holds none: a miss, a spill, a warm-up placement). \
+         With --policy-controller on: the share of the request's blocks that the policy \
+         engine's placement states the chosen worker holds, one observation per placement \
+         that states a share"
     );
 
     // Layer 3: Worker resilience metrics (retry)
@@ -1110,6 +1122,53 @@ pub(super) fn record_tokenizer_encode_activity() {
     for stats in encode_fallbacks() {
         counter!("smg_tokenizer_encode_fallbacks_total", "reason" => stats.reason)
             .absolute(stats.encodes);
+    }
+}
+
+/// What the scrapes so far published of the policy engine's shadow counts
+/// ([`record_policy_shadow_activity`]), under one lock.
+#[derive(Default)]
+pub(super) struct ShadowsPublished(Mutex<LastRead>);
+
+/// The number of the policy document the shadow counts were last read
+/// under, and each count as it was read then, by its binding's place, its
+/// side and its kind.
+#[derive(Default)]
+struct LastRead {
+    document: u64,
+    counts: HashMap<(u32, ShadowSide, ShadowKind), u64>,
+}
+
+/// Publish the shadow decisions `engine` counted, read at the scrape and on
+/// no request's path: every binding that names a shadow, by its place in the
+/// policy document, by the side the shadow is asked beside and by kind, as a
+/// zero series from the first scrape. Each count's growth since the last
+/// scrape is added, and a count read under another policy document is added
+/// whole: a document put in force later starts its counts at zero, and a
+/// series set to such a count would stand still until the new count passed
+/// the old one. What the document before it counted behind its last scrape
+/// is not published. The read and the adds are one turn of `published`'s
+/// lock, so two scrapes at once add a growth once.
+pub(super) fn record_policy_shadow_activity(engine: &PolicyEngine, published: &ShadowsPublished) {
+    let mut published = published.0.lock();
+    let mut counts = Vec::new();
+    let read_under = engine.shadow_counts(|count| counts.push(count));
+    if published.document != read_under {
+        published.document = read_under;
+        published.counts.clear();
+    }
+    for count in counts {
+        let key = (count.binding, count.side, count.kind);
+        let last = published.counts.entry(key).or_default();
+        let grew = count.count.saturating_sub(*last);
+        *last = count.count;
+        counter!(
+            "smg_policy_shadow_decisions_total",
+            "binding" => count.binding.to_string(),
+            "side" => count.side.as_str(),
+            "kind" => count.kind.as_str()
+        )
+        .increment(grew);
     }
 }
 
@@ -2434,7 +2493,9 @@ impl Metrics {
 
     /// Record the predicted overlap ratio (0..1) of a cache-aware routing
     /// decision: the tree's best prefix match in tree mode, the chosen
-    /// worker's overlap over the request's blocks in event mode.
+    /// worker's overlap over the request's blocks in event mode. Where the
+    /// policy engine decides, the share of the request's blocks that its
+    /// placement states the chosen worker holds.
     pub fn record_cache_aware_match_ratio(ratio: f64) {
         handles::with_single(
             &handles::CACHE_AWARE_MATCH_RATIO,
@@ -2499,6 +2560,7 @@ pub(crate) mod test_support {
     use std::sync::OnceLock;
 
     use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+    use smg_policy_controller::document::{AppliedSpec, PolicySpec, ShadowSpec};
 
     /// The lib test binary's one process-wide recorder, for records made on
     /// threads no local recorder covers (the blocking pool). Installed once;
@@ -2517,6 +2579,44 @@ pub(crate) mod test_support {
     /// readers of it: the worker's test support owns them.
     pub(crate) use smg_worker::test_support::assert_metric;
     pub(crate) use smg_worker::test_support::{render_with_recorder, sorted_series};
+
+    /// A policy document of two bindings. The first is of another model
+    /// and names no shadow. The second is the `round_robin` preset's, of
+    /// every model, with the `random` preset's profile as its shadow.
+    pub(crate) fn shadowing_document() -> PolicySpec {
+        let preset = |name| PolicySpec::preset(name).expect("a stock preset");
+        let mut document = preset("round_robin");
+        document.profiles.extend(preset("random").profiles);
+        let mut ahead = document.bindings[0].clone();
+        ahead.matcher.model = "another-model".to_owned();
+        document.bindings[0].shadow = Some(ShadowSpec::Profile("random".to_owned()));
+        document.bindings.insert(0, ahead);
+        document
+    }
+
+    /// [`shadowing_document`], as an engine is built from it.
+    pub(crate) fn shadowing_spec() -> AppliedSpec {
+        AppliedSpec::validate(&shadowing_document()).expect("a valid policy document")
+    }
+
+    /// The shadow series of the second binding's single requests in a
+    /// scrape, by kind: agreed, other target, other outcome, skipped.
+    /// `None` where the scrape holds no such series.
+    pub(crate) fn shadow_kinds(rendered: &str) -> [Option<u64>; 4] {
+        ["agreed", "other-target", "other-outcome", "skipped"].map(|kind| {
+            let labels = [
+                r#"binding="1""#,
+                r#"side="single""#,
+                &format!(r#"kind="{kind}""#),
+            ];
+            let of_kind = |line: &&str| {
+                line.starts_with("smg_policy_shadow_decisions_total{")
+                    && labels.iter().all(|label| line.contains(label))
+            };
+            let line = rendered.lines().find(of_kind)?;
+            line.rsplit(' ').next()?.parse().ok()
+        })
+    }
 }
 
 #[cfg(test)]

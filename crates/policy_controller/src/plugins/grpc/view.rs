@@ -252,6 +252,9 @@ fn request(facts: &RequestFacts<'_>, exposure: &Exposure, needs: Needs) -> proto
         // The client's key is the host's and the controller's: no exposure
         // shows it.
         client_key: 0,
+        // Who handed the session key is the host's and the controller's
+        // too: no exposure shows it.
+        session_key_from_rid: false,
     }
 }
 
@@ -1194,6 +1197,39 @@ mod tests {
             Needs::default(),
         );
         assert_eq!(frame.request.expect("the frame's request").client_key, 0);
+    }
+
+    /// A plugin's frame says nothing of who handed its request's session
+    /// key, though the plugin is shown the key: the word is a host's to its
+    /// controller.
+    #[test]
+    fn the_frame_states_no_source_of_its_session_key() {
+        use crate::{
+            document::spec::Needs,
+            engine::view::{Identity, PoolFacts, RequestFacts},
+            plugins::shared::config::{Exposure, Reveal},
+        };
+
+        let facts = RequestFacts {
+            session_key: Identity::plain("req-1"),
+            session_key_from_rid: true,
+            ..RequestFacts::default()
+        };
+        let exposure = Exposure {
+            session_key: Reveal::Plain,
+            ..Exposure::default()
+        };
+        let frame = super::decide(
+            1,
+            &facts,
+            &[],
+            &PoolFacts::default(),
+            &exposure,
+            Needs::default(),
+        );
+        let request = frame.request.expect("the frame's request");
+        assert!(request.session_key.is_some(), "the plugin is shown the key");
+        assert!(!request.session_key_from_rid);
     }
 
     /// The frame carries each candidate's count of the request's session

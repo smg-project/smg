@@ -101,9 +101,12 @@
 //! at a side's phase: a prefill frame, or a decode frame that names no
 //! lease, whose plan pairs no side of its phase. The binding of its own
 //! phase decides it over that phase's list, and its pick is filed a
-//! single's lease. An encode request has no decision over worker lists
-//! yet, and a decode frame that names no lease under a plan that pairs it
-//! has none at all: each is answered `Busy` with no reason, and its
+//! single's lease. An encode request that carries its items is decided
+//! here too, as its pair's one request: for both sides and for each
+//! item's encoder, with its pair's leases and none for an encoder. A frame
+//! of the encode phase that carries no items has no decision over worker
+//! lists, and a decode frame that names no lease under a plan that pairs
+//! it has none at all: each is answered `Busy` with no reason, and its
 //! gateway decides it. A decode call its lease refuses is
 //! answered `Busy` under that refusal's own reason: at the call's first
 //! test of the lease, ahead of every stage its decision runs, or at its
@@ -963,13 +966,21 @@ impl Deciding {
                 if lease.is_some_and(|leased| past_mark(leased.lease.id) && leased.minted()) {
                     self.marked = Some(term);
                 }
+                // An encode request's pick leaves with where its items go,
+                // as its decision left it on this thread.
+                let (id, encode) = if request.carries_items() {
+                    self.frames.answered(request, &decision)
+                } else {
+                    (request.into_id(), None)
+                };
                 // The decision leaves as it was made: its stream builds
                 // the frame where it sends it.
                 wire::Decided::Decision {
-                    id: request.into_id(),
+                    id,
                     term,
                     decision,
                     lease,
+                    encode,
                 }
             }
             Ok(Err(reason)) => {
@@ -1096,11 +1107,13 @@ impl Deciding {
         let (term, taken) = judged?;
         // A single request, a pair at its prefill, a decode call behind a
         // pair's held prefill and a prefill or a decode frame that stands
-        // alone have a decision over worker lists. An encode request has
-        // none yet: it is answered `Busy` with no reason before anything
-        // is read for it, and its gateway decides it locally. A frame that
-        // names a lease is read at the decode phase, so a single request
-        // and a prefill are asked for none.
+        // alone have a decision over worker lists. So has an encode
+        // request that carries its items: it is read at the prefill phase,
+        // as its pair's one request. A frame of the encode phase that
+        // carries none has no decision: it is answered `Busy` with no
+        // reason before anything is read for it, and its gateway decides
+        // it locally. A frame that names a lease is read at the decode
+        // phase, so a single request and a prefill are asked for none.
         let entry = match request.phase() {
             Phase::Single => Entry::Single,
             Phase::Prefill => Entry::Prefill,
@@ -1329,7 +1342,9 @@ enum Entry {
     /// A single request.
     Single,
     /// A prefill frame: a pair's one request where its plan pairs, and a
-    /// frame that stands alone where it pairs no side.
+    /// frame that stands alone where it pairs no side. An encode request
+    /// that carries its items is read as one, and is its pair's one
+    /// request under any plan.
     Prefill,
     /// The decode call that names this lease.
     Decode(LeaseId),
@@ -1368,6 +1383,13 @@ enum FiledBeside {
 /// A prefill whose model's plan pairs no side stands alone
 /// ([`stands_alone`]).
 ///
+/// An encode request that carries its items is such a frame under any
+/// plan: decided for its pair and for each item's encoder
+/// ([`frame_decision::decide_encode`]) and issued as a pair is, with no
+/// lease for an encoder. It never stands alone, so no frame with items is
+/// decided without them: under a plan with no encode side the engine
+/// declines it.
+///
 /// Out of line: a single's decision carries no part of a pair's.
 #[inline(never)]
 fn prefill(
@@ -1379,10 +1401,12 @@ fn prefill(
     (frames, loads, own): (&mut FrameBuffers, &Arc<LoadSnapshot>, &Part),
     caught: &mut bool,
 ) -> Result<(Decision, Filed, FiledBeside), Reason> {
-    if !world
-        .spec()
-        .engine()
-        .pairs(taken.request.model(), Phase::Prefill)
+    let encode = taken.request.carries_items();
+    if !encode
+        && !world
+            .spec()
+            .engine()
+            .pairs(taken.request.model(), Phase::Prefill)
     {
         return stands_alone(
             store,
@@ -1394,7 +1418,11 @@ fn prefill(
             caught,
         );
     }
-    let decided = frame_decision::decide_pair(world, objects, taken, frames, loads, own);
+    let decided = if encode {
+        frame_decision::decide_encode(world, objects, taken, frames, loads, own)
+    } else {
+        frame_decision::decide_pair(world, objects, taken, frames, loads, own)
+    };
     let (decision, booked) = made(decided, caught)?;
     let (filed, beside) =
         match frame_decision::issue_pair(store, world, taken, term, &decision, booked) {
@@ -1577,6 +1605,7 @@ pub(crate) mod tests {
     use smg_worker::load::state::{one_rank_load, LoadReceiver, LoadSnapshot};
     use tokio::{
         sync::{mpsc, watch},
+        task::JoinSet,
         time::timeout,
     };
 
@@ -1622,6 +1651,8 @@ pub(crate) mod tests {
         tracking::lease::{Dispatch, Lease, LeaseId, ReleaseReason, Said, Side, DISPATCH_TTL},
         worker_host::{stand, Members, Objects},
     };
+
+    pub(crate) mod encode;
 
     /// How long a case waits for a decider before it fails.
     pub(crate) const PATIENCE: Duration = Duration::from_secs(20);
@@ -1946,6 +1977,16 @@ pub(crate) mod tests {
         frame_for(MODEL, id, seed)
     }
 
+    /// [`frame`] with a prompt of eight hashed blocks, the same for every
+    /// id and seed.
+    pub(crate) fn hashed(id: u8, seed: u64) -> proto::DecideRequest {
+        let mut frame = frame(id, seed);
+        let facts = frame.facts.as_mut().expect("the case's frame has facts");
+        facts.block_hashes = (1..=8).collect();
+        facts.prompt_tokens = 8 * 16;
+        frame
+    }
+
     /// `frame` with `budget` in place of the case's.
     fn budgeted(mut frame: proto::DecideRequest, budget: Duration) -> proto::DecideRequest {
         let facts = frame.facts.as_mut().expect("the case's frame has facts");
@@ -2071,7 +2112,7 @@ pub(crate) mod tests {
                 let decided = front.decide_without_lease(&maker, self.script.taken);
                 decided.expect("the engine decides").0
             });
-            wire::decided(frame.request_id.clone(), term, &decision, None)
+            wire::decided(frame.request_id.clone(), term, &decision, None, None)
         }
     }
 
@@ -2664,7 +2705,7 @@ pub(crate) mod tests {
                     }
                     decision
                 });
-                let made = wire::decided(vec![id], 1, &made, None);
+                let made = wire::decided(vec![id], 1, &made, None, None);
                 assert_eq!(said(&served), said(&made), "{name}, request {id}");
             }
         }
@@ -2676,18 +2717,11 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_served_request_lands_where_its_prefix_was_sent() {
         let mut bed = bed(Some(preset("cache_aware", 1)), true, (1, 8), []);
-        let asked = |id: u8, seed: u64| {
-            let mut frame = frame(id, seed);
-            let facts = frame.facts.as_mut().expect("the case's frame has facts");
-            facts.block_hashes = (1..=8).collect();
-            facts.prompt_tokens = 8 * 16;
-            frame
-        };
-        let sent = picked(&bed.ask(asked(1, 100)).await);
+        let sent = picked(&bed.ask(hashed(1, 100)).await);
         // Each lease on file books its worker: load alone would send the
         // next request to another.
         for (id, seed) in (2..=4).zip(101..) {
-            let returned = picked(&bed.ask(asked(id, seed)).await);
+            let returned = picked(&bed.ask(hashed(id, seed)).await);
             assert_eq!(returned, sent, "request {id}");
         }
     }
@@ -2698,20 +2732,13 @@ pub(crate) mod tests {
     /// stays, and the next request with that prefix follows it.
     #[tokio::test]
     async fn a_decision_that_leaves_as_busy_keeps_its_prefix_for_the_next_request() {
-        let asked = |id: u8, seed: u64| {
-            let mut frame = frame(id, seed);
-            let facts = frame.facts.as_mut().expect("the case's frame has facts");
-            facts.block_hashes = (1..=8).collect();
-            facts.prompt_tokens = 8 * 16;
-            frame
-        };
         let fresh = |steps: Vec<Step>| bed(Some(preset("cache_aware", 1)), true, (1, 8), steps);
         // Where the late request lands, and a second request that lands
         // elsewhere as the first of its prefix, each on a bed of its own.
-        let late = picked(&fresh(Vec::new()).ask(asked(1, 100)).await);
+        let late = picked(&fresh(Vec::new()).ask(hashed(1, 100)).await);
         let mut elsewhere = None;
         for seed in 101..=132 {
-            if picked(&fresh(Vec::new()).ask(asked(2, seed)).await) != late {
+            if picked(&fresh(Vec::new()).ask(hashed(2, seed)).await) != late {
                 elsewhere = Some(seed);
                 break;
             }
@@ -2722,11 +2749,118 @@ pub(crate) mod tests {
         // the first's instant again.
         let steps = [Duration::ZERO, BUDGET, Duration::ZERO].map(Step::At);
         let mut bed = fresh(steps.into());
-        let answer = bed.ask(asked(1, 100)).await;
+        let answer = bed.ask(hashed(1, 100)).await;
         assert_eq!(busy(&answer), Reason::BudgetGoneOnArrival);
         assert_eq!(bed.store.live(GATEWAY), 0);
-        let next = picked(&bed.ask(asked(2, seed)).await);
+        let next = picked(&bed.ask(hashed(2, seed)).await);
         assert_eq!(next, late, "the late decision's entry is followed");
+    }
+
+    /// The workers the engine's record of the prefixes sent for [`MODEL`]
+    /// holds a place for, in the bed's store: `None` where the engine keeps
+    /// no record of the model.
+    fn sent_prefixes(bed: &Bed) -> Option<Vec<WorkerId>> {
+        let held = bed.store.deciding(|world| world.front().affinity().held());
+        let of_model = |(model, _): &(Box<str>, _)| **model == *MODEL;
+        held.into_iter().find(of_model).map(|(_, workers)| workers)
+    }
+
+    /// The bed under the `cache_aware` preset behind one request of a hashed
+    /// prompt, with the worker the request was sent to and the facts that
+    /// worker is registered under: the model's record holds a place for
+    /// that worker alone.
+    async fn sent_one_prefix() -> (Bed, WorkerId, WorkerFacts) {
+        let mut bed = bed(Some(preset("cache_aware", 1)), true, (1, 8), []);
+        let sent = picked(&bed.ask(hashed(1, 100)).await);
+        assert_eq!(sent_prefixes(&bed), Some(vec![sent]));
+        let row = WorkersStore::get(&*bed.store, sent).expect("the row");
+        (bed, sent, row.facts)
+    }
+
+    /// A served engine's records of sent prefixes hear the store's word of
+    /// a replacement. A key registered again under a new incarnation is a
+    /// new id, and the records keep no place for the id that went.
+    #[tokio::test]
+    async fn the_sent_prefixes_of_a_replaced_incarnation_are_forgotten() {
+        let (bed, sent, facts) = sent_one_prefix().await;
+        let next = WorkerFacts {
+            incarnation: facts.incarnation + 1,
+            ..facts
+        };
+        let replaced = bed.store.upsert(next).id();
+        assert_ne!(replaced, sent, "a new incarnation is a new id");
+        assert_eq!(sent_prefixes(&bed), Some(Vec::new()));
+    }
+
+    /// The records hear the store's word of a worker that stands under its
+    /// id and serves a model no more. A registration that keeps the
+    /// worker's models keeps what the worker was sent, whether it changes a
+    /// limit of the worker or its width. One that takes the model off
+    /// leaves the records no place for the worker.
+    #[tokio::test]
+    async fn the_sent_prefixes_of_a_worker_that_left_its_model_are_forgotten() {
+        let (bed, sent, facts) = sent_one_prefix().await;
+        let relabelled = WorkerFacts {
+            max_running: Some(8),
+            ..facts.clone()
+        };
+        let resized = WorkerFacts {
+            dp_size: 2,
+            ..facts.clone()
+        };
+        for kept in [relabelled, resized] {
+            assert_eq!(bed.store.upsert(kept).id(), sent);
+            assert_eq!(sent_prefixes(&bed), Some(vec![sent]));
+        }
+        let elsewhere = WorkerFacts {
+            models: vec!["model-b".to_owned()],
+            ..facts
+        };
+        assert_eq!(bed.store.upsert(elsewhere).id(), sent, "the id stands");
+        assert_eq!(sent_prefixes(&bed), Some(Vec::new()));
+    }
+
+    /// The upkeep of a served engine rides the presence sweep's task: that
+    /// engine runs no task of its own. A session key a decision read leaves
+    /// the engine's table by the task's own tick once its idle time ended,
+    /// and no sooner, with no request behind the one that read it.
+    #[tokio::test]
+    async fn the_sweeps_task_takes_a_session_key_out_once_its_idle_time_ended() {
+        let mut document = PolicySpec::preset("manual").expect("a preset of this build");
+        document.generation = 1;
+        let rule = document.bindings[0].sessions.as_mut();
+        let rule = rule.expect("the preset's rule");
+        (rule.ttl_s, rule.sweep_s) = (1, 1);
+        let mut bed = bed(Some(applied(&document)), true, (1, 8), []);
+        let keys = |bed: &Bed| {
+            bed.store
+                .deciding(|world| world.spec().engine().sessions().len())
+        };
+        bed.ask(keyed(1, 1_001)).await;
+        assert_eq!(keys(&bed), 1, "the key its decision read");
+
+        let grace = Duration::from_millis(60);
+        let fence = bed.elector.fence();
+        let gateways = Arc::new(Gateways::new(grace, 1_024, fence, Arc::clone(&bed.store)));
+        let (stop, stopped) = watch::channel(false);
+        let mut task = JoinSet::new();
+        task.spawn(async move { gateways.run(stopped).await });
+        // The decision is dated at the bed's take.
+        let read = bed.script.taken;
+        while keys(&bed) > 0 {
+            assert!(read.elapsed() < PATIENCE, "the task took no key out");
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert!(
+            read.elapsed() >= Duration::from_secs(1),
+            "the key left inside its idle time"
+        );
+        stop.send_replace(true);
+        timeout(PATIENCE, task.join_next())
+            .await
+            .expect("the task ends at its stop")
+            .expect("one task")
+            .expect("it ended by itself");
     }
 
     /// A decision waits in its stream's queue as it was made, with the
@@ -2744,6 +2878,7 @@ pub(crate) mod tests {
             term,
             decision,
             lease: Some(leased),
+            encode: None,
         })) = handed
         else {
             panic!("a decision as it was made, with its lease: {handed:?}");
@@ -2923,6 +3058,127 @@ pub(crate) mod tests {
         );
     }
 
+    /// The worker `frame` takes on `bed`. Its lease is given up where it
+    /// stands, so the request weighs on no later one.
+    async fn placed(bed: &mut Bed, frame: proto::DecideRequest) -> WorkerId {
+        use crate::service::controller::lifecycle::tests::a_released;
+        let answer = bed.ask(frame).await;
+        let released = a_released(lease_of(&answer).id);
+        lifecycle::released(&bed.store, &Hand::new(GATEWAY), &released).expect("the frame reads");
+        picked(&answer)
+    }
+
+    /// A frame says who handed its session key, and the prefix form of a
+    /// ring reads the word. The document is the settings' for `prefix_hash`
+    /// under the sticky override. Twelve keys under one prompt, each
+    /// handed by its request's own id, take the worker a request of that
+    /// prompt takes with no key: the ring places them by the prompt. Twelve
+    /// keys under the same prompt whose frames say nothing lead it, and
+    /// stand on more workers than that one: a header's keys, and every key
+    /// of a gateway older than the field. The id's key names the session
+    /// still: once dispatched, its next request follows its pin under a
+    /// prompt another worker owns.
+    #[tokio::test]
+    async fn the_prefix_ring_places_a_frame_by_its_prompt_where_its_id_handed_the_key() {
+        use crate::{
+            document::{PolicySettings, RoutingKeyOverrideSettings, RoutingSettings},
+            engine::sticky_sessions::SessionVerdict,
+            service::controller::lifecycle::tests::a_dispatched,
+        };
+        let settings = RoutingSettings {
+            policy: PolicySettings::PrefixHash {
+                prefix_token_count: 256,
+                load_factor: 1.25,
+                balance_abs_threshold: 10,
+                cache_boundaries: Vec::new(),
+            },
+            routing_key_override: RoutingKeyOverrideSettings {
+                enabled: true,
+                ..RoutingKeyOverrideSettings::default()
+            },
+            ..RoutingSettings::default()
+        };
+        let mut document = settings.policy_document().expect("the settings' document");
+        document.generation = 1;
+        let mut bed = bed(Some(applied(&document)), true, (1, 8), []);
+        // A frame of four blocks from `prompt` on, sixteen tokens a block,
+        // under `key` where it has one, and `by_id` is the word it says of
+        // that key.
+        let asked = |key: Option<u64>, by_id: bool, prompt: u64, seed: u64| {
+            let mut one = match key {
+                Some(key) => keyed(key.wrapping_mul(0x9e37_79b9_7f4a_7c15), seed),
+                None => frame(u8::try_from(seed % 251).expect("under 251"), seed),
+            };
+            let facts = one.facts.as_mut().expect("the case's frame has facts");
+            facts.block_hashes = (prompt..prompt + 4).collect();
+            facts.prompt_tokens = 64;
+            facts.session_key_from_rid = by_id;
+            one
+        };
+        // Two prompts that two workers own: a request with no key goes by
+        // its prompt.
+        const NEAR: u64 = 1_000;
+        let here = placed(&mut bed, asked(None, false, NEAR, 1)).await;
+        let (mut far, mut there) = (NEAR, here);
+        while there == here {
+            far += 100;
+            assert!(far < 4_000, "every prompt stands on one worker");
+            there = placed(&mut bed, asked(None, false, far, far)).await;
+        }
+        // The requests' own ids handed these keys: each goes where its
+        // prompt goes.
+        for key in 1..=12 {
+            let by_id = placed(&mut bed, asked(Some(key), true, NEAR, 100 + key)).await;
+            assert_eq!(by_id, here, "key {key}");
+        }
+        // These frames say nothing of their keys, and each key leads the
+        // prompt.
+        let mut led = Vec::new();
+        for key in 13..=24 {
+            led.push(placed(&mut bed, asked(Some(key), false, NEAR, 100 + key)).await);
+        }
+        assert!(led.iter().any(|&worker| worker != here), "{led:?}");
+        // An id's key is its session's name: dispatched, it pins its
+        // worker, and its next request follows the pin under the prompt
+        // the other worker owns.
+        let first = bed.ask(asked(Some(25), true, NEAR, 125)).await;
+        assert_eq!(picked(&first), here);
+        let (hand, at) = (Hand::new(GATEWAY), bed.script.taken);
+        lifecycle::dispatched(&bed.store, &hand, &a_dispatched(lease_of(&first).id), at)
+            .expect("the frame reads");
+        let next = bed.ask(asked(Some(25), true, far, 126)).await;
+        assert_eq!(picked(&next), here, "its pin, and not {there:?}");
+        let filed = LeasesStore::get(&*bed.store, GATEWAY, LeaseId(lease_of(&next).id));
+        let filed = filed.expect("the lease is on file").lease;
+        assert_eq!(filed.session_verdict, SessionVerdict::Pinned);
+    }
+
+    /// The plain ring reads no word of who handed a key. Under
+    /// `consistent_hashing` a frame that says its request's own id handed
+    /// its key takes the worker that key takes with nothing said, and the
+    /// keys stand on more than one worker.
+    #[tokio::test]
+    async fn the_plain_ring_places_a_frame_by_its_key_whoever_handed_it() {
+        let mut bed = bed(Some(preset("consistent_hashing", 1)), true, (2, 8), []);
+        let said = |key: u64, by_id: bool| {
+            let mut one = keyed(key.wrapping_mul(0x9e37_79b9_7f4a_7c15), key);
+            let facts = one.facts.as_mut().expect("the case's frame has facts");
+            facts.session_key_from_rid = by_id;
+            one
+        };
+        let mut by_key = Vec::new();
+        for key in 1..=12 {
+            let silent = placed(&mut bed, said(key, false)).await;
+            let by_id = placed(&mut bed, said(key, true)).await;
+            assert_eq!(by_id, silent, "key {key}");
+            by_key.push(silent);
+        }
+        assert!(
+            by_key.windows(2).any(|pair| pair[0] != pair[1]),
+            "{by_key:?}"
+        );
+    }
+
     /// Requests that state no prompt size spread over the members: each
     /// dispatch is its worker's credit at the load stage's mean until that
     /// worker's next report, and each lease states no size.
@@ -3024,9 +3280,19 @@ pub(crate) mod tests {
         sender: &mpsc::Sender<wire::Decided>,
         answers: &mut mpsc::Receiver<wire::Decided>,
     ) -> Vec<Result<u64, Reason>> {
+        burst_of(deciders, sender, answers, frame).await
+    }
+
+    /// [`burst`] of the frames `framed` makes of each request's id and seed.
+    pub(crate) async fn burst_of(
+        deciders: &DecisionSlots,
+        sender: &mpsc::Sender<wire::Decided>,
+        answers: &mut mpsc::Receiver<wire::Decided>,
+        framed: fn(u8, u64) -> proto::DecideRequest,
+    ) -> Vec<Result<u64, Reason>> {
         for id in 0..16 {
             let job = Job {
-                request: checked(frame(id, u64::from(id))),
+                request: checked(framed(id, u64::from(id))),
                 gateway: GATEWAY,
                 received: Instant::now(),
                 answers: sender.clone(),
@@ -5173,10 +5439,11 @@ pub(crate) mod tests {
 
     /// A controller decides a single request, a pair at its prefill and a
     /// decode call. Under a pair plan a request of the decode phase that
-    /// names no lease, and one of the encode phase, have no decision: `Busy` with no
-    /// reason, counted by its cause, never one side's decision and never a
-    /// shed, which is a policy's word. Its gateway decides it. A prompt
-    /// carried as text is never decided as a request with no prefix.
+    /// names no lease, and one of the encode phase that carries no items,
+    /// have no decision: `Busy` with no reason, counted by its cause, never
+    /// one side's decision and never a shed, which is a policy's word. Its
+    /// gateway decides it. A prompt carried as text is never decided as a
+    /// request with no prefix.
     #[tokio::test]
     async fn a_request_of_a_decode_or_an_encode_phase_and_a_prompt_as_text_have_no_decision() {
         let spec = pair_plan(&StageRegistry::builtin(), "random");
@@ -5347,10 +5614,10 @@ pub(crate) mod tests {
     /// of its three single workers. Its pick is filed a single's lease: one
     /// lease of the single side on the wire, one record with no decode side
     /// on file, and its worker booked. Neither frame is counted with the
-    /// sides. An encode frame has no decision under this plan either:
-    /// `Busy` with no reason, counted, and nothing filed. A model that has
-    /// no worker of the frame's role is shed with no endpoint, as a single
-    /// request of a model nobody serves is.
+    /// sides. An encode frame that carries no items has no decision under
+    /// this plan either: `Busy` with no reason, counted, and nothing filed.
+    /// A model that has no worker of the frame's role is shed with no
+    /// endpoint, as a single request of a model nobody serves is.
     #[tokio::test]
     async fn a_prefill_or_a_decode_frame_that_stands_alone_is_decided_over_its_own_phases_list() {
         let mut bed = leading([]);

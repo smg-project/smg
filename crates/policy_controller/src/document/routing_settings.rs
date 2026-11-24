@@ -2041,8 +2041,9 @@ fn key_sources(
 ///   This crate's ring does the same in a gateway's own process, where
 ///   the one call says that a key is the id's
 ///   ([`RequestFacts::session_key_from_rid`](crate::engine::RequestFacts::session_key_from_rid)).
-///   No frame says it: a served controller's ring places a request by
-///   the key its id handed.
+///   A gateway's frame says it to a served controller. The frame of a
+///   host older than that field says nothing, and its controller's ring
+///   places the request by the key its id handed.
 /// - `random` draws.
 /// - `round_robin` takes turns. The gateway asks one policy object for a
 ///   request with no key, for a key's first request and for a key at its

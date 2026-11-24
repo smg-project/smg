@@ -144,7 +144,8 @@ impl LoadMonitor {
     /// that stands has ended then, a poll in flight with its task. The
     /// snapshot is published empty and every overload verdict is off the
     /// objects. The monitor keeps nothing that a stream's records filed,
-    /// no rank of a report and no publish that waited for its window: the
+    /// no rank of a report and no publish that waited for its window, and
+    /// no object stays marked as a worker whose stream pushes: the
     /// next lead starts each worker from no report. So a replica that does
     /// not lead dials no engine for its load, and the next lead's start
     /// comes behind the last poll. This task alone starts and stops the
@@ -667,8 +668,9 @@ mod tests {
     /// tasks is dropped: the streams are shut out ahead of the stop. The
     /// record comes where the stop drops a poll in flight. Handed on there,
     /// it would start a publishing task that the stop no longer ends and
-    /// mark its worker as one whose stream pushes. The stop's eviction
-    /// takes such a record's report, and neither the task nor the mark.
+    /// mark its worker as one whose stream pushes. The stop takes such a
+    /// record's report and its mark, and not the task: the mark is read
+    /// where the record came.
     #[tokio::test(start_paused = true)]
     async fn a_load_record_inside_the_stop_is_dropped() {
         let mut replica = Replica::new();
@@ -692,19 +694,25 @@ mod tests {
         let pushed = Arc::clone(&replica.pushed);
         let registry = replica.workers.objects().registry();
         let object = registry.get_by_url(A).expect("the row's object");
+        // Whether the object was marked where the record came.
+        let marked = Arc::new(parking_lot::Mutex::new(None));
+        let at_record = Arc::clone(&marked);
         *replica.engine.at_cut.lock() = Some(AtCut(Box::new(move || {
             let record = EngineLoad {
                 waiting_requests: 9,
                 ..EngineLoad::default()
             };
             Arc::clone(&pushed).push_load(&object, 0, &record, Instant::now());
+            let state = object.runtime_state();
+            *at_record.lock() = Some(state.is_some_and(|state| state.pushes_load_records()));
         })));
         replica.role.send_replace(None);
         time::sleep(EVERY).await;
         assert_eq!(replica.waiting(A), None, "a record landed inside the stop");
         assert!(!replica.overloaded(A), "a verdict stands behind the stop");
-        assert!(
-            !replica.pushes(A),
+        assert_eq!(
+            *marked.lock(),
+            Some(false),
             "the monitor took a record inside the stop"
         );
         // The step holds the sink, and the engine holds the step.
@@ -715,7 +723,8 @@ mod tests {
     /// Nothing that a stream filed under one lead is published under a later
     /// one. Under the first lead B's rank 1 pushed and was published, and
     /// A's record came inside the lead's last publish window: it is still
-    /// queued where the lead ends. The monitor's stop evicts both files.
+    /// queued where the lead ends. The monitor's stop evicts both files,
+    /// and takes the mark of a stream that pushes off both objects.
     /// The next lead's first window, which B's rank 0 opens while no poll
     /// has answered yet, publishes that record alone: no rank of B's from
     /// the earlier lead, and no report of A. C never pushes: its poll goes
@@ -746,6 +755,10 @@ mod tests {
         assert!(
             comes(|| replica.waiting(A).is_none() && replica.waiting(B).is_none()).await,
             "the lead's end empties the snapshot"
+        );
+        assert!(
+            !replica.pushes(A) && !replica.pushes(B),
+            "an object is marked behind the lead's end"
         );
 
         // The next lead's polls are answered late, so none lays over a

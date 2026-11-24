@@ -26,14 +26,12 @@ use crate::{
     document::spec::AppliedSpec,
     engine::{
         decision_engine::DecodeRefused,
-        prompt_hashes::{block_size_and_depth, HashSeeds, PromptHashes},
         view::{LoadRow, Session, WorkerId, LOAD_REPORT_CLOCK_HISTORY_MS},
     },
-    stages::lifecycle::Lifecycle,
     store::{
         applied::Applied,
         health::{HealthSink, VetoWrite},
-        index::{indexed_under, KvEvent, KvTables, LaneCounts, LaneWriter},
+        index::{indexed_under, KvTables, LaneWriter},
         journal::{Journal, Position},
         kv_events::{BatchFacts, BatchOutcome, KvCursor, KvEventSink, ResyncReason},
         leases::{
@@ -912,8 +910,7 @@ impl MemoryStore {
     }
 
     /// The snapshot as the last publication left it, taken through no lock.
-    /// Its identity moves with every publication: [`StoreSnapshot::epoch`] says
-    /// whether the membership moved.
+    /// Its identity moves with every publication.
     ///
     /// This door hands an owned pointer, for a reader that keeps a world
     /// across calls. Taking it and dropping it each write the count every
@@ -950,28 +947,6 @@ impl MemoryStore {
     /// returns.
     pub fn deciding<R>(&self, decide: impl FnOnce(&StoreSnapshot) -> R) -> R {
         decide(&self.world.load())
-    }
-
-    /// The block hashes of a request's prompt for `model`: those of its
-    /// token ids where the caller holds them, else those of its text, else
-    /// none ([`PromptHashes::under_document`]). The document is the
-    /// generation in force, and the block size of record is the one the
-    /// model's workers reported here.
-    ///
-    /// A caller hashes a request once and calls this on its request path.
-    /// The block size is read under the cache index's lock, the one lock
-    /// this takes. The world is borrowed for the two reads alone, and the
-    /// hashing runs after it. A request with no prompt reads nothing.
-    pub fn prompt_hashes(
-        &self,
-        model: &str,
-        tokens: Option<&[u32]>,
-        text: Option<&str>,
-        seeds: HashSeeds,
-    ) -> PromptHashes {
-        PromptHashes::of_prompt(tokens, text, seeds, |kind| {
-            self.deciding(|world| block_size_and_depth(world.spec(), self.block_size(model), kind))
-        })
     }
 
     /// `at` in the rows' clock: microseconds since the store's origin.
@@ -1012,7 +987,7 @@ impl MemoryStore {
     /// Tell the engine of the world the store shows one membership word:
     /// under the workers lock, with the load lock let go.
     fn tell_engine(&self, word: &Membership<'_>) {
-        self.world.load().spec().engine().on_membership(word);
+        self.world.load().applied().on_membership(word);
     }
 
     /// Tell the standing generation's engine what `change` is to it
@@ -1026,9 +1001,10 @@ impl MemoryStore {
     /// returns, whoever wrote. A join is told when the store takes it, and
     /// the world that lists its row follows at its window's build. A
     /// decision takes neither lock and meets the call at a stage's own lock
-    /// alone. One that read its world before a leave's swap may still name
-    /// the worker: a stage answers that from its own state, as the ring
-    /// fences a pruned id ([`crate::stages::RETIRED_WORKER_TTL`]).
+    /// or at a record of sent prefixes' own, and nowhere else. One that
+    /// read its world before a leave's swap may still name the worker: a
+    /// stage answers that from its own state, as the ring fences a pruned
+    /// id ([`crate::stages::RETIRED_WORKER_TTL`]).
     fn tell_membership(&self, change: MembershipChange) {
         if let Some(change) = change.as_lifecycle() {
             self.tell_engine(&change);
@@ -1384,13 +1360,6 @@ impl MemoryStore {
     /// the store does not index.
     pub fn indexed_blocks(&self, id: WorkerId, rank: u16) -> usize {
         self.kv.indexed_blocks(id, rank)
-    }
-
-    /// What the lane of `id` at `rank` counted beside its blocks, over its
-    /// typed batches; `None` for a row the store does not index. A batch
-    /// lent to a body moves none of them.
-    pub fn lane_counts(&self, id: WorkerId, rank: u16) -> Option<LaneCounts> {
-        self.kv.counts(id, rank)
     }
 
     /// Rows that ask for events and hold no lane. Each was written while
@@ -2522,21 +2491,6 @@ impl LoadSink for MemoryStore {
 // -------------------------------------------------------------- KV events
 
 impl KvEventSink for MemoryStore {
-    /// The batch's events as its collector decoded them: the store applies
-    /// them to the index of the worker's model
-    /// (`index`).
-    type Batch = [KvEvent];
-
-    fn admit(
-        &self,
-        id: WorkerId,
-        rank: u16,
-        facts: BatchFacts,
-        batch: &Self::Batch,
-    ) -> BatchOutcome {
-        self.kv.admit(id, rank, facts, batch)
-    }
-
     fn admit_through(
         &self,
         id: WorkerId,

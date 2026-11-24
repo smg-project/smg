@@ -131,10 +131,7 @@ use smg_worker::{
 use super::Objects;
 use crate::{
     engine::view::WorkerId,
-    store::{
-        self, ApplyError, ChainBlockMap, KvEvent, LaneWriter, SequenceHash, StoredBlock,
-        WorkerGroups,
-    },
+    store::{self, ApplyError, ChainBlockMap, LaneWriter, SequenceHash, StoredBlock, WorkerGroups},
 };
 
 /// The worker crate's KV event port over a store's KV event sink.
@@ -410,7 +407,7 @@ impl<S: ?Sized> KvAdapter<S> {
 
 impl<S> KvAdapter<S>
 where
-    S: store::KvEventSink<Batch = [KvEvent]> + ?Sized,
+    S: store::KvEventSink + ?Sized,
 {
     /// The state of `row` for a batch on `id`'s stream, and whether the
     /// table keeps it: the stream's own row that no entry is kept of gets a
@@ -551,7 +548,7 @@ where
 
 impl<S> KvEventSink for KvAdapter<S>
 where
-    S: store::KvEventSink<Batch = [KvEvent]> + ?Sized + 'static,
+    S: store::KvEventSink + ?Sized + 'static,
 {
     type Batch = KvEventBatch;
     type Id = WorkerId;
@@ -831,7 +828,7 @@ impl<G, S: ?Sized> KvHost<G, S> {
 impl<G, S> KvEventHost for KvHost<G, S>
 where
     G: Generation,
-    S: store::KvEventSink<Batch = [KvEvent]> + ?Sized + 'static,
+    S: store::KvEventSink + ?Sized + 'static,
 {
     type Sink = KvAdapter<S>;
     type Ticket = Result<WorkerId, SkipReason>;
@@ -935,7 +932,7 @@ mod tests {
     const RANK: u16 = 1;
     const BLOCK_SIZE: u32 = 32;
 
-    type Store = dyn store::KvEventSink<Batch = [KvEvent]>;
+    type Store = dyn store::KvEventSink;
 
     struct Fixture {
         store: Arc<MemoryStore>,
@@ -2000,7 +1997,7 @@ mod tests {
     fn a_cursor_reads_as_the_stores() {
         let f = Fixture::new();
         assert_eq!(f.sink.cursor(f.row, RANK), None);
-        f.store.admit(
+        f.store.admit_through(
             f.row,
             RANK,
             store::BatchFacts {
@@ -2010,16 +2007,16 @@ mod tests {
                     unknown_before: true,
                 }),
             },
-            &[],
+            &mut |_| {},
         );
-        f.store.admit(
+        f.store.admit_through(
             f.row,
             RANK,
             store::BatchFacts {
                 sequence: 43,
                 ..Default::default()
             },
-            &[],
+            &mut |_| {},
         );
         let expected = f.store.cursor(f.row, RANK).expect("the store's cursor");
         assert!(expected.replay_pending && expected.degraded);
@@ -3050,18 +3047,6 @@ mod tests {
     }
 
     impl store::KvEventSink for Clears {
-        type Batch = [KvEvent];
-
-        fn admit(
-            &self,
-            id: WorkerId,
-            rank: u16,
-            facts: store::BatchFacts,
-            batch: &[KvEvent],
-        ) -> store::BatchOutcome {
-            self.store.admit(id, rank, facts, batch)
-        }
-
         fn admit_through(
             &self,
             id: WorkerId,

@@ -32,7 +32,7 @@ use crate::{
         MANUAL_SESSION_HEADER,
     },
     engine::{
-        decision::{Queue, ShadowKind, Shed, Target, Targets, Trace},
+        decision::{Queue, Shed, Target, Targets, Trace},
         decision_engine::{Decided, DecisionEngine},
         framework::{Filter, Picker, Place, PoolWord, Scorer, TieBand, DRAW_FROM},
         list_cell::PublishedList,
@@ -1076,6 +1076,92 @@ fn placing_a_request_asks_the_table_of_names_for_nothing() {
             assert_eq!(placement.profile, name);
         }
         assert_eq!(asked(), before, "{name}");
+    }
+}
+
+/// A placement states what its pick states of the worker the request goes
+/// to ([`Placement::overlap`]): a host observes its cache series from it.
+/// A prompt's first request reads a miss of its blocks. Its next request
+/// reads every block held, by the record of sent prefixes, and a kept
+/// placement says the same. A pick states its first target alone: a request
+/// its route's rule sends to the target behind is stated nothing, though
+/// one decision placed it. Neither is a place one pick decides, nor a pair.
+///
+/// The classic policy observes the share of the worker it chose
+/// (`model_gateway/src/policies/cache_aware.rs:2676-2688`), a pair's sides
+/// each by its own policy.
+#[test]
+fn a_placement_states_what_its_pick_states_of_the_worker_taken() {
+    use crate::engine::decision::{Overlap, OverlapSource};
+
+    let engine = hosted(preset("cache_aware"));
+    let list = pool(4);
+    let members = PublishedList::new(Arc::clone(&list));
+    let tokens: Vec<u32> = (0..256).collect();
+    let prompt = Prompt {
+        tokens: Some(&tokens),
+        ..Prompt::NONE
+    };
+    let mut request = PlaceRequest {
+        prompt,
+        ..PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()))
+    };
+    let first = engine.place(&request).expect("a placement");
+    let of = first.overlap.of;
+    assert_ne!(of, 0, "a miss is stated of the request's blocks");
+    let miss = Overlap {
+        of,
+        ..Overlap::NONE
+    };
+    assert_eq!(first.overlap, miss);
+
+    let again = engine.place(&request).expect("a placement");
+    let held = Overlap {
+        blocks: of,
+        source: OverlapSource::Predictor,
+        ..miss
+    };
+    assert_eq!((again.id(), again.overlap), (first.id(), held));
+    assert_eq!(again.kept().overlap, held, "a kept placement states it too");
+
+    // The rule refuses the prompt's worker: the request goes to the target
+    // behind it, of which the pick states nothing.
+    let holder = first.id();
+    let asked = Cell::new(0);
+    let admits = |worker: &dyn Worker| {
+        asked.set(asked.get() + 1);
+        worker_id(worker) != holder
+    };
+    request.admits = Some(&admits);
+    let moved = engine.place(&request).expect("a placement");
+    assert_ne!(moved.id(), holder);
+    assert_eq!(
+        asked.get(),
+        2,
+        "one decision: its first target, then the next"
+    );
+    assert_eq!(moved.overlap, Overlap::NONE);
+
+    // A place one pick decides reads no row.
+    request.admits = None;
+    let plain = hosted(preset("round_robin"));
+    let placed = plain.place(&request).expect("a placement");
+    assert_eq!(placed.overlap, Overlap::NONE);
+
+    // A pair whose two sides read who holds the prompt: its pick states
+    // none, at the prompt's first request and at its next.
+    let sides = PolicySpec::pair_presets("cache_aware", "cache_aware");
+    let paired = hosted(engine_of(&sides.expect("the pair presets")));
+    let two = PublishedList::new(pool(2));
+    let classes = PartnerClasses::number(2, [&[0_u32, 1][..], &[0, 1][..]]);
+    let pair = PlaceRequest {
+        prompt,
+        ..PlaceRequest::of(MODEL, WorkerLists::Pair(pair_of(&two, &classes)))
+    };
+    for _ in 0..2 {
+        let placement = paired.place(&pair).expect("a pair");
+        assert!(placement.decode.is_some());
+        assert_eq!(placement.overlap, Overlap::NONE);
     }
 }
 
@@ -2183,7 +2269,7 @@ fn a_shadow_of_another_ring_form_is_lent_no_ring() {
     let placement = engine.place(&request).expect("a placement");
     assert!(Arc::ptr_eq(&placement.worker, &list[0]), "the ring's owner");
     // Agreed, another target, another outcome, skipped.
-    let counted = ShadowKind::ALL.map(|kind| engine.shadowed(0, kind));
+    let counted = engine.shadow_kinds(0);
     assert_eq!(counted, [0, 1, 0, 0]);
 }
 
@@ -2249,7 +2335,7 @@ fn a_shadow_is_lent_the_ring_where_it_places_as_its_live_profile_does() {
         let placement = engine.place(&request).expect("a placement");
         assert!(Arc::ptr_eq(&placement.worker, &list[0]), "the ring's owner");
         // Agreed, another target, another outcome, skipped.
-        let counted = ShadowKind::ALL.map(|kind| engine.shadowed(0, kind));
+        let counted = engine.shadow_kinds(0);
         (ring.1.load(atomic::Ordering::Relaxed), counted)
     };
     let (plain, prefix) = ("consistent_hashing", "prefix_hash");
