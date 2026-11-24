@@ -11,11 +11,7 @@
 //! refused by its field's name and writes nothing. A lease the store does
 //! not hold is no error: its dispatch deadline may have ended it, or the
 //! gateway decided that request itself. Nor is a ticket: this build
-//! issues none, so the one a `Released` names is one it does not hold. A
-//! completion is written for a worker the store holds a row for and for
-//! no other, under the stream's own gateway, and a gateway's completions
-//! end with its presence: the health table grows with the rows and with
-//! who is present, never with what a frame names.
+//! issues none, so the one a `Released` names is one it does not hold.
 //!
 //! What a frame says of a lease is handed to the leases' file, never
 //! written by its session ([`MemoryStore::hand`]): the file's decider
@@ -74,10 +70,7 @@ pub(crate) fn dispatched(
     Ok(())
 }
 
-/// A `Completed` frame: the lease's side ends with its outcome, and the
-/// gateway's completion on the worker is written for the health
-/// precedence, whether or not the lease is on file: one routine says
-/// both ([`lease_words::completed`]).
+/// A `Completed` frame: the lease's side ends with its outcome.
 ///
 /// # Errors
 ///
@@ -86,12 +79,9 @@ pub(crate) fn completed(
     store: &MemoryStore,
     hand: &Hand,
     frame: &proto::Completed,
-    now: Instant,
 ) -> Result<(), Status> {
     let (lease, outcome) = outcome(frame)?;
-    lease_words::completed(store, hand.gateway(), &outcome, now, |said| {
-        store.hand(hand, lease, said);
-    });
+    store.hand(hand, lease, Said::Completed(outcome));
     Ok(())
 }
 
@@ -303,8 +293,8 @@ pub(crate) mod tests {
         },
         stages::{lifecycle::Lifecycle, registry::StageRegistry},
         store::{
-            DecodeSide, GatewayId, Hand, HealthSink, LeaseRecord, LeaseState, LeasesStore,
-            MemoryStore, PickRecord, WorkerFacts, WorkersStore,
+            DecodeSide, GatewayId, Hand, LeaseRecord, LeaseState, LeasesStore, MemoryStore,
+            PickRecord, WorkerFacts, WorkersStore,
         },
         tracking::{
             lease::{Dispatch, Lease, LeaseId, Outcome, ReleaseReason, Side, TransportClass},
@@ -493,7 +483,7 @@ pub(crate) mod tests {
         dispatched(&store, &open(&store, A), &a_dispatched(1), t0).expect("the frame reads");
         // The dispatch names the worker the lease books.
         assert_eq!(*heard.lock(), [("dispatched", 1, WorkerId(7))]);
-        completed(&store, &open(&store, A), &a_completed(1, served), t0).expect("the frame reads");
+        completed(&store, &open(&store, A), &a_completed(1, served)).expect("the frame reads");
         released(&store, &open(&store, A), &a_released(2)).expect("the frame reads");
         assert_eq!(
             heard.lock()[1..],
@@ -615,13 +605,8 @@ pub(crate) mod tests {
             ..a_completed(1, served)
         };
         for _ in 0..2 {
-            completed(
-                &store,
-                &open(&store, A),
-                &ended(proto::Side::Prefill, p),
-                now,
-            )
-            .expect("the frame reads");
+            completed(&store, &open(&store, A), &ended(proto::Side::Prefill, p))
+                .expect("the frame reads");
         }
         assert_eq!(heard.lock()[2..], [("completed", 1, p)]);
         // A release with no side ends what stands: the decode alone.
@@ -912,39 +897,13 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_completed_frame_ends_the_lease_and_writes_the_gateways_completion() {
+    fn a_completed_frame_ends_the_lease() {
         let store = MemoryStore::new();
         let t0 = Instant::now();
         let served = worker(&store, "http://a:8000");
         store.issue(lease(A, 1, t0)).expect("a lease");
-        completed(&store, &open(&store, A), &a_completed(1, served), t0).expect("the frame reads");
+        completed(&store, &open(&store, A), &a_completed(1, served)).expect("the frame reads");
         assert_eq!(state(&store, A, 1), None, "the lease ended");
-        assert!(store.completed_ok_since(A, served, t0));
-        assert!(
-            !store.completed_ok_since(B, served, t0),
-            "a completion is its gateway's own"
-        );
-    }
-
-    /// The gateway reports every request, the ones it decided itself among
-    /// them: the completion is a fact of the worker and the gateway.
-    #[test]
-    fn a_completed_frame_for_a_lease_not_on_file_still_writes_the_completion() {
-        let store = MemoryStore::new();
-        let t0 = Instant::now();
-        let served = worker(&store, "http://a:8000");
-        completed(&store, &open(&store, A), &a_completed(9, served), t0).expect("no error");
-        assert!(store.completed_ok_since(A, served, t0));
-    }
-
-    /// The health table grows with the rows, never with what a frame names.
-    #[test]
-    fn a_completion_for_a_worker_on_no_file_writes_nothing() {
-        let store = MemoryStore::new();
-        let t0 = Instant::now();
-        let gone = WorkerId(999_999);
-        completed(&store, &open(&store, A), &a_completed(9, gone), t0).expect("no error");
-        assert!(!store.completed_ok_since(A, gone, t0));
     }
 
     #[test]
@@ -962,7 +921,7 @@ pub(crate) mod tests {
         let t0 = Instant::now();
         store.issue(lease(A, 1, t0)).expect("a lease");
         dispatched(&store, &open(&store, A), &a_dispatched(2), t0).expect("no error");
-        completed(&store, &open(&store, A), &a_completed(2, WorkerId(7)), t0).expect("no error");
+        completed(&store, &open(&store, A), &a_completed(2, WorkerId(7))).expect("no error");
         released(&store, &open(&store, A), &a_released(2)).expect("no error");
         assert_eq!(state(&store, A, 1), Some(LeaseState::ISSUED));
         assert_eq!(store.live(A), 1);
@@ -1008,7 +967,7 @@ pub(crate) mod tests {
         let t0 = Instant::now();
         store.issue(lease(B, 1, t0)).expect("a lease");
         dispatched(&store, &open(&store, A), &a_dispatched(1), t0).expect("no error");
-        completed(&store, &open(&store, A), &a_completed(1, WorkerId(7)), t0).expect("no error");
+        completed(&store, &open(&store, A), &a_completed(1, WorkerId(7))).expect("no error");
         released(&store, &open(&store, A), &a_released(1)).expect("no error");
         assert_eq!(state(&store, B, 1), Some(LeaseState::ISSUED));
     }
@@ -1141,7 +1100,7 @@ pub(crate) mod tests {
                 ..a_completed(1, served)
             };
             refused(
-                completed(&store, &open(&store, A), &frame, t0),
+                completed(&store, &open(&store, A), &frame),
                 Code::InvalidArgument,
                 &none("Completed.side", number),
             );
@@ -1150,7 +1109,7 @@ pub(crate) mod tests {
                 ..a_completed(1, served)
             };
             refused(
-                completed(&store, &open(&store, A), &frame, t0),
+                completed(&store, &open(&store, A), &frame),
                 Code::InvalidArgument,
                 &none("Completed.class", number),
             );
@@ -1187,7 +1146,7 @@ pub(crate) mod tests {
             ..a_completed(1, served)
         };
         refused(
-            completed(&store, &open(&store, A), &frame, t0),
+            completed(&store, &open(&store, A), &frame),
             Code::InvalidArgument,
             "Completed.status is 65536: 65535 is the most it holds",
         );
@@ -1200,10 +1159,8 @@ pub(crate) mod tests {
             Code::InvalidArgument,
             "Released.what names neither a lease nor a ticket",
         );
-        // Nothing was written: the lease stands as issued and no
-        // completion is on file.
+        // Nothing was written: the lease stands as issued.
         assert_eq!(state(&store, A, 1), Some(LeaseState::ISSUED));
-        assert!(!store.completed_ok_since(A, served, t0));
     }
 
     /// The model of the cases of a profile's count of sends.

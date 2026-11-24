@@ -124,10 +124,8 @@ impl Lease {
     }
 }
 
-/// The transport outcome of a dispatch, beside its status: what a health
-/// rule reads when it weighs a prober's verdict against the gateways'
-/// reports. Further classes add their cases: a `match` outside this crate
-/// keeps an arm for the rest.
+/// The transport outcome of a dispatch, beside its status. Further classes
+/// add their cases: a `match` outside this crate keeps an arm for the rest.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum TransportClass {
@@ -184,8 +182,9 @@ impl Outcome {
     /// leaves both as made here. A guard's caller states both
     /// ([`Outcome::with_served`]).
     ///
-    /// The class has no default: it feeds a worker's health, and an end
-    /// whose caller forgot it must not read as [`TransportClass::Ok`].
+    /// The class has no default: a plugin is shown it and a session's
+    /// frame carries it, and an end whose caller forgot it must not read
+    /// as [`TransportClass::Ok`].
     #[must_use]
     pub const fn reported(status: u16, class: TransportClass) -> Self {
         Self {

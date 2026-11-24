@@ -536,7 +536,7 @@ pub trait LeasesStore: Send + Sync {
 
     /// The gateways are gone past their grace: every lease of each released
     /// as client gone, and with them what the store holds of each gateway's
-    /// own about a worker (its vetoes, its completed dispatches). One write
+    /// own about a worker: its vetoes. One write
     /// a table for them all: one pass over the leases, one over the vetoes
     /// and one publication. Returns how many leases each held, in the order
     /// of `gone`. It is the store's one door for a gone gateway.
