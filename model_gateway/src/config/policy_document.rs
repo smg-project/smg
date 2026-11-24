@@ -21,6 +21,7 @@ use smg_policy_controller::{
         OverloadSpec, Pairing, PolicySettings, PolicySpec, RoutingKeyOverrideSettings,
         RoutingSettings, RoutingSettingsError, ShadowSpec, SpecError,
     },
+    engine::Phase,
     stages::StageRegistry,
 };
 use smg_worker::identity::basic::ConnectionMode;
@@ -188,24 +189,28 @@ impl RouterConfig {
     ///
     /// A binding's shadows by side are refused as not in this build: the
     /// engine this gateway hosts decides a shadow beside a single request
-    /// alone, so a pair's would load and never run.
+    /// alone, so a pair's would load and never run. So would the shadow of
+    /// a binding whose phase list is not empty and leaves out `single`, and
+    /// it is refused too.
     pub fn hosted_policy(
         &self,
         document: &PolicySpec,
         stages: &StageRegistry,
     ) -> Result<AppliedSpec, SpecError> {
         let applied = AppliedSpec::validate_in(document, stages, &self.denied_view_headers())?;
-        let by_side = document
-            .bindings
-            .iter()
-            .position(|binding| matches!(binding.shadow, Some(ShadowSpec::Sides(_))));
-        match by_side {
-            Some(index) => Err(SpecError::NotInBuild {
-                path: format!("bindings[{index}].shadow"),
-                what: "a pair's shadow",
-            }),
-            None => Ok(applied),
+        for (index, binding) in document.bindings.iter().enumerate() {
+            let phases = &binding.matcher.phase;
+            let what = match binding.shadow {
+                Some(ShadowSpec::Sides(_)) => "a pair's shadow",
+                Some(_) if !phases.is_empty() && !phases.contains(&Phase::Single) => {
+                    "a shadow outside the single phase"
+                }
+                _ => continue,
+            };
+            let path = format!("bindings[{index}].shadow");
+            return Err(SpecError::NotInBuild { path, what });
         }
+        Ok(applied)
     }
 
     /// The header names this gateway denies the view of a document it
@@ -1241,7 +1246,8 @@ mod tests {
 
     /// One model's single binding with a shadow stands ahead of a pair's
     /// binding. The single binding's shadow loads, and a shadow by side on
-    /// the pair's binding is refused by that binding's path.
+    /// the pair's binding is refused by that binding's path. Scoped to the
+    /// decode phase, the single binding's shadow is refused too.
     #[test]
     fn a_pair_bindings_shadow_is_refused_as_not_in_this_build() {
         let pairs = PolicySpec::pair_presets("round_robin", "round_robin");
@@ -1272,6 +1278,19 @@ mod tests {
                 what: "a pair's shadow",
             })
         );
+
+        // No single request reaches a binding scoped to the decode phase:
+        // its shadow is named ahead of the pair's, and alone too.
+        let outside = Some(SpecError::NotInBuild {
+            path: "bindings[0].shadow".to_owned(),
+            what: "a shadow outside the single phase",
+        });
+        let ahead = document.bindings.first_mut().expect("the single binding");
+        ahead.matcher.phase = vec![Phase::Decode];
+        assert_eq!(refused(&document), outside);
+        let pair = document.bindings.last_mut().expect("the pair's binding");
+        pair.shadow = None;
+        assert_eq!(refused(&document), outside);
     }
 
     #[test]
