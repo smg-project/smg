@@ -704,6 +704,8 @@ fn test_validate_tools_mcp_valid_ok() {
             allowed_tools: None,
             connector_id: None,
             defer_loading: None,
+            allowed_callers: None,
+            tunnel_id: None,
         })]),
         ..Default::default()
     };
@@ -741,6 +743,8 @@ fn test_validate_tools_mcp_duplicate_server_label() {
                 allowed_tools: None,
                 connector_id: None,
                 defer_loading: None,
+                allowed_callers: None,
+                tunnel_id: None,
             }),
             ResponseTool::Mcp(McpTool {
                 server_url: None,
@@ -752,6 +756,8 @@ fn test_validate_tools_mcp_duplicate_server_label() {
                 allowed_tools: None,
                 connector_id: None,
                 defer_loading: None,
+                allowed_callers: None,
+                tunnel_id: None,
             }),
         ]),
         ..Default::default()
@@ -788,6 +794,8 @@ fn test_validate_tools_mcp_server_label_invalid_cases() {
                 allowed_tools: None,
                 connector_id: None,
                 defer_loading: None,
+                allowed_callers: None,
+                tunnel_id: None,
             })]),
             ..Default::default()
         };
@@ -1124,7 +1132,7 @@ fn test_validate_tool_continuation_keeps_other_constraints() {
         .any(|error| error.code == "mutually_exclusive_parameters")));
 
     for item in [
-        json!({"type": "function_call_output", "output": "sunny"}),
+        json!({"type": "function_call", "name": "get_weather", "arguments": "{}"}),
         json!({"type": "function_call_output", "call_id": "call_weather"}),
     ] {
         assert!(serde_json::from_value::<ResponsesRequest>(json!({

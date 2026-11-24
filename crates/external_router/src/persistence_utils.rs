@@ -40,8 +40,21 @@ pub const ITEM_TYPE_FIELDS: &[(&str, &[&str])] = &[
     // persistence whitelist so failed list-tools items round-trip through
     // conversation storage without losing the failure reason.
     ("mcp_list_tools", &["tools", "server_label", "error"]),
-    ("function_call", &["call_id", "name", "arguments", "output"]),
-    ("function_call_output", &["call_id", "output"]),
+    (
+        "function_call",
+        &[
+            "call_id",
+            "caller",
+            "name",
+            "namespace",
+            "arguments",
+            "output",
+        ],
+    ),
+    (
+        "function_call_output",
+        &["call_id", "caller", "name", "namespace", "output"],
+    ),
 ];
 
 // ============================================================================
