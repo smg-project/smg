@@ -16,6 +16,7 @@ use crate::{
             RETAINED,
         },
         test_support::*,
+        MAX_DOCUMENT_BYTES,
     },
     engine::{Candidate, Constraints, Filter, RequestFacts},
 };

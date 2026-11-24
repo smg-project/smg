@@ -734,7 +734,8 @@ struct RoutingArgs {
     /// setting, the overload switch and shed flag and the warm-up and pairing
     /// settings are each refused beside it by name. The two overload
     /// thresholds stand beside it: the gateway builds its workers with them,
-    /// unless the document switches its overload block off
+    /// unless the document switches its overload block off.
+    /// A file named `.json` is read as JSON, any other name as YAML
     #[arg(
         long,
         value_name = "FILE",

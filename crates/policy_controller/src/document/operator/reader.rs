@@ -1,12 +1,11 @@
 //! Read the source's bytes and name a refusal by the field it came from.
 
-#[cfg(any(test, feature = "controller"))]
-use std::path::Path;
-use std::{cell::Cell, fmt};
+use std::{cell::Cell, fmt, path::Path};
 
-use serde::de::{self, DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor};
+use serde::de::{self, DeserializeSeed, Deserializer, EnumAccess, MapAccess, SeqAccess, Visitor};
 use serde_json::{map::Entry, Map, Number, Value};
 
+use super::SpecRejected;
 use crate::document::spec::PolicySpec;
 
 /// The largest document a source hands over, in bytes: 128 KiB. What sets
@@ -17,6 +16,12 @@ use crate::document::spec::PolicySpec;
 /// beside it when the host takes its turns. A fleet's document is far under the bound: 143 names
 /// with a binding each write 11,523 bytes.
 pub const MAX_DOCUMENT_BYTES: u64 = 128 << 10;
+
+/// A document's size, where it is over the bound.
+pub(crate) fn over_bound(document: &[u8]) -> Option<u64> {
+    let len = u64::try_from(document.len()).unwrap_or(u64::MAX);
+    (len > MAX_DOCUMENT_BYTES).then_some(len)
+}
 
 /// How many bytes a YAML document may build for each byte of the size bound
 /// ([`MAX_DOCUMENT_BYTES`]), as the values it is read into. A value weighs
@@ -60,9 +65,9 @@ pub enum Format {
 }
 
 impl Format {
-    /// A file's form by its name: `.json` is JSON, any other name YAML.
-    #[cfg(any(test, feature = "controller"))]
-    pub(crate) fn of(path: &Path) -> Self {
+    /// A file's form by its name: `.json` is JSON, any other name YAML. The
+    /// one rule for every host that starts from a file.
+    pub fn of(path: &Path) -> Self {
         let json = path
             .extension()
             .is_some_and(|extension| extension.eq_ignore_ascii_case("json"));
@@ -89,13 +94,31 @@ impl Format {
             .find(|format| format.as_str() == name)
     }
 
+    /// The document a source's bytes read as in this form: the size bound
+    /// first ([`MAX_DOCUMENT_BYTES`]), then this form's reader. Every
+    /// source's document is read here: the file a host starts from, an
+    /// apply and a controller's file. A document past the bound is refused
+    /// by its size, unread. One the reader refuses is refused under its
+    /// form's name, by the path of the field where the refusal is about one.
+    pub fn read(self, document: &[u8]) -> Result<PolicySpec, SpecRejected> {
+        if let Some(len) = over_bound(document) {
+            return Err(SpecRejected::TooLarge(len));
+        }
+        self.parse(document)
+            .map_err(|Refused { path, message }| SpecRejected::Unparsed {
+                format: self.as_str(),
+                path,
+                message,
+            })
+    }
+
     /// The document these bytes read as. A YAML document is read once, into
     /// the values it reads as, held under a bound ([`read_yaml`]), and the
     /// document is built from those values alone. So a YAML document reads
     /// as JSON does: text that looks like a number or a boolean is quoted
     /// where a field takes text. A field the reader refuses is named by its
     /// path.
-    pub(super) fn parse(self, document: &[u8]) -> Result<PolicySpec, Refused> {
+    fn parse(self, document: &[u8]) -> Result<PolicySpec, Refused> {
         match self {
             Self::Yaml => placed(read_yaml(document).map_err(Refused::whole)?),
             // A JSON document that reads is read once, by the typed read
@@ -123,9 +146,38 @@ fn placed(values: Value) -> Result<PolicySpec, Refused> {
         let path = if path == "." { String::new() } else { path };
         Refused {
             path: wanted(path, &message),
-            message,
+            message: cured(message),
         }
     })
+}
+
+/// `message` with what a writer does about it, where the typed read refused
+/// a plain word of YAML. A number, a boolean or a null where the field takes
+/// text is that text in quotes. A null where a list or a map stands is a
+/// key with nothing under it.
+fn cured(message: String) -> String {
+    let cure = message
+        .strip_prefix("invalid type: ")
+        .and_then(|rest| rest.split_once(", expected "))
+        .and_then(|(found, expected)| {
+            let word = found.split([' ', '`']).next().unwrap_or(found);
+            let text = expected == "a string";
+            let holds =
+                ["a sequence", "a map"].contains(&expected) || expected.starts_with("struct ");
+            match word {
+                "integer" | "floating" | "boolean" | "null" if text => {
+                    Some("text that reads as a number, a boolean or a null is written in quotes")
+                }
+                "null" if holds => Some(
+                    "a key with nothing under it is a null: take the key out, or write [] or {}",
+                ),
+                _ => None,
+            }
+        });
+    match cure {
+        Some(cure) => format!("{message}: {cure}"),
+        None => message,
+    }
 }
 
 /// `path` ended by the key a typed read found missing. The map that wants
@@ -147,9 +199,9 @@ fn wanted(mut path: String, message: &str) -> String {
 
 /// Why a reader refused a document: the path of the field, where the
 /// refusal is about one, and the reader's message.
-pub(super) struct Refused {
-    pub(super) path: String,
-    pub(super) message: String,
+struct Refused {
+    path: String,
+    message: String,
 }
 
 impl Refused {
@@ -294,9 +346,30 @@ impl<'de> Visitor<'de> for Weighed<'_> {
             .ok_or_else(|| E::custom(format_args!("the number {value} is none JSON writes")))
     }
 
+    fn visit_i128<E: de::Error>(self, value: i128) -> Result<Value, E> {
+        Err(E::custom(format_args!(
+            "the number {value} is none JSON writes"
+        )))
+    }
+
+    fn visit_u128<E: de::Error>(self, value: u128) -> Result<Value, E> {
+        Err(E::custom(format_args!(
+            "the number {value} is none JSON writes"
+        )))
+    }
+
     fn visit_str<E: de::Error>(self, text: &str) -> Result<Value, E> {
         self.weigh(text.len())?;
         Ok(Value::String(text.to_owned()))
+    }
+
+    /// A tagged value, refused by its tag: JSON has no form for one.
+    fn visit_enum<A: EnumAccess<'de>>(self, tagged: A) -> Result<Value, A::Error> {
+        let (tag, _) = tagged.variant::<String>()?;
+        Err(de::Error::custom(format_args!(
+            "the tag `!{}` is none JSON writes: take the tag out",
+            tag.trim_start_matches('!')
+        )))
     }
 
     fn visit_unit<E: de::Error>(self) -> Result<Value, E> {
@@ -471,8 +544,14 @@ mod tests {
         assert_eq!(items.capacity(), 2, "a list keeps no room it does not fill");
 
         for (document, named) in [
-            ("a: !tagged 1\n", "enum"),
-            ("a: 340282366920938463463374607431768211455\n", "u128"),
+            (
+                "a: !tagged 1\n",
+                "the tag `!tagged` is none JSON writes: take the tag out",
+            ),
+            (
+                "a: 340282366920938463463374607431768211455\n",
+                "the number 340282366920938463463374607431768211455 is none JSON writes",
+            ),
             ("a: .inf\n", "is none JSON writes"),
             ("a: 1\na: 2\n", "the key `a` is written twice"),
         ] {
@@ -509,5 +588,97 @@ mod tests {
         let escapes = "\\L".repeat(1000);
         let read = read_yaml(format!("\"{escapes}\"").as_bytes()).expect("it reads");
         assert_eq!(read.as_str().map(str::len), Some(3000));
+    }
+
+    /// What a read refuses `document` with, in this form.
+    fn refusal(format: Format, document: &[u8]) -> String {
+        format
+            .read(document)
+            .expect_err("the document is refused")
+            .to_string()
+    }
+
+    #[test]
+    fn a_read_is_the_bound_and_then_the_forms_reader() {
+        let document = "apiVersion: smg.policy/v1\nprofiles:\n  default: {pick: random}\n";
+        let read = Format::Yaml.read(document.as_bytes()).expect("it reads");
+        assert_eq!(Format::Yaml.parse(document.as_bytes()).ok(), Some(read));
+        // Past the bound a document is refused by its size, unread: these
+        // bytes are no document in either form.
+        let bound = usize::try_from(MAX_DOCUMENT_BYTES).expect("the bound fits");
+        let over = vec![b'{'; bound + 1];
+        for format in [Format::Yaml, Format::Json] {
+            assert_eq!(
+                refusal(format, &over),
+                format!("the document is {} bytes; at most {bound}", bound + 1)
+            );
+        }
+        // At the bound the form's reader has the word, under its form's name.
+        let at = &over[..bound];
+        assert!(refusal(Format::Yaml, at).starts_with("not a policy spec in yaml: "));
+        assert!(refusal(Format::Json, at).starts_with("not a policy spec in json: "));
+    }
+
+    /// A typed YAML read takes each of these, and so a host's own did. This
+    /// read refuses each by its field or its place, with what a writer does
+    /// about it where a plain word of YAML is the cause.
+    #[test]
+    fn a_refusal_names_its_place_and_what_a_writer_does() {
+        const QUOTES: &str =
+            "text that reads as a number, a boolean or a null is written in quotes";
+        const EMPTY: &str =
+            "a key with nothing under it is a null: take the key out, or write [] or {}";
+        let document = |profile: &str, more: &str| {
+            format!("apiVersion: smg.policy/v1\nprofiles:\n  default: {profile}\n{more}")
+        };
+        let binding = |model: &str| {
+            document(
+                "{pick: random}",
+                &format!("bindings:\n- match: {{model: {model}}}\n  profile: default\n"),
+            )
+        };
+        for (document, refused) in [
+            (
+                binding("123"),
+                format!("bindings[0].match.model: invalid type: integer `123`, expected a string: {QUOTES}"),
+            ),
+            (
+                binding("true"),
+                format!("bindings[0].match.model: invalid type: boolean `true`, expected a string: {QUOTES}"),
+            ),
+            (
+                binding("~"),
+                format!("bindings[0].match.model: invalid type: null, expected a string: {QUOTES}"),
+            ),
+            (
+                document("{pick: random, score: }", ""),
+                format!("profiles.default.score: invalid type: null, expected a sequence: {EMPTY}"),
+            ),
+            (
+                document("{pick: random}", "signals:\n"),
+                format!("signals: invalid type: null, expected a map: {EMPTY}"),
+            ),
+            (
+                binding("!mine batch"),
+                "bindings[0].match.model: the tag `!mine` is none JSON writes: take the tag out at line 5 column 18".to_owned(),
+            ),
+            (
+                document("{pick: best, score: [{least-load: {weight: 18446744073709551616}}]}", ""),
+                "profiles.default.score[0].least-load.weight: the number 18446744073709551616 is none JSON writes at line 3 column 55".to_owned(),
+            ),
+        ] {
+            assert_eq!(
+                refusal(Format::Yaml, document.as_bytes()),
+                format!("not a policy spec in yaml: {refused}"),
+                "{document}"
+            );
+        }
+        // A refusal that is no plain word's keeps the reader's own words.
+        let unknown = refusal(
+            Format::Yaml,
+            document("{pick: random}", "more: 1\n").as_bytes(),
+        );
+        assert!(unknown.starts_with("not a policy spec in yaml: more: unknown field `more`"));
+        assert!(!unknown.contains(QUOTES) && !unknown.contains(EMPTY));
     }
 }

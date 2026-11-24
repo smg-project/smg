@@ -359,6 +359,8 @@ What a policy remembers lives in several places, among them:
 generations. It can keep the last eight generations in a folder, one file each, and roll back to
 one of them.
 
+A gateway reads the supplied file by the crate's one read of a document (`Format::read`), the read an apply and a controller's file pass. A file named `.json` is read as JSON, any other name as YAML (`Format::of`). A YAML document reads as JSON does: text that looks like a number, a boolean or a null is written in quotes, a key with nothing under it is refused where a list or a map stands, and a tag is refused. A refusal names the field by its path, or the line and column where the file itself does not read.
+
 ### 3.5 The stage interfaces
 
 A filter, a scorer and a picker are three traits (`engine/framework.rs`). Each has two required
