@@ -418,6 +418,26 @@ pub trait Scorer: Lifecycle + Debug {
         Needs::default()
     }
 
+    /// Whether the scorer weighs load against affinity by a gate of its
+    /// own: it places a request by who holds its prefix, and its gate
+    /// bounds where it sends the request by the workers' load. The default
+    /// is no.
+    ///
+    /// Under a binding that steers, a pair's prefill profile with such a
+    /// scorer runs with the overload veto lifted
+    /// ([`Constraints::overload_lifted`]). The veto would move a request
+    /// off its holder each time that worker crosses a threshold, and the
+    /// gate already answers a worker loaded too far. What a stage is fed
+    /// says nothing of a gate: one that reads the affinity column
+    /// ([`Self::needs`]) and answers no here keeps the veto for its
+    /// profile.
+    ///
+    /// Asked where an engine is built, as [`Self::needs`] is: no decision
+    /// asks.
+    fn balances_load_against_affinity(&self) -> bool {
+        false
+    }
+
     /// The per-decision scope this stage reads, if it holds one.
     fn scope(&self) -> Option<&dyn DecisionScope> {
         None
@@ -3856,6 +3876,11 @@ impl Marks {
     /// profile ([`Engine::pool_turn`]). One read tells a decision so,
     /// where the picker's own answer is a call.
     const TURNS: u16 = 1 << 12;
+    /// A scorer weighs load against affinity by a gate of its own
+    /// ([`Scorer::balances_load_against_affinity`]). A pair's decision
+    /// reads it for its prefill profile ([`Engine::weighs`]). No single
+    /// decision does: each of its masked reads names other marks.
+    const WEIGHS: u16 = 1 << 13;
 
     fn of(profile: &Profile, order: Order) -> Self {
         let scoped = if profile.scoped() { Self::SCOPED } else { 0 };
@@ -3927,16 +3952,27 @@ impl Marks {
         } else {
             0
         };
+        let weighing = |stage: &WeightedScorer| stage.scorer.balances_load_against_affinity();
+        let weighs = if profile.scorers.iter().any(weighing) {
+            Self::WEIGHS
+        } else {
+            0
+        };
         // The three marks no run of the engine reads.
         let for_hosts = by_reports | key_place | other_place;
         // What says when the profile draws, and how.
         let draws = draws_first | joined | turns;
-        Self(scoped | by_assignment | draws | ranked | engines | owns | for_hosts)
+        Self(scoped | by_assignment | draws | ranked | engines | owns | for_hosts | weighs)
     }
 
     /// A profile whose requests take their list's own turn first.
     const fn turns(self) -> bool {
         self.0 & Self::TURNS != 0
+    }
+
+    /// A scorer that weighs load against affinity by a gate of its own.
+    const fn weighs(self) -> bool {
+        self.0 & Self::WEIGHS != 0
     }
 
     /// Whether no stage asks anything before the profile's run: no scope
@@ -7150,7 +7186,10 @@ impl Engine {
     /// ([`LiftedVeto::Overload`]). On a retry the profile's soft filter keeps
     /// that pick to the partners the request has not tried while one is
     /// left. Under a binding that sheds, such a pool is shed as saturated.
-    /// The prefill side's own run is put to no rule.
+    /// The prefill side's own run is put to no rule. Under a binding that
+    /// steers, a prefill profile that weighs load against affinity runs with
+    /// the overload veto lifted (`Engine::weighing_lift`), and a pair no
+    /// prefill of which stood without the lift says that veto in its trace.
     ///
     /// Where that run sheds, a pool whose every usable worker is vetoed
     /// goes to the pair's default: the usable prefill and partner of the
@@ -7452,8 +7491,7 @@ impl Engine {
                         Half::new(prefill_profile, first, &prefill_facts, prefills, cx),
                         Half::new(decode_profile, second, &decode_facts, decodes, decode_cx),
                     ];
-                    let weighs = self.profile_needs[usize::from(first)].affinity;
-                    let words = (vetoed == AllVetoed::Steer, weighs);
+                    let words = (vetoed == AllVetoed::Steer, self.weighs(first));
                     if let Some(pair) = vetoed::paired(sides, &pools.table, words, pool, scratch) {
                         return pair;
                     }
@@ -7593,7 +7631,12 @@ impl Engine {
                     // The pair's trace is the prefill's, with the mark of
                     // the veto the rule lifted for the decode side, or of
                     // the overload veto the prefill's own run was placed
-                    // past.
+                    // past. The decode side's own mark stands where it names
+                    // one. A first decision puts that side to the rule's
+                    // overload tier alone, so the two marks differ only
+                    // under a filter whose `retain` drops a row its `keep`
+                    // keeps, which [`Filter::retain`] forbids: the liveness
+                    // mark of such a decode side is kept.
                     let lifted = trace.lifted;
                     *trace = prefill_pick.trace;
                     trace.lifted = match lifted {
@@ -7633,30 +7676,45 @@ impl Engine {
         }
     }
 
+    /// Whether the profile at `index` weighs load against affinity by a
+    /// gate of its own: one of its scorers says so
+    /// ([`Scorer::balances_load_against_affinity`]), read into the
+    /// profile's marks where the engine is built. The one reader of that
+    /// mark. A pair's decision asks it twice of its prefill profile: for
+    /// the lifted run ([`Self::weighing_lift`]) and for the word its
+    /// default is handed ([`vetoed::paired`]). What a stage is fed is
+    /// another word ([`Needs::affinity`]): a stage that reads the column
+    /// and has no gate lifts nothing.
+    pub(crate) fn weighs(&self, index: u16) -> bool {
+        let marks = self.marks.get(usize::from(index));
+        marks.is_some_and(|marks| marks.weighs())
+    }
+
     /// The constraints a pair's prefill profile at `index` runs under where
     /// it weighs load against affinity: `cx` with the overload veto lifted.
     /// `None` where the stated ones stand: under a binding that sheds
-    /// (`rule`), and under a profile none of whose stages reads affinity.
+    /// (`rule`), and under a profile none of whose scorers says that it
+    /// weighs ([`Self::weighs`]).
     ///
-    /// A profile whose stages read affinity is taken to weigh load against
-    /// it itself: its own gate moves a request off a holder loaded well
-    /// past the pool. The veto would move a session off the prefill that
-    /// holds its prefix each time that prefill crosses a threshold, and
-    /// under sustained load the prefills cross them in turn. So such a
-    /// profile places among the prefills over their thresholds too, as the
-    /// gateway's own pair selection leaves the veto off a prefill pool
-    /// whose policy weighs so
-    /// (`model_gateway/src/routers/common/placement.rs:2375-2394`, at main
-    /// `55c35100d`). The lift is the constraint a kept key's run is given
-    /// ([`Self::keep`]). A profile that reads no affinity keeps the veto.
+    /// A scorer that weighs has a gate of its own, which moves a request
+    /// off a holder loaded well past the pool. The veto would move a
+    /// session off the prefill that holds its prefix each time that prefill
+    /// crosses a threshold, and under sustained load the prefills cross
+    /// them in turn. So such a profile places among the prefills over their
+    /// thresholds too, as the gateway's own pair selection leaves the veto
+    /// off a prefill pool whose policy says the same word of itself
+    /// (`model_gateway/src/routers/common/placement.rs:2575-2577`, at main
+    /// `82a135b1b`). The lift is the constraint a kept key's run is given
+    /// ([`Self::keep`]). A profile whose stages only read the affinity
+    /// column keeps the veto: a need says what a stage is fed, and nothing
+    /// of a gate.
     fn weighing_lift<'a>(
         &self,
         index: u16,
         rule: AllVetoed,
         cx: &Constraints<'a>,
     ) -> Option<Constraints<'a>> {
-        let needs = self.profile_needs.get(usize::from(index));
-        let weighs = rule == AllVetoed::Steer && needs.is_some_and(|needs| needs.affinity);
+        let weighs = rule == AllVetoed::Steer && self.weighs(index);
         // Every pair's decision asks, so the copy is made only where the
         // lift stands.
         if !weighs {
@@ -7712,10 +7770,15 @@ impl Engine {
     /// rule, so it sheds a pool its live side was steered in, and decides
     /// by its profile where the live side was taken by load. The decode's
     /// shadow says none beside a pair whose trace names a lifted veto, by
-    /// the binding's all-vetoed rule or by the pair's default
-    /// ([`vetoed::paired`]). The prefill's shadow says none beside a pair
-    /// the default made, which the mark on the prefill's buffer says: it
-    /// speaks beside a pair whose decode side alone the rule steered.
+    /// the binding's all-vetoed rule, by the pair's default
+    /// ([`vetoed::paired`]) or by a weighing prefill profile's lifted run
+    /// ([`Self::weighing_lift`]). The trace carries one mark and does not
+    /// say which side it was lifted for, so the decode's shadow stands
+    /// aside beside that last pair too, whose decode side no rule steered.
+    /// The prefill's shadow says none beside a pair the default made or
+    /// the weighing lift alone placed, which the mark on the prefill's
+    /// buffer says: it speaks beside a pair whose decode side alone the
+    /// rule steered.
     #[expect(
         clippy::too_many_arguments,
         reason = "the pair's entry and its inputs, beside the side and the live pick"

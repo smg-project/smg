@@ -474,8 +474,9 @@ struct Apart {
 ///
 /// The four rows of a prefill policy that weighs load against cache
 /// affinity itself replay as recorded: the gateway lifts the overload veto
-/// for such a policy while shedding is off, and a prefill profile that
-/// reads affinity runs with that veto lifted under a binding that steers.
+/// for such a policy while shedding is off, and a prefill profile one of
+/// whose scorers says the same of itself runs with that veto lifted under
+/// a binding that steers.
 const APART: &[Apart] = &[Apart {
     row: "pair-the-only-ready-prefills-partners-over-beside-a-free-decode",
     here: Held("overloaded"),

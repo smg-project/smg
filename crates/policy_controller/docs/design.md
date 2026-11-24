@@ -362,8 +362,8 @@ one of them.
 ### 3.5 The stage interfaces
 
 A filter, a scorer and a picker are three traits (`engine/framework.rs`). Each has two required
-methods, shown here. The others have default bodies and are not shown: most are switches and
-short paths that the built-in stages use.
+methods, shown here. The others have default bodies, and all but one are not shown: most are
+switches and short paths that the built-in stages use.
 
 ```rust
 pub trait Filter {
@@ -377,6 +377,8 @@ pub trait Scorer: Lifecycle {
     // write one score for each surviving worker
     fn score(&self, facts: &RequestFacts<'_>, candidates: &[Candidate], kept: &[u32],
              out: &mut [f32]) -> TieBand;
+    // a gate of the scorer's own weighs load against cache affinity
+    fn balances_load_against_affinity(&self) -> bool { false }
 }
 
 pub trait Picker: Lifecycle {
@@ -402,6 +404,21 @@ The built-in stages:
 
 A program that embeds the crate can add stages of its own under new names
 (`StageRegistry::filter`, `scorer`, `picker`) and validate documents against that table.
+
+**[built]** One default method is shown, `balances_load_against_affinity`: a scorer of a program's
+own that weighs load against affinity must answer it, because a pair's lift rests on it. A scorer
+that answers yes places a request by who holds the prompt's beginning, and a gate of its own bounds
+where it sends the request by the workers' load: `prefix-affinity` moves a request off that worker
+once it is loaded well past the others. Under a binding that steers, a pair's prefill profile with
+such a scorer is decided with the overload filter lifted, so a prompt stays on the prefill that
+holds its beginning while that worker is over its thresholds. The lift rests on that answer alone,
+as classic's rests on its policy's answer of the same name:
+`LoadBalancingPolicy::balances_load_against_affinity` (`model_gateway/src/policies/mod.rs`), read
+where `select_pair` places a pair (`model_gateway/src/routers/common/placement.rs`).
+`prefix-affinity` and `warmup-slice` answer yes, by their spill gate. What a stage reads says
+nothing of a gate: a stage that reads the cache records and answers no keeps the filter for its
+profile, a scorer a program adds answers for itself, and a plugin's stage answers no. A filter or a
+picker has no such word: one that reads the cache records keeps the filter for its profile.
 
 **[built]** Such a stage keeps building when the crate grows. For each type below, the table says
 whether it is marked non-exhaustive and how code writes it:
