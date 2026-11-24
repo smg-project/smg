@@ -549,8 +549,8 @@ fn reported(end: &SideEnd, status: u16, answered: bool) {
 /// The class of an end of `status`, the one mapping of the gateway: a
 /// status under 400 is a success, 408 and 504 a timeout, any other 4xx the
 /// client's error. A 5xx is the server's error where the worker answered
-/// it, and a failed connection where the router made it of a transport
-/// failure.
+/// it. A 5xx the router made is a failed connection: a transport failure,
+/// or an answer of the worker's that the router refused.
 fn transport_class(status: u16, answered: bool) -> TransportClass {
     match status {
         ..400 => TransportClass::Ok,
@@ -574,8 +574,10 @@ fn transport_class(status: u16, answered: bool) -> TransportClass {
 /// request (`policy_controller: on`), the guard is counted under the routing
 /// value the engine names, and under the route's own key where it names
 /// none. It keeps the engine's placement to the request's end: the engine
-/// hears the dispatch where the guard is made and the end where the guard
-/// is dropped. It is told no outcome: the worker object has it.
+/// hears the dispatch where the guard is made, and the end where the guard
+/// and every handle on that end are gone. It is told the outcome where its
+/// route reports it ([`Placed::ended`], [`RequestEnd`]), and otherwise only
+/// that the request ended.
 ///
 /// A pair's prefill is the one answer whose guard is made of its worker
 /// alone, ahead of its send and under the route's key: what the answer
@@ -744,7 +746,8 @@ impl Placed {
 
     /// [`Self::guard`] for a caller that keeps nothing else of the answer:
     /// the worker's handle moves into the guard. The decision bench's routes
-    /// and tests call it. A route keeps its answer and calls [`Self::guard`].
+    /// and tests call it. A route keeps its answer and calls [`Self::guard`]
+    /// or [`Self::guard_keeping_end`].
     #[cfg(any(test, feature = "test-util"))]
     #[inline]
     pub(crate) fn into_guard(self, key: Option<&str>) -> WorkerLoadGuard {

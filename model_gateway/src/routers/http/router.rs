@@ -853,10 +853,10 @@ impl Router {
     }
 
     /// The attempt's dispatch: the request's load guard, made from the
-    /// placement's answer ([`placement::Placed::guard`]), the request-sent
-    /// event, the trace headers, the relay mode, the serialized body and the
-    /// send through the relay. Once the bytes exist the lease frees the parsed
-    /// request when retries are disabled.
+    /// placement's answer ([`placement::Placed::guard_keeping_end`]), the
+    /// request-sent event, the trace headers, the relay mode, the serialized
+    /// body and the send through the relay. Once the bytes exist the lease
+    /// frees the parsed request when retries are disabled.
     async fn dispatch_attempt<T: GenerationRequest + serde::Serialize>(
         &self,
         attempt: &TypedAttempt<'_, T>,
