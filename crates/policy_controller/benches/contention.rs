@@ -41,8 +41,9 @@ use smg_policy_controller::{
 /// excludes three rows drawn from a mixed seed, so most decisions see a set
 /// the table has forgotten: the claim path, with its one shared count.
 /// `least_load_rising` dates its bookings at one clock every thread advances,
-/// so a rank row's lanes interleave by instant and an overflow's batch merges
-/// them (the tied rows drain one lane): the price of retiring in order.
+/// so a rank row's lanes interleave by instant and a send past the row's
+/// bound reads every lane's front for the oldest (the tied rows drain one
+/// lane): the price of retiring in order.
 const PRESETS: [&str; 6] = [
     "least_load",
     "least_load_rising",

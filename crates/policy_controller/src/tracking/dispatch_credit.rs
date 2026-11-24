@@ -91,7 +91,7 @@ pub(crate) struct SentSettings {
 /// limit and the row's removal. Under a report delay the report that ends
 /// a send is one sampled that long after the send, or longer: a report
 /// sampled sooner behind it leaves it counted. When a send arrives with
-/// 8,192 already held on a row, the tally retires the oldest batch to
+/// 8,192 already held on a row, the tally lets the row's oldest go to
 /// bound the count. This threshold applies at any age.
 #[derive(Debug)]
 pub struct DispatchCredit {
