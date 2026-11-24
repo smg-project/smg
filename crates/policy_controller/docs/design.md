@@ -1476,7 +1476,8 @@ channel. So a host relies on both once the task has been polled once, not when t
 returns.
 
 The fourth job serves a policy that keeps a number of each worker's load report
-(`Lifecycle::keeps_loads`). At each load snapshot the task takes, it tells such a policy the
+(`Lifecycle::keeps_loads`). No stock policy keeps one: the job serves a policy a host registers.
+At each load snapshot the task takes, it tells such a policy the
 reports that are new in it, for the workers it follows in the host's registry, and only then keeps
 the snapshot at hand. A report is new where its sample instant is not the one the task told last
 of its worker. The channel keeps one snapshot, so of two reports of one worker the task took no
@@ -2454,7 +2455,7 @@ bursts. It is bounded by the tree's size bound and the time between two eviction
 | The crate's bench of the kept engine | **[planned]** | |
 | The gateway as a host | **[partly]** | section 9, behind `--policy-controller on`, which is off by default: single requests and pairs on the HTTP and gRPC routes, a pair's decode asked again, a host's table of stages at the start; an encode request that carries an item is refused by name until the gateway hands the engine its three lists; every classic test of the gateway with the engine on (the bar's fourth point) is not met yet |
 | The controller: service, election, replication, document apply and roll back | **[partly]** | a session never pushes the document and refuses a gateway's replay; a standby serves neither the worker list nor the snapshot (section 10.1) |
-| The controller on the one engine and the worker crate's structures | **[partly]** | a single request, a pair at its prefill and its decode call are decided by `PolicyEngine` over the registry's lists; an encode request is answered `Busy`; a decision reads no cache event, and no load report under a document that holds a stage that keeps reports (section 10.2) |
+| The controller on the one engine and the worker crate's structures | **[partly]** | a single request, a pair at its prefill and its decode call are decided by `PolicyEngine` over the registry's lists; an encode request is answered `Busy`; a decision reads no cache event, and no load report under a document that holds a stage that keeps reports, as no stock stage does (section 10.2) |
 | The controller finding its own workers | **[partly]** | the image leaves the feature out; a worker's API key is refused; no flag sets a registration's timing |
 | A gateway under a controller | **[planned]** | section 11 |
 | User stages in WebAssembly and over gRPC | **[partly]** | library code that no document reaches |
