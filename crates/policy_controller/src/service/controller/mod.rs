@@ -6,8 +6,7 @@
 //! controller's deciding threads, and, on the leader, the control scope's
 //! registration calls and the gateway scope's watch of the worker rows, and
 //! the run loop sweeps the gateways that are gone; the scopes' other call
-//! bodies arrive with the gateway, ingestion and control scope PRs, the
-//! ingestion drivers with their move out of the gateway. In the
+//! bodies arrive with the gateway, ingestion and control scope PRs. In the
 //! `elected` mode the gateway runs this same loop inside its process. A
 //! controller given a spec file runs its document, watches the file and
 //! answers `GetPolicySpec` and a dry run of `ApplyPolicySpec`
@@ -29,10 +28,12 @@
 //! and returns.
 //!
 //! Every replica runs the same loop, the load monitor's task included. A
-//! follower polls no engine and holds no load report: the monitor is
-//! stopped where a lead ends, and its snapshot is published empty. Its
-//! first poll goes out at its promotion. No load row is written to the
-//! store.
+//! follower polls no engine, drops the load records its workers' event
+//! streams carry and holds no load report: the monitor is stopped where a
+//! lead ends, and its snapshot is published empty. Its first poll goes out
+//! at its promotion. No load row is written to the store. The controller
+//! keeps no ingestion driver of its own: its loads come from this monitor
+//! and its cache events from the worker host's feed.
 //!
 //! Every socket a listener accepts is set to send at once: a small answer
 //! never waits for the peer's acknowledgement of the write before it.
@@ -472,6 +473,10 @@ impl Controller {
         // The load monitor is built stopped, ahead of the deciding threads:
         // each takes its channel at its start, and the serve runs its task.
         let monitor = worker_objects::LoadMonitor::new(&workers, config.load_poll_interval);
+        // The load records that ride the workers' event streams go to the
+        // monitor while this replica leads: the feed takes their sink
+        // ahead of its first stream.
+        kv_feed.set_load_sink(monitor.pushed());
         let mut shared = Shared::new(
             config.controller_id.clone(),
             address.unwrap_or_default(),

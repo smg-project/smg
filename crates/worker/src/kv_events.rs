@@ -31,7 +31,7 @@ pub use collector::{KvEventCollector, KvEventHost};
 #[cfg(all(feature = "runtime", any(test, feature = "test-util")))]
 pub use subscription::{batch_facts, batch_rank};
 #[cfg(feature = "runtime")]
-pub use subscription::{KvEventFeed, SubscriptionKind};
+pub use subscription::{KvEventFeed, PushedLoadSink, SubscriptionKind};
 /// The bound on the removals that run at once and its permits, for a host's
 /// cases of what a removal holds up.
 #[cfg(all(feature = "runtime", any(test, feature = "test-util")))]
