@@ -477,7 +477,8 @@ impl PrefixPredictor {
             return;
         }
         // The request's own path is the newest before any block leaves for
-        // it, and its deepest block is kept: the write stands on it. A
+        // it, and its deepest block is kept: the write stands on it. So is
+        // the deepest the worker was sent, where that is another block. A
         // block that waited is an end again while the write runs.
         if end != NONE {
             if self.block(end).waits() {
@@ -487,31 +488,45 @@ impl PrefixPredictor {
                 self.touch(end);
             }
         }
-        self.make_room(need, end);
+        self.make_room(need, end, before);
         let room = need.min(self.bound.saturating_sub(self.placements));
         self.dropped += (need - room) as u64;
         for (at, &key) in keys.iter().enumerate().take(held + room).skip(held) {
             // A block past what anyone was sent is not there: the lookup
             // that puts it in is its only one.
             let found = if at < have { self.find(key) } else { None };
-            before = match found {
-                Some(block) => {
-                    if self.add(block, place) {
-                        self.placements += 1;
-                    }
-                    block
-                }
+            let (block, made) = match found {
+                Some(block) => (block, false),
                 None => {
-                    let Some((block, made)) = self.take(key, before, place, tick) else {
+                    let Some(taken) = self.take(key, before, place, tick) else {
                         self.dropped += (held + room - at) as u64;
                         break;
                     };
-                    if made || self.add(block, place) {
-                        self.placements += 1;
-                    }
-                    block
+                    taken
                 }
             };
+            if !made {
+                // A block that stood may be another prefix's under one
+                // key. The block before it on this write then has none
+                // behind it and stands on no list: it goes on the list
+                // of ends.
+                if before != NONE {
+                    let left = self.block(before);
+                    if left.after == 0 && left.older == UNLISTED {
+                        self.link_newest(before);
+                    }
+                }
+                // Such a block may wait. The write gives it a worker, so
+                // it leaves the list of those that wait first. The
+                // write's end left that list above.
+                if block != end && self.block(block).waits() {
+                    self.unlink_waiting(block);
+                }
+            }
+            if made || self.add(block, place) {
+                self.placements += 1;
+            }
+            before = block;
         }
         if before != NONE {
             self.end_at(before, tick);
@@ -561,7 +576,8 @@ impl PrefixPredictor {
     pub fn sweep(&mut self, budget: usize) -> usize {
         let mut steps = 0;
         while steps < budget {
-            if (self.waiting != NONE || self.placements > self.bound) && self.forget_one(NONE) {
+            if (self.waiting != NONE || self.placements > self.bound) && self.forget_one(NONE, NONE)
+            {
                 steps += 1;
                 continue;
             }
@@ -848,8 +864,10 @@ impl PrefixPredictor {
     /// One step of forgetting, never past `keep`. A block that waits
     /// leaves first. With none, the step is at the old end of the list: a
     /// block that others follow leaves the list, one that none follows
-    /// leaves the predictor. Whether a step was taken.
-    fn forget_one(&mut self, keep: u32) -> bool {
+    /// leaves the predictor, unless it is `own`, the block a write's
+    /// worker was sent: the step stops there as at `keep`. Whether a step
+    /// was taken.
+    fn forget_one(&mut self, keep: u32, own: u32) -> bool {
         let at = if self.waiting == NONE {
             self.oldest
         } else {
@@ -860,6 +878,9 @@ impl PrefixPredictor {
             return false;
         }
         if self.block(at).after == 0 {
+            if at == own {
+                return false;
+            }
             self.drop_block(at, keep);
         } else {
             self.unlink(at);
@@ -878,11 +899,12 @@ impl PrefixPredictor {
         at
     }
 
-    /// Room for `need` placements of a write that stands on `keep`: at
-    /// most two steps of forgetting for each, and eight more.
-    fn make_room(&mut self, need: usize, keep: u32) {
+    /// Room for `need` placements of a write that stands on `keep` and
+    /// whose worker was sent `own`: at most two steps of forgetting for
+    /// each, and eight more.
+    fn make_room(&mut self, need: usize, keep: u32, own: u32) {
         let mut steps = 2 * need + 8;
-        while steps != 0 && self.placements + need > self.bound && self.forget_one(keep) {
+        while steps != 0 && self.placements + need > self.bound && self.forget_one(keep, own) {
             steps -= 1;
         }
     }
