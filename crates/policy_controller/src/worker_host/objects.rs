@@ -1145,9 +1145,7 @@ impl Objects<Members> {
     ///
     /// The rule runs over whatever is lent. Where no prefill is lent, an
     /// encoder keeps the class of its end, and the pair's own decision
-    /// answers for the side that is missing. The store's pools read
-    /// otherwise there: the store derives no class for a model with no
-    /// prefill, and each of its encoders reads class `0`.
+    /// answers for the side that is missing.
     ///
     /// A generation keeps one pair of columns, derived at the first ask
     /// as a set of its pair classes is ([`Self::pair_classes`]): behind

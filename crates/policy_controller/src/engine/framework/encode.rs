@@ -774,11 +774,10 @@ impl Engine {
                 .all(|f| f.keep(&encode_facts, row, encode_cx))
         };
         if needs {
-            // An encode class is numbered over the whole pool, and a view
-            // hands fewer rows than the pool holds: one bit a number up to
-            // the count of the rows handed, and a list for the numbers
-            // above it. No number is dropped and no set is wider than the
-            // fleet.
+            // A host states each encoder's class, and no class is held to
+            // the count of the rows handed: one bit a number up to that
+            // count, and a list for the numbers above it. No number is
+            // dropped and no set is wider than the fleet.
             let width = encode.encoders.len() + 1;
             side.open.reset(width);
             side.member.reset(width);
