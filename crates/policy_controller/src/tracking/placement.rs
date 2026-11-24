@@ -55,7 +55,7 @@ use crate::{
         policy_engine::{Loaded, PolicyEngine},
         records::worker_id,
         view::WorkerId,
-        PlaceRequest, Unplaced,
+        Overlap, PlaceRequest, Unplaced,
     },
     store::GatewayId,
 };
@@ -155,6 +155,16 @@ pub struct Placement<'a> {
     /// request. Neither constructor reads one: the call that places a pair
     /// writes it, under the document it decided with.
     pub decode_profile: Option<&'static str>,
+    /// What the pick states of the worker the request goes to
+    /// ([`Overlap`]): how many leading blocks of the request that worker
+    /// holds, of how many. A host observes its cache series from it, once
+    /// a placement that states one. A pick states it of its first target
+    /// alone ([`Pick::overlap`](crate::engine::Pick::overlap)), so it
+    /// stands here where the request goes to that target.
+    /// [`Overlap::NONE`], which states nothing, where the pick states none,
+    /// as a pair's does. So too for a place of which nothing is owed, and
+    /// for a request that goes to a later target of its pick.
+    pub overlap: Overlap,
     /// The pick's lease: a pair's always, a single request's where a stage
     /// of the document takes a word of a request. `None` for an answer of
     /// which nothing is owed.
@@ -178,6 +188,7 @@ impl Placement<'_> {
             routing_key: None,
             profile,
             decode_profile: None,
+            overlap: Overlap::NONE,
             held: None,
         }
     }
@@ -217,6 +228,12 @@ impl Placement<'_> {
         // position in the document that decided.
         let profile = pick.map(|pick| engine.label_at(pick.trace.profile));
         let target = pick.and_then(|pick| pick.targets.as_slice().get(index).copied());
+        // A pick states what its first target holds, and nothing of the
+        // others: a request that goes to a later one is stated nothing.
+        let overlap = match pick {
+            Some(pick) if index == 0 => pick.overlap(),
+            _ => Overlap::NONE,
+        };
         // Held ahead of every refusal below: a lease ends at this guard's
         // drop where the placement is not made.
         let leased = decided.lease.is_some();
@@ -238,6 +255,7 @@ impl Placement<'_> {
             routing_key: None,
             profile,
             decode_profile: None,
+            overlap,
             held,
         })
     }
@@ -255,6 +273,7 @@ impl Placement<'_> {
             routing_key: None,
             profile: self.profile,
             decode_profile: self.decode_profile,
+            overlap: self.overlap,
             held: self.held,
         }
     }

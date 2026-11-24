@@ -1156,9 +1156,14 @@ mod tests {
         assert_eq!(size_of::<DecisionGuard<&PolicyEngine>>(), HELD);
         // A placement is the handle and what its host reads of the answer:
         // two worker pointers, the routing key, the profile's label, the
-        // label of a pair's decode side and one pointer to an encode
-        // request's encoders.
-        assert_eq!(size_of::<crate::tracking::Placement<'_>>(), HELD + 88);
+        // label of a pair's decode side, one pointer to an encode request's
+        // encoders, and what its pick states of the worker taken: six
+        // bytes, in a word of their own.
+        assert_eq!(size_of::<crate::tracking::Placement<'_>>(), HELD + 96);
+        // A host boxes a single request's side once, and that side is its
+        // placement with three words of its own: the box stays within the
+        // 640 bytes of the allocation class it had.
+        assert!(size_of::<crate::tracking::PlacementSide>() <= 640);
         // The lease the handle keeps states its request's text's two
         // lengths beside its token count: eight bytes more, the handle's
         // too. The second length sits in the padding the first left. The
