@@ -4714,9 +4714,8 @@ impl<'a> PairPools<'a> {
                 seed,
                 affinity,
                 named: None,
-                // A pin and lent counts are positions in one pool: neither
-                // side takes them.
-                pinned_at: 0,
+                // Lent counts are positions in one pool: neither side takes
+                // them.
                 lent_in_flight: None,
                 // The side's own cells: the request's would be read by
                 // another pool's positions.
@@ -4740,7 +4739,7 @@ fn carries_a_column(facts: &RequestFacts<'_>) -> bool {
 }
 
 /// The stage a decision names when a profile that shows its rows to a
-/// plugin was handed rows that carry a mask or a pin beside them.
+/// plugin was handed rows that carry a mask beside them.
 const WRITTEN_ROWS: &str = "written-rows";
 
 /// The decline of a decision whose rows were not written for the plugin
@@ -5249,8 +5248,7 @@ impl Engine {
     /// A host hands such a decision rows written for it: a plugin's view
     /// carries each row's bits and ages as the row's own fields, and
     /// [`Self::decide`] declines such a profile over rows that carry a mask
-    /// or a pin beside them ([`Constraints::stalled`],
-    /// [`RequestFacts::pinned_at`]). [`Self::decide_pair`] declines a mask
+    /// beside them ([`Constraints::stalled`]). So does [`Self::decide_pair`]
     /// beside a side that shows its rows: for a decode decision of a model
     /// that also pairs, the word carries the pair's decode side too, as the
     /// needs do, and for an encode decision the encode side of its `epd`
@@ -5912,8 +5910,8 @@ impl Engine {
     /// named in the column's place ([`AffinityRows`]) are read as the host
     /// derived them: a debug build asserts that they stand for the pool. A
     /// profile that shows its rows to a plugin is declined over rows that
-    /// carry a mask or a pin beside them, under the stage name
-    /// `written-rows` ([`Self::reads_for`]).
+    /// carry a mask beside them, under the stage name `written-rows`
+    /// ([`Self::reads_for`]).
     pub fn decide(
         &self,
         facts: &RequestFacts<'_>,
@@ -6114,9 +6112,9 @@ impl Engine {
         };
         // A plugin is shown each row as a record of the row's own fields:
         // its host hands rows written for the decision
-        // ([`Self::reads_for`]). A mask or a pin beside the rows says they
-        // are not, and the arm that would open the scope declines.
-        let unwritten = || !cx.stalled.is_empty() || facts.pinned_at != 0;
+        // ([`Self::reads_for`]). A mask beside the rows says they are not,
+        // and the arm that would open the scope declines.
+        let unwritten = || !cx.stalled.is_empty();
         // One arm a mark, the scope's and the assignment's first: a profile
         // under those two alone meets no test for the key.
         let _opened = if marks.asks_nothing_first() {
@@ -11084,11 +11082,9 @@ mod tests {
                 holders: &holders,
                 ..AffinityRows::default()
             }),
-            // A pin is a position in one pool: no side takes it either.
-            pinned_at: 2,
             ..RequestFacts::default()
         };
-        // Nor the counts a host lent: they are read by a position too.
+        // Nor the counts a host lent: they are read by a position.
         let mut counted = [0, 1].map(|position| Candidate {
             position,
             ..Candidate::default()
@@ -11103,7 +11099,6 @@ mod tests {
         for (side, name) in [(PairSide::Prefill, "prefill"), (PairSide::Decode, "decode")] {
             let (_, read) = pools.side(side, &facts).expect("an empty column fits");
             assert!(read.named.is_none(), "the {name} side");
-            assert_eq!(read.pinned_at, 0, "the {name} side");
             assert!(read.lent_in_flight.is_none(), "the {name} side");
         }
     }
@@ -11282,8 +11277,8 @@ mod tests {
     }
 
     /// A profile that shows its rows to a plugin says so by the engine's one
-    /// lookup, and its decision over rows that carry a mask or a pin beside
-    /// them is declined under a name of its own, in every build.
+    /// lookup, and its decision over rows that carry a mask beside them is
+    /// declined under a name of its own, in every build.
     #[test]
     fn a_profile_that_shows_its_rows_is_told_and_declines_rows_not_written_for_it() {
         #[derive(Debug)]
@@ -11326,10 +11321,6 @@ mod tests {
             model: "m",
             ..RequestFacts::default()
         };
-        let pinned = RequestFacts {
-            pinned_at: 1,
-            ..facts
-        };
         let masked = Constraints {
             stalled: &[0],
             ..Constraints::default()
@@ -11339,18 +11330,15 @@ mod tests {
             engine.decide(facts, &PoolFacts::default(), &pool, cx, &mut Scratch::new())
         };
         assert!(lead(&decide(&facts, &written)).is_some());
-        for (facts, cx, beside) in [(&facts, &masked, "a mask"), (&pinned, &written, "a pin")] {
-            let Decision::Shed(shed) = decide(facts, cx) else {
-                panic!("{beside} beside the rows is declined");
-            };
-            assert_eq!(
-                (shed.reason, shed.emptied_by),
-                (ShedReason::PolicyDeclined, WRITTEN_ROWS),
-                "{beside}"
-            );
-            assert_eq!(shed.trace.made_under(), Some(0), "{beside}");
-        }
-        // A profile that shows nothing reads both.
+        let Decision::Shed(shed) = decide(&facts, &masked) else {
+            panic!("a mask beside the rows is declined");
+        };
+        assert_eq!(
+            (shed.reason, shed.emptied_by),
+            (ShedReason::PolicyDeclined, WRITTEN_ROWS)
+        );
+        assert_eq!(shed.trace.made_under(), Some(0));
+        // A profile that shows nothing reads the mask.
         assert!(lead(&plain.decide(
             &facts,
             &PoolFacts::default(),

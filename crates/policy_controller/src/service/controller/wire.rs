@@ -413,8 +413,6 @@ impl Checked {
             // The wire carries the name: each read of the request's
             // session fingerprints it.
             model_fingerprint: ModelFingerprint::NONE,
-            // No decider asks its view for a pinned worker's row.
-            pinned_at: 0,
             // What the leases book stands beside rows a view lent: no
             // frame carries it.
             lent_in_flight: None,

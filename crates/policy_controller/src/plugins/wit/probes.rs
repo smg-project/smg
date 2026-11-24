@@ -216,12 +216,11 @@ pub(crate) fn all() -> Vec<Probe> {
             model, namespace_seed, tenant, priority, streaming, max_output_tokens,
             prompt_tokens, block_hashes, hash_kind, session_key, phase, attempt, tried,
             budget_micros, headers, media, seed, block_size, prompt_chars, prompt_bytes, now_micros,
-            pinned_at,
             lent_in_flight, session_counted, affinity, named,
             model_fingerprint, signal_cells, client_key, ring, ring_positions,
             session_key_from_rid,
         } host [
-            prompt_chars, prompt_bytes, now_micros, pinned_at, lent_in_flight,
+            prompt_chars, prompt_bytes, now_micros, lent_in_flight,
             session_counted,
             affinity, named, model_fingerprint, signal_cells, client_key, ring, ring_positions,
             session_key_from_rid
