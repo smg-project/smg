@@ -4454,10 +4454,23 @@ impl<'a> PairTable<'a> {
             return;
         }
         // A number above the table's width is no class of the table.
-        marks.reset(self.width());
+        let width = self.width();
+        marks.reset(width);
+        // The decodes are read until every number from one to the width
+        // less one has an open decode: no decode behind that one opens a
+        // class, and `open` is not asked for it.
+        let mut closed = width.saturating_sub(1);
         let mut any = false;
         for class in open {
-            any |= marks.insert(class);
+            if class == 0 || class as usize >= width || marks.has(class) {
+                continue;
+            }
+            marks.insert(class);
+            any = true;
+            closed -= 1;
+            if closed == 0 {
+                break;
+            }
         }
         if any {
             classes.extend(
@@ -7333,7 +7346,7 @@ impl Engine {
                 .map_or_else(|clause| clause.to_string(), |()| String::new())
         );
         // A decode outside its side's places partners nobody.
-        let open = places::rows(decodes, decode_cx)
+        let mut open = places::rows(decodes, decode_cx)
             .filter(|d| {
                 d.pair_class != 0
                     && decode_profile
@@ -7345,7 +7358,14 @@ impl Engine {
             .map(|d| d.pair_class);
         pools
             .table
-            .partnered(open, &mut scratch.classes, &mut scratch.marks);
+            .partnered(open.by_ref(), &mut scratch.classes, &mut scratch.marks);
+        // The pass may end ahead of the last decode. A filter the engine
+        // does not hold itself is asked about every decode all the same,
+        // in the pass's order: what it keeps of its asks stands.
+        let asked_whole = self.row_tests[usize::from(decode_index)].is_none();
+        if asked_whole {
+            open.for_each(drop);
+        }
         // No prefill class has an open decode. The decode pool is put to
         // the binding's all-vetoed rule once. Where the overload veto alone
         // left it nobody, every decode the hard filters keep with that veto
@@ -7375,13 +7395,15 @@ impl Engine {
                 // Here too a decode outside its side's places partners
                 // nobody: the rule's pass above opened with those places.
                 // So does a decode of class 0.
-                let kept = places::rows(decodes, decode_cx)
-                    .filter(|d| d.pair_class != 0 && hard().all(|f| f.keep(&all, d, &pass)));
-                pools.table.partnered(
-                    kept.map(|d| d.pair_class),
-                    &mut scratch.classes,
-                    &mut scratch.marks,
-                );
+                let mut kept = places::rows(decodes, decode_cx)
+                    .filter(|d| d.pair_class != 0 && hard().all(|f| f.keep(&all, d, &pass)))
+                    .map(|d| d.pair_class);
+                pools
+                    .table
+                    .partnered(kept.by_ref(), &mut scratch.classes, &mut scratch.marks);
+                if asked_whole {
+                    kept.for_each(drop);
+                }
             }
         }
         // The prefill buffer's mark of a lifted veto is cleared for this
@@ -13813,6 +13835,63 @@ mod tests {
         let second = decide_tabled(&engine, &prefills, &decodes, &lists);
         assert_eq!(lead(&second), Some(1));
         assert_eq!(decodes_of(&second), [1, 2], "class 2's decodes: {second:?}");
+    }
+
+    #[test]
+    fn the_partner_pass_ends_at_the_decode_that_opens_the_tables_last_class() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        // The pass alone: the third decode opens the last class, and the
+        // two behind it are not read.
+        let lists: [&[u32]; 2] = [&[1], &[2]];
+        let (ends, listed) = table_of(&lists);
+        let mut scratch = Scratch::new();
+        let mut open = [1, 1, 2, 2, 1].into_iter();
+        PairTable::new(&ends, &listed).partnered(
+            open.by_ref(),
+            &mut scratch.classes,
+            &mut scratch.marks,
+        );
+        assert_eq!(scratch.classes, [1, 2]);
+        assert_eq!(open.as_slice(), [2, 1]);
+
+        // A filter the engine does not hold itself is asked about every
+        // decode all the same: five asks in the pass, then three in the
+        // decode run of the prefill's class.
+        static ASKS: AtomicU32 = AtomicU32::new(0);
+        #[derive(Debug)]
+        struct Asked;
+        impl Filter for Asked {
+            fn name(&self) -> &'static str {
+                "asked"
+            }
+
+            fn keep(&self, _: &RequestFacts<'_>, _: &Candidate, _: &Constraints<'_>) -> bool {
+                ASKS.fetch_add(1, Ordering::Relaxed);
+                true
+            }
+        }
+        let engine = Engine::new(
+            vec![
+                least_requests_profile(),
+                Profile {
+                    filters: vec![Box::new(Asked)],
+                    ..least_requests_profile()
+                },
+            ],
+            vec![Binding {
+                decode_profile: Some(1),
+                ..pair_binding()
+            }],
+            1,
+            Needs::default(),
+        );
+        let mut prefills = classed_rows(&[1, 2]);
+        prefills[1].in_flight = 5;
+        let decodes = classed_rows(&[1, 1, 2, 2, 1]);
+        let decision = decide_tabled(&engine, &prefills, &decodes, &lists);
+        assert_eq!(decodes_of(&decision), [0, 1, 4]);
+        assert_eq!(ASKS.load(Ordering::Relaxed), 5 + 3);
     }
 
     #[test]
