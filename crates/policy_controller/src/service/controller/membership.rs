@@ -26,8 +26,8 @@
 //! **A call reads the record that stands off the worker objects.** The row
 //! under a URL, the row under an id and an engine's rows are read back from
 //! the objects in their holder's turn, behind its read of the store to its
-//! end ([`Objects::record`]). A status is the store's word still, so a
-//! record read carries the status the table holds.
+//! end ([`Objects::record`]). A worker object's status leads its row's, so
+//! a record read carries the status its object states.
 //!
 //! **A call writes under the term it reads once it holds the door's turn.**
 //! The fence is read under the lock, first: a call that waited its turn
@@ -38,13 +38,14 @@
 //! write.** The door is made with the holder of those objects, which the
 //! service's decisions read. A call's write of a row (a registration, a
 //! patch, a removal) is decided over them and the store follows it
-//! ([`Objects::upsert`]): the object stands when the write returns. A status
-//! is the store's word still: a drain and a connect signal write the
-//! table. So behind a write that answered, the door follows the store into
-//! the objects before the call answers: a decision made behind an
-//! acknowledged registration, drain or removal reads the fleet the call
-//! left. A standby's applier writes its leader's rows through the holder
-//! too ([`Objects::follow_at`]).
+//! ([`Objects::upsert`]): the object stands when the write returns. A drain
+//! and a connect signal go through the holder too: the store is told the
+//! status first, and the object moves where the store took it
+//! ([`Objects::drain_row`], [`Objects::connect_row`]). So a decision made
+//! behind an acknowledged registration, drain or removal reads the fleet
+//! the call left, and the door follows nothing behind its write. A
+//! standby's applier writes its leader's rows through the holder too
+//! ([`Objects::follow_at`]).
 //!
 //! **A registration that states several ranks is one write.** Each rank's
 //! facts are read by the call's own rules, a rank at a time. The host
@@ -230,8 +231,8 @@ impl MembershipCalls {
     }
 
     /// The door's read of the row under `id`, in its turn: the record read
-    /// back from the worker object that stands, with the status the table
-    /// holds ([`Objects::record`]).
+    /// back from the worker object that stands, with the status that
+    /// object states ([`Objects::record`]).
     fn row(&self, id: WorkerId) -> Option<WorkerRow> {
         self.objects.record(&self.store, id)
     }
@@ -823,7 +824,10 @@ impl MembershipCalls {
 
 /// A controller replica's own membership writer: the same calls for the
 /// program's own writers, sharing the turn of its control calls.
-#[cfg_attr(not(test), expect(dead_code, reason = "the host owns the door"))]
+#[cfg_attr(
+    not(any(test, feature = "discovery")),
+    expect(dead_code, reason = "the replica's discovery owns the door")
+)]
 pub(crate) struct ReplicaMembershipWriter {
     door: Arc<MembershipCalls>,
     by: Principal,
@@ -831,7 +835,7 @@ pub(crate) struct ReplicaMembershipWriter {
 }
 
 #[cfg_attr(
-    not(test),
+    not(any(test, feature = "discovery")),
     expect(dead_code, reason = "the host supplies the principal and fence")
 )]
 impl ReplicaMembershipWriter {
@@ -929,7 +933,7 @@ impl ReplicaMembershipWriter {
 }
 
 #[cfg_attr(
-    not(test),
+    not(any(test, feature = "discovery")),
     expect(dead_code, reason = "the host reads the term for each registration")
 )]
 struct ReplicaTurn<'a> {
@@ -1542,6 +1546,40 @@ pub(crate) mod tests {
             assert_eq!(refused.code(), Code::AlreadyExists, "engine {engine:?}");
             assert_eq!((store.epoch(), store.by_key(URL)), stood);
         }
+    }
+
+    /// A row that names no engine dials its key, and its engine's ranks
+    /// are asked under that key. Here such a row stands beside a rank that
+    /// names the key as its engine, both written around the holder: a
+    /// plain registration of the URL is refused as over any engine that
+    /// stands as ranks.
+    #[test]
+    fn a_row_that_names_no_engine_is_asked_for_its_ranks_under_its_key() {
+        let (store, door) = door();
+        let plain = WorkerFacts {
+            key: URL.to_owned(),
+            engine: String::new(),
+            incarnation: 1,
+            wire_modes: WireModes::GRPC,
+            models: vec!["model-a".to_owned()],
+            ..WorkerFacts::default()
+        };
+        let rank = WorkerFacts {
+            key: format!("{URL}@1"),
+            engine: URL.to_owned(),
+            dp_rank: 1,
+            dp_size: 2,
+            ..plain.clone()
+        };
+        store.upsert_by(plain, Registrant::Control);
+        store.upsert_by(rank, Registrant::Control);
+        let refused = door
+            .register(&operator(), under(TERM), &ask(spec(URL), Mode::Add))
+            .expect_err("its engine stands as ranks");
+        assert_eq!(
+            (refused.code(), refused.message()),
+            (Code::FailedPrecondition, super::AS_RANKS)
+        );
     }
 
     #[test]

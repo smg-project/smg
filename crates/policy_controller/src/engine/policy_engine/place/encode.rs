@@ -105,7 +105,7 @@ fn asked<'a>(
     call: &mut Call,
     placed: &mut EncodePlaced,
 ) -> Result<Option<Placement<'a>>, Unplaced> {
-    let mut made = Made::asked(engine.object, request, call);
+    let mut made = Made::asked(engine, request, call);
     let dated = Cell::new(None);
     let clock = || {
         let now = Instant::now();
@@ -149,7 +149,7 @@ fn asked<'a>(
     // reads each target's sides all the same, notes the ones that cannot be
     // sent to, and gives the decision up.
     let read = OnceCell::new();
-    let taken = walk(engine, decided, later, now, &mut call.missed, |target| {
+    let mut taken = walk(engine, decided, later, now, &mut call.missed, |target| {
         let (_, down) = read.get_or_init(&encoders);
         let sides = sides(request, &lists.pair, target, &kept)?;
         if down.is_empty() {
@@ -157,14 +157,19 @@ fn asked<'a>(
         } else {
             Err([None; 2])
         }
-    })?;
+    });
+    let Ok(walked) = &mut taken else {
+        return taken;
+    };
     let (workers, down) = read.into_inner().unwrap_or_default();
     for id in down {
         if !call.missed.contains(&id) {
             call.missed.push(id);
         }
     }
-    Ok(taken.map(|mut placement| {
+    // The placement is finished where the walk wrote it: a placement is
+    // several hundred bytes, and every hand of it is a copy.
+    if let Some(placement) = walked {
         placement.routing_key = key;
         placement.decode_profile = Some(decode_label(engine, request.model));
         // A decision that placed no item names no encoder, and allocates
@@ -172,8 +177,8 @@ fn asked<'a>(
         if !workers.is_empty() {
             placement.encoders = Encoders::named(workers, placed.one());
         }
-        placement
-    }))
+    }
+    taken
 }
 
 /// The asks of one call for an encode request over `lists` ([`ask`]): where
@@ -191,9 +196,10 @@ pub(super) fn place<'a>(
     items: EncodeItems<'_>,
     call: &mut Call,
 ) -> Result<Placement<'a>, Unplaced> {
-    match ask(engine, request, lists, items, call)? {
-        Some(placement) => Ok(placement),
-        None => call.again(|call| place(engine, request, lists, items, call)),
+    match ask(engine, request, lists, items, call) {
+        Ok(Some(placement)) => Ok(placement),
+        Ok(None) => call.again(|call| place(engine, request, lists, items, call)),
+        Err(unplaced) => Err(unplaced),
     }
 }
 

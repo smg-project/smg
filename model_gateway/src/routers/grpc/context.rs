@@ -61,8 +61,12 @@ use crate::{
     policies::CacheNamespace,
     routers::{
         common::{
-            attempt_ledger::AttemptLedger, pd_admission::PdAdmissionGuard, placement::Placed,
-            prefill_admission::PrefillLoadGuard, snapshot::WorkerRegistry, sse::SseSender,
+            attempt_ledger::AttemptLedger,
+            pd_admission::PdAdmissionGuard,
+            placement::Placed,
+            prefill_admission::{PrefillAhead, PrefillLoadGuard},
+            snapshot::WorkerRegistry,
+            sse::SseSender,
         },
         error::internal_error,
         grpc::regular::symphony::{template::Templates, PreparedConstraint},
@@ -360,8 +364,9 @@ pub(crate) struct ProcessingState {
     pub clients: Option<ClientSelection>,
 
     /// Prefill admission slot, taken during PD/EPD worker selection and
-    /// handed to the dispatch that runs the Prefill side.
-    pub pd_prefill_guard: Option<PrefillLoadGuard>,
+    /// handed to the dispatch that runs the Prefill side, which says the
+    /// prefill's send.
+    pub pd_prefill_guard: Option<PrefillAhead>,
 
     // Response processing state seeded during ingress (stop decoder, router
     // stop obligations, derived skip_special_tokens).
@@ -485,9 +490,9 @@ pub(crate) struct DispatchContext {
     /// its last reader and takes it.
     pub dispatch: Option<DispatchMetadata>,
     pub load_guards: Option<LoadGuards>,
-    /// Prefill admission slot for the next PD/EPD dispatch; a retry's
-    /// reselection refills it.
-    pub pd_prefill_guard: Option<PrefillLoadGuard>,
+    /// Prefill admission slot for the next PD/EPD dispatch, held ahead of
+    /// the prefill's send; a retry's reselection refills it.
+    pub pd_prefill_guard: Option<PrefillAhead>,
     pub response: ResponseState,
 }
 
@@ -1012,8 +1017,10 @@ pub(crate) enum WorkerSelection {
     ///
     /// The decode is kept as its placement answered it: its load guard is
     /// made from the answer ([`LoadGuards::new`],
-    /// [`LoadGuards::behind_prefill`]). The prefill's guard was made from
-    /// its answer where the Prefill admission took its slot.
+    /// [`LoadGuards::behind_prefill`]). The prefill's load is a plain guard
+    /// of its worker, held where the Prefill admission took its slot. What
+    /// its answer owes its send goes with that load ([`PrefillAhead`]), and
+    /// the dispatch says the send where the prefill goes out.
     Disaggregated {
         encode_assignments: Option<Vec<EncodeWorkerAssignment>>,
         prefill: Arc<dyn Worker>,

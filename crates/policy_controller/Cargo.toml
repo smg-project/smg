@@ -378,6 +378,12 @@ required-features = ["controller"]
 name = "watch_workers"
 required-features = ["controller"]
 
+# One case in a process of its own: another bind or TLS call of the process
+# would install the crypto provider first.
+[[test]]
+name = "crypto_provider"
+required-features = ["controller"]
+
 [[bench]]
 name = "decision"
 harness = false
@@ -448,10 +454,6 @@ harness = false
 
 [[bench]]
 name = "store_journal"
-harness = false
-
-[[bench]]
-name = "store_signals"
 harness = false
 
 [[bench]]

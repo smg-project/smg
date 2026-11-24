@@ -651,7 +651,7 @@ pub(crate) mod tests {
             decision_engine::{Decided, DecisionEngine, DecisionRefused, TokenKey, WorkerLists},
             demands::{DemandFacts, Demands},
             framework::{Picker, Place, PoolWord, TieBand, DRAW_FROM},
-            list_cell::tests::PublishedList,
+            list_cell::PublishedList,
             prompt_hashes::HashSeeds,
             records::worker_id,
             view::{
@@ -955,7 +955,8 @@ pub(crate) mod tests {
     #[test]
     fn a_place_picked_under_a_document_that_takes_a_word_is_noted() {
         let (engine, heard) = hearing_as(false, true, EventSet::LEASE);
-        let place = engine.place_for(MODEL, Phase::Single);
+        let document = engine.spec();
+        let place = document.place_for(MODEL, Phase::Single);
         assert!(matches!(place, Place::Alone(_)), "{place:?}");
         let list = pool(4);
         let members = PublishedList::new(Arc::clone(&list));
@@ -1044,7 +1045,7 @@ pub(crate) mod tests {
         });
         let records = engine
             .members_of(members.lent())
-            .records(engine.spec(), &engine.clock);
+            .records(engine.standing_spec(), &engine.clock);
         let stated: Vec<WorkerId> = (0..4).map(wide).collect();
         assert_eq!(records.ids(), stated);
         for (row, worker) in records.fixed().iter().zip(list.iter()) {
@@ -1074,7 +1075,7 @@ pub(crate) mod tests {
             .map(|worker| worker_id(worker.as_ref()))
             .collect();
         let unsaid = engine.members_of(unsaid.lent());
-        let records = unsaid.records(engine.spec(), &engine.clock);
+        let records = unsaid.records(engine.standing_spec(), &engine.clock);
         assert_eq!(records.ids(), prints);
     }
 
@@ -1099,7 +1100,7 @@ pub(crate) mod tests {
             .collect();
         let records = engine
             .members_of(members.lent())
-            .records(engine.spec(), &engine.clock);
+            .records(engine.standing_spec(), &engine.clock);
         assert_eq!(records.ids(), prints);
 
         // The stock sessions rule: a key's first request is placed and
@@ -1436,7 +1437,7 @@ pub(crate) mod tests {
         for workers in [3, DRAW_FROM - 1, DRAW_FROM, 64] {
             let spec = AppliedSpec::validate(&document).expect("the document validates");
             let engine = PolicyEngine::new(spec);
-            let Place::Alone(profile) = engine.place_for("unruled-1", Phase::Single) else {
+            let Place::Alone(profile) = engine.spec().place_for("unruled-1", Phase::Single) else {
                 panic!("one pick of round robin decides the place");
             };
             let (one, other) = (pool(workers), pool(workers));
@@ -1469,7 +1470,12 @@ pub(crate) mod tests {
             let mut shared = Vec::new();
             for turn in 0..8 {
                 shared.push(if turn % 2 == 0 {
-                    let alone = engine.pick(profile, lists[0].lent(), RoutingState::eligible);
+                    let alone = engine.pick(
+                        &engine.spec(),
+                        profile,
+                        lists[0].lent(),
+                        RoutingState::eligible,
+                    );
                     alone.expect("a worker")
                 } else {
                     whole(&lists[0], true)
@@ -2314,7 +2320,7 @@ pub(crate) mod tests {
         overlap::decide(
             engine.affinity(),
             &overlap::PoolAffinity::default(),
-            engine.spec(),
+            engine.standing_spec(),
             list,
             &ids,
             &mut asked.facts,
@@ -2583,7 +2589,8 @@ pub(crate) mod tests {
     #[test]
     fn a_decision_without_a_lease_takes_no_id_and_tells_no_stage() {
         let (engine, heard) = hearing_as(false, true, EventSet::LEASE);
-        let place = engine.place_for(MODEL, Phase::Single);
+        let document = engine.spec();
+        let place = document.place_for(MODEL, Phase::Single);
         assert!(matches!(place, Place::Alone(_)), "{place:?}");
         let list = pool(4);
         let members = PublishedList::new(Arc::clone(&list));
@@ -3364,6 +3371,22 @@ pub(crate) mod tests {
         hearing_spec_as(false, false, EventSet::LEASE)
     }
 
+    /// [`hearing_spec`] under the generation `number`, for a case that
+    /// puts a later document in force.
+    pub(in crate::engine::policy_engine) fn hearing_spec_at(number: u64) -> (AppliedSpec, Heard) {
+        let heard = Heard::default();
+        let kept = Arc::clone(&heard);
+        let spec = spec_picked_by_at(number, "hears", move || {
+            Box::new(Hears {
+                heard: Arc::clone(&kept),
+                panics: false,
+                alone: false,
+                takes: EventSet::LEASE,
+            })
+        });
+        (spec, heard)
+    }
+
     /// [`hearing`] with a picker that places by itself where `alone`, and
     /// that names the words `takes`.
     fn hearing_as(panics: bool, alone: bool, takes: EventSet) -> (PolicyEngine, Heard) {
@@ -3400,11 +3423,20 @@ pub(crate) mod tests {
         name: &'static str,
         make: impl Fn() -> Box<dyn Picker> + Send + Sync + 'static,
     ) -> AppliedSpec {
+        spec_picked_by_at(1, name, make)
+    }
+
+    /// [`spec_picked_by`] under the generation `number`.
+    fn spec_picked_by_at(
+        number: u64,
+        name: &'static str,
+        make: impl Fn() -> Box<dyn Picker> + Send + Sync + 'static,
+    ) -> AppliedSpec {
         let mut stages = StageRegistry::builtin();
         let added = stages.picker(name, make);
         added.expect("a free name");
         let mut document = PolicySpec::preset("random").expect("a built-in preset");
-        document.generation = 1;
+        document.generation = number;
         let profile = document.profiles.get_mut("random");
         profile.expect("the preset's profile").pick = name.into();
         let spec = AppliedSpec::validate_in(&document, &stages, &[]);
@@ -4089,7 +4121,7 @@ pub(crate) mod tests {
                 takes: EventSet::NONE,
             }))
         });
-        assert_eq!(engine.document.hears, EventSet::LEASE);
+        assert_eq!(engine.in_force().hears, EventSet::LEASE);
         assert_eq!(
             told(&engine, &heard, 0),
             ["issued", "dispatched", "completed", "issued", "released"]

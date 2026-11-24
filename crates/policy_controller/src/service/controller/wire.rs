@@ -413,8 +413,6 @@ impl Checked {
             // The wire carries the name: each read of the request's
             // session fingerprints it.
             model_fingerprint: ModelFingerprint::NONE,
-            // No decider asks its view for a pinned worker's row.
-            pinned_at: 0,
             // What the leases book stands beside rows a view lent: no
             // frame carries it.
             lent_in_flight: None,
@@ -449,6 +447,8 @@ impl Checked {
             wire_modes: self.wires().unwrap_or_default(),
             overload_lifted: constraints.overload_lifted,
             decode_later: self.decode_later(),
+            // A frame's request is counted by the leases on file alone.
+            counted_on_decode: false,
             subset_hint: constraints.subset_hint,
             demands: Demands::default(),
             stalled: &[],

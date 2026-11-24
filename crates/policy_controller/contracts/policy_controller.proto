@@ -1058,14 +1058,14 @@ message Snapshot {
   uint64 membership_epoch = 19;
 }
 
-// The health precedence's inputs.
+// What the controller holds of a worker's health.
 message HealthRow {
   fixed64 worker_id = 1;
   uint32 health = 2;
   uint32 probe_failures = 3;
   // Gateways with a standing veto on the worker.
   uint32 vetoing_gateways = 4;
-  // Gateways whose Completed reports succeeded within the last probe interval.
+  // Zero: the controller keeps no count of a gateway's Completed reports.
   uint32 reporting_ok = 5;
   uint32 since_ms = 6;
 }

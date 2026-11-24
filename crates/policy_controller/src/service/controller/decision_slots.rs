@@ -572,6 +572,8 @@ impl DecisionSlots {
             let files = "the store's files of leases are not one a decider";
             return Err(io::Error::new(io::ErrorKind::InvalidInput, files));
         }
+        // A replica's shared state gave the store its word already, and the
+        // first stays: this gives it for deciders started with no such state.
         lifecycle::tells(&reads.store, &reads.objects);
         let told = Arc::new(watch::Sender::new(false));
         let shared = Arc::new(Shared::default());
@@ -2183,13 +2185,89 @@ pub(crate) mod tests {
         assert_eq!(picked(&answer), bed.workers[2], "{answer:?}");
     }
 
+    /// A scorer that ranks every worker alike and says that it keeps a
+    /// number of each load report: no stage of this build says so.
+    #[derive(Debug)]
+    pub(crate) struct KeepsReports;
+
+    impl Lifecycle for KeepsReports {
+        fn keeps_loads(&self) -> bool {
+            true
+        }
+    }
+
+    impl Scorer for KeepsReports {
+        fn name(&self) -> &'static str {
+            "keeps-reports"
+        }
+
+        fn score(
+            &self,
+            _: &RequestFacts<'_>,
+            _: &[Candidate],
+            _: &[u32],
+            out: &mut [f32],
+        ) -> TieBand {
+            out.fill(0.0);
+            TieBand::NORMALIZED
+        }
+    }
+
+    /// A snapshot as the load monitor publishes it for the bed's three
+    /// workers, each report counting its resident tokens: the one at `idle`
+    /// holds none, and the others hold many.
+    fn resident_reports(idle: usize) -> Arc<LoadSnapshot> {
+        let loads = ["w0", "w1", "w2"].iter().enumerate();
+        let loads = loads.map(|(at, name)| {
+            let mut load = one_rank_load(0, 0.1, 10.0);
+            load.loads[0].num_resident_tokens = Some(if at == idle { 0 } else { 900_000 });
+            (format!("http://{name}:8000"), load)
+        });
+        LoadSnapshot::from_loads_for_test(loads.collect())
+    }
+
+    /// A document whose scorer is `resident-work` is given the snapshot, as
+    /// any document that reads reports: the scorer keeps no number of a
+    /// report. The monitor publishes one worker that holds no resident
+    /// tokens and the others many, and three frames name that worker,
+    /// whatever it holds in flight by then. The monitor then publishes
+    /// another worker so, and the picks follow. Given no snapshot, the
+    /// scorer would cost each worker by its requests in flight, and three
+    /// frames would name three workers.
+    #[tokio::test]
+    async fn a_decision_under_the_resident_work_scorer_reads_the_monitors_reports() {
+        let document: PolicySpec = serde_json::from_str(
+            r#"{
+              "apiVersion": "smg.policy/v1",
+              "generation": 1,
+              "profiles": { "p": {
+                "score": [{ "resident-work": { "request_tokens": 512 } }],
+                "pick": "best"
+              } },
+              "bindings": [{ "profile": "p" }]
+            }"#,
+        )
+        .expect("a document of this build");
+        let mut bed = bed(Some(applied(&document)), true, (2, 8), []);
+        // Three frames a publication: a worker of the bed runs four requests
+        // at the most.
+        for (idle, ids) in [(0, 1..=3u8), (1, 4..=6)] {
+            bed.loads.send_replace(resident_reports(idle));
+            for id in ids {
+                let answer = bed.ask(frame(id, 100 + u64::from(id))).await;
+                assert_eq!(picked(&answer), bed.workers[idle], "{answer:?}");
+            }
+        }
+    }
+
     /// A document with a stage that keeps load reports is given no
     /// snapshot: its engine's own task tells such a stage each report, and
-    /// a controller runs no such task yet. The monitor publishes one worker
-    /// with no queue and the others deep in theirs, and three frames still
-    /// name three workers, each by the requests it holds. The scorer that
-    /// reads reports outweighs the one that keeps them eight to one: given
-    /// the snapshot, it would name the worker with no queue three times.
+    /// a controller runs no such task yet. The stage is the cases' own
+    /// ([`KeepsReports`]). The monitor publishes one worker with no queue
+    /// and the others deep in theirs, and three frames still name three
+    /// workers, each by the requests it holds. The scorer that reads
+    /// reports outweighs the one that keeps them eight to one: given the
+    /// snapshot, it would name the worker with no queue three times.
     #[tokio::test]
     async fn a_document_with_a_stage_that_keeps_reports_is_given_no_snapshot() {
         let document: PolicySpec = serde_json::from_str(
@@ -2199,7 +2277,7 @@ pub(crate) mod tests {
               "profiles": { "p": {
                 "score": [
                   { "least-load": { "weight": 8 } },
-                  { "resident-work": { "request_tokens": 512 } }
+                  "keeps-reports"
                 ],
                 "pick": "best"
               } },
@@ -2207,7 +2285,14 @@ pub(crate) mod tests {
             }"#,
         )
         .expect("a document of this build");
-        let mut bed = bed(Some(applied(&document)), true, (2, 8), []);
+        let mut catalog = StageRegistry::builtin();
+        catalog
+            .scorer("keeps-reports", || Box::new(KeepsReports))
+            .expect("a free name");
+        let digest = document.digest().expect("the document digests");
+        let spec = AppliedSpec::validate_digested(&document, digest, &catalog, &[])
+            .expect("the catalog holds the stage");
+        let mut bed = bed(Some(spec), true, (2, 8), []);
         bed.loads.send_replace(reports(0));
         let mut named = Vec::new();
         for id in 1..=3u8 {
@@ -2273,6 +2358,9 @@ pub(crate) mod tests {
                 heard.push((pinned, None));
             }
             heard.push((pinned, Some(ReleaseReason::ClientGone)));
+            // The hand leaves the release to a decider still at work
+            // behind its answer, which tells it as it leaves that work.
+            settled(|| told.lock().len() >= heard.len()).await;
             assert_eq!(*told.lock(), heard, "{kept:?}");
         }
     }
@@ -2419,7 +2507,7 @@ pub(crate) mod tests {
             );
             given_up(&bed, &plain);
             let ended = a_completed(lease_of(&pinned).id, near);
-            lifecycle::completed(&bed.store, &hand, &ended, at).expect("the frame reads");
+            lifecycle::completed(&bed.store, &hand, &ended).expect("the frame reads");
             let plain = bed.ask(sized(frame(5, 1_005), 1_000)).await;
             assert_eq!(
                 picked(&plain),
@@ -2541,7 +2629,7 @@ pub(crate) mod tests {
                     let generation = generation.expect("the fleet serves the model");
                     let lent = objects.lent(&generation, Role::Single);
                     let members = front.members_of(lent);
-                    let ids = members.records(front.spec(), front.clock()).ids();
+                    let ids = members.records(front.standing_spec(), front.clock()).ids();
                     let place = |worker: &WorkerId| {
                         let at = ids.iter().position(|id| id == worker);
                         u32::try_from(at.expect("a worker of the list")).expect("a short list")
@@ -4195,7 +4283,7 @@ pub(crate) mod tests {
         let at = Instant::now();
         lifecycle::dispatched(&bed.store, &hand, &a_dispatched(lease), at)
             .expect("the frame reads");
-        lifecycle::completed(&bed.store, &hand, &a_completed(lease, picked(&answer)), at)
+        lifecycle::completed(&bed.store, &hand, &a_completed(lease, picked(&answer)))
             .expect("the frame reads");
         // The other model's decision, at the other file, right behind the
         // completion: it reads no request in flight.
@@ -4432,8 +4520,7 @@ pub(crate) mod tests {
                         .expect("the frame reads");
                     pause(served);
                     let completed = a_completed(lease, picked(&answer));
-                    lifecycle::completed(&bed.store, &hand, &completed, Instant::now())
-                        .expect("the frame reads");
+                    lifecycle::completed(&bed.store, &hand, &completed).expect("the frame reads");
                     pause(think);
                 }
                 // The first decision of a cell stands behind the cell

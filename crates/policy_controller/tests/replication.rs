@@ -37,7 +37,7 @@ use std::{
 use net::{http_get, loopback};
 use prost::Message as _;
 use smg_policy_controller::{
-    engine::{LoadRow, WireModes, WorkerId},
+    engine::{LoadRow, Role, WireModes, WorkerId},
     service::{
         controller::{
             Config, Controller, ElectionConfig, Error, LeasePlace, Listener, Readiness, Scope,
@@ -2053,6 +2053,41 @@ async fn a_standby_passes_its_probes_only_while_it_is_synced_with_its_leader() {
         "1"
     );
     assert_eq!(sample(standby.admin, state).await, "0");
+    standby.stop().await;
+    leader.stop().await;
+}
+
+/// A row its leader wrote reaches the published world of a standby that
+/// still follows. The standby's applier leaves the followed row's build
+/// owed, and no write of the standby's own comes behind it: its own serve
+/// pays the publication, as a leader's serve pays its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "the follower binds 127.0.0.2: off Linux that takes a loopback alias"
+)]
+async fn a_followed_row_reaches_the_published_world_of_a_standby() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let mut leader = Replica::serve("replication-0", LEADER, 0, shared(&dir)).await;
+    leader.leads().await;
+    let port = leader.replication.port();
+    let mut standby = Replica::serve("replication-1", FOLLOWER, port, shared(&dir)).await;
+    standby.reads(State::Follower).await;
+    let members = |replica: &Replica| replica.store.snapshot().members("model-a", Role::Single);
+    assert_eq!(members(&standby), None, "no row is written yet");
+
+    // One row on the leader, and no write behind it on either replica.
+    leader.store.upsert(facts("http://a:8000", 1, 0));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while members(&standby) != Some(1) {
+        assert!(
+            Instant::now() < deadline,
+            "the standby published no followed row within 10 s"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // It published as a follower: the lead did not turn.
+    standby.reads(State::Follower).await;
     standby.stop().await;
     leader.stop().await;
 }

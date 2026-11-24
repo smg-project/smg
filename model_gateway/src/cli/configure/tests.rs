@@ -751,14 +751,12 @@ fn the_print_option_says_a_refusal_in_one_sentence() {
     // A setting no document says: no document, and one sentence with the
     // setting by its name at the head. The words behind the head are the
     // policy crate's, and no case of the gateway holds them. The sticky
-    // override has no document beside the prefix hash ring.
-    let sticky = printed(&[
-        "smg",
-        "--policy",
-        "prefix_hash",
-        "--routing-key-override",
-        "--print-policy-spec",
-    ]);
+    // override's rule places single requests alone, and this line plans a
+    // pair.
+    let mut line = vec!["smg"];
+    line.extend_from_slice(PAIR);
+    line.extend_from_slice(&["--routing-key-override", "--print-policy-spec"]);
+    let sticky = printed(&line);
     assert_eq!(sticky.document(), None);
     assert!(
         sticky

@@ -183,7 +183,7 @@ fn decide_at(
         ..
     } = *taken;
     let front = world.front();
-    let spec = front.spec();
+    let spec = world.spec();
     let model = frame.model();
     if frame.hashes() > frame.hashes_read(spec) {
         own.hashes_cut.fetch_add(1, Ordering::Relaxed);
@@ -200,6 +200,9 @@ fn decide_at(
     let (decision, said) = match generation.as_deref() {
         Some(generation) => {
             let lent = objects.lent(generation, role);
+            // The list's value is asked under the document in force at this
+            // call, and the decision below loads that document again. The
+            // two read one document: a store's engine takes no new one.
             let members = front.members_of(lent);
             let records = members.records(spec, front.clock());
             let reach = objects.reach(generation, role);
@@ -257,7 +260,8 @@ fn decide_at(
 /// ahead of the snapshot that task keeps, and a snapshot a request gives is
 /// outside that order ([`RequestMaker::loads`]). A controller runs no such
 /// task yet: a document that holds such a stage is given none here, and its
-/// decisions read no report.
+/// decisions read no report. No stage of this build keeps reports: such a
+/// stage is one a host registers.
 ///
 /// [`RequestMaker::loads`]: crate::engine::RequestMaker::loads
 fn hands_reports(spec: &AppliedSpec) -> bool {
@@ -308,7 +312,7 @@ pub(crate) fn decide_pair(
         ..
     } = *taken;
     let front = world.front();
-    let spec = front.spec();
+    let spec = world.spec();
     let model = frame.model();
     if frame.hashes() > frame.hashes_read(spec) {
         own.hashes_cut.fetch_add(1, Ordering::Relaxed);
@@ -512,7 +516,7 @@ pub(crate) fn issue(
         front.count_shadow(said);
         return Ok(None);
     };
-    let stages = front.spec().engine();
+    let stages = world.spec().engine();
     let sized = (session, tokens);
     // The stages hear of every pick but one the binding's sessions rule
     // keeps from the profile: that one's lease is filed under the word.
@@ -561,11 +565,18 @@ pub(crate) fn issue(
 /// until a decode call issues it ([`issue_decode`]) or a dispatch names it.
 /// Its answer carries the prefill side's lease alone.
 ///
-/// No shadow runs on a pair's side yet, so none is counted here. The
-/// decode side's lease states the prefill side's session verdict: the
-/// store's decode side keeps none of its own yet. So a document that
-/// binds a sessions rule under the pair plan is refused at its apply, as
-/// not in this build.
+/// No shadow runs on a pair's side yet, so none is counted here. Each
+/// side's lease states its own session verdict: the prefill's the pick's,
+/// and the decode's the one the pick's first target states of its decode,
+/// which the store keeps with the side.
+///
+/// A pair's lease counts for each side's key
+/// ([`MemoryStore::issue_decided_pair`]), under any sessions rule and under
+/// none, as a single's keyed pick does ([`issue`]): one request more of a
+/// side's session stands on the side's worker while the side lives. A
+/// rule or a scorer that places by the fewest keys reads a pair's keys
+/// there. A decode call's side counts the key its own frame states
+/// ([`issue_decode`]), whatever the pair's first frame stated.
 ///
 /// # Errors
 ///
@@ -595,7 +606,7 @@ pub(crate) fn issue_pair(
         debug_assert!(decision.pick().is_none(), "a pair's pick: {decision:?}");
         return Ok(None);
     };
-    let stages = front.spec().engine();
+    let stages = world.spec().engine();
     let sized = (session, tokens);
     let record = record_of(front, taken, term, (pick, first), Side::Prefill, sized);
     let later = taken.request.decode_later();
@@ -603,6 +614,7 @@ pub(crate) fn issue_pair(
         target: chosen.decode_id,
         picked: PickRecord::of_decodes(&pick.targets),
         session: decode_session,
+        session_verdict: chosen.decode_verdict.on(chosen.decode_id),
         state: if later {
             LeaseState::Chosen
         } else {
@@ -672,7 +684,7 @@ pub(crate) fn decide_decode(
         ..
     } = *taken;
     let front = world.front();
-    let spec = front.spec();
+    let spec = world.spec();
     let model = frame.model();
     if frame.hashes() > frame.hashes_read(spec) {
         own.hashes_cut.fetch_add(1, Ordering::Relaxed);
@@ -766,8 +778,9 @@ pub(crate) fn decide_decode(
 /// Files a decode call's pick under `lease`, the pair's own lease, and
 /// tells the engine, under one hold of the file: the decode side on the
 /// pick's first decode, under the request's session of the decode phase,
-/// booking that decode's count. The side's lease comes with its issue's
-/// count, for an answer that does not leave
+/// booking that decode's count. The side keeps the call's own session
+/// verdict, in place of the one its first decision stated. The side's
+/// lease comes with its issue's count, for an answer that does not leave
 /// ([`MemoryStore::unissue_decode`]). `None` for a shed, which files none.
 ///
 /// The engine told is the one of the lease's own generation ([`issuing`]):
@@ -804,6 +817,7 @@ pub(crate) fn issue_decode(
         target: chosen.decode_id,
         picked: PickRecord::of_decodes(&pick.targets),
         session,
+        session_verdict: chosen.decode_verdict.on(chosen.decode_id),
         state: LeaseState::ISSUED,
         tokens,
         target_index: 0,

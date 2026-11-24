@@ -124,8 +124,9 @@ pub async fn serve_with_listener_until(
     // One simulated engine per listener (i.e. per virtual worker), registered
     // in the process fleet under `grpc:<port>` for the oracle and admin API.
     let name = format!("grpc:{}", addr.map(|a| a.port()).unwrap_or(0));
-    script::register(&name);
+    // The count before the name: a fleet list that names the worker finds it.
     let ops = AdminOps::register(&name);
+    script::register(&name);
     let ranks = Rank::spawn_all(&cfg, &name);
     // The worker's vLLM-wire KV-event publisher, numbered by its port offset:
     // its one rank's (the publisher ports are per worker, not per rank, so
@@ -718,6 +719,7 @@ impl MockScheduler {
         &self,
         input: GenerateInput,
     ) -> Result<FrameStream, Status> {
+        self.ops.record_request();
         self.check_rendezvous(&input.rendezvous)?;
         let in_flight = InFlight::enter_on(&self.in_flight);
 

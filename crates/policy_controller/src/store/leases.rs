@@ -118,7 +118,7 @@ impl PickRecord {
 
 /// The decode side of a pair's lease, as the store keeps it beside the
 /// lease's record ([`Sides`]). The sides share the lease's id and generation.
-/// Each has its own target, state, and, when live, booking.
+/// Each has its own target, session verdict, state, and, when live, booking.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DecodeSide {
     /// The first decode target of the pick, or the worker the side moved
@@ -129,6 +129,11 @@ pub struct DecodeSide {
     pub picked: PickRecord,
     /// The request's session under the decode phase.
     pub session: Session,
+    /// What the side's decision did with that session's key: the verdict
+    /// the pair of its pick's first target states
+    /// ([`Pair::decode_verdict`](crate::engine::decision::Pair::decode_verdict)),
+    /// by that pair's decode. The record's lease keeps the prefill side's.
+    pub session_verdict: SessionVerdict,
     /// Where the side stands.
     pub state: LeaseState,
     /// The token-work the side carries when issued.
@@ -147,15 +152,18 @@ impl DecodeSide {
     }
 
     /// Builds the side's lease from the shared fields on `prefill` and
-    /// the decode side's own fields. [`Lease::booked`] names the decode
-    /// target at the read, including any move at dispatch. A dispatch
-    /// hook for an issued side reads the lease as it stood at issue.
+    /// the decode side's own fields: a dispatch on the side settles its
+    /// session's claim by the side's own verdict, never by the prefill
+    /// side's. [`Lease::booked`] names the decode target at the read,
+    /// including any move at dispatch. A dispatch hook for an issued side
+    /// reads the lease as it stood at issue.
     pub fn lease(&self, prefill: &Lease) -> Lease {
         Lease {
             side: Side::Decode,
             target_index: self.target_index,
             booked: self.target,
             session: self.session,
+            session_verdict: self.session_verdict,
             tokens: self.tokens,
             ..*prefill
         }
@@ -536,7 +544,7 @@ pub trait LeasesStore: Send + Sync {
 
     /// The gateways are gone past their grace: every lease of each released
     /// as client gone, and with them what the store holds of each gateway's
-    /// own about a worker (its vetoes, its completed dispatches). One write
+    /// own about a worker: its vetoes. One write
     /// a table for them all: one pass over the leases, one over the vetoes
     /// and one publication. Returns how many leases each held, in the order
     /// of `gone`. It is the store's one door for a gone gateway.

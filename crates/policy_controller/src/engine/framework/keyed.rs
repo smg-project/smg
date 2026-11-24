@@ -148,6 +148,7 @@ impl Engine {
         let (entry, index, profile) = self.resolve(facts.model, facts.phase)?;
         let Entry {
             binding,
+            glob: _,
             placing,
             vetoed,
             sides_placed: _,

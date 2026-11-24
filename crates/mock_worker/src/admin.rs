@@ -4,8 +4,9 @@
 //!
 //! - `GET /admin/fleet`: every worker of the process: a realistic engine with
 //!   its cache size and load and, in a canned process, each listener with its
-//!   name and mode; with the shared KV tier on (`--global-l3-blocks`), the
-//!   blocks it holds and the tokens restored from it.
+//!   name, its mode and the generation requests it received; with the shared
+//!   KV tier on (`--global-l3-blocks`), the blocks it holds and the tokens
+//!   restored from it.
 //! - `GET /admin/requests?since=<seq>&limit=<n>`: admitted-request records
 //!   (`request_id`, serving worker, prompt/cached/oracle tokens and the
 //!   cached tokens restored from the shared tier, queue wait), oldest first,
@@ -15,7 +16,8 @@
 //!   cache and publish `AllBlocksCleared` (an engine restart, to the index).
 //! - `POST /admin/fault/{worker}/drop?batches=N`, `.../duplicate?batches=N`,
 //!   `.../swap?pairs=N`, `.../cut-streams`, `.../delay?ms=D`,
-//!   `.../load-lag?ms=D`, `.../restart-publisher`, `.../pause`, `.../resume`,
+//!   `.../load-lag?ms=D`, `.../load-freeze?on=B`, `.../restart-publisher`,
+//!   `.../pause`, `.../resume`,
 //!   `.../fail?status=S[&count=N|&secs=T][&after_tokens=K][&stall_ms=M]` and
 //!   `GET /admin/fault/{worker}`: the fault hooks (see the README).
 //! - `POST /admin/fault/{worker}/load-fail?status=S`: the worker's load
@@ -23,8 +25,8 @@
 //! - `POST /admin/fault/{worker}/load-mute?on=B`: the worker pushes no
 //!   load report while B is `true` (see the README).
 //! - `GET /admin/ops/{worker}`: what the gateway's admin fan-out reached on
-//!   the worker: its flushes, its profiling runs and the last trace written
-//!   (`all`: every worker).
+//!   the worker: its flushes, its profiling runs and the last trace written,
+//!   and the generation requests the worker received (`all`: every worker).
 //! - `POST /admin/truth/{worker}` with `{"token_ids": [...]}`: what the
 //!   worker would serve from cache for that prompt right now;
 //!   `GET /admin/truth`: per worker, what it served over every admitted
@@ -94,6 +96,7 @@ fn router(state: Arc<AdminState>) -> Router {
         .route("/admin/fault/{worker}/admit-rate", post(fault_admit_rate))
         .route("/admin/fault/{worker}/cold-shape", post(fault_cold_shape))
         .route("/admin/fault/{worker}/load-lag", post(fault_load_lag))
+        .route("/admin/fault/{worker}/load-freeze", post(fault_load_freeze))
         .route(
             "/admin/fault/{worker}/restart-publisher",
             post(fault_restart_publisher),
@@ -301,6 +304,7 @@ fn status_json(e: &Engine) -> Value {
         "admit_per_sec": s.admit_per_sec,
         "cold_shape_ms": s.cold_shape_ms,
         "load_lag_ms": s.load_lag_ms,
+        "load_frozen": s.load_frozen,
         "paused": s.paused,
         "generation": s.generation,
         "restarts": s.restarts,
@@ -413,8 +417,9 @@ async fn fleet(State(state): State<Arc<AdminState>>) -> Json<Value> {
 
 /// One row per worker of the process, in name order: a realistic engine with
 /// its load (a data-parallel rank is a row of its own, named `<worker>:r<k>`)
-/// and, in a canned process, each listener with its name and mode alone, since
-/// no engine stands behind it. A listener registers its name when it starts,
+/// and, in a canned process, each listener with its name, its mode and the
+/// generation requests it received (an HTTP or gRPC worker's own count, since
+/// no engine stands behind it). A listener registers its name when it starts,
 /// before a realistic engine spawns (a ZMQ rank's after its handshake), so a
 /// realistic process lists its engines alone and a canned fleet counts here as
 /// it serves; an engine no listener claims is listed after them.
@@ -422,7 +427,19 @@ fn fleet_rows(cfg: &Config) -> Vec<Value> {
     let engines = engine::fleet_engines();
     let mut listed = vec![false; engines.len()];
     let mut rows = Vec::with_capacity(engines.len());
-    for worker in script::registered() {
+    // The names first, then every worker's count in one read of the registry
+    // (not one a row): a worker registers its count before its name, so each
+    // name read here has its count there.
+    let workers = script::registered();
+    let received: HashMap<String, u64> = if cfg.realistic {
+        HashMap::new()
+    } else {
+        AdminOps::all()
+            .iter()
+            .map(|ops| (ops.name().to_string(), ops.requests()))
+            .collect()
+    };
+    for worker in workers {
         let mut found = false;
         for (index, e) in engines.iter().enumerate() {
             if is_engine_of(&worker, e.name()) {
@@ -432,7 +449,12 @@ fn fleet_rows(cfg: &Config) -> Vec<Value> {
             }
         }
         if !found && !cfg.realistic {
-            rows.push(json!({ "worker": worker, "engine": "canned" }));
+            let mut row = json!({ "worker": worker, "engine": "canned" });
+            // A ZMQ rank keeps no such count: its row stays without the key.
+            if let Some(requests) = received.get(&worker) {
+                row["requests"] = json!(requests);
+            }
+            rows.push(row);
         }
     }
     for (index, e) in engines.iter().enumerate() {
@@ -678,6 +700,19 @@ async fn fault_load_lag(
         Err(response) => return response,
     };
     apply(&worker, |e| e.fault_load_lag_ms(ms))
+}
+
+/// The worker's load reports stand as they read now (`on=true`), or follow
+/// its engine again (`on=false`).
+async fn fault_load_freeze(
+    Path(worker): Path<String>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let on: bool = match param(&q, "on") {
+        Ok(v) => v,
+        Err(response) => return response,
+    };
+    apply(&worker, |e| e.fault_load_freeze(on))
 }
 
 async fn fault_admit_rate(

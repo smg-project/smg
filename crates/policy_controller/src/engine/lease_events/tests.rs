@@ -19,7 +19,7 @@ use crate::{
         decision::{Decision, PlacedBy, Target, Targets},
         decision_engine::{Request, RequestMaker, WorkerLists},
         framework::{Picker, TieBand},
-        list_cell::tests::PublishedList,
+        list_cell::PublishedList,
         policy_engine::PolicyEngine,
         view::{Candidate, Constraints, Identity, RequestFacts},
     },

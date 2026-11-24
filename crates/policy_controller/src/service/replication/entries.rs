@@ -48,11 +48,6 @@ pub const ENTRIES: &[(&str, &str, EntryReplication)] = &[
         "host_count",
         EntryReplication::Rebuilt("each replica's holder hands its own worker objects"),
     ),
-    // The status a verdict moves is journaled as the status write it makes.
-    // The streak between two moves is the prober's own count: a promoted
-    // standby's prober starts it again.
-    ("HealthSink", "probe_outcome", EntryReplication::Journaled),
-    ("HealthSink", "connected", EntryReplication::Journaled),
     (
         "HealthSink",
         "gateway_veto",
@@ -64,12 +59,6 @@ pub const ENTRIES: &[(&str, &str, EntryReplication)] = &[
         EntryReplication::Rebuilt(HELLO),
     ),
     ("HealthSink", "vetoed", EntryReplication::Read),
-    (
-        "HealthSink",
-        "completed",
-        EntryReplication::Rebuilt("the gateways' reports of the last probe interval"),
-    ),
-    ("HealthSink", "completed_ok_since", EntryReplication::Read),
     // A log carries no load row: a standby holds none of its leader's and
     // no overload verdict. Its first poll goes out at its take.
     ("LoadSink", "record", EntryReplication::Rebuilt(REPORTED)),
@@ -99,12 +88,6 @@ pub const ENTRIES: &[(&str, &str, EntryReplication)] = &[
     ("LoadSink", "publish_due", EntryReplication::Read),
     ("LoadSink", "publish", EntryReplication::Rebuilt(PUBLISHED)),
     ("LoadSink", "wake_with", EntryReplication::Read),
-    ("SignalSink", "signal_columns", EntryReplication::Read),
-    (
-        "SignalSink",
-        "signal_value",
-        EntryReplication::Rebuilt(REPORTED),
-    ),
     (
         "KvEventSink",
         "admit",
@@ -249,11 +232,10 @@ mod tests {
     use super::*;
 
     /// The store's ingress traits, each with its file's text.
-    const TRAITS: [(&str, &str); 7] = [
+    const TRAITS: [(&str, &str); 6] = [
         ("WorkersStore", include_str!("../../store/workers.rs")),
         ("HealthSink", include_str!("../../store/health.rs")),
         ("LoadSink", include_str!("../../store/loads.rs")),
-        ("SignalSink", include_str!("../../store/signals.rs")),
         ("KvEventSink", include_str!("../../store/kv_events.rs")),
         (
             "ReservationStore",

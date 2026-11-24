@@ -236,7 +236,8 @@ pub mod bench_support {
     use super::{
         attempt_ledger::AttemptLedger,
         overload,
-        placement::{select_pair, select_single, Placed, PlacementInputs, Stated},
+        placement::{select_pair, select_single, Placed, PlacedPair, PlacementInputs, Stated},
+        prefill_admission::hold_unbounded,
     };
     use crate::{
         config::RouterConfig,
@@ -387,12 +388,21 @@ pub mod bench_support {
         .ok()?;
         let went = placed_on(pair.prefill.worker());
         let key = policies.sticky_key(None, None);
-        let prefill = pair.prefill.into_guard(key);
+        // The prefill's load as a pair route holds it with admission
+        // disabled: a plain guard of its worker under the route's key, made
+        // ahead of the send, and the send said where the prefill goes out.
+        let handed_on = |pair: PlacedPair| {
+            let (prefill, unsent) = pair.prefill.unsent();
+            ((prefill, pair.decode), unsent)
+        };
+        let ((_prefill, decode), ahead) =
+            hold_unbounded(pair, key, |pair| &pair.prefill, handed_on);
+        let prefill = ahead.sent();
         // The decode's guard as a pair route makes it: ahead of the decode's
         // send, and sent behind the prefill.
-        let decode = pair.decode.ahead(key);
-        let decode = pair.decode.sent(decode);
-        drop((prefill, decode));
+        let decode_guard = decode.ahead(key);
+        let decode_guard = decode.sent(decode_guard);
+        drop((prefill, decode_guard));
         Some(went)
     }
 

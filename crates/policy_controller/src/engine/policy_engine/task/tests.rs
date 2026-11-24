@@ -26,7 +26,7 @@ use crate::{
     document::spec::{AppliedSpec, PolicySpec},
     engine::{
         decision_engine::{DecisionEngine, Request, RequestMaker, WorkerLists},
-        list_cell::tests::PublishedList,
+        list_cell::PublishedList,
         policy_engine::{
             membership::tests::{handed, id, in_id_order, registry, told},
             single::tests::hearing,
@@ -46,10 +46,14 @@ pub(in crate::engine::policy_engine) const MODEL: &str = "model-a";
 
 /// The engine of a stock document, as a host that spawns its task holds it.
 fn preset(name: &str) -> Arc<PolicyEngine> {
+    Arc::new(PolicyEngine::new(stock(name, 1)))
+}
+
+/// The stock document `name` as applied under the generation `number`.
+pub(in crate::engine::policy_engine) fn stock(name: &str, number: u64) -> AppliedSpec {
     let mut document = PolicySpec::preset(name).expect("a built-in preset");
-    document.generation = 1;
-    let spec = AppliedSpec::validate(&document).expect("the document validates");
-    Arc::new(PolicyEngine::new(spec))
+    document.generation = number;
+    AppliedSpec::validate(&document).expect("the document validates")
 }
 
 pub(in crate::engine::policy_engine) fn url(at: usize) -> String {
@@ -333,8 +337,9 @@ async fn a_requests_own_snapshot_is_read_ahead_of_the_engines() {
 }
 
 /// An engine whose document reads no load report and no named signal, and
-/// none of whose stages keeps a report, keeps no channel and no snapshot:
-/// its draws look no report up, so its list never converts one.
+/// none of whose stages keeps a report, keeps its host's channel and no
+/// snapshot of it: its draws look no report up, so its list never converts
+/// one.
 #[tokio::test(start_paused = true)]
 async fn an_engine_whose_document_reads_no_report_keeps_no_snapshot() {
     let engine = preset("random");
@@ -343,13 +348,44 @@ async fn an_engine_whose_document_reads_no_report_keeps_no_snapshot() {
     let (_feed, channel) = monitor(&reports(32, 2));
     engine.set_loads(channel);
     let task = running(&engine).await;
-    assert!(engine.loads.feed.lock().1.is_none(), "no channel is kept");
-    assert!(engine.loads.newest().is_none(), "and no snapshot");
+    assert!(engine.loads.feed.lock().1.is_some(), "the channel is kept");
+    assert!(engine.loads.newest().is_none(), "and no snapshot of it");
     for seed in 0..256 {
         let _ = picked(&engine, &asks(seed, &members, None));
     }
     let converted = engine.conversions(members.lent());
     assert_eq!(converted, 0, "no report was looked up");
+    task.abort();
+}
+
+/// The channel a host handed once serves each document put in force
+/// later. Under a document that reads no report the task keeps no
+/// snapshot of it. Under a document that reads reports, put in force with
+/// no second hand-over, the task keeps the newest from its next upkeep on,
+/// and a decision picks by it. A document that reads none again lets the
+/// snapshot go.
+#[tokio::test(start_paused = true)]
+async fn a_channel_handed_once_serves_each_document_put_in_force_later() {
+    let engine = preset("random");
+    let list = pool(4);
+    let members = PublishedList::new(Arc::clone(&list));
+    let (_feed, channel) = monitor(&reports(4, 2));
+    engine.set_loads(channel);
+    let task = running(&engine).await;
+    assert!(engine.loads.newest().is_none(), "none under the first");
+
+    let applied = engine.apply(stock("least_load", 2));
+    applied.expect("a number above the standing one");
+    sleep(Duration::from_secs(1)).await;
+    for seed in 0..32 {
+        let place = picked(&engine, &asks(seed, &members, None));
+        assert_eq!(place, 2, "seed {seed}: the shortest queue handed once");
+    }
+
+    let applied = engine.apply(stock("random", 3));
+    applied.expect("a number above the standing one");
+    sleep(Duration::from_secs(1)).await;
+    assert!(engine.loads.newest().is_none(), "none under the third");
     task.abort();
 }
 
@@ -473,7 +509,7 @@ async fn the_task_runs_the_upkeep_with_no_call_of_its_host() {
     first.dispatched(now);
     first.completed(&served(pinned.id), now);
     drop(first);
-    let sessions = engine.spec().engine().sessions();
+    let sessions = engine.standing_spec().engine().sessions();
     assert_eq!(sessions.len(), 1);
     // The stock rule idles a key four hours and sweeps once a minute: the
     // key ends at the first sweep at or after its idle time, and the pass

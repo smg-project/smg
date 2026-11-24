@@ -7,17 +7,17 @@
 //!
 //! Every fact the store holds of an engine came from that engine, through a
 //! sink. Loads are the controller's own load monitor's: the harness writes
-//! none. Health and KV events are the controller's own where its build
-//! has the `worker-host` feature: its prober and its feed are then the
-//! store's one writer of each, and the harness only listens. Its dialer
-//! ([`probe`]) asks each engine its wire's health check once an interval
-//! and keeps how the dial ended, and a listener ([`subscribe`]) holds one
+//! none. Health is the controller's own too: its prober moves a worker's
+//! status, and the harness's dialer ([`probe`]) writes nothing. It asks
+//! each engine its wire's health check once an interval and keeps how the
+//! dial ended, for a case to read. KV events are the controller's own
+//! where its build has the `worker-host` feature: its feed is then the
+//! store's one writer of them, and a listener ([`subscribe`]) holds one
 //! event stream an engine and keeps what the stream said. A build without
-//! that feature has no driver of either, so there each stands in for one.
-//! The dialer writes what it heard, never what the case knows, and the
-//! listener decodes each batch into the events an index applies and hands
-//! it to the sink. A dial is bounded, so an engine that stops answering
-//! costs a turn that bound and no more.
+//! that feature has no feed, so there the listener stands in for one: it
+//! decodes each batch into the events an index applies and hands it to
+//! the sink. A dial is bounded, so an engine that stops answering costs a
+//! turn that bound and no more.
 //!
 //! An engine speaks the wire of its kind ([`Shape::runtime`]): the fleet's
 //! first wire, or the one whose load report counts resident tokens. The
@@ -75,9 +75,9 @@ use smg_policy_controller::{
     },
     stages::StageRegistry,
     store::{
-        BatchFacts, BatchOutcome, GatewayId, HealthPolicy, HealthSink, KvCursor, KvEvent,
-        KvEventSink, LaneCounts, LeaseState, MembershipChange, MembershipTail, MemoryStore,
-        ResyncReason, SequenceHash, Signals, StoredBlock, WorkerFacts, WorkerStatus, WorkersStore,
+        BatchFacts, BatchOutcome, GatewayId, HealthPolicy, KvCursor, KvEvent, KvEventSink,
+        LaneCounts, LeaseState, MembershipChange, MembershipTail, MemoryStore, ResyncReason,
+        SequenceHash, Signals, StoredBlock, WorkerFacts, WorkerStatus, WorkersStore,
     },
     tracking::LeaseId,
 };
@@ -106,7 +106,7 @@ use crate::{
 const LEADER: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 const STANDBY: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2));
 
-/// How often the stand-in prober asks every engine: the check interval of
+/// How often the harness's dialer asks every engine: the check interval of
 /// every registration.
 pub const PROBE_INTERVAL: Duration = Duration::from_millis(500);
 
@@ -124,11 +124,6 @@ pub const ROOM: Duration = Duration::from_secs(30);
 /// with the `worker-host` feature streams each engine's events into its
 /// store, and the harness then only listens.
 const PRODUCT_FEEDS: bool = cfg!(feature = "worker-host");
-
-/// Whether the controller under test probes its own workers: a build with
-/// the `worker-host` feature probes each while it leads, and the harness's
-/// dialer then writes nothing.
-pub const PRODUCT_PROBES: bool = cfg!(feature = "worker-host");
 
 /// Every reason the store counts a resync under.
 const RESYNCS: [ResyncReason; 9] = [
@@ -219,17 +214,6 @@ pub struct Moved {
     pub to: WorkerStatus,
 }
 
-/// One status the stand-in prober moved.
-#[derive(Clone, Copy, Debug)]
-pub struct Verdict {
-    pub engine: usize,
-    pub from: WorkerStatus,
-    pub to: WorkerStatus,
-    /// The probe turn that wrote it, counted from one.
-    pub turn: u64,
-    pub at: Instant,
-}
-
 /// One rank's KV events: what the listener's stream delivered beside what
 /// the store holds of it, read at one instant. Where the controller feeds
 /// itself the two come by streams of their own, so they agree only at rest.
@@ -255,12 +239,6 @@ pub struct Heard {
 pub struct Death {
     /// When the kill was asked: no socket of the engine had closed yet.
     pub at: Instant,
-    /// The probe turns begun when the kill was asked: a dial of a turn
-    /// numbered below it heard a live engine.
-    pub asked: u64,
-    /// The probe turns begun once every socket of the engine had closed: a
-    /// turn numbered above it dialed a dead engine.
-    pub turn: u64,
 }
 
 /// A mock engine on a runtime and a thread of its own. Its kill drops that
@@ -315,13 +293,12 @@ impl Engine {
     }
 }
 
-/// What the stand-in prober counts and writes.
+/// What the harness's dialer counts.
 #[derive(Default)]
 struct Turns {
     begun: AtomicU64,
     /// What each dial heard, in the order dialed.
     dialed: Mutex<Vec<Dialed>>,
-    verdicts: Mutex<Vec<Verdict>>,
 }
 
 /// How one dial of an engine ended.
@@ -388,7 +365,7 @@ struct Stream {
     head: Vec<StoredBlock>,
 }
 
-/// An engine as the stand-in prober dials it: its address and the rows its
+/// An engine as the harness's dialer dials it: its address and the rows its
 /// one answer speaks for.
 #[derive(Clone)]
 struct Probed {
@@ -473,9 +450,9 @@ fn millis(duration: Duration) -> u32 {
 }
 
 /// The health policy every registration states: one probe turn moves a
-/// rank between ready and unhealthy, at the stand-in prober's interval and
-/// under its dial bound. A controller that probes by itself counts both in
-/// whole seconds: it asks an engine once a second.
+/// rank between ready and unhealthy, at the harness's dialer's interval and
+/// under its dial bound. The controller's prober counts both in whole
+/// seconds: it asks an engine once a second.
 fn health_policy() -> HealthPolicy {
     HealthPolicy {
         failure_threshold: 1,
@@ -770,16 +747,12 @@ async fn dial(
 }
 
 /// The harness's dialer: every [`PROBE_INTERVAL`] one turn asks each engine
-/// once and keeps how the dial ended. Where it `writes` it stands in for
-/// the health prober: it writes what the dial heard for each of the
-/// engine's rows, under the row's revision, and a status that moved is kept
-/// with the turn that moved it.
+/// once and keeps how the dial ended. It writes nothing: the controller
+/// under test probes its own workers.
 async fn probe(
-    store: Arc<MemoryStore>,
     probed: Arc<Mutex<Vec<Probed>>>,
     turns: Arc<Turns>,
     mut stop: watch::Receiver<bool>,
-    writes: bool,
 ) {
     let mut clients = HashMap::new();
     let mut tick = tokio::time::interval(PROBE_INTERVAL);
@@ -795,33 +768,11 @@ async fn probe(
             engine,
             runtime,
             endpoint,
-            ids,
+            ..
         } in engines
         {
             let end = dial(&mut clients, runtime, &endpoint).await;
-            let healthy = end.healthy();
             turns.dialed.lock().push(Dialed { engine, turn, end });
-            if !writes {
-                continue;
-            }
-            for id in ids {
-                let Some(row) = store.get(id) else { continue };
-                // A verdict is pushed under the lock its write was made
-                // under: a reader that saw the write reads the verdict.
-                let mut verdicts = turns.verdicts.lock();
-                if let Some((from, to)) = store
-                    .probe_outcome(id, healthy, row.revision, &|| true)
-                    .moved()
-                {
-                    verdicts.push(Verdict {
-                        engine,
-                        from,
-                        to,
-                        turn,
-                        at: Instant::now(),
-                    });
-                }
-            }
         }
     }
 }
@@ -1328,10 +1279,8 @@ impl Harness {
     /// releases the lease, and turns the harness to `standby` once it
     /// leads: the two clients connect to its listeners and the store read
     /// from here on is its own. The registrations stand, since a standby
-    /// holds its leader's rows under their ids. A stand-in prober goes on
-    /// writing to the stopped controller's store, so there the promoted
-    /// one's rows keep the status its leader's log told. A controller that
-    /// probes by itself probes its rows from its take on.
+    /// holds its leader's rows under their ids. The promoted controller
+    /// probes its rows from its take on.
     pub async fn hand_over(&mut self, standby: Replica) -> Result<(), String> {
         let stopped = std::mem::replace(&mut self.replica, standby);
         stopped.stop().await?;
@@ -1415,9 +1364,9 @@ impl Harness {
 
     /// Register: starts one mock engine per shape and registers each of its
     /// ranks, pending: only a probe's verdict makes a rank ready. The check
-    /// interval and the timeout are the stand-in prober's own, and both
+    /// interval and the timeout are the harness's dialer's own, and both
     /// thresholds are one, so one probe turn moves a rank between ready and
-    /// not ready; the store steps a rank that stays not ready on to failed
+    /// not ready; the prober steps a rank that stays not ready on to failed
     /// three failures later. Returns the engines' indexes, in the shapes'
     /// order.
     pub async fn register(&mut self, shapes: &[Shape]) -> Result<Vec<usize>, String> {
@@ -1508,7 +1457,7 @@ impl Harness {
         match answer.event {
             Some(Event::Registered(row))
                 if row.status() == proto::WorkerStatus::Pending
-                    || (PRODUCT_PROBES && row.status() == proto::WorkerStatus::Ready) =>
+                    || row.status() == proto::WorkerStatus::Ready =>
             {
                 Ok(WorkerId(row.id))
             }
@@ -1522,11 +1471,9 @@ impl Harness {
     /// controller's own load monitor polls every ready engine.
     pub fn feed(&mut self) {
         self.feeds.spawn(probe(
-            Arc::clone(&self.store),
             Arc::clone(&self.probed),
             Arc::clone(&self.turns),
             self.stop_feeds.subscribe(),
-            !PRODUCT_PROBES,
         ));
         let engines = self.probed.lock().clone();
         for engine in engines {
@@ -1916,17 +1863,6 @@ impl Harness {
             .is_some_and(|record| matches!(record.state, LeaseState::Dispatched { .. }))
     }
 
-    /// Whether the store holds a completion of class ok by the gateway named
-    /// `gateway` on the first rank of the engine at `engine`, at or after
-    /// `since`: the read a decision's precedence rule makes of one
-    /// gateway's own dispatches.
-    pub fn completed_ok(&self, gateway: &str, engine: usize, since: Instant) -> bool {
-        self.worker(engine).is_ok_and(|served| {
-            let gateway = GatewayId(fingerprint(gateway.as_bytes()));
-            self.store.completed_ok_since(gateway, served, since)
-        })
-    }
-
     /// The row id of the first rank of the engine at `engine`.
     pub fn worker(&self, engine: usize) -> Result<WorkerId, String> {
         self.members
@@ -1946,18 +1882,13 @@ impl Harness {
             .engines
             .get_mut(engine)
             .ok_or_else(|| format!("no engine {engine}"))?;
-        // Both are read before a hung engine is let go: its release runs
-        // the thread to its end.
+        // Read before a hung engine is let go: its release runs the thread
+        // to its end.
         let at = Instant::now();
-        let asked = self.turns.begun.load(Ordering::SeqCst);
         if !slot.die().await? {
             return Err(format!("engine {engine} is dead already"));
         }
-        Ok(Death {
-            at,
-            asked,
-            turn: self.turns.begun.load(Ordering::SeqCst),
-        })
+        Ok(Death { at })
     }
 
     /// Hangs the engine at `engine`: its thread stops, so nothing of it
@@ -2028,12 +1959,6 @@ impl Harness {
         .await?
         .map(drop)
         .map_err(|error| error.to_string())
-    }
-
-    /// The statuses the stand-in prober moved so far, in the order written:
-    /// none where the controller probes by itself.
-    pub fn verdicts(&self) -> Vec<Verdict> {
-        self.turns.verdicts.lock().clone()
     }
 
     /// A place in the store's membership, for [`Harness::moved`].

@@ -96,18 +96,16 @@ use rustc_hash::FxHashMap;
 #[cfg(feature = "in-process")]
 use crate::engine::policy_engine::PolicyEngine;
 use crate::{
-    document::spec::{AppliedSpec, IndexKind, Pairing, ViewListPositions},
+    document::spec::{AppliedSpec, Pairing, ViewListPositions},
     engine::{
         framework::{Engine, OverloadThresholds},
         view::{fingerprint, Candidate, Health, Phase, Role, WorkerId},
-        warm_up::WarmUpRule,
     },
     load::signals::ReportSignals,
     stages::lifecycle::Lifecycle,
     store::{
         applied::Applied,
         encoding::{EncodeClasses, EncodeMember},
-        index::{KvTables, PoolIndex, Predict, Reading},
         loads::LoadSample,
         pairing::{known, Derivation, Member, PairClasses, Pool},
         workers::{Overload, Reachability, WorkerFacts, WorkerRow, WorkerStatus},
@@ -137,8 +135,6 @@ pub(super) fn micros(origin: Instant, at: Instant) -> u64 {
 /// One pool's shape: what a membership build derives of it and no
 /// publication changes.
 struct PoolShape {
-    /// Each row's admission instant, in the rows' clock.
-    admitted_micros: Box<[u64]>,
     /// Each row's worker's slot in the store's counts of the leases on
     /// file ([`InFlightCounts`]): the slot its member keeps across membership
     /// builds.
@@ -193,10 +189,10 @@ struct Derived {
     /// status (a status change is a health signal and moves no position).
     by_model: FxHashMap<Box<str>, [Option<u32>; ROLES]>,
     pools: Box<[PoolShape]>,
-    /// The members in no pool, by id, each with its slot in the counts:
-    /// a member that offers no model. With the pools' rows they are every
-    /// member the build read ([`StoreSnapshot::unpooled_of`]).
-    unpooled: Box<[(WorkerId, WorkerSlot)]>,
+    /// Every member the build read, by id, each with its slot in the
+    /// counts: a member a pool lists, and one that offers no model
+    /// ([`StoreSnapshot::booked_of`]).
+    slots: Box<[(WorkerId, WorkerSlot)]>,
 }
 
 impl Derived {
@@ -237,7 +233,7 @@ impl Derived {
     /// How many members `pool` holds: none where there is no pool.
     fn members(&self, pool: Option<u32>) -> usize {
         pool.and_then(|pool| self.pools.get(pool as usize))
-            .map_or(0, |shape| shape.admitted_micros.len())
+            .map_or(0, |shape| shape.booked.len())
     }
 }
 
@@ -272,7 +268,7 @@ impl Ends<'_> {
                         .binary_search_by_key(&id, |entry| entry.row.id)
                         .is_ok()
                 };
-                entries.len() == shape.map_or(0, |shape| shape.admitted_micros.len())
+                entries.len() == shape.map_or(0, |shape| shape.booked.len())
                     && !joined.is_some_and(holds)
             })
     }
@@ -660,15 +656,6 @@ pub struct StoreSnapshot {
     /// the pointer to the generation.
     #[cfg(feature = "controller")]
     samples_decisions: bool,
-    /// Each pool's standing in its model's index, at the pool's index.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the decision views were the standings' one reader: they leave in a following change"
-        )
-    )]
-    indexes: Arc<[Option<Arc<PoolIndex>>]>,
 }
 
 impl std::fmt::Debug for StoreSnapshot {
@@ -827,13 +814,15 @@ impl StoreSnapshot {
         Some(self.derived.by_model.get(model)?[role_slot(role)]? as usize)
     }
 
-    /// The slot of worker `id`'s count wherever this world lists it: a
-    /// member's rows name one. `None` for a worker in no pool: a member
-    /// there is read apart ([`StoreSnapshot::unpooled_of`]). It searches every
-    /// pool, for a lease written outside a decision.
+    /// The slot of worker `id`'s count, where the worker was a member
+    /// when this world's membership was built: in a pool, or in none
+    /// where it offers no model. `None` for a worker that was no member
+    /// then. One binary search of the members by id, whatever the pools:
+    /// a lease written outside a decision reads it too.
     pub(crate) fn booked_of(&self, id: WorkerId) -> Option<WorkerSlot> {
-        let (pool, row) = self.pooled_row(id)?;
-        self.derived.pools.get(pool)?.booked.get(row).copied()
+        let slots = &self.derived.slots;
+        let at = slots.binary_search_by_key(&id, |&(of, _)| of).ok()?;
+        slots.get(at).map(|&(_, slot)| slot)
     }
 
     /// The first pool that lists `id`, with the member's row there: one
@@ -843,17 +832,6 @@ impl StoreSnapshot {
             let row = rows.binary_search_by_key(&id, |row| row.id).ok()?;
             Some((pool, row))
         })
-    }
-
-    /// The slot of worker `id`'s count where the worker is a member in no
-    /// pool of this world: one that offers no model. `None` for a member
-    /// a pool lists, and for a worker that was no member when this
-    /// world's membership was built. A lease's door reads it behind the
-    /// pools and the table, off the path of a listed target.
-    pub(crate) fn unpooled_of(&self, id: WorkerId) -> Option<WorkerSlot> {
-        let unpooled = &self.derived.unpooled;
-        let at = unpooled.binary_search_by_key(&id, |&(of, _)| of).ok()?;
-        unpooled.get(at).map(|&(_, slot)| slot)
     }
 
     /// `gateway`'s vetoes on the workers of `model`'s `role` pool, lent
@@ -889,20 +867,6 @@ impl StoreSnapshot {
         GatewayVetoes {
             vetoes: run.map_or(&[], |run| &run.vetoes),
         }
-    }
-
-    /// The pool's standing in its model's index, for the cases: a
-    /// membership write that kept it publishes the same one.
-    #[cfg(test)]
-    pub(super) fn standing(&self, model: &str, role: Role) -> Option<Arc<PoolIndex>> {
-        self.indexes.get(self.index(model, role)?)?.clone()
-    }
-
-    /// Every pool's standing, for the cases: a membership write that moved
-    /// none publishes the same list.
-    #[cfg(test)]
-    pub(super) fn standings(&self) -> Arc<[Option<Arc<PoolIndex>>]> {
-        Arc::clone(&self.indexes)
     }
 }
 
@@ -964,12 +928,11 @@ fn health_of(status: WorkerStatus) -> Health {
 }
 
 /// One member on its way into a pool: its row, what it registered with, and
-/// the two facts of its place.
+/// its slot in the store's counts.
 #[derive(Clone, Copy)]
 struct Entry<'a> {
     row: Candidate,
     facts: &'a WorkerFacts,
-    admitted_micros: u64,
     /// The thresholds its registration names.
     own: Overload,
     /// Its member's slot in the store's counts.
@@ -1048,9 +1011,7 @@ pub(super) enum Classes {
     /// No member joined or left and no member's offer moved
     /// ([`same_offer`]): the classes are the last write's, carried, and no
     /// member's facts are read for them. Every pool holds the rows it
-    /// held, each admitted when it was and stating the wires it stated: a
-    /// pool's standing in its model's index is carried on the same word
-    /// ([`Writer::index_pools`]).
+    /// held, each admitted when it was and stating the wires it stated.
     Carry,
 }
 
@@ -1102,15 +1063,6 @@ pub(super) fn same_offer(old: &WorkerFacts, new: &WorkerFacts) -> bool {
         && known(&old.engine_kind) == known(&new.engine_kind)
         && old.pairing == new.pairing
         && old.encode == new.encode
-}
-
-/// Whether the prefixes sent to a worker under `old` still say what it
-/// holds under `new`, where both are one worker's facts under one
-/// registration: the same offer at the same rank. A rank is a cache of
-/// its own. Every write that keeps a worker under its id asks here, and
-/// the worker leaves the records of sent prefixes where it says no.
-pub(super) fn same_cache(old: &WorkerFacts, new: &WorkerFacts) -> bool {
-    old.dp_rank == new.dp_rank && same_offer(old, new)
 }
 
 /// The models `old` stands in a pool of and `new` does not, where both are
@@ -1396,23 +1348,6 @@ pub(super) struct Writer {
     /// The generation every world is published under until the next is
     /// applied: the unbound one at the start.
     spec: Arc<Applied>,
-    /// Each pool's standing in its model's index: made by a membership
-    /// write, its warming rows read again by a window's publication.
-    indexes: Arc<[Option<Arc<PoolIndex>>]>,
-    /// The buffers a pool's reading is made in.
-    reading: Reading,
-    /// The lane table's count of moves as the last membership write read
-    /// it ([`KvTables::moves`]): while it stands, no pool's place in an
-    /// index moved.
-    lanes: u64,
-    /// How many membership writes walked the pools
-    /// ([`Self::index_pools`]), for the cases.
-    #[cfg(test)]
-    walks: u64,
-    /// The store's index tables, where a membership write reads each
-    /// pool's standing ([`Self::over`]). A writer made alone holds tables
-    /// of its own with no lane.
-    kv: Arc<KvTables>,
     /// The generation before the standing one, kept one apply longer: the
     /// publication that lets go of the last world published under it
     /// frees no engine, the next apply does. Its whole engine stays
@@ -1503,12 +1438,6 @@ impl Writer {
             vetoes: Arc::default(),
             pool_vetoes: Arc::default(),
             spec: Arc::new(Applied::new(AppliedSpec::unbound(), origin)),
-            indexes: Arc::default(),
-            reading: Reading::default(),
-            lanes: 0,
-            #[cfg(test)]
-            walks: 0,
-            kv: Arc::default(),
             retired: None,
             engines: Vec::new(),
             engine_rows: Vec::new(),
@@ -1535,14 +1464,6 @@ impl Writer {
         Arc::clone(&self.counts)
     }
 
-    /// The writer over the store's index tables: every membership write
-    /// reads its pools' standings in `kv`. The store hands them once, at
-    /// its making, and writes its lanes into the same tables.
-    pub(super) fn over(mut self, kv: Arc<KvTables>) -> Self {
-        self.kv = kv;
-        self
-    }
-
     /// A world of everything published so far: one small object, a pointer
     /// per pool. Nothing derived is built here.
     pub(super) fn world(&self) -> Arc<StoreSnapshot> {
@@ -1555,7 +1476,6 @@ impl Writer {
             spec: Arc::clone(&self.spec),
             #[cfg(feature = "controller")]
             samples_decisions: self.spec.engine().explain_sample() != 0,
-            indexes: Arc::clone(&self.indexes),
         })
     }
 
@@ -1592,9 +1512,7 @@ impl Writer {
     /// takes in every membership write since the last, so none stays owed.
     /// It reads every member where the generation's lists differ from the
     /// standing one's and carries each member's fields where they are the
-    /// same. Either way each pool's warming rows are ruled by the new
-    /// generation: the build's door reads the index tables under it, and a
-    /// generation of the standing mode rules each pool's standing again.
+    /// same.
     ///
     /// The generation this one replaces is kept until the next apply, and
     /// the one kept until now is handed back for the caller to let go
@@ -1635,9 +1553,6 @@ impl Writer {
             // stand.
             self.hear_again(&on_file);
             self.judge_every();
-            // A generation may rule a pool's warming rows by other numbers,
-            // or rule none, and it may turn a pool's record of sent prefixes.
-            self.rule_indexes();
             self.publish()
         };
         Ok((world, before))
@@ -2034,12 +1949,6 @@ impl Writer {
         }
     }
 
-    /// The standing generation: the one every world is published under
-    /// until the next is applied.
-    pub(super) fn spec(&self) -> &AppliedSpec {
-        &self.spec
-    }
-
     /// Every ready rank is heard once a `period` from here on: a judgment
     /// counts a rank only while its receipt lies within three periods of
     /// its engine's newest, and every engine with a threshold is judged
@@ -2200,8 +2109,7 @@ impl Writer {
     /// caller says (`classes`). A member's engine family, zone and labels
     /// under the standing generation's lists are read where its row's
     /// revision moved since they were last read, and carried where it
-    /// stands. Each pool takes its standing in its model's index as the
-    /// write leaves the store's tables ([`Self::over`]).
+    /// stands.
     pub(super) fn rebuild<'a>(
         &mut self,
         epoch: u64,
@@ -2248,10 +2156,6 @@ impl Writer {
         // Each model's members a side, by their place in `entries`: a
         // member's entry is written once, whatever it offers.
         let mut groups: FxHashMap<Box<str>, [Vec<u32>; ROLES]> = FxHashMap::default();
-        // The members that offer no model, by their place in `members`: in
-        // no pool, and named by the world all the same. None in most
-        // fleets.
-        let mut bare: Vec<u32> = Vec::new();
         // The members' ids are read by the vetoes alone: a membership build
         // with no veto standing does not collect them.
         let standing = !self.vetoes.by_gateway.is_empty();
@@ -2344,7 +2248,6 @@ impl Writer {
             let entry = Entry {
                 row: row_of(member, sample.as_ref(), origin, listed),
                 facts,
-                admitted_micros: micros(origin, member.admitted_at),
                 own: facts.overload,
                 // The slot the member's first write gave it: a build gives
                 // none and moves none.
@@ -2354,7 +2257,6 @@ impl Writer {
             entries.push(entry);
             if facts.models.is_empty() {
                 // In no pool, and done: the loop below starts on a model.
-                bare.push(at);
                 continue;
             }
             let side = role_slot(facts.role);
@@ -2443,7 +2345,6 @@ impl Writer {
                         row: row as u32,
                     }));
                 pools.push(PoolShape {
-                    admitted_micros: entries.iter().map(|entry| entry.admitted_micros).collect(),
                     booked: entries.iter().map(|entry| entry.booked).collect(),
                     pairs: if side == role_slot(Role::Prefill) {
                         pairs.take()
@@ -2645,23 +2546,16 @@ impl Writer {
         self.engines = engines;
         self.silenced = silenced;
         self.epoch = epoch;
-        // In id order, as the walk above pushed them.
-        // A place names its member's id and slot: the list stands by id, as
-        // the walk read the members.
-        let unpooled: Box<[(WorkerId, WorkerSlot)]> = bare
-            .iter()
-            .filter_map(|&at| members.get(at as usize))
-            .map(|&(id, _, slot)| (id, slot))
-            .collect();
-        debug_assert!(unpooled.is_sorted_by(|a, b| a.0 < b.0));
-        let before = mem::replace(
-            &mut self.derived,
-            Arc::new(Derived {
-                by_model,
-                pools: pools.into_boxed_slice(),
-                unpooled,
-            }),
-        );
+        // Every member's id and slot, in the id order of this write's one
+        // sort: a member in a pool, and one that offers no model.
+        let slots: Box<[(WorkerId, WorkerSlot)]> =
+            members.iter().map(|&(id, _, slot)| (id, slot)).collect();
+        debug_assert!(slots.is_sorted_by(|a, b| a.0 < b.0));
+        self.derived = Arc::new(Derived {
+            by_model,
+            pools: pools.into_boxed_slice(),
+            slots,
+        });
         // A worker's vetoes leave with its row, in this write's own hold:
         // no publication shows the row without them. The ids stand in
         // order as the walk above pushed them.
@@ -2690,7 +2584,6 @@ impl Writer {
             pool.dirty = false;
             self.published.push(Arc::from(pool.rows.as_slice()));
         }
-        self.index_pools(&before, classes);
         self.publish()
     }
 
@@ -3067,202 +2960,6 @@ impl Writer {
         self.builds
     }
 
-    /// How many membership writes walked the pools to stand each in its
-    /// model's index ([`Self::index_pools`]).
-    #[cfg(test)]
-    pub(super) fn walks(&self) -> u64 {
-        self.walks
-    }
-
-    /// Each pool's standing in its model's index as this membership write
-    /// leaves it. A pool the write did not move keeps its standing: its
-    /// tables, and its warming rows as a write or a window last read them.
-    /// A write that moved no pool looks none up and allocates nothing
-    /// here. A pool moved where its rows are not as many, a row was
-    /// admitted at another instant, a lane's row states other wires
-    /// ([`PoolIndex::holds`]), or a lane of the pool was made or retired
-    /// ([`KvTables::stands`]); its standing is made ([`KvTables::pool`])
-    /// with its warming rows under the standing generation's ruling for
-    /// the pool's model and phase, read at the last window's instant or an
-    /// admission after it. A pool is found at its place, or among
-    /// `before`, the pools as they stood, where the write moved its place.
-    /// A write that moved no member and no offer ([`Classes::Carry`]) moved
-    /// no row, no admission and no wire a row states: where no lane, no
-    /// block size of record and no row's word to record moved either
-    /// ([`KvTables::moves`]), every pool stands as it did and none is
-    /// walked. A pool is also made anew when its sent-prefix settings
-    /// change. Under [`Classes::Derive`] the pools may stand under a
-    /// generation of another pairing mode, one the standings were not ruled
-    /// by: every kept pool's warming rows are ruled and read again.
-    fn index_pools(&mut self, before: &Derived, classes: Classes) {
-        let Self {
-            derived,
-            working,
-            spec,
-            reading,
-            indexes: held,
-            origin,
-            last_window,
-            lanes,
-            kv,
-            ..
-        } = self;
-        let window = last_window.map_or(0, |at| micros(*origin, at));
-        // No lane was made or retired, no block size of record moved and
-        // no row's word to record was cleared since the last write stood
-        // its pools: no pool's place in an index moved, no record's bound
-        // and no row's word, and none is looked up.
-        let moves = kv.moves();
-        let still = mem::replace(lanes, moves) == moves;
-        if still && classes == Classes::Carry {
-            return;
-        }
-        #[cfg(test)]
-        {
-            self.walks += 1;
-        }
-        let ruled = classes != Classes::Derive;
-        // The list is copied at the first pool whose standing is new:
-        // where the pools are as many, every other stands in it already.
-        let same = held.len() == working.len();
-        let mut next = (!same).then(|| vec![None; working.len()]);
-        for (model, sides) in &derived.by_model {
-            // The model's pools as they stood, looked up at the first of
-            // its pools that does not stand at its place.
-            let mut stood = None;
-            for (side, pool) in sides.iter().enumerate() {
-                let Some(at) = pool.map(|pool| pool as usize) else {
-                    continue;
-                };
-                let (Some(rows), Some(shape)) = (working.get(at), derived.pools.get(at)) else {
-                    continue;
-                };
-                let (rows, admitted) = (&*rows.rows, &*shape.admitted_micros);
-                let predict = predict_of(spec, kv, model, rows);
-                let here = held.get(at).and_then(Option::as_ref);
-                let here = here.filter(|standing| standing.is_of(model, rows));
-                let was = here.map(|standing| (at, standing)).or_else(|| {
-                    let sides = *stood.get_or_insert_with(|| before.by_model.get(model));
-                    let old = sides?.get(side).copied().flatten()? as usize;
-                    Some((old, held.get(old)?.as_ref()?))
-                });
-                let kept = was.filter(|(_, standing)| {
-                    standing.predict() == predict
-                        && standing.holds(rows, admitted)
-                        && (still || kv.stands(model, rows, standing))
-                });
-                let now = || admitted.iter().copied().fold(window, u64::max);
-                let read = match kept {
-                    Some((old, standing)) => {
-                        let read = if ruled {
-                            None
-                        } else {
-                            standing.again(ruling_of(spec, model, rows), now(), reading)
-                        };
-                        match read {
-                            Some(read) => Arc::new(read),
-                            None if same && old == at => continue,
-                            None => Arc::clone(standing),
-                        }
-                    }
-                    None => {
-                        let rule = ruling_of(spec, model, rows);
-                        Arc::new(kv.pool(model, rows, admitted, rule, predict, now(), reading))
-                    }
-                };
-                let next = next.get_or_insert_with(|| held.to_vec());
-                if let Some(slot) = next.get_mut(at) {
-                    *slot = Some(read);
-                }
-            }
-        }
-        if let Some(next) = next {
-            *held = next.into();
-        }
-    }
-
-    /// Rule every pool's warming rows again under the standing generation,
-    /// at the last window's instant: it may rule a pool by other numbers,
-    /// or rule none. A pool whose settings for the record of sent prefixes
-    /// moved is made anew.
-    fn rule_indexes(&mut self) {
-        let Self {
-            derived,
-            working,
-            spec,
-            reading,
-            indexes,
-            kv,
-            origin,
-            last_window,
-            ..
-        } = self;
-        let now = last_window.map_or(0, |at| micros(*origin, at));
-        let mut next = None;
-        for (model, sides) in &derived.by_model {
-            for &pool in sides.iter().flatten() {
-                let at = pool as usize;
-                let (Some(Some(held)), Some(rows), Some(shape)) =
-                    (indexes.get(at), working.get(at), derived.pools.get(at))
-                else {
-                    continue;
-                };
-                let rule = ruling_of(spec, model, &rows.rows);
-                let predict = predict_of(spec, kv, model, &rows.rows);
-                let read = if held.predict() == predict {
-                    held.again(rule, now, reading)
-                } else {
-                    Some(kv.pool(
-                        model,
-                        &rows.rows,
-                        &shape.admitted_micros,
-                        rule,
-                        predict,
-                        now,
-                        reading,
-                    ))
-                };
-                if let Some(read) = read {
-                    put_read(&mut next, indexes, at, read);
-                }
-            }
-        }
-        if let Some(next) = next {
-            *indexes = next.into();
-        }
-    }
-
-    /// Read each ruled pool's warming rows again at the last window's
-    /// instant, under the ruling it was read by. A pool no ruling names
-    /// warms nobody, so a window reads nothing of it. The list is new only
-    /// when a pool's rows moved: a publication that moved none allocates
-    /// nothing.
-    fn read_indexes(&mut self) {
-        let Self {
-            reading,
-            indexes,
-            origin,
-            last_window,
-            ..
-        } = self;
-        let mut next = None;
-        for (at, held) in indexes.iter().enumerate() {
-            let Some(held) = held else {
-                continue;
-            };
-            let Some(rule) = held.rule() else {
-                continue;
-            };
-            let now = last_window.map_or(0, |at| micros(*origin, at));
-            if let Some(read) = held.again(Some(rule), now, reading) {
-                put_read(&mut next, indexes, at, read);
-            }
-        }
-        if let Some(next) = next {
-            *indexes = next.into();
-        }
-    }
-
     fn publish_window(&mut self, at: Instant) -> Arc<StoreSnapshot> {
         self.last_window = Some(at);
         // A veto that ended at or before this window's instant leaves the
@@ -3272,64 +2969,8 @@ impl Writer {
             self.vetoes = Arc::new(vetoes);
             self.derive_vetoes();
         }
-        self.read_indexes();
         self.publish()
     }
-}
-
-/// Sets pool `at`'s standing to `read` in `next`, the list a writer
-/// publishes in `standing`'s place: a copy of it, made at the first pool
-/// whose rows moved.
-fn put_read(
-    next: &mut Option<Vec<Option<Arc<PoolIndex>>>>,
-    standing: &[Option<Arc<PoolIndex>>],
-    at: usize,
-    read: PoolIndex,
-) {
-    let next = next.get_or_insert_with(|| standing.to_vec());
-    if let Some(slot) = next.get_mut(at) {
-        *slot = Some(Arc::new(read));
-    }
-}
-
-/// The warm-up ruling of the profile a pool's decisions resolve to under
-/// `spec`, by the pool's model and its role's phase: as a request of that
-/// phase asked alone resolves its profile, not by the pair binding a decode
-/// pool's thresholds take
-/// ([`Engine::pool_binding`](crate::engine::framework::Engine::pool_binding)). The
-/// hand names rows for such a request alone; a pair's sides read their
-/// columns. `None` where the profile's warm-up stages rule by different
-/// numbers: it is named no rows.
-fn ruling_of(spec: &AppliedSpec, model: &str, rows: &[Candidate]) -> Option<WarmUpRule> {
-    let role = rows.first()?.role;
-    spec.engine().pool_rule_for(model, phase_of(role))
-}
-
-/// The tree's placement bound for a pool that keeps a record of sent
-/// prefixes: its profile reads them, its model's pair does at the decode
-/// side, or its binding's shadow does where that profile is named no row
-/// ([`Engine::pool_record_for`](crate::engine::framework::Engine::pool_record_for)).
-fn predict_of(
-    spec: &AppliedSpec,
-    kv: &KvTables,
-    model: &str,
-    rows: &[Candidate],
-) -> Option<Predict> {
-    let phase = phase_of(rows.first()?.role);
-    let ahead = spec.engine().pool_record_for(model, phase)?;
-    let index = spec.index_for(model);
-    if index.kind != IndexKind::Tree {
-        return None;
-    }
-    let size = kv
-        .block_size(model)
-        .unwrap_or_else(|| spec.block_size())
-        .max(1);
-    let bound = (index.max_size / u64::from(size)).max(1);
-    Some(Predict {
-        bound: usize::try_from(bound).unwrap_or(usize::MAX),
-        ahead,
-    })
 }
 
 /// Writes `rows` over `over` when `over` is of `rows`' length and the

@@ -3143,14 +3143,25 @@ impl Binding {
         (self.plan == Plan::Single).then_some(self.shadow).flatten()
     }
 
-    fn matches(&self, model: &str, phase: Phase) -> bool {
-        let model_ok = match (self.model.strip_prefix('*'), self.model.strip_suffix('*')) {
-            _ if self.model == "*" => true,
-            (Some(suffix), _) => model.ends_with(suffix),
-            (_, Some(prefix)) => model.starts_with(prefix),
-            _ => self.model == model,
+    /// Whether a request of `model` in `phase` resolves to the binding,
+    /// where no binding in front of it matches. `glob` is what the
+    /// binding's pattern asks ([`Self::pattern`]): an engine reads it once,
+    /// when it is built ([`Entry`]).
+    #[inline(always)]
+    fn matches_as(&self, glob: &Glob, model: &str, phase: Phase) -> bool {
+        // One id is the commonest pattern: asked first, by a plain branch.
+        let model_ok = if matches!(glob, Glob::Exact) {
+            self.model == model
+        } else {
+            glob.covers(&self.model, model)
         };
-        model_ok && (self.phases.is_empty() || self.phases.contains(&phase))
+        model_ok && self.covers(phase)
+    }
+
+    /// [`Self::matches_as`], of a binding no engine holds.
+    #[cfg(test)]
+    fn matches(&self, model: &str, phase: Phase) -> bool {
+        self.matches_as(&self.pattern().glob(), model, phase)
     }
 
     /// Whether the binding's phase list covers `phase`: an empty list
@@ -3159,7 +3170,7 @@ impl Binding {
         self.phases.is_empty() || self.phases.contains(&phase)
     }
 
-    /// The model pattern, read as [`Self::matches`] reads it.
+    /// The model pattern, as its stars read.
     fn pattern(&self) -> Pattern<'_> {
         match (self.model.strip_prefix('*'), self.model.strip_suffix('*')) {
             _ if self.model == "*" => Pattern::Any,
@@ -3193,6 +3204,43 @@ enum Pattern<'a> {
     Suffix(&'a str),
     Prefix(&'a str),
     Exact(&'a str),
+}
+
+impl Pattern<'_> {
+    fn glob(&self) -> Glob {
+        match *self {
+            Self::Any => Glob::Any,
+            Self::Suffix(suffix) => Glob::Suffix(suffix.into()),
+            Self::Prefix(prefix) => Glob::Prefix(prefix.into()),
+            Self::Exact(_) => Glob::Exact,
+        }
+    }
+}
+
+/// What a binding's model pattern asks of a model id ([`Pattern`]), with
+/// the text a suffix or a prefix compares. The engine reads it once when
+/// it is built ([`Entry`]), so a walk of the bindings reads no pattern's
+/// stars.
+#[derive(Debug)]
+enum Glob {
+    Any,
+    Suffix(Box<str>),
+    Prefix(Box<str>),
+    /// One id: the pattern's own text, which the binding holds.
+    Exact,
+}
+
+impl Glob {
+    /// Whether `pattern`, which asks this, covers `model`.
+    #[inline(always)]
+    fn covers(&self, pattern: &str, model: &str) -> bool {
+        match self {
+            Self::Any => true,
+            Self::Suffix(suffix) => model.ends_with(&**suffix),
+            Self::Prefix(prefix) => model.starts_with(&**prefix),
+            Self::Exact => pattern == model,
+        }
+    }
 }
 
 /// What a host names a profile's rows by, where it names them in the
@@ -4098,6 +4146,9 @@ const fn placed_by(assignment: Assignment, by_assignment: bool) -> Assignment {
 #[derive(Debug)]
 struct Entry {
     binding: Binding,
+    /// What the binding's model pattern asks ([`Binding::pattern`]), read
+    /// once when the engine is built.
+    glob: Glob,
     /// The assignment that places a request of the binding ([`placed_by`]):
     /// the rule's own, or `delegate` where no rule stands, as the binding's
     /// profile reads it under the single plan. Written once when the engine
@@ -4714,9 +4765,8 @@ impl<'a> PairPools<'a> {
                 seed,
                 affinity,
                 named: None,
-                // A pin and lent counts are positions in one pool: neither
-                // side takes them.
-                pinned_at: 0,
+                // Lent counts are positions in one pool: neither side takes
+                // them.
                 lent_in_flight: None,
                 // The side's own cells: the request's would be read by
                 // another pool's positions.
@@ -4740,7 +4790,7 @@ fn carries_a_column(facts: &RequestFacts<'_>) -> bool {
 }
 
 /// The stage a decision names when a profile that shows its rows to a
-/// plugin was handed rows that carry a mask or a pin beside them.
+/// plugin was handed rows that carry a mask beside them.
 const WRITTEN_ROWS: &str = "written-rows";
 
 /// The decline of a decision whose rows were not written for the plugin
@@ -5075,6 +5125,7 @@ impl Engine {
                     || assigned(binding.profile)
                     || binding.decode_profile.is_some_and(assigned);
                 Entry {
+                    glob: binding.pattern().glob(),
                     placing: placed_by(declared, by_assignment),
                     vetoed: AllVetoed::default(),
                     sides_placed,
@@ -5249,8 +5300,7 @@ impl Engine {
     /// A host hands such a decision rows written for it: a plugin's view
     /// carries each row's bits and ages as the row's own fields, and
     /// [`Self::decide`] declines such a profile over rows that carry a mask
-    /// or a pin beside them ([`Constraints::stalled`],
-    /// [`RequestFacts::pinned_at`]). [`Self::decide_pair`] declines a mask
+    /// beside them ([`Constraints::stalled`]). So does [`Self::decide_pair`]
     /// beside a side that shows its rows: for a decode decision of a model
     /// that also pairs, the word carries the pair's decode side too, as the
     /// needs do, and for an encode decision the encode side of its `epd`
@@ -5557,14 +5607,14 @@ impl Engine {
     fn entry(&self, model: &str, phase: Phase) -> Option<&Entry> {
         self.bindings
             .iter()
-            .find(|entry| entry.binding.matches(model, phase))
+            .find(|entry| entry.binding.matches_as(&entry.glob, model, phase))
     }
 
     /// The position of the first matching binding in this generation.
     pub(crate) fn binding_position(&self, model: &str, phase: Phase) -> Option<u32> {
         self.bindings
             .iter()
-            .position(|entry| entry.binding.matches(model, phase))
+            .position(|entry| entry.binding.matches_as(&entry.glob, model, phase))
             .and_then(|at| u32::try_from(at).ok())
     }
 
@@ -5693,6 +5743,7 @@ impl Engine {
     /// column it is handed whole. The answer is of what the
     /// build kept: a membership write asks it of every pool, and no stage
     /// is asked again.
+    #[cfg(any(test, feature = "in-process"))]
     pub(crate) fn reads_sent_for(&self, model: &str, phase: Phase) -> bool {
         self.needs.sent_prefixes
             && self
@@ -5709,6 +5760,7 @@ impl Engine {
     /// cap it would lose them. A stage that reads cache events for a row's
     /// warm-up reads no holder and turns nothing here.
     /// Kept at the build, as [`Self::reads_sent_for`] is.
+    #[cfg(any(test, feature = "in-process"))]
     pub(crate) fn reads_sent_alone_for(&self, model: &str, phase: Phase) -> bool {
         self.resolve(model, phase)
             .is_some_and(|(_, index, _)| self.named_by[usize::from(index)].sent_alone)
@@ -5735,6 +5787,7 @@ impl Engine {
     /// the model's record. So a decode pool's word is, in this order,
     /// that request's profile's where it reads the record, the pair's
     /// decode profile's, and the shadow's as above.
+    #[cfg(any(test, feature = "in-process"))]
     pub(crate) fn pool_record_for(&self, model: &str, phase: Phase) -> Option<bool> {
         if self.reads_sent_for(model, phase) {
             return Some(self.reads_sent_alone_for(model, phase));
@@ -5909,8 +5962,8 @@ impl Engine {
     /// named in the column's place ([`AffinityRows`]) are read as the host
     /// derived them: a debug build asserts that they stand for the pool. A
     /// profile that shows its rows to a plugin is declined over rows that
-    /// carry a mask or a pin beside them, under the stage name
-    /// `written-rows` ([`Self::reads_for`]).
+    /// carry a mask beside them, under the stage name `written-rows`
+    /// ([`Self::reads_for`]).
     pub fn decide(
         &self,
         facts: &RequestFacts<'_>,
@@ -6086,6 +6139,7 @@ impl Engine {
         };
         let Entry {
             binding,
+            glob: _,
             placing,
             vetoed,
             sides_placed: _,
@@ -6111,9 +6165,9 @@ impl Engine {
         };
         // A plugin is shown each row as a record of the row's own fields:
         // its host hands rows written for the decision
-        // ([`Self::reads_for`]). A mask or a pin beside the rows says they
-        // are not, and the arm that would open the scope declines.
-        let unwritten = || !cx.stalled.is_empty() || facts.pinned_at != 0;
+        // ([`Self::reads_for`]). A mask beside the rows says they are not,
+        // and the arm that would open the scope declines.
+        let unwritten = || !cx.stalled.is_empty();
         // One arm a mark, the scope's and the assignment's first: a profile
         // under those two alone meets no test for the key.
         let _opened = if marks.asks_nothing_first() {
@@ -6275,11 +6329,12 @@ impl Engine {
         cx: &Constraints<'_>,
         scratch: &mut Scratch,
     ) -> Option<Decision> {
+        let (model, phase) = (facts.model, facts.phase);
         let (entry, placing) = self
             .bindings
             .iter()
             .zip(&self.shadow_placing)
-            .find(|(entry, _)| entry.binding.matches(facts.model, facts.phase))?;
+            .find(|(entry, _)| entry.binding.matches_as(&entry.glob, model, phase))?;
         let placing = (*placing)?;
         let index = entry.binding.shadow?;
         let profile = &self.profiles[usize::from(index)];
@@ -6616,7 +6671,13 @@ impl Engine {
                     // reads the pins the table held there against its own
                     // pins and its own pick, as the table does. Where no
                     // pin came in, the table's answer was the live pick:
-                    // that is no pin, and the shadow keeps its own.
+                    // no pin for the shadow to follow, and it keeps its
+                    // own. Where the pins stood as read, the live pick
+                    // was a pin already under the id that stands for its
+                    // worker. A shadow asks no id that stands: it keeps
+                    // its own pick there too, put to no cap. Where the
+                    // live claim took a rename's step for the key first,
+                    // the pin it renamed reads as the newcomer.
                     match Claim::standing(&found.standing, &pins, first) {
                         Some(owner) => Claim::Standing(owner, found.standing),
                         None => return decision,
@@ -6630,11 +6691,13 @@ impl Engine {
                     // placement stands as the profile made it.
                     Claim::NoRoom => {}
                     // The table took no claim of this decision's: another
-                    // request's stands, or the pins moved under the
-                    // decision. The worker it names is a pin of the key
-                    // where it is among the survivors: the rule's cap
-                    // holds for it as for the pin read first, and it leads
-                    // where the placement stood elsewhere.
+                    // request's stands, the pins moved under the
+                    // decision, or its worker is a pin of the key already,
+                    // under the id that stands or under one a rename's
+                    // walk had yet to reach. The worker it names is a
+                    // pin of the key where it is among the survivors: the
+                    // rule's cap holds for it as for the pin read first,
+                    // and it leads where the placement stood elsewhere.
                     Claim::Standing(owner, held) => {
                         if WRITE_SESSIONS && KEEPS {
                             // The pins the table held, kept for the shadow.
@@ -11081,11 +11144,9 @@ mod tests {
                 holders: &holders,
                 ..AffinityRows::default()
             }),
-            // A pin is a position in one pool: no side takes it either.
-            pinned_at: 2,
             ..RequestFacts::default()
         };
-        // Nor the counts a host lent: they are read by a position too.
+        // Nor the counts a host lent: they are read by a position.
         let mut counted = [0, 1].map(|position| Candidate {
             position,
             ..Candidate::default()
@@ -11100,7 +11161,6 @@ mod tests {
         for (side, name) in [(PairSide::Prefill, "prefill"), (PairSide::Decode, "decode")] {
             let (_, read) = pools.side(side, &facts).expect("an empty column fits");
             assert!(read.named.is_none(), "the {name} side");
-            assert_eq!(read.pinned_at, 0, "the {name} side");
             assert!(read.lent_in_flight.is_none(), "the {name} side");
         }
     }
@@ -11279,8 +11339,8 @@ mod tests {
     }
 
     /// A profile that shows its rows to a plugin says so by the engine's one
-    /// lookup, and its decision over rows that carry a mask or a pin beside
-    /// them is declined under a name of its own, in every build.
+    /// lookup, and its decision over rows that carry a mask beside them is
+    /// declined under a name of its own, in every build.
     #[test]
     fn a_profile_that_shows_its_rows_is_told_and_declines_rows_not_written_for_it() {
         #[derive(Debug)]
@@ -11323,10 +11383,6 @@ mod tests {
             model: "m",
             ..RequestFacts::default()
         };
-        let pinned = RequestFacts {
-            pinned_at: 1,
-            ..facts
-        };
         let masked = Constraints {
             stalled: &[0],
             ..Constraints::default()
@@ -11336,18 +11392,15 @@ mod tests {
             engine.decide(facts, &PoolFacts::default(), &pool, cx, &mut Scratch::new())
         };
         assert!(lead(&decide(&facts, &written)).is_some());
-        for (facts, cx, beside) in [(&facts, &masked, "a mask"), (&pinned, &written, "a pin")] {
-            let Decision::Shed(shed) = decide(facts, cx) else {
-                panic!("{beside} beside the rows is declined");
-            };
-            assert_eq!(
-                (shed.reason, shed.emptied_by),
-                (ShedReason::PolicyDeclined, WRITTEN_ROWS),
-                "{beside}"
-            );
-            assert_eq!(shed.trace.made_under(), Some(0), "{beside}");
-        }
-        // A profile that shows nothing reads both.
+        let Decision::Shed(shed) = decide(&facts, &masked) else {
+            panic!("a mask beside the rows is declined");
+        };
+        assert_eq!(
+            (shed.reason, shed.emptied_by),
+            (ShedReason::PolicyDeclined, WRITTEN_ROWS)
+        );
+        assert_eq!(shed.trace.made_under(), Some(0));
+        // A profile that shows nothing reads the mask.
         assert!(lead(&plain.decide(
             &facts,
             &PoolFacts::default(),
@@ -15376,6 +15429,112 @@ mod tests {
         assert_eq!(place_keyed(&engine, &pool, 8, 60).id, WorkerId(202));
     }
 
+    /// A decision reads its rows ahead of its claim. Where its worker is
+    /// registered again between the two, the key is claimed under the id
+    /// that stands: the key's next request, decided on the rows that stand
+    /// ahead of the first one's dispatch, follows the claim. The first
+    /// request's verdict and its dispatch name the id its decision read,
+    /// and the dispatch confirms the claim.
+    #[test]
+    fn a_claim_behind_its_workers_rename_leads_under_the_id_that_stands() {
+        let engine = session_engine(SESSIONS);
+        // The rows the first decision read, and the rows that stand: the
+        // host replaced the first worker's row and says it is the worker
+        // it was.
+        let read = [candidate(0, 0), candidate(1, 1)];
+        let mut rows = read;
+        rows[0].id = WorkerId(900);
+        engine.on_membership(&Membership::Replaced {
+            old: read[0].id,
+            new: rows[0].id,
+        });
+        engine.pins_follow(read[0].id, rows[0].id);
+        let decision = decide_keyed(&engine, &read, 7, 10);
+        let pick = decision.pick().expect("a placement");
+        let first = *pick.targets.first().expect("a target");
+        assert_eq!(first.id, read[0].id);
+        assert_eq!(pick.session_verdict, SessionVerdict::Claimed(read[0].id));
+        let pins = || engine.sessions.pins(session(7));
+        assert_eq!(
+            pins(),
+            Some([rows[0].id, WorkerId(0)]),
+            "the id that stands"
+        );
+        // The worker is the busiest now: the key's pin alone sends there.
+        rows[0].in_flight = 9;
+        let next = decide_keyed(&engine, &rows, 7, 20);
+        let pick = next.pick().expect("a pick");
+        assert_eq!(pick.targets.first().map(|t| t.id), Some(rows[0].id));
+        let lease = Lease {
+            session: session(7),
+            session_verdict: SessionVerdict::Claimed(read[0].id),
+            issued_micros: 10,
+            ..Lease::default()
+        };
+        engine.on_dispatched(&lease, &first, Side::Single, 0);
+        assert_eq!(pins(), Some([rows[0].id, WorkerId(0)]), "confirmed");
+    }
+
+    /// A key pinned on a worker and decided on rows read before the worker
+    /// was registered again: the pin names the id that stands, no row
+    /// read holds it, and the rotation's turn lands on the worker under
+    /// the id it had. The table answers that the worker is a pin of the
+    /// key already, and the decision takes its pick as the pin it is:
+    /// nothing is claimed, and the rule's cap holds for it. At the cap the
+    /// key is handed on to the rotation's next turn, as from a pin read
+    /// first, and that worker leads the pins ahead of the dispatch.
+    #[test]
+    fn a_pick_answered_as_a_pin_already_is_put_to_the_rules_cap() {
+        let engine = session_engine_of(round_robin_profile(), SESSIONS);
+        let read = [
+            candidate(0, 0),
+            candidate(1, 0),
+            candidate(2, 0),
+            candidate(3, 0),
+        ];
+        let home = place_keyed(&engine, &read, 7, 10);
+        let stands = WorkerId(900);
+        engine.on_membership(&Membership::Replaced {
+            old: home.id,
+            new: stands,
+        });
+        engine.pins_follow(home.id, stands);
+        let pins = || engine.sessions.pins(session(7));
+        assert_eq!(pins(), Some([stands, WorkerId(0)]));
+        // A request with no key takes one turn of the rotation.
+        let turn = |now: u64| {
+            let facts = RequestFacts {
+                model: "m",
+                now_micros: now,
+                ..RequestFacts::default()
+            };
+            let (shared, cx) = (PoolFacts::default(), Constraints::default());
+            let decision = engine.decide(&facts, &shared, &read, &cx, &mut Scratch::new());
+            let pick = decision.pick().expect("a pick");
+            pick.targets.first().expect("a target").position
+        };
+        // Three turns bring the rotation back to the key's worker. Under
+        // the cap its turn is the pin: no claim, and nothing is written.
+        let behind: Vec<u32> = (0..3).map(|step| turn(20 + step)).collect();
+        assert!(!behind.contains(&home.position), "{behind:?}");
+        let under = decide_keyed(&engine, &read, 7, 30);
+        let pick = under.pick().expect("a pick");
+        assert_eq!(pick.targets.first().map(|t| t.id), Some(home.id));
+        assert_eq!(pick.session_verdict, SessionVerdict::Pinned, "no claim");
+        assert_eq!(pins(), Some([stands, WorkerId(0)]), "nothing is written");
+        // At the cap, a rotation later: the key is handed on.
+        let behind: Vec<u32> = (0..3).map(|step| turn(40 + step)).collect();
+        assert!(!behind.contains(&home.position), "{behind:?}");
+        let mut capped = read;
+        capped[home.position as usize].session_in_flight = SESSIONS.inflight_cap;
+        let handed = decide_keyed(&engine, &capped, 7, 50);
+        let pick = handed.pick().expect("a pick");
+        assert_eq!(pick.session_verdict, SessionVerdict::Respill);
+        let taken = *pick.targets.first().expect("a target");
+        assert_ne!(taken.id, home.id);
+        assert_eq!(pins(), Some([taken.id, stands]), "ahead of its dispatch");
+    }
+
     #[test]
     fn two_first_decisions_of_a_fresh_key_agree_on_the_first_claim() {
         let engine = session_engine(SESSIONS);
@@ -16264,6 +16423,62 @@ mod tests {
         prefills[0].health.healthy = false;
         let (answer, shown) = placed(8, &prefills, &decodes, &mut scratch);
         assert_eq!((answer, shown), (((1, 1), claimed(101)), vec![1, 2]));
+    }
+
+    /// Where a host states no first partners, a rule's prefill run is
+    /// shown the prefills of the classes that have an open partner, as
+    /// the profile's run is. A key pinned to a prefill whose class lost
+    /// its last open partner stands outside them: the rule places the key
+    /// again among the prefills that pair, and a new key is not placed on
+    /// that prefill though it is the idle one. Shown every class, the
+    /// rule would follow the pin to a prefill no decode partners, and the
+    /// key would find no pair.
+    ///
+    /// The classic router hands its policy the prefills with an open
+    /// partner alone (the candidates of `pair_pass` in
+    /// `model_gateway/src/routers/common/placement.rs`).
+    #[test]
+    fn a_rule_places_a_pairs_prefill_among_the_classes_with_an_open_partner() {
+        let engine = pair_session_engine(vec![least_requests_profile()], Assignment::Delegate);
+        let mut scratch = Scratch::new();
+        // Each prefill class pairs with the decode class of its own number.
+        let table = PairTable::new(&[1, 2], &[1, 2]);
+        // A side's two workers, of class 1 and of class 2, under ids from
+        // `first_id` on and the loads given.
+        let rows = |loads: [u32; 2], first_id: u64| -> Vec<Candidate> {
+            let mut rows = classed_rows(&[1, 2]);
+            for (row, load) in rows.iter_mut().zip(loads) {
+                (row.id, row.in_flight) = (WorkerId(first_id + u64::from(row.position)), load);
+            }
+            rows
+        };
+        // The idle worker of each side is the one of class 1.
+        let (prefills, mut decodes) = (rows([0, 5], 100), rows([0, 5], 200));
+        // The pair of `key`'s next request with its two verdicts, and the
+        // classes its prefill side was shown.
+        let placed = |key, decodes: &[Candidate], scratch: &mut Scratch| {
+            let pools = PairPools {
+                prefills: &prefills,
+                decodes,
+                table,
+                ..PairPools::default()
+            };
+            let answer = pair_placed_in(&engine, &pair_request(Some(key)), pools, scratch);
+            (answer, scratch.classes.clone())
+        };
+        let claim = DecodeVerdict::CLAIMED;
+        let claimed = |id| (SessionVerdict::Claimed(WorkerId(id)), claim);
+        // Both classes pair: the key is placed on the idle pair.
+        let (answer, shown) = placed(7, &decodes, &mut scratch);
+        assert_eq!((answer, shown), (((0, 0), claimed(100)), vec![1, 2]));
+        // Class 1 loses its one decode: its prefill is shown no more, and
+        // the key's pin stands on it.
+        decodes[0].health.healthy = false;
+        let (answer, shown) = placed(7, &decodes, &mut scratch);
+        assert_eq!((answer, shown), (((1, 1), claimed(101)), vec![2]));
+        // A new key is placed among the prefills that pair too.
+        let (answer, shown) = placed(8, &decodes, &mut scratch);
+        assert_eq!((answer, shown), (((1, 1), claimed(101)), vec![2]));
     }
 
     /// A side of a pair takes no turn of a list. Its request with no

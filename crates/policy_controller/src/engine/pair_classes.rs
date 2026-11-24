@@ -180,25 +180,28 @@ impl PartnerClasses {
     /// prefill's class and each decode's in their lists' order, where
     /// prefill class `k`'s list ends in `listed` (at `k - 1`), and the
     /// lists one after another, the decode classes each prefill class
-    /// pairs with, ascending.
+    /// pairs with, ascending. `first` is the rule's first partners, laid
+    /// out as the table is: their ends, then their lists. Both are empty
+    /// where the rule puts no pair ahead of another.
     ///
-    /// For a rule that numbers as [`Self::number`] does: each side's
-    /// classes from `1`, `0` for a worker that pairs with nobody, and every
-    /// decode class named by some list.
+    /// For a rule that numbers as [`Self::number_first`] does: each side's
+    /// classes from `1`, `0` for a worker that pairs with nobody, every
+    /// decode class named by some list, and a class's first partners whole
+    /// classes of its list.
     #[must_use]
     pub(crate) fn derived(
         prefills: Box<[u32]>,
         decodes: Box<[u32]>,
-        ends: Box<[u32]>,
-        listed: Box<[u32]>,
+        [ends, listed]: [Box<[u32]>; 2],
+        [first_ends, first_listed]: [Box<[u32]>; 2],
     ) -> Self {
         Self {
             prefills,
             decodes,
             ends,
             listed,
-            first_ends: Box::default(),
-            first_listed: Box::default(),
+            first_ends,
+            first_listed,
         }
     }
 

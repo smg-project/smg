@@ -33,9 +33,13 @@ use crate::{
     engine::{
         decision::Targets,
         framework::{Picker, TieBand},
+        list_cell::{LentList, ModelLists, PublishedList},
         policy_engine::{
-            membership::Members,
-            task::tests::{monitor, running, settle},
+            membership::{
+                tests::{fills::Program, handed},
+                Members,
+            },
+            task::tests::{asks, monitor, running, settle, stock},
             PolicyEngine,
         },
         records::{worker_id, Live},
@@ -160,10 +164,14 @@ impl Picker for Keeps {
 }
 
 /// The snapshot `engine` keeps at hand for its decisions: what a decision
-/// whose request gives none reads.
+/// whose request gives none reads under the document in force, by the
+/// decision's own read.
 fn at_hand(engine: &PolicyEngine) -> Option<Arc<LoadSnapshot>> {
-    let newest = engine.loads.newest()?;
-    (*newest).clone()
+    let none = PublishedList::new(Arc::from(Vec::new()));
+    let gives_none = asks(0, &none, None);
+    let document = engine.in_force();
+    let read = engine.under(&document).loads_read(&gives_none);
+    read.snapshot().cloned()
 }
 
 /// The engine of `preset` with [`Keeps`] in its pick's place, as a host
@@ -193,6 +201,25 @@ fn declare(document: &mut PolicySpec) {
 /// [`keeping`], under a document that declares two signals where
 /// `declared` ([`declare`]): neither stage keeps a column of them.
 fn keeping_under(preset: &str, behind_a_panic: bool, declared: bool) -> (Arc<PolicyEngine>, Heard) {
+    let (spec, heard, own) = keeping_spec(preset, 1, behind_a_panic, declared);
+    let engine = Arc::new(PolicyEngine::new(spec));
+    own.set(Arc::downgrade(&engine)).expect("set once");
+    (engine, heard)
+}
+
+/// The engine a keeping stage reads the snapshot at hand of, once a case
+/// names it.
+type Own = Arc<OnceLock<Weak<PolicyEngine>>>;
+
+/// The document of [`keeping_under`]'s engine under the generation
+/// `number`, what its stage heard, and where a case names the engine that
+/// decides under it.
+fn keeping_spec(
+    preset: &str,
+    number: u64,
+    behind_a_panic: bool,
+    declared: bool,
+) -> (AppliedSpec, Heard, Own) {
     let heard = Heard::default();
     let own = Arc::new(OnceLock::new());
     let mut stages = StageRegistry::builtin();
@@ -208,7 +235,7 @@ fn keeping_under(preset: &str, behind_a_panic: bool, declared: bool) -> (Arc<Pol
         added.expect("a free name");
     }
     let mut document = PolicySpec::preset(preset).expect("a built-in preset");
-    document.generation = 1;
+    document.generation = number;
     if declared {
         declare(&mut document);
     }
@@ -224,11 +251,7 @@ fn keeping_under(preset: &str, behind_a_panic: bool, declared: bool) -> (Arc<Pol
         profile.pick = "keeps".into();
     }
     let spec = AppliedSpec::validate_in(&document, &stages, &[]);
-    let engine = Arc::new(PolicyEngine::new(
-        spec.expect("the stages hold the pickers"),
-    ));
-    own.set(Arc::downgrade(&engine)).expect("set once");
-    (engine, heard)
+    (spec.expect("the stages hold the pickers"), heard, own)
 }
 
 fn url(at: usize) -> String {
@@ -344,7 +367,7 @@ async fn a_stage_that_keeps_reports_is_told_each_report_as_a_record_states_it() 
     let worker = |at: usize| registry.get_by_url(&url(at)).expect("a worker");
     let list: Arc<[Arc<dyn Worker>]> = (0..2).map(worker).chain([prefill]).collect();
     let snapshot = at_hand(&engine).expect("the snapshot at hand");
-    let (spec, clock) = (engine.spec(), engine.clock());
+    let (spec, clock) = (engine.standing_spec(), engine.clock());
     let live = Live::at(spec.engine(), clock, Instant::now(), Some(&snapshot), None);
     let members = engine.pool_members(&list);
     for (position, word) in (0..).zip(&told) {
@@ -368,12 +391,12 @@ async fn a_stage_that_keeps_reports_is_told_each_report_as_a_record_states_it() 
     task.abort();
 }
 
-/// A document that reads no load report and no named signal keeps its
-/// host's channel for a stage that keeps reports, and for it alone: the
-/// stage is told each new report, and a decision whose request gives no
-/// snapshot finds none.
+/// Under a document that reads no load report and no named signal the
+/// task reads its host's channel for a stage that keeps reports, and for
+/// it alone: the stage is told each new report, and a decision whose
+/// request gives no snapshot finds none.
 #[tokio::test(start_paused = true)]
-async fn a_document_that_reads_no_report_keeps_the_channel_for_its_stage_alone() {
+async fn a_document_that_reads_no_report_reads_the_channel_for_its_stage_alone() {
     let (engine, heard) = keeping("random", false);
     let needs = engine.spec().needs();
     assert!(!needs.loads && !needs.signal_cells, "the preset reads none");
@@ -391,6 +414,82 @@ async fn a_document_that_reads_no_report_keeps_the_channel_for_its_stage_alone()
         at_hand(&engine).is_none(),
         "none stands for a decision to read"
     );
+    task.abort();
+}
+
+/// A stage that keeps load reports, under a document put in force on a
+/// running engine, is told each standing worker's report at the task's
+/// next upkeep, as behind a start. The document before it kept none, and
+/// the host handed its channel once: the follow reads the registry whole
+/// again for the new document, and the task takes the channel again.
+#[tokio::test(start_paused = true)]
+async fn a_new_documents_stage_is_told_each_report_at_the_next_upkeep() {
+    let engine = Arc::new(PolicyEngine::new(stock("random", 1)));
+    engine.set_registry(registry(2) as Arc<dyn Members>);
+    let (_feed, channel) = monitor(&reports(&[1, 2], 0));
+    engine.set_loads(channel);
+    let task = running(&engine).await;
+
+    let (next, heard, own) = keeping_spec("least_load", 2, false, false);
+    own.set(Arc::downgrade(&engine)).expect("set once");
+    let applied = engine.apply(next);
+    applied.expect("a number above the standing one");
+    assert!(told_since(&heard).is_empty(), "none ahead of the upkeep");
+    sleep(Duration::from_secs(1)).await;
+    let told = steps_of(&engine, &told_since(&heard));
+    assert_eq!(told, [(id(0), 1), (id(1), 2)]);
+    task.abort();
+}
+
+/// A program's lists that put a document in force where the engine's task
+/// first asks them for a model's lists: inside the task's step, behind its
+/// read of the registry.
+#[derive(Debug)]
+struct AppliesAtAFill {
+    program: Arc<Program>,
+    engine: Own,
+    next: Mutex<Option<AppliedSpec>>,
+}
+
+impl ModelLists for AppliesAtAFill {
+    fn lists_of(&self, model: &str, hand: &mut dyn FnMut(LentList<'_>)) {
+        let next = self.next.lock().take();
+        let engine = self.engine.get().and_then(Weak::upgrade);
+        if let (Some(next), Some(engine)) = (next, engine) {
+            let applied = engine.apply(next);
+            applied.expect("a number above the standing one");
+        }
+        self.program.lists_of(model, hand);
+    }
+}
+
+/// A document put in force inside the task's step, behind the step's read
+/// of the registry, has its stage told each report at the next upkeep.
+/// The step it came in under tells none: its follow made its records
+/// under the document before, which kept no report. The next step reads
+/// the registry whole under the new document and takes the channel again
+/// behind that read: a step that took the hand-over on the records of the
+/// document before would leave the stage untold.
+#[tokio::test(start_paused = true)]
+async fn a_document_put_in_force_inside_a_step_is_told_each_report_at_the_next() {
+    let engine = Arc::new(PolicyEngine::new(stock("random", 1)));
+    let program = Program::of(2);
+    engine.set_registry(handed(&program.registry));
+    let (next, heard, own) = keeping_spec("least_load", 2, false, false);
+    own.set(Arc::downgrade(&engine)).expect("set once");
+    engine.set_lists(Arc::new(AppliesAtAFill {
+        program,
+        engine: Arc::clone(&own),
+        next: Mutex::new(Some(next)),
+    }));
+    let (_feed, channel) = monitor(&reports(&[1, 2], 0));
+    engine.set_loads(channel);
+    let task = running(&engine).await;
+    assert_eq!(engine.spec().generation(), 2, "in force inside the step");
+    assert!(told_since(&heard).is_empty(), "none at the step it came in");
+    sleep(Duration::from_secs(1)).await;
+    let told = steps_of(&engine, &told_since(&heard));
+    assert_eq!(told, [(id(0), 1), (id(1), 2)]);
     task.abort();
 }
 
@@ -1168,7 +1267,7 @@ async fn a_stage_that_keeps_a_column_is_told_what_each_report_states_under_it() 
     let worker = |at: usize| registry.get_by_url(&url(at)).expect("a worker");
     let list: Arc<[Arc<dyn Worker>]> = (0..7).map(worker).collect();
     let snapshot = at_hand(&engine).expect("the snapshot at hand");
-    let (spec, clock) = (engine.spec(), engine.clock());
+    let (spec, clock) = (engine.standing_spec(), engine.clock());
     let live = Live::at(spec.engine(), clock, Instant::now(), Some(&snapshot), None);
     let members = engine.pool_members(&list);
     let lent = members.records(spec, clock).cells(&list, &live);

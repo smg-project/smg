@@ -20,8 +20,8 @@ use crate::{
         view::WorkerId,
     },
     stages::lifecycle::Lifecycle,
-    store::{GatewayId, HealthSink, MemoryStore, Sides, StoreSnapshot},
-    tracking::lease::{Dispatch, Lease, Outcome, Said, Side},
+    store::{MemoryStore, Sides, StoreSnapshot},
+    tracking::lease::{Dispatch, Lease, Said, Side},
 };
 
 /// Tells the engine what was said of a lease: one function of the record
@@ -283,20 +283,4 @@ fn chosen_dispatched(
     };
     issued_later(world, engine, &sent, &decision, at);
     engine.dispatched_stages(&sent, target, dispatch.side, dispatch.since_decision_micros);
-}
-
-/// A completion, said whole: the lease's word goes where `hand` takes it, a
-/// session's hand at the file, and the gateway's completion is written on
-/// the served worker for the health precedence, whether or not the lease
-/// is on file.
-pub(crate) fn completed(
-    store: &MemoryStore,
-    gateway: GatewayId,
-    outcome: &Outcome,
-    now: Instant,
-    hand: impl FnOnce(Said),
-) {
-    hand(Said::Completed(*outcome));
-    // The sink writes for a worker it holds a row for and for no other.
-    HealthSink::completed(store, gateway, outcome.served, outcome.class, now);
 }

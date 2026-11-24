@@ -148,8 +148,9 @@ pub async fn serve_with_listener_until(
     // One simulated engine per listener (i.e. per virtual worker), registered
     // in the process fleet under `http:<port>` for the oracle and admin API.
     let name = format!("http:{port}");
-    script::register(&name);
+    // The count before the name: a fleet list that names the worker finds it.
     let ops = AdminOps::register(&name);
+    script::register(&name);
     let engine = cfg
         .realistic
         .then(|| Engine::spawn_named(cfg.engine_for(&name), name.clone(), true));
@@ -611,6 +612,7 @@ async fn handle(route: Route, state: Arc<AppState>, body: Bytes) -> Response {
     // done, so a shutdown knows what it waits for and this worker's load
     // report counts it.
     let in_flight = InFlight::enter_on(&state.in_flight);
+    state.ops.record_request();
     let Incoming {
         parsed,
         stream_requested,
@@ -718,6 +720,7 @@ async fn handle(route: Route, state: Arc<AppState>, body: Bytes) -> Response {
 /// Messages form, so one answer is taken and none are read.
 async fn handle_messages(state: Arc<AppState>, body: Bytes) -> Response {
     let in_flight = InFlight::enter_on(&state.in_flight);
+    state.ops.record_request();
     let Incoming {
         parsed,
         stream_requested,

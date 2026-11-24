@@ -849,7 +849,9 @@ pub struct Candidate {
     /// makes the worker's load guard and lowers where the guard is
     /// dropped. A guard can be made ahead of its send. The decode of a
     /// pair named at the first decision is so counted on its row before
-    /// it is sent, and the classic policies count it the same way.
+    /// it is sent, and the classic policies count it the same way. Where
+    /// the host states [`Constraints::counted_on_decode`], a decode asked
+    /// again reads that decode's row without the asking request.
     pub in_flight: u32,
     /// The latest load row, when the host has a report for the worker.
     pub load: Option<LoadRow>,
@@ -860,9 +862,7 @@ pub struct Candidate {
     /// In-process only; the wire carries the row's age.
     pub load_sampled_at_micros: u64,
     /// The session key of the request is pinned to this worker. A host
-    /// writes it into a row it copies for the decision. Over a publication's
-    /// own rows the pin stands beside the rows instead
-    /// ([`RequestFacts::pinned_at`]).
+    /// writes it into a row it copies for the decision.
     pub session_hit: bool,
     /// Requests of the request's session key in flight on this worker. A
     /// host writes it into a row it copies for the decision.
@@ -1235,15 +1235,6 @@ pub struct RequestFacts<'a> {
     /// The host's clock at the decision, in microseconds since its origin.
     /// In-process only; no absolute instant crosses the wire.
     pub now_micros: u64,
-    /// One more than the position of the row the request's session key is
-    /// pinned to, where the host did not write the session bit into the
-    /// row: a view of a publication's own rows hands the pin here. A reader
-    /// of one row's session bit asks both ([`RequestFacts::pins`]), and a
-    /// pass over the rows looks for the pinned position once, as the
-    /// session scorer does. Zero for no pin, and where the rows were written
-    /// for the decision. A pair takes none: a pin is a position in one
-    /// pool, and neither side reads it. In-process only.
-    pub pinned_at: u32,
     /// What the leases on file book on each row, where the host did not
     /// write the count into the row: a view of a publication's own rows
     /// lends the table here. A reader of a row's requests in flight asks
@@ -1467,13 +1458,6 @@ impl<'a> RequestFacts<'a> {
         }
     }
 
-    /// Whether the request's session key is pinned to the row at
-    /// `position`, beside the row's own session bit.
-    #[inline]
-    pub fn pins(&self, position: u32) -> bool {
-        self.pinned_at != 0 && self.pinned_at - 1 == position
-    }
-
     /// The requests in flight of `row`: what the host lent for the row's
     /// position where it lent a table ([`RequestFacts::lent_in_flight`]),
     /// the row's own count otherwise. Every reader of a row's count asks
@@ -1581,6 +1565,16 @@ pub struct Constraints<'a> {
     /// ask, and a decode call over the link answers that the side was not
     /// chosen.
     pub decode_later: bool,
+    /// The host counts this request on the decode its pair's first
+    /// decision named while it asks that decode again: one of that
+    /// decode's requests in flight. Default: false. The decode asked again
+    /// over the host's own worker lists then reads that decode's record
+    /// with one request less in flight: the record of that id in the list
+    /// handed at the call. Its count of session keys is read as the worker
+    /// states it. A first decision does not read it, and no frame carries
+    /// it: a controller's requests are counted by the leases it holds on
+    /// file.
+    pub counted_on_decode: bool,
     /// A subset hint: decide over at most this many candidates.
     pub subset_hint: Option<u32>,
     /// What the request demands of the worker that takes it
@@ -1905,7 +1899,7 @@ mod tests {
     /// bench's cells that copy the facts (`benches/decision.rs`).
     #[test]
     fn a_requests_facts_take_the_pinned_bytes() {
-        assert_eq!(size_of::<RequestFacts<'_>>(), 320);
+        assert_eq!(size_of::<RequestFacts<'_>>(), 312);
     }
 
     #[test]

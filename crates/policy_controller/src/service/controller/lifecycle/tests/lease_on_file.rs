@@ -152,7 +152,7 @@ impl Bed {
     /// A `Completed` frame, served by `served`.
     fn completed(&self, lease: u64, served: WorkerId) {
         let (hand, frame) = (open(&self.store, GATEWAY), a_completed(lease, served));
-        completed(&self.store, &hand, &frame, self.now).expect("the frame reads");
+        completed(&self.store, &hand, &frame).expect("the frame reads");
     }
 
     /// A `Released` frame that names no side. Its reason is
@@ -461,6 +461,7 @@ fn a_pairs_lease_lends_nothing_as_a_singles() {
         target: WorkerId(8),
         picked: PickRecord::default(),
         session: Session::NONE,
+        session_verdict: SessionVerdict::None,
         state: LeaseState::ISSUED,
         tokens: TOKENS,
         target_index: 0,

@@ -848,7 +848,7 @@ pub(crate) fn init_metrics() {
     );
     describe_gauge!(
         "smg_cache_tree_chars",
-        "Cache-aware string tree cached characters by model (summed across tenants)"
+        "Cache-aware string tree size by model: cached characters plus 1024 for each node, summed across tenants"
     );
     describe_gauge!(
         "smg_cache_tree_tokens",
@@ -2381,7 +2381,7 @@ impl Metrics {
         );
     }
 
-    /// Set cache-aware string-tree cached characters for a model
+    /// Set the cache-aware string-tree size for a model
     pub fn set_cache_tree_chars(model_id: &str, chars: usize) {
         let model = intern_model_label(model_id);
         gauge!("smg_cache_tree_chars", "model" => model).set(chars as f64);

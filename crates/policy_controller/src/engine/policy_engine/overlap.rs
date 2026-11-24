@@ -22,8 +22,10 @@
 //! ([`CacheIndexes::token_tree`]) and the model has no index of cache
 //! events: inside the tree's match ([`TokenTree`]). The match names the
 //! workers sent the deepest prefix of the request, and the same descent
-//! writes the request for the worker picked. The tree is the host's own,
-//! the one its policy reads and writes: the engine keeps none.
+//! writes the request for the worker picked. The pick states its first
+//! target's entry of the rows the match named, as every other pick states
+//! its rows'. The tree is the host's own, the one its policy reads and
+//! writes: the engine keeps none.
 //!
 //! What is kept, and what guards it:
 //!
@@ -58,7 +60,7 @@ use std::{
     fmt, mem,
     rc::Rc,
     sync::{
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
         Arc, OnceLock,
     },
     time::Duration,
@@ -73,7 +75,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use smg_worker::identity::basic::Worker;
 
 use crate::{
-    document::spec::{AppliedSpec, IndexKind},
+    document::spec::{AppliedSpec, IndexKind, IndexSpec},
     engine::{
         decision::{Decision, Overlap, Target},
         decision_engine::TokenKey,
@@ -422,7 +424,9 @@ impl Affinity {
     /// The work the records left waiting, a bounded step of each: the
     /// placements of workers that left, and the blocks past a bound that
     /// came down. For the engine's timer. A record a decision holds is
-    /// passed over.
+    /// passed over. A record of text counts the turn, and every `sweep_s`
+    /// turns what it holds over its `max_size` is owed: it takes its
+    /// turn's share of that cut here, behind the map's mutex.
     ///
     /// A record leaves the map here once the map alone holds it and it
     /// holds no worker's place: no list's table reads it, and every worker
@@ -437,10 +441,14 @@ impl Affinity {
         // Nobody takes a record from the map but by a clone under this
         // mutex, so one the map alone holds is read by no table and written
         // by no pick.
+        let mut owing = Vec::new();
         let left: Vec<_> = records
             .extract_if(|_, record| {
                 let lone = Arc::get_mut(record)
                     .is_some_and(|record| record.predictor.get_mut().held().next().is_none());
+                if !lone && record.timed() {
+                    owing.push(Arc::clone(record));
+                }
                 if !lone && record.sweeping.load(Ordering::Relaxed) {
                     if let Some(mut predictor) = record.predictor.try_write() {
                         record.sweep(&mut predictor);
@@ -455,8 +463,11 @@ impl Affinity {
             .sum();
         self.left_out.fetch_add(left_out, Ordering::Relaxed);
         // What left is freed once the mutex is given back, so the read of a
-        // list's table waits for no free.
+        // list's table waits for no free, and for no cut.
         drop(records);
+        for record in owing {
+            record.cut();
+        }
     }
 
     /// How many picks' prefixes the records left out in whole or in part,
@@ -473,7 +484,8 @@ impl Affinity {
     /// The record of `model`, made at its first asking and held to `bound`
     /// placements of token blocks, or to `max_size` bytes where it counts
     /// text ([`PrefixRecord::hold`]).
-    fn record_of(&self, model: &str, bound: usize, max_size: u64) -> Arc<PrefixRecord> {
+    fn record_of(&self, model: &str, bound: usize, settings: &IndexSpec) -> Arc<PrefixRecord> {
+        let max_size = settings.max_size;
         let record = {
             let mut records = self.records.lock();
             if let Some(record) = records.get(model) {
@@ -485,6 +497,7 @@ impl Affinity {
             }
         };
         // Outside the map's mutex: a bound that moved takes the record.
+        record.sweep_s.store(settings.sweep_s, Ordering::Relaxed);
         record.bound_to(bound, max_size);
         record
     }
@@ -503,6 +516,21 @@ struct PrefixRecord {
     /// reads the record and kept while the record stands:
     /// [`Self::UNREAD`], [`Self::TOKENS`], or the bytes of a window of text.
     window: AtomicU64,
+    /// The index's `sweep_s` as the last table read it: the timer's turns
+    /// between two cuts of a record of text.
+    sweep_s: AtomicU32,
+    /// The timer's turns since the last cut. The timer alone writes it.
+    turns: AtomicU32,
+    /// What a cut brings a record of text down to: `max_size` over the
+    /// bytes of a window. Written under the record's guard.
+    swept: AtomicUsize,
+    /// The placements the running cut has still to take out: what the
+    /// record held over [`Self::swept`] at the timer's `sweep_s`th turn. A
+    /// write behind that turn adds nothing to it. The timer alone writes it.
+    owed: AtomicUsize,
+    /// The share of [`Self::owed`] a turn of the timer takes out: the whole
+    /// of it is out before the next cut is counted.
+    pace: AtomicUsize,
     /// Work waits for a sweep: a worker left, or the bound came down.
     sweeping: AtomicBool,
     /// How many leaves were told. Written under the record's guard, a
@@ -562,6 +590,11 @@ impl PrefixRecord {
     const UNREAD: u64 = 0;
     /// [`Self::window`] of a record of token blocks.
     const TOKENS: u64 = u64::MAX;
+    /// What a record of text holds between two cuts, as a multiple of what
+    /// a cut brings it down to. The text a pool's conversations hold stays
+    /// whole between two cuts up to it, and a write past it makes its own
+    /// room: what callers send grows the record no further.
+    const CEILING: usize = 32;
 
     fn new(bound: usize, max_size: u64) -> Self {
         Self {
@@ -569,6 +602,11 @@ impl PrefixRecord {
             bound: AtomicUsize::new(bound),
             max_size: AtomicU64::new(max_size),
             window: AtomicU64::new(Self::UNREAD),
+            sweep_s: AtomicU32::new(u32::MAX),
+            turns: AtomicU32::new(0),
+            swept: AtomicUsize::new(bound),
+            owed: AtomicUsize::new(0),
+            pace: AtomicUsize::new(0),
             sweeping: AtomicBool::new(false),
             left: AtomicU64::new(0),
             left_out: AtomicU64::new(0),
@@ -598,10 +636,67 @@ impl PrefixRecord {
                 usize::try_from(windows.max(1)).unwrap_or(usize::MAX)
             }
         };
-        if predictor.bound() != held {
-            predictor.set_bound(held);
+        // A record of text is cut down to `held` by the timer and holds
+        // up to a multiple of it between two cuts; a record of token blocks
+        // is held at every write.
+        let ceiling = match self.window.load(Ordering::Relaxed) {
+            Self::UNREAD | Self::TOKENS => held,
+            _ => held.saturating_mul(Self::CEILING),
+        };
+        self.swept.store(held, Ordering::Relaxed);
+        if predictor.bound() != ceiling {
+            predictor.set_bound(ceiling);
             self.sweeping.store(true, Ordering::Relaxed);
         }
+    }
+
+    /// The timer's turn, once a second, under the map's mutex. Every
+    /// `sweep_s` turns what the record holds over [`Self::swept`] is owed,
+    /// a turn's share of it at a time. Whether a cut is owed.
+    fn timed(&self) -> bool {
+        let every = self.sweep_s.load(Ordering::Relaxed).max(1);
+        let turns = self.turns.load(Ordering::Relaxed).saturating_add(1);
+        if turns < every {
+            self.turns.store(turns, Ordering::Relaxed);
+        } else {
+            self.turns.store(0, Ordering::Relaxed);
+            let held = self.predictor.read().len();
+            let over = held.saturating_sub(self.swept.load(Ordering::Relaxed));
+            self.owed.store(over, Ordering::Relaxed);
+            self.pace
+                .store(over.div_ceil(every as usize), Ordering::Relaxed);
+        }
+        self.owed.load(Ordering::Relaxed) != 0
+    }
+
+    /// A turn's share of the cut, on the timer's thread and outside the
+    /// map's mutex: the oldest ends leave, a sweep's step at a time, and
+    /// the lock is given to a waiting decider between two steps. The bound
+    /// comes down only while a step holds the guard, so no write meets it
+    /// and no request pays for a cut.
+    fn cut(&self) {
+        let owed = self.owed.load(Ordering::Relaxed);
+        let mut share = self.pace.load(Ordering::Relaxed).min(owed);
+        let mut paid = 0;
+        let mut predictor = self.predictor.write();
+        while share != 0 {
+            let (ceiling, held) = (predictor.bound(), predictor.len());
+            let step = share.min(Self::SWEEP);
+            predictor.set_bound(held.saturating_sub(step).min(ceiling));
+            let steps = predictor.sweep(Self::SWEEP);
+            predictor.set_bound(ceiling);
+            let out = held - predictor.len();
+            paid += out;
+            share = share.saturating_sub(out);
+            if steps == 0 {
+                // Nothing is left to take: the debt ends here.
+                paid = owed;
+                break;
+            }
+            RwLockWriteGuard::bump(&mut predictor);
+        }
+        self.owed
+            .store(owed.saturating_sub(paid), Ordering::Relaxed);
     }
 
     /// Takes the record's unit from a request that reads it. The first
@@ -1004,7 +1099,7 @@ impl Table {
             let size = size.unwrap_or_else(|| spec.block_size()).max(1);
             let bound = (settings.max_size / u64::from(size)).max(1);
             let bound = usize::try_from(bound).unwrap_or(usize::MAX);
-            let record = affinity.record_of(registered, bound, settings.max_size);
+            let record = affinity.record_of(registered, bound, &settings);
             table.record = Some(record);
             table.ahead = ahead;
             if table.index.is_none() && cap != 0 {
@@ -1549,12 +1644,22 @@ struct Asked<'a> {
 /// its prefix, for the first one it takes. No other decision asks it.
 ///
 /// A pick states what its first target holds of the request ([`Overlap`]),
-/// from the rows its decision was given: the rows named here, the column
-/// filled here, a column its host filled or the rows its host named. A
-/// request decided inside a tree's match states nothing: a match is a count
-/// of tokens and no entry of blocks. Neither does a decision whose own
-/// profile reads no affinity, whether it is given no rows or the rows of
-/// its binding's shadow.
+/// from the rows its decision was given: the rows named here, from the
+/// host's data or from a tree's match, the column filled here, a column its
+/// host filled or the rows its host named. A decision whose own profile
+/// reads no affinity states nothing, whether it is given no rows or the
+/// rows of its binding's shadow.
+///
+/// A request decided inside a tree's match states what the match's rows
+/// say: the match's tokens counted in the request's blocks for a worker
+/// named among its holders, and a miss for any other. A gateway's classic
+/// cache-aware policy observes another thing of such a request, the match's
+/// share of the prompt's tokens whoever it chose, so the two differ in
+/// three places. A match under one block states a miss: a prompt shorter
+/// than one block always does, where the classic policy may observe it
+/// whole. A pick that is none of the match's holders states a miss, where
+/// the classic policy observes the match's share. Past the cap the holders
+/// named are a draw, so a holder the draw left out states a miss too.
 ///
 /// The rows live in the calling thread's buffers until this returns:
 /// `decide` reads them and keeps nothing of them. Nothing is allocated once
@@ -1947,6 +2052,10 @@ impl Table {
     /// nothing: the match has marked the path it walked as used, as every
     /// match of the tree does. The record of hashed prefixes is neither
     /// read nor written.
+    ///
+    /// The pick states its first target's entry of the rows the match named
+    /// ([`state`]), where the request's own profile reads affinity: the
+    /// match's blocks for a holder named, and a miss for any other worker.
     #[expect(
         clippy::too_many_arguments,
         reason = "the tree and the entry, the target the caller takes, the list, the request's facts and its places, the buffers, and the decision"
@@ -1963,15 +2072,20 @@ impl Table {
     ) -> Decision {
         let mut decide_over = |holders: &[TenantId], blocks: u32| {
             self.name_sent(holders, blocks, workers, facts, places, buffers);
-            decide(&mut RequestFacts {
-                named: Some(AffinityRows {
-                    holders: &buffers.holders,
-                    warming: &buffers.warming,
-                    thin: self.ruled.thin,
-                    mean_in_flight: None,
-                }),
+            let named = AffinityRows {
+                holders: &buffers.holders,
+                warming: &buffers.warming,
+                thin: self.ruled.thin,
+                mean_in_flight: None,
+            };
+            let mut decision = decide(&mut RequestFacts {
+                named: Some(named),
                 ..*facts
-            })
+            });
+            if self.states {
+                state(&mut decision, Feed::Named(named), facts, self.block);
+            }
+            decision
         };
         let mut decided = None;
         sent.match_and_insert_with(&key.tokens, |found| {
@@ -1984,7 +2098,7 @@ impl Table {
         });
         // The tree asks for the worker once, so the decision was made
         // there. Were it not asked, the request is decided here, with no
-        // holder named and nothing written.
+        // holder named and nothing written: its pick states a miss.
         decided.unwrap_or_else(|| decide_over(&[], 0))
     }
 
