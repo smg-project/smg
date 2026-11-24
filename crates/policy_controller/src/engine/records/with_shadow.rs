@@ -76,8 +76,13 @@ pub(crate) fn decide(
         })
     };
     with_buffers(|buffers: &mut Buffers| {
-        let Buffers { rows, scratch } = buffers;
-        let (rows, pool_facts) = pool.write(workers, live, rows);
+        let Buffers {
+            whole,
+            stands,
+            scratch,
+            ..
+        } = buffers;
+        let (rows, pool_facts) = pool.write_over::<true>(workers, live, whole, stands);
         let written;
         let cx = if cx.stalled.is_empty() {
             cx
