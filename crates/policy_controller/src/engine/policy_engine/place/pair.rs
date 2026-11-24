@@ -21,7 +21,7 @@ use super::{decide, raise, sendable, walk, Call, Made, PlaceRequest, Sent, Sides
 use crate::{
     engine::{
         decision::Target,
-        decision_engine::{Decided, DecisionRefused},
+        decision_engine::DecisionRefused,
         list_cell::LentList,
         policy_engine::Loaded,
         prefills_full,
@@ -70,16 +70,17 @@ pub(super) fn ask<'a>(
     call: &mut Call,
 ) -> Result<Option<Placement<'a>>, Unplaced> {
     let mut made = Made::asked(engine.object, request, call);
-    let decided = decide(engine, &made);
+    let mut whole = None;
+    let decided = decide(engine, &made, &mut whole);
     // The route's rule panicked inside the decision, at the question of
     // where the prompt goes: the panic is the caller's, as a single's is.
     if let Some(panic) = made.panicked.take() {
-        raise(engine.object, panic, decided);
+        raise(engine.object, panic, whole, decided);
     }
-    let (decided, dated) = decided.map_err(Unplaced::Refused)?;
+    let (alone, dated) = decided.map_err(Unplaced::Refused)?;
     let (key, kept) = (made.key(), [made.sent.get(), made.decodes.get()]);
     // A pair's decision is whole: no one pick decides a place of two lists.
-    let Decided::Whole(decided, later) = decided else {
+    let (None, Some((decided, later))) = (alone, whole) else {
         return Err(Unplaced::Refused(DecisionRefused::Faulted));
     };
     if prefills_full(&decided.decision) {

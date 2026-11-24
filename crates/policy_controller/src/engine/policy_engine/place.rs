@@ -81,8 +81,8 @@ use crate::{
     engine::{
         decision::{Decision, Pick, ShedReason, Target, MAX_TARGETS},
         decision_engine::{
-            DecideOutcome, Decided, DecisionEngine, DecisionRefused, Plain, Request, RequestMaker,
-            TokenKey, WorkerLists,
+            AlonePick, DecideOutcome, DecisionEngine, DecisionRefused, Plain, Request,
+            RequestMaker, TokenKey, WorkerLists,
         },
         demands::Demands,
         framework::EncodeItems,
@@ -1010,22 +1010,28 @@ const fn declined(stated: &'static str) -> Unplaced {
     }
 }
 
-/// The engine's one decision for `made` ([`PolicyEngine::decide_at`]), and
-/// the instant it was dated at. A place dates nothing: no clock is read
-/// for it. Every walk of a first placement decides here, and nowhere else:
-/// a decode decided again is asked through its guard ([`decode_again`]).
+/// The engine's one decision for `made` ([`PolicyEngine::decide_at`]): the
+/// place it answers, or `None` with its whole decision written into
+/// `whole`, the room its caller keeps ([`Loaded::decide_into`]); and the
+/// instant it was dated at. A place dates nothing: no clock is read for
+/// it. A single's ask and a pair's decide here, three lists with no item
+/// stated among the pairs. An encode request's items are decided with its
+/// pair in one call ([`Loaded::decide_encode_at`]), and a decode decided
+/// again is asked through its guard ([`decode_again`]).
 #[inline]
 pub(super) fn decide(
     engine: Loaded<'_, '_>,
     made: &Made<'_, '_>,
-) -> Result<(Decided, Option<Instant>), DecisionRefused> {
+    whole: &mut Option<(DecideOutcome, bool)>,
+) -> Result<(Option<AlonePick>, Option<Instant>), DecisionRefused> {
     let dated = Cell::new(None);
-    let decided = engine.decide_at(made, || {
+    let clock = || {
         let now = Instant::now();
         dated.set(Some(now));
         now
-    })?;
-    Ok((decided, dated.get()))
+    };
+    let alone = engine.decide_into(made, clock, whole)?;
+    Ok((alone, dated.get()))
 }
 
 /// The pick of a whole decision, or why the decision placed nothing: its
@@ -1297,10 +1303,11 @@ fn named(engine: Loaded<'_, '_>, list: Option<LentList<'_>>, place: u32) -> Opti
 fn raise(
     engine: &'static PolicyEngine,
     panic: Box<dyn Any + Send>,
-    decided: Result<(Decided, Option<Instant>), DecisionRefused>,
+    whole: Option<(DecideOutcome, bool)>,
+    decided: Result<(Option<AlonePick>, Option<Instant>), DecisionRefused>,
 ) -> ! {
-    if let Ok((Decided::Whole(decided, later), dated)) = decided {
-        give_up(engine, decided, later, dated.unwrap_or_else(Instant::now));
+    if let (Some((outcome, later)), Ok((_, dated))) = (whole, decided) {
+        give_up(engine, outcome, later, dated.unwrap_or_else(Instant::now));
     }
     resume_unwind(panic)
 }
@@ -1326,20 +1333,20 @@ fn single<'a>(
         budget_micros: call.left(request)?,
         ..Made::asked(engine.object, request, call)
     };
-    let decided = decide(engine, &made);
+    let mut whole = None;
+    let decided = decide(engine, &made, &mut whole);
     if let Some(panic) = made.panicked.take() {
-        raise(engine.object, panic, decided);
+        raise(engine.object, panic, whole, decided);
     }
-    let (decided, dated) = decided.map_err(Unplaced::Refused)?;
-    let (key, sent) = (made.key(), made.sent.get());
+    let (alone, dated) = decided.map_err(Unplaced::Refused)?;
     let at = |place: u32| list?.workers.get(place as usize);
     // Each arm answers its own placement: a place's holds no decision, and
     // is written without the room of one.
-    match decided {
+    match alone {
         // The engine picked the place on the read of the worker that
         // found it eligible: the worker is read no second time, and its
         // route's rule is asked of it.
-        Decided::Alone(pick) => {
+        Some(pick) => {
             let worker = at(pick.place).ok_or(Unplaced::NoWorkers)?;
             // A caller of this call states no worker id of its own: where
             // its list's records stand, they name the worker by its
@@ -1359,10 +1366,16 @@ fn single<'a>(
                 return call.again(|call| single(engine, request, list, call));
             }
             let mut placement = Placement::alone(Arc::clone(worker), engine.label_at(pick.profile));
-            placement.routing_key = key;
+            placement.routing_key = made.key();
             Ok(placement)
         }
-        Decided::Whole(decided, later) => {
+        None => {
+            // The pass writes its decision ahead of every answer but a
+            // place.
+            let Some((decided, later)) = whole else {
+                return Err(Unplaced::Refused(DecisionRefused::Faulted));
+            };
+            let (key, sent) = (made.key(), made.sent.get());
             let now = dated.unwrap_or_else(Instant::now);
             // Whether the rule refused a target that was ready: inside
             // the decision, or here.
