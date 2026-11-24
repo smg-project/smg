@@ -2231,6 +2231,41 @@ controller's prefix ring places that request by its prompt, as a gateway's own p
 (section 8.1). The frame of a host older than that field says nothing, and under it the id's key
 places as any other.
 
+A frame that is decided over one list may state the number its request names its worker by
+(`DecideRequest.named_worker`): a single request's frame, and one that stands alone at a side's
+phase. Its host reads the number under the target source of its binding (section 8.2) and states
+it. A text that is no number crosses as the widest number, which reaches no worker. Under a
+document whose binding for the frame names that source, the controller counts as the one call
+does, by the same function: from 0 and in the order of its own list, over the workers the asking
+gateway can be sent to. Those are the places the gateway may take by its reach and its wires, that
+none of its standing vetoes holds back, and whose worker object is available by its own test. The
+frame's one decision is held to the worker the number reaches. The request goes to that worker or
+is shed with no endpoint, under `target-worker`: where the number reaches no worker, or that
+worker cannot take the request after all. Where the gateway can be sent to no worker of the list,
+the request is decided as one that names none, and carries neither its session key nor its
+client's key. A frame that states no number is decided as it was, and the frame of a host older
+than the field states none. No pair's frame and no encode request's is read for the number.
+
+Four things differ there from a gateway's own process (section 8.2). Each is open under rule 6.
+
+- **The route's rule is not asked.** It is the gateway's own code and no frame states it yet, so
+  the number counts a worker that rule refuses. It ends when the rule crosses as section 11 plans
+  it, and the count passes over the workers it refuses **[planned]**.
+- **The order is the controller's list.** The number counts in the order the workers registered
+  with the controller (10.2), and a gateway's own process counts in the order of its own list. It
+  ends when a gateway under a controller follows the controller's list and keeps its order
+  (section 11) **[planned]**.
+- **No hard demand crosses.** A frame states none in this protocol version, and a host decides a
+  request that states one by itself. So the controller's count leaves no worker out for a demand.
+  It ends when a frame states a request's demands **[planned]**.
+- **A pair's frame is read for no number.** A gateway's own process holds a pair to the workers
+  its request names, a side at a time (section 8.2), and a controller decides a pair's frame as
+  one that names none. It ends when a controller counts a pair's two sides as the one call does
+  **[planned]**.
+
+A gateway that decides by itself for lack of an answer (decision 6) counts over its own list by
+its own rule, so it can reach another worker than the controller's count reaches.
+
 ### 10.2 As designed **[partly]**
 
 Rule 2 and rule 3 apply to the controller as they do to the gateway: one set of worker data, in

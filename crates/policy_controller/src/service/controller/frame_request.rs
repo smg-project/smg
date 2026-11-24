@@ -56,7 +56,7 @@ use crate::{
     document::spec::AppliedSpec,
     engine::{
         decision_engine::{Request, RequestMaker, WorkerLists},
-        view::{Constraints, RequestFacts, SessionCountedUnder, WireModes},
+        view::{Constraints, Identity, RequestFacts, SessionCountedUnder, WireModes},
     },
 };
 
@@ -64,8 +64,13 @@ use crate::{
 /// lists: the frame, its lists as its decider read them, what is left of
 /// its budget, the worker lists of its model, and the places of a single
 /// request's list its gateway may take.
+///
+/// `UNKEYED` says whether the request is made with no routing value and no
+/// client's value, whatever its frame states ([`FrameRequest::unkeyed`]).
+/// The word is the type's and no field: the maker of every other request
+/// is compiled with no test of it.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct FrameRequest<'a> {
+pub(crate) struct FrameRequest<'a, const UNKEYED: bool = false> {
     frame: &'a Checked,
     lists: &'a FrameLists<'a>,
     /// What is left of the frame's budget at the decision, in microseconds.
@@ -149,10 +154,41 @@ impl<'a> FrameRequest<'a> {
             ..self
         }
     }
+
+    /// The request made with no routing value and no client's value,
+    /// whatever its frame states: a request that names its worker over a
+    /// list none of whose workers can be sent to. It leaves its worker's
+    /// hold and is decided as one that names none, and the worker a request
+    /// names outranks its routing value: that value keeps no worker over a
+    /// veto. What the one call does there, in a host's own process
+    /// ([`PolicyEngine::place`](crate::engine::policy_engine::PolicyEngine::place)).
+    #[must_use]
+    pub(crate) fn unkeyed(self) -> FrameRequest<'a, true> {
+        let Self {
+            frame,
+            lists,
+            budget_micros,
+            workers,
+            loads,
+            places,
+            stalled,
+            held,
+        } = self;
+        FrameRequest {
+            frame,
+            lists,
+            budget_micros,
+            workers,
+            loads,
+            places,
+            stalled,
+            held,
+        }
+    }
 }
 
 // `plain` keeps the trait's answer: a controller's request is never plain.
-impl RequestMaker for FrameRequest<'_> {
+impl<const UNKEYED: bool> RequestMaker for FrameRequest<'_, UNKEYED> {
     fn model(&self) -> &str {
         self.frame.model()
     }
@@ -160,6 +196,18 @@ impl RequestMaker for FrameRequest<'_> {
     fn make<'w>(&'w self, spec: &'w AppliedSpec) -> Request<'w> {
         let frame = self.frame;
         let facts = frame.facts(self.lists, frame.hashes_read(spec), self.budget_micros);
+        // A request made with no key states neither of its frame's keys,
+        // nor who handed the first.
+        let facts = if UNKEYED {
+            RequestFacts {
+                session_key: Identity::NONE,
+                client_key: 0,
+                session_key_from_rid: false,
+                ..facts
+            }
+        } else {
+            facts
+        };
         Request {
             id: frame.id(),
             facts: RequestFacts {

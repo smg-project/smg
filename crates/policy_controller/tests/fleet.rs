@@ -73,6 +73,8 @@
 //! on the caller's reports, or on the link's own release if an answer
 //! arrives after the caller's budget. A watch on the link takes the
 //! snapshot and the tail beside an ask, and can follow after the link ends.
+//! A request that names its worker is answered that worker over the link,
+//! by the number its host states at the door's ask.
 //!
 //! No stub server: the engines are the mock worker's, the controller is the
 //! one the binary runs and the client is the generated one. Every wait is
@@ -2847,6 +2849,91 @@ async fn a_handle_over_a_link_ends_a_lease_its_alternate_served() {
                 .await
                 .expect("the completion ends the lease");
         }
+        assert!(link.stands());
+        drop(link);
+        harness.stop().await.expect("a clean stop");
+    };
+    tokio::time::timeout(CASE, Box::pin(case))
+        .await
+        .expect("the case ends inside its outer bound");
+}
+
+/// A request that names its worker is answered that worker over a link, by
+/// the number its host states at the door's ask. Under the stock hash ring
+/// document, whose binding names a target source, each number of a fleet of
+/// three is answered one worker and no alternate, the same at each ask
+/// whatever the request's id, and the three numbers are answered the three
+/// workers in the order they registered. A number past the fleet and a text
+/// that is no number are answered a shed with no endpoint. A request that
+/// names no worker is answered a pick with its alternates, as it was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_handle_over_a_link_is_answered_the_worker_its_request_names() {
+    use smg_policy_controller::{
+        engine::{Decision as Decided, PolicyEngine, Request, RequestFacts, ShedReason as Why},
+        tracking::DecisionGuard,
+    };
+
+    const GATEWAY: &str = "fleet-named";
+    let case = async {
+        let (mut harness, link) = Box::pin(linked_fleet(GATEWAY, 3))
+            .await
+            .expect("a ready fleet");
+        harness
+            .apply("consistent_hashing")
+            .expect("a preset of this build applies");
+        let asks = [
+            ("named-0a", Some(Some(0))),
+            ("named-1a", Some(Some(1))),
+            ("named-2a", Some(Some(2))),
+            ("named-0b", Some(Some(0))),
+            ("named-1b", Some(Some(1))),
+            ("named-2b", Some(Some(2))),
+            ("named-3", Some(Some(3))),
+            ("named-text", Some(None)),
+            ("named-none", None),
+        ];
+        // The engine an ask is answered and how many targets its pick
+        // names, or the reason of its shed.
+        let mut answers = Vec::with_capacity(asks.len());
+        for (id, named) in asks {
+            let asked = Request {
+                id: id.as_bytes(),
+                facts: RequestFacts {
+                    model: MODEL,
+                    budget_micros: 5_000_000,
+                    ..RequestFacts::default()
+                },
+                constraints: Default::default(),
+            };
+            let started = Instant::now();
+            let held = Box::pin(DecisionGuard::<&PolicyEngine>::asked_naming(
+                &link, &asked, named, started, ROOM,
+            ))
+            .await;
+            let handle = held.expect("the controller's decision");
+            let answer = match handle.decision() {
+                Decided::Pick(pick) => {
+                    let first = pick.targets.as_slice()[0];
+                    let (engine, _) = harness
+                        .named(first.id.0)
+                        .expect("the picked worker is in the fleet");
+                    Ok((engine, pick.targets.len()))
+                }
+                Decided::Shed(shed) => Err(shed.reason),
+                Decided::Queue(_) => panic!("{id} is queued"),
+            };
+            answers.push(answer);
+        }
+        let alone = |engine: usize| -> Result<(usize, usize), Why> { Ok((engine, 1)) };
+        let twice = [alone(0), alone(1), alone(2), alone(0), alone(1), alone(2)];
+        assert_eq!(answers[..6], twice, "its worker alone, at each ask");
+        let shed = [Err(Why::NoEndpoints), Err(Why::NoEndpoints)];
+        assert_eq!(answers[6..8], shed, "a number that reaches no worker");
+        let unnamed = answers[8];
+        assert!(
+            matches!(unnamed, Ok((_, targets)) if targets > 1),
+            "{unnamed:?}"
+        );
         assert!(link.stands());
         drop(link);
         harness.stop().await.expect("a clean stop");

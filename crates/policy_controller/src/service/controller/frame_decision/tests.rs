@@ -9,7 +9,8 @@
 //! [`decide_decode`] behind the pair its lease holds, and the two that
 //! issue its side ask [`issue_decode`] behind it. One asks
 //! [`decide_alone`] for a prefill and for a decode frame that stands
-//! alone. An encode request's cases stand in a file of their own.
+//! alone. An encode request's cases stand in a file of their own, and so do
+//! those of a frame whose request names its worker.
 
 use std::{
     collections::BTreeSet,
@@ -24,7 +25,7 @@ use smg_worker::load::state::{one_rank_load, LoadSnapshot};
 
 use super::{
     decide, decide_alone, decide_decode, decide_pair, hands_reports, issue_decode, issue_pair,
-    FrameBuffers,
+    Booked, FrameBuffers,
 };
 use crate::{
     document::spec::{AppliedSpec, Assignment, PolicySpec},
@@ -69,6 +70,7 @@ use crate::{
 };
 
 mod encode;
+mod named;
 
 /// A gateway that is not the cases' own.
 const OTHER: GatewayId = GatewayId(12);
@@ -90,6 +92,19 @@ fn served(
     taken: (Instant, Instant),
     place: Option<&AtWork>,
 ) -> Decision {
+    served_booked(store, objects, frame, gateway, taken, place).0
+}
+
+/// [`served`] with what the lease of a pick takes of its frame, beside the
+/// decision.
+fn served_booked(
+    store: &MemoryStore,
+    objects: &Objects<Members>,
+    frame: proto::DecideRequest,
+    gateway: GatewayId,
+    taken: (Instant, Instant),
+    place: Option<&AtWork>,
+) -> (Decision, Booked) {
     let request = Checked::new(frame).expect("a frame the record holds");
     let taken = taken_at(&request, gateway, taken, place);
     objects.follow(store);
@@ -98,7 +113,7 @@ fn served(
     // The load monitor published nothing: the request reads no report.
     let loads = Arc::new(LoadSnapshot::default());
     let decided = store.deciding(|world| decide(world, objects, &taken, &mut frames, &loads, &own));
-    decided.expect("the engine decides").0
+    decided.expect("the engine decides")
 }
 
 /// The `i`th ready member of [`BOOKED`] in `store`, on the HTTP wire.

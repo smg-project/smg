@@ -234,6 +234,10 @@ pub(crate) struct Checked {
     /// [`AGAIN`], [`DECODE_LATER`], [`DECODE_OF`], [`ITEMS`]): `0` for a
     /// frame that says none, so a decider reads them by one test.
     rare: u8,
+    /// The number the frame's request names its worker by
+    /// (`DecideRequest.named_worker`), as it came; `None` for a frame that
+    /// names no worker.
+    named: Option<u32>,
     /// The lease whose decode side the frame asks; `0` for a frame that
     /// asks none.
     decode_of: u64,
@@ -308,6 +312,10 @@ impl Checked {
             hash_kind,
             session_key,
             rare,
+            // Kept as the frame states it, whatever the frame's phase: the
+            // decision of a frame over one list reads it, under a spec
+            // whose binding names a target source, and no other does.
+            named: request.named_worker,
             decode_of,
             items,
         })
@@ -371,6 +379,16 @@ impl Checked {
     /// the prefill phase as its pair's one request ([`Self::phase`]).
     pub(crate) const fn carries_items(&self) -> bool {
         self.rare & ITEMS != 0
+    }
+
+    /// The number the frame's request names its worker by
+    /// (`DecideRequest.named_worker`), as its host read it under the
+    /// target source of its binding's routing key
+    /// ([`KeySources::target`](crate::document::KeySources::target));
+    /// `None` for a frame that names no worker. The widest number is a
+    /// text that was no number: it reaches no worker of any list.
+    pub(crate) const fn named_worker(&self) -> Option<u32> {
+        self.named
     }
 
     /// The keys of an encode request's items as the engine takes them, in
@@ -1561,6 +1579,28 @@ pub(crate) mod tests {
         assert_eq!(said(true, Some(lease)), call);
         let last = Some(u64::MAX);
         assert_eq!(said(false, last), (true, false, last, Phase::Decode));
+    }
+
+    /// The number a frame's request names its worker by is kept as it came:
+    /// none for a frame that states none, the first worker's apart from
+    /// none, and the widest number. It is kept whatever the frame's phase:
+    /// its decision reads it or does not. It is no word of the byte few
+    /// frames say one of: a decider's one test reads a frame that names its
+    /// worker as it reads any other.
+    #[test]
+    fn a_frame_keeps_the_number_its_request_names_its_worker_by() {
+        let said = |named: Option<u32>, phase: proto::Phase| {
+            let mut frame = with(|facts| facts.phase = phase.into());
+            frame.named_worker = named;
+            let frame = Checked::new(frame).expect("no word is a field out of its range");
+            (frame.says_more(), frame.named_worker())
+        };
+        let single = proto::Phase::Single;
+        assert_eq!(said(None, single), (false, None));
+        assert_eq!(said(Some(0), single), (false, Some(0)));
+        assert_eq!(said(Some(7), proto::Phase::Prefill), (false, Some(7)));
+        let widest = Some(u32::MAX);
+        assert_eq!(said(widest, single), (false, widest));
     }
 
     /// No lease has the id 0: a frame that names it is refused by its

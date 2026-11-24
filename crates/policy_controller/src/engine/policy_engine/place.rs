@@ -68,7 +68,7 @@
 mod decode_again;
 mod encode;
 mod pair;
-mod target;
+pub(crate) mod target;
 
 use std::{
     any::Any,
@@ -394,8 +394,8 @@ pub struct PlaceRequest<'a> {
     /// under the lock the pair's two sides share. It must leave both sides
     /// alone: the send or the drop of one, from inside the rule, waits on
     /// that lock and never returns. That decision asks the request's
-    /// headers, its ring and its lists' admission under the same lock, and
-    /// each is held to the same.
+    /// headers, its ring, its lists' admission and their workers' own calls
+    /// under the same lock, and each is held to the same.
     ///
     /// For an encode request the rule is its pair's: it is asked of the
     /// pair's two workers and of no encoder, and of no list where the
