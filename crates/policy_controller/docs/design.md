@@ -563,6 +563,7 @@ circuit breaker, stalled, overloaded, the in-flight count and the count of reque
 // crates/worker/src/load/state.rs
 pub struct LoadSnapshot {
     entries: HashMap<Arc<str>, LoadEntry>, // worker URL -> its last load report and when it was taken
+    kept: FxHashMap<Arc<str>, LoadEntry>,  // worker URL -> the last report of one whose load call fails
 }
 pub type LoadReceiver = watch::Receiver<Arc<LoadSnapshot>>; // how a reader follows new snapshots
 ```
@@ -570,7 +571,10 @@ pub type LoadReceiver = watch::Receiver<Arc<LoadSnapshot>>; // how a reader foll
 The load monitor polls each worker (every 10 seconds by the gateway's default) and takes the load
 records that workers push. A worker whose pushed records are fresh is not polled. A new snapshot
 is published after each poll, and for pushed records at most once in 20 ms. A snapshot is never
-changed after it is published.
+changed after it is published. Where a worker's load call fails, the next snapshot holds no entry
+of it, and its last report is kept beside the entries, for `LoadSnapshot::report_or_kept` alone:
+where it states a running or waiting request, and no further than the first poll that finds its
+sample 30 seconds old (decision 12).
 
 **Who opens the stream.** A worker pushes on a stream that its host opens to it. The worker
 crate's collector connects to the worker and subscribes, and the worker answers on that stream
@@ -868,8 +872,10 @@ live half is read from the worker object once for each decision. A thread keeps 
 decision of a single request wrote whole for a list. Where its next such decision would copy from
 the same rows, and reads the same session counts, it writes the live half over them and copies
 nothing. The load report comes from the
-load snapshot; a snapshot's reports are converted once for a list and cached. Until the list
-holds them, a record written alone takes its report by one look-up in the snapshot: a drawn
+load snapshot, a kept report included (decision 12), and is as old as its sample. A snapshot's
+reports are converted once for a list and cached. Until the list
+holds them, a record written alone takes its report by one read of the snapshot, which looks
+among the kept reports too where it holds no entry of the worker: a drawn
 worker's, a worker's that a routing key names, and the held prefill's of a decode decided again.
 
 The field `engine` numbers the list's data-parallel engines: records that state one number are
@@ -1706,8 +1712,9 @@ decision is due is shed under `budget`. A pair's decisions are each given the wh
   is decided when the document is applied: a request under a document that names none pays one
   test of that word, and no header of it is read for a target.
 
-Where no worker of the list can be sent to, there is none to count. Classic steers such a
-request to its least-loaded worker, as it steers any request, and lifts no veto for its routing
+Where no worker of the list can be sent to, there is none to count. Classic answers such a
+request by its default for workers that are all vetoed, as it answers any request, and lifts no
+veto for its routing
 value (`overload_fallback` in `placement.rs`; `routes_by_session_key` in
 `consistent_hashing.rs`). The engine places it as a
 request that names no worker and carries no routing value, by the binding's rule for workers
@@ -1878,7 +1885,7 @@ The design adds no second mechanism where one exists.
 |---|---|---|
 | a model's worker lists | the registry's published lists (`Generation`) | one field beside each list: the engine's value |
 | a worker's health, breaker, overload, in-flight count | the worker object, read in place | one bit at a pair's decode asked again: that the caller counts the request on that decode already (section 8.2) |
-| load reports | the load monitor's `LoadSnapshot` | nothing |
+| load reports | the load monitor's `LoadSnapshot` | the last report of a worker whose load call fails, kept beside the snapshot's entries, and the one read that gives it (decision 12) |
 | which worker holds a prompt, by cache events | the kv-index crate's index, through two traits | the gateway's two readers of its index for those traits (section 9.2) |
 | which prefill pairs with which decode | the gateway's pair index (`PdPairIndex`) | the pair classes read from it, one file (section 9.2) |
 | which worker was sent a prompt | the host's own trees, of the kv-index crate's two tree types | one more question on the trait the host already answers for cache events |
@@ -2618,7 +2625,7 @@ and it has served traffic on a cluster beside classic.
 
 Each is the maintainer's. Work inside the crate goes on where a decision is not needed for it.
 
-All eleven at a glance. An answer can be as short as the numbers with their letters.
+All twelve at a glance. An answer can be as short as the numbers with their letters.
 
 | # | Decision | Recommended | Needed for |
 |---|---|---|---|
@@ -2632,7 +2639,8 @@ All eleven at a glance. An answer can be as short as the numbers with their lett
 | 8 | User stages in WebAssembly and over gRPC | (a) left as library code | nothing now |
 | 9 | The gateway's options | three with stage 3, the address and TLS options with stage 5 | stages 3 and 5 |
 | 10 | What the controller needs in the worker crate | one list type, and a load monitor that can be stopped; the other worker facts are kept beside the object; recommended: one set of overload thresholds for each worker | stage 4 |
-| 11 | The crate in CI and in the published set | (b) one line in CI's test script names the engine's feature; (a) out of the published set until stage 3 | CI's run of the kept engine's tests; stage 0 |
+| 11 | The crate in CI and in the published set | closed inside the crate: the feature `controller` takes the engine's feature; (a) out of the published set until stage 3 | CI's run of the kept engine's tests; stage 0 |
+| 12 | The last report of a worker whose load call fails | (a) the engine alone reads it, about 40 seconds at most at the default poll | rule 6, for the documents whose stages read load reports |
 
 ### Decision 1: the name of a cache partition
 
@@ -2797,6 +2805,39 @@ registers it with no threshold at all. What that leaves of a binding's block:
 | How does CI run the kept engine's own tests? | The kept engine compiles only under the feature `in-process`. The feature `controller` takes it. The first of CI's four test lines of the crate in `scripts/ci_rust_tests.sh` enables `client`, which takes `controller`, so that line runs the cases behind `in-process` and the test target `caller`. | (a) The crate's default build includes the feature: one line in the crate's manifest. Measured: two of CI's four lines then run the 82 cases, in under a second more. But a default build of the crate goes from 147 to 272 packages, the controller's image and three bench workflows then build the engine in, and two READMEs become wrong, one of them outside the crate. (b) CI's first test line names the feature: one line in the script, outside the crate. That line builds the same 364 packages with it and without it, and nothing else builds differently. (c) The crate's test-only dependency on itself names the feature: inside the crate, and no product build changes. But every build that takes the crate's test-only dependencies then builds the engine too: CI's two lines that test one feature alone, the lint of `operator` alone, and the three bench workflows that (a) names. Not measured. | Closed a fourth way, inside the crate: `controller` takes `in-process` and `worker-host`, the two features the controller's switch (section 10.2) builds on. A build with `controller` or `client` then compiles the kept engine and the worker objects, and a controller built with `controller` alone keeps worker objects as the stock binary does. No line outside the crate changed. |
 | Is the crate published before it is ready? | The earlier integration added the crate to the published set: four lines in two release workflows and the release version check. | (a) Stage 0's change takes the four lines out, and they return with the gateway's integration (stage 3). (b) They stay. | (a). |
 
+### Decision 12: the last report of a worker whose load call fails
+
+*Needed for:* rule 6 (section 1), for the documents whose stages read load reports.
+
+A worker's load call can fail while the worker goes on serving. The worker crate's load monitor
+drops the worker's report at that poll. Classic then scores the worker as one with no report:
+`least_load` starts it from the score of its best reporting peer. So a worker that had stated a
+full queue can be drawn again at the first failed call.
+
+The monitor keeps such a report beside its entries where the report states a running or waiting
+request. The kept report ends when the worker's load call answers again, when a load record of
+the worker arrives on its event stream, and when the worker leaves or is no longer ready. It ends
+no later than the first poll that finds its sample 30 seconds old: at the default poll of 10
+seconds, about 40 seconds after the sample. One read gives it, `LoadSnapshot::report_or_kept`,
+and the engine's rows and signal cells take that read. Classic's reads, `LoadSnapshot::report`
+and `LoadSnapshot::get`, give no kept report.
+
+So while a report is kept, the engine and classic can answer differently under the same routing
+flags. The engine charges the worker its last report and every request sent to it since that
+report's sample. Classic scores it as a worker with no report.
+
+| Option | Cost |
+|---|---|
+| (a) The engine alone reads the kept report. | Classic's answers do not move. With the option on, a worker whose load call fails while it serves is charged its last report for up to about 40 seconds, and can be under-used that long. In that window the engine differs from classic, by this decision. |
+| (b) Classic's reads take the kept report too. | The two agree. Classic's answers change for every policy that reads a report, and each of those reads pays a second look-up where a worker has no entry. |
+| (c) No stage reads it. | The two agree, and nothing changes. A worker that stated a full queue is scored from its peers at the first failed load call, and can be drawn again. |
+
+**Recommendation: (a).** A failed call is not a worker that never reported. The kept report is
+bounded by its own sample, and classic stays as recorded.
+
+**As taken.** (a) is on main: the monitor keeps the report, the engine's two reads take it, and
+classic's reads are as they were.
+
 ## 16. The order of work
 
 The crate first (rule 7). Each stage ends with a test, and the next does not start before it.
@@ -2807,7 +2848,7 @@ The crate first (rule 7). Each stage ends with a test, and the next does not sta
 | 1 | **The policies, proven in the crate.** Each classic policy decided by `PolicyEngine` over worker objects: its sheet replays through that engine, and its bench cell meets classic's count. | Every line of the 15 sheets that record a decision (415 of section 13.1's 489) replays through the kept engine over worker objects. Each difference from classic is fixed or accepted as a named difference. Under decision 3 (a) the 16 `prefix_hash` lines that measure a key's tokens or a spread of prompts replay there with no ring lent, and their proof for a gateway is stage 3's. |
 | 2 | **The host contract.** `place`, `Placement`, the engine's own upkeep and membership events (section 8.2). | A test host in the crate serves every plan through `place` alone. |
 | 3 | **The gateway, one change** (section 9), off by default. | The four points of section 9.2's bar; under decision 3 (a), the 47 `prefix_hash` lines and the 12 ring lines of `all_vetoed` read as recorded, count for count, through the gateway's own entry with the engine on and the recorder's own workers and prompts; a cluster run beside classic. |
-| 4 | **The controller on the one engine** (section 10.2); the old engine is deleted. | The controller's own tests pass on `PolicyEngine`; the store-backed engine is gone; each of the 74 lines of the four host sheets (section 13.1) is answered by the host's code that the controller takes from the worker crate, or by a rule of the crate's with its differences named. One difference is named so far, and 11 `overload` lines answer by it: where ranks are worker objects, a threshold that judged an engine's summed queue judges each rank's own queue, and a usage threshold each rank's own usage in place of the mean (two ranks that queue 4 requests each under a threshold of 8 are vetoed as one worker and not as two). The 18 `minimum_tokens` lines are answered as recorded by the worker crate's rank cache behind that monitor, which no code of a controller asks. They are not answers of the engine: it serves no rank option (`refuse_unsupported` in `src/document/routing_settings.rs` refuses classic's at the start), and where ranks are worker objects it picks among them by its profile. That pick was measured once, on 2026-11-23 over `55c35100d`, outside the tests: under a resident-work profile with a picker of two it names the recorded ranks on 5 of the 18 lines and other ranks on 13, by four rules. On 6 lines classic finds no rank on a worker its cache holds nothing of, and the engine places on a ready object that has no report (`with_no_survivor_reporting_resident_tokens_the_in_flight_count_decides`). On 3 a rank that the answer omits or reports with no token capacity is no rank to classic, and the engine scores it from its best reporting peer (`a_worker_without_resident_tokens_scores_from_the_best_reporting_peer`). On 3 the engine reads resident tokens and draws among equal ranks, where classic reads used tokens and takes the lowest rank (`equal_resident_work_ties_and_a_token_apart_does_not`). On 1 classic keeps a worker's last answer and its bookings behind a failed poll, and the monitor publishes no report of that worker (`publish_polled` in the worker crate's load monitor). Three of the lines move with how the caller counts a pick in flight and with the picker, and the count stays at 5 or 6. |
+| 4 | **The controller on the one engine** (section 10.2); the old engine is deleted. | The controller's own tests pass on `PolicyEngine`; the store-backed engine is gone; each of the 74 lines of the four host sheets (section 13.1) is answered by the host's code that the controller takes from the worker crate, or by a rule of the crate's with its differences named. One difference is named so far, and 11 `overload` lines answer by it: where ranks are worker objects, a threshold that judged an engine's summed queue judges each rank's own queue, and a usage threshold each rank's own usage in place of the mean (two ranks that queue 4 requests each under a threshold of 8 are vetoed as one worker and not as two). The 18 `minimum_tokens` lines are answered as recorded by the worker crate's rank cache behind that monitor, which no code of a controller asks. They are not answers of the engine: it serves no rank option (`refuse_unsupported` in `src/document/routing_settings.rs` refuses classic's at the start), and where ranks are worker objects it picks among them by its profile. That pick was measured once, on 2026-11-23 over `55c35100d`, outside the tests: under a resident-work profile with a picker of two it names the recorded ranks on 5 of the 18 lines and other ranks on 13, by four rules. On 6 lines classic finds no rank on a worker its cache holds nothing of, and the engine places on a ready object that has no report (`with_no_survivor_reporting_resident_tokens_the_in_flight_count_decides`). On 3 a rank that the answer omits or reports with no token capacity is no rank to classic, and the engine scores it from its best reporting peer (`a_worker_without_resident_tokens_scores_from_the_best_reporting_peer`). On 3 the engine reads resident tokens and draws among equal ranks, where classic reads used tokens and takes the lowest rank (`equal_resident_work_ties_and_a_token_apart_does_not`). On 1 classic keeps a worker's last answer and its bookings behind a failed poll, and the monitor publishes no report of that worker (`publish_polled` in the worker crate's load monitor). It keeps none for the engine either: the line's report states no running or waiting request (decision 12). Three of the lines move with how the caller counts a pick in flight and with the picker, and the count stays at 5 or 6. |
 | 5 | **A gateway under a controller** (section 11). | A cluster run: gateways under a controller beside classic, with the controller stopped and started under load. |
 
 ### Stage 1, the first changes
