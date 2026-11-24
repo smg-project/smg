@@ -521,7 +521,10 @@ request: the leases its store holds on file write the in-flight counter there (`
 
 These are the main writers, not all of them. The status is also written at a drain, at a
 registration's activation, by the registry itself where a worker leaves or comes from a peer's
-record, and on a controller by its worker host, which follows the store's row. The liveness flag
+record, and, on a host that follows a controller, by its worker host, which lays each status it
+is told. A controller's standby is told by its leader's log. A gateway's watcher
+(`service/watcher.rs`) is told by its watch of the controller's workers, and no gateway runs it
+on main (section 11). The liveness flag
 is also written on the word of the stream a worker pushes on (section 4.3), of a passed probe
 and of a request's own token stream.
 
@@ -645,7 +648,8 @@ request goes to.
   The one call answers by the read it makes of a target itself: ready, and admitted by the
   route's rule. So a call that decides again stores the prompt once, for the worker it sends
   to, and a call shed under the rule's name stores nothing. A maker that does not answer is
-  stored for the pick's first target.
+  stored for the pick's first target. A pick that a session's pin made ahead of the walk stores
+  nothing where a worker's leave was told in between: its worker may be the one that left.
 - **[built]** The one call takes a target by the answer the tree's walk was given on it: a
   worker's state is read, and its route's rule asked, once a decision. So the tree names the
   worker the prompt went to. A worker that stops being ready behind that read is still sent to,
@@ -656,8 +660,10 @@ request goes to.
 - **[planned]** The hash table leaves the single decision. Until then a request of a model with
   an index of cache events reads the index, where it has token ids, and the hash table for the
   workers the index holds no block for, as today.
-- **[built]** A prefill-decode pair decided over worker lists reads the hash table and the
-  host's index of cache events for each side, by the side's own list. Behind its pick it writes
+- **[built]** A prefill-decode pair decided over worker lists reads the host's index of cache
+  events and the hash table for each side, by the side's own list: the index, where the request
+  has token ids, for the workers it holds a block for, and the hash table for the others. Behind
+  its pick it writes
   the first target its caller sends to into the hash table, a side at a time, where the index
   does not speak for that side's worker. An encode
   request's first decision does the same for its pair. It writes neither side where its caller
@@ -678,7 +684,8 @@ the holders' rows. A request given as text names no entry and still reads the ha
 request of a model that has an index still reads the index, where the request has token ids,
 and the hash table for the workers the index holds no block for.
 A prefill-decode pair is lent no tree: each of its sides
-reads the hash table, and the index where its model has one, by the side's own list. An encode
+reads the hash table, and the index where its model has one, by the side's own list, worker by
+worker as a single request does. An encode
 request's pair reads them the same way. A controller is to
 keep trees of its own **[planned]**, and section 11 says what its contract must hold for that. On
 main a controller's engine reads its hash table alone (section 10.1).
@@ -822,7 +829,10 @@ pub struct Candidate {
 ```
 
 The identity half is filled once for a list and cached (`PoolRecords`, `engine/records.rs`). The
-live half is read from the worker object once for each decision. The load report comes from the
+live half is read from the worker object once for each decision. A thread keeps the rows its
+decision of a single request wrote whole for a list. Where its next such decision would copy from
+the same rows, and reads the same session counts, it writes the live half over them and copies
+nothing. The load report comes from the
 load snapshot; a snapshot's reports are converted once for a list and cached. Until the list
 holds them, a record written alone takes its report by one look-up in the snapshot: a drawn
 worker's, a worker's that a routing key names, and the held prefill's of a decode decided again.
@@ -844,7 +854,7 @@ pub struct Request<'a> {
     pub constraints: Constraints<'a>, // what only the deciding host knows
 }
 
-// engine/view.rs (the fields a stage reads; 32 in all)
+// engine/view.rs (the fields a stage reads; 31 in all)
 pub struct RequestFacts<'a> {
     pub model: &'a str,            // the resolved model id
     pub phase: Phase,              // Single, Prefill, Decode or Encode
@@ -870,8 +880,8 @@ pub struct RequestFacts<'a> {
     pub now_micros: u64,           // the host's clock at the decision
     pub ring: Option<&'a dyn LentRing>, // the hash ring the host keeps, lent to this decision
     pub ring_positions: &'a [u64], // where the request stands on that ring, as the host states it
-    // eight more fields: `affinity`, `named`, `signal_cells`, `session_counted` and
-    // `session_key_from_rid`, and the three that 5.8 removes
+    // seven more fields: `affinity`, `named`, `signal_cells`, `session_counted` and
+    // `session_key_from_rid`, and the two that 5.8 removes
 }
 
 pub struct Constraints<'a> {
@@ -1208,7 +1218,8 @@ A count of sends holds a send until one of four ends: a load report of the worke
 after the send (later by `sent_report_delay_ms`, where the profile sets it), the age `sent_ttl_ms`
 where the profile sets it, a newer send once the worker's rank holds 8,192, or a membership
 change the count is told. The changes that end a worker's sends are its removal, its replacement
-under another id and a change of its data-parallel width. A list of the ids that stand
+under another id and, where a controller's store tells it, a change of its data-parallel width.
+A list of the ids that stand
 (section 8.1) ends the sends of each worker it leaves out.
 
 A sessions rule places some requests alone, behind the profile's filters and with no scorer or
@@ -1789,7 +1800,7 @@ The design adds no second mechanism where one exists.
 | Need | Reused, as it exists | Added |
 |---|---|---|
 | a model's worker lists | the registry's published lists (`Generation`) | one field beside each list: the engine's value |
-| a worker's health, breaker, overload, in-flight count | the worker object, read in place | nothing |
+| a worker's health, breaker, overload, in-flight count | the worker object, read in place | one bit at a pair's decode asked again: that the caller counts the request on that decode already (section 8.2) |
 | load reports | the load monitor's `LoadSnapshot` | nothing |
 | which worker holds a prompt, by cache events | the kv-index crate's index, through two traits | the gateway's two readers of its index for those traits (section 9.2) |
 | which prefill pairs with which decode | the gateway's pair index (`PdPairIndex`) | the pair classes read from it, one file (section 9.2) |
@@ -2096,7 +2107,8 @@ A fact leaves the remainder when the worker object gets a field that holds it as
    object stands when the write returns. The table of records follows on a leader as it does
    on a standby, by one body, and the membership log is told from it. In a controller the
    code that keeps the objects alone writes a worker object's own facts, so the record a change
-   in place writes to the table is the object's record read back whole. A second writer of an
+   in place writes to the table is the object's record read back whole, less its status: the
+   table keeps its own, and the object's is told behind the write. A second writer of an
    object's facts in a controller would break that, as a gateway's refresh of a worker's models
    is one in a gateway. The locks in their
    order: the door's turn, the keeper's turn, the store's membership lock, and no lock of the
@@ -2525,7 +2537,7 @@ different modes would disagree.
 
 | Option | Cost |
 |---|---|
-| (a) The host lends the ring it keeps; the engine asks it which workers a routing key reaches. | Crate only: one deletion and four changes. The crate's ring beside a worker list is deleted (1,728 lines removed, 230 added, 17 files). The four changes are about 580, 270, 450 and 550 changed lines, about 370 of them product code and 1,050 proof. The host lends its ring through one trait (`LentRing`) and states where a request stands on it. For such a request the crate then reads no ring of its own, so the request is placed on classic's own ring. The price in proof: 16 of the 47 recorded `prefix_hash` lines measure which tokens are in a key (15 lines) or how prompts spread over workers (1 line). In the crate they keep replaying on the crate's own ring, share for share as on main. For a gateway they are proven at stage 3 (section 13.1). On main classic's key recipe and its ring lookup are functions that classic and the lender both call. A controller has no classic ring to be lent: until (b) it keeps its own ring and places a routing key on another worker than a gateway would. |
+| (a) The host lends the ring it keeps; the engine asks it which workers a routing key reaches. | Crate only: one deletion and four changes. The crate's ring beside a worker list is deleted (1,728 lines removed, 230 added, 17 files). The four changes are about 580, 270, 450 and 550 changed lines, about 370 of them product code and 1,050 proof. The host lends its ring through one trait (`LentRing`) and states where a request stands on it. For such a request the crate then reads no ring of its own, so the request is placed on classic's own ring. The price in proof: 16 of the 47 recorded `prefix_hash` lines measure which tokens are in a key (15 lines) or how prompts spread over workers (1 line). In the crate they keep replaying on the crate's own ring. One of the 15 is held apart (section 13.1). The other 14 and the spread line hold classic's shares, as on main. For a gateway they are proven at stage 3 (section 13.1). On main classic's key recipe and its ring lookup are functions that classic and the lender both call. A controller has no classic ring to be lent: until (b) it keeps its own ring and places a routing key on another worker than a gateway would. |
 | (b) Classic's ring (one file, 508 lines) moves to a crate both sides use. | A pure move, about 15 lines changed beside it. The gateway, the engine and the controller then build one ring type. |
 | (c) The crate's ring is changed to classic's hashes. | About 125 lines. Classic's recipe written twice; a gateway would keep two rings for a model. |
 
