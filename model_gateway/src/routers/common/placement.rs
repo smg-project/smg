@@ -23,7 +23,7 @@ use rand::RngExt;
 use smg_policy_controller::{
     document::DecodePick,
     engine::{
-        LentList, PairAdmission, PairLists, Phase, PlaceRequest, PolicyEngine, Unplaced,
+        LentList, Overlap, PairAdmission, PairLists, Phase, PlaceRequest, PolicyEngine, Unplaced,
         WorkerLists,
     },
     policies::consistent_hashing::LentRing,
@@ -1004,6 +1004,16 @@ fn row_name(policies: &PolicyRegistry, side: Option<RowSide>, label: &'static st
 /// counts a request under. The name is read off the settings: no policy
 /// object is asked.
 ///
+/// Observes the match ratio a classic cache-aware selection observes of the
+/// worker it chose ([`Metrics::record_cache_aware_match_ratio`]): the share
+/// of the request's blocks the placement states its worker holds
+/// ([`Placement::overlap`]), a miss as zero. One observation a placement
+/// that states one, under any profile whose stages read who holds the
+/// prompt. A placement that states nothing observes nothing: a profile that
+/// reads no such row, a request decided inside a token tree the gateway
+/// lends, a request the sessions rule placed and keeps from the profile, and
+/// a request that goes to a later target of its pick.
+///
 /// A traced request's decision record takes one row, as a classic
 /// selection's does ([`PolicyRegistry::select_worker_for_model`]): the
 /// list as it stands ahead of the engine's call, and the worker picked, or
@@ -1043,6 +1053,10 @@ fn placed_by_engine(
         model_id,
         counted_under,
     );
+    let Overlap { blocks, of, .. } = placement.overlap;
+    if of != 0 {
+        Metrics::record_cache_aware_match_ratio(f64::from(blocks) / f64::from(of));
+    }
     let named = || row_name(policies, None, placement.profile);
     engine_row(seen, named, Some(&placement.worker));
     // A placement is moved whole only where the engine is owed the request's
@@ -8131,6 +8145,77 @@ pub(crate) mod tests {
             assert_eq!(counted, BTreeMap::from([(name.to_owned(), 2)]), "{name}");
             assert_eq!(policies.classic_made_or_asked(), 0, "{name}");
         }
+    }
+
+    /// While the policy engine decides, a single request's placement
+    /// observes the match ratio a classic cache-aware selection observes of
+    /// the worker it chose: the share of the request's blocks the engine's
+    /// placement states its worker holds. A prompt's first request reads a
+    /// miss, and its next request, which goes back to its worker, reads
+    /// every block. Under a document whose stages read no prompt's holder
+    /// the series stays silent, as it is under a classic policy that is not
+    /// cache-aware. No classic policy object is made or asked.
+    #[test]
+    fn a_request_the_engine_places_observes_its_match_ratio() {
+        use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
+
+        use crate::{
+            config::RouterConfig, observability::metrics::CACHE_AWARE_MATCH_RATIO_BUCKETS,
+        };
+
+        const SERIES: &str = "smg_cache_aware_match_ratio";
+        let observed = |policy: PolicyConfig| {
+            let recorder = PrometheusBuilder::new()
+                .set_buckets_for_metric(
+                    Matcher::Full(String::from(SERIES)),
+                    CACHE_AWARE_MATCH_RATIO_BUCKETS,
+                )
+                .expect("the series' buckets")
+                .build_recorder();
+            let handle = recorder.handle();
+            let registry = http_registry(&["http://h:1", "http://h:2", "http://h:3"]);
+            let settings = RouterConfig {
+                policy,
+                ..Default::default()
+            };
+            let policies = PolicyRegistry::for_policy_engine(
+                settings.policy.clone(),
+                settings.routing_key_override.clone(),
+            );
+            let document = settings.policy_document().expect("the settings' document");
+            let spec = AppliedSpec::validate(&document);
+            engine_on(&policies, spec.expect("a valid document"));
+            let text = "the words of one prompt, said twice. ".repeat(8);
+            let inputs = PlacementInputs {
+                text: Some(&text),
+                ..Default::default()
+            };
+            let went_back = metrics::with_local_recorder(&recorder, || {
+                let first = pick(&registry, &policies, inputs);
+                pick(&registry, &policies, inputs).url() == first.url()
+            });
+            assert_eq!(policies.classic_made_or_asked(), 0);
+            let rendered = handle.render();
+            let lines = rendered.lines().filter(|line| line.starts_with(SERIES));
+            (went_back, lines.map(str::to_owned).collect::<Vec<_>>())
+        };
+        let (went_back, cache_aware) = observed(PolicyConfig::cache_aware(0.5, 32, 1.1, 0, 4096));
+        assert!(went_back, "the prompt's next request goes to its worker");
+        for series in [
+            "smg_cache_aware_match_ratio_bucket{le=\"0\"} 1",
+            "smg_cache_aware_match_ratio_bucket{le=\"0.9\"} 1",
+            "smg_cache_aware_match_ratio_bucket{le=\"1\"} 2",
+            "smg_cache_aware_match_ratio_sum 1",
+            "smg_cache_aware_match_ratio_count 2",
+        ] {
+            assert!(
+                cache_aware.iter().any(|line| line == series),
+                "missing {series} in {cache_aware:#?}"
+            );
+        }
+        let (went_back, round_robin) = observed(PolicyConfig::RoundRobin);
+        assert!(!went_back, "the list's turn moves on");
+        assert_eq!(round_robin, Vec::<String>::new());
     }
 
     // ---- a traced request under the policy engine --------------------------------------------
