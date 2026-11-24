@@ -1181,7 +1181,11 @@ On main three pickers say so: round robin, `random` and `passthrough`.
    lifted the overload veto for the request. The rule lifts nothing harder: a veto the host
    holds (`Constraints::held`), an open breaker, a worker that is not ready or is draining.
    Otherwise the decision is a refusal that names the filter: `Saturated` for the overload filter,
-   `NoEndpoints` for any other. A single request with a routing key keeps its key's worker over
+   `NoEndpoints` for any other. An encode request's encoders enter no such rule. Where the
+   overload filter leaves none of them, the refusal is `Saturated` under a binding that sheds
+   and `NoEndpoints` under `encoders` under one that steers. Classic answers a client the
+   same way: its overload shed with the shed option, and no available worker without it.
+   A single request with a routing key keeps its key's worker over
    the overload veto, beside free workers too, where its binding does not shed, the plain ring
    alone places its profile and every worker it may take is a single worker. A sessions rule adds
    conditions of its own. Over workers of another role the veto stands, and the key passes on to

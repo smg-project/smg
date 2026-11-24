@@ -662,15 +662,17 @@ fn overloaded(row: Candidate) -> Candidate {
     }
 }
 
-/// Encoders the overload veto left none of are a saturated fleet: the shed
-/// names the veto's stage and its reason is saturation, as a pair's side
-/// sheds if its binding sheds. A stage ahead of the veto that leaves none is a
-/// missing endpoint as before, and so is one behind it that refuses an
-/// encoder the veto kept. An encoder that does not take the request is not
-/// counted, and under a veto its host lifted the encoders serve.
+/// Under a binding that sheds a pool the overload veto empties, encoders
+/// the veto left none of are a saturated fleet: the shed names the veto's
+/// stage and its reason is saturation, as a pair's side sheds under that
+/// binding. A stage ahead of the veto that leaves none is a missing endpoint
+/// as before, and so is one behind it that refuses an encoder the veto
+/// kept. An encoder that does not take the request is not counted, and
+/// under a veto its host lifted the encoders serve.
 #[test]
-fn encoders_the_veto_left_none_of_shed_as_saturation() {
-    let stock = engine();
+fn encoders_the_veto_left_none_of_shed_as_saturation_under_a_binding_that_sheds() {
+    let mut shedding = engine();
+    shedding.shed_when_all_vetoed(0);
     let saturated = (ShedReason::Saturated, "not-overloaded");
     let missing = (ShedReason::NoEndpoints, "encoders");
     // Every encoder that takes the request is over its thresholds.
@@ -680,15 +682,13 @@ fn encoders_the_veto_left_none_of_shed_as_saturation() {
         overloaded(row(1, Role::Encode, 0, 0)),
     ];
     bed.facts = vec![pushing(1), pushing(1)];
-    let shed = bed.decide().0;
+    let shed = bed.decide_with(&shedding).0;
     assert_eq!(shed_of(&shed), saturated);
     // The veto is a stage of the encode profile, and the trace says so.
-    assert_eq!(shed.trace().made_under(), encode_profile(&stock));
+    assert_eq!(shed.trace().made_under(), encode_profile(&shedding));
     assert!(shed.trace().made_under().is_some());
-    // A pair's decode side says the same of its own rows under a binding
-    // that sheds. One that steers picks among them.
-    let mut shedding = engine();
-    shedding.shed_when_all_vetoed(0);
+    // A pair's decode side says the same of its own rows under that
+    // binding.
     let mut side = Bed::new();
     side.decodes = vec![overloaded(row(0, Role::Decode, 1, 0))];
     assert_eq!(shed_of(&side.pair(&shedding)), saturated);
@@ -700,17 +700,17 @@ fn encoders_the_veto_left_none_of_shed_as_saturation() {
         ..Constraints::default()
     };
     let sides = [&cx, &cx, &lifted];
-    let (decision, placed) = decide_under(&bed, &stock, &facts, bed.pools(), sides);
+    let (decision, placed) = decide_under(&bed, &shedding, &facts, bed.pools(), sides);
     assert!(matches!(decision, Decision::Pick(_)), "{decision:?}");
     assert_eq!(placed.encoders().len(), 1);
 
     // An unready encoder beside one over its thresholds was refused ahead
     // of the veto: the veto still left none.
     bed.encoders[1] = unready(row(1, Role::Encode, 0, 0));
-    assert_eq!(shed_of(&bed.decide().0), saturated);
+    assert_eq!(shed_of(&bed.decide_with(&shedding).0), saturated);
     // No encoder reached the veto: a missing endpoint.
     bed.encoders[0] = unready(row(0, Role::Encode, 0, 0));
-    assert_eq!(shed_of(&bed.decide().0), missing);
+    assert_eq!(shed_of(&bed.decide_with(&shedding).0), missing);
 
     // An encoder the veto kept, refused by a hard filter listed behind it:
     // a missing endpoint, as a pair's side names rows so filtered.
@@ -719,6 +719,7 @@ fn encoders_the_veto_left_none_of_shed_as_saturation() {
         row(1, Role::Encode, 0, 0),
     ];
     let mut behind = engine();
+    behind.shed_when_all_vetoed(0);
     for profile in behind.profiles.iter_mut().map(own) {
         profile
             .filters
@@ -735,15 +736,15 @@ fn encoders_the_veto_left_none_of_shed_as_saturation() {
             ..overloaded(row(1, Role::Encode, 0, 0))
         },
     ];
-    assert_eq!(shed_of(&bed.decide().0), missing);
+    assert_eq!(shed_of(&bed.decide_with(&shedding).0), missing);
     // A video alone asks the same of an encoder as an image does.
     (bed.images, bed.video) = (0, 1);
-    assert_eq!(shed_of(&bed.decide().0), missing);
+    assert_eq!(shed_of(&bed.decide_with(&shedding).0), missing);
     (bed.images, bed.video) = (1, 0);
     // Nor is one over its thresholds that states no end.
     bed.encoders[1] = overloaded(row(1, Role::Encode, 0, 0));
     bed.facts[1] = pushing(0);
-    assert_eq!(shed_of(&bed.decide().0), missing);
+    assert_eq!(shed_of(&bed.decide_with(&shedding).0), missing);
     // Nor is one over its thresholds dialed on no wire the request states.
     bed.encoders = vec![
         unready(dialed_on(WireModes::HTTP, 0, 0)),
@@ -751,10 +752,10 @@ fn encoders_the_veto_left_none_of_shed_as_saturation() {
     ];
     bed.facts[1] = pushing(1);
     bed.wires = WireModes::HTTP;
-    assert_eq!(shed_of(&bed.decide().0), missing);
+    assert_eq!(shed_of(&bed.decide_with(&shedding).0), missing);
     // With no wire stated the veto left none.
     bed.wires = WireModes::NONE;
-    assert_eq!(shed_of(&bed.decide().0), saturated);
+    assert_eq!(shed_of(&bed.decide_with(&shedding).0), saturated);
     // Nor is one over its thresholds that states another runtime than the
     // request stays on.
     let on = |runtime: u32| DemandFacts {
@@ -766,10 +767,53 @@ fn encoders_the_veto_left_none_of_shed_as_saturation() {
         ..Demands::default()
     };
     bed.stated = vec![on(7), on(8)];
-    assert_eq!(shed_of(&bed.decide().0), missing);
+    assert_eq!(shed_of(&bed.decide_with(&shedding).0), missing);
     // Both on the request's runtime: the veto left none.
     bed.stated = vec![on(7), on(7)];
-    assert_eq!(shed_of(&bed.decide().0), saturated);
+    assert_eq!(shed_of(&bed.decide_with(&shedding).0), saturated);
+}
+
+/// Under a binding that steers, encoders the overload veto left none of are
+/// a missing endpoint under `encoders`: no encoder enters the all-vetoed
+/// rule, so none is steered to, and the request is answered as one whose
+/// encoders are not ready. The shed is made under the encode profile all
+/// the same. A pair's decode side picks among its rows under that binding,
+/// and under a veto its host lifted the encoders serve.
+#[test]
+fn encoders_the_veto_left_none_of_are_a_missing_endpoint_under_a_binding_that_steers() {
+    let stock = engine();
+    let missing = (ShedReason::NoEndpoints, "encoders");
+    // Every encoder that takes the request is over its thresholds.
+    let mut bed = Bed::new();
+    bed.encoders = vec![
+        overloaded(row(0, Role::Encode, 0, 0)),
+        overloaded(row(1, Role::Encode, 0, 0)),
+    ];
+    bed.facts = vec![pushing(1), pushing(1)];
+    let shed = bed.decide().0;
+    assert_eq!(shed_of(&shed), missing);
+    assert_eq!(shed.trace().made_under(), encode_profile(&stock));
+    assert!(shed.trace().made_under().is_some());
+    // A pair's decode side over its thresholds is picked among under that
+    // binding: the rule steers there, and it is asked of no encoder.
+    let mut side = Bed::new();
+    side.decodes = vec![overloaded(row(0, Role::Decode, 1, 0))];
+    let pair = side.pair(&stock);
+    assert!(matches!(pair, Decision::Pick(_)), "{pair:?}");
+    // The host lifted the veto on the encode side: the item is placed.
+    let (facts, _) = bed.asked();
+    let cx = Constraints::default();
+    let lifted = Constraints {
+        overload_lifted: true,
+        ..Constraints::default()
+    };
+    let sides = [&cx, &cx, &lifted];
+    let (decision, placed) = decide_under(&bed, &stock, &facts, bed.pools(), sides);
+    assert!(matches!(decision, Decision::Pick(_)), "{decision:?}");
+    assert_eq!(placed.encoders().len(), 1);
+    // An unready encoder beside one over its thresholds reads the same.
+    bed.encoders[1] = unready(row(1, Role::Encode, 0, 0));
+    assert_eq!(shed_of(&bed.decide().0), missing);
 }
 
 #[test]
@@ -2653,8 +2697,10 @@ fn a_request_held_off_every_worker_that_takes_it_is_shed_under_the_places_name()
     assert_eq!(shed(&bed, [&first, &open, &open]), unheld);
 
     // The encoder at the place takes the request and is not ready: the
-    // shed is the encode side's, by state. Over its thresholds it is a
-    // saturated fleet of one, whatever the encoder outside the place is.
+    // shed is the encode side's, by state. Over its thresholds it reads
+    // the same under a binding that steers, and is a saturated fleet of
+    // one under a binding that sheds, whatever the encoder outside the
+    // place is.
     let mut bed = Bed::new();
     bed.encoders = vec![
         unready(row(0, Role::Encode, 0, 0)),
@@ -2663,18 +2709,23 @@ fn a_request_held_off_every_worker_that_takes_it_is_shed_under_the_places_name()
     bed.facts = vec![pushing(1), pushing(1)];
     assert_eq!(shed(&bed, [&open, &open, &first]), by_state);
     bed.encoders[0] = overloaded(row(0, Role::Encode, 0, 0));
+    assert_eq!(shed(&bed, [&open, &open, &first]), by_state);
     let saturated = (ShedReason::Saturated, "not-overloaded");
-    assert_eq!(shed(&bed, [&open, &open, &first]), saturated);
+    let mut shedding = engine();
+    shedding.shed_when_all_vetoed(0);
+    let (facts, _) = bed.asked();
+    let held = decide_under(&bed, &shedding, &facts, bed.pools(), [&open, &open, &first]);
+    assert_eq!(shed_of(&held.0), saturated);
     // A hard filter behind the veto refuses the encoder outside the place.
     // Over every encoder that is a missing endpoint: the request held to
     // the place reads the encoder there alone.
     let mut behind = engine();
+    behind.shed_when_all_vetoed(0);
     for profile in behind.profiles.iter_mut().map(own) {
         profile
             .filters
             .push(Box::new(RefusesOne(bed.encoders[1].id)));
     }
-    let (facts, _) = bed.asked();
     let under = |sides: [&Constraints<'_>; 3]| {
         shed_of(&decide_under(&bed, &behind, &facts, bed.pools(), sides).0)
     };

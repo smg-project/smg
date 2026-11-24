@@ -73,8 +73,9 @@ mod tests;
 
 /// The stage named when no encoder is open for the request though one that
 /// takes it is registered, or when none is registered at all: a retry may
-/// find one. Where the overload veto left none open, the veto's own stage,
-/// `not-overloaded`, is named in its stead ([`saturation`]).
+/// find one. Where the overload veto left none open under a binding that
+/// sheds, the veto's own stage, `not-overloaded`, is named in its stead
+/// ([`saturation`]).
 const ENCODERS: &str = "encoders";
 /// The stage named when the request holds pixels, an image or a video, and
 /// none of the registered encoders that would take it otherwise takes
@@ -648,7 +649,9 @@ fn reached<'a>(
 /// none. A stage ahead of the veto that leaves none is no saturation, and
 /// neither is one behind it that refuses an encoder the veto kept. Of a
 /// request held to places they are the encoders at its places
-/// ([`reached`]): one outside them is none of the request's.
+/// ([`reached`]): one outside them is none of the request's. The entry
+/// asks it under a binding that sheds a pool the veto empties, and under
+/// no other.
 ///
 /// Cold and out of line: a request an encoder is open for never comes here.
 #[cold]
@@ -738,8 +741,13 @@ impl Engine {
     /// no decode of a served pair takes the images asked of it
     /// (`decode-vision`). With an encoder registered and none open the stage
     /// is `encoders`. Where the overload veto is the stage that left none
-    /// open, the encoders are saturated: the shed names `not-overloaded` and
-    /// its reason is saturation. No encoder enters the all-vetoed rule here.
+    /// open, the binding's word for a pool the veto empties names the shed
+    /// (the document's `overload.shed_when_all_vetoed`). Under a binding
+    /// that sheds the encoders are saturated: the shed names
+    /// `not-overloaded` and its reason is saturation. Under one that steers
+    /// no encoder is steered to, and the stage is `encoders`, as for
+    /// encoders that are not ready. No encoder enters the all-vetoed rule
+    /// here.
     ///
     /// The items are placed by the binding's encode profile over the open
     /// encoders of the chosen prefill's class that take the media, each
@@ -1040,9 +1048,16 @@ impl Engine {
             // its answer waits: the gap of no open encoder is not its own.
             if !any_open && !held_off {
                 // Encoders the overload veto left none of are a saturated
-                // fleet, and the shed says so.
-                if let Some(stage) = saturation(profile, &encode_facts, encode_cx, &encode, &wanted)
-                {
+                // fleet where the binding sheds a pool the veto empties, and
+                // the shed says so. Where it steers no encoder is steered
+                // to: the gap below names them with those that are not
+                // ready. The binding's word is read here alone, off every
+                // decision that places an item.
+                let sheds = !self.steers_all_vetoed(facts.model);
+                let saturated = sheds
+                    .then(|| saturation(profile, &encode_facts, encode_cx, &encode, &wanted))
+                    .flatten();
+                if let Some(stage) = saturated {
                     return turned_away(ShedReason::Saturated, stage, bare);
                 }
                 return gap(encode_gap(&encode, &wanted, any_member));

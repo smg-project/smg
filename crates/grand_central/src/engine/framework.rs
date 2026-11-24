@@ -5692,9 +5692,10 @@ impl Engine {
     /// Whether the binding of `model`'s pair steers a pool the overload
     /// veto empties to its least-vetoed worker ([`AllVetoed::Steer`]), and
     /// does not shed it: `false` where the model's prefill resolves to no
-    /// binding. One lookup of the binding, asked by the call of a pair that
-    /// names its worker where no decode can be sent to.
-    #[cfg(feature = "in-process")]
+    /// binding. One lookup of the binding, asked off every decision that
+    /// places: by the call of a pair that names its worker where no decode
+    /// can be sent to, and by the encode entry where the overload veto left
+    /// no encoder open.
     pub(crate) fn steers_all_vetoed(&self, model: &str) -> bool {
         let entry = self.resolve(model, Phase::Prefill);
         entry.is_some_and(|(entry, _, _)| entry.vetoed == AllVetoed::Steer)
