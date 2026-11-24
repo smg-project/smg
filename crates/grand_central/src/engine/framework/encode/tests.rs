@@ -367,6 +367,11 @@ fn the_one_key_is_placed_under_a_class_that_pushes_and_under_no_other() {
     bed.keys = vec![Identity::hashed(11), Identity::hashed(12)];
     bed.one = Some(Identity::hashed(99));
     assert_eq!(bed.placed(), ((0, 0), vec![0], true));
+    // A one key with no form is a one key all the same: the items are
+    // placed once, with no affinity.
+    bed.one = Some(Identity::NONE);
+    assert_eq!(bed.placed(), ((0, 0), vec![0], true));
+    bed.one = Some(Identity::hashed(99));
     bed.facts = vec![EncoderFacts {
         class: 1,
         ..EncoderFacts::default()

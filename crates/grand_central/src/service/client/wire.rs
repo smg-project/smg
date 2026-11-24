@@ -132,7 +132,10 @@ pub(crate) fn request(
 /// Each item's key crosses by the rule of a frame's key, with the key's
 /// own fingerprint as its hash form. A key that is none keeps its place,
 /// as an identity with no form: the answer's encoders stand in the keys'
-/// order.
+/// order. The items' one key crosses by the same rule where the host
+/// states it. One that is none is stated with no form too: it still says
+/// that the items are taken as one, and its form is only what that one
+/// placement is placed by.
 pub(crate) fn encode_request(
     request: &Request<'_>,
     items: EncodeItems<'_>,
@@ -153,7 +156,9 @@ pub(crate) fn encode_request(
                 form: form(*key, || key.hash),
             })
             .collect(),
-        one: items.one.and_then(|one| identity(one, || one.hash)),
+        one: items.one.map(|one| proto::Identity {
+            form: form(one, || one.hash),
+        }),
         references: items.references,
         decode_images: items.decode_images,
     });
@@ -251,9 +256,10 @@ pub(crate) fn decided(told: &proto::Decision, now: Instant) -> Result<DecideOutc
 /// By the contract the encoders are one where the answer says `one`, else
 /// one a key, and an encoder names no pair. An answer that says otherwise
 /// cannot be read. Neither can one that says `one` to a request that
-/// stated no key for its items as one, nor a pick of a request with keys
-/// that names no encoders: its host could send no item. `placed` is left
-/// empty then.
+/// stated no key for its items as one, or that stated no item: the one key
+/// is placed in the stead of items alone. Nor can a pick of a request with
+/// keys that names no encoders: its host could send no item. `placed` is
+/// left empty then.
 pub(crate) fn placed(
     told: Option<&proto::EncodePlaced>,
     decision: &Decision,
@@ -270,8 +276,8 @@ pub(crate) fn placed(
             _ => Err(unread("encode", "a pick names no encoder for its keys")),
         };
     };
-    if told.one && items.one.is_none() {
-        return Err(unread("encode.one", "the request stated no one key"));
+    if told.one && (items.one.is_none() || items.keys.is_empty()) {
+        return Err(unread("encode.one", "the request stated no items as one"));
     }
     let count = if told.one { 1 } else { items.keys.len() };
     if told.encoders.len() != count {
@@ -774,9 +780,11 @@ mod tests {
     /// An encode request's frame states the encode phase and the items,
     /// and the controller reads it at the prefill phase with the items its
     /// host stated, in their order: a plain key, an empty text as the key
-    /// it is, a key that is none at its place, and a fingerprint. A
-    /// request that states no item at all is an encode request all the
-    /// same.
+    /// it is, a key that is none at its place, and a fingerprint. The
+    /// items' one key crosses as stated too: one that is none is stated
+    /// with no form and read as a one key, and a host that states none is
+    /// read as stating none. A request that states no item at all is an
+    /// encode request all the same.
     #[test]
     fn the_controller_reads_an_encode_requests_items_as_the_host_stated_them() {
         let keys = [
@@ -807,6 +815,25 @@ mod tests {
         let read = checked.items(&read);
         assert_eq!(read.one.map(|one| one.hash), items.one.map(|one| one.hash));
         assert!(read.references && read.decode_images);
+
+        let formless = EncodeItems {
+            one: Some(Identity::NONE),
+            ..items
+        };
+        let (sent, _) = encode_request(&asked, formless);
+        let one = sent.encode.as_ref().and_then(|stated| stated.one.as_ref());
+        assert_eq!(one.map(|one| one.form.is_none()), Some(true));
+        let checked = Checked::new(sent).expect("the controller reads the request");
+        let read = checked.item_keys(Vec::new());
+        assert!(checked.items(&read).one.is_some_and(|one| one.is_none()));
+        let (sent, _) = encode_request(&asked, EncodeItems { one: None, ..items });
+        assert!(sent
+            .encode
+            .as_ref()
+            .is_some_and(|stated| stated.one.is_none()));
+        let checked = Checked::new(sent).expect("the controller reads the request");
+        let read = checked.item_keys(Vec::new());
+        assert!(checked.items(&read).one.is_none());
 
         let (sent, _) = encode_request(&asked, EncodeItems::default());
         let checked = Checked::new(sent).expect("the controller reads the request");
@@ -1172,7 +1199,8 @@ mod tests {
 
     /// The encoders an answer names are read onto the host's room in the
     /// keys' order, each by its worker and its rank, at position 0. The
-    /// one key's encoder is read alone, and the room says so. A decision
+    /// one key's encoder is read alone, and the room says so, also where
+    /// the request's one key has no form. A decision
     /// that picks nothing places nothing, whatever stands beside it, and a
     /// pick of a request with no key wants no encoder. Each read empties
     /// what the room held.
@@ -1206,6 +1234,14 @@ mod tests {
         placed(Some(&one), &picked, &items, &mut room).expect("the one key's encoder");
         assert_eq!(room.encoders(), [named(4, 6)]);
         assert!(room.one());
+        let formless = EncodeItems {
+            one: Some(Identity::NONE),
+            ..items
+        };
+        placed(Some(&each), &picked, &formless, &mut room).expect("an encoder a key");
+        placed(Some(&one), &picked, &formless, &mut room).expect("the one key's encoder");
+        assert_eq!(room.encoders(), [named(4, 6)]);
+        assert!(room.one());
 
         let shed = Decision::Shed(Shed {
             reason: ShedReason::NoEndpoints,
@@ -1228,7 +1264,8 @@ mod tests {
     /// otherwise is named by its field and leaves the room empty, also
     /// where the room held an earlier answer's encoders. So are a pick
     /// that names no encoder for its keys, and an answer that says the one
-    /// key was placed where the request stated none.
+    /// key was placed where the request stated none, or stated no item for
+    /// it to stand for: no engine writes that.
     #[test]
     fn an_answer_whose_encoders_do_not_fit_its_request_is_unreadable() {
         let keys = [Identity::hashed(1), Identity::hashed(2)];
@@ -1280,6 +1317,12 @@ mod tests {
             assert!(!error.why.is_empty());
             assert!(room.encoders().is_empty() && !room.one(), "{path}");
         }
+        let keyless = EncodeItems { keys: &[], ..items };
+        placed(Some(&told(&[9, 4], false)), &picked, &items, &mut room).expect("an encoder a key");
+        let error = placed(Some(&told(&[9], true)), &picked, &keyless, &mut room)
+            .expect_err("the one key stands for no item");
+        assert_eq!(error.path, "encode.one");
+        assert!(room.encoders().is_empty() && !room.one());
     }
 
     #[test]

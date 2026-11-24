@@ -530,7 +530,9 @@ message EncodeItems {
   // The items taken as one: the caller's digest over them. A class of
   // encoders that takes them as one places it in the items' stead, so
   // callers that share a fleet agree on it. Absent where each item is
-  // encoded on its own.
+  // encoded on its own. A digest with no form is present all the same: it
+  // still says that the items are taken as one, and such a class places
+  // them once, with no affinity.
   Identity one = 2;
   // The items are references an encoder processes itself.
   bool references = 3;
