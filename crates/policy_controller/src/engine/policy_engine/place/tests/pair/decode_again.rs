@@ -848,3 +848,114 @@ fn a_decode_list_that_states_worker_ids_is_told_at_its_decode_call_in_a_debug_bu
     });
     let _ = placement.decode_again(&again);
 }
+
+/// A decode decided again keeps its prompt for the decode the request is
+/// sent to. Where the route's rule refuses the decode the first decision
+/// chose, the walk takes a later decode. Over the lists without the decode
+/// first chosen, the prompt's next requests go to the decode it was sent
+/// to, ahead of one that was sent less of it. A rule that panics where the
+/// decode's decision asks it passes its panic to the call's caller, and
+/// the placement stands on the decode first chosen.
+#[test]
+fn a_prompt_whose_decode_was_decided_past_a_refused_decode_goes_to_it_again() {
+    let mut document = PolicySpec::pair_presets("cache_aware", "cache_aware").expect("presets");
+    document.generation = 1;
+    document.plans.pd_pair.decode = DecodePick::AfterPrefill;
+    let spec = AppliedSpec::validate(&document).expect("a valid document");
+    let engine = hosted(PolicyEngine::new(spec));
+    let lists = Lists::of(1, 3);
+    let classes = lists.every();
+    let pair = lists.under(&classes, &Open);
+    let tokens: Vec<u32> = (1_000..5_096).collect();
+    let prompt = Prompt {
+        tokens: Some(&tokens),
+        ..Prompt::NONE
+    };
+    let first = PlaceRequest {
+        prompt,
+        decode_again: true,
+        ..PlaceRequest::of(MODEL, WorkerLists::Pair(pair))
+    };
+    let mut placement = engine.place(&first).expect("a placement");
+    let chosen = lists.places(&placement);
+    placement.sent(Side::Prefill);
+    // The rule refuses the decode the first decision chose.
+    let refused = lists.decodes[chosen.1].url().to_owned();
+    let rule = |worker: &dyn Worker| worker.url() != refused;
+    let again = PlaceRequest {
+        prompt,
+        decode_again: true,
+        admits: Some(&rule),
+        ..PlaceRequest::of(MODEL, WorkerLists::Pair(pair))
+    };
+    assert_eq!(placement.decode_again(&again), Ok(()));
+    let to = lists.places(&placement);
+    assert_ne!(to.1, chosen.1, "past the refused decode");
+    placement.sent(Side::Decode);
+    placement.ended(Side::Prefill, SERVED);
+    placement.ended(Side::Decode, SERVED);
+    drop(placement);
+    // The decode first chosen keeps the entry its first decision wrote, so
+    // the lists go on without it: among their decodes a read of the record
+    // names the one sent most of the prompt.
+    let sent = Arc::clone(&lists.decodes[to.1]);
+    let stays = |decode: &&Arc<dyn Worker>| decode.url() != refused;
+    let decodes: Arc<[Arc<dyn Worker>]> = lists.decodes.iter().filter(stays).cloned().collect();
+    let rest = Lists {
+        published: [&lists.prefills, &decodes].map(|list| PublishedList::new(Arc::clone(list))),
+        prefills: Arc::clone(&lists.prefills),
+        decodes,
+    };
+    let partners = rest.every();
+    let two = rest.under(&partners, &Open);
+    // The other decode is sent the prompt's leading three quarters.
+    let other = |worker: &dyn Worker| worker.url() != sent.url();
+    let leading = PlaceRequest {
+        prompt: Prompt {
+            tokens: Some(&tokens[..3_072]),
+            ..Prompt::NONE
+        },
+        admits: Some(&other),
+        ..PlaceRequest::of(MODEL, WorkerLists::Pair(two))
+    };
+    drop(engine.place(&leading).expect("a placement"));
+    // The prompt goes back to the decode it was sent to.
+    let stated = PlaceRequest {
+        prompt,
+        ..PlaceRequest::of(MODEL, WorkerLists::Pair(two))
+    };
+    let went: Vec<_> = (0..16)
+        .map(|_| rest.places(&engine.place(&stated).expect("a placement")))
+        .collect();
+    let to = (0, usize::from(!Arc::ptr_eq(&rest.decodes[0], &sent)));
+    assert_eq!(went, [to; 16], "the decode the prompt was sent to");
+
+    // A rule that panics at its first question alone, inside the decode's
+    // decision: asked again, it would admit.
+    let mut placement = engine.place(&first).expect("a placement");
+    let stood = lists.places(&placement);
+    placement.sent(Side::Prefill);
+    let asked = Cell::new(false);
+    let once = |_: &dyn Worker| -> bool {
+        if asked.replace(true) {
+            return true;
+        }
+        panic!("the route's rule failed")
+    };
+    let failing = PlaceRequest {
+        prompt,
+        decode_again: true,
+        admits: Some(&once),
+        ..PlaceRequest::of(MODEL, WorkerLists::Pair(pair))
+    };
+    let raised = catch_unwind(AssertUnwindSafe(|| {
+        placement.decode_again(&failing).is_ok()
+    }));
+    assert!(raised.is_err(), "the rule's panic reaches the caller");
+    assert_eq!(
+        lists.places(&placement),
+        stood,
+        "on the decode first chosen"
+    );
+    assert_eq!((engine.faults(), engine.unheard()), (0, 0));
+}

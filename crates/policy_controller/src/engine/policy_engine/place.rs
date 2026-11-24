@@ -428,6 +428,9 @@ pub(super) struct Made<'r, 'a> {
     /// The same on the decodes of a pair's targets, by their places in the
     /// decode list: `sent` holds the prefills' then.
     decodes: Cell<Sent>,
+    /// Whether the request is a pair's decode decided again: a target's
+    /// prefill was sent already, and its decode alone is asked.
+    decode_alone: bool,
 }
 
 /// What a call's maker answered on a decision's targets where the decision
@@ -498,6 +501,7 @@ impl<'r, 'a> Made<'r, 'a> {
             panicked: OnceCell::new(),
             sent: Cell::new(Sent::NONE),
             decodes: Cell::new(Sent::NONE),
+            decode_alone: false,
         }
     }
 
@@ -847,7 +851,7 @@ impl RequestMaker for Made<'_, '_> {
                     held.unwrap_or_else(|| self.asks(list, place, kept))
                 };
                 target.pair.is_some_and(|pair| {
-                    side(lists.prefill, target.position, &self.sent)
+                    (self.decode_alone || side(lists.prefill, target.position, &self.sent))
                         && side(lists.decode, pair.decode_position, &self.decodes)
                 })
             }
