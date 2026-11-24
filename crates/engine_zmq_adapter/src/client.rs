@@ -57,7 +57,7 @@ use crate::{
     tokenspeed::{
         constraint_ref as tokenspeed_constraint_ref, fan_out_tokenspeed_requests, loads_by_rank,
         translate_encode_request, translate_request_tokenspeed_for, EncodeRendezvous, GridTensors,
-        LogprobColumns, RankIndices, TokenSpeedGenerateStream,
+        TokenSpeedConnection, TokenSpeedGenerateStream, TokenSpeedHandshakes,
     },
     trtllm::{
         constraint_ref as trtllm_constraint_ref, fan_out_trtllm_requests, translate_request_trtllm,
@@ -211,6 +211,12 @@ pub(crate) struct ZmqConnectionMeta {
     /// connection ([`PerImageItems::declared`]): on the SGLang wire, whose
     /// translation alone asks it.
     per_image: PerImageItems,
+    /// What the ranks declared at their handshakes of where a request is
+    /// placed, of the logprob columns and of an item's grid tensors, read
+    /// once here for every request of the connection
+    /// ([`TokenSpeedHandshakes::declared`]): on the TokenSpeed wire, whose
+    /// generate path and load report alone ask it.
+    tokenspeed: TokenSpeedHandshakes,
 }
 
 /// Bind the SMG-side ZMQ sockets and complete the handshake with the
@@ -435,6 +441,12 @@ impl ZmqEngineClient {
                 PerImageItems::default()
             }
         };
+        let tokenspeed = match dialect {
+            ZmqDialect::TokenSpeed => TokenSpeedHandshakes::declared(&transport.engines),
+            ZmqDialect::Vllm | ZmqDialect::Sglang | ZmqDialect::Trtllm => {
+                TokenSpeedHandshakes::declared(&[])
+            }
+        };
         let backend = match dialect {
             ZmqDialect::Vllm => ZmqBackend::Vllm(Arc::new(EngineCoreClient::new(transport))),
             ZmqDialect::TokenSpeed => {
@@ -457,6 +469,7 @@ impl ZmqEngineClient {
                 pin_yield: PinYieldNote::default(),
                 request_timeout: OnceLock::new(),
                 per_image,
+                tokenspeed,
             }),
         };
         // Every wire bounds a prompt by the window the engine reported
@@ -1012,10 +1025,7 @@ impl ZmqEngineClient {
         &self,
         req: tokenspeed_proto::GenerateRequest,
     ) -> Result<Vec<TokenSpeedGenerateStream>, tonic::Status> {
-        let grid_tensors = self
-            .ready_response()
-            .map_or(GridTensors::Positions, GridTensors::declared);
-        self.generate_tokenspeed_streams_for_model(req, grid_tensors)
+        self.generate_tokenspeed_streams_for_model(req, self.meta.tokenspeed.grid_tensors)
             .await
     }
 
@@ -1033,11 +1043,8 @@ impl ZmqEngineClient {
         };
         // A disaggregated encode worker lists `encode` alone: it runs no
         // language model, so the gRPC servicer's words for its Generate.
-        if !client
-            .engines()
-            .iter()
-            .any(|engine| engine.ready_response.takes_generate())
-        {
+        let declared = &self.meta.tokenspeed;
+        if !declared.takes_generate {
             return Err(tonic::Status::failed_precondition(
                 "Generate is unavailable on TokenSpeed encode workers",
             ));
@@ -1051,25 +1058,22 @@ impl ZmqEngineClient {
             )
             .map_err(constraint_refused_status)?;
         }
-        let max_model_len = self.prompt_bound()?;
-        // The ranks as the engine numbers them: a disaggregated request is
-        // placed on a prefill engine by its room's residue, a pinned one
-        // elsewhere by its pin.
-        let ranks = RankIndices::of(client.engines());
-        let logprobs = LogprobColumns::of(client.engines());
+        let connection = TokenSpeedConnection {
+            grid_tensors,
+            max_model_len: self.prompt_bound()?,
+            // The ranks as the engine numbers them: a disaggregated request is
+            // placed on a prefill engine by its room's residue, a pinned one
+            // elsewhere by its pin.
+            ranks: &declared.ranks,
+            logprobs: declared.logprobs,
+            yields: &self.meta.pin_yield,
+        };
         // Sub-streams submitted before a mid-loop failure are dropped with the
         // error, which auto-aborts their engine-side requests.
         let mut streams = Vec::new();
         for (index, sub) in fan_out_tokenspeed_requests(req).into_iter().enumerate() {
-            let request = translate_request_tokenspeed_for(
-                sub,
-                grid_tensors,
-                max_model_len,
-                &ranks,
-                logprobs,
-                &self.meta.pin_yield,
-            )
-            .map_err(tonic::Status::invalid_argument)?;
+            let request = translate_request_tokenspeed_for(sub, &connection)
+                .map_err(tonic::Status::invalid_argument)?;
             let stream = client.submit(request).await.map_err(zmq_status)?;
             streams.push(TokenSpeedGenerateStream::new(stream, index as u32));
         }
@@ -1756,12 +1760,10 @@ impl ZmqEngineClient {
     /// at indices 0..n in rank order; the other dialects place a pin by
     /// index.
     pub fn get_loads_by_rank(&self) -> WorkerLoadResponse {
-        let ZmqBackend::TokenSpeed(client) = &self.backend else {
+        let ZmqBackend::TokenSpeed(_) = &self.backend else {
             return self.get_loads();
         };
-        let loads = loads_by_rank(&RankIndices::of(client.engines()), |index| {
-            self.rank_load(index)
-        });
+        let loads = loads_by_rank(&self.meta.tokenspeed.ranks, |index| self.rank_load(index));
         WorkerLoadResponse {
             timestamp: String::new(),
             dp_rank_count: i32::try_from(loads.len()).unwrap_or(i32::MAX),
@@ -3093,6 +3095,48 @@ mod tests {
         placed_encoder
             .check_declared_role(WorkerType::Encode)
             .expect("an encode worker that lists the encode request and declares its address");
+    }
+
+    /// What the ranks declared at their handshakes is read when the
+    /// connection is made and kept for its requests: a connection of an
+    /// encode worker alone refuses a generate request in the gRPC servicer's
+    /// words, and two ranks that dialled in against their own numbering are
+    /// reached by that numbering.
+    #[tokio::test]
+    async fn a_connection_keeps_what_its_ranks_declared() {
+        let dir = tempfile::tempdir().unwrap();
+        let encoder = tokenspeed_ranks(
+            &dir.path().join("e"),
+            vec![EngineCoreReadyResponse {
+                request_types: vec!["encode".into()],
+                ..default_ready_response()
+            }],
+        )
+        .await;
+        let Err(refused) = encoder
+            .generate_tokenspeed_streams(tokenspeed_proto::GenerateRequest::default())
+            .await
+        else {
+            panic!("an encode worker took a generate request");
+        };
+        assert_eq!(
+            (refused.code(), refused.message()),
+            (
+                Code::FailedPrecondition,
+                "Generate is unavailable on TokenSpeed encode workers"
+            )
+        );
+
+        let numbered = |rank: u32| EngineCoreReadyResponse {
+            data_parallel_rank: rank,
+            ..default_ready_response()
+        };
+        let swapped = tokenspeed_ranks(&dir.path().join("s"), vec![numbered(1), numbered(0)]).await;
+        assert_eq!(
+            swapped.meta.tokenspeed.ranks,
+            crate::tokenspeed::RankIndices::new(vec![1, 0]),
+            "rank 0 is the engine that dialled in second"
+        );
     }
 
     /// An RL operation rides the TokenSpeed control wire as a control call

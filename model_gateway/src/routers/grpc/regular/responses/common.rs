@@ -281,7 +281,7 @@ pub(super) fn extract_all_tool_calls_from_chat(
 /// no-op on anything but an object).
 pub(super) fn dispatch_arguments(
     response_format: ResponseFormat,
-    original_request: &ResponsesRequest,
+    request: &ResponsesRequest,
     arguments: &str,
 ) -> Value {
     let mut arguments = match serde_json::from_str::<Value>(arguments) {
@@ -291,8 +291,8 @@ pub(super) fn dispatch_arguments(
     prepare_hosted_dispatch_args(
         &mut arguments,
         response_format,
-        original_request.tools.as_deref().unwrap_or(&[]),
-        original_request.user.as_deref(),
+        request.tools.as_deref().unwrap_or(&[]),
+        request.user.as_deref(),
     );
     arguments
 }

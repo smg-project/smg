@@ -34,7 +34,9 @@
 //! the log, which is a mark and no lock, then the holder's turn, then the
 //! store's membership lock inside the store's write. No lock of the store
 //! is held over a write of the registry: the store's write has returned
-//! when the object is put.
+//! when the object is put. A restore that carries a generation takes the
+//! turn under the lock of the document's door, which its applier holds
+//! from the generation's pass: nothing under the turn takes that door.
 
 use smg_worker::registry::Generation;
 
@@ -209,21 +211,29 @@ mod tests {
 
     /// The wire tells a row's age, so each event's row comes with an
     /// instant of its own. A row told in place keeps the instant it was
-    /// admitted at: the table's row and the row read back from the object
-    /// state the first one.
+    /// admitted at, by a relabel and by a resize: the table's row and the
+    /// row read back from the object state the first one.
     #[test]
     fn a_row_told_in_place_keeps_the_instant_it_was_admitted_at() {
         let (leader, standby) = (Replica::new(), Replica::new());
         leader.upsert(facts(1, "gold"));
         follow(&standby, &leader);
         let admitted = standby.one_row(A).admitted_at;
-        leader.upsert(facts(1, "iron"));
-        let (change, row) = told(&leader);
-        let mut row = row.expect("a row changed in place is told");
-        row.admitted_at += Duration::from_secs(5);
-        hand(&standby, 1, change, Some(row));
-        let row = standby.one_row(A);
-        assert_eq!((row.revision, row.admitted_at), (2, admitted));
+        let wider = WorkerFacts {
+            dp_size: 2,
+            ..facts(1, "iron")
+        };
+        for (revision, stated, resizes) in [(2, facts(1, "iron"), false), (3, wider, true)] {
+            leader.upsert(stated);
+            let (change, row) = told(&leader);
+            let resized = matches!(change, MembershipChange::Resized { .. });
+            assert_eq!(resized, resizes, "{change:?}");
+            let mut row = row.expect("a row changed in place is told");
+            row.admitted_at += Duration::from_secs(5);
+            hand(&standby, 1, change, Some(row));
+            let row = standby.one_row(A);
+            assert_eq!((row.revision, row.admitted_at), (revision, admitted));
+        }
     }
 
     /// An event the store does not take lays nothing: here one at an epoch

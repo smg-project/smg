@@ -6,7 +6,8 @@
 //! it draws two engines, compares one row of each, and reads the rows of
 //! the engine it takes. The rows of an engine it passes by are not read, so
 //! what the decision costs follows the ranks of one engine and not the
-//! fleet.
+//! fleet. A draw that finds no two engines inside its bound decides
+//! nothing, and the whole pass reads the pool.
 //!
 //! [`Picker::unit`]: super::Picker::unit
 
@@ -50,12 +51,15 @@ const ENGINE_TARGETS: usize = 2;
 /// the seed of the stream that draws between equal rows of the taken
 /// engine; and the picker's own compare reads the stream past those.
 ///
-/// Where no row is kept the draw says nothing of the pool: the decision
-/// widens to the whole pass on the stream continued, which alone sheds,
-/// names a stage and asks the all-vetoed rule. The trace keeps the
-/// request's seed, from which the whole decision replays. No engine is
-/// drawn for a request its host holds to places ([`places`]): the staged
-/// pass decides it.
+/// Where no row is kept, or where a pool of several engines yields one
+/// engine's row and no second's, the draw says nothing of the pool: the
+/// decision widens to the whole pass on the stream continued, which alone
+/// sheds, names a stage and asks the all-vetoed rule. One engine standing
+/// alone among several is such a pool: the whole pass compares two of its
+/// rows, as the picker draws over rows, and does not seek its least rank.
+/// The trace keeps the request's seed, from which the whole decision
+/// replays. No engine is drawn for a request its host holds to places
+/// ([`places`]): the staged pass decides it.
 ///
 /// Out of line, so a decision of any other profile keeps the engine's
 /// decision path as it was.
@@ -191,7 +195,8 @@ pub(super) fn run_owned(
 }
 
 /// The decision of [`run_engines`] under one form of the filters' test, or
-/// `None` where no row was kept. One body, built once for each form.
+/// `None` where the draw leaves the pool to the whole pass. One body, built
+/// once for each form.
 #[expect(
     clippy::too_many_arguments,
     reason = "the profile run's inputs, with the stream and the filters' test"
@@ -226,20 +231,28 @@ fn by_engines(
     } else {
         None
     };
-    let second = first.and_then(|(engine, _)| {
-        let but = Some(engine);
-        stand_in(draw, engines, candidates, but, &mut keep, &mut refused)
-    });
+    // One row compared with none says nothing of the pool: where the
+    // second engine is not found the whole pass decides, as it does for
+    // a draw over rows.
+    let drawn = match first {
+        Some(a) => {
+            let but = Some(a.0);
+            Some((
+                a,
+                stand_in(draw, engines, candidates, but, &mut keep, &mut refused)?,
+            ))
+        }
+        None => None,
+    };
     let ties = Draw::new(draw.next_u64());
     let after = RequestFacts {
         seed: draw.state(),
         ..*facts
     };
     // The engine taken, its row already kept, and the other engine's row.
-    let (taken, held, other) = match (first, second) {
-        (None, _) => (0, None, None),
-        (Some((engine, row)), None) => (engine, Some(row), None),
-        (Some((a_engine, a)), Some((b_engine, b))) => {
+    let (taken, held, other) = match drawn {
+        None => (0, None, None),
+        Some(((a_engine, a), (b_engine, b))) => {
             buf.kept.clear();
             buf.kept.extend([a, b]);
             let (kept, scores) = (&buf.kept, &mut buf.scores);

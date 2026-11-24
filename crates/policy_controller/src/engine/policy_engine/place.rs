@@ -72,7 +72,7 @@ use std::{
 
 use smg_worker::identity::basic::Worker;
 
-use super::{Loaded, PolicyEngine};
+use super::{encode::EncodeLists, Loaded, PolicyEngine};
 use crate::{
     document::{
         spec::{AppliedSpec, DecodePick},
@@ -276,8 +276,9 @@ pub struct PlaceRequest<'a> {
     /// answer. Where the document picks the decode after the prefill, such
     /// a request's first decision books the prefill alone. A caller that
     /// sends both sides at once states nothing here and keeps one decision
-    /// under every document. The word is a pair's: over one list it asks
-    /// nothing, and a first attempt that carries it is plain still. An
+    /// under every document. The word is a pair's: over one list, or over
+    /// none, it asks nothing. The request made states no later decode
+    /// then, and a first attempt that carries it is plain still. An
     /// encode request whose decode is held to the workers that take images
     /// ([`EncodeItems::decode_images`], or references beside an image or a
     /// video) books its decode with its prefill whatever it states here: a
@@ -376,6 +377,14 @@ impl<'a> PlaceRequest<'a> {
             WorkerLists::None | WorkerLists::Single(_) => Phase::Single,
         }
     }
+
+    /// Whether the request asks a pair's decode again
+    /// ([`Self::decode_again`]). The word is a pair's, over its two lists
+    /// or an encode request's three: over one list, and over none, it asks
+    /// nothing. The request made and its plain test both read this.
+    const fn asks_decode_again(&self) -> bool {
+        self.decode_again && matches!(self.lists, WorkerLists::Pair(_) | WorkerLists::Encode(_))
+    }
 }
 
 /// One request as the engine makes it of what its caller stated: the one
@@ -425,6 +434,9 @@ pub(super) struct Made<'r, 'a> {
     /// ([`RequestMaker::sends_to`]): the call's pick takes these answers,
     /// and reads none of those targets again.
     sent: Cell<Sent>,
+    /// The same on the decodes of a pair's targets, by their places in the
+    /// decode list: `sent` holds the prefills' then.
+    decodes: Cell<Sent>,
 }
 
 /// What a call's maker answered on a decision's targets where the decision
@@ -494,6 +506,7 @@ impl<'r, 'a> Made<'r, 'a> {
             heads: OnceCell::new(),
             panicked: OnceCell::new(),
             sent: Cell::new(Sent::NONE),
+            decodes: Cell::new(Sent::NONE),
         }
     }
 
@@ -748,12 +761,14 @@ impl RequestMaker for Made<'_, '_> {
             hashes.write_to(&mut facts);
         }
         // The document's word, like the keys: read from the generation
-        // that decides. An encode request whose decode is held to the ones
-        // that take images, by its demand or by the preference of
-        // references beside pixels, states no later decode: a decode asked
+        // that decides. A request over one list, or over none, states no
+        // later decode whatever its caller says: the word is a pair's, as
+        // the plain test reads it. An encode request whose decode is held
+        // to the ones that take images, by its demand or by the preference
+        // of references beside pixels, states none either: a decode asked
         // again reads no image fact. The hold is read last, so a request
         // that asks no decode again reads none of it.
-        let later = request.decode_again
+        let later = request.asks_decode_again()
             && spec.decode_pick() == DecodePick::AfterPrefill
             && !request
                 .encode
@@ -773,16 +788,13 @@ impl RequestMaker for Made<'_, '_> {
 
     // A first attempt that names nothing tried or missed, is held to no
     // place of its list, demands nothing, carries no encode item and asks
-    // no decode again is plain. Its size
-    // is the one the request made would state. A decode asked again is a
-    // pair's word, over its two lists or an encode request's three: over
-    // one list it asks nothing, and the request is plain still.
+    // no decode again ([`PlaceRequest::asks_decode_again`]) is plain. Its
+    // size is the one the request made would state.
     fn plain(&self) -> Option<Plain> {
         let request = self.request;
         let first = request.attempt == 0 && request.tried.is_empty() && self.missed.is_empty();
         let first = first && self.places.is_none();
-        let pair = matches!(request.lists, WorkerLists::Pair(_) | WorkerLists::Encode(_));
-        let again = request.decode_again && pair;
+        let again = request.asks_decode_again();
         let asks_more = !request.demands.is_none() || request.encode.is_some() || again;
         (first && !asks_more).then(|| Plain {
             phase: request.phase(),
@@ -815,10 +827,12 @@ impl RequestMaker for Made<'_, '_> {
         self.request.prompt.entry?.token_key(page)
     }
 
-    // The walk's own read of a single request's target, made ahead of the
-    // walk for the write of where the prompt went, a lent tree's or the
-    // record's: ready, and admitted by the route's rule, which is asked of
-    // a worker that is ready and of no other.
+    // The walk's own read of a target, made ahead of the walk for the
+    // write of where the prompt went, a lent tree's or the record's: each
+    // worker of the target ready, and admitted by the route's rule, which
+    // is asked of a worker that is ready and of no other. A single
+    // request's target is its one worker, and a pair's is its prefill and
+    // its decode, in a pair's two lists or an encode request's.
     //
     // A rule that panics here panics inside a decision, where the engine's
     // own catch would answer it as a decision that faulted. It is the
@@ -827,20 +841,41 @@ impl RequestMaker for Made<'_, '_> {
     // the decision ([`raise`]). The walk catches the rule's panic the same
     // way where it asks ([`walk`]).
     //
-    // Each answer is kept ([`Sent`]): the call's pick takes it, so a
-    // target is read and its rule asked once a decision.
+    // Each answer is kept ([`Sent`]), a pair's by its side: the call's pick
+    // takes it, so a worker is read and its rule asked once a decision. A
+    // pair's targets share workers, their prefill first of all: one that
+    // an earlier target was asked of answers as it did.
     fn sends_to(&self, target: &Target) -> bool {
-        let WorkerLists::Single(list) = self.request.lists else {
-            return true;
-        };
-        let Some(worker) = list.workers.get(target.position as usize) else {
+        match self.request.lists {
+            WorkerLists::None => true,
+            WorkerLists::Single(list) => self.asks(list, target.position, &self.sent),
+            WorkerLists::Pair(lists) | WorkerLists::Encode(EncodeLists { pair: lists, .. }) => {
+                let side = |list: LentList<'_>, place: u32, kept: &Cell<Sent>| {
+                    let held = kept.get().answer(place);
+                    held.unwrap_or_else(|| self.asks(list, place, kept))
+                };
+                target.pair.is_some_and(|pair| {
+                    side(lists.prefill, target.position, &self.sent)
+                        && side(lists.decode, pair.decode_position, &self.decodes)
+                })
+            }
+        }
+    }
+}
+
+impl Made<'_, '_> {
+    /// Whether the call sends to the worker at `place` of `list`, one
+    /// worker of a target ([`RequestMaker::sends_to`]). The answer is kept
+    /// in `kept`.
+    fn asks(&self, list: LentList<'_>, place: u32, kept: &Cell<Sent>) -> bool {
+        let Some(worker) = list.workers.get(place as usize) else {
             return false;
         };
         let worker = worker.as_ref();
         if self.panicked.get().is_some() {
             return false;
         }
-        let mut sent = self.sent.get();
+        let mut sent = kept.get();
         let sendable = ready(worker)
             && self.request.admits.is_none_or(|admits| {
                 match catch_unwind(AssertUnwindSafe(|| admits(worker))) {
@@ -854,8 +889,8 @@ impl RequestMaker for Made<'_, '_> {
                     }
                 }
             });
-        sent.keep(target.position, sendable);
-        self.sent.set(sent);
+        sent.keep(place, sendable);
+        kept.set(sent);
         sendable
     }
 }
@@ -1348,17 +1383,25 @@ fn single<'a>(
                     Some(worker) if sendable => Ok((Arc::clone(worker), None)),
                     _ => Err([Some(target.id), None]),
                 }
-            })?;
-            let Some(mut placement) = taken else {
-                // The walk gave the decision up: the rule is asked of the
-                // list while the call holds none.
-                if refused.get() {
-                    hold_to_rule(request, list, call)?;
+            });
+            // One match takes the placement out of the walk's answer. A
+            // `?` ahead of a `let else` takes it out in two steps, and a
+            // build copies it at each.
+            match taken {
+                Ok(Some(mut placement)) => {
+                    placement.routing_key = key;
+                    Ok(placement)
                 }
-                return call.again(|call| single(engine, request, list, call));
-            };
-            placement.routing_key = key;
-            Ok(placement)
+                Ok(None) => {
+                    // The walk gave the decision up: the rule is asked of
+                    // the list while the call holds none.
+                    if refused.get() {
+                        hold_to_rule(request, list, call)?;
+                    }
+                    call.again(|call| single(engine, request, list, call))
+                }
+                Err(unplaced) => Err(unplaced),
+            }
         }
     }
 }

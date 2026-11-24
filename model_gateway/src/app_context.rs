@@ -730,6 +730,13 @@ impl AppContextBuilder {
         // words. The engine is started last, from the document that was
         // checked here.
         let policy = Self::policy_in_force(&router_config, policy_stages.as_ref())?;
+        // The overload veto's two words are read once below, where the
+        // registration settings are made and the registry's shed word is set.
+        // A supplied document this gateway refuses for them ends the start
+        // here, behind the document's own check and in the same form.
+        router_config
+            .supplied_overload_words()
+            .map_err(|refused| format!("policy controller: {refused}"))?;
         // A served model aliased under a vendor name keeps that vendor's
         // contract profile after the alias is resolved into the served name.
         ProviderProfile::register_model_aliases(
@@ -1004,8 +1011,10 @@ impl AppContextBuilder {
         // The overload shed advertises the poll interval as Retry-After — the
         // veto cannot clear between polls.
         overload::set_shed_retry_after_secs(shed_retry_after_secs(config.load_monitor_interval()));
+        // The shed word in force: a supplied document's own where the policy
+        // controller runs one, else the configuration's.
         if let Some(registry) = self.worker_registry.as_ref() {
-            registry.set_overload_shed(config.worker_overload_shed);
+            registry.set_overload_shed(config.overload_words_in_force().shed);
         }
         // PD dispatch waits here, not in the decode engine's queue, when the
         // pair's running window is full.
@@ -1030,6 +1039,11 @@ impl AppContextBuilder {
     /// (`RouterConfig::policy_engine_decides`). That gateway places its
     /// requests by no routing policy, so the option moves nothing there,
     /// and this start says so in one log line.
+    ///
+    /// A document whose `explain.sample` is not zero is named in one warn
+    /// line, ahead of its check: the engine this process hosts keeps no
+    /// sample (the served controller alone does), and the document is not
+    /// refused for it.
     fn policy_in_force(
         config: &RouterConfig,
         stages: Option<&StageRegistry>,
@@ -1047,6 +1061,15 @@ impl AppContextBuilder {
         let document = config
             .policy_document_in_force()
             .map_err(|refused| format!("policy controller: {refused}"))?;
+        // One document may serve this gateway and a served controller that
+        // keeps the sample, so the field is named here and not refused.
+        if document.explain.sample != 0 {
+            tracing::warn!(
+                sample = document.explain.sample,
+                "The policy document sets explain.sample, and the policy engine this gateway \
+                 hosts keeps no sample of its decisions"
+            );
+        }
         let checked = match stages {
             Some(stages) => config.hosted_policy(&document, stages),
             None => config.hosted_policy(&document, &StageRegistry::builtin()),
@@ -2004,6 +2027,53 @@ policy:
             .await;
         assert!(logs_contain("Starting KV event subscription"));
         monitor.stop().await;
+    }
+
+    /// The engine this process hosts keeps no sample of its decisions. A
+    /// supplied document that leaves `explain.sample` at zero is taken
+    /// without a word, and one that sets it is taken with one warn line.
+    /// One the check refuses is named too, ahead of its refusal.
+    #[traced_test]
+    #[test]
+    fn a_documents_explain_sample_is_named_at_the_start() {
+        let mut config = RouterConfig {
+            policy_controller: true,
+            ..Default::default()
+        };
+        let mut document = config.policy_document().expect("the settings' document");
+        config.policy_spec = Some(document.clone());
+        let taken = AppContextBuilder::policy_in_force(&config, None);
+        assert!(matches!(taken, Ok(Some(_))));
+        assert!(!logs_contain("explain.sample"));
+
+        document.explain.sample = 10;
+        config.policy_spec = Some(document.clone());
+        let taken = AppContextBuilder::policy_in_force(&config, None);
+        assert!(matches!(taken, Ok(Some(_))));
+        logs_assert(|lines: &[&str]| {
+            let named: Vec<_> = lines
+                .iter()
+                .filter(|line| line.contains("explain.sample"))
+                .collect();
+            match named.as_slice() {
+                [line] if line.contains("WARN") && line.contains("sample=10") => Ok(()),
+                _ => Err(format!("the lines that name explain.sample: {named:?}")),
+            }
+        });
+
+        // Its binding's profile gone, the document is refused by the check.
+        document.explain.sample = 11;
+        document.profiles.clear();
+        config.policy_spec = Some(document);
+        let taken = AppContextBuilder::policy_in_force(&config, None);
+        assert!(taken.is_err());
+        logs_assert(|lines: &[&str]| {
+            let named = lines.iter().filter(|line| line.contains("sample=11"));
+            match named.count() {
+                1 => Ok(()),
+                named => Err(format!("the lines of the refused document: {named}")),
+            }
+        });
     }
 }
 

@@ -385,7 +385,7 @@ impl WorkerSelectionStage {
 /// request type pins, and the model. Gathered once ([`Self::gather`]), kept
 /// for the retries in the routing snapshot ([`Self::snapshot`]; the token
 /// ids excepted: a retry reads them off the retained plan), read by the
-/// pick ([`WorkerSelectionStage::pick`]).
+/// pick ([`WorkerSelectionStage::select`]).
 struct SelectionInputs<'a> {
     intermediate: Option<&'a multimodal::MultimodalIntermediate>,
     /// Media references are forwarded: only a worker that advertises
@@ -565,9 +565,11 @@ impl WorkerSelectionStage {
     /// The selection behind [`Self::execute`]; a refusal it returns
     /// is reported there by [`Self::report_refusal`]. The request's inputs are
     /// gathered first and kept for the retries in the routing snapshot, the
-    /// mode's pick runs on them ([`Self::pick`]), and the selection is checked
-    /// against the request's modalities and media references before it is
-    /// stored.
+    /// mode's pick runs on them (the single worker that meets every demand, or
+    /// the pair admitted within the queue budget, with the encode assignments
+    /// in EPD mode, and the Prefill admission slot it holds), and the selection
+    /// is checked against the request's modalities and media references before
+    /// it is stored.
     async fn select(&self, ctx: &mut RequestContext) -> Result<(), Response> {
         let accepted = self.acceptance_for_selection(ctx);
         if let Some(refused) = accepted.and_then(|accepted| self.refuse_if_expired(ctx, accepted)) {
@@ -591,63 +593,8 @@ impl WorkerSelectionStage {
             .map(str::to_string);
         ctx.state.routing_snapshot = Some(inputs.snapshot());
 
-        let (workers, prefill_guard) = self.pick(ctx, accepted, &inputs).await?;
-        if let Some(guard) = prefill_guard {
-            ctx.state.pd_prefill_guard = Some(guard);
-        }
-        // Only an encoder that processes the media itself (a push handoff)
-        // takes references; a rendezvous encoder takes router-processed items.
-        if self.mode == WorkerSelectionMode::EncodePrefillDecode
-            && inputs.media_refs
-            && workers.encode_handoff() != Some(EncodeHandoff::Push)
-        {
-            return Err(multimodal::MmRefsError::EncodeNotSupported.into_response());
-        }
-
-        // Reject an unsupported (backend, modality) combination now that the
-        // runtime is known, before request building assembles the payload only
-        // to fail deep in assembly. Preparation refused the request before the
-        // decode when no worker of the model took a modality
-        // (`ensure_model_accepts_media`); this answers for the pools it let
-        // through, where the pick may land on a worker whose engine does not.
-        // The prefill side builds the request in disaggregated mode, so its
-        // runtime is the one that must support the request's modalities.
-        if let Some(intermediate) = inputs.intermediate {
-            if let Err(err) = multimodal::ensure_backend_supports_modalities(
-                selection_runtime(&workers),
-                intermediate,
-            ) {
-                return Err(error::bad_request(
-                    "multimodal_not_supported",
-                    format!("{err}"),
-                ));
-            }
-        }
-
-        if let Some(plan) = ctx.state.multimodal_refs.as_ref() {
-            if let Err(err) = multimodal::ensure_selection_supports_media_refs(
-                &workers,
-                plan,
-                ctx.state.media_refs_pipeline,
-            ) {
-                return Err(err.into_response());
-            }
-        }
-
-        ctx.state.workers = Some(workers);
-        Ok(())
-    }
-
-    /// The mode's pick over the gathered inputs: the single worker that
-    /// meets every demand, or the pair admitted within the queue budget (with
-    /// the encode assignments in EPD mode) and the Prefill admission slot it
-    /// holds.
-    async fn pick(
-        &self,
-        ctx: &RequestContext,
-        accepted: Option<Instant>,
-        inputs: &SelectionInputs<'_>,
-    ) -> Result<(WorkerSelection, Option<PrefillLoadGuard>), Response> {
+        // The mode's pick runs here and not in a future of its own: the
+        // regular mode awaits nothing.
         let model_id = inputs.model_id;
         let media = inputs.media;
         let context_requirements = inputs.context_requirements;
@@ -655,7 +602,7 @@ impl WorkerSelectionStage {
         let accepts_refs = |worker: &dyn Worker| media.accepts_refs(worker);
         let placement = inputs.placement(inputs.media_refs.then_some(&accepts_refs));
         let sticky_key = ctx.state.sticky_key.as_deref();
-        match self.mode {
+        let (workers, prefill_guard) = match self.mode {
             WorkerSelectionMode::Regular => {
                 match self.select_regular(
                     model_id,
@@ -671,13 +618,15 @@ impl WorkerSelectionStage {
                     wire,
                     &[],
                 ) {
-                    Some(w) => Ok((WorkerSelection::Single { worker: w }, None)),
-                    None => Err(self.context_selection_failure(
-                        model_id,
-                        wire,
-                        media,
-                        context_requirements,
-                    )),
+                    Some(w) => (WorkerSelection::Single { worker: w }, None),
+                    None => {
+                        return Err(self.context_selection_failure(
+                            model_id,
+                            wire,
+                            media,
+                            context_requirements,
+                        ));
+                    }
                 }
             }
             WorkerSelectionMode::PrefillDecode => {
@@ -695,7 +644,7 @@ impl WorkerSelectionStage {
                         ),
                     )
                     .await?;
-                Ok((disaggregated(pair), Some(guard)))
+                (disaggregated(pair), Some(guard))
             }
             WorkerSelectionMode::EncodePrefillDecode => {
                 let hashes = if let Some(plan) = ctx.state.multimodal_refs.as_ref() {
@@ -746,7 +695,7 @@ impl WorkerSelectionStage {
                         ),
                     )
                     .await?;
-                Ok((
+                (
                     WorkerSelection::Disaggregated {
                         encode_assignments: if encode_assignments.is_empty() {
                             None
@@ -758,9 +707,53 @@ impl WorkerSelectionStage {
                         runtime_type,
                     },
                     Some(guard),
-                ))
+                )
+            }
+        };
+        if let Some(guard) = prefill_guard {
+            ctx.state.pd_prefill_guard = Some(guard);
+        }
+        // Only an encoder that processes the media itself (a push handoff)
+        // takes references; a rendezvous encoder takes router-processed items.
+        if self.mode == WorkerSelectionMode::EncodePrefillDecode
+            && inputs.media_refs
+            && workers.encode_handoff() != Some(EncodeHandoff::Push)
+        {
+            return Err(multimodal::MmRefsError::EncodeNotSupported.into_response());
+        }
+
+        // Reject an unsupported (backend, modality) combination now that the
+        // runtime is known, before request building assembles the payload only
+        // to fail deep in assembly. Preparation refused the request before the
+        // decode when no worker of the model took a modality
+        // (`ensure_model_accepts_media`); this answers for the pools it let
+        // through, where the pick may land on a worker whose engine does not.
+        // The prefill side builds the request in disaggregated mode, so its
+        // runtime is the one that must support the request's modalities.
+        if let Some(intermediate) = inputs.intermediate {
+            if let Err(err) = multimodal::ensure_backend_supports_modalities(
+                selection_runtime(&workers),
+                intermediate,
+            ) {
+                return Err(error::bad_request(
+                    "multimodal_not_supported",
+                    format!("{err}"),
+                ));
             }
         }
+
+        if let Some(plan) = ctx.state.multimodal_refs.as_ref() {
+            if let Err(err) = multimodal::ensure_selection_supports_media_refs(
+                &workers,
+                plan,
+                ctx.state.media_refs_pipeline,
+            ) {
+                return Err(err.into_response());
+            }
+        }
+
+        ctx.state.workers = Some(workers);
+        Ok(())
     }
 }
 
@@ -7378,6 +7371,45 @@ mod tests {
                 assert_eq!(prefill.url(), "grpc://127.0.0.1:9120");
             }
             WorkerSelection::Single { .. } => panic!("expected a PD selection"),
+        }
+    }
+
+    /// An image request to a model whose prefill workers are all gone, with
+    /// a language-model-only decode worker still registered, is the
+    /// `no_available_workers` 503 a text request gets then, not a 400 for
+    /// the encoder: no worker that would take the pixels is there to judge.
+    #[tokio::test]
+    async fn an_image_request_with_no_prefill_worker_is_unavailable_like_a_text_request() {
+        let registry = Arc::new(WorkerRegistry::new());
+        registry
+            .register(labeled_worker(
+                "grpc://127.0.0.1:9140",
+                "test-model",
+                WorkerType::Decode,
+                NO_VISION_ENCODER,
+            ))
+            .unwrap();
+        let stage = round_robin_pd_stage(Arc::clone(&registry));
+
+        for image in [true, false] {
+            let mut ctx = prepared_ctx(Arc::clone(&registry), None);
+            if image {
+                ctx.state.multimodal_intermediate = Some(image_intermediate(None));
+            }
+            let response = stage
+                .execute(&mut ctx)
+                .await
+                .expect_err("no prefill worker is registered");
+            assert_eq!(
+                response.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "image={image}"
+            );
+            assert_eq!(
+                error::extract_error_code_from_response(&response),
+                "no_available_workers",
+                "image={image}"
+            );
         }
     }
 

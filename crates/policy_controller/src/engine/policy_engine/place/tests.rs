@@ -636,23 +636,43 @@ fn a_plain_request_says_so_and_is_answered_a_place() {
 /// again and the document picks the decode after the prefill. Under a
 /// document that picks both sides at once it states none, and so does a
 /// caller that asks no decode again.
+///
+/// The word is a pair's, over its two lists or an encode request's three.
+/// Over one list, and over none, a request that carries it states no
+/// later decode: the request made is as plain as its plain test says.
 #[test]
 fn the_later_decode_is_stated_where_the_document_picks_it_so() {
     let mut document = PolicySpec::pair_presets("round_robin", "round_robin").expect("presets");
     let at_once = engine_of(&document);
     document.plans.pd_pair.decode = DecodePick::AfterPrefill;
     let after = engine_of(&document);
-    let later = |engine: &PolicyEngine, decode_again| {
+    let members = PublishedList::new(pool(2));
+    let classes = PartnerClasses::number(2, [&[0_u32, 1][..], &[0, 1][..]]);
+    let pair = pair_of(&members, &classes);
+    let later = |engine: &PolicyEngine, lists: WorkerLists<'_>, decode_again| {
         let request = PlaceRequest {
             decode_again,
-            ..PlaceRequest::of(MODEL, WorkerLists::None)
+            ..PlaceRequest::of(MODEL, lists)
         };
         let made = Made::new(engine, &request, &[]);
         made.make(engine.spec()).constraints.decode_later
     };
-    assert!(later(&after, true));
-    assert!(!later(&after, false));
-    assert!(!later(&at_once, true));
+    for lists in [WorkerLists::Pair(pair), three_of(pair)] {
+        assert!(later(&after, lists, true));
+        assert!(!later(&after, lists, false));
+        assert!(!later(&at_once, lists, true));
+    }
+    for lists in [WorkerLists::Single(members.lent()), WorkerLists::None] {
+        let request = PlaceRequest {
+            decode_again: true,
+            ..PlaceRequest::of(MODEL, lists)
+        };
+        let made = Made::new(&after, &request, &[]);
+        let stated = made.make(after.spec());
+        assert!(!stated.constraints.decode_later);
+        assert!(made.plain().is_some());
+        assert_eq!(stated.plain(), made.plain());
+    }
 }
 
 /// A worker can be sent to while it is ready and its circuit breaker lets

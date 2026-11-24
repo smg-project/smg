@@ -276,29 +276,35 @@ pub trait MembershipWriter: Send + Sync + 'static {
     ) -> Result<MembershipWriteOutcome, MembershipWriteRefused>;
 }
 
-/// What a door owns of a write, beside the rules every door shares.
+/// What a door owns of a write and of the reads ahead of it, beside the
+/// rules every door shares.
 pub(crate) trait Turn {
     fn store(&self) -> &MemoryStore;
 
-    /// The turn's write of a registration's facts: the store's own
-    /// ([`WorkersStore::upsert_by`]), unless the door's worker objects
-    /// decide a row's write. `None` where another writer moved the row
-    /// under the turn.
-    fn upsert(&self, facts: WorkerFacts, maker: Registrant) -> Option<MembershipChange> {
-        Some(self.store().upsert_by(facts, maker))
-    }
+    /// The row that stands under the id `id`, as the door reads a record:
+    /// a door with a holder reads it off its worker objects
+    /// ([`Objects::record`](super::Objects::record)).
+    fn row(&self, id: WorkerId) -> Option<WorkerRow>;
+
+    /// The row that stands under `url`, as [`Self::row`] reads one.
+    fn row_under(&self, url: &str) -> Option<WorkerRow>;
+
+    /// Every row whose facts name `engine`, as [`Self::row`] reads one.
+    fn rows_of(&self, engine: &str) -> Vec<WorkerRow>;
+
+    /// The turn's write of a registration's facts: a door with a holder
+    /// decides it over its worker objects
+    /// ([`Objects::upsert`](super::Objects::upsert)). `None` where another
+    /// writer moved the row under the turn.
+    fn upsert(&self, facts: WorkerFacts, maker: Registrant) -> Option<MembershipChange>;
 
     /// The turn's write of a patch, as [`Self::upsert`] writes a
-    /// registration ([`WorkersStore::patch`]).
-    fn patch(&self, id: WorkerId, patch: WorkerPatch, revision: u64) -> Option<MembershipChange> {
-        self.store().patch(id, patch, revision)
-    }
+    /// registration.
+    fn patch(&self, id: WorkerId, patch: WorkerPatch, revision: u64) -> Option<MembershipChange>;
 
     /// The turn's removal of a row, as [`Self::upsert`] writes a
-    /// registration ([`WorkersStore::remove`]).
-    fn remove(&self, id: WorkerId, revision: u64) -> Option<MembershipChange> {
-        self.store().remove(id, revision)
-    }
+    /// registration.
+    fn remove(&self, id: WorkerId, revision: u64) -> Option<MembershipChange>;
 
     /// Check the term ahead of a write. A registration asks before each
     /// row it writes and each row it removes.
@@ -330,11 +336,11 @@ fn made_by(row: &WorkerRow, maker: &Registrant) -> Result<(), MembershipWriteRef
 /// The row an asker saw, where it still stands under the URL at the
 /// revision the asker saw.
 fn seen_row(
-    store: &MemoryStore,
+    turn: &impl Turn,
     url: &str,
     seen: RowRevision,
 ) -> Result<WorkerRow, MembershipWriteRefused> {
-    let row = store.by_key(url).ok_or(MembershipWriteRefused::Absent)?;
+    let row = turn.row_under(url).ok_or(MembershipWriteRefused::Absent)?;
     if (row.id, row.revision) != (seen.row, seen.revision) {
         return Err(MembershipWriteRefused::Moved);
     }
@@ -391,13 +397,13 @@ fn states_the_engine_whole(ready: &[Ready]) -> bool {
 /// The row a write expects to stand under `url`, read once for the row's
 /// rule.
 fn standing_under(
-    store: &MemoryStore,
+    turn: &impl Turn,
     expect: Precondition,
     url: &str,
 ) -> Result<Option<WorkerRow>, MembershipWriteRefused> {
     Ok(match expect {
-        Precondition::AtRevision(seen) => Some(seen_row(store, url, seen)?),
-        Precondition::Absent | Precondition::Any => store.by_key(url),
+        Precondition::AtRevision(seen) => Some(seen_row(turn, url, seen)?),
+        Precondition::Absent | Precondition::Any => turn.row_under(url),
     })
 }
 
@@ -458,7 +464,7 @@ fn ready_row(
 /// The rule reads what stands and nothing of a first attempt, so it holds
 /// at the next leader's door too.
 fn same_add(
-    store: &MemoryStore,
+    turn: &impl Turn,
     maker: &Registrant,
     ready: &[Ready],
 ) -> Result<(), MembershipWriteRefused> {
@@ -468,7 +474,7 @@ fn same_add(
             writes = true;
             continue;
         };
-        let own = store.get(*id).is_some_and(|row| row.made_by(maker).is_ok());
+        let own = turn.row(*id).is_some_and(|row| row.made_by(maker).is_ok());
         if !own || *laid != WorkerFactsChange::Unmoved {
             return Err(MembershipWriteRefused::Stands);
         }
@@ -491,7 +497,7 @@ pub(crate) fn lay_one(
     url: &str,
     state: &dyn Fn(Option<&WorkerFacts>) -> WorkerFacts,
 ) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
-    let standing = standing_under(turn.store(), expect, url)?;
+    let standing = standing_under(turn, expect, url)?;
     if expect == Precondition::Absent && standing.is_some() {
         return Err(MembershipWriteRefused::Stands);
     }
@@ -527,10 +533,9 @@ pub(crate) fn lay(
         };
         return lay_one(turn, maker, expect, row.url, row.state).map(|wrote| vec![wrote]);
     }
-    let store = turn.store();
     let mut standing = Vec::with_capacity(rows.len());
     for row in rows {
-        standing.push(standing_under(store, expect, row.url)?);
+        standing.push(standing_under(turn, expect, row.url)?);
     }
     // An add with no row left to write is refused before a fact is stated,
     // whoever made the rows that stand.
@@ -556,7 +561,6 @@ pub(crate) fn lay_ready(
     adds: bool,
     ready: Vec<Ready>,
 ) -> Result<Vec<MembershipWriteOutcome>, MembershipWriteRefused> {
-    let store = turn.store();
     let Some((first, _)) = ready.first() else {
         return Err(MembershipWriteRefused::Past(FactPastBound {
             fact: "rows",
@@ -564,10 +568,10 @@ pub(crate) fn lay_ready(
         }));
     };
     if adds {
-        same_add(store, maker, &ready)?;
+        same_add(turn, maker, &ready)?;
     }
     // The engine is the one the first row states. The others are held to
-    // it below, and the store is asked by it.
+    // it below, and the door's rows are asked by it.
     let engine = first.engine.as_str();
     if !states_the_engine_whole(&ready) {
         let width = usize::from(first.dp_size);
@@ -595,8 +599,8 @@ pub(crate) fn lay_ready(
     // plain row of one that comes back ranked, the ranks of one that comes
     // back plain, and a rank left above ranks that were removed. The rows
     // are the engine's by their own fact, whatever their keys read as.
-    let mut left: Vec<_> = store
-        .of_engine(engine)
+    let mut left: Vec<_> = turn
+        .rows_of(engine)
         .into_iter()
         .filter(|row| ready.iter().all(|(facts, _)| facts.key != row.facts.key))
         .collect();
@@ -659,7 +663,7 @@ fn write_row(
         }
     };
     // The row as its write left it: a connect signal moves it next.
-    if let Some(row) = store.get(change.id()) {
+    if let Some(row) = turn.row(change.id()) {
         turn.laid(&row);
         if !probes {
             store.connected(row.id, row.revision, &|| true);
@@ -679,12 +683,12 @@ fn changed(
 }
 
 fn removal_row(
-    store: &MemoryStore,
+    turn: &impl Turn,
     by: Remover<'_>,
     url: &str,
     seen: RowRevision,
 ) -> Result<WorkerRow, MembershipWriteRefused> {
-    let row = seen_row(store, url, seen)?;
+    let row = seen_row(turn, url, seen)?;
     match by {
         Remover::Registrant(maker) => made_by(&row, maker)?,
         Remover::Provider(name) => match &row.maker {
@@ -721,15 +725,16 @@ fn removal_row(
 
 /// Mark the guarded row as draining while the door holds its turn.
 pub(crate) fn drain(
-    store: &MemoryStore,
+    turn: &impl Turn,
     by: Remover<'_>,
     url: &str,
     seen: RowRevision,
 ) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
-    let row = removal_row(store, by, url, seen)?;
+    let row = removal_row(turn, by, url, seen)?;
     if row.status == WorkerStatus::Draining {
         return Ok(MembershipWriteOutcome::Unmoved(row.id));
     }
+    let store = turn.store();
     changed(
         store.set_status(row.id, WorkerStatus::Draining, row.revision),
         MembershipWriteOutcome::Draining,
@@ -743,7 +748,7 @@ pub(crate) fn take(
     url: &str,
     seen: RowRevision,
 ) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
-    let row = removal_row(turn.store(), by, url, seen)?;
+    let row = removal_row(turn, by, url, seen)?;
     changed(
         turn.remove(row.id, row.revision),
         MembershipWriteOutcome::Removed,
@@ -781,8 +786,7 @@ fn refresh_stated(
     url: &str,
     state: &dyn Fn(&WorkerFacts) -> WorkerFacts,
 ) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
-    let store = turn.store();
-    let row = seen_row(store, url, seen)?;
+    let row = seen_row(turn, url, seen)?;
     // A draining row is leaving: its removal wins over a refresh, as over
     // a replacement.
     if row.status == WorkerStatus::Draining {
@@ -868,11 +872,50 @@ pub(super) mod tests {
             membership::{self, FactPastBound},
             pairing::PairingDescriptor,
             MembershipChange, MembershipTail, MemoryStore, Registrant, Signals, WorkerFacts,
-            WorkerRow, WorkerStatus, WorkersStore,
+            WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
         },
     };
 
     const URL: &str = "http://worker:8000";
+
+    /// The reads and the writes of a turn over a store alone, which every
+    /// turn of these cases is: the store's own table, where no holder
+    /// states or decides a record.
+    macro_rules! over_the_table {
+        () => {
+            fn upsert(&self, facts: WorkerFacts, maker: Registrant) -> Option<MembershipChange> {
+                Some(self.store().upsert_by(facts, maker))
+            }
+
+            fn patch(
+                &self,
+                id: WorkerId,
+                patch: WorkerPatch,
+                revision: u64,
+            ) -> Option<MembershipChange> {
+                self.store().patch(id, patch, revision)
+            }
+
+            fn remove(&self, id: WorkerId, revision: u64) -> Option<MembershipChange> {
+                self.store().remove(id, revision)
+            }
+
+            fn row(&self, id: WorkerId) -> Option<WorkerRow> {
+                self.store().get(id)
+            }
+
+            fn row_under(&self, url: &str) -> Option<WorkerRow> {
+                self.store().by_key(url)
+            }
+
+            fn rows_of(&self, engine: &str) -> Vec<WorkerRow> {
+                let (_, rows) = self.store().all_rows();
+                rows.into_iter()
+                    .filter(|row| row.facts.engine == engine)
+                    .collect()
+            }
+        };
+    }
 
     /// A door over a store alone, with no election, no log and no holder:
     /// each call runs the door's rules over the store's own writes. The
@@ -896,6 +939,8 @@ pub(super) mod tests {
         fn store(&self) -> &MemoryStore {
             &self.store
         }
+
+        over_the_table!();
 
         fn life(&self) -> Result<u64, MembershipWriteRefused> {
             Ok(membership::life(0, self.base, self.store.epoch()))
@@ -935,7 +980,7 @@ pub(super) mod tests {
             url: &str,
             seen: RowRevision,
         ) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
-            drain(&self.store, by, url, seen)
+            drain(self, by, url, seen)
         }
 
         fn gone(
@@ -2403,6 +2448,8 @@ pub(super) mod tests {
                 self.0
             }
 
+            over_the_table!();
+
             fn life(&self) -> Result<u64, MembershipWriteRefused> {
                 if self.1.replace(true) {
                     return Err(MembershipWriteRefused::NotLeading(
@@ -2449,6 +2496,8 @@ pub(super) mod tests {
         fn store(&self) -> &MemoryStore {
             self.0
         }
+
+        over_the_table!();
 
         fn check_term(&self) -> Result<(), MembershipWriteRefused> {
             let Some(left) = self.1.get().checked_sub(1) else {
@@ -2588,6 +2637,8 @@ pub(super) mod tests {
             fn store(&self) -> &MemoryStore {
                 self.0
             }
+
+            over_the_table!();
 
             fn life(&self) -> Result<u64, MembershipWriteRefused> {
                 Ok(0)

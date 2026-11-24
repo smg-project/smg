@@ -284,6 +284,7 @@ impl PairBuffers {
             prefill_signal_cells: self.prefill.cells(),
             decode_signal_cells: self.decode.cells(),
             table: PairTable::new(&self.ends, &self.listed),
+            ..PairPools::default()
         }
     }
 

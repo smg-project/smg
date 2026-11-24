@@ -83,7 +83,7 @@ pub struct StageBuild<'a> {
     written: &'a Map<String, Value>,
     profile: &'a str,
     sent_settings: SentSettings,
-    sent: &'a mut Option<Arc<DispatchCredit>>,
+    sent: &'a mut SentSlot,
     reports: LoadReportReader,
     /// The document's signals, resolved, in name order.
     signals: &'a [SignalColumn],
@@ -106,7 +106,7 @@ impl<'a> StageBuild<'a> {
         written: &'a Map<String, Value>,
         profile: &'a str,
         sent_settings: SentSettings,
-        sent: &'a mut Option<Arc<DispatchCredit>>,
+        sent: &'a mut SentSlot,
         reports: LoadReportReader,
         signals: &'a [SignalColumn],
         build: impl FnOnce(&mut Self) -> Result<Box<S>, StageError>,
@@ -172,9 +172,12 @@ impl StageBuild<'_> {
         self.written
     }
 
-    /// The profile's count of sends. The first call for a profile makes
-    /// its tally under that profile's `sent_ttl_ms` and its
-    /// `sent_report_delay_ms`.
+    /// The profile's count of sends, under its `sent_ttl_ms` and its
+    /// `sent_report_delay_ms`. The profiles of a document that set the same
+    /// two read one count: the first call hands an earlier profile's count
+    /// where one stands under them, and makes one otherwise. A read by any
+    /// of those profiles' decisions lets go the sends the row's report
+    /// covers, for all of them.
     pub fn dispatch_credit(&mut self) -> Arc<DispatchCredit> {
         profile_sent(self.sent, self.profile, self.sent_settings)
     }
@@ -204,15 +207,34 @@ impl StageBuild<'_> {
     }
 }
 
-/// The count of sends in a profile's slot, made at the first ask under the
-/// profile's `sent_ttl_ms` and its `sent_report_delay_ms`. A factory's
-/// context and a typed stage both ask here, so a profile holds one count.
+/// A profile's slot for its count of sends while its stages are built.
+#[derive(Default)]
+pub(crate) struct SentSlot {
+    /// The count the profile's stages read, from the first ask on.
+    pub(crate) asked: Option<Arc<DispatchCredit>>,
+    /// The count of an earlier profile of the document under the same
+    /// `sent_ttl_ms` and `sent_report_delay_ms`. The engine records a send
+    /// in every count, so two counts under one pair of settings would hold
+    /// the same sends, and the one whose profile decides no request would
+    /// keep them: only a decision's read lets a send go.
+    pub(crate) shared: Option<Arc<DispatchCredit>>,
+}
+
+/// The count of sends in a profile's slot: the slot's shared one, or one
+/// made at the first ask under the profile's `sent_ttl_ms` and its
+/// `sent_report_delay_ms`. A factory's context and a typed stage both ask
+/// here, so a profile holds one count.
 pub(crate) fn profile_sent(
-    slot: &mut Option<Arc<DispatchCredit>>,
+    slot: &mut SentSlot,
     profile: &str,
     settings: SentSettings,
 ) -> Arc<DispatchCredit> {
-    Arc::clone(slot.get_or_insert_with(|| Arc::new(DispatchCredit::new(profile, settings))))
+    let SentSlot { asked, shared } = slot;
+    Arc::clone(asked.get_or_insert_with(|| {
+        shared
+            .clone()
+            .unwrap_or_else(|| Arc::new(DispatchCredit::new(profile, settings)))
+    }))
 }
 
 /// Why a factory refuses what the document wrote. It displays as the

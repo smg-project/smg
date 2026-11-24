@@ -306,6 +306,11 @@ const CELLS: &[Cell] = &[
         ..Cell::PLAIN
     },
     Cell {
+        name: "sent_cost",
+        document: sent_cost,
+        ..Cell::PLAIN
+    },
+    Cell {
         name: "signal_cost",
         document: signals::document,
         ..Cell::PLAIN
@@ -315,6 +320,20 @@ const CELLS: &[Cell] = &[
 /// A built-in preset as a cell's document.
 fn preset(name: &str) -> PolicySpec {
     PolicySpec::preset(name).expect("a preset's name")
+}
+
+/// The `sent_cost` cell's document: the `least_load` preset costed by its
+/// profile's count of sends. Each decision reads every row's count, the
+/// requests the row was sent and their prompt tokens, and each leased
+/// decision adds its send to its row's.
+fn sent_cost() -> PolicySpec {
+    let mut document = preset("least_load");
+    let cost = r#"{"least-cost":{"terms":{"load.waiting_uncached_tokens":1,
+        "sent.requests":1000,"sent.tokens":1},"unreported":"missing-as-zero"}}"#;
+    let profile = document.profiles.get_mut("least_load");
+    let profile = profile.expect("the preset's profile");
+    profile.score = vec![serde_json::from_str(cost).expect("a scorer")];
+    document
 }
 
 /// The profile of the preset `name` under the stock sessions rule, a new
@@ -762,7 +781,7 @@ fn main() {
         let (rule, ring) = (ruled::stated(&run), place::lent(&host));
         if worded::stated(&run) {
             measure(&run, &host, upkeep, publish, converted, |_| {
-                worded::one(&host)
+                worded::one(&host, ring)
             });
             return;
         }

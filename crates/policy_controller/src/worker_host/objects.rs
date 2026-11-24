@@ -3,7 +3,8 @@
 //! it, and the store follows that write ([`mod@write`]). A standby's applier
 //! hands it each event of its leader's stream ([`mod@standby`]). A host can
 //! also ask it to follow the rows' status, or to build each object with the
-//! thresholds its own load monitor judges overload by.
+//! thresholds its own load monitor judges overload by. A door reads the row
+//! that stands off it ([`mod@read`]).
 
 use std::{
     collections::{HashMap, HashSet},
@@ -44,6 +45,7 @@ use crate::{
 };
 
 mod host_count;
+mod read;
 mod standby;
 mod write;
 
@@ -270,12 +272,13 @@ impl<G> Objects<G> {
     /// worker, for its own decisions, and the holder does not copy its
     /// verdict onto the object's flag.
     ///
-    /// The monitor and the store do not read the same thresholds. A policy
-    /// document's binding thresholds, which the store reads for each signal
-    /// a row names none for, are not read here: `defaults` stands in their
-    /// place, and with no signal in `defaults` the monitor does not judge a
-    /// row that names none. The store judges an engine's ranks together, and
-    /// the monitor judges each object by its own report.
+    /// The monitor and the store do not read the same thresholds. The
+    /// crate's two defaults, which the store reads under a binding whose
+    /// block is on for each signal a row names none for, are not read here:
+    /// `defaults` stands in their place, and with no signal in `defaults`
+    /// the monitor does not judge a row that names none. No document names
+    /// a threshold. The store judges an engine's ranks together, and the
+    /// monitor judges each object by its own report.
     #[must_use]
     pub fn with_overload_thresholds(mut self, defaults: OverloadThresholds) -> Self {
         self.overload_defaults = Some(defaults);

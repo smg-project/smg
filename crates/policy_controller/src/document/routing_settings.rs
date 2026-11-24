@@ -113,13 +113,16 @@ use crate::{
 /// rooms. The two overload thresholds are the gateway's too: the default it
 /// builds its worker objects with, under each worker's own registration. No
 /// document carries a threshold, so one off its default means the same
-/// document. The pin of a sticky key to one engine of a grouped worker is
-/// the dispatch's as well: it runs behind the decision, on the worker the
-/// decision names. Its key is the gateway's own, read from the routing-key
-/// headers. A supplied document names its own key sources, which need not
-/// be that key, so the pin is refused beside one. The copy of the cache
-/// boundaries at the top of the configuration decides nothing either: each
-/// policy reads its own.
+/// document. Both at none leave nothing to veto by, and the settings' own
+/// document switches the block off. Beside a supplied document the two are
+/// no difference, whatever they are: its host says what a block that is on
+/// means over no threshold. The pin of a sticky key to one engine of a
+/// grouped worker is the dispatch's as well: it runs behind the decision, on
+/// the worker the decision names. Its key is the gateway's own, read from
+/// the routing-key headers. A supplied document names its own key sources,
+/// which need not be that key, so the pin is refused beside one. The copy
+/// of the cache boundaries at the top of the configuration decides nothing
+/// either: each policy reads its own.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RoutingSettings {
     /// The kinds of worker the gateway routes to, with each side's own policy.
@@ -566,6 +569,11 @@ impl RoutingSettings {
     /// another value. A conflict names the first difference and the two
     /// values.
     ///
+    /// The two overload thresholds are no part of the comparison: no
+    /// document carries one, so they stand beside a supplied document
+    /// whatever they are, both at none too. What a supplied document's
+    /// switch means over no threshold is its host's to say.
+    ///
     /// Both launchers refuse a routing setting beside a document before
     /// this runs, so the comparison judges a configuration built by hand.
     /// The generation is no part of it: it numbers the document, and no
@@ -597,10 +605,14 @@ impl RoutingSettings {
         // The default configuration of this gateway's kind: a provider mode
         // has a document under the multi-router setting alone, and a pair
         // mode binds a single request by how the gateway reaches its workers.
+        // The two overload thresholds are the gateway's own beside a
+        // document, so the default configuration states them as they are.
         let plain = Self {
             mode: self.mode.with_defaults(),
             enable_igw: self.enable_igw,
             connection_mode: self.connection_mode,
+            worker_overload_waiting_requests: self.worker_overload_waiting_requests,
+            worker_overload_token_usage: self.worker_overload_token_usage,
             ..defaults.clone()
         }
         .policy_document()?;
@@ -1651,9 +1663,8 @@ fn key_sources(
 ///   gateway's policy hears of no request its sticky map placed
 ///   (`model_gateway/src/policies/registry.rs:736-739`). Both read such a
 ///   request in the count of requests the gateway holds on the worker. A
-///   host that tells a dispatch off a lease on file keeps no word of who
-///   placed it, and its stages hear such a request's dispatch as any
-///   other's.
+///   controller keeps the rule's word on the lease it files, and tells no
+///   stage that dispatch either.
 /// - `passthrough` sends every request to the first worker that takes one.
 /// - `bucket` draws for a single request, and the rule plans single
 ///   requests alone. Its stage places a prefill decision by the sizes it
@@ -1670,10 +1681,8 @@ fn key_sources(
 ///   stages place, as under the policy alone, and behind none the rule
 ///   places alone: the rule keeps those from the profile
 ///   ([`override_rule`]), and the record's writes read that word
-///   (`lease_events::stages_hear`). A host that tells a dispatch off a
-///   lease on file keeps no word of who placed it, and its stages hear
-///   such a request's dispatch as any other's. Its decision is this
-///   engine's, so its record follows the word all the same.
+///   (`lease_events::stages_hear`). A controller's decision is this
+///   engine's, so its record follows the word too.
 fn override_places(policy: &PolicySettings, config: &RoutingSettings) -> bool {
     let placed = matches!(
         policy,
@@ -2611,8 +2620,8 @@ mod tests {
     /// two.
     const PLACED: [&str; 7] = [
         "random",
-        "round_robin",
         "power_of_two",
+        "round_robin",
         "least_load",
         "passthrough",
         "bucket",
@@ -2764,9 +2773,9 @@ mod tests {
 
     /// The override's rule places single requests alone, beside a policy
     /// that places one by nothing its key hands it. A pair plan, a gateway
-    /// of many routers and the two other policies whose keyed requests the
+    /// of many routers and the one other policy whose keyed requests the
     /// override places are each refused by the setting's name, in a
-    /// sentence that says which of the four it is.
+    /// sentence that says which of the three it is.
     #[test]
     fn the_override_is_refused_where_its_rule_has_no_document() {
         let why = |config: &RoutingSettings| match config.policy_document() {
@@ -2899,6 +2908,49 @@ mod tests {
                 Ok(given.clone())
             );
         }
+    }
+
+    /// The two thresholds are no part of the comparison with a supplied
+    /// document. Beside settings that state nothing else, a document is in
+    /// force with one threshold at none and with both at none, whether its
+    /// block is on or off: what a block that is on means over no threshold
+    /// is its host's to say. The settings' own document still switches the
+    /// block off for both at none.
+    #[test]
+    fn overload_thresholds_at_none_beside_a_given_document_are_no_disagreement() {
+        let on = preset("least_load");
+        let off = edited(preset("least_load"), |document| {
+            document["bindings"][0]["overload"] = json!({ "enabled": false });
+        });
+        for (waiting, usage) in [(None, Some(0.9)), (Some(32), None), (None, None)] {
+            for given in [&on, &off] {
+                let beside = RoutingSettings {
+                    policy_spec: Some(given.clone()),
+                    worker_overload_waiting_requests: waiting,
+                    worker_overload_token_usage: usage,
+                    ..defaults()
+                };
+                assert_eq!(
+                    beside.policy_document_in_force(&defaults()),
+                    Ok(given.clone()),
+                    "{waiting:?} and {usage:?}"
+                );
+            }
+        }
+        let own = RoutingSettings {
+            worker_overload_waiting_requests: None,
+            worker_overload_token_usage: None,
+            ..defaults()
+        };
+        let block = |document: PolicySpec| {
+            document
+                .bindings
+                .first()
+                .and_then(|binding| binding.overload.clone())
+        };
+        let switched_off = own.policy_document_in_force(&defaults());
+        assert_eq!(switched_off, own.policy_document());
+        assert_eq!(switched_off.map(block), Ok(block(off)));
     }
 
     #[test]

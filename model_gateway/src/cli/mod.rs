@@ -733,7 +733,8 @@ struct RoutingArgs {
     /// The document replaces those flags. A policy name, a policy's own
     /// setting, the overload switch and shed flag and the warm-up and pairing
     /// settings are each refused beside it by name. The two overload
-    /// thresholds stand beside it: the gateway builds its workers with them
+    /// thresholds stand beside it: the gateway builds its workers with them,
+    /// unless the document switches its overload block off
     #[arg(
         long,
         value_name = "FILE",

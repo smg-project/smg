@@ -584,6 +584,7 @@ pub(crate) mod tests {
             target: p,
             picked: PickRecord::of(&targets),
             decode: None,
+            untold: false,
             term: 0,
             issued_at: now,
             dispatch_deadline: now + Duration::from_secs(5),

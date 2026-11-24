@@ -94,7 +94,7 @@
 //! - Behind the `controller` feature, the standalone controller
 //!   (`controller`): the listeners with their credentialed scopes, the
 //!   health service on each, the admin endpoints, readiness, the drain and
-//!   the load driver over the store. The feature turns on `in-process`, the
+//!   the load monitor's task. The feature turns on `in-process`, the
 //!   engine over worker objects, and `worker-host`, so every controller
 //!   keeps its worker objects, probes them and reads cache events.
 //! - Behind the `client` feature, the gateway's side of the controller's

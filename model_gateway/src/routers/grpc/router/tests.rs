@@ -289,6 +289,87 @@ async fn count_tokens_refuses_media_no_worker_of_the_model_takes() {
     }
 }
 
+/// The rule that refuses images for a model without a vision encoder judges
+/// the workers the router's mode sends a request's pixels to, and the router
+/// tells it its mode. One fleet, a prefill and a decode worker of `m` that
+/// both run without the encoder, under two routers: the prefill/decode
+/// router refuses an image block, since its prefill side would take the
+/// pixels; the encode/prefill/decode router does not, since its encode
+/// workers would and none is registered, so the count goes on past the rule.
+#[tokio::test]
+async fn count_tokens_judges_the_workers_the_routers_mode_sends_the_pixels_to() {
+    let model_dir = unreadable_model_dir();
+    for (mode, refused) in [
+        (Mode::PrefillDecode, true),
+        (Mode::EncodePrefillDecode, false),
+    ] {
+        let ctx = grpc_ctx(routing_mode(mode)).await;
+        let source = model_dir.path().to_str().expect("utf-8 path");
+        let tokenizer: Arc<dyn llm_tokenizer::traits::Tokenizer> = Arc::new(
+            llm_tokenizer::mock::MockTokenizer::new().with_deferred_chat_ids(vec![11, 12, 13]),
+        );
+        ctx.tokenizer_registry
+            .load("m", "m", source, || async move { Ok(tokenizer) })
+            .await
+            .expect("register the tokenizer");
+        for (url, worker_type) in [
+            ("grpc://127.0.0.1:30001", WorkerType::Prefill),
+            ("grpc://127.0.0.1:30002", WorkerType::Decode),
+        ] {
+            let worker = BasicWorkerBuilder::new(url)
+                .worker_type(worker_type)
+                .connection_mode(ConnectionMode::Grpc)
+                .runtime_type(RuntimeType::Vllm)
+                .model(ModelCard::new("m"))
+                .label(smg_worker::labels::SUPPORTS_VISION_LABEL, "false")
+                .health_config(HealthCheckConfig {
+                    disable_health_check: true,
+                    ..Default::default()
+                })
+                .build();
+            ctx.worker_registry
+                .register(Arc::new(worker))
+                .expect("register worker");
+        }
+        let router = GrpcRouter::new(&ctx, mode).expect("router");
+        let tenant_meta = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+        let request: CountMessageTokensRequest = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "What colour is this pixel?"},
+                {"type": "image", "source": {
+                    "type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="
+                }}
+            ]}]
+        }))
+        .expect("count request");
+
+        let response = router
+            .route_messages_count_tokens(None, &tenant_meta, request, "m")
+            .await;
+        let status = response.status();
+        let code = error::extract_error_code_from_response(&response).to_string();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body = String::from_utf8_lossy(&bytes);
+        if refused {
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{mode:?}: {body}");
+            assert_eq!(code, "multimodal_not_supported", "{mode:?}: {body}");
+            assert!(
+                body.contains("none of its prefill workers accept vision input"),
+                "{mode:?}: {body}"
+            );
+        } else {
+            assert_ne!(code, "multimodal_not_supported", "{mode:?}: {body}");
+            assert!(
+                !body.contains("accept vision input"),
+                "{mode:?}: the rule did not refuse: {body}"
+            );
+        }
+    }
+}
+
 /// count_tokens judges media of a model without a media spec by the template
 /// the count renders through, as `/v1/messages` does: the one for requests
 /// with tools when the request declares tools, the default one otherwise.
