@@ -1507,34 +1507,48 @@ impl Placement<'_> {
 }
 ```
 
-Where the document's stages want no events, a single request's placement holds nothing and
-these calls do nothing. A pair's placement always holds a lease (section 6), and so does an
-encode request's: it reports its pair's two sides as a pair does, and nothing of an encode side.
-No lease stands for an encoder, so `sent` and `ended` under the encode side tell no stage and
-end no side. The host that sends an encode call counts it on the worker itself, as the gateway's
-encode stage does. `place` answers a single request, a pair and an encode request with a
-placement, and no host makes one itself.
+What a placement holds, and so what these calls do, depends on the request:
 
-A pair's decode can be decided again on its placement. Under a document that picks the decode
-after the prefill, a caller that states `decode_again` is placed with its prefill booked alone,
-and the decode the first decision named stands chosen. When the prefill has answered, the caller
-asks `decode_again` with the request stated again, as its first call stated it. The engine makes
-the request of it anew, as it makes a first call's, and decides under the binding of the model it
-states. Every fact of the decode's decision is that request's: the pair's two lists as they stand
-then, the request's size, its routing value and the workers it tried among them. It decides the
-decode on the records of that instant, behind the prefill that was sent, and the placement takes
-the first decode it names that can be sent to. The placement's routing key and its two profile
-labels stay as the first call wrote them. The order is part of the contract: the caller asks, or
-says the send of the first decision's decode, before it says the prefill's end, and a decode
-still chosen at that end leaves with it. Behind a decode the call took, the prefill's end is said
-when the prefill answers, and the decode's send at its own later instant. Where the call takes no
-decode the placement stands as it stood. A shed is answered by its name. A decision none of
-whose decodes can be sent to answers `NoWorkers` and gives up the side it issued; the caller may
-then ask again, send the first decision's decode, or answer its client.
+- **A single request.** Where the document's stages want no events, its placement holds nothing
+  and these calls do nothing.
+- **A pair.** Its placement always holds a lease (section 6).
+- **An encode request.** Its placement always holds a lease too: it reports its pair's two sides
+  as a pair does, and nothing of an encode side. No lease stands for an encoder, so `sent` and
+  `ended` under the encode side tell no stage and end no side. The host that sends an encode
+  call counts it on the worker itself, as the gateway's encode stage does.
 
-A host that keeps a value with each send, as a gateway keeps a worker's load guard, takes a
-kept placement apart into its sides. A side says its dispatch by one call and its end at its
-drop. Whoever reads the side's answer reports its outcome through a handle on the side's end:
+`place` answers a single request, a pair and an encode request with a placement, and no host
+makes one itself.
+
+**A pair's decode decided again.** A pair's decode can be decided again on its placement:
+
+1. Under a document that picks the decode after the prefill, a caller whose request states
+   `decode_again` is placed with its prefill booked alone. The decode the first decision named
+   stands chosen.
+2. When the prefill has answered, the caller calls `decode_again` with the request stated
+   again, as its first call stated it.
+3. The engine makes the request anew from what the caller stated, as it makes a first call's,
+   and decides under the binding of the model stated there. Every fact of the decode's decision
+   is that request's: the pair's two lists as they stand then, the request's size, its routing
+   value and the workers it tried among them. The engine decides the decode on the records of
+   that instant, behind the prefill that was sent.
+4. The placement takes the first decode the engine names that can be sent to. Its routing key
+   and its two profile labels stay as the first call wrote them.
+
+The order is part of the contract. The caller asks the decode again, or says the send of the
+first decision's decode, before it says the prefill's end: a decode still chosen at that end
+leaves with it. Behind a decode the call took, the prefill's end is said when the prefill
+answers, and the decode's send at its own later instant.
+
+Where the call takes no decode, the placement stands as it stood. A shed is answered by its
+name. A decision none of whose decodes can be sent to answers `NoWorkers` and gives up the side
+it issued. The caller may then ask again, send the first decision's decode, or answer its
+client.
+
+**The sides of a placement.** A host that keeps a value with each send, as a gateway keeps a
+worker's load guard, takes a kept placement apart into its sides. A side says its dispatch by one
+call and its end at its drop. Whoever reads the side's answer reports its outcome through a
+handle on the side's end:
 
 ```rust
 // tracking/placement_side.rs, behind the feature `in-process`
@@ -1557,14 +1571,18 @@ impl SideEnd {
 }
 ```
 
-The value a host keeps with a send is often not where the answer is read: a streamed
-response's guard rides in the response's body, and another task reads the worker's answer. So
-the reader holds a handle, which is cheap to clone and may outlive the side. The side's end is
-said once the side and every handle on it are gone: with the outcome last reported, or with
-none in the words of a dropped side, a release or an end of class cancelled. The side writes
-into a reported outcome its own name, the worker that served and the span from its dispatch to
-the report. A host that asks no handle, and a handle dropped with no report, change nothing.
-Under a document none of whose stages takes an end a handle is empty and costs nothing: no
+**A handle on a side's end.** The value a host keeps with a send is often not where the answer
+is read: a streamed response's guard is held in the response's body, and another task reads the
+worker's answer. So whoever reads the answer holds a handle, which is cheap to clone and may
+outlive the side.
+
+The side's end is said once the side and every handle on it are gone. It is said with the
+outcome last reported or, where none was, in the words of a dropped side: a release or an end of
+class cancelled. Into a reported outcome the side writes its own name, the worker that served
+and the span from its dispatch to the report. A host that asks no handle, and a handle dropped
+with no report, change nothing.
+
+Under a document none of whose stages takes an end, a handle is empty and costs nothing: no
 allocation and no lock. Under one that does, a side shares its placement with its handles: one
 allocation a side.
 
@@ -1576,12 +1594,13 @@ drop. One that never went out is released. So a host that sends a pair's decode 
 orders nothing by hand.
 
 A host that keeps sides asks the decode again on the pair's decode side, once the prefill
-side's send was said. It may let the prefill side go before that call or behind it: a
-prefill's end that waits is said behind the decode the call took, and behind a call that took
-none it still waits. Any other side is refused by name, with no decision made.
+side's send was said. It may let the prefill side go before that call or behind it. A prefill's
+end that waits is said behind the decode the call took. Behind a call that took none, it still
+waits. A side that is not a pair's decode side is refused by name, with no decision made.
 
-Nothing else is asked of a host that makes this call. In particular it never names a policy,
-never looks inside a decision, never keeps a lease and never runs a timer for the engine.
+Nothing else is asked of a host that makes the one call (`place`). In particular it never names
+a policy, never looks inside a decision, never keeps a lease and never runs a timer for the
+engine.
 
 ### 8.3 What is reused and what is added
 
