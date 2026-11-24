@@ -998,7 +998,7 @@ impl<G: Generation> WorkerMonitor<G> {
         // A record feeds the DP-rank token cache nothing. The cache's one
         // reader is the HTTP pair router's rank pick, and a stream is opened
         // for a gRPC worker alone: no pick reads a pushing worker's entry. A
-        // poll feeds the cache (`poll_group_once`).
+        // poll feeds the cache (`poll_group`).
         //
         // The window's publish takes the report once, under the incarnation
         // that pushed last: the file's pusher, queued once a window.
@@ -3091,6 +3091,7 @@ impl OpenFetches {
 
 /// One whole tick of a group at `now`: every engine it asks is awaited, and
 /// their answers are one publish.
+#[cfg(any(test, feature = "test-util"))]
 async fn poll_group_once<G: Generation>(
     monitor: &Arc<WorkerMonitor<G>>,
     group_key: &WorkerGroupKey,
