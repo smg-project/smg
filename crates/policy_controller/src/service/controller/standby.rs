@@ -8,8 +8,11 @@
 //! log's guard of the event's position ([`Log::adopt`]), so the twin's log
 //! holds the leader's positions and terms, and an event that does not land
 //! stops the stream ([`Halt`]). The applier is the one writer of the
-//! replicated tables while a replica follows: its own load driver writes
-//! nothing then.
+//! replicated tables while a replica follows.
+//!
+//! A membership event and a restore go through the holder of the replica's
+//! worker objects, which lays each row's object and hands the store the
+//! write: a standby's objects stand at the place its log stands at too.
 
 use std::{
     sync::{
@@ -47,6 +50,7 @@ use crate::{
         replication::{Log, LogPositionLost},
     },
     store::{LeasesStore, MemoryStore, Position, StoreCheckpoint, WorkerRow},
+    worker_host::{Members, Objects},
 };
 
 /// Why a standby stopped applying its leader's stream.
@@ -68,20 +72,28 @@ const UNAPPLIED: Refused = Refused {
     why: "an event this build does not apply",
 };
 
-/// The standby's applier over one store and the log it journals to.
+/// The standby's applier over one store, the log it journals to and the
+/// holder of the replica's worker objects.
 pub(crate) struct Follower {
     store: Arc<MemoryStore>,
     log: Arc<Log>,
+    /// What lays a told row's object and hands the store the write.
+    objects: Arc<Objects<Members>>,
     /// The door a leader's generation is applied through
     /// ([`Follower::through`]).
     generations: Option<Arc<Generations>>,
 }
 
 impl Follower {
-    pub(crate) fn new(store: Arc<MemoryStore>, log: Arc<Log>) -> Self {
+    pub(crate) fn new(
+        store: Arc<MemoryStore>,
+        log: Arc<Log>,
+        objects: Arc<Objects<Members>>,
+    ) -> Self {
         Self {
             store,
             log,
+            objects,
             generations: None,
         }
     }
@@ -127,6 +139,10 @@ impl Follower {
     /// `false` where the log refuses that place (a history that is not
     /// ahead of its own), the store as it was.
     ///
+    /// The restore runs in the turn of the holder of the worker objects
+    /// ([`Objects::restore_from`]): the cut's rows have their objects when
+    /// it returns.
+    ///
     /// `told` is the leader's standing generation where the snapshot
     /// states one. Its document's pass comes first, under the door's lock,
     /// and the generation lands behind the restore under that lock still:
@@ -143,7 +159,7 @@ impl Follower {
             (Some(told), Some(generations)) => Some(generations.following(told)?),
             _ => None,
         };
-        if !self.store.restore_from(cut) {
+        if !self.objects.restore_from(&self.store, cut) {
             return Ok(false);
         }
         following.map_or(Ok(()), |following| following.land(None))?;
@@ -196,7 +212,9 @@ impl Follower {
                 Some(Sent::Membership(told)) => {
                     let (epoch, change, row) =
                         worker_wire::told_change(told, now).map_err(Halt::Unread)?;
-                    self.store.follow(at, epoch, change, row);
+                    // Through the holder: the row's object is built, the
+                    // store takes the write, and the object is put.
+                    self.objects.follow_at(&self.store, at, epoch, change, row);
                 }
                 // A leader of this build sends no load row: this one is an
                 // older leader's. The store keeps none of its leader's, so
@@ -602,8 +620,12 @@ pub(crate) struct Standby {
 
 impl Standby {
     pub(crate) fn new(shared: Arc<Shared>, port: u16) -> Self {
-        let follower = Follower::new(Arc::clone(&shared.store), Arc::clone(&shared.feed.log))
-            .through(Arc::clone(&shared.generations));
+        let follower = Follower::new(
+            Arc::clone(&shared.store),
+            Arc::clone(&shared.feed.log),
+            Arc::clone(&shared.objects),
+        )
+        .through(Arc::clone(&shared.generations));
         Self {
             shared,
             follower,
@@ -994,9 +1016,10 @@ mod tests {
         engine::view::{LoadRow, WireModes, WorkerId},
         service::{
             controller::{
-                decision_slots::tests::followed,
+                decision_slots::tests::{followed, frame_for, lent_pick, preset},
                 election::LeasePlace,
                 replication::{journaled, journaled_from, parts, Replication},
+                worker_objects::{ObjectsWake, WorkerObjects},
             },
             elector::{ElectionSettings, Elector, TickOutcome},
             proto::policy_controller_server::{PolicyController, PolicyControllerServer},
@@ -1021,13 +1044,20 @@ mod tests {
         log.first().expect("every write is retained")
     }
 
+    /// A standby's applier over a replica's store and log, with the holder
+    /// of its worker objects as a controller keeps one.
+    fn applier((store, log): &Replica) -> Follower {
+        let objects = WorkerObjects::new(Arc::clone(store), ObjectsWake::default()).holder();
+        Follower::new(Arc::clone(store), Arc::clone(log), objects)
+    }
+
     /// A leader's store and log under term 1, and a standby's applier over
     /// its own.
     fn pair() -> (Replica, Follower, Replica) {
         let leader = replica();
         leader.0.set_term(1);
         let standby = replica();
-        let follower = Follower::new(Arc::clone(&standby.0), Arc::clone(&standby.1));
+        let follower = applier(&standby);
         (leader, follower, standby)
     }
 
@@ -1187,6 +1217,62 @@ mod tests {
         assert_eq!(told(&followed), told(&led));
         assert_eq!(follower.place(), led.head());
         assert!(told(&led).len() > 8, "{:?}", told(&led));
+    }
+
+    /// The holder of `follower`'s worker objects has the object of every
+    /// row `store` holds and of no other, each stating its row.
+    fn each_row_has_its_object(follower: &Follower, store: &MemoryStore) {
+        let (_, rows) = store.all_rows();
+        assert!(!rows.is_empty());
+        for row in &rows {
+            let object = follower.objects.object(row.id);
+            let object = object.expect("the row's object");
+            assert_eq!(follower.objects.row_of(&object).as_ref(), Some(row));
+        }
+        assert_eq!(follower.objects.len(), rows.len(), "an object a row");
+    }
+
+    /// The applier lays what it applies. Behind each batch the holder of
+    /// the standby's worker objects has the object of every row its table
+    /// holds and of no other, each stating its row, with no follow.
+    #[test]
+    fn a_standby_fed_the_leaders_log_holds_each_rows_object() {
+        let ((leader, led), follower, (standby, _)) = pair();
+        let at = Instant::now();
+        first(&leader, at);
+        follow(&follower, &led, at);
+        each_row_has_its_object(&follower, &standby);
+        rest(&leader, at);
+        follow(&follower, &led, at);
+        each_row_has_its_object(&follower, &standby);
+    }
+
+    /// A restore lays what it restores: the cut's rows have their objects
+    /// when it returns, with no follow.
+    #[test]
+    fn a_standby_restored_from_the_snapshot_holds_each_rows_object() {
+        let ((leader, _), follower, (standby, _)) = pair();
+        first(&leader, Instant::now());
+        assert_eq!(follower.restore(leader.checkpoint(), None), Ok(true));
+        each_row_has_its_object(&follower, &standby);
+    }
+
+    /// What the applier's way through the holder is for: a replica that
+    /// takes the lead right behind an applied event decides over that
+    /// event's worker. A decision over the holder's lists names the worker
+    /// its leader registered and made ready, with no follow run.
+    #[test]
+    fn a_replica_that_takes_the_lead_decides_over_its_last_applied_event() {
+        let ((leader, led), follower, (standby, _)) = pair();
+        let id = leader.upsert(facts("http://a:8000", 1)).id();
+        leader.set_status(id, WorkerStatus::Ready, 1);
+        follow(&follower, &led, Instant::now());
+        // The standby takes the lead, and applies a document of its own.
+        standby.set_term(2);
+        let applied = standby.apply(preset("round_robin", 1));
+        applied.expect("above the unbound start");
+        let named = lent_pick(&standby, &follower.objects, frame_for("m", 1, 1));
+        assert_eq!(named, Some(id));
     }
 
     /// The parts of the leader's snapshot at `at`, as its replication scope
@@ -1404,7 +1490,7 @@ mod tests {
         // A log whose places start at the start: its head is zero under no
         // term, the place of a standby that applied nothing and no ask.
         let (store, feed) = journaled_from(&LeasePlace::File("shared".into()), 0);
-        let follower = Follower::new(store, Arc::clone(&feed.log));
+        let follower = applier(&(store, Arc::clone(&feed.log)));
         assert_eq!(follower.place(), Position::default());
         assert_eq!(follower.asking(), Position { seq: 1, term: 0 });
         // Past it, the head's own number.
@@ -2966,7 +3052,7 @@ mod tests {
 
     /// A standby's applier over its own store and log, through `door`.
     fn through((store, log): &Replica, door: &Arc<Generations>) -> Follower {
-        Follower::new(Arc::clone(store), Arc::clone(log)).through(Arc::clone(door))
+        applier(&(Arc::clone(store), Arc::clone(log))).through(Arc::clone(door))
     }
 
     /// One entry as a leader's stream sends it: a generation with the
@@ -3015,7 +3101,7 @@ mod tests {
         // An applier with no door does not apply a generation: its standby
         // leaves the synced state at that place, the term's start applied.
         let other = replica();
-        let bare = Follower::new(Arc::clone(&other.0), Arc::clone(&other.1));
+        let bare = applier(&other);
         assert_eq!(bare.apply(&batch(&led[0]), at), Ok(()));
         assert_eq!(
             bare.apply(&sent(&leading, &led[1]), at),

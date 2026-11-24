@@ -1013,9 +1013,9 @@ mod sends {
     /// rule moves it under `delegate`
     /// (`model_gateway/src/policies/registry.rs`, `select_sticky`). The
     /// book reads the gateway's counts and the place a request went to,
-    /// and no word of the engine it is held against. No worker of these
-    /// cases stops taking requests, so a key's leading pin is the one pin
-    /// its rule reads.
+    /// and no word of the engine it is held against. No worker a key is
+    /// pinned on stops taking requests in these cases, so a key's leading
+    /// pin is the one pin its rule reads.
     #[derive(Default)]
     struct Pins(HashMap<&'static str, usize>);
 
@@ -1275,6 +1275,65 @@ mod sends {
                  worker took none"
             );
         }
+    }
+
+    /// Two requests of a key that meet its pin at the cap, the second
+    /// decided ahead of the first's dispatch, go to one worker. The
+    /// gateway's sticky map moves a pin where it selects the worker, ahead
+    /// of the request's dispatch (`select_sticky` in
+    /// `model_gateway/src/policies/registry.rs`: `pin_front` behind the
+    /// policy's pick for a pin over its cap). So the key's next request
+    /// follows the moved pin under its cap, and the policy is not asked
+    /// again. Under `round_robin` a second ask takes the rotation's next
+    /// turn: the key's requests would spread over a third worker, and the
+    /// key would lead with that one from then on.
+    #[test]
+    fn a_capped_keys_requests_follow_the_move_decided_ahead_of_its_dispatch() {
+        let engine = engine("round_robin", true);
+        let mut host = Host::new(&[0; 4]);
+        let (list, cell) = (Arc::clone(&host.list), ListCell::default());
+        let members = lent(&list, &cell);
+        let mut pins = Pins::default();
+        // Two requests of the key fill its pin's worker to the cap.
+        for nth in 0..2 {
+            let (guard, place, by) = host.decide(&engine, members, ("k1", 1_000, nth));
+            pins.rule(&host, "k1", (place, by));
+            pins.sent(&host, "k1", place, verdict(&guard));
+            host.sent(vec![guard], ("k1", nth), place);
+        }
+        let (first, _) = pins.of(&host, "k1");
+        // The third meets the cap: the policy places it on another worker,
+        // and the gateway's map moves the pin there as it selects.
+        let (third, moved, by) = host.decide(&engine, members, ("k1", 1_000, 2));
+        assert!(
+            pins.rule(&host, "k1", (moved, by)),
+            "the pin stands at its cap"
+        );
+        assert_ne!(Some(moved), first, "the rotation's next turn");
+        pins.sent(&host, "k1", moved, verdict(&third));
+        // The fourth is decided ahead of the third's dispatch.
+        let (fourth, place, by) = host.decide(&engine, members, ("k1", 1_000, 3));
+        assert_eq!(
+            (place, by),
+            (moved, PlacedBy::Rule),
+            "the fourth follows the pin the third's decision moved"
+        );
+        pins.rule(&host, "k1", (place, by));
+        pins.sent(&host, "k1", place, verdict(&fourth));
+        host.sent(vec![third], ("k1", 2), moved);
+        host.sent(vec![fourth], ("k1", 3), place);
+        // Behind both dispatches, and one end on that worker, the key leads
+        // with the worker it moved to.
+        let last = host.held.pop_back().expect("the fourth request");
+        host.ended(last, 4);
+        let (fifth, place, by) = host.decide(&engine, members, ("k1", 1_000, 4));
+        assert_eq!(
+            (place, by),
+            (moved, PlacedBy::Rule),
+            "the key leads with the worker it moved to"
+        );
+        pins.rule(&host, "k1", (place, by));
+        pins.sent(&host, "k1", place, verdict(&fifth));
     }
 
     /// `cache_aware` under the override, which no sheet of the gateway

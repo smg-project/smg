@@ -295,7 +295,7 @@ impl SglangScheduler for MockScheduler {
         request: Request<sg::GetLoadsRequest>,
     ) -> Result<Response<sg::GetLoadsResponse>, Status> {
         let loads: Vec<sg::SchedulerLoad> = self
-            .load_rows(request.into_inner().dp_rank)
+            .load_rows(request.into_inner().dp_rank)?
             .into_iter()
             .map(|(dp_rank, s)| sg::SchedulerLoad {
                 dp_rank,

@@ -57,6 +57,7 @@ pub(super) mod pair;
 pub(super) mod place;
 mod signals;
 mod single;
+mod stands_alone;
 pub(super) mod start;
 mod task;
 mod told_loads;
@@ -297,12 +298,17 @@ impl PoolMembers {
         }
     }
 
-    /// What the document says of the shadow of a single request of `model`
-    /// ([`ShadowWord`]): `None` under a binding that names no shadow. Found
-    /// once a list, as [`Self::alone`] is: a request of the list's model
-    /// pays no second read of its binding.
-    fn shadow(&self, spec: &AppliedSpec, model: &str) -> Option<ShadowWord> {
-        let find = || spec.engine().shadow_for(model, Phase::Single);
+    /// What the document says of the shadow of a request of `model` that
+    /// stands alone at `phase` ([`ShadowWord`]): `None` under a binding
+    /// that names no shadow. A single request's word is found once a list,
+    /// as [`Self::alone`] is: a request of the list's model pays no second
+    /// read of its binding. A binding matches by phase, so a request of
+    /// another phase asks the document each time.
+    fn shadow(&self, spec: &AppliedSpec, model: &str, phase: Phase) -> Option<ShadowWord> {
+        let find = || spec.engine().shadow_for(model, phase);
+        if phase != Phase::Single {
+            return find();
+        }
         let (named, shadow) = self.shadow.get_or_init(|| (model.into(), find()));
         if **named == *model {
             *shadow
@@ -419,13 +425,27 @@ impl PolicyEngine {
 
     /// Tells the document's stages one change of membership, on the calling
     /// thread, and not the session table. A stage that panics at it is held
-    /// here and counted ([`Self::unheard`]): the registration or the removal
+    /// and counted ([`Self::word_caught`]): the registration or the removal
     /// goes on.
     fn told(&self, change: &Membership<'_>) {
         let engine = self.document.spec.engine();
-        if let Err(payload) = catch_unwind(AssertUnwindSafe(|| engine.membership_stages(change))) {
-            release(payload);
-            self.unheard.fetch_add(1, Ordering::Relaxed);
+        self.word_caught(|| engine.membership_stages(change));
+    }
+
+    /// One word to the document's stages, `tell`, under a catch of its own:
+    /// what the word answers, and `None` where a stage panicked at it. The
+    /// panic is held here and counted ([`Self::unheard`]). The stages behind
+    /// the one that panicked do not hear the word, and what the word is of
+    /// goes on: a request, a registration or a removal.
+    #[inline]
+    fn word_caught<R>(&self, tell: impl FnOnce() -> R) -> Option<R> {
+        match catch_unwind(AssertUnwindSafe(tell)) {
+            Ok(answered) => Some(answered),
+            Err(payload) => {
+                release(payload);
+                self.unheard.fetch_add(1, Ordering::Relaxed);
+                None
+            }
         }
     }
 
@@ -436,15 +456,16 @@ impl PolicyEngine {
         &self.clock
     }
 
-    /// How many words of a lease (its dispatch, its end, its release) and
-    /// changes of membership panicked in a stage that heard them. The word
-    /// stands as said: the request, the registration or the removal it is
-    /// of goes on, and the stages after the one that panicked did not hear
-    /// it.
+    /// How many words of a lease (its issue, its dispatch, its end, its
+    /// release) and changes of membership panicked in a stage that heard
+    /// them. The word stands as said: the request, the registration or the
+    /// removal it is of goes on, and the stages after the one that panicked
+    /// did not hear it.
     ///
-    /// The issue of a decode at its own call is such a word too: the call
-    /// answers its pick all the same
-    /// ([`DecisionEngine::decide_decode_under`]).
+    /// A lease's issue is such a word at a first decision and at a decode's
+    /// own call alike: the call answers its pick and the lease all the same
+    /// ([`DecisionEngine::decide_under`],
+    /// [`DecisionEngine::decide_decode_under`]).
     #[must_use]
     pub fn unheard(&self) -> u64 {
         self.unheard.load(Ordering::Relaxed)
@@ -697,7 +718,7 @@ impl Loaded<'_, '_> {
         clock: impl FnOnce() -> Instant,
     ) -> Result<Decided, DecisionRefused> {
         let mut whole = None;
-        let alone = self.caught(|| self.placed_or(maker, clock, &mut whole))?;
+        let alone = self.decide_into(maker, clock, &mut whole)?;
         match (alone, whole) {
             (Some(pick), _) => Ok(Decided::Alone(pick)),
             (None, Some((decided, later))) => Ok(Decided::Whole(decided, later)),
@@ -705,6 +726,20 @@ impl Loaded<'_, '_> {
             // place.
             (None, None) => Err(DecisionRefused::Faulted),
         }
+    }
+
+    /// The decision of [`Self::decide_at`] for a caller that keeps the
+    /// room of a whole decision itself, as the call that places a request
+    /// does: the place it answers, or `None` with the decision written
+    /// into `whole` beside whether the request stated the later decode.
+    /// Its caller hands `whole` empty, and only a whole decision fills it.
+    pub(super) fn decide_into(
+        self,
+        maker: &impl RequestMaker,
+        clock: impl FnOnce() -> Instant,
+        whole: &mut Option<(DecideOutcome, bool)>,
+    ) -> Result<Option<AlonePick>, DecisionRefused> {
+        self.caught(|| self.placed_or(maker, clock, whole))
     }
 }
 
@@ -719,7 +754,8 @@ impl PolicyEngine {
     ///
     /// The request is made once and decided whole, at `now`, as
     /// [`Self::decide_at`] decides a request that is not plain
-    /// ([`RequestMaker::plain`]): a single over its host's list, a pair at
+    /// ([`RequestMaker::plain`]): a request that stands alone
+    /// ([`Loaded::stands_alone`]) over its host's one list, a pair at
     /// its prefill over its host's two lists ([`pair::decide`], the test
     /// of the request's wires in it), and a request that hands no such
     /// list over no worker. This entry never asks whether a request is
@@ -741,8 +777,9 @@ impl PolicyEngine {
     ///
     /// # Errors
     ///
-    /// [`DecisionRefused::PairSide`] for a decode or an encode request. A
-    /// decode behind its pair's prefill has an entry of its own
+    /// [`DecisionRefused::PairSide`] for a decode or an encode request
+    /// that is a side of its plan's pair, or that hands more than one
+    /// list. A decode behind its pair's prefill has an entry of its own
     /// ([`Self::decide_decode_without_lease`]).
     /// [`DecisionRefused::Faulted`] where the decision panicked.
     #[cfg_attr(
@@ -759,7 +796,11 @@ impl PolicyEngine {
             let mut request = own.made(maker);
             let mut said = None;
             let decision = match (request.facts.phase, maker.workers()) {
-                (Phase::Single, WorkerLists::Single(lent)) => {
+                // A single, and a request of a phase its plan pairs no side
+                // of: one profile over its host's one list.
+                (phase, WorkerLists::Single(lent))
+                    if own.stands_alone(request.facts.model, phase) =>
+                {
                     // The engine's own value of the list, asked of its
                     // cell.
                     let members = own.members_of(lent);
@@ -774,9 +815,22 @@ impl PolicyEngine {
                 ) => {
                     let read = self.loads_read(maker);
                     let loads = read.snapshot();
-                    Ok(pair::decide(own, &lists, &mut request, None, loads, now))
+                    let sends_to = |target: &_| maker.sends_to(target);
+                    Ok(pair::decide(
+                        own,
+                        &lists,
+                        &mut request,
+                        None,
+                        loads,
+                        now,
+                        sends_to,
+                    ))
                 }
                 (Phase::Single | Phase::Prefill, _) => Ok(single::over_none(own, &request)),
+                // A request that stands alone and hands no list.
+                (phase, WorkerLists::None) if own.stands_alone(request.facts.model, phase) => {
+                    Ok(single::over_none(own, &request))
+                }
                 (Phase::Decode | Phase::Encode, _) => Err(DecisionRefused::PairSide),
             };
             decision.map(|decision| (decision, said))
@@ -796,11 +850,8 @@ impl PolicyEngine {
     ///
     /// [`DecisionRefused::Faulted`] where the decision panicked.
     #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the controller's service calls it once it decides by this engine"
-        )
+        not(any(test, feature = "controller")),
+        expect(dead_code, reason = "a controller's deciding thread calls it")
     )]
     pub(crate) fn decide_decode_without_lease(
         &self,
@@ -815,7 +866,9 @@ impl PolicyEngine {
                 WorkerLists::Pair(lists) | WorkerLists::Encode(EncodeLists { pair: lists, .. }) => {
                     let read = self.loads_read(maker);
                     let loads = read.snapshot();
-                    pair::decide(own, &lists, &mut request, Some(held), loads, now)
+                    // The decode asked again is asked which decode it is sent to.
+                    let sends_to = |target: &_| maker.sends_to(target);
+                    pair::decide(own, &lists, &mut request, Some(held), loads, now, sends_to)
                 }
                 _ => single::over_none(own, &request),
             })
@@ -824,8 +877,9 @@ impl PolicyEngine {
 }
 
 impl Loaded<'_, '_> {
-    /// A made single request's whole decision over its host's list, for
-    /// every entry that decides one. It reads the snapshot the request
+    /// The whole decision of a made request that stands alone
+    /// ([`Self::stands_alone`]) over its host's list, for every entry that
+    /// decides one. It reads the snapshot the request
     /// gives where it gives one, and the newest the engine's own task
     /// keeps at hand otherwise ([`PolicyEngine::loads_read`]).
     ///
@@ -851,17 +905,20 @@ impl Loaded<'_, '_> {
         let read = self.loads_read(maker);
         let loads = read.snapshot();
         // Under a document a stage of which reads a named signal the
-        // list's word says whether this request's profile reads one.
+        // list's word says whether this request's profile reads one, at
+        // the request's own phase.
         let spec = &self.document.spec;
-        if self.document.signals && members.reads_signal(spec, request.facts.model, Phase::Single) {
+        let (model, phase) = (request.facts.model, request.facts.phase);
+        if self.document.signals && members.reads_signal(spec, model, phase) {
             return signals::decide(self, request, members, maker, loads, now, said);
         }
         self.decide_with_loads(request, members, maker, loads, now, said)
     }
 
     /// [`Self::decide_made`] behind its choice of the snapshot: the
-    /// decision of a made single request over `loads`, by its binding's
-    /// live profile and, where the binding names one, its shadow behind
+    /// decision of a made request that stands alone over `loads`, by the
+    /// live profile of its phase's binding and, where the binding names
+    /// one, its shadow behind
     /// it. A request that is lent its list's signal cells is decided here
     /// too, as the copy that carries them ([`signals::decide`]).
     ///
@@ -882,7 +939,8 @@ impl Loaded<'_, '_> {
         // Under a document that names a shadow the list's word says
         // whether this binding does.
         if self.document.any_shadow {
-            if let Some(binding) = members.shadow(&self.document.spec, request.facts.model) {
+            let (model, phase) = (request.facts.model, request.facts.phase);
+            if let Some(binding) = members.shadow(&self.document.spec, model, phase) {
                 let (decision, shadow) =
                     with_shadow::decide(self, request, members, maker, loads, now, binding);
                 *said = shadow;
@@ -944,7 +1002,9 @@ impl Loaded<'_, '_> {
         let mut request = self.made(maker);
         let later = request.constraints.decode_later;
         let decided = match (request.facts.phase, maker.workers()) {
-            (Phase::Single, WorkerLists::Single(lent)) => {
+            // A single, and a request of a phase its plan pairs no side of:
+            // one profile over its host's one list.
+            (phase, WorkerLists::Single(lent)) if self.stands_alone(request.facts.model, phase) => {
                 // The engine's own value of the list the request was made
                 // for: a maker may name its list while it makes the
                 // request. The cell the pick asked is not asked again.
@@ -971,13 +1031,17 @@ impl Loaded<'_, '_> {
             ) => {
                 let read = self.loads_read(maker);
                 let loads = read.snapshot();
-                let decided = pair::decided(self, &lists, &mut request, None, loads, now);
+                let sends_to = |target: &_| maker.sends_to(target);
+                let decided = pair::decided(self, &lists, &mut request, None, loads, now, sends_to);
                 *whole = Some((decided, later));
                 return Ok(None);
             }
             // A request that hands no list of its own is decided over
             // no worker.
             (Phase::Single | Phase::Prefill, _) => single::over_none(self, &request),
+            (phase, WorkerLists::None) if self.stands_alone(request.facts.model, phase) => {
+                single::over_none(self, &request)
+            }
             (Phase::Decode | Phase::Encode, _) => return Err(DecisionRefused::PairSide),
         };
         let decided = single::issued(self, decided, &request, now);
@@ -1032,7 +1096,9 @@ impl DecisionEngine for PolicyEngine {
                 WorkerLists::Pair(lists) | WorkerLists::Encode(EncodeLists { pair: lists, .. }) => {
                     let read = self.loads_read(maker);
                     let loads = read.snapshot();
-                    pair::decided(own, &lists, &mut request, Some(held), loads, now)
+                    // The decode asked again is asked which decode it is sent to.
+                    let sends_to = |target: &_| maker.sends_to(target);
+                    pair::decided(own, &lists, &mut request, Some(held), loads, now, sends_to)
                 }
                 _ => single::issued(own, single::over_none(own, &request), &request, now),
             })
@@ -1058,10 +1124,7 @@ impl DecisionEngine for PolicyEngine {
             // No lease is issued for a side on its own.
             Side::Decode | Side::Encode => {}
         };
-        if let Err(payload) = catch_unwind(AssertUnwindSafe(tell)) {
-            release(payload);
-            self.unheard.fetch_add(1, Ordering::Relaxed);
-        }
+        self.word_caught(tell);
     }
 
     // No lease is filed, so no pass ends one: a lease ends at its guard's

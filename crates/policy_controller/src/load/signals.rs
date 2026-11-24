@@ -186,6 +186,7 @@ impl SignalCells {
     }
 
     /// The cells, row after row.
+    #[cfg(all(test, feature = "in-process"))]
     pub(crate) fn cells(&self) -> &[SignalCell] {
         &self.cells
     }

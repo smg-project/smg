@@ -6,11 +6,17 @@
 //! by one formula on every host). A decision reads the table once and
 //! carries what it did with the key as its own verdict (on the pick, then
 //! the lease), so its commit moves the pins by that verdict alone: a hit
-//! leaves them, a respill fronts the worker taken. The one write before a
-//! commit is a fresh key's claim of the worker its decision chose, so
-//! concurrent first requests agree on one.
+//! leaves them, a respill fronts the worker taken. Two writes come before a
+//! commit. A fresh key's decision claims the worker it chose, so concurrent
+//! first requests agree on one. A decision that met its key's pin at the cap
+//! fronts the worker it placed the request on, so the key's next request
+//! follows the move ahead of that dispatch, as a gateway's sticky map moves
+//! a pin where it selects the worker.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::{
+    collections::hash_map,
+    sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+};
 
 use parking_lot::{Mutex, MutexGuard, RwLock};
 use rustc_hash::FxHashMap;
@@ -76,8 +82,9 @@ pub enum SessionVerdict {
     /// records the worker by the key's recovery.
     Pinned,
     /// The routable pin was at the in-flight cap and the stages placed the
-    /// request on another worker under the cap: the commit fronts the
-    /// worker it lands on.
+    /// request on another worker under the cap. The decision fronts that
+    /// worker where it is made, and the commit fronts the worker it lands
+    /// on.
     Respill,
     /// The key had no routable pin and the decision claimed the worker it
     /// placed the request on: that decision's commit confirms the claim on
@@ -150,6 +157,9 @@ pub(crate) enum Claim {
     /// the pins the key held: a shadow reads those against its own pins
     /// and its own pick.
     Standing(WorkerId, SessionPins),
+    /// The table is full and does not hold the key: nothing is recorded of
+    /// it, and its decision keeps the placement it made.
+    NoRoom,
 }
 
 impl Claim {
@@ -267,15 +277,9 @@ impl Entry {
     }
 }
 
-/// Shards of a table no host sized ([`SessionTable::new`]), and of the
-/// store's count of each key's requests in flight, by the key's low bits:
-/// keyed decisions on different keys take different locks.
-pub(crate) const SHARDS: usize = 16;
-
-/// The shard of `key` in the store's count of requests in flight.
-pub(crate) fn shard_of(key: u64) -> usize {
-    (key % SHARDS as u64) as usize
-}
+/// Shards of a table no host sized ([`SessionTable::new`]): keyed
+/// decisions on different keys take different locks.
+const SHARDS: usize = 16;
 
 /// The shards of a table whose keyed decisions run on every core of the
 /// host at once ([`SessionTable::with_shards`]): four a core, rounded up to
@@ -298,6 +302,18 @@ fn empty_shards(count: usize) -> Box<[Shard]> {
     (0..count).map(|_| Shard::default()).collect()
 }
 
+/// The most keys a table holds. A full table records no further key
+/// ([`SessionTable::slot`]): a request of such a key is placed with no pin
+/// until keys leave the table.
+const KEYS: usize = 4_194_304;
+
+/// How many keys a table holds, on cache lines of its own: a key that enters
+/// or leaves writes it, and a decision of a key the table holds reads none of
+/// its lines.
+#[derive(Debug, Default)]
+#[repr(align(128))]
+struct Held(AtomicUsize);
+
 /// How long a worker that left keeps its pins where no rule says a TTL:
 /// four hours, the TTL a rule takes where its document names none.
 pub const ABSENT_WORKER_PIN_TTL_MICROS: u64 = 14_400 * 1_000_000;
@@ -312,7 +328,8 @@ pub(crate) const ABSENT_WORKERS: usize = 4_096;
 /// list holds. At the bound the list starts over.
 pub(crate) const RENAMED_WORKERS: usize = 4_096;
 
-/// The session table: every key's pins, swept on the decision clock.
+/// The session table: the pins of the keys it holds, swept on the decision
+/// clock.
 ///
 /// A decision of a key takes one lock, the mutex of its key's shard. The
 /// read of the pins is a write: it renews the key's idle time, and starts a
@@ -325,6 +342,10 @@ pub struct SessionTable {
     /// The shards, a power of two of them: a key's shard is named by the
     /// key's bits above its low word ([`Self::shard`]).
     shards: Box<[Shard]>,
+    /// The keys the table holds: a key is counted before its entry is made
+    /// and given back behind the walk that takes it, each under its shard's
+    /// mutex, so the count is never under the entries.
+    held: Held,
     /// The decision clock at the next sweep, of the idle keys or of a
     /// worker that left: `u64::MAX` while neither is owed.
     next_sweep_micros: AtomicU64,
@@ -359,11 +380,12 @@ pub struct SessionTable {
     /// the id that stands for it ([`Self::rename_worker`]). A dispatch
     /// names the id its lease was issued on, and one that lands behind
     /// the rename is the standing worker's. [`RENAMED_WORKERS`] at most.
-    /// A dispatch reads this lock under its shard's. A rename writes it
-    /// with no shard held.
+    /// A dispatch and a respill's move read this lock under their shard's.
+    /// A rename writes it with no shard held.
     renamed: RwLock<FxHashMap<WorkerId, WorkerId>>,
-    /// How many ids the list holds: what a dispatch reads ahead of the
-    /// lock, so a table that renamed no worker asks nothing.
+    /// How many ids the list holds: what a dispatch and a respill's move
+    /// read ahead of the lock, so a table that renamed no worker asks
+    /// nothing.
     renamed_len: AtomicUsize,
     /// Whether a pass of the table's host sweeps it ([`Self::sweep_due`]):
     /// set at the first such pass, for good. A read of a key then runs no
@@ -380,6 +402,7 @@ impl SessionTable {
     pub fn new(sweep_micros: u64) -> Self {
         Self {
             shards: empty_shards(SHARDS),
+            held: Held::default(),
             next_sweep_micros: AtomicU64::new(if sweep_micros == 0 { u64::MAX } else { 0 }),
             next_pass_micros: AtomicU64::new(if sweep_micros == 0 { u64::MAX } else { 0 }),
             sweep_micros: AtomicU64::new(sweep_micros),
@@ -473,13 +496,41 @@ impl SessionTable {
         &self.shards[at].0
     }
 
+    /// The entry of `key` in its `shard`: the one the shard holds, or a new
+    /// one while the table holds fewer than [`KEYS`]. `None` for a key a
+    /// full table does not hold: nothing is recorded of it, and its request
+    /// is placed with no pin. Room comes back as keys leave
+    /// ([`Self::retain`]). An entry a claim or a dispatch makes where its
+    /// decision's read found no room is one no decision has read: the
+    /// key's next read starts it over ([`SessionExpiry::Unread`]).
+    /// Writers of different shards that race for the last room each take
+    /// it: the table can stand past [`KEYS`] by a key a shard at the most.
+    /// Always inlined: it stands on the pin's path of every keyed decision.
+    #[inline(always)]
+    fn slot<'a>(&self, shard: &'a mut FxHashMap<u64, Entry>, key: u64) -> Option<&'a mut Entry> {
+        match shard.entry(key) {
+            hash_map::Entry::Occupied(held) => Some(held.into_mut()),
+            hash_map::Entry::Vacant(free) => {
+                // A full table refuses by a read alone, and a key that
+                // enters writes the count once: no writer tries twice.
+                if self.held.0.load(Ordering::Relaxed) >= KEYS {
+                    return None;
+                }
+                self.held.0.fetch_add(1, Ordering::Relaxed);
+                Some(free.insert(Entry::default()))
+            }
+        }
+    }
+
     /// The pins of `key` at a decision taken at `now_micros` under `rule`,
     /// the key touched when its decision instant is not older (its TTL
     /// renewed, its recovery rule recorded) and the table swept when a sweep
     /// is due and the list's lock is free, where no pass of the table's
     /// host sweeps it ([`Self::sweep_due`]): under such a host a read walks
     /// no shard but its key's. A key never seen, or one past its end, has empty pins:
-    /// expiry is the key's own compare, the sweep only reclaims.
+    /// expiry is the key's own compare, the sweep only reclaims. So has a
+    /// key a full table does not hold, of which nothing is written
+    /// ([`Self::slot`]).
     /// Always inlined: the keyed decision has two forms, and a second caller
     /// would otherwise move this out of line under the first.
     #[inline(always)]
@@ -489,7 +540,9 @@ impl SessionTable {
             self.sweep_if_due(now_micros);
         }
         let mut shard = self.shard(key).lock();
-        let entry = shard.entry(key).or_default();
+        let Some(entry) = self.slot(&mut shard, key) else {
+            return [WorkerId(0); 2];
+        };
         if entry.expires_at_micros <= now_micros {
             // Expired and not yet swept: the key starts over here, under the
             // lock the sweep takes; the walk only reclaims what expired.
@@ -506,7 +559,7 @@ impl SessionTable {
     /// the newcomer among them is the claim to follow instead, when it is
     /// among this decision's survivors; the pin that stands is returned with
     /// the pins the key held ([`Claim::standing`] is the rule). The
-    /// claim is the one pin made before a commit, and it is marked as such:
+    /// claim is a pin made before a commit, and it is marked as such:
     /// any dispatch to it confirms it, the claiming decision's own dispatch
     /// elsewhere withdraws it (`dispatched`), the TTL sweeps it otherwise.
     /// Always inlined: the keyed decision has two forms, and a second caller
@@ -518,7 +571,9 @@ impl SessionTable {
             return Claim::Standing(target, seen);
         }
         let mut shard = self.shard(key).lock();
-        let entry = shard.entry(key).or_default();
+        let Some(entry) = self.slot(&mut shard, key) else {
+            return Claim::NoRoom;
+        };
         let Some(owner) = Claim::standing(&entry.pins, &seen, target) else {
             match entry.recovery {
                 Recovery::Latest => entry.front(target),
@@ -529,6 +584,39 @@ impl SessionTable {
             return Claim::Made(target);
         };
         Claim::Standing(owner, entry.pins)
+    }
+
+    /// A decision that met `key`'s routable pin at the cap and placed the
+    /// request on `target`, another worker under the cap, fronts that worker
+    /// where it is made. The key's next request follows the move ahead of
+    /// this one's dispatch, as a gateway's sticky map moves a pin where it
+    /// selects the worker. The move is no claim, and nothing takes it back:
+    /// the commit fronts the worker the request lands on, this one or an
+    /// alternate of its pick, and a request never dispatched leaves the pin
+    /// moved. Two decisions that read one pin at its cap both front, the
+    /// later one last, as their two commits do. No entry is made: a key
+    /// the table holds no more, as an empty key, is left to the commit.
+    /// A move on an id its worker had before it was registered again
+    /// fronts the id that stands ([`Self::standing`]), as a dispatch on
+    /// that id does.
+    pub(crate) fn respilled(&self, key: Session, target: WorkerId) {
+        let key = key.get();
+        if target == WorkerId(0) {
+            return;
+        }
+        if let Some(entry) = self.shard(key).lock().get_mut(&key) {
+            // The decision read its rows ahead of this write. In neither
+            // pin, its worker may have been registered again between the
+            // two: the dispatch behind this move finds the worker pinned
+            // and asks the renames no more, so the move asks them here.
+            let renamed = self.renamed_len.load(Ordering::Relaxed) != 0;
+            let target = if renamed && !entry.pins.contains(&target) {
+                self.standing(target)
+            } else {
+                target
+            };
+            entry.front(target);
+        }
     }
 
     /// The commit dispatched a decision for `key` to `target` under the
@@ -546,7 +634,9 @@ impl SessionTable {
             return;
         }
         let mut shard = self.shard(key).lock();
-        let entry = shard.entry(key).or_default();
+        let Some(entry) = self.slot(&mut shard, key) else {
+            return;
+        };
         // A dispatch to the claimed worker confirms the claim, whichever
         // decision commits there: the key was served on it, so a pin another
         // request already used is never withdrawn. Only the claiming
@@ -708,9 +798,10 @@ impl SessionTable {
     }
 
     /// The id that stands for `target`, the id a dispatch's lease was
-    /// issued on: its worker's own where the worker was registered again
-    /// since. Out of line: a dispatch asks only where its target is in
-    /// neither pin and the table renamed a worker.
+    /// issued on or a respill's decision read: its worker's own where the
+    /// worker was registered again since. Out of line: a dispatch and a
+    /// respill's move ask only where their target is in neither pin and
+    /// the table renamed a worker.
     #[cold]
     #[inline(never)]
     fn standing(&self, target: WorkerId) -> WorkerId {
@@ -741,10 +832,25 @@ impl SessionTable {
     /// The pins of `workers` leave every key, in one walk.
     fn drop_pins(&self, workers: &[WorkerId]) {
         for shard in &self.shards {
-            shard
-                .0
-                .lock()
-                .retain(|_, entry| Self::unpinned(entry, workers));
+            self.retain(shard, |entry| Self::unpinned(entry, workers));
+        }
+    }
+
+    /// Keeps the entries of `shard` that `keep` says stay, and gives the
+    /// room of the keys that left back to the table's count. A shard the
+    /// walk leaves under a quarter of what its map can hold gives the
+    /// spare storage back too, to twice its keys.
+    fn retain(&self, shard: &Shard, mut keep: impl FnMut(&mut Entry) -> bool) {
+        let mut keys = shard.0.lock();
+        let before = keys.len();
+        keys.retain(|_, entry| keep(entry));
+        let left = before - keys.len();
+        if left != 0 {
+            self.held.0.fetch_sub(left, Ordering::Relaxed);
+            let kept = keys.len();
+            if kept < keys.capacity() / 4 {
+                keys.shrink_to(2 * kept);
+            }
         }
     }
 
@@ -888,7 +994,7 @@ impl SessionTable {
             return;
         }
         for shard in &self.shards {
-            shard.0.lock().retain(|_, entry| {
+            self.retain(shard, |entry| {
                 let stays = !idle || entry.expires_at_micros > now_micros;
                 stays && Self::unpinned(entry, &ended)
             });
@@ -929,9 +1035,9 @@ impl SessionTable {
         })
     }
 
-    /// Keys the table holds.
+    /// Keys the table holds, by its count: no shard is locked.
     pub fn len(&self) -> usize {
-        self.shards.iter().map(|s| s.0.lock().len()).sum()
+        self.held.0.load(Ordering::Relaxed)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1563,6 +1669,97 @@ mod tests {
         assert!(table.is_empty());
     }
 
+    /// A respill's move, written ahead of its commit, fronts the worker
+    /// taken under either recovery, as the commit does. It makes no entry:
+    /// an empty key, an empty worker and a key the table holds no more
+    /// write nothing.
+    #[test]
+    fn a_respills_move_fronts_the_worker_taken_and_makes_no_entry() {
+        for rule in [RULE, ORIGINAL] {
+            let table = SessionTable::new(rule.sweep_micros);
+            table.lookup(s(7), 10, &rule);
+            table.dispatched(s(7), SessionVerdict::Pinned, WorkerId(1));
+            table.respilled(s(7), WorkerId(2));
+            assert_eq!(table.pins(s(7)), Some([WorkerId(2), WorkerId(1)]));
+            // The worker that leads already: nothing moves, and the commit
+            // finds the pins in place.
+            table.respilled(s(7), WorkerId(2));
+            table.dispatched(s(7), SessionVerdict::Respill, WorkerId(2));
+            assert_eq!(table.pins(s(7)), Some([WorkerId(2), WorkerId(1)]));
+            table.respilled(s(0), WorkerId(3));
+            table.respilled(s(7), WorkerId(0));
+            table.respilled(s(8), WorkerId(3));
+            assert_eq!(table.pins(s(7)), Some([WorkerId(2), WorkerId(1)]));
+            assert_eq!((table.pins(s(8)), table.len()), (None, 1));
+        }
+    }
+
+    /// Two decisions read one pin at its cap, and each takes another
+    /// worker. Both front, the later one last, and their commits front in
+    /// their own order: the pins end where the two commits alone leave
+    /// them.
+    #[test]
+    fn two_respills_of_one_capped_pin_both_front_the_later_one_last() {
+        let ends = [true, false].map(|moved| {
+            let table = SessionTable::new(RULE.sweep_micros);
+            table.lookup(s(7), 10, &RULE);
+            table.dispatched(s(7), SessionVerdict::Pinned, WorkerId(1));
+            // Both decisions read the pin ahead of either's move.
+            let read = [20, 21].map(|now| table.lookup(s(7), now, &RULE));
+            assert_eq!(read, [[WorkerId(1), WorkerId(0)]; 2]);
+            if moved {
+                table.respilled(s(7), WorkerId(2));
+                table.respilled(s(7), WorkerId(3));
+                assert_eq!(table.pins(s(7)), Some([WorkerId(3), WorkerId(2)]));
+            }
+            // The later decision's request is sent first.
+            table.dispatched(s(7), SessionVerdict::Respill, WorkerId(3));
+            table.dispatched(s(7), SessionVerdict::Respill, WorkerId(2));
+            table.pins(s(7))
+        });
+        assert_eq!(ends, [Some([WorkerId(2), WorkerId(3)]); 2]);
+    }
+
+    /// A respill's move beside a claim no commit has confirmed leaves the
+    /// claim to its own commit. On the claimed worker that commit confirms
+    /// it, and elsewhere it withdraws it. Whichever of the two commits
+    /// comes first, under either recovery, the pins end where the two
+    /// commits alone leave them.
+    #[test]
+    fn a_respills_move_beside_an_open_claim_ends_where_the_commits_alone_end() {
+        let (claimed, taken) = (WorkerId(1), WorkerId(2));
+        for rule in [RULE, ORIGINAL] {
+            for lands in [claimed, WorkerId(3)] {
+                for claim_first in [true, false] {
+                    let ends = [true, false].map(|moved| {
+                        let table = SessionTable::new(rule.sweep_micros);
+                        let seen = table.lookup(s(1), 10, &rule);
+                        assert_eq!(table.claim(s(1), seen, claimed), Claim::Made(claimed));
+                        if moved {
+                            table.respilled(s(1), taken);
+                            assert_eq!(table.pins(s(1)), Some([taken, claimed]));
+                        }
+                        let claims = SessionVerdict::Claimed(claimed);
+                        if claim_first {
+                            table.dispatched(s(1), claims, lands);
+                        }
+                        table.dispatched(s(1), SessionVerdict::Respill, taken);
+                        if !claim_first {
+                            table.dispatched(s(1), claims, lands);
+                        }
+                        table.pins(s(1))
+                    });
+                    assert_eq!(
+                        ends[0], ends[1],
+                        "{:?}: the claim's commit on {lands:?}, first: {claim_first}",
+                        rule.recovery
+                    );
+                    assert_eq!(ends[0].map(|pins| pins.contains(&taken)), Some(true));
+                }
+            }
+        }
+    }
+
     /// Two decisions on one key interleave: A reads, B reads, A notes its
     /// respill, B dispatches onto the failover pin (a hit, its instant is
     /// not the note's), then A dispatches onto it (the respill). The note is
@@ -1901,6 +2098,51 @@ mod tests {
         assert_eq!(table.renamed(), 2, "the two ids it left behind");
     }
 
+    /// A decision reads its rows ahead of its move, and a worker may be
+    /// registered again between the two. The move fronts the id that
+    /// stands where the rename is over and where its walk has not reached
+    /// the key. A pin the walk has yet to rename leads under the id it
+    /// had, and the walk renames it there, as it renames a move made
+    /// ahead of the whole rename. The dispatch on the id the worker had
+    /// finds the pins in place, and no pin names an id no row holds.
+    #[test]
+    fn a_respills_move_on_the_id_a_worker_had_fronts_the_id_that_stands() {
+        let table = SessionTable::new(RULE.sweep_micros);
+        for key in [1, 2, 4] {
+            table.lookup(s(key), 10, &RULE);
+            table.dispatched(s(key), SessionVerdict::Pinned, WorkerId(2));
+        }
+        table.lookup(s(3), 10, &RULE);
+        table.dispatched(s(3), SessionVerdict::Pinned, WorkerId(4));
+        table.dispatched(s(3), SessionVerdict::Pinned, WorkerId(2));
+        assert_eq!(table.pins(s(3)), Some([WorkerId(2), WorkerId(4)]));
+        // The whole rename is ahead of the move.
+        table.rename_worker(WorkerId(1), WorkerId(11));
+        table.respilled(s(1), WorkerId(1));
+        assert_eq!(table.pins(s(1)), Some([WorkerId(11), WorkerId(2)]));
+        // The rename's first half: remembered, the shards not yet walked.
+        table.remember(WorkerId(3), WorkerId(13));
+        table.respilled(s(2), WorkerId(3));
+        assert_eq!(table.pins(s(2)), Some([WorkerId(13), WorkerId(2)]));
+        // The same half where the worker is the key's failover: its pin
+        // leads as it stands, and the walk renames it.
+        table.remember(WorkerId(4), WorkerId(14));
+        table.respilled(s(3), WorkerId(4));
+        assert_eq!(table.pins(s(3)), Some([WorkerId(4), WorkerId(2)]));
+        // The move is ahead of the whole rename.
+        table.respilled(s(4), WorkerId(5));
+        assert_eq!(table.pins(s(4)), Some([WorkerId(5), WorkerId(2)]));
+        for (had, stands) in [(3, 13), (4, 14), (5, 15)] {
+            table.rename_worker(WorkerId(had), WorkerId(stands));
+        }
+        for (key, had, stands) in [(1, 1, 11), (2, 3, 13), (3, 4, 14), (4, 5, 15)] {
+            let led = Some([WorkerId(stands), WorkerId(2)]);
+            assert_eq!(table.pins(s(key)), led, "key {key} behind the renames");
+            table.dispatched(s(key), SessionVerdict::Respill, WorkerId(had));
+            assert_eq!(table.pins(s(key)), led, "key {key} behind its dispatch");
+        }
+    }
+
     /// A claim's commit elsewhere withdraws it inside a rename's walk too:
     /// the renames already say the new id, the entry still holds the old
     /// one, and the claim is matched by the id its lease names.
@@ -2186,6 +2428,45 @@ mod tests {
             least >= Some(&50) && most <= Some(&200),
             "a share of 100 a shard: {least:?} to {most:?}"
         );
+    }
+
+    /// A full table records no further key, in whichever shard it falls:
+    /// such a key reads no pin, is written none and claims none, while the
+    /// keys the table holds are answered. Keys that leave at their end give
+    /// their room back, and their shard its spare storage.
+    #[test]
+    fn a_full_table_records_no_further_key_and_answers_the_keys_it_holds() {
+        let table = SessionTable::new(RULE.sweep_micros);
+        for key in 1..=8 {
+            table.lookup(s(key), 10, &RULE);
+            table.dispatched(s(key), SessionVerdict::Pinned, WorkerId(1));
+        }
+        // One key under the 4,194,304 a table holds: the count stands for
+        // the keys no test inserts, and key 9 takes the last room.
+        table.held.0.store(4_194_303, Ordering::Relaxed);
+        table.lookup(s(9), 10, &RULE);
+        table.dispatched(s(9), SessionVerdict::Pinned, WorkerId(1));
+        assert_eq!(table.held.0.load(Ordering::Relaxed), KEYS);
+        // A key of another shard finds the table full.
+        let fresh = s(1 << 32);
+        let none = [WorkerId(0); 2];
+        assert_eq!(table.lookup(fresh, 20, &RULE), none);
+        assert_eq!(table.claim(fresh, none, WorkerId(2)), Claim::NoRoom);
+        table.dispatched(fresh, SessionVerdict::Pinned, WorkerId(2));
+        assert_eq!(table.pins(fresh), None);
+        // A key the table holds is read and renewed as before.
+        assert_eq!(table.lookup(s(1), 500, &RULE), [WorkerId(1), WorkerId(0)]);
+        // The other eight end at 1 100 and leave at the pass.
+        let room = table.shards[0].0.lock().capacity();
+        table.sweep_due(1_200);
+        assert_eq!(table.held.0.load(Ordering::Relaxed), KEYS - 8);
+        assert!(table.shards[0].0.lock().capacity() < room);
+        assert_eq!(table.lookup(fresh, 1_200, &RULE), none);
+        assert_eq!(
+            table.claim(fresh, none, WorkerId(2)),
+            Claim::Made(WorkerId(2))
+        );
+        assert_eq!(table.held.0.load(Ordering::Relaxed), KEYS - 7);
     }
 
     #[test]

@@ -333,6 +333,53 @@ fn every_pool_reads_one_membership_epoch_that_a_new_pool_moves() {
     assert_eq!(facts.membership_epoch, 2);
 }
 
+/// A list builds its column of demand facts where a worker of it states
+/// one, and whether a worker registered a data-parallel rank is no such
+/// fact. A list of rank workers that states nothing builds no column, as a
+/// list of plain workers builds none, and each of its workers meets a
+/// request that demands nothing of them. A list with one worker that
+/// states a runtime builds the column.
+#[test]
+fn a_list_of_rank_workers_builds_no_demand_column() {
+    let spec = applied("least_load");
+    let clock = DecisionClock::new();
+    let rank = |rank: usize| -> Arc<dyn Worker> {
+        Arc::new(
+            <BasicWorkerBuilder>::from_spec(WorkerSpec {
+                dp_base_url: Some("grpc://engine:9000".to_owned()),
+                dp_rank: Some(rank),
+                dp_size: Some(2),
+                ..WorkerSpec::new(format!("grpc://engine:9000@{rank}"))
+            })
+            .health_config(no_health_check())
+            .build(),
+        )
+    };
+    let ranked = vec![rank(0), rank(1)];
+    assert!(ranked.iter().all(|worker| worker.is_dp_aware()));
+    let pool = PoolRecords::new(&ranked, &spec, &clock);
+    assert!(pool.demand_facts.is_none());
+    let mut kept = Vec::new();
+    assert_eq!(pool.meeting(Demands::default(), None, &mut kept), None);
+    assert_eq!(kept, [0, 1]);
+    assert!(PoolRecords::new(&fleet(2), &spec, &clock)
+        .demand_facts
+        .is_none());
+
+    let stated = PoolRecords::with_fixed_facts(&ranked, &spec, &clock, |worker| FixedFacts {
+        demands: DemandFacts {
+            runtime: u32::from(worker.url().ends_with("@1")),
+            ..DemandFacts::default()
+        },
+        ..FixedFacts::default()
+    });
+    let column = stated.demand_facts.as_deref().expect("a column");
+    assert_eq!(
+        column.iter().map(|facts| facts.runtime).collect::<Vec<_>>(),
+        [0, 1]
+    );
+}
+
 #[test]
 fn the_ranks_of_one_engine_are_listed_together_and_a_plain_pool_lists_none() {
     let spec = applied("least_load");

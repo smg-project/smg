@@ -1,4 +1,4 @@
-//! What the controller's and the load driver's test binaries share, included
+//! What the controller's test binaries share, included
 //! by path so each binary compiles only what it uses: a loopback address, one
 //! HTTP/1.1 GET over a plain socket and the process's resident size.
 

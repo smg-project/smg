@@ -19,13 +19,18 @@ use crate::{
 
 /// The overload thresholds an object states for each signal its row names
 /// none for: the worker crate's two default numbers, which a gateway hands
-/// its workers too. They are the policy document's two default numbers
+/// each worker of an engine too. An external row's object takes none, as a
+/// gateway's external worker takes none at its registration. They are this
+/// crate's own two defaults, by which the store judges under a binding
+/// whose block is on
 /// ([`OVERLOAD_WAITING_REQUESTS`](crate::document::spec::OVERLOAD_WAITING_REQUESTS),
-/// [`OVERLOAD_TOKEN_USAGE`](crate::document::spec::OVERLOAD_TOKEN_USAGE)).
-/// One set a worker: a registration's own values, each over these.
+/// [`OVERLOAD_TOKEN_USAGE`](crate::document::spec::OVERLOAD_TOKEN_USAGE)):
+/// no document names a threshold.
+/// One set a worker: a registration's own values, each over these for an
+/// engine's worker.
 ///
 /// The usage is the worker crate's 64-bit number, as an engine reports it.
-/// The document's constant is 32 bits wide: widened, it reads just above
+/// This crate's constant is 32 bits wide: widened, it reads just above
 /// the 0.8 an engine reports, and a worker at the threshold would not be
 /// over it.
 const OVERLOAD_DEFAULTS: OverloadThresholds = OverloadThresholds {
@@ -40,9 +45,10 @@ const OVERLOAD_DEFAULTS: OverloadThresholds = OverloadThresholds {
 /// here. The replica cannot dial a row that one gateway alone reaches: such
 /// a row's object is built with its checks off, and no probe is sent to it.
 ///
-/// Each object states its row's overload thresholds over the program's
-/// default ([`OVERLOAD_DEFAULTS`]): what a load monitor over the registry
-/// judges the worker by ([`load_monitor`](crate::worker_host::load_monitor)).
+/// The object of an engine's row states its row's overload thresholds over
+/// the program's default ([`OVERLOAD_DEFAULTS`]), and an external row's
+/// object its row's alone: what a load monitor over the registry judges
+/// the worker by ([`load_monitor`](crate::worker_host::load_monitor)).
 /// The service runs that monitor while the replica leads, and it writes
 /// each verdict on the worker's object.
 ///
@@ -328,7 +334,11 @@ mod tests {
         let leader = Replica::new();
         leader.store.set_term(1);
         let standby = Replica::new();
-        let follower = Follower::new(Arc::clone(&standby.store), Arc::clone(&standby.feed.log));
+        let follower = Follower::new(
+            Arc::clone(&standby.store),
+            Arc::clone(&standby.feed.log),
+            standby.workers.holder(),
+        );
         let row = |store: &MemoryStore| store.by_key(URL).expect("a row");
         let writes: [Write<'_>; 6] = [
             ("a registration", &|store| {
@@ -373,10 +383,12 @@ mod tests {
         standby.stopped().await;
     }
 
-    /// A standby that takes its leader's rows whole is woken by the log's
-    /// restart, and holds the objects of those rows.
+    /// A store that takes another's rows whole with no turn of the holder
+    /// wakes the follower by the log's restart, and the follower lays the
+    /// objects of those rows. A standby's applier restores in the holder's
+    /// turn: this is the restore that went around it.
     #[tokio::test(start_paused = true)]
-    async fn a_standby_restored_from_its_leaders_cut_holds_the_objects_of_its_rows() {
+    async fn a_restore_around_the_holder_is_laid_at_the_logs_restart() {
         let leader = Replica::new();
         leader.store.set_term(1);
         leader.store.upsert(facts(1, 1));
@@ -384,9 +396,9 @@ mod tests {
         let standby = Replica::new();
         standby.caught_up("the standby's start").await;
         assert!(standby.held().is_empty());
-        let follower = Follower::new(Arc::clone(&standby.store), Arc::clone(&standby.feed.log));
         let cut = leader.store.checkpoint();
-        assert_eq!(follower.restore(cut, None), Ok(true));
+        assert!(standby.store.restore_from(cut));
+        assert!(standby.held().is_empty(), "the follower's to lay");
         standby.caught_up("the restore").await;
         assert_eq!(standby.held(), leader.held());
         assert_eq!(standby.held().len(), 1);

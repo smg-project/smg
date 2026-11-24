@@ -89,6 +89,7 @@ use crate::{
                 PrefillLoadGuard, PrefillSelectionContext,
             },
             request_lease::{ReleasePoint, RequestLease, RoutingDerivatives},
+            responses_compat::lower_responses_request_for_local_backend,
             retry::{
                 is_request_timeout, is_retryable_response, request_timeout_response, RetryExecutor,
             },
@@ -771,7 +772,7 @@ impl PDRouter {
     /// reserves its estimate once, before any dispatch, and the one answer
     /// the dispatch paths converge on resolves the reservation once
     /// (`tenant_rate_limit`), as the regular HTTP router's typed route does.
-    async fn execute_dual_dispatch<T: TenantCharge + Serialize>(
+    async fn execute_dual_dispatch<T: TenantCharge + Serialize + GenerationRequest>(
         &self,
         headers: Option<&HeaderMap>,
         tenant_meta: Option<&TenantRequestMeta>,
@@ -843,7 +844,16 @@ impl PDRouter {
             // Retries disabled: one dispatch; the lease frees the parsed
             // request as soon as its serialized sides exist.
             let res = self
-                .execute_dual_dispatch_attempt(0, headers, &lease, context, &ledger, &tried, false)
+                .execute_dual_dispatch_attempt(
+                    0,
+                    headers,
+                    &lease,
+                    GenerationRequest::max_output_tokens,
+                    context,
+                    &ledger,
+                    &tried,
+                    false,
+                )
                 .await;
             // Mirror the retry executor's exhaustion accounting for a
             // retryable response that gets no retry.
@@ -863,7 +873,14 @@ impl PDRouter {
                         let context = context.clone();
                         async move {
                             self.execute_dual_dispatch_attempt(
-                                attempt, headers, lease, context, ledger, tried, false,
+                                attempt,
+                                headers,
+                                lease,
+                                GenerationRequest::max_output_tokens,
+                                context,
+                                ledger,
+                                tried,
+                                false,
                             )
                             .await
                         }
@@ -954,7 +971,8 @@ impl PDRouter {
         // Chat's PdRoute uses batch_size for its sampling fanout n, not a
         // batch of prompts. Each independent chat child is one conversation.
         // Completions' actual prompt batch size remains unchanged/refused.
-        if context.route == "/v1/chat/completions" {
+        let is_chat = context.route == "/v1/chat/completions";
+        if is_chat {
             context.batch_size = None;
         }
         let n = body.get("n").and_then(Value::as_u64).unwrap_or(1);
@@ -1029,6 +1047,24 @@ impl PDRouter {
                     attempt,
                     Some(&child_headers),
                     &child_lease,
+                    move |request: &Value| {
+                        // The child is the original typed wire rendering, with
+                        // only n and request_id changed. Match its protocol's
+                        // accessor, and read this child's lease only where the
+                        // policy engine actually makes a decision.
+                        let limit = if is_chat {
+                            request
+                                .get("max_completion_tokens")
+                                .filter(|value| !value.is_null())
+                                .or_else(|| request.get("max_tokens"))
+                        } else {
+                            // For completions max_completion_tokens is opaque.
+                            request.get("max_tokens")
+                        };
+                        limit
+                            .and_then(Value::as_u64)
+                            .and_then(|limit| u32::try_from(limit).ok())
+                    },
                     child_context,
                     ledger,
                     tried,
@@ -1275,11 +1311,12 @@ impl PDRouter {
         clippy::too_many_arguments,
         reason = "one attempt keeps the retry ledger and independent MoRI-IO child identity"
     )]
-    async fn execute_dual_dispatch_attempt<T: Serialize>(
+    async fn execute_dual_dispatch_attempt<T: Serialize + Send + Sync>(
         &self,
         attempt: u32,
         headers: Option<&HeaderMap>,
         lease: &RequestLease<T>,
+        output_limit: impl Fn(&T) -> Option<u32> + Send + Sync,
         context: PDRequestContext<'_>,
         ledger: &AttemptLedger,
         tried: &parking_lot::Mutex<Vec<String>>,
@@ -1329,6 +1366,13 @@ impl PDRouter {
                     tried: &tried_before,
                 },
                 sticky_key,
+                // The body's output limit, for the policy engine alone. The
+                // selection may wait for admission, so what rides with it
+                // is the lease's reference: the body is read where the
+                // engine decides and nowhere else.
+                move || {
+                    lease.with_view(|view| placement::Stated::of_limit(output_limit(view.request)))
+                },
             )
             .await;
         let ((prefill, decode), guards) = match selected {
@@ -3041,18 +3085,24 @@ impl PDRouter {
     }
 
     /// Select a PD pair and take its load. With Prefill admission enabled
-    /// the selection runs at the head of the admission queue.
+    /// the selection runs at the head of the admission queue. `stated`
+    /// states what the policy engine alone reads of the request
+    /// ([`placement::Stated`]): the pair placement makes that call where
+    /// the engine decides and nowhere else. The call rides with the
+    /// selection while it waits, for a pair the classic policies pick too:
+    /// that is what a classic pair selection pays for it.
     async fn select_pd_pair_with_admission(
         &self,
         model_id: &str,
         inputs: PlacementInputs<'_>,
         sticky_key: Option<&str>,
+        stated: impl Fn() -> placement::Stated + Send + Sync,
     ) -> Result<(PdPair, PdLoadGuards), Box<PdSelectionFailure>> {
         let ((prefill, decode), prefill_guard) = acquire_prefill(
             self.prefill_admission.as_deref(),
             sticky_key,
             |(prefill, _): &(Placed, Placed)| prefill,
-            |capacity| self.select_pd_pair(model_id, inputs, capacity),
+            |capacity| self.select_pd_pair(model_id, inputs, capacity, &stated),
         )
         .await
         .map_err(|error| Box::new(PdSelectionFailure::from(error)))?;
@@ -3126,6 +3176,7 @@ impl PDRouter {
         model_id: &str,
         inputs: PlacementInputs<'_>,
         prefill_capacity: Option<&PrefillSelectionContext<'_>>,
+        stated: impl FnOnce() -> placement::Stated,
     ) -> Result<(Placed, Placed), Box<PairFailure>> {
         debug!("Selecting PD pair: model_id={:?}", model_id);
         let pairs = self.pd_pairs(model_id);
@@ -3137,10 +3188,7 @@ impl PDRouter {
             None,
             prefill_capacity,
             inputs,
-            // The pair route states nothing for the policy engine alone:
-            // its selection runs inside the admission's wait, where a
-            // reading of the body would ride for a classic pair too.
-            placement::Stated::nothing,
+            stated,
         )?;
 
         Ok((pair.prefill, pair.decode))
@@ -3692,30 +3740,33 @@ impl RouterTrait for PDRouter {
         // Note: This endpoint actually causes the model to generate tokens, so we only test one pair
 
         // Select a random worker pair using the policy
-        let (prefill, decode) =
-            match self.select_pd_pair(UNKNOWN_MODEL_ID, PlacementInputs::default(), None) {
-                Ok(pair) => pair,
-                // A deep probe that generates gets the same answer routing does:
-                // an all-vetoed fleet fails the probe, exactly as an all-circuit-
-                // broken one already did.
-                Err(failure) => match Self::pair_failure(*failure) {
-                    PdSelectionFailure::Shed(shed) => return shed,
-                    PdSelectionFailure::Incompatible(e) => {
-                        return error::service_unavailable("no_compatible_pd_pair", e);
-                    }
-                    PdSelectionFailure::Unavailable(e) => {
-                        return error::service_unavailable(
-                            "no_healthy_worker_pair",
-                            format!("No healthy worker pair available: {e}"),
-                        );
-                    }
-                    // The probe does not go through admission.
-                    rejection @ (PdSelectionFailure::QueueFull
-                    | PdSelectionFailure::QueueTimeout) => {
-                        return Self::handle_server_selection_error(rejection);
-                    }
-                },
-            };
+        let (prefill, decode) = match self.select_pd_pair(
+            UNKNOWN_MODEL_ID,
+            PlacementInputs::default(),
+            None,
+            placement::Stated::nothing,
+        ) {
+            Ok(pair) => pair,
+            // A deep probe that generates gets the same answer routing does:
+            // an all-vetoed fleet fails the probe, exactly as an all-circuit-
+            // broken one already did.
+            Err(failure) => match Self::pair_failure(*failure) {
+                PdSelectionFailure::Shed(shed) => return shed,
+                PdSelectionFailure::Incompatible(e) => {
+                    return error::service_unavailable("no_compatible_pd_pair", e);
+                }
+                PdSelectionFailure::Unavailable(e) => {
+                    return error::service_unavailable(
+                        "no_healthy_worker_pair",
+                        format!("No healthy worker pair available: {e}"),
+                    );
+                }
+                // The probe does not go through admission.
+                rejection @ (PdSelectionFailure::QueueFull | PdSelectionFailure::QueueTimeout) => {
+                    return Self::handle_server_selection_error(rejection);
+                }
+            },
+        };
 
         let prefill_url = prefill.endpoint_url("/health_generate");
         let (prefill_result, decode_result) = tokio::join!(
@@ -4003,9 +4054,12 @@ impl RouterTrait for PDRouter {
         &self,
         headers: Option<&HeaderMap>,
         tenant_meta: &TenantRequestMeta,
-        body: ResponsesRequest,
+        mut body: ResponsesRequest,
         model_id: &str,
     ) -> Response {
+        if let Err(response) = lower_responses_request_for_local_backend(&mut body) {
+            return response;
+        }
         self.route_pd(headers, Some(tenant_meta), body, model_id)
             .await
     }
@@ -4992,7 +5046,12 @@ mod tests {
             .worker_registry
             .register_or_replace(Arc::from(decode_worker));
 
-        let result = router.select_pd_pair(UNKNOWN_MODEL_ID, PlacementInputs::default(), None);
+        let result = router.select_pd_pair(
+            UNKNOWN_MODEL_ID,
+            PlacementInputs::default(),
+            None,
+            placement::Stated::nothing,
+        );
 
         assert!(result.is_ok());
         let (prefill, _decode) = result.unwrap();
@@ -5017,13 +5076,23 @@ mod tests {
         }
 
         let (prefill, decode) = router
-            .select_pd_pair("GLM-5.2-Coding", PlacementInputs::default(), None)
+            .select_pd_pair(
+                "GLM-5.2-Coding",
+                PlacementInputs::default(),
+                None,
+                placement::Stated::nothing,
+            )
             .expect("alias should select a PD pair");
         assert_eq!(prefill.url(), "http://prefill");
         assert_eq!(decode.url(), "http://decode");
 
         assert!(router
-            .select_pd_pair("GLM-5.2-Unknown", PlacementInputs::default(), None)
+            .select_pd_pair(
+                "GLM-5.2-Unknown",
+                PlacementInputs::default(),
+                None,
+                placement::Stated::nothing,
+            )
             .is_err());
     }
 
@@ -5031,7 +5100,12 @@ mod tests {
     async fn test_empty_worker_lists() {
         let router = create_test_pd_router();
 
-        let result = router.select_pd_pair(UNKNOWN_MODEL_ID, PlacementInputs::default(), None);
+        let result = router.select_pd_pair(
+            UNKNOWN_MODEL_ID,
+            PlacementInputs::default(),
+            None,
+            placement::Stated::nothing,
+        );
 
         assert!(result.is_err());
         // No workers at all is the pre-existing unavailable string, not a shed:
@@ -6070,6 +6144,88 @@ mod tests {
             .is_empty());
     }
 
+    /// The count route asks the pair's text question, and its request is
+    /// decided as a single one over the prefill pool: by the model's main
+    /// policy under the classic policies, by the binding of single requests
+    /// under the policy engine. Beside a cache-aware main policy with
+    /// round-robin sides the two sides read no text. So neither kind builds
+    /// the count's text, and both place it on the same worker, the one that
+    /// holds less.
+    #[tokio::test]
+    async fn a_count_beside_quiet_sides_is_placed_with_no_text_under_either_kind() {
+        use smg_policy_controller::document::AppliedSpec;
+
+        use crate::{
+            config::types::{RouterConfig, RoutingMode},
+            policies::Side,
+        };
+
+        let settings = RouterConfig {
+            mode: RoutingMode::PrefillDecode {
+                prefill_urls: Vec::new(),
+                decode_urls: Vec::new(),
+                prefill_policy: Some(PolicyConfig::RoundRobin),
+                decode_policy: Some(PolicyConfig::RoundRobin),
+            },
+            policy: PolicyConfig::cache_aware(0.5, 32, 1.1, 0, 4096),
+            ..Default::default()
+        };
+        let classic = PolicyRegistry::new(settings.policy.clone());
+        let engine = PolicyRegistry::for_policy_engine(
+            settings.policy.clone(),
+            settings.routing_key_override.clone(),
+        );
+        let document = settings.policy_document().expect("the settings' document");
+        engine_on(
+            &engine,
+            AppliedSpec::validate(&document).expect("a valid document"),
+        );
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+        let body = || -> CountMessageTokensRequest {
+            serde_json::from_value(json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": "count me"}],
+            }))
+            .expect("valid count_tokens request")
+        };
+        for (kind, policies) in [("classic", classic), ("engine", engine)] {
+            // The router factory names each side's policy at the start.
+            for side in [Side::Prefill, Side::Decode] {
+                policies.set_side_policy(side, &PolicyConfig::RoundRobin);
+            }
+            let router = PDRouter {
+                policy_registry: Arc::new(policies),
+                ..create_test_pd_router()
+            };
+            let reads = router.policies_need_request_text();
+            let (text, _) = PDRouter::count_tokens_routing_text(body(), reads);
+            assert!(text.is_none(), "{kind}: the two sides read no text");
+
+            let (busy_url, busy_seen) = spawn_recording_stub(r#"{"input_tokens":42}"#).await;
+            let (idle_url, idle_seen) = spawn_recording_stub(r#"{"input_tokens":42}"#).await;
+            let busy: Arc<dyn Worker> =
+                Arc::from(create_test_worker(busy_url, WorkerType::Prefill, true));
+            let idle: Arc<dyn Worker> =
+                Arc::from(create_test_worker(idle_url, WorkerType::Prefill, true));
+            for _ in 0..3 {
+                busy.increment_load();
+            }
+            for worker in [busy, idle] {
+                router.worker_registry.register_or_replace(worker);
+            }
+            let response = router
+                .route_messages_count_tokens(None, &tenant, body(), UNKNOWN_MODEL_ID)
+                .await;
+            assert_eq!(response.status(), StatusCode::OK, "{kind}");
+            let arrived = [&busy_seen, &idle_seen].map(|seen| {
+                seen.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .len()
+            });
+            assert_eq!(arrived, [0, 1], "{kind}: the worker that holds less");
+        }
+    }
+
     /// The prefill/decode relay renders no prompt either: `max_tokens: 0` is
     /// refused with the 400 naming the field before any side is dispatched, and
     /// neither worker sees the request; a positive `max_tokens` takes both sides.
@@ -7006,6 +7162,190 @@ mod tests {
         {
             assert_eq!(worker.load(), 0, "request load guard leaked");
         }
+    }
+
+    /// With retries disabled the provisional parent's lease is released
+    /// before children select. Each child must still state its own body's
+    /// limit, under capacity-one admission too. The expectation comes from
+    /// the real protocol accessor, including chat precedence and the opaque
+    /// completions extension, rather than another copy of the Value reader.
+    #[tokio::test]
+    async fn moriio_choice_limits_follow_the_typed_protocol_after_parent_release() {
+        for admission in [false, true] {
+            for mode in ["read", "write"] {
+                for (route, caps, expected) in [
+                    (
+                        "/v1/chat/completions",
+                        json!({"max_tokens": 23, "max_completion_tokens": 73}),
+                        73,
+                    ),
+                    (
+                        "/v1/chat/completions",
+                        json!({"max_tokens": 23, "max_completion_tokens": null}),
+                        23,
+                    ),
+                    ("/v1/chat/completions", json!({"max_tokens": 23}), 23),
+                    (
+                        "/v1/completions",
+                        json!({"max_tokens": 23, "max_completion_tokens": 73}),
+                        23,
+                    ),
+                ] {
+                    let mut body = caps;
+                    body["model"] = json!("m");
+                    body["n"] = json!(2);
+                    let typed_limit = if route == "/v1/chat/completions" {
+                        body["messages"] = json!([{"role": "user", "content": "hi"}]);
+                        let typed: ChatCompletionRequest = serde_json::from_value(body.clone())
+                            .expect("a valid typed chat request");
+                        typed.max_output_tokens()
+                    } else {
+                        body["prompt"] = json!("hi");
+                        let typed: CompletionRequest = serde_json::from_value(body.clone())
+                            .expect("a valid typed completion request");
+                        typed.max_output_tokens()
+                    };
+                    assert_eq!(typed_limit, Some(expected));
+
+                    let (prefill_url, prefill_seen) =
+                        spawn_moriio_prefill_stub(StubHandoff::Minted).await;
+                    let (decode_url, decode_seen) = spawn_choice_decode_stub(None).await;
+                    let mut router = single_attempt_router();
+                    assert_eq!(
+                        ReleasePoint::from_retry_config(&router.retry_config),
+                        ReleasePoint::AfterDispatch
+                    );
+                    let heard = hearing_pairs_on(&router.policy_registry, true);
+                    if admission {
+                        router.prefill_admission =
+                            Some(Arc::new(PrefillAdmission::new(1, 1, ROUND_TRIP_GUARD)));
+                    }
+                    let labels = if mode == "write" {
+                        vec![CONCURRENT_WRITE]
+                    } else {
+                        vec![]
+                    };
+                    register_moriio_pair_with(
+                        &router,
+                        (prefill_url, Some(mode)),
+                        (decode_url, mode),
+                        &labels,
+                    );
+                    let response = tokio::time::timeout(
+                        ROUND_TRIP_GUARD,
+                        moriio_call(&router, route, None, &body),
+                    )
+                    .await
+                    .expect("capacity-one fanout finishes after the parent gives up its guards");
+                    assert_eq!(
+                        response.status(),
+                        StatusCode::OK,
+                        "{admission}/{mode}/{route}"
+                    );
+                    let answer = json_of(response).await;
+                    assert_eq!(answer["choices"].as_array().unwrap().len(), 2);
+                    let prefill = taken(&prefill_seen);
+                    let decode = taken(&decode_seen);
+                    assert_eq!((prefill.len(), decode.len()), (2, 2));
+                    assert_ne!(decode[0].1["request_id"], decode[1].1["request_id"]);
+                    for ((_, prefill), (_, decode)) in prefill.iter().zip(&decode) {
+                        assert_eq!(prefill["n"], 1);
+                        assert_eq!(decode["n"], 1);
+                        assert_eq!(prefill["request_id"], decode["request_id"]);
+                        assert_eq!(
+                            prefill["kv_transfer_params"]["transfer_id"],
+                            decode["kv_transfer_params"]["transfer_id"]
+                        );
+                    }
+                    let words = heard.lock().expect("the stage heard");
+                    let limits: Vec<&str> = words
+                        .iter()
+                        .filter(|word| word.starts_with("limit "))
+                        .map(String::as_str)
+                        .collect();
+                    let limit = format!("limit {expected}");
+                    // One available pair: the provisional parent and the two
+                    // independent child decisions each ask its decode scorer.
+                    assert_eq!(limits, vec![limit.as_str(); 3], "{words:?}");
+                    assert_eq!(
+                        words
+                            .iter()
+                            .filter(|word| *word == "dispatched Decode")
+                            .count(),
+                        2,
+                        "only the children dispatch: {words:?}"
+                    );
+                    assert_moriio_guards_released(&router);
+                }
+            }
+        }
+    }
+
+    /// A real classic-policy attempt queues behind one retained admission
+    /// guard and later dispatches. Its accessor is deliberately unusable:
+    /// neither waiting for a slot nor classic placement may read the limit.
+    #[tokio::test]
+    async fn classic_pd_attempt_does_not_read_a_limit_while_waiting_or_dispatching() {
+        let (prefill_url, prefill_seen) = spawn_moriio_prefill_stub(StubHandoff::Minted).await;
+        let (decode_url, decode_seen) = spawn_choice_decode_stub(None).await;
+        let mut router = single_attempt_router();
+        router.prefill_admission = Some(Arc::new(PrefillAdmission::new(1, 1, ROUND_TRIP_GUARD)));
+        register_moriio_pair(&router, (prefill_url, Some("read")), (decode_url, "read"));
+        let (_, held_guards) = router
+            .select_pd_pair_with_admission(
+                UNKNOWN_MODEL_ID,
+                PlacementInputs::default(),
+                None,
+                || panic!("classic selection must not ask for stated facts"),
+            )
+            .await
+            .expect("the first request owns the only slot");
+        let mut headers = HeaderMap::new();
+        headers.insert("x-request-id", HeaderValue::from_static("classic-limit-n1"));
+        let lease = RequestLease::new(
+            json!({
+                "model": "m", "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 41,
+            }),
+            RoutingDerivatives::default(),
+            ReleasePoint::AfterDispatch,
+        );
+        let context = PDRequestContext {
+            route: "/v1/chat/completions",
+            batch_size: None,
+            is_stream: false,
+            return_logprob: false,
+            model_id: UNKNOWN_MODEL_ID,
+            headers: Some(headers.clone()),
+        };
+        let ledger = AttemptLedger::default();
+        let tried = parking_lot::Mutex::new(Vec::new());
+        let dispatch = router.execute_dual_dispatch_attempt(
+            0,
+            Some(&headers),
+            &lease,
+            |_: &Value| panic!("a classic attempt must never read its output limit"),
+            context,
+            &ledger,
+            &tried,
+            false,
+        );
+        tokio::pin!(dispatch);
+        assert!(matches!(
+            futures_util::poll!(&mut dispatch),
+            std::task::Poll::Pending
+        ));
+        assert!(prefill_seen.lock().unwrap().is_empty());
+        assert!(decode_seen.lock().unwrap().is_empty());
+        drop(held_guards);
+        let response = tokio::time::timeout(ROUND_TRIP_GUARD, dispatch)
+            .await
+            .expect("the queued request proceeds after its predecessor releases");
+        assert_eq!(response.status(), StatusCode::OK);
+        json_of(response).await;
+        assert_eq!(taken(&prefill_seen).len(), 1);
+        assert_eq!(taken(&decode_seen).len(), 1);
+        assert_moriio_guards_released(&router);
     }
 
     #[tokio::test]
@@ -8838,6 +9178,7 @@ mod tests {
                         UNKNOWN_MODEL_ID,
                         PlacementInputs::default(),
                         None,
+                        placement::Stated::nothing,
                     )
                     .await
                     .unwrap();
@@ -8866,6 +9207,7 @@ mod tests {
                     UNKNOWN_MODEL_ID,
                     PlacementInputs::default(),
                     None,
+                    placement::Stated::nothing,
                 );
                 tokio::pin!(next);
                 tokio::select! {
@@ -8930,6 +9272,7 @@ mod tests {
                         UNKNOWN_MODEL_ID,
                         PlacementInputs::default(),
                         None,
+                        placement::Stated::nothing,
                     )
                     .await
                     .unwrap();
@@ -9016,6 +9359,7 @@ mod tests {
                         UNKNOWN_MODEL_ID,
                         PlacementInputs::default(),
                         None,
+                        placement::Stated::nothing,
                     )
                     .await
                     .unwrap();
@@ -10520,9 +10864,10 @@ mod tests {
     /// that decode stops being ready meanwhile, under a document that picks
     /// a pair's decode behind its prefill. It is sent the request all the
     /// same and stays counted for it; the other decode is sent nothing and
-    /// is never counted. The engine hears each side's dispatch and end, the
-    /// decode booked at its send, and no release. Both transfer modes of a
-    /// pair sent prefill first.
+    /// is never counted. The engine hears the body's output limit at the
+    /// pair's one decision, each side's dispatch and end, the decode booked
+    /// at its send, and no release. Both transfer modes of a pair sent
+    /// prefill first.
     #[tokio::test]
     async fn a_moriio_pairs_decode_is_not_asked_again_behind_its_prefill() {
         for transfer in ["read", "write"] {
@@ -10595,6 +10940,7 @@ mod tests {
             assert_eq!(
                 *heard.lock().expect("the stage heard"),
                 [
+                    "limit 50",
                     "issued",
                     "dispatched Prefill",
                     "issued",

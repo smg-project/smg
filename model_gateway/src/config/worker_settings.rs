@@ -20,14 +20,18 @@ use super::types::RouterConfig;
 impl RouterConfig {
     /// Gateway-level thresholds: the `--worker-overload-*` values, which
     /// default to [`DEFAULT_WAITING_REQUESTS`] and
-    /// [`DEFAULT_TOKEN_USAGE_CEILING`]. `--disable-worker-overload-protection`
-    /// (`worker_overload_protection: false`) switches both off whatever the
-    /// thresholds say; per-worker `overload` blocks still apply on top.
+    /// [`DEFAULT_TOKEN_USAGE_CEILING`]. The overload switch in force
+    /// (`RouterConfig::overload_words_in_force`) switches both off whatever
+    /// the thresholds say: `--disable-worker-overload-protection`
+    /// (`worker_overload_protection: false`), or, where the policy
+    /// controller runs a supplied document, that document's
+    /// `overload.enabled: false`. Per-worker `overload` blocks still apply
+    /// on top.
     ///
     /// [`DEFAULT_WAITING_REQUESTS`]: smg_worker::health::overload::DEFAULT_WAITING_REQUESTS
     /// [`DEFAULT_TOKEN_USAGE_CEILING`]: smg_worker::health::overload::DEFAULT_TOKEN_USAGE_CEILING
     pub fn worker_overload_thresholds(&self) -> OverloadThresholds {
-        if !self.worker_overload_protection {
+        if !self.overload_words_in_force().protection {
             return OverloadThresholds::default();
         }
         OverloadThresholds {
@@ -100,6 +104,7 @@ mod tests {
     use std::sync::Arc;
 
     use openai_protocol::worker::HttpPoolConfig;
+    use smg_policy_controller::document::{OverloadSpec, PolicySpec};
     use smg_worker::{
         connection::http_client::WorkerHttpClientCache,
         health::overload::{DEFAULT_TOKEN_USAGE_CEILING, DEFAULT_WAITING_REQUESTS},
@@ -229,6 +234,42 @@ mod tests {
 
         let off = gateway_config(false, Some(8), Some(0.8)).worker_overload_thresholds();
         assert!(!off.is_enabled());
+    }
+
+    /// Where the policy controller runs a supplied document, the document's
+    /// switch decides the default thresholds. Bindings that switch the
+    /// overload block off leave the worker objects no default threshold
+    /// whatever the two threshold settings say, as disabling protection
+    /// does with no document, and a block that is on leaves the two
+    /// settings standing. With the option off the document is not read.
+    #[test]
+    fn a_supplied_documents_switch_decides_the_default_thresholds() {
+        let under = |enabled: bool, policy_controller: bool| {
+            let mut document = PolicySpec::preset("round_robin").expect("a stock policy");
+            document.bindings[0].overload = Some(OverloadSpec {
+                enabled,
+                ..OverloadSpec::default()
+            });
+            RouterConfig {
+                policy_controller,
+                policy_spec: Some(document),
+                ..gateway_config(true, Some(32), Some(0.9))
+            }
+        };
+        let stated = OverloadThresholds {
+            waiting_requests: Some(32),
+            token_usage: Some(0.9),
+        };
+        assert_eq!(under(true, true).worker_overload_thresholds(), stated);
+        assert_eq!(
+            under(false, true).worker_overload_thresholds(),
+            OverloadThresholds::default()
+        );
+        assert_eq!(
+            under(false, true).registration_settings().overload_defaults,
+            OverloadThresholds::default()
+        );
+        assert_eq!(under(false, false).worker_overload_thresholds(), stated);
     }
 
     /// Each liveness budget comes from its own field.

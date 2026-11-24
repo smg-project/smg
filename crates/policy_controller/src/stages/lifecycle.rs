@@ -25,17 +25,23 @@ use crate::{
 /// release of a lease its decision gives up, costs that request its
 /// decision.
 ///
-/// Under a sessions rule that says so (`rule_placed: untold`), a stage in
-/// a gateway's own process hears neither the issue nor the dispatch of a
-/// single request the rule placed alone: a pin of the request's key
-/// followed, or the rule's own assignment. No stage placed that request,
-/// as a gateway's sticky map keeps a request it places from the gateway's
-/// policy. Its completion and its release are told as any request's, so a
-/// stage hears an end whose issue and dispatch it did not hear: a stage
-/// matches an end by the lease's id ([`Lease::id`]), and moves no count by
-/// an end it cannot match. A host that tells a lease's words off its file
-/// keeps no word of who placed a request: it tells such a request as it
-/// tells any other.
+/// The engine of a gateway's own process tells every word of a lease
+/// under a catch, the issue of a first decision among them. A hook that
+/// panics at one is held and counted, the stages behind it do not hear
+/// that word, and the request keeps its decision and its lease. A stage
+/// may so hear a lease's dispatch and its end with no issue ahead of them:
+/// it matches them by the lease's id, as below.
+///
+/// Under a sessions rule that says so (`rule_placed: untold`), a stage
+/// hears neither the issue nor the dispatch of a single request the rule
+/// placed alone: a pin of the request's key followed, or the rule's own
+/// assignment. No stage placed that request, as a gateway's sticky map
+/// keeps a request it places from the gateway's policy. Its completion and
+/// its release are told as any request's, so a stage hears an end whose
+/// issue and dispatch it did not hear: a stage matches an end by the
+/// lease's id ([`Lease::id`]), and moves no count by an end it cannot
+/// match. It is so in a gateway's own process and behind a controller,
+/// which keeps the rule's word on the lease it files.
 pub trait Lifecycle: Send + Sync {
     /// The engine issued `decision` under `lease`. Its host filed the
     /// lease as it issued it, in process as behind a served controller:

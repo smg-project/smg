@@ -63,9 +63,9 @@ thread_local! {
 ///
 /// # Errors
 ///
-/// The decision's shed, its queue or its refusal. Prefills that are all at
-/// the caller's admission limit answer [`Unplaced::PrefillsFull`], as a
-/// pair's do.
+/// The decision's shed, its queue or its refusal. Prefills with an open
+/// partner that are all at the caller's admission limit answer
+/// [`Unplaced::PrefillsFull`], as a pair's do.
 pub(super) fn ask<'a>(
     engine: Loaded<'static, '_>,
     request: &PlaceRequest<'a>,
@@ -106,7 +106,7 @@ fn asked<'a>(
     };
     let decided = engine.decide_encode_at(&made, items, placed, clock);
     let (decided, later) = decided.map_err(Unplaced::Refused)?;
-    let key = made.key();
+    let (key, kept) = (made.key(), [made.sent.get(), made.decodes.get()]);
     if prefills_full(&decided.decision) {
         return Err(Unplaced::PrefillsFull);
     }
@@ -133,7 +133,7 @@ fn asked<'a>(
     let read = OnceCell::new();
     let taken = walk(engine, decided, later, now, &mut call.missed, |target| {
         let (_, down) = read.get_or_init(&encoders);
-        let sides = sides(request, &lists.pair, target)?;
+        let sides = sides(request, &lists.pair, target, &kept)?;
         if down.is_empty() {
             Ok(sides)
         } else {

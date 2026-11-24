@@ -59,16 +59,22 @@
 //! takes it ahead of the oldest end. A worker's place is given to
 //! another worker once a whole pass has run since it left.
 //!
-//! Memory: 32 bytes a block and its entry in a map, about 60 bytes
-//! together. A block that more than one worker was sent keeps their
+//! Memory: 32 bytes a block and 13 a bucket of its map, about 55 bytes
+//! together: a map holds a key in halves, so no bucket is padded. A
+//! block that more than one worker was sent keeps their
 //! places in a list of its own: two bytes a worker, room for eight
 //! places or for twice its workers at most, whichever is more, and the
 //! list's own 24 bytes. A block left with one worker holds it in itself
 //! again, and a list no block uses keeps room for eight places at most.
-//! The blocks stand in pieces of 4,096 that never move, and the keys in
-//! 256 maps by their top byte, so a growth moves one map's entries.
+//! The blocks stand in pieces of 4,096 that never move, but for the
+//! first: it starts at 64 and moves as it doubles to a whole piece, so a
+//! model that sent a few blocks holds no room for 4,096. The keys stand
+//! in 256 maps by their top byte, so a growth moves one map's entries.
 
-use std::{mem, slice};
+use std::{
+    hash::{Hash, Hasher},
+    mem, slice,
+};
 
 use rustc_hash::FxHashMap;
 
@@ -84,8 +90,10 @@ const FREE: u32 = u32::MAX;
 /// No worker: the lone holder of a block whose holders are a group, or of
 /// one that no worker is left of.
 const NOBODY: u16 = u16::MAX;
-/// The blocks of one piece of the slab.
+/// The blocks of a whole piece of the slab.
 const CHUNK: usize = 1 << 12;
+/// The blocks the first piece starts with.
+const FIRST: usize = 1 << 6;
 /// The maps a key is found through, one for each value of its top byte.
 const MAPS: usize = 1 << 8;
 /// The places of room a list of workers keeps while no block uses it.
@@ -94,6 +102,25 @@ const POOLED: usize = 8;
 /// The map a key is found through.
 const fn map_of(key: u64) -> usize {
     (key >> 56) as usize
+}
+
+/// A block's key as a map holds it: in halves, so that the key and the
+/// block's place fill an entry of twelve bytes. A whole word is aligned
+/// to eight, and the entry is then padded to sixteen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Halves([u32; 2]);
+
+impl Halves {
+    const fn of(key: u64) -> Self {
+        Self([key as u32, (key >> 32) as u32])
+    }
+}
+
+impl Hash for Halves {
+    /// One write of the whole key, as the word itself hashes.
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u64(u64::from(self.0[1]) << 32 | u64::from(self.0[0]));
+    }
 }
 
 /// One block of a sent prefix.
@@ -166,14 +193,15 @@ enum Ask<'a> {
 /// workers the store hears no cache events from, and what its issue writes.
 #[derive(Debug)]
 pub struct PrefixPredictor {
-    /// The blocks, in pieces that never move.
+    /// The blocks, in pieces. A whole piece never moves; the first
+    /// doubles to one.
     chunks: Vec<Box<[Block]>>,
     /// How many entries the pieces have handed out.
     span: u32,
     /// The first free entry; `NONE` where every entry handed out is held.
     free: u32,
     /// Where a block stands, by its key.
-    maps: Box<[FxHashMap<u64, u32>]>,
+    maps: Box<[FxHashMap<Halves, u32>]>,
     /// The workers of the blocks that more than one was sent.
     groups: Vec<Vec<u16>>,
     /// The groups no block holds.
@@ -513,7 +541,7 @@ impl PrefixPredictor {
     }
 
     fn find(&self, key: u64) -> Option<u32> {
-        self.maps[map_of(key)].get(&key).copied()
+        self.maps[map_of(key)].get(&Halves::of(key)).copied()
     }
 
     fn is_live(&self, place: u16) -> bool {
@@ -644,9 +672,18 @@ impl PrefixPredictor {
             if self.span == UNLISTED {
                 return None;
             }
-            if (self.span as usize).is_multiple_of(CHUNK) {
+            let span = self.span as usize;
+            if span.is_multiple_of(CHUNK) {
+                let room = if span == 0 { FIRST } else { CHUNK };
                 self.chunks
-                    .push(vec![Block::BLANK; CHUNK].into_boxed_slice());
+                    .push(vec![Block::BLANK; room].into_boxed_slice());
+            } else if span < CHUNK {
+                let first = self.chunks.first_mut();
+                if let Some(first) = first.filter(|first| first.len() == span) {
+                    let mut grown = mem::take(first).into_vec();
+                    grown.resize(span * 2, Block::BLANK);
+                    *first = grown.into_boxed_slice();
+                }
             }
             self.span += 1;
             self.span - 1
@@ -663,7 +700,7 @@ impl PrefixPredictor {
             touched: tick,
             ..Block::BLANK
         };
-        self.maps[map_of(key)].insert(key, at);
+        self.maps[map_of(key)].insert(Halves::of(key), at);
         self.blocks += 1;
         if before != NONE {
             let block = self.block_mut(before);
@@ -816,7 +853,7 @@ impl PrefixPredictor {
         if block.older != UNLISTED {
             self.unlink(at);
         }
-        self.maps[map_of(block.key)].remove(&block.key);
+        self.maps[map_of(block.key)].remove(&Halves::of(block.key));
         if block.group == NONE {
             self.placements -= usize::from(block.lone != NOBODY);
         } else {

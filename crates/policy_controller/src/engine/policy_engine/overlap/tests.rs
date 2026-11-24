@@ -5,7 +5,7 @@ use std::{borrow::Cow, cell::RefCell, sync::atomic::AtomicUsize, thread, time::D
 
 use kv_index::{
     compute_request_content_hashes, request_prefix_hashes, ChainBlockMap, ChainIndex, ContentHash,
-    StoredBlock,
+    GroupKind, SequenceHash, StoredBlock,
 };
 use smg_worker::test_support::ready_worker;
 
@@ -574,7 +574,9 @@ fn the_record_names_the_worker_a_prefix_was_sent_to() {
 /// decision named its rows, and the one behind a decision handed the column
 /// whole. A pick the rule keeps from the profile leaves no prefix. One that
 /// is the profile's own, the rule's default, is written as a pick by the
-/// profile's stages is. The lookup returns the answer it is handed either
+/// profile's stages is. A pick is written for the first of its targets its
+/// caller sends to (`sends_to`), and for none where it sends to none. The
+/// lookup returns the answer it is handed either
 /// way, but for what the pick states of its first target
 /// ([`a_pick_its_rule_keeps_from_the_profile_states_nothing`]): a pin the
 /// keyed entry followed passes through it with its answer made. A profile
@@ -630,7 +632,8 @@ fn a_pick_the_sessions_rule_placed_is_recorded_by_the_rules_word_at_both_writes(
                 &bed.ids,
                 &mut request(asked, 7, NOW),
                 |_| None,
-                |_| true,
+                // The caller sends to every worker but the one at 3.
+                |target| target.position != 3,
                 |facts| {
                     assert_eq!(facts.named.is_none(), whole);
                     match facts.named {
@@ -665,14 +668,26 @@ fn a_pick_the_sessions_rule_placed_is_recorded_by_the_rules_word_at_both_writes(
         let told = ruled(1, bed.ids[1], RulePlaced::Told);
         assert_eq!(decided(&own, told), [0; 4], "whole: {whole}");
         assert_eq!(decided(&own, shed()), [0, 4, 0, 0], "whole: {whole}: told");
-        // The stages' pick of the first prompt is written as that one was.
-        let by_stages = picked(2, bed.ids[2]);
+        // The stages' pick of the first prompt is written as that one was,
+        // behind a lead its caller passes over: the worker at 3.
+        let mut by_stages = picked(2, bed.ids[2]);
+        if let Decision::Pick(pick) = &mut by_stages {
+            pick.targets.lead(Target {
+                position: 3,
+                id: bed.ids[3],
+                ..Target::default()
+            });
+        }
         assert_eq!(decided(&kept, by_stages), [0; 4], "whole: {whole}");
         assert_eq!(
             decided(&kept, shed()),
             [0, 0, 4, 0],
             "whole: {whole}: the stages'"
         );
+        // A pick whose one target its caller passes over: nothing is written.
+        let (lost, alone) = (prompt(3_000, 4), picked(3, bed.ids[3]));
+        assert_eq!(decided(&lost, alone), [0; 4], "whole: {whole}");
+        assert_eq!(decided(&lost, shed()), [0; 4], "whole: {whole}: to none");
     }
 }
 
@@ -1044,6 +1059,38 @@ fn a_pick_that_meets_a_held_record_leaves_its_prefix_out() {
     assert_eq!(bed.affinity.left_out(), 1);
 }
 
+/// A worker that leaves behind a decision's read of the record and ahead
+/// of its write is given no place: the record held none for it at the
+/// leave, and the pick's write gives it none. So where the worker is told
+/// gone, and where the standing workers are said whole without it.
+#[test]
+fn a_worker_that_leaves_under_its_first_pick_is_given_no_place() {
+    let (affinity, _, _) = hosted(false);
+    let bed = Bed::new(affinity, preset("cache_aware"), 4);
+    let asked = prompt(1_000, 4);
+    let holders_behind = |leave: &dyn Fn()| {
+        let decision = decide(
+            &bed.affinity,
+            &bed.pool,
+            &bed.spec,
+            &bed.workers,
+            &bed.ids,
+            &mut request(&asked, 7, NOW),
+            |_| None,
+            |_| true,
+            |_| {
+                leave();
+                picked(2, bed.ids[2])
+            },
+        );
+        assert!(decision.pick().is_some());
+        bed.holders(&asked, NOW)
+    };
+    assert!(holders_behind(&|| bed.affinity.forget(bed.ids[2])).is_empty());
+    let standing = [bed.ids[0], bed.ids[1], bed.ids[3]];
+    assert!(holders_behind(&|| bed.affinity.keep(&standing)).is_empty());
+}
+
 /// A list of no worker is read no table: its request is named no holder, no
 /// record of sent prefixes is made, and the host is asked for no index and
 /// no tree.
@@ -1055,6 +1102,33 @@ fn a_list_of_no_worker_keeps_no_record() {
     assert!(bed.holders(&asked, NOW).is_empty());
     assert!(bed.affinity.records.lock().is_empty());
     assert_eq!(host.asked.load(Ordering::Relaxed), 0);
+}
+
+/// A model's record leaves the map at the timer's sweep once its worker
+/// left and no list's table holds it, and what it left out stays counted.
+/// Until then it stays: a worker that stands keeps its prefixes when its
+/// list is published again, and a table that stands reads its record.
+#[test]
+fn a_record_leaves_behind_its_models_last_worker() {
+    let (affinity, _, _) = hosted(false);
+    let mut bed = Bed::new(affinity, preset("cache_aware"), 1);
+    let asked = prompt(1_000, 4);
+    bed.decide(&request(&asked, 7, NOW), Some(0));
+    bed.affinity.records.lock()[MODEL]
+        .left_out
+        .store(1, Ordering::Relaxed);
+    // The list is published again, with no table yet; its worker stands.
+    bed.pool = PoolAffinity::default();
+    bed.affinity.sweep();
+    assert_eq!(bed.holders(&asked, NOW), [(0, 0, 4)]);
+    bed.affinity.forget(bed.ids[0]);
+    bed.affinity.sweep();
+    assert_eq!(bed.affinity.records.lock().len(), 1, "a table reads it");
+    // The list falls, and its table with it.
+    bed.pool = PoolAffinity::default();
+    bed.affinity.sweep();
+    assert!(bed.affinity.records.lock().is_empty());
+    assert_eq!(bed.affinity.left_out(), 1);
 }
 
 /// A prompt of more blocks than one turn of the record's lock writes is
@@ -1527,6 +1601,32 @@ fn a_profile_named_no_row_is_handed_the_column() {
     assert!(decision.pick().is_none());
     let seen = seen.expect("a decision");
     assert_eq!(seen, [(0, 0), (0, 0), (4, 0), (0, 0)]);
+}
+
+/// A profile that is named no row and reads sent prefixes is handed what
+/// its own picks sent: a request's pick writes its prefix for its worker,
+/// and the column of the repeat holds it.
+#[test]
+fn a_profile_named_no_row_is_handed_the_prefix_its_pick_sent() {
+    let asked = prompt(1_000, 4);
+    let bed = Bed::new(hosted(false).0, handed_whole(), 4);
+    assert!(bed.decide(&request(&asked, 7, NOW), Some(1)).is_none());
+    let mut seen = None;
+    decide(
+        &bed.affinity,
+        &bed.pool,
+        &bed.spec,
+        &bed.workers,
+        &bed.ids,
+        &mut request(&asked, 7, NOW),
+        |_| None,
+        |_| true,
+        |facts| {
+            seen = Some(held(facts.affinity));
+            shed()
+        },
+    );
+    assert_eq!(seen.expect("a decision"), [(0, 0), (0, 4), (0, 0), (0, 0)]);
 }
 
 /// A pick states what its first target holds of the request, read from the
@@ -2860,4 +2960,211 @@ fn a_lower_bound_keeps_its_sweep_past_a_decider_that_holds_the_record() {
         left <= 100 - PrefixRecord::SWEEP,
         "one step of the sweep leaves {left} placements"
     );
+}
+
+/// A mask that names `numbers`, a bit a number.
+fn naming(numbers: &[u32]) -> Vec<u64> {
+    let mut mask = vec![0u64; 2];
+    for &number in numbers {
+        set(&mut mask, number as usize);
+    }
+    mask
+}
+
+/// The blocks of `hashes` as a worker's main store names them to its view:
+/// the worker's own hash of a block, here the block's prefix hash, and the
+/// block's content hash.
+fn named(hashes: &[u64]) -> Vec<(SequenceHash, ContentHash)> {
+    let contents: Vec<ContentHash> = hashes.iter().map(|&hash| ContentHash(hash)).collect();
+    let prefixes = request_prefix_hashes(&contents);
+    prefixes.into_iter().zip(contents).collect()
+}
+
+/// The numbers the index gave the first `count` workers.
+fn numbers(index: &ChainIndex, count: usize) -> Vec<u32> {
+    let number = |at| index.worker_id(&address(at)).expect("a number");
+    (0..count).map(number).collect()
+}
+
+/// On a fleet none of whose workers keeps cache groups, the lookup within
+/// groups is the chain index's own capped lookup, holder for holder, under
+/// every mask, cap and draw. Holders a host scored itself are kept by the
+/// same rule: as many, of the same depths.
+#[test]
+fn the_lookup_within_groups_is_the_plain_lookup_where_no_worker_keeps_groups() {
+    let index = ChainIndex::new();
+    let request = [1u64, 2, 3];
+    // Three blocks, two, two and one.
+    for (at, depth) in [3usize, 2, 2, 1].into_iter().enumerate() {
+        store(&index, at, &request[..depth]);
+    }
+    let all = numbers(&index, 4);
+    let groups = GroupViews::new();
+    let contents: Vec<ContentHash> = request.iter().map(|&hash| ContentHash(hash)).collect();
+    let depths = |kept: &[(u32, u32)]| {
+        let mut depths: Vec<u32> = kept.iter().map(|&(_, depth)| depth).collect();
+        depths.sort_unstable();
+        depths
+    };
+    let none: &[u32] = &[];
+    for among in [&all[..], &all[1..], none] {
+        let within = naming(among);
+        for cap in [0usize, 1, 2, 3, 16] {
+            for drawn in 0..2u32 {
+                let said = format!("{among:?}, cap {cap}, draw {drawn}");
+                let (mut plain, mut grouped) = (vec![(9, 9)], vec![(9, 9)]);
+                index.deepest_into(&request, |hash| *hash, &within, cap, |_| drawn, &mut plain);
+                let mut below = |_: u32| drawn;
+                deepest_within_groups(
+                    &index,
+                    &groups,
+                    &request,
+                    BLOCK,
+                    &within,
+                    cap,
+                    &mut below,
+                    &mut grouped,
+                );
+                assert_eq!(grouped, plain, "{said}");
+                let scores = index.find_matches(&contents, false).scores;
+                let mut scored = vec![(9, 9)];
+                deepest_of_within_groups(
+                    scores,
+                    &groups,
+                    &request,
+                    BLOCK,
+                    &within,
+                    cap,
+                    &mut below,
+                    &mut scored,
+                );
+                assert_eq!(depths(&scored), depths(&plain), "{said}");
+                let holds = |&(number, depth): &(u32, u32)| {
+                    let at = all.iter().position(|&held| held == number);
+                    at.is_some_and(|at| [3, 2, 2, 1][at] == depth) && among.contains(&number)
+                };
+                assert!(scored.iter().all(holds), "{said}: {scored:?}");
+            }
+        }
+    }
+}
+
+/// Where a worker keeps cache groups, each holder is lowered to what its
+/// groups can serve, by the index crate's own rule, before the deepest are
+/// kept. A holder lowered below another loses its place to it, and a holder
+/// lowered to nothing leaves.
+#[test]
+fn a_holder_is_lowered_to_what_its_groups_serve_before_the_deepest_are_kept() {
+    let index = ChainIndex::new();
+    let request = [1u64, 2, 3];
+    // Workers 0, 1 and 2 hold the three blocks and worker 3 holds two.
+    for (at, depth) in [3usize, 3, 3, 2].into_iter().enumerate() {
+        store(&index, at, &request[..depth]);
+    }
+    let all = numbers(&index, 4);
+    let groups = GroupViews::new();
+    // Worker 1's state group keeps the request's first block alone.
+    let first = groups.get_or_create(all[1]);
+    first.learn(1, Some(GroupKind::State), 0);
+    first.main_stored(None, &named(&request));
+    first.group_stored(1, &[named(&request)[0].0]);
+    // Worker 2's keeps a block of another prompt and none of the request.
+    let other = groups.get_or_create(all[2]);
+    other.learn(1, Some(GroupKind::State), 0);
+    other.main_stored(None, &named(&request));
+    other.main_stored(None, &named(&[9]));
+    other.group_stored(1, &[named(&[9])[0].0]);
+
+    // What the index crate's rule says each worker serves of its depth.
+    let contents: Vec<ContentHash> = request.iter().map(|&hash| ContentHash(hash)).collect();
+    let prefixes = request_prefix_hashes(&contents);
+    let served = |at: usize, depth: u32| {
+        let view = groups.get(all[at]);
+        view.map_or(depth, |view| {
+            view.cap(&prefixes, depth, BLOCK as usize).depth
+        })
+    };
+    let serves = [served(0, 3), served(1, 3), served(2, 3), served(3, 2)];
+    assert_eq!(serves, [3, 1, 0, 2]);
+
+    let within = naming(&all);
+    let lookup = |cap: usize| {
+        let mut kept = vec![(u32::MAX, 0)];
+        let mut below = |_: u32| 0u32;
+        deepest_within_groups(
+            &index, &groups, &request, BLOCK, &within, cap, &mut below, &mut kept,
+        );
+        kept.sort_unstable();
+        kept
+    };
+    // Every holder its groups leave a block, at the depth they serve.
+    assert_eq!(lookup(16), [(all[0], 3), (all[1], 1), (all[3], 2)]);
+    // The deepest two behind the lowering: worker 1 is as deep as worker 0
+    // in the index, and worker 3 takes its place.
+    assert_eq!(lookup(2), [(all[0], 3), (all[3], 2)]);
+    assert_eq!(lookup(1), [(all[0], 3)]);
+    // A worker the mask does not name is no holder.
+    let mut kept = Vec::new();
+    let mut below = |_: u32| 0u32;
+    deepest_within_groups(
+        &index,
+        &groups,
+        &request,
+        BLOCK,
+        &naming(&all[1..]),
+        16,
+        &mut below,
+        &mut kept,
+    );
+    kept.sort_unstable();
+    assert_eq!(kept, [(all[1], 1), (all[3], 2)]);
+
+    // Holders a host scored itself are lowered and kept by the same rule.
+    let scores = index.find_matches(&contents, false).scores;
+    let mut scored = vec![(u32::MAX, 0)];
+    deepest_of_within_groups(
+        scores,
+        &groups,
+        &request,
+        BLOCK,
+        &within,
+        2,
+        &mut below,
+        &mut scored,
+    );
+    scored.sort_unstable();
+    assert_eq!(scored, lookup(2));
+
+    // The chain a thread keeps is made anew for each request, and a deeper
+    // holder extends the chain a shallower one made: a second request, whose
+    // first block differs, held two blocks deep and three, the shallower
+    // holder handed first. Each holder's state group keeps its last block
+    // alone, so it is served its depth only under that request's own chain.
+    let second = [7u64, 2, 3];
+    store(&index, 4, &second);
+    store(&index, 5, &second[..2]);
+    let more = numbers(&index, 6);
+    let (deep, shallow) = (more[4], more[5]);
+    let chain = request_prefix_hashes(&second.map(ContentHash));
+    for (number, depth) in [(deep, 3u32), (shallow, 2)] {
+        let view = groups.get_or_create(number);
+        view.learn(1, Some(GroupKind::State), 0);
+        view.main_stored(None, &named(&second[..depth as usize]));
+        view.group_stored(1, &[chain[depth as usize - 1]]);
+        assert_eq!(view.cap(&chain, depth, BLOCK as usize).depth, depth);
+    }
+    deepest_of_within_groups(
+        [(shallow, 2), (deep, 3)],
+        &groups,
+        &second,
+        BLOCK,
+        &naming(&[deep, shallow]),
+        16,
+        &mut below,
+        &mut kept,
+    );
+    kept.sort_unstable();
+    let mut wanted = [(deep, 3), (shallow, 2)];
+    wanted.sort_unstable();
+    assert_eq!(kept, wanted);
 }

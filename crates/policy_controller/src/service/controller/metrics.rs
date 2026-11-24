@@ -1,13 +1,13 @@
 //! The controller's process series: its state, its start time, the load
-//! driver's counts, the decide call's and the store's two counts (design 14
+//! monitor's counts, the decide call's and the store's two counts (design 14
 //! names the rest, which arrive with the scopes, the replication and the
 //! election). They live on a recorder of the controller's own, not the
 //! process global, so a gateway that embeds the controller keeps its
 //! recorder and two controllers in one test process keep theirs; the admin
-//! listener renders it in the Prometheus text form. The driver's counts and
-//! the decide call's are read from their atomics at each render and the
-//! store's from the store, so none carries a recorder handle and a decision
-//! writes no series.
+//! listener renders it in the Prometheus text form. The monitor's counts
+//! are read from the worker crate at each render, the decide call's from
+//! their atomics and the store's from the store, so none carries a recorder
+//! handle and a decision writes no series.
 
 use std::{
     sync::{
@@ -20,16 +20,14 @@ use std::{
 use metrics::{Counter, Gauge, Key, KeyName, Label, Level, Metadata, Recorder};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle, PrometheusRecorder};
 use parking_lot::Mutex;
+use smg_worker::load::counts::{FailureTotals, PollTotals};
 
 use super::{
     decision_slots::DecideStats,
     generations::Generations,
     readiness::{Sample, State},
 };
-use crate::{
-    load::ingest::loads::{Failures, Stats},
-    store::{SignalWriteOutcome, StoreStats},
-};
+use crate::store::{SignalWriteOutcome, StoreStats};
 
 /// `1` for the controller's state (`starting`, `leader`, `syncing`,
 /// `follower`, `draining`), `0` for the other four. The admin listener sets it from the
@@ -53,17 +51,19 @@ pub const REPLICATION_RESTORES_ASKED_TOTAL: &str =
     "smg_policy_controller_replication_restores_asked_total";
 /// Load polls by the arbitration's decision (`mode`: `poll`, `fallback`,
 /// `suppressed`; a suppressed one made no call), each counted once per
-/// engine and poll interval.
+/// worker and poll interval, for a worker on a connection. A worker is one
+/// rank of its engine: the count is one an engine and interval but for an
+/// engine of several ranks.
 pub const LOAD_POLLS_TOTAL: &str = "smg_policy_controller_load_polls_total";
-/// Load polls that produced no report, by `reason`.
+/// Load polls over a connection that produced no report, by `reason`.
 pub const LOAD_POLL_FAILURES_TOTAL: &str = "smg_policy_controller_load_poll_failures_total";
-/// Metrics scrapes that produced the engine's sample.
+/// Load reads over HTTP that produced the engine's report.
 pub const LOAD_SCRAPES_TOTAL: &str = "smg_policy_controller_load_scrapes_total";
-/// Metrics scrapes that produced no sample, by `reason`.
+/// Load reads over HTTP that produced no report, by `reason`.
 pub const LOAD_SCRAPE_FAILURES_TOTAL: &str = "smg_policy_controller_load_scrape_failures_total";
-/// Rank rows the load driver wrote.
+/// Rank rows of polled answers the load monitor published.
 pub const LOAD_ROWS_TOTAL: &str = "smg_policy_controller_load_rows_total";
-/// Named values the bounds took out of the load driver's polled answers.
+/// Named values the bounds took out of the load monitor's polled answers.
 pub const LOAD_VALUES_DROPPED_TOTAL: &str = "smg_policy_controller_load_values_dropped_total";
 /// The generation of the policy spec the controller runs. Rendered by a
 /// controller with a spec source, from its first document on.
@@ -114,7 +114,8 @@ pub const DECIDE_BUDGET_OUTLASTED_TOTAL: &str =
 /// not name, by `list` (`engines`, `zones`). Such a member is admitted and
 /// reads position 0 in that field. A generation with no list counts none.
 pub const MEMBERS_OUTSIDE_LIST: &str = "smg_policy_controller_members_outside_list";
-/// Writes to the load table that moved an overload verdict.
+/// Overload verdicts of a worker that changed, either way: the load
+/// monitor's own, a lead's end that takes each one off among them.
 pub const OVERLOAD_FLIPS_TOTAL: &str = "smg_policy_controller_overload_flips_total";
 /// Lifecycle calls that panicked as a lease's event was applied (a
 /// dispatch, a completion, a release a frame brings, a dispatch
@@ -165,16 +166,50 @@ struct SpecSeries {
     rejected: Counter,
 }
 
-/// The load driver's counts as the recorder's counters, set absolute from
-/// its atomics at each render.
+/// What the load monitor's polls did and how often an overload verdict of a
+/// worker changed: one read of the worker crate's counts, for a render.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct LoadTotals {
+    /// The monitor's polls, as its one read answers them.
+    pub(crate) polls: PollTotals,
+    /// The overload verdicts that changed, as the monitor's registry counts
+    /// its edges.
+    pub(crate) overload_flips: u64,
+}
+
+/// The `reason` labels of a failed poll or read, in the order of
+/// [`by_reason`].
+const REASONS: [&str; 6] = [
+    "transport",
+    "answer",
+    "deadline",
+    "no_load",
+    "unsupported",
+    "client",
+];
+
+/// The failures of `totals`, in the order of [`REASONS`].
+fn by_reason(totals: &FailureTotals) -> [u64; 6] {
+    [
+        totals.transport,
+        totals.answer,
+        totals.deadline,
+        totals.no_load,
+        totals.unsupported,
+        totals.client,
+    ]
+}
+
+/// The load monitor's counts as the recorder's counters, set absolute from
+/// one read of them at each render.
 struct LoadCounters {
     /// `poll`, `fallback`, `suppressed`.
     polls: [Counter; 3],
-    /// In the order of [`Failures::LABELS`].
-    poll_failures: Vec<Counter>,
+    /// In the order of [`REASONS`].
+    poll_failures: [Counter; 6],
     scrapes: Counter,
-    /// In the order of [`Failures::LABELS`].
-    scrape_failures: Vec<Counter>,
+    /// In the order of [`REASONS`].
+    scrape_failures: [Counter; 6],
     rows: Counter,
     values_dropped: Counter,
 }
@@ -234,32 +269,32 @@ impl Metrics {
         recorder.describe_counter(
             KeyName::from_const_str(LOAD_POLLS_TOTAL),
             None,
-            "Load polls by the arbitration's decision (poll, fallback, suppressed), one per engine and poll interval".into(),
+            "Load polls by the arbitration's decision (poll, fallback, suppressed), one per worker on a connection and poll interval".into(),
         );
         recorder.describe_counter(
             KeyName::from_const_str(LOAD_POLL_FAILURES_TOTAL),
             None,
-            "Load polls that produced no report, by reason".into(),
+            "Load polls over a connection that produced no report, by reason".into(),
         );
         recorder.describe_counter(
             KeyName::from_const_str(LOAD_SCRAPES_TOTAL),
             None,
-            "Metrics scrapes that produced the engine's sample".into(),
+            "Load reads over HTTP that produced the engine's report".into(),
         );
         recorder.describe_counter(
             KeyName::from_const_str(LOAD_SCRAPE_FAILURES_TOTAL),
             None,
-            "Metrics scrapes that produced no sample, by reason".into(),
+            "Load reads over HTTP that produced no report, by reason".into(),
         );
         recorder.describe_counter(
             KeyName::from_const_str(LOAD_ROWS_TOTAL),
             None,
-            "Rank rows the load driver wrote".into(),
+            "Rank rows of polled answers the load monitor published".into(),
         );
         recorder.describe_counter(
             KeyName::from_const_str(LOAD_VALUES_DROPPED_TOTAL),
             None,
-            "Named values the bounds took out of the load driver's polled answers".into(),
+            "Named values the bounds took out of the load monitor's polled answers".into(),
         );
         recorder.describe_counter(
             KeyName::from_const_str(DECIDE_BUSY_TOTAL),
@@ -310,7 +345,7 @@ impl Metrics {
         recorder.describe_counter(
             KeyName::from_const_str(OVERLOAD_FLIPS_TOTAL),
             None,
-            "Writes to the load table that moved an overload verdict".into(),
+            "Overload verdicts of a worker that changed, either way".into(),
         );
         recorder.describe_counter(
             KeyName::from_const_str(SIGNAL_WRITES_TOTAL),
@@ -335,15 +370,11 @@ impl Metrics {
         let loads = LoadCounters {
             polls: ["poll", "fallback", "suppressed"]
                 .map(|mode| counter(LOAD_POLLS_TOTAL, "mode", mode)),
-            poll_failures: Failures::LABELS
-                .iter()
-                .map(|reason| counter(LOAD_POLL_FAILURES_TOTAL, "reason", reason))
-                .collect(),
+            poll_failures: REASONS
+                .map(|reason| counter(LOAD_POLL_FAILURES_TOTAL, "reason", reason)),
             scrapes: recorder.register_counter(&Key::from_name(LOAD_SCRAPES_TOTAL), &metadata),
-            scrape_failures: Failures::LABELS
-                .iter()
-                .map(|reason| counter(LOAD_SCRAPE_FAILURES_TOTAL, "reason", reason))
-                .collect(),
+            scrape_failures: REASONS
+                .map(|reason| counter(LOAD_SCRAPE_FAILURES_TOTAL, "reason", reason)),
             rows: recorder.register_counter(&Key::from_name(LOAD_ROWS_TOTAL), &metadata),
             values_dropped: recorder
                 .register_counter(&Key::from_name(LOAD_VALUES_DROPPED_TOTAL), &metadata),
@@ -449,14 +480,14 @@ impl Metrics {
     }
 
     /// One scrape's text form: the state and the standby's lag sampled once
-    /// by `sample` and their gauges written, the load driver's counts, the
+    /// by `sample` and their gauges written, the load monitor's counts, the
     /// decide call's and the store's read, and the render, with no other
     /// scrape between the sample and the render. Two scrapes across a change
     /// of role each render one state, their own.
     pub(crate) fn render<S: Into<Sample>>(
         &self,
         sample: impl FnOnce() -> S,
-        loads: &Stats,
+        loads: &LoadTotals,
         decides: &DecideStats,
         store: impl FnOnce() -> StoreStats,
     ) -> String {
@@ -513,41 +544,32 @@ impl Metrics {
         let [engines, zones] = &self.outside;
         engines.set(f64::from(counts.outside.engines));
         zones.set(f64::from(counts.outside.zones));
-        self.overload_flips.absolute(counts.overload_flips);
         self.lifecycle_faults.absolute(counts.lifecycle_faults);
         for (counter, count) in self.signal_writes.iter().zip(counts.signal_writes) {
             counter.absolute(count);
         }
     }
 
-    /// Sets the load counters from the driver's atomics.
-    fn observe_loads(&self, stats: &Stats) {
-        let polls = [&stats.polls, &stats.fallbacks, &stats.suppressed];
-        for (counter, count) in self.loads.polls.iter().zip(polls) {
-            counter.absolute(count.load(Ordering::Relaxed));
-        }
-        for (counter, (_, count)) in self
-            .loads
-            .poll_failures
-            .iter()
-            .zip(stats.poll_failures.each())
-        {
+    /// Sets the load counters and the overload flips from one read of the
+    /// load monitor's counts.
+    fn observe_loads(&self, totals: &LoadTotals) {
+        let (loads, polled) = (&self.loads, &totals.polls);
+        let polls = [polled.polls, polled.fallbacks, polled.suppressed];
+        for (counter, count) in loads.polls.iter().zip(polls) {
             counter.absolute(count);
         }
-        self.loads
-            .scrapes
-            .absolute(stats.scrapes.load(Ordering::Relaxed));
-        for (counter, (_, count)) in self
-            .loads
-            .scrape_failures
-            .iter()
-            .zip(stats.scrape_failures.each())
-        {
+        let failures = by_reason(&polled.poll_failures);
+        for (counter, count) in loads.poll_failures.iter().zip(failures) {
             counter.absolute(count);
         }
-        self.loads.rows.absolute(stats.rows.load(Ordering::Relaxed));
-        let dropped = stats.values_dropped.load(Ordering::Relaxed);
-        self.loads.values_dropped.absolute(dropped);
+        loads.scrapes.absolute(polled.scrapes);
+        let failures = by_reason(&polled.scrape_failures);
+        for (counter, count) in loads.scrape_failures.iter().zip(failures) {
+            counter.absolute(count);
+        }
+        loads.rows.absolute(polled.rows);
+        loads.values_dropped.absolute(polled.values_dropped);
+        self.overload_flips.absolute(totals.overload_flips);
     }
 
     /// Moves the state gauge: `1` on `now`, `0` on the others.
@@ -563,12 +585,11 @@ mod tests {
     use std::{sync::Arc, time::Duration};
 
     use super::{
-        Generations, Metrics, StoreStats, MEMBERS_OUTSIDE_LIST, REPLICATION_LAG_SECONDS,
-        REPLICATION_RESTORES_ASKED_TOTAL, REPLICATION_SYNCED, SIGNAL_WRITES_TOTAL,
-        SPEC_APPLY_TOTAL, SPEC_GENERATION, START_TIME_SECONDS, STATE,
+        Generations, LoadTotals, Metrics, StoreStats, MEMBERS_OUTSIDE_LIST,
+        REPLICATION_LAG_SECONDS, REPLICATION_RESTORES_ASKED_TOTAL, REPLICATION_SYNCED,
+        SIGNAL_WRITES_TOTAL, SPEC_APPLY_TOTAL, SPEC_GENERATION, START_TIME_SECONDS, STATE,
     };
     use crate::{
-        load::ingest::loads::Stats,
         service::controller::{
             decision_slots::DecideStats,
             readiness::{Sample, State},
@@ -588,7 +609,7 @@ mod tests {
         let metrics = Metrics::new();
         let rendered = metrics.render(
             || State::Starting,
-            &Stats::default(),
+            &LoadTotals::default(),
             &DecideStats::default(),
             StoreStats::default,
         );
@@ -604,7 +625,7 @@ mod tests {
 
         let rendered = metrics.render(
             || State::Leader,
-            &Stats::default(),
+            &LoadTotals::default(),
             &DecideStats::default(),
             StoreStats::default,
         );
@@ -622,7 +643,7 @@ mod tests {
             line(
                 &other.render(
                     || State::Starting,
-                    &Stats::default(),
+                    &LoadTotals::default(),
                     &DecideStats::default(),
                     StoreStats::default
                 ),
@@ -647,18 +668,14 @@ mod tests {
         };
 
         let metrics = Arc::new(Metrics::new());
-        let stats = Arc::new(Stats::default());
+        let stats = LoadTotals::default();
         let inside = Arc::new(AtomicBool::new(false));
         let (sampling, sampled) = mpsc::channel();
         // The first scrape stays inside its sample while the second begins,
         // and the role changes between the two. It runs on a thread the
         // case does not wait for without a bound.
         let first = thread::spawn({
-            let (metrics, stats, inside) = (
-                Arc::clone(&metrics),
-                Arc::clone(&stats),
-                Arc::clone(&inside),
-            );
+            let (metrics, inside) = (Arc::clone(&metrics), Arc::clone(&inside));
             move || {
                 metrics.render(
                     || {
@@ -712,48 +729,73 @@ mod tests {
         }
     }
 
+    /// Every load series renders the number the load monitor's one read
+    /// states for it, each mode and each reason under its own label, and
+    /// the overload flips render the registry's count of its edges. Every
+    /// number of the read is another, so a series that took a neighbour's
+    /// would read wrong.
     #[test]
-    fn the_load_counters_render_the_drivers_counts() {
-        use std::sync::atomic::Ordering;
-
-        use crate::load::ingest::loads::ReadError;
-
+    fn the_load_counters_render_the_monitors_counts() {
         let metrics = Metrics::new();
-        let stats = Stats::default();
         let rendered = metrics.render(
             || State::Starting,
-            &stats,
+            &LoadTotals::default(),
             &DecideStats::default(),
             StoreStats::default,
         );
         assert!(rendered.contains("smg_policy_controller_load_polls_total{mode=\"poll\"} 0"));
         assert!(rendered.contains("smg_policy_controller_load_rows_total 0"));
+        assert!(rendered.contains("smg_policy_controller_overload_flips_total 0"));
 
-        stats.polls.fetch_add(3, Ordering::Relaxed);
-        stats.suppressed.fetch_add(2, Ordering::Relaxed);
-        stats.rows.fetch_add(7, Ordering::Relaxed);
-        stats.values_dropped.fetch_add(4, Ordering::Relaxed);
-        stats.scrapes.fetch_add(1, Ordering::Relaxed);
-        stats.poll_failures.deadline.fetch_add(1, Ordering::Relaxed);
+        let mut totals = LoadTotals {
+            overload_flips: 9,
+            ..LoadTotals::default()
+        };
+        let polled = &mut totals.polls;
+        (polled.polls, polled.fallbacks, polled.suppressed) = (3, 5, 2);
+        (polled.scrapes, polled.rows, polled.values_dropped) = (11, 7, 4);
+        let failed = &mut polled.poll_failures;
+        (failed.transport, failed.answer, failed.deadline) = (21, 22, 23);
+        (failed.no_load, failed.unsupported, failed.client) = (24, 25, 26);
+        let failed = &mut polled.scrape_failures;
+        (failed.transport, failed.answer, failed.deadline) = (31, 32, 33);
+        (failed.no_load, failed.unsupported, failed.client) = (34, 35, 36);
         let rendered = metrics.render(
             || State::Starting,
-            &stats,
+            &totals,
             &DecideStats::default(),
             StoreStats::default,
         );
-        assert!(rendered.contains("smg_policy_controller_load_polls_total{mode=\"poll\"} 3"));
-        assert!(rendered.contains("smg_policy_controller_load_polls_total{mode=\"suppressed\"} 2"));
-        assert!(rendered
-            .contains("smg_policy_controller_load_poll_failures_total{reason=\"deadline\"} 1"));
-        assert!(rendered.contains("smg_policy_controller_load_scrapes_total 1"));
-        assert!(rendered
-            .contains("smg_policy_controller_load_scrape_failures_total{reason=\"no_load\"} 0"));
-        assert!(rendered.contains("smg_policy_controller_load_rows_total 7"));
-        assert!(rendered.contains("smg_policy_controller_load_values_dropped_total 4"));
-        assert_eq!(
-            ReadError::Deadline(Duration::from_secs(3)).label(),
-            "deadline"
-        );
+        let mut lines = vec![
+            "smg_policy_controller_load_polls_total{mode=\"poll\"} 3".to_string(),
+            "smg_policy_controller_load_polls_total{mode=\"fallback\"} 5".to_string(),
+            "smg_policy_controller_load_polls_total{mode=\"suppressed\"} 2".to_string(),
+            "smg_policy_controller_load_scrapes_total 11".to_string(),
+            "smg_policy_controller_load_rows_total 7".to_string(),
+            "smg_policy_controller_load_values_dropped_total 4".to_string(),
+            "smg_policy_controller_overload_flips_total 9".to_string(),
+        ];
+        let reasons = [
+            "transport",
+            "answer",
+            "deadline",
+            "no_load",
+            "unsupported",
+            "client",
+        ];
+        for (at, reason) in (1..).zip(reasons) {
+            lines.push(format!(
+                "smg_policy_controller_load_poll_failures_total{{reason=\"{reason}\"}} {}",
+                20 + at
+            ));
+            lines.push(format!(
+                "smg_policy_controller_load_scrape_failures_total{{reason=\"{reason}\"}} {}",
+                30 + at
+            ));
+        }
+        for line in lines {
+            assert!(rendered.contains(&line), "{line}\n{rendered}");
+        }
     }
 
     #[test]
@@ -764,7 +806,7 @@ mod tests {
         let counts = DecideStats::default();
         let rendered = metrics.render(
             || State::Starting,
-            &Stats::default(),
+            &LoadTotals::default(),
             &counts,
             StoreStats::default,
         );
@@ -830,7 +872,7 @@ mod tests {
         fourth.hashes_cut.store(22, Ordering::Relaxed);
         let rendered = metrics.render(
             || State::Starting,
-            &Stats::default(),
+            &LoadTotals::default(),
             &counts,
             StoreStats::default,
         );
@@ -868,7 +910,7 @@ mod tests {
         let metrics = Metrics::new();
         let rendered = metrics.render(
             || State::Leader,
-            &Stats::default(),
+            &LoadTotals::default(),
             &DecideStats::default(),
             StoreStats::default,
         );
@@ -876,7 +918,6 @@ mod tests {
             line(&rendered, MEMBERS_OUTSIDE_LIST, "list=\"engines\"").as_deref(),
             Some("smg_policy_controller_members_outside_list{list=\"engines\"} 0")
         );
-        assert!(rendered.contains("smg_policy_controller_overload_flips_total 0"));
         assert!(rendered.contains("smg_policy_controller_lifecycle_faults_total 0"));
         assert!(rendered.contains("# HELP smg_policy_controller_members_outside_list "));
 
@@ -891,7 +932,7 @@ mod tests {
         };
         let rendered = metrics.render(
             || State::Leader,
-            &Stats::default(),
+            &LoadTotals::default(),
             &DecideStats::default(),
             || counts,
         );
@@ -903,7 +944,9 @@ mod tests {
             line(&rendered, MEMBERS_OUTSIDE_LIST, "list=\"zones\"").as_deref(),
             Some("smg_policy_controller_members_outside_list{list=\"zones\"} 5")
         );
-        assert!(rendered.contains("smg_policy_controller_overload_flips_total 9"));
+        // The store's own count of its load table's flips is no series:
+        // the flips are the load monitor's.
+        assert!(rendered.contains("smg_policy_controller_overload_flips_total 0"));
         assert!(rendered.contains("smg_policy_controller_lifecycle_faults_total 4"));
         // The signal sink's writes, one series an outcome.
         let outcomes = [
@@ -922,7 +965,7 @@ mod tests {
         // The count outside a list falls once a generation names the member.
         let rendered = metrics.render(
             || State::Leader,
-            &Stats::default(),
+            &LoadTotals::default(),
             &DecideStats::default(),
             StoreStats::default,
         );
@@ -937,7 +980,7 @@ mod tests {
         let metrics = Metrics::new();
         let rendered = metrics.render(
             || State::Starting,
-            &Stats::default(),
+            &LoadTotals::default(),
             &DecideStats::default(),
             StoreStats::default,
         );
@@ -966,7 +1009,7 @@ mod tests {
         let metrics = Metrics::new();
         let rendered = metrics.render(
             || State::Leader,
-            &Stats::default(),
+            &LoadTotals::default(),
             &DecideStats::default(),
             StoreStats::default,
         );
@@ -980,7 +1023,7 @@ mod tests {
         let series = |generation: u64, applied: u64, rejected: u64| {
             let rendered = metrics.render(
                 || State::Leader,
-                &Stats::default(),
+                &LoadTotals::default(),
                 &DecideStats::default(),
                 StoreStats::default,
             );
@@ -1022,7 +1065,7 @@ mod tests {
                     synced,
                     restores: 0,
                 },
-                &Stats::default(),
+                &LoadTotals::default(),
                 &DecideStats::default(),
                 StoreStats::default,
             );
@@ -1052,7 +1095,7 @@ mod tests {
         // A leader follows nobody: both read zero, as before any frame.
         let rendered = metrics.render(
             || State::Leader,
-            &Stats::default(),
+            &LoadTotals::default(),
             &DecideStats::default(),
             StoreStats::default,
         );
@@ -1076,7 +1119,7 @@ mod tests {
                     restores,
                     ..Sample::from(State::Syncing)
                 },
-                &Stats::default(),
+                &LoadTotals::default(),
                 &DecideStats::default(),
                 StoreStats::default,
             );
@@ -1095,7 +1138,7 @@ mod tests {
         assert_eq!(scrape(3), read(3));
         let rendered = metrics.render(
             || State::Leader,
-            &Stats::default(),
+            &LoadTotals::default(),
             &DecideStats::default(),
             StoreStats::default,
         );

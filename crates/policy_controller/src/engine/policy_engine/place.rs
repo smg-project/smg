@@ -72,17 +72,17 @@ use std::{
 
 use smg_worker::identity::basic::Worker;
 
-use super::{Loaded, PolicyEngine};
+use super::{encode::EncodeLists, Loaded, PolicyEngine};
 use crate::{
     document::{
         spec::{AppliedSpec, DecodePick},
-        DerivedKeys,
+        DerivedKeys, KeySource,
     },
     engine::{
         decision::{Decision, Pick, ShedReason, Target, MAX_TARGETS},
         decision_engine::{
-            DecideOutcome, Decided, DecisionEngine, DecisionRefused, Plain, Request, RequestMaker,
-            TokenKey, WorkerLists,
+            AlonePick, DecideOutcome, DecisionEngine, DecisionRefused, Plain, Request,
+            RequestMaker, TokenKey, WorkerLists,
         },
         demands::Demands,
         framework::EncodeItems,
@@ -276,8 +276,9 @@ pub struct PlaceRequest<'a> {
     /// answer. Where the document picks the decode after the prefill, such
     /// a request's first decision books the prefill alone. A caller that
     /// sends both sides at once states nothing here and keeps one decision
-    /// under every document. The word is a pair's: over one list it asks
-    /// nothing, and a first attempt that carries it is plain still. An
+    /// under every document. The word is a pair's: over one list, or over
+    /// none, it asks nothing. The request made states no later decode
+    /// then, and a first attempt that carries it is plain still. An
     /// encode request whose decode is held to the workers that take images
     /// ([`EncodeItems::decode_images`], or references beside an image or a
     /// video) books its decode with its prefill whatever it states here: a
@@ -301,13 +302,15 @@ pub struct PlaceRequest<'a> {
     /// `None` for a route that has none. It is asked of the workers the
     /// engine picked: a request whose first pick it admits pays one call
     /// of it, and a pair's request one for each of its two workers. A
-    /// request decided inside a token tree its caller lends
-    /// ([`Prompt::entry`]) has the rule asked inside that decision, ahead
-    /// of the tree's write, so the tree stores the prompt for a worker the
-    /// rule takes. The pick takes that answer and asks the rule of that
-    /// worker no second time. A rule asked there runs inside a decision:
-    /// it asks the engine nothing, and where it panics the tree stores
-    /// nothing and the panic reaches the caller behind the decision.
+    /// request whose decision stores where its prompt went, in a token
+    /// tree its caller lends ([`Prompt::entry`]) or in the record of sent
+    /// prefixes a `cache_aware` profile keeps, has the rule asked inside
+    /// that decision, ahead of the write, so the prompt is stored for a
+    /// worker the rule takes. The pick takes that answer and asks the rule
+    /// of that worker no second time. A rule asked there runs inside a
+    /// decision: it asks the engine nothing, and where it panics the prompt
+    /// is stored for no worker and the panic reaches the caller behind the
+    /// decision.
     /// Behind
     /// a single request's decision none of whose picks can be sent to,
     /// where it refused one that was ready, it is asked of every worker of
@@ -374,6 +377,14 @@ impl<'a> PlaceRequest<'a> {
             WorkerLists::None | WorkerLists::Single(_) => Phase::Single,
         }
     }
+
+    /// Whether the request asks a pair's decode again
+    /// ([`Self::decode_again`]). The word is a pair's, over its two lists
+    /// or an encode request's three: over one list, and over none, it asks
+    /// nothing. The request made and its plain test both read this.
+    const fn asks_decode_again(&self) -> bool {
+        self.decode_again && matches!(self.lists, WorkerLists::Pair(_) | WorkerLists::Encode(_))
+    }
 }
 
 /// One request as the engine makes it of what its caller stated: the one
@@ -415,20 +426,27 @@ pub(super) struct Made<'r, 'a> {
     /// of the ring stage: asked of the lender at the request's first
     /// making, like the key's place.
     heads: OnceCell<Places>,
-    /// The panic of the route's rule where it was asked inside the lookup
-    /// of a lent token tree ([`RequestMaker::sends_to`]): kept for the
-    /// call, which raises it again outside the decision ([`raise`]).
+    /// The panic of the route's rule where it was asked inside a decision
+    /// ([`RequestMaker::sends_to`]): kept for the call, which raises it
+    /// again outside the decision ([`raise`]).
     panicked: OnceCell<Box<dyn Any + Send>>,
-    /// What the lookup of a lent token tree was answered on the targets it
-    /// asked ([`RequestMaker::sends_to`]): the call's pick takes these
-    /// answers, and reads none of those targets again.
+    /// What a decision was answered on the targets it asked
+    /// ([`RequestMaker::sends_to`]): the call's pick takes these answers,
+    /// and reads none of those targets again.
     sent: Cell<Sent>,
+    /// The same on the decodes of a pair's targets, by their places in the
+    /// decode list: `sent` holds the prefills' then.
+    decodes: Cell<Sent>,
+    /// Whether the request is a pair's decode decided again: a target's
+    /// prefill was sent already, and its decode alone is asked.
+    decode_alone: bool,
 }
 
-/// What a call's maker answered on a decision's targets inside the lookup
-/// of a lent token tree: each place asked, and whether the call sends to
-/// it. The lookup asks a pick's targets best first and stops at the first
-/// one the call sends to, so a pick's targets fit.
+/// What a call's maker answered on a decision's targets where the decision
+/// asked which of them a prompt is stored for, in a lent token tree or in
+/// the record of sent prefixes: each place asked, and whether the call
+/// sends to it. A pick's targets are asked best first up to the first one
+/// the call sends to, so a pick's targets fit.
 #[derive(Clone, Copy)]
 struct Sent {
     /// The places asked, in the order asked.
@@ -491,6 +509,8 @@ impl<'r, 'a> Made<'r, 'a> {
             heads: OnceCell::new(),
             panicked: OnceCell::new(),
             sent: Cell::new(Sent::NONE),
+            decodes: Cell::new(Sent::NONE),
+            decode_alone: false,
         }
     }
 
@@ -523,14 +543,17 @@ impl<'r, 'a> Made<'r, 'a> {
     /// The request's routing value and its client's value, by the sources
     /// its binding names in the engine's document, with where the value a
     /// ring places it by stands on a ring, as `place` answers for that
-    /// value's text and for whether it is the client's
+    /// value's text and its source, `None` for the client's value
     /// ([`KeySources::derive_keys`](crate::document::KeySources::derive_keys)).
     /// The routing value is the first source that holds one; none where
     /// the binding names no source or none holds a value. The client's
     /// value is read only where the request has no routing value: it
     /// places where no session does. A request its call makes with no key
     /// has neither ([`Call::unkeyed`]).
-    fn keys(&self, place: impl FnOnce(&str, bool) -> Option<u64>) -> DerivedKeys<'a> {
+    fn keys(
+        &self,
+        place: impl FnOnce(&str, Option<KeySource<'a>>) -> Option<u64>,
+    ) -> DerivedKeys<'a> {
         let request = self.request;
         let spec = self.engine.spec();
         let sources = spec.key_sources_for(request.model, request.phase());
@@ -551,8 +574,10 @@ impl<'r, 'a> Made<'r, 'a> {
     /// the ring
     /// ([`Engine::states_head_places`](crate::engine::Engine::states_head_places))
     /// is stated where the lender puts each head of the request
-    /// ([`LentRing::head_position`]): the routing value where the request
-    /// carries one, else the prompt's heads, the deepest first. A lender
+    /// ([`LentRing::head_position`]): the routing value where a header
+    /// handed the request one, else the prompt's heads, the deepest first.
+    /// A value the request's own id handed names the session alone
+    /// ([`RequestFacts::session_key_from_rid`]). A lender
     /// that places no head lends no ring, a request that has no head is
     /// lent none, and a request under any other profile lends none: its
     /// stage places by its own. The lender is asked at the first making
@@ -580,12 +605,14 @@ impl<'r, 'a> Made<'r, 'a> {
         let Some(rule) = engine.head_rule_of(profiles) else {
             return (self.keys(|_, _| None), None, &[]);
         };
-        // A routing value leads the prompt: its text is the one head. A
-        // client's value places nothing under this form.
+        // A routing value a header handed leads the prompt: its text is the
+        // one head. A client's value places nothing under this form, and
+        // neither does a value the request's own id handed: that request
+        // is placed by its prompt's heads.
         let key_at = Cell::new(None);
         let first = self.heads.get().is_none();
-        let keys = self.keys(|text, client| {
-            if first && !client {
+        let keys = self.keys(|text, source| {
+            if first && source.is_some_and(leads_a_prompt) {
                 key_at.set(Some(ring.head_position(Head::Text(text))));
             }
             None
@@ -613,6 +640,16 @@ impl<'r, 'a> Made<'r, 'a> {
         let ring = (!places.is_empty()).then_some(ring);
         (keys, ring, places)
     }
+}
+
+/// Whether a routing value from `source` leads a request's prompt under a
+/// ring's prefix form: every source but the request's own id, whose value
+/// names the session alone. One test for the place the one call states on
+/// a lent ring ([`Made::stated`]) and for the word its request carries
+/// ([`RequestFacts::session_key_from_rid`]), so the stated place and the
+/// stage's own key cannot part where a source gains a kind.
+fn leads_a_prompt(source: KeySource<'_>) -> bool {
+    source != KeySource::Rid
 }
 
 /// How many of a request's places on a lent ring its maker keeps in the
@@ -714,6 +751,11 @@ impl RequestMaker for Made<'_, '_> {
             // count a capped sessions rule reads off the list's records.
             session_counted: session_key.plain.is_some(),
             session_key,
+            // The one place the word is set: the prefix form of a ring
+            // reads it, and places such a request by its prompt.
+            session_key_from_rid: keys
+                .session
+                .is_some_and(|derived| !leads_a_prompt(derived.source)),
             client_key: keys.client_key,
             ring,
             ring_positions: places,
@@ -745,12 +787,14 @@ impl RequestMaker for Made<'_, '_> {
             hashes.write_to(&mut facts);
         }
         // The document's word, like the keys: read from the generation
-        // that decides. An encode request whose decode is held to the ones
-        // that take images, by its demand or by the preference of
-        // references beside pixels, states no later decode: a decode asked
+        // that decides. A request over one list, or over none, states no
+        // later decode whatever its caller says: the word is a pair's, as
+        // the plain test reads it. An encode request whose decode is held
+        // to the ones that take images, by its demand or by the preference
+        // of references beside pixels, states none either: a decode asked
         // again reads no image fact. The hold is read last, so a request
         // that asks no decode again reads none of it.
-        let later = request.decode_again
+        let later = request.asks_decode_again()
             && spec.decode_pick() == DecodePick::AfterPrefill
             && !request
                 .encode
@@ -770,16 +814,13 @@ impl RequestMaker for Made<'_, '_> {
 
     // A first attempt that names nothing tried or missed, is held to no
     // place of its list, demands nothing, carries no encode item and asks
-    // no decode again is plain. Its size
-    // is the one the request made would state. A decode asked again is a
-    // pair's word, over its two lists or an encode request's three: over
-    // one list it asks nothing, and the request is plain still.
+    // no decode again ([`PlaceRequest::asks_decode_again`]) is plain. Its
+    // size is the one the request made would state.
     fn plain(&self) -> Option<Plain> {
         let request = self.request;
         let first = request.attempt == 0 && request.tried.is_empty() && self.missed.is_empty();
         let first = first && self.places.is_none();
-        let pair = matches!(request.lists, WorkerLists::Pair(_) | WorkerLists::Encode(_));
-        let again = request.decode_again && pair;
+        let again = request.asks_decode_again();
         let asks_more = !request.demands.is_none() || request.encode.is_some() || again;
         (first && !asks_more).then(|| Plain {
             phase: request.phase(),
@@ -812,9 +853,12 @@ impl RequestMaker for Made<'_, '_> {
         self.request.prompt.entry?.token_key(page)
     }
 
-    // The walk's own read of a single request's target, made ahead of the
-    // walk for the tree's write: ready, and admitted by the route's rule,
-    // which is asked of a worker that is ready and of no other.
+    // The walk's own read of a target, made ahead of the walk for the
+    // write of where the prompt went, a lent tree's or the record's: each
+    // worker of the target ready, and admitted by the route's rule, which
+    // is asked of a worker that is ready and of no other. A single
+    // request's target is its one worker, and a pair's is its prefill and
+    // its decode, in a pair's two lists or an encode request's.
     //
     // A rule that panics here panics inside a decision, where the engine's
     // own catch would answer it as a decision that faulted. It is the
@@ -823,20 +867,41 @@ impl RequestMaker for Made<'_, '_> {
     // the decision ([`raise`]). The walk catches the rule's panic the same
     // way where it asks ([`walk`]).
     //
-    // Each answer is kept ([`Sent`]): the call's pick takes it, so a
-    // target is read and its rule asked once a decision.
+    // Each answer is kept ([`Sent`]), a pair's by its side: the call's pick
+    // takes it, so a worker is read and its rule asked once a decision. A
+    // pair's targets share workers, their prefill first of all: one that
+    // an earlier target was asked of answers as it did.
     fn sends_to(&self, target: &Target) -> bool {
-        let WorkerLists::Single(list) = self.request.lists else {
-            return true;
-        };
-        let Some(worker) = list.workers.get(target.position as usize) else {
+        match self.request.lists {
+            WorkerLists::None => true,
+            WorkerLists::Single(list) => self.asks(list, target.position, &self.sent),
+            WorkerLists::Pair(lists) | WorkerLists::Encode(EncodeLists { pair: lists, .. }) => {
+                let side = |list: LentList<'_>, place: u32, kept: &Cell<Sent>| {
+                    let held = kept.get().answer(place);
+                    held.unwrap_or_else(|| self.asks(list, place, kept))
+                };
+                target.pair.is_some_and(|pair| {
+                    (self.decode_alone || side(lists.prefill, target.position, &self.sent))
+                        && side(lists.decode, pair.decode_position, &self.decodes)
+                })
+            }
+        }
+    }
+}
+
+impl Made<'_, '_> {
+    /// Whether the call sends to the worker at `place` of `list`, one
+    /// worker of a target ([`RequestMaker::sends_to`]). The answer is kept
+    /// in `kept`.
+    fn asks(&self, list: LentList<'_>, place: u32, kept: &Cell<Sent>) -> bool {
+        let Some(worker) = list.workers.get(place as usize) else {
             return false;
         };
         let worker = worker.as_ref();
         if self.panicked.get().is_some() {
             return false;
         }
-        let mut sent = self.sent.get();
+        let mut sent = kept.get();
         let sendable = ready(worker)
             && self.request.admits.is_none_or(|admits| {
                 match catch_unwind(AssertUnwindSafe(|| admits(worker))) {
@@ -850,8 +915,8 @@ impl RequestMaker for Made<'_, '_> {
                     }
                 }
             });
-        sent.keep(target.position, sendable);
-        self.sent.set(sent);
+        sent.keep(place, sendable);
+        kept.set(sent);
         sendable
     }
 }
@@ -884,13 +949,18 @@ pub enum Unplaced {
     /// The engine queued the request. A caller that holds no request
     /// answers as for overloaded workers.
     Queued,
-    /// The document's capacity filter left a pair's request no prefill:
-    /// each one the filters ahead of it kept is at its caller's admission
-    /// limit
-    /// ([`PairAdmission::has_capacity`](crate::engine::PairAdmission::has_capacity)),
-    /// whether or not a decode it pairs with can be sent to. The request
-    /// is not refused: its caller waits for a prefill's room and places
-    /// it again. A document with no capacity filter never answers this.
+    /// The caller's admission limit alone left a pair's request no prefill
+    /// ([`PairAdmission::has_capacity`](crate::engine::PairAdmission::has_capacity)):
+    /// a prefill with an open partner stands but for its limit, and no
+    /// such prefill is under its limit. A partner is open where the decode
+    /// side's hard filters keep it, and where the binding's all-vetoed
+    /// rule lifts the overload veto for a decode pool that is over its
+    /// thresholds whole. The pair's default answers this too, where the
+    /// one prefill it took by load is at its limit. The request is not
+    /// refused: its caller waits for a prefill's room and places it again.
+    /// Outside that default, a prefill at its limit with no open partner
+    /// makes no request wait: a request with no other prefill is answered
+    /// its shed. A document with no capacity filter never answers this.
     PrefillsFull,
     /// The call's decisions named workers and none of their targets could
     /// be sent to when the call came to it: a target holds where its
@@ -966,22 +1036,28 @@ const fn declined(stated: &'static str) -> Unplaced {
     }
 }
 
-/// The engine's one decision for `made` ([`PolicyEngine::decide_at`]), and
-/// the instant it was dated at. A place dates nothing: no clock is read
-/// for it. Every walk of a first placement decides here, and nowhere else:
-/// a decode decided again is asked through its guard ([`decode_again`]).
+/// The engine's one decision for `made` ([`PolicyEngine::decide_at`]): the
+/// place it answers, or `None` with its whole decision written into
+/// `whole`, the room its caller keeps ([`Loaded::decide_into`]); and the
+/// instant it was dated at. A place dates nothing: no clock is read for
+/// it. A single's ask and a pair's decide here, three lists with no item
+/// stated among the pairs. An encode request's items are decided with its
+/// pair in one call ([`Loaded::decide_encode_at`]), and a decode decided
+/// again is asked through its guard ([`decode_again`]).
 #[inline]
 pub(super) fn decide(
     engine: Loaded<'_, '_>,
     made: &Made<'_, '_>,
-) -> Result<(Decided, Option<Instant>), DecisionRefused> {
+    whole: &mut Option<(DecideOutcome, bool)>,
+) -> Result<(Option<AlonePick>, Option<Instant>), DecisionRefused> {
     let dated = Cell::new(None);
-    let decided = engine.decide_at(made, || {
+    let clock = || {
         let now = Instant::now();
         dated.set(Some(now));
         now
-    })?;
-    Ok((decided, dated.get()))
+    };
+    let alone = engine.decide_into(made, clock, whole)?;
+    Ok((alone, dated.get()))
 }
 
 /// The pick of a whole decision, or why the decision placed nothing: its
@@ -1242,21 +1318,22 @@ fn named(engine: Loaded<'_, '_>, list: Option<LentList<'_>>, place: u32) -> Opti
     records.ids().get(place as usize).copied()
 }
 
-/// Raises again the panic of a route's rule that was asked inside the
-/// lookup of a lent token tree ([`RequestMaker::sends_to`]), behind the
-/// decision that asked it. That decision stored nothing in the tree. A
-/// lease it was issued is given up by name first, as the walk gives one up
-/// behind a rule that panics there. Out of line: a rule that panics is no
-/// request's path.
+/// Raises again the panic of a route's rule that was asked inside a
+/// decision ([`RequestMaker::sends_to`]), behind the decision that asked
+/// it. That decision stored the prompt for no worker. A lease it was
+/// issued is given up by name first, as the walk gives one up behind a
+/// rule that panics there. Out of line: a rule that panics is no request's
+/// path.
 #[cold]
 #[inline(never)]
 fn raise(
     engine: &'static PolicyEngine,
     panic: Box<dyn Any + Send>,
-    decided: Result<(Decided, Option<Instant>), DecisionRefused>,
+    whole: Option<(DecideOutcome, bool)>,
+    decided: Result<(Option<AlonePick>, Option<Instant>), DecisionRefused>,
 ) -> ! {
-    if let Ok((Decided::Whole(decided, later), dated)) = decided {
-        give_up(engine, decided, later, dated.unwrap_or_else(Instant::now));
+    if let (Some((outcome, later)), Ok((_, dated))) = (whole, decided) {
+        give_up(engine, outcome, later, dated.unwrap_or_else(Instant::now));
     }
     resume_unwind(panic)
 }
@@ -1265,9 +1342,8 @@ fn raise(
 /// one decision, and the first of its targets that can be sent to
 /// ([`walk`]): ready ([`ready`]) and admitted by its route's rule. At a
 /// pick the rule is asked of a worker that is ready, and of no other. A
-/// target the lookup of a lent token tree asked is taken by the answer
-/// it was given there ([`Sent`]): it is read once a decision, and its
-/// rule asked once.
+/// target the decision asked is taken by the answer it was given there
+/// ([`Sent`]): it is read once a decision, and its rule asked once.
 /// Where none can be sent to, the decision is given up by name, its
 /// targets join the ones the call's next ask leaves out
 /// ([`Call::missed`]), and the call's next ask answers ([`Call::again`]).
@@ -1283,20 +1359,20 @@ fn single<'a>(
         budget_micros: call.left(request)?,
         ..Made::asked(engine.object, request, call)
     };
-    let decided = decide(engine, &made);
+    let mut whole = None;
+    let decided = decide(engine, &made, &mut whole);
     if let Some(panic) = made.panicked.take() {
-        raise(engine.object, panic, decided);
+        raise(engine.object, panic, whole, decided);
     }
-    let (decided, dated) = decided.map_err(Unplaced::Refused)?;
-    let (key, sent) = (made.key(), made.sent.get());
+    let (alone, dated) = decided.map_err(Unplaced::Refused)?;
     let at = |place: u32| list?.workers.get(place as usize);
     // Each arm answers its own placement: a place's holds no decision, and
     // is written without the room of one.
-    match decided {
+    match alone {
         // The engine picked the place on the read of the worker that
         // found it eligible: the worker is read no second time, and its
         // route's rule is asked of it.
-        Decided::Alone(pick) => {
+        Some(pick) => {
             let worker = at(pick.place).ok_or(Unplaced::NoWorkers)?;
             // A caller of this call states no worker id of its own: where
             // its list's records stand, they name the worker by its
@@ -1316,13 +1392,19 @@ fn single<'a>(
                 return call.again(|call| single(engine, request, list, call));
             }
             let mut placement = Placement::alone(Arc::clone(worker), engine.label_at(pick.profile));
-            placement.routing_key = key;
+            placement.routing_key = made.key();
             Ok(placement)
         }
-        Decided::Whole(decided, later) => {
+        None => {
+            // The pass writes its decision ahead of every answer but a
+            // place.
+            let Some((decided, later)) = whole else {
+                return Err(Unplaced::Refused(DecisionRefused::Faulted));
+            };
+            let (key, sent) = (made.key(), made.sent.get());
             let now = dated.unwrap_or_else(Instant::now);
             // Whether the rule refused a target that was ready: inside
-            // the lookup of a lent tree, or here.
+            // the decision, or here.
             let refused = Cell::new(sent.refused);
             let taken = walk(engine, decided, later, now, &mut call.missed, |target| {
                 let worker = at(target.position);
@@ -1340,17 +1422,25 @@ fn single<'a>(
                     Some(worker) if sendable => Ok((Arc::clone(worker), None)),
                     _ => Err([Some(target.id), None]),
                 }
-            })?;
-            let Some(mut placement) = taken else {
-                // The walk gave the decision up: the rule is asked of the
-                // list while the call holds none.
-                if refused.get() {
-                    hold_to_rule(request, list, call)?;
+            });
+            // One match takes the placement out of the walk's answer. A
+            // `?` ahead of a `let else` takes it out in two steps, and a
+            // build copies it at each.
+            match taken {
+                Ok(Some(mut placement)) => {
+                    placement.routing_key = key;
+                    Ok(placement)
                 }
-                return call.again(|call| single(engine, request, list, call));
-            };
-            placement.routing_key = key;
-            Ok(placement)
+                Ok(None) => {
+                    // The walk gave the decision up: the rule is asked of
+                    // the list while the call holds none.
+                    if refused.get() {
+                        hold_to_rule(request, list, call)?;
+                    }
+                    call.again(|call| single(engine, request, list, call))
+                }
+                Err(unplaced) => Err(unplaced),
+            }
         }
     }
 }
@@ -1383,7 +1473,7 @@ impl PolicyEngine {
     /// A worker the rule refuses is left out like one that is not ready.
     /// The rule is asked of a decision's picks first: a request whose
     /// first pick it admits pays one call of it, inside the decision where
-    /// that is made in a lent token tree. Behind the first decision
+    /// that stores the prompt for a worker. Behind the first decision
     /// none of whose picks can be sent to, where the rule refused one that
     /// was ready, the decision is given up and the rule is asked of every
     /// worker of the list, ready or not, once a call. The call's later
@@ -1400,26 +1490,21 @@ impl PolicyEngine {
     ///
     /// A decision that is given up has written what its stages write as
     /// they decide, and its release takes none of that back: the tokens a
-    /// `bucket` profile books on a worker a prefill decision listed, the
-    /// prompt's holder a `cache_aware` profile records, a new session's
-    /// claim of its worker.
+    /// `bucket` profile books on a worker a prefill decision listed, a new
+    /// session's claim of its worker, the move of a session's pin at its
+    /// cap. A decision whose later target is taken has written for its
+    /// first target all the same.
     ///
-    /// A decision whose later target is taken has written for its first
-    /// target all the same. A `cache_aware` profile records the prompt's
-    /// holder inside the decision, as the worker it picked first. A
-    /// placement on a later target tells that record nothing, and the next
-    /// decision does not learn that the rule refused the first: the
-    /// prompt's next request is drawn to the refused worker again.
-    ///
-    /// A token tree the caller lends is written otherwise. A decision made
-    /// inside its lookup ([`Prompt::entry`]) asks, ahead of the write,
-    /// which of its targets this call can send to
-    /// ([`RequestMaker::sends_to`]): ready, and admitted by the route's
-    /// rule. The tree stores the prompt for the first such target, and the
-    /// call takes that target by the same answer: a worker is read, and
-    /// its rule asked, once a decision. Where there is none the tree
-    /// stores the prompt for no worker: a decision that is given up
-    /// leaves no holder in it.
+    /// Where a prompt went is written otherwise, in the record of sent
+    /// prefixes a `cache_aware` profile keeps and in a token tree the
+    /// caller lends ([`Prompt::entry`]). A decision that writes either
+    /// asks, ahead of the write, which of its targets this call can send
+    /// to ([`RequestMaker::sends_to`]): ready, and admitted by the route's
+    /// rule. The prompt is stored for the first such target, and the call
+    /// takes that target by the same answer: a worker is read, and its
+    /// rule asked, once a decision. Where there is none the prompt is
+    /// stored for no worker: a decision that is given up leaves no holder
+    /// behind.
     ///
     /// A request with a pair's two lists is placed over both, a target at
     /// a time. The first target both of whose workers can be sent to is
@@ -1435,9 +1520,10 @@ impl PolicyEngine {
     /// refuses is not, and where an earlier attempt of the request tried
     /// it.
     /// Which workers pair is the caller's word, in the classes its lists
-    /// carry: no pair is tested here again. Prefills that are all at the
-    /// caller's limit answer [`Unplaced::PrefillsFull`], on which the
-    /// caller waits for room and places the request again.
+    /// carry: no pair is tested here again. Prefills with an open partner
+    /// that are all at the caller's limit answer
+    /// [`Unplaced::PrefillsFull`], on which the caller waits for room and
+    /// places the request again.
     ///
     /// A request with an encode request's three lists is decided over the
     /// three ([`PolicyEngine::decide_encode_at`]), with the items it

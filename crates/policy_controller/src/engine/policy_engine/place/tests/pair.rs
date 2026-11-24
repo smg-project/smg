@@ -366,6 +366,43 @@ fn no_pair_crosses_the_classes_its_caller_states() {
     assert_eq!(call.missed, [lists.decode_id(0)]);
 }
 
+/// A caller that states first partners is placed on a pair of them while
+/// one can be sent to, whatever else its lists hold: the engine hands the
+/// pair's decision the first partners its caller numbered
+/// ([`PartnerClasses::number_first`]). Where no first partner is ready,
+/// every pair of the classes stands.
+///
+/// The classic router places a pair on one known runtime ahead of a pair
+/// with a worker whose runtime is unknown
+/// (`model_gateway/src/routers/common/placement.rs:2479-2502` on main
+/// `30f636706`), and a gateway states that order as first partners.
+#[test]
+fn a_pair_of_first_partners_is_placed_ahead_of_every_other() {
+    let mut document = PolicySpec::pair_presets("round_robin", "round_robin").expect("presets");
+    document.generation = 1;
+    let engine = hosted(engine_of(&document));
+    let lists = Lists::of(2, 2);
+    // Both prefills pair with both decodes, and prefill 1 with decode 1
+    // first.
+    let both: &[u32] = &[0, 1];
+    let classes = PartnerClasses::number_first(2, [(both, &[][..]), (both, &[1][..])]);
+    let pair = lists.under(&classes, &Open);
+    let request = PlaceRequest::of(MODEL, WorkerLists::Pair(pair));
+    for _ in 0..8 {
+        let placement = engine.place(&request).expect("a placement");
+        assert_eq!(lists.places(&placement), (1, 1), "the pair that goes first");
+    }
+    lists.decodes[1].set_status(WorkerStatus::NotReady);
+    let mut taken = [0_u32; 2];
+    for _ in 0..8 {
+        let placement = engine.place(&request).expect("a placement");
+        let (prefill, decode) = lists.places(&placement);
+        assert_eq!(decode, 0, "the one ready decode");
+        taken[prefill] += 1;
+    }
+    assert!(taken[0] > 0 && taken[1] > 0, "{taken:?}");
+}
+
 /// Prefills that are all at their caller's admission limit answer the word
 /// on which the caller waits for room, and no refusal: no lease was issued
 /// and nothing is said. With one prefill under its limit the request is
@@ -374,8 +411,8 @@ fn no_pair_crosses_the_classes_its_caller_states() {
 /// The classic router answers the same way where each prefill at its limit
 /// has a partner that can be sent to: "Selection was not run; the request
 /// waits for a slot"
-/// (`model_gateway/src/routers/common/placement.rs:307-309`, `:1470-1480`).
-/// Where a prefill at its limit has none the two answers part
+/// (`model_gateway/src/routers/common/placement.rs:332-334`, `:2532-2545`).
+/// Where a prefill at its limit has none, neither waits for it
 /// ([`a_pairs_shed_is_answered_by_its_name`]).
 #[test]
 fn prefills_all_at_their_limit_answer_the_word_their_caller_waits_on() {
@@ -401,14 +438,14 @@ fn prefills_all_at_their_limit_answer_the_word_their_caller_waits_on() {
 /// `healthy` filter.
 ///
 /// The classic router answers such lists that no pair is open
-/// (`model_gateway/src/routers/common/placement.rs:1438-1464`). It judges
-/// a prefill's limit over the prefills that still have a partner to send
-/// to (`:1422-1437`, `:1470-1480`); the engine's decision judges it over
-/// every prefill. So two inputs are answered otherwise here. One prefill
-/// at its limit whose one partner is not ready waits for room, where the
-/// classic router has no pair. And with two classes, the first prefill at
-/// its limit and the second's decode not ready, the request has no worker,
-/// where the classic router waits for the first prefill.
+/// (`model_gateway/src/routers/common/placement.rs:2503-2530` on main
+/// `30f636706`). It asks a prefill's limit of the prefills that still have
+/// a partner to send to, and of no other (`:2479-2502`, `:2532-2545`
+/// there), and so does the pair's decision. One prefill at its limit whose
+/// one partner is not ready has no pair, and no request waits for it. With
+/// two classes, one prefill at its limit beside its ready decode and the
+/// other's decode not ready, the request waits for the full prefill,
+/// whichever of the two it is.
 #[test]
 fn a_pairs_shed_is_answered_by_its_name() {
     let mut document = PolicySpec::pair_presets("round_robin", "round_robin").expect("presets");
@@ -434,7 +471,8 @@ fn a_pairs_shed_is_answered_by_its_name() {
     let answer = engine.place(&request).err();
     assert!(no_worker(answer, "healthy"), "{answer:?}");
 
-    // One prefill at its limit, whose one partner is not ready.
+    // One prefill at its limit, whose one partner is not ready: no pair,
+    // ahead of the limit.
     let engine = stock();
     let lists = Lists::of(1, 1);
     let classes = lists.every();
@@ -442,19 +480,26 @@ fn a_pairs_shed_is_answered_by_its_name() {
     let full = Gates(|_| false, |_| true);
     let pair = lists.under(&classes, &full);
     let request = PlaceRequest::of(MODEL, WorkerLists::Pair(pair));
-    assert_eq!(engine.place(&request).err(), Some(Unplaced::PrefillsFull));
-
-    // Two classes: the first prefill is at its limit, and the second's
-    // decode is not ready.
-    let engine = stock();
-    let lists = Lists::of(2, 2);
-    let classes = PartnerClasses::number(2, [&[0_u32][..], &[1][..]]);
-    lists.decodes[1].set_status(WorkerStatus::NotReady);
-    let first = Gates(|prefill| prefill != 0, |_| true);
-    let pair = lists.under(&classes, &first);
-    let request = PlaceRequest::of(MODEL, WorkerLists::Pair(pair));
     let answer = engine.place(&request).err();
     assert!(no_worker(answer, "healthy"), "{answer:?}");
+
+    // Two classes: one prefill is at its limit beside its ready decode, and
+    // the other's decode is not ready. The request waits for the full
+    // prefill, asked both ways round.
+    let one_full = [
+        Gates(|prefill| prefill != 0, |_| true),
+        Gates(|prefill| prefill != 1, |_| true),
+    ];
+    for (full, gates) in one_full.iter().enumerate() {
+        let engine = stock();
+        let lists = Lists::of(2, 2);
+        let classes = PartnerClasses::number(2, [&[0_u32][..], &[1][..]]);
+        lists.decodes[1 - full].set_status(WorkerStatus::NotReady);
+        let pair = lists.under(&classes, gates);
+        let request = PlaceRequest::of(MODEL, WorkerLists::Pair(pair));
+        let answer = engine.place(&request).err();
+        assert_eq!(answer, Some(Unplaced::PrefillsFull), "prefill {full}");
+    }
 }
 
 /// A pair's placement names the request's routing value where its document
@@ -681,7 +726,8 @@ fn a_pairs_call_makes_three_decisions_at_most() {
 /// A route's rule that panics passes its panic to the call's caller, and
 /// the decision it was asked under is given up by name as the panic
 /// passes: its lease is released once, and the engine is owed nothing. The
-/// same holds for a single request's whole decision.
+/// same holds for a single request's whole decision, and for a rule that
+/// panics where a pair's decision asks it.
 #[test]
 fn a_rule_that_panics_loses_no_lease() {
     let failing = |_: &dyn Worker| -> bool { panic!("the route's rule failed") };
@@ -718,6 +764,34 @@ fn a_rule_that_panics_loses_no_lease() {
     assert!(passed(&|| engine.place(&request).is_ok()));
     let first = worker_id(list[0].as_ref());
     assert_eq!(heard.lock().as_slice(), given_up(first));
+    assert_eq!((engine.faults(), engine.unheard()), (0, 0));
+
+    // A pair whose sides read their record of sent prefixes asks the rule
+    // inside its decision. This rule panics at its first question alone:
+    // a panic swallowed there would leave the walk a rule that admits.
+    let mut document = PolicySpec::pair_presets("cache_aware", "cache_aware").expect("presets");
+    document.generation = 1;
+    let spec = AppliedSpec::validate(&document).expect("a valid document");
+    let engine = hosted(PolicyEngine::new(spec));
+    let lists = Lists::of(1, 1);
+    let classes = lists.every();
+    let tokens: Vec<u32> = (1_000..5_096).collect();
+    let asked = Cell::new(false);
+    let once = |_: &dyn Worker| -> bool {
+        if asked.replace(true) {
+            return true;
+        }
+        panic!("the route's rule failed")
+    };
+    let request = PlaceRequest {
+        prompt: Prompt {
+            tokens: Some(&tokens),
+            ..Prompt::NONE
+        },
+        admits: Some(&once),
+        ..PlaceRequest::of(MODEL, WorkerLists::Pair(lists.under(&classes, &Open)))
+    };
+    assert!(passed(&|| engine.place(&request).is_ok()));
     assert_eq!((engine.faults(), engine.unheard()), (0, 0));
 }
 
@@ -854,4 +928,61 @@ fn a_pair_that_states_a_demand_is_placed_on_the_workers_that_meet_it() {
     assert_eq!(engine.place(&decided).err(), Some(none));
     assert_eq!(said(&heard).len(), from, "a shed issues nothing");
     assert_eq!((engine.faults(), engine.unheard()), (0, 0));
+}
+
+/// A pair's record of sent prefixes names the workers its request went to.
+/// Where the route's rule refuses the decode of the pick's first target,
+/// the walk takes a later target or the call's next decision, and the
+/// prompt's next requests go to the pair that one was sent to. A decision
+/// asks the rule of a worker once: a decode refused at its first question
+/// alone is passed by the request and by the record.
+#[test]
+fn a_prompt_sent_past_a_refused_decode_goes_to_its_pair_again() {
+    let mut document = PolicySpec::pair_presets("cache_aware", "cache_aware").expect("presets");
+    document.generation = 1;
+    let spec = AppliedSpec::validate(&document).expect("a valid document");
+    let engine = hosted(PolicyEngine::new(spec));
+    let lists = Lists::of(2, 4);
+    let classes = lists.every();
+    let pair = lists.under(&classes, &Open);
+    let tokens: Vec<u32> = (1_000..5_096).collect();
+    let prompt = Prompt {
+        tokens: Some(&tokens),
+        ..Prompt::NONE
+    };
+    // The rule refuses the first decode it is asked of, at that question
+    // alone: asked of it again, it would take it.
+    let refused = RefCell::new(None::<String>);
+    let rule = |worker: &dyn Worker| {
+        if *worker.worker_type() != WorkerType::Decode {
+            return true;
+        }
+        let mut refused = refused.borrow_mut();
+        if refused.is_some() {
+            return true;
+        }
+        *refused = Some(worker.url().to_owned());
+        false
+    };
+    let refusing = PlaceRequest {
+        prompt,
+        admits: Some(&rule),
+        ..PlaceRequest::of(MODEL, WorkerLists::Pair(pair))
+    };
+    let sent = engine.place(&refusing).expect("a placement");
+    let to = lists.places(&sent);
+    drop(sent);
+    let passed = refused.borrow().clone().expect("the rule refused a decode");
+    assert_ne!(lists.decodes[to.1].url(), passed, "past the refused decode");
+    let stated = PlaceRequest {
+        prompt,
+        ..PlaceRequest::of(MODEL, WorkerLists::Pair(pair))
+    };
+    let mut went = Vec::new();
+    for _ in 0..16 {
+        let again = engine.place(&stated).expect("a placement");
+        went.push(lists.places(&again));
+        drop(again);
+    }
+    assert_eq!(went, [to; 16], "the pair the prompt was sent to");
 }

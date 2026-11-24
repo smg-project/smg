@@ -485,6 +485,16 @@ mod tests {
                 Some(0)
             );
         }
+        // So does a report that lists one rank of the two it states: its
+        // 1,000 tokens are one rank's, not the worker's count.
+        let mut one_of_two = resident(2, 1_000);
+        one_of_two.dp_rank_count = 2;
+        loads.insert("http://w1:8000".to_string(), one_of_two);
+        feed.publish(&loads);
+        assert_eq!(
+            policy.select_worker(&workers, &SelectWorkerInfo::default()),
+            Some(0)
+        );
     }
 
     #[test]

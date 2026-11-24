@@ -418,10 +418,6 @@ impl Checked {
             // What the leases book stands beside rows a view lent: no
             // frame carries it.
             lent_in_flight: None,
-            // The frame carries no count of the key's requests: the
-            // door hands the store's beside the rows, for a request
-            // whose rule has an in-flight cap.
-            lent_session_in_flight: None,
             session_counted: false,
             // The frame carries no signal cells: they stand beside the
             // candidates of the program that decides.
@@ -431,6 +427,9 @@ impl Checked {
             // as it learns it from the rows.
             ring: None,
             ring_positions: &[],
+            // No frame states where a key came from: a served controller's
+            // prefix ring places by any session key.
+            session_key_from_rid: false,
         }
     }
 
@@ -556,10 +555,6 @@ pub(crate) enum Beside {
     /// The issue of a decode call's pick. Where the answer does not leave,
     /// its sender takes this one issue back: the prefill that runs under
     /// the same lease keeps its booking ([`Leased::given_up`]).
-    #[expect(
-        dead_code,
-        reason = "a decode call's lease is handed over again once it is decided over worker lists"
-    )]
     Issue(DecodeIssue),
 }
 
@@ -615,6 +610,13 @@ impl Leased {
     /// Whether too little of the span is left to hand the lease over.
     pub(crate) fn spent(&self) -> bool {
         self.left < Self::LEAST
+    }
+
+    /// Whether the lease's id was minted for this answer. A decode call's
+    /// was not: its lease is its pair's, minted for that pair's first
+    /// answer, under that answer's term.
+    pub(crate) const fn minted(&self) -> bool {
+        !matches!(self.beside, Beside::Issue(_))
     }
 }
 

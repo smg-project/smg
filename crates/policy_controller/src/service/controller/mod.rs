@@ -1,5 +1,5 @@
 //! The standalone controller's run loop (design 2, 6, 8 and 10): the store,
-//! the load driver over it, the election, the gRPC listeners with their
+//! the load monitor's task, the election, the gRPC listeners with their
 //! scopes, the service and the health service on each, the admin listener,
 //! readiness and the drain. The service answers `Leader`, a gateway's
 //! `Session` and its `Decide` streams, whose decisions run on the
@@ -7,7 +7,7 @@
 //! registration calls and the gateway scope's watch of the worker rows, and
 //! the run loop sweeps the gateways that are gone; the scopes' other call
 //! bodies arrive with the gateway, ingestion and control scope PRs, the
-//! other ingestion drivers with their move out of the gateway. In the
+//! ingestion drivers with their move out of the gateway. In the
 //! `elected` mode the gateway runs this same loop inside its process. A
 //! controller given a spec file runs its document, watches the file and
 //! answers `GetPolicySpec` and a dry run of `ApplyPolicySpec`
@@ -28,10 +28,11 @@
 //! the shutdown future resolves, then gives the lease up, settles, drains
 //! and returns.
 //!
-//! Every replica runs the same loop, the load driver included. A follower
-//! polls no engine, is sent no load row and holds none: the rows of a lead
-//! are dropped where the lead ends. Its first poll goes out at its
-//! promotion. A decision reads none of the store's load rows yet.
+//! Every replica runs the same loop, the load monitor's task included. A
+//! follower polls no engine and holds no load report: the monitor is
+//! stopped where a lead ends, and its snapshot is published empty. Its
+//! first poll goes out at its promotion. No load row is written to the
+//! store.
 //!
 //! Every socket a listener accepts is set to send at once: a small answer
 //! never waits for the peer's acknowledgement of the write before it.
@@ -57,6 +58,7 @@ mod lifecycle;
 mod membership;
 pub mod metrics;
 mod principal;
+mod publications;
 pub(crate) mod readiness;
 mod replication;
 mod run;
@@ -112,10 +114,6 @@ use self::{
     standby::{Lag, Standby},
 };
 use crate::{
-    load::ingest::{
-        loads::{LoadDriver, LoadDriverConfig},
-        probe::EngineProbe,
-    },
     service::elector::{Elector, Fence},
     stages::registry::StageRegistry,
     store::{MemoryStore, WorkersStore},
@@ -149,14 +147,12 @@ pub struct Controller {
     phase: watch::Sender<Phase>,
     readiness: Readiness,
     metrics: Arc<metrics::Metrics>,
-    /// The engines' probe the load driver dials through.
-    probe: Arc<EngineProbe>,
     /// This replica's candidate: the election thread steps it once served.
     elector: Elector,
     /// The election's sight of the lease, written by its thread.
     standing: watch::Sender<ElectionObservation>,
     /// What every listener's instance of the service reads; the store is
-    /// its field, the run loop's drivers read the same one.
+    /// its field, the run loop's tasks read the same one.
     shared: Arc<Shared>,
     /// The spec's file source, once [`Controller::spec_file`] has read it:
     /// the serve watches it.
@@ -502,14 +498,12 @@ impl Controller {
             ))
         });
         let shared = Arc::new(shared);
-        let probe = Arc::new(EngineProbe::new());
         Ok(Self {
             config,
             catalog,
             phase,
             readiness,
             metrics: Arc::new(metrics::Metrics::new()),
-            probe,
             elector,
             standing,
             shared,
@@ -756,7 +750,10 @@ impl Controller {
         }
     }
 
-    /// The store the ingestion drivers and the scopes' calls feed and read.
+    /// The store the serve's tasks and the scopes' calls feed and read. The
+    /// serve writes no load row to it and drops none: a host that writes
+    /// load rows through this handle drops them itself where its role
+    /// turns.
     pub fn store(&self) -> Arc<MemoryStore> {
         Arc::clone(&self.shared.store)
     }
@@ -783,8 +780,8 @@ impl Controller {
     }
 
     /// Serves until `shutdown` resolves, then drains. The listeners answer
-    /// from the start; the load driver polls the store's engines from the
-    /// first tick (idle while the store has no rows); the election thread
+    /// from the start; the load monitor polls the replica's workers while
+    /// the replica leads, from each take of the lead; the election thread
     /// takes its first look at the lease, and the state turns
     /// [`State::Leader`] or [`State::Follower`] and the health service's
     /// overall status `SERVING` once that look has landed. A replica that
@@ -839,7 +836,6 @@ impl Controller {
             phase,
             readiness,
             metrics,
-            probe,
             elector,
             standing,
             shared,
@@ -921,31 +917,17 @@ impl Controller {
             teller.await;
             Ok(())
         });
-        let driver = Arc::new(LoadDriver::new(
-            Arc::clone(&store),
-            probe,
-            LoadDriverConfig {
-                poll_interval: config.load_poll_interval,
-                ..LoadDriverConfig::default()
-            },
-        ));
-        let loads = driver.stats();
-        let driver_stop = stop.subscribe();
-        // A replica that follows polls no engine: it decides no request, and
-        // it is sent no load row. The driver drops the rows of its own lead
-        // at the word that the lead ended. The loop itself runs on every
-        // replica: it pays the store's publications, so a followed row
-        // reaches the published world.
-        let polls = follows.map(|_| shared.role.subscribe());
+        // The store's publications are paid by one loop on every replica,
+        // whoever wrote the rows: a followed row reaches the published
+        // world as a leader's own does.
+        let (published, publications_stop) = (Arc::clone(&store), stop.subscribe());
         tasks.spawn(async move {
-            match polls {
-                // The word names the term led: a take under another term
-                // is another lead, and another run of polls.
-                Some(polls) => driver.run_while(driver_stop, polls).await,
-                None => driver.run(driver_stop).await,
-            }
+            publications::run(&*published, publications_stop).await;
             Ok(())
         });
+        // The load monitor's counts are read where they are rendered: the
+        // reader is taken ahead of the monitor's task.
+        let loads = Arc::new(monitor.counts());
         if let Some(port) = follows {
             info!(
                 controller_id = %config.controller_id,
@@ -1394,18 +1376,13 @@ mod tests {
         decision_slots::{tests as bed, TERM_MARK},
         election::{self, ElectionObservation},
         following,
-        membership::tests::Logged,
         principal::Layer,
         readiness::{self, tests::fenced, Phase},
         standby::Lag,
-        tell_readiness, tell_role, unnamed_port, Bound, ConfigError, Controller, EngineProbe,
-        Error, NoFollow, Scope,
+        tell_readiness, tell_role, unnamed_port, Bound, ConfigError, Controller, Error, NoFollow,
+        Scope,
     };
     use crate::{
-        load::ingest::{
-            loads::{LoadProbe, ReadError},
-            probe::unbuildable,
-        },
         service::elector::{
             ConditionalWriteOutcome, ElectError, ElectionSettings, Elector, LeaseBackend,
             LeaseRecord, MemoryLease, TickOutcome,
@@ -1438,39 +1415,6 @@ mod tests {
         fn place(&self) -> String {
             self.lease.place()
         }
-    }
-
-    /// A controller with no engine to scrape builds no HTTP client: its
-    /// start reads no root certificate of the platform.
-    #[tokio::test]
-    async fn a_start_with_no_engine_to_scrape_builds_no_http_client() {
-        let controller = Controller::bind(valid()).await.expect("the listeners bind");
-        assert!(!controller.probe.http_built());
-    }
-
-    /// A probe whose client cannot be built says so once, as a warning
-    /// that names the controller's own client and no engine.
-    #[tokio::test]
-    async fn a_client_that_cannot_be_built_is_said_once_as_the_controllers_own() {
-        let lines = Logged::default();
-        let writer = lines.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_ansi(false)
-            .with_writer(move || writer.clone())
-            .finish();
-        let _beside = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
-        let _kept = tracing::subscriber::set_default(subscriber);
-        let probe = EngineProbe::building(unbuildable);
-        for _ in 0..3 {
-            let read = probe
-                .scrape("http://127.0.0.1:9", Duration::from_secs(1))
-                .await;
-            assert!(matches!(read, Err(ReadError::Client(_))), "{read:?}");
-        }
-        let said = String::from_utf8(lines.0.lock().clone()).expect("the lines");
-        assert_eq!(said.matches("could not be built").count(), 1, "{said}");
-        assert!(said.contains("WARN"), "{said}");
-        assert!(!said.contains("127.0.0.1"), "no engine is named: {said}");
     }
 
     /// Every socket the controller accepts sends at once, read from the

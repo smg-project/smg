@@ -151,7 +151,6 @@ fn request_record() -> &'static [&'static str] {
             now_micros,
             pinned_at,
             lent_in_flight,
-            lent_session_in_flight,
             session_counted,
             affinity,
             named,
@@ -160,6 +159,7 @@ fn request_record() -> &'static [&'static str] {
             client_key,
             ring,
             ring_positions,
+            session_key_from_rid,
         }
     )
 }
@@ -593,7 +593,6 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
                 "now_micros",
                 "pinned_at",
                 "lent_in_flight",
-                "lent_session_in_flight",
                 "session_counted",
                 "affinity",
                 "named",
@@ -601,6 +600,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
                 "signal_cells",
                 "ring",
                 "ring_positions",
+                "session_key_from_rid",
             ],
             wire_only: &["prompt_text"],
             wire: &[
@@ -847,7 +847,6 @@ fn wit_mirrors() -> Vec<WitMirror> {
                 "now_micros",
                 "pinned_at",
                 "lent_in_flight",
-                "lent_session_in_flight",
                 "session_counted",
                 "affinity",
                 "named",
@@ -856,6 +855,7 @@ fn wit_mirrors() -> Vec<WitMirror> {
                 "client_key",
                 "ring",
                 "ring_positions",
+                "session_key_from_rid",
             ],
             before: &[],
             beside: &[],

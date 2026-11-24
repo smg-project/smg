@@ -1,25 +1,28 @@
 //! A gateway's worker follower: one task that follows the worker list of a
 //! standalone controller, over that controller's worker watch, into a
-//! [`MemoryStore`]. It is no part of the election, where a follower is a
-//! replica that does not lead.
+//! [`MemoryStore`] and its owner's worker objects. It is no part of the
+//! election, where a follower is a replica that does not lead.
 //!
 //! The task keeps the store as the watch tells it ([`Watcher`]). A watch may
 //! reopen or a connection may fail. The same watcher keeps its place, and
 //! the store keeps its last fleet until a new snapshot replaces it.
 //!
-//! After each event the store takes at a place, the task calls the
-//! function its owner handed it at the start. The owner brings what it
-//! keeps beside the store up to date there, as its worker objects. The
-//! task reports a fleet only after the first such call, so the owner's
-//! workers stand when it turns ready.
+//! The watcher writes through the holder of the owner's worker objects
+//! ([`Objects`]), so the object of each row stands when the event that
+//! told it returns. The owner follows nothing behind the watch.
 //!
-//! The store publishes a snapshot's rows as it lays them, and so it does
-//! a replaced worker and a status change. Between such an event and the
-//! call that follows it a decision can name a row the owner has not
-//! caught up with yet. The owner passes that target over and asks again.
+//! After each event the store takes at a place, the task calls the
+//! function its owner handed it at the start: the task's word that the
+//! fleet stands as of a place, for the owner's readiness. The task
+//! reports a fleet only after the first such call.
+//!
+//! The watch and a decision travel apart. A decision the controller
+//! answers can name a row whose event the watch has not told yet. The
+//! owner passes that target over and asks again.
 
 use std::{io, sync::Arc, time::Duration};
 
+use smg_worker::registry::Generation;
 use tokio::{
     sync::{oneshot, watch},
     task::JoinHandle,
@@ -34,6 +37,7 @@ use crate::{
         watcher::{WatchStreamEnd, Watcher},
     },
     store::MemoryStore,
+    worker_host::Objects,
 };
 
 const FIRST_RETRY: Duration = Duration::from_millis(250);
@@ -160,15 +164,20 @@ pub struct WorkerFollower {
 }
 
 impl WorkerFollower {
-    /// Starts the task. The watch alone writes `store` from here, and the
-    /// task calls `after_event` after each event the store takes at a place.
+    /// Starts the task. The watch alone writes `store`'s rows from here,
+    /// through `objects`, the holder of the owner's worker objects over
+    /// that store: the object of a row stands when its event returns. The
+    /// task calls `after_event` after each event the store takes at a
+    /// place. The objects stand by then, so the call lays nothing: it is
+    /// the word the owner's readiness waits for.
     ///
     /// It spawns the task, so it is called inside a Tokio runtime. Dropping
     /// the follower ends the task too, without the wait [`Self::stop`]
     /// makes.
-    pub fn start(
+    pub fn start<G: Generation>(
         settings: WorkerFollowerSettings,
         store: Arc<MemoryStore>,
+        objects: Arc<Objects<G>>,
         after_event: impl Fn() + Send + Sync + 'static,
     ) -> Self {
         let (stop, stopped) = oneshot::channel();
@@ -181,7 +190,7 @@ impl WorkerFollower {
             tokio::select! {
                 biased;
                 _ = stopped => {}
-                () = run(settings, store, after_event, progress) => {}
+                () = run(settings, store, objects, after_event, progress) => {}
             }
         });
         Self {
@@ -226,13 +235,14 @@ fn named_leader(error: &DialError, followed: u32) -> Option<&str> {
     (!leader.is_empty() && followed < REDIRECTS).then_some(leader.as_str())
 }
 
-async fn run(
+async fn run<G: Generation>(
     settings: WorkerFollowerSettings,
     store: Arc<MemoryStore>,
+    objects: Arc<Objects<G>>,
     after_event: impl Fn(),
     progress: watch::Sender<bool>,
 ) {
-    let mut watcher = Watcher::new(store);
+    let mut watcher = Watcher::new(store, objects);
     let mut delay = FIRST_RETRY;
     let mut redirect: Option<String> = None;
     // The leaders followed at once since the watch last held a place.
@@ -265,9 +275,9 @@ async fn run(
     }
 }
 
-async fn follow(
+async fn follow<G: Generation>(
     client: &mut Client,
-    watcher: &mut Watcher,
+    watcher: &mut Watcher<G>,
     after_event: &impl Fn(),
     progress: &watch::Sender<bool>,
     delay: &mut Duration,
@@ -295,9 +305,9 @@ async fn follow(
                 Err(WatchStreamEnd::Client(error)) => return error,
             }
             if following.watcher().at().is_some() {
-                // The store holds the fleet as of a place. The owner brings
-                // what it keeps beside the store up to date. Only then does
-                // readiness hear of a fleet.
+                // The store and the worker objects hold the fleet as of a
+                // place. The owner is told, and only then does readiness
+                // hear of a fleet.
                 after_event();
                 placed = true;
                 *delay = FIRST_RETRY;
@@ -327,6 +337,7 @@ mod tests {
 
     use axum::{extract::Request as HttpRequest, Router};
     use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair};
+    use smg_worker::registry::WorkerRegistry;
     use tokio::{
         net::TcpListener,
         sync::{mpsc, oneshot, Notify},
@@ -346,12 +357,15 @@ mod tests {
     use crate::{
         document::operator::test_support::Logged,
         engine::view::WorkerId,
-        load::ingest::probe::install_crypto_provider,
         service::{
-            controller::{config::tests::valid, Controller, Scope, State, PRINCIPAL_ENTRY},
+            controller::{
+                config::tests::valid, tls::install_crypto_provider, Controller, Scope, State,
+                PRINCIPAL_ENTRY,
+            },
             proto::{self, policy_controller_client::PolicyControllerClient, worker_event::Event},
         },
         store::{MemoryStore, WorkerStatus, WorkersStore},
+        worker_host::{Members, Objects},
     };
 
     const WAIT: Duration = Duration::from_secs(5);
@@ -364,17 +378,26 @@ mod tests {
         }
     }
 
-    /// A follower of `settings` over `store`, and the number of times it
-    /// called its owner.
+    /// A follower of `settings` over `store` and a holder of its own, and
+    /// the number of times it called its owner with the worker objects
+    /// standing: one object for each row the store holds, and no other.
+    /// The owner lays nothing, so a call that finds a row without its
+    /// object is not counted.
     fn following(
         settings: WorkerFollowerSettings,
         store: &Arc<MemoryStore>,
     ) -> (WorkerFollower, Arc<AtomicUsize>) {
         let settled = Arc::new(AtomicUsize::new(0));
-        let follower = WorkerFollower::start(settings, Arc::clone(store), {
-            let settled = Arc::clone(&settled);
+        let registry = Arc::new(WorkerRegistry::new());
+        let objects = Arc::new(Objects::<Members>::new(registry).with_status_followed());
+        let follower = WorkerFollower::start(settings, Arc::clone(store), Arc::clone(&objects), {
+            let (settled, store) = (Arc::clone(&settled), Arc::clone(store));
             move || {
-                settled.fetch_add(1, Relaxed);
+                let (_, rows) = store.all_rows();
+                let stand = rows.iter().all(|row| objects.object(row.id).is_some());
+                if stand && objects.len() == rows.len() {
+                    settled.fetch_add(1, Relaxed);
+                }
             }
         });
         (follower, settled)
@@ -507,7 +530,8 @@ mod tests {
 
     /// The store keeps the fleet of a controller that stopped, and the
     /// follower still reports it. The owner was called before the fleet was
-    /// reported.
+    /// reported, and found the fleet's worker objects standing: it lays
+    /// none itself.
     #[tokio::test]
     async fn a_stopped_controller_leaves_its_last_rows_and_fleet_state() {
         let mut controller = Serving::start().await;

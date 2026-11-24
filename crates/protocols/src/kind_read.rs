@@ -1,11 +1,12 @@
-//! The read of a chat request's `messages`. Inside [`direct`] a message is
-//! read straight into the variant its `role` names; a value that stands before
-//! `role` is kept as it was parsed until the role is known. A message that is
-//! no object and every read outside [`direct`] take the derived read of
-//! [`ChatMessage`], which first copies the whole message into a generic tree.
-//! Both read a body into the same value and refuse the same bodies: a value
-//! the variant ignores is parsed before it is dropped, as the derived read
-//! parses it. Every refusal is worded by the derived read.
+//! The read of a list whose items are objects of several kinds, the kind named
+//! by one key: today the `messages` of a chat request, by `role`. Inside
+//! [`direct`] an item is read straight into the variant its kind names; a value
+//! that stands before that key is kept as it was parsed until the kind is
+//! known. An item that is no object and every read outside [`direct`] take the
+//! derived read of the type, which first copies the whole item into a generic
+//! tree. Both read a body into the same value and refuse the same bodies: a
+//! value the variant ignores is parsed before it is dropped, as the derived
+//! read parses it. Every refusal is worded by the derived read.
 
 use std::{borrow::Cow, cell::Cell, fmt, marker::PhantomData};
 
@@ -20,12 +21,6 @@ use serde::{
         Visitor,
     },
     Deserialize, Deserializer,
-};
-
-use crate::{
-    chat::{AssistantReasoning, ChatAssistantAudio, ChatMessage, MessageContent},
-    common::{FunctionCallResponse, ToolCall},
-    ext::kimi::{KimiAssistantExt, KimiDeveloperExt, KimiSystemExt, KimiUserExt},
 };
 
 thread_local! {
@@ -55,192 +50,106 @@ pub(crate) fn direct<T: 'static, R>(f: impl FnOnce() -> R) -> R {
     f()
 }
 
-pub(crate) fn read<'de, D: Deserializer<'de>>(
+pub(crate) fn list<'de, T: ByKind + Deserialize<'de>, D: Deserializer<'de>>(
     deserializer: D,
-) -> Result<Vec<ChatMessage>, D::Error> {
+) -> Result<Vec<T>, D::Error> {
     if DIRECT.get() {
-        deserializer.deserialize_seq(Messages)
+        deserializer.deserialize_seq(List(PhantomData))
     } else {
         Vec::deserialize(deserializer)
     }
 }
 
-const ROLES: &[&str] = &[
-    "system",
-    "user",
-    "assistant",
-    "tool",
-    "function",
-    "developer",
-    "root",
-];
-
-/// The kind of a message: the entry of `KINDS` at the place of its role in
-/// `ROLES`.
-#[derive(Clone, Copy)]
-enum Kind {
-    System,
-    User,
-    Assistant,
-    Tool,
-    Function,
-    Developer,
-    Root,
+/// A type whose kind is named by one key of its object: the key, the kind as
+/// the derived read words it, and the read of one kind from the other keys.
+/// `by_kind!` writes it from the type's own definition.
+pub(crate) trait ByKind: Sized {
+    /// The key that names the kind.
+    const KEY: &'static str;
+    /// What the derived read says it expects.
+    const EXPECTING: &'static str;
+    /// The kind, read from the value of the key.
+    type Kind: for<'de> Deserialize<'de>;
+    /// The value of that kind from the other keys of the object.
+    fn of_kind<'de, D: Deserializer<'de>>(kind: Self::Kind, rest: D) -> Result<Self, D::Error>;
 }
 
-const KINDS: [Kind; ROLES.len()] = [
-    Kind::System,
-    Kind::User,
-    Kind::Assistant,
-    Kind::Tool,
-    Kind::Function,
-    Kind::Developer,
-    Kind::Root,
-];
-
-// A new variant of `ChatMessage` does not compile until this reader names it.
-const _: fn(&ChatMessage) = |message| match message {
-    ChatMessage::System { .. }
-    | ChatMessage::User { .. }
-    | ChatMessage::Assistant { .. }
-    | ChatMessage::Tool { .. }
-    | ChatMessage::Function { .. }
-    | ChatMessage::Developer { .. }
-    | ChatMessage::Root { .. } => {}
-};
-
-/// What stands before `role` in a message: each key and its value.
+/// What stands before the kind key in an item: each key and its value.
 type Before<'de> = Vec<(Cow<'de, str>, Held<'de>)>;
 
-struct Messages;
+struct List<T>(PhantomData<T>);
 
-impl<'de> Visitor<'de> for Messages {
-    type Value = Vec<ChatMessage>;
+impl<'de, T: ByKind + Deserialize<'de>> Visitor<'de> for List<T> {
+    type Value = Vec<T>;
 
     fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.write_str("a sequence")
     }
 
     fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
-        let mut messages = Vec::new();
+        let mut items = Vec::new();
         let mut before = Vec::new();
-        while let Some(message) = seq.next_element_seed(Message(&mut before))? {
-            messages.push(message);
+        while let Some(item) = seq.next_element_seed(Item(&mut before, PhantomData))? {
+            items.push(item);
         }
-        Ok(messages)
+        Ok(items)
     }
 }
 
-struct Message<'a, 'de>(&'a mut Before<'de>);
+struct Item<'a, 'de, T>(&'a mut Before<'de>, PhantomData<T>);
 
-impl<'de> DeserializeSeed<'de> for Message<'_, 'de> {
-    type Value = ChatMessage;
+impl<'de, T: ByKind + Deserialize<'de>> DeserializeSeed<'de> for Item<'_, 'de, T> {
+    type Value = T;
 
-    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<ChatMessage, D::Error> {
-        // What the message before this one kept is dropped here.
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<T, D::Error> {
+        // What the item before this one kept is dropped here.
         self.0.clear();
         deserializer.deserialize_any(self)
     }
 }
 
-impl<'de> Visitor<'de> for Message<'_, 'de> {
-    type Value = ChatMessage;
+impl<'de, T: ByKind + Deserialize<'de>> Visitor<'de> for Item<'_, 'de, T> {
+    type Value = T;
 
     fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.write_str("internally tagged enum ChatMessage")
+        f.write_str(T::EXPECTING)
     }
 
-    fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<ChatMessage, A::Error> {
-        ChatMessage::deserialize(SeqAccessDeserializer::new(seq))
+    fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<T, A::Error> {
+        T::deserialize(SeqAccessDeserializer::new(seq))
     }
 
-    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<ChatMessage, A::Error> {
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<T, A::Error> {
         let mut key = map.next_key_seed(Key)?;
-        let before: &mut [(Cow<'de, str>, Held<'de>)] = if key.as_deref() == Some("role") {
+        let before: &mut [(Cow<'de, str>, Held<'de>)] = if key.as_deref() == Some(T::KEY) {
             &mut []
         } else {
             let before = self.0;
             loop {
                 match key {
-                    None => return Err(de::Error::missing_field("role")),
-                    Some(key) if key == "role" => break,
+                    None => return Err(de::Error::missing_field(T::KEY)),
+                    Some(key) if key == T::KEY => break,
                     Some(key) => before.push((key, map.next_value_seed(Hold)?)),
                 }
                 key = map.next_key_seed(Key)?;
             }
             before.as_mut_slice()
         };
-        let role = map.next_value_seed(Role)?;
-        let rest = MapAccessDeserializer::new(Rest {
-            before,
-            at: 0,
-            held: false,
-            map,
-        });
-        Ok(match role {
-            Kind::System => {
-                let m = System::deserialize(rest)?;
-                ChatMessage::System {
-                    content: m.content,
-                    name: m.name,
-                    ext: m.ext,
-                }
-            }
-            Kind::User => {
-                let m = User::deserialize(rest)?;
-                ChatMessage::User {
-                    content: m.content,
-                    name: m.name,
-                    ext: m.ext,
-                }
-            }
-            Kind::Assistant => {
-                let m = Assistant::deserialize(rest)?;
-                ChatMessage::Assistant {
-                    content: m.content,
-                    refusal: m.refusal,
-                    name: m.name,
-                    audio: m.audio,
-                    tool_calls: m.tool_calls,
-                    function_call: m.function_call,
-                    reasoning: m.reasoning,
-                    ext: m.ext,
-                }
-            }
-            Kind::Tool => {
-                let m = Tool::deserialize(rest)?;
-                ChatMessage::Tool {
-                    content: m.content,
-                    tool_call_id: m.tool_call_id,
-                }
-            }
-            Kind::Function => {
-                let m = Function::deserialize(rest)?;
-                ChatMessage::Function {
-                    content: m.content,
-                    name: m.name,
-                }
-            }
-            Kind::Developer => {
-                let m = Developer::deserialize(rest)?;
-                ChatMessage::Developer {
-                    content: m.content,
-                    name: m.name,
-                    ext: m.ext,
-                }
-            }
-            Kind::Root => {
-                let m = Root::deserialize(rest)?;
-                ChatMessage::Root {
-                    content: m.content,
-                    name: m.name,
-                }
-            }
-        })
+        let kind = map.next_value_seed(PhantomData::<T::Kind>)?;
+        T::of_kind(
+            kind,
+            MapAccessDeserializer::new(Rest {
+                before,
+                at: 0,
+                held: false,
+                of: PhantomData::<T>,
+                map,
+            }),
+        )
     }
 }
 
-/// A key of a message, borrowed from the body where it holds no escape.
+/// A key of an item, borrowed from the body where it holds no escape.
 struct Key;
 
 impl<'de> DeserializeSeed<'de> for Key {
@@ -277,57 +186,17 @@ fn hand_key<'de, K: DeserializeSeed<'de>, E: de::Error>(
     }
 }
 
-/// The value of `role`, worded as the derived variant identifier words it.
-struct Role;
-
-impl<'de> DeserializeSeed<'de> for Role {
-    type Value = Kind;
-
-    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Kind, D::Error> {
-        deserializer.deserialize_identifier(self)
-    }
-}
-
-impl Visitor<'_> for Role {
-    type Value = Kind;
-
-    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.write_str("variant identifier")
-    }
-
-    fn visit_u64<E: de::Error>(self, v: u64) -> Result<Kind, E> {
-        usize::try_from(v)
-            .ok()
-            .and_then(|index| KINDS.get(index).copied())
-            .ok_or_else(|| {
-                E::invalid_value(de::Unexpected::Unsigned(v), &"variant index 0 <= i < 7")
-            })
-    }
-
-    fn visit_str<E: de::Error>(self, v: &str) -> Result<Kind, E> {
-        ROLES
-            .iter()
-            .position(|role| *role == v)
-            .and_then(|index| KINDS.get(index).copied())
-            .ok_or_else(|| E::unknown_variant(v, ROLES))
-    }
-
-    fn visit_bytes<E: de::Error>(self, v: &[u8]) -> Result<Kind, E> {
-        let v = String::from_utf8_lossy(v);
-        self.visit_str(&v)
-    }
-}
-
-/// The keys of a message but `role`: what stood before it, then what follows.
-/// A second `role` is refused as the derived read refuses it.
-struct Rest<'a, 'de, A> {
+/// The keys of an item but the one that names its kind: what stood before it,
+/// then what follows. A second such key is refused as the derived read refuses it.
+struct Rest<'a, 'de, A, T> {
     before: &'a mut [(Cow<'de, str>, Held<'de>)],
     at: usize,
     held: bool,
+    of: PhantomData<T>,
     map: A,
 }
 
-impl<'de, A: MapAccess<'de>> MapAccess<'de> for Rest<'_, 'de, A> {
+impl<'de, A: MapAccess<'de>, T: ByKind> MapAccess<'de> for Rest<'_, 'de, A, T> {
     type Error = A::Error;
 
     fn next_key_seed<K: DeserializeSeed<'de>>(
@@ -344,7 +213,7 @@ impl<'de, A: MapAccess<'de>> MapAccess<'de> for Rest<'_, 'de, A> {
         }
         match self.map.next_key_seed(Key)? {
             None => Ok(None),
-            Some(key) if key == "role" => Err(de::Error::duplicate_field("role")),
+            Some(key) if key == T::KEY => Err(de::Error::duplicate_field(T::KEY)),
             Some(key) => hand_key(seed, key).map(Some),
         }
     }
@@ -363,8 +232,8 @@ impl<'de, A: MapAccess<'de>> MapAccess<'de> for Rest<'_, 'de, A> {
     }
 }
 
-/// A value that stood before `role`, kept as it was parsed until the role is
-/// known.
+/// A value that stood before the kind key, kept as it was parsed until the kind
+/// is known.
 #[derive(Default)]
 enum Held<'de> {
     #[default]
@@ -440,7 +309,7 @@ impl<'de> Visitor<'de> for Hold {
     }
 }
 
-/// A kept value as a source for the hints the fields of a message ask for: each
+/// A kept value as a source for the hints the fields of an item ask for: each
 /// takes the kinds the JSON parser takes for it. Every other hint and every
 /// other kind is refused, and a refused body is read again by the derived read.
 struct Replayed<'de, E>(Held<'de>, PhantomData<E>);
@@ -481,8 +350,15 @@ impl<'de, E: de::Error> Deserializer<'de> for Replayed<'de, E> {
 
     kinds! {
         deserialize_bool: Bool;
+        deserialize_i8: U64 | I64 | F64;
+        deserialize_i16: U64 | I64 | F64;
+        deserialize_i32: U64 | I64 | F64;
         deserialize_i64: U64 | I64 | F64;
+        deserialize_u8: U64 | I64 | F64;
+        deserialize_u16: U64 | I64 | F64;
+        deserialize_u32: U64 | I64 | F64;
         deserialize_u64: U64 | I64 | F64;
+        deserialize_f32: U64 | I64 | F64;
         deserialize_f64: U64 | I64 | F64;
         deserialize_str: Str;
         deserialize_string: Str;
@@ -491,11 +367,10 @@ impl<'de, E: de::Error> Deserializer<'de> for Replayed<'de, E> {
         deserialize_map: Map;
     }
 
-    // No field of a message asks for these: they are refused, not modelled.
+    // No field of an item asks for these: they are refused, not modelled.
     refused! {
-        deserialize_i8 deserialize_i16 deserialize_i32 deserialize_i128 deserialize_u8
-        deserialize_u16 deserialize_u32 deserialize_u128 deserialize_f32 deserialize_char
-        deserialize_bytes deserialize_byte_buf deserialize_unit
+        deserialize_i128 deserialize_u128 deserialize_char deserialize_bytes
+        deserialize_byte_buf deserialize_unit
     }
 
     fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, E> {
@@ -873,19 +748,19 @@ impl<'de> Visitor<'de> for Checked {
     }
 }
 
-/// A list of tool calls in the room its calls take. Read from the text a list
-/// grows by doubling, where the derived read sizes it from its tree: an
-/// assistant message with one call would hold room for four.
-struct ToolCalls;
+/// A list that may be absent, in the room its items take. Read from the text
+/// a list grows by doubling, where the derived read sizes it from its tree: a
+/// list of one item would hold room for four.
+struct Fitted<T>(PhantomData<T>);
 
-fn tool_calls<'de, D: Deserializer<'de>>(
+pub(crate) fn fitted<'de, T: Deserialize<'de>, D: Deserializer<'de>>(
     deserializer: D,
-) -> Result<Option<Vec<ToolCall>>, D::Error> {
-    deserializer.deserialize_option(ToolCalls)
+) -> Result<Option<Vec<T>>, D::Error> {
+    deserializer.deserialize_option(Fitted(PhantomData))
 }
 
-impl<'de> Visitor<'de> for ToolCalls {
-    type Value = Option<Vec<ToolCall>>;
+impl<'de, T: Deserialize<'de>> Visitor<'de> for Fitted<T> {
+    type Value = Option<Vec<T>>;
 
     fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.write_str("a sequence")
@@ -905,79 +780,118 @@ impl<'de> Visitor<'de> for ToolCalls {
 
     fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
         // A replayed list names its length, the text of a body names none. The
-        // hint is a claim of the source: room for a mebibyte of calls at most.
-        let bound = 1024 * 1024 / size_of::<ToolCall>();
-        let mut calls = Vec::with_capacity(seq.size_hint().unwrap_or(0).min(bound));
-        while let Some(call) = seq.next_element()? {
-            if calls.is_empty() {
-                calls.reserve_exact(1);
+        // hint is a claim of the source: room for a mebibyte of items at most.
+        let bound = 1024 * 1024 / size_of::<T>().max(1);
+        let mut items = Vec::with_capacity(seq.size_hint().unwrap_or(0).min(bound));
+        while let Some(item) = seq.next_element()? {
+            if items.is_empty() {
+                items.reserve_exact(1);
             }
-            calls.push(call);
+            items.push(item);
         }
-        calls.shrink_to_fit();
-        Ok(Some(calls))
+        items.shrink_to_fit();
+        Ok(Some(items))
     }
 }
 
-// The fields of each variant of `ChatMessage`, as its derive reads them.
+/// Wraps the definition of an enum read by a kind key (`#[serde(tag = "...")]`,
+/// every variant with named fields and a comma after its last field), derives
+/// its `Deserialize` (the enum's derive list leaves it out, so no other reader
+/// of the enum can stand beside serde's) and writes its [`ByKind`]: the kinds
+/// as serde's own variant identifier reads them, and for each variant a struct
+/// of its fields with their serde attributes, read by serde's own derive, so
+/// every field rule stays serde's. An attribute of a field that is not serde's
+/// is left out of that struct; a field written `Option<Vec<T>>` with no serde
+/// attribute is read by [`fitted`]. What the kinds and the fields would not
+/// read as the derive of the enum does is refused at compile time: the enum
+/// and its variants may carry the attributes of `@known` alone (on a variant a
+/// doc comment and `#[serde(rename = "...")]`); an attribute of a field may
+/// neither stand behind `cfg_attr` nor come from another macro as a fragment,
+/// since either could hide a serde attribute; and a field may not stand
+/// behind `cfg`, which that struct would leave out. In a field's type the
+/// enum goes by its name: `Self` there would mean that struct.
+macro_rules! by_kind {
+    (@key #[serde(tag = $key:literal)] $($more:tt)*) => { $key };
+    (@key #[$($other:tt)*] $($more:tt)*) => { $crate::kind_read::by_kind!(@key $($more)*) };
+    (@known #[doc = $doc:literal] $($more:tt)*) => { $crate::kind_read::by_kind!(@known $($more)*); };
+    (@known #[derive($($derive:tt)*)] $($more:tt)*) => { $crate::kind_read::by_kind!(@known $($more)*); };
+    (@known #[serde_with::skip_serializing_none] $($more:tt)*) => { $crate::kind_read::by_kind!(@known $($more)*); };
+    (@known #[serde(tag = $key:literal)] $($more:tt)*) => { $crate::kind_read::by_kind!(@known $($more)*); };
+    (@known #[serde(rename = $name:literal)] $($more:tt)*) => { $crate::kind_read::by_kind!(@known $($more)*); };
+    (@known) => {};
+    (@f $ctx:tt [$($done:tt)*] [$($names:ident)*] [$($keep:tt)*] #[serde $s:tt] $($more:tt)*) => {
+        $crate::kind_read::by_kind!(@f $ctx [$($done)*] [$($names)*] [$($keep)* #[serde $s]] $($more)*)
+    };
+    (@f $ctx:tt [$($done:tt)*] [$($names:ident)*] [$($keep:tt)*] #[cfg_attr $($no:tt)*] $($more:tt)*) => {
+        compile_error!("by_kind! does not read a field attribute behind cfg_attr")
+    };
+    (@f $ctx:tt [$($done:tt)*] [$($names:ident)*] [$($keep:tt)*] #[cfg $($no:tt)*] $($more:tt)*) => {
+        compile_error!("by_kind! does not read a field behind cfg")
+    };
+    (@f $ctx:tt [$($done:tt)*] [$($names:ident)*] [$($keep:tt)*] #[$attr:ident $($args:tt)*] $($more:tt)*) => {
+        $crate::kind_read::by_kind!(@f $ctx [$($done)*] [$($names)*] [$($keep)*] $($more)*)
+    };
+    (@f $ctx:tt [$($done:tt)*] [$($names:ident)*] [$($keep:tt)*] #[$($no:tt)*] $($more:tt)*) => {
+        compile_error!("by_kind! does not read a field attribute whose name it cannot see")
+    };
+    (@f $ctx:tt [$($done:tt)*] [$($names:ident)*] [] $field:ident : Option<Vec<$item:ty>>, $($more:tt)*) => {
+        $crate::kind_read::by_kind!(@f $ctx
+            [$($done)* #[serde(default, deserialize_with = "crate::kind_read::fitted")] $field: Option<Vec<$item>>,]
+            [$($names)* $field] [] $($more)*)
+    };
+    (@f $ctx:tt [$($done:tt)*] [$($names:ident)*] [$($keep:tt)*] $field:ident : $fty:ty, $($more:tt)*) => {
+        $crate::kind_read::by_kind!(@f $ctx [$($done)* $($keep)* $field: $fty,] [$($names)* $field] [] $($more)*)
+    };
+    (@f ($name:ident $variant:ident $rest:ident) [$($done:tt)*] [$($names:ident)*] []) => {{
+        #[derive(serde::Deserialize)]
+        struct __ByKindFields {
+            $($done)*
+        }
+        let fields = <__ByKindFields as serde::Deserialize>::deserialize($rest)?;
+        Ok($name::$variant { $($names: fields.$names),* })
+    }};
+    (
+        $(#[$($emeta:tt)*])*
+        $vis:vis enum $name:ident {
+            $( $(#[$($vmeta:tt)*])* $variant:ident { $($body:tt)* } ),* $(,)?
+        }
+    ) => {
+        #[derive(serde::Deserialize)]
+        $(#[$($emeta)*])*
+        $vis enum $name {
+            $( $(#[$($vmeta)*])* $variant { $($body)* } ),*
+        }
 
-#[derive(Deserialize)]
-struct System {
-    #[serde(default)]
-    content: MessageContent,
-    name: Option<String>,
-    #[serde(flatten)]
-    ext: KimiSystemExt,
-}
+        const _: () = {
+            $crate::kind_read::by_kind!(@known $(#[$($emeta)*])*);
+            $( $crate::kind_read::by_kind!(@known $(#[$($vmeta)*])*); )*
 
-#[derive(Deserialize)]
-struct User {
-    content: MessageContent,
-    name: Option<String>,
-    #[serde(flatten)]
-    ext: KimiUserExt,
-}
+            // A field's type is named again inside `of_kind`, where these items
+            // are in scope too: they carry names no type of a caller has.
+            #[derive(serde::Deserialize)]
+            #[serde(variant_identifier)]
+            pub(crate) enum __ByKindKind {
+                $( $(#[$($vmeta)*])* $variant ),*
+            }
 
-#[derive(Deserialize)]
-struct Assistant {
-    content: Option<MessageContent>,
-    refusal: Option<String>,
-    name: Option<String>,
-    audio: Option<ChatAssistantAudio>,
-    #[serde(default, deserialize_with = "tool_calls")]
-    tool_calls: Option<Vec<ToolCall>>,
-    function_call: Option<Box<FunctionCallResponse>>,
-    #[serde(flatten)]
-    reasoning: AssistantReasoning,
-    #[serde(flatten)]
-    ext: KimiAssistantExt,
-}
+            impl $crate::kind_read::ByKind for $name {
+                const KEY: &'static str = $crate::kind_read::by_kind!(@key $(#[$($emeta)*])*);
+                const EXPECTING: &'static str = concat!("internally tagged enum ", stringify!($name));
+                type Kind = __ByKindKind;
 
-#[derive(Deserialize)]
-struct Tool {
-    content: MessageContent,
-    tool_call_id: String,
+                fn of_kind<'de, __D: serde::Deserializer<'de>>(
+                    kind: __ByKindKind,
+                    rest: __D,
+                ) -> ::std::result::Result<Self, __D::Error> {
+                    match kind {
+                        $( __ByKindKind::$variant => $crate::kind_read::by_kind!(@f ($name $variant rest) [] [] [] $($body)*), )*
+                    }
+                }
+            }
+        };
+    };
 }
-
-#[derive(Deserialize)]
-struct Function {
-    content: Option<String>,
-    name: String,
-}
-
-#[derive(Deserialize)]
-struct Developer {
-    content: MessageContent,
-    name: Option<String>,
-    #[serde(flatten)]
-    ext: KimiDeveloperExt,
-}
-
-#[derive(Deserialize)]
-struct Root {
-    content: MessageContent,
-    name: Option<String>,
-}
+pub(crate) use by_kind;
 
 #[cfg(all(test, feature = "axum"))]
 mod tests {
@@ -1112,5 +1026,30 @@ mod tests {
             assert_eq!(direct.is_ok(), derived.is_ok(), "{message}");
         }
         assert!(misplaced.is_empty(), "in the wrong list: {misplaced:#?}");
+    }
+
+    crate::kind_read::by_kind! {
+    #[derive(Debug, PartialEq)]
+    #[serde(tag = "kind")]
+    enum Wrapped {
+        #[serde(rename = "numbers")]
+        Numbers {
+            #[serde{alias = "ids"}]
+            list: Vec<u32>,
+        },
+    }
+    }
+
+    /// A type other than a chat message is read by its kind. Small numbers held
+    /// before the kind key reach their field, and a serde attribute reaches the
+    /// struct of the fields whatever its brackets: serde reads braces too.
+    #[test]
+    fn a_wrapped_type_is_read_by_its_kind() {
+        use serde::de::DeserializeSeed;
+
+        let body = r#"{"ids":[1,2],"kind":"numbers"}"#;
+        let read: Result<Wrapped, _> = super::Item(&mut Vec::new(), std::marker::PhantomData)
+            .deserialize(&mut serde_json::Deserializer::from_str(body));
+        assert_eq!(read.ok(), Some(Wrapped::Numbers { list: vec![1, 2] }));
     }
 }

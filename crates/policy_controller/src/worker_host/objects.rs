@@ -1,8 +1,10 @@
 //! The holder of a replica's worker objects: it follows the store's
 //! membership and writes the registry. A leader's door writes a row through
-//! it, and the store follows that write ([`mod@write`]). A host can also ask it
-//! to follow the rows' status, or to build each object with the thresholds
-//! its own load monitor judges overload by.
+//! it, and the store follows that write ([`mod@write`]). A standby's applier
+//! hands it each event of its leader's stream ([`mod@standby`]). A host can
+//! also ask it to follow the rows' status, or to build each object with the
+//! thresholds its own load monitor judges overload by. A door reads the row
+//! that stands off it ([`mod@read`]).
 
 use std::{
     collections::{HashMap, HashSet},
@@ -22,20 +24,23 @@ use smg_worker::{
 };
 
 #[cfg(feature = "in-process")]
-use super::members::{Members, Stated};
+use super::members::{EncodeColumns, Members, Stated};
 #[cfg(feature = "in-process")]
 use super::reach::{ListReach, Reach};
 use super::{
     credentials::Credentials,
     membership_writer::MembershipWriteRefused,
-    object::{builder, dial_address, status, thresholds, unchecked},
+    object::{builder, dial_address, external, status, thresholds, unchecked},
     remainder::RowRemainder,
 };
 #[cfg(feature = "in-process")]
 use crate::{
     document::spec::Pairing,
     engine::{FixedFacts, LentList, PartnerClasses, Role},
-    store::pairing::{Member, PairClasses},
+    store::{
+        encoding::{EncodeClasses, EncodeMember, EncodeOffer},
+        pairing::{Member, PairClasses},
+    },
 };
 use crate::{
     engine::view::WorkerId,
@@ -43,6 +48,8 @@ use crate::{
 };
 
 mod host_count;
+mod read;
+mod standby;
 mod write;
 
 /// The row an object stands for.
@@ -139,8 +146,8 @@ impl Held {
 /// stands one object in the registry, and none beside.
 ///
 /// [`Self::follow`] reads what the store's membership did since its last
-/// read: every change on a standby, and on a leader each change no door
-/// wrote through the holder, a status change among them. It builds the
+/// read: each change that neither a door nor a standby's applier wrote
+/// through the holder, a status change among them. It builds the
 /// object of a row that arrived, drops the object of a row that went, and
 /// replaces the object of a row whose facts changed under the same id in
 /// the registry. A new incarnation of a key gets a new object and id.
@@ -205,9 +212,10 @@ pub struct Objects<G> {
     forgotten_at: AtomicU64,
     /// Whether the object of a host-local row is built with its checks off.
     host_local_unchecked: bool,
-    /// The overload thresholds an object built from a row states for each
-    /// signal its row names none for, where the host asked for objects with
-    /// thresholds ([`Self::with_overload_thresholds`]).
+    /// The overload thresholds an object built from an engine's row states
+    /// for each signal its row names none for, where the host asked for
+    /// objects with thresholds ([`Self::with_overload_thresholds`]). An
+    /// external row's object states its row's own alone.
     overload_defaults: Option<OverloadThresholds>,
     /// One registration that keeps its credential at a time, from its keep
     /// to the lay-again its keeper's answer asks for ([`Self::keeping`]).
@@ -259,6 +267,14 @@ impl<G> Objects<G> {
     /// whose thresholds change is laid again, so its object states the new
     /// ones.
     ///
+    /// A row that states the external runtime takes its own alone, at its
+    /// first build and at every later one. A gateway registers an engine's
+    /// worker with its default thresholds and an external worker with none,
+    /// so its monitor judges an external worker by nothing where its
+    /// registration names nothing. A gateway's update of a worker's
+    /// properties builds the worker again with the defaults, an external
+    /// worker too: this holder does not.
+    ///
     /// For a host whose own load monitor judges overload: the worker
     /// crate's monitor writes its verdict on an object by the thresholds
     /// the object states, at each load report of its worker.
@@ -268,12 +284,13 @@ impl<G> Objects<G> {
     /// worker, for its own decisions, and the holder does not copy its
     /// verdict onto the object's flag.
     ///
-    /// The monitor and the store do not read the same thresholds. A policy
-    /// document's binding thresholds, which the store reads for each signal
-    /// a row names none for, are not read here: `defaults` stands in their
-    /// place, and with no signal in `defaults` the monitor does not judge a
-    /// row that names none. The store judges an engine's ranks together, and
-    /// the monitor judges each object by its own report.
+    /// The monitor and the store do not read the same thresholds. The
+    /// crate's two defaults, which the store reads under a binding whose
+    /// block is on for each signal a row names none for, are not read here:
+    /// `defaults` stands in their place, and with no signal in `defaults`
+    /// the monitor does not judge a row that names none. No document names
+    /// a threshold. The store judges an engine's ranks together, and the
+    /// monitor judges each object by its own report.
     #[must_use]
     pub fn with_overload_thresholds(mut self, defaults: OverloadThresholds) -> Self {
         self.overload_defaults = Some(defaults);
@@ -445,10 +462,10 @@ impl<G: Generation> Objects<G> {
     /// alone among them. `None` as [`Self::standing`] answers it. The
     /// remainder is shared with the entry: a row laid again gets another.
     #[cfg_attr(
-        not(test),
+        not(any(test, feature = "controller")),
         expect(
             dead_code,
-            reason = "the controller's service reads it once its worker objects lead"
+            reason = "a controller's standby reads the instant a row was admitted at"
         )
     )]
     pub(crate) fn remainder(&self, object: &ObjectId) -> Option<Arc<RowRemainder>> {
@@ -785,8 +802,9 @@ impl<G: Generation> Objects<G> {
     /// State the entry of the object that stands for `row` again, from the
     /// row: its maker and the time it was admitted at. The caller found the
     /// row's facts and revision to be the ones the object was built from
-    /// ([`Self::stands`]), so nothing a generation's lists or pair classes
-    /// are derived from moves here, and the registry is not written.
+    /// ([`Self::stands`]), so nothing a generation's lists, pair classes or
+    /// encode columns are derived from moves here, and the registry is not
+    /// written.
     fn restate(&self, row: &WorkerRow) {
         let held = &mut *self.held.write();
         let entry = held.objects.get(&row.id);
@@ -809,11 +827,14 @@ impl<G: Generation> Objects<G> {
             unchecked(row)
         };
         // The thresholds the host's own monitor judges the object by: the
-        // row's own, each over the host's default for its signal.
+        // row's own, each over the host's default for its signal. An
+        // external row takes no default, as a gateway's external worker
+        // takes none.
         if let Some(defaults) = self.overload_defaults {
-            worker = worker
-                .overload(thresholds(&row.facts.overload))
-                .overload_defaults(defaults);
+            worker = worker.overload(thresholds(&row.facts.overload));
+            if !external(&row.facts) {
+                worker = worker.overload_defaults(defaults);
+            }
         }
         // The registry's signal sender: the object says its connect signal
         // and each move of its liveness veto to the collector's loop.
@@ -1021,25 +1042,100 @@ impl Objects<Members> {
             )
         }
         let lists = [Role::Prefill, Role::Decode].map(|role| self.lent(generation, role));
-        // What the row of each lent worker states, where the row's object
-        // still stands for it: read under the entry's lock, which is let
-        // go before the rule runs.
-        let stated = {
-            let held = self.held.read();
-            lists.map(|list| -> Vec<Option<Arc<RowRemainder>>> {
-                let facts = list.facts.unwrap_or_default();
-                let row = |(worker, fact): (&Arc<dyn Worker>, &FixedFacts)| {
-                    let laid = held.rows.get(held.objects.get(&fact.id?)?)?;
-                    Arc::ptr_eq(&laid.object, worker).then(|| Arc::clone(&laid.remainder))
-                };
-                list.workers.iter().zip(facts).map(row).collect()
-            })
-        };
+        let stated = self.remainders(lists);
         let members = [&stated[0], &stated[1]]
             .map(|side| side.iter().flatten().map(member).collect::<Vec<_>>());
         let derived = PairClasses::derive(&members[0], &members[1], mode);
         let stands = |side: usize| stated[side].iter().map(Option::is_some);
         derived.by_place(stands(0), stands(1))
+    }
+
+    /// What an encode request's decision reads beside `generation`'s
+    /// encoder list and beside its prefill list: what the encode side
+    /// reads of each encoder and the encode class each prefill names, by a
+    /// worker's place in its list AS LENT ([`Self::lent`]). Each column
+    /// holds one entry a worker of its list, whatever the workers state,
+    /// so a host hands both with the lists as they are
+    /// ([`EncodeLists::facts`](crate::engine::EncodeLists::facts),
+    /// [`EncodeLists::prefill_classes`](crate::engine::EncodeLists::prefill_classes)).
+    ///
+    /// The classes are the store's own encode rule and no other
+    /// ([`EncodeClasses::derive`]), over one member for each lent worker
+    /// in its list's order, made of what the worker's row states: its
+    /// engine kind and its end of the encode handoff. So a place of the
+    /// rule is a place of the list lent. A lent worker whose row's object
+    /// was replaced or ended before the columns are derived states no end
+    /// there: an encoder of class `0`, which takes no item, and a prefill
+    /// no encoder hands to.
+    ///
+    /// The rule runs over whatever is lent. Where no prefill is lent, an
+    /// encoder keeps the class of its end, and the pair's own decision
+    /// answers for the side that is missing. The store's pools read
+    /// otherwise there: the store derives no class for a model with no
+    /// prefill, and each of its encoders reads class `0`.
+    ///
+    /// A generation keeps one pair of columns, derived at the first ask
+    /// as a set of its pair classes is ([`Self::pair_classes`]): behind
+    /// the cut of the lists, with one read of the holder's entry under its
+    /// read lock, and the rule run with that lock let go. What they are
+    /// derived from does not move under a generation: a write that moves a
+    /// row's engine kind or its encode offer gets the row a new object,
+    /// and a new object publishes another generation. Every later ask is
+    /// one read and takes no lock.
+    #[must_use]
+    pub fn encode_columns<'a>(&self, generation: &'a Members) -> &'a EncodeColumns {
+        generation.encode_columns(|| self.derive_encode(generation))
+    }
+
+    /// The encode columns of `generation`'s two lists as lent, derived now.
+    fn derive_encode(&self, generation: &Members) -> EncodeColumns {
+        /// A lent worker as the rule reads it: its row's engine kind and
+        /// offer, and for a worker no row stands for an unknown runtime
+        /// with `none`, the offer that states nothing.
+        fn member<'a>(
+            row: Option<&'a Arc<RowRemainder>>,
+            none: &'a EncodeOffer,
+        ) -> EncodeMember<'a> {
+            row.map_or(
+                EncodeMember {
+                    runtime: "",
+                    offer: none,
+                },
+                |row| EncodeMember {
+                    runtime: &row.engine_kind,
+                    offer: &row.encode,
+                },
+            )
+        }
+        let lists = [Role::Encode, Role::Prefill].map(|role| self.lent(generation, role));
+        let [encoders, prefills] = self.remainders(lists);
+        let none = EncodeOffer::default();
+        let classes = EncodeClasses::derive(
+            encoders.iter().map(|row| member(row.as_ref(), &none)),
+            prefills.iter().map(|row| member(row.as_ref(), &none)),
+        );
+        let offers = encoders.iter().map(|row| member(row.as_ref(), &none).offer);
+        let prefill_classes = (0..prefills.len()).map(|at| classes.prefill_class(at));
+        EncodeColumns::new(classes.encoder_facts(offers), prefill_classes.collect())
+    }
+
+    /// What the row of each worker of `lists` states, at the worker's
+    /// place in its list, where the row's object still stands for the
+    /// worker: one read of the holder's entry, under its read lock, which
+    /// is let go before a rule runs over what was read.
+    fn remainders<const N: usize>(
+        &self,
+        lists: [LentList<'_>; N],
+    ) -> [Vec<Option<Arc<RowRemainder>>>; N] {
+        let held = self.held.read();
+        lists.map(|list| {
+            let facts = list.facts.unwrap_or_default();
+            let row = |(worker, fact): (&Arc<dyn Worker>, &FixedFacts)| {
+                let laid = held.rows.get(held.objects.get(&fact.id?)?)?;
+                Arc::ptr_eq(&laid.object, worker).then(|| Arc::clone(&laid.remainder))
+            };
+            list.workers.iter().zip(facts).map(row).collect()
+        })
     }
 }
 
@@ -1065,10 +1161,7 @@ mod tests {
             GatewayId, HealthSink, MemoryStore, Overload, Registrant, WorkerFacts, WorkerPatch,
             WorkerStatus,
         },
-        worker_host::{
-            membership_writer::tests::StoreDoor, object, HealthAdapter, KeptCredential, Members,
-            MembershipWriteOutcome, MembershipWriter, Precondition, SoleLead,
-        },
+        worker_host::{object, HealthAdapter, KeptCredential, Members, SoleLead},
     };
 
     const A: &str = "http://a:8000";
@@ -1374,6 +1467,10 @@ mod tests {
         use crate::{
             document::spec::{AppliedSpec, PolicySpec},
             engine::{Decision, DemandFacts, PolicyEngine, Role, ShedReason},
+            worker_host::{
+                membership_writer::tests::StoreDoor, MembershipWriteOutcome, MembershipWriter,
+                Precondition,
+            },
         };
 
         let mut replica = Replica::new();
@@ -1537,6 +1634,65 @@ mod tests {
             };
             assert_eq!(stated(&replica, B), if asked { own } else { none });
         }
+    }
+
+    /// A row that states the external runtime takes no default: its object
+    /// states the thresholds its row names and no other, a queue alone or a
+    /// usage alone, and in any spelling of the runtime's name. An engine's
+    /// row takes the default, one that names its runtime too. A gateway
+    /// registers an engine's worker with its default thresholds (its
+    /// registration workflow's `overload_defaults`) and an external worker
+    /// with none (`build_external_worker`), so until that worker's first
+    /// update its monitor judges it by nothing.
+    #[test]
+    fn an_external_rows_object_states_no_default_threshold() {
+        let defaults = OverloadThresholds {
+            waiting_requests: Some(8),
+            token_usage: Some(0.8),
+        };
+        let mut replica = Replica::new();
+        let registry = Arc::clone(replica.objects.registry());
+        replica.objects = Objects::new(registry).with_overload_thresholds(defaults);
+        let of_kind = |url, kind: &str| WorkerFacts {
+            engine_kind: kind.to_string(),
+            ..facts(url, 1)
+        };
+        replica.store.upsert(of_kind(A, "external"));
+        replica.store.upsert(WorkerFacts {
+            overload: Overload {
+                kv_usage_permille: None,
+                waiting_requests: Some(3),
+            },
+            ..of_kind(B, "external")
+        });
+        replica.store.upsert(facts(C, 1));
+        replica.store.upsert(WorkerFacts {
+            overload: Overload {
+                kv_usage_permille: Some(500),
+                waiting_requests: None,
+            },
+            ..of_kind(D, "external")
+        });
+        replica.store.upsert(of_kind(E, "vllm"));
+        replica.store.upsert(of_kind(F, "EXTERNAL"));
+        replica.follow();
+
+        let stated = |url| replica.at(url).metadata().overload;
+        let queue = OverloadThresholds {
+            waiting_requests: Some(3),
+            token_usage: None,
+        };
+        let usage = OverloadThresholds {
+            waiting_requests: None,
+            token_usage: Some(0.5),
+        };
+        let none = OverloadThresholds::default();
+        assert_eq!(stated(A), none);
+        assert_eq!(stated(B), queue, "an external row states its own alone");
+        assert_eq!(stated(D), usage, "and no default queue beside its usage");
+        assert_eq!(stated(F), none, "in any spelling of the name");
+        assert_eq!(stated(C), defaults, "an engine's row takes the default");
+        assert_eq!(stated(E), defaults, "one that names its runtime too");
     }
 
     /// The first act: by the snapshot for a row that stood before the first
@@ -1895,6 +2051,18 @@ mod tests {
             replica.lay_again(&facts(A, 1));
         }
         assert!(replica.holds_credential(A, Some(KEY_B)));
+    }
+
+    /// One registration that keeps its credential at a time: its write
+    /// runs inside the holder's keeping turn, and the turn is let go
+    /// behind it.
+    #[test]
+    fn a_keeping_write_runs_in_a_turn_of_its_own() {
+        let replica = Replica::new();
+        let objects = &replica.objects;
+        let held = objects.keeping(A, None, || objects.keeping.is_locked());
+        assert_eq!(held, Ok(true), "the write runs inside the turn");
+        assert!(!objects.keeping.is_locked(), "let go behind the write");
     }
 
     #[test]

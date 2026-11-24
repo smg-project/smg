@@ -179,11 +179,14 @@ pub trait RequestMaker {
     }
 
     /// Whether the request's caller sends it to `target`, a target of the
-    /// decision's pick. A decision made inside the host's token tree
-    /// ([`Self::token_key`]) asks it of the pick's targets, best first, and
-    /// the tree stores the prompt for the first one answered `true`: for
-    /// none where each is answered `false`, so the tree names no worker
-    /// the request was not sent to.
+    /// decision's pick. A decision that stores where its prompt went, in
+    /// the host's token tree ([`Self::token_key`]) or in the engine's
+    /// record of sent prefixes, asks it of the pick's targets, best first,
+    /// and stores the prompt for the first one answered `true`: for none
+    /// where each is answered `false`, so neither names a worker the
+    /// request was not sent to. A pair's decode decided again asks it of
+    /// each target, and its maker answers for the target's decode alone:
+    /// the prefill a target names was sent already.
     ///
     /// It is asked behind the pick and ahead of the decision's lease,
     /// inside the decision: an answer asks the engine nothing. No other
@@ -191,8 +194,8 @@ pub trait RequestMaker {
     ///
     /// `true` from a maker that does not say: its caller sends to the
     /// first target of a decision. A maker whose caller may send to a
-    /// later target answers it, or the tree names the first target for a
-    /// prompt that went to another.
+    /// later target answers it, or the first target is named for a prompt
+    /// that went to another.
     #[cfg(feature = "in-process")]
     fn sends_to(&self, target: &Target) -> bool {
         let _ = target;
@@ -278,7 +281,8 @@ pub enum WorkerLists<'a> {
     /// The host hands no list.
     #[default]
     None,
-    /// A single request's list.
+    /// A single request's list, and the one list of a request of another
+    /// phase that stands alone.
     Single(super::list_cell::LentList<'a>),
     /// A pair's two lists, its prefills and its decodes, with the pair
     /// classes of their workers and the host's reads of its admission.

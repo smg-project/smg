@@ -150,6 +150,8 @@ impl WorkerLoadGuard {
 
     /// The guard's one copy of the key, made by the constructor that resolved
     /// it; the worker's keyed-load bookkeeping borrows it from here on.
+    // Always in line: on every request's path, and the call cost more than the body.
+    #[inline(always)]
     fn with_owned_key(worker: Arc<dyn Worker>, routing_key: Option<String>) -> Self {
         worker.increment_load();
         Self::from_acquired_load(worker, routing_key)
@@ -224,6 +226,8 @@ impl WorkerLoadGuard {
 }
 
 impl Drop for WorkerLoadGuard {
+    // Always in line: on every request's path, and the call cost more than the body.
+    #[inline(always)]
     fn drop(&mut self) {
         self.worker.decrement_load();
         if let Some(ref key) = self.routing_key {

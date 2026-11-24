@@ -159,7 +159,7 @@ pub(crate) struct Shared {
     /// The election's last sight of the lease.
     pub(crate) standing: watch::Receiver<ElectionObservation>,
     /// The controller's store: what the calls feed and read, and the run
-    /// loop's drivers with them.
+    /// loop's tasks with them.
     pub(crate) store: Arc<MemoryStore>,
     /// Who is present: the gateways a `Session` welcomed, over this fence
     /// and this store.
@@ -172,6 +172,9 @@ pub(crate) struct Shared {
     /// The membership door over that store: the control scope's
     /// registration calls.
     pub(crate) door: MembershipCalls,
+    /// The replica's worker objects: what a standby's applier lays its
+    /// leader's rows as, and what the door decides a row's write over.
+    pub(crate) objects: Arc<Objects<Members>>,
     /// The replication scope's calls over that store and its log.
     pub(crate) replication: Replication,
     /// The threads the decisions run on, a model's on one.
@@ -271,6 +274,7 @@ impl Shared {
             fence: elector.fence(),
             standing,
             generations: Arc::clone(&generations),
+            objects: Arc::clone(&objects),
             // The door decides a row's write over the worker objects its
             // deciding threads read.
             door: MembershipCalls::new(Arc::clone(&store), Arc::clone(&feed.log), objects),

@@ -54,8 +54,9 @@
 //! [`WarmUpRule`]: crate::engine::WarmUpRule
 
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     fmt, mem,
+    rc::Rc,
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, OnceLock,
@@ -64,7 +65,9 @@ use std::{
 };
 
 use arc_swap::ArcSwapOption;
-use kv_index::{ChainIndex, TenantId, TokenTree};
+use kv_index::{
+    chain_prefix_hash, ChainIndex, ContentHash, GroupViews, SequenceHash, TenantId, TokenTree,
+};
 use parking_lot::{Mutex, RwLock, RwLockWriteGuard};
 use rustc_hash::{FxHashMap, FxHashSet};
 use smg_worker::identity::basic::Worker;
@@ -162,6 +165,151 @@ impl CacheIndex for ChainIndex {
     }
 }
 
+/// [`CacheIndex::deepest_into`] for a host that keeps its workers' cache
+/// groups beside its chain index.
+///
+/// On a fleet with no worker that keeps groups the chain index keeps the
+/// deepest holders itself, and nothing is allocated. Where a worker keeps
+/// cache groups, every holder's depth is first lowered to what its groups
+/// can serve ([`kv_index::WorkerGroups::cap`]), a holder lowered to nothing
+/// leaves, and the deepest are kept after.
+#[inline]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the lookup's own arguments, beside the index and its groups"
+)]
+pub fn deepest_within_groups(
+    index: &ChainIndex,
+    groups: &GroupViews,
+    block_hashes: &[u64],
+    block_size: u32,
+    within: &[u64],
+    cap: usize,
+    below: &mut dyn FnMut(u32) -> u32,
+    kept: &mut Vec<(u32, u32)>,
+) {
+    if groups.is_empty() {
+        index.deepest_into(block_hashes, |hash| *hash, within, cap, below, kept);
+        return;
+    }
+    kept.clear();
+    index.score_into(
+        block_hashes,
+        |hash| *hash,
+        false,
+        |worker, depth| {
+            if is_set(within, worker as usize) {
+                kept.push((worker, depth));
+            }
+        },
+    );
+    keep_within_groups(Some(groups), block_hashes, block_size, cap, below, kept);
+}
+
+/// [`deepest_within_groups`] over holders a host scored by an index of its
+/// own: each of `holders` is a worker's number and the count of leading
+/// blocks it holds. Those `within` names go to `kept`, which is emptied
+/// first. Each is lowered to what its groups can serve, and the deepest are
+/// kept.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the lookup's own arguments, beside the holders and their groups"
+)]
+pub fn deepest_of_within_groups(
+    holders: impl IntoIterator<Item = (u32, u32)>,
+    groups: &GroupViews,
+    block_hashes: &[u64],
+    block_size: u32,
+    within: &[u64],
+    cap: usize,
+    below: &mut dyn FnMut(u32) -> u32,
+    kept: &mut Vec<(u32, u32)>,
+) {
+    kept.clear();
+    let holders = holders.into_iter();
+    kept.extend(holders.filter(|&(worker, _)| is_set(within, worker as usize)));
+    let groups = (!groups.is_empty()).then_some(groups);
+    keep_within_groups(groups, block_hashes, block_size, cap, below, kept);
+}
+
+thread_local! {
+    /// The calling thread's own list for a request's chain of prefix
+    /// hashes, taken for one lookup and put back behind it: the chain
+    /// allocates nothing once the list has grown to the depth of the
+    /// thread's deepest holder.
+    static PREFIXES: Cell<Vec<SequenceHash>> = const { Cell::new(Vec::new()) };
+}
+
+/// Lowers each holder of `kept` to what its cache groups can serve, where
+/// the host's workers keep `groups`, and keeps the deepest, at most `cap`.
+///
+/// The request's chain of prefix hashes is made from its block hashes in
+/// the calling thread's own list ([`PREFIXES`]), no further than the depth
+/// of the deepest holder with a group view: no view reads the chain past
+/// its holder's depth.
+fn keep_within_groups(
+    groups: Option<&GroupViews>,
+    block_hashes: &[u64],
+    block_size: u32,
+    cap: usize,
+    below: &mut dyn FnMut(u32) -> u32,
+    kept: &mut Vec<(u32, u32)>,
+) {
+    if let Some(groups) = groups {
+        let table = groups.read();
+        // A lookup made while its thread ends finds the thread's list
+        // gone and takes a list of its own.
+        let mut prefixes = PREFIXES.try_with(Cell::take).unwrap_or_default();
+        prefixes.clear();
+        kept.retain_mut(|(worker, depth)| {
+            let Some(view) = table.view(*worker) else {
+                return true;
+            };
+            // A holder's groups read the chain no further than its depth.
+            let until = (*depth as usize).min(block_hashes.len());
+            for &hash in block_hashes.get(prefixes.len()..until).unwrap_or_default() {
+                // The chain's first hash is the first block's own.
+                let prefix = prefixes.last().map_or(SequenceHash(hash), |&last| {
+                    chain_prefix_hash(last, ContentHash(hash))
+                });
+                prefixes.push(prefix);
+            }
+            *depth = (*depth).min(view.cap(&prefixes, *depth, block_size as usize).depth);
+            *depth > 0
+        });
+        let _ = PREFIXES.try_with(|list| list.set(prefixes));
+    }
+    keep_deepest(kept, cap, below);
+}
+
+/// Keeps the deepest of `kept`, at most `cap`, as the chain index's capped
+/// lookup does: every holder of a depth that fits whole, from the deepest
+/// down, and of the depth the cap cuts as many as fit, each as likely as
+/// another by `below`, which is asked for a value under its argument.
+fn keep_deepest(kept: &mut Vec<(u32, u32)>, cap: usize, below: &mut dyn FnMut(u32) -> u32) {
+    if kept.len() <= cap {
+        return;
+    }
+    kept.sort_unstable_by_key(|&(_, depth)| std::cmp::Reverse(depth));
+    let Some(&(_, cut)) = kept.get(cap) else {
+        return;
+    };
+    // The holders of the depth the cap cuts, and those of them that fit.
+    let from = kept.partition_point(|&(_, depth)| depth > cut);
+    let until = kept.partition_point(|&(_, depth)| depth >= cut);
+    let room = cap.saturating_sub(from);
+    for taken in 0..room {
+        let left = until - from - taken;
+        if left < 2 {
+            break;
+        }
+        let left = u32::try_from(left).unwrap_or(u32::MAX);
+        let drawn = below(left).min(left - 1) as usize;
+        kept.swap(from + taken, from + taken + drawn);
+    }
+    kept.truncate(cap);
+}
+
 /// Where a host keeps its models' indexes of cache events, and its trees
 /// of the prompts it sent.
 pub trait CacheIndexes: Send + Sync {
@@ -203,6 +351,9 @@ pub struct Affinity {
     /// change of membership and at the timer's sweep: never by a decision's naming
     /// or its write, which hold their record by the list's table.
     records: Mutex<FxHashMap<Box<str>, Arc<PrefixRecord>>>,
+    /// What the records that left the map had left out
+    /// ([`Self::left_out`]). Written under the map's mutex.
+    left_out: AtomicU64,
 }
 
 impl fmt::Debug for Affinity {
@@ -255,24 +406,51 @@ impl Affinity {
     /// placements of workers that left, and the blocks past a bound that
     /// came down. For the engine's timer. A record a decision holds is
     /// passed over.
+    ///
+    /// A record leaves the map here once the map alone holds it and it
+    /// holds no worker's place: no list's table reads it, and every worker
+    /// it was written for was forgotten. So a model's record goes behind
+    /// its last worker, and a record with no placement yet can go between
+    /// two tables of its list. The model's next table read makes a fresh
+    /// record. A pick named from a record that left writes to the fresh
+    /// one or writes nothing: an entry is a prediction, and the next
+    /// request of the prefix writes it.
     pub fn sweep(&self) {
-        for record in self.records.lock().values() {
-            if record.sweeping.load(Ordering::Relaxed) {
-                if let Some(mut predictor) = record.predictor.try_write() {
-                    record.sweep(&mut predictor);
+        let mut records = self.records.lock();
+        // Nobody takes a record from the map but by a clone under this
+        // mutex, so one the map alone holds is read by no table and written
+        // by no pick.
+        let left: Vec<_> = records
+            .extract_if(|_, record| {
+                let lone = Arc::get_mut(record)
+                    .is_some_and(|record| record.predictor.get_mut().held().next().is_none());
+                if !lone && record.sweeping.load(Ordering::Relaxed) {
+                    if let Some(mut predictor) = record.predictor.try_write() {
+                        record.sweep(&mut predictor);
+                    }
                 }
-            }
-        }
+                lone
+            })
+            .collect();
+        let left_out = left
+            .iter()
+            .map(|(_, record)| record.left_out.load(Ordering::Relaxed))
+            .sum();
+        self.left_out.fetch_add(left_out, Ordering::Relaxed);
+        // What left is freed once the mutex is given back, so the read of a
+        // list's table waits for no free.
+        drop(records);
     }
 
     /// How many picks' prefixes the records left out in whole or in part,
-    /// every model's together: a write that meets a held record ends there
-    /// and waits for nobody. For a host's own count beside its count of
-    /// decisions, never for a decision.
+    /// every model's together, those of the records that left the map among
+    /// them: a write that meets a held record ends there and waits for
+    /// nobody. For a host's own count beside its count of decisions, never
+    /// for a decision.
     pub fn left_out(&self) -> u64 {
         let records = self.records.lock();
         let left_out = |record: &Arc<PrefixRecord>| record.left_out.load(Ordering::Relaxed);
-        records.values().map(left_out).sum()
+        self.left_out.load(Ordering::Relaxed) + records.values().map(left_out).sum::<u64>()
     }
 
     /// The record of `model`, made at its first asking and held to `bound`
@@ -303,8 +481,9 @@ struct PrefixRecord {
     bound: AtomicUsize,
     /// Work waits for a sweep: a worker left, or the bound came down.
     sweeping: AtomicBool,
-    /// How many workers were told gone. Written under the record's write
-    /// guard: a write in parts stops where it moved since its naming.
+    /// How many leaves were told. Written under the record's guard, a
+    /// reader's where the leave takes no place out: a write in parts stops
+    /// where it moved since its naming.
     left: AtomicU64,
     /// How many writes ended before the request's last block, a turn of
     /// theirs having met a held lock. Written by such a write alone, so a
@@ -375,10 +554,18 @@ impl PrefixRecord {
         }
     }
 
+    /// Counts the leave also where the record holds no place for `worker`:
+    /// a pick named ahead of the leave would give the worker its first
+    /// place, and its write stops where the count moved. The count moves
+    /// under the guard that reads or clears the place, so no read pairs
+    /// the count behind a leave with the place ahead of it.
     fn forget(&self, worker: WorkerId) {
-        if !self.predictor.read().holds(worker) {
+        let held = self.predictor.read();
+        if !held.holds(worker) {
+            self.left.fetch_add(1, Ordering::Relaxed);
             return;
         }
+        drop(held);
         let mut predictor = self.predictor.write();
         self.left.fetch_add(1, Ordering::Relaxed);
         predictor.forget(worker);
@@ -386,9 +573,11 @@ impl PrefixRecord {
     }
 
     /// Forgets every worker the record holds a place for that is not in
-    /// `standing` ([`Self::forget`]).
+    /// `standing` ([`Self::forget`]), and counts one leave ahead of them: a
+    /// worker `standing` names no more may be under its first pick.
     fn keep(&self, standing: &FxHashSet<WorkerId>) {
         let held = self.predictor.read();
+        self.left.fetch_add(1, Ordering::Relaxed);
         let gone: Vec<WorkerId> = held
             .held()
             .filter(|worker| !standing.contains(worker))
@@ -1135,18 +1324,21 @@ impl Buffers {
 
 /// Runs `with` over the calling thread's buffers.
 fn with_buffers<T>(with: impl FnOnce(&mut Buffers) -> T) -> T {
-    BUFFERS.with(|buffers| match buffers.try_borrow_mut() {
-        Ok(mut buffers) => with(&mut buffers),
+    // The key's own call hands out the pointer alone: what a decision
+    // answers through that call is copied on its way out of it.
+    let buffers = BUFFERS.with(Rc::clone);
+    let Ok(mut buffers) = buffers.try_borrow_mut() else {
         // A stage asked for a decision from inside this one, on this
         // thread: that decision takes buffers of its own.
-        Err(_) => with(&mut Buffers::new()),
-    })
+        return with(&mut Buffers::new());
+    };
+    with(&mut buffers)
 }
 
 thread_local! {
     /// The calling thread's buffers: a naming allocates nothing once they
     /// have grown to a request's blocks and the profile's cap.
-    static BUFFERS: RefCell<Buffers> = const { RefCell::new(Buffers::new()) };
+    static BUFFERS: Rc<RefCell<Buffers>> = Rc::new(RefCell::new(Buffers::new()));
 }
 
 /// The list one decision is made over and the place it is decided for.
@@ -1169,8 +1361,9 @@ struct Asked<'a> {
 /// It names the request's rows from the host's own data, hands them to
 /// `decide` in the request's facts ([`RequestFacts::named`]) and returns
 /// what `decide` answers. Where that is a pick and the record of sent
-/// prefixes speaks for the first target, the request's prefix is written
-/// for it: the record says where a prefix was decided to go.
+/// prefixes speaks for the target the request goes to, the first one its
+/// caller sends to (`sends_to`), the request's prefix is written for it:
+/// the record says where a prefix was sent.
 ///
 /// `workers` is the list the decision is made over and `pool` what the
 /// engine keeps beside that list. `ids` holds the workers' ids by their
@@ -1199,8 +1392,9 @@ struct Asked<'a> {
 ///
 /// `sends_to` says whether the request's caller sends it to a target of the
 /// pick ([`RequestMaker::sends_to`]). A decision made inside the tree's
-/// match asks it of the pick's targets, best first, and the tree stores the
-/// request's pages for the first one it takes. No other decision asks it.
+/// match, and one the record is written behind, asks it of the pick's
+/// targets, best first: the tree stores the request's pages, and the record
+/// its prefix, for the first one it takes. No other decision asks it.
 ///
 /// A pick states what its first target holds of the request ([`Overlap`]),
 /// from the rows its decision was given: the rows named here, the column
@@ -1349,11 +1543,12 @@ fn state(decision: &mut Decision, feed: Feed<'_>, facts: &RequestFacts<'_>, bloc
     }
 }
 
-/// The worker a decision sent its request to, where the profile is told of
-/// the request: the pick's first target, and none for a pick the binding's
-/// sessions rule placed alone and keeps from the profile
-/// ([`lease_events::stages_hear`]). The one test in front of every write
-/// that keeps where a prompt went.
+/// Whether the profile is told of a decision's pick: the pick's first
+/// target where it is, and none for a decision that picked nobody and for
+/// a pick the binding's sessions rule placed alone and keeps from the
+/// profile ([`lease_events::stages_hear`]). The one test in front of every
+/// write that keeps where a prompt went. A single's writes name the worker
+/// the request goes to ([`sent_target`]), which may be a later target.
 ///
 /// The rule's word is read through that one function at five places: the
 /// words of a single's lease, the record's two writes here, the store of a
@@ -1374,7 +1569,8 @@ pub(super) fn told_target(decision: &Decision) -> Option<&Target> {
 /// Behind a pick made over a column ([`column()`]): records the request's
 /// prefix as sent to the picked worker `id`, where the record of sent
 /// prefixes speaks for that worker. The record says where a prefix was
-/// decided to go.
+/// sent, and this write has no `sends_to` to ask: `id` is the worker its
+/// caller says the request goes to.
 ///
 /// `pool`, `phase` and `facts` are the ones the column was filled with, and
 /// `read` is what that fill returned. A worker the index speaks for, a
@@ -1440,21 +1636,30 @@ impl PoolAffinity {
     }
 }
 
-/// The address of the worker a decision's request goes to, in the list it
-/// was made over: the first target of a pick the profile is told of
-/// ([`told_target`]) that the request's caller sends to (`sends_to`),
-/// asked best first. It is the worker a tree's match writes the request's
-/// prefix for. `None` where the decision picked nobody, the binding's
-/// sessions rule keeps the request from the profile, or the caller sends
-/// to none of the pick's targets, and the tree stores nothing.
+/// The target a decision's request goes to: the first target of a pick the
+/// profile is told of ([`told_target`]) that the request's caller sends to
+/// (`sends_to`), asked best first. It is the worker a tree's match, the
+/// record's two writes and a pair's two writes behind its first pick keep
+/// the request's prefix for. `None` where the decision picked nobody, the
+/// binding's sessions rule keeps the request from the profile, or the
+/// caller sends to none of the pick's targets: nothing is stored.
+pub(super) fn sent_target(
+    decision: &Decision,
+    sends_to: impl Fn(&Target) -> bool,
+) -> Option<&Target> {
+    told_target(decision)?;
+    let mut targets = decision.pick()?.targets.iter();
+    targets.find(|target| sends_to(target))
+}
+
+/// The address of the worker a decision's request goes to
+/// ([`sent_target`]), in the list it was made over.
 fn sent_address<'w>(
     workers: &'w [Arc<dyn Worker>],
     decision: &Decision,
     sends_to: impl Fn(&Target) -> bool,
 ) -> Option<&'w str> {
-    told_target(decision)?;
-    let mut targets = decision.pick()?.targets.iter();
-    let target = targets.find(|target| sends_to(target))?;
+    let target = sent_target(decision, sends_to)?;
     Some(workers.get(target.position as usize)?.url())
 }
 
@@ -1476,7 +1681,7 @@ impl Table {
             return decide(facts);
         }
         if self.cap == 0 {
-            return self.decide_by_column(facts, buffers, decide);
+            return self.decide_by_column(facts, buffers, sends_to, decide);
         }
         // The entry is asked for where the host lends the place a tree,
         // once, by the tree's own page.
@@ -1504,7 +1709,8 @@ impl Table {
         };
         // The index speaks for a worker whose cache events are heard: the
         // record takes no entry for it.
-        let Some(target) = told_target(&decision).filter(|to| !self.heard(to.position)) else {
+        let sent = sent_target(&decision, sends_to);
+        let Some(target) = sent.filter(|to| !self.heard(to.position)) else {
             return decision;
         };
         let held = buffers.deepest.contains(&target.id);
@@ -1577,6 +1783,7 @@ impl Table {
         &self,
         facts: &RequestFacts<'_>,
         buffers: &mut Buffers,
+        sends_to: impl Fn(&Target) -> bool,
         decide: impl FnOnce(&mut RequestFacts<'_>) -> Decision,
     ) -> Decision {
         // The column leaves the buffers while the fill writes the others.
@@ -1593,7 +1800,8 @@ impl Table {
         let (Some(read), Some(record)) = (read, self.record.as_deref()) else {
             return decision;
         };
-        let Some(target) = told_target(&decision).filter(|to| !self.heard(to.position)) else {
+        let sent = sent_target(&decision, sends_to);
+        let Some(target) = sent.filter(|to| !self.heard(to.position)) else {
             return decision;
         };
         let held = read.deepest.contains(&target.position);

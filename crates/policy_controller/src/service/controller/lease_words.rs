@@ -55,6 +55,13 @@ use crate::{
 /// side the lease held live, the frame's side or with none every side
 /// ([`Sides::ending`]).
 ///
+/// The dispatch of a single request its sessions rule keeps from the
+/// profile ([`LeaseRecord::untold`]) is told to the session table alone,
+/// where the key's pin moves. No count of sends takes it, under whichever
+/// generation `world` holds, and no stage hears it, as under a host that
+/// holds its decisions (`lease_events::single`). Its end and its release
+/// are told as any lease's.
+///
 /// Its caller is whoever applies the report, under the turn of the leases'
 /// file: what it calls is bounded and takes no door of the leases. It
 /// enters as the decider whose file the lease is on, on whichever thread
@@ -67,6 +74,8 @@ use crate::{
 /// applied and the fault is counted on the store
 /// ([`MemoryStore::lifecycle_faults`]). It costs no request its decision
 /// and ends no thread.
+///
+/// [`LeaseRecord::untold`]: crate::store::LeaseRecord::untold
 pub(crate) fn told(
     store: &MemoryStore,
     world: &StoreSnapshot,
@@ -126,13 +135,18 @@ fn tell(world: &StoreSnapshot, found: &Sides, said: Said, listed: &impl Fn(Worke
                 target_index: dispatch.target_index,
                 ..lease
             };
-            spec.engine().dispatched_sent(
-                &lease,
-                &target,
-                dispatch.side,
-                dispatch.since_decision_micros,
-                || listed(id, dp_rank),
-            );
+            // A request its sessions rule keeps from the profile is none
+            // of the profile's sends, and no stage hears its dispatch.
+            let own = !found.record.untold;
+            if own {
+                spec.engine().dispatched_sent(
+                    &lease,
+                    &target,
+                    dispatch.side,
+                    dispatch.since_decision_micros,
+                    || listed(id, dp_rank),
+                );
+            }
             // The table hears first and the stages last. A stage's call
             // that unwinds there leaves the table's entry written.
             if let Some(engine) = issuing() {
@@ -142,7 +156,7 @@ fn tell(world: &StoreSnapshot, found: &Sides, said: Said, listed: &impl Fn(Worke
                     // pick's, and this dispatch books it: the stages hear
                     // its issue first, as they hear every side's.
                     chosen_dispatched(world, engine, found, &lease, &target, dispatch, at);
-                } else {
+                } else if own {
                     engine.dispatched_stages(
                         &lease,
                         &target,
@@ -175,9 +189,9 @@ fn tell(world: &StoreSnapshot, found: &Sides, said: Said, listed: &impl Fn(Worke
 /// instant. A side filed later is told here under its
 /// lease dated `at`, the instant of that filing as its caller states it.
 /// A served controller files a side later for a pair whose frame stated
-/// the later decode: at the dispatch that sends the side with no call,
-/// dated by the read of that dispatch's frame. It serves no decode call
-/// yet: on the day it does, the date is the decider's read at the call.
+/// the later decode: at its decode call, dated by the decider's read at
+/// the call, or at the dispatch that sends the side with no call, dated by
+/// the read of that dispatch's frame.
 /// The lease on file keeps the instant of the pair's first decision for
 /// its other words.
 ///
@@ -185,7 +199,7 @@ fn tell(world: &StoreSnapshot, found: &Sides, said: Said, listed: &impl Fn(Worke
 /// its newest as a clock that went back, and ends what it passed. So a
 /// later issue bears neither the instant of that first decision nor the
 /// date a gateway gives a dispatch.
-fn issued_later(
+pub(crate) fn issued_later(
     world: &StoreSnapshot,
     engine: &Engine,
     lease: &Lease,

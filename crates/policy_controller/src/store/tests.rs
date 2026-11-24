@@ -92,6 +92,7 @@ fn lease(gateway: GatewayId, id: u64, term: u64, now: Instant) -> LeaseRecord {
         target: WorkerId(7),
         picked: PickRecord::default(),
         decode: None,
+        untold: false,
         term,
         issued_at: now,
         dispatch_deadline: now + Duration::from_secs(1),
@@ -2029,6 +2030,32 @@ fn issue_pair(
     leases.issue_pair(record, decode)
 }
 
+/// A pair's record states no word of a request kept from its profile: the
+/// door that files a pair clears it, as it writes the pair's mark, so both
+/// sides of a pair are told whatever a caller wrote. A single's record
+/// keeps the word as it was filed.
+#[test]
+fn the_door_that_files_a_pair_clears_the_word_of_a_kept_request() {
+    let store = MemoryStore::new();
+    let [p, d] = ["p", "d"].map(|name| ready(&store, &format!("http://{name}:1")));
+    let leases: &dyn LeasesStore = &store;
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    leases.set_term(1);
+    let kept = LeaseRecord {
+        untold: true,
+        ..booking(gateway, 1, p, now)
+    };
+    leases.issue(kept).expect("free");
+    let (record, decode) = pair(2, p, &[d], now);
+    let kept = LeaseRecord {
+        untold: true,
+        ..record
+    };
+    issue_pair(leases, (kept, decode)).expect("free");
+    let word = |id| leases.get(gateway, LeaseId(id)).expect("on file").untold;
+    assert_eq!((word(1), word(2)), (true, false));
+}
+
 /// A dispatch of `side` on the pick's target at `index`.
 fn on(side: Side, index: u8) -> Dispatch {
     Dispatch {
@@ -2262,10 +2289,8 @@ fn a_dispatch_on_a_chosen_side_books_it_once_as_it_lands() {
     let leases: &dyn LeasesStore = &store;
     let (gateway, now) = (GatewayId(1), Instant::now());
     leases.set_term(1);
-    for (index, target, booked_index, counts) in
-        [(1, d1, 1, [1, 0, 1]), (u8::MAX, d0, 0, [1, 1, 0])]
-    {
-        let id = LeaseId(u64::from(index));
+    for (index, target, counts) in [(1, d1, [1, 0, 1]), (0, d0, [1, 1, 0])] {
+        let id = LeaseId(u64::from(index) + 1);
         let (record, decode) = chosen_pair(id.0, p, &[d0, d1], now);
         issue_pair(leases, (record, decode)).expect("the key is free");
         assert!(leases.dispatched(gateway, id, on(Side::Prefill, 0), now));
@@ -2278,19 +2303,86 @@ fn a_dispatch_on_a_chosen_side_books_it_once_as_it_lands() {
             filed.decode,
             Some(DecodeSide {
                 target,
-                target_index: booked_index,
+                target_index: index,
                 state: LeaseState::Dispatched { at },
                 ..decode
             })
         );
         assert_eq!(booked(&store, &[p, d0, d1]), counts);
         assert_eq!(store.queued(), 0);
-        assert!(leases.dispatched(gateway, id, on(Side::Decode, 0), now));
+        // A second word, on the pick's other target, moves nothing.
+        assert!(leases.dispatched(gateway, id, on(Side::Decode, 1 - index), now));
         assert_eq!(leases.sides(gateway, id), Some(filed));
         assert_eq!(booked(&store, &[p, d0, d1]), counts);
         assert!(leases.released(gateway, id, None, ReleaseReason::ClientGone));
         assert_eq!(booked(&store, &[p, d0, d1]), [0, 0, 0]);
     }
+}
+
+/// A dispatch at an index the pick holds no target at names no worker. A
+/// chosen side takes nothing of it: the side stays chosen on its pick's
+/// first decode and books none, and the door still answers that the lease
+/// is on file. Behind the word a call issues the side, a dispatch that
+/// names a target books that target, and the side's release frees no
+/// count. The pick is as wide as a record keeps one, four targets, so the
+/// first index past it is the first that no record holds.
+#[test]
+fn a_dispatch_at_an_index_its_pick_holds_no_target_at_leaves_a_chosen_side_as_it_stood() {
+    let store = MemoryStore::new();
+    let keys = ["p", "d0", "d1", "d2", "d3"].map(|name| format!("http://{name}:1"));
+    let workers = keys.map(|key| ready(&store, &key));
+    let [p, d0, d1, d2, d3] = workers;
+    let leases: &dyn LeasesStore = &store;
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    leases.set_term(1);
+    let at = now + Duration::from_secs(8);
+    // A pair of four targets with its prefill sent, and the word said past
+    // them: at the first index the pick does not hold, and at a byte's
+    // last.
+    let past_its_pick = |id: u64| {
+        let id = LeaseId(id);
+        let (record, decode) = chosen_pair(id.0, p, &[d0, d1, d2, d3], now);
+        issue_pair(leases, (record, decode)).expect("the key is free");
+        assert!(leases.dispatched(gateway, id, on(Side::Prefill, 0), now));
+        let filed = leases.sides(gateway, id);
+        for index in [4, u8::MAX] {
+            assert!(leases.dispatched(gateway, id, on(Side::Decode, index), at));
+        }
+        assert_eq!(leases.sides(gateway, id), filed);
+        assert_eq!(filed.and_then(|sides| sides.decode), Some(decode));
+        assert_eq!(booked(&store, &workers), [1, 0, 0, 0, 0]);
+        id
+    };
+
+    // A call behind the word issues the side, on its own pick's first
+    // decode.
+    let id = past_its_pick(1);
+    let (_, called) = pair(id.0, p, &[d1, d0], now);
+    assert_eq!(leases.issue_decode(gateway, id, called, now), Ok(()));
+    assert_eq!(booked(&store, &workers), [1, 0, 1, 0, 0]);
+    assert!(leases.released(gateway, id, None, ReleaseReason::ClientGone));
+
+    // A dispatch behind it that names a target books that target: here
+    // the pick's last.
+    let id = past_its_pick(2);
+    assert!(leases.dispatched(gateway, id, on(Side::Decode, 3), at));
+    let sent = (
+        LeaseState::Dispatched { at: now },
+        LeaseState::Dispatched { at },
+    );
+    assert_eq!(sides(&store, id.0), Some(sent));
+    assert_eq!(booked(&store, &workers), [1, 0, 0, 0, 1]);
+    assert!(leases.released(gateway, id, None, ReleaseReason::ClientGone));
+
+    // A release of the side behind it ends the side and frees no count.
+    let id = past_its_pick(3);
+    assert!(leases.released(gateway, id, Some(Side::Decode), ReleaseReason::ClientGone));
+    let gone = LeaseState::Released(ReleaseReason::ClientGone);
+    let ended = (LeaseState::Dispatched { at: now }, gone);
+    assert_eq!(sides(&store, id.0), Some(ended));
+    assert_eq!(booked(&store, &workers), [1, 0, 0, 0, 0]);
+    assert!(leases.completed(gateway, id, &done(Side::Prefill)));
+    assert_eq!(booked(&store, &workers), [0, 0, 0, 0, 0]);
 }
 
 #[test]
@@ -4667,6 +4759,150 @@ fn a_decode_take_back_looks_up_the_lease_once() {
     LEASE_HASHES.set(0);
     assert!(store.take_back_decode(gateway, id, ReleaseReason::Abandoned));
     assert_eq!(LEASE_HASHES.get(), 1);
+}
+
+/// The pair a decode call reads ahead of its decision is the lease's own:
+/// its prefill's worker, then the worker and the rank of the decode its
+/// first decision chose for the target the prefill's dispatch took, the
+/// pick's first or the one that dispatch named. A side a call issued and a
+/// take-back put back names the first decision's decode again. The read is
+/// refused under the name its issue is refused under, it gives the file's
+/// turn back with its answer, and it moves nothing.
+#[cfg(feature = "controller")]
+#[test]
+fn the_held_pair_names_the_prefill_and_the_decode_of_the_target_its_dispatch_took() {
+    use DecodeRefused::{DecodeStands, NoLease, NotChosen, PrefillNotHeld};
+
+    let store = MemoryStore::new();
+    let keys = ["http://p:1", "http://d0:1", "http://d1:1", "http://d2:1"];
+    let [p, d0, d1, d2] = keys.map(|key| ready(&store, key));
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    store.set_term(1);
+    // A pick of three targets on the one prefill, each decode at a rank of
+    // its own: the pair filed with its decode side chosen where `later`.
+    let filed = |id: u64, later: bool| {
+        let (mut record, mut decode) = pair(id, p, &[d0, d1, d2], now);
+        let mut targets = Targets::new();
+        for (decode_id, decode_dp_rank) in [(d0, 2), (d1, 3), (d2, 5)] {
+            let pair = decision::Pair {
+                decode_id,
+                decode_dp_rank,
+                ..Default::default()
+            };
+            targets.push(Target {
+                id: p,
+                pair: Some(pair),
+                ..Target::default()
+            });
+        }
+        (record.picked, decode.picked) =
+            (PickRecord::of(&targets), PickRecord::of_decodes(&targets));
+        if later {
+            decode.state = LeaseState::Chosen;
+        }
+        issue_pair(&store, (record, decode)).expect("the key is free");
+    };
+    for id in 1..=3 {
+        filed(id, true);
+    }
+    filed(4, false);
+    store
+        .issue(booking(gateway, 5, p, now))
+        .expect("the key is free");
+    let file = || {
+        let sides = [1, 2, 3, 4, 5].map(|id| LeasesStore::sides(&store, gateway, LeaseId(id)));
+        (sides, booked(&store, &[p, d0, d1, d2]), store.queued())
+    };
+    let held = |owner: GatewayId, id: u64| {
+        let before = file();
+        let held = store.held_pair(owner, LeaseId(id));
+        assert!(store.unlocked(), "the turn is given back");
+        assert_eq!(file(), before, "the read moves nothing");
+        held
+    };
+    // No prefill was sent yet.
+    assert_eq!(held(gateway, 1), Err(PrefillNotHeld));
+    // The prefill's dispatch names the pick's first target, then another.
+    assert!(store.dispatched(gateway, LeaseId(1), on(Side::Prefill, 0), now));
+    assert!(store.dispatched(gateway, LeaseId(2), on(Side::Prefill, 2), now));
+    assert!(store.dispatched(gateway, LeaseId(4), on(Side::Prefill, 0), now));
+    assert_eq!(held(gateway, 1), Ok((p, Some((d0, 2)))));
+    assert_eq!(held(gateway, 2), Ok((p, Some((d2, 5)))));
+    // Each refusal by its name: another gateway's id, a prefill not sent,
+    // a pair filed whole and a single's lease.
+    assert_eq!(held(GatewayId(2), 1), Err(NoLease));
+    assert_eq!(held(gateway, 3), Err(PrefillNotHeld));
+    assert_eq!(held(gateway, 4), Err(NotChosen));
+    assert_eq!(held(gateway, 5), Err(NotChosen));
+    // A call issues the side on another decode: the side stands, and the
+    // read is refused as the next issue is.
+    let moved = DecodeSide {
+        picked: PickRecord::default(),
+        ..decode_side(d1)
+    };
+    assert_eq!(store.issue_decode(gateway, LeaseId(2), moved, now), Ok(()));
+    assert_eq!(held(gateway, 2), Err(DecodeStands));
+    assert_eq!(
+        store.issue_decode(gateway, LeaseId(2), moved, now),
+        Err(DecodeStands)
+    );
+    // Taken back, the side names the first decision's decode again, at the
+    // target the prefill's dispatch took.
+    assert!(store.take_back_decode(gateway, LeaseId(2), ReleaseReason::Abandoned));
+    assert_eq!(held(gateway, 2), Ok((p, Some((d2, 5)))));
+}
+
+/// An undo takes back its own issue of a decode side and no other. Where a
+/// take-back ended that issue, and where a later call issued the side
+/// since, the first issue's undo moves nothing and frees nothing: the place
+/// counts the side's issues, and an undo names its own. The undo of the
+/// issue that stands puts the side back as that issue found it and frees
+/// its booking. Behind the prefill's end it takes the lease off the file:
+/// the side would stand chosen beside a prefill that ended, and no later
+/// event ends a side that is not live.
+#[cfg(feature = "controller")]
+#[test]
+fn an_undo_takes_back_its_own_issue_of_a_decode_side_and_no_other() {
+    let store = MemoryStore::new();
+    let [p, d0, d1] = ["http://p:1", "http://d0:1", "http://d1:1"].map(|key| ready(&store, key));
+    let (gateway, id, now) = (GatewayId(1), LeaseId(1), Instant::now());
+    store.set_term(1);
+    issue_pair(&store, chosen_pair(id.0, p, &[d0, d1], now)).expect("the key is free");
+    assert!(store.dispatched(gateway, id, on(Side::Prefill, 0), now));
+    let file = || {
+        let sides = LeasesStore::sides(&store, gateway, id);
+        (sides, booked(&store, &[p, d0, d1]))
+    };
+    let chosen = file();
+    assert_eq!(chosen.1, [1, 0, 0]);
+    // One call's issue of the side on the second decode, with the slot of
+    // the count it books.
+    let call = || {
+        let slot = store.snapshot().booked_of(d1);
+        let issued = store.issue_decided_decode(gateway, id, (decode_side(d1), slot), now, |_| ());
+        issued.expect("the prefill holds the chosen side").1
+    };
+    let first = call();
+    assert_eq!(file().1, [1, 0, 1]);
+    assert!(store.take_back_decode(gateway, id, ReleaseReason::Abandoned));
+    assert_eq!(file(), chosen);
+    assert!(!store.unissue_decode(gateway, id, first), "its issue ended");
+    assert_eq!(file(), chosen);
+    let second = call();
+    let issued = file();
+    assert_eq!(issued.1, [1, 0, 1]);
+    assert!(!store.unissue_decode(gateway, id, first), "another's issue");
+    assert_eq!(file(), issued);
+    assert!(store.unissue_decode(gateway, id, second));
+    assert_eq!(file(), chosen);
+    assert!(!store.unissue_decode(gateway, id, second), "undone once");
+    // Behind the prefill's end.
+    let third = call();
+    let gone = ReleaseReason::ClientGone;
+    assert!(store.released(gateway, id, Some(Side::Prefill), gone));
+    assert!(file().0.is_some(), "the issued decode stands");
+    assert!(store.unissue_decode(gateway, id, third));
+    assert_eq!(file(), (None, vec![0, 0, 0]));
 }
 
 #[test]

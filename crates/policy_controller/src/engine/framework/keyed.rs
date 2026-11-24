@@ -115,12 +115,30 @@ impl Engine {
     /// followed renews its key's idle time, and a request not decided here
     /// writes nothing.
     ///
+    /// The rows are taken for regular workers': a key keeps its worker over
+    /// the overload veto among those alone, and the rows read here do not
+    /// say the pool's roles. A host whose pool holds a worker of another
+    /// role asks the whole decision.
+    ///
     /// [`Scorer::own_by_place`]: super::Scorer::own_by_place
     pub fn decide_keyed<R: PoolRows>(
         &self,
         facts: &RequestFacts<'_>,
         rows: &R,
         cx: &Constraints<'_>,
+    ) -> Option<Decision> {
+        self.decide_keyed_among(facts, rows, cx, true)
+    }
+
+    /// [`Self::decide_keyed`] for a host that says whether every row of the
+    /// pool is a regular worker's (`regular`): over any other pool the
+    /// key's walk reads the overload veto as it stands.
+    pub(crate) fn decide_keyed_among<R: PoolRows>(
+        &self,
+        facts: &RequestFacts<'_>,
+        rows: &R,
+        cx: &Constraints<'_>,
+        regular: bool,
     ) -> Option<Decision> {
         // No binding of the phase pins a key or walks a ring: one test.
         if !self.keyed[slot(facts.phase)] {
@@ -170,7 +188,8 @@ impl Engine {
             return None;
         }
         // The kept key's form: its walk reads the overload veto as lifted.
-        let kept = marks.keyed() && vetoed::keeps_its_key(binding, *placing, *vetoed, facts);
+        let kept =
+            marks.keyed() && regular && vetoed::keeps_its_key(binding, *placing, *vetoed, facts);
         self.walk_ring(index, profile, facts, rows, cx, kept)
     }
 
@@ -205,7 +224,7 @@ impl Engine {
             .find(|row| test.keeps(row))?;
         // At its cap a pin puts the request to the stages again, over every
         // row the filters keep.
-        if Self::at_cap(rule, facts, &pinned) {
+        if Self::at_cap(rule, &pinned) {
             return None;
         }
         if self.sessions.lookup(key, facts.now_micros, rule) != pins {

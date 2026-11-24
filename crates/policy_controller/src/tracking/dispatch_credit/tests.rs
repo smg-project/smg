@@ -197,6 +197,75 @@ fn a_send_with_no_stated_size_counts_only_as_a_request() {
     );
 }
 
+/// A send of text alone states no token count, and the count keeps its
+/// bytes over four as an estimate. The documents' terms read the estimate
+/// as the send's tokens, and the whole read states it apart from the
+/// stated tokens, beside the count of such sends. A send that states a
+/// token count is counted by it. A report that reflects a send takes its
+/// estimate with it.
+#[test]
+fn a_send_of_text_alone_counts_by_its_bytes_over_four_in_the_documents_terms() {
+    let (engine, sent) = built(None);
+    let mut a = row(113, 5);
+    let text = |issued_micros: u64, bytes: u32| {
+        let lease = Lease {
+            issued_micros,
+            bytes,
+            ..Lease::default()
+        };
+        engine.on_dispatched(&lease, &target(&a), Side::Single, DELAY);
+    };
+    text(START, 404);
+    text(START + 9, 39);
+    send(&engine, &a, START + 20, TOKENS);
+    send(&engine, &a, START + 30, 0);
+    // 404 bytes are 101 tokens and 39 bytes are 9.
+    assert_eq!(
+        sent.read(&clock(0), &a),
+        CreditedDispatches {
+            requests: 4,
+            tokens: u64::from(TOKENS),
+            unsized_requests: 3,
+            estimated_tokens: 110,
+        }
+    );
+    let counts = sent.pass(&clock(0)).counts(&a);
+    assert_eq!(
+        counts,
+        DispatchCounts {
+            requests: 4,
+            tokens: u64::from(TOKENS) + 110,
+        }
+    );
+    // A stage that reads the sends one by one is handed each with its
+    // stated tokens: none for a send of text.
+    assert_eq!(
+        instants(&sent, &clock(0), &a),
+        [
+            (sent_at(START), 0),
+            (sent_at(START + 9), 0),
+            (sent_at(START + 20), TOKENS),
+            (sent_at(START + 30), 0),
+        ]
+    );
+    // A report that reflects the first send, the text of 404 bytes.
+    a.load = Some(LoadRow::default());
+    a.load_sampled_at_micros = START + u64::from(DELAY);
+    assert_eq!(
+        sent.read(&clock(0), &a),
+        CreditedDispatches {
+            requests: 3,
+            tokens: u64::from(TOKENS),
+            unsized_requests: 2,
+            estimated_tokens: 9,
+        }
+    );
+    assert_eq!(
+        sent.pass(&clock(0)).counts(&a).tokens,
+        u64::from(TOKENS) + 9
+    );
+}
+
 #[test]
 fn a_send_of_no_stated_size_leaves_the_count_with_its_release() {
     let (engine, sent) = built(None);
@@ -210,6 +279,7 @@ fn a_send_of_no_stated_size_leaves_the_count_with_its_release() {
             requests: 3,
             tokens: u64::from(TOKENS),
             unsized_requests: 2,
+            estimated_tokens: 0,
         }
     );
     // A report that reflects the first two sends, each of no stated size.
@@ -219,7 +289,7 @@ fn a_send_of_no_stated_size_leaves_the_count_with_its_release() {
 }
 
 #[test]
-fn a_retired_batch_takes_its_sends_of_no_stated_size_with_it() {
+fn a_retired_send_of_no_stated_size_leaves_that_count_too() {
     let (engine, sent) = built(None);
     let a = row(181, 5);
     for _ in 0..300 {
@@ -228,19 +298,20 @@ fn a_retired_batch_takes_its_sends_of_no_stated_size_with_it() {
     for _ in 300..8201 {
         send(&engine, &a, START + 1, 13);
     }
-    // The 256 oldest sends went, each of no stated size.
+    // The nine oldest sends went, each of no stated size.
     assert_eq!(
         sent.read(&clock(0), &a),
         CreditedDispatches {
-            requests: 7945,
+            requests: 8192,
             tokens: 7901 * 13,
-            unsized_requests: 44,
+            unsized_requests: 291,
+            estimated_tokens: 0,
         }
     );
 }
 
 #[test]
-fn a_busy_rows_tally_retires_its_oldest_batch() {
+fn a_busy_rows_tally_lets_its_oldest_go_past_the_bound() {
     let (engine, sent) = built(None);
     let a = row(111, 3);
     for _ in 0..8037 {
@@ -260,8 +331,8 @@ fn a_busy_rows_tally_retires_its_oldest_batch() {
     assert_eq!(
         sent.read(&clock(0), &a),
         CreditedDispatches {
-            requests: 7945,
-            tokens: 7781 * 13 + 164 * 19,
+            requests: 8192,
+            tokens: 8028 * 13 + 164 * 19,
             ..CreditedDispatches::default()
         }
     );
@@ -626,6 +697,7 @@ fn a_release_leaves_a_later_send_of_no_stated_size_in_the_read_that_ran_it() {
             requests: 1,
             tokens: 0,
             unsized_requests: 1,
+            estimated_tokens: 0,
         }
     );
 }
@@ -899,6 +971,39 @@ fn least_load_prices_a_send_of_no_stated_size_at_its_mean() {
     send(&engine, &rows[1], START, 1);
     let [unsized_send, stated] = scores(&engine, &rows, START + 700);
     assert!(stated < unsized_send, "{stated} against {unsized_send}");
+}
+
+/// A send of text alone states no size to `least-load` either. The stage
+/// prices it at its mean prefill and adds nothing for the text's bytes,
+/// which the count keeps apart for the documents' terms.
+#[test]
+fn least_load_prices_a_send_of_text_alone_at_its_mean() {
+    let mut document = load_document(POOL, None, false);
+    document.profiles.get_mut(POOL).expect("the profile").score =
+        vec![
+            serde_json::from_value(json!({ "least-load": { "mean_prefill_tokens": 701 } }))
+                .expect("a stage"),
+        ];
+    let engine = document.validate().expect("the profile validates");
+    let rows = reporting();
+    // 404 bytes of text: 101 by the bytes over four.
+    let text = Lease {
+        issued_micros: START,
+        bytes: 404,
+        ..Lease::default()
+    };
+    engine.on_dispatched(&text, &target(&rows[0]), Side::Single, DELAY);
+    send(&engine, &rows[1], START, 701);
+    assert_eq!(
+        engine.sent_credits[0].read(&clock(0), &rows[0]),
+        CreditedDispatches {
+            unsized_requests: 1,
+            estimated_tokens: 101,
+            ..one(0)
+        }
+    );
+    let [text_send, stated] = scores(&engine, &rows, START + 700);
+    assert_eq!(text_send, stated);
 }
 
 #[test]

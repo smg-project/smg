@@ -9,9 +9,11 @@
 //! caller hands at this call. The targets are walked best first, and a
 //! decode is read once, by the one read a worker gets at a first placement
 //! ([`sendable`]): ready, and admitted by the route's own rule as the
-//! request states it at this call.
+//! request states it at this call. A decision that keeps where the prompt
+//! went asks that of its decodes itself ([`Made`]), and the walk takes its
+//! answers.
 
-use std::{sync::Arc, time::Instant};
+use std::{panic::resume_unwind, sync::Arc, time::Instant};
 
 use smg_worker::identity::basic::Worker;
 
@@ -48,7 +50,10 @@ impl PolicyEngine {
             let refused = DecisionRefused::Decode(DecodeRefused::NotChosen);
             return Err(Unplaced::Refused(refused));
         };
-        let made = Made::new(engine, request, &[]);
+        let mut made = Made {
+            decode_alone: true,
+            ..Made::new(engine, request, &[])
+        };
         // A request that hands no pair's lists is decided over no worker.
         // An encode request's three lists are its pair's two for a decode
         // decided again, as they are for the engine's decode entry.
@@ -60,18 +65,30 @@ impl PolicyEngine {
         };
         let mut taken = None;
         let placed = held.decode_placed_under(&made, Instant::now(), |target| {
-            let place = target.pair.map(|pair| pair.decode_position as usize);
-            let worker = place.and_then(|place| decodes?.workers.get(place));
+            let place = target.pair.map(|pair| pair.decode_position);
+            let worker = place.and_then(|place| decodes?.workers.get(place as usize));
             debug_assert_eq!(
                 worker.map(|worker| worker_id(worker.as_ref())),
                 worker.and(target.pair).map(|pair| pair.decode_id),
                 "the decode stands at the target's position"
             );
-            taken = worker
-                .filter(|worker| sendable(request, worker.as_ref()))
-                .cloned();
+            // A decode the decision asked is taken by the answer it was
+            // given there. A rule that panicked there holds no decode.
+            let kept = place.and_then(|place| made.decodes.get().answer(place));
+            let sends = |worker: &&Arc<dyn Worker>| {
+                made.panicked.get().is_none()
+                    && kept.unwrap_or_else(|| sendable(request, worker.as_ref()))
+            };
+            taken = worker.filter(sends).cloned();
             taken.is_some()
         });
+        // The route's rule panicked inside the decision, at the question
+        // of where the prompt goes. The walk held no decode, the guard
+        // stands as it stood before the call, and the panic is the
+        // caller's.
+        if let Some(panic) = made.panicked.take() {
+            resume_unwind(panic);
+        }
         match placed.map_err(Unplaced::Refused)? {
             None => taken.ok_or(Unplaced::NoWorkers),
             // A pick none of whose decodes holds names workers and no

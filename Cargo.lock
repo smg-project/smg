@@ -8124,7 +8124,6 @@ dependencies = [
  "prost-build",
  "prost-types",
  "rcgen",
- "reqwest 0.13.4",
  "rustc-hash 2.1.3",
  "rustix",
  "rustls",

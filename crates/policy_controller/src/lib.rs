@@ -75,12 +75,6 @@
 //!   bound to a profile as the framework's own stages. What every plugin
 //!   kind shares (the breaker, the counters, the stage adapters) is the
 //!   `plugins::shared` module.
-//! - Behind the `ingest` feature, the ingestion drivers (`ingest`): the load
-//!   path (the `GetLoads` poll per engine under the store's poll
-//!   arbitration, the metrics scrape of an engine without a servicer) and
-//!   the metrics parser. The load driver and a worker list's records share
-//!   the `load_report` conversion.
-//!
 //! - Behind the `operator` feature, `document::operator::DocumentManager`
 //!   applies a host's start document and serves its status, document and dry
 //!   run. The feature also serves worker snapshots over the host's store.
@@ -94,7 +88,7 @@
 //! - Behind the `controller` feature, the standalone controller
 //!   (`controller`): the listeners with their credentialed scopes, the
 //!   health service on each, the admin endpoints, readiness, the drain and
-//!   the load driver over the store. The feature turns on `in-process`, the
+//!   the load monitor's task. The feature turns on `in-process`, the
 //!   engine over worker objects, and `worker-host`, so every controller
 //!   keeps its worker objects, probes them and reads cache events.
 //! - Behind the `client` feature, the gateway's side of the controller's
@@ -104,9 +98,9 @@
 //!   for concurrent asks on one decide stream and reports on one session.
 //! - Behind the same feature, the watcher (`watcher`): a gateway's copy of
 //!   the controller's workers. It takes the watch's events in their order
-//!   into a [`store::MemoryStore`] of its own, through the door a
-//!   standby's applier writes a followed row by, and names the place a
-//!   watch opened again goes on from.
+//!   into a [`store::MemoryStore`] of its own, through the holder of the
+//!   gateway's worker objects as a standby's applier writes a followed
+//!   row, and names the place a watch opened again goes on from.
 //! - Behind the same feature, the worker follower
 //!   (`service::worker_follower::WorkerFollower`): the task a gateway
 //!   follows a controller's worker list with. It dials the controller,
@@ -168,7 +162,7 @@
 
 use std::{cell::Cell, collections::hash_map::RandomState, hash::BuildHasher, thread};
 
-#[cfg(any(feature = "ingest", feature = "operator"))]
+#[cfg(feature = "operator")]
 mod address;
 pub mod document;
 pub mod engine;
@@ -208,15 +202,9 @@ pub mod worker_host;
 ///   the workers the count-first picker passed over;
 /// - the first value of the seed's stream: the seed a pair plan hands its
 ///   decode side, whose stages derive their streams from it as above;
-/// - the seed under the store's two naming masks: where the store names a
-///   decision's rows and cuts a list at the profile's sample, the holders'
-///   draw and the warming rows' draw;
-/// - the first value of the holders' stream, and of each stream so seeded:
-///   the seed of each lookup a naming makes again, a stream a round;
-/// - the first value of the seed under the store's mask for refused
-///   holders, and of each stream so seeded: the seed of each lookup a
-///   naming makes again past a cap of holders the pass refused, a stream a
-///   round.
+/// - the seed under the two naming masks: where a decision's rows are named
+///   and a list is cut at the profile's sample, the holders' draw and the
+///   warming rows' draw.
 #[derive(Clone, Copy, Debug)]
 pub struct Draw(u64);
 

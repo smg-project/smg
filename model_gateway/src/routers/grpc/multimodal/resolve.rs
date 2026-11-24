@@ -18,6 +18,7 @@ use llm_tokenizer::{
     traits::{MediaHandling, Tokenizer},
 };
 use openai_protocol::worker::MmProcessingMode;
+use smg_worker::identity::basic::WorkerType;
 use tracing::{error, warn};
 
 use crate::{
@@ -131,11 +132,19 @@ pub(crate) async fn resolve_media(
         .multimodal
         .as_ref()
         .is_some_and(|mm_components| mm_components.processing == MmProcessingMode::Router);
+    // The first rule judges the workers the pixels go to in this router's mode.
+    let pixels_go_to = components
+        .multimodal
+        .as_ref()
+        .map_or(WorkerType::Regular, |mm_components| {
+            mm_components.pixels_go_to
+        });
     multimodal::ensure_model_accepts_media(
         &components.worker_registry,
         model_id,
         &plan,
         router_processes,
+        pixels_go_to,
     )?;
     if plan.is_empty() {
         // A request without media renders the same under either order (its text parts in

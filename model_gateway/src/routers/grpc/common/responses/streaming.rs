@@ -371,6 +371,8 @@ pub(crate) struct ResponseStreamEventEmitter {
     current_message_output_index: Option<usize>,
     current_item_id: Option<String>,
     original_request: Option<ResponsesRequest>,
+    // Local tool declarations after inline declarations and history are resolved.
+    effective_tools: Option<Vec<ResponseTool>>,
     tool_call_items: Vec<ToolCallStreamItem>,
     /// In-flight reasoning item: opened on the first reasoning delta, closed
     /// before the first message/tool item or on finish.
@@ -494,6 +496,7 @@ impl ResponseStreamEventEmitter {
             current_message_output_index: None,
             current_item_id: None,
             original_request: None,
+            effective_tools: None,
             tool_call_items: Vec::new(),
             reasoning_item: None,
             finish_reason: None,
@@ -510,6 +513,16 @@ impl ResponseStreamEventEmitter {
     pub fn set_original_request(&mut self, request: ResponsesRequest) {
         self.background = request.background.unwrap_or(false);
         self.original_request = Some(request);
+    }
+
+    pub(crate) fn set_effective_tools(&mut self, tools: Option<Vec<ResponseTool>>) {
+        self.effective_tools = tools;
+    }
+
+    pub(crate) fn effective_tools(&self) -> Option<&[ResponseTool]> {
+        self.effective_tools
+            .as_deref()
+            .or_else(|| self.original_request.as_ref()?.tools.as_deref())
     }
 
     /// The finish reason of the iteration a stream that drives the emitter
@@ -1073,17 +1086,18 @@ impl ResponseStreamEventEmitter {
     // Output Item Wrapper Events
     // ========================================================================
 
-    /// Restore declared namespace identities for streamed function items.
+    /// Restore declared namespace identities for streamed function and custom calls.
     fn normalize_function_item<'a>(
         &self,
         item: &'a serde_json::Value,
     ) -> Cow<'a, serde_json::Value> {
-        if item["type"] == "function_call" && item["namespace"].is_null() {
+        if matches!(
+            item["type"].as_str(),
+            Some("function_call" | "custom_tool_call")
+        ) && item["namespace"].is_null()
+        {
             if let Some(name) = item["name"].as_str() {
-                let tools = self
-                    .original_request
-                    .as_ref()
-                    .and_then(|req| req.tools.as_deref());
+                let tools = self.effective_tools();
                 let (name, namespace) = super::utils::resolve_function_identity(tools, name);
                 if let Some(namespace) = namespace {
                     let mut item = item.clone();
@@ -1391,12 +1405,29 @@ impl ResponseStreamEventEmitter {
             .is_some_and(|f| f.contains(&IncludeField::ReasoningEncryptedContent))
     }
 
-    fn is_custom_tool(&self, name: &str) -> bool {
-        let tools = self
-            .original_request
-            .as_ref()
-            .and_then(|r| r.tools.as_deref());
-        super::utils::custom_tool_names(tools).contains(name)
+    pub(crate) fn is_custom_tool(&self, name: &str) -> bool {
+        super::utils::custom_tool_names(self.effective_tools()).contains(name)
+    }
+
+    pub(crate) fn custom_input_events(
+        &mut self,
+        output_index: usize,
+        item_id: &str,
+        input: &str,
+    ) -> [serde_json::Value; 2] {
+        [
+            ("response.custom_tool_call_input.delta", "delta"),
+            ("response.custom_tool_call_input.done", "input"),
+        ]
+        .map(|(event_type, field)| {
+            json!({
+                "type": event_type,
+                "sequence_number": self.next_sequence(),
+                "output_index": output_index,
+                "item_id": item_id,
+                field: input,
+            })
+        })
     }
 
     fn emit_reasoning_text_done(
@@ -1572,17 +1603,7 @@ impl ResponseStreamEventEmitter {
             let status = self.function_call_status(&item.arguments);
             let full = if item.custom {
                 let input = super::utils::custom_tool_input(&item.arguments);
-                for (event_type, field) in [
-                    ("response.custom_tool_call_input.delta", "delta"),
-                    ("response.custom_tool_call_input.done", "input"),
-                ] {
-                    let event = json!({
-                        "type": event_type,
-                        "sequence_number": self.next_sequence(),
-                        "output_index": item.output_index,
-                        "item_id": item.item_id,
-                        field: input,
-                    });
+                for event in self.custom_input_events(item.output_index, &item.item_id, &input) {
                     if sent.is_ok() {
                         sent = self.send_event(&event, tx).await;
                     }

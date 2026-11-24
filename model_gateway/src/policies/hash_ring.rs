@@ -17,7 +17,9 @@ use std::{
     sync::Arc,
 };
 
-use smg_policy_controller::policies::consistent_hashing::LentRing;
+use smg_policy_controller::policies::consistent_hashing::{Head, LentRing};
+
+use super::prefix_hash::PrefixHashPolicy;
 
 /// Number of virtual nodes per physical worker for even distribution.
 /// 150 is a common choice that provides good balance between memory and distribution.
@@ -318,13 +320,20 @@ impl HashRing {
 }
 
 /// The ring as the policy engine asks it, for a request its caller lends
-/// the ring with: where a key's text stands, and the walk from a stated
-/// place. Nothing of the ring is copied. The position is the one a lookup
-/// starts from and the walk is the lookup's own (`HashRing::walk_from`),
-/// so the engine places a key on the worker a ring policy finds for it.
+/// the ring with: where a key's text stands, where a head of a request
+/// stands, and the walk from a stated place. Nothing of the ring is copied.
+/// The position is the one a lookup starts from and the walk is the
+/// lookup's own (`HashRing::walk_from`), so the engine places a key on the
+/// worker a ring policy finds for it. A head stands where the
+/// `prefix_hash` policy looks it up (`PrefixHashPolicy::head_position`),
+/// so the engine places a prompt on the worker that policy finds for it.
 impl LentRing for HashRing {
     fn position(&self, key: &str) -> u64 {
         Self::hash_position(key)
+    }
+
+    fn head_position(&self, head: Head<'_>) -> Option<u64> {
+        Some(PrefixHashPolicy::head_position(head))
     }
 
     fn walk(&self, position: u64, take: &mut dyn FnMut(&str) -> bool) {
@@ -337,12 +346,22 @@ impl LentRing for HashRing {
 /// the key at that position over the workers it keeps, as a ring policy
 /// does with no ring (`ConsistentHashingPolicy::find_by_consistent_hash`:
 /// the key's position modulo the eligible workers).
+///
+/// A head has its position too. The `prefix_hash` policy takes the least
+/// loaded worker with no ring, and the engine's prefix form leaves a head
+/// that reaches no worker to the stages behind its ring, the fewest
+/// requests in flight. A head with no position would be placed on the
+/// engine's own ring instead.
 #[derive(Debug)]
 pub(crate) struct Unfilled;
 
 impl LentRing for Unfilled {
     fn position(&self, key: &str) -> u64 {
         HashRing::hash_position(key)
+    }
+
+    fn head_position(&self, head: Head<'_>) -> Option<u64> {
+        Some(PrefixHashPolicy::head_position(head))
     }
 
     fn walk(&self, _: u64, _: &mut dyn FnMut(&str) -> bool) {}

@@ -310,29 +310,30 @@ impl KeySources {
     }
 
     /// [`Self::derive_keys`] with the place asked of `place`: it is handed
-    /// the text of the value a ring places the request by and whether that
-    /// value is the client's, once, and is not asked where the request
-    /// carries neither value. The prefix form of a ring is asked where a
-    /// routing value's text stands as a head does, and nothing of a
-    /// client's.
+    /// the text of the value a ring places the request by, once, with the
+    /// source of a routing value and `None` for the client's value, and is
+    /// not asked where the request carries neither value. The prefix form
+    /// of a ring is asked where a routing value's text stands as a head
+    /// does where a header handed it, and nothing of a client's value or
+    /// of one the request's own id handed.
     pub(crate) fn derive_keys_by<'a>(
         &'a self,
         header: impl Fn(&str) -> Option<&'a [u8]>,
         rid: Option<&'a str>,
-        place: impl FnOnce(&str, bool) -> Option<u64>,
+        place: impl FnOnce(&str, Option<KeySource<'a>>) -> Option<u64>,
     ) -> DerivedKeys<'a> {
         match self.session(&header, rid) {
             Some((key, text)) => DerivedKeys {
                 session: Some(key),
                 client_key: 0,
-                ring_position: place(text, false),
+                ring_position: place(text, Some(key.source)),
             },
             None => {
                 let client = self.client(&header);
                 DerivedKeys {
                     session: None,
                     client_key: client.map_or(0, |value| fingerprint(value.as_bytes())),
-                    ring_position: client.and_then(|value| place(value, true)),
+                    ring_position: client.and_then(|value| place(value, None)),
                 }
             }
         }

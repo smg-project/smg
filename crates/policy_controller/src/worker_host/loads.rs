@@ -43,7 +43,9 @@ impl<G: Generation> LoadConsumer for SnapshotReaders<G> {
 /// host whose decisions read the monitor's snapshot.
 ///
 /// It polls every `Ready` object its host dials each `every`, cut to whole
-/// seconds: the monitor takes one second for less. An object built for a
+/// seconds: the monitor takes one second for less. An object whose load
+/// stream pushed a record within that time on every rank that pushes is
+/// not polled. An object built for a
 /// row that one gateway alone reaches is asked for no load, where the
 /// host asked for such objects with their checks off
 /// ([`Objects::with_host_local_unchecked`]).

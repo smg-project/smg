@@ -97,9 +97,9 @@ thread_local! {
 
 /// The stage a pair whose request states places is declined under
 /// ([`Constraints::places`](crate::engine::view::Constraints::places)):
-/// one set of places cannot hold a pair's two lists. An encode request's
-/// lists whose pair is held to places are declined under it too.
-pub(super) const PLACES: &str = "places";
+/// one set of places cannot hold a pair's two lists. An encode request
+/// that states places of its own is declined under it too.
+pub(super) use crate::engine::decision::PLACES;
 
 /// The crate's word, in a shed's `emptied_by`, for a pool no stage emptied.
 const NO_STAGE: &str = "none";
@@ -141,9 +141,9 @@ pub(super) fn alone(
 /// picked, alone ([`AlonePick::decision`]), and its lease, issued here as a
 /// whole pass's is ([`issued`]). The lease states the size `plain` states,
 /// the two lengths of its `text`, characters and bytes, and no session, and
-/// is dated at `now` on the engine's clock. The issue
-/// is told where a stage takes it. `None` where the list holds no worker at
-/// the place.
+/// is dated at `now` on the engine's clock. The issue is told where a
+/// stage takes it, under a catch of its own as a whole pass's is. `None`
+/// where the list holds no worker at the place.
 pub(super) fn noted(
     own: Loaded<'_, '_>,
     pick: AlonePick,
@@ -184,7 +184,7 @@ pub(super) fn noted(
     };
     if document.hears.contains(EventKind::Issued) {
         let stages = document.spec.engine();
-        stages.on_decision_issued(&lease, &decided.decision);
+        own.word_caught(|| stages.on_decision_issued(&lease, &decided.decision));
     }
     Some(decided)
 }
@@ -282,7 +282,7 @@ pub(super) fn decide(
     let cx = if cx.demands.is_none() {
         &cx
     } else {
-        match held(records, cx, &mut meeting) {
+        match held(records, cx, request.facts.phase, &mut meeting) {
             Ok(held) => {
                 narrowed = held;
                 &narrowed
@@ -471,12 +471,26 @@ fn retried(
 /// ([`held_in`]). The places stand in `meeting`, the calling thread's own
 /// list, taken here: its caller puts it back ([`MEETING`]). Out of line:
 /// its code stays off the path of a request that states no demand.
+///
+/// A request stands alone here, so its list is held to what a worker of
+/// its `phase`'s role holds of the demands ([`Demands::held_by`]). A
+/// prefill worker holds the input alone, with no decode beside it to hold
+/// the rest: a host states both bounds whatever the phase.
+///
+/// [`Demands::held_by`]: crate::engine::demands::Demands::held_by
 #[inline(never)]
 fn held<'a>(
     records: &PoolRecords,
     cx: Constraints<'a>,
+    phase: Phase,
     meeting: &'a mut Option<Vec<u32>>,
 ) -> Result<Constraints<'a>, UnmetDemand> {
+    let demands = cx.demands.held_by(phase.role());
+    let cx = Constraints { demands, ..cx };
+    // Where the role holds none of them, no row is judged.
+    if demands.is_none() {
+        return Ok(cx);
+    }
     held_in(records, cx, meeting.insert(MEETING.take()))
 }
 
@@ -549,8 +563,12 @@ fn shed(
 /// on a lease a pick is issued before the answer leaves: its lease takes
 /// the next id, books the pick's first target and is dated at the
 /// decision's instant, and the stages that take the issue hear of it here,
-/// on the calling thread and inside the decision's own catch. From the
-/// answer the lease is its guard's: nothing of it is filed.
+/// on the calling thread and under a catch of its own
+/// ([`super::PolicyEngine::word_caught`]). A stage that panics at the issue
+/// is held and counted, the stages behind it do not hear it, and the pick
+/// and its lease are answered all the same: the guard tells the lease's
+/// dispatch and its end as any lease's. From the answer the lease is its
+/// guard's: nothing of it is filed.
 ///
 /// A pick the binding's sessions rule keeps from the profile is issued
 /// too, and no stage hears its issue ([`lease_events::stages_hear`]).
@@ -589,7 +607,7 @@ pub(super) fn issued(
         // Asked behind the document's own word: a document whose stages
         // take no issue reads nothing of the pick here.
         if lease_events::stages_hear(&decision) {
-            document.spec.engine().on_decision_issued(lease, &decision);
+            own.word_caught(|| document.spec.engine().on_decision_issued(lease, &decision));
         }
     }
     DecideOutcome {
@@ -1869,8 +1887,7 @@ pub(crate) mod tests {
     }
 
     /// A request that hands no list is decided over no worker. One that
-    /// states what no stage here runs is declined under that stage's name,
-    /// and a side sent on its own has no decision.
+    /// states what no stage here runs is declined under that stage's name.
     #[test]
     fn what_no_stage_runs_is_answered_by_name() {
         let engine = preset("round_robin");
@@ -1900,19 +1917,11 @@ pub(crate) mod tests {
         dialed.constraints.wire_modes = WireModes::HTTP.union(WireModes::GRPC);
         let asks = Asks::of(dialed, Some(&members));
         assert!(matches!(answered(&engine, &asks), Decided::Alone(_)));
-        let mut side = request();
-        side.facts.phase = Phase::Decode;
-        let asks = Asks::of(side, Some(&members));
-        assert_eq!(
-            engine
-                .decide_under(GatewayId::LOCAL, &asks, Instant::now())
-                .err(),
-            Some(DecisionRefused::PairSide)
-        );
     }
 
     /// A list's cell is asked where the engine decides over the list, and
-    /// nowhere else. A request the engine refuses by its phase asks no
+    /// nowhere else. A request the engine refuses by its phase, a pair's
+    /// decode sent on its own, asks no
     /// cell, plain or not, at either entry: its list's cell stays empty. A
     /// maker that names its list while it makes the request is decided over
     /// that list. So is a plain maker that lends one list ahead of its
@@ -1970,22 +1979,26 @@ pub(crate) mod tests {
         let list = pool(2);
         let members = PublishedList::new(Arc::clone(&list));
         let now = Instant::now();
-        for phase in [Phase::Decode, Phase::Encode] {
-            let mut side = request();
-            side.facts.phase = phase;
-            // A plain request, and the same one from a maker that does not
-            // say so.
-            let plain = Asks::of(side, Some(&members));
-            assert!(plain.plain().is_some());
-            let leased = engine.decide_under(GatewayId::LOCAL, &plain, now);
-            assert_eq!(leased.err(), Some(DecisionRefused::PairSide), "{phase:?}");
-            let whole = Whole(Asks::of(side, Some(&members)));
-            let leased = engine.decide_under(GatewayId::LOCAL, &whole, now);
-            assert_eq!(leased.err(), Some(DecisionRefused::PairSide), "{phase:?}");
-            let bare = engine.decide_without_lease(&whole, now);
-            assert_eq!(bare.err(), Some(DecisionRefused::PairSide), "{phase:?}");
-        }
-        assert_eq!(engine.values_made(), 0, "no cell was asked");
+        // Under a pair plan a decode is its pair's side: sent on its own
+        // over one list it is refused, and the list's cell is not asked.
+        let document =
+            PolicySpec::pair_presets("round_robin", "round_robin").expect("the pair presets");
+        let paired = PolicyEngine::new(AppliedSpec::validate(&document).expect("a valid document"));
+        let mut side = request();
+        side.facts.phase = Phase::Decode;
+        // A plain request, and the same one from a maker that does not say
+        // so.
+        let plain = Asks::of(side, Some(&members));
+        assert!(plain.plain().is_some());
+        let leased = paired.decide_under(GatewayId::LOCAL, &plain, now);
+        assert_eq!(leased.err(), Some(DecisionRefused::PairSide));
+        let whole = Whole(Asks::of(side, Some(&members)));
+        let leased = paired.decide_under(GatewayId::LOCAL, &whole, now);
+        assert_eq!(leased.err(), Some(DecisionRefused::PairSide));
+        let bare = paired.decide_without_lease(&whole, now);
+        assert_eq!(bare.err(), Some(DecisionRefused::PairSide));
+        assert_eq!(paired.values_made(), 0, "no cell was asked");
+        assert!(!members.filled(), "the list's cell stays empty");
 
         let late = Late(request(), &members, Cell::new(false));
         let leased = engine.decide_under(GatewayId::LOCAL, &late, now);
@@ -2633,9 +2646,10 @@ pub(crate) mod tests {
 
     /// A request that hands no list of its kind is decided over no worker,
     /// as the one entry decides it: a single with no list, a pair's prefill
-    /// with none, and a prefill over a single's list. A single over a pair's
-    /// two lists or an encode request's three is shed too. A decode or an
-    /// encode request sent on its own is refused.
+    /// with none, and a pair's prefill over a single's list. A single over a
+    /// pair's two lists or an encode request's three is shed too. So is a
+    /// decode or an encode request that stands alone and hands no list. A
+    /// pair's decode sent on its own is refused.
     #[test]
     fn a_decision_without_a_lease_over_no_list_names_no_worker() {
         use smg_worker::{test_support::worker_with_model_aliases, worker::WorkerType};
@@ -2685,6 +2699,7 @@ pub(crate) mod tests {
         let encode = EncodeLists {
             pair,
             encoders: encoders.lent(),
+            encoders_places: None,
             encoders_stalled: &[],
             encoders_held: &[],
             facts: &[EncoderFacts {
@@ -2704,7 +2719,9 @@ pub(crate) mod tests {
         for (phase, over, members, engine) in [
             (Phase::Single, "no list", WorkerLists::None, &engine),
             (Phase::Prefill, "no list", WorkerLists::None, &engine),
-            (Phase::Prefill, "a single's list", single, &engine),
+            (Phase::Decode, "no list", WorkerLists::None, &engine),
+            (Phase::Encode, "no list", WorkerLists::None, &engine),
+            (Phase::Prefill, "a single's list", single, &paired),
             (Phase::Single, "a pair's lists", both, &paired),
             (Phase::Single, "an encode request's lists", three, &paired),
         ] {
@@ -2725,11 +2742,9 @@ pub(crate) mod tests {
             };
             assert_eq!((theirs.reason, theirs.emptied_by), none);
         }
-        for phase in [Phase::Decode, Phase::Encode] {
-            let asks = stating(phase, WorkerLists::None);
-            let refused = engine.decide_without_lease(&asks, Instant::now());
-            assert_eq!(refused.err(), Some(DecisionRefused::PairSide), "{phase:?}");
-        }
+        let asks = stating(Phase::Decode, WorkerLists::None);
+        let refused = paired.decide_without_lease(&asks, Instant::now());
+        assert_eq!(refused.err(), Some(DecisionRefused::PairSide));
     }
 
     /// A request its sessions rule places alone says so on its pick, and its
@@ -3401,8 +3416,9 @@ pub(crate) mod tests {
     }
 
     /// The words a stage of `engine` put into `heard` of two requests: one
-    /// sent to its first target and completed, and one given up unsent.
-    fn told(engine: &PolicyEngine, heard: &Heard) -> Vec<&'static str> {
+    /// sent to its first target and completed, and one given up unsent. A
+    /// stage panicked at `unheard` of the words, and no decision faulted.
+    fn told(engine: &PolicyEngine, heard: &Heard, unheard: u64) -> Vec<&'static str> {
         let list = pool(4);
         let members = PublishedList::new(Arc::clone(&list));
         let asks = Asks::of(request(), Some(&members));
@@ -3428,7 +3444,7 @@ pub(crate) mod tests {
         let unsent =
             DecisionGuard::decide_under(engine, GatewayId::LOCAL, &asks, now).expect("a decision");
         drop(unsent);
-        assert_eq!((engine.faults(), engine.unheard()), (0, 0));
+        assert_eq!((engine.faults(), engine.unheard()), (0, unheard));
         let words = heard.lock().iter().map(|heard| heard.0).collect();
         words
     }
@@ -4008,7 +4024,7 @@ pub(crate) mod tests {
     fn a_word_no_stage_takes_is_told_to_nobody() {
         let told_of = |kind: EventKind| {
             let (engine, heard) = hearing_as(false, false, EventSet::NONE.with(kind));
-            told(&engine, &heard)
+            told(&engine, &heard, 0)
         };
         assert_eq!(told_of(EventKind::Issued), ["issued", "issued"]);
         assert_eq!(told_of(EventKind::Dispatched), ["dispatched"]);
@@ -4034,8 +4050,142 @@ pub(crate) mod tests {
         });
         assert_eq!(engine.document.hears, EventSet::LEASE);
         assert_eq!(
-            told(&engine, &heard),
+            told(&engine, &heard, 0),
             ["issued", "dispatched", "completed", "issued", "released"]
+        );
+    }
+
+    /// [`Hears`] as a stage that panics at one word of a lease, the kind it
+    /// names, and keeps each other word.
+    #[derive(Debug)]
+    struct StopsAt(Hears, EventKind);
+
+    impl StopsAt {
+        /// Panics where `word` is the stage's own.
+        fn stop(&self, word: EventKind) {
+            assert!(self.1 != word, "this stage panics at that word");
+        }
+    }
+
+    impl Lifecycle for StopsAt {
+        fn hears(&self) -> EventSet {
+            EventSet::LEASE
+        }
+
+        fn on_decision_issued(&self, lease: &Lease, decision: &Decision) {
+            self.stop(EventKind::Issued);
+            self.0.on_decision_issued(lease, decision);
+        }
+
+        fn on_dispatched(&self, lease: &Lease, target: &Target, side: Side, since: u32) {
+            self.stop(EventKind::Dispatched);
+            self.0.on_dispatched(lease, target, side, since);
+        }
+
+        fn on_completed(&self, lease: &Lease, outcome: &Outcome) {
+            self.stop(EventKind::Completed);
+            self.0.on_completed(lease, outcome);
+        }
+
+        fn on_released(&self, lease: &Lease, reason: ReleaseReason) {
+            self.stop(EventKind::Released);
+            self.0.on_released(lease, reason);
+        }
+    }
+
+    impl Picker for StopsAt {
+        fn name(&self) -> &'static str {
+            "stops-at"
+        }
+
+        fn refuses_by_reports(&self) -> bool {
+            self.0.refuses_by_reports()
+        }
+
+        fn picks_alone(&self) -> bool {
+            self.0.picks_alone()
+        }
+
+        fn pick_alone(
+            &self,
+            pool: &PoolWord<'_>,
+            keep: &mut dyn FnMut(usize) -> bool,
+        ) -> Option<usize> {
+            self.0.pick_alone(pool, keep)
+        }
+
+        fn pick(
+            &self,
+            facts: &RequestFacts<'_>,
+            candidates: &[Candidate],
+            kept: &[u32],
+            scores: &[f32],
+            band: TieBand,
+            out: &mut Targets,
+        ) {
+            self.0.pick(facts, candidates, kept, scores, band, out);
+        }
+    }
+
+    /// What [`told`] reads of an engine whose stage panics at `word`, with
+    /// `unheard` held panics counted and no fault. The stage's picker
+    /// places by itself where `alone`.
+    fn told_past(word: EventKind, alone: bool, unheard: u64) -> Vec<&'static str> {
+        let heard = Heard::default();
+        let kept = Arc::clone(&heard);
+        let engine = picked_by("stops-at", move || {
+            let hears = Hears {
+                heard: Arc::clone(&kept),
+                panics: false,
+                alone,
+                takes: EventSet::LEASE,
+            };
+            Box::new(StopsAt(hears, word))
+        });
+        told(&engine, &heard, unheard)
+    }
+
+    /// A stage that panics at a first decision's issue is held and counted
+    /// with the words a stage did not hear, on the whole pass and on the
+    /// short path of a picker that places by itself. The decision answers
+    /// its pick and its lease, so the guard tells the lease's dispatch and
+    /// its end as any lease's: of a request sent and one given up, the
+    /// stage hears every word but the two issues. Before, each request was
+    /// answered a fault.
+    ///
+    /// The classic pass tells a policy nothing where a pick is issued: it
+    /// asks the policy for one pick
+    /// (`model_gateway/src/routers/common/placement.rs:1391`).
+    #[test]
+    fn a_stage_that_panics_at_a_first_issue_costs_the_request_nothing() {
+        for alone in [false, true] {
+            // The two held panics alone are counted.
+            assert_eq!(
+                told_past(EventKind::Issued, alone, 2),
+                ["dispatched", "completed", "released"],
+                "a picker that places by itself: {alone}"
+            );
+        }
+    }
+
+    /// A stage that panics at a later word of a lease is held under the
+    /// same catch and counted the same way, as before this catch was the
+    /// issue's too: the request goes on, and the stage hears every other
+    /// word of the request sent and of the one given up.
+    #[test]
+    fn a_stage_that_panics_at_a_later_word_of_a_lease_is_held_and_counted() {
+        let past = |word| told_past(word, false, 1);
+        assert_eq!(
+            past(EventKind::Dispatched),
+            ["issued", "completed", "issued", "released"]
+        );
+        assert_eq!(
+            past(EventKind::Completed),
+            ["issued", "dispatched", "issued", "released"]
+        );
+        assert_eq!(
+            past(EventKind::Released),
+            ["issued", "dispatched", "completed", "issued"]
         );
     }
 
@@ -4256,62 +4406,6 @@ pub(crate) mod tests {
         // worker when it makes the list's value.
         assert_eq!(asked(&silent, long), Ok(BTreeSet::from([0, 1, 2, 3])));
         assert_eq!(asked(&silent, pixels), blind);
-    }
-
-    /// Over a worker list a worker's rank is read off its object, whatever
-    /// the list's host says of the worker. A request no rank can be pinned
-    /// for is decided among the workers that registered none, a group of
-    /// one left out with the rest, and a list of ranked workers alone is
-    /// shed with no endpoint under the rank's stage. That is the gateway's
-    /// classic rule: it filters its pool to the workers with no rank before
-    /// it selects one, and refuses where none is left
-    /// (`model_gateway/src/routers/http/router.rs:1237-1247` at main
-    /// `ddd8a44cb`). A request that says nothing of ranks takes any worker.
-    #[test]
-    fn a_request_no_rank_can_be_pinned_for_stays_off_a_worker_whose_object_registered_one() {
-        let engine = preset("round_robin");
-        // The object of one rank of a data-parallel group of `size`.
-        let ranked = |at: usize, rank: usize, size: usize| -> Arc<dyn Worker> {
-            let worker = <BasicWorkerBuilder>::new(format!("http://ranked-{at}:8000"))
-                .model(ModelCard::new(MODEL))
-                .dp_config(rank, size)
-                .health_config(no_health_check())
-                .build();
-            worker.set_status(WorkerStatus::Ready);
-            Arc::new(worker)
-        };
-        let plain = pool(2);
-        // The second worker is a group of one, the fourth a rank of two.
-        let list: Arc<[Arc<dyn Worker>]> = Arc::from(vec![
-            Arc::clone(&plain[0]),
-            ranked(1, 0, 1),
-            Arc::clone(&plain[1]),
-            ranked(3, 1, 2),
-        ]);
-        let unpinned = Demands {
-            no_rank: true,
-            ..Demands::default()
-        };
-        // A list nothing is said of, and one whose host says the opposite
-        // of each worker's rank: both read the objects.
-        let silent = PublishedList::new(Arc::clone(&list));
-        let said = PublishedList::with_facts(Arc::clone(&list), |worker| FixedFacts {
-            demands: DemandFacts {
-                ranked: !worker.is_dp_aware(),
-                ..DemandFacts::default()
-            },
-            ..FixedFacts::default()
-        });
-        for members in [&silent, &said] {
-            let kept = places_named(&engine, members, unpinned);
-            assert_eq!(kept, Ok(BTreeSet::from([0, 2])));
-            let any = places_named(&engine, members, Demands::default());
-            assert_eq!(any, Ok(BTreeSet::from([0, 1, 2, 3])));
-        }
-        let ranks: Arc<[Arc<dyn Worker>]> = Arc::from(vec![ranked(0, 0, 2), ranked(1, 1, 2)]);
-        let ranks = PublishedList::new(Arc::clone(&ranks));
-        let shed = places_named(&engine, &ranks, unpinned);
-        assert_eq!(shed, Err((ShedReason::NoEndpoints, "rank")));
     }
 
     /// Over a list long enough for the passes that draw, a request that

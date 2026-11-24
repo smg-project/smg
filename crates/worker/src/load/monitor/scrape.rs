@@ -6,10 +6,6 @@
 //! is the signal load-aware routing acts on, and without it `token_usage`
 //! would default to `0.0` and make an engine of unknown pressure look idle,
 //! so the read says unavailable instead.
-//!
-//! The policy controller crate holds the same parser and tables for its own
-//! scrape driver (`ingest::scrape`); a gauge rename is an edit in both until
-//! the two share one home.
 
 use std::collections::HashMap;
 

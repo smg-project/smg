@@ -7,7 +7,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-use smg_worker::{identity::basic::Worker, test_support::ready_worker, worker::WorkerStatus};
+use smg_worker::{
+    identity::basic::Worker,
+    test_support::{ready_worker, worker_with_model_aliases},
+    worker::{WorkerStatus, WorkerType},
+};
 
 use crate::{
     document::spec::{AppliedSpec, PolicySpec},
@@ -296,6 +300,90 @@ fn a_rings_keyed_request_keeps_its_keys_workers_whatever_its_seed() {
         owners.sort_unstable();
         owners.dedup();
         assert!(owners.len() > 1, "{ring}: every key went to one worker");
+    }
+}
+
+/// A key keeps its worker over that worker's overload thresholds among
+/// regular workers alone. Over a list of prefill workers the owner over its
+/// thresholds passes the key to the next worker its ring reaches: on the
+/// ring its caller lends, where the key's rows alone are read, and on the
+/// stage's own ring, where the whole decision answers.
+///
+/// The gateway's own placement lifts the overload veto for a key where
+/// every candidate is a regular worker (`select_pass` in
+/// `model_gateway/src/routers/common/placement.rs`).
+#[test]
+fn a_key_over_prefill_workers_passes_an_owner_over_its_thresholds() {
+    let engine = preset("consistent_hashing");
+    let list: Arc<[Arc<dyn Worker>]> = (0..8)
+        .map(|at| {
+            let url = format!("http://prefill-{at}:8000");
+            let worker = worker_with_model_aliases(&url, MODEL, &[], WorkerType::Prefill);
+            worker.set_status(WorkerStatus::Ready);
+            worker
+        })
+        .collect();
+    let members = PublishedList::new(Arc::clone(&list));
+    let ring = InOrder(list.iter().map(|worker| worker.url().to_owned()).collect());
+    let places = |lent: bool| -> Vec<u32> {
+        let mut asks = keyed(9, &members);
+        if lent {
+            asks.request.facts.ring = Some(&ring);
+            asks.request.facts.ring_positions = &[0];
+        }
+        let decision = decided(&engine, &asks).decision;
+        let trace = &decision.pick().expect("a pick").trace;
+        assert!(!lent || trace.drew_first(), "a pass over the list ran");
+        targets(&decision).iter().map(|&(place, _)| place).collect()
+    };
+    for lent in [true, false] {
+        let free = places(lent);
+        let owner = &list[free[0] as usize];
+        owner.set_overloaded(true);
+        assert_eq!(places(lent)[0], free[1], "ring lent: {lent}");
+        owner.set_overloaded(false);
+    }
+}
+
+/// A list of decode workers and a list of encode workers pass the key on as
+/// a list of prefill workers does: every role but the regular one counts,
+/// on the ring the caller lends and on the stage's own.
+///
+/// The gateway's own placement lifts the overload veto for a key only
+/// where every candidate's type is the regular one (`select_pass`, at main
+/// `450084124`, `model_gateway/src/routers/common/placement.rs:1337`).
+#[test]
+fn a_key_over_decode_or_encode_workers_passes_an_owner_over_its_thresholds() {
+    for role in [WorkerType::Decode, WorkerType::Encode] {
+        let engine = preset("consistent_hashing");
+        let list: Arc<[Arc<dyn Worker>]> = (0..8)
+            .map(|at| {
+                let url = format!("http://other-{at}:8000");
+                let worker = worker_with_model_aliases(&url, MODEL, &[], role);
+                worker.set_status(WorkerStatus::Ready);
+                worker
+            })
+            .collect();
+        let members = PublishedList::new(Arc::clone(&list));
+        let ring = InOrder(list.iter().map(|worker| worker.url().to_owned()).collect());
+        let places = |lent: bool| -> Vec<u32> {
+            let mut asks = keyed(9, &members);
+            if lent {
+                asks.request.facts.ring = Some(&ring);
+                asks.request.facts.ring_positions = &[0];
+            }
+            let decision = decided(&engine, &asks).decision;
+            let trace = &decision.pick().expect("a pick").trace;
+            assert!(!lent || trace.drew_first(), "a pass over the list ran");
+            targets(&decision).iter().map(|&(place, _)| place).collect()
+        };
+        for lent in [true, false] {
+            let free = places(lent);
+            let owner = &list[free[0] as usize];
+            owner.set_overloaded(true);
+            assert_eq!(places(lent)[0], free[1], "{role:?}, ring lent: {lent}");
+            owner.set_overloaded(false);
+        }
     }
 }
 

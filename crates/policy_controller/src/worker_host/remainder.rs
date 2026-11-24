@@ -34,7 +34,7 @@ use crate::{
 /// | `wire_modes` | the one wire it speaks | the other wires of the set |
 /// | `engine_kind` | the runtime the worker crate reads the name as | a name that crate does not know, and a known name as it was written |
 /// | `health` | its checks in whole seconds, off where its host cannot dial the worker | a part of a second, and the policy of a row built with its checks off |
-/// | `overload` | the thresholds its host's monitor judges by, the row's own over the host's defaults, or none | which of them the row stated |
+/// | `overload` | the thresholds its host's monitor judges by, the row's own over the host's defaults, an external row's own alone, or none | which of them the row stated |
 /// | `drain_settle_secs` | the window in force | a window stated equal to the object's default, which reads back as none |
 ///
 /// Ten are not carried to the object: the incarnation, and the facts a

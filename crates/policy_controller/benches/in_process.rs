@@ -27,8 +27,11 @@
 //! publishes once. `--overloaded 1` puts every worker over its
 //! overload threshold, so the list admits no worker, and gives each worker
 //! requests in flight: its place plus one, the middle worker none, so the
-//! rule for such a list has loads to steer by. `--shadow twin` names a copy
-//! of the cell's profile as its binding's shadow, so each decision is
+//! rule for such a list has loads to steer by. `--refused limit` puts every
+//! prefill of a pair's cell at its host's admission limit, and `--refused
+//! partners` takes its every decode out of service: each decision is then
+//! refused, and a turn refused that way counts. `--shadow twin` names a
+//! copy of the cell's profile as its binding's shadow, so each decision is
 //! followed by its shadow profile's. `--shadow other` names that shadow at
 //! a binding of another model: the cell's decisions then have no shadow,
 //! under a document that names one. `--callers` threads each
@@ -228,6 +231,15 @@ const CELLS: &[Cell] = &[
         document: || preset("consistent_hashing"),
         ..Cell::PLAIN
     },
+    // An encode request held to places of each of its three lists: every
+    // worker of the list, as a gateway states the workers on its wire.
+    Cell {
+        name: "encode_held_least_load",
+        document: || encode::of("least_load"),
+        request: encode::request,
+        words: encode::words,
+        ..Cell::PLAIN
+    },
     Cell {
         name: "encode_least_load",
         document: || encode::of("least_load"),
@@ -238,6 +250,13 @@ const CELLS: &[Cell] = &[
     Cell {
         name: "encode_round_robin",
         document: || encode::of("round_robin"),
+        request: encode::request,
+        words: encode::words,
+        ..Cell::PLAIN
+    },
+    Cell {
+        name: "encode_signal_cost",
+        document: signals::encode_document,
         request: encode::request,
         words: encode::words,
         ..Cell::PLAIN
@@ -303,6 +322,11 @@ const CELLS: &[Cell] = &[
         ..Cell::PLAIN
     },
     Cell {
+        name: "sent_cost",
+        document: sent_cost,
+        ..Cell::PLAIN
+    },
+    Cell {
         name: "signal_cost",
         document: signals::document,
         ..Cell::PLAIN
@@ -312,6 +336,20 @@ const CELLS: &[Cell] = &[
 /// A built-in preset as a cell's document.
 fn preset(name: &str) -> PolicySpec {
     PolicySpec::preset(name).expect("a preset's name")
+}
+
+/// The `sent_cost` cell's document: the `least_load` preset costed by its
+/// profile's count of sends. Each decision reads every row's count, the
+/// requests the row was sent and their prompt tokens, and each leased
+/// decision adds its send to its row's.
+fn sent_cost() -> PolicySpec {
+    let mut document = preset("least_load");
+    let cost = r#"{"least-cost":{"terms":{"load.waiting_uncached_tokens":1,
+        "sent.requests":1000,"sent.tokens":1},"unreported":"missing-as-zero"}}"#;
+    let profile = document.profiles.get_mut("least_load");
+    let profile = profile.expect("the preset's profile");
+    profile.score = vec![serde_json::from_str(cost).expect("a scorer")];
+    document
 }
 
 /// The profile of the preset `name` under the stock sessions rule, a new
@@ -471,6 +509,9 @@ struct Run {
     entry: String,
     overloaded: bool,
     publish_ms: u64,
+    /// What refuses every pair of a pair's cell: the bench's `pair` file
+    /// reads it.
+    refused: pair::Refused,
     shadow: Shadowed,
     /// Whether a thread of its own turns the engine's task behind its first
     /// step.
@@ -486,6 +527,7 @@ fn run() -> Run {
         entry: "decide_at".to_owned(),
         overloaded: false,
         publish_ms: 0,
+        refused: pair::Refused::No,
         shadow: Shadowed::No,
         upkeep_thread: true,
         workers: 64,
@@ -505,6 +547,7 @@ fn run() -> Run {
             "--entry" => run.entry = place::named(&value),
             "--overloaded" => run.overloaded = number() != 0,
             "--publish-ms" => run.publish_ms = number(),
+            "--refused" => run.refused = pair::Refused::named(&value),
             "--shadow" => {
                 run.shadow = match value.as_str() {
                     "twin" => Shadowed::Twin,
@@ -688,6 +731,8 @@ fn main() {
     if pair::runs(&run) || encode::runs(&run) {
         return;
     }
+    let open = run.refused == pair::Refused::No;
+    assert!(open, "a pair's cell alone runs refused");
     let Cell {
         behind,
         document,
@@ -752,7 +797,7 @@ fn main() {
         let (rule, ring) = (ruled::stated(&run), place::lent(&host));
         if worded::stated(&run) {
             measure(&run, &host, upkeep, publish, converted, |_| {
-                worded::one(&host)
+                worded::one(&host, ring)
             });
             return;
         }

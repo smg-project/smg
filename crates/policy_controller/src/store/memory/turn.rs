@@ -136,11 +136,10 @@
 //! the files' order (`set_term`, `follow_term`), and so does a standby's
 //! restore, from its start until it has read the ids on file
 //! ([`MemoryStore::restore_from`]). Under a turn come the world's load
-//! (no lock), a stage's own lock, the engine's sessions table, the store's
-//! session counts, the journal's word of a term, the table of the
-//! members no world lists yet, a leaf lock, and the entry of the worker
-//! objects a host's word to the engine asks, a leaf lock too. A standby's
-//! restore takes the
+//! (no lock), a stage's own lock, the engine's sessions table, the
+//! journal's word of a term, the table of the members no world lists yet,
+//! a leaf lock, and the entry of the worker objects a host's word to the
+//! engine asks, a leaf lock too. A standby's restore takes the
 //! store's tables under its turns too: the workers', the health's and the
 //! loads', in that order. No path takes one of those and then a turn. A
 //! lifecycle call of a served controller therefore runs under a turn, or
@@ -1154,9 +1153,11 @@ impl MemoryStore {
     /// at `at`: the record's read, the door's change and the word to the
     /// engine. A lease not on file is no error and tells nothing: its
     /// dispatch deadline ended it, or its gateway decided that request
-    /// itself. Neither does a second dispatch of one lease, nor a frame on
-    /// a side of a pair's lease that ended: the word is of the sides the
-    /// record held as the frame found it.
+    /// itself. Neither does a dispatch on a side an earlier dispatch
+    /// moved, nor a frame on a side of a pair's lease that ended: the word
+    /// is of the sides the record held as the frame found it. A dispatch
+    /// at an index a chosen side's pick holds no target at moves nothing
+    /// and is handed on all the same.
     fn apply_frame(&self, at: usize, leases: &mut Leases, key: Key, said: Said, one: &mut OneLoad) {
         let found = match said {
             Said::Dispatched(dispatch, when) => leases

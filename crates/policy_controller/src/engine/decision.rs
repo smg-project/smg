@@ -151,6 +151,17 @@ impl Targets {
         }
     }
 
+    /// No target, of a pick the binding's sessions rule placed alone and
+    /// keeps from the profile (`Pick::untold`): the pick a file of leases
+    /// lends with the words of such a request's lease, which lists no
+    /// target (`Sides::with_held_single`).
+    pub(crate) const fn untold() -> Self {
+        Self {
+            placing: Placing::RuleUntold,
+            ..Self::new()
+        }
+    }
+
     /// States what the first target holds of the request. A list led anew
     /// ([`Self::lead`]) says nothing of its new first target.
     #[cfg(any(test, feature = "in-process"))]
@@ -556,15 +567,16 @@ impl Overlap {
 /// the profile asked, where it follows a pin of the request's key, and
 /// where its own assignment places the key.
 ///
-/// What a host in a gateway's own process does with a pick the rule placed
-/// is the rule's own word beside this one ([`RulePlaced`]), read through
-/// one function (`lease_events::stages_hear`). Under `untold` no stage
-/// hears the issue or the dispatch of such a single request, the record of
-/// sent prompts takes no entry behind it and a lent token tree stores no
-/// prompt for it, as a gateway's sticky map keeps a request it places from
-/// the gateway's policy. Under `told`, the default, the stages hear both
-/// and where the prompt went is kept as behind any pick. The session table
-/// hears the dispatch under either.
+/// What a host does with a pick the rule placed is the rule's own word
+/// beside this one ([`RulePlaced`]), read through one function
+/// (`lease_events::stages_hear`): by the front in a gateway's own process,
+/// and by a controller where it files the pick's lease. Under `untold` no
+/// stage hears the issue or the dispatch of such a single request, the
+/// record of sent prompts takes no entry behind it and a lent token tree
+/// stores no prompt for it, as a gateway's sticky map keeps a request it
+/// places from the gateway's policy. Under `told`, the default, the stages
+/// hear both and where the prompt went is kept as behind any pick. The
+/// session table hears the dispatch under either.
 ///
 /// Who placed a pick does not cross the crate's frame: no wire message
 /// carries it, since the record is written where the decision is made.
@@ -630,9 +642,10 @@ impl Pick {
 
     /// Whether the pick is kept from the profile: the binding's sessions
     /// rule placed it alone, and the rule says such a request is none of
-    /// the profile's own ([`RulePlaced::Untold`]). Its one reader stands in
-    /// a gateway's own process (`lease_events::stages_hear`): the words of
-    /// a lease and what is kept of where a prompt went both ask it.
+    /// the profile's own ([`RulePlaced::Untold`]). It has one reader
+    /// (`lease_events::stages_hear`): the words of a lease and what is kept
+    /// of where a prompt went both ask it, and so does a controller where
+    /// it files a pick's lease.
     #[cfg(any(test, feature = "in-process"))]
     pub(crate) const fn untold(&self) -> bool {
         matches!(self.targets.placing, Placing::RuleUntold)
@@ -774,6 +787,15 @@ pub(crate) const WIRES: &str = "wires";
     )
 )]
 pub(crate) const SUBSET_HINT: &str = "subset-hint";
+
+/// The stage a request is answered under for the places it is held to
+/// ([`Constraints::places`](crate::engine::view::Constraints::places)). A
+/// pair whose own request states places is declined under it: one set of
+/// places cannot hold a pair's two lists. An encode request is shed under
+/// it where a list's places name workers and none of them takes the
+/// request, though a worker outside them does: it is held off every worker
+/// that takes it, which no gap of the membership says.
+pub(crate) const PLACES: &str = "places";
 
 /// A shed the deciders say in the engine's place, in the shape of the
 /// engine's own.

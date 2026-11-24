@@ -281,7 +281,7 @@
           "minimum": 1
         },
         "sent_report_delay_ms": {
-          "description": "The least number of milliseconds between a send and the sample of a\nload report that ends it: a report sampled less than that long after\na send leaves the send counted. Unset, a report sampled at or after\na send ends it. A written zero is refused, as a zero limit is. A\nprofile whose stages do not read its count of sends is refused if it\nsets a delay. The limit ends a send whatever the delay. A new\ndocument's profile of the same name takes over the sends the\nstanding profile holds and shares them: a read under the shorter of\nthe two delays ends such a send for both.",
+          "description": "The least number of milliseconds between a send and the sample of a\nload report that ends it: a report sampled less than that long after\na send leaves the send counted. Unset, a report sampled at or after\na send ends it. A written zero is refused, as a zero limit is. A\nprofile whose stages do not read its count of sends is refused if it\nsets a delay. The limit ends a send whatever the delay. The\nprofiles of a document that set the same limit and the same delay\nread one count, under the name of the first of them that reads it,\nin the order of their names. A new document's count takes over the\nsends the standing count under the same name holds and shares them:\na read under the shorter of the two delays ends such a send for\nboth. A count under a name with no standing count starts empty: a\ndocument that drops that first profile, or groups it apart from the\nothers, starts the count of the others empty, once.",
           "type": [
             "integer",
             "null"
@@ -936,7 +936,7 @@
           "exclusiveMinimum": 0
         },
         "prefix_tokens": {
-          "description": "The depth in tokens at which a request with no routing key is keyed\nby its prefix through the last whole block at or under the depth, so at\nleast one block of the view's block size and at most the blocks a\nrequest carries. Under the view's `boundaries` a request that reaches\none is keyed there instead, at the deepest it reaches. The depth is\nchecked in the view's token blocks and read in the blocks a request\nwas hashed by. A host that hashes a text request by windows of the\nblock size times four bytes gives it the checked depth in windows,\nas a token request has it in blocks. Under a block size\nan engine published above the depth a request has no key. Absent, a\nrequest with no routing key has none.",
+          "description": "The depth in tokens at which a request with no routing key is keyed\nby its prefix through the last whole block at or under the depth, so at\nleast one block of the view's block size and at most the blocks a\nrequest carries. Under the view's `boundaries` a request that reaches\none is keyed there instead, at the deepest it reaches. The depth is\nchecked in the view's token blocks and read in the blocks a request\nwas hashed by. A host that hashes a text request by windows of the\nblock size times four bytes gives it the checked depth in windows,\nas a token request has it in blocks. Under a block size\nan engine published above the depth a request has no key. Where\nthe request's caller lends its ring no block is read: the request\nis keyed at the token, at each boundary it reaches or else at the\ndepth, a shorter request whole, and a text at four characters a\ntoken. A routing key the request's own id handed (a `rid` source)\nleads no prompt under this form: it names the session alone, and\nthe request is keyed by its prefix as one with no routing key. That\nholds in a gateway's own process: no frame states where a key came\nfrom, so under a controller's address the id's key places as any\nother. Absent, a request with no routing key has none.",
           "type": [
             "integer",
             "null"
@@ -1582,7 +1582,7 @@
       ]
     },
     "OverloadSpec": {
-      "description": "What a binding says of the overload veto on the workers of the pools\ndecided under it, as its `overload` field: whether the default\nthresholds veto at all, and what a decision does where every worker is\nvetoed. The veto is evaluated per load report by the host and latched,\nnever per request. The block names no threshold: a worker's\nregistration states its own two, over its program's default where the\nprogram has one. The store's judge reads the switch; a host that judges\non its worker objects does not read it yet.",
+      "description": "What a binding says of the overload veto on the workers of the pools\ndecided under it, as its `overload` field: whether the default\nthresholds veto at all, and what a decision does where every worker is\nvetoed. The veto is evaluated per load report by the host and latched,\nnever per request. The block names no threshold: a worker's\nregistration states its own two, over its program's default where the\nprogram has one. The store's judge reads the switch, for each binding's\npools. A gateway that runs the document in its own process reads the\nswitch once, where it builds its workers' default thresholds, and its\nroutes read one shed word: it refuses a document whose bindings differ\non either word. A controller that judges on its worker objects does not\nread the switch yet.",
       "type": "object",
       "properties": {
         "enabled": {
@@ -1607,7 +1607,7 @@
       "additionalProperties": false
     },
     "RoutingKeySpec": {
-      "description": "Where a binding's requests take their routing key from: the sources a\nhost reads in order, and the first that holds a value is the key. A ring\nplaces by the key and a sessions rule pins it. No value enters a view,\nso the list is not held to `view.headers`.",
+      "description": "Where a binding's requests take their routing key from: the sources a\nhost reads in order, and the first that holds a value is the key. A ring\nplaces by the key and a sessions rule pins it. In a gateway's own\nprocess a ring's prefix form places by a header's key alone. No value\nenters a view, so the list is not held to `view.headers`.",
       "type": "object",
       "properties": {
         "sources": {
@@ -1641,7 +1641,7 @@
           ]
         },
         "rid": {
-          "description": "The request's own id, the `rid` of its body: `true` names it.",
+          "description": "The request's own id, the `rid` of its body: `true` names it. Under\na ring's prefix form (`prefix_tokens`) in a gateway's own process\nits key names the session alone: a sessions rule pins it, and the\nring places the request by its prompt. The plain ring places by it,\nand so does a served controller's prefix ring.",
           "type": "boolean"
         },
         "max_bytes": {
@@ -1718,7 +1718,7 @@
           "default": "original"
         },
         "rule_placed": {
-          "description": "Whether a single request this rule placed alone is the profile's\nown (default `told`). Under `untold` no stage hears that request's\nissue or its dispatch, it is none of the profile's sends, and\nneither the engine's record of sent prefixes nor a lent token tree\ntakes its prompt. The session table still hears its dispatch,\nand the stages its completion and its release. A pair's sides are\ntold under either word. A host that tells a lease's words off its\nfile keeps no such word of a pick: it takes the rule, and tells such\na request as it tells any other. Its decision is the engine's own,\nso its record of sent prefixes follows the word all the same.",
+          "description": "Whether a single request this rule placed alone is the profile's\nown (default `told`). Under `untold` no stage hears that request's\nissue or its dispatch, it is none of the profile's sends, and\nneither the engine's record of sent prefixes nor a lent token tree\ntakes its prompt. The session table still hears its dispatch,\nand the stages its completion and its release. A pair's sides are\ntold under either word. A controller keeps the word on the lease it\nfiles, and tells such a request off its file by it all the same.",
           "$ref": "#/$defs/RulePlaced"
         }
       },

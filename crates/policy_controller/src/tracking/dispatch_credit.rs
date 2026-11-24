@@ -7,7 +7,7 @@ use rustc_hash::FxHashMap;
 
 use crate::{
     engine::{Candidate, RequestFacts, Target, WorkerId},
-    stages::scorers::{Credits, RankCredit},
+    stages::scorers::{Credits, RankCredit, SentCredit},
     tracking::{Lease, Membership, Side},
 };
 
@@ -24,25 +24,40 @@ pub struct CreditedDispatches {
     /// How many of the sends stated no size. A reader that prices such a
     /// send chooses the price: `least-load` takes its mean prefill.
     pub unsized_requests: u32,
+    /// The estimates of the sends that stated no token count, summed: for
+    /// each, the bytes of its text over four, and nothing for a send of
+    /// no text. A reader that prices such a send by its text adds this to
+    /// `tokens`, as a document's `sent.` terms do
+    /// ([`DispatchCounts::tokens`]). Such a reader asks for each request's
+    /// size ([`Needs::prompt_size`](crate::document::Needs::prompt_size)):
+    /// a host that can send a request on without reading its prompt states
+    /// a text's bytes only where a stage asks.
+    pub estimated_tokens: u64,
 }
 
-/// The sends a row holds and the prompt tokens they stated: the two
-/// numbers a document's `sent.` terms read, and what a stage reads that
-/// prices no send of unstated size ([`DispatchCreditPass::counts`]). Such a
-/// send is one of `requests` and adds no tokens;
-/// [`CreditedDispatches::unsized_requests`] says how many there are. The pair
-/// is closed: a further number goes on [`CreditedDispatches`].
+/// The sends a row holds and their prompt tokens: the two numbers a
+/// document's `sent.` terms read ([`DispatchCreditPass::counts`]). A send
+/// that stated no token count is one of `requests` and adds its estimate,
+/// the bytes of its text over four: [`CreditedDispatches`] states the
+/// stated tokens and the estimates apart, and how many such sends there
+/// are. The pair is closed: a further number goes on
+/// [`CreditedDispatches`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DispatchCounts {
     /// The number of sends.
     pub requests: u32,
-    /// The prompt tokens the sends stated. A send of unstated size adds none.
+    /// The prompt tokens of the sends: the count each one stated, and for
+    /// a send that stated none the bytes of its text over four. A send of
+    /// no tokens and no text adds none. A stage that reads this number
+    /// asks for each request's size
+    /// ([`Needs::prompt_size`](crate::document::Needs::prompt_size)), as
+    /// the document's two stages do where a term names `sent.tokens`.
     pub tokens: u64,
 }
 
 /// A profile's two settings on its count of sends, as its document writes
 /// them: an unset one is `None`.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct SentSettings {
     /// `sent_ttl_ms`: how long a send counts.
     pub(crate) ttl_ms: Option<u32>,
@@ -56,9 +71,13 @@ pub(crate) struct SentSettings {
 /// feeds it and stages read it: a registered stage, `least-cost` through
 /// its `sent.` terms, and `least-load` for its credit. Under a standalone
 /// controller it counts sends from every gateway through that controller.
+/// The profiles of a document that set the same time limit and report
+/// delay read one count: the engine records a send in every count, and
+/// only a decision's read lets one go, so a count of its own would keep
+/// the sends of a profile that decides no request.
 ///
 /// A new document's count takes over the rows' entries of the standing
-/// profile of the same name and shares them with it
+/// count that a profile of the same name made, and shares them with it
 /// ([`Engine::succeed`](crate::engine::Engine::succeed)). Each count reads them
 /// under its own time limit and its own report delay, and a send that one
 /// read releases has left the other count too: of two report delays, a
@@ -72,7 +91,7 @@ pub(crate) struct SentSettings {
 /// limit and the row's removal. Under a report delay the report that ends
 /// a send is one sampled that long after the send, or longer: a report
 /// sampled sooner behind it leaves it counted. When a send arrives with
-/// 8,192 already held on a row, the tally retires the oldest batch to
+/// 8,192 already held on a row, the tally lets the row's oldest go to
 /// bound the count. This threshold applies at any age.
 #[derive(Debug)]
 pub struct DispatchCredit {
@@ -87,8 +106,12 @@ pub struct DispatchCredit {
     /// Whether the profile sets either of the two: what a pass asks once
     /// ([`Self::limited`]).
     limited: bool,
-    /// The profile's name: the count of a later document's profile of
-    /// this name takes over this one's entries.
+    /// The two settings as the document writes them: a later profile of
+    /// the document that writes the same two reads this count.
+    pub(crate) settings: SentSettings,
+    /// The name of the profile that made the count, the first of its
+    /// readers: the count a later document's profile of this name makes
+    /// takes over this one's entries.
     pub(crate) profile: String,
 }
 
@@ -100,6 +123,7 @@ impl DispatchCredit {
             ttl_micros: settings.ttl_ms.map_or(u64::MAX, micros),
             report_delay_micros: settings.report_delay_ms.map_or(0, micros),
             limited: settings.ttl_ms.is_some() || settings.report_delay_ms.is_some(),
+            settings,
             profile: profile.to_owned(),
         }
     }
@@ -127,7 +151,7 @@ impl DispatchCredit {
             side,
             since_decision_micros,
             present,
-            |since, at_micros, tokens| since.record(at_micros, tokens),
+            |since, at_micros, size| since.record(at_micros, size),
         );
     }
 
@@ -210,10 +234,10 @@ impl DispatchCreditPass<'_> {
     /// report delay, and the time cutoff. A row without a report has a
     /// sample instant of zero.
     ///
-    /// Inlined into its caller's row loop, so the three numbers come back
-    /// in no memory. Where the row holds sends it loads three words, read
-    /// or not: a stage that wants the requests and the stated tokens alone
-    /// reads [`Self::counts`], which loads two.
+    /// Inlined into its caller's row loop, so the four numbers come back
+    /// in no memory. Where the row holds sends it loads four words, read
+    /// or not: a stage that wants the requests and their tokens, stated
+    /// or estimated, reads [`Self::counts`], which loads three.
     #[inline(always)]
     pub fn of(&self, row: &Candidate) -> CreditedDispatches {
         self.tally
@@ -221,28 +245,33 @@ impl DispatchCreditPass<'_> {
             .map_or_else(CreditedDispatches::default, |since| {
                 let sample = row.load.map_or(0, |_| row.load_sampled_at_micros);
                 let sent = since.sent_through(self.through(sample));
-                // The count of sends of no stated size is read apart from
-                // the other two: beside a send that lands between the
-                // reads it is held to the sends counted.
+                // The count of sends of no stated size and their
+                // estimates are read apart from the other two: beside a
+                // send that lands between the reads the count is held to
+                // the sends counted.
                 CreditedDispatches {
+                    requests: sent.requests,
+                    tokens: sent.tokens,
                     unsized_requests: sent.unsized_requests.min(sent.requests),
-                    ..sent
+                    estimated_tokens: since.estimated(),
                 }
             })
     }
 
-    /// The requests and the stated tokens of [`Self::of`], for a stage
-    /// that prices no send of unstated size. It releases what a report or
-    /// the time limit reaches, as [`Self::of`] does, and loads two words
-    /// where it releases none: the third number's word is read only by a
-    /// release. Inlined into its caller's row loop.
+    /// The requests of [`Self::of`] and their tokens, stated or estimated:
+    /// what a document's `sent.` terms read. A send that stated no token
+    /// count adds the bytes of its text over four. It releases what a
+    /// report or the time limit reaches, as [`Self::of`] does, and loads
+    /// three words where it releases none: the count of the sends of no
+    /// stated size is read only by a release. Inlined into its caller's
+    /// row loop.
     #[inline(always)]
     pub fn counts(&self, row: &Candidate) -> DispatchCounts {
         self.tally
             .get(&(row.id, row.dp_rank))
             .map_or_else(DispatchCounts::default, |since| {
                 let sample = row.load.map_or(0, |_| row.load_sampled_at_micros);
-                since.credit_through(self.through(sample)).counts()
+                since.counts_through(self.through(sample))
             })
     }
 
@@ -280,27 +309,29 @@ pub(crate) struct UnlimitedPass<'a> {
     credit: PhantomData<&'a DispatchCredit>,
 }
 
-/// [`DispatchCreditPass::of`] for a row that holds a report, in a stage's
-/// row loop. Each of a count's two passes answers it by its own rule, and
-/// which pass reads is settled once a pass ([`DispatchCredit::limited`]):
-/// the pass of a count with no time limit and no report delay compares no
-/// cutoff and takes no delay off a sample. The count of sends of no stated
-/// size is as its word stands: beside a send that lands between the reads
-/// it may differ by that send.
+/// The requests, the stated tokens and the count of the sends of no stated
+/// size of [`DispatchCreditPass::of`], for a row that holds a report, in
+/// the row loop of a stage that prices such a send itself: three loads,
+/// and no estimate. Each of a count's two passes answers it by its own
+/// rule, and which pass reads is settled once a pass
+/// ([`DispatchCredit::limited`]): the pass of a count with no time limit
+/// and no report delay compares no cutoff and takes no delay off a sample.
+/// The count of sends of no stated size is as its word stands: beside a
+/// send that lands between the reads it may differ by that send.
 pub(crate) trait ReportedSends {
-    fn reported(&self, row: &Candidate) -> CreditedDispatches;
+    fn reported(&self, row: &Candidate) -> SentCredit;
 }
 
 impl ReportedSends for DispatchCreditPass<'_> {
     #[inline(always)]
-    fn reported(&self, row: &Candidate) -> CreditedDispatches {
+    fn reported(&self, row: &Candidate) -> SentCredit {
         reported_through(&self.tally, row, |sample| self.through(sample))
     }
 }
 
 impl ReportedSends for UnlimitedPass<'_> {
     #[inline(always)]
-    fn reported(&self, row: &Candidate) -> CreditedDispatches {
+    fn reported(&self, row: &Candidate) -> SentCredit {
         reported_through(&self.tally, row, |sample| sample)
     }
 }
@@ -312,11 +343,11 @@ fn reported_through(
     tally: &Tally,
     row: &Candidate,
     through: impl FnOnce(u64) -> u64,
-) -> CreditedDispatches {
+) -> SentCredit {
     debug_assert!(row.load.is_some(), "the row holds a report");
     tally
         .get(&(row.id, row.dp_rank))
-        .map_or_else(CreditedDispatches::default, |since| {
+        .map_or_else(SentCredit::default, |since| {
             since.sent_through(through(row.load_sampled_at_micros))
         })
 }

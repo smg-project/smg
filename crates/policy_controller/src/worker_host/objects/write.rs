@@ -18,8 +18,9 @@
 //!
 //! A write the store does not take answers `None`: another writer moved
 //! the row under the holder's turn. The store tests that under its own
-//! lock, by the revision the holder read: a replica that just took the
-//! lead may still apply its last leader's last event, outside every turn.
+//! lock, by the revision the holder read: a door and a standby's applier
+//! write in the holder's turn, and a caller of the store's own writes
+//! takes none.
 //! The holder then reads the store to its end again before it answers, so
 //! the registry holds what that writer left. A removal has taken its
 //! object out by then, and the row that writer left gets an object anew.
@@ -77,11 +78,7 @@ impl<G: Generation> Objects<G> {
     ) -> Option<MembershipChange> {
         let mut place = self.read_to.lock();
         self.follow_from(store, &mut place);
-        // Under the exact key, as the store's table finds a row. The
-        // registry's other lookup also finds a bare address under the form
-        // with its scheme, and that is another key.
-        let standing = self.registry.get_id_by_url_or_reservation(&facts.key);
-        let standing = standing.and_then(|object| self.row_of(&object));
+        let standing = self.row_under(&facts.key);
         let seen = standing.as_ref().map(|row| row.revision);
         let (change, row) = facts.laid_over(standing.as_ref(), maker, Instant::now());
         self.lay_decided(store, &mut place, change, &row, seen)
@@ -130,7 +127,7 @@ impl<G: Generation> Objects<G> {
     /// The row `id` as its object and what stands beside it state it,
     /// where the object was built at `revision`.
     fn guarded(&self, id: WorkerId, revision: u64) -> Option<WorkerRow> {
-        let row = self.row_of(&self.object(id)?)?;
+        let row = self.row(id)?;
         (row.revision == revision).then_some(row)
     }
 
@@ -186,7 +183,7 @@ impl<G: Generation> Objects<G> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use std::{collections::BTreeMap, sync::Arc};
 
     use parking_lot::Mutex;
@@ -199,11 +196,11 @@ mod tests {
         worker_host::Members,
     };
 
-    const A: &str = "http://a:8000";
+    pub(crate) const A: &str = "http://a:8000";
 
     /// What a journal was told of each membership write: the change, the
     /// row it left and the row it took out.
-    type Member = (MembershipChange, Option<WorkerRow>, Option<WorkerRow>);
+    pub(crate) type Member = (MembershipChange, Option<WorkerRow>, Option<WorkerRow>);
 
     /// A journal that keeps what it was told of the membership.
     #[derive(Default)]
@@ -242,14 +239,14 @@ mod tests {
 
     /// A replica as a controller keeps one: a journaled store, and a holder
     /// whose objects follow their rows' status.
-    struct Replica {
-        store: MemoryStore,
-        objects: Objects<Members>,
+    pub(crate) struct Replica {
+        pub(crate) store: MemoryStore,
+        pub(crate) objects: Objects<Members>,
         told: Arc<Told>,
     }
 
     impl Replica {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             let told = Arc::new(Told::default());
             Self {
                 store: MemoryStore::journaled(Arc::clone(&told) as _),
@@ -258,12 +255,12 @@ mod tests {
             }
         }
 
-        fn upsert(&self, facts: WorkerFacts) -> Option<MembershipChange> {
+        pub(crate) fn upsert(&self, facts: WorkerFacts) -> Option<MembershipChange> {
             self.objects.upsert(&self.store, facts, Registrant::Control)
         }
 
         /// The last membership write as the journal was told it.
-        fn last(&self) -> Member {
+        pub(crate) fn last(&self) -> Member {
             self.told
                 .0
                 .lock()
@@ -272,14 +269,14 @@ mod tests {
                 .expect("a write was told")
         }
 
-        fn object(&self, url: &str) -> Option<ObjectId> {
+        pub(crate) fn object(&self, url: &str) -> Option<ObjectId> {
             self.objects.registry().get_id_by_url(url)
         }
 
         /// The row under `url` where the journal's last word, the table and
         /// the object agree on it, each fact and the status. No follow is
         /// run: the holder's place stands one change behind the store.
-        fn one_row(&self, url: &str) -> WorkerRow {
+        pub(crate) fn one_row(&self, url: &str) -> WorkerRow {
             let (_, told, _) = self.last();
             let table = self.store.by_key(url).expect("the table holds the row");
             let object = self.object(url).expect("the object stands with no follow");
@@ -294,7 +291,7 @@ mod tests {
 
     /// A registration that states what an object holds and what stands
     /// beside it.
-    fn facts(incarnation: u64, tier: &str) -> WorkerFacts {
+    pub(crate) fn facts(incarnation: u64, tier: &str) -> WorkerFacts {
         WorkerFacts {
             key: A.to_owned(),
             engine: A.to_owned(),
@@ -554,8 +551,8 @@ mod tests {
             objects.follow_from(store, &mut place);
             let read = replica.object(A).and_then(|object| objects.row_of(&object));
             let read = read.expect("the row read");
-            // Another writer, outside the holder's turn: a last leader's
-            // late event lands as a write of the store's own.
+            // Another writer, outside the holder's turn: a write of the
+            // store's own, which takes no turn of the holder.
             let late = WorkerPatch {
                 labels: Some(BTreeMap::from([("tier".to_owned(), "late".to_owned())])),
                 ..WorkerPatch::default()

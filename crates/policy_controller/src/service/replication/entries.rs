@@ -25,7 +25,8 @@ const DISPATCHED: &str = "a new leader reads dispatched leases from the engines'
                           snapshots and rebuilds credits from its own tally";
 const LEASES: &str = "no journal entry carries a reservation, an issue or a lease's end yet";
 const PUBLISHED: &str = "every replica publishes its own world";
-const REPORTED: &str = "each engine's next load report states its values again";
+const REPORTED: &str = "a host's own writer states the values again at each engine's next \
+                        load report, and a controller's serve writes none";
 
 /// The list: `(trait or type, entry, fate)`, each in its file's own order.
 pub const ENTRIES: &[(&str, &str, EntryReplication)] = &[
@@ -79,17 +80,17 @@ pub const ENTRIES: &[(&str, &str, EntryReplication)] = &[
         EntryReplication::Rebuilt(REPORTED),
     ),
     ("LoadSink", "poll_mode", EntryReplication::Read),
-    // The report period is the load driver's own setting, told where the
-    // driver is built: every replica builds its own.
+    // The report period is the setting of a host's own writer of load
+    // rows, told where that writer is built.
     (
         "LoadSink",
         "heard_every",
-        EntryReplication::Rebuilt("each replica's load driver tells its own report period"),
+        EntryReplication::Rebuilt("a host's own writer of load rows tells its report period"),
     ),
     ("LoadSink", "load", EntryReplication::Read),
     ("LoadSink", "ranks", EntryReplication::Read),
-    // The load driver drops a replica's rows at each turn of its role: each
-    // replica's own rows, and a standby holds none.
+    // A host's own writer drops the rows it wrote: each replica's own
+    // rows, and a standby holds none.
     (
         "LoadSink",
         "evict",
@@ -223,10 +224,7 @@ pub const ENTRIES: &[(&str, &str, EntryReplication)] = &[
         EntryReplication::Journaled,
     ),
     ("MemoryStore", "snapshot", EntryReplication::Read),
-    ("MemoryStore", "build_view", EntryReplication::Read),
     ("MemoryStore", "with_snapshot", EntryReplication::Read),
-    ("MemoryStore", "build_pair", EntryReplication::Read),
-    ("MemoryStore", "build_encode_pair", EntryReplication::Read),
     ("MemoryStore", "deciding", EntryReplication::Read),
     ("MemoryStore", "prompt_hashes", EntryReplication::Read),
     ("MemoryStore", "micros", EntryReplication::Read),

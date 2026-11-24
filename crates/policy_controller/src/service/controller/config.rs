@@ -123,11 +123,11 @@ pub struct Config {
     /// another controller holds waits this long for that one to stop
     /// ([`Controller::spec_store`](super::Controller::spec_store)).
     pub shutdown_grace: Duration,
-    /// How often the load driver polls an engine whose stream is not
-    /// serving it, and the freshness bound a pushed record must meet to
-    /// stand in for the poll: the gateway's `--load-monitor-interval`. The
-    /// load monitor, whose reports a decision reads, polls each worker by
-    /// the same interval cut to whole seconds, and by one second for less.
+    /// How often the load monitor, whose reports a decision reads, polls a
+    /// worker whose stream is not serving it, and the freshness bound a
+    /// pushed record must meet to stand in for the poll: the gateway's
+    /// `--load-monitor-interval`. The monitor polls by the interval cut to
+    /// whole seconds, and by one second for less.
     pub load_poll_interval: Duration,
     /// How many threads decide (design 5.5): a model's decisions all run on
     /// one of them, behind one bounded queue. From 1 to
