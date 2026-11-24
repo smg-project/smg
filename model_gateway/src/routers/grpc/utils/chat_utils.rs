@@ -16,8 +16,8 @@ use bytes::Bytes;
 use llm_multimodal::{MediaPartOrder, Modality};
 use llm_tokenizer::{
     chat_template::{
-        ChatTemplateContentFormat, ChatTemplateParams, PreparedTools, TemplateRefusal,
-        ThinkingKeyName,
+        ChatTemplateContentFormat, ChatTemplateParams, PreparedTools, TemplateFailure,
+        TemplateRefusal, ThinkingKeyName,
     },
     traits::{Encoding, PromptEncoding, Tokenizer},
     StopRules, StopSequenceConfig, StopSequenceDecoder,
@@ -932,16 +932,80 @@ pub(crate) fn empty_content(content_format: ChatTemplateContentFormat) -> Value 
     }
 }
 
+/// Media text shorter than this stays in the template value: leaving it out
+/// takes a copy of the message, which costs more than a short text does.
+const MEDIA_TEXT_LEFT_OUT: usize = 64 << 10;
+
+/// A copy of `message` with the text of each media part (a URL, a `data:`
+/// URL, base64 audio) left empty, for a template value whose content
+/// transform drops that text: megabytes the value would otherwise copy.
+/// `None` where the media text is short, or shorter than the text the copy
+/// clones.
+fn without_media_text(message: &ChatMessage) -> Option<ChatMessage> {
+    let content = match message {
+        ChatMessage::System { content, .. }
+        | ChatMessage::User { content, .. }
+        | ChatMessage::Tool { content, .. }
+        | ChatMessage::Developer { content, .. }
+        | ChatMessage::Root { content, .. } => content,
+        ChatMessage::Assistant { .. } | ChatMessage::Function { .. } => return None,
+    };
+    let MessageContent::Parts(parts) = content else {
+        return None;
+    };
+    let (mut media, mut text) = (0, 0);
+    for part in parts {
+        match part {
+            ContentPart::ImageUrl { image_url } => media += image_url.url.len(),
+            ContentPart::AudioUrl { audio_url } => media += audio_url.url.len(),
+            ContentPart::VideoUrl { video_url } => media += video_url.url.len(),
+            ContentPart::InputAudio { input_audio } => media += input_audio.data.len(),
+            _ => text += part.text().map_or(0, str::len),
+        }
+    }
+    if media < MEDIA_TEXT_LEFT_OUT.max(text) {
+        return None;
+    }
+    let mut light = message.clone();
+    if let ChatMessage::System { content, .. }
+    | ChatMessage::User { content, .. }
+    | ChatMessage::Tool { content, .. }
+    | ChatMessage::Developer { content, .. }
+    | ChatMessage::Root { content, .. } = &mut light
+    {
+        if let MessageContent::Parts(parts) = content {
+            for part in parts {
+                match part {
+                    ContentPart::ImageUrl { image_url } => image_url.url = Arc::default(),
+                    ContentPart::AudioUrl { audio_url } => audio_url.url = Arc::default(),
+                    ContentPart::VideoUrl { video_url } => video_url.url = Arc::default(),
+                    ContentPart::InputAudio { input_audio } => input_audio.data = Arc::default(),
+                    _ => {}
+                }
+            }
+        }
+    }
+    Some(light)
+}
+
 fn process_content_format_with_order(
     messages: &[ChatMessage],
     content_format: ChatTemplateContentFormat,
     placeholder_tokens: Option<&PlaceholderTokens>,
     media_order: MediaPartOrder,
 ) -> Result<Vec<Value>, PromptError> {
+    // The transform below writes a media part without its text under the
+    // OpenAI format, and under the string format wherever the template has
+    // placeholders: there the text stays out of the value from the start.
+    let drops_media_text =
+        matches!(content_format, ChatTemplateContentFormat::OpenAI) || placeholder_tokens.is_some();
     messages
         .iter()
         .map(|message| {
-            let mut message_json = serde_json::to_value(message)
+            let light = drops_media_text
+                .then(|| without_media_text(message))
+                .flatten();
+            let mut message_json = serde_json::to_value(light.as_ref().unwrap_or(message))
                 .map_err(|e| format!("Failed to serialize message: {e}"))?;
 
             if let Some(obj) = message_json.as_object_mut() {
@@ -1190,19 +1254,36 @@ pub fn request_as_rendered(
     }
 }
 
-/// Why a conversation did not become a prompt.
+/// Why a request's conversation or input did not become a prompt.
 ///
 /// [`Self::Refused`] is a cause the request itself brings and its client can
 /// fix: media for a template with no placeholder for it, a block or a document
 /// source the route does not take, a response format the renderer does not
 /// take with the request's other fields, a conversation the model's template
-/// rejects through its own `raise_exception`. A stage writes one WARN for it
-/// and marks its answer reported. Every other cause is [`Self::Failed`], which
-/// is also what a bare message converts into: a failure nobody typed as the
-/// request's is the deployment's, and the stage keeps its ERROR line for it.
+/// rejects through its own `raise_exception`, a generate input the route does
+/// not take. A stage writes one WARN for it and marks its answer reported.
+///
+/// [`Self::TemplateFailed`] is a render the model's chat template failed on
+/// its own account, whatever the request holds ([`TemplateFailure`]): the
+/// template is not there to render, or its source alone asks the engine for
+/// another template, a filter, a test or a function that is not there. A
+/// template is its deployment's to fix, so this one cause is answered in the
+/// server's class ([`Self::answer`]) and a broken template alerts instead of
+/// reading as its clients' mistakes.
+///
+/// Every other cause is [`Self::Failed`], which is also what a bare message
+/// converts into: a failure nobody typed as the request's is the
+/// deployment's, and the stage keeps its ERROR line for it. Its answer keeps
+/// the 400 it had, because a request can be the cause of these: a render
+/// that stops on a value (a `chat_template_kwargs` entry of a kind the
+/// template does not expect, or one that takes the name of a function it
+/// calls), a continuation the render cannot make, a tool the template cannot
+/// be handed. A template that breaks on some values fails the same way, and
+/// the render does not tell the two apart.
 #[derive(Debug)]
 pub enum PromptError {
     Refused(String),
+    TemplateFailed(String),
     Failed(String),
 }
 
@@ -1212,22 +1293,47 @@ impl PromptError {
         matches!(self, Self::Refused(_))
     }
 
+    /// Whether the model's chat template failed on its own account.
+    pub fn is_template_failure(&self) -> bool {
+        matches!(self, Self::TemplateFailed(_))
+    }
+
     /// A template render's failure: the template's own refusal of the
-    /// conversation is the request's; any other (no template set, an
-    /// operation the template could not run) is not.
+    /// conversation is the request's, and a failure that is the template's
+    /// whatever the request holds is the template's; any other (no template
+    /// set, a render that stops on a value, a check of the request the render
+    /// makes) is neither.
     pub(crate) fn of_render(error: &anyhow::Error) -> Self {
         let message = format!("Failed to apply chat template: {error}");
         if TemplateRefusal::is(error) {
             Self::Refused(message)
+        } else if TemplateFailure::is(error) {
+            Self::TemplateFailed(message)
         } else {
             Self::Failed(message)
+        }
+    }
+
+    /// The answer to the client, under the failure's own text: a 500
+    /// `chat_template_render_failed` for the template's own failure, the 400
+    /// `process_messages_failed` for every other cause. The one mapping for
+    /// the chat stage, the Messages stage and the token count, so the three
+    /// answer a conversation alike.
+    pub(crate) fn answer(self) -> Response {
+        match self {
+            Self::TemplateFailed(message) => {
+                error::internal_error("chat_template_render_failed", message)
+            }
+            Self::Refused(message) | Self::Failed(message) => {
+                error::bad_request("process_messages_failed", message)
+            }
         }
     }
 }
 
 impl fmt::Display for PromptError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let (Self::Refused(message) | Self::Failed(message)) = self;
+        let (Self::Refused(message) | Self::TemplateFailed(message) | Self::Failed(message)) = self;
         f.write_str(message)
     }
 }
@@ -1240,7 +1346,9 @@ impl From<String> for PromptError {
 
 impl From<PromptError> for String {
     fn from(error: PromptError) -> Self {
-        let (PromptError::Refused(message) | PromptError::Failed(message)) = error;
+        let (PromptError::Refused(message)
+        | PromptError::TemplateFailed(message)
+        | PromptError::Failed(message)) = error;
         message
     }
 }

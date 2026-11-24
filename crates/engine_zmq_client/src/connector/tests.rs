@@ -1498,6 +1498,181 @@ async fn a_holder_whose_add_is_still_unread_after_the_rewoken_wave_is_woken_agai
     .await;
 }
 
+/// The lost-wake split: a submit's wake reaches rank 0 while
+/// the old wave is still running, so rank 0 only adopts the number, parks
+/// with its peers and self-increments past it; rank 1 reads the same wake
+/// after parking and starts the new wave alone, holding the request in an
+/// all-reduce rank 0 never joins. The parked ranks' completion reports are
+/// the client's only signal (without a DP coordinator every rank reports its
+/// own; rank 0's names the wave it adopted), so that one report, while the
+/// prompt is unanswered, must re-wake the group above rank 0's wave.
+///
+/// Unlike `a_wave_drained_while_a_handed_prompt_is_unanswered_wakes_the_group_again`,
+/// only one rank reports the park here: a single rank's report is enough.
+#[tokio::test]
+async fn a_split_park_with_a_prompt_unanswered_rewakes_the_group() {
+    let (client, mut engines, _ns) = connect_ranks(2, true).await;
+
+    let _stream = client.submit(request_for("req-1", 1)).await.unwrap();
+    let wake = next_wake(&mut engines[0]).await;
+    assert_eq!(next_wake(&mut engines[1]).await, wake);
+
+    // Rank 0 consumed `wake` mid-wave, then parked: it reports completing
+    // `wake` and now sits on `wake + 1`.
+    engines[0]
+        .send_output(wave_control(0, DpControlMessage::WaveComplete(wake)))
+        .await
+        .unwrap();
+
+    let rewake = tokio::time::timeout(TIMEOUT, next_wake(&mut engines[0]))
+        .await
+        .expect("a park with a request in flight did not re-wake the group");
+    assert!(
+        rewake > wake + 1,
+        "re-wake {rewake} is not accepted by the rank parked on {}",
+        wake + 1
+    );
+    assert_eq!(next_wake(&mut engines[1]).await, rewake);
+}
+
+/// Every parked rank reports its own completion, so one park yields one
+/// re-wake, not one per rank; and a report below the last submit's wave (the
+/// late reader's, or a group's that parked before the wake went out) does
+/// not re-wake: that wake itself starts the rank. Otherwise a short request
+/// could meet the idle wave's park and split the group with nothing in
+/// flight. What this adds to the tests above is the second half: reports
+/// below the submit's wave.
+#[tokio::test]
+async fn a_rewake_fires_once_per_park_and_not_below_the_submits_wave() {
+    async fn assert_quiet(engines: &mut [MockEngine], why: &str) {
+        for engine in engines {
+            let quiet = tokio::time::timeout(Duration::from_millis(200), engine.recv()).await;
+            assert!(quiet.is_err(), "{why}: {quiet:?}");
+        }
+    }
+    async fn complete(engines: &mut [MockEngine], rank: u32, wave: u64) {
+        engines[rank as usize]
+            .send_output(wave_control(rank, DpControlMessage::WaveComplete(wave)))
+            .await
+            .unwrap();
+    }
+    let (client, mut engines, _ns) = connect_ranks(2, true).await;
+
+    // Split park: rank 0 adopted `wake` before parking, rank 1 did not.
+    let _stream = client.submit(request_for("req-1", 1)).await.unwrap();
+    let wake = next_wake(&mut engines[0]).await;
+    assert_eq!(next_wake(&mut engines[1]).await, wake);
+    complete(&mut engines, 0, wake).await;
+    let rewake = next_wake(&mut engines[0]).await;
+    assert_eq!(next_wake(&mut engines[1]).await, rewake);
+    complete(&mut engines, 1, wake - 1).await;
+    complete(&mut engines, 1, wake).await;
+    assert_quiet(&mut engines, "a second report of the same park re-woke").await;
+
+    // A new submit's wake: reports of the wave before it (the group parked
+    // before the wake went out) do not re-wake, with both prompts pending.
+    let _second = client.submit(request_for("req-2", 0)).await.unwrap();
+    let wake2 = next_wake(&mut engines[0]).await;
+    assert_eq!(next_wake(&mut engines[1]).await, wake2);
+    complete(&mut engines, 0, wake2 - 1).await;
+    complete(&mut engines, 1, wake2 - 1).await;
+    assert_quiet(&mut engines, "a report below the submit's wave re-woke").await;
+}
+
+/// A park after every request finished is the normal idle transition: it
+/// must not start a new wave (the ranks would otherwise spin dummy waves
+/// forever, each completion triggering the next). Unlike
+/// `answered_prompt_leaves_the_group_parked`, the group never split: one
+/// rank's report of the wave the submit woke it to.
+#[tokio::test]
+async fn a_park_with_nothing_in_flight_stays_parked() {
+    let (client, mut engines, _ns) = connect_ranks(2, true).await;
+
+    let mut stream = client.submit(request_for("req-1", 0)).await.unwrap();
+    let wake = next_wake(&mut engines[0]).await;
+    assert_eq!(next_wake(&mut engines[1]).await, wake);
+    engines[0]
+        .send_output(finished_output("req-1"))
+        .await
+        .unwrap();
+    assert!(stream.next().await.unwrap().unwrap().finished());
+
+    engines[0]
+        .send_output(wave_control(0, DpControlMessage::WaveComplete(wake)))
+        .await
+        .unwrap();
+    tokio::time::timeout(TIMEOUT, async {
+        while *client.inner.wave.as_ref().unwrap().lock() <= wake {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the completion never reached the clock");
+
+    for engine in &mut engines {
+        let quiet = tokio::time::timeout(Duration::from_millis(200), engine.recv()).await;
+        assert!(quiet.is_err(), "an idle park re-woke the group: {quiet:?}");
+    }
+}
+
+/// Wakes are numbered and queued under the clock's lock, so however many
+/// wake the group at once (submits on several threads, and the dispatcher's
+/// re-wakes for the parks the ranks report meanwhile), every rank reads them
+/// in numbering order: a rank that read a lower number after a higher one
+/// would ignore it and could be left parked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_wakes_reach_every_rank_in_numbering_order() {
+    const SUBMITS: usize = 64;
+    let (client, mut engines, _ns) = connect_ranks(2, true).await;
+    let client = Arc::new(client);
+
+    let submits: Vec<_> = (0..SUBMITS)
+        .map(|i| {
+            let client = Arc::clone(&client);
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "each submit is joined below, before the test ends"
+            )]
+            tokio::spawn(async move {
+                let rank = u32::try_from(i % 2).unwrap();
+                client
+                    .submit(request_for(&format!("req-{i}"), rank))
+                    .await
+                    .unwrap()
+            })
+        })
+        .collect();
+    // Parks reported while the submits race: with prompts unanswered they
+    // re-wake the group from the dispatcher's task.
+    for wave in 1..=8 {
+        for rank in 0..2u32 {
+            engines[rank as usize]
+                .send_output(wave_control(rank, DpControlMessage::WaveComplete(wave)))
+                .await
+                .unwrap();
+        }
+    }
+    let _streams = futures::future::join_all(submits).await;
+
+    for (rank, engine) in engines.iter_mut().enumerate() {
+        let mut waves = Vec::new();
+        while let Ok(wave) =
+            tokio::time::timeout(Duration::from_millis(300), next_wake(engine)).await
+        {
+            waves.push(wave);
+        }
+        assert!(
+            waves.len() >= SUBMITS,
+            "rank {rank} read {} wakes",
+            waves.len()
+        );
+        assert!(
+            waves.windows(2).all(|pair| pair[0] < pair[1]),
+            "rank {rank} read wakes out of numbering order: {waves:?}"
+        );
+    }
+}
+
 /// Submit `request_id` pinned to `rank` on a two-rank lockstep group: the
 /// rank reads its add and every rank the wake, whose wave is returned with
 /// the request's stream.
@@ -1886,6 +2061,25 @@ async fn saturate_input(client: &EngineCoreClient) {
     })
     .await
     .expect("transport-owned payload budget becomes full");
+}
+
+/// The byte bound of a case whose large submit must be queued behind the
+/// stalled writer. One large request fits under it, so the submit is
+/// admitted however long after the stall it starts; two do not, so the
+/// transport's budget (the same bound) is still full after the first
+/// saturation frame and the writer stalls on the second, as it does under
+/// the default bound.
+const QUEUED_SUBMIT_BYTES: usize = 96 << 20;
+
+/// [`saturate_input`] for a case whose large submit must be queued behind
+/// the stalled writer and then time out. Under the default byte bound a
+/// request this large is refused at once when its submit starts a whole
+/// send window after the stall: that is the bound's own rule, with its own
+/// cases, and such a case would depend on how soon the host lets it go from
+/// the stall to its submit.
+async fn saturate_input_for_a_queued_submit(client: &EngineCoreClient) {
+    client.set_input_queue_limit(usize::MAX, QUEUED_SUBMIT_BYTES);
+    saturate_input(client).await;
 }
 
 /// A finished one-token output for `request_id` on rank 0.
@@ -2324,7 +2518,12 @@ async fn an_engine_lost_while_the_handshake_waited_for_the_others_ends_the_link(
     ));
 }
 
-/// Local admission completes before receipt; output silence still detects stalls.
+/// Local admission completes before receipt; output silence still detects
+/// stalls. The client is given up on a whole silence window after the ask at
+/// the soonest, not at the input-death window, a quarter as long. The case
+/// reads when the give-up came and takes no sample of the client in
+/// between: the silence count starts inside the submit, and on a starved
+/// host the submit returns too late for a sample timed from its return.
 #[tokio::test]
 async fn accepted_large_frame_uses_output_silence_not_input_timeout() {
     let (client, _engine, _ns) = connect().await;
@@ -2332,17 +2531,23 @@ async fn accepted_large_frame_uses_output_silence_not_input_timeout() {
     client.set_input_death_timeout(SEND_WINDOW / 2);
     client.set_silence_death_timeout(SEND_WINDOW * 2);
     let (request, aux) = large_request("queued");
+    let asked = std::time::Instant::now();
     let mut stream = client.submit_with_aux(request, aux).await.unwrap();
-    tokio::time::sleep(SEND_WINDOW).await;
-    assert!(
-        client.is_alive(),
-        "queue admission finished despite the stalled receiver"
-    );
-    assert!(tokio::time::timeout(TIMEOUT, stream.next())
+    let error = tokio::time::timeout(TIMEOUT, stream.next())
         .await
         .unwrap()
         .unwrap()
-        .is_err());
+        .expect_err("the stalled request ends with an error");
+    let given_up_after = asked.elapsed();
+    assert!(
+        matches!(&error, Error::Shared(shared) if matches!(**shared, Error::EngineCoreDead)),
+        "{error:?}"
+    );
+    assert!(
+        given_up_after >= SEND_WINDOW * 2,
+        "queue admission finished despite the stalled receiver, and the client was \
+         given up on after {given_up_after:?}: sooner than a silence window"
+    );
     assert!(
         !client.is_alive(),
         "unanswered queued requests still trigger output silence"
@@ -2451,7 +2656,7 @@ async fn a_full_peer_queue_times_out_requests_without_closing_the_client() {
 async fn a_request_after_the_engine_resumes_is_served() {
     let (client, mut engine, _ns) = connect().await;
     client.set_send_timeout(SEND_WINDOW);
-    saturate_input(&client).await;
+    saturate_input_for_a_queued_submit(&client).await;
     let (request, aux) = large_request("req-large");
     let error = client
         .submit_with_aux(request, aux)
@@ -2494,7 +2699,7 @@ async fn output_is_routed_while_aborts_wait_on_a_blocked_input() {
     let (client, mut engine, _ns) = connect().await;
     client.set_send_timeout(SEND_WINDOW);
     let mut in_flight = client.submit(request_for("req-small", 0)).await.unwrap();
-    saturate_input(&client).await;
+    saturate_input_for_a_queued_submit(&client).await;
     let (request, aux) = large_request("req-large");
     let error = client
         .submit_with_aux(request, aux)
@@ -2530,7 +2735,7 @@ async fn an_input_blocked_for_the_death_window_ends_the_client() {
     client.set_send_timeout(SEND_WINDOW);
     client.set_input_death_timeout(SEND_WINDOW * 3);
     let mut in_flight = client.submit(request_for("req-small", 0)).await.unwrap();
-    saturate_input(&client).await;
+    saturate_input_for_a_queued_submit(&client).await;
     let (request, aux) = large_request("req-large");
     let error = client
         .submit_with_aux(request, aux)
@@ -2585,7 +2790,7 @@ async fn an_accepted_large_frame_can_arrive_after_client_drop() {
 async fn an_abandoned_submit_aborts_its_request_and_frees_its_id() {
     let (client, mut engine, _ns) = connect().await;
     client.set_send_timeout(SEND_WINDOW);
-    saturate_input(&client).await;
+    saturate_input_for_a_queued_submit(&client).await;
     let (request, aux) = large_request("req-large");
     let abandoned =
         tokio::time::timeout(SEND_WINDOW / 3, client.submit_with_aux(request, aux)).await;
@@ -2845,7 +3050,7 @@ async fn a_wake_requested_while_a_frame_is_blocked_parks_no_output_and_skips_no_
     }
     assert_eq!(next_wake(&mut engines[1]).await, 1);
     // A frame rank 0 does not read blocks the input queue.
-    saturate_input(&client).await;
+    saturate_input_for_a_queued_submit(&client).await;
     let (request, aux) = large_request("req-large");
     let error = client
         .submit_with_aux(request, aux)
@@ -3217,6 +3422,9 @@ async fn a_peer_disconnect_fails_accepted_typed_tensor_requests_on_the_tagged_wi
 async fn an_abandoned_typed_tensor_submit_aborts_its_request_on_the_tagged_wire() {
     let (client, mut engine, _ns) = connect_tagged().await;
     client.set_send_timeout(SEND_WINDOW);
+    // The large submit must be queued behind the stalled writer however
+    // late it starts: see `QUEUED_SUBMIT_BYTES`.
+    client.set_input_queue_limit(usize::MAX, QUEUED_SUBMIT_BYTES);
     for _ in 0..3 {
         let (payload, aux) = TokenSpeedProtocol::encode_add(
             &large_tagged_request("queue-saturation"),
@@ -3692,7 +3900,10 @@ async fn an_add_the_engine_never_received_queues_no_allowance_on_the_wire() {
     let (client, mut engine, _ns) = connect().await;
     client.set_prefill_tokens_per_sec(10_000);
     client.set_send_timeout(SEND_WINDOW);
-    client.set_input_queue_limit(0, usize::MAX);
+    // One add may wait behind a blocked input: the first submit after the
+    // stall is admitted however late the host lets it start, and the prompt
+    // after it finds the queue at its bound.
+    client.set_input_queue_limit(1, usize::MAX);
     // The engine reads one short request.
     let mut stream = client.submit(request_for("req-short", 0)).await.unwrap();
     engine.recv().await.unwrap();

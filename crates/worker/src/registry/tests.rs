@@ -11,6 +11,7 @@ use crate::{
     identity::basic::WorkerLoadGuard,
     metrics::{series as worker_series, series::WorkerSeriesRecorder},
     model_card::ModelCard,
+    registry::event::WorkerConnected,
     test_support::{no_health_check, worker_with_model_aliases, BasicWorkerBuilder},
 };
 
@@ -193,7 +194,7 @@ fn assert_sampling_defaults_group_values(
 }
 
 #[test]
-fn connect_signal_receiver_is_taken_exactly_once() {
+fn connect_signal_receiver_is_held_by_one_taker_at_a_time() {
     let registry = WorkerRegistry::new();
     assert!(
         registry.take_connect_signal_receiver().is_some(),
@@ -205,6 +206,44 @@ fn connect_signal_receiver_is_taken_exactly_once() {
     );
 }
 
+/// The receiver handed back is taken again, with what was sent while
+/// nobody read: a signal waits in the channel for the next loop. The
+/// hand-back wakes a waiter that asks after it too.
+#[tokio::test]
+async fn a_returned_connect_signal_receiver_is_taken_again_with_what_was_sent_meanwhile() {
+    let registry = WorkerRegistry::new();
+    let held = registry
+        .take_connect_signal_receiver()
+        .expect("the first take");
+    registry
+        .connect_signal_sender()
+        .send(WorkerSignal::Connected(WorkerConnected {
+            url: "ipc:///tmp/w.ipc".to_string(),
+            revision: 3,
+        }))
+        .expect("send on a live channel");
+    registry.return_connect_signal_receiver(held);
+    // A lost wake fails here by its message, not by a hang.
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        registry.connect_signal_receiver_returned(),
+    )
+    .await
+    .expect("a hand-back nobody awaited is kept for the next await");
+
+    let mut again = registry
+        .take_connect_signal_receiver()
+        .expect("the receiver is back");
+    let got = again.recv().await.expect("the signal sent meanwhile");
+    assert!(
+        matches!(
+            &got,
+            WorkerSignal::Connected(WorkerConnected { revision: 3, .. })
+        ),
+        "{got:?}"
+    );
+}
+
 #[tokio::test]
 async fn connect_signal_sender_delivers_to_the_receiver() {
     let registry = WorkerRegistry::new();
@@ -213,15 +252,20 @@ async fn connect_signal_sender_delivers_to_the_receiver() {
         .take_connect_signal_receiver()
         .expect("receiver present");
 
-    tx.send(WorkerConnected {
+    tx.send(WorkerSignal::Connected(WorkerConnected {
         url: "ipc:///tmp/w.ipc".to_string(),
         revision: 7,
-    })
+    }))
     .expect("send on a live channel");
 
     let got = rx.recv().await.expect("a delivered signal");
-    assert_eq!(got.url, "ipc:///tmp/w.ipc");
-    assert_eq!(got.revision, 7);
+    assert!(
+        matches!(
+            &got,
+            WorkerSignal::Connected(WorkerConnected { url, revision: 7 }) if url == "ipc:///tmp/w.ipc"
+        ),
+        "{got:?}"
+    );
 }
 
 #[test]
@@ -1531,9 +1575,38 @@ fn test_model_index_fast_lookup() {
     assert_eq!(llama_workers_after[0].url(), "http://worker2:8080");
 }
 
-// Health-checker integration tests moved to worker/health/manager.rs along with
+/// The model index is iterated on request paths and the map's iterator pays
+/// for every shard, so its shard count is fixed: not the library's default
+/// of four shards a CPU.
+#[test]
+fn the_model_index_keeps_a_fixed_shard_count() {
+    use dashmap::Map as _;
+
+    let registry = WorkerRegistry::new();
+    assert_eq!(
+        registry.model_index._shard_count(),
+        16,
+        "the model index's shard count follows the CPUs"
+    );
+}
+
+/// The per-model retry overrides are scanned on a request path, as the model
+/// index is counted on one, so their map keeps the same fixed shard count.
+#[test]
+fn the_retry_override_map_keeps_a_fixed_shard_count() {
+    use dashmap::Map as _;
+
+    let registry = WorkerRegistry::new();
+    assert_eq!(
+        registry.model_retry_configs._shard_count(),
+        16,
+        "the retry override map's shard count follows the CPUs"
+    );
+}
+
+// Health-checker integration tests moved to health/manager.rs along with
 // the loop itself. The registry is now a pure collection — see
-// `worker::health::manager::WorkerManager` tests.
+// `health::manager::WorkerManager` tests.
 
 #[test]
 fn test_transition_status_emits_event_and_changes_status() {
@@ -2718,240 +2791,6 @@ fn test_worker_event_broadcast() {
     }
 }
 
-fn worker_serving(url: &str, model_ids: &[&str]) -> Arc<dyn Worker> {
-    Arc::new(
-        BasicWorkerBuilder::new(url)
-            .models(
-                model_ids
-                    .iter()
-                    .map(|id| ModelCard::new(*id))
-                    .collect::<Vec<_>>(),
-            )
-            .health_config(no_health_check())
-            .build(),
-    )
-}
-
-fn assert_hash_ring_urls(registry: &WorkerRegistry, model_id: &str, urls: &[&str]) {
-    let ring = registry.get_hash_ring(model_id);
-    if urls.is_empty() {
-        assert!(ring.is_none(), "removed model {model_id} has no ring");
-        return;
-    }
-    let ring = ring.expect("nonempty model has a ring");
-    assert_eq!(ring.worker_count(), urls.len(), "model {model_id}");
-    for &url in urls {
-        assert_eq!(
-            ring.find_healthy_url("key", |candidate| candidate == url),
-            Some(url),
-            "model {model_id} must contain {url}"
-        );
-    }
-}
-
-#[test]
-fn concurrent_hash_ring_registration_preserves_wildcard_union() {
-    let registry = Arc::new(WorkerRegistry::new());
-    let blocked = registry.overlapping_hash_ring_updates(
-        |registry| {
-            registry
-                .register(worker_serving("http://first:8080", &["model-a", "model-b"]))
-                .expect("register multi-model worker");
-        },
-        |registry| {
-            registry
-                .register(worker_serving("http://second:8080", &["model-b"]))
-                .expect("register other worker");
-        },
-    );
-    assert_hash_ring_urls(&registry, "model-a", &["http://first:8080"]);
-    assert_hash_ring_urls(
-        &registry,
-        "model-b",
-        &["http://first:8080", "http://second:8080"],
-    );
-    assert_hash_ring_urls(
-        &registry,
-        UNKNOWN_MODEL_ID,
-        &["http://first:8080", "http://second:8080"],
-    );
-    assert!(blocked, "different models also serialize wildcard updates");
-}
-
-#[test]
-fn concurrent_hash_ring_removal_does_not_restore_the_last_worker() {
-    let registry = Arc::new(WorkerRegistry::new());
-    let first_id = registry
-        .register(worker_serving("http://first:8080", &["model"]))
-        .expect("first worker");
-    let second_id = registry
-        .register(worker_serving("http://second:8080", &["model"]))
-        .expect("second worker");
-    let blocked = registry.overlapping_hash_ring_updates(
-        move |registry| {
-            registry.remove(&first_id).expect("remove first worker");
-        },
-        move |registry| {
-            registry.remove(&second_id).expect("remove last worker");
-        },
-    );
-    assert!(registry.get_by_model("model").is_empty());
-    assert_hash_ring_urls(&registry, "model", &[]);
-    assert_hash_ring_urls(&registry, UNKNOWN_MODEL_ID, &[]);
-    assert!(blocked, "removals serialize ring publications");
-}
-
-#[test]
-fn concurrent_hash_ring_removal_does_not_erase_a_new_registration() {
-    let registry = Arc::new(WorkerRegistry::new());
-    let old_id = registry
-        .register(worker_serving("http://old:8080", &["model"]))
-        .expect("old worker");
-    let blocked = registry.overlapping_hash_ring_updates(
-        move |registry| {
-            registry.remove(&old_id).expect("remove old worker");
-        },
-        |registry| {
-            registry
-                .register(worker_serving("http://new:8080", &["model"]))
-                .expect("new worker");
-        },
-    );
-    assert_eq!(registry.get_by_model("model").len(), 1);
-    assert_hash_ring_urls(&registry, "model", &["http://new:8080"]);
-    assert_hash_ring_urls(&registry, UNKNOWN_MODEL_ID, &["http://new:8080"]);
-    assert!(blocked, "registration waits for the older removal");
-}
-
-#[test]
-fn concurrent_hash_ring_replace_preserves_changed_models() {
-    let registry = Arc::new(WorkerRegistry::new());
-    let first_id = registry
-        .register(worker_serving("http://first:8080", &["old", "kept"]))
-        .expect("first worker");
-    let second_id = registry
-        .register(worker_serving("http://second:8080", &["old"]))
-        .expect("second worker");
-    let blocked = registry.overlapping_hash_ring_updates(
-        move |registry| {
-            assert!(registry.replace(
-                &first_id,
-                worker_serving("http://first:8080", &["new", "kept"]),
-            ));
-        },
-        move |registry| {
-            registry
-                .remove(&second_id)
-                .expect("remove last old-model worker");
-        },
-    );
-    assert!(registry.get_by_model("old").is_empty());
-    assert_hash_ring_urls(&registry, "old", &[]);
-    assert_hash_ring_urls(&registry, "new", &["http://first:8080"]);
-    assert_hash_ring_urls(&registry, "kept", &["http://first:8080"]);
-    assert_hash_ring_urls(&registry, UNKNOWN_MODEL_ID, &["http://first:8080"]);
-    assert!(blocked, "replace and remove serialize ring publications");
-}
-
-#[test]
-fn test_wildcard_hash_ring_matches_the_only_model() {
-    let registry = WorkerRegistry::new();
-    registry
-        .register(worker_serving("http://w1:8080", &["llama-3"]))
-        .unwrap();
-    registry
-        .register(worker_serving("http://w2:8080", &["llama-3"]))
-        .unwrap();
-
-    let wildcard = registry
-        .get_hash_ring(UNKNOWN_MODEL_ID)
-        .expect("requests naming no model need a ring");
-    let model_ring = registry.get_hash_ring("llama-3").expect("per-model ring");
-
-    assert_eq!(wildcard.worker_count(), 2);
-    for key in ["alpha", "beta", "gamma"] {
-        assert_eq!(
-            wildcard.find_healthy_url(key, |_| true),
-            model_ring.find_healthy_url(key, |_| true),
-            "wildcard and single-model rings must agree on {key}"
-        );
-    }
-}
-
-#[test]
-fn test_wildcard_hash_ring_unions_models() {
-    let registry = WorkerRegistry::new();
-    registry
-        .register(worker_serving("http://w1:8080", &["llama-3"]))
-        .unwrap();
-    registry
-        .register(worker_serving("http://w2:8080", &["gpt-4"]))
-        .unwrap();
-
-    let wildcard = registry.get_hash_ring(UNKNOWN_MODEL_ID).expect("ring");
-    assert_eq!(wildcard.worker_count(), 2);
-    assert_eq!(
-        wildcard.find_healthy_url("key", |url| url == "http://w1:8080"),
-        Some("http://w1:8080")
-    );
-    assert_eq!(
-        wildcard.find_healthy_url("key", |url| url == "http://w2:8080"),
-        Some("http://w2:8080")
-    );
-
-    // Per-model rings stay scoped to their own workers.
-    assert_eq!(
-        registry
-            .get_hash_ring("llama-3")
-            .expect("ring")
-            .worker_count(),
-        1
-    );
-}
-
-#[test]
-fn test_wildcard_hash_ring_weights_multi_model_worker_once() {
-    let registry = WorkerRegistry::new();
-    registry
-        .register(worker_serving("http://w1:8080", &["llama-3", "gpt-4"]))
-        .unwrap();
-    registry
-        .register(worker_serving("http://w2:8080", &["gpt-4"]))
-        .unwrap();
-
-    let wildcard = registry.get_hash_ring(UNKNOWN_MODEL_ID).expect("ring");
-    assert_eq!(
-        wildcard.worker_count(),
-        2,
-        "a worker serving two models must not take a double share of the ring"
-    );
-}
-
-#[test]
-fn test_wildcard_hash_ring_follows_removals() {
-    let registry = WorkerRegistry::new();
-    registry
-        .register(worker_serving("http://w1:8080", &["llama-3"]))
-        .unwrap();
-    registry
-        .register(worker_serving("http://w2:8080", &["gpt-4"]))
-        .unwrap();
-
-    registry.remove_by_url("http://w2:8080");
-    let wildcard = registry.get_hash_ring(UNKNOWN_MODEL_ID).expect("ring");
-    assert_eq!(wildcard.worker_count(), 1);
-    assert_eq!(
-        wildcard.find_healthy_url("key", |_| true),
-        Some("http://w1:8080")
-    );
-
-    registry.remove_by_url("http://w1:8080");
-    assert!(
-        registry.get_hash_ring(UNKNOWN_MODEL_ID).is_none(),
-        "an empty registry has no ring to route against"
-    );
-}
-
 fn overload_worker(url: &str, model_id: &str) -> Arc<dyn Worker> {
     Arc::new(
         BasicWorkerBuilder::new(url)
@@ -3144,6 +2983,50 @@ fn clear_all_overload_flags_resets_every_model() {
     assert_eq!(registry.overloaded_worker_count("m2"), 0);
 }
 
+/// The registry counts its overload edges for a host's read: one a veto
+/// that changed, either way, a clear of every flag among them. A verdict
+/// said again counts nothing, and a worker the registry does not hold
+/// counts nothing. The replacement and the removal of an overloaded worker
+/// lower its flag, an edge each, and those of a worker with no flag count
+/// nothing.
+#[test]
+fn an_overload_edge_is_counted_once_and_a_verdict_said_again_is_not() {
+    let registry = WorkerRegistry::new();
+    let a = overload_worker("http://127.0.0.1:9711", "m");
+    let b = overload_worker("http://127.0.0.1:9712", "m");
+    let a_id = registry.register(Arc::clone(&a)).unwrap();
+    let b_id = registry.register(Arc::clone(&b)).unwrap();
+    assert_eq!(registry.overload_edges(), 0);
+
+    assert!(registry.set_worker_overloaded(&a, true));
+    assert!(!registry.set_worker_overloaded(&a, true));
+    assert_eq!(registry.overload_edges(), 1, "said again: no edge");
+    assert!(registry.set_worker_overloaded(&b, true));
+    assert!(registry.set_worker_overloaded(&a, false));
+    assert_eq!(registry.overload_edges(), 3, "either way is an edge");
+
+    assert_eq!(registry.clear_all_overload_flags(), 1);
+    assert_eq!(registry.overload_edges(), 4, "a clear is an edge a flag");
+
+    let stranger = overload_worker("http://127.0.0.1:9713", "m");
+    assert!(!registry.set_worker_overloaded(&stranger, true));
+    assert_eq!(registry.overload_edges(), 4, "no worker of the registry's");
+
+    assert!(registry.set_worker_overloaded(&a, true));
+    assert!(registry.set_worker_overloaded(&b, true));
+    let again = overload_worker("http://127.0.0.1:9711", "m");
+    assert!(registry.replace(&a_id, again));
+    assert_eq!(
+        registry.overload_edges(),
+        7,
+        "a replacement lowers the flag"
+    );
+    assert!(registry.remove(&b_id).is_some());
+    assert_eq!(registry.overload_edges(), 8, "a removal lowers the flag");
+    assert!(registry.remove(&a_id).is_some());
+    assert_eq!(registry.overload_edges(), 8, "no flag to lower: no edge");
+}
+
 /// A removed worker's address stays retired in the series store while a
 /// handle to the worker lives (a late write of that handle lands nowhere),
 /// and the store's upkeep forgets it once the last handle is gone: the
@@ -3277,4 +3160,441 @@ fn remove_if_removes_the_worker_only_while_its_condition_holds() {
         registry.remove_if(&id, |_| true).is_none(),
         "a worker gone reads None"
     );
+}
+
+/// A call that names a worker already removed keeps no lock for it: only the
+/// removal that found the worker drops its entry, so a later one would stay.
+#[test]
+fn a_call_that_names_a_removed_worker_keeps_no_lock_for_it() {
+    let registry = WorkerRegistry::new();
+    let worker: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new("http://w1:8080")
+            .worker_type(WorkerType::Regular)
+            .health_config(no_health_check())
+            .build(),
+    );
+    let id = registry
+        .register(Arc::clone(&worker))
+        .expect("the worker registers");
+    registry.remove(&id).expect("the worker is removed");
+    assert!(registry.worker_mutation_locks.is_empty());
+
+    assert_eq!(
+        registry.transition_status_if_revision(&id, worker.revision(), WorkerStatus::NotReady),
+        None
+    );
+    assert!(registry.worker_mutation_locks.is_empty(), "a transition");
+    assert!(!registry.replace(&id, Arc::clone(&worker)));
+    assert!(registry.worker_mutation_locks.is_empty(), "a replacement");
+    assert!(registry.remove_if(&id, |_| true).is_none());
+    assert!(
+        registry.worker_mutation_locks.is_empty(),
+        "a conditional removal"
+    );
+    assert!(registry.remove(&id).is_none());
+    assert!(registry.worker_mutation_locks.is_empty(), "a removal");
+}
+
+/// The lines a rendered scrape holds for the worker at `url`, sorted.
+fn series_of(rendered: &str, url: &str) -> Vec<String> {
+    let label = format!("worker=\"{url}\"");
+    let mut lines: Vec<String> = rendered
+        .lines()
+        .filter(|line| line.contains(&label))
+        .map(str::to_owned)
+        .collect();
+    lines.sort_unstable();
+    lines
+}
+
+/// The sample of `family` that carries the label of the worker at `url`
+/// alone.
+fn worker_sample(rendered: &str, family: &str, url: &str) -> Option<f64> {
+    let prefix = format!("{family}{{worker=\"{url}\"}} ");
+    rendered
+        .lines()
+        .find_map(|line| line.strip_prefix(prefix.as_str()))
+        .map(|value| value.parse().unwrap())
+}
+
+/// A breaker that opens on one failed request and stays open for an hour.
+fn opens_on_one_failure() -> CircuitBreakerConfig {
+    CircuitBreakerConfig {
+        failure_threshold: 1,
+        success_threshold: 1,
+        timeout_duration: std::time::Duration::from_secs(3600),
+        window_duration: std::time::Duration::from_secs(3600),
+    }
+}
+
+/// Building a worker writes no series. Its registration starts them: its
+/// health, its HTTP/2 flag, its breaker's state and two counts, and at zero
+/// the breaker's five transition counters and its health readmissions.
+#[test]
+fn a_workers_series_start_at_its_registration_and_not_at_its_build() {
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let url = "http://series-start:8080";
+    metrics::with_local_recorder(&recorder, || {
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Regular)
+                .health_config(no_health_check())
+                .http2(true)
+                .build(),
+        );
+        assert_eq!(
+            series_of(&handle.render(), url),
+            Vec::<String>::new(),
+            "a build writes no series"
+        );
+
+        let registry = WorkerRegistry::new();
+        registry.register(worker).expect("a fresh URL registers");
+        let rendered = handle.render();
+        assert_eq!(
+            worker_sample(&rendered, "smg_worker_health", url),
+            Some(1.0)
+        );
+        assert_eq!(worker_sample(&rendered, "smg_worker_http2", url), Some(1.0));
+        assert_eq!(
+            worker_sample(&rendered, "smg_worker_cb_state", url),
+            Some(0.0)
+        );
+        // The breaker's two counts are on the scrape from the registration,
+        // ahead of the worker's first outcome.
+        for count in [
+            "smg_worker_cb_consecutive_failures",
+            "smg_worker_cb_consecutive_successes",
+        ] {
+            assert_eq!(worker_sample(&rendered, count, url), Some(0.0), "{count}");
+        }
+        let zero_counters: Vec<String> = series_of(&rendered, url)
+            .into_iter()
+            .filter(|line| {
+                line.starts_with("smg_worker_cb_transitions_total{")
+                    || line.starts_with("smg_worker_cb_health_readmissions_total{")
+            })
+            .collect();
+        assert_eq!(zero_counters.len(), 6, "{rendered}");
+        assert!(
+            zero_counters.iter().all(|line| line.ends_with(" 0")),
+            "{rendered}"
+        );
+    });
+}
+
+/// A replacement is built for an address a live worker serves, and its host
+/// refuses it before it enters the registry. Its build wrote no series, so
+/// every series of the address reads as the live worker left it: healthy,
+/// on HTTP/2, its breaker open.
+#[test]
+fn a_replacement_that_never_enters_leaves_the_live_workers_series_as_they_stood() {
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let url = "http://refused-replacement:8080";
+    metrics::with_local_recorder(&recorder, || {
+        let registry = WorkerRegistry::new();
+        let live: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Regular)
+                .health_config(no_health_check())
+                .http2(true)
+                .circuit_breaker_config(opens_on_one_failure())
+                .build(),
+        );
+        registry
+            .register(Arc::clone(&live))
+            .expect("a fresh URL registers");
+        live.record_outcome(503);
+        let rendered = handle.render();
+        let stood = series_of(&rendered, url);
+        assert_eq!(
+            worker_sample(&rendered, "smg_worker_health", url),
+            Some(1.0)
+        );
+        assert_eq!(worker_sample(&rendered, "smg_worker_http2", url), Some(1.0));
+        assert_eq!(
+            worker_sample(&rendered, "smg_worker_cb_state", url),
+            Some(1.0)
+        );
+
+        // The replacement differs in each of them: its health checks are on,
+        // so it starts pending; it speaks HTTP/1.1; its breaker is closed.
+        let refused = BasicWorkerBuilder::new(url)
+            .worker_type(WorkerType::Regular)
+            .build();
+        assert!(!refused.is_healthy());
+        drop(refused);
+
+        assert_eq!(series_of(&handle.render(), url), stood);
+    });
+}
+
+/// A replacement's series are its own from the moment it enters: its HTTP/2
+/// flag, and the breaker it ends with. A replacement with the old worker's
+/// breaker settings adopts the live breaker, whose open state and failure
+/// count stand. One with other settings keeps its own breaker: the state
+/// reads closed and the failure count zero. The status is the address's:
+/// a replacement built pending serves as ready, and reads healthy. The
+/// counter of the trip keeps its count through both.
+#[test]
+fn a_replacement_publishes_its_own_series_where_it_enters() {
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let url = "http://replacement-series:8080";
+    let replacement = |http2: bool, breaker: CircuitBreakerConfig| -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Regular)
+                .http2(http2)
+                .circuit_breaker_config(breaker)
+                .build(),
+        )
+    };
+    metrics::with_local_recorder(&recorder, || {
+        let read = |family: &str| worker_sample(&handle.render(), family, url);
+        let registry = WorkerRegistry::new();
+        let live: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Regular)
+                .health_config(no_health_check())
+                .circuit_breaker_config(opens_on_one_failure())
+                .build(),
+        );
+        let id = registry
+            .register(Arc::clone(&live))
+            .expect("a fresh URL registers");
+        live.record_outcome(503);
+        assert_eq!(read("smg_worker_http2"), Some(0.0));
+        assert_eq!(read("smg_worker_cb_state"), Some(1.0));
+        assert_eq!(read("smg_worker_cb_consecutive_failures"), Some(1.0));
+
+        assert!(registry.replace(&id, replacement(true, opens_on_one_failure())));
+        assert_eq!(read("smg_worker_http2"), Some(1.0));
+        assert_eq!(read("smg_worker_cb_state"), Some(1.0));
+        assert_eq!(read("smg_worker_cb_consecutive_failures"), Some(1.0));
+        assert_eq!(read("smg_worker_health"), Some(1.0));
+
+        let other = CircuitBreakerConfig {
+            failure_threshold: 2,
+            ..opens_on_one_failure()
+        };
+        assert!(registry.replace(&id, replacement(false, other)));
+        assert_eq!(read("smg_worker_http2"), Some(0.0));
+        assert_eq!(read("smg_worker_cb_state"), Some(0.0));
+        assert_eq!(read("smg_worker_cb_consecutive_failures"), Some(0.0));
+        assert_eq!(read("smg_worker_health"), Some(1.0));
+
+        let trips = series_of(&handle.render(), url)
+            .into_iter()
+            .find(|line| {
+                line.starts_with("smg_worker_cb_transitions_total{")
+                    && line.contains("from=\"closed\",to=\"open\"")
+            })
+            .expect("the trip's counter");
+        assert!(trips.ends_with(" 1"), "{trips}");
+    });
+}
+
+/// A refresh of a worker's model list leaves the model index as the
+/// registration wrote it. So a removal takes the worker out of every entry
+/// that holds it, and not out of the models it lists that minute alone: the
+/// lookup by a model its refresh left out must not hand out a removed worker.
+#[test]
+fn a_removed_worker_leaves_every_model_the_index_holds_it_under() {
+    let registry = WorkerRegistry::new();
+    let endpoint: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new("http://endpoint:8080")
+            .models(vec![ModelCard::new("qwen"), ModelCard::new("llama")])
+            .build(),
+    );
+    let id = registry.register(Arc::clone(&endpoint)).unwrap();
+    assert!(registry.refresh_models(&endpoint, vec![ModelCard::new("llama")]));
+    assert_eq!(registry.get_by_model("qwen").len(), 1);
+    registry.set_model_retry_config("qwen", RetryConfig::default(), true);
+
+    assert!(registry.remove(&id).is_some());
+    assert!(registry.get_by_model("llama").is_empty());
+    assert!(registry.get_by_model("qwen").is_empty());
+    // The registry holds no worker now, so it lists no model, and the
+    // left-out model's retry settings went with its last worker.
+    assert!(registry.get_models().is_empty());
+    assert!(registry.get_retry_config("qwen").is_none());
+}
+
+/// The same for a worker registered without model cards: it is indexed
+/// under its primary model alone, and a list it discovers later leaves
+/// that model out.
+#[test]
+fn a_removed_worker_registered_without_cards_leaves_its_primary_model() {
+    let registry = WorkerRegistry::new();
+    let labelled: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new("http://labelled:8080")
+            .label("model_id", "llama")
+            .build(),
+    );
+    let id = registry.register(Arc::clone(&labelled)).unwrap();
+    assert!(registry.refresh_models(&labelled, vec![ModelCard::new("qwen")]));
+
+    assert!(registry.remove(&id).is_some());
+    assert!(registry.get_by_model("llama").is_empty());
+}
+
+/// A replacement takes the old handle out of every entry that holds it
+/// too: the worker that takes its place stands under the models it lists,
+/// and the old handle under none.
+#[test]
+fn a_replaced_worker_leaves_every_model_the_index_holds_it_under() {
+    let registry = WorkerRegistry::new();
+    let endpoint: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new("http://endpoint:8080")
+            .models(vec![ModelCard::new("qwen"), ModelCard::new("llama")])
+            .build(),
+    );
+    let id = registry.register(Arc::clone(&endpoint)).unwrap();
+    assert!(registry.refresh_models(&endpoint, vec![ModelCard::new("llama")]));
+    let next: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new("http://endpoint:8080")
+            .models(vec![ModelCard::new("llama")])
+            .build(),
+    );
+
+    assert!(registry.replace(&id, Arc::clone(&next)));
+    assert!(registry.get_by_model("qwen").is_empty());
+    let llama = registry.get_by_model("llama");
+    assert_eq!(llama.len(), 1);
+    assert!(Arc::ptr_eq(&llama[0], &next));
+}
+
+/// An alias goes with its model: the alias of a model the refresh left out
+/// resolves to nothing once the worker is removed.
+#[test]
+fn a_removed_workers_alias_goes_with_a_model_its_refresh_left_out() {
+    let registry = WorkerRegistry::new();
+    let endpoint: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new("http://endpoint:8080")
+            .models(vec![
+                ModelCard::new("qwen").with_alias("qwen-latest"),
+                ModelCard::new("llama"),
+            ])
+            .build(),
+    );
+    let id = registry.register(Arc::clone(&endpoint)).unwrap();
+    assert!(registry.refresh_models(&endpoint, vec![ModelCard::new("llama")]));
+
+    assert!(registry.remove(&id).is_some());
+    assert!(registry.resolve_model_alias("qwen-latest").is_none());
+    assert!(registry.get_by_model("qwen-latest").is_empty());
+}
+
+/// A replacement reads the aliases from the alias index too: the alias of
+/// a model the old worker's refresh left out goes with the old handle.
+#[test]
+fn a_replaced_workers_alias_goes_with_a_model_its_refresh_left_out() {
+    let registry = WorkerRegistry::new();
+    let endpoint: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new("http://endpoint:8080")
+            .models(vec![
+                ModelCard::new("qwen").with_alias("qwen-latest"),
+                ModelCard::new("llama"),
+            ])
+            .build(),
+    );
+    let id = registry.register(Arc::clone(&endpoint)).unwrap();
+    assert!(registry.refresh_models(&endpoint, vec![ModelCard::new("llama")]));
+    let next: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new("http://endpoint:8080")
+            .models(vec![ModelCard::new("llama")])
+            .build(),
+    );
+
+    assert!(registry.replace(&id, next));
+    assert!(registry.resolve_model_alias("qwen-latest").is_none());
+    assert!(registry.get_by_model("qwen-latest").is_empty());
+}
+
+/// An alias stays while a peer still serves its model, though a refresh
+/// wrote the peer's cards with no alias: the cards of the minute cannot
+/// tell an alias the peer registered from a stale one. The alias goes
+/// with the model's last worker.
+#[test]
+fn an_alias_stays_while_a_refreshed_peer_still_serves_its_model() {
+    let registry = WorkerRegistry::new();
+    let (first, second) = two_refreshed_workers_of_an_aliased_model(&registry);
+
+    assert!(registry.remove(&first).is_some());
+    assert_eq!(
+        registry.resolve_model_alias("qwen-latest").as_deref(),
+        Some("qwen")
+    );
+    assert!(registry.remove(&second).is_some());
+    assert!(registry.resolve_model_alias("qwen-latest").is_none());
+}
+
+/// The same through a replacement whose cards do not declare the alias:
+/// the refreshed peer registered it, and it stays.
+#[test]
+fn an_alias_stays_through_a_replacement_while_a_refreshed_peer_serves_its_model() {
+    let registry = WorkerRegistry::new();
+    let (first, _second) = two_refreshed_workers_of_an_aliased_model(&registry);
+    let next: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new("http://first:8080")
+            .model(ModelCard::new("qwen"))
+            .build(),
+    );
+
+    assert!(registry.replace(&first, next));
+    assert_eq!(
+        registry.resolve_model_alias("qwen-latest").as_deref(),
+        Some("qwen")
+    );
+}
+
+/// Two workers registered with one aliased model, each refreshed since:
+/// a refresh writes the cards an endpoint's model list names, with no
+/// alias. Returns their ids.
+fn two_refreshed_workers_of_an_aliased_model(registry: &WorkerRegistry) -> (WorkerId, WorkerId) {
+    let registered = |url: &str| {
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(url)
+                .model(ModelCard::new("qwen").with_alias("qwen-latest"))
+                .build(),
+        );
+        let id = registry.register(Arc::clone(&worker)).unwrap();
+        assert!(registry.refresh_models(&worker, vec![ModelCard::new("qwen")]));
+        id
+    };
+    (
+        registered("http://first:8080"),
+        registered("http://second:8080"),
+    )
+}
+
+/// A removal frees its URL ahead of its walk of the index, so a
+/// registration of the same URL can stand in a model's slice already.
+/// The eviction takes the handle it is given, and the newcomer keeps its
+/// place.
+#[test]
+fn an_eviction_from_the_index_takes_the_handle_and_not_its_address() {
+    let registry = WorkerRegistry::new();
+    let built = || -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new("http://endpoint:8080")
+                .model(ModelCard::new("llama"))
+                .build(),
+        )
+    };
+    let (leaving, newcomer) = (built(), built());
+    // What the slice holds once the newcomer registered at the freed URL:
+    // its handle, in the place of the one that leaves.
+    registry.add_worker_to_model_index("llama", Arc::clone(&newcomer));
+
+    registry.remove_worker_from_model_index("llama", &leaving);
+    let llama = registry.get_by_model("llama");
+    assert_eq!(llama.len(), 1);
+    assert!(Arc::ptr_eq(&llama[0], &newcomer));
+
+    registry.remove_worker_from_model_index("llama", &newcomer);
+    assert!(registry.get_by_model("llama").is_empty());
 }

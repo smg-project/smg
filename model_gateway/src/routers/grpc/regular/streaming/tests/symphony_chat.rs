@@ -41,7 +41,7 @@ use crate::{
                 assign, assign_for, telemetry,
                 template::Templates,
                 testing::{tools, Refusing},
-                Asks, Assignment, Reading,
+                Asks, Assignment, Forbids, Reading,
             },
         },
         utils::ModelNames,
@@ -57,7 +57,7 @@ pub(super) fn assigned(
     spec.symphony = Some(Assignment {
         format: Arc::new(format),
         prompt: prompt.to_string(),
-        forbids_calls: false,
+        forbids_calls: Forbids::Nothing,
         past_the_end: false,
         forcing: None,
         opener: None,
@@ -743,7 +743,7 @@ pub(super) fn assigned_message(
         symphony: Some(Assignment {
             format: Arc::new(format),
             prompt: prompt.to_string(),
-            forbids_calls: false,
+            forbids_calls: Forbids::Nothing,
             past_the_end: false,
             forcing: None,
             opener: None,

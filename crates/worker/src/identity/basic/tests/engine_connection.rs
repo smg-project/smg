@@ -4,8 +4,10 @@
 
 use std::sync::Arc;
 
+use tokio::sync::OnceCell;
+
 use crate::{
-    connection::engine::{EngineConnector, NO_ENGINE_CONNECTOR},
+    connection::engine::{EngineConnectionCache, EngineConnector, NO_ENGINE_CONNECTOR},
     identity::{basic::Worker, builder::BasicWorkerBuilder, error::WorkerError},
     test_support::{no_health_check, CountingConnector, NoEngine},
     worker::ConnectionMode,
@@ -152,4 +154,43 @@ async fn a_rebuild_keeps_the_engine_connector() {
     let rebuilt = <BasicWorkerBuilder>::carrying(&worker).build();
     assert!(rebuilt.engine_connection().await.unwrap().is_some());
     assert_eq!(connector.connects(), 1);
+}
+
+/// The rank workers of one ZMQ engine group run one handshake between them:
+/// each probe finds the connection the first one made, and a dead connection
+/// one rank's probe retires is retired for every rank.
+#[tokio::test]
+async fn the_rank_workers_of_a_zmq_group_connect_once_between_them() {
+    let connector = Arc::new(CountingConnector::default());
+    let slot = Arc::new(EngineConnectionCache::new(OnceCell::new()));
+    let ranks: Vec<_> = (0..3)
+        .map(|rank| {
+            <BasicWorkerBuilder>::new("ipc:///tmp/smg-zmq/group.ipc")
+                .connection_mode(ConnectionMode::Zmq)
+                .dp_config(rank, 3)
+                .engine_connector(Arc::clone(&connector) as Arc<dyn EngineConnector>)
+                .shared_engine_connection(Arc::clone(&slot))
+                .build()
+        })
+        .collect();
+
+    for rank in &ranks {
+        assert!(!rank.zmq_health_check(), "the handshake has not landed");
+    }
+    while ranks[0].engine_connection_if_initialized().is_none() {
+        tokio::task::yield_now().await;
+    }
+
+    assert_eq!(connector.connects(), 1);
+    let first = ranks[0].engine_connection_if_initialized().unwrap();
+    for rank in &ranks {
+        assert!(rank.zmq_health_check());
+        let connection = rank.engine_connection_if_initialized().unwrap();
+        assert!(Arc::ptr_eq(&connection, &first));
+    }
+
+    ranks[1].engine_connection.evict(&slot.load_full());
+    for rank in &ranks {
+        assert!(rank.engine_connection_if_initialized().is_none());
+    }
 }

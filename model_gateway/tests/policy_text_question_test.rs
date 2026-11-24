@@ -36,12 +36,13 @@ use smg::{
         ManualPolicy, PassthroughPolicy, PolicyRegistry, PowerOfTwoPolicy, PrefixHashConfig,
         PrefixHashPolicy, RandomPolicy, SelectWorkerInfo,
     },
-    worker::{
-        load::state::{one_rank_load, TestFeed},
-        BasicWorkerBuilder, Worker, WorkerType,
-    },
+    routers::grpc::backend_client::BasicWorkerBuilder,
 };
 use smg_external_router::metrics::handles::force_on_this_thread;
+use smg_worker::{
+    identity::basic::{Worker, WorkerType},
+    load::state::{one_rank_load, TestFeed},
+};
 
 struct Counting;
 

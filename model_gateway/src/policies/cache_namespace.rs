@@ -39,6 +39,8 @@
 //! Size it for tenants × working set; a per-request salt makes every request
 //! a unique path.
 
+use std::borrow::Cow;
+
 use kv_index::salt::namespace_seed;
 use openai_protocol::common::CachePartition;
 use xxhash_rust::xxh3::Xxh3;
@@ -113,6 +115,15 @@ impl CacheNamespace {
         self.event_seed
     }
 
+    /// The partition's whole identity as an XXH3 seed, the extra key
+    /// included. A host names a request's prefix under it, so two requests
+    /// share a named prefix only where their partitions are one, as they
+    /// share an engine's cache. A text request's windows are hashed under
+    /// it too: no engine hashes text, so that seed need match none.
+    pub fn partition_seed(self) -> u64 {
+        self.marker
+    }
+
     /// The namespace as token ids for the token tree and hash mode: two ids
     /// with the reserved high bit set, so they never match prompt tokens.
     pub fn token_marker(self) -> [u32; TOKEN_MARKER_LEN] {
@@ -165,6 +176,30 @@ impl CacheNamespace {
         &tokens[start..]
     }
 
+    /// The token tree's key for `tokens` under `namespace`, in a tree whose
+    /// pages hold `page_size` tokens, and the length of the marker at its
+    /// head. A partitioned request keys under its namespace marker: another
+    /// namespace diverges at position 0 and can never match, and the marker
+    /// never counts toward the match ratio, so a match count read from the
+    /// tree has the marker length subtracted. The marker fills whole pages,
+    /// so the prompt's page grid is the unpartitioned one. An unpartitioned
+    /// request keys under its tokens stripped of marker material, marker
+    /// length 0.
+    #[inline]
+    pub fn keyed_tokens(
+        namespace: Option<Self>,
+        tokens: &[u32],
+        page_size: usize,
+    ) -> (Cow<'_, [u32]>, usize) {
+        match namespace {
+            Some(namespace) => (
+                Cow::Owned(namespace.prefixed_tokens(tokens, page_size)),
+                Self::token_marker_len(page_size),
+            ),
+            None => (Cow::Borrowed(Self::unpartitioned_tokens(tokens)), 0),
+        }
+    }
+
     /// The routing key of an unpartitioned request: leading marker delimiters
     /// are dropped so the key can never enter a namespace's subtree. A no-op
     /// for prompt text.
@@ -209,6 +244,25 @@ mod tests {
         assert_ne!(a, extra);
         assert_ne!(a, lora);
         assert_ne!(extra, lora);
+    }
+
+    #[test]
+    fn partition_seed_follows_every_field() {
+        let seed = |salt, extra, lora| {
+            CacheNamespace::derive(&partition(salt, extra, lora))
+                .expect("a partition")
+                .partition_seed()
+        };
+        // The extra key moves it, where the event seed stays the plain one.
+        let extra_only = seed(None, Some("k"), None);
+        assert_ne!(extra_only, kv_index::XXH3_SEED);
+        assert_ne!(extra_only, seed(None, Some("other"), None));
+        // One value in another field is another partition.
+        assert_ne!(
+            seed(Some("tenant"), None, None),
+            seed(None, None, Some("tenant"))
+        );
+        assert_eq!(extra_only, seed(None, Some("k"), None));
     }
 
     #[test]
@@ -273,6 +327,27 @@ mod tests {
             .iter()
             .all(|&id| id & MARKER_TOKEN_BIT != 0));
         assert_eq!(&keyed[16..], &[7, 8, 9]);
+    }
+
+    /// A token tree's key is the ids behind the partition's marker, which
+    /// fills whole pages of the tree, with the marker's length beside it. A
+    /// request in no partition keys under its ids alone, any id of marker
+    /// material at their head dropped, with no marker.
+    #[test]
+    fn a_token_trees_key_is_the_marker_ahead_of_the_ids_or_the_ids_alone() {
+        let ns = CacheNamespace::derive(&partition(Some("salt"), None, None)).unwrap();
+        let tokens = [7, 8, 9];
+        let (keyed, marker) = CacheNamespace::keyed_tokens(Some(ns), &tokens, 16);
+        assert_eq!(marker, CacheNamespace::token_marker_len(16));
+        assert_eq!(keyed, ns.prefixed_tokens(&tokens, 16));
+        assert_eq!(&keyed[marker..], &tokens);
+
+        let (keyed, marker) = CacheNamespace::keyed_tokens(None, &tokens, 16);
+        assert_eq!((keyed.as_ref(), marker), (&tokens[..], 0));
+        assert!(matches!(keyed, Cow::Borrowed(_)), "the request's own ids");
+        let forged = [MARKER_TOKEN_BIT | 1, 7, 8, 9];
+        let (keyed, marker) = CacheNamespace::keyed_tokens(None, &forged, 16);
+        assert_eq!((keyed.as_ref(), marker), (&tokens[..], 0));
     }
 
     #[test]

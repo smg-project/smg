@@ -6,7 +6,9 @@ use std::{
 };
 
 use llm_tokenizer::TokenizerRegistry;
+use openai_protocol::model_card::ModelCard;
 use parking_lot::{Mutex, MutexGuard};
+use smg_worker::{identity::basic::Worker, registry::WorkerOrigin};
 use tokio::sync::{Semaphore, SemaphorePermit};
 use tokio_util::sync::CancellationToken;
 use wfaas::{StepId, WorkflowError, WorkflowResult};
@@ -14,8 +16,7 @@ use wfaas::{StepId, WorkflowError, WorkflowResult};
 use super::{tokenizer_registration::register_tokenizer, TokenizerConfigRequest};
 use crate::{
     app_context::AppContext,
-    worker::{ModelCard, Worker},
-    workflow::steps::local::ReleaseTokenizerStep,
+    workflow::steps::local::{submit_tokenizer_job::tokenizer_source, ReleaseTokenizerStep},
 };
 
 /// Tokenizers held by registrations that have not published their workers yet.
@@ -126,7 +127,9 @@ impl TokenizerPreparation {
             }
             commit()
         };
-        self.close();
+        if result.is_ok() {
+            self.close();
+        }
         result
     }
 
@@ -167,6 +170,7 @@ pub(crate) async fn prepare_worker_tokenizers(
     app_context: &Arc<AppContext>,
     workers: &[Arc<dyn Worker>],
     preparation: &TokenizerPreparation,
+    origin: WorkerOrigin,
 ) -> WorkflowResult<()> {
     let mut prepared = HashSet::new();
     for worker in workers {
@@ -209,10 +213,19 @@ pub(crate) async fn prepare_worker_tokenizers(
                 id: TokenizerRegistry::generate_id(),
                 name: card.id.clone(),
                 source: source.to_owned(),
-                chat_template_path: card
-                    .chat_template
-                    .clone()
-                    .or_else(|| router.chat_template.clone()),
+                chat_template_path: match origin {
+                    WorkerOrigin::Local => card
+                        .chat_template
+                        .clone()
+                        .or_else(|| router.chat_template.clone()),
+                    WorkerOrigin::Mesh => {
+                        super::worker_events::imported_chat_template(
+                            card.chat_template.as_deref(),
+                            router.chat_template.as_deref(),
+                        )
+                        .await
+                    }
+                },
                 cache_config: router.tokenizer_cache.to_option(),
                 fail_on_duplicate: false,
                 for_worker: true,
@@ -227,37 +240,15 @@ pub(crate) async fn prepare_worker_tokenizers(
     Ok(())
 }
 
-/// The source a model's tokenizer is loaded from, in order (an empty value is
-/// no source): the worker's `tokenizer_path` label, its `model_path` label,
-/// the router's `--tokenizer-path`, its `--model-path`, and last the worker's
-/// `model_id` label. A dialect whose model info names the model by its id
-/// only (a path or hub id on the worker's side) still gets a job that way:
-/// for a gRPC worker a local load that fails on the id falls back to the
-/// worker's own bundle (`fetch_tokenizer_from_worker`); a ZMQ worker's id has
-/// to be a path or hub id the gateway itself can load. Coming last, the id
-/// never displaces an operator's flag.
-pub(crate) fn tokenizer_source<'a>(
-    labels: &'a HashMap<String, String>,
-    router_tokenizer_path: Option<&'a str>,
-    router_model_path: Option<&'a str>,
-) -> Option<&'a str> {
-    let usable = |path: &&str| !path.is_empty();
-    let label = |key: &str| labels.get(key).map(String::as_str).filter(usable);
-    label("tokenizer_path")
-        .or_else(|| label("model_path"))
-        .or_else(|| router_tokenizer_path.filter(usable))
-        .or_else(|| router_model_path.filter(usable))
-        .or_else(|| label("model_id"))
-}
-
 #[cfg(test)]
 mod tests {
+    use smg_worker::identity::basic::ConnectionMode;
+
     use super::*;
     use crate::{
         app_context::testing::app_context_for_tests,
         config::RouterConfig,
-        worker::{BasicWorkerBuilder, ConnectionMode, WorkerRegistry},
-        workflow::steps::local::test_support::labels_of,
+        routers::{common::snapshot::WorkerRegistry, grpc::backend_client::BasicWorkerBuilder},
     };
 
     #[tokio::test]
@@ -306,7 +297,7 @@ mod tests {
                 .await
                 .unwrap();
             let preparation = TokenizerPreparation::new(&app);
-            prepare_worker_tokenizers(&app, &[worker], &preparation)
+            prepare_worker_tokenizers(&app, &[worker], &preparation, WorkerOrigin::Local)
                 .await
                 .unwrap();
             assert_eq!(
@@ -319,65 +310,5 @@ mod tests {
                     .unwrap_or_else(|| router_tokenizer.to_str().unwrap())
             );
         }
-    }
-
-    /// A worker that names its model by id only, with neither a path label
-    /// nor a router flag: the id is the source (a local load that fails on
-    /// it falls back to the worker's bundle); an empty id is no source.
-    #[test]
-    fn tokenizer_source_is_the_model_id_when_nothing_else_names_a_path() {
-        let id_only = labels_of(&[("model_id", "/engines/served")]);
-        assert_eq!(
-            tokenizer_source(&id_only, None, None),
-            Some("/engines/served")
-        );
-        assert_eq!(
-            tokenizer_source(&id_only, Some(""), Some("")),
-            Some("/engines/served")
-        );
-        assert_eq!(
-            tokenizer_source(&labels_of(&[("model_id", "")]), None, None),
-            None
-        );
-        assert_eq!(tokenizer_source(&labels_of(&[]), None, None), None);
-    }
-
-    /// The operator's flags and the worker's path labels keep their
-    /// precedence over the id: `--tokenizer-path`, then `--model-path`, win
-    /// over an id-only worker, and a `tokenizer_path` or `model_path` label
-    /// wins over the flags as before.
-    #[test]
-    fn tokenizer_source_reads_the_model_id_only_after_the_flags_and_path_labels() {
-        let id_only = labels_of(&[("model_id", "/engines/served")]);
-        assert_eq!(
-            tokenizer_source(&id_only, Some("/opt/tok"), None),
-            Some("/opt/tok")
-        );
-        assert_eq!(
-            tokenizer_source(&id_only, None, Some("/opt/model")),
-            Some("/opt/model")
-        );
-        assert_eq!(
-            tokenizer_source(&id_only, Some("/opt/tok"), Some("/opt/model")),
-            Some("/opt/tok")
-        );
-
-        let with_paths = labels_of(&[
-            ("model_id", "/engines/served"),
-            ("model_path", "/engines/weights"),
-            ("tokenizer_path", "/engines/tok"),
-        ]);
-        assert_eq!(
-            tokenizer_source(&with_paths, Some("/opt/tok"), None),
-            Some("/engines/tok")
-        );
-        let with_model_path = labels_of(&[
-            ("model_id", "/engines/served"),
-            ("model_path", "/engines/weights"),
-        ]);
-        assert_eq!(
-            tokenizer_source(&with_model_path, Some("/opt/tok"), None),
-            Some("/engines/weights")
-        );
     }
 }

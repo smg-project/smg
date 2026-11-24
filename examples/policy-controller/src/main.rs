@@ -8,7 +8,10 @@
 use std::process::ExitCode;
 
 use smg_policy_controller::{
-    controller, Candidate, Catalog, CatalogError, Lifecycle, Needs, RequestFacts, Scorer, TieBand,
+    document::Needs,
+    engine::{Candidate, RequestFacts, Scorer, TieBand},
+    service::controller,
+    stages::{Lifecycle, StageRegistry, StageRegistryError},
 };
 
 /// The process's allocator, the one the stock controller's binary registers,
@@ -66,10 +69,16 @@ impl Scorer for Pack {
     /// hands none to a scorer that does not declare them, and every worker
     /// then reads as idle.
     fn needs(&self) -> Needs {
-        Needs {
-            loads: true,
-            ..Needs::default()
-        }
+        Needs::NONE.with_loads()
+    }
+
+    /// This scorer only places, and by the engines' own reports: it turns
+    /// no request away. Saying so leaves a price: a stage that says
+    /// nothing is taken as one that may refuse a request by what the
+    /// gateways report of leases, and each decision under it applies those
+    /// reports first.
+    fn refuses_by_reports(&self) -> bool {
+        false
     }
 
     fn score(
@@ -101,34 +110,41 @@ impl Scorer for Pack {
 
 /// The stock build's stages and this file's scorer, under the name a policy
 /// document writes.
-fn stages() -> Result<Catalog, CatalogError> {
-    let mut stages = Catalog::builtin();
+fn stages() -> Result<StageRegistry, StageRegistryError> {
+    let mut stages = StageRegistry::builtin();
     stages.scorer("pack", || Box::new(Pack))?;
     Ok(stages)
 }
 
 /// The crate's command line and run loop over this build's stages.
-fn main() -> Result<ExitCode, CatalogError> {
+fn main() -> Result<ExitCode, StageRegistryError> {
     Ok(controller::run(stages()?))
 }
 
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::HashMap,
+        future::Future,
         net::{Ipv4Addr, SocketAddr},
         sync::Arc,
-        time::{Duration, Instant},
+        time::Duration,
     };
 
     use smg_policy_controller::{
-        controller::{Config, Controller, Election, Error, Listener, Scope, SpecRejected},
-        spec::OVERLOAD_WAITING_REQUESTS,
-        store::{
-            Ask, GatewayId, HealthSink, LoadSink, LoadSource, MemoryStore, Overload, ViewBuffers,
-            WorkerFacts, WorkerStatus, WorkersStore, PUBLISH_WINDOW,
+        document::{operator::SpecRejected, AppliedSpec, PolicySpec, SpecError},
+        engine::{
+            Candidate, LentList, ListCell, LoadRow, PlaceRequest, PolicyEngine, RequestFacts,
+            Scorer, TieBand, Unplaced, WorkerLists, WorkerRule,
         },
-        Constraints, Engine, LoadRow, PolicySpec, RequestFacts, Role, Scorer, Scratch, SpecError,
-        WorkerId,
+        service::controller::{Config, Controller, ElectionConfig, Error, Listener, Scope},
+        stages::StageRegistry,
+    };
+    use smg_worker::{
+        identity::basic::Worker,
+        load::state::{one_rank_load, TestFeed},
+        test_support::ready_worker,
+        worker::{WorkerLoadResponse, WorkerStatus},
     };
 
     use super::{stages, Pack};
@@ -141,285 +157,292 @@ mod tests {
 
     const MODEL: &str = "a-model";
 
-    /// The queue at which a worker of a fleet of its own names itself
-    /// overloaded, at its registration.
-    const QUEUE: u32 = 4;
-
     fn read(document: &str) -> PolicySpec {
         serde_yaml::from_str(document).expect("a well-formed document")
     }
 
-    /// The engine `document` validates into over this build's stages.
-    fn engine(document: &str) -> Engine {
-        let stages = stages().expect("the scorer's name is free");
-        read(document)
-            .validate_in(&stages, &[])
+    /// The generation `document` validates into over `stages`.
+    fn applied_in(document: &str, stages: &StageRegistry) -> AppliedSpec {
+        AppliedSpec::validate_in(&read(document), stages, &[])
             .expect("the document names stages this build holds")
     }
 
-    /// A store as the controller keeps one, fed through the doors its
-    /// ingestion uses: two workers of one model, registered, proven ready
-    /// and each with a load report on file. One runs three requests, one is
-    /// idle. No row a decision reads is written by hand.
+    /// The generation `document` validates into over this build's stages.
+    fn applied(document: &str) -> AppliedSpec {
+        applied_in(document, &stages().expect("the scorer's name is free"))
+    }
+
+    /// A worker list as a controller holds one: two workers of one model,
+    /// the worker crate's own worker objects, each ready, in the list a
+    /// registry publishes with the cell its holder keeps beside it. A load
+    /// feed stands where the load monitor does, and the engine is handed
+    /// its channel once, at the start. One worker runs three requests, one
+    /// is idle. No row a decision reads is written by hand: the engine
+    /// writes each from a worker's object and its engine's report.
     struct Fleet {
-        store: Arc<MemoryStore>,
-        busy: WorkerId,
-        idle: WorkerId,
-        /// The overload thresholds each worker names at its registration.
-        own: Overload,
-        /// The instant the store's last publication window opened.
-        window: Instant,
+        /// The engine, built for the life of the process: a placement holds
+        /// it for as long as its request runs. The fixture makes each
+        /// hand-over of a program itself: the load channel once at the
+        /// start, and a worker's address as it joins.
+        engine: &'static PolicyEngine,
+        workers: Arc<[Arc<dyn Worker>]>,
+        cell: ListCell,
+        loads: TestFeed,
+        /// Each worker's newest load report, by its address.
+        reports: HashMap<String, WorkerLoadResponse>,
+        busy: Arc<dyn Worker>,
+        idle: Arc<dyn Worker>,
     }
 
     impl Fleet {
-        /// A store of its own, whose workers each name a queue of [`QUEUE`]
-        /// requests as their threshold.
+        /// The two workers under the document the example ships.
         fn new() -> Self {
-            let own = Overload {
-                waiting_requests: Some(QUEUE),
-                ..Overload::default()
-            };
-            Self::over(Arc::new(MemoryStore::new()), own)
+            Self::under(applied(POLICY))
         }
 
-        /// The two workers on `store`, each naming `own` at its
-        /// registration.
-        fn over(store: Arc<MemoryStore>, own: Overload) -> Self {
-            let window = Instant::now();
-            let busy = Self::join(&store, window, "busy", Some(3), own);
-            let idle = Self::join(&store, window, "idle", Some(0), own);
+        /// The two workers under `spec`.
+        fn under(spec: AppliedSpec) -> Self {
+            let engine: &'static PolicyEngine = Box::leak(Box::new(PolicyEngine::new(spec)));
+            let loads = TestFeed::attached_to(|channel| {
+                if let Some(channel) = channel {
+                    engine.set_loads(channel);
+                }
+            });
+            let busy = ready_worker("http://busy:8000", MODEL);
+            let idle = ready_worker("http://idle:8000", MODEL);
             let mut fleet = Self {
-                store,
-                busy,
-                idle,
-                own,
-                window,
+                engine,
+                workers: Vec::new().into(),
+                cell: ListCell::default(),
+                loads,
+                reports: HashMap::new(),
+                busy: Arc::clone(&busy),
+                idle: Arc::clone(&idle),
             };
-            fleet.publish();
+            fleet.join(busy, Some(3));
+            fleet.join(idle, Some(0));
             fleet
         }
 
-        /// Registers a worker and proves it ready. `running` is the load
-        /// report its engine sent, and `None` an engine that has sent none.
-        fn join(
-            store: &MemoryStore,
-            window: Instant,
-            name: &str,
-            running: Option<u32>,
-            own: Overload,
-        ) -> WorkerId {
-            let key = format!("http://{name}:8000");
-            let id = store
-                .upsert(WorkerFacts {
-                    key: key.clone(),
-                    engine: key,
-                    incarnation: 1,
-                    models: vec![MODEL.to_owned()],
-                    dp_size: 1,
-                    overload: own,
-                    ..WorkerFacts::default()
-                })
-                .id();
-            let revision = WorkersStore::get(store, id).expect("the row").revision;
-            store
-                .set_status(id, WorkerStatus::Ready, revision)
-                .expect("the prober's first pass");
+        /// A worker joins: the list is published again with an empty cell
+        /// beside it, as a registry publishes a membership generation, and
+        /// the engine is told. `running` is the load report the worker's
+        /// engine sent, and `None` an engine that has sent none.
+        fn join(&mut self, worker: Arc<dyn Worker>, running: Option<i32>) {
+            let listed = self.workers.iter().cloned();
+            self.workers = listed.chain([Arc::clone(&worker)]).collect();
+            self.cell = ListCell::default();
+            self.engine.joined(worker.url());
             if let Some(running) = running {
-                let report = LoadRow {
-                    running,
-                    ..LoadRow::default()
-                };
-                store.record(id, 0, report, window, LoadSource::Stream);
+                self.report(&worker, running);
             }
-            id
         }
 
-        /// Adds a ready worker whose engine has sent no load report yet.
-        fn join_unreported(&mut self, name: &str) -> WorkerId {
-            let id = Self::join(&self.store, self.window, name, None, self.own);
-            self.publish();
-            id
+        /// Publishes a load report as a worker's engine sends one: its
+        /// requests running.
+        fn report(&mut self, worker: &Arc<dyn Worker>, running: i32) {
+            let mut report = one_rank_load(0, 0.0, 0.0);
+            for rank in &mut report.loads {
+                rank.num_running_reqs = running;
+            }
+            self.reports.insert(worker.url().to_owned(), report);
+            self.loads.publish(&self.reports);
         }
 
-        /// Closes the store's publication window: a decision reads what was
-        /// written before it.
-        fn publish(&mut self) {
-            self.window += PUBLISH_WINDOW;
-            self.store.publish(self.window);
+        /// The address of the worker one request is placed on: the engine's
+        /// one call for a request, over the list as it stands.
+        fn pick(&self) -> Option<String> {
+            self.pick_where(None)
         }
 
-        /// Moves a worker's status as the prober does.
-        fn set(&mut self, id: WorkerId, status: WorkerStatus) {
-            let revision = WorkersStore::get(&*self.store, id)
-                .expect("the row")
-                .revision;
-            self.store
-                .set_status(id, status, revision)
-                .expect("the status moves");
-            self.publish();
+        /// Whether eight requests in a row are placed on `worker`. Among
+        /// equal scores the picker's draw moves from request to request,
+        /// so a fleet that ties does not answer one worker eight times.
+        fn fills(&self, worker: &Arc<dyn Worker>) -> bool {
+            (0..8).all(|_| self.pick().as_deref() == Some(worker.url()))
         }
 
-        /// Records a load report as an engine's stream delivers one: its
-        /// requests running and queued.
-        fn report(&mut self, id: WorkerId, running: u32, queued: u32) {
-            let report = LoadRow {
+        /// [`Self::pick`] for a request whose route states a rule of its
+        /// own for a worker it may be sent to.
+        fn pick_where(&self, admits: Option<WorkerRule<'_>>) -> Option<String> {
+            self.place(admits).ok()
+        }
+
+        /// The engine's one call for a request over the list as it stands:
+        /// the address of the worker it is placed on, or why it has none.
+        fn place(&self, admits: Option<WorkerRule<'_>>) -> Result<String, Unplaced> {
+            let lent = LentList {
+                workers: &self.workers,
+                cell: &self.cell,
+                facts: None,
+            };
+            let request = PlaceRequest {
+                admits,
+                ..PlaceRequest::of(MODEL, WorkerLists::Single(lent))
+            };
+            let placement = self.engine.place(&request)?;
+            Ok(placement.worker.url().to_owned())
+        }
+    }
+
+    /// `case` beside the engine's own task, as a program runs it: the task
+    /// keeps the newest load snapshot at hand. It runs for as long as its
+    /// engine stands, so the case's end ends both.
+    ///
+    /// The task is polled ahead of the case at every turn. Its first tick
+    /// is due before the case's first wait ends, and a report wakes it at
+    /// once, so a report the feed published is at hand before the case
+    /// reads on, on a paused clock and on a real one.
+    async fn beside_its_task(engine: &'static PolicyEngine, case: impl Future<Output = ()>) {
+        tokio::select! {
+            biased;
+            () = engine.run() => {}
+            () = case => {}
+        }
+    }
+
+    /// Long enough for the engine's task to take a report the feed just
+    /// published.
+    async fn seen() {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_workers_load_reports_and_health_shape_the_decision() {
+        let fleet = Fleet::new();
+        let case = async {
+            seen().await;
+            // The engines' own reports say which worker is busy.
+            assert!(fleet.fills(&fleet.busy));
+            // A worker taken out of rotation is not picked, however busy.
+            fleet.busy.set_status(WorkerStatus::NotReady);
+            assert_eq!(fleet.pick().as_deref(), Some(fleet.idle.url()));
+            // With no worker in rotation the request is shed, and by the
+            // document's own filter: the profile lists `healthy`, so its
+            // decision holds no worker that is out of rotation. A profile
+            // that listed no such filter would name one, and the call would
+            // answer that it has no worker to send to.
+            fleet.idle.set_status(WorkerStatus::NotReady);
+            match fleet.place(None) {
+                Err(Unplaced::Shed { emptied_by, .. }) => assert_eq!(emptied_by, "healthy"),
+                other => panic!("the request was answered {other:?}"),
+            }
+        };
+        beside_its_task(fleet.engine, case).await;
+    }
+
+    /// The scorer alone, over rows made by hand. A worker scores its share
+    /// of the busiest worker's running requests. Where nothing runs no
+    /// worker is the busiest, and each takes the whole score: an idle fleet
+    /// ties.
+    #[test]
+    fn the_scorer_scores_a_workers_share_of_the_busiest_and_ties_an_idle_fleet() {
+        let row = |running: Option<u32>| Candidate {
+            load: running.map(|running| LoadRow {
                 running,
-                queued,
                 ..LoadRow::default()
-            };
-            self.store
-                .record(id, 0, report, self.window, LoadSource::Stream);
-            self.publish();
-        }
+            }),
+            ..Candidate::default()
+        };
+        let scores = |rows: &[Candidate]| {
+            let kept: Vec<u32> = (0..).take(rows.len()).collect();
+            let mut out = vec![0.0_f32; rows.len()];
+            let band = Pack.score(&RequestFacts::default(), rows, &kept, &mut out);
+            assert_eq!(band, TieBand::NORMALIZED);
+            out
+        };
+        // A worker with no report counts as idle beside the busy ones.
+        let busy = [row(Some(4)), row(Some(1)), row(None)];
+        assert_eq!(scores(&busy), [1.0, 0.25, 0.0]);
+        let idle = [row(Some(0)), row(None), row(Some(0))];
+        assert_eq!(scores(&idle), [1.0, 1.0, 1.0]);
+    }
 
-        /// Sets or clears a gateway's standing veto on a worker, as the
-        /// gateway's breaker does.
-        fn veto(&mut self, gateway: GatewayId, id: WorkerId, standing: bool) {
-            let until = standing.then(|| self.window + Duration::from_secs(3600));
-            self.store.gateway_veto(gateway, id, until);
-            self.publish();
-        }
+    #[tokio::test(start_paused = true)]
+    async fn a_worker_that_joins_late_is_in_force_at_once() {
+        let mut fleet = Fleet::new();
+        let engine = fleet.engine;
+        let case = async {
+            seen().await;
+            assert!(fleet.fills(&fleet.busy));
+            // A worker joins behind the first decision, running more
+            // requests than any other: the next request fills it.
+            let late = ready_worker("http://late:8000", MODEL);
+            fleet.join(Arc::clone(&late), Some(5));
+            seen().await;
+            assert!(fleet.fills(&late));
+        };
+        beside_its_task(engine, case).await;
+    }
 
-        /// What one decision asks of the store, a second into its window.
-        fn ask(&self) -> Ask {
-            Ask {
-                gateway: GatewayId::LOCAL,
-                now: self.window + Duration::from_secs(1),
-                pinned: None,
-                affinity: false,
+    #[tokio::test(start_paused = true)]
+    async fn a_worker_with_no_report_counts_as_idle_and_an_idle_fleet_ties() {
+        let mut fleet = Fleet::new();
+        let engine = fleet.engine;
+        let case = async {
+            // A third worker is ready and its engine has sent no report
+            // yet. It counts as idle: beside the busy worker it is never
+            // the pick.
+            let unreported = ready_worker("http://unreported:8000", MODEL);
+            fleet.join(Arc::clone(&unreported), None);
+            seen().await;
+            assert!(fleet.fills(&fleet.busy));
+            // The busy worker drains and nothing runs. An idle fleet ties:
+            // every worker takes the same whole score, and the picker
+            // draws among equals, so each of them takes picks.
+            let busy = Arc::clone(&fleet.busy);
+            fleet.report(&busy, 0);
+            seen().await;
+            let picks: Vec<_> = (0..64).map(|_| fleet.pick()).collect();
+            for worker in [&fleet.busy, &fleet.idle, &unreported] {
+                let address = Some(worker.url().to_owned());
+                assert!(picks.contains(&address), "{} took no pick", worker.url());
             }
-        }
-
-        /// The scores `pack` writes over the pool's rows, each of them kept.
-        fn scores(&self) -> Vec<f32> {
-            let ask = self.ask();
-            let mut view = ViewBuffers::default();
-            let built = self
-                .store
-                .build_view(MODEL, Role::Single, &ask, &mut view)
-                .expect("the pool has members");
-            let facts = RequestFacts {
-                model: MODEL,
-                now_micros: built.now_micros,
-                ..RequestFacts::default()
-            };
-            let kept: Vec<u32> = (0..view.candidates.len() as u32).collect();
-            let mut scores = vec![0.0; kept.len()];
-            let _ = Pack.score(&facts, &view.candidates, &kept, &mut scores);
-            scores
-        }
-
-        /// The first target of one decision over the store's rows.
-        fn pick(&self, engine: &Engine) -> Option<WorkerId> {
-            self.pick_at(engine, 0)
-        }
-
-        /// The first target of one decision by the engine the store stands
-        /// under: the generation a controller applied to it.
-        fn pick_standing(&self) -> Option<WorkerId> {
-            let world = self.store.world();
-            self.pick(world.spec().engine())
-        }
-
-        /// The same under a seed of the caller's: the picker draws among
-        /// equal scores from it.
-        fn pick_at(&self, engine: &Engine, seed: u64) -> Option<WorkerId> {
-            let ask = self.ask();
-            let mut view = ViewBuffers::default();
-            let built = self
-                .store
-                .build_view(MODEL, Role::Single, &ask, &mut view)
-                .expect("the pool has members");
-            let facts = RequestFacts {
-                model: MODEL,
-                seed,
-                now_micros: built.now_micros,
-                ..RequestFacts::default()
-            };
-            let decision = engine.decide(
-                &facts,
-                &built.pool_facts(),
-                &view.candidates,
-                &Constraints::default(),
-                &mut Scratch::new(),
-            );
-            decision
-                .pick()
-                .and_then(|pick| pick.targets.first())
-                .map(|target| target.id)
-        }
+        };
+        beside_its_task(engine, case).await;
     }
 
-    #[test]
-    fn the_stores_load_reports_and_health_shape_the_decision() {
-        let mut fleet = Fleet::new();
-        let engine = engine(POLICY);
-        // The engines' own reports say which worker is busy.
-        assert_eq!(fleet.pick(&engine), Some(fleet.busy));
-        // The profile's filters read the store's health: a worker the
-        // prober takes out of rotation is not picked, however busy.
-        fleet.set(fleet.busy, WorkerStatus::NotReady);
-        assert_eq!(fleet.pick(&engine), Some(fleet.idle));
+    #[tokio::test(start_paused = true)]
+    async fn a_routes_own_rule_takes_a_worker_out_for_its_requests_alone() {
+        let fleet = Fleet::new();
+        let case = async {
+            seen().await;
+            // A request whose route states no rule fills the busy worker.
+            assert!(fleet.fills(&fleet.busy));
+            // A route's own rule refuses the busy worker: its request
+            // opens the next worker.
+            let refused = fleet.busy.url().to_owned();
+            let rule = |worker: &dyn Worker| worker.url() != refused;
+            let ruled = fleet.pick_where(Some(&rule));
+            assert_eq!(ruled.as_deref(), Some(fleet.idle.url()));
+            // The rule is that request's own: the next request, which
+            // states none, fills the busy worker again.
+            assert!(fleet.fills(&fleet.busy));
+        };
+        beside_its_task(fleet.engine, case).await;
     }
 
-    #[test]
-    fn a_worker_with_no_report_counts_as_idle_and_an_idle_fleet_ties() {
-        let mut fleet = Fleet::new();
-        let engine = engine(POLICY);
-        // A third worker is ready and its engine has sent no report yet. It
-        // counts as idle: beside the busy worker it is never the pick.
-        let unreported = fleet.join_unreported("unreported");
-        for seed in 0..32 {
-            assert_eq!(fleet.pick_at(&engine, seed), Some(fleet.busy));
-        }
-        // The busy worker drains and nothing runs. An idle fleet ties: every
-        // worker takes the same whole score, and the picker draws among
-        // equals, so each of them takes picks.
-        fleet.report(fleet.busy, 0, 0);
-        assert_eq!(fleet.scores(), [1.0; 3]);
-        let picks: Vec<_> = (0..64).map(|seed| fleet.pick_at(&engine, seed)).collect();
-        for worker in [fleet.busy, fleet.idle, unreported] {
-            assert!(picks.contains(&Some(worker)), "{worker:?} took no pick");
-        }
-    }
-
-    #[test]
-    fn a_gateways_veto_takes_its_worker_out_for_that_gateway_alone() {
-        let mut fleet = Fleet::new();
-        let engine = engine(POLICY);
-        // Another gateway's veto is its own: this gateway still picks the
-        // busy worker.
-        fleet.veto(GatewayId(7), fleet.busy, true);
-        assert_eq!(fleet.pick(&engine), Some(fleet.busy));
-        // This gateway's veto stalls the worker for it, and the profile's
-        // health filter drops a stalled worker.
-        fleet.veto(GatewayId::LOCAL, fleet.busy, true);
-        assert_eq!(fleet.pick(&engine), Some(fleet.idle));
-        // The veto cleared, the busy worker fills again.
-        fleet.veto(GatewayId::LOCAL, fleet.busy, false);
-        assert_eq!(fleet.pick(&engine), Some(fleet.busy));
-    }
-
-    #[test]
-    fn a_worker_at_its_overload_threshold_is_passed_over_and_the_next_opens() {
-        let mut fleet = Fleet::new();
-        let engine = engine(POLICY);
-        // A queue under the worker's threshold: `pack` still fills it.
-        fleet.report(fleet.busy, 3, QUEUE - 1);
-        assert_eq!(fleet.pick(&engine), Some(fleet.busy));
-        // At the threshold the store judges the worker's engine overloaded
-        // and the document's `not-overloaded` drops it: the next opens.
-        fleet.report(fleet.busy, 3, QUEUE);
-        assert_eq!(fleet.pick(&engine), Some(fleet.idle));
-        // The queue drains and the worker fills again.
-        fleet.report(fleet.busy, 3, 0);
-        assert_eq!(fleet.pick(&engine), Some(fleet.busy));
+    #[tokio::test(start_paused = true)]
+    async fn a_worker_judged_overloaded_is_passed_over_and_the_next_opens() {
+        let fleet = Fleet::new();
+        let case = async {
+            seen().await;
+            assert!(fleet.fills(&fleet.busy));
+            // The worker's host judges its engine at an overload threshold,
+            // and the document's `not-overloaded` drops it: the next opens.
+            fleet.busy.set_overloaded(true);
+            assert_eq!(fleet.pick().as_deref(), Some(fleet.idle.url()));
+            // The verdict is lifted and the worker fills again.
+            fleet.busy.set_overloaded(false);
+            assert!(fleet.fills(&fleet.busy));
+        };
+        beside_its_task(fleet.engine, case).await;
     }
 
     #[test]
     fn the_document_declares_the_load_reports_its_scorer_reads() {
         // `pack` is the document's only reader of the load reports.
-        assert!(engine(POLICY).needs().loads);
+        assert!(applied(POLICY).needs().loads);
     }
 
     #[test]
@@ -452,30 +475,31 @@ mod tests {
             shutdown_settle: Config::DEFAULT_SHUTDOWN_SETTLE,
             shutdown_grace: Config::DEFAULT_SHUTDOWN_GRACE,
             load_poll_interval: Config::DEFAULT_LOAD_POLL_INTERVAL,
-            election: Election::default(),
+            election: ElectionConfig::default(),
+            discovery: None,
         }
     }
 
     #[tokio::test]
-    async fn a_controller_handed_the_document_decides_by_it_over_its_store() {
+    async fn a_controller_handed_the_document_runs_it_and_it_decides_over_a_worker_list() {
         let stages = stages().expect("the scorer's name is free");
         let mut own = Controller::bind_with(config(), stages)
             .await
             .expect("binds");
         // The start's own door: the document is judged over the stages the
-        // bind was handed and applied to the controller's store.
+        // bind was handed, and the controller runs it as its generation 1.
         own.spec_file(POLICY_FILE).await.expect("the document runs");
-        assert_eq!(own.store().world().spec().generation(), 1);
-        // The controller's store, fed as its ingestion feeds it. Its workers
-        // name no threshold of their own: the document's defaults stand.
-        let mut fleet = Fleet::over(own.store(), Overload::default());
-        assert_eq!(fleet.pick_standing(), Some(fleet.busy));
-        // At the document's default queue the store judges the busy
-        // worker's engine overloaded, and `not-overloaded` drops it.
-        fleet.report(fleet.busy, 3, OVERLOAD_WAITING_REQUESTS);
-        assert_eq!(fleet.pick_standing(), Some(fleet.idle));
-        fleet.report(fleet.busy, 3, OVERLOAD_WAITING_REQUESTS - 1);
-        assert_eq!(fleet.pick_standing(), Some(fleet.busy));
+        assert_eq!(own.store().snapshot().spec().generation(), 1);
+        // The document as the controller's own stages judge it, deciding
+        // over a worker list.
+        let fleet = Fleet::under(applied_in(POLICY, own.stage_registry()));
+        let case = async {
+            seen().await;
+            assert!(fleet.fills(&fleet.busy));
+            fleet.busy.set_overloaded(true);
+            assert_eq!(fleet.pick().as_deref(), Some(fleet.idle.url()));
+        };
+        beside_its_task(fleet.engine, case).await;
         // The stock controller refuses the same file by the scorer's name.
         let mut stock = Controller::bind(config()).await.expect("binds");
         match stock.spec_file(POLICY_FILE).await {
@@ -493,11 +517,11 @@ mod tests {
         let own = Controller::bind_with(config(), stages)
             .await
             .expect("binds");
-        assert!(read(POLICY).validate_in(own.catalog(), &[]).is_ok());
+        assert!(read(POLICY).validate_in(own.stage_registry(), &[]).is_ok());
         // A controller bound with the stock stages refuses the same document
         // by the scorer's name.
         let stock = Controller::bind(config()).await.expect("binds");
-        match read(POLICY).validate_in(stock.catalog(), &[]) {
+        match read(POLICY).validate_in(stock.stage_registry(), &[]) {
             Err(SpecError::UnknownScorer { name, .. }) => assert_eq!(name, "pack"),
             other => panic!("the stock controller read the document as {other:?}"),
         }

@@ -48,6 +48,7 @@ use smg_mesh::{
     ClusterState, MeshServer, MeshServerBuilder, MeshServerConfig, MeshServerHandler,
     PreparedMeshServer,
 };
+use smg_policy_controller::stages::StageRegistry;
 use tokio::{signal, spawn};
 use tracing::{debug, error, info, warn, Level};
 use wfaas::LoggingSubscriber;
@@ -59,12 +60,21 @@ pub mod posture;
 mod rate_limit_document;
 pub(crate) mod tls;
 
+use smg_service_discovery::{export_manifest, start_service_discovery, RuntimeDiscoveryConfig};
 // The HTTP client constructors and the process crypto provider they install
 // first live in the worker tree, which builds the worker-directed clients
 // with them; callers read them as `server::http_client()` and its siblings.
-pub use crate::worker::connection::client_factory::{
+pub use smg_worker::connection::client_factory::{
     blocking_http_client, http_client, http_client_builder, install_crypto_provider,
 };
+use smg_worker::{
+    connection::engine::EngineConnector,
+    health::manager::{WorkerManager, WorkerManagerConfig},
+    identity::{basic::ConnectionMode, endpoint::Endpoint},
+    jobs::WorkerJobs,
+    registry::WorkerId,
+};
+
 use crate::{
     admin::{
         json::AdminJson,
@@ -72,7 +82,8 @@ use crate::{
     },
     app_context::{effective_max_concurrent_requests, AppContext},
     config::{
-        available_cpus, bind_socket_addr, dp_minimum_tokens_scheduler_scope_warning, redacted,
+        available_cpus, bind_socket_addr, dp_aware_deprecation_warning,
+        dp_minimum_tokens_scheduler_scope_warning, redacted,
         runtime_worker_threads_oversubscription, unused_credentials_warnings,
         validate_mesh_listener_port, ParserChoice, RouterConfig,
     },
@@ -86,11 +97,9 @@ use crate::{
     },
     middleware::{self, inert::InertLayer, AdmissionQueue, AuthConfig},
     observability::{
-        heap_profile, history_metrics,
-        inflight_tracker::InFlightRequestTracker,
-        logging::{self, LoggingConfig},
-        metrics::{self, PrometheusConfig},
-        metrics_server, otel_trace, runtime_metrics,
+        heap_profile, history_metrics, inflight_tracker::InFlightRequestTracker, logging,
+        logging::LoggingConfig, metrics, metrics::PrometheusConfig, metrics_server, otel_trace,
+        runtime_metrics,
     },
     routers::{
         common::realtime::ws::RealtimeQueryParams,
@@ -106,16 +115,11 @@ use crate::{
         connection_timeouts::{ConnectionTimeoutAcceptor, ConnectionTimeouts},
         health::{liveness_response, spawn_readiness_maintainer, start_probe_listener, ProbeState},
     },
-    service_discovery::{export_manifest, start_service_discovery, RuntimeDiscoveryConfig},
     tenant,
     wasm::route::{add_wasm_module, list_wasm_modules, remove_wasm_module},
-    worker::{
-        health::manager::{WorkerJobs, WorkerManager, WorkerManagerConfig},
-        identity::endpoint::Endpoint,
-        ConnectionMode,
-    },
     workflow::{
         job_queue::{JobQueue, JobQueueConfig},
+        worker_events::spawn_worker_event_reactions,
         Job, TokenizerConfigRequest, WorkflowEngines,
     },
 };
@@ -824,6 +828,7 @@ async fn get_loads(
         &state.context.worker_registry,
         &snapshot,
         query.model.as_deref(),
+        concat!("smg-", env!("CARGO_PKG_VERSION")),
     ))
     .into_response()
 }
@@ -944,7 +949,11 @@ async fn get_worker(
 ) -> Response {
     match state.context.worker_service.get_worker(&worker_id_raw) {
         Ok(mut result) => {
-            if let Some(monitor) = state.context.worker_monitor.as_ref() {
+            // Only a worker in the registry has a load of its own: the
+            // address of a pending view can be another worker's.
+            let id = WorkerId::from_string(result.0.id.clone());
+            let registered = state.context.worker_registry.get(&id).is_some();
+            if let Some(monitor) = state.context.worker_monitor.as_ref().filter(|_| registered) {
                 let snapshot = monitor.load_snapshot();
                 result.0.engine_load = snapshot.get(&result.0.spec.url).cloned();
             }
@@ -1125,6 +1134,86 @@ impl ServerConfig {
             secret_files: Default::default(),
             secrets_auto_reload: false,
         }
+    }
+}
+
+/// What a host binary adds to the gateway at startup.
+#[non_exhaustive]
+pub struct Extensions {
+    connector: Option<Arc<dyn EngineConnector>>,
+    policy_stages: Option<StageRegistry>,
+}
+
+impl Extensions {
+    /// Use the stock connector and the stock policy stages.
+    pub fn new() -> Self {
+        Self {
+            connector: None,
+            policy_stages: None,
+        }
+    }
+
+    /// Set the connector workers of this gateway use to probe and connect
+    /// to their engines. Delegate to [`BackendConnector::shared`] for engines
+    /// you want the gateway to connect to as usual.
+    ///
+    /// A gRPC connection of your own carries a worker's health, loads and
+    /// events. The gateway puts it behind a front ([`Fronted`]) and sends
+    /// requests through its own client, which it connects to the worker's
+    /// address and runtime at the first request. So an engine the gateway's
+    /// client speaks to must listen there. The worker's connection is the
+    /// front: read your own type back through [`Fronted::front`]. If you
+    /// hold the gateway's client already, return [`Fronted::over`] of yours
+    /// and it, and the two share one channel.
+    ///
+    /// For ZMQ inference, and for a ZMQ worker's label refresh, the gateway
+    /// requires a [`BackendClient`] as the worker's connection. It refuses
+    /// another with `its engine connection is not the gateway's backend
+    /// client`.
+    /// If the connection supplies load reports, let the worker runtime be
+    /// the only poller of that engine's load.
+    ///
+    /// An HTTP worker connects no engine, and its load is polled over HTTP.
+    /// A connector that keeps such a worker's load on a service of its own
+    /// answers [`EngineConnector::http_load_source`]: the worker runtime
+    /// then polls that source alone and sends the worker no load request.
+    ///
+    /// [`BackendConnector::shared`]: crate::routers::grpc::backend_client::BackendConnector::shared
+    /// [`BackendClient`]: crate::routers::grpc::backend_client::BackendClient
+    /// [`Fronted`]: crate::routers::grpc::backend_client::Fronted
+    /// [`Fronted::front`]: crate::routers::grpc::backend_client::Fronted::front
+    /// [`Fronted::over`]: crate::routers::grpc::backend_client::Fronted::over
+    #[must_use]
+    pub fn connector(mut self, connector: Arc<dyn EngineConnector>) -> Self {
+        self.connector = Some(connector);
+        self
+    }
+
+    /// Set the table of stages a policy document of this gateway may name,
+    /// where the gateway runs the policy controller (`policy_controller`
+    /// on). Start from the stock table ([`StageRegistry::builtin`]) and add
+    /// each stage of your own under a new name, with
+    /// [`StageRegistry::filter`], [`StageRegistry::scorer`] or
+    /// [`StageRegistry::picker`]. A supplied document (`policy_spec`) then
+    /// names your stage as it names a stock one, and the engine that places
+    /// this gateway's requests runs it.
+    ///
+    /// The gateway validates its document against this table first, before
+    /// it opens a store or listens. A document that names a stage the table
+    /// does not hold ends the start by the stage's name. Without this call
+    /// the document is validated against the stock table.
+    ///
+    /// With the policy controller off the table is not read.
+    #[must_use]
+    pub fn policy_stages(mut self, stages: StageRegistry) -> Self {
+        self.policy_stages = Some(stages);
+        self
+    }
+}
+
+impl Default for Extensions {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -1891,6 +1980,10 @@ async fn start_workflow_engines(
         info!("Startup tokenizer job submitted (will complete in background)");
     }
 
+    // A worker that no workflow registers here (a mesh peer's) gets its
+    // model's tokenizer job from the registry's events.
+    spawn_worker_event_reactions(app_context);
+
     info!(
         "Initializing workers for routing mode: {:?}",
         config.router_config.mode
@@ -1965,24 +2058,34 @@ async fn prepare_mesh_server(
     Ok(Some(prepared))
 }
 
-/// [`startup`] on `runtime` to its end, then the process-wide observability
+/// Run the gateway on `runtime` with no extension of a host. See
+/// [`run_with`] for shutdown behavior.
+pub fn run(
+    runtime: &tokio::runtime::Runtime,
+    config: ServerConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    run_with(runtime, config, Extensions::default())
+}
+
+/// [`startup_with`] on `runtime` to its end, then the process-wide observability
 /// closed behind it, on every exit alike: the log writers are flushed and
 /// stopped, then the tracer is flushed and shut down (a bounded wait, see
 /// [`otel_trace::shutdown_otel`]), and only then is the result read. A
 /// failed start-up used to return before the tracer's shutdown, and the
 /// spans the batch exporter still held were lost with the process. The
-/// result is `startup`'s own: the error line and the exit code are the
+/// result is `startup_with`'s own: the error line and the exit code are the
 /// caller's, as before. The runtime stays up throughout: the exporter's
 /// connection lives on it, and the shutdown is driven from it, so a
 /// current-thread runtime serves as well as a multi-thread one.
 ///
 /// For a caller whose process goes on after the server (a language
-/// binding), [`startup`] alone is the entry point.
-pub fn run(
+/// binding), [`startup_with`] alone is the entry point.
+pub fn run_with(
     runtime: &tokio::runtime::Runtime,
     config: ServerConfig,
+    extensions: Extensions,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let served = runtime.block_on(Box::pin(startup(config)));
+    let served = runtime.block_on(Box::pin(startup_with(config, extensions)));
     // The writer threads outlive `startup` (a process may start more than one
     // router); flush and stop them now that this process is done logging.
     logging::close_logging();
@@ -2010,11 +2113,33 @@ struct BoundListeners {
     admin: Option<std::net::TcpListener>,
 }
 
+/// The accept queue a client-facing listener asks for: more than a host
+/// allows, so the kernel caps it at the host's own maximum
+/// (`net.core.somaxconn` on Linux).
+const LISTEN_QUEUE: u32 = i32::MAX.unsigned_abs();
+
+/// A listener on `addr` with [`LISTEN_QUEUE`] asked for. The runtime's own
+/// bind takes no queue length and its socket queued 128 connections on a
+/// host that allows 4096: a burst of new connections overflowed it. Runs
+/// inside the runtime: the socket registers with its reactor before
+/// `into_std` hands it back.
+fn listen_on(addr: std::net::SocketAddr) -> std::io::Result<std::net::TcpListener> {
+    let socket = match addr {
+        std::net::SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4()?,
+        std::net::SocketAddr::V6(_) => tokio::net::TcpSocket::new_v6()?,
+    };
+    // As the runtime's bind sets it: a restart takes its port back at once.
+    #[cfg(not(windows))]
+    socket.set_reuseaddr(true)?;
+    socket.bind(addr)?;
+    socket.listen(LISTEN_QUEUE)?.into_std()
+}
+
 /// The admin and HTTP listeners, bound in that order after the mesh
 /// listener, eagerly: a port another process holds fails the start here,
 /// before anything serves (the comments inside say why each binds where it
 /// does and how).
-async fn bind_listeners(
+fn bind_listeners(
     addr: std::net::SocketAddr,
     admin_addr: Option<std::net::SocketAddr>,
 ) -> Result<BoundListeners, Box<dyn std::error::Error>> {
@@ -2022,26 +2147,17 @@ async fn bind_listeners(
     // listener did in `startup` before this call: a port another process
     // holds fails the start here, before anything serves.
     let admin_listener = match admin_addr {
-        Some(admin_addr) => Some(
-            tokio::net::TcpListener::bind(admin_addr)
-                .await
-                .and_then(tokio::net::TcpListener::into_std)
-                .map_err(|e| {
-                    format!("Failed to bind the admin listener on {admin_addr} (--admin-port): {e}")
-                })?,
-        ),
+        Some(admin_addr) => Some(listen_on(admin_addr).map_err(|e| {
+            format!("Failed to bind the admin listener on {admin_addr} (--admin-port): {e}")
+        })?),
         None => None,
     };
     // The HTTP listener binds now, eagerly, the last of the listeners: a port
     // another process holds fails the start here, before `startup` lets the
-    // mesh server join the cluster. Bound through tokio, as axum-server
-    // binds (the same socket options and accept backlog; std's bind would
-    // queue 128 connections instead of 1024), and served from the socket in
+    // mesh server join the cluster. Served from the socket in
     // `serve_listeners`.
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .and_then(tokio::net::TcpListener::into_std)
-        .map_err(|e| format!("Failed to bind the HTTP listener on {addr}: {e}"))?;
+    let listener =
+        listen_on(addr).map_err(|e| format!("Failed to bind the HTTP listener on {addr}: {e}"))?;
     info!("Starting server on {addr}");
     Ok(BoundListeners {
         addr,
@@ -2187,8 +2303,47 @@ fn serve_listeners(
     Ok((data_serving, admin_serving))
 }
 
+/// The context of this process, built over what the host added: its
+/// worker connector and its table of policy stages.
+async fn build_app_context(
+    config: &ServerConfig,
+    extensions: Extensions,
+) -> Result<Arc<AppContext>, String> {
+    Ok(Arc::new(
+        AppContext::from_config_with_extensions(
+            config.router_config.clone(),
+            config.router_config.request_timeout_secs,
+            config.webrtc_bind_addr,
+            config.webrtc_stun_server.clone(),
+            extensions.connector,
+            extensions.policy_stages,
+        )
+        .await?,
+    ))
+}
+
+/// What the start line says places this process's requests: the policy
+/// document the policy controller runs in place of the one the routing
+/// settings mean, by its path where it was read from one, and the routing
+/// settings' policy everywhere else.
+fn start_line_policy(config: &RouterConfig) -> String {
+    match (&config.policy_spec, &config.policy_spec_path) {
+        (None, _) => format!("{:?}", config.policy),
+        (Some(_), Some(path)) => format!("document {path}"),
+        (Some(_), None) => "a supplied document".to_owned(),
+    }
+}
+
 /// Start the gateway listeners and drain them within the configured shutdown budget.
 pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
+    Box::pin(startup_with(config, Extensions::default())).await
+}
+
+/// [`startup`] with the host's extensions.
+pub async fn startup_with(
+    config: ServerConfig,
+    extensions: Extensions,
+) -> Result<(), Box<dyn std::error::Error>> {
     install_crypto_provider();
 
     // Defense in depth: the CLI and Python bindings both validate via
@@ -2293,12 +2448,16 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     for warning in unused_credentials_warnings(&config.router_config.mode) {
         tracing::warn!("{warning}");
     }
-    // A rank scheduler under rank expansion chooses nothing: the operator's
-    // configuration runs, with the word that one of its flags does nothing.
-    if let Some(warning) = dp_minimum_tokens_scheduler_scope_warning(
-        config.router_config.dp_aware,
-        config.router_config.dp_minimum_tokens_scheduler,
-    ) {
+    // Two settings the operator's configuration still carries and that
+    // choose nothing where an engine's ranks are registered as workers: the
+    // configuration runs, with the word that the setting does nothing.
+    for warning in [
+        dp_aware_deprecation_warning(config.router_config.dp_aware),
+        dp_minimum_tokens_scheduler_scope_warning(config.router_config.dp_minimum_tokens_scheduler),
+    ]
+    .into_iter()
+    .flatten()
+    {
         tracing::warn!("{warning}");
     }
 
@@ -2380,23 +2539,15 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     };
 
     info!(
-        "Starting router on {}:{} | mode: {:?} | policy: {:?} | max_payload: {}MB",
+        "Starting router on {}:{} | mode: {:?} | policy: {} | max_payload: {}MB",
         config.router_config.host,
         config.router_config.port,
         config.router_config.mode,
-        config.router_config.policy,
+        start_line_policy(&config.router_config),
         config.router_config.max_payload_size / (1024 * 1024)
     );
 
-    let app_context = Arc::new(
-        AppContext::from_config(
-            config.router_config.clone(),
-            config.router_config.request_timeout_secs,
-            config.webrtc_bind_addr,
-            config.webrtc_stun_server.clone(),
-        )
-        .await?,
-    );
+    let app_context = build_app_context(&config, extensions).await?;
     // The history store's size on /metrics, from the stores that can count.
     if config.prometheus_config.is_some() {
         history_metrics::spawn_sampler(Arc::clone(&app_context));
@@ -2435,7 +2586,6 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     );
 
     let gateway = Gateway::from_config(&config, &app_context).await?;
-    let router: Arc<dyn RouterTrait> = gateway.clone();
 
     // WorkerManager owns the background health check loop. Its handle must
     // outlive the server to keep the task alive — bind it here so its Drop
@@ -2557,7 +2707,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     };
 
     let app_state = Arc::new(AppState {
-        router,
+        router: gateway.clone(),
         context: app_context.clone(),
         admission_queue,
         gateway: Some(gateway),
@@ -2657,7 +2807,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     // The mesh listener binds and the mesh server prepares now, eagerly,
     // before the admin and HTTP listeners bind (see `prepare_mesh_server`).
     let mesh_server = prepare_mesh_server(mesh_server, config.mesh_server_config.as_ref()).await?;
-    let listeners = bind_listeners(addr, admin_addr).await?;
+    let listeners = bind_listeners(addr, admin_addr)?;
 
     // The mesh server serves once every listener is bound: a member that
     // joined the cluster and vanished with a failed bind is the partial start
@@ -3617,6 +3767,11 @@ fn create_cors_layer(allowed_origins: Vec<String>) -> Option<tower_http::cors::C
 
 #[cfg(test)]
 mod tests {
+    mod connector;
+    mod load_source;
+    mod policy_stages;
+    mod worker_data;
+
     use std::convert::Infallible;
 
     use axum::response::sse::{Event, Sse};
@@ -3626,6 +3781,81 @@ mod tests {
 
     use super::*;
     use crate::config::TenantApiKeyEntry;
+
+    /// A gRPC worker imported from a mesh peer runs no registration workflow
+    /// here; without its model's tokenizer, readiness answers 503.
+    #[tokio::test]
+    async fn an_imported_grpc_workers_model_gets_its_tokenizer() {
+        use openai_protocol::model_card::ModelCard;
+        use smg_worker::{
+            identity::basic::ConnectionMode,
+            registry::RemoteWorkerState,
+            worker::{WorkerModels, WorkerSpec},
+        };
+
+        use crate::{
+            routers::grpc::backend_client::BasicWorkerBuilder,
+            workflow::tokenizer_registration::test_support::tokenizer_dir,
+        };
+
+        let tokenizer = tokenizer_dir();
+        let config = ServerConfig::minimal(RouterConfig::default());
+        let context = Arc::new(
+            AppContext::from_config(config.router_config.clone(), 10, None, None)
+                .await
+                .unwrap(),
+        );
+        let import = |model: &str, url: &str| {
+            let mut spec = WorkerSpec::new(url);
+            spec.connection_mode = ConnectionMode::Grpc;
+            spec.models = WorkerModels::Single(Box::new(ModelCard::new(model)));
+            spec.labels.insert(
+                "tokenizer_path".to_string(),
+                tokenizer.path().to_str().unwrap().to_string(),
+            );
+            context
+                .worker_registry
+                .on_remote_worker_state(&RemoteWorkerState {
+                    worker_id: model.to_string(),
+                    model_id: model.to_string(),
+                    url: url.to_string(),
+                    health: true,
+                    version: 1,
+                    spec: serde_json::to_vec(&spec).unwrap(),
+                });
+        };
+        import("imported-early", "grpc://127.0.0.1:1");
+        start_workflow_engines(&context, &config).await.unwrap();
+        // A worker registered here is its own workflow's: no job from the task.
+        context.worker_registry.register(Arc::new(
+            BasicWorkerBuilder::new("grpc://127.0.0.1:3")
+                .model(ModelCard::new("registered-here"))
+                .label("tokenizer_path", tokenizer.path().to_str().unwrap())
+                .connection_mode(ConnectionMode::Grpc)
+                .build(),
+        ));
+        import("imported-late", "grpc://127.0.0.1:2");
+        for model in ["imported-early", "imported-late"] {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !context.tokenizer_registry.contains(model) {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("no tokenizer for the model of the import {model}"));
+        }
+        // A peer's tombstone takes an import and runs no removal workflow.
+        let late = context.worker_registry.get_id_by_url("grpc://127.0.0.1:2");
+        context.worker_registry.remove_remote(&late.unwrap());
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while context.tokenizer_registry.contains("imported-late") {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the tokenizer of the import that left is still loaded");
+        assert!(!context.tokenizer_registry.contains("registered-here"));
+    }
 
     /// The not-found fallback sits inside the edge layers: an unknown route
     /// gets a request id (and a log line and a metric) like a known one.
@@ -5213,13 +5443,54 @@ mod tests {
 
         // The refusal named, not any error: a listener that failed to bind
         // would also be one.
-        let error = startup(ServerConfig::minimal(router_config))
+        let error = Box::pin(startup(ServerConfig::minimal(router_config)))
             .await
             .expect_err("startup must validate router_config even when constructed directly");
         assert!(
             error.to_string().contains("must have a non-empty key"),
             "startup refused for another reason: {error}"
         );
+    }
+
+    /// The start line names what places requests. Under the classic
+    /// policies, and where the policy controller runs the document the
+    /// settings mean, it is the settings' policy in its debug form. A
+    /// supplied document is named in its place: by its path where it was
+    /// read from one, and without one where the caller set it.
+    #[test]
+    fn the_start_line_names_a_supplied_document() {
+        let classic = RouterConfig::default();
+        assert_eq!(start_line_policy(&classic), format!("{:?}", classic.policy));
+
+        let the_settings_own = RouterConfig {
+            policy_controller: true,
+            ..RouterConfig::default()
+        };
+        assert_eq!(
+            start_line_policy(&the_settings_own),
+            format!("{:?}", the_settings_own.policy)
+        );
+
+        let document = classic
+            .policy_document()
+            .expect("the default settings mean a document");
+        let read_from_a_path = RouterConfig {
+            policy_controller: true,
+            policy_spec_path: Some("routing.yaml".to_owned()),
+            policy_spec: Some(document.clone()),
+            ..RouterConfig::default()
+        };
+        assert_eq!(
+            start_line_policy(&read_from_a_path),
+            "document routing.yaml"
+        );
+
+        let set_by_the_caller = RouterConfig {
+            policy_controller: true,
+            policy_spec: Some(document),
+            ..RouterConfig::default()
+        };
+        assert_eq!(start_line_policy(&set_by_the_caller), "a supplied document");
     }
 
     /// `minimal` leaves a library caller on the CLI's shutdown grace, not a
@@ -5232,5 +5503,31 @@ mod tests {
             DEFAULT_SHUTDOWN_GRACE_SECS
         );
         assert_eq!(config.shutdown_grace_period_secs, 180);
+    }
+
+    /// The HTTP listener queues as many unaccepted connections as its host
+    /// allows: the runtime's own bind stopped at 128.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_http_listener_queues_what_its_host_allows() {
+        let allowed: usize = std::fs::read_to_string("/proc/sys/net/core/somaxconn")
+            .expect("the host's accept queue maximum")
+            .trim()
+            .parse()
+            .expect("a number");
+        let listeners = bind_listeners("127.0.0.1:0".parse().expect("an address"), None)
+            .expect("the listeners");
+        let addr = listeners.data.local_addr().expect("its address");
+        // Nothing accepts: a connection past the queue waits on the kernel's
+        // retries and is never queued.
+        let queued = tokio::time::timeout(Duration::from_secs(3), async {
+            let mut held = Vec::new();
+            for _ in 0..allowed.min(256) {
+                held.push(TcpStream::connect(addr).await.expect("a connection"));
+            }
+            held
+        })
+        .await;
+        assert!(queued.is_ok(), "a connection past 128 was not queued");
     }
 }

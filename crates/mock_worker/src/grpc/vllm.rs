@@ -305,7 +305,7 @@ impl VllmEngine for MockScheduler {
         request: Request<vllm::GetLoadsRequest>,
     ) -> Result<Response<vllm::GetLoadsResponse>, Status> {
         let loads: Vec<vllm::SchedulerLoad> = self
-            .load_rows(request.into_inner().dp_rank)
+            .load_rows(request.into_inner().dp_rank)?
             .into_iter()
             .map(|(dp_rank, s)| vllm::SchedulerLoad {
                 dp_rank,
@@ -321,6 +321,7 @@ impl VllmEngine for MockScheduler {
                 utilization: s.token_usage,
                 max_running_requests: s.max_running_requests,
                 num_waiting_uncached_tokens: s.num_waiting_uncached_tokens,
+                values: self.load_values(dp_rank),
             })
             .collect();
         Ok(Response::new(vllm::GetLoadsResponse {

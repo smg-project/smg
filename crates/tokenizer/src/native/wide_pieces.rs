@@ -12,8 +12,7 @@ const WIDE_PIECE_MAX_BYTES: usize = 32;
 const WIDE_IDS: usize = 7;
 /// The slots of a table's first allocation, 4 KiB of entries.
 const MIN_SLOTS: usize = 64;
-/// The slot count up to which the table grows by four; by two above, as the
-/// packed table of the shorter pieces does.
+/// The slot count up to which the table grows by four; by two above.
 const GROW_BY_FOUR_UP_TO: usize = 4_096;
 const EMPTY_TAG: u8 = 0;
 const LOW_SALT: u64 = 0x2545_F491_4F6C_DD1D;

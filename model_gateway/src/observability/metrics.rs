@@ -16,22 +16,25 @@ pub use smg_external_router::metrics::{
     bool_to_static_str, error_reason_from_status, intern_model_label, intern_tool_label,
     metrics_labels, STREAMING_FALSE, STREAMING_TRUE,
 };
+use smg_worker::metrics::{
+    series as worker_series,
+    series::{WorkerSeries, WorkerSeriesRecorder},
+    writers::{
+        describe_series as describe_worker_series, intern_string, KV_EVENT_APPLY_SECONDS,
+        KV_EVENT_LAG_SECONDS,
+    },
+};
 
 use crate::{
     config::{ConfigError, ConfigResult},
     routers::grpc::regular::symphony::telemetry as symphony_telemetry,
-    worker::metrics::{
-        describe_series as describe_worker_series, intern_string,
-        series::{self as worker_series, WorkerSeries, WorkerSeriesRecorder},
-        KV_EVENT_APPLY_SECONDS, KV_EVENT_LAG_SECONDS,
-    },
 };
 
 /// Per-thread caches of the handles the gateway's per-request records go
 /// through: the HTTP layer's, the stream-timing set's, the selection's, the
 /// cache-aware decision's, the index lookup's, the admission gauges' and the
 /// body path's. The worker's own caches are the worker module's
-/// (`crate::worker::metrics`); the helpers and the installed flag are the
+/// (`smg_worker::metrics::writers`); the helpers and the installed flag are the
 /// worker crate's, so every writer records the same way.
 mod handles {
     use std::{
@@ -84,6 +87,8 @@ mod handles {
     pub(super) struct StreamHandles {
         /// `smg_router_ttft_seconds`.
         pub(super) ttft: OnceCell<Histogram>,
+        /// `smg_router_dispatch_wait_seconds`.
+        pub(super) dispatch_wait: OnceCell<Histogram>,
         /// `smg_router_tpot_seconds`.
         pub(super) tpot: OnceCell<Histogram>,
         /// `smg_router_time_to_first_token_seconds`.
@@ -327,6 +332,14 @@ pub(crate) const TIME_TO_FIRST_TOKEN_SECONDS: &str = "smg_router_time_to_first_t
 pub(crate) const REQUEST_TIME_PER_OUTPUT_TOKEN_SECONDS: &str =
     "smg_router_request_time_per_output_token_seconds";
 
+/// The wait ahead of the dispatch the first-token clock starts at: from the
+/// request's entry at the edge to the answering attempt's RPC dispatch.
+/// Observed with `smg_router_ttft_seconds`, for the same requests and under
+/// the same labels, so the two add up to the time to first token from the
+/// request's receipt. A streamed Responses tool loop observes one per turn,
+/// a later turn's from that turn's start.
+pub(crate) const DISPATCH_WAIT_SECONDS: &str = "smg_router_dispatch_wait_seconds";
+
 /// Histogram buckets for `smg_router_time_to_first_token_seconds`: six per
 /// decade (1, 1.5, 2, 3, 5, 7.5) from 10 ms to 10 s, where a first-token
 /// objective lives, then coarser to two minutes; a first token later than that
@@ -405,6 +418,12 @@ pub(crate) const MM_SECONDS_BUCKETS: &[f64] = &[
 pub(crate) const MM_MEDIA_PER_REQUEST_BUCKETS: &[f64] =
     &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0, 16.0, 32.0, 64.0];
 
+/// Buckets of the images a request carries: dense where most requests land,
+/// and starting at 0, the bucket a request without media is counted in.
+pub(crate) const MM_REQUEST_IMAGES_BUCKETS: &[f64] = &[
+    0.0, 1.0, 2.0, 3.0, 5.0, 8.0, 12.0, 20.0, 30.0, 50.0, 100.0, 200.0,
+];
+
 /// The `modality` label of a media series.
 fn mm_modality_label(modality: llm_multimodal::Modality) -> &'static str {
     match modality {
@@ -415,14 +434,13 @@ fn mm_modality_label(modality: llm_multimodal::Modality) -> &'static str {
     }
 }
 
-/// Jemalloc's run-time options for a long-running gateway, for every final
-/// artifact (the `smg` executable, the Python extension, the Go FFI library)
-/// to export as `_rjem_malloc_conf` next to its `#[global_allocator]`. The
+/// Jemalloc's run-time options for a long-running gateway. Binaries that use
+/// [`crate::stock_allocator!`] and the Python and Go bindings export them as
+/// `_rjem_malloc_conf` next to their `#[global_allocator]`. The
 /// multimodal crate's baseline harness (`crates/multimodal/examples/mm_baseline.rs`)
 /// sits below this crate and repeats the bytes by hand; the test
 /// `the_multimodal_harness_repeats_the_malloc_conf` keeps that copy equal. With
-/// the stock
-/// settings a thread's freed pages decay back to the OS only when that thread
+/// the allocator's defaults, a thread's freed pages decay back only when it
 /// allocates again, so after a traffic burst an idle gateway kept ~1.5 GB
 /// resident over ~270 MB of live objects (soak s2, ten hours). A background
 /// thread purges on schedule instead; dirty pages are returned after 10 s and
@@ -487,20 +505,40 @@ fn mm_modality_label(modality: llm_multimodal::Modality) -> &'static str {
 pub const SERVER_MALLOC_CONF: &[u8; 100] =
     b"background_thread:true,dirty_decay_ms:10000,muzzy_decay_ms:0,narenas:16,oversize_threshold:33554432\0";
 
-/// Marks jemalloc as the final artifact's Rust global allocator.
+/// The bytes of the one allocation that tells which allocator serves the
+/// process.
+#[cfg(all(
+    feature = "jemalloc-stats",
+    not(target_env = "msvc"),
+    not(target_env = "musl")
+))]
+const ALLOCATOR_PROBE_BYTES: usize = 4096;
+
+/// Whether this process's Rust allocations go through the library's
+/// jemalloc.
 ///
-/// Call this before [`start_prometheus`] only from a binary or extension that
-/// declares `tikv_jemallocator::Jemalloc` with `#[global_allocator]`. Keeping
-/// this registration at the artifact boundary prevents `smg` rlib consumers
-/// that use the system allocator from publishing statistics for an unused
-/// linked jemalloc instance.
-pub fn register_jemalloc_as_global_allocator() {
-    #[cfg(all(
-        feature = "jemalloc-stats",
-        not(target_env = "msvc"),
-        not(target_env = "musl")
-    ))]
-    allocator_stats::register_global_allocator();
+/// The gateway finds out and is not told: it makes one allocation and reads
+/// the allocator's own count of this thread's bytes before and after. A
+/// count that did not move means another allocator serves the process, and
+/// the statistics of the linked jemalloc are then not published. The answer
+/// is found once and kept.
+#[cfg(all(
+    feature = "jemalloc-stats",
+    not(target_env = "msvc"),
+    not(target_env = "musl")
+))]
+pub(crate) fn jemalloc_is_global() -> bool {
+    static FOUND: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FOUND.get_or_init(|| {
+        let Ok(allocated) = tikv_jemalloc_ctl::thread::allocatedp::read() else {
+            return false;
+        };
+        let before = allocated.get();
+        let probe = std::hint::black_box(Vec::<u8>::with_capacity(ALLOCATOR_PROBE_BYTES));
+        let after = allocated.get();
+        drop(probe);
+        after > before
+    })
 }
 
 pub(crate) fn init_metrics() {
@@ -524,7 +562,7 @@ pub(crate) fn init_metrics() {
     );
     describe_counter!(
         symphony_telemetry::CALLS_FORBIDDEN,
-        "Tool calls a Symphony table read under tool_choice: none and the gateway dropped, by table"
+        "Tool calls a Symphony table read and the gateway dropped under a tool_choice that forbids them (every call under none; a call outside the callable tools under a named function, an allowed list or required), by table"
     );
     describe_counter!(
         symphony_telemetry::FALLBACK,
@@ -639,10 +677,15 @@ pub(crate) fn init_metrics() {
     // per-token families hold streamed answers alone: a collected answer is
     // built from the drained stream and sees no first token, and a streamed
     // Responses answer on the Harmony pipeline records only the prefill-decode
-    // first-token pair, none of these four.
+    // first-token pair, none of these four. The dispatch wait is observed with
+    // the first token: it ends where the first-token clock starts.
     describe_histogram!(
         "smg_router_ttft_seconds",
         "Time to first token of streamed answers by router_type, backend_type, model, endpoint (gRPC only; a collected answer records no first token, nor does a streamed Responses answer on the Harmony pipeline); the clock starts at the answering attempt's RPC dispatch (the prefill dispatch of a prefill-decode pair, after the encode call when encode pushes), so a refused attempt's wait and its backoff are in smg_router_request_duration_seconds, the backoff alone in smg_worker_retry_backoff_seconds, and the refused attempt counted by smg_worker_retries_total, not here"
+    );
+    describe_histogram!(
+        DISPATCH_WAIT_SECONDS,
+        "Dispatch wait of streamed answers by router_type, backend_type, model, endpoint (gRPC only; a collected answer records no first token, nor does a streamed Responses answer on the Harmony pipeline, so no wait): from the request's entry at the edge to the answering attempt's RPC dispatch (the prefill dispatch of a prefill-decode pair, after the encode call when encode pushes), where the clock of smg_router_ttft_seconds starts, so the body read, admission, tokenizing, templating, worker selection, a refused attempt's wait and its backoff are here; observed with smg_router_ttft_seconds, once per observation of it and under the same labels, so the two add up to the time to first token from the request's receipt; a streamed Responses tool loop observes one per turn, as it observes smg_router_ttft_seconds: the first turn's from the request's entry, a later turn's from that turn's start, after the generations and tool calls before it, so a later turn's two add up to the time to first token from the turn's start"
     );
     describe_histogram!(
         "smg_router_tpot_seconds",
@@ -743,10 +786,6 @@ pub(crate) fn init_metrics() {
     );
 
     // Layer 3: Worker metrics
-    describe_gauge!(
-        "smg_worker_pool_size",
-        "Current worker pool size by worker_type, connection_mode, model"
-    );
     // The worker's own series, described by the worker's module.
     describe_worker_series();
     describe_counter!(
@@ -858,30 +897,7 @@ pub(crate) fn init_metrics() {
     );
 
     // Layer 4: Discovery metrics
-    describe_counter!(
-        "smg_discovery_registrations_total",
-        "Worker registration attempts by source and result"
-    );
-    describe_counter!(
-        "smg_discovery_deregistrations_total",
-        "Worker deregistration events by source and reason"
-    );
-    describe_histogram!(
-        "smg_discovery_sync_duration_seconds",
-        "Discovery sync duration by source"
-    );
-    describe_gauge!(
-        "smg_discovery_workers_discovered",
-        "Workers known via discovery by source"
-    );
-    describe_counter!(
-        "smg_discovery_snapshot_errors_total",
-        "Discovery source observations rejected, by source and reason"
-    );
-    describe_counter!(
-        "smg_discovery_skipped_total",
-        "Discovered workers left out of an otherwise good snapshot, by source and reason"
-    );
+    smg_service_discovery::describe_series();
 
     // Layer 5: MCP metrics
     describe_counter!(
@@ -961,6 +977,10 @@ pub(crate) fn init_metrics() {
         "smg_mm_media_per_request",
         "Media items a generation request carried, by model and modality, counted before any refusal or limit (a refused request counts; a token count does not)"
     );
+    describe_histogram!(
+        "smg_mm_request_images",
+        "Images a generation request carried, by model and the source class of its media (none, inline, remote, hybrid: inline is a data: URL or carried bytes, remote a fetched URL, read over every modality), observed once per request that reaches media resolution, a request without media included (0 under none)"
+    );
     describe_counter!(
         "smg_mm_media_items_total",
         "Media items generation requests carried, by model, modality and source (url, data_url, inline, read as the fetch reads them), counted before any refusal or limit"
@@ -1017,8 +1037,7 @@ pub fn init_startup_series() {
         ENDPOINT_GENERATE, ENDPOINT_MESSAGES, ENDPOINT_RERANK, ENDPOINT_RESPONSES,
         ENDPOINT_SYSTEMONE, WORKER_DECODE, WORKER_PREFILL, WORKER_REGULAR,
     };
-
-    use crate::worker::health::overload::{STAGE_DISPATCH, STAGE_PD_ADMISSION, STAGE_SELECTION};
+    use smg_worker::health::overload::{STAGE_DISPATCH, STAGE_PD_ADMISSION, STAGE_SELECTION};
 
     // Shedding happens at every stage; the two fallbacks only while the
     // candidate pool is assembled.
@@ -1122,7 +1141,7 @@ pub fn start_prometheus(config: PrometheusConfig) -> PrometheusHandle {
     let handle = recorder.handle();
 
     // Series labelled `worker` live in a store of their own so they can be
-    // dropped with their worker (see `worker::metrics::series`); it renders histograms
+    // dropped with their worker (see `smg_worker::metrics::series`); it renders histograms
     // with the exporter's buckets and quantiles.
     let workers = Arc::new(WorkerSeries::new(DistributionBuilder::new(
         parse_quantiles(DEFAULT_SUMMARY_QUANTILES),
@@ -1183,6 +1202,12 @@ fn histogram_bucket_overrides(duration_buckets: Option<Vec<f64>>) -> HashMap<Mat
     let ttft_matcher = Matcher::Suffix(String::from("ttft_seconds"));
     let tpot_matcher = Matcher::Suffix(String::from("tpot_seconds"));
 
+    // The dispatch wait (edge entry to the answering attempt's dispatch) ends
+    // in `_wait_seconds`, not `duration_seconds`: matched by its full name, it
+    // keeps the request-latency buckets (an operator's list with them), as
+    // the TTFT it adds up with does.
+    let dispatch_wait_matcher = Matcher::Full(String::from(DISPATCH_WAIT_SECONDS));
+
     // The first-token and per-output-token families: their own log-spaced
     // edges, which `--prometheus-duration-buckets` does not replace.
     let first_token_matcher = Matcher::Full(String::from(TIME_TO_FIRST_TOKEN_SECONDS));
@@ -1216,11 +1241,13 @@ fn histogram_bucket_overrides(duration_buckets: Option<Vec<f64>>) -> HashMap<Mat
     let mm_processing_matcher = Matcher::Full(String::from("smg_mm_processing_seconds"));
     let mm_fetch_matcher = Matcher::Full(String::from("smg_mm_media_fetch_seconds"));
     let mm_per_request_matcher = Matcher::Full(String::from("smg_mm_media_per_request"));
+    let mm_request_images_matcher = Matcher::Full(String::from("smg_mm_request_images"));
 
     HashMap::from([
         (duration_matcher, duration_bucket.clone()),
         (ttft_matcher, duration_bucket.clone()),
-        (tpot_matcher, duration_bucket),
+        (tpot_matcher, duration_bucket.clone()),
+        (dispatch_wait_matcher, duration_bucket),
         (first_token_matcher, TIME_TO_FIRST_TOKEN_BUCKETS.to_vec()),
         (
             per_output_token_matcher,
@@ -1248,6 +1275,10 @@ fn histogram_bucket_overrides(duration_buckets: Option<Vec<f64>>) -> HashMap<Mat
             mm_per_request_matcher,
             MM_MEDIA_PER_REQUEST_BUCKETS.to_vec(),
         ),
+        (
+            mm_request_images_matcher,
+            MM_REQUEST_IMAGES_BUCKETS.to_vec(),
+        ),
     ])
 }
 
@@ -1257,22 +1288,12 @@ fn histogram_bucket_overrides(duration_buckets: Option<Vec<f64>>) -> HashMap<Mat
     not(target_env = "musl")
 ))]
 pub(crate) mod allocator_stats {
-    use std::sync::atomic::{AtomicBool, Ordering};
-
     use metrics::{describe_gauge, gauge};
 
-    static JEMALLOC_IS_GLOBAL: AtomicBool = AtomicBool::new(false);
-
-    pub(super) fn register_global_allocator() {
-        JEMALLOC_IS_GLOBAL.store(true, Ordering::Release);
-    }
-
-    fn is_global_allocator() -> bool {
-        JEMALLOC_IS_GLOBAL.load(Ordering::Acquire)
-    }
+    use super::jemalloc_is_global;
 
     pub(crate) fn describe() {
-        if !is_global_allocator() {
+        if !jemalloc_is_global() {
             return;
         }
         describe_gauge!(
@@ -1312,10 +1333,10 @@ pub(crate) mod allocator_stats {
         }
     }
 
-    /// Registration at the final-artifact boundary keeps these gauges tied to
-    /// Rust's actual global allocator.
+    /// The gauges are published where this jemalloc serves the process's Rust
+    /// allocations, and nowhere else.
     pub(crate) fn start_reporting() {
-        if !is_global_allocator() {
+        if !jemalloc_is_global() {
             return;
         }
         record();
@@ -1330,6 +1351,13 @@ pub(crate) mod allocator_stats {
 
     #[cfg(test)]
     mod tests {
+        #[test]
+        fn the_allocator_of_the_lib_tests_is_found() {
+            // The lib's tests declare jemalloc as their allocator (lib.rs),
+            // so the one allocation moves its count.
+            assert!(super::jemalloc_is_global());
+        }
+
         #[test]
         fn jemalloc_stats_interface_readable() {
             use tikv_jemalloc_ctl::{epoch, stats};
@@ -1374,6 +1402,12 @@ pub struct StreamingMetricsParams<'a> {
     pub endpoint: &'static str,
     /// Time to first token (None if no tokens were generated)
     pub ttft: Option<Duration>,
+    /// The request's wait ahead of the dispatch `ttft` runs from: its entry
+    /// at the edge to that dispatch (for a later turn of a streamed tool
+    /// loop, that turn's start to its dispatch). Recorded only with `ttft`.
+    /// None for a generation dispatched under no entry stamp, and for a
+    /// collected answer.
+    pub dispatch_wait: Option<Duration>,
     /// Total generation time
     pub generation_duration: Duration,
     /// Input token count (None for endpoints that don't track this)
@@ -1797,6 +1831,22 @@ impl Metrics {
         }
     }
 
+    /// The images one generation request carried, by the source class of its
+    /// media (`none`, `inline`, `remote`, `hybrid`, read over every
+    /// modality). Observed once per request that reaches media resolution, a
+    /// request without media included (`images` 0, class `none`), so the
+    /// family's count is the requests and its 0 bucket the ones without an
+    /// image.
+    pub fn record_mm_request_images(model_id: &str, source_class: &'static str, images: usize) {
+        let model = intern_model_label(model_id);
+        histogram!(
+            "smg_mm_request_images",
+            "model" => model,
+            "source_class" => source_class
+        )
+        .record(images as f64);
+    }
+
     /// One media fetch, as the tracker reports it: its time by outcome, and
     /// the bytes it brought in.
     pub fn record_mm_fetch(model_id: &str, report: &llm_multimodal::FetchReport) {
@@ -1918,7 +1968,8 @@ impl Metrics {
     /// TTFT, TPOT, generation duration and the token counters, with the TPOT
     /// computed here. A streamed answer records at its end; a collected one
     /// when its response is built, with no TTFT (no first token is seen on
-    /// that path) and so no TPOT.
+    /// that path) and so no TPOT. The dispatch wait is recorded where the
+    /// TTFT is and only with it, so the two families count the same requests.
     pub fn record_streaming_metrics(params: StreamingMetricsParams<'_>) {
         let StreamingMetricsParams {
             router_type,
@@ -1926,6 +1977,7 @@ impl Metrics {
             model_id,
             endpoint,
             ttft,
+            dispatch_wait,
             generation_duration,
             input_tokens,
             cached_tokens,
@@ -1951,6 +2003,7 @@ impl Metrics {
             )
         };
         let ttft_histogram = || duration_histogram("smg_router_ttft_seconds");
+        let dispatch_wait_histogram = || duration_histogram(DISPATCH_WAIT_SECONDS);
         let tpot_histogram = || duration_histogram("smg_router_tpot_seconds");
         let first_token_histogram = || duration_histogram(TIME_TO_FIRST_TOKEN_SECONDS);
         let per_output_token_histogram =
@@ -1975,6 +2028,9 @@ impl Metrics {
                 let seconds = ttft.as_secs_f64();
                 ttft_histogram().record(seconds);
                 first_token_histogram().record(seconds);
+                if let Some(wait) = dispatch_wait {
+                    dispatch_wait_histogram().record(wait.as_secs_f64());
+                }
             }
             if let Some(tpot) = tpot {
                 let seconds = tpot.as_secs_f64();
@@ -2009,6 +2065,11 @@ impl Metrics {
                         kept.first_token
                             .get_or_init(first_token_histogram)
                             .record(seconds);
+                        if let Some(wait) = dispatch_wait {
+                            kept.dispatch_wait
+                                .get_or_init(dispatch_wait_histogram)
+                                .record(wait.as_secs_f64());
+                        }
                     }
                     if let Some(tpot) = tpot {
                         let seconds = tpot.as_secs_f64();
@@ -2203,23 +2264,6 @@ impl Metrics {
     // ========================================================================
     // Layer 3: Worker metrics
     // ========================================================================
-
-    /// Set worker pool size
-    pub fn set_worker_pool_size(
-        worker_type: &'static str,
-        connection_mode: &'static str,
-        model_id: &str,
-        size: usize,
-    ) {
-        let model = intern_model_label(model_id);
-        gauge!(
-            "smg_worker_pool_size",
-            "worker_type" => worker_type,
-            "connection_mode" => connection_mode,
-            "model" => model
-        )
-        .set(size as f64);
-    }
 
     /// Record worker selection
     pub fn record_worker_selection(
@@ -2440,70 +2484,6 @@ impl Metrics {
     // ========================================================================
 
     // ========================================================================
-    // Layer 4: Discovery metrics
-    // ========================================================================
-
-    /// Record worker registration attempt
-    pub fn record_discovery_registration(source: &'static str, result: &'static str) {
-        counter!(
-            "smg_discovery_registrations_total",
-            "source" => source,
-            "result" => result
-        )
-        .increment(1);
-    }
-
-    /// Record worker deregistration
-    pub fn record_discovery_deregistration(source: &'static str, reason: &'static str) {
-        counter!(
-            "smg_discovery_deregistrations_total",
-            "source" => source,
-            "reason" => reason
-        )
-        .increment(1);
-    }
-
-    /// Record discovery sync duration
-    pub fn record_discovery_sync_duration(source: &'static str, duration: Duration) {
-        histogram!(
-            "smg_discovery_sync_duration_seconds",
-            "source" => source
-        )
-        .record(duration.as_secs_f64());
-    }
-
-    /// Set workers discovered count
-    pub fn set_discovery_workers_discovered(source: &'static str, count: usize) {
-        gauge!(
-            "smg_discovery_workers_discovered",
-            "source" => source
-        )
-        .set(count as f64);
-    }
-
-    /// Record a discovered worker a provider left out of a snapshot it
-    /// otherwise applied
-    pub fn record_discovery_skip(source: &'static str, reason: &'static str) {
-        counter!(
-            "smg_discovery_skipped_total",
-            "source" => source,
-            "reason" => reason
-        )
-        .increment(1);
-    }
-
-    /// Record a discovery source observation that was rejected; the provider
-    /// keeps reconciling its last good snapshot meanwhile
-    pub fn record_discovery_snapshot_error(source: &'static str, reason: &'static str) {
-        counter!(
-            "smg_discovery_snapshot_errors_total",
-            "source" => source,
-            "reason" => reason
-        )
-        .increment(1);
-    }
-
-    // ========================================================================
     // Layer 5: MCP metrics
     // ========================================================================
 
@@ -2535,9 +2515,8 @@ pub(crate) mod test_support {
 
     /// The scrape a test renders under its own recorder, with the two
     /// readers of it: the worker's test support owns them.
-    pub(crate) use crate::worker::test_support::{
-        assert_metric, render_with_recorder, sorted_series,
-    };
+    pub(crate) use smg_worker::test_support::assert_metric;
+    pub(crate) use smg_worker::test_support::{render_with_recorder, sorted_series};
 }
 
 #[cfg(test)]

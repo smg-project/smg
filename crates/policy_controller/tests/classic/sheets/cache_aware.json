@@ -1,0 +1,2217 @@
+{
+  "recorded_from": "bfe189b332349c44cf7e3b6e1102a9b5a2699d9d",
+  "policy": "cache_aware",
+  "rows": [
+    {
+      "name": "tokens-a-holder-keeps-its-prefix-over-an-idle-worker",
+      "matcher": "tokens",
+      "config": {
+        "cache_threshold": 0.5,
+        "balance_abs_threshold": 32,
+        "balance_rel_threshold": 1.1,
+        "block_size": 16,
+        "balance_token_usage_threshold": 1.0,
+        "overload_token_usage_threshold": 1.0
+      },
+      "workers": [
+        {
+          "in_flight": 2,
+          "state": "free",
+          "report": null
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "report": null
+        },
+        {
+          "in_flight": 2,
+          "state": "free",
+          "report": null
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "prompt": [
+              [
+                1000,
+                64
+              ]
+            ],
+            "tried": []
+          }
+        },
+        {
+          "loads": [
+            1,
+            3,
+            0
+          ]
+        },
+        {
+          "pick": {
+            "prompt": [
+              [
+                1000,
+                48
+              ],
+              [
+                5000,
+                16
+              ]
+            ],
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "name": "tokens-a-holder-over-the-count-gate-spills-and-the-prefix-gains-a-holder",
+      "matcher": "tokens",
+      "config": {
+        "cache_threshold": 0.5,
+        "balance_abs_threshold": 32,
+        "balance_rel_threshold": 1.1,
+        "block_size": 16,
+        "balance_token_usage_threshold": 1.0,
+        "overload_token_usage_threshold": 1.0
+      },
+      "workers": [
+        {
+          "in_flight": 2,
+          "state": "free",
+          "report": null
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "report": null
+        },
+        {
+          "in_flight": 2,
+          "state": "free",
+          "report": null
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "prompt": [
+              [
+                1000,
+                64
+              ]
+            ],
+            "tried": []
+          }
+        },
+        {
+          "loads": [
+            1,
+            9,
+            0
+          ]
+        },
+        {
+          "pick": {
+            "prompt": [
+              [
+                1000,
+                64
+              ]
+            ],
+            "tried": []
+          }
+        },
+        {
+          "pick": {
+            "prompt": [
+              [
+                1000,
+                64
+              ]
+            ],
+            "tried": []
+          }
+        },
+        {
+          "loads": [
+            0,
+            2,
+            5
+          ]
+        },
+        {
+          "pick": {
+            "prompt": [
+              [
+                1000,
+                64
+              ]
+            ],
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1,
+          2,
+          2,
+          1
+        ]
+      }
+    },
+    {
+      "name": "tokens-a-match-at-the-threshold-is-a-miss",
+      "matcher": "tokens",
+      "config": {
+        "cache_threshold": 0.5,
+        "balance_abs_threshold": 32,
+        "balance_rel_threshold": 1.1,
+        "block_size": 16,
+        "balance_token_usage_threshold": 1.0,
+        "overload_token_usage_threshold": 1.0
+      },
+      "workers": [
+        {
+          "in_flight": 2,
+          "state": "free",
+          "report": null
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "report": null
+        },
+        {
+          "in_flight": 2,
+          "state": "free",
+          "report": null
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "prompt": [
+              [
+                1000,
+                64
+              ]
+            ],
+            "tried": []
+          }
+        },
+        {
+          "loads": [
+            0,
+            3,
+            1
+          ]
+        },
+        {
+          "pick": {
+            "prompt": [
+              [
+                1000,
+                32
+              ],
+              [
+                6000,
+                32
+              ]
+            ],
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1,
+          0
+        ]
+      }
+    },
+    {
+      "name": "tokens-at-the-command-lines-defaults-a-match-of-half-is-a-hit",
+      "matcher": "tokens",
+      "config": {
+        "cache_threshold": 0.3,
+        "balance_abs_threshold": 64,
+        "balance_rel_threshold": 1.5,
+        "block_size": 16,
+        "balance_token_usage_threshold": 1.0,
+        "overload_token_usage_threshold": 1.0
+      },
+      "workers": [
+        {
+          "in_flight": 2,
+          "state": "free",
+          "report": null
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "report": null
+        },
+        {
+          "in_flight": 2,
+          "state": "free",
+          "report": null
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "prompt": [
+              [
+                1000,
+                64
+              ]
+            ],
+            "tried": []
+          }
+        },
+        {
+          "loads": [
+            0,
+            3,
+            1
+          ]
+        },
+        {
+          "pick": {
+            "prompt": [
+              [
+                1000,
+                32
+              ],
+              [
+                6000,
+                32
+              ]
+            ],
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "name": "tokens-a-completion-frees-its-worker-for-the-next-miss",
+      "matcher": "tokens",
+      "config": {
+        "cache_threshold": 0.5,
+        "balance_abs_threshold": 32,
+        "balance_rel_threshold": 1.1,
+        "block_size": 16,
+        "balance_token_usage_threshold": 1.0,
+        "overload_token_usage_threshold": 1.0
+      },
+      "workers": [
+        {
+          "in_flight": 2,
+          "state": "free",
+          "report": null
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "report": null
+        },
+        {
+          "in_flight": 3,
+          "state": "free",
+          "report": null
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "prompt": [
+              [
+                1000,
+                64
+              ]
+            ],
+            "tried": []
+          }
+        },
+        {
+          "pick": {
+            "prompt": [
+              [
+                9000,
+                64
+              ]
+            ],
+            "tried": []
+          }
+        },
+        {
+          "complete": 0
+        },
+        {
+          "pick": {
+            "prompt": [
+              [
+                8000,
+                64
+              ]
+            ],
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1,
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "name": "tokens-the-deepest-holder-tried-is-a-miss-beside-a-shallower-holder",
+      "matcher": "tokens",
+      "config": {
+        "cache_threshold": 0.5,
+        "balance_abs_threshold": 32,
+        "balance_rel_threshold": 1.1,
+        "block_size": 16,
+        "balance_token_usage_threshold": 1.0,
+        "overload_token_usage_threshold": 1.0
+      },
+      "workers": [
+        {
+          "in_flight": 0,
+          "state": "free",
+          "report": null
+        },
+        {
+          "in_flight": 3,
+          "state": "free",
+          "report": null
+        },
+        {
+          "in_flight": 3,
+          "state": "free",
+          "report": null
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "prompt": [
+              [
+                1000,
+                64
+              ]
+            ],
+            "tried": []
+          }
+        },
+        {
+          "loads": [
+            3,
+            0,
+            3
+          ]
+        },
+        {
+          "pick": {
+            "prompt": [
+              [
+                1000,
+                48
+              ],
+              [
+                5000,
+                16
+              ]
+            ],
+            "tried": [
+              0
+            ]
+          }
+        },
+        {
+          "loads": [
+            1,
+            2,
+            0
+          ]
+        },
+        {
+          "pick": {
+            "prompt": [
+              [
+                1000,
+                64
+              ]
+            ],
+            "tried": [
+              0
+            ]
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          0,
+          1,
+          2
+        ]
+      }
+    },
+    {
+      "name": "tokens-a-holder-that-is-not-ready-is-a-miss-and-holds-again-when-it-is-back",
+      "matcher": "tokens",
+      "config": {
+        "cache_threshold": 0.5,
+        "balance_abs_threshold": 32,
+        "balance_rel_threshold": 1.1,
+        "block_size": 16,
+        "balance_token_usage_threshold": 1.0,
+        "overload_token_usage_threshold": 1.0
+      },
+      "workers": [
+        {
+          "in_flight": 0,
+          "state": "free",
+          "report": null
+        },
+        {
+          "in_flight": 3,
+          "state": "free",
+          "report": null
+        },
+        {
+          "in_flight": 3,
+          "state": "free",
+          "report": null
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "prompt": [
+              [
+                1000,
+                64
+              ]
+            ],
+            "tried": []
+          }
+        },
+        {
+          "states": [
+            "down",
+            "free",
+            "free"
+          ]
+        },
+        {
+          "loads": [
+            0,
+            2,
+            1
+          ]
+        },
+        {
+          "pick": {
+            "prompt": [
+              [
+                1000,
+                64
+              ]
+            ],
+            "tried": []
+          }
+        },
+        {
+          "states": [
+            "free",
+            "free",
+            "free"
+          ]
+        },
+        {
+          "loads": [
+            1,
+            0,
+            4
+          ]
+        },
+        {
+          "pick": {
+            "prompt": [
+              [
+                1000,
+                64
+              ]
+            ],
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          0,
+          2,
+          0
+        ]
+      }
+    },
+    {
+      "name": "tokens-a-holder-over-its-thresholds-is-a-miss",
+      "matcher": "tokens",
+      "config": {
+        "cache_threshold": 0.5,
+        "balance_abs_threshold": 32,
+        "balance_rel_threshold": 1.1,
+        "block_size": 16,
+        "balance_token_usage_threshold": 1.0,
+        "overload_token_usage_threshold": 1.0
+      },
+      "workers": [
+        {
+          "in_flight": 0,
+          "state": "free",
+          "report": null
+        },
+        {
+          "in_flight": 3,
+          "state": "free",
+          "report": null
+        },
+        {
+          "in_flight": 3,
+          "state": "free",
+          "report": null
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "prompt": [
+              [
+                1000,
+                64
+              ]
+            ],
+            "tried": []
+          }
+        },
+        {
+          "states": [
+            "over",
+            "free",
+            "free"
+          ]
+        },
+        {
+          "loads": [
+            0,
+            2,
+            1
+          ]
+        },
+        {
+          "pick": {
+            "prompt": [
+              [
+                1000,
+                64
+              ]
+            ],
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          0,
+          2
+        ]
+      }
+    },
+    {
+      "name": "tokens-under-the-kv-spread-gate-a-hot-holder-yields-to-the-expected-wait",
+      "matcher": "tokens",
+      "config": {
+        "cache_threshold": 0.5,
+        "balance_abs_threshold": 32,
+        "balance_rel_threshold": 1.1,
+        "block_size": 16,
+        "balance_token_usage_threshold": 0.3,
+        "overload_token_usage_threshold": 1.0
+      },
+      "workers": [
+        {
+          "in_flight": 0,
+          "state": "free",
+          "report": {
+            "running": 0,
+            "queued": 0,
+            "resident_tokens": null,
+            "waiting_tokens": 0,
+            "throughput": 0,
+            "kv_usage_permille": 100
+          }
+        },
+        {
+          "in_flight": 1,
+          "state": "free",
+          "report": {
+            "running": 0,
+            "queued": 0,
+            "resident_tokens": null,
+            "waiting_tokens": 0,
+            "throughput": 0,
+            "kv_usage_permille": 100
+          }
+        },
+        {
+          "in_flight": 2,
+          "state": "free",
+          "report": {
+            "running": 0,
+            "queued": 0,
+            "resident_tokens": null,
+            "waiting_tokens": 0,
+            "throughput": 0,
+            "kv_usage_permille": 100
+          }
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "prompt": [
+              [
+                1000,
+                64
+              ]
+            ],
+            "tried": []
+          }
+        },
+        {
+          "reports": [
+            {
+              "running": 0,
+              "queued": 0,
+              "resident_tokens": null,
+              "waiting_tokens": 0,
+              "throughput": 0,
+              "kv_usage_permille": 900
+            },
+            {
+              "running": 0,
+              "queued": 0,
+              "resident_tokens": null,
+              "waiting_tokens": 0,
+              "throughput": 0,
+              "kv_usage_permille": 100
+            },
+            {
+              "running": 0,
+              "queued": 0,
+              "resident_tokens": null,
+              "waiting_tokens": 0,
+              "throughput": 0,
+              "kv_usage_permille": 100
+            }
+          ]
+        },
+        {
+          "pick": {
+            "prompt": [
+              [
+                1000,
+                64
+              ]
+            ],
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          0,
+          1
+        ]
+      }
+    },
+    {
+      "name": "tokens-under-the-kv-ceiling-a-hot-holder-yields-to-the-expected-wait",
+      "matcher": "tokens",
+      "config": {
+        "cache_threshold": 0.5,
+        "balance_abs_threshold": 32,
+        "balance_rel_threshold": 1.1,
+        "block_size": 16,
+        "balance_token_usage_threshold": 1.0,
+        "overload_token_usage_threshold": 0.8
+      },
+      "workers": [
+        {
+          "in_flight": 0,
+          "state": "free",
+          "report": {
+            "running": 0,
+            "queued": 0,
+            "resident_tokens": null,
+            "waiting_tokens": 0,
+            "throughput": 0,
+            "kv_usage_permille": 100
+          }
+        },
+        {
+          "in_flight": 1,
+          "state": "free",
+          "report": {
+            "running": 0,
+            "queued": 0,
+            "resident_tokens": null,
+            "waiting_tokens": 0,
+            "throughput": 0,
+            "kv_usage_permille": 100
+          }
+        },
+        {
+          "in_flight": 2,
+          "state": "free",
+          "report": {
+            "running": 0,
+            "queued": 0,
+            "resident_tokens": null,
+            "waiting_tokens": 0,
+            "throughput": 0,
+            "kv_usage_permille": 100
+          }
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "prompt": [
+              [
+                1000,
+                64
+              ]
+            ],
+            "tried": []
+          }
+        },
+        {
+          "reports": [
+            {
+              "running": 0,
+              "queued": 0,
+              "resident_tokens": null,
+              "waiting_tokens": 0,
+              "throughput": 0,
+              "kv_usage_permille": 900
+            },
+            {
+              "running": 0,
+              "queued": 0,
+              "resident_tokens": null,
+              "waiting_tokens": 0,
+              "throughput": 0,
+              "kv_usage_permille": 100
+            },
+            {
+              "running": 0,
+              "queued": 0,
+              "resident_tokens": null,
+              "waiting_tokens": 0,
+              "throughput": 0,
+              "kv_usage_permille": 100
+            }
+          ]
+        },
+        {
+          "pick": {
+            "prompt": [
+              [
+                1000,
+                64
+              ]
+            ],
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          0,
+          1
+        ]
+      }
+    },
+    {
+      "name": "tokens-with-the-kv-gates-off-the-hot-holder-keeps-its-prefix",
+      "matcher": "tokens",
+      "config": {
+        "cache_threshold": 0.5,
+        "balance_abs_threshold": 32,
+        "balance_rel_threshold": 1.1,
+        "block_size": 16,
+        "balance_token_usage_threshold": 1.0,
+        "overload_token_usage_threshold": 1.0
+      },
+      "workers": [
+        {
+          "in_flight": 0,
+          "state": "free",
+          "report": {
+            "running": 0,
+            "queued": 0,
+            "resident_tokens": null,
+            "waiting_tokens": 0,
+            "throughput": 0,
+            "kv_usage_permille": 100
+          }
+        },
+        {
+          "in_flight": 1,
+          "state": "free",
+          "report": {
+            "running": 0,
+            "queued": 0,
+            "resident_tokens": null,
+            "waiting_tokens": 0,
+            "throughput": 0,
+            "kv_usage_permille": 100
+          }
+        },
+        {
+          "in_flight": 2,
+          "state": "free",
+          "report": {
+            "running": 0,
+            "queued": 0,
+            "resident_tokens": null,
+            "waiting_tokens": 0,
+            "throughput": 0,
+            "kv_usage_permille": 100
+          }
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "prompt": [
+              [
+                1000,
+                64
+              ]
+            ],
+            "tried": []
+          }
+        },
+        {
+          "reports": [
+            {
+              "running": 0,
+              "queued": 0,
+              "resident_tokens": null,
+              "waiting_tokens": 0,
+              "throughput": 0,
+              "kv_usage_permille": 900
+            },
+            {
+              "running": 0,
+              "queued": 0,
+              "resident_tokens": null,
+              "waiting_tokens": 0,
+              "throughput": 0,
+              "kv_usage_permille": 100
+            },
+            {
+              "running": 0,
+              "queued": 0,
+              "resident_tokens": null,
+              "waiting_tokens": 0,
+              "throughput": 0,
+              "kv_usage_permille": 100
+            }
+          ]
+        },
+        {
+          "pick": {
+            "prompt": [
+              [
+                1000,
+                64
+              ]
+            ],
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          0,
+          0
+        ]
+      }
+    },
+    {
+      "name": "tokens-a-miss-over-equal-loads-is-drawn",
+      "matcher": "tokens",
+      "config": {
+        "cache_threshold": 0.5,
+        "balance_abs_threshold": 32,
+        "balance_rel_threshold": 1.1,
+        "block_size": 16,
+        "balance_token_usage_threshold": 1.0,
+        "overload_token_usage_threshold": 1.0
+      },
+      "workers": [
+        {
+          "in_flight": 1,
+          "state": "free",
+          "report": null
+        },
+        {
+          "in_flight": 1,
+          "state": "free",
+          "report": null
+        },
+        {
+          "in_flight": 3,
+          "state": "free",
+          "report": null
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "prompt": [
+              [
+                9000,
+                64
+              ]
+            ],
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "counts": {
+          "draws": 6000,
+          "counts": [
+            3009,
+            2991,
+            0
+          ]
+        }
+      }
+    },
+    {
+      "name": "events-the-deepest-holder-keeps-the-request-and-equal-holders-go-by-load",
+      "matcher": "events",
+      "config": {
+        "cache_threshold": 0.5,
+        "balance_abs_threshold": 32,
+        "balance_rel_threshold": 1.1,
+        "block_size": 16,
+        "balance_token_usage_threshold": 1.0,
+        "overload_token_usage_threshold": 1.0
+      },
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "free",
+          "report": null
+        },
+        {
+          "in_flight": 1,
+          "state": "free",
+          "report": null
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "report": null
+        }
+      ],
+      "steps": [
+        {
+          "stored": {
+            "worker": 0,
+            "prompt": [
+              [
+                1000,
+                64
+              ]
+            ]
+          }
+        },
+        {
+          "stored": {
+            "worker": 1,
+            "prompt": [
+              [
+                1000,
+                32
+              ]
+            ]
+          }
+        },
+        {
+          "pick": {
+            "prompt": [
+              [
+                1000,
+                64
+              ]
+            ],
+            "tried": []
+          }
+        },
+        {
+          "pick": {
+            "prompt": [
+              [
+                1000,
+                32
+              ],
+              [
+                6000,
+                32
+              ]
+            ],
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          0,
+          1
+        ]
+      }
+    },
+    {
+      "name": "events-a-one-block-overlap-keeps-its-holder",
+      "matcher": "events",
+      "config": {
+        "cache_threshold": 0.5,
+        "balance_abs_threshold": 32,
+        "balance_rel_threshold": 1.1,
+        "block_size": 16,
+        "balance_token_usage_threshold": 1.0,
+        "overload_token_usage_threshold": 1.0
+      },
+      "workers": [
+        {
+          "in_flight": 2,
+          "state": "free",
+          "report": null
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "report": null
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "report": null
+        }
+      ],
+      "steps": [
+        {
+          "stored": {
+            "worker": 0,
+            "prompt": [
+              [
+                1000,
+                16
+              ]
+            ]
+          }
+        },
+        {
+          "pick": {
+            "prompt": [
+              [
+                1000,
+                64
+              ]
+            ],
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          0
+        ]
+      }
+    },
+    {
+      "name": "events-a-holder-over-the-count-gate-spills-and-holds-again-under-it",
+      "matcher": "events",
+      "config": {
+        "cache_threshold": 0.5,
+        "balance_abs_threshold": 32,
+        "balance_rel_threshold": 1.1,
+        "block_size": 16,
+        "balance_token_usage_threshold": 1.0,
+        "overload_token_usage_threshold": 1.0
+      },
+      "workers": [
+        {
+          "in_flight": 9,
+          "state": "free",
+          "report": null
+        },
+        {
+          "in_flight": 1,
+          "state": "free",
+          "report": null
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "report": null
+        }
+      ],
+      "steps": [
+        {
+          "stored": {
+            "worker": 0,
+            "prompt": [
+              [
+                1000,
+                64
+              ]
+            ]
+          }
+        },
+        {
+          "pick": {
+            "prompt": [
+              [
+                1000,
+                64
+              ]
+            ],
+            "tried": []
+          }
+        },
+        {
+          "loads": [
+            5,
+            1,
+            0
+          ]
+        },
+        {
+          "pick": {
+            "prompt": [
+              [
+                1000,
+                64
+              ]
+            ],
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          2,
+          0
+        ]
+      }
+    },
+    {
+      "name": "events-a-miss-goes-to-the-fewest-in-flight",
+      "matcher": "events",
+      "config": {
+        "cache_threshold": 0.5,
+        "balance_abs_threshold": 32,
+        "balance_rel_threshold": 1.1,
+        "block_size": 16,
+        "balance_token_usage_threshold": 1.0,
+        "overload_token_usage_threshold": 1.0
+      },
+      "workers": [
+        {
+          "in_flight": 2,
+          "state": "free",
+          "report": null
+        },
+        {
+          "in_flight": 1,
+          "state": "free",
+          "report": null
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "report": null
+        }
+      ],
+      "steps": [
+        {
+          "stored": {
+            "worker": 0,
+            "prompt": [
+              [
+                1000,
+                64
+              ]
+            ]
+          }
+        },
+        {
+          "pick": {
+            "prompt": [
+              [
+                9000,
+                64
+              ]
+            ],
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          2
+        ]
+      }
+    },
+    {
+      "name": "events-the-deepest-holder-tried-a-shallower-holder-takes-the-request",
+      "matcher": "events",
+      "config": {
+        "cache_threshold": 0.5,
+        "balance_abs_threshold": 32,
+        "balance_rel_threshold": 1.1,
+        "block_size": 16,
+        "balance_token_usage_threshold": 1.0,
+        "overload_token_usage_threshold": 1.0
+      },
+      "workers": [
+        {
+          "in_flight": 1,
+          "state": "free",
+          "report": null
+        },
+        {
+          "in_flight": 2,
+          "state": "free",
+          "report": null
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "report": null
+        }
+      ],
+      "steps": [
+        {
+          "stored": {
+            "worker": 0,
+            "prompt": [
+              [
+                1000,
+                64
+              ]
+            ]
+          }
+        },
+        {
+          "stored": {
+            "worker": 1,
+            "prompt": [
+              [
+                1000,
+                48
+              ]
+            ]
+          }
+        },
+        {
+          "pick": {
+            "prompt": [
+              [
+                1000,
+                64
+              ]
+            ],
+            "tried": [
+              0
+            ]
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1
+        ]
+      }
+    },
+    {
+      "name": "events-the-deepest-holder-over-its-thresholds-a-shallower-holder-takes-the-request",
+      "matcher": "events",
+      "config": {
+        "cache_threshold": 0.5,
+        "balance_abs_threshold": 32,
+        "balance_rel_threshold": 1.1,
+        "block_size": 16,
+        "balance_token_usage_threshold": 1.0,
+        "overload_token_usage_threshold": 1.0
+      },
+      "workers": [
+        {
+          "in_flight": 1,
+          "state": "free",
+          "report": null
+        },
+        {
+          "in_flight": 2,
+          "state": "free",
+          "report": null
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "report": null
+        }
+      ],
+      "steps": [
+        {
+          "states": [
+            "over",
+            "free",
+            "free"
+          ]
+        },
+        {
+          "stored": {
+            "worker": 0,
+            "prompt": [
+              [
+                1000,
+                64
+              ]
+            ]
+          }
+        },
+        {
+          "stored": {
+            "worker": 1,
+            "prompt": [
+              [
+                1000,
+                48
+              ]
+            ]
+          }
+        },
+        {
+          "pick": {
+            "prompt": [
+              [
+                1000,
+                64
+              ]
+            ],
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1
+        ]
+      }
+    },
+    {
+      "name": "events-a-removed-block-shortens-the-hold-and-the-last-one-ends-it",
+      "matcher": "events",
+      "config": {
+        "cache_threshold": 0.5,
+        "balance_abs_threshold": 32,
+        "balance_rel_threshold": 1.1,
+        "block_size": 16,
+        "balance_token_usage_threshold": 1.0,
+        "overload_token_usage_threshold": 1.0
+      },
+      "workers": [
+        {
+          "in_flight": 2,
+          "state": "free",
+          "report": null
+        },
+        {
+          "in_flight": 1,
+          "state": "free",
+          "report": null
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "report": null
+        }
+      ],
+      "steps": [
+        {
+          "stored": {
+            "worker": 0,
+            "prompt": [
+              [
+                1000,
+                64
+              ]
+            ]
+          }
+        },
+        {
+          "stored": {
+            "worker": 1,
+            "prompt": [
+              [
+                1000,
+                32
+              ]
+            ]
+          }
+        },
+        {
+          "stored": {
+            "worker": 2,
+            "prompt": [
+              [
+                7000,
+                16
+              ]
+            ]
+          }
+        },
+        {
+          "pick": {
+            "prompt": [
+              [
+                1000,
+                64
+              ]
+            ],
+            "tried": []
+          }
+        },
+        {
+          "removed": {
+            "worker": 0,
+            "prompt": [
+              [
+                1000,
+                64
+              ]
+            ],
+            "kept_blocks": 1
+          }
+        },
+        {
+          "pick": {
+            "prompt": [
+              [
+                1000,
+                64
+              ]
+            ],
+            "tried": []
+          }
+        },
+        {
+          "removed": {
+            "worker": 1,
+            "prompt": [
+              [
+                1000,
+                32
+              ]
+            ],
+            "kept_blocks": 0
+          }
+        },
+        {
+          "pick": {
+            "prompt": [
+              [
+                1000,
+                64
+              ]
+            ],
+            "tried": []
+          }
+        },
+        {
+          "removed": {
+            "worker": 0,
+            "prompt": [
+              [
+                1000,
+                64
+              ]
+            ],
+            "kept_blocks": 0
+          }
+        },
+        {
+          "pick": {
+            "prompt": [
+              [
+                1000,
+                64
+              ]
+            ],
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          0,
+          1,
+          0,
+          2
+        ]
+      }
+    },
+    {
+      "name": "events-at-the-command-lines-defaults-a-holder-under-the-factor-keeps-its-prefix",
+      "matcher": "events",
+      "config": {
+        "cache_threshold": 0.3,
+        "balance_abs_threshold": 64,
+        "balance_rel_threshold": 1.5,
+        "block_size": 16,
+        "balance_token_usage_threshold": 1.0,
+        "overload_token_usage_threshold": 1.0
+      },
+      "workers": [
+        {
+          "in_flight": 37,
+          "state": "free",
+          "report": null
+        },
+        {
+          "in_flight": 19,
+          "state": "free",
+          "report": null
+        },
+        {
+          "in_flight": 19,
+          "state": "free",
+          "report": null
+        }
+      ],
+      "steps": [
+        {
+          "stored": {
+            "worker": 0,
+            "prompt": [
+              [
+                1000,
+                64
+              ]
+            ]
+          }
+        },
+        {
+          "pick": {
+            "prompt": [
+              [
+                1000,
+                64
+              ]
+            ],
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          0
+        ]
+      }
+    },
+    {
+      "name": "events-at-the-command-lines-defaults-a-holder-over-the-factor-spills",
+      "matcher": "events",
+      "config": {
+        "cache_threshold": 0.3,
+        "balance_abs_threshold": 64,
+        "balance_rel_threshold": 1.5,
+        "block_size": 16,
+        "balance_token_usage_threshold": 1.0,
+        "overload_token_usage_threshold": 1.0
+      },
+      "workers": [
+        {
+          "in_flight": 39,
+          "state": "free",
+          "report": null
+        },
+        {
+          "in_flight": 19,
+          "state": "free",
+          "report": null
+        },
+        {
+          "in_flight": 18,
+          "state": "free",
+          "report": null
+        }
+      ],
+      "steps": [
+        {
+          "stored": {
+            "worker": 0,
+            "prompt": [
+              [
+                1000,
+                64
+              ]
+            ]
+          }
+        },
+        {
+          "pick": {
+            "prompt": [
+              [
+                1000,
+                64
+              ]
+            ],
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          2
+        ]
+      }
+    },
+    {
+      "name": "events-a-margin-under-the-floor-spills-a-holder-the-floor-would-keep",
+      "matcher": "events",
+      "config": {
+        "cache_threshold": 0.5,
+        "balance_abs_threshold": 2,
+        "balance_rel_threshold": 1.5,
+        "block_size": 16,
+        "balance_token_usage_threshold": 1.0,
+        "overload_token_usage_threshold": 1.0
+      },
+      "workers": [
+        {
+          "in_flight": 8,
+          "state": "free",
+          "report": null
+        },
+        {
+          "in_flight": 3,
+          "state": "free",
+          "report": null
+        },
+        {
+          "in_flight": 4,
+          "state": "free",
+          "report": null
+        }
+      ],
+      "steps": [
+        {
+          "stored": {
+            "worker": 0,
+            "prompt": [
+              [
+                1000,
+                64
+              ]
+            ]
+          }
+        },
+        {
+          "pick": {
+            "prompt": [
+              [
+                1000,
+                64
+              ]
+            ],
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1
+        ]
+      }
+    },
+    {
+      "name": "events-under-the-kv-spread-gate-a-hot-holder-yields-to-the-expected-wait",
+      "matcher": "events",
+      "config": {
+        "cache_threshold": 0.5,
+        "balance_abs_threshold": 32,
+        "balance_rel_threshold": 1.1,
+        "block_size": 16,
+        "balance_token_usage_threshold": 0.3,
+        "overload_token_usage_threshold": 1.0
+      },
+      "workers": [
+        {
+          "in_flight": 1,
+          "state": "free",
+          "report": {
+            "running": 0,
+            "queued": 0,
+            "resident_tokens": null,
+            "waiting_tokens": 0,
+            "throughput": 0,
+            "kv_usage_permille": 900
+          }
+        },
+        {
+          "in_flight": 1,
+          "state": "free",
+          "report": {
+            "running": 0,
+            "queued": 0,
+            "resident_tokens": null,
+            "waiting_tokens": 0,
+            "throughput": 0,
+            "kv_usage_permille": 100
+          }
+        },
+        {
+          "in_flight": 2,
+          "state": "free",
+          "report": {
+            "running": 0,
+            "queued": 0,
+            "resident_tokens": null,
+            "waiting_tokens": 0,
+            "throughput": 0,
+            "kv_usage_permille": 100
+          }
+        }
+      ],
+      "steps": [
+        {
+          "stored": {
+            "worker": 0,
+            "prompt": [
+              [
+                1000,
+                64
+              ]
+            ]
+          }
+        },
+        {
+          "pick": {
+            "prompt": [
+              [
+                1000,
+                64
+              ]
+            ],
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1
+        ]
+      }
+    },
+    {
+      "name": "events-with-the-kv-gates-off-the-hot-holder-keeps-the-request",
+      "matcher": "events",
+      "config": {
+        "cache_threshold": 0.5,
+        "balance_abs_threshold": 32,
+        "balance_rel_threshold": 1.1,
+        "block_size": 16,
+        "balance_token_usage_threshold": 1.0,
+        "overload_token_usage_threshold": 1.0
+      },
+      "workers": [
+        {
+          "in_flight": 1,
+          "state": "free",
+          "report": {
+            "running": 0,
+            "queued": 0,
+            "resident_tokens": null,
+            "waiting_tokens": 0,
+            "throughput": 0,
+            "kv_usage_permille": 900
+          }
+        },
+        {
+          "in_flight": 1,
+          "state": "free",
+          "report": {
+            "running": 0,
+            "queued": 0,
+            "resident_tokens": null,
+            "waiting_tokens": 0,
+            "throughput": 0,
+            "kv_usage_permille": 100
+          }
+        },
+        {
+          "in_flight": 2,
+          "state": "free",
+          "report": {
+            "running": 0,
+            "queued": 0,
+            "resident_tokens": null,
+            "waiting_tokens": 0,
+            "throughput": 0,
+            "kv_usage_permille": 100
+          }
+        }
+      ],
+      "steps": [
+        {
+          "stored": {
+            "worker": 0,
+            "prompt": [
+              [
+                1000,
+                64
+              ]
+            ]
+          }
+        },
+        {
+          "pick": {
+            "prompt": [
+              [
+                1000,
+                64
+              ]
+            ],
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          0
+        ]
+      }
+    },
+    {
+      "name": "events-equal-holders-at-equal-loads-are-drawn",
+      "matcher": "events",
+      "config": {
+        "cache_threshold": 0.5,
+        "balance_abs_threshold": 32,
+        "balance_rel_threshold": 1.1,
+        "block_size": 16,
+        "balance_token_usage_threshold": 1.0,
+        "overload_token_usage_threshold": 1.0
+      },
+      "workers": [
+        {
+          "in_flight": 2,
+          "state": "free",
+          "report": null
+        },
+        {
+          "in_flight": 2,
+          "state": "free",
+          "report": null
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "report": null
+        }
+      ],
+      "steps": [
+        {
+          "stored": {
+            "worker": 0,
+            "prompt": [
+              [
+                1000,
+                64
+              ]
+            ]
+          }
+        },
+        {
+          "stored": {
+            "worker": 1,
+            "prompt": [
+              [
+                1000,
+                64
+              ]
+            ]
+          }
+        },
+        {
+          "pick": {
+            "prompt": [
+              [
+                1000,
+                64
+              ]
+            ],
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "counts": {
+          "draws": 6000,
+          "counts": [
+            3013,
+            2987,
+            0
+          ]
+        }
+      }
+    },
+    {
+      "name": "text-a-holder-keeps-its-prefix-over-an-idle-worker",
+      "matcher": "text",
+      "config": {
+        "cache_threshold": 0.5,
+        "balance_abs_threshold": 32,
+        "balance_rel_threshold": 1.1,
+        "block_size": 16,
+        "balance_token_usage_threshold": 1.0,
+        "overload_token_usage_threshold": 1.0
+      },
+      "workers": [
+        {
+          "in_flight": 2,
+          "state": "free",
+          "report": null
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "report": null
+        },
+        {
+          "in_flight": 2,
+          "state": "free",
+          "report": null
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "prompt": [
+              [
+                100,
+                16
+              ]
+            ],
+            "tried": []
+          }
+        },
+        {
+          "loads": [
+            1,
+            3,
+            0
+          ]
+        },
+        {
+          "pick": {
+            "prompt": [
+              [
+                100,
+                12
+              ],
+              [
+                9000,
+                4
+              ]
+            ],
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "name": "text-a-match-at-the-threshold-is-a-miss",
+      "matcher": "text",
+      "config": {
+        "cache_threshold": 0.5,
+        "balance_abs_threshold": 32,
+        "balance_rel_threshold": 1.1,
+        "block_size": 16,
+        "balance_token_usage_threshold": 1.0,
+        "overload_token_usage_threshold": 1.0
+      },
+      "workers": [
+        {
+          "in_flight": 2,
+          "state": "free",
+          "report": null
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "report": null
+        },
+        {
+          "in_flight": 2,
+          "state": "free",
+          "report": null
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "prompt": [
+              [
+                100,
+                16
+              ]
+            ],
+            "tried": []
+          }
+        },
+        {
+          "loads": [
+            0,
+            3,
+            1
+          ]
+        },
+        {
+          "pick": {
+            "prompt": [
+              [
+                100,
+                8
+              ],
+              [
+                9000,
+                8
+              ]
+            ],
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1,
+          0
+        ]
+      }
+    },
+    {
+      "name": "text-a-holder-over-the-count-gate-spills",
+      "matcher": "text",
+      "config": {
+        "cache_threshold": 0.5,
+        "balance_abs_threshold": 32,
+        "balance_rel_threshold": 1.1,
+        "block_size": 16,
+        "balance_token_usage_threshold": 1.0,
+        "overload_token_usage_threshold": 1.0
+      },
+      "workers": [
+        {
+          "in_flight": 2,
+          "state": "free",
+          "report": null
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "report": null
+        },
+        {
+          "in_flight": 2,
+          "state": "free",
+          "report": null
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "prompt": [
+              [
+                100,
+                16
+              ]
+            ],
+            "tried": []
+          }
+        },
+        {
+          "loads": [
+            1,
+            9,
+            0
+          ]
+        },
+        {
+          "pick": {
+            "prompt": [
+              [
+                100,
+                16
+              ]
+            ],
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1,
+          2
+        ]
+      }
+    }
+  ]
+}

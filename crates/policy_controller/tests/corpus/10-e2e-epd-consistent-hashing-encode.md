@@ -24,14 +24,24 @@ profiles:
     pick: best
   prefill:
     filter: [healthy, not-overloaded, has-capacity, not-tried]
-    score: [prefix-affinity, kv-pressure, least-load, warmup-slice]
-    pick: best
+    score:
+      - warmup-slice: { weight: 8 }
+      - prefix-affinity: { weight: 4 }
+      - kv-pressure
+      - least-load
+    pick:
+      best: { sample: 16 }
   decode:
     filter: [healthy, not-overloaded, has-room, not-tried]
-    score: [prefix-affinity, kv-pressure, least-load, warmup-slice]
-    pick: best
+    score:
+      - warmup-slice: { weight: 8 }
+      - prefix-affinity: { weight: 4 }
+      - kv-pressure
+      - least-load
+    pick:
+      best: { sample: 16 }
 bindings:
-  - match: { model: "*", phase: [encode, prefill, decode] }
+  - match: { model: "*" }
     plan: epd
     profiles: { encode: encode, prefill: prefill, decode: decode }
 ```

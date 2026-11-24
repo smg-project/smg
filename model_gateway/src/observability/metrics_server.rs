@@ -5,11 +5,12 @@ use std::{net::SocketAddr, time::Duration};
 
 use axum::{extract::State, response::IntoResponse, routing::get, Router};
 use metrics_exporter_prometheus::PrometheusHandle;
+use smg_worker::metrics::series as worker_series;
 use tokio::task::JoinHandle;
 use tracing::{error, info};
 
 use super::metrics::UPKEEP_INTERVAL_SECS;
-use crate::{config::bind_socket_addr, worker::metrics::series as worker_series};
+use crate::config::bind_socket_addr;
 
 #[derive(Clone)]
 struct MetricsState {

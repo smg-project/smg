@@ -50,7 +50,10 @@
 //! region and its closing marker ends it, so prose has no place inside: [`Framing::Framed`]
 //! reports text where the list should be, a `[` that opens no list of calls included, as
 //! `Malformed` where the bare list takes it for content. The engine picks it for a table with a
-//! row into the arguments state.
+//! row into the arguments state. [`Framing::FramedObjectOrList`] is that region for a table with
+//! no call marker whose model also writes one call as an object alone between the markers
+//! (Command): a `{` at the first byte is one call and what follows it reads as under
+//! [`Framing::ObjectOrList`], and text in place of the calls is malformed all the same.
 //!
 //! Under a JSON schema (a required call's list, [`Framing::Forced`]) the output reads as under
 //! [`Framing::ObjectOrList`] with no marker and differs at the end of the stream alone: the
@@ -59,7 +62,7 @@
 //! behind its arguments are refused ([`crate::tagged::refuse`]), where the other framings return
 //! them as `Malformed`.
 //!
-//! The four are the one [`Framing`] the assembler takes at construction, the family's call marker
+//! The five are the one [`Framing`] the assembler takes at construction, the family's call marker
 //! inside the one that reads it, and the engine's factory maps the table's call syntax to it; the
 //! object reader and the stages around it are the same under every framing. A call written as one
 //! object between a table's markers (`CallSyntax::Json`) is the object reader itself
@@ -85,13 +88,14 @@ pub struct Assembler {
     carried: String,
     /// Objects that began, so that prose after the `[` is told from text between objects.
     objects: u32,
-    /// Whether a `{` at the first byte is one call alone ([`Framing::ObjectOrList`]).
+    /// Whether a `{` at the first byte is one call alone ([`Framing::ObjectOrList`],
+    /// [`Framing::FramedObjectOrList`], [`Framing::Forced`]).
     lone_object: bool,
     /// Whether a `[` opened a list, so that a finished object returns to the list or ends the
     /// output's calls.
     listed: bool,
-    /// Whether markers frame the list ([`Framing::Framed`]): text in place of it is malformed,
-    /// not prose.
+    /// Whether markers frame the calls ([`Framing::Framed`], and with `lone_object`
+    /// [`Framing::FramedObjectOrList`]): text in place of them is malformed, not prose.
     framed: bool,
     /// Whether a schema holds the output to the list ([`Framing::Forced`]): what the end of the
     /// stream leaves of an open list is refused, never text.
@@ -133,6 +137,10 @@ pub enum Framing {
     /// The list between the table's markers (Llama Nemotron): a `[` opens it, and anything else
     /// is malformed, since prose has no place inside the markers.
     Framed,
+    /// One object, several with `;` or whitespace between them, or the list between the table's
+    /// markers (Command): a `{` is one call alone, a `[` opens the list, and anything else is
+    /// malformed, as under [`Self::Framed`].
+    FramedObjectOrList,
     /// One object, several with `;` or whitespace between them, or a list alone in the output
     /// (the `json` table): a `{` is one call alone, a `[` opens the list, and anything else is
     /// prose.
@@ -151,14 +159,17 @@ impl Framing {
     /// Whether a `{` at the first byte is one call alone, and another object after it, behind a
     /// `;` or whitespace, the next.
     fn lone_object(self) -> bool {
-        matches!(self, Self::ObjectOrList { .. } | Self::Forced)
+        matches!(
+            self,
+            Self::ObjectOrList { .. } | Self::FramedObjectOrList | Self::Forced
+        )
     }
 
     /// The family's call marker the output may open with, where the framing names one.
     fn opener(self) -> Option<&'static str> {
         match self {
             Self::ObjectOrList { opener } => opener,
-            Self::Bare | Self::Framed | Self::Forced => None,
+            Self::Bare | Self::Framed | Self::FramedObjectOrList | Self::Forced => None,
         }
     }
 }
@@ -197,7 +208,7 @@ impl Assembler {
             objects: 0,
             lone_object: framing.lone_object(),
             listed: false,
-            framed: framing == Framing::Framed,
+            framed: matches!(framing, Framing::Framed | Framing::FramedObjectOrList),
             forced: framing == Framing::Forced,
             prose_after: false,
             released: false,
@@ -1190,33 +1201,39 @@ mod tests {
 
     #[test]
     fn between_markers_text_in_place_of_the_list_is_malformed() {
-        for output in [
-            "not a list",
-            "  [Note: draft] ok",
-            "{\"name\": \"f\", \"arguments\": {}}",
+        // Text in place of the calls is malformed whole under both framings between markers;
+        // the object alone is a call only where the framing reads one.
+        let alone = "{\"name\": \"f\", \"arguments\": {}}";
+        for (framing, output, held) in [
+            (Framing::Framed, "not a list", 0),
+            (Framing::Framed, "  [Note: draft] ok", 0),
+            (Framing::Framed, alone, 0),
+            (Framing::Framed, LIST, 2),
+            (Framing::FramedObjectOrList, "not a list", 0),
+            (Framing::FramedObjectOrList, "  [Note: draft] ok", 0),
+            (Framing::FramedObjectOrList, alone, 1),
+            (Framing::FramedObjectOrList, LIST, 2),
         ] {
-            let mut assembler = Assembler::new(0, ids(), Framing::Framed);
+            let mut assembler = Assembler::new(0, ids(), framing);
             let mut out = Events::new();
             assembler.feed(output, &mut out);
             assembler.close(&mut out);
             let events = out.drain();
-            assert_eq!(bytes(&events), output, "{output:?}");
-            assert!(calls(&events).is_empty(), "{output:?}");
-            assert!(
-                events
-                    .iter()
-                    .all(|event| matches!(event, Event::Malformed { .. })),
-                "{output:?}: {events:?}"
-            );
+            assert_eq!(bytes(&events), output, "{framing:?} {output:?}");
+            assert_eq!(calls(&events).len(), held, "{framing:?} {output:?}");
+            let malformed = |event: &Event| matches!(event, Event::Malformed { .. });
+            if held == 0 {
+                assert!(
+                    events.iter().all(malformed),
+                    "{framing:?} {output:?}: {events:?}"
+                );
+            } else {
+                assert!(
+                    !events.iter().any(malformed),
+                    "{framing:?} {output:?}: {events:?}"
+                );
+            }
         }
-        // The list itself reads the same between markers.
-        let mut assembler = Assembler::new(0, ids(), Framing::Framed);
-        let mut out = Events::new();
-        assembler.feed(LIST, &mut out);
-        assembler.close(&mut out);
-        let events = out.drain();
-        assert_eq!(bytes(&events), LIST);
-        assert_eq!(calls(&events).len(), 2);
     }
 
     #[test]

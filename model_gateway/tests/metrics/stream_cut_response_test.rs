@@ -23,12 +23,12 @@ use smg::{
     middleware::AuthConfig,
     routers::RouterFactory,
     server::{build_app, health::ProbeState, AppState},
-    worker::{RuntimeType, Worker, WorkerType},
 };
 use smg_test_harness::{
     grpc_harness::{grpc_router_config, grpc_test_context_with_tokenizer, grpc_worker},
     scripted_tokenizer::ScriptedTokenizer,
 };
+use smg_worker::identity::basic::{RuntimeType, Worker, WorkerType};
 use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle};
 use tower::ServiceExt;
 

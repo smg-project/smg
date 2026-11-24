@@ -21,15 +21,15 @@ use serde_json::{json, Value};
 use smg::{
     config::{RetryConfig, RouterConfig, RoutingMode},
     middleware::TenantRequestMeta,
-    routers::RouterFactory,
+    routers::{grpc::backend_client::BasicWorkerBuilder, RouterFactory},
     tenant::TenantKey,
-    worker::{
-        health::circuit_breaker::CircuitState, BasicWorkerBuilder, ConnectionMode, RuntimeType,
-        Worker, WorkerType,
-    },
 };
 use smg_grpc_client::{
     stamp_media_code, tokenspeed_scheduler::tokenspeed_proto as ts, WorkerMediaFault,
+};
+use smg_worker::{
+    health::circuit_breaker::CircuitState,
+    identity::basic::{ConnectionMode, RuntimeType, Worker, WorkerType},
 };
 use tokio::{net::TcpListener, time::timeout};
 use tonic::{transport::Server, Request, Response, Status};
@@ -177,13 +177,23 @@ async fn answers_of(
     (answers, worker)
 }
 
+/// The gateway's own sentences for a media fetch that failed, by whose fault.
+const FETCH_FAILED_CLIENT: &str =
+    "The media could not be fetched from the reference the request gives: check the reference and what it leads to";
+const FETCH_FAILED_TRANSIENT: &str =
+    "The media could not be fetched from its URL for now: its host did not answer in time or failed; a retry may succeed";
+
 /// Twenty requests whose media the worker could not fetch, in each of the
 /// forms the worker reports it, are each answered for the media (the
 /// request's own reference a 400 `invalid_request_error`, an origin that
 /// does not deliver right now a 502 `server_error`, under the code the
 /// worker names, and `media_fetch_failed` from a worker that names none) and
 /// leave the worker's breaker closed and the worker in rotation; the request
-/// after them is served.
+/// after them is served. A fetch that failed, named by the worker's code or
+/// by the connector's fetch words, is answered in the gateway's own sentence
+/// for the fault, never in the worker's words for it; media refused as the
+/// request sent it, or for its size, keeps the worker's words, under its code
+/// or from a worker that names the fault alone.
 #[tokio::test]
 async fn media_faults_are_answered_for_the_media_and_leave_the_worker_in_rotation() {
     let cases = [
@@ -195,6 +205,7 @@ async fn media_faults_are_answered_for_the_media_and_leave_the_worker_in_rotatio
             )),
             "media_fetch_failed",
             StatusCode::BAD_REQUEST,
+            Some(FETCH_FAILED_CLIENT),
         ),
         (
             "the media host's fault, reported in the trailer",
@@ -204,6 +215,7 @@ async fn media_faults_are_answered_for_the_media_and_leave_the_worker_in_rotatio
             )),
             "media_fetch_failed",
             StatusCode::BAD_GATEWAY,
+            Some(FETCH_FAILED_TRANSIENT),
         ),
         (
             "a size refusal, with its code in the trailer",
@@ -216,6 +228,7 @@ async fn media_faults_are_answered_for_the_media_and_leave_the_worker_in_rotatio
             ),
             "media_too_large",
             StatusCode::BAD_REQUEST,
+            None,
         ),
         (
             "media refused as the request sent it, with its code in the trailer",
@@ -228,6 +241,7 @@ async fn media_faults_are_answered_for_the_media_and_leave_the_worker_in_rotatio
             ),
             "invalid_multimodal_request",
             StatusCode::BAD_REQUEST,
+            None,
         ),
         (
             "a worker that predates the trailer",
@@ -237,9 +251,34 @@ async fn media_faults_are_answered_for_the_media_and_leave_the_worker_in_rotatio
             ),
             "media_fetch_failed",
             StatusCode::BAD_GATEWAY,
+            Some(FETCH_FAILED_TRANSIENT),
+        ),
+        (
+            "a fetch failure in other words, with its code in the trailer",
+            stamp_media_code(
+                WorkerMediaFault::Client.stamp(Status::invalid_argument(
+                    "Failed to finalize multimodal tracker: the reference could not be followed",
+                )),
+                "media_fetch_failed",
+            ),
+            "media_fetch_failed",
+            StatusCode::BAD_REQUEST,
+            Some(FETCH_FAILED_CLIENT),
+        ),
+        (
+            "media refused as the request sent it, by a worker that names the fault alone",
+            WorkerMediaFault::Client.stamp(Status::invalid_argument(
+                "Failed to finalize multimodal tracker: data URL parse error: missing comma \
+                 in data url",
+            )),
+            "media_fetch_failed",
+            StatusCode::BAD_REQUEST,
+            None,
         ),
     ];
-    for (name, refusal, code, status) in cases {
+    for (name, refusal, code, status, sentence) in cases {
+        // The gateway's sentence where the case names one, else the worker's own words.
+        let message = sentence.map_or_else(|| refusal.message().to_string(), str::to_string);
         let kind = if status.is_server_error() {
             "server_error"
         } else {
@@ -254,6 +293,11 @@ async fn media_faults_are_answered_for_the_media_and_leave_the_worker_in_rotatio
             );
             assert_eq!(
                 answer.body["error"]["code"], code,
+                "{name}: {}",
+                answer.body
+            );
+            assert_eq!(
+                answer.body["error"]["message"], message,
                 "{name}: {}",
                 answer.body
             );

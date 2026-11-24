@@ -22,15 +22,15 @@ use crate::{
     },
 };
 
-pub const QWEN3_OMNI_MEAN: [f64; 3] = [0.5; 3];
-pub const QWEN3_OMNI_STD: [f64; 3] = [0.5; 3];
-pub const DEFAULT_IMAGE_MIN_PIXELS: usize = 3_136;
-pub const DEFAULT_IMAGE_MAX_PIXELS: usize = 12_845_056;
-pub const DEFAULT_VIDEO_MIN_PIXELS: usize = 128 * 32 * 32;
-pub const DEFAULT_VIDEO_MAX_PIXELS: usize = 768 * 32 * 32;
-pub const DEFAULT_PATCH_SIZE: usize = 16;
-pub const DEFAULT_MERGE_SIZE: usize = 2;
-pub const DEFAULT_TEMPORAL_PATCH_SIZE: usize = 2;
+pub(crate) const QWEN3_OMNI_MEAN: [f64; 3] = [0.5; 3];
+pub(crate) const QWEN3_OMNI_STD: [f64; 3] = [0.5; 3];
+pub(crate) const DEFAULT_IMAGE_MIN_PIXELS: usize = 3_136;
+pub(crate) const DEFAULT_IMAGE_MAX_PIXELS: usize = 12_845_056;
+pub(crate) const DEFAULT_VIDEO_MIN_PIXELS: usize = 128 * 32 * 32;
+pub(crate) const DEFAULT_VIDEO_MAX_PIXELS: usize = 768 * 32 * 32;
+pub(crate) const DEFAULT_PATCH_SIZE: usize = 16;
+pub(crate) const DEFAULT_MERGE_SIZE: usize = 2;
+pub(crate) const DEFAULT_TEMPORAL_PATCH_SIZE: usize = 2;
 
 /// The `fps` argument of the checkpoint's processor. It computes a clip's
 /// `video_second_per_grid`, the time one temporal patch spans in the
@@ -51,7 +51,7 @@ impl Default for Qwen3OmniVisionProcessor {
 }
 
 impl Qwen3OmniVisionProcessor {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::with_limits(
             DEFAULT_IMAGE_MIN_PIXELS,
             DEFAULT_IMAGE_MAX_PIXELS,
@@ -129,8 +129,13 @@ impl Qwen3OmniVisionProcessor {
         self
     }
 
+    /// See [`QwenVLProcessorBase::validate`].
+    pub(crate) fn validate(&self) -> Result<(), TransformError> {
+        self.inner.validate()
+    }
+
     /// Build a processor for a resolved image or video configuration.
-    pub fn from_config_for(config: &PreProcessorConfig, modality: Modality) -> Self {
+    pub(crate) fn from_config_for(config: &PreProcessorConfig, modality: Modality) -> Self {
         if modality == Modality::Video && !config.is_image_only_processor_type() {
             Self::from_video_preprocessor_config(config)
         } else {
@@ -192,6 +197,11 @@ impl VisionPreProcessor for Qwen3OmniVisionProcessor {
 
     fn calculate_num_tokens(&self, width: u32, height: u32) -> Result<usize, TransformError> {
         self.inner.calculate_num_tokens(width, height)
+    }
+
+    /// Number of stored patch elements for one image.
+    fn image_input_elements(&self, width: u32, height: u32) -> Option<usize> {
+        self.inner.image_input_elements(width, height)
     }
 
     fn model_name(&self) -> &'static str {
@@ -322,5 +332,17 @@ mod tests {
                 "sampled at {sampled_fps}"
             );
         }
+    }
+
+    #[test]
+    fn the_element_estimate_of_an_image_is_the_bases() {
+        let omni = Qwen3OmniVisionProcessor::new();
+        // 4096x3136 is exactly the default max_pixels and a multiple of the
+        // 32-pixel factor, so it is kept as is: 3136 * 4096 * 3 * 2.
+        assert_eq!(omni.image_input_elements(4096, 3136), Some(77_070_336));
+        assert_eq!(
+            omni.image_input_elements(4096, 3136),
+            omni.inner.image_input_elements(4096, 3136)
+        );
     }
 }

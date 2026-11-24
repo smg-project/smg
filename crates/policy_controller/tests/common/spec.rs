@@ -5,7 +5,7 @@
 
 use std::{fmt::Debug, future::Future, time::Duration};
 
-use smg_policy_controller::proto::{
+use smg_policy_controller::service::proto::{
     policy_controller_client::PolicyControllerClient, ApplyMode, ApplyRequest, ApplyResult,
     GetPolicySpecRequest, PolicySpecDocument,
 };

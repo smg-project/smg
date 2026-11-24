@@ -48,7 +48,10 @@ impl Default for Qwen3AudioParams {
 }
 
 impl Qwen3AudioParams {
-    pub fn from_configs(model_config: &Value, preprocessor_config: &PreProcessorConfig) -> Self {
+    pub(crate) fn from_configs(
+        model_config: &Value,
+        preprocessor_config: &PreProcessorConfig,
+    ) -> Self {
         let mut params = Self::default();
 
         if let Some(value) = preprocessor_config.get_extra::<usize>("sampling_rate") {
@@ -142,7 +145,7 @@ impl Qwen3AudioProcessor {
         Self::with_params(Qwen3AudioParams::default())
     }
 
-    pub fn with_params(params: Qwen3AudioParams) -> Self {
+    pub(crate) fn with_params(params: Qwen3AudioParams) -> Self {
         Self {
             params,
             frontend: OnceLock::new(),
@@ -443,7 +446,6 @@ impl MelFrontend {
         out: &mut [f32],
     ) -> Result<(), TransformError> {
         let n_fft = params.n_fft;
-        let fft_bins = n_fft / 2 + 1;
         reflect_pad_into(
             &mut scratch.padded,
             samples,
@@ -476,37 +478,16 @@ impl MelFrontend {
                 &mut scratch.fft_scratch,
             );
 
-            // The power term of each bin once per frame; `mul_add`, as the product reads it,
-            // not `re * re + im * im`, which rounds twice and differs on real spectra (the
-            // sibling frontends hoist the unfused form; this one must not copy it).
-            for k in 0..count {
-                let spectrum = &scratch.frames[k * n_fft..k * n_fft + fft_bins];
-                let power = &mut scratch.power[k * fft_bins..(k + 1) * fft_bins];
-                for (value, bin) in power.iter_mut().zip(spectrum) {
-                    *value = bin.re.mul_add(bin.re, bin.im * bin.im);
-                }
-            }
-
-            // The mel product over each filter's band: a zero weight adds nothing to a finite
-            // power, so the band's sum is the full row's sum, bit for bit. Where a power
-            // overflowed, a zero weight times infinity is NaN and the full row keeps it.
-            for k in 0..count {
-                let power = &scratch.power[k * fft_bins..(k + 1) * fft_bins];
-                let finite = power.iter().all(|value| value.is_finite());
-                for mel in 0..params.n_mels {
-                    let (first, last) = if finite {
-                        self.bands[mel]
-                    } else {
-                        (0, fft_bins)
-                    };
-                    let weights = &self.filters[mel * fft_bins + first..mel * fft_bins + last];
-                    let mut value = 0.0_f32;
-                    for (weight, power) in weights.iter().zip(&power[first..last]) {
-                        value = weight.mul_add(*power, value);
-                    }
-                    out[mel * frame_count + frame + k] = value.max(1e-10).log10();
-                }
-            }
+            // The chunk's power terms and mel band products (see `power_and_mel_rows`).
+            power_and_mel_rows(
+                &scratch.frames[..count * n_fft],
+                &mut scratch.power,
+                &self.filters,
+                &self.bands,
+                n_fft,
+                (frame, frame_count),
+                out,
+            );
             frame += count;
         }
 
@@ -516,6 +497,54 @@ impl MelFrontend {
             *value = (value.max(floor) + 4.0) / 4.0;
         }
         Ok(())
+    }
+}
+
+/// The power terms and the band products of one chunk's frames, as `log_mel` reads them. Built a
+/// second time for AVX2 and FMA, where each `mul_add` is one instruction and not a call into
+/// the math library; the fused operation is the same one, so the bits are the same on both.
+#[cfg_attr(
+    target_arch = "x86_64",
+    multiversion::multiversion(targets("x86_64+avx2+fma"))
+)]
+fn power_and_mel_rows(
+    frames: &[Complex32],
+    power_rows: &mut [f32],
+    filters: &[f32],
+    bands: &[(usize, usize)],
+    n_fft: usize,
+    span: (usize, usize),
+    out: &mut [f32],
+) {
+    let (frame, frame_count) = span;
+    let count = frames.len() / n_fft;
+    let fft_bins = n_fft / 2 + 1;
+    let n_mels = bands.len();
+    // The power term of each bin once per frame; `mul_add`, as the product reads it,
+    // not `re * re + im * im`, which rounds twice and differs on real spectra (the
+    // sibling frontends hoist the unfused form; this one must not copy it).
+    for k in 0..count {
+        let spectrum = &frames[k * n_fft..k * n_fft + fft_bins];
+        let power = &mut power_rows[k * fft_bins..(k + 1) * fft_bins];
+        for (value, bin) in power.iter_mut().zip(spectrum) {
+            *value = bin.re.mul_add(bin.re, bin.im * bin.im);
+        }
+    }
+    // The mel product over each filter's band: a zero weight adds nothing to a finite
+    // power, so the band's sum is the full row's sum, bit for bit. Where a power
+    // overflowed, a zero weight times infinity is NaN and the full row keeps it.
+    for k in 0..count {
+        let power = &power_rows[k * fft_bins..(k + 1) * fft_bins];
+        let finite = power.iter().all(|value| value.is_finite());
+        for mel in 0..n_mels {
+            let (first, last) = if finite { bands[mel] } else { (0, fft_bins) };
+            let weights = &filters[mel * fft_bins + first..mel * fft_bins + last];
+            let mut value = 0.0_f32;
+            for (weight, power) in weights.iter().zip(&power[first..last]) {
+                value = weight.mul_add(*power, value);
+            }
+            out[mel * frame_count + frame + k] = value.max(1e-10).log10();
+        }
     }
 }
 

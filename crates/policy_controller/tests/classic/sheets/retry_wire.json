@@ -1,0 +1,387 @@
+{
+  "recorded_from": "a4935a5acd15151641b1988e234016a95fd172da",
+  "policy": "retry-wire",
+  "rows": [
+    {
+      "name": "a-retry-stays-on-its-runtime-and-its-transport",
+      "shed": false,
+      "workers": [
+        {
+          "runtime": "sglang",
+          "transport": "grpc",
+          "state": "free"
+        },
+        {
+          "runtime": "vllm",
+          "transport": "grpc",
+          "state": "free"
+        },
+        {
+          "runtime": "vllm",
+          "transport": "zmq",
+          "state": "free"
+        },
+        {
+          "runtime": "tokenspeed",
+          "transport": "grpc",
+          "state": "free"
+        }
+      ],
+      "requests": [
+        {},
+        {
+          "wire": {
+            "runtime": "vllm",
+            "transport": "grpc"
+          }
+        },
+        {
+          "wire": {
+            "runtime": "vllm",
+            "transport": "zmq"
+          }
+        },
+        {
+          "wire": {
+            "runtime": "sglang",
+            "transport": "grpc"
+          }
+        },
+        {
+          "wire": {
+            "runtime": "tokenspeed",
+            "transport": "grpc"
+          }
+        },
+        {
+          "wire": {
+            "runtime": "sglang",
+            "transport": "zmq"
+          }
+        },
+        {
+          "wire": {
+            "runtime": "tokenspeed",
+            "transport": "zmq"
+          }
+        }
+      ],
+      "answers": [
+        {
+          "placed": [
+            0,
+            1,
+            2,
+            3
+          ]
+        },
+        {
+          "placed": [
+            1
+          ]
+        },
+        {
+          "placed": [
+            2
+          ]
+        },
+        {
+          "placed": [
+            0
+          ]
+        },
+        {
+          "placed": [
+            3
+          ]
+        },
+        {
+          "refused": {
+            "status": 404,
+            "code": "model_not_found",
+            "retry_after": false,
+            "message": "No worker available for model 'm'"
+          }
+        },
+        {
+          "refused": {
+            "status": 404,
+            "code": "model_not_found",
+            "retry_after": false,
+            "message": "No worker available for model 'm'"
+          }
+        }
+      ]
+    },
+    {
+      "name": "the-workers-of-a-wire-share-its-retries",
+      "shed": false,
+      "workers": [
+        {
+          "runtime": "vllm",
+          "transport": "grpc",
+          "state": "free"
+        },
+        {
+          "runtime": "sglang",
+          "transport": "grpc",
+          "state": "free"
+        },
+        {
+          "runtime": "vllm",
+          "transport": "grpc",
+          "state": "free"
+        },
+        {
+          "runtime": "vllm",
+          "transport": "zmq",
+          "state": "free"
+        }
+      ],
+      "requests": [
+        {
+          "wire": {
+            "runtime": "vllm",
+            "transport": "grpc"
+          }
+        },
+        {
+          "wire": {
+            "runtime": "sglang",
+            "transport": "grpc"
+          }
+        }
+      ],
+      "answers": [
+        {
+          "placed": [
+            0,
+            2
+          ]
+        },
+        {
+          "placed": [
+            1
+          ]
+        }
+      ]
+    },
+    {
+      "name": "a-wire-whose-worker-is-down-is-not-left",
+      "shed": false,
+      "workers": [
+        {
+          "runtime": "vllm",
+          "transport": "grpc",
+          "state": "down"
+        },
+        {
+          "runtime": "sglang",
+          "transport": "grpc",
+          "state": "free"
+        },
+        {
+          "runtime": "vllm",
+          "transport": "zmq",
+          "state": "free"
+        }
+      ],
+      "requests": [
+        {
+          "wire": {
+            "runtime": "vllm",
+            "transport": "grpc"
+          }
+        }
+      ],
+      "answers": [
+        {
+          "refused": {
+            "status": 503,
+            "code": "no_available_workers",
+            "retry_after": true,
+            "message": "All workers for model 'm' are unavailable (unhealthy or circuit breaker open)"
+          }
+        }
+      ]
+    },
+    {
+      "name": "a-worker-of-the-wire-over-its-thresholds-yields-to-one-under-them",
+      "shed": false,
+      "workers": [
+        {
+          "runtime": "vllm",
+          "transport": "grpc",
+          "state": "over"
+        },
+        {
+          "runtime": "vllm",
+          "transport": "grpc",
+          "state": "free"
+        },
+        {
+          "runtime": "sglang",
+          "transport": "grpc",
+          "state": "free"
+        }
+      ],
+      "requests": [
+        {
+          "wire": {
+            "runtime": "vllm",
+            "transport": "grpc"
+          }
+        }
+      ],
+      "answers": [
+        {
+          "placed": [
+            1
+          ]
+        }
+      ]
+    },
+    {
+      "name": "a-wire-over-on-every-worker-is-steered",
+      "shed": false,
+      "workers": [
+        {
+          "runtime": "vllm",
+          "transport": "grpc",
+          "state": "over"
+        },
+        {
+          "runtime": "vllm",
+          "transport": "grpc",
+          "state": "over"
+        },
+        {
+          "runtime": "sglang",
+          "transport": "grpc",
+          "state": "free"
+        }
+      ],
+      "requests": [
+        {
+          "wire": {
+            "runtime": "vllm",
+            "transport": "grpc"
+          }
+        }
+      ],
+      "answers": [
+        {
+          "placed": [
+            0,
+            1
+          ]
+        }
+      ]
+    },
+    {
+      "name": "a-wire-over-on-every-worker-is-shed-where-shedding-is-on",
+      "shed": true,
+      "workers": [
+        {
+          "runtime": "vllm",
+          "transport": "grpc",
+          "state": "over"
+        },
+        {
+          "runtime": "vllm",
+          "transport": "grpc",
+          "state": "over"
+        },
+        {
+          "runtime": "sglang",
+          "transport": "grpc",
+          "state": "free"
+        }
+      ],
+      "requests": [
+        {
+          "wire": {
+            "runtime": "vllm",
+            "transport": "grpc"
+          }
+        }
+      ],
+      "answers": [
+        {
+          "refused": {
+            "status": 503,
+            "code": "worker_overload_protection_shed",
+            "retry_after": true,
+            "message": "All workers for model 'm' are overloaded"
+          }
+        }
+      ]
+    },
+    {
+      "name": "a-wire-no-worker-of-the-model-is-on",
+      "shed": false,
+      "workers": [
+        {
+          "runtime": "sglang",
+          "transport": "grpc",
+          "state": "free"
+        },
+        {
+          "runtime": "vllm",
+          "transport": "zmq",
+          "state": "free"
+        }
+      ],
+      "requests": [
+        {
+          "wire": {
+            "runtime": "vllm",
+            "transport": "grpc"
+          }
+        },
+        {
+          "wire": {
+            "runtime": "tokenspeed",
+            "transport": "grpc"
+          }
+        }
+      ],
+      "answers": [
+        {
+          "refused": {
+            "status": 404,
+            "code": "model_not_found",
+            "retry_after": false,
+            "message": "No worker available for model 'm'"
+          }
+        },
+        {
+          "refused": {
+            "status": 404,
+            "code": "model_not_found",
+            "retry_after": false,
+            "message": "No worker available for model 'm'"
+          }
+        }
+      ]
+    },
+    {
+      "name": "a-model-no-worker-serves",
+      "shed": false,
+      "workers": [],
+      "requests": [
+        {}
+      ],
+      "answers": [
+        {
+          "refused": {
+            "status": 404,
+            "code": "model_not_found",
+            "retry_after": false,
+            "message": "No worker available for model 'm'"
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -16,6 +16,7 @@ mod pd_anchor;
 mod pd_usage;
 mod sse_bytes;
 mod symphony_chat;
+mod symphony_choice;
 mod thinking_display;
 mod usage;
 mod usage_chunk;
@@ -829,14 +830,16 @@ fn the_chat_writer_returns_at_the_bound_and_resumes_with_the_next_event() {
 /// three shapes.
 #[test]
 fn text_delta_logprobs_frames_write_the_bytes_of_the_serialized_choice() {
-    use std::borrow::Cow;
+    use std::{borrow::Cow, cell::Cell};
 
     use openai_protocol::chat::{ChatMessageDeltaRef, ChatStreamChoiceRef};
     use smg_grpc_client::{trtllm_proto as trtllm, vllm_proto as vllm};
 
     use crate::routers::grpc::{proto_wrapper::ProtoOutputLogProbs, utils::convert_proto_logprobs};
 
+    let decodes = Cell::new(0);
     let decode = |id: u32| -> String {
+        decodes.set(decodes.get() + 1);
         match id {
             1 => "he".to_string(),
             2 => " said \"hi\" \\".to_string(),
@@ -874,7 +877,7 @@ fn text_delta_logprobs_frames_write_the_bytes_of_the_serialized_choice() {
         trtllm::TokenLogprob {
             token_id: 1,
             logprob: -0.125,
-            top_logprobs: vec![candidate(1, -0.125), candidate(3, -1.5)],
+            top_logprobs: vec![candidate(3, -1.5), candidate(1, -2.0)],
         },
         trtllm::TokenLogprob {
             token_id: 6,
@@ -887,15 +890,21 @@ fn text_delta_logprobs_frames_write_the_bytes_of_the_serialized_choice() {
         token_ids: vec![],
         top_logprobs: vec![],
     };
-    let views = [
-        ProtoOutputLogProbs::Vllm(&columns),
-        ProtoOutputLogProbs::Trtllm(&records),
-        ProtoOutputLogProbs::Vllm(&empty),
+    // Counts include the chosen tokens and the requested candidates with different IDs.
+    let cases = [
+        (ProtoOutputLogProbs::Vllm(&columns), [4, 5, 7, 11, 11]),
+        (ProtoOutputLogProbs::Trtllm(&records), [2, 3, 3, 3, 3]),
+        (ProtoOutputLogProbs::Vllm(&empty), [0; 5]),
     ];
     let frame = ChatChunkFrame::new("chatcmpl-1", "model-x", 1_700_000_000, Some("v7"));
-    for view in views {
-        for requested in [0usize, 1, 2, 6, 20] {
+    for (view, counts) in cases {
+        for (requested, expected_decodes) in [0, 1, 2, 6, 20].into_iter().zip(counts) {
             let converted = convert_proto_logprobs(view, Some(requested), decode);
+            assert_eq!(
+                decodes.replace(0),
+                expected_decodes,
+                "unary top {requested}"
+            );
             for field in [TextDelta::Content, TextDelta::Reasoning] {
                 for text in ["a", "he said \"hi\" \\ done", ""] {
                     let choice = ChatStreamChoiceRef {
@@ -933,6 +942,11 @@ fn text_delta_logprobs_frames_write_the_bytes_of_the_serialized_choice() {
                             decode,
                             usage.as_ref(),
                             emit_usage_null,
+                        );
+                        assert_eq!(
+                            decodes.replace(0),
+                            expected_decodes,
+                            "stream top {requested}"
                         );
                         assert_eq!(
                             got,

@@ -467,6 +467,12 @@ pub enum ResponseTool {
     /// matching `local_shell_call_output` item.
     #[serde(rename = "local_shell")]
     LocalShell,
+
+    /// Tool-search tool — `{ type: "tool_search", execution?, description?, parameters? }`.
+    ///
+    /// Emitted by Codex and Responses clients using deferred tool loading.
+    #[serde(rename = "tool_search")]
+    ToolSearch(ToolSearchTool),
 }
 
 impl ResponseTool {
@@ -489,8 +495,24 @@ impl ResponseTool {
             ResponseTool::Shell(_) => "shell",
             ResponseTool::ApplyPatch => "apply_patch",
             ResponseTool::LocalShell => "local_shell",
+            ResponseTool::ToolSearch(_) => "tool_search",
         }
     }
+}
+
+/// Tool-search declaration (`type: "tool_search"`).
+///
+/// Spec / Codex: `{ type: "tool_search", execution?, description?, parameters? }`.
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ToolSearchTool {
+    /// Execution target (`"client"` or `"server"`).
+    pub execution: Option<String>,
+    /// Optional description surfaced to the model.
+    pub description: Option<String>,
+    /// Optional JSON Schema parameters for client-executed tool search.
+    pub parameters: Option<Value>,
 }
 
 /// Payload carried by [`ResponseTool::Namespace`].
@@ -512,6 +534,9 @@ pub struct NamespaceToolDef {
     /// namespaces and hosted-tool leakage that the parent `ResponseTool`
     /// enum would otherwise allow.
     pub tools: Vec<NamespaceTool>,
+    /// Optional namespace-level deferred loading hint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub defer_loading: Option<bool>,
 }
 
 /// Element type accepted inside a [`NamespaceToolDef`]'s `tools` array.
@@ -1207,6 +1232,7 @@ pub struct McpTool {
     pub server_url: Option<String>,
     pub authorization: Option<String>,
     /// Custom headers to send to MCP server (from request payload, not HTTP headers)
+    #[serde(serialize_with = "crate::common::serialize_with_sorted_keys")]
     pub headers: Option<HashMap<String, String>>,
     pub server_label: String,
     pub server_description: Option<String>,
@@ -1320,12 +1346,16 @@ pub struct WebSearchPreviewTool {
 pub struct WebSearchTool {
     /// Whether the tool may fetch live external sources rather than cached results.
     pub external_web_access: Option<bool>,
+    /// Whether the tool may fetch indexed web sources.
+    pub indexed_web_access: Option<bool>,
     /// Optional domain allowlist applied to candidate sources.
     pub filters: Option<WebSearchFilters>,
     /// Search-result context token budget. Spec enum: `"default" | "unlimited"`.
     pub return_token_budget: Option<WebSearchReturnTokenBudget>,
     /// Search context budget. Spec enum: `"low" | "medium" | "high"`.
     pub search_context_size: Option<WebSearchContextSize>,
+    /// Content kinds the search may return (e.g. `"text"`, `"image"`).
+    pub search_content_types: Option<Vec<String>>,
     /// Approximate user location used to bias results.
     pub user_location: Option<WebSearchUserLocation>,
 }
@@ -1811,6 +1841,37 @@ pub enum MessagePhase {
     FinalAnswer,
 }
 
+/// Content part carried inside a [`ResponseInputOutputItem::AgentMessage`].
+///
+/// Mirrors Codex's `AgentMessageInputContent` (`input_text` or
+/// `encrypted_content`). Unknown part kinds fail deserialization fast so
+/// callers get a clear error naming the offending part rather than silently
+/// dropping sub-agent payload.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AgentMessageContentPart {
+    InputText { text: String },
+    EncryptedContent { encrypted_content: String },
+}
+
+impl AgentMessageContentPart {
+    /// Plaintext carried by this part, or `None` for encrypted payloads.
+    pub fn text(&self) -> Option<&str> {
+        match self {
+            Self::InputText { text } => Some(text),
+            Self::EncryptedContent { .. } => None,
+        }
+    }
+
+    /// The wire-format type name of this part.
+    pub const fn type_name(&self) -> &'static str {
+        match self {
+            Self::InputText { .. } => "input_text",
+            Self::EncryptedContent { .. } => "encrypted_content",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]
@@ -1830,11 +1891,17 @@ pub enum ResponseInputOutputItem {
     #[serde(rename = "reasoning")]
     #[non_exhaustive]
     Reasoning {
-        id: String,
-        #[serde(default)]
+        /// Optional on input: Codex models `reasoning.id` as optional and
+        /// strips non-conforming IDs before resending history.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(default, deserialize_with = "deserialize_null_as_empty_vec")]
         summary: Vec<SummaryTextContent>,
-        #[serde(skip_serializing_if = "Vec::is_empty")]
-        #[serde(default)]
+        #[serde(
+            default,
+            deserialize_with = "deserialize_null_as_empty_vec",
+            skip_serializing_if = "Vec::is_empty"
+        )]
         content: Vec<ResponseReasoningContent>,
         /// Encrypted reasoning payload for gpt-5 / o-series round-trip via
         /// `previous_response_id`. Opaque to SMG; preserved verbatim.
@@ -2194,6 +2261,31 @@ pub enum ResponseInputOutputItem {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
+    /// `type: "additional_tools"` — inline tool declarations injected at a
+    /// specific point in the conversation `input` (OpenAI Responses API /
+    /// Codex Responses Lite).
+    #[serde(rename = "additional_tools")]
+    AdditionalTools {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        role: Option<String>,
+        tools: Vec<ResponseTool>,
+    },
+    /// `type: "agent_message"` — inter-agent message emitted by Codex native
+    /// multi-agent (`spawn_agent` / `send_message`) to deliver a parent task
+    /// or peer message to a sub-agent.
+    #[serde(rename = "agent_message")]
+    AgentMessage {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        author: String,
+        recipient: String,
+        content: Vec<AgentMessageContentPart>,
+        /// Codex stamps agent mail with creation time and content attribution.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        internal_chat_message_metadata_passthrough: Option<serde_json::Map<String, Value>>,
+    },
     #[serde(untagged)]
     SimpleInputMessage {
         content: StringOrContentParts,
@@ -2396,9 +2488,40 @@ fn content_parts(field: &str, parts: &[Value]) -> Result<Vec<ResponseContentPart
         .collect()
 }
 
+/// The parts under `field` of an `agent_message`, each from its buffered value
+/// so a refusal names the part and its field.
+fn agent_message_content_parts(
+    field: &str,
+    parts: &[Value],
+) -> Result<Vec<AgentMessageContentPart>, String> {
+    parts
+        .iter()
+        .enumerate()
+        .map(|(index, part)| {
+            AgentMessageContentPart::deserialize(part).map_err(|error| {
+                let reason = error.to_string();
+                let located = part.as_object().and_then(|fields| {
+                    refused_field(fields, &reason, |entries| {
+                        AgentMessageContentPart::deserialize(
+                            MapDeserializer::<_, serde_json::Error>::new(entries.iter().copied()),
+                        )
+                        .err()
+                        .map(|error| error.to_string())
+                    })
+                });
+                match located {
+                    Some(name) => format!("{field}[{index}].{name}: {reason}"),
+                    None => format!("{field}[{index}]: {reason}"),
+                }
+            })
+        })
+        .collect()
+}
+
 /// A typed item's refusal from the derived reader, named. When the item
 /// carries content parts (a `message`'s `content`, a `function_call_output`'s
-/// `output`) and serde refuses one on its own, that part's refusal. An
+/// `output`, an `agent_message`'s `content`) and serde refuses one on its own,
+/// that part's refusal. An
 /// `item_reference`, the untagged shape with a `type` of its own, is refused
 /// for its `id` alone, named by the field reader. Otherwise the words of the
 /// tagged shapes alone (see [`TaggedItem`]): the derived reader's fallback to
@@ -2409,15 +2532,21 @@ fn content_parts(field: &str, parts: &[Value]) -> Result<Vec<ResponseContentPart
 /// without a `type`, and for one the tagged shapes read.
 fn typed_item_refusal(item: &Value, derived: serde_json::Error) -> String {
     let kind = item.get("type").and_then(Value::as_str);
-    let parts = match kind {
-        Some("message") => Some("content"),
-        Some("function_call_output") => Some("output"),
+    let refused_part = match kind {
+        Some("message") => item
+            .get("content")
+            .and_then(Value::as_array)
+            .and_then(|parts| content_parts("content", parts).err()),
+        Some("function_call_output") => item
+            .get("output")
+            .and_then(Value::as_array)
+            .and_then(|parts| content_parts("output", parts).err()),
+        Some("agent_message") => item
+            .get("content")
+            .and_then(Value::as_array)
+            .and_then(|parts| agent_message_content_parts("content", parts).err()),
         _ => None,
     };
-    let refused_part = parts.and_then(|field| {
-        let parts = item.get(field)?.as_array()?;
-        content_parts(field, parts).err()
-    });
     if let Some(refusal) = refused_part {
         return refusal;
     }
@@ -2492,10 +2621,11 @@ enum TaggedItem {
     },
     #[serde(rename = "reasoning")]
     Reasoning {
-        id: String,
         #[serde(default)]
+        id: Option<String>,
+        #[serde(default, deserialize_with = "deserialize_null_as_empty_vec")]
         summary: Vec<SummaryTextContent>,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "deserialize_null_as_empty_vec")]
         content: Vec<ResponseReasoningContent>,
         #[serde(default)]
         encrypted_content: Option<String>,
@@ -2674,6 +2804,24 @@ enum TaggedItem {
         tools: Vec<McpToolInfo>,
         #[serde(default)]
         error: Option<String>,
+    },
+    #[serde(rename = "additional_tools")]
+    AdditionalTools {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(default)]
+        role: Option<String>,
+        tools: Vec<ResponseTool>,
+    },
+    #[serde(rename = "agent_message")]
+    AgentMessage {
+        #[serde(default)]
+        id: Option<String>,
+        author: String,
+        recipient: String,
+        content: Vec<AgentMessageContentPart>,
+        #[serde(default)]
+        internal_chat_message_metadata_passthrough: Option<serde_json::Map<String, Value>>,
     },
 }
 
@@ -3067,12 +3215,12 @@ pub enum ResponseOutputItem {
     #[non_exhaustive]
     Reasoning {
         id: String,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "deserialize_null_as_empty_vec")]
         summary: Vec<SummaryTextContent>,
         /// The reasoning text. The public API does not require the key and
-        /// often leaves it out, so an item written without it reads as
-        /// having none.
-        #[serde(default)]
+        /// often leaves it out (or writes `null`), so an item written without
+        /// it reads as having none.
+        #[serde(default, deserialize_with = "deserialize_null_as_empty_vec")]
         content: Vec<ResponseReasoningContent>,
         /// Encrypted reasoning payload for gpt-5 / o-series round-trip.
         /// Opaque to SMG; preserved verbatim.
@@ -3914,6 +4062,7 @@ pub struct ResponsesRequest {
     /// string values up to 512 characters (the public API's limits)
     #[serde(skip_serializing_if = "Option::is_none")]
     #[validate(custom(function = "validate_metadata"))]
+    #[serde(serialize_with = "crate::common::serialize_with_sorted_keys")]
     pub metadata: Option<HashMap<String, Value>>,
 
     /// Model to use
@@ -4191,25 +4340,32 @@ impl Default for ResponsesRequest {
 
 impl Normalizable for ResponsesRequest {
     /// Normalize the request by applying defaults:
-    /// 1. Apply tool_choice defaults based on tools presence
+    /// 1. Apply tool_choice defaults based on tools presence (including inline
+    ///    `additional_tools` declarations so an empty top-level `tools: []`
+    ///    does not silently default to `"none"` and disable inline tools)
     /// 2. Apply parallel_tool_calls defaults
     /// 3. Apply store field defaults
     fn normalize(&mut self) {
-        // 1. Apply tool_choice defaults
+        let has_declared_tools = all_declared_tools(self).next().is_some();
+
+        // 1. Apply tool_choice defaults (preserve any caller-supplied value)
         if self.tool_choice.is_none() {
-            if let Some(tools) = &self.tools {
-                let choice_value = if tools.is_empty() {
-                    ToolChoiceOptions::None
-                } else {
-                    ToolChoiceOptions::Auto
-                };
-                self.tool_choice = Some(ResponsesToolChoice::Options(choice_value));
+            if has_declared_tools {
+                self.tool_choice = Some(ResponsesToolChoice::Options(ToolChoiceOptions::Auto));
+            } else if self.tools.is_some()
+                && self.previous_response_id.is_none()
+                && self.conversation.is_none()
+            {
+                // A continuation can inherit inline tools. Leave its choice
+                // open until the backend has loaded the preceding turn.
+                self.tool_choice = Some(ResponsesToolChoice::Options(ToolChoiceOptions::None));
             }
-            // If tools is None, leave tool_choice as None (don't set it)
+            // If neither top-level `tools` nor inline `additional_tools` is
+            // present, leave tool_choice as None.
         }
 
         // 2. Apply default for parallel_tool_calls if tools are present
-        if self.parallel_tool_calls.is_none() && self.tools.is_some() {
+        if self.parallel_tool_calls.is_none() && (self.tools.is_some() || has_declared_tools) {
             self.parallel_tool_calls = Some(true);
         }
 
@@ -4223,6 +4379,10 @@ impl Normalizable for ResponsesRequest {
 impl GenerationRequest for ResponsesRequest {
     fn is_stream(&self) -> bool {
         self.stream.unwrap_or(false)
+    }
+
+    fn max_output_tokens(&self) -> Option<u32> {
+        self.max_output_tokens
     }
 
     fn get_model(&self) -> Option<&str> {
@@ -4268,7 +4428,12 @@ impl GenerationRequest for ResponsesRequest {
                                 }
                             }
                         }
-                        ResponseInputOutputItem::FunctionToolCall { .. }
+                        ResponseInputOutputItem::AgentMessage { content, .. } => content
+                            .iter()
+                            .filter_map(AgentMessageContentPart::text)
+                            .for_each(&mut append_text),
+                        ResponseInputOutputItem::AdditionalTools { .. }
+                        | ResponseInputOutputItem::FunctionToolCall { .. }
                         | ResponseInputOutputItem::FunctionCallOutput { .. }
                         | ResponseInputOutputItem::McpApprovalRequest { .. }
                         | ResponseInputOutputItem::McpApprovalResponse { .. }
@@ -4330,13 +4495,35 @@ pub fn validate_conversation_id(conv: &ConversationRef) -> Result<(), Validation
     Ok(())
 }
 
+/// Iterate over every tool declared on the request: top-level `tools` first,
+/// followed by tools declared inline via `additional_tools` items in `input`.
+fn all_declared_tools(request: &ResponsesRequest) -> impl Iterator<Item = (&ResponseTool, bool)> {
+    let top_level = request
+        .tools
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(|tool| (tool, false));
+    let inline = match &request.input {
+        ResponseInput::Items(items) => items.as_slice(),
+        ResponseInput::Text(_) => &[],
+    }
+    .iter()
+    .flat_map(|item| match item {
+        ResponseInputOutputItem::AdditionalTools { tools, .. } => tools.as_slice(),
+        _ => &[],
+    })
+    .map(|tool| (tool, true));
+    top_level.chain(inline)
+}
+
 /// Validates tool_choice requires tools and references exist
 fn validate_tool_choice_with_tools(request: &ResponsesRequest) -> Result<(), ValidationError> {
     let Some(tool_choice) = &request.tool_choice else {
         return Ok(());
     };
 
-    let has_tools = request.tools.as_ref().is_some_and(|t| !t.is_empty());
+    let has_tools = all_declared_tools(request).next().is_some();
     // `none` and `auto` name no tool, so they stand without tools (with nothing
     // to call, `auto` answers in text as an omitted `tool_choice` does); Codex
     // sends `tools: []` with `tool_choice: "auto"` when it compacts a
@@ -4359,18 +4546,23 @@ fn validate_tool_choice_with_tools(request: &ResponsesRequest) -> Result<(), Val
         return Ok(());
     }
 
-    // Extract function tool names from ResponseTools
-    // INVARIANT: has_tools is true here, so tools is Some and non-empty
-    let Some(tools) = request.tools.as_ref() else {
-        return Ok(());
-    };
-    let function_tool_names: Vec<&str> = tools
-        .iter()
-        .filter_map(|t| match t {
-            ResponseTool::Function(ft) => Some(ft.function.name.as_str()),
-            _ => None,
-        })
-        .collect();
+    // Extract function tool names from top-level tools and inline additional_tools
+    let mut function_tool_names: Vec<&str> = Vec::new();
+    for (tool, from_additional_tools) in all_declared_tools(request) {
+        match tool {
+            ResponseTool::Function(ft) => function_tool_names.push(ft.function.name.as_str()),
+            ResponseTool::Namespace(namespace)
+                if from_additional_tools && namespace.name == "functions" =>
+            {
+                for member in &namespace.tools {
+                    if let NamespaceTool::Function(ft) = member {
+                        function_tool_names.push(ft.function.name.as_str());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
 
     // Validate tool references exist
     match tool_choice {
@@ -4379,14 +4571,23 @@ fn validate_tool_choice_with_tools(request: &ResponsesRequest) -> Result<(), Val
             // the underlying wire shape (flat vs. legacy nested) — both are
             // normalized at deserialize time.
             if let Some(name) = tool_choice.function_name() {
-                let found = tools.iter().any(|tool| match (tool, choice.namespace.as_deref()) {
-                    (ResponseTool::Function(function), None) => function.function.name == name,
-                    (ResponseTool::Namespace(namespace), Some(selected_namespace)) => {
-                        namespace.name == selected_namespace && namespace.tools.iter().any(|member| {
-                            matches!(member, NamespaceTool::Function(function) if function.function.name == name)
-                        })
+                let found = all_declared_tools(request).any(|(tool, from_additional_tools)| {
+                    match (tool, choice.namespace.as_deref()) {
+                        (ResponseTool::Function(function), None) => function.function.name == name,
+                        (ResponseTool::Namespace(namespace), None)
+                            if from_additional_tools && namespace.name == "functions" =>
+                        {
+                            namespace.tools.iter().any(|member| {
+                                matches!(member, NamespaceTool::Function(function) if function.function.name == name)
+                            })
+                        }
+                        (ResponseTool::Namespace(namespace), Some(selected_namespace)) => {
+                            namespace.name == selected_namespace && namespace.tools.iter().any(|member| {
+                                matches!(member, NamespaceTool::Function(function) if function.function.name == name)
+                            })
+                        }
+                        _ => false,
                     }
-                    _ => false,
                 });
                 if !found {
                     return Err(invalid(
@@ -4486,7 +4687,7 @@ fn validate_responses_cross_parameters(request: &ResponsesRequest) -> Result<(),
 fn validate_openai_structured_output_rules(
     request: &ResponsesRequest,
 ) -> Result<(), ValidationError> {
-    for tool in request.tools.as_deref().unwrap_or_default() {
+    for (tool, _) in all_declared_tools(request) {
         match tool {
             ResponseTool::Function(function_tool) => {
                 validate_strict_function_schema(&function_tool.function)?;
@@ -4567,6 +4768,9 @@ fn request_mentions_json(request: &ResponsesRequest) -> bool {
                     matches!(part, ResponseContentPart::InputText { text } if mentions(text))
                 }),
             },
+            ResponseInputOutputItem::AgentMessage { content, .. } => content.iter().any(|part| {
+                matches!(part, AgentMessageContentPart::InputText { text } if mentions(text))
+            }),
             _ => false,
         }
         }),
@@ -4678,8 +4882,8 @@ fn validate_response_input(input: &ResponseInput) -> Result<(), ValidationError>
                 return Err(invalid("input_items_empty", "Input items cannot be empty"));
             }
             // Validate each item has valid content
-            for item in items {
-                validate_input_item(item)?;
+            for (item_idx, item) in items.iter().enumerate() {
+                validate_input_item(item, item_idx)?;
             }
         }
     }
@@ -4687,8 +4891,25 @@ fn validate_response_input(input: &ResponseInput) -> Result<(), ValidationError>
 }
 
 /// Validates individual input items have valid content
-fn validate_input_item(item: &ResponseInputOutputItem) -> Result<(), ValidationError> {
+fn validate_input_item(
+    item: &ResponseInputOutputItem,
+    item_idx: usize,
+) -> Result<(), ValidationError> {
     match item {
+        ResponseInputOutputItem::AdditionalTools { role, tools, .. } => {
+            if let Some(role) = role {
+                validate_input_message_role(role)?;
+            }
+            validate_response_tools_at(tools, &format!("input[{item_idx}].tools"))?;
+        }
+        ResponseInputOutputItem::AgentMessage { content, .. } => {
+            if content.is_empty() {
+                return Err(invalid(
+                    "message_content_empty",
+                    "Agent message content cannot be empty",
+                ));
+            }
+        }
         ResponseInputOutputItem::Message { content, role, .. } => {
             validate_input_message_role(role)?;
             if content.is_empty() {
@@ -4788,21 +5009,22 @@ fn validate_input_item(item: &ResponseInputOutputItem) -> Result<(), ValidationE
     Ok(())
 }
 
-/// A function's place in `tools` as a refusal names it: a top-level function's
-/// index, or its namespace's index and its own inside the namespace. It is
-/// written only into a refusal, so a function that passes formats no place.
+/// A function's place in a tool array (`tools` or `input[i].tools`) as a
+/// refusal names it: a direct function's index, or its namespace's index and
+/// its own inside the namespace. It is written only into a refusal, so a
+/// function that passes formats no place.
 #[derive(Clone, Copy)]
-enum FunctionPlace {
-    Tool(usize),
-    Member(usize, usize),
+enum FunctionPlace<'a> {
+    Tool(&'a str, usize),
+    Member(&'a str, usize, usize),
 }
 
-impl std::fmt::Display for FunctionPlace {
+impl std::fmt::Display for FunctionPlace<'_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
         match *self {
-            Self::Tool(tool) => write!(formatter, "tools[{tool}]"),
-            Self::Member(namespace, member) => {
-                write!(formatter, "tools[{namespace}].tools[{member}]")
+            Self::Tool(prefix, tool) => write!(formatter, "{prefix}[{tool}]"),
+            Self::Member(prefix, namespace, member) => {
+                write!(formatter, "{prefix}[{namespace}].tools[{member}]")
             }
         }
     }
@@ -4815,7 +5037,7 @@ impl std::fmt::Display for FunctionPlace {
 /// each of them also `null`.
 fn validate_function_tool_keys(
     function: &Function,
-    at: FunctionPlace,
+    at: FunctionPlace<'_>,
 ) -> Result<(), ValidationError> {
     for key in FunctionTool::TOOL_KEYS {
         let Some(value) = function.extra.get(*key) else {
@@ -4851,7 +5073,7 @@ fn validate_function_tool_keys(
 /// its own.
 fn validate_function_parameters(
     function: &Function,
-    at: FunctionPlace,
+    at: FunctionPlace<'_>,
 ) -> Result<(), ValidationError> {
     let schema = function.parameters_schema();
     if schema.is_object() {
@@ -4868,6 +5090,13 @@ fn validate_function_parameters(
 
 /// Validates ResponseTool structure based on tool type
 fn validate_response_tools(tools: &[ResponseTool]) -> Result<(), ValidationError> {
+    validate_response_tools_at(tools, "tools")
+}
+
+/// Validates a ResponseTool array, naming any refusal under `prefix`
+/// (`"tools"` for top-level declarations or `"input[i].tools"` for inline
+/// `additional_tools`).
+fn validate_response_tools_at(tools: &[ResponseTool], prefix: &str) -> Result<(), ValidationError> {
     // MCP server_label must be present and unique (case-insensitive).
     let mut seen_mcp_labels: HashSet<String> = HashSet::new();
 
@@ -4880,9 +5109,9 @@ fn validate_response_tools(tools: &[ResponseTool]) -> Result<(), ValidationError
             ResponseTool::Function(function_tool) => {
                 let function = &function_tool.function;
                 if function.name.is_empty() {
-                    return Err(empty_tool_name(&format!("tools[{idx}].name")));
+                    return Err(empty_tool_name(&format!("{prefix}[{idx}].name")));
                 }
-                let at = FunctionPlace::Tool(idx);
+                let at = FunctionPlace::Tool(prefix, idx);
                 validate_function_parameters(function, at)?;
                 validate_function_tool_keys(function, at)?;
             }
@@ -4890,7 +5119,7 @@ fn validate_response_tools(tools: &[ResponseTool]) -> Result<(), ValidationError
             // name for it.
             ResponseTool::Custom(custom) => {
                 if custom.name.is_empty() {
-                    return Err(empty_tool_name(&format!("tools[{idx}].name")));
+                    return Err(empty_tool_name(&format!("{prefix}[{idx}].name")));
                 }
             }
             // A namespace has a name, and so has each of its members: the
@@ -4899,7 +5128,7 @@ fn validate_response_tools(tools: &[ResponseTool]) -> Result<(), ValidationError
             // parameters are held to a top-level function's rule.
             ResponseTool::Namespace(namespace) => {
                 if namespace.name.is_empty() {
-                    return Err(empty_tool_name(&format!("tools[{idx}].name")));
+                    return Err(empty_tool_name(&format!("{prefix}[{idx}].name")));
                 }
                 for (member_idx, member) in namespace.tools.iter().enumerate() {
                     let name = match member {
@@ -4908,11 +5137,11 @@ fn validate_response_tools(tools: &[ResponseTool]) -> Result<(), ValidationError
                     };
                     if name.is_empty() {
                         return Err(empty_tool_name(&format!(
-                            "tools[{idx}].tools[{member_idx}].name"
+                            "{prefix}[{idx}].tools[{member_idx}].name"
                         )));
                     }
                     if let NamespaceTool::Function(function_tool) = member {
-                        let at = FunctionPlace::Member(idx, member_idx);
+                        let at = FunctionPlace::Member(prefix, idx, member_idx);
                         validate_function_parameters(&function_tool.function, at)?;
                         validate_function_tool_keys(&function_tool.function, at)?;
                     }
@@ -4923,7 +5152,7 @@ fn validate_response_tools(tools: &[ResponseTool]) -> Result<(), ValidationError
             ResponseTool::LocalShell => {
                 return Err(invalid(
                     "tool_not_supported",
-                    format!("Invalid 'tools[{idx}]': the local_shell tool is not supported."),
+                    format!("Invalid '{prefix}[{idx}]': the local_shell tool is not supported."),
                 ));
             }
             _ => {}
@@ -4933,7 +5162,7 @@ fn validate_response_tools(tools: &[ResponseTool]) -> Result<(), ValidationError
             if raw_label.is_empty() {
                 return Err(invalid(
                     "missing_required_parameter",
-                    format!("Missing required parameter: 'tools[{idx}].server_label'."),
+                    format!("Missing required parameter: '{prefix}[{idx}].server_label'."),
                 ));
             }
 
@@ -4956,7 +5185,9 @@ fn validate_response_tools(tools: &[ResponseTool]) -> Result<(), ValidationError
             if !seen_mcp_labels.insert(normalized) {
                 return Err(invalid(
                     "mcp_tool_duplicate_server_label",
-                    format!("Duplicate MCP server_label '{raw_label}' found in 'tools' parameter."),
+                    format!(
+                        "Duplicate MCP server_label '{raw_label}' found in '{prefix}' parameter."
+                    ),
                 ));
             }
 
@@ -5045,6 +5276,34 @@ pub fn without_outputs_of_missing_calls(
         .collect()
 }
 
+/// `items` without the tool calls that only an output among `skipped`
+/// answers, items of the same history that are not replayed: a call replays
+/// only with its output, as an output only with its call. A call with its
+/// output among `items` stays, whatever `skipped` holds for it, and so does
+/// a call that no output answers: the request may bring its output.
+pub fn without_calls_answered_by(
+    items: Vec<ResponseInputOutputItem>,
+    skipped: &[ResponseInputOutputItem],
+) -> Vec<ResponseInputOutputItem> {
+    let unreplayed: HashSet<&str> = skipped.iter().filter_map(tool_output_call_id).collect();
+    if unreplayed.is_empty() {
+        return items;
+    }
+    let answered: HashSet<&str> = items.iter().filter_map(tool_output_call_id).collect();
+    let stays: Vec<bool> = items
+        .iter()
+        .map(|item| {
+            is_answered_call(item, &answered)
+                || tool_call_id(item).is_none_or(|call_id| !unreplayed.contains(call_id))
+        })
+        .collect();
+    items
+        .into_iter()
+        .zip(stays)
+        .filter_map(|(item, stays)| stays.then_some(item))
+        .collect()
+}
+
 /// `items` from their first turn boundary on: the first message the client
 /// sent (a user, developer or system message), or, when no client message is
 /// among them (one long turn of the model's calls), the first tool call with
@@ -5077,7 +5336,17 @@ pub fn from_turn_boundary(items: Vec<ResponseInputOutputItem>) -> Vec<ResponseIn
     if start == 0 {
         return items;
     }
-    items.into_iter().skip(start).collect()
+    let mut prefix = items;
+    let tail = prefix.split_off(start);
+    let mut kept: Vec<_> = prefix
+        .into_iter()
+        .filter(|item| matches!(item, ResponseInputOutputItem::AdditionalTools { .. }))
+        .collect();
+    if kept.is_empty() {
+        return tail;
+    }
+    kept.extend(tail);
+    kept
 }
 
 /// Whether `item` is a message the client sent (a user, developer or system
@@ -5086,6 +5355,7 @@ fn is_client_message(item: &ResponseInputOutputItem) -> bool {
     match item {
         ResponseInputOutputItem::Message { role, .. }
         | ResponseInputOutputItem::SimpleInputMessage { role, .. } => role.as_str() != "assistant",
+        ResponseInputOutputItem::AgentMessage { .. } => true,
         _ => false,
     }
 }
@@ -5409,7 +5679,7 @@ impl ResponseInputOutputItem {
         status: Option<String>,
     ) -> Self {
         Self::Reasoning {
-            id,
+            id: Some(id),
             summary,
             content,
             encrypted_content: None,
@@ -5428,7 +5698,7 @@ impl ResponseInputOutputItem {
         status: Option<String>,
     ) -> Self {
         Self::Reasoning {
-            id,
+            id: Some(id),
             summary,
             content,
             encrypted_content: Some(encrypted_content),
@@ -5758,9 +6028,11 @@ mod tests {
     }
 
     /// Every tagged variant's smallest payload.
-    const SMALLEST_TAGGED_ITEMS: [&str; 20] = [
+    const SMALLEST_TAGGED_ITEMS: [&str; 22] = [
+        r#"{"type":"additional_tools","tools":[]}"#,
+        r#"{"type":"agent_message","author":"root","recipient":"worker","content":[]}"#,
         r#"{"type":"message","id":"msg_1","role":"user","content":[]}"#,
-        r#"{"type":"reasoning","id":"rs_1"}"#,
+        r#"{"type":"reasoning","content":null}"#,
         r#"{"type":"function_call","call_id":"call_1","name":"lookup","arguments":"{}"}"#,
         r#"{"type":"function_call_output","call_id":"call_1","output":"found"}"#,
         r#"{"type":"mcp_approval_request","id":"mcpr_1","server_label":"docs","name":"search","arguments":"{}"}"#,
@@ -6225,6 +6497,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn from_turn_boundary_retains_additional_tools_from_trimmed_prefix() {
+        let window = items(serde_json::json!([
+            {"type": "function_call_output", "call_id": "call_gone", "output": "1"},
+            {"type": "additional_tools", "id": "at_1", "role": "developer",
+             "tools": [{"type": "function", "name": "exec_command", "parameters": {"type": "object"}}]},
+            {"type": "message", "id": "msg_1", "role": "assistant",
+             "content": [{"type": "output_text", "text": "tail", "annotations": []}]},
+            {"type": "agent_message", "id": "am_1", "author": "/root", "recipient": "/root/worker",
+             "content": [{"type": "input_text", "text": "run check"}]}
+        ]));
+        let kept = from_turn_boundary(window);
+        assert_eq!(kinds(&kept), ["additional_tools", "agent_message"]);
+    }
+
     /// The Responses API usage of a chat-style usage: both detail objects
     /// present, zero included, the cached and reasoning counts from the
     /// details the usage carries.
@@ -6443,7 +6730,7 @@ mod tests {
                     phase: None,
                 },
                 ResponseInputOutputItem::Reasoning {
-                    id: "r1".to_string(),
+                    id: Some("r1".to_string()),
                     summary: vec![],
                     content: vec![ResponseReasoningContent::ReasoningText {
                         text: "five".to_string(),

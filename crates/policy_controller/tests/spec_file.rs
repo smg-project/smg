@@ -44,7 +44,7 @@ use std::{
 };
 
 use replicas::{Lease, Replica, ROOM};
-use smg_policy_controller::{elector::ElectionSettings, proto::ApplyMode};
+use smg_policy_controller::service::{elector::ElectionSettings, proto::ApplyMode};
 use spec::{answers, apply, as_operator, control, page, read, until, LEAST_LOAD, PACE, RANDOM};
 use tempfile::TempDir;
 use tokio::time;
@@ -319,7 +319,7 @@ fn a_start_on_a_document_the_validator_refuses_exits_naming_the_field() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_replica_on_a_listing_file_counts_the_member_its_list_does_not_name() {
     use openai_protocol::worker::RuntimeType;
-    use smg_policy_controller::proto::{
+    use smg_policy_controller::service::proto::{
         register_worker_request::Mode, HealthPolicy, RegisterWorkerRequest, Role, WireMode,
         WorkerSpec,
     };

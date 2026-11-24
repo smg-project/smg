@@ -57,7 +57,7 @@ use tonic::{
 };
 use tracing::{debug, info};
 
-use self::connection::{Connection, DialFailure, End};
+use self::connection::{Connection, DialFailure, End, KeepAliveTimeout};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -200,21 +200,34 @@ pub async fn connect_channel_with_timeout(
 /// a dial the peer refuses or that times out (the channel's `UNAVAILABLE`
 /// over the connect error, before any call was in flight), nor the
 /// `UNAVAILABLE` "keep-alive timed out" of a connection this side dropped
-/// for a pong that never came, as tonic answered it.
+/// for a pong that never came, as tonic answered it
+/// ([`is_keep_alive_timeout`] tells that one).
 ///
 /// The gateway's liveness asks a different question of the ends of its
 /// polls and streams, whether the peer is reachable for work, and answers
 /// it from the code alone (`worker::health::liveness::is_connection_code` in the
 /// gateway crate); the two are not interchangeable.
 pub fn is_transport_failure(status: &tonic::Status) -> bool {
-    let mut source = std::error::Error::source(status);
-    while let Some(error) = source {
-        if error.is::<h2::Error>() {
-            return true;
-        }
-        source = error.source();
-    }
-    false
+    sources(status).any(|error| error.is::<h2::Error>())
+}
+
+/// Whether `status` is this client's own for a call whose connection it
+/// dropped at the keep-alive timeout ([`keep_alive_timeout_status`]): the
+/// peer answered no ping, so the status is no answer of the worker's. Its
+/// source says so; a worker's own `UNAVAILABLE` has none, whatever its
+/// words.
+pub fn is_keep_alive_timeout(status: &tonic::Status) -> bool {
+    sources(status).any(|error| error.is::<KeepAliveTimeout>())
+}
+
+/// The status of a call whose connection this side dropped at the keep-alive
+/// timeout: `UNAVAILABLE` "keep-alive timed out", the answer tonic gave that
+/// case, over the timeout as its source (see [`is_keep_alive_timeout`]).
+#[must_use]
+pub fn keep_alive_timeout_status() -> tonic::Status {
+    let mut status = tonic::Status::unavailable("keep-alive timed out");
+    status.set_source(Arc::new(KeepAliveTimeout));
+    status
 }
 
 /// The message of `status` less the peer's address, when the status is the
@@ -224,14 +237,14 @@ pub fn is_transport_failure(status: &tonic::Status) -> bool {
 /// answer to a client takes this form. `None` for every other status, the
 /// worker's own included.
 pub fn dial_failure_without_peer(status: &tonic::Status) -> Option<&str> {
-    let mut source = std::error::Error::source(status);
-    while let Some(error) = source {
-        if let Some(failure) = DialFailure::of(error) {
-            return Some(failure.without_peer());
-        }
-        source = error.source();
-    }
-    None
+    sources(status)
+        .find_map(DialFailure::of)
+        .map(DialFailure::without_peer)
+}
+
+/// The errors behind `status`, the nearest first.
+fn sources(status: &tonic::Status) -> impl Iterator<Item = &(dyn std::error::Error + 'static)> {
+    std::iter::successors(std::error::Error::source(status), |error| error.source())
 }
 
 /// Convert a `grpc://` or `grpcs://` endpoint to a tonic-compatible

@@ -24,7 +24,7 @@
 use std::borrow::Cow;
 
 use crate::{
-    event::{runs, DropReason, Event, Events, MalformedReason, Text},
+    event::{runs, CallEnd, DropReason, Event, Events, MalformedReason, Text},
     json::{PartialJson, PartialJsonError},
     tagged::{
         assembler::{escaped, push_escaped, push_quoted},
@@ -272,6 +272,7 @@ impl Assembler {
         out.push(Event::ToolCallEnd {
             index: self.index,
             source: Text::uncounted(terminal.to_owned()),
+            ended: CallEnd::Closed,
         });
         self.done = true;
     }

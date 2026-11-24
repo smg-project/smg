@@ -43,17 +43,15 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use openai_protocol::worker::WorkerStatus;
+use openai_protocol::{model_card::ModelCard, worker::WorkerStatus};
 use serde::{Serialize, Serializer};
+use smg_worker::{identity::basic::ConnectionMode, test_support::no_health_check};
 
 use super::*;
 use crate::{
     config::types::PolicyConfig,
     policies::PolicyFactory,
-    worker::{
-        test_support::no_health_check, BasicWorkerBuilder, ConnectionMode, ModelCard,
-        WorkerRegistryExt,
-    },
+    routers::{common::snapshot::WorkerRegistryExt, grpc::backend_client::BasicWorkerBuilder},
 };
 
 const MODEL: &str = "m";
@@ -340,6 +338,9 @@ fn refusal(failure: EpdSelectionFailure) -> Answer {
         EpdSelectionFailure::DecodeVisionUnsupported => named("decode_vision_unsupported"),
         EpdSelectionFailure::EncodeNotSupported => named("encode_not_supported"),
         EpdSelectionFailure::EncodeVisionUnsupported => named("encode_vision_unsupported"),
+        // The recorder starts no policy engine, so no row of its sheet
+        // records this refusal. It has its name all the same.
+        EpdSelectionFailure::EncodeUnderPolicyEngine => named("encode_under_policy_engine"),
         EpdSelectionFailure::Placement(failure) => Answer::Refused {
             name: "placement",
             role: Some(format!("{:?}", failure.role).to_lowercase()),
@@ -401,6 +402,10 @@ impl LoadBalancingPolicy for Watched {
 
     fn name(&self) -> &'static str {
         self.inner.name()
+    }
+
+    fn honors_routing_key(&self) -> bool {
+        self.inner.honors_routing_key()
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

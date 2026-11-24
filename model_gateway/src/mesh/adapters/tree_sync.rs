@@ -30,13 +30,11 @@ use kv_index::TenantId;
 use rand::seq::IndexedRandom;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use smg_mesh::{DrainHandle, StreamNamespace, MAX_STREAM_CHUNK_BYTES};
+use smg_worker::identity::endpoint::Endpoint;
 use tracing::{debug, error, trace, warn};
 use uuid::Uuid;
 
-use crate::{
-    policies::{TreeHandle, TreeKind},
-    worker::identity::endpoint::Endpoint,
-};
+use crate::policies::{TreeHandle, TreeKind};
 
 const PREFIX: &str = "td:";
 pub(crate) const REPAIR_REQUEST_PREFIX: &str = "tree:req:";
@@ -972,18 +970,15 @@ impl TreeSyncAdapter {
         };
 
         let key = (page.model_id.clone(), page.tree_kind);
-        let mut entry = match self.outstanding_repairs.get_mut(&key) {
-            Some(e) => e,
-            None => {
-                debug!(
-                    model_id = %page.model_id,
-                    kind = ?page.tree_kind,
-                    session_id = %page.session_id,
-                    page_index = page.page_index,
-                    "received tree:page: with no matching outstanding session; dropping",
-                );
-                return;
-            }
+        let Some(mut entry) = self.outstanding_repairs.get_mut(&key) else {
+            debug!(
+                model_id = %page.model_id,
+                kind = ?page.tree_kind,
+                session_id = %page.session_id,
+                page_index = page.page_index,
+                "received tree:page: with no matching outstanding session; dropping",
+            );
+            return;
         };
 
         if entry.session_id != page.session_id {

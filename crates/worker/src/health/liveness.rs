@@ -157,7 +157,7 @@ const DEFAULT_WEDGE: Duration = Duration::from_secs(3);
 const DEFAULT_STALE: Duration = Duration::from_secs(15);
 
 /// How often the sweep runs.
-pub const SWEEP_INTERVAL: Duration = Duration::from_millis(250);
+pub(crate) const SWEEP_INTERVAL: Duration = Duration::from_millis(250);
 
 /// In-flight requests this many deep with no token for the wedge threshold
 /// are a wedged engine even when nothing new arrives (a saturated client
@@ -636,10 +636,9 @@ pub(crate) fn configure(stall: Duration, wedge: Duration, stale: Duration) {
 
 /// Apply every liveness budget the host hands in: the stall, wedge and
 /// stale thresholds and the warm-up slice. The one place the budgets are
-/// set from outside, for the server's start-up and, as
-/// `worker::configure_liveness`, for a host that builds the context without
-/// the builder (the test harness today); the first call in a process wins,
-/// as for the thresholds' own setter.
+/// set from outside, for the server's start-up and for a host that builds
+/// the context without the builder (the test harness today); the first
+/// call in a process wins, as for the thresholds' own setter.
 pub fn configure_from(budgets: Budgets) {
     configure(budgets.stall, budgets.wedge, budgets.stale);
     configure_warmup(Warmup {
@@ -737,6 +736,12 @@ pub fn is_connection_code(code: tonic::Code) -> bool {
     )
 }
 
+/// The worker's veto, read off the runtime state in hand when it has one
+/// (the worker's own read loads that state again).
+fn stall_reason_of(worker: &Arc<dyn Worker>, state: Option<&WorkerRuntime>) -> Option<StallReason> {
+    state.map_or_else(|| worker.stall_reason(), WorkerRuntime::stall_reason)
+}
+
 /// A successful interaction over the transport (a poll answered, an event
 /// batch, a response): the worker is reachable, so an unreachable veto ends
 /// here. A worker the health checker demoted while it was gone (its probes
@@ -755,7 +760,7 @@ pub fn on_contact(worker: &Arc<dyn Worker>) {
     if let Some(state) = state {
         state.note_contact();
     }
-    if worker.stall_reason() != Some(StallReason::Unreachable) {
+    if stall_reason_of(worker, state) != Some(StallReason::Unreachable) {
         return;
     }
     set(worker, state, None, "contact");
@@ -773,7 +778,7 @@ pub fn on_contact(worker: &Arc<dyn Worker>) {
 /// timeout apart, or an interval if that is shorter, once one passes); a
 /// probe that short-circuited it would make one passing probe out of a
 /// flapping engine's run a return to service.
-pub fn on_probe_passed(worker: &Arc<dyn Worker>) {
+pub(crate) fn on_probe_passed(worker: &Arc<dyn Worker>) {
     let state = worker.runtime_state();
     let state = state.as_deref();
     if let Some(state) = state {
@@ -786,7 +791,7 @@ pub fn on_probe_passed(worker: &Arc<dyn Worker>) {
 
 /// A transport failure from `what`. Vetoes the worker when nothing has been
 /// heard from it for the stall threshold; a failure right after a contact is
-/// remembered, and [`sweep`] vetoes the worker once the threshold passes
+/// remembered, and the sweep vetoes the worker once the threshold passes
 /// without a contact. A worker vetoed as wedged is no exception: the failure
 /// took the connection its pile was on, so the streams that were to show
 /// progress are gone and only a contact can say the worker is back; its veto
@@ -821,7 +826,7 @@ fn on_contact_failed_with(worker: &Arc<dyn Worker>, what: &'static str, stall: D
 /// Periodic check: a worker whose transport failed and that has then stayed
 /// silent for the stall threshold is vetoed now, not at its next failed poll,
 /// so the exclusion lands at the threshold itself.
-pub fn sweep(worker: &Arc<dyn Worker>) {
+pub(crate) fn sweep(worker: &Arc<dyn Worker>) {
     let (stall, wedge, stale) = thresholds();
     sweep_with(worker, stall, wedge, stale);
 }
@@ -952,17 +957,20 @@ pub fn on_token_progress_on(runtime: &WorkerRuntime, worker: &Arc<dyn Worker>, n
 /// the worker has shown no rate and a token-batch wire only once it has.
 /// A standing veto is judged at the threshold on either wire, whatever
 /// the servicer reports pending: the allowance lifts no veto, as the
-/// cold-shape grace lifts none.
-pub fn on_load_report(
+/// cold-shape grace lifts none. `state` is the worker's runtime state as
+/// the caller loaded it: the apply of a pushed record holds it already.
+pub(crate) fn on_load_report(
     worker: &Arc<dyn Worker>,
+    state: Option<&WorkerRuntime>,
     waiting: i64,
     engine_silence: Option<Duration>,
     engine_reports_steps: bool,
     engine_prefill_pending: Option<u64>,
 ) {
     let (_, wedge, _) = thresholds();
-    on_load_report_with(
+    on_load_report_on(
         worker,
+        state,
         waiting,
         engine_silence,
         engine_reports_steps,
@@ -971,7 +979,8 @@ pub fn on_load_report(
     );
 }
 
-/// [`on_load_report`] at the given wedge threshold.
+/// [`on_load_report`] at the given wedge threshold, the state loaded here.
+#[cfg(test)]
 fn on_load_report_with(
     worker: &Arc<dyn Worker>,
     waiting: i64,
@@ -981,12 +990,33 @@ fn on_load_report_with(
     wedge: Duration,
 ) {
     let state = worker.runtime_state();
-    let state = state.as_deref();
+    on_load_report_on(
+        worker,
+        state.as_deref(),
+        waiting,
+        engine_silence,
+        engine_reports_steps,
+        engine_prefill_pending,
+        wedge,
+    );
+}
+
+/// [`on_load_report`] at the given wedge threshold, on the runtime state
+/// its caller loaded.
+fn on_load_report_on(
+    worker: &Arc<dyn Worker>,
+    state: Option<&WorkerRuntime>,
+    waiting: i64,
+    engine_silence: Option<Duration>,
+    engine_reports_steps: bool,
+    engine_prefill_pending: Option<u64>,
+    wedge: Duration,
+) {
     let previous = state.map_or(0, |state| state.swap_waiting_reqs(waiting));
     // The grace of a cold shape arms no veto and lifts none: a worker vetoed
     // before the longer prompt reached it is judged as before until it
     // produces, so the grace never reads as the engine producing again.
-    let standing = worker.stall_reason().is_some();
+    let standing = stall_reason_of(worker, state).is_some();
     let grace = if standing {
         Duration::ZERO
     } else {
@@ -1014,7 +1044,7 @@ fn on_load_report_with(
     if let Some(state) = state {
         state.note_engine_stall(engine_stalled);
     }
-    match worker.stall_reason() {
+    match stall_reason_of(worker, state) {
         Some(StallReason::Wedged) => {
             // A clock that restarted with this gateway's first dispatch is
             // not progress while the engine still reports silence: a token
@@ -1225,7 +1255,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        health::circuit_breaker::CircuitBreakerConfig, registry::event::WorkerConnected,
+        health::circuit_breaker::CircuitBreakerConfig,
+        registry::event::{WorkerConnected, WorkerSignal},
         test_support::BasicWorkerBuilder,
     };
 
@@ -1417,7 +1448,7 @@ mod tests {
         );
         sweep(&w);
         assert!(w.stall_reason().is_none());
-        on_load_report(&w, 3, None, false, None);
+        on_load_report(&w, w.runtime_state().as_deref(), 3, None, false, None);
         assert!(w.stall_reason().is_none());
         // The same pile with a clock that had run from registration would be
         // the false positive.
@@ -2484,7 +2515,77 @@ mod tests {
         );
     }
 
-    fn signalling_worker() -> (Arc<dyn Worker>, mpsc::UnboundedReceiver<WorkerConnected>) {
+    /// The next connect signal on the channel, past the moves of the
+    /// liveness veto that ride it too.
+    fn connected(rx: &mut mpsc::UnboundedReceiver<WorkerSignal>) -> Option<WorkerConnected> {
+        loop {
+            match rx.try_recv().ok()? {
+                WorkerSignal::Connected(connected) => return Some(connected),
+                WorkerSignal::LivenessMoved { .. } => {}
+            }
+        }
+    }
+
+    /// A move of the veto is said once on the worker's signal sender, and
+    /// again only after the loop took the mark: at most one liveness signal
+    /// of a worker waits in the channel, whoever reads it.
+    #[test]
+    fn a_move_of_the_veto_is_signalled_once_until_the_loop_takes_the_mark() {
+        let (w, mut rx) = signalling_worker();
+        let runtime = w.runtime_state().expect("a running state");
+        let moves = |rx: &mut mpsc::UnboundedReceiver<WorkerSignal>| {
+            let mut moves = 0;
+            while let Ok(signal) = rx.try_recv() {
+                assert!(
+                    matches!(&signal, WorkerSignal::LivenessMoved { url } if url == "http://w1:8000"),
+                    "{signal:?}"
+                );
+                moves += 1;
+            }
+            moves
+        };
+
+        set(
+            &w,
+            Some(runtime.as_ref()),
+            Some(StallReason::Unreachable),
+            "test",
+        );
+        set(&w, Some(runtime.as_ref()), None, "test");
+        set(
+            &w,
+            Some(runtime.as_ref()),
+            Some(StallReason::Wedged),
+            "test",
+        );
+        assert_eq!(moves(&mut rx), 1, "three moves, one signal waiting");
+
+        // The loop took the mark. A veto that stands signals nothing, and
+        // the next move signals again.
+        runtime.liveness_signal_taken();
+        set(
+            &w,
+            Some(runtime.as_ref()),
+            Some(StallReason::Wedged),
+            "test",
+        );
+        assert_eq!(moves(&mut rx), 0);
+        set(&w, Some(runtime.as_ref()), None, "test");
+        assert_eq!(moves(&mut rx), 1);
+
+        // A worker built for no registry holds no sender: its veto moves
+        // and nothing is said.
+        let alone = worker();
+        set(
+            &alone,
+            alone.runtime_state().as_deref(),
+            Some(StallReason::Unreachable),
+            "test",
+        );
+        assert!(alone.stall_reason().is_some());
+    }
+
+    fn signalling_worker() -> (Arc<dyn Worker>, mpsc::UnboundedReceiver<WorkerSignal>) {
         let (tx, rx) = mpsc::unbounded_channel();
         let w: Arc<dyn Worker> = Arc::new(
             BasicWorkerBuilder::new("http://w1:8000")
@@ -2498,7 +2599,10 @@ mod tests {
     fn contact_asks_for_promotion_only_of_a_worker_that_was_unreachable() {
         let (w, mut rx) = signalling_worker();
         on_contact(&w);
-        assert!(rx.try_recv().is_err(), "a Ready worker needs no promotion");
+        assert!(
+            connected(&mut rx).is_none(),
+            "a Ready worker needs no promotion"
+        );
         // Demoted by its probes while its transport was gone: the first
         // contact is its return, promoted now.
         set(
@@ -2510,9 +2614,8 @@ mod tests {
         w.set_status(WorkerStatus::NotReady);
         on_contact(&w);
         assert!(w.stall_reason().is_none());
-        let signal = rx
-            .try_recv()
-            .expect("a demoted worker back from a transport outage is signalled");
+        let signal =
+            connected(&mut rx).expect("a demoted worker back from a transport outage is signalled");
         assert_eq!(signal.url, "http://w1:8000");
         // Demoted by its probes alone (a draining engine answering 503 on
         // /health while it still relays KV batches and answers GetLoads):
@@ -2521,12 +2624,12 @@ mod tests {
         on_contact(&w);
         on_contact(&w);
         assert!(
-            rx.try_recv().is_err(),
+            connected(&mut rx).is_none(),
             "a reachable transport does not lift a health demotion"
         );
         w.set_status(WorkerStatus::Failed);
         on_contact(&w);
-        assert!(rx.try_recv().is_err(), "nor a Failed one");
+        assert!(connected(&mut rx).is_none(), "nor a Failed one");
     }
 
     #[test]
@@ -2554,7 +2657,7 @@ mod tests {
         assert!(age <= elapsed, "a passing probe is a contact");
         assert!(w.stall_reason().is_none(), "and ends an unreachable veto");
         assert!(
-            rx.try_recv().is_err(),
+            connected(&mut rx).is_none(),
             "the health state machine promotes at its success threshold, not the probe"
         );
     }

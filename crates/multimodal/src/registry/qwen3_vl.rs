@@ -318,10 +318,17 @@ impl ModelProcessorSpec for Qwen3VLVisionSpec {
         modality: Modality,
     ) -> RegistryResult<Box<dyn VisionPreProcessor>> {
         match modality {
-            Modality::Image | Modality::Video => Ok(Box::new(Qwen3VLProcessor::from_config_for(
-                preprocessor_config,
-                modality,
-            ))),
+            Modality::Image | Modality::Video => {
+                let processor = Qwen3VLProcessor::from_config_for(preprocessor_config, modality);
+                processor.validate().map_err(|error| {
+                    ModelRegistryError::InvalidPreprocessorConfig {
+                        spec: self.name(),
+                        modality,
+                        reason: error.to_string(),
+                    }
+                })?;
+                Ok(Box::new(processor))
+            }
             _ => Err(ModelRegistryError::unsupported(self.name(), modality)),
         }
     }

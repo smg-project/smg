@@ -96,6 +96,10 @@ from smg_grpc_servicer.sglang.model_artifacts import (
     prepare_model_metadata,
     tokenizer_dir_for,
 )
+from smg_grpc_servicer.sglang.scheduler_metrics import (
+    SchedulerMetricsEndpoint,
+    serve_scheduler_metrics,
+)
 from smg_grpc_servicer.sglang.warmup import WARMUP_ENV, media_warmup, warmup_inputs, warmup_wire
 
 logger = logging.getLogger(__name__)
@@ -103,6 +107,8 @@ logger = logging.getLogger(__name__)
 SERVICER_IMPL_ENV = "SMG_SGLANG_SERVICER_IMPL"
 HANDSHAKE_PORT_ENV = "SMG_SGLANG_SERVICER_HANDSHAKE_PORT"
 DRAIN_SECS_ENV = "SMG_SGLANG_SERVICER_DRAIN_SECS"
+# How long the engine stays up after the drain's last stream (default 1 s).
+DRAIN_LINGER_SECS_ENV = "SMG_SGLANG_SERVICER_DRAIN_LINGER_SECS"
 STARTUP_TIMEOUT_SECS_ENV = "SMG_SGLANG_SERVICER_STARTUP_TIMEOUT_SECS"
 STARTUP_CEILING_SECS_ENV = "SMG_SGLANG_SERVICER_STARTUP_CEILING_SECS"
 SILENCE_TIMEOUT_SECS_ENV = "SMG_SGLANG_SERVICER_SILENCE_TIMEOUT_SECS"
@@ -563,6 +569,7 @@ class SglangLauncher(RustLauncher):
     ipc_prefix = "sglang-servicer"
     handshake_port_env = HANDSHAKE_PORT_ENV
     drain_secs_env = DRAIN_SECS_ENV
+    drain_linger_secs_env = DRAIN_LINGER_SECS_ENV
     startup_timeout_secs_env = STARTUP_TIMEOUT_SECS_ENV
     startup_ceiling_secs_env = STARTUP_CEILING_SECS_ENV
     silence_timeout_secs_env = SILENCE_TIMEOUT_SECS_ENV
@@ -652,12 +659,27 @@ class SglangLauncher(RustLauncher):
         )
         return {"encode_dispatcher": self.encode}
 
+    # SGLang's scheduler metrics endpoint (``--enable-metrics``), started with
+    # the ranks and closed when the servicer stops; ``None`` without one.
+    scheduler_metrics: SchedulerMetricsEndpoint | None = None
+
     def launch(self, args: Any, handshake_port: int, facts: Mapping[str, Any]) -> Any:
         if self.encode is None:
-            return launch_scheduler_ranks(args, handshake_port=handshake_port)
-        return launch_scheduler_ranks(
-            args, handshake_port=handshake_port, encode_bridge=self.encode
-        )
+            engine = launch_scheduler_ranks(args, handshake_port=handshake_port)
+        else:
+            engine = launch_scheduler_ranks(
+                args, handshake_port=handshake_port, encode_bridge=self.encode
+            )
+        # After the ranks: their launch sets the metrics directory.
+        self.scheduler_metrics = serve_scheduler_metrics(args)
+        return engine
+
+    async def serve(self, args: Any) -> int:
+        try:
+            return await super().serve(args)
+        finally:
+            if self.scheduler_metrics is not None:
+                self.scheduler_metrics.close()
 
     # The media request's material, built with the inputs for a
     # language-side worker whose frontend dispatches to the encoders; ``None``

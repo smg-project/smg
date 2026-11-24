@@ -200,8 +200,10 @@ fn resolution_returns_router_obligations() {
 
 #[test]
 fn pd_bootstrap_injection_skips_non_sglang_requests() {
+    use smg_worker::identity::basic::{RuntimeType, WorkerType};
+
     use super::{Worker, WorkerSelection};
-    use crate::worker::{BasicWorkerBuilder, RuntimeType, WorkerType};
+    use crate::routers::grpc::backend_client::BasicWorkerBuilder;
 
     // An SGLang-runtime worker selection paired with a non-SGLang proto
     // (e.g. a misreporting backend) must skip injection, not panic.
@@ -213,7 +215,7 @@ fn pd_bootstrap_injection_skips_non_sglang_requests() {
     let selection = WorkerSelection::Disaggregated {
         encode_assignments: None,
         prefill: worker.clone(),
-        decode: worker,
+        decode: worker.into(),
         runtime_type: RuntimeType::Sglang,
     };
 

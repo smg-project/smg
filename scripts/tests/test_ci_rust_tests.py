@@ -189,6 +189,8 @@ class ShardTableTests(unittest.TestCase):
             for name in sorted(closure(members, script("packages", row["shard"]).split())):
                 crate = members[name]["dir"]
                 probes = ["Cargo.toml", "src/lib.rs", "src/main.rs"]
+                if crate == "model_gateway":
+                    probes.append("src/cli/mod.rs")
                 # The target directories cargo discovers, where the crate has Rust sources in them.
                 probes += [
                     f"{d}/probe.rs"
@@ -470,7 +472,7 @@ class ShardTableTests(unittest.TestCase):
                 self.assertEqual(read.stdout.strip(), expected, args)
             for name in (
                 "crates/policy_controller/Cargo.toml",
-                "crates/grpc_client/proto/common.proto",
+                "crates/worker/proto/common.proto",
             ):
                 self.assertTrue((source / name).is_file(), name)
         # A directory inside the checkout is refused and never made: the

@@ -113,7 +113,7 @@ struct BedArgs {
     #[arg(long, default_value_t = 8)]
     gw_threads: u32,
     /// Extra gateway flags
-    #[arg(long, default_value = DEFAULT_GW_ARGS)]
+    #[arg(long, default_value = DEFAULT_GW_ARGS, allow_hyphen_values = true)]
     gw_args: String,
     /// perf stat hardware counters [auto: when perf can count instructions]
     #[arg(long, value_enum, default_value_t = Counters::Auto)]
@@ -156,6 +156,9 @@ struct CellCmd {
     /// The base branch's gateway binary (`gateway-perf base` builds one)
     #[arg(long)]
     base: Option<PathBuf>,
+    /// The base's extra gateway flags, where one binary is measured under two settings [--gw-args]
+    #[arg(long, requires = "base", allow_hyphen_values = true)]
+    base_gw_args: Option<String>,
     #[command(flatten)]
     cell: CellArgs,
 }
@@ -169,6 +172,9 @@ struct MemCmd {
     /// The base branch's gateway binary (`gateway-perf base` builds one)
     #[arg(long)]
     base: Option<PathBuf>,
+    /// The base's extra gateway flags, where one binary is measured under two settings [--gw-args]
+    #[arg(long, requires = "base", allow_hyphen_values = true)]
+    base_gw_args: Option<String>,
     /// Comma-separated paths
     #[arg(long, default_value = "stream")]
     paths: String,
@@ -220,6 +226,9 @@ struct LiveCmd {
     /// The base branch's gateway binary: the ramp runs it too
     #[arg(long)]
     base: Option<PathBuf>,
+    /// The base's extra gateway flags, where one binary is measured under two settings [--gw-args]
+    #[arg(long, requires = "base", allow_hyphen_values = true)]
+    base_gw_args: Option<String>,
     /// The path to ramp
     #[arg(long, default_value = "chat")]
     path: String,
@@ -535,22 +544,26 @@ fn run_report(cmd: &ReportCmd) -> Result<i32> {
 fn run(cli: Cli) -> Result<i32> {
     match cli.command {
         Cmd::Cpu(c) => {
-            let s = settings(&c.bed, c.base.as_deref(), true, Some(&c.cell))?;
+            let mut s = settings(&c.bed, c.base.as_deref(), true, Some(&c.cell))?;
+            s.base_gw_args = c.base_gw_args;
             cells::run_cells(&s, "cpu", c.cell.gates.as_deref())
         }
         Cmd::Alloc(c) => {
             let mut s = settings(&c.bed, c.base.as_deref(), true, Some(&c.cell))?;
+            s.base_gw_args = c.base_gw_args;
             s.counters = false;
             s.counters_note = "alloc mode: jemalloc statistics only".to_string();
             cells::run_cells(&s, "alloc", c.cell.gates.as_deref())
         }
         Cmd::Mem(m) => {
             let cell = m.cell_args();
-            let s = settings(&m.bed, m.base.as_deref(), true, Some(&cell))?;
+            let mut s = settings(&m.bed, m.base.as_deref(), true, Some(&cell))?;
+            s.base_gw_args = m.base_gw_args;
             cells::run_mem(&s, m.windows, m.burst, m.gates.as_deref())
         }
         Cmd::Live(l) => {
-            let s = settings(&l.bed, l.base.as_deref(), l.base.is_some(), None)?;
+            let mut s = settings(&l.bed, l.base.as_deref(), l.base.is_some(), None)?;
+            s.base_gw_args = l.base_gw_args;
             let spec = fleet_paths(s.bed.fleet, Some(&l.path))?.remove(0);
             let rates = l
                 .rates
@@ -614,6 +627,37 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_base_takes_gateway_flags_of_its_own_beside_a_base_binary() {
+        for mode in ["cpu", "alloc", "mem", "live"] {
+            let cli = Cli::try_parse_from([
+                "gateway-perf",
+                mode,
+                "--base",
+                "/b",
+                "--base-gw-args",
+                "--parser symphony",
+                "--gw-args",
+                "--parser symphony --trust-tenant-header",
+            ])
+            .unwrap();
+            let (base, head) = match cli.command {
+                Cmd::Cpu(c) | Cmd::Alloc(c) => (c.base_gw_args, c.bed.gw_args),
+                Cmd::Mem(m) => (m.base_gw_args, m.bed.gw_args),
+                Cmd::Live(l) => (l.base_gw_args, l.bed.gw_args),
+                _ => panic!("{mode} has no base"),
+            };
+            assert_eq!(base.as_deref(), Some("--parser symphony"), "{mode}");
+            assert_eq!(head, "--parser symphony --trust-tenant-header", "{mode}");
+        }
+        let alone = Cli::try_parse_from(["gateway-perf", "live", "--base-gw-args", "--x"]);
+        assert_eq!(
+            alone.unwrap_err().kind(),
+            clap::error::ErrorKind::MissingRequiredArgument,
+            "flags of a base that does not run"
+        );
+    }
 
     #[test]
     fn every_subcommand_parses_with_defaults() {

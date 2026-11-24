@@ -12,7 +12,7 @@
 use std::{
     ffi::OsStr,
     io::{BufRead, BufReader, Write},
-    net::SocketAddr,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     path::Path,
     process::{Child, Command, ExitStatus, Stdio},
     sync::Arc,
@@ -22,7 +22,7 @@ use std::{
 
 use parking_lot::Mutex;
 use prost::Message as _;
-use smg_policy_controller::{
+use smg_policy_controller::service::{
     elector::ElectionSettings,
     proto::{
         controller_frame, gateway_frame, policy_controller_client::PolicyControllerClient,
@@ -182,7 +182,15 @@ pub struct Replica {
     /// The directory of the spec source it was given where its flags named
     /// none, kept as long as the process.
     _spec: Option<tempfile::TempDir>,
+    /// It was given a spec file beside a lease another replica can take:
+    /// its start's document lands a moment behind the start of its first
+    /// lead, and [`Record::agreed`] waits for it.
+    filed: bool,
 }
+
+/// Where a replica listens unless its start names a place: the loopback
+/// address, every port the system's pick.
+const LOOPBACK: (IpAddr, u16) = (IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
 
 /// A document of one plain profile: what a replica runs where its flags
 /// name no spec source and a store is refused.
@@ -202,7 +210,7 @@ impl Replica {
         settings: ElectionSettings,
         settle_secs: u64,
     ) -> Result<Self, String> {
-        Self::start_as(id, None, lease, settings, settle_secs, &[])
+        Self::start_as(id, None, lease, settings, settle_secs, &[], LOOPBACK)
     }
 
     /// Starts the binary as [`Replica::start`] does, under an advertised
@@ -216,7 +224,15 @@ impl Replica {
         settings: ElectionSettings,
         settle_secs: u64,
     ) -> Result<Self, String> {
-        Self::start_as(id, Some(advertise), lease, settings, settle_secs, &[])
+        Self::start_as(
+            id,
+            Some(advertise),
+            lease,
+            settings,
+            settle_secs,
+            &[],
+            LOOPBACK,
+        )
     }
 
     /// [`Replica::start`] with `flags` after its own on the command line.
@@ -227,7 +243,22 @@ impl Replica {
         settle_secs: u64,
         flags: &[&OsStr],
     ) -> Result<Self, String> {
-        Self::start_as(id, None, lease, settings, settle_secs, flags)
+        Self::start_as(id, None, lease, settings, settle_secs, flags, LOOPBACK)
+    }
+
+    /// [`Replica::start_with`] with every listener at the address `ip` and
+    /// the replication listener at `port` there (`0` takes one), its
+    /// listeners closed at once on a stop's signal. A standby dials its
+    /// leader's host at its own replication port: the replicas of a pair
+    /// listen on one replication port, each at an address of its own.
+    pub fn start_on(
+        id: &str,
+        place: (IpAddr, u16),
+        lease: Lease<'_>,
+        settings: ElectionSettings,
+        flags: &[&OsStr],
+    ) -> Result<Self, String> {
+        Self::start_as(id, None, lease, settings, 0, flags, place)
     }
 
     fn start_as(
@@ -237,7 +268,9 @@ impl Replica {
         settings: ElectionSettings,
         settle_secs: u64,
         flags: &[&OsStr],
+        (ip, replication): (IpAddr, u16),
     ) -> Result<Self, String> {
+        let at = |port: u16| SocketAddr::new(ip, port).to_string();
         let millis = |duration: Duration| duration.as_millis().to_string();
         let grace_secs = (2 * settle_secs).max(5);
         let mut command = Command::new(BIN);
@@ -285,10 +318,10 @@ impl Replica {
         };
         command
             .args(["--controller-id", id])
-            .args(["--gateway-listen", "127.0.0.1:0"])
-            .args(["--control-listen", "127.0.0.1:0"])
-            .args(["--replication-listen", "127.0.0.1:0"])
-            .args(["--admin-listen", "127.0.0.1:0"])
+            .args(["--gateway-listen", &at(0)])
+            .args(["--control-listen", &at(0)])
+            .args(["--replication-listen", &at(replication)])
+            .args(["--admin-listen", &at(0)])
             .args(["--lease-duration-ms", &millis(settings.duration)])
             .args(["--lease-renew-period-ms", &millis(settings.renew_period)])
             .args([
@@ -336,6 +369,7 @@ impl Replica {
             replication: unbound(),
             admin: unbound(),
             client: None,
+            filed: spec.is_some() && !alone,
             _spec: spec,
         };
         let started = Instant::now();
@@ -688,7 +722,9 @@ impl Record {
 
     /// Samples until one replica answers as the leader and every replica
     /// names it under its term: the leader's place in `replicas` and the
-    /// term.
+    /// term. A leader this helper gave a file is agreed once its log says
+    /// a document was applied: its start's lands a moment behind the start
+    /// of its lead, and until then it has no decision for a request.
     pub async fn agreed(&mut self, replicas: &mut [Replica]) -> Result<(usize, u64), String> {
         let started = Instant::now();
         loop {
@@ -702,7 +738,10 @@ impl Record {
                 });
                 let place = replicas.iter().position(|r| r.id == leader.replica);
                 if let (true, Some(place)) = (named, place) {
-                    return Ok((place, leader.info.term));
+                    let leads = &replicas[place];
+                    if !leads.filed || leads.logged("policy spec applied") {
+                        return Ok((place, leader.info.term));
+                    }
                 }
             }
             if started.elapsed() > ROOM {

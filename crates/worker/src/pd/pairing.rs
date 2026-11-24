@@ -45,6 +45,13 @@ const LAYOUT_FACTS: [(&str, &str, &[&str]); 4] = [
     ("model", "model_dtype", &[]),
 ];
 
+/// The canonical labels of the KV layout facts, in the order a descriptor
+/// compares and reports them ([`PdPairing::kv_layout`]). A reader that
+/// keeps a place a fact holds its own list to this one.
+pub fn layout_labels() -> impl Iterator<Item = &'static str> {
+    LAYOUT_FACTS.iter().map(|(_, label, _)| *label)
+}
+
 /// The component two descriptors disagree on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PairingMismatch {

@@ -181,15 +181,29 @@ impl ModelProcessorSpec for LlavaSpec {
         modality: Modality,
     ) -> RegistryResult<Box<dyn VisionPreProcessor>> {
         match modality {
-            Modality::Image => Ok(match VisionTower::of(model_config) {
-                VisionTower::Clip => Box::new(LlavaProcessor::from_configs(
-                    model_config,
-                    preprocessor_config,
-                )),
-                VisionTower::Pixtral => Box::new(PixtralProcessor::from_preprocessor_config(
-                    preprocessor_config,
-                )),
-            }),
+            Modality::Image => {
+                let (processor, served): (Box<dyn VisionPreProcessor>, _) =
+                    match VisionTower::of(model_config) {
+                        VisionTower::Clip => {
+                            let processor =
+                                LlavaProcessor::from_configs(model_config, preprocessor_config);
+                            let served = processor.validate();
+                            (Box::new(processor), served)
+                        }
+                        VisionTower::Pixtral => {
+                            let processor =
+                                PixtralProcessor::from_preprocessor_config(preprocessor_config);
+                            let served = processor.validate();
+                            (Box::new(processor), served)
+                        }
+                    };
+                served.map_err(|error| ModelRegistryError::InvalidPreprocessorConfig {
+                    spec: self.name(),
+                    modality,
+                    reason: error.to_string(),
+                })?;
+                Ok(processor)
+            }
             _ => Err(ModelRegistryError::unsupported(self.name(), modality)),
         }
     }
@@ -259,10 +273,17 @@ impl ModelProcessorSpec for LlavaNextSpec {
         modality: Modality,
     ) -> RegistryResult<Box<dyn VisionPreProcessor>> {
         match modality {
-            Modality::Image => Ok(Box::new(LlavaNextProcessor::from_configs(
-                model_config,
-                preprocessor_config,
-            ))),
+            Modality::Image => {
+                let processor = LlavaNextProcessor::from_configs(model_config, preprocessor_config);
+                processor.validate().map_err(|error| {
+                    ModelRegistryError::InvalidPreprocessorConfig {
+                        spec: self.name(),
+                        modality,
+                        reason: error.to_string(),
+                    }
+                })?;
+                Ok(Box::new(processor))
+            }
             _ => Err(ModelRegistryError::unsupported(self.name(), modality)),
         }
     }

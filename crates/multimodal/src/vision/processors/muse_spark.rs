@@ -22,11 +22,14 @@
 //! normalization ([`EncoderInput::U8`]), so the destination's dtype is written
 //! once at serialization and a cached item serves every destination.
 
+use std::collections::TryReserveError;
+
 use image::DynamicImage;
 use ndarray::Array2;
 
 use super::qwen_vl_base::pixel_norm;
 use crate::{
+    buffer_pool,
     encoder_inputs::{
         EncoderDtype, EncoderInput, ModelSpecificValue, PixelNorm, PreprocessedEncoderInputs,
     },
@@ -39,26 +42,26 @@ use crate::{
 };
 
 /// Spatial patch size of the reference image and video processors.
-pub const DEFAULT_PATCH_SIZE: usize = 14;
+pub(crate) const DEFAULT_PATCH_SIZE: usize = 14;
 /// Patches merged into one token along each spatial axis.
-pub const DEFAULT_MERGE_SIZE: usize = 2;
+pub(crate) const DEFAULT_MERGE_SIZE: usize = 2;
 /// Frames per temporal patch.
-pub const DEFAULT_TEMPORAL_PATCH_SIZE: usize = 2;
+pub(crate) const DEFAULT_TEMPORAL_PATCH_SIZE: usize = 2;
 /// The reference image processor's merged-token cap per image.
-pub const DEFAULT_MAX_IMAGE_TOKENS: usize = 4096;
+pub(crate) const DEFAULT_MAX_IMAGE_TOKENS: usize = 4096;
 /// The reference video processor class's merged-token cap per frame; the
 /// released checkpoints raise it in their processor config.
-pub const DEFAULT_MAX_VIDEO_FRAME_TOKENS: usize = 144;
+pub(crate) const DEFAULT_MAX_VIDEO_FRAME_TOKENS: usize = 144;
 /// Normalization mean of the family.
-pub const MUSE_SPARK_MEAN: [f64; 3] = [0.5, 0.5, 0.5];
+pub(crate) const MUSE_SPARK_MEAN: [f64; 3] = [0.5, 0.5, 0.5];
 /// Normalization std of the family.
-pub const MUSE_SPARK_STD: [f64; 3] = [0.5, 0.5, 0.5];
+pub(crate) const MUSE_SPARK_STD: [f64; 3] = [0.5, 0.5, 0.5];
 
 const CHANNELS: usize = 3;
 
 /// The processor's view of one preprocessor config.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MuseSparkVisionSettings {
+pub(crate) struct MuseSparkVisionSettings {
     pub patch_size: usize,
     pub merge_size: usize,
     pub temporal_patch_size: usize,
@@ -69,7 +72,7 @@ pub struct MuseSparkVisionSettings {
 
 impl MuseSparkVisionSettings {
     /// The settings of an image config: the cap is `max_image_tokens`.
-    pub fn for_images(config: &PreProcessorConfig) -> Self {
+    pub(crate) fn for_images(config: &PreProcessorConfig) -> Self {
         Self::read(
             config,
             config
@@ -80,7 +83,7 @@ impl MuseSparkVisionSettings {
 
     /// The settings of a video config: the cap is `max_video_frame_tokens`,
     /// applied to every frame.
-    pub fn for_video(config: &PreProcessorConfig) -> Self {
+    pub(crate) fn for_video(config: &PreProcessorConfig) -> Self {
         Self::read(
             config,
             config
@@ -133,7 +136,7 @@ impl MuseSparkVisionSettings {
 
 /// One item's resize target and patch grid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ResizePlan {
+pub(crate) struct ResizePlan {
     /// Resized height in pixels.
     pub height: usize,
     /// Resized width in pixels.
@@ -157,7 +160,7 @@ pub struct ResizePlan {
 /// CPython's hash table, is reproduced here because near-square inputs have
 /// two grids of identical distortion. `max_tokens / ratio` is raised to `0.5`
 /// through the C library's `pow`, as the interpreter does.
-pub fn smart_resize_grid(
+pub(crate) fn smart_resize_grid(
     height: usize,
     width: usize,
     factor: usize,
@@ -314,10 +317,12 @@ fn resized_frame<'a>(
     })
 }
 
-/// The three channel planes of `width` x `height` interleaved RGB bytes.
+/// The three channel planes of `width` x `height` interleaved RGB bytes, in
+/// buffers of the pool: every byte of a plane is written here.
 fn planes(data: &[u8], width: usize, height: usize) -> [Vec<u8>; 3] {
     let pixels = width * height;
-    let mut planes = [vec![0u8; pixels], vec![0u8; pixels], vec![0u8; pixels]];
+    debug_assert_eq!(data.len(), pixels * CHANNELS);
+    let mut planes: [Vec<u8>; 3] = std::array::from_fn(|_| buffer_pool::take(pixels));
     let [red, green, blue] = &mut planes;
     for (((pixel, r), g), b) in data
         .as_chunks::<CHANNELS>()
@@ -373,7 +378,17 @@ fn patchify_group(
                             &mut slot[channel * channel_block..(channel + 1) * channel_block];
                         for (y, line) in block.chunks_exact_mut(patch).enumerate() {
                             let start = (top + y) * width + left;
-                            line.copy_from_slice(&plane[start..start + patch]);
+                            let source = &plane[start..start + patch];
+                            // The released patch size is known here, so its line
+                            // is copied by two moves and not by a call.
+                            if let (Ok(line), Ok(source)) = (
+                                <&mut [u8; DEFAULT_PATCH_SIZE]>::try_from(&mut *line),
+                                <&[u8; DEFAULT_PATCH_SIZE]>::try_from(source),
+                            ) {
+                                *line = *source;
+                            } else {
+                                line.copy_from_slice(source);
+                            }
                         }
                     }
                 }
@@ -389,6 +404,15 @@ fn patchify_group(
             }
         }
     }
+    frame_planes
+        .into_iter()
+        .flatten()
+        .for_each(buffer_pool::recycle);
+}
+
+/// The request's error for a patch output that cannot be reserved.
+fn refused(error: TryReserveError) -> TransformError {
+    TransformError::ReserveRefused(format!("cannot reserve Muse Spark patch output: {error}"))
 }
 
 /// Muse Spark image and video processor.
@@ -414,7 +438,7 @@ impl MuseSparkVisionProcessor {
 
     /// Resolve the image and video settings, the resize switch and the
     /// normalization of `config` once.
-    pub fn from_preprocessor_config(config: &PreProcessorConfig) -> Self {
+    pub(crate) fn from_preprocessor_config(config: &PreProcessorConfig) -> Self {
         let image = MuseSparkVisionSettings::for_images(config);
         Self {
             image,
@@ -433,24 +457,6 @@ impl MuseSparkVisionProcessor {
             MUSE_SPARK_STD,
             settings.patch_size * settings.patch_size,
         )
-    }
-
-    /// The resize plan of a `width` x `height` image under `config`.
-    pub fn image_plan(
-        width: u32,
-        height: u32,
-        config: &PreProcessorConfig,
-    ) -> Result<ResizePlan, TransformError> {
-        MuseSparkVisionSettings::for_images(config).plan(height as usize, width as usize)
-    }
-
-    /// The resize plan of a clip's `width` x `height` frames under `config`.
-    pub fn video_plan(
-        width: u32,
-        height: u32,
-        config: &PreProcessorConfig,
-    ) -> Result<ResizePlan, TransformError> {
-        MuseSparkVisionSettings::for_video(config).plan(height as usize, width as usize)
     }
 
     fn preprocess_frames<'a, I>(
@@ -473,7 +479,7 @@ impl MuseSparkVisionProcessor {
         let mut original = (0u32, 0u32);
         let mut rows_per_group = 0;
         let mut out: Vec<u8> = Vec::new();
-        let mut group: Vec<std::borrow::Cow<'a, [u8]>> = Vec::with_capacity(temporal);
+        let mut group: Vec<std::borrow::Cow<'a, [u8]>> = Vec::with_capacity(temporal.min(count));
         let mut written = 0;
         for (index, (width, height, data)) in frames.enumerate() {
             let plan = match plan {
@@ -481,8 +487,13 @@ impl MuseSparkVisionProcessor {
                 None => {
                     let first = settings.plan(height, width)?;
                     original = (width as u32, height as u32);
-                    rows_per_group = first.grid_h * first.grid_w;
-                    out = vec![0u8; groups * rows_per_group * features];
+                    rows_per_group = first.grid_h.saturating_mul(first.grid_w);
+                    out = buffer_pool::try_take(
+                        groups
+                            .saturating_mul(rows_per_group)
+                            .saturating_mul(features),
+                    )
+                    .map_err(refused)?;
                     plan = Some(first);
                     first
                 }
@@ -596,14 +607,15 @@ impl VisionPreProcessor for MuseSparkVisionProcessor {
         let do_resize = self.do_resize;
         let features = settings.patch_features();
         let mut plans = Vec::with_capacity(images.len());
-        let mut total_rows = 0;
+        let mut total_rows = 0usize;
         for image in images {
             let (width, height) = (image.width() as usize, image.height() as usize);
             let plan = settings.plan(height, width)?;
-            total_rows += plan.grid_h * plan.grid_w;
+            total_rows = total_rows.saturating_add(plan.grid_h.saturating_mul(plan.grid_w));
             plans.push(plan);
         }
-        let mut out = vec![0u8; total_rows * features];
+        let mut out =
+            buffer_pool::try_take(total_rows.saturating_mul(features)).map_err(refused)?;
         let mut tokens = Vec::with_capacity(images.len());
         let mut sizes = Vec::with_capacity(images.len());
         let mut grids = Vec::with_capacity(images.len() * 3);
@@ -968,6 +980,27 @@ mod tests {
         }
     }
 
+    #[test]
+    fn another_patch_size_keeps_the_reading_order() {
+        // Patch 16 is not the released size, so its lines take the plain copy.
+        // 64x32: four patch columns, the left half red and the right half blue.
+        let image = RgbImage::from_fn(64, 32, |x, _| {
+            Rgb(if x < 32 { [200, 0, 0] } else { [0, 0, 200] })
+        });
+        let config = PreProcessorConfig::from_json(r#"{"patch_size": 16}"#).unwrap();
+        let output = MuseSparkVisionProcessor::from_preprocessor_config(&config)
+            .preprocess(&[&DynamicImage::ImageRgb8(image)])
+            .unwrap();
+        assert_eq!(output.encoder_input.shape(), &[8, 1536]);
+        let values = output.encoder_input.as_f32().into_owned();
+        for index in 0..8 {
+            // The end of the last patch line of the red and of the blue plane.
+            let (r, b) = (values[[index, 255]], values[[index, 767]]);
+            let red = index % 4 < 2;
+            assert_eq!((r > 0.0, b > 0.0), (red, !red), "row {index}");
+        }
+    }
+
     /// A 16-bit grey image in a container longer than its samples gives the
     /// bytes of the exact image.
     #[test]
@@ -1091,12 +1124,58 @@ mod tests {
     fn video_frames_resize_under_the_per_frame_cap() {
         let config = video_config();
         // 1280x720 under 256 tokens per frame: the reference grid is 12x21.
-        let plan = MuseSparkVisionProcessor::video_plan(1280, 720, &config).unwrap();
+        let plan = MuseSparkVisionSettings::for_video(&config)
+            .plan(720, 1280)
+            .unwrap();
         assert_eq!((plan.grid_h, plan.grid_w, plan.tokens), (24, 42, 252));
         assert_eq!((plan.width, plan.height), (588, 336));
         // The same frame as an image gets the image cap instead.
-        let plan = MuseSparkVisionProcessor::image_plan(1280, 720, &image_config()).unwrap();
+        let plan = MuseSparkVisionSettings::for_images(&image_config())
+            .plan(720, 1280)
+            .unwrap();
         assert_eq!((plan.grid_h, plan.grid_w, plan.tokens), (52, 92, 1196));
+    }
+
+    /// A batch's and a clip's patch rows are buffers of the pool, and so are an
+    /// image's channel planes: with the rows written out, all are back in their
+    /// classes, and the next run writes the same bytes into them.
+    #[test]
+    fn a_batch_and_a_clip_take_their_rows_and_planes_from_the_pool() {
+        use crate::buffer_pool::{self, BufferPool};
+
+        static BATCH: BufferPool = BufferPool::new();
+        static CLIP: BufferPool = BufferPool::new();
+        let frame = DynamicImage::ImageRgb8(RgbImage::from_fn(700, 700, |x, y| {
+            Rgb([x as u8, y as u8, (x ^ y) as u8])
+        }));
+        let frames = [frame.clone(), frame.clone()];
+        let image = MuseSparkVisionProcessor::from_preprocessor_config(&image_config());
+        let video = MuseSparkVisionProcessor::from_preprocessor_config(&video_config());
+        let clip = VideoClipOptions::sampled_at(2.0);
+        let bytes = |output: Result<PreprocessedEncoderInputs, TransformError>| {
+            output
+                .unwrap()
+                .encoder_input
+                .into_bytes_as(EncoderDtype::Uint8)
+                .unwrap()
+        };
+        let reused = |pool: &'static BufferPool, kept: usize, run: &dyn Fn() -> Vec<u8>| {
+            buffer_pool::with_pool(pool, || {
+                let first = run();
+                assert_eq!(pool.held(), kept, "the buffers went back to their classes");
+                assert!(run() == first, "the bytes differ on the reused buffers");
+            });
+        };
+        // 700x700 keeps its size as an image: 2,940,000 bytes of rows and three
+        // planes of 490,000 bytes.
+        reused(&BATCH, (4 << 20) + 3 * (512 << 10), &|| {
+            bytes(image.preprocess(&[&frame]))
+        });
+        // A clip's frame shrinks to 448x448: 1,204,224 bytes of rows; its planes
+        // are under the pool's smallest class.
+        reused(&CLIP, 2 << 20, &|| {
+            bytes(video.preprocess_video(&frames, &clip))
+        });
     }
 
     #[test]
@@ -1117,5 +1196,39 @@ mod tests {
             videos.preprocess_video(&frames, &clip),
             Err(TransformError::InconsistentShapes)
         ));
+    }
+
+    /// A patch row no allocation holds, then sizes `usize` cannot count (the
+    /// patch grid of an image, the rows of a batch, the patch grid of a clip
+    /// whose temporal width no frame list holds): each reads the refused
+    /// reserve.
+    #[test]
+    fn a_patch_output_that_cannot_be_reserved_is_an_error() {
+        let processor = |patch_size, merge_size| {
+            let mut processor = MuseSparkVisionProcessor::new();
+            processor.image.patch_size = patch_size;
+            processor.image.merge_size = merge_size;
+            processor.video = processor.image;
+            processor.do_resize = false;
+            processor
+        };
+        let half = usize::BITS / 2;
+        let image = solid(1, 1, Rgb([0; 3]));
+        let clip = VideoClipOptions::sampled_at(2.0);
+        let mut long_groups = processor(1, 1 << half);
+        long_groups.video.temporal_patch_size = 1 << (usize::BITS - 2);
+
+        for result in [
+            processor(1 << 30, 1).preprocess(&[&image]),
+            processor(1, 1 << half).preprocess(&[&image]),
+            processor(1, (1 << half) - 1).preprocess(&[&image; 2]),
+            long_groups.preprocess_video(std::slice::from_ref(&image), &clip),
+        ] {
+            assert!(
+                matches!(&result, Err(TransformError::ReserveRefused(message))
+                    if message.starts_with("cannot reserve Muse Spark patch output: ")),
+                "{result:?}"
+            );
+        }
     }
 }

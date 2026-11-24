@@ -18,20 +18,21 @@ use smg_grpc_client::{
         VllmEngineClient,
     },
 };
+use smg_worker::{
+    health::circuit_breaker::{CircuitBreakerConfig, CircuitState},
+    identity::basic::Worker,
+};
 use tokio::{sync::oneshot, task::JoinHandle, time::timeout};
 use tonic::codec::Codec;
 use tool_parser::types::ToolCallItem;
 
 pub(super) use super::super::character_tokenizer::CharacterTokenizer;
 use super::super::*;
-use crate::{
-    routers::{
-        common::sse::SseReceiver,
-        grpc::{regular::processor::ResponseProcessor, test_engine::mock_engine},
-    },
-    worker::{
-        health::circuit_breaker::{CircuitBreakerConfig, CircuitState},
-        BasicWorkerBuilder, Worker, WorkerRegistry,
+use crate::routers::{
+    common::{snapshot::WorkerRegistry, sse::SseReceiver},
+    grpc::{
+        backend_client::BasicWorkerBuilder, regular::processor::ResponseProcessor,
+        test_engine::mock_engine,
     },
 };
 
@@ -3615,7 +3616,7 @@ async fn frames_of_a_chat_stream_cut_with(status: tonic::Status) -> (Vec<String>
     let (stream, server) = cut_stream(vec![chunk(0, "Hi")], status).await;
     let worker = breaker_worker();
     let selection = context::WorkerSelection::Single {
-        worker: Arc::clone(&worker),
+        worker: Arc::clone(&worker).into(),
     };
     let source =
         utils::StreamSource::new(Some(&selection), &dispatch(), metrics_labels::ENDPOINT_CHAT);
@@ -3707,7 +3708,7 @@ async fn the_load_guards_of_a_chat_stream_go_with_its_body() {
             scripted_stream(vec![chunk(0, "Hi"), complete(0, "stop")], "0").await;
         let worker = breaker_worker();
         let selection = context::WorkerSelection::Single {
-            worker: Arc::clone(&worker),
+            worker: Arc::clone(&worker).into(),
         };
         let guards = context::LoadGuards::new(&selection, None);
         assert_eq!(worker.load(), 1, "the dispatch loaded the worker");
@@ -3759,7 +3760,7 @@ async fn the_load_guards_of_a_chat_stream_go_with_its_body() {
 async fn the_load_guards_of_a_completion_stream_refused_before_its_first_frame_go_with_its_body() {
     let worker = breaker_worker();
     let selection = context::WorkerSelection::Single {
-        worker: Arc::clone(&worker),
+        worker: Arc::clone(&worker).into(),
     };
     let guards = context::LoadGuards::new(&selection, None);
     let request: openai_protocol::completion::CompletionRequest = serde_json::from_value(

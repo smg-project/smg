@@ -18,7 +18,7 @@ view:
   headers: [x-smg-routing-key]
 profiles:
   manual:
-    filter: [healthy, not-overloaded]
+    filter: [healthy, not-overloaded, not-tried]
     score: []
     pick: manual
 bindings:
@@ -26,10 +26,9 @@ bindings:
     profile: manual
     sessions:
       sticky_header: x-smg-routing-key
-      headers: [x-smg-routing-key]
       ttl_s: 3600
       sweep_s: 30
       assignment: min_group
-      inflight_cap: 2
+      inflight_cap: 65535
       issue_session_id: false
 ```

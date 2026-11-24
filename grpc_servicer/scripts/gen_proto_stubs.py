@@ -26,11 +26,15 @@ def main(argv: list[str]) -> int:
         return 2
     target = pathlib.Path(argv[1]).resolve()
     repo = pathlib.Path(__file__).resolve().parents[2]
-    proto_dir = repo / "crates" / "grpc_client" / "proto"
     package_src = repo / "crates" / "grpc_client" / "python" / "smg_grpc_proto"
-    protos = sorted(proto_dir.glob("*.proto"))
+    # The sources themselves, the gRPC client's and the worker crate's: the files
+    # the release ships. The package's own proto directory gathers them through
+    # links, or holds copies where a checkout cannot keep links, and a copy is
+    # stale after an edit of its source.
+    proto_dirs = [repo / "crates" / "grpc_client" / "proto", repo / "crates" / "worker" / "proto"]
+    protos = sorted(path for proto_dir in proto_dirs for path in proto_dir.glob("*.proto"))
     if not protos:
-        print(f"no .proto files under {proto_dir}", file=sys.stderr)
+        print(f"no .proto files under {' or '.join(map(str, proto_dirs))}", file=sys.stderr)
         return 1
 
     import grpc_tools
@@ -54,7 +58,7 @@ def main(argv: list[str]) -> int:
     well_known = pathlib.Path(grpc_tools.__file__).parent / "_proto"
     args = [
         "grpc_tools.protoc",
-        f"--proto_path={proto_dir}",
+        *(f"--proto_path={proto_dir}" for proto_dir in proto_dirs),
         f"--proto_path={well_known}",
         f"--python_out={generated}",
         f"--grpc_python_out={generated}",

@@ -31,7 +31,7 @@ use engine_servicer::{
     DEFAULT_ENGINE_SILENCE_TIMEOUT, DEFAULT_ENGINE_STARTUP_CEILING, DEFAULT_ENGINE_STARTUP_TIMEOUT,
     PIXEL_MODALITIES,
 };
-use llm_multimodal::{jpeg_turbo::TurboJpegPolicy, Modality};
+use llm_multimodal::{jpeg_turbo::TurboJpegPolicy, MediaErrorCode, Modality};
 use prost::Message;
 use pyo3::{
     exceptions::{PyRuntimeError, PyTimeoutError, PyValueError},
@@ -359,15 +359,33 @@ fn lent_bytes(owner: Bound<'_, PyAny>) -> PyResult<Bytes> {
 /// Python's answer to one media request, called once: `("ok",
 /// (prompt_token_ids, mm_features | None, aux_frames, cache_salt | None,
 /// media_identity | None))` where each aux frame is a read-only numpy view
-/// lent without a copy, or `(kind, message)` with `kind` one of `invalid`,
-/// `unavailable`, `internal`.
+/// lent without a copy, `("media", (code, message))` for a failure of the
+/// request's own media under the public `code` the router answers (one it
+/// does not know is `media_fetch_failed`, as the router reads it), or
+/// `(kind, message)` with `kind` one of `invalid`, `unavailable`, `internal`,
+/// or, for a fetch that failed for the reference's own reason, `media_client`
+/// or `media_transient`: the media's fault under the fetch-failed code, as the
+/// gateway's own pipeline on a worker reports it.
 #[pyclass(name = "_MediaDone")]
 struct MediaDone {
     tx: Mutex<Option<oneshot::Sender<Result<ProcessedMedia, MediaError>>>>,
 }
 
+/// The outcome kinds of a fetch that failed for the reference's own reason,
+/// as the servicer package's bridge names them.
+const MEDIA_CLIENT_KIND: &str = "media_client";
+const MEDIA_TRANSIENT_KIND: &str = "media_transient";
+
 #[pymethods]
 impl MediaDone {
+    /// The media-fault kinds `__call__` reads. The servicer package sends a
+    /// kind only to a callback that lists it: one that predates a kind reads
+    /// it as `internal`.
+    #[classattr]
+    fn media_fault_kinds() -> (&'static str, &'static str) {
+        (MEDIA_CLIENT_KIND, MEDIA_TRANSIENT_KIND)
+    }
+
     fn __call__(&self, kind: &str, payload: &Bound<'_, PyAny>) -> PyResult<()> {
         let outcome = match kind {
             "ok" => {
@@ -394,8 +412,28 @@ impl MediaDone {
                     media_identity,
                 })
             }
+            "media" => {
+                let (code, message): (String, String) = payload.extract()?;
+                Err(MediaError::Media {
+                    fault: smg_grpc_client::WorkerMediaFault::Client,
+                    code: MediaErrorCode::parse(&code)
+                        .unwrap_or(MediaErrorCode::FetchFailed)
+                        .as_str(),
+                    message,
+                })
+            }
             "invalid" => Err(MediaError::Invalid(payload.extract()?)),
             "unavailable" => Err(MediaError::Unavailable(payload.extract()?)),
+            MEDIA_CLIENT_KIND => Err(MediaError::Media {
+                fault: smg_grpc_client::WorkerMediaFault::Client,
+                code: MediaErrorCode::FetchFailed.as_str(),
+                message: payload.extract()?,
+            }),
+            MEDIA_TRANSIENT_KIND => Err(MediaError::Media {
+                fault: smg_grpc_client::WorkerMediaFault::Transient,
+                code: MediaErrorCode::FetchFailed.as_str(),
+                message: payload.extract()?,
+            }),
             _ => Err(MediaError::Internal(payload.extract()?)),
         };
         let sender = self

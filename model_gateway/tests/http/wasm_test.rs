@@ -19,7 +19,10 @@ use smg::{
     app_context::AppContext,
     config::RouterConfig,
     policies::PolicyRegistry,
-    routers::RouterFactory,
+    routers::{
+        common::snapshot::{WorkerMonitor, WorkerRegistry},
+        RouterFactory,
+    },
     server::{build_app, health::ProbeState, AppState},
     wasm::{
         module::{
@@ -29,7 +32,6 @@ use smg::{
         },
         module_manager::WasmModuleManager,
     },
-    worker::{WorkerMonitor, WorkerRegistry},
 };
 use smg_data_connector::{
     MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,

@@ -151,6 +151,22 @@ fn json_response_contract_requires_separation_and_an_empty_prefix() {
 }
 
 #[test]
+fn looped_checkpoints_take_the_inkling2_renderer() {
+    for config in [
+        json!({"model_type":"inkling2_loop"}),
+        json!({"architectures":["Inkling2LoopForConditionalGeneration"]}),
+    ] {
+        let (_directory, tokenizer) = tiny_tokenizer(config, true);
+        // The Inkling2 renderer's JSON contract; the Jinja one accepts this.
+        assert!(tokenizer
+            .unwrap()
+            .renderer_capabilities()
+            .validate_json_response(false, None)
+            .is_err());
+    }
+}
+
+#[test]
 fn invalid_efforts_and_unsupported_parts_fail() {
     for effort in [
         json!(-0.1),

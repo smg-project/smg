@@ -1,7 +1,8 @@
 //! The KV event sink: the admission cursor per rank in front of the index
 //! (design 5.1, the KV index row; 5.4, a standby subscribes itself).
 
-use crate::view::WorkerId;
+use super::index::LaneWriter;
+use crate::engine::view::WorkerId;
 
 /// The header facts of one batch, read by the cursor; the batch itself (the
 /// servicer's message, with the blocks the index applies) rides beside them
@@ -64,7 +65,8 @@ pub enum ResyncReason {
     /// The server lost batches it cannot name.
     DataLoss,
     StreamEnded,
-    /// The stream ended with a snapshot still arriving: a partial live set.
+    /// The stream ended with a snapshot still arriving: a partial live set,
+    /// kept until the next snapshot's start.
     SnapshotAbandoned,
     RelayRestart,
     EngineReplaced,
@@ -147,13 +149,39 @@ pub trait KvEventSink: Send + Sync {
         batch: &Self::Batch,
     ) -> BatchOutcome;
 
+    /// Run one batch of `rank` through its cursor as [`Self::admit`] does
+    /// and, where the cursor admits it, lend the row's lane to `body`: once,
+    /// inside the lane's turn, behind whatever emptying the cursor asked. A
+    /// batch the cursor skips or answers with a gap runs no body. The body
+    /// is the host's own apply rules over the lane's writer: it writes what
+    /// the batch's events leave. The writer's writes are this crate's own
+    /// ([`LaneWriter`]): the crate's worker host is the body that writes.
+    ///
+    /// The cursor reads `facts` alone, since it holds no batch to look
+    /// into: a batch that carries the engine's own clear says so in
+    /// [`BatchFacts::clears`].
+    ///
+    /// The body runs under the lane's lock and calls nothing of the sink
+    /// for its own row. A body that unwinds leaves the rank half written:
+    /// the store has the lane start over, as where the worker was reported
+    /// gone, before the unwind goes on.
+    fn admit_through(
+        &self,
+        id: WorkerId,
+        rank: u16,
+        facts: BatchFacts,
+        body: &mut dyn FnMut(&mut LaneWriter<'_>),
+    ) -> BatchOutcome;
+
     /// A new stream connection was made for the worker: the first batch on
     /// it shows where the publisher stands.
     fn reconnected(&self, id: WorkerId);
 
     /// Reset the row's cursor for `reason`: its blocks go with it, and the
     /// next stream is taken from wherever it starts. A `rank` that is not
-    /// the row's resets nothing; `None` asks no check.
+    /// the row's resets nothing; `None` asks no check. A snapshot the
+    /// stream did not finish keeps the blocks it showed: the next
+    /// snapshot's start replaces them.
     fn resync(&self, id: WorkerId, rank: Option<u16>, reason: ResyncReason);
 
     /// The cursor of one rank, when the rank has been heard from.
@@ -170,6 +198,9 @@ pub trait KvEventSink: Send + Sync {
     /// Name a model's block size: provisional until a stored block confirms
     /// it, and only ever raised.
     fn set_block_size(&self, model: &str, size: u32);
+
+    /// Drop the model's block size of record when its last events subscription leaves.
+    fn forget_block_size(&self, model: &str);
 }
 
 /// A sequence this far below the cursor is a restarted publisher, not a late
@@ -183,7 +214,7 @@ pub const GAP_CLEAR_THRESHOLD: u64 = 1_024;
 
 /// What the cursor decided about one batch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Admission {
+pub enum BatchAdmission {
     /// Apply the batch; the cursor advanced to it.
     Apply,
     /// A duplicate of something already applied; drop it.
@@ -198,7 +229,7 @@ pub enum Admission {
     Unrecovered { missed: u64, cleared: bool },
 }
 
-impl Admission {
+impl BatchAdmission {
     /// The batch is applied after this decision.
     pub const fn applies(self) -> bool {
         matches!(self, Self::Apply | Self::Restart | Self::Unrecovered { .. })
@@ -234,17 +265,17 @@ pub struct RankCursor {
 impl RankCursor {
     /// Decide what to do with a batch carrying `seq`; `clears` says whether
     /// it carries the engine's own cache clear.
-    pub fn admit(&mut self, seq: u64, clears: bool) -> Admission {
+    pub fn admit(&mut self, seq: u64, clears: bool) -> BatchAdmission {
         let fresh = std::mem::replace(&mut self.fresh, false);
         let Some(last) = self.applied else {
             self.applied = Some(seq);
             self.replay = None;
-            return Admission::Apply;
+            return BatchAdmission::Apply;
         };
         if seq == last + 1 {
             self.applied = Some(seq);
             self.replay = None;
-            return Admission::Apply;
+            return BatchAdmission::Apply;
         }
         if seq <= last {
             // A counter at its start is a new publisher too: replays never
@@ -255,24 +286,24 @@ impl RankCursor {
                 || (seq <= 1 && seq < last)
                 || seq + RESTART_WINDOW <= last;
             if !restarted {
-                return Admission::Stale;
+                return BatchAdmission::Stale;
             }
             self.applied = Some(seq);
             self.replay = None;
             self.degraded = false;
-            return Admission::Restart;
+            return BatchAdmission::Restart;
         }
         let expected = last + 1;
         if self.replay.is_none() {
             self.replay = Some((expected, seq));
-            return Admission::Replay { expected };
+            return BatchAdmission::Replay { expected };
         }
         let missed = seq - expected;
         let cleared = missed > GAP_CLEAR_THRESHOLD;
         self.replay = None;
         self.degraded = !cleared;
         self.applied = Some(seq);
-        Admission::Unrecovered { missed, cleared }
+        BatchAdmission::Unrecovered { missed, cleared }
     }
 
     /// A snapshot chunk stamped `seq` was applied: the cursor stands there,
@@ -309,5 +340,33 @@ impl RankCursor {
             replay_pending: self.replay.is_some(),
             degraded: self.degraded,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::KvEventSink;
+    use crate::store::{MemoryStore, Signals, WorkerFacts, WorkersStore};
+
+    #[test]
+    fn a_forgotten_block_size_is_gone_and_a_new_one_stands() {
+        let store = MemoryStore::new();
+        let model = "m";
+        store.upsert(WorkerFacts {
+            key: "http://a:8000".into(),
+            models: vec![model.into()],
+            signals: Signals {
+                events: true,
+                ..Signals::default()
+            },
+            ..WorkerFacts::default()
+        });
+        store.set_block_size(model, 32);
+        store.set_block_size("other", 64);
+        store.forget_block_size(model);
+        assert_eq!(store.block_size(model), None);
+        assert_eq!(store.block_size("other"), Some(64));
+        store.set_block_size(model, 16);
+        assert_eq!(store.block_size(model), Some(16));
     }
 }

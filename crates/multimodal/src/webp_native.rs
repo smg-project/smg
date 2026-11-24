@@ -298,7 +298,9 @@ mod tests {
             .expect("encode");
         assert!(is_webp(&encoded));
         match decode_webp(&encoded) {
-            Some(DynamicImage::ImageRgb8(decoded)) => assert_eq!(decoded.as_raw(), rgb.as_raw()),
+            Some(DynamicImage::ImageRgb8(decoded)) => {
+                assert!(decoded == rgb, "lossless RGB pixels differ");
+            }
             Some(other) => panic!("unexpected image type {other:?}"),
             None => assert!(
                 !webp_available(),
@@ -315,7 +317,9 @@ mod tests {
             .write_image(rgba.as_raw(), 5, 4, image::ExtendedColorType::Rgba8)
             .expect("encode");
         match decode_webp(&encoded) {
-            Some(DynamicImage::ImageRgba8(decoded)) => assert_eq!(decoded.as_raw(), rgba.as_raw()),
+            Some(DynamicImage::ImageRgba8(decoded)) => {
+                assert!(decoded == rgba, "lossless RGBA pixels differ");
+            }
             Some(other) => panic!("unexpected image type {other:?}"),
             None => assert!(!webp_available()),
         }

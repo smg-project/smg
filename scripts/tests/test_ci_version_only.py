@@ -97,7 +97,7 @@ BASE = {
     ),
     "Cargo.lock": lock(),
     "model_gateway/Cargo.toml": manifest("smg", "1.14.0-rc.1", GATEWAY_DEPENDENCIES),
-    "model_gateway/src/main.rs": "fn main() {}\n",
+    "model_gateway/src/cli/mod.rs": "fn read_args() {}\n",
     "crates/tool_parser/Cargo.toml": manifest("tool-parser", "1.10.1"),
     "crates/tool_parser/src/lib.rs": "pub fn parse() {}\n",
     "bindings/python/Cargo.toml": manifest("smg-python", "1.14.0-rc.1"),
@@ -236,12 +236,11 @@ def test_a_bump_of_the_gateway_and_its_mirrors_is_version_only(mod, crv, tree: T
 
 
 def test_a_bump_beside_one_source_line_is_not(mod, crv, tree: Tree) -> None:
-    head = tree.head(
-        {**GATEWAY_BUMP, "model_gateway/src/main.rs": 'fn main() { println!("2"); }\n'}
-    )
+    path = "model_gateway/src/cli/mod.rs"
+    head = tree.head({**GATEWAY_BUMP, path: 'fn read_args() { println!("args"); }\n'})
     done = verdict(mod, crv, tree, head)
     assert not done.version_only
-    assert done.reason == "model_gateway/src/main.rs: not a version carrier"
+    assert done.reason == f"{path}: not a version carrier"
 
 
 def test_the_lock_alone_moving_the_workspace_crates_is_version_only(mod, crv, tree: Tree) -> None:

@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 use llm_tokenizer::traits::Tokenizer;
 
-use crate::worker::WorkerRegistry;
+use crate::routers::common::snapshot::WorkerRegistry;
 
 /// The worker label that carries the engine's embedding-table size: `vocab_size` of the
 /// engine's model info, kept on every worker that reports it.

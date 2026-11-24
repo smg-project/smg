@@ -18,10 +18,13 @@ use axum::{
     Json,
 };
 use llm_tokenizer::{registry::TokenizerEntry, traits::Tokenizer, TokenizerRegistry};
-use openai_protocol::tokenize::{
-    AddTokenizerRequest, AddTokenizerResponse, CountResult, DetokenizeRequest, DetokenizeResponse,
-    ListTokenizersResponse, RemoveTokenizerResponse, TextResult, TokenizeRequest, TokenizeResponse,
-    TokenizerInfo, TokensResult,
+use openai_protocol::{
+    tokenize::{
+        AddTokenizerRequest, AddTokenizerResponse, CountResult, DetokenizeRequest,
+        DetokenizeResponse, ListTokenizersResponse, RemoveTokenizerResponse, TextResult,
+        TokenizeRequest, TokenizeResponse, TokenizerInfo, TokensResult,
+    },
+    UNKNOWN_MODEL_ID,
 };
 use smg_auth::AuditResource;
 use tracing::{debug, error, warn};
@@ -30,10 +33,10 @@ use crate::{
     admin::json::refusal,
     app_context::AppContext,
     routers::{
+        common::snapshot::WorkerRegistry,
         error,
         grpc::utils::{encode_blocking_in_batch, InPlaceBudget},
     },
-    worker::{WorkerRegistry, UNKNOWN_MODEL_ID},
     workflow::{note_tokenizer_removed, Job, TokenizerConfigRequest},
 };
 
@@ -411,9 +414,15 @@ pub async fn get_tokenizer_status(context: &Arc<AppContext>, tokenizer_id: &str)
         .into_response();
     }
 
-    // Check job status (jobs are tracked by ID)
+    // Check job status (jobs are tracked by ID): a tokenizer job's alone,
+    // the queue keeps the statuses of other kinds of job under their keys.
     if let Some(job_queue) = context.worker_job_queue.get() {
-        if let Some(job_status) = job_queue.get_status(tokenizer_id) {
+        if let Some(job_status) = job_queue.get_status(tokenizer_id).filter(|status| {
+            matches!(
+                status.job_type.as_str(),
+                Job::ADD_TOKENIZER_TYPE | Job::REMOVE_TOKENIZER_TYPE
+            )
+        }) {
             return Json(AddTokenizerResponse {
                 id: tokenizer_id.to_string(),
                 status: job_status.status.clone(),

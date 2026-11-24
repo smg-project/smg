@@ -1,9 +1,9 @@
 //! GLM-5.3 checkpoint rendering through the normal gRPC pipelines.
 
+use smg_worker::test_support::no_health_check;
+
 use super::*;
-use crate::{
-    routers::grpc::common::stages::selection_context_length, worker::test_support::no_health_check,
-};
+use crate::routers::grpc::common::stages::selection_context_length;
 
 /// Build a checkpoint-backed tokenizer without any multimodal components.
 async fn glm53_components(worker_registry: Arc<WorkerRegistry>) -> Arc<SharedComponents> {
@@ -378,6 +378,25 @@ fn glm53_media_is_recorded_before_the_template_renders_it_as_text() {
             &body,
             "smg_mm_media_items_total",
             &[model.as_str(), "modality=\"image\"", "source=\"data_url\""]
+        ),
+        Some(1.0),
+        "{body}"
+    );
+    // The request's one image, under the class of a `data:` URL.
+    assert_eq!(
+        sample(
+            &body,
+            "smg_mm_request_images_sum",
+            &[model.as_str(), "source_class=\"inline\""]
+        ),
+        Some(1.0),
+        "{body}"
+    );
+    assert_eq!(
+        sample(
+            &body,
+            "smg_mm_request_images_count",
+            &[model.as_str(), "source_class=\"inline\""]
         ),
         Some(1.0),
         "{body}"

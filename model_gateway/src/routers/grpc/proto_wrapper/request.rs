@@ -9,6 +9,7 @@ use smg_grpc_client::{
     mlx_proto as mlx, sglang_proto as sglang, tokenspeed_proto as tokenspeed,
     trtllm_proto as trtllm, vllm_proto as vllm,
 };
+use smg_worker::identity::basic::RuntimeType;
 
 use super::{vllm_mm_hash_identity, vllm_mm_identity, EncodeItemBootstrapInfo, ProtoEmbedRequest};
 
@@ -115,8 +116,7 @@ impl ProtoGenerateRequest {
     }
 
     /// The runtime whose message type this request is.
-    pub fn runtime_type(&self) -> crate::worker::RuntimeType {
-        use crate::worker::RuntimeType;
+    pub fn runtime_type(&self) -> RuntimeType {
         match self {
             Self::Sglang(_) => RuntimeType::Sglang,
             Self::Vllm(_) => RuntimeType::Vllm,

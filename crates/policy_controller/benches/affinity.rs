@@ -24,7 +24,7 @@ use column::build_column;
 use common::{build_view, engine_of, fleet};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use placed::page_start_buffer;
-use smg_policy_controller::{AffinityFacts, Constraints, PoolFacts, RequestFacts, Scratch};
+use smg_policy_controller::engine::{AffinityFacts, Constraints, PoolFacts, RequestFacts, Scratch};
 
 const SIZES: [usize; 3] = [8, 64, 512];
 
@@ -75,7 +75,7 @@ fn decide(c: &mut Criterion) {
             pool_size: n as u32,
             generation: 1,
             // Every row of the bench's fleet reports a rate.
-            rated: true,
+            reported: true,
             ..PoolFacts::default()
         };
         let cx = Constraints::default();

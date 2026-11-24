@@ -1,12 +1,16 @@
 //! The gRPC disaggregation mode (Regular/PD/EPD).
 
+use smg_worker::identity::basic::{ConnectionMode, WorkerType};
+
 use crate::{
     config::types::{RouterConfig, RoutingMode},
-    routers::grpc::{
-        common::stages::WorkerSelectionMode,
-        context::{ExecutionPlanKind, PlanSettings},
+    routers::{
+        common::snapshot::RoutingPool,
+        grpc::{
+            common::stages::WorkerSelectionMode,
+            context::{ExecutionPlanKind, PlanSettings},
+        },
     },
-    worker::{ConnectionMode, RoutingPool},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -30,6 +34,19 @@ impl Mode {
                 RoutingPool::GrpcPrefill,
                 RoutingPool::GrpcDecode,
             ],
+        }
+    }
+
+    /// The role whose workers take a request's pixels: the regular workers;
+    /// a pair's prefill workers, whose side takes the request's media
+    /// whole; the encode workers of an encode/prefill/decode fleet. The
+    /// rule that refuses images for a model without a vision encoder judges
+    /// these workers alone.
+    pub(crate) fn pixels_go_to(self) -> WorkerType {
+        match self {
+            Mode::Regular => WorkerType::Regular,
+            Mode::PrefillDecode => WorkerType::Prefill,
+            Mode::EncodePrefillDecode => WorkerType::Encode,
         }
     }
 
@@ -100,6 +117,7 @@ mod tests {
         bool,
         &'static str,
         &'static [RoutingPool],
+        WorkerType,
     );
 
     #[test]
@@ -112,6 +130,7 @@ mod tests {
                 false,
                 "grpc",
                 &[RoutingPool::GrpcPipelineRegular],
+                WorkerType::Regular,
             ),
             (
                 Mode::PrefillDecode,
@@ -120,6 +139,7 @@ mod tests {
                 true,
                 "grpc_pd",
                 &[RoutingPool::GrpcPrefill, RoutingPool::GrpcDecode],
+                WorkerType::Prefill,
             ),
             (
                 Mode::EncodePrefillDecode,
@@ -132,9 +152,10 @@ mod tests {
                     RoutingPool::GrpcPrefill,
                     RoutingPool::GrpcDecode,
                 ],
+                WorkerType::Encode,
             ),
         ];
-        for (m, ws, pk, inject, rt, pools) in cases {
+        for (m, ws, pk, inject, rt, pools, pixels) in cases {
             assert_eq!(m.worker_selection(), ws, "worker_selection {m:?}");
             assert_eq!(m.plan_kind(), pk, "plan_kind {m:?}");
             assert_eq!(m.inject_pd_metadata(), inject, "inject_pd_metadata {m:?}");
@@ -154,6 +175,9 @@ mod tests {
                 pools,
                 "multimodal_wire_pools {m:?}"
             );
+            // The role the image rule judges: the workers the mode sends a
+            // request's pixels to.
+            assert_eq!(m.pixels_go_to(), pixels, "pixels_go_to {m:?}");
         }
     }
 }

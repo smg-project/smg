@@ -2,47 +2,45 @@
 //! ranks, what the gateway's rank cache is handed step by step (a poll's
 //! answer, a poll that failed, the worker's loads dropped) and the requests
 //! that asked the policy for a rank. A row holds the rank each request
-//! took, `null` where the gateway found none. Its replay writes each step
-//! through the store's load sink, as this crate's driver writes it, decides
-//! each request over the rows of the worker's ranks under the resident-work
-//! scorer picked by `best`, and books the request's tokens at its dispatch.
+//! took, `null` where the gateway found none.
 //!
-//! This crate decides a rank by rules of its own, and [`APART`] names each
-//! recorded row they decide apart from the gateway, with the ranks here.
+//! What this replay proves: the worker crate's own rank choice, under the
+//! load monitor a host of the engine over worker lists builds (the bed of
+//! the load sheets, [`Bed`]). A poll goes through the monitor's poll of the
+//! worker's group, a failed poll is the engine failing the call, the
+//! worker's loads are dropped by the monitor's own loop, and a request asks
+//! the monitor's rank cache for its rank, which books the request's tokens
+//! on it, as the gateway's policy does. The worker stands as one object for
+//! all its ranks, as the recording gateway held it, or as the object of its
+//! one rank where the row says it stands for one. Every row replays as
+//! recorded.
+//!
+//! What it does not prove: the engine's choice among rank objects. The
+//! engine serves no rank option. Routing settings that ask for the
+//! gateway's minimum-tokens rank choice make no document
+//! (`refuse_unsupported` in `src/document/routing_settings.rs`: "under the
+//! controller a rank is a candidate of the profile"), and no rank is chosen
+//! behind a pick. Where each rank is a worker object the engine picks among
+//! them by its profile, and these rows are not its answers.
 
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse};
 use serde::Deserialize;
-use smg_policy_controller::{
-    ingest::rows,
-    store::{
-        Ask, GatewayId, LoadSink, LoadSource, MemoryStore, ViewBuffers, WorkerFacts, WorkerStatus,
-        WorkersStore,
-    },
-    AppliedSpec, Constraints, Engine, Lease, Lifecycle, LoadRow, PolicySpec, PoolFacts,
-    PowerOfTwoMetric, RequestFacts, Role, Scratch, Side, SignalSource, WorkerId,
+use smg_policy_controller::store::Overload;
+use smg_worker::{
+    health::overload::OverloadThresholds,
+    worker::{SchedulerLoadSnapshot, WorkerLoadResponse},
 };
+
+use super::load_bed::{paused, Bed, Laid, STEP};
 
 /// What these rows record, as a sheet's head names it: the rank the
 /// gateway's minimum-tokens policy gives a request on one worker.
 pub const POLICY: &str = "minimum_tokens";
 
-const MODEL: &str = "m";
-
-/// The report period the replay tells the store, as this crate's driver
-/// tells its own, and the time between two writes of a row's loads. A
-/// request follows the step before it by [`SOON`].
-const PERIOD: Duration = Duration::from_secs(10);
-const SOON: Duration = Duration::from_millis(1);
-
-/// The worker's engine: the key of a worker of one rank, and what the rows
-/// of a worker's ranks share.
-const ENGINE: &str = "http://w0:8000";
-
-/// One rank's row in a poll's answer: the tokens its cache uses, its token
-/// capacity, and the context tokens of the requests it holds where the rank
-/// reports them.
+/// One rank's row in a poll's answer: the tokens its cache uses, which is
+/// the count the rank cache reads, its token capacity, and the context
+/// tokens of the requests it holds where the rank reports them.
 #[derive(Clone, Copy, Debug, Deserialize)]
 struct Figures {
     used: u32,
@@ -87,328 +85,78 @@ struct Sheet {
     rows: Vec<Row>,
 }
 
-/// What a request takes here in a row decided apart: one rank, or a draw
-/// among the worker's ranks, which names any of them.
-#[derive(Clone, Copy, Debug)]
-enum Here {
-    Rank(u16),
-    Drawn,
-}
-
-/// A recorded row this crate decides apart from the gateway, by a rule of
-/// its own that `rule` states: its replay must give `here`, request by
-/// request, and its first `each_once` requests must take as many different
-/// ranks. An entry that names no draw fails the day its row replays as
-/// recorded, so it cannot outlive its rule; every entry fails on any other
-/// outcome.
-struct Apart {
-    row: &'static str,
-    here: &'static [Here],
-    each_once: usize,
-    rule: &'static str,
-}
-
-/// The rows decided apart. The gateway's rank cache reads the tokens a
-/// rank's cache uses, from a row that carries token capacity, forgets a
-/// worker's ranks at an answer with no entry, and takes the lowest of equal
-/// ranks. The store reads the context tokens of the requests a rank holds
-/// and keeps what is on file through an answer with no row. It hands a
-/// decision every rank of the worker: a rank with nothing on file scores
-/// beside its peers, and equal ranks are drawn. A rank an answer leaves out
-/// beside a rank it names is avoided on both sides: those rows replay.
-const APART: &[Apart] = &[
-    Apart {
-        row: "equal-ranks-go-to-the-lowest-rank",
-        here: &[Here::Drawn, Here::Drawn, Here::Drawn, Here::Drawn],
-        each_once: 3,
-        rule: "equal ranks are the picker's draw, where the gateway takes the lowest",
-    },
-    Apart {
-        row: "a-row-with-no-token-capacity-is-no-rank",
-        here: &[Here::Rank(0), Here::Rank(0)],
-        each_once: 0,
-        rule: "a rank's row is read whatever token capacity it carries",
-    },
-    Apart {
-        row: "an-answer-with-no-token-capacity-drops-the-worker-s-ranks",
-        here: &[Here::Rank(0), Here::Rank(0), Here::Rank(0)],
-        each_once: 0,
-        rule: "a rank's row is read whatever token capacity it carries",
-    },
-    Apart {
-        row: "an-answer-with-no-row-drops-the-worker-s-ranks",
-        here: &[Here::Rank(0), Here::Rank(0)],
-        each_once: 0,
-        rule: "an answer with no row is the word that no report came, and nothing on file changes",
-    },
-    Apart {
-        row: "a-worker-never-polled-has-no-rank",
-        here: &[Here::Drawn, Here::Drawn],
-        each_once: 2,
-        rule: "a rank with nothing on file is a rank, and the requests in flight part equal ranks",
-    },
-    Apart {
-        row: "an-evicted-worker-has-no-rank-until-its-next-answer",
-        here: &[Here::Rank(0), Here::Drawn, Here::Rank(0)],
-        each_once: 0,
-        rule: "a rank with nothing on file is a rank, and the requests in flight part equal ranks",
-    },
-    Apart {
-        row: "a-worker-of-one-rank-the-answer-omits-has-none",
-        here: &[Here::Rank(1)],
-        each_once: 0,
-        rule: "a worker of one row answers with its row",
-    },
-    Apart {
-        row: "an-answer-with-no-row-drops-the-one-rank-of-its-worker",
-        here: &[Here::Rank(1), Here::Rank(1)],
-        each_once: 0,
-        rule: "a worker of one row answers with its row",
-    },
-    Apart {
-        row: "the-used-tokens-decide-where-a-rank-holds-fewer-context-tokens",
-        here: &[Here::Rank(1), Here::Rank(1)],
-        each_once: 0,
-        rule: "a rank is scored by the context tokens of its requests, not by the tokens its cache uses",
-    },
-    Apart {
-        row: "a-rank-that-reports-no-context-tokens-is-a-rank-by-its-used-tokens",
-        here: &[Here::Drawn, Here::Drawn, Here::Drawn],
-        each_once: 2,
-        rule: "where no rank counts its context tokens the requests in flight decide",
-    },
-];
-
-/// The generation that decides a rank: the resident-work scorer over every
-/// row, a request priced at no tokens of its own, picked by `best`.
-fn document() -> PolicySpec {
-    let mut document =
-        PolicySpec::power_of_two(PowerOfTwoMetric::ResidentTokens { request_tokens: 0 })
-            .expect("a preset form of this build");
-    document.generation = 1;
-    document
-}
-
-/// One rank's figures as the row a host writes for the rank: through the
-/// crate's own row builder, from the report of that rank alone, read at the
-/// instant it was sampled.
-fn load_row(figures: Figures, at: Instant) -> LoadRow {
-    let count = |n: u32| i32::try_from(n).expect("a recorded count fits the wire's field");
-    let wire = WorkerLoadResponse {
-        dp_rank_count: 1,
-        loads: vec![SchedulerLoadSnapshot {
-            num_used_tokens: count(figures.used),
-            max_total_num_tokens: count(figures.capacity),
-            num_resident_tokens: figures.resident.map(i64::from),
-            ..SchedulerLoadSnapshot::default()
-        }],
-        ..WorkerLoadResponse::default()
-    };
-    rows::load_row(&wire, Role::Single, at, at, SignalSource::Poll)
-}
-
-/// The store with the row's worker in it and the engine that decides over
-/// its rows: a member row a rank of one engine, or the one row of a worker
-/// that stands for one rank.
-struct Bed {
-    store: MemoryStore,
-    engine: Engine,
-    /// The member rows, each with its rank.
-    ids: Vec<(WorkerId, u16)>,
-    out: ViewBuffers,
-    scratch: Scratch,
-}
-
-impl Bed {
-    /// The bed, or the validator's words when this crate does not build the
-    /// row's form.
-    fn new(row: &Row) -> Result<Self, String> {
-        let document = document();
-        let engine = document.validate().map_err(|err| err.to_string())?;
-        let applied = AppliedSpec::validate(&document).map_err(|err| err.to_string())?;
-        let store = MemoryStore::new();
-        let ranks: Vec<u16> = match row.pinned {
-            Some(rank) => vec![rank],
-            None => (0..row.ranks).collect(),
-        };
-        let ids = ranks
-            .into_iter()
-            .map(|rank| {
-                let key = if row.ranks == 1 {
-                    ENGINE.to_string()
-                } else {
-                    format!("{ENGINE}@{rank}")
-                };
-                let id = store
-                    .upsert(WorkerFacts {
-                        key,
-                        engine: ENGINE.to_string(),
-                        incarnation: 1,
-                        models: vec![MODEL.to_string()],
-                        dp_rank: rank,
-                        dp_size: row.ranks,
-                        ..WorkerFacts::default()
-                    })
-                    .id();
-                let revision = WorkersStore::get(&store, id).expect("the row").revision;
-                store
-                    .set_status(id, WorkerStatus::Ready, revision)
-                    .expect("ready");
-                (id, rank)
+/// A poll's answer as an engine sends it: one entry for each rank it names.
+fn answer(ranks: u16, figures: &[Option<Figures>]) -> WorkerLoadResponse {
+    let count = |n: u32| i32::try_from(n).expect("a recorded count fits the report's field");
+    WorkerLoadResponse {
+        dp_rank_count: i32::from(ranks),
+        loads: figures
+            .iter()
+            .enumerate()
+            .filter_map(|(at, figures)| {
+                figures.map(|figures| SchedulerLoadSnapshot {
+                    dp_rank: i32::try_from(at).expect("a rank fits the report's field"),
+                    num_used_tokens: count(figures.used),
+                    max_total_num_tokens: count(figures.capacity),
+                    num_resident_tokens: figures.resident.map(i64::from),
+                    ..SchedulerLoadSnapshot::default()
+                })
             })
-            .collect();
-        store.apply(applied).expect("the first generation applies");
-        // The driver tells its poll interval where it is built.
-        assert!(store.heard_every(PERIOD), "the first period told");
-        Ok(Self {
-            store,
-            engine,
-            ids,
-            out: ViewBuffers::default(),
-            scratch: Scratch::new(),
-        })
+            .collect(),
+        ..WorkerLoadResponse::default()
     }
+}
 
-    /// One step at `now`: a write of the worker's loads through the load
-    /// sink, each as the crate's driver writes it, or a request, whose rank
-    /// is returned. An engine's answer goes in whole in one report, a poll
-    /// that failed as an answer with no row, and the eviction rank by rank.
-    fn step(&mut self, step: &Step, now: Instant, seed: u64) -> Option<Option<u16>> {
-        match step {
-            Step::Poll(figures) => {
-                let answer: Vec<_> = self
-                    .ids
-                    .iter()
-                    .map(|&(id, rank)| {
-                        let figures = figures.get(usize::from(rank)).copied().flatten();
-                        (id, rank, figures.map(|figures| load_row(figures, now)))
-                    })
-                    .collect();
-                self.store.report(&answer, now, LoadSource::Poll);
-            }
-            Step::Failed => {
-                let answer: Vec<_> = self
-                    .ids
-                    .iter()
-                    .map(|&(id, rank)| (id, rank, None))
-                    .collect();
-                self.store.report(&answer, now, LoadSource::Poll);
-            }
-            Step::Evict => {
-                for &(id, _) in &self.ids {
-                    self.store.evict(id);
+/// The row's worker among a host's objects: one object for all its ranks,
+/// or the object of the one rank it stands for. The rank cache reads token
+/// counts alone, so the holder states no threshold and the worker none of
+/// its own.
+fn bed(row: &Row) -> Result<Bed, String> {
+    let no_veto = OverloadThresholds {
+        waiting_requests: None,
+        token_usage: None,
+    };
+    let laid = row.pinned.map_or(Laid::Whole, Laid::Rank);
+    Bed::new(row.ranks, laid, no_veto, Overload::default())
+}
+
+/// The rank the monitor's rank cache gives each request of the row, `None`
+/// where it finds none.
+fn replay(row: &Row) -> Result<Vec<Option<u16>>, String> {
+    paused(async {
+        let bed = bed(row)?;
+        bed.start().await;
+        let [worker] = bed.workers() else {
+            return Err(format!("{} objects of one worker", bed.workers().len()));
+        };
+        let cache = &bed.monitor().worker_load_manager;
+        let start = Instant::now();
+        let mut picks = Vec::new();
+        for (at, step) in row.steps.iter().enumerate() {
+            let now = start + STEP * (at as u32 + 1);
+            match step {
+                Step::Poll(figures) => bed.poll(Some(answer(row.ranks, figures)), now).await,
+                Step::Failed => bed.poll(None, now).await,
+                Step::Evict => bed.evict().await?,
+                Step::Pick { cost } => {
+                    let cost = isize::try_from(*cost).map_err(|err| err.to_string())?;
+                    // The select the gateway's policy forwards a request
+                    // to: it names the rank and books the cost on it.
+                    let rank = cache.select_and_increment_lowest_dp_load(worker.as_ref(), cost);
+                    let rank = rank.map(u16::try_from).transpose();
+                    picks.push(rank.map_err(|err| err.to_string())?);
                 }
             }
-            Step::Pick { cost } => return Some(self.pick(*cost, now, seed)),
         }
-        if let Some(due) = self.store.publish_due() {
-            self.store.publish(due);
-        }
-        None
-    }
-
-    /// One request decided over the rows of the worker's ranks and
-    /// dispatched, as a host commits it: the rank it took, or `None` where
-    /// the decision names no row.
-    fn pick(&mut self, cost: u32, now: Instant, seed: u64) -> Option<u16> {
-        let ask = Ask {
-            gateway: GatewayId(1),
-            now,
-            pinned: None,
-            affinity: false,
-        };
-        let built = self
-            .store
-            .build_view(MODEL, Role::Single, &ask, &mut self.out)?;
-        let now_micros = self.store.micros(now);
-        let facts = RequestFacts {
-            model: MODEL,
-            prompt_tokens: cost,
-            seed,
-            now_micros,
-            ..RequestFacts::default()
-        };
-        let pool = PoolFacts {
-            pool_size: built.pool_size,
-            generation: 1,
-            ..PoolFacts::default()
-        };
-        let decision = self.engine.decide(
-            &facts,
-            &pool,
-            &self.out.candidates,
-            &Constraints::default(),
-            &mut self.scratch,
-        );
-        let target = *decision.pick()?.targets.first()?;
-        let lease = Lease {
-            issued_micros: now_micros,
-            tokens: cost,
-            ..Lease::default()
-        };
-        self.engine.on_dispatched(&lease, &target, Side::Single, 0);
-        Some(target.dp_rank)
-    }
+        Ok(picks)
+    })
 }
 
-/// The rank each request of the row takes here, or the validator's words
-/// for a form this crate does not build. A write of the loads follows the
-/// step before it by a report period and a request by a moment, so no
-/// request is older than the answer after it.
-fn replay(row: &Row) -> Result<Vec<Option<u16>>, String> {
-    let mut bed = Bed::new(row)?;
-    let mut now = Instant::now();
-    let mut picks = Vec::new();
-    for (at, step) in row.steps.iter().enumerate() {
-        now += if matches!(step, Step::Pick { .. }) {
-            SOON
-        } else {
-            PERIOD
-        };
-        if let Some(pick) = bed.step(step, now, at as u64) {
-            picks.push(pick);
-        }
-    }
-    Ok(picks)
-}
-
-/// `None` when a row's ranks here are the recorded ones, or what its entry
-/// gives when [`APART`] names the row; the reason otherwise. A row decided
-/// apart with no draw that replays as recorded is a defect of its entry,
-/// whose rule decides nothing of it.
+/// `None` when the ranks a row's requests take here are the recorded ones;
+/// the reason otherwise.
 fn held(row: &Row, here: &[Option<u16>]) -> Option<String> {
     let recorded = row.outcome.sequence.as_slice();
-    let Some(apart) = APART.iter().find(|apart| apart.row == row.name) else {
-        return (here != recorded).then(|| format!("recorded {recorded:?}, replayed {here:?}"));
-    };
-    let drawn = apart.here.iter().any(|pick| matches!(pick, Here::Drawn));
-    if !drawn && here == recorded {
-        return Some(format!(
-            "it replays as recorded now ({}): take the row out of APART",
-            apart.rule
-        ));
-    }
-    let fits = here.len() == apart.here.len()
-        && here
-            .iter()
-            .zip(apart.here)
-            .all(|(pick, want)| match (pick, want) {
-                (Some(rank), Here::Rank(want)) => rank == want,
-                (Some(rank), Here::Drawn) => *rank < row.ranks,
-                (None, _) => false,
-            });
-    let mut seen = Vec::with_capacity(apart.each_once);
-    let once = here.iter().take(apart.each_once).all(|pick| {
-        let new = !seen.contains(pick);
-        seen.push(*pick);
-        new
-    });
-    (!(fits && once)).then(|| {
-        format!(
-            "recorded {recorded:?}, apart by its entry {:?} with the first {} each once, replayed {here:?}",
-            apart.here, apart.each_once
-        )
-    })
+    (here != recorded).then(|| format!("recorded {recorded:?}, replayed {here:?}"))
 }
 
 /// The rows of a sheet replayed: how many, and what did not replay.
@@ -436,22 +184,60 @@ pub fn replay_rows(text: &str, source: &str) -> (usize, Vec<String>) {
     (sheet.rows.len(), defects)
 }
 
-/// Every row decided apart is an inline row, so every run of the suite
-/// checks that its rule still decides it, and how.
+/// The sheet whole: every row as recorded, fifteen with the worker as one
+/// object for all its ranks and three with the worker as one rank's object.
 #[test]
-fn every_rank_row_decided_apart_is_an_inline_row() {
-    let sheet: Sheet = serde_json::from_str(INLINE).expect("the inline rows");
-    for apart in APART {
-        assert!(
-            sheet.rows.iter().any(|row| row.name == apart.row),
-            "{} is decided apart and is no inline row",
-            apart.row
-        );
+fn the_sheet_replays_whole_under_both_layouts_it_records() {
+    let sheet: Sheet =
+        serde_json::from_str(include_str!("sheets/minimum_tokens.json")).expect("the sheet");
+    let mut pinned = 0;
+    for row in &sheet.rows {
+        let here = replay(row).expect("a row this crate builds");
+        assert_eq!(held(row, &here), None, "{}", row.name);
+        pinned += usize::from(row.pinned.is_some());
     }
+    assert_eq!((sheet.rows.len(), pinned), (18, 3));
 }
 
-/// Rows of the sheet, copied: every row decided apart and a few that
-/// replay as recorded.
+/// A row is held to the rank each of its requests took: a copied row whose
+/// first request recorded another answer is a defect by that request.
+#[test]
+fn a_row_that_recorded_another_rank_is_a_defect() {
+    let mut sheet: serde_json::Value = serde_json::from_str(INLINE).expect("the inline rows");
+    let row = &mut sheet["rows"][0];
+    let taken = row["outcome"]["sequence"][0].take();
+    assert!(taken.is_u64(), "the first inline row's request took a rank");
+    let row: Row = serde_json::from_value(row.take()).expect("a row");
+    let here = replay(&row).expect("a row this crate builds");
+    let why = held(&row, &here).expect("a request recorded with no rank");
+    assert!(why.starts_with("recorded [None]"), "{why}");
+}
+
+/// A worker that stands for one rank of its engine is laid as that rank's
+/// object, and one that stands for every rank states the width and no rank.
+#[test]
+fn a_worker_of_one_rank_is_laid_as_that_ranks_object() {
+    let sheet: Sheet = serde_json::from_str(INLINE).expect("the inline rows");
+    let mut seen = [false; 2];
+    for row in &sheet.rows {
+        let bed = bed(row).expect("a row this crate builds");
+        let [worker] = bed.workers() else {
+            panic!("{} objects of one worker", bed.workers().len());
+        };
+        let width = Some(usize::from(row.ranks));
+        assert_eq!(
+            (worker.dp_rank(), worker.dp_size()),
+            (row.pinned.map(usize::from), width),
+            "{}",
+            row.name
+        );
+        seen[usize::from(row.pinned.is_some())] = true;
+    }
+    assert_eq!(seen, [true; 2], "an inline row of each layout");
+}
+
+/// A few of the sheet's rows, copied whole: every run of the suite replays
+/// them.
 pub const INLINE: &str = r#"{
   "recorded_from": "615542c4c69bb28fb3cb3e9e4ee29a8e2be0a7bc",
   "policy": "minimum_tokens",
@@ -493,6 +279,19 @@ pub const INLINE: &str = r#"{
       "outcome": {"sequence": [0, 1, 2, 0]}
     },
     {
+      "name": "a-taken-answer-replaces-the-ranks-and-their-bookings",
+      "ranks": 2,
+      "pinned": null,
+      "steps": [
+        {"poll": [{"used": 100, "capacity": 8192, "resident": 100}, {"used": 200, "capacity": 8192, "resident": 200}]},
+        {"pick": {"cost": 500}},
+        {"poll": [{"used": 100, "capacity": 8192, "resident": 100}, {"used": 200, "capacity": 8192, "resident": 200}]},
+        {"pick": {"cost": 500}},
+        {"pick": {"cost": 1}}
+      ],
+      "outcome": {"sequence": [0, 0, 1]}
+    },
+    {
       "name": "a-rank-an-answer-omits-is-no-rank-at-once",
       "ranks": 3,
       "pinned": null,
@@ -517,20 +316,6 @@ pub const INLINE: &str = r#"{
       "outcome": {"sequence": [1, 1]}
     },
     {
-      "name": "an-answer-with-no-token-capacity-drops-the-worker-s-ranks",
-      "ranks": 2,
-      "pinned": null,
-      "steps": [
-        {"poll": [{"used": 100, "capacity": 8192, "resident": 100}, {"used": 200, "capacity": 8192, "resident": 200}]},
-        {"pick": {"cost": 1}},
-        {"poll": [{"used": 100, "capacity": 0, "resident": 100}, {"used": 200, "capacity": 0, "resident": 200}]},
-        {"pick": {"cost": 1}},
-        {"poll": [{"used": 100, "capacity": 8192, "resident": 100}, {"used": 200, "capacity": 8192, "resident": 200}]},
-        {"pick": {"cost": 1}}
-      ],
-      "outcome": {"sequence": [0, null, 0]}
-    },
-    {
       "name": "an-answer-with-no-row-drops-the-worker-s-ranks",
       "ranks": 2,
       "pinned": null,
@@ -543,15 +328,17 @@ pub const INLINE: &str = r#"{
       "outcome": {"sequence": [0, null]}
     },
     {
-      "name": "a-worker-never-polled-has-no-rank",
+      "name": "a-failed-poll-keeps-the-last-answer-and-its-bookings",
       "ranks": 2,
       "pinned": null,
       "steps": [
-        {"pick": {"cost": 1}},
+        {"poll": [{"used": 100, "capacity": 8192, "resident": 100}, {"used": 200, "capacity": 8192, "resident": 200}]},
+        {"pick": {"cost": 150}},
         "failed",
+        {"pick": {"cost": 1}},
         {"pick": {"cost": 1}}
       ],
-      "outcome": {"sequence": [null, null]}
+      "outcome": {"sequence": [0, 1, 1]}
     },
     {
       "name": "an-evicted-worker-has-no-rank-until-its-next-answer",
@@ -568,17 +355,6 @@ pub const INLINE: &str = r#"{
       "outcome": {"sequence": [0, null, 0]}
     },
     {
-      "name": "a-worker-of-one-rank-takes-its-own-rank-alone",
-      "ranks": 2,
-      "pinned": 1,
-      "steps": [
-        {"poll": [{"used": 10, "capacity": 8192, "resident": 10}, {"used": 500, "capacity": 8192, "resident": 500}]},
-        {"pick": {"cost": 1}},
-        {"pick": {"cost": 1}}
-      ],
-      "outcome": {"sequence": [1, 1]}
-    },
-    {
       "name": "a-worker-of-one-rank-the-answer-omits-has-none",
       "ranks": 2,
       "pinned": 1,
@@ -587,18 +363,6 @@ pub const INLINE: &str = r#"{
         {"pick": {"cost": 1}}
       ],
       "outcome": {"sequence": [null]}
-    },
-    {
-      "name": "an-answer-with-no-row-drops-the-one-rank-of-its-worker",
-      "ranks": 2,
-      "pinned": 1,
-      "steps": [
-        {"poll": [{"used": 10, "capacity": 8192, "resident": 10}, {"used": 500, "capacity": 8192, "resident": 500}]},
-        {"pick": {"cost": 1}},
-        {"poll": [null, null]},
-        {"pick": {"cost": 1}}
-      ],
-      "outcome": {"sequence": [1, null]}
     },
     {
       "name": "the-used-tokens-decide-where-a-rank-holds-fewer-context-tokens",
@@ -610,38 +374,7 @@ pub const INLINE: &str = r#"{
         {"pick": {"cost": 1}}
       ],
       "outcome": {"sequence": [0, 0]}
-    },
-    {
-      "name": "a-rank-that-reports-no-context-tokens-is-a-rank-by-its-used-tokens",
-      "ranks": 2,
-      "pinned": null,
-      "steps": [
-        {"poll": [{"used": 100, "capacity": 8192, "resident": null}, {"used": 200, "capacity": 8192, "resident": null}]},
-        {"pick": {"cost": 1}},
-        {"pick": {"cost": 200}},
-        {"pick": {"cost": 1}}
-      ],
-      "outcome": {"sequence": [0, 0, 1]}
-    },
-    {
-      "name": "a-rank-five-answers-omit-is-no-rank-after-any-of-them",
-      "ranks": 3,
-      "pinned": null,
-      "steps": [
-        {"poll": [{"used": 100, "capacity": 8192, "resident": 100}, {"used": 200, "capacity": 8192, "resident": 200}, {"used": 300, "capacity": 8192, "resident": 300}]},
-        {"pick": {"cost": 1}},
-        {"poll": [null, {"used": 200, "capacity": 8192, "resident": 200}, {"used": 300, "capacity": 8192, "resident": 300}]},
-        {"pick": {"cost": 1}},
-        {"poll": [null, {"used": 200, "capacity": 8192, "resident": 200}, {"used": 300, "capacity": 8192, "resident": 300}]},
-        {"pick": {"cost": 1}},
-        {"poll": [null, {"used": 200, "capacity": 8192, "resident": 200}, {"used": 300, "capacity": 8192, "resident": 300}]},
-        {"pick": {"cost": 1}},
-        {"poll": [null, {"used": 200, "capacity": 8192, "resident": 200}, {"used": 300, "capacity": 8192, "resident": 300}]},
-        {"pick": {"cost": 1}},
-        {"poll": [null, {"used": 200, "capacity": 8192, "resident": 200}, {"used": 300, "capacity": 8192, "resident": 300}]},
-        {"pick": {"cost": 1}}
-      ],
-      "outcome": {"sequence": [0, 1, 1, 1, 1, 1]}
     }
   ]
-}"#;
+}
+"#;

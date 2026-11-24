@@ -16,14 +16,16 @@ use llm_multimodal::{
     ModelSpecificValue, PlaceholderRange, PreprocessedEncoderInputs,
 };
 use smg_grpc_client::common_proto as common;
+use smg_worker::identity::basic::RuntimeType;
 use tracing::{info, warn};
 
 use super::{
     capability::ensure_backend_supports_modalities,
     log_mm_timing_enabled,
     serialize::{
-        model_specific_to_tensor_bytes, serialize_encoder_input_owned, serialize_model_specific,
-        serialize_tokenspeed_encoder_input, serialize_tokenspeed_encoder_input_owned, wire_dtype,
+        model_specific_to_tensor_bytes, recycle_encoder_input, serialize_encoder_input_owned,
+        serialize_model_specific, serialize_tokenspeed_encoder_input,
+        serialize_tokenspeed_encoder_input_owned, wire_dtype,
     },
     transport::{
         mm_encoder_input_dtype, mm_sglang_encoder_input_dtype, mm_vllm_device_normalizes,
@@ -31,19 +33,16 @@ use super::{
     },
     MediaBatch, MultimodalIntermediate, PrecomputedMultimodalIntermediate, PromptBinding,
 };
-use crate::{
-    routers::grpc::{
-        backend_client::BackendClient,
-        client::GrpcClient,
-        context::WorkerSelection,
-        proto_wrapper::{
-            cleanup_tokenspeed_items_encoder_shm, SglangMultimodalData, TensorBytes,
-            TokenSpeedModality, TokenSpeedMultimodalData, TokenSpeedMultimodalItem,
-            TokenSpeedTensor, TrtllmMultimodalData, VllmMultimodalData,
-        },
-        MultimodalData,
+use crate::routers::grpc::{
+    backend_client::BackendClient,
+    client::GrpcClient,
+    context::WorkerSelection,
+    proto_wrapper::{
+        cleanup_tokenspeed_items_encoder_shm, SglangMultimodalData, TensorBytes,
+        TokenSpeedModality, TokenSpeedMultimodalData, TokenSpeedMultimodalItem, TokenSpeedTensor,
+        TrtllmMultimodalData, VllmMultimodalData,
     },
-    worker::RuntimeType,
+    MultimodalData,
 };
 
 /// Assemble backend-specific multimodal data from the intermediate.
@@ -399,7 +398,13 @@ fn assemble_vllm(
     intermediate: PrecomputedMultimodalIntermediate,
     assembly: &VllmAssembly,
 ) -> Result<VllmMultimodalData> {
-    let dtype = vllm_pixel_dtype(&intermediate.preprocessed, assembly)?;
+    // Audio follows vLLM's floating-point model dtype, independently of
+    // the worker's image-only device-normalization setting.
+    let dtype = if intermediate.media.modality() == Modality::Audio {
+        assembly.encoder_dtype.as_ref()
+    } else {
+        vllm_pixel_dtype(&intermediate.preprocessed, assembly)?
+    };
     let (pixel_values, pixel_values_shape, pixel_values_dtype) =
         serialize_encoder_input_owned(intermediate.preprocessed.encoder_input, dtype)?;
     let model_specific_tensors = serialize_model_specific(intermediate.preprocessed.model_specific);
@@ -412,9 +417,10 @@ fn assemble_vllm(
             common::Modality::Video,
             videos.iter().map(|video| video.hash.clone()).collect(),
         ),
-        MediaBatch::Audios(_) => {
-            anyhow::bail!("vLLM assembly requires an image or video batch")
-        }
+        MediaBatch::Audios(audios) => (
+            common::Modality::Audio,
+            audios.iter().map(|audio| audio.hash.clone()).collect(),
+        ),
     };
     let mm_placeholders = placeholders_for_bindings(&intermediate.bindings, false)?;
     // The primary tensor travels in the proto's `pixel_values` field but is
@@ -484,7 +490,7 @@ fn assemble_tokenspeed(
     validate_precomputed_batch(intermediate)?;
     let options =
         tokenspeed_assembly_options(intermediate.media.modality(), workers, skip_pixel_values);
-    assemble_tokenspeed_with_options(intermediate, options, None)
+    assemble_tokenspeed_with_options(intermediate, options, Vec::new())
 }
 
 /// Assemble the items an EPD request's encode workers run the tower on, with
@@ -530,13 +536,13 @@ fn tokenspeed_assembly_options(
     }
 }
 
-/// `owned_input` is the batch's encoder input when the caller handed it over
-/// whole (see [`take_whole_encoder_input`]); its one item then moves those
-/// bytes into its payload instead of writing a copy of its view.
+/// `owned_items` holds, by item index, what the caller handed over (see
+/// [`take_item_inputs`]); an item found there moves those bytes into its
+/// payload instead of writing a copy of its view.
 fn assemble_tokenspeed_with_options(
     intermediate: &PrecomputedMultimodalIntermediate,
     options: TokenSpeedAssemblyOptions,
-    mut owned_input: Option<EncoderInput>,
+    mut owned_items: Vec<Option<EncoderInput>>,
 ) -> Result<TokenSpeedMultimodalData> {
     let log_timing = log_mm_timing_enabled();
     let total_started = Instant::now();
@@ -579,7 +585,7 @@ fn assemble_tokenspeed_with_options(
         // the per-item slice + serialize entirely when skip_pixel_values is set.
         let encoder_input = if skip_pixel_values {
             TokenSpeedTensor::inline(Vec::new(), Vec::new(), encoder_input_dtype.to_string())
-        } else if let Some(input) = owned_input.take() {
+        } else if let Some(input) = owned_items.get_mut(item_index).and_then(Option::take) {
             serialize_tokenspeed_encoder_input_owned(
                 input,
                 &encoder_input_dtype,
@@ -659,18 +665,83 @@ fn assemble_tokenspeed_batches(
     batches: &[PrecomputedMultimodalIntermediate],
     options: Vec<TokenSpeedAssemblyOptions>,
 ) -> Result<TokenSpeedMultimodalData> {
-    let none = batches.iter().map(|_| None).collect();
+    let none = batches.iter().map(|_| Vec::new()).collect();
     assemble_tokenspeed_batches_with(batches, options, none)
 }
 
 /// Batches the caller hands over: a batch whose one item is the whole encoder
-/// input moves that input into the item's payload instead of writing a copy.
+/// input moves that input into the item's payload, and a batch of several
+/// items that [`take_item_inputs`] shares lends each item its rows, instead of
+/// writing a copy.
 fn assemble_tokenspeed_batches_owned(
     mut batches: Vec<PrecomputedMultimodalIntermediate>,
     options: Vec<TokenSpeedAssemblyOptions>,
 ) -> Result<TokenSpeedMultimodalData> {
-    let owned = batches.iter_mut().map(take_whole_encoder_input).collect();
-    assemble_tokenspeed_batches_with(&batches, options, owned)
+    let owned = batches
+        .iter_mut()
+        .zip(&options)
+        .map(|(batch, options)| take_item_inputs(batch, options))
+        .collect();
+    let data = assemble_tokenspeed_batches_with(&batches, options, owned);
+    // Items written from views, or left out, leave their batch's buffer behind.
+    for batch in batches {
+        recycle_encoder_input(batch.preprocessed.encoder_input);
+    }
+    data
+}
+
+/// What each item of a batch takes instead of a written copy, by item
+/// index. A batch of one item hands its whole input over. A batch of
+/// several items is shared when it is wire bytes in the dtype the worker
+/// reads and shared memory is off; one that is shared already (cached
+/// images), only when its allocation is exactly the size of its items.
+/// Each item then takes its own rows of the one allocation, which returns
+/// to the buffer pool with the last payload. Empty for every other batch,
+/// whose items are written from views, and for one whose pixels are left
+/// out.
+fn take_item_inputs(
+    batch: &mut PrecomputedMultimodalIntermediate,
+    options: &TokenSpeedAssemblyOptions,
+) -> Vec<Option<EncoderInput>> {
+    if options.skip_pixel_values {
+        return Vec::new();
+    }
+    if let Some(whole) = take_whole_encoder_input(batch) {
+        return vec![Some(whole)];
+    }
+    // A range keeps its whole batch alive: with shared memory on, an item
+    // may leave for a segment while an inline sibling holds all of it.
+    if options.shm_enabled {
+        return Vec::new();
+    }
+    let wire = wire_dtype(&options.encoder_input_dtype, false);
+    // A range keeps its whole allocation alive: an input that is shared
+    // already lends its rows only when the capacity of that allocation is
+    // exactly their byte length.
+    let limit = match &batch.preprocessed.encoder_input {
+        EncoderInput::Wire { dtype, .. } if *dtype == wire => usize::MAX,
+        EncoderInput::SharedWire { bytes, dtype, .. } if *dtype == wire => bytes.len(),
+        // Any other form or dtype is written out item by item anyway.
+        _ => return Vec::new(),
+    };
+    let lengths = match &batch.field_layouts.encoder_input {
+        FieldLayout::Batched => vec![1; batch.media.len()],
+        FieldLayout::Flat { sizes_key } => {
+            match tensor_sizes_from_model_specific(&batch.preprocessed.model_specific, sizes_key) {
+                Ok(sizes) => sizes,
+                Err(_) => return Vec::new(),
+            }
+        }
+    };
+    if !batch.preprocessed.encoder_input.share_wire(limit) {
+        return Vec::new();
+    }
+    batch
+        .preprocessed
+        .encoder_input
+        .split_axis0(&lengths)
+        .map(|parts| parts.into_iter().map(Some).collect())
+        .unwrap_or_default()
 }
 
 /// The encoder input of a batch whose single item spans all of it, taken out
@@ -703,7 +774,7 @@ fn take_whole_encoder_input(batch: &mut PrecomputedMultimodalIntermediate) -> Op
 fn assemble_tokenspeed_batches_with(
     batches: &[PrecomputedMultimodalIntermediate],
     options: Vec<TokenSpeedAssemblyOptions>,
-    owned_inputs: Vec<Option<EncoderInput>>,
+    owned_inputs: Vec<Vec<Option<EncoderInput>>>,
 ) -> Result<TokenSpeedMultimodalData> {
     anyhow::ensure!(
         batches.len() == options.len() && batches.len() == owned_inputs.len(),

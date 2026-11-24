@@ -518,7 +518,7 @@ impl VllmEngineClient {
 // ---------------------------------------------------------------------------
 
 // The disaggregation fields stay absent until this wire exposes them.
-crate::impl_rank_load_conversions!(proto);
+crate::impl_rank_load_conversions!(proto, values);
 
 impl VllmEngineClient {
     /// `generate` with the request's large inline tensors as body frames of

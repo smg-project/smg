@@ -7,6 +7,7 @@ use ndarray::Array2;
 
 use super::qwen_vl_base::pixel_norm;
 use crate::{
+    buffer_pool,
     encoder_inputs::{EncoderDtype, EncoderInput, ModelSpecificValue, PixelNorm},
     types::{Modality, RgbFrameRef},
     vision::{
@@ -377,7 +378,8 @@ fn prepare<'a, F: RgbSource>(
 }
 
 /// Append resized RGB frames to `values` as merged patch rows with temporal
-/// padding. After an error `values` holds a partial append.
+/// padding; a `values` with no allocation yet takes a pooled buffer first.
+/// After an error `values` holds a partial append.
 fn encode<F: RgbSource>(
     frames: &[F],
     budget_frames: usize,
@@ -407,9 +409,12 @@ fn encode<F: RgbSource>(
         "GLM features",
     )?;
     let expected = product(&[count, features], "GLM patch output size")?;
-    values
-        .try_reserve_exact(expected)
-        .map_err(|error| shape(format!("cannot reserve GLM patch output: {error}")))?;
+    let refused =
+        |error| TransformError::ReserveRefused(format!("cannot reserve GLM patch output: {error}"));
+    if values.capacity() == 0 {
+        *values = buffer_pool::take_empty(expected).map_err(refused)?;
+    }
+    values.try_reserve_exact(expected).map_err(refused)?;
     // Write bounded row slices rather than growing the Vec for each pixel.
     let written = values.len();
     values.resize(written + expected, 0);
@@ -572,7 +577,7 @@ impl Glm53FlashProcessor {
         clippy::expect_used,
         reason = "the default config sets the checkpoint geometry and CLIP normalization"
     )]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::from_config_for(&PreProcessorConfig::default(), Modality::Image)
             .expect("the default preprocessor config is valid")
     }
@@ -596,10 +601,16 @@ impl Glm53FlashProcessor {
             }
         };
         let params = Params::from_config(config, video)?;
+        let pixels = Pixels::from_config(config, params)?;
+        // With resizing on, the smallest canvas is one aligned patch: a
+        // budget under it takes no input, whatever its size.
+        if pixels.do_resize && params.max_pixels < params.factor * params.factor * params.temporal {
+            return Err(shape("GLM max_pixels is smaller than one aligned patch"));
+        }
         Ok(Self {
             modality,
             params,
-            pixels: Pixels::from_config(config, params)?,
+            pixels,
         })
     }
 
@@ -678,10 +689,9 @@ impl VisionPreProcessor for Glm53FlashProcessor {
                 .checked_add(self.image_elements(image.width(), image.height())?)
                 .ok_or_else(|| shape("GLM image batch size overflow"))
         })?;
-        let mut values = Vec::new();
-        values
-            .try_reserve_exact(expected)
-            .map_err(|error| shape(format!("cannot reserve GLM image batch: {error}")))?;
+        let mut values = buffer_pool::take_empty(expected).map_err(|error| {
+            TransformError::ReserveRefused(format!("cannot reserve GLM image batch: {error}"))
+        })?;
         let mut grids = Vec::with_capacity(images.len() * 3);
         let mut counts = Vec::with_capacity(images.len());
         let mut tokens = Vec::with_capacity(images.len());
@@ -1031,6 +1041,45 @@ mod tests {
             .any(|value| (*value - padding).abs() < 1e-5));
     }
 
+    /// A batch's and a clip's patch buffer is the pool's: written out, it
+    /// goes back to its class, and the next run writes the same bytes into it.
+    #[test]
+    fn a_batch_and_a_clip_write_their_patches_into_a_pooled_buffer() {
+        use crate::buffer_pool::{self, BufferPool};
+
+        static BATCH: BufferPool = BufferPool::new();
+        static CLIP: BufferPool = BufferPool::new();
+        let frame = DynamicImage::ImageRgb8(RgbImage::from_fn(400, 200, |x, y| {
+            Rgb([x as u8, y as u8, (x ^ y) as u8])
+        }));
+        let frames = [frame.clone(), frame.clone()];
+        let image =
+            Glm53FlashProcessor::from_config_for(&config(MAX_IMAGE_TOKENS), Modality::Image)
+                .unwrap();
+        let video = Glm53FlashProcessor::from_config_for(&video_config(), Modality::Video).unwrap();
+        let clip = VideoClipOptions::sampled_at(2.0);
+        let bytes = |output: Result<PreprocessedEncoderInputs, TransformError>| {
+            output
+                .unwrap()
+                .encoder_input
+                .into_bytes_as(EncoderDtype::Uint8)
+                .unwrap()
+        };
+        let reused = |pool: &'static BufferPool, run: &dyn Fn() -> Vec<u8>| {
+            buffer_pool::with_pool(pool, || {
+                let first = run();
+                assert_eq!(
+                    pool.held(),
+                    buffer_pool::allocation_capacity(first.len()),
+                    "the patch buffer went back to its class"
+                );
+                assert!(run() == first, "the bytes differ on the reused buffer");
+            });
+        };
+        reused(&BATCH, &|| bytes(image.preprocess(&[&frame])));
+        reused(&CLIP, &|| bytes(video.preprocess_video(&frames, &clip)));
+    }
+
     #[test]
     fn borrowed_and_dynamic_video_paths_match_layout_and_timing() {
         let rgb = [[10, 20, 30], [40, 50, 60], [70, 80, 90]]
@@ -1315,6 +1364,9 @@ mod tests {
         let params = Params::from_config(&tiny, false).unwrap();
         let err = params.geometry(1, 100, 100).unwrap_err();
         assert!(err.to_string().contains("aligned patch"), "{err}");
+        // With resizing on, such a budget builds no processor.
+        assert!(Glm53FlashProcessor::from_config_for(&tiny, Modality::Image)
+            .is_err_and(|err| err.to_string().contains("aligned patch")));
 
         // do_resize=false hands the canvas alignment burden to the caller.
         let mut no_resize = config(MAX_IMAGE_TOKENS);

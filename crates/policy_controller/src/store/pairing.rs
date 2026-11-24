@@ -26,11 +26,11 @@
 //! id order, so two stores that hold one membership number its classes
 //! alike.
 //!
-//! A membership write of one worker derives for that worker alone: the
-//! store's writer keeps each model's offers and the rule's verdicts on
-//! them from one write to the next, moves the written worker in them and
-//! runs the rule again only on an offer no worker of its pool held. The
-//! classes it hands back are the whole derivation's.
+//! A membership build of one worker's writes derives for that worker
+//! alone: the store's writer keeps each model's offers and the rule's
+//! verdicts on them from one build to the next, moves the written worker in
+//! them and runs the rule again only on an offer no worker of its pool
+//! held. The classes it hands back are the whole derivation's.
 //!
 //! Every value here is opaque text: a runtime, a transport and a layout
 //! fact are compared for equality and never interpreted. Deriving a
@@ -46,9 +46,12 @@ use std::{
 use rustc_hash::{FxBuildHasher, FxHashMap};
 
 use crate::{
-    framework::PairTable,
-    spec::Pairing,
-    view::{WireModes, WorkerId},
+    document::spec::Pairing,
+    engine::{
+        framework::PairTable,
+        view::{WireModes, WorkerId},
+        PartnerClasses,
+    },
 };
 
 #[cfg(test)]
@@ -68,7 +71,7 @@ pub const LAYOUT_FACTS: [(&str, &str); 4] = [
 /// its runtime (the row's engine kind). A field left `None` is one the
 /// worker does not report. A blank value is no report either, and the rule
 /// never meets one: the store's door hands it a normalized descriptor
-/// ([`PairingDescriptor::normalized`]), as the gateway's own derive drops a
+/// ([`PairingDescriptor::normalize`]), as the gateway's own derive drops a
 /// blank label where it makes a worker's descriptor.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct PairingDescriptor {
@@ -84,16 +87,9 @@ pub struct PairingDescriptor {
 }
 
 impl PairingDescriptor {
-    /// The descriptor as the rule reads it: every blank value dropped and
-    /// every name read past the blanks around it. The store's door makes a
-    /// worker's descriptor so, once a write.
-    #[must_use]
-    pub fn normalized(mut self) -> Self {
-        self.normalize();
-        self
-    }
-
-    /// [`PairingDescriptor::normalized`], in place.
+    /// Make the descriptor what the rule reads, in place: every blank value
+    /// dropped and every name read past the blanks around it. The store's
+    /// door makes a worker's descriptor so, once a write.
     pub fn normalize(&mut self) {
         normalize(&mut self.protocol);
         normalize(&mut self.transport);
@@ -102,7 +98,7 @@ impl PairingDescriptor {
     }
 
     /// Whether no value is blank or stands between blanks.
-    fn is_normalized(&self) -> bool {
+    pub(super) fn is_normalized(&self) -> bool {
         [&self.protocol, &self.transport, &self.version]
             .into_iter()
             .chain(&self.kv_layout)
@@ -158,8 +154,8 @@ type Offer<'a> = (bool, Option<&'a str>, &'a PairingDescriptor);
 /// never as strings: the C library's compare of two empty strings that
 /// hold no buffer takes a slow path (about 200 ns by a probe, where two
 /// strings of four bytes take 3). An engine kind is a kind's name, which
-/// the load ingest parses as written too, so it is read as written: a
-/// descriptor's free text is what the door normalizes.
+/// a worker object's builder parses as written too, so it is read as
+/// written: a descriptor's free text is what the door normalizes.
 pub(crate) fn known(runtime: &str) -> Option<&str> {
     (!runtime.is_empty()).then_some(runtime)
 }
@@ -455,6 +451,35 @@ impl PairClasses {
         Derivation::default().whole(prefills, decodes, mode)
     }
 
+    /// The classes as an engine over worker lists reads them
+    /// ([`PartnerClasses`]): each worker's class by its place in the
+    /// caller's list, with this derivation's table, which they take.
+    ///
+    /// `prefills` and `decodes` say, for each place of the caller's two
+    /// lists in order, whether the worker there was among the members
+    /// derived. The members derived stand in the lists' order, so each
+    /// takes its class as derived. A worker that was not among them takes
+    /// class `0`, which pairs with nobody.
+    #[must_use]
+    pub fn by_place(
+        self,
+        prefills: impl IntoIterator<Item = bool>,
+        decodes: impl IntoIterator<Item = bool>,
+    ) -> PartnerClasses {
+        fn side(derived: &[(WorkerId, u32)], given: impl IntoIterator<Item = bool>) -> Box<[u32]> {
+            let mut derived = derived.iter();
+            let mut next = || derived.next().map_or(0, |&(_, class)| class);
+            let class = |given: bool| if given { next() } else { 0 };
+            given.into_iter().map(class).collect()
+        }
+        PartnerClasses::derived(
+            side(&self.prefills, prefills),
+            side(&self.decodes, decodes),
+            self.ends,
+            self.listed,
+        )
+    }
+
     /// Each prefill with its class, in the order given: `0` for a prefill
     /// no decode pairs with, else a class numbered from `1`.
     pub fn prefills(&self) -> &[(WorkerId, u32)] {
@@ -481,15 +506,6 @@ impl PairClasses {
     /// Which classes pair, as a pair decision reads it beside its rows.
     pub fn table(&self) -> PairTable<'_> {
         PairTable::new(&self.ends, &self.listed)
-    }
-
-    /// Write the table into `ends` and `listed`, each cleared first: a
-    /// pair build hands a decision the table with its rows.
-    pub(super) fn table_into(&self, ends: &mut Vec<u32>, listed: &mut Vec<u32>) {
-        ends.clear();
-        ends.extend_from_slice(&self.ends);
-        listed.clear();
-        listed.extend_from_slice(&self.listed);
     }
 
     /// The partner list of prefill class `class`: the decodes of the
@@ -818,7 +834,7 @@ struct Work {
 }
 
 /// One model's derivation as the store's writer keeps it from one
-/// membership write to the next: each pool's distinct offers, which worker
+/// membership build to the next: each pool's distinct offers, which worker
 /// holds which, and the rule's verdict on every pair of offers. A write of
 /// one worker moves that worker alone in it ([`Derivation::written`]), and
 /// the rule runs again only on an offer no worker of its pool held. What is
@@ -831,9 +847,6 @@ pub(super) struct Derivation {
     /// The rule's verdict on each prefill slot beside each decode slot.
     verdicts: Vec<Vec<Verdict>>,
     work: Work,
-    /// How many whole derivations made what is kept.
-    #[cfg(test)]
-    wholes: usize,
 }
 
 impl Derivation {
@@ -846,10 +859,6 @@ impl Derivation {
         decodes: &P,
         mode: Pairing,
     ) -> PairClasses {
-        #[cfg(test)]
-        {
-            self.wholes += 1;
-        }
         let Self {
             sides: [prefill, decode],
             verdicts,
@@ -876,12 +885,6 @@ impl Derivation {
         let (refusals, _) = self.class(prefills, decodes);
         let table = (&*self.work.ends, &*self.work.listed);
         self.classes(prefills, decodes, table, refusals)
-    }
-
-    /// How many whole derivations made what is kept.
-    #[cfg(test)]
-    pub(super) fn wholes(&self) -> usize {
-        self.wholes
     }
 
     /// Class the offers as they stand: each slot's class, the table into

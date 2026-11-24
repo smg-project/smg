@@ -23,13 +23,15 @@ profiles:
   cache_aware:
     filter: [healthy, not-overloaded, not-tried]
     score:
+      - warmup-slice: { weight: 8, miss_share: 0.4 }
       - prefix-affinity:
+          weight: 4
           threshold: 0.4
           spill: { abs: 48, rel: 1.3 }
       - kv-pressure
       - least-load
-      - warmup-slice
-    pick: best
+    pick:
+      best: { sample: 16 }
 bindings:
   - match: { model: "*" }
     profile: cache_aware

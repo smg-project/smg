@@ -160,11 +160,10 @@ pub fn set_class_capacity_pressure(class: Class, pressure: f64) {
 #[cfg(test)]
 mod tests {
     use smg_external_router::metrics::BoundedLabels;
+    use smg_worker::metrics::writers::interner_size;
 
     use super::*;
-    use crate::{
-        observability::metrics::test_support::render_with_recorder, worker::metrics::interner_size,
-    };
+    use crate::observability::metrics::test_support::render_with_recorder;
 
     /// Forty distinct tenant keys at a cap of 32 render 32 tenant series of
     /// their own and one `other` series carrying the rest; the process-wide

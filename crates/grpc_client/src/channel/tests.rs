@@ -22,8 +22,8 @@ use super::{
         drive, open, Connection, End, CONNECTION_WINDOW, KEEPALIVE_INTERVAL, KEEPALIVE_TIMEOUT,
         STREAM_WINDOW,
     },
-    dial_failure_without_peer, is_transport_failure, normalize_grpc_endpoint, testing, BoxError,
-    Channel, RecvBody, Shared, DEFAULT_CONNECT_TIMEOUT,
+    dial_failure_without_peer, is_keep_alive_timeout, is_transport_failure,
+    normalize_grpc_endpoint, testing, BoxError, Channel, RecvBody, Shared, DEFAULT_CONNECT_TIMEOUT,
 };
 use crate::{tokenspeed_proto, TokenSpeedSchedulerClient};
 
@@ -667,10 +667,11 @@ async fn a_peer_that_answers_before_reading_the_request_is_heard() {
 // (`max(window / 2, 25_600)`), which is what turns a backlog of streamed
 // token frames into `GOAWAY ENHANCE_YOUR_CALM too_many_data_frames`.
 
-/// Read `SETTINGS_INITIAL_WINDOW_SIZE` from the client's first frame.
-/// `None` means the client omitted it, which h2 does at the 65535 default.
+/// Read `SETTINGS_INITIAL_WINDOW_SIZE` and `SETTINGS_HEADER_TABLE_SIZE` from
+/// the client's first frame. `None` means the client omitted one, which h2
+/// does at its default (65535, 4096).
 #[tokio::test]
-async fn the_channel_advertises_its_stream_window() {
+async fn the_channel_advertises_its_stream_window_and_header_table() {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind loopback");
@@ -692,11 +693,14 @@ async fn the_channel_advertises_its_stream_window() {
     connected.expect("connect");
 
     let (entries, _) = payload.as_chunks::<6>();
-    let advertised = entries
-        .iter()
-        .find(|e| u16::from_be_bytes([e[0], e[1]]) == 0x4)
-        .map(|e| u32::from_be_bytes([e[2], e[3], e[4], e[5]]));
-    assert_eq!(advertised, Some(STREAM_WINDOW));
+    let advertised = |id: u16| {
+        entries
+            .iter()
+            .find(|e| u16::from_be_bytes([e[0], e[1]]) == id)
+            .map(|e| u32::from_be_bytes([e[2], e[3], e[4], e[5]]))
+    };
+    assert_eq!(advertised(0x4), Some(STREAM_WINDOW));
+    assert_eq!(advertised(0x1), Some(1024));
 }
 
 #[derive(Debug)]
@@ -1885,6 +1889,12 @@ async fn a_keep_alive_timeout_under_a_call_is_unavailable() {
     assert_eq!(status.code(), tonic::Code::Unavailable, "{status:?}");
     assert_eq!(status.message(), "keep-alive timed out");
     assert!(!is_transport_failure(&status), "{status:?}");
+    // The timeout is the status's source. A worker's `UNAVAILABLE` in the
+    // same words has none.
+    assert!(is_keep_alive_timeout(&status), "{status:?}");
+    assert!(!is_keep_alive_timeout(&tonic::Status::unavailable(
+        "keep-alive timed out"
+    )));
     assert!(pings.load(Ordering::SeqCst) >= 1, "a ping was sent");
 }
 

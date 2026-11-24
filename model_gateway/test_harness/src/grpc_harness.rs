@@ -13,9 +13,9 @@ use openai_protocol::{model_card::ModelCard, worker::HealthCheckConfig};
 use smg::{
     app_context::AppContext,
     config::{RouterConfig, RouterConfigBuilder},
-    routers::{RouterFactory, RouterTrait},
-    worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, Worker, WorkerType},
+    routers::{grpc::backend_client::BasicWorkerBuilder, RouterFactory, RouterTrait},
 };
+use smg_worker::identity::basic::{ConnectionMode, RuntimeType, Worker, WorkerType};
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{body::Body, server::NamedService, transport::Server};

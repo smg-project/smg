@@ -2,10 +2,11 @@
 
 use openai_protocol::{
     common::{
-        to_value_exact, ContextManagementType, Detail, PromptCacheRetention,
+        to_value_exact, ContextManagementType, Detail, GenerationRequest, PromptCacheRetention,
         ToolChoice as ChatToolChoice, ToolChoiceValue as ChatToolChoiceValue, ToolReference,
     },
     responses::*,
+    validated::Normalizable,
 };
 use serde_json::json;
 use validator::Validate;
@@ -5537,4 +5538,307 @@ fn function_tool_round_trips_a_missing_schema_as_null() {
         serde_json::to_value(tool).unwrap(),
         json!({"type":"function", "name":"absent", "parameters":null})
     );
+}
+
+#[test]
+fn codex_additional_tools_and_agent_message_round_trip_and_validate() {
+    let body = json!({
+        "model": "test-model",
+        "stream": true,
+        "tool_choice": "auto",
+        "parallel_tool_calls": false,
+        "store": false,
+        "input": [
+            {
+                "type": "additional_tools",
+                "id": "at_123",
+                "role": "developer",
+                "tools": [
+                    {
+                        "type": "namespace",
+                        "name": "functions",
+                        "description": "",
+                        "tools": [
+                            {
+                                "type": "function",
+                                "name": "exec_command",
+                                "description": "Run a shell command",
+                                "parameters": {"type": "object", "properties": {}},
+                                "strict": false
+                            },
+                            {
+                                "type": "custom",
+                                "name": "apply_patch",
+                                "description": "Apply a patch",
+                                "format": {"type": "text"}
+                            }
+                        ]
+                    },
+                    {
+                        "type": "namespace",
+                        "name": "clock",
+                        "description": "Tools in the clock namespace.",
+                        "defer_loading": true,
+                        "tools": [
+                            {
+                                "type": "function",
+                                "name": "now",
+                                "description": "Current time",
+                                "parameters": {"type": "object", "properties": {}}
+                            }
+                        ]
+                    },
+                    {
+                        "type": "namespace",
+                        "name": "collaboration",
+                        "description": "Tools in the collaboration namespace.",
+                        "tools": [
+                            {
+                                "type": "function",
+                                "name": "send_message",
+                                "description": "Message another agent",
+                                "parameters": {"type": "object", "properties": {}}
+                            }
+                        ]
+                    },
+                    {
+                        "type": "tool_search",
+                        "execution": "client",
+                        "description": "Load deferred tools",
+                        "parameters": {"type": "object", "properties": {}}
+                    },
+                    {
+                        "type": "web_search",
+                        "external_web_access": true,
+                        "indexed_web_access": false,
+                        "search_content_types": ["text", "image"]
+                    }
+                ]
+            },
+            {
+                "type": "message",
+                "id": "msg_1",
+                "role": "developer",
+                "content": [{"type": "input_text", "text": "Base instructions"}]
+            },
+            {
+                "type": "agent_message",
+                "id": "am_1",
+                "author": "/root",
+                "recipient": "/root/worker_1",
+                "content": [{"type": "input_text", "text": "Reply with OK-SUBAGENT."}]
+            }
+        ]
+    });
+
+    let request: ResponsesRequest =
+        serde_json::from_value(body.clone()).expect("Codex subagent request should parse");
+    request
+        .validate()
+        .expect("Codex subagent request should validate");
+    assert_eq!(
+        request.extract_text_for_routing(),
+        "Base instructions Reply with OK-SUBAGENT."
+    );
+
+    let wire = to_value_exact(&request).expect("serialize request");
+    assert_eq!(wire["input"], body["input"]);
+}
+
+#[test]
+fn additional_tools_normalizes_tool_choice_and_reports_input_item_error_path() {
+    let input = json!([
+        {
+            "type": "additional_tools",
+            "role": "developer",
+            "tools": [
+                {
+                    "type": "namespace",
+                    "name": "functions",
+                    "description": "",
+                    "tools": [{
+                        "type": "function",
+                        "name": "exec_command",
+                        "parameters": {"type": "object"}
+                    }]
+                },
+                {
+                    "type": "namespace",
+                    "name": "collaboration",
+                    "description": "Collab",
+                    "tools": [{
+                        "type": "function",
+                        "name": "spawn_agent",
+                        "parameters": {"type": "object"}
+                    }]
+                }
+            ]
+        },
+        {"role": "user", "content": "hi"}
+    ]);
+
+    // Empty top-level `tools: []` with inline `additional_tools` defaults to
+    // `"auto"`, while an explicit `"none"` is preserved.
+    let mut implicit_choice: ResponsesRequest = serde_json::from_value(json!({
+        "model": "test-model",
+        "tools": [],
+        "input": input
+    }))
+    .unwrap();
+    implicit_choice.normalize();
+    assert!(matches!(
+        implicit_choice.tool_choice,
+        Some(ResponsesToolChoice::Options(ToolChoiceOptions::Auto))
+    ));
+    implicit_choice.validate().unwrap();
+
+    let mut explicit_none: ResponsesRequest = serde_json::from_value(json!({
+        "model": "test-model",
+        "tools": [],
+        "tool_choice": "none",
+        "input": input
+    }))
+    .unwrap();
+    explicit_none.normalize();
+    assert!(matches!(
+        explicit_none.tool_choice,
+        Some(ResponsesToolChoice::Options(ToolChoiceOptions::None))
+    ));
+
+    for choice in [
+        json!("required"),
+        json!({"type": "function", "name": "exec_command"}),
+        json!({"type": "function", "name": "spawn_agent", "namespace": "collaboration"}),
+        json!({"type": "function", "name": "exec_command", "namespace": "functions"}),
+        json!({"type": "allowed_tools", "mode": "required", "tools": [{"type": "function", "name": "exec_command"}]}),
+    ] {
+        let req: ResponsesRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "input": input,
+            "tool_choice": choice
+        }))
+        .unwrap();
+        req.validate()
+            .unwrap_or_else(|e| panic!("choice {choice} should validate: {e}"));
+    }
+
+    // Validation errors inside inline additional_tools point at `input[i].tools[j]`.
+    let bad_inline_tool: ResponsesRequest = serde_json::from_value(json!({
+        "model": "test-model",
+        "input": [
+            {"role": "developer", "content": "instructions"},
+            {
+                "type": "additional_tools",
+                "role": "developer",
+                "tools": [{
+                    "type": "function",
+                    "name": "bad_schema",
+                    "parameters": "not-an-object"
+                }]
+            }
+        ]
+    }))
+    .unwrap();
+    let err = bad_inline_tool.validate().unwrap_err().to_string();
+    assert!(
+        err.contains("input[1].tools[0].parameters"),
+        "expected input-scoped error path, got: {err}"
+    );
+}
+
+#[test]
+fn empty_agent_message_is_rejected_at_validation() {
+    let req: ResponsesRequest = serde_json::from_value(json!({
+        "model": "test-model",
+        "input": [{"type":"agent_message","author":"/root","recipient":"/root/worker","content":[]}]
+    }))
+    .unwrap();
+    assert!(req
+        .validate()
+        .unwrap_err()
+        .to_string()
+        .contains("Agent message content cannot be empty"));
+}
+
+#[test]
+fn agent_message_rejects_unknown_content_part() {
+    let err = serde_json::from_value::<ResponsesRequest>(json!({
+        "model": "test-model",
+        "input": [{
+            "type": "agent_message",
+            "author": "/root",
+            "recipient": "/root/worker",
+            "content": [{"type": "mystery_part", "payload": "x"}]
+        }]
+    }))
+    .expect_err("unknown agent_message content part must fail deserialization");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("content[0].type") && msg.contains("mystery_part"),
+        "expected part-scoped refusal, got: {msg}"
+    );
+}
+
+#[test]
+fn reasoning_input_accepts_null_content_and_optional_id() {
+    // Matches cross-model continuation history (reasoning with explicit
+    // `content: null`, omitted `content`, empty `[]`, and non-empty content)
+    // and Codex tool-output follow-ups where `reasoning.id` is omitted or null.
+    let req: ResponsesRequest = serde_json::from_value(json!({
+        "model": "test-model",
+        "input": [
+            {
+                "type": "reasoning",
+                "id": "rs_omitted_content",
+                "summary": [{"type": "summary_text", "text": "s0"}]
+            },
+            {
+                "type": "reasoning",
+                "id": "rs_empty_content",
+                "summary": [],
+                "content": []
+            },
+            {
+                "type": "reasoning",
+                "id": "rs_null_content",
+                "summary": [{"type": "summary_text", "text": "s1"}],
+                "content": null,
+                "encrypted_content": "gAAAAB-opaque"
+            },
+            {
+                "type": "reasoning",
+                "id": "rs_with_content",
+                "summary": [],
+                "content": [{"type": "reasoning_text", "text": "step 1"}]
+            },
+            {
+                "type": "reasoning",
+                "summary": [{"type": "summary_text", "text": "no id"}]
+            },
+            {
+                "type": "reasoning",
+                "id": null,
+                "summary": [],
+                "content": null
+            }
+        ]
+    }))
+    .expect("reasoning items with null content and optional id should deserialize");
+
+    req.validate().expect("reasoning items should validate");
+
+    let wire = serde_json::to_value(&req).unwrap();
+    let items = wire["input"].as_array().unwrap();
+    assert_eq!(items[0]["id"], "rs_omitted_content");
+    assert!(items[0].get("content").is_none());
+    assert_eq!(items[1]["id"], "rs_empty_content");
+    assert!(items[1].get("content").is_none());
+    assert_eq!(items[2]["id"], "rs_null_content");
+    assert!(items[2].get("content").is_none());
+    assert_eq!(items[2]["summary"][0]["text"], "s1");
+    assert_eq!(items[2]["encrypted_content"], "gAAAAB-opaque");
+    assert_eq!(items[3]["content"][0]["text"], "step 1");
+    assert!(items[4].get("id").is_none());
+    assert!(items[5].get("id").is_none());
+    assert!(items[5].get("content").is_none());
 }

@@ -10,9 +10,44 @@
 #[path = "common/gateway_launch.rs"]
 mod gateway_launch;
 
-use std::time::{Duration, Instant};
+use std::{
+    net::SocketAddr,
+    path::Path,
+    time::{Duration, Instant},
+};
 
-use gateway_launch::{launch, Until, EXIT_TIMEOUT};
+use gateway_launch::{base_args, free_ports, launch, serial, Gateway, Until, EXIT_TIMEOUT, IP};
+
+/// A gateway kept serving with the common flags plus `args`, its log at
+/// `log`. The caller holds [`serial`]: the ports are picked here.
+fn serving(args: &[&str], log: &Path) -> Gateway {
+    let [port, metrics_port] = free_ports();
+    let mut all = base_args(port, metrics_port);
+    all.extend(args.iter().map(|arg| (*arg).to_string()));
+    Gateway::start(&all, SocketAddr::from((IP, port)), log)
+}
+
+/// The JSON line of the gateway's log whose message `named` accepts, once
+/// the log holds the line whole, or `None` when [`EXIT_TIMEOUT`] passes
+/// first. A line reaches the log a moment after the event it reports: the
+/// gateway's writer thread batches its lines and is late on a busy host. A
+/// launch that ends at the first health answer kills the gateway with the
+/// line still unwritten, so a case that reads a line keeps its gateway
+/// serving and waits here.
+fn logged(gateway: &Gateway, named: impl Fn(&str) -> bool) -> Option<serde_json::Value> {
+    let deadline = Instant::now() + EXIT_TIMEOUT;
+    loop {
+        let line = gateway
+            .log()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|line| line["message"].as_str().is_some_and(&named));
+        if line.is_some() || Instant::now() >= deadline {
+            return line;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
 
 /// Zero is refused before anything listens, with the field in the error and
 /// without a panic.
@@ -111,32 +146,21 @@ fn a_runtime_worker_thread_count_above_four_per_cpu_serves_with_a_warning() {
         );
         return;
     }
+    let _serial = serial();
     let dir = tempfile::tempdir().expect("a temp dir");
-    let launch = launch(
+    // The start fails the case, with the log, where the gateway does not
+    // serve its health route.
+    let gateway = serving(
         &[
             "--runtime-worker-threads",
             &threads.to_string(),
             "--log-json",
         ],
-        Until::Served,
         &dir.path().join("over.log"),
     );
-    assert!(
-        launch.served,
-        "the gateway did not serve its health route with {threads} worker threads (exit {:?})\n{}",
-        launch.status, launch.log
-    );
     let expected = format!("runtime_worker_threads {threads} is above {advised}");
-    let warned = launch
-        .log
-        .lines()
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .find(|line| {
-            line["message"]
-                .as_str()
-                .is_some_and(|message| message.starts_with(&expected))
-        })
-        .unwrap_or_else(|| panic!("the warning did not reach the log\n{}", launch.log));
+    let warned = logged(&gateway, |message| message.starts_with(&expected))
+        .unwrap_or_else(|| panic!("the warning did not reach the log\n{}", gateway.log()));
     assert_eq!(warned["level"], "WARN", "{warned}");
     assert!(
         warned["message"]
@@ -153,25 +177,22 @@ fn a_runtime_worker_thread_count_above_four_per_cpu_serves_with_a_warning() {
 /// read exactly.
 #[test]
 fn a_runtime_worker_thread_count_of_one_serves() {
+    let _serial = serial();
     let dir = tempfile::tempdir().expect("a temp dir");
-    let launch = launch(
+    // The start fails the case, with the log, where the gateway does not
+    // serve its health route.
+    let gateway = serving(
         &["--runtime-worker-threads", "1", "--log-json"],
-        Until::Served,
         &dir.path().join("one.log"),
-    );
-    assert!(
-        launch.served,
-        "the gateway did not serve its health route with one worker thread (exit {:?})\n{}",
-        launch.status, launch.log
     );
     // The line is flat JSON: read it exactly, so a default-sized runtime on
     // a host whose core count starts with 1 cannot pass for the pinned one.
-    let sized = launch
-        .log
-        .lines()
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .find(|line| line["message"] == "Tokio runtime sized")
-        .unwrap_or_else(|| panic!("the runtime's size did not reach the log\n{}", launch.log));
+    let sized = logged(&gateway, |message| message == "Tokio runtime sized").unwrap_or_else(|| {
+        panic!(
+            "the runtime's size did not reach the log\n{}",
+            gateway.log()
+        )
+    });
     assert_eq!(sized["worker_threads"], 1, "{sized}");
     assert_eq!(sized["pinned"], true, "{sized}");
 }

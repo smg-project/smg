@@ -1,7 +1,8 @@
 # Optional tokenizers v1 encoding
 
 Build the gateway with `cargo build --release -p smg --features tokenizers-v1`.
-The default build continues using tokenizers 0.23 for encoding. The optional
+The default build encodes through the crate's direct encoders where one takes
+the tokenizer and through tokenizers 0.23 otherwise (`src/encode_path.rs`). The optional
 dependency is aliased as `tokenizers_v1` and pinned to `1.0.0-rc.3`. Enabling it
 accelerates single and batch text encoding inside `HuggingFaceTokenizer` and
 nothing else: the full decode of a plain ByteLevel decoder goes through SMG's

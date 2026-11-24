@@ -1,0 +1,537 @@
+{
+  "recorded_from": "a4935a5acd15151641b1988e234016a95fd172da",
+  "policy": "context-window",
+  "rows": [
+    {
+      "name": "each-bound-is-held-against-the-window-alone",
+      "shed": false,
+      "workers": [
+        {
+          "runtime": "vllm",
+          "transport": "grpc",
+          "state": "free",
+          "window": 100
+        },
+        {
+          "runtime": "vllm",
+          "transport": "grpc",
+          "state": "free",
+          "window": 200
+        },
+        {
+          "runtime": "vllm",
+          "transport": "grpc",
+          "state": "free"
+        },
+        {
+          "runtime": "vllm",
+          "transport": "zmq",
+          "state": "free",
+          "window": 50
+        }
+      ],
+      "requests": [
+        {},
+        {
+          "input_tokens": 100
+        },
+        {
+          "input_tokens": 101
+        },
+        {
+          "input_tokens": 100,
+          "scoring_position": true
+        },
+        {
+          "input_tokens": 99,
+          "scoring_position": true
+        },
+        {
+          "input_tokens": 0,
+          "output_tokens": 100
+        },
+        {
+          "input_tokens": 0,
+          "output_tokens": 101
+        },
+        {
+          "input_tokens": 60,
+          "output_tokens": 60
+        },
+        {
+          "input_tokens": 100,
+          "output_tokens": 100
+        },
+        {
+          "input_tokens": 150,
+          "output_tokens": 150
+        },
+        {
+          "input_tokens": 200
+        },
+        {
+          "input_tokens": 201
+        },
+        {
+          "input_tokens": 200,
+          "scoring_position": true
+        }
+      ],
+      "answers": [
+        {
+          "placed": [
+            0,
+            1,
+            2,
+            3
+          ]
+        },
+        {
+          "placed": [
+            0,
+            1,
+            2,
+            3
+          ]
+        },
+        {
+          "placed": [
+            1,
+            2,
+            3
+          ]
+        },
+        {
+          "placed": [
+            1,
+            2,
+            3
+          ]
+        },
+        {
+          "placed": [
+            0,
+            1,
+            2,
+            3
+          ]
+        },
+        {
+          "placed": [
+            0,
+            1,
+            2,
+            3
+          ]
+        },
+        {
+          "placed": [
+            1,
+            2,
+            3
+          ]
+        },
+        {
+          "placed": [
+            0,
+            1,
+            2,
+            3
+          ]
+        },
+        {
+          "placed": [
+            0,
+            1,
+            2,
+            3
+          ]
+        },
+        {
+          "placed": [
+            1,
+            2,
+            3
+          ]
+        },
+        {
+          "placed": [
+            1,
+            2,
+            3
+          ]
+        },
+        {
+          "placed": [
+            2,
+            3
+          ]
+        },
+        {
+          "placed": [
+            2,
+            3
+          ]
+        }
+      ]
+    },
+    {
+      "name": "no-window-holds-the-input",
+      "shed": false,
+      "workers": [
+        {
+          "runtime": "vllm",
+          "transport": "grpc",
+          "state": "free",
+          "window": 100
+        },
+        {
+          "runtime": "vllm",
+          "transport": "grpc",
+          "state": "free",
+          "window": 200
+        }
+      ],
+      "requests": [
+        {
+          "input_tokens": 201
+        },
+        {
+          "input_tokens": 200,
+          "scoring_position": true
+        },
+        {
+          "input_tokens": 1000
+        }
+      ],
+      "answers": [
+        {
+          "refused": {
+            "status": 400,
+            "code": "context_length_exceeded",
+            "retry_after": false,
+            "message": "This model's maximum context length is 200 tokens. However, your request has 201 input tokens. Please reduce the length of the input."
+          }
+        },
+        {
+          "refused": {
+            "status": 400,
+            "code": "context_length_exceeded",
+            "retry_after": false,
+            "message": "Decision prompt has 200 tokens and cannot fit the 200-token context window with its scoring position intact"
+          }
+        },
+        {
+          "refused": {
+            "status": 400,
+            "code": "context_length_exceeded",
+            "retry_after": false,
+            "message": "This model's maximum context length is 200 tokens. However, your request has 1000 input tokens. Please reduce the length of the input."
+          }
+        }
+      ]
+    },
+    {
+      "name": "no-window-holds-the-budget",
+      "shed": false,
+      "workers": [
+        {
+          "runtime": "vllm",
+          "transport": "grpc",
+          "state": "free",
+          "window": 100
+        },
+        {
+          "runtime": "vllm",
+          "transport": "grpc",
+          "state": "free",
+          "window": 200
+        }
+      ],
+      "requests": [
+        {
+          "input_tokens": 0,
+          "output_tokens": 201
+        },
+        {
+          "input_tokens": 10,
+          "output_tokens": 201
+        },
+        {
+          "input_tokens": 201,
+          "output_tokens": 201
+        }
+      ],
+      "answers": [
+        {
+          "refused": {
+            "status": 400,
+            "code": "context_length_exceeded",
+            "retry_after": false,
+            "message": "This model's maximum context length is 200 tokens. However, you requested 201 tokens for the completion. Please reduce max_tokens."
+          }
+        },
+        {
+          "refused": {
+            "status": 400,
+            "code": "context_length_exceeded",
+            "retry_after": false,
+            "message": "This model's maximum context length is 200 tokens. However, you requested 201 tokens for the completion. Please reduce max_tokens."
+          }
+        },
+        {
+          "refused": {
+            "status": 400,
+            "code": "context_length_exceeded",
+            "retry_after": false,
+            "message": "This model's maximum context length is 200 tokens. However, your request has 201 input tokens. Please reduce the length of the input."
+          }
+        }
+      ]
+    },
+    {
+      "name": "the-widest-window-is-read-on-the-retry-s-wire",
+      "shed": false,
+      "workers": [
+        {
+          "runtime": "sglang",
+          "transport": "grpc",
+          "state": "free",
+          "window": 400
+        },
+        {
+          "runtime": "vllm",
+          "transport": "grpc",
+          "state": "free",
+          "window": 100
+        },
+        {
+          "runtime": "vllm",
+          "transport": "grpc",
+          "state": "free",
+          "window": 120
+        }
+      ],
+      "requests": [
+        {
+          "input_tokens": 150
+        },
+        {
+          "wire": {
+            "runtime": "vllm",
+            "transport": "grpc"
+          },
+          "input_tokens": 150
+        },
+        {
+          "wire": {
+            "runtime": "vllm",
+            "transport": "grpc"
+          },
+          "input_tokens": 110
+        },
+        {
+          "input_tokens": 500
+        }
+      ],
+      "answers": [
+        {
+          "placed": [
+            0
+          ]
+        },
+        {
+          "refused": {
+            "status": 400,
+            "code": "context_length_exceeded",
+            "retry_after": false,
+            "message": "This model's maximum context length is 120 tokens. However, your request has 150 input tokens. Please reduce the length of the input."
+          }
+        },
+        {
+          "placed": [
+            2
+          ]
+        },
+        {
+          "refused": {
+            "status": 400,
+            "code": "context_length_exceeded",
+            "retry_after": false,
+            "message": "This model's maximum context length is 400 tokens. However, your request has 500 input tokens. Please reduce the length of the input."
+          }
+        }
+      ]
+    },
+    {
+      "name": "the-worker-whose-window-holds-the-request-is-down",
+      "shed": false,
+      "workers": [
+        {
+          "runtime": "vllm",
+          "transport": "grpc",
+          "state": "free",
+          "window": 100
+        },
+        {
+          "runtime": "vllm",
+          "transport": "grpc",
+          "state": "down",
+          "window": 200
+        }
+      ],
+      "requests": [
+        {
+          "input_tokens": 150
+        },
+        {
+          "input_tokens": 50
+        },
+        {
+          "input_tokens": 250
+        }
+      ],
+      "answers": [
+        {
+          "refused": {
+            "status": 503,
+            "code": "no_available_workers",
+            "retry_after": true,
+            "message": "All workers for model 'm' are unavailable (unhealthy or circuit breaker open)"
+          }
+        },
+        {
+          "placed": [
+            0
+          ]
+        },
+        {
+          "refused": {
+            "status": 400,
+            "code": "context_length_exceeded",
+            "retry_after": false,
+            "message": "This model's maximum context length is 200 tokens. However, your request has 250 input tokens. Please reduce the length of the input."
+          }
+        }
+      ]
+    },
+    {
+      "name": "the-worker-whose-window-holds-the-request-is-over-its-thresholds",
+      "shed": false,
+      "workers": [
+        {
+          "runtime": "vllm",
+          "transport": "grpc",
+          "state": "free",
+          "window": 100
+        },
+        {
+          "runtime": "vllm",
+          "transport": "grpc",
+          "state": "over",
+          "window": 200
+        }
+      ],
+      "requests": [
+        {
+          "input_tokens": 150
+        },
+        {
+          "input_tokens": 50
+        }
+      ],
+      "answers": [
+        {
+          "placed": [
+            1
+          ]
+        },
+        {
+          "placed": [
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "the-worker-whose-window-holds-the-request-is-over-and-shedding-is-on",
+      "shed": true,
+      "workers": [
+        {
+          "runtime": "vllm",
+          "transport": "grpc",
+          "state": "free",
+          "window": 100
+        },
+        {
+          "runtime": "vllm",
+          "transport": "grpc",
+          "state": "over",
+          "window": 200
+        }
+      ],
+      "requests": [
+        {
+          "input_tokens": 150
+        },
+        {
+          "input_tokens": 50
+        }
+      ],
+      "answers": [
+        {
+          "refused": {
+            "status": 503,
+            "code": "worker_overload_protection_shed",
+            "retry_after": true,
+            "message": "All workers for model 'm' are overloaded"
+          }
+        },
+        {
+          "placed": [
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "a-pool-of-unknown-windows-takes-any-request",
+      "shed": false,
+      "workers": [
+        {
+          "runtime": "vllm",
+          "transport": "grpc",
+          "state": "free"
+        },
+        {
+          "runtime": "sglang",
+          "transport": "grpc",
+          "state": "free"
+        }
+      ],
+      "requests": [
+        {
+          "input_tokens": 1000000
+        },
+        {
+          "input_tokens": 1000000,
+          "output_tokens": 1000000
+        }
+      ],
+      "answers": [
+        {
+          "placed": [
+            0,
+            1
+          ]
+        },
+        {
+          "placed": [
+            0,
+            1
+          ]
+        }
+      ]
+    }
+  ]
+}

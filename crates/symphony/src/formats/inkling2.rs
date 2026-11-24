@@ -41,7 +41,7 @@ mod tests {
         engine::Engine,
         event::Event,
         formats::inkling,
-        grammar::GrammarStart,
+        grammar::{GrammarStart, Options},
         ids::CallIds,
         testing::{
             arguments_of, bytes, content, drive, dropped, names, reasoning, said, weather_tools,
@@ -403,17 +403,61 @@ mod tests {
     }
 
     #[test]
-    fn the_forced_calls_tag_is_inklings() {
+    fn the_owed_calls_tag_takes_the_opener_before_inklings_tag() {
         let tools = weather_tools();
-        for (at_least_one, reasoning_open) in [(true, false), (false, false), (true, true)] {
+        let tag = |format: Format, start| {
+            let options = Options {
+                at_least_one: true,
+                reasoning_open: false,
+                thought_closed: false,
+                one_call: false,
+                start,
+            };
+            format
+                .grammar_for(&tools, options)
+                .expect("a calls tag")
+                .payload()["format"]
+                .clone()
+        };
+        let lead = json!({"type": "const_string", "value": "<|message_model|>"});
+        // No turn is open, so the first call the request owes starts between the messages: from
+        // the first token the opener is owed before Inkling's tag, and it is optional where the
+        // engine may have passed it already.
+        assert_eq!(
+            tag(inkling2(), GrammarStart::FirstToken),
+            json!({"type": "sequence", "elements": [lead, tag(inkling(), GrammarStart::FirstToken)]})
+        );
+        for start in [
+            GrammarStart::Unknown,
+            GrammarStart::AfterReasoning,
+            GrammarStart::Either,
+        ] {
             assert_eq!(
-                inkling2()
-                    .grammar(&tools, at_least_one, reasoning_open)
-                    .map(|grammar| grammar.payload()),
-                inkling()
-                    .grammar(&tools, at_least_one, reasoning_open)
-                    .map(|grammar| grammar.payload())
+                tag(inkling2(), start),
+                json!({"type": "sequence", "elements": [
+                    {"type": "optional", "content": lead},
+                    tag(inkling(), start),
+                ]}),
+                "{start:?}"
             );
         }
+        // A call the request does not owe, or one after a thought the prompt left open, has
+        // Inkling's tag.
+        for (owed, open) in [(false, false), (true, true)] {
+            let payload = |format: Format| {
+                format
+                    .grammar(&tools, owed, open)
+                    .expect("a calls tag")
+                    .payload()
+            };
+            assert_eq!(payload(inkling2()), payload(inkling()));
+        }
+        let events = run(
+            UNOPENED,
+            &["<|message_model|><|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Paris\"}}<|end_message|>\
+               <|message_model|><|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Rome\"}}<|end_message|>"],
+        );
+        assert_eq!(names(&events), ["get_weather", "get_weather"]);
+        assert_eq!(malformed_count(&events), 0);
     }
 }

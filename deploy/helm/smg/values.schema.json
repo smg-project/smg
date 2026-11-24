@@ -28,7 +28,8 @@
             "least_load",
             "manual",
             "consistent_hashing",
-            "prefix_hash"
+            "prefix_hash",
+            "bucket"
           ]
         },
         "parser": { "type": "string", "enum": ["", "legacy", "symphony"] },
@@ -509,6 +510,11 @@
                 "description": "The worker's image tag; none takes the router's. A tag is text: a tag of digits alone is quoted."
               }
             }
+          },
+          "terminationGracePeriodSeconds": {
+            "type": ["integer", "null"],
+            "minimum": 0,
+            "description": "Seconds the kubelet waits between SIGTERM and SIGKILL on the worker's pod; none is 90, enough for the servicer's drain. A whole number of seconds: a duration such as 90s is refused, not read as 0."
           }
         }
       }

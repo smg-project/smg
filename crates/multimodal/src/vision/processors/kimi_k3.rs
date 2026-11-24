@@ -32,15 +32,15 @@ use crate::{
     },
 };
 
-pub const KIMI_K3_MEAN: [f64; 3] = [0.5, 0.5, 0.5];
-pub const KIMI_K3_STD: [f64; 3] = [0.5, 0.5, 0.5];
+pub(crate) const KIMI_K3_MEAN: [f64; 3] = [0.5, 0.5, 0.5];
+pub(crate) const KIMI_K3_STD: [f64; 3] = [0.5, 0.5, 0.5];
 
-pub const DEFAULT_PATCH_SIZE: usize = 14;
-pub const DEFAULT_MERGE_SIZE: usize = 2;
+pub(crate) const DEFAULT_PATCH_SIZE: usize = 14;
+pub(crate) const DEFAULT_MERGE_SIZE: usize = 2;
 /// Maximum total patches before merge (`in_patch_limit`) — 4x K2.5's budget.
-pub const DEFAULT_IN_PATCH_LIMIT: usize = 65536;
+pub(crate) const DEFAULT_IN_PATCH_LIMIT: usize = 65536;
 /// Maximum patches along one spatial dimension
-pub const DEFAULT_PATCH_LIMIT_ON_ONE_SIDE: usize = 512;
+pub(crate) const DEFAULT_PATCH_LIMIT_ON_ONE_SIDE: usize = 512;
 
 /// The `transparent_bg_config` shipped with `moonshotai/Kimi-K3`, verbatim from
 /// the checkpoint's `preprocessor_config.json`. These values describe K3 only —
@@ -72,7 +72,7 @@ impl Default for KimiK3Processor {
 }
 
 impl KimiK3Processor {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             params: MoonVitParams {
                 patch_size: DEFAULT_PATCH_SIZE,
@@ -92,14 +92,6 @@ impl KimiK3Processor {
             params: base.params.resolved(config),
             transparent_bg: base.resolved_transparent_bg(config),
         }
-    }
-
-    pub fn patch_size(&self) -> usize {
-        self.params.patch_size
-    }
-
-    pub fn merge_size(&self) -> usize {
-        self.params.merge_size
     }
 
     /// Overlay the model's own transparency settings, if it ships any.
@@ -210,8 +202,8 @@ mod tests {
     #[test]
     fn test_defaults_differ_from_k25() {
         let p = KimiK3Processor::new();
-        assert_eq!(p.patch_size(), 14);
-        assert_eq!(p.merge_size(), 2);
+        assert_eq!(p.params.patch_size, 14);
+        assert_eq!(p.params.merge_size, 2);
         assert_eq!(p.params.in_patch_limit, 65536);
         assert_ne!(
             p.params.in_patch_limit, K25_LIM,

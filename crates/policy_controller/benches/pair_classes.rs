@@ -9,12 +9,7 @@
 //!   carried, and published;
 //! - `policy_pairs/apply_mode/<fleet>`: one generation of another mode
 //!   applied to a store that holds the fleet: the standing membership
-//!   derived again under it and published once;
-//! - `policy_pairs/build/<fleet>`: one pair build through the store's pair
-//!   door under the default mode: both pools' rows and the table;
-//! - `policy_pairs/decide/<fleet>`: one pair decision under the default
-//!   mode: that build, then the engine's pair entry over what it built,
-//!   every worker ready with a load record on file.
+//!   derived again under it and published once.
 //!
 //! The fleets, each of one wire. A worker stands once in its pool, so the
 //! decode pool is 384 rows in each:
@@ -41,27 +36,26 @@
 //! Before the timed cells the bench prints, per fleet and mode, what the
 //! derivation holds: each side's classes, the table's bytes (four an entry
 //! and four a list's end), the bytes of one list a prefill (four a pair),
-//! and the rows of the decode pool as a store of that mode builds it.
+//! and the members a store of that mode lists in the decode pool.
 #![expect(
     clippy::expect_used,
     reason = "a bench's setup has no caller to answer"
 )]
 
-use std::{
-    hint::black_box,
-    time::{Duration, Instant},
-};
+#[path = "common/filled.rs"]
+mod filled;
+
+use std::{hint::black_box, sync::Arc};
 
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
 use smg_policy_controller::{
-    spec::Pairing,
+    document::{AppliedSpec, Pairing, PolicySpec},
+    engine::{Role, WireModes},
     store::{
-        identity, pairing::Member, Ask, GatewayId, LoadSink, LoadSource, MemoryStore, PairBuffers,
-        PairClasses, PairingDescriptor, ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore,
-        PUBLISH_WINDOW,
+        identity,
+        pairing::{Member, PairClasses, PairingDescriptor},
+        MemoryStore, WorkerFacts, WorkersStore,
     },
-    AppliedSpec, Constraints, LoadRow, PolicySpec, RequestFacts, Role, Scratch, SignalSource,
-    WireModes,
 };
 
 const PREFILLS: usize = 128;
@@ -204,7 +198,7 @@ fn fleet(fleet: &str) -> Vec<WorkerFacts> {
             engine_kind: runtime,
             models: vec![MODEL.to_string()],
             dp_size: 1,
-            pairing: pairing.map(Box::new),
+            pairing: pairing.map(Arc::new),
             ..WorkerFacts::default()
         }
     };
@@ -260,47 +254,15 @@ fn store_of(fleet: &[WorkerFacts], mode: Pairing) -> MemoryStore {
     for facts in fleet {
         store.upsert(facts.clone());
     }
+    store.publish_now();
+    if let Some(first) = fleet.first() {
+        let rows = fleet
+            .iter()
+            .filter(|facts| facts.role == first.role)
+            .count();
+        filled::filled(&store, MODEL, first.role, rows);
+    }
     store
-}
-
-/// Worker `index`'s record: figures that differ per worker, so no two rows
-/// read alike.
-fn record_of(index: usize) -> LoadRow {
-    let x = (index as u64 + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-    LoadRow {
-        running: (x >> 16) as u32 % 12,
-        queued: (x >> 24) as u32 % 4,
-        kv_usage_permille: ((x >> 32) % 900) as u16,
-        live_rate: 1_000 + ((x >> 40) % 3_000) as u32,
-        report_age_ms: 5,
-        source: SignalSource::Events,
-        ..LoadRow::default()
-    }
-}
-
-/// A store of the default mode that holds `fleet`, every worker ready with
-/// its record on file and published; and the ask of a decision a second
-/// after the window that opened last.
-fn serving(fleet: &[WorkerFacts]) -> (MemoryStore, Ask) {
-    let store = store_of(fleet, Pairing::default());
-    let opened = Instant::now();
-    for (index, facts) in fleet.iter().enumerate() {
-        let id = identity(&facts.key, facts.incarnation);
-        let revision = WorkersStore::get(&store, id).expect("the row").revision;
-        store
-            .set_status(id, WorkerStatus::Ready, revision)
-            .expect("ready");
-        store.record(id, 0, record_of(index), opened, LoadSource::Stream);
-    }
-    let opened = opened + PUBLISH_WINDOW;
-    store.publish(opened);
-    let ask = Ask {
-        gateway: GatewayId(1),
-        now: opened + Duration::from_secs(1),
-        pinned: None,
-        affinity: false,
-    };
-    (store, ask)
 }
 
 #[expect(clippy::print_stdout, reason = "the sizes are the bench's report")]
@@ -315,17 +277,10 @@ fn sizes() {
             let classes = PairClasses::derive(&prefills, &decodes, mode);
             let entries = classes.entries();
             let decode_classes = classes.decodes().iter().map(|&(_, class)| class).max();
-            let ask = Ask {
-                gateway: GatewayId(1),
-                now: Instant::now(),
-                pinned: None,
-                affinity: false,
-            };
-            let mut out = ViewBuffers::default();
             let rows = store_of(&fleet, mode)
-                .build_view(MODEL, Role::Decode, &ask, &mut out)
-                .expect("the decode pool")
-                .pool_size;
+                .snapshot()
+                .members(MODEL, Role::Decode)
+                .expect("the decode pool");
             println!(
                 "policy_pairs/sizes/{name}/{mode_name}: prefill_classes={} decode_classes={} \
                  table_bytes={} pair_list_bytes={} decode_rows={rows}",
@@ -365,7 +320,11 @@ fn membership_write(c: &mut Criterion) {
         group.bench_function(name, |b| {
             b.iter_batched(
                 || refreshed.clone(),
-                |facts| store.upsert(black_box(facts)),
+                |facts| {
+                    let change = store.upsert(black_box(facts));
+                    store.publish_now();
+                    change
+                },
                 BatchSize::SmallInput,
             );
         });
@@ -400,61 +359,5 @@ fn mode_change(c: &mut Criterion) {
     group.finish();
 }
 
-/// The pair door's build alone, then the build and the decision over it.
-fn pair_decision(c: &mut Criterion) {
-    let engine = serde_json::from_str::<PolicySpec>(PAIR_PLAN)
-        .expect("a well-formed document")
-        .validate()
-        .expect("the engine");
-    let cx = Constraints::default();
-    for name in FLEETS {
-        let (store, ask) = serving(&fleet(name));
-        let mut out = PairBuffers::default();
-        c.bench_function(&format!("policy_pairs/build/{name}"), |b| {
-            b.iter(|| {
-                let built = store.build_pair(MODEL, black_box(&ask), &mut out);
-                black_box(out.pools());
-                built
-            });
-        });
-        let mut scratch = Scratch::new();
-        let mut decide = |seed: u64| {
-            let (built, _) = store
-                .build_pair(MODEL, black_box(&ask), &mut out)
-                .expect("both pools");
-            let request = RequestFacts {
-                model: MODEL,
-                prompt_tokens: 512,
-                seed,
-                now_micros: built.now_micros,
-                ..RequestFacts::default()
-            };
-            engine.decide_pair(
-                &request,
-                &built.pool_facts(),
-                out.pools(),
-                &cx,
-                &cx,
-                &mut scratch,
-            )
-        };
-        let probe = decide(0);
-        assert!(probe.pick().is_some(), "{name}: {probe:?}");
-        c.bench_function(&format!("policy_pairs/decide/{name}"), |b| {
-            let mut seed = 0u64;
-            b.iter(|| {
-                seed += 1;
-                decide(seed)
-            });
-        });
-    }
-}
-
-criterion_group!(
-    benches,
-    derivation,
-    membership_write,
-    mode_change,
-    pair_decision
-);
+criterion_group!(benches, derivation, membership_write, mode_change);
 criterion_main!(benches);

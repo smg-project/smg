@@ -4,18 +4,19 @@
 
 use std::collections::BTreeMap;
 
-use kv_index::{chain_prefix_hash, ApplyError, ReferenceIndexer};
+use kv_index::{chain_prefix_hash, ApplyError, GroupKind, ReferenceIndexer};
 
 use super::{
-    admit, Blocks, ContentHash, KvEvent, LaneCounts, SequenceHash, StoredBlock, INDEX_WORKERS,
+    admit, Blocks, ContentHash, KvEvent, LaneCounts, LaneWriter, SequenceHash, StoredBlock,
+    INDEX_WORKERS,
 };
 use crate::{
+    engine::view::WorkerId,
     store::{
         kv_events::{RankCursor, GAP_CLEAR_THRESHOLD},
         BatchFacts, BatchOutcome, KvEventSink, MemoryStore, ResyncReason, Signals, SnapshotChunk,
         WorkerFacts, WorkersStore,
     },
-    view::WorkerId,
 };
 
 const MODEL: &str = "m";
@@ -37,7 +38,11 @@ fn publisher(key: &str, models: &[&str]) -> WorkerFacts {
 }
 
 fn admitted(store: &MemoryStore, key: &str) -> WorkerId {
-    store.upsert(publisher(key, &[MODEL])).id()
+    let id = store.upsert(publisher(key, &[MODEL])).id();
+    // The build this registration owes, asked: the cases read the row at
+    // once.
+    store.publish_now();
+    id
 }
 
 /// The facts of the row of `engine` at `rank` of `ranks`.
@@ -332,6 +337,225 @@ fn a_row_past_the_ceiling_stands_counted_until_its_own_write_finds_a_place() {
         held(&store, MODEL, &[1]),
         BTreeMap::from([(next, 1), (over, 1)])
     );
+}
+
+/// A lent body's write of `blocks` as a chain from the root: the lane's map
+/// is taken for the write and put back.
+fn write_lent(lane: &mut LaneWriter<'_>, blocks: &[StoredBlock]) {
+    let mut map = std::mem::take(lane.map());
+    let placed = lane.stored(blocks, None, &mut map);
+    *lane.map() = map;
+    placed.expect("stored");
+}
+
+/// A lent batch runs through the row's cursor as a typed one does. An
+/// admitted batch runs its body once, inside the lane's turn, and what the
+/// body writes is the row's. A batch the cursor skips or answers with a gap
+/// runs no body, and the typed admit goes on from the same cursor and map.
+#[test]
+fn a_lent_batch_runs_its_body_where_the_cursor_admits_it() {
+    let store = MemoryStore::new();
+    let a = admitted(&store, "a");
+    let blocks = chain(&[1, 2, 3]);
+    let mut ran = 0;
+    let mut body = |lane: &mut LaneWriter<'_>| {
+        ran += 1;
+        write_lent(lane, &blocks);
+    };
+    assert_eq!(
+        store.admit_through(a, 0, batch(1), &mut body),
+        BatchOutcome::Applied
+    );
+    // A duplicate at the cursor, a gap past it, another rank and a row the
+    // store does not hold.
+    assert_eq!(
+        store.admit_through(a, 0, batch(1), &mut body),
+        BatchOutcome::Skipped
+    );
+    assert_eq!(
+        store.admit_through(a, 0, batch(5), &mut body),
+        BatchOutcome::Gap {
+            expected: 2,
+            received: 5
+        }
+    );
+    assert_eq!(
+        store.admit_through(a, 1, batch(2), &mut body),
+        BatchOutcome::Skipped
+    );
+    assert_eq!(
+        store.admit_through(WorkerId(u64::MAX), 0, batch(1), &mut body),
+        BatchOutcome::Skipped
+    );
+    assert_eq!(ran, 1);
+    assert_eq!(held(&store, MODEL, &[1, 2, 3]), BTreeMap::from([(a, 3)]));
+    assert_eq!(store.indexed_blocks(a, 0), 3);
+
+    let evicted = [KvEvent::Removed(vec![blocks[2].seq_hash])];
+    assert_eq!(store.admit(a, 0, batch(2), &evicted), BatchOutcome::Applied);
+    assert_eq!(held(&store, MODEL, &[1, 2, 3]), BTreeMap::from([(a, 2)]));
+}
+
+/// A lent body reads a value that moves each time the store empties the
+/// rank: a resync, a restart its cursor reads, the worker reported gone, a
+/// typed batch's clear. It stands still between them, and the body reads it
+/// over a map that is empty by then.
+#[test]
+fn a_lent_body_reads_each_emptying_of_its_rank() {
+    let store = MemoryStore::new();
+    let a = admitted(&store, "a");
+    let blocks = chain(&[1, 2, 3]);
+    let lent = |sequence, clears| {
+        let facts = BatchFacts {
+            sequence,
+            clears,
+            ..BatchFacts::default()
+        };
+        let mut read = None;
+        let outcome = store.admit_through(a, 0, facts, &mut |lane| {
+            read = Some((lane.emptied(), lane.map().len()));
+            write_lent(lane, &blocks);
+        });
+        assert_eq!(outcome, BatchOutcome::Applied);
+        read.expect("the body ran")
+    };
+    let (first, held) = lent(10, false);
+    assert_eq!(held, 0);
+    assert_eq!(lent(11, false), (first, 3), "no emptying between the two");
+
+    store.resync(a, Some(0), ResyncReason::DataLoss);
+    let (resynced, held) = lent(20, false);
+    assert_eq!(held, 0);
+    assert_ne!(resynced, first);
+    // A clear under the cursor is a restarted publisher: the cursor empties
+    // the rank ahead of the body.
+    let (restarted, held) = lent(5, true);
+    assert_eq!(held, 0);
+    assert_ne!(restarted, resynced);
+    store.removed(a);
+    let (gone, held) = lent(1, false);
+    assert_eq!(held, 0);
+    assert_ne!(gone, restarted);
+    // A typed batch's clear empties the rank through the same routine.
+    assert_eq!(
+        store.admit(a, 0, batch(2), &[KvEvent::Cleared]),
+        BatchOutcome::Applied
+    );
+    let (cleared, held) = lent(3, false);
+    assert_eq!(held, 0);
+    assert_ne!(cleared, gone);
+}
+
+/// The store makes a row's lane again under the row's id: here the row
+/// stops asking for events and asks again. A lane usually sees one resync,
+/// its first snapshot, so two lanes that each counted from nothing would
+/// read alike. The new lane reads another value than the old one did, and
+/// a body that outlives the lane resets its state at the next batch.
+#[test]
+fn a_lane_made_again_under_one_row_id_reads_another_value() {
+    let store = MemoryStore::new();
+    let a = admitted(&store, "a");
+    let read = || {
+        store.resync(a, Some(0), ResyncReason::Snapshot);
+        let mut read = None;
+        let outcome = store.admit_through(a, 0, batch(1), &mut |lane| {
+            read = Some(lane.emptied());
+        });
+        assert_eq!(outcome, BatchOutcome::Applied);
+        read.expect("the body ran")
+    };
+    let old = read();
+
+    let quiet = WorkerFacts {
+        signals: Signals::default(),
+        ..publisher("a", &[MODEL])
+    };
+    assert_eq!(store.upsert(quiet).id(), a, "the row keeps its id");
+    assert_eq!(
+        store.admit_through(a, 0, batch(2), &mut |_| {}),
+        BatchOutcome::Skipped,
+        "a row that asks for no events holds no lane"
+    );
+    assert_eq!(store.upsert(publisher("a", &[MODEL])).id(), a);
+    store.publish_now();
+    assert_ne!(read(), old);
+}
+
+/// A lent body writes the row's view in the model's group views. The view
+/// empties with the rank, and its groups stay. It leaves with the row: the
+/// row that comes next finds a view of its own.
+#[test]
+fn a_rows_group_view_empties_with_its_rank_and_leaves_with_the_row() {
+    let store = MemoryStore::new();
+    let a = admitted(&store, "a");
+    let view_of = |id, sequence| {
+        let mut view = None;
+        let outcome = store.admit_through(id, 0, batch(sequence), &mut |lane| {
+            view = Some(lane.groups());
+        });
+        assert_eq!(outcome, BatchOutcome::Applied);
+        view.expect("the body ran")
+    };
+    let view = view_of(a, 1);
+    view.learn(1, Some(GroupKind::State), 16);
+    view.group_stored(1, &[SequenceHash(7)]);
+    let blocks = |view: &kv_index::WorkerGroups| view.pending_blocks() + view.retained_blocks();
+    assert_eq!(blocks(&view), 1);
+    assert!(std::sync::Arc::ptr_eq(&view, &view_of(a, 2)));
+
+    store.resync(a, Some(0), ResyncReason::DataLoss);
+    assert_eq!(blocks(&view), 0, "the view empties with the rank");
+    assert!(view.knows(1), "its groups stay");
+
+    let successor = store
+        .upsert(WorkerFacts {
+            incarnation: 2,
+            ..publisher("a", &[MODEL])
+        })
+        .id();
+    assert_ne!(successor, a);
+    let next = view_of(successor, 1);
+    assert!(!std::sync::Arc::ptr_eq(&view, &next));
+    assert!(!next.knows(1), "the successor's view is its own");
+}
+
+/// A lent body that unwinds leaves its rank half written. The store has
+/// the lane start over before the unwind goes on, as where the worker was
+/// reported gone: the rank is empty, the cursor reads nothing, and the next
+/// body reads another value over an empty map.
+#[test]
+fn a_lent_body_that_unwinds_starts_its_lane_over() {
+    let store = MemoryStore::new();
+    let a = admitted(&store, "a");
+    let blocks = chain(&[1, 2, 3]);
+    let mut first = None;
+    let outcome = store.admit_through(a, 0, batch(1), &mut |lane| {
+        first = Some(lane.emptied());
+        write_lent(lane, &blocks);
+    });
+    assert_eq!(outcome, BatchOutcome::Applied);
+    assert_eq!(store.indexed_blocks(a, 0), 3);
+    assert!(store.cursor(a, 0).is_some());
+
+    let more = chain(&[4, 5]);
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        store.admit_through(a, 0, batch(2), &mut |lane| {
+            write_lent(lane, &more);
+            panic!("the body's rules failed behind a write");
+        })
+    }));
+    assert!(unwound.is_err());
+    assert_eq!(store.indexed_blocks(a, 0), 0, "the rank is empty");
+    assert!(store.cursor(a, 0).is_none(), "the cursor starts over");
+
+    let mut next = None;
+    let outcome = store.admit_through(a, 0, batch(1), &mut |lane| {
+        next = Some((lane.emptied(), lane.map().len()));
+    });
+    assert_eq!(outcome, BatchOutcome::Applied);
+    let (next, held) = next.expect("the body ran");
+    assert_eq!(held, 0);
+    assert_ne!(Some(next), first);
 }
 
 /// A stand-in for an index at a size cap: it places `room` blocks more and
@@ -994,6 +1218,51 @@ fn a_second_snapshot_leaves_nothing_of_the_first_and_a_chunk_alone_only_adds() {
     assert_eq!(store.cursor(a, 0).expect("heard").applied, 41);
 }
 
+/// A snapshot its stream did not finish cannot be trusted past what it
+/// showed. The cursor starts over, so the next subscription asks from zero,
+/// and the blocks of its chunks stay until the next snapshot's start. Every
+/// other reason empties the rank, and a rank that is not the row's resets
+/// nothing.
+#[test]
+fn an_abandoned_snapshot_keeps_its_blocks_and_starts_its_cursor_over() {
+    let store = MemoryStore::new();
+    let a = admitted(&store, "a");
+    let chunk = |sequence| BatchFacts {
+        sequence,
+        clears: false,
+        snapshot: Some(SnapshotChunk {
+            unknown_before: false,
+        }),
+    };
+    let (first, second) = (chain(&[1, 2, 3]), chain(&[7, 8]));
+    store.resync(a, None, ResyncReason::Snapshot);
+    assert_eq!(
+        store.admit(a, 0, chunk(9), &stored(None, &first)),
+        BatchOutcome::Applied
+    );
+    store.resync(a, Some(1), ResyncReason::DataLoss);
+    assert_eq!(store.cursor(a, 0).expect("heard").applied, 9, "rank 1");
+    assert_eq!(store.indexed_blocks(a, 0), 3);
+
+    store.resync(a, Some(0), ResyncReason::SnapshotAbandoned);
+    assert_eq!(store.cursor(a, 0), Some(Default::default()), "from zero");
+    assert_eq!(held(&store, MODEL, &[1, 2, 3]), BTreeMap::from([(a, 3)]));
+    assert_eq!(store.resyncs(ResyncReason::SnapshotAbandoned), 1);
+    // The stream that follows is taken from wherever it starts, and its
+    // snapshot's start replaces what the abandoned one showed.
+    store.resync(a, None, ResyncReason::Snapshot);
+    assert_eq!(store.indexed_blocks(a, 0), 0);
+    assert_eq!(
+        store.admit(a, 0, chunk(4), &stored(None, &second)),
+        BatchOutcome::Applied
+    );
+    assert_eq!(held(&store, MODEL, &[7, 8]), BTreeMap::from([(a, 2)]));
+
+    store.resync(a, Some(0), ResyncReason::DataLoss);
+    assert_eq!(store.cursor(a, 0), Some(Default::default()), "from zero");
+    assert_eq!(store.indexed_blocks(a, 0), 0);
+}
+
 /// What a batch that clears leaves owes nothing to what came before it,
 /// wherever the clear stands among its events: below the cursor such a batch
 /// is a restarted publisher's, applied whole, and the stream goes on from
@@ -1055,1138 +1324,4 @@ fn a_row_written_at_another_rank_starts_over_there() {
         BatchOutcome::Applied
     );
     assert_eq!(store.indexed_blocks(row, 1), 1);
-}
-
-/// The rows a decision is handed in the affinity column's place.
-mod named {
-    use std::{
-        sync::{atomic::Ordering, Arc},
-        time::{Duration, Instant},
-    };
-
-    use super::{admitted, batch, chain, publisher, stored, MODEL};
-    use crate::{
-        store::{
-            index::PoolIndex, Ask, BatchOutcome, GatewayId, KvEventSink, LoadSink, LoadSource,
-            MemoryStore, Named, Naming, Reachability, Signals, ViewBuffers, WorkerFacts,
-            WorkersStore,
-        },
-        view::{LoadRow, Role, WireModes, WorkerId},
-        AppliedSpec, PolicySpec,
-    };
-
-    /// Another gateway than the one most cases decide for.
-    const OTHER: GatewayId = GatewayId(9);
-
-    /// The preset whose picker takes a sample of sixteen, as a generation:
-    /// its warm-up stage rules who warms (a level of 1,024 blocks, half of
-    /// it thin, sixty seconds young).
-    fn sampled(generation: u64) -> AppliedSpec {
-        let mut document = PolicySpec::preset("cache_aware").expect("a preset of this build");
-        document.generation = generation;
-        AppliedSpec::validate(&document).expect("a preset validates")
-    }
-
-    /// `facts` registered: the row's id.
-    fn registered(store: &MemoryStore, facts: WorkerFacts) -> WorkerId {
-        store.upsert(facts).id()
-    }
-
-    /// What one decision is handed, by worker: its rows, the holders named
-    /// with their depths, the warming rows named, and the bit.
-    struct Handed {
-        rows: Vec<WorkerId>,
-        holders: Vec<(WorkerId, u32)>,
-        warming: Vec<WorkerId>,
-        thin: bool,
-    }
-
-    /// The naming of `request` for a decision of `gateway` that states
-    /// `wires`, under a cap of `cap` rows, made now.
-    fn handed(
-        store: &MemoryStore,
-        gateway: GatewayId,
-        wires: Option<WireModes>,
-        request: &[u64],
-        cut: (u32, u64),
-    ) -> Handed {
-        handed_at(store, gateway, wires, request, cut, Instant::now())
-    }
-
-    /// The naming of `request` for a decision of `gateway` that states
-    /// `wires`, under a cap of `cap` rows, made at `at`: the view built,
-    /// narrowed as the decider narrows it, then named.
-    fn handed_at(
-        store: &MemoryStore,
-        gateway: GatewayId,
-        wires: Option<WireModes>,
-        request: &[u64],
-        (cap, seed): (u32, u64),
-        at: Instant,
-    ) -> Handed {
-        let mut view = ViewBuffers::default();
-        let mut named = Named::default();
-        store.deciding(|world| {
-            let ask = Ask {
-                gateway,
-                now: at,
-                pinned: None,
-                affinity: false,
-            };
-            let built = world
-                .build(MODEL, Role::Single, &ask, &mut view)
-                .expect("the pool");
-            if let Some(wires) = wires {
-                view.candidates
-                    .retain(|row| row.wire_modes.intersects(wires));
-            }
-            let naming = Naming {
-                gateway,
-                block_hashes: request,
-                seed,
-                cap,
-                wires,
-                now_micros: built.now_micros,
-            };
-            world.name(MODEL, Role::Single, &naming, &view.candidates, &mut named);
-        });
-        let rows: Vec<WorkerId> = view.candidates.iter().map(|row| row.id).collect();
-        let places = |list: &[u32]| list.windows(2).all(|pair| pair[0] < pair[1]);
-        let holders: Vec<u32> = named.holders.iter().map(|holder| holder.row).collect();
-        assert!(
-            places(&holders) && places(&named.warming),
-            "ascending, once"
-        );
-        Handed {
-            holders: named
-                .holders
-                .iter()
-                .map(|holder| (rows[holder.row as usize], holder.overlap_blocks))
-                .collect(),
-            warming: named
-                .warming
-                .iter()
-                .map(|&row| rows[row as usize])
-                .collect(),
-            thin: named.thin,
-            rows,
-        }
-    }
-
-    /// `id` holds `blocks`, by one batch.
-    fn holds(store: &MemoryStore, id: WorkerId, contents: &[u64]) {
-        let outcome = store.admit(id, 0, batch(1), &stored(None, &chain(contents)));
-        assert_eq!(outcome, BatchOutcome::Applied);
-    }
-
-    /// A decision is handed its request's deepest holders by their place in
-    /// its rows: whole depths from the deepest while they fit, and of the
-    /// depth the cap cuts as many as fit.
-    #[test]
-    fn a_decision_is_handed_its_requests_deepest_holders_by_their_place() {
-        let store = MemoryStore::new();
-        store.apply(sampled(1)).expect("above the unbound start");
-        let ids: Vec<WorkerId> = (0..6).map(|n| admitted(&store, &format!("w{n}"))).collect();
-        // Two hold the whole request, three its first two blocks, one none.
-        for (n, &id) in ids.iter().enumerate().take(5) {
-            holds(&store, id, if n < 2 { &[1, 2, 3, 4] } else { &[1, 2] });
-        }
-        let request = [1, 2, 3, 4];
-        let mut every: Vec<(WorkerId, u32)> = (0..5)
-            .map(|n| (ids[n], if n < 2 { 4 } else { 2 }))
-            .collect();
-        every.sort_unstable();
-        let whole = handed(&store, GatewayId::LOCAL, None, &request, (16, 7));
-        assert_eq!(whole.rows.len(), 6);
-        assert_eq!(whole.holders, every);
-        // No cap holds every holder.
-        let uncapped = handed(&store, GatewayId::LOCAL, None, &request, (0, 7));
-        assert_eq!(uncapped.holders, every);
-        // Under a cap of three: the two deepest and one of the three under
-        // them, whichever the seed draws.
-        let mut drawn = std::collections::BTreeSet::new();
-        for seed in 0..40 {
-            let cut = handed(&store, GatewayId::LOCAL, None, &request, (3, seed)).holders;
-            let deep = cut.iter().filter(|holder| holder.1 == 4).count();
-            assert_eq!((cut.len(), deep), (3, 2), "seed {seed}");
-            assert!(cut.iter().all(|holder| every.contains(holder)));
-            drawn.extend(
-                cut.iter()
-                    .filter(|holder| holder.1 == 2)
-                    .map(|holder| holder.0),
-            );
-        }
-        assert_eq!(drawn.len(), 3, "each of the three is drawn by some seed");
-        // A request nobody holds, and a request with no block: nobody named.
-        assert!(handed(&store, GatewayId::LOCAL, None, &[9], (16, 7))
-            .holders
-            .is_empty());
-        assert!(handed(&store, GatewayId::LOCAL, None, &[], (16, 7))
-            .holders
-            .is_empty());
-    }
-
-    /// A row the decision cannot reach is not named, and the cap is filled
-    /// from the rows it can: a gateway that states wires reads the holders
-    /// that share one with it, and no gateway reads another's host-local
-    /// row.
-    #[test]
-    fn the_holders_are_named_among_the_rows_a_decision_reaches() {
-        let store = MemoryStore::new();
-        store.apply(sampled(1)).expect("above the unbound start");
-        let member = |key: &str, wires: WireModes, reach: Reachability| {
-            let facts = WorkerFacts {
-                wire_modes: wires,
-                reachable_from: reach,
-                ..publisher(key, &[MODEL])
-            };
-            let id = registered(&store, facts);
-            holds(&store, id, &[1, 2, 3]);
-            id
-        };
-        let http = member("http", WireModes::HTTP, Reachability::Any);
-        let grpc = member("grpc", WireModes::GRPC, Reachability::Any);
-        let wires = WireModes::HTTP.union(WireModes::GRPC);
-        let both = member("both", wires, Reachability::Any);
-        let local = member("local", WireModes::GRPC, Reachability::Gateway(OTHER));
-        let named = |gateway, wires, cap, seed| {
-            let got = handed(&store, gateway, wires, &[1, 2, 3], (cap, seed));
-            got.holders
-                .iter()
-                .map(|holder| holder.0)
-                .collect::<Vec<_>>()
-        };
-        let sorted = |mut ids: Vec<WorkerId>| {
-            ids.sort_unstable();
-            ids
-        };
-        // Each gateway's own rows, whole.
-        let own = sorted(vec![http, grpc, both]);
-        assert_eq!(named(GatewayId::LOCAL, None, 16, 1), own);
-        let theirs = sorted(vec![http, grpc, both, local]);
-        assert_eq!(named(OTHER, None, 16, 1), theirs);
-        // Under a cap of two a gateway that speaks gRPC alone is handed the
-        // two holders it dials, whatever the seed: the row that speaks HTTP
-        // alone and the other gateway's row take no place of the cap.
-        let dialed = sorted(vec![grpc, both]);
-        for seed in 0..40 {
-            let cut = named(GatewayId::LOCAL, Some(WireModes::GRPC), 2, seed);
-            assert_eq!(cut, dialed, "seed {seed}");
-            let one = named(GatewayId::LOCAL, None, 1, seed);
-            assert!(one.len() == 1 && one[0] != local, "seed {seed}: {one:?}");
-        }
-        // A pool that holds no row foreign to its gateway is narrowed by that
-        // gateway's wires all the same: the row that speaks HTTP alone is not
-        // read.
-        let reached = sorted(vec![grpc, both, local]);
-        assert_eq!(named(OTHER, Some(WireModes::GRPC), 16, 1), reached);
-    }
-
-    /// What a decision that holds the world of before is named for
-    /// `request` under a cap and a seed once `then` has run under it: the
-    /// holders by their workers, and the workers of that world's rows.
-    fn named_under_a_kept_world(
-        store: &MemoryStore,
-        request: &[u64],
-        (cap, seed): (u32, u64),
-        then: impl FnOnce(),
-    ) -> (Vec<(WorkerId, u32)>, Vec<WorkerId>) {
-        let mut view = ViewBuffers::default();
-        let mut named = Named::default();
-        let before: Vec<WorkerId> = store.deciding(|world| {
-            let ask = Ask {
-                gateway: GatewayId::LOCAL,
-                now: Instant::now(),
-                pinned: None,
-                affinity: false,
-            };
-            let built = world
-                .build(MODEL, Role::Single, &ask, &mut view)
-                .expect("the pool");
-            then();
-            let naming = Naming {
-                gateway: GatewayId::LOCAL,
-                block_hashes: request,
-                seed,
-                cap,
-                wires: None,
-                now_micros: built.now_micros,
-            };
-            world.name(MODEL, Role::Single, &naming, &view.candidates, &mut named);
-            view.candidates.iter().map(|row| row.id).collect()
-        });
-        let holders = named
-            .holders
-            .iter()
-            .map(|holder| (before[holder.row as usize], holder.overlap_blocks))
-            .collect();
-        (holders, before)
-    }
-
-    /// The same once `left` has left under that world, a row has taken its
-    /// index id, and `then` has said what the taker and the others hold:
-    /// the holders by their workers, and the taker.
-    fn named_past_an_id_taken_again(
-        store: &MemoryStore,
-        left: WorkerId,
-        request: &[u64],
-        (cap, seed): (u32, u64),
-        then: impl FnOnce(WorkerId),
-    ) -> (Vec<(WorkerId, u32)>, WorkerId) {
-        // A row's id in the model's index, as the world of now holds it.
-        let index_id = |id: WorkerId| {
-            store.deciding(|world| {
-                let rows = handed(store, GatewayId::LOCAL, None, &[], (16, 7)).rows;
-                let row = rows.iter().position(|&row| row == id).expect("a row");
-                let standing = world.standing(MODEL, Role::Single).expect("a standing");
-                standing.tables.id_of[row]
-            })
-        };
-        let mut taker = None;
-        let (holders, before) = named_under_a_kept_world(store, request, (cap, seed), || {
-            let freed = index_id(left);
-            let revision = WorkersStore::get(store, left).expect("the row").revision;
-            store.remove(left, revision).expect("removed");
-            let row = admitted(store, "taker");
-            assert_eq!(index_id(row), freed, "the id is taken again");
-            then(row);
-            taker = Some(row);
-        });
-        assert!(before.contains(&left), "the world of before holds the row");
-        (holders, taker.expect("a taker"))
-    }
-
-    /// An index id is free for the next row once its row leaves, and a
-    /// decision may hold a world published before that. It reads the live
-    /// index under that world's tables: the row that left is named no
-    /// holder by the blocks of the row that took its id, and a row that
-    /// stands is named by what it holds now.
-    #[test]
-    fn an_index_id_taken_again_names_no_holder_under_the_row_that_left() {
-        let store = MemoryStore::new();
-        store.apply(sampled(1)).expect("above the unbound start");
-        let (left, stays) = (admitted(&store, "left"), admitted(&store, "stays"));
-        let request = [1, 2, 3];
-        // The taker holds the request whole, and the row that stands comes
-        // to hold two of its blocks.
-        let (holders, taker) =
-            named_past_an_id_taken_again(&store, left, &request, (16, 7), |taker| {
-                holds(&store, taker, &request);
-                holds(&store, stays, &[1, 2]);
-            });
-        assert_eq!(holders, [(stays, 2)]);
-        // The world of now names both by what they hold.
-        let now = handed(&store, GatewayId::LOCAL, None, &request, (16, 7));
-        assert_eq!(now.holders.len(), 2);
-        assert!(now.holders.contains(&(stays, 2)) && now.holders.contains(&(taker, 3)));
-    }
-
-    /// The naming goes on past an id taken again: a row that stands is named
-    /// by its depth whether the lookup read it before that id or after it.
-    #[test]
-    fn a_row_read_after_an_index_id_taken_again_is_still_named() {
-        let store = MemoryStore::new();
-        store.apply(sampled(1)).expect("above the unbound start");
-        // The row that leaves stands between the two that stay, by its id
-        // and, once taken again, by its depth.
-        let shallow = admitted(&store, "shallow");
-        let left = admitted(&store, "left");
-        let deep = admitted(&store, "deep");
-        let request = [1, 2, 3];
-        let (holders, _) = named_past_an_id_taken_again(&store, left, &request, (16, 7), |taker| {
-            holds(&store, shallow, &[1]);
-            holds(&store, taker, &[1, 2]);
-            holds(&store, deep, &request);
-        });
-        assert_eq!(holders.len(), 2, "{holders:?}");
-        assert!(holders.contains(&(shallow, 1)) && holders.contains(&(deep, 3)));
-    }
-
-    /// An id taken again takes no place of the cap: the lookup runs again
-    /// within the ids not taken since, and the cap is filled from them.
-    /// The taker is the deepest of three under a cap of two, so one lookup
-    /// alone would name one row.
-    #[test]
-    fn an_index_id_taken_again_takes_no_place_of_the_cap() {
-        let store = MemoryStore::new();
-        store.apply(sampled(1)).expect("above the unbound start");
-        let left = admitted(&store, "left");
-        let (shallow, deep) = (admitted(&store, "shallow"), admitted(&store, "deep"));
-        let request = [1, 2, 3];
-        let (holders, _) = named_past_an_id_taken_again(&store, left, &request, (2, 7), |taker| {
-            holds(&store, taker, &request);
-            holds(&store, deep, &[1, 2]);
-            holds(&store, shallow, &[1]);
-        });
-        assert_eq!(holders.len(), 2, "{holders:?}");
-        assert!(holders.contains(&(deep, 2)) && holders.contains(&(shallow, 1)));
-    }
-
-    /// The lookup made again cuts by a draw of its own. Three rows hold one
-    /// block under a cap of one, and one of them is on an id taken again:
-    /// where the first lookup drew that id, the second draws between the two
-    /// that stand, and across seeds each is named as often as the other. By
-    /// the first lookup's stream again the lower id would be named two
-    /// times of three.
-    #[test]
-    fn the_rows_that_stand_beside_an_id_taken_again_are_drawn_evenly() {
-        let request = [1];
-        let mut lower = 0u32;
-        for seed in 0..600 {
-            let store = MemoryStore::new();
-            store.apply(sampled(1)).expect("above the unbound start");
-            let left = admitted(&store, "left");
-            let (first, second) = (admitted(&store, "first"), admitted(&store, "second"));
-            let (holders, _) =
-                named_past_an_id_taken_again(&store, left, &request, (1, seed), |taker| {
-                    holds(&store, taker, &request);
-                    holds(&store, first, &request);
-                    holds(&store, second, &request);
-                });
-            assert!(
-                holders == [(first, 1)] || holders == [(second, 1)],
-                "seed {seed}: {holders:?}"
-            );
-            lower += u32::from(holders == [(first, 1)]);
-        }
-        // 600 draws of one in two: about 300 a row.
-        assert!((240..=360).contains(&lower), "{lower} of 600");
-    }
-
-    /// A row that joins takes an id of its own, and the index counts that
-    /// take as any: a decision that holds the world of before asks the rows
-    /// it kept, finds no id of theirs taken since, and names them by its
-    /// one lookup. The row that joined is no row of that world.
-    #[test]
-    fn a_join_under_a_kept_world_names_that_worlds_rows_as_before() {
-        let store = MemoryStore::new();
-        store.apply(sampled(1)).expect("above the unbound start");
-        let (near, far) = (admitted(&store, "near"), admitted(&store, "far"));
-        let request = [1, 2, 3];
-        holds(&store, near, &request);
-        holds(&store, far, &[1]);
-        let (holders, before) = named_under_a_kept_world(&store, &request, (16, 7), || {
-            let joined = admitted(&store, "joined");
-            holds(&store, joined, &request);
-        });
-        assert_eq!(before.len(), 2, "the world of before holds two rows");
-        assert_eq!(holders.len(), 2, "{holders:?}");
-        assert!(holders.contains(&(near, 3)) && holders.contains(&(far, 1)));
-    }
-
-    /// A row that joins another pool of the model takes an id of the
-    /// model's index, and the write that admits it keeps this pool's
-    /// standing. It tells the standing whole at the index's new count, so a
-    /// decision on it still asks its one question and looks up once.
-    #[test]
-    fn a_standing_kept_through_another_pools_take_is_whole_at_the_new_count() {
-        let store = MemoryStore::new();
-        store.apply(sampled(1)).expect("above the unbound start");
-        admitted(&store, "a");
-        admitted(&store, "b");
-        // The pool's standing, the count its tables are whole at, and the
-        // index's count of takes.
-        let stood = || {
-            store.deciding(|world| {
-                let standing = world.standing(MODEL, Role::Single).expect("the pool's");
-                let whole_at = standing.tables.taken.load(Ordering::Relaxed);
-                let index = standing.tables.index.as_ref().expect("an index");
-                (Arc::clone(&standing), whole_at, index.taken())
-            })
-        };
-        let (before, whole_at, taken) = stood();
-        assert_eq!(whole_at, taken);
-        let other = WorkerFacts {
-            role: Role::Decode,
-            ..publisher("d", &[MODEL])
-        };
-        registered(&store, other);
-        let (after, whole_at, taken_now) = stood();
-        assert!(Arc::ptr_eq(&before, &after), "the standing was kept");
-        assert_eq!(taken_now, taken + 1, "the other pool's row took an id");
-        assert_eq!(whole_at, taken_now);
-    }
-
-    /// The pool's warming rows are named as a publication read them: the
-    /// thin once the fleet holds a cache worth catching up to, then the
-    /// young, and nobody once the window is over. A write to the index
-    /// moves them at the next window, never between two.
-    #[test]
-    fn the_warming_rows_follow_the_index_and_the_clock_window_by_window() {
-        let store = MemoryStore::new();
-        store.apply(sampled(1)).expect("above the unbound start");
-        let (a, b) = (admitted(&store, "a"), admitted(&store, "b"));
-        let c = admitted(&store, "c");
-        let t0 = Instant::now();
-        let warming = || {
-            let got = handed(&store, GatewayId::LOCAL, None, &[], (16, 1));
-            (got.warming, got.thin)
-        };
-        // A window's publication: a load record with its instant.
-        let window = |at: Instant| store.record(a, 0, LoadRow::default(), at, LoadSource::Stream);
-        // Three rows admitted together are all young: nobody to catch up to.
-        assert_eq!(warming(), (vec![], false));
-        // Two fill past the level's floor. The third is thin at the next
-        // window, and not before it.
-        let filled: Vec<u64> = (1..=1_100).collect();
-        holds(&store, a, &filled);
-        holds(&store, b, &filled);
-        assert_eq!(warming(), (vec![], false));
-        window(t0 + Duration::from_secs(1));
-        assert_eq!(warming(), (vec![c], true));
-        // Past half the level it is thin no more, and young still: short of
-        // its first blocks, inside its window.
-        holds(&store, c, &filled[..600]);
-        window(t0 + Duration::from_secs(2));
-        assert_eq!(warming(), (vec![c], false));
-        // Its window over, nobody warms.
-        window(t0 + Duration::from_secs(61));
-        assert_eq!(warming(), (vec![], false));
-    }
-
-    /// Past the cap the warming rows a decision reads are a draw of the cap
-    /// from its seed, each row as likely as another; within the cap every
-    /// one is read.
-    #[test]
-    fn warming_rows_past_the_cap_are_a_draw_of_the_cap_each_row_as_likely() {
-        let store = MemoryStore::new();
-        store.apply(sampled(1)).expect("above the unbound start");
-        let ids: Vec<WorkerId> = (0..24)
-            .map(|n| admitted(&store, &format!("w{n:02}")))
-            .collect();
-        // Fourteen fill past the level's floor: the other ten are thin.
-        let filled: Vec<u64> = (1..=1_100).collect();
-        for &id in &ids[..14] {
-            holds(&store, id, &filled);
-        }
-        let at = Instant::now() + Duration::from_secs(1);
-        store.record(ids[0], 0, LoadRow::default(), at, LoadSource::Stream);
-        let mut thin = ids[14..].to_vec();
-        thin.sort_unstable();
-        let all = handed(&store, GatewayId::LOCAL, None, &[], (16, 1));
-        assert_eq!((all.warming, all.thin), (thin.clone(), true));
-        // No cap reads every one.
-        let uncapped = handed(&store, GatewayId::LOCAL, None, &[], (0, 1));
-        assert_eq!(uncapped.warming, thin);
-        let mut picked = std::collections::BTreeMap::new();
-        for seed in 0..1_000 {
-            let cut = handed(&store, GatewayId::LOCAL, None, &[], (4, seed)).warming;
-            assert_eq!(cut.len(), 4, "seed {seed}");
-            for id in cut {
-                *picked.entry(id).or_insert(0u32) += 1;
-            }
-        }
-        // 1,000 draws of 4 in 10: about 400 a row.
-        assert_eq!(picked.keys().copied().collect::<Vec<_>>(), thin);
-        assert!(
-            picked.values().all(|count| (300..=500).contains(count)),
-            "{picked:?}"
-        );
-    }
-
-    /// The cap and the draw are over the warming rows the view holds. A
-    /// gateway whose wires take half of a pool's thin rows is named the cap
-    /// among its own half, each as likely as another: a draw over the
-    /// pool's whole list would spend its places on rows the view lost.
-    #[test]
-    fn warming_rows_are_capped_among_the_rows_the_view_holds() {
-        let store = MemoryStore::new();
-        store.apply(sampled(1)).expect("above the unbound start");
-        // Fourteen rows that state both wires and fill past the level's
-        // floor; ten thin rows, five on gRPC and five on HTTP alone.
-        let both = WireModes::from_bits(WireModes::GRPC.bits() | WireModes::HTTP.bits());
-        let ids: Vec<WorkerId> = (0..24)
-            .map(|n| {
-                let wire_modes = match n {
-                    0..14 => both,
-                    _ if n % 2 == 0 => WireModes::GRPC,
-                    _ => WireModes::HTTP,
-                };
-                let facts = WorkerFacts {
-                    wire_modes,
-                    ..publisher(&format!("w{n:02}"), &[MODEL])
-                };
-                registered(&store, facts)
-            })
-            .collect();
-        let filled: Vec<u64> = (1..=1_100).collect();
-        for &id in &ids[..14] {
-            holds(&store, id, &filled);
-        }
-        let at = Instant::now() + Duration::from_secs(1);
-        store.record(ids[0], 0, LoadRow::default(), at, LoadSource::Stream);
-        let mut thin: Vec<WorkerId> = ids[14..].iter().copied().step_by(2).collect();
-        thin.sort_unstable();
-        let grpc = Some(WireModes::GRPC);
-        // Within the cap the view's own five are named, and no other.
-        let all = handed(&store, GatewayId::LOCAL, grpc, &[], (16, 1));
-        assert_eq!((all.rows.len(), all.warming), (19, thin.clone()));
-        // Past it every draw fills the cap from the five.
-        let mut picked = std::collections::BTreeMap::new();
-        for seed in 0..500 {
-            let cut = handed(&store, GatewayId::LOCAL, grpc, &[], (4, seed)).warming;
-            assert_eq!(cut.len(), 4, "seed {seed}");
-            for id in cut {
-                *picked.entry(id).or_insert(0u32) += 1;
-            }
-        }
-        // 500 draws of 4 in 5: about 400 a row.
-        assert_eq!(picked.keys().copied().collect::<Vec<_>>(), thin);
-        assert!(
-            picked.values().all(|count| (350..=450).contains(count)),
-            "{picked:?}"
-        );
-    }
-
-    /// One predicate says what a decision reaches: over a pool of every
-    /// kind of wires, with rows local to two gateways, the rows a read is
-    /// kept within are the rows the view holds once the decider narrowed
-    /// it, for each gateway and each set of wires it may state.
-    #[test]
-    fn a_read_is_kept_within_the_rows_the_narrowed_view_holds() {
-        let store = MemoryStore::new();
-        store.apply(sampled(1)).expect("above the unbound start");
-        let (first, second) = (GatewayId(1), GatewayId(2));
-        // Every set of the three wires a member may state, none among them,
-        // each under every reach.
-        for bits in 0u8..8 {
-            for local in 0u8..3 {
-                let facts = WorkerFacts {
-                    wire_modes: WireModes::from_bits(bits),
-                    reachable_from: match local {
-                        0 => Reachability::Any,
-                        1 => Reachability::Gateway(first),
-                        _ => Reachability::Gateway(second),
-                    },
-                    ..publisher(&format!("w{bits}-{local}"), &[MODEL])
-                };
-                registered(&store, facts);
-            }
-        }
-        for gateway in [GatewayId::LOCAL, first, second] {
-            for bits in 0u8..8 {
-                let wires = (bits != 0).then(|| WireModes::from_bits(bits));
-                let view = handed(&store, gateway, wires, &[], (16, 1)).rows;
-                let naming = Naming {
-                    gateway,
-                    block_hashes: &[],
-                    seed: 1,
-                    cap: 16,
-                    wires,
-                    now_micros: 0,
-                };
-                let reached = store.deciding(|world| world.reached(MODEL, Role::Single, &naming));
-                assert_eq!(reached, view, "gateway {gateway:?}, wires {bits:#05b}");
-                assert!(!view.is_empty(), "every set of wires has a member");
-            }
-        }
-    }
-
-    /// A young row's naming ends at its own instant, with no window
-    /// published between: a decision before the end of its window reads
-    /// it, and a decision past it reads nobody.
-    #[test]
-    fn a_young_rows_naming_ends_at_its_own_instant_with_no_window() {
-        let store = MemoryStore::new();
-        store.apply(sampled(1)).expect("above the unbound start");
-        let (a, b) = (admitted(&store, "a"), admitted(&store, "b"));
-        let c = admitted(&store, "c");
-        let t0 = Instant::now();
-        // Two fill past the level's floor; the third past half the level
-        // and short of its first blocks: young, and not thin.
-        let filled: Vec<u64> = (1..=1_100).collect();
-        holds(&store, a, &filled);
-        holds(&store, b, &filled);
-        holds(&store, c, &filled[..600]);
-        // A generation applied reads the pools again. No window is
-        // published, here or below.
-        store.apply(sampled(2)).expect("a later generation");
-        let warming = |at: Instant| {
-            let got = handed_at(&store, GatewayId::LOCAL, None, &[], (16, 1), at);
-            (got.warming, got.thin)
-        };
-        assert_eq!(warming(t0), (vec![c], false));
-        assert_eq!(warming(t0 + Duration::from_secs(50)), (vec![c], false));
-        // Sixty seconds past its admission the row is young no more.
-        assert_eq!(warming(t0 + Duration::from_secs(61)), (vec![], false));
-    }
-
-    /// The warming rows named at `now_micros` of the store's clock, by
-    /// worker.
-    fn warming_at(store: &MemoryStore, now_micros: u64) -> Vec<WorkerId> {
-        let mut view = ViewBuffers::default();
-        let mut named = Named::default();
-        store.deciding(|world| {
-            let ask = Ask {
-                gateway: GatewayId::LOCAL,
-                now: Instant::now(),
-                pinned: None,
-                affinity: false,
-            };
-            world
-                .build(MODEL, Role::Single, &ask, &mut view)
-                .expect("the pool");
-            let naming = Naming {
-                gateway: GatewayId::LOCAL,
-                block_hashes: &[],
-                seed: 1,
-                cap: 16,
-                wires: None,
-                now_micros,
-            };
-            world.name(MODEL, Role::Single, &naming, &view.candidates, &mut named);
-        });
-        let rows = &view.candidates;
-        let named = named.warming.iter();
-        named.map(|&row| rows[row as usize].id).collect()
-    }
-
-    /// The ends are exact. A fleet that is all young is named from its
-    /// first row's end: at that very microsecond the row that ends there is
-    /// named no more, and each of the rest is named until its own.
-    #[test]
-    fn a_naming_ends_at_its_rows_own_microsecond() {
-        let store = MemoryStore::new();
-        store.apply(sampled(1)).expect("above the unbound start");
-        let before = Instant::now();
-        // Admitted a millisecond apart: three ends, in this order.
-        let ids = ["a", "b", "c"].map(|key| {
-            let id = admitted(&store, key);
-            std::thread::sleep(Duration::from_millis(1));
-            id
-        });
-        let window = Duration::from_secs(60);
-        let from = store.micros(before + window);
-        let until = store.micros(Instant::now() + window);
-        let sorted = |ids: &[WorkerId]| {
-            let mut ids = ids.to_vec();
-            ids.sort_unstable();
-            ids
-        };
-        // The first instant anybody is named is the first row's end: the
-        // other two are named there, and it is not.
-        let first = (from..=until)
-            .find(|&at| !warming_at(&store, at).is_empty())
-            .expect("the fleet is named once its first row is young no more");
-        assert_eq!(warming_at(&store, first - 1), Vec::<WorkerId>::new());
-        assert_eq!(warming_at(&store, first), sorted(&ids[1..]));
-        // The second row is named until its own end, and the third until
-        // its own.
-        let second = (first..=until)
-            .find(|&at| !warming_at(&store, at).contains(&ids[1]))
-            .expect("the second row's end");
-        assert_eq!(warming_at(&store, second - 1), sorted(&ids[1..]));
-        assert_eq!(warming_at(&store, second), vec![ids[2]]);
-        let third = (second..=until)
-            .find(|&at| warming_at(&store, at).is_empty())
-            .expect("the third row's end");
-        assert_eq!(warming_at(&store, third - 1), vec![ids[2]]);
-        assert!(first < second && second < third);
-    }
-
-    /// A row that lists the model after its first name is in the pool and in
-    /// no index of the model: the id it holds in its first model's index is
-    /// no id of this one. The row that stands at that id here keeps its
-    /// blocks to itself, as a holder and by its size.
-    #[test]
-    fn a_row_indexed_under_another_model_takes_no_id_of_this_one() {
-        let store = MemoryStore::new();
-        store.apply(sampled(1)).expect("above the unbound start");
-        // Three rows of the model fill past the level's floor, each beside a
-        // row that lists the model second and stands at the same id of its
-        // own first model's index.
-        let filled: Vec<u64> = (1..=1_100).collect();
-        let (mut own, mut others) = (Vec::new(), Vec::new());
-        for n in 0..3 {
-            let other = publisher(&format!("x{n}"), &["m-first", MODEL]);
-            others.push(registered(&store, other));
-            let id = admitted(&store, &format!("w{n}"));
-            holds(&store, id, &filled);
-            own.push((id, 3));
-        }
-        own.sort_unstable();
-        others.sort_unstable();
-        // A window's publication reads the sizes.
-        let at = Instant::now() + Duration::from_secs(1);
-        store.record(own[0].0, 0, LoadRow::default(), at, LoadSource::Stream);
-        let got = handed(&store, GatewayId::LOCAL, None, &[1, 2, 3], (16, 1));
-        assert_eq!(got.rows.len(), 6);
-        // The holders are the model's own rows, and each row indexed
-        // elsewhere reads as empty here: thin beside a fleet that is full.
-        assert_eq!(got.holders, own);
-        assert_eq!((got.warming, got.thin), (others, true));
-    }
-
-    /// A view with no row names nobody, whatever its pool holds.
-    #[test]
-    fn a_view_with_no_row_names_nobody() {
-        let store = MemoryStore::new();
-        store.apply(sampled(1)).expect("above the unbound start");
-        let id = admitted(&store, "a");
-        holds(&store, id, &[1, 2, 3]);
-        let mut view = ViewBuffers::default();
-        let mut named = Named::default();
-        store.deciding(|world| {
-            let ask = Ask {
-                gateway: GatewayId::LOCAL,
-                now: Instant::now(),
-                pinned: None,
-                affinity: false,
-            };
-            let built = world
-                .build(MODEL, Role::Single, &ask, &mut view)
-                .expect("the pool");
-            // As a subset hint of 0 leaves it.
-            view.candidates.clear();
-            let naming = Naming {
-                gateway: GatewayId::LOCAL,
-                block_hashes: &[1, 2, 3],
-                seed: 1,
-                cap: 16,
-                wires: None,
-                now_micros: built.now_micros,
-            };
-            world.name(MODEL, Role::Single, &naming, &view.candidates, &mut named);
-        });
-        assert!(named.holders.is_empty() && named.warming.is_empty());
-    }
-
-    /// A pool's standing in its model's index, as a world holds it.
-    type Standing = Arc<PoolIndex>;
-
-    /// The standings of the case's two pools, and the list they stand in.
-    type Standings = (Standing, Standing, Arc<[Option<Standing>]>);
-
-    /// A membership write keeps the standing of every pool it did not move:
-    /// the same tables and warming rows are published, and the list itself
-    /// where the write moved none. A pool moves with a wire a lane's row
-    /// states, with a lane, and with an admission; any other pool stands,
-    /// whether or not a lane moved elsewhere.
-    #[test]
-    fn a_membership_write_keeps_the_standing_of_a_pool_it_did_not_move() {
-        const BESIDE: &str = "n";
-        let store = MemoryStore::new();
-        store.apply(sampled(1)).expect("above the unbound start");
-        let (a, b) = (admitted(&store, "a"), admitted(&store, "b"));
-        // A row with no lane: its signals ask for no events.
-        let plain = |incarnation: u64| WorkerFacts {
-            signals: Signals::default(),
-            incarnation,
-            ..publisher("p", &[MODEL])
-        };
-        registered(&store, plain(1));
-        registered(&store, publisher("c", &[BESIDE]));
-        let standings = || -> Standings {
-            store.deciding(|world| {
-                let of = |model| world.standing(model, Role::Single).expect("the pool's");
-                (of(MODEL), of(BESIDE), world.standings())
-            })
-        };
-        let reached = |wires: Option<WireModes>| {
-            let naming = Naming {
-                gateway: GatewayId::LOCAL,
-                block_hashes: &[],
-                seed: 1,
-                cap: 16,
-                wires,
-                now_micros: 0,
-            };
-            store.deciding(|world| world.reached(MODEL, Role::Single, &naming))
-        };
-        // A registration written again as it stands moves no pool: the
-        // list is the one published before.
-        let first = standings();
-        registered(&store, publisher("a", &[MODEL]));
-        let again = standings();
-        assert!(Arc::ptr_eq(&first.2, &again.2));
-        assert_eq!(reached(Some(WireModes::GRPC)), vec![]);
-        // A lane's row states a wire: its pool stands again, the other as
-        // it did, and a read for that wire is kept within the row.
-        registered(
-            &store,
-            WorkerFacts {
-                wire_modes: WireModes::GRPC,
-                ..publisher("a", &[MODEL])
-            },
-        );
-        let wired = standings();
-        assert!(!Arc::ptr_eq(&again.0, &wired.0) && Arc::ptr_eq(&again.1, &wired.1));
-        assert_eq!(reached(Some(WireModes::GRPC)), vec![a]);
-        // A lane is retired: its pool stands again with no id for the row,
-        // and the other pool is found standing by its own lanes.
-        let mut both = vec![a, b];
-        both.sort_unstable();
-        assert_eq!(reached(None), both);
-        registered(
-            &store,
-            WorkerFacts {
-                signals: Signals::default(),
-                ..publisher("b", &[MODEL])
-            },
-        );
-        let retired = standings();
-        assert!(!Arc::ptr_eq(&wired.0, &retired.0) && Arc::ptr_eq(&wired.1, &retired.1));
-        assert_eq!(reached(None), vec![a]);
-        // The row asks for events again: a lane is made, and its pool
-        // stands again with the row's id.
-        registered(&store, publisher("b", &[MODEL]));
-        let made = standings();
-        assert!(!Arc::ptr_eq(&retired.0, &made.0) && Arc::ptr_eq(&retired.1, &made.1));
-        assert_eq!(reached(None), both);
-        // A lane is made in the other pool: this one stands as it did.
-        registered(&store, publisher("d", &[BESIDE]));
-        let joined = standings();
-        assert!(Arc::ptr_eq(&made.0, &joined.0) && !Arc::ptr_eq(&made.1, &joined.1));
-        // A row with no lane is admitted again: as many rows, no lane
-        // moved, and the pool stands again by the admission alone.
-        std::thread::sleep(Duration::from_millis(2));
-        registered(&store, plain(2));
-        let readmitted = standings();
-        assert!(!Arc::ptr_eq(&joined.0, &readmitted.0) && Arc::ptr_eq(&joined.1, &readmitted.1));
-    }
-
-    /// A pool's standing goes with the pool where a write moves its place:
-    /// models that come one after another move the pools about, with a lane
-    /// and without one, and each pool that was there keeps its standing.
-    #[test]
-    fn a_pool_keeps_its_standing_where_a_write_moves_its_place() {
-        let store = MemoryStore::new();
-        store.apply(sampled(1)).expect("above the unbound start");
-        admitted(&store, "a");
-        let standing = |model: &str| {
-            store.deciding(|world| {
-                let standing = world.standing(model, Role::Single).expect("the pool's");
-                let held = |held: &Option<Standing>| {
-                    held.as_ref()
-                        .is_some_and(|held| Arc::ptr_eq(held, &standing))
-                };
-                let place = world.standings().iter().position(held);
-                (standing, place.expect("it stands in the list"))
-            })
-        };
-        let mut known = vec![(MODEL.to_string(), standing(MODEL))];
-        let mut moved = 0;
-        for n in 0..12 {
-            let model = format!("model-{n}");
-            let mut facts = publisher(&format!("w{n}"), &[model.as_str()]);
-            if n % 2 == 1 {
-                facts.signals = Signals::default();
-            }
-            registered(&store, facts);
-            for (model, (was, place)) in &mut known {
-                let (now, at) = standing(model);
-                assert!(Arc::ptr_eq(was, &now), "{model} after model-{n}");
-                moved += usize::from(at != *place);
-                *place = at;
-            }
-            known.push((model.clone(), standing(&model)));
-        }
-        // The case is of pools that moved: their order is the map's.
-        assert!(moved > 0);
-    }
-
-    /// A kept pool is found at its place among as many pools. A worker that
-    /// is the last of one model and comes back as the first of another
-    /// takes a pool out and brings one in: the pools are as many, the map
-    /// lays them in another order, and each pool that was there is read by
-    /// its own standing at the place the write gave it.
-    #[test]
-    fn a_kept_pool_is_found_at_its_place_among_as_many_pools() {
-        let store = MemoryStore::new();
-        store.apply(sampled(1)).expect("above the unbound start");
-        let standing = |model: &str| {
-            store.deciding(|world| {
-                let standing = world.standing(model, Role::Single).expect("the pool's");
-                let held = |held: &Option<Standing>| {
-                    held.as_ref()
-                        .is_some_and(|held| Arc::ptr_eq(held, &standing))
-                };
-                let place = world.standings().iter().position(held);
-                (standing, place.expect("it stands in the list"))
-            })
-        };
-        let mut known = Vec::new();
-        for n in 0..8 {
-            let model = format!("fixed-{n}");
-            registered(&store, publisher(&format!("f{n}"), &[model.as_str()]));
-            known.push(model);
-        }
-        registered(&store, publisher("hop", &["hop-0"]));
-        let pools = store.deciding(|world| world.standings().len());
-        let mut known: Vec<(String, (Standing, usize))> = known
-            .into_iter()
-            .map(|model| {
-                let at = standing(&model);
-                (model, at)
-            })
-            .collect();
-        let mut moved = 0;
-        for n in 1..=24 {
-            let model = format!("hop-{n}");
-            registered(&store, publisher("hop", &[model.as_str()]));
-            let now = store.deciding(|world| world.standings().len());
-            assert_eq!(now, pools, "as many pools after {model}");
-            for (model, (was, place)) in &mut known {
-                let (now, at) = standing(model);
-                assert!(Arc::ptr_eq(was, &now), "{model} after hop-{n}");
-                moved += usize::from(at != *place);
-                *place = at;
-            }
-        }
-        // The case is of pools that moved while their count stood.
-        assert!(moved > 0);
-    }
-
-    /// A lane's row admitted again under a new incarnation is a row of its
-    /// own id, and its lane takes the index id the one before it held. Of
-    /// the incarnations that follow one another, one whose id stands where
-    /// its row stood leaves as many rows, the same wires and the same ids
-    /// at the same places: its admission alone says the pool moved, and the
-    /// pool stands again by it.
-    #[test]
-    fn a_lanes_row_admitted_again_moves_its_pool_by_the_admission_alone() {
-        let store = MemoryStore::new();
-        store.apply(sampled(1)).expect("above the unbound start");
-        let (mut last, _) = (admitted(&store, "a"), admitted(&store, "b"));
-        let standing =
-            || store.deciding(|world| world.standing(MODEL, Role::Single).expect("the pool's"));
-        let mut held = 0;
-        for incarnation in 2..=16 {
-            let before = standing();
-            std::thread::sleep(Duration::from_millis(2));
-            let again = registered(
-                &store,
-                WorkerFacts {
-                    incarnation,
-                    ..publisher("a", &[MODEL])
-                },
-            );
-            assert_ne!(again, last);
-            last = again;
-            let after = standing();
-            // An id that stands elsewhere among the rows moves the places.
-            if before.tables.id_of != after.tables.id_of {
-                continue;
-            }
-            held += 1;
-            assert_ne!(before.tables.admitted, after.tables.admitted);
-            assert!(!Arc::ptr_eq(&before, &after));
-        }
-        // The case is of a row that took its place again.
-        assert!(held > 0);
-    }
-
-    /// The holders' draw and the warming rows' draw are on streams of their
-    /// own. Two rows are the request's only holders and the pool's only
-    /// warming rows, under a cap of one: over the seeds each list names
-    /// either row beside either row of the other. On one stream the two
-    /// draws would read one value, and one list's row would give the
-    /// other's.
-    #[test]
-    fn the_holders_and_the_warming_rows_are_drawn_apart() {
-        let store = MemoryStore::new();
-        store.apply(sampled(1)).expect("above the unbound start");
-        // Two rows fill past the level's floor with blocks of their own.
-        let filled: Vec<u64> = (1..=1_100).collect();
-        for key in ["big-a", "big-b"] {
-            holds(&store, admitted(&store, key), &filled);
-        }
-        // Two hold the request's one block and nothing more: thin.
-        let (x, y) = (admitted(&store, "x"), admitted(&store, "y"));
-        holds(&store, x, &[9_001]);
-        holds(&store, y, &[9_001]);
-        let at = Instant::now() + Duration::from_secs(1);
-        store.record(x, 0, LoadRow::default(), at, LoadSource::Stream);
-        let mut pairs = std::collections::BTreeSet::new();
-        for seed in 0..64 {
-            let got = handed(&store, GatewayId::LOCAL, None, &[9_001], (1, seed));
-            assert_eq!(
-                (got.holders.len(), got.warming.len()),
-                (1, 1),
-                "seed {seed}"
-            );
-            pairs.insert((got.holders[0].0, got.warming[0]));
-        }
-        assert_eq!(pairs.len(), 4, "{pairs:?}");
-    }
-
-    /// A generation rules the warming rows by its own stage from its apply,
-    /// with no window and no membership write between: one whose profile
-    /// holds no warm-up stage names nobody, one that holds it again names
-    /// them again, and one whose stage holds another number rules by it.
-    #[test]
-    fn a_generation_rules_the_warming_rows_from_its_apply() {
-        use crate::spec::{Pairing, ScoreSpec, ScoreStage};
-
-        let store = MemoryStore::new();
-        store.apply(sampled(1)).expect("above the unbound start");
-        let (a, b) = (admitted(&store, "a"), admitted(&store, "b"));
-        let c = admitted(&store, "c");
-        // Two fill past the level's floor and the third holds under half
-        // the level: thin, by the window that reads it.
-        let filled: Vec<u64> = (1..=1_100).collect();
-        holds(&store, a, &filled);
-        holds(&store, b, &filled);
-        holds(&store, c, &filled[..400]);
-        let at = Instant::now() + Duration::from_secs(1);
-        store.record(a, 0, LoadRow::default(), at, LoadSource::Stream);
-        let warming = || {
-            let got = handed(&store, GatewayId::LOCAL, None, &[], (16, 1));
-            (got.warming, got.thin)
-        };
-        assert_eq!(warming(), (vec![c], true));
-        let mut document = PolicySpec::preset("random").expect("a preset of this build");
-        document.generation = 2;
-        let unruled = AppliedSpec::validate(&document).expect("a preset validates");
-        store.apply(unruled).expect("a later generation");
-        assert_eq!(warming(), (vec![], false));
-        store.apply(sampled(3)).expect("a later generation");
-        assert_eq!(warming(), (vec![c], true));
-        // A stage that calls a quarter of the level thin: 400 blocks are
-        // thin no more, and young.
-        let mut document = PolicySpec::preset("cache_aware").expect("a preset of this build");
-        document.generation = 4;
-        for profile in document.profiles.values_mut() {
-            for stage in &mut profile.score {
-                if let ScoreSpec::Params(ScoreStage::WarmupSlice(stage)) = stage {
-                    stage.thin_ratio = Some(0.25);
-                }
-            }
-        }
-        let quarter = AppliedSpec::validate(&document).expect("a preset validates");
-        store.apply(quarter).expect("a later generation");
-        assert_eq!(warming(), (vec![c], false));
-        // A generation of another pairing mode derives the membership
-        // again and rules the pools that stand by its own stage there:
-        // half the level is thin again.
-        let mut document = PolicySpec::preset("cache_aware").expect("a preset of this build");
-        document.generation = 5;
-        document.plans.pd_pair.pairing = Pairing::Strict;
-        let strict = AppliedSpec::validate(&document).expect("a preset validates");
-        store.apply(strict).expect("a later generation");
-        assert_eq!(warming(), (vec![c], true));
-        // A generation whose stage holds another number and reads the same
-        // rows at its apply rules the next window by its own number: 400
-        // blocks are thin under 0.45 of the level as under half of it, and
-        // 520 under half alone.
-        let mut document = PolicySpec::preset("cache_aware").expect("a preset of this build");
-        document.generation = 6;
-        document.plans.pd_pair.pairing = Pairing::Strict;
-        for profile in document.profiles.values_mut() {
-            for stage in &mut profile.score {
-                if let ScoreSpec::Params(ScoreStage::WarmupSlice(stage)) = stage {
-                    stage.thin_ratio = Some(0.45);
-                }
-            }
-        }
-        let nearer = AppliedSpec::validate(&document).expect("a preset validates");
-        store.apply(nearer).expect("a later generation");
-        assert_eq!(warming(), (vec![c], true));
-        let longer = chain(&filled[..520]);
-        let more = stored(Some(longer[399].seq_hash), &longer[400..]);
-        assert_eq!(store.admit(c, 0, batch(2), &more), BatchOutcome::Applied);
-        let next = at + Duration::from_secs(1);
-        store.record(a, 0, LoadRow::default(), next, LoadSource::Stream);
-        assert_eq!(warming(), (vec![c], false));
-    }
 }

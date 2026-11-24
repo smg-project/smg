@@ -1,33 +1,45 @@
 //! What the crate's tests, and the tests of a crate that hosts the runtime,
 //! build their workers with, behind `test-util`: a health-check configuration
 //! that leaves a worker as the test built it, a ready worker, a worker under
-//! its model's aliases, a removed worker and its witness, and the registry
-//! and the builder a test of this crate names ([`WorkerRegistry`] over
-//! [`Members`], [`BasicWorkerBuilder`] with no connector). [`RefusedAddress`]
+//! its model's aliases, a removed worker and its witness, and the registry,
+//! the load monitor and the builder a test of this crate names
+//! ([`WorkerRegistry`] and [`WorkerMonitor`] over [`Members`],
+//! [`BasicWorkerBuilder`] with no connector). [`LoadReaders`] is the routing
+//! side a load monitor's test stands beside it. [`RefusedAddress`]
 //! is the loopback address nothing answers at: a dead worker's port, held for
 //! as long as the test needs it. [`NoEngine`] is an engine connection with no
 //! engine behind it, and [`CountingConnector`] the connector that hands those
-//! out. A test of a metric renders its scrape with [`render_with_recorder`]
-//! and reads it with [`assert_metric`] and [`sorted_series`].
+//! out; [`ScriptedEngine`] is one whose two pushed streams follow a
+//! [`Script`]. [`ScriptedAnswers`] is a connection whose health call, model
+//! labels and server labels answer as a case scripts them, and [`ScriptedConnector`] the
+//! connector that hands such connections out by runtime. A test of a metric
+//! renders its scrape with
+//! [`render_with_recorder`] and reads it with [`assert_metric`] and
+//! [`sorted_series`].
 
 use std::{
+    collections::HashMap,
     net::{Ipv4Addr, SocketAddr},
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc, Weak,
     },
+    time::Duration,
 };
 
 use async_trait::async_trait;
 use metrics_exporter_prometheus::PrometheusBuilder;
+use parking_lot::Mutex;
 use tokio::net::{TcpListener, TcpSocket};
 
 use crate::{
-    connection::engine::{AdminAnswer, EngineConnection, EngineConnector, ZmqLink},
+    common_proto::KvEventBatch,
+    connection::engine::{AdminAnswer, EngineConnection, EngineConnector, HealthAnswer, ZmqLink},
     identity::{
         basic::{ConnectionMode, Worker},
         builder,
     },
+    load::monitor::{self, LoadConsumer},
     model_card::ModelCard,
     registry,
     registry::Generation,
@@ -36,6 +48,9 @@ use crate::{
         WorkerType,
     },
 };
+
+mod scripted_engine;
+pub use scripted_engine::{Script, ScriptedEngine};
 
 /// The members alone: the value of a generation for a test that derives
 /// nothing from one.
@@ -58,6 +73,27 @@ pub type WorkerRegistry = registry::WorkerRegistry<Members>;
 
 /// The builder a test of this crate names: the one with no connector.
 pub type BasicWorkerBuilder = builder::BasicWorkerBuilder;
+
+/// The load monitor a test of this crate builds, over the same generations.
+pub type WorkerMonitor = monitor::WorkerMonitor<Members>;
+
+/// The routing side a test stands beside the load monitor: it says whether
+/// a reader wants worker loads, and reconciles nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadReaders {
+    /// No reader wants loads, as under a policy that reads none.
+    Blind,
+    /// A reader wants loads, as under a load-aware policy.
+    Aware,
+}
+
+impl LoadConsumer for LoadReaders {
+    fn needs_loads(&self) -> bool {
+        matches!(self, Self::Aware)
+    }
+
+    fn reconcile_in_flight(&self, _worker: &dyn Worker) {}
+}
 
 /// The health checker disabled, everything else default: a test's worker
 /// keeps the state it was built with, with no probe behind it.
@@ -380,14 +416,21 @@ mod tests {
 }
 
 /// An engine connection with no engine behind it: alive, without admin
-/// calls, and every call refused as unavailable. What a test hands a worker
-/// whose connection only has to exist.
+/// calls, every call refused as unavailable and its two streams as
+/// unimplemented. What a test hands a worker whose connection only has to
+/// exist.
 #[derive(Debug, Default)]
 pub struct NoEngine;
 
 fn no_engine<T>() -> Result<T, tonic::Status> {
     Err(tonic::Status::unavailable(
         "no engine behind the test's connection",
+    ))
+}
+
+fn no_stream<T>() -> Result<T, tonic::Status> {
+    Err(tonic::Status::unimplemented(
+        "the test's connection carries no event stream",
     ))
 }
 
@@ -401,7 +444,7 @@ impl EngineConnection for NoEngine {
         true
     }
 
-    async fn health_check(&self) -> Result<bool, tonic::Status> {
+    async fn health_answer(&self) -> Result<HealthAnswer, tonic::Status> {
         no_engine()
     }
 
@@ -421,8 +464,25 @@ impl EngineConnection for NoEngine {
         no_engine()
     }
 
-    async fn kv_engine_id(&self) -> Result<Option<String>, tonic::Status> {
+    async fn model_labels(&self) -> Result<HashMap<String, String>, tonic::Status> {
         no_engine()
+    }
+
+    async fn server_labels(&self) -> Result<HashMap<String, String>, tonic::Status> {
+        no_engine()
+    }
+
+    async fn subscribe_kv_events(
+        &self,
+        _start_seq: u64,
+    ) -> Result<tonic::Streaming<KvEventBatch>, tonic::Status> {
+        no_stream()
+    }
+
+    async fn subscribe_load_records(
+        &self,
+    ) -> Result<tonic::Streaming<KvEventBatch>, tonic::Status> {
+        no_stream()
     }
 }
 
@@ -454,5 +514,214 @@ impl EngineConnector for CountingConnector {
     async fn connect_zmq(&self, _link: ZmqLink) -> Result<Arc<dyn EngineConnection>, String> {
         self.connects.fetch_add(1, Ordering::SeqCst);
         Ok(Arc::new(NoEngine))
+    }
+
+    /// A dial makes no connection, so it is not counted.
+    async fn dial_grpc(&self, _base_url: &str, _timeout: Duration) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// An engine connection with scripted health and label answers.
+/// A case may change the health answer while a connection is held.
+#[derive(Debug)]
+pub struct ScriptedAnswers {
+    health: Mutex<Result<HealthAnswer, tonic::Code>>,
+    model: Result<HashMap<String, String>, tonic::Code>,
+    server: Result<HashMap<String, String>, tonic::Code>,
+    #[cfg(test)]
+    loads: Option<WorkerLoadResponse>,
+}
+
+impl ScriptedAnswers {
+    /// A connection that answers its health call as `health` says, and
+    /// refuses the read of its server labels.
+    pub fn answering_health(health: Result<HealthAnswer, tonic::Code>) -> Self {
+        Self {
+            health: Mutex::new(health),
+            model: Err(tonic::Code::Unimplemented),
+            server: Err(tonic::Code::Unimplemented),
+            #[cfg(test)]
+            loads: None,
+        }
+    }
+
+    /// A connection that returns the given load report.
+    #[cfg(test)]
+    pub(crate) fn answering_loads(loads: WorkerLoadResponse) -> Self {
+        Self {
+            loads: Some(loads),
+            ..Self::answering_health(Err(tonic::Code::Unimplemented))
+        }
+    }
+
+    /// A connection whose server reports the labels of `server`, or refuses
+    /// their read with its code, and that refuses its health call.
+    pub fn reporting(server: Result<&[(&str, &str)], tonic::Code>) -> Self {
+        Self::describing(Err(tonic::Code::Unimplemented), server)
+    }
+
+    /// A connection whose engine reports the model labels of `model` and the
+    /// server labels of `server`, or refuses either read with its code, and
+    /// that refuses its health call.
+    pub fn describing(
+        model: Result<&[(&str, &str)], tonic::Code>,
+        server: Result<&[(&str, &str)], tonic::Code>,
+    ) -> Self {
+        Self {
+            health: Mutex::new(Err(tonic::Code::Unimplemented)),
+            model: model.map(labels_of),
+            server: server.map(labels_of),
+            #[cfg(test)]
+            loads: None,
+        }
+    }
+
+    /// The health answer from now on.
+    pub fn set_health(&self, health: Result<HealthAnswer, tonic::Code>) {
+        *self.health.lock() = health;
+    }
+}
+
+/// The label map `pairs` spell, each name and value owned.
+pub fn labels_of(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+    pairs
+        .iter()
+        .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+        .collect()
+}
+
+fn not_scripted<T>() -> Result<T, tonic::Status> {
+    Err(tonic::Status::unimplemented(
+        "the case scripts no such call",
+    ))
+}
+
+fn scripted<T>(answer: Result<T, tonic::Code>) -> Result<T, tonic::Status> {
+    answer.map_err(|code| tonic::Status::new(code, "scripted"))
+}
+
+#[async_trait]
+impl EngineConnection for ScriptedAnswers {
+    fn carries_admin_calls(&self) -> bool {
+        false
+    }
+
+    fn is_alive(&self) -> bool {
+        true
+    }
+
+    async fn health_answer(&self) -> Result<HealthAnswer, tonic::Status> {
+        let answer = self.health.lock().clone();
+        scripted(answer)
+    }
+
+    async fn get_loads(&self) -> Result<WorkerLoadResponse, tonic::Status> {
+        #[cfg(test)]
+        if let Some(loads) = &self.loads {
+            return Ok(loads.clone());
+        }
+        not_scripted()
+    }
+
+    async fn flush_cache(&self, _timeout_s: f32) -> Result<AdminAnswer, tonic::Status> {
+        not_scripted()
+    }
+
+    async fn start_profile(&self, _options: &ProfileOptions) -> Result<AdminAnswer, tonic::Status> {
+        not_scripted()
+    }
+
+    async fn stop_profile(&self) -> Result<AdminAnswer, tonic::Status> {
+        not_scripted()
+    }
+
+    async fn model_labels(&self) -> Result<HashMap<String, String>, tonic::Status> {
+        scripted(self.model.clone())
+    }
+
+    async fn server_labels(&self) -> Result<HashMap<String, String>, tonic::Status> {
+        scripted(self.server.clone())
+    }
+
+    async fn subscribe_kv_events(
+        &self,
+        _start_seq: u64,
+    ) -> Result<tonic::Streaming<KvEventBatch>, tonic::Status> {
+        not_scripted()
+    }
+
+    async fn subscribe_load_records(
+        &self,
+    ) -> Result<tonic::Streaming<KvEventBatch>, tonic::Status> {
+        not_scripted()
+    }
+}
+
+/// A connector a case scripts. Its dial passes, or fails with a reason. A
+/// connect as a runtime it was given an engine for is answered by that
+/// engine. A connect as any other runtime gets a connection that refuses its
+/// health call as unimplemented, as an engine refuses a service it does not
+/// serve. It counts the connects it was asked for.
+#[derive(Debug, Default)]
+pub struct ScriptedConnector {
+    dial_refusal: Option<String>,
+    engines: Vec<(RuntimeType, Arc<ScriptedAnswers>)>,
+    connects: AtomicUsize,
+}
+
+impl ScriptedConnector {
+    /// The same connector with a dial that fails with `reason`.
+    #[must_use]
+    pub fn refusing_the_dial(mut self, reason: &str) -> Self {
+        self.dial_refusal = Some(reason.to_string());
+        self
+    }
+
+    /// The same connector with `engine` answering as `runtime`.
+    #[must_use]
+    pub fn with_engine(mut self, runtime: RuntimeType, engine: Arc<ScriptedAnswers>) -> Self {
+        self.engines.push((runtime, engine));
+        self
+    }
+
+    /// How many connects it was asked for.
+    pub fn connects(&self) -> usize {
+        self.connects.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl EngineConnector for ScriptedConnector {
+    async fn connect_grpc(
+        &self,
+        _base_url: &str,
+        runtime: RuntimeType,
+    ) -> Result<Arc<dyn EngineConnection>, String> {
+        self.connects.fetch_add(1, Ordering::SeqCst);
+        let scripted = self
+            .engines
+            .iter()
+            .find(|(served, _)| *served == runtime)
+            .map(|(_, engine)| Arc::clone(engine));
+        let engine: Arc<dyn EngineConnection> = match scripted {
+            Some(engine) => engine,
+            None => Arc::new(ScriptedAnswers::answering_health(Err(
+                tonic::Code::Unimplemented,
+            ))),
+        };
+        Ok(engine)
+    }
+
+    async fn connect_zmq(&self, _link: ZmqLink) -> Result<Arc<dyn EngineConnection>, String> {
+        Err("the case scripts no ZMQ link".to_string())
+    }
+
+    /// A dial makes no connection, so it is not counted.
+    async fn dial_grpc(&self, _base_url: &str, _timeout: Duration) -> Result<(), String> {
+        match &self.dial_refusal {
+            Some(reason) => Err(reason.clone()),
+            None => Ok(()),
+        }
     }
 }

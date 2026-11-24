@@ -11,10 +11,10 @@ use common::grpc_harness::{
 };
 use mock_worker::config::{Config, SchedulerWire};
 use openai_protocol::model_card::ModelCard;
-use smg::{
-    middleware::TenantRequestMeta,
-    tenant::TenantKey,
-    worker::{PdPairingMode, RuntimeType, Worker, WorkerType},
+use smg::{middleware::TenantRequestMeta, tenant::TenantKey};
+use smg_worker::{
+    identity::basic::{RuntimeType, Worker, WorkerType},
+    pd::pairing::PdPairingMode,
 };
 
 use super::completion_request;

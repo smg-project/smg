@@ -96,6 +96,7 @@ async fn stream_bytes(scenario: &GenerateScenario) -> Vec<u8> {
         backend_type: "test",
         model: "fixture-model".to_string(),
         expected_choices: scenario.expected_choices,
+        dispatch_wait: None,
     };
     let tokenizer: Arc<dyn Tokenizer> = Arc::new(CharacterTokenizer::default());
     let (tx, mut rx) = sse_channel();

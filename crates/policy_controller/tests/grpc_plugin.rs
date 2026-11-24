@@ -36,20 +36,28 @@ use rcgen::{
     BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
     KeyUsagePurpose,
 };
+#[cfg(feature = "wasm")]
+use smg_policy_controller::plugins::wasm;
 use smg_policy_controller::{
-    builtins::{Best, Healthy, LeastRequests},
-    grpc::{
-        Bound, BreakerSpec, EventKind, EventSet, Exposure, Failure, GrpcFilter, GrpcPicker,
-        GrpcPluginSpec, GrpcScorer, HeaderSet, LoadError, Plugin, Reveal, Runtime, Tls, Transport,
+    document::Needs,
+    engine::{
+        Binding, Candidate, Constraints, Decision, Engine, Filter, Header, Health, Identity,
+        PairPools, Picker, Plan, PoolFacts, Profile, RequestFacts, Scorer, Scratch, ShedReason,
+        Target, Targets, TieBand, WeightedScorer, WorkerId,
     },
-    plugins::OpenDecisions,
-    proto, Binding, Candidate, Constraints, Decision, Engine, Filter, Header, Health, Identity,
-    Lease, Lifecycle, Membership, Needs, PairPools, Picker, Plan, PoolFacts, Profile,
-    ReleaseReason, RequestFacts, Scorer, Scratch, ShedReason, Side, Signal, Target, Targets,
-    TieBand, Weighted, WorkerId,
+    plugins::{
+        grpc::{
+            GrpcFilter, GrpcPicker, GrpcPluginSpec, GrpcScorer, LoadError, Plugin, PluginBinding,
+            Runtime, Tls, Transport,
+        },
+        shared::{BreakerSpec, Exposure, Failure, FrameBudget, HeaderSet, OpenDecisions, Reveal},
+    },
+    service::proto,
+    stages::{Best, Healthy, LeastRequests, Lifecycle},
+    tracking::{EventKind, EventSet, Lease, Membership, ReleaseReason, Side, Signal},
 };
 use support::{
-    grpc_plugin::{eventually, Behaviour, ServerTls, TestPlugin, ALL, FILTER, PICK, SCORE},
+    grpc_plugin::{eventually, Behaviour, Gate, ServerTls, TestPlugin, ALL, FILTER, PICK, SCORE},
     said::{lines, openings, panic_at, said, trap_spent},
 };
 
@@ -73,6 +81,10 @@ fn unix(served: &TestPlugin) -> Transport {
 fn spec(served: &TestPlugin, name: &str) -> GrpcPluginSpec {
     let mut spec = GrpcPluginSpec::new(name, unix(served));
     spec.connect_micros = BUDGET_MICROS;
+    // The plugin states its frame, as wide as an answered case's budget. A
+    // plugin that states none takes the default frame, which has a case of
+    // its own.
+    spec.budget_micros = BUDGET_MICROS;
     // Every kind of event: the lifecycle's cases tell them, and a decision
     // reads none of it.
     spec.observes = EventSet::ALL;
@@ -107,11 +119,8 @@ const GUEST_LOADS: u32 = 10;
 /// says. The WebAssembly plugin binary's loads that must succeed do the
 /// same.
 #[cfg(feature = "wasm")]
-fn guest_loaded(
-    runtime: &Arc<smg_policy_controller::wasm::Runtime>,
-    spec: &smg_policy_controller::wasm::PluginSpec,
-) -> Arc<smg_policy_controller::wasm::Plugin> {
-    use smg_policy_controller::wasm;
+fn guest_loaded(runtime: &Arc<wasm::Runtime>, spec: &wasm::PluginSpec) -> Arc<wasm::Plugin> {
+    use smg_policy_controller::plugins::wasm;
 
     let mut loads = 0;
     loop {
@@ -139,7 +148,7 @@ fn profile_of(plugin: &Arc<Plugin>, stages: u32, fallbacks: bool) -> Profile {
 }
 
 /// `profile_of` over a bound set the caller took.
-fn bound_profile(bound: Arc<Bound>, stages: u32, fallbacks: bool) -> Profile {
+fn bound_profile(bound: Arc<PluginBinding>, stages: u32, fallbacks: bool) -> Profile {
     let filter: Box<dyn Filter> = if stages & FILTER != 0 {
         let fallback: Option<Box<dyn Filter>> = fallbacks.then(|| Box::new(Healthy) as _);
         Box::new(GrpcFilter::new(Arc::clone(&bound), fallback))
@@ -161,7 +170,7 @@ fn bound_profile(bound: Arc<Bound>, stages: u32, fallbacks: bool) -> Profile {
     Profile {
         name: "plugin".into(),
         filters: vec![filter],
-        scorers: vec![Weighted {
+        scorers: vec![WeightedScorer {
             scorer,
             weight: 1.0,
         }],
@@ -182,7 +191,7 @@ fn filter_then_picker(filter: &Arc<Plugin>, picker: &Arc<Plugin>) -> Profile {
     Profile {
         name: "two-plugins".into(),
         filters: vec![Box::new(GrpcFilter::new(filter.bind(), healthy))],
-        scorers: vec![Weighted {
+        scorers: vec![WeightedScorer {
             scorer: Box::new(LeastRequests),
             weight: 1.0,
         }],
@@ -197,6 +206,8 @@ fn binding(plan: Plan, decode_profile: Option<u16>) -> Binding {
         plan,
         profile: 0,
         decode_profile,
+        shadow: None,
+        decode_shadow: None,
         sessions: None,
         overload: None,
     }
@@ -338,7 +349,11 @@ fn the_hello_names_the_plugin_and_the_window_and_the_load_settles_the_stream() {
     let seen = served.seen();
     assert_eq!(seen.hellos.len(), 1);
     let hello = &seen.hellos[0];
-    assert_eq!((hello.protocol_min, hello.protocol_max), (1, 1));
+    assert_eq!(
+        (hello.protocol_min, hello.protocol_max),
+        (1, 2),
+        "no stream stands yet: the host's range"
+    );
     assert_eq!(hello.plugin, "greeter");
     assert_eq!(hello.config, b"mode=1");
     assert_eq!(hello.counters, ["hits", "skips"]);
@@ -384,11 +399,14 @@ fn a_plugin_that_cannot_be_reached_or_whose_init_fails_does_not_load() {
         other => panic!("an init failure, not {other:?}"),
     }
 
-    // The ack names a version outside the offered one.
+    // The ack names a version outside the offered range.
     let served = TestPlugin::serve();
-    served.script(|s| s.ack_protocol = 2);
+    served.script(|s| s.ack_protocol = 3);
     match Plugin::load(&runtime, spec(&served, "newer")) {
-        Err(LoadError::Connect(why)) => assert!(why.contains("protocol 2"), "{why}"),
+        Err(LoadError::Connect(why)) => assert!(
+            why.contains("protocol 3") && why.contains("offered 1 to 2"),
+            "{why}"
+        ),
         other => panic!("a refused version, not {other:?}"),
     }
 
@@ -448,10 +466,11 @@ fn an_init_failures_words_are_cut_at_a_characters_start() {
     }
 }
 
-/// One plugin speaks one version: the host offers the one it speaks on every
-/// stream, and a stream whose ack names another is cancelled with an error
-/// that names both, however many deciding threads open theirs at once. The
-/// stream that settled keeps deciding.
+/// One plugin speaks one version: the first stream to settle fixes it, a
+/// stream opened while it stands is offered that version alone, and one
+/// whose ack names another is cancelled with an error that names both,
+/// however many deciding threads open theirs at once. The stream that
+/// settled keeps deciding.
 #[test]
 fn an_ack_under_another_version_is_cancelled_on_every_racing_thread_naming_both() {
     const THREADS: usize = 4;
@@ -491,11 +510,13 @@ fn an_ack_under_another_version_is_cancelled_on_every_racing_thread_naming_both(
     {
         let seen = served.seen();
         assert_eq!(seen.hellos.len(), 1 + THREADS, "one hello a stream");
+        let offered = |hello: &proto::PluginHello| (hello.protocol_min, hello.protocol_max);
+        assert_eq!(offered(&seen.hellos[0]), (1, 2), "the load's hello");
         assert!(
-            seen.hellos
+            seen.hellos[1..]
                 .iter()
-                .all(|hello| (hello.protocol_min, hello.protocol_max) == (1, 1)),
-            "every hello names the one version"
+                .all(|hello| offered(hello) == (1, 1)),
+            "every later hello names the fixed version alone"
         );
     }
     assert!(
@@ -513,6 +534,118 @@ fn an_ack_under_another_version_is_cancelled_on_every_racing_thread_naming_both(
     let engine = single_engine(profile(&plugin, ALL));
     assert!(plugin.is_warm());
     assert_eq!(lead(&decide(&engine, &pool(4), 1)), Some(100));
+}
+
+/// Two streams offered the host's range settle one after the other: the
+/// first ack fixes the plugin's version, and the stream whose ack then names
+/// another is cancelled with an error that names both. Here the load's
+/// stream has ended, so no stream stands as two threads' hellos go out, and
+/// the plugin answers the second hello first. The events call is opened
+/// again under the version that settle fixed.
+#[test]
+fn an_ack_that_settles_second_under_another_version_is_cancelled_naming_both() {
+    let served = TestPlugin::serve();
+    served.behave(Behaviour::EndStream);
+    let runtime = runtime();
+    let mut spec = spec(&served, "second-to-settle");
+    // The ended and the refused stream count on the breaker: far from its
+    // threshold.
+    spec.breaker = BreakerSpec {
+        failures: 100,
+        ..BreakerSpec::default()
+    };
+    let plugin = Plugin::load(&runtime, spec).expect("the plugin loads");
+    let engine = single_engine(profile(&plugin, ALL));
+    // The plugin ends the load's stream at its first frame.
+    decide(&engine, &pool(4), 1);
+    assert!(
+        eventually(|| plugin.stats().failed_streams == 1),
+        "the load's stream ended: no stream stands"
+    );
+    // The events call that names the load's version is open before the
+    // version moves: its hello is the first of the two read below.
+    assert!(
+        eventually(|| served.seen().observe_hellos.len() == 1),
+        "the events call opened under the load's version"
+    );
+    // The first hello's ack names 1 and waits at a gate. The second's names
+    // 2 at once, and the gate opens once that stream has settled.
+    let gate = Gate::default();
+    served.script(|s| {
+        s.behaviour = Behaviour::Honest;
+        s.hello_gate = Some(gate.clone());
+    });
+    std::thread::scope(|scope| {
+        let first = scope.spawn(|| plugin.warm());
+        assert!(
+            eventually(|| served.seen().hellos.len() == 2),
+            "the first thread's hello is out"
+        );
+        served.script(|s| {
+            s.ack_protocol = 2;
+            s.hello_gate = None;
+        });
+        let second = scope.spawn(|| plugin.warm());
+        assert!(
+            matches!(second.join(), Ok(Ok(()))),
+            "the stream answered first settles"
+        );
+        gate.open();
+        match first.join() {
+            Ok(Err(LoadError::Connect(why))) => assert!(
+                why.contains("protocol 1 on this stream and 2 on the one that settled first"),
+                "both versions are named: {why}"
+            ),
+            other => panic!("a cancelled stream, not {other:?}"),
+        }
+    });
+    assert!(
+        eventually(|| served.seen().observe_hellos.len() == 2),
+        "the events call is opened again"
+    );
+    let seen = served.seen();
+    let offered = |hello: &proto::PluginHello| (hello.protocol_min, hello.protocol_max);
+    let offers: Vec<(u32, u32)> = seen.hellos.iter().map(offered).collect();
+    assert_eq!(offers, [(1, 2); 3], "each went out while no stream stood");
+    let named: Vec<(u32, u32)> = seen.observe_hellos.iter().map(offered).collect();
+    assert_eq!(named, [(1, 1), (2, 2)], "one events call a version");
+}
+
+/// The first stream to settle fixes the version a plugin speaks: the load's
+/// hello offers the host's range, and once its ack named a version every
+/// later hello names that one alone, a second thread's `Decide` and the
+/// `Observe` call's.
+#[test]
+fn the_first_settled_stream_fixes_the_version_every_later_hello_names() {
+    for version in [1, 2] {
+        let served = TestPlugin::serve();
+        served.script(|s| s.ack_protocol = version);
+        let runtime = runtime();
+        let plugin = load(&runtime, &served, "fixed");
+        std::thread::scope(|scope| {
+            let second = scope.spawn(|| plugin.warm());
+            assert!(
+                matches!(second.join(), Ok(Ok(()))),
+                "a second thread's stream"
+            );
+        });
+        assert!(
+            eventually(|| served.seen().observe_hellos.len() == 1),
+            "the events call opens at the first settle"
+        );
+        let seen = served.seen();
+        let offered: Vec<(u32, u32)> = seen
+            .hellos
+            .iter()
+            .chain(&seen.observe_hellos)
+            .map(|hello| (hello.protocol_min, hello.protocol_max))
+            .collect();
+        assert_eq!(
+            offered,
+            [(1, 2), (version, version), (version, version)],
+            "protocol {version}"
+        );
+    }
 }
 
 #[test]
@@ -648,6 +781,61 @@ fn a_scorer_alone_is_asked_for_scores_alone() {
     );
     assert_eq!(served.seen().frames[0].stages, SCORE);
     assert_eq!(plugin.stats().answered, 1);
+}
+
+// The best scores of the four rows are 1/2 and 1/3, followed by 1/4.
+const SCORES_WITH_BAND: Behaviour = Behaviour::ScoreBand(210);
+const BAND_ROUNDS: u64 = 64;
+
+#[test]
+fn a_plugins_band_widens_the_tie_the_built_in_picker_draws_from() {
+    let served = TestPlugin::serve();
+    served.behave(SCORES_WITH_BAND);
+    let runtime = runtime();
+    let plugin = load(&runtime, &served, "scorer");
+    let engine = single_engine(profile(&plugin, SCORE));
+    let candidates = pool(4);
+    let mut led = [false; 2];
+    for seed in 0..BAND_ROUNDS {
+        let picked = lead(&decide(&engine, &candidates, seed));
+        assert!(matches!(picked, Some(102 | 103)), "seed {seed}: {picked:?}");
+        led[0] |= picked == Some(102);
+        led[1] |= picked == Some(103);
+    }
+    assert_eq!(led, [true; 2], "each row in the band led");
+    assert_eq!(plugin.stats().answered, BAND_ROUNDS);
+}
+
+#[test]
+fn a_plugin_that_sends_no_band_decides_as_before() {
+    let served = TestPlugin::serve();
+    let runtime = runtime();
+    let plugin = load(&runtime, &served, "scorer");
+    let engine = single_engine(profile(&plugin, SCORE));
+    let candidates = pool(4);
+    for seed in 0..BAND_ROUNDS {
+        assert_eq!(
+            lead(&decide(&engine, &candidates, seed)),
+            Some(103),
+            "seed {seed}"
+        );
+    }
+    assert_eq!(plugin.stats().answered, BAND_ROUNDS);
+}
+
+#[test]
+fn a_band_is_not_carried_to_the_next_decision() {
+    let served = TestPlugin::serve();
+    served.behave(SCORES_WITH_BAND);
+    let runtime = runtime();
+    let plugin = load(&runtime, &served, "scorer");
+    let engine = single_engine(profile(&plugin, SCORE));
+    let candidates = pool(4);
+    let seed = 13;
+    assert_eq!(lead(&decide(&engine, &candidates, seed)), Some(102));
+    served.behave(Behaviour::Honest);
+    assert_eq!(lead(&decide(&engine, &candidates, seed)), Some(103));
+    assert_eq!(plugin.stats().answered, 2);
 }
 
 #[test]
@@ -991,7 +1179,7 @@ fn a_pick_only_frame_is_not_sent_once_the_plugin_failed_its_decision() {
 #[cfg(feature = "wasm")]
 #[test]
 fn a_pair_decision_over_both_kinds_is_one_decision_to_every_plugin() {
-    use smg_policy_controller::wasm;
+    use smg_policy_controller::plugins::wasm;
     use support::wasm_guest::{mode, record_guest};
 
     let open = OpenDecisions::new();
@@ -1010,7 +1198,7 @@ fn a_pair_decision_over_both_kinds_is_one_decision_to_every_plugin() {
         vec![Profile {
             name: "both-kinds".into(),
             filters: vec![Box::new(wasm::WasmFilter::new(guest.bind(), healthy))],
-            scorers: vec![Weighted {
+            scorers: vec![WeightedScorer {
                 scorer: Box::new(GrpcScorer::new(remote.bind(), least)),
                 weight: 1.0,
             }],
@@ -1218,15 +1406,6 @@ fn a_budget_decline_is_busy_and_a_frame_that_answers_nothing_declines_every_stag
 
 #[test]
 fn each_invalid_answer_is_one_fault_and_the_frame_falls_back_whole() {
-    let served = TestPlugin::serve();
-    let runtime = runtime();
-    let mut spec = spec(&served, "sloppy");
-    spec.breaker = BreakerSpec {
-        failures: 100,
-        ..BreakerSpec::default()
-    };
-    let plugin = Plugin::load(&runtime, spec).expect("the plugin loads");
-    let engine = single_engine(profile(&plugin, ALL));
     let behaviours = [
         Behaviour::SurvivorOutOfRange,
         Behaviour::SurvivorTwice,
@@ -1234,7 +1413,24 @@ fn each_invalid_answer_is_one_fault_and_the_frame_falls_back_whole() {
         Behaviour::ScoreNan,
         Behaviour::PickOutsideOwnSurvivors,
         Behaviour::DeclinedAndAnswered,
+        Behaviour::BandNan,
+        Behaviour::BandAboveOne,
+        Behaviour::BandBelowZero,
+        Behaviour::BandWithoutScores,
+        Behaviour::BandWithScoreDecline,
     ];
+    let failures = behaviours.len();
+    let served = TestPlugin::serve();
+    served.script(|s| s.counters = vec![(0, 1)]);
+    let runtime = Runtime::with_clock(&OpenDecisions::new(), || 1_234).expect("a runtime");
+    let mut spec = spec(&served, "sloppy");
+    spec.breaker = BreakerSpec {
+        failures: failures as u32,
+        ..BreakerSpec::default()
+    };
+    spec.metrics = vec!["answers".to_owned()];
+    let plugin = Plugin::load(&runtime, spec).expect("the plugin loads");
+    let engine = single_engine(profile(&plugin, ALL));
     for (i, behaviour) in behaviours.into_iter().enumerate() {
         served.behave(behaviour);
         assert_eq!(
@@ -1244,12 +1440,17 @@ fn each_invalid_answer_is_one_fault_and_the_frame_falls_back_whole() {
         );
         let stats = plugin.stats();
         assert_eq!(
-            (stats.invalid, stats.answered),
-            (i as u64 + 1, 0),
+            (
+                stats.invalid,
+                stats.answered,
+                stats.declined,
+                stats.breaker_opens
+            ),
+            (i as u64 + 1, 0, 0, u64::from(i + 1 == failures)),
             "{behaviour:?}"
         );
     }
-    assert_eq!(plugin.stats().breaker_opens, 0, "under the threshold");
+    assert!(plugin.counters().read().all(|(_, value)| value == 0));
 }
 
 #[test]
@@ -1385,6 +1586,70 @@ fn a_missed_deadline_under_the_plugins_own_bound_is_one_failure_of_its_decision(
     );
 }
 
+/// A plugin that states no budget takes the default frame, under a request
+/// that states none too: a stage is shown the widest budget there, the
+/// frame names the default as the plugin's deadline, and a plugin that
+/// answers nothing is waited for that long and no longer. The fallbacks
+/// decide, and the missed frame is the plugin's own failure.
+#[test]
+fn a_plugin_with_no_budget_is_waited_for_the_default_frame_under_a_request_with_none() {
+    let served = TestPlugin::serve();
+    served.behave(Behaviour::Silent);
+    let runtime = runtime();
+    let mut unset = spec(&served, "unbudgeted");
+    unset.budget_micros = 0;
+    let plugin = Plugin::load(&runtime, unset).expect("the plugin loads");
+    let engine = single_engine(profile(&plugin, ALL));
+    // What a stage is shown for a request that states no budget.
+    let widest = RequestFacts {
+        budget_micros: u32::MAX,
+        ..facts(1)
+    };
+    let default = FrameBudget::DEFAULT_MICROS;
+    let started = Instant::now();
+    assert_eq!(
+        lead(&decide_with(&engine, &widest, &pool(4))),
+        Some(103),
+        "the fallbacks decide"
+    );
+    let waited = started.elapsed();
+    assert!(
+        waited >= Duration::from_micros(u64::from(default)),
+        "the first stage waited out the default frame: {waited:?}"
+    );
+    assert!(
+        waited < Duration::from_micros(u64::from(BUDGET_MICROS)),
+        "and nothing like a request's budget: {waited:?}"
+    );
+    assert!(eventually(|| served.frames() == 1));
+    let seen = served.seen();
+    let frame = &seen.frames[0];
+    assert_eq!(frame.budget_micros, default, "the deadline the frame named");
+    assert_eq!(
+        frame.request.as_ref().map(|request| request.budget_micros),
+        Some(u32::MAX),
+        "the request's own budget, as a stage is shown it"
+    );
+    // A loaded host can hold the I/O thread under any one frame, and a held
+    // miss is the host's: the next frame that leaves is judged.
+    decide_until_judged(&engine, &plugin, &widest, &pool(4), 1);
+    let stats = plugin.stats();
+    assert_eq!(
+        (
+            stats.missed - stats.stalls,
+            stats.own_misses,
+            stats.unread,
+            stats.answered
+        ),
+        (1, 1, 0, 0),
+        "the missed default frame is the plugin's own: {stats:?}"
+    );
+    assert_eq!(
+        stats.budget_spent, stats.stalls,
+        "no budget of the request's was spent: {stats:?}"
+    );
+}
+
 #[test]
 fn a_plugin_that_misses_every_deadline_opens_its_breaker_through_the_latency_sample() {
     let served = TestPlugin::serve();
@@ -1419,6 +1684,56 @@ fn a_plugin_that_misses_every_deadline_opens_its_breaker_through_the_latency_sam
     );
     assert!(matches!(
         decide_with(&engine, &quick, &candidates),
+        Decision::Pick(_)
+    ));
+    let after = plugin.stats();
+    assert_eq!(
+        (after.missed, after.bypassed),
+        (stats.missed, 1),
+        "inside the cool-down the plugin is not asked"
+    );
+}
+
+/// The same plugin under a request that states no budget, with a budget of
+/// its own that it misses every time: a stage is shown the widest budget
+/// there, and the plugin's time is set against its own frames, not against
+/// that budget. So the ring still judges it, and opens the breaker at its
+/// first window.
+#[test]
+fn a_plugin_that_misses_every_deadline_of_its_own_is_judged_under_a_request_with_no_budget() {
+    let served = TestPlugin::serve();
+    served.behave(Behaviour::Silent);
+    let runtime = runtime();
+    let mut tight = spec(&served, "always-late-of-its-own");
+    // A budget no longer than the I/O thread's promise: no miss of it is
+    // the plugin's failure, so the ring alone can turn the plugin off.
+    tight.budget_micros = 2_000;
+    let plugin = Plugin::load(&runtime, tight).expect("the plugin loads");
+    let engine = single_engine(profile(&plugin, ALL));
+    let candidates = pool(4);
+    // What a stage is shown for a request that states no budget.
+    let widest = RequestFacts {
+        budget_micros: u32::MAX,
+        ..facts(1)
+    };
+    decide_until_judged(&engine, &plugin, &widest, &candidates, 64);
+    let stats = plugin.stats();
+    assert_eq!(
+        (
+            stats.missed - stats.stalls,
+            stats.breaker_opens,
+            stats.bypassed
+        ),
+        (64, 1, 0),
+        "{stats:?}"
+    );
+    assert_eq!(
+        (stats.own_misses, stats.unread),
+        (0, stats.missed - stats.stalls),
+        "the ring alone judged these: {stats:?}"
+    );
+    assert!(matches!(
+        decide_with(&engine, &widest, &candidates),
         Decision::Pick(_)
     ));
     let after = plugin.stats();
@@ -1785,7 +2100,7 @@ fn filters_of(plugins: &[&Arc<Plugin>]) -> Profile {
                 Box::new(GrpcFilter::new(plugin.bind(), healthy)) as Box<dyn Filter>
             })
             .collect(),
-        scorers: vec![Weighted {
+        scorers: vec![WeightedScorer {
             scorer: Box::new(LeastRequests),
             weight: 1.0,
         }],
@@ -1811,11 +2126,14 @@ fn a_wait_the_remainder_ended_first_is_the_decisions_spend_at_what_the_frame_was
         .map(|(i, served)| {
             served.behave(Behaviour::Silent);
             // Seven of the decision's twenty milliseconds each, their own
-            // misses never opening them here.
+            // misses never opening them here. Each sample of theirs is a
+            // whole frame, so their windows read slow: under a cool-down of
+            // zero that opening bypasses nothing.
             let mut spec = spec(served, &format!("front-{i}"));
             spec.budget_micros = 7_000;
             spec.breaker = BreakerSpec {
                 failures: u32::MAX,
+                cooldown_micros: 0,
                 ..BreakerSpec::default()
             };
             Plugin::load(&runtime, spec).expect("the plugin loads")
@@ -1865,6 +2183,64 @@ fn a_wait_the_remainder_ended_first_is_the_decisions_spend_at_what_the_frame_was
     assert!(
         stats.own_misses <= 2,
         "a wait the remainder ended is not the plugin's own: {stats:?}"
+    );
+}
+
+/// A frame sent under what a decision had left is read against its plugin's
+/// whole frame. A silent filter draws three quarters of the budget, so the
+/// picker's frame leaves with the last quarter as its deadline and misses
+/// it: the decision's budget spent, whoever spent it, and no failure. Its
+/// sample is a quarter of the plugin's own frame, which no window reads
+/// slow. Read against the frame as sent, every sample would be a whole
+/// frame and the window would open at its first read.
+#[test]
+fn a_frame_sent_under_the_rest_is_read_against_its_plugins_whole_frame() {
+    let silent = TestPlugin::serve();
+    silent.behave(Behaviour::Silent);
+    let mute = TestPlugin::serve();
+    mute.behave(Behaviour::Silent);
+    let runtime = runtime();
+    // The silent filter's own budget is three quarters of the decision's.
+    // Nothing bypasses it here: its misses never count to an opening, and
+    // an opening by its own slow samples lasts no time.
+    let mut front = spec(&silent, "silent-front");
+    front.budget_micros = SHORT_MICROS / 4 * 3;
+    front.breaker = BreakerSpec {
+        failures: u32::MAX,
+        cooldown_micros: 0,
+        ..BreakerSpec::default()
+    };
+    let filter = Plugin::load(&runtime, front).expect("the plugin loads");
+    // The picker's own frame is the whole budget. A round whose filter frame
+    // did not leave asks it under that, and such a miss is its own: its
+    // failures never open it here.
+    let mut rest = spec(&mute, "under-the-rest");
+    rest.breaker = BreakerSpec {
+        failures: u32::MAX,
+        ..BreakerSpec::default()
+    };
+    let picker = Plugin::load(&runtime, rest).expect("the plugin loads");
+    let engine = single_engine(filter_then_picker(&filter, &picker));
+    let short = RequestFacts {
+        budget_micros: SHORT_MICROS,
+        ..facts(1)
+    };
+    // The window's first read is at its 64th sample.
+    decide_until_judged(&engine, &picker, &short, &pool(4), 64);
+    let stats = picker.stats();
+    assert_eq!(
+        (stats.unread, stats.breaker_opens, stats.bypassed),
+        (0, 0, 0),
+        "{stats:?}"
+    );
+    assert_eq!(
+        stats.budget_spent + stats.own_misses,
+        stats.missed,
+        "{stats:?}"
+    );
+    assert!(
+        stats.own_misses <= 2,
+        "a frame the remainder clamped is not the plugin's own: {stats:?}"
     );
 }
 
@@ -1936,13 +2312,18 @@ fn a_miss_under_a_remainder_the_plugin_alone_spent_is_its_own() {
 /// across its deadline leaves no gap for the witness. An honest plugin
 /// under such a budget, the I/O thread held across each deadline for less
 /// than the promise, misses every frame, and nothing says whose the miss
-/// is: each is the decision's budget spent, counted unread, and the breaker
-/// stays shut. Judged as the plugin's own, the fifth would open it.
+/// is: each is the decision's budget spent, counted unread, and no miss is
+/// the plugin's failure. Judged as its own, the fifth would open the
+/// breaker. The latency rule alone judges such frames: a window of them
+/// used up whole reads slow at its first read, whoever was late.
 #[test]
 fn a_miss_too_short_for_the_witness_is_unread_and_the_decisions_budget_spent() {
     // Longer than the plugin's budget, shorter than the promise.
     const HOLD: Duration = Duration::from_millis(3);
     let served = TestPlugin::serve();
+    // The plugin's usual time: inside its budget below, and over half of it.
+    // So a round answered in time is a slow sample too, like a miss.
+    served.script(|s| s.delay = Duration::from_micros(1_200));
     let runtime = runtime();
     // The plugin's own budget: a fifth of the decision's, half the promise.
     let mut spec = spec(&served, "short-frames");
@@ -1954,11 +2335,15 @@ fn a_miss_too_short_for_the_witness_is_unread_and_the_decisions_budget_spent() {
         budget_micros: 10_000,
         ..facts(1)
     };
-    // Past the window's first read, at its 64th sample.
+    // Up to the window's first read, at its 64th sample: an unread miss, or
+    // a round answered in time. A round the I/O thread was seen late in is
+    // charged nothing, answered or missed, so it is no sample.
     let mut rounds = 0_u64;
     let more = |rounds: u64| {
         let stats = plugin.stats();
-        stats.unread < 64 && stats.breaker_opens == 0 && rounds < 192
+        stats.answered + stats.missed - stats.stalls < 64
+            && stats.breaker_opens == 0
+            && rounds < 192
     };
     while more(rounds) {
         rounds += 1;
@@ -1980,14 +2365,17 @@ fn a_miss_too_short_for_the_witness_is_unread_and_the_decisions_budget_spent() {
         );
     }
     let stats = plugin.stats();
+    // The window's sixty-four samples: every one an unread miss, but a
+    // round answered in time, where this thread was held off its send. Each
+    // is past half of the plugin's frame, so the window's first read opens.
     assert_eq!(
         (
-            stats.unread,
+            stats.answered + stats.missed - stats.stalls,
             stats.own_misses,
             stats.breaker_opens,
             stats.bypassed
         ),
-        (64, 0, 0, 0),
+        (64, 0, 1, 0),
         "after {rounds} rounds: {stats:?}"
     );
     assert_eq!(
@@ -2185,7 +2573,7 @@ fn a_frame_past_the_window_is_refused_without_a_fault() {
     let scorers = (0..9)
         .map(|_| {
             let fallback: Option<Box<dyn Scorer>> = Some(Box::new(LeastRequests));
-            Weighted {
+            WeightedScorer {
                 scorer: Box::new(GrpcScorer::new(binder.bind(), fallback)) as Box<dyn Scorer>,
                 weight: 1.0,
             }
@@ -3025,7 +3413,7 @@ fn an_adapter_needs_the_lifecycle_where_its_row_or_its_fallback_does() {
         single_engine(Profile {
             name: "adapted".into(),
             filters: vec![],
-            scorers: vec![Weighted {
+            scorers: vec![WeightedScorer {
                 scorer: Box::new(adapter(fallback)),
                 weight: 1.0,
             }],
@@ -3044,6 +3432,143 @@ fn an_adapter_needs_the_lifecycle_where_its_row_or_its_fallback_does() {
     assert!(GrpcPicker::new(binder.bind(), None).needs_lifecycle());
 }
 
+/// The models a worker left ride protocol 2. A plugin whose streams settled
+/// on 2 hears the word once, with its names, ahead of the relabelling of the
+/// same write. One that settled on 1 is not sent it and hears the
+/// relabelling alone, numbered as the first event: the word takes no number
+/// on a stream that does not carry it.
+#[test]
+fn the_models_a_worker_left_reach_a_plugin_on_protocol_2_alone() {
+    use proto::{lifecycle_event::Event, membership_change::Kind};
+    let models = ["m-chat".to_owned(), "m-embed".to_owned()];
+    for version in [2, 1] {
+        let served = TestPlugin::serve();
+        served.script(|s| s.ack_protocol = version);
+        let runtime = runtime();
+        let plugin = load(&runtime, &served, "leaver");
+        let engine = single_engine(profile(&plugin, ALL));
+        engine.on_membership(&Membership::left(WorkerId(7), &models));
+        engine.on_membership(&Membership::Relabelled(WorkerId(7)));
+        // While a stream stands on 1 the left word is not raised.
+        let raised = if version == 2 { 2 } else { 1 };
+        assert_eq!(plugin.stats().observed, raised, "protocol {version}");
+        // The relabelling is the last event of either stream.
+        let relabelled = |events: &[proto::LifecycleEvent]| {
+            events.last().is_some_and(|last| {
+                matches!(&last.event, Some(Event::Membership(m)) if m.kind == Kind::Relabelled as i32)
+            })
+        };
+        assert!(
+            eventually(|| relabelled(&served.seen().events)),
+            "protocol {version}"
+        );
+        let seen = served.seen();
+        let told: Vec<(u64, i32, u64, &[String])> = seen
+            .events
+            .iter()
+            .map(|event| match &event.event {
+                Some(Event::Membership(m)) => (event.seq, m.kind, m.worker_id, &m.models[..]),
+                other => panic!("a membership word, not {other:?}"),
+            })
+            .collect();
+        let left = (1, Kind::Left as i32, 7, &models[..]);
+        if version == 2 {
+            assert_eq!(told, [left, (2, Kind::Relabelled as i32, 7, &[][..])]);
+        } else {
+            assert_eq!(told, [(1, Kind::Relabelled as i32, 7, &[][..])]);
+        }
+    }
+}
+
+/// A stream on protocol 1 hears what it heard before the word came, at the
+/// queue's bound too. While a stream stands on 1 a left word is not raised:
+/// twice the queue's worth of them takes no place and counts no loss, and
+/// the relabelling behind them is the stream's first event.
+#[test]
+fn left_words_past_the_queues_bound_cost_a_stream_on_protocol_1_nothing() {
+    let served = TestPlugin::serve();
+    let runtime = runtime();
+    let plugin = load(&runtime, &served, "older");
+    let engine = single_engine(profile(&plugin, ALL));
+    let models = ["m-chat".to_owned()];
+    // The queue holds 1,024 events.
+    for _ in 0..2_048 {
+        engine.on_membership(&Membership::left(WorkerId(7), &models));
+    }
+    engine.on_membership(&Membership::Relabelled(WorkerId(7)));
+    assert!(
+        eventually(|| !served.seen().events.is_empty()),
+        "the relabelling reaches the plugin"
+    );
+    let stats = plugin.stats();
+    assert_eq!(
+        (stats.observed, stats.observe_dropped),
+        (1, 0),
+        "no left word took a place: {stats:?}"
+    );
+    let seen = served.seen();
+    assert_eq!(seen.events.len(), 1, "the relabelling alone");
+    assert_eq!(seen.events[0].seq, 1, "no loss is numbered");
+}
+
+/// A left word raised while no stream stands waits for the stream that
+/// settles next: the events call that still stands yields at it, and the
+/// word is kept with the events behind it. Where that stream settles on
+/// protocol 1 the word is not written: the plugin hears the relabelling
+/// behind it alone, as the first event, and the word takes no number on a
+/// stream that does not carry it. Here the load's stream has ended as the
+/// two words are raised.
+#[test]
+fn a_left_word_that_waited_for_a_stream_is_not_written_on_protocol_1() {
+    use proto::{lifecycle_event::Event, membership_change::Kind};
+    let served = TestPlugin::serve();
+    served.behave(Behaviour::EndStream);
+    let runtime = runtime();
+    let mut spec = spec(&served, "waited");
+    // The ended stream counts on the breaker: far from its threshold.
+    spec.breaker = BreakerSpec {
+        failures: 100,
+        ..BreakerSpec::default()
+    };
+    let plugin = Plugin::load(&runtime, spec).expect("the plugin loads");
+    let engine = single_engine(profile(&plugin, ALL));
+    // The plugin ends the load's stream at its first frame.
+    decide(&engine, &pool(4), 1);
+    assert!(
+        eventually(|| plugin.stats().failed_streams == 1),
+        "the load's stream ended: no stream stands"
+    );
+    let models = ["m-chat".to_owned()];
+    engine.on_membership(&Membership::left(WorkerId(7), &models));
+    engine.on_membership(&Membership::Relabelled(WorkerId(7)));
+    assert_eq!(
+        plugin.stats().observed,
+        2,
+        "no stream stands, so both words are raised"
+    );
+    // The next stream settles on protocol 1, the fixture's own.
+    served.behave(Behaviour::Honest);
+    plugin.warm().expect("a stream settles");
+    assert!(
+        eventually(|| !served.seen().events.is_empty()),
+        "the relabelling reaches the plugin"
+    );
+    let seen = served.seen();
+    let told: Vec<(u64, i32, u64)> = seen
+        .events
+        .iter()
+        .map(|event| match &event.event {
+            Some(Event::Membership(m)) => (event.seq, m.kind, m.worker_id),
+            other => panic!("a membership word, not {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        told,
+        [(1, Kind::Relabelled as i32, 7)],
+        "the left word was not written, and took no number"
+    );
+}
+
 #[test]
 fn the_lifecycle_reaches_the_plugin_once_in_order() {
     let served = TestPlugin::serve();
@@ -3055,10 +3580,7 @@ fn the_lifecycle_reaches_the_plugin_once_in_order() {
     engine.on_dispatched(&lease, &Target::default(), Side::Single, 3);
     engine.on_released(&lease, ReleaseReason::ClientGone);
     engine.on_membership(&Membership::Snapshot(&[WorkerId(1), WorkerId(2)]));
-    engine.on_signal(&Signal::GatewayVeto {
-        worker: WorkerId(1),
-        until_micros: 500_000,
-    });
+    engine.on_signal(&Signal::gateway_veto(WorkerId(1), 500_000));
     assert_eq!(plugin.stats().observed, 4);
     assert!(eventually(|| served.seen().events.len() == 4));
     let seen = served.seen();
@@ -3105,14 +3627,12 @@ fn a_plugin_hears_the_kinds_of_event_its_row_lists_and_no_other() {
         engine.on_dispatched(&lease, &Target::default(), Side::Single, 3);
         engine.on_released(&lease, ReleaseReason::ClientGone);
         engine.on_membership(&Membership::Snapshot(&[WorkerId(1), WorkerId(2)]));
-        engine.on_signal(&Signal::GatewayVeto {
-            worker: WorkerId(1),
-            until_micros: 500_000,
-        });
+        engine.on_signal(&Signal::gateway_veto(WorkerId(1), 500_000));
     };
     // The default row lists nothing.
     let mut unlisted = GrpcPluginSpec::new("unlisted", unix(&served));
     unlisted.connect_micros = BUDGET_MICROS;
+    unlisted.budget_micros = BUDGET_MICROS;
     assert_eq!(unlisted.observes, EventSet::NONE);
     let deaf = Plugin::load(&runtime, unlisted).expect("the plugin loads");
     assert_eq!(deaf.observes(), EventSet::NONE);
@@ -3682,15 +4202,9 @@ fn a_frame_carries_block_hashes_to_a_row_that_declares_them_alone() {
         sent("reads-none", Needs::default()).is_empty(),
         "a row that declares no hashes is sent none"
     );
-    let tokens = Needs {
-        token_hashes: true,
-        ..Needs::default()
-    };
+    let tokens = Needs::NONE.with_token_hashes();
     assert_eq!(sent("reads-tokens", tokens), hashes);
-    let text = Needs {
-        text_hashes: true,
-        ..Needs::default()
-    };
+    let text = Needs::NONE.with_text_hashes();
     assert_eq!(sent("reads-text", text), hashes);
 }
 
@@ -3836,6 +4350,7 @@ fn mutual_tls_with_the_pinned_server_name() {
     let runtime = runtime();
     let mut spec = GrpcPluginSpec::new("remote", tls("plugin.test", &client_cert, &client_key));
     spec.connect_micros = BUDGET_MICROS;
+    spec.budget_micros = BUDGET_MICROS;
     let plugin = Plugin::load(&runtime, spec).expect("the plugin loads over mutual TLS");
     let engine = single_engine(profile(&plugin, ALL));
     assert_eq!(lead(&decide(&engine, &pool(4), 1)), Some(103));

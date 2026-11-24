@@ -250,7 +250,9 @@ impl ConstraintRef<'_> {
 /// and the engine answers off the schema with a 200, which is why an engine's
 /// own frontend refuses it under an xgrammar backend (a 400); a backend that
 /// enforces such a schema itself takes the constraint
-/// as is, and so does one this adapter does not know. The message names the
+/// as is, and so does one this adapter does not know. The caller sends the
+/// refusal as [`smg_grpc_client::constraint_refused_status`], whose trailer a
+/// router answers as the request's 400. The message names the
 /// constraint's source, the keyword, where it stands and, in a tag, the tags
 /// around it by their `begin` (a call's opens with the tool's name).
 pub fn refuse_unenforceable_constraint(

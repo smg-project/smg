@@ -25,9 +25,10 @@ use std::{fs, path::PathBuf, sync::Arc};
 
 use openai_protocol::worker::WorkerStatus;
 use serde::Serialize;
+use smg_worker::identity::basic::Worker;
 
 use super::{LoadBalancingPolicy, ManualConfig, ManualPolicy, SelectWorkerInfo, WorkerRole};
-use crate::{config::ManualAssignmentMode, policies::test_support::make_worker, worker::Worker};
+use crate::{config::ManualAssignmentMode, policies::test_support::make_worker};
 
 /// One worker of a row: the requests the router holds on it and the routing
 /// keys that have a request in flight on it.

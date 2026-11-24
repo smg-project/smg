@@ -14,14 +14,14 @@
 use std::sync::Arc;
 
 use axum::response::Response;
+use openai_protocol::common::GenerationRequest;
+use smg_worker::identity::basic::{ConnectionMode, Worker, WorkerType};
 use tracing::debug;
 
-use crate::{
-    routers::{
-        error,
-        grpc::context::{PreparationOutput, RequestType, WorkerSelection},
-    },
-    worker::{ConnectionMode, ModelWorkerSnapshot, RoutingPool, WindowFloor, Worker, WorkerType},
+use crate::routers::{
+    common::snapshot::{ModelWorkerSnapshot, RoutingPool, WindowFloor},
+    error,
+    grpc::context::{PreparationOutput, RequestType, WorkerSelection},
 };
 
 /// The window that binds `worker` for `model_id`, and whether the worker
@@ -95,6 +95,30 @@ impl ContextRequirements {
             scoring_position: false,
             output_tokens: Some(budget),
         }
+    }
+
+    /// The demand of a request of `input_tokens`, with or without a scoring
+    /// position and a completion budget, for a recorder that prepares no
+    /// request.
+    #[cfg(test)]
+    pub(crate) fn of_demand(
+        input_tokens: usize,
+        scoring_position: bool,
+        output_tokens: Option<u32>,
+    ) -> Self {
+        Self {
+            input_tokens,
+            scoring_position,
+            output_tokens,
+        }
+    }
+
+    /// The request's completion budget as [`Self::new`] captured it: what a
+    /// selection states to the policy engine as the answer's limit. `None`
+    /// where the body names none, and for requirements that were not
+    /// captured (the encode-prefill-decode mode's default).
+    pub(crate) fn output_tokens(self) -> Option<u32> {
+        self.output_tokens
     }
 
     /// Unknown windows remain eligible; no character estimate or token sum is used.
@@ -322,22 +346,17 @@ fn output_context_length(workers: &WorkerSelection, model_id: &str) -> Option<u3
     }
 }
 
-/// The completion budget the request names, on the routes that carry one.
-fn output_budget(request_type: &RequestType) -> Option<u32> {
+/// The completion budget the request names, on the routes that carry one:
+/// the body's one reader answers it
+/// ([`GenerationRequest::max_output_tokens`]), which the HTTP routes read
+/// too, so the two wires state one limit.
+pub(crate) fn output_budget(request_type: &RequestType) -> Option<u32> {
     match request_type {
-        RequestType::Chat(request) => {
-            #[expect(deprecated, reason = "the request may predate normalization")]
-            {
-                request.max_completion_tokens.or(request.max_tokens)
-            }
-        }
-        RequestType::Completion(request) => request.max_tokens,
-        RequestType::Messages(request) => Some(request.max_tokens),
-        RequestType::Responses(request) => request.max_output_tokens,
-        RequestType::Generate(request) => request
-            .sampling_params
-            .as_ref()
-            .and_then(|params| params.max_new_tokens),
+        RequestType::Chat(request) => request.max_output_tokens(),
+        RequestType::Completion(request) => request.max_output_tokens(),
+        RequestType::Messages(request) => request.max_output_tokens(),
+        RequestType::Responses(request) => request.max_output_tokens(),
+        RequestType::Generate(request) => request.max_output_tokens(),
         RequestType::Embedding(_)
         | RequestType::Classify(_)
         | RequestType::Decisions(_)
@@ -379,7 +398,7 @@ pub(crate) fn selection_context_length(workers: &WorkerSelection, model_id: &str
         WorkerSelection::Single { worker } => worker.context_length(model_id),
         WorkerSelection::Disaggregated {
             prefill, decode, ..
-        } => pair_context_length(prefill.as_ref(), decode.as_ref(), model_id),
+        } => pair_context_length(prefill.as_ref(), &**decode, model_id),
     }
 }
 
@@ -408,14 +427,13 @@ mod tests {
         chat::ChatCompletionRequest, model_card::ModelCard, validated::Normalizable,
         worker::HealthCheckConfig,
     };
+    use smg_worker::identity::basic::{ConnectionMode, RuntimeType, Worker, WorkerType};
 
     use super::*;
-    use crate::{
-        routers::{error::HEADER_X_SMG_ERROR_CODE, grpc::context::CompletionItem},
-        worker::{
-            BasicWorkerBuilder, ConnectionMode, RuntimeType, Worker, WorkerRegistry,
-            WorkerRegistryExt, WorkerType,
-        },
+    use crate::routers::{
+        common::snapshot::{WorkerRegistry, WorkerRegistryExt},
+        error::HEADER_X_SMG_ERROR_CODE,
+        grpc::{backend_client::BasicWorkerBuilder, context::CompletionItem},
     };
 
     const MODEL: &str = "ctx-test-model";
@@ -519,7 +537,7 @@ mod tests {
 
     fn single(context_length: Option<u32>) -> WorkerSelection {
         WorkerSelection::Single {
-            worker: worker(WorkerType::Regular, context_length),
+            worker: worker(WorkerType::Regular, context_length).into(),
         }
     }
 
@@ -527,7 +545,7 @@ mod tests {
         WorkerSelection::Disaggregated {
             encode_assignments: None,
             prefill: worker(WorkerType::Prefill, prefill),
-            decode: worker(WorkerType::Decode, decode),
+            decode: worker(WorkerType::Decode, decode).into(),
             runtime_type: RuntimeType::Sglang,
         }
     }
@@ -859,7 +877,9 @@ mod tests {
                 })
                 .build(),
         );
-        let selection = WorkerSelection::Single { worker };
+        let selection = WorkerSelection::Single {
+            worker: worker.into(),
+        };
         assert!(enforce_context_length(&input(10), &selection, "wide").is_ok());
         assert_rejected(enforce_context_length(&input(10), &selection, "narrow"));
         // An id no card matches falls back to the primary (first) card.

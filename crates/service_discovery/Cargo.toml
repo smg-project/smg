@@ -1,0 +1,61 @@
+[package]
+name = "smg-service-discovery"
+version = "0.1.0"
+edition = "2021"
+description = "Worker discovery for SMG: the Kubernetes, file, Slurm and Consul providers and their reconciler, behind a host trait"
+license = "Apache-2.0"
+repository = "https://github.com/smg-project/smg"
+readme = "README.md"
+keywords = ["smg", "llm", "gateway", "discovery"]
+categories = ["network-programming"]
+
+[lib]
+name = "smg_service_discovery"
+
+[features]
+default = []
+# One feature a provider: a host builds the providers it runs and no other.
+consul = ["dep:reqwest", "dep:rustls"]
+file = ["fs-watch"]
+kubernetes = ["dep:futures", "dep:k8s-openapi", "dep:kube", "dep:rustls"]
+slurm = ["tokio/process"]
+# The watch on a directory. The file provider needs it, and a host's own file
+# readers share it without building a provider.
+fs-watch = ["dep:notify"]
+# For the tests of a crate that hosts discovery: a double of the host trait
+# with a job queue that records and, under `kubernetes`, that provider
+# started on a client the test hands it and a pod fixture.
+test-util = ["smg-worker/test-util", "dep:parking_lot"]
+
+[dependencies]
+async-trait.workspace = true
+blake3.workspace = true
+futures = { workspace = true, optional = true }
+k8s-openapi = { version = "0.27.0", features = ["v1_33"], optional = true }
+kube = { version = "3.0.1", features = ["runtime", "derive"], optional = true }
+metrics = "0.24.6"
+notify = { workspace = true, optional = true }
+openai-protocol.workspace = true
+parking_lot = { workspace = true, optional = true }
+reqwest = { workspace = true, features = ["http2", "json", "rustls-no-provider"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+smg-worker = { workspace = true, features = ["runtime"] }
+thiserror.workspace = true
+tokio = { workspace = true, features = ["fs", "macros", "rt", "sync", "time"] }
+tracing.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
+http.workspace = true
+openssl = "0.10.81"
+parking_lot.workspace = true
+smg-worker = { workspace = true, features = ["test-util"] }
+tempfile = "3.27"
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "sync", "test-util", "time"] }
+tracing-test = "0.2"
+url = "2.5.8"
+
+[lints]
+workspace = true

@@ -39,8 +39,8 @@ CHART = REPO / "deploy" / "helm" / "smg"
 HELPERS = CHART / "templates" / "_helpers.tpl"
 SCHEMA = CHART / "values.schema.json"
 ROUTER_TEMPLATE = CHART / "templates" / "deployment-router.yaml"
-# The gateway's Consul provider, which reads Consul's own variables.
-CONSUL_PROVIDER = REPO / "model_gateway" / "src" / "service_discovery" / "consul.rs"
+# The discovery crate's Consul provider, which reads Consul's own variables.
+CONSUL_PROVIDER = REPO / "crates" / "service_discovery" / "src" / "consul.rs"
 # The chart needs Kubernetes >= 1.26 and `helm template` checks it against
 # its default version, which older helm releases put below that.
 KUBE_VERSION = "1.30.0"
@@ -86,8 +86,11 @@ needs_chart = pytest.mark.skipif(not HELPERS.exists(), reason="chart not present
 needs_helm = pytest.mark.skipif(
     shutil.which("helm") is None or not HELPERS.exists(), reason="helm or the chart not present"
 )
-needs_gateway_source = pytest.mark.skipif(
-    not CONSUL_PROVIDER.exists(), reason="the gateway source is not in this checkout"
+# A checkout with no Rust sources has no workspace manifest, and the test that
+# reads them stands down. With the sources there, a provider file that moved
+# fails that test: a skip would hide the move.
+needs_rust_sources = pytest.mark.skipif(
+    not (REPO / "Cargo.toml").exists(), reason="the Rust sources are not in this checkout"
 )
 
 
@@ -674,7 +677,7 @@ def test_consul_secrets_are_wired_only_for_the_consul_provider(provider):
 
 
 @needs_chart
-@needs_gateway_source
+@needs_rust_sources
 def test_chart_consul_variables_are_the_ones_the_gateway_reads():
     text = HELPERS.read_text() + ROUTER_TEMPLATE.read_text()
     assert set(re.findall(r"\bCONSUL_[A-Z_]+\b", text)) == CONSUL_VARIABLES
@@ -863,6 +866,15 @@ def test_every_example_renders_arguments_the_launcher_parses(example, tmp_path):
     launcher_args(with_readable_files(router_container(documents)["args"], tmp_path))
 
 
+def launcher_policies() -> list[str]:
+    """The launcher's ``--policy`` choices, read from its own parser."""
+    parser = argparse.ArgumentParser(allow_abbrev=False)
+    RouterArgs.add_cli_args(parser)
+    choices = parser._option_string_actions["--policy"].choices
+    assert choices is not None, "the launcher's --policy option holds no choices"
+    return list(choices)
+
+
 @needs_chart
 def test_the_schema_admits_the_policies_the_launcher_takes():
     """``router.policy`` is rendered as the launcher's ``--policy``, so the
@@ -871,13 +883,13 @@ def test_the_schema_admits_the_policies_the_launcher_takes():
     render a pod whose launcher exits at argparse)."""
     schema = json.loads(SCHEMA.read_text())
     policy = schema["properties"]["router"]["properties"]["policy"]
-    assert policy["enum"] == router_args.COMMON_POLICY_CHOICES, (
+    assert policy["enum"] == launcher_policies(), (
         "values.schema.json's router.policy enum differs from the launcher's --policy choices"
     )
 
 
 @needs_helm
-@pytest.mark.parametrize("policy", router_args.COMMON_POLICY_CHOICES)
+@pytest.mark.parametrize("policy", launcher_policies())
 def test_every_launcher_policy_renders_and_reaches_the_launcher(policy):
     _, documents = render(f"router.policy={policy}")
     args = router_container(documents)["args"]
@@ -886,10 +898,50 @@ def test_every_launcher_policy_renders_and_reaches_the_launcher(policy):
 
 
 @needs_helm
-def test_a_prefill_only_policy_is_refused_by_the_schema():
-    """``bucket`` is a ``--prefill-policy`` choice, not a ``--policy`` one; the
-    schema refuses it where the launcher would, at render time."""
-    assert "router.policy must be one of the following" in render_error("router.policy=bucket")
+def test_a_policy_the_launcher_does_not_take_is_refused_by_the_schema():
+    """The schema refuses a name at render time, where the launcher would."""
+    assert "router.policy must be one of the following" in render_error("router.policy=fastest")
+
+
+@needs_helm
+def test_the_default_values_render_the_arguments_in_order():
+    """Keep the default arguments in order so an upgrade does not roll the pods."""
+    _, documents = render()
+    expected = """
+        --host 0.0.0.0
+        --port 30000
+        --policy cache_aware
+        --cache-threshold 0.3
+        --balance-abs-threshold 64
+        --balance-rel-threshold 1.5
+        --eviction-interval-secs 120
+        --max-tree-size 67108864
+        --block-size 16
+        --max-payload-size 536870912
+        --request-timeout-secs 1800
+        --mm-turbojpeg require
+        --shutdown-grace-period-secs 180
+        --max-concurrent-requests -1
+        --queue-size 100
+        --queue-timeout-secs 60
+        --retry-max-retries 5
+        --retry-initial-backoff-ms 50
+        --retry-max-backoff-ms 30000
+        --retry-backoff-multiplier 1.5
+        --retry-jitter-factor 0.2
+        --cb-failure-threshold 10
+        --cb-success-threshold 3
+        --cb-timeout-duration-secs 60
+        --cb-window-duration-secs 120
+        --health-failure-threshold 3
+        --health-success-threshold 2
+        --health-check-timeout-secs 5
+        --health-check-interval-secs 60
+        --health-check-endpoint /health
+        --prometheus-port 29000
+        --log-level info
+    """.split()
+    assert router_container(documents)["args"] == expected
 
 
 # Tags of digits alone, two workers whose tags are filled in as written, and
@@ -959,6 +1011,65 @@ def test_a_tag_of_digits_quoted_names_the_image(tmp_path):
         f"docker.io/lightseekorg/smg:{version}",
         f"ghcr.io/smg-project/smg:{version}",
     }
+
+
+def worker_pods(documents: list[dict]) -> dict[str, dict]:
+    """Every worker Deployment's pod spec, by worker name."""
+    return {
+        document["metadata"]["labels"]["smg.lightseek.org/worker"]: document["spec"]["template"][
+            "spec"
+        ]
+        for document in documents
+        if document["kind"] == "Deployment"
+        and document["metadata"].get("labels", {}).get("app.kubernetes.io/component") == "worker"
+    }
+
+
+@needs_helm
+def test_a_worker_pod_gets_a_termination_grace_that_covers_the_servicer_drain(tmp_path):
+    """A worker's Rust servicer drains in-flight streams for up to 30 s on
+    SIGTERM, then stops its server and terminates the engine: 70 s, past
+    Kubernetes' default grace of 30 s. A worker pod gets 90 s unless the entry
+    names its own, 0 included."""
+    values = tmp_path / "values.yaml"
+    values.write_text(
+        WORKERS.format('"0.31"', '"0.31"')
+        + "    terminationGracePeriodSeconds: 0\n"
+        + "  - name: three\n    engine: sglang\n    model: m\n"
+        + "    terminationGracePeriodSeconds: 300\n"
+    )
+    _, documents = render(files=(values,))
+    graces = {
+        name: pod.get("terminationGracePeriodSeconds")
+        for name, pod in worker_pods(documents).items()
+    }
+    assert graces == {"one": 90, "two": 0, "three": 300}
+
+
+@needs_helm
+@pytest.mark.parametrize("written", ['"90s"', '"90"', "90.5", "-1"])
+def test_a_termination_grace_that_is_not_whole_seconds_is_refused_by_the_schema(tmp_path, written):
+    """The template reads the grace through ``int``, which turns ``"90s"`` into
+    0: a pod with no grace at all, its streams cut on SIGTERM. The schema
+    refuses a string, a fraction and a negative value under the entry's name
+    (helm 3.18 moved to a JSON pointer for it); ``null`` is the default."""
+    values = tmp_path / "values.yaml"
+    values.write_text(
+        WORKERS.format('"0.31"', '"0.31"') + f"    terminationGracePeriodSeconds: {written}\n"
+    )
+    error = render_error(files=(values,))
+    assert any(
+        name in error
+        for name in (
+            "workers.1.terminationGracePeriodSeconds",
+            "/workers/1/terminationGracePeriodSeconds",
+        )
+    ), error
+    values.write_text(
+        WORKERS.format('"0.31"', '"0.31"') + "    terminationGracePeriodSeconds: null\n"
+    )
+    _, documents = render(files=(values,))
+    assert worker_pods(documents)["two"]["terminationGracePeriodSeconds"] == 90
 
 
 @needs_helm

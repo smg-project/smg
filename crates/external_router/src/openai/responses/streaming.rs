@@ -60,8 +60,12 @@ use crate::{
             TOOL_CALL_LIMIT_REASON,
         },
     },
-    persistence_utils::persist_conversation_items,
+    persistence_utils::persist_conversation_items_owned,
     sse::{sse_channel, SseEncoder, SseSender},
+    upstream_body::{
+        error_body_text, read_response_body_limited, ReadBodyResult, ERROR_BODY_TOO_LARGE,
+        MAX_ERROR_RESPONSE_SIZE,
+    },
 };
 
 /// Apply all transformations to event data in-place (rewrite + transform)
@@ -677,9 +681,15 @@ pub(super) async fn handle_simple_streaming_passthrough(
     worker.record_outcome(status.as_u16());
 
     if !status.is_success() {
-        let error_body = response.text().await.unwrap_or_else(|err| {
-            format!("Failed to read upstream error body: {}", err.without_url())
-        });
+        let error_body = match read_response_body_limited(response, MAX_ERROR_RESPONSE_SIZE).await {
+            ReadBodyResult::Ok(body) => body,
+            ReadBodyResult::TooLarge => {
+                return error::create_error(status, "upstream_error", ERROR_BODY_TOO_LARGE);
+            }
+            // The reader's text of a failed read is the body stream's own, which
+            // carries no request URL.
+            ReadBodyResult::Error(err) => format!("Failed to read upstream error body: {err}"),
+        };
         let error_body = error::sanitize_error_body(&error_body);
         return (status, error_body).into_response();
     }
@@ -762,11 +772,11 @@ pub(super) async fn handle_simple_streaming_passthrough(
                 );
 
                 // Always persist conversation items and response (even without conversation)
-                if let Err(err) = persist_conversation_items(
+                if let Err(err) = persist_conversation_items_owned(
                     storage.conversation.clone(),
                     storage.conversation_item.clone(),
                     storage.response.clone(),
-                    &response_json,
+                    response_json,
                     &original_request,
                     storage.tenant.as_deref(),
                     storage.request_context.clone(),
@@ -821,11 +831,12 @@ struct RelayFlags {
     mcp_list_tools_sent: bool,
 }
 
-/// Relays one upstream event stream to the client: every block goes through
-/// the handler and is forwarded, buffered or dropped as it says; the MCP
-/// list-tools items (the loop's, built once with its session; none without
-/// one) go out at the first `in_progress` of the first stream; a tool-call
-/// trigger ends the relay with the calls pending in the handler.
+/// Relays one upstream event stream to the client: every block but the
+/// upstream's end sentinel (the loop ends the client's stream with its own)
+/// goes through the handler and is forwarded, buffered or dropped as it says;
+/// the MCP list-tools items (the loop's, built once with its session; none
+/// without one) go out at the first `in_progress` of the first stream; a
+/// tool-call trigger ends the relay with the calls pending in the handler.
 #[expect(
     clippy::too_many_arguments,
     reason = "The relay reads the loop's client side as the loop's own text did (the sender, the encoder, the sequence number) beside the handler and its two flags; a struct for one call would be a type the loop's other phases do not share."
@@ -851,7 +862,7 @@ async fn relay_upstream_stream(
                     // Parse event
                     let (event_name, data) = parse_sse_block(raw_block);
 
-                    if data.is_empty() {
+                    if data.is_empty() || data == "[DONE]" {
                         continue;
                     }
 
@@ -1084,8 +1095,7 @@ pub(super) fn handle_streaming_with_tool_interception(
 
             if !response.status().is_success() {
                 let status = response.status();
-                let body = response.text().await.unwrap_or_default();
-                let body = error::sanitize_error_body(&body);
+                let body = error_body_text(response).await;
                 let (code, message) = upstream_status_error(status, &body);
                 send_error_event(&tx, &mut sse_encoder, &mut sequence_number, &code, &message)
                     .await;
@@ -1236,11 +1246,11 @@ pub(super) fn handle_streaming_with_tool_interception(
 
         if should_store {
             // Always persist conversation items and response (even without conversation)
-            if let Err(err) = persist_conversation_items(
+            if let Err(err) = persist_conversation_items_owned(
                 storage.conversation.clone(),
                 storage.conversation_item.clone(),
                 storage.response.clone(),
-                &final_response,
+                final_response,
                 &original_request,
                 storage.tenant.as_deref(),
                 storage.request_context.clone(),
@@ -1645,11 +1655,10 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
         let body = text_of(response).await;
-        assert!(
-            body.contains("Failed to read upstream error body"),
-            "{body}"
+        assert_eq!(
+            body,
+            "Failed to read upstream error body: error decoding response body"
         );
-        assert!(!body.contains(&addr.to_string()), "{body}");
     }
 
     /// The plain streaming path's answer to a streamed request for the worker
@@ -1971,8 +1980,8 @@ mod tests {
     }
 
     /// The whole interception path against a stub upstream that answers one
-    /// four-event stream: the client reads the stream's events, the loop's
-    /// terminal and the sentinel.
+    /// four-event stream and its own end sentinel: the client reads the
+    /// stream's events, the loop's terminal and one sentinel, the loop's.
     #[tokio::test]
     async fn a_tool_interception_stream_ends_with_the_terminal_and_the_sentinel() {
         use std::sync::Arc;
@@ -1996,7 +2005,7 @@ mod tests {
             .await
             .expect("a listener");
         let port = listener.local_addr().expect("an address").port();
-        let body = [CREATED, IN_PROGRESS, DELTA, COMPLETED].join("\n\n") + "\n\n";
+        let body = [CREATED, IN_PROGRESS, DELTA, COMPLETED, "data: [DONE]"].join("\n\n") + "\n\n";
         #[expect(
             clippy::disallowed_methods,
             reason = "test stub upstream answering one event stream per request; aborted at the test's end"
@@ -2059,6 +2068,8 @@ mod tests {
         );
         assert!(text.contains("event: response.completed\n"), "{text}");
         assert!(text.ends_with("data: [DONE]\n\n"), "{text}");
+        // A reader that stops at the first sentinel has read the terminal.
+        assert_eq!(text.matches("data: [DONE]").count(), 1, "{text}");
         upstream.abort();
     }
 

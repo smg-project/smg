@@ -40,6 +40,9 @@ workspace = true
 [dependencies.smg-grpc-client]
 workspace = true
 
+[dependencies.smg-worker]
+workspace = true
+
 [features]
 default = []
 opencv-video = ["smg/opencv-video"]

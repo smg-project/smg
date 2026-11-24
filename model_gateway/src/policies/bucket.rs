@@ -8,13 +8,13 @@ use std::{
 use dashmap::DashMap;
 use parking_lot::{Mutex, RwLock};
 use rand::RngExt;
+use smg_worker::identity::{basic::Worker, endpoint::Endpoint};
 use tracing::{debug, info, warn};
 
 use super::{
     get_healthy_worker_indices, normalize_model_key, utils::PeriodicTask, BucketConfig,
     LoadBalancingPolicy, SelectWorkerInfo,
 };
-use crate::worker::{identity::endpoint::Endpoint, Worker};
 
 #[derive(Debug)]
 pub struct BucketPolicy {
@@ -664,10 +664,11 @@ mod classic_bucket_rows;
 
 #[cfg(test)]
 mod tests {
+    use smg_worker::identity::basic::WorkerType;
     use tracing_test::traced_test;
 
     use super::*;
-    use crate::worker::{test_support::worker_of, WorkerType};
+    use crate::routers::common::snapshot::test_support::worker_of;
 
     /// The boundary lines name each worker's address masked. The table is
     /// written whole at info, when the prefill workers are listed and around

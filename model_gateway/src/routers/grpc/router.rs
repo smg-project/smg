@@ -16,7 +16,9 @@ use openai_protocol::{
     },
     responses::ResponsesRequest,
     transcription::{AudioFile, TranscriptionRequest},
+    UNKNOWN_MODEL_ID,
 };
+use smg_worker::identity::basic::WorkerType;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -52,10 +54,15 @@ use crate::{
     middleware::TenantRequestMeta,
     observability::metrics::metrics_labels,
     routers::{
-        common::json_response, error, grpc::regular::symphony::template::Templates, RouterTrait,
+        common::{
+            json_response,
+            snapshot::{RoutingPool, WorkerRegistry, WorkerRegistryExt},
+        },
+        error,
+        grpc::regular::symphony::template::Templates,
+        RouterTrait,
     },
     tenant::storage_tenant,
-    worker::{RoutingPool, WorkerRegistry, WorkerRegistryExt, WorkerType, UNKNOWN_MODEL_ID},
 };
 
 /// The gRPC family router: one router over the gRPC request pipelines, built for one `Mode`.
@@ -111,15 +118,15 @@ impl GrpcRouter {
         // What can fail here is the operator's own setting, so the router
         // stops rather than coming up with media handling quietly switched
         // off and every media request failing later for no stated reason.
-        let multimodal = Some(Arc::new(
-            MultimodalComponents::new(
-                ctx.multimodal_config_registry.clone(),
-                ctx.router_config.mm_per_request_image_limit,
-                ctx.router_config.multimodal_max_inflight_bytes,
-                mm_settings(),
-            )
-            .map_err(|e| format!("multimodal components: {e:#}"))?,
-        ));
+        let mut multimodal = MultimodalComponents::new(
+            ctx.multimodal_config_registry.clone(),
+            ctx.router_config.mm_per_request_image_limit,
+            ctx.router_config.multimodal_max_inflight_bytes,
+            mm_settings(),
+        )
+        .map_err(|e| format!("multimodal components: {e:#}"))?;
+        multimodal.pixels_go_to = mode.pixels_go_to();
+        let multimodal = Some(Arc::new(multimodal));
 
         // Create shared components for pipeline
         let shared_components = Arc::new(SharedComponents {
@@ -853,7 +860,8 @@ impl GrpcRouter {
     /// failed for good will not get one on its own (503 without); a served
     /// model with no tokenizer when the gateway does not load tokenizers
     /// itself is a gateway fault (500), as is a prompt that does not encode;
-    /// a prompt that does not render is a 400.
+    /// a prompt that does not render is a 400, and a 500 where the model's
+    /// chat template failed on its own account whatever the request holds.
     /// `record_media` says whether the prompt's media counts in the
     /// per-request media series: the `max_tokens: 0` answer is a Messages
     /// request, a token count is not.
@@ -902,8 +910,16 @@ impl GrpcRouter {
         .await
         .map_err(|e| match e {
             message_utils::CountError::Render(e) => {
-                debug!(model = %model_id, error = %e, "the request does not render");
-                error::bad_request("process_messages_failed", e)
+                // A failure that is the template's own whatever the request
+                // holds is the deployment's to fix and gets a line an
+                // operator reads; any other render failure may be the
+                // client's.
+                if e.is_template_failure() {
+                    tracing::error!(model = %model_id, error = %e, "the chat template failed to render");
+                } else {
+                    debug!(model = %model_id, error = %e, "the request does not render");
+                }
+                e.answer()
             }
             message_utils::CountError::Encode(e) => {
                 tracing::error!(model = %model_id, error = %e, "tokenization failed");

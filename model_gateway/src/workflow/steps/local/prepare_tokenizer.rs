@@ -3,17 +3,15 @@
 use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
+use smg_worker::{identity::basic::ConnectionMode, registry::WorkerOrigin, workflow::WorkerKind};
 use wfaas::{
     BackoffStrategy, FailureAction, RetryPolicy, StepDefinition, StepExecutor, StepResult,
     WorkflowContext, WorkflowError, WorkflowResult,
 };
 
-use crate::{
-    worker::ConnectionMode,
-    workflow::{
-        data::{require_app_context, WorkerKind, WorkerRegistrationData, WorkerWorkflowData},
-        tokenizer_preparation::{prepare_worker_tokenizers, TokenizerPreparation},
-    },
+use crate::workflow::{
+    data::{require_app_context, WorkerRegistrationData, WorkerWorkflowData},
+    tokenizer_preparation::{prepare_worker_tokenizers, TokenizerPreparation},
 };
 
 pub struct PrepareTokenizerStep;
@@ -52,19 +50,20 @@ impl StepExecutor<WorkerWorkflowData> for PrepareTokenizerStep {
         &self,
         context: &mut WorkflowContext<WorkerWorkflowData>,
     ) -> WorkflowResult<StepResult> {
-        let app_context = require_app_context(context.data.app_context.as_ref())?.clone();
+        let app_context = require_app_context(context.data.host.as_ref())?.clone();
         if !app_context.router_config.wait_for_tokenizer
             || context.data.worker_kind != Some(WorkerKind::Local)
             || context.data.connection_mode == Some(ConnectionMode::Http)
             || app_context.router_config.disable_tokenizer_autoload
         {
-            if let Some(preparation) = context.data.tokenizer_preparation.take() {
+            if let Some(preparation) = context.data.host_notes.tokenizer_preparation.take() {
                 preparation.close();
             }
             return Ok(StepResult::Skip);
         }
         let preparation = context
             .data
+            .host_notes
             .tokenizer_preparation
             .as_ref()
             .ok_or_else(TokenizerPreparation::closed)?;
@@ -73,7 +72,7 @@ impl StepExecutor<WorkerWorkflowData> for PrepareTokenizerStep {
             .actual_workers
             .as_ref()
             .ok_or_else(|| WorkflowError::ContextValueNotFound("workers".to_string()))?;
-        prepare_worker_tokenizers(&app_context, workers, preparation).await?;
+        prepare_worker_tokenizers(&app_context, workers, preparation, WorkerOrigin::Local).await?;
         Ok(StepResult::Success)
     }
 
@@ -88,7 +87,7 @@ mod tests {
     use crate::{
         app_context::testing::app_context_for_tests,
         config::RouterConfig,
-        worker::WorkerRegistry,
+        routers::common::snapshot::WorkerRegistry,
         workflow::{steps::create_worker_workflow_data, WorkerRegistrationMode},
     };
 
@@ -115,6 +114,7 @@ mod tests {
                             openai_protocol::worker::WorkerSpec::new("bare:8000"),
                             WorkerRegistrationMode::CreateOnly,
                             Arc::clone(&app),
+                            smg_worker::jobs::WorkerJobAsker::Api,
                         );
                         data.worker_kind = kind;
                         data.connection_mode = wire;

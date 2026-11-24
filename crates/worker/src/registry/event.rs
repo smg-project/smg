@@ -59,3 +59,33 @@ pub struct WorkerConnected {
     pub url: String,
     pub revision: u64,
 }
+
+/// What a worker object says to the manager's loop from a place that holds
+/// no registry handle. Both ride one unbounded channel, whose sender the
+/// registry hands each worker built for it
+/// ([`WorkerRegistry::connect_signal_sender`][sender]).
+///
+/// [sender]: crate::registry::WorkerRegistry::connect_signal_sender
+#[derive(Debug, Clone)]
+pub enum WorkerSignal {
+    /// The worker's backend connection completed, or a contact came from a
+    /// worker demoted while its transport was gone.
+    Connected(WorkerConnected),
+    /// The liveness veto of the worker at `url` moved: it was set, changed
+    /// its reason, or was cleared. The signal carries no reading and no
+    /// revision. The loop resolves the URL to the worker that stands there
+    /// now and tells its health sink, which reads the veto on the object
+    /// ([`HealthSink::liveness_moved`][told]). At most one waits per
+    /// worker, whoever reads the channel: the worker marks its running
+    /// state at the send, and signals again only once the loop took the
+    /// mark.
+    ///
+    /// [told]: crate::health::port::HealthSink::liveness_moved
+    LivenessMoved { url: String },
+}
+
+impl From<WorkerConnected> for WorkerSignal {
+    fn from(connected: WorkerConnected) -> Self {
+        Self::Connected(connected)
+    }
+}

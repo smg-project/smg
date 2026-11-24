@@ -2,6 +2,7 @@ pub mod classify;
 pub mod external;
 pub mod local;
 pub mod shared;
+#[cfg(test)]
 pub(crate) mod util;
 
 use std::{sync::Arc, time::Duration};
@@ -13,21 +14,26 @@ pub use external::{
 };
 pub use local::{
     create_worker_removal_workflow, create_worker_removal_workflow_data,
-    create_worker_update_workflow, create_worker_update_workflow_data, CreateLocalWorkerStep,
-    DetectConnectionModeStep, DiscoverDPInfoStep, DiscoverMetadataStep, DpInfo,
-    FindWorkerToUpdateStep, FindWorkersToRemoveStep, ReleaseTokenizerStep,
-    RemoveFromPolicyRegistryStep, RemoveFromWorkerRegistryStep, UpdatePoliciesForWorkerStep,
-    UpdateRemainingPoliciesStep, UpdateWorkerPropertiesStep, WorkerRemovalRequest,
+    create_worker_update_workflow, create_worker_update_workflow_data, FindWorkerToUpdateStep,
+    ReleaseTokenizerStep, RemoveFromPolicyRegistryStep, UpdatePoliciesForWorkerStep,
+    UpdateRemainingPoliciesStep, UpdateWorkerPropertiesStep,
 };
 use local::{
-    DetectBackendStep, DiscoverDPInfoStep as DPStep, EnsureHarmonyEncodingStep,
-    PrepareTokenizerStep, SubmitTokenizerJobStep,
+    CheckLocalWorkerStep, DiscoverZmqLabelsStep, EnsureHarmonyEncodingStep, PrepareTokenizerStep,
+    SubmitTokenizerJobStep, CHECK_LOCAL_WORKER_STEP, ZMQ_LABELS_STEP,
 };
 use openai_protocol::worker::WorkerSpec;
-use shared::REGISTER_WORKERS_STEP;
 pub use shared::{
     registered_entries, registered_in, ActivateWorkersStep, RegisterWorkersStep,
     UpdatePoliciesStep, WorkerList,
+};
+use shared::{ACTIVATE_WORKERS_STEP, REGISTER_WORKERS_STEP};
+use smg_worker::{
+    jobs::WorkerJobAsker,
+    workflow::{
+        startup_attempts, worker_registration_workflow, RegistrationGates,
+        CREATE_LOCAL_WORKER_STEP, DISCOVER_DP_STEP,
+    },
 };
 use wfaas::{BackoffStrategy, FailureAction, RetryPolicy, StepDefinition, WorkflowDefinition};
 
@@ -54,12 +60,17 @@ use crate::{
 ///       |                               |
 ///  discover_dp_info                     |
 ///       |                               |
+///  discover_zmq_labels                  |
+///  (ZMQ only)                           |
+///       |                               |
 ///  create_local_worker           create_external_workers
+///       |                               |
+///  check_local_worker                   |
 ///       |                               |
 ///  ensure_harmony_encoding              |
 ///  (gRPC gpt-oss only)                  |
 ///       |                               |
-///  prepare_tokenizer (opt-in)           |
+///  prepare_tokenizer (when enabled)     |
 ///       +---------------+---------------+
 ///                        |
 ///                 register_workers  (shared)
@@ -72,23 +83,11 @@ use crate::{
 pub fn create_worker_registration_workflow(
     router_config: &RouterConfig,
 ) -> WorkflowDefinition<WorkerWorkflowData> {
-    let detect_timeout = Duration::from_secs(router_config.worker_startup_timeout_secs);
-    let startup_delay = Duration::from_secs(router_config.worker_startup_delay_secs);
-    let check_interval = Duration::from_secs(router_config.worker_startup_check_interval_secs);
-
-    // Startup detection polls the starting engine every
-    // `worker_startup_check_interval_secs` until `worker_startup_timeout_secs`
-    // elapses. Derive the retry attempt budget from that cadence (reserving
-    // 10% of the timeout for workflow overhead like step transitions) so the
-    // two knobs stay consistent: total wait ≈ max_attempts × check_interval ≈
-    // worker_startup_timeout_secs. A floor keeps a very short timeout retrying
-    // a few times.
-    const EFFECTIVE_TIMEOUT_FACTOR: f64 = 0.9;
-    const MIN_ATTEMPTS: u32 = 3;
-
-    let interval_secs = (check_interval.as_secs() as f64).max(1.0);
-    let effective_timeout = detect_timeout.as_secs() as f64 * EFFECTIVE_TIMEOUT_FACTOR;
-    let max_attempts = ((effective_timeout / interval_secs).ceil() as u32).max(MIN_ATTEMPTS);
+    let settings = router_config.registration_settings();
+    let startup_delay = Duration::from_secs(settings.startup_delay_secs);
+    // The steps that poll a starting engine share one attempt budget, which
+    // the worker crate derives from the startup timings.
+    let max_attempts = startup_attempts(&settings);
 
     // Step 0: Classify worker type (Local vs External). This is the entry step,
     // so it carries the one-time startup grace period: leave the engine alone
@@ -105,179 +104,159 @@ pub fn create_worker_registration_workflow(
         classify_worker_type = classify_worker_type.with_delay(startup_delay);
     }
 
-    WorkflowDefinition::new("worker_registration", "Worker Registration")
-        // Step 0: Classify worker type (Local vs External)
-        .add_step(classify_worker_type)
-        // === LOCAL BRANCH ===
-        // Step 1: Detect connection mode (HTTP vs gRPC)
-        .add_step(
-            StepDefinition::new(
-                "detect_connection_mode",
-                "Detect Connection Mode",
-                Arc::new(DetectConnectionModeStep),
-            )
-            .with_retry(RetryPolicy {
-                max_attempts,
-                // Poll the starting engine at the configured startup cadence.
-                backoff: BackoffStrategy::Fixed(check_interval),
-            })
-            .with_timeout(detect_timeout)
-            .with_failure_action(FailureAction::FailWorkflow)
-            .depends_on(&["classify_worker_type"]),
+    // The worker crate detects and builds local workers. The ZMQ label read
+    // stands between the detection and the creation, and the check and the
+    // encoding steps behind the creation, one after another: the engine
+    // writes a step's whole copy of the run's data back, so two steps that
+    // wait on one step would each drop what the other wrote.
+    let check_local_worker = StepDefinition::new(
+        CHECK_LOCAL_WORKER_STEP,
+        "Check Local Worker",
+        Arc::new(CheckLocalWorkerStep),
+    )
+    .with_timeout(Duration::from_secs(5))
+    .with_failure_action(FailureAction::FailWorkflow)
+    .depends_on(&[CREATE_LOCAL_WORKER_STEP]);
+
+    let prepare = router_config.wait_for_tokenizer && !router_config.disable_tokenizer_autoload;
+    let before_publish = if prepare {
+        "prepare_tokenizer"
+    } else {
+        "ensure_harmony_encoding"
+    };
+    let workflow = worker_registration_workflow::<AppContext>(
+        &settings,
+        RegistrationGates {
+            detection: Some("classify_worker_type"),
+            creation: Some(ZMQ_LABELS_STEP),
+        },
+    )
+    // Step 0: Classify worker type (Local vs External)
+    .add_step(classify_worker_type)
+    // === LOCAL BRANCH ===
+    // Step 2c (ZMQ): what the gateway knows of a ZMQ worker ahead of its
+    // handshake. It waits on the crate's DP read, the last step of the
+    // crate's detection, so the two write the run's data one after the
+    // other. The crate's metadata read reads nothing for such a worker.
+    .add_step(
+        StepDefinition::new(
+            ZMQ_LABELS_STEP,
+            "Discover ZMQ Labels",
+            Arc::new(DiscoverZmqLabelsStep),
         )
-        // Step 1.5: Detect backend runtime (sglang, vllm, trtllm)
-        .add_step(
-            StepDefinition::new(
-                "detect_backend",
-                "Detect Backend",
-                Arc::new(DetectBackendStep),
-            )
-            .with_retry(RetryPolicy {
-                max_attempts,
-                backoff: BackoffStrategy::Linear {
-                    increment: Duration::from_secs(1),
-                    max: Duration::from_secs(5),
-                },
-            })
-            .with_timeout(Duration::from_secs(10))
-            .with_failure_action(FailureAction::ContinueNextStep)
-            .depends_on(&["detect_connection_mode"]),
+        .with_retry(RetryPolicy {
+            max_attempts: 3,
+            backoff: BackoffStrategy::Fixed(Duration::from_secs(1)),
+        })
+        .with_timeout(Duration::from_secs(10))
+        .with_failure_action(FailureAction::ContinueNextStep)
+        .depends_on(&[DISCOVER_DP_STEP]),
+    )
+    .add_step(check_local_worker)
+    // Step 3b (local): gRPC gpt-oss workers need the Harmony encoding; load
+    // it before registration so an unavailable vocab fails this worker
+    // instead of panicking the gateway or erroring at first request.
+    .add_step(
+        StepDefinition::new(
+            "ensure_harmony_encoding",
+            "Ensure Harmony Encoding",
+            Arc::new(EnsureHarmonyEncodingStep),
         )
-        // Step 2a: Discover metadata
-        .add_step(
-            StepDefinition::new(
-                "discover_metadata",
-                "Discover Metadata",
-                Arc::new(DiscoverMetadataStep),
-            )
-            .with_retry(RetryPolicy {
-                max_attempts: 3,
-                backoff: BackoffStrategy::Fixed(Duration::from_secs(1)),
-            })
-            .with_timeout(Duration::from_secs(10))
-            .with_failure_action(FailureAction::ContinueNextStep)
-            .depends_on(&["detect_backend"]),
+        .with_retry(RetryPolicy {
+            max_attempts,
+            backoff: BackoffStrategy::Exponential {
+                base: Duration::from_secs(1),
+                max: Duration::from_secs(10),
+            },
+        })
+        .with_timeout(Duration::from_secs(30))
+        .with_failure_action(FailureAction::FailWorkflow)
+        .depends_on(&[CHECK_LOCAL_WORKER_STEP]),
+    )
+    // === EXTERNAL BRANCH ===
+    // Step 1 (external): Discover models from /v1/models
+    .add_step(
+        StepDefinition::new(
+            "discover_models",
+            "Discover Models",
+            Arc::new(DiscoverModelsStep),
         )
-        // Step 2b: Discover DP info (after metadata)
-        .add_step(
-            StepDefinition::new("discover_dp_info", "Discover DP Info", Arc::new(DPStep))
-                .with_retry(RetryPolicy {
-                    max_attempts: 3,
-                    backoff: BackoffStrategy::Fixed(Duration::from_secs(1)),
-                })
-                .with_timeout(Duration::from_secs(10))
-                .with_failure_action(FailureAction::FailWorkflow)
-                .depends_on(&["discover_metadata"]),
+        .with_retry(RetryPolicy {
+            max_attempts: 3,
+            backoff: BackoffStrategy::Exponential {
+                base: Duration::from_secs(1),
+                max: Duration::from_secs(10),
+            },
+        })
+        .with_timeout(Duration::from_secs(30))
+        .with_failure_action(FailureAction::FailWorkflow)
+        .depends_on(&["classify_worker_type"]),
+    )
+    // Step 2 (external): Create external workers
+    .add_step(
+        StepDefinition::new(
+            "create_external_workers",
+            "Create External Workers",
+            Arc::new(CreateExternalWorkersStep),
         )
-        // Step 3 (local): Create local worker(s)
-        .add_step(
-            StepDefinition::new(
-                "create_local_worker",
-                "Create Local Worker",
-                Arc::new(CreateLocalWorkerStep),
-            )
-            .with_timeout(Duration::from_secs(5))
-            .with_failure_action(FailureAction::FailWorkflow)
-            .depends_on(&["discover_dp_info"]),
+        .with_timeout(Duration::from_secs(5))
+        .with_failure_action(FailureAction::FailWorkflow)
+        .depends_on(&["discover_models"]),
+    )
+    // === SHARED (both branches converge) ===
+    // Step 4: Register workers
+    .add_step(
+        StepDefinition::new(
+            REGISTER_WORKERS_STEP,
+            "Register Workers",
+            Arc::new(RegisterWorkersStep),
         )
-        // Step 3b (local): gRPC gpt-oss workers need the Harmony encoding; load
-        // it before registration so an unavailable vocab fails this worker
-        // instead of panicking the gateway or erroring at first request.
-        .add_step(
-            StepDefinition::new(
-                "ensure_harmony_encoding",
-                "Ensure Harmony Encoding",
-                Arc::new(EnsureHarmonyEncodingStep),
-            )
-            .with_retry(RetryPolicy {
-                max_attempts,
-                backoff: BackoffStrategy::Exponential {
-                    base: Duration::from_secs(1),
-                    max: Duration::from_secs(10),
-                },
-            })
-            .with_timeout(Duration::from_secs(30))
-            .with_failure_action(FailureAction::FailWorkflow)
-            .depends_on(&["create_local_worker"]),
+        .with_timeout(Duration::from_secs(5))
+        .with_failure_action(FailureAction::FailWorkflow)
+        .depends_on(&[
+            CHECK_LOCAL_WORKER_STEP,
+            before_publish,
+            "create_external_workers",
+        ]),
+    )
+    // Step 5a: Submit tokenizer job (local only)
+    .add_step(
+        StepDefinition::new(
+            "submit_tokenizer_job",
+            "Submit Tokenizer Job",
+            Arc::new(SubmitTokenizerJobStep),
         )
-        // === EXTERNAL BRANCH ===
-        // Step 1 (external): Discover models from /v1/models
-        .add_step(
-            StepDefinition::new(
-                "discover_models",
-                "Discover Models",
-                Arc::new(DiscoverModelsStep),
-            )
-            .with_retry(RetryPolicy {
-                max_attempts: 3,
-                backoff: BackoffStrategy::Exponential {
-                    base: Duration::from_secs(1),
-                    max: Duration::from_secs(10),
-                },
-            })
-            .with_timeout(Duration::from_secs(30))
-            .with_failure_action(FailureAction::FailWorkflow)
-            .depends_on(&["classify_worker_type"]),
+        .with_timeout(Duration::from_secs(5))
+        .with_failure_action(FailureAction::ContinueNextStep)
+        .depends_on(&[REGISTER_WORKERS_STEP]),
+    )
+    // Step 5b: Update policies
+    .add_step(
+        StepDefinition::new(
+            "update_policies",
+            "Update Policies",
+            Arc::new(UpdatePoliciesStep),
         )
-        // Step 2 (external): Create external workers
-        .add_step(
-            StepDefinition::new(
-                "create_external_workers",
-                "Create External Workers",
-                Arc::new(CreateExternalWorkersStep),
-            )
-            .with_timeout(Duration::from_secs(5))
-            .with_failure_action(FailureAction::FailWorkflow)
-            .depends_on(&["discover_models"]),
+        .with_timeout(Duration::from_secs(5))
+        .with_failure_action(FailureAction::ContinueNextStep)
+        .depends_on(&[REGISTER_WORKERS_STEP]),
+    )
+    // Step 5c: Activate workers
+    .add_step(
+        StepDefinition::new(
+            ACTIVATE_WORKERS_STEP,
+            "Activate Workers",
+            Arc::new(ActivateWorkersStep),
         )
-        // Prepare local tokenizers before the serving registry can see the workers.
-        .add_step(PrepareTokenizerStep::definition())
-        // === SHARED (both branches converge) ===
-        // Step 4: Register workers
-        .add_step(
-            StepDefinition::new(
-                REGISTER_WORKERS_STEP,
-                "Register Workers",
-                Arc::new(RegisterWorkersStep),
-            )
-            .with_timeout(Duration::from_secs(5))
-            .with_failure_action(FailureAction::FailWorkflow)
-            .depends_on(&["prepare_tokenizer", "create_external_workers"]),
-        )
-        // Keep fire-and-forget autoload as the default; opt-in preparation
-        // has already loaded the tokenizer before register_workers.
-        .add_step(
-            StepDefinition::new(
-                "submit_tokenizer_job",
-                "Submit Tokenizer Job",
-                Arc::new(SubmitTokenizerJobStep),
-            )
-            .with_timeout(Duration::from_secs(5))
-            .with_failure_action(FailureAction::ContinueNextStep)
-            .depends_on(&[REGISTER_WORKERS_STEP]),
-        )
-        // Step 5b: Update policies
-        .add_step(
-            StepDefinition::new(
-                "update_policies",
-                "Update Policies",
-                Arc::new(UpdatePoliciesStep),
-            )
-            .with_timeout(Duration::from_secs(5))
-            .with_failure_action(FailureAction::ContinueNextStep)
-            .depends_on(&[REGISTER_WORKERS_STEP]),
-        )
-        // Step 5c: Activate workers
-        .add_step(
-            StepDefinition::new(
-                "activate_workers",
-                "Activate Workers",
-                Arc::new(ActivateWorkersStep),
-            )
-            .with_timeout(Duration::from_secs(5))
-            .with_failure_action(FailureAction::FailWorkflow)
-            .depends_on(&[REGISTER_WORKERS_STEP]),
-        )
+        .with_timeout(Duration::from_secs(5))
+        .with_failure_action(FailureAction::FailWorkflow)
+        .depends_on(&[REGISTER_WORKERS_STEP]),
+    );
+    if prepare {
+        workflow.add_step(PrepareTokenizerStep::definition())
+    } else {
+        workflow
+    }
 }
 
 /// Create initial workflow data for the unified worker registration workflow.
@@ -285,28 +264,14 @@ pub fn create_worker_workflow_data(
     config: WorkerSpec,
     registration_mode: WorkerRegistrationMode,
     app_context: Arc<AppContext>,
+    asker: WorkerJobAsker,
 ) -> WorkerWorkflowData {
-    WorkerWorkflowData {
-        tokenizer_preparation: app_context
-            .router_config
-            .wait_for_tokenizer
-            .then(|| super::tokenizer_preparation::TokenizerPreparation::new(&app_context)),
-        config,
-        registration_mode,
-        worker_kind: None,
-        connection_mode: None,
-        http2: None,
-        http_client_handle: None,
-        detected_runtime_type: None,
-        discovered_labels: std::collections::HashMap::new(),
-        dp_info: None,
-        symphony_table: None,
-        model_cards: Vec::new(),
-        workers: None,
-        final_labels: std::collections::HashMap::new(),
-        app_context: Some(app_context),
-        actual_workers: None,
-    }
+    let preparation = (app_context.router_config.wait_for_tokenizer
+        && !app_context.router_config.disable_tokenizer_autoload)
+        .then(|| super::tokenizer_preparation::TokenizerPreparation::new(&app_context));
+    let mut data = WorkerWorkflowData::new(config, registration_mode, app_context, asker);
+    data.host_notes.tokenizer_preparation = preparation;
+    data
 }
 
 #[cfg(test)]
@@ -314,8 +279,12 @@ mod policy_lifecycle_tests;
 
 #[cfg(test)]
 mod tests {
+    use smg_worker::workflow::{
+        DETECT_CONNECTION_MODE_STEP, DETECT_RUNTIME_STEP, DISCOVER_METADATA_STEP,
+    };
+    use wfaas::StepId;
+
     use super::*;
-    use crate::config::RouterConfig;
 
     fn config_with(timeout_secs: u64, check_interval_secs: u64) -> RouterConfig {
         RouterConfig::builder()
@@ -383,6 +352,21 @@ mod tests {
         let mut config = config_with(1800, 30);
         config.worker_startup_delay_secs = 120;
         assert_eq!(startup_delay(&config), Some(Duration::from_secs(120)));
+        // The detection, the worker crate's step, waits on that entry step
+        // and carries no delay of its own: the worker is left alone once.
+        let workflow = create_worker_registration_workflow(&config);
+        let detection = workflow
+            .steps
+            .iter()
+            .find(|s| s.id.to_string() == DETECT_CONNECTION_MODE_STEP)
+            .expect("detect_connection_mode step present");
+        assert_eq!(detection.delay, None);
+        let waits_on: Vec<String> = detection
+            .depends_on
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(waits_on, ["classify_worker_type"]);
     }
 
     #[test]
@@ -391,5 +375,155 @@ mod tests {
         let config = config_with(1800, 30);
         assert_eq!(config.worker_startup_delay_secs, 0);
         assert_eq!(startup_delay(&config), None);
+    }
+
+    fn step<'a>(
+        workflow: &'a WorkflowDefinition<WorkerWorkflowData>,
+        id: &str,
+    ) -> &'a StepDefinition<WorkerWorkflowData> {
+        let id = StepId::new(id);
+        workflow.steps.iter().find(|step| step.id == id).unwrap()
+    }
+
+    /// Each local step writes the run's data before the next one reads it.
+    #[test]
+    fn a_local_workers_steps_write_the_data_one_after_another() {
+        let workflow = create_worker_registration_workflow(&config_with(1800, 30));
+        let line = [
+            "classify_worker_type",
+            DETECT_CONNECTION_MODE_STEP,
+            DETECT_RUNTIME_STEP,
+            DISCOVER_METADATA_STEP,
+            DISCOVER_DP_STEP,
+            ZMQ_LABELS_STEP,
+            CREATE_LOCAL_WORKER_STEP,
+            CHECK_LOCAL_WORKER_STEP,
+        ];
+        for pair in line.windows(2) {
+            let next = step(&workflow, pair[1]);
+            assert_eq!(
+                next.depends_on,
+                [StepId::new(pair[0])],
+                "{} waits on {} alone",
+                pair[1],
+                pair[0]
+            );
+            assert!(next.depends_on_any.is_empty(), "{}", pair[1]);
+        }
+        let dependents = |id: &str| {
+            let id = StepId::new(id);
+            let mut dependents: Vec<_> = workflow
+                .steps
+                .iter()
+                .filter(|step| {
+                    step.depends_on
+                        .iter()
+                        .chain(&step.depends_on_any)
+                        .any(|dep| dep == &id)
+                })
+                .map(|step| step.id.to_string())
+                .collect();
+            dependents.sort_unstable();
+            dependents
+        };
+        // Classification also starts the external branch.
+        for pair in line[1..].windows(2) {
+            assert_eq!(dependents(pair[0]), [pair[1]], "{}", pair[0]);
+        }
+        assert_eq!(
+            dependents(CHECK_LOCAL_WORKER_STEP),
+            ["ensure_harmony_encoding", REGISTER_WORKERS_STEP]
+        );
+        let register = step(&workflow, REGISTER_WORKERS_STEP);
+        assert_eq!(
+            register.depends_on,
+            [
+                CHECK_LOCAL_WORKER_STEP,
+                "ensure_harmony_encoding",
+                "create_external_workers"
+            ]
+            .map(StepId::new)
+        );
+        assert!(register.depends_on_any.is_empty());
+    }
+
+    #[test]
+    fn the_harmony_encoding_waits_on_the_check_step_alone() {
+        let workflow = create_worker_registration_workflow(&config_with(1800, 30));
+        let check = step(&workflow, CHECK_LOCAL_WORKER_STEP);
+        assert_eq!(check.id, StepId::new("check_local_worker"));
+        assert_eq!(check.name, "Check Local Worker");
+        assert_eq!(check.timeout, Some(Duration::from_secs(5)));
+        assert!(check.retry_policy.is_none());
+        assert!(matches!(check.on_failure, FailureAction::FailWorkflow));
+
+        let harmony = step(&workflow, "ensure_harmony_encoding");
+        assert_eq!(harmony.depends_on, [StepId::new(CHECK_LOCAL_WORKER_STEP)]);
+        assert!(harmony.depends_on_any.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_unknown_parser_override_fails_the_registration_and_writes_no_worker() {
+        use openai_protocol::worker::{ConnectionMode, RuntimeType};
+        use smg_worker::workflow::WORKER_REGISTRATION_WORKFLOW;
+        use wfaas::{StepStatus, WorkflowEngine, WorkflowId, WorkflowStatus};
+
+        use crate::{
+            app_context::testing::app_context_for_tests, config::ParserChoice,
+            routers::common::snapshot::WorkerRegistry,
+        };
+
+        let config = RouterConfig {
+            parser: ParserChoice::Legacy,
+            ..config_with(1, 1)
+        };
+        let registry = Arc::new(WorkerRegistry::new());
+        let host = app_context_for_tests(
+            config.clone(),
+            Arc::clone(&registry),
+            Some(tool_parser::ParserFactory::default()),
+        );
+        let engine = WorkflowEngine::new();
+        engine
+            .register_workflow(create_worker_registration_workflow(&config))
+            .unwrap();
+
+        let url = "ipc:///tmp/worker-unknown-parser.ipc";
+        let mut spec = WorkerSpec::new(url);
+        spec.connection_mode = ConnectionMode::Zmq;
+        spec.runtime_type = RuntimeType::Vllm;
+        spec.labels.insert("model_id".into(), "m".into());
+        spec.labels
+            .insert("tool_parser".into(), "no-such-parser".into());
+        let id = engine
+            .start_workflow(
+                WorkflowId::new(WORKER_REGISTRATION_WORKFLOW),
+                create_worker_workflow_data(
+                    spec,
+                    WorkerRegistrationMode::Upsert,
+                    host,
+                    WorkerJobAsker::Api,
+                ),
+            )
+            .await
+            .unwrap();
+        let state = engine
+            .wait_for_terminal_state(id, url, Duration::from_secs(5))
+            .await
+            .unwrap();
+
+        assert!(registry.is_empty());
+        assert_eq!(state.status, WorkflowStatus::Failed);
+        let check = &state.step_states[&StepId::new(CHECK_LOCAL_WORKER_STEP)];
+        assert_eq!(check.status, StepStatus::Failed);
+        assert_eq!(check.attempt, 1);
+        assert_eq!(
+            check.last_error.as_deref(),
+            Some(
+                "Step failed: create_worker - worker ipc:///tmp/worker-unknown-parser.ipc \
+                 declares a parser override for model 'm' the gateway cannot read with: \
+                 unknown tool-call parser 'no-such-parser'"
+            )
+        );
     }
 }

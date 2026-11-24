@@ -228,12 +228,7 @@ pub fn run_live(settings: &Settings, spec: &PathSpec, ramp: &Ramp) -> Result<i32
                 .join(side)
                 .join(format!("rate-{}", py_g(*offered, 6)));
             fs::create_dir_all(&sdir)?;
-            let mut bed = Bed::new(
-                &settings.bed,
-                settings.binary(side)?,
-                &sdir.join("bed"),
-                false,
-            );
+            let mut bed = settings.side_bed(side, &sdir.join("bed"), false)?;
             println!(
                 "[{}] live {side} {} at {} req/s for {} s",
                 hms(),
@@ -275,7 +270,7 @@ pub fn run_live(settings: &Settings, spec: &PathSpec, ramp: &Ramp) -> Result<i32
             &json!({"path": spec.name, "slo": ramp.slo, "sides": sides_json}),
         )? + "\n",
     )?;
-    let text = live_markdown(spec, ramp, &report);
+    let text = live_markdown(spec, ramp, &report, &settings.flags_text());
     fs::write(settings.out.join("live.md"), &text)?;
     println!("\n{text}");
     if let Ok(summary) = std::env::var("GITHUB_STEP_SUMMARY") {
@@ -292,14 +287,19 @@ pub fn run_live(settings: &Settings, spec: &PathSpec, ramp: &Ramp) -> Result<i32
 }
 
 /// The ramp's table and the capacity lines.
-pub fn live_markdown(spec: &PathSpec, ramp: &Ramp, report: &[(&str, Capacity)]) -> String {
+pub fn live_markdown(
+    spec: &PathSpec,
+    ramp: &Ramp,
+    report: &[(&str, Capacity)],
+    flags: &str,
+) -> String {
     let slo = &ramp.slo;
     let mut lines = vec![
         format!("## Live: open-loop ramp on the {} path", spec.name),
         String::new(),
         format!(
             "SLO: TTFT p99 <= {} ms, e2e p99 <= {} ms, error rate <= {}, achieved >= {:.0}% of offered; \
-             {} s per step after {} s warm-up, a fresh gateway per step.",
+             {} s per step after {} s warm-up, a fresh gateway per step{flags}.",
             py_float(slo.ttft_p99_ms),
             py_float(slo.e2e_p99_ms),
             py_g(slo.error_rate, 6),
@@ -466,7 +466,7 @@ mod tests {
         };
         let spec = path_named("chat").unwrap();
         let cap = capacity(vec![step(200.0, 5.0, None, 0), step(400.0, 500.0, None, 0)]);
-        let text = live_markdown(spec, &ramp, &[("pr", cap)]);
+        let text = live_markdown(spec, &ramp, &[("pr", cap)], "");
         assert!(
             text.starts_with("## Live: open-loop ramp on the chat path\n"),
             "{text}"

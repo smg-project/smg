@@ -40,8 +40,7 @@ impl SchedulerError {
     fn status(self) -> StatusCode {
         match self {
             Self::QueueFull => StatusCode::TOO_MANY_REQUESTS,
-            Self::QueueTimeout => StatusCode::SERVICE_UNAVAILABLE,
-            Self::Preempted => StatusCode::SERVICE_UNAVAILABLE,
+            Self::QueueTimeout | Self::Preempted => StatusCode::SERVICE_UNAVAILABLE,
             // `unwrap_or` (not `unwrap`/`expect`, both denied) — 499 is a
             // valid code so the fallback is never taken.
             Self::ClientCancelled => StatusCode::from_u16(STATUS_CLIENT_CLOSED_REQUEST)

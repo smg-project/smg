@@ -37,19 +37,16 @@ use crate::{
 };
 
 /// CLIP normalization mean values.
-pub const CLIP_MEAN: [f64; 3] = [0.48145466, 0.4578275, 0.40821073];
+pub(crate) const CLIP_MEAN: [f64; 3] = [0.48145466, 0.4578275, 0.40821073];
 
 /// CLIP normalization std values.
-pub const CLIP_STD: [f64; 3] = [0.26862954, 0.26130258, 0.27577711];
+pub(crate) const CLIP_STD: [f64; 3] = [0.26862954, 0.26130258, 0.27577711];
 
 /// Default number of crops for HD transform.
-pub const DEFAULT_NUM_CROPS: usize = 16;
-
-/// Default number of image tokens per crop (144 per tile + base).
-pub const DEFAULT_NUM_IMG_TOKENS: usize = 144;
+pub(crate) const DEFAULT_NUM_CROPS: usize = 16;
 
 /// Tile size used in Phi3-Vision (336x336).
-pub const TILE_SIZE: u32 = 336;
+pub(crate) const TILE_SIZE: u32 = 336;
 
 /// Phi3-Vision image processor.
 ///
@@ -72,7 +69,7 @@ impl Default for Phi3VisionProcessor {
 
 impl Phi3VisionProcessor {
     /// Create a new Phi3-Vision processor with default settings.
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             num_crops: DEFAULT_NUM_CROPS,
             mean: CLIP_MEAN,
@@ -81,24 +78,13 @@ impl Phi3VisionProcessor {
     }
 
     /// Create a processor with custom settings.
-    pub fn with_config(num_crops: usize) -> Self {
+    #[cfg(test)]
+    fn with_config(num_crops: usize) -> Self {
         Self {
             num_crops,
             mean: CLIP_MEAN,
             std: CLIP_STD,
         }
-    }
-
-    /// This processor normalized with `config`'s mean and std where the config
-    /// sets them; the crop budget stays this processor's own.
-    pub fn with_normalization_of(mut self, config: &PreProcessorConfig) -> Self {
-        if let Some(mean) = &config.image_mean {
-            self.mean = [mean[0], mean[1], mean[2]];
-        }
-        if let Some(std) = &config.image_std {
-            self.std = [std[0], std[1], std[2]];
-        }
-        self
     }
 
     /// Create a processor from preprocessor config.
@@ -116,11 +102,6 @@ impl Phi3VisionProcessor {
                 .map(|v| [v[0], v[1], v[2]])
                 .unwrap_or(CLIP_STD),
         }
-    }
-
-    /// Get the number of crops.
-    pub fn num_crops(&self) -> usize {
-        self.num_crops
     }
 
     /// The HD transform's target size for an image of `width` x `height`
@@ -204,7 +185,7 @@ impl Phi3VisionProcessor {
     /// 3. Resize to new_w = scale * 336, new_h = new_w / ratio
     /// 4. Pad height to multiple of 336 (centered, white padding)
     /// 5. If transposed, transpose back
-    pub fn hd_transform(&self, image: &DynamicImage) -> DynamicImage {
+    pub(crate) fn hd_transform(&self, image: &DynamicImage) -> DynamicImage {
         let (width, height) = image.dimensions();
 
         let transposed = width < height;
@@ -403,7 +384,15 @@ impl VisionPreProcessor for Phi3VisionProcessor {
         let batch_size = images.len();
         let tile = TILE_SIZE as usize;
         let shape = vec![batch_size, max_crops, 3, tile, tile];
-        let mut flat_data = scratch::take_f32_cap(shape.iter().product());
+        let refused = |reason: String| format!("cannot reserve Phi-3 patch output: {reason}");
+        let len = shape
+            .iter()
+            .try_fold(1usize, |n, &d| n.checked_mul(d))
+            .ok_or_else(|| {
+                TransformError::ReserveRefused(refused(format!("{shape:?} overflows usize")))
+            })?;
+        let mut flat_data = scratch::try_take_f32_cap(len)
+            .map_err(|error| TransformError::ReserveRefused(refused(error.to_string())))?;
         let mut all_image_sizes = Vec::with_capacity(images.len());
         let mut all_num_tokens = Vec::with_capacity(images.len());
 
@@ -476,7 +465,7 @@ mod tests {
     #[test]
     fn test_phi3_vision_processor_default() {
         let processor = Phi3VisionProcessor::new();
-        assert_eq!(processor.num_crops(), 16);
+        assert_eq!(processor.num_crops, 16);
         assert_eq!(processor.default_mean(), CLIP_MEAN);
         assert_eq!(processor.default_std(), CLIP_STD);
     }
@@ -495,7 +484,7 @@ mod tests {
 
         // Should respect num_crops limit
         let num_tiles = (h / 336) * (w / 336);
-        assert!(num_tiles <= processor.num_crops() as u32);
+        assert!(num_tiles <= processor.num_crops as u32);
     }
 
     #[test]
@@ -635,7 +624,7 @@ mod tests {
         };
 
         let processor = Phi3VisionProcessor::from_preprocessor_config(&config);
-        assert_eq!(processor.num_crops(), 8);
+        assert_eq!(processor.num_crops, 8);
     }
 
     #[test]
@@ -850,6 +839,38 @@ mod tests {
         let processor = Phi3VisionProcessor::new();
         let result = processor.preprocess(&[]);
         assert!(matches!(result, Err(TransformError::EmptyBatch)));
+    }
+
+    /// A batch of 2^40 crops is more bytes than any allocation holds: the
+    /// request reads an error.
+    #[test]
+    fn a_batch_that_cannot_be_reserved_is_an_error() {
+        let processor = Phi3VisionProcessor::with_config(1 << 40);
+        let image = create_test_image(1, 1, Rgb([0, 0, 0]));
+
+        let error = processor.preprocess(&[&image]).expect_err("not reserved");
+
+        assert!(
+            matches!(&error, TransformError::ReserveRefused(message)
+                if message.contains("cannot reserve Phi-3 patch output")),
+            "{error}"
+        );
+    }
+
+    /// A batch of 2^46 crops is more elements than `usize` counts: the size
+    /// overflows before any room is asked, and the request reads an error.
+    #[test]
+    fn a_batch_whose_size_overflows_is_an_error() {
+        let processor = Phi3VisionProcessor::with_config(1 << 46);
+        let image = create_test_image(1, 1, Rgb([0, 0, 0]));
+
+        let error = processor.preprocess(&[&image]).expect_err("overflows");
+
+        assert!(
+            matches!(&error, TransformError::ReserveRefused(message)
+                if message.contains("overflows usize")),
+            "{error}"
+        );
     }
 
     /// The padded canvas is a buffer of the pool. Its bytes are a previous

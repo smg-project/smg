@@ -25,12 +25,9 @@ use openai_protocol::{
     chat::ChatCompletionRequest, completion::CompletionRequest, model_card::ModelCard,
 };
 use smg::{
-    config::RoutingMode,
-    middleware::TenantRequestMeta,
-    routers::RouterTrait,
-    tenant::TenantKey,
-    worker::{RuntimeType, WorkerType},
+    config::RoutingMode, middleware::TenantRequestMeta, routers::RouterTrait, tenant::TenantKey,
 };
+use smg_worker::identity::basic::{RuntimeType, Worker, WorkerType};
 
 use crate::common;
 
@@ -50,11 +47,7 @@ async fn start_mock_grpc_worker() -> u16 {
     .await
 }
 
-fn worker(
-    port: u16,
-    worker_type: WorkerType,
-    context_length: Option<u32>,
-) -> Arc<dyn smg::worker::Worker> {
+fn worker(port: u16, worker_type: WorkerType, context_length: Option<u32>) -> Arc<dyn Worker> {
     let mut card = ModelCard::new(MODEL);
     if let Some(len) = context_length {
         card = card.with_context_length(len);
@@ -62,10 +55,7 @@ fn worker(
     Arc::new(grpc_worker(port, worker_type, RuntimeType::TokenSpeed, card).build())
 }
 
-async fn build_router(
-    mode: RoutingMode,
-    workers: Vec<Arc<dyn smg::worker::Worker>>,
-) -> Box<dyn RouterTrait> {
+async fn build_router(mode: RoutingMode, workers: Vec<Arc<dyn Worker>>) -> Box<dyn RouterTrait> {
     let config = grpc_router_config()
         .mode(mode)
         .random_policy()

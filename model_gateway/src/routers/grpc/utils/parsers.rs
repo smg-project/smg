@@ -13,19 +13,17 @@ use openai_protocol::{
     chat::{thinking_from_reasoning_effort, ChatCompletionRequest},
     model_card::ModelCard,
     profile::ProviderProfile,
-    worker::ConstrainedDecoding,
+    worker::{ConstrainedDecoding, GrammarStart},
 };
 use reasoning_parser::{ParserFactory as ReasoningParserFactory, ReasoningParser};
 use serde_json::Value;
+use smg_worker::identity::basic::{Worker, WorkerType};
 use tool_parser::{
-    GrammarStart, ParserFactory as ToolParserFactory, PooledParser as ToolPooledParser, ToolParser,
+    ParserFactory as ToolParserFactory, PooledParser as ToolPooledParser, ToolParser,
 };
 use tracing::warn;
 
-use crate::{
-    routers::grpc::context::WorkerSelection,
-    worker::{Worker, WorkerRegistry, WorkerType},
-};
+use crate::routers::{common::snapshot::WorkerRegistry, grpc::context::WorkerSelection};
 
 /// Per-request parser-name resolution.
 ///
@@ -720,8 +718,8 @@ pub struct WorkerDecoding {
 impl WorkerDecoding {
     pub fn of(workers: Option<&WorkerSelection>) -> Self {
         match workers {
-            Some(WorkerSelection::Single { worker }) => Self::of_worker(worker.as_ref()),
-            Some(WorkerSelection::Disaggregated { decode, .. }) => Self::of_worker(decode.as_ref()),
+            Some(WorkerSelection::Single { worker }) => Self::of_worker(&**worker),
+            Some(WorkerSelection::Disaggregated { decode, .. }) => Self::of_worker(&**decode),
             None => Self {
                 policy: ConstrainedDecoding::Requested,
                 start: GrammarStart::Unknown,
@@ -1018,14 +1016,13 @@ mod tests {
     use std::sync::Arc;
 
     use llm_multimodal::MediaPartOrder;
+    use smg_worker::identity::basic::WorkerType;
 
     use super::*;
-    use crate::{
-        routers::grpc::{
-            testing::{forced_call_on_a_thinking_prompt, worker},
-            utils::{chat_utils, message_utils},
-        },
-        worker::{BasicWorkerBuilder, WorkerType},
+    use crate::routers::grpc::{
+        backend_client::BasicWorkerBuilder,
+        testing::{forced_call_on_a_thinking_prompt, worker},
+        utils::{chat_utils, message_utils},
     };
 
     /// A parser that registers a reasoning prefix, so a forced call on a
@@ -1060,7 +1057,7 @@ mod tests {
             .build();
         assert_eq!(
             WorkerDecoding::of(Some(&WorkerSelection::Single {
-                worker: Arc::new(spec_wins),
+                worker: Arc::new(spec_wins).into(),
             }))
             .policy,
             ConstrainedDecoding::Always
@@ -1080,7 +1077,7 @@ mod tests {
             WorkerDecoding::of(Some(&WorkerSelection::Disaggregated {
                 encode_assignments: None,
                 prefill,
-                decode,
+                decode: decode.into(),
                 runtime_type: openai_protocol::worker::RuntimeType::TokenSpeed,
             }))
             .policy,
@@ -1125,7 +1122,7 @@ mod tests {
             let decided_on = WorkerDecoding::of(Some(&worker(first_labels)));
             for (other, other_labels) in labels.iter().enumerate() {
                 assert_eq!(
-                    decided_on.decides_alike(engine(other_labels).as_ref()),
+                    decided_on.decides_alike(&*engine(other_labels)),
                     alike[first] == alike[other],
                     "decided on {first_labels:?}, retried on {other_labels:?}"
                 );
@@ -1169,7 +1166,7 @@ mod tests {
             WorkerDecoding::of(Some(&WorkerSelection::Disaggregated {
                 encode_assignments: None,
                 prefill,
-                decode,
+                decode: decode.into(),
                 runtime_type: openai_protocol::worker::RuntimeType::TokenSpeed,
             }))
             .vocabulary,
@@ -2323,9 +2320,12 @@ mod tests {
 #[cfg(test)]
 mod parser_resolver_tests {
     use openai_protocol::model_card::ModelCard;
+    use smg_worker::identity::basic::WorkerType;
 
     use super::*;
-    use crate::worker::{BasicWorkerBuilder, WorkerRegistry, WorkerType};
+    use crate::routers::{
+        common::snapshot::WorkerRegistry, grpc::backend_client::BasicWorkerBuilder,
+    };
 
     fn registry_with_card(card: ModelCard) -> Arc<WorkerRegistry> {
         let registry = Arc::new(WorkerRegistry::new());

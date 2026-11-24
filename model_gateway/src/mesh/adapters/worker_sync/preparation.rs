@@ -3,16 +3,16 @@
 use std::{sync::Arc, time::Duration};
 
 use smg_mesh::WorkerState;
+use smg_worker::{
+    identity::{basic::Worker, endpoint::Scheme},
+    registry::{worker_model_ids, WorkerId, WorkerOrigin},
+};
 use tracing::{info, warn};
 use wfaas::WorkflowResult;
 
 use super::{remote_worker_state, WorkerSyncAdapter, PREFIX};
 use crate::{
-    worker::{
-        identity::endpoint::Scheme,
-        registry::{worker_model_ids, WorkerId},
-        Worker, WorkerRegistry,
-    },
+    routers::common::snapshot::WorkerRegistry,
     workflow::{
         steps::local::ReleaseTokenizerStep,
         tokenizer_preparation::{prepare_worker_tokenizers, TokenizerPreparation},
@@ -200,7 +200,7 @@ impl WorkerSyncAdapter {
             let candidates = [candidate];
             let result = tokio::time::timeout(
                 Duration::from_secs(300),
-                prepare_worker_tokenizers(&app_context, &candidates, &scope),
+                prepare_worker_tokenizers(&app_context, &candidates, &scope, WorkerOrigin::Mesh),
             )
             .await;
             let cancelled = scope.is_cancelled();

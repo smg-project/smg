@@ -32,7 +32,7 @@ use super::{
         after_last_user, at_or_after_last_user, drop_thinking_messages, encode_arguments_to_dsml,
         has_tools, merge_tool_messages, push_tools_and_response_format, render_system_message,
         render_v4_tools_template, sort_tool_results_by_call_order, task_sp_token, text, to_json,
-        tool_schemas, DsmlTags, IncomingBlocks, Turn,
+        tool_schemas, DsmlTags, IncomingBlocks, Turn, KEPT_ROLES,
     },
     truthy, RendererProfile,
 };
@@ -736,7 +736,7 @@ pub(crate) fn render_messages(
     }
     if thinking_mode == ThinkingMode::Thinking && effective_drop_thinking {
         let last_user_idx = find_last_turn_index(&full_messages);
-        full_messages = drop_thinking_messages(&full_messages, last_user_idx);
+        full_messages = drop_thinking_messages(&full_messages, last_user_idx, KEPT_ROLES);
     }
     for idx in 0..full_messages.len() {
         prompt.push_str(&render_message(

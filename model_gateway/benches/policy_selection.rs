@@ -39,31 +39,39 @@ use criterion::{
 };
 use kv_index::{compute_content_hash, request_prefix_hashes};
 use metrics_exporter_prometheus::PrometheusHandle;
-use openai_protocol::worker::{HealthCheckConfig, WorkerLoadResponse};
+use openai_protocol::{
+    model_card::ModelCard,
+    worker::{HealthCheckConfig, WorkerLoadResponse},
+};
 use smg::{
     config::types::{ManualAssignmentMode, PolicyConfig, RoutingKeyOverrideConfig},
     observability::metrics::{start_prometheus, PrometheusConfig},
     policies::{
         cost::{build, CandidateInputs, RequestInputs, POLICY_NAMES},
         hash_ring::HashRing,
+        kv_index::{
+            event_monitor::{bench_support::IndexFeed, KvEventMonitor},
+            index_backend::KvIndex,
+        },
         CacheAwareConfig, CacheAwarePolicy, ConsistentHashingPolicy, LeastLoadPolicy,
         LoadBalancingPolicy, ManualPolicy, NamedList, PassthroughPolicy, PolicyRegistry,
         PowerOfTwoPolicy, PrefixHashConfig, PrefixHashPolicy, RandomPolicy, RoundRobinPolicy,
         SelectWorkerInfo,
     },
     routers::{
-        common::bench_support::{process_trace_configured, PairPath, RegularPath},
-        grpc::SelectionBench,
-    },
-    worker::{
-        kv::event_monitor::bench_support::IndexFeed,
-        load::state::{one_rank_load, TestFeed},
-        BasicWorkerBuilder, ConnectionMode, KvEventMonitor, KvIndex, ModelCard, RuntimeType,
-        Worker, WorkerRegistry, WorkerType,
+        common::{
+            bench_support::{process_trace_configured, PairPath, RegularPath},
+            snapshot::WorkerRegistry,
+        },
+        grpc::{backend_client::BasicWorkerBuilder, SelectionBench},
     },
 };
 use smg_grpc_client::common_proto::{
     kv_cache_event, KvBlock, KvBlocksStored, KvCacheEvent, KvEventBatch,
+};
+use smg_worker::{
+    identity::basic::{ConnectionMode, RuntimeType, Worker, WorkerType},
+    load::state::{one_rank_load, TestFeed},
 };
 
 const BLOCK_SIZE: usize = 16;

@@ -590,7 +590,7 @@ async fn default_local_registration_keeps_the_existing_asynchronous_readiness_be
         tokio::time::sleep(Duration::from_millis(30)).await;
     }
     assert_eq!(gateway.infer("model-a").await, StatusCode::OK);
-    assert!(gateway.hub_calls.load(Ordering::SeqCst) > 0);
+    assert_eq!(gateway.hub_calls.load(Ordering::SeqCst), 0);
     gate.release();
     gateway.wait_ready().await;
 }
@@ -669,18 +669,29 @@ async fn a_failed_preparation_leaves_a_serving_and_allows_a_clean_same_url_retry
     gateway.stays_ready().await;
     gate.release();
     let started = Instant::now();
-    while gateway.json(&format!("/workers/{id}")).await.0 != StatusCode::NOT_FOUND {
+    loop {
+        let (status, record) = gateway.json(&format!("/workers/{id}")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(gateway.json("/readiness").await.0, StatusCode::OK);
+        if record["job_status"]["status"] == "failed" {
+            assert_eq!(record["is_healthy"], false);
+            assert!(
+                record["job_status"]["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("prepare_tokenizer")),
+                "{record}"
+            );
+            break;
+        }
         assert!(
             started.elapsed() < WAIT,
-            "failed registration did not end: {}",
-            gateway.logs()
+            "registration did not report its failure: {record}"
         );
-        assert_eq!(gateway.json("/readiness").await.0, StatusCode::OK);
         tokio::time::sleep(Duration::from_millis(30)).await;
     }
-    gateway_launch::log_with_line(&gateway.log, "Failed job: type=AddWorker", WAIT).unwrap();
     gate.failing.store(false, Ordering::SeqCst);
     let retry = gateway.create(&url, "model-b").await;
+    assert_ne!(retry, id);
     gateway.ready_worker(&retry).await;
     assert_eq!(gateway.infer("model-b").await, StatusCode::OK);
 }
@@ -804,25 +815,25 @@ async fn a_slow_put_keeps_the_old_worker_and_cannot_overwrite_a_newer_put() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn default_mesh_imports_keep_the_existing_no_local_autoload_behavior() {
+async fn default_mesh_imports_publish_then_load_the_tokenizer_on_the_peer() {
     let _serial = GATEWAYS.lock().await;
     let owner = Gateway::start_mode("owner", None, true, false).await;
-    let peer = Gateway::start_mode("peer", Some(owner.mesh_port), true, false).await;
-    let (url, gate) = worker("model-a", &[]).await;
+    let (url, gate) = worker("model-a", &[2]).await;
     let id = owner.create(&url, "model-a").await;
     owner.wait_ready().await;
+    let peer = Gateway::start_mode("peer", Some(owner.mesh_port), true, false).await;
+    gate.wait_for_calls(2).await;
     peer.ready_worker(&id).await;
-    let started = Instant::now();
-    while peer.json("/readiness").await.0 != StatusCode::SERVICE_UNAVAILABLE {
-        assert!(started.elapsed() < WAIT);
-        tokio::time::sleep(Duration::from_millis(30)).await;
-    }
     assert_eq!(
-        gate.calls.load(Ordering::SeqCst),
-        1,
-        "default mesh unexpectedly loaded a tokenizer"
+        peer.json("/readiness").await.0,
+        StatusCode::SERVICE_UNAVAILABLE
     );
     assert_eq!(peer.infer("model-a").await, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(owner.infer("model-a").await, StatusCode::OK);
+    gate.release();
+    peer.wait_ready().await;
+    assert_eq!(peer.infer("model-a").await, StatusCode::OK);
+    assert_eq!(gate.calls.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

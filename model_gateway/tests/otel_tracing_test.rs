@@ -1,10 +1,6 @@
-use std::{
-    sync::{Arc, Mutex},
-    time::Duration,
-};
+use std::sync::{Arc, Mutex};
 
 use opentelemetry::trace::TraceContextExt;
-use portpicker::pick_unused_port;
 use serial_test::serial;
 use smg::{observability::otel_trace, routers::grpc::client::GrpcClient};
 use smg_grpc_client::tokenspeed_proto as ts;
@@ -45,9 +41,8 @@ mod collector;
 async fn test_grpc_trace_context_injection() {
     // 1. Start the OTLP collector (needed even if OTEL is already initialized,
     //    as a target for any spans that might be exported)
-    let port = pick_unused_port().expect("Failed to pick unused port");
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let _collector = start_collector(port, shutdown_rx)
+    let (_collector, port) = start_collector(shutdown_rx)
         .await
         .expect("Failed to start collector");
     let collector_endpoint = format!("0.0.0.0:{port}");
@@ -190,29 +185,24 @@ impl TokenSpeedAnswers for MetadataStub {
 #[expect(
     clippy::disallowed_methods,
     clippy::expect_used,
-    clippy::panic,
     reason = "test stub; the server lives for the test"
 )]
 async fn spawn_metadata_stub(stub: MetadataStub) -> u16 {
-    let port = pick_unused_port().expect("free port for the metadata stub");
-    let addr = format!("127.0.0.1:{port}").parse().expect("stub addr");
+    // Bound here, on a port of the system's choice, before the server is
+    // spawned: a call connects at once, and no other process can be handed
+    // the port between a pick and the bind.
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("a port for the metadata stub");
+    let port = listener.local_addr().expect("the stub's address").port();
     tokio::spawn(async move {
         Server::builder()
             .add_service(stub.into_server())
-            .serve(addr)
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
             .await
             .expect("metadata stub server");
     });
-    for _ in 0..100 {
-        if tokio::net::TcpStream::connect(("127.0.0.1", port))
-            .await
-            .is_ok()
-        {
-            return port;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    panic!("metadata stub on port {port} never came up");
+    port
 }
 
 /// A generate call made under the gateway's upstream span carries that span's
@@ -221,9 +211,8 @@ async fn spawn_metadata_stub(stub: MetadataStub) -> u16 {
 #[tokio::test]
 #[serial]
 async fn engine_calls_carry_the_current_span_trace_context() {
-    let port = pick_unused_port().expect("Failed to pick unused port");
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let _collector = start_collector(port, shutdown_rx)
+    let (_collector, port) = start_collector(shutdown_rx)
         .await
         .expect("Failed to start collector");
     let collector_endpoint = format!("0.0.0.0:{port}");

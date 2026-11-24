@@ -49,6 +49,21 @@ pub const fn connect_timeout_secs_below(
     }
 }
 
+/// Longest idle timeout a pool is given: thirty years, which no process
+/// outlives. The pool's idle sweeper adds the timeout to the clock, and a sum
+/// the clock cannot hold panics the sweeper's task.
+const MAX_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 365 * 24 * 60 * 60);
+
+/// The idle timeout a pool is built with for a configured number of seconds:
+/// zero keeps idle connections indefinitely, and a timeout longer than thirty
+/// years is thirty years. Every client the gateway builds with an idle
+/// timeout takes it from here (the worker clients through
+/// [`WorkerHttpClientCache`], the shared client for external providers in
+/// the gateway's `AppContext::with_client`), so the bound stands in one place.
+pub fn pool_idle_timeout(secs: u64) -> Option<Duration> {
+    (secs != 0).then(|| Duration::from_secs(secs).min(MAX_POOL_IDLE_TIMEOUT))
+}
+
 /// HTTP/2 tuning for the gateway's `--upstream-http2`, applied to every worker
 /// client under the flag; only the prior-knowledge bucket forces h2 on
 /// cleartext.
@@ -181,10 +196,7 @@ impl WorkerHttpClientCache {
         // Idle pooled connections must expire before the backend server's
         // keep-alive closes them (a common engine default: 5s), or checkout races
         // the server's FIN and non-idempotent sends fail.
-        let pool_idle_timeout = match key.pool_idle_timeout_secs {
-            0 => None,
-            secs => Some(Duration::from_secs(secs)),
-        };
+        let pool_idle_timeout = pool_idle_timeout(key.pool_idle_timeout_secs);
         let identity = self
             .settings
             .client_identity
@@ -638,6 +650,13 @@ mod tests {
     }
 
     #[test]
+    fn pool_idle_timeout_keeps_zero_unbounded_and_caps_the_rest() {
+        assert_eq!(pool_idle_timeout(0), None, "zero keeps idle connections");
+        assert_eq!(pool_idle_timeout(5), Some(Duration::from_secs(5)));
+        assert_eq!(pool_idle_timeout(u64::MAX), Some(MAX_POOL_IDLE_TIMEOUT));
+    }
+
+    #[test]
     fn same_effective_config_shares_one_client() {
         let cache = cache(settings());
         let a = cache
@@ -780,6 +799,51 @@ mod tests {
             )
             .expect("client");
         assert_eq!(cache.cached_len(), 1);
+    }
+
+    /// The pool's idle sweeper is a task the client starts when its first
+    /// connection goes back to the pool, and it adds the idle timeout to the
+    /// clock. The largest number of seconds a worker's pool settings can
+    /// carry is capped where the client is built, so the sum holds and the
+    /// sweeper runs; before the cap the sweeper panicked on it. The runtime
+    /// catches a task's panic, so the test counts panics in the panic hook: a
+    /// current-thread runtime polls the sweeper on this thread.
+    #[tokio::test]
+    async fn the_largest_idle_timeout_leaves_the_pools_sweeper_running() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static PANICS_ON_THIS_THREAD: AtomicUsize = AtomicUsize::new(0);
+        let url = spawn_echo_server().await;
+        let this_thread = std::thread::current().id();
+        let previous = Arc::new(std::panic::take_hook());
+        let forward = Arc::clone(&previous);
+        std::panic::set_hook(Box::new(move |info| {
+            if std::thread::current().id() == this_thread {
+                PANICS_ON_THIS_THREAD.fetch_add(1, Ordering::SeqCst);
+            }
+            forward(info);
+        }));
+
+        let client = cache(settings())
+            .get(
+                &HttpPoolConfig {
+                    pool_idle_timeout_secs: Some(u64::MAX),
+                    ..HttpPoolConfig::default()
+                },
+                false,
+            )
+            .expect("client");
+        let resp = client.get(&url).send().await.expect("response");
+        assert_eq!(resp.text().await.expect("body"), "ok");
+        // The connection is idle now: give the sweeper it started its first poll.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        std::panic::set_hook(Box::new(move |info| previous(info)));
+        assert_eq!(
+            PANICS_ON_THIS_THREAD.load(Ordering::SeqCst),
+            0,
+            "a task of this client panicked"
+        );
     }
 
     #[tokio::test]

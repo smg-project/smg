@@ -8,8 +8,8 @@ use std::{
 };
 
 use futures_util::StreamExt;
-use smg::worker::Worker;
 use smg_grpc_client::{sglang_proto as proto, sglang_scheduler::AbortOnDropStream};
+use smg_worker::identity::basic::Worker;
 
 use super::{
     error::{set_error_message, SglErrorCode},

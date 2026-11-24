@@ -49,6 +49,22 @@ def test_primary_key_tolerates_an_older_proto_stub():
     assert mm_keys.primary_encoder_key(stub) == "pixel_values"
 
 
+def test_audio_keeps_its_modality_and_native_tensor_keys():
+    from smg_grpc_proto.generated import common_pb2
+
+    mm = vllm_engine_pb2.MultimodalInputs(
+        modality=common_pb2.AUDIO,
+        encoder_input_key="audio_signal",
+        batched_keys=["audio_signal", "audio_signal_length"],
+        keep_on_cpu_keys=["audio_signal_length"],
+    )
+    assert mm_keys.modality_name(mm) == "audio"
+    assert mm_keys.primary_encoder_key(mm) == "audio_signal"
+    for key in mm.batched_keys:
+        assert mm_keys.modality_key(key, is_video=False) == key
+    assert mm_keys.modality_name(vllm_engine_pb2.MultimodalInputs()) == "image"
+
+
 def test_other_keys_pass_through_unchanged():
     for key in ["image_grid_thw", "vit_grid", "types", "patches_per_image"]:
         assert mm_keys.modality_key(key, is_video=False) == key

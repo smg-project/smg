@@ -9,6 +9,11 @@
 //! `routers::common::overload`). Refusing requests with a 503 instead is the
 //! opt-in `--worker-overload-shed`.
 
+#[cfg(feature = "runtime")]
+use tracing::info;
+
+#[cfg(feature = "runtime")]
+use crate::identity::basic::Worker;
 use crate::worker::{OverloadUpdate, WorkerLoadResponse};
 
 /// Default KV token-usage ceiling (mean across DP ranks). On the replay
@@ -72,6 +77,55 @@ pub struct OverloadThresholds {
     /// `f64` to match the reported signal exactly: widening an `f32` threshold
     /// would put `0.8` just above the `0.8` an engine reports.
     pub token_usage: Option<f64>,
+}
+
+/// What the line of an overload veto's edge states of the worker beside
+/// the verdict: its load figures as the veto's writer read them, and its
+/// thresholds.
+///
+/// The line does not say that a figure crossed a threshold. A writer that
+/// judges the worker's own report against the worker's own thresholds
+/// states what it judged on. A writer that mirrors a verdict judged
+/// elsewhere states the worker's figures and thresholds as it holds them,
+/// and they need not explain the verdict: such a judge may weigh several
+/// ranks together, or hold them against thresholds the worker does not
+/// name. The line's `source` says who judged.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct OverloadReading {
+    /// Queued requests, as the writer read them.
+    pub waiting_requests: i64,
+    /// KV pressure, as the writer read it.
+    pub kv_pressure: f64,
+    /// The worker's thresholds, as the writer holds them.
+    pub thresholds: OverloadThresholds,
+}
+
+/// Write the INFO line of an overload veto's edge on `worker`: the verdict,
+/// the worker's figures and thresholds ([`OverloadReading`]) and who judged
+/// (`source`). A worker vetoed by overload reads as "unavailable" in a
+/// refusal line exactly like one with an open breaker, and the breaker and
+/// the liveness veto log their edges already. Every writer of the veto
+/// calls this, so the line reads alike whoever judged. It keeps the load
+/// monitor's log target, where it was first written.
+#[cfg(feature = "runtime")]
+pub fn log_overload_edge(
+    worker: &dyn Worker,
+    overloaded: bool,
+    reading: &OverloadReading,
+    source: &'static str,
+) {
+    info!(
+        target: "smg_worker::load::monitor",
+        worker_url = %worker.redacted_url(),
+        overloaded,
+        waiting_requests = reading.waiting_requests,
+        kv_pressure = reading.kv_pressure,
+        waiting_threshold = ?reading.thresholds.waiting_requests,
+        kv_pressure_threshold = ?reading.thresholds.token_usage,
+        source,
+        "Worker overload veto {}",
+        if overloaded { "set" } else { "cleared" }
+    );
 }
 
 impl OverloadThresholds {

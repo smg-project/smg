@@ -612,17 +612,21 @@ mod tests {
     use super::test_encoders::{SplittingEncoder, Tail};
     use crate::{mock::MockTokenizer, *};
 
-    /// Tokenizer that prepends a sentinel BOS when `add_special_tokens` is set,
-    /// so duplicated specials across a prefix/suffix merge are observable.
-    struct BosTokenizer {
+    /// A tokenizer over a [`SplittingEncoder`]. What it reports to a cache is
+    /// each constructor's own: special tokens, vocabulary size, added tokens.
+    struct SplittingTokenizer {
         special_tokens: SpecialTokens,
         splitting: SplittingEncoder,
+        vocab_size: usize,
+        added_tokens: Vec<String>,
     }
 
     const BOS_ID: TokenIdType = 99;
 
-    impl BosTokenizer {
-        fn new() -> Self {
+    impl SplittingTokenizer {
+        /// Tokenizer that prepends a sentinel BOS when `add_special_tokens` is set,
+        /// so duplicated specials across a prefix/suffix merge are observable.
+        fn bos() -> Self {
             Self {
                 special_tokens: SpecialTokens {
                     bos_token: Some("<bos>".to_string()),
@@ -633,6 +637,8 @@ mod tests {
                     ..Default::default()
                 },
                 splitting: atomic().with_bos(BOS_ID),
+                vocab_size: 256,
+                added_tokens: Vec::new(),
             }
         }
     }
@@ -660,7 +666,7 @@ mod tests {
             .sum()
     }
 
-    impl Encoder for BosTokenizer {
+    impl Encoder for SplittingTokenizer {
         fn encode(&self, input: &str, add_special_tokens: bool) -> Result<Encoding> {
             self.splitting.encode(input, add_special_tokens)
         }
@@ -670,15 +676,15 @@ mod tests {
         }
     }
 
-    impl Decoder for BosTokenizer {
+    impl Decoder for SplittingTokenizer {
         fn decode(&self, _token_ids: &[TokenIdType], _skip_special_tokens: bool) -> Result<String> {
             Ok(String::new())
         }
     }
 
-    impl traits::Tokenizer for BosTokenizer {
+    impl traits::Tokenizer for SplittingTokenizer {
         fn vocab_size(&self) -> usize {
-            256
+            self.vocab_size
         }
         fn get_special_tokens(&self) -> &SpecialTokens {
             &self.special_tokens
@@ -689,16 +695,19 @@ mod tests {
         fn id_to_token(&self, _id: TokenIdType) -> Option<String> {
             None
         }
+        fn added_token_strings(&self) -> Vec<String> {
+            self.added_tokens.clone()
+        }
         fn as_any(&self) -> &dyn std::any::Any {
             self
         }
     }
 
-    /// Wraps [`BosTokenizer`], counting `encode` invocations and the total bytes
-    /// of text tokenized, so tests can assert how much tokenizer work each cache
-    /// path actually performs.
+    /// Wraps [`SplittingTokenizer::bos`], counting `encode` invocations and the
+    /// total bytes of text tokenized, so tests can assert how much tokenizer
+    /// work each cache path actually performs.
     struct CountingTokenizer {
-        inner: BosTokenizer,
+        inner: SplittingTokenizer,
         encode_calls: AtomicUsize,
         bytes_encoded: AtomicUsize,
     }
@@ -706,7 +715,7 @@ mod tests {
     impl CountingTokenizer {
         fn new() -> Self {
             Self {
-                inner: BosTokenizer::new(),
+                inner: SplittingTokenizer::bos(),
                 encode_calls: AtomicUsize::new(0),
                 bytes_encoded: AtomicUsize::new(0),
             }
@@ -816,7 +825,7 @@ mod tests {
         );
 
         // Both paths return the same stream as a fresh uncached encode.
-        let fresh = BosTokenizer::new().encode(input, true).unwrap();
+        let fresh = SplittingTokenizer::bos().encode(input, true).unwrap();
         assert_eq!(first.token_ids(), fresh.token_ids());
         assert_eq!(second.token_ids(), fresh.token_ids());
     }
@@ -855,7 +864,7 @@ mod tests {
             turn_two.len() - deepest + 2 * "<|im_start|>".len() + "<|im_end|>".len(),
             "the next turn must match its own previous turn, not the shared prefix"
         );
-        let fresh = BosTokenizer::new().encode(&turn_two, true).unwrap();
+        let fresh = SplittingTokenizer::bos().encode(&turn_two, true).unwrap();
         assert_eq!(encoded.token_ids(), fresh.token_ids());
     }
 
@@ -899,7 +908,7 @@ mod tests {
             second.len() - system.len() + "<|im_end|>".len() + 2 * "<|im_start|>".len(),
             "the second conversation must match at the shared system prompt, not at the leading token"
         );
-        let fresh = BosTokenizer::new().encode(&second, true).unwrap();
+        let fresh = SplittingTokenizer::bos().encode(&second, true).unwrap();
         assert_eq!(encoded.token_ids(), fresh.token_ids());
 
         // The second conversation cached the boundary after its match in turn: a
@@ -918,7 +927,7 @@ mod tests {
             third.len() - deeper + 2 * "<|im_start|>".len() + "<|im_end|>".len(),
             "the third conversation must match one boundary deeper than the second"
         );
-        let fresh = BosTokenizer::new().encode(&third, true).unwrap();
+        let fresh = SplittingTokenizer::bos().encode(&third, true).unwrap();
         assert_eq!(encoded.token_ids(), fresh.token_ids());
     }
 
@@ -937,8 +946,9 @@ mod tests {
         }
 
         for add_special_tokens in [false, true] {
-            let cached = CachedTokenizer::new(Arc::new(BosTokenizer::new()), l1_only_config());
-            let plain = BosTokenizer::new();
+            let cached =
+                CachedTokenizer::new(Arc::new(SplittingTokenizer::bos()), l1_only_config());
+            let plain = SplittingTokenizer::bos();
 
             for (i, turn) in turns.iter().enumerate() {
                 let got = cached.encode(turn, add_special_tokens).unwrap();
@@ -958,7 +968,7 @@ mod tests {
 
     #[test]
     fn test_l1_hit_does_not_duplicate_special_tokens() {
-        let tokenizer = Arc::new(BosTokenizer::new());
+        let tokenizer = Arc::new(SplittingTokenizer::bos());
         let config = CacheConfig {
             enable_l0: false,
             l0_max_entries: 0,
@@ -978,7 +988,7 @@ mod tests {
         // The merged result must match a fresh, uncached encode: a single BOS at
         // the start, none duplicated mid-sequence and none dropped.
         let fresh = CachedTokenizer::new(
-            Arc::new(BosTokenizer::new()),
+            Arc::new(SplittingTokenizer::bos()),
             CacheConfig {
                 enable_l0: false,
                 l0_max_entries: 0,
@@ -1000,19 +1010,14 @@ mod tests {
         );
     }
 
-    /// Tokenizer whose special tokens are extracted leftmost-longest, as a
-    /// BPE tokenizer's added vocabulary does it: one id per special token, one
-    /// per byte otherwise. Its short special token is a prefix of its long one.
-    struct NestedSpecialsTokenizer {
-        special_tokens: SpecialTokens,
-        splitting: SplittingEncoder,
-    }
-
     const SHORT_SPECIAL: &str = "<|a|>";
     const LONG_SPECIAL: &str = "<|a|>b|>";
 
-    impl NestedSpecialsTokenizer {
-        fn new() -> Self {
+    impl SplittingTokenizer {
+        /// Tokenizer whose special tokens are extracted leftmost-longest, as a
+        /// BPE tokenizer's added vocabulary does it: one id per special token, one
+        /// per byte otherwise. Its short special token is a prefix of its long one.
+        fn nested_specials() -> Self {
             let specials = [SHORT_SPECIAL, LONG_SPECIAL];
             Self {
                 special_tokens: SpecialTokens {
@@ -1020,41 +1025,9 @@ mod tests {
                     ..Default::default()
                 },
                 splitting: SplittingEncoder::new(specials, 1000),
+                vocab_size: 1002,
+                added_tokens: Vec::new(),
             }
-        }
-    }
-
-    impl Encoder for NestedSpecialsTokenizer {
-        fn encode(&self, input: &str, add_special_tokens: bool) -> Result<Encoding> {
-            self.splitting.encode(input, add_special_tokens)
-        }
-
-        fn encode_batch(&self, inputs: &[&str], add_special_tokens: bool) -> Result<Vec<Encoding>> {
-            self.splitting.encode_batch(inputs, add_special_tokens)
-        }
-    }
-
-    impl Decoder for NestedSpecialsTokenizer {
-        fn decode(&self, _token_ids: &[TokenIdType], _skip_special_tokens: bool) -> Result<String> {
-            Ok(String::new())
-        }
-    }
-
-    impl traits::Tokenizer for NestedSpecialsTokenizer {
-        fn vocab_size(&self) -> usize {
-            1002
-        }
-        fn get_special_tokens(&self) -> &SpecialTokens {
-            &self.special_tokens
-        }
-        fn token_to_id(&self, _token: &str) -> Option<TokenIdType> {
-            None
-        }
-        fn id_to_token(&self, _id: TokenIdType) -> Option<String> {
-            None
-        }
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
         }
     }
 
@@ -1169,21 +1142,15 @@ mod tests {
         assert_eq!((stats.misses, stats.hits), (1, 1), "{stats:?}");
     }
 
-    /// Tokenizer whose post-processor frames a text when `add_special_tokens`
-    /// is set: a BOS in front, `tail` after it; the chat specials atomic.
-    struct FramesText {
-        special_tokens: SpecialTokens,
-        splitting: SplittingEncoder,
-    }
-
     const FRAME_BOS: TokenIdType = 1;
     const FRAME_EOS: TokenIdType = 2;
 
-    impl FramesText {
-        /// `tail` after the text when `add_special_tokens` is set: the EOS
-        /// (a frame the cache can apply around a result) or the input's
-        /// length as an id (no frame).
-        fn new(tail: Tail) -> Self {
+    impl SplittingTokenizer {
+        /// Tokenizer whose post-processor frames a text when `add_special_tokens`
+        /// is set: a BOS in front, `tail` after it; the chat specials atomic.
+        /// `tail` is the EOS (a frame the cache can apply around a result) or
+        /// the input's length as an id (no frame).
+        fn frames_text(tail: Tail) -> Self {
             let specials = ["<|im_start|>", "<|im_end|>"];
             Self {
                 special_tokens: SpecialTokens {
@@ -1193,41 +1160,9 @@ mod tests {
                 splitting: SplittingEncoder::new(specials, 1000)
                     .with_bos(FRAME_BOS)
                     .with_tail(tail),
+                vocab_size: 1002,
+                added_tokens: Vec::new(),
             }
-        }
-    }
-
-    impl Encoder for FramesText {
-        fn encode(&self, input: &str, add_special_tokens: bool) -> Result<Encoding> {
-            self.splitting.encode(input, add_special_tokens)
-        }
-
-        fn encode_batch(&self, inputs: &[&str], add_special_tokens: bool) -> Result<Vec<Encoding>> {
-            self.splitting.encode_batch(inputs, add_special_tokens)
-        }
-    }
-
-    impl Decoder for FramesText {
-        fn decode(&self, _token_ids: &[TokenIdType], _skip_special_tokens: bool) -> Result<String> {
-            Ok(String::new())
-        }
-    }
-
-    impl traits::Tokenizer for FramesText {
-        fn vocab_size(&self) -> usize {
-            1002
-        }
-        fn get_special_tokens(&self) -> &SpecialTokens {
-            &self.special_tokens
-        }
-        fn token_to_id(&self, _token: &str) -> Option<TokenIdType> {
-            None
-        }
-        fn id_to_token(&self, _id: TokenIdType) -> Option<String> {
-            None
-        }
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
         }
     }
 
@@ -1241,8 +1176,11 @@ mod tests {
             enable_l1: true,
             ..Default::default()
         };
-        let plain = FramesText::new(Tail::Id(FRAME_EOS));
-        let cached = CachedTokenizer::new(Arc::new(FramesText::new(Tail::Id(FRAME_EOS))), config);
+        let plain = SplittingTokenizer::frames_text(Tail::Id(FRAME_EOS));
+        let cached = CachedTokenizer::new(
+            Arc::new(SplittingTokenizer::frames_text(Tail::Id(FRAME_EOS))),
+            config,
+        );
         let next_turn = format!("{FRAMED_TEXT}<|im_start|>assistant\nHello");
         // Per flag: a miss, a hit, a hit with a suffix (the deepest boundary
         // cached too), the hit there.
@@ -1278,8 +1216,11 @@ mod tests {
             enable_l1: true,
             ..Default::default()
         };
-        let plain = FramesText::new(Tail::TextLength);
-        let cached = CachedTokenizer::new(Arc::new(FramesText::new(Tail::TextLength)), config);
+        let plain = SplittingTokenizer::frames_text(Tail::TextLength);
+        let cached = CachedTokenizer::new(
+            Arc::new(SplittingTokenizer::frames_text(Tail::TextLength)),
+            config,
+        );
         for _ in 0..2 {
             for add_special_tokens in [true, false] {
                 assert_eq!(
@@ -1300,59 +1241,19 @@ mod tests {
         assert_eq!((stats.misses, stats.hits), (1, 1), "{stats:?}");
     }
 
-    /// Tokenizer with the special tokens `/think` and `<|im_end|>` and the
-    /// longer, non-special added token `</think>`, all extracted whole.
-    struct ThinkTokenizer {
-        special_tokens: SpecialTokens,
-        splitting: SplittingEncoder,
-    }
-
-    impl ThinkTokenizer {
-        fn new() -> Self {
+    impl SplittingTokenizer {
+        /// Tokenizer with the special tokens `/think` and `<|im_end|>` and the
+        /// longer, non-special added token `</think>`, all extracted whole.
+        fn think() -> Self {
             Self {
                 special_tokens: SpecialTokens {
                     additional_special_tokens: vec!["/think".to_owned(), "<|im_end|>".to_owned()],
                     ..Default::default()
                 },
                 splitting: SplittingEncoder::new(["/think", "<|im_end|>", "</think>"], 1000),
+                vocab_size: 1003,
+                added_tokens: vec!["</think>".to_owned()],
             }
-        }
-    }
-
-    impl Encoder for ThinkTokenizer {
-        fn encode(&self, input: &str, add_special_tokens: bool) -> Result<Encoding> {
-            self.splitting.encode(input, add_special_tokens)
-        }
-
-        fn encode_batch(&self, inputs: &[&str], add_special_tokens: bool) -> Result<Vec<Encoding>> {
-            self.splitting.encode_batch(inputs, add_special_tokens)
-        }
-    }
-
-    impl Decoder for ThinkTokenizer {
-        fn decode(&self, _token_ids: &[TokenIdType], _skip_special_tokens: bool) -> Result<String> {
-            Ok(String::new())
-        }
-    }
-
-    impl traits::Tokenizer for ThinkTokenizer {
-        fn vocab_size(&self) -> usize {
-            1003
-        }
-        fn get_special_tokens(&self) -> &SpecialTokens {
-            &self.special_tokens
-        }
-        fn token_to_id(&self, _token: &str) -> Option<TokenIdType> {
-            None
-        }
-        fn id_to_token(&self, _id: TokenIdType) -> Option<String> {
-            None
-        }
-        fn added_token_strings(&self) -> Vec<String> {
-            vec!["</think>".to_owned()]
-        }
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
         }
     }
 
@@ -1366,8 +1267,8 @@ mod tests {
             enable_l1: true,
             ..Default::default()
         };
-        let plain = ThinkTokenizer::new();
-        let inner = CachedTokenizer::new(Arc::new(ThinkTokenizer::new()), config.clone());
+        let plain = SplittingTokenizer::think();
+        let inner = CachedTokenizer::new(Arc::new(SplittingTokenizer::think()), config.clone());
         let outer = CachedTokenizer::new(Arc::new(inner), config);
         assert_eq!(outer.added_token_strings(), vec!["</think>"]);
         for text in [
@@ -1387,7 +1288,7 @@ mod tests {
         // A prefix cached after the short special token must not be spliced
         // into an input where the same bytes begin the long one: the tokenizer
         // reads them as a single token there, so the ids differ.
-        let tokenizer = Arc::new(NestedSpecialsTokenizer::new());
+        let tokenizer = Arc::new(SplittingTokenizer::nested_specials());
         let cached = CachedTokenizer::new(tokenizer.clone(), l1_only_config());
         let seen = format!("{SHORT_SPECIAL}first");
         assert_eq!(

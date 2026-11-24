@@ -4,11 +4,18 @@
 use std::sync::Arc;
 
 use kv_index::{compute_content_hash, SequenceHash, StoredBlock};
+use smg_worker::{
+    identity::basic::{Worker, WorkerType},
+    load::state::TestFeed,
+};
 
 use super::{normalize_model_key, LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo};
-use crate::worker::{
-    load::state::TestFeed, test_support::worker_of, KvEventMonitor, KvIndex, Worker, WorkerBlocks,
-    WorkerType,
+use crate::{
+    policies::kv_index::{
+        event_monitor::KvEventMonitor,
+        index_backend::{KvIndex, WorkerBlocks},
+    },
+    routers::common::snapshot::test_support::worker_of,
 };
 
 /// A healthy worker (health checks disabled) at `url`.

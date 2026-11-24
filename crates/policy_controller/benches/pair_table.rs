@@ -41,7 +41,8 @@ use std::hint::black_box;
 use common::{build_view, fleet};
 use criterion::{criterion_group, criterion_main, Criterion};
 use smg_policy_controller::{
-    Candidate, Constraints, PairPools, PairTable, PolicySpec, PoolFacts, RequestFacts, Scratch,
+    document::PolicySpec,
+    engine::{Candidate, Constraints, PairPools, PairTable, PoolFacts, RequestFacts, Scratch},
 };
 
 const PREFILLS: u32 = 128;

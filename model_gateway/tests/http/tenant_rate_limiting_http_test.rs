@@ -51,6 +51,7 @@ use openai_protocol::{
     embedding::EmbeddingRequest,
     generate::GenerateRequest,
     messages::{CountMessageTokensRequest, CreateMessageRequest},
+    model_card::ModelCard,
     rerank::RerankRequest,
     responses::ResponsesRequest,
     worker::HealthCheckConfig,
@@ -59,14 +60,15 @@ use parking_lot::Mutex;
 use serde_json::{json, Value};
 use smg::{
     app_context::AppContext,
-    config::{PolicyConfig, RetryConfig, RouterConfig},
+    config::{PolicyConfig, RetryConfig, RouterConfig, RouterConfigBuilder},
     middleware::TenantRequestMeta,
     rate_limit::{
         RateLimitBackend, RateLimitManager, ReserveOutcome, ReserveRequest, UsageSettlement,
     },
-    routers::{http::router::Router as HttpRouter, RouterTrait},
+    routers::{
+        grpc::backend_client::BasicWorkerBuilder, http::router::Router as HttpRouter, RouterTrait,
+    },
     tenant::TenantKey,
-    worker::{BasicWorkerBuilder, ModelCard},
 };
 use tokio::{net::TcpListener, task::JoinHandle};
 use tower::ServiceExt;
@@ -291,9 +293,33 @@ pub(super) async fn limited_context_with_policy(
     retries: bool,
     policy: PolicyConfig,
 ) -> (Arc<AppContext>, Option<tempfile::TempDir>) {
-    let mut builder = RouterConfig::builder()
-        .regular_mode(vec![])
-        .policy(policy)
+    let regular = RouterConfig::builder().regular_mode(vec![]).policy(policy);
+    limited_context_over(regular, limiter, retries).await
+}
+
+/// [`limited_context_with_policy`] for a gateway of prefill and decode
+/// pairs: the configuration says pair mode, as the configuration of a
+/// gateway that builds a pair router does, and each side routes by
+/// `policy`.
+pub(super) async fn limited_pair_context_with_policy(
+    limiter: Limiter,
+    retries: bool,
+    policy: PolicyConfig,
+) -> (Arc<AppContext>, Option<tempfile::TempDir>) {
+    let pair = RouterConfig::builder()
+        .prefill_decode_mode(vec![], vec![])
+        .policy(policy);
+    limited_context_over(pair, limiter, retries).await
+}
+
+/// The context of the configuration `routing` states the mode and the
+/// policy of, under `limiter`, its retries on or off.
+async fn limited_context_over(
+    routing: RouterConfigBuilder,
+    limiter: Limiter,
+    retries: bool,
+) -> (Arc<AppContext>, Option<tempfile::TempDir>) {
+    let mut builder = routing
         .host("127.0.0.1")
         .port(0)
         .max_payload_size(1024 * 1024)

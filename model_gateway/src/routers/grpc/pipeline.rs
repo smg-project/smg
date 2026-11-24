@@ -84,14 +84,14 @@ use crate::{
     rate_limit::{RateLimitManager, UsageSettlement},
     routers::{
         common::{
-            json_response,
-            placement::{self, Candidates, WireConstraint},
+            json_response, placement,
+            placement::{Candidates, WireConstraint},
             prefill_admission::PrefillAdmission,
             retry::{is_retryable_response, BackoffCalculator},
+            snapshot::{RoutingPool, WorkerRegistry},
         },
         error,
     },
-    worker::{RoutingPool, WorkerRegistry},
 };
 
 /// Which endpoint a pipeline serves. Selects the endpoint-specific stage set
@@ -661,6 +661,7 @@ impl RequestPipeline {
             last_attempt,
             self.request_timeout,
             self.grouped_dp_sticky,
+            &self.stages.worker_selection,
         )
         .await?;
         self.stages
@@ -683,10 +684,9 @@ impl RequestPipeline {
     /// iteration, so the pipeline is not where that turn is counted);
     /// `retry_config` enables the dispatch-phase retry loop.
     ///
-    /// The run is boxed once, here: it holds ingress + per-attempt state
-    /// across awaits. The 2.5 KiB context comes in a box of its own, so every
-    /// hop from the entry point into this future moves a pointer; by value,
-    /// each hop copied the context whole.
+    /// The run is boxed once, here. It holds ingress and per-attempt state
+    /// across awaits. The ingress context comes in a box of its own, so every
+    /// hop from the entry point into this future moves a pointer.
     fn run<'a>(
         &'a self,
         ctx: Box<RequestContext>,
@@ -803,6 +803,9 @@ impl RequestPipeline {
                 // queued behind its own predecessor's bootstrap rooms.
                 dctx.load_guards = None;
                 dctx.pd_prefill_guard = None;
+                // A stream that failed after its call was taken is the worker's
+                // failure too: charged here, where the request's ledger is.
+                dctx.ledger.charge_pending(&failure);
                 // A worker's definitive answer closes the retry window on that
                 // worker: the next attempt goes to another available worker, or
                 // the answer stands as the client's response.
@@ -900,8 +903,8 @@ impl RequestPipeline {
         }
         if let Some(workers) = ctx.workers.as_ref() {
             let worker = match workers {
-                WorkerSelection::Single { worker } => worker,
-                WorkerSelection::Disaggregated { decode, .. } => decode,
+                WorkerSelection::Single { worker } => worker.worker(),
+                WorkerSelection::Disaggregated { decode, .. } => decode.worker(),
             };
             insert_routed_worker_id(response.headers_mut(), worker.redacted_url());
         }

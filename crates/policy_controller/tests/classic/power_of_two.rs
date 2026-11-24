@@ -7,9 +7,14 @@ use std::time::Instant;
 use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse};
 use serde::Deserialize;
 use smg_policy_controller::{
-    builtins::DEFAULT_MEAN_PREFILL_TOKENS, ingest::rows, Candidate, Constraints, Engine, Health,
-    Lease, Lifecycle, LoadRow, PolicySpec, PoolFacts, PowerOfTwoMetric, RequestFacts, Role,
-    Scratch, Side, SignalSource, WorkerId,
+    document::PolicySpec,
+    engine::{
+        Candidate, Constraints, Engine, Health, LoadRow, PoolFacts, RequestFacts, Role, Scratch,
+        SignalSource, WorkerId,
+    },
+    policies::power_of_two::PowerOfTwoMetric,
+    stages::Lifecycle,
+    tracking::{Lease, Side},
 };
 
 use crate::{Outcome, Recorded, Replayed};
@@ -98,7 +103,7 @@ fn wire(report: Report) -> WorkerLoadResponse {
 /// the instant it was sampled.
 fn load_row(report: Report) -> LoadRow {
     let now = Instant::now();
-    rows::load_row(&wire(report), Role::Single, now, now, SignalSource::Poll)
+    smg_policy_controller::load::load_row(&wire(report), Role::Single, now, now, SignalSource::Poll)
 }
 
 /// Each field of a recorded report reaches its field of the row: a report
@@ -131,7 +136,7 @@ fn a_recorded_report_reaches_the_row_field_for_field() {
 }
 
 /// A recorded report of an idle worker with a rate replays with none:
-/// outside the prefill role the crate's ingest writes a worker's rate only
+/// outside the prefill role the row builder writes a worker's rate only
 /// while it runs requests, and the sheet's workers carry no role.
 #[test]
 fn the_replay_carries_no_rate_for_an_idle_worker() {
@@ -223,7 +228,7 @@ impl Bed {
     fn pick(&mut self, prompt_tokens: Option<u32>, seed: u64) -> usize {
         let picked = self.decide(prompt_tokens, seed);
         let candidate = &self.pool[picked];
-        let target = smg_policy_controller::Target {
+        let target = smg_policy_controller::engine::Target {
             position: candidate.position,
             id: candidate.id,
             dp_rank: candidate.dp_rank,
@@ -231,8 +236,9 @@ impl Bed {
         };
         let lease = Lease {
             issued_micros: self.clock,
-            // A request of unknown size is booked at the host's mean.
-            tokens: prompt_tokens.unwrap_or(DEFAULT_MEAN_PREFILL_TOKENS),
+            // A request of unknown size states none: the stage credits
+            // its dispatch at its own mean.
+            tokens: prompt_tokens.unwrap_or(0),
             ..Lease::default()
         };
         self.engine.on_dispatched(&lease, &target, Side::Single, 0);

@@ -9,7 +9,7 @@ use ndarray::Array2;
 use super::*;
 use crate::routers::grpc::multimodal::{
     config::MultimodalConfigRegistry, encoder_budget::ItemOverEncoderBudget,
-    settings::MultimodalSettings,
+    is_request_media_fault, processing_failed_response, settings::MultimodalSettings,
 };
 
 #[derive(Default)]
@@ -589,6 +589,79 @@ async fn every_image_family_is_held_to_the_budget_on_its_header_size() {
     }
 }
 
+/// A size the processor's own rule refuses is refused on the header, in the
+/// words the preprocessing reports it in and as the request's own media
+/// (a 400 under the media stage's code), before any image of the batch is
+/// decoded: the allowed frame in front has no bytes, so a decode of it would
+/// fail first. With a budget and without one, with the pixel cache and
+/// without it.
+#[tokio::test]
+async fn a_size_the_processors_rule_refuses_is_refused_before_any_decode() {
+    let (mut components, _, _) = setup(true, false);
+    let config = MultimodalModelConfig::new(
+        serde_json::json!({"model_type": "qwen2_vl"}),
+        PreProcessorConfig::default(),
+        None,
+    );
+    let metadata = ModelMetadata {
+        model_id: "qwen2_vl",
+        tokenizer: &NoTokenizer,
+        config: &config.config,
+    };
+    let spec = components.model_registry.lookup(&metadata).unwrap();
+    let header_only = |hash: &str, width, height| {
+        Arc::new(ImageFrame::encoded(
+            Default::default(),
+            Default::default(),
+            ImageSource::InlineBytes,
+            hash.to_string(),
+            ImageSize::new(width, height),
+            None,
+        ))
+    };
+    // The second is past the aspect ratio the Qwen size rule takes.
+    let pair = MediaBatch::Images(vec![
+        header_only("fits", 64, 64),
+        header_only("thin", 4020, 20),
+    ]);
+    // Without the pixel cache first (the default, where the whole batch is
+    // decoded at once), then with it.
+    let cache = components.pixel_cache.take();
+    for (cached, budget) in [
+        (false, None),
+        (false, Some(usize::MAX)),
+        (true, None),
+        (true, Some(usize::MAX)),
+    ] {
+        if cached {
+            components.pixel_cache.clone_from(&cache);
+        }
+        let ctx = context(&components, &config, spec, "qwen2_vl", "tok", None, budget);
+        let error = preprocess_modality(&pair, &ctx).await.unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Image preprocessing failed: Invalid tensor shape: expected aspect ratio < 200:1, \
+             got [20, 4020]",
+            "pixel cache {cached}, budget {budget:?}"
+        );
+        let response = processing_failed_response(&error);
+        assert_eq!(response.status(), http::StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response.headers()["x-smg-error-code"],
+            "invalid_multimodal_request"
+        );
+        assert!(is_request_media_fault(&error));
+    }
+    // A header with a side of zero is left to the decode, as before.
+    let empty = MediaBatch::Images(vec![header_only("empty", 0, 64)]);
+    let ctx = context(&components, &config, spec, "qwen2_vl", "tok", None, None);
+    let error = preprocess_modality(&empty, &ctx).await.unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "image decode error: The image format could not be determined"
+    );
+}
+
 /// Hits and misses per model, as `(hits, misses)`; `None` until both series
 /// are rendered.
 fn lookups(
@@ -913,6 +986,78 @@ async fn bf16_batch_cache_reuses_large_batches_across_image_families() {
             );
         }
     }
+}
+
+/// A budget between a wire's length and its pooled class stores the batch
+/// once: the replay views the allocation of the fill, without a gather. The
+/// joined output of a growing request, a pooled buffer too, is stored at its
+/// exact length the same way.
+#[tokio::test]
+async fn a_pooled_buffer_is_cached_at_its_exact_length() {
+    let batch = MediaBatch::Images(
+        (0..8u8)
+            .map(|id| {
+                Arc::new(ImageFrame::new(
+                    image::RgbImage::from_pixel(224, 224, image::Rgb([id, 21, 203])).into(),
+                    Default::default(),
+                    Default::default(),
+                    ImageSource::InlineBytes,
+                    id.to_string(),
+                ))
+            })
+            .collect(),
+    );
+    let model = "qwen3_vl";
+    let (mut components, _, _) = setup(true, false);
+    let config = MultimodalModelConfig::new(
+        serde_json::json!({"model_type": model, "image_token_id": 100}),
+        PreProcessorConfig::default(),
+        None,
+    );
+    let registry = Arc::clone(&components.model_registry);
+    let spec = registry
+        .lookup(&ModelMetadata {
+            model_id: model,
+            tokenizer: &NoTokenizer,
+            config: &config.config,
+        })
+        .unwrap();
+    let wire = Some(EncoderDtype::BFloat16);
+    let ctx = context(&components, &config, spec, model, model, wire, None);
+    let uncached = preprocess_batch(&batch, &ctx).await.unwrap();
+    let len = uncached.encoder_input.nbytes();
+    // Room for the entries' metadata beside the bytes, still under the class.
+    let budget = len + 64 * 1024;
+    assert!(llm_multimodal::buffer_pool::allocation_capacity(len) > budget);
+    components.pixel_cache = Some(Arc::new(PixelCache::new(budget)));
+    let ctx = context(&components, &config, spec, model, model, wire, None);
+
+    let fill = preprocess_modality(&batch, &ctx).await.unwrap();
+    let replay = preprocess_modality(&batch, &ctx).await.unwrap();
+    let stored = fill.encoder_input.shared_allocation();
+    assert_eq!(stored.map(|(_, capacity)| capacity), Some(len));
+    assert_eq!(replay.encoder_input.shared_allocation(), stored);
+    let expected = uncached.encoder_input.write_as(EncoderDtype::BFloat16);
+    for output in [fill, replay] {
+        let bytes = output.encoder_input.write_as(EncoderDtype::BFloat16);
+        assert_eq!(bytes, expected);
+    }
+
+    // A request that grows from four of the images to all eight is answered
+    // by a join of two allocations, which the cache then keeps.
+    components.pixel_cache = Some(Arc::new(PixelCache::new(4 * len)));
+    let ctx = context(&components, &config, spec, model, model, wire, None);
+    let MediaBatch::Images(images) = &batch else {
+        panic!("an image batch");
+    };
+    let prefix = MediaBatch::Images(images[..4].to_vec());
+    preprocess_modality(&prefix, &ctx).await.unwrap();
+    let grown = preprocess_modality(&batch, &ctx).await.unwrap();
+    let stored = grown.encoder_input.shared_allocation();
+    assert_eq!(stored.map(|(_, capacity)| capacity), Some(len));
+    // The cache kept it: the replay views the joined allocation, without a gather.
+    let replay = preprocess_modality(&batch, &ctx).await.unwrap();
+    assert_eq!(replay.encoder_input.shared_allocation(), stored);
 }
 
 /// Keep newly computed images when an overlapping request cannot replace its old backing.

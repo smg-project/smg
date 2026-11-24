@@ -4,8 +4,13 @@
 
 use serde::Deserialize;
 use smg_policy_controller::{
-    Assignment, Candidate, Constraints, Engine, Health, Identity, Lease, Lifecycle, PolicySpec,
-    PoolFacts, RequestFacts, Scratch, Side, WorkerId,
+    document::{Assignment, PolicySpec},
+    engine::{
+        Candidate, Constraints, Engine, Health, Identity, PairPools, PairTable, Phase, PoolFacts,
+        RequestFacts, Role as WorkerRole, Scratch, Target, WorkerId,
+    },
+    stages::Lifecycle,
+    tracking::{Lease, Side},
 };
 
 use crate::{Outcome, Recorded, Replayed};
@@ -68,26 +73,26 @@ impl Row {
     }
 
     /// The manual preset under the row's assignment. A row with a request
-    /// on a side of a pair runs the preset on both sides, under the same
-    /// rule.
+    /// on a side of a pair binds the preset twice under the one rule: on
+    /// both sides of a pair for the prefill and the decode phase, and alone
+    /// for every other request.
     fn spec(&self) -> PolicySpec {
-        let mut spec = if self.pairs() {
-            PolicySpec::pair_presets(POLICY, POLICY)
-        } else {
-            PolicySpec::preset(POLICY)
-        }
-        .expect("the preset's form");
-        let mut sessions = PolicySpec::preset(POLICY)
-            .expect("the preset's form")
-            .bindings
-            .pop()
-            .and_then(|binding| binding.sessions)
+        let mut alone = PolicySpec::preset(POLICY).expect("the preset's form");
+        let single = alone.bindings.first_mut().expect("the preset's binding");
+        let rule = single
+            .sessions
+            .as_mut()
             .expect("the preset's sessions rule");
-        sessions.assignment = self.assignment;
-        spec.bindings
-            .first_mut()
-            .expect("the preset's binding")
-            .sessions = Some(sessions);
+        rule.assignment = self.assignment;
+        if !self.pairs() {
+            return alone;
+        }
+        let mut spec = PolicySpec::pair_presets(POLICY, POLICY).expect("the presets' form");
+        let pair = spec.bindings.first_mut().expect("the presets' binding");
+        pair.matcher.phase = vec![Phase::Prefill, Phase::Decode];
+        pair.sessions.clone_from(&single.sessions);
+        spec.profiles.append(&mut alone.profiles);
+        spec.bindings.append(&mut alone.bindings);
         spec
     }
 }
@@ -101,6 +106,9 @@ struct Bed {
     scratch: Scratch,
     /// The host's clock, microseconds: each request has its own instant.
     clock: u64,
+    /// A pair's request between its two steps: the pool as it stood at the
+    /// prefill step, with the request's key and seed.
+    asked: Option<(Vec<Candidate>, Option<String>, u64)>,
 }
 
 impl Bed {
@@ -130,6 +138,7 @@ impl Bed {
             pool,
             scratch: Scratch::new(),
             clock: 1_000,
+            asked: None,
         })
     }
 
@@ -169,10 +178,101 @@ impl Bed {
         target.position as usize
     }
 
+    /// One request of a pair, decided once and dispatched a side at a time,
+    /// as a host commits it: each side's pins move by that side's lease,
+    /// under the side's own session and verdict. The prefill side reads
+    /// `prefills`, the decode side the pool as it stands, and every prefill
+    /// pairs with every decode. It answers the worker of each side.
+    fn pair(&mut self, prefills: &[Candidate], key: Option<&str>, seed: u64) -> [usize; 2] {
+        self.clock += 1_000;
+        let facts = RequestFacts {
+            model: "m",
+            session_key: key.map_or(Identity::NONE, Identity::plain),
+            seed,
+            now_micros: self.clock,
+            ..RequestFacts::default()
+        };
+        let pool_facts = PoolFacts {
+            pool_size: prefills.len() as u32,
+            generation: 1,
+            ..PoolFacts::default()
+        };
+        let side = |pool: &[Candidate], role| -> Vec<Candidate> {
+            (pool.iter())
+                .map(|worker| Candidate {
+                    role,
+                    pair_class: 1,
+                    has_capacity: true,
+                    has_room: true,
+                    ..*worker
+                })
+                .collect()
+        };
+        let prefills = side(prefills, WorkerRole::Prefill);
+        let decodes = side(&self.pool, WorkerRole::Decode);
+        let pools = PairPools {
+            prefills: &prefills,
+            decodes: &decodes,
+            table: PairTable::new(&[1], &[1]),
+            ..PairPools::default()
+        };
+        let cx = Constraints::default();
+        let decision =
+            (self.engine).decide_pair(&facts, &pool_facts, pools, &cx, &cx, &mut self.scratch);
+        let pick = decision.pick().expect("a pair");
+        let target = *pick.targets.first().expect("a target");
+        let pair = target.pair.expect("the target's pair");
+        // The host's two dispatches: the prefill's under the pick's verdict,
+        // the decode's under the one the first target's pair states.
+        let session = |phase| RequestFacts { phase, ..facts }.session();
+        let prefill = Lease {
+            issued_micros: self.clock,
+            side: Side::Prefill,
+            session: session(Phase::Prefill),
+            session_verdict: pick.session_verdict,
+            ..Lease::default()
+        };
+        self.engine
+            .on_dispatched(&prefill, &target, Side::Prefill, 0);
+        let decode = Lease {
+            side: Side::Decode,
+            booked: pair.decode_id,
+            session: session(Phase::Decode),
+            session_verdict: pair.decode_verdict.on(pair.decode_id),
+            ..prefill
+        };
+        let went = Target {
+            position: pair.decode_position,
+            id: pair.decode_id,
+            dp_rank: pair.decode_dp_rank,
+            pair: None,
+        };
+        self.engine.on_dispatched(&decode, &went, Side::Decode, 0);
+        [target.position as usize, pair.decode_position as usize]
+    }
+
     /// One step of the row; a request answers the worker it was placed on.
-    fn step(&mut self, step: &Step, seed: u64) -> Option<usize> {
+    /// A pair's request is asked in two steps, its prefill role and then
+    /// its decode role. It is one decision here: the prefill step keeps
+    /// the pool as it stands, and the decode step decides the pair and
+    /// answers both workers.
+    fn step(&mut self, step: &Step, seed: u64, picked: &mut Vec<usize>) {
         match step {
-            Step::Pick { key, .. } => return Some(self.pick(key.as_deref(), seed)),
+            Step::Pick { key, role } => match role {
+                Role::Single => picked.push(self.pick(key.as_deref(), seed)),
+                Role::Prefill => {
+                    assert!(self.asked.is_none(), "a prefill step with no decode step");
+                    self.asked = Some((self.pool.clone(), key.clone(), seed));
+                }
+                Role::Decode => {
+                    let (prefills, asked, seed) = self
+                        .asked
+                        .take()
+                        .expect("a decode step behind its prefill step");
+                    assert_eq!(&asked, key, "a pair's request has one key");
+                    picked.extend(self.pair(&prefills, key.as_deref(), seed));
+                }
+            },
             Step::Down(i) => self.pool[*i].health.healthy = false,
             Step::Up(i) => self.pool[*i].health.healthy = true,
             Step::Loads(loads) => {
@@ -188,7 +288,6 @@ impl Bed {
                 }
             }
         }
-        None
     }
 }
 
@@ -197,12 +296,12 @@ impl Bed {
 /// runs; a sequence row is run `0`.
 fn run(row: &Row, draw: u64) -> Result<Vec<usize>, String> {
     let mut bed = Bed::new(row)?;
-    Ok(row
-        .steps
-        .iter()
-        .enumerate()
-        .filter_map(|(n, step)| bed.step(step, draw * 1_000 + n as u64 + 1))
-        .collect())
+    let mut picked = Vec::new();
+    for (n, step) in row.steps.iter().enumerate() {
+        bed.step(step, draw * 1_000 + n as u64 + 1, &mut picked);
+    }
+    assert!(bed.asked.is_none(), "a prefill step with no decode step");
+    Ok(picked)
 }
 
 /// This crate's outcome for the row, in the shape of the recorded one, or

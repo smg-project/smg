@@ -62,7 +62,8 @@ jobs:
           SUFFIX="$(date -u +%Y%m%d)-${GITHUB_SHA::7}"
           # The `-slurm` variant (the router image with the Slurm clients) takes
           # every tag with `-slurm` appended, the policy controller's image every
-          # tag with `-policy-controller` appended.
+          # tag with `-policy-controller` appended, and the OL9 router every tag
+          # with `-ol9` appended.
           if [ "$EXPRESS" = "true" ]; then
             # amd64-only: the floating :nightly stays multi-arch by not
             # retagging it here; consumers pin the suffixed tag.
@@ -76,6 +77,9 @@ jobs:
               echo "EOF"
               echo "controller_list<<EOF"
               echo "ghcr.io/${OWNER}/smg:nightly-${SUFFIX}-policy-controller"
+              echo "EOF"
+              echo "ol9_list<<EOF"
+              echo "ghcr.io/${OWNER}/smg:nightly-${SUFFIX}-ol9"
               echo "EOF"
             } >> "$GITHUB_OUTPUT"
           else
@@ -92,6 +96,10 @@ jobs:
               echo "controller_list<<EOF"
               echo "ghcr.io/${OWNER}/smg:nightly-policy-controller"
               echo "ghcr.io/${OWNER}/smg:nightly-${SUFFIX}-policy-controller"
+              echo "EOF"
+              echo "ol9_list<<EOF"
+              echo "ghcr.io/${OWNER}/smg:nightly-ol9"
+              echo "ghcr.io/${OWNER}/smg:nightly-${SUFFIX}-ol9"
               echo "EOF"
             } >> "$GITHUB_OUTPUT"
           fi
@@ -136,3 +144,17 @@ jobs:
           push: true
           tags: ${{ steps.tags.outputs.controller_list }}
           platforms: ${{ steps.tags.outputs.platforms }}
+
+      # Publish the validated amd64 OL9 router beside the nightly Ubuntu image.
+      - name: Build and push the Oracle Linux 9 router
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/ol9.Dockerfile
+          target: router-image
+          push: true
+          tags: ${{ steps.tags.outputs.ol9_list }}
+          cache-from: type=gha,scope=smg-ol9-amd64
+          cache-to: type=gha,scope=smg-ol9-amd64,mode=max
+          platforms: linux/amd64

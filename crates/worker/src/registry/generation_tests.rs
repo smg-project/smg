@@ -188,6 +188,36 @@ fn the_model_less_generation_carries_a_value_like_any_other() {
 }
 
 #[test]
+fn the_global_epoch_wrap_keeps_the_live_generation() {
+    let registry = WorkerRegistry::<Counted>::new();
+    registry
+        .register(ready_worker("http://a:8000", "m"))
+        .unwrap();
+    registry
+        .global_epoch
+        .store(usize::MAX - 2, Ordering::Relaxed);
+
+    registry
+        .register(ready_worker("http://b:8000", "m"))
+        .unwrap();
+    let before_wrap = registry.global_generation();
+    let mut before_urls: Vec<_> = before_wrap.members().iter().map(|w| w.url()).collect();
+    before_urls.sort_unstable();
+    assert_eq!(before_urls, ["http://a:8000", "http://b:8000"]);
+
+    registry
+        .register(ready_worker("http://c:8000", "m"))
+        .unwrap();
+    let after_wrap = registry.global_generation();
+    let mut after_urls: Vec<_> = after_wrap.members().iter().map(|w| w.url()).collect();
+    after_urls.sort_unstable();
+    assert_eq!(
+        after_urls,
+        ["http://a:8000", "http://b:8000", "http://c:8000"]
+    );
+}
+
+#[test]
 fn a_superseded_model_less_value_falls_at_the_next_membership_change() {
     let standing = STANDING.get();
     let registry = WorkerRegistry::<Counted>::new();

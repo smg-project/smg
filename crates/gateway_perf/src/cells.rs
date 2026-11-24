@@ -32,6 +32,9 @@ pub struct Settings {
     pub out: PathBuf,
     pub bed: BedConfig,
     pub binaries: BTreeMap<String, PathBuf>,
+    /// The base's own gateway flags, where it runs under other flags than the
+    /// head (`--base-gw-args`): one binary measured under two settings.
+    pub base_gw_args: Option<String>,
     pub paths: Vec<PathSpec>,
     pub requests: u64,
     pub repeats: usize,
@@ -55,6 +58,7 @@ impl Settings {
             out: out.to_path_buf(),
             bed,
             binaries,
+            base_gw_args: None,
             paths,
             requests: 10_000,
             repeats: 3,
@@ -73,6 +77,33 @@ impl Settings {
             .get(side)
             .map(PathBuf::as_path)
             .ok_or_else(|| anyhow!("no gateway binary for the {side} side"))
+    }
+
+    /// The gateway flags `side` runs under: the base's own where it has any,
+    /// else the bed's.
+    pub fn gw_args(&self, side: &str) -> &str {
+        match (side, &self.base_gw_args) {
+            ("base", Some(flags)) => flags,
+            _ => &self.bed.gw_args,
+        }
+    }
+
+    /// A bed for `side`: its binary under its gateway flags.
+    pub fn side_bed(&self, side: &str, run_dir: &Path, jemalloc_stats: bool) -> Result<Bed> {
+        let mut cfg = self.bed.clone();
+        cfg.gw_args = self.gw_args(side).to_string();
+        Ok(Bed::new(&cfg, self.binary(side)?, run_dir, jemalloc_stats))
+    }
+
+    /// What a setup line says where the two sides ran under different gateway
+    /// flags: nothing where they ran under the same.
+    pub fn flags_text(&self) -> String {
+        let (base, head) = (self.gw_args("base"), self.gw_args("pr"));
+        if base == head {
+            String::new()
+        } else {
+            format!("; gateway flags before `{base}`, after `{head}`")
+        }
     }
 }
 
@@ -121,6 +152,8 @@ pub struct CellRecord {
     pub path: String,
     pub label: String,
     pub binary: String,
+    /// The extra gateway flags the cell's gateway ran under.
+    pub gw_args: String,
     pub dir: String,
     pub sent: u64,
     pub ok: u64,
@@ -321,7 +354,7 @@ pub fn cell(
     let cdir = settings.out.join("cells").join(side).join(name).join(label);
     fs::create_dir_all(&cdir)?;
     let binary = settings.binary(side)?;
-    let mut bed = Bed::new(&settings.bed, binary, &cdir.join("bed"), true);
+    let mut bed = settings.side_bed(side, &cdir.join("bed"), true)?;
     let t_start = Instant::now();
     println!(
         "[{}] cell {side}/{name}/{label} load={:.2}",
@@ -338,6 +371,7 @@ pub fn cell(
         path: name.to_string(),
         label: label.to_string(),
         binary: binary.display().to_string(),
+        gw_args: settings.gw_args(side).to_string(),
         dir: cdir.display().to_string(),
         ..CellRecord::default()
     };
@@ -572,11 +606,12 @@ pub fn setup_text(settings: &Settings, mode: &str) -> String {
         prompt.push_str(&format!(", {} distinct", settings.distinct));
     }
     format!(
-        "{mode}: {} requests per cell at the path's rate x {}, {prompt}, {}, {} runtime threads{cores}",
+        "{mode}: {} requests per cell at the path's rate x {}, {prompt}, {}, {} runtime threads{cores}{}",
         thousands(settings.requests as f64, 0, false),
         py_g(settings.rate_scale, 6),
         settings.bed.engines_text(),
-        settings.bed.gw_threads
+        settings.bed.gw_threads,
+        settings.flags_text()
     )
 }
 
@@ -930,12 +965,7 @@ pub fn mem_soak(
         .join(format!("mem-{}", spec.name))
         .join(label);
     fs::create_dir_all(&cdir)?;
-    let mut bed = Bed::new(
-        &settings.bed,
-        settings.binary(side)?,
-        &cdir.join("bed"),
-        false,
-    );
+    let mut bed = settings.side_bed(side, &cdir.join("bed"), false)?;
     println!(
         "[{}] mem {side}/{}/{label}: {windows} windows of {} + a burst at x{}",
         hms(),
@@ -1022,10 +1052,11 @@ pub fn run_mem(
         unit: Some(String::new()),
     };
     let setup = format!(
-        "mem: {windows} windows of {} requests on one gateway, then a burst at x{}; {}",
+        "mem: {windows} windows of {} requests on one gateway, then a burst at x{}; {}{}",
         thousands(settings.requests as f64, 0, false),
         py_g(burst, 6),
-        settings.bed.engines_text()
+        settings.bed.engines_text(),
+        settings.flags_text()
     );
     let values: Vec<Value> = records
         .iter()
@@ -1037,12 +1068,7 @@ pub fn run_mem(
 /// `bed smoke`: the bed up, one request per path with the first response shown, the
 /// script counts, the bed down. Returns 0 when every path answered from the script.
 pub fn smoke(settings: &Settings, paths: &[PathSpec]) -> Result<i32> {
-    let mut bed = Bed::new(
-        &settings.bed,
-        settings.binary("pr")?,
-        &settings.out.join("bed"),
-        true,
-    );
+    let mut bed = settings.side_bed("pr", &settings.out.join("bed"), true)?;
     let info = bed.up()?.clone();
     println!(
         "bed up: gateway pid {} at {}, {}, bed.json {}",
@@ -1121,12 +1147,7 @@ fn smoke_paths(settings: &Settings, bed: &Bed, paths: &[PathSpec]) -> Result<i32
 
 /// The record that `bed up` prints and `bed down` needs: the same bed object.
 pub fn bed_for(settings: &Settings, jemalloc_stats: bool) -> Result<Bed> {
-    Ok(Bed::new(
-        &settings.bed,
-        settings.binary("pr")?,
-        &settings.out.join("bed"),
-        jemalloc_stats,
-    ))
+    settings.side_bed("pr", &settings.out.join("bed"), jemalloc_stats)
 }
 
 /// The log line of a sleep-free timestamp (for the `live` mode's steps).
@@ -1137,7 +1158,10 @@ pub fn elapsed_since(t: f64) -> f64 {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::{bed::Fleet, paths::path_named};
+    use crate::{
+        bed::Fleet,
+        paths::{path_named, DEFAULT_GW_ARGS},
+    };
 
     /// A results file from per-id samples: run i holds the i-th value of every id that
     /// has one.
@@ -1484,5 +1508,40 @@ pub(crate) mod tests {
             setup_text(&settings, "cpu"),
             "cpu: 10,000 requests per cell at the path's rate x 0.5, 64-word prompts, 128 distinct, 4 scripted mock engines on the HTTP wire, 8 runtime threads; gateway pinned to cores 0-7"
         );
+    }
+
+    #[test]
+    fn the_base_runs_under_gateway_flags_of_its_own_where_it_has_any() {
+        let cfg = BedConfig::new(Path::new("/bed.sh"), Path::new("/m"), Path::new("/l"), "/t");
+        let binaries = BTreeMap::from([
+            ("base".to_string(), PathBuf::from("/smg")),
+            ("pr".to_string(), PathBuf::from("/smg")),
+        ]);
+        let mut settings = Settings::new(Path::new("/out"), cfg, binaries, Vec::new());
+        let ran_under = |settings: &Settings, side: &str| {
+            let bed = settings.side_bed(side, Path::new("/run"), false).unwrap();
+            let env: BTreeMap<String, String> = bed.env().into_iter().collect();
+            env["GW_ARGS"].clone()
+        };
+        assert_eq!(ran_under(&settings, "base"), DEFAULT_GW_ARGS);
+        assert_eq!(ran_under(&settings, "pr"), DEFAULT_GW_ARGS);
+        assert_eq!(settings.flags_text(), "");
+
+        settings.base_gw_args = Some("--parser symphony".to_string());
+        settings.bed.gw_args = "--parser symphony --trust-tenant-header".to_string();
+        assert_eq!(ran_under(&settings, "base"), "--parser symphony");
+        assert_eq!(
+            ran_under(&settings, "pr"),
+            "--parser symphony --trust-tenant-header"
+        );
+        assert_eq!(
+            setup_text(&settings, "alloc"),
+            "alloc: 10,000 requests per cell at the path's rate x 1, 64-word prompts, 4 scripted mock engines, 8 runtime threads; \
+             gateway flags before `--parser symphony`, after `--parser symphony --trust-tenant-header`"
+        );
+
+        // Flags of its own that equal the head's are no difference to state.
+        settings.base_gw_args = Some(settings.bed.gw_args.clone());
+        assert_eq!(settings.flags_text(), "");
     }
 }

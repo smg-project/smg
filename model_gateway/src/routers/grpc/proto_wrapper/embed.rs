@@ -3,6 +3,7 @@
 //! read. Moved out of `proto_wrapper.rs`.
 
 use smg_grpc_client::{sglang_proto as sglang, vllm_proto as vllm};
+use smg_worker::identity::basic::RuntimeType;
 
 /// Unified EmbedRequest that works with all backends
 #[derive(Clone)]
@@ -13,8 +14,7 @@ pub enum ProtoEmbedRequest {
 
 impl ProtoEmbedRequest {
     /// The runtime whose message type this request is.
-    pub fn runtime_type(&self) -> crate::worker::RuntimeType {
-        use crate::worker::RuntimeType;
+    pub fn runtime_type(&self) -> RuntimeType {
         match self {
             Self::Sglang(_) => RuntimeType::Sglang,
             Self::Vllm(_) => RuntimeType::Vllm,

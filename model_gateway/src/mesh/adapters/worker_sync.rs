@@ -72,21 +72,21 @@ use std::{
 
 use parking_lot::Mutex;
 use smg_mesh::{gossip::NodeStatus, ClusterState, CrdtNamespace, WorkerState};
+use smg_service_discovery::DISCOVERY_ID_LABEL;
+use smg_worker::{
+    identity::{
+        basic::{ConnectionMode, Worker},
+        endpoint::{endpoint_key, Endpoint, EndpointKey},
+    },
+    registry::{event::WorkerEvent, RemoteWorkerState, WorkerId, WorkerOrigin},
+};
 use tokio::{
     sync::{broadcast, Semaphore},
     time::Instant,
 };
 use tracing::{debug, info, warn};
 
-use crate::{
-    service_discovery::DISCOVERY_ID_LABEL,
-    worker::{
-        endpoint_key,
-        identity::endpoint::Endpoint,
-        registry::{event::WorkerEvent, WorkerId},
-        ConnectionMode, EndpointKey, RemoteWorkerState, Worker, WorkerOrigin, WorkerRegistry,
-    },
-};
+use crate::routers::common::snapshot::WorkerRegistry;
 
 mod preparation;
 
@@ -1084,14 +1084,14 @@ mod tests {
 
     use openai_protocol::{model_card::ModelCard, worker::WorkerStatus};
     use smg_mesh::{gossip::NodeState, MergeStrategy, MeshKV};
+    use smg_worker::identity::basic::WorkerType;
     use tokio::{sync::mpsc::error::TryRecvError, time::sleep};
     use tracing_test::traced_test;
 
     use super::*;
     use crate::{
-        app_context::testing::app_context_for_tests,
-        config::RouterConfig,
-        worker::{BasicWorkerBuilder, WorkerType},
+        app_context::testing::app_context_for_tests, config::RouterConfig,
+        routers::grpc::backend_client::BasicWorkerBuilder,
     };
 
     fn worker_namespace(mesh: &MeshKV) -> Arc<CrdtNamespace> {

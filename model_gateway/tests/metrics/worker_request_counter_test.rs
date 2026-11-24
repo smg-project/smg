@@ -32,11 +32,12 @@ use smg::{
     middleware::TenantRequestMeta,
     observability::metrics_server::start_metrics_server,
     routers::{
-        factory::router_ids, gateway::Gateway, http::router::Router as HttpRouter, RouterTrait,
+        factory::router_ids, gateway::Gateway, grpc::backend_client::BasicWorkerBuilder,
+        http::router::Router as HttpRouter, RouterTrait,
     },
     tenant::TenantKey,
-    worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, Worker, WorkerType},
 };
+use smg_worker::identity::basic::{ConnectionMode, RuntimeType, Worker, WorkerType};
 use tokio::net::TcpListener;
 use tower::ServiceExt;
 

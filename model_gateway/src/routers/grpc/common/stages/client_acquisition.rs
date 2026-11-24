@@ -6,18 +6,16 @@
 use std::sync::Arc;
 
 use axum::response::Response;
+use smg_worker::identity::basic::Worker;
 use tracing::error;
 
-use crate::{
-    routers::{
-        common::overload,
-        error,
-        grpc::{
-            backend_client::{get_backend_client, BackendClient},
-            context::{ClientSelection, WorkerSelection},
-        },
+use crate::routers::{
+    common::overload,
+    error,
+    grpc::{
+        backend_client::{get_backend_client, BackendClient},
+        context::{ClientSelection, WorkerSelection},
     },
-    worker::Worker,
 };
 
 /// Acquire backend clients for the selected workers, with a dispatch-time
@@ -31,6 +29,7 @@ pub(crate) async fn acquire_clients(
 ) -> Result<ClientSelection, Response> {
     match workers {
         WorkerSelection::Single { worker } => {
+            let worker = worker.worker();
             if let Some(shed) = overload::shed_if_worker_overloaded(worker.as_ref(), model_id, shed)
             {
                 return Err(shed);
@@ -50,9 +49,7 @@ pub(crate) async fn acquire_clients(
             // to a worker known to be over the ceiling.
             if let Some(shed) =
                 overload::shed_if_worker_overloaded(prefill.as_ref(), model_id, shed)
-                    .or_else(|| {
-                        overload::shed_if_worker_overloaded(decode.as_ref(), model_id, shed)
-                    })
+                    .or_else(|| overload::shed_if_worker_overloaded(&**decode, model_id, shed))
                     .or_else(|| {
                         encode_assignments.iter().flatten().find_map(|assignment| {
                             overload::shed_if_worker_overloaded(
@@ -66,7 +63,7 @@ pub(crate) async fn acquire_clients(
                 return Err(shed);
             }
             let prefill_client = get_backend_client_from_worker(prefill).await?;
-            let decode_client = get_backend_client_from_worker(decode).await?;
+            let decode_client = get_backend_client_from_worker(decode.worker()).await?;
 
             Ok(ClientSelection::Disaggregated {
                 prefill: prefill_client,

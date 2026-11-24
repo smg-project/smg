@@ -4,7 +4,7 @@
 //!
 //! The store holds what a decision reads and nothing a request path writes:
 //! membership, health, loads, the KV index behind its event cursors,
-//! reservations, session pins and leases. Every path that writes it today
+//! reservations and leases. Every path that writes it today
 //! ends in one of these sinks (the step-3 inventory counted thirteen paths
 //! into six writes), so the drivers that move into the controller (discovery,
 //! the handshake, the prober, the poll, the subscriptions, the relays) and the
@@ -13,11 +13,10 @@
 //! | trait | who calls | how often |
 //! |---|---|---|
 //! | [`WorkersStore`] | discovery and the registration handshake, the control scope's register, patch and deregister calls | per membership change; a rollout of 512 workers is under one change per second |
-//! | [`HealthSink`] | the prober (one probe per worker per interval, 128 in flight), the connect signal, every gateway's vetoes and completed dispatches | per probe; two frames per request |
+//! | [`HealthSink`] | the prober (one probe per worker per interval, 128 in flight), the connect signal, every gateway's vetoes | per probe; per veto a gateway sets or lifts |
 //! | [`LoadSink`] | the subscription task per record, the poll per engine per tick, the scrape per interval, a relay per frame | up to ten records per rank per second busy, one per second idle |
 //! | [`KvEventSink`] | the subscription task per batch, a relay per frame | one batch per scheduler step that moved blocks |
 //! | [`ReservationStore`] | a commit (a prefill slot, a decode room), a lease's end | two per pair dispatch |
-//! | [`SessionsStore`] | a keyed commit, the TTL sweep, a gateway's `Hello` pages | per keyed decision |
 //! | [`LeasesStore`] | every decision, dispatch and completion report, the dispatch-deadline sweep, `Hello` pages | two to three frames per request |
 //!
 //! Rules every implementation keeps:
@@ -49,7 +48,7 @@
 //!   behind [`KvEventSink::Batch`], with the header facts the cursor reads
 //!   beside it. [`MemoryStore`] takes a batch as the events its collector
 //!   decoded ([`KvEvent`]) and applies them to the index of the worker's
-//!   model ([`index`]).
+//!   model (`index`).
 //!
 //! [`MemoryStore`] is the one-process store behind every trait: the
 //! controller's own store once its drivers move in, and the double the
@@ -57,54 +56,58 @@
 //! same traits over the structures it already holds.
 //!
 //! A decision reads none of the tables behind those traits. The store
-//! derives a [`World`] from them (every pool as whole candidate rows) and
-//! publishes it by pointer swap: [`world`] holds the read side and the
-//! build of one decision's view. Every world is published under the
-//! generation the store holds, which [`MemoryStore::apply`] alone replaces:
-//! a decision reads its rows and its engine in one load.
+//! derives a [`StoreSnapshot`] from them (every pool as whole candidate rows)
+//! and publishes it by pointer swap: `snapshot` holds the read side. Every
+//! world is published under the generation the store holds, which
+//! [`MemoryStore::apply`] alone replaces: a decision reads the world and its
+//! engine in one load.
 //!
-//! [`LoadRow`]: crate::view::LoadRow
+//! [`LoadRow`]: crate::engine::view::LoadRow
 
-pub mod encoding;
-pub mod health;
-pub mod index;
-pub mod journal;
-pub mod kv_events;
-pub mod leases;
-pub mod loads;
-pub mod memory;
+pub(crate) mod applied;
+pub(crate) mod encoding;
+pub(crate) mod health;
+pub(crate) mod index;
+pub(crate) mod journal;
+pub(crate) mod kv_events;
+pub(crate) mod leases;
+pub(crate) mod loads;
+pub mod membership;
+pub(crate) mod memory;
 pub mod pairing;
-pub mod reservations;
-pub mod sessions;
-pub mod workers;
-pub mod world;
+pub(crate) mod reservations;
+pub(crate) mod signals;
+pub(crate) mod snapshot;
+pub(crate) mod workers;
 
 #[cfg(test)]
 mod tests;
 
-pub use encoding::{EncodeClasses, EncodeHandoff, EncodeOffer};
-pub use health::{HealthSink, VetoWrite};
+pub use encoding::{hands_to, EncodeClasses, EncodeHandoff, EncodeMember, EncodeOffer};
+pub use health::{HealthSink, HealthWrite, VetoWrite};
 pub use index::{
-    ContentHash, KvEvent, LaneCounts, Named, SequenceHash, StoredBlock, INDEX_WORKERS,
+    ApplyError, ChainBlockMap, ContentHash, KvEvent, LaneCounts, LaneWriter, SequenceHash,
+    StoredBlock, WorkerGroups, INDEX_WORKERS,
 };
-pub use journal::{Journal, Kinds, Position};
+pub use journal::{Journal, Position};
 pub use kv_events::{
-    Admission, BatchFacts, BatchOutcome, KvCursor, KvEventSink, RankCursor, ResyncReason,
-    SnapshotChunk,
+    BatchAdmission, BatchFacts, BatchOutcome, KvCursor, KvEventSink, RankCursor, ResyncReason,
+    SnapshotChunk, GAP_CLEAR_THRESHOLD, RESTART_WINDOW,
 };
-pub use leases::{Dispatch, LeaseRecord, LeaseRefused, LeaseState, LeasesStore, Picked};
-pub use loads::{LoadSample, LoadSink, LoadSource, PollMode};
-pub use memory::{Cut, MemoryStore, StoreCounts};
-pub use pairing::{PairClasses, PairingDescriptor};
+pub use leases::{
+    DecodeMark, DecodeSide, LeaseRecord, LeaseRefused, LeaseState, LeasesStore, PickRecord, Sides,
+};
+pub use loads::{LoadSample, LoadSink, LoadSource, PollMode, Wake};
+#[cfg(feature = "controller")]
+pub(crate) use memory::DecodeIssue;
+pub use memory::{AtWork, Hand, LookOutcome, MemoryStore, StoreCheckpoint, StoreStats};
 pub use reservations::{ReservationKind, ReservationStore};
-pub use sessions::{Pin, SessionsStore};
+pub use signals::{SignalSink, SignalWriteOutcome};
+pub use snapshot::{OutsideLists, StaleGeneration, StoreSnapshot, PUBLISH_WINDOW};
 pub use workers::{
-    identity, identity_of, HealthPolicy, MembershipChange, MembershipTail, Overload, Reachability,
-    Signals, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
-};
-pub use world::{
-    Ask, Built, EncodePairBuffers, Naming, OutsideLists, PairBuffers, PoolView, StaleGeneration,
-    ViewBuffers, World, PUBLISH_WINDOW,
+    identity, identity_of, token, HealthPolicy, MembershipChange, MembershipTail, Overload,
+    ProviderKey, ProviderKeyError, Reachability, Registrant, Signals, WorkerFacts, WorkerPatch,
+    WorkerRow, WorkerStatus, WorkersStore,
 };
 
 /// The verified identity of a gateway: the fingerprint of the subject its

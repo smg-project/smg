@@ -65,40 +65,33 @@ impl ComponentRefs {
         }
     }
 
-    /// The MCP orchestrator, present only on the Responses path.
-    pub fn mcp_orchestrator(&self) -> Option<&Arc<McpOrchestrator>> {
+    /// The components of the Responses path, absent on the shared path.
+    fn responses(&self) -> Option<&ResponsesComponents> {
         match self {
             ComponentRefs::Shared(_) => None,
-            ComponentRefs::Responses(r) => Some(&r.mcp_orchestrator),
+            ComponentRefs::Responses(r) => Some(r),
         }
+    }
+
+    /// The MCP orchestrator, present only on the Responses path.
+    pub fn mcp_orchestrator(&self) -> Option<&Arc<McpOrchestrator>> {
+        self.responses().map(|r| &r.mcp_orchestrator)
     }
 
     pub fn mcp_format_registry(&self) -> Option<&openai_bridge::FormatRegistry> {
-        match self {
-            ComponentRefs::Shared(_) => None,
-            ComponentRefs::Responses(r) => Some(&r.mcp_format_registry),
-        }
+        self.responses().map(|r| &r.mcp_format_registry)
     }
 
     pub fn response_storage(&self) -> Option<&Arc<dyn ResponseStorage>> {
-        match self {
-            ComponentRefs::Shared(_) => None,
-            ComponentRefs::Responses(r) => Some(&r.response_storage),
-        }
+        self.responses().map(|r| &r.response_storage)
     }
 
     pub fn conversation_storage(&self) -> Option<&Arc<dyn ConversationStorage>> {
-        match self {
-            ComponentRefs::Shared(_) => None,
-            ComponentRefs::Responses(r) => Some(&r.conversation_storage),
-        }
+        self.responses().map(|r| &r.conversation_storage)
     }
 
     pub fn conversation_item_storage(&self) -> Option<&Arc<dyn ConversationItemStorage>> {
-        match self {
-            ComponentRefs::Shared(_) => None,
-            ComponentRefs::Responses(r) => Some(&r.conversation_item_storage),
-        }
+        self.responses().map(|r| &r.conversation_item_storage)
     }
 }
 

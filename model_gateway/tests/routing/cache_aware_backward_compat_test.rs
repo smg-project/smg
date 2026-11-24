@@ -3,8 +3,9 @@ use std::{collections::HashMap, sync::Arc};
 use openai_protocol::worker::HealthCheckConfig;
 use smg::{
     policies::{CacheAwareConfig, CacheAwarePolicy, LoadBalancingPolicy, SelectWorkerInfo},
-    worker::{BasicWorkerBuilder, Worker, WorkerType},
+    routers::grpc::backend_client::BasicWorkerBuilder,
 };
+use smg_worker::identity::basic::{Worker, WorkerType};
 
 /// Test helper: health check config that skips health checks.
 /// Workers built with this config start Ready (routable) immediately.

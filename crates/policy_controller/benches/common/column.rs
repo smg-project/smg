@@ -4,7 +4,7 @@
 //! the benches that feed a column: `mod.rs` is compiled into the gated
 //! `decision` binary, whose rows keep to what that binary measures
 //! (`.github/bench-gates/policy-engine.toml`).
-use smg_policy_controller::AffinityFacts;
+use smg_policy_controller::engine::AffinityFacts;
 
 use crate::common::WorkerState;
 

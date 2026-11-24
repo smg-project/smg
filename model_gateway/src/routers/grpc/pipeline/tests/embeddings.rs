@@ -16,14 +16,12 @@ use std::sync::{
 use llm_tokenizer::{traits::Tokenizer, MockTokenizer, TokenizerRegistry};
 use openai_protocol::{classify::ClassifyRequest, embedding::EmbeddingRequest};
 use serde_json::{json, Value};
+use smg_worker::identity::basic::BasicWorker;
 use tokio::sync::watch;
 use vllm_proto::vllm_engine_server::{VllmEngine, VllmEngineServer};
 
 use super::*;
-use crate::{
-    routers::grpc::common::stages::request_execution::MAX_IN_FLIGHT_EMBED_CALLS,
-    worker::BasicWorker,
-};
+use crate::routers::grpc::common::stages::request_execution::MAX_IN_FLIGHT_EMBED_CALLS;
 
 /// The engine's answer to one call: the ids' count and the first id, as two
 /// dimensions a test reads the call back from.

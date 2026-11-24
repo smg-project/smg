@@ -56,12 +56,15 @@ use std::{fs, path::PathBuf, sync::Arc};
 use http::HeaderMap;
 use openai_protocol::worker::WorkerStatus;
 use serde::Serialize;
+use smg_worker::{identity::basic::Worker, test_support::ready_worker};
 
 use super::PolicyRegistry;
 use crate::{
     config::types::PolicyConfig,
-    routers::common::placement::{self, PlacementInputs},
-    worker::{test_support::ready_worker, RoutingPool, Worker, WorkerRegistry},
+    routers::common::{
+        placement::{self, PlacementInputs},
+        snapshot::{RoutingPool, WorkerRegistry},
+    },
 };
 
 const MODEL: &str = "m";
@@ -330,6 +333,7 @@ impl Bed {
             RoutingPool::HttpRegular,
             None,
             inputs,
+            placement::Stated::nothing,
         )
         .expect("the request is placed");
         let place = self

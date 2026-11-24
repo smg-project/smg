@@ -33,6 +33,9 @@
     reason = "a bench's setup has no caller to answer, and the fill's report is its output"
 )]
 
+#[path = "common/filled.rs"]
+mod filled;
+
 use std::{
     fs,
     hint::black_box,
@@ -43,11 +46,11 @@ use std::{
 use criterion::{criterion_group, BatchSize, BenchmarkId, Criterion, Throughput};
 use kv_index::{chain_prefix_hash, ChainBlockMap, ChainIndex};
 use smg_policy_controller::{
+    engine::{Role, WorkerId},
     store::{
         BatchFacts, BatchOutcome, ContentHash, KvEvent, KvEventSink, LaneCounts, MemoryStore,
         SequenceHash, Signals, StoredBlock, WorkerFacts, WorkersStore, INDEX_WORKERS,
     },
-    WorkerId,
 };
 
 const MODEL: &str = "m";
@@ -137,6 +140,8 @@ fn publishers(rows: usize) -> (MemoryStore, Vec<WorkerId>) {
     let ids = (0..rows)
         .map(|row| store.upsert(publisher(row)).id())
         .collect();
+    store.publish_now();
+    filled::filled(&store, MODEL, Role::Single, rows);
     (store, ids)
 }
 
@@ -412,6 +417,7 @@ fn leaves(c: &mut Criterion) {
             b.iter_batched(
                 || {
                     let change = store.upsert(publisher(rows));
+                    store.publish_now();
                     let id = change.id();
                     if filled {
                         assert_eq!(store.admit(id, 0, batch(1), &held), BatchOutcome::Applied);
@@ -423,7 +429,11 @@ fn leaves(c: &mut Criterion) {
                     let revision = WorkersStore::get(&store, id).expect("the row").revision;
                     (id, revision)
                 },
-                |(id, revision)| store.remove(id, revision).expect("removed"),
+                |(id, revision)| {
+                    let removed = store.remove(id, revision).expect("removed");
+                    store.publish_now();
+                    removed
+                },
                 BatchSize::PerIteration,
             );
         });

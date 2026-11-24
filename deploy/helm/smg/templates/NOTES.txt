@@ -10,6 +10,13 @@ Router:
 Policy controller:
   gRPC:     {{ $fullname }}-policy-controller:{{ .Values.policyController.ports.gateway }}
   Metrics:  http://{{ $fullname }}-policy-controller:{{ .Values.policyController.ports.admin }}/metrics
+{{- if include "smg.policyControllerElection" . }}
+{{- if not (include "smg.policyControllerReplicationAsTold" .) }}
+  Standby:  follows no leader and takes over with no worker and no load: policyController.identityAsTold does not name replication (the chart's README, Standby)
+{{- else if include "smg.policyControllerServesTls" . }}
+  Standby:  follows no leader and takes over with no worker and no load: the controller's listeners serve TLS, and a standby's dial has no credential yet (the chart's README, Standby)
+{{- end }}
+{{- end }}
 {{- end }}
 
 {{- if .Values.router.ingress.enabled }}

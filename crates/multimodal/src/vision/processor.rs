@@ -7,7 +7,10 @@ use image::DynamicImage;
 
 use super::transforms::TransformError;
 pub use crate::encoder_inputs::{ModelSpecificValue, PreprocessedEncoderInputs};
-use crate::{encoder_inputs::EncoderDtype, types::RgbFrameRef};
+use crate::{
+    encoder_inputs::EncoderDtype,
+    types::{RgbFrameRef, VideoSamplingInfo},
+};
 
 /// Helper to extract a dimension from encoder_input given an ndim-dependent axis index.
 /// Returns `Err` if the ndim is not 4 or 5.
@@ -28,17 +31,6 @@ fn dim_for_ndim(
 }
 
 impl PreprocessedEncoderInputs {
-    /// Get the number of channels.
-    ///
-    /// For 4D tensors `[B, C, H, W]`, returns `shape[1]`.
-    /// For 5D tensors `[B, N, C, H, W]` (Phi3-Vision), returns `shape[2]`.
-    ///
-    /// # Errors
-    /// Returns `TransformError::InvalidShape` if encoder_input is not 4D or 5D.
-    pub fn channels(&self) -> Result<usize, TransformError> {
-        dim_for_ndim(self.encoder_input.ndim(), 1, 2, self.encoder_input.shape())
-    }
-
     /// Get the height of processed images.
     ///
     /// For 4D tensors `[B, C, H, W]`, returns `shape[2]`.
@@ -223,6 +215,19 @@ pub trait VisionPreProcessor: Send + Sync {
         )))
     }
 
+    /// [`preprocess_video_rgb`](Self::preprocess_video_rgb) for a clip whose
+    /// decoder reported how its frames were sampled from the source, for a
+    /// processor whose outputs carry the frames' source indices or times. The
+    /// default ignores `sampling`.
+    fn preprocess_video_rgb_sampled(
+        &self,
+        frames: &[RgbFrameRef<'_>],
+        clip: &VideoClipOptions,
+        _sampling: Option<&VideoSamplingInfo>,
+    ) -> Result<PreprocessedEncoderInputs, TransformError> {
+        self.preprocess_video_rgb(frames, clip)
+    }
+
     /// Calculate the number of vision tokens for a given image size.
     ///
     /// This is used to determine how many placeholder tokens to insert
@@ -268,7 +273,6 @@ mod tests {
             vec![(640, 480), (800, 600)],
         );
 
-        assert_eq!(inputs.channels().unwrap(), 3);
         assert_eq!(inputs.height().unwrap(), 336);
         assert_eq!(inputs.width().unwrap(), 336);
     }

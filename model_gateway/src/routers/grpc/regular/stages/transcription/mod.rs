@@ -24,9 +24,10 @@ pub(crate) use request_building::TranscriptionRequestBuildingStage;
 pub(crate) use response_processing::TranscriptionResponseProcessingStage;
 use serde_json::json;
 
-use crate::{
-    routers::{common::json_response, error, grpc::spec::TranscriptionResponseFormat},
-    worker::WorkerRegistry,
+use crate::routers::{
+    common::{json_response, snapshot::WorkerRegistry},
+    error,
+    grpc::spec::TranscriptionResponseFormat,
 };
 
 /// Label keys that carry model identity. Family detection through worker
@@ -128,9 +129,11 @@ mod tests {
 
     use axum::http::StatusCode;
     use bytes::Bytes;
+    use openai_protocol::model_card::ModelCard;
+    use smg_worker::identity::basic::Worker;
 
     use super::*;
-    use crate::worker::{BasicWorkerBuilder, ModelCard, Worker};
+    use crate::routers::grpc::backend_client::BasicWorkerBuilder;
 
     fn audio(file_name: &str, content_type: Option<&str>) -> AudioFile {
         AudioFile {
