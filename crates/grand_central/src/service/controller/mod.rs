@@ -787,9 +787,9 @@ impl Controller {
     /// replica leads ([`Self::readiness`]). No call asks the term itself:
     /// the holder's doc says what a write on a replica that follows comes
     /// to ("A host's write calls"). A row written through the entries of
-    /// [`Self::store`] itself has no worker object until the holder next
-    /// reads the store, at its next call that writes a row or its next
-    /// first copy.
+    /// [`Self::store`] itself has no worker object, and no first copy holds
+    /// it, until its host has the holder follow the store
+    /// ([`Objects::follow`]) or a registration under its key is refused.
     pub fn workers(&self) -> Arc<Objects<Members>> {
         self.workers.holder()
     }

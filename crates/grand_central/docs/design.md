@@ -2429,8 +2429,9 @@ A fact leaves the remainder when the worker object gets a field that holds it as
    keeper's turn, the last part of step 2. Since step 3 a status is the object's
    word: a drain and a connect signal write the object and tell the table, a key's next life
    starts in the status its worker object stood in, and a call's answer waits on no follow. A
-   change the store took and the registry did not get is laid at the head of the keeper's
-   next turn, where it reads the store. A change that moves a fact the object holds builds the object again: the
+   change the store took and the registry did not get is laid where the store next refuses a
+   write of the record: the keeper reads the store again before it answers. A record with no
+   object at all is reached so by a registration under its key alone. A change that moves a fact the object holds builds the object again: the
    new object takes the standing one's place under its id, with its running state, as the code
    that keeps the objects does today for a record that changed.
 2. A standby applies the leader's events to its own worker objects **[built]**. A call reads the
@@ -2448,7 +2449,11 @@ A fact leaves the remainder when the worker object gets a field that holds it as
    **[built]**: the calls a record is written by are public, a host of the worker objects
    writes through them, and a served controller hands the code that keeps its objects. A
    record written through the store's own entries gets its object where that code next reads
-   the store, and no task lays it.
+   the store, and no task lays it. No turn that takes the controller's own store starts with
+   a read of its table **[built]**: a write call decides over the object that stands, a call's read
+   and a first copy read the objects, and a standby's applier lays its leader's event. A
+   host's follow and its call that lays a kept credential again still read the store they are
+   handed.
 
 **One rule for a registration's write [built].** What a registration makes of the record under
 its address is one function beside the other membership rules (`WorkerFacts::laid_over`,
@@ -2471,7 +2476,7 @@ part of step 2.
 **A call reads the worker objects [built].** A registration call reads the record that stands
 before it writes: the record under an address, the record under an id, and an engine's records.
 It reads them back from the worker objects (the second part of step 2), in the turn of the code
-that keeps them and behind that code's read of the store to its end. So a call's test and the
+that keeps them. So a call's test and the
 write behind it read the record from one copy, and a call that waited behind another writer reads what that
 writer left. A record read this way carries the status its worker object states (step 3).
 An engine's records are found by the list of ranks kept beside the objects,
@@ -2483,14 +2488,15 @@ is restored from and what an operator reads are cut from the worker objects and 
 remainders (the last part of step 2), in the turn of the code that keeps them. Every writer
 of a record's facts holds that turn from its decision to the log's telling. The store's own
 entries for a registration, a patch and a removal take no such turn: no product code calls
-them, and they end with step 4. A copy reads the log's place, the store's epoch and its
-history in one hold, and the code that keeps the objects reads the store again where the
-epoch or the history moved since its own read ended: every write of a record moves the one,
-a restore the other. So a copy holds
-each record the log told at the copy's place, and none it did not, beside any writer. A copy's statuses are the
+them, and they end with step 4. A copy reads the log's place and the store's epoch in one
+hold, and no record of the table. So a copy holds
+each record the log told at the copy's place, and none it did not, beside every writer that holds the turn. A
+record the store took and the registry did not get is in no copy until it is laid (step 1):
+one written through the store's own entries, once its host has had that code follow the
+store. A copy's statuses are the
 ones the log last told at its place, and not the objects': an object can stand one tell
 ahead of the log. The store keeps what the log last told of each record's status, beside its
-epoch and its tail. A copy reads the log's place, the epoch, the history and those statuses in one hold
+epoch and its tail. A copy reads the log's place, the epoch and those statuses in one hold
 of the membership lock, which it holds for one status a record and for no record. A copy
 takes no object's lock. Three writes move the log's place outside the keeper's turn, and a
 copy stays whole beside each: a status tell changes no fact, and a generation's apply and a

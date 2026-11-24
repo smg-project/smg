@@ -1314,7 +1314,10 @@ mod tests {
         let Ok(TickOutcome::Acquired { term }) = elector.tick(at) else {
             panic!("a free lease is taken at the first tick");
         };
+        // The cases write the leader's rows through its store's own
+        // entries: the holder its cut is taken from follows the store.
         let cut_from = holder(store);
+        cut_from.follow(&**store);
         let cut = Replication::new(
             Arc::clone(store),
             Arc::clone(log),

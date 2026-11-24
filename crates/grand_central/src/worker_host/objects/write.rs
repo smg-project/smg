@@ -3,12 +3,14 @@
 //!
 //! A door hands the holder the write it would have asked of the store's
 //! table: a registration's facts, a patch, or a removal. The holder takes
-//! its turn, reads the store to its end, and decides over the row read back
+//! its turn and decides over the row read back
 //! from the object that stands ([`Objects::row_of`]), by the rule every
 //! writer of a row decides by. It builds the object of the row the change
 //! leaves, tells the store the decided change
 //! ([`MemoryStore::follow_objects`]), and puts the object in the registry.
 //! So the object stands when the write returns, with no follow.
+//! No row of the store's table is read at the head of a write: every
+//! writer of a row holds the turn, so the object states the row.
 //!
 //! The store is told between the build and the registry's write: its write
 //! files the member's count slot, which a lease books the moment a decision
@@ -21,11 +23,12 @@
 //! lock, by the revision the holder read: a door and a standby's applier
 //! write in the holder's turn, and a caller of the store's own writes
 //! takes none.
-//! The holder then reads the store to its end again before it answers, so
+//! The holder then reads the store to its end before it answers, so
 //! the registry holds what that writer left. A removal has taken its
 //! object out by then, and the row that writer left gets an object anew.
 //! A change the store took and the registry did not get, because the
-//! writer's thread ended between the two, is laid by the next follow: it
+//! writer's thread ended between the two, is laid by that read where the
+//! store refuses the key's next registration, or by a host's follow: it
 //! settles each row the store's tail names against the object that stands
 //! for it.
 //!
@@ -74,7 +77,6 @@ impl<G: Generation> Objects<G> {
         maker: Registrant,
     ) -> Option<MembershipChange> {
         let mut place = self.read_to.lock();
-        self.follow_from(store, &mut place);
         let standing = self.row_under(&facts.key);
         let seen = standing.as_ref().map(|row| row.revision);
         let (change, row) = facts.laid_over(standing.as_ref(), maker, Instant::now());
@@ -94,7 +96,6 @@ impl<G: Generation> Objects<G> {
         revision: u64,
     ) -> Option<MembershipChange> {
         let mut place = self.read_to.lock();
-        self.follow_from(store, &mut place);
         let mut row = self.guarded(id, revision)?;
         patch.laid_on(&mut row.facts);
         row.revision += 1;
@@ -115,7 +116,6 @@ impl<G: Generation> Objects<G> {
         revision: u64,
     ) -> Option<MembershipChange> {
         let mut place = self.read_to.lock();
-        self.follow_from(store, &mut place);
         self.guarded(id, revision)?;
         self.take_decided(store, &mut place, id, revision)
     }
@@ -127,8 +127,8 @@ impl<G: Generation> Objects<G> {
         (row.revision == revision).then_some(row)
     }
 
-    /// The decided `change` and the `row` it leaves, over a row read at
-    /// the revision `seen` by the read that ended at `place`: the row's
+    /// The decided `change` and the `row` it leaves, over a row read back
+    /// at the revision `seen` in the turn that holds `place`: the row's
     /// object is built, the store is told, and the object is put in the
     /// registry. A change the store does not take builds an object nobody
     /// sees ([`Self::moved`]).
@@ -157,8 +157,8 @@ impl<G: Generation> Objects<G> {
         Some(change)
     }
 
-    /// The decided removal of the row `id`, read at `revision` by the read
-    /// that ended at `place`: its object leaves the registry, then the
+    /// The decided removal of the row `id`, read back at `revision` in the
+    /// turn that holds `place`: its object leaves the registry, then the
     /// store is told. Where the store does not take it, the row that stands
     /// gets an object anew ([`Self::moved`]): a new object under a new id
     /// in the registry. The leases the store counts on the row are stated
@@ -178,9 +178,11 @@ impl<G: Generation> Objects<G> {
         Some(change)
     }
 
-    /// The store did not take a write: another writer moved the row since
-    /// the read that ended at `place`. The store is read to its end again,
-    /// so the registry holds what that writer left when the write answers.
+    /// The store did not take a write: a writer that took no turn moved
+    /// the row, or the registry never got a change the store took. The
+    /// store is read to its end from `place`, where the holder's last read
+    /// of it ended, so the registry holds what stands there when the write
+    /// answers. No other read of the store's rows is left in a write.
     fn moved(&self, store: &MemoryStore, place: &mut Place) -> Option<MembershipChange> {
         self.follow_from(store, place);
         None
@@ -280,7 +282,7 @@ pub(super) mod tests {
 
         /// The row under `url` where the journal's last word, the table and
         /// the object agree on it, each fact and the status. No follow is
-        /// run: the holder's place stands one change behind the store.
+        /// run: the holder's place stands behind the store.
         pub(crate) fn one_row(&self, url: &str) -> WorkerRow {
             let (_, told, _) = self.last();
             let table = self.store.by_key(url).expect("the table holds the row");
@@ -288,8 +290,8 @@ pub(super) mod tests {
             let read = self.objects.row_of(&object).expect("the object's row");
             assert_eq!(told.as_ref(), Some(&table), "the journal against the table");
             assert_eq!(read, table, "the object against the table");
-            let behind = self.store.epoch().checked_sub(1);
-            assert_eq!(self.objects.read_to(), behind, "no follow laid it");
+            let end = Some(self.store.epoch());
+            assert_ne!(self.objects.read_to(), end, "no follow laid it");
             table
         }
     }
@@ -497,6 +499,85 @@ pub(super) mod tests {
         assert!(replica.object(A).is_some(), "the store alone was told");
         objects.follow(store);
         assert_eq!(replica.object(A), None);
+    }
+
+    /// No write call moves the holder's place, so a read of the store's
+    /// tail reads the holder's own writes too. A row the holder removed and
+    /// registered again under its incarnation stands under its old id, and
+    /// the read keeps that life's object: it was built from the row that
+    /// stands. So it is where a key took another incarnation and then the
+    /// first one again. A row that left and came back by the store's own
+    /// entries, with the facts it had, is another life admitted at another
+    /// time: its object is built anew, as before.
+    #[test]
+    fn a_read_of_the_tail_keeps_the_object_of_a_row_the_holder_laid_again() {
+        let replica = Replica::new();
+        let (store, objects) = (&replica.store, &replica.objects);
+        // The place stands at the empty store's end: the next read is the
+        // tail, with each change the holder writes from here.
+        objects.follow(store);
+        let id = replica.upsert(facts(1, "gold")).expect("registered").id();
+        assert!(objects.remove(store, id, 1).is_some(), "the row left");
+        let again = replica.upsert(facts(1, "gold"));
+        assert_eq!(again, Some(MembershipChange::Registered { id }));
+        let object = replica.object(A);
+        assert!(object.is_some(), "the next life's object");
+        assert_eq!(objects.read_to(), Some(0), "no write moved the place");
+        objects.follow(store);
+        assert_eq!(replica.object(A), object, "behind its own removal");
+        // Another incarnation, then the first one again: its old id.
+        replica.upsert(facts(2, "gold")).expect("the next life");
+        let back = replica.upsert(facts(1, "gold"));
+        let replaced = MembershipChange::Replaced {
+            old: identity(A, 2),
+            new: id,
+        };
+        assert_eq!(back, Some(replaced));
+        let object = replica.object(A);
+        objects.follow(store);
+        assert_eq!(replica.object(A), object, "behind its own replacement");
+        assert_eq!(objects.len(), 1);
+        let read = object.as_ref().and_then(|object| objects.row_of(object));
+        assert_eq!(read, store.by_key(A), "the object against the table");
+        // Around the holder: the same facts, the same id, the first
+        // revision again, and another time of admission.
+        assert!(store.remove(id, 1).is_some(), "the store's own removal");
+        let around = store.upsert_by(facts(1, "gold"), Registrant::Control);
+        assert_eq!(around, MembershipChange::Registered { id });
+        objects.follow(store);
+        assert!(replica.object(A).is_some(), "the row's object");
+        assert_ne!(replica.object(A), object, "another life, built anew");
+    }
+
+    /// A change the store took and the registry did not get is laid where
+    /// the store next refuses a write of the row. A patch and a removal by
+    /// the row's id find no object to guard them: each answers `None`,
+    /// reads nothing and lays nothing. A registration under its key is
+    /// decided over no object: the store refuses it, the object stands when
+    /// it answers `None`, and the same call again is decided over it.
+    #[test]
+    fn a_row_with_no_object_is_laid_where_its_registration_is_refused() {
+        let replica = Replica::new();
+        let (store, objects) = (&replica.store, &replica.objects);
+        let now = Instant::now();
+        let (change, row) = facts(1, "gold").laid_over(None, Registrant::Control, now);
+        assert!(store.follow_objects(change, Some(row.clone()), None));
+        let id = change.id();
+        let patch = WorkerPatch {
+            priority: Some(7),
+            ..WorkerPatch::default()
+        };
+        assert_eq!(objects.patch(store, id, patch, 1), None);
+        assert_eq!(objects.remove(store, id, 1), None);
+        assert_eq!(replica.object(A), None, "neither read the store");
+        let told = replica.told.0.lock().len();
+        assert_eq!(replica.upsert(facts(1, "iron")), None, "refused once");
+        let object = replica.object(A).expect("the refusal's read laid it");
+        assert_eq!(objects.row_of(&object), Some(row));
+        assert_eq!(replica.told.0.lock().len(), told, "nothing told");
+        let again = replica.upsert(facts(1, "iron"));
+        assert_eq!(again, Some(MembershipChange::Relabelled { id }));
+        assert_eq!(replica.one_row(A).facts, facts(1, "iron"));
     }
 
     /// A write decided over a row another writer moved since is refused

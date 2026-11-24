@@ -367,9 +367,11 @@ mod tests {
     }
 
     /// The rows a lone call reads of `store`, as the service reads them:
-    /// off the worker objects, whose holder follows the store first.
+    /// off the worker objects. The case's rows are written through the
+    /// store's own entries, so its holder follows the store first.
     fn lone(store: &MemoryStore, models: &[String], limit: usize) -> (Vec<WorkerRow>, usize) {
         let objects: Objects<Members> = Objects::new(Arc::default());
+        objects.follow(store);
         objects.rows_serving(store, models, limit)
     }
 

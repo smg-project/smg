@@ -1562,8 +1562,6 @@ pub(crate) struct Told {
     pub(crate) at: Position,
     /// The membership epoch.
     pub(crate) epoch: u64,
-    /// The history the epoch stands in ([`WorkersStore::history`]).
-    pub(crate) history: u64,
     statuses: FxHashMap<WorkerId, WorkerStatus>,
 }
 
@@ -1579,13 +1577,11 @@ impl Told {
 #[cfg(feature = "worker-host")]
 impl MemoryStore {
     /// The told status of every row: what the journal last told of its
-    /// id, with the journal's place, the membership epoch and the history
-    /// the epoch stands in, all read in one hold of the membership lock.
+    /// id, with the journal's place and the membership epoch,
+    /// all read in one hold of the membership lock.
     /// A status write holds that lock from its apply to its telling, so
     /// no status stands half told here. The hold copies a place and one
-    /// status a row, and no row. The epoch and the history say whether
-    /// the store moved since a reader's own read of its rows: the holder
-    /// of the worker objects reads the store again where it did.
+    /// status a row, and no row.
     ///
     /// The told status is the log's own word, kept beside the epoch and
     /// the tail: no copy of what a decision reads. A decision reads a
@@ -1620,7 +1616,6 @@ impl MemoryStore {
         Told {
             at,
             epoch: workers.epoch,
-            history: workers.history,
             statuses,
         }
     }

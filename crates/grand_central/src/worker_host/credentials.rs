@@ -53,12 +53,12 @@ use crate::{engine::view::WorkerId, store::WorkerFacts};
 /// what stood, and each returns `true` where an object may hold a
 /// credential that is not its row's any more.
 ///
-/// The holder forgets by itself. Each of its reads drops the rows that
-/// left from the keeper, and an entry goes with its last row. The holder
-/// reads the keeper's clock ahead of the store: a row bound behind that
-/// read may have been written behind it, and stays. Once the clock is
-/// past the last forgetting, the next read forgets again whatever it
-/// finds: an answer may bind a row that left before it. A forgetting
+/// The holder forgets by itself. Each of its reads of the store drops the
+/// rows that left from the keeper, and an entry goes with its last row.
+/// The holder reads the keeper's clock ahead of the store: a row bound
+/// behind that read may have been written behind it, and stays. Once the
+/// clock is past the last forgetting, the next read forgets again whatever
+/// it finds: an answer may bind a row that left before it. A forgetting
 /// that misses a row leaves a binding no later worker matches.
 ///
 /// The address is the one the row's object dials. The keeper works it out

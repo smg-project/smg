@@ -191,6 +191,8 @@ impl Held {
 /// again by the time the change is read: a row registered again under the
 /// same key and incarnation is another life under the same id, and starts
 /// at the same revision. Its object is dropped and a new one is built.
+/// One object stays: the one built from the very row that stands under the
+/// id now, which the holder laid itself behind its own removal.
 ///
 /// A store that took another store's rows whole holds another history: a
 /// row may stand there under the id and the revision an object was built
@@ -207,11 +209,11 @@ impl Held {
 /// which carries the standing object's running state over. An entry's
 /// revision never moves under an object that stands.
 ///
-/// With a keeper ([`Self::with_credentials`]), each read has the keeper
-/// forget the rows that left, whoever wrote the removal, and an entry goes
-/// with its last row. The keeper's clock is read ahead of the store: a row
-/// bound behind that read stays, and the next read forgets it whatever it
-/// finds.
+/// With a keeper ([`Self::with_credentials`]), each read of the store has
+/// the keeper forget the rows that left, whoever wrote the removal, and an
+/// entry goes with its last row. The keeper's clock is read ahead of the
+/// store: a row bound behind that read stays, and the next read forgets it
+/// whatever it finds.
 ///
 /// The holder is the registry's one writer: an object any other writer left
 /// under a row's URL is replaced by the row's.
@@ -226,9 +228,8 @@ impl Held {
 /// membership lock. A generation's apply and a term's start change no row.
 /// A caller of the store's own registration, patch or removal takes no
 /// turn either: no product code calls those, and they go with the store's
-/// table. A copy's told read carries the store's epoch and history, and
-/// the holder reads the store again where either moved since its own
-/// read, so a copy holds such a write too.
+/// table. A row written so has no object, and no copy holds it, until its
+/// host calls [`Self::follow`].
 ///
 /// A row takes the place of its own object alone: an object another row
 /// holds under its URL is dropped first.
@@ -665,6 +666,8 @@ impl<G: Generation> Objects<G> {
     /// once more and one that came and went builds nothing. A change that
     /// says a row left ends its object first, so a row that left and came
     /// back under its id is built anew.
+    /// An object built from the very row that stands is kept: the holder's
+    /// own removal is read here behind its own registration of the id.
     ///
     /// Calls to `follow` run one at a time. A status mirror reads the row
     /// and writes the object under the object's mutation lock.
@@ -742,21 +745,37 @@ impl<G: Generation> Objects<G> {
             MembershipChange::StatusChanged { id, .. } => self.follow_status(store, id),
             // The old incarnation first: its object leaves the URL the new
             // one's is built under. It leaves whatever stands under its id
-            // now: an incarnation a key takes again is another life.
+            // now: an incarnation a key takes again is another life. An
+            // object built from the row that stands now is that life's,
+            // and stays (`end_left`).
             MembershipChange::Replaced { old, new } => {
-                self.end(old);
+                self.end_left(store, old);
                 self.settle(store, old);
                 self.settle(store, new);
             }
             // The row left, so its object does, even where its id stands
             // again: that row is another life, at the first revision too.
+            // An object built from the row that stands now is that life's,
+            // and stays (`end_left`).
             MembershipChange::Removed { id } => {
-                self.end(id);
+                self.end_left(store, id);
                 self.settle(store, id);
             }
             MembershipChange::Registered { id }
             | MembershipChange::Relabelled { id }
             | MembershipChange::Resized { id } => self.settle(store, id),
+        }
+    }
+
+    /// End the object of the row `id`, which the tail says left. An object
+    /// built from the very row that stands under the id now stays: it is
+    /// that next life's already. The holder reads its own writes in the
+    /// tail, since no write call moves its place: a removal it wrote, and
+    /// behind it its own registration of the id.
+    fn end_left<S: WorkersStore + ?Sized>(&self, store: &S, id: WorkerId) {
+        let next_life = |row: WorkerRow| self.stands(&row) && !self.remade(&row);
+        if !store.get(id).is_some_and(next_life) {
+            self.end(id);
         }
     }
 
