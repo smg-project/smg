@@ -8154,7 +8154,7 @@ dependencies = [
  "wat",
  "wfaas",
  "wit-component",
- "wit-parser",
+ "wit-parser 0.263.0",
 ]
 
 [[package]]
@@ -10241,7 +10241,7 @@ dependencies = [
  "wasmtime-internal-versioned-export-macros",
  "wat",
  "windows-sys 0.61.2",
- "wit-parser",
+ "wit-parser 0.258.3",
 ]
 
 [[package]]
@@ -10287,7 +10287,7 @@ dependencies = [
  "syn 2.0.119",
  "wasmtime-internal-component-util",
  "wasmtime-internal-wit-bindgen",
- "wit-parser",
+ "wit-parser 0.258.3",
 ]
 
 [[package]]
@@ -10405,7 +10405,7 @@ dependencies = [
  "heck",
  "indexmap 2.14.2",
  "wit-component",
- "wit-parser",
+ "wit-parser 0.258.3",
 ]
 
 [[package]]
@@ -10951,7 +10951,7 @@ dependencies = [
  "wasm-encoder 0.258.3",
  "wasm-metadata",
  "wasmparser 0.258.3",
- "wit-parser",
+ "wit-parser 0.258.3",
 ]
 
 [[package]]
@@ -10971,6 +10971,22 @@ dependencies = [
  "serde_json",
  "unicode-ident",
  "wasmparser 0.258.3",
+]
+
+[[package]]
+name = "wit-parser"
+version = "0.263.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "874d6ce9db4261cb66980ab14f3da066b24292497b6f46f988c0d1b9b27913f3"
+dependencies = [
+ "anyhow",
+ "hashbrown 0.17.1",
+ "id-arena",
+ "indexmap 2.14.2",
+ "log",
+ "semver",
+ "unicode-ident",
+ "wasmparser 0.263.0",
 ]
 
 [[package]]

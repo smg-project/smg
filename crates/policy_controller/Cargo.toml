@@ -269,7 +269,7 @@ serde_yaml = { workspace = true }
 # is generated and nothing at run time reads the files.
 prost-build = { version = "0.14.4", default-features = false }
 prost-types = { workspace = true }
-wit-parser = { version = "0.258.3", default-features = false, features = ["std"] }
+wit-parser = { version = "0.263.0", default-features = false, features = ["std"] }
 # The lease-file tests and bench write under a directory of their own.
 tempfile = "3"
 # The gRPC plugin's tests and bench serve a plugin of their own over a
