@@ -20,6 +20,11 @@
 //!   without elevating the payload to a system/developer instruction. Non-
 //!   plaintext parts (such as `encrypted_content`) are rejected explicitly with
 //!   HTTP 400 rather than silently dropped.
+//! - `tool_search_output`: validates and lifts discovered tools into top-level
+//!   `tools`. The corresponding hosted search records (`tool_search_call` and
+//!   `web_search_call`) are omitted on local backends.
+//! - `function_call_output` without a call ID becomes a user message carrying
+//!   the tool name, namespace, and output. Reasoning items missing an ID get one.
 //!
 //! External OpenAI-compatible cloud providers bypass this lowering so the
 //! original wire items pass through untouched.
@@ -28,9 +33,9 @@ use axum::response::Response;
 use openai_protocol::{
     common::ToolReference,
     responses::{
-        generate_id, AgentMessageContentPart, NamespaceTool, ResponseContentPart, ResponseInput,
-        ResponseInputOutputItem, ResponseTool, ResponsesRequest, ResponsesToolChoice,
-        StringOrContentParts,
+        generate_id, validate_response_tools_at, AgentMessageContentPart, NamespaceTool,
+        ResponseContentPart, ResponseInput, ResponseInputOutputItem, ResponseTool,
+        ResponsesRequest, ResponsesToolChoice, StringOrContentParts,
     },
 };
 
@@ -129,9 +134,8 @@ pub(crate) fn format_agent_message_text(
     Ok(out)
 }
 
-/// Lower Codex-specific Responses input items (`additional_tools`,
-/// `agent_message`, and `reasoning` items missing an `id`) into standard forms
-/// understood by local HTTP/PD/gRPC inference backends.
+/// Lower inline and discovered tool declarations, agent messages, unpaired
+/// function outputs, reasoning items, and hosted search records for local backends.
 ///
 /// Requests that need no lowering return immediately without allocating.
 pub(crate) fn lower_responses_request_for_local_backend(
@@ -216,16 +220,32 @@ pub(crate) fn lower_responses_request_for_local_backend(
         }
     };
 
-    for item in original_items {
+    for (item_idx, item) in original_items.into_iter().enumerate() {
         match item {
             ResponseInputOutputItem::AdditionalTools { tools, .. } => {
                 lift_tools(tools);
             }
             ResponseInputOutputItem::ToolSearchOutput { tools, .. } => {
+                let prefix = format!("input[{item_idx}].tools");
                 let parsed: Vec<ResponseTool> = tools
                     .into_iter()
-                    .filter_map(|val| serde_json::from_value::<ResponseTool>(val).ok())
-                    .collect();
+                    .enumerate()
+                    .map(|(tool_idx, value)| {
+                        serde_json::from_value(value).map_err(|err| {
+                            error::bad_request(
+                                "invalid_tool",
+                                format!("Invalid '{prefix}[{tool_idx}]': {err}"),
+                            )
+                        })
+                    })
+                    .collect::<Result<_, _>>()?;
+                validate_response_tools_at(&parsed, &prefix).map_err(|err| {
+                    error::bad_request(
+                        err.code,
+                        err.message
+                            .unwrap_or_else(|| format!("Invalid '{prefix}'").into()),
+                    )
+                })?;
                 lift_tools(parsed);
             }
             ResponseInputOutputItem::ToolSearchCall { .. }
@@ -290,7 +310,7 @@ pub(crate) fn lower_responses_request_for_local_backend(
     if lowered_items.is_empty() {
         return Err(error::bad_request(
             "input_items_empty",
-            "Input must contain at least one message or item beyond additional_tools",
+            "Input must contain at least one item beyond tool declarations and hosted search records",
         ));
     }
 
@@ -922,6 +942,7 @@ mod tests {
     fn lowers_tool_search_and_web_search_items_for_local_backends() {
         let mut req = parse_request(json!({
             "model": "test-model",
+            "tools": [],
             "input": [
                 {"role": "user", "content": "check weather"},
                 {
@@ -949,6 +970,33 @@ mod tests {
             ]
         }));
 
+        let mut explicit = req.clone();
+        explicit.tool_choice = Some(ResponsesToolChoice::Options(ToolChoiceOptions::None));
+        explicit.normalize();
+        lower_responses_request_for_local_backend(&mut explicit).unwrap();
+        assert!(matches!(
+            explicit.tool_choice,
+            Some(ResponsesToolChoice::Options(ToolChoiceOptions::None))
+        ));
+
+        let mut named = req.clone();
+        named.tool_choice = Some(
+            serde_json::from_value(json!({
+                "type": "function",
+                "name": "get_weather"
+            }))
+            .unwrap(),
+        );
+        named
+            .validate()
+            .expect("a discovered function can be selected by name");
+
+        req.validate().unwrap();
+        req.normalize();
+        assert!(matches!(
+            req.tool_choice,
+            Some(ResponsesToolChoice::Options(ToolChoiceOptions::Auto))
+        ));
         lower_responses_request_for_local_backend(&mut req)
             .expect("tool_search and web_search_call should lower cleanly");
 
@@ -959,5 +1007,39 @@ mod tests {
         let items = wire["input"].as_array().unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0]["role"], "user");
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_discovered_tools_with_their_input_path() {
+        for (tool, code) in [
+            (json!({"type": "function"}), "invalid_tool"),
+            (
+                json!({"type": "function", "name": "lookup", "parameters": []}),
+                "invalid_type",
+            ),
+            (json!({"type": "local_shell"}), "tool_not_supported"),
+        ] {
+            let mut req = parse_request(json!({
+                "model": "test-model",
+                "input": [
+                    {"role": "user", "content": "hi"},
+                    {"type": "tool_search_output", "tools": [
+                        {"type": "function", "name": "valid", "parameters": {}},
+                        tool
+                    ]}
+                ]
+            }));
+            let response = lower_responses_request_for_local_backend(&mut req).unwrap_err();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let bytes = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            let payload: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(payload["error"]["code"], code);
+            assert!(payload["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("input[1].tools[1]"));
+        }
     }
 }

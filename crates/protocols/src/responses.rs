@@ -1,7 +1,10 @@
 // OpenAI Responses API types
 // https://platform.openai.com/docs/api-reference/responses
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    borrow::Cow,
+    collections::{HashMap, HashSet},
+};
 
 use serde::{
     de::value::{MapAccessDeserializer, MapDeserializer},
@@ -481,6 +484,22 @@ pub enum ResponseTool {
 }
 
 impl ResponseTool {
+    /// Whether the tool itself permits direct calls. Check namespace members separately.
+    pub fn allows_direct_calls(&self) -> bool {
+        let callers = match self {
+            Self::Function(tool) => return tool.allows_direct_calls(),
+            Self::Custom(tool) => return tool.allows_direct_calls(),
+            Self::Mcp(tool) => &tool.allowed_callers,
+            Self::CodeInterpreter(tool) => &tool.allowed_callers,
+            Self::Shell(tool) => &tool.allowed_callers,
+            Self::ApplyPatch(tool) => &tool.allowed_callers,
+            _ => return true,
+        };
+        callers
+            .as_ref()
+            .is_none_or(|callers| callers.iter().any(|caller| caller == "direct"))
+    }
+
     /// Wire `type` tag for this variant — matches the variant's
     /// `#[serde(rename = ...)]` attribute. Stable across serde
     /// roundtrips and safe to use as a discriminator string.
@@ -2392,6 +2411,8 @@ pub enum ResponseInputOutputItem {
         status: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         action: Option<Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        results: Option<Vec<WebSearchResult>>,
     },
     /// `type: "program"` — Programmatic Tool Calling program item.
     #[serde(rename = "program")]
@@ -3012,6 +3033,8 @@ enum TaggedItem {
         status: Option<String>,
         #[serde(default)]
         action: Option<Value>,
+        #[serde(default)]
+        results: Option<Vec<WebSearchResult>>,
     },
     #[serde(rename = "program")]
     Program {
@@ -4573,9 +4596,7 @@ impl Default for ResponsesRequest {
 
 impl Normalizable for ResponsesRequest {
     /// Normalize the request by applying defaults:
-    /// 1. Apply tool_choice defaults based on tools presence (including inline
-    ///    `additional_tools` declarations so an empty top-level `tools: []`
-    ///    does not silently default to `"none"` and disable inline tools)
+    /// 1. Apply tool_choice defaults based on top-level, inline, and discovered tools
     /// 2. Apply parallel_tool_calls defaults
     /// 3. Apply store field defaults
     fn normalize(&mut self) {
@@ -4593,8 +4614,6 @@ impl Normalizable for ResponsesRequest {
                 // open until the backend has loaded the preceding turn.
                 self.tool_choice = Some(ResponsesToolChoice::Options(ToolChoiceOptions::None));
             }
-            // If neither top-level `tools` nor inline `additional_tools` is
-            // present, leave tool_choice as None.
         }
 
         // 2. Apply default for parallel_tool_calls if tools are present
@@ -4733,23 +4752,34 @@ pub fn validate_conversation_id(conv: &ConversationRef) -> Result<(), Validation
     Ok(())
 }
 
-/// Iterate over every tool declared on the request: top-level `tools` first,
-/// followed by tools declared inline via `additional_tools` items in `input`.
-fn all_declared_tools(request: &ResponsesRequest) -> impl Iterator<Item = (&ResponseTool, bool)> {
+/// Iterate over top-level, inline, and discovered tool declarations.
+fn all_declared_tools(
+    request: &ResponsesRequest,
+) -> impl Iterator<Item = (Cow<'_, ResponseTool>, bool)> {
     let top_level = request
         .tools
         .as_deref()
         .unwrap_or_default()
         .iter()
-        .map(|tool| (tool, false));
+        .map(|tool| (Cow::Borrowed(tool), false));
     let inline = match &request.input {
         ResponseInput::Items(items) => items.as_slice(),
         ResponseInput::Text(_) => &[],
     }
     .iter()
-    .flat_map(|item| match item {
-        ResponseInputOutputItem::AdditionalTools { tools, .. } => tools.as_slice(),
-        _ => &[],
+    .flat_map(|item| {
+        let (tools, discovered) = match item {
+            ResponseInputOutputItem::AdditionalTools { tools, .. } => (tools.as_slice(), &[][..]),
+            ResponseInputOutputItem::ToolSearchOutput { tools, .. } => (&[][..], tools.as_slice()),
+            _ => (&[][..], &[][..]),
+        };
+        tools.iter().map(Cow::Borrowed).chain(
+            // The wire item is kept raw for upstream passthrough. Local lowering
+            // reports malformed declarations using their input and tool indices.
+            discovered
+                .iter()
+                .filter_map(|value| ResponseTool::deserialize(value).ok().map(Cow::Owned)),
+        )
     })
     .map(|tool| (tool, true));
     top_level.chain(inline)
@@ -4761,46 +4791,29 @@ fn validate_tool_choice_with_tools(request: &ResponsesRequest) -> Result<(), Val
         return Ok(());
     };
 
-    let has_tools = all_declared_tools(request).next().is_some();
     // `none` and `auto` name no tool, so they stand without tools (with nothing
     // to call, `auto` answers in text as an omitted `tool_choice` does); Codex
     // sends `tools: []` with `tool_choice: "auto"` when it compacts a
     // conversation.
-    let is_some_choice = !matches!(
+    if matches!(
         tool_choice,
         ResponsesToolChoice::Options(ToolChoiceOptions::None | ToolChoiceOptions::Auto)
-    );
+    ) {
+        return Ok(());
+    }
 
-    // Check if tool_choice requires tools but none are provided
-    if is_some_choice && !has_tools {
+    let declared_tools: Vec<_> = all_declared_tools(request).collect();
+    if declared_tools.is_empty() {
         return Err(invalid(
             "tool_choice_requires_tools",
             "Invalid value for 'tool_choice': 'tool_choice' is only allowed when 'tools' are specified.",
         ));
     }
-
-    // Validate tool references exist when tools are present
-    if !has_tools {
-        return Ok(());
-    }
-
-    // Extract function tool names from top-level tools and inline additional_tools
-    let mut function_tool_names: Vec<&str> = Vec::new();
-    for (tool, from_additional_tools) in all_declared_tools(request) {
-        match tool {
-            ResponseTool::Function(ft) => function_tool_names.push(ft.function.name.as_str()),
-            ResponseTool::Namespace(namespace)
-                if from_additional_tools && namespace.name == "functions" =>
-            {
-                for member in &namespace.tools {
-                    if let NamespaceTool::Function(ft) = member {
-                        function_tool_names.push(ft.function.name.as_str());
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
+    let tools = || {
+        declared_tools
+            .iter()
+            .map(|(tool, inline)| (tool.as_ref(), *inline))
+    };
 
     // Validate tool references exist
     match tool_choice {
@@ -4809,11 +4822,11 @@ fn validate_tool_choice_with_tools(request: &ResponsesRequest) -> Result<(), Val
             // the underlying wire shape (flat vs. legacy nested) — both are
             // normalized at deserialize time.
             if let Some(name) = tool_choice.function_name() {
-                let found = all_declared_tools(request).any(|(tool, from_additional_tools)| {
+                let found = tools().any(|(tool, from_inline)| {
                     match (tool, choice.namespace.as_deref()) {
                         (ResponseTool::Function(function), None) => function.function.name == name,
                         (ResponseTool::Namespace(namespace), None)
-                            if from_additional_tools && namespace.name == "functions" =>
+                            if from_inline && namespace.name == "functions" =>
                         {
                             namespace.tools.iter().any(|member| {
                                 matches!(member, NamespaceTool::Function(function) if function.function.name == name)
@@ -4855,7 +4868,16 @@ fn validate_tool_choice_with_tools(request: &ResponsesRequest) -> Result<(), Val
             // Validate that all function tool references exist
             for tool_ref in allowed_tools {
                 if let ToolReference::Function { name } = tool_ref {
-                    if !function_tool_names.contains(&name.as_str()) {
+                    let found = tools().any(|(tool, from_inline)| match tool {
+                        ResponseTool::Function(function) => function.function.name == *name,
+                        ResponseTool::Namespace(namespace) if from_inline && namespace.name == "functions" => {
+                            namespace.tools.iter().any(|member| {
+                                matches!(member, NamespaceTool::Function(function) if function.function.name == *name)
+                            })
+                        }
+                        _ => false,
+                    });
+                    if !found {
                         return Err(invalid(
                             "tool_choice_tool_not_found",
                             format!(
@@ -4926,7 +4948,7 @@ fn validate_openai_structured_output_rules(
     request: &ResponsesRequest,
 ) -> Result<(), ValidationError> {
     for (tool, _) in all_declared_tools(request) {
-        match tool {
+        match tool.as_ref() {
             ResponseTool::Function(function_tool) => {
                 validate_strict_function_schema(&function_tool.function)?;
             }
@@ -5338,8 +5360,11 @@ fn validate_response_tools(tools: &[ResponseTool]) -> Result<(), ValidationError
 
 /// Validates a ResponseTool array, naming any refusal under `prefix`
 /// (`"tools"` for top-level declarations or `"input[i].tools"` for inline
-/// `additional_tools`).
-fn validate_response_tools_at(tools: &[ResponseTool], prefix: &str) -> Result<(), ValidationError> {
+/// and discovered tools).
+pub fn validate_response_tools_at(
+    tools: &[ResponseTool],
+    prefix: &str,
+) -> Result<(), ValidationError> {
     // MCP server_label must be present and unique (case-insensitive).
     let mut seen_mcp_labels: HashSet<String> = HashSet::new();
 
@@ -5632,8 +5657,10 @@ fn tool_call_id(item: &ResponseInputOutputItem) -> Option<&str> {
         | ResponseInputOutputItem::ShellCall { call_id, .. }
         | ResponseInputOutputItem::ApplyPatchCall { call_id, .. }
         | ResponseInputOutputItem::Program { call_id, .. } => Some(call_id),
-        ResponseInputOutputItem::LocalShellCall { call_id, .. }
-        | ResponseInputOutputItem::ToolSearchCall { call_id, .. } => call_id.as_deref(),
+        ResponseInputOutputItem::LocalShellCall { id, call_id, .. } => {
+            call_id.as_deref().or(id.as_deref())
+        }
+        ResponseInputOutputItem::ToolSearchCall { call_id, .. } => call_id.as_deref(),
         _ => None,
     }
 }
@@ -6545,6 +6572,9 @@ mod tests {
             {"type": "function_call_output", "call_id": "call_kept", "output": "2"},
             {"type": "custom_tool_call_output", "call_id": "call_gone_too", "output": "3"},
             {"type": "local_shell_call_output", "id": "call_gone_shell", "output": "4"},
+            {"type": "local_shell_call", "id": "ls_1",
+             "action": {"type": "exec", "command": ["pwd"], "env": {}}, "status": "completed"},
+            {"type": "local_shell_call_output", "id": "ls_1", "output": "5"},
             {"type": "message", "id": "msg_2", "role": "assistant",
              "content": [{"type": "output_text", "text": "ok", "annotations": []}]},
         ]))
@@ -6567,6 +6597,8 @@ mod tests {
                 "message",
                 "function_call",
                 "function_call_output",
+                "local_shell_call",
+                "local_shell_call_output",
                 "message"
             ]
         );

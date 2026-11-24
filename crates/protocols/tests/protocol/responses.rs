@@ -5906,7 +5906,7 @@ fn responses_schema_passthrough_for_ptc_tool_search_web_search_and_optional_ids(
         "input": [
             {"type": "tool_search_call", "call_id": "ts_1", "arguments": {"query": "weather"}, "execution": "client"},
             {"type": "tool_search_output", "call_id": "ts_1", "execution": "client", "tools": [{"type": "function", "name": "get_weather", "parameters": {"type": "object"}}]},
-            {"type": "web_search_call", "id": "ws_1", "status": "completed", "action": {"type": "search", "query": "rust"}},
+            {"type": "web_search_call", "id": "ws_1", "status": "completed", "action": {"type": "search", "query": "rust"}, "results": [{"url": "https://rust-lang.org/", "title": "Rust"}]},
             {"type": "program", "id": "prg_1", "call_id": "call_p1", "code": "return 1;", "fingerprint": "fp_1"},
             {"type": "program_output", "id": "prgo_1", "call_id": "call_p1", "result": "1", "status": "completed"},
             {"type": "local_shell_call", "action": {"type": "exec", "command": ["ls"], "env": {}}, "status": "completed"},

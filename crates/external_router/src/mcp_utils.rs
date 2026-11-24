@@ -390,6 +390,22 @@ pub async fn ensure_request_mcp_routing(
     format_registry: &FormatRegistry,
     tools: &[ResponseTool],
 ) -> Result<Option<Vec<McpServerBinding>>, Response> {
+    for (idx, tool) in tools.iter().enumerate() {
+        if tool.allows_direct_calls() {
+            continue;
+        }
+        let gateway_managed = matches!(tool, ResponseTool::Mcp(_))
+            || openai_bridge::builtin_type_for_response_tool(tool)
+                .is_some_and(|kind| mcp_orchestrator.find_builtin_server(kind).is_some());
+        if gateway_managed {
+            return Err(error::bad_request(
+                "tool_not_supported",
+                format!(
+                    "Invalid 'tools[{idx}].allowed_callers': gateway-managed tools must allow the 'direct' caller."
+                ),
+            ));
+        }
+    }
     match ensure_request_mcp_client(mcp_orchestrator, format_registry, tools).await {
         Some(servers) => Ok(Some(servers)),
         None if tools

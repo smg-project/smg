@@ -30,7 +30,7 @@ use tracing::{debug, enabled, trace, warn, Level};
 
 use super::types::HarmonyBuildOutput;
 use crate::routers::{
-    common::responses_compat::format_agent_message_text,
+    common::responses_compat::{format_agent_message_text, format_call_id_less_tool_output_header},
     grpc::{
         common::responses::{
             history::hosted_call_result,
@@ -915,8 +915,7 @@ impl HarmonyBuilder {
             )),
 
             // Function call output (separate from call) - requires looking up the original call
-            // when paired by call_id, or falls back to explicit name/namespace or a user message
-            // for call_id-less outputs.
+            // when paired by call_id. Unpaired outputs are replayed as user messages.
             ResponseInputOutputItem::FunctionCallOutput {
                 call_id,
                 name,
@@ -927,13 +926,11 @@ impl HarmonyBuilder {
                 let text = output.to_text_only()?;
                 if let Some(call_id) = call_id.as_deref().filter(|id| !id.is_empty()) {
                     replay_tool_result(prev_outputs, call_id, text)
-                } else if let Some(name) = name.as_deref().filter(|n| !n.is_empty()) {
-                    let qualified = namespace
-                        .as_deref()
-                        .filter(|ns| !ns.is_empty())
-                        .map_or_else(|| name.to_string(), |ns| format!("{ns}.{name}"));
-                    Ok(tool_result_message(format!("functions.{qualified}"), text))
                 } else {
+                    let header = format_call_id_less_tool_output_header(
+                        name.as_deref(),
+                        namespace.as_deref(),
+                    );
                     Ok(HarmonyMessage {
                         author: Author {
                             role: Role::User,
@@ -942,9 +939,9 @@ impl HarmonyBuilder {
                         recipient: None,
                         content: vec![Content::Text(TextContent {
                             text: if text.is_empty() {
-                                "[tool_output]".to_string()
+                                header
                             } else {
-                                format!("[tool_output]\n{text}")
+                                format!("{header}\n{text}")
                             },
                         })],
                         channel: None,
