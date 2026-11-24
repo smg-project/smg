@@ -1813,7 +1813,7 @@ tells the data once more:
 
 | Copy | Where | Read by |
 |---|---|---|
-| the worker record | the store's table of records (`store/memory.rs`) | the registration calls; a watcher's and a standby's first copy |
+| the worker record | the store's table of records (`store/memory.rs`) | the registration calls, for a record's status; the load poller, and the follower of cache events for whether a worker's events are indexed, each until it reads the worker objects; a watcher's and a standby's first copy |
 | a copy of the record's facts | beside the worker objects (`worker_host/objects.rs`) | the code that keeps the objects, to tell a record that changed under its object |
 | the worker object | the worker-crate registry | the health checker, the follower of cache events and a single request's decision |
 | the remainder: 17 of the 24 facts and one bit of an eighteenth, with the record's id and revision | beside each worker object (`worker_host/remainder.rs`) | a single request's decision, for the record's id, whether the worker takes images, its wire modes and from where it is reached. What the worker states for a request's hard demands is lent with the list, and no frame states a demand yet |
@@ -1881,16 +1881,18 @@ A fact leaves the remainder when the worker object gets a field that holds it as
    store over a write of the registry. The store takes a decided change only where the record
    it was decided over still stands at the revision the keeper read, tested under the
    membership lock: a write that landed between the two is never written over, and the keeper
-   reads the store again before it answers. Until step 2 a first copy is still cut from the table,
-   and a call still reads the record that stands there. Until step 3 a status is still the
+   reads the store again before it answers. Until step 3 a first copy is still cut from the table,
+   and a call reads the status of a record there. Until step 3 a status is still the
    table's word: a drain and a connect signal write the table, the store hands a record the
    status its table holds, and a call follows the store into the objects before it answers. A
    change the store took and the registry did not get is laid by the task that follows the
    table, while that task stands. A change that moves a fact the object holds builds the object again: the
    new object takes the standing one's place under its id, with its running state, as the code
    that keeps the objects does today for a record that changed.
-2. A standby applies the leader's events to its own worker objects **[built]**. A watcher's and a
-   standby's first copy is cut from the objects and their remainders **[planned]**.
+2. A standby applies the leader's events to its own worker objects **[built]**. A call reads the
+   record that stands from the worker objects **[built]**. A watcher's and a
+   standby's first copy is cut from the objects and their remainders behind step 3, because a
+   copy's statuses must be the ones the log last told **[planned]**.
 3. No health outcome is copied into a record: a decision reads the object's status, as a single
    request's does on main.
 4. The table of records, the second copy of the facts, the two conversions between a record
@@ -1912,7 +1914,19 @@ the store took the event. A removal's object leaves the registry first. A record
 place keeps the instant it was admitted at. A status is still the table's word, and it is
 copied onto the object in the same turn. A restore is the store's restore and the read of its
 records in one turn of that code. A first copy is still cut from the table, and a watcher
-still writes a table of its own: the two other parts of step 2.
+still writes a table of its own: two later parts of step 2.
+
+**A call reads the worker objects [built].** A registration call reads the record that stands
+before it writes: the record under an address, the record under an id, and an engine's records.
+It reads them back from the worker objects (the second part of step 2), in the turn of the code
+that keeps them and behind that code's read of the store to its end. So a call's test and the
+write behind it read the record from one copy, and a call that waited behind another writer reads what that
+writer left. A status is still the table's word, so a record read this way carries the status
+the table holds. An engine's records are found by the list of ranks kept beside the objects,
+where the store passed over every record under the membership lock: that read of the table is
+deleted. A first copy stays on the table until step 3. Its statuses must be the ones the log
+last told at its place, and until an object's status leads the table alone holds them under
+the lock that orders the log.
 
 A lease keeps naming its worker by the record's id, never by a place in a list: a gateway
 reports on a lease later and across membership changes.

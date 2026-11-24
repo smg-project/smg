@@ -379,10 +379,12 @@ mod tests {
         standby.stopped().await;
     }
 
-    /// A standby that takes its leader's rows whole is woken by the log's
-    /// restart, and holds the objects of those rows.
+    /// A store that takes another's rows whole with no turn of the holder
+    /// wakes the follower by the log's restart, and the follower lays the
+    /// objects of those rows. A standby's applier restores in the holder's
+    /// turn: this is the restore that went around it.
     #[tokio::test(start_paused = true)]
-    async fn a_standby_restored_from_its_leaders_cut_holds_the_objects_of_its_rows() {
+    async fn a_restore_around_the_holder_is_laid_at_the_logs_restart() {
         let leader = Replica::new();
         leader.store.set_term(1);
         leader.store.upsert(facts(1, 1));
@@ -390,13 +392,9 @@ mod tests {
         let standby = Replica::new();
         standby.caught_up("the standby's start").await;
         assert!(standby.held().is_empty());
-        let follower = Follower::new(
-            Arc::clone(&standby.store),
-            Arc::clone(&standby.feed.log),
-            standby.workers.holder(),
-        );
         let cut = leader.store.checkpoint();
-        assert_eq!(follower.restore(cut, None), Ok(true));
+        assert!(standby.store.restore_from(cut));
+        assert!(standby.held().is_empty(), "the follower's to lay");
         standby.caught_up("the restore").await;
         assert_eq!(standby.held(), leader.held());
         assert_eq!(standby.held().len(), 1);
