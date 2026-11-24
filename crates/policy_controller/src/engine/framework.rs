@@ -3143,14 +3143,25 @@ impl Binding {
         (self.plan == Plan::Single).then_some(self.shadow).flatten()
     }
 
-    fn matches(&self, model: &str, phase: Phase) -> bool {
-        let model_ok = match (self.model.strip_prefix('*'), self.model.strip_suffix('*')) {
-            _ if self.model == "*" => true,
-            (Some(suffix), _) => model.ends_with(suffix),
-            (_, Some(prefix)) => model.starts_with(prefix),
-            _ => self.model == model,
+    /// Whether a request of `model` in `phase` resolves to the binding,
+    /// where no binding in front of it matches. `glob` is what the
+    /// binding's pattern asks ([`Self::pattern`]): an engine reads it once,
+    /// when it is built ([`Entry`]).
+    #[inline(always)]
+    fn matches_as(&self, glob: &Glob, model: &str, phase: Phase) -> bool {
+        // One id is the commonest pattern: asked first, by a plain branch.
+        let model_ok = if matches!(glob, Glob::Exact) {
+            self.model == model
+        } else {
+            glob.covers(&self.model, model)
         };
-        model_ok && (self.phases.is_empty() || self.phases.contains(&phase))
+        model_ok && self.covers(phase)
+    }
+
+    /// [`Self::matches_as`], of a binding no engine holds.
+    #[cfg(test)]
+    fn matches(&self, model: &str, phase: Phase) -> bool {
+        self.matches_as(&self.pattern().glob(), model, phase)
     }
 
     /// Whether the binding's phase list covers `phase`: an empty list
@@ -3159,7 +3170,7 @@ impl Binding {
         self.phases.is_empty() || self.phases.contains(&phase)
     }
 
-    /// The model pattern, read as [`Self::matches`] reads it.
+    /// The model pattern, as its stars read.
     fn pattern(&self) -> Pattern<'_> {
         match (self.model.strip_prefix('*'), self.model.strip_suffix('*')) {
             _ if self.model == "*" => Pattern::Any,
@@ -3193,6 +3204,43 @@ enum Pattern<'a> {
     Suffix(&'a str),
     Prefix(&'a str),
     Exact(&'a str),
+}
+
+impl Pattern<'_> {
+    fn glob(&self) -> Glob {
+        match *self {
+            Self::Any => Glob::Any,
+            Self::Suffix(suffix) => Glob::Suffix(suffix.into()),
+            Self::Prefix(prefix) => Glob::Prefix(prefix.into()),
+            Self::Exact(_) => Glob::Exact,
+        }
+    }
+}
+
+/// What a binding's model pattern asks of a model id ([`Pattern`]), with
+/// the text a suffix or a prefix compares. The engine reads it once when
+/// it is built ([`Entry`]), so a walk of the bindings reads no pattern's
+/// stars.
+#[derive(Debug)]
+enum Glob {
+    Any,
+    Suffix(Box<str>),
+    Prefix(Box<str>),
+    /// One id: the pattern's own text, which the binding holds.
+    Exact,
+}
+
+impl Glob {
+    /// Whether `pattern`, which asks this, covers `model`.
+    #[inline(always)]
+    fn covers(&self, pattern: &str, model: &str) -> bool {
+        match self {
+            Self::Any => true,
+            Self::Suffix(suffix) => model.ends_with(&**suffix),
+            Self::Prefix(prefix) => model.starts_with(&**prefix),
+            Self::Exact => pattern == model,
+        }
+    }
 }
 
 /// What a host names a profile's rows by, where it names them in the
@@ -4098,6 +4146,9 @@ const fn placed_by(assignment: Assignment, by_assignment: bool) -> Assignment {
 #[derive(Debug)]
 struct Entry {
     binding: Binding,
+    /// What the binding's model pattern asks ([`Binding::pattern`]), read
+    /// once when the engine is built.
+    glob: Glob,
     /// The assignment that places a request of the binding ([`placed_by`]):
     /// the rule's own, or `delegate` where no rule stands, as the binding's
     /// profile reads it under the single plan. Written once when the engine
@@ -5074,6 +5125,7 @@ impl Engine {
                     || assigned(binding.profile)
                     || binding.decode_profile.is_some_and(assigned);
                 Entry {
+                    glob: binding.pattern().glob(),
                     placing: placed_by(declared, by_assignment),
                     vetoed: AllVetoed::default(),
                     sides_placed,
@@ -5555,14 +5607,14 @@ impl Engine {
     fn entry(&self, model: &str, phase: Phase) -> Option<&Entry> {
         self.bindings
             .iter()
-            .find(|entry| entry.binding.matches(model, phase))
+            .find(|entry| entry.binding.matches_as(&entry.glob, model, phase))
     }
 
     /// The position of the first matching binding in this generation.
     pub(crate) fn binding_position(&self, model: &str, phase: Phase) -> Option<u32> {
         self.bindings
             .iter()
-            .position(|entry| entry.binding.matches(model, phase))
+            .position(|entry| entry.binding.matches_as(&entry.glob, model, phase))
             .and_then(|at| u32::try_from(at).ok())
     }
 
@@ -6087,6 +6139,7 @@ impl Engine {
         };
         let Entry {
             binding,
+            glob: _,
             placing,
             vetoed,
             sides_placed: _,
@@ -6276,11 +6329,12 @@ impl Engine {
         cx: &Constraints<'_>,
         scratch: &mut Scratch,
     ) -> Option<Decision> {
+        let (model, phase) = (facts.model, facts.phase);
         let (entry, placing) = self
             .bindings
             .iter()
             .zip(&self.shadow_placing)
-            .find(|(entry, _)| entry.binding.matches(facts.model, facts.phase))?;
+            .find(|(entry, _)| entry.binding.matches_as(&entry.glob, model, phase))?;
         let placing = (*placing)?;
         let index = entry.binding.shadow?;
         let profile = &self.profiles[usize::from(index)];
