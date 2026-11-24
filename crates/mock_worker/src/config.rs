@@ -138,6 +138,11 @@ pub struct Config {
     /// batches), `false` (the default) a wire that carries token batches
     /// only, whose silence the gateway judges against its prefill bound.
     pub step_reports: bool,
+    /// What the gRPC workers' model info says of vision input from their
+    /// start (`--supports-vision`): the `supports_vision` entry of the info
+    /// the admin API patches, seeded. Unset, each wire answers as it does
+    /// with no entry.
+    pub supports_vision: Option<bool>,
     /// The role of a process's HTTP workers alone, or of its gRPC workers
     /// and ZMQ ranks together, in a disaggregated fleet
     /// (`--worker-type`): a prefill worker answers every request with the
@@ -409,6 +414,7 @@ impl Default for Config {
             kv_events_wire: Wire::Vllm,
             loads_like: LoadsLike::Mock,
             step_reports: false,
+            supports_vision: None,
             role: None,
             bootstrap_base_port: None,
             pairing_protocol: None,
@@ -563,6 +569,9 @@ impl Config {
                 }
                 "--loads-like" => cfg.loads_like = value(&mut args, &flag)?.parse()?,
                 "--step-reports" => cfg.step_reports = parse(value(&mut args, &flag)?, &flag)?,
+                "--supports-vision" => {
+                    cfg.supports_vision = Some(parse(value(&mut args, &flag)?, &flag)?);
+                }
                 "--block-size" => {
                     cfg.engine.block_size = parse(value(&mut args, &flag)?, &flag)?;
                     block_size_given = true;
@@ -1231,6 +1240,11 @@ pub fn usage() -> String {
                                 vLLM's stats-only step batches do) instead of token batches only\n\
                                 (default false): decides which bound the gateway judges the\n\
                                 engine's silence against\n\
+       --supports-vision <bool> what the gRPC workers' model info says of vision input from\n\
+                                their start (default: no entry, so an encode worker on the vLLM\n\
+                                wire says true and every other worker false); the gateway\n\
+                                refuses an image request to vLLM-wire workers that all say\n\
+                                false; the admin API's info patch sets the same entry later\n\
        --admin-port <port>      process-wide admin API: fleet, request records with the\n\
                                 arrival-time oracle, cache dumps, resets (default off)\n\
        --worker-type <prefill|decode|encode>  the role of the HTTP workers alone, or of the gRPC\n\

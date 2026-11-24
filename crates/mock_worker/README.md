@@ -110,6 +110,43 @@ inside the prompt and disjoint across the request's items, and, when the item
 names its placeholder token id, spans that cover exactly the prompt's tokens of
 that id; a wrong item is refused with `InvalidArgument` naming the item and the
 field, so a gateway regression in a wire's items reads as a red row on the mock.
+A regular worker takes a request with media once the gateway lets it through:
+on every wire the gateway asks the model's family for a media spec (the model
+directory above), and on the vLLM wire it also asks the workers, refusing the
+request with `multimodal_not_supported` while every worker that would take the
+pixels reports `supports_vision` false, as a regular worker of the mock does
+unless `--supports-vision true` or the admin API's info patch says otherwise
+before the gateway reads the model info. The realistic engine keys a media
+item's tokens by the item. The gateway writes the same placeholder id under
+every image, so the cache reads the ids under each placeholder span as one id
+of the item's hash (below 2^30): on the vLLM wire the i-th entry of a batch's
+`mm_hashes` over the batch's i-th span, on the TokenSpeed wire an item's
+`content_hash` with its modality over the item's spans, on the SGLang wire one
+value over all the spans of a batch (its `feature_hash`, or a fold of its
+pixel tensor where the request carries none, taken where the cache reads the
+request, so a prefill-role or scripted request does not pay for it: one batch
+sent both ways reads as two items, and the mock cuts no batch into items by a
+model family's grid). Where the wire names the item's placeholder id, a token
+of another id under a span stays as sent; a token two spans claim goes to the
+first of them, in the prompt's order, that takes its id. A vLLM request's
+media is read one way, as the engine's servicer reads it: where a batch
+carries tensors (`pixel_values` or `model_specific_tensors`), the batches with
+tensors key their spans and a batch without them keys nothing; where none
+does, as on the decode side of a pair that holds the language model alone,
+every batch's hashes, in order, salt the whole prompt, folded with the first
+token into that token's key (an empty prompt has no token to carry them). The
+prompt's token count stays, a script and `--capture` read the ids as sent, the
+same image is the same prompt to the cache, and another image parts the prompt
+at the image's first token (`cached_tokens`, `GET /admin/truth`).
+`--output-seed prompt` reads the prompt as the cache does: the same image
+gives the same output, another image another. The KV
+events follow each wire's engine. On the vLLM wire a stored block carries the
+ids as sent and the item is in the block's hash alone, so an index built from
+the events reads a prompt by its ids, two images under one placeholder id as
+one prompt, as it does of the engine's events. On the SGLang and TokenSpeed
+wires, whose engines write the item's id under its tokens themselves, the
+events carry the keyed ids (read in the engines' servicers and clients, not
+compared with an engine's events).
 A reference batch on the SGLang wire (media URLs without a pixel tensor, the
 form the gateway hands a worker that processes media itself) is the primary
 batch's alone, travels with no extra batch, and is accepted as it stands: the
@@ -250,6 +287,7 @@ experiments against it transfer to engines:
 | `--context-length` | 32768 | advertised context length |
 | `--output-prefix-ids` | none | the token ids every output starts with, before the synthetic ids: a stream shaped for a gateway that parses the engine's tokens (a channel header, say); the canned gRPC and ZMQ workers and the realistic engine shape their output with it (the canned HTTP worker does not read it) |
 | `--loads-like` | mock | `vllm`: report only what the vLLM servicer reports (running, waiting, `token_usage`, maxima), so the gateway's expected-wait routes as it does on a vLLM fleet |
+| `--supports-vision` | unset | what the gRPC workers' model info says of vision input from their start: the `supports_vision` entry of the info the admin API patches (`/admin/info/{port}`), seeded; unset, an encode worker on the vLLM wire says `true` and every other worker `false` |
 | `--admin-port` | off | process-wide admin API (below) |
 | `--drain-timeout-secs` | 5 | on SIGTERM or SIGINT: stop accepting, let the requests in flight finish for this long, then exit 0 either way |
 | `--kv-events-zmq-base-port` | off | ZMQ KV-event publishers on vLLM's or SGLang's wire (below) |
@@ -409,7 +447,7 @@ path has no engine to hook.
 
 | Endpoint | Answer |
 |----------|--------|
-| `POST /admin/truth/{worker}` with `{"token_ids": [...]}` | what the worker would serve from cache for that prompt right now: `cached_tokens`, `cached_blocks`, `restored_tokens`, `block_size` (the engine's own prefix match and, with the shared KV tier on, the run the tier holds after it, as `restored_tokens`; last-block rule included) |
+| `POST /admin/truth/{worker}` with `{"token_ids": [...]}` | what the worker would serve from cache for that prompt right now: `cached_tokens`, `cached_blocks`, `restored_tokens`, `block_size` (the engine's own prefix match and, with the shared KV tier on, the run the tier holds after it, as `restored_tokens`; last-block rule included); the ids are read as sent, with no media item beside them, so of a prompt with media it reads only the blocks in front of the first item, and nothing of a prompt its hashes salt |
 | `GET /admin/truth` | per worker, over every admitted request: `requests`, `prompt_tokens`, `cached_tokens`, `oracle_tokens`, `restored_tokens` (the shared tier's share of `cached_tokens`), so a gateway's hit-rate claim can be checked against what the engines actually served; `injected_failures` and `cut_streams` count what the `fail` hook refused before admission and cut after output |
 | `GET /admin/zmq/{worker}` | a ZMQ rank's output counts since it connected: `batch_messages`, the messages that carried request outputs, and `outputs`, the outputs in them (one per message without a step period, several with one; a utility reply is neither); cumulative, `POST /admin/reset` does not clear them; a rank name, not `all` |
 
