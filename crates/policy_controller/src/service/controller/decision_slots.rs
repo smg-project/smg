@@ -572,6 +572,8 @@ impl DecisionSlots {
             let files = "the store's files of leases are not one a decider";
             return Err(io::Error::new(io::ErrorKind::InvalidInput, files));
         }
+        // A replica's shared state gave the store its word already, and the
+        // first stays: this gives it for deciders started with no such state.
         lifecycle::tells(&reads.store, &reads.objects);
         let told = Arc::new(watch::Sender::new(false));
         let shared = Arc::new(Shared::default());
