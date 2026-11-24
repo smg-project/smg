@@ -3118,8 +3118,8 @@ struct Leases {
     /// ([`LeaseRecord::decode`]) and for no other, named by the record's
     /// entry ([`Held::decode`]). A record and its place are laid under
     /// one hold of the turn ([`Leases::file`], and a decision's issue of
-    /// a pair, `issue_decided_pair`) and leave under one
-    /// ([`Leases::leave`]): no other door lays or takes either.
+    /// a pair, `issue_decided_pair` or `issue_keyed_pair`) and leave under
+    /// one ([`Leases::leave`]): no other door lays or takes either.
     decodes: Decodes,
     /// The store's counts, a cell a worker: what the leases on file book.
     counts: Arc<InFlightCounts>,
@@ -3212,7 +3212,8 @@ struct Held {
     /// Whether the lease's sides book their keys' requests in flight, each
     /// on its worker's count ([`InFlightCounts::book`]): said once, where
     /// the lease is filed, so an end frees what the filing booked. A
-    /// decision's lease counts where [`MemoryStore::issue_keyed`] files it. A
+    /// decision's lease counts where [`MemoryStore::issue_keyed`] files it,
+    /// and a pair's where `issue_keyed_pair` does. A
     /// record filed whole carries no such word and counts wherever it has
     /// a key: more than a cap reads, never less.
     keyed: bool,
@@ -4179,8 +4180,9 @@ impl MemoryStore {
     /// sessions rule and under none: the lease books one request of its key
     /// on its worker until it leaves the file, whatever the decision did
     /// with the key's pin, and the worker's count of the key's requests
-    /// steps with the lease's own ([`InFlightCounts::book`]). The lease of
-    /// any other decision books no key.
+    /// steps with the lease's own ([`InFlightCounts::book`]). A keyed
+    /// pair's decision is filed by `issue_keyed_pair`. The lease of any
+    /// other decision books no key.
     ///
     /// # Errors
     ///
@@ -4196,6 +4198,26 @@ impl MemoryStore {
         issued: impl Fn(&crate::tracking::Lease),
     ) -> Result<crate::tracking::Lease, LeaseRefused> {
         self.issue_minted(record, booked, None, true, issued)
+    }
+
+    /// [`Self::issue_decided_pair`] for a keyed pair's decision, under any
+    /// sessions rule and under none: each side books one request of its
+    /// own session on its worker while it lives, as a keyed single's lease
+    /// books its key ([`Self::issue_keyed`]). A decode side filed chosen
+    /// books none until its issue or its dispatch.
+    ///
+    /// # Errors
+    ///
+    /// Those of [`Self::issue_decided`].
+    #[cfg(feature = "controller")]
+    pub(crate) fn issue_keyed_pair(
+        &self,
+        record: LeaseRecord,
+        side: DecodeSide,
+        [booked, decode]: [Option<WorkerSlot>; 2],
+        issued: impl Fn(&crate::tracking::Lease),
+    ) -> Result<crate::tracking::Lease, LeaseRefused> {
+        self.issue_minted(record, booked, Some((side, decode)), true, issued)
     }
 
     /// Takes back the issue that stands of the decode side of `gateway`'s

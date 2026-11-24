@@ -647,7 +647,8 @@ fn the_doors_of_a_chosen_decode_side_step_its_sessions_count() {
 }
 
 /// A lease that counts for no key steps no session's count at any door,
-/// whatever session it carries. A pair that a decision issues: at its
+/// whatever session it carries. A pair that the door of a keyless
+/// decision issues: at its
 /// filing, at its decode side's dispatch on another target and at its
 /// end. A single's lease whose decision read no count: at its dispatch on
 /// another target. Each books and moves its worker's count alone. One

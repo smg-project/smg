@@ -566,6 +566,13 @@ pub(crate) fn issue(
 /// and the decode's the one the pick's first target states of its decode,
 /// which the store keeps with the side.
 ///
+/// A keyed pick files a lease that counts for its key on each side's
+/// worker ([`MemoryStore::issue_keyed_pair`]), under any sessions rule and
+/// under none, as a single's keyed pick does ([`issue`]): one request more
+/// of the side's session stands on the side's worker while the side
+/// lives. A rule or a scorer that places by the fewest keys reads a
+/// pair's keys there.
+///
 /// # Errors
 ///
 /// Those of [`issue`].
@@ -616,7 +623,13 @@ pub(crate) fn issue_pair(
     let slot = |id| world.booked_of(id).or_else(|| store.filed_slot(id));
     let slots = [slot(first.id), slot(chosen.decode_id)];
     let told = |lease: &Lease| stages.on_decision_issued(lease, decision);
-    let lease = store.issue_decided_pair(record, side, slots, told)?;
+    // A keyed pick's lease counts for its key on each side's worker, as a
+    // single's does. A pick with no key reads no session.
+    let lease = if session.is_none() && decode_session.is_none() {
+        store.issue_decided_pair(record, side, slots, told)
+    } else {
+        store.issue_keyed_pair(record, side, slots, told)
+    }?;
     Ok(Some((lease, (!later).then(|| side.lease(&lease)))))
 }
 

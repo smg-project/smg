@@ -65,7 +65,7 @@ use crate::{
         WorkerFacts, WorkerStatus, WorkersStore,
     },
     tracking::lease::{Dispatch, Lease, LeaseId, Outcome, ReleaseReason, Side, DISPATCH_TTL},
-    worker_host::{Members, Objects},
+    worker_host::{stand, Members, Objects},
 };
 
 /// A gateway that is not the cases' own.
@@ -2278,6 +2278,11 @@ fn a_dispatched_frame_at_an_index_its_pick_does_not_hold_leaves_a_chosen_side_as
 /// workers its health filter keeps, and each side's key follows the worker
 /// its first request claimed.
 fn ruled_pair_plan() -> AppliedSpec {
+    ruled_pair_plan_of(Assignment::Delegate)
+}
+
+/// [`ruled_pair_plan`] where the rule places a new key by `assignment`.
+fn ruled_pair_plan_of(assignment: Assignment) -> AppliedSpec {
     let document = r#"{
       "apiVersion": "smg.policy/v1",
       "generation": 1,
@@ -2293,7 +2298,10 @@ fn ruled_pair_plan() -> AppliedSpec {
         { "profile": "prefills" }
       ]
     }"#;
-    let document: PolicySpec = serde_json::from_str(document).expect("a document of this build");
+    let mut document: PolicySpec =
+        serde_json::from_str(document).expect("a document of this build");
+    let rule = document.bindings[0].sessions.as_mut();
+    rule.expect("the pair's rule").assignment = assignment;
     staged(&document, &StageRegistry::builtin().without_lifecycle())
 }
 
@@ -2400,4 +2408,120 @@ fn a_served_decode_calls_side_keeps_the_calls_own_session_verdict() {
     assert_eq!(on_file(), (LeaseState::ISSUED, SessionVerdict::Pinned));
     assert!(store.unissue_decode(GATEWAY, prefill.id, issue));
     assert_eq!(on_file(), claimed);
+}
+
+/// The keys the worker objects of `names` count, in the names' order: a
+/// key counts once on each worker that carries a request of it.
+fn keys_on<const N: usize>(objects: &Objects<Members>, names: [&str; N]) -> [usize; N] {
+    names.map(|name| {
+        let url = format!("http://{name}:8000");
+        let object = objects.registry().get_by_url(&url).expect("its object");
+        object.routing_key_load()
+    })
+}
+
+/// A served pair's keyed pick counts for its key on each side's worker,
+/// under the stock controller's own catalog: the prefill's worker and the
+/// decode's each carry one key more while the pair's lease stands, and a
+/// pair with no key counts for none. A rule that places a new key on the
+/// worker with the fewest keys reads those counts on each side: the next
+/// key's pair takes the prefill and the decode that carry none, and the
+/// key after a release takes the two the release freed.
+///
+/// The classic router counts the same. Its load guard counts every
+/// request that carries a key (`WorkerLoadGuard::from_acquired_load` in
+/// `crates/worker/src/load/inflight.rs`). A pair's request is guarded on
+/// each side under the route's key (`acquire_prefill` in
+/// `model_gateway/src/routers/common/prefill_admission.rs`, `LoadGuards::new`
+/// in `model_gateway/src/routers/grpc/context.rs`). Its sticky policy places
+/// a new key on a worker with the fewest keys in flight (`min_group_select`
+/// in `model_gateway/src/policies/manual.rs`).
+#[test]
+fn a_served_pairs_keyed_lease_counts_its_key_on_each_sides_worker() {
+    let store = Arc::new(MemoryStore::new());
+    store
+        .apply(ruled_pair_plan_of(Assignment::MinGroup))
+        .expect("above the unbound start");
+    let [p0, p1] = ["p0", "p1"].map(|name| side_member(&store, name, Role::Prefill, None));
+    let [d0, d1] = ["d0", "d1"].map(|name| side_member(&store, name, Role::Decode, None));
+    LeasesStore::set_term(&*store, 1);
+    let objects = holder(&store);
+    let now = Instant::now();
+    // What the workers' objects count, and what the pairs that stand make:
+    // the two prefills, then the two decodes.
+    let keys = || keys_on(&objects, ["p0", "p1", "d0", "d1"]);
+    let made = |pairs: &[(WorkerId, WorkerId)]| {
+        let carried = |id| {
+            let carrying = pairs.iter().filter(|pair| pair.0 == id || pair.1 == id);
+            carrying.count()
+        };
+        [p0, p1, d0, d1].map(carried)
+    };
+    let leased = |n: u8, key: Option<u64>| {
+        let frame = at_prefill(n, WireModes::NONE, None);
+        let frame = match key {
+            Some(key) => keyed(frame, key),
+            None => frame,
+        };
+        let (decision, prefill, _) = leased_pair(&store, &objects, frame, now);
+        (pairs_of(&decision)[0], prefill.id)
+    };
+    let released = |lease: LeaseId| {
+        let gone = ReleaseReason::ClientGone;
+        assert!(LeasesStore::released(&*store, GATEWAY, lease, None, gone));
+    };
+    let (_, keyless) = leased(1, None);
+    assert_eq!(keys(), [0; 4], "a pair with no key counts for none");
+    released(keyless);
+    let (first, held) = leased(2, Some(7));
+    assert_eq!(keys(), made(&[first]), "a key on each side's worker");
+    // The next key's pair takes the prefill and the decode with no key.
+    let (second, _) = leased(3, Some(8));
+    let apart = second.0 != first.0 && second.1 != first.1;
+    assert!(apart, "{first:?} {second:?}");
+    assert_eq!(keys(), [1; 4]);
+    // A release frees the key on each side, and the next key lands there.
+    released(held);
+    assert_eq!(keys(), made(&[second]), "the released pair's key left");
+    let (third, _) = leased(4, Some(9));
+    assert_eq!(third, first);
+}
+
+/// A served pair whose decode is sent later counts its key on the
+/// prefill's worker at its filing, and on the decode's from the call that
+/// issues the side: a side that stands chosen carries no request. The
+/// decode the pair chose is not ready at the call, so the call picks the
+/// other, and the key counts on the decode the call picked. The issue's
+/// undo gives the decode's count up, and the prefill's stands.
+#[test]
+fn a_served_pairs_later_decode_counts_its_key_from_its_calls_issue() {
+    let store = Arc::new(MemoryStore::new());
+    store
+        .apply(ruled_pair_plan())
+        .expect("above the unbound start");
+    let p = side_member(&store, "p0", Role::Prefill, None);
+    let decodes = ["d0", "d1"].map(|name| side_member(&store, name, Role::Decode, None));
+    LeasesStore::set_term(&*store, 1);
+    let objects = holder(&store);
+    let now = Instant::now();
+    let keys = || keys_on(&objects, ["p0", "d0", "d1"]);
+    let mut frame = keyed(at_prefill(1, WireModes::NONE, None), 7);
+    frame.decode_later = true;
+    let (decision, prefill, decode) = leased_pair(&store, &objects, frame, now);
+    assert_eq!((decode, keys()), (None, [1, 0, 0]), "the side stands chosen");
+    let hand = open(&store, GATEWAY);
+    let own = sent(&prefill, proto::Side::Prefill, 0);
+    lifecycle::dispatched(&store, &hand, &own, now).expect("the frame reads");
+    let first = pairs_of(&decision)[0].1;
+    stand(&objects, &store, first, WorkerStatus::NotReady);
+    let call = keyed(at_call(2, prefill.id, WireModes::NONE, None), 7);
+    let (again, issued) = leased_call(&store, &objects, call, now);
+    let other = if first == decodes[0] { 1 } else { 0 };
+    assert_eq!(pairs_of(&again), [(p, decodes[other])], "the call picks again");
+    let (_, issue) = issued.expect("a pick's issue");
+    let mut counted = [1, 0, 0];
+    counted[1 + other] = 1;
+    assert_eq!(keys(), counted, "the call's issue, on the decode it picked");
+    assert!(store.unissue_decode(GATEWAY, prefill.id, issue));
+    assert_eq!(keys(), [1, 0, 0], "the issue taken back");
 }
