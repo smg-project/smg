@@ -68,11 +68,9 @@ fn bucket_prefill(group: &mut BenchmarkGroup<'_, WallTime>) {
         let mut view = Vec::with_capacity(n);
         build_view(&fleet, &mut view);
         let mut scratch = Scratch::new();
-        let pool = PoolFacts {
-            pool_size: n as u32,
-            generation: 1,
-            ..PoolFacts::default()
-        };
+        let mut pool = PoolFacts::default();
+        pool.pool_size = n as u32;
+        pool.generation = 1;
         let cx = Constraints::default();
         let mut seed = 0u64;
         group.bench_with_input(BenchmarkId::new("bucket_prefill", n), &n, |b, _| {
@@ -80,14 +78,12 @@ fn bucket_prefill(group: &mut BenchmarkGroup<'_, WallTime>) {
                 seed += 1;
                 let now_micros = 1_000_000 + seed * 1_000;
                 let tokens = (seed.wrapping_mul(2_654_435_761) % 4_096) as u32;
-                let facts = RequestFacts {
-                    model: "m",
-                    phase: Phase::Prefill,
-                    prompt_tokens: tokens,
-                    seed,
-                    now_micros,
-                    ..RequestFacts::default()
-                };
+                let mut facts = RequestFacts::default();
+                facts.model = "m";
+                facts.phase = Phase::Prefill;
+                facts.prompt_tokens = tokens;
+                facts.seed = seed;
+                facts.now_micros = now_micros;
                 let decision = engine.decide(&facts, &pool, black_box(&view), &cx, &mut scratch);
                 let lease = Lease {
                     tokens,
@@ -114,18 +110,14 @@ fn bucket_prefill_stale(group: &mut BenchmarkGroup<'_, WallTime>) {
         let mut view = Vec::with_capacity(n);
         build_view(&fleet, &mut view);
         let mut scratch = Scratch::new();
-        let pool = PoolFacts {
-            pool_size: n as u32,
-            generation: 1,
-            ..PoolFacts::default()
-        };
+        let mut pool = PoolFacts::default();
+        pool.pool_size = n as u32;
+        pool.generation = 1;
         let cx = Constraints::default();
-        let listing = RequestFacts {
-            model: "m",
-            phase: Phase::Prefill,
-            now_micros: 1_000_000,
-            ..RequestFacts::default()
-        };
+        let mut listing = RequestFacts::default();
+        listing.model = "m";
+        listing.phase = Phase::Prefill;
+        listing.now_micros = 1_000_000;
         black_box(engine.decide(&listing, &pool, &view, &cx, &mut scratch));
         // The first healthy worker from the middle of the view on leaves: a
         // row the filters keep, with half the view behind it.
@@ -146,14 +138,12 @@ fn bucket_prefill_stale(group: &mut BenchmarkGroup<'_, WallTime>) {
                 }
                 let now_micros = 1_000_000 + seed * 1_000;
                 let tokens = (seed.wrapping_mul(2_654_435_761) % 4_096) as u32;
-                let facts = RequestFacts {
-                    model: "m",
-                    phase: Phase::Prefill,
-                    prompt_tokens: tokens,
-                    seed,
-                    now_micros,
-                    ..RequestFacts::default()
-                };
+                let mut facts = RequestFacts::default();
+                facts.model = "m";
+                facts.phase = Phase::Prefill;
+                facts.prompt_tokens = tokens;
+                facts.seed = seed;
+                facts.now_micros = now_micros;
                 let decision = engine.decide(&facts, &pool, black_box(&view), &cx, &mut scratch);
                 let lease = Lease {
                     tokens,
@@ -203,11 +193,9 @@ fn bucket_prefill_models(group: &mut BenchmarkGroup<'_, WallTime>) {
             })
             .collect();
         let mut scratch = Scratch::new();
-        let pool = PoolFacts {
-            pool_size: n as u32,
-            generation: 1,
-            ..PoolFacts::default()
-        };
+        let mut pool = PoolFacts::default();
+        pool.pool_size = n as u32;
+        pool.generation = 1;
         let cx = Constraints::default();
         let mut seed = 0u64;
         group.bench_with_input(BenchmarkId::new(name, n), &n, |b, _| {
@@ -216,14 +204,12 @@ fn bucket_prefill_models(group: &mut BenchmarkGroup<'_, WallTime>) {
                 let now_micros = 1_000_000 + seed * 1_000;
                 let tokens = (seed.wrapping_mul(2_654_435_761) % 4_096) as u32;
                 let (model, view) = &views[seed as usize % MODELS];
-                let facts = RequestFacts {
-                    model: model.as_str(),
-                    phase: Phase::Prefill,
-                    prompt_tokens: tokens,
-                    seed,
-                    now_micros,
-                    ..RequestFacts::default()
-                };
+                let mut facts = RequestFacts::default();
+                facts.model = model.as_str();
+                facts.phase = Phase::Prefill;
+                facts.prompt_tokens = tokens;
+                facts.seed = seed;
+                facts.now_micros = now_micros;
                 let decision = engine.decide(&facts, &pool, black_box(view), &cx, &mut scratch);
                 let lease = Lease {
                     tokens,
@@ -270,18 +256,20 @@ fn bucket_prefill_parted(group: &mut BenchmarkGroup<'_, WallTime>) {
         let engine = engine_of("bucket");
         let mut scratch = Scratch::new();
         let cx = Constraints::default();
-        let facts_of = |tokens: u32, seed: u64, now_micros: u64| RequestFacts {
-            model: "m",
-            phase: Phase::Prefill,
-            prompt_tokens: tokens,
-            seed,
-            now_micros,
-            ..RequestFacts::default()
+        let facts_of = |tokens: u32, seed: u64, now_micros: u64| {
+            let mut request_facts = RequestFacts::default();
+            request_facts.model = "m";
+            request_facts.phase = Phase::Prefill;
+            request_facts.prompt_tokens = tokens;
+            request_facts.seed = seed;
+            request_facts.now_micros = now_micros;
+            request_facts
         };
-        let pool_of = |rows: usize| PoolFacts {
-            pool_size: rows as u32,
-            generation: 1,
-            ..PoolFacts::default()
+        let pool_of = |rows: usize| {
+            let mut pool_facts = PoolFacts::default();
+            pool_facts.pool_size = rows as u32;
+            pool_facts.generation = 1;
+            pool_facts
         };
         // One decision lists the model's workers in the order of `listed`.
         black_box(engine.decide(

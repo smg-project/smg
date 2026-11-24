@@ -9,7 +9,7 @@ use serde::Deserialize;
 use smg_grand_central::{
     document::PolicySpec,
     engine::{
-        Candidate, Constraints, Engine, Health, LoadRow, PoolFacts, RequestFacts, Role, Scratch,
+        Candidate, Constraints, Engine, LoadRow, PoolFacts, RequestFacts, Role, Scratch,
         SignalSource, WorkerId,
     },
     policies::power_of_two::PowerOfTwoMetric,
@@ -175,18 +175,16 @@ impl Bed {
             .workers
             .iter()
             .enumerate()
-            .map(|(i, worker)| Candidate {
-                position: i as u32,
-                id: WorkerId(1_000 + i as u64),
-                key: 1_000 + i as u32,
-                health: Health {
-                    healthy: true,
-                    ..Health::default()
-                },
-                in_flight: worker.in_flight,
-                load: worker.report.map(load_row),
-                load_sampled_at_micros: clock,
-                ..Candidate::default()
+            .map(|(i, worker)| {
+                let mut candidate = Candidate::default();
+                candidate.position = i as u32;
+                candidate.id = WorkerId(1_000 + i as u64);
+                candidate.key = 1_000 + i as u32;
+                candidate.health.healthy = true;
+                candidate.in_flight = worker.in_flight;
+                candidate.load = worker.report.map(load_row);
+                candidate.load_sampled_at_micros = clock;
+                candidate
             })
             .collect();
         Self {
@@ -200,18 +198,14 @@ impl Bed {
     /// One decision over the pool as it stands.
     fn decide(&mut self, prompt_tokens: Option<u32>, seed: u64) -> usize {
         self.clock += 1_000;
-        let facts = RequestFacts {
-            model: "m",
-            prompt_tokens: prompt_tokens.unwrap_or(0),
-            seed,
-            now_micros: self.clock,
-            ..RequestFacts::default()
-        };
-        let pool_facts = PoolFacts {
-            pool_size: self.pool.len() as u32,
-            generation: 1,
-            ..PoolFacts::default()
-        };
+        let mut facts = RequestFacts::default();
+        facts.model = "m";
+        facts.prompt_tokens = prompt_tokens.unwrap_or(0);
+        facts.seed = seed;
+        facts.now_micros = self.clock;
+        let mut pool_facts = PoolFacts::default();
+        pool_facts.pool_size = self.pool.len() as u32;
+        pool_facts.generation = 1;
         let decision = self.engine.decide(
             &facts,
             &pool_facts,

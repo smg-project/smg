@@ -2806,10 +2806,11 @@ async fn a_handle_over_a_link_ends_a_lease_its_alternate_served() {
         for id in ["held-0", "held-1", "held-2"] {
             let asked = Request {
                 id: id.as_bytes(),
-                facts: RequestFacts {
-                    model: MODEL,
-                    budget_micros: 5_000_000,
-                    ..RequestFacts::default()
+                facts: {
+                    let mut facts = RequestFacts::default();
+                    facts.model = MODEL;
+                    facts.budget_micros = 5_000_000;
+                    facts
                 },
                 constraints: Default::default(),
             };
@@ -2898,10 +2899,11 @@ async fn a_handle_over_a_link_is_answered_the_worker_its_request_names() {
         for (id, named) in asks {
             let asked = Request {
                 id: id.as_bytes(),
-                facts: RequestFacts {
-                    model: MODEL,
-                    budget_micros: 5_000_000,
-                    ..RequestFacts::default()
+                facts: {
+                    let mut facts = RequestFacts::default();
+                    facts.model = MODEL;
+                    facts.budget_micros = 5_000_000;
+                    facts
                 },
                 constraints: Default::default(),
             };

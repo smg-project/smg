@@ -6,7 +6,7 @@ use serde::Deserialize;
 use smg_grand_central::{
     document::{Assignment, PolicySpec},
     engine::{
-        Candidate, Constraints, Engine, Health, Identity, PairPools, PairTable, Phase, PoolFacts,
+        Candidate, Constraints, Engine, Identity, PairPools, PairTable, Phase, PoolFacts,
         RequestFacts, Role as WorkerRole, Scratch, Target, WorkerId,
     },
     stages::Lifecycle,
@@ -120,17 +120,15 @@ impl Bed {
             .workers
             .iter()
             .enumerate()
-            .map(|(i, worker)| Candidate {
-                position: i as u32,
-                id: WorkerId(1_000 + i as u64),
-                key: 1_000 + i as u32,
-                health: Health {
-                    healthy: true,
-                    ..Health::default()
-                },
-                in_flight: worker.in_flight,
-                active_sessions: worker.keys,
-                ..Candidate::default()
+            .map(|(i, worker)| {
+                let mut candidate = Candidate::default();
+                candidate.position = i as u32;
+                candidate.id = WorkerId(1_000 + i as u64);
+                candidate.key = 1_000 + i as u32;
+                candidate.health.healthy = true;
+                candidate.in_flight = worker.in_flight;
+                candidate.active_sessions = worker.keys;
+                candidate
             })
             .collect();
         Ok(Self {
@@ -147,18 +145,14 @@ impl Bed {
     /// move by the row's own steps, as they did under the recorder.
     fn pick(&mut self, key: Option<&str>, seed: u64) -> usize {
         self.clock += 1_000;
-        let facts = RequestFacts {
-            model: "m",
-            session_key: key.map_or(Identity::NONE, Identity::plain),
-            seed,
-            now_micros: self.clock,
-            ..RequestFacts::default()
-        };
-        let pool_facts = PoolFacts {
-            pool_size: self.pool.len() as u32,
-            generation: 1,
-            ..PoolFacts::default()
-        };
+        let mut facts = RequestFacts::default();
+        facts.model = "m";
+        facts.session_key = key.map_or(Identity::NONE, Identity::plain);
+        facts.seed = seed;
+        facts.now_micros = self.clock;
+        let mut pool_facts = PoolFacts::default();
+        pool_facts.pool_size = self.pool.len() as u32;
+        pool_facts.generation = 1;
         let decision = self.engine.decide(
             &facts,
             &pool_facts,
@@ -185,26 +179,23 @@ impl Bed {
     /// pairs with every decode. It answers the worker of each side.
     fn pair(&mut self, prefills: &[Candidate], key: Option<&str>, seed: u64) -> [usize; 2] {
         self.clock += 1_000;
-        let facts = RequestFacts {
-            model: "m",
-            session_key: key.map_or(Identity::NONE, Identity::plain),
-            seed,
-            now_micros: self.clock,
-            ..RequestFacts::default()
-        };
-        let pool_facts = PoolFacts {
-            pool_size: prefills.len() as u32,
-            generation: 1,
-            ..PoolFacts::default()
-        };
+        let mut facts = RequestFacts::default();
+        facts.model = "m";
+        facts.session_key = key.map_or(Identity::NONE, Identity::plain);
+        facts.seed = seed;
+        facts.now_micros = self.clock;
+        let mut pool_facts = PoolFacts::default();
+        pool_facts.pool_size = prefills.len() as u32;
+        pool_facts.generation = 1;
         let side = |pool: &[Candidate], role| -> Vec<Candidate> {
             (pool.iter())
-                .map(|worker| Candidate {
-                    role,
-                    pair_class: 1,
-                    has_capacity: true,
-                    has_room: true,
-                    ..*worker
+                .map(|worker| {
+                    let mut record = *worker;
+                    record.role = role;
+                    record.pair_class = 1;
+                    record.has_capacity = true;
+                    record.has_room = true;
+                    record
                 })
                 .collect()
         };
@@ -224,7 +215,14 @@ impl Bed {
         let pair = target.pair.expect("the target's pair");
         // The host's two dispatches: the prefill's under the pick's verdict,
         // the decode's under the one the first target's pair states.
-        let session = |phase| RequestFacts { phase, ..facts }.session();
+        let session = |phase| {
+            {
+                let mut request_facts = facts;
+                request_facts.phase = phase;
+                request_facts
+            }
+            .session()
+        };
         let prefill = Lease {
             issued_micros: self.clock,
             side: Side::Prefill,

@@ -14,8 +14,7 @@ use smg_grand_central::{
         RoutingKeyOverrideSettings, RoutingSettings,
     },
     engine::{
-        Candidate, Constraints, Engine, Health, Identity, PoolFacts, RequestFacts, Scratch,
-        WorkerId,
+        Candidate, Constraints, Engine, Identity, PoolFacts, RequestFacts, Scratch, WorkerId,
     },
     stages::Lifecycle,
     tracking::{Lease, Side},
@@ -188,16 +187,14 @@ impl Bed {
             .workers
             .iter()
             .enumerate()
-            .map(|(i, worker)| Candidate {
-                position: i as u32,
-                id: WorkerId(1_000 + i as u64),
-                key: 1_000 + i as u32,
-                health: Health {
-                    healthy: true,
-                    ..Health::default()
-                },
-                in_flight: worker.in_flight,
-                ..Candidate::default()
+            .map(|(i, worker)| {
+                let mut candidate = Candidate::default();
+                candidate.position = i as u32;
+                candidate.id = WorkerId(1_000 + i as u64);
+                candidate.key = 1_000 + i as u32;
+                candidate.health.healthy = true;
+                candidate.in_flight = worker.in_flight;
+                candidate
             })
             .collect();
         Ok(Self {
@@ -223,19 +220,15 @@ impl Bed {
             let held = self.held.values().filter(|on| on[i] > 0).count();
             candidate.active_sessions = self.keys[i] + held as u16;
         }
-        let facts = RequestFacts {
-            model,
-            session_key: key.map_or(Identity::NONE, Identity::plain),
-            session_counted: true,
-            seed,
-            now_micros: self.clock,
-            ..RequestFacts::default()
-        };
-        let pool_facts = PoolFacts {
-            pool_size: self.pool.len() as u32,
-            generation: 1,
-            ..PoolFacts::default()
-        };
+        let mut facts = RequestFacts::default();
+        facts.model = model;
+        facts.session_key = key.map_or(Identity::NONE, Identity::plain);
+        facts.session_counted = true;
+        facts.seed = seed;
+        facts.now_micros = self.clock;
+        let mut pool_facts = PoolFacts::default();
+        pool_facts.pool_size = self.pool.len() as u32;
+        pool_facts.generation = 1;
         let decision = self.engine.decide(
             &facts,
             &pool_facts,
@@ -891,15 +884,13 @@ mod sends {
                 "" => Identity::NONE,
                 key => Identity::plain(key),
             };
-            let mut facts = RequestFacts {
-                model: MODEL,
-                seed: u64::from(nth),
-                prompt_tokens: tokens,
-                session_key,
-                session_key_from_rid: by_id,
-                session_counted: true,
-                ..RequestFacts::default()
-            };
+            let mut facts = RequestFacts::default();
+            facts.model = MODEL;
+            facts.seed = u64::from(nth);
+            facts.prompt_tokens = tokens;
+            facts.session_key = session_key;
+            facts.session_key_from_rid = by_id;
+            facts.session_counted = true;
             if let Some(prompt) = prompt {
                 prompt.write_to(&mut facts);
             }

@@ -9,8 +9,8 @@
 use smg_grand_central::{
     document::{CostMargin, PolicySpec, SpecError, API_VERSION},
     engine::{
-        Candidate, Constraints, Engine, Health, LoadRow, Pick, PoolFacts, RequestFacts, Scorer,
-        Scratch, Target, TieBand, WorkerId,
+        Candidate, Constraints, Engine, LoadRow, Pick, PoolFacts, RequestFacts, Scorer, Scratch,
+        Target, TieBand, WorkerId,
     },
     stages::{score_costs, Lifecycle, StageRegistry},
     tracking::{Lease, Side},
@@ -31,39 +31,28 @@ fn engine(params: &str) -> Engine {
 }
 
 fn row(position: u32, in_flight: u32, load: Option<LoadRow>) -> Candidate {
-    Candidate {
-        position,
-        id: WorkerId(u64::from(position) + 1),
-        health: Health {
-            healthy: true,
-            ..Health::default()
-        },
-        in_flight,
-        load,
-        ..Candidate::default()
-    }
+    let mut row = Candidate::default();
+    row.position = position;
+    row.id = WorkerId(u64::from(position) + 1);
+    row.health.healthy = true;
+    row.in_flight = in_flight;
+    row.load = load;
+    row
 }
 
 fn reports<const N: usize>(loads: [(u32, u32); N]) -> [Candidate; N] {
     let mut positions = 0..;
     loads.map(|(running, queued)| {
-        row(
-            positions.next().expect("a position"),
-            0,
-            Some(LoadRow {
-                running,
-                queued,
-                ..LoadRow::default()
-            }),
-        )
+        let mut load = LoadRow::default();
+        load.running = running;
+        load.queued = queued;
+        row(positions.next().expect("a position"), 0, Some(load))
     })
 }
 
 fn decide(engine: &Engine, rows: &[Candidate], seed: u64, scratch: &mut Scratch) -> Pick {
-    let facts = RequestFacts {
-        seed,
-        ..RequestFacts::default()
-    };
+    let mut facts = RequestFacts::default();
+    facts.seed = seed;
     decide_with(engine, rows, &facts, scratch)
 }
 
@@ -73,10 +62,8 @@ fn decide_with(
     facts: &RequestFacts<'_>,
     scratch: &mut Scratch,
 ) -> Pick {
-    let pool = PoolFacts {
-        pool_size: rows.len() as u32,
-        ..PoolFacts::default()
-    };
+    let mut pool = PoolFacts::default();
+    pool.pool_size = rows.len() as u32;
     *engine
         .decide(facts, &pool, rows, &Constraints::default(), scratch)
         .pick()
@@ -89,10 +76,8 @@ fn scores(params: &str, rows: &[Candidate]) -> Vec<(u64, f32)> {
 
 /// The scores of a decision at `now_micros` on the host's clock.
 fn scores_at(engine: &Engine, rows: &[Candidate], now_micros: u64) -> Vec<(u64, f32)> {
-    let facts = RequestFacts {
-        now_micros,
-        ..RequestFacts::default()
-    };
+    let mut facts = RequestFacts::default();
+    facts.now_micros = now_micros;
     let pick = decide_with(engine, rows, &facts, &mut Scratch::new());
     pick.trace.top[..usize::from(pick.trace.top_len)]
         .iter()
@@ -365,10 +350,8 @@ fn each_load_term_reads_its_own_field_in_the_reports_units() {
         ("load.resident_tokens", |r, n| r.resident_tokens = n),
     ] {
         let make = |(position, n)| {
-            let mut report = LoadRow {
-                resident_counted: true,
-                ..LoadRow::default()
-            };
+            let mut report = LoadRow::default();
+            report.resident_counted = true;
             set(&mut report, n);
             row(position, 0, Some(report))
         };
@@ -550,18 +533,20 @@ fn mixed_reports() -> [Candidate; 3] {
         row(
             0,
             2,
-            Some(LoadRow {
-                running: 7,
-                ..LoadRow::default()
+            Some({
+                let mut load = LoadRow::default();
+                load.running = 7;
+                load
             }),
         ),
         row(1, 3, None),
         row(
             2,
             3,
-            Some(LoadRow {
-                running: 16,
-                ..LoadRow::default()
+            Some({
+                let mut load = LoadRow::default();
+                load.running = 16;
+                load
             }),
         ),
     ]
@@ -629,11 +614,10 @@ fn uncounted_resident_tokens_make_a_row_unreported_only_when_named() {
 #[test]
 fn zero_waiting_tokens_beside_a_queue_are_a_missing_value() {
     let report = |queued, waiting_uncached_tokens| {
-        Some(LoadRow {
-            queued,
-            waiting_uncached_tokens,
-            ..LoadRow::default()
-        })
+        let mut load = LoadRow::default();
+        load.queued = queued;
+        load.waiting_uncached_tokens = waiting_uncached_tokens;
+        Some(load)
     };
     // Tokens over a queue, a depth alone, and an empty queue.
     let rows = [
@@ -677,15 +661,11 @@ fn a_report_past_the_documents_age_limit_costs_as_no_report() {
         document("terms: {load.running: 5}, unreported: {over-least: {request_cost: 5}}");
     spec.view.max_report_age_ms = Some(LIMIT_MS);
     let engine = spec.validate().expect("a least-cost profile under a limit");
-    let facts = RequestFacts {
-        now_micros: NOW,
-        ..RequestFacts::default()
-    };
+    let mut facts = RequestFacts::default();
+    facts.now_micros = NOW;
     let scored = |rows: &[Candidate]| {
-        let pool = PoolFacts {
-            pool_size: rows.len() as u32,
-            ..PoolFacts::default()
-        };
+        let mut pool = PoolFacts::default();
+        pool.pool_size = rows.len() as u32;
         let mut scratch = Scratch::new();
         let pick = *engine
             .decide(&facts, &pool, rows, &Constraints::default(), &mut scratch)
@@ -715,10 +695,8 @@ fn a_report_past_the_documents_age_limit_costs_as_no_report() {
     // With no limit the same report is read whatever its age.
     spec.view.max_report_age_ms = None;
     let unlimited = spec.validate().expect("a least-cost profile");
-    let pool = PoolFacts {
-        pool_size: rows.len() as u32,
-        ..PoolFacts::default()
-    };
+    let mut pool = PoolFacts::default();
+    pool.pool_size = rows.len() as u32;
     let pick = *unlimited
         .decide(
             &facts,

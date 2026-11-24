@@ -17,8 +17,8 @@ use std::sync::Arc;
 use smg_grand_central::{
     document::Needs,
     engine::{
-        Binding, Candidate, Constraints, Decision, Engine, Health, Plan, PoolFacts, Profile,
-        RequestFacts, Scratch, ShedReason, WeightedScorer, WorkerId,
+        Binding, Candidate, Constraints, Decision, Engine, Plan, PoolFacts, Profile, RequestFacts,
+        Scratch, ShedReason, WeightedScorer, WorkerId,
     },
     plugins::{
         shared::{Failure, OpenDecisions},
@@ -117,33 +117,27 @@ fn engine_under(spec: PluginSpec) -> (Arc<Plugin>, Engine) {
 /// one; `healthy` says which of them are healthy.
 fn pool(healthy: [bool; 4]) -> Vec<Candidate> {
     (0..4u32)
-        .map(|i| Candidate {
-            position: i,
-            id: WorkerId(100 + u64::from(i)),
-            health: Health {
-                healthy: healthy[i as usize],
-                ..Health::default()
-            },
-            in_flight: 4 - i,
-            has_capacity: true,
-            ..Candidate::default()
+        .map(|i| {
+            let mut row = Candidate::default();
+            row.position = i;
+            row.id = WorkerId(100 + u64::from(i));
+            row.health.healthy = healthy[i as usize];
+            row.in_flight = 4 - i;
+            row.has_capacity = true;
+            row
         })
         .collect()
 }
 
 /// The decision over `candidates`.
 fn decide(engine: &Engine, candidates: &[Candidate]) -> Decision {
-    let facts = RequestFacts {
-        model: "m",
-        budget_micros: 10_000,
-        seed: 1,
-        ..RequestFacts::default()
-    };
-    let pool_facts = PoolFacts {
-        pool_size: candidates.len() as u32,
-        generation: 1,
-        ..PoolFacts::default()
-    };
+    let mut facts = RequestFacts::default();
+    facts.model = "m";
+    facts.budget_micros = 10_000;
+    facts.seed = 1;
+    let mut pool_facts = PoolFacts::default();
+    pool_facts.pool_size = candidates.len() as u32;
+    pool_facts.generation = 1;
     engine.decide(
         &facts,
         &pool_facts,

@@ -71,13 +71,11 @@ impl Replayed for Row {
         let mut answers = Vec::with_capacity(self.requests.len());
         for asked in &self.requests {
             let (wire_modes, runtime) = runtimes.stays_on(asked.wire.as_ref())?;
-            let constraints = Constraints {
-                wire_modes,
-                demands: Demands {
-                    runtime,
-                    ..Demands::default()
-                },
-                ..Constraints::default()
+            let mut constraints = Constraints::default();
+            constraints.wire_modes = wire_modes;
+            constraints.demands = Demands {
+                runtime,
+                ..Demands::default()
             };
             answers.push(bed.answer(constraints, pool_refusal)?);
         }

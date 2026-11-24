@@ -8,8 +8,8 @@ use smg_grand_central::{
         Capacity, FilterSpec, FilterStage, HasRoomParams, PolicySpec, SpecError, API_VERSION,
     },
     engine::{
-        Candidate, Constraints, Decision, Engine, Health, LoadRow, PoolFacts, RequestFacts,
-        Scratch, Target, WorkerId,
+        Candidate, Constraints, Decision, Engine, LoadRow, PoolFacts, RequestFacts, Scratch,
+        Target, WorkerId,
     },
     stages::Lifecycle,
     tracking::{Lease, Side},
@@ -35,37 +35,32 @@ fn policy(filters: &str) -> Engine {
 /// A healthy row whose report, sampled at the request's instant, counts
 /// `resident` tokens.
 fn row(position: u32, resident: u32) -> Candidate {
-    Candidate {
-        position,
-        id: WorkerId(u64::from(position) + 1),
-        health: Health {
-            healthy: true,
-            ..Health::default()
-        },
-        load_sampled_at_micros: NOW,
-        load: Some(LoadRow {
-            resident_tokens: resident,
-            resident_counted: true,
-            ..LoadRow::default()
-        }),
-        ..Candidate::default()
-    }
+    let mut row = Candidate::default();
+    row.position = position;
+    row.id = WorkerId(u64::from(position) + 1);
+    row.health.healthy = true;
+    row.load_sampled_at_micros = NOW;
+    row.load = Some({
+        let mut load = LoadRow::default();
+        load.resident_tokens = resident;
+        load.resident_counted = true;
+        load
+    });
+    row
 }
 
 fn request(prompt_tokens: u32) -> RequestFacts<'static> {
-    RequestFacts {
-        now_micros: NOW,
-        prompt_tokens,
-        ..RequestFacts::default()
-    }
+    let mut facts = RequestFacts::default();
+    facts.now_micros = NOW;
+    facts.prompt_tokens = prompt_tokens;
+    facts
 }
 
 /// A request of `prompt_tokens` whose answer may hold `limit` tokens.
 fn with_limit(prompt_tokens: u32, limit: u32) -> RequestFacts<'static> {
-    RequestFacts {
-        max_output_tokens: limit,
-        ..request(prompt_tokens)
-    }
+    let mut facts = request(prompt_tokens);
+    facts.max_output_tokens = limit;
+    facts
 }
 
 /// The rows the profile's filter at `at` keeps, by their positions. The
@@ -86,10 +81,8 @@ fn kept(policy: &Engine, at: usize, facts: &RequestFacts<'_>, rows: &[Candidate]
 
 /// The worker a decision over `rows` picks.
 fn picked(policy: &Engine, facts: &RequestFacts<'_>, rows: &[Candidate]) -> Option<WorkerId> {
-    let pool = PoolFacts {
-        pool_size: rows.len() as u32,
-        ..PoolFacts::default()
-    };
+    let mut pool = PoolFacts::default();
+    pool.pool_size = rows.len() as u32;
     let decision = policy.decide(
         facts,
         &pool,
@@ -151,9 +144,10 @@ fn the_requests_size_counts_where_the_rule_names_it() {
     assert_eq!(kept(&policy, 0, &request(301), &rows), [0u32; 0]);
     // A request of text alone counts at its text's bytes over four: 404
     // bytes are the 101 tokens that leave the second row no room.
-    let worded = |prompt_bytes| RequestFacts {
-        prompt_bytes,
-        ..request(0)
+    let worded = |prompt_bytes| {
+        let mut facts = request(0);
+        facts.prompt_bytes = prompt_bytes;
+        facts
     };
     assert_eq!(kept(&policy, 0, &worded(400), &rows), [0, 1]);
     assert_eq!(kept(&policy, 0, &worded(404), &rows), [0]);
@@ -224,10 +218,8 @@ fn the_output_limit_reserves_room_under_the_views_report_age_limit() {
     );
     spec.view.max_report_age_ms = Some(LIMIT_MS);
     let limited = spec.validate().expect("a valid policy");
-    let stale = Candidate {
-        load_sampled_at_micros: NOW - LIMIT_MS * 1_000 - 1,
-        ..row(2, 10)
-    };
+    let mut stale = row(2, 10);
+    stale.load_sampled_at_micros = NOW - LIMIT_MS * 1_000 - 1;
     let rows = [row(0, 600), row(1, 601), stale];
     // Twice an answer of 199 leaves both fresh rows under the bound.
     assert_eq!(kept(&limited, 0, &with_limit(0, 199), &rows), [0, 1]);
@@ -259,10 +251,8 @@ fn where_no_row_has_room_the_filter_steps_aside_and_every_row_stands() {
 fn a_row_that_lacks_a_named_value_has_no_room() {
     let policy = policy(RESIDENT);
     let reported = row(0, 10);
-    let unreported = Candidate {
-        load: None,
-        ..row(1, 0)
-    };
+    let mut unreported = row(1, 0);
+    unreported.load = None;
     let mut uncounted = row(2, 10);
     if let Some(load) = uncounted.load.as_mut() {
         load.resident_counted = false;
@@ -274,21 +264,18 @@ fn a_row_that_lacks_a_named_value_has_no_room() {
     let running = self::policy(r#"{"has-room":{"used":{"load.running":1},"capacity":2}}"#);
     assert_eq!(kept(&running, 0, &request(0), &rows), [0, 2]);
     // Where no row reports, the filter keeps nobody and steps aside.
-    let silent = [
-        Candidate {
-            position: 0,
-            id: WorkerId(7),
-            ..unreported
-        },
-        unreported,
-    ];
+    let mut candidate = unreported;
+    candidate.position = 0;
+    candidate.id = WorkerId(7);
+    let silent = [candidate, unreported];
     assert_eq!(kept(&policy, 0, &request(0), &silent), [0u32; 0]);
     assert!(picked(&policy, &request(0), &silent).is_some());
     // A rule that reads no report keeps a row with none.
     let counted = self::policy(r#"{"has-room":{"used":{"candidate.in_flight":1},"capacity":2}}"#);
-    let busy = |in_flight| Candidate {
-        in_flight,
-        ..unreported
+    let busy = |in_flight| {
+        let mut record = unreported;
+        record.in_flight = in_flight;
+        record
     };
     assert!(counted.profiles()[0].filters[0].keep(&request(0), &busy(2), &Constraints::default()));
     assert!(!counted.profiles()[0].filters[0].keep(&request(0), &busy(3), &Constraints::default()));
@@ -334,9 +321,10 @@ fn the_rule_needs_reports_where_a_term_reads_them_or_the_sends() {
 fn a_report_past_the_views_limit_reads_as_no_report() {
     const LIMIT_MS: u64 = 27;
     const EDGE: u64 = NOW - LIMIT_MS * 1_000;
-    let sampled = |position, sample| Candidate {
-        load_sampled_at_micros: sample,
-        ..row(position, 10)
+    let sampled = |position, sample| {
+        let mut row = row(position, 10);
+        row.load_sampled_at_micros = sample;
+        row
     };
     let rows = [sampled(0, EDGE), sampled(1, EDGE - 1)];
     let mut spec = document(RESIDENT);
@@ -398,17 +386,16 @@ fn a_send_takes_room_until_a_report_or_the_profiles_limit_ends_it() {
         policy.on_dispatched(&lease, &target, Side::Single, DELAY);
     };
     let at = START + u64::from(DELAY);
-    let facts = |now_micros| RequestFacts {
-        now_micros,
-        ..RequestFacts::default()
+    let facts = |now_micros| {
+        let mut request_facts = RequestFacts::default();
+        request_facts.now_micros = now_micros;
+        request_facts
     };
     // The row's report was sampled ahead of both sends.
     let mut a = row(0, 0);
     a.load_sampled_at_micros = at - 1;
-    let b = Candidate {
-        load_sampled_at_micros: at - 1,
-        ..row(1, 0)
-    };
+    let mut b = row(1, 0);
+    b.load_sampled_at_micros = at - 1;
     send(&a);
     assert_eq!(kept(&policy, 0, &facts(at + 400), &[a, b]), [0, 1]);
     send(&a);
@@ -448,10 +435,8 @@ fn a_send_takes_room_past_a_report_sampled_sooner_than_the_profiles_delay() {
         ..Target::default()
     };
     policy.on_dispatched(&lease, &target, Side::Single, 0);
-    let facts = RequestFacts {
-        now_micros: SENT_AT + 9_000,
-        ..RequestFacts::default()
-    };
+    let mut facts = RequestFacts::default();
+    facts.now_micros = SENT_AT + 9_000;
     // Three milliseconds behind the send: its 317 tokens are over 300.
     a.load_sampled_at_micros = SENT_AT + 3_000;
     assert_eq!(kept(&policy, 0, &facts, &[a, b]), [1]);
@@ -499,10 +484,8 @@ fn a_send_of_text_alone_takes_room_by_its_bytes_over_four() {
     let rows = [row(0, 800), row(1, 0)];
     // A request of text alone states no token count: its 404 bytes read
     // as 101, and 800 resident with them are under the thousand.
-    let text = RequestFacts {
-        prompt_bytes: 404,
-        ..request(0)
-    };
+    let mut text = request(0);
+    text.prompt_bytes = 404;
     assert_eq!(kept(&policy, 0, &text, &rows), [0, 1]);
     // The same text is sent to the first row, behind its report's sample.
     let lease = Lease {

@@ -13,8 +13,8 @@
 use smg_grand_central::{
     document::{AppliedSpec, PolicySettings, PolicySpec},
     engine::{
-        Candidate, Constraints, Decision, Engine, Health, PairPools, Phase, PoolFacts,
-        RequestFacts, Role, Scratch, Target, WorkerId,
+        Candidate, Constraints, Decision, Engine, PairPools, Phase, PoolFacts, RequestFacts, Role,
+        Scratch, Target, WorkerId,
     },
 };
 
@@ -35,45 +35,41 @@ fn decided(mut document: PolicySpec) -> Engine {
 
 /// A request for [`MODEL`] decided under `seed`.
 fn request(seed: u64) -> RequestFacts<'static> {
-    RequestFacts {
-        model: MODEL,
-        phase: Phase::Prefill,
-        seed,
-        ..RequestFacts::default()
-    }
+    let mut facts = RequestFacts::default();
+    facts.model = MODEL;
+    facts.phase = Phase::Prefill;
+    facts.seed = seed;
+    facts
 }
 
 /// A rank of the engine at place 0 of its list, at `position`, holding
 /// `in_flight` requests.
 fn rank(position: u32, role: Role, dp_rank: u16, in_flight: u32) -> Candidate {
-    Candidate {
-        engine: 0,
-        dp_rank,
-        dp_size: 2,
-        in_flight,
-        ..alone(position, role, in_flight)
-    }
+    let mut row = alone(position, role, in_flight);
+    row.engine = 0;
+    row.dp_rank = dp_rank;
+    row.dp_size = 2;
+    row.in_flight = in_flight;
+    row
 }
 
 /// A worker that stands alone at `position`, holding `in_flight` requests:
 /// a record made ready is an engine of its own. Its engine is its position,
 /// which is right where every record before it is an engine of its own.
 fn alone(position: u32, role: Role, in_flight: u32) -> Candidate {
-    Candidate {
-        in_flight,
-        pair_class: 1,
-        ..Candidate::ready(position, WorkerId(100 + u64::from(position)), role)
-    }
+    let mut row = Candidate::ready(position, WorkerId(100 + u64::from(position)), role);
+    row.in_flight = in_flight;
+    row.pair_class = 1;
+    row
 }
 
 /// A worker that stands alone behind the two ranks of engine 0, at
 /// `position`: the next engine of its list. An engine states its place
 /// among the engines of its list, so this one states `1`.
 fn behind(position: u32, role: Role, in_flight: u32) -> Candidate {
-    Candidate {
-        engine: 1,
-        ..alone(position, role, in_flight)
-    }
+    let mut row = alone(position, role, in_flight);
+    row.engine = 1;
+    row
 }
 
 /// The first target `decision` picks.
@@ -122,18 +118,11 @@ fn a_rank_a_filter_drops_still_counts_on_its_engine() {
     let (pool, cx) = (PoolFacts::default(), Constraints::default());
     let mut scratch = Scratch::new();
     let busy = rank(0, Role::Single, 0, 20);
-    let overloaded = Health {
-        overloaded: true,
-        ..busy.health
-    };
-    let records = [
-        Candidate {
-            health: overloaded,
-            ..busy
-        },
-        rank(1, Role::Single, 1, 0),
-        behind(2, Role::Single, 2),
-    ];
+    let mut overloaded = busy.health;
+    overloaded.overloaded = true;
+    let mut row = busy;
+    row.health = overloaded;
+    let records = [row, rank(1, Role::Single, 1, 0), behind(2, Role::Single, 2)];
     for seed in 1..=16 {
         let decision = engine.decide(&request(seed), &pool, &records, &cx, &mut scratch);
         assert_eq!(first(&decision), Target::of(&records[2]), "seed {seed}");

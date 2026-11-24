@@ -90,11 +90,10 @@ enum State {
 
 impl State {
     fn health(self) -> Health {
-        Health {
-            healthy: self != Self::Down,
-            overloaded: self == Self::Over,
-            ..Health::default()
-        }
+        let mut health = Health::default();
+        health.healthy = self != Self::Down;
+        health.overloaded = self == Self::Over;
+        health
     }
 }
 
@@ -324,15 +323,16 @@ impl Bed {
             .workers
             .iter()
             .enumerate()
-            .map(|(place, worker)| Candidate {
-                position: place as u32,
-                id: id(place),
-                key: 1_000 + place as u32,
-                health: worker.state.health(),
-                in_flight: worker.in_flight,
-                load: worker.report.map(load_row),
-                load_sampled_at_micros: clock,
-                ..Candidate::default()
+            .map(|(place, worker)| {
+                let mut candidate = Candidate::default();
+                candidate.position = place as u32;
+                candidate.id = id(place);
+                candidate.key = 1_000 + place as u32;
+                candidate.health = worker.state.health();
+                candidate.in_flight = worker.in_flight;
+                candidate.load = worker.report.map(load_row);
+                candidate.load_sampled_at_micros = clock;
+                candidate
             })
             .collect();
         Ok(Self {
@@ -363,12 +363,11 @@ impl Bed {
                     let overlap = (1..=prompt.len() / per)
                         .take_while(|&blocks| held.iter().any(|h| h[..] == prompt[..blocks * per]))
                         .count();
-                    AffinityFacts {
-                        overlap_blocks: overlap as u32,
-                        indexed_growth: held.len() as u32,
-                        indexed_blocks: held.len() as u32,
-                        ..AffinityFacts::default()
-                    }
+                    let mut affinity = AffinityFacts::default();
+                    affinity.overlap_blocks = overlap as u32;
+                    affinity.indexed_growth = held.len() as u32;
+                    affinity.indexed_blocks = held.len() as u32;
+                    affinity
                 })
                 .collect(),
             // The holders of the deepest match alone, by the prompts
@@ -388,9 +387,10 @@ impl Bed {
                 let deepest = depths.iter().copied().max().unwrap_or(0);
                 depths
                     .iter()
-                    .map(|&depth| AffinityFacts {
-                        predicted_blocks: if depth == deepest { depth } else { 0 },
-                        ..AffinityFacts::default()
+                    .map(|&depth| {
+                        let mut affinity = AffinityFacts::default();
+                        affinity.predicted_blocks = if depth == deepest { depth } else { 0 };
+                        affinity
                     })
                     .collect()
             }
@@ -407,29 +407,25 @@ impl Bed {
         let column = self.column(&prompt);
         let tried: Vec<WorkerId> = tried.iter().map(|&i| id(i)).collect();
         let text = self.matcher == Matcher::Text;
-        let facts = RequestFacts {
-            model: MODEL,
-            // A text of four characters an id is an estimate of one token
-            // an id.
-            prompt_tokens: prompt.len() as u32,
-            hash_kind: if text {
-                HashKind::Text
-            } else {
-                HashKind::Token
-            },
-            block_size: self.block_size,
-            attempt: u8::from(!tried.is_empty()),
-            tried: &tried,
-            seed,
-            now_micros: self.clock,
-            affinity: &column,
-            ..RequestFacts::default()
+        let mut facts = RequestFacts::default();
+        facts.model = MODEL;
+        // A text of four characters an id is an estimate of one token
+        // an id.
+        facts.prompt_tokens = prompt.len() as u32;
+        facts.hash_kind = if text {
+            HashKind::Text
+        } else {
+            HashKind::Token
         };
-        let pool_facts = PoolFacts {
-            pool_size: self.pool.len() as u32,
-            generation: 1,
-            ..PoolFacts::default()
-        };
+        facts.block_size = self.block_size;
+        facts.attempt = u8::from(!tried.is_empty());
+        facts.tried = &tried;
+        facts.seed = seed;
+        facts.now_micros = self.clock;
+        facts.affinity = &column;
+        let mut pool_facts = PoolFacts::default();
+        pool_facts.pool_size = self.pool.len() as u32;
+        pool_facts.generation = 1;
         let decision = self.engine.decide(
             &facts,
             &pool_facts,

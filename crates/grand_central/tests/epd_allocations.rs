@@ -26,8 +26,8 @@ use common::counting_alloc::{calls, Counting};
 use smg_grand_central::{
     document::PolicySpec,
     engine::{
-        Candidate, Constraints, EncodeItems, EncodePlaced, EncodePool, EncoderFacts, Health,
-        Identity, MediaCounts, PairPools, Phase, PoolFacts, RequestFacts, Role, Scratch, WorkerId,
+        Candidate, Constraints, EncodeItems, EncodePlaced, EncodePool, EncoderFacts, Identity,
+        PairPools, Phase, PoolFacts, RequestFacts, Role, Scratch, WorkerId,
     },
     policies::consistent_hashing::LentRing,
 };
@@ -37,18 +37,16 @@ static GLOBAL: Counting = Counting(std::alloc::System);
 
 fn encoders(n: u32) -> Vec<Candidate> {
     (0..n)
-        .map(|i| Candidate {
-            position: i,
-            id: WorkerId(1_000 + u64::from(i)),
-            key: 1_000 + i,
-            role: Role::Encode,
-            health: Health {
-                healthy: true,
-                ..Health::default()
-            },
-            ec_compatible: true,
-            vision: true,
-            ..Candidate::default()
+        .map(|i| {
+            let mut row = Candidate::default();
+            row.position = i;
+            row.id = WorkerId(1_000 + u64::from(i));
+            row.key = 1_000 + i;
+            row.role = Role::Encode;
+            row.health.healthy = true;
+            row.ec_compatible = true;
+            row.vision = true;
+            row
         })
         .collect()
 }
@@ -132,19 +130,18 @@ fn an_encode_items_decision_allocates_nothing_after_the_first() {
             .expect("validates");
         for n in [8u32, 64, 512] {
             let pool = encoders(n);
-            let facts_of = |key: u64| RequestFacts {
-                model: "m",
-                phase: Phase::Encode,
-                session_key: Identity::hashed(key),
-                seed: key,
-                now_micros: 1_000_000,
-                ..RequestFacts::default()
+            let facts_of = |key: u64| {
+                let mut facts = RequestFacts::default();
+                facts.model = "m";
+                facts.phase = Phase::Encode;
+                facts.session_key = Identity::hashed(key);
+                facts.seed = key;
+                facts.now_micros = 1_000_000;
+                facts
             };
-            let pool_facts = PoolFacts {
-                pool_size: n,
-                generation: 1,
-                ..PoolFacts::default()
-            };
+            let mut pool_facts = PoolFacts::default();
+            pool_facts.pool_size = n;
+            pool_facts.generation = 1;
             let cx = Constraints::default();
             let mut scratch = Scratch::new();
             // The first decision sizes the scratch and teaches the ring.
@@ -173,20 +170,18 @@ fn an_encode_items_decision_allocates_nothing_after_the_first() {
 /// bit set.
 fn side(role: Role, first: u32, n: u32) -> Vec<Candidate> {
     (0..n)
-        .map(|i| Candidate {
-            position: i,
-            id: WorkerId(u64::from(first + i)),
-            key: first + i,
-            role,
-            health: Health {
-                healthy: true,
-                ..Health::default()
-            },
-            pair_class: 1,
-            has_capacity: true,
-            has_room: true,
-            vision: true,
-            ..Candidate::default()
+        .map(|i| {
+            let mut row = Candidate::default();
+            row.position = i;
+            row.id = WorkerId(u64::from(first + i));
+            row.key = first + i;
+            row.role = role;
+            row.health.healthy = true;
+            row.pair_class = 1;
+            row.has_capacity = true;
+            row.has_room = true;
+            row.vision = true;
+            row
         })
         .collect()
 }
@@ -279,18 +274,14 @@ fn an_encode_pair_decision_allocates_nothing_after_its_first_32() {
                     affinity: &[],
                     ..EncodePool::default()
                 };
-                let pool_facts = PoolFacts {
-                    pool_size: n,
-                    generation: 1,
-                    ..PoolFacts::default()
-                };
+                let mut pool_facts = PoolFacts::default();
+                pool_facts.pool_size = n;
+                pool_facts.generation = 1;
                 let cx = Constraints::default();
                 // The first row of each pool, masked.
                 let stalled = [0u32];
-                let masked = Constraints {
-                    stalled: &stalled,
-                    ..Constraints::default()
-                };
+                let mut masked = Constraints::default();
+                masked.stalled = &stalled;
                 let mut scratch = Scratch::new();
                 let mut placed = EncodePlaced::new();
                 let ring = ByRow(pool.iter().map(|row| row.id).collect());
@@ -302,16 +293,11 @@ fn an_encode_pair_decision_allocates_nothing_after_its_first_32() {
                             Identity::hashed(seed * 16 + item)
                         }
                     });
-                    let facts = RequestFacts {
-                        model: "m",
-                        media: MediaCounts {
-                            images: 1,
-                            ..MediaCounts::default()
-                        },
-                        seed,
-                        now_micros: 1_000_000,
-                        ..RequestFacts::default()
-                    };
+                    let mut facts = RequestFacts::default();
+                    facts.model = "m";
+                    facts.media.images = 1;
+                    facts.seed = seed;
+                    facts.now_micros = 1_000_000;
                     let items = EncodeItems {
                         keys: &keys,
                         one: None,

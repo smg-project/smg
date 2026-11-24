@@ -36,24 +36,22 @@ const SIZES: [usize; 3] = [8, 64, 512];
 const KEYS: u64 = 64;
 
 fn facts(seed: u64) -> RequestFacts<'static> {
-    RequestFacts {
-        model: "m",
-        prompt_tokens: 512,
-        seed,
-        session_key: Identity::hashed(1 + seed % KEYS),
-        now_micros: 1_000_000,
-        ..RequestFacts::default()
-    }
+    let mut facts = RequestFacts::default();
+    facts.model = "m";
+    facts.prompt_tokens = 512;
+    facts.seed = seed;
+    facts.session_key = Identity::hashed(1 + seed % KEYS);
+    facts.now_micros = 1_000_000;
+    facts
 }
 
 fn pool_of(view: &[Candidate]) -> PoolFacts<'static> {
-    PoolFacts {
-        pool_size: view.len() as u32,
-        generation: 1,
-        // Every row of the bench's fleet reports a rate.
-        reported: true,
-        ..PoolFacts::default()
-    }
+    let mut pool = PoolFacts::default();
+    pool.pool_size = view.len() as u32;
+    pool.generation = 1;
+    // Every row of the bench's fleet reports a rate.
+    pool.reported = true;
+    pool
 }
 
 fn decide_over(

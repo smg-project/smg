@@ -32,7 +32,7 @@ use smg_grand_central::{
     document::PolicySpec,
     engine::{
         Candidate, Constraints, EncodeItems, EncodePlaced, EncodePool, EncoderFacts, Identity,
-        MediaCounts, PairPools, PoolFacts, RequestFacts, Role, Scratch, WorkerId,
+        PairPools, PoolFacts, RequestFacts, Role, Scratch, WorkerId,
     },
 };
 
@@ -95,23 +95,19 @@ fn encode_pair(c: &mut Criterion) {
                 affinity: &[],
                 ..EncodePool::default()
             };
-            let pool = PoolFacts {
-                pool_size: prefills.len() as u32,
-                generation: 1,
-                ..PoolFacts::default()
-            };
+            let mut pool = PoolFacts::default();
+            pool.pool_size = prefills.len() as u32;
+            pool.generation = 1;
             let cx = Constraints::default();
             let mut scratch = Scratch::new();
             let mut placed = EncodePlaced::new();
-            let facts_of = |seed: u64| RequestFacts {
-                model: "m",
-                media: MediaCounts {
-                    images: 1,
-                    ..MediaCounts::default()
-                },
-                seed,
-                now_micros: 1_000_000,
-                ..RequestFacts::default()
+            let facts_of = |seed: u64| {
+                let mut facts = RequestFacts::default();
+                facts.model = "m";
+                facts.media.images = 1;
+                facts.seed = seed;
+                facts.now_micros = 1_000_000;
+                facts
             };
             if preset == "consistent_hashing" {
                 group.bench_with_input(BenchmarkId::new("pair_alone", n), &n, |b, _| {
@@ -217,11 +213,9 @@ fn left_out(c: &mut Criterion) {
                 affinity: &[],
                 ..EncodePool::default()
             };
-            let pool = PoolFacts {
-                pool_size: prefills.len() as u32,
-                generation: 1,
-                ..PoolFacts::default()
-            };
+            let mut pool = PoolFacts::default();
+            pool.pool_size = prefills.len() as u32;
+            pool.generation = 1;
             let cx = Constraints::default();
             let mut scratch = Scratch::new();
             let mut placed = EncodePlaced::new();
@@ -229,16 +223,11 @@ fn left_out(c: &mut Criterion) {
                 let mut seed = 0u64;
                 b.iter(|| {
                     seed += 1;
-                    let facts = RequestFacts {
-                        model: "m",
-                        media: MediaCounts {
-                            images: 1,
-                            ..MediaCounts::default()
-                        },
-                        seed,
-                        now_micros: 1_000_000,
-                        ..RequestFacts::default()
-                    };
+                    let mut facts = RequestFacts::default();
+                    facts.model = "m";
+                    facts.media.images = 1;
+                    facts.seed = seed;
+                    facts.now_micros = 1_000_000;
                     let keys = [Identity::hashed(
                         (seed * 16).wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1,
                     )];

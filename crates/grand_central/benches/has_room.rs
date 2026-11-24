@@ -106,13 +106,11 @@ fn paths(c: &mut Criterion) {
     ];
     for &n in &SIZES {
         let view = rows(n);
-        let pool = PoolFacts {
-            pool_size: n as u32,
-            generation: 1,
-            // Every row of the bench's fleet reports a rate.
-            reported: true,
-            ..PoolFacts::default()
-        };
+        let mut pool = PoolFacts::default();
+        pool.pool_size = n as u32;
+        pool.generation = 1;
+        // Every row of the bench's fleet reports a rate.
+        pool.reported = true;
         let cx = Constraints::default();
         for (path, with_rule, drawn, sends) in cells {
             let engine = policy(with_rule, drawn);
@@ -124,13 +122,11 @@ fn paths(c: &mut Criterion) {
                 let mut seed = 0u64;
                 b.iter(|| {
                     seed += 1;
-                    let facts = RequestFacts {
-                        model: "m",
-                        prompt_tokens: 512,
-                        seed,
-                        now_micros: 1_000_000,
-                        ..RequestFacts::default()
-                    };
+                    let mut facts = RequestFacts::default();
+                    facts.model = "m";
+                    facts.prompt_tokens = 512;
+                    facts.seed = seed;
+                    facts.now_micros = 1_000_000;
                     engine.decide(&facts, &pool, black_box(&view), &cx, &mut scratch)
                 });
             });

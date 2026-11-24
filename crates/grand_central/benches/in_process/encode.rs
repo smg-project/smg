@@ -109,10 +109,9 @@ pub(super) fn words() -> String {
 
 /// The media of one request: [`ITEMS`] images.
 fn images() -> MediaCounts {
-    MediaCounts {
-        images: ITEMS as u16,
-        ..MediaCounts::default()
-    }
+    let mut media = MediaCounts::default();
+    media.images = ITEMS as u16;
+    media
 }
 
 /// The keys of one request's items by the turn's seed, each item's own:

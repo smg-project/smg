@@ -20,9 +20,7 @@
 use serde::Deserialize;
 use smg_grand_central::{
     document::PolicySpec,
-    engine::{
-        Candidate, Constraints, Engine, Health, Phase, PoolFacts, RequestFacts, Scratch, WorkerId,
-    },
+    engine::{Candidate, Constraints, Engine, Phase, PoolFacts, RequestFacts, Scratch, WorkerId},
     stages::Lifecycle,
     tracking::{Lease, Membership},
 };
@@ -187,15 +185,11 @@ impl Bed {
 
     fn join(&mut self) {
         let number = self.ready.len();
-        self.view.push(Candidate {
-            id: WorkerId(1_000 + number as u64),
-            key: 1_000 + number as u32,
-            health: Health {
-                healthy: true,
-                ..Health::default()
-            },
-            ..Candidate::default()
-        });
+        let mut row = Candidate::default();
+        row.id = WorkerId(1_000 + number as u64);
+        row.key = 1_000 + number as u32;
+        row.health.healthy = true;
+        self.view.push(row);
         self.numbers.push(number);
         self.ready.push(true);
         self.settle();
@@ -228,20 +222,16 @@ impl Bed {
             .iter()
             .map(|&number| WorkerId(1_000 + number as u64))
             .collect();
-        let facts = RequestFacts {
-            model: "m",
-            phase: self.phase,
-            prompt_tokens: request.size(),
-            tried: &tried,
-            seed: self.seed,
-            now_micros,
-            ..RequestFacts::default()
-        };
-        let pool = PoolFacts {
-            pool_size: self.view.len() as u32,
-            generation: 1,
-            ..PoolFacts::default()
-        };
+        let mut facts = RequestFacts::default();
+        facts.model = "m";
+        facts.phase = self.phase;
+        facts.prompt_tokens = request.size();
+        facts.tried = &tried;
+        facts.seed = self.seed;
+        facts.now_micros = now_micros;
+        let mut pool = PoolFacts::default();
+        pool.pool_size = self.view.len() as u32;
+        pool.generation = 1;
         let decision = self.engine.decide(
             &facts,
             &pool,

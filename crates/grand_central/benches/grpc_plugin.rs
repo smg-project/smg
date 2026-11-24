@@ -145,22 +145,20 @@ fn engine_of(profile: Profile) -> Engine {
 }
 
 fn facts(seed: u64) -> RequestFacts<'static> {
-    RequestFacts {
-        model: "m",
-        prompt_tokens: 512,
-        budget_micros: BUDGET_MICROS,
-        seed,
-        now_micros: 1_000_000,
-        ..RequestFacts::default()
-    }
+    let mut facts = RequestFacts::default();
+    facts.model = "m";
+    facts.prompt_tokens = 512;
+    facts.budget_micros = BUDGET_MICROS;
+    facts.seed = seed;
+    facts.now_micros = 1_000_000;
+    facts
 }
 
 fn pool_of(n: usize) -> PoolFacts<'static> {
-    PoolFacts {
-        pool_size: n as u32,
-        generation: 1,
-        ..PoolFacts::default()
-    }
+    let mut pool = PoolFacts::default();
+    pool.pool_size = n as u32;
+    pool.generation = 1;
+    pool
 }
 
 fn decide(c: &mut Criterion) {
@@ -248,10 +246,8 @@ fn prompt(c: &mut Criterion) {
                 let mut seed = 0u64;
                 b.iter(|| {
                     seed += 1;
-                    let facts = RequestFacts {
-                        block_hashes: black_box(&held),
-                        ..facts(seed)
-                    };
+                    let mut facts = facts(seed);
+                    facts.block_hashes = black_box(&held);
                     engine.decide(&facts, &pool, black_box(&view), &cx, &mut scratch)
                 });
             });

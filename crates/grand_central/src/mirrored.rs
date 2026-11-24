@@ -14,7 +14,13 @@
 //! The package's own tests build this module (`test-util`); no build of a
 //! product has it.
 
-use crate::tracking::{Membership, Outcome, ReleaseReason, Signal, TransportClass};
+use crate::{
+    engine::{
+        AffinityFacts, Candidate, Constraints, HashKind, Health, LoadRow, MediaCounts,
+        OverloadRegime, PoolFacts, RequestFacts, SignalSource, ZoneCapacity,
+    },
+    tracking::{Membership, Outcome, ReleaseReason, Signal, TransportClass},
+};
 
 /// A record's field names in declaration order. The pattern names every
 /// field without `..`, so the type cannot gain, lose or rename one without
@@ -127,6 +133,233 @@ pub fn signal() -> &'static [&'static str] {
             Load,
             Health,
             GatewayVeto,
+        }
+    )
+}
+
+/// The fields of [`Candidate`].
+#[must_use]
+pub fn candidate() -> &'static [&'static str] {
+    record!(
+        Candidate,
+        Candidate {
+            position,
+            id,
+            role,
+            dp_rank,
+            dp_size,
+            health,
+            wire_modes,
+            engine_kind,
+            connector,
+            in_flight,
+            load,
+            load_sampled_at_micros,
+            session_hit,
+            session_in_flight,
+            pair_class,
+            has_capacity,
+            has_room,
+            zone,
+            labels,
+            ec_compatible,
+            vision,
+            host_local,
+            active_sessions,
+            key,
+            engine,
+        }
+    )
+}
+
+/// The fields of [`AffinityFacts`].
+#[must_use]
+pub fn affinity_facts() -> &'static [&'static str] {
+    record!(
+        AffinityFacts,
+        AffinityFacts {
+            overlap_blocks,
+            predicted_blocks,
+            admitted_age_ms,
+            indexed_growth,
+            indexed_blocks,
+        }
+    )
+}
+
+/// The fields of [`RequestFacts`].
+#[must_use]
+pub fn request_facts() -> &'static [&'static str] {
+    record!(
+        RequestFacts<'_>,
+        RequestFacts {
+            model,
+            namespace_seed,
+            tenant,
+            priority,
+            streaming,
+            max_output_tokens,
+            prompt_tokens,
+            block_hashes,
+            hash_kind,
+            session_key,
+            phase,
+            attempt,
+            tried,
+            budget_micros,
+            headers,
+            media,
+            seed,
+            block_size,
+            prompt_chars,
+            prompt_bytes,
+            now_micros,
+            session_counted,
+            affinity,
+            named,
+            model_fingerprint,
+            signal_cells,
+            client_key,
+            ring,
+            ring_positions,
+            session_key_from_rid,
+        }
+    )
+}
+
+/// The fields of [`LoadRow`].
+#[must_use]
+pub fn load_row() -> &'static [&'static str] {
+    record!(
+        LoadRow,
+        LoadRow {
+            running,
+            queued,
+            waiting_uncached_tokens,
+            kv_usage_permille,
+            active_kv_permille,
+            live_rate,
+            resident_tokens,
+            resident_counted,
+            report_age_ms,
+            source,
+            max_running,
+        }
+    )
+}
+
+/// The fields of [`Constraints`].
+#[must_use]
+pub fn constraints() -> &'static [&'static str] {
+    record!(
+        Constraints<'_>,
+        Constraints {
+            excluded,
+            wire_modes,
+            overload_lifted,
+            decode_later,
+            counted_on_decode,
+            subset_hint,
+            demands,
+            stalled,
+            held,
+            places
+        }
+    )
+}
+
+/// The fields of [`PoolFacts`].
+#[must_use]
+pub fn pool_facts() -> &'static [&'static str] {
+    record!(
+        PoolFacts<'_>,
+        PoolFacts {
+            pool_size,
+            membership_epoch,
+            ring_epoch,
+            regime,
+            generation,
+            zones,
+            reach,
+            reported,
+            engines,
+            word,
+        }
+    )
+}
+
+/// The fields of [`ZoneCapacity`].
+#[must_use]
+pub fn zone_capacity() -> &'static [&'static str] {
+    record!(
+        ZoneCapacity,
+        ZoneCapacity {
+            zone,
+            healthy,
+            total
+        }
+    )
+}
+
+/// The fields of [`MediaCounts`].
+#[must_use]
+pub fn media_counts() -> &'static [&'static str] {
+    record!(
+        MediaCounts,
+        MediaCounts {
+            images,
+            audio,
+            video,
+            bytes
+        }
+    )
+}
+
+/// The fields of [`Health`].
+#[must_use]
+pub fn health() -> &'static [&'static str] {
+    record!(
+        Health,
+        Health {
+            healthy,
+            breaker_open,
+            stalled,
+            draining,
+            overloaded
+        }
+    )
+}
+
+/// The cases of [`HashKind`].
+#[must_use]
+pub fn hash_kind() -> &'static [&'static str] {
+    cases!(HashKind, HashKind { Token, Text })
+}
+
+/// The cases of [`SignalSource`].
+#[must_use]
+pub fn signal_source() -> &'static [&'static str] {
+    cases!(
+        SignalSource,
+        SignalSource {
+            None,
+            Events,
+            Scrape,
+            Relay,
+            Poll
+        }
+    )
+}
+
+/// The cases of [`OverloadRegime`].
+#[must_use]
+pub fn overload_regime() -> &'static [&'static str] {
+    cases!(
+        OverloadRegime,
+        OverloadRegime {
+            None,
+            Partial,
+            Saturated
         }
     )
 }

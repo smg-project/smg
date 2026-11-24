@@ -29,19 +29,20 @@ use smg_grand_central::engine::{
 const SIZES: [usize; 5] = [8, 64, 128, 512, 1024];
 
 fn facts(seed: u64, holders: &[AffinityHolder]) -> RequestFacts<'_> {
-    RequestFacts {
-        model: "m",
-        prompt_tokens: 512,
-        seed,
-        now_micros: 1_000_000,
-        named: Some(AffinityRows {
-            holders,
-            warming: &[],
-            thin: false,
-            mean_in_flight: None,
-        }),
-        ..RequestFacts::default()
-    }
+    let mut facts = RequestFacts::default();
+    facts.model = "m";
+    facts.prompt_tokens = 512;
+    facts.seed = seed;
+    facts.now_micros = 1_000_000;
+    facts.named = Some({
+        let mut affinity_rows = AffinityRows::default();
+        affinity_rows.holders = holders;
+        affinity_rows.warming = &[];
+        affinity_rows.thin = false;
+        affinity_rows.mean_in_flight = None;
+        affinity_rows
+    });
+    facts
 }
 
 fn decide(c: &mut Criterion) {
@@ -58,10 +59,12 @@ fn decide(c: &mut Criterion) {
         let mut holders: Vec<AffinityHolder> = (0u32..)
             .zip(&held)
             .filter(|(_, entry)| entry.overlap_blocks > 0 || entry.predicted_blocks > 0)
-            .map(|(row, entry)| AffinityHolder {
-                row,
-                overlap_blocks: entry.overlap_blocks,
-                predicted_blocks: entry.predicted_blocks,
+            .map(|(row, entry)| {
+                let mut affinity_holder = AffinityHolder::default();
+                affinity_holder.row = row;
+                affinity_holder.overlap_blocks = entry.overlap_blocks;
+                affinity_holder.predicted_blocks = entry.predicted_blocks;
+                affinity_holder
             })
             .collect();
         let cap = engine.sample_for("m", Phase::Single) as usize;
@@ -86,11 +89,9 @@ fn decide(c: &mut Criterion) {
             holders.sort_by_key(|holder| holder.row);
         }
         let mut scratch = Scratch::new();
-        let pool = PoolFacts {
-            pool_size: n as u32,
-            generation: 1,
-            ..PoolFacts::default()
-        };
+        let mut pool = PoolFacts::default();
+        pool.pool_size = n as u32;
+        pool.generation = 1;
         let cx = Constraints::default();
         let first = engine.decide(&facts(0, &holders), &pool, &rows, &cx, &mut scratch);
         assert!(first.pick().is_some(), "{n}: the decision picks a worker");

@@ -6,8 +6,8 @@
 use smg_grand_central::{
     document::{PolicySpec, SpecError, API_VERSION},
     engine::{
-        Candidate, Constraints, Decision, Engine, Health, LoadRow, Pair, PairPools, Phase,
-        PoolFacts, RequestFacts, Scratch, Target, WorkerId,
+        Candidate, Constraints, Decision, Engine, LoadRow, Pair, PairPools, Phase, PoolFacts,
+        RequestFacts, Scratch, Target, WorkerId,
     },
     load::{SignalCell, SignalCells},
     stages::Lifecycle,
@@ -65,16 +65,12 @@ fn refused(filters: &str, score: &str) -> SpecError {
 }
 
 fn row(position: u32, in_flight: u32) -> Candidate {
-    Candidate {
-        position,
-        id: WorkerId(u64::from(position) + 1),
-        health: Health {
-            healthy: true,
-            ..Health::default()
-        },
-        in_flight,
-        ..Candidate::default()
-    }
+    let mut row = Candidate::default();
+    row.position = position;
+    row.id = WorkerId(u64::from(position) + 1);
+    row.health.healthy = true;
+    row.in_flight = in_flight;
+    row
 }
 
 /// A value sampled `age_ms` before the decisions' instant.
@@ -114,19 +110,16 @@ fn rooms(values: &[(SignalCell, SignalCell)]) -> SignalCells {
 }
 
 fn facts<'a>(cells: Option<&'a SignalCells>, prompt_tokens: u32) -> RequestFacts<'a> {
-    RequestFacts {
-        now_micros: NOW,
-        prompt_tokens,
-        signal_cells: cells,
-        ..RequestFacts::default()
-    }
+    let mut facts = RequestFacts::default();
+    facts.now_micros = NOW;
+    facts.prompt_tokens = prompt_tokens;
+    facts.signal_cells = cells;
+    facts
 }
 
 fn decide(engine: &Engine, facts: &RequestFacts<'_>, rows: &[Candidate]) -> Decision {
-    let pool = PoolFacts {
-        pool_size: rows.len() as u32,
-        ..PoolFacts::default()
-    };
+    let mut pool = PoolFacts::default();
+    pool.pool_size = rows.len() as u32;
     engine.decide(
         facts,
         &pool,
@@ -294,10 +287,9 @@ fn the_least_reported_cost_is_taken_with_the_signal_terms_in_it() {
          unreported: {{over-least: {{request_cost: 50}}}}"
     ));
     let report = |running| {
-        Some(LoadRow {
-            running,
-            ..LoadRow::default()
-        })
+        let mut load = LoadRow::default();
+        load.running = running;
+        Some(load)
     };
     let mut rows = [row(0, 0), row(1, 0), row(2, 5)];
     rows[0].load = report(1);
@@ -418,9 +410,10 @@ fn the_output_limit_reserves_room_in_a_rule_that_names_a_signal() {
         (fresh(1_000.0), fresh(700.0)),
         (fresh(1_000.0), fresh(701.0)),
     ]);
-    let with_limit = |limit| RequestFacts {
-        max_output_tokens: limit,
-        ..facts(Some(&cells), 100)
+    let with_limit = |limit| {
+        let mut facts = facts(Some(&cells), 100);
+        facts.max_output_tokens = limit;
+        facts
     };
     // A prompt of 100 and a quarter of an answer of 796 put the second row
     // on its capacity.
@@ -440,9 +433,10 @@ fn the_output_limit_alone_under_a_signals_capacity_keeps_the_rows_it_fits() {
     let rows = [row(0, 0), row(1, 0)];
     let holds = |capacity: f64| (fresh(capacity), SignalCell::NONE);
     let cells = rooms(&[holds(4_096.0), holds(8_192.0)]);
-    let with_limit = |limit| RequestFacts {
-        max_output_tokens: limit,
-        ..facts(Some(&cells), 0)
+    let with_limit = |limit| {
+        let mut facts = facts(Some(&cells), 0);
+        facts.max_output_tokens = limit;
+        facts
     };
     assert_eq!(kept(&engine, &with_limit(4_096), &rows), [0, 1]);
     // An answer one token longer fits the larger capacity alone.
@@ -488,11 +482,10 @@ fn a_rule_that_names_a_signal_and_one_that_names_none_each_keep_what_they_kept_a
     let mut rows: Vec<_> = (0..4).map(|position| row(position, 0)).collect();
     for (row, resident) in rows.iter_mut().zip([900, 1_100, 900, 1_100]) {
         row.load_sampled_at_micros = NOW;
-        row.load = Some(LoadRow {
-            resident_tokens: resident,
-            resident_counted: true,
-            ..LoadRow::default()
-        });
+        let mut load = LoadRow::default();
+        load.resident_tokens = resident;
+        load.resident_counted = true;
+        row.load = Some(load);
     }
     let room = |used: f64| (fresh(100.0), fresh(used));
     let cells = rooms(&[room(50.0), room(50.0), room(150.0), room(150.0)]);
@@ -565,10 +558,9 @@ profiles:
     let mut rows: Vec<_> = (0..4).map(|position| row(position, 0)).collect();
     for (row, (report, _)) in rows.iter_mut().zip(ages) {
         row.load_sampled_at_micros = NOW - report * 1_000;
-        row.load = Some(LoadRow {
-            queued: 1,
-            ..LoadRow::default()
-        });
+        let mut load = LoadRow::default();
+        load.queued = 1;
+        row.load = Some(load);
     }
     let cells = ages.map(|(_, signal)| aged(1.0, signal)).to_vec();
     let cells = SignalCells::new(cells, 1);
@@ -600,11 +592,12 @@ bindings:
     .expect("a pair's document");
     let side = |first: u64| -> Vec<Candidate> {
         (0..2)
-            .map(|position| Candidate {
-                position,
-                id: WorkerId(first + u64::from(position)),
-                pair_class: 1,
-                ..Candidate::default()
+            .map(|position| {
+                let mut row = Candidate::default();
+                row.position = position;
+                row.id = WorkerId(first + u64::from(position));
+                row.pair_class = 1;
+                row
             })
             .collect()
     };
@@ -613,12 +606,10 @@ bindings:
     // The prefills' second row is the cheaper and the decodes' first. The
     // request's cells name neither pool's rows.
     let (prefill, decode, request) = (one([900.0, 100.0]), one([100.0, 900.0]), one([5.0, 5.0]));
-    let facts = RequestFacts {
-        phase: Phase::Prefill,
-        now_micros: NOW,
-        signal_cells: Some(&request),
-        ..RequestFacts::default()
-    };
+    let mut facts = RequestFacts::default();
+    facts.phase = Phase::Prefill;
+    facts.now_micros = NOW;
+    facts.signal_cells = Some(&request);
     let cx = Constraints::default();
     let decision = engine.decide_pair(
         &facts,

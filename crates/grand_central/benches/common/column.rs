@@ -13,16 +13,16 @@ use crate::common::WorkerState;
 pub fn build_column(fleet: &[WorkerState], out: &mut Vec<AffinityFacts>) {
     out.clear();
     for w in fleet {
-        out.push(AffinityFacts {
-            overlap_blocks: match w.id % 8 {
-                3 => 24,
-                5 => 8,
-                _ => 0,
-            },
-            predicted_blocks: 0,
-            admitted_age_ms: 3_600_000,
-            indexed_growth: 50_000,
-            indexed_blocks: 40_000 + w.live_rate,
-        });
+        let mut affinity = AffinityFacts::default();
+        affinity.overlap_blocks = match w.id % 8 {
+            3 => 24,
+            5 => 8,
+            _ => 0,
+        };
+        affinity.predicted_blocks = 0;
+        affinity.admitted_age_ms = 3_600_000;
+        affinity.indexed_growth = 50_000;
+        affinity.indexed_blocks = 40_000 + w.live_rate;
+        out.push(affinity);
     }
 }
