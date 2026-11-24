@@ -2682,7 +2682,8 @@ impl PDRouter {
     /// `pairs` reads the pair index again. It is handed as a call, so that
     /// a pair the classic policies picked, which has nothing to ask, reads
     /// nothing: the placement makes the call for an answer of the policy
-    /// engine alone.
+    /// engine alone. This route claims no room at a decode's admission
+    /// gate, and says so.
     fn decode_again(
         &self,
         model_id: &str,
@@ -2700,6 +2701,7 @@ impl PDRouter {
             inputs,
             first,
             ahead,
+            false,
         )
     }
 

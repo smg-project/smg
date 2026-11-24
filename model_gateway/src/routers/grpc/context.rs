@@ -1164,6 +1164,17 @@ impl LoadGuards {
         }
     }
 
+    /// Whether an admission claim rides with these guards
+    /// ([`Self::admitted`]): the dispatch then holds its rooms at its
+    /// decode's gate.
+    pub(crate) fn claimed(&self) -> bool {
+        match self {
+            Self::Admitted { .. } => true,
+            Self::Traced { _guards, .. } => _guards.claimed(),
+            Self::Single { .. } | Self::Disaggregated { .. } | Self::Batch { .. } => false,
+        }
+    }
+
     /// The decode moved to another worker behind its prefill: `claim` is
     /// what that worker's gate seated for the dispatch, `None` where its
     /// engine reports no window. It takes the place of the claim at the

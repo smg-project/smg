@@ -135,7 +135,8 @@ pub trait PairAdmission: fmt::Debug {
     fn has_capacity(&self, prefill: usize) -> bool;
 
     /// Whether the decode at place `decode` of the decode list has a room
-    /// that nothing waiting at its gate is in line for.
+    /// for this request: one that nothing waiting at its gate is in line
+    /// for, or the room the request holds there already.
     fn has_room(&self, decode: usize) -> bool;
 }
 
