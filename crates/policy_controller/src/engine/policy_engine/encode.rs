@@ -109,11 +109,11 @@ pub struct EncodeLists<'a> {
     pub encoders_held: &'a [u32],
     /// What the encode side reads of each encoder beside its record, by its
     /// place in the encoder list
-    /// ([`EncodeClasses::encoder_facts`](crate::store::EncodeClasses::encoder_facts)).
+    /// ([`EncodeClasses::encoder_facts`](crate::engine::EncodeClasses::encoder_facts)).
     pub facts: &'a [EncoderFacts],
     /// The encode class each prefill names, one entry a prefill, by its
     /// place in the prefill list
-    /// ([`EncodeClasses::prefill_class`](crate::store::EncodeClasses::prefill_class)).
+    /// ([`EncodeClasses::prefill_class`](crate::engine::EncodeClasses::prefill_class)).
     pub prefill_classes: &'a [u32],
 }
 

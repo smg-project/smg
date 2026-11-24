@@ -788,7 +788,7 @@ message PairingDescriptor {
   // The worker's end of the encode handoff, with its two EC roles: the form
   // its registration states and, under a push, the connector the role is
   // stated on. Unspecified is no end, as a registration that names no form
-  // reads; the connector above is the pair's. The store derives from them
+  // reads; the connector above is the pair's. A host derives from them
   // which encoders hand an item to which prefills.
   EncodeHandoff encode_handoff = 12;
   string ec_connector = 13;

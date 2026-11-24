@@ -42,9 +42,9 @@ use super::{
 #[cfg(feature = "in-process")]
 use crate::{
     document::spec::Pairing,
-    engine::{FixedFacts, LentList, PartnerClasses, Role},
+    engine::{EncodeClasses, EncodeMember, FixedFacts, LentList, PartnerClasses, Role},
     store::{
-        encoding::{EncodeClasses, EncodeMember, EncodeOffer},
+        encoding::EncodeOffer,
         pairing::{Member, PairClasses, PairingDescriptor},
     },
 };
@@ -1134,7 +1134,7 @@ impl Objects<Members> {
     /// ([`EncodeLists::facts`](crate::engine::EncodeLists::facts),
     /// [`EncodeLists::prefill_classes`](crate::engine::EncodeLists::prefill_classes)).
     ///
-    /// The classes are the store's own encode rule and no other
+    /// The classes are the engine's encode rule and no other
     /// ([`EncodeClasses::derive`]), over one member for each lent worker
     /// in its list's order, made of what the worker's row states: its
     /// engine kind and its end of the encode handoff. So a place of the

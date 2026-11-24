@@ -2,8 +2,11 @@
 //! encode classes. Every name is an opaque token: the rule compares names
 //! for equality and reads none.
 
-use super::{hands_to, EncodeClasses, EncodeHandoff, EncodeMember, EncodeOffer};
-use crate::engine::EncoderFacts;
+use super::{hands_to, EncodeClasses, EncodeMember};
+use crate::{
+    engine::EncoderFacts,
+    store::{EncodeHandoff, EncodeOffer},
+};
 
 /// One worker as a case writes it: its runtime (empty when unknown) and the
 /// end it states.

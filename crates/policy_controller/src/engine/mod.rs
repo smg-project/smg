@@ -11,12 +11,15 @@
 //!
 //! The session table that a `sessions` rule reads lives in this folder too.
 //! So does the warm-up ruling: a stage applies it, and a host names a pool's
-//! warming rows by it.
+//! warming rows by it. And so does the encode class rule
+//! ([`EncodeClasses`]): a host derives by it which encoders hand to which
+//! prefills of the lists it lends.
 
 pub(crate) mod decision;
 pub(crate) mod decision_engine;
 pub(crate) mod decision_slot;
 pub(crate) mod demands;
+pub(crate) mod encode_classes;
 pub(crate) mod explain;
 pub(crate) mod framework;
 #[cfg(feature = "in-process")]
@@ -47,6 +50,7 @@ pub use decision_engine::{
 pub use decision_engine::{TokenKey, WorkerLists};
 pub use decision_slot::{DecisionSlot, DecisionSlotGuard};
 pub use demands::{DemandFacts, Demands, References, UnmetDemand};
+pub use encode_classes::{hands_to, EncodeClasses, EncodeMember};
 pub use explain::{DecisionNames, DecisionRecord};
 pub use framework::{
     AloneProfile, Binding, DecisionScope, DrawUnit, EncodeItems, EncodePlaced, EncodePool,

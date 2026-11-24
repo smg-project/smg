@@ -3,14 +3,14 @@
 //! over one view, so no item is placed on an encoder its pair's prefill
 //! takes nothing from.
 //!
-//! Which encoders hand to which prefill is the store's fact: every encoder
-//! and every prefill carries its encode class
-//! ([`store`](crate::store)), and an item is placed
-//! over the encoders of the chosen prefill's class. Three sentences rule
-//! the rest. The pair is picked among the prefills whose class holds an
-//! open encoder that takes the request's media. A refusal's name comes
-//! from membership: only the registered encoders prove a gap no retry
-//! closes. The pick comes from what is open.
+//! Which encoders hand to which prefill is the host's fact: it states the
+//! encode class of every encoder and of every prefill, as the encode class
+//! rule derives them ([`EncodeClasses`](crate::engine::EncodeClasses)), and
+//! an item is placed over the encoders of the chosen prefill's class. Three
+//! sentences rule the rest. The pair is picked among the prefills whose
+//! class holds an open encoder that takes the request's media. A refusal's
+//! name comes from membership: only the registered encoders prove a gap no
+//! retry closes. The pick comes from what is open.
 //!
 //! The pair itself is the pair entry's ([`Engine::decide_pair`]), entered
 //! unchanged over the prefills and decodes this side admits: a prefill of a
