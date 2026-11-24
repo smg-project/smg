@@ -475,7 +475,14 @@ impl EncodeLists<'_> {
                 };
                 *every_encoder.get_or_init(asked) && sends_to(target)
             };
-            record_sides(&decision, facts, (prefill, decode), read, sends);
+            record_sides(
+                &decision,
+                facts,
+                (prefill, decode),
+                read,
+                &buffers.columns,
+                sends,
+            );
             decision
         };
         let decision = BUFFERS.with(|buffers| match buffers.try_borrow_mut() {

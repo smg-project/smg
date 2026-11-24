@@ -545,13 +545,15 @@ struct RecordRead {
 pub struct PrefixRead {
     read: RecordRead,
     /// The rows sent the record's deepest block of the request, the first
-    /// of them, as many as fit: a pick of one of them may be a repeat that
+    /// of them, as many as fit, for a write handed no column
+    /// ([`record_prefix`]): a pick of one of them may be a repeat that
     /// writes nothing.
     deepest: [u32; Self::KEPT],
 }
 
 impl PrefixRead {
-    /// The deepest rows a read keeps. A pick of a row past them is no
+    /// The deepest rows a read keeps, for a write handed no column
+    /// ([`record_prefix`]). There a pick of a row past them is no
     /// repeat: where it is written, the write is tried from the request's
     /// first block ([`PrefixRecord::write`]). A turn of it that finds the
     /// request held for that row as far as the turn's end adds no block:
@@ -559,6 +561,13 @@ impl PrefixRead {
     /// read's tick, which can change the block that leaves next at the
     /// record's bound.
     const KEPT: usize = 8;
+
+    /// Whether the fill found the worker of `entry`, an entry of the column
+    /// it wrote, among those sent the request's deepest block: it wrote
+    /// that depth into the entry of each of them, however many they are.
+    fn found(self, entry: &AffinityFacts) -> bool {
+        self.read.blocks != 0 && entry.predicted_blocks == self.read.blocks
+    }
 }
 
 /// The record's tick at an instant of the decision clock: about a second.
@@ -1735,11 +1744,31 @@ pub(super) fn told_target(decision: &Decision) -> Option<&Target> {
 /// `read` is what that fill returned. A worker the index speaks for, a
 /// worker that is not of the list, and a list whose table was since read
 /// for another place write nothing.
+///
+/// Whether the picked worker was sent the request's deepest block is read
+/// here from the rows `read` kept, the first eight of them: a holder past
+/// them is written from the request's first block. The engine's own
+/// decisions read it from their column.
 pub fn record_prefix(
     pool: &PoolAffinity,
     phase: Phase,
     facts: &RequestFacts<'_>,
     read: PrefixRead,
+    id: WorkerId,
+) {
+    record_by_column(pool, phase, facts, read, None, id);
+}
+
+/// [`record_prefix`], handed the column `read` was returned with where the
+/// caller kept it: the picked worker's entry of it says whether the fill
+/// found that worker among those sent the request's deepest block
+/// ([`PrefixRead::found`]), which the rows `read` kept say of eight.
+pub(super) fn record_by_column(
+    pool: &PoolAffinity,
+    phase: Phase,
+    facts: &RequestFacts<'_>,
+    read: PrefixRead,
+    column: Option<&[AffinityFacts]>,
     id: WorkerId,
 ) {
     let standing = pool.table.load();
@@ -1750,7 +1779,10 @@ pub fn record_prefix(
     let (Some(record), Some(row)) = (table.record.as_deref(), table.spoken_row(id)) else {
         return;
     };
-    let held = read.deepest.contains(&row);
+    let held = match column.and_then(|column| column.get(row as usize)) {
+        Some(sent) => read.found(sent),
+        None => read.deepest.contains(&row),
+    };
     if record.repeats(read.read, held) {
         return;
     }
@@ -2007,7 +2039,8 @@ impl Table {
         let Some(target) = sent.filter(|to| !self.heard(to.position)) else {
             return decision;
         };
-        let held = read.deepest.contains(&target.position);
+        let sent = buffers.column.get(target.position as usize);
+        let held = sent.is_some_and(|sent| read.found(sent));
         if !record.repeats(read.read, held) {
             record.write(&buffers.keys, read.read, held, target.id);
         }

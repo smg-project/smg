@@ -1294,6 +1294,31 @@ fn a_pick_that_meets_a_held_record_leaves_its_prefix_out() {
     assert_eq!(bed.affinity.left_out(), 1);
 }
 
+/// A pick of a worker the record holds the whole request for leaves nothing
+/// out, however many workers hold it: a read keeps eight of them, and the
+/// pick's own entry of the column says it of the others. At the tick of the
+/// last use it writes nothing, and two seconds on its write adds no block.
+#[test]
+fn a_pick_of_a_holder_past_the_kept_rows_leaves_nothing_out() {
+    let (affinity, _, _) = hosted(false);
+    let bed = Bed::new(affinity, handed_whole(), 10);
+    let asked = prompt(1_000, 4);
+    for row in 0..10 {
+        bed.decide(&request(&asked, 7, NOW), Some(row));
+    }
+    let (column, _) = bed.column(&request(&asked, 7, NOW), Phase::Single);
+    assert_eq!(held(&column), [(0, 4); 10]);
+    let record = {
+        let records = bed.affinity.records.lock();
+        Arc::clone(records.get(MODEL).expect("the model's record"))
+    };
+    for now in [NOW, NOW + 2 * SECOND] {
+        let _reader = record.predictor.read();
+        bed.decide(&request(&asked, 7, now), Some(9));
+    }
+    assert_eq!(bed.affinity.left_out(), 0);
+}
+
 /// A worker that leaves behind a decision's read of the record and ahead
 /// of its write is given no place: the record held none for it at the
 /// leave, and the pick's write gives it none. So where the worker is told
