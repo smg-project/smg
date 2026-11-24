@@ -883,6 +883,23 @@ fn an_evicted_member_has_nothing_on_file_and_takes_its_next_report() {
     assert_eq!(loads.ranks(id), 1, "a member's next report is written");
 }
 
+/// The eviction of a member with nothing on file moves no row a
+/// publication shows: no world is made for it, and none is due at the
+/// window's end.
+#[test]
+fn the_eviction_of_a_member_with_nothing_on_file_asks_for_no_publication() {
+    let store = MemoryStore::new();
+    let id = ready(&store, "http://w:8000");
+    let loads: &dyn LoadSink = &store;
+    let published = store.publications();
+    assert_eq!(loads.publish_due(), None);
+    loads.evict(id);
+    assert_eq!(
+        (store.publications(), loads.publish_due()),
+        (published, None)
+    );
+}
+
 /// A poll's row stands in for a silent rank's sample but never for its
 /// receipt: the poll decision keeps asking while that rank stays silent,
 /// whatever its neighbour pushes.

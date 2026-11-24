@@ -76,7 +76,6 @@ pub mod membership;
 pub(crate) mod memory;
 pub mod pairing;
 pub(crate) mod reservations;
-pub(crate) mod signals;
 pub(crate) mod snapshot;
 pub(crate) mod workers;
 
@@ -102,7 +101,6 @@ pub use loads::{LoadSample, LoadSink, LoadSource, PollMode, Wake};
 pub(crate) use memory::DecodeIssue;
 pub use memory::{AtWork, Hand, LookOutcome, MemoryStore, StoreCheckpoint, StoreStats};
 pub use reservations::{ReservationKind, ReservationStore};
-pub use signals::{SignalSink, SignalWriteOutcome};
 pub use snapshot::{OutsideLists, StaleGeneration, StoreSnapshot, PUBLISH_WINDOW};
 pub use workers::{
     identity, identity_of, token, HealthPolicy, MembershipChange, MembershipTail, Overload,
