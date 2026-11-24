@@ -81,6 +81,39 @@ fn bad_request(message: String) -> WorkerServiceError {
     WorkerServiceError::BadRequest { message }
 }
 
+/// A worker's view with its address as a read shows it: a plain address
+/// exactly as registered, any other in the form of the log lines
+/// ([`WorkerSpec::redacted_url`]). Applied where the answer is written: the
+/// engine load and the manifest export read the registered address.
+fn redacted(mut info: WorkerInfo) -> WorkerInfo {
+    let url = info.spec.redacted_url();
+    // A rank's address is its group's base and `@rank`; a base that is no
+    // part of the url is shown by its own value.
+    let base = info
+        .spec
+        .dp_base_url
+        .as_deref()
+        .map(|base| match url.rsplit_once('@') {
+            Some((shown, _)) if info.spec.url_is_ranked() => shown.to_string(),
+            _ => WorkerSpec::new(base).redacted_url(),
+        });
+    // A status kept under another registration's key shows that one's
+    // address, by its own value.
+    if let Some(status) = &mut info.job_status {
+        if status.worker_url == info.spec.url {
+            status.worker_url.clone_from(&url);
+        } else {
+            status.worker_url = WorkerSpec::new(status.worker_url.as_str()).redacted_url();
+        }
+    }
+    if url != info.spec.url || base != info.spec.dp_base_url {
+        let spec = Arc::make_mut(&mut info.spec);
+        spec.dp_base_url = base;
+        spec.url = url;
+    }
+    info
+}
+
 /// The strings of a model card that log lines and a failed job's text write
 /// as they came, each under its field's name in a registration body.
 pub(crate) fn logged_strings(
@@ -318,7 +351,7 @@ fn validate_labels(labels: &HashMap<String, String>) -> Result<(), WorkerService
 fn refuse_discovery_owned(worker: &dyn Worker) -> Result<(), WorkerServiceError> {
     match discovery_provider(worker) {
         Some(provider) => Err(WorkerServiceError::DiscoveryOwned {
-            url: worker.url().to_string(),
+            url: worker.redacted_url().to_string(),
             provider: provider.clone(),
         }),
         None => Ok(()),
@@ -604,7 +637,7 @@ impl IntoResponse for ListWorkersResult {
             regular_count: usize,
         }
         Json(Body {
-            workers: self.workers,
+            workers: self.workers.into_iter().map(redacted).collect(),
             total: self.total,
             stats: Stats {
                 prefill_count: self.prefill_count,
@@ -621,7 +654,7 @@ pub struct GetWorkerResponse(pub WorkerInfo);
 
 impl IntoResponse for GetWorkerResponse {
     fn into_response(self) -> Response {
-        Json(self.0).into_response()
+        Json(redacted(self.0)).into_response()
     }
 }
 
@@ -724,17 +757,15 @@ impl WorkerService {
             None => None,
         };
         if let Some((worker_id, existing)) = live {
+            let url = config.redacted_url();
             return Err(if existing.status() == WorkerStatus::Draining {
                 WorkerServiceError::RemovalInProgress {
-                    url: worker_url,
+                    url,
                     worker_id,
                     drain_secs: existing.metadata().health_config.drain_settle_secs,
                 }
             } else {
-                WorkerServiceError::Conflict {
-                    url: worker_url,
-                    worker_id,
-                }
+                WorkerServiceError::Conflict { url, worker_id }
             });
         }
 
@@ -758,7 +789,7 @@ impl WorkerService {
                 .worker_registry
                 .get_id_by_url_or_reservation(&worker_url);
             return Err(WorkerServiceError::CreateInProgress {
-                url: worker_url,
+                url: WorkerSpec::new(worker_url).redacted_url(),
                 worker_id,
             });
         }
@@ -791,7 +822,7 @@ impl WorkerService {
     fn require_provider_router(config: &WorkerSpec) -> Result<(), WorkerServiceError> {
         match provider_support::missing_router(config) {
             Some(missing) => Err(WorkerServiceError::ProviderNotCompiled {
-                url: config.url.clone(),
+                url: config.redacted_url(),
                 family: missing.label,
                 feature: missing.feature,
             }),
@@ -818,6 +849,7 @@ impl WorkerService {
         // the change, not which labels to strip.
         refuse_discovery_owned(existing.as_ref())?;
         let url = existing.url().to_string();
+        let shown_url = existing.redacted_url();
         validate_spec(&config)?;
         Self::require_provider_router(&config)?;
 
@@ -828,7 +860,7 @@ impl WorkerService {
         if existing.is_dp_aware() {
             return Err(WorkerServiceError::BadRequest {
                 message: format!(
-                    "Worker '{url}' belongs to a data-parallel group. \
+                    "Worker '{shown_url}' belongs to a data-parallel group. \
                     PUT is not supported for data-parallel workers. \
                     Use DELETE + POST instead."
                 ),
@@ -839,11 +871,10 @@ impl WorkerService {
         // URL changes are not supported via replace — use DELETE + POST instead.
         if config.url != url {
             return Err(WorkerServiceError::BadRequest {
-                message: format!(
-                    "URL mismatch: worker has URL '{url}' but request body has '{}'. \
-                    URL changes are not supported via PUT. Use DELETE + POST instead.",
-                    config.url
-                ),
+                message: "URL mismatch: a PUT carries the worker's URL exactly as it was \
+                    registered (a read may show it shortened). URL changes are not \
+                    supported via PUT. Use DELETE + POST instead."
+                    .to_string(),
             });
         }
 
@@ -852,7 +883,7 @@ impl WorkerService {
         // Draining status and be served again inside the drain.
         if existing.status() == WorkerStatus::Draining {
             return Err(WorkerServiceError::RemovalInProgress {
-                url,
+                url: shown_url.to_string(),
                 worker_id,
                 drain_secs: existing.metadata().health_config.drain_settle_secs,
             });
@@ -960,10 +991,7 @@ impl WorkerService {
                 .get_status(worker_id.as_str())
                 .filter(|status| status.job_type == Job::REGISTRATION_TYPE)
         };
-        if let Some(mut status) = in_flight.or_else(failed) {
-            // A plain address as registered, any other as the gateway's log
-            // lines write it.
-            status.worker_url = Endpoint::redacted_url(&status.worker_url);
+        if let Some(status) = in_flight.or_else(failed) {
             return Ok(GetWorkerResponse(WorkerInfo::pending(
                 worker_id.as_str(),
                 status.worker_url.clone(),
@@ -1124,7 +1152,7 @@ impl WorkerService {
                 .map_err(|message| WorkerServiceError::QueueSubmitFailed { message })?;
             if !admitted {
                 return Err(WorkerServiceError::CreateInProgress {
-                    url,
+                    url: WorkerSpec::new(url).redacted_url(),
                     worker_id: Some(worker_id),
                 });
             }
@@ -2563,5 +2591,64 @@ mod tests {
             "discovery: the worker a provider owns"
         );
         assert_eq!(service.list_workers(None, None).total, 2, "no origin: both");
+    }
+
+    #[tokio::test]
+    async fn the_reads_of_a_worker_show_an_address_that_is_not_plain_in_the_log_form() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let live = "http://name:made-up@10.0.0.5:8000";
+        register_worker(&registry, live, None);
+        let queue = JobQueue::new(JobQueueConfig::default(), std::sync::Weak::new());
+        assert!(queue.claim_if_idle(&registration(live)));
+        let held = Arc::new(std::sync::OnceLock::new());
+        held.set(queue).ok();
+        let service = WorkerService::new(Arc::clone(&registry), held, RouterConfig::default());
+
+        let listed = service.list_workers(None, None);
+        let id = listed.workers[0].id.clone();
+        let read = service.get_worker(&id).expect("a read");
+        let refused = service
+            .create_worker(worker_spec(live))
+            .await
+            .expect_err("the address is registered")
+            .to_string();
+        let put = service
+            .replace_worker(&id, worker_spec("http://10.0.0.6:8000"))
+            .await
+            .expect_err("a PUT with another address is refused")
+            .to_string();
+
+        assert_eq!(
+            (
+                listed.workers[0].spec.url.as_str(),
+                read.0.spec.url.as_str()
+            ),
+            (live, live),
+            "the load and the export read the registered address"
+        );
+        let mut written = Vec::new();
+        for response in [listed.into_response(), read.into_response()] {
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("a body");
+            let body: serde_json::Value = serde_json::from_slice(&bytes).expect("a JSON body");
+            let row = body.get("workers").map_or(&body, |rows| &rows[0]);
+            written.push(row["url"].clone());
+            written.extend(row["job_status"].get("worker_url").cloned());
+        }
+        let shown = worker_spec(live).redacted_url();
+        assert_eq!(
+            written,
+            [json!(shown), json!(shown), json!(shown)],
+            "url of the list's row, then url and job_status.worker_url of the read"
+        );
+        assert!(
+            refused.contains(&shown) && !refused.contains("made-up"),
+            "the refusal of a second registration: {refused}"
+        );
+        assert!(
+            put.contains("URL mismatch") && !put.contains("10.0.0."),
+            "the refusal of a PUT with another address names neither: {put}"
+        );
     }
 }

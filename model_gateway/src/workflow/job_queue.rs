@@ -1234,9 +1234,21 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_registration_reads_failed_with_its_reason_at_its_id() {
+        use axum::response::IntoResponse;
+
         use crate::{
-            admin::worker_service::WorkerService, endpoints::tokenize::get_tokenizer_status,
+            admin::worker_service::{GetWorkerResponse, WorkerService},
+            endpoints::tokenize::get_tokenizer_status,
         };
+
+        // A read as its client gets it: the address takes its shown form
+        // where the answer is written.
+        async fn written(read: GetWorkerResponse) -> serde_json::Value {
+            let bytes = axum::body::to_bytes(read.into_response().into_body(), usize::MAX)
+                .await
+                .expect("a body");
+            serde_json::from_slice(&bytes).expect("a JSON body")
+        }
 
         let context = create_test_app_context();
         let queue = JobQueue::new(JobQueueConfig::default(), Arc::downgrade(&context));
@@ -1265,17 +1277,18 @@ mod tests {
         let id = fail().await;
         let read = service
             .get_worker(id.as_str())
-            .expect("the id of a failed registration answers while its status is kept")
-            .0;
-        let status = read.job_status.expect("its job status");
-        assert_eq!(status.status, "failed");
+            .expect("the id of a failed registration answers while its status is kept");
+        // The result holds the address as registered until the answer is written.
+        assert_eq!(read.0.spec.url, url);
+        let read = written(read).await;
+        assert_eq!(read["job_status"]["status"], "failed");
         assert_eq!(
-            status.message.as_deref(),
-            Some("Workflow engines not initialized")
+            read["job_status"]["message"],
+            "Workflow engines not initialized"
         );
-        // No plain address: the view writes it as the job's own lines write it.
-        assert_eq!(read.spec.url, Endpoint::redacted_str(url));
-        assert_eq!(status.worker_url, read.spec.url);
+        // No plain address: the answer writes it as the job's own lines write it.
+        assert_eq!(read["url"], Endpoint::redacted_str(url));
+        assert_eq!(read["job_status"]["worker_url"], read["url"]);
         // The tokenizer status route takes the status of a tokenizer job alone.
         let at_tokenizers = get_tokenizer_status(&context, id.as_str()).await;
         assert_eq!(at_tokenizers.status().as_u16(), 404);
@@ -1288,8 +1301,8 @@ mod tests {
         // The pending view of a reserved id writes the address in that form too.
         let held = context.worker_registry.reserve_id_for_url(url);
         assert_eq!(
-            service.get_worker(held.as_str()).unwrap().0.spec.url,
-            read.spec.url
+            written(service.get_worker(held.as_str()).unwrap()).await["url"],
+            read["url"]
         );
 
         // A plain address reads as registered, byte for byte.
@@ -1306,7 +1319,7 @@ mod tests {
             )
             .await;
         assert_eq!(
-            service.get_worker(plain_id.as_str()).unwrap().0.spec.url,
+            written(service.get_worker(plain_id.as_str()).unwrap()).await["url"],
             plain
         );
     }
