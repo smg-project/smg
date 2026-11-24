@@ -483,7 +483,12 @@ impl PairClasses {
     /// lists in order, whether the worker there was among the members
     /// derived. The members derived stand in the lists' order, so each
     /// takes its class as derived. A worker that was not among them takes
-    /// class `0`, which pairs with nobody.
+    /// class `0`, which pairs with nobody. A debug build holds the caller
+    /// to its word on both ends: a member was derived for every place it
+    /// says so of, and it says so of a place for every member derived. A
+    /// release build answers a broken word and faults nothing: a place
+    /// given with no member derived takes class `0`, and a member derived
+    /// with no place given is passed over.
     #[must_use]
     pub fn by_place(
         self,
@@ -492,9 +497,16 @@ impl PairClasses {
     ) -> PartnerClasses {
         fn side(derived: &[(WorkerId, u32)], given: impl IntoIterator<Item = bool>) -> Box<[u32]> {
             let mut derived = derived.iter();
-            let mut next = || derived.next().map_or(0, |&(_, class)| class);
+            let mut next = || {
+                let member = derived.next();
+                debug_assert!(member.is_some(), "a member derived for every place given");
+                member.map_or(0, |&(_, class)| class)
+            };
             let class = |given: bool| if given { next() } else { 0 };
-            given.into_iter().map(class).collect()
+            let classes = given.into_iter().map(class).collect();
+            let left = derived.as_slice();
+            debug_assert!(left.is_empty(), "a place given for every member derived");
+            classes
         }
         PartnerClasses::derived(
             side(&self.prefills, prefills),

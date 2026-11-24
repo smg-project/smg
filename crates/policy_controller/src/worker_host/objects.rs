@@ -1070,6 +1070,11 @@ impl Objects<Members> {
     }
 
     /// The classes of `generation`'s two lists as lent, derived now.
+    ///
+    /// One side alone is no pair, as the store's own build of a model's
+    /// classes has it: where a list lends no worker whose row's object
+    /// stands, no member is made and the rule does not run, and every
+    /// worker of both lists takes class `0`.
     fn derive_pairs(&self, generation: &Members, mode: Pairing) -> PartnerClasses {
         /// A row as the rule reads it: by the descriptor it states, else by
         /// `own`, what its worker object offers a partner.
@@ -1087,6 +1092,15 @@ impl Objects<Members> {
         }
         let lists = [Role::Prefill, Role::Decode].map(|role| self.lent(generation, role));
         let stated = self.remainders(lists);
+        if stated.iter().any(|side| side.iter().all(Option::is_none)) {
+            let nobody = |side: usize| vec![0; stated[side].len()].into();
+            return PartnerClasses::derived(
+                nobody(0),
+                nobody(1),
+                Default::default(),
+                Default::default(),
+            );
+        }
         // What each lent worker offers by itself, where its row states no
         // descriptor. The object was built of the row, so these are the
         // row's labels and engine kind under the worker's own rule.
@@ -1605,6 +1619,64 @@ mod tests {
         assert_eq!(lends(&replica).1, [(Some(new), 9)], "under the new id");
         assert_eq!(retry(&replica, 9), Ok(Some(new)));
         assert_eq!(retry(&replica, 7), unstated);
+    }
+
+    /// One side alone is no pair, as the store's own build of a model's
+    /// classes has it: the holder makes no member and does not run the
+    /// rule, and every worker lent takes class `0`, which is what the rule
+    /// answers over one side. In a debug build the rule refuses to read a
+    /// descriptor that stands between blanks, and no write of the store
+    /// leaves one so. So the case lays such a row by the holder's own step:
+    /// nobody reads it.
+    #[cfg(feature = "in-process")]
+    #[test]
+    fn one_side_alone_makes_no_member_and_every_worker_lent_pairs_with_nobody() {
+        use crate::{
+            document::spec::Pairing, engine::WireModes, store::pairing::PairingDescriptor,
+        };
+
+        for role in [Role::Prefill, Role::Decode] {
+            let replica = Replica::new();
+            for url in [A, B] {
+                let side = WorkerFacts {
+                    role,
+                    ..facts(url, 1)
+                };
+                replica.store.upsert(side);
+            }
+            replica.follow();
+            let mut row = replica.row(A);
+            let between_blanks = PairingDescriptor {
+                transport: Some(" a ".to_string()),
+                ..PairingDescriptor::default()
+            };
+            row.facts.pairing = Some(Arc::new(between_blanks));
+            replica.objects.restate(&row);
+
+            let registry = replica.objects.registry();
+            let generation = registry
+                .model_generation("m")
+                .expect("the model's generation");
+            // The side as the rule can read it: two members that report
+            // nothing.
+            let members = [A, B].map(|url| {
+                let id = replica.row(url).id;
+                Member::new(id, WireModes::default(), "", None)
+            });
+            for mode in [Pairing::Off, Pairing::Lenient, Pairing::Strict] {
+                let derived = match role {
+                    Role::Prefill => {
+                        PairClasses::derive(&members, &[], mode).by_place([true; 2], [])
+                    }
+                    _ => PairClasses::derive(&[], &members, mode).by_place([], [true; 2]),
+                };
+                let classes = replica.objects.pair_classes(&generation, mode);
+                assert_eq!(*classes, derived, "{role:?} alone under {mode:?}");
+                let lent = classes.prefills().iter().chain(classes.decodes());
+                assert_eq!(lent.collect::<Vec<_>>(), [&0; 2], "{role:?} alone");
+                assert!(classes.table().is_empty());
+            }
+        }
     }
 
     /// A host that is no gateway asks for a host-local row's object with
