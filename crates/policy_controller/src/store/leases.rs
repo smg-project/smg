@@ -6,7 +6,7 @@
     reason = "a caller still builds or matches these types whole: each mark comes with its call"
 )]
 
-use std::time::Instant;
+use std::{mem, time::Instant};
 
 /// The table of counts the leases on file book and a member's place in
 /// it, named here for the store's files that write it: their home is the
@@ -15,10 +15,11 @@ pub(super) use crate::tracking::in_flight::{HostCount, InFlightCounts, WorkerSlo
 use crate::{
     engine::{
         decision::{
-            Decision, LiftedVeto, Pick, Survivors, Target, Targets, Trace, MAX_TARGETS, TRACE_TOP,
+            Decision, LiftedVeto, Pair, Pick, Survivors, Target, Targets, Trace, MAX_TARGETS,
+            TRACE_TOP,
         },
         decision_engine::{DecodeRefused, HeldDecision, HeldDecode},
-        sticky_sessions::SessionVerdict,
+        sticky_sessions::{DecodeVerdict, SessionVerdict},
         view::{Session, WorkerId},
     },
     store::GatewayId,
@@ -298,33 +299,6 @@ impl Sides {
         }
     }
 
-    /// The lease of each side a frame on `side` ends: the side named
-    /// where it is issued or dispatched, and with `None` every such side.
-    /// A single's lease ends whole under any side.
-    pub fn ending(&self, side: Option<Side>) -> [Option<Lease>; 2] {
-        let live = |side| {
-            self.side(side)
-                .and_then(|(lease, state)| state.is_live().then_some(lease))
-        };
-        match (self.decode, side) {
-            (None, _) => [Some(self.record.own()), None],
-            (Some(_), Some(side)) => [live(side), None],
-            (Some(_), None) => [live(Side::Prefill), live(Side::Decode)],
-        }
-    }
-
-    /// Calls `told` with the lease of each side a frame on `side` ends
-    /// ([`Self::ending`]). A single's lease is told off its record: it
-    /// reads no side and builds no list.
-    pub fn each_ending(&self, side: Option<Side>, mut told: impl FnMut(&Lease)) {
-        if self.decode.is_none() {
-            return told(&self.record.own());
-        }
-        for lease in self.ending(side).iter().flatten() {
-            told(lease);
-        }
-    }
-
     /// Calls `told` with a single's lease as a host that held its decision
     /// would lend it with `said` ([`HeldDecision`]): the view a request's
     /// guard lends its engine, made from the record on file. `None`, and
@@ -397,21 +371,220 @@ impl Sides {
             },
         }))
     }
+
+    /// Calls `told` with a pair's lease as a host that held its decision
+    /// would lend it ([`HeldDecision`]), once for each side `said` is of,
+    /// with the word as it is said of that side. A served controller tells
+    /// a pair's words through this view, by the rule a guard's lease is
+    /// told by. No call for a single's lease, which is no pair's.
+    ///
+    /// A file meets words no guard says, and the calls turn them into
+    /// words the rule knows:
+    ///
+    /// - **An end** is lent for a side that is issued or dispatched, and
+    ///   for no other: a second end of a side, and an end of a decode side
+    ///   still chosen, call nothing. A release that names no side is lent
+    ///   once for each such side, the prefill's first, and each call's
+    ///   word names its side.
+    /// - **A dispatch** is lent for the side it names, where its index
+    ///   names a target of the pick on that side. A word on a side a pair
+    ///   does not hold calls nothing.
+    ///
+    /// The parts are read as they stood before the word:
+    ///
+    /// - **The lease** is the record's own, the prefill side's as issued:
+    ///   no dispatch moves a pair's prefill.
+    /// - **The target** is the one the word is about, in a pair's form: the
+    ///   prefill's worker and rank, with the decode's in its pair. A
+    ///   dispatch names both by its frame's index. An end names the worker
+    ///   each side books. The index is the dispatch's, and at an end the
+    ///   side's own.
+    /// - **The decode side** is the file's: its session, its token count,
+    ///   and whether it stands chosen. Its two text sizes are the record's
+    ///   lease's. A frame states a count and no text's length, so a
+    ///   controller files every lease with neither, and the file keeps no
+    ///   second pair of them for the side.
+    /// - **The pick** is one of no target with a word of the prefill side,
+    ///   which reads none. With a word of the decode side it is the pick's
+    ///   first target as the rule reads it: the decode the side's lease
+    ///   books, by its id, with the side's own session verdict, but for a
+    ///   release behind a dispatch on another worker (below). The
+    ///   dispatch of a side that stood chosen is the side's issue too, and
+    ///   carries its pick to the stages. There the pick is every target
+    ///   the record keeps, each side's worker and rank, under no trace
+    ///   beside the generation. The first target's pair states the side's
+    ///   verdict and no pair behind it states one, as in the pick the
+    ///   side's decision made. The record keeps no position, and each
+    ///   target bears the default one, 0: a stage reads a worker by its
+    ///   id.
+    ///
+    /// The first target's decode is the one the side was issued on. A
+    /// dispatch on another target moves the side, and the file keeps the
+    /// worker it went to in the first one's place. Where the side's verdict
+    /// is a claim, the claim still names the first: a completion is lent
+    /// that worker as the first, and states the claim as the side keeps
+    /// it, on the worker the side went to. A release behind a dispatch is
+    /// a word no guard says, since a guard ends a side it sent by a
+    /// completion. It is lent the worker the side went to as the first: the
+    /// release names that worker under index 0. The rule states a guard's
+    /// release on the first target's decode, so behind a dispatch that
+    /// moved the side the two hosts would name two workers: the file keeps
+    /// the side's target and not the first.
+    ///
+    /// A pick's first pair states a claim on its own decode and on no
+    /// other. So a release states the side's claim where the side stands
+    /// on the worker it claimed, and no claim behind a dispatch on another
+    /// worker. Behind that dispatch the side's claim stands no more, and a
+    /// claim that stands on the key is another decision's. A release for a
+    /// commit that failed takes back the claim it states: there it takes
+    /// back none.
+    pub fn with_held_pair(&self, said: Said, mut told: impl FnMut(&HeldDecision<'_>, Said)) {
+        let Some(decode) = &self.decode else {
+            return;
+        };
+        let record = &self.record;
+        let lease = record.own();
+        let side = HeldDecode {
+            session: decode.session,
+            tokens: decode.tokens,
+            chars: lease.chars,
+            bytes: lease.bytes,
+            chosen: decode.state.is_chosen(),
+        };
+        let mut lend = |decision: &Decision, index: u8, target: Target, said: Said| {
+            let held = HeldDecision {
+                decision,
+                lease: &lease,
+                index,
+                target: &target,
+                decode: side,
+            };
+            told(&held, said);
+        };
+        // The worker and the rank each side stands on.
+        let prefill = record
+            .target_at(lease.target_index)
+            .unwrap_or((record.target, 0));
+        let stands = decode
+            .target_at(decode.target_index)
+            .unwrap_or((decode.target, 0));
+        // The decode the side was issued on: a claim names it, also behind
+        // a dispatch that moved the side.
+        let issued_on = match decode.session_verdict {
+            SessionVerdict::Claimed(first) => first,
+            _ => decode.target,
+        };
+        // The pick of a decode side's word: its first target alone, which
+        // names the decode `first`. It states the side's verdict where
+        // `first` is the decode the side was issued on, and none on
+        // another: a pair states a claim on its own decode alone.
+        let verdict = DecodeVerdict::of(decode.session_verdict);
+        let first_alone = |first: WorkerId| {
+            let verdict = if first == issued_on {
+                verdict
+            } else {
+                DecodeVerdict::NONE
+            };
+            let mut targets = Targets::new();
+            targets.push(pair_target(prefill, Some((first, 0)), verdict));
+            lent_pick(targets, lease.generation)
+        };
+        let named = match said {
+            Said::Dispatched(dispatch, _) => {
+                let index = dispatch.target_index;
+                let (to, paired) = (record.target_at(index), decode.target_at(index));
+                let target = pair_target(to.unwrap_or(prefill), paired, DecodeVerdict::NONE);
+                match dispatch.side {
+                    Side::Prefill if to.is_some() => lend(&EMPTY_PICK, index, target, said),
+                    // The side's issue too: its pick goes to the stages.
+                    Side::Decode if paired.is_some() && side.chosen => {
+                        let pick = lent_pick(self.pick_on_file(decode), lease.generation);
+                        lend(&pick, index, target, said);
+                    }
+                    Side::Decode if paired.is_some() => {
+                        lend(&first_alone(issued_on), index, target, said);
+                    }
+                    _ => {}
+                }
+                return;
+            }
+            Said::Completed(outcome) => Some(outcome.side),
+            Said::Released(named, _) => named,
+        };
+        // An end is of each side the word names that is issued or
+        // dispatched, the prefill's first. A release names its side.
+        let ends = |side| named.is_none_or(|named| named == side);
+        let of = |side| match said {
+            Said::Released(_, reason) => Said::Released(Some(side), reason),
+            said => said,
+        };
+        let target = pair_target(prefill, Some(stands), DecodeVerdict::NONE);
+        if ends(Side::Prefill) && record.state.is_live() {
+            lend(&EMPTY_PICK, lease.target_index, target, of(Side::Prefill));
+        }
+        if ends(Side::Decode) && decode.state.is_live() {
+            // A release names the worker the side stands on.
+            let first = match said {
+                Said::Released(..) => decode.target,
+                _ => issued_on,
+            };
+            let pick = first_alone(first);
+            lend(&pick, decode.target_index, target, of(Side::Decode));
+        }
+    }
+
+    /// The targets of a pair's pick as its record keeps them, lent with
+    /// the dispatch that is the issue of a decode side no call issued
+    /// ([`Self::with_held_pair`]): every target's two workers and their
+    /// ranks, the first pair alone stating the side's session verdict.
+    fn pick_on_file(&self, decode: &DecodeSide) -> Targets {
+        let named = |index| Some((self.record.target_at(index)?, decode.target_at(index)?));
+        let mut verdict = DecodeVerdict::of(decode.session_verdict);
+        let mut targets = Targets::new();
+        for (prefill, paired) in (0..=u8::MAX).map_while(named) {
+            targets.push(pair_target(prefill, Some(paired), mem::take(&mut verdict)));
+        }
+        targets
+    }
 }
 
-/// The pick lent with a single's lease ([`Sides::with_held_single`]): no
+/// A pair's target as a file of leases names it: the prefill's worker and
+/// rank, with the decode's in its pair, which states `decode_verdict`. A
+/// file keeps no position, and each bears the default one, 0.
+fn pair_target(
+    (id, dp_rank): (WorkerId, u16),
+    decode: Option<(WorkerId, u16)>,
+    decode_verdict: DecodeVerdict,
+) -> Target {
+    let pair = decode.map(|(decode_id, decode_dp_rank)| Pair {
+        decode_id,
+        decode_dp_rank,
+        decode_verdict,
+        ..Pair::default()
+    });
+    Target {
+        id,
+        dp_rank,
+        pair,
+        ..Target::default()
+    }
+}
+
+/// The pick lent with a single's lease ([`Sides::with_held_single`]) and
+/// with a word of a pair's prefill side ([`Sides::with_held_pair`]): no
 /// target, under no trace. A file keeps of a single's pick the workers a
 /// dispatch names by its index, and lists none of them for a word: no word
 /// of a single carries its pick to a stage.
-static EMPTY_PICK: Decision = lent_pick(Targets::new());
+static EMPTY_PICK: Decision = lent_pick(Targets::new(), 0);
 
 /// [`EMPTY_PICK`] for a lease whose request is kept from its profile
 /// ([`LeaseRecord::untold`]): the pick says so, as the one a host that held
 /// the decision lends.
-static UNTOLD_PICK: Decision = lent_pick(Targets::untold());
+static UNTOLD_PICK: Decision = lent_pick(Targets::untold(), 0);
 
-/// A pick of `targets` under no trace, with no verdict on a session key.
-const fn lent_pick(targets: Targets) -> Decision {
+/// A pick of `targets` under no trace beside `generation`, with no verdict
+/// on a session key.
+const fn lent_pick(targets: Targets, generation: u64) -> Decision {
     Decision::Pick(Pick {
         targets,
         trace: Trace {
@@ -420,7 +593,7 @@ const fn lent_pick(targets: Targets) -> Decision {
             top: [(WorkerId(0), 0.0); TRACE_TOP],
             top_len: 0,
             seed: 0,
-            generation: 0,
+            generation,
             lifted: LiftedVeto::None,
         },
         session_verdict: SessionVerdict::None,

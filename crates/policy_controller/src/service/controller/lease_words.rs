@@ -13,7 +13,7 @@ use std::{
 use crate::{
     document::spec::AppliedSpec,
     engine::{
-        decision::{Decision, Pair, Pick, Target, Targets, Trace},
+        decision::Decision,
         decision_slot::DecisionSlot,
         framework::{release, Engine},
         lease_events::{self, Hearers},
@@ -21,7 +21,7 @@ use crate::{
     },
     stages::lifecycle::Lifecycle,
     store::{MemoryStore, Sides, StoreSnapshot},
-    tracking::lease::{Dispatch, Lease, Said, Side},
+    tracking::lease::{Lease, Said},
 };
 
 /// Tells the engine what was said of a lease: one function of the record
@@ -48,22 +48,23 @@ use crate::{
 /// as the record holds the pick, and the lease told names that index:
 /// the record was read before the door wrote it. A report that names no
 /// target of the pick tells nothing. A pair's decode side that stood
-/// chosen is told its issue first ([`chosen_dispatched`]): no call
-/// issued it, and it goes out as the first pick's.
+/// chosen is told its issue first: no call issued it, and it goes out as
+/// the first pick's, dated by the read of the dispatch's frame on the
+/// store's clock.
 ///
-/// A pair's lease is told by side: a dispatch on the side its frame names,
-/// with that side's lease and on that side's worker, and an end once a
-/// side the lease held live, the frame's side or with none every side
-/// ([`Sides::ending`]).
+/// A lease's words are told by the rule a host that holds its decisions
+/// tells them by ([`lease_events::single`], [`lease_events::pair`]), over
+/// the lease as the file lends it ([`Sides::with_held_single`],
+/// [`Sides::with_held_pair`]). A pair's lease is told by side: a dispatch
+/// on the side its frame names, with that side's lease and on that side's
+/// worker, and an end once a side the lease held live, the frame's side
+/// or with none every side.
 ///
-/// A single's words are told by the rule a host that holds its decisions
-/// tells them by ([`lease_events::single`]), over the lease as the file
-/// lends it ([`Sides::with_held_single`]). So the dispatch of a single
-/// request its sessions rule keeps from the profile
-/// ([`LeaseRecord::untold`]) is told to the session table alone, where the
-/// key's pin moves. No count of sends takes it, under whichever generation
-/// `world` holds, and no stage hears it. Its end and its release are told
-/// as any lease's.
+/// So the dispatch of a single request its sessions rule keeps from the
+/// profile ([`LeaseRecord::untold`]) is told to the session table alone,
+/// where the key's pin moves. No count of sends takes it, under whichever
+/// generation `world` holds, and no stage hears it. Its end and its
+/// release are told as any lease's.
 ///
 /// Its caller is whoever applies the report, under the turn of the leases'
 /// file: what it calls is bounded and takes no door of the leases. It
@@ -111,98 +112,42 @@ pub(crate) fn issuing<'a>(spec: &'a AppliedSpec, lease: &Lease) -> Option<&'a En
     (spec.generation() == lease.generation).then(|| spec.engine())
 }
 
-/// What [`told`] tells, under its catch. A single's words go by the
-/// engine's one rule over the lease as the file lends it
-/// ([`lease_events::single`], [`Sides::with_held_single`]): this function
-/// says which engines hear and nothing more. A pair's words are told here,
-/// by side.
+/// What [`told`] tells, under its catch. A lease's words go by the
+/// engine's one rule over the lease as the file lends it: a single's by
+/// [`lease_events::single`] over [`Sides::with_held_single`], and a pair's
+/// by [`lease_events::pair`] over [`Sides::with_held_pair`], a side at a
+/// time. This function says which engines hear, and by which clock the
+/// issue of a decode side sent with no call is dated: the store's own, at
+/// the read of the dispatch's frame. It says nothing more.
 fn tell(world: &StoreSnapshot, found: &Sides, said: Said, listed: &impl Fn(WorkerId, u16) -> bool) {
     let spec = world.spec();
-    let issuing = || issuing(spec, &found.record.lease);
+    let hearers = Hearers {
+        issuing: issuing(spec, &found.record.lease),
+        sends: spec.engine(),
+        listed,
+    };
     if found.decode.is_none() {
-        let hearers = Hearers {
-            issuing: issuing(),
-            sends: spec.engine(),
-            listed,
-        };
         found.with_held_single(said, |held| lease_events::single(&hearers, held, said));
         return;
     }
-    match said {
-        Said::Dispatched(dispatch, at) => {
-            // The side the frame names: its lease, and its worker at
-            // the index the frame names.
-            let Some((lease, stood)) = found.side(dispatch.side) else {
-                return;
-            };
-            let named = found.target_of(dispatch.side, dispatch.target_index);
-            let Some((id, dp_rank)) = named else {
-                return;
-            };
-            let target = Target {
-                id,
-                dp_rank,
-                ..Target::default()
-            };
-            // The record was read before the door wrote the dispatched
-            // index: the lease told carries it, for a stage that reads
-            // the index off the lease.
-            let lease = Lease {
-                target_index: dispatch.target_index,
-                ..lease
-            };
-            spec.engine().dispatched_sent(
-                &lease,
-                &target,
-                dispatch.side,
-                dispatch.since_decision_micros,
-                || listed(id, dp_rank),
-            );
-            // The table hears first and the stages last. A stage's call
-            // that unwinds there leaves the table's entry written.
-            if let Some(engine) = issuing() {
-                engine.dispatched_table(&lease, &target, dispatch.side);
-                if stood.is_chosen() {
-                    // A decode side no call issued goes out as the first
-                    // pick's, and this dispatch books it: the stages hear
-                    // its issue first, as they hear every side's.
-                    chosen_dispatched(world, engine, found, &lease, &target, dispatch, at);
-                } else {
-                    engine.dispatched_stages(
-                        &lease,
-                        &target,
-                        dispatch.side,
-                        dispatch.since_decision_micros,
-                    );
-                }
-            }
-        }
-        Said::Completed(outcome) => {
-            if let Some(engine) = issuing() {
-                let side = Some(outcome.side);
-                found.each_ending(side, |lease| engine.on_completed(lease, &outcome));
-            }
-        }
-        Said::Released(side, reason) => {
-            if let Some(engine) = issuing() {
-                found.each_ending(side, |lease| engine.on_released(lease, reason));
-            }
-        }
-    }
+    let micros = |at| world.micros(at);
+    found.with_held_pair(said, |held, said| {
+        lease_events::pair(&hearers, held, said, micros);
+    });
 }
 
-/// Tells `engine`'s stages the issue of a pair's decode side the store
-/// files behind the pair's first decision: at its decode call, or at the
-/// dispatch that sends it with no call ([`chosen_dispatched`]).
+/// Tells `engine`'s stages the issue of a pair's decode side a decode call
+/// files behind the pair's first decision.
 ///
 /// One rule dates an issue: the instant the store files the side, on the
 /// store's own clock. A side filed in its decision bears that decision's
-/// instant. A side filed later is told here under its
-/// lease dated `at`, the instant of that filing as its caller states it.
-/// A served controller files a side later for a pair whose frame stated
-/// the later decode: at its decode call, dated by the decider's read at
-/// the call, or at the dispatch that sends the side with no call, dated by
-/// the read of that dispatch's frame.
+/// instant. A side filed later is told under its lease dated at that
+/// filing. A served controller files a side later for a pair whose frame
+/// stated the later decode. At its decode call the issue is told here,
+/// dated `at`, the decider's read at the call. At the dispatch that sends
+/// the side with no call the engine's rule tells it
+/// ([`lease_events::pair`]), dated by the read of that dispatch's frame on
+/// the same clock ([`tell`]).
 /// The lease on file keeps the instant of the pair's first decision for
 /// its other words.
 ///
@@ -222,65 +167,4 @@ pub(crate) fn issued_later(
         ..*lease
     };
     engine.on_decision_issued(&issued, decision);
-}
-
-/// Tells `engine`'s stages the dispatch of a pair's decode side that no
-/// call issued, as the frame read at `at` names it: the side's issue
-/// first ([`issued_later`]), then the dispatch's own word. The side goes
-/// out as the first pick's and the store books it at this dispatch, so
-/// the dispatch is the side's issue too: a stage that books at an issue
-/// books the worker that serves, as it does at a decode call's issue.
-///
-/// The issue names the pair's pick as the lease's record keeps it: every
-/// target's two workers and their ranks, with no trace beside the
-/// generation. The record keeps no position, and each target bears the
-/// default one, 0, as the target of a dispatch's word does: a stage reads
-/// the worker by its id. The issue's lease names the target the dispatch
-/// took and that target's worker as the one it books. The dispatch's
-/// word then keeps the lease's own instant and names the same worker as
-/// the one the issue booked: no stage books it twice.
-///
-/// Out of line: no other dispatch builds a pick, and the teller's frame
-/// stays as short as it was.
-#[inline(never)]
-fn chosen_dispatched(
-    world: &StoreSnapshot,
-    engine: &Engine,
-    found: &Sides,
-    lease: &Lease,
-    target: &Target,
-    dispatch: Dispatch,
-    at: Instant,
-) {
-    let named = |index| {
-        let prefill = found.target_of(Side::Prefill, index)?;
-        Some((prefill, found.target_of(Side::Decode, index)?))
-    };
-    let mut targets = Targets::new();
-    for ((id, dp_rank), (decode_id, decode_dp_rank)) in (0..=u8::MAX).map_while(named) {
-        targets.push(Target {
-            id,
-            dp_rank,
-            pair: Some(Pair {
-                decode_id,
-                decode_dp_rank,
-                ..Pair::default()
-            }),
-            ..Target::default()
-        });
-    }
-    let decision = Decision::Pick(Pick {
-        targets,
-        trace: Trace {
-            generation: lease.generation,
-            ..Trace::default()
-        },
-        ..Pick::default()
-    });
-    let sent = Lease {
-        booked: target.id,
-        ..*lease
-    };
-    issued_later(world, engine, &sent, &decision, at);
-    engine.dispatched_stages(&sent, target, dispatch.side, dispatch.since_decision_micros);
 }

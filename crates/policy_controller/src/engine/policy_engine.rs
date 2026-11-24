@@ -1285,7 +1285,9 @@ impl DecisionEngine for PolicyEngine {
         let tell = || match held.lease.side {
             Side::Single => lease_events::single(&lease_events::of_host(engine, sends), held, said),
             // A pair's guard holds its prefill side's lease.
-            Side::Prefill => lease_events::pair(engine, sends, held, said, micros),
+            Side::Prefill => {
+                lease_events::pair(&lease_events::of_host(engine, sends), held, said, micros);
+            }
             // No lease is issued for a side on its own.
             Side::Decode | Side::Encode => {}
         };

@@ -3183,7 +3183,9 @@ mod tests {
     /// One word of a held pair told to the stages, the clock reading 9,900
     /// and every worker still listed.
     fn tell(engine: &Engine, held: &HeldDecision<'_>, word: Said) {
-        lease_events::pair(engine, engine, held, word, |_| 9_900);
+        lease_events::pair(&lease_events::of_host(engine, engine), held, word, |_| {
+            9_900
+        });
     }
 
     /// Each word of a pair, both sides issued with the prefill, the host
