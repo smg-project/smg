@@ -1,6 +1,7 @@
 use std::{sync::Arc, time::Duration};
 
 use smg_worker::{
+    health::overload::OverloadThresholds,
     jobs::{
         queue::{JobOutcomeError, JobQueue, JobQueueConfig},
         WorkerJob, WorkerJobAsker, WorkerRegistrationMode,
@@ -20,6 +21,7 @@ use crate::{
         membership::{MembershipCalls, ReplicaMembershipWriter},
         principal::Principal,
         replication::journaled_from,
+        Config,
     },
     store::{self, MemoryStore, Registrant, WorkerStatus, WorkersStore},
 };
@@ -38,8 +40,18 @@ fn queue(leads: bool) -> (Arc<MemoryStore>, Arc<Jobs>, Arc<JobQueue<Jobs>>) {
 /// A host whose jobs write at the replica's own door, over a store that
 /// stands in [`TERM`]. The door leads that term where `leads`, and refuses
 /// as a replica that does not lead otherwise. An ended run's state stands
-/// for `kept` ahead of its sweep.
+/// for `kept` ahead of its sweep. Its registrations run under the default
+/// overload thresholds of a start that sets no others.
 fn host(leads: bool, kept: Duration) -> (Arc<MemoryStore>, Arc<Jobs>) {
+    host_stating(leads, kept, Config::DEFAULT_WORKER_OVERLOAD)
+}
+
+/// [`host`] of a start that states `overload`.
+fn host_stating(
+    leads: bool,
+    kept: Duration,
+    overload: OverloadThresholds,
+) -> (Arc<MemoryStore>, Arc<Jobs>) {
     let (store, feed) = journaled_from(&LeasePlace::Process, 0);
     store::LeasesStore::set_term(store.as_ref(), TERM);
     let objects = holder(&store);
@@ -53,7 +65,7 @@ fn host(leads: bool, kept: Duration) -> (Arc<MemoryStore>, Arc<Jobs>) {
     };
     let door =
         ReplicaMembershipWriter::new(Arc::new(calls), Principal::replica("controller-a"), leading);
-    let jobs = Jobs::swept(&objects, Arc::new(door), kept).expect("the two definitions");
+    let jobs = Jobs::swept(&objects, Arc::new(door), overload, kept).expect("the two definitions");
     (store, jobs)
 }
 
@@ -170,10 +182,19 @@ async fn an_update_and_a_labels_refresh_are_refused() {
 
 /// The README names what a controller fixes for a registration: a starting
 /// worker is polled every 30 seconds for 1800 seconds from the job's start,
-/// over HTTP/1.1, and its row states the worker crate's default checks.
-#[test]
-fn a_registrations_settings_are_the_ones_the_readme_names() {
-    let fixed = super::settings();
+/// over HTTP/1.1, and its row states the worker crate's default checks. The
+/// default overload thresholds are not fixed: a registration's settings
+/// state the ones its host is built with, which are the start's.
+#[tokio::test]
+async fn a_registrations_settings_are_the_ones_the_readme_names() {
+    let started = OverloadThresholds {
+        waiting_requests: Some(4),
+        token_usage: None,
+    };
+    let (_, jobs) = host_stating(true, ENDED_RUN_KEPT, started);
+    assert_eq!(jobs.settings.overload_defaults, started);
+    let fixed = super::settings(started);
+    assert_eq!(fixed.overload_defaults, started);
     let timing = (
         fixed.startup_timeout_secs,
         fixed.startup_delay_secs,

@@ -21,6 +21,7 @@ use smg_service_discovery::{
     start_service_discovery, DiscoveryConfig, Roles, RuntimeDiscoveryConfig,
     DEFAULT_DISCOVERY_CHECK_INTERVAL_SECS,
 };
+use smg_worker::health::overload::OverloadThresholds;
 use tokio::{sync::watch, task::JoinHandle, time};
 use tracing::error;
 
@@ -128,7 +129,9 @@ impl Discovery {
     /// The discovery of a replica that registers what its passes find. The
     /// host reads the registry of `objects`, and its queue runs each job
     /// with the store's write at `door` ([`Jobs`]): the door reads the term
-    /// this replica leads under at each write.
+    /// this replica leads under at each write. `overload` is the default
+    /// overload thresholds the replica's start states, which a registration's
+    /// own object states too.
     ///
     /// A configured worker key is refused. The replica keeps no key of a
     /// worker it finds yet: dropped, it would leave the worker's object
@@ -138,6 +141,7 @@ impl Discovery {
         objects: &Arc<Objects<Members>>,
         door: Arc<dyn MembershipWriter>,
         fence: Arc<Fence>,
+        overload: OverloadThresholds,
     ) -> Result<Self, ConfigError> {
         if settings.credential().is_some() {
             return Err(refuse(
@@ -147,7 +151,7 @@ impl Discovery {
             ));
         }
         let host = Arc::new(Host::new(Arc::clone(objects.registry()), None));
-        let jobs = Jobs::new(objects, door).map_err(|error| {
+        let jobs = Jobs::new(objects, door, overload).map_err(|error| {
             refuse(
                 "--discovery-provider",
                 format!("the jobs of a pass do not run: {error}"),

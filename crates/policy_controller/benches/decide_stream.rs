@@ -965,6 +965,7 @@ fn config(deciders: usize) -> Config {
         shutdown_settle: Duration::from_millis(10),
         shutdown_grace: Duration::from_secs(5),
         load_poll_interval: Config::DEFAULT_LOAD_POLL_INTERVAL,
+        worker_overload: Config::DEFAULT_WORKER_OVERLOAD,
         decide_shards: deciders,
         election: ElectionConfig::default(),
         discovery: None,

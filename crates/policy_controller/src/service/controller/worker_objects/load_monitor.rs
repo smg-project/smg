@@ -223,6 +223,7 @@ mod tests {
         connection::engine::{
             AdminAnswer, EngineConnection, EngineConnector, HealthAnswer, ZmqLink,
         },
+        health::overload::OverloadThresholds,
         worker::{ProfileOptions, RuntimeType, SchedulerLoadSnapshot, WorkerLoadResponse},
     };
     use tokio::{task::JoinSet, time};
@@ -230,7 +231,7 @@ mod tests {
     use super::{super::ObjectsWake, *};
     use crate::{
         engine::view::WireModes,
-        service::controller::frame_loads::FrameLoads,
+        service::controller::{frame_loads::FrameLoads, Config},
         store::{GatewayId, MemoryStore, Reachability, WorkerFacts, WorkerStatus, WorkersStore},
     };
 
@@ -422,6 +423,11 @@ mod tests {
     impl Replica {
         /// A replica that does not lead yet, its monitor's task started.
         fn new() -> Self {
+            Self::stating(Config::DEFAULT_WORKER_OVERLOAD)
+        }
+
+        /// [`Self::new`] of a start that states `overload`.
+        fn stating(overload: OverloadThresholds) -> Self {
             let store = Arc::new(MemoryStore::new());
             let engine = Arc::new(Engine::default());
             let dials: Arc<dyn EngineConnector> = Arc::new(Dials(Arc::clone(&engine)));
@@ -429,6 +435,7 @@ mod tests {
                 Arc::clone(&store),
                 ObjectsWake::default(),
                 dials,
+                overload,
             ));
             let monitor = LoadMonitor::new(&workers, EVERY);
             let loads = monitor.loads();
@@ -539,6 +546,30 @@ mod tests {
             time::sleep(Duration::from_millis(1)).await;
         }
         holds()
+    }
+
+    /// The monitor judges a worker whose row names no threshold by the two
+    /// its start states. Five wait: a replica started with a count of four
+    /// vetoes the worker at its first poll, and one started with the
+    /// default of eight does not.
+    #[tokio::test(start_paused = true)]
+    async fn a_worker_that_names_no_threshold_is_judged_by_its_starts() {
+        let four = OverloadThresholds {
+            waiting_requests: Some(4),
+            ..Config::DEFAULT_WORKER_OVERLOAD
+        };
+        for (overload, vetoed) in [(four, true), (Config::DEFAULT_WORKER_OVERLOAD, false)] {
+            let mut replica = Replica::stating(overload);
+            replica.register(facts(A));
+            replica.engine.waiting.store(5, SeqCst);
+            replica.role.send_replace(Some(1));
+            assert!(comes(|| replica.waiting(A) == Some(5)).await, "the report");
+            // The verdict is the first poll's own: the next is an interval
+            // away, and a moment more moves nothing.
+            time::sleep(Duration::from_millis(5)).await;
+            assert_eq!(replica.overloaded(A), vetoed, "{overload:?}");
+            assert!(replica.stopped().await, "the task ends at the stop");
+        }
     }
 
     /// The reader of the monitor's counts answers what the replica's polls

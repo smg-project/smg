@@ -2062,7 +2062,7 @@ Its data is one in-memory store (`store/memory.rs`):
 | Data | Filled by | Note |
 |---|---|---|
 | worker records | the `RegisterWorker`, `PatchWorker`, `DeregisterWorker` calls, and the leader's own discovery | discovery is behind a feature the image leaves out; a record it writes asks for the worker's cache events where the document in force at the find reads them for the worker's first model, and a document applied later does not write that word again |
-| worker objects | a task that follows the worker records | a second form of the same workers, of the worker crate's type; each states its registration's overload thresholds over one default, 8 queued requests and 0.8 usage, an external record's over none, and the load monitor judges by them while the replica leads; an object's status leads its record's, and a single request's decision reads the workers here |
+| worker objects | a task that follows the worker records | a second form of the same workers, of the worker crate's type; each states its registration's overload thresholds over one default, which its start states (8 queued requests and 0.8 usage by its flags' defaults), an external record's over none, and the load monitor judges by them while the replica leads; an object's status leads its record's, and a single request's decision reads the workers here |
 | health | the worker crate's health checker over the worker objects, on the leader | copied into the records |
 | loads | the worker crate's load monitor over the worker objects, while the replica leads: a poll every 10 seconds, and the load records on the workers' event streams | `PushLoad` is not served; a single request's decision is given the monitor's snapshot where the document reads reports and keeps none; the store's load table is written by nothing |
 | cache index | a follower of each worker's cache events | an index of the store's own; `PushKvEvents` is not served; a single request's decision reads none yet, only the engine's own record of sent prompts |
@@ -2802,7 +2802,9 @@ registers it with no threshold at all. What that leaves of a binding's block:
   registration, or its program's default. The two that a gateway's routing settings state are
   the defaults its worker objects are built with where the switch below is on, and the crate's
   translation of those settings writes neither onto a binding. A gateway states them on its
-  command line, beside a supplied document too.
+  command line, beside a supplied document too. A standalone controller states them on its own
+  command line, by the gateway's two flags, and its worker objects are built with them: the
+  flags' defaults are 8 queued requests and 0.8 usage.
 - **Its shed word [built].** A binding keeps whether a request is shed when every worker is
   vetoed. A decision reads it.
 - **Its switch [partly].** Whether the program's default vetoes at all is one word for the
