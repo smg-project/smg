@@ -10682,20 +10682,15 @@ mod tests {
         assert_eq!(preset.validate().expect("validates").needs().sample, 16);
     }
 
-    /// The guard of the count's one reader, over the catalog's own lists: a
-    /// profile of each stock stage decides alike over rows that carry their
-    /// requests in flight and over rows that read otherwise with the counts
-    /// in a table lent beside them. A stage that reads a row's own field
-    /// reads another count beside lent rows, and parts here. The same
-    /// lists hold each stock stage to its word on what the gateways
-    /// report of leases
-    /// ([`Filter::refuses_by_reports`](crate::engine::Filter::refuses_by_reports)).
+    /// The guard of each stock stage's word on what the gateways report of
+    /// leases
+    /// ([`Filter::refuses_by_reports`](crate::engine::Filter::refuses_by_reports)),
+    /// over the catalog's own lists: a profile of each stock stage says no
+    /// line. The same lists hold the fewest requests to the rows' counts:
+    /// its profiles decide otherwise over rows that carry none.
     #[test]
-    fn every_catalog_stage_reads_a_lent_count_as_a_rows_own() {
-        use crate::{
-            engine::{view::Identity, Health, PoolFacts, Scratch, WorkerId},
-            tracking::in_flight::tests::Lent,
-        };
+    fn every_catalog_stage_says_no_line_on_what_gateways_report_of_leases() {
+        use crate::engine::{view::Identity, Health, PoolFacts, Scratch, WorkerId};
         let sessions = r#""score":["fewest-sessions"]"#;
         let scored = |pick: &str| format!(r#"{{{sessions},"pick":{pick}}}"#);
         let alone = |pick: &str| format!(r#"{{"filter":["healthy"],"pick":{pick}}}"#);
@@ -10743,8 +10738,7 @@ mod tests {
             let built = forms.iter().find_map(|form| document(form).validate().ok());
             built.unwrap_or_else(|| panic!("no form validates: {forms:?}"))
         };
-        // Counts that part the rows, the same rows reading otherwise with
-        // the counts in a lent table, and rows that read none.
+        // Counts that part the rows, and rows that read none.
         let counts = [5, 1, 3, 0, 4, 2, 6, 1];
         let row = |(position, in_flight): (u32, u32)| Candidate {
             position,
@@ -10757,11 +10751,7 @@ mod tests {
             ..Candidate::default()
         };
         let rows = |held: [u32; 8]| -> Vec<Candidate> { (0..).zip(held).map(row).collect() };
-        let (own, mut other, bare) = (rows(counts), rows(counts), rows([0; 8]));
-        let lent = Lent::take(&mut other);
-        for (row, held) in other.iter_mut().zip([1, 6, 2, 4, 0, 3, 1, 5]) {
-            row.in_flight = held;
-        }
+        let (own, bare) = (rows(counts), rows([0; 8]));
         let pool = PoolFacts {
             pool_size: 8,
             generation: 1,
@@ -10769,7 +10759,7 @@ mod tests {
         };
         // One engine a feed: a stage that keeps a rotation starts each
         // feed's decisions at the same place.
-        let run = |forms: &[String], rows: &[Candidate], beside: bool| {
+        let run = |forms: &[String], rows: &[Candidate]| {
             let engine = build(forms);
             let picks = |seed: u64| {
                 let facts = RequestFacts {
@@ -10778,7 +10768,6 @@ mod tests {
                     seed,
                     ..RequestFacts::default()
                 };
-                let facts = if beside { lent.beside(&facts) } else { facts };
                 let cx = Constraints::default();
                 let decision = engine.decide(&facts, &pool, rows, &cx, &mut Scratch::new());
                 let picked = decision.pick();
@@ -10793,14 +10782,8 @@ mod tests {
             (0..32).map(picks).collect::<Vec<_>>()
         };
         for forms in &profiles {
-            let written = run(forms, &own, false);
-            let read = run(forms, &other, true);
-            assert_eq!(
-                written, read,
-                "a lent count is not read as a row's own: {forms:?}"
-            );
             // The counts part the rows: the fewest requests answer by them.
-            let moved = written != run(forms, &bare, false);
+            let moved = run(forms, &own) != run(forms, &bare);
             assert!(moved || !forms[0].contains("least-requests"), "{forms:?}");
             // No stock stage takes a silent stage's side: each says it
             // refuses by nothing a gateway reports of leases, so a decision

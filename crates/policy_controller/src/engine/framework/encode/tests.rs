@@ -18,7 +18,6 @@ use crate::{
     },
     load::signals::{SignalCell, SignalCells, SignalColumn},
     policies::consistent_hashing::InOrder,
-    tracking::in_flight::tests::Lent,
 };
 
 /// A profile of an engine no other engine shares yet, to change in a case.
@@ -267,25 +266,6 @@ fn an_item_is_placed_on_an_encoder_of_the_chosen_prefills_class() {
     bed.facts = vec![pushing(1), pushing(2), pushing(2)];
     bed.keys = vec![Identity::hashed(11), Identity::hashed(12)];
     assert_eq!(bed.placed(), ((1, 0), vec![2, 2], false));
-}
-
-/// A lent table numbers the rows of the request's own pool, and the encoders
-/// are numbered again from zero: the encode side reads each encoder's own
-/// count and nothing of the table.
-#[test]
-fn the_encode_side_reads_no_count_lent_for_another_pool() {
-    let mut bed = Bed::new();
-    // The first encoder holds five requests and the second none.
-    bed.encoders = vec![row(0, Role::Encode, 0, 5), row(1, Role::Encode, 0, 0)];
-    bed.facts = vec![pushing(1), pushing(1)];
-    // Another pool's table says the opposite of those two positions.
-    let mut others = vec![row(0, Role::Prefill, 1, 0), row(1, Role::Prefill, 1, 9)];
-    let lent = Lent::take(&mut others);
-    let (facts, pool) = bed.asked();
-    let (decision, placed) = bed.decide_asked(&engine(), &lent.beside(&facts), &pool);
-    assert!(matches!(decision, Decision::Pick(_)), "{decision:?}");
-    let encoders: Vec<u32> = placed.encoders().iter().map(|t| t.position).collect();
-    assert_eq!(encoders, vec![1]);
 }
 
 #[test]

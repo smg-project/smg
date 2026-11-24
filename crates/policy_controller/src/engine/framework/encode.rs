@@ -789,9 +789,6 @@ impl Engine {
         let encode_facts = RequestFacts {
             phase: Phase::Encode,
             affinity: encode.affinity,
-            // Lent counts are positions in another pool: the encode side
-            // takes none.
-            lent_in_flight: None,
             // The encoders' own cells: the request's would be read by
             // another pool's positions.
             signal_cells: encode.signal_cells,
