@@ -1021,6 +1021,11 @@ fn a_block_keeps_its_thirty_two_bytes() {
     assert_eq!(size_of::<Block>(), 32);
 }
 
+#[test]
+fn a_map_entry_keeps_its_twelve_bytes() {
+    assert_eq!(size_of::<(Halves, u32)>(), 12);
+}
+
 /// One key a block, each the fold of the hashes up to it: a leading
 /// part's keys are the leading keys, and another seed gives other keys.
 #[test]
