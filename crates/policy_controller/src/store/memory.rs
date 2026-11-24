@@ -921,9 +921,8 @@ impl MemoryStore {
                 return Ok(false);
             }
             let Loads { ranks, writer } = &mut *loads;
-            // The cells on file go under the generation's own columns
-            // before the writer reads them. A generation the writer refuses
-            // moves none.
+            // The cells on file go under the generation's own columns. A
+            // generation the writer refuses moves none.
             let standing = writer.spec();
             if generation > standing.generation() {
                 carry_cells(ranks, standing.signal_columns(), spec.signal_columns());
@@ -968,8 +967,7 @@ impl MemoryStore {
     ///
     /// A world kept across two publications of a pool keeps the rows it
     /// lists as they are: the second publication writes over other rows,
-    /// and allocates that pool's rows when the writer holds none alone
-    /// ([`publication_allocations`](Self::publication_allocations)).
+    /// and allocates that pool's rows when the writer holds none alone.
     pub fn snapshot(&self) -> Arc<StoreSnapshot> {
         self.world.load_full()
     }
@@ -1436,22 +1434,6 @@ impl MemoryStore {
     /// engine's time ([`Engine::pins_absence_micros`](crate::engine::Engine::pins_absence_micros)).
     fn pins_absence(&self) -> Duration {
         Duration::from_micros(self.world.load().spec().engine().pins_absence_micros())
-    }
-
-    /// How many times a publication allocated a pool's rows since the store
-    /// was made. A publication writes a pool's rows over rows no world
-    /// lists any more: the ones the pool published before its last, else
-    /// any of its length that left a pool. It allocates when it finds
-    /// none: at a pool's first publication after a membership build,
-    /// unless rows that build retired fit it, and past that only while a
-    /// reader holds a world from before the pool's last publication. A
-    /// membership build's own rows are not counted.
-    ///
-    /// A pool's signal cells count with its rows, by the same rule: a
-    /// publication writes them over the block the pool published before
-    /// its last, and a membership build's own cells are not counted.
-    pub fn publication_allocations(&self) -> u64 {
-        self.loads.lock().writer.allocations()
     }
 
     /// How many worlds the store published since it was made. A write that
@@ -2330,10 +2312,6 @@ impl OnFile for OnTable<'_> {
     fn sample(&self, id: WorkerId, rank: u16) -> Option<LoadSample> {
         self.0.get(&id)?.samples.get(&rank).copied()
     }
-
-    fn cells(&self, id: WorkerId, rank: u16) -> Option<&[SignalCell]> {
-        self.0.get(&id)?.cells.get(&rank).map(|cells| &**cells)
-    }
 }
 
 /// What a write read before it took the load lock
@@ -2778,7 +2756,6 @@ impl LoadSink for MemoryStore {
                 folded = writer.fold_load(id, rank, None).or(folded);
             }
             // The member's values go with its samples.
-            let unsaid = !ranks.cells.is_empty() && writer.forget_signals(id);
             *ranks = Ranks::default();
             // The member's marks go with its rows: a rank with nothing on
             // file is a rank again, and its engine is judged for it.
@@ -2788,7 +2765,7 @@ impl LoadSink for MemoryStore {
                 None if forgot => writer.engine_of(id),
                 None => None,
             };
-            if folded.is_some() || forgot || unsaid {
+            if folded.is_some() || forgot {
                 if let Some(engine) = engine {
                     writer.judged(engine, false);
                 }
@@ -2835,9 +2812,7 @@ impl SignalSink for MemoryStore {
         self.world.load().spec().shared_signal_columns()
     }
 
-    /// A value that is taken is shown as a load write with no instant of
-    /// its own is: with the window's next publication, or at once in a
-    /// store that publishes no window.
+    /// A value that is taken goes on file and asks for no publication.
     fn signal_value(
         &self,
         id: WorkerId,
@@ -2941,10 +2916,6 @@ impl MemoryStore {
             return SignalWriteOutcome::Older;
         }
         *held = cell;
-        if writer.fold_signal(id, rank, column, cell) {
-            let world = writer.folded();
-            self.show(writer, world);
-        }
         SignalWriteOutcome::Written
     }
 }

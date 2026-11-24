@@ -236,11 +236,6 @@ pub const ENTRIES: &[(&str, &str, EntryReplication)] = &[
     ("MemoryStore", "stats", EntryReplication::Read),
     ("MemoryStore", "overload_flips", EntryReplication::Read),
     ("MemoryStore", "outside_lists", EntryReplication::Read),
-    (
-        "MemoryStore",
-        "publication_allocations",
-        EntryReplication::Read,
-    ),
     ("MemoryStore", "publications", EntryReplication::Read),
     ("MemoryStore", "membership_builds", EntryReplication::Read),
     ("MemoryStore", "resyncs", EntryReplication::Read),

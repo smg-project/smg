@@ -1,16 +1,14 @@
 //! The signal sink: where a source writes the values a report states by
 //! name, one value for one rank's row.
 //!
-//! A value stands beside its rank's load sample, under the same lock, and
-//! reaches a decision in a publication, as the row does: no stage is told a
-//! value as it arrives. The store keeps cells for the names the document in
-//! force declares ([`AppliedSpec::signal_columns`]) and for no other.
+//! A value stands beside its rank's load sample, under the same lock: no
+//! stage is told a value as it arrives. The store keeps cells for the names
+//! the document in force declares ([`AppliedSpec::signal_columns`]) and for
+//! no other.
 //!
 //! A source writes a report's row first ([`LoadSink`]), then its values. A
-//! publication cut between the two shows the new row beside the values of
-//! the report before, for that one publication, and a stage relies on no
-//! more: a value may ride one record in ten. A row the load sink passed
-//! over takes its values with it: its source writes none of them.
+//! row the load sink passed over takes its values with it: its source
+//! writes none of them.
 //!
 //! A source reads the declared columns once a report
 //! ([`SignalSink::signal_columns`]) and writes each value under the column
@@ -81,7 +79,7 @@ pub trait SignalSink: Send + Sync {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum SignalWriteOutcome {
-    /// The value is on file and is shown with the next publication.
+    /// The value is on file.
     Written,
     /// The document in force does not continue the column the value was
     /// written under: it declares no signal of the name, or declares it
