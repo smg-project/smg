@@ -4518,12 +4518,10 @@ mod tests {
         let under = decide(&engine, &request, &pool);
         assert_eq!(order(&under)[0], ring[0], "the pin under its thresholds");
         pool[owner].health.overloaded = true;
-        let over = decide(&engine, &request, &pool);
-        assert_eq!(order(&over)[0], ring[2], "the pin over its thresholds");
-        assert_eq!(over.trace().lifted, LiftedVeto::None);
         // The free workers carry the cap too. The veto as it stands still
         // keeps them: the ring's first of them takes the request, no veto
-        // is lifted, and no pin moves to a worker at the cap.
+        // is lifted, and no pin moves to a worker at the cap. Asked ahead
+        // of the respill below, which moves the pin where it is decided.
         pool[ring[2] as usize].session_in_flight = 2;
         pool[ring[3] as usize].session_in_flight = 2;
         let standing = decide(&engine, &request, &pool);
@@ -4531,6 +4529,13 @@ mod tests {
         let pick = standing.pick().expect("a pick");
         assert_eq!(pick.session_verdict, SessionVerdict::None);
         assert_eq!(standing.trace().lifted, LiftedVeto::None);
+        // The free workers under the cap: the key passes the ring's next
+        // worker, over its thresholds, to the first of them.
+        pool[ring[2] as usize].session_in_flight = 0;
+        pool[ring[3] as usize].session_in_flight = 0;
+        let over = decide(&engine, &request, &pool);
+        assert_eq!(order(&over)[0], ring[2], "the pin over its thresholds");
+        assert_eq!(over.trace().lifted, LiftedVeto::None);
     }
 
     /// What a filter that turns was asked, and whether it turned.
