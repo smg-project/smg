@@ -141,9 +141,9 @@ pub(super) fn alone(
 /// picked, alone ([`AlonePick::decision`]), and its lease, issued here as a
 /// whole pass's is ([`issued`]). The lease states the size `plain` states,
 /// the two lengths of its `text`, characters and bytes, and no session, and
-/// is dated at `now` on the engine's clock. The issue
-/// is told where a stage takes it. `None` where the list holds no worker at
-/// the place.
+/// is dated at `now` on the engine's clock. The issue is told where a
+/// stage takes it, under a catch of its own as a whole pass's is. `None`
+/// where the list holds no worker at the place.
 pub(super) fn noted(
     own: Loaded<'_, '_>,
     pick: AlonePick,
@@ -184,7 +184,7 @@ pub(super) fn noted(
     };
     if document.hears.contains(EventKind::Issued) {
         let stages = document.spec.engine();
-        stages.on_decision_issued(&lease, &decided.decision);
+        own.word_caught(|| stages.on_decision_issued(&lease, &decided.decision));
     }
     Some(decided)
 }
@@ -549,8 +549,12 @@ fn shed(
 /// on a lease a pick is issued before the answer leaves: its lease takes
 /// the next id, books the pick's first target and is dated at the
 /// decision's instant, and the stages that take the issue hear of it here,
-/// on the calling thread and inside the decision's own catch. From the
-/// answer the lease is its guard's: nothing of it is filed.
+/// on the calling thread and under a catch of its own
+/// ([`super::PolicyEngine::word_caught`]). A stage that panics at the issue
+/// is held and counted, the stages behind it do not hear it, and the pick
+/// and its lease are answered all the same: the guard tells the lease's
+/// dispatch and its end as any lease's. From the answer the lease is its
+/// guard's: nothing of it is filed.
 ///
 /// A pick the binding's sessions rule keeps from the profile is issued
 /// too, and no stage hears its issue ([`lease_events::stages_hear`]).
@@ -589,7 +593,7 @@ pub(super) fn issued(
         // Asked behind the document's own word: a document whose stages
         // take no issue reads nothing of the pick here.
         if lease_events::stages_hear(&decision) {
-            document.spec.engine().on_decision_issued(lease, &decision);
+            own.word_caught(|| document.spec.engine().on_decision_issued(lease, &decision));
         }
     }
     DecideOutcome {
@@ -3401,8 +3405,9 @@ pub(crate) mod tests {
     }
 
     /// The words a stage of `engine` put into `heard` of two requests: one
-    /// sent to its first target and completed, and one given up unsent.
-    fn told(engine: &PolicyEngine, heard: &Heard) -> Vec<&'static str> {
+    /// sent to its first target and completed, and one given up unsent. A
+    /// stage panicked at `unheard` of the words, and no decision faulted.
+    fn told(engine: &PolicyEngine, heard: &Heard, unheard: u64) -> Vec<&'static str> {
         let list = pool(4);
         let members = PublishedList::new(Arc::clone(&list));
         let asks = Asks::of(request(), Some(&members));
@@ -3428,7 +3433,7 @@ pub(crate) mod tests {
         let unsent =
             DecisionGuard::decide_under(engine, GatewayId::LOCAL, &asks, now).expect("a decision");
         drop(unsent);
-        assert_eq!((engine.faults(), engine.unheard()), (0, 0));
+        assert_eq!((engine.faults(), engine.unheard()), (0, unheard));
         let words = heard.lock().iter().map(|heard| heard.0).collect();
         words
     }
@@ -4008,7 +4013,7 @@ pub(crate) mod tests {
     fn a_word_no_stage_takes_is_told_to_nobody() {
         let told_of = |kind: EventKind| {
             let (engine, heard) = hearing_as(false, false, EventSet::NONE.with(kind));
-            told(&engine, &heard)
+            told(&engine, &heard, 0)
         };
         assert_eq!(told_of(EventKind::Issued), ["issued", "issued"]);
         assert_eq!(told_of(EventKind::Dispatched), ["dispatched"]);
@@ -4034,8 +4039,142 @@ pub(crate) mod tests {
         });
         assert_eq!(engine.document.hears, EventSet::LEASE);
         assert_eq!(
-            told(&engine, &heard),
+            told(&engine, &heard, 0),
             ["issued", "dispatched", "completed", "issued", "released"]
+        );
+    }
+
+    /// [`Hears`] as a stage that panics at one word of a lease, the kind it
+    /// names, and keeps each other word.
+    #[derive(Debug)]
+    struct StopsAt(Hears, EventKind);
+
+    impl StopsAt {
+        /// Panics where `word` is the stage's own.
+        fn stop(&self, word: EventKind) {
+            assert!(self.1 != word, "this stage panics at that word");
+        }
+    }
+
+    impl Lifecycle for StopsAt {
+        fn hears(&self) -> EventSet {
+            EventSet::LEASE
+        }
+
+        fn on_decision_issued(&self, lease: &Lease, decision: &Decision) {
+            self.stop(EventKind::Issued);
+            self.0.on_decision_issued(lease, decision);
+        }
+
+        fn on_dispatched(&self, lease: &Lease, target: &Target, side: Side, since: u32) {
+            self.stop(EventKind::Dispatched);
+            self.0.on_dispatched(lease, target, side, since);
+        }
+
+        fn on_completed(&self, lease: &Lease, outcome: &Outcome) {
+            self.stop(EventKind::Completed);
+            self.0.on_completed(lease, outcome);
+        }
+
+        fn on_released(&self, lease: &Lease, reason: ReleaseReason) {
+            self.stop(EventKind::Released);
+            self.0.on_released(lease, reason);
+        }
+    }
+
+    impl Picker for StopsAt {
+        fn name(&self) -> &'static str {
+            "stops-at"
+        }
+
+        fn refuses_by_reports(&self) -> bool {
+            self.0.refuses_by_reports()
+        }
+
+        fn picks_alone(&self) -> bool {
+            self.0.picks_alone()
+        }
+
+        fn pick_alone(
+            &self,
+            pool: &PoolWord<'_>,
+            keep: &mut dyn FnMut(usize) -> bool,
+        ) -> Option<usize> {
+            self.0.pick_alone(pool, keep)
+        }
+
+        fn pick(
+            &self,
+            facts: &RequestFacts<'_>,
+            candidates: &[Candidate],
+            kept: &[u32],
+            scores: &[f32],
+            band: TieBand,
+            out: &mut Targets,
+        ) {
+            self.0.pick(facts, candidates, kept, scores, band, out);
+        }
+    }
+
+    /// What [`told`] reads of an engine whose stage panics at `word`, with
+    /// `unheard` held panics counted and no fault. The stage's picker
+    /// places by itself where `alone`.
+    fn told_past(word: EventKind, alone: bool, unheard: u64) -> Vec<&'static str> {
+        let heard = Heard::default();
+        let kept = Arc::clone(&heard);
+        let engine = picked_by("stops-at", move || {
+            let hears = Hears {
+                heard: Arc::clone(&kept),
+                panics: false,
+                alone,
+                takes: EventSet::LEASE,
+            };
+            Box::new(StopsAt(hears, word))
+        });
+        told(&engine, &heard, unheard)
+    }
+
+    /// A stage that panics at a first decision's issue is held and counted
+    /// with the words a stage did not hear, on the whole pass and on the
+    /// short path of a picker that places by itself. The decision answers
+    /// its pick and its lease, so the guard tells the lease's dispatch and
+    /// its end as any lease's: of a request sent and one given up, the
+    /// stage hears every word but the two issues. Before, each request was
+    /// answered a fault.
+    ///
+    /// The classic pass tells a policy nothing where a pick is issued: it
+    /// asks the policy for one pick
+    /// (`model_gateway/src/routers/common/placement.rs:1391`).
+    #[test]
+    fn a_stage_that_panics_at_a_first_issue_costs_the_request_nothing() {
+        for alone in [false, true] {
+            // The two held panics alone are counted.
+            assert_eq!(
+                told_past(EventKind::Issued, alone, 2),
+                ["dispatched", "completed", "released"],
+                "a picker that places by itself: {alone}"
+            );
+        }
+    }
+
+    /// A stage that panics at a later word of a lease is held under the
+    /// same catch and counted the same way, as before this catch was the
+    /// issue's too: the request goes on, and the stage hears every other
+    /// word of the request sent and of the one given up.
+    #[test]
+    fn a_stage_that_panics_at_a_later_word_of_a_lease_is_held_and_counted() {
+        let past = |word| told_past(word, false, 1);
+        assert_eq!(
+            past(EventKind::Dispatched),
+            ["issued", "completed", "issued", "released"]
+        );
+        assert_eq!(
+            past(EventKind::Completed),
+            ["issued", "dispatched", "issued", "released"]
+        );
+        assert_eq!(
+            past(EventKind::Released),
+            ["issued", "dispatched", "completed", "issued"]
         );
     }
 

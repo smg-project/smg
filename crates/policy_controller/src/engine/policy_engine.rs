@@ -419,13 +419,27 @@ impl PolicyEngine {
 
     /// Tells the document's stages one change of membership, on the calling
     /// thread, and not the session table. A stage that panics at it is held
-    /// here and counted ([`Self::unheard`]): the registration or the removal
+    /// and counted ([`Self::word_caught`]): the registration or the removal
     /// goes on.
     fn told(&self, change: &Membership<'_>) {
         let engine = self.document.spec.engine();
-        if let Err(payload) = catch_unwind(AssertUnwindSafe(|| engine.membership_stages(change))) {
-            release(payload);
-            self.unheard.fetch_add(1, Ordering::Relaxed);
+        self.word_caught(|| engine.membership_stages(change));
+    }
+
+    /// One word to the document's stages, `tell`, under a catch of its own:
+    /// what the word answers, and `None` where a stage panicked at it. The
+    /// panic is held here and counted ([`Self::unheard`]). The stages behind
+    /// the one that panicked do not hear the word, and what the word is of
+    /// goes on: a request, a registration or a removal.
+    #[inline]
+    fn word_caught<R>(&self, tell: impl FnOnce() -> R) -> Option<R> {
+        match catch_unwind(AssertUnwindSafe(tell)) {
+            Ok(answered) => Some(answered),
+            Err(payload) => {
+                release(payload);
+                self.unheard.fetch_add(1, Ordering::Relaxed);
+                None
+            }
         }
     }
 
@@ -436,15 +450,16 @@ impl PolicyEngine {
         &self.clock
     }
 
-    /// How many words of a lease (its dispatch, its end, its release) and
-    /// changes of membership panicked in a stage that heard them. The word
-    /// stands as said: the request, the registration or the removal it is
-    /// of goes on, and the stages after the one that panicked did not hear
-    /// it.
+    /// How many words of a lease (its issue, its dispatch, its end, its
+    /// release) and changes of membership panicked in a stage that heard
+    /// them. The word stands as said: the request, the registration or the
+    /// removal it is of goes on, and the stages after the one that panicked
+    /// did not hear it.
     ///
-    /// The issue of a decode at its own call is such a word too: the call
-    /// answers its pick all the same
-    /// ([`DecisionEngine::decide_decode_under`]).
+    /// A lease's issue is such a word at a first decision and at a decode's
+    /// own call alike: the call answers its pick and the lease all the same
+    /// ([`DecisionEngine::decide_under`],
+    /// [`DecisionEngine::decide_decode_under`]).
     #[must_use]
     pub fn unheard(&self) -> u64 {
         self.unheard.load(Ordering::Relaxed)
@@ -1067,10 +1082,7 @@ impl DecisionEngine for PolicyEngine {
             // No lease is issued for a side on its own.
             Side::Decode | Side::Encode => {}
         };
-        if let Err(payload) = catch_unwind(AssertUnwindSafe(tell)) {
-            release(payload);
-            self.unheard.fetch_add(1, Ordering::Relaxed);
-        }
+        self.word_caught(tell);
     }
 
     // No lease is filed, so no pass ends one: a lease ends at its guard's

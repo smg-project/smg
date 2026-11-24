@@ -37,7 +37,7 @@ use crate::{
     },
     engine::{
         decision::{Decision, ShadowKind, ShedReason, Targets},
-        decision_engine::{Decided, DecisionEngine, DecisionRefused, Request},
+        decision_engine::{Decided, DecisionEngine, Request},
         demands::Demands,
         framework::{Picker, ShadowRows, TieBand},
         list_cell::tests::PublishedList,
@@ -381,20 +381,27 @@ fn a_shadow_that_panics_leaves_the_live_answer_and_counts_a_fault() {
 }
 
 /// A shadow decision is counted behind the issue of its live decision's
-/// lease. Where a stage panics at that issue the request has no decision
-/// and the engine counts the fault: the shadow that ran beside it counts
-/// nothing.
+/// lease. A stage that panics at that issue is held and counted with the
+/// words a stage did not hear: the request keeps its decision and its
+/// lease, no fault is counted, and the shadow that ran beside it is counted
+/// as beside any decision. Before, the request had no decision and its
+/// shadow counted nothing.
 #[test]
-fn a_decision_whose_issue_panics_counts_no_shadow() {
+fn a_decision_whose_issue_panics_counts_its_shadow() {
     let list = pool(3);
     let (engine, seen) = bed(Rule::IssuePanics, Rule::Place(1));
     let members = PublishedList::new(Arc::clone(&list));
-    let asks = Asks::of(request(7), Some(&members));
-    let refused = engine.decide_under(GatewayId::LOCAL, &asks, Instant::now());
-    assert!(matches!(refused, Err(DecisionRefused::Faulted)));
+    let answer = decided(&engine, &Asks::of(request(7), Some(&members)));
+    let pick = answer.decision.pick().expect("a pick");
+    let live = pick.targets.first().expect("a target").id;
+    let lease = answer.lease.expect("the live pick's lease").lease;
+    assert_eq!((lease.booked, lease.id.0), (live, 1));
     assert_eq!(seen.shadows(), 1, "the shadow profile ran");
-    assert_eq!(engine.faults(), 1);
-    assert_eq!(kinds(&engine), [0; 4]);
+    assert_eq!((engine.faults(), engine.unheard()), (0, 1));
+    // The shadow's picker takes the row behind the live pick's.
+    assert_eq!(kinds(&engine), [0, 1, 0, 0]);
+    // The live profile's stage panicked: the stage behind it heard nothing.
+    assert!(seen.heard.lock().is_empty());
 }
 
 /// The entry that issues no lease runs a binding's shadow behind the live

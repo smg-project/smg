@@ -25,6 +25,13 @@ use crate::{
 /// release of a lease its decision gives up, costs that request its
 /// decision.
 ///
+/// The engine of a gateway's own process tells every word of a lease
+/// under a catch, the issue of a first decision among them. A hook that
+/// panics at one is held and counted, the stages behind it do not hear
+/// that word, and the request keeps its decision and its lease. A stage
+/// may so hear a lease's dispatch and its end with no issue ahead of them:
+/// it matches them by the lease's id, as below.
+///
 /// Under a sessions rule that says so (`rule_placed: untold`), a stage
 /// hears neither the issue nor the dispatch of a single request the rule
 /// placed alone: a pin of the request's key followed, or the rule's own
