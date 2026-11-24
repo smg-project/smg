@@ -2398,10 +2398,11 @@ fn run_profile(
 
 /// The body of [`run_profile`], which hands no `first`. A pair's decode
 /// decided again enters here with the decode its first decision named,
-/// where its picker takes turns, under no scorer or one it does not read
-/// ([`Engine::decide_decode`]): the scoring half keeps that decode where it
-/// is a survivor ([`score_survivors`]).
-/// Inlined into the two, so a run that hands none is the code it was.
+/// where its profile keeps such a decode ([`keeps_its_first`]), and so
+/// does that call's shadow ([`Engine::decide_decode`],
+/// [`Engine::shadow_decode_later`]): the scoring half keeps that decode
+/// where it is a survivor ([`score_survivors`]).
+/// Inlined into each, so a run that hands none is the code it was.
 #[inline(always)]
 #[expect(
     clippy::too_many_arguments,
@@ -2422,6 +2423,16 @@ fn run_side(
         return single_emptied(index, facts, pool, candidates, emptied_by, buf);
     }
     score_survivors(profile, index, facts, pool, candidates, buf, first)
+}
+
+/// Whether a decode decided again under `profile` keeps the decode its
+/// pair's first decision named, where the call is handed one: its picker
+/// takes turns, under no scorer or one the picker does not read. The live
+/// call asks it of its decode profile ([`Engine::decide_decode`]), and
+/// that call's shadow of its own ([`Engine::shadow_decode_later`]).
+#[inline]
+fn keeps_its_first(profile: &Profile) -> bool {
+    profile.picker.takes_turns() && (profile.scorers.is_empty() || profile.picker.picks_alone())
 }
 
 /// The targets of a pair's decode decided again where `first`, the worker
@@ -3097,6 +3108,14 @@ fn profile_index(binding: &Binding, phase: Phase) -> Option<u16> {
         (Plan::Epd { encode }, Phase::Encode) => Some(encode),
         (Plan::PdPair, Phase::Single | Phase::Encode) | (Plan::Epd { .. }, Phase::Single) => None,
     }
+}
+
+/// The live profiles of a pair binding's two sides, by position, the
+/// prefill's first. A binding that names no decode profile runs its one
+/// profile on both sides.
+fn live_sides(binding: &Binding) -> [u16; 2] {
+    let prefill = binding.profile;
+    [prefill, binding.decode_profile.unwrap_or(prefill)]
 }
 
 /// `entry` where its binding's plan pairs (`pd-pair` or `epd`): what makes
@@ -8402,11 +8421,7 @@ impl Engine {
         let profile = self.profiles.get(usize::from(index))?;
         let entry = self.bindings.get(at as usize)?;
         // The place stated on a lent ring is the two live sides'.
-        let binding = &entry.binding;
-        let lives = [
-            binding.profile,
-            binding.decode_profile.unwrap_or(binding.profile),
-        ];
+        let lives = live_sides(&entry.binding);
         // A side its binding's sessions rule or its picker's assignment
         // placed: a shadow's run is put to neither.
         if self.places_side(entry, lives[side.index()], facts) {
@@ -8467,10 +8482,18 @@ impl Engine {
     /// pair with the held `prefill`, on the call's own draw sequence.
     /// `at` is the pair binding's position ([`Self::pair_position`]). The
     /// run writes the scratch and the shadow profile's stages, and
-    /// nothing a commit reads. The shadow is handed the ring its request
-    /// lends whatever its ring form. No host asks a later decode's shadow
-    /// yet, and the change that asks it holds it to the rule of a side's
-    /// at the pair's decision ([`Self::shadow_side`]).
+    /// nothing a commit reads. The shadow is lent the ring its request
+    /// lends by the rule of a side's at the pair's decision
+    /// ([`Self::shadow_side`]), held against both live sides
+    /// ([`Self::unlent`]).
+    ///
+    /// `first_decode` is the decode the pair's first decision named, as
+    /// that call is handed it. A shadow profile that keeps such a decode
+    /// ([`keeps_its_first`]) answers it while its own filters keep it, and
+    /// its picker takes no turn there, as the live profile's takes none: a
+    /// rotation's shadow stays a turn a request beside its live side. The
+    /// test is the shadow profile's own: one that keeps no such decode
+    /// decides afresh, whatever its live side keeps.
     ///
     /// `None` where [`Self::shadow_side`] says none for the decode side,
     /// and where the held prefill left the rows. The same beside a decode
@@ -8482,10 +8505,10 @@ impl Engine {
         reason = "the decode entry and its inputs, beside the binding"
     )]
     #[cfg_attr(
-        not(test),
+        not(any(feature = "in-process", test)),
         expect(
             dead_code,
-            reason = "no host asks a later decode's shadow until the engine over worker lists does"
+            reason = "the one caller is the engine over worker lists, built under `in-process`"
         )
     )]
     pub(crate) fn shadow_decode_later(
@@ -8495,6 +8518,7 @@ impl Engine {
         pool: &PoolFacts<'_>,
         pools: PairPools<'_>,
         prefill: WorkerId,
+        first_decode: Option<(WorkerId, u16)>,
         live: &Pick,
         decode_cx: &Constraints<'_>,
         scratch: &mut Scratch,
@@ -8507,18 +8531,21 @@ impl Engine {
         // A decode its binding's sessions rule or its picker's assignment
         // placed, as at the pair's decision.
         let entry = self.bindings.get(at as usize)?;
-        let live_decode = entry.binding.decode_profile;
-        if self.places_side(entry, live_decode.unwrap_or(entry.binding.profile), facts) {
+        let lives = live_sides(&entry.binding);
+        if self.places_side(entry, lives[side.index()], facts) {
             return None;
         }
         let profile = self.profiles.get(usize::from(index))?;
+        // The place stated on a lent ring is the two live sides'.
+        let unlent = self.unlent(index, &lives, facts);
+        let facts = unlent.as_ref().unwrap_or(facts);
         let (decodes, mut decode_facts) = pools.side(side, facts)?;
         let prefill = pools.prefills.iter().find(|row| row.id == prefill)?;
         // The call's own draw sequence, as its live decode's.
         decode_facts.seed = facts.seed;
         let class = prefill.pair_class;
         let firsts = pools.made_first(class, live);
-        Some(run_profile(
+        Some(run_side(
             profile,
             index,
             &decode_facts,
@@ -8526,6 +8553,7 @@ impl Engine {
             Set::side(decodes, Some(pools.partners(&class, firsts)), None),
             decode_cx,
             &mut scratch.decode,
+            first_decode.filter(|_| keeps_its_first(profile)),
         ))
     }
 
@@ -8677,10 +8705,7 @@ impl Engine {
                 partners,
                 decode_cx,
                 &mut scratch.decode,
-                first_decode.filter(|_| {
-                    profile.picker.takes_turns()
-                        && (profile.scorers.is_empty() || profile.picker.picks_alone())
-                }),
+                first_decode.filter(|_| keeps_its_first(profile)),
             )
         };
         // Each target names the held prefill with one decode, as the
@@ -14724,8 +14749,17 @@ mod tests {
             ..facts
         };
         let mut later = |engine: &Engine, held: WorkerId| {
-            let shadow =
-                engine.shadow_decode_later(0, &call, &pool, pools, held, pick, &cx, &mut scratch);
+            let shadow = engine.shadow_decode_later(
+                0,
+                &call,
+                &pool,
+                pools,
+                held,
+                None,
+                pick,
+                &cx,
+                &mut scratch,
+            );
             shadow.map(|shadow| lead(&shadow))
         };
         assert_eq!(later(&both, prefills[0].id), Some(Some(1)));
@@ -17562,8 +17596,17 @@ mod tests {
                     engine.shadow_side(0, side, &facts, &pool, pools, &cx, &cx, pick, &mut scratch);
                 shadow.is_some()
             });
-            let later =
-                engine.shadow_decode_later(0, &facts, &pool, pools, held, pick, &cx, &mut scratch);
+            let later = engine.shadow_decode_later(
+                0,
+                &facts,
+                &pool,
+                pools,
+                held,
+                None,
+                pick,
+                &cx,
+                &mut scratch,
+            );
             (sides, later.is_some())
         };
         let rule = SessionRule {
