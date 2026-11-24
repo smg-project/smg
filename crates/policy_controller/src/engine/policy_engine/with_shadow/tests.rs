@@ -304,9 +304,10 @@ fn a_shadow_that_picks_another_worker_is_counted_and_the_live_answer_served() {
     let live = pick.targets.first().expect("a target").id;
     let lease = answer.lease.expect("a lease").lease;
     assert_eq!((lease.booked, lease.id.0), (live, 1));
-    assert_eq!(engine.leases.0.load(Ordering::Relaxed), 1, "one id taken");
     let heard = [("takes-live", live), ("takes-shadow", live)];
     assert_eq!(*seen.heard.lock(), heard);
+    let next = decided(&engine, &Asks::of(request(7), Some(&members)));
+    assert_eq!(next.lease.expect("a lease").lease.id.0, 2, "one id taken");
 
     let (agreeing, _) = bed(Rule::Place(0), Rule::Place(0));
     assert_eq!(placed(&agreeing, &list, request(7)), answer.decision);
@@ -423,9 +424,12 @@ fn a_shadow_that_panics_leaves_the_live_answer_and_counts_a_fault() {
     let members = PublishedList::new(Arc::clone(&list));
     for faults in 1..=2 {
         let answer = decided(&engine, &Asks::of(request(7), Some(&members)));
+        // The twin's decision takes the thread's run of ids: the engine's
+        // next answer takes a new run of its own counter.
         assert_eq!(answer.decision, placed(&unshadowed, &list, request(7)));
         let lease = answer.lease.expect("the live pick's lease").lease;
-        assert_eq!(lease.id.0, faults, "each answer takes the next id");
+        let id = (faults - 1) * single::ID_RUN + 1;
+        assert_eq!(lease.id.0, id, "a run is issued under its own engine");
         assert_eq!(engine.faults(), faults);
         assert_eq!(kinds(&engine), [0; 4]);
     }

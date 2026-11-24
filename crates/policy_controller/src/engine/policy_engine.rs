@@ -167,8 +167,9 @@ pub struct PolicyEngine {
     /// upkeep, a step of the registry's follow, or a telling of load
     /// reports ([`Self::upkeep_faults`]).
     upkeep_faults: AtomicU64,
-    /// The id of the last lease issued. A pick that is issued one writes
-    /// it: one atomic step, on cache lines of its own.
+    /// The last lease id handed out. A pair's lease writes it, and a thread
+    /// once for a run of its single requests' ids ([`single::lease_id`]):
+    /// one atomic step, on cache lines of its own.
     leases: OwnWord,
     /// The session table, one for the engine's life: the pins of every key
     /// a sessions rule placed. The document's engine reads and writes it
@@ -1200,14 +1201,15 @@ impl Loaded<'_, '_> {
 /// The engine of a gateway's own process, asked for whole decisions.
 ///
 /// It decides over the lists the request's maker hands and reads a worker
-/// where the gateway keeps it. It files no lease: an id is one step of a
+/// where the gateway keeps it. It files no lease: an id is taken of a
 /// counter, the stages hear the issue inside the decision, on the calling
 /// thread, and each later word is told from what the request's guard lends
 /// back ([`HeldDecision`]). A lease whose dispatch is never named ends at
 /// its guard's drop: no table holds it, and no pass looks for it.
 ///
 /// What every pick shares is the id counter alone, one atomic step on cache
-/// lines of its own. No lock of the engine is waited for, only the one build
+/// lines of its own, which a thread takes once for a run of its single
+/// requests' ids. No lock of the engine is waited for, only the one build
 /// of a list's records, wires or one-pick profile: a stage's lock is its own.
 ///
 /// A panic in a decision costs that request its decision and is counted
