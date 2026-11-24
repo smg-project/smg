@@ -1645,6 +1645,8 @@ impl<G: Generation> WorkerMonitor<G> {
         }
         // Every pusher goes ahead of the reset, which by itself keeps the
         // file of a worker that stays `Ready`: no file outlives the stop.
+        // The reset's flush takes the evictions queued here, so a stopped
+        // monitor holds none of its pushers.
         let pushers: Vec<Arc<dyn Worker>> = self
             .pushed_reports
             .lock()
@@ -4310,6 +4312,54 @@ mod native_loads_tests {
         assert!(
             !runtime.pushes_load_records(),
             "the mark of a worker with no report on file"
+        );
+    }
+
+    /// A rebuild from the registry keeps the mark of a stream that pushes:
+    /// the stop alone takes it off. The rebuild keeps the file of a pusher
+    /// that stays `Ready`, whose stream serves it still, and the stale rule
+    /// judges that stream's silence still.
+    #[tokio::test(start_paused = true)]
+    async fn a_rebuild_from_the_registry_keeps_the_mark_of_a_pusher_that_stays() {
+        let (registry, monitor) = monitor_with_readers(LoadReaders::Aware);
+        let worker = silent_worker("grpc://engine-a.invalid:50051", "a");
+        registry.register(Arc::clone(&worker)).unwrap();
+        monitor.start_event_loop();
+        monitor.apply_pushed_load(&worker, 0, &PushedRecord::requests(8, 0), Instant::now());
+
+        // The lag recovery's own call.
+        monitor.reconcile_from_registry();
+        let runtime = worker.runtime_state().expect("the worker's running state");
+        assert!(
+            monitor.pushed_reports.lock().contains_key(worker.url()),
+            "the rebuild took the file of a pusher that stays"
+        );
+        assert!(runtime.pushes_load_records(), "the rebuild took the mark");
+        monitor.stop().await;
+    }
+
+    /// A stopped monitor holds none of its pushers. The stop evicts each
+    /// one ahead of its reset, and the reset's flush takes the evictions
+    /// queued there. With the reset ahead of them, each pusher would stay
+    /// queued until the next start.
+    #[tokio::test(start_paused = true)]
+    async fn a_stopped_monitor_holds_none_of_its_pushers() {
+        let (registry, monitor) = monitor_with_readers(LoadReaders::Aware);
+        let worker = silent_worker("grpc://engine-a.invalid:50051", "a");
+        registry.register(Arc::clone(&worker)).unwrap();
+        // The registry's own handles, with the generation it publishes for
+        // its first reader: the stop is one.
+        drop(registry.global_generation());
+        let handles = Arc::strong_count(&worker);
+        monitor.start_event_loop();
+        monitor.apply_pushed_load(&worker, 0, &PushedRecord::requests(8, 0), Instant::now());
+        assert!(Arc::strong_count(&worker) > handles, "the file's handle");
+
+        monitor.stop().await;
+        assert_eq!(
+            Arc::strong_count(&worker),
+            handles,
+            "the handles of a pusher behind the stop"
         );
     }
 
