@@ -6539,7 +6539,9 @@ impl Engine {
                     // own. Where the pins stood as read, the live pick
                     // was a pin already under the id that stands for its
                     // worker. A shadow asks no id that stands: it keeps
-                    // its own pick there too, put to no cap.
+                    // its own pick there too, put to no cap. Where the
+                    // live claim took a rename's step for the key first,
+                    // the pin it renamed reads as the newcomer.
                     match Claim::standing(&found.standing, &pins, first) {
                         Some(owner) => Claim::Standing(owner, found.standing),
                         None => return decision,
@@ -6554,8 +6556,9 @@ impl Engine {
                     Claim::NoRoom => {}
                     // The table took no claim of this decision's: another
                     // request's stands, the pins moved under the
-                    // decision, or its worker is a pin of the key already
-                    // under the id that stands. The worker it names is a
+                    // decision, or its worker is a pin of the key already,
+                    // under the id that stands or under one a rename's
+                    // walk had yet to reach. The worker it names is a
                     // pin of the key where it is among the survivors: the
                     // rule's cap holds for it as for the pin read first,
                     // and it leads where the placement stood elsewhere.
