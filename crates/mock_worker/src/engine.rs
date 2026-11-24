@@ -774,6 +774,9 @@ struct Faults {
     /// The status a load poll is answered with instead of a report (0 =
     /// none): a worker whose load call fails, or is not implemented.
     load_fail_status: AtomicU16,
+    /// The engine pushes no load report: a worker whose pushed reports
+    /// stop, so that the last one ages. A load poll is no push.
+    load_muted: AtomicBool,
     /// Publisher generation; a restart bumps it.
     generation: AtomicU64,
     restarts: AtomicU64,
@@ -850,6 +853,7 @@ pub(crate) struct FaultStatus {
     pub admit_per_sec: u64,
     pub paused: bool,
     pub load_fail_status: u16,
+    pub load_muted: bool,
     pub generation: u64,
     pub restarts: u64,
     /// The armed request fault, if any.
@@ -1351,6 +1355,18 @@ impl Engine {
         (status != 0).then_some(status)
     }
 
+    /// Push no load report of this engine while `on`: no load record on a
+    /// KV-event stream, no scheduler stats on a ZMQ rank's outputs. Its
+    /// load polls are answered and its requests are served.
+    pub(crate) fn fault_load_mute(&self, on: bool) {
+        self.shared.faults.load_muted.store(on, Ordering::Relaxed);
+    }
+
+    /// Whether the load-mute hook withholds what this engine pushes.
+    pub(crate) fn load_muted(&self) -> bool {
+        self.shared.faults.load_muted.load(Ordering::Relaxed)
+    }
+
     /// How long the engine has produced nothing while it holds requests
     /// (running or queued): the time since its last pass, counted from the
     /// dispatch when it was idle before; `None` while nothing is in flight.
@@ -1458,6 +1474,7 @@ impl Engine {
             admit_per_sec: f.admit_per_sec.load(Ordering::Relaxed),
             paused: f.paused.load(Ordering::Relaxed),
             load_fail_status: f.load_fail_status.load(Ordering::Relaxed),
+            load_muted: f.load_muted.load(Ordering::Relaxed),
             generation: f.generation.load(Ordering::Relaxed),
             restarts: f.restarts.load(Ordering::Relaxed),
             fail,
