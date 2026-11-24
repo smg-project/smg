@@ -248,11 +248,13 @@ pub struct RoutingKeyOverrideSettings {
     /// The header names a request's routing key is read from, in order.
     pub headers: Vec<String>,
     /// The seconds between two sweeps of the override's sessions. Zero here
-    /// or in `max_idle_secs` keeps every key pinned for ever.
+    /// or in `max_idle_secs` keeps every key the session table holds pinned
+    /// for ever: a table full of such keys records no new key.
     pub eviction_interval_secs: u64,
     /// The seconds with no request after which a key of the override leaves
     /// at the next sweep. Zero here or in `eviction_interval_secs` keeps
-    /// every key pinned for ever.
+    /// every key the session table holds pinned for ever: a table full of
+    /// such keys records no new key.
     pub max_idle_secs: u64,
     /// How a key the override sees for the first time picks its worker.
     pub assignment_mode: Assignment,
@@ -1249,8 +1251,8 @@ fn seconds(setting: &'static str, secs: u64) -> Result<u32, RoutingSettingsError
 
 /// A sticky map's idle time and sweep interval as a session rule's `ttl_s`
 /// and `sweep_s`, each with the name of its setting. The map sweeps nothing
-/// where either time is zero: a key stays pinned for ever, which the rule
-/// says with its largest number.
+/// where either time is zero: a key the table holds stays pinned for ever,
+/// which the rule says with its largest number.
 fn pin_times(
     (idle_setting, max_idle_secs): (&'static str, u64),
     (sweep_setting, eviction_interval_secs): (&'static str, u64),
