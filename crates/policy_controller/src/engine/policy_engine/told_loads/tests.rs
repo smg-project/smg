@@ -33,7 +33,7 @@ use crate::{
     engine::{
         decision::Targets,
         framework::{Picker, TieBand},
-        list_cell::{tests::PublishedList, LentList, ModelLists},
+        list_cell::{LentList, ModelLists, PublishedList},
         policy_engine::{
             membership::{
                 tests::{fills::Program, handed},
@@ -441,6 +441,60 @@ async fn a_new_documents_stage_is_told_each_report_at_the_next_upkeep() {
     task.abort();
 }
 
+/// A whole read of the registry that a program's own code panics in is made
+/// again at the next upkeep, and tells there. A stage that keeps reports,
+/// under a document put in force on a running engine, hears each standing
+/// worker's report at the upkeep that read is made at. The upkeep before it
+/// took the channel's hand-over on the records of the document before,
+/// which kept no report, and told none.
+#[tokio::test(start_paused = true)]
+async fn a_whole_read_made_again_tells_each_report_at_its_upkeep() {
+    let engine = Arc::new(PolicyEngine::new(stock("random", 1)));
+    let host = Counted::over(registry(2), false);
+    engine.set_registry(Arc::clone(&host) as Arc<dyn Members>);
+    let (_feed, channel) = monitor(&reports(&[1, 2], 0));
+    engine.set_loads(channel);
+    let task = running(&engine).await;
+
+    let (next, heard, own) = keeping_spec("least_load", 2, false, false);
+    own.set(Arc::downgrade(&engine)).expect("set once");
+    let applied = engine.apply(next);
+    applied.expect("a number above the standing one");
+    host.panics.store(true, Ordering::Relaxed);
+    sleep(Duration::from_secs(1)).await;
+    assert_eq!(engine.upkeep_faults(), 1, "the whole read panicked");
+    assert!(told_since(&heard).is_empty(), "none behind a read not made");
+
+    host.panics.store(false, Ordering::Relaxed);
+    sleep(Duration::from_secs(1)).await;
+    let told = steps_of(&engine, &told_since(&heard));
+    assert_eq!(told, [(stated(0), 1), (stated(1), 2)]);
+    task.abort();
+}
+
+/// The same behind a start. The first whole read panics in the program's
+/// own code, at the upkeep that takes the channel's hand-over, and that
+/// hand-over tells no worker. The upkeep that makes the read again tells
+/// each standing worker's report.
+#[tokio::test(start_paused = true)]
+async fn a_first_whole_read_made_again_tells_each_report_at_its_upkeep() {
+    let (engine, heard) = keeping("least_load", false);
+    let host = Counted::over(registry(2), false);
+    host.panics.store(true, Ordering::Relaxed);
+    engine.set_registry(Arc::clone(&host) as Arc<dyn Members>);
+    let (_feed, channel) = monitor(&reports(&[1, 2], 0));
+    engine.set_loads(channel);
+    let task = running(&engine).await;
+    assert_eq!(engine.upkeep_faults(), 1, "the first whole read panicked");
+    assert!(told_since(&heard).is_empty(), "none behind a read not made");
+
+    host.panics.store(false, Ordering::Relaxed);
+    sleep(Duration::from_secs(1)).await;
+    let told = steps_of(&engine, &told_since(&heard));
+    assert_eq!(told, [(stated(0), 1), (stated(1), 2)]);
+    task.abort();
+}
+
 /// A program's lists that put a document in force where the engine's task
 /// first asks them for a model's lists: inside the task's step, behind its
 /// read of the registry.
@@ -648,8 +702,10 @@ async fn the_workers_the_task_told_as_joined_are_told_their_reports() {
     settle().await;
     assert_eq!(told_since(&heard), [], "no worker is told as joined yet");
     // None counts as told yet, so the first telling behind the upkeep holds
-    // every worker's report: the same ones, shown again.
+    // every worker's report: the same ones, shown again. The upkeep's own
+    // read tells none of the snapshot at hand: no upkeep put that read off.
     sleep(Duration::from_secs(1)).await;
+    assert_eq!(told_since(&heard), [], "a first read tells no snapshot");
     feed.publish(&reports(&[1, 3], 0));
     settle().await;
     let told = steps_of(&alone, &told_since(&heard));

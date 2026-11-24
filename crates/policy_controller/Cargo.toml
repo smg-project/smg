@@ -449,15 +449,7 @@ name = "store"
 harness = false
 
 [[bench]]
-name = "store_kv"
-harness = false
-
-[[bench]]
 name = "store_journal"
-harness = false
-
-[[bench]]
-name = "store_signals"
 harness = false
 
 [[bench]]

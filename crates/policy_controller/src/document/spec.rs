@@ -544,8 +544,9 @@ pub struct IndexSpec {
     /// How long a hash-index placement stays routable, in seconds.
     #[schemars(range(min = 1))]
     pub ttl_s: u32,
-    /// The size bound of a tree index: characters on a text host, tokens
-    /// otherwise. The crate's own store reads it for a pool whose profile
+    /// The size bound of a tree index: on a text host its characters plus
+    /// 1024 for each node a worker stands on, tokens otherwise.
+    /// The crate's own store reads it for a pool whose profile
     /// reads sent prefixes: the model's record is bound to `max_size` over
     /// the block size placements, never under one, one a block a worker
     /// was sent. A lowered bound is met by sweeps at the record's next
@@ -918,10 +919,11 @@ pub struct ConsistentHashParams {
     /// depth, a shorter request whole, and a text at four characters a
     /// token. A routing key the request's own id handed (a `rid` source)
     /// leads no prompt under this form: it names the session alone, and
-    /// the request is keyed by its prefix as one with no routing key. That
-    /// holds in a gateway's own process: no frame states where a key came
-    /// from, so under a controller's address the id's key places as any
-    /// other. Absent, a request with no routing key has none.
+    /// the request is keyed by its prefix as one with no routing key. A
+    /// gateway's frame states to a controller where the key came from.
+    /// The frame of a host older than that field states nothing, and
+    /// under it the id's key places as any other. Absent, a request with
+    /// no routing key has none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1))]
     pub prefix_tokens: Option<u32>,
@@ -954,8 +956,8 @@ pub struct ResidentWorkParams {
     pub request_tokens: u32,
 }
 
-/// The largest magnitude of a cost rule's parameter. The signal sink holds
-/// a value it takes to the same bound.
+/// The largest magnitude of a cost rule's parameter. A signal's value is
+/// held to the same bound where its cell is written.
 pub(crate) const COST_PARAMETER_LIMIT: f64 = 1e15;
 const RELATIVE_MARGIN_LIMIT: f64 = 1e6;
 
@@ -2172,11 +2174,12 @@ pub const OVERLOAD_TOKEN_USAGE: f32 = 0.8;
 /// never per request. The block names no threshold: a worker's
 /// registration states its own two, over its program's default where the
 /// program has one. The store's judge reads the switch, for each binding's
-/// pools. A gateway that runs the document in its own process reads the
-/// switch where it builds its workers' default thresholds, from the
-/// document it starts with, and its routes read one shed word: it refuses
-/// a document whose bindings differ on either word. A controller that
-/// judges on its worker objects does not read the switch yet.
+/// pools. A gateway that runs a supplied document in its own process reads
+/// the switch where it builds its workers' default thresholds, and its
+/// routes read one shed word, both from that document: it refuses one
+/// whose bindings differ on either word. With no document supplied it
+/// reads its own two settings. A controller that judges on its worker
+/// objects does not read the switch yet.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct OverloadSpec {
@@ -2376,10 +2379,10 @@ pub struct KeySourceSpec {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub header: Option<String>,
     /// The request's own id, the `rid` of its body: `true` names it. Under
-    /// a ring's prefix form (`prefix_tokens`) in a gateway's own process
-    /// its key names the session alone: a sessions rule pins it, and the
-    /// ring places the request by its prompt. The plain ring places by it,
-    /// and so does a served controller's prefix ring.
+    /// a ring's prefix form (`prefix_tokens`) its key names the session
+    /// alone: a sessions rule pins it, and the ring places the request by
+    /// its prompt. The plain ring places by it, and so does a controller's
+    /// prefix ring where its host's frame does not say the id handed it.
     #[serde(skip_serializing_if = "is_default")]
     pub rid: bool,
     /// The most bytes of a value this source hands, 8192 at most (default
@@ -5533,7 +5536,8 @@ pub struct AppliedSpec {
     max_block_hashes: u32,
     /// The view's block size: a request that names none is counted by it.
     block_size: u32,
-    /// The index settings a model takes at a membership write or apply.
+    /// The index settings a model takes where the in-process engine reads
+    /// a pool's table.
     #[cfg(feature = "in-process")]
     index: BTreeMap<String, IndexSpec>,
     pairing: Pairing,
@@ -5668,14 +5672,16 @@ impl AppliedSpec {
     /// The document's signals, resolved, in column order: a signal's place
     /// here is its column's number. What a stage's build answered from
     /// ([`StageBuild::signal_column`](crate::stages::StageBuild::signal_column)),
-    /// and the one reading of the names for a store that keeps the cells.
+    /// and the one reading of the names for whoever makes the cells: the
+    /// engine over worker lists, or a host that builds its own.
     /// Empty for a document that declares none and for the unbound start.
     pub fn signal_columns(&self) -> &[SignalColumn] {
         &self.signal_columns
     }
 
-    /// [`Self::signal_columns`] as the list is shared: what the store's
-    /// signal sink hands a report's conversion.
+    /// [`Self::signal_columns`] as the list is shared: what a worker list's
+    /// records keep for a report's conversion.
+    #[cfg(feature = "in-process")]
     pub(crate) fn shared_signal_columns(&self) -> Arc<[SignalColumn]> {
         Arc::clone(&self.signal_columns)
     }

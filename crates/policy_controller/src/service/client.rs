@@ -1987,6 +1987,7 @@ mod tests {
             request_id: id.to_vec(),
             term,
             answer: answer.into(),
+            encode: None,
         }
     }
 

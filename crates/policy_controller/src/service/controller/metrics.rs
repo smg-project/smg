@@ -27,7 +27,7 @@ use super::{
     generations::Generations,
     readiness::{Sample, State},
 };
-use crate::store::{SignalWriteOutcome, StoreStats};
+use crate::store::StoreStats;
 
 /// `1` for the controller's state (`starting`, `leader`, `syncing`,
 /// `follower`, `draining`), `0` for the other four. The admin listener sets it from the
@@ -124,12 +124,6 @@ pub const OVERLOAD_FLIPS_TOTAL: &str = "smg_policy_controller_overload_flips_tot
 /// decision gives up) counts with the requests that got no decision.
 pub const LIFECYCLE_FAULTS_TOTAL: &str = "smg_policy_controller_lifecycle_faults_total";
 
-/// Writes to the store's signal sink, by `outcome`: what became of each
-/// ([`SignalWriteOutcome`]). A value under a column the document in force does
-/// not continue counts `undeclared`, and one in another unit than its column's
-/// `wrong_unit`.
-pub const SIGNAL_WRITES_TOTAL: &str = "smg_policy_controller_signal_writes_total";
-
 /// The controller's series and the handle that renders them.
 pub(crate) struct Metrics {
     handle: PrometheusHandle,
@@ -146,8 +140,6 @@ pub(crate) struct Metrics {
     outside: [Gauge; 2],
     overload_flips: Counter,
     lifecycle_faults: Counter,
-    /// The signal sink's writes, in the order of [`SignalWriteOutcome::EACH`].
-    signal_writes: [Counter; SignalWriteOutcome::EACH.len()],
     /// Held from a scrape's sample of the state to the end of its render:
     /// the gauges are written from one sample and read back whole.
     scrape: Mutex<()>,
@@ -347,11 +339,6 @@ impl Metrics {
             None,
             "Overload verdicts of a worker that changed, either way".into(),
         );
-        recorder.describe_counter(
-            KeyName::from_const_str(SIGNAL_WRITES_TOTAL),
-            None,
-            "Named values written to the store, by what became of each".into(),
-        );
         let state = State::ALL.map(|state| {
             let key = Key::from_parts(STATE, vec![Label::new("state", state.as_str())]);
             recorder.register_gauge(&key, &metadata)
@@ -409,11 +396,6 @@ impl Metrics {
             recorder.register_counter(&Key::from_name(OVERLOAD_FLIPS_TOTAL), &metadata);
         let lifecycle_faults =
             recorder.register_counter(&Key::from_name(LIFECYCLE_FAULTS_TOTAL), &metadata);
-        let signal_writes = SignalWriteOutcome::EACH.map(|taken| {
-            let outcome = Label::new("outcome", taken.label());
-            let key = Key::from_parts(SIGNAL_WRITES_TOTAL, vec![outcome]);
-            recorder.register_counter(&key, &metadata)
-        });
         start.set(
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -431,7 +413,6 @@ impl Metrics {
             outside,
             overload_flips,
             lifecycle_faults,
-            signal_writes,
             scrape: Mutex::new(()),
             recorder,
             spec: OnceLock::new(),
@@ -545,9 +526,6 @@ impl Metrics {
         engines.set(f64::from(counts.outside.engines));
         zones.set(f64::from(counts.outside.zones));
         self.lifecycle_faults.absolute(counts.lifecycle_faults);
-        for (counter, count) in self.signal_writes.iter().zip(counts.signal_writes) {
-            counter.absolute(count);
-        }
     }
 
     /// Sets the load counters and the overload flips from one read of the
@@ -587,7 +565,7 @@ mod tests {
     use super::{
         Generations, LoadTotals, Metrics, StoreStats, MEMBERS_OUTSIDE_LIST,
         REPLICATION_LAG_SECONDS, REPLICATION_RESTORES_ASKED_TOTAL, REPLICATION_SYNCED,
-        SIGNAL_WRITES_TOTAL, SPEC_APPLY_TOTAL, SPEC_GENERATION, START_TIME_SECONDS, STATE,
+        SPEC_APPLY_TOTAL, SPEC_GENERATION, START_TIME_SECONDS, STATE,
     };
     use crate::{
         service::controller::{
@@ -928,7 +906,6 @@ mod tests {
             },
             overload_flips: 9,
             lifecycle_faults: 4,
-            signal_writes: [7, 1, 2, 3, 4, 5],
         };
         let rendered = metrics.render(
             || State::Leader,
@@ -948,19 +925,6 @@ mod tests {
         // the flips are the load monitor's.
         assert!(rendered.contains("smg_policy_controller_overload_flips_total 0"));
         assert!(rendered.contains("smg_policy_controller_lifecycle_faults_total 4"));
-        // The signal sink's writes, one series an outcome.
-        let outcomes = [
-            ("written", 7),
-            ("undeclared", 1),
-            ("wrong_unit", 2),
-            ("out_of_range", 3),
-            ("not_a_member", 4),
-            ("older", 5),
-        ];
-        for (outcome, count) in outcomes {
-            let series = format!("{SIGNAL_WRITES_TOTAL}{{outcome=\"{outcome}\"}} {count}");
-            assert!(rendered.contains(&series), "{series}");
-        }
 
         // The count outside a list falls once a generation names the member.
         let rendered = metrics.render(

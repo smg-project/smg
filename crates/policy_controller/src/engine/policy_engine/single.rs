@@ -651,7 +651,7 @@ pub(crate) mod tests {
             decision_engine::{Decided, DecisionEngine, DecisionRefused, TokenKey, WorkerLists},
             demands::{DemandFacts, Demands},
             framework::{Picker, Place, PoolWord, TieBand, DRAW_FROM},
-            list_cell::tests::PublishedList,
+            list_cell::PublishedList,
             prompt_hashes::HashSeeds,
             records::worker_id,
             view::{

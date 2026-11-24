@@ -1,5 +1,6 @@
-//! The health sink: the prober's verdicts, the connect signal and the
-//! gateways' standing masks (design 10.2, the health row).
+//! The health sink: the gateways' standing masks (design 10.2, the health
+//! row). A worker's status is its worker object's word: the holder of the
+//! objects tells the store each one (`MemoryStore::status_told`).
 
 use std::time::Instant;
 
@@ -22,9 +23,8 @@ pub enum VetoWrite {
     NoRow,
 }
 
-/// What a health write found ([`HealthSink::probe_outcome`],
-/// [`HealthSink::connected`]): what happened to the write, and the status
-/// that stands where the write was judged.
+/// What a told status found (`MemoryStore::status_told`): what happened to
+/// the write, and the status that stands where the write was judged.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HealthWrite {
     /// The status moved: `from` is the one the row left, `to` the one that
@@ -64,43 +64,10 @@ impl HealthWrite {
     }
 }
 
-/// Where health is written. The pool's view is the prober's and the reports';
-/// a gateway's breaker and liveness vetoes are its own and mask the worker
-/// for that gateway alone.
+/// Where a gateway's own health words are written. The pool's view is the
+/// prober's, on the worker objects; a gateway's breaker and liveness
+/// vetoes are its own and mask the worker for that gateway alone.
 pub trait HealthSink: Send + Sync {
-    /// The prober's verdict for one probe of the worker, under the row's
-    /// [`HealthPolicy`](crate::store::HealthPolicy): the status machine moves
-    /// after `failure_threshold` consecutive failures (ready to not ready),
-    /// three times as many (to failed), `success_threshold` consecutive
-    /// passes (back to ready), and a pending worker that flaps past ten times
-    /// the failure threshold fails. The answer says what happened to the
-    /// write: the status moved; it stood, and the probe is counted;
-    /// `revision` moved (a stale outcome is dropped, never applied to a
-    /// successor, and not counted); or the worker has no row.
-    ///
-    /// `leads` is the writer's last word. The store asks it behind the
-    /// lock the write waits for, before the probe is counted. Where it
-    /// says no, the outcome is stale: a term that ended while the write
-    /// waited there counts nothing, moves no status and tells the journal
-    /// nothing. It is asked under the store's lock and takes none of the
-    /// store's: a lock it takes is never held by its writer across a write
-    /// of the store. A writer with no term to end hands a word that always
-    /// holds.
-    fn probe_outcome(
-        &self,
-        id: WorkerId,
-        ok: bool,
-        revision: u64,
-        leads: &dyn Fn() -> bool,
-    ) -> HealthWrite;
-
-    /// The connect signal of a handshake-promoted worker (a worker whose
-    /// checks are off, a host-local wire): ready at once, under the same
-    /// revision guard and the same last word of its writer
-    /// ([`probe_outcome`](Self::probe_outcome)). A ready or a draining row
-    /// stands, and its counters with it.
-    fn connected(&self, id: WorkerId, revision: u64, leads: &dyn Fn() -> bool) -> HealthWrite;
-
     /// A gateway's standing veto on a worker until `until`; `None` clears
     /// it. A veto standing across a reconnect is re-asserted in the
     /// gateway's `Hello`. The store keeps no kind of a veto. It keeps two

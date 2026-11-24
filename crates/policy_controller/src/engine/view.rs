@@ -1352,8 +1352,9 @@ pub struct RequestFacts<'a> {
     /// where it derives the key
     /// ([`DerivedKey::source`](crate::document::DerivedKey)). An encode
     /// item's facts state it as false: the key they carry is the item's
-    /// own. In-process only: no frame states it, so under a controller's
-    /// address the prefix form places by any session key.
+    /// own. A gateway's frame states it to a controller, and a plugin's
+    /// frame states false. A frame of a host older than the field reads
+    /// false: under that host the prefix form places by any session key.
     pub session_key_from_rid: bool,
 }
 

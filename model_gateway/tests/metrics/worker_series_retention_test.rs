@@ -47,7 +47,7 @@ fn worker() -> Arc<dyn Worker> {
 #[tokio::test]
 async fn removed_worker_series_leave_the_scrape() {
     let handle = recorder();
-    let (addr, _server) = start_metrics_server(handle, "127.0.0.1".to_string(), 0)
+    let (addr, _server) = start_metrics_server(handle, "127.0.0.1".to_string(), 0, None)
         .await
         .expect("metrics server binds an ephemeral port");
     let registry = WorkerRegistry::new();

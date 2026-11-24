@@ -91,7 +91,7 @@ mod tests {
             decision::{Decision, ShadowKind, ShedReason},
             decision_engine::{DecisionEngine, Request, RequestMaker, WorkerLists},
             framework::{DecisionScope, Filter},
-            list_cell::tests::PublishedList,
+            list_cell::PublishedList,
             policy_engine::PolicyEngine,
             shadow::Shadow,
             view::{Candidate, Constraints, Phase, PoolFacts, RequestFacts},

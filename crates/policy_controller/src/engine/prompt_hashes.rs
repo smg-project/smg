@@ -42,21 +42,15 @@ impl HashSeeds {
 /// A stage that reads a cache reads the prompt as block hashes
 /// ([`RequestFacts::block_hashes`]): one hash for each block of the prompt's
 /// token ids, or for each window of its text where the caller holds no token
-/// ids. Two entries compute them:
+/// ids. One entry computes them: [`PromptHashes::under_document`] hashes a
+/// prompt as a policy document says. Token ids win over a text. A block is
+/// the model's block size of record, and the document's where the caller
+/// has none. The document bounds how many blocks are hashed
+/// ([`AppliedSpec::block_hashes_read`]).
 ///
-/// - [`PromptHashes::under_document`] hashes a prompt as a policy document
-///   says, and reads no store. Token ids win over a text. A block is the
-///   model's block size of record, and the document's where the caller has
-///   none. The document bounds how many blocks are hashed
-///   ([`AppliedSpec::block_hashes_read`]).
-/// - [`MemoryStore::prompt_hashes`](crate::store::MemoryStore::prompt_hashes)
-///   does the same for a caller that decides over a store. The block size
-///   of record and the document in force are the store's.
-///
-/// Both run the same hashing, which takes a block size, a depth and the
-/// seeds and reads neither a document nor a store. It is private: a window
-/// of text is sized by a rule of this crate, which a caller with no
-/// document would have to repeat.
+/// The hashing itself takes a block size, a depth and the seeds and reads
+/// no document. It is private: a window of text is sized by a rule of this
+/// crate, which a caller with no document would have to repeat.
 ///
 /// The caller names the seeds ([`HashSeeds`]). What separates one request's
 /// cache from another's is the caller's own rule.
@@ -157,7 +151,7 @@ impl PromptHashes {
     /// how many blocks are read, and whether the document reads a request's
     /// size ([`block_size_and_depth`]). A prompt with neither asks nothing,
     /// and keeps the seed of its partition.
-    pub(crate) fn of_prompt(
+    fn of_prompt(
         tokens: Option<&[u32]>,
         text: Option<&str>,
         seeds: HashSeeds,
@@ -223,7 +217,7 @@ impl PromptHashes {
 /// A token block is the model's block size: its size of record, and the
 /// document's where it has none. A window of text is that many tokens in
 /// bytes.
-pub(crate) fn block_size_and_depth(
+fn block_size_and_depth(
     spec: &AppliedSpec,
     block_size_of_record: Option<u32>,
     kind: HashKind,
@@ -279,10 +273,8 @@ mod tests {
     use crate::{
         document::spec::{AppliedSpec, PolicySpec},
         engine::view::{HashKind, RequestFacts, TEXT_BYTES_PER_TOKEN},
-        store::{KvEventSink, MemoryStore},
     };
 
-    const MODEL: &str = "model-a";
     const BLOCK_SIZE: u32 = 16;
     /// A text of two windows and a tail, at a block of sixteen tokens.
     const RECORDED_TEXT: &str = "A request's text is hashed by windows of its bytes, as deep as \
@@ -299,11 +291,10 @@ mod tests {
         AppliedSpec::validate(&document).expect("the preset validates")
     }
 
-    /// A store under that document.
-    fn store() -> MemoryStore {
-        let store = MemoryStore::new();
-        store.apply(document()).expect("the store takes the preset");
-        store
+    /// The hashes of a prompt under that document, for a model whose block
+    /// size of record is [`BLOCK_SIZE`].
+    fn hashed(tokens: Option<&[u32]>, text: Option<&str>, seeds: HashSeeds) -> PromptHashes {
+        PromptHashes::under_document(&document(), Some(BLOCK_SIZE), tokens, text, seeds)
     }
 
     /// The facts `hashes` writes into a request that holds none.
@@ -331,20 +322,18 @@ mod tests {
     /// own cache partition.
     #[test]
     fn a_prompts_hashes_are_the_recorded_ones() {
-        let store = store();
-        store.set_block_size(MODEL, BLOCK_SIZE);
         let tokens: Vec<u32> = (1..=40).collect();
-        let plain = store.prompt_hashes(MODEL, Some(&tokens), None, HashSeeds::PLAIN);
+        let plain = hashed(Some(&tokens), None, HashSeeds::PLAIN);
         assert_eq!(written(&plain).block_hashes, RECORDED_TOKENS);
         let seeds = HashSeeds {
             event: namespace_seed(None, Some("partition")),
             partition: 7,
         };
-        let scoped = store.prompt_hashes(MODEL, Some(&tokens), None, seeds);
+        let scoped = hashed(Some(&tokens), None, seeds);
         let facts = written(&scoped);
         assert_eq!(facts.block_hashes, RECORDED_SCOPED_TOKENS);
         assert_eq!(facts.namespace_seed, 7);
-        let windows = store.prompt_hashes(MODEL, None, Some(RECORDED_TEXT), HashSeeds::PLAIN);
+        let windows = hashed(None, Some(RECORDED_TEXT), HashSeeds::PLAIN);
         let facts = written(&windows);
         assert_eq!(facts.block_hashes, RECORDED_WINDOWS);
         // A text states no count of tokens. Its length is counted in
@@ -358,19 +347,17 @@ mod tests {
     /// zero states no hash.
     #[test]
     fn a_model_with_no_block_size_of_record_is_hashed_by_the_documents() {
-        let store = store();
-        let size = store.deciding(|world| world.spec().block_size());
+        let document = document();
+        let size = document.block_size();
         let tokens: Vec<u32> = (1..=2 * size).collect();
         for (recorded, blocks, block_size) in [
             (None, 2, size),
             (Some(0), 0, 0),
             (Some(2 * size), 1, 2 * size),
         ] {
-            if let Some(size) = recorded {
-                store.set_block_size(MODEL, size);
-            }
-            assert_eq!(store.block_size(MODEL), recorded);
-            let hashes = store.prompt_hashes(MODEL, Some(&tokens), None, HashSeeds::PLAIN);
+            let seeds = HashSeeds::PLAIN;
+            let hashes =
+                PromptHashes::under_document(&document, recorded, Some(&tokens), None, seeds);
             let facts = written(&hashes);
             assert_eq!(
                 (facts.block_hashes.len(), facts.block_size),
@@ -384,10 +371,8 @@ mod tests {
 
     #[test]
     fn the_plain_seeds_give_the_index_crates_plain_hashes() {
-        let store = store();
-        store.set_block_size(MODEL, BLOCK_SIZE);
         let tokens: Vec<u32> = (1..=2 * BLOCK_SIZE).collect();
-        let hashes = store.prompt_hashes(MODEL, Some(&tokens), None, HashSeeds::PLAIN);
+        let hashes = hashed(Some(&tokens), None, HashSeeds::PLAIN);
         let expected: Vec<_> = compute_request_content_hashes(&tokens, BLOCK_SIZE as usize)
             .into_iter()
             .map(|hash| hash.0)
@@ -399,10 +384,8 @@ mod tests {
 
     #[test]
     fn a_tail_shorter_than_a_block_gives_no_hash() {
-        let store = store();
-        store.set_block_size(MODEL, BLOCK_SIZE);
         let tokens = [1; BLOCK_SIZE as usize + 1];
-        let hashes = store.prompt_hashes(MODEL, Some(&tokens), None, HashSeeds::PLAIN);
+        let hashes = hashed(Some(&tokens), None, HashSeeds::PLAIN);
         let facts = written(&hashes);
         assert_eq!(facts.block_hashes.len(), 1);
         assert_eq!(facts.prompt_tokens, BLOCK_SIZE + 1);
@@ -414,11 +397,8 @@ mod tests {
     /// token prompt states its ids' count, and the text its 25 characters.
     #[test]
     fn a_prompt_under_one_block_states_one_block_of_what_it_has() {
-        let store = store();
-        store.set_block_size(MODEL, BLOCK_SIZE);
-        let tokens =
-            |tokens: &[u32]| store.prompt_hashes(MODEL, Some(tokens), None, HashSeeds::PLAIN);
-        let text = |text: &str| store.prompt_hashes(MODEL, None, Some(text), HashSeeds::PLAIN);
+        let tokens = |tokens: &[u32]| hashed(Some(tokens), None, HashSeeds::PLAIN);
+        let text = |text: &str| hashed(None, Some(text), HashSeeds::PLAIN);
         let (sevens, eights) = ([7; BLOCK_SIZE as usize - 1], [8; 3]);
         for (short, again, other, block_size, sizes) in [
             (
@@ -453,13 +433,11 @@ mod tests {
     /// each length of its text it holds.
     #[test]
     fn a_prompt_size_the_facts_hold_wins_over_the_hashings_count() {
-        let store = store();
-        store.set_block_size(MODEL, BLOCK_SIZE);
         let seeds = HashSeeds {
             event: XXH3_SEED,
             partition: 9,
         };
-        let hashes = store.prompt_hashes(MODEL, Some(&[3; 88]), None, seeds);
+        let hashes = hashed(Some(&[3; 88]), None, seeds);
         let facts = written(&hashes);
         assert_eq!(
             (
@@ -478,7 +456,7 @@ mod tests {
         hashes.write_to(&mut sized);
         assert_eq!(sized.prompt_tokens, 37);
         assert_eq!(sized.block_hashes, facts.block_hashes);
-        let worded = store.prompt_hashes(MODEL, None, Some("a text of its own"), seeds);
+        let worded = hashed(None, Some("a text of its own"), seeds);
         let mut stated = RequestFacts {
             prompt_chars: 5,
             prompt_bytes: 6,
@@ -522,32 +500,24 @@ mod tests {
     /// none, and the model's block size is still written.
     #[test]
     fn no_block_is_hashed_past_the_documents_depth() {
-        let store = store();
-        store.set_block_size(MODEL, BLOCK_SIZE);
+        let spec = document();
         let window = BLOCK_SIZE * TEXT_BYTES_PER_TOKEN;
-        let (blocks, windows) = store.deciding(|world| {
-            let spec = world.spec();
-            (
-                spec.block_hashes_read(HashKind::Token, BLOCK_SIZE),
-                spec.block_hashes_read(HashKind::Text, window),
-            )
-        });
+        let blocks = spec.block_hashes_read(HashKind::Token, BLOCK_SIZE);
+        let windows = spec.block_hashes_read(HashKind::Text, window);
         assert!(blocks > 0 && windows > 0);
         let tokens: Vec<u32> = (0..(blocks as u32 + 1) * BLOCK_SIZE).collect();
-        let hashes = store.prompt_hashes(MODEL, Some(&tokens), None, HashSeeds::PLAIN);
+        let hashes = hashed(Some(&tokens), None, HashSeeds::PLAIN);
         let facts = written(&hashes);
         assert_eq!(facts.block_hashes.len(), blocks);
         assert_eq!(facts.prompt_tokens, tokens.len() as u32);
         let text = "a".repeat((windows + 1) * window as usize);
-        let hashes = store.prompt_hashes(MODEL, None, Some(&text), HashSeeds::PLAIN);
+        let hashes = hashed(None, Some(&text), HashSeeds::PLAIN);
         assert_eq!(written(&hashes).block_hashes.len(), windows);
 
-        let mut document = PolicySpec::preset("random").expect("the preset");
-        document.generation += 1;
-        store
-            .apply(AppliedSpec::validate(&document).expect("the generation"))
-            .expect("the newer generation");
-        let hashes = store.prompt_hashes(MODEL, Some(&tokens), None, HashSeeds::PLAIN);
+        let unread = PolicySpec::preset("random").expect("the preset");
+        let unread = AppliedSpec::validate(&unread).expect("the preset validates");
+        let (size, seeds) = (Some(BLOCK_SIZE), HashSeeds::PLAIN);
+        let hashes = PromptHashes::under_document(&unread, size, Some(&tokens), None, seeds);
         let facts = written(&hashes);
         assert!(facts.block_hashes.is_empty());
         assert_eq!(facts.block_size, BLOCK_SIZE);
@@ -559,13 +529,10 @@ mod tests {
     /// The event seed moves none: no worker hashes text.
     #[test]
     fn a_text_is_hashed_under_the_partition_seed_alone() {
-        let store = store();
-        store.set_block_size(MODEL, BLOCK_SIZE);
         let window = BLOCK_SIZE * TEXT_BYTES_PER_TOKEN;
         let text = "a".repeat(2 * window as usize);
-        let windows = |event: u64, partition: u64| {
-            store.prompt_hashes(MODEL, None, Some(&text), HashSeeds { event, partition })
-        };
+        let windows =
+            |event: u64, partition: u64| hashed(None, Some(&text), HashSeeds { event, partition });
         let keyed = windows(5, 11);
         let facts = written(&keyed);
         assert_eq!(
@@ -582,9 +549,8 @@ mod tests {
             .all(|(keyed, other)| keyed != other));
     }
 
-    /// The hashing itself reads no document and no store: it hashes by the
-    /// block size and the depth it is handed. The values are the recorded
-    /// ones.
+    /// The hashing itself reads no document: it hashes by the block size and
+    /// the depth it is handed. The values are the recorded ones.
     #[test]
     fn the_hashing_alone_reads_the_block_size_and_the_depth_it_is_handed() {
         let tokens: Vec<u32> = (1..=40).collect();
@@ -603,32 +569,6 @@ mod tests {
         assert_eq!(written(&whole).block_hashes, RECORDED_WINDOWS);
         let first = PromptHashes::of_text(RECORDED_TEXT, window, 1, false, HashSeeds::PLAIN);
         assert_eq!(written(&first).block_hashes, &RECORDED_WINDOWS[..1]);
-    }
-
-    /// A caller that holds a document and no store hashes a prompt as a
-    /// store under that document does: by the block size it has on record
-    /// for the model, and by the document's where it has none.
-    #[test]
-    fn a_document_alone_hashes_a_prompt_as_a_store_under_it_does() {
-        let document = document();
-        let tokens: Vec<u32> = (1..=200).collect();
-        let text = "a".repeat(1_000);
-        let seeds = HashSeeds {
-            event: 3,
-            partition: 7,
-        };
-        for of_record in [None, Some(BLOCK_SIZE)] {
-            let store = store();
-            if let Some(size) = of_record {
-                store.set_block_size(MODEL, size);
-            }
-            for (tokens, text) in [(Some(tokens.as_slice()), None), (None, Some(text.as_str()))] {
-                let alone = PromptHashes::under_document(&document, of_record, tokens, text, seeds);
-                let stored = store.prompt_hashes(MODEL, tokens, text, seeds);
-                assert_eq!(five(&alone), five(&stored), "{of_record:?}");
-                assert!(!written(&alone).block_hashes.is_empty(), "{of_record:?}");
-            }
-        }
     }
 
     /// Token ids win over a text, a text is hashed where there are none, and

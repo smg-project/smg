@@ -39,11 +39,14 @@
 //! ([`PlacementSide::decode_again`]), so whatever the request lends that
 //! decision is asked under it: its route's rule
 //! ([`PlaceRequest::admits`]), its headers ([`PlaceRequest::headers`]),
-//! its ring ([`PlaceRequest::ring`]) and its lists' admission. None of
-//! them may send or drop a side of the pair, or report through or drop a
-//! handle on a side's end: it would wait on a lock it is asked under and
-//! never return. A single request's side owns its placement and takes no
-//! lock, but the one it shares the placement with its handles behind.
+//! its ring ([`PlaceRequest::ring`]), its lists' admission
+//! ([`PairLists::admission`](crate::engine::PairLists::admission)) and its
+//! lists' workers, by their own calls ([`Worker::routing_state`] among
+//! them). None of them may send or drop a side of the pair, or report
+//! through or drop a handle on a side's end: it would wait on a lock it is
+//! asked under and never return. A single request's side owns its
+//! placement and takes no lock, but the one it shares the placement with
+//! its handles behind.
 //!
 //! **The order of a pair's words** is kept here, in whatever order its
 //! host lets the two sides go. A decode that still stands chosen leaves
@@ -235,7 +238,7 @@ impl Of {
             return Err(Unplaced::Refused(refused));
         };
         let mut pair = pair.lock();
-        let decode = pair.placement.decode_taken(request)?;
+        let decode = Arc::clone(pair.placement.decode_taken(request)?);
         // The decode no longer stands chosen: a prefill's end that waited
         // for this side's word is said behind the decode the call took.
         pair.end_held_prefill();
@@ -396,9 +399,9 @@ impl PlacementSide {
     ///
     /// `request` states the request again, as [`Placement::decode_again`]
     /// reads it. What it lends the decision (its rule, its headers, its
-    /// ring and its lists' admission) is asked under the pair's lock and
-    /// must leave the pair's sides and the handles on their ends alone
-    /// (the module's words on the lock).
+    /// ring, its lists' admission and their workers' own calls) is asked
+    /// under the pair's lock and must leave the pair's sides and the
+    /// handles on their ends alone (the module's words on the lock).
     ///
     /// **The order.** The call is made once the prefill side's send was
     /// said. Its host may let the prefill side go before the call or
@@ -538,7 +541,7 @@ mod tests {
             decision::{Decision, Target, Targets},
             decision_engine::{DecisionEngine, Request, RequestMaker, WorkerLists},
             framework::{Picker, TieBand},
-            list_cell::tests::PublishedList,
+            list_cell::PublishedList,
             policy_engine::PolicyEngine,
             records::worker_id,
             view::{Candidate, Constraints, Phase, RequestFacts, WorkerId},

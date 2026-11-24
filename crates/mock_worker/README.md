@@ -64,7 +64,31 @@ realistic engine's admission hooks, counts in the admin API's `encodes` and
 answers accepted; it reports health under the encoder service's name, as the
 engine does in that role; its `Generate` is refused as the wrong pool, and a
 prefill worker on that wire refuses a request whose `encode_bootstrap_info`
-does not name a rendezvous for each media item once.
+does not name a rendezvous for each media item once. A request reaches that
+`Encode` only when the gateway processes the media itself, which it does for
+a model whose family it has a media spec for, matched by a model id that
+names the family (`llava` in it) or by the `model_type` in the model
+directory's `config.json`: with the default model id and a text model's
+tokenizer a chat request that carries an image is refused with
+`multimodal_not_supported`. A model directory of a vision family serves it:
+every worker is started with `--model mock-llava --tokenizer <dir>` and
+registered with `<dir>` as its tokenizer path, which the gateway reads itself
+(the mock serves no tokenizer: where the gateway cannot read `<dir>`, the
+model's requests are answered with `tokenizer_load_failed` once the load has
+failed), and `<dir>` holds a `config.json` of the llava family (`model_type`,
+`image_token_index`, the vision tower's `patch_size` and `image_size`),
+tokenizer files with the token `<image>`, a `preprocessor_config.json` of a
+CLIP image processor, and a chat template whose prompt holds one `<image>`
+for each image: a template that walks the content parts renders an image
+part as `<image>`, and one that prints the content as a string is given the
+tag by the gateway. A prompt with another count of the tag (a walk of the
+parts with no clause for an image part, a literal `<image>` in the text) is
+refused with `multimodal_prompt_contract_mismatch`; with the right count the
+request is answered, the encode worker takes one `Encode` for each image, and
+a prefill and a decode worker take the request. That holds with the gateway's
+policy controller off and its media processing at `auto` or `router` (the
+defaults are off and `auto`); with `--mm-processing worker` the gateway does
+not process the media and refuses the request with `multimodal_not_supported`.
 The SGLang wire has no encode role. On the TokenSpeed and the SGLang wires a
 request's media items are checked against the shape the engine's adapter
 requires before the canned answer: a known modality, the TokenSpeed item's

@@ -14,7 +14,7 @@ use super::{
     identity, identity_of,
     leases::{InFlightCounts, WorkerSlot},
     AtWork, BatchFacts, BatchOutcome, ContentHash, DecodeMark, DecodeSide, GatewayId, Hand,
-    HealthSink, HealthWrite, Journal, KvEvent, KvEventSink, LeaseRecord, LeaseRefused, LeaseState,
+    HealthSink, Journal, KvEventSink, LaneWriter, LeaseRecord, LeaseRefused, LeaseState,
     LeasesStore, LoadSink, LoadSource, LookOutcome, MembershipChange, MembershipTail, MemoryStore,
     PickRecord, PollMode, Position, ReservationKind, ReservationStore, ResyncReason, SequenceHash,
     Sides, Signals, SnapshotChunk, StoreSnapshot, StoredBlock, VetoWrite, WorkerFacts, WorkerPatch,
@@ -310,302 +310,45 @@ fn snapshot_sort_does_not_hold_the_workers_lock() {
     );
 }
 
+/// A status its holder tells says what happened to it, and the status that
+/// stands where it was judged: it moved, it stood, its writer's last word
+/// said no, the row left the revision it was told under, or no row stands.
+#[cfg(feature = "worker-host")]
 #[test]
-fn probe_outcomes_follow_the_rows_thresholds_and_a_stale_outcome_is_dropped() {
-    let store = MemoryStore::new();
-    let health: &dyn HealthSink = &store;
-    let id = store.upsert(facts("http://w:8000", 1)).id();
-    let revision = || WorkersStore::get(&store, id).expect("the row").revision;
-    assert_eq!(
-        health.probe_outcome(id, true, revision(), &|| true).moved(),
-        None
-    );
-    assert_eq!(
-        health.probe_outcome(id, true, revision(), &|| true).moved(),
-        Some((WorkerStatus::Pending, WorkerStatus::Ready)),
-        "two passes promote a pending worker"
-    );
-    // A patch moves the revision: an outcome read under the one it left is
-    // stale.
-    let stale = revision();
-    WorkersStore::patch(&store, id, WorkerPatch::default(), stale).expect("the patch");
-    assert_eq!(
-        health.probe_outcome(id, false, stale, &|| true).moved(),
-        None,
-        "a stale outcome is dropped"
-    );
-    assert_eq!(
-        health
-            .probe_outcome(id, false, revision(), &|| true)
-            .moved(),
-        None
-    );
-    assert_eq!(
-        health
-            .probe_outcome(id, false, revision(), &|| true)
-            .moved(),
-        None
-    );
-    assert_eq!(
-        health
-            .probe_outcome(id, false, revision(), &|| true)
-            .moved(),
-        Some((WorkerStatus::Ready, WorkerStatus::NotReady)),
-        "three failures demote"
-    );
-    for _ in 0..8 {
-        assert_eq!(
-            health
-                .probe_outcome(id, false, revision(), &|| true)
-                .moved(),
-            None
-        );
-    }
-    assert_eq!(
-        health
-            .probe_outcome(id, false, revision(), &|| true)
-            .moved(),
-        Some((WorkerStatus::NotReady, WorkerStatus::Failed)),
-        "nine more fail it"
-    );
-    assert_eq!(
-        health.probe_outcome(id, true, revision(), &|| true).moved(),
-        None
-    );
-    assert_eq!(
-        health.probe_outcome(id, true, revision(), &|| true).moved(),
-        Some((WorkerStatus::Failed, WorkerStatus::Ready)),
-        "two passes bring a failed worker back"
-    );
-    let fresh = store.upsert(facts("http://f:8000", 1)).id();
-    let fresh_revision = WorkersStore::get(&store, fresh).expect("the row").revision;
-    assert_eq!(
-        health.connected(fresh, fresh_revision, &|| true).moved(),
-        Some((WorkerStatus::Pending, WorkerStatus::Ready)),
-        "the connect signal promotes at once"
-    );
-    assert_eq!(
-        health.connected(fresh, fresh_revision, &|| true).moved(),
-        None,
-        "a ready row takes no second promotion"
-    );
-}
-
-#[test]
-fn a_threshold_past_the_counters_range_is_never_met_early() {
-    // The first threshold whose tenfold passes 32 bits, and the last one.
-    for threshold in [429_496_730, u32::MAX] {
-        let store = MemoryStore::new();
-        let health: &dyn HealthSink = &store;
-        let mut stated = facts("http://w:8000", 1);
-        stated.health.failure_threshold = threshold;
-        let id = store.upsert(stated).id();
-        let revision = || WorkersStore::get(&store, id).expect("the row").revision;
-        // A pending worker's cap is ten thresholds: five failed probes are
-        // far under it.
-        for _ in 0..5 {
-            assert_eq!(
-                health
-                    .probe_outcome(id, false, revision(), &|| true)
-                    .moved(),
-                None,
-                "pending under {threshold}"
-            );
-        }
-        assert_eq!(
-            health.probe_outcome(id, true, revision(), &|| true).moved(),
-            None
-        );
-        assert_eq!(
-            health.probe_outcome(id, true, revision(), &|| true).moved(),
-            Some((WorkerStatus::Pending, WorkerStatus::Ready))
-        );
-        // And a ready one stays ready through failures under the threshold.
-        for _ in 0..5 {
-            assert_eq!(
-                health
-                    .probe_outcome(id, false, revision(), &|| true)
-                    .moved(),
-                None,
-                "ready under {threshold}"
-            );
-        }
-    }
-}
-
-#[test]
-fn a_counter_at_its_ranges_end_stays_there() {
-    let store = MemoryStore::new();
-    let health: &dyn HealthSink = &store;
-    let mut stated = facts("http://w:8000", 1);
-    stated.health.failure_threshold = u32::MAX;
-    let id = store.upsert(stated).id();
-    let revision = || WorkersStore::get(&store, id).expect("the row").revision;
-    // A pending worker's cap is held at the counter's end: met there, and
-    // one probe short of it not yet.
-    store.probed(id, 0, 0, u32::MAX - 2);
-    assert_eq!(
-        health
-            .probe_outcome(id, false, revision(), &|| true)
-            .moved(),
-        None
-    );
-    assert_eq!(
-        health
-            .probe_outcome(id, false, revision(), &|| true)
-            .moved(),
-        Some((WorkerStatus::Pending, WorkerStatus::Failed))
-    );
-    // Each counter at its end takes one probe more and stays there.
-    store.probed(id, u32::MAX, u32::MAX, u32::MAX);
-    assert_eq!(
-        health
-            .probe_outcome(id, false, revision(), &|| true)
-            .moved(),
-        None
-    );
-    store.probed(id, 0, u32::MAX, u32::MAX);
-    assert_eq!(
-        health.probe_outcome(id, true, revision(), &|| true).moved(),
-        Some((WorkerStatus::Failed, WorkerStatus::Ready))
-    );
-}
-
-#[test]
-fn a_threshold_whose_triple_passes_the_counters_range_fails_no_row_early() {
-    // The first threshold whose triple passes 32 bits: a product that
-    // wrapped would read 2.
-    let threshold = 1_431_655_766;
-    let store = MemoryStore::new();
-    let health: &dyn HealthSink = &store;
-    let mut stated = facts("http://w:8000", 1);
-    stated.health.failure_threshold = threshold;
-    let id = store.upsert(stated).id();
-    let revision = || WorkersStore::get(&store, id).expect("the row").revision;
-    assert_eq!(
-        health.probe_outcome(id, true, revision(), &|| true).moved(),
-        None
-    );
-    assert_eq!(
-        health.probe_outcome(id, true, revision(), &|| true).moved(),
-        Some((WorkerStatus::Pending, WorkerStatus::Ready))
-    );
-    // Ready, the row is not ready at the threshold's own count of failed
-    // probes: the count is set one short of it.
-    store.probed(id, threshold - 1, 0, 0);
-    assert_eq!(
-        health
-            .probe_outcome(id, false, revision(), &|| true)
-            .moved(),
-        Some((WorkerStatus::Ready, WorkerStatus::NotReady))
-    );
-    // Not ready, it fails at three thresholds of failed probes: five are
-    // far under them.
-    for _ in 0..5 {
-        assert_eq!(
-            health
-                .probe_outcome(id, false, revision(), &|| true)
-                .moved(),
-            None,
-            "not ready under the triple"
-        );
-    }
-}
-
-#[test]
-fn a_connect_signal_read_under_a_revision_the_row_left_is_dropped() {
-    let store = MemoryStore::new();
-    let health: &dyn HealthSink = &store;
-    let id = store.upsert(facts("http://p:8000", 1)).id();
-    let read = WorkersStore::get(&store, id).expect("the row").revision;
-    WorkersStore::patch(&store, id, WorkerPatch::default(), read).expect("the patch");
-    assert_eq!(
-        health.connected(id, read, &|| true).moved(),
-        None,
-        "a stale signal is dropped"
-    );
-    assert_eq!(
-        WorkersStore::get(&store, id).expect("the row").status,
-        WorkerStatus::Pending,
-        "and the row stays as it stood"
-    );
-    assert_eq!(
-        health.connected(id, read + 1, &|| true).moved(),
-        Some((WorkerStatus::Pending, WorkerStatus::Ready)),
-        "the signal read under the row's revision promotes"
-    );
-}
-
-#[test]
-fn a_health_write_says_what_happened_and_the_status_that_stands() {
+fn a_told_status_says_what_happened_and_the_status_that_stands() {
     use super::HealthWrite::{Moved, NoRow, Stale, Stood};
 
     let store = MemoryStore::new();
-    let health: &dyn HealthSink = &store;
     let id = store.upsert(facts("http://w:8000", 1)).id();
     let revision = || WorkersStore::get(&store, id).expect("the row").revision;
-    // A write that moves nothing is judged, and says the status that stands.
+    let told = |status, revision, leads: bool| store.status_told(id, status, revision, &|| leads);
+    // A status the row holds already stands, and nothing is written.
+    let epoch = store.epoch();
     assert_eq!(
-        health.probe_outcome(id, true, revision(), &|| true),
+        told(WorkerStatus::Pending, revision(), true),
         Stood(WorkerStatus::Pending)
     );
+    assert_eq!(store.epoch(), epoch);
     assert_eq!(
-        health.probe_outcome(id, true, revision(), &|| true),
+        told(WorkerStatus::Ready, revision(), true),
         Moved {
             from: WorkerStatus::Pending,
             to: WorkerStatus::Ready
         }
     );
-    // The connect signal on a ready row stands and clears no counter: two
-    // failures ahead of it and one behind it are the threshold's three.
-    for _ in 0..2 {
-        assert_eq!(
-            health.probe_outcome(id, false, revision(), &|| true),
-            Stood(WorkerStatus::Ready)
-        );
-    }
-    assert_eq!(
-        health.connected(id, revision(), &|| true),
-        Stood(WorkerStatus::Ready)
-    );
-    assert_eq!(
-        health.probe_outcome(id, false, revision(), &|| true),
-        Moved {
-            from: WorkerStatus::Ready,
-            to: WorkerStatus::NotReady
-        },
-        "the signal cleared no counter of the ready row"
-    );
-    // A write read under a revision the row left is stale: it says no
-    // status and is not counted, so the two passes behind it are the
-    // threshold's two.
+    // A writer whose last word says no writes nothing.
+    assert_eq!(told(WorkerStatus::NotReady, revision(), false), Stale);
+    // A status told under a revision the row left is stale: it says no
+    // status, and the row stands as it stood.
     let left = revision();
     WorkersStore::patch(&store, id, WorkerPatch::default(), left).expect("the patch");
-    assert_eq!(health.probe_outcome(id, true, left, &|| true), Stale);
-    assert_eq!(health.connected(id, left, &|| true), Stale);
-    assert_eq!(
-        health.probe_outcome(id, true, revision(), &|| true),
-        Stood(WorkerStatus::NotReady),
-        "the stale pass was not counted"
-    );
-    assert_eq!(
-        health.probe_outcome(id, true, revision(), &|| true),
-        Moved {
-            from: WorkerStatus::NotReady,
-            to: WorkerStatus::Ready
-        }
-    );
-    // A draining row stands at the signal too.
-    WorkersStore::set_status(&store, id, WorkerStatus::Draining, revision()).expect("drained");
-    assert_eq!(
-        health.connected(id, revision(), &|| true),
-        Stood(WorkerStatus::Draining)
-    );
-    // A write for a worker whose row is gone says no row.
+    assert_eq!(told(WorkerStatus::NotReady, left, true), Stale);
+    let stands = WorkersStore::get(&store, id).expect("the row").status;
+    assert_eq!((stands, store.epoch()), (WorkerStatus::Ready, epoch + 2));
+    // A status told for a worker whose row is gone says no row.
     let last = revision();
     store.remove(id, last).expect("removed");
-    assert_eq!(health.probe_outcome(id, true, last, &|| true), NoRow);
-    assert_eq!(health.connected(id, last, &|| true), NoRow);
+    assert_eq!(told(WorkerStatus::NotReady, last, true), NoRow);
 }
 
 #[test]
@@ -865,6 +608,47 @@ fn a_writer_racing_the_removal_finds_no_row_after_it_returns() {
     }
 }
 
+/// A member with nothing on file but a mark: its engine's last answer named
+/// another rank and left its own out. Its eviction takes the mark, judges
+/// the engine again and is said, as the eviction of a member with a record
+/// is: a world is made, or one is due.
+#[test]
+fn the_eviction_of_a_member_an_answer_left_out_is_said() {
+    let store = MemoryStore::new();
+    let member = |rank: u16| {
+        let facts = WorkerFacts {
+            engine: "http://e:8000".to_string(),
+            dp_rank: rank,
+            dp_size: 2,
+            ..facts(&format!("http://e:8000/{rank}"), 1)
+        };
+        let id = store.upsert(facts).id();
+        store.publish_now();
+        let revision = WorkersStore::get(&store, id).expect("the row").revision;
+        store
+            .set_status(id, WorkerStatus::Ready, revision)
+            .expect("ready");
+        id
+    };
+    let (named, left_out) = (member(0), member(1));
+    let loads: &dyn LoadSink = &store;
+    let t0 = Instant::now();
+    loads.report(
+        &[(named, 0, Some(row(0))), (left_out, 1, None)],
+        t0,
+        LoadSource::Poll,
+    );
+    store.publish_now();
+    assert_eq!(loads.ranks(left_out), 0, "nothing of it is on file");
+    let published = store.publications();
+    assert_eq!(store.publish_due(), None);
+    loads.evict(left_out);
+    assert!(
+        store.publications() > published || store.publish_due().is_some(),
+        "the eviction is said"
+    );
+}
+
 #[test]
 fn an_evicted_member_has_nothing_on_file_and_takes_its_next_report() {
     let store = MemoryStore::new();
@@ -881,6 +665,23 @@ fn an_evicted_member_has_nothing_on_file_and_takes_its_next_report() {
     );
     loads.report(&[(id, 0, Some(row(0)))], t0, LoadSource::Poll);
     assert_eq!(loads.ranks(id), 1, "a member's next report is written");
+}
+
+/// The eviction of a member with nothing on file moves no row a
+/// publication shows: no world is made for it, and none is due at the
+/// window's end.
+#[test]
+fn the_eviction_of_a_member_with_nothing_on_file_asks_for_no_publication() {
+    let store = MemoryStore::new();
+    let id = ready(&store, "http://w:8000");
+    let loads: &dyn LoadSink = &store;
+    let published = store.publications();
+    assert_eq!(store.publish_due(), None);
+    loads.evict(id);
+    assert_eq!(
+        (store.publications(), store.publish_due()),
+        (published, None)
+    );
 }
 
 /// A poll's row stands in for a silent rank's sample but never for its
@@ -1177,23 +978,26 @@ fn publisher(store: &MemoryStore, key: &str, rank: u16) -> WorkerId {
     store.upsert(facts).id()
 }
 
-/// What the batch of `sequence` carries in these cases: one block of its
-/// own at a chain's start, so the blocks a rank holds count the batches
-/// applied since its last clear.
-fn one_block(sequence: u64) -> [KvEvent; 1] {
-    [KvEvent::Stored {
-        parent: None,
-        blocks: vec![StoredBlock {
+/// What the batch of `sequence` writes in these cases, as the body its
+/// row's lane is lent to: one block of its own at a chain's start, so the
+/// blocks a rank holds count the batches applied since its last clear.
+fn one_block(sequence: u64) -> impl FnMut(&mut LaneWriter<'_>) {
+    move |lane| {
+        let block = StoredBlock {
             seq_hash: SequenceHash(1_000 + sequence),
             content_hash: ContentHash(2_000 + sequence),
-        }],
-    }]
+        };
+        let mut map = std::mem::take(lane.map());
+        let placed = lane.stored(&[block], None, &mut map);
+        *lane.map() = map;
+        placed.expect("stored");
+    }
 }
 
 #[test]
 fn a_reorder_that_moves_the_first_model_moves_the_rows_lane_with_it() {
     let store = MemoryStore::new();
-    let sink: &dyn KvEventSink<Batch = [KvEvent]> = &store;
+    let sink: &dyn KvEventSink = &store;
     let mut stated = WorkerFacts {
         models: vec!["m".to_owned(), "n".to_owned()],
         signals: Signals {
@@ -1204,7 +1008,7 @@ fn a_reorder_that_moves_the_first_model_moves_the_rows_lane_with_it() {
     };
     let id = store.upsert(stated.clone()).id();
     for seq in 1..=3 {
-        sink.admit(id, 0, batch(seq), &one_block(seq));
+        sink.admit_through(id, 0, batch(seq), &mut one_block(seq));
     }
     let held = || (store.kv().held_blocks("m"), store.kv().held_blocks("n"));
     assert_eq!(held(), (3, 0));
@@ -1217,7 +1021,7 @@ fn a_reorder_that_moves_the_first_model_moves_the_rows_lane_with_it() {
     assert_eq!(held(), (0, 0));
     assert_eq!(sink.cursor(id, 0), None);
     assert_eq!(
-        sink.admit(id, 0, batch(1), &one_block(1)),
+        sink.admit_through(id, 0, batch(1), &mut one_block(1)),
         BatchOutcome::Applied
     );
     assert_eq!(held(), (0, 1));
@@ -1226,25 +1030,25 @@ fn a_reorder_that_moves_the_first_model_moves_the_rows_lane_with_it() {
 #[test]
 fn kv_batches_apply_in_sequence_skip_duplicates_and_ask_one_replay_per_gap() {
     let store = MemoryStore::new();
-    let sink: &dyn KvEventSink<Batch = [KvEvent]> = &store;
+    let sink: &dyn KvEventSink = &store;
     let id = publisher(&store, "w", 0);
     assert_eq!(sink.cursor(id, 0), None, "a rank never heard from");
     assert_eq!(
-        sink.admit(id, 0, batch(17), &one_block(17)),
+        sink.admit_through(id, 0, batch(17), &mut one_block(17)),
         BatchOutcome::Applied
     );
     assert_eq!(
-        sink.admit(id, 0, batch(18), &one_block(18)),
+        sink.admit_through(id, 0, batch(18), &mut one_block(18)),
         BatchOutcome::Applied
     );
     assert_eq!(
-        sink.admit(id, 0, batch(18), &one_block(18)),
+        sink.admit_through(id, 0, batch(18), &mut one_block(18)),
         BatchOutcome::Skipped,
         "a duplicate"
     );
     assert_eq!(sink.cursor(id, 0).expect("heard").applied, 18);
     assert_eq!(
-        sink.admit(id, 0, batch(25), &one_block(25)),
+        sink.admit_through(id, 0, batch(25), &mut one_block(25)),
         BatchOutcome::Gap {
             expected: 19,
             received: 25
@@ -1253,21 +1057,21 @@ fn kv_batches_apply_in_sequence_skip_duplicates_and_ask_one_replay_per_gap() {
     assert!(sink.cursor(id, 0).expect("heard").replay_pending);
     for seq in 19..=25 {
         assert_eq!(
-            sink.admit(id, 0, batch(seq), &one_block(seq)),
+            sink.admit_through(id, 0, batch(seq), &mut one_block(seq)),
             BatchOutcome::Applied,
             "the replay fills the gap"
         );
     }
     assert_eq!(store.indexed_blocks(id, 0), 9);
     assert_eq!(
-        sink.admit(id, 0, batch(40), &one_block(40)),
+        sink.admit_through(id, 0, batch(40), &mut one_block(40)),
         BatchOutcome::Gap {
             expected: 26,
             received: 40
         }
     );
     assert_eq!(
-        sink.admit(id, 0, batch(50), &one_block(50)),
+        sink.admit_through(id, 0, batch(50), &mut one_block(50)),
         BatchOutcome::Applied,
         "a second gap is lost history, applied"
     );
@@ -1280,7 +1084,7 @@ fn kv_batches_apply_in_sequence_skip_duplicates_and_ask_one_replay_per_gap() {
     );
     let second = publisher(&store, "w/1", 1);
     assert_eq!(
-        sink.admit(second, 1, batch(3), &one_block(3)),
+        sink.admit_through(second, 1, batch(3), &mut one_block(3)),
         BatchOutcome::Applied
     );
     assert_eq!(
@@ -1289,12 +1093,12 @@ fn kv_batches_apply_in_sequence_skip_duplicates_and_ask_one_replay_per_gap() {
         "each rank its own counter"
     );
     assert_eq!(
-        sink.admit(id, 1, batch(3), &one_block(3)),
+        sink.admit_through(id, 1, batch(3), &mut one_block(3)),
         BatchOutcome::Skipped,
         "a batch of a rank the row is not"
     );
     assert_eq!(
-        sink.admit(WorkerId(9), 0, batch(1), &one_block(1)),
+        sink.admit_through(WorkerId(9), 0, batch(1), &mut one_block(1)),
         BatchOutcome::Skipped,
         "a batch of a worker the store holds no row for"
     );
@@ -1306,16 +1110,16 @@ fn kv_batches_apply_in_sequence_skip_duplicates_and_ask_one_replay_per_gap() {
 #[test]
 fn a_fresh_connection_below_the_cursor_is_a_restart_where_a_late_duplicate_is_not() {
     let store = MemoryStore::new();
-    let sink: &dyn KvEventSink<Batch = [KvEvent]> = &store;
+    let sink: &dyn KvEventSink = &store;
     let id = publisher(&store, "w", 0);
     for seq in 1..=5 {
         assert_eq!(
-            sink.admit(id, 0, batch(seq), &one_block(seq)),
+            sink.admit_through(id, 0, batch(seq), &mut one_block(seq)),
             BatchOutcome::Applied
         );
     }
     assert_eq!(
-        sink.admit(id, 0, batch(3), &one_block(3)),
+        sink.admit_through(id, 0, batch(3), &mut one_block(3)),
         BatchOutcome::Skipped,
         "a late duplicate on the same connection"
     );
@@ -1323,7 +1127,7 @@ fn a_fresh_connection_below_the_cursor_is_a_restart_where_a_late_duplicate_is_no
     assert_eq!(store.resyncs(ResyncReason::PublisherRestart), 0);
     sink.reconnected(id);
     assert_eq!(
-        sink.admit(id, 0, batch(3), &one_block(3)),
+        sink.admit_through(id, 0, batch(3), &mut one_block(3)),
         BatchOutcome::Applied,
         "the same sequence on a fresh connection is a restarted publisher"
     );
@@ -1332,7 +1136,7 @@ fn a_fresh_connection_below_the_cursor_is_a_restart_where_a_late_duplicate_is_no
     assert_eq!(store.indexed_blocks(id, 0), 1, "the rank was cleared first");
     assert_eq!(store.resyncs(ResyncReason::PublisherRestart), 1);
     assert_eq!(
-        sink.admit(id, 0, batch(4), &one_block(4)),
+        sink.admit_through(id, 0, batch(4), &mut one_block(4)),
         BatchOutcome::Applied,
         "the new life continues from there"
     );
@@ -1342,11 +1146,11 @@ fn a_fresh_connection_below_the_cursor_is_a_restart_where_a_late_duplicate_is_no
 #[test]
 fn a_publisher_restart_and_a_resync_clear_the_rank_and_a_removal_forgets_it() {
     let store = MemoryStore::new();
-    let sink: &dyn KvEventSink<Batch = [KvEvent]> = &store;
+    let sink: &dyn KvEventSink = &store;
     let id = publisher(&store, "w", 0);
     for seq in 1..=5 {
         assert_eq!(
-            sink.admit(id, 0, batch(seq), &one_block(seq)),
+            sink.admit_through(id, 0, batch(seq), &mut one_block(seq)),
             BatchOutcome::Applied
         );
     }
@@ -1356,7 +1160,7 @@ fn a_publisher_restart_and_a_resync_clear_the_rank_and_a_removal_forgets_it() {
         snapshot: None,
     };
     assert_eq!(
-        sink.admit(id, 0, clearing, &one_block(2)),
+        sink.admit_through(id, 0, clearing, &mut one_block(2)),
         BatchOutcome::Applied,
         "a clear below the cursor is a restarted publisher"
     );
@@ -1364,13 +1168,13 @@ fn a_publisher_restart_and_a_resync_clear_the_rank_and_a_removal_forgets_it() {
     assert_eq!(store.resyncs(ResyncReason::PublisherRestart), 1);
     sink.reconnected(id);
     assert_eq!(
-        sink.admit(id, 0, batch(1), &one_block(1)),
+        sink.admit_through(id, 0, batch(1), &mut one_block(1)),
         BatchOutcome::Applied,
         "below the cursor on a fresh connection: a restart too"
     );
     assert_eq!(store.resyncs(ResyncReason::PublisherRestart), 2);
     for seq in 2..=4 {
-        sink.admit(id, 0, batch(seq), &one_block(seq));
+        sink.admit_through(id, 0, batch(seq), &mut one_block(seq));
     }
     assert_eq!(store.indexed_blocks(id, 0), 4);
     sink.resync(id, Some(0), ResyncReason::OutOfRange);
@@ -1386,14 +1190,14 @@ fn a_publisher_restart_and_a_resync_clear_the_rank_and_a_removal_forgets_it() {
     };
     sink.resync(id, Some(0), ResyncReason::Snapshot);
     assert_eq!(
-        sink.admit(id, 0, chunk, &one_block(90)),
+        sink.admit_through(id, 0, chunk, &mut one_block(90)),
         BatchOutcome::Applied
     );
     let cursor = sink.cursor(id, 0).expect("heard");
     assert_eq!((cursor.applied, cursor.degraded), (90, true));
     assert_eq!(store.resyncs(ResyncReason::Snapshot), 1);
     assert_eq!(
-        sink.admit(id, 0, batch(91), &one_block(91)),
+        sink.admit_through(id, 0, batch(91), &mut one_block(91)),
         BatchOutcome::Applied,
         "live batches continue after the snapshot's stamp"
     );
@@ -3237,10 +3041,9 @@ fn a_watch_snapshot_keeps_a_members_local_tables() {
     LoadSink::record(&store, id, 0, row(0), now, LoadSource::Stream);
     let local_load = LoadSink::load(&store, id, 0).expect("the local report");
     assert_eq!(
-        store.admit(id, 0, batch(1), &one_block(1)),
+        store.admit_through(id, 0, batch(1), &mut one_block(1)),
         BatchOutcome::Applied
     );
-    store.probed(id, 2, 0, 0);
 
     let mut cut = store.checkpoint();
     cut.epoch += 1;
@@ -3250,7 +3053,6 @@ fn a_watch_snapshot_keeps_a_members_local_tables() {
     cut.rows[0].facts.priority = 8;
     let mut expected = cut.rows[0].clone();
     expected.admitted_at = WorkersStore::get(&store, id).expect("the row").admitted_at;
-    let revision = expected.revision;
     assert!(store.watch_from(cut));
 
     assert_eq!(leases.live(gateway), 1);
@@ -3262,13 +3064,6 @@ fn a_watch_snapshot_keeps_a_members_local_tables() {
     assert_eq!(LoadSink::load(&store, id, 0), Some(local_load));
     assert_eq!(store.kv().held_blocks("m"), 1);
     assert_eq!(WorkersStore::get(&store, id), Some(expected));
-    assert_eq!(
-        store.probe_outcome(id, false, revision, &|| true),
-        HealthWrite::Moved {
-            from: WorkerStatus::Ready,
-            to: WorkerStatus::NotReady
-        }
-    );
 }
 
 #[test]
@@ -3286,7 +3081,7 @@ fn a_watch_snapshot_evicts_a_leavers_tables_and_its_lease_moves_no_other_count()
     store.gateway_veto(gateway, left, Some(now + Duration::from_secs(60)));
     LoadSink::record(&store, left, 0, row(0), now, LoadSource::Stream);
     assert_eq!(
-        store.admit(left, 0, batch(1), &one_block(1)),
+        store.admit_through(left, 0, batch(1), &mut one_block(1)),
         BatchOutcome::Applied
     );
 
@@ -3402,8 +3197,12 @@ fn a_watch_snapshot_publishes_the_cut_at_once_and_tells_the_members_once() {
     store.upsert(facts("http://owed:1", 1));
     assert!(store.publish_due().is_some(), "a build is owed");
     heard.lock().expect("the stage heard").clear();
+    let before = store.snapshot();
     assert!(store.watch_from(cut));
-    assert_eq!(store.snapshot().epoch(), epoch);
+    assert!(
+        !Arc::ptr_eq(&store.snapshot(), &before),
+        "a world of the cut stands at once"
+    );
     assert_eq!(store.epoch(), epoch);
     assert_eq!(store.history(), 1);
     assert_eq!(
@@ -4942,17 +4741,19 @@ fn a_frame_handed_while_a_thread_is_at_work_is_left_to_that_thread() {
 }
 
 thread_local! {
-    /// The epoch of the world each tell of [`under`] was handed.
-    static UNDER: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+    /// The world each tell of [`under`] was handed, by its address. A case
+    /// holds every world it compares, so no later world stands where one
+    /// of them stood.
+    static UNDER: RefCell<Vec<*const StoreSnapshot>> = const { RefCell::new(Vec::new()) };
     /// Whether the next tell of [`under`] publishes a later world.
     static LATER: Cell<bool> = const { Cell::new(true) };
 }
 
-/// A teller that keeps the epoch of the world each tell is handed. Its
-/// first tell publishes a later world before it returns, so a word told
-/// behind it under the same load reads the earlier epoch.
+/// A teller that keeps the world each tell is handed. Its first tell
+/// publishes a later world before it returns, so a word told behind it
+/// under the same load reads the earlier world.
 fn under(store: &MemoryStore, world: &StoreSnapshot, _: &Sides, _: Said, _: Option<DecisionSlot>) {
-    UNDER.with_borrow_mut(|under| under.push(world.epoch()));
+    UNDER.with_borrow_mut(|under| under.push(std::ptr::from_ref(world)));
     if LATER.replace(false) {
         ready(store, "http://b:1");
     }
@@ -4960,16 +4761,19 @@ fn under(store: &MemoryStore, world: &StoreSnapshot, _: &Sides, _: Said, _: Opti
 
 /// A store under term 1 that tells through [`under`], with one ready
 /// worker and `leases` leases issued on it at `now`, five seconds to their
-/// dispatch: the store, the worker, the leases' ids and the epoch of the
-/// world that stands.
-fn under_bed(leases: u64, now: Instant) -> (Arc<MemoryStore>, WorkerId, Vec<LeaseId>, u64) {
+/// dispatch: the store, the worker, the leases' ids and the world that
+/// stands.
+fn under_bed(
+    leases: u64,
+    now: Instant,
+) -> (Arc<MemoryStore>, WorkerId, Vec<LeaseId>, Arc<StoreSnapshot>) {
     let store = Arc::new(MemoryStore::new());
     store.tell_through(under);
     let a = ready(&store, "http://a:1");
     LeasesStore::set_term(&*store, 1);
     let ids = (0..leases).map(|_| LeaseId(1 << 32 | issued_at(&store, a, now).0));
     let ids = ids.collect();
-    let first = store.snapshot().epoch();
+    let first = store.snapshot();
     (store, a, ids, first)
 }
 
@@ -5551,8 +5355,9 @@ fn the_frames_of_a_take_are_told_under_one_world() {
     store.hand(&hand, ids[0], GONE);
     store.hand(&hand, ids[1], GONE);
     at_work.apply();
-    let later = store.snapshot().epoch();
-    assert!(later > first);
+    let later = store.snapshot();
+    assert!(!Arc::ptr_eq(&later, &first), "a later world stands");
+    let (first, later) = (Arc::as_ptr(&first), Arc::as_ptr(&later));
     assert_eq!(UNDER.take(), [first, first], "one load for the take");
     store.hand(&hand, ids[2], GONE);
     at_work.apply();
@@ -5570,8 +5375,9 @@ fn the_leases_an_issue_ends_are_told_under_one_world() {
     // issue ends two, and the one behind it the third.
     let late = now + Duration::from_secs(6);
     issued_at(&store, a, late);
-    let later = store.snapshot().epoch();
-    assert!(later > first);
+    let later = store.snapshot();
+    assert!(!Arc::ptr_eq(&later, &first), "a later world stands");
+    let (first, later) = (Arc::as_ptr(&first), Arc::as_ptr(&later));
     assert_eq!(
         UNDER.take(),
         [first, first],
@@ -5589,7 +5395,11 @@ fn the_leases_a_sweep_ends_in_a_file_are_told_under_one_world() {
     let (store, _, ids, first) = under_bed(3, now);
     let ended = LeasesStore::expire(&*store, now + Duration::from_secs(6));
     assert_eq!(ended.len(), ids.len());
-    assert!(store.snapshot().epoch() > first);
+    assert!(
+        !Arc::ptr_eq(&store.snapshot(), &first),
+        "a later world stands"
+    );
+    let first = Arc::as_ptr(&first);
     assert_eq!(
         UNDER.take(),
         [first, first, first],
@@ -5613,9 +5423,13 @@ fn an_issues_frames_and_its_ends_are_told_under_a_load_each() {
     // issue applies the handed frame, then ends that lease.
     issued_at(&store, a, now + Duration::from_secs(6));
     drop(at_work);
-    let later = store.snapshot().epoch();
-    assert!(later > first);
-    assert_eq!(UNDER.take(), [first, later], "a load for each run");
+    let later = store.snapshot();
+    assert!(!Arc::ptr_eq(&later, &first), "a later world stands");
+    assert_eq!(
+        UNDER.take(),
+        [Arc::as_ptr(&first), Arc::as_ptr(&later)],
+        "a load for each run"
+    );
 }
 
 /// A decider looks at what is handed before a decision reads its rows'

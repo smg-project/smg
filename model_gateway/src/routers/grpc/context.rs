@@ -61,8 +61,12 @@ use crate::{
     policies::CacheNamespace,
     routers::{
         common::{
-            attempt_ledger::AttemptLedger, pd_admission::PdAdmissionGuard, placement::Placed,
-            prefill_admission::PrefillLoadGuard, snapshot::WorkerRegistry, sse::SseSender,
+            attempt_ledger::AttemptLedger,
+            pd_admission::PdAdmissionGuard,
+            placement::Placed,
+            prefill_admission::{PrefillAhead, PrefillLoadGuard},
+            snapshot::WorkerRegistry,
+            sse::SseSender,
         },
         error::internal_error,
         grpc::regular::symphony::{template::Templates, PreparedConstraint},
@@ -360,8 +364,9 @@ pub(crate) struct ProcessingState {
     pub clients: Option<ClientSelection>,
 
     /// Prefill admission slot, taken during PD/EPD worker selection and
-    /// handed to the dispatch that runs the Prefill side.
-    pub pd_prefill_guard: Option<PrefillLoadGuard>,
+    /// handed to the dispatch that runs the Prefill side, which says the
+    /// prefill's send.
+    pub pd_prefill_guard: Option<PrefillAhead>,
 
     // Response processing state seeded during ingress (stop decoder, router
     // stop obligations, derived skip_special_tokens).
@@ -485,9 +490,9 @@ pub(crate) struct DispatchContext {
     /// its last reader and takes it.
     pub dispatch: Option<DispatchMetadata>,
     pub load_guards: Option<LoadGuards>,
-    /// Prefill admission slot for the next PD/EPD dispatch; a retry's
-    /// reselection refills it.
-    pub pd_prefill_guard: Option<PrefillLoadGuard>,
+    /// Prefill admission slot for the next PD/EPD dispatch, held ahead of
+    /// the prefill's send; a retry's reselection refills it.
+    pub pd_prefill_guard: Option<PrefillAhead>,
     pub response: ResponseState,
 }
 
@@ -1012,8 +1017,10 @@ pub(crate) enum WorkerSelection {
     ///
     /// The decode is kept as its placement answered it: its load guard is
     /// made from the answer ([`LoadGuards::new`],
-    /// [`LoadGuards::behind_prefill`]). The prefill's guard was made from
-    /// its answer where the Prefill admission took its slot.
+    /// [`LoadGuards::behind_prefill`]). The prefill's load is a plain guard
+    /// of its worker, held where the Prefill admission took its slot. What
+    /// its answer owes its send goes with that load ([`PrefillAhead`]), and
+    /// the dispatch says the send where the prefill goes out.
     Disaggregated {
         encode_assignments: Option<Vec<EncodeWorkerAssignment>>,
         prefill: Arc<dyn Worker>,
@@ -1974,18 +1981,24 @@ pub(crate) type DispatchWait = Option<std::time::Duration>;
 /// run inside it, so they read the wait there, against the dispatch instant
 /// their stream's clocks start at, and hand it to the reading they build:
 /// the response body drives that reading once the request's future has
-/// returned, outside the scope.
+/// returned, outside the scope. A collected answer is built inside the
+/// request's future, so its processor reads the wait where it makes the
+/// answer's records, against the dispatch its generation clock starts at.
 ///
-/// A streamed Responses tool loop dispatches its generations from a task of
-/// its own and puts each of them under a stamp there: the first turn's under
-/// the request's own, a later turn's under one taken where that turn starts.
-/// A later turn's wait is therefore the gateway's time from the turn's start
-/// to its dispatch, with none of the generations and tool calls before it.
+/// A Responses tool loop puts each of its generations under a stamp: the
+/// first turn's under the request's own, a later turn's under one taken
+/// where that turn starts (the streamed loop dispatches from a task of its
+/// own and carries the request's stamp there; the collected loop runs in the
+/// request's future). A later turn's wait is therefore the gateway's time
+/// from the turn's start to its dispatch, with none of the generations and
+/// tool calls before it.
 ///
-/// `None` when no stamp is in scope. Behind the edge every entry point that
-/// reads the wait runs under one. A pipeline a test runs bare has none, on
-/// any turn of a tool loop either, and its stream records its time to first
-/// token alone.
+/// `None` when no stamp is in scope. Behind the edge every streaming entry
+/// point that reads the wait runs under one, and so does every collected
+/// answer but a background Responses request's: its generations run in a
+/// task of its own, outside the request's scope, and record no wait. A
+/// pipeline a test runs bare has none, on any turn of a tool loop either,
+/// and its answer records its other families alone.
 pub(crate) fn dispatch_wait(dispatched: Instant) -> DispatchWait {
     let entered = RequestStarted::current()?;
     Some(dispatched.saturating_duration_since(entered))

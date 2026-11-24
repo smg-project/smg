@@ -2,15 +2,16 @@
 //!
 //! The store shows its readers what a write left waiting at the end of the
 //! window the write fell in, and names that instant
-//! ([`LoadSink::publish_due`]). No write pays for a publication itself:
-//! this loop keeps the instant and publishes at it ([`LoadSink::publish`]).
+//! ([`MemoryStore::publish_due`]). No write pays for a publication itself:
+//! this loop keeps the instant and publishes at it ([`MemoryStore::publish`]).
 //! It runs on every replica for the serve's length, whoever wrote: a
 //! followed row reaches the published world as a leader's own does.
 //!
 //! A membership write of another task can leave the store an instant the
-//! loop read none of, a registration's build: the store wakes the loop
-//! ([`LoadSink::wake_with`]), which reads the instant again. A write that
-//! wakes nobody is read at the loop's next tick.
+//! loop read none of, a registration's build: the store calls the wake the
+//! loop handed it ([`MemoryStore::wake_with`], a
+//! [`Wake`](crate::store::Wake)), and the loop reads the instant again. A
+//! write that wakes nobody is read at the loop's next tick.
 
 use std::{
     sync::Arc,
@@ -22,7 +23,7 @@ use tokio::{
     time::MissedTickBehavior,
 };
 
-use crate::store::LoadSink;
+use crate::store::MemoryStore;
 
 /// How often the loop reads the store's instant again with no wake: how
 /// late a write that wakes nobody is shown, at the most, behind its window.
@@ -43,7 +44,7 @@ async fn at(instant: Option<Instant>) {
 }
 
 /// Pays `store`'s publications until `stop` reads `true`.
-pub(super) async fn run<S: LoadSink + ?Sized>(store: &S, mut stop: watch::Receiver<bool>) {
+pub(super) async fn run(store: &MemoryStore, mut stop: watch::Receiver<bool>) {
     let mut ticker = tokio::time::interval(TICK);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let woken = Arc::new(Notify::new());
@@ -72,7 +73,7 @@ mod tests {
     use super::*;
     use crate::{
         engine::view::{LoadRow, Role, WireModes, WorkerId},
-        store::{LoadSource, MemoryStore, WorkerFacts, WorkersStore, PUBLISH_WINDOW},
+        store::{LoadSink, LoadSource, WorkerFacts, WorkersStore, PUBLISH_WINDOW},
     };
 
     /// A store with the loop running over it, and the loop's stop.
@@ -81,7 +82,7 @@ mod tests {
         let (stop, stopped) = watch::channel(false);
         let mut tasks = JoinSet::new();
         let published = Arc::clone(&store);
-        tasks.spawn(async move { run(&*published, stopped).await });
+        tasks.spawn(async move { run(&published, stopped).await });
         (store, stop, tasks)
     }
 

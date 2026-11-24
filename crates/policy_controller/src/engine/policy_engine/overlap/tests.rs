@@ -830,7 +830,7 @@ fn a_later_model_of_its_workers_shares_the_first_models_record() {
 /// list keeps one for a shadow that is named rows, and the column shows
 /// what that record holds. A gateway's sticky map hands a request it places
 /// to no policy, so the policy's record never takes it
-/// (`model_gateway/src/policies/registry.rs:736-739`, `:782-783`).
+/// (`model_gateway/src/policies/registry.rs:791`, `:840`).
 #[test]
 fn a_pick_the_sessions_rule_placed_is_recorded_by_the_rules_word_at_both_writes() {
     for whole in [false, true] {
@@ -960,7 +960,7 @@ fn an_entrys_debug_form_holds_no_token() {
 /// worker's entry of the match's rows of one that is the profile's own. A
 /// gateway's sticky map hands a request it places to no policy, so the
 /// policy's tree never takes that request's prompt
-/// (`model_gateway/src/policies/registry.rs:736-739`, `:782-783`).
+/// (`model_gateway/src/policies/registry.rs:791`, `:840`).
 #[test]
 fn a_pick_the_sessions_rule_placed_is_written_to_a_tree_by_the_rules_word() {
     let (affinity, _tree) = lending(false);
@@ -2111,13 +2111,97 @@ fn a_trees_match_under_one_block_states_a_miss() {
     assert_eq!(stated_in_tree(&bed, short, 3), none);
 }
 
+/// A holder the sample's draw leaves out states a miss. Eight workers hold
+/// the prompt in the tree, and under a sample of four a decision is named
+/// four of them. A pick of one of the four states the match's blocks. A
+/// pick of one the draw left out states a miss of the request's blocks,
+/// though the tree holds the prompt for it. A gateway's classic policy
+/// counts every tenant of the match
+/// (`model_gateway/src/policies/cache_aware.rs:3103-3123`).
+#[test]
+fn a_holder_the_samples_draw_leaves_out_states_a_miss() {
+    let (affinity, _tree) = lending(false);
+    let bed = Bed::new(affinity, sampled(4), 20);
+    let asked = tokens(1_000, 4);
+    for at in 0..8 {
+        bed.keyed(&asked, 0, Some(at));
+    }
+    let hashes = hashed(&asked);
+    let (mut named_picks, mut left_out) = (0, 0);
+    for seed in 0..32 {
+        for row in 0..8 {
+            let key = TokenKey {
+                tokens: Cow::Borrowed(asked.as_slice()),
+                marker: 0,
+            };
+            let mut named = Vec::new();
+            let returned = decide(
+                &bed.affinity,
+                &bed.pool,
+                &bed.spec,
+                &bed.workers,
+                &bed.ids,
+                &mut request(&hashes, seed, NOW),
+                None,
+                |_| Some(key),
+                |_| true,
+                |facts| {
+                    let rows = facts.named.expect("rows named");
+                    named = rows.holders.iter().map(|holder| holder.row).collect();
+                    picked(row, bed.ids[row as usize])
+                },
+            );
+            let stated = returned.pick().map(Pick::overlap).unwrap_or_default();
+            assert_eq!(named.len(), 4, "seed {seed}: the sample");
+            if named.contains(&row) {
+                let sent = holds(4, 4, OverlapSource::Predictor);
+                assert_eq!(stated, sent, "seed {seed}, row {row}: named");
+                named_picks += 1;
+            } else {
+                let miss = holds(0, 4, OverlapSource::None);
+                assert_eq!(stated, miss, "seed {seed}, row {row}: left out");
+                left_out += 1;
+            }
+        }
+    }
+    assert!(named_picks > 0 && left_out > 0, "both kinds were picked");
+}
+
+/// A tree pick is counted by the document's block size where the request
+/// states its tokens and no hash of them: the match in the request's
+/// blocks, and the request itself. Sixty-four tokens are four blocks of
+/// sixteen. Once the tree holds the prompt for a worker, a pick of it
+/// states four of four.
+#[test]
+fn a_tree_pick_of_a_request_with_no_hashes_is_counted_by_the_documents_block() {
+    let (affinity, _tree) = lending(false);
+    let bed = Bed::new(affinity, preset("cache_aware"), 4);
+    let asked = tokens(1_000, 4);
+    let facts = RequestFacts {
+        model: MODEL,
+        seed: 7,
+        now_micros: NOW,
+        prompt_tokens: 4 * BLOCK,
+        ..RequestFacts::default()
+    };
+    let key = || TokenKey {
+        tokens: Cow::Borrowed(asked.as_slice()),
+        marker: 0,
+    };
+    let answer = picked(1, bed.ids[1]);
+    let miss = holds(0, 4, OverlapSource::None);
+    assert_eq!(bed.stated(&facts, Some(key()), answer), miss);
+    let sent = holds(4, 4, OverlapSource::Predictor);
+    assert_eq!(bed.stated(&facts, Some(key()), answer), sent);
+}
+
 /// A pick the binding's sessions rule placed alone and keeps from the
 /// profile states nothing, over the engine's own rows and over a column its
 /// host filled: the request is none of the profile's. One the rule places
 /// under its default word is the profile's own, and states its worker's
 /// entry as a pick by the profile's stages does. A gateway's sticky map
 /// hands a request it places to no policy, so the policy observes nothing
-/// of it (`model_gateway/src/policies/registry.rs:736-739`, `:782-783`).
+/// of it (`model_gateway/src/policies/registry.rs:791`, `:840`).
 #[test]
 fn a_pick_its_rule_keeps_from_the_profile_states_nothing() {
     let (affinity, _, index) = hosted(true);

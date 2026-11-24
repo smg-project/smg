@@ -1177,7 +1177,7 @@ mod tests {
             decision_engine::{DecisionEngine, HeldDecode, RequestMaker, WorkerLists},
             demands::DemandFacts,
             framework::{Filter, Picker, TieBand},
-            list_cell::tests::PublishedList,
+            list_cell::PublishedList,
             prompt_hashes::{HashSeeds, PromptHashes},
             records::worker_id,
             sticky_sessions::{DecodeVerdict, SessionVerdict},

@@ -9,7 +9,7 @@
 //! [`decide_decode`] behind the pair its lease holds, and the two that
 //! issue its side ask [`issue_decode`] behind it. One asks
 //! [`decide_alone`] for a prefill and for a decode frame that stands
-//! alone.
+//! alone. An encode request's cases stand in a file of their own.
 
 use std::{
     collections::BTreeSet,
@@ -67,6 +67,8 @@ use crate::{
     tracking::lease::{Dispatch, Lease, LeaseId, Outcome, ReleaseReason, Side, DISPATCH_TTL},
     worker_host::{stand, Members, Objects},
 };
+
+mod encode;
 
 /// A gateway that is not the cases' own.
 const OTHER: GatewayId = GatewayId(12);
@@ -2553,4 +2555,111 @@ fn a_served_pairs_later_decode_counts_its_key_from_its_calls_issue() {
         assert!(store.unissue_decode(GATEWAY, prefill.id, issue));
         assert_eq!(keys(), [held, 0, 0], "the issue taken back");
     }
+}
+
+/// A ready member `name` of [`PAIRED`] on `role`'s side, on the gRPC wire,
+/// whose registration names the engine kind `kind`: none where it is empty.
+fn kind_member(store: &MemoryStore, name: &str, role: Role, kind: &str) -> WorkerId {
+    let key = format!("grpc://{name}:8000");
+    let facts = WorkerFacts {
+        key: key.clone(),
+        engine: key,
+        incarnation: 1,
+        role,
+        wire_modes: WireModes::GRPC,
+        engine_kind: kind.to_owned(),
+        models: vec![PAIRED.to_owned()],
+        dp_size: 1,
+        max_running: Some(4),
+        ..WorkerFacts::default()
+    };
+    let id = store.upsert(facts).id();
+    store.publish_now();
+    let row = WorkersStore::get(store, id).expect("the row");
+    let ready = store.set_status(id, WorkerStatus::Ready, row.revision);
+    ready.expect("the row stands");
+    id
+}
+
+/// A controller's pair classes hold a model's workers of both wires in one
+/// table, and state which pairs go first: every pair but one that, on the
+/// wire that carries one runtime's request, has a worker of unknown
+/// runtime. One prefill and one decode stand on the plain wire here, and
+/// on the other wire a prefill and a decode of one known runtime beside a
+/// prefill and a decode of none. Every worker of a wire pairs with every
+/// other of it under the stock plan's pairing.
+///
+/// A frame held to one wire reads the gateway's own order on it. On the
+/// runtime-specific wire every target names the pair on the known runtime
+/// while it is open, and a pair with a worker of unknown runtime once the
+/// asking gateway holds the known decode back
+/// (`model_gateway/src/routers/common/placement.rs:2754-2771`,
+/// `:2884-2887`, on main `4b41f39a7`). On the plain wire the one pair
+/// there is made: that wire has no such order.
+///
+/// A frame of a gateway that speaks both wires, or states none, is decided
+/// over both. No replay on main shows this: no request of a gateway's own
+/// pair placement is placed over two wires. The plain pair and the pair on
+/// the known runtime are both made, and a pair with a worker of unknown
+/// runtime is made only while neither is open.
+///
+/// A decode call behind the prefill of the known runtime names the decode
+/// of its runtime alone, and one behind the prefill of unknown runtime
+/// names either decode of its wire.
+#[test]
+fn a_served_pair_with_a_worker_of_unknown_runtime_goes_behind_every_other_pair() {
+    let store = Arc::new(MemoryStore::new());
+    let applied = store.apply(stock_pair_plan());
+    applied.expect("above the unbound start");
+    let nameless = kind_member(&store, "p0", Role::Prefill, "");
+    let known = kind_member(&store, "p1", Role::Prefill, "runtime-a");
+    let any = kind_member(&store, "d0", Role::Decode, "");
+    let same = kind_member(&store, "d1", Role::Decode, "runtime-a");
+    let plain = (
+        side_member(&store, "p2", Role::Prefill, None),
+        side_member(&store, "d2", Role::Decode, None),
+    );
+    let objects = holder(&store);
+    let now = Instant::now();
+    // One gateway holds the known decode back, and another the plain
+    // decode too.
+    let until = Some(now + Duration::from_secs(60));
+    let (one_held, both_held) = (OTHER, GatewayId(13));
+    store.gateway_veto(one_held, same, until);
+    store.gateway_veto(both_held, same, until);
+    store.gateway_veto(both_held, plain.1, until);
+    let made = |gateway: GatewayId, wires: WireModes| -> BTreeSet<(WorkerId, WorkerId)> {
+        let mut made = BTreeSet::new();
+        for n in 1..=64 {
+            let frame = at_prefill(n, wires, None);
+            let answer = served_pair(&store, &objects, frame, gateway, now);
+            assert!(answer.pick().is_some(), "frame {n}: {answer:?}");
+            made.extend(pairs_of(&answer));
+        }
+        made
+    };
+    let first = (known, same);
+    let behind = BTreeSet::from([(known, any), (nameless, any)]);
+    assert_eq!(made(GATEWAY, WireModes::GRPC), BTreeSet::from([first]));
+    assert_eq!(made(one_held, WireModes::GRPC), behind);
+    assert_eq!(made(GATEWAY, WireModes::HTTP), BTreeSet::from([plain]));
+    for wires in [WireModes::HTTP.union(WireModes::GRPC), WireModes::NONE] {
+        let both = BTreeSet::from([first, plain]);
+        assert_eq!(made(GATEWAY, wires), both, "{wires:?}");
+        assert_eq!(made(one_held, wires), BTreeSet::from([plain]), "{wires:?}");
+        assert_eq!(made(both_held, wires), behind, "{wires:?}");
+    }
+
+    let unread = Arc::new(LoadSnapshot::default());
+    let mut calls = [BTreeSet::new(), BTreeSet::new()];
+    for n in 1..=32 {
+        for (prefill, named) in [known, nameless].into_iter().zip(&mut calls) {
+            let frame = at_call(n, LeaseId(1), WireModes::GRPC, None);
+            let (asked, given) = ((GATEWAY, now), (&unread, None));
+            let call = served_call(&store, &objects, frame, asked, (prefill, None), given);
+            named.extend(pairs_of(&call).into_iter().map(|pair| pair.1));
+        }
+    }
+    let either = BTreeSet::from([any, same]);
+    assert_eq!(calls, [BTreeSet::from([same]), either]);
 }

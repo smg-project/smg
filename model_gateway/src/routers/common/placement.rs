@@ -387,10 +387,13 @@ pub(crate) struct Pair {
 }
 
 /// A selected prefill/decode pair as the pair placement answers it
-/// ([`select_pair`]): each worker as a [`Placed`]. A route makes each
-/// side's load guard from that side's answer, in the place it made one from
-/// the worker: the prefill's by [`Placed::guard`], and the decode's, which
-/// it makes ahead of the decode's send, by [`Placed::ahead`] with
+/// ([`select_pair`]): each worker as a [`Placed`]. A route holds each
+/// side's load in the place it held one before. The prefill's is a plain
+/// guard of its worker under the route's key, made where the prefill's
+/// load is acquired, ahead of its send: what the prefill's answer owes
+/// that send goes with the load ([`Placed::unsent`]) and is said where the
+/// prefill goes out ([`Unsent::sent`]). The decode's, which a route makes
+/// ahead of the decode's send, is made by [`Placed::ahead`] with
 /// [`Placed::sent`] at that send.
 ///
 /// Under the classic policies the two guards are the ones a route made
@@ -500,6 +503,10 @@ pub(crate) fn accepted_by(
 /// none. It keeps the engine's placement to the request's end: the engine
 /// hears the dispatch where the guard is made and the end where the guard
 /// is dropped. It is told no outcome: the worker object has it.
+///
+/// A pair's prefill is the one answer whose guard is made of its worker
+/// alone, ahead of its send and under the route's key: what the answer
+/// owes that send goes on apart from the worker ([`Placed::unsent`]).
 ///
 /// A classic answer is the worker's handle and one empty word: that word is
 /// all a classic placement pays for the engine's side of this type.
@@ -687,12 +694,21 @@ impl Placed {
     /// True where the policy engine placed the request. A classic answer is
     /// owed neither: asked again it stands, and [`Self::guard`] makes its
     /// guard whole. A route asks this where it decides its dispatch's
-    /// shape, and sends a decode that is owed nothing as it does with no
-    /// engine. This test of the answer's one word is then all the pair pays
-    /// behind its prefill.
+    /// shape: it builds no ask for a decode that is owed nothing, and
+    /// sends it as it does with no engine.
     #[inline]
     pub(crate) fn owed_behind_prefill(&self) -> bool {
         self.engine.is_some()
+    }
+
+    /// This answer's worker, and what the answer still owes its send
+    /// ([`Unsent`]): for a pair's prefill, whose load is made ahead of its
+    /// send as a plain guard under the route's key, and whose handle goes
+    /// on behind that load. A move, with no test of the answer: a classic
+    /// answer owes nothing.
+    #[inline]
+    pub(crate) fn unsent(self) -> (Arc<dyn Worker>, Option<Unsent>) {
+        (self.worker, self.engine.map(Unsent))
     }
 
     /// The worker alone, for a caller that sends it no request: a bench's
@@ -708,7 +724,7 @@ impl Placed {
     /// The worker of an answer whose load guard was made: the engine's
     /// side of the request is the guard's by now, so the answer has nothing
     /// left to give up, and the worker's handle moves on with no count. For
-    /// a route that hands a pair's prefill on behind its guard. A debug
+    /// a route that hands a pair's decode on behind its guard. A debug
     /// build stops where the answer still holds its side: the request
     /// would go out under no guard of its own, and the engine would hear a
     /// release.
@@ -721,6 +737,32 @@ impl Placed {
             "a worker is handed on behind its guard"
         );
         self.worker
+    }
+}
+
+/// What is left of an answer's engine side when its worker's handle goes on
+/// ahead of the send ([`Placed::unsent`]): the engine's side of the request
+/// and the routing value the engine names. [`Self::sent`] says the send.
+/// Dropped unsent, it lets the side go, which the engine hears as a
+/// release.
+#[derive(Debug)]
+pub(crate) struct Unsent(Box<ByEngine>);
+
+impl Unsent {
+    /// The request went out under `guard`, a plain guard of the answer's
+    /// worker, made ahead of the send under its route's own key. The engine
+    /// hears the dispatch now, and the guard keeps the side, so the guard's
+    /// drop is the side's end. From here on the guard counts under the
+    /// routing value the engine names, where the engine names one: up to
+    /// the send the worker counted the request under the route's key. Out
+    /// of line: a classic answer leaves nothing unsent.
+    #[inline(never)]
+    pub(crate) fn sent(self, guard: WorkerLoadGuard) -> WorkerLoadGuard {
+        let guard = match self.0.routing_key.as_deref() {
+            Some(key) => guard.under_key(key),
+            None => guard,
+        };
+        self.0.sent(guard)
     }
 }
 
@@ -1012,6 +1054,15 @@ fn row_name(policies: &PolicyRegistry, side: Option<RowSide>, label: &'static st
 /// counts a request under. The name is read off the settings: no policy
 /// object is asked.
 ///
+/// Observes the match ratio a classic cache-aware selection observes of the
+/// worker it chose ([`Metrics::record_cache_aware_match_ratio`]): the share
+/// of the request's blocks the placement states its worker holds
+/// ([`Placement::overlap`]), a miss as zero. One observation a placement
+/// that states one, under any profile whose stages read who holds the
+/// prompt. A placement that states nothing observes nothing: a profile that
+/// reads no such row, a request the sessions rule placed and keeps from the
+/// profile, and a request that goes to a later target of its pick.
+///
 /// A traced request's decision record takes one row, as a classic
 /// selection's does ([`PolicyRegistry::select_worker_for_model`]): the
 /// list as it stands ahead of the engine's call, and the worker picked, or
@@ -1063,6 +1114,10 @@ fn placed_by_engine(
         model_id,
         counted_under,
     );
+    let (blocks, of) = (placement.overlap.blocks, placement.overlap.of);
+    if of != 0 {
+        Metrics::record_cache_aware_match_ratio(f64::from(blocks) / f64::from(of));
+    }
     let named = || row_name(policies, None, placement.profile);
     engine_row(seen, named, Some(&placement.worker));
     // A placement is moved whole only where the engine is owed the request's
@@ -8659,6 +8714,86 @@ pub(crate) mod tests {
         }
     }
 
+    /// While the policy engine decides, a single request's placement
+    /// observes the match ratio a classic cache-aware selection observes of
+    /// the worker it chose: the share of the request's blocks the engine's
+    /// placement states its worker holds. A prompt's first request reads a
+    /// miss, and its next request, which goes back to its worker, reads
+    /// every block: a prompt held as text and one held as token ids read
+    /// the same. Under a document whose stages read no prompt's holder the
+    /// series stays silent, as it is under a classic policy that is not
+    /// cache-aware. No classic policy object is made or asked.
+    #[test]
+    fn a_request_the_engine_places_observes_its_match_ratio() {
+        use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
+
+        use crate::{
+            config::RouterConfig, observability::metrics::CACHE_AWARE_MATCH_RATIO_BUCKETS,
+        };
+
+        const SERIES: &str = "smg_cache_aware_match_ratio";
+        let observed = |policy: PolicyConfig, inputs: PlacementInputs<'_>| {
+            let recorder = PrometheusBuilder::new()
+                .set_buckets_for_metric(
+                    Matcher::Full(String::from(SERIES)),
+                    CACHE_AWARE_MATCH_RATIO_BUCKETS,
+                )
+                .expect("the series' buckets")
+                .build_recorder();
+            let handle = recorder.handle();
+            let registry = http_registry(&["http://h:1", "http://h:2", "http://h:3"]);
+            let settings = RouterConfig {
+                policy,
+                ..Default::default()
+            };
+            let policies = PolicyRegistry::for_policy_engine(
+                settings.policy.clone(),
+                settings.routing_key_override.clone(),
+            );
+            let document = settings.policy_document().expect("the settings' document");
+            let spec = AppliedSpec::validate(&document);
+            engine_on(&policies, spec.expect("a valid document"));
+            let went_back = metrics::with_local_recorder(&recorder, || {
+                let first = pick(&registry, &policies, inputs);
+                pick(&registry, &policies, inputs).url() == first.url()
+            });
+            assert_eq!(policies.classic_made_or_asked(), 0);
+            let rendered = handle.render();
+            let lines = rendered.lines().filter(|line| line.starts_with(SERIES));
+            (went_back, lines.map(str::to_owned).collect::<Vec<_>>())
+        };
+        let text = "the words of one prompt, said twice. ".repeat(8);
+        let tokens: Vec<u32> = (0..512).collect();
+        let as_text = PlacementInputs {
+            text: Some(&text),
+            ..Default::default()
+        };
+        let as_tokens = PlacementInputs {
+            tokens: Some(&tokens),
+            ..Default::default()
+        };
+        for inputs in [as_text, as_tokens] {
+            let cache_aware = PolicyConfig::cache_aware(0.5, 32, 1.1, 0, 4096);
+            let (went_back, cache_aware) = observed(cache_aware, inputs);
+            assert!(went_back, "the prompt's next request goes to its worker");
+            for series in [
+                "smg_cache_aware_match_ratio_bucket{le=\"0\"} 1",
+                "smg_cache_aware_match_ratio_bucket{le=\"0.9\"} 1",
+                "smg_cache_aware_match_ratio_bucket{le=\"1\"} 2",
+                "smg_cache_aware_match_ratio_sum 1",
+                "smg_cache_aware_match_ratio_count 2",
+            ] {
+                assert!(
+                    cache_aware.iter().any(|line| line == series),
+                    "missing {series} in {cache_aware:#?}"
+                );
+            }
+        }
+        let (went_back, round_robin) = observed(PolicyConfig::RoundRobin, as_text);
+        assert!(!went_back, "the list's turn moves on");
+        assert_eq!(round_robin, Vec::<String>::new());
+    }
+
     // ---- a traced request under the policy engine --------------------------------------------
 
     /// One row of a decision record as these cases read it: its policy, its
@@ -8965,6 +9100,24 @@ pub(crate) mod tests {
         let spec = AppliedSpec::validate_in(&document, &stages, &[]);
         engine_on(policies, spec.expect("the stages hold the scorer"));
         heard
+    }
+
+    /// Hands `policies` an engine under the stock pair document, with a
+    /// request's routing value read from the body's own id, which the
+    /// engine keeps in the clear: the engine names that value for a pair.
+    pub(crate) fn keyed_pairs_on(policies: &PolicyRegistry) {
+        let document = PolicySpec::pair_presets("round_robin", "round_robin");
+        let mut document = document.expect("the pair presets");
+        document.generation = 1;
+        document.bindings[0].routing_key = Some(RoutingKeySpec {
+            sources: vec![KeySourceSpec {
+                rid: true,
+                ..KeySourceSpec::default()
+            }],
+            strip_lineage: false,
+        });
+        let spec = AppliedSpec::validate(&document);
+        engine_on(policies, spec.expect("a valid document"));
     }
 
     /// With an engine handed to the registry the pair placement asks it,

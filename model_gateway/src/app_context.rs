@@ -1810,6 +1810,105 @@ mod tests {
         assert!(policies.lent_trees().is_some());
     }
 
+    /// A model whose index of cache events holds no block is decided in the
+    /// token tree the gateway lends, and its list leaves the tree once the
+    /// index holds a block. A gRPC model's index stands from the enrolment
+    /// of its first worker, so the gateway answers the engine no index
+    /// while it holds none (`KvEventMonitor`'s `CacheIndexes::index`).
+    /// Until the first cache event a conversation's turns are stored in the
+    /// tree and return by it. The engine reads the index again when it
+    /// reads its table of the list again, a second at most behind the
+    /// block, and from then on no prompt is written to the tree.
+    ///
+    /// The classic policy reads an index that holds no block as no index
+    /// and then reads its own token tree
+    /// (`model_gateway/src/policies/cache_aware.rs:1800`, `event_index_for`).
+    /// It asks at each request, so it leaves its tree with the block.
+    #[tokio::test]
+    async fn a_model_whose_index_holds_no_block_is_decided_in_the_lent_tree() {
+        use std::time::Instant;
+
+        use kv_index::{ContentHash, SequenceHash, StoredBlock};
+        use openai_protocol::worker::RuntimeType;
+
+        use crate::{
+            policies::kv_index::index_backend::{KvIndex, WorkerBlocks},
+            routers::common::{
+                placement::{select_single, PlacementInputs, Stated},
+                snapshot::{test_support::grpc_worker, RoutingPool},
+            },
+        };
+
+        let mut config = config_with_policy(PolicyConfig::cache_aware(0.5, 32, 1.1, 0, 4096));
+        config.policy_controller = true;
+        config.health_check.disable_health_check = true;
+        let context = AppContext::from_config(config, 30, None, None).await;
+        let context = context.expect("a context");
+        let trees = context.policy_registry.lent_trees();
+        let tree = trees.expect("the start made the trees").token_tree("m");
+        // The model's index as the enrolment of its first worker leaves it.
+        let monitor = context.kv_event_monitor.as_ref();
+        let index = Arc::new(KvIndex::chain());
+        monitor
+            .expect("the monitor")
+            .set_index("m", Arc::clone(&index));
+        for at in 0..4 {
+            let url = format!("grpc://w{at}:9000");
+            let worker = grpc_worker(&url, "m", RuntimeType::Vllm, &[]);
+            context.worker_registry.register(worker).expect("a worker");
+        }
+        let turn = |said: &[u32]| {
+            let inputs = PlacementInputs {
+                tokens: Some(said),
+                ..PlacementInputs::default()
+            };
+            let placed = select_single(
+                &context.worker_registry,
+                &context.policy_registry,
+                "m",
+                RoutingPool::GrpcPipelineRegular,
+                None,
+                inputs,
+                Stated::nothing,
+            );
+            placed.expect("a worker").into_worker().url().to_owned()
+        };
+        let mut said: Vec<u32> = (0..256).collect();
+        let first = turn(&said);
+        for next in 1..8_u32 {
+            said.extend(next * 1_000_000..next * 1_000_000 + 16);
+            assert_eq!(turn(&said), first, "turn {next}");
+        }
+        let held: Vec<String> = tree.get_tenant_token_counts().into_keys().collect();
+        assert_eq!(held, [first.as_str()]);
+
+        // A worker's first event stores a block.
+        let worker = index.intern_worker("grpc://w0:9000").expect("a number");
+        let block = StoredBlock {
+            seq_hash: SequenceHash(1),
+            content_hash: ContentHash(101),
+        };
+        let stored = index.apply_stored(worker, &[block], None, &mut WorkerBlocks::default());
+        stored.expect("a block stored");
+        // Each prompt is one no worker was sent. While the list reads the
+        // tree the prompt is written there, and once the list left the tree
+        // no count moves.
+        let counted = || tree.get_tenant_token_counts().into_values().sum::<usize>();
+        let bound = Instant::now() + Duration::from_secs(60);
+        let mut prompt = 100_u32;
+        loop {
+            let before = counted();
+            prompt += 1;
+            let fresh: Vec<u32> = (prompt * 1_000_000..prompt * 1_000_000 + 64).collect();
+            turn(&fresh);
+            if counted() == before {
+                break;
+            }
+            assert!(Instant::now() < bound, "the list never left the tree");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
     /// A context built on a runtime starts the task that fills the hash
     /// rings: the ring of a generation is filled with no request to read it.
     #[tokio::test]

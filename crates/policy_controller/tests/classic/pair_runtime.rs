@@ -6,6 +6,12 @@
 //! a document builds, over the first partners a row's runtimes state. No
 //! row draws, and none is decided apart.
 //!
+//! They replay a second way, over the pair classes a controller derives
+//! for the same workers by the store's pairing rule
+//! ([`replay_rows_by_rule`]): that rule states a prefill's partners on its
+//! own known runtime as its first, and a controller's pair decision reads
+//! its classes.
+//!
 //! The gateway keeps two known runtimes apart on that wire and decides one
 //! order: a prefill of a known runtime with an open partner on that runtime
 //! is a candidate ahead of every other prefill
@@ -18,6 +24,7 @@
 //! those of the commit the sheet was recorded from.
 
 pub use super::pair_select::replay_rows;
+use super::pair_select::replay_rows_by_rule;
 
 /// What a sheet's head names these rows.
 pub const POLICY: &str = "pair-runtime";
@@ -28,6 +35,16 @@ pub const POLICY: &str = "pair-runtime";
 #[test]
 fn the_runtime_rows_replay_answer_for_answer() {
     let (rows, found) = replay_rows(INLINE, "inline");
+    assert_eq!(rows, 10);
+    assert_eq!(found, Vec::<String>::new());
+}
+
+/// The rows replay answer for answer over the pair classes the store's
+/// pairing rule derives from each row's workers: their wire, their runtime
+/// and their transport. The replay's own numbering of the row is not read.
+#[test]
+fn the_runtime_rows_replay_over_the_classes_the_pairing_rule_derives() {
+    let (rows, found) = replay_rows_by_rule(INLINE, "inline");
     assert_eq!(rows, 10);
     assert_eq!(found, Vec::<String>::new());
 }
