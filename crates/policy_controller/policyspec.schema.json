@@ -160,7 +160,7 @@
           "default": 180
         },
         "max_size": {
-          "description": "The size bound of a tree index: characters on a text host, tokens\notherwise. The crate's own store reads it for a pool whose profile\nreads sent prefixes: the model's record is bound to `max_size` over\nthe block size placements, never under one, one a block a worker\nwas sent. A lowered bound is met by sweeps at the record's next\nwrites, and a pool whose lanes are all heard writes none.",
+          "description": "The size bound of a tree index: characters on a text host, tokens\notherwise. The crate's own store reads it for a pool whose profile\nreads sent prefixes: the model's record is bound to `max_size` over\nthe block size placements, never under one, one a block a worker\nwas sent. In the engine's own decisions a record takes its unit from\nthe first request that reads it and keeps it: where that request is\nhashed by windows of its text, four bytes a token of the block size,\nthe record is bound to `max_size` over a window's bytes, never under\none window. A lowered bound is met by sweeps at the record's next\nwrites, and a pool whose lanes are all heard writes none.",
           "type": "integer",
           "format": "uint64",
           "minimum": 1,

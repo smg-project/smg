@@ -815,6 +815,37 @@ fn a_later_model_of_its_workers_shares_the_first_models_record() {
     assert_eq!(bed.holders(&asked, NOW), [(1, 0, 4)]);
 }
 
+/// A record counts its index's `max_size` in the unit of the first request
+/// that reads it: a window of text by its bytes, a token block by its
+/// tokens. A record that text begins keeps `max_size` bytes of text, and
+/// token blocks behind the text are held to the same placements.
+#[test]
+fn a_record_that_text_begins_is_held_to_max_size_bytes() {
+    use crate::document::spec::IndexSpec;
+    let (affinity, _, _) = hosted(false);
+    let mut document = PolicySpec::preset("cache_aware").expect("the preset");
+    document.generation = 1;
+    // Eight token blocks, which is two windows of text.
+    let eight = IndexSpec {
+        max_size: u64::from(BLOCK) * 8,
+        ..IndexSpec::default()
+    };
+    document.index.insert(MODEL.into(), eight);
+    let spec = AppliedSpec::validate(&document).expect("the document validates");
+    let bed = Bed::new(affinity, spec, 4);
+    // Eight windows of text: the record keeps the first two of them.
+    let text = "0123456789abcdef".repeat(32);
+    let spec = preset("cache_aware");
+    let seeds = HashSeeds::PLAIN;
+    let worded = PromptHashes::under_document(&spec, Some(BLOCK), None, Some(&text), seeds);
+    bed.decide(&request(&worded, 7, NOW), Some(2));
+    assert_eq!(bed.holders(&worded, NOW), [(2, 0, 2)]);
+    // Token blocks behind the text raise no bound: two placements stand.
+    let asked = prompt(1_000, 8);
+    bed.decide(&request(&asked, 7, NOW), Some(1));
+    assert_eq!(bed.holders(&asked, NOW), [(1, 0, 2)]);
+}
+
 /// A pick the binding's sessions rule placed alone is recorded by the
 /// rule's own word of it, at both of the record's writes: the one behind a
 /// decision named its rows, and the one behind a decision handed the column
@@ -2276,7 +2307,7 @@ fn a_request_sent_a_moment_ago_writes_nothing() {
         }
 
         // The older of the two ends loses one block.
-        let record = bed.affinity.record_of(MODEL, 8);
+        let record = bed.affinity.record_of(MODEL, 8, u64::from(BLOCK) * 8);
         record.predictor.write().sweep(1);
         assert_eq!(
             bed.holders(&asked, last),
@@ -2340,7 +2371,7 @@ fn a_long_request_is_written_in_slices_of_sixteen() {
     }
 
     // A write at any repeated end puts it after the marker.
-    let record = bed.affinity.record_of(MODEL, 1);
+    let record = bed.affinity.record_of(MODEL, 1, u64::from(BLOCK));
     record.predictor.write().sweep(usize::MAX);
     assert_eq!(
         bed.holders(&marker, NOW),
@@ -3224,7 +3255,7 @@ fn a_lower_bound_keeps_its_sweep_past_a_decider_that_holds_the_record() {
     let mut held = record.predictor.write();
     assert_eq!(held.len(), 100, "the record holds the prompt whole");
     thread::scope(|scope| {
-        scope.spawn(|| record.bound_to(1));
+        scope.spawn(|| record.bound_to(1, u64::from(BLOCK)));
         // Five seconds at most for the bound's word to move: a lowering
         // that never moves it fails the case below and hangs nothing.
         for _ in 0..5_000 {

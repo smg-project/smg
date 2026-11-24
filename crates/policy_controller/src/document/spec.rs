@@ -548,7 +548,11 @@ pub struct IndexSpec {
     /// otherwise. The crate's own store reads it for a pool whose profile
     /// reads sent prefixes: the model's record is bound to `max_size` over
     /// the block size placements, never under one, one a block a worker
-    /// was sent. A lowered bound is met by sweeps at the record's next
+    /// was sent. In the engine's own decisions a record takes its unit from
+    /// the first request that reads it and keeps it: where that request is
+    /// hashed by windows of its text, four bytes a token of the block size,
+    /// the record is bound to `max_size` over a window's bytes, never under
+    /// one window. A lowered bound is met by sweeps at the record's next
     /// writes, and a pool whose lanes are all heard writes none.
     #[schemars(range(min = 1))]
     pub max_size: u64,

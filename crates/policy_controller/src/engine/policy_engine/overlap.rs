@@ -58,7 +58,7 @@ use std::{
     fmt, mem,
     rc::Rc,
     sync::{
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
         Arc, OnceLock,
     },
     time::Duration,
@@ -471,20 +471,21 @@ impl Affinity {
     }
 
     /// The record of `model`, made at its first asking and held to `bound`
-    /// placements.
-    fn record_of(&self, model: &str, bound: usize) -> Arc<PrefixRecord> {
+    /// placements of token blocks, or to `max_size` bytes where it counts
+    /// text ([`PrefixRecord::hold`]).
+    fn record_of(&self, model: &str, bound: usize, max_size: u64) -> Arc<PrefixRecord> {
         let record = {
             let mut records = self.records.lock();
             if let Some(record) = records.get(model) {
                 Arc::clone(record)
             } else {
-                let record = Arc::new(PrefixRecord::new(bound));
+                let record = Arc::new(PrefixRecord::new(bound, max_size));
                 records.insert(model.into(), Arc::clone(&record));
                 record
             }
         };
         // Outside the map's mutex: a bound that moved takes the record.
-        record.bound_to(bound);
+        record.bound_to(bound, max_size);
         record
     }
 }
@@ -496,6 +497,12 @@ struct PrefixRecord {
     /// The record's bound as the last table set it: a table's read takes
     /// the record, which the deciders hold, only where the bound moved.
     bound: AtomicUsize,
+    /// The index's `max_size` as the last table read it.
+    max_size: AtomicU64,
+    /// The unit `max_size` is counted in, taken from the first request that
+    /// reads the record and kept while the record stands:
+    /// [`Self::UNREAD`], [`Self::TOKENS`], or the bytes of a window of text.
+    window: AtomicU32,
     /// Work waits for a sweep: a worker left, or the bound came down.
     sweeping: AtomicBool,
     /// How many leaves were told. Written under the record's guard, a
@@ -551,23 +558,83 @@ impl PrefixRecord {
     const SLICE: usize = 16;
     /// A sweep's step.
     const SWEEP: usize = 64;
+    /// [`Self::window`] of a record no request read yet.
+    const UNREAD: u32 = 0;
+    /// [`Self::window`] of a record of token blocks.
+    const TOKENS: u32 = u32::MAX;
 
-    fn new(bound: usize) -> Self {
+    fn new(bound: usize, max_size: u64) -> Self {
         Self {
             predictor: RwLock::new(PrefixPredictor::new(bound)),
             bound: AtomicUsize::new(bound),
+            max_size: AtomicU64::new(max_size),
+            window: AtomicU32::new(Self::UNREAD),
             sweeping: AtomicBool::new(false),
             left: AtomicU64::new(0),
             left_out: AtomicU64::new(0),
         }
     }
 
-    /// Holds the record to `bound` placements. A lower bound forgets
-    /// nothing here: the next writes and sweeps take the oldest blocks out.
-    fn bound_to(&self, bound: usize) {
-        if self.bound.swap(bound, Ordering::Relaxed) != bound {
-            self.predictor.write().set_bound(bound);
+    /// Holds the record to what a table read: `bound` placements of token
+    /// blocks, `max_size` for a record of text ([`Self::hold`]). A lower
+    /// bound forgets nothing here: the next writes and sweeps take the
+    /// oldest blocks out.
+    fn bound_to(&self, bound: usize, max_size: u64) {
+        let moved = self.bound.swap(bound, Ordering::Relaxed) != bound;
+        if self.max_size.swap(max_size, Ordering::Relaxed) != max_size || moved {
+            self.hold(&mut self.predictor.write());
+        }
+    }
+
+    /// Sets the predictor's bound, under its writer's guard, behind every
+    /// change of a word it is made of: the table's bound for token blocks,
+    /// and for a record of text `max_size` over the bytes of a window,
+    /// never under one window.
+    fn hold(&self, predictor: &mut PrefixPredictor) {
+        let held = match self.window.load(Ordering::Relaxed) {
+            Self::UNREAD | Self::TOKENS => self.bound.load(Ordering::Relaxed),
+            window => {
+                let windows = self.max_size.load(Ordering::Relaxed) / u64::from(window);
+                usize::try_from(windows.max(1)).unwrap_or(usize::MAX)
+            }
+        };
+        if predictor.bound() != held {
+            predictor.set_bound(held);
             self.sweeping.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Takes the record's unit from a request that reads it. The first
+    /// request's stands: no request of the other kind moves the bound, so
+    /// none makes the record forget for it. A text request with another
+    /// window, its model having reported another block size, moves the
+    /// window.
+    #[inline]
+    fn count_by(&self, facts: &RequestFacts<'_>) {
+        let window = match facts.hash_kind {
+            HashKind::Text => facts.block_size,
+            HashKind::Token => Self::TOKENS,
+        };
+        if self.window.load(Ordering::Relaxed) != window {
+            self.recount(window);
+        }
+    }
+
+    #[cold]
+    fn recount(&self, window: u32) {
+        // A text request that states no window, or one of the other kind.
+        let stays = |unit: u32| {
+            window == Self::UNREAD
+                || (unit != Self::UNREAD && (unit == Self::TOKENS) != (window == Self::TOKENS))
+        };
+        if stays(self.window.load(Ordering::Relaxed)) {
+            return;
+        }
+        let mut predictor = self.predictor.write();
+        // Of two first requests, the one that took the guard first stands.
+        if !stays(self.window.load(Ordering::Relaxed)) {
+            self.window.store(window, Ordering::Relaxed);
+            self.hold(&mut predictor);
         }
     }
 
@@ -937,7 +1004,8 @@ impl Table {
             let size = size.unwrap_or_else(|| spec.block_size()).max(1);
             let bound = (settings.max_size / u64::from(size)).max(1);
             let bound = usize::try_from(bound).unwrap_or(usize::MAX);
-            table.record = Some(affinity.record_of(registered, bound));
+            let record = affinity.record_of(registered, bound, settings.max_size);
+            table.record = Some(record);
             table.ahead = ahead;
             if table.index.is_none() && cap != 0 {
                 let lent = affinity.indexes.get();
@@ -1163,6 +1231,7 @@ impl Table {
         deepest: &mut Vec<WorkerId>,
     ) -> (u32, RecordRead) {
         PrefixPredictor::fold_into(keys, facts.namespace_seed, facts.block_hashes);
+        record.count_by(facts);
         let tick = tick_of(facts.now_micros);
         let usable = |id: WorkerId| self.spoken_row(id).is_some();
         let predictor = record.predictor.read();
