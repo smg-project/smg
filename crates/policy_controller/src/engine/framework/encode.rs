@@ -717,10 +717,11 @@ impl Engine {
             return declined(ENCODE_SCOPE);
         }
         let pixels = facts.media.holds_pixels();
+        let images = items.holds_decode_to_images(pixels);
         // A request with no item that asks no images of its decode is the
         // pair's alone: the pair entry answers it over the pools as handed,
         // and no pass of the encode side is laid for it.
-        if !needs && !items.holds_decode_to_images(pixels) {
+        if !needs && !images {
             return self.decide_pair(facts, pool, pools, cx, decode_cx, scratch);
         }
         let encode_facts = RequestFacts {
@@ -829,8 +830,8 @@ impl Engine {
             side.far_member.sort_unstable();
         }
         // The pairs by membership: one at all, one an encoder serves, and
-        // one whose decode takes images. Every request that comes here asks
-        // one of them: the request that asks none left by the early answer.
+        // one whose decode takes images. The request with no item that asks
+        // none of them left by the early answer.
         //
         // The decodes' classes stand in sets of bits no wider than the
         // fleet. Under a table the width is the table's own, as the pair
@@ -840,6 +841,22 @@ impl Engine {
         // numbers above it, which a dense numbering never names.
         let class_of = |at: usize| encode.prefill_classes.get(at).copied().unwrap_or(0);
         let (mut any_pair, mut any_served, mut any_vision) = (false, false, false);
+        // A request with items whose decode is not held to the ones that
+        // take images reads these answers for one thing: a pair that no
+        // encoder serves. An open class has an encoder that serves it, so
+        // with every prefill's class open there is no such pair: no answer
+        // is read, and the two passes below walk no row. Such a request is
+        // asked that ahead, and the admission below reads the same word.
+        let every_open = || {
+            let (open, far_open) = (side.open.words(), side.far_open.as_slice());
+            let classes = encode.prefill_classes;
+            classes.iter().all(|&class| holds_in(open, far_open, class))
+        };
+        let ahead = (needs && !images).then(&every_open);
+        let (decodes, prefills): (&[Candidate], &[Candidate]) = match ahead {
+            Some(true) => (&[], &[]),
+            _ => (pools.decodes, pools.prefills),
+        };
         let tabled = !pools.table.is_empty();
         let width = if tabled {
             pools.table.width()
@@ -850,7 +867,7 @@ impl Engine {
         side.vision_of.reset(width);
         side.far.clear();
         side.far_vision.clear();
-        for row in pools.decodes.iter().filter(|row| row.pair_class != 0) {
+        for row in decodes.iter().filter(|row| row.pair_class != 0) {
             if side.decodes_of.insert(row.pair_class) {
                 if row.vision {
                     side.vision_of.insert(row.pair_class);
@@ -867,8 +884,7 @@ impl Engine {
         // The three answers only rise: the pass ends at the prefill
         // that gives the last of them the request reads. The third is read
         // for a request whose decode is held to the ones that take images.
-        let images = items.holds_decode_to_images(pixels);
-        for (at, row) in pools.prefills.iter().enumerate() {
+        for (at, row) in prefills.iter().enumerate() {
             let listed = pools.table.of(&row.pair_class);
             if listed
                 .iter()
@@ -907,12 +923,7 @@ impl Engine {
         // a pool of their own and the targets are read back by where a row
         // stood.
         let mut admitted = pools;
-        let open_class = |class: u32| holds(&side.open, &side.far_open, class);
-        let every_prefill = !needs
-            || encode
-                .prefill_classes
-                .iter()
-                .all(|&class| open_class(class));
+        let every_prefill = !needs || ahead.unwrap_or_else(&every_open);
         // A list handed on in a pool's stead is numbered anew. A mask and
         // the places a side's host holds the request to number the rows of
         // the host's pool: beside such a list both are numbered with the
