@@ -29,7 +29,7 @@ fn families(body: &str, marker: &str) -> BTreeSet<String> {
 #[tokio::test]
 async fn every_smg_family_has_help_text() {
     let handle = recorder();
-    let (addr, _server) = start_metrics_server(handle, "127.0.0.1".to_string(), 0)
+    let (addr, _server) = start_metrics_server(handle, "127.0.0.1".to_string(), 0, None)
         .await
         .expect("metrics server binds an ephemeral port");
 

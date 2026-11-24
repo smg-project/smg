@@ -1,6 +1,12 @@
 //! The load sink: one row per rank from any of the three sources, with the
 //! poll arbitration per worker (design 5.1, the loads row).
 
+#![expect(
+    clippy::exhaustive_enums,
+    clippy::exhaustive_structs,
+    reason = "the store's copy of this worker data leaves the crate, and its types with it"
+)]
+
 use std::time::{Duration, Instant};
 
 use crate::{
@@ -174,42 +180,4 @@ pub trait LoadSink: Send + Sync {
 
     /// The worker left, or its reports stopped: nothing on file for it.
     fn evict(&self, id: WorkerId);
-
-    /// When the writes this sink took and has not yet shown its readers are
-    /// due to be shown; `None` when nothing waits. A sink that shows each
-    /// write at once never names an instant. The controller's serve keeps
-    /// the instant; a host that writes from a task of its own reads it
-    /// after a write and calls [`LoadSink::publish`] at it. A host that
-    /// does neither shows a waiting write with its next one, and the row's
-    /// age says so meanwhile.
-    ///
-    /// The crate's store names the instant for one thing more: the build
-    /// its membership writes owe. The store pays that build ahead of the
-    /// instant for one load write alone, a poll's answer for a rank that
-    /// has no row yet, and no load write is shown before it, so a host with
-    /// no loop asks for it ([`crate::store::MemoryStore::publish_now`]).
-    fn publish_due(&self) -> Option<Instant> {
-        None
-    }
-
-    /// Show the readers what waits, when `now` is at or past the instant
-    /// [`LoadSink::publish_due`] names; a call before it shows nothing.
-    fn publish(&self, now: Instant) {
-        let _ = now;
-    }
-
-    /// Hand the sink the host's wake. The sink calls it, on the writing
-    /// thread, where a write that is no load call leaves an instant for
-    /// [`LoadSink::publish_due`] to name and none stood: in the crate's
-    /// store, the build a membership write owes. The host's loop reads the
-    /// instant again at each call. The last wake handed stands. A sink
-    /// that never names an instant drops it.
-    fn wake_with(&self, wake: Wake) {
-        drop(wake);
-    }
 }
-
-/// The host's wake: what a sink calls to have its host read
-/// [`LoadSink::publish_due`] again. It is called under the writer's locks:
-/// it sets a flag or a notification and returns.
-pub type Wake = Box<dyn Fn() + Send + Sync>;

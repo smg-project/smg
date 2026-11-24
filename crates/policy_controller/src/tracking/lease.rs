@@ -9,6 +9,12 @@
 //! calls the lifecycle once per side. Every stateful built-in keeps its state
 //! behind these events alone.
 
+#![expect(
+    clippy::exhaustive_enums,
+    clippy::exhaustive_structs,
+    reason = "a caller still builds or matches these types whole: each mark comes with its call"
+)]
+
 use std::{fmt, time::Instant};
 
 use crate::{
@@ -17,10 +23,10 @@ use crate::{
         view::{tokens_or_text, Health, LoadRow, Session, WorkerId},
     },
     load::ReportSignals,
-    tracking::in_flight::WorkerSlot,
 };
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[expect(clippy::exhaustive_structs, reason = "its one value is the record")]
 pub struct LeaseId(pub u64);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -36,6 +42,7 @@ pub enum LeaseKind {
 
 /// Which side of a dispatch a lease or an event is about.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[expect(clippy::exhaustive_enums, reason = "a caller answers every case")]
 pub enum Side {
     #[default]
     Single,
@@ -180,7 +187,9 @@ impl Outcome {
     /// A placement that is told an end (`Placement::ended`, with the feature
     /// `in-process`) writes the side and the served worker over: its caller
     /// leaves both as made here. A guard's caller states both
-    /// ([`Outcome::with_served`]).
+    /// ([`Outcome::with_served`]). Through a handle on a side's end
+    /// (`SideEnd::reported`) the span is written over too: the side counts
+    /// it from its own dispatch.
     ///
     /// The class has no default: a plugin is shown it and a session's
     /// frame carries it, and an end whose caller forgot it must not read
@@ -250,6 +259,7 @@ pub struct Dispatch {
 /// ([`DecisionEngine::say`](crate::engine::DecisionEngine::say)): a side's
 /// dispatch, a side's end, or a release.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[expect(clippy::exhaustive_enums, reason = "a caller answers every case")]
 pub enum Said {
     /// The dispatch the frame names, and the instant the frame was read.
     Dispatched(Dispatch, Instant),
@@ -390,11 +400,6 @@ pub enum Signal<'a> {
         worker: WorkerId,
         dp_rank: u16,
         row: LoadRow,
-        /// The place of the rank's count in the host's counts: a stage that
-        /// keeps a number a member finds the member's cell by it.
-        /// In-process only; [`WorkerSlot::NONE`] from a host that keeps no
-        /// counts.
-        slot: WorkerSlot,
         /// The sample instant of `row` on the host's clock, in microseconds
         /// since the host's origin, as the rank's row names it to a
         /// decision. In-process only; the wire carries the row's age. Each
@@ -433,9 +438,7 @@ pub enum Signal<'a> {
 
 impl<'a> Signal<'a> {
     /// A load row of `worker`'s rank `dp_rank`, sampled at
-    /// `sampled_at_micros`, as a host that keeps no counts tells it: with
-    /// no slot ([`WorkerSlot::NONE`]) and no named value
-    /// ([`ReportSignals::NONE`]).
+    /// `sampled_at_micros`, with no named value ([`ReportSignals::NONE`]).
     #[must_use]
     pub const fn load(
         worker: WorkerId,
@@ -447,7 +450,6 @@ impl<'a> Signal<'a> {
             worker,
             dp_rank,
             row,
-            slot: WorkerSlot::NONE,
             sampled_at_micros,
             signals: ReportSignals::NONE,
         }
@@ -478,14 +480,12 @@ impl<'a> Signal<'a> {
                 worker,
                 dp_rank,
                 row,
-                slot,
                 sampled_at_micros,
                 ..
             } => Self::Load {
                 worker,
                 dp_rank,
                 row,
-                slot,
                 sampled_at_micros,
                 signals,
             },
@@ -634,27 +634,26 @@ mod tests {
         kinds
     }
 
-    /// A load word made by its call names no slot and no named value. It
-    /// takes a report's values whole and keeps every other field, its slot
-    /// too. Two words of one row are two where their values are. A word of
-    /// another kind takes no value.
+    /// A load word made by its call states no named value. It takes a
+    /// report's values whole and keeps every other field. Two words of one
+    /// row are two where their values are. A word of another kind takes no
+    /// value.
     #[test]
-    fn a_load_word_is_made_with_no_slot_and_takes_its_reports_values() {
-        use crate::{load::SignalCell, tracking::in_flight::InFlightCounts};
+    fn a_load_word_is_made_with_no_value_and_takes_its_reports_values() {
+        use crate::load::SignalCell;
         let row = LoadRow {
             waiting_uncached_tokens: 7,
             ..LoadRow::default()
         };
-        let load = |slot, signals| Signal::Load {
+        let load = |signals| Signal::Load {
             worker: WorkerId(3),
             dp_rank: 1,
             row,
-            slot,
             sampled_at_micros: 9,
             signals,
         };
         let made = Signal::load(WorkerId(3), 1, row, 9);
-        assert_eq!(made, load(WorkerSlot::NONE, ReportSignals::NONE));
+        assert_eq!(made, load(ReportSignals::NONE));
         let cells = [
             SignalCell {
                 value: 7.0,
@@ -663,12 +662,8 @@ mod tests {
             SignalCell::NONE,
         ];
         let stated = ReportSignals::new(&cells);
-        assert_eq!(made.with_signals(stated), load(WorkerSlot::NONE, stated));
+        assert_eq!(made.with_signals(stated), load(stated));
         assert_ne!(made.with_signals(stated), made, "one row, two words");
-        let slot = InFlightCounts::default().claim();
-        assert_ne!(slot, WorkerSlot::NONE, "a table's first slot");
-        let counted = load(slot, ReportSignals::NONE);
-        assert_eq!(counted.with_signals(stated), load(slot, stated));
         let health = Signal::Health {
             worker: WorkerId(3),
             health: Health::default(),

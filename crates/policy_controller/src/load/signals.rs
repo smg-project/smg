@@ -24,6 +24,11 @@
 //! named values with the report ([`ReportSignals`]), and reads one by the
 //! column it holds ([`SignalColumn::told`]): the same index, and no age.
 
+#![expect(
+    clippy::exhaustive_structs,
+    reason = "a caller still builds or matches these types whole: each mark comes with its call"
+)]
+
 use crate::{
     document::spec::{AcrossRanks, MAX_SIGNALS},
     engine::view::{Candidate, RequestFacts},

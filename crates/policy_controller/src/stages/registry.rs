@@ -15,7 +15,14 @@
 //! sandbox and no budget. A policy that must change without a rebuild is a
 //! plugin.
 
-use std::{convert::Infallible, fmt, sync::Arc};
+use std::{
+    convert::Infallible,
+    fmt,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+};
 
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
@@ -311,6 +318,7 @@ impl std::error::Error for StageError {}
 
 /// What a stage is in a profile.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum StageKind {
     Filter,
     Scorer,
@@ -329,6 +337,7 @@ impl fmt::Display for StageKind {
 
 /// A registration the registry refuses.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum StageRegistryError {
     /// The name is held already, by a built-in or by an earlier
     /// registration of any kind.
@@ -347,6 +356,12 @@ pub enum StageRegistryError {
 /// The stages a build knows by name. [`StageRegistry::builtin`] is the stock
 /// build's; a host adds its own under new names and hands the catalog to
 /// the validator ([`crate::document::PolicySpec::validate_in`]).
+///
+/// A running engine keeps a profile's stages from one document to the next
+/// (`PolicyEngine::apply`) only where both were validated over the stock
+/// table, or over one table of the host's own as it stood at both
+/// validations. A host that builds its table anew for each document keeps
+/// nothing.
 pub struct StageRegistry {
     filters: Vec<(&'static str, FilterBuild)>,
     scorers: Vec<(&'static str, ScorerBuild)>,
@@ -355,7 +370,16 @@ pub struct StageRegistry {
     /// them ([`crate::stages::Lifecycle::needs_lifecycle`]) is in no other
     /// build.
     lifecycle: bool,
+    /// Zero while the table holds the stock stages alone. Else a number
+    /// no other table of the process has, taken anew at each stage a host
+    /// adds. Two tables under one number build the same stage under each
+    /// name, so an engine may keep stages built over the other
+    /// ([`Engine::keep_from`](crate::engine::Engine::keep_from)).
+    pub(crate) own: u64,
 }
+
+/// The number the next table that takes a stage of a host's own goes under.
+static OWN_TABLES: AtomicU64 = AtomicU64::new(1);
 
 /// A built-in that takes no parameter: its factory builds it.
 fn of<T: ?Sized + 'static, F>(build: fn() -> Box<T>) -> Build<T, F> {
@@ -393,7 +417,15 @@ impl StageRegistry {
                 ("best-with-temperature", Build::Typed),
             ],
             lifecycle: true,
+            own: 0,
         }
+    }
+
+    /// The table with one more stage of a host's own: under a number of
+    /// its own from here on.
+    fn added(&mut self) -> &mut Self {
+        self.own = OWN_TABLES.fetch_add(1, Ordering::Relaxed);
+        self
     }
 
     /// The catalog of a host that makes some lifecycle calls only: the
@@ -426,7 +458,7 @@ impl StageRegistry {
     {
         self.admit(StageKind::Filter, name, || factory().name())?;
         self.filters.push((name, Build::Factory(Box::new(factory))));
-        Ok(self)
+        Ok(self.added())
     }
 
     /// Adds a filter that reads parameters under `name`: a document writes
@@ -448,7 +480,7 @@ impl StageRegistry {
             return Err(StageRegistryError::Held { name, held });
         }
         self.filters.push((name, Build::With(Box::new(build))));
-        Ok(self)
+        Ok(self.added())
     }
 
     /// Adds a scorer under `name`; a document gives it a weight, `{ name:
@@ -466,7 +498,7 @@ impl StageRegistry {
     {
         self.admit(StageKind::Scorer, name, || factory().name())?;
         self.scorers.push((name, Build::Factory(Box::new(factory))));
-        Ok(self)
+        Ok(self.added())
     }
 
     /// Adds a scorer that reads parameters beside `weight` under `name`.
@@ -488,7 +520,7 @@ impl StageRegistry {
             return Err(StageRegistryError::Held { name, held });
         }
         self.scorers.push((name, Build::With(Box::new(build))));
-        Ok(self)
+        Ok(self.added())
     }
 
     /// Adds a picker under `name`. It takes no parameter: a map written
@@ -506,7 +538,7 @@ impl StageRegistry {
     {
         self.admit(StageKind::Picker, name, || factory().name())?;
         self.pickers.push((name, Build::Factory(Box::new(factory))));
-        Ok(self)
+        Ok(self.added())
     }
 
     /// Adds a picker that reads parameters under `name`: a document writes
@@ -529,7 +561,7 @@ impl StageRegistry {
             return Err(StageRegistryError::Held { name, held });
         }
         self.pickers.push((name, Build::With(Box::new(build))));
-        Ok(self)
+        Ok(self.added())
     }
 
     /// The filters' names: the built-ins in the spec's order, then the
@@ -614,9 +646,9 @@ fn find<'a, T: ?Sized, B, F>(
         })
 }
 
-/// The names by kind and the host's two facts: whether it makes the
-/// lifecycle's calls and whether it records the prefixes sent; a factory
-/// has nothing to print.
+/// The names by kind, the host's one fact, whether it makes the
+/// lifecycle's calls, and the table's number; a factory has nothing to
+/// print.
 impl fmt::Debug for StageRegistry {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("StageRegistry")
@@ -624,6 +656,7 @@ impl fmt::Debug for StageRegistry {
             .field("scorers", &self.scorers().collect::<Vec<_>>())
             .field("pickers", &self.pickers().collect::<Vec<_>>())
             .field("lifecycle", &self.lifecycle)
+            .field("own", &self.own)
             .finish()
     }
 }

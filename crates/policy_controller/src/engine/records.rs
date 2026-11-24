@@ -253,11 +253,25 @@ impl<'a> Live<'a> {
     /// `word`, the word a pick over the list alone counts its turns in: the
     /// pool's facts made by them lend it ([`PoolFacts::word`]), so a picker
     /// that takes turns counts a draw's turn in it too. A pair's decision
-    /// reads two lists by one value of these and lends none.
+    /// reads two lists by one value of these, the decodes' under their
+    /// side's own name ([`Self::counted_under`]), and lends none.
     #[must_use]
     pub(crate) fn turning(self, word: &'a AtomicU64) -> Self {
         Self {
             word: Some(word),
+            ..self
+        }
+    }
+
+    /// These reads with the request's key counted under `session_key`: for
+    /// the decodes' records of a pair. Each side of a pair keeps a session
+    /// of its own, so where the session's number names the count the
+    /// decodes' name is their own. Its caller names a key under a document
+    /// that reads the count and under no other, as [`Self::at`]'s does.
+    #[must_use]
+    pub(crate) fn counted_under(self, session_key: Option<&'a str>) -> Self {
+        Self {
+            counted_key: session_key,
             ..self
         }
     }
@@ -337,7 +351,9 @@ impl<'a> Live<'a> {
 /// instant on `clock`, and says whether the snapshot holds a report of the
 /// worker: one look-up of the worker's address, one conversion
 /// ([`load_row`]). The report's age is left at rest: it is a decision's to
-/// state ([`Live::age`]).
+/// state ([`Live::age`]). The report is the snapshot's own, or the last
+/// one it keeps of a worker whose load fetch fails
+/// ([`LoadSnapshot::report_or_kept`]): as old as its sample.
 #[inline]
 fn report_into(
     worker: &dyn Worker,
@@ -345,7 +361,7 @@ fn report_into(
     clock: &DecisionClock,
     row: &mut Candidate,
 ) -> bool {
-    let Some((report, sampled_at)) = loads.report(worker.url()) else {
+    let Some((report, sampled_at)) = loads.report_or_kept(worker.url()) else {
         return false;
     };
     let (load, sampled_at_micros) = stated_report(report, sampled_at, row.role, clock);
@@ -1165,7 +1181,7 @@ impl PoolRecords {
     ) {
         cells.blank(self.fixed.len(), self.signals.len());
         for (fixed, worker) in self.fixed.iter().zip(workers) {
-            let Some((report, sampled_at)) = loads.report(worker.url()) else {
+            let Some((report, sampled_at)) = loads.report_or_kept(worker.url()) else {
                 continue;
             };
             let ranks = || stated_ranks(&worker.metadata().spec);
@@ -1382,6 +1398,9 @@ impl<'a> Singly<'a> {
     /// Pays the decision's look-ups toward the conversion of its list's
     /// reports ([`LookUps`]): the draw that pays the last of the list's
     /// length converts them, and the draws behind it copy the rows.
+    // In line at its two callers, a draw and a draw that claims: as a call
+    // it costs a draw 20 instructions, counted with Callgrind.
+    #[inline(always)]
     fn paid(&self) {
         let looked_up = self.looked_up.get();
         if let (Some(loads), true) = (self.live.loads, looked_up > 0) {
@@ -1562,7 +1581,8 @@ pub fn decide(
         // No record says yet whether it carries a report: a draw reads that
         // fact of no pool.
         let unsaid = pool.facts(live, false);
-        if let Some(drawn) = engine.drawn_for(facts, &unsaid, pool.len()) {
+        let drawn = engine.drawn_for(facts, &unsaid, pool.len());
+        if let Some(drawn) = drawn.filter(|drawn| !drawn.claims()) {
             if rows.len() < pool.len() {
                 rows.resize(pool.len(), Candidate::default());
             }
@@ -1580,6 +1600,15 @@ pub fn decide(
                 scratch,
             );
             singly.paid();
+            return decision;
+        } else if let Some(decision) = drawn.and_then(|drawn| {
+            // A key with no pin takes the list's turn, and the turn's
+            // worker is claimed for it. Where the whole decision answers
+            // by another way it is asked below, over every record.
+            claimed(
+                engine, drawn, pool, workers, live, facts, &unsaid, cx, rows, scratch,
+            )
+        }) {
             return decision;
         }
         let (rows, pool_facts) = pool.write_over::<true>(workers, live, whole, stands);
@@ -1609,6 +1638,54 @@ fn with_buffers<T>(decide: impl FnOnce(&mut Buffers) -> T) -> T {
         return decide(&mut Buffers::default());
     };
     decide(&mut buffers)
+}
+
+/// [`decide`]'s draw for a key with no pin under a sessions rule
+/// ([`Engine::decide_claimed`]), as the plain draw runs: a worker's record
+/// is written when the draw asks about the worker, and the look-ups are
+/// paid at its end. `None` where the whole decision answers, as it does
+/// over a list where two rows carry one id ([`PoolRecords::place_of`]): the
+/// rule's cap is asked of every row of an id, and a draw keeps a few rows.
+///
+/// Out of line: a draw that claims nothing holds none of this.
+#[inline(never)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one decision's inputs and the calling thread's two buffers"
+)]
+fn claimed(
+    engine: &Engine,
+    drawn: super::framework::Drawn,
+    pool: &PoolRecords,
+    workers: &[Arc<dyn Worker>],
+    live: &Live<'_>,
+    facts: &RequestFacts<'_>,
+    unsaid: &PoolFacts<'_>,
+    cx: &Constraints<'_>,
+    rows: &mut Vec<Candidate>,
+    scratch: &mut Scratch,
+) -> Option<Decision> {
+    if pool.places.is_empty() {
+        return None;
+    }
+    if rows.len() < pool.len() {
+        rows.resize(pool.len(), Candidate::default());
+    }
+    let rows = &mut rows[..pool.len()];
+    let singly = Singly::new(pool, workers, live);
+    let mut write = |fixed: &Candidate, row: &mut Candidate| singly.write(fixed, row);
+    let claimed = engine.decide_claimed(
+        drawn,
+        facts,
+        unsaid,
+        &pool.fixed,
+        rows,
+        &mut write,
+        cx,
+        scratch,
+    );
+    singly.paid();
+    claimed
 }
 
 #[cfg(test)]

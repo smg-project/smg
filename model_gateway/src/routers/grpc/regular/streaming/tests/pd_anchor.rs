@@ -14,7 +14,8 @@
 //! The request's wait ahead of that dispatch is recorded with the route's
 //! time to first token. Each case's entry point runs under an entry stamp
 //! taken a known time before the dispatch, as the edge runs a request; the
-//! body is read outside it, as the connection reads it.
+//! body is read outside it, as the connection reads it. A collected answer
+//! records the same wait with no first token.
 use std::{future::Future, time::Duration};
 
 use openai_protocol::{
@@ -26,7 +27,8 @@ use tokio::task::JoinHandle;
 use super::{
     super::*,
     eof::{
-        chunk, complete, messages_spec, processor, runtime, scripted_stream, CharacterTokenizer,
+        chunk, complete, messages_spec, processor, response_processor, runtime, scripted_stream,
+        CharacterTokenizer,
     },
 };
 use crate::{
@@ -790,4 +792,122 @@ fn the_dispatch_wait_is_read_at_the_stream_s_entry_not_where_it_is_recorded() {
         servers
     });
     assert_stream_anchor(&rendered, "single chat", metrics_labels::ENDPOINT_CHAT);
+}
+
+/// The collected chat answer of `result`, built by the non-streaming
+/// processor.
+async fn collected_chat(result: ExecutionResult) {
+    let tokenizer: Arc<dyn Tokenizer> = Arc::new(CharacterTokenizer::default());
+    let mut decoder = utils::create_stop_decoder(&tokenizer, None, None, false, false, false);
+    response_processor()
+        .process_non_streaming_chat_response(
+            result,
+            ChatResponseSpec::from(&chat_request()),
+            dispatch(),
+            tokenizer,
+            &mut decoder,
+            false,
+        )
+        .await
+        .unwrap_or_else(|response| panic!("{}", response.status()));
+}
+
+/// A collected chat answer's records: one generation duration anchored at
+/// the dispatch and no first token. Its dispatch wait needs none: it is
+/// recorded once, under the generation record's labels, and it is the time
+/// from the entry stamp to the dispatch. A wait counted to a pair's decode
+/// dispatch reads `PREFILL_OFFSET - DECODE_OFFSET` more, and one counted to
+/// where the answer is built at least `PREFILL_OFFSET` more.
+fn assert_collected_anchor(rendered: &str, route: &str) {
+    let label = format!("endpoint=\"{}\"", metrics_labels::ENDPOINT_CHAT);
+    let generation_family = "smg_router_generation_duration_seconds";
+    let generation = sample(rendered, generation_family, "sum", &label);
+    let waits = sample(rendered, DISPATCH_WAIT_SECONDS, "count", &label);
+    let wait = sample(rendered, DISPATCH_WAIT_SECONDS, "sum", &label);
+    report(
+        route,
+        &format!("generation={generation:?} s dispatch wait={wait:?} s records={waits:?}"),
+    );
+    assert_eq!(
+        sample(rendered, generation_family, "count", &label),
+        Some(1.0),
+        "one generation record:\n{rendered}"
+    );
+    let generation = generation.expect("the generation duration");
+    let floor = PREFILL_OFFSET.as_secs_f64();
+    assert!(
+        generation >= floor,
+        "generation duration {generation} s anchors at the dispatch ({floor} s before)"
+    );
+    assert_eq!(
+        sample(rendered, "smg_router_ttft_seconds", "count", &label),
+        None,
+        "a collected answer shows no first token:\n{rendered}"
+    );
+    assert_eq!(waits, Some(1.0), "one dispatch wait:\n{rendered}");
+    assert_eq!(
+        count_labels(rendered, DISPATCH_WAIT_SECONDS, &label),
+        count_labels(rendered, generation_family, &label),
+        "the dispatch wait carries the generation record's labels:\n{rendered}"
+    );
+    let wait = wait.expect("the dispatch wait");
+    assert!(
+        (wait - DISPATCH_WAIT.as_secs_f64()).abs() < 1e-9,
+        "dispatch wait {wait} s is the time from the entry stamp to the dispatch ({DISPATCH_WAIT:?})"
+    );
+}
+
+/// One worker's collected chat answer records the request's wait ahead of its
+/// dispatch, though it has no first token to record it with.
+#[test]
+fn a_collected_chat_answer_records_its_dispatch_wait_and_no_ttft() {
+    let rendered = render_after(|| async {
+        let (result, servers) = single_result(text_frames()).await;
+        let entered = entered_before(dispatched_at(&result));
+        collected_chat(result).entered(entered).await;
+        servers
+    });
+    assert_collected_anchor(&rendered, "single collected chat");
+}
+
+/// A pair's collected chat answer records the wait ahead of its prefill
+/// dispatch: the decode side was dispatched later, and the answer is built
+/// later still.
+#[test]
+fn a_pd_collected_chat_answer_records_its_wait_ahead_of_the_prefill_dispatch() {
+    let rendered = render_after(|| async {
+        let (result, servers) = pd_result(text_frames(), PREFILL_OFFSET).await;
+        let entered = entered_before(dispatched_at(&result));
+        collected_chat(result).entered(entered).await;
+        servers
+    });
+    assert_collected_anchor(&rendered, "collected chat");
+}
+
+/// A collected answer built outside any entry stamp, as a pipeline run bare
+/// builds it, has no entry to count from: it records its generation and no
+/// dispatch wait.
+#[test]
+fn a_collected_answer_outside_an_entry_stamp_records_no_dispatch_wait() {
+    let rendered = render_after(|| async {
+        let (result, servers) = single_result(text_frames()).await;
+        collected_chat(result).await;
+        servers
+    });
+    let label = format!("endpoint=\"{}\"", metrics_labels::ENDPOINT_CHAT);
+    assert_eq!(
+        sample(
+            &rendered,
+            "smg_router_generation_duration_seconds",
+            "count",
+            &label
+        ),
+        Some(1.0),
+        "{rendered}"
+    );
+    assert_eq!(
+        sample(&rendered, DISPATCH_WAIT_SECONDS, "count", &label),
+        None,
+        "{rendered}"
+    );
 }

@@ -131,7 +131,7 @@ impl PoolMembers {
 /// column.
 ///
 /// `maker` is the request's own, handed on with the copy: where the
-/// request's host lends a token tree, the copy's decision asks it for the
+/// request's host lends a tree, the copy's decision asks it for the
 /// request's entry there. It is taken as a trait object, so this function
 /// is compiled once, and the copy's decision is no second caller of the
 /// decision a request with no cells takes: as one, it put that decision

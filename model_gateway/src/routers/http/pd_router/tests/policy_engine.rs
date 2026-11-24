@@ -788,3 +788,185 @@ async fn the_engine_reads_the_output_limit_a_retried_attempt_states() {
         }
     }
 }
+
+// ---- a pair refused ahead of its prefill's send --------------------------------------------
+
+/// A pair the route refuses between its selection and its prefill's send
+/// tells the engine a release, and no dispatch. The decode is a MoRI-IO
+/// engine and the prefill is none, so the route refuses the pair before
+/// either side is contacted, and neither engine is asked. The prefill's
+/// worker was counted from the selection on, and is counted no more. Under
+/// a document that decides the decode behind its prefill the first decision
+/// booked the prefill alone: the engine hears that one issue and its one
+/// release. Under the stock document it booked both sides, and hears each
+/// released.
+#[tokio::test]
+async fn a_pair_refused_ahead_of_its_prefills_send_is_heard_as_a_release() {
+    for (decode_pick, told) in [
+        (
+            DecodePick::AfterPrefill,
+            &["issued Prefill", "released Prefill"][..],
+        ),
+        (
+            DecodePick::WithPrefill,
+            &[
+                "issued Prefill",
+                "issued Decode",
+                "released Prefill",
+                "released Decode",
+            ][..],
+        ),
+    ] {
+        let said = Said::default();
+        let prefill_url = spawn_saying(&said, "the prefill is asked", "{}", None).await;
+        let decode_url = spawn_saying(&said, "the decode is asked", "{}", None).await;
+        let only = WorkerId::from_address(&decode_url);
+        let heard = Arc::clone(&said);
+        let stages = table_with(move || {
+            Box::new(Hears {
+                said: Arc::clone(&heard),
+                answered: Arc::new(AtomicBool::new(false)),
+                first: only,
+                later: only,
+            })
+        });
+        let (mut router, _monitor) = pair_router_under(&stages, decode_pick);
+        // One attempt: a refusal the route would try again is told once.
+        router.retry_config.max_retries = 1;
+        let worker_at = |url: String, worker_type: WorkerType| {
+            BasicWorkerBuilder::new(url)
+                .worker_type(worker_type)
+                .runtime_type(RuntimeType::Vllm)
+        };
+        let prefill: Arc<dyn Worker> =
+            Arc::new(worker_at(prefill_url, WorkerType::Prefill).build());
+        let decode: Arc<dyn Worker> = Arc::new(
+            worker_at(decode_url, WorkerType::Decode)
+                .kv_connector("MoRIIOConnector")
+                .label("moriio_mode", "read")
+                .build(),
+        );
+        for worker in [&prefill, &decode] {
+            worker.set_status(openai_protocol::worker::WorkerStatus::Ready);
+            router
+                .worker_registry
+                .register_or_replace(Arc::clone(worker));
+        }
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+
+        let chat: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "m",
+            "max_tokens": 50,
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .expect("valid chat request");
+        let response = router
+            .route_chat(None, &tenant, Arc::new(chat), UNKNOWN_MODEL_ID)
+            .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{decode_pick:?}"
+        );
+        drop(response);
+
+        let order = said.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        // How often a decision asks its scorer is the engine's own.
+        let words: Vec<&str> = order
+            .iter()
+            .map(String::as_str)
+            .filter(|word| *word != "scored")
+            .collect();
+        assert_eq!(words, told, "{decode_pick:?}");
+        assert_eq!((prefill.load(), decode.load()), (0, 0), "{decode_pick:?}");
+    }
+}
+
+// ---- a fan-out that sends no prefill -------------------------------------------------------
+
+/// A request for more than one answer goes to its decode alone on the pair
+/// route that sends a prefill first: one handoff serves one answer, so no
+/// prefill goes out. The route lets the prefill's load go as it was
+/// acquired, unsent, and sends the decode behind that. The engine hears the
+/// prefill's side released with no dispatch, and the decode's dispatch and
+/// end as that side's own: the prefill engine is never asked. Under a
+/// document that decides the decode behind its prefill the first decision
+/// booked the prefill alone, and the decode's issue is told where it goes
+/// out, ahead of the prefill's release. Under the stock document both
+/// sides were issued, and the prefill's release is told where its load is
+/// let go.
+#[tokio::test]
+async fn a_fan_out_that_sends_no_prefill_is_heard_as_its_release_and_its_decode() {
+    for (decode_pick, told) in [
+        (
+            DecodePick::AfterPrefill,
+            &[
+                "issued Prefill",
+                "issued Decode",
+                "dispatched Decode",
+                "released Prefill",
+                "the decode is asked",
+                "ended Decode",
+            ][..],
+        ),
+        (
+            DecodePick::WithPrefill,
+            &[
+                "issued Prefill",
+                "issued Decode",
+                "released Prefill",
+                "dispatched Decode",
+                "the decode is asked",
+                "ended Decode",
+            ][..],
+        ),
+    ] {
+        let said = Said::default();
+        let prefill_url = spawn_saying(&said, "the prefill is asked", "{}", None).await;
+        let chat_completion = r#"{"object":"chat.completion"}"#;
+        let decode_url = spawn_saying(&said, "the decode is asked", chat_completion, None).await;
+        let only = WorkerId::from_address(&decode_url);
+        let heard = Arc::clone(&said);
+        let stages = table_with(move || {
+            Box::new(Hears {
+                said: Arc::clone(&heard),
+                answered: Arc::new(AtomicBool::new(false)),
+                first: only,
+                later: only,
+            })
+        });
+        let (router, _monitor) = pair_router_under(&stages, decode_pick);
+        let [prefill, decode] = sequential_pair(prefill_url, decode_url);
+        for worker in [&prefill, &decode] {
+            router
+                .worker_registry
+                .register_or_replace(Arc::clone(worker));
+        }
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+
+        let chat: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "m",
+            "max_tokens": 50,
+            "n": 2,
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .expect("valid chat request");
+        let response = router
+            .route_chat(None, &tenant, Arc::new(chat), UNKNOWN_MODEL_ID)
+            .await;
+        assert_eq!(response.status(), StatusCode::OK, "{decode_pick:?}");
+        // The decode side has ended once its answer is read whole and let go.
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await;
+        drop(body.expect("the decode's answer"));
+
+        let order = said.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        // How often a decision asks its scorer is the engine's own.
+        let words: Vec<&str> = order
+            .iter()
+            .map(String::as_str)
+            .filter(|word| *word != "scored")
+            .collect();
+        assert_eq!(words, told, "{decode_pick:?}");
+        assert_eq!((prefill.load(), decode.load()), (0, 0), "{decode_pick:?}");
+    }
+}

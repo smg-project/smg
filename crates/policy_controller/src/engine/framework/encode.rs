@@ -33,6 +33,11 @@
 //! member all the same. A gap is named by what the model takes, and a
 //! place says what this request may reach.
 
+#![expect(
+    clippy::exhaustive_structs,
+    reason = "a caller still builds or matches these types whole: each mark comes with its call"
+)]
+
 use super::{
     carries_a_column, column_fits, debug_assert_cells, debug_assert_indexed, reason_of,
     run_profile, shed, Buffers, ClassBits, Engine, PairPools, Plan, Profile, Scratch, Set,
@@ -47,6 +52,7 @@ use crate::{
         },
     },
     load::signals::{SignalCell, SignalCells},
+    policies::consistent_hashing::{Head, LentRing},
     Draw,
 };
 
@@ -60,13 +66,18 @@ mod tests;
 const ENCODERS: &str = "encoders";
 /// The stage named when the request holds pixels, an image or a video, and
 /// none of the registered encoders that would take it otherwise takes
-/// images.
-const ENCODE_VISION: &str = "encode-vision";
+/// images. A demand for vision the request states says this word too where
+/// it leaves no encoder
+/// ([`UnmetDemand::encoders_stage`](crate::engine::demands::UnmetDemand::encoders_stage)).
+pub(crate) const ENCODE_VISION: &str = "encode-vision";
 /// The stage named when no registered encoder hands to a prefill of a pair:
 /// a pushing encoder states no role, or no prefill states its end.
 const EC_COMPATIBLE: &str = "ec-compatible";
 /// The stage named when no registered encoder takes the request's media.
-const ENCODE_MEDIA: &str = "encode-media";
+/// A demand for media by reference the request states says this word too
+/// where it leaves no encoder
+/// ([`UnmetDemand::encoders_stage`](crate::engine::demands::UnmetDemand::encoders_stage)).
+pub(crate) const ENCODE_MEDIA: &str = "encode-media";
 /// The stage named when the decode must take images and no decode of a pair
 /// an encoder serves does.
 const DECODE_VISION: &str = "decode-vision";
@@ -81,10 +92,9 @@ const ENCODE_SCOPE: &str = "encode-scope";
 /// its host states it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct EncoderFacts {
-    /// The encoder's encode class; `0` when it states no end. The store
-    /// numbers the classes from 1 over the whole pool as their first
-    /// encoder stands, and a gateway's view keeps the numbers of its rows:
-    /// a class may stand above the count of the rows a decision is handed.
+    /// The encoder's encode class; `0` when it states no end. Its host
+    /// numbers the classes from 1 over the encoders it lends, as their
+    /// first encoder stands.
     pub class: u32,
     /// Its registration states the pushing form, with its role or without.
     pub pushes: bool,
@@ -114,17 +124,64 @@ pub struct EncodePool<'a> {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct EncodeItems<'a> {
     /// Each item's key, the caller's content hash. Empty for a request
-    /// without items.
+    /// without items. A key that carries its text ([`Identity::plain`]) is
+    /// placed by that text on a ring lent for the items ([`Self::ring`]).
     pub keys: &'a [Identity<'a>],
     /// The items taken as one: the caller's digest over them, opaque here.
     /// A class that pushes places it in the items' stead, so callers that
     /// share a fleet agree on it. `None` when each item is encoded on its
-    /// own.
+    /// own. A lent ring places it by its text, as it places an item's key.
     pub one: Option<Identity<'a>>,
     /// The items are references an encoder processes itself.
     pub references: bool,
     /// The decode of the pair must take images.
     pub decode_images: bool,
+    /// The hash ring the request's caller keeps of the model's workers,
+    /// lent for the items ([`LentRing`]): the ring a request is lent
+    /// ([`RequestFacts::ring`]), read here for the encoders. A key that
+    /// carries its text goes to the first encoder offered to it that this
+    /// ring's walk reaches from where that text stands, and a key the walk
+    /// hands to no offered encoder goes by the ring stage's rule for such
+    /// a place. So one content keeps the encoder the caller's own ring
+    /// gives it, whatever its request's routing value is.
+    ///
+    /// The encode profile's word says what the ring is asked, once a key:
+    /// where the text itself stands ([`LentRing::position`]) under a stage
+    /// that places a routing value by its own text, and where it stands
+    /// as a request's one head ([`LentRing::head_position`]) under the
+    /// prefix form, where a routing value leads its request's prompt.
+    /// Under any other encode profile the ring is asked nothing.
+    ///
+    /// A key with no text states no place, and neither does one whose
+    /// lender places no head: the stage's own ring places it by its
+    /// fingerprint, as with `None`. A controller is lent none. The one
+    /// call for a request writes here the ring that request states,
+    /// whatever its caller put: through that call a value stated here is
+    /// not read. In-process only.
+    pub ring: Option<&'a dyn LentRing>,
+}
+
+/// What a ring lent for the items is asked for a key's text, by the encode
+/// profile's word ([`EncodeItems::ring`]).
+#[derive(Clone, Copy)]
+enum Asked {
+    /// Where the text itself stands: under a stage that places a routing
+    /// value by its own text.
+    Text,
+    /// Where the text stands as a request's one head: under the prefix
+    /// form, where a routing value leads its request's prompt.
+    Head,
+}
+
+impl Asked {
+    /// Where `text` stands on `ring`: `None` from a lender that places no
+    /// head.
+    fn place(self, ring: &dyn LentRing, text: &str) -> Option<u64> {
+        match self {
+            Self::Text => Some(ring.position(text)),
+            Self::Head => ring.head_position(Head::Text(text)),
+        }
+    }
 }
 
 impl EncodeItems<'_> {
@@ -560,8 +617,12 @@ impl Engine {
     /// encoders of the chosen prefill's class that take the media, each
     /// item's key as the decision's key. Under a class that pushes, the one
     /// key is placed in the items' stead when the request carries it.
-    /// `placed` holds each placed key's encoder; a request without items
-    /// reads no encoder and places none.
+    /// A key that carries its text is stated its own place on the ring
+    /// lent for the items ([`EncodeItems::ring`]), and the profile's ring
+    /// stage places it where that ring's walk reaches among the encoders
+    /// offered: the place its request states on a lent ring places no
+    /// item. `placed` holds each placed key's encoder; a request without
+    /// items reads no encoder and places none.
     ///
     /// What this side cannot read truly is declined. A request with items
     /// names `encode-column` when a column of the encode pool is not one
@@ -595,8 +656,9 @@ impl Engine {
     /// the same. Where a list's places name workers and none of them takes
     /// the request, though a worker outside them does, the request is held
     /// off every worker that takes it: it is shed under the places' name
-    /// (`places`), which no gap says. A gap this pass reads is answered
-    /// ahead of every list's places: no other place closes it. What the
+    /// (`places`), which no gap says. A gap of the pairs' membership this
+    /// pass reads (`ec-compatible`, `decode-vision`) is answered ahead of
+    /// every list's places: no other place closes it. What the
     /// pair's own decision answers stays behind the pass, under places as
     /// under none. Places that name no worker of a list are no such case.
     /// Such places of a side shed the request as they shed its pair alone,
@@ -727,16 +789,14 @@ impl Engine {
         let encode_facts = RequestFacts {
             phase: Phase::Encode,
             affinity: encode.affinity,
-            // Lent counts are positions in another pool: the encode side
-            // takes none.
-            lent_in_flight: None,
             // The encoders' own cells: the request's would be read by
             // another pool's positions.
             signal_cells: encode.signal_cells,
             // The places stated on a lent ring are the request's routing
-            // value's, or its prompt's heads': an item is placed by its
-            // own key, so it takes no lent ring and the stage's own places
-            // it.
+            // value's, or its prompt's heads': no item is placed by them.
+            // A key's run is stated the key's own place, on the ring lent
+            // for the items, where that run is made below. The passes
+            // over the encoders ahead of it read no ring.
             ring: None,
             ring_positions: &[],
             // The word says how the request's own key came. An item's key
@@ -764,11 +824,10 @@ impl Engine {
                 .all(|f| f.keep(&encode_facts, row, encode_cx))
         };
         if needs {
-            // An encode class is numbered over the whole pool, and a view
-            // hands fewer rows than the pool holds: one bit a number up to
-            // the count of the rows handed, and a list for the numbers
-            // above it. No number is dropped and no set is wider than the
-            // fleet.
+            // A host states each encoder's class, and no class is held to
+            // the count of the rows handed: one bit a number up to that
+            // count, and a list for the numbers above it. No number is
+            // dropped and no set is wider than the fleet.
             let width = encode.encoders.len() + 1;
             side.open.reset(width);
             side.member.reset(width);
@@ -912,8 +971,8 @@ impl Engine {
         if items.decode_images && any_served && !any_vision {
             return gap(DECODE_VISION);
         }
-        // No gap this pass reads stands, and the encoders' places hold
-        // the request off every encoder that takes it.
+        // No gap of the pairs' membership stands, and the encoders' places
+        // hold the request off every encoder that takes it.
         if held_off {
             return gap(PLACES);
         }
@@ -1061,14 +1120,42 @@ impl Engine {
         let one = items.one.filter(|_| pushes);
         placed.one = one.is_some();
         let keys = one.as_ref().map_or(items.keys, std::slice::from_ref);
+        // What the ring lent for the items is asked for a key's text, by
+        // the encode profile's word: the engine's two questions of the
+        // profiles a request is placed by on a lent ring, asked of this
+        // profile alone. `None` with no ring lent and under a profile
+        // that places by neither: the lender is then asked nothing.
+        let lent = items.ring.and_then(|ring| {
+            let profile = (Some(usize::from(index)), None);
+            let asked = if self.key_place_of(profile) {
+                Asked::Text
+            } else {
+                self.head_rule_of(profile).map(|_| Asked::Head)?
+            };
+            Some((ring, asked))
+        });
         // Each key draws its own sequence, derived from the request's seed.
         let mut seeds = Draw::new(Draw::new(facts.seed).next_u64());
         for key in keys {
+            // Where the key's own text stands on that ring: one ask of
+            // the lender a key, kept here for the key's run. A key with
+            // no text states no place, and neither does one whose lender
+            // places no head: the stage's own ring places it.
+            let place = lent.and_then(|(ring, asked)| {
+                let at = asked.place(ring, key.plain?)?;
+                Some((ring, [at]))
+            });
+            let (ring, ring_positions): (_, &[u64]) = match &place {
+                Some((ring, at)) => (Some(*ring), at),
+                None => (None, &[]),
+            };
             let key_facts = RequestFacts {
                 session_key: *key,
                 seed: seeds.next_u64(),
                 affinity: &side.offered.affinity,
                 signal_cells: offered_cells,
+                ring,
+                ring_positions,
                 ..encode_facts
             };
             let of_key = run_profile(

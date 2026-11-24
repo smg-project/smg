@@ -40,6 +40,8 @@ mod tests {
         worker_host::{KvFeed, Members, MembershipWriter as _, Objects, Precondition, StoreDoor},
     };
 
+    mod load_streams;
+
     const MODEL: &str = "m";
     const FIRST: &str = "grpc://127.0.0.1:1";
     const SECOND: &str = "grpc://127.0.0.1:2";

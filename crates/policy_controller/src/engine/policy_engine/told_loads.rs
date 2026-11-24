@@ -9,7 +9,8 @@
 //! snapshot at hand. So a report told at the first snapshot that holds it
 //! is told before a decision can read it in the engine's snapshot. A report
 //! whose worker is told as joined behind that snapshot is told at the next
-//! one the task takes: a decision can read it first. A decision that runs
+//! one the task takes, or at the upkeep of a whole read that was put off
+//! (below): a decision can read it first. A decision that runs
 //! during a telling reads the snapshot before it, beside what the stages
 //! have kept of the new one so far. A request that gives a snapshot of its
 //! own ([`RequestMaker::loads`](crate::engine::RequestMaker::loads)) is
@@ -29,7 +30,10 @@
 //! of it, is told the worker's reports all the same. An engine handed no
 //! registry, or no channel, tells no report. A registry handed behind the
 //! channel is followed from the task's next upkeep, and its workers are
-//! told their reports at the first snapshot behind it.
+//! told their reports at the first snapshot behind it. A whole read that a
+//! panic of the host's own code put off to a later upkeep tells its workers
+//! the snapshot at hand at that upkeep: a channel's hand-over the earlier
+//! upkeep took was told ahead of the read.
 //!
 //! **Which reports.** The follow keeps, with each worker it holds, the
 //! sample instant of the report told last ([`Joined::told_at`]). A report is
@@ -53,10 +57,7 @@
 //! it ([`stated_report`]): the row at rest, its age left for a decision to
 //! state, and the sample's instant on the engine's decision clock. A worker
 //! object that stands for several ranks is told as its one record: the
-//! ranks' sum, under the rank its registration states. The slot of the
-//! worker's count is none
-//! ([`WorkerSlot::NONE`](crate::tracking::WorkerSlot::NONE)): this engine
-//! keeps no table of counts, and a worker's count is its object's.
+//! ranks' sum, under the rank its registration states.
 //!
 //! **Its named values.** Under a document a stage of which keeps a signal's
 //! column, the report is told with the values it states under the
@@ -81,8 +82,10 @@
 //! and nothing counts them. A report whose counts change under a sample
 //! instant that stands is not told again: the worker crate states one
 //! instant for a worker object's several ranks. The task tells at a
-//! snapshot alone: a worker told as joined behind the last snapshot of a
-//! channel that publishes no more is told no report. Of two workers held
+//! snapshot, and at the upkeep behind a whole read that was put off: a
+//! worker told as joined behind the last snapshot of a channel that
+//! publishes no more is told no report, unless such an upkeep tells the
+//! snapshot at hand. Of two workers held
 //! under one id, the one that stays when the other goes is told from its
 //! next new sample on: a report told ahead of the other's join is not told
 //! again.

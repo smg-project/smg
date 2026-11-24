@@ -4,7 +4,10 @@ use arc_swap::{ArcSwap, ArcSwapOption};
 use tokio::sync::mpsc;
 
 use super::{
-    basic::{BasicWorker, ConnectionMode, RuntimeType, WorkerMetadata, WorkerRuntime, WorkerType},
+    basic::{
+        running_window, BasicWorker, ConnectionMode, RuntimeType, WorkerMetadata, WorkerRuntime,
+        WorkerType,
+    },
     endpoint::Endpoint,
     metadata::DecodingLabels,
 };
@@ -447,6 +450,7 @@ impl<D: ConnectorDefault> BasicWorkerBuilder<D> {
             pd_pairing: PdPairing::derive(&self.spec),
             redacted_url: self.spec.redacted_url(),
             decoding: DecodingLabels::of(&self.spec),
+            running_window: running_window(&self.spec.labels),
             spec: Arc::new(self.spec),
             health_config,
             health_endpoint: self.health_endpoint,

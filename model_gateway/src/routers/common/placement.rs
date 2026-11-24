@@ -24,10 +24,10 @@ use smg_policy_controller::{
     document::DecodePick,
     engine::{
         DecisionEngine, LentList, PairAdmission, PairLists, Phase, PlaceRequest, PolicyEngine,
-        ShedReason, Unplaced, WorkerLists,
+        Unplaced, WorkerLists,
     },
     policies::consistent_hashing::LentRing,
-    tracking::{Placement, PlacementSide},
+    tracking::{Outcome, Placement, PlacementSide, SideEnd, TransportClass},
 };
 use smg_worker::{
     health::overload::{
@@ -144,8 +144,13 @@ pub(crate) type PairsAgain<'a> = &'a dyn Fn() -> Arc<PdPairIndex>;
 /// and makes it, as it reads a pair index again ([`PairsAgain`]): a classic
 /// placement reads none of it, and the call's own reads of the body are
 /// not made for one. A route's call takes what it reads by value (`move`),
-/// so that nothing of the request is kept in memory for it on the way to
-/// a classic placement.
+/// or borrows what its route holds until the placement answers in any
+/// case, as a stage holds its request: nothing of the request is kept in
+/// memory for the call on the way to a classic placement.
+///
+/// A pair's decode keeps what its request stated ([`Placed::stated`]): a
+/// route that holds the body no more states it again from that answer,
+/// where it asks the decode again and where it retries the request.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Stated {
     /// The most tokens the request's answer may hold, as its body states
@@ -387,10 +392,13 @@ pub(crate) struct Pair {
 }
 
 /// A selected prefill/decode pair as the pair placement answers it
-/// ([`select_pair`]): each worker as a [`Placed`]. A route makes each
-/// side's load guard from that side's answer, in the place it made one from
-/// the worker: the prefill's by [`Placed::guard`], and the decode's, which
-/// it makes ahead of the decode's send, by [`Placed::ahead`] with
+/// ([`select_pair`]): each worker as a [`Placed`]. A route holds each
+/// side's load in the place it held one before. The prefill's is a plain
+/// guard of its worker under the route's key, made where the prefill's
+/// load is acquired, ahead of its send: what the prefill's answer owes
+/// that send goes with the load ([`Placed::unsent`]) and is said where the
+/// prefill goes out ([`Unsent::sent`]). The decode's, which a route makes
+/// ahead of the decode's send, is made by [`Placed::ahead`] with
 /// [`Placed::sent`] at that send.
 ///
 /// Under the classic policies the two guards are the ones a route made
@@ -485,6 +493,84 @@ pub(crate) fn accepted_by(
     Some(passed.iter().chain(rest).cloned().collect())
 }
 
+/// A handle on one request's end, for whoever reads the request's answer:
+/// the reader reports the answer's status through it ([`Self::report`]),
+/// and may hold it past the request's load guard.
+///
+/// A route asks it of the guard ([`Self::of`]) and tests nothing of who
+/// placed the request. The handle is empty for a guard that keeps no side
+/// of the policy engine's: a classic guard, a guard made ahead of its send
+/// until that send hands it the side ([`Placed::ahead`] until
+/// [`Placed::sent`], the load of a pair's prefill until [`Unsent::sent`]),
+/// and a guard made of another ([`WorkerLoadGuard::replicate`]). It is
+/// empty too where no stage of the engine's document takes an outcome. An
+/// empty handle holds nothing, and a report through it says nothing.
+///
+/// Where the handle is not empty, the engine hears the request's end once
+/// the guard and every handle are gone: with the status last reported, or
+/// as it heard it before where nobody reported (a client that left).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct RequestEnd(SideEnd);
+
+impl RequestEnd {
+    /// The handle on the end of the request `guard` counts. A classic
+    /// guard pays one test of the word it keeps nothing in.
+    #[inline]
+    pub(crate) fn of(guard: &WorkerLoadGuard) -> Self {
+        match guard.kept() {
+            None => Self::default(),
+            Some(kept) => Self(kept_side_end(kept)),
+        }
+    }
+
+    /// The request ended with `status`, as the reader of its answer took
+    /// it. `answered` says whether the worker itself answered the request:
+    /// at a route's account, whether the answer carries the worker's mark
+    /// ([`super::attempt_ledger::UpstreamAnswer`]).
+    ///
+    /// The outcome is made behind the handle's test: an empty handle pays
+    /// that test, and nothing is asked or classed for it.
+    #[inline]
+    pub(crate) fn report(&self, status: u16, answered: impl FnOnce() -> bool) {
+        if !self.0.is_empty() {
+            reported(&self.0, status, answered());
+        }
+    }
+}
+
+/// [`RequestEnd::of`] for a guard that keeps something, out of line: a
+/// classic guard never comes here.
+#[inline(never)]
+fn kept_side_end(kept: &(dyn std::any::Any + Send + Sync)) -> SideEnd {
+    kept.downcast_ref::<PlacementSide>()
+        .map_or_else(SideEnd::default, PlacementSide::side_end)
+}
+
+/// [`RequestEnd::report`] through a handle a stage hears, out of line.
+#[inline(never)]
+fn reported(end: &SideEnd, status: u16, answered: bool) {
+    end.reported(Outcome::reported(status, transport_class(status, answered)));
+}
+
+/// The class of an end of `status`, the one mapping of the gateway: a
+/// status under 400 is a success, 408 and 504 a timeout, any other 4xx the
+/// client's error. A 5xx follows whether the worker answered the request.
+/// Where it did, the 5xx is the server's error, whoever wrote the status:
+/// the worker's own, or the 502 the Decisions adapter makes of an answer
+/// it cannot map. Where no answer of the worker stands, the 5xx is a
+/// failed connection. One refusal differs: the router's refusal of a
+/// worker's body over its limit carries no mark, on the Decisions route
+/// too, so it reads as a failed connection.
+fn transport_class(status: u16, answered: bool) -> TransportClass {
+    match status {
+        ..400 => TransportClass::Ok,
+        408 | 504 => TransportClass::Timeout,
+        400..500 => TransportClass::ClientError,
+        _ if answered => TransportClass::ServerError,
+        _ => TransportClass::ConnectFailed,
+    }
+}
+
 /// The worker a single-request placement picked, as the placement functions
 /// answer it: the request's worker, and what the request's load guard takes
 /// from the answer ([`Placed::guard`]).
@@ -498,8 +584,14 @@ pub(crate) fn accepted_by(
 /// request (`policy_controller: on`), the guard is counted under the routing
 /// value the engine names, and under the route's own key where it names
 /// none. It keeps the engine's placement to the request's end: the engine
-/// hears the dispatch where the guard is made and the end where the guard
-/// is dropped. It is told no outcome: the worker object has it.
+/// hears the dispatch where the guard is made, and the end where the guard
+/// and every handle on that end are gone. It is told the outcome where its
+/// route reports it ([`Placed::ended`], [`RequestEnd`]), and otherwise only
+/// that the request ended.
+///
+/// A pair's prefill is the one answer whose guard is made of its worker
+/// alone, ahead of its send and under the route's key: what the answer
+/// owes that send goes on apart from the worker ([`Placed::unsent`]).
 ///
 /// A classic answer is the worker's handle and one empty word: that word is
 /// all a classic placement pays for the engine's side of this type.
@@ -522,6 +614,12 @@ struct ByEngine {
     /// no guard took tells the engine a release where the answer is
     /// dropped.
     side: Mutex<Option<Box<PlacementSide>>>,
+    /// A handle on that side's end, kept from the send where the route
+    /// made its guard by [`Placed::guard_keeping_end`]: the answer reports
+    /// the request's outcome through it ([`Placed::ended`]) and lets it go
+    /// there. Empty before that send, behind the report, and for a route
+    /// that reports nothing through its answer.
+    end: Mutex<SideEnd>,
     /// The routing value the engine names for the request, which the guard
     /// counts it under. `None` where the engine names none: a value it
     /// keeps as a fingerprint alone, a document that reads no value. The
@@ -530,7 +628,9 @@ struct ByEngine {
     /// What the request stated for the engine alone at the decision that
     /// made this answer, kept by the answer of a pair's decode. Asked again
     /// behind its prefill, that decode states it again from here: its
-    /// route may hold the body no more by then.
+    /// route may hold the body no more by then. A retry of such a route
+    /// reads it too ([`Placed::stated`]), so the decode a request moved to
+    /// keeps what the first one kept.
     stated: Stated,
 }
 
@@ -582,6 +682,7 @@ impl Placed {
             worker,
             engine: Some(Box::new(ByEngine {
                 side: Mutex::new(side),
+                end: Mutex::default(),
                 routing_key,
                 // A single worker's answer is asked nothing again.
                 stated: Stated::nothing(),
@@ -603,6 +704,7 @@ impl Placed {
             worker,
             engine: Some(Box::new(ByEngine {
                 side: Mutex::new(Some(Box::new(side))),
+                end: Mutex::default(),
                 routing_key: routing_key.map(Box::from),
                 stated,
             })),
@@ -615,6 +717,19 @@ impl Placed {
     #[inline]
     pub(crate) fn worker(&self) -> &Arc<dyn Worker> {
         &self.worker
+    }
+
+    /// What the request stated for the policy engine alone ([`Stated`]) at
+    /// the decision that made this answer, where the answer is a pair's
+    /// decode the engine placed, or the decode such a request moved to.
+    /// Nothing for any other answer. A route whose retry holds the body no
+    /// more makes this call where the engine decides, off the answer of
+    /// the attempt before: a classic retry never makes it.
+    #[inline]
+    pub(crate) fn stated(&self) -> Stated {
+        self.engine
+            .as_ref()
+            .map_or_else(Stated::nothing, |engine| engine.stated)
     }
 
     /// The request's load guard on the placed worker: it raises the worker's
@@ -636,9 +751,28 @@ impl Placed {
         }
     }
 
+    /// [`Self::guard`] for a route that tells the request's outcome through
+    /// this answer ([`Self::ended`]): the answer keeps a handle on the
+    /// request's end from this send to its report. A classic answer keeps
+    /// nothing, and its guard is [`Self::guard`]'s.
+    ///
+    /// The end of a request waits for every handle on it. So an answer that
+    /// keeps one and outlives its guard holds that end back until it
+    /// reports or is dropped: a route that reports nothing through its
+    /// answer makes its guard by [`Self::guard`].
+    #[inline]
+    pub(crate) fn guard_keeping_end(&self, key: Option<&str>) -> WorkerLoadGuard {
+        let worker = Arc::clone(&self.worker);
+        match &self.engine {
+            None => WorkerLoadGuard::with_key(worker, key),
+            Some(engine) => engine.guard_keeping_end(worker, key),
+        }
+    }
+
     /// [`Self::guard`] for a caller that keeps nothing else of the answer:
     /// the worker's handle moves into the guard. The decision bench's routes
-    /// and tests call it. A route keeps its answer and calls [`Self::guard`].
+    /// and tests call it. A route keeps its answer and calls [`Self::guard`]
+    /// or [`Self::guard_keeping_end`].
     #[cfg(any(test, feature = "test-util"))]
     #[inline]
     pub(crate) fn into_guard(self, key: Option<&str>) -> WorkerLoadGuard {
@@ -694,6 +828,32 @@ impl Placed {
         self.engine.is_some()
     }
 
+    /// The request this answer placed ended with `status`, as the route
+    /// that keeps the answer takes it at its attempt's account. `answered`
+    /// says whether the answer carries the worker's mark
+    /// ([`super::attempt_ledger::UpstreamAnswer`]): it is asked only where
+    /// the policy engine hears the outcome. A classic answer pays the test
+    /// of its one empty word.
+    ///
+    /// It needs the guard made by [`Self::guard_keeping_end`]: behind any
+    /// other guard the answer keeps no handle, and this says nothing.
+    #[inline]
+    pub(crate) fn ended(&self, status: u16, answered: impl FnOnce() -> bool) {
+        if let Some(engine) = &self.engine {
+            engine.ended(status, answered);
+        }
+    }
+
+    /// This answer's worker, and what the answer still owes its send
+    /// ([`Unsent`]): for a pair's prefill, whose load is made ahead of its
+    /// send as a plain guard under the route's key, and whose handle goes
+    /// on behind that load. A move, with no test of the answer: a classic
+    /// answer owes nothing.
+    #[inline]
+    pub(crate) fn unsent(self) -> (Arc<dyn Worker>, Option<Unsent>) {
+        (self.worker, self.engine.map(Unsent))
+    }
+
     /// The worker alone, for a caller that sends it no request: a bench's
     /// placement, a test. An engine's side of the request is let go here,
     /// which the engine hears as a release. A route never calls this: it
@@ -707,7 +867,7 @@ impl Placed {
     /// The worker of an answer whose load guard was made: the engine's
     /// side of the request is the guard's by now, so the answer has nothing
     /// left to give up, and the worker's handle moves on with no count. For
-    /// a route that hands a pair's prefill on behind its guard. A debug
+    /// a route that hands a pair's decode on behind its guard. A debug
     /// build stops where the answer still holds its side: the request
     /// would go out under no guard of its own, and the engine would hear a
     /// release.
@@ -720,6 +880,32 @@ impl Placed {
             "a worker is handed on behind its guard"
         );
         self.worker
+    }
+}
+
+/// What is left of an answer's engine side when its worker's handle goes on
+/// ahead of the send ([`Placed::unsent`]): the engine's side of the request
+/// and the routing value the engine names. [`Self::sent`] says the send.
+/// Dropped unsent, it lets the side go, which the engine hears as a
+/// release.
+#[derive(Debug)]
+pub(crate) struct Unsent(Box<ByEngine>);
+
+impl Unsent {
+    /// The request went out under `guard`, a plain guard of the answer's
+    /// worker, made ahead of the send under its route's own key. The engine
+    /// hears the dispatch now, and the guard keeps the side, so the guard's
+    /// drop is the side's end. From here on the guard counts under the
+    /// routing value the engine names, where the engine names one: up to
+    /// the send the worker counted the request under the route's key. Out
+    /// of line: a classic answer leaves nothing unsent.
+    #[inline(never)]
+    pub(crate) fn sent(self, guard: WorkerLoadGuard) -> WorkerLoadGuard {
+        let guard = match self.0.routing_key.as_deref() {
+            Some(key) => guard.under_key(key),
+            None => guard,
+        };
+        self.0.sent(guard)
     }
 }
 
@@ -737,17 +923,46 @@ impl ByEngine {
         self.sent(WorkerLoadGuard::with_key(worker, self.key(key)))
     }
 
+    /// [`Self::guard`] with a handle on the request's end kept by the
+    /// answer ([`Placed::guard_keeping_end`]), out of line as it is.
+    #[inline(never)]
+    fn guard_keeping_end(&self, worker: Arc<dyn Worker>, key: Option<&str>) -> WorkerLoadGuard {
+        self.send(WorkerLoadGuard::with_key(worker, self.key(key)), true)
+    }
+
     /// The send of a request the policy engine placed, out of line as
-    /// [`Self::guard`] is: the first guard sent takes the engine's side of
-    /// the request and tells the engine the dispatch.
+    /// [`Self::guard`] is.
     #[inline(never)]
     fn sent(&self, guard: WorkerLoadGuard) -> WorkerLoadGuard {
+        self.send(guard, false)
+    }
+
+    /// The first guard sent takes the engine's side of the request and
+    /// tells the engine the dispatch. With `keeping_end` the answer keeps a
+    /// handle on that side's end, for its own report.
+    fn send(&self, guard: WorkerLoadGuard, keeping_end: bool) -> WorkerLoadGuard {
         match self.side.lock().take() {
             Some(mut side) => {
                 side.sent();
+                if keeping_end {
+                    *self.end.lock() = side.side_end();
+                }
                 guard.keeping(side)
             }
             None => guard,
+        }
+    }
+
+    /// [`Placed::ended`] for a request the policy engine placed, out of
+    /// line: a classic placement never comes here. The handle leaves the
+    /// answer with the report, so an answer that outlives its request
+    /// holds no end back. A side that never went out has no handle: it
+    /// ends as a release. The status is classed behind the handle's test.
+    #[inline(never)]
+    fn ended(&self, status: u16, answered: impl FnOnce() -> bool) {
+        let end = std::mem::take(&mut *self.end.lock());
+        if !end.is_empty() {
+            reported(&end, status, answered());
         }
     }
 
@@ -790,7 +1005,6 @@ impl ByEngine {
             &pairs,
             wire,
             None,
-            None,
             inputs,
             self.stated,
             |request| {
@@ -819,10 +1033,11 @@ impl ByEngine {
         debug!(decode = %worker.redacted_url(), "A pair's decode moved behind its prefill");
         let guard = ahead.onto(Arc::clone(&worker));
         // The decode the request moved to is asked nothing again: the
-        // engine decides a pair's decode again once, so its answer keeps
-        // nothing of what the request stated.
+        // engine decides a pair's decode again once. Its answer keeps what
+        // the request stated all the same, for a retry that states it
+        // again off the answer of the attempt before ([`Placed::stated`]).
         let routing_key = self.routing_key.as_deref();
-        let moved = Placed::by_side(worker, *side, routing_key, Stated::nothing());
+        let moved = Placed::by_side(worker, *side, routing_key, self.stated);
         (Some(moved), guard)
     }
 }
@@ -1011,6 +1226,15 @@ fn row_name(policies: &PolicyRegistry, side: Option<RowSide>, label: &'static st
 /// counts a request under. The name is read off the settings: no policy
 /// object is asked.
 ///
+/// Observes the match ratio a classic cache-aware selection observes of the
+/// worker it chose ([`Metrics::record_cache_aware_match_ratio`]): the share
+/// of the request's blocks the placement states its worker holds
+/// ([`Placement::overlap`]), a miss as zero. One observation a placement
+/// that states one, under any profile whose stages read who holds the
+/// prompt. A placement that states nothing observes nothing: a profile that
+/// reads no such row, a request the sessions rule placed and keeps from the
+/// profile, and a request that goes to a later target of its pick.
+///
 /// A traced request's decision record takes one row, as a classic
 /// selection's does ([`PolicyRegistry::select_worker_for_model`]): the
 /// list as it stands ahead of the engine's call, and the worker picked, or
@@ -1062,6 +1286,10 @@ fn placed_by_engine(
         model_id,
         counted_under,
     );
+    let (blocks, of) = (placement.overlap.blocks, placement.overlap.of);
+    if of != 0 {
+        Metrics::record_cache_aware_match_ratio(f64::from(blocks) / f64::from(of));
+    }
     let named = || row_name(policies, None, placement.profile);
     engine_row(seen, named, Some(&placement.worker));
     // A placement is moved whole only where the engine is owed the request's
@@ -2306,22 +2534,16 @@ impl PairAdmission for PairGates<'_> {
 ///
 /// What `inputs` and `stated` state of the request is handed as the engine
 /// reads it ([`place_request`]), the route's own rule among it, which the
-/// engine asks of the workers it picked. Four things are the pair's own:
+/// engine asks of the workers it picked and, behind a first decision that
+/// places nobody, of each pool. Three things are the pair's own:
 ///
 /// - A request pinned to a wire, as a retry is to its retained plan's,
 ///   states it as its demand ([`place_request`]): each pool states its
 ///   workers' wires, and the engine holds each side to the workers on the
 ///   request's. The lists stay the pools' own, and the wire states no
-///   place beside them.
-/// - A pair asked again behind a call that answered no worker, or that
-///   shed the request as saturated where the overload shed is off and a
-///   side has nobody the request may use and that is available, where the
-///   route's rule takes a pair that can be sent to, is held to the places
-///   of the workers `held_to` takes, that rule ([`pair_by_engine`]). A
-///   first ask states none, and neither does a decode asked again: its
-///   route's rule claims the decode it is asked of. A pinned pair asked
-///   again so is held to both: the engine judges its demand among the
-///   places stated.
+///   place beside them. A pinned pair the engine decides again among
+///   the workers its route's rule takes stays on its wire: the engine
+///   judges the demand among the places it holds a side to.
 /// - The retry number is stated as half the engines the request tried,
 ///   rounded up: a pair's failed attempt names both its engines.
 /// - The request states that its decode may be asked again behind its
@@ -2338,27 +2560,12 @@ fn with_pair_request<R>(
     model_id: &str,
     pairs: &PdPairIndex,
     wire: Option<WireConstraint>,
-    held_to: Option<CandidateFilter<'_>>,
     prefill_capacity: Option<&PrefillSelectionContext<'_>>,
     inputs: PlacementInputs<'_>,
     stated: Stated,
     ask: impl FnOnce(&mut PlaceRequest<'_>) -> R,
 ) -> R {
     let ([prefill, decode], classes) = pairs.lent();
-    // The places of the workers the route's rule takes, where the pair is
-    // asked again held to it. The wire is no part of them: a pinned request
-    // states it as its demand, and the engine judges that demand among the
-    // places a side is held to.
-    let held = |pool: &[Arc<dyn Worker>]| -> Option<Vec<u32>> {
-        held_to.map(|takes| {
-            (0u32..)
-                .zip(pool)
-                .filter(|(_, worker)| takes(worker.as_ref()))
-                .map(|(place, _)| place)
-                .collect()
-        })
-    };
-    let (prefill_places, decode_places) = (held(prefill.workers), held(decode.workers));
     let gates = PairGates {
         prefills: prefill.workers,
         decodes: decode.workers,
@@ -2369,10 +2576,11 @@ fn with_pair_request<R>(
         decode,
         classes,
         admission: &gates,
-        // A pinned request is held to its wire by its demand, a side at a
-        // time: the wire states no place of a list.
-        prefill_places: prefill_places.as_deref(),
-        decode_places: decode_places.as_deref(),
+        // No place of a list is stated. A pinned request is held to its
+        // wire by its demand, a side at a time, and the engine asks the
+        // route's rule of a list itself.
+        prefill_places: None,
+        decode_places: None,
         // The gateway's standing vetoes are on its worker objects, which
         // the engine reads: none is stated beside a list.
         prefill_stalled: &[],
@@ -2402,13 +2610,12 @@ fn with_pair_request<R>(
 
 /// [`select_pair`] where the gateway started the policy engine, out of
 /// line: the engine places the pair with one call, over the request
-/// [`with_pair_request`] states, and with one more, held to the route's
-/// rule, where that rule takes a pair that can be sent to and the first
-/// answers no worker, or sheds the request as saturated
-/// ([`ShedReason::Saturated`]) where the overload shed is off and a side
-/// has nobody the request may use and that is available. Its document
-/// picks both sides: no classic policy runs, and the load default of the
-/// classic pass pairs nobody here.
+/// [`with_pair_request`] states. Behind the call's first decision none of
+/// whose picks can be sent to, refused by the route's rule or not ready,
+/// or that sheds the request as saturated, the call asks a rule the route
+/// states of each pool, once, and decides again among the workers it
+/// takes. Its document picks both sides: no classic policy runs, and the
+/// load default of the classic pass pairs nobody here.
 ///
 /// Prefills all at the request's admission limit answer
 /// [`PlacementFailure::PrefillAtCapacity`], on which the route waits for a
@@ -2458,87 +2665,31 @@ fn pair_by_engine(
     let stated = stated();
     let fail =
         |role: WorkerRole, verdict: PlacementFailure| Box::new(PairFailure { role, verdict });
-    let admitted = |worker: &Arc<dyn Worker>| {
-        WireConstraint::admits(wire, worker.as_ref())
-            && inputs
-                .candidate_filter
-                .is_none_or(|accepts| accepts(worker.as_ref()))
-    };
-    let place = |held_to: Option<CandidateFilter<'_>>| {
-        with_pair_request(
-            engine,
-            registry,
-            policies,
-            model_id,
-            pairs,
-            wire,
-            held_to,
-            prefill_capacity,
-            inputs,
-            stated,
-            |request| {
-                engine.place(request).map(|placement| {
-                    let labels = (
-                        placement.profile,
-                        placement.decode_profile.unwrap_or(placement.profile),
-                    );
-                    (labels, PlacedPair::by_engine(placement, stated))
-                })
-            },
-        )
-    };
-    // The engine asks a pair's rule of its picks alone, a few a decision,
-    // which miss the workers a rule takes of a long pool: the pair is then
-    // decided once more among the workers the rule takes now, where it
-    // takes a prefill and a decode that prefill pairs with, each ready and
-    // let through by its circuit breaker: the overload veto and the liveness
-    // veto are the engine's to lift. Prefills of one descriptor share one
-    // partner list: the rule is asked of a list once.
-    let takes_a_pair = || {
-        let takes = |worker: &Arc<dyn Worker>| {
-            let state = worker.routing_state();
-            state.healthy && state.can_execute && admitted(worker)
-        };
-        let mut refused: Vec<&Arc<[Arc<dyn Worker>]>> = Vec::new();
-        for (prefill, partners) in pairs.prefill.iter().zip(&pairs.partners) {
-            if refused.iter().any(|&list| Arc::ptr_eq(list, partners)) || !takes(prefill) {
-                continue;
-            }
-            if partners.iter().any(takes) {
-                return true;
-            }
-            refused.push(partners);
-        }
-        false
-    };
-    let open = |pool: &[Arc<dyn Worker>]| pool.iter().any(|w| admitted(w) && w.is_available());
-    // The engine judges the overload steer over the pools it was handed: a
-    // worker under the thresholds that the rule refuses keeps it from a side
-    // whose workers the rule takes are all over them, and the call sheds the
-    // request. Where the gateway steers, that call is asked again the same
-    // way, as a classic pass steers a pool over the workers the rule takes.
-    let missed = |unplaced: &Unplaced| match unplaced {
-        Unplaced::NoWorkers => true,
-        Unplaced::Shed { reason, .. } => {
-            *reason == ShedReason::Saturated
-                && !registry.overload_shed_enabled()
-                && !(open(&pairs.prefill) && open(&pairs.decode_pool))
-        }
-        _ => false,
-    };
     let side_row = |side: RowSide, label| row_name(policies, Some(side), label);
     let prefill_seen = cache_trace::observe(&pairs.prefill_pool);
     let decode_seen = prefill_seen
         .as_ref()
         .and_then(|_| cache_trace::observe(&pairs.decode_pool));
-    let placed = match place(None) {
-        Err(unplaced)
-            if inputs.candidate_filter.is_some() && missed(&unplaced) && takes_a_pair() =>
-        {
-            place(inputs.candidate_filter)
-        }
-        placed => placed,
-    };
+    let placed = with_pair_request(
+        engine,
+        registry,
+        policies,
+        model_id,
+        pairs,
+        wire,
+        prefill_capacity,
+        inputs,
+        stated,
+        |request| {
+            engine.place(request).map(|placement| {
+                let labels = (
+                    placement.profile,
+                    placement.decode_profile.unwrap_or(placement.profile),
+                );
+                (labels, PlacedPair::by_engine(placement, stated))
+            })
+        },
+    );
     let (labels, pair) = match placed {
         Ok(placed) => placed,
         Err(Unplaced::PrefillsFull) => {
@@ -2549,6 +2700,14 @@ fn pair_by_engine(
         }
         Err(unplaced) => {
             report_unplaced(model_id, &unplaced, "The policy engine placed no pair");
+            let admitted = |worker: &Arc<dyn Worker>| {
+                WireConstraint::admits(wire, worker.as_ref())
+                    && inputs
+                        .candidate_filter
+                        .is_none_or(|accepts| accepts(worker.as_ref()))
+            };
+            let open =
+                |pool: &[Arc<dyn Worker>]| pool.iter().any(|w| admitted(w) && w.is_available());
             let (role, pool) = if open(&pairs.prefill) {
                 engine_row(decode_seen, || side_row(DECODE_ROW, ""), None);
                 (WorkerRole::Decode, &pairs.decode_pool)
@@ -3046,7 +3205,9 @@ pub(crate) mod tests {
         worker::{HealthCheckConfig, WorkerStatus},
     };
     use smg_policy_controller::{
-        document::{AppliedSpec, DecodePick, KeySourceSpec, PolicySpec, RoutingKeySpec},
+        document::{
+            AppliedSpec, DecodePick, KeySourceSpec, OverloadSpec, PolicySpec, RoutingKeySpec,
+        },
         engine::{Candidate, Decision, RequestFacts, Scorer, Target, TieBand},
         stages::{Lifecycle, StageRegistry},
         tracking::{EventSet, Lease, Outcome, ReleaseReason, Side},
@@ -6985,7 +7146,13 @@ pub(crate) mod tests {
         }
 
         fn on_completed(&self, _: &Lease, outcome: &Outcome) {
-            self.note(format!("completed {:?}", outcome.class));
+            // An end nobody reported states no status, and is noted by its
+            // class alone.
+            let status = match outcome.status {
+                0 => String::new(),
+                status => format!(" {status}"),
+            };
+            self.note(format!("completed {:?}{status}", outcome.class));
         }
 
         fn on_released(&self, _: &Lease, reason: ReleaseReason) {
@@ -7081,6 +7248,158 @@ pub(crate) mod tests {
             ["issued", "dispatched Single", "completed Cancelled"],
             "the end is told at the guard's drop, with no outcome"
         );
+    }
+
+    /// A handle on a request's end is asked of the guard that keeps the
+    /// engine's side: a classic guard's is empty, and so is one made ahead
+    /// of its send until the send hands it the side. An empty handle asks
+    /// nothing of its reporter.
+    #[test]
+    fn a_requests_end_is_asked_of_the_guard_that_keeps_its_side() {
+        let registry = http_registry(&["http://h:1"]);
+        let classic = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let placed = answered(&registry, &classic, PlacementInputs::default());
+        let guard = placed.guard(None);
+        let end = RequestEnd::of(&guard);
+        assert!(end.0.is_empty(), "a classic guard keeps nothing");
+        end.report(200, || panic!("nothing is asked for a classic guard"));
+        placed.ended(200, || panic!("nothing is asked for a classic answer"));
+        drop((guard, placed));
+
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let heard = hearing_engine_on(&policies);
+        let placed = answered(&registry, &policies, PlacementInputs::default());
+        let ahead = placed.ahead(None);
+        assert!(
+            RequestEnd::of(&ahead).0.is_empty(),
+            "a guard made ahead keeps no side yet"
+        );
+        let sent = placed.sent(ahead);
+        let end = RequestEnd::of(&sent);
+        assert!(!end.0.is_empty(), "the sent guard keeps the side");
+        drop(placed);
+        drop(sent);
+        assert_eq!(
+            *heard.lock().expect("the stage heard"),
+            ["issued", "dispatched Single"],
+            "the end waits for the handle"
+        );
+        end.report(502, || false);
+        drop(end);
+        assert_eq!(
+            *heard.lock().expect("the stage heard"),
+            ["issued", "dispatched Single", "completed ConnectFailed 502"]
+        );
+    }
+
+    /// An answer reports its request's end once and lets its handle go
+    /// there: the end is heard at the guard's drop while the answer still
+    /// stands, with the status reported, and a second report says nothing.
+    #[test]
+    fn an_answer_reports_its_requests_end_and_lets_its_handle_go() {
+        let registry = http_registry(&["http://h:1"]);
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let heard = hearing_engine_on(&policies);
+        let said = || heard.lock().expect("the stage heard").clone();
+
+        let placed = answered(&registry, &policies, PlacementInputs::default());
+        let guard = placed.guard_keeping_end(None);
+        placed.ended(500, || true);
+        assert_eq!(
+            said(),
+            ["issued", "dispatched Single"],
+            "the guard still stands"
+        );
+        drop(guard);
+        assert_eq!(
+            said(),
+            ["issued", "dispatched Single", "completed ServerError 500"],
+            "the answer holds no end back behind its report"
+        );
+        placed.ended(200, || panic!("the answer's handle is gone"));
+        drop(placed);
+        assert_eq!(said().len(), 3, "one end a request");
+    }
+
+    /// An answer keeps a handle on its request's end only where its route
+    /// made the guard by the keeping call. Behind [`Placed::guard`] it holds
+    /// no end back, and a report through it says nothing.
+    #[test]
+    fn an_answer_keeps_no_handle_behind_a_plain_guard() {
+        let registry = http_registry(&["http://h:1"]);
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let heard = hearing_engine_on(&policies);
+
+        let placed = answered(&registry, &policies, PlacementInputs::default());
+        let guard = placed.guard(None);
+        placed.ended(200, || panic!("the answer keeps no handle"));
+        drop(guard);
+        assert_eq!(
+            *heard.lock().expect("the stage heard"),
+            ["issued", "dispatched Single", "completed Cancelled"],
+            "the end is told at the guard's drop, while the answer stands"
+        );
+        drop(placed);
+    }
+
+    /// Through the answer only a sent request is reported: an answer whose
+    /// guard was never made has no handle, and its drop is a release.
+    #[test]
+    fn an_answer_that_was_never_sent_reports_nothing() {
+        let registry = http_registry(&["http://h:1"]);
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let heard = hearing_engine_on(&policies);
+
+        let placed = answered(&registry, &policies, PlacementInputs::default());
+        placed.ended(502, || panic!("an unsent request has no end to report"));
+        drop(placed);
+        assert_eq!(
+            *heard.lock().expect("the stage heard"),
+            ["issued", "released Abandoned"]
+        );
+    }
+
+    /// Under a stock document, none of whose stages takes an end, nothing is
+    /// asked or classed for a report, through the answer or through the guard.
+    #[test]
+    fn nothing_is_classed_where_no_stage_takes_an_end() {
+        let registry = http_registry(&["http://h:1"]);
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        preset_on(&policies, "round_robin");
+
+        let placed = answered(&registry, &policies, PlacementInputs::default());
+        let guard = placed.guard_keeping_end(None);
+        RequestEnd::of(&guard).report(200, || panic!("no stage takes this end"));
+        placed.ended(200, || panic!("no stage takes this end"));
+    }
+
+    /// The gateway's one mapping of a status to a class: under 400 a
+    /// success, 408 and 504 a timeout, any other 4xx the client's error, and
+    /// a 5xx the server's error where the worker answered the request, a
+    /// failed connection where it did not.
+    #[test]
+    fn a_status_is_classed_by_one_mapping() {
+        for (status, answered, class) in [
+            (200, true, TransportClass::Ok),
+            (204, false, TransportClass::Ok),
+            (399, true, TransportClass::Ok),
+            (400, true, TransportClass::ClientError),
+            (408, true, TransportClass::Timeout),
+            (429, true, TransportClass::ClientError),
+            (499, false, TransportClass::ClientError),
+            (500, true, TransportClass::ServerError),
+            (500, false, TransportClass::ConnectFailed),
+            (502, false, TransportClass::ConnectFailed),
+            (503, true, TransportClass::ServerError),
+            (504, true, TransportClass::Timeout),
+            (504, false, TransportClass::Timeout),
+        ] {
+            assert_eq!(
+                transport_class(status, answered),
+                class,
+                "{status}, answered by the worker: {answered}"
+            );
+        }
     }
 
     /// An answer of the engine that no guard was made from gives its lease
@@ -8658,6 +8977,86 @@ pub(crate) mod tests {
         }
     }
 
+    /// While the policy engine decides, a single request's placement
+    /// observes the match ratio a classic cache-aware selection observes of
+    /// the worker it chose: the share of the request's blocks the engine's
+    /// placement states its worker holds. A prompt's first request reads a
+    /// miss, and its next request, which goes back to its worker, reads
+    /// every block: a prompt held as text and one held as token ids read
+    /// the same. Under a document whose stages read no prompt's holder the
+    /// series stays silent, as it is under a classic policy that is not
+    /// cache-aware. No classic policy object is made or asked.
+    #[test]
+    fn a_request_the_engine_places_observes_its_match_ratio() {
+        use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
+
+        use crate::{
+            config::RouterConfig, observability::metrics::CACHE_AWARE_MATCH_RATIO_BUCKETS,
+        };
+
+        const SERIES: &str = "smg_cache_aware_match_ratio";
+        let observed = |policy: PolicyConfig, inputs: PlacementInputs<'_>| {
+            let recorder = PrometheusBuilder::new()
+                .set_buckets_for_metric(
+                    Matcher::Full(String::from(SERIES)),
+                    CACHE_AWARE_MATCH_RATIO_BUCKETS,
+                )
+                .expect("the series' buckets")
+                .build_recorder();
+            let handle = recorder.handle();
+            let registry = http_registry(&["http://h:1", "http://h:2", "http://h:3"]);
+            let settings = RouterConfig {
+                policy,
+                ..Default::default()
+            };
+            let policies = PolicyRegistry::for_policy_engine(
+                settings.policy.clone(),
+                settings.routing_key_override.clone(),
+            );
+            let document = settings.policy_document().expect("the settings' document");
+            let spec = AppliedSpec::validate(&document);
+            engine_on(&policies, spec.expect("a valid document"));
+            let went_back = metrics::with_local_recorder(&recorder, || {
+                let first = pick(&registry, &policies, inputs);
+                pick(&registry, &policies, inputs).url() == first.url()
+            });
+            assert_eq!(policies.classic_made_or_asked(), 0);
+            let rendered = handle.render();
+            let lines = rendered.lines().filter(|line| line.starts_with(SERIES));
+            (went_back, lines.map(str::to_owned).collect::<Vec<_>>())
+        };
+        let text = "the words of one prompt, said twice. ".repeat(8);
+        let tokens: Vec<u32> = (0..512).collect();
+        let as_text = PlacementInputs {
+            text: Some(&text),
+            ..Default::default()
+        };
+        let as_tokens = PlacementInputs {
+            tokens: Some(&tokens),
+            ..Default::default()
+        };
+        for inputs in [as_text, as_tokens] {
+            let cache_aware = PolicyConfig::cache_aware(0.5, 32, 1.1, 0, 4096);
+            let (went_back, cache_aware) = observed(cache_aware, inputs);
+            assert!(went_back, "the prompt's next request goes to its worker");
+            for series in [
+                "smg_cache_aware_match_ratio_bucket{le=\"0\"} 1",
+                "smg_cache_aware_match_ratio_bucket{le=\"0.9\"} 1",
+                "smg_cache_aware_match_ratio_bucket{le=\"1\"} 2",
+                "smg_cache_aware_match_ratio_sum 1",
+                "smg_cache_aware_match_ratio_count 2",
+            ] {
+                assert!(
+                    cache_aware.iter().any(|line| line == series),
+                    "missing {series} in {cache_aware:#?}"
+                );
+            }
+        }
+        let (went_back, round_robin) = observed(PolicyConfig::RoundRobin, as_text);
+        assert!(!went_back, "the list's turn moves on");
+        assert_eq!(round_robin, Vec::<String>::new());
+    }
+
     // ---- a traced request under the policy engine --------------------------------------------
 
     /// One row of a decision record as these cases read it: its policy, its
@@ -8966,6 +9365,24 @@ pub(crate) mod tests {
         heard
     }
 
+    /// Hands `policies` an engine under the stock pair document, with a
+    /// request's routing value read from the body's own id, which the
+    /// engine keeps in the clear: the engine names that value for a pair.
+    pub(crate) fn keyed_pairs_on(policies: &PolicyRegistry) {
+        let document = PolicySpec::pair_presets("round_robin", "round_robin");
+        let mut document = document.expect("the pair presets");
+        document.generation = 1;
+        document.bindings[0].routing_key = Some(RoutingKeySpec {
+            sources: vec![KeySourceSpec {
+                rid: true,
+                ..KeySourceSpec::default()
+            }],
+            strip_lineage: false,
+        });
+        let spec = AppliedSpec::validate(&document);
+        engine_on(policies, spec.expect("a valid document"));
+    }
+
     /// With an engine handed to the registry the pair placement asks it,
     /// and the engine hears each side of the pair by that side's own guard.
     /// The prefill's guard says its dispatch where it is made. The decode's
@@ -9180,14 +9597,13 @@ pub(crate) mod tests {
         );
     }
 
-    /// A route's rule that takes one worker of each pool finds that pair.
-    /// The engine's call names twelve pairs at most, four a decision: where
-    /// none of them holds the rule's two workers, the pair is decided once
-    /// more among the workers the rule takes, a stalled prefill or decode
-    /// among them. That ask answers as a first one does: with the rule's
-    /// prefill at its admission limit the request waits for a slot. A rule
-    /// whose decode is not ready takes no second ask: the first answer
-    /// stands.
+    /// A route's rule that takes one worker of each pool finds that pair,
+    /// by the engine's one call. Where a decision's picks miss the rule's
+    /// two workers, the call asks the rule of each pool and decides again
+    /// among the workers it takes, a stalled prefill or decode among
+    /// them. That decision answers as any does: with the rule's prefill at
+    /// its admission limit the request waits for a slot, and with the
+    /// rule's decode not ready the decode side has nobody.
     #[test]
     fn the_engines_pair_finds_the_one_decode_its_routes_rule_takes() {
         let grpc = ConnectionMode::Grpc;
@@ -9285,17 +9701,32 @@ pub(crate) mod tests {
         engine_on(&policies, spec.expect("a valid document"));
         let d1 = registry.get_by_url("grpc://d:1").expect("registered");
         registry.set_worker_overloaded(&d1, true);
-        let pairs = pairs_of(&registry, &policies);
-        // A pair for a request whose rule refuses the one worker at `refused`.
-        let pick = |refused: &str, limit: Option<&PrefillSelectionContext<'_>>| {
+        // A gateway that sheds an overloaded pool says so in its document,
+        // and its engine decides under that word.
+        let shedding = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let mut sheds = PolicySpec::pair_presets("round_robin", "round_robin").expect("presets");
+        sheds.bindings[0].overload = Some(OverloadSpec {
+            shed_when_all_vetoed: true,
+            ..OverloadSpec::default()
+        });
+        engine_on(
+            &shedding,
+            AppliedSpec::validate(&sheds).expect("a valid document"),
+        );
+        // A pair under `policies` for a request whose rule refuses the one
+        // worker at `refused`.
+        let pick = |policies: &PolicyRegistry,
+                    refused: &str,
+                    limit: Option<&PrefillSelectionContext<'_>>| {
             let takes = |worker: &dyn Worker| worker.url() != refused;
             let inputs = PlacementInputs {
                 candidate_filter: Some(&takes),
                 ..Default::default()
             };
+            let pairs = pairs_of(&registry, policies);
             select_pair(
                 &registry,
-                &policies,
+                policies,
                 MODEL,
                 &pairs,
                 None,
@@ -9304,12 +9735,12 @@ pub(crate) mod tests {
                 Stated::nothing,
             )
         };
-        let steered = pick("grpc://d:2", None).ok();
+        let steered = pick(&policies, "grpc://d:2", None).ok();
         let decode = steered.map(|pair| pair.decode.url().to_owned());
         assert_eq!(decode.as_deref(), Some("grpc://d:1"));
 
         registry.set_overload_shed(true);
-        let shed = pick("grpc://d:2", None).err();
+        let shed = pick(&shedding, "grpc://d:2", None).err();
         let shed = shed.map(|failure| failure.verdict);
         assert!(matches!(shed, Some(PlacementFailure::AllOverloaded(_))));
         registry.set_overload_shed(false);
@@ -9320,7 +9751,7 @@ pub(crate) mod tests {
         let runtime = tokio::runtime::Builder::new_current_thread().build();
         let mut failure = None;
         let asked = admission.admit(None, |limit: &PrefillSelectionContext<'_>| {
-            failure = pick("grpc://p:2", Some(limit)).err();
+            failure = pick(&policies, "grpc://p:2", Some(limit)).err();
             PrefillAdmissionAttempt::<()>::Unavailable
         });
         assert!(runtime.expect("a runtime").block_on(asked).is_err());
@@ -9331,11 +9762,12 @@ pub(crate) mod tests {
     /// A pinned pair asked again under its route's rule is held to both at
     /// once: to the workers the rule takes, and among them to those on its
     /// wire. The rule takes one prefill and one decode on the request's
-    /// wire, past the pairs a first ask names, and one of each on another
-    /// wire, which stand first in their pools. The second ask states the
-    /// places of the four and the wire as the request's demand, and the
-    /// engine answers the pair on the wire, as classic does. Held to the
-    /// places alone it would be free to answer the pair off the wire.
+    /// wire, past the pairs a first decision names, and one of each on
+    /// another wire, which stand first in their pools. The engine's call
+    /// asks the rule of each pool and decides again among the four, the
+    /// wire still the request's demand, and answers the pair on the wire,
+    /// as classic does. Held to the places alone it would be free to
+    /// answer the pair off the wire.
     #[test]
     fn a_pinned_pair_asked_again_is_held_to_its_wire_and_to_its_routes_rule() {
         let grpc = ConnectionMode::Grpc;
@@ -9659,6 +10091,59 @@ pub(crate) mod tests {
 
         let (_moved, guard) = asked_again(&registry, &policies, None, &pair, ahead);
         assert_eq!(said()[3..5], ["limit 64", "issued"]);
+        drop(guard);
+    }
+
+    /// A pair's decode keeps what its request stated, for a retry whose
+    /// route holds the body no more: the answer of the first decision keeps
+    /// it, and so does the answer of the decode the request moved to behind
+    /// its prefill. The prefill's answer keeps nothing, and neither answer
+    /// of a classic pair does.
+    #[test]
+    fn a_pairs_decode_keeps_what_its_request_stated_through_a_move() {
+        let stated = || Stated {
+            max_output_tokens: 64,
+        };
+        let fleet = || {
+            pd_registry(&[
+                ("grpc://p:1", WorkerType::Prefill, Some("NixlConnector")),
+                ("grpc://d:1", WorkerType::Decode, Some("NixlConnector")),
+                ("grpc://d:2", WorkerType::Decode, Some("NixlConnector")),
+            ])
+        };
+        let inputs = PlacementInputs::default();
+
+        // A classic pair: no answer keeps anything.
+        let registry = fleet();
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let pairs = pairs_of(&registry, &policies);
+        let pair = select_pair(
+            &registry, &policies, MODEL, &pairs, None, None, inputs, stated,
+        );
+        let pair = pair.expect("a classic pair");
+        assert_eq!(pair.prefill.stated(), Stated::nothing());
+        assert_eq!(pair.decode.stated(), Stated::nothing());
+
+        // The engine's pair: the decode's answer keeps it.
+        let registry = fleet();
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let _heard = hearing_pairs_on(&policies, true);
+        let pairs = pairs_of(&registry, &policies);
+        let pair = select_pair(
+            &registry, &policies, MODEL, &pairs, None, None, inputs, stated,
+        );
+        let pair = pair.expect("the engine places the pair");
+        assert_eq!(pair.prefill.stated(), Stated::nothing());
+        assert_eq!(pair.decode.stated(), stated());
+
+        // The decode the request moves to keeps it too.
+        drop(pair.prefill.guard(None));
+        let ahead = pair.decode.ahead(None);
+        pair.decode.worker().set_status(WorkerStatus::NotReady);
+        let (moved, guard) = asked_again(&registry, &policies, None, &pair, ahead);
+        let moved = moved.expect("the decode moved");
+        assert_ne!(moved.url(), pair.decode.url());
+        assert_eq!(moved.stated(), stated());
         drop(guard);
     }
 

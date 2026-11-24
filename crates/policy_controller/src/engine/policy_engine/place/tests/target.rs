@@ -1,13 +1,14 @@
-//! The cases of a single request that names its worker.
+//! The cases of a single request that names its worker. A pair's stand
+//! with the pair's cases ([`super::pair`]).
 
 use super::*;
 use crate::policies::consistent_hashing::target_source;
 
 /// The header the stock hash ring document names as its target source.
-const TARGET: &str = "x-smg-target-worker";
+pub(super) const TARGET: &str = "x-smg-target-worker";
 
 /// The shed of a request whose named worker cannot take it.
-const MISSED: Unplaced = Unplaced::Shed {
+pub(super) const MISSED: Unplaced = Unplaced::Shed {
     reason: ShedReason::NoEndpoints,
     emptied_by: "target-worker",
     retry_after_secs: 1,
@@ -17,7 +18,7 @@ const MISSED: Unplaced = Unplaced::Shed {
 /// as its block's last source. A binding that named no block is given the
 /// routing key header as its one source of a key first: a target source
 /// is no block alone.
-fn names_target(document: &mut PolicySpec) {
+pub(super) fn names_target(document: &mut PolicySpec) {
     let keyed = || RoutingKeySpec {
         sources: vec![KeySourceSpec {
             header: Some(MANUAL_SESSION_HEADER.to_owned()),
@@ -38,13 +39,13 @@ fn naming(name: &str) -> &'static PolicyEngine {
 }
 
 /// A request's headers that count how often the target header is read.
-struct Counted<'a> {
+pub(super) struct Counted<'a> {
     carried: &'a [(&'a str, &'a str)],
-    reads: Cell<u32>,
+    pub(super) reads: Cell<u32>,
 }
 
 impl<'a> Counted<'a> {
-    fn of(carried: &'a [(&'a str, &'a str)]) -> Self {
+    pub(super) fn of(carried: &'a [(&'a str, &'a str)]) -> Self {
         let reads = Cell::new(0);
         Self { carried, reads }
     }
@@ -572,41 +573,5 @@ fn the_target_header_is_read_once_a_call_and_only_where_the_document_names_it() 
         assert!(!unnamed.spec().names_target(), "{name}");
         let (read, placed) = reads(unnamed, &[(TARGET, "8")]);
         assert_eq!((read, placed.is_ok()), (0, true), "{name}");
-    }
-}
-
-/// A pair's request is not read for a target: under the stock pair of two
-/// hash rings, whose binding names the target source, a pair that carries
-/// the header is placed on the workers its routing value owns, as it is
-/// without the header, and the header is never read.
-///
-/// The classic router reads the header once a side, each side's policy
-/// over its own workers
-/// (`model_gateway/src/routers/common/placement.rs:2519`, `:2540`,
-/// `:2616`): the engine does not yet.
-#[test]
-fn a_pairs_request_is_not_read_for_a_target() {
-    let document = PolicySpec::pair_presets("consistent_hashing", "consistent_hashing");
-    let engine = hosted(engine_of(&document.expect("the pair presets")));
-    assert!(engine.spec().names_target());
-    let list = pool(2);
-    let members = PublishedList::new(Arc::clone(&list));
-    let classes = PartnerClasses::number(2, [&[0_u32, 1][..], &[0, 1][..]]);
-    let placed = |carried: &[(&str, &str)]| {
-        let headers = Counted::of(carried);
-        let request = PlaceRequest {
-            headers: &headers,
-            ..PlaceRequest::of(MODEL, WorkerLists::Pair(pair_of(&members, &classes)))
-        };
-        let placement = engine.place(&request).expect("a placement");
-        let decode = placement.decode.as_deref().map(worker_id);
-        (headers.reads.get(), placement.id(), decode)
-    };
-    for key in ["talk-1", "talk-2", "talk-3", "talk-4"] {
-        let (_, prefill, decode) = placed(&[(MANUAL_SESSION_HEADER, key)]);
-        for named in ["0", "1", "7"] {
-            let with = placed(&[(MANUAL_SESSION_HEADER, key), (TARGET, named)]);
-            assert_eq!(with, (0, prefill, decode), "{key}, names {named}");
-        }
     }
 }

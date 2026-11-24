@@ -50,6 +50,7 @@ pub struct CreditedDispatches {
 /// are. The pair is closed: a further number goes on
 /// [`CreditedDispatches`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[expect(clippy::exhaustive_structs, reason = "the pair is closed: see its doc")]
 pub struct DispatchCounts {
     /// The number of sends.
     pub requests: u32,

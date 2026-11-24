@@ -14,7 +14,10 @@ use smg_worker::{
 };
 
 use crate::{
-    document::spec::{AppliedSpec, PolicySpec},
+    document::{
+        spec::{AppliedSpec, PolicySpec},
+        Assignment,
+    },
     engine::{
         decision::Decision,
         decision_engine::{DecideOutcome, DecisionEngine, Request, RequestMaker, WorkerLists},
@@ -498,6 +501,38 @@ fn a_sessions_pin_stands_across_a_new_document() {
     assert_eq!(targets(&followed), [(pinned.position, pinned.id)]);
 }
 
+/// A dispatch said behind a new document, for a decision the document
+/// before made, is told to the session table: the table is the engine's,
+/// and it heard that decision's claim. The key follows its pin under the
+/// new document, whose profile has another text: it kept no stage.
+#[test]
+fn a_dispatch_said_behind_a_new_document_pins_its_session() {
+    let engine = preset("manual");
+    let list = pool(16);
+    let members = PublishedList::new(Arc::clone(&list));
+    let now = Instant::now();
+    let asks = keyed(41, &members);
+    let mut first =
+        DecisionGuard::decide_under(&engine, GatewayId::LOCAL, &asks, now).expect("a decision");
+    let sent_to = first.take(0).expect("the first target");
+
+    let mut next = PolicySpec::preset("manual").expect("a built-in preset");
+    next.generation = 2;
+    let profile = next.profiles.get_mut("manual");
+    profile.expect("the preset's profile").filter.reverse();
+    let next = AppliedSpec::validate(&next).expect("the document validates");
+    engine.apply(next).expect("a number above the standing one");
+    first.dispatched(now);
+    first.completed(&served(sent_to.id), now);
+    drop(first);
+
+    let followed = decided(&engine, &asks).decision;
+    let pick = followed.pick().expect("a pick");
+    assert_eq!(pick.trace.generation, 2, "under the new document");
+    assert_eq!(pick.session_verdict, SessionVerdict::Pinned);
+    assert_eq!(targets(&followed), [(sent_to.position, sent_to.id)]);
+}
+
 /// The engine's own pass drops the session keys past their end, off the
 /// path of a request: a pin made at a dispatch is held through the rule's
 /// idle time and gone after it.
@@ -682,4 +717,98 @@ fn keyed_decisions_reach_all_four_live_workers_after_two_thousand_replacements()
         reached[place] = true;
     }
     assert_eq!(reached, [true; 4], "each live worker owns a key");
+}
+
+/// Under a sessions rule that leaves a new key to a profile that takes
+/// turns, a key with no pin is placed by the list's next turn, as a request
+/// with no key is, and the turn's worker is claimed for it: the decision
+/// writes the records of the workers the turn asks about, with no pass over
+/// the list. The key's next request follows the claim and takes no turn. A
+/// turn that lands on a worker that is not ready is the whole pass's, as it
+/// is for a request with no key: that pass places the key on another
+/// worker and claims that one, and the list has turned once. A new key
+/// over a list with no ready worker is shed and turns nothing. Over a list
+/// that names one worker twice the whole pass places a new key.
+#[test]
+fn a_key_with_no_pin_takes_the_lists_turn_and_claims_its_worker() {
+    let mut document = PolicySpec::preset("manual").expect("a built-in preset");
+    let turns = PolicySpec::preset("round_robin").expect("a built-in preset");
+    document.profiles = turns.profiles;
+    let binding = &mut document.bindings[0];
+    binding.profile = Some("round_robin".into());
+    binding
+        .sessions
+        .as_mut()
+        .expect("the stock rule")
+        .assignment = Assignment::Delegate;
+    document.generation = 1;
+    let engine =
+        PolicyEngine::new(AppliedSpec::validate(&document).expect("the document validates"));
+    let list = pool(16);
+    let members = PublishedList::new(Arc::clone(&list));
+    let ask = |key: u64| decided(&engine, &keyed(key, &members)).decision;
+    let places = |decision: &Decision| -> Vec<u32> {
+        targets(decision).iter().map(|target| target.0).collect()
+    };
+    // The workers a turn at `from` hands out over a list that is all ready.
+    let turned = |from: u32| -> Vec<u32> { (0..4).map(|step| (from + step) % 16).collect() };
+
+    let plain = ask(0);
+    let start = places(&plain)[0];
+    assert_eq!(places(&plain), turned(start));
+
+    let new = ask(41);
+    let pick = new.pick().expect("a pick");
+    assert_eq!(places(&new), turned(start + 1), "the list's next turn");
+    let claimed = targets(&new)[0];
+    assert_eq!(pick.session_verdict, SessionVerdict::Claimed(claimed.1));
+    assert!(pick.trace.drew_first(), "no pass over the list ran");
+
+    let followed = ask(41);
+    let pick = followed.pick().expect("a pick");
+    assert_eq!(pick.session_verdict, SessionVerdict::Pinned);
+    assert_eq!(targets(&followed), [claimed]);
+    assert_eq!(
+        places(&ask(0)),
+        turned(start + 2),
+        "a followed claim turns nothing"
+    );
+
+    let down = (start + 3) % 16;
+    list[down as usize].set_status(WorkerStatus::NotReady);
+    let widened = ask(42);
+    let pick = widened.pick().expect("a pick");
+    assert!(!pick.trace.drew_first(), "the whole pass places the key");
+    let placed = targets(&widened)[0];
+    assert_ne!(placed.0, down);
+    assert_eq!(pick.session_verdict, SessionVerdict::Claimed(placed.1));
+    assert_eq!(targets(&ask(42)), [placed]);
+    assert_eq!(
+        places(&ask(0))[0],
+        (start + 4) % 16,
+        "the key's request turned once"
+    );
+
+    for worker in list.iter() {
+        worker.set_status(WorkerStatus::NotReady);
+    }
+    assert!(ask(43).pick().is_none(), "no worker is ready");
+    for worker in list.iter() {
+        worker.set_status(WorkerStatus::Ready);
+    }
+    assert_eq!(
+        places(&ask(0))[0],
+        (start + 5) % 16,
+        "a key that is shed turns nothing"
+    );
+
+    let twice: Arc<[Arc<dyn Worker>]> = list.iter().chain([&list[0]]).cloned().collect();
+    let twice = PublishedList::new(twice);
+    let passed = decided(&engine, &keyed(44, &twice)).decision;
+    let pick = passed.pick().expect("a pick");
+    assert!(!pick.trace.drew_first(), "the whole pass places the key");
+    assert_eq!(
+        pick.session_verdict,
+        SessionVerdict::Claimed(targets(&passed)[0].1)
+    );
 }

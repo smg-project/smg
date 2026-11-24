@@ -22,7 +22,7 @@ use std::{
 };
 
 use axum::{routing::get, Router};
-use engines::mock_engine;
+use engines::polled_engine;
 use net::{http_get, loopback, vm_rss_kib};
 use openai_protocol::worker::RuntimeType;
 use rcgen::{
@@ -51,6 +51,7 @@ use smg_policy_controller::{
     },
     tracking::{Lease, LeaseId},
 };
+use smg_worker::health::overload::OverloadThresholds;
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::{mpsc, oneshot},
@@ -90,6 +91,7 @@ fn config() -> Config {
         shutdown_settle: Duration::from_millis(100),
         shutdown_grace: Duration::from_secs(5),
         load_poll_interval: Config::DEFAULT_LOAD_POLL_INTERVAL,
+        worker_overload: Config::DEFAULT_WORKER_OVERLOAD,
         decide_shards: 2,
         election: ElectionConfig::default(),
         discovery: None,
@@ -1793,15 +1795,16 @@ fn series(page: &str, name: &str) -> Option<u64> {
 
 /// The serve runs the load monitor while the replica leads, and the admin
 /// page's load series read the monitor's counts. A worker on a connection
-/// is polled and a worker with a gauge page alone is read over HTTP. The
-/// monitor publishes a report of each. The second's states its page's
-/// gauges, over the queue bound its row states: one overload verdict moves,
-/// once. The store holds no load row: the serve writes none.
+/// that serves no stream of its load records is polled, and a worker with
+/// a gauge page alone is read over HTTP. The monitor publishes a report of
+/// each. The second's states its page's gauges, over the queue bound its
+/// row states: one overload verdict moves, once. The store holds no load
+/// row: the serve writes none.
 #[tokio::test]
 async fn the_serve_runs_the_load_monitor_and_renders_its_counts() {
     const PATIENCE: Duration = Duration::from_secs(30);
 
-    let (addr, _engine) = mock_engine(1).await.expect("a mock engine");
+    let (addr, _engine) = polled_engine(1).await.expect("a mock engine");
     let (read, _server) = metrics_server(METRICS_TEXT)
         .await
         .expect("a metrics server");
@@ -1870,4 +1873,118 @@ async fn the_serve_runs_the_load_monitor_and_renders_its_counts() {
     };
     let (served, ()) = tokio::join!(serve, probe);
     served.expect("a clean stop");
+}
+
+/// A metrics body of the first gauge family that reads over both of a
+/// start's default thresholds: nine requests waiting, nine tenths of the KV
+/// cache in use.
+const BUSY_METRICS_TEXT: &str = "vllm:num_requests_running{model_name=\"m\"} 3\n\
+                                 vllm:num_requests_waiting{model_name=\"m\"} 9\n\
+                                 vllm:kv_cache_usage_perc{model_name=\"m\"} 0.9\n";
+
+/// A start states the two overload thresholds that a worker with none of
+/// its own is judged by. One worker's page reads 5 queued requests and a
+/// usage of 0.75, and its row states no threshold. A controller started
+/// with a count of 4 vetoes it, and so does one started with a usage of
+/// 0.7: each beside the other signal's default, and each alone. Under the
+/// thresholds a start states by default, 8 queued requests and a usage of
+/// 0.8, no verdict moves. A signal a start states none for has no default:
+/// under a start that states neither, no verdict moves for a worker with no
+/// threshold of its own whose page reads 9 queued requests and a usage of
+/// 0.9.
+#[tokio::test]
+async fn a_start_states_the_overload_thresholds_a_worker_with_none_is_judged_by() {
+    const PATIENCE: Duration = Duration::from_secs(30);
+
+    let (calm, _calm) = metrics_server(METRICS_TEXT)
+        .await
+        .expect("a metrics server");
+    let (busy, _busy) = metrics_server(BUSY_METRICS_TEXT)
+        .await
+        .expect("a metrics server");
+    let stating = |waiting_requests, token_usage| OverloadThresholds {
+        waiting_requests,
+        token_usage,
+    };
+    let stock = Config::DEFAULT_WORKER_OVERLOAD;
+    let starts = [
+        (&calm, (5, 0.75), stating(Some(4), stock.token_usage), true),
+        (
+            &calm,
+            (5, 0.75),
+            stating(stock.waiting_requests, Some(0.7)),
+            true,
+        ),
+        (&calm, (5, 0.75), stock, false),
+        (&calm, (5, 0.75), stating(Some(4), None), true),
+        (&calm, (5, 0.75), stating(None, Some(0.7)), true),
+        (&busy, (9, 0.9), stating(None, None), false),
+    ];
+    for (worker, (queued, used), worker_overload, vetoed) in starts {
+        let controller = Controller::bind(Config {
+            load_poll_interval: Duration::from_secs(1),
+            worker_overload,
+            ..config()
+        })
+        .await
+        .expect("the controller binds");
+        let admin = controller.addresses().admin;
+        let (store, loads) = (controller.store(), controller.loads());
+        ready_row(&store, worker, WireModes::HTTP, None).expect("the read row");
+        let (stop, stopped) = oneshot::channel::<()>();
+        let serve = controller.serve(async {
+            let _ = stopped.await;
+        });
+        let probe = async {
+            let started = Instant::now();
+            let page = loop {
+                let read = timeout(PATIENCE, http_get(admin, "/metrics"));
+                let (status, page) = read
+                    .await
+                    .expect("the page answers inside the patience")
+                    .expect("the metrics page");
+                assert_eq!(status, 200);
+                let reported = loads.borrow().report(worker).is_some();
+                // Two reads of the worker's page are counted: the first
+                // one's report is judged by then.
+                let read_twice =
+                    series(&page, "load_scrapes_total").is_some_and(|count| count >= 2);
+                // A verdict that stands has moved an odd number of times:
+                // once, and twice more where a read of the worker's page
+                // failed between two good ones. The failed read lifts the
+                // verdict and the next good one sets it again.
+                let stands =
+                    series(&page, "overload_flips_total").is_some_and(|flips| flips % 2 == 1);
+                if reported && read_twice && (stands || !vetoed) {
+                    break page;
+                }
+                assert!(
+                    started.elapsed() < PATIENCE,
+                    "{worker_overload:?} vetoes a worker at {queued} and {used}: {page}"
+                );
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            };
+            let stated = loads
+                .borrow()
+                .report(worker)
+                .map(|(report, _)| (report.total_waiting_reqs(), report.effective_kv_pressure()));
+            assert!(
+                stated.is_some_and(
+                    |(waiting, usage)| waiting == queued && (usage - used).abs() < 1e-6
+                ),
+                "the report states the page's gauges: {stated:?}"
+            );
+            if !vetoed {
+                // No failed read moves a verdict that never stood.
+                assert_eq!(
+                    series(&page, "overload_flips_total"),
+                    Some(0),
+                    "{worker_overload:?} at {queued} and {used}: {page}"
+                );
+            }
+            stop.send(()).expect("the serve is listening for the stop");
+        };
+        let (served, ()) = tokio::join!(serve, probe);
+        served.expect("a clean stop");
+    }
 }

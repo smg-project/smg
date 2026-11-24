@@ -718,12 +718,11 @@ impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
     /// lease's events in their order. That dispatch carries the
     /// completion's instant, so a stage that times a request from its
     /// dispatch reads a span of zero for it. On a pair's handle a decode
-    /// outcome ends the decode side. An encode outcome is said whole
-    /// there and ends no side, since the lease holds none such: what the
-    /// handle owes stands.
+    /// outcome ends the decode side. An encode outcome there is said to
+    /// nobody: the pair's lease holds no such side and no stage hears
+    /// one, so the handle says nothing and what it owes stands.
     /// Any other outcome ends the handle's own side, and a single's lease
-    /// ends under any side its host names. A side's end is said once. An
-    /// encode outcome on a pair's handle is said at each call.
+    /// ends under any side its host names. A side's end is said once.
     pub fn completed(&mut self, outcome: &Outcome, now: Instant) {
         let pair = self.decided.pair();
         let owed = match outcome.side {
@@ -731,20 +730,9 @@ impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
                 self.dispatched_decode(now);
                 &mut self.decode
             }
-            // A side the pair's lease does not hold: the completion is said
-            // whole, as a served controller says such a frame. The file ends
-            // no side of the lease.
-            Side::Encode if pair => {
-                if let Some(leased) = self.decided.lease {
-                    self.say(
-                        leased.lease.id,
-                        outcome.side,
-                        Said::Completed(*outcome),
-                        now,
-                    );
-                }
-                return;
-            }
+            // A side the pair's lease does not hold: no file ends a side
+            // for it and no stage hears it, so nothing is said.
+            Side::Encode if pair => return,
             Side::Single | Side::Prefill | Side::Decode | Side::Encode => {
                 self.dispatched(now);
                 &mut self.owed
@@ -1168,9 +1156,14 @@ mod tests {
         assert_eq!(size_of::<DecisionGuard<&PolicyEngine>>(), HELD);
         // A placement is the handle and what its host reads of the answer:
         // two worker pointers, the routing key, the profile's label, the
-        // label of a pair's decode side and one pointer to an encode
-        // request's encoders.
-        assert_eq!(size_of::<crate::tracking::Placement<'_>>(), HELD + 88);
+        // label of a pair's decode side, one pointer to an encode request's
+        // encoders, and what its pick states of the worker taken: six
+        // bytes, in a word of their own.
+        assert_eq!(size_of::<crate::tracking::Placement<'_>>(), HELD + 96);
+        // A host boxes a single request's side once, and that side is its
+        // placement with three words of its own: the box stays within the
+        // 640 bytes of the allocation class it had.
+        assert!(size_of::<crate::tracking::PlacementSide>() <= 640);
         // The lease the handle keeps states its request's text's two
         // lengths beside its token count: eight bytes more, the handle's
         // too. The second length sits in the padding the first left. The
@@ -1913,7 +1906,7 @@ mod tests {
         }
 
         #[tokio::test(start_paused = true)]
-        async fn a_linked_pair_reports_each_side_and_keeps_its_encode_outcome() {
+        async fn a_linked_pair_reports_each_side_and_sends_no_encode_outcome() {
             let mut peer = Peer::new(1);
             let now = Instant::now();
             let mut handle = answered(&mut peer, paired(), now)
@@ -1954,7 +1947,6 @@ mod tests {
                 &mut peer,
                 [
                     pair_dispatch(proto::Side::Prefill, 0, 100),
-                    pair_completion(proto::Side::Encode, 47),
                     pair_completion(proto::Side::Prefill, 28),
                     pair_dispatch(proto::Side::Decode, 1, 200),
                     pair_completion(proto::Side::Decode, 49),

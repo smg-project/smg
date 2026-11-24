@@ -27,6 +27,7 @@ pub(crate) fn profile() -> ProfileSpec {
 
 /// The first survivor, as the host lists them.
 #[derive(Debug)]
+#[expect(clippy::exhaustive_structs, reason = "no field: its name is its value")]
 pub struct Passthrough;
 
 impl Lifecycle for Passthrough {}

@@ -260,11 +260,13 @@ fn every_field_of_a_frame_reaches_the_request_its_maker_makes() {
     assert_eq!(facts.media, media);
     assert_eq!((facts.seed, facts.block_size), (24, 25));
     assert_eq!(facts.client_key, 29);
+    // The frame says its id handed the key, and the request says so.
+    assert!(facts.session_key_from_rid);
     // The frame's budget of 2,000 is not what the engine is told is left,
     // and the decision's instant is the engine's to write.
     assert_eq!((facts.budget_micros, facts.now_micros), (1_500, 0));
     assert!(facts.affinity.is_empty() && facts.named.is_none());
-    assert!(facts.lent_in_flight.is_none() && facts.signal_cells.is_none());
+    assert!(facts.signal_cells.is_none());
     // The frame carries its model's name and no fingerprint of it: each
     // read of the request's session fingerprints the name.
     assert_eq!(facts.model_fingerprint, ModelFingerprint::NONE);

@@ -36,8 +36,8 @@
 //! leaves nobody sheds the pair with no endpoint, under the stage of the
 //! demand that took that side's last worker, the prefills' first. The
 //! decode asked again judges its decodes alone. An encode request's three
-//! lists are held to no demand: such a request is shed under the wires'
-//! name.
+//! lists are held a list at a time too, its pair's two by this rule
+//! ([`PairLists::sides_meeting`], [`super::encode`]).
 //!
 //! **The words.** A side is told its issue once: with the prefill's
 //! ([`issue_caught`]), or, where its decode is sent later, at the decode
@@ -81,6 +81,11 @@
 //! convert writes its own into a buffer of the calling thread, and where
 //! both sides do, the second side's are allocated.
 
+#![expect(
+    clippy::exhaustive_structs,
+    reason = "a caller still builds or matches these types whole: each mark comes with its call"
+)]
+
 use std::{
     cell::RefCell,
     fmt,
@@ -103,7 +108,7 @@ use crate::{
         records::{vetoes, HeldCells, Live, PoolRecords},
         view::{
             AffinityFacts, Candidate, Constraints, Phase, PoolFacts, RequestFacts, Role, Session,
-            WorkerId,
+            SessionCountedUnder, WorkerId,
         },
     },
     stages::Lifecycle,
@@ -296,6 +301,40 @@ impl<'a> PairLists<'a> {
         ]
     }
 
+    /// [`Self::sides_of`] for a request that states a hard demand: each
+    /// side held to the places of its list whose worker meets `demands` as
+    /// that side's role is held to it, among the places its host states
+    /// ([`Beside::meeting`]). `kept` takes the places, the prefills' first.
+    /// `Err` names the demand that left a side nobody, the prefills'
+    /// first. An encode request's decision judges its pair's two lists
+    /// here, so a side is held one way under a pair's decision and under
+    /// its.
+    pub(super) fn sides_meeting<'s>(
+        &self,
+        cx: &Constraints<'s>,
+        demands: Demands,
+        (prefill, decode): (&PoolRecords, &PoolRecords),
+        [prefill_kept, decode_kept]: [&'s mut Vec<u32>; 2],
+    ) -> Result<[Constraints<'s>; 2], UnmetDemand>
+    where
+        'a: 's,
+    {
+        let side = |places, stalled, held| Beside {
+            places,
+            stalled,
+            held,
+            unmet: None,
+        };
+        let prefills = side(self.prefill_places, self.prefill_stalled, self.prefill_held);
+        let prefills = prefills.meeting(prefill, demands.held_by(Role::Prefill), prefill_kept);
+        let decodes = side(self.decode_places, self.decode_stalled, self.decode_held);
+        let decodes = decodes.meeting(decode, demands.held_by(Role::Decode), decode_kept);
+        match prefills.unmet.or(decodes.unmet) {
+            Some(unmet) => Err(unmet),
+            None => Ok([prefills.of(cx), decodes.of(cx)]),
+        }
+    }
+
     /// One decision for a pair at `now`, over records written for it from
     /// both lists' worker objects and from `loads`, the host's snapshot of
     /// its workers' reports, with each record's pair class and its side's
@@ -365,35 +404,24 @@ impl<'a> PairLists<'a> {
         request: &mut Request<'_>,
         held: Option<&Target>,
     ) -> Decision {
-        self.decide_sides(engine, sides, loads, now, request, held, true, |_| true)
+        let counted = SessionCountedUnder::default;
+        self.decide_sides(engine, sides, loads, now, request, held, |_| true, counted)
     }
 
-    /// A pair's first decision with a hard demand its request states left
-    /// to the records' decision, which sheds it ([`not_decided`]): what an
-    /// encode request's entry asks for a request its three lists do not
-    /// decide. Those lists are held to no demand.
-    pub(super) fn decide_unjudged(
-        &self,
-        engine: Loaded<'_, '_>,
-        sides: (&PoolMembers, &PoolMembers),
-        loads: Option<&Arc<LoadSnapshot>>,
-        now: Instant,
-        request: &mut Request<'_>,
-    ) -> Decision {
-        self.decide_sides(engine, sides, loads, now, request, None, false, |_| true)
-    }
-
-    /// [`Self::decide_over`], and whether a hard demand the request states
-    /// is `judged` over the two lists: each side is then held to the
-    /// places whose worker meets it, and the records' decision is handed
-    /// none. `sends_to` says whether the request's caller sends it to a
-    /// target of the pick ([`RequestMaker::sends_to`]): each side's record
-    /// of sent prefixes is written for the first target it takes.
+    /// [`Self::decide_over`], and where the request's caller sends it:
+    /// `sends_to` says whether it sends to a target of the pick
+    /// ([`RequestMaker::sends_to`]), and each side's record of sent
+    /// prefixes is written for the first target it takes. `counted` says
+    /// where a worker's object counts the requests of the request's
+    /// session key ([`RequestMaker::session_counted_under`]): it is asked
+    /// under a document that reads the count and under no other, and the
+    /// entry above, which holds no maker, answers the key's own text.
     ///
     /// [`RequestMaker::sends_to`]: crate::engine::RequestMaker::sends_to
+    /// [`RequestMaker::session_counted_under`]: crate::engine::RequestMaker::session_counted_under
     #[expect(
         clippy::too_many_arguments,
-        reason = "a pair's decision over its two lists, and how it reads a demand"
+        reason = "a pair's decision over its two lists, and where its caller sends it"
     )]
     fn decide_sides(
         &self,
@@ -403,18 +431,39 @@ impl<'a> PairLists<'a> {
         now: Instant,
         request: &mut Request<'_>,
         held: Option<&Target>,
-        judged: bool,
         sends_to: impl Fn(&Target) -> bool,
+        counted: impl FnOnce() -> SessionCountedUnder,
     ) -> Decision {
         let (spec, clock) = (&engine.document.spec, &engine.clock);
         // The engine as the fill of a side's column takes it: the name
         // stands for the document's engine inside the decision below.
         let loaded = engine;
+        // The name each side's records read the count of the key's
+        // requests under, on a worker's object: the one its side's session
+        // is counted under, as the request's maker states it. One text
+        // names both sides where the key's own text is the name, and a
+        // session's number is each side's own. Named under a document that
+        // reads the count and under no other.
+        let mut names;
+        let [prefill_key, decode_key] = if spec.engine().needs().session_in_flight {
+            names = [[0; Session::TEXT_LEN]; 2];
+            let (counted, [prefill, decode]) = (counted(), &mut names);
+            let side = |phase| RequestFacts {
+                phase,
+                ..request.facts
+            };
+            [
+                counted.name(&side(Phase::Prefill), prefill),
+                counted.name(&side(Phase::Decode), decode),
+            ]
+        } else {
+            [None; 2]
+        };
         // One value for both lists' records: this call's instant on the
-        // clock and the host's snapshot, as the host holds it. No session
-        // key's text is handed to it: a pair's records carry no count of a
-        // key's requests.
-        let live = Live::at(spec.engine(), clock, now, loads, None);
+        // clock and the host's snapshot, as the host holds it. The
+        // decodes' records read the key's count under their own name.
+        let live = Live::at(spec.engine(), clock, now, loads, prefill_key);
+        let decode_live = live.counted_under(decode_key);
         request.facts.now_micros = live.now_micros();
         request.facts.budget_micros = super::budget::shown(request.facts.budget_micros);
         let (facts, cx) = (&request.facts, &request.constraints);
@@ -460,7 +509,7 @@ impl<'a> PairLists<'a> {
                 None => prefill_records.write(workers, &live, prefills),
             };
             let (workers, decode_records) = (decode.workers(), decode.records(spec, clock));
-            let (decodes, decode_facts) = decode_records.write(workers, &live, decodes);
+            let (decodes, decode_facts) = decode_records.write(workers, &decode_live, decodes);
             // A host that counts the request on its first decode
             // ([`Constraints::counted_on_decode`]) is answered over that
             // decode's record without the request. The decode is read at
@@ -475,6 +524,10 @@ impl<'a> PairLists<'a> {
                     .or_else(|| decodes.iter().position(is_first));
                 if let Some(row) = place.and_then(|place| decodes.get_mut(place)) {
                     row.in_flight = row.in_flight.saturating_sub(1);
+                    // The host's count of the request there is under its
+                    // key too: a capped rule reads the key's other
+                    // requests, as a first decision does.
+                    row.session_in_flight = row.session_in_flight.saturating_sub(1);
                 }
             }
             stamp(prefills, decodes, self.classes, self.admission);
@@ -485,8 +538,9 @@ impl<'a> PairLists<'a> {
             // decision is handed the places and no demand. The decode
             // asked again judges no prefill: the held one ran already.
             let spent;
-            let (cx, prefill_side, decode_side) = if judged && !cx.demands.is_none() {
-                let [prefill_kept, decode_kept] = &mut buffers.meeting;
+            let demanded = !cx.demands.is_none();
+            let (cx, prefill_side, decode_side) = if demanded {
+                let [prefill_kept, decode_kept, _] = &mut buffers.meeting;
                 let demands = cx.demands;
                 let prefill_side = match held {
                     None => {
@@ -712,8 +766,9 @@ fn held_prefill<'a, 'f>(
 /// prefills' first, and the engine's scratch. An encode request's decision
 /// keeps its encoders' records here too ([`super::encode`]): a pair's
 /// leaves them as they were. A pair that states a hard demand keeps each
-/// side's places that meet it here, the prefills' first: such a request
-/// allocates nothing once each list has grown to its side.
+/// side's places that meet it here, the prefills' first, and an encode
+/// request its encoders' in the third list: such a request allocates
+/// nothing once each list has grown to its side.
 /// A side whose phase reads who holds the prompt keeps its list's column
 /// here, the prefills' first.
 #[derive(Debug, Default)]
@@ -721,7 +776,7 @@ pub(super) struct Buffers {
     pub(super) rows: [Vec<Candidate>; 2],
     pub(super) encoders: Vec<Candidate>,
     pub(super) scratch: Scratch,
-    meeting: [Vec<u32>; 2],
+    pub(super) meeting: [Vec<u32>; 3],
     pub(super) columns: [Vec<AffinityFacts>; 2],
 }
 
@@ -760,8 +815,8 @@ pub(super) fn stamp(
 /// not narrowed by, and the stage it is shed under: a subset hint, a hard
 /// demand, or places of its list. A pair's records keep no demand fact. A
 /// pair's own decision judges a demand ahead of them, a side at a time
-/// ([`PairLists::decide`]), and hands them none. A demand that reaches
-/// them is an encode request's, whose three lists are held to none: it is
+/// ([`PairLists::decide`]), and hands them none, and so does an encode
+/// request's. A demand that reaches them was judged by no decision: it is
 /// shed, and the request is never placed past its demand. A hint of some
 /// records is declined: no stage here takes a part of a list. So are
 /// places the request states itself ([`single::PLACES`]): one set cannot
@@ -1028,23 +1083,24 @@ fn decode_side(facts: &RequestFacts<'_>, decision: &Decision, prefill: &Lease) -
     })
 }
 
-/// [`issue_decode`] for the decode call of `own`, dated at the call, under
-/// a catch of its own ([`PolicyEngine::word_caught`]). A stage that panics
-/// at the side's issue is held and counted, as at a later word of the
-/// lease, and the stages behind it do not hear the issue. The pick stands:
-/// the call answers the side's lease all the same, so its guard holds the
-/// side as issued and tells its dispatch and its end. A stage that heard
-/// the issue then hears the side end.
+/// [`issue_decode`] for the decode call of `own`, told to `engine`'s
+/// stages and dated at the call, under a catch of its own
+/// ([`PolicyEngine::word_caught`]). A stage that panics at the side's
+/// issue is held and counted, as at a later word of the lease, and the
+/// stages behind it do not hear the issue. The pick stands: the call
+/// answers the side's lease all the same, so its guard holds the side as
+/// issued and tells its dispatch and its end. A stage that heard the issue
+/// then hears the side end.
 ///
 /// A panic in the decision itself is not held here: it costs the call its
 /// decision, as a first decision's does.
 fn issue_decode_caught(
     own: Loaded<'_, '_>,
+    engine: &Engine,
     facts: &RequestFacts<'_>,
     decision: &Decision,
     prefill: &Lease,
 ) -> Option<Lease> {
-    let engine = own.document.spec.engine();
     let told = own.word_caught(|| issue_decode(engine, facts, decision, prefill, facts.now_micros));
     told.unwrap_or_else(|| decode_side(facts, decision, prefill))
 }
@@ -1068,8 +1124,18 @@ fn issue_decode_caught(
 /// for the first decode it takes. The entry its first decision wrote, for
 /// the decode chosen then, stands beside it.
 ///
+/// `counted` says where a worker's object counts the requests of the
+/// request's session key ([`RequestMaker::session_counted_under`]). It is
+/// asked under a document one of whose stages reads that count, and each
+/// side's records then read it under the name of the side's own session.
+///
 /// [`RequestMaker::sends_to`]: crate::engine::RequestMaker::sends_to
+/// [`RequestMaker::session_counted_under`]: crate::engine::RequestMaker::session_counted_under
 #[inline]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a pair's decision as its host takes it, and its maker's two words"
+)]
 pub(super) fn decide(
     own: Loaded<'_, '_>,
     lists: &PairLists<'_>,
@@ -1078,6 +1144,7 @@ pub(super) fn decide(
     loads: Option<&Arc<LoadSnapshot>>,
     now: Instant,
     sends_to: impl Fn(&Target) -> bool,
+    counted: impl FnOnce() -> SessionCountedUnder,
 ) -> Decision {
     // The engine's own value of each list, asked of the list's cell once.
     let sides = (own.members_of(lists.prefill), own.members_of(lists.decode));
@@ -1086,7 +1153,7 @@ pub(super) fn decide(
     if !wires.is_empty() && !wires.contains(dialed) {
         return single::declined(own, request, WIRES);
     }
-    lists.decide_sides(own, sides, loads, now, request, target, true, sends_to)
+    lists.decide_sides(own, sides, loads, now, request, target, sends_to, counted)
 }
 
 /// One decision of a pair by `own`, the engine of a gateway's own process,
@@ -1096,8 +1163,12 @@ pub(super) fn decide(
 /// With the view of the guard that holds the first it is the decode asked
 /// again behind the prefill that view names. The decision reads the
 /// reports in `loads`: the snapshot the request gives for this call, or
-/// the newest the engine's own task keeps at hand. `sends_to` is handed
-/// to [`decide`] as it stands.
+/// the newest the engine's own task keeps at hand. `sends_to` and `counted`
+/// are handed to [`decide`] as they stand.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a pair's decision as its host takes it, and its maker's two words"
+)]
 pub(super) fn decided(
     own: Loaded<'_, '_>,
     lists: &PairLists<'_>,
@@ -1106,9 +1177,10 @@ pub(super) fn decided(
     loads: Option<&Arc<LoadSnapshot>>,
     now: Instant,
     sends_to: impl Fn(&Target) -> bool,
+    counted: impl FnOnce() -> SessionCountedUnder,
 ) -> DecideOutcome {
     let target = held.map(|held| held.target);
-    let decision = decide(own, lists, request, target, loads, now, sends_to);
+    let decision = decide(own, lists, request, target, loads, now, sends_to, counted);
     issued(own, request, decision, held, now)
 }
 
@@ -1121,9 +1193,10 @@ pub(super) fn decided(
 /// call ([`issue_decode_caught`]). Either issue is told under a catch of
 /// its own: a stage that panics at it costs the call nothing. A lease's
 /// dispatch is due as a single's. A decision that picks no pair issues
-/// nothing. Behind a held lease of another document than the one that
-/// decides, the side is leased and no stage hears its issue: no later
-/// word of that lease reaches a stage ([`PolicyEngine::apply`]).
+/// nothing. Behind a held lease of an earlier document than the one that
+/// decides, the side's issue is told as each later word of that lease
+/// is: to the stages that stood under that document, and to no stage built
+/// since ([`PolicyEngine::apply`]).
 // In line at its two callers: as a call it costs a pair's decision 33
 // instructions, counted with Callgrind.
 #[inline(always)]
@@ -1141,11 +1214,19 @@ pub(super) fn issued(
             let id = LeaseId(own.leases.0.fetch_add(1, Ordering::Relaxed) + 1);
             issue_caught(own, facts, &decision, id, later)
         }),
-        Some(held) if held.lease.generation != own.document.spec.generation() => {
-            decode_side(facts, &decision, held.lease).map(|decode| (decode, decode.session))
+        Some(held) => {
+            // Behind a held lease of an earlier document the side's issue
+            // is told as its later words are: to the stages that stood
+            // under that document.
+            let document = own.document;
+            let hearing = if held.lease.generation == document.spec.generation() {
+                document.spec.engine()
+            } else {
+                document.stood_at(held.lease.generation)
+            };
+            issue_decode_caught(own, hearing, facts, &decision, held.lease)
+                .map(|decode| (decode, decode.session))
         }
-        Some(held) => issue_decode_caught(own, facts, &decision, held.lease)
-            .map(|decode| (decode, decode.session)),
     };
     DecideOutcome {
         decision,
@@ -1320,6 +1401,28 @@ mod tests {
         let digest = document.digest().expect("a digest");
         let spec = AppliedSpec::validate_digested(&document, digest, &catalog, &[]);
         (spec.expect("a valid document"), heard)
+    }
+
+    /// [`hearing`]'s document and the same text under the next generation,
+    /// both validated over one catalog: an engine keeps the stages of the
+    /// first under the second.
+    fn hearing_and_its_next() -> ([AppliedSpec; 2], Arc<Mutex<Vec<Word>>>) {
+        let heard = Arc::new(Mutex::new(Vec::new()));
+        let kept = Arc::clone(&heard);
+        let mut catalog = StageRegistry::builtin();
+        catalog
+            .picker("hears", move || Box::new(Hears(Arc::clone(&kept))))
+            .expect("a free picker name");
+        let under = |number: u64| {
+            let mut document =
+                PolicySpec::pair_presets("round_robin", "round_robin").expect("the pair presets");
+            document.generation = number;
+            let decode = document.profiles.get_mut("decode");
+            decode.expect("the decode profile").pick = "hears".into();
+            let spec = AppliedSpec::validate_in(&document, &catalog, &[]);
+            spec.expect("a valid document")
+        };
+        ([under(3), under(4)], heard)
     }
 
     /// The host's admission as two tests of a place: the prefills', then
@@ -3072,7 +3175,7 @@ mod tests {
     /// One word of a held pair told to the stages, the clock reading 9,900
     /// and every worker still listed.
     fn tell(engine: &Engine, held: &HeldDecision<'_>, word: Said) {
-        lease_events::pair(engine, held, word, |_| 9_900);
+        lease_events::pair(engine, engine, held, word, |_| 9_900);
     }
 
     /// Each word of a pair, both sides issued with the prefill, the host
@@ -3353,6 +3456,7 @@ mod tests {
                 None,
                 now,
                 |_| true,
+                SessionCountedUnder::default,
             );
             let outcome = super::decided(
                 leasing.engine.loaded(),
@@ -3362,6 +3466,7 @@ mod tests {
                 None,
                 now,
                 |_| true,
+                SessionCountedUnder::default,
             );
             assert!(outcome.lease.is_some(), "the leasing form issues its pick");
             assert_eq!(alone.picked(&decision), leasing.picked(&outcome.decision));
@@ -3378,6 +3483,7 @@ mod tests {
             None,
             now,
             |_| true,
+            SessionCountedUnder::default,
         );
         let outcome = super::decided(
             leasing.engine.loaded(),
@@ -3387,6 +3493,7 @@ mod tests {
             None,
             now,
             |_| true,
+            SessionCountedUnder::default,
         );
         assert_eq!(alone.picked(&first), leasing.picked(&outcome.decision));
         let (ours, theirs) = (target_at(&first, 0), target_at(&outcome.decision, 0));
@@ -3413,6 +3520,7 @@ mod tests {
             None,
             call,
             |_| true,
+            SessionCountedUnder::default,
         );
         let issued = super::decided(
             leasing.engine.loaded(),
@@ -3422,6 +3530,7 @@ mod tests {
             None,
             call,
             |_| true,
+            SessionCountedUnder::default,
         );
         assert!(issued.lease.is_some(), "the leasing form issues the decode");
         assert_eq!(alone.picked(&again), leasing.picked(&issued.decision));
@@ -3437,6 +3546,7 @@ mod tests {
             None,
             now,
             |_| true,
+            SessionCountedUnder::default,
         ) {
             Decision::Shed(shed) => assert_eq!(
                 (shed.reason, shed.emptied_by),
@@ -3457,6 +3567,7 @@ mod tests {
                 None,
                 call,
                 |_| true,
+                SessionCountedUnder::default,
             );
             assert!(matches!(&declined.decision, Decision::Shed(shed) if shed.emptied_by == WIRES));
             assert!(declined.lease.is_none());
@@ -4704,6 +4815,115 @@ mod tests {
         assert!(later.lock().is_empty(), "no stage is told the issue");
     }
 
+    /// A pair's decode asked again behind a later document that kept the
+    /// first one's stages tells them the side's issue: they heard the
+    /// pair's lease issued, and they hear the side's dispatch. A stage
+    /// hears a lease's issue where it hears that lease's later words, and
+    /// nowhere else.
+    #[test]
+    fn a_decode_asked_again_behind_a_document_that_kept_its_stages_tells_them_its_issue() {
+        let ([first, next], heard) = hearing_and_its_next();
+        let host = Host::under((first, heard), 1, 1);
+        let classes = every(1, 1);
+        let asks = host.asks(&classes, true);
+        let first = leased(&host, &asks, Instant::now());
+        let target = first_target(&first.decision);
+        let lease = first.lease.expect("the prefill lease").lease;
+        let held = HeldDecision {
+            decision: &first.decision,
+            lease: &lease,
+            index: 0,
+            target: &target,
+            decode: HeldDecode {
+                session: first.decode_session,
+                tokens: lease.tokens,
+                chars: lease.chars,
+                bytes: lease.bytes,
+                chosen: false,
+            },
+        };
+        host.words();
+        let applied = host.engine.apply(next);
+        applied.expect("a number above the standing one");
+
+        let local = Default::default();
+        let now = Instant::now();
+        let again = host.engine.decide_decode_under(local, &asks, &held, now);
+        let again = again.expect("a decode decision");
+        let side = again.lease.expect("the side's lease").lease;
+        assert_eq!((side.side, side.generation), (Side::Decode, 3));
+        let decided_under = again.decision.trace().generation;
+        assert_eq!(decided_under, 4, "the document in force decides");
+        host.engine
+            .say(local, &held, dispatched(Side::Decode, 0), now);
+        let told: Vec<_> = host.words().iter().map(|word| (word.0, word.1)).collect();
+        let both = [("issued", Side::Decode), ("dispatched", Side::Decode)];
+        assert_eq!(told, both, "the stages kept hear the side whole");
+    }
+
+    /// A pair's dispatch said behind a later document, for a pair the
+    /// document before placed, is counted by the counts of sends in force.
+    /// The later document built its counts new: a send is a fact of its
+    /// worker, whatever document decided it.
+    #[test]
+    fn a_pairs_older_send_is_counted_by_the_counts_in_force() {
+        // The stock pair document whose sides count their sends. Under a
+        // later number its filters stand in another order: built new.
+        let counting = |number: u64| {
+            let document = PolicySpec::pair_presets("least_load", "least_load");
+            let mut document = document.expect("the pair presets");
+            document.generation = number;
+            if number > 3 {
+                for profile in document.profiles.values_mut() {
+                    profile.filter.reverse();
+                }
+            }
+            AppliedSpec::validate(&document).expect("a valid document")
+        };
+        let host = Host::under((counting(3), Arc::default()), 1, 1);
+        let classes = every(1, 1);
+        let asks = host.asks(&classes, false);
+        let now = Instant::now();
+        let first = leased(&host, &asks, now);
+        let target = first_target(&first.decision);
+        let lease = first.lease.expect("the prefill lease").lease;
+        let held = HeldDecision {
+            decision: &first.decision,
+            lease: &lease,
+            index: 0,
+            target: &target,
+            decode: HeldDecode {
+                session: first.decode_session,
+                tokens: lease.tokens,
+                chars: lease.chars,
+                bytes: lease.bytes,
+                chosen: false,
+            },
+        };
+        let applied = host.engine.apply(counting(4));
+        applied.expect("a number above the standing one");
+
+        // The prefill's sends, as each count in force reads them.
+        let counted = || -> Vec<u32> {
+            let row = Candidate {
+                id: target.id,
+                dp_rank: target.dp_rank,
+                ..Default::default()
+            };
+            let facts = RequestFacts::default();
+            let counts = &host.engine.standing_spec().engine().sent_credits;
+            let counts = counts.iter();
+            counts
+                .map(|count| count.read(&facts, &row).requests)
+                .collect()
+        };
+        assert_eq!(counted(), [0], "not said yet");
+        let local = Default::default();
+        host.engine
+            .say(local, &held, dispatched(Side::Prefill, 0), now);
+        assert_eq!(counted(), [1], "the count built new takes it");
+    }
+
     /// A caller held to the decodes it reaches (`decode_places`) is paired
     /// by the table of the full lists. The first prefill, a partner of
     /// every decode, takes each decode its caller reaches and no other.
@@ -5070,5 +5290,251 @@ mod tests {
             let again = host.picked(&decide_prompt(&host, &sent, seed, None));
             assert_eq!(again, first, "seed {seed}");
         }
+    }
+
+    /// The maker of a host that counts a key's requests by the decisions it
+    /// holds: the count stands under the session's number.
+    struct ByNumber<'a>(Asks<'a>);
+
+    impl RequestMaker for ByNumber<'_> {
+        fn model(&self) -> &str {
+            self.0.model()
+        }
+
+        fn make<'w>(&'w self, spec: &'w AppliedSpec) -> Request<'w> {
+            self.0.make(spec)
+        }
+
+        fn workers(&self) -> WorkerLists<'_> {
+            self.0.workers()
+        }
+
+        fn session_counted_under(&self) -> SessionCountedUnder {
+            SessionCountedUnder::SessionNumber
+        }
+    }
+
+    /// The key of the capped cases' request, in the clear.
+    const TALK: &str = "talk-1";
+
+    /// A host of `prefills` and `decodes` workers under the pair of the
+    /// stock sessions presets and a rule with the in-flight cap `cap`,
+    /// which places a key on the worker with the fewest requests.
+    fn ruled_host(cap: u16, prefills: usize, decodes: usize) -> Host {
+        use crate::document::spec::Assignment;
+
+        let pair = PolicySpec::pair_presets("manual", "manual");
+        let mut document = pair.expect("the pair presets");
+        let stock = PolicySpec::preset("manual").expect("a built-in preset");
+        let mut rule = stock.bindings[0].sessions.clone();
+        let ruled = rule.as_mut().expect("the stock rule");
+        (ruled.inflight_cap, ruled.assignment) = (cap, Assignment::MinLoad);
+        document.bindings[0].sessions = rule;
+        host_of(document, prefills, decodes)
+    }
+
+    /// [`ruled_host`] under an in-flight cap of two.
+    fn capped_host(prefills: usize, decodes: usize) -> Host {
+        ruled_host(2, prefills, decodes)
+    }
+
+    /// The name each side of [`TALK`]'s request is counted under where the
+    /// session's number names the count: the prefill side's, then the
+    /// decode side's.
+    fn numbers() -> [String; 2] {
+        let facts = RequestFacts {
+            session_key: Identity::plain(TALK),
+            ..facts()
+        };
+        let mut digits = [0; Session::TEXT_LEN];
+        [facts.session(), decode_session(&facts)].map(|side| side.text(&mut digits).to_owned())
+    }
+
+    /// `count` requests in flight on `worker`, each counted under `name`.
+    fn counted_on(worker: &Arc<dyn Worker>, name: &str, count: usize) {
+        for _ in 0..count {
+            worker.increment_load();
+            worker.increment_routing_key_load(name);
+        }
+    }
+
+    /// Under a capped sessions rule each side of a pair reads the count of
+    /// its key's requests on a worker's object, under the name the
+    /// request's maker states for that side's session. A maker that says
+    /// nothing is of a host whose own guard counts: the key's text names
+    /// both sides. A maker of a host that counts by the decisions it holds
+    /// says the session's number, and each side keeps a session of its
+    /// own: the prefills' count stands under the prefill side's number and
+    /// the decodes' under the decode side's. A side whose pin carries the
+    /// cap under its own name hands the key on, and a count under any
+    /// other name is no count of that side's key.
+    #[test]
+    fn a_pairs_sides_read_their_keys_count_under_the_name_the_maker_states() {
+        /// The key's first pair is placed and both its sides dispatched,
+        /// two requests of the key are counted on each side's worker
+        /// under that side's name of `names`, the prefills' first, and
+        /// the key's next pair is decided: each side's verdict.
+        fn next(
+            host: &Host,
+            maker: &impl RequestMaker,
+            names: [&str; 2],
+        ) -> (SessionVerdict, DecodeVerdict) {
+            let now = Instant::now();
+            let mut guard = DecisionGuard::decide_under(&host.engine, GatewayId::LOCAL, maker, now)
+                .expect("a decision");
+            let (prefill, decode) = host.picked(guard.decision());
+            guard.dispatched(now);
+            guard.dispatched_decode(now);
+            counted_on(&host.prefills[prefill], names[0], 2);
+            counted_on(&host.decodes[decode], names[1], 2);
+            let decided = host.engine.decide_under(GatewayId::LOCAL, maker, now);
+            let (decided, _) = decided.expect("an answer").whole().expect("a whole one");
+            let pick = *decided.decision.pick().expect("a pick");
+            let pair = pick.targets.first().and_then(|target| target.pair);
+            (pick.session_verdict, pair.expect("a pair").decode_verdict)
+        }
+
+        let numbers = numbers();
+        let numbers = [numbers[0].as_str(), numbers[1].as_str()];
+        assert_ne!(numbers[0], numbers[1], "each side keeps its own session");
+        let classes = every(2, 2);
+        let decided = |by_number: bool, names: [&str; 2]| {
+            let host = capped_host(2, 2);
+            let mut asks = host.asks(&classes, false);
+            asks.0.facts.session_key = Identity::plain(TALK);
+            if by_number {
+                next(&host, &ByNumber(asks), names)
+            } else {
+                next(&host, &asks, names)
+            }
+        };
+        let (handed_on, kept) = (
+            (SessionVerdict::Respill, DecodeVerdict::RESPILL),
+            (SessionVerdict::Pinned, DecodeVerdict::PINNED),
+        );
+        assert_eq!(decided(false, [TALK; 2]), handed_on, "a guard's count");
+        assert_eq!(decided(false, numbers), kept, "no count of a guard's");
+        assert_eq!(decided(true, numbers), handed_on, "the held decisions'");
+        assert_eq!(decided(true, [TALK; 2]), kept, "no held decision's count");
+        // Each side under its own session's number: the other side's is no
+        // count of its key.
+        let crossed = [numbers[1], numbers[0]];
+        assert_eq!(decided(true, crossed), kept, "the other side's number");
+    }
+
+    /// A decode asked again under a capped rule reads its key's count as
+    /// its first decision does, under the name the request's maker states.
+    /// A host that counts the request on its first decode across the call
+    /// says so, and its guard counts under the request's key: that
+    /// decode's record is read with one of the key's requests less. One
+    /// other request of the key there leaves the request on its decode
+    /// under a cap of two, and two hand it on. A host that says nothing is
+    /// read as it counts: the request is one of the key's there. A host
+    /// that counts by the decisions it holds is read under the decode
+    /// side's number.
+    #[test]
+    fn a_decode_asked_again_reads_its_keys_other_requests_on_its_first_decode() {
+        /// A pair's request is decided with its decode sent later, and
+        /// its prefill dispatched. `others` requests of the key stand on
+        /// the decode it chose, under `name`, and the host's guard counts
+        /// the request itself there under the key's text. The decode is
+        /// asked again: whether it stands, and the side's verdict.
+        fn again(
+            by_number: bool,
+            counted: bool,
+            name: &str,
+            others: usize,
+        ) -> (bool, DecodeVerdict) {
+            let (host, classes) = (capped_host(1, 3), every(1, 3));
+            let mut asks = host.asks(&classes, true);
+            asks.0.facts.session_key = Identity::plain(TALK);
+            asks.0.constraints.counted_on_decode = counted;
+            let maker = ByNumber(asks);
+            let now = Instant::now();
+            let decided = if by_number {
+                DecisionGuard::decide_under(&host.engine, GatewayId::LOCAL, &maker, now)
+            } else {
+                DecisionGuard::decide_under(&host.engine, GatewayId::LOCAL, &maker.0, now)
+            };
+            let mut guard = decided.expect("a decision");
+            let chosen = host.picked(guard.decision()).1;
+            guard.dispatched(now);
+            counted_on(&host.decodes[chosen], TALK, 1);
+            counted_on(&host.decodes[chosen], name, others);
+            let call = now + Duration::from_millis(1);
+            let asked = if by_number {
+                guard.decide_decode_under(&maker, call)
+            } else {
+                guard.decide_decode_under(&maker.0, call)
+            };
+            let asked = *asked.expect("a decision");
+            let pair = target_at(&asked, 0).pair.expect("a pair");
+            (host.picked(&asked).1 == chosen, pair.decode_verdict)
+        }
+
+        let (stays, handed_on) = (
+            (true, DecodeVerdict::PINNED),
+            (false, DecodeVerdict::RESPILL),
+        );
+        assert_eq!(again(false, true, TALK, 1), stays, "one other request");
+        assert_eq!(again(false, true, TALK, 2), handed_on, "two others");
+        assert_eq!(again(false, false, TALK, 1), handed_on, "read as it counts");
+        let [_, decode_number] = numbers();
+        assert_eq!(
+            again(true, false, &decode_number, 2),
+            handed_on,
+            "by number"
+        );
+        assert_eq!(
+            again(true, false, TALK, 2),
+            stays,
+            "no held decision's count"
+        );
+    }
+
+    /// A pair's decision asks its request's maker where the key's requests
+    /// are counted under a document that reads the count, once a decision,
+    /// and under no other: a rule with no cap asks nothing, and neither
+    /// does a binding with no rule.
+    #[test]
+    fn a_pairs_decision_asks_where_a_key_is_counted_under_a_capped_rule_alone() {
+        use std::cell::Cell;
+
+        /// A maker that counts how often it is asked.
+        struct Asked<'a>(Asks<'a>, Cell<u32>);
+
+        impl RequestMaker for Asked<'_> {
+            fn model(&self) -> &str {
+                self.0.model()
+            }
+
+            fn make<'w>(&'w self, spec: &'w AppliedSpec) -> Request<'w> {
+                self.0.make(spec)
+            }
+
+            fn workers(&self) -> WorkerLists<'_> {
+                self.0.workers()
+            }
+
+            fn session_counted_under(&self) -> SessionCountedUnder {
+                self.1.set(self.1.get() + 1);
+                SessionCountedUnder::KeyText
+            }
+        }
+
+        let classes = every(1, 1);
+        let asked = |host: &Host| {
+            let mut asks = host.asks(&classes, false);
+            asks.0.facts.session_key = Identity::plain(TALK);
+            let maker = Asked(asks, Cell::new(0));
+            let decided = host
+                .engine
+                .decide_under(GatewayId::LOCAL, &maker, Instant::now());
+            assert!(decided.is_ok(), "a decision");
+            maker.1.get()
+        };
+        assert_eq!(asked(&capped_host(1, 1)), 1, "a capped rule");
+        assert_eq!(asked(&ruled_host(u16::MAX, 1, 1)), 0, "a rule with no cap");
+        assert_eq!(asked(&Host::of(1, 1)), 0, "no rule");
     }
 }

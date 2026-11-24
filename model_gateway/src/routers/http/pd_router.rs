@@ -86,7 +86,7 @@ use crate::{
             },
             prefill_admission::{
                 acquire_prefill, PrefillAcquireError, PrefillAdmission, PrefillAdmissionRejection,
-                PrefillLoadGuard, PrefillSelectionContext,
+                PrefillAhead, PrefillSelectionContext,
             },
             request_lease::{ReleasePoint, RequestLease, RoutingDerivatives},
             responses_compat::lower_responses_request_for_local_backend,
@@ -137,11 +137,15 @@ fn own_failure(response: &Response) -> Option<PdSide> {
         .map(|&OwnFailure(side)| side)
 }
 
-/// The load one admitted PD request holds. The Prefill guard is released
-/// when the Prefill phase ends; the Decode guard rides on the response body,
-/// from the decode's send on ([`DecodeAhead::sent`]).
+/// The load one admitted PD request holds, each side's ahead of its send.
+/// The Prefill load is said sent where a dispatch shape hands the prefill's
+/// request to its client ([`PrefillAhead::sent`]), and released when the
+/// Prefill phase ends. A request refused on the way drops it unsent: the
+/// worker is counted no more, and the policy engine hears a release. The
+/// Decode guard rides on the response body, from the decode's send on
+/// ([`DecodeAhead::sent`]).
 struct PdLoadGuards {
-    prefill: PrefillLoadGuard,
+    prefill: PrefillAhead,
     decode: DecodeAhead,
 }
 
@@ -223,15 +227,15 @@ fn asks_decode_again(mode: &KvConnectorMode, decode: &DecodeAhead) -> bool {
 }
 
 /// What every dispatch body sets up before its first side goes out: the two
-/// serialized sides and the two load guards taken apart (the decode's still
-/// ahead of its send), the request headers as every side is sent them (the
+/// serialized sides and the two loads taken apart (each still ahead of its
+/// side's send), the request headers as every side is sent them (the
 /// caller's, lent while tracing is off; a copy carrying the trace context
 /// while it is on), and the prefill engine's runtime label the PD metrics are
 /// recorded under.
 struct PdSetup<'a> {
     prefill_body: Bytes,
     decode_body: Bytes,
-    prefill_guard: PrefillLoadGuard,
+    prefill_ahead: PrefillAhead,
     decode: DecodeAhead,
     headers_with_trace: Cow<'a, HeaderMap>,
     runtime: &'static str,
@@ -246,14 +250,14 @@ impl<'a> PdSetup<'a> {
     ) -> Self {
         let (prefill_body, decode_body) = side_bodies;
         let PdLoadGuards {
-            prefill: prefill_guard,
+            prefill: prefill_ahead,
             decode,
         } = guards;
         let headers_with_trace = with_trace_context_http(headers);
         Self {
             prefill_body,
             decode_body,
-            prefill_guard,
+            prefill_ahead,
             decode,
             headers_with_trace,
             runtime: prefill.metadata().spec.runtime_type.as_str(),
@@ -1723,7 +1727,7 @@ impl PDRouter {
         let PdSetup {
             prefill_body,
             decode_body,
-            prefill_guard,
+            prefill_ahead,
             decode,
             headers_with_trace,
             runtime,
@@ -1770,6 +1774,9 @@ impl PDRouter {
             Draining(tokio_util::task::AbortOnDropHandle<()>),
         }
         let dispatch_start = Instant::now();
+        // The prefill goes out with the join below, in a future that owns
+        // its load: the prefill's send is said here.
+        let prefill_guard = prefill_ahead.sent();
         let prefill_fut = async {
             let resp = send_with_stale_conn_retry(prefill_request)
                 .await
@@ -2107,7 +2114,7 @@ impl PDRouter {
         let PdSetup {
             prefill_body,
             decode_body,
-            prefill_guard,
+            prefill_ahead,
             decode,
             headers_with_trace,
             runtime,
@@ -2143,6 +2150,8 @@ impl PDRouter {
                 headers,
                 dp_rank.or_else(|| prefill.dp_rank()),
             );
+            // The prefill goes out here: its send is said.
+            let prefill_guard = prefill_ahead.sent();
             let prefill_bytes = match Self::prefill_side_bytes(
                 ledger,
                 prefill.as_ref(),
@@ -2163,15 +2172,20 @@ impl PDRouter {
 
             // Harvest the handoff params the prefill engine returned (NIXL and
             // opportunistic passthrough; Mooncake returns nothing and is minted).
-            Self::harvest_kv_transfer_params(&prefill_bytes)
+            let harvested = Self::harvest_kv_transfer_params(&prefill_bytes);
+            // The Prefill phase is over: its load is released.
+            drop(prefill_guard);
+            harvested
         } else {
             debug!(
                 "vLLM PD over HTTP: n>1 fan-out cannot consume a KV handoff; \
                  dispatching to decode only"
             );
+            // No prefill goes out: its load is let go as it was acquired,
+            // unsent, and the policy engine hears the prefill's side released.
+            drop(prefill_ahead);
             None
         };
-        drop(prefill_guard);
         if mode == KvConnectorMode::MoriIo {
             let checked = match (&harvested, transfer_id.as_deref()) {
                 (Some(handoff), Some(id)) => validate_moriio_handoff(handoff, id, dp_rank),
@@ -2313,7 +2327,7 @@ impl PDRouter {
         let PdSetup {
             prefill_body,
             decode_body,
-            prefill_guard,
+            prefill_ahead,
             decode,
             headers_with_trace,
             runtime,
@@ -2341,13 +2355,15 @@ impl PDRouter {
             headers,
             dp_rank,
         );
+        // Both sides go out here, one beside the other: each side's send is
+        // said.
+        let prefill_guard = prefill_ahead.sent();
         let prefill_side = Self::prefill_side_bytes(
             ledger,
             prefill.as_ref(),
             prefill_request,
             self.max_payload_size,
         );
-        // The decode side goes out here, beside its prefill: its send is said.
         let (decode, decode_guard) = decode.sent();
         let decode_side = send_with_stale_conn_retry(decode_request);
         tokio::pin!(decode_side);
@@ -2650,19 +2666,26 @@ impl PDRouter {
         sticky_key: Option<&str>,
         stated: impl Fn() -> placement::Stated + Send + Sync,
     ) -> Result<(PdPair, PdLoadGuards), Box<PdSelectionFailure>> {
-        let ((prefill, decode), prefill_guard) = acquire_prefill(
+        let ((prefill, decode), prefill_ahead) = acquire_prefill(
             self.prefill_admission.as_deref(),
             sticky_key,
             |(prefill, _): &(Placed, Placed)| prefill,
             |capacity| self.select_pd_pair(model_id, inputs, capacity, &stated),
+            // The prefill's worker goes on behind its load, and what its
+            // answer owes its send goes with that load.
+            |(prefill, decode)| {
+                let (prefill, unsent) = prefill.unsent();
+                ((prefill, decode), unsent)
+            },
         )
         .await
         .map_err(|error| Box::new(PdSelectionFailure::from(error)))?;
-        // The prefill's side went into its guard. The decode's guard is made
-        // ahead of its send, and its side stays with its answer until then.
-        let pair = (prefill.into_guarded_worker(), Arc::clone(decode.worker()));
+        // Each side's load is held ahead of its send: a dispatch shape says
+        // the send where that side goes out, and what a side's answer owes
+        // its send stays with its load until then.
+        let pair = (prefill, Arc::clone(decode.worker()));
         let guards = PdLoadGuards {
-            prefill: prefill_guard,
+            prefill: prefill_ahead,
             decode: DecodeAhead::new(decode, sticky_key),
         };
         Ok((pair, guards))
@@ -2821,6 +2844,9 @@ impl PDRouter {
                 upstream_sse,
                 source,
                 guard: decode_guard,
+                // The pair routes tell the policy engine no end yet, so
+                // the relay is handed no handle and says nothing.
+                end: placement::RequestEnd::default(),
                 headers: response_headers,
                 mode: ChunkMode::Hook(hook),
             },
@@ -3691,6 +3717,7 @@ mod tests {
         routers::{
             common::{
                 placement::tests::{engine_on, hearing_pairs_on, Heard},
+                prefill_admission::PrefillLoadGuard,
                 sse::SSE_CHANNEL_BUFFER,
             },
             grpc::backend_client::BasicWorkerBuilder,
@@ -9421,11 +9448,10 @@ mod tests {
         heard.clone()
     }
 
-    /// Both sides at once: the engine hears the prefill's dispatch where the
-    /// selection makes its guard and the decode's where the two requests go
-    /// out, then each side's end where its guard is dropped, the prefill's at
-    /// its answer and the decode's behind the answer's body. Nothing is
-    /// released.
+    /// Both sides at once: the engine hears the prefill's dispatch and the
+    /// decode's where the two requests go out, then each side's end where
+    /// its guard is dropped, the prefill's at its answer and the decode's
+    /// behind the answer's body. Nothing is released.
     #[tokio::test]
     async fn the_engine_hears_both_sides_of_a_pair_sent_at_once() {
         assert_eq!(
@@ -9470,6 +9496,41 @@ mod tests {
     async fn the_engine_hears_both_sides_of_a_pair_written_concurrently() {
         assert_eq!(
             heard_of_a_served_pair(Sends::ConcurrentWrite).await,
+            [
+                "issued",
+                "issued",
+                "dispatched Prefill",
+                "dispatched Decode",
+                "completed Cancelled",
+                "completed Cancelled",
+            ]
+        );
+    }
+
+    /// A streamed pair tells the engine no outcome yet. The decode's answer
+    /// goes through the relay that the regular router's streams go through,
+    /// and this route hands that relay no handle: under a stage that takes
+    /// an end the decode's guard holds one, and both sides still end with
+    /// class cancelled and no status.
+    #[tokio::test]
+    async fn the_engine_hears_no_outcome_of_a_pairs_streamed_decode() {
+        let (router, heard) = heard_pair_router(Sends::BothAtOnce).await;
+        let response = chat_through(&router, true).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        // A relay that held a handle would tell the end from its task,
+        // behind the body's last byte.
+        let said = || heard.lock().expect("the stage heard").clone();
+        for _ in 0..1024 {
+            if said().len() >= 6 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            said(),
             [
                 "issued",
                 "issued",
@@ -10816,9 +10877,9 @@ mod tests {
                 .build(),
         );
         let guards = PdLoadGuards {
-            prefill: PrefillLoadGuard::Unbounded {
+            prefill: PrefillAhead::classic(PrefillLoadGuard::Unbounded {
                 _guard: WorkerLoadGuard::with_key(Arc::clone(&prefill), None),
-            },
+            }),
             decode: DecodeAhead::new(Placed::from(Arc::clone(&decode)), None),
         };
         assert_eq!((prefill.load(), decode.load()), (1, 1));

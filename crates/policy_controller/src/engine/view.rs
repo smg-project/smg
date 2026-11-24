@@ -7,10 +7,16 @@
 //! into the spec's declared lists (zones, engine kinds, connectors, labels,
 //! headers) are the same positions here.
 
+#![expect(
+    clippy::exhaustive_enums,
+    clippy::exhaustive_structs,
+    reason = "a caller still builds or matches these types whole: each mark comes with its call"
+)]
+
 use std::sync::atomic::AtomicU64;
 
 use super::demands::DemandFacts;
-use crate::{load::signals, policies::consistent_hashing::LentRing, tracking::in_flight};
+use crate::{load::signals, policies::consistent_hashing::LentRing};
 
 /// The identity of a candidate, as its host states it. A controller's
 /// membership states a hash of the registration key and the incarnation
@@ -21,6 +27,7 @@ use crate::{load::signals, policies::consistent_hashing::LentRing, tracking::in_
 /// ([`FixedFacts::id`]). A hash ring a caller lends finds a worker's row
 /// by the address's fingerprint alone.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[expect(clippy::exhaustive_structs, reason = "its one value is the record")]
 pub struct WorkerId(pub u64);
 
 impl WorkerId {
@@ -38,6 +45,7 @@ impl WorkerId {
 
 /// A worker's role in the fleet.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[expect(clippy::exhaustive_enums, reason = "a caller answers every case")]
 pub enum Role {
     #[default]
     Single,
@@ -74,6 +82,7 @@ impl From<smg_worker::worker::WorkerType> for Role {
     schemars::JsonSchema,
 )]
 #[serde(rename_all = "lowercase")]
+#[expect(clippy::exhaustive_enums, reason = "a caller answers every case")]
 pub enum Phase {
     #[default]
     Single,
@@ -360,6 +369,7 @@ impl LoadRow {
 /// plugin sees one form or the other by its exposure. [`Identity::NONE`] is
 /// the absent key.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Identity<'a> {
     /// The fingerprint of the key; `0` when absent.
     pub hash: u64,
@@ -816,10 +826,7 @@ pub struct Candidate {
     /// takes one row and no index, so a filter that read the affinity
     /// column there would have to read it at the position; no filter of
     /// this crate does. A debug build asserts that the two agree where a
-    /// decision takes its inputs; a release build does not check. A count
-    /// the host lent beside its rows is read at the position too
-    /// ([`RequestFacts::in_flight`]): the row's place in the host's pool,
-    /// whatever its index.
+    /// decision takes its inputs; a release build does not check.
     pub position: u32,
     /// The worker's id ([`WorkerId`]). Each rank of a data-parallel engine
     /// is a row of its own with an id of its own: a rank's worker object
@@ -839,10 +846,8 @@ pub struct Candidate {
     /// The pairing descriptor's connector, as a position into the spec's
     /// declared list; `0` when none.
     pub connector: u16,
-    /// Requests the deciding host holds on the worker right now. A host
-    /// that lends its counts beside the rows
-    /// ([`RequestFacts::lent_in_flight`]) leaves this zero, so a reader
-    /// asks [`RequestFacts::in_flight`].
+    /// Requests the deciding host holds on the worker right now: what
+    /// [`RequestFacts::in_flight`] reads.
     ///
     /// The in-process front reads it off the worker object at every
     /// decision: the object's own counter, which a host raises where it
@@ -1082,9 +1087,8 @@ pub struct Header<'a> {
 
 /// The mean of the in-flight counts of `rows` of `candidates`; zero over no
 /// row.
-// Forced into its callers: the walk is two small loops, one a kind of rows.
-// Out of line they cost an affinity pass a call and one instruction a row
-// more than the one loop that stood inside the pass.
+// Forced into its callers: out of line the walk cost an affinity pass a call
+// and one instruction a row more than the loop that stood inside the pass.
 #[inline(always)]
 pub(crate) fn mean_in_flight(
     facts: &RequestFacts<'_>,
@@ -1110,6 +1114,7 @@ pub(crate) fn mean_in_flight(
 /// or by the decisions it holds on file and never by both, so the two
 /// names do not meet on one object.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SessionCountedUnder {
     /// The key's own text: the caller's own guard counts each request on
     /// the worker it sends it to, for as long as the request runs. What a
@@ -1237,15 +1242,6 @@ pub struct RequestFacts<'a> {
     /// The host's clock at the decision, in microseconds since its origin.
     /// In-process only; no absolute instant crosses the wire.
     pub now_micros: u64,
-    /// What the leases on file book on each row, where the host did not
-    /// write the count into the row: a view of a publication's own rows
-    /// lends the table here. A reader of a row's requests in flight asks
-    /// both ([`RequestFacts::in_flight`]). `None` where the rows carry
-    /// their counts: rows written for the decision, and a host that keeps
-    /// the count itself. A pair takes none: a position is a place in one
-    /// pool, and a pair's rows carry what counts their host wrote.
-    /// In-process only.
-    pub lent_in_flight: Option<&'a in_flight::PoolInFlightCounts<'a>>,
     /// The host holds each row's count of this request's session key, the
     /// count a capped sessions rule asks for
     /// ([`Needs::session_in_flight`](crate::document::Needs::session_in_flight)),
@@ -1325,9 +1321,13 @@ pub struct RequestFacts<'a> {
     /// the one ring, each over its own list: a side takes a worker of the
     /// ring only where its list keeps that worker, and a key no kept
     /// worker of the side takes goes by the same rule over that side's
-    /// kept workers. An encode request's items take none: the place stated
-    /// is the request's routing value's, and an item is placed by its own
-    /// key on the stage's ring. In-process only.
+    /// kept workers. An encode request's items take none of this: the
+    /// place stated is the request's routing value's. An item whose key
+    /// carries its text is placed by that text on the ring lent for the
+    /// items ([`EncodeItems::ring`](crate::engine::EncodeItems::ring)),
+    /// where the encode profile reads that ring and its lender places
+    /// what it is asked. Every other item is placed by its own key on the
+    /// stage's ring. In-process only.
     pub ring: Option<&'a dyn LentRing>,
     /// Where the request stands on the lent ring, as its caller states it:
     /// the position of the value it is placed by ([`LentRing::position`]).
@@ -1354,8 +1354,9 @@ pub struct RequestFacts<'a> {
     /// where it derives the key
     /// ([`DerivedKey::source`](crate::document::DerivedKey)). An encode
     /// item's facts state it as false: the key they carry is the item's
-    /// own. In-process only: no frame states it, so under a controller's
-    /// address the prefix form places by any session key.
+    /// own. A gateway's frame states it to a controller, and a plugin's
+    /// frame states false. A frame of a host older than the field reads
+    /// false: under that host the prefix form places by any session key.
     pub session_key_from_rid: bool,
 }
 
@@ -1460,18 +1461,15 @@ impl<'a> RequestFacts<'a> {
         }
     }
 
-    /// The requests in flight of `row`: what the host lent for the row's
-    /// position where it lent a table ([`RequestFacts::lent_in_flight`]),
-    /// the row's own count otherwise. Every reader of a row's count asks
-    /// here, and none learns which rows it was given. A decision reads one
-    /// count a row: beside lent rows the first read is kept, and every
-    /// later read returns it.
+    /// The requests in flight of `row`: the row's own count
+    /// ([`Candidate::in_flight`]).
     #[inline]
+    #[expect(
+        clippy::unused_self,
+        reason = "stages call the reader on the request: the receiver keeps their calls as they stand"
+    )]
     pub fn in_flight(&self, row: &Candidate) -> u32 {
-        match self.lent_in_flight {
-            Some(lent) => lent.at(row.position),
-            None => row.in_flight,
-        }
+        row.in_flight
     }
 
     /// The affinity facts of the candidate at `index` of the slice the
@@ -1572,10 +1570,12 @@ pub struct Constraints<'a> {
     /// decode's requests in flight. Default: false. The decode asked again
     /// over the host's own worker lists then reads that decode's record
     /// with one request less in flight: the record of that id in the list
-    /// handed at the call. Its count of session keys is read as the worker
-    /// states it. A first decision does not read it, and no frame carries
-    /// it: a controller's requests are counted by the leases it holds on
-    /// file.
+    /// handed at the call. Where a stage reads the count of the key's
+    /// requests on a worker, that record carries one of the key's requests
+    /// less too: the host's guard counts the request under its key. Its
+    /// count of session keys is read as the worker states it. A first
+    /// decision does not read it, and no frame carries it: a controller's
+    /// requests are counted by the leases it holds on file.
     pub counted_on_decode: bool,
     /// A subset hint: decide over at most this many candidates.
     pub subset_hint: Option<u32>,
@@ -1586,8 +1586,10 @@ pub struct Constraints<'a> {
     /// that meet them. Over a pair's two worker lists each side is held
     /// to the workers that meet them as its role is held to them
     /// ([`Demands::held_by`](crate::engine::Demands::held_by)). An encode
-    /// request's three lists keep none yet: such a request that states a
-    /// demand is shed under the stage `wires`, whatever its lists state.
+    /// request's three lists are held a list at a time too. Where it has
+    /// items its encoders are held to the runtime and the media's demands
+    /// ([`Demands::beside_pair`](crate::engine::Demands::beside_pair)),
+    /// and its pair's two sides to the rest.
     /// In-process only: this protocol version
     /// states no demand, and a handle refuses a request that states one
     /// before it sends it over a link (`DecisionGuard::asked`).
@@ -1788,29 +1790,20 @@ pub struct PoolFacts<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tracking::in_flight::tests::Lent;
 
-    /// One reader, two feeds: a row's requests in flight are the lent count
-    /// at the row's position where the host lends a table, whatever the
-    /// row's own field holds, and the row's own field where it lends none.
+    /// The one reader of a row's requests in flight returns the row's own
+    /// count.
     #[test]
-    fn a_rows_requests_in_flight_are_the_lent_count_or_the_rows_own() {
+    fn a_rows_requests_in_flight_are_the_rows_own() {
         let row = |position, in_flight| Candidate {
             position,
             in_flight,
             ..Candidate::default()
         };
-        let mut rows = [row(0, 5), row(1, 2)];
-        let own = RequestFacts::default();
-        let read = |facts: &RequestFacts<'_>, rows: &[Candidate]| -> Vec<u32> {
-            rows.iter().map(|row| facts.in_flight(row)).collect()
-        };
-        assert_eq!(read(&own, &rows), [5, 2]);
-        let lent = Lent::take(&mut rows);
-        assert_eq!(read(&own, &rows), [0, 0]);
-        // A count a host left on a row does not speak over its table.
-        rows[0].in_flight = 9;
-        assert_eq!(read(&lent.beside(&own), &rows), [5, 2]);
+        let rows = [row(0, 5), row(1, 2)];
+        let facts = RequestFacts::default();
+        let read: Vec<u32> = rows.iter().map(|row| facts.in_flight(row)).collect();
+        assert_eq!(read, [5, 2]);
     }
 
     #[test]
@@ -1901,7 +1894,7 @@ mod tests {
     /// bench's cells that copy the facts (`benches/decision.rs`).
     #[test]
     fn a_requests_facts_take_the_pinned_bytes() {
-        assert_eq!(size_of::<RequestFacts<'_>>(), 312);
+        assert_eq!(size_of::<RequestFacts<'_>>(), 304);
     }
 
     #[test]

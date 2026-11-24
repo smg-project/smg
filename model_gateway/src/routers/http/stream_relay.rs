@@ -28,6 +28,7 @@ use super::stream_failure::{
     mark_head_success_recorded, note_sent, RelaySource, SentTail, UpstreamCut,
 };
 use crate::routers::common::{
+    placement::RequestEnd,
     sse::SSE_CHANNEL_BUFFER,
     sse_rechunk::{NoopObserver, SseRechunker},
     stream::GuardedStream,
@@ -114,6 +115,13 @@ pub(crate) struct Relay {
     pub(crate) source: RelaySource,
     /// The worker's load, released when the body is dropped.
     pub(crate) guard: WorkerLoadGuard,
+    /// The handle the relay reports the stream's end through: its caller's
+    /// word on whether its route tells the policy engine its requests'
+    /// ends. A route that tells them asks it of `guard`
+    /// ([`RequestEnd::of`]). A route that tells none hands the empty
+    /// handle, and the relay says nothing: the pair route, until it tells
+    /// every answer of its two sides.
+    pub(crate) end: RequestEnd,
     /// The response headers, prepared by the caller. Under `upstream_sse` the
     /// relay removes the upstream's `Content-Length` from them, since it may
     /// lengthen the body.
@@ -134,6 +142,7 @@ where
         upstream_sse,
         source,
         guard,
+        end,
         mut headers,
         mut mode,
     } = relay;
@@ -160,6 +169,17 @@ where
     if head_success_recorded {
         source.worker().record_outcome(status.as_u16());
     }
+    // A good head's end is the relay's to report, as its cut is the
+    // relay's to account: the task holds the handle its caller handed. A
+    // failed head is the caller's to report with its record, so the handle
+    // is let go here and that report waits for no task. A client that
+    // leaves is reported by nobody.
+    let end = if head_success_recorded {
+        end
+    } else {
+        drop(end);
+        RequestEnd::default()
+    };
 
     // The relay runs under the request's span, so a failure after
     // the head went out is logged with the request's id.
@@ -216,6 +236,9 @@ where
                                 // event was the last frame, and letting go of
                                 // the upstream cancels the engine's work.
                                 if last || mode.stopped() {
+                                    if last {
+                                        end.report(status.as_u16(), || true);
+                                    }
                                     break;
                                 }
                             }
@@ -230,7 +253,9 @@ where
                                 // worker's to account.
                                 if mode.stopped() {
                                     if status.is_success() {
-                                        source.account(&UpstreamCut::of(&e), relayed);
+                                        let cut = UpstreamCut::of(&e);
+                                        source.account(&cut, relayed);
+                                        end.report(cut.status().as_u16(), || false);
                                     }
                                     break;
                                 }
@@ -243,6 +268,7 @@ where
                                 if status.is_success() {
                                     let cut = UpstreamCut::of(&e);
                                     source.account(&cut, relayed);
+                                    end.report(cut.status().as_u16(), || false);
                                     if upstream_sse {
                                         // On its own frame: a cut inside a frame leaves
                                         // a partial line the event must not merge into.
@@ -260,6 +286,7 @@ where
                                 if !tail.is_empty() {
                                     let _ = tx.send(Ok(tail)).await;
                                 }
+                                end.report(status.as_u16(), || true);
                                 break;
                             }
                         }
@@ -325,7 +352,7 @@ mod tests {
     use tokio::sync::mpsc;
     use tokio_stream::wrappers::ReceiverStream;
 
-    use super::{relay_streaming_body, ChunkHook, ChunkMode, ChunkStep, Relay};
+    use super::{relay_streaming_body, ChunkHook, ChunkMode, ChunkStep, Relay, RequestEnd};
     use crate::{
         routers::{
             common::{sse::SSE_CHANNEL_BUFFER, sse_rechunk::SseRechunker},
@@ -350,6 +377,7 @@ mod tests {
                 upstream_sse: true,
                 source: RelaySource::new("m", "/v1/chat/completions", Arc::clone(&worker)),
                 guard: WorkerLoadGuard::with_key(worker, None),
+                end: RequestEnd::default(),
                 headers: HeaderMap::new(),
                 mode,
             },
@@ -668,6 +696,7 @@ mod tests {
                     upstream_sse,
                     source: RelaySource::new("m", "/v1/chat/completions", Arc::clone(&worker)),
                     guard: WorkerLoadGuard::with_key(worker, None),
+                    end: RequestEnd::default(),
                     headers,
                     mode: ChunkMode::Plain,
                 },

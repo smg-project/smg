@@ -11,22 +11,31 @@
 //! one of whose sides cannot be sent to is passed over whole, and the next
 //! is asked.
 //!
+//! Where no target of a call's first decision holds, or that decision
+//! sheds the request as saturated, and the request states a rule, the
+//! rule is asked of both lists once, and the call's later decisions are
+//! held to the workers it takes on each ([`again`]): they are lent the
+//! same two lists with each side's places beside it
+//! ([`PairLists::prefill_places`], [`PairLists::decode_places`]).
+//!
 //! Which workers pair is the caller's word: the classes its lists carry
 //! ([`PartnerClasses`](crate::engine::PartnerClasses)). A decision names no
 //! pair across them, and this walk tests no pair again.
 
 use std::{sync::Arc, time::Instant};
 
-use super::{decide, raise, sendable, walk, Call, Made, PlaceRequest, Sent, Sides, Unplaced};
+use super::{
+    decide, hold_to_rule, raise, sendable, walk, Call, Made, PlaceRequest, Sent, Sides, Unplaced,
+};
 use crate::{
     engine::{
-        decision::Target,
+        decision::{ShedReason, Target},
         decision_engine::DecisionRefused,
         list_cell::LentList,
         policy_engine::Loaded,
         prefills_full,
         view::{Phase, WorkerId},
-        PairLists,
+        EncodeLists, PairLists, WorkerLists,
     },
     tracking::Placement,
 };
@@ -44,7 +53,10 @@ pub(super) fn decode_label(engine: Loaded<'_, '_>, model: &str) -> &'static str 
 /// One ask of `call` for a pair over `lists`, the two lists its caller
 /// handed with their pair classes: one decision told to leave out the
 /// workers the call missed so far ([`Call::missed`]), and the first of its
-/// targets both of whose workers can be sent to.
+/// targets both of whose workers can be sent to. The decision is lent
+/// `lent`: the request's own lists, or those lists with each side's
+/// places beside it, the workers a rule takes ([`again`]) or the worker a
+/// request names ([`target::pair`](super::target::pair)).
 ///
 /// The placement names the request's routing value, and the profile of its
 /// decode side by its label ([`decode_label`]).
@@ -67,9 +79,13 @@ pub(super) fn ask<'a>(
     engine: Loaded<'static, '_>,
     request: &PlaceRequest<'a>,
     lists: &PairLists<'_>,
+    lent: &WorkerLists<'_>,
     call: &mut Call,
 ) -> Result<Option<Placement<'a>>, Unplaced> {
-    let mut made = Made::asked(engine, request, call);
+    let mut made = Made {
+        lists: lent,
+        ..Made::asked(engine, request, call)
+    };
     let mut whole = None;
     let decided = decide(engine, &made, &mut whole);
     // The route's rule panicked inside the decision, at the question of
@@ -129,23 +145,142 @@ pub(super) fn sides(
     }
 }
 
-/// The asks of one call for a pair over `lists` ([`ask`]): where no target
-/// of an ask holds, the call's next ask answers in its place, three asks a
-/// call at most ([`Call::again`]), and no worker for the request behind the
-/// last.
+/// The asks of one call for a pair over `lists` ([`asks`]): the first is
+/// lent the request's own lists.
 ///
 /// # Errors
 ///
 /// What an ask answers, and [`Unplaced::NoWorkers`] where no target of the
-/// call's last ask holds.
+/// call's last ask holds. A rule that takes no worker of one of the two
+/// lists sheds the request with no endpoint, under `admits`
+/// ([`hold_to_rule`]).
 pub(super) fn place<'a>(
     engine: Loaded<'static, '_>,
     request: &PlaceRequest<'a>,
     lists: &PairLists<'_>,
     call: &mut Call,
 ) -> Result<Placement<'a>, Unplaced> {
-    match ask(engine, request, lists, call)? {
-        Some(placement) => Ok(placement),
-        None => call.again(|call| place(engine, request, lists, call)),
+    asks(engine, request, lists, &request.lists, call)
+}
+
+/// An ask of a call for a pair over `lists`, lent `lent` ([`ask`]), and
+/// the asks of the call behind it: where no target of an ask holds, the
+/// call's next ask answers in its place ([`again`]), three asks a call at
+/// most ([`Call::again`]), and no worker for the request behind the last.
+/// An ask that sheds the request as saturated goes there too: it judged
+/// the overload over the lists it was lent, which a rule may narrow.
+///
+/// A pair held to the prefill its request names is asked so over its lists
+/// with that prefill's place beside them
+/// ([`target::pair`](super::target::pair)): a rule the request states is
+/// then asked of that place alone. One held to the two workers it names
+/// is the call's one decision: no ask follows it ([`again`]).
+pub(super) fn asks<'a>(
+    engine: Loaded<'static, '_>,
+    request: &PlaceRequest<'a>,
+    lists: &PairLists<'_>,
+    lent: &WorkerLists<'_>,
+    call: &mut Call,
+) -> Result<Placement<'a>, Unplaced> {
+    match ask(engine, request, lists, lent, call) {
+        Ok(Some(placement)) => Ok(placement),
+        Ok(None) => again(engine, request, lists, lent, call, None),
+        Err(
+            shed @ Unplaced::Shed {
+                reason: ShedReason::Saturated,
+                ..
+            },
+        ) => again(engine, request, lists, lent, call, Some(shed)),
+        Err(unplaced) => Err(unplaced),
     }
+}
+
+/// The call's next ask behind one none of whose targets held, or that
+/// shed the request as saturated (`shed`), which was lent `lent`
+/// ([`asks`]). Behind the call's first ask, a rule the request
+/// states is asked of the two lists first, while the call holds no
+/// decision ([`hold_to_rule`]): of the prefills, then of the decodes,
+/// among the places the caller states for each. It is asked whether it
+/// refused a side of the first decision or the sides were not ready: a
+/// side that is not ready is not asked of it, so a decision none of whose
+/// sides is ready learns nothing of the rule.
+///
+/// The asks behind that one are lent the request's own lists with each
+/// side's places set to the workers the rule takes
+/// ([`PairLists::prefill_places`], [`PairLists::decode_places`]): the
+/// lists stay the caller's, with their cells and their classes. The
+/// places live here, beside those asks: a call keeps none of a pair's. A
+/// request that states no rule keeps no places, and each of its asks is
+/// lent its lists as they stand. Out of line: a pair whose first ask
+/// takes a target runs none of it.
+///
+/// A decision judges the overload over the lists it is lent: a worker
+/// under its thresholds that the rule refuses, and that no decision
+/// names, keeps a list from being wholly over them, and the decision
+/// sheds the request. Held to the rule's workers, the next decision
+/// judges it over those alone. Under a document that sheds a list
+/// wholly over its thresholds that decision sheds again, and its shed
+/// stands. A shed stands where the rule is not asked here: behind a
+/// later ask, and under no rule.
+///
+/// A pair held to the two workers its request names
+/// ([`target::pair`](super::target::pair)) is asked no second time: behind
+/// a worker it cannot send to it has no worker, and its shed stands.
+#[cold]
+#[inline(never)]
+fn again<'a>(
+    engine: Loaded<'static, '_>,
+    request: &PlaceRequest<'a>,
+    lists: &PairLists<'_>,
+    lent: &WorkerLists<'_>,
+    call: &mut Call,
+    shed: Option<Unplaced>,
+) -> Result<Placement<'a>, Unplaced> {
+    /// `pair` with each side's places beside its list.
+    fn held<'w>(pair: PairLists<'w>, prefills: &'w [u32], decodes: &'w [u32]) -> PairLists<'w> {
+        PairLists {
+            prefill_places: Some(prefills),
+            decode_places: Some(decodes),
+            ..pair
+        }
+    }
+    if call.named_pair {
+        return Err(shed.unwrap_or(Unplaced::NoWorkers));
+    }
+    let (mut prefills, mut decodes) = (None, None);
+    // The rule is asked of a list once a call: behind the first ask.
+    if call.spent == 0 {
+        hold_to_rule(
+            request,
+            Some(lists.prefill),
+            lists.prefill_places,
+            &mut prefills,
+        )?;
+        hold_to_rule(
+            request,
+            Some(lists.decode),
+            lists.decode_places,
+            &mut decodes,
+        )?;
+    }
+    // A shed stands where the rule was not asked here: behind a later ask,
+    // and under no rule.
+    if let (Some(shed), None) = (shed, &prefills) {
+        return Err(shed);
+    }
+    let lent = match (request.lists, &prefills, &decodes) {
+        (WorkerLists::Pair(pair), Some(prefills), Some(decodes)) => {
+            WorkerLists::Pair(held(pair, prefills, decodes))
+        }
+        // Three lists with no item are decided as their pair.
+        (WorkerLists::Encode(three), Some(prefills), Some(decodes)) => {
+            WorkerLists::Encode(EncodeLists {
+                pair: held(three.pair, prefills, decodes),
+                ..three
+            })
+        }
+        // No places were found here: the next ask is lent what this one was.
+        _ => *lent,
+    };
+    call.again(|call| asks(engine, request, lists, &lent, call))
 }

@@ -64,6 +64,7 @@ pub struct Link {
 /// Why an ask has no usable decision from the controller. The host can
 /// decide the request itself.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum DecisionUnavailable {
     /// The stream holds no credit. Nothing was sent.
     NoCredit,
@@ -1091,6 +1092,7 @@ pub(super) mod tests {
                     request_id: if id == 0 { Vec::new() } else { vec![id] },
                     term,
                     answer: Some(answer),
+                    encode: None,
                 }))
                 .expect("the decide reader takes the frame");
         }
@@ -2023,6 +2025,7 @@ pub(super) mod tests {
             request_id: vec![1],
             term: WELCOME_TERM,
             answer: Some(answer),
+            encode: None,
         };
         let shared = &link.shared;
         shared.read_decide(first, late(decision(7, &[Side::Single])));

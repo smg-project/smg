@@ -44,7 +44,7 @@ pub use decision_engine::{
     HeldDecision, HeldDecode, Leased, Plain, Request, RequestMaker,
 };
 #[cfg(feature = "in-process")]
-pub use decision_engine::{TokenKey, WorkerLists};
+pub use decision_engine::{TextKey, TokenKey, WorkerLists};
 pub use decision_slot::{DecisionSlot, DecisionSlotGuard};
 pub use demands::{DemandFacts, Demands, References, UnmetDemand};
 pub use explain::{DecisionNames, DecisionRecord};
@@ -79,7 +79,7 @@ pub use policy_engine::{PolicyEngine, SpecHandle};
 pub use prompt_hashes::{HashSeeds, PromptHashes};
 #[cfg(feature = "in-process")]
 pub use records::{decide, worker_id, worker_rank, DecisionClock, Live, PoolRecords};
-pub use shadow::SHADOW_ROWS;
+pub use shadow::{ShadowCount, ShadowSide, SHADOW_ROWS};
 pub use sticky_sessions::{
     DecodeVerdict, SessionExpiry, SessionPins, SessionRule, SessionTable, SessionVerdict,
     ABSENT_WORKER_PIN_TTL_MICROS,

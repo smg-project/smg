@@ -21,11 +21,11 @@
 //!
 //! What a membership build derives (where each pool stands, each pool's
 //! shape) is built once and shared by every world until the next membership
-//! build. A world's epoch is the membership's at its build and is the one
-//! thing to compare between two worlds' pools: a world's identity moves
-//! with every publication. The pair classes are derived with the shapes
-//! where a write moved a member or an offer, and once more where a
-//! generation moves the pairing mode: a new world of the same epoch.
+//! build. A world's epoch is the membership's at its build: a world's
+//! identity moves with every publication. The pair classes are derived
+//! with the shapes where a write moved a member or an offer, and once more
+//! where a generation moves the pairing mode: a new world of the same
+//! epoch.
 //! Between two membership builds a publication derives nothing: it is one
 //! small object, a pointer per pool, and new rows for each pool a write was
 //! folded into.
@@ -41,13 +41,6 @@
 //! of writes that moved no member and no member's offer carries the last
 //! build's classes and reads no member's facts for them. Two workers'
 //! writes are one whole derivation.
-//!
-//! **The encode classes stand beside them.** Where a model's encoders state
-//! an end of the encode handoff, the same write derives which encoders each
-//! prefill's handoff reaches ([`EncodeClasses`]), by the rows of the two
-//! pools. A write carries them in every model whose encoders and prefills
-//! it leaves as they stood, a decode's write and another model's among
-//! them, and derives them whole in the models it moves one of.
 //!
 //! A row in a pool is the candidate row itself. Its fixed fields are
 //! written when the membership's first world is built. Its moving facts
@@ -74,7 +67,7 @@
 //! waits for an owed build, and else publishes by itself when the last
 //! window is a window old; one that lands inside the window waits, and the
 //! sink names the instant it is due
-//! ([`LoadSink::publish_due`](crate::store::LoadSink::publish_due)).
+//! ([`MemoryStore::publish_due`](crate::store::MemoryStore::publish_due)).
 //!
 //! **A veto is published in its gateway's run.** The writer keeps
 //! each gateway's list and publishes each pool's standing vetoes as one run
@@ -84,6 +77,11 @@
 //! window's publication that drops a veto past its end build every run
 //! again. A veto leaves with its worker's row in the membership build's own
 //! step, so no publication shows the row without it.
+
+#![expect(
+    clippy::exhaustive_structs,
+    reason = "the store's views for a decision leave the crate, and their types with them"
+)]
 
 use std::{
     mem,
@@ -98,23 +96,17 @@ use crate::engine::policy_engine::PolicyEngine;
 use crate::{
     document::spec::{AppliedSpec, Pairing, ViewListPositions},
     engine::{
-        framework::{Engine, OverloadThresholds},
+        framework::OverloadThresholds,
         view::{fingerprint, Candidate, Health, Phase, Role, WorkerId},
     },
-    load::signals::ReportSignals,
-    stages::lifecycle::Lifecycle,
     store::{
         applied::Applied,
-        encoding::{EncodeClasses, EncodeMember},
         loads::LoadSample,
         pairing::{known, Derivation, Member, PairClasses, Pool},
         workers::{Overload, Reachability, WorkerFacts, WorkerRow, WorkerStatus},
         GatewayId,
     },
-    tracking::{
-        in_flight::{InFlightCounts, WorkerSlot},
-        lease::Signal,
-    },
+    tracking::in_flight::{InFlightCounts, WorkerSlot},
 };
 
 #[cfg(test)]
@@ -145,11 +137,6 @@ struct PoolShape {
     /// ([`Classes::Carry`]) and a written worker's derive that leaves them
     /// as they were ([`Classes::Written`]).
     pairs: Option<Arc<PairClasses>>,
-    /// The encode classes of the pool's model, on its prefill pool where an
-    /// encoder of the model states an end: a decision that carries encode
-    /// items reads its chosen prefill's class beside the pool it chose in.
-    /// Counted and carried as the pair classes are.
-    encodes: Option<Arc<EncodeClasses>>,
 }
 
 /// The roles a model's pools are derived for: one slot each.
@@ -212,65 +199,10 @@ impl Derived {
         self.prefill(model)?.pairs.as_ref()
     }
 
-    /// The encode classes of `model`, where it has a prefill and an encoder
-    /// that states an end.
-    fn encodes(&self, model: &str) -> Option<&Arc<EncodeClasses>> {
-        self.prefill(model)?.encodes.as_ref()
-    }
-
-    /// The shapes of `model`'s encode pool and of its prefill pool, each
-    /// where the model has one, by one read of the model's pools.
-    fn ends(&self, model: &str) -> Option<Ends<'_>> {
-        let pools = self.by_model.get(model)?;
-        let shape =
-            |role: Role| pools[role_slot(role)].and_then(|pool| self.pools.get(pool as usize));
-        Some(Ends {
-            encode: shape(Role::Encode),
-            prefill: shape(Role::Prefill),
-        })
-    }
-
     /// How many members `pool` holds: none where there is no pool.
     fn members(&self, pool: Option<u32>) -> usize {
         pool.and_then(|pool| self.pools.get(pool as usize))
             .map_or(0, |shape| shape.booked.len())
-    }
-}
-
-/// The two pools of one model that the encode handoff reads, as one write
-/// left them: the shape of its encode pool and of its prefill pool, each
-/// where the model has one.
-#[derive(Clone, Copy)]
-struct Ends<'a> {
-    encode: Option<&'a PoolShape>,
-    prefill: Option<&'a PoolShape>,
-}
-
-impl Ends<'_> {
-    /// Whether a write that asks `classes` left both pools as they stand
-    /// here, `sides` being the model's members after it: no member of
-    /// either joined or left, and the written worker is in neither. One
-    /// worker's write moves that worker's rows alone, so two sides of these
-    /// pools' lengths that do not hold the worker are these pools' sides,
-    /// row for row.
-    fn stand(&self, classes: Classes, sides: &[Vec<Entry<'_>>; ROLES]) -> bool {
-        let joined = match classes {
-            Classes::Carry => return true,
-            Classes::Derive => return false,
-            Classes::Written { joined, .. } => joined,
-        };
-        [(Role::Encode, self.encode), (Role::Prefill, self.prefill)]
-            .into_iter()
-            .all(|(role, shape)| {
-                let entries = &sides[role_slot(role)];
-                let holds = |id: WorkerId| {
-                    entries
-                        .binary_search_by_key(&id, |entry| entry.row.id)
-                        .is_ok()
-                };
-                entries.len() == shape.map_or(0, |shape| shape.booked.len())
-                    && !joined.is_some_and(holds)
-            })
     }
 }
 
@@ -640,6 +572,8 @@ pub struct OutsideLists {
 /// engine of its generation and its gateway's standing vetoes. A world never
 /// changes once published.
 pub struct StoreSnapshot {
+    /// The store's epoch at the membership write this world's pools were
+    /// derived by. A status change moves the store's epoch and no world's.
     epoch: u64,
     origin: Instant,
     derived: Arc<Derived>,
@@ -668,16 +602,6 @@ impl std::fmt::Debug for StoreSnapshot {
 }
 
 impl StoreSnapshot {
-    /// The store's epoch at the membership write this world's pools were
-    /// derived by: the one thing to compare between two worlds' pools. A
-    /// status change moves the store's epoch and no world's, and a
-    /// publication between two membership writes is a new world of the same
-    /// epoch. The pair classes move once more, at a generation of another
-    /// pairing mode ([`StoreSnapshot::pairs`]).
-    pub fn epoch(&self) -> u64 {
-        self.epoch
-    }
-
     /// The generation this world was published under: the engine a decision
     /// over these rows runs, and its number. The store starts under the
     /// unbound generation ([`AppliedSpec::unbound`]), and a reader that saw
@@ -690,6 +614,12 @@ impl StoreSnapshot {
     /// hands the engine under a borrow of the world, never an owned world,
     /// whose shared count a deciding thread would write.
     pub fn spec(&self) -> &AppliedSpec {
+        &self.spec
+    }
+
+    /// This publication's document as its store holds it ([`Applied`]):
+    /// what a word of the store's membership and its host's tick reach.
+    pub(crate) fn applied(&self) -> &Applied {
         &self.spec
     }
 
@@ -709,43 +639,6 @@ impl StoreSnapshot {
     #[cfg(feature = "controller")]
     pub(crate) fn samples_decisions(&self) -> bool {
         self.samples_decisions
-    }
-
-    /// Tells this world's engine each rank's report, where a stage of it
-    /// keeps a number of them ([`Lifecycle::keeps_loads`]): what the store
-    /// does before it shows a world, so a decision over the world finds
-    /// the numbers of its own rows. An engine with no such stage says so
-    /// by one word made at its build, and the tell is not entered: by
-    /// count the call alone read 29 instructions a publication.
-    pub(crate) fn tell_kept_loads(&self) {
-        let engine = self.spec.engine();
-        if engine.keeps_loads() {
-            self.tell_loads(engine);
-        }
-    }
-
-    /// Tells each stage of `engine` that keeps a number of the reports
-    /// each rank's report as this world shows it to a decision, with the
-    /// rank's slot, the report's sample instant and no named value
-    /// ([`Signal::Load`]). A stage that keeps none is sent nothing. A
-    /// member of several pools is told once a pool, the same word.
-    pub fn tell_loads(&self, engine: &Engine) {
-        engine.tell_loads(|tell| {
-            for (rows, shape) in self.rows.iter().zip(self.derived.pools.iter()) {
-                for (row, &slot) in rows.iter().zip(shape.booked.iter()) {
-                    if let Some(load) = row.load {
-                        tell(&Signal::Load {
-                            worker: row.id,
-                            dp_rank: row.dp_rank,
-                            row: load,
-                            slot,
-                            sampled_at_micros: row.load_sampled_at_micros,
-                            signals: ReportSignals::NONE,
-                        });
-                    }
-                }
-            }
-        });
     }
 
     /// `at` in the rows' clock: microseconds since the store's origin.
@@ -786,23 +679,9 @@ impl StoreSnapshot {
     /// the table a pair decision reads beside the two pools
     /// ([`PairClasses::table`]); `None` when the model has no prefill or no
     /// decode. A membership write derives them, and so does a generation of
-    /// another pairing mode at the same epoch: the epoch alone does not key
-    /// the classes a reader keeps across worlds.
+    /// another pairing mode at the same epoch.
     pub fn pairs(&self, model: &str) -> Option<&PairClasses> {
         self.derived.pairs(model).map(|classes| &**classes)
-    }
-
-    /// The encode classes of `model` as this world's pools were derived: the
-    /// class each row of its prefill pool names and each
-    /// class's encoders by their rows in its encode pool, another gateway's
-    /// host-local rows counted ([`EncodeClasses`]). A class's number is read
-    /// under this world's borrow and never kept. `None` when the model has
-    /// no prefill or no encoder that states an end. A membership write that
-    /// moves one of the model's encoders or prefills derives them, and so
-    /// does a generation of another pairing mode at the same epoch, as it
-    /// does the pair classes ([`StoreSnapshot::pairs`]).
-    pub fn encodes(&self, model: &str) -> Option<&EncodeClasses> {
-        self.derived.encodes(model).map(|classes| &**classes)
     }
 
     fn pool(&self, model: &str, role: Role) -> Option<(&[Candidate], &PoolShape)> {
@@ -988,11 +867,7 @@ impl<'a> Pool<'a> for [Entry<'a>] {
     }
 }
 
-/// What a membership write asks of a model's classes. The pair classes
-/// follow each variant's words. The encode classes are carried under
-/// [`Classes::Carry`], and under [`Classes::Written`] in every model whose
-/// encoders and prefills the write left as they stood ([`Ends::stand`]).
-/// Elsewhere they are derived whole.
+/// What a membership write asks of a model's pair classes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Classes {
     /// Every model's classes are derived whole: a generation of another
@@ -1049,20 +924,17 @@ impl Classes {
 /// Whether two versions of one worker's facts stand in the same pools with
 /// the same offer: the role and the models place a worker in its pools, and
 /// the wires, the runtime and the descriptor are what the pairing rule reads of
-/// it, the runtime as an offer holds it ([`known`]); the runtime and the
-/// stated end are what [`encode_member`] reads. A write from one such
-/// version to the other moves no pair class and no encode class. The
-/// models are read as they are listed: a refresh that only reorders them
-/// is answered as a moved offer, for that worker alone, where
-/// [`WorkerFacts::same_models`] reads the reorder as the same worker for
-/// the status a new incarnation takes.
+/// it, the runtime as an offer holds it ([`known`]). A write from one such
+/// version to the other moves no pair class. The models are read as they
+/// are listed: a refresh that only reorders them is answered as a moved
+/// offer, for that worker alone, where [`WorkerFacts::same_models`] reads
+/// the reorder as the same worker for the status a new incarnation takes.
 pub(super) fn same_offer(old: &WorkerFacts, new: &WorkerFacts) -> bool {
     old.role == new.role
         && old.models == new.models
         && old.wire_modes == new.wire_modes
         && known(&old.engine_kind) == known(&new.engine_kind)
         && old.pairing == new.pairing
-        && old.encode == new.encode
 }
 
 /// The models `old` stands in a pool of and `new` does not, where both are
@@ -1132,48 +1004,6 @@ fn pair_up(
         }
     }
     Some(classes)
-}
-
-/// What the encode handoff's rule reads of one entry: its worker's runtime
-/// and stated end.
-fn encode_member<'a>(entry: &Entry<'a>) -> EncodeMember<'a> {
-    EncodeMember {
-        runtime: &entry.facts.engine_kind,
-        offer: &entry.facts.encode,
-    }
-}
-
-/// One model's encode classes, each side in its rows' order: what the last
-/// write left on the model's prefill pool (`last_prefill`), classes or
-/// none, where this write left the model's encoders and prefills as they
-/// stood ([`Ends::stand`]), else derived. `None` when the model has none:
-/// no prefill, or no encoder that states an end. A model with no encoder
-/// pays no derivation, and a write that carries pays none whatever the
-/// model holds.
-fn encode_up(
-    sides: &[Vec<Entry<'_>>; ROLES],
-    last_prefill: Option<&PoolShape>,
-) -> Option<Arc<EncodeClasses>> {
-    let encoders = &sides[role_slot(Role::Encode)];
-    let prefills = &sides[role_slot(Role::Prefill)];
-    if let Some(last) = last_prefill {
-        debug_assert!(
-            last.encodes.iter().all(|classes| {
-                classes.encoders().len() == encoders.len()
-                    && classes.prefills().len() == prefills.len()
-            }),
-            "the classes are these members'"
-        );
-        return last.encodes.clone();
-    }
-    if encoders.is_empty() || prefills.is_empty() {
-        return None;
-    }
-    let classes = EncodeClasses::derive(
-        encoders.iter().map(encode_member),
-        prefills.iter().map(encode_member),
-    );
-    (classes.classes() != 0).then(|| Arc::new(classes))
 }
 
 /// One member's row in one pool of the writer's working copy.
@@ -2312,17 +2142,9 @@ impl Writer {
                 .all(|entries| entries.is_sorted_by(|a, b| a.row.id < b.row.id)));
             // The model's classes go on its prefill pool's shape: a model
             // that has classes has that pool.
-            // One read of the last write's pools of the model serves its
-            // pair classes and its encode classes.
-            let ends = last.as_deref().and_then(|last| last.ends(&model));
-            let carried = ends.and_then(|ends| ends.prefill?.pairs.as_ref());
+            let carried = last.as_deref().and_then(|last| last.pairs(&model));
             let (mode, kept) = (self.spec.pairing(), &mut self.derivations);
             let mut pairs = pair_up(&mut sides, mode, classes, carried, kept, &model);
-            // The encode classes are the last write's in every model whose
-            // encoders and prefills this write left as they stood, and
-            // derived whole in the others.
-            let stood = ends.filter(|ends| ends.stand(classes, &sides));
-            let mut encodes = encode_up(&sides, stood.and_then(|ends| ends.prefill));
             let mut indexes = [None; ROLES];
             for (side, entries) in sides.into_iter().enumerate() {
                 if entries.is_empty() {
@@ -2348,11 +2170,6 @@ impl Writer {
                     booked: entries.iter().map(|entry| entry.booked).collect(),
                     pairs: if side == role_slot(Role::Prefill) {
                         pairs.take()
-                    } else {
-                        None
-                    },
-                    encodes: if side == role_slot(Role::Prefill) {
-                        encodes.take()
                     } else {
                         None
                     },

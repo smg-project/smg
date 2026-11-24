@@ -1043,9 +1043,9 @@ impl AppContextBuilder {
     /// and this start says so in one log line.
     ///
     /// A document whose `explain.sample` is not zero is named in one warn
-    /// line, ahead of its check: the engine this process hosts keeps no
-    /// sample (the served controller alone does), and the document is not
-    /// refused for it.
+    /// line, ahead of its check: the engine this process hosts keeps the
+    /// sample, and no route of this gateway reads a kept record yet. The
+    /// document is not refused for it.
     fn policy_in_force(
         config: &RouterConfig,
         stages: Option<&StageRegistry>,
@@ -1063,13 +1063,13 @@ impl AppContextBuilder {
         let document = config
             .policy_document_in_force()
             .map_err(|refused| format!("policy controller: {refused}"))?;
-        // One document may serve this gateway and a served controller that
-        // keeps the sample, so the field is named here and not refused.
+        // The engine keeps the sample and this gateway has no route that
+        // reads one yet, so the field is named here and not refused.
         if document.explain.sample != 0 {
             tracing::warn!(
                 sample = document.explain.sample,
-                "The policy document sets explain.sample, and the policy engine this gateway \
-                 hosts keeps no sample of its decisions"
+                "The policy document sets explain.sample: the policy engine this gateway hosts \
+                 keeps the sample, and no route of this gateway reads a kept record yet"
             );
         }
         let checked = match stages {
@@ -2303,10 +2303,11 @@ policy:
         monitor.stop().await;
     }
 
-    /// The engine this process hosts keeps no sample of its decisions. A
-    /// supplied document that leaves `explain.sample` at zero is taken
-    /// without a word, and one that sets it is taken with one warn line.
-    /// One the check refuses is named too, ahead of its refusal.
+    /// The engine this process hosts keeps the sample, and no route of this
+    /// gateway reads a kept record yet. A supplied document that leaves
+    /// `explain.sample` at zero is taken without a word, and one that sets
+    /// it is taken with one warn line that says so. One the check refuses
+    /// is named too, ahead of its refusal.
     #[traced_test]
     #[test]
     fn a_documents_explain_sample_is_named_at_the_start() {
@@ -2329,8 +2330,10 @@ policy:
                 .iter()
                 .filter(|line| line.contains("explain.sample"))
                 .collect();
+            let said = "keeps the sample, and no route of this gateway reads a kept record yet";
+            let warns = |line: &&&str| line.contains("WARN") && line.contains("sample=10");
             match named.as_slice() {
-                [line] if line.contains("WARN") && line.contains("sample=10") => Ok(()),
+                [line] if warns(line) && line.contains(said) => Ok(()),
                 _ => Err(format!("the lines that name explain.sample: {named:?}")),
             }
         });

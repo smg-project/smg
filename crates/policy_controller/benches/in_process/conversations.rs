@@ -10,6 +10,13 @@
 //! call instead, which is handed the token ids and the turn's entry, and
 //! under `--entry place_ruled` a route's rule too.
 //!
+//! The host of the cell named `recorded` lends no tree. The engine then
+//! names a turn's holders by its own record of the prefixes it sent, and
+//! writes the record behind the pick. An engine does the same under a host
+//! that keeps an index of cache events for the model, for the workers the
+//! index does not hear: it walks a lent tree only where its host keeps no
+//! such index.
+//!
 //! A caller makes its prompts before its first turn, about half a kilobyte
 //! a decision, so such a cell is run with a stated `--decisions`, and stops
 //! at its start where the callers' prompts outgrow the token ids. Its line

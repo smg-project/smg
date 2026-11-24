@@ -221,6 +221,7 @@ struct Bound {
 
 /// Where a bound controller listens.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct Addresses {
     /// The gRPC listeners, in configuration order.
     pub listeners: Vec<ListenerAddress>,
@@ -230,6 +231,7 @@ pub struct Addresses {
 
 /// One bound gRPC listener.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct ListenerAddress {
     /// The listener's name.
     pub name: String,
@@ -253,6 +255,7 @@ impl Addresses {
 
 /// A controller that did not start or did not serve.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     /// The configuration was refused.
     #[error("configuration: {0}")]
@@ -464,19 +467,24 @@ impl Controller {
         let woken = objects.clone();
         let journal =
             replication::journaled_waking(&config.election.lease, config.decide_shards, objects);
-        let workers = Arc::new(worker_objects::WorkerObjects::new(
+        let workers = Arc::new(worker_objects::WorkerObjects::stating(
             Arc::clone(&journal.0),
             woken,
+            config.worker_overload,
         ));
         let kv_feed = KvFeed::new(Arc::clone(&journal.0), workers.holder());
         let prober = worker_objects::Prober::new(Arc::clone(&workers), elector.fence());
         // The load monitor is built stopped, ahead of the deciding threads:
         // each takes its channel at its start, and the serve runs its task.
         let monitor = worker_objects::LoadMonitor::new(&workers, config.load_poll_interval);
-        // The load records that ride the workers' event streams go to the
-        // monitor while this replica leads: the feed takes their sink
-        // ahead of its first stream.
+        // The load records on the workers' streams go to the monitor while
+        // this replica leads: the feed takes their sink ahead of its first
+        // stream.
         kv_feed.set_load_sink(monitor.pushed());
+        // The monitor says whose loads are wanted, so a gRPC worker that is
+        // not indexed streams its load records alone. Every replica opens
+        // that stream: a take finds it open.
+        kv_feed.set_loads_wanted(monitor.wanted());
         let mut shared = Shared::new(
             config.controller_id.clone(),
             address.unwrap_or_default(),
@@ -509,6 +517,7 @@ impl Controller {
                     &workers.holder(),
                     Arc::new(door),
                     Arc::clone(&shared.fence),
+                    config.worker_overload,
                 )
                 .map(Box::new)
             })
@@ -937,7 +946,7 @@ impl Controller {
         // world as a leader's own does.
         let (published, publications_stop) = (Arc::clone(&store), stop.subscribe());
         tasks.spawn(async move {
-            publications::run(&*published, publications_stop).await;
+            publications::run(&published, publications_stop).await;
             Ok(())
         });
         // The load monitor's counts are read where they are rendered: the
@@ -981,7 +990,7 @@ impl Controller {
                 Ok(())
             });
             // The load monitor runs under the same word: a replica that
-            // does not lead asks no engine for its load either. Its stop
+            // does not lead polls no engine for its load either. Its stop
             // publishes the snapshot empty for the deciding threads, but
             // for the one loop `LoadMonitor::run` names.
             let (loads_stop, led) = (stop.subscribe(), shared.role.subscribe());
@@ -1591,6 +1600,54 @@ mod tests {
             }
             terms.dedup();
             assert_eq!(terms, [1, 2], "the term of the mark, then the next");
+            stop.send(()).expect("the serve waits for its stop");
+        };
+        let (served, ()) = timeout(Duration::from_secs(60), async { tokio::join!(serve, case) })
+            .await
+            .expect("the serve ends at its stop");
+        served.expect("a serve that leaves by its signal");
+    }
+
+    /// The serve's presence sweep runs the upkeep of the engine its store
+    /// decides by, which runs no task of its own, and the store tells that
+    /// engine each worker that leaves. Served picks write the record of the
+    /// prefixes sent for their model. Once the model's last worker left,
+    /// the record is gone within the sweep's period, with no request behind
+    /// the leaves.
+    #[tokio::test]
+    async fn a_served_controller_keeps_no_sent_prefixes_of_a_model_whose_workers_left() {
+        let controller = Controller::bind(valid()).await.expect("the listeners bind");
+        let (shared, store) = (Arc::clone(&controller.shared), controller.store());
+        let (stop, stopped) = oneshot::channel::<()>();
+        let serve = controller.serve(async {
+            let _ = stopped.await;
+        });
+        let case = async {
+            let (wait, begun) = (Duration::from_secs(20), Instant::now());
+            while shared.fence.leader_term(Instant::now()).is_none() {
+                assert!(begun.elapsed() < wait, "no first take");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            let (singles, sides) = bed::fleet(&store);
+            let applied = store.apply(bed::preset("cache_aware", 1));
+            applied.expect("above the unbound start");
+            let records = || store.deciding(|world| world.front().affinity().held());
+            let (sender, mut answers) = mpsc::channel(64);
+            let read = bed::burst_of(&shared.deciders, &sender, &mut answers, bed::hashed).await;
+            assert!(read.iter().any(Result::is_ok), "no pick: {read:?}");
+            let sent = records();
+            assert!(
+                matches!(sent.as_slice(), [(_, workers)] if !workers.is_empty()),
+                "one model's record, of the workers its picks named: {sent:?}"
+            );
+            for id in singles.into_iter().chain(sides.map(|(_, id)| id)) {
+                let revision = store.get(id).expect("the row").revision;
+                store.remove(id, revision).expect("a removal");
+            }
+            while !records().is_empty() {
+                assert!(begun.elapsed() < wait, "a record no worker is left in");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
             stop.send(()).expect("the serve waits for its stop");
         };
         let (served, ()) = timeout(Duration::from_secs(60), async { tokio::join!(serve, case) })

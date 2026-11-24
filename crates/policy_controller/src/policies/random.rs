@@ -34,6 +34,7 @@ pub(crate) fn profile() -> ProfileSpec {
 /// distinct draws as alternates. A place's pick is one draw of the calling
 /// thread's own and names no alternate ([`Picker::pick_alone`]).
 #[derive(Debug, Default)]
+#[expect(clippy::exhaustive_structs, reason = "no field: its name is its value")]
 pub struct Random;
 
 impl Lifecycle for Random {}

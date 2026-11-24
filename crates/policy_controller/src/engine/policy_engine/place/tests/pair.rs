@@ -1,6 +1,8 @@
 //! The cases of a request with a pair's two lists.
 
 mod decode_again;
+mod named;
+mod ruled;
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
@@ -234,6 +236,33 @@ fn a_pair_is_placed_on_the_first_target_both_of_whose_workers_can_be_sent_to() {
     assert_eq!(engine.place(&request).err(), Some(Unplaced::NoWorkers));
 }
 
+/// Under a document that keeps a sample of its decisions, a pair's first
+/// decision is kept as it was answered and found by its request's id: the
+/// pick whose first target names both workers of the placement, under the
+/// pair's binding. A request of another id finds nothing.
+#[test]
+fn a_pairs_first_decision_is_kept_and_found_by_its_request() {
+    let mut document = PolicySpec::pair_presets("round_robin", "round_robin").expect("presets");
+    document.generation = 1;
+    document.explain.sample = 1;
+    let engine = hosted(engine_of(&document));
+    let lists = Lists::of(2, 2);
+    let classes = lists.every();
+    let request = PlaceRequest {
+        request_id: Some("pair-1"),
+        ..PlaceRequest::of(MODEL, WorkerLists::Pair(lists.under(&classes, &Open)))
+    };
+    let placement = engine.place(&request).expect("a placement");
+    let record = engine.explained(b"pair-1").expect("the decision is kept");
+    let pick = record.decision.pick().expect("a pick");
+    let first = pick.targets.first().expect("a target");
+    let named = (first.id, first.pair.map(|pair| pair.decode_id));
+    assert_eq!(named, (placement.id(), placement.decode_id()));
+    let names = record.names(engine.standing_spec().engine());
+    assert_eq!(names.expect("its names").plan, "pd-pair");
+    assert_eq!(engine.explained(b"pair-2"), None);
+}
+
 /// A side that cannot be sent to is left out of the next ask by its own
 /// id, and the side that held stays a candidate of it. A pair's targets
 /// share one prefill, so a prefill that cannot be sent to fails every
@@ -255,7 +284,7 @@ fn a_side_that_cannot_be_sent_to_is_left_out_of_the_next_ask_by_its_own_id() {
     let pair = lists.under(&classes, &Open);
     let request = PlaceRequest::of(MODEL, WorkerLists::Pair(pair));
     let mut call = Call::default();
-    let first = ask(engine.loaded(), &request, &pair, &mut call);
+    let first = ask(engine.loaded(), &request, &pair, &request.lists, &mut call);
     assert!(matches!(first, Ok(None)), "no target holds");
     assert_eq!(
         call.missed,
@@ -271,7 +300,7 @@ fn a_side_that_cannot_be_sent_to_is_left_out_of_the_next_ask_by_its_own_id() {
             ("released CommitFailed".to_owned(), lists.decode_id(0)),
         ]
     );
-    let second = ask(engine.loaded(), &request, &pair, &mut call);
+    let second = ask(engine.loaded(), &request, &pair, &request.lists, &mut call);
     let second = second.expect("an answer").expect("a placement");
     assert_eq!(lists.places(&second), (1, 0), "the decode is named again");
     drop(second);
@@ -287,7 +316,7 @@ fn a_side_that_cannot_be_sent_to_is_left_out_of_the_next_ask_by_its_own_id() {
         decode.set_status(WorkerStatus::NotReady);
     }
     let mut call = Call::default();
-    let third = ask(engine.loaded(), &request, &pair, &mut call);
+    let third = ask(engine.loaded(), &request, &pair, &request.lists, &mut call);
     assert!(matches!(third, Ok(None)));
     assert_eq!(call.missed, [lists.decode_id(0), lists.decode_id(1)]);
 
@@ -295,7 +324,7 @@ fn a_side_that_cannot_be_sent_to_is_left_out_of_the_next_ask_by_its_own_id() {
     // the prefill every target of the decision names joins once.
     lists.prefills[0].set_status(WorkerStatus::NotReady);
     let mut call = Call::default();
-    let fourth = ask(engine.loaded(), &request, &pair, &mut call);
+    let fourth = ask(engine.loaded(), &request, &pair, &request.lists, &mut call);
     assert!(matches!(fourth, Ok(None)));
     assert_eq!(
         call.missed,
@@ -306,7 +335,7 @@ fn a_side_that_cannot_be_sent_to_is_left_out_of_the_next_ask_by_its_own_id() {
     // told to leave decode 1 out, it names the prefill and decode 0.
     let mut call = Call::default();
     call.missed.push(lists.decode_id(1));
-    let fifth = ask(engine.loaded(), &request, &pair, &mut call);
+    let fifth = ask(engine.loaded(), &request, &pair, &request.lists, &mut call);
     assert!(matches!(fifth, Ok(None)));
     assert_eq!(
         call.missed,
@@ -361,7 +390,7 @@ fn no_pair_crosses_the_classes_its_caller_states() {
     let request = PlaceRequest::of(MODEL, WorkerLists::Pair(pair));
     lists.decodes[0].set_status(WorkerStatus::NotReady);
     let mut call = Call::default();
-    let held = ask(keeps.loaded(), &request, &pair, &mut call);
+    let held = ask(keeps.loaded(), &request, &pair, &request.lists, &mut call);
     assert!(matches!(held, Ok(None)), "prefill 0 has no other partner");
     assert_eq!(call.missed, [lists.decode_id(0)]);
 }
@@ -690,11 +719,11 @@ fn the_routes_rule_is_asked_of_both_workers_of_a_pairs_target() {
     assert_eq!((engine.faults(), engine.unheard()), (0, 0));
 }
 
-/// A pair's call makes three decisions at most: none of them is held to
-/// the workers a route's rule takes. Over lists whose first three prefills
-/// cannot be sent to, each decision names the next prefill, each is given
-/// up by name, and the request has no worker though a fourth prefill could
-/// be sent to.
+/// A pair's call makes three decisions at most, and those of a request
+/// that states no rule are held to no worker. Over lists whose first three
+/// prefills cannot be sent to, each decision names the next prefill, each
+/// is given up by name, and the request has no worker though a fourth
+/// prefill could be sent to.
 #[test]
 fn a_pairs_call_makes_three_decisions_at_most() {
     let (engine, heard) = paired(false);

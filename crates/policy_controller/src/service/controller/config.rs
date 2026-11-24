@@ -5,7 +5,16 @@
 //! shutdown bounds, and worker discovery settings when built with discovery.
 //! The configuration is validated before anything binds.
 
+#![expect(
+    clippy::exhaustive_structs,
+    reason = "a caller still builds or matches these types whole: each mark comes with its call"
+)]
+
 use std::{collections::BTreeMap, fmt, net::SocketAddr, path::PathBuf, thread, time::Duration};
+
+use smg_worker::health::overload::{
+    OverloadThresholds, DEFAULT_TOKEN_USAGE_CEILING, DEFAULT_WAITING_REQUESTS,
+};
 
 #[cfg(feature = "discovery")]
 pub use super::discovery::DiscoverySettings;
@@ -16,6 +25,7 @@ use super::election::ElectionConfig;
 /// configuration names none.
 #[cfg(not(feature = "discovery"))]
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[expect(clippy::exhaustive_enums, reason = "no case: discovery is not built")]
 pub enum DiscoverySettings {}
 
 /// A credentialed group of the controller's calls (design 8). Each scope is
@@ -23,6 +33,7 @@ pub enum DiscoverySettings {}
 /// credential rule is its scopes' rule, so scopes with different rules go
 /// on different listeners.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[non_exhaustive]
 pub enum Scope {
     /// `Session`, `Decide` and `WatchWorkers`: the gateways' calls. Mutual
     /// TLS, or a per-gateway bearer whose verified subject is the gateway id
@@ -99,8 +110,9 @@ pub struct Listener {
     pub tls: Option<Tls>,
 }
 
-/// The controller's start-up configuration.
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// The controller's start-up configuration. It is compared by `PartialEq`
+/// alone: its overload usage is a ratio.
+#[derive(Clone, Debug, PartialEq)]
 pub struct Config {
     /// This controller's identity: the holder of the leases it takes
     /// (design 10, `controller-id@host:port`) and the name on its log lines.
@@ -129,6 +141,16 @@ pub struct Config {
     /// `--load-monitor-interval`. The monitor polls by the interval cut to
     /// whole seconds, and by one second for less.
     pub load_poll_interval: Duration,
+    /// The overload thresholds the object of an engine's worker states for
+    /// each signal its registration names none for (design, decision 10):
+    /// the gateway's `--worker-overload-waiting-requests` and
+    /// `--worker-overload-token-usage`. A registration's own threshold
+    /// stands over each, and an external worker's object takes none of
+    /// them. A worker at or above a threshold is vetoed: a count is from 1
+    /// to `i64::MAX`, the most a load report states, and a usage is above 0
+    /// and at most 1. A signal that states none has no default: a worker
+    /// that registers none for it is not judged by it.
+    pub worker_overload: OverloadThresholds,
     /// How many threads decide (design 5.5): a model's decisions all run on
     /// one of them, behind one bounded queue. From 1 to
     /// [`Config::MAX_DECIDE_SHARDS`].
@@ -163,6 +185,22 @@ impl Config {
     pub const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
     /// The default load poll interval, the gateway's.
     pub const DEFAULT_LOAD_POLL_INTERVAL: Duration = Duration::from_secs(10);
+    /// The default overload thresholds, those of the gateway's two flags:
+    /// the worker crate's two numbers, 8 queued requests and a usage of
+    /// 0.8. They are this crate's own two defaults, by which the store
+    /// judges under a binding whose block is on
+    /// ([`OVERLOAD_WAITING_REQUESTS`](crate::document::spec::OVERLOAD_WAITING_REQUESTS),
+    /// [`OVERLOAD_TOKEN_USAGE`](crate::document::spec::OVERLOAD_TOKEN_USAGE)):
+    /// no document names a threshold.
+    ///
+    /// The usage is the worker crate's 64-bit number, as an engine reports
+    /// it. This crate's constant is 32 bits wide: widened, it reads just
+    /// above the 0.8 an engine reports, and a worker at the threshold would
+    /// not be over it.
+    pub const DEFAULT_WORKER_OVERLOAD: OverloadThresholds = OverloadThresholds {
+        waiting_requests: Some(DEFAULT_WAITING_REQUESTS),
+        token_usage: Some(DEFAULT_TOKEN_USAGE_CEILING),
+    };
     /// The most deciding threads a controller starts.
     pub const MAX_DECIDE_SHARDS: usize = 256;
 
@@ -171,6 +209,27 @@ impl Config {
     /// design's count for its busiest fleet.
     pub fn default_decide_shards() -> usize {
         thread::available_parallelism().map_or(1, |cpus| cpus.get().min(8))
+    }
+
+    /// Holds default overload thresholds to their bounds, each signal that
+    /// states one: what [`Self::validate`] asks of
+    /// [`Self::worker_overload`], and the command line of the value each of
+    /// its two flags is typed with.
+    pub(super) fn overload_in_bounds(overload: OverloadThresholds) -> Result<(), ConfigError> {
+        // A worker at or above a threshold is vetoed: a count or a usage of
+        // zero would veto a worker with nothing queued and nothing in use.
+        // So would a count over the most a report states, which the
+        // comparison reads as a negative one. A usage is a fraction, at most
+        // one, and one that is no number compares with none.
+        let out_of_count = |count: &usize| *count == 0 || i64::try_from(*count).is_err();
+        if let Some(count) = overload.waiting_requests.filter(out_of_count) {
+            return Err(ConfigError::OverloadWaitingRequests(count));
+        }
+        let out_of_range = |usage: f64| !usage.is_finite() || usage <= 0.0 || usage > 1.0;
+        if overload.token_usage.is_some_and(out_of_range) {
+            return Err(ConfigError::OverloadTokenUsageOutOfRange);
+        }
+        Ok(())
     }
 
     /// Refuses the configuration by the first field that is wrong.
@@ -250,6 +309,7 @@ impl Config {
         if self.load_poll_interval.is_zero() {
             return Err(ConfigError::ZeroLoadPollInterval);
         }
+        Self::overload_in_bounds(self.worker_overload)?;
         if !(1..=Self::MAX_DECIDE_SHARDS).contains(&self.decide_shards) {
             return Err(ConfigError::DecideShards(self.decide_shards));
         }
@@ -268,6 +328,7 @@ impl Config {
 
 /// A controller setting refused by name.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+#[non_exhaustive]
 pub enum ConfigError {
     /// `controller_id` is empty.
     #[error("the controller id is empty")]
@@ -332,6 +393,16 @@ pub enum ConfigError {
     /// The load poll interval is zero.
     #[error("the load poll interval is zero")]
     ZeroLoadPollInterval,
+    /// A default overload threshold of queued requests outside its range:
+    /// zero, or over the most a load report states. A worker at or above a
+    /// threshold is vetoed, and a count over a report's is read as a
+    /// negative one: either would veto a worker with nothing queued.
+    #[error("a default overload threshold of {0} queued requests: the count is from 1 to {max}, the most a load report states", max = i64::MAX)]
+    OverloadWaitingRequests(usize),
+    /// The default overload threshold of usage is no ratio above 0 and at
+    /// most 1.
+    #[error("the default overload threshold of usage is not above 0 and at most 1: a worker at or above it is vetoed")]
+    OverloadTokenUsageOutOfRange,
     /// A count of deciding threads outside its range.
     #[error("{0} deciding threads: the count is from 1 to {max}", max = Config::MAX_DECIDE_SHARDS)]
     DecideShards(usize),
@@ -429,7 +500,7 @@ pub(crate) mod tests {
         time::Duration,
     };
 
-    use super::{Config, ConfigError, Listener, Scope, Tls};
+    use super::{Config, ConfigError, Listener, OverloadThresholds, Scope, Tls};
     use crate::service::{
         controller::election::{ElectionConfig, LeasePlace},
         elector::ElectionSettings,
@@ -461,6 +532,7 @@ pub(crate) mod tests {
             shutdown_settle: Duration::from_millis(100),
             shutdown_grace: Duration::from_secs(2),
             load_poll_interval: Config::DEFAULT_LOAD_POLL_INTERVAL,
+            worker_overload: Config::DEFAULT_WORKER_OVERLOAD,
             decide_shards: 2,
             election: ElectionConfig::default(),
             discovery: None,
@@ -477,6 +549,67 @@ pub(crate) mod tests {
         assert_eq!(
             config.validate(),
             Err(ConfigError::ListenerNameShared("gateway".to_owned()))
+        );
+    }
+
+    /// A default overload threshold is held to its bounds, by name. A
+    /// worker at or above a threshold is vetoed: a count of zero would veto
+    /// a worker with nothing queued, and so would a count over the most a
+    /// load report states, which is read as a negative one. A usage of zero
+    /// would veto a worker with nothing in use. A usage is a fraction, at
+    /// most one, and one that is no number compares with none.
+    /// The ends are taken: a count of 1 and the most a report states, and a
+    /// usage of 1 and the least above 0. A signal that states none has no
+    /// default and is no refusal, one signal or both.
+    #[test]
+    fn a_default_overload_threshold_is_one_a_worker_can_stay_under() {
+        let stating = |waiting_requests, token_usage| OverloadThresholds {
+            waiting_requests,
+            token_usage,
+        };
+        // The most queued requests a load report states, and the least
+        // usage above zero.
+        let most = usize::try_from(i64::MAX).unwrap_or(usize::MAX);
+        let least = f64::from_bits(1);
+        let mut config = valid();
+        assert_eq!(config.worker_overload, stating(Some(8), Some(0.8)));
+        for taken in [
+            stating(Some(1), Some(1.0)),
+            stating(Some(most), Some(least)),
+            stating(None, Some(0.5)),
+            stating(Some(3), None),
+            stating(None, None),
+        ] {
+            config.worker_overload = taken;
+            assert_eq!(config.validate(), Ok(()), "{taken:?}");
+        }
+        for count in [Some(0), most.checked_add(1)].into_iter().flatten() {
+            for usage in [None, Some(0.5)] {
+                config.worker_overload = stating(Some(count), usage);
+                assert_eq!(
+                    config.validate(),
+                    Err(ConfigError::OverloadWaitingRequests(count)),
+                    "{count} beside {usage:?}"
+                );
+            }
+        }
+        for usage in [0.0, -0.5, 1.0 + f64::EPSILON, 1.5, f64::INFINITY, f64::NAN] {
+            for waiting in [None, Some(1)] {
+                config.worker_overload = stating(waiting, Some(usage));
+                assert_eq!(
+                    config.validate(),
+                    Err(ConfigError::OverloadTokenUsageOutOfRange),
+                    "{usage} beside {waiting:?}"
+                );
+            }
+        }
+        assert_eq!(
+            ConfigError::OverloadWaitingRequests(0).to_string(),
+            "a default overload threshold of 0 queued requests: the count is from 1 to 9223372036854775807, the most a load report states"
+        );
+        assert_eq!(
+            ConfigError::OverloadTokenUsageOutOfRange.to_string(),
+            "the default overload threshold of usage is not above 0 and at most 1: a worker at or above it is vetoed"
         );
     }
 

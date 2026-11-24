@@ -147,6 +147,7 @@ fn encode_pair(c: &mut Criterion) {
                                 one: None,
                                 references: false,
                                 decode_images: false,
+                                ring: None,
                             };
                             let decision = engine.decide_encode_pair(
                                 &facts_of(seed),
@@ -246,6 +247,7 @@ fn left_out(c: &mut Criterion) {
                         one: None,
                         references: false,
                         decode_images: true,
+                        ring: None,
                     };
                     let decision = engine.decide_encode_pair(
                         &facts,

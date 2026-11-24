@@ -338,6 +338,57 @@ fn references_beside_an_image_keep_one_decision_on_a_decode_that_takes_images() 
     assert_eq!(placement.decode_again(&with_a_video), Err(never_chosen));
 }
 
+/// A request with items that demands vision leaves that demand to its
+/// encoders: the one encoder takes images, and neither worker of its pair
+/// does. It keeps one decision, which books both its sides, though its
+/// caller asks the decode again under a document that picks the decode
+/// after the prefill: a decode asked again takes no items, and would hold
+/// the decode to the whole demand. So that decode never stood chosen, and
+/// the placement refuses to decide it again. The same request with no
+/// demand books its prefill alone, and its decode is decided again on the
+/// placement.
+///
+/// The classic router admits a pair whole, both sides by one call
+/// (`model_gateway/src/routers/grpc/common/stages/worker_selection.rs:821-841`
+/// on main 3d0315f3d), as this request's one decision books both.
+#[test]
+fn a_request_whose_media_is_its_encoders_to_meet_keeps_one_decision() {
+    let (engine, heard) = hearing(fewest(DecodePick::AfterPrefill));
+    let three = Three::of([1, 1, 1], |list, _| list == 2);
+    let keys = [Identity::plain("item")];
+    let items = EncodeItems {
+        keys: &keys,
+        ..EncodeItems::default()
+    };
+    let demanding = PlaceRequest {
+        demands: Demands {
+            vision: true,
+            ..Demands::default()
+        },
+        decode_again: true,
+        ..asking(three.lists((&[PLAIN], &[1])), items)
+    };
+    let mut placement = engine.place(&demanding).expect("a placement");
+    assert_eq!(three.places(&placement), (0, 0, vec![0]));
+    let (prefill, decode) = (three.id(0, 0), three.id(1, 0));
+    assert_eq!(*heard.lock(), [issued(prefill), issued(decode)]);
+    placement.sent(Side::Prefill);
+    let never_chosen = Unplaced::Refused(DecisionRefused::Decode(DecodeRefused::NotChosen));
+    assert_eq!(placement.decode_again(&demanding), Err(never_chosen));
+    drop(placement);
+    heard.lock().clear();
+
+    let undemanding = PlaceRequest {
+        demands: Demands::default(),
+        ..demanding
+    };
+    let mut placement = engine.place(&undemanding).expect("a placement");
+    assert_eq!(three.places(&placement), (0, 0, vec![0]));
+    assert_eq!(*heard.lock(), [issued(prefill)]);
+    placement.sent(Side::Prefill);
+    assert_eq!(placement.decode_again(&undemanding), Ok(()));
+}
+
 /// An encode request is placed by one call: the placement names its
 /// prefill and its decode, as a pair's does, and each item's encoder in
 /// the items' order, each the list's own worker object. It names the
@@ -828,10 +879,10 @@ fn an_encode_sides_send_and_end_say_nothing_and_leave_the_pair_owed() {
 }
 
 /// An encode request's decision that sheds is answered its shed by name,
-/// and no lease is left behind. With no encoder ready the request has no
-/// worker under the encode side's stage. With no decode ready, and where it
-/// states a demand, it is answered as its pair is: a pair's decision
-/// narrows no list by a demand.
+/// and no lease is left behind. Where the request states a demand for
+/// vision that no encoder meets, it has no worker under the encode side's
+/// word for that fact. With no encoder ready it has none under the encode
+/// side's stage, and with no decode ready it is answered as its pair is.
 ///
 /// The classic router answers a request no encoder is available for ahead
 /// of its pair
@@ -854,7 +905,7 @@ fn an_encode_requests_shed_is_answered_by_its_name() {
         },
         ..request
     };
-    assert_eq!(gap(engine.place(&demanding)), Some("wires"));
+    assert_eq!(gap(engine.place(&demanding)), Some("encode-vision"));
     three.workers[2][0].set_status(WorkerStatus::NotReady);
     assert_eq!(gap(engine.place(&request)), Some("encoders"));
     three.workers[2][0].set_status(WorkerStatus::Ready);
@@ -994,6 +1045,71 @@ fn an_id_keyed_requests_item_goes_where_its_key_goes_under_a_prefix_ring() {
     for id in ["conv-1", "conv-2"] {
         assert_eq!(keys.map(|key| encoder_of(key, Some(id))), homes, "{id}");
     }
+}
+
+/// The one call lends an encode request's items the ring its request
+/// states. Each item that carries its text goes to the encoder that ring's
+/// walk reaches from where the text stands, as the classic gateway places
+/// an item by the hex of its content hash on the model's ring
+/// (`model_gateway/src/routers/grpc/common/stages/worker_selection.rs`,
+/// lines 2637 to 2649 and 2722 to 2772 at 6aa129a5c). The encode profile's
+/// word alone says so. The pair's two sides here read no ring, and the
+/// items are lent it all the same: classic reads the ring for the items by
+/// its encode policy, whatever the main policy is. The caller states its
+/// ring once: a ring written into the items themselves is not read, beside
+/// the call's ring and with none on the call.
+#[test]
+fn the_one_call_lends_an_encode_requests_items_the_ring_its_request_states() {
+    let side = "round_robin";
+    let document = PolicySpec::epd_presets("consistent_hashing", side, side);
+    let spec = AppliedSpec::validate(&document.expect("the presets")).expect("a valid document");
+    let engine = hosted(PolicyEngine::new(spec));
+    let three = Three::of([1, 1, 8], |_, _| false);
+    let order = [6usize, 1, 4, 0, 7, 2, 5, 3];
+    let reversed = [3usize, 5, 2, 7, 0, 4, 1, 6];
+    let of = |order: &[usize]| {
+        let url = |&at: &usize| three.workers[2][at].url().to_owned();
+        Lent(order.iter().map(url).collect())
+    };
+    let (ring, turned) = (of(&order), of(&reversed));
+    // Six texts at six places of the ring's eight: the case's ring places
+    // a text by its fingerprint, whose last bits read each byte's alone.
+    let texts = ["a0", "a1", "a2", "a3", "a4", "a5"];
+    let keys = texts.map(Identity::plain);
+    // Each item's encoder for a request that states `call` as its ring,
+    // with `own` written into its items.
+    let encoders = |call: Option<&dyn LentRing>, own: Option<&dyn LentRing>| {
+        let items = EncodeItems {
+            keys: &keys,
+            ring: own,
+            ..EncodeItems::default()
+        };
+        let request = PlaceRequest {
+            ring: call,
+            ..asking(three.lists((&[PLAIN; 8], &[1])), items)
+        };
+        let placement = engine.place(&request).expect("a placement");
+        three.places(&placement).2
+    };
+    // The encoder a ring of `order` reaches first from each text's place.
+    let walked = |order: &[usize]| -> Vec<usize> {
+        let first = |text: &&str| order[(ring.position(text) % 8) as usize];
+        texts.iter().map(first).collect()
+    };
+    let stated = encoders(Some(&ring), None);
+    assert_eq!(stated, walked(&order));
+    // The call's ring is the one read, beside another in the items.
+    assert_ne!(
+        walked(&reversed),
+        stated,
+        "the two rings agree on every item"
+    );
+    assert_eq!(encoders(Some(&ring), Some(&turned)), stated);
+    // With none on the call the items are lent none, whatever they hold:
+    // the stage's own ring places them.
+    let own = encoders(None, None);
+    assert_ne!(own, stated, "the stage's own ring agrees with the lent one");
+    assert_eq!(encoders(None, Some(&turned)), own);
 }
 
 /// An encode request's record of sent prefixes names the pair its request

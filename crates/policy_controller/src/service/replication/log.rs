@@ -16,6 +16,7 @@ use crate::store::{Journal, MembershipChange, Position, WorkerRow};
 
 /// One replicated write, as the store told it.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum Event {
     /// A membership or status write.
     Member {
@@ -45,6 +46,7 @@ pub enum Event {
 
 /// An event at its place in the history.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct Entry {
     pub at: Position,
     pub event: Event,
@@ -53,10 +55,12 @@ pub struct Entry {
 /// A reader's place is no longer the log's, or never was: it starts again
 /// from a snapshot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[expect(clippy::exhaustive_structs, reason = "no field: its name is its value")]
 pub struct LogPositionLost;
 
 /// Why a store does not lead a term its replica took ([`Log::leads`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum NotLeading {
     /// The log has seen no term that high: the store is told the term next
     /// and leads it from there. A moment.

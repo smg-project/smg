@@ -60,6 +60,7 @@ pub(super) mod membership;
 pub mod overlap;
 pub(super) mod pair;
 pub(super) mod place;
+mod sample;
 mod signals;
 mod single;
 mod stands_alone;
@@ -93,22 +94,22 @@ use self::{
     overlap::{Affinity, PoolAffinity},
 };
 use super::{
-    decision::ShadowKind,
     decision_engine::{
         AlonePick, DecideOutcome, Decided, DecisionEngine, DecisionRefused, HeldDecision, Request,
         RequestMaker, WorkerLists,
     },
-    framework::{release, AloneProfile, NotAlone, Picker, Place, PoolWord, ShadowRows},
+    framework::{release, AloneProfile, Engine, NotAlone, Picker, Place, PoolWord, ShadowRows},
     lease_events,
     list_cell::{HandedLists, LentList},
     prompt_hashes::{HashSeeds, PromptHashes},
     records::{DecisionClock, PoolRecords},
-    shadow::{Counted, Shadowed},
+    shadow::Shadowed,
     sticky_sessions::{shards_for_this_host, SessionTable},
     view::{FixedFacts, Phase, WireModes, WorkerId},
 };
 use crate::{
     document::spec::AppliedSpec,
+    stages::Lifecycle,
     store::GatewayId,
     tracking::lease::{EventKind, EventSet, Membership, Said, Side},
 };
@@ -132,9 +133,16 @@ pub struct PolicyEngine {
     /// What the engine holds of the document in force ([`InForce`]): the
     /// document, its number, what the engine reads of the document once,
     /// and the shadow decisions counted under it. Replaced whole where a
-    /// new document is put in force ([`Self::apply`]). A decision loads it
-    /// once, at its entry ([`Self::in_force`]).
+    /// new document is put in force ([`Self::apply`]). A decision reads it
+    /// once, at its entry, through the reference its thread keeps
+    /// ([`Self::in_force`]): the cell itself is read where a thread kept
+    /// another document or none.
     document: ArcSwap<InForce>,
+    /// The number of the document in force ([`InForce::applied`]): what an
+    /// entry compares with the number of the document its thread read
+    /// last ([`Self::in_force`]). Written behind the document where a new
+    /// one is put in force ([`Self::apply`]).
+    applied: AtomicU64,
     /// Held while a change of membership is told and while a new document
     /// is put in force ([`Self::apply`]), so no word is told to a document
     /// that a new one is replacing. No decision takes it.
@@ -342,8 +350,10 @@ impl PolicyEngine {
         // engine takes the pointer.
         let sessions = Arc::new(SessionTable::new(0).with_shards(shards_for_this_host()));
         spec.share_sessions(Arc::clone(&sessions));
+        let document = InForce::of(spec);
         Self {
-            document: ArcSwap::from_pointee(InForce::of(spec)),
+            applied: AtomicU64::new(document.applied),
+            document: ArcSwap::from_pointee(document),
             telling: Mutex::new(()),
             epochs: AtomicU64::new(0),
             clock: DecisionClock::new(),
@@ -390,7 +400,8 @@ impl PolicyEngine {
     /// fingerprint of its address: the id every decision knew it by, where
     /// its program states none ([`FixedFacts::id`]). A stage that keeps a
     /// range, a count or a credit of the worker drops it. A dispatch said
-    /// behind the leave enters its rank in a count of sends again. The
+    /// behind the leave enters its rank in a count of sends again, until a
+    /// join of the id drops it ([`Self::joined`]). The
     /// session table is not told: a leave takes no pin away, so a
     /// session's pin stands on a worker that is gone until the session's
     /// idle time or two other workers end it, and is a routable pin again
@@ -423,13 +434,16 @@ impl PolicyEngine {
     /// says it at a registration, where it tells its classic policies. A
     /// host that hands its registry says it nowhere
     /// ([`Self::set_registry`]).
+    ///
+    /// A count of sends drops what it holds under the id: a dispatch said
+    /// behind the id's removal, and with it a send to this worker said
+    /// ahead of this word.
     pub fn joined(&self, address: &str) {
         self.came(WorkerId::from_address(address));
     }
 
     /// A removal by the worker's id: what [`Self::forget`] says.
     fn left(&self, id: WorkerId) {
-        self.affinity.forget(id);
         self.tell(&Membership::Removed(id));
     }
 
@@ -444,18 +458,19 @@ impl PolicyEngine {
     /// never during one ([`Self::apply`]).
     fn tell(&self, change: &Membership<'_>) {
         let _held = self.telling.lock();
-        self.told(&self.document.load(), change);
+        self.told(self.document.load().spec.engine(), change);
     }
 
-    /// Tells the stages of `document` one change of membership, and not
-    /// the session table: the one place a word of membership passes. A
-    /// stage that panics at it is held and counted
+    /// Tells the stages of `engine` one change of membership, and not
+    /// the session table. The records of sent prefixes hear it first
+    /// ([`Self::hears`]). A stage that panics at it is held and counted
     /// ([`Self::word_caught`]): the registration or the removal goes on.
     /// Its caller holds the telling's lock. A decision takes that lock
     /// nowhere.
-    fn told(&self, document: &InForce, change: &Membership<'_>) {
-        let engine = document.spec.engine();
-        self.word_caught(|| engine.membership_stages(change));
+    fn told(&self, engine: &Engine, change: &Membership<'_>) {
+        self.hears(engine, change, |engine| {
+            self.word_caught(|| engine.membership_stages(change));
+        });
     }
 
     /// One word to the document's stages, `tell`, under a catch of its own:
@@ -473,6 +488,52 @@ impl PolicyEngine {
                 None
             }
         }
+    }
+
+    /// One word of a store's membership, said under the store's lock of its
+    /// workers ([`Self::hears`]): the document's engine hears it whole, its
+    /// session table and then its stages ([`Lifecycle::on_membership`]).
+    ///
+    /// It holds the telling's lock for the word, as a gateway's word does
+    /// ([`Self::tell`]). The locks are taken in one order: the store's, the
+    /// telling's, then the records' own ([`Affinity::forget`]). A decision
+    /// takes a record's lock and neither of the other two.
+    pub(crate) fn on_membership(&self, word: &Membership<'_>) {
+        let _held = self.telling.lock();
+        self.hears(self.document.load().spec.engine(), word, |engine| {
+            engine.on_membership(word);
+        });
+    }
+
+    /// One change of membership as the engine hears it under either host,
+    /// the one place a word of membership passes: the records of sent
+    /// prefixes first, then `engine` by `core`, the host's own way of
+    /// telling it. The engine is the document's, or the part of it a word
+    /// is told to ([`Engine::hearing`]). Its caller holds the telling's
+    /// lock.
+    ///
+    /// | The word | The records of sent prefixes |
+    /// |---|---|
+    /// | `Added` | Nothing. |
+    /// | `Removed` | Each forgets the worker. |
+    /// | `Replaced` | Each forgets the old id. |
+    /// | `Relabelled` | Nothing. |
+    /// | `Resized` | Nothing. |
+    /// | `Snapshot` | Each forgets every worker that is not among the ids. |
+    /// | `Left` | Each forgets the worker. |
+    ///
+    /// A worker that stands under its id and serves a model no more is
+    /// forgotten whole, in every model's record: an entry is a prediction,
+    /// and the next request of a prefix writes it again.
+    fn hears(&self, engine: &Engine, change: &Membership<'_>, core: impl FnOnce(&Engine)) {
+        match *change {
+            Membership::Removed(id)
+            | Membership::Replaced { old: id, .. }
+            | Membership::Left { id, .. } => self.affinity.forget(id),
+            Membership::Snapshot(standing) => self.affinity.keep(standing),
+            Membership::Added(_) | Membership::Relabelled(_) | Membership::Resized(_) => {}
+        }
+        core(engine);
     }
 
     /// The clock of the engine's decisions: a list's records are made on
@@ -507,7 +568,9 @@ impl PolicyEngine {
 
     /// The number of the document in force, which no other applied
     /// document of the process has. A list's value is made under it
-    /// and read under it alone ([`Self::members_of`]).
+    /// and read under it alone ([`Self::members_of`]). Read of the
+    /// engine's cell, as [`Self::spec`] is: no request's entry asks it, so
+    /// the calling thread keeps no document for it.
     pub(super) fn applied(&self) -> u64 {
         self.document.load().applied
     }
@@ -733,7 +796,8 @@ impl PolicyEngine {
     /// decision is dated. A place ([`Decided::Alone`]) dates nothing, so it
     /// is answered with no read of a clock, and with no copy of a decision:
     /// the catch hands the place back, and a whole decision is written
-    /// beside it.
+    /// beside it. A place that is kept as a sample ([`Self::explained`])
+    /// reads the clock for its record.
     ///
     /// # Errors
     ///
@@ -744,7 +808,7 @@ impl PolicyEngine {
         clock: impl FnOnce() -> Instant,
     ) -> Result<Decided, DecisionRefused> {
         let mut whole = None;
-        let document = self.document.load();
+        let document = self.in_force();
         let alone = self.under(&document).decide_into(maker, clock, &mut whole);
         // The document is let go ahead of the answer's making: an answer
         // made while it is held is moved once more behind its release.
@@ -782,7 +846,7 @@ impl PolicyEngine {
     /// is issued, no id is taken and no stage is told. For a host that
     /// files a pick's lease itself and tells the stages of the issue under
     /// that lease
-    /// ([`Lifecycle::on_decision_issued`](crate::stages::Lifecycle::on_decision_issued)
+    /// ([`Lifecycle::on_decision_issued`]
     /// of the document's engine), as a controller's service does in its
     /// store.
     ///
@@ -825,7 +889,7 @@ impl PolicyEngine {
         maker: &impl RequestMaker,
         now: Instant,
     ) -> Result<(super::decision::Decision, Option<Shadowed>), DecisionRefused> {
-        let document = self.document.load();
+        let document = self.in_force();
         let own = self.under(&document);
         self.caught(|| {
             let mut request = own.made(maker);
@@ -851,6 +915,7 @@ impl PolicyEngine {
                     let read = own.loads_read(maker);
                     let loads = read.snapshot();
                     let sends_to = |target: &_| maker.sends_to(target);
+                    let counted = || maker.session_counted_under();
                     Ok(pair::decide(
                         own,
                         &lists,
@@ -859,6 +924,7 @@ impl PolicyEngine {
                         loads,
                         now,
                         sends_to,
+                        counted,
                     ))
                 }
                 (Phase::Single | Phase::Prefill, _) => Ok(single::over_none(own, &request)),
@@ -894,7 +960,7 @@ impl PolicyEngine {
         held: &super::decision::Target,
         now: Instant,
     ) -> Result<super::decision::Decision, DecisionRefused> {
-        let document = self.document.load();
+        let document = self.in_force();
         let own = self.under(&document);
         self.caught(|| {
             let mut request = own.made(maker);
@@ -904,7 +970,17 @@ impl PolicyEngine {
                     let loads = read.snapshot();
                     // The decode asked again is asked which decode it is sent to.
                     let sends_to = |target: &_| maker.sends_to(target);
-                    pair::decide(own, &lists, &mut request, Some(held), loads, now, sends_to)
+                    let counted = || maker.session_counted_under();
+                    pair::decide(
+                        own,
+                        &lists,
+                        &mut request,
+                        Some(held),
+                        loads,
+                        now,
+                        sends_to,
+                        counted,
+                    )
                 }
                 _ => single::over_none(own, &request),
             })
@@ -1015,9 +1091,17 @@ impl Loaded<'_, '_> {
                 let members = self.members_of(lent);
                 asked = Some((lent.cell, members));
                 if let Some(pick) = single::alone(self, maker.model(), plain, members) {
-                    // No stage takes a word of the request: the place
-                    // is the whole answer.
+                    // No stage takes a word of the request and the
+                    // document keeps no sample: the place is the whole
+                    // answer.
+                    if !self.document.leases_or_samples {
+                        return Ok(Some(pick));
+                    }
+                    // A document that keeps a sample and takes no word: the
+                    // place is the whole answer all the same, counted
+                    // toward the thread's next sample behind the pick.
                     if !self.document.hears.intersects(EventSet::LEASE) {
+                        sample::place(self, maker, pick, members, clock);
                         return Ok(Some(pick));
                     }
                     picked = Some((pick, members, plain));
@@ -1032,6 +1116,7 @@ impl Loaded<'_, '_> {
             let text = (maker.prompt_chars(), maker.prompt_bytes());
             if let Some(decided) = single::noted(self, pick, members, plain, text, now) {
                 *whole = Some((decided, false));
+                sample::noted(self, maker, now, whole.as_ref());
                 return Ok(None);
             }
         }
@@ -1054,6 +1139,7 @@ impl Loaded<'_, '_> {
                 if let Some(said) = said {
                     let decided = with_shadow::issued(self, decision, &request, now, said);
                     *whole = Some((decided, later));
+                    sample::whole(self, &request, now, whole.as_ref(), Some(said));
                     return Ok(None);
                 }
                 decision
@@ -1068,8 +1154,19 @@ impl Loaded<'_, '_> {
                 let read = self.loads_read(maker);
                 let loads = read.snapshot();
                 let sends_to = |target: &_| maker.sends_to(target);
-                let decided = pair::decided(self, &lists, &mut request, None, loads, now, sends_to);
+                let counted = || maker.session_counted_under();
+                let decided = pair::decided(
+                    self,
+                    &lists,
+                    &mut request,
+                    None,
+                    loads,
+                    now,
+                    sends_to,
+                    counted,
+                );
                 *whole = Some((decided, later));
+                sample::whole(self, &request, now, whole.as_ref(), None);
                 return Ok(None);
             }
             // A request that hands no list of its own is decided over
@@ -1082,6 +1179,7 @@ impl Loaded<'_, '_> {
         };
         let decided = single::issued(self, decided, &request, now);
         *whole = Some((decided, later));
+        sample::whole(self, &request, now, whole.as_ref(), None);
         Ok(None)
     }
 }
@@ -1128,7 +1226,7 @@ impl DecisionEngine for PolicyEngine {
         held: &HeldDecision<'_>,
         now: Instant,
     ) -> Result<DecideOutcome, DecisionRefused> {
-        let document = self.document.load();
+        let document = self.in_force();
         let own = self.under(&document);
         self.caught(|| {
             let mut request = own.made(maker);
@@ -1140,7 +1238,17 @@ impl DecisionEngine for PolicyEngine {
                     let loads = read.snapshot();
                     // The decode asked again is asked which decode it is sent to.
                     let sends_to = |target: &_| maker.sends_to(target);
-                    pair::decided(own, &lists, &mut request, Some(held), loads, now, sends_to)
+                    let counted = || maker.session_counted_under();
+                    pair::decided(
+                        own,
+                        &lists,
+                        &mut request,
+                        Some(held),
+                        loads,
+                        now,
+                        sends_to,
+                        counted,
+                    )
                 }
                 _ => single::issued(own, single::over_none(own, &request), &request, now),
             })
@@ -1155,20 +1263,24 @@ impl DecisionEngine for PolicyEngine {
             Said::Completed(_) => EventKind::Completed,
             Said::Released(..) => EventKind::Released,
         };
-        // A word of a decision made under another document is told to
-        // nobody: its stages are not the ones in force.
-        let document = self.document.load();
+        // A word of a decision made under an earlier document goes to the
+        // stages that stood when its lease was issued, and to no stage
+        // built since. Its dispatch is counted by every count of sends in
+        // force: a send is a fact of its worker, whatever document decided
+        // it.
+        let document = self.in_force();
+        let sends = document.spec.engine();
+        let mut engine = sends;
         if held.lease.generation != document.spec.generation() {
+            engine = document.stood_at(held.lease.generation);
+        } else if held.lease.side == Side::Single && !document.hears.contains(kind) {
             return;
         }
-        if held.lease.side == Side::Single && !document.hears.contains(kind) {
-            return;
-        }
-        let engine = document.spec.engine();
+        let micros = |at| self.clock.micros(at);
         let tell = || match held.lease.side {
-            Side::Single => lease_events::single(&lease_events::one_engine(engine), held, said),
+            Side::Single => lease_events::single(&lease_events::of_host(engine, sends), held, said),
             // A pair's guard holds its prefill side's lease.
-            Side::Prefill => lease_events::pair(engine, held, said, |at| self.clock.micros(at)),
+            Side::Prefill => lease_events::pair(engine, sends, held, said, micros),
             // No lease is issued for a side on its own.
             Side::Decode | Side::Encode => {}
         };
@@ -1186,7 +1298,7 @@ impl DecisionEngine for PolicyEngine {
     }
 
     fn with_spec<R>(&self, read: impl FnOnce(&AppliedSpec) -> R) -> R {
-        read(&self.document.load().spec)
+        read(&self.in_force().spec)
     }
 
     // By the block size the model's cache events taught the host's index,
@@ -1200,23 +1312,11 @@ impl DecisionEngine for PolicyEngine {
         seeds: HashSeeds,
     ) -> PromptHashes {
         let size = self.affinity.block_size(model);
-        PromptHashes::under_document(&self.document.load().spec, size, tokens, text, seeds)
+        PromptHashes::under_document(&self.in_force().spec, size, tokens, text, seeds)
     }
 
     fn faults(&self) -> u64 {
         self.faults.load(Ordering::Relaxed)
-    }
-
-    // The shadow decisions counted for single requests. No shadow profile
-    // runs on a pair's side here.
-    fn shadowed(&self, binding: u32, kind: ShadowKind) -> u64 {
-        let document = self.document.load();
-        let counts = document.shadow_counts.get();
-        counts.map_or(0, |counts| {
-            counts
-                .of(binding, Counted::Single, kind)
-                .load(Ordering::Relaxed)
-        })
     }
 }
 

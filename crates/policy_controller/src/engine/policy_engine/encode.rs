@@ -3,9 +3,12 @@
 //! the engine decides them in
 //! ([`Engine::decide_encode_pair`](crate::engine::Engine::decide_encode_pair)).
 //!
-//! No affinity column stands beside the encoders, and no ring is lent for
-//! them: an encode profile's stage that places by a ring places by its
-//! own.
+//! No affinity column stands beside the encoders. A ring lent for the
+//! items ([`EncodeItems::ring`]) places an item that carries its text
+//! where that ring's walk reaches among the encoders offered, where the
+//! encode profile reads that ring and its lender places what it is
+//! asked. Every other item is placed as with no ring lent: an encode
+//! profile's stage that places by a ring places it by its own.
 //!
 //! **Named signals.** Under a document a stage of which reads a named
 //! signal, each of the three sides whose profile reads one is lent its own
@@ -21,6 +24,11 @@
 //! [`PolicyEngine::decide_encode_at`]: the three lists' decision, with the
 //! pair's lease a pick is issued. No lease is issued for an encoder.
 
+#![expect(
+    clippy::exhaustive_structs,
+    reason = "a caller still builds or matches these types whole: each mark comes with its call"
+)]
+
 use std::{cell::OnceCell, sync::Arc, time::Instant};
 
 use smg_worker::load::state::LoadSnapshot;
@@ -33,11 +41,12 @@ use super::{
     signals, single, Loaded, PolicyEngine, PoolMembers,
 };
 use crate::engine::{
-    decision::{Decision, Target, WIRES},
+    decision::{shed, Decision, ShedReason, Target, WIRES},
     decision_engine::{DecideOutcome, DecisionRefused, Request, RequestMaker, WorkerLists},
+    demands::{Demands, UnmetDemand},
     framework::{EncodeItems, EncodePlaced, EncodePool, EncoderFacts, PairPools},
     list_cell::LentList,
-    records::{HeldCells, Live},
+    records::{HeldCells, Live, PoolRecords},
     view::{Constraints, Phase, RequestFacts},
 };
 
@@ -47,8 +56,20 @@ mod tests;
 /// What a request that states the later decode is declined under where its
 /// decode is held to the ones that take images, by its demand or by
 /// references beside an image or a video: a decode asked again takes no
-/// items, so nothing there holds it to a decode that takes images.
+/// items, so nothing there holds it to a decode that takes images. So is
+/// one that leaves a part of its hard demand to its encoders
+/// ([`splits`]): a decode asked again would hold the decode to the whole.
 const DECODE_LATER: &str = "decode-later";
+
+/// Whether an encode request leaves a part of its hard demand to its
+/// encoders: it carries items, and `demands` name its media, which the
+/// encoders meet in its pair's stead ([`Demands::beside_encoders`]). Its
+/// first decision then holds its pair's sides to the rest. A decode asked
+/// again takes no items, so it would hold the decode to the whole demand:
+/// the decode of such a request is not asked again.
+pub(super) fn splits(items: &EncodeItems<'_>, demands: Demands) -> bool {
+    !items.keys.is_empty() && demands != demands.beside_encoders()
+}
 
 /// An encode request's three lists as their host lends them for one
 /// decision: the pair's two lists, the encoders with their cell, and what
@@ -117,12 +138,31 @@ impl EncodeLists<'_> {
     /// A request that states no budget is decided with the widest one
     /// written into its facts too, as a pair's is ([`PairLists::decide`]).
     ///
-    /// These lists are narrowed by no demand and no subset hint, and a
-    /// request's own places and its own mask name places of no one list: a
-    /// request that states one of these is shed or declined as its pair's
-    /// records answer it, and no key is placed. A pair's own request is
-    /// held to a demand a side at a time ([`PairLists::decide`]), and an
-    /// encode request is not. One side of the pair
+    /// These lists are narrowed by no subset hint, and a request's own
+    /// places and its own mask name places of no one list: a request that
+    /// states one of these is shed or declined as its pair answers it
+    /// ([`PairLists::decide`]), and no key is placed.
+    ///
+    /// A request that states a hard demand
+    /// ([`Constraints::demands`]) is held to it a list at a time, as a
+    /// pair's own request is a side at a time: each list to the places
+    /// whose worker meets what the list is held to, among the places its
+    /// host states for the list. An encoder takes the media of a request
+    /// that carries items: the encoders are then held to the runtime and
+    /// the media's demands ([`Demands::beside_pair`]), and the pair's two
+    /// sides to the rest, each as its role is held to it
+    /// ([`Demands::beside_encoders`], [`Demands::held_by`]). A request with
+    /// no item takes no encoder: its pair's sides are held as a pair's own,
+    /// and no encoder is judged. A list the demand leaves nobody sheds the
+    /// request with no endpoint under the stage of the demand that took
+    /// the list's last worker, and no key is placed: the encoders' first,
+    /// then the prefills', then the decodes'. The encoders' stage is the
+    /// encode pass's own word where the pass tests the same fact
+    /// ([`UnmetDemand::encoders_stage`]). The demand is judged ahead of
+    /// the engine's pass, which reads the places that meet it as the
+    /// list's own.
+    ///
+    /// One side of the pair
     /// alone is no pair, and the engine says so behind the encoders: a
     /// request that no encoder is ready for is shed under the encode side's
     /// stage. For a request with items, facts or classes of another length
@@ -138,6 +178,9 @@ impl EncodeLists<'_> {
     /// whose places name workers and none that takes the request, though a
     /// worker outside them does, sheds it under the places' name, and no
     /// key is placed: the request is held off every worker that takes it.
+    /// The places are its host's, or the ones its demand leaves. A gap of
+    /// the pairs' membership the engine's pass reads (`ec-compatible`,
+    /// `decode-vision`) is answered ahead of every list's places.
     /// Places that name no worker of a list are no such case. Such places
     /// of a side shed the request as they shed its pair alone, and such
     /// places of the encoders shed it as a list with no open encoder does.
@@ -212,6 +255,67 @@ impl EncodeLists<'_> {
         )
     }
 
+    /// The request's constraints as each of the three lists reads them
+    /// under the hard demand it states: the prefills', the decodes', the
+    /// encoders'. Each list is held to the places whose worker meets what
+    /// the list is held to, among the places its host states
+    /// ([`PairLists::sides_meeting`], [`single::held_in`]). `kept` takes
+    /// the places, in that order. The three state no demand: it is judged
+    /// here, and the engine's pass is handed none.
+    ///
+    /// `items` says the request carries items. An encoder then takes its
+    /// media: the encoders are held to the runtime and the media's demands
+    /// ([`Demands::beside_pair`]), and the pair's sides to the rest
+    /// ([`Demands::beside_encoders`]). A request with no item takes no
+    /// encoder: its pair's sides are held as a pair's own, and the encoders
+    /// read what their host states and no more.
+    ///
+    /// `Err` names the stage of the demand that left a list nobody: the
+    /// encoders' first ([`UnmetDemand::encoders_stage`]), then the
+    /// prefills', then the decodes'. Out of line: its code stays off the
+    /// path of a request that states no demand.
+    #[inline(never)]
+    fn meeting<'s>(
+        &self,
+        cx: &Constraints<'s>,
+        [prefill, decode, encoders]: [&PoolRecords; 3],
+        items: bool,
+        kept: &'s mut [Vec<u32>; 3],
+    ) -> Result<[Constraints<'s>; 3], &'static str>
+    where
+        Self: 's,
+    {
+        let [prefill_kept, decode_kept, encoders_kept] = kept;
+        let stated = cx.demands;
+        // The demand is judged here and the pass is handed none, as a
+        // pair's records are.
+        let spent = Constraints {
+            demands: Demands::default(),
+            ..*cx
+        };
+        let mut encode_cx = Constraints {
+            places: self.encoders_places,
+            stalled: self.encoders_stalled,
+            held: self.encoders_held,
+            ..spent
+        };
+        let mut sides = stated;
+        if items {
+            let asked = Constraints {
+                demands: stated.beside_pair(),
+                places: self.encoders_places,
+                ..Constraints::default()
+            };
+            let held = single::held_in(encoders, asked, encoders_kept);
+            encode_cx.places = held.map_err(UnmetDemand::encoders_stage)?.places;
+            sides = stated.beside_encoders();
+        }
+        let (lists, kept) = ((prefill, decode), [prefill_kept, decode_kept]);
+        let held = self.pair.sides_meeting(&spent, sides, lists, kept);
+        let [prefill_cx, decode_cx] = held.map_err(UnmetDemand::stage)?;
+        Ok([prefill_cx, decode_cx, encode_cx])
+    }
+
     /// [`Self::decide`] over the engine's values of the pair's two lists,
     /// which its caller asked of their cells, and of the encoders' where
     /// its caller read it. The encoders' cell is else asked here, behind
@@ -242,11 +346,19 @@ impl EncodeLists<'_> {
     ) -> Decision {
         let (spec, clock) = (&engine.document.spec, &engine.clock);
         let pair = &self.pair;
-        // A hard demand is among what these lists do not decide: the pair
-        // sheds it by its records, and holds no side to it for this entry.
+        // A hard demand is judged below, a list at a time. What these
+        // lists do not decide beside it is the pair's to answer: a subset
+        // hint, and places or a mask of the request's own.
+        let demanded = !request.constraints.demands.is_none();
         if not_decided(&request.constraints).is_some() {
-            placed.clear();
-            return pair.decide_unjudged(engine, (prefill, decode), loads, now, request);
+            let undemanding = Constraints {
+                demands: Demands::default(),
+                ..request.constraints
+            };
+            if !demanded || not_decided(&undemanding).is_some() {
+                placed.clear();
+                return pair.decide_over(engine, (prefill, decode), loads, now, request, None);
+            }
         }
         // One value for the three lists' records, as a pair's decision
         // takes one for its two.
@@ -293,6 +405,27 @@ impl EncodeLists<'_> {
             stamp(prefills, decodes, pair.classes, pair.admission);
             let (workers, records) = (encoders.workers(), encoders.records(spec, clock));
             let (rows, _) = records.write(workers, &live, &mut buffers.encoders);
+            // A hard demand the request states is judged here, a list at a
+            // time, and the engine's pass is handed the places that meet
+            // it. A request that states none pays one test.
+            let met;
+            let [prefill_cx, decode_cx, encode_cx] = if demanded {
+                let lists = [prefill_records, decode_records, records];
+                let carries = !items.keys.is_empty();
+                match self.meeting(cx, lists, carries, &mut buffers.meeting) {
+                    Ok(sides) => {
+                        met = sides;
+                        met.each_ref()
+                    }
+                    Err(stage) => {
+                        placed.clear();
+                        let (seed, generation) = (facts.seed, pool.generation);
+                        return shed(ShedReason::NoEndpoints, stage, seed, generation);
+                    }
+                }
+            } else {
+                [&prefill_cx, &decode_cx, &encode_cx]
+            };
             // Under a document a stage of which reads a named signal, each
             // of the three sides that reads one is lent its list's cells
             // for this call.
@@ -331,15 +464,7 @@ impl EncodeLists<'_> {
             };
             let (engine, scratch) = (spec.engine(), &mut buffers.scratch);
             let decision = engine.decide_encode_pair(
-                facts,
-                &pool,
-                pools,
-                encode,
-                items,
-                &prefill_cx,
-                &decode_cx,
-                &encode_cx,
-                scratch,
+                facts, &pool, pools, encode, items, prefill_cx, decode_cx, encode_cx, scratch,
                 placed,
             );
             // Behind the pick, each side's record keeps where the prompt
@@ -404,7 +529,11 @@ impl PolicyEngine {
     /// prefer a decode that takes images: a decode asked again takes no
     /// items, so nothing there holds it to such a decode. The decline reads
     /// the request's own facts and no list: it stands also where no decode
-    /// of the lists takes images.
+    /// of the lists takes images. A request with items that demands vision
+    /// or a way of processing its references
+    /// ([`Constraints::demands`]) is declined so too: its encoders meet
+    /// that part of the demand, and a decode asked again would hold the
+    /// decode to it.
     ///
     /// # Errors
     ///
@@ -434,10 +563,10 @@ impl PolicyEngine {
     ///
     /// As [`Self::decide_encode_at`].
     #[cfg_attr(
-        not(test),
+        not(any(test, feature = "controller")),
         expect(
             dead_code,
-            reason = "the controller's service calls it once it decides by this engine"
+            reason = "a controller's deciding thread calls it, and no build without one does"
         )
     )]
     pub(crate) fn decide_encode_without_lease(
@@ -551,6 +680,9 @@ impl Loaded<'_, '_> {
 /// ([`EncodeItems::references`]). The entries that decide a decode again
 /// take no items ([`WorkerLists::Encode`]). The decline reads the request's
 /// own facts and no list, so it stands also where no decode takes images.
+/// A request with items whose hard demand names its media is declined so
+/// too ([`splits`]): this decision leaves that part of the demand to the
+/// encoders, and a decode asked again would hold the decode to it.
 ///
 /// `sends_to` says whether the request's caller sends it to a target of
 /// the pick ([`RequestMaker::sends_to`]): each side's record of sent
@@ -601,8 +733,11 @@ pub(super) fn decide(
             return single::declined(own, request, WIRES);
         }
     }
+    // A decode asked again takes no items: it reads no image fact, and it
+    // holds the decode to the whole demand, the media's part with it.
     let images = items.holds_decode_to_images(request.facts.media.holds_pixels());
-    if images && request.constraints.decode_later {
+    let cx = &request.constraints;
+    if cx.decode_later && (images || splits(&items, cx.demands)) {
         placed.clear();
         return single::declined(own, request, DECODE_LATER);
     }
