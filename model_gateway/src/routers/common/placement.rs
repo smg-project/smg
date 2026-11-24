@@ -552,9 +552,9 @@ fn reported(end: &SideEnd, status: u16, answered: bool) {
 /// Where it did, the 5xx is the server's error, whoever wrote the status:
 /// the worker's own, or the 502 the Decisions adapter makes of an answer
 /// it cannot map. Where no answer of the worker stands, the 5xx is a
-/// failed connection. One refusal differs: a plain route's refusal of a
-/// body over its limit carries no mark, so it reads as a failed
-/// connection.
+/// failed connection. One refusal differs: the router's refusal of a
+/// worker's body over its limit carries no mark, on the Decisions route
+/// too, so it reads as a failed connection.
 fn transport_class(status: u16, answered: bool) -> TransportClass {
     match status {
         ..400 => TransportClass::Ok,
