@@ -1941,7 +1941,7 @@ mod tests {
 
     /// One block of `row`'s own written through its lane at rank 0, as the
     /// body of an admitted batch writes it.
-    fn one_block(tables: &KvTables, row: WorkerId, sequence: u64) -> BatchOutcome {
+    pub(super) fn one_block(tables: &KvTables, row: WorkerId, sequence: u64) -> BatchOutcome {
         let block = [kv_tables::StoredBlock {
             seq_hash: kv_tables::SequenceHash(1_000 + sequence),
             content_hash: kv_index::ContentHash(2_000 + sequence),

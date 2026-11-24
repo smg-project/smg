@@ -168,11 +168,15 @@ mod tests {
     use std::{cell::Cell, rc::Rc, sync::Arc, time::Duration};
 
     use smg_worker::{
-        identity::basic::Worker, registry::WorkerRegistry, worker::WorkerStatus as ObjectStatus,
+        identity::basic::Worker, kv_events::port::BatchOutcome, registry::WorkerRegistry,
+        worker::WorkerStatus as ObjectStatus,
     };
 
     use super::{
-        super::write::tests::{facts, Replica, A},
+        super::{
+            tests::one_block,
+            write::tests::{facts, Replica, A},
+        },
         *,
     };
     use crate::{
@@ -597,7 +601,9 @@ mod tests {
 
     /// A cut laid whole leaves a lane for each of its rows that asks for
     /// cache events, by a restore and by a watch's snapshot, and a row the
-    /// cut drops holds none.
+    /// cut drops holds none. A row that stays through the next cut keeps the
+    /// blocks this replica heard for it: they are the replica's own, in no
+    /// cut, so a lay that made its lane again would lose them.
     #[test]
     fn a_cut_laid_whole_leaves_a_lane_for_each_row_that_asks_for_events() {
         type Lay = fn(&Objects<Members>, &MemoryStore, StoreCheckpoint) -> bool;
@@ -624,6 +630,20 @@ mod tests {
             assert!(lane(asks), "{name}: a row of the cut that asks");
             assert!(!lane(dropped), "{name}: a row the cut drops");
             assert_eq!(tables.lanes(), 1, "{name}: the quiet row holds none");
+            // The replica hears one block of the row, and the leader's next
+            // cut brings one row more: the row that stays keeps its block.
+            let heard = one_block(&tables, asks, 1);
+            assert_eq!(heard, BatchOutcome::Applied, "{name}");
+            assert_eq!(tables.indexed_blocks(asks, 0), 1, "{name}");
+            leader.upsert(asking("http://d:8000", true));
+            let next = leader.store.checkpoint();
+            assert!(lay(&standby.objects, &standby.store, next), "{name}");
+            assert_eq!(tables.lanes(), 2, "{name}: the row the next cut brings");
+            let kept = tables.indexed_blocks(asks, 0);
+            assert_eq!(
+                kept, 1,
+                "{name}: the lane of a row that stays was made again"
+            );
         }
     }
 }
