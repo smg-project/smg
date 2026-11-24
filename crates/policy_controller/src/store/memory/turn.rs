@@ -1153,9 +1153,11 @@ impl MemoryStore {
     /// at `at`: the record's read, the door's change and the word to the
     /// engine. A lease not on file is no error and tells nothing: its
     /// dispatch deadline ended it, or its gateway decided that request
-    /// itself. Neither does a second dispatch of one lease, nor a frame on
-    /// a side of a pair's lease that ended: the word is of the sides the
-    /// record held as the frame found it.
+    /// itself. Neither does a dispatch on a side an earlier dispatch
+    /// moved, nor a frame on a side of a pair's lease that ended: the word
+    /// is of the sides the record held as the frame found it. A dispatch
+    /// at an index a chosen side's pick holds no target at moves nothing
+    /// and is handed on all the same.
     fn apply_frame(&self, at: usize, leases: &mut Leases, key: Key, said: Said, one: &mut OneLoad) {
         let found = match said {
             Said::Dispatched(dispatch, when) => leases
