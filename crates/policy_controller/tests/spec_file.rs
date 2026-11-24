@@ -315,7 +315,7 @@ fn a_start_on_a_document_the_validator_refuses_exits_naming_the_field() {
 
 /// A running replica's scrape reads its store's counts: a worker whose
 /// engine family the document's list does not name is counted at the scrape
-/// after its registration, and no load write has moved a verdict.
+/// after its registration, and no load report has moved a verdict.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_replica_on_a_listing_file_counts_the_member_its_list_does_not_name() {
     use openai_protocol::worker::RuntimeType;

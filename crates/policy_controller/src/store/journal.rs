@@ -6,8 +6,7 @@
 //! ([`crate::service::replication::Log`]) is its one implementation: a store with a
 //! journal is a store whose history a standby or a watcher of its rows can
 //! follow, and a store without one (a gateway deciding in its own process)
-//! pays one branch a write. A journal carries no load row: a load write
-//! tells it nothing.
+//! pays one branch a write.
 
 #![expect(
     clippy::exhaustive_structs,

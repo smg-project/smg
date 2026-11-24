@@ -146,9 +146,9 @@
 //! alike. Two builds are compared where they print one tally.
 //!
 //! A served decision reads no report of the bench's yet (`READS_LOADS`): a
-//! controller's decision is given its load monitor's snapshot, and the bench
-//! writes its members' reports into the store's table, which no decision
-//! reads. Until its members answer the monitor, the bands hold no row's
+//! controller's decision is given its load monitor's snapshot, and the
+//! bench's members answer no poll, so the bands above are written nowhere
+//! yet. Until its members answer the monitor, the bands hold no row's
 //! pool: it moves with the leases on file, and a row whose pool moves stops
 //! the bench. So no wire row is run, and each kind's line says so. The count
 //! cells run: they read a decision's calls of the allocator, not its pool.
@@ -196,7 +196,7 @@ use std::{
 
 use smg_policy_controller::{
     document::{AppliedSpec, PolicySpec, ShadowSpec},
-    engine::{LoadRow, Role},
+    engine::Role,
     service::{
         controller::{Config, Controller, ElectionConfig, Listener, Scope, State},
         proto::{
@@ -206,9 +206,7 @@ use smg_policy_controller::{
             Phase as WirePhase, RequestFacts as WireFacts, Side,
         },
     },
-    store::{
-        GatewayId, Hand, LoadSink, LoadSource, MemoryStore, WorkerFacts, WorkerStatus, WorkersStore,
-    },
+    store::{GatewayId, Hand, MemoryStore, WorkerFacts, WorkerStatus, WorkersStore},
     tracking::{LeaseId, ReleaseReason, Said},
 };
 use tokio::{
@@ -557,10 +555,10 @@ const GATEWAY: &str = "bench-gateway";
 const PRESET: &str = "least_load";
 /// Whether a served decision reads the load reports a row's members stand
 /// in their bands by. A controller's single decision is given its load
-/// monitor's snapshot, and the bench writes its reports into the store's
-/// table, so no wire row is run: a row's pool moves with the leases on
-/// file, and a row's guard stops a pool that moves. It turns when the
-/// bench's members answer the load monitor's polls.
+/// monitor's snapshot, and the bench's members answer no poll, so no wire
+/// row is run: a row's pool moves with the leases on file, and a row's
+/// guard stops a pool that moves. It turns when the bench's members answer
+/// the load monitor's polls.
 const READS_LOADS: bool = false;
 /// The pair plan of the pair count cell: the plan of the engine's own
 /// pair cells (`pair_classes`), least load on each side.
@@ -1010,14 +1008,15 @@ fn bands(members: u32) -> Vec<u32> {
     band_of
 }
 
-/// The shape's fleet: ready members, each with a load report in its band
-/// ([`bands`]), under the row's preset as generation 1, their rows built.
-/// A row that tells its dispatches stands its bands apart ([`APART`]), and
-/// each member's ceiling at twice the highest band's report.
-/// A shared fleet is one deal of the bands over members that serve every
-/// model; fleets of their own are the same deal a model, over members
-/// that serve it alone. A pair plan's row holds that many members a side,
-/// under the pair cell's plan.
+/// The shape's fleet: ready members under the row's preset as generation
+/// 1, their rows built. No report is written for them ([`READS_LOADS`]):
+/// the bands ([`bands`]) set each member's ceiling alone, at twice the
+/// highest band's report, where a row that tells its dispatches stands its
+/// bands apart ([`APART`]).
+/// A shared fleet is one set of members that serve every model; fleets of
+/// their own are the same count a model, over members that serve it
+/// alone. A pair plan's row holds that many members a side, under the pair
+/// cell's plan.
 fn fill(store: &MemoryStore, shape: Shape) {
     let models: Vec<String> = (0..shape.models).map(model).collect();
     let fleets: Vec<(String, Vec<String>)> = match shape.fleet {
@@ -1033,20 +1032,17 @@ fn fill(store: &MemoryStore, shape: Shape) {
     } else {
         &[(Role::Single, "worker")]
     };
-    let bands = bands(shape.members);
-    let (step, ceiling) = if shape.frames {
-        let highest = bands.iter().copied().max().unwrap_or(0);
-        (APART, 2 * (HELD + APART * highest))
+    let ceiling = if shape.frames {
+        let highest = bands(shape.members).into_iter().max().unwrap_or(0);
+        2 * (HELD + APART * highest)
     } else {
-        (1, 2 * HELD)
+        2 * HELD
     };
-    let now = Instant::now();
     for (fleet, models) in &fleets {
-        let rows = sides.iter().flat_map(|&(role, name)| {
-            let banded = (0..shape.members).zip(&bands);
-            banded.map(move |(index, band)| (role, name, index, band))
-        });
-        for (role, name, index, band) in rows {
+        let rows = sides
+            .iter()
+            .flat_map(|&(role, name)| (0..shape.members).map(move |index| (role, name, index)));
+        for (role, name, index) in rows {
             let key = format!("http://{name}-{fleet}{index}.fleet:8000");
             let id = store
                 .upsert(WorkerFacts {
@@ -1062,17 +1058,6 @@ fn fill(store: &MemoryStore, shape: Shape) {
                 .id();
             let revision = WorkersStore::get(store, id).expect("the row").revision;
             store.set_status(id, WorkerStatus::Ready, revision);
-            store.record(
-                id,
-                0,
-                LoadRow {
-                    running: HELD + step * band,
-                    max_running: ceiling,
-                    ..LoadRow::default()
-                },
-                now,
-                LoadSource::Stream,
-            );
         }
     }
     let mut document = if shape.pair {

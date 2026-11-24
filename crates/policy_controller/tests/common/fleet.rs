@@ -27,9 +27,10 @@
 //! engine of one rank is an add on the control listener, under the name the
 //! harness states there. The call makes one rank, so a rank of a wider
 //! engine is still the store's membership write. The rows a case reads
-//! ([`Harness::pool`]) are the store's too: its workers' table and its load
-//! table, as the controller's own writers left them. A case calls the
-//! handle alone, so a move of either rewrites no case.
+//! ([`Harness::pool`]) are the store's too: its workers' table, as the
+//! controller's own writers left it, each row with the load monitor's
+//! newest report of it. A case calls the handle alone, so a move of either
+//! rewrites no case.
 
 use std::{
     collections::{HashMap, HashSet},

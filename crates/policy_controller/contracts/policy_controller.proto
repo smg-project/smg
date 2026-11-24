@@ -500,6 +500,24 @@ message DecideRequest {
   // carries decode_of and this field is out of range, whatever its facts'
   // phase says.
   EncodeItems encode = 7;
+  // The number this request names its worker by, as its host read it under
+  // the target source of its binding's routing key. It counts, from 0 and
+  // in the order of the controller's list, the workers the asking gateway
+  // can be sent to: a place it may take of the list, that none of its
+  // standing vetoes holds back, and whose worker is available by the
+  // controller's own test. The decision is held to the worker the number
+  // reaches, and the request goes to that worker or to none: where the
+  // number reaches no worker, or that worker cannot take the request after
+  // all, the request is shed with no endpoint, under `target-worker`. Where
+  // no worker can be counted, the request is decided as one that names no
+  // worker, and neither its session key nor its client key is read. A text
+  // that is no number is stated as 4294967295: it reaches no worker of any
+  // list, as that text does. Absent, the request names no worker, so the
+  // frame of a host older than the field is decided as it was. Read on a
+  // frame that is decided over one list, a single request's and one that
+  // stands alone at a side's phase, under a spec whose binding for the
+  // frame names a target source, and on no other.
+  optional uint32 named_worker = 8;
 }
 
 // The encode items of a request and what it asks for them.

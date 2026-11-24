@@ -904,7 +904,6 @@ mod tests {
                 engines: 2,
                 zones: 5,
             },
-            overload_flips: 9,
             lifecycle_faults: 4,
         };
         let rendered = metrics.render(
@@ -921,9 +920,6 @@ mod tests {
             line(&rendered, MEMBERS_OUTSIDE_LIST, "list=\"zones\"").as_deref(),
             Some("smg_policy_controller_members_outside_list{list=\"zones\"} 5")
         );
-        // The store's own count of its load table's flips is no series:
-        // the flips are the load monitor's.
-        assert!(rendered.contains("smg_policy_controller_overload_flips_total 0"));
         assert!(rendered.contains("smg_policy_controller_lifecycle_faults_total 4"));
 
         // The count outside a list falls once a generation names the member.

@@ -33,8 +33,8 @@ use smg_policy_controller::{
     },
     stages::Lifecycle,
     store::{
-        GatewayId, Hand, LeaseRecord, LeaseState, LeasesStore, LoadSink, LoadSource, MemoryStore,
-        PickRecord, WorkerFacts, WorkerStatus, WorkersStore, PUBLISH_WINDOW,
+        GatewayId, Hand, LeaseRecord, LeaseState, LeasesStore, MemoryStore, PickRecord,
+        WorkerFacts, WorkerStatus, WorkersStore,
     },
     tracking::{Dispatch, Lease, LeaseId, Outcome, Said, Side, TransportClass},
 };
@@ -579,11 +579,10 @@ fn a_pair_decision_after_the_first_allocates_nothing() {
 }
 
 /// A store of two pools: `n` ready members serving `m` and one member
-/// serving another model, each with a record on file and published. The
-/// members of `m` and the instant the store's last window opened.
-fn store_of(n: usize) -> (MemoryStore, Vec<WorkerId>, Instant) {
+/// serving another model, each published. The store and the members of
+/// `m`.
+fn store_of(n: usize) -> (MemoryStore, Vec<WorkerId>) {
     let store = MemoryStore::new();
-    let opened = Instant::now();
     let register = |key: String, model: &str| {
         let id = store
             .upsert(WorkerFacts {
@@ -600,19 +599,13 @@ fn store_of(n: usize) -> (MemoryStore, Vec<WorkerId>, Instant) {
         store
             .set_status(id, WorkerStatus::Ready, revision)
             .expect("ready");
-        store.record(id, 0, LoadRow::default(), opened, LoadSource::Stream);
         id
     };
     let ids = (0..n)
         .map(|index| register(format!("http://w{index}:8000"), "m"))
         .collect();
     register("http://other:8000".to_string(), "other");
-    // The records that landed inside the first one's window are published
-    // at its end: nothing waits.
-    let opened = opened + PUBLISH_WINDOW;
-    store.publish(opened);
-    assert_eq!(store.publish_due(), None);
-    (store, ids, opened)
+    (store, ids)
 }
 
 /// A lease's life at the store, over the store's own calls and no engine:
@@ -631,12 +624,13 @@ fn a_lease_filed_dispatched_and_completed_at_the_store_allocates_nothing() {
     const STEP: Duration = Duration::from_millis(50);
     const SPAN: Duration = Duration::from_secs(5);
     for n in [8usize, 64] {
-        let (store, ids, opened) = store_of(n);
+        let (store, ids) = store_of(n);
+        let began = Instant::now();
         let gateway = GatewayId(7);
         let hand = Hand::new(gateway);
         let term = LeasesStore::term(&store);
         let life = |request: u32| {
-            let now = opened + STEP * request;
+            let now = began + STEP * request;
             let worker = ids[request as usize % n];
             // An id of the host's own minting: the high bit.
             let lease = LeaseId(1 << 63 | u64::from(request));
@@ -746,7 +740,7 @@ fn a_registrations_allocations_do_not_follow_the_fleet() {
     // so what a registration allocates does not follow the fleet: one into
     // 512 workers makes the allocator calls of one into 8.
     let fewest = |n: usize| {
-        let (store, _, _) = store_of(n);
+        let (store, _) = store_of(n);
         // The fewest allocation calls of one registration and the build it
         // owes among a few: the store's tables and the writer's kept lists
         // grow by doubling, and one write in many pays for it.
@@ -770,28 +764,6 @@ fn a_registrations_allocations_do_not_follow_the_fleet() {
     };
     let (few, many) = (fewest(8), fewest(512));
     assert_eq!(many, few, "a registration's allocations follow the fleet");
-}
-
-#[test]
-fn a_record_inside_the_window_allocates_nothing_and_a_publication_derives_nothing() {
-    let (store, ids, opened) = store_of(64);
-    // Inside the window the store's making opened: on file and folded,
-    // nothing published.
-    let inside = opened + Duration::from_millis(1);
-    let record = LoadRow {
-        running: 7,
-        ..LoadRow::default()
-    };
-    let ((), allocations) =
-        allocations_during(|| store.record(ids[0], 0, record, inside, LoadSource::Stream));
-    assert_eq!(allocations, 0, "a load record inside the window allocated");
-    // The window's end: the rows of the one pool a record was folded into,
-    // the world and its pointer a pool. Nothing the membership derived is
-    // built again, and the other pool's rows are not copied.
-    let due = store.publish_due().expect("the record waits");
-    let ((), allocations) = allocations_during(|| store.publish(due));
-    assert_eq!(allocations, 3, "a publication of one pool's rows");
-    assert_eq!(store.publish_due(), None);
 }
 
 /// A validation builds an index key's error path at the key's refusal

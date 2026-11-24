@@ -43,9 +43,8 @@
 //! writes are one whole derivation.
 //!
 //! A row in a pool is the candidate row itself. Its fixed fields are
-//! written when the membership's first world is built. Its moving facts
-//! (the load record with its sample instant, the two status bits) are
-//! folded into the writer's own copy of the pool, and a publication copies
+//! written when the membership's first world is built. Its two status bits
+//! are folded into the writer's own copy of the pool, and a publication copies
 //! each pool that moved, whole. A published world never changes: a reader
 //! reads memory nobody is writing and sees each row as one publication left
 //! it, through no lock.
@@ -59,24 +58,20 @@
 //! takes other rows the writer holds alone, or the publication allocates.
 //!
 //! **The store publishes at its own rate, never at its writers'.** Every
-//! deciding thread fetches every publication, so there is one world a
-//! window for the whole store: the load records folded into any pool are
-//! published together once per [`PUBLISH_WINDOW`], with the build the
-//! membership writes left owed, and a status change, a veto or a leave at
-//! once, through the same door, with whatever else waits. A load write
-//! waits for an owed build, and else publishes by itself when the last
-//! window is a window old; one that lands inside the window waits, and the
-//! sink names the instant it is due
+//! deciding thread fetches every publication, so the build the membership
+//! writes left owed is published once per [`PUBLISH_WINDOW`], and a status
+//! change, a veto or a leave at once, through the same door. The store
+//! names the instant the build is due
 //! ([`MemoryStore::publish_due`](crate::store::MemoryStore::publish_due)).
 //!
 //! **A veto is published in its gateway's run.** The writer keeps
 //! each gateway's list and publishes each pool's standing vetoes as one run
 //! a gateway, by row. A veto's write builds its own gateway's run again in
 //! the pools its worker has a row in and shares every other run with the
-//! publication before. A membership build, which moves the rows, and a
-//! window's publication that drops a veto past its end build every run
-//! again. A veto leaves with its worker's row in the membership build's own
-//! step, so no publication shows the row without it.
+//! publication before. A membership build, which moves the rows, builds
+//! every run again, and one paid at a window's end drops the vetoes past
+//! their end first. A veto leaves with its worker's row in the membership
+//! build's own step, so no publication shows the row without it.
 
 #![expect(
     clippy::exhaustive_structs,
@@ -95,15 +90,11 @@ use rustc_hash::FxHashMap;
 use crate::engine::policy_engine::PolicyEngine;
 use crate::{
     document::spec::{AppliedSpec, Pairing, ViewListPositions},
-    engine::{
-        framework::OverloadThresholds,
-        view::{fingerprint, Candidate, Health, Phase, Role, WorkerId},
-    },
+    engine::view::{fingerprint, Candidate, Health, Role, WorkerId},
     store::{
         applied::Applied,
-        loads::LoadSample,
         pairing::{known, Derivation, Member, PairClasses, Pool},
-        workers::{Overload, Reachability, WorkerFacts, WorkerRow, WorkerStatus},
+        workers::{Reachability, WorkerFacts, WorkerRow, WorkerStatus},
         GatewayId,
     },
     tracking::in_flight::{InFlightCounts, WorkerSlot},
@@ -112,11 +103,10 @@ use crate::{
 #[cfg(test)]
 mod tests;
 
-/// How long a folded load record may wait for its publication: the window
-/// the gateway's load monitor already publishes pushed records by. A record
-/// steers within one window of its receipt. The value is inherited, so a
-/// comparison against that monitor differs by one thing fewer; a test hands
-/// its own to [`MemoryStore::with_publish_window`](crate::store::MemoryStore::with_publish_window).
+/// How long a build the membership writes left owed may wait for its
+/// publication: the window the gateway's load monitor publishes pushed
+/// records by. A test hands its own to
+/// [`MemoryStore::with_publish_window`](crate::store::MemoryStore::with_publish_window).
 pub const PUBLISH_WINDOW: Duration = Duration::from_millis(20);
 
 /// Microseconds from `origin` to `at`, saturating at both ends.
@@ -152,16 +142,6 @@ const fn role_slot(role: Role) -> usize {
         Role::Prefill => 1,
         Role::Decode => 2,
         Role::Encode => 3,
-    }
-}
-
-/// The phase a role's pool decides: what a binding is matched on.
-pub(crate) const fn phase_of(role: Role) -> Phase {
-    match role {
-        Role::Single => Phase::Single,
-        Role::Prefill => Phase::Prefill,
-        Role::Decode => Phase::Decode,
-        Role::Encode => Phase::Encode,
     }
 }
 
@@ -455,8 +435,8 @@ fn with_veto(
 /// workers by id, each with its ends. Replaced whole at each of the
 /// four writes that change them, all rare: a veto's write, a gateway's
 /// leaving that takes its whole list, a membership write that takes a
-/// departed worker's vetoes with its row, and a window's publication that
-/// drops a veto past its end. A world carries what is
+/// departed worker's vetoes with its row, and a build paid at a window's
+/// end, which drops a veto past its end. A world carries what is
 /// derived from them: each pool's runs by gateway ([`PoolVetoes`]).
 #[derive(Debug, Default)]
 struct Vetoes {
@@ -646,24 +626,8 @@ impl StoreSnapshot {
         micros(self.origin, at)
     }
 
-    /// Every row this world publishes under an overload verdict, pool by
-    /// pool. A worker has a row in each pool it serves, and each row is
-    /// judged under its own pool's thresholds. A host that mirrors the
-    /// verdict onto its own worker object reads the worker overloaded
-    /// where any of its rows is handed, and clear where none is.
-    pub fn overloaded(&self) -> impl Iterator<Item = &Candidate> + '_ {
-        self.rows
-            .iter()
-            .flat_map(|pool| pool.iter())
-            .filter(|row| row.health.overloaded)
-    }
-
     /// The row of worker `id` in the first pool that lists it, by one
-    /// binary search a pool; `None` for a worker no pool lists. A member
-    /// holds one rank in every pool that lists it, and each of its rows
-    /// carries that rank's load record: the first pool found answers for
-    /// its figures. Its overload verdict is each pool's own
-    /// ([`Self::overloaded`]).
+    /// binary search a pool; `None` for a worker no pool lists.
     pub fn first_row_of(&self, id: WorkerId) -> Option<&Candidate> {
         let (pool, row) = self.pooled_row(id)?;
         self.rows.get(pool)?.get(row)
@@ -761,16 +725,10 @@ struct Held {
 }
 
 /// The candidate row of one member: its fixed fields from its registration,
-/// its status bits, its load record when one is on file, and its engine
-/// family, zone and labels as `listed` reads them under the standing
-/// generation's lists. Its pair class is the membership's to derive
-/// ([`pair_up`]).
-fn row_of(
-    member: &WorkerRow,
-    sample: Option<&LoadSample>,
-    origin: Instant,
-    listed: ViewListPositions,
-) -> Candidate {
+/// its status bits, and its engine family, zone and labels as `listed`
+/// reads them under the standing generation's lists. Its pair class is the
+/// membership's to derive ([`pair_up`]).
+fn row_of(member: &WorkerRow, listed: ViewListPositions) -> Candidate {
     let facts = &member.facts;
     Candidate {
         id: member.id,
@@ -779,8 +737,6 @@ fn row_of(
         dp_size: facts.dp_size,
         health: health_of(member.status),
         wire_modes: facts.wire_modes,
-        load: sample.map(|sample| sample.row),
-        load_sampled_at_micros: sample.map_or(0, |sample| micros(origin, sample.sampled_at)),
         host_local: facts.reachable_from != Reachability::Any,
         vision: facts.vision,
         // No admission window is the store's to know: both bits read open,
@@ -812,8 +768,6 @@ fn health_of(status: WorkerStatus) -> Health {
 struct Entry<'a> {
     row: Candidate,
     facts: &'a WorkerFacts,
-    /// The thresholds its registration names.
-    own: Overload,
     /// Its member's slot in the store's counts.
     booked: WorkerSlot,
 }
@@ -1014,99 +968,12 @@ struct Place {
     row: u32,
 }
 
-/// The writer's own copy of one pool: what records and status changes are
-/// folded into between two publications.
+/// The writer's own copy of one pool: what status changes are folded into
+/// between two publications.
 struct Working {
     rows: Vec<Candidate>,
     /// Folded since the last publication.
     dirty: bool,
-    /// Each row's own overload thresholds, from its registration.
-    own: Vec<Overload>,
-    /// The thresholds the standing generation's binding hands this pool;
-    /// `None` when no binding matches it or its block is switched off.
-    binding: Option<OverloadThresholds>,
-}
-
-/// One engine as the overload verdict reads it: the ranks of one
-/// data-parallel engine, which share its key, a member a rank; or a
-/// single-rank worker alone, whose engine is its own key.
-#[derive(Clone, Copy, Default)]
-struct EngineRows {
-    /// Where the engine's rows stand in the writer's one list of them: the
-    /// first, and how many.
-    at: u32,
-    len: u32,
-    /// A row of the engine has a threshold, or an answer left one of its
-    /// ranks unnamed. An engine with neither is not judged at a write: its
-    /// rows' bits are clear and stay so.
-    judged: bool,
-    /// The last word of the engine's poll was that no report came: its
-    /// verdict reads clear, whatever is on file, until its next record or
-    /// report. It outlives a membership build, which judges again, and it
-    /// is kept and ended while no threshold stands.
-    silent: bool,
-    /// When the poll of that word began, in microseconds from the origin;
-    /// read while `silent` alone. A membership build carries the word over
-    /// no record that came at or after it and that no row took at its write.
-    said: u64,
-}
-
-/// One row of an engine: a rank's row in one pool, where a verdict is
-/// written.
-#[derive(Clone, Copy, Default)]
-struct EngineRow {
-    pool: u32,
-    row: u32,
-    /// The first of its rank's rows: where the judge reads the rank's
-    /// record on file. A rank's rows carry the same record in every pool.
-    rank: bool,
-}
-
-/// How many report periods a rank's sample may lie behind its engine's
-/// newest receipt and still be judged. The period told is no shorter than
-/// the time between two of the caller's polls and than a poll's deadline,
-/// so a rank that loses a report is heard again inside three periods. A
-/// rank that stays silent is counted through three periods, so through
-/// one lost report at the least, and ends at the first judged write
-/// after them.
-const SAMPLE_PERIODS: u64 = 3;
-
-/// The engine's rows, in the writer's list of every engine's.
-fn rows_of<'a>(rows: &'a [EngineRow], engine: &EngineRows) -> &'a [EngineRow] {
-    let from = engine.at as usize;
-    rows.get(from..from + engine.len as usize)
-        .unwrap_or_default()
-}
-
-/// The group and the receipt of the rank `id` in `ranked`, which stands by
-/// id, or `None` for a member that is no rank of a data-parallel engine.
-/// The callers ask in rising id order: `next` is their cursor.
-fn ranked_at(
-    ranked: &[(WorkerId, u32, u64)],
-    next: &mut usize,
-    id: WorkerId,
-) -> Option<(u32, u64)> {
-    while ranked.get(*next).is_some_and(|&(at, ..)| at < id) {
-        *next += 1;
-    }
-    ranked
-        .get(*next)
-        .filter(|&&(at, ..)| at == id)
-        .map(|&(_, group, heard)| (group, heard))
-}
-
-/// What the load table holds of one rank, as a membership build and an
-/// applied generation read it: its load sample. A closure reads the samples
-/// of a table.
-pub(super) trait OnFile {
-    /// The rank's load sample.
-    fn sample(&self, id: WorkerId, rank: u16) -> Option<LoadSample>;
-}
-
-impl<F: Fn(WorkerId, u16) -> Option<LoadSample>> OnFile for F {
-    fn sample(&self, id: WorkerId, rank: u16) -> Option<LoadSample> {
-        self(id, rank)
-    }
 }
 
 /// The build the membership writes since the last one left owed.
@@ -1119,7 +986,7 @@ struct Owed {
     since: Instant,
 }
 
-/// The write side of the world, behind the store's load lock: the working
+/// The write side of the world, behind one lock of the store: the working
 /// copy of every pool, where each member's rows stand in them, what the
 /// last publication held, and the publication window. Every write that
 /// publishes hands back the world it made; the store shows it under the
@@ -1139,7 +1006,7 @@ pub(super) struct Writer {
     /// Each pool's spare: the rows it published before its last, kept for
     /// its next publication to write over; none before the pool's first
     /// publication after a membership build. Beside the working copies,
-    /// not in them: a load write's step from pool to pool is as it was.
+    /// not in them.
     spares: Vec<Option<Arc<[Candidate]>>>,
     working: Vec<Working>,
     /// Rows that left their pool and that a world may still list: a spare a
@@ -1172,8 +1039,7 @@ pub(super) struct Writer {
     vetoes: Arc<Vetoes>,
     /// The vetoes as the world carries them, by pool and by gateway. A
     /// veto's write builds its own gateway's runs again; a membership build
-    /// and a window's publication that drops a veto past its end build
-    /// every run again.
+    /// builds every run again.
     pool_vetoes: Arc<[PoolVetoes]>,
     /// The generation every world is published under until the next is
     /// applied: the unbound one at the start.
@@ -1184,47 +1050,6 @@ pub(super) struct Writer {
     /// resident that long, its session table included, as it stood when
     /// it was replaced.
     retired: Option<Arc<Applied>>,
-    /// The engines of the membership, as the overload verdict reads them.
-    engines: Vec<EngineRows>,
-    /// Every engine's rows in one list, an engine's together. A membership
-    /// write fills both lists again in place: it allocates for no engine.
-    engine_rows: Vec<EngineRow>,
-    /// Each place's engine, in the places' order: beside the places, not
-    /// in them, so a write that judges no engine steps over them as it
-    /// did.
-    place_engines: Vec<u32>,
-    /// Each place's row among the engines' rows, in the places' order: a
-    /// rank's receipt stands at its first place's, found by no search.
-    /// Written with the receipts, and empty where none is kept.
-    place_slots: Vec<u32>,
-    /// When each rank of a data-parallel engine was last heard: the
-    /// receipt of its record on file, in microseconds from the origin,
-    /// in the engine rows' order. Empty for a membership of single-rank
-    /// workers, whose one sample is its engine's newest. A record's
-    /// write keeps it while an engine has a threshold, and the writes
-    /// that start a judgment, a membership write and an applied
-    /// generation, read every receipt again from the samples.
-    heard: Vec<u64>,
-    /// How far behind its engine's newest receipt a rank's sample may
-    /// lie and still be judged, in microseconds; none until a report
-    /// period is told.
-    sample_bound: Option<u64>,
-    /// An engine has a threshold.
-    judging: bool,
-    /// How many engines' last word was that no report came.
-    silenced: u32,
-    /// The ranks an engine's last answer left unnamed beside a rank it
-    /// named, each by its member and its rank's number, sorted. A rank
-    /// stands here until an answer or a record names it again, its
-    /// member's rows go, or the build that follows its member's
-    /// registration under another rank number. While a rank the answer
-    /// named has a record on file, an unnamed rank's rows carry the
-    /// overload bit ([`Self::judge`]): a decision that drops overloaded
-    /// rows takes no rank its engine stopped naming while another
-    /// answers. Empty until an answer names part of an engine.
-    unnamed: Vec<(WorkerId, u16)>,
-    /// How many writes to the load table moved an overload verdict.
-    flips: u64,
     /// The standing members outside the standing generation's lists.
     outside: OutsideLists,
     /// Each member's fields under the standing generation's lists, in id
@@ -1235,11 +1060,8 @@ pub(super) struct Writer {
     listed: Vec<Held>,
     /// The build before's `listed`, kept for its room.
     listed_spare: Vec<Held>,
-    /// The last publication the window counts from: a window's end, or a
-    /// load write that published by itself.
+    /// The last publication the window counts from: a window's end.
     last_window: Option<Instant>,
-    /// A folded load record waits for the window's end.
-    waiting: bool,
     /// The build the membership writes since the last one left owed; `None`
     /// while the working rows are the membership's.
     owed: Option<Owed>,
@@ -1269,21 +1091,10 @@ impl Writer {
             pool_vetoes: Arc::default(),
             spec: Arc::new(Applied::new(AppliedSpec::unbound(), origin)),
             retired: None,
-            engines: Vec::new(),
-            engine_rows: Vec::new(),
-            place_engines: Vec::new(),
-            place_slots: Vec::new(),
-            heard: Vec::new(),
-            sample_bound: None,
-            judging: false,
-            silenced: 0,
-            unnamed: Vec::new(),
-            flips: 0,
             outside: OutsideLists::default(),
             listed: Vec::new(),
             listed_spare: Vec::new(),
             last_window: None,
-            waiting: false,
             owed: None,
         }
     }
@@ -1325,9 +1136,7 @@ impl Writer {
     /// the standing membership under the new generation. A number at or
     /// under the standing one is refused by naming the standing one, and
     /// nothing is published: the number only rises, so no reader sees a
-    /// generation and then a lower one. Each pool takes the thresholds of
-    /// the new generation's binding, and every engine is judged again
-    /// under them from what is on file. A generation whose lists differ
+    /// generation and then a lower one. A generation whose lists differ
     /// from the standing one's has each of `members`, the standing
     /// membership, read again under them, so the first world of a
     /// generation holds rows of its own lists.
@@ -1355,7 +1164,6 @@ impl Writer {
         spec: Arc<Applied>,
         epoch: u64,
         members: impl Iterator<Item = (&'a WorkerRow, WorkerSlot)>,
-        on_file: impl OnFile,
     ) -> Result<(Arc<StoreSnapshot>, Option<Arc<Applied>>), StaleGeneration> {
         let standing = self.spec.generation();
         if spec.generation() <= standing {
@@ -1372,17 +1180,11 @@ impl Writer {
                 // No member's fields are carried into other lists.
                 self.listed.clear();
             }
-            self.rebuild(epoch, members, on_file, Classes::Derive)
+            self.rebuild(epoch, members, Classes::Derive)
         } else {
             if relisted {
                 self.list(members);
             }
-            self.bind();
-            // A generation of the standing mode comes with no membership
-            // write: the receipts are read from the samples as the rows
-            // stand.
-            self.hear_again(&on_file);
-            self.judge_every();
             self.publish()
         };
         Ok((world, before))
@@ -1437,488 +1239,6 @@ impl Writer {
         held.sort_unstable_by_key(|held| held.id);
     }
 
-    /// Each pool's thresholds under the standing generation: those of the
-    /// binding the pool is decided under, which is the first to match its
-    /// model and its role's phase, or the model's pair binding for a
-    /// decode pool, and for an encode pool where that binding's plan is
-    /// `epd`
-    /// ([`Engine::pool_binding`](crate::engine::framework::Engine::pool_binding)).
-    /// Whether any pool has a pair.
-    fn bind(&mut self) -> bool {
-        let Self {
-            derived,
-            working,
-            spec,
-            ..
-        } = self;
-        let mut bound = false;
-        for (model, pools) in &derived.by_model {
-            for &index in pools.iter().flatten() {
-                let Some(pool) = working.get_mut(index as usize) else {
-                    continue;
-                };
-                let Some(role) = pool.rows.first().map(|row| row.role) else {
-                    continue;
-                };
-                pool.binding = spec
-                    .engine()
-                    .pool_binding(model, phase_of(role))
-                    .and_then(|binding| binding.overload);
-                bound |= pool.binding.is_some();
-            }
-        }
-        bound
-    }
-
-    /// Whether a row of the engine has a threshold: its own, or its
-    /// pool's.
-    fn has_threshold(&self, engine: usize) -> bool {
-        self.engines.get(engine).is_some_and(|engine| {
-            rows_of(&self.engine_rows, engine).iter().any(|at| {
-                self.working.get(at.pool as usize).is_some_and(|pool| {
-                    pool.binding.is_some()
-                        || pool
-                            .own
-                            .get(at.row as usize)
-                            .is_some_and(|own| *own != Overload::default())
-                })
-            })
-        })
-    }
-
-    /// Judge every engine again from what is on file. A membership build's
-    /// rows start with no bit, and an applied generation may hand any pool
-    /// another pair or none: an engine that had a threshold is judged once
-    /// more under what it has now, so a bit no threshold holds is cleared.
-    ///
-    /// A door comes here too where its write ended the last mark, behind
-    /// its own judgment of the write ([`Self::judged`]). That judgment
-    /// read the written engine as the whole write left it, the mark gone,
-    /// and counted the write, so the write is counted once. This pass
-    /// finds every verdict as its last write left it and moves none: from
-    /// it an engine with no threshold is judged at no write. Whether any
-    /// row's bit moved, which a door holds to none
-    /// ([`Self::judge_every_behind_a_door`]).
-    pub(super) fn judge_every(&mut self) -> bool {
-        self.judging = false;
-        let mut moved = false;
-        for index in 0..self.engines.len() {
-            // A rank stands unnamed only while the writer judges: a record
-            // reads a mark behind that one test.
-            let has = self.has_threshold(index) || self.unnamed_in(index);
-            self.judging |= has;
-            let Some(engine) = self.engines.get_mut(index) else {
-                continue;
-            };
-            let had = mem::replace(&mut engine.judged, true);
-            if had || has {
-                moved |= self.judge(index as u32);
-            }
-            if let Some(engine) = self.engines.get_mut(index) {
-                engine.judged = has;
-            }
-        }
-        moved
-    }
-
-    /// The pass over every engine as a door runs it, behind its own
-    /// judgment of a write that ended the last mark
-    /// ([`Self::judge_every`]). That judgment counted the write and this
-    /// pass counts nothing, so the pass must move no verdict: one it moved
-    /// would go uncounted, and unpublished where the door's own judgment
-    /// moved none. A debug build stops there.
-    pub(super) fn judge_every_behind_a_door(&mut self) {
-        let moved = self.judge_every();
-        debug_assert!(!moved, "the pass behind a door's judgment moved a verdict");
-    }
-
-    /// Judge one engine over what is on file for its ranks and write the
-    /// verdict on each row where it changes; whether any row's bit moved.
-    ///
-    /// The verdict is the engine's: the queued requests summed over its
-    /// ranks on file against a row's count, and their active KV usage
-    /// summed against the row's permille times the ranks on file, which is
-    /// the mean compared with no division. Each row is judged under its
-    /// own pair: the value its registration names, else its pool's
-    /// binding's. An engine with nothing on file reads clear, and so does
-    /// one whose last poll brought no report. An engine no row of which
-    /// has a threshold is not judged, unless an answer left a rank of it
-    /// unnamed ([`Self::name`]): that rank's rows carry the bit while a
-    /// rank the answer named has a record on file, whatever the
-    /// thresholds say, and with no such rank it reads as its engine does.
-    fn judge(&mut self, engine: u32) -> bool {
-        let Self {
-            engines,
-            engine_rows,
-            working,
-            heard,
-            sample_bound,
-            unnamed,
-            ..
-        } = self;
-        let Some(engine) = engines.get(engine as usize).filter(|engine| engine.judged) else {
-            return false;
-        };
-        let rows = rows_of(engine_rows, engine);
-        let load_of = |at: &EngineRow| {
-            working
-                .get(at.pool as usize)
-                .and_then(|pool| pool.rows.get(at.row as usize))
-                .and_then(|row| row.load)
-        };
-        // A rank the engine's last answer left unnamed is avoided while a
-        // rank that answer named has a record on file: alone it answers.
-        let is_unnamed = |id: WorkerId, rank: u16| unnamed.binary_search(&(id, rank)).is_ok();
-        let named = !unnamed.is_empty()
-            && rows.iter().filter(|at| at.rank).any(|at| {
-                working
-                    .get(at.pool as usize)
-                    .and_then(|pool| pool.rows.get(at.row as usize))
-                    .is_some_and(|row| row.load.is_some() && !is_unnamed(row.id, row.dp_rank))
-            });
-        // A sample is a fact while its engine still says it: once a report
-        // period is told, a rank whose receipt lies further behind the
-        // engine's newest than the bound is not counted. One rank's sample
-        // is its engine's newest. An engine no rank of which is heard is
-        // judged by no write: its verdict stands as it was last judged.
-        let from = engine.at as usize;
-        let receipts = match *sample_bound {
-            Some(bound) if rows.len() > 1 => heard
-                .get(from..from + rows.len())
-                .map(|heard| (heard, bound)),
-            _ => None,
-        };
-        // The sums over the ranks heard no earlier than `oldest`, then the
-        // newest and the eldest receipt among them.
-        let sum = |oldest: u64| {
-            let (mut queued, mut usage, mut ranks) = (0_u64, 0_u64, 0_u64);
-            let (mut newest, mut eldest) = (0_u64, u64::MAX);
-            for (index, at) in rows.iter().enumerate().filter(|(_, at)| at.rank) {
-                let Some(load) = load_of(at) else {
-                    continue;
-                };
-                let heard = receipts
-                    .and_then(|(heard, _)| heard.get(index))
-                    .copied()
-                    .unwrap_or(0);
-                if heard < oldest {
-                    continue;
-                }
-                queued += u64::from(load.queued);
-                usage += u64::from(load.active_kv_permille);
-                ranks += 1;
-                newest = newest.max(heard);
-                eldest = eldest.min(heard);
-            }
-            ((queued, usage, ranks), (newest, eldest))
-        };
-        // One walk sums an engine no sample of which has ended; a second
-        // leaves the ended ones out.
-        let (queued, usage, ranks) = if engine.silent {
-            (0, 0, 0)
-        } else {
-            let (whole, (newest, eldest)) = sum(0);
-            let oldest = receipts.map_or(0, |(_, bound)| newest.saturating_sub(bound));
-            if eldest < oldest {
-                sum(oldest).0
-            } else {
-                whole
-            }
-        };
-        let mut moved = false;
-        for &EngineRow { pool, row, .. } in rows {
-            let Some(pool) = working.get_mut(pool as usize) else {
-                continue;
-            };
-            let own = pool.own.get(row as usize).copied().unwrap_or_default();
-            let waiting = own
-                .waiting_requests
-                .or_else(|| pool.binding.map(|pair| pair.waiting_requests));
-            let permille = own
-                .kv_usage_permille
-                .or_else(|| pool.binding.map(|pair| pair.kv_usage_permille));
-            let over = ranks > 0
-                && (waiting.is_some_and(|at| queued >= u64::from(at))
-                    || permille.is_some_and(|at| usage >= u64::from(at) * ranks));
-            let Some(row) = pool.rows.get_mut(row as usize) else {
-                continue;
-            };
-            let over = over || (named && is_unnamed(row.id, row.dp_rank));
-            if row.health.overloaded != over {
-                row.health.overloaded = over;
-                pool.dirty = true;
-                moved = true;
-            }
-        }
-        moved
-    }
-
-    /// A write changed what is on file for the engine: judge it once, and
-    /// count the write when a verdict moved. `heard` is a record or a
-    /// report's row, which ends the word that none came, whether or not a
-    /// threshold stands: a generation that brings one judges by a word
-    /// that is current. An engine no row of which has a threshold is not
-    /// judged.
-    pub(super) fn judged(&mut self, engine: u32, heard: bool) -> bool {
-        let Some(rows) = self.engines.get_mut(engine as usize) else {
-            return false;
-        };
-        let ended = heard && mem::take(&mut rows.silent);
-        let judged = rows.judged;
-        self.silenced -= u32::from(ended);
-        if !judged {
-            return false;
-        }
-        let moved = self.judge(engine);
-        self.flips += u64::from(moved);
-        moved
-    }
-
-    /// The engine the member is a rank of; `None` for a member with no
-    /// row.
-    pub(super) fn engine_of(&self, id: WorkerId) -> Option<u32> {
-        let first = self.places.partition_point(|place| place.id < id);
-        self.places
-            .get(first)
-            .filter(|place| place.id == id)
-            .and_then(|_| self.engine_at(first as u32))
-    }
-
-    /// The engine of the member whose place stands at `place`.
-    pub(super) fn engine_at(&self, place: u32) -> Option<u32> {
-        self.place_engines.get(place as usize).copied()
-    }
-
-    /// A record received at `at` changed what is on file for the member
-    /// whose first place stands at `place`: its engine is heard, and
-    /// judged once ([`Self::judge_heard`]). The record names its rank, so
-    /// a mark an answer left on it ends ([`Self::recorded_marked`]). While
-    /// no engine has a threshold, none is silent and no rank stands
-    /// unnamed there is no word to end and no verdict to move, and the
-    /// write reads no engine and no mark.
-    pub(super) fn recorded(&mut self, place: u32, id: WorkerId, rank: u16, at: Instant) -> bool {
-        if !self.judging && self.silenced == 0 {
-            return false;
-        }
-        if !self.unnamed.is_empty() {
-            return self.recorded_marked(place, id, rank, at);
-        }
-        self.judge_heard(place, at)
-    }
-
-    /// The member whose first place stands at `place` was heard at `at`:
-    /// its rank takes the receipt, and its engine is judged once with its
-    /// word that no report came ended ([`Self::judged`]).
-    fn judge_heard(&mut self, place: u32, at: Instant) -> bool {
-        let Some(engine) = self.engine_at(place) else {
-            return false;
-        };
-        self.hear(place, at);
-        self.judged(engine, true)
-    }
-
-    /// The record door in a store that holds a mark. The record names its
-    /// rank again, which ends the mark an answer left on the rank
-    /// ([`Self::name`]), and its engine is heard and judged as at any
-    /// record. Where the last mark went with it, every engine is judged
-    /// once more behind that judgment
-    /// ([`Self::judge_every_behind_a_door`]). Cold and
-    /// out of line: the record door runs at every pushed record and comes
-    /// here only while a mark stands, and with this step inlined a record
-    /// paid for it in a store that holds no mark.
-    #[cold]
-    #[inline(never)]
-    fn recorded_marked(&mut self, place: u32, id: WorkerId, rank: u16, at: Instant) -> bool {
-        self.name(id, rank, false);
-        let moved = self.judge_heard(place, at);
-        if self.unnamed.is_empty() {
-            self.judge_every_behind_a_door();
-        }
-        moved
-    }
-
-    /// The member whose first place stands at `place` was heard at `at`:
-    /// the receipt its sample is aged from, at the place's own row among
-    /// the engines' rows. Kept for the ranks of a data-parallel engine,
-    /// and only while an engine has a threshold: a write that starts a
-    /// judgment reads every receipt again from the samples, a membership
-    /// write in its walk and an applied generation by
-    /// [`Self::hear_again`].
-    pub(super) fn hear(&mut self, place: u32, at: Instant) {
-        if self.heard.is_empty() || !self.judging {
-            return;
-        }
-        let Some(&slot) = self.place_slots.get(place as usize) else {
-            return;
-        };
-        // A member's later place holds no receipt: its row is no rank's.
-        let row = self.engine_rows.get(slot as usize);
-        if !row.is_some_and(|row| row.rank) {
-            return;
-        }
-        if let Some(heard) = self.heard.get_mut(slot as usize) {
-            *heard = micros(self.origin, at);
-        }
-    }
-
-    /// Every rank's receipt again, from its sample on file: what an
-    /// applied generation judges by, since a record's write keeps the
-    /// receipts only while an engine has a threshold. A membership write
-    /// reads them in its own walk.
-    fn hear_again(&mut self, on_file: &impl OnFile) {
-        for (heard, at) in self.heard.iter_mut().zip(&self.engine_rows) {
-            if !at.rank {
-                continue;
-            }
-            let sample = self
-                .working
-                .get(at.pool as usize)
-                .and_then(|pool| pool.rows.get(at.row as usize))
-                .and_then(|row| on_file.sample(row.id, row.dp_rank));
-            *heard = sample.map_or(0, |sample| micros(self.origin, sample.received_at));
-        }
-    }
-
-    /// Every ready rank is heard once a `period` from here on: a judgment
-    /// counts a rank only while its receipt lies within three periods of
-    /// its engine's newest, and every engine with a threshold is judged
-    /// again under it. A period is told once: another changes nothing.
-    /// Whether `period` is the one that stands, and whether a verdict
-    /// moved.
-    pub(super) fn heard_every(&mut self, period: Duration) -> (bool, bool) {
-        let bound = u64::try_from(period.as_micros())
-            .unwrap_or(u64::MAX)
-            .saturating_mul(SAMPLE_PERIODS);
-        if let Some(told) = self.sample_bound {
-            return (told == bound, false);
-        }
-        self.sample_bound = Some(bound);
-        let mut moved = false;
-        for index in 0..self.engines.len() {
-            moved |= self.judge(index as u32);
-        }
-        (true, moved)
-    }
-
-    /// The engine's ranks, each by its member and its rank's number.
-    pub(super) fn ranks_of(&self, engine: u32) -> impl Iterator<Item = (WorkerId, u16)> + '_ {
-        let rows = self
-            .engines
-            .get(engine as usize)
-            .map(|engine| rows_of(&self.engine_rows, engine))
-            .unwrap_or_default();
-        rows.iter().filter(|at| at.rank).filter_map(|at| {
-            let pool = self.working.get(at.pool as usize)?;
-            let row = pool.rows.get(at.row as usize)?;
-            Some((row.id, row.dp_rank))
-        })
-    }
-
-    /// The word that no report came for the engine, by a poll that began at
-    /// `polled_at`: from here its verdict reads clear until its next record
-    /// or report, and the engine is judged once. The word keeps that
-    /// instant for the next membership build ([`Self::rebuild`]). It is kept
-    /// for an engine with no threshold too, which is not judged. Whether a
-    /// verdict moved.
-    pub(super) fn silence(&mut self, engine: u32, polled_at: Instant) -> bool {
-        let said = micros(self.origin, polled_at);
-        let Some(rows) = self.engines.get_mut(engine as usize) else {
-            return false;
-        };
-        let was = mem::replace(&mut rows.silent, true);
-        rows.said = said;
-        self.silenced += u32::from(!was);
-        self.judged(engine, false)
-    }
-
-    /// The engine's last answer named another of its ranks and not `rank`
-    /// of the member `id` (`unnamed`), or an answer or a record names the
-    /// rank again. The caller judges the engine once its write is whole
-    /// ([`Self::judged`]), and every engine once more behind that where
-    /// the write ended the last mark
-    /// ([`Self::judge_every_behind_a_door`]). From the
-    /// mark on the engine is judged at each write, threshold or none,
-    /// until the last mark's end, a membership write or a generation
-    /// finds it with no mark and no threshold. Whether the mark moved.
-    pub(super) fn name(&mut self, id: WorkerId, rank: u16, unnamed: bool) -> bool {
-        match (self.unnamed.binary_search(&(id, rank)), unnamed) {
-            (Err(at), true) => {
-                self.unnamed.insert(at, (id, rank));
-                let engine = self
-                    .engine_of(id)
-                    .and_then(|engine| self.engines.get_mut(engine as usize));
-                if let Some(engine) = engine {
-                    engine.judged = true;
-                }
-                self.judging = true;
-                true
-            }
-            (Ok(at), false) => {
-                self.unnamed.remove(at);
-                true
-            }
-            _ => false,
-        }
-    }
-
-    /// Whether any rank stands unnamed: a door's one test before it reads
-    /// an answer or a record for a mark.
-    pub(super) fn any_unnamed(&self) -> bool {
-        !self.unnamed.is_empty()
-    }
-
-    /// The member's rows went with an eviction: its ranks' marks go with
-    /// them, and a rank with nothing on file is a rank again. The caller
-    /// judges the engine, and every engine once more behind it where the
-    /// last mark went ([`Self::judge_every_behind_a_door`]). Whether a
-    /// mark went.
-    pub(super) fn forget(&mut self, id: WorkerId) -> bool {
-        let before = self.unnamed.len();
-        self.unnamed.retain(|&(member, _)| member != id);
-        self.unnamed.len() != before
-    }
-
-    /// The marks of the members a membership write removed go with them,
-    /// and so does a mark on a rank number its member no longer holds: a
-    /// refresh may move the number under one id, and no answer or record
-    /// names the old one again.
-    fn forget_gone(&mut self) {
-        let Self {
-            unnamed,
-            places,
-            working,
-            ..
-        } = self;
-        unnamed.retain(|&(id, rank)| {
-            places_of(places, id).any(|place| {
-                working
-                    .get(place.pool as usize)
-                    .and_then(|pool| pool.rows.get(place.row as usize))
-                    .is_some_and(|row| row.dp_rank == rank)
-            })
-        });
-    }
-
-    /// Whether an answer left a rank of the engine unnamed.
-    fn unnamed_in(&self, engine: usize) -> bool {
-        !self.unnamed.is_empty()
-            && self.engines.get(engine).is_some_and(|engine| {
-                rows_of(&self.engine_rows, engine).iter().any(|at| {
-                    self.working
-                        .get(at.pool as usize)
-                        .and_then(|pool| pool.rows.get(at.row as usize))
-                        .is_some_and(|row| {
-                            self.unnamed.binary_search(&(row.id, row.dp_rank)).is_ok()
-                        })
-                })
-            })
-    }
-
-    /// How many writes to the load table moved an overload verdict.
-    pub(super) fn flips(&self) -> u64 {
-        self.flips
-    }
-
     /// The standing members outside the standing generation's lists.
     pub(super) fn outside(&self) -> OutsideLists {
         self.outside
@@ -1931,58 +1251,26 @@ impl Writer {
     }
 
     /// Derive the pools of the membership `members` at the store's `epoch`,
-    /// each row with its load record on file, make them the working copy
-    /// and publish them through the one door: every pool is new, so the
-    /// door copies none, every earlier fold is in the world this returns
-    /// and nothing waits. The pair classes are derived for the written
-    /// worker alone, derived whole or carried from the last write, as the
-    /// caller says (`classes`). A member's engine family, zone and labels
-    /// under the standing generation's lists are read where its row's
-    /// revision moved since they were last read, and carried where it
-    /// stands.
+    /// make them the working copy and publish them through the one door:
+    /// every pool is new, so the door copies none, every earlier fold is in
+    /// the world this returns and nothing waits. The pair classes are
+    /// derived for the written worker alone, derived whole or carried from
+    /// the last write, as the caller says (`classes`). A member's engine
+    /// family, zone and labels under the standing generation's lists are
+    /// read where its row's revision moved since they were last read, and
+    /// carried where it stands.
     pub(super) fn rebuild<'a>(
         &mut self,
         epoch: u64,
         members: impl Iterator<Item = (&'a WorkerRow, WorkerSlot)>,
-        on_file: impl OnFile,
         classes: Classes,
     ) -> Arc<StoreSnapshot> {
         // A build takes in every membership write: none stays owed.
         self.owed = None;
         self.builds += 1;
-        let origin = self.origin;
         // The last write's classes: carried, or what the written worker's
         // derive starts from.
         let last = (classes != Classes::Derive).then(|| Arc::clone(&self.derived));
-        // An engine whose last poll brought no report stays silent across
-        // the write: its verdict is not raised again from what is still on
-        // file. The word is carried by its members' ids, which the outgoing
-        // places hold in order. Each id stands with the instant its engine's
-        // word was said for. The list is empty while no engine is silent.
-        let mut silent: Vec<(WorkerId, u64)> = Vec::new();
-        if self.silenced > 0 {
-            let engines = &self.engines;
-            let word = |(place, &engine): (&Place, &u32)| {
-                let rows = engines.get(engine as usize)?;
-                rows.silent.then_some((place.id, rows.said))
-            };
-            let outgoing = self.places.iter().zip(&self.place_engines);
-            silent.extend(outgoing.filter_map(word));
-            silent.dedup();
-        }
-        // The ranks of the data-parallel engines, each with its engine's
-        // group by key and the receipt of its sample on file. A fleet of
-        // single-rank workers lists none.
-        let mut by_key: FxHashMap<&'a str, u32> = FxHashMap::default();
-        // The records on file that no row took at their write, each by its
-        // receipt: the newest of an engine's ranks at its group's number, a
-        // single-rank worker's under its own id. Read while a word may be
-        // carried.
-        let mut fresh: Vec<Option<u64>> = Vec::new();
-        let mut alone: Vec<(WorkerId, u64)> = Vec::new();
-        let mut ranked: Vec<(WorkerId, u32, u64)> = Vec::new();
-        // A member names a threshold of its own.
-        let mut owned = false;
         // Each model's members a side, by their place in `entries`: a
         // member's entry is written once, whatever it offers.
         let mut groups: FxHashMap<Box<str>, [Vec<u32>; ROLES]> = FxHashMap::default();
@@ -2021,39 +1309,6 @@ impl Writer {
                 ids.push(member.id);
             }
             let facts = &member.facts;
-            let sample = on_file.sample(member.id, facts.dp_rank);
-            // The ranks of a data-parallel engine share its key. A
-            // single-rank worker's engine is its own key, which no other
-            // row has: it is an engine alone, and no key is looked up.
-            // A record on file that no row took: the build asks what the
-            // record's load write asked, whether a row of the member stands
-            // at its rank. None does for a member new to the rows and for
-            // one a refresh moved to another rank.
-            let rank = facts.dp_rank;
-            let unheard = !silent.is_empty()
-                && sample.is_some()
-                && rows_at(&self.places, &mut self.working, member.id, rank, |_| false).is_none();
-            if facts.dp_size > 1 {
-                let next = by_key.len() as u32;
-                let group = *by_key.entry(facts.engine.as_str()).or_insert(next);
-                let heard = sample.map_or(0, |sample| micros(origin, sample.received_at));
-                ranked.push((member.id, group, heard));
-                if unheard {
-                    // The groups are dense numbers: an engine's newest
-                    // receipt is one slot, and one lookup a silent member.
-                    let at = group as usize;
-                    if fresh.len() <= at {
-                        fresh.resize(at + 1, None);
-                    }
-                    if let Some(newest) = fresh.get_mut(at) {
-                        *newest = Some(newest.map_or(heard, |was| was.max(heard)));
-                    }
-                }
-            } else if unheard {
-                let heard = sample.map_or(0, |sample| micros(origin, sample.received_at));
-                alone.push((member.id, heard));
-            }
-            owned |= facts.overload != Overload::default();
             let listed = if listing {
                 while outgoing.get(from).is_some_and(|held| held.id < member.id) {
                     from += 1;
@@ -2076,9 +1331,8 @@ impl Writer {
                 ViewListPositions::default()
             };
             let entry = Entry {
-                row: row_of(member, sample.as_ref(), origin, listed),
+                row: row_of(member, listed),
                 facts,
-                own: facts.overload,
                 // The slot the member's first write gave it: a build gives
                 // none and moves none.
                 booked: slot,
@@ -2175,18 +1429,7 @@ impl Writer {
                     },
                 });
                 self.spares.push(None);
-                self.working.push(Working {
-                    rows,
-                    dirty: false,
-                    // No list where no member names a threshold of its own:
-                    // a row with none reads its pool's.
-                    own: if owned {
-                        entries.iter().map(|entry| entry.own).collect()
-                    } else {
-                        Vec::new()
-                    },
-                    binding: None,
-                });
+                self.working.push(Working { rows, dirty: false });
                 indexes[side] = Some(index);
             }
             by_model.insert(model, indexes);
@@ -2207,161 +1450,6 @@ impl Writer {
         self.listed = incoming;
         self.listed_spare = outgoing;
         self.outside = outside;
-        // The engines, from the places, which stand by member: a member's
-        // first place is where its record is read, each is where a verdict
-        // is written. The writer's lists are written over in place, so the
-        // write allocates for no engine.
-        let mut engines = mem::take(&mut self.engines);
-        engines.clear();
-        self.engine_rows.clear();
-        self.place_engines.clear();
-        self.place_slots.clear();
-        // A record no row took was heard for no engine, and no write before
-        // this build knew the engine it is for: the word is carried to that
-        // engine over no such record that came at or after the word's poll
-        // began. A record's write leaves one, for a rank that waits for
-        // this build; a poll's answer asks for the build first.
-        if !fresh.is_empty() {
-            silent.retain(|&(id, said)| {
-                let at = ranked.binary_search_by_key(&id, |&(of, ..)| of).ok();
-                let group = at.and_then(|at| ranked.get(at)).map(|&(_, group, _)| group);
-                let newest = group.and_then(|group| fresh.get(group as usize).copied().flatten());
-                !newest.is_some_and(|received| received >= said)
-            });
-        }
-        // A single-rank worker is an engine alone: its own record ends the
-        // word its own id carries.
-        if !alone.is_empty() {
-            silent.retain(|&(id, said)| {
-                let at = alone.binary_search_by_key(&id, |&(of, _)| of).ok();
-                let received = at.and_then(|at| alone.get(at));
-                !received.is_some_and(|&(_, received)| received >= said)
-            });
-        }
-        // The word a member's engine takes from it: the instant it was said
-        // for.
-        let carried = |id: WorkerId| {
-            let at = silent.binary_search_by_key(&id, |&(of, _)| of).ok()?;
-            silent.get(at).map(|&(_, said)| said)
-        };
-        let mut silenced = 0;
-        let mut last = None;
-        if ranked.is_empty() {
-            // Single-rank workers alone: a member is an engine, and its
-            // rows are the engine's as they come, in one walk. One rank's
-            // sample is its engine's newest, so no receipt is kept.
-            self.heard.clear();
-            for place in &self.places {
-                let rank = last != Some(place.id);
-                if rank {
-                    last = Some(place.id);
-                    let said = carried(place.id);
-                    silenced += u32::from(said.is_some());
-                    engines.push(EngineRows {
-                        at: self.engine_rows.len() as u32,
-                        len: 0,
-                        judged: false,
-                        silent: said.is_some(),
-                        said: said.unwrap_or_default(),
-                    });
-                }
-                if let Some(engine) = engines.last_mut() {
-                    engine.len += 1;
-                }
-                self.place_engines
-                    .push(engines.len().saturating_sub(1) as u32);
-                self.engine_rows.push(EngineRow {
-                    pool: place.pool,
-                    row: place.row,
-                    rank,
-                });
-            }
-        } else {
-            // Ranks that share an engine do not stand together: each place
-            // takes its engine, the engines' rows are counted and given
-            // their room, then written in the places' order. The places
-            // and the ranks both stand by id, the ranks as the walk above
-            // pushed them, so a cursor finds a place's rank as the places
-            // pass.
-            debug_assert!(ranked.is_sorted_by(|a, b| a.0 < b.0));
-            let mut of_group = vec![u32::MAX; by_key.len()];
-            let mut engine = 0_u32;
-            let mut next = 0;
-            for place in &self.places {
-                if last != Some(place.id) {
-                    last = Some(place.id);
-                    let group = ranked_at(&ranked, &mut next, place.id)
-                        .and_then(|(group, _)| of_group.get_mut(group as usize));
-                    let known = group.as_deref().copied().filter(|&known| known != u32::MAX);
-                    engine = match known {
-                        Some(known) => known,
-                        None => {
-                            engines.push(EngineRows::default());
-                            let new = (engines.len() - 1) as u32;
-                            if let Some(group) = group {
-                                *group = new;
-                            }
-                            new
-                        }
-                    };
-                    if let Some(rows) = engines.get_mut(engine as usize) {
-                        if let Some(said) = carried(place.id) {
-                            silenced += u32::from(!rows.silent);
-                            rows.silent = true;
-                            rows.said = rows.said.max(said);
-                        }
-                    }
-                }
-                if let Some(rows) = engines.get_mut(engine as usize) {
-                    rows.len += 1;
-                }
-                self.place_engines.push(engine);
-            }
-            let mut rows = 0;
-            for engine in &mut engines {
-                engine.at = rows;
-                rows += mem::take(&mut engine.len);
-            }
-            self.engine_rows.resize(rows as usize, EngineRow::default());
-            // Each rank's receipt stands beside its row, from its sample on
-            // file as the walk above read it: a judgment ages a sample from
-            // where the writes before left it.
-            self.heard.clear();
-            self.heard.resize(rows as usize, 0);
-            last = None;
-            next = 0;
-            self.place_slots.resize(self.places.len(), u32::MAX);
-            let placed = self.places.iter().zip(&self.place_engines);
-            for (index, (place, &engine)) in placed.enumerate() {
-                let Some(engine) = engines.get_mut(engine as usize) else {
-                    continue;
-                };
-                let slot = engine.at + engine.len;
-                if let Some(of_place) = self.place_slots.get_mut(index) {
-                    *of_place = slot;
-                }
-                let at = slot as usize;
-                let rank = last != Some(place.id);
-                if let Some(row) = self.engine_rows.get_mut(at) {
-                    *row = EngineRow {
-                        pool: place.pool,
-                        row: place.row,
-                        rank,
-                    };
-                }
-                if rank {
-                    let receipt =
-                        ranked_at(&ranked, &mut next, place.id).map_or(0, |(_, heard)| heard);
-                    if let Some(heard) = self.heard.get_mut(at) {
-                        *heard = receipt;
-                    }
-                }
-                engine.len += 1;
-                last = Some(place.id);
-            }
-        }
-        self.engines = engines;
-        self.silenced = silenced;
         self.epoch = epoch;
         // Every member's id and slot, in the id order of this write's one
         // sort: a member in a pool, and one that offers no model.
@@ -2383,20 +1471,6 @@ impl Writer {
             }
         }
         self.derive_vetoes();
-        // Every row is new and carries no bit: each engine is judged again
-        // from what is on file, under the standing generation's pairs. A
-        // write with no pair in any pool and none of a member's own has no
-        // engine to judge. A pool's rows are cut for the publication after
-        // that judgment, so the write copies each pool once, with a
-        // verdict on it or none. A rank an answer left unnamed keeps its
-        // mark across the write while its member stands, and its engine
-        // is judged for it.
-        self.forget_gone();
-        if self.bind() || owned || !self.unnamed.is_empty() {
-            self.judge_every();
-        } else {
-            self.judging = false;
-        }
         for pool in &mut self.working {
             pool.dirty = false;
             self.published.push(Arc::from(pool.rows.as_slice()));
@@ -2405,8 +1479,7 @@ impl Writer {
     }
 
     /// Every pool's runs built again from the gateways' lists and the
-    /// members' places: for a membership build, which moves the rows, and
-    /// for a window's publication that dropped a veto past its end. A
+    /// members' places: for a membership build, which moves the rows. A
     /// veto's own write builds its gateway's runs alone
     /// ([`Self::write_veto`]). No list at all while no veto stands.
     fn derive_vetoes(&mut self) {
@@ -2480,58 +1553,6 @@ impl Writer {
                 }
             })
             .collect();
-    }
-
-    /// Fold one rank's load record, or its absence, into the member's rows
-    /// at that rank ([`rows_at`]); where the member's first place stands
-    /// when a row took it. The caller judges the member's engine once its
-    /// write is whole ([`Writer::recorded`], [`Writer::judged`]) and says
-    /// when that is ([`Writer::folded_at`]).
-    pub(super) fn fold_load(
-        &mut self,
-        id: WorkerId,
-        rank: u16,
-        sample: Option<&LoadSample>,
-    ) -> Option<u32> {
-        let Self {
-            places,
-            working,
-            origin,
-            ..
-        } = self;
-        rows_at(places, working, id, rank, |row| {
-            row.load = sample.map(|sample| sample.row);
-            row.load_sampled_at_micros =
-                sample.map_or(0, |sample| micros(*origin, sample.sampled_at));
-            true
-        })
-    }
-
-    /// A load write folded its rows at `at`: it publishes by itself when
-    /// the last window is a window old, else it waits for the window's end.
-    /// While a build is owed it waits for the call that pays the build: a
-    /// load write that opened the next window by itself would put the build
-    /// off by a window each time. The world to show, when it published.
-    #[must_use]
-    pub(super) fn folded_at(&mut self, at: Instant) -> Option<Arc<StoreSnapshot>> {
-        let inside = |last| self.window_end(last).is_none_or(|end| at < end);
-        if self.owed.is_some() || self.last_window.is_some_and(inside) {
-            self.waiting = true;
-            return None;
-        }
-        Some(self.publish_window(at))
-    }
-
-    /// A load write with no instant of its own folded its rows: it waits
-    /// for the window's end, or publishes when no window ever opened.
-    #[must_use]
-    pub(super) fn folded(&mut self) -> Option<Arc<StoreSnapshot>> {
-        if self.last_window.is_some() {
-            self.waiting = true;
-            None
-        } else {
-            Some(self.publish())
-        }
     }
 
     /// Fold a status change into the member's rows and publish at once: a
@@ -2617,17 +1638,15 @@ impl Writer {
         Some(self.publish())
     }
 
-    /// When what waits is due: the end of the window the last publication
-    /// opened, for the folds and for a build the membership writes left
-    /// owed. A build owed past that end, or with no window opened yet, is
-    /// due from its first write. `None` when nothing waits, and for a
-    /// window the clock cannot add.
+    /// When the build the membership writes left owed is due: the end of
+    /// the window the last publication opened. A build owed past that end,
+    /// or with no window opened yet, is due from its first write. `None`
+    /// when none is owed, and for a window the clock cannot add.
     pub(super) fn due(&self) -> Option<Instant> {
         let end = self.last_window.map(|last| self.window_end(last));
         match (self.owed, end) {
             (Some(owed), None) => Some(owed.since),
             (Some(owed), Some(end)) => end.map(|end| end.max(owed.since)),
-            (None, Some(end)) if self.waiting => end,
             (None, _) => None,
         }
     }
@@ -2661,42 +1680,30 @@ impl Writer {
         self.owed.is_some()
     }
 
-    /// Whether the member `id` waits at `rank` for a build: a membership
-    /// write left one owed and no row of the member stands at the rank, by
-    /// the walk a load write folds a rank's record with ([`rows_at`]). A
-    /// rank inside the window of its registration reads so, and one a
-    /// refresh moved under its id. So does a worker that left while
-    /// another's build is owed: the caller knows its members.
-    pub(super) fn waits(&mut self, id: WorkerId, rank: u16) -> bool {
-        self.owed.is_some()
-            && rows_at(&self.places, &mut self.working, id, rank, |_| false).is_none()
-    }
-
     /// Pay the build the membership writes left owed: the pools of
-    /// `members`, the membership at the store's `epoch`, with every record
-    /// on file. A host pays it at the window's end, `at`, which opens the
-    /// next window and lets the vetoes past their end go. An asked build
-    /// names no instant and leaves the window as it stands: the asker's own
-    /// time holds no later record back. `None` when no build is owed:
-    /// another call paid it.
+    /// `members`, the membership at the store's `epoch`. A host pays it at
+    /// the window's end, `at`, which opens the next window and lets the
+    /// vetoes past their end go. An asked build names no instant and leaves
+    /// the window as it stands. `None` when no build is owed: another call
+    /// paid it.
     #[must_use]
     pub(super) fn build_owed<'a>(
         &mut self,
         at: Option<Instant>,
         epoch: u64,
         members: impl Iterator<Item = (&'a WorkerRow, WorkerSlot)>,
-        on_file: impl OnFile,
     ) -> Option<Arc<StoreSnapshot>> {
         let owed = self.owed.take()?;
         if let Some(at) = at {
             self.last_window = Some(at);
-            // A veto past its end leaves here, as at a window's publication:
-            // the build derives every run from the vetoes that stand.
+            // A veto that ended at or before the window's instant leaves the
+            // table here and waits for no gateway's clear: the build derives
+            // every run from the vetoes that stand.
             if let Some(vetoes) = self.vetoes.standing_at(at) {
                 self.vetoes = Arc::new(vetoes);
             }
         }
-        Some(self.rebuild(epoch, members, on_file, owed.classes))
+        Some(self.rebuild(epoch, members, owed.classes))
     }
 
     /// The end of the window `last` opened; `None` for a window so long
@@ -2705,19 +1712,9 @@ impl Writer {
         last.checked_add(self.window)
     }
 
-    /// The window's end: publish what waits when `now` is at or past the
-    /// due instant; a call before it publishes nothing, so a caller cannot
-    /// publish faster than the window.
-    #[must_use]
-    pub(super) fn publish_if_due(&mut self, now: Instant) -> Option<Arc<StoreSnapshot>> {
-        self.due()
-            .is_some_and(|due| now >= due)
-            .then(|| self.publish_window(now))
-    }
-
     /// The one door every publication goes through: each pool folded since
     /// the last publication takes new rows, whole, and one world holds
-    /// every pool. What waited for the window rides along.
+    /// every pool.
     ///
     /// A pool's new rows are its working copy written over rows the writer
     /// holds the last reference to ([`written_over`]): the pool's spare,
@@ -2760,7 +1757,6 @@ impl Writer {
         }
         // Rows no world lists and no pool took are freed here, by a write.
         self.unlisted.clear();
-        self.waiting = false;
         self.publications += 1;
         self.world()
     }
@@ -2775,18 +1771,6 @@ impl Writer {
     /// ask or a window's end paid, or a generation of another pairing mode.
     pub(super) fn builds(&self) -> u64 {
         self.builds
-    }
-
-    fn publish_window(&mut self, at: Instant) -> Arc<StoreSnapshot> {
-        self.last_window = Some(at);
-        // A veto that ended at or before this window's instant leaves the
-        // table here and waits for no gateway's clear: a decision walks
-        // only what stands.
-        if let Some(vetoes) = self.vetoes.standing_at(at) {
-            self.vetoes = Arc::new(vetoes);
-            self.derive_vetoes();
-        }
-        self.publish()
     }
 }
 
@@ -2817,39 +1801,6 @@ fn seek<T>(sorted: &[T], from: usize, id: WorkerId, id_of: impl Fn(&T) -> Worker
         Some(step) => from + step,
         None => from + near.len() + far.partition_point(|entry| id_of(entry) < id),
     }
-}
-
-/// Hand `fold` each row of member `id` that stands at `rank` in the working
-/// copy; a pool is marked written where `fold` says it wrote. Where the
-/// member's first place stands when a row was handed, and `None` where no
-/// row of the member stands at the rank: the member has no place yet, or
-/// its rows stand at another rank. A load write folds a rank's record by
-/// this walk and a membership build asks it which records no row took, so
-/// the two read one rule.
-fn rows_at(
-    places: &[Place],
-    working: &mut [Working],
-    id: WorkerId,
-    rank: u16,
-    mut fold: impl FnMut(&mut Candidate) -> bool,
-) -> Option<u32> {
-    let first = places.partition_point(|place| place.id < id);
-    let of_member = places.get(first..).unwrap_or_default();
-    let mut at = None;
-    for place in of_member.iter().take_while(|place| place.id == id) {
-        let Some(pool) = working.get_mut(place.pool as usize) else {
-            continue;
-        };
-        let Some(row) = pool.rows.get_mut(place.row as usize) else {
-            continue;
-        };
-        if row.dp_rank != rank {
-            continue;
-        }
-        pool.dirty |= fold(row);
-        at = Some(first as u32);
-    }
-    at
 }
 
 /// The places of worker `id` in a list sorted by worker id.

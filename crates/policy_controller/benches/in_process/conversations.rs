@@ -180,7 +180,7 @@ pub(super) fn caller(host: &Host, start: &Barrier, decisions: u64, caller: u64) 
     let said = Said::by(host.engine, caller, CALLER_WARM + decisions);
     let by_call = place::asks();
     let (mut carried, mut returned, mut last) = (0u64, 0u64, None);
-    let timed = stretch(start, decisions, |turn| {
+    let timed = stretch(start, decisions, &[], |turn| {
         let (prompt, carries) = said.turn(turn);
         let seed = mix(caller << 40 | turn);
         let place = match by_call {

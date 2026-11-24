@@ -80,8 +80,10 @@ impl Applied {
     /// the document, said under the store's lock of its workers. Where the
     /// build holds the front, the front hears it: its records of sent
     /// prefixes, then the document's engine
-    /// ([`PolicyEngine::on_membership`]). Else the document's engine hears
-    /// it alone.
+    /// ([`PolicyEngine::on_membership`]). The front holds a stage's panic
+    /// at the word and counts it ([`PolicyEngine::unheard`]): the store's
+    /// write goes on. Else the document's engine hears it alone, under no
+    /// catch.
     pub(crate) fn on_membership(&self, word: &Membership<'_>) {
         #[cfg(feature = "in-process")]
         self.engine.on_membership(word);

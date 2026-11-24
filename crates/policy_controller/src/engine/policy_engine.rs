@@ -88,6 +88,10 @@ use smg_worker::{identity::basic::Worker, load::state::LoadSnapshot, runtime::Ro
 
 pub(crate) use self::document::Loaded;
 pub use self::document::SpecHandle;
+// The count of a request that names its worker, for a controller's served
+// decision: the one the one call counts by.
+#[cfg(feature = "controller")]
+pub(crate) use self::place::target as named_worker;
 use self::{
     document::InForce,
     encode::EncodeLists,
@@ -492,7 +496,12 @@ impl PolicyEngine {
 
     /// One word of a store's membership, said under the store's lock of its
     /// workers ([`Self::hears`]): the document's engine hears it whole, its
-    /// session table and then its stages ([`Lifecycle::on_membership`]).
+    /// session table and then its stages ([`Lifecycle::on_membership`]). A
+    /// stage that panics at it is held and counted, as at a gateway's word
+    /// ([`Self::word_caught`]): the session table, told ahead of the
+    /// stages, stays told, the stages behind the one that panicked do not
+    /// hear the word, and the store's write goes on with what it still
+    /// owes.
     ///
     /// It holds the telling's lock for the word, as a gateway's word does
     /// ([`Self::tell`]). The locks are taken in one order: the store's, the
@@ -501,7 +510,7 @@ impl PolicyEngine {
     pub(crate) fn on_membership(&self, word: &Membership<'_>) {
         let _held = self.telling.lock();
         self.hears(self.document.load().spec.engine(), word, |engine| {
-            engine.on_membership(word);
+            self.word_caught(|| engine.on_membership(word));
         });
     }
 
@@ -775,7 +784,10 @@ impl<'d> Loaded<'_, 'd> {
 
 impl PolicyEngine {
     /// A whole decision under the engine's catch: a panic in it costs its
-    /// request alone and is counted ([`DecisionEngine::faults`]).
+    /// request alone and is counted ([`DecisionEngine::faults`]). A side's
+    /// shadow of a pair runs under a catch of its own here too
+    /// (`pair::side_shadows`): its panic is counted the same and costs
+    /// its request nothing.
     #[inline]
     fn caught<R>(
         &self,
@@ -870,8 +882,9 @@ impl PolicyEngine {
     /// counted nowhere here: the caller counts it once its own filing of
     /// the lease stands, and a shed's, which files none, all the same
     /// ([`Self::count_shadow`]). So a decision whose issue fails counts
-    /// none under either entry. A pair's prefill answers no word: no
-    /// shadow runs on a pair's side here yet.
+    /// none under either entry. A pair's prefill answers no word: the
+    /// pair's decision alone asks no side's shadow ([`pair::decide`]), so
+    /// none runs here yet.
     ///
     /// # Errors
     ///
@@ -1280,7 +1293,9 @@ impl DecisionEngine for PolicyEngine {
         let tell = || match held.lease.side {
             Side::Single => lease_events::single(&lease_events::of_host(engine, sends), held, said),
             // A pair's guard holds its prefill side's lease.
-            Side::Prefill => lease_events::pair(engine, sends, held, said, micros),
+            Side::Prefill => {
+                lease_events::pair(&lease_events::of_host(engine, sends), held, said, micros);
+            }
             // No lease is issued for a side on its own.
             Side::Decode | Side::Encode => {}
         };

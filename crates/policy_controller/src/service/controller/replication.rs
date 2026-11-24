@@ -1074,7 +1074,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        engine::view::{LoadRow, WorkerId},
+        engine::view::WorkerId,
         service::{
             controller::decision_slots::tests::holder,
             elector::{ElectionSettings, Elector, TickOutcome},
@@ -1083,8 +1083,7 @@ mod tests {
         },
         stages::registry,
         store::{
-            LeasesStore, LoadSink, LoadSource, MembershipChange, WorkerFacts, WorkerRow,
-            WorkerStatus, WorkersStore,
+            LeasesStore, MembershipChange, WorkerFacts, WorkerRow, WorkerStatus, WorkersStore,
         },
     };
 
@@ -2219,17 +2218,6 @@ mod tests {
         let leader = Leader::leading();
         let id = leader.writes(3);
         let head = leader.log.head();
-        // A load row on the leader's own table: it is journaled nowhere,
-        // so the log stands where it stood, and no part holds it.
-        let row = LoadRow {
-            running: 2,
-            ..LoadRow::default()
-        };
-        leader
-            .store
-            .record(id, 0, row, leader.at, LoadSource::Stream);
-        assert!(leader.store.load(id, 0).is_some(), "the leader's own row");
-        assert_eq!(leader.log.head(), head);
         let cut = leader.replication().cut(leader.term).expect("a cut");
         assert_eq!((cut.at, cut.epoch), (head, leader.store.epoch()));
         // One part, the row's, and the last. It says the place as a

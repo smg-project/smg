@@ -378,6 +378,9 @@ pub struct Affinity {
     /// change of membership and at the timer's sweep: never by a decision's naming
     /// or its write, which hold their record by the list's table.
     records: Mutex<FxHashMap<Box<str>, Arc<PrefixRecord>>>,
+    /// How many times a table took a record of the map
+    /// ([`Self::record_of`]). Written under the map's mutex.
+    taken: AtomicU64,
     /// What the records that left the map had left out
     /// ([`Self::left_out`]). Written under the map's mutex.
     left_out: AtomicU64,
@@ -442,6 +445,46 @@ impl Affinity {
         }
     }
 
+    /// The records no list may read again, for the follow of a host's
+    /// registry: each one the map alone holds that holds a worker's place,
+    /// under a model `stated` says none of the follow's workers states as
+    /// its own, with the number of its last taking. A list keeps its
+    /// record under the model its first worker states, so no list reads a
+    /// record whose model no worker that stands states. The follow asks
+    /// its registry of each ahead of [`Self::let_go`].
+    pub(super) fn unstated(&self, stated: impl Fn(&str) -> bool) -> Vec<(Box<str>, u64)> {
+        let mut records = self.records.lock();
+        let unstated = records.iter_mut().filter_map(|(model, record)| {
+            let record = Arc::get_mut(record)?;
+            record.predictor.get_mut().held().next()?;
+            (!stated(model)).then(|| (model.clone(), *record.taken.get_mut()))
+        });
+        unstated.collect()
+    }
+
+    /// The records named by [`Self::unstated`] leave the map with their
+    /// places: each one the map alone still holds that no table took since
+    /// it was named. The model's next table read makes a fresh record, as
+    /// behind a sweep ([`Self::sweep`]), and what a record left out stays
+    /// in the total ([`Self::left_out`]).
+    pub(super) fn let_go(&self, unstated: &[(Box<str>, u64)]) {
+        let mut records = self.records.lock();
+        let left: Vec<_> = unstated
+            .iter()
+            .filter_map(|(model, taken)| {
+                let record = Arc::get_mut(records.get_mut(model)?)?;
+                (*record.taken.get_mut() == *taken).then(|| records.remove(model))?
+            })
+            .collect();
+        let left_out = left
+            .iter()
+            .map(|record| record.left_out.load(Ordering::Relaxed))
+            .sum();
+        self.left_out.fetch_add(left_out, Ordering::Relaxed);
+        // Freed once the mutex is given back, as at a sweep.
+        drop(records);
+    }
+
     /// The work the records left waiting, a bounded step of each: the
     /// placements of workers that left, and the blocks past a bound that
     /// came down. For the engine's timer. A record a decision holds is
@@ -496,11 +539,13 @@ impl Affinity {
         }
     }
 
-    /// How many picks' prefixes the records left out in whole or in part,
-    /// every model's together, those of the records that left the map among
-    /// them: a write that meets a held record ends there and waits for
-    /// nobody. For a host's own count beside its count of decisions, never
-    /// for a decision.
+    /// How many picks' prefixes the records left out in whole or in part
+    /// at a held lock, every model's together, those of the records that
+    /// left the map among them: a write that meets a held record ends
+    /// there and waits for nobody. A write that ends at a turn the record
+    /// has no room for, or at one that finds its worker to hold less than
+    /// it was told, is not counted. For a host's own count beside its
+    /// count of decisions, never for a decision.
     pub fn left_out(&self) -> u64 {
         let records = self.records.lock();
         let left_out = |record: &Arc<PrefixRecord>| record.left_out.load(Ordering::Relaxed);
@@ -508,8 +553,8 @@ impl Affinity {
     }
 
     /// The workers each record holds a place for, by its model, for the
-    /// cases of a served controller.
-    #[cfg(all(test, feature = "controller"))]
+    /// cases of a host's membership.
+    #[cfg(test)]
     pub(crate) fn held(&self) -> Vec<(Box<str>, Vec<WorkerId>)> {
         let records = self.records.lock();
         let held = |record: &Arc<PrefixRecord>| record.predictor.read().held().collect();
@@ -526,13 +571,19 @@ impl Affinity {
         let max_size = settings.max_size;
         let record = {
             let mut records = self.records.lock();
-            if let Some(record) = records.get(model) {
+            let record = if let Some(record) = records.get(model) {
                 Arc::clone(record)
             } else {
                 let record = Arc::new(PrefixRecord::new(bound, max_size));
                 records.insert(model.into(), Arc::clone(&record));
                 record
-            }
+            };
+            // The number of this taking, which no other taking of the map
+            // has: a record made anew under its model never reads as the
+            // one that left.
+            let taken = self.taken.fetch_add(1, Ordering::Relaxed) + 1;
+            record.taken.store(taken, Ordering::Relaxed);
+            record
         };
         // Outside the map's mutex: a bound that moved takes the record.
         record.sweep_s.store(settings.sweep_s, Ordering::Relaxed);
@@ -586,6 +637,13 @@ struct PrefixRecord {
     /// theirs having met a held lock. Written by such a write alone, so a
     /// pick that records whole writes no shared word for it.
     left_out: AtomicU64,
+    /// The number of the last taking of the record by a table, among
+    /// every taking of the map ([`Affinity::record_of`]): written under
+    /// the map's mutex and by a table's read alone. A record named as one
+    /// no list reads again stays where a table took it since, and a
+    /// record made anew under its model is not the one named
+    /// ([`Affinity::let_go`]).
+    taken: AtomicU64,
 }
 
 /// What a naming read of the record its pick may write.
@@ -680,6 +738,7 @@ impl PrefixRecord {
             waited: AtomicU32::new(0),
             left: AtomicU64::new(0),
             left_out: AtomicU64::new(0),
+            taken: AtomicU64::new(0),
         }
     }
 
