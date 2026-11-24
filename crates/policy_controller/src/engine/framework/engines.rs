@@ -12,7 +12,8 @@
 //! [`Picker::unit`]: super::Picker::unit
 
 use super::{
-    combine, places, run_single, trace_ordered, Buffers, Engine, Profile, Set, DRAW_BOUND,
+    combine, keep_folded, places, run_single, score_survivors, trace_ordered, Buffers, Engine,
+    Profile, Set, DRAW_BOUND,
 };
 use crate::{
     engine::{
@@ -35,6 +36,8 @@ const ENGINE_TARGETS: usize = 2;
 /// Two engines are drawn by the seed's stream, and a row of each stands
 /// for it: the engine's one row, or one of its rows by one more value.
 /// Every filter of the profile is asked about that row, as a draw asks,
+/// except a test the build folded that keeps every row under the
+/// request's facts ([`RowTests::asked`]),
 /// and a row refused is drawn again with its engine, [`DRAW_BOUND`] rows
 /// refused in the decision at the most. The profile's stages cost the two
 /// rows among themselves and the picker orders them: the engine of the row
@@ -65,6 +68,7 @@ const ENGINE_TARGETS: usize = 2;
 /// decision path as it was.
 ///
 /// [`Picker::unit`]: super::Picker::unit
+/// [`RowTests::asked`]: crate::stages::filters::RowTests::asked
 #[inline(never)]
 pub(super) fn run_engines(
     engine: &Engine,
@@ -80,10 +84,13 @@ pub(super) fn run_engines(
     let candidates = set.candidates;
     buf.reserve(candidates.len());
     let mut draw = Draw::new(facts.seed);
+    // The fold as this decision asks it: a test that keeps every row under
+    // these facts is left out of the draw's rows too.
+    let rows = rows.map(|tests| tests.asked(facts, cx));
     let decided = match rows {
         // A request held to places is the staged pass's, which opens its
         // set with them: no engine is drawn, and the pass below decides.
-        _ if places::stated(cx) => None,
+        _ if places::stated(cx) => Err(false),
         Some(tests) if tests.masked(cx) => {
             let keep = |c: &Candidate| tests.keeps(facts, c, cx) && !cx.masks(c.position);
             by_engines(
@@ -103,14 +110,30 @@ pub(super) fn run_engines(
             )
         }
     };
-    if let Some(decision) = decided {
-        return decision;
-    }
+    let stood = match decided {
+        Ok(decision) => return decision,
+        Err(stood) => stood,
+    };
     let resumed = RequestFacts {
         seed: draw.state(),
         ..*facts
     };
-    let mut decision = run_single(profile, index, &resumed, pool, set, cx, buf);
+    let mut decision = match rows {
+        // A row the draw kept passes the fold, so the fold's one pass over
+        // the pool keeps a row and leaves the rows the stages would
+        // ([`keep_folded`]): the stages are not asked one by one. Under a
+        // standing veto they are: the fold asks its tests of a row before
+        // the host's mask, the stages behind it.
+        Some(tests)
+            if stood
+                && set.plain()
+                && !tests.masked(cx)
+                && keep_folded(tests, &resumed, candidates, cx, &mut buf.kept) =>
+        {
+            score_survivors(profile, index, &resumed, pool, candidates, buf, None)
+        }
+        _ => run_single(profile, index, &resumed, pool, set, cx, buf),
+    };
     match &mut decision {
         Decision::Pick(pick) => pick.trace.seed = facts.seed,
         Decision::Shed(shed) => shed.trace.seed = facts.seed,
@@ -195,8 +218,8 @@ pub(super) fn run_owned(
 }
 
 /// The decision of [`run_engines`] under one form of the filters' test, or
-/// `None` where the draw leaves the pool to the whole pass. One body, built
-/// once for each form.
+/// `Err` where the draw leaves the pool to the whole pass: with `true`
+/// where a row it drew stood. One body, built once for each form.
 #[expect(
     clippy::too_many_arguments,
     reason = "the profile run's inputs, with the stream and the filters' test"
@@ -211,7 +234,7 @@ fn by_engines(
     buf: &mut Buffers,
     draw: &mut Draw,
     mut keep: impl FnMut(&Candidate) -> bool,
-) -> Option<Decision> {
+) -> Result<Decision, bool> {
     let engines = &pool.engines;
     // The list names rows by their place among those handed.
     debug_assert!(candidates
@@ -220,14 +243,8 @@ fn by_engines(
         .all(|(place, row)| row.position as usize == place));
     let mut refused = 0;
     let first = if engines.len() > 1 {
-        Some(stand_in(
-            draw,
-            engines,
-            candidates,
-            None,
-            &mut keep,
-            &mut refused,
-        )?)
+        let first = stand_in(draw, engines, candidates, None, &mut keep, &mut refused);
+        Some(first.ok_or(false)?)
     } else {
         None
     };
@@ -237,10 +254,8 @@ fn by_engines(
     let drawn = match first {
         Some(a) => {
             let but = Some(a.0);
-            Some((
-                a,
-                stand_in(draw, engines, candidates, but, &mut keep, &mut refused)?,
-            ))
+            let second = stand_in(draw, engines, candidates, but, &mut keep, &mut refused);
+            Some((a, second.ok_or(true)?))
         }
         None => None,
     };
@@ -263,7 +278,7 @@ fn by_engines(
             match two.first() {
                 Some(better) if better.position == b => (b_engine, Some(b), Some(a)),
                 Some(_) => (a_engine, Some(a), Some(b)),
-                None => return None,
+                None => return Err(true),
             }
         }
     };
@@ -274,7 +289,7 @@ fn by_engines(
         }
     }
     if buf.kept.is_empty() {
-        return None;
+        return Err(false);
     }
     let (kept, scores) = (&buf.kept, &mut buf.scores);
     let band = combine(profile, &after, candidates, kept, scores, &mut buf.stage);
@@ -298,7 +313,7 @@ fn by_engines(
         .iter()
         .map(|&at| (candidates[kept[at] as usize].id, scores[at]));
     let trace = trace_ordered(index, facts, pool, handed);
-    Some(Decision::Pick(Pick {
+    Ok(Decision::Pick(Pick {
         targets,
         trace,
         session_verdict: SessionVerdict::None,
