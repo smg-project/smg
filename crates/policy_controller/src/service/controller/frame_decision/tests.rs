@@ -9,7 +9,7 @@
 //! [`decide_decode`] behind the pair its lease holds, and the two that
 //! issue its side ask [`issue_decode`] behind it. One asks
 //! [`decide_alone`] for a prefill and for a decode frame that stands
-//! alone.
+//! alone. An encode request's cases stand in a file of their own.
 
 use std::{
     collections::BTreeSet,
@@ -67,6 +67,8 @@ use crate::{
     tracking::lease::{Dispatch, Lease, LeaseId, Outcome, ReleaseReason, Side, DISPATCH_TTL},
     worker_host::{stand, Members, Objects},
 };
+
+mod encode;
 
 /// A gateway that is not the cases' own.
 const OTHER: GatewayId = GatewayId(12);

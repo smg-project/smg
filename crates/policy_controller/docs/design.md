@@ -516,8 +516,8 @@ is. A controller's decision of a pair, at its prefill and at its decode call, re
 Beside its encoder list and its prefill list the holder hands the two columns an encode request's
 decision reads (`Objects::encode_columns`). They are what the encode side reads of each encoder
 and the encode class each prefill names, by a worker's place in the list as lent. The classes are
-the store's own encode rule over what the rows state. The columns stand in the same build. No
-decision of a controller reads them yet: an encode request is answered `Busy` (section 10.1).
+the store's own encode rule over what the rows state. The columns stand in the same build. A
+controller's decision of an encode request that carries its items reads them (section 10.1).
 
 ### 4.2 The worker object **[built]** (`smg-worker`)
 
@@ -1135,8 +1135,8 @@ A second engine stood beside it: the store-backed engine, also called the old en
 decided over records copied into the policy store and kept its leases there. Its type is deleted,
 a step of stage 4 (section 16). The store's copies of the worker data that only it read are
 deleted in the steps behind it (sections 10.2 and 10.3). A controller decides a pair at its
-prefill and its decode call over worker lists too; an encode request is answered `Busy` until
-it follows (decision 5).
+prefill, its decode call and an encode request that carries its items over worker lists too
+(decision 5).
 
 The types the two engines shared stay where they were moved ahead of the deletion: `Request`,
 `DecideOutcome`, `DecisionRefused` and `DecodeRefused` in the trait's file, and
@@ -2018,11 +2018,21 @@ request, or a decode request that names no lease, stands alone where its plan pa
 its phase: it is decided as a single request is, over the registry's list of its own phase's
 workers, and its lease is a single's. The token count of a prefill-decode mode (section 3.3) is
 not decided this way: it is a single request over the prefill workers, the wire cannot say so,
-and a controller reads the single workers' list for it, which such a fleet does not have. An
-encode request, and a decode request that names no lease under a pair plan, are answered `Busy`.
-By the contract the gateway decides such a request locally
-(`crates/policy_controller/contracts/policy_controller.proto`) **[planned]**: no gateway calls a
-controller yet.
+and a controller reads the single workers' list for it, which such a fleet does not have.
+
+An encode request states its items on a frame of the encode phase (`DecideRequest.encode`), with
+a key or with none, and 256 keys at most. A longer list is refused as out of range, and so is a
+frame of another phase that carries items: no frame with items is decided without them. Such a
+frame is its pair's one request. It is decided at the prefill phase, for both sides of the pair
+and for each item's encoder, by `PolicyEngine::decide_encode_without_lease` over the registry's
+three lists of its model, with the holder's pair classes and its encode columns. Its pick is
+issued as a pair's is, with no lease for an encoder, and its answer names each item's encoder
+beside the decision (`DecideAnswer.encode`). The answers come in a pair's order, and a request
+with a key takes its encoders' list as a third list in it. A decode asked again names its lease
+and states no items. A frame of the encode phase that carries no items, and a decode request that
+names no lease under a pair plan, are answered `Busy`. By the contract the gateway decides such a
+request locally (`crates/policy_controller/contracts/policy_controller.proto`) **[planned]**: no
+gateway calls a controller yet.
 
 A frame states no source of a key. So a controller's prefix ring places by any session key, also
 one the request's own id handed, where a gateway's own process places that request by its prompt
@@ -2036,13 +2046,13 @@ the worker crate's structures, and the one engine.
 | Data | On main | As designed |
 |---|---|---|
 | workers | records in the store, and worker objects kept in step with them | worker objects in a worker-crate registry; beside each, the code that keeps the objects holds what a registration stated and the object does not hold as stated (10.3); the membership log that watchers and standbys read stays |
-| lists | the store's published copy; a single request's decision reads the registry's published list of the model's single workers, a pair's, at its prefill and at its decode call, the lists of its two sides, and a prefill or a decode request that stands alone the list of its own phase's workers | the registry's published lists by role and protocol, with the engine's value beside each (decision 10) |
+| lists | the store's published copy; a single request's decision reads the registry's published list of the model's single workers, a pair's, at its prefill and at its decode call, the lists of its two sides, an encode request's those two and its encoders', and a prefill or a decode request that stands alone the list of its own phase's workers | the registry's published lists by role and protocol, with the engine's value beside each (decision 10) |
 | health | the worker crate's health checker over the worker objects, on the leader; each outcome moves the object, the store's record is told the status that stands, and a decision reads the object's | the same checker; a decision reads the object's own status; a gateway's veto on a worker stays in the store |
 | loads | the worker crate's load monitor over the worker objects, while the replica leads, fed by its polls and by the load records on the workers' event streams: a decision is given its snapshot where the document reads reports and keeps none, and reads the overload verdict on the object; the crate's own poller runs no more, and the store's load table is written by nothing and read by no decision | the worker crate's load monitor, publishing `LoadSnapshot` (decision 10). Every worker is judged by the thresholds its object states, so the loads of every worker the controller dials are read: no new cost against classic as it runs by default, whose gateway hands each worker of an engine the same two defaults and an external worker none at its registration, as a controller's objects state them. A gateway started with `--disable-load-monitoring` polls by need, and this monitor polls every group |
 | cache events | an index of the store's own; a decision reads none yet | the kv-index crate's index, filled by the worker crate's collector |
 | sessions | the engine's session table for a single request, one for each document | the engine's session table |
 | leases | the store's lease tables, in memory, one for each deciding thread | stay: a controller must remember what it issued to gateways |
-| decisions | a single request, a pair at its prefill, its decode call, and a prefill or a decode request that stands alone: `PolicyEngine` over the registry's lists; an encode request, and a decode request that names no lease under a pair plan: none, the request is answered `Busy` | `PolicyEngine::decide_without_lease` over the registry's lists |
+| decisions | a single request, a pair at its prefill, its decode call, an encode request that carries its items, and a prefill or a decode request that stands alone: `PolicyEngine` over the registry's lists; a frame of the encode phase that carries no items, and a decode request that names no lease under a pair plan: none, the request is answered `Busy` | `PolicyEngine::decide_without_lease` over the registry's lists, and `decide_encode_without_lease` over an encode request's three |
 | discovery | the discovery crate through its host interface, registering and removing through the worker crate's job queue while the replica leads; behind a feature the image leaves out; a worker's API key is refused at the start, since no replica keeps one | the same in the image, with a worker's API key; how a replica comes by the key of a worker found before it led is open, as a gateway's way to a key is (section 11) |
 
 **Who sends a worker's data.** Nothing changes for a worker. It pushes its load records and its
@@ -2518,7 +2528,7 @@ bursts. It is bounded by the tree's size bound and the time between two eviction
 | The crate's bench of the kept engine | **[planned]** | |
 | The gateway as a host | **[partly]** | section 9, behind `--policy-controller on`, which is off by default: single requests and pairs on the HTTP and gRPC routes, a pair's decode asked again, a host's table of stages at the start; an encode request that carries an item is refused by name until the gateway hands the engine its three lists; every classic test of the gateway with the engine on (the bar's fourth point) is not met yet |
 | The controller: service, election, replication, document apply and roll back | **[partly]** | a session never pushes the document and refuses a gateway's replay; a standby serves neither the worker list nor the snapshot (section 10.1) |
-| The controller on the one engine and the worker crate's structures | **[partly]** | a single request, a pair at its prefill and its decode call are decided by `PolicyEngine` over the registry's lists; an encode request is answered `Busy`; a decision reads no cache event, and no load report under a document that holds a stage that keeps reports, as no stock stage does (section 10.2) |
+| The controller on the one engine and the worker crate's structures | **[partly]** | a single request, a pair at its prefill, its decode call and an encode request that carries its items are decided by `PolicyEngine` over the registry's lists; the crate's own client states no items yet; a decision reads no cache event, and no load report under a document that holds a stage that keeps reports, as no stock stage does (section 10.2) |
 | The controller finding its own workers | **[partly]** | the image leaves the feature out; a worker's API key is refused; no flag sets a registration's timing |
 | A gateway under a controller | **[planned]** | section 11 |
 | User stages in WebAssembly and over gRPC | **[partly]** | library code that no document reaches |
@@ -2617,9 +2627,9 @@ request's heads.
 **Recommendation: (a).**
 
 **As taken.** The deciding threads were switched for a single request first (section 10.1), and
-the store-backed engine's type was deleted behind that step. A pair at its prefill and its decode
-call are decided by the one engine over worker lists too. An encode request is answered `Busy`
-until it follows.
+the store-backed engine's type was deleted behind that step. A pair at its prefill, its decode
+call and an encode request that carries its items are decided by the one engine over worker lists
+too.
 
 ### Decision 6: a gateway under a controller that gets no answer in time
 
