@@ -1957,8 +1957,15 @@ request ──> route (HTTP or gRPC, any family)
   send as a release, abandoned. Two guards are made ahead of their sends, both a pair's: the
   decode's, behind the selection, and the prefill's, where its load is acquired (with prefill
   admission, under the admission's lock). The prefill's is a plain guard under the route's key.
-  At the prefill's send it takes the engine's side, and counts under the routing value the
+  A route says the prefill's send where the prefill's request goes out, a batch once for all its
+  sub-requests. There the guard takes the engine's side, and counts under the routing value the
   engine names from there on.
+
+  Classic's `least_load` credits the worker it picks among several with the request's work at the
+  pick, until a report of that worker sampled behind the pick, and takes no pick back (`decide` in
+  `model_gateway/src/policies/least_load.rs`). The engine's counts of sends take a send at its
+  dispatch. So a pair that a route refuses between its selection and its send stays in classic's
+  count and enters none of the engine's. That difference stands open under rule 6.
 
   The regular HTTP router's typed route and its streamed pass-through tell the engine that end's
   outcome, through the handle of section 8.2: the status the route records on the worker, and its
