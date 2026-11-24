@@ -58,7 +58,7 @@ use std::{
     fmt, mem,
     rc::Rc,
     sync::{
-        atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, OnceLock,
     },
     time::Duration,
@@ -502,7 +502,7 @@ struct PrefixRecord {
     /// The unit `max_size` is counted in, taken from the first request that
     /// reads the record and kept while the record stands:
     /// [`Self::UNREAD`], [`Self::TOKENS`], or the bytes of a window of text.
-    window: AtomicU32,
+    window: AtomicU64,
     /// Work waits for a sweep: a worker left, or the bound came down.
     sweeping: AtomicBool,
     /// How many leaves were told. Written under the record's guard, a
@@ -559,16 +559,16 @@ impl PrefixRecord {
     /// A sweep's step.
     const SWEEP: usize = 64;
     /// [`Self::window`] of a record no request read yet.
-    const UNREAD: u32 = 0;
+    const UNREAD: u64 = 0;
     /// [`Self::window`] of a record of token blocks.
-    const TOKENS: u32 = u32::MAX;
+    const TOKENS: u64 = u64::MAX;
 
     fn new(bound: usize, max_size: u64) -> Self {
         Self {
             predictor: RwLock::new(PrefixPredictor::new(bound)),
             bound: AtomicUsize::new(bound),
             max_size: AtomicU64::new(max_size),
-            window: AtomicU32::new(Self::UNREAD),
+            window: AtomicU64::new(Self::UNREAD),
             sweeping: AtomicBool::new(false),
             left: AtomicU64::new(0),
             left_out: AtomicU64::new(0),
@@ -594,7 +594,7 @@ impl PrefixRecord {
         let held = match self.window.load(Ordering::Relaxed) {
             Self::UNREAD | Self::TOKENS => self.bound.load(Ordering::Relaxed),
             window => {
-                let windows = self.max_size.load(Ordering::Relaxed) / u64::from(window);
+                let windows = self.max_size.load(Ordering::Relaxed) / window;
                 usize::try_from(windows.max(1)).unwrap_or(usize::MAX)
             }
         };
@@ -612,7 +612,7 @@ impl PrefixRecord {
     #[inline]
     fn count_by(&self, facts: &RequestFacts<'_>) {
         let window = match facts.hash_kind {
-            HashKind::Text => facts.block_size,
+            HashKind::Text => u64::from(facts.block_size),
             HashKind::Token => Self::TOKENS,
         };
         if self.window.load(Ordering::Relaxed) != window {
@@ -621,9 +621,9 @@ impl PrefixRecord {
     }
 
     #[cold]
-    fn recount(&self, window: u32) {
+    fn recount(&self, window: u64) {
         // A text request that states no window, or one of the other kind.
-        let stays = |unit: u32| {
+        let stays = |unit: u64| {
             window == Self::UNREAD
                 || (unit != Self::UNREAD && (unit == Self::TOKENS) != (window == Self::TOKENS))
         };
@@ -1781,6 +1781,9 @@ pub fn record_prefix(
     let (Some(record), Some(row)) = (table.record.as_deref(), table.spoken_row(id)) else {
         return;
     };
+    // The table may hold a record made since the fill read one: the write
+    // takes the record's unit as a read does.
+    record.count_by(facts);
     let held = read.deepest.contains(&row);
     if record.repeats(read.read, held) {
         return;

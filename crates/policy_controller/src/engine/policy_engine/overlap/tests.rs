@@ -818,7 +818,9 @@ fn a_later_model_of_its_workers_shares_the_first_models_record() {
 /// A record counts its index's `max_size` in the unit of the first request
 /// that reads it: a window of text by its bytes, a token block by its
 /// tokens. A record that text begins keeps `max_size` bytes of text, and
-/// token blocks behind the text are held to the same placements.
+/// token blocks behind the text are held to the same placements. A wider
+/// window of text moves the bound, a record that token blocks begin keeps
+/// theirs, and a pair side's write takes the unit of a record nobody read.
 #[test]
 fn a_record_that_text_begins_is_held_to_max_size_bytes() {
     use crate::document::spec::IndexSpec;
@@ -826,11 +828,12 @@ fn a_record_that_text_begins_is_held_to_max_size_bytes() {
     let mut document = PolicySpec::preset("cache_aware").expect("the preset");
     document.generation = 1;
     // Eight token blocks, which is two windows of text.
-    let eight = IndexSpec {
-        max_size: u64::from(BLOCK) * 8,
+    let max_size = u64::from(BLOCK) * 8;
+    let eight = || IndexSpec {
+        max_size,
         ..IndexSpec::default()
     };
-    document.index.insert(MODEL.into(), eight);
+    document.index.insert(MODEL.into(), eight());
     let spec = AppliedSpec::validate(&document).expect("the document validates");
     let bed = Bed::new(affinity, spec, 4);
     // Eight windows of text: the record keeps the first two of them.
@@ -844,6 +847,38 @@ fn a_record_that_text_begins_is_held_to_max_size_bytes() {
     let asked = prompt(1_000, 8);
     bed.decide(&request(&asked, 7, NOW), Some(1));
     assert_eq!(bed.holders(&asked, NOW), [(1, 0, 2)]);
+    // The same text by windows twice as wide moves the window: one stands.
+    let wide = PromptHashes::under_document(&spec, Some(2 * BLOCK), None, Some(&text), seeds);
+    bed.decide(&request(&wide, 7, NOW), Some(2));
+    let bound = |bed: &Bed| bed.affinity.records.lock()[MODEL].predictor.read().bound();
+    assert_eq!(bound(&bed), 1);
+    // A record that token blocks begin keeps their bound under text.
+    let applied = AppliedSpec::validate(&document).expect("the document validates");
+    let tokens = Bed::new(hosted(false).0, applied, 4);
+    tokens.decide(&request(&asked, 7, NOW), Some(1));
+    tokens.decide(&request(&worded, 7, NOW), Some(2));
+    assert_eq!(bound(&tokens), 8);
+    // A pair side's write that meets a record no request read takes the
+    // unit as a read does: two windows of the text stand.
+    let mut pair = PolicySpec::pair_presets("cache_aware", "cache_aware").expect("the presets");
+    pair.generation = 1;
+    pair.index.insert(MODEL.into(), eight());
+    let side = || {
+        let applied = AppliedSpec::validate(&pair).expect("the pair document validates");
+        Bed::new(hosted(false).0, applied, 4)
+    };
+    let facts = request(&worded, 7, NOW);
+    let read = side().column(&facts, Phase::Prefill).1;
+    let (side, read) = (side(), read.expect("the record speaks for the side"));
+    let bare = RequestFacts {
+        model: MODEL,
+        now_micros: NOW,
+        ..RequestFacts::default()
+    };
+    assert_eq!(held(&side.column(&bare, Phase::Prefill).0), [(0, 0); 4]);
+    record_prefix(&side.pool, Phase::Prefill, &facts, read, side.ids[1]);
+    let sent_to_one = [(0, 0), (0, 2), (0, 0), (0, 0)];
+    assert_eq!(held(&side.column(&facts, Phase::Prefill).0), sent_to_one);
 }
 
 /// A pick the binding's sessions rule placed alone is recorded by the
