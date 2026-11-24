@@ -135,8 +135,6 @@ pub(super) fn micros(origin: Instant, at: Instant) -> u64 {
 /// One pool's shape: what a membership build derives of it and no
 /// publication changes.
 struct PoolShape {
-    /// Each row's admission instant, in the rows' clock.
-    admitted_micros: Box<[u64]>,
     /// Each row's worker's slot in the store's counts of the leases on
     /// file ([`InFlightCounts`]): the slot its member keeps across membership
     /// builds.
@@ -235,7 +233,7 @@ impl Derived {
     /// How many members `pool` holds: none where there is no pool.
     fn members(&self, pool: Option<u32>) -> usize {
         pool.and_then(|pool| self.pools.get(pool as usize))
-            .map_or(0, |shape| shape.admitted_micros.len())
+            .map_or(0, |shape| shape.booked.len())
     }
 }
 
@@ -270,7 +268,7 @@ impl Ends<'_> {
                         .binary_search_by_key(&id, |entry| entry.row.id)
                         .is_ok()
                 };
-                entries.len() == shape.map_or(0, |shape| shape.admitted_micros.len())
+                entries.len() == shape.map_or(0, |shape| shape.booked.len())
                     && !joined.is_some_and(holds)
             })
     }
@@ -939,12 +937,11 @@ fn health_of(status: WorkerStatus) -> Health {
 }
 
 /// One member on its way into a pool: its row, what it registered with, and
-/// the two facts of its place.
+/// its slot in the store's counts.
 #[derive(Clone, Copy)]
 struct Entry<'a> {
     row: Candidate,
     facts: &'a WorkerFacts,
-    admitted_micros: u64,
     /// The thresholds its registration names.
     own: Overload,
     /// Its member's slot in the store's counts.
@@ -2270,7 +2267,6 @@ impl Writer {
             let entry = Entry {
                 row: row_of(member, sample.as_ref(), origin, listed),
                 facts,
-                admitted_micros: micros(origin, member.admitted_at),
                 own: facts.overload,
                 // The slot the member's first write gave it: a build gives
                 // none and moves none.
@@ -2369,7 +2365,6 @@ impl Writer {
                         row: row as u32,
                     }));
                 pools.push(PoolShape {
-                    admitted_micros: entries.iter().map(|entry| entry.admitted_micros).collect(),
                     booked: entries.iter().map(|entry| entry.booked).collect(),
                     pairs: if side == role_slot(Role::Prefill) {
                         pairs.take()
