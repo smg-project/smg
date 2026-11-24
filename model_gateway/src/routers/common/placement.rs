@@ -7524,6 +7524,419 @@ pub(crate) mod tests {
         );
     }
 
+    /// The classic `prefix_hash` policy's registry beside one whose engine
+    /// decides under the document the same settings mean, with the cache
+    /// boundaries given.
+    fn prefix_policies(cache_boundaries: &[usize]) -> (PolicyRegistry, PolicyRegistry) {
+        use crate::config::RouterConfig;
+
+        let settings = RouterConfig {
+            policy: PolicyConfig::PrefixHash {
+                prefix_token_count: 256,
+                load_factor: 1.25,
+                balance_abs_threshold: 10,
+                cache_boundaries: cache_boundaries.to_vec(),
+            },
+            ..Default::default()
+        };
+        let engine = PolicyRegistry::for_policy_engine(
+            settings.policy.clone(),
+            settings.routing_key_override.clone(),
+        );
+        let document = settings.policy_document().expect("the settings' document");
+        let spec = AppliedSpec::validate(&document).expect("a valid document");
+        engine_on(&engine, spec);
+        (PolicyRegistry::new(settings.policy), engine)
+    }
+
+    /// A request the `prefix_hash` policy places by a ring: its name, its
+    /// token ids, its text and its headers.
+    type Prefixed = (String, Option<Vec<u32>>, Option<String>, HeaderMap);
+
+    /// The requests the `prefix_hash` policy places by a ring. Prompts of
+    /// token ids: the policy's own recorded set of 70 to 400, and four
+    /// around the first boundary. Prompts of text alone, measured at four
+    /// characters a token, around both boundaries. A routing key over a
+    /// prompt, which the key leads.
+    fn prefix_placed() -> Vec<Prefixed> {
+        let mut requests = Vec::new();
+        for p in 0..32u32 {
+            let len = 70 + (p * 37) % 331;
+            let step = 1 + p % 3;
+            let tokens: Vec<u32> = (0..len).map(|i| (p / 4) * 1_000 + i * step).collect();
+            requests.push((
+                format!("{len} tokens"),
+                Some(tokens),
+                None,
+                HeaderMap::new(),
+            ));
+        }
+        for len in [5u32, 40, 63, 64] {
+            let tokens: Vec<u32> = (0..len).map(|i| 9_000 + i).collect();
+            requests.push((
+                format!("{len} tokens"),
+                Some(tokens),
+                None,
+                HeaderMap::new(),
+            ));
+        }
+        let lengths = [100usize, 255, 256, 300, 1_023, 1_024, 1_500];
+        for (at, len) in lengths.into_iter().enumerate() {
+            let letters = "abcdefghijklmnopqrstuvwxy\u{e9}".chars().cycle();
+            let text: String = letters.skip(at).take(len).collect();
+            requests.push((
+                format!("a text of {len}"),
+                None,
+                Some(text),
+                HeaderMap::new(),
+            ));
+        }
+        for at in 0..6 {
+            let mut headers = HeaderMap::new();
+            let key = format!("session-{at}").parse().expect("a header value");
+            headers.insert("x-smg-routing-key", key);
+            let tokens: Vec<u32> = (0..300).collect();
+            requests.push((format!("key {at}"), Some(tokens), None, headers));
+        }
+        requests
+    }
+
+    /// Under the engine a request the `prefix_hash` policy places by a
+    /// ring goes to the worker that policy sends it to. The gateway's ring
+    /// answers the engine where each head of the request stands, by the
+    /// policy's own recipe (`PrefixHashPolicy::head_position`), and the
+    /// engine cuts the request into the heads the policy cuts it into: a
+    /// prompt at each cache boundary it reaches, else at the policy's
+    /// depth, and a routing key whole. So does the request's retry, which
+    /// leaves the worker it tried for the next one the ring reaches, and a
+    /// request placed while three workers are not ready. With and without
+    /// cache boundaries.
+    #[test]
+    fn the_engine_places_a_prompt_where_the_classic_prefix_ring_does() {
+        let urls: Vec<String> = (0..16).map(|at| format!("http://w{at:02}:8000")).collect();
+        let urls: Vec<&str> = urls.iter().map(String::as_str).collect();
+        let down = ["http://w03:8000", "http://w07:8000", "http://w11:8000"];
+        for boundaries in [&[64usize, 256][..], &[][..]] {
+            let registry = http_registry(&urls);
+            let (classic, engine) = prefix_policies(boundaries);
+            let compared = |round: &str| {
+                let mut owners = BTreeMap::new();
+                for (name, tokens, text, headers) in prefix_placed() {
+                    let inputs = PlacementInputs {
+                        tokens: tokens.as_deref(),
+                        text: text.as_deref(),
+                        headers: Some(&headers),
+                        ..Default::default()
+                    };
+                    let owner = pick(&registry, &classic, inputs);
+                    let placed = pick(&registry, &engine, inputs);
+                    assert_eq!(placed.url(), owner.url(), "{name}, {round}");
+                    *owners.entry(owner.url().to_owned()).or_insert(0) += 1;
+
+                    let tried = vec![owner.base_url().to_string()];
+                    let retry = PlacementInputs {
+                        tried: &tried,
+                        ..inputs
+                    };
+                    let next = pick(&registry, &classic, retry);
+                    assert_ne!(next.url(), owner.url(), "{name}, {round}");
+                    let placed = pick(&registry, &engine, retry);
+                    assert_eq!(placed.url(), next.url(), "{name}, {round}, its retry");
+                }
+                owners
+            };
+            let owners = compared("every worker ready");
+            assert!(owners.len() > 8, "the requests spread: {owners:?}");
+            for url in down {
+                let worker = registry.get_by_url(url).expect("registered");
+                worker.set_status(WorkerStatus::NotReady);
+            }
+            let owners = compared("three workers not ready");
+            assert!(owners.len() > 8, "the requests spread: {owners:?}");
+            assert!(down.iter().all(|url| !owners.contains_key(*url)));
+            assert!(registry.get_routing_snapshot(MODEL).hash_ring_is_filled());
+            // The model's ring was read from the registry's kept rings: no
+            // classic policy object was made for it, and none was asked.
+            assert_eq!(engine.classic_made_or_asked(), 0);
+        }
+    }
+
+    /// A request the `prefix_hash` policy places keeps classic's worker
+    /// through a change of the model's workers: one that leaves, one that
+    /// joins, and one replaced by a new worker at its address. The engine
+    /// walks the ring the gateway keeps for the model, so after each change
+    /// it is lent the ring the classic policy reads. A request whose worker
+    /// stayed keeps it, a new worker takes requests from the others and
+    /// moves none between them, and a worker replaced at its address hands
+    /// its requests to the new one.
+    #[test]
+    fn the_engine_follows_the_classic_prefix_ring_through_a_membership_change() {
+        let urls: Vec<String> = (0..16).map(|at| format!("http://w{at:02}:8000")).collect();
+        let urls: Vec<&str> = urls.iter().map(String::as_str).collect();
+        let registry = http_registry(&urls);
+        let (classic, engine) = prefix_policies(&[64, 256]);
+        let register = |url: &str| {
+            let worker = BasicWorkerBuilder::new(url)
+                .model(ModelCard::new(MODEL))
+                .worker_type(WorkerType::Regular)
+                .connection_mode(ConnectionMode::Http)
+                .runtime_type(RuntimeType::Sglang)
+                .health_config(HealthCheckConfig {
+                    disable_health_check: true,
+                    ..Default::default()
+                })
+                .build();
+            registry
+                .register(Arc::new(worker))
+                .expect("worker registers");
+        };
+        // Each request's worker under the engine, which is classic's.
+        let placed = |round: &str| -> Vec<Arc<dyn Worker>> {
+            let place = |(name, tokens, text, headers): Prefixed| {
+                let inputs = PlacementInputs {
+                    tokens: tokens.as_deref(),
+                    text: text.as_deref(),
+                    headers: Some(&headers),
+                    ..Default::default()
+                };
+                let owner = pick(&registry, &classic, inputs);
+                let by_engine = pick(&registry, &engine, inputs);
+                assert_eq!(by_engine.url(), owner.url(), "{name}, {round}");
+                assert!(Arc::ptr_eq(&by_engine, &owner), "{name}, {round}");
+                by_engine
+            };
+            prefix_placed().into_iter().map(place).collect()
+        };
+        let first = placed("sixteen workers");
+
+        // The first request's worker leaves: its requests move, no other's.
+        let left = first[0].url().to_owned();
+        registry.remove_by_url(&left).expect("registered");
+        let without = placed("one worker left");
+        for (before, after) in first.iter().zip(&without) {
+            assert_ne!(after.url(), left);
+            let stays = before.url() == left || Arc::ptr_eq(after, before);
+            assert!(stays, "{} to {}", before.url(), after.url());
+        }
+
+        let joined = "http://w16:8000";
+        register(joined);
+        let with = placed("one worker joined");
+        let takes = with.iter().filter(|after| after.url() == joined).count();
+        assert!(takes > 0, "the new worker takes a request");
+        for (before, after) in without.iter().zip(&with) {
+            let stays = after.url() == joined || Arc::ptr_eq(after, before);
+            assert!(stays, "{} to {}", before.url(), after.url());
+        }
+
+        // A new worker at the second request's address: each request stays
+        // at its address, and that address's go to the new worker.
+        let old = registry.remove_by_url(with[1].url()).expect("registered");
+        register(old.url());
+        let again = placed("one worker replaced at its address");
+        for (before, after) in with.iter().zip(&again) {
+            assert_eq!(after.url(), before.url());
+            let kept = Arc::ptr_eq(after, before);
+            assert_eq!(kept, !Arc::ptr_eq(before, &old), "{}", before.url());
+        }
+        assert_eq!(engine.classic_made_or_asked(), 0);
+    }
+
+    /// The bounded-load rule under the engine is the classic policy's. A
+    /// prompt whose deepest head's owner holds more requests than the bound
+    /// goes to the owner of its next head: classic tries the next boundary's
+    /// key, and the engine the next place its request states. Where every
+    /// head's owner is past the bound, it goes to the worker with the
+    /// fewest requests, which the loads here leave one of.
+    #[test]
+    fn the_engine_steps_past_a_loaded_owner_as_the_classic_prefix_ring_does() {
+        let urls: Vec<String> = (0..16).map(|at| format!("http://w{at:02}:8000")).collect();
+        let urls: Vec<&str> = urls.iter().map(String::as_str).collect();
+        let idle = "http://w09:8000";
+        let mut stepped = 0;
+        for (name, tokens, _, headers) in prefix_placed() {
+            // A prompt that reaches both boundaries has two heads, and no
+            // routing key leads it.
+            let Some(tokens) = tokens.filter(|tokens| tokens.len() >= 256 && headers.is_empty())
+            else {
+                continue;
+            };
+            let registry = http_registry(&urls);
+            let (classic, engine) = prefix_policies(&[64, 256]);
+            let placed = |tokens: &[u32], round: &str| {
+                let inputs = PlacementInputs {
+                    tokens: Some(tokens),
+                    ..Default::default()
+                };
+                let owner = pick(&registry, &classic, inputs);
+                let by_engine = pick(&registry, &engine, inputs);
+                assert!(Arc::ptr_eq(&by_engine, &owner), "{name}, {round}");
+                owner
+            };
+            let load = |worker: &Arc<dyn Worker>, requests: usize| {
+                for _ in worker.load()..requests {
+                    worker.increment_load();
+                }
+            };
+            // With no request in flight the deepest head's owner takes the
+            // prompt, and its first boundary's owner takes that head alone.
+            let owner = placed(&tokens, "no load");
+            let next = placed(&tokens[..64], "the first boundary alone");
+            if Arc::ptr_eq(&owner, &next) || owner.url() == idle || next.url() == idle {
+                continue;
+            }
+            // Eleven requests on the owner are past the bound of sixteen
+            // workers: the mean with this request, and ten.
+            load(&owner, 11);
+            let after = placed(&tokens, "the deepest head's owner past the bound");
+            assert!(Arc::ptr_eq(&after, &next), "{name}: {}", after.url());
+            // Both owners past the bound, and every other worker but one
+            // holds a request.
+            for worker in &registry.get_all() {
+                let own = Arc::ptr_eq(worker, &owner) || Arc::ptr_eq(worker, &next);
+                load(
+                    worker,
+                    if own {
+                        13
+                    } else {
+                        usize::from(worker.url() != idle)
+                    },
+                );
+            }
+            let after = placed(&tokens, "every head's owner past the bound");
+            assert_eq!(after.url(), idle, "{name}");
+            assert_eq!(engine.classic_made_or_asked(), 0);
+            stepped += 1;
+        }
+        assert!(stepped >= 8, "{stepped} prompts stepped past their owner");
+    }
+
+    /// A pair under the engine is placed where the classic `prefix_hash`
+    /// policies place its two sides. The gateway lends a pair's decision
+    /// the model's ring as it lends a single request's, and the ring
+    /// answers for the pair's heads too: each side is found among its own
+    /// role's workers from the place the classic policy of that role
+    /// starts at.
+    #[test]
+    fn the_engine_places_a_pair_where_the_classic_prefix_ring_does() {
+        use crate::{
+            config::{RouterConfig, RoutingMode},
+            policies::PolicyFactory,
+        };
+
+        let prefix = PolicyConfig::PrefixHash {
+            prefix_token_count: 256,
+            load_factor: 1.25,
+            balance_abs_threshold: 10,
+            cache_boundaries: vec![64, 256],
+        };
+        let settings = RouterConfig {
+            mode: RoutingMode::PrefillDecode {
+                prefill_urls: vec![],
+                decode_urls: vec![],
+                prefill_policy: Some(prefix.clone()),
+                decode_policy: Some(prefix.clone()),
+            },
+            policy: prefix.clone(),
+            ..Default::default()
+        };
+        let fleet: Vec<(String, WorkerType)> = (0..8)
+            .flat_map(|at| {
+                [
+                    (format!("grpc://p{at}:1"), WorkerType::Prefill),
+                    (format!("grpc://d{at}:1"), WorkerType::Decode),
+                ]
+            })
+            .collect();
+        let listed: Vec<_> = fleet
+            .iter()
+            .map(|(url, role)| (url.as_str(), *role, Some("NixlConnector")))
+            .collect();
+        let registry = pd_registry(&listed);
+        let classic = PolicyRegistry::new(prefix.clone());
+        classic.set_prefill_policy(PolicyFactory::create_from_config(&prefix));
+        classic.set_decode_policy(PolicyFactory::create_from_config(&prefix));
+        let engine = PolicyRegistry::for_policy_engine(
+            settings.policy.clone(),
+            settings.routing_key_override.clone(),
+        );
+        let document = settings.policy_document().expect("the settings' document");
+        let spec = AppliedSpec::validate(&document).expect("a valid document");
+        engine_on(&engine, spec);
+        let placed = |policies: &PolicyRegistry, inputs: PlacementInputs<'_>| {
+            let pairs = pairs_of(&registry, policies);
+            let pair = select_pair(
+                &registry,
+                policies,
+                MODEL,
+                &pairs,
+                None,
+                None,
+                inputs,
+                Stated::nothing,
+            );
+            let pair = pair.expect("a pair is open");
+            (pair.prefill.url().to_owned(), pair.decode.url().to_owned())
+        };
+        let mut sides = std::collections::BTreeSet::new();
+        for (name, tokens, text, headers) in prefix_placed() {
+            let inputs = PlacementInputs {
+                tokens: tokens.as_deref(),
+                text: text.as_deref(),
+                headers: Some(&headers),
+                ..Default::default()
+            };
+            let by_classic = placed(&classic, inputs);
+            assert_eq!(placed(&engine, inputs), by_classic, "{name}");
+            sides.insert(by_classic);
+        }
+        assert!(sides.len() > 8, "the pairs spread: {sides:?}");
+        assert!(registry.get_routing_snapshot(MODEL).hash_ring_is_filled());
+        assert_eq!(engine.classic_made_or_asked(), 0);
+    }
+
+    /// A model's first prompts, before a ring is kept for it, go where the
+    /// `prefix_hash` policy sends them with no ring: to the worker with the
+    /// fewest requests. The engine is lent a ring that holds no worker and
+    /// places a head ([`Unfilled`](crate::policies::hash_ring::Unfilled)),
+    /// so its ring stage ranks nobody and the fewest requests decide. The
+    /// task that fills the rings lives here and never runs: nothing drives
+    /// its runtime.
+    #[test]
+    fn the_engine_places_a_models_first_prompts_by_the_fewest_requests() {
+        let urls: Vec<String> = (0..8).map(|at| format!("http://w{at:02}:8000")).collect();
+        let urls: Vec<&str> = urls.iter().map(String::as_str).collect();
+        let registry = Arc::new(http_registry(&urls));
+        let (classic, engine) = prefix_policies(&[64, 256]);
+        let runtime = tokio::runtime::Builder::new_current_thread().build();
+        let runtime = runtime.expect("a runtime");
+        classic.keep_rings_warm(&registry, runtime.handle());
+        engine.keep_rings_warm(&registry, runtime.handle());
+        // Every worker but one holds a request.
+        let idle = "http://w05:8000";
+        for worker in &registry.get_all() {
+            if worker.url() != idle {
+                worker.increment_load();
+            }
+        }
+
+        for (name, tokens, text, headers) in prefix_placed() {
+            let inputs = PlacementInputs {
+                tokens: tokens.as_deref(),
+                text: text.as_deref(),
+                headers: Some(&headers),
+                ..Default::default()
+            };
+            assert_eq!(pick(&registry, &classic, inputs).url(), idle, "{name}");
+            assert_eq!(pick(&registry, &engine, inputs).url(), idle, "{name}");
+        }
+        assert!(
+            !registry.get_routing_snapshot(MODEL).hash_ring_is_filled(),
+            "no request fills a ring while the task lives"
+        );
+        assert_eq!(engine.classic_made_or_asked(), 0);
+    }
+
     /// The engine's request reads the model's ring only under a document
     /// that places by one, as a classic placement reads it only for a
     /// policy that walks it: a ring nobody walks is not filled.
