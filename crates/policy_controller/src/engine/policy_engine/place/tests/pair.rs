@@ -1,6 +1,7 @@
 //! The cases of a request with a pair's two lists.
 
 mod decode_again;
+mod named;
 mod ruled;
 
 use std::panic::{catch_unwind, AssertUnwindSafe};

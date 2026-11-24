@@ -306,6 +306,15 @@ const CELLS: &[Cell] = &[
         document: || preset("least_load"),
         ..Cell::PLAIN
     },
+    // The hash ring's pair document with a request that carries no key:
+    // through the one call (`--entry place`) a pair's headers are read for
+    // the worker it may name, and `--entry place_named` names one.
+    Cell {
+        name: "pair_consistent_hashing_no_key",
+        document: || pair::of("consistent_hashing"),
+        request: pair::request,
+        ..Cell::PLAIN
+    },
     Cell {
         name: "least_load_on_runtime",
         document: || preset("least_load"),
