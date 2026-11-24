@@ -19,7 +19,7 @@
 //!   ([`RequestMaker::plain`]): such a request is not made at all.
 //!
 //! One thing of the request the engine does not make: the prompt's entry in
-//! a token tree its caller lends. The caller names it ([`Prompt::entry`]),
+//! a tree its caller lends. The caller names it ([`Prompt::entry`]),
 //! by its own rule for a cache partition, and a decision that reads the
 //! tree asks it. That decision stores the prompt in the tree for the first
 //! of its targets this call can send to ([`RequestMaker::sends_to`]), and
@@ -82,7 +82,7 @@ use crate::{
         decision::{Decision, Pick, ShedReason, Target, MAX_TARGETS},
         decision_engine::{
             AlonePick, DecideOutcome, DecisionEngine, DecisionRefused, Plain, Request,
-            RequestMaker, TokenKey, WorkerLists,
+            RequestMaker, TextKey, TokenKey, WorkerLists,
         },
         demands::Demands,
         framework::EncodeItems,
@@ -138,19 +138,32 @@ impl HeaderRead for http::HeaderMap {
     }
 }
 
-/// A prompt's entry in a token tree, as the request's caller names it: the
-/// one question a decision asks where it reads the tree the caller lends
-/// ([`CacheIndexes::token_tree`]). A caller of [`PolicyEngine::place`]
-/// answers it for its request ([`Prompt::entry`]), as a maker written by
-/// hand answers [`RequestMaker::token_key`].
+/// A prompt's entry in a tree its caller lends, as the caller names it: the
+/// one question a decision asks where it reads the caller's token tree
+/// ([`CacheIndexes::token_tree`]), and the one it asks where it reads the
+/// caller's string tree ([`CacheIndexes::string_tree`]). A caller of
+/// [`PolicyEngine::place`] answers them for its request
+/// ([`Prompt::entry`]), as a maker written by hand answers
+/// [`RequestMaker::token_key`] and [`RequestMaker::text_key`].
+///
+/// The trait is named for its first question. A caller that keeps no
+/// string tree answers that one alone.
 ///
 /// [`CacheIndexes::token_tree`]: crate::engine::CacheIndexes::token_tree
+/// [`CacheIndexes::string_tree`]: crate::engine::CacheIndexes::string_tree
 pub trait TokenEntry {
     /// The entry by token ids for a tree whose page is `page` tokens
     /// ([`TokenKey`]): `None` where the caller holds no token ids of the
     /// prompt. The marker of a cache partition fills whole pages, which is
     /// why the page is asked with.
     fn token_key(&self, page: usize) -> Option<TokenKey<'_>>;
+
+    /// The entry by text for the caller's string tree ([`TextKey`]):
+    /// `None`, the default, where the caller holds the prompt's token ids
+    /// or no text of it, or lends no string tree.
+    fn text_key(&self) -> Option<TextKey<'_>> {
+        None
+    }
 }
 
 /// A request's prompt, as its caller holds it: what the stages that place a
@@ -166,14 +179,15 @@ pub struct Prompt<'a> {
     /// [`HashSeeds::PLAIN`] for a request with none. The caller's own rule
     /// keeps two partitions apart.
     pub seeds: HashSeeds,
-    /// The prompt's entry in the token tree the caller lends
-    /// ([`CacheIndexes::token_tree`]), named by the caller's own rule as
-    /// the seeds are: the same cache partition, for a tree's lookup.
-    /// `None` from a caller that lends no tree or holds no token ids: the
+    /// The prompt's entry in the tree the caller lends: its token tree
+    /// ([`CacheIndexes::token_tree`]), or its string tree for a prompt it
+    /// holds as text ([`CacheIndexes::string_tree`]). The caller's own
+    /// rule names it as the seeds are: the same cache partition, for a
+    /// tree's lookup. `None` from a caller that lends no tree: the
     /// request is then named its holders from the record of hashed
     /// prefixes. One entry answers for every tree the request is decided
-    /// in, a pair's two sides too when a pair reads one: the tree's page
-    /// is the question's argument.
+    /// in, a pair's two sides too when a pair reads one: the token tree's
+    /// page is that question's argument.
     ///
     /// It is asked once by each decision of the call that reads the tree,
     /// and never where no stage of the request's place reads the tree. The
@@ -188,6 +202,7 @@ pub struct Prompt<'a> {
     /// between two awaits.
     ///
     /// [`CacheIndexes::token_tree`]: crate::engine::CacheIndexes::token_tree
+    /// [`CacheIndexes::string_tree`]: crate::engine::CacheIndexes::string_tree
     pub entry: Option<&'a dyn TokenEntry>,
 }
 
@@ -226,7 +241,7 @@ pub type WorkerRule<'a> = &'a dyn Fn(&dyn Worker) -> bool;
 /// `PlaceRequest { streaming: true, tried: &tried, ..PlaceRequest::of(model, lists) }`.
 ///
 /// A request is not [`Send`]: its headers, its route's rule and its
-/// prompt's entry in a token tree are borrowed as their caller holds them,
+/// prompt's entry in a lent tree are borrowed as their caller holds them,
 /// and none is asked to be [`Sync`]. A caller makes one for each call,
 /// between two awaits.
 pub struct PlaceRequest<'a> {
@@ -447,7 +462,7 @@ pub(super) struct Made<'r, 'a> {
 }
 
 /// What a call's maker answered on a decision's targets where the decision
-/// asked which of them a prompt is stored for, in a lent token tree or in
+/// asked which of them a prompt is stored for, in a lent tree or in
 /// the record of sent prefixes: each place asked, and whether the call
 /// sends to it. A pick's targets are asked best first up to the first one
 /// the call sends to, so a pick's targets fit.
@@ -872,6 +887,10 @@ impl RequestMaker for Made<'_, '_> {
     // The caller's own naming, handed on: nothing else reads the field.
     fn token_key(&self, page: usize) -> Option<TokenKey<'_>> {
         self.request.prompt.entry?.token_key(page)
+    }
+
+    fn text_key(&self) -> Option<TextKey<'_>> {
+        self.request.prompt.entry?.text_key()
     }
 
     // The walk's own read of a target, made ahead of the walk for the
@@ -1535,7 +1554,7 @@ impl PolicyEngine {
     /// first target all the same.
     ///
     /// Where a prompt went is written otherwise, in the record of sent
-    /// prefixes a `cache_aware` profile keeps and in a token tree the
+    /// prefixes a `cache_aware` profile keeps and in a tree the
     /// caller lends ([`Prompt::entry`]). A decision that writes either
     /// asks, ahead of the write, which of its targets this call can send
     /// to ([`RequestMaker::sends_to`]): ready, and admitted by the route's

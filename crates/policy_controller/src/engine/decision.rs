@@ -577,7 +577,7 @@ impl Overlap {
 /// (`lease_events::stages_hear`): by the front in a gateway's own process,
 /// and by a controller where it files the pick's lease. Under `untold` no
 /// stage hears the issue or the dispatch of such a single request, the
-/// record of sent prompts takes no entry behind it and a lent token tree
+/// record of sent prompts takes no entry behind it and a lent tree
 /// stores no prompt for it, as a gateway's sticky map keeps a request it
 /// places from the gateway's policy. Under `told`, the default, the stages
 /// hear both and where the prompt went is kept as behind any pick. The

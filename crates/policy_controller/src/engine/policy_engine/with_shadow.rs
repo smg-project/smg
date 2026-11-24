@@ -125,7 +125,7 @@ impl PolicyEngine {
 /// said beside it where one was due: the whole decision followed by the
 /// shadow profile's ([`WithShadow`]). `binding` is the document's word of
 /// the request's binding ([`Engine::shadow_for`]), as its list keeps it.
-/// `maker` is the request's own, handed on for its entry in a token tree
+/// `maker` is the request's own, handed on for its entry in a tree
 /// its host lends ([`single::decide`]): the live answer is the one the
 /// binding would give with no shadow.
 ///

@@ -1,5 +1,6 @@
 //! The naming of a decision's rows from a host's index of cache events, its
-//! token tree of sent prefixes and the engine's record of sent prefixes.
+//! token tree and its string tree of sent prefixes, and the engine's record
+//! of sent prefixes.
 
 use std::{borrow::Cow, cell::RefCell, sync::atomic::AtomicUsize, thread, time::Duration};
 
@@ -88,13 +89,14 @@ fn pool(count: usize) -> (Vec<Arc<dyn Worker>>, Vec<WorkerId>) {
 }
 
 /// A host's indexes: one model's chain index, and the host's own token tree
-/// of the prompts it sent to the model's workers, where it keeps one. And
-/// how often it was asked for either.
+/// and string tree of the prompts it sent to the model's workers, where it
+/// keeps them. And how often it was asked for the index or the token tree.
 #[derive(Default)]
 struct Host {
     index: Option<Arc<ChainIndex>>,
     asked: AtomicUsize,
     tree: Option<Arc<TokenTree>>,
+    text: Option<Arc<StringTree>>,
 }
 
 impl CacheIndexes for Host {
@@ -112,6 +114,11 @@ impl CacheIndexes for Host {
         self.asked.fetch_add(1, Ordering::Relaxed);
         let single = model == MODEL && phase == Phase::Single;
         self.tree.as_ref().filter(|_| single).cloned()
+    }
+
+    fn string_tree(&self, model: &str, phase: Phase) -> Option<Arc<StringTree>> {
+        let single = model == MODEL && phase == Phase::Single;
+        self.text.as_ref().filter(|_| single).cloned()
     }
 }
 
@@ -155,6 +162,26 @@ fn lending_by(page: usize, indexed: bool) -> (Affinity, Arc<TokenTree>) {
     (affinity, tree)
 }
 
+/// An engine's affinity over a host that keeps a string tree of the prompts
+/// it sent as text and lends it: with a chain index that holds a block
+/// beside it, or with none. It lends no token tree.
+fn lending_text(indexed: bool) -> (Affinity, Arc<StringTree>) {
+    let tree = Arc::new(StringTree::new());
+    let index = indexed.then(|| {
+        let index = Arc::new(ChainIndex::new());
+        store(&index, 0, &[7]);
+        index
+    });
+    let host = Arc::new(Host {
+        index,
+        text: Some(Arc::clone(&tree)),
+        ..Host::default()
+    });
+    let affinity = Affinity::default();
+    affinity.set_indexes(host as Arc<dyn CacheIndexes>);
+    (affinity, tree)
+}
+
 /// Stores `hashes`, a prompt's blocks from its first, for the worker at
 /// `at`, as its event stream would.
 fn store(index: &ChainIndex, at: usize, hashes: &[u64]) {
@@ -187,6 +214,40 @@ fn hashed(tokens: &[u32]) -> PromptHashes {
 /// A prompt of `blocks` whole blocks, its tokens counted from `first`.
 fn prompt(first: u32, blocks: u32) -> PromptHashes {
     hashed(&tokens(first, blocks))
+}
+
+/// Bytes a window of text: a block's tokens at four bytes a token.
+const WINDOW: usize = 4 * BLOCK as usize;
+
+/// A prompt of text of `windows` whole windows, each a number counted from
+/// `first` and written `char` by `char` behind its digits: a text that
+/// begins with a shorter one of the same `first`. `fill` is one char of
+/// some bytes, and a window is filled to its bytes.
+fn text_of(first: u32, windows: u32, fill: char) -> String {
+    let window = |at: u32| {
+        let mut window = (first + at).to_string();
+        while window.len() < WINDOW {
+            window.push(fill);
+        }
+        assert_eq!(
+            window.len(),
+            WINDOW,
+            "the fill ends on the window's last byte"
+        );
+        window
+    };
+    (0..windows).map(window).collect()
+}
+
+/// A prompt of text of `windows` whole windows of one byte a char.
+fn text(first: u32, windows: u32) -> String {
+    text_of(first, windows, '.')
+}
+
+/// What a host hashes of a prompt it holds as text.
+fn worded(text: &str) -> PromptHashes {
+    let spec = preset("cache_aware");
+    PromptHashes::under_document(&spec, Some(BLOCK), None, Some(text), HashSeeds::PLAIN)
 }
 
 /// The hashes of `prompt`'s blocks.
@@ -347,6 +408,19 @@ impl Bed {
         key: Option<TokenKey<'_>>,
         target: Option<u32>,
     ) -> Option<Named> {
+        self.decide_entered(facts, places, (key, None), target)
+    }
+
+    /// [`Self::decide_among`] for a request whose host names its entry in
+    /// each tree it lends, where it names one: `key` in the token tree,
+    /// `text` in the string tree.
+    fn decide_entered(
+        &self,
+        facts: &RequestFacts<'_>,
+        places: Option<&[u32]>,
+        (key, text): (Option<TokenKey<'_>>, Option<TextKey<'_>>),
+        target: Option<u32>,
+    ) -> Option<Named> {
         let mut named = None;
         let decision = decide(
             &self.affinity,
@@ -357,6 +431,7 @@ impl Bed {
             &mut { *facts },
             places,
             |_| key,
+            || text,
             |_| true,
             |facts| {
                 named = facts.named.map(|rows| Named {
@@ -397,6 +472,7 @@ impl Bed {
             &mut { *facts },
             None,
             |_| key,
+            || None,
             |_| true,
             |_| answer,
         );
@@ -427,6 +503,25 @@ impl Bed {
             marker,
         };
         let named = self.decide_keyed(&request(&hashes, 7, NOW), Some(key), target);
+        named.expect("rows named").holders
+    }
+
+    /// The holders a request of text is named whose host names `key` as its
+    /// entry in the string tree: the prompt's text behind `marker` chars of
+    /// a partition's marker. Decided by picking the worker at `target`,
+    /// which writes the request for it, or by a shed, which writes nothing.
+    fn worded(&self, key: &str, marker: usize, target: Option<u32>) -> Vec<(u32, u32, u32)> {
+        let behind = key
+            .char_indices()
+            .nth(marker)
+            .map_or(key.len(), |(at, _)| at);
+        let hashes = worded(&key[behind..]);
+        let entry = TextKey {
+            text: Cow::Borrowed(key),
+            marker,
+        };
+        let facts = request(&hashes, 7, NOW);
+        let named = self.decide_entered(&facts, None, (None, Some(entry)), target);
         named.expect("rows named").holders
     }
 
@@ -879,6 +974,7 @@ fn a_pick_the_sessions_rule_placed_is_recorded_by_the_rules_word_at_both_writes(
                 &mut request(asked, 7, NOW),
                 None,
                 |_| None,
+                || None,
                 // The caller sends to every worker but the one at 3.
                 |target| target.position != 3,
                 |facts| {
@@ -947,6 +1043,11 @@ fn an_entrys_debug_form_holds_no_token() {
         marker: 1,
     };
     assert_eq!(format!("{key:?}"), "TokenKey { tokens: 2, marker: 1 }");
+    let key = TextKey {
+        text: Cow::Borrowed("a client's words"),
+        marker: 2,
+    };
+    assert_eq!(format!("{key:?}"), "TextKey { text: 16, marker: 2 }");
 }
 
 /// The host's token tree takes the prompt of a pick the binding's sessions
@@ -979,6 +1080,7 @@ fn a_pick_the_sessions_rule_placed_is_written_to_a_tree_by_the_rules_word() {
             &mut request(&hashes, 7, NOW),
             None,
             |_| Some(key),
+            || None,
             |_| true,
             |_| answer,
         );
@@ -1212,6 +1314,7 @@ fn a_tree_stores_a_prompt_for_the_first_target_its_caller_sends_to() {
             &mut request(&hashes, 7, NOW),
             None,
             |_| Some(entry),
+            || None,
             |target| {
                 asked.borrow_mut().push(target.position);
                 sent.contains(&target.position)
@@ -1267,6 +1370,7 @@ fn the_entry_is_asked_for_once_and_only_where_the_host_lends_a_tree() {
                 facts,
                 None,
                 asks,
+                || None,
                 |_| true,
                 |_| shed(),
             );
@@ -1277,6 +1381,244 @@ fn the_entry_is_asked_for_once_and_only_where_the_host_lends_a_tree() {
     assert!(pages(false, false, "cache_aware").is_empty());
     assert!(pages(true, true, "cache_aware").is_empty());
     assert!(pages(true, false, "least_load").is_empty());
+}
+
+/// A request its host holds as text and names an entry for is decided
+/// inside the host's string tree, as a tokenized one is inside its token
+/// tree. A pick writes the whole text for its worker, a later request that
+/// begins alike is named that worker by the windows the two share, the
+/// deepest holders alone are named, a shed writes nothing and a worker its
+/// host took out of the tree is named no more. The record of hashed
+/// windows stays empty.
+///
+/// The classic policy matches and writes its string tree for a request
+/// that holds no token ids (`select_worker_with_text` in
+/// `model_gateway/src/policies/cache_aware.rs`).
+#[test]
+fn a_string_tree_names_the_worker_a_text_was_sent_to() {
+    let (affinity, tree) = lending_text(false);
+    let bed = Bed::new(affinity, preset("cache_aware"), 4);
+    let asked = text(1_000, 4);
+    assert!(bed.worded(&asked, 0, None).is_empty());
+    // The pick's own decision is named what stood before it.
+    assert!(bed.worded(&asked, 0, Some(1)).is_empty());
+    assert_eq!(bed.worded(&asked, 0, None), [(1, 0, 4)]);
+    // A longer text that begins with it is named by the four windows sent.
+    let longer = text(1_000, 6);
+    assert_eq!(bed.worded(&longer, 0, Some(3)), [(1, 0, 4)]);
+    // The worker sent the longer text is its one deepest holder, and both
+    // hold the shorter one.
+    assert_eq!(bed.worded(&longer, 0, None), [(3, 0, 6)]);
+    assert_eq!(bed.worded(&asked, 0, None), [(1, 0, 4), (3, 0, 4)]);
+    // The tree is the host's to keep: it takes out a worker that left.
+    tree.remove_tenant_all(&TenantId::from(address(3)));
+    assert_eq!(bed.worded(&longer, 0, None), [(1, 0, 4)]);
+    // A text under one window names nobody, and is decided all the same.
+    let short = &text(7_000, 1)[..WINDOW - 1];
+    assert!(bed.worded(short, 0, Some(2)).is_empty());
+    assert!(bed.worded(short, 0, None).is_empty());
+    // A host that names no entry reads the record of hashed windows, which
+    // no request above wrote.
+    assert!(bed.holders(&worded(&asked), NOW).is_empty());
+}
+
+/// A request of text reads no index of cache events: an index speaks of
+/// token blocks. So a host whose index holds a block still lends its string
+/// tree, and a request of text is decided inside it. A tokenized request
+/// under the same host is never asked for a text entry, and neither is a
+/// request of text whose host lends no string tree: that one is named its
+/// rows from the record of hashed windows, as before.
+///
+/// The classic policy asks its index only where the request holds token
+/// ids, and sends every request of text to its string tree (`select_worker`
+/// in `model_gateway/src/policies/cache_aware.rs`).
+#[test]
+fn a_request_of_text_is_decided_in_the_string_tree_beside_an_index() {
+    let (affinity, _tree) = lending_text(true);
+    let bed = Bed::new(affinity, preset("cache_aware"), 4);
+    let asked = text(1_000, 4);
+    assert!(bed.worded(&asked, 0, Some(2)).is_empty());
+    assert_eq!(bed.worded(&asked, 0, None), [(2, 0, 4)]);
+    // How often a decision of `facts` over `bed` asks for the text entry.
+    let asks = |bed: &Bed, facts: &RequestFacts<'_>| {
+        let asked = Cell::new(0);
+        decide(
+            &bed.affinity,
+            &bed.pool,
+            &bed.spec,
+            &bed.workers,
+            &bed.ids,
+            &mut { *facts },
+            None,
+            |_| None,
+            || {
+                asked.set(asked.get() + 1);
+                None
+            },
+            |_| true,
+            |_| picked(1, bed.ids[1]),
+        );
+        asked.get()
+    };
+    let (tokenized, of_text) = (prompt(1_000, 4), worded(&text(2_000, 4)));
+    assert_eq!(asks(&bed, &request(&of_text, 7, NOW)), 1);
+    assert_eq!(asks(&bed, &request(&tokenized, 7, NOW)), 0);
+    // A host that lends its token tree alone: the record takes the text.
+    let (affinity, _tree) = lending(false);
+    let bed = Bed::new(affinity, preset("cache_aware"), 4);
+    assert_eq!(asks(&bed, &request(&of_text, 7, NOW)), 0);
+    assert_eq!(bed.holders(&of_text, NOW), [(1, 0, 4)]);
+}
+
+/// A string tree counts chars and a request of text is sized in bytes: a
+/// match is turned into the bytes of the text it matched before it is
+/// counted in the request's windows. So a text of several bytes a char is
+/// named by every window it was sent, where a char read as a byte would
+/// name fewer.
+///
+/// The classic policy divides the chars its tree matched by the text's
+/// chars (`select_worker_with_text` in
+/// `model_gateway/src/policies/cache_aware.rs`).
+#[test]
+fn a_text_of_several_bytes_a_char_is_counted_in_its_bytes() {
+    let (affinity, _tree) = lending_text(false);
+    let bed = Bed::new(affinity, preset("cache_aware"), 4);
+    for (first, fill) in [(2_000, 'é'), (3_000, '語'), (4_000, '🦀')] {
+        let asked = text_of(first, 4, fill);
+        assert_eq!(asked.len(), 4 * WINDOW);
+        assert!(asked.chars().count() < asked.len(), "{fill}");
+        assert!(bed.worded(&asked, 0, Some(1)).is_empty(), "{fill}");
+        assert_eq!(bed.worded(&asked, 0, None), [(1, 0, 4)], "{fill}");
+    }
+    // The bytes of a match behind a marker, by its chars.
+    assert_eq!(bytes_behind("é語🦀a", 0, 0), 0);
+    assert_eq!(bytes_behind("é語🦀a", 0, 2), 5);
+    assert_eq!(bytes_behind("é語🦀a", 1, 3), 7);
+    assert_eq!(bytes_behind("é語🦀a", 1, 9), 8);
+    // A match that ends inside the marker holds nothing of the prompt.
+    assert_eq!(bytes_behind("é語🦀a", 3, 2), 0);
+}
+
+/// The naming of a cache partition is the host's, for text as for tokens.
+/// An entry named behind a partition's marker shares no prefix with another
+/// partition's nor with a plain one, and the marker's chars are no part of
+/// the windows a worker is named by, whatever their bytes.
+#[test]
+fn a_hosts_marker_keeps_two_partitions_of_text_apart() {
+    let (affinity, _) = lending_text(false);
+    let bed = Bed::new(affinity, preset("cache_aware"), 4);
+    // Eighteen chars no prompt begins with, one of them of two bytes.
+    let under = |partition: u32, prompt: &str| format!("\u{1}§{partition:016x}{prompt}");
+    let marker = 18;
+    let asked = text(1_000, 4);
+    assert!(bed.worded(&under(1, &asked), marker, Some(2)).is_empty());
+    assert_eq!(bed.worded(&under(1, &asked), marker, None), [(2, 0, 4)]);
+    assert!(bed.worded(&under(2, &asked), marker, None).is_empty());
+    assert!(bed.worded(&asked, 0, None).is_empty());
+    // Another prompt of the partition shares the marker alone, and a
+    // marker is no window of a prompt.
+    let other = under(1, &text(5_000, 4));
+    assert!(bed.worded(&other, marker, None).is_empty());
+    // A prompt that ends fourteen bytes short of its fourth window is named
+    // by three: the marker's nineteen bytes fill no window of it.
+    let cut = &asked[..4 * WINDOW - 14];
+    assert_eq!(bed.worded(&under(1, cut), marker, None), [(2, 0, 3)]);
+}
+
+/// The string tree stores a text for the first target of the pick its
+/// caller sends to, asked best first, and for no worker where the caller
+/// sends to none, as the token tree does
+/// ([`a_tree_stores_a_prompt_for_the_first_target_its_caller_sends_to`]).
+/// The host and the engine read and write one tree: what the engine decided
+/// stands in the host's tree under the worker's address, every char of it.
+#[test]
+fn a_string_tree_stores_a_text_for_the_first_target_its_caller_sends_to() {
+    let (affinity, tree) = lending_text(false);
+    let bed = Bed::new(affinity, preset("cache_aware"), 4);
+    // The workers at 1 and 2, best first.
+    let two = || {
+        let mut targets = Targets::new();
+        for position in 1..3 {
+            targets.push(Target {
+                position,
+                id: bed.ids[position as usize],
+                ..Target::default()
+            });
+        }
+        Decision::Pick(Pick {
+            targets,
+            trace: Trace::default(),
+            session_verdict: SessionVerdict::None,
+        })
+    };
+    // One decision of `key` that picks the two, under a caller that sends
+    // to the places `sent` names. Says the places the caller was asked of.
+    let place = |key: &str, sent: &[u32]| {
+        let hashes = worded(key);
+        let asked = RefCell::new(Vec::new());
+        let entry = TextKey {
+            text: Cow::Borrowed(key),
+            marker: 0,
+        };
+        decide(
+            &bed.affinity,
+            &bed.pool,
+            &bed.spec,
+            &bed.workers,
+            &bed.ids,
+            &mut request(&hashes, 7, NOW),
+            None,
+            |_| None,
+            || Some(entry),
+            |target| {
+                asked.borrow_mut().push(target.position);
+                sent.contains(&target.position)
+            },
+            |_| two(),
+        );
+        asked.into_inner()
+    };
+    let (first, second, none) = (text(1_000, 4), text(2_000, 4), text(3_000, 4));
+    assert_eq!(place(&first, &[1, 2]), [1]);
+    assert_eq!(bed.worded(&first, 0, None), [(1, 0, 4)]);
+    // A caller that passes the first over is stored for the second alone.
+    assert_eq!(place(&second, &[2]), [1, 2]);
+    assert_eq!(bed.worded(&second, 0, None), [(2, 0, 4)]);
+    // One that sends to none is asked of each, and nothing is stored.
+    assert_eq!(place(&none, &[]), [1, 2]);
+    assert!(bed.worded(&none, 0, None).is_empty());
+    for (text, at) in [(&first, 1), (&second, 2)] {
+        let found = tree.match_prefix_with_counts(text);
+        assert_eq!(found.matched_char_count, text.chars().count());
+        assert_eq!(found.matched_tenants, [TenantId::from(address(at))]);
+    }
+    assert_eq!(tree.get_tenant_char_count().len(), 2);
+}
+
+/// A request of text its host holds to places is named the workers its
+/// string tree's match hands among those places, as a tokenized one is
+/// ([`a_held_request_is_named_a_trees_workers_among_its_places`]).
+#[test]
+fn a_held_request_of_text_is_named_a_trees_workers_among_its_places() {
+    let (affinity, _) = lending_text(false);
+    let bed = Bed::new(affinity, sampled(4), 20);
+    let asked = text(1_000, 4);
+    for at in 0..8 {
+        bed.worded(&asked, 0, Some(at));
+    }
+    let hashes = worded(&asked);
+    let key = || TextKey {
+        text: Cow::Borrowed(&asked),
+        marker: 0,
+    };
+    for seed in 0..32 {
+        let facts = request(&hashes, seed, NOW);
+        let named = bed.decide_entered(&facts, Some(&[2, 5]), (None, Some(key())), None);
+        let named = named.expect("rows named");
+        assert_eq!(named.holders, [(2, 0, 4), (5, 0, 4)], "seed {seed}");
+    }
+    // Stated to no place, the sample cuts the eight to four.
+    assert_eq!(bed.worded(&asked, 0, None).len(), 4);
 }
 
 /// A pick that meets a held record waits for nobody: it writes nothing, the
@@ -1328,6 +1670,7 @@ fn a_worker_that_leaves_under_its_first_pick_is_given_no_place() {
             &mut request(&asked, 7, NOW),
             None,
             |_| None,
+            || None,
             |_| true,
             |_| {
                 leave();
@@ -1360,6 +1703,7 @@ fn an_answer_made_ahead_of_a_leave_gives_its_worker_no_place() {
             &bed.ids,
             &mut request(&asked, 7, NOW),
             |_| None,
+            || None,
             |_| true,
             leaves,
             made,
@@ -1724,6 +2068,7 @@ fn the_engine_decides_by_the_rows_named() {
                 &mut request,
                 None,
                 |_| None,
+                || None,
                 |_| true,
                 |request| {
                     let engine = bed.spec.engine();
@@ -1875,6 +2220,7 @@ fn a_profile_named_no_row_is_handed_the_column() {
         &mut request(&asked, 7, NOW),
         None,
         |_| None,
+        || None,
         |_| true,
         |facts| {
             assert!(facts.named.is_none());
@@ -1905,6 +2251,7 @@ fn a_profile_named_no_row_is_handed_the_prefix_its_pick_sent() {
         &mut request(&asked, 7, NOW),
         None,
         |_| None,
+        || None,
         |_| true,
         |facts| {
             seen = Some(held(facts.affinity));
@@ -2167,6 +2514,7 @@ fn a_shadow_that_reads_affinity_states_nothing_of_the_live_pick() {
             &mut { *facts },
             None,
             |_| None,
+            || None,
             |_| true,
             |facts| {
                 held = Some(facts.affinity_at(1).overlap_blocks);
@@ -2242,6 +2590,7 @@ fn a_worker_that_asks_for_events_and_publishes_none_keeps_its_prompt() {
             &mut request(&asked, 7, now),
             None,
             |_| None,
+            || None,
             |_| true,
             |facts| {
                 bed.spec
@@ -2443,6 +2792,7 @@ fn a_decision_that_names_no_row_writes_nothing_of_the_one_before() {
         &mut other,
         None,
         |_| None,
+        || None,
         |_| true,
         |facts| {
             assert!(facts.named.is_none(), "least load receives no named rows");
@@ -2514,6 +2864,7 @@ fn a_cap_the_records_holders_fill_is_not_read_past() {
         &mut facts,
         None,
         |_| None,
+        || None,
         |_| true,
         |facts| {
             assert_eq!(
@@ -2625,6 +2976,7 @@ fn a_naming_the_record_fills_stands_whole_where_every_holder_is_refused() {
             &mut request(&asked, 0, NOW),
             None,
             |_| None,
+            || None,
             |_| true,
             |facts| {
                 for holder in facts.named.expect("rows").holders {
@@ -2949,6 +3301,7 @@ fn a_removal_waits_for_no_decider_of_another_model() {
         },
         None,
         |_| None,
+        || None,
         |_| true,
         |_| picked(0, reader_id),
     );

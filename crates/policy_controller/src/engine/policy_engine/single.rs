@@ -238,12 +238,13 @@ impl WholeDecision for WithoutShadow {
 /// stage here runs is declined under that stage's name.
 ///
 /// `maker` is asked for the request's entry in its host's token tree of
-/// sent prefixes ([`RequestMaker::token_key`]) where the host lends the
-/// request's place one ([`overlap::decide`]). It is asked of the maker's
-/// own type and no argument carries the entry: a maker that names none
-/// costs a decision nothing. The decision is compiled once for each maker
-/// type, as the engine's entry that calls it is, and once more for the
-/// trait object through which a copy that carries signal cells asks
+/// sent prefixes ([`RequestMaker::token_key`]), or in its string tree
+/// ([`RequestMaker::text_key`]), where the host lends the request's place
+/// one ([`overlap::decide`]). It is asked of the maker's own type and no
+/// argument carries the entry: a maker that names none costs a decision
+/// nothing. The decision is compiled once for each maker type, as the
+/// engine's entry that calls it is, and once more for the trait object
+/// through which a copy that carries signal cells asks
 /// ([`super::signals::decide`]).
 ///
 /// A request that states a hard demand is decided under its constraints
@@ -341,7 +342,7 @@ pub(super) fn decide(
 /// decision more.
 ///
 /// `maker` is the request's own, a retry's too: the lookup that names a
-/// request's holders asks it for the request's entry in a lent token tree,
+/// request's holders asks it for the request's entry in a lent tree,
 /// and which target of its pick the request's caller sends to.
 #[inline(always)]
 #[expect(
@@ -385,6 +386,7 @@ fn by_facts<const RETRY: bool>(
             facts,
             cx.places,
             |page| maker.token_key(page),
+            || maker.text_key(),
             |target| maker.sends_to(target),
             |facts| whole.decide(engine, records, workers, live, facts, cx),
         ),
@@ -425,6 +427,7 @@ fn handed_on(
         records.ids(),
         facts,
         |page| maker.token_key(page),
+        || maker.text_key(),
         |target| maker.sends_to(target),
         leaves,
         keyed,
@@ -438,7 +441,7 @@ fn handed_on(
 /// binding's shadow profile so read one list, and the request's own list
 /// stays as its host made it. The decision's instant is written back into
 /// `facts`: the request's lease is dated by it. The request's maker goes
-/// with the copy, so a retry is decided inside a lent token tree as a
+/// with the copy, so a retry is decided inside a lent tree as a
 /// first attempt is.
 ///
 /// The workers stand in the calling thread's own list ([`TRIED`]), so a
@@ -630,7 +633,7 @@ pub(super) fn issued(
 pub(crate) mod tests {
     use std::{borrow::Cow, cell::Cell, collections::BTreeSet, sync::Arc, time::Duration};
 
-    use kv_index::{TenantId, TokenTree};
+    use kv_index::{TenantId, TokenTree, Tree as StringTree};
     use parking_lot::Mutex;
     use smg_worker::{
         identity::{basic::Worker, builder::BasicWorkerBuilder},
@@ -648,7 +651,9 @@ pub(crate) mod tests {
         },
         engine::{
             decision::{LiftedVeto, Overlap, PlacedBy, Target, Targets, MAX_TARGETS},
-            decision_engine::{Decided, DecisionEngine, DecisionRefused, TokenKey, WorkerLists},
+            decision_engine::{
+                Decided, DecisionEngine, DecisionRefused, TextKey, TokenKey, WorkerLists,
+            },
             demands::{DemandFacts, Demands},
             framework::{Picker, Place, PoolWord, TieBand, DRAW_FROM},
             list_cell::tests::PublishedList,
@@ -709,6 +714,35 @@ pub(crate) mod tests {
         fn token_tree(&self, _: &str, _: Phase) -> Option<Arc<TokenTree>> {
             Some(Arc::clone(&self.0))
         }
+    }
+
+    /// A host that keeps a string tree of the prompts it sent as text and
+    /// lends it. It keeps no token tree and no index of cache events.
+    struct LendsText(Arc<StringTree>);
+
+    impl overlap::CacheIndexes for LendsText {
+        fn index(&self, _: &str) -> Option<Arc<dyn overlap::CacheIndex>> {
+            None
+        }
+
+        fn block_size(&self, _: &str) -> Option<u32> {
+            None
+        }
+
+        fn string_tree(&self, _: &str, _: Phase) -> Option<Arc<StringTree>> {
+            Some(Arc::clone(&self.0))
+        }
+    }
+
+    /// The engine of `spec` under a host that lends its string tree, and
+    /// the host's tree.
+    pub(crate) fn lending_text(spec: AppliedSpec) -> (PolicyEngine, Arc<StringTree>) {
+        let engine = PolicyEngine::new(spec);
+        let tree = Arc::new(StringTree::new());
+        engine
+            .affinity()
+            .set_indexes(Arc::new(LendsText(Arc::clone(&tree))));
+        (engine, tree)
     }
 
     /// What a lending host's document holds beyond its preset.
@@ -789,6 +823,10 @@ pub(crate) mod tests {
         /// tree, and how many times the engine asked for the entry.
         pub(crate) key: Option<&'a [u32]>,
         pub(crate) keyed: Cell<u32>,
+        /// The text the host names as the request's entry in a string
+        /// tree, and how many times the engine asked for that entry.
+        pub(crate) text: Option<&'a str>,
+        pub(crate) worded: Cell<u32>,
     }
 
     impl<'a> Asks<'a> {
@@ -808,6 +846,8 @@ pub(crate) mod tests {
                 made: Cell::new(0),
                 key: None,
                 keyed: Cell::new(0),
+                text: None,
+                worded: Cell::new(0),
             }
         }
     }
@@ -846,6 +886,12 @@ pub(crate) mod tests {
             self.keyed.set(self.keyed.get() + 1);
             let tokens = Cow::Borrowed(self.key?);
             Some(TokenKey { tokens, marker: 0 })
+        }
+
+        fn text_key(&self) -> Option<TextKey<'_>> {
+            self.worded.set(self.worded.get() + 1);
+            let text = Cow::Borrowed(self.text?);
+            Some(TextKey { text, marker: 0 })
         }
     }
 
@@ -2320,6 +2366,7 @@ pub(crate) mod tests {
             &mut asked.facts,
             None,
             |_| None,
+            || None,
             |_| true,
             |facts| {
                 match facts.named {
@@ -2998,6 +3045,10 @@ pub(crate) mod tests {
             self.asks.token_key(page)
         }
 
+        fn text_key(&self) -> Option<TextKey<'_>> {
+            self.asks.text_key()
+        }
+
         fn sends_to(&self, _: &Target) -> bool {
             self.to
         }
@@ -3195,6 +3246,177 @@ pub(crate) mod tests {
                 sent(&said, seed) != first
             });
             assert!(moved, "a worker out of the tree holds no prompt: {also:?}");
+        }
+    }
+
+    /// A conversation its host holds as text goes back to its worker by the
+    /// host's string tree, however long it grows and whatever a turn's seed,
+    /// as a tokenized one does by the token tree
+    /// ([`a_long_conversation_goes_back_to_its_worker_by_the_token_tree`]).
+    /// The engine's entry hands the lookup its maker's text entry: the host
+    /// is asked for it once a decision, and for no token entry where it
+    /// lends no token tree. A worker its host took out of the tree holds no
+    /// prompt.
+    #[test]
+    fn a_long_conversation_of_text_goes_back_to_its_worker_by_the_string_tree() {
+        let mut document = PolicySpec::preset("cache_aware").expect("a built-in preset");
+        document.generation = 1;
+        let spec = AppliedSpec::validate(&document).expect("the document validates");
+        let (engine, tree) = lending_text(spec);
+        let list = pool(8);
+        let members = PublishedList::new(Arc::clone(&list));
+        let sent = |text: &str, seed: u64| {
+            let hashes = engine.prompt_hashes(MODEL, None, Some(text), HashSeeds::PLAIN);
+            let mut asked = request();
+            asked.facts.seed = seed;
+            hashes.write_to(&mut asked.facts);
+            let asks = Asks {
+                text: Some(text),
+                ..Asks::of(asked, Some(&members))
+            };
+            let decided = decided(&engine, &asks);
+            let entries = (asks.worded.get(), asks.keyed.get());
+            assert_eq!(entries, (1, 0), "the text entry is asked for once");
+            let pick = decided.decision.pick().expect("a pick");
+            pick.targets.first().expect("a target").position
+        };
+        // A thousand windows of text, past what a host hashes of a prompt.
+        let mut said = "a system prompt of some length. ".repeat(2_000);
+        let first = sent(&said, 0);
+        for turn in 1..32_u64 {
+            said.push_str(&format!("turn {turn:059}"));
+            assert_eq!(sent(&said, turn), first, "turn {turn}");
+        }
+        // The tree is the host's to keep. With every worker taken out of it
+        // before a request, the request's seed places it.
+        let moved = (0..32).any(|seed| {
+            for worker in list.iter() {
+                tree.remove_tenant_all(&TenantId::from(worker.url()));
+            }
+            sent(&said, seed) != first
+        });
+        assert!(moved, "a worker out of the tree holds no prompt");
+    }
+
+    /// A pin followed under a host that lends its string tree. The
+    /// hand-over of the pin's made answer asks the request's maker for its
+    /// text entry, once, and the tree then holds the whole text of a prompt
+    /// nobody was sent, for the pin's worker alone: as the token tree does
+    /// ([`a_followed_pin_is_stored_in_a_lent_tree_by_the_rules_word`]).
+    #[test]
+    fn a_followed_pin_of_text_is_stored_in_a_lent_string_tree() {
+        let (engine, tree) = lending_text(default_under_sessions(RulePlaced::Told));
+        let list = pool(8);
+        let members = PublishedList::new(Arc::clone(&list));
+        let prompt = |first: u32| format!("{first:08}").repeat(512);
+        // One request of `text` under the key `key`, sent to its first
+        // target and served there. The place it went to, its pick, and how
+        // often its host was asked for the text entry.
+        let sent = |text: &str, key: u64, seed: u64| {
+            let hashes = engine.prompt_hashes(MODEL, None, Some(text), HashSeeds::PLAIN);
+            let mut asked = request();
+            asked.facts.seed = seed;
+            asked.facts.session_key = Identity::hashed(key);
+            hashes.write_to(&mut asked.facts);
+            let asks = Asks {
+                text: Some(text),
+                ..Asks::of(asked, Some(&members))
+            };
+            let now = Instant::now();
+            let mut guard = DecisionGuard::decide_under(&engine, GatewayId::LOCAL, &asks, now)
+                .expect("a decision");
+            let pick = *guard.decision().pick().expect("a pick");
+            let target = guard.take(0).expect("the first target");
+            guard.dispatched(now);
+            guard.completed(
+                &Outcome {
+                    side: Side::Single,
+                    served: target.id,
+                    status: 200,
+                    class: TransportClass::Ok,
+                    ttft_micros: 0,
+                    tokens_in: 0,
+                    tokens_out: 0,
+                    duration_micros: 0,
+                },
+                now,
+            );
+            (target.position, pick, asks.worded.get())
+        };
+        for key in 1..=6_u32 {
+            let seed = u64::from(key);
+            let (pin, _, entry) = sent(&prompt(key * 100_000), seed, seed);
+            assert_eq!(entry, 1, "key {key}: a new key's entry");
+            // The key's pin, of a prompt nobody was sent.
+            let fresh = prompt(key * 100_000 + 50_000);
+            let (went, pick, entry) = sent(&fresh, seed, 1);
+            assert_eq!((went, pick.placed_by()), (pin, PlacedBy::Rule), "key {key}");
+            assert_eq!(entry, 1, "key {key}: the pin's entry");
+            let found = tree.match_prefix_with_counts(&fresh);
+            let at = vec![TenantId::from(list[pin as usize].url())];
+            let stored = (found.matched_char_count, found.matched_tenants);
+            assert_eq!(stored, (fresh.len(), at), "key {key}: the pin's prompt");
+        }
+    }
+
+    /// A request its host holds to places is never the keyed entry's: the
+    /// entry answers nothing for it, so a key's pin outside the places is
+    /// not followed ahead of the lookup, and the hand-over of a made answer
+    /// never sees a request held to places, which is why it hands the
+    /// naming none (`overlap::decide_behind`). The whole decision places
+    /// the request among its places, and the lent tree holds its prompt
+    /// for the worker picked there.
+    #[test]
+    fn a_pinned_key_held_to_places_is_decided_among_them() {
+        let (engine, tree) = lending(default_under_sessions(RulePlaced::Told));
+        let list = pool(8);
+        let members = PublishedList::new(Arc::clone(&list));
+        let prompt = |first: u32| (first..first + 1_024).collect::<Vec<u32>>();
+        // One request of `tokens` under the key `key`, held to `places`
+        // where its host states any, sent to its first target and served
+        // there. The place it went to.
+        let sent = |tokens: &[u32], key: u64, places: Option<&[u32]>| {
+            let hashes = engine.prompt_hashes(MODEL, Some(tokens), None, HashSeeds::PLAIN);
+            let mut asked = request();
+            asked.facts.seed = key;
+            asked.facts.session_key = Identity::hashed(key);
+            asked.constraints.places = places;
+            hashes.write_to(&mut asked.facts);
+            let asks = Asks {
+                key: Some(tokens),
+                ..Asks::of(asked, Some(&members))
+            };
+            let now = Instant::now();
+            let mut guard = DecisionGuard::decide_under(&engine, GatewayId::LOCAL, &asks, now)
+                .expect("a decision");
+            let target = guard.take(0).expect("the first target");
+            guard.dispatched(now);
+            guard.completed(
+                &Outcome {
+                    side: Side::Single,
+                    served: target.id,
+                    status: 200,
+                    class: TransportClass::Ok,
+                    ttft_micros: 0,
+                    tokens_in: 0,
+                    tokens_out: 0,
+                    duration_micros: 0,
+                },
+                now,
+            );
+            target.position
+        };
+        for key in 1..=6_u32 {
+            let pin = sent(&prompt(key * 100_000), u64::from(key), None);
+            // The key again, held to two places that leave its pin out.
+            let places: Vec<u32> = (0..8).filter(|&at| at != pin).take(2).collect();
+            let fresh = prompt(key * 100_000 + 50_000);
+            let went = sent(&fresh, u64::from(key), Some(&places));
+            assert!(places.contains(&went), "key {key}: {went} of {places:?}");
+            let found = tree.match_prefix_with_counts(&fresh);
+            let at = vec![TenantId::from(list[went as usize].url())];
+            let stored = (found.matched_token_count, found.matched_tenants);
+            assert_eq!(stored, (1_024, at), "key {key}: the prompt's worker");
         }
     }
 

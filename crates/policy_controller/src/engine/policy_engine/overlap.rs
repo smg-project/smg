@@ -23,7 +23,10 @@
 //! events: inside the tree's match ([`TokenTree`]). The match names the
 //! workers sent the deepest prefix of the request, and the same descent
 //! writes the request for the worker picked. The tree is the host's own,
-//! the one its policy reads and writes: the engine keeps none.
+//! the one its policy reads and writes: the engine keeps none. A request
+//! its host holds as text is decided the same way inside the host's string
+//! tree ([`CacheIndexes::string_tree`], [`TextKey`]), whether or not the
+//! model has an index: an index speaks of token blocks.
 //!
 //! What is kept, and what guards it:
 //!
@@ -67,6 +70,7 @@ use std::{
 use arc_swap::ArcSwapOption;
 use kv_index::{
     chain_prefix_hash, ChainIndex, ContentHash, GroupViews, SequenceHash, TenantId, TokenTree,
+    Tree as StringTree,
 };
 use parking_lot::{Mutex, RwLock, RwLockWriteGuard};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -76,7 +80,7 @@ use crate::{
     document::spec::{AppliedSpec, IndexKind},
     engine::{
         decision::{Decision, Overlap, Target},
-        decision_engine::TokenKey,
+        decision_engine::{TextKey, TokenKey},
         lease_events,
         view::{
             blocks_within, fingerprint, AffinityFacts, AffinityHolder, AffinityRows, Feed,
@@ -338,8 +342,24 @@ pub trait CacheIndexes: Send + Sync {
     /// alone where it has one. `None`, the default, where the host keeps
     /// none: the request is named its rows from the record of hashed
     /// prefixes. This question lends the one tree a tokenized request
-    /// reads. A host's other records of the prompts it sent are not lent.
+    /// reads, and [`Self::string_tree`] the one a request of text reads.
     fn token_tree(&self, model: &str, phase: Phase) -> Option<Arc<TokenTree>> {
+        let _ = (model, phase);
+        None
+    }
+
+    /// The host's own string tree of the prompts sent as text to the
+    /// workers that serve `model` at `phase`: the tree its policy reads and
+    /// writes for a request that holds no token ids, with a worker a tenant
+    /// by its address. A request hashed by its text whose host names its
+    /// entry ([`TextKey`]) is decided inside this tree's match, as a
+    /// tokenized one is inside the token tree's, and the host keeps the
+    /// tree the same way. It is asked for whatever [`Self::index`] answers:
+    /// an index of cache events speaks of token blocks, and says nothing of
+    /// a request of text. `None`, the default, where the host keeps none:
+    /// the request is named its rows from the record of hashed windows of
+    /// its text.
+    fn string_tree(&self, model: &str, phase: Phase) -> Option<Arc<StringTree>> {
         let _ = (model, phase);
         None
     }
@@ -764,6 +784,12 @@ struct Table {
     /// match. The handle is the host's own tree, kept while the table
     /// stands.
     sent: Option<Arc<TokenTree>>,
+    /// The host's string tree for the place, where it lends one and the
+    /// profile reads a record: a request hashed by its text whose host
+    /// names its entry is decided inside the tree's match, under a model
+    /// with an index of cache events too. The host's own tree, as
+    /// [`Self::sent`] is.
+    sent_text: Option<Arc<StringTree>>,
     /// The document's block size, in tokens: what a tree's match is
     /// counted by for a request its host counted with none
     /// ([`Self::blocks_of`]).
@@ -847,6 +873,7 @@ impl Table {
             record: None,
             ahead: false,
             sent: None,
+            sent_text: None,
             block: spec.block_size(),
             by_address: Box::default(),
             by_id: Box::default(),
@@ -939,11 +966,16 @@ impl Table {
             let bound = usize::try_from(bound).unwrap_or(usize::MAX);
             table.record = Some(affinity.record_of(registered, bound));
             table.ahead = ahead;
-            if table.index.is_none() && cap != 0 {
+            if cap != 0 {
                 let lent = affinity.indexes.get();
-                table.sent = lent.and_then(|indexes| indexes.token_tree(registered, phase));
+                if table.index.is_none() {
+                    table.sent = lent.and_then(|indexes| indexes.token_tree(registered, phase));
+                }
+                // A request of text reads no index: its tree is asked for
+                // beside one too.
+                table.sent_text = lent.and_then(|indexes| indexes.string_tree(registered, phase));
             }
-            if table.sent.is_some() {
+            if table.sent.is_some() || table.sent_text.is_some() {
                 let print = |worker: &Arc<dyn Worker>| fingerprint(worker.url().as_bytes());
                 let mut by_address: Vec<(u64, u32)> =
                     workers.iter().map(print).zip(0u32..).collect();
@@ -1471,7 +1503,12 @@ struct Asked<'a> {
 /// ([`CacheIndexes::token_tree`]): its profile reads a record of sent
 /// prefixes and is named rows, and the model has no index of cache events.
 /// A request it names an entry for is decided inside the tree's match.
-/// `decide` is called once either way.
+/// `text_key` names the entry of a request hashed by its text in the host's
+/// string tree ([`TextKey`]). It is called at most once, of such a request
+/// that was named no token entry, and only where the host lends the place
+/// a string tree ([`CacheIndexes::string_tree`]), whatever the model's
+/// index holds. A request it names an entry for is decided inside that
+/// tree's match. `decide` is called once either way.
 ///
 /// `sends_to` says whether the request's caller sends it to a target of the
 /// pick ([`RequestMaker::sends_to`]). A decision made inside the tree's
@@ -1496,7 +1533,7 @@ struct Asked<'a> {
 /// [`RequestMaker::sends_to`]: crate::engine::RequestMaker::sends_to
 #[expect(
     clippy::too_many_arguments,
-    reason = "the list, what is kept beside it, the request's facts, its entry in a tree and the target its caller takes, and the decision"
+    reason = "the list, what is kept beside it, the request's facts, its entry in each tree and the target its caller takes, and the decision"
 )]
 pub fn decide<'p>(
     affinity: &Affinity,
@@ -1507,6 +1544,7 @@ pub fn decide<'p>(
     facts: &mut RequestFacts<'_>,
     places: Option<&[u32]>,
     token_key: impl FnOnce(usize) -> Option<TokenKey<'p>>,
+    text_key: impl FnOnce() -> Option<TextKey<'p>>,
     sends_to: impl Fn(&Target) -> bool,
     mut decide: impl FnMut(&mut RequestFacts<'_>) -> Decision,
 ) -> Decision {
@@ -1543,7 +1581,8 @@ pub fn decide<'p>(
     };
     with_buffers(|buffers| {
         pool.with_table(&asked, |table| {
-            table.decide(workers, facts, places, buffers, token_key, sends_to, decide)
+            let keys = (token_key, text_key);
+            table.decide(workers, facts, places, buffers, keys, sends_to, decide)
         })
     })
 }
@@ -1564,6 +1603,7 @@ pub(super) fn decide_behind<'p>(
     ids: &[WorkerId],
     facts: &mut RequestFacts<'_>,
     token_key: impl FnOnce(usize) -> Option<TokenKey<'p>>,
+    text_key: impl FnOnce() -> Option<TextKey<'p>>,
     sends_to: impl Fn(&Target) -> bool,
     leaves: u64,
     made: Decision,
@@ -1580,6 +1620,7 @@ pub(super) fn decide_behind<'p>(
         // its decision hands the naming its places itself.
         None,
         token_key,
+        text_key,
         |target| affinity.leaves() == leaves && sends_to(target),
         |_| made,
     )
@@ -1673,7 +1714,7 @@ fn state(decision: &mut Decision, feed: Feed<'_>, facts: &RequestFacts<'_>, bloc
 ///
 /// The rule's word is read through that one function at five places: the
 /// words of a single's lease, the record's two writes here, the store of a
-/// prompt in a lent token tree ([`sent_address`]), the hand-over of a pin
+/// prompt in a lent tree ([`sent_address`]), the hand-over of a pin
 /// the keyed entry followed to this lookup, and a pair's two writes behind
 /// its pick, a side at a time. Under the rule's default word a request it
 /// places is the profile's own, and its prompt is kept as any pick's. Under
@@ -1784,14 +1825,36 @@ fn sent_address<'w>(
     Some(workers.get(target.position as usize)?.url())
 }
 
+/// What a tree's walk hands its match to ([`Table::decide_in_tree`]): the
+/// workers the match found and the request's blocks it holds, answered
+/// with the address the walk writes the request for, where it writes it.
+type Over<'a, 'w> = dyn FnMut(&[TenantId], u32) -> Option<&'w str> + 'a;
+
+/// The bytes of the leading `matched` chars of `text` that lie behind its
+/// first `marker` chars: what a string tree's match holds of a prompt whose
+/// key begins with a partition's marker. A string tree counts chars, and a
+/// request of text is sized in bytes. One pass over the matched chars.
+fn bytes_behind(text: &str, marker: usize, matched: usize) -> usize {
+    // The byte the first `chars` chars of the text end at.
+    let end_of = |chars: usize| {
+        let mut rest = text.chars();
+        if let Some(last) = chars.checked_sub(1) {
+            rest.nth(last);
+        }
+        text.len() - rest.as_str().len()
+    };
+    end_of(matched).saturating_sub(end_of(marker.min(matched)))
+}
+
 impl Table {
     /// One decision by this table: the naming, the decision, and the
     /// record's write behind a pick. A request whose host names its entry
-    /// in the token tree it lends is decided inside the tree's match
-    /// ([`Self::decide_in_tree`]).
+    /// in a tree it lends is decided inside that tree's match
+    /// ([`Self::decide_in_tree`]): by its token ids in the token tree, and
+    /// a request hashed by its text in the string tree.
     #[expect(
         clippy::too_many_arguments,
-        reason = "the list, the request's facts and its places, the buffers, its entry in a tree and the target its caller takes, and the decision"
+        reason = "the list, the request's facts and its places, the buffers, its entry in each tree and the target its caller takes, and the decision"
     )]
     fn decide<'p>(
         &self,
@@ -1799,7 +1862,10 @@ impl Table {
         facts: &mut RequestFacts<'_>,
         places: Option<&[u32]>,
         buffers: &mut Buffers,
-        token_key: impl FnOnce(usize) -> Option<TokenKey<'p>>,
+        (token_key, text_key): (
+            impl FnOnce(usize) -> Option<TokenKey<'p>>,
+            impl FnOnce() -> Option<TextKey<'p>>,
+        ),
         sends_to: impl Fn(&Target) -> bool,
         mut decide: impl FnMut(&mut RequestFacts<'_>) -> Decision,
     ) -> Decision {
@@ -1814,15 +1880,30 @@ impl Table {
         let sent = self.sent.as_deref();
         let keyed = sent.and_then(|sent| Some((sent, token_key(sent.page_size())?)));
         if let Some((sent, key)) = keyed {
-            return self.decide_in_tree(
-                (sent, &key),
-                sends_to,
-                workers,
-                facts,
-                places,
-                buffers,
-                decide,
-            );
+            let facts = &*facts;
+            let walk = |over: &mut Over<'_, '_>| {
+                sent.match_and_insert_with(&key.tokens, |found| {
+                    // The marker is no part of the prompt.
+                    let matched = found.matched_token_count.saturating_sub(key.marker);
+                    over(&found.matched_tenants, self.blocks_of(matched, facts))
+                });
+            };
+            return self.decide_in_tree(walk, sends_to, workers, facts, places, buffers, decide);
+        }
+        // A request hashed by its text is asked for its entry where the
+        // host lends the place a string tree, once.
+        let text = facts.hash_kind == HashKind::Text;
+        let sent = self.sent_text.as_deref().filter(|_| text);
+        if let Some((sent, key)) = sent.and_then(|sent| Some((sent, text_key()?))) {
+            let facts = &*facts;
+            let walk = |over: &mut Over<'_, '_>| {
+                sent.match_and_insert_with(&key.text, |found| {
+                    // The match counts the marker's chars too.
+                    let bytes = bytes_behind(&key.text, key.marker, found.matched_char_count);
+                    over(&found.matched_tenants, self.blocks_of_text(bytes, facts))
+                });
+            };
+            return self.decide_in_tree(walk, sends_to, workers, facts, places, buffers, decide);
         }
         let read = self.name(facts, places, buffers);
         let named = AffinityRows {
@@ -1865,25 +1946,37 @@ impl Table {
         blocks_within(count(tokens), facts.hash_kind, block)
     }
 
-    /// One decision of a request inside the match of the host's token tree
-    /// for its place, by the tree and the request's entry in it. The match
-    /// names the workers sent the deepest prefix of the request, the
-    /// decision is made over them, and the same descent writes the
-    /// request's whole pages for the worker the request goes to: the first
-    /// target of the pick its caller sends to (`sends_to`). A decision that
-    /// picks nobody, or none of whose targets its caller sends to, stores
-    /// nothing: the match has marked the path it walked as used, as every
-    /// match of the tree does. The record of hashed prefixes is neither
-    /// read nor written.
+    /// How many of the request's blocks a string tree's match of `bytes`
+    /// bytes of its text holds. A request hashed by its text is sized in
+    /// bytes, and its blocks are windows of the size its host counted it
+    /// with: the divisor the stages count such a request's blocks by
+    /// ([`RequestFacts::blocks`]).
+    fn blocks_of_text(&self, bytes: usize, facts: &RequestFacts<'_>) -> u32 {
+        count(bytes) / facts.block_size_or(self.block).max(1)
+    }
+
+    /// One decision of a request inside the match of a tree its host lends
+    /// for its place: the token tree, or the string tree for a request of
+    /// text. `walk` runs the tree's match by the request's entry in it and
+    /// hands [`Over`] what the match found: the workers sent the deepest
+    /// prefix of the request, and how many of the request's blocks that
+    /// prefix holds. The decision is made over them, and the same descent
+    /// writes the request for the worker it goes to, whose address `Over`
+    /// answers: the first target of the pick its caller sends to
+    /// (`sends_to`). A token tree stores the request's whole pages. A
+    /// decision that picks nobody, or none of whose targets its caller
+    /// sends to, stores nothing: the match has marked the path it walked as
+    /// used, as every match of a tree does. The record of hashed prefixes
+    /// is neither read nor written.
     #[expect(
         clippy::too_many_arguments,
-        reason = "the tree and the entry, the target the caller takes, the list, the request's facts and its places, the buffers, and the decision"
+        reason = "the tree's walk, the target the caller takes, the list, the request's facts and its places, the buffers, and the decision"
     )]
-    fn decide_in_tree(
+    fn decide_in_tree<'w>(
         &self,
-        (sent, key): (&TokenTree, &TokenKey<'_>),
+        walk: impl FnOnce(&mut Over<'_, 'w>),
         sends_to: impl Fn(&Target) -> bool,
-        workers: &[Arc<dyn Worker>],
+        workers: &'w [Arc<dyn Worker>],
         facts: &RequestFacts<'_>,
         places: Option<&[u32]>,
         buffers: &mut Buffers,
@@ -1902,10 +1995,8 @@ impl Table {
             })
         };
         let mut decided = None;
-        sent.match_and_insert_with(&key.tokens, |found| {
-            // The marker is no part of the prompt.
-            let matched = found.matched_token_count.saturating_sub(key.marker);
-            let decision = decide_over(&found.matched_tenants, self.blocks_of(matched, facts));
+        walk(&mut |holders, blocks| {
+            let decision = decide_over(holders, blocks);
             let to = sent_address(workers, &decision, &sends_to);
             decided = Some(decision);
             to
