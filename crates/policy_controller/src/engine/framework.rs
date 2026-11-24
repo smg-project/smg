@@ -7036,10 +7036,10 @@ impl Engine {
             // first claim when its worker is among this decision's survivors.
             if let Some(first) = pick.targets.first().map(|t| t.id) {
                 // A kept key the lifted pass put back on one of its pins is
-                // no claim: the pin stands as it was read. A claim would
-                // mark it provisional, and an alternate's dispatch would
-                // withdraw it. The plain form never names a pin here, and
-                // carries no test for one.
+                // no claim: the pin stands as it was read. The table
+                // answers the same for a pin its decision read: this test
+                // spares its lock, and a shadow reads no table. The plain
+                // form never names a pin here, and carries no test for one.
                 if KEPT && pins.contains(&first) {
                     pick.session_verdict = SessionVerdict::Pinned;
                     // A dispatch on an alternate writes that worker among
