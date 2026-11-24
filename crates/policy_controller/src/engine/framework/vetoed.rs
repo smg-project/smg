@@ -4493,6 +4493,54 @@ mod tests {
         );
     }
 
+    /// A key handed on from another request's claim at the rule's cap moves
+    /// its pin where it is decided, in either form, as a respill from a pin
+    /// read first does: the worker taken leads the key's pins ahead of its
+    /// dispatch, and the claimed worker stands behind it.
+    #[test]
+    fn a_key_handed_on_from_a_followed_claim_fronts_its_worker_where_it_is_decided() {
+        let rule = SessionRule {
+            assignment: Assignment::Delegate,
+            inflight_cap: 2,
+            ttl_micros: None,
+            sweep_micros: 0,
+            recovery: Recovery::Original,
+            rule_placed: RulePlaced::Told,
+        };
+        let (ringed, _) = ring_with_a_gap(None);
+        let pool = [free(0, 4), free(1, 4), free(2, 4), free(3, 4)];
+        let ring = ring_order(&ringed, &keyed("k1"), &pool);
+        let (taken, claimed) = (ring[0] as usize, ring[1] as usize);
+        let forms = [
+            ("kept", ring_with_a_gap(Some(rule))),
+            ("plain", plain_ring_with_a_gap(rule)),
+        ];
+        for (form, (engine, gap)) in forms {
+            // The other decision sees the ring's first worker down and
+            // claims the ring's second. This one sees the claimed worker
+            // with the cap's two requests of the key.
+            let mut pool = [free(0, 4), free(1, 4), free(2, 4), free(3, 4)];
+            let mut theirs = pool.to_vec();
+            theirs[taken].health.healthy = false;
+            *gap.staged.lock().expect("the staged pool") = theirs;
+            pool[claimed].session_in_flight = 2;
+            let request = keyed("k1");
+            let decision = decide(&engine, &request, &pool);
+            assert!(
+                gap.staged.lock().expect("the staged pool").is_empty(),
+                "{form}: the other decision ran"
+            );
+            let pick = decision.pick().expect("a pick");
+            assert_eq!(pick.session_verdict, SessionVerdict::Respill, "{form}");
+            assert_eq!(order(&decision)[0], ring[0], "{form}");
+            assert_eq!(
+                engine.sessions().pins(request.session()),
+                Some([pool[taken].id, pool[claimed].id]),
+                "{form}: ahead of its dispatch"
+            );
+        }
+    }
+
     /// A key handed on at the cap reads the veto as it stands: from a pin
     /// over its thresholds it passes the ring's next worker where that
     /// worker is over its thresholds beside free ones. Where the free
@@ -4536,6 +4584,45 @@ mod tests {
         let over = decide(&engine, &request, &pool);
         assert_eq!(order(&over)[0], ring[2], "the pin over its thresholds");
         assert_eq!(over.trace().lifted, LiftedVeto::None);
+    }
+
+    /// A kept key handed on from the pin its lifted pass landed on moves
+    /// that pin where it is decided, as a respill from a pin read first
+    /// does: the worker taken leads the key's pins ahead of its dispatch,
+    /// and the key's next request, decided ahead of that dispatch, follows
+    /// it there as a pin.
+    #[test]
+    fn a_kept_key_handed_on_at_the_cap_fronts_its_worker_where_it_is_decided() {
+        let engine = ring_under_a_cap(2);
+        let mut pool = [free(0, 4), free(1, 4), free(2, 4), free(3, 4)];
+        let ring = ring_order(&engine_of("consistent_hashing", false), &keyed("k1"), &pool);
+        let (owner, next) = (ring[0] as usize, ring[1] as usize);
+        assert_eq!(dispatched(&engine, &pool, 1_000), ring[0], "the pin");
+        let request = RequestFacts {
+            now_micros: 2_000,
+            ..keyed("k1")
+        };
+        let pins = || engine.sessions().pins(request.session());
+        assert_eq!(pins(), Some([pool[owner].id, WorkerId(0)]), "the pin read");
+        // The pin carries the cap's two requests of the key, over its
+        // thresholds: the veto as it stands drops it, the lifted pass lands
+        // on it, and the ring's next worker takes the key.
+        pool[owner].session_in_flight = 2;
+        pool[owner].health.overloaded = true;
+        let handed = decide(&engine, &request, &pool);
+        assert_eq!(order(&handed)[0], ring[1]);
+        let pick = handed.pick().expect("a pick");
+        assert_eq!(pick.session_verdict, SessionVerdict::Respill);
+        assert_eq!(
+            pins(),
+            Some([pool[next].id, pool[owner].id]),
+            "ahead of its dispatch"
+        );
+        // The key's next request, decided ahead of that dispatch.
+        let later = decide(&engine, &request, &pool);
+        assert_eq!(order(&later)[0], ring[1]);
+        let pick = later.pick().expect("a pick");
+        assert_eq!(pick.session_verdict, SessionVerdict::Pinned);
     }
 
     /// What a filter that turns was asked, and whether it turned.
