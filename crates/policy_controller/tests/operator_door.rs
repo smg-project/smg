@@ -83,7 +83,12 @@ fn a_host_applies_its_start_document_and_serves_a_read_only_source() {
         models: vec!["served".to_owned()],
         limit: 1,
     };
-    let (rows, serving) = store.rows_serving(&asked.models, asked.limit);
+    // A lone read's answer: the first rows by key that serve the model, as
+    // many as the limit, with the count that serve it.
+    let mut rows = store.checkpoint().rows;
+    rows.retain(|row| row.facts.models == asked.models);
+    let serving = rows.len();
+    rows.truncate(asked.limit);
     let page = worker_rows_page(&asked, Rows::Told(rows, serving), Instant::now());
     let [row] = page.rows.as_slice() else {
         panic!("one row fits the limit");

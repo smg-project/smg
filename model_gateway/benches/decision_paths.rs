@@ -82,6 +82,19 @@
 //! requests of a gateway that serves many models do, so no two requests in
 //! a row are for one model.
 //!
+//! `--end FORM` runs the cell on a route that tells the policy engine the
+//! request's end, and names what that route does behind the making of its
+//! load guard. Without it the route drops its guard at once and reports no
+//! outcome. `streamed` is a streamed answer: the route asks the guard a
+//! handle on the request's end, and the stream's reader reports the outcome
+//! through it while the guard stands. It is counted against `passed`, which
+//! shows the guard to an opaque reader and reports nothing. `answer` is an
+//! answer read whole: the route reports through the answer it keeps past
+//! its guard. It is counted against `kept`, which keeps that answer and
+//! reports nothing. A pair route tells no end yet: under `streamed` its
+//! decode's reader tests the empty handle it is handed, and a pair cell
+//! takes neither `kept` nor `answer`.
+//!
 //! No Criterion harness: a cell runs a fixed count of decisions, so the same
 //! binary counts instructions under callgrind (two counts, one difference).
 //!
@@ -123,8 +136,8 @@ use smg::{
     routers::{
         common::{
             bench_support::{
-                attach_loads, route_classic, route_pair, set_pair_sides, thread_allocated_bytes,
-                Route,
+                attach_loads, route_classic, route_classic_ended, route_pair, route_pair_ended,
+                set_pair_sides, thread_allocated_bytes, Ended, Route,
             },
             snapshot::WorkerRegistry,
         },
@@ -187,6 +200,9 @@ struct Cell {
     /// The tokens a request adds to its caller's conversation; `0` for the
     /// prompts in turn.
     grow: usize,
+    /// What a route that tells the request's end does with it; `None` for
+    /// the route that drops its guard at once.
+    end: Option<Ended>,
 }
 
 fn cell() -> Cell {
@@ -207,6 +223,7 @@ fn cell() -> Cell {
         prompts: 1,
         publish_ms: 0,
         grow: 0,
+        end: None,
     };
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
@@ -240,6 +257,15 @@ fn cell() -> Cell {
             "--prompts" => cell.prompts = value.parse().unwrap(),
             "--publish-ms" => cell.publish_ms = value.parse().unwrap(),
             "--grow" => cell.grow = value.parse().unwrap(),
+            "--end" => {
+                cell.end = Some(match value.as_str() {
+                    "passed" => Ended::Passed,
+                    "streamed" => Ended::Streamed,
+                    "kept" => Ended::Kept,
+                    "answer" => Ended::Answer,
+                    other => panic!("no end {other}"),
+                });
+            }
             other => panic!("no flag {other}"),
         }
     }
@@ -606,28 +632,57 @@ fn build(cell: &Cell) -> Built {
         }
         runtime
     });
-    let (route, pair) = (cell.route, cell.pair);
+    let (route, pair, end) = (cell.route, cell.pair, cell.end);
     assert!(
         !(pair && cell.keys != 0),
         "a pair cell sends no routing key"
+    );
+    assert!(
+        !(pair && matches!(end, Some(Ended::Kept | Ended::Answer))),
+        "a pair cell reports through no answer"
     );
     assert!(
         !(cell.grow > 0 && cell.models > 1),
         "a growing conversation is one model's"
     );
     let keys = keyed_headers(cell.keys);
-    let routing: Routing = Box::new(move |tokens, turn| {
-        let model = &models[(turn % models.len() as u64) as usize];
-        let headers = match keys.len() {
-            0 => None,
-            count => keys.get((turn % count as u64) as usize),
-        };
-        if pair {
-            route_pair(&registry, &policies, model, Some(tokens))
-        } else {
-            route_classic(&registry, &policies, model, route, Some(tokens), headers)
-        }
-    });
+    let routing: Routing = match end {
+        None => Box::new(move |tokens, turn| {
+            let model = &models[(turn % models.len() as u64) as usize];
+            let headers = match keys.len() {
+                0 => None,
+                count => keys.get((turn % count as u64) as usize),
+            };
+            if pair {
+                route_pair(&registry, &policies, model, Some(tokens))
+            } else {
+                route_classic(&registry, &policies, model, route, Some(tokens), headers)
+            }
+        }),
+        // The same routing on a route that tells the request's end, as a
+        // closure of its own: a cell without `--end` runs the code it ran
+        // before this flag, instruction for instruction.
+        Some(end) => Box::new(move |tokens, turn| {
+            let model = &models[(turn % models.len() as u64) as usize];
+            let headers = match keys.len() {
+                0 => None,
+                count => keys.get((turn % count as u64) as usize),
+            };
+            if pair {
+                route_pair_ended(&registry, &policies, model, Some(tokens), end)
+            } else {
+                route_classic_ended(
+                    &registry,
+                    &policies,
+                    model,
+                    route,
+                    Some(tokens),
+                    headers,
+                    end,
+                )
+            }
+        }),
+    };
     Built {
         routing,
         feed,
@@ -767,7 +822,7 @@ fn main() {
         returned as f64 / turns as f64
     };
     println!(
-        "path={} route={:?} policy={} workers={} callers={} reports={} not_ready={} ready={} overloaded={} models={} pair={} keys={} prompts={} grow={} turns={} returned={} return_rate={:.4} publish_ms={} publications={} alloc_bytes_per_decision={:.2} decisions={} wall_s={:.3} decisions_per_s={:.0} ns_per_decision={:.1}",
+        "path={} route={:?} policy={} workers={} callers={} reports={} not_ready={} ready={} overloaded={} models={} pair={} end={} keys={} prompts={} grow={} turns={} returned={} return_rate={:.4} publish_ms={} publications={} alloc_bytes_per_decision={:.2} decisions={} wall_s={:.3} decisions_per_s={:.0} ns_per_decision={:.1}",
         cell.path,
         cell.route,
         cell.policy,
@@ -779,6 +834,9 @@ fn main() {
         cell.overloaded,
         cell.models,
         cell.pair,
+        cell
+            .end
+            .map_or_else(|| "dropped".to_owned(), |end| format!("{end:?}").to_lowercase()),
         cell.keys,
         cell.prompts,
         cell.grow,

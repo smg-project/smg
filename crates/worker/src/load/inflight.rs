@@ -130,7 +130,8 @@ impl fmt::Debug for WorkerRoutingKeyLoad {
 /// when the body is dropped: at the stream's end or the client's disconnect.
 ///
 /// A guard can keep one value of its maker's to the request's end
-/// ([`WorkerLoadGuard::keeping`]). The guard never reads it: it lets it go
+/// ([`WorkerLoadGuard::keeping`]). The guard never reads it: it hands it
+/// back to its maker's question ([`WorkerLoadGuard::kept`]) and lets it go
 /// where the guard is dropped, behind the worker's load.
 pub struct WorkerLoadGuard {
     worker: Arc<dyn Worker>,
@@ -234,6 +235,15 @@ impl WorkerLoadGuard {
     pub fn keeping(mut self, kept: Box<dyn Any + Send + Sync>) -> Self {
         self.kept = Some(kept);
         self
+    }
+
+    /// What the guard keeps for its maker ([`Self::keeping`]), for that
+    /// maker to find again while the guard stands. The guard still reads
+    /// nothing of it. `None` for a guard that keeps nothing.
+    #[inline]
+    #[must_use]
+    pub fn kept(&self) -> Option<&(dyn Any + Send + Sync)> {
+        self.kept.as_deref()
     }
 
     /// Whether this guard counts `worker`'s load: the same worker object.

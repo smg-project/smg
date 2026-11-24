@@ -36,8 +36,8 @@
 //! leaves nobody sheds the pair with no endpoint, under the stage of the
 //! demand that took that side's last worker, the prefills' first. The
 //! decode asked again judges its decodes alone. An encode request's three
-//! lists are held to no demand: such a request is shed under the wires'
-//! name.
+//! lists are held a list at a time too, its pair's two by this rule
+//! ([`PairLists::sides_meeting`], [`super::encode`]).
 //!
 //! **The words.** A side is told its issue once: with the prefill's
 //! ([`issue_caught`]), or, where its decode is sent later, at the decode
@@ -296,6 +296,40 @@ impl<'a> PairLists<'a> {
         ]
     }
 
+    /// [`Self::sides_of`] for a request that states a hard demand: each
+    /// side held to the places of its list whose worker meets `demands` as
+    /// that side's role is held to it, among the places its host states
+    /// ([`Beside::meeting`]). `kept` takes the places, the prefills' first.
+    /// `Err` names the demand that left a side nobody, the prefills'
+    /// first. An encode request's decision judges its pair's two lists
+    /// here, so a side is held one way under a pair's decision and under
+    /// its.
+    pub(super) fn sides_meeting<'s>(
+        &self,
+        cx: &Constraints<'s>,
+        demands: Demands,
+        (prefill, decode): (&PoolRecords, &PoolRecords),
+        [prefill_kept, decode_kept]: [&'s mut Vec<u32>; 2],
+    ) -> Result<[Constraints<'s>; 2], UnmetDemand>
+    where
+        'a: 's,
+    {
+        let side = |places, stalled, held| Beside {
+            places,
+            stalled,
+            held,
+            unmet: None,
+        };
+        let prefills = side(self.prefill_places, self.prefill_stalled, self.prefill_held);
+        let prefills = prefills.meeting(prefill, demands.held_by(Role::Prefill), prefill_kept);
+        let decodes = side(self.decode_places, self.decode_stalled, self.decode_held);
+        let decodes = decodes.meeting(decode, demands.held_by(Role::Decode), decode_kept);
+        match prefills.unmet.or(decodes.unmet) {
+            Some(unmet) => Err(unmet),
+            None => Ok([prefills.of(cx), decodes.of(cx)]),
+        }
+    }
+
     /// One decision for a pair at `now`, over records written for it from
     /// both lists' worker objects and from `loads`, the host's snapshot of
     /// its workers' reports, with each record's pair class and its side's
@@ -365,35 +399,18 @@ impl<'a> PairLists<'a> {
         request: &mut Request<'_>,
         held: Option<&Target>,
     ) -> Decision {
-        self.decide_sides(engine, sides, loads, now, request, held, true, |_| true)
+        self.decide_sides(engine, sides, loads, now, request, held, |_| true)
     }
 
-    /// A pair's first decision with a hard demand its request states left
-    /// to the records' decision, which sheds it ([`not_decided`]): what an
-    /// encode request's entry asks for a request its three lists do not
-    /// decide. Those lists are held to no demand.
-    pub(super) fn decide_unjudged(
-        &self,
-        engine: Loaded<'_, '_>,
-        sides: (&PoolMembers, &PoolMembers),
-        loads: Option<&Arc<LoadSnapshot>>,
-        now: Instant,
-        request: &mut Request<'_>,
-    ) -> Decision {
-        self.decide_sides(engine, sides, loads, now, request, None, false, |_| true)
-    }
-
-    /// [`Self::decide_over`], and whether a hard demand the request states
-    /// is `judged` over the two lists: each side is then held to the
-    /// places whose worker meets it, and the records' decision is handed
-    /// none. `sends_to` says whether the request's caller sends it to a
-    /// target of the pick ([`RequestMaker::sends_to`]): each side's record
-    /// of sent prefixes is written for the first target it takes.
+    /// [`Self::decide_over`], and where the request's caller sends it:
+    /// `sends_to` says whether it sends to a target of the pick
+    /// ([`RequestMaker::sends_to`]), and each side's record of sent
+    /// prefixes is written for the first target it takes.
     ///
     /// [`RequestMaker::sends_to`]: crate::engine::RequestMaker::sends_to
     #[expect(
         clippy::too_many_arguments,
-        reason = "a pair's decision over its two lists, and how it reads a demand"
+        reason = "a pair's decision over its two lists, and where its caller sends it"
     )]
     fn decide_sides(
         &self,
@@ -403,7 +420,6 @@ impl<'a> PairLists<'a> {
         now: Instant,
         request: &mut Request<'_>,
         held: Option<&Target>,
-        judged: bool,
         sends_to: impl Fn(&Target) -> bool,
     ) -> Decision {
         let (spec, clock) = (&engine.document.spec, &engine.clock);
@@ -485,8 +501,9 @@ impl<'a> PairLists<'a> {
             // decision is handed the places and no demand. The decode
             // asked again judges no prefill: the held one ran already.
             let spent;
-            let (cx, prefill_side, decode_side) = if judged && !cx.demands.is_none() {
-                let [prefill_kept, decode_kept] = &mut buffers.meeting;
+            let demanded = !cx.demands.is_none();
+            let (cx, prefill_side, decode_side) = if demanded {
+                let [prefill_kept, decode_kept, _] = &mut buffers.meeting;
                 let demands = cx.demands;
                 let prefill_side = match held {
                     None => {
@@ -712,8 +729,9 @@ fn held_prefill<'a, 'f>(
 /// prefills' first, and the engine's scratch. An encode request's decision
 /// keeps its encoders' records here too ([`super::encode`]): a pair's
 /// leaves them as they were. A pair that states a hard demand keeps each
-/// side's places that meet it here, the prefills' first: such a request
-/// allocates nothing once each list has grown to its side.
+/// side's places that meet it here, the prefills' first, and an encode
+/// request its encoders' in the third list: such a request allocates
+/// nothing once each list has grown to its side.
 /// A side whose phase reads who holds the prompt keeps its list's column
 /// here, the prefills' first.
 #[derive(Debug, Default)]
@@ -721,7 +739,7 @@ pub(super) struct Buffers {
     pub(super) rows: [Vec<Candidate>; 2],
     pub(super) encoders: Vec<Candidate>,
     pub(super) scratch: Scratch,
-    meeting: [Vec<u32>; 2],
+    pub(super) meeting: [Vec<u32>; 3],
     pub(super) columns: [Vec<AffinityFacts>; 2],
 }
 
@@ -760,8 +778,8 @@ pub(super) fn stamp(
 /// not narrowed by, and the stage it is shed under: a subset hint, a hard
 /// demand, or places of its list. A pair's records keep no demand fact. A
 /// pair's own decision judges a demand ahead of them, a side at a time
-/// ([`PairLists::decide`]), and hands them none. A demand that reaches
-/// them is an encode request's, whose three lists are held to none: it is
+/// ([`PairLists::decide`]), and hands them none, and so does an encode
+/// request's. A demand that reaches them was judged by no decision: it is
 /// shed, and the request is never placed past its demand. A hint of some
 /// records is declined: no stage here takes a part of a list. So are
 /// places the request states itself ([`single::PLACES`]): one set cannot
@@ -1028,23 +1046,24 @@ fn decode_side(facts: &RequestFacts<'_>, decision: &Decision, prefill: &Lease) -
     })
 }
 
-/// [`issue_decode`] for the decode call of `own`, dated at the call, under
-/// a catch of its own ([`PolicyEngine::word_caught`]). A stage that panics
-/// at the side's issue is held and counted, as at a later word of the
-/// lease, and the stages behind it do not hear the issue. The pick stands:
-/// the call answers the side's lease all the same, so its guard holds the
-/// side as issued and tells its dispatch and its end. A stage that heard
-/// the issue then hears the side end.
+/// [`issue_decode`] for the decode call of `own`, told to `engine`'s
+/// stages and dated at the call, under a catch of its own
+/// ([`PolicyEngine::word_caught`]). A stage that panics at the side's
+/// issue is held and counted, as at a later word of the lease, and the
+/// stages behind it do not hear the issue. The pick stands: the call
+/// answers the side's lease all the same, so its guard holds the side as
+/// issued and tells its dispatch and its end. A stage that heard the issue
+/// then hears the side end.
 ///
 /// A panic in the decision itself is not held here: it costs the call its
 /// decision, as a first decision's does.
 fn issue_decode_caught(
     own: Loaded<'_, '_>,
+    engine: &Engine,
     facts: &RequestFacts<'_>,
     decision: &Decision,
     prefill: &Lease,
 ) -> Option<Lease> {
-    let engine = own.document.spec.engine();
     let told = own.word_caught(|| issue_decode(engine, facts, decision, prefill, facts.now_micros));
     told.unwrap_or_else(|| decode_side(facts, decision, prefill))
 }
@@ -1086,7 +1105,7 @@ pub(super) fn decide(
     if !wires.is_empty() && !wires.contains(dialed) {
         return single::declined(own, request, WIRES);
     }
-    lists.decide_sides(own, sides, loads, now, request, target, true, sends_to)
+    lists.decide_sides(own, sides, loads, now, request, target, sends_to)
 }
 
 /// One decision of a pair by `own`, the engine of a gateway's own process,
@@ -1121,9 +1140,10 @@ pub(super) fn decided(
 /// call ([`issue_decode_caught`]). Either issue is told under a catch of
 /// its own: a stage that panics at it costs the call nothing. A lease's
 /// dispatch is due as a single's. A decision that picks no pair issues
-/// nothing. Behind a held lease of another document than the one that
-/// decides, the side is leased and no stage hears its issue: no later
-/// word of that lease reaches a stage ([`PolicyEngine::apply`]).
+/// nothing. Behind a held lease of an earlier document than the one that
+/// decides, the side's issue is told as each later word of that lease
+/// is: to the stages that stood under that document, and to no stage built
+/// since ([`PolicyEngine::apply`]).
 // In line at its two callers: as a call it costs a pair's decision 33
 // instructions, counted with Callgrind.
 #[inline(always)]
@@ -1141,11 +1161,19 @@ pub(super) fn issued(
             let id = LeaseId(own.leases.0.fetch_add(1, Ordering::Relaxed) + 1);
             issue_caught(own, facts, &decision, id, later)
         }),
-        Some(held) if held.lease.generation != own.document.spec.generation() => {
-            decode_side(facts, &decision, held.lease).map(|decode| (decode, decode.session))
+        Some(held) => {
+            // Behind a held lease of an earlier document the side's issue
+            // is told as its later words are: to the stages that stood
+            // under that document.
+            let document = own.document;
+            let hearing = if held.lease.generation == document.spec.generation() {
+                document.spec.engine()
+            } else {
+                document.stood_at(held.lease.generation)
+            };
+            issue_decode_caught(own, hearing, facts, &decision, held.lease)
+                .map(|decode| (decode, decode.session))
         }
-        Some(held) => issue_decode_caught(own, facts, &decision, held.lease)
-            .map(|decode| (decode, decode.session)),
     };
     DecideOutcome {
         decision,
@@ -1320,6 +1348,28 @@ mod tests {
         let digest = document.digest().expect("a digest");
         let spec = AppliedSpec::validate_digested(&document, digest, &catalog, &[]);
         (spec.expect("a valid document"), heard)
+    }
+
+    /// [`hearing`]'s document and the same text under the next generation,
+    /// both validated over one catalog: an engine keeps the stages of the
+    /// first under the second.
+    fn hearing_and_its_next() -> ([AppliedSpec; 2], Arc<Mutex<Vec<Word>>>) {
+        let heard = Arc::new(Mutex::new(Vec::new()));
+        let kept = Arc::clone(&heard);
+        let mut catalog = StageRegistry::builtin();
+        catalog
+            .picker("hears", move || Box::new(Hears(Arc::clone(&kept))))
+            .expect("a free picker name");
+        let under = |number: u64| {
+            let mut document =
+                PolicySpec::pair_presets("round_robin", "round_robin").expect("the pair presets");
+            document.generation = number;
+            let decode = document.profiles.get_mut("decode");
+            decode.expect("the decode profile").pick = "hears".into();
+            let spec = AppliedSpec::validate_in(&document, &catalog, &[]);
+            spec.expect("a valid document")
+        };
+        ([under(3), under(4)], heard)
     }
 
     /// The host's admission as two tests of a place: the prefills', then
@@ -3072,7 +3122,7 @@ mod tests {
     /// One word of a held pair told to the stages, the clock reading 9,900
     /// and every worker still listed.
     fn tell(engine: &Engine, held: &HeldDecision<'_>, word: Said) {
-        lease_events::pair(engine, held, word, |_| 9_900);
+        lease_events::pair(engine, engine, held, word, |_| 9_900);
     }
 
     /// Each word of a pair, both sides issued with the prefill, the host
@@ -4702,6 +4752,115 @@ mod tests {
         assert_eq!(decided_under, 4, "the document in force decides");
         assert!(host.words().is_empty(), "the first document hears nothing");
         assert!(later.lock().is_empty(), "no stage is told the issue");
+    }
+
+    /// A pair's decode asked again behind a later document that kept the
+    /// first one's stages tells them the side's issue: they heard the
+    /// pair's lease issued, and they hear the side's dispatch. A stage
+    /// hears a lease's issue where it hears that lease's later words, and
+    /// nowhere else.
+    #[test]
+    fn a_decode_asked_again_behind_a_document_that_kept_its_stages_tells_them_its_issue() {
+        let ([first, next], heard) = hearing_and_its_next();
+        let host = Host::under((first, heard), 1, 1);
+        let classes = every(1, 1);
+        let asks = host.asks(&classes, true);
+        let first = leased(&host, &asks, Instant::now());
+        let target = first_target(&first.decision);
+        let lease = first.lease.expect("the prefill lease").lease;
+        let held = HeldDecision {
+            decision: &first.decision,
+            lease: &lease,
+            index: 0,
+            target: &target,
+            decode: HeldDecode {
+                session: first.decode_session,
+                tokens: lease.tokens,
+                chars: lease.chars,
+                bytes: lease.bytes,
+                chosen: false,
+            },
+        };
+        host.words();
+        let applied = host.engine.apply(next);
+        applied.expect("a number above the standing one");
+
+        let local = Default::default();
+        let now = Instant::now();
+        let again = host.engine.decide_decode_under(local, &asks, &held, now);
+        let again = again.expect("a decode decision");
+        let side = again.lease.expect("the side's lease").lease;
+        assert_eq!((side.side, side.generation), (Side::Decode, 3));
+        let decided_under = again.decision.trace().generation;
+        assert_eq!(decided_under, 4, "the document in force decides");
+        host.engine
+            .say(local, &held, dispatched(Side::Decode, 0), now);
+        let told: Vec<_> = host.words().iter().map(|word| (word.0, word.1)).collect();
+        let both = [("issued", Side::Decode), ("dispatched", Side::Decode)];
+        assert_eq!(told, both, "the stages kept hear the side whole");
+    }
+
+    /// A pair's dispatch said behind a later document, for a pair the
+    /// document before placed, is counted by the counts of sends in force.
+    /// The later document built its counts new: a send is a fact of its
+    /// worker, whatever document decided it.
+    #[test]
+    fn a_pairs_older_send_is_counted_by_the_counts_in_force() {
+        // The stock pair document whose sides count their sends. Under a
+        // later number its filters stand in another order: built new.
+        let counting = |number: u64| {
+            let document = PolicySpec::pair_presets("least_load", "least_load");
+            let mut document = document.expect("the pair presets");
+            document.generation = number;
+            if number > 3 {
+                for profile in document.profiles.values_mut() {
+                    profile.filter.reverse();
+                }
+            }
+            AppliedSpec::validate(&document).expect("a valid document")
+        };
+        let host = Host::under((counting(3), Arc::default()), 1, 1);
+        let classes = every(1, 1);
+        let asks = host.asks(&classes, false);
+        let now = Instant::now();
+        let first = leased(&host, &asks, now);
+        let target = first_target(&first.decision);
+        let lease = first.lease.expect("the prefill lease").lease;
+        let held = HeldDecision {
+            decision: &first.decision,
+            lease: &lease,
+            index: 0,
+            target: &target,
+            decode: HeldDecode {
+                session: first.decode_session,
+                tokens: lease.tokens,
+                chars: lease.chars,
+                bytes: lease.bytes,
+                chosen: false,
+            },
+        };
+        let applied = host.engine.apply(counting(4));
+        applied.expect("a number above the standing one");
+
+        // The prefill's sends, as each count in force reads them.
+        let counted = || -> Vec<u32> {
+            let row = Candidate {
+                id: target.id,
+                dp_rank: target.dp_rank,
+                ..Default::default()
+            };
+            let facts = RequestFacts::default();
+            let counts = &host.engine.standing_spec().engine().sent_credits;
+            let counts = counts.iter();
+            counts
+                .map(|count| count.read(&facts, &row).requests)
+                .collect()
+        };
+        assert_eq!(counted(), [0], "not said yet");
+        let local = Default::default();
+        host.engine
+            .say(local, &held, dispatched(Side::Prefill, 0), now);
+        assert_eq!(counted(), [1], "the count built new takes it");
     }
 
     /// A caller held to the decodes it reaches (`decode_places`) is paired

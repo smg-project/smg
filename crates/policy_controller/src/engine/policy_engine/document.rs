@@ -25,7 +25,10 @@ use arc_swap::Guard;
 use super::{labels, next_applied, PolicyEngine};
 use crate::{
     document::spec::AppliedSpec,
-    engine::{framework::SHADOWS, shadow::ShadowCounts},
+    engine::{
+        framework::{Engine, SHADOWS},
+        shadow::ShadowCounts,
+    },
     stages::Lifecycle,
     store::StaleGeneration,
     tracking::lease::{EventKind, EventSet, Membership},
@@ -44,6 +47,15 @@ pub(in crate::engine) struct InForce {
     /// process has ([`PolicyEngine::applied`]). A list's value is made
     /// under it and read under it alone ([`Loaded::members_of`]).
     pub(in crate::engine) applied: u64,
+    /// What an older request's word is told to ([`Self::stood_at`]): for
+    /// each generation below the document's own under which a profile it
+    /// kept was built, in their order, the profiles and counts of sends
+    /// that stood by then ([`Engine::hearing`]). Empty where every profile
+    /// was built new.
+    older: Box<[(u64, Engine)]>,
+    /// No stage and no count, over the engine's session table: what hears
+    /// a word older than every stage the document kept.
+    table: Engine,
     /// The kinds of event the document takes ([`Lifecycle::hears`]), read
     /// once, here. A document that takes no word on a lease
     /// ([`EventSet::LEASE`]) costs a request no lease, no id and no word,
@@ -86,7 +98,11 @@ impl InForce {
         let hears = spec.engine().hears();
         let needs = spec.needs();
         let any_shadow = spec.engine().seat_flags() & SHADOWS != 0;
+        let engine = spec.engine();
+        let kept = |since| (since, engine.hearing(|made| made <= since));
         Self {
+            older: engine.kept_since().into_iter().map(kept).collect(),
+            table: engine.hearing(|_| false),
             hears,
             labels: labels::of(&spec),
             signals: needs.signal_cells,
@@ -96,6 +112,18 @@ impl InForce {
             applied: next_applied(),
             shadow_counts: OnceLock::new(),
         }
+    }
+
+    /// What hears a word of a lease issued under `generation`, an earlier
+    /// one than the document's: the stages the document kept that stood
+    /// under that generation, and the session table. A stage built since
+    /// hears none of it: it never heard that lease's issue. The lease's
+    /// dispatch is counted apart, by every count of sends in force
+    /// ([`lease_events::of_host`](crate::engine::lease_events::of_host)).
+    pub(super) fn stood_at(&self, generation: u64) -> &Engine {
+        let stood = |kept: &&(u64, Engine)| kept.0 <= generation;
+        let kept = self.older.iter().rev().find(stood);
+        kept.map_or(&self.table, |kept| &kept.1)
     }
 }
 
@@ -174,16 +202,33 @@ impl PolicyEngine {
     ///
     /// What stands across the call: the engine's clock, its session table
     /// and its record of sent prompts. The table takes the new document's
-    /// two times. A count of sends takes over a standing count: which one
-    /// is the count's own rule
-    /// ([`Engine::succeed`](crate::engine::Engine::succeed)). Every
-    /// other stage of the new document starts empty, a registered one too.
+    /// two times. The stages of a profile whose name and text did not
+    /// change stand too, with what they hold: the new document keeps their
+    /// objects. A profile's stages are built from its own block, the
+    /// document's `view` and its `signals`, so a new document that changes
+    /// `view` or `signals` builds every profile anew. A profile is built
+    /// anew too where one of its stages, built again, says otherwise of
+    /// itself than the standing one: another name, other words of a
+    /// request's life to hear, or anything else the engine reads of a
+    /// stage when it builds a profile. A factory of the host's own may
+    /// build such a stage. A count of sends stands where every profile
+    /// that reads it is kept and the first of them by name made the
+    /// standing count, and its readers are built new where either fails.
+    /// A count built new takes over a standing count: which one is the
+    /// count's own rule
+    /// ([`Engine::succeed`](crate::engine::Engine::succeed)). Every other
+    /// stage starts empty, a registered one too. The keep stands between
+    /// two documents validated over the stock table, or over one table of
+    /// the host's own as it stood at both validations
+    /// ([`StageRegistry`](crate::stages::StageRegistry)): a host that
+    /// builds its table anew for each document keeps nothing.
     ///
-    /// What a caller may rely on when the call returns: the new document's
-    /// stages have heard every worker that stands in the registry the
+    /// What a caller may rely on when the call returns: the stages built
+    /// new have heard every worker that stands in the registry the
     /// program handed ([`Self::set_registry`]), each as joined and then
-    /// the list of them, on the calling thread. So the first decision
-    /// under the new document finds its stages told. A count of sends
+    /// the list of them, on the calling thread. A stage kept is told none
+    /// of them again: it heard each as it came. So the first decision
+    /// under the new document finds its stages told. A count built new
     /// takes over behind those joins and ahead of the list: a join this
     /// call tells drops no send the count takes over, and the list drops
     /// what it took over under an id that stands no more. A program that
@@ -198,12 +243,11 @@ impl PolicyEngine {
     /// at that upkeep too ([`Self::set_lists`]): a request that asks a
     /// list ahead of it makes the list's value itself.
     ///
-    /// A word of a lease issued under the standing document reaches no
-    /// stage from here on ([`DecisionEngine::say`]), and the shadow counts
-    /// start at zero ([`Self::shadow_counts`]). The session table
-    /// hears no dispatch of such a lease either: a claim that decision
-    /// made is neither confirmed nor taken back, and a pin its dispatch
-    /// would move stays. A list keeps the
+    /// A word of a lease issued under the standing document reaches the
+    /// stages kept, the counts kept and the session table from here on,
+    /// and no stage built since ([`DecisionEngine::say`]): such a stage
+    /// never heard the lease's issue. The shadow counts start at zero
+    /// ([`Self::shadow_counts`]). A list keeps the
     /// value the engine made of it under each document until the list
     /// falls ([`LentList`]): a list that stands across many documents is
     /// read past the values of the earlier ones. The document replaced
@@ -217,7 +261,13 @@ impl PolicyEngine {
     /// asks the program of its workers under it
     /// ([`Members::standing`](super::membership::Members::standing),
     /// [`Members::facts_of`](super::membership::Members::facts_of)). No decision
-    /// takes that lock: decisions run on beside the call.
+    /// takes that lock: decisions run on beside the call. The call reaches
+    /// no store: a store's word of membership takes the store's lock of its
+    /// workers first and this one behind it.
+    ///
+    /// The engine's records of sent prefixes hear the list told here and
+    /// forget every worker that does not stand. A join told here writes
+    /// nothing to them.
     ///
     /// # Errors
     ///
@@ -237,19 +287,22 @@ impl PolicyEngine {
         // panic of its code leaves the engine as the call found it.
         let ids = self.members.standing_ids();
         spec.share_sessions(Arc::clone(&self.sessions));
+        spec.keep_from(&standing.spec);
         let next = Arc::new(InForce::of(spec));
-        // The new document's stages hear the workers that stand before a
+        // The stages built new hear the workers that stand before a
         // decision reads them: each as joined, then the list of them, as
-        // the task's whole read of the registry says it. A count of sends
-        // takes over between the two: a join told here finds the count
-        // empty and drops no send the standing count holds, and the list
-        // drops what stands under an id that is gone.
+        // the task's whole read of the registry says it. A stage kept
+        // heard them as they came. A count built new takes over between
+        // the two: a join told here finds the count empty and drops no
+        // send the standing count holds, and the list drops what stands
+        // under an id that is gone.
+        let new = next.spec.engine().hearing(|made| made == offered);
         for id in ids.as_deref().unwrap_or_default() {
-            self.told(&next, &Membership::Added(*id));
+            self.told(&new, &Membership::Added(*id));
         }
         next.spec.engine().succeed(standing.spec.engine());
         if let Some(ids) = &ids {
-            self.told(&next, &Membership::Snapshot(ids));
+            self.told(&new, &Membership::Snapshot(ids));
         }
         self.document.store(next);
         self.members.owe_read();

@@ -88,7 +88,8 @@ pub enum SessionVerdict {
     Respill,
     /// The key had no routable pin and the decision claimed the worker it
     /// placed the request on: that decision's commit confirms the claim on
-    /// the worker, or withdraws it when the dispatch landed elsewhere.
+    /// the worker, or withdraws it when the dispatch landed elsewhere or it
+    /// refused every target.
     Claimed(WorkerId),
 }
 
@@ -221,7 +222,8 @@ struct Entry {
     /// it stands unconfirmed, and no other dispatch elsewhere touches it; a
     /// claim whose commit never comes stands until the TTL sweeps the key.
     /// A pair's decision moves its own claim to the prefill its pair formed
-    /// on, and withdraws it where none formed ([`SessionTable::move_claim`]).
+    /// on, and withdraws it where none formed; a commit that refused every
+    /// target withdraws its decision's ([`SessionTable::move_claim`]).
     /// A rename's step takes the mark where the key held the claim's
     /// worker under another id as well ([`Entry::follow`]).
     claim: WorkerId,
@@ -611,7 +613,8 @@ impl SessionTable {
     /// claim is a pin made before a commit, and it is marked as such:
     /// any dispatch to it confirms it, the claiming decision's own dispatch
     /// elsewhere withdraws it (`dispatched`), the TTL sweeps it otherwise.
-    /// A pair's decision moves its own claim before its dispatch
+    /// A pair's decision moves its own claim before its dispatch, and a
+    /// commit that refused every target withdraws its decision's
     /// ([`Self::move_claim`]).
     ///
     /// The pin and the claim of record take the id that stands for the
@@ -696,7 +699,8 @@ impl SessionTable {
 
     /// The decision that claimed `claimed` for `key` does not go there: a
     /// pair's decision formed its pair on another prefill, `target`, or on
-    /// none (`WorkerId(0)`). The claim is withdrawn where it still stands
+    /// none (`WorkerId(0)`), or its commit refused every target
+    /// (`WorkerId(0)` too). The claim is withdrawn where it still stands
     /// unconfirmed, as the claiming decision's commit elsewhere withdraws
     /// it ([`Self::dispatched`]), and `target` is claimed in its place by
     /// the key's recovery: the key's next decision follows a worker the

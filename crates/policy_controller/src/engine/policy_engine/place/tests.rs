@@ -1079,6 +1079,92 @@ fn placing_a_request_asks_the_table_of_names_for_nothing() {
     }
 }
 
+/// A placement states what its pick states of the worker the request goes
+/// to ([`Placement::overlap`]): a host observes its cache series from it.
+/// A prompt's first request reads a miss of its blocks. Its next request
+/// reads every block held, by the record of sent prefixes, and a kept
+/// placement says the same. A pick states its first target alone: a request
+/// its route's rule sends to the target behind is stated nothing, though
+/// one decision placed it. Neither is a place one pick decides, nor a pair.
+///
+/// The classic policy observes the share of the worker it chose
+/// (`model_gateway/src/policies/cache_aware.rs:2676-2688`), a pair's sides
+/// each by its own policy.
+#[test]
+fn a_placement_states_what_its_pick_states_of_the_worker_taken() {
+    use crate::engine::decision::{Overlap, OverlapSource};
+
+    let engine = hosted(preset("cache_aware"));
+    let list = pool(4);
+    let members = PublishedList::new(Arc::clone(&list));
+    let tokens: Vec<u32> = (0..256).collect();
+    let prompt = Prompt {
+        tokens: Some(&tokens),
+        ..Prompt::NONE
+    };
+    let mut request = PlaceRequest {
+        prompt,
+        ..PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()))
+    };
+    let first = engine.place(&request).expect("a placement");
+    let of = first.overlap.of;
+    assert_ne!(of, 0, "a miss is stated of the request's blocks");
+    let miss = Overlap {
+        of,
+        ..Overlap::NONE
+    };
+    assert_eq!(first.overlap, miss);
+
+    let again = engine.place(&request).expect("a placement");
+    let held = Overlap {
+        blocks: of,
+        source: OverlapSource::Predictor,
+        ..miss
+    };
+    assert_eq!((again.id(), again.overlap), (first.id(), held));
+    assert_eq!(again.kept().overlap, held, "a kept placement states it too");
+
+    // The rule refuses the prompt's worker: the request goes to the target
+    // behind it, of which the pick states nothing.
+    let holder = first.id();
+    let asked = Cell::new(0);
+    let admits = |worker: &dyn Worker| {
+        asked.set(asked.get() + 1);
+        worker_id(worker) != holder
+    };
+    request.admits = Some(&admits);
+    let moved = engine.place(&request).expect("a placement");
+    assert_ne!(moved.id(), holder);
+    assert_eq!(
+        asked.get(),
+        2,
+        "one decision: its first target, then the next"
+    );
+    assert_eq!(moved.overlap, Overlap::NONE);
+
+    // A place one pick decides reads no row.
+    request.admits = None;
+    let plain = hosted(preset("round_robin"));
+    let placed = plain.place(&request).expect("a placement");
+    assert_eq!(placed.overlap, Overlap::NONE);
+
+    // A pair whose two sides read who holds the prompt: its pick states
+    // none, at the prompt's first request and at its next.
+    let sides = PolicySpec::pair_presets("cache_aware", "cache_aware");
+    let paired = hosted(engine_of(&sides.expect("the pair presets")));
+    let two = PublishedList::new(pool(2));
+    let classes = PartnerClasses::number(2, [&[0_u32, 1][..], &[0, 1][..]]);
+    let pair = PlaceRequest {
+        prompt,
+        ..PlaceRequest::of(MODEL, WorkerLists::Pair(pair_of(&two, &classes)))
+    };
+    for _ in 0..2 {
+        let placement = paired.place(&pair).expect("a pair");
+        assert!(placement.decode.is_some());
+        assert_eq!(placement.overlap, Overlap::NONE);
+    }
+}
+
 /// A program that asks `place` states no worker id of its own: a placement
 /// of a place names its worker by the fingerprint of its address, and a
 /// retry states that id as tried. A program whose list states ids of its
@@ -1631,7 +1717,14 @@ fn the_places_a_rule_takes_are_ascending_and_hold_every_later_pick() {
     };
     let mut call = Call::default();
     call.missed.push(worker_id(list[1].as_ref()));
-    hold_to_rule(&request, Some(members.lent()), &mut call).expect("the rule takes workers");
+    hold_to_rule(
+        &request,
+        Some(members.lent()),
+        None,
+        &mut call.admitted,
+        &mut call.spent,
+    )
+    .expect("the rule takes workers");
     let places: Vec<u32> = thirds().map(|at| at as u32).collect();
     assert_eq!(call.admitted.as_deref(), Some(&places[..]));
 
@@ -1690,6 +1783,44 @@ fn a_keyed_request_whose_owner_the_rule_refuses_stays_on_one_worker() {
         }
         assert!(by_list > 0, "{policy}: no key asked the rule of the list");
     }
+}
+
+/// A fresh key whose first decision names workers the rule refuses keeps no
+/// pin of them: the commit refused every target of that decision, and the
+/// claim it made goes with it. The request is sent to the rule's one
+/// worker, and that worker is the key's pin: the key's request with no rule
+/// lands there.
+///
+/// The classic router pins no worker its rule refuses: it narrows the list
+/// by the rule ahead of its policy (`Candidates::of`,
+/// `model_gateway/src/routers/common/placement.rs`).
+#[test]
+fn a_fresh_key_keeps_no_pin_of_a_worker_its_rule_refused() {
+    let mut document = PolicySpec::preset("manual").expect("a built-in preset");
+    document.generation = 1;
+    let rule = document.bindings[0].sessions.as_mut();
+    rule.expect("the stock rule").assignment = Assignment::MinLoad;
+    let engine = hosted(engine_of(&document));
+    // Four idle workers and a busier one: the first decision names the four.
+    let list = pool(5);
+    list[4].increment_load();
+    let members = PublishedList::new(Arc::clone(&list));
+    let busy = worker_id(list[4].as_ref());
+    let admits = |worker: &dyn Worker| worker_id(worker) == busy;
+    let headers = [(MANUAL_SESSION_HEADER, "talk-fresh")];
+    let keyed = PlaceRequest {
+        headers: &headers,
+        ..PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()))
+    };
+    let ruled = PlaceRequest {
+        admits: Some(&admits),
+        ..keyed
+    };
+    let mut placement = engine.place(&ruled).expect("a placement");
+    placement.sent(Side::Single);
+    assert_eq!(placement.id(), busy);
+    let next = engine.place(&keyed).expect("a placement");
+    assert_eq!(next.id(), busy, "the pin is the worker that served the key");
 }
 
 /// A call's first decision is given the request's whole budget, and a later

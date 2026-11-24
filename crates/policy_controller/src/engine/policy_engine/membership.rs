@@ -316,6 +316,10 @@ pub(super) struct Follow {
     /// word lost to a panic of the host's own code, and behind a word of
     /// membership of a host that states ids.
     unread: bool,
+    /// Whether the last upkeep owed a whole read and did not make it: the
+    /// host's own code panicked in the subscription or in the read. The
+    /// next upkeep says so ([`PolicyEngine::follow_registry`]).
+    late: bool,
     /// Whether the host stated an id of a worker at any ask so far. Such a
     /// host can state an id and take it back between the registry's write
     /// and the follow's ask.
@@ -391,7 +395,7 @@ impl PolicyEngine {
     /// |---|---|
     /// | `Registered` | a join |
     /// | `Removed` | a leave, under the id told at the worker's join |
-    /// | `Replaced` | nothing where the host states the id told of the new object: the worker stands, with what the stages keep for it. Where it states another, a leave of the id told and a join of the new one. Nothing of an object the follow does not hold |
+    /// | `Replaced` | nothing where the host states the id told of the new object and that object serves every model of the old one: the worker stands, with what the stages keep for it. Where the new object serves one of those models no more, the models it left ([`Membership::Left`]). Where the host states another id, a leave of the id told and a join of the new one. Nothing of an object the follow does not hold |
     /// | `StatusChanged` | nothing: a decision reads a worker's status on its object |
     ///
     /// A worker removed and another registered at its address come as a
@@ -442,13 +446,14 @@ impl PolicyEngine {
     /// with words still standing: those a whole read owed, those of words
     /// that never stood alone on the subscription, and, where the program
     /// handed its lists behind the whole read, those of every list that
-    /// stands.
-    pub(super) fn follow_registry(&self, members: &mut Option<Follow>) {
+    /// stands. It answers whether the upkeep before this one owed a whole
+    /// read and did not make it.
+    pub(super) fn follow_registry(&self, members: &mut Option<Follow>) -> bool {
         let follow = match members {
             Some(follow) => follow,
             None => {
                 let Some(registry) = self.members.get() else {
-                    return;
+                    return false;
                 };
                 members.insert(Follow {
                     registry: Arc::clone(registry),
@@ -456,6 +461,7 @@ impl PolicyEngine {
                     told: FxHashMap::default(),
                     under: FxHashMap::default(),
                     unread: true,
+                    late: false,
                     stating: false,
                     owed: Vec::new(),
                     filling: false,
@@ -474,6 +480,14 @@ impl PolicyEngine {
             read = self.held(|| self.read_whole(follow)).is_some();
             follow.unread = !read;
         }
+        // The upkeep before this one owed a whole read and did not make it:
+        // the load reports wait for this answer. A read the host fails
+        // again writes no record of a worker it read, as the host is asked
+        // of every worker ahead of the first write: the telling behind it
+        // tells the workers the subscription told as joined since the
+        // snapshot at hand, and no other.
+        let again = follow.late;
+        follow.late = follow.unread;
         // The program handed its lists since the follow last owed every
         // list that stands: a whole read owed them, and else they are owed
         // here, once.
@@ -484,6 +498,7 @@ impl PolicyEngine {
         // What the whole read owes, and what words left owed that never
         // stood alone on the subscription.
         self.fill_owed(follow);
+        again
     }
 
     /// Every list that stands is owed a fill: the lists of each model a
@@ -625,14 +640,27 @@ impl PolicyEngine {
                     self.stands(follow, worker_id, &new, id, true);
                     // A worker that stands under its id and serves one of
                     // its models no more keeps no place in that model's
-                    // record: the records forget it. A changed id was told
-                    // as a leave and a join, which forget it already. The
+                    // record: the records forget it, and the stages are
+                    // told the models it left. A changed id was told as a
+                    // leave and a join, which forget it already. The
                     // objects are asked under a catch, and a panic of their
-                    // code is read as a model lost.
+                    // code is read as a model lost that no word can name:
+                    // the records forget the worker and the stages hear
+                    // nothing.
                     let left = |model: &String| !new.supports_model(model);
-                    let lost = || worker_model_ids(&old).iter().any(left);
-                    if was == Some(id) && self.held(lost).unwrap_or(true) {
-                        self.affinity.forget(id);
+                    let lost = || {
+                        let mut models = worker_model_ids(&old);
+                        models.retain(left);
+                        models
+                    };
+                    if was == Some(id) {
+                        let lost = self.held(lost);
+                        if lost.as_ref().is_none_or(|lost| !lost.is_empty()) {
+                            self.affinity.forget(id);
+                        }
+                        if let Some(models) = lost.as_deref().filter(|lost| !lost.is_empty()) {
+                            self.tell(&Membership::Left { id, models });
+                        }
                     }
                 }
                 // The lists of both objects' models were published again,
@@ -790,7 +818,6 @@ impl PolicyEngine {
             self.stands(follow, object, &worker, id, false);
         }
         let standing: Vec<WorkerId> = follow.under.keys().copied().collect();
-        self.affinity.keep(&standing);
         self.tell(&Membership::Snapshot(&standing));
     }
 }

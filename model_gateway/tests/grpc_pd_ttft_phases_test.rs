@@ -15,10 +15,11 @@
 //! generation record there too.
 //!
 //! The request's wait ahead of the prefill dispatch
-//! (`smg_router_dispatch_wait_seconds`) is recorded with a route's time to
-//! first token: once, under its labels, counted from the entry stamp the
-//! request's handler runs under. The body is read outside the stamp, as the
-//! connection reads it.
+//! (`smg_router_dispatch_wait_seconds`) is recorded once per answer, counted
+//! from the entry stamp the request's handler runs under: with a streamed
+//! route's time to first token and under its labels, and alone for a
+//! collected answer, which has no first token. The body is read outside the
+//! stamp, as the connection reads it.
 //!
 //! Each case runs on a current-thread runtime under a thread-local Prometheus
 //! recorder, so the request path's emissions land in the rendered text.
@@ -585,14 +586,22 @@ fn the_completions_route_anchors_at_the_prefill_dispatch_under_held_headers() {
     route_anchors_at_the_prefill_dispatch(Route::Completions, true);
 }
 
-/// A collected (non-streaming) chat answer on the sequential pair: its one
-/// record, the generation duration, is anchored at the prefill dispatch, so it
-/// carries both workers' delays. A clock read where the anchor is derived
-/// would carry the decode worker's delay alone, since the sequential pair
-/// drains the prefill stream before the answer path reads its anchor; the
-/// case then falls short of its floor by the prefill delay.
+/// A collected (non-streaming) chat answer on the sequential pair: its
+/// generation duration is anchored at the prefill dispatch, so it carries
+/// both workers' delays. A clock read where the anchor is derived would carry
+/// the decode worker's delay alone, since the sequential pair drains the
+/// prefill stream before the answer path reads its anchor; the case then
+/// falls short of its floor by the prefill delay.
+///
+/// The request's handler runs under an entry stamp taken `ENTRY_LEAD` ago,
+/// and the answer records its dispatch wait once, with no first token: from
+/// that stamp to the prefill dispatch, where the generation clock starts. So
+/// the wait and the generation duration fit in the request's own time since
+/// its entry; a wait that ran to the decode dispatch would count the prefill
+/// delay twice and pass it.
 #[test]
 fn a_collected_chat_answer_anchors_its_generation_at_the_prefill_dispatch() {
+    let mut since_entry = Duration::ZERO;
     let rendered = render_after(|| async {
         let prefill =
             start_mock_engine(HeldHeadersEngine::eager(PREFILL_DELAY, OUTPUT_TOKENS)).await;
@@ -604,13 +613,15 @@ fn a_collected_chat_answer_anchors_its_generation_at_the_prefill_dispatch() {
             "max_tokens": 8,
         }))
         .unwrap();
-        let response = RequestStarted::now()
+        let entered = std::time::Instant::now() - ENTRY_LEAD;
+        let response = RequestStarted::at(entered)
             .scope(router.route_chat(None, &tenant(), Arc::new(request), MODEL))
             .await;
         let status = response.status();
         let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
             .await
             .expect("response body");
+        since_entry = entered.elapsed();
         assert_eq!(
             status,
             http::StatusCode::OK,
@@ -645,14 +656,31 @@ fn a_collected_chat_answer_anchors_its_generation_at_the_prefill_dispatch() {
         generation >= floor,
         "chat: generation duration {generation} s carries both workers' delays ({floor} s)"
     );
-    // A collected answer records no time to first token, so it records no
-    // dispatch wait either, though its handler ran under an entry stamp: the
-    // two families count the same requests.
-    for family in ["smg_router_ttft_seconds", DISPATCH_WAIT] {
-        assert_eq!(
-            metrics_capture::sample(&rendered, family, "count", &labels),
-            None,
-            "{family}:\n{rendered}"
-        );
-    }
+    // A collected answer records no time to first token. Its dispatch wait
+    // needs none: one observation, under the generation record's labels.
+    assert_eq!(
+        metrics_capture::sample(&rendered, "smg_router_ttft_seconds", "count", &labels),
+        None,
+        "chat: a collected answer recorded a first token:\n{rendered}"
+    );
+    let (Some(wait), Some(1.0)) = (
+        metrics_capture::sample(&rendered, DISPATCH_WAIT, "sum", &labels),
+        metrics_capture::sample(&rendered, DISPATCH_WAIT, "count", &labels),
+    ) else {
+        panic!("chat: one dispatch wait for the collected answer:\n{rendered}");
+    };
+    assert_eq!(
+        count_labels(&rendered, DISPATCH_WAIT, "chat"),
+        count_labels(&rendered, "smg_router_generation_duration_seconds", "chat"),
+        "chat: the dispatch wait carries the generation record's labels:\n{rendered}"
+    );
+    assert!(
+        within(wait, ENTRY_LEAD, SLACK),
+        "chat: dispatch wait {wait} s runs from the entry stamp to the prefill dispatch"
+    );
+    let since_entry = since_entry.as_secs_f64();
+    assert!(
+        wait + generation <= since_entry,
+        "chat: dispatch wait {wait} s ends where the generation clock ({generation} s) starts, at the prefill dispatch: the two fit in the request's time since its entry ({since_entry} s)"
+    );
 }

@@ -29,6 +29,7 @@ use smg_worker::{
         engine::EngineConnector,
         http_client::{WorkerHttpClientCache, WorkerHttpClientSettings},
     },
+    health::overload::OverloadThresholds,
     identity::endpoint::Endpoint,
     jobs::{
         queue::{JobHost, JobQueue, JobQueueConfig, JobRun, QueueJob},
@@ -47,7 +48,6 @@ use smg_worker::{
 };
 use wfaas::{ValidationError, WorkflowEngine, WorkflowId};
 
-use super::super::worker_objects::OVERLOAD_DEFAULTS;
 use crate::worker_host::{
     registration_into_store, removal_from_store, Members, MembershipWriter, Objects,
 };
@@ -71,12 +71,14 @@ const ENDED_RUN_SWEEP: Duration = Duration::from_secs(60);
 type Registration = WorkerRegistrationWorkflowData<Jobs>;
 type Removal = WorkerRemovalWorkflowData<Jobs>;
 
-/// What a controller fixes for every registration it runs. No flag sets one
-/// yet. A worker is polled for [`STARTUP_TIMEOUT_SECS`] every
-/// [`STARTUP_CHECK_INTERVAL_SECS`] from the job's start, over HTTP/1.1
-/// where it speaks HTTP. Its row states the worker crate's default health
-/// checks where its registration states none.
-fn settings() -> RegistrationSettings {
+/// What a controller fixes for every registration it runs, beside
+/// `overload`: the default overload thresholds its start states, which the
+/// object a registration builds states as the row's standing object will.
+/// No flag sets another yet. A worker is polled for
+/// [`STARTUP_TIMEOUT_SECS`] every [`STARTUP_CHECK_INTERVAL_SECS`] from the
+/// job's start, over HTTP/1.1 where it speaks HTTP. Its row states the
+/// worker crate's default health checks where its registration states none.
+fn settings(overload: OverloadThresholds) -> RegistrationSettings {
     let health = HealthCheckConfig::default();
     RegistrationSettings {
         upstream_http2: false,
@@ -92,7 +94,7 @@ fn settings() -> RegistrationSettings {
         retries_enabled: false,
         circuit_breaker: Default::default(),
         circuit_breaker_enabled: false,
-        overload_defaults: OVERLOAD_DEFAULTS,
+        overload_defaults: overload,
         health,
         health_endpoint: "/health".to_owned(),
         zmq_startup_timeout_secs: DEFAULT_ZMQ_STARTUP_TIMEOUT_SECS,
@@ -115,13 +117,15 @@ pub(crate) struct Jobs {
 
 impl Jobs {
     /// The host of a queue whose jobs write at `door`, over the worker
-    /// objects of `objects`. A definition that does not validate is a fault
+    /// objects of `objects`, each registration under the start's default
+    /// thresholds `overload`. A definition that does not validate is a fault
     /// of this file and is answered as it is.
     pub(crate) fn new(
         objects: &Arc<Objects<Members>>,
         door: Arc<dyn MembershipWriter>,
+        overload: OverloadThresholds,
     ) -> Result<Arc<Self>, ValidationError> {
-        Self::swept(objects, door, ENDED_RUN_KEPT)
+        Self::swept(objects, door, overload, ENDED_RUN_KEPT)
     }
 
     /// [`Self::new`] with `kept`, how long an ended run's state stands
@@ -136,9 +140,10 @@ impl Jobs {
     fn swept(
         objects: &Arc<Objects<Members>>,
         door: Arc<dyn MembershipWriter>,
+        overload: OverloadThresholds,
         kept: Duration,
     ) -> Result<Arc<Self>, ValidationError> {
-        let settings = settings();
+        let settings = settings(overload);
         let registration = WorkflowEngine::new();
         registration.register_workflow(registration_into_store::<Self>(
             &settings,

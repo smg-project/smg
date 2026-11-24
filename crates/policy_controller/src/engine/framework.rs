@@ -48,6 +48,7 @@ mod vetoed;
 
 pub use alone::{AloneProfile, InTheWay, NotAlone, Place};
 pub use encode::{EncodeItems, EncodePlaced, EncodePool, EncoderFacts};
+pub(crate) use encode::{ENCODE_MEDIA, ENCODE_VISION};
 use engines::{run_engines, run_owned};
 pub use keyed::PoolRows;
 use vetoed::{AllVetoed, Half};
@@ -3254,7 +3255,7 @@ impl Glob {
 /// ([`Engine::keeps_for`]). Every input of a naming that is a profile's
 /// own stands here: two profiles are named the same rows where
 /// [`Self::names_as`] says so.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct NamedBy {
     /// The cap of each list: `0` where the profile is named no row.
     cap: u32,
@@ -3292,7 +3293,7 @@ impl NamedBy {
 /// profile's can be told from another's. The key's mark is no part of
 /// it: the mark is set behind the build, and the test reads it where it
 /// is made.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum Held {
     /// To no test: the pass alone can say which rows stay
     /// ([`Profile::asked_by_row`]), and the naming stands as it is made.
@@ -3546,7 +3547,15 @@ fn live_reader_beside(bindings: &[Binding], at: usize, named_by: &[NamedBy]) -> 
 /// session table the bindings' sessions rules read.
 #[derive(Debug)]
 pub struct Engine {
-    profiles: Vec<Profile>,
+    /// Each profile behind a counted reference: the engine of a later
+    /// spec keeps a profile's object where nothing it was built from
+    /// changed ([`Engine::keep_from`]), and the two engines then run one
+    /// set of stages.
+    profiles: Vec<Arc<Profile>>,
+    /// Beside each profile, the generation whose build made its object:
+    /// this engine's own, or an earlier one's for a profile it kept.
+    #[cfg(feature = "in-process")]
+    born: Vec<u64>,
     /// The bindings in the spec's order, each beside what the build derived
     /// from it ([`Entry`]).
     bindings: Vec<Entry>,
@@ -3628,6 +3637,19 @@ pub struct Engine {
     /// takes one that is left
     /// ([`Engine::succeed`]).
     pub(crate) sent_credits: Vec<Arc<DispatchCredit>>,
+    /// Beside each profile, the place in `sent_credits` of the tally its
+    /// stages read, where one asked for it at the build.
+    #[cfg(feature = "in-process")]
+    pub(crate) sent_of: Vec<Option<usize>>,
+    /// Beside each tally, the generation whose build made its object.
+    /// Empty until the engine keeps one ([`Engine::keep_from`]): every
+    /// tally is its own.
+    #[cfg(feature = "in-process")]
+    sent_born: Vec<u64>,
+    /// The number of the stage table a spec's build made the stages over
+    /// (`StageRegistry::own`): none for an engine made in code.
+    #[cfg(feature = "in-process")]
+    pub(crate) stage_table: Option<u64>,
     /// The kinds of event the document takes, but for its counts of sends
     /// ([`Lifecycle::hears`] adds those): each stage's answer, asked once at
     /// the build, with the engine's own. A word of a request is told to
@@ -5028,12 +5050,15 @@ impl Engine {
             .map(|(profile, &folded)| profile.named_by(folded))
             .collect();
         let keepers = Keeper::of(&profiles);
-        // The engine's own: the session table follows a dispatch where a
-        // binding states a sessions rule. At an issue the engine does
-        // nothing but tell its stages: the record of dispatched prefixes
-        // is its host's to write, where the host decides.
+        // The engine's own: the session table follows a dispatch, and at a
+        // release takes back the claim of a decision its commit refused,
+        // where a binding states a sessions rule. At an issue the engine
+        // does nothing but tell its stages: the record of dispatched
+        // prefixes is its host's to write, where the host decides.
         let own = if bindings.iter().any(|binding| binding.sessions.is_some()) {
-            EventSet::NONE.with(EventKind::Dispatched)
+            EventSet::NONE
+                .with(EventKind::Dispatched)
+                .with(EventKind::Released)
         } else {
             EventSet::NONE
         };
@@ -5134,7 +5159,9 @@ impl Engine {
             })
             .collect();
         Self {
-            profiles,
+            #[cfg(feature = "in-process")]
+            born: vec![generation; profiles.len()],
+            profiles: profiles.into_iter().map(Arc::new).collect(),
             bindings,
             shadow_placing: shadow_placing.into_boxed_slice(),
             shadow_rows: shadow_rows.into_boxed_slice(),
@@ -5159,6 +5186,12 @@ impl Engine {
             max_report_age_ms: None,
             keepers,
             sent_credits: Vec::new(),
+            #[cfg(feature = "in-process")]
+            sent_of: Vec::new(),
+            #[cfg(feature = "in-process")]
+            sent_born: Vec::new(),
+            #[cfg(feature = "in-process")]
+            stage_table: None,
             hears,
         }
     }
@@ -5221,10 +5254,156 @@ impl Engine {
             }
         }
         for (credit, at) in self.sent_credits.iter().zip(taken) {
-            if let Some(at) = at {
+            // A count this engine kept is the standing one itself.
+            if let Some(at) = at.filter(|&at| !Arc::ptr_eq(credit, &prior[at])) {
                 credit.succeed(&prior[at]);
             }
         }
+    }
+
+    /// Keeps the standing engine's profile objects where nothing they were
+    /// built from changed: a profile of the same name for which `same`
+    /// holds, asked by that name, and whose stages say of themselves what
+    /// the standing ones say. Such a profile's stages keep what they
+    /// hold, and a decision under either engine runs the one set of them.
+    /// What a stage says of itself is its name, in the stages' order, its
+    /// needs, the words it takes, whether it keeps load reports and
+    /// whether it needs the lifecycle's calls, and what the build read of
+    /// the profile ([`Self::read_as`]). The spec's validation and this
+    /// engine's tables were folded from the stages built for it: a
+    /// profile whose factory built it a stage that says otherwise, under
+    /// the same name and text, is built new.
+    /// A count of sends goes with its readers: it is kept where every
+    /// profile that reads it is kept and the standing count was made under
+    /// the same profile's name, and else every reader of it is built new,
+    /// since a rank first heard behind this call would stand in one of two
+    /// counts alone. A profile kept keeps the generation its object was
+    /// made under ([`Engine::hearing`]).
+    ///
+    /// Nothing is kept across two stage tables that may build another
+    /// stage under one name: the stock table's number, or one table of a
+    /// host's own that took no stage between the two builds, is the same
+    /// under both. Its caller calls it before this engine takes a decision
+    /// or a word: what a replaced object held until then is let go.
+    #[cfg(feature = "in-process")]
+    pub(crate) fn keep_from(&mut self, standing: &Engine, same: impl Fn(&str) -> bool) {
+        if self.stage_table.is_none() || self.stage_table != standing.stage_table {
+            return;
+        }
+        // What a stage says of itself to a validation and to a making: its
+        // name, its needs, the words it takes, and whether it keeps load
+        // reports and needs the lifecycle's calls.
+        let said = |of: &Profile| {
+            let filters = of.filters.iter();
+            let filters = filters.map(|f| (f.name(), f.needs(), EventSet::NONE, [false; 2]));
+            let scorers = of.scorers.iter().map(|w| &w.scorer).map(|s| {
+                let calls = [s.keeps_loads(), s.needs_lifecycle()];
+                (s.name(), s.needs(), s.hears(), calls)
+            });
+            let picker = &of.picker;
+            let calls = [picker.keeps_loads(), picker.needs_lifecycle()];
+            let picker = (picker.name(), picker.needs(), picker.hears(), calls);
+            filters.chain(scorers).chain([picker]).collect::<Vec<_>>()
+        };
+        // Beside each profile, the place of the standing one it keeps.
+        let twin = |(at, built): (usize, &Arc<Profile>)| {
+            let named = |p: &Arc<Profile>| p.name == built.name;
+            let stood = standing.profiles.iter().position(named)?;
+            let like = same(&built.name)
+                && said(built) == said(&standing.profiles[stood])
+                && self.read_as(at, standing, stood);
+            like.then_some(stood)
+        };
+        let profiles = self.profiles.iter().enumerate();
+        let mut kept: Vec<Option<usize>> = profiles.map(twin).collect();
+        // A count's readers, by their places: kept whole, or built new whole.
+        debug_assert_eq!(self.sent_of.len(), self.profiles.len());
+        let read = |of: &Self, at: usize| of.sent_of.get(at).copied().flatten();
+        self.sent_born = vec![self.generation; self.sent_credits.len()];
+        for count in 0..self.sent_credits.len() {
+            let readers = (0..self.profiles.len()).filter(|&at| read(self, at) == Some(count));
+            let readers: Vec<usize> = readers.collect();
+            let stood = readers.first().and_then(|&at| {
+                let stood = read(standing, kept[at]?)?;
+                let reads = |other| read(standing, other) == Some(stood);
+                let whole = readers.iter().all(|&at| kept[at].is_some_and(reads));
+                let made = &standing.sent_credits[stood].profile;
+                (whole && *made == self.sent_credits[count].profile).then_some(stood)
+            });
+            let Some(stood) = stood else {
+                readers.into_iter().for_each(|at| kept[at] = None);
+                continue;
+            };
+            let born = standing.sent_born.get(stood).copied();
+            self.sent_born[count] = born.unwrap_or(standing.generation);
+            self.sent_credits[count] = Arc::clone(&standing.sent_credits[stood]);
+        }
+        for (at, stood) in kept.into_iter().enumerate() {
+            let Some(stood) = stood else { continue };
+            self.profiles[at] = Arc::clone(&standing.profiles[stood]);
+            self.born[at] = standing.born[stood];
+        }
+    }
+
+    /// Whether the build read of the stages of the profile at `at` what
+    /// `standing` holds of its profile at `stood`: each table an engine
+    /// folds from a profile's stages at its making and reads in their
+    /// place, and whether a stage asked its build for the profile's count
+    /// of sends. Two tables are not compared. The profile's needs are its
+    /// stages' own, which its caller compares stage by stage, less a
+    /// sample the marks rule. Whether its draw may be asked first is read
+    /// of the marks and the picker's name. A table added to the making is
+    /// added here.
+    #[cfg(feature = "in-process")]
+    fn read_as(&self, at: usize, standing: &Self, stood: usize) -> bool {
+        let asked = |of: &Self, at: usize| of.sent_of.get(at).is_some_and(Option::is_some);
+        self.marks[at] == standing.marks[stood]
+            && self.orders[at] == standing.orders[stood]
+            && self.named_by[at] == standing.named_by[stood]
+            && self.row_tests[at] == standing.row_tests[stood]
+            && self.head_places[at] == standing.head_places[stood]
+            && asked(self, at) == asked(standing, stood)
+    }
+
+    /// An engine of no binding that holds this engine's profiles and
+    /// counts of sends whose objects were made under a generation `made`
+    /// passes, over the same session table. It decides nothing: a word
+    /// that is not for every stage of this engine is told to it. An older
+    /// request's dispatch, end and release go to the stages that stood
+    /// when its lease was issued, and the workers that stand at an apply
+    /// are told as joined to the stages built new.
+    ///
+    /// It is made with no profile and then handed four things of this
+    /// engine: the profile objects, the generations they were made
+    /// under, the counts of sends and the session table. Every other
+    /// table of it is an empty engine's and says nothing of these
+    /// profiles: a word that reads one, as a load report's telling reads
+    /// its keepers, is not for it.
+    #[cfg(feature = "in-process")]
+    pub(crate) fn hearing(&self, made: impl Fn(u64) -> bool) -> Engine {
+        let mut hearing = Engine::new(Vec::new(), Vec::new(), self.generation, Needs::default());
+        let stood = (0..self.profiles.len()).filter(|&at| made(self.born[at]));
+        let stood: Vec<usize> = stood.collect();
+        let object = |at: &usize| Arc::clone(&self.profiles[*at]);
+        hearing.profiles = stood.iter().map(object).collect();
+        hearing.born = stood.iter().map(|&at| self.born[at]).collect();
+        let born = |at: usize| self.sent_born.get(at).copied().unwrap_or(self.generation);
+        let counts = (0..self.sent_credits.len()).filter(|&at| made(born(at)));
+        let count = |at| Arc::clone(&self.sent_credits[at]);
+        hearing.sent_credits = counts.map(count).collect();
+        hearing.sessions = Arc::clone(&self.sessions);
+        hearing
+    }
+
+    /// The generations below this engine's own under which a profile or a
+    /// count it kept was made, ascending, each once.
+    #[cfg(feature = "in-process")]
+    pub(crate) fn kept_since(&self) -> Vec<u64> {
+        let all = self.born.iter().chain(&self.sent_born);
+        let mut older: Vec<u64> = all.copied().filter(|&at| at < self.generation).collect();
+        older.sort_unstable();
+        older.dedup();
+        older
     }
 
     /// The session table: the pins of the keys it holds, each placed by a
@@ -5591,7 +5770,7 @@ impl Engine {
             .unwrap_or_default()
     }
 
-    pub fn profiles(&self) -> &[Profile] {
+    pub fn profiles(&self) -> &[Arc<Profile>] {
         &self.profiles
     }
 
@@ -8360,6 +8539,15 @@ impl Lifecycle for Engine {
     }
 
     fn on_released(&self, lease: &Lease, reason: ReleaseReason) {
+        // The table hears first and the stages last, as at a dispatch: a
+        // commit that refused every target leaves the decision's claim no
+        // worker to move to.
+        if reason == ReleaseReason::CommitFailed {
+            if let SessionVerdict::Claimed(claimed) = lease.session_verdict {
+                self.sessions
+                    .move_claim(lease.session, claimed, WorkerId(0));
+            }
+        }
         for profile in &self.profiles {
             for w in &profile.scorers {
                 w.scorer.on_released(lease, reason);
@@ -8409,9 +8597,9 @@ impl Lifecycle for Engine {
     }
 
     /// The words the document takes: a stage's, the session table's at a
-    /// dispatch under a sessions rule, the record of dispatched prefixes
-    /// at an issue, and a count of sends at a dispatch. Folded at the
-    /// build: one read here.
+    /// dispatch and at a release under a sessions rule, the record of
+    /// dispatched prefixes at an issue, and a count of sends at a
+    /// dispatch. Folded at the build: one read here.
     fn hears(&self) -> EventSet {
         if self.sent_credits.is_empty() {
             self.hears

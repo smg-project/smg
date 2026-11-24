@@ -126,13 +126,10 @@ pub const ROOM: Duration = Duration::from_secs(30);
 const PRODUCT_FEEDS: bool = cfg!(feature = "worker-host");
 
 /// Every reason the store counts a resync under.
-const RESYNCS: [ResyncReason; 9] = [
+const RESYNCS: [ResyncReason; 6] = [
     ResyncReason::OutOfRange,
     ResyncReason::DataLoss,
-    ResyncReason::StreamEnded,
     ResyncReason::SnapshotAbandoned,
-    ResyncReason::RelayRestart,
-    ResyncReason::EngineReplaced,
     ResyncReason::PublisherRestart,
     ResyncReason::GapCleared,
     ResyncReason::Snapshot,
@@ -144,13 +141,10 @@ const fn place(reason: ResyncReason) -> usize {
     match reason {
         ResyncReason::OutOfRange => 0,
         ResyncReason::DataLoss => 1,
-        ResyncReason::StreamEnded => 2,
-        ResyncReason::SnapshotAbandoned => 3,
-        ResyncReason::RelayRestart => 4,
-        ResyncReason::EngineReplaced => 5,
-        ResyncReason::PublisherRestart => 6,
-        ResyncReason::GapCleared => 7,
-        ResyncReason::Snapshot => 8,
+        ResyncReason::SnapshotAbandoned => 2,
+        ResyncReason::PublisherRestart => 3,
+        ResyncReason::GapCleared => 4,
+        ResyncReason::Snapshot => 5,
     }
 }
 
@@ -1026,6 +1020,7 @@ impl Replica {
             shutdown_settle: Duration::ZERO,
             shutdown_grace: Duration::from_secs(5),
             load_poll_interval: POLL_INTERVAL,
+            worker_overload: Config::DEFAULT_WORKER_OVERLOAD,
             discovery: None,
             election: ElectionConfig {
                 lease: lease.map_or(LeasePlace::Process, |file| {

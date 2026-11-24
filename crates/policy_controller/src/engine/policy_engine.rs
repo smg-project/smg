@@ -97,7 +97,7 @@ use super::{
         AlonePick, DecideOutcome, Decided, DecisionEngine, DecisionRefused, HeldDecision, Request,
         RequestMaker, WorkerLists,
     },
-    framework::{release, AloneProfile, NotAlone, Picker, Place, PoolWord, ShadowRows},
+    framework::{release, AloneProfile, Engine, NotAlone, Picker, Place, PoolWord, ShadowRows},
     lease_events,
     list_cell::{HandedLists, LentList},
     prompt_hashes::{HashSeeds, PromptHashes},
@@ -108,6 +108,7 @@ use super::{
 };
 use crate::{
     document::spec::AppliedSpec,
+    stages::Lifecycle,
     store::GatewayId,
     tracking::lease::{EventKind, EventSet, Membership, Said, Side},
 };
@@ -389,7 +390,8 @@ impl PolicyEngine {
     /// fingerprint of its address: the id every decision knew it by, where
     /// its program states none ([`FixedFacts::id`]). A stage that keeps a
     /// range, a count or a credit of the worker drops it. A dispatch said
-    /// behind the leave enters its rank in a count of sends again. The
+    /// behind the leave enters its rank in a count of sends again, until a
+    /// join of the id drops it ([`Self::joined`]). The
     /// session table is not told: a leave takes no pin away, so a
     /// session's pin stands on a worker that is gone until the session's
     /// idle time or two other workers end it, and is a routable pin again
@@ -422,13 +424,16 @@ impl PolicyEngine {
     /// says it at a registration, where it tells its classic policies. A
     /// host that hands its registry says it nowhere
     /// ([`Self::set_registry`]).
+    ///
+    /// A count of sends drops what it holds under the id: a dispatch said
+    /// behind the id's removal, and with it a send to this worker said
+    /// ahead of this word.
     pub fn joined(&self, address: &str) {
         self.came(WorkerId::from_address(address));
     }
 
     /// A removal by the worker's id: what [`Self::forget`] says.
     fn left(&self, id: WorkerId) {
-        self.affinity.forget(id);
         self.tell(&Membership::Removed(id));
     }
 
@@ -443,18 +448,19 @@ impl PolicyEngine {
     /// never during one ([`Self::apply`]).
     fn tell(&self, change: &Membership<'_>) {
         let _held = self.telling.lock();
-        self.told(&self.document.load(), change);
+        self.told(self.document.load().spec.engine(), change);
     }
 
-    /// Tells the stages of `document` one change of membership, and not
-    /// the session table: the one place a word of membership passes. A
-    /// stage that panics at it is held and counted
+    /// Tells the stages of `engine` one change of membership, and not
+    /// the session table. The records of sent prefixes hear it first
+    /// ([`Self::hears`]). A stage that panics at it is held and counted
     /// ([`Self::word_caught`]): the registration or the removal goes on.
     /// Its caller holds the telling's lock. A decision takes that lock
     /// nowhere.
-    fn told(&self, document: &InForce, change: &Membership<'_>) {
-        let engine = document.spec.engine();
-        self.word_caught(|| engine.membership_stages(change));
+    fn told(&self, engine: &Engine, change: &Membership<'_>) {
+        self.hears(engine, change, |engine| {
+            self.word_caught(|| engine.membership_stages(change));
+        });
     }
 
     /// One word to the document's stages, `tell`, under a catch of its own:
@@ -472,6 +478,52 @@ impl PolicyEngine {
                 None
             }
         }
+    }
+
+    /// One word of a store's membership, said under the store's lock of its
+    /// workers ([`Self::hears`]): the document's engine hears it whole, its
+    /// session table and then its stages ([`Lifecycle::on_membership`]).
+    ///
+    /// It holds the telling's lock for the word, as a gateway's word does
+    /// ([`Self::tell`]). The locks are taken in one order: the store's, the
+    /// telling's, then the records' own ([`Affinity::forget`]). A decision
+    /// takes a record's lock and neither of the other two.
+    pub(crate) fn on_membership(&self, word: &Membership<'_>) {
+        let _held = self.telling.lock();
+        self.hears(self.document.load().spec.engine(), word, |engine| {
+            engine.on_membership(word);
+        });
+    }
+
+    /// One change of membership as the engine hears it under either host,
+    /// the one place a word of membership passes: the records of sent
+    /// prefixes first, then `engine` by `core`, the host's own way of
+    /// telling it. The engine is the document's, or the part of it a word
+    /// is told to ([`Engine::hearing`]). Its caller holds the telling's
+    /// lock.
+    ///
+    /// | The word | The records of sent prefixes |
+    /// |---|---|
+    /// | `Added` | Nothing. |
+    /// | `Removed` | Each forgets the worker. |
+    /// | `Replaced` | Each forgets the old id. |
+    /// | `Relabelled` | Nothing. |
+    /// | `Resized` | Nothing. |
+    /// | `Snapshot` | Each forgets every worker that is not among the ids. |
+    /// | `Left` | Each forgets the worker. |
+    ///
+    /// A worker that stands under its id and serves a model no more is
+    /// forgotten whole, in every model's record: an entry is a prediction,
+    /// and the next request of a prefix writes it again.
+    fn hears(&self, engine: &Engine, change: &Membership<'_>, core: impl FnOnce(&Engine)) {
+        match *change {
+            Membership::Removed(id)
+            | Membership::Replaced { old: id, .. }
+            | Membership::Left { id, .. } => self.affinity.forget(id),
+            Membership::Snapshot(standing) => self.affinity.keep(standing),
+            Membership::Added(_) | Membership::Relabelled(_) | Membership::Resized(_) => {}
+        }
+        core(engine);
     }
 
     /// The clock of the engine's decisions: a list's records are made on
@@ -781,7 +833,7 @@ impl PolicyEngine {
     /// is issued, no id is taken and no stage is told. For a host that
     /// files a pick's lease itself and tells the stages of the issue under
     /// that lease
-    /// ([`Lifecycle::on_decision_issued`](crate::stages::Lifecycle::on_decision_issued)
+    /// ([`Lifecycle::on_decision_issued`]
     /// of the document's engine), as a controller's service does in its
     /// store.
     ///
@@ -1154,20 +1206,24 @@ impl DecisionEngine for PolicyEngine {
             Said::Completed(_) => EventKind::Completed,
             Said::Released(..) => EventKind::Released,
         };
-        // A word of a decision made under another document is told to
-        // nobody: its stages are not the ones in force.
+        // A word of a decision made under an earlier document goes to the
+        // stages that stood when its lease was issued, and to no stage
+        // built since. Its dispatch is counted by every count of sends in
+        // force: a send is a fact of its worker, whatever document decided
+        // it.
         let document = self.document.load();
+        let sends = document.spec.engine();
+        let mut engine = sends;
         if held.lease.generation != document.spec.generation() {
+            engine = document.stood_at(held.lease.generation);
+        } else if held.lease.side == Side::Single && !document.hears.contains(kind) {
             return;
         }
-        if held.lease.side == Side::Single && !document.hears.contains(kind) {
-            return;
-        }
-        let engine = document.spec.engine();
+        let micros = |at| self.clock.micros(at);
         let tell = || match held.lease.side {
-            Side::Single => lease_events::single(&lease_events::one_engine(engine), held, said),
+            Side::Single => lease_events::single(&lease_events::of_host(engine, sends), held, said),
             // A pair's guard holds its prefill side's lease.
-            Side::Prefill => lease_events::pair(engine, held, said, |at| self.clock.micros(at)),
+            Side::Prefill => lease_events::pair(engine, sends, held, said, micros),
             // No lease is issued for a side on its own.
             Side::Decode | Side::Encode => {}
         };

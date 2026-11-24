@@ -187,15 +187,16 @@ impl Pair {
     /// the decode's. The release of a prefill that never went out takes a
     /// chosen decode as an end does, and is held back the same.
     ///
-    /// An outcome says that its side went out: a send never said is said
-    /// here first, at the report's instant, as a placement's own end says
-    /// it ([`Placement::ended`]). So a prefill reported with no send is
-    /// held back like any other while its decode stands chosen.
+    /// An outcome says that its side went out. A prefill's send never said
+    /// is said here first, at the report's instant, as a placement's own
+    /// end says it ([`Placement::ended`]). So a prefill reported with no
+    /// send is held back like any other while its decode stands chosen. A
+    /// decode needs no such word: its end says its own send, at the same
+    /// instant.
     fn ended(&mut self, side: Side, end: End) {
-        if let (Some(_), Some(held)) = (end.outcome, &mut self.placement.held) {
-            match side {
-                Side::Decode => held.dispatched_decode(end.at),
-                _ => held.dispatched(end.at),
+        if side != Side::Decode {
+            if let (Some(_), Some(held)) = (end.outcome, &mut self.placement.held) {
+                held.dispatched(end.at);
             }
         }
         let lease = self.placement.held.as_ref();

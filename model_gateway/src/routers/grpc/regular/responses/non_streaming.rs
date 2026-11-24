@@ -26,6 +26,7 @@ use super::{
 };
 use crate::{
     config::ParserChoice,
+    middleware::RequestStarted,
     observability::metrics::Metrics,
     routers::{
         common::{
@@ -166,6 +167,11 @@ async fn execute_without_mcp(
 ///
 /// The answer comes with the parser that read the completion it is built
 /// from; the readers of one turn are the same.
+///
+/// Every turn's generation records its dispatch wait (see
+/// `context::dispatch_wait`): the first turn's under the request's entry
+/// stamp, a later turn's under one taken where that turn starts, as the
+/// streamed loop's.
 pub(super) async fn execute_tool_loop(
     ctx: &ResponsesContext,
     mut current_request: ResponsesRequest,
@@ -202,6 +208,10 @@ pub(super) async fn execute_tool_loop(
         mcp_chat_tools.len()
     );
 
+    // The stamp a later turn's generation is dispatched under; the first
+    // turn's runs under the request's own.
+    let mut turn_entered: Option<RequestStarted> = None;
+
     loop {
         // Convert to chat request, the MCP tools in its tool list
         let mut chat_request =
@@ -222,16 +232,17 @@ pub(super) async fn execute_tool_loop(
         });
 
         // Execute chat pipeline (errors already have proper HTTP status codes)
-        let (chat_response, parser) = ctx
-            .pipeline
-            .execute_chat_for_responses(
-                Arc::new(chat_request),
-                params.headers.clone(),
-                params.model_id.clone(),
-                ctx.components.clone(),
-                Some(params.tenant_request_meta.clone()),
-            )
-            .await?;
+        let generation = ctx.pipeline.execute_chat_for_responses(
+            Arc::new(chat_request),
+            params.headers.clone(),
+            params.model_id.clone(),
+            ctx.components.clone(),
+            Some(params.tenant_request_meta.clone()),
+        );
+        let (chat_response, parser) = match turn_entered {
+            Some(entered) => entered.scope(generation).await,
+            None => generation.await,
+        }?;
 
         state.record_usage(chat_response.usage.as_ref());
 
@@ -427,6 +438,13 @@ pub(super) async fn execute_tool_loop(
             }
 
             state.final_turn = tool_call_limit == Some(McpToolCallLimit::User);
+
+            // The next turn starts here, and its stamp is taken here: its
+            // dispatch wait is the gateway's time from this instant to its
+            // dispatch. Counted from the request's entry it would hold every
+            // generation and tool call before it. A loop that runs under no
+            // entry stamp (a background response's) takes none.
+            turn_entered = RequestStarted::current().map(|_| RequestStarted::now());
 
             // Build resume request with conversation history
             current_request = build_next_request(&mut state, current_request);

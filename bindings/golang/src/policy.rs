@@ -37,7 +37,8 @@ use smg_worker::{
     },
     identity::{
         basic::{
-            ConnectionMode, RuntimeType, Worker, WorkerMetadata, WorkerRoutingKeyLoad, WorkerType,
+            running_window, ConnectionMode, RuntimeType, Worker, WorkerMetadata,
+            WorkerRoutingKeyLoad, WorkerType,
         },
         error::WorkerResult,
         metadata::DecodingLabels,
@@ -80,6 +81,7 @@ impl GrpcWorker {
             pd_pairing: PdPairing::derive(&spec),
             redacted_url: spec.redacted_url(),
             decoding: DecodingLabels::of(&spec),
+            running_window: running_window(&spec.labels),
             spec: Arc::new(spec),
             discovered_labels: Arc::default(),
             health_config: HealthCheckConfig::default(),

@@ -2853,8 +2853,8 @@ pub(crate) mod tests {
     /// Where the rule keeps what it places from the profile no form leaves
     /// a block of the prompt in the record: a gateway's sticky map hands
     /// none of them to its policy, so the policy's record never sees the
-    /// prompt (`model_gateway/src/policies/registry.rs:736-739` for a pin
-    /// under its cap, `:782-783` for the map's own assignment). Where the
+    /// prompt (`model_gateway/src/policies/registry.rs:794-797` for a pin
+    /// under its cap, `:840-841` for the map's own assignment). Where the
     /// request is the profile's own, the rule's default, every form leaves
     /// the whole prompt for the session's worker and for no other, the pin
     /// by one record as the pin the whole decision follows. That prompt
@@ -2923,8 +2923,8 @@ pub(crate) mod tests {
                 }
                 if whole {
                     // A second warm-up stage that rules by another window:
-                    // the live profile is named no row and reads the column
-                    // whole, and its list keeps the record for the shadow.
+                    // the live profile is named no row, reads the column
+                    // whole and keeps the record by its own word.
                     let profile = document.profiles.get_mut("cache_aware");
                     profile.expect("the preset's profile").score.push(
                         ScoreStage::WarmupSlice(WarmupSliceParams {
@@ -3532,6 +3532,9 @@ pub(crate) mod tests {
             let heard = match *change {
                 Membership::Added(id) => ("joined", id, 0),
                 Membership::Removed(id) => ("left", id, 0),
+                // A leave of the cases' model, and one of any other.
+                Membership::Left { id, models } if models == [MODEL] => ("left a model", id, 0),
+                Membership::Left { id, .. } => ("left another model", id, 0),
                 // The ids that stand, one word each.
                 Membership::Snapshot(ids) => {
                     let standing = ids.iter().map(|&id| ("standing", id, 0));
@@ -3607,6 +3610,33 @@ pub(crate) mod tests {
             })
         });
         (spec, heard)
+    }
+
+    /// A stage table whose picker `hears` takes every word of a lease and
+    /// keeps what it hears in a list of its own, and those lists in the
+    /// order the table built their pickers: a validation builds one for
+    /// each profile that names the picker. Documents validated over the
+    /// one table build the same stage under each name.
+    pub(in crate::engine::policy_engine) fn hearing_stages(
+    ) -> (StageRegistry, Arc<Mutex<Vec<Heard>>>) {
+        let built = Arc::new(Mutex::new(Vec::new()));
+        let lists = Arc::clone(&built);
+        let make = move || -> Box<dyn Picker> {
+            let heard = Heard::default();
+            lists.lock().push(Arc::clone(&heard));
+            Box::new(Hears {
+                heard,
+                panics: false,
+                alone: false,
+                takes: EventSet::LEASE,
+            })
+        };
+        let mut stages = StageRegistry::builtin();
+        let added = stages.picker("hears", make);
+        added.expect("a free name");
+        // The registration built one picker, to ask its name.
+        built.lock().clear();
+        (stages, built)
     }
 
     /// [`hearing`] with a picker that places by itself where `alone`, and
