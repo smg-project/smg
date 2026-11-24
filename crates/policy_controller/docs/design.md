@@ -1926,7 +1926,7 @@ The bar for that change:
 3. With the engine off, a classic decision pays what rule 5 names and no more, counted in the
    gateway's decision bench.
 
-   With the engine off, the one call of the second point is still made for a pair sent prefill first: it returns at its first test, of the engine side of the pair's first answer, and reads no pair index. The decision bench's pair route does not make that call, so what a route pays to make it is not counted yet.
+   With the engine off, neither pair route makes the one call of the second point. Each route asks the pair's first answer once, where it decides how the pair is sent, and builds no ask for a decode the classic policies picked. A classic pair sent prefill first still pays that test, the holder of its decode ahead of the send, and on the HTTP route the cell a moved decode is written to. That cost is counted under Callgrind, on the lines the second point added.
 4. With the engine on, every classic test of the gateway passes under the settings' own document.
 
 ### 9.3 The options

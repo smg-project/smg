@@ -213,6 +213,15 @@ impl DecodeAhead {
 type DecodeAsk<'a> =
     dyn Fn(&Placed, WorkerLoadGuard) -> (Option<Placed>, WorkerLoadGuard) + Sync + 'a;
 
+/// Whether the attempt of a pair sent prefill first hands its dispatch the
+/// ask for `decode` ([`DecodeAsk`]): the decode is owed it behind its
+/// prefill's answer ([`DecodeAhead::owed_behind_prefill`]), and the pair's
+/// connector is not MoRI-IO, whose prefill was told of its decode. A decode
+/// the classic policies picked is owed none: its attempt builds no ask.
+fn asks_decode_again(mode: &KvConnectorMode, decode: &DecodeAhead) -> bool {
+    *mode != KvConnectorMode::MoriIo && decode.owed_behind_prefill()
+}
+
 /// What every dispatch body sets up before its first side goes out: the two
 /// serialized sides and the two load guards taken apart (the decode's still
 /// ahead of its send), the request headers as every side is sent them (the
@@ -1189,34 +1198,41 @@ impl PDRouter {
             // decode takes the transfer its prefill was told of, and this
             // prefill was told of none. So the ask is held to a decode that
             // is no such engine, beside the retry's rule.
-            let keeps_the_shape = |worker: &dyn Worker| {
-                !is_moriio_worker(worker) && candidate_filter.is_none_or(|accepts| accepts(worker))
-            };
+            //
+            // The ask and its rule are built where the decode is asked again
+            // and nowhere else ([`asks_decode_again`]): the attempt of a
+            // pair the classic policies picked makes that test, builds
+            // neither and hands its dispatch no ask.
             let moved_to = parking_lot::Mutex::new(None);
-            let ask = |first: &Placed, ahead: WorkerLoadGuard| {
-                let inputs = PlacementInputs {
-                    text: text.as_deref(),
-                    tokens: tokens.as_deref(),
-                    headers,
-                    rid_key: rid_key.as_deref(),
-                    // The derived key again, as the selection stated it.
-                    rid: rid_key.as_deref(),
-                    cache_namespace,
-                    candidate_filter: Some(&keeps_the_shape),
-                    tried: &tried_before,
+            let (keeps_the_shape, ask);
+            let again: Option<&DecodeAsk<'_>> = if asks_decode_again(&mode, &guards.decode) {
+                keeps_the_shape = |worker: &dyn Worker| {
+                    !is_moriio_worker(worker)
+                        && candidate_filter.is_none_or(|accepts| accepts(worker))
                 };
-                let pairs = || self.pd_pairs(model_id);
-                let (moved, guard) = self.decode_again(model_id, &pairs, inputs, first, ahead);
-                if let Some(moved) = &moved {
-                    *moved_to.lock() = Some(Arc::clone(moved.worker()));
-                }
-                (moved, guard)
+                ask = |first: &Placed, ahead: WorkerLoadGuard| {
+                    let inputs = PlacementInputs {
+                        text: text.as_deref(),
+                        tokens: tokens.as_deref(),
+                        headers,
+                        rid_key: rid_key.as_deref(),
+                        // The derived key again, as the selection stated it.
+                        rid: rid_key.as_deref(),
+                        cache_namespace,
+                        candidate_filter: Some(&keeps_the_shape),
+                        tried: &tried_before,
+                    };
+                    let pairs = || self.pd_pairs(model_id);
+                    let (moved, guard) = self.decode_again(model_id, &pairs, inputs, first, ahead);
+                    if let Some(moved) = &moved {
+                        *moved_to.lock() = Some(Arc::clone(moved.worker()));
+                    }
+                    (moved, guard)
+                };
+                Some(&ask)
+            } else {
+                None
             };
-            let ask: &DecodeAsk<'_> = &ask;
-            // A decode the classic policies picked is owed no ask either:
-            // its answer's one test is all that pair pays behind its prefill.
-            let again = (mode != KvConnectorMode::MoriIo && guards.decode.owed_behind_prefill())
-                .then_some(ask);
 
             // Outcome accounting happens per-side inside the sequential path:
             // a prefill-only failure must not feed the decode worker's
