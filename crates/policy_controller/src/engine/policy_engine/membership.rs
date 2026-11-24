@@ -745,7 +745,6 @@ impl PolicyEngine {
             self.owes(follow, &worker);
         }
         let standing: Vec<WorkerId> = follow.under.keys().copied().collect();
-        self.affinity.keep(&standing);
         self.tell(&Membership::Snapshot(&standing));
     }
 }

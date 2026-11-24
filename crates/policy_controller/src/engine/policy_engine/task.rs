@@ -216,7 +216,9 @@ impl PolicyEngine {
     /// run of the upkeep, a step of the registry's follow in the host's own
     /// code, a stage's hearing of a load report, a report's conversion for
     /// the stages, or a fill of worker lists' cells ahead of their
-    /// requests. Each was held, and the task went on. While the upkeep's
+    /// requests. Each was held, and the task went on. A run of the upkeep
+    /// at the tick of a host that spawns no task of the engine is held
+    /// and counted with them. While the upkeep's
     /// panics raise the count it does not run whole: session keys past
     /// their end can stay on file, though every request is still answered.
     /// While the follow's raise it, a join whose answer of the host
@@ -245,6 +247,14 @@ impl PolicyEngine {
                 None
             }
         }
+    }
+
+    /// The engine's upkeep at `now` under the task's catch
+    /// ([`Self::held`]), for a host that spawns no task of the engine and
+    /// runs the upkeep at a tick of its own. A panic in it is held and
+    /// counted ([`Self::upkeep_faults`]): the host's tick goes on.
+    pub(crate) fn upkeep(&self, now: Instant) {
+        let _swept = self.held(|| self.sweep(now));
     }
 
     /// The task's loop. `upkeep` is the step it runs once a second under

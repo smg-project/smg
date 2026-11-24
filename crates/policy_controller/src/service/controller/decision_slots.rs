@@ -1577,6 +1577,7 @@ pub(crate) mod tests {
     use smg_worker::load::state::{one_rank_load, LoadReceiver, LoadSnapshot};
     use tokio::{
         sync::{mpsc, watch},
+        task::JoinSet,
         time::timeout,
     };
 
@@ -1944,6 +1945,16 @@ pub(crate) mod tests {
 
     pub(crate) fn frame(id: u8, seed: u64) -> proto::DecideRequest {
         frame_for(MODEL, id, seed)
+    }
+
+    /// [`frame`] with a prompt of eight hashed blocks, the same for every
+    /// id and seed.
+    pub(crate) fn hashed(id: u8, seed: u64) -> proto::DecideRequest {
+        let mut frame = frame(id, seed);
+        let facts = frame.facts.as_mut().expect("the case's frame has facts");
+        facts.block_hashes = (1..=8).collect();
+        facts.prompt_tokens = 8 * 16;
+        frame
     }
 
     /// `frame` with `budget` in place of the case's.
@@ -2676,18 +2687,11 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_served_request_lands_where_its_prefix_was_sent() {
         let mut bed = bed(Some(preset("cache_aware", 1)), true, (1, 8), []);
-        let asked = |id: u8, seed: u64| {
-            let mut frame = frame(id, seed);
-            let facts = frame.facts.as_mut().expect("the case's frame has facts");
-            facts.block_hashes = (1..=8).collect();
-            facts.prompt_tokens = 8 * 16;
-            frame
-        };
-        let sent = picked(&bed.ask(asked(1, 100)).await);
+        let sent = picked(&bed.ask(hashed(1, 100)).await);
         // Each lease on file books its worker: load alone would send the
         // next request to another.
         for (id, seed) in (2..=4).zip(101..) {
-            let returned = picked(&bed.ask(asked(id, seed)).await);
+            let returned = picked(&bed.ask(hashed(id, seed)).await);
             assert_eq!(returned, sent, "request {id}");
         }
     }
@@ -2698,20 +2702,13 @@ pub(crate) mod tests {
     /// stays, and the next request with that prefix follows it.
     #[tokio::test]
     async fn a_decision_that_leaves_as_busy_keeps_its_prefix_for_the_next_request() {
-        let asked = |id: u8, seed: u64| {
-            let mut frame = frame(id, seed);
-            let facts = frame.facts.as_mut().expect("the case's frame has facts");
-            facts.block_hashes = (1..=8).collect();
-            facts.prompt_tokens = 8 * 16;
-            frame
-        };
         let fresh = |steps: Vec<Step>| bed(Some(preset("cache_aware", 1)), true, (1, 8), steps);
         // Where the late request lands, and a second request that lands
         // elsewhere as the first of its prefix, each on a bed of its own.
-        let late = picked(&fresh(Vec::new()).ask(asked(1, 100)).await);
+        let late = picked(&fresh(Vec::new()).ask(hashed(1, 100)).await);
         let mut elsewhere = None;
         for seed in 101..=132 {
-            if picked(&fresh(Vec::new()).ask(asked(2, seed)).await) != late {
+            if picked(&fresh(Vec::new()).ask(hashed(2, seed)).await) != late {
                 elsewhere = Some(seed);
                 break;
             }
@@ -2722,11 +2719,118 @@ pub(crate) mod tests {
         // the first's instant again.
         let steps = [Duration::ZERO, BUDGET, Duration::ZERO].map(Step::At);
         let mut bed = fresh(steps.into());
-        let answer = bed.ask(asked(1, 100)).await;
+        let answer = bed.ask(hashed(1, 100)).await;
         assert_eq!(busy(&answer), Reason::BudgetGoneOnArrival);
         assert_eq!(bed.store.live(GATEWAY), 0);
-        let next = picked(&bed.ask(asked(2, seed)).await);
+        let next = picked(&bed.ask(hashed(2, seed)).await);
         assert_eq!(next, late, "the late decision's entry is followed");
+    }
+
+    /// The workers the engine's record of the prefixes sent for [`MODEL`]
+    /// holds a place for, in the bed's store: `None` where the engine keeps
+    /// no record of the model.
+    fn sent_prefixes(bed: &Bed) -> Option<Vec<WorkerId>> {
+        let held = bed.store.deciding(|world| world.front().affinity().held());
+        let of_model = |(model, _): &(Box<str>, _)| **model == *MODEL;
+        held.into_iter().find(of_model).map(|(_, workers)| workers)
+    }
+
+    /// The bed under the `cache_aware` preset behind one request of a hashed
+    /// prompt, with the worker the request was sent to and the facts that
+    /// worker is registered under: the model's record holds a place for
+    /// that worker alone.
+    async fn sent_one_prefix() -> (Bed, WorkerId, WorkerFacts) {
+        let mut bed = bed(Some(preset("cache_aware", 1)), true, (1, 8), []);
+        let sent = picked(&bed.ask(hashed(1, 100)).await);
+        assert_eq!(sent_prefixes(&bed), Some(vec![sent]));
+        let row = WorkersStore::get(&*bed.store, sent).expect("the row");
+        (bed, sent, row.facts)
+    }
+
+    /// A served engine's records of sent prefixes hear the store's word of
+    /// a replacement. A key registered again under a new incarnation is a
+    /// new id, and the records keep no place for the id that went.
+    #[tokio::test]
+    async fn the_sent_prefixes_of_a_replaced_incarnation_are_forgotten() {
+        let (bed, sent, facts) = sent_one_prefix().await;
+        let next = WorkerFacts {
+            incarnation: facts.incarnation + 1,
+            ..facts
+        };
+        let replaced = bed.store.upsert(next).id();
+        assert_ne!(replaced, sent, "a new incarnation is a new id");
+        assert_eq!(sent_prefixes(&bed), Some(Vec::new()));
+    }
+
+    /// The records hear the store's word of a worker that stands under its
+    /// id and serves a model no more. A registration that keeps the
+    /// worker's models keeps what the worker was sent, whether it changes a
+    /// limit of the worker or its width. One that takes the model off
+    /// leaves the records no place for the worker.
+    #[tokio::test]
+    async fn the_sent_prefixes_of_a_worker_that_left_its_model_are_forgotten() {
+        let (bed, sent, facts) = sent_one_prefix().await;
+        let relabelled = WorkerFacts {
+            max_running: Some(8),
+            ..facts.clone()
+        };
+        let resized = WorkerFacts {
+            dp_size: 2,
+            ..facts.clone()
+        };
+        for kept in [relabelled, resized] {
+            assert_eq!(bed.store.upsert(kept).id(), sent);
+            assert_eq!(sent_prefixes(&bed), Some(vec![sent]));
+        }
+        let elsewhere = WorkerFacts {
+            models: vec!["model-b".to_owned()],
+            ..facts
+        };
+        assert_eq!(bed.store.upsert(elsewhere).id(), sent, "the id stands");
+        assert_eq!(sent_prefixes(&bed), Some(Vec::new()));
+    }
+
+    /// The upkeep of a served engine rides the presence sweep's task: that
+    /// engine runs no task of its own. A session key a decision read leaves
+    /// the engine's table by the task's own tick once its idle time ended,
+    /// and no sooner, with no request behind the one that read it.
+    #[tokio::test]
+    async fn the_sweeps_task_takes_a_session_key_out_once_its_idle_time_ended() {
+        let mut document = PolicySpec::preset("manual").expect("a preset of this build");
+        document.generation = 1;
+        let rule = document.bindings[0].sessions.as_mut();
+        let rule = rule.expect("the preset's rule");
+        (rule.ttl_s, rule.sweep_s) = (1, 1);
+        let mut bed = bed(Some(applied(&document)), true, (1, 8), []);
+        let keys = |bed: &Bed| {
+            bed.store
+                .deciding(|world| world.spec().engine().sessions().len())
+        };
+        bed.ask(keyed(1, 1_001)).await;
+        assert_eq!(keys(&bed), 1, "the key its decision read");
+
+        let grace = Duration::from_millis(60);
+        let fence = bed.elector.fence();
+        let gateways = Arc::new(Gateways::new(grace, 1_024, fence, Arc::clone(&bed.store)));
+        let (stop, stopped) = watch::channel(false);
+        let mut task = JoinSet::new();
+        task.spawn(async move { gateways.run(stopped).await });
+        // The decision is dated at the bed's take.
+        let read = bed.script.taken;
+        while keys(&bed) > 0 {
+            assert!(read.elapsed() < PATIENCE, "the task took no key out");
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert!(
+            read.elapsed() >= Duration::from_secs(1),
+            "the key left inside its idle time"
+        );
+        stop.send_replace(true);
+        timeout(PATIENCE, task.join_next())
+            .await
+            .expect("the task ends at its stop")
+            .expect("one task")
+            .expect("it ended by itself");
     }
 
     /// A decision waits in its stream's queue as it was made, with the
@@ -3024,9 +3128,19 @@ pub(crate) mod tests {
         sender: &mpsc::Sender<wire::Decided>,
         answers: &mut mpsc::Receiver<wire::Decided>,
     ) -> Vec<Result<u64, Reason>> {
+        burst_of(deciders, sender, answers, frame).await
+    }
+
+    /// [`burst`] of the frames `framed` makes of each request's id and seed.
+    pub(crate) async fn burst_of(
+        deciders: &DecisionSlots,
+        sender: &mpsc::Sender<wire::Decided>,
+        answers: &mut mpsc::Receiver<wire::Decided>,
+        framed: fn(u8, u64) -> proto::DecideRequest,
+    ) -> Vec<Result<u64, Reason>> {
         for id in 0..16 {
             let job = Job {
-                request: checked(frame(id, u64::from(id))),
+                request: checked(framed(id, u64::from(id))),
                 gateway: GATEWAY,
                 received: Instant::now(),
                 answers: sender.clone(),

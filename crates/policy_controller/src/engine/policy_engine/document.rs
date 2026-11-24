@@ -218,7 +218,13 @@ impl PolicyEngine {
     /// asks the program of its workers under it
     /// ([`Members::standing`](super::membership::Members::standing),
     /// [`Members::facts_of`](super::membership::Members::facts_of)). No decision
-    /// takes that lock: decisions run on beside the call.
+    /// takes that lock: decisions run on beside the call. The call reaches
+    /// no store: a store's word of membership takes the store's lock of its
+    /// workers first and this one behind it.
+    ///
+    /// The engine's records of sent prefixes hear the list told here and
+    /// forget every worker that does not stand. A join told here writes
+    /// nothing to them.
     ///
     /// # Errors
     ///

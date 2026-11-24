@@ -1599,6 +1599,54 @@ mod tests {
         served.expect("a serve that leaves by its signal");
     }
 
+    /// The serve's presence sweep runs the upkeep of the engine its store
+    /// decides by, which runs no task of its own, and the store tells that
+    /// engine each worker that leaves. Served picks write the record of the
+    /// prefixes sent for their model. Once the model's last worker left,
+    /// the record is gone within the sweep's period, with no request behind
+    /// the leaves.
+    #[tokio::test]
+    async fn a_served_controller_keeps_no_sent_prefixes_of_a_model_whose_workers_left() {
+        let controller = Controller::bind(valid()).await.expect("the listeners bind");
+        let (shared, store) = (Arc::clone(&controller.shared), controller.store());
+        let (stop, stopped) = oneshot::channel::<()>();
+        let serve = controller.serve(async {
+            let _ = stopped.await;
+        });
+        let case = async {
+            let (wait, begun) = (Duration::from_secs(20), Instant::now());
+            while shared.fence.leader_term(Instant::now()).is_none() {
+                assert!(begun.elapsed() < wait, "no first take");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            let (singles, sides) = bed::fleet(&store);
+            let applied = store.apply(bed::preset("cache_aware", 1));
+            applied.expect("above the unbound start");
+            let records = || store.deciding(|world| world.front().affinity().held());
+            let (sender, mut answers) = mpsc::channel(64);
+            let read = bed::burst_of(&shared.deciders, &sender, &mut answers, bed::hashed).await;
+            assert!(read.iter().any(Result::is_ok), "no pick: {read:?}");
+            let sent = records();
+            assert!(
+                matches!(sent.as_slice(), [(_, workers)] if !workers.is_empty()),
+                "one model's record, of the workers its picks named: {sent:?}"
+            );
+            for id in singles.into_iter().chain(sides.map(|(_, id)| id)) {
+                let revision = store.get(id).expect("the row").revision;
+                store.remove(id, revision).expect("a removal");
+            }
+            while !records().is_empty() {
+                assert!(begun.elapsed() < wait, "a record no worker is left in");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            stop.send(()).expect("the serve waits for its stop");
+        };
+        let (served, ()) = timeout(Duration::from_secs(60), async { tokio::join!(serve, case) })
+            .await
+            .expect("the serve ends at its stop");
+        served.expect("a serve that leaves by its signal");
+    }
+
     /// The serve starts the follower of the replica's worker objects, on
     /// the wake the store's log tells: a row written while the controller
     /// leads has its object, and a row removed has none.

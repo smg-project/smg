@@ -2046,7 +2046,10 @@ the store steps for each lease on file. A record made of a worker object states 
 no zone.
 The asking gateway's reach, its wires and its standing vetoes are stated to the engine as places
 of the list. A new document is a new engine object: its session pins and its record of sent
-prompts start empty, and that record is told no worker's leave. A sessions rule's cap reads a
+prompts start empty. That engine runs no task of its own. The store tells it each word of its
+membership, so the record forgets a worker that leaves, is replaced or serves a model no more. The
+engine's upkeep runs at each pass of the presence sweep, a tenth of the grace period: once a
+second, the period of the engine's own task in a gateway's process. A sessions rule's cap reads a
 key's requests on the worker object too: the store steps that count for the lease of each keyed
 request on file, a single's on its worker and a pair's on each side's worker, with a sessions rule
 or with none, under the session's number written as text. The object's count of keys with a
