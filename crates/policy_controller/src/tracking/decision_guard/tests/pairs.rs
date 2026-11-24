@@ -1044,10 +1044,9 @@ fn a_pair_dropped_with_one_side_sent_completes_it_and_gives_the_other_up() {
     }
 }
 
-/// A pair's lease holds no encode side: an encode outcome ends no side.
-/// The engine hears the completion whole, under its own side, and the
-/// handle still owes both of its own: the prefill ends at its own word,
-/// and the decode is given up at the drop.
+/// A pair's lease holds no encode side: an encode outcome ends no side
+/// and is said to nobody. The handle still owes both of its own: the
+/// prefill ends at its own word, and the decode is given up at the drop.
 #[test]
 fn an_encode_outcome_on_a_pairs_handle_ends_neither_side() {
     let host = PairHost::of(1, 1);
@@ -1057,7 +1056,7 @@ fn an_encode_outcome_on_a_pairs_handle_ends_neither_side() {
     let first = handle.take(0).expect("the first target");
     let encoded = outcome(Side::Encode, decode_of(&first), TransportClass::Ok);
     handle.completed(&encoded, now);
-    assert_eq!(door.words(), [Said::Completed(encoded)]);
+    assert!(door.words().is_empty(), "nothing is said");
     assert!(handle.owes(), "neither side moved");
     let served = outcome(Side::Single, first.id, TransportClass::Ok);
     handle.completed(&served, now);

@@ -608,6 +608,47 @@ fn a_writer_racing_the_removal_finds_no_row_after_it_returns() {
     }
 }
 
+/// A member with nothing on file but a mark: its engine's last answer named
+/// another rank and left its own out. Its eviction takes the mark, judges
+/// the engine again and is said, as the eviction of a member with a record
+/// is: a world is made, or one is due.
+#[test]
+fn the_eviction_of_a_member_an_answer_left_out_is_said() {
+    let store = MemoryStore::new();
+    let member = |rank: u16| {
+        let facts = WorkerFacts {
+            engine: "http://e:8000".to_string(),
+            dp_rank: rank,
+            dp_size: 2,
+            ..facts(&format!("http://e:8000/{rank}"), 1)
+        };
+        let id = store.upsert(facts).id();
+        store.publish_now();
+        let revision = WorkersStore::get(&store, id).expect("the row").revision;
+        store
+            .set_status(id, WorkerStatus::Ready, revision)
+            .expect("ready");
+        id
+    };
+    let (named, left_out) = (member(0), member(1));
+    let loads: &dyn LoadSink = &store;
+    let t0 = Instant::now();
+    loads.report(
+        &[(named, 0, Some(row(0))), (left_out, 1, None)],
+        t0,
+        LoadSource::Poll,
+    );
+    store.publish_now();
+    assert_eq!(loads.ranks(left_out), 0, "nothing of it is on file");
+    let published = store.publications();
+    assert_eq!(store.publish_due(), None);
+    loads.evict(left_out);
+    assert!(
+        store.publications() > published || store.publish_due().is_some(),
+        "the eviction is said"
+    );
+}
+
 #[test]
 fn an_evicted_member_has_nothing_on_file_and_takes_its_next_report() {
     let store = MemoryStore::new();
