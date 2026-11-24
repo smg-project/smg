@@ -287,12 +287,23 @@ impl EncodeLists<'_> {
         let mut decide = |buffers: &mut Buffers| {
             let [prefills, decodes] = &mut buffers.rows;
             let (workers, prefill_records) = (prefill.workers(), prefill.records(spec, clock));
+            let (decode_workers, decode_records) = (decode.workers(), decode.records(spec, clock));
+            let (encode_workers, records) = (encoders.workers(), encoders.records(spec, clock));
+            // The rows are filled with no read of a worker object where
+            // the three lists are wholly available and the host states no
+            // veto beside any.
+            let live = live.rested_where(spec.engine(), |word| {
+                pair.prefill_stalled.is_empty()
+                    && pair.decode_stalled.is_empty()
+                    && self.encoders_stalled.is_empty()
+                    && prefill_records.stands(workers, word)
+                    && decode_records.stands(decode_workers, word)
+                    && records.stands(encode_workers, word)
+            });
             let (prefills, pool) = prefill_records.write(workers, &live, prefills);
-            let (workers, decode_records) = (decode.workers(), decode.records(spec, clock));
-            let (decodes, _) = decode_records.write(workers, &live, decodes);
+            let (decodes, _) = decode_records.write(decode_workers, &live, decodes);
             stamp(prefills, decodes, pair.classes, pair.admission);
-            let (workers, records) = (encoders.workers(), encoders.records(spec, clock));
-            let (rows, _) = records.write(workers, &live, &mut buffers.encoders);
+            let (rows, _) = records.write(encode_workers, &live, &mut buffers.encoders);
             // Under a document a stage of which reads a named signal, each
             // of the three sides that reads one is lent its list's cells
             // for this call.

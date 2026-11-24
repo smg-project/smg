@@ -845,7 +845,9 @@ pub struct Candidate {
     /// asks [`RequestFacts::in_flight`].
     ///
     /// The in-process front reads it off the worker object at every
-    /// decision: the object's own counter, which a host raises where it
+    /// decision, but for a pair's or an encode request's rows filled with
+    /// no read of the object, under a document no stage of which reads this
+    /// count. It is the object's own counter, which a host raises where it
     /// makes the worker's load guard and lowers where the guard is
     /// dropped. A guard can be made ahead of its send. The decode of a
     /// pair named at the first decision is so counted on its row before

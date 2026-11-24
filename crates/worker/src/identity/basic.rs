@@ -610,6 +610,23 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
         }
     }
 
+    /// Whether the routing state this worker published last says that no
+    /// routing veto holds: the one case [`Self::routing_state`] answers
+    /// without a read of the worker's facts. Every write that changes a
+    /// published state moves the process's word
+    /// ([`published_word`](crate::runtime::published_word)), so a caller
+    /// that read the word before it asked, and reads the same value later,
+    /// knows the answer still stands.
+    ///
+    /// `false` for a worker that publishes no routing state, the default:
+    /// what such a worker says is read from its facts at every decision.
+    /// A worker type that answers `true` moves the process's word at every
+    /// change of this answer, behind the change: a caller keeps a `true`
+    /// for as long as the word stands.
+    fn published_available(&self) -> bool {
+        false
+    }
+
     /// Record the outcome of a request based on the HTTP status code.
     ///
     /// Statuses in the per-worker `capacity_status_codes` set (default: 429)
@@ -1845,6 +1862,10 @@ impl Worker for BasicWorker {
             overloaded: rt.is_overloaded(),
             stalled: rt.stall_reason().is_some(),
         }
+    }
+
+    fn published_available(&self) -> bool {
+        self.runtime.load().published_state() == AVAILABLE_CODE
     }
 
     fn record_circuit_breaker_outcome(&self, success: bool) {

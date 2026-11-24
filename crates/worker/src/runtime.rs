@@ -133,6 +133,30 @@ const _: () = assert!(matches!(
 pub(super) const STALE_BIT: u8 = 0x80;
 const _: () = assert!(STALE_BIT as usize > ROUTING_STATE_SERIES.len());
 
+/// The process's count of moves of a published code, alone on its cache
+/// lines: every routing decision may load it, and a write beside it would
+/// cost each of them a miss.
+#[repr(align(128))]
+struct PublishedWord(AtomicU64);
+
+static PUBLISHED_WORD: PublishedWord = PublishedWord(AtomicU64::new(1));
+
+/// How many times a worker's published routing state has moved in this
+/// process, starting at one. Every write that changes a worker's published
+/// code moves it, after the code is written
+/// ([`WorkerRuntime::swap_published_state`],
+/// [`WorkerRuntime::mark_published_stale`]).
+///
+/// A caller that reads it, then asks workers whether their published state
+/// says available (`Worker::published_available`), and later reads the same
+/// value again knows that no published state has changed since: what the
+/// workers answered still stands. A write that lands between its two reads
+/// shows in the second.
+#[inline]
+pub fn published_word() -> u64 {
+    PUBLISHED_WORD.0.load(Ordering::Acquire)
+}
+
 /// The index in [`ROUTING_STATE_SERIES`] of a worker with these facts: the
 /// first that excludes it, else available.
 pub(super) fn routing_state_series(
@@ -811,15 +835,26 @@ impl WorkerRuntime {
 
     /// Mark the published code stale (the `STALE_BIT`). Called under
     /// [`Self::publish_lock`], so it lands before or after a whole publish.
+    /// A mark that changes the code moves the process's word
+    /// ([`published_word`]).
     pub fn mark_published_stale(&self) {
-        self.published_state.fetch_or(STALE_BIT, Ordering::AcqRel);
+        let previous = self.published_state.fetch_or(STALE_BIT, Ordering::AcqRel);
+        if previous & STALE_BIT == 0 {
+            PUBLISHED_WORD.0.fetch_add(1, Ordering::AcqRel);
+        }
     }
 
     /// Remember `code` as the published `smg_worker_state` series; the code
     /// published before it comes back (0 when none was). Called under
-    /// [`Self::publish_lock`].
+    /// [`Self::publish_lock`]. A code that differs from the one before it
+    /// moves the process's word ([`published_word`]), after the code is
+    /// written: a reader that finds the word unmoved has missed no code.
     pub fn swap_published_state(&self, code: u8) -> u8 {
-        self.published_state.swap(code, Ordering::AcqRel)
+        let previous = self.published_state.swap(code, Ordering::AcqRel);
+        if previous != code {
+            PUBLISHED_WORD.0.fetch_add(1, Ordering::AcqRel);
+        }
+        previous
     }
 
     /// The lock a publish of the `smg_worker_state` series holds from the

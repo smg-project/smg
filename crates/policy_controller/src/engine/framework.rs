@@ -2820,6 +2820,15 @@ const DRAWS_BY_ITS_TEST: [&str; 6] = [
     "round-robin",
 ];
 
+/// The crate's own pickers, by name, that read no count a worker object
+/// alone holds: neither a row's requests in flight nor a count of its
+/// sessions. A profile of the engine's own filters, no scorer and one of
+/// these reads a row's fixed half, its report and its vetoes, and nothing
+/// else of it ([`Engine::rows_stand`]). A picker of one of these names is
+/// the crate's, as one of [`DRAWS_BY_ITS_TEST`] is.
+#[cfg(feature = "in-process")]
+const PICKS_BY_NO_COUNT: [&str; 2] = ["random", "round-robin"];
+
 /// A plain single decision that is a draw's, as [`Engine::drawn_for`] found
 /// it: the profile that draws and its binding's word for a pool the
 /// overload veto empties.
@@ -3614,6 +3623,10 @@ pub struct Engine {
     /// is handed and in no other way ([`DRAWS_BY_ITS_TEST`]).
     #[cfg(feature = "in-process")]
     written_draws: Box<[bool]>,
+    /// Whether no stage of any profile and no sessions rule's assignment
+    /// reads a count a worker object alone holds ([`Self::rows_stand`]).
+    #[cfg(feature = "in-process")]
+    rows_stand: bool,
     /// What the door needs of a seat, zero on the plain path.
     seat_flags: u8,
     explain_sample: u32,
@@ -5022,6 +5035,18 @@ impl Engine {
             .iter()
             .map(|profile| RowTests::of(&profile.filters))
             .collect();
+        // A sessions rule that places a new key by a count scores the rows
+        // itself, beside every profile ([`Self::place`]).
+        #[cfg(feature = "in-process")]
+        let rows_stand = profiles.iter().zip(&row_tests).all(|(profile, tests)| {
+            tests.is_some()
+                && profile.scorers.is_empty()
+                && PICKS_BY_NO_COUNT.contains(&profile.picker.name())
+        }) && bindings.iter().all(|binding| {
+            binding.sessions.as_ref().is_none_or(|rule| {
+                matches!(rule.assignment, Assignment::Delegate | Assignment::Random)
+            })
+        });
         let named_by: Vec<NamedBy> = profiles
             .iter()
             .zip(&row_tests)
@@ -5154,6 +5179,8 @@ impl Engine {
             orders,
             #[cfg(feature = "in-process")]
             written_draws,
+            #[cfg(feature = "in-process")]
+            rows_stand,
             seat_flags: (u8::from(keeping) * KEEPS_SLOT_STATE) | (u8::from(shadows) * SHADOWS),
             explain_sample: 0,
             max_report_age_ms: None,
@@ -5280,6 +5307,22 @@ impl Engine {
     /// stages and the view's own list of headers.
     pub fn needs(&self) -> Needs {
         self.needs
+    }
+
+    /// Whether the rows of a decision under this document may be written
+    /// with no read of a worker object where every worker of its lists is
+    /// available: no stage of any profile, live or shadow, and no sessions
+    /// rule reads a row's requests in flight or a count of its sessions.
+    /// Each profile holds the engine's own filters alone, no scorer, and a
+    /// picker that reads no count ([`PICKS_BY_NO_COUNT`]); a plugin's stage
+    /// and a host's own are taken as reading one. No sessions rule places
+    /// a new key on the worker with the fewest requests or the fewest
+    /// keys, and none caps a key's requests. The engine's own rule for an
+    /// emptied pool reads the count too, and never over rows none of which
+    /// carries a veto.
+    #[cfg(feature = "in-process")]
+    pub(crate) fn rows_stand(&self) -> bool {
+        self.rows_stand && !self.needs.session_in_flight && !self.needs.active_sessions
     }
 
     /// What a decision of `phase` for `model` reads: the needs of the stages

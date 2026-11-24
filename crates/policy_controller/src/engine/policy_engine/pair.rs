@@ -454,13 +454,26 @@ impl<'a> PairLists<'a> {
         let decide = |buffers: &mut Buffers| {
             let [prefills, decodes] = &mut buffers.rows;
             let (workers, prefill_records) = (prefill.workers(), prefill.records(spec, clock));
+            let (decode_workers, decode_records) = (decode.workers(), decode.records(spec, clock));
+            // The rows are filled with no read of a worker object where
+            // both lists are wholly available and the host states no veto
+            // beside either. The decode asked again writes one prefill: it
+            // takes the prefills' kept answer and asks no prefill.
+            let live = live.rested_where(spec.engine(), |word| {
+                self.prefill_stalled.is_empty()
+                    && self.decode_stalled.is_empty()
+                    && match held {
+                        Some(_) => prefill_records.stood(word),
+                        None => prefill_records.stands(workers, word),
+                    }
+                    && decode_records.stands(decode_workers, word)
+            });
             // The decode asked again reads one prefill, the held one.
             let (prefills, prefill_facts) = match held {
                 Some(held) => held_prefill(prefill_records, workers, &live, held, prefills),
                 None => prefill_records.write(workers, &live, prefills),
             };
-            let (workers, decode_records) = (decode.workers(), decode.records(spec, clock));
-            let (decodes, decode_facts) = decode_records.write(workers, &live, decodes);
+            let (decodes, decode_facts) = decode_records.write(decode_workers, &live, decodes);
             // A host that counts the request on its first decode
             // ([`Constraints::counted_on_decode`]) is answered over that
             // decode's record without the request. The decode is read at
