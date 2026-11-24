@@ -28,7 +28,7 @@ use crate::{
             Plain, Request, RequestMaker, TokenKey, WorkerLists,
         },
         framework::{EncodeItems, EncodePlaced, EncoderFacts},
-        list_cell::tests::PublishedList,
+        list_cell::PublishedList,
         prompt_hashes::{HashSeeds, PromptHashes},
         records::worker_id,
         view::{Constraints, Identity, Phase, RequestFacts, Session, WorkerId},

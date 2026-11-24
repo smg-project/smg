@@ -1220,7 +1220,7 @@ mod tests {
             .to_owned()
     }
 
-    // Six kinds of document a typed YAML read took and the policy crate's
+    // Five kinds of document a typed YAML read took and the policy crate's
     // read refuses. Each refusal names its place and what a writer does.
 
     #[test]
@@ -1258,17 +1258,6 @@ mod tests {
     }
 
     #[test]
-    fn a_whole_number_past_64_bits_is_refused_by_its_digits_and_its_place() {
-        let text = "apiVersion: smg.policy/v1\nprofiles:\n  default:\n    \
-                    score: [{least-load: {weight: 18446744073709551616}}]\n    pick: best\n";
-        assert_eq!(
-            refusal_of("routing.yaml", text),
-            "not a policy spec in yaml: profiles.default.score[0].least-load.weight: \
-             the number 18446744073709551616 is none JSON writes at line 4 column 35"
-        );
-    }
-
-    #[test]
     fn aliases_past_the_readers_bounds_are_refused_by_the_bound() {
         // One list of a thousand scorers, shared by a thousand profiles, each
         // named by a binding.
@@ -1302,6 +1291,37 @@ mod tests {
             "not a policy spec in json: expected value at line 1 column 1: \
              a file named .json is read as JSON, any other name as YAML"
         );
+    }
+
+    /// A whole number past 64 bits where a fraction stands reads as a
+    /// fraction, in a YAML file as in a JSON file.
+    #[test]
+    fn a_whole_number_past_64_bits_reads_as_a_fraction_in_both_forms() {
+        let dir = tempdir().expect("a temporary directory");
+        let forms = [
+            (
+                "routing.yaml",
+                "apiVersion: smg.policy/v1\nprofiles:\n  default:\n    \
+                 score: [{least-load: {weight: 18446744073709551616}}]\n    pick: best\n",
+            ),
+            (
+                "routing.json",
+                r#"{"apiVersion":"smg.policy/v1","profiles":{"default":{"score":[{"least-load":{"weight":18446744073709551616}}],"pick":"best"}}}"#,
+            ),
+        ];
+        let [yaml, json] = forms.map(|(file, text)| {
+            let path = dir.path().join(file);
+            let path = path.to_str().expect("a UTF-8 path");
+            std::fs::write(path, text).expect("the document is written");
+            RouterConfig::builder()
+                .policy_controller(true)
+                .maybe_policy_spec_path(Some(path))
+                .build_with_validation(false)
+                .expect("the document reads")
+                .policy_spec
+        });
+        assert!(yaml.is_some(), "the YAML file reads");
+        assert_eq!(yaml, json);
     }
 
     /// A file's form is read off its name, and what the print of a

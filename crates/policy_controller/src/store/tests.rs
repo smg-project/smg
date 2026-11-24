@@ -14,10 +14,10 @@ use super::{
     identity, identity_of,
     leases::{InFlightCounts, WorkerSlot},
     AtWork, BatchFacts, BatchOutcome, ContentHash, DecodeMark, DecodeSide, GatewayId, Hand,
-    HealthSink, HealthWrite, Journal, KvEvent, KvEventSink, LeaseRecord, LeaseRefused, LeaseState,
-    LeasesStore, LoadSink, LoadSource, LookOutcome, MembershipChange, MembershipTail, MemoryStore,
-    PickRecord, PollMode, Position, ReservationKind, ReservationStore, ResyncReason, SequenceHash,
-    Sides, Signals, SnapshotChunk, StoreSnapshot, StoredBlock, VetoWrite, WorkerFacts, WorkerPatch,
+    HealthSink, Journal, KvEvent, KvEventSink, LeaseRecord, LeaseRefused, LeaseState, LeasesStore,
+    LoadSink, LoadSource, LookOutcome, MembershipChange, MembershipTail, MemoryStore, PickRecord,
+    PollMode, Position, ReservationKind, ReservationStore, ResyncReason, SequenceHash, Sides,
+    Signals, SnapshotChunk, StoreSnapshot, StoredBlock, VetoWrite, WorkerFacts, WorkerPatch,
     WorkerRow, WorkerStatus, WorkersStore,
 };
 use crate::{
@@ -310,302 +310,45 @@ fn snapshot_sort_does_not_hold_the_workers_lock() {
     );
 }
 
+/// A status its holder tells says what happened to it, and the status that
+/// stands where it was judged: it moved, it stood, its writer's last word
+/// said no, the row left the revision it was told under, or no row stands.
+#[cfg(feature = "worker-host")]
 #[test]
-fn probe_outcomes_follow_the_rows_thresholds_and_a_stale_outcome_is_dropped() {
-    let store = MemoryStore::new();
-    let health: &dyn HealthSink = &store;
-    let id = store.upsert(facts("http://w:8000", 1)).id();
-    let revision = || WorkersStore::get(&store, id).expect("the row").revision;
-    assert_eq!(
-        health.probe_outcome(id, true, revision(), &|| true).moved(),
-        None
-    );
-    assert_eq!(
-        health.probe_outcome(id, true, revision(), &|| true).moved(),
-        Some((WorkerStatus::Pending, WorkerStatus::Ready)),
-        "two passes promote a pending worker"
-    );
-    // A patch moves the revision: an outcome read under the one it left is
-    // stale.
-    let stale = revision();
-    WorkersStore::patch(&store, id, WorkerPatch::default(), stale).expect("the patch");
-    assert_eq!(
-        health.probe_outcome(id, false, stale, &|| true).moved(),
-        None,
-        "a stale outcome is dropped"
-    );
-    assert_eq!(
-        health
-            .probe_outcome(id, false, revision(), &|| true)
-            .moved(),
-        None
-    );
-    assert_eq!(
-        health
-            .probe_outcome(id, false, revision(), &|| true)
-            .moved(),
-        None
-    );
-    assert_eq!(
-        health
-            .probe_outcome(id, false, revision(), &|| true)
-            .moved(),
-        Some((WorkerStatus::Ready, WorkerStatus::NotReady)),
-        "three failures demote"
-    );
-    for _ in 0..8 {
-        assert_eq!(
-            health
-                .probe_outcome(id, false, revision(), &|| true)
-                .moved(),
-            None
-        );
-    }
-    assert_eq!(
-        health
-            .probe_outcome(id, false, revision(), &|| true)
-            .moved(),
-        Some((WorkerStatus::NotReady, WorkerStatus::Failed)),
-        "nine more fail it"
-    );
-    assert_eq!(
-        health.probe_outcome(id, true, revision(), &|| true).moved(),
-        None
-    );
-    assert_eq!(
-        health.probe_outcome(id, true, revision(), &|| true).moved(),
-        Some((WorkerStatus::Failed, WorkerStatus::Ready)),
-        "two passes bring a failed worker back"
-    );
-    let fresh = store.upsert(facts("http://f:8000", 1)).id();
-    let fresh_revision = WorkersStore::get(&store, fresh).expect("the row").revision;
-    assert_eq!(
-        health.connected(fresh, fresh_revision, &|| true).moved(),
-        Some((WorkerStatus::Pending, WorkerStatus::Ready)),
-        "the connect signal promotes at once"
-    );
-    assert_eq!(
-        health.connected(fresh, fresh_revision, &|| true).moved(),
-        None,
-        "a ready row takes no second promotion"
-    );
-}
-
-#[test]
-fn a_threshold_past_the_counters_range_is_never_met_early() {
-    // The first threshold whose tenfold passes 32 bits, and the last one.
-    for threshold in [429_496_730, u32::MAX] {
-        let store = MemoryStore::new();
-        let health: &dyn HealthSink = &store;
-        let mut stated = facts("http://w:8000", 1);
-        stated.health.failure_threshold = threshold;
-        let id = store.upsert(stated).id();
-        let revision = || WorkersStore::get(&store, id).expect("the row").revision;
-        // A pending worker's cap is ten thresholds: five failed probes are
-        // far under it.
-        for _ in 0..5 {
-            assert_eq!(
-                health
-                    .probe_outcome(id, false, revision(), &|| true)
-                    .moved(),
-                None,
-                "pending under {threshold}"
-            );
-        }
-        assert_eq!(
-            health.probe_outcome(id, true, revision(), &|| true).moved(),
-            None
-        );
-        assert_eq!(
-            health.probe_outcome(id, true, revision(), &|| true).moved(),
-            Some((WorkerStatus::Pending, WorkerStatus::Ready))
-        );
-        // And a ready one stays ready through failures under the threshold.
-        for _ in 0..5 {
-            assert_eq!(
-                health
-                    .probe_outcome(id, false, revision(), &|| true)
-                    .moved(),
-                None,
-                "ready under {threshold}"
-            );
-        }
-    }
-}
-
-#[test]
-fn a_counter_at_its_ranges_end_stays_there() {
-    let store = MemoryStore::new();
-    let health: &dyn HealthSink = &store;
-    let mut stated = facts("http://w:8000", 1);
-    stated.health.failure_threshold = u32::MAX;
-    let id = store.upsert(stated).id();
-    let revision = || WorkersStore::get(&store, id).expect("the row").revision;
-    // A pending worker's cap is held at the counter's end: met there, and
-    // one probe short of it not yet.
-    store.probed(id, 0, 0, u32::MAX - 2);
-    assert_eq!(
-        health
-            .probe_outcome(id, false, revision(), &|| true)
-            .moved(),
-        None
-    );
-    assert_eq!(
-        health
-            .probe_outcome(id, false, revision(), &|| true)
-            .moved(),
-        Some((WorkerStatus::Pending, WorkerStatus::Failed))
-    );
-    // Each counter at its end takes one probe more and stays there.
-    store.probed(id, u32::MAX, u32::MAX, u32::MAX);
-    assert_eq!(
-        health
-            .probe_outcome(id, false, revision(), &|| true)
-            .moved(),
-        None
-    );
-    store.probed(id, 0, u32::MAX, u32::MAX);
-    assert_eq!(
-        health.probe_outcome(id, true, revision(), &|| true).moved(),
-        Some((WorkerStatus::Failed, WorkerStatus::Ready))
-    );
-}
-
-#[test]
-fn a_threshold_whose_triple_passes_the_counters_range_fails_no_row_early() {
-    // The first threshold whose triple passes 32 bits: a product that
-    // wrapped would read 2.
-    let threshold = 1_431_655_766;
-    let store = MemoryStore::new();
-    let health: &dyn HealthSink = &store;
-    let mut stated = facts("http://w:8000", 1);
-    stated.health.failure_threshold = threshold;
-    let id = store.upsert(stated).id();
-    let revision = || WorkersStore::get(&store, id).expect("the row").revision;
-    assert_eq!(
-        health.probe_outcome(id, true, revision(), &|| true).moved(),
-        None
-    );
-    assert_eq!(
-        health.probe_outcome(id, true, revision(), &|| true).moved(),
-        Some((WorkerStatus::Pending, WorkerStatus::Ready))
-    );
-    // Ready, the row is not ready at the threshold's own count of failed
-    // probes: the count is set one short of it.
-    store.probed(id, threshold - 1, 0, 0);
-    assert_eq!(
-        health
-            .probe_outcome(id, false, revision(), &|| true)
-            .moved(),
-        Some((WorkerStatus::Ready, WorkerStatus::NotReady))
-    );
-    // Not ready, it fails at three thresholds of failed probes: five are
-    // far under them.
-    for _ in 0..5 {
-        assert_eq!(
-            health
-                .probe_outcome(id, false, revision(), &|| true)
-                .moved(),
-            None,
-            "not ready under the triple"
-        );
-    }
-}
-
-#[test]
-fn a_connect_signal_read_under_a_revision_the_row_left_is_dropped() {
-    let store = MemoryStore::new();
-    let health: &dyn HealthSink = &store;
-    let id = store.upsert(facts("http://p:8000", 1)).id();
-    let read = WorkersStore::get(&store, id).expect("the row").revision;
-    WorkersStore::patch(&store, id, WorkerPatch::default(), read).expect("the patch");
-    assert_eq!(
-        health.connected(id, read, &|| true).moved(),
-        None,
-        "a stale signal is dropped"
-    );
-    assert_eq!(
-        WorkersStore::get(&store, id).expect("the row").status,
-        WorkerStatus::Pending,
-        "and the row stays as it stood"
-    );
-    assert_eq!(
-        health.connected(id, read + 1, &|| true).moved(),
-        Some((WorkerStatus::Pending, WorkerStatus::Ready)),
-        "the signal read under the row's revision promotes"
-    );
-}
-
-#[test]
-fn a_health_write_says_what_happened_and_the_status_that_stands() {
+fn a_told_status_says_what_happened_and_the_status_that_stands() {
     use super::HealthWrite::{Moved, NoRow, Stale, Stood};
 
     let store = MemoryStore::new();
-    let health: &dyn HealthSink = &store;
     let id = store.upsert(facts("http://w:8000", 1)).id();
     let revision = || WorkersStore::get(&store, id).expect("the row").revision;
-    // A write that moves nothing is judged, and says the status that stands.
+    let told = |status, revision, leads: bool| store.status_told(id, status, revision, &|| leads);
+    // A status the row holds already stands, and nothing is written.
+    let epoch = store.epoch();
     assert_eq!(
-        health.probe_outcome(id, true, revision(), &|| true),
+        told(WorkerStatus::Pending, revision(), true),
         Stood(WorkerStatus::Pending)
     );
+    assert_eq!(store.epoch(), epoch);
     assert_eq!(
-        health.probe_outcome(id, true, revision(), &|| true),
+        told(WorkerStatus::Ready, revision(), true),
         Moved {
             from: WorkerStatus::Pending,
             to: WorkerStatus::Ready
         }
     );
-    // The connect signal on a ready row stands and clears no counter: two
-    // failures ahead of it and one behind it are the threshold's three.
-    for _ in 0..2 {
-        assert_eq!(
-            health.probe_outcome(id, false, revision(), &|| true),
-            Stood(WorkerStatus::Ready)
-        );
-    }
-    assert_eq!(
-        health.connected(id, revision(), &|| true),
-        Stood(WorkerStatus::Ready)
-    );
-    assert_eq!(
-        health.probe_outcome(id, false, revision(), &|| true),
-        Moved {
-            from: WorkerStatus::Ready,
-            to: WorkerStatus::NotReady
-        },
-        "the signal cleared no counter of the ready row"
-    );
-    // A write read under a revision the row left is stale: it says no
-    // status and is not counted, so the two passes behind it are the
-    // threshold's two.
+    // A writer whose last word says no writes nothing.
+    assert_eq!(told(WorkerStatus::NotReady, revision(), false), Stale);
+    // A status told under a revision the row left is stale: it says no
+    // status, and the row stands as it stood.
     let left = revision();
     WorkersStore::patch(&store, id, WorkerPatch::default(), left).expect("the patch");
-    assert_eq!(health.probe_outcome(id, true, left, &|| true), Stale);
-    assert_eq!(health.connected(id, left, &|| true), Stale);
-    assert_eq!(
-        health.probe_outcome(id, true, revision(), &|| true),
-        Stood(WorkerStatus::NotReady),
-        "the stale pass was not counted"
-    );
-    assert_eq!(
-        health.probe_outcome(id, true, revision(), &|| true),
-        Moved {
-            from: WorkerStatus::NotReady,
-            to: WorkerStatus::Ready
-        }
-    );
-    // A draining row stands at the signal too.
-    WorkersStore::set_status(&store, id, WorkerStatus::Draining, revision()).expect("drained");
-    assert_eq!(
-        health.connected(id, revision(), &|| true),
-        Stood(WorkerStatus::Draining)
-    );
-    // A write for a worker whose row is gone says no row.
+    assert_eq!(told(WorkerStatus::NotReady, left, true), Stale);
+    let stands = WorkersStore::get(&store, id).expect("the row").status;
+    assert_eq!((stands, store.epoch()), (WorkerStatus::Ready, epoch + 2));
+    // A status told for a worker whose row is gone says no row.
     let last = revision();
     store.remove(id, last).expect("removed");
-    assert_eq!(health.probe_outcome(id, true, last, &|| true), NoRow);
-    assert_eq!(health.connected(id, last, &|| true), NoRow);
+    assert_eq!(told(WorkerStatus::NotReady, last, true), NoRow);
 }
 
 #[test]
@@ -881,6 +624,23 @@ fn an_evicted_member_has_nothing_on_file_and_takes_its_next_report() {
     );
     loads.report(&[(id, 0, Some(row(0)))], t0, LoadSource::Poll);
     assert_eq!(loads.ranks(id), 1, "a member's next report is written");
+}
+
+/// The eviction of a member with nothing on file moves no row a
+/// publication shows: no world is made for it, and none is due at the
+/// window's end.
+#[test]
+fn the_eviction_of_a_member_with_nothing_on_file_asks_for_no_publication() {
+    let store = MemoryStore::new();
+    let id = ready(&store, "http://w:8000");
+    let loads: &dyn LoadSink = &store;
+    let published = store.publications();
+    assert_eq!(loads.publish_due(), None);
+    loads.evict(id);
+    assert_eq!(
+        (store.publications(), loads.publish_due()),
+        (published, None)
+    );
 }
 
 /// A poll's row stands in for a silent rank's sample but never for its
@@ -2134,6 +1894,52 @@ fn a_call_issues_the_chosen_side_afresh_and_books_it_once() {
     );
 }
 
+/// A pair's decode side keeps its own session verdict on file, beside the
+/// prefill side's on the record's lease, and the side's lease states the
+/// side's own. A dispatch that moves the side to another target leaves the
+/// verdict as it was: a claim names the worker claimed at the issue. A
+/// call's issue files the call's verdict with its side.
+#[test]
+fn a_decode_side_keeps_its_own_session_verdict_on_file() {
+    let store = MemoryStore::new();
+    let [p, d0, d1] = ["http://p:1", "http://d0:1", "http://d1:1"].map(|key| ready(&store, key));
+    let leases: &dyn LeasesStore = &store;
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    leases.set_term(1);
+    let claimed = |id| Some(SessionVerdict::Claimed(id));
+    // What the file holds of the lease `id`: the side's verdict, then the
+    // one each side's lease states.
+    let verdicts = |id: u64| {
+        let filed = leases.sides(gateway, LeaseId(id)).expect("on file");
+        let stated = |side| filed.side(side).map(|(lease, _)| lease.session_verdict);
+        let kept = filed.decode.map(|side| side.session_verdict);
+        [kept, stated(Side::Prefill), stated(Side::Decode)]
+    };
+    let (mut record, mut decode) = pair(1, p, &[d0, d1], now);
+    record.lease.session_verdict = SessionVerdict::Claimed(p);
+    decode.session_verdict = SessionVerdict::Claimed(d0);
+    issue_pair(leases, (record, decode)).expect("the key is free");
+    let own = [claimed(d0), claimed(p), claimed(d0)];
+    assert_eq!(verdicts(1), own);
+    assert!(leases.dispatched(gateway, LeaseId(1), on(Side::Decode, 1), now));
+    let moved = leases.sides(gateway, LeaseId(1)).expect("on file").decode;
+    assert_eq!(moved.map(|side| side.target), Some(d1));
+    assert_eq!(verdicts(1), own, "the worker claimed at the issue");
+
+    let (mut record, mut chosen) = chosen_pair(2, p, &[d0], now);
+    record.lease.session_verdict = SessionVerdict::Claimed(p);
+    chosen.session_verdict = SessionVerdict::Claimed(d0);
+    issue_pair(leases, (record, chosen)).expect("the key is free");
+    assert!(leases.dispatched(gateway, LeaseId(2), on(Side::Prefill, 0), now));
+    let call = DecodeSide {
+        session_verdict: SessionVerdict::Pinned,
+        ..decode_side(d0)
+    };
+    assert_eq!(leases.issue_decode(gateway, LeaseId(2), call, now), Ok(()));
+    let pinned = Some(SessionVerdict::Pinned);
+    assert_eq!(verdicts(2), [pinned, claimed(p), pinned]);
+}
+
 #[test]
 fn the_call_starts_the_dispatch_deadline_again() {
     let store = MemoryStore::new();
@@ -3018,6 +2824,7 @@ fn decode_side(target: WorkerId) -> DecodeSide {
         target,
         picked: PickRecord::default(),
         session: Session::NONE,
+        session_verdict: SessionVerdict::None,
         state: LeaseState::ISSUED,
         tokens: 0,
         target_index: 0,
@@ -3193,7 +3000,6 @@ fn a_watch_snapshot_keeps_a_members_local_tables() {
         store.admit(id, 0, batch(1), &one_block(1)),
         BatchOutcome::Applied
     );
-    store.probed(id, 2, 0, 0);
 
     let mut cut = store.checkpoint();
     cut.epoch += 1;
@@ -3203,7 +3009,6 @@ fn a_watch_snapshot_keeps_a_members_local_tables() {
     cut.rows[0].facts.priority = 8;
     let mut expected = cut.rows[0].clone();
     expected.admitted_at = WorkersStore::get(&store, id).expect("the row").admitted_at;
-    let revision = expected.revision;
     assert!(store.watch_from(cut));
 
     assert_eq!(leases.live(gateway), 1);
@@ -3215,13 +3020,6 @@ fn a_watch_snapshot_keeps_a_members_local_tables() {
     assert_eq!(LoadSink::load(&store, id, 0), Some(local_load));
     assert_eq!(store.kv().held_blocks("m"), 1);
     assert_eq!(WorkersStore::get(&store, id), Some(expected));
-    assert_eq!(
-        store.probe_outcome(id, false, revision, &|| true),
-        HealthWrite::Moved {
-            from: WorkerStatus::Ready,
-            to: WorkerStatus::NotReady
-        }
-    );
 }
 
 #[test]
@@ -3864,8 +3662,8 @@ fn a_lease_on_a_member_in_no_pool_books_its_count() {
 }
 
 /// A world names the slot of a member in no pool from the build behind
-/// its write to the build behind its leave, and of no worker beside the
-/// members its build read.
+/// its write to the build behind its leave, a slot of its own, and of
+/// no worker beside the members its build read.
 #[test]
 fn a_world_names_a_member_in_no_pool_until_it_leaves() {
     let store = MemoryStore::new();
@@ -3875,28 +3673,21 @@ fn a_world_names_a_member_in_no_pool_until_it_leaves() {
         ..facts("http://b:1", 1)
     };
     let owed = store.upsert(bare).id();
-    assert!(store.snapshot().booked_of(pooled).is_some());
+    let listed = store.snapshot().booked_of(pooled);
+    assert!(listed.is_some());
     assert!(
-        store.snapshot().unpooled_of(owed).is_none(),
+        store.snapshot().booked_of(owed).is_none(),
         "inside its window"
     );
     store.publish_now();
-    assert!(
-        store.snapshot().unpooled_of(owed).is_some(),
-        "named, in no pool"
-    );
-    assert!(
-        store.snapshot().booked_of(owed).is_none(),
-        "no pool lists it"
-    );
-    assert!(
-        store.snapshot().unpooled_of(pooled).is_none(),
-        "a pool lists it"
-    );
+    let named = store.snapshot().booked_of(owed);
+    assert!(named.is_some(), "named, in no pool");
+    assert_ne!(named, listed, "a slot of its own");
+    assert_eq!(store.snapshot().booked_of(pooled), listed);
     let revision = WorkersStore::get(&store, owed).expect("the row").revision;
     assert!(store.remove(owed, revision).is_some());
-    assert!(store.snapshot().unpooled_of(owed).is_none(), "it left");
-    assert!(store.snapshot().booked_of(pooled).is_some());
+    assert!(store.snapshot().booked_of(owed).is_none(), "it left");
+    assert_eq!(store.snapshot().booked_of(pooled), listed);
 }
 
 /// A generation of the standing pairing mode builds no membership: the
@@ -3913,10 +3704,12 @@ fn a_generation_that_builds_no_membership_still_names_a_member_in_no_pool() {
     };
     let owed = store.upsert(bare).id();
     store.publish_now();
-    assert!(store.snapshot().unpooled_of(owed).is_some());
+    let named = store.snapshot().booked_of(owed);
+    assert!(named.is_some());
     store.apply(manual_ruled(2, 60, 30)).expect("generation 2");
-    assert!(
-        store.snapshot().unpooled_of(owed).is_some(),
+    assert_eq!(
+        store.snapshot().booked_of(owed),
+        named,
         "the generation built no membership"
     );
 }

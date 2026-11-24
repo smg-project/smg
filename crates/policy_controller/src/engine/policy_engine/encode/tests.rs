@@ -25,7 +25,7 @@ use crate::{
         decision::{LiftedVeto, ShedReason, Targets, SUBSET_HINT},
         decision_engine::{DecisionEngine, HeldDecision, HeldDecode},
         framework::{DecisionScope, Filter, Picker, TieBand},
-        list_cell::tests::PublishedList,
+        list_cell::PublishedList,
         pair_classes::PartnerClasses,
         policy_engine::pair::PairAdmission,
         prompt_hashes::{HashSeeds, PromptHashes},

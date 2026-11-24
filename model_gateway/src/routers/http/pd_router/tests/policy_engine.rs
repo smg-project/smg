@@ -299,6 +299,49 @@ async fn a_decode_that_moved_is_sent_the_rank_of_the_row_it_moved_to() {
     assert_eq!(noted(&to_prefill), [None]);
 }
 
+// ---- which attempt asks its decode again ---------------------------------------------------
+
+/// The attempt of a pair sent prefill first hands its dispatch the ask for
+/// a decode the policy engine placed, and none for a decode the classic
+/// policies picked: that pair's attempt builds no ask. Under the MoRI-IO
+/// connector no decode is asked again, the engine's neither: that prefill
+/// was told of its decode.
+#[tokio::test]
+async fn an_attempt_asks_again_the_decode_the_engine_placed_and_no_other() {
+    let rows = |router: &PDRouter| {
+        for (url, side) in [
+            ("http://p:1", WorkerType::Prefill),
+            ("http://d:1", WorkerType::Decode),
+        ] {
+            router
+                .worker_registry
+                .register_or_replace(sequential_row(url, side, None, 1));
+        }
+    };
+    let inputs = PlacementInputs::default();
+
+    let classic = create_test_pd_router();
+    rows(&classic);
+    let (_pair, guards) = classic
+        .select_pd_pair_with_admission(UNKNOWN_MODEL_ID, inputs, None, placement::Stated::nothing)
+        .await
+        .expect("the classic policies pick the pair");
+    assert!(!asks_decode_again(&KvConnectorMode::Nixl, &guards.decode));
+
+    let stages = table_with(|| Box::new(WantsRank(Arc::default())));
+    let (by_engine, _monitor) = pair_router_under(&stages, DecodePick::AfterPrefill);
+    rows(&by_engine);
+    let (_pair, guards) = by_engine
+        .select_pd_pair_with_admission(UNKNOWN_MODEL_ID, inputs, None, placement::Stated::nothing)
+        .await
+        .expect("the engine places the pair");
+    assert!(asks_decode_again(&KvConnectorMode::Nixl, &guards.decode));
+    assert!(
+        !asks_decode_again(&KvConnectorMode::MoriIo, &guards.decode),
+        "a MoRI-IO prefill was told of its decode"
+    );
+}
+
 // ---- a decode decided behind its prefill ---------------------------------------------------
 
 /// What the scorer and the engines' servers said, in the order they said
@@ -667,6 +710,81 @@ async fn the_engine_reads_the_output_limit_a_pair_request_states() {
                 limits.iter().all(|word| *word == "limit 50"),
                 "admission {admission}: {order:?}"
             );
+        }
+    }
+}
+
+/// A decode server that writes `a decode is asked` down for each request.
+/// While `refuses` is raised it answers a 500 of its own and lowers the
+/// mark, so the servers that share one mark refuse one request among them.
+async fn spawn_decode_refusing_once(said: &Said, refuses: &Arc<AtomicBool>) -> String {
+    let (said, refuses) = (Arc::clone(said), Arc::clone(refuses));
+    spawn_stub(axum::Router::new().fallback(axum::routing::any(move || {
+        let (said, refuses) = (Arc::clone(&said), Arc::clone(&refuses));
+        async move {
+            say(&said, "a decode is asked");
+            let (status, body) = if refuses.swap(false, Ordering::Relaxed) {
+                let refusal = r#"{"error":{"message":"refused"}}"#;
+                (StatusCode::INTERNAL_SERVER_ERROR, refusal)
+            } else {
+                (StatusCode::OK, r#"{"object":"chat.completion"}"#)
+            };
+            (status, [(CONTENT_TYPE, "application/json")], body)
+        }
+    })))
+    .await
+}
+
+/// A retried attempt states the limit again. Three decode engines stand
+/// behind one prefill, and the decode the first attempt is sent to answers
+/// a 500 of its own, so the route sends the pair once more. The second
+/// attempt ranks the two decodes left and reads 50, at its first decision
+/// and again behind the prefill's second answer: each attempt reads the
+/// leased body where it is made, the first and every one behind it.
+#[tokio::test]
+async fn the_engine_reads_the_output_limit_a_retried_attempt_states() {
+    let said = Said::default();
+    let prefill_url = spawn_saying(
+        &said,
+        "the prefill answers",
+        r#"{"kv_transfer_params":{"remote_engine_id":"eng0","remote_block_ids":[1,2]}}"#,
+        None,
+    )
+    .await;
+    let refuses = Arc::new(AtomicBool::new(true));
+    let heard = Arc::clone(&said);
+    let stages = table_with(move || Box::new(NotesLimit(Arc::clone(&heard))));
+    let (router, _monitor) = pair_router_under(&stages, DecodePick::AfterPrefill);
+    let one_url = spawn_decode_refusing_once(&said, &refuses).await;
+    for worker in sequential_pair(prefill_url, one_url) {
+        router.worker_registry.register_or_replace(worker);
+    }
+    for _ in 0..2 {
+        let url = spawn_decode_refusing_once(&said, &refuses).await;
+        let decode = sequential_row(&url, WorkerType::Decode, None, 1);
+        router.worker_registry.register_or_replace(decode);
+    }
+
+    one_chat(&router).await;
+
+    let order = said.lock().unwrap_or_else(PoisonError::into_inner).clone();
+    // An attempt's words run from its first decision to its decode's request.
+    let attempts: Vec<&[String]> = order
+        .split_inclusive(|word| word == "a decode is asked")
+        .collect();
+    assert_eq!(attempts.len(), 2, "{order:?}");
+    for attempt in attempts {
+        let answered_at = attempt
+            .iter()
+            .position(|word| word == "the prefill answers");
+        let (before, behind) = attempt.split_at(answered_at.expect("the prefill went first"));
+        for side in [before, behind] {
+            let limits: Vec<&String> = side
+                .iter()
+                .filter(|word| word.starts_with("limit"))
+                .collect();
+            assert!(!limits.is_empty(), "{order:?}");
+            assert!(limits.iter().all(|word| *word == "limit 50"), "{order:?}");
         }
     }
 }

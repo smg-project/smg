@@ -1904,6 +1904,12 @@ impl Lifecycle for ResidentWork {
     /// A rank's report as its host shows it to decisions: the stage keeps
     /// the rank's cost as one number in the cell of its slot. A host that
     /// names no slot is kept no number.
+    ///
+    /// No host of this repository tells this stage a report. It does not
+    /// say that it keeps them ([`Lifecycle::keeps_loads`]), so an engine's
+    /// telling of its keepers passes it by, and no caller hands an engine
+    /// a load report for every stage. A kept number is read only beside a
+    /// lent table of counts, and no host's request lends one.
     fn on_signal(&self, signal: &Signal<'_>) {
         let Signal::Load {
             worker,
@@ -1929,10 +1935,6 @@ impl Lifecycle for ResidentWork {
             };
             self.tell(&mut bound, cell, &since, word);
         }
-    }
-
-    fn keeps_loads(&self) -> bool {
-        true
     }
 
     /// The dispatch: a credit is counted from it.
@@ -4696,7 +4698,6 @@ pub(crate) mod tests {
             max_age_ms: 10,
         };
         let (told, untold) = (limited(), limited());
-        assert!(told.keeps_loads(), "the wrapper says what its stage keeps");
         let scores = |stage: &WithLoadReportAgeLimit<ResidentWork>, now_micros: u64| {
             let facts = lent.beside(&RequestFacts {
                 now_micros,

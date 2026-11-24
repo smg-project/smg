@@ -13,7 +13,7 @@ use smg_worker::{identity::basic::Worker, registry::Generation};
 #[cfg(feature = "in-process")]
 use super::reach::{ListReach, Reach};
 #[cfg(feature = "in-process")]
-use crate::engine::{FixedFacts, LentList, ListCell, Role};
+use crate::engine::{FixedFacts, LentList, PublishedList, Role};
 
 /// What a host keeps of a registry's generation: the members.
 ///
@@ -39,8 +39,11 @@ pub struct Members {
     /// and prefill lists: derived at the first ask, once.
     #[cfg(feature = "in-process")]
     encode: OnceLock<EncodeColumns>,
+    /// The members by role: each role's list with its cell, its facts and
+    /// its reach, cut at the generation's first ask, all four by one pass
+    /// over the members.
     #[cfg(feature = "in-process")]
-    by_role: ByRole,
+    by_role: OnceLock<Cut>,
 }
 
 impl Generation for Members {
@@ -52,7 +55,7 @@ impl Generation for Members {
             #[cfg(feature = "in-process")]
             encode: OnceLock::new(),
             #[cfg(feature = "in-process")]
-            by_role: ByRole::default(),
+            by_role: OnceLock::new(),
         }
     }
 
@@ -72,29 +75,15 @@ pub(super) struct Stated {
     pub(super) reach: Reach,
 }
 
-/// One role's workers of a generation that the holder answered for and, at
-/// the same places, what it stated of each.
-#[cfg(feature = "in-process")]
-type RoleList = (Arc<[Arc<dyn Worker>]>, Box<[FixedFacts]>);
-
-/// What one pass over a generation's members cuts: each role's list at the
-/// role's place, and the reach of the same workers at the same places.
+/// What one pass over a generation's members cuts, each at its role's
+/// place: the role's workers that the holder answered for, published with
+/// the cell beside them and with what it stated of each, and the reach of
+/// the same workers at the same places.
 #[cfg(feature = "in-process")]
 #[derive(Debug)]
 struct Cut {
-    lists: [RoleList; 4],
+    lists: [PublishedList; 4],
     reach: [ListReach; 4],
-}
-
-/// A generation's members by role.
-#[cfg(feature = "in-process")]
-#[derive(Debug, Default)]
-struct ByRole {
-    /// Each role's list and its reach, at the role's place: cut at the
-    /// generation's first ask, all four by one pass over the members.
-    cut: OnceLock<Cut>,
-    /// The cell beside each role's list, at the role's place.
-    cells: [ListCell; 4],
 }
 
 /// A role's place among a generation's lists and cells.
@@ -122,12 +111,7 @@ impl Members {
         state: impl FnOnce(&[Arc<dyn Worker>]) -> Box<[Option<Stated>]>,
     ) -> LentList<'_> {
         let cut = || self.cut(&state(&self.members));
-        let (workers, facts) = &self.by_role.cut.get_or_init(cut).lists[place(role)];
-        LentList {
-            workers,
-            cell: &self.by_role.cells[place(role)],
-            facts: Some(facts),
-        }
+        self.by_role.get_or_init(cut).lists[place(role)].lent()
     }
 
     /// The reach of the list [`Self::lent`] lends for `role`: one worker's
@@ -140,7 +124,7 @@ impl Members {
         state: impl FnOnce(&[Arc<dyn Worker>]) -> Box<[Option<Stated>]>,
     ) -> &ListReach {
         let cut = || self.cut(&state(&self.members));
-        &self.by_role.cut.get_or_init(cut).reach[place(role)]
+        &self.by_role.get_or_init(cut).reach[place(role)]
     }
 
     /// Each role's members that `stated` answers for, in the members'
@@ -164,7 +148,7 @@ impl Members {
         Cut {
             lists: array::from_fn(|at| {
                 let (workers, facts) = (mem::take(&mut workers[at]), mem::take(&mut facts[at]));
-                (workers.into(), facts.into())
+                PublishedList::stating(workers.into(), facts.into())
             }),
             reach: reach.map(ListReach::new),
         }

@@ -18,7 +18,7 @@ use crate::{
     engine::{
         decision::Decision,
         decision_engine::{DecideOutcome, DecisionEngine, Request, RequestMaker, WorkerLists},
-        list_cell::tests::PublishedList,
+        list_cell::PublishedList,
         policy_engine::PolicyEngine,
         records,
         sticky_sessions::{shards_for_this_host, SessionVerdict},

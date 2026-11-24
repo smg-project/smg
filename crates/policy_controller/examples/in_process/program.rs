@@ -4,7 +4,7 @@
 //! It holds what a program that routes requests holds already, in the
 //! worker crate's own types: the worker registry, with the program's value
 //! of each membership generation ([`Lists`]), which is the list the registry
-//! published and the empty cell the program keeps beside it. The engine
+//! published with its empty cell ([`PublishedList`]). The engine
 //! takes the registry and the load monitor's channel once, at its start
 //! ([`PolicyEngine::start`]), and reads both in place: the program tells it
 //! nothing of a worker that joins or leaves. The program hands its lists
@@ -28,7 +28,7 @@ use http::HeaderMap;
 use smg_policy_controller::{
     document::{AppliedSpec, PolicySettings, RoutingSettings},
     engine::{
-        HeaderRead, LentList, ListCell, ModelLists, PlaceRequest, PolicyEngine, Unplaced,
+        HeaderRead, LentList, ModelLists, PlaceRequest, PolicyEngine, PublishedList, Unplaced,
         WorkerData, WorkerId, WorkerLists,
     },
     tracking::{Outcome, Placement, Side, TransportClass},
@@ -62,35 +62,27 @@ pub fn settings(policy: PolicySettings) -> RoutingSettings {
 
 /// The program's value of one membership generation of a model: the list
 /// the registry published, and the cell the program keeps beside it, empty
-/// at the publish.
+/// at the publish. The program knows nothing of a worker beside its
+/// object, so it states no fact of one.
 #[derive(Debug)]
-pub struct Lists {
-    all: Arc<[Arc<dyn Worker>]>,
-    cell: ListCell,
-}
+pub struct Lists(PublishedList);
 
 impl Generation for Lists {
+    /// Made under the registry's guard: no worker is read and no lock
+    /// taken.
     fn of(members: Arc<[Arc<dyn Worker>]>) -> Self {
-        Self {
-            all: members,
-            cell: ListCell::default(),
-        }
+        Self(PublishedList::new(members))
     }
 
     fn members(&self) -> &Arc<[Arc<dyn Worker>]> {
-        &self.all
+        self.0.workers()
     }
 }
 
 impl Lists {
-    /// The list lent with its cell. The program knows nothing of a worker
-    /// beside its object, so it lends no fact.
+    /// The list lent with its cell, and with no fact.
     fn lent(&self) -> LentList<'_> {
-        LentList {
-            workers: &self.all,
-            cell: &self.cell,
-            facts: None,
-        }
+        self.0.lent()
     }
 }
 

@@ -606,7 +606,8 @@ fn require_prefill_guard(guard: Option<PrefillLoadGuard>) -> Result<PrefillLoadG
 /// ([`Placed::owed_behind_prefill`]). A batch's sub-requests, and both sides
 /// of the parallel shape, go out with the dispatch. A decode the classic
 /// policies picked goes out behind its prefill and is owed nothing there:
-/// its answer's test is made first, and is all that pair pays here.
+/// its answer's test is made ahead of the runtime's, and the dispatch holds
+/// nothing for it.
 fn decode_is_owed_behind_its_prefill(plan: &ExecutionPlan, workers: &WorkerSelection) -> bool {
     matches!(
         plan,
@@ -5454,7 +5455,9 @@ pub(crate) mod tests {
     /// where the policy engine placed the pair: the decode is owed its ask
     /// and its send behind the prefill. A pair the classic policies picked
     /// is owed neither, so its dispatch holds nothing and makes the guard
-    /// it made with no engine. The parallel shape holds nothing for either.
+    /// it made with no engine. The parallel shape holds nothing for either,
+    /// and neither does a batch, whose sub-requests go out with the dispatch
+    /// whatever placed the pair.
     #[test]
     fn a_sequential_dispatch_holds_nothing_for_a_classic_pairs_decode() {
         use crate::{
@@ -5506,6 +5509,18 @@ pub(crate) mod tests {
         assert!(
             !decode_is_owed_behind_its_prefill(&plan, &selected(&by_engine, RuntimeType::Sglang)),
             "both sides of the parallel shape go out with the dispatch"
+        );
+
+        // A batch over the engine's pair, under the runtime that sends one
+        // request's sides one behind the other.
+        let batch = ExecutionPlan::Batch {
+            kind: ExecutionPlanKind::PrefillDecode,
+            shared_request_id: "cmpl-1".to_string(),
+            requests: vec![ProtoGenerateRequest::Vllm(Box::default())],
+        };
+        assert!(
+            !decode_is_owed_behind_its_prefill(&batch, &selected(&by_engine, RuntimeType::Vllm)),
+            "a batch's sub-requests go out with the dispatch"
         );
     }
 

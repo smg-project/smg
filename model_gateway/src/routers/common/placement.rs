@@ -687,9 +687,8 @@ impl Placed {
     /// True where the policy engine placed the request. A classic answer is
     /// owed neither: asked again it stands, and [`Self::guard`] makes its
     /// guard whole. A route asks this where it decides its dispatch's
-    /// shape, and sends a decode that is owed nothing as it does with no
-    /// engine. This test of the answer's one word is then all the pair pays
-    /// behind its prefill.
+    /// shape: it builds no ask for a decode that is owed nothing, and
+    /// sends it as it does with no engine.
     #[inline]
     pub(crate) fn owed_behind_prefill(&self) -> bool {
         self.engine.is_some()
