@@ -44,7 +44,7 @@ use crate::{
             decision_slots::{
                 tests::{
                     a_frame_under_the_second_files_watch, fleet, frame_for, holder, preset, ready,
-                    taken_at, BUDGET, GATEWAY, MODEL,
+                    taken_at, KeepsReports, BUDGET, GATEWAY, MODEL,
                 },
                 Part,
             },
@@ -650,9 +650,11 @@ fn a_served_request_decides_by_the_rows_named_under_no_cap_as_by_the_column_fill
 }
 
 /// A frame's request is given the snapshot where its document reads load
-/// reports and no stage of it keeps them: the three load-led presets. A
+/// reports and no stage of it keeps them: the three load-led presets, and
+/// a document that holds the resident-work stage, which keeps none. A
 /// document that reads no report is given none, and neither is one that
-/// holds the resident-work stage, which keeps the reports it is told.
+/// holds a stage that keeps the reports it is told: a stage of the cases'
+/// own, since no stage of this build keeps them.
 #[test]
 fn a_request_is_given_the_snapshot_where_its_document_reads_reports_and_keeps_none() {
     let applied = |document: &str| {
@@ -672,7 +674,7 @@ fn a_request_is_given_the_snapshot_where_its_document_reads_reports_and_keeps_no
         }"#,
     );
     assert!(!hands_reports(&unread), "the document reads no report");
-    let keeping = applied(
+    let resident = applied(
         r#"{
           "apiVersion": "smg.policy/v1",
           "generation": 1,
@@ -684,7 +686,24 @@ fn a_request_is_given_the_snapshot_where_its_document_reads_reports_and_keeps_no
         }"#,
     );
     assert!(
-        !hands_reports(&keeping),
+        hands_reports(&resident),
+        "the resident-work stage keeps no report"
+    );
+    let mut catalog = StageRegistry::builtin();
+    catalog
+        .scorer("keeps-reports", || Box::new(KeepsReports))
+        .expect("a free name");
+    let keeping: PolicySpec = serde_json::from_str(
+        r#"{
+          "apiVersion": "smg.policy/v1",
+          "generation": 1,
+          "profiles": { "p": { "score": ["least-load", "keeps-reports"], "pick": "best" } },
+          "bindings": [{ "profile": "p" }]
+        }"#,
+    )
+    .expect("a document of this build");
+    assert!(
+        !hands_reports(&staged(&keeping, &catalog)),
         "a stage of the document keeps reports"
     );
 }

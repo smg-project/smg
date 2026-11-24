@@ -257,7 +257,8 @@ fn decide_at(
 /// ahead of the snapshot that task keeps, and a snapshot a request gives is
 /// outside that order ([`RequestMaker::loads`]). A controller runs no such
 /// task yet: a document that holds such a stage is given none here, and its
-/// decisions read no report.
+/// decisions read no report. No stage of this build keeps reports: such a
+/// stage is one a host registers.
 ///
 /// [`RequestMaker::loads`]: crate::engine::RequestMaker::loads
 fn hands_reports(spec: &AppliedSpec) -> bool {
