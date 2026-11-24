@@ -60,6 +60,7 @@ pub(super) mod membership;
 pub mod overlap;
 pub(super) mod pair;
 pub(super) mod place;
+mod sample;
 mod signals;
 mod single;
 mod stands_alone;
@@ -795,7 +796,8 @@ impl PolicyEngine {
     /// decision is dated. A place ([`Decided::Alone`]) dates nothing, so it
     /// is answered with no read of a clock, and with no copy of a decision:
     /// the catch hands the place back, and a whole decision is written
-    /// beside it.
+    /// beside it. A place that is kept as a sample ([`Self::explained`])
+    /// reads the clock for its record.
     ///
     /// # Errors
     ///
@@ -1089,9 +1091,17 @@ impl Loaded<'_, '_> {
                 let members = self.members_of(lent);
                 asked = Some((lent.cell, members));
                 if let Some(pick) = single::alone(self, maker.model(), plain, members) {
-                    // No stage takes a word of the request: the place
-                    // is the whole answer.
+                    // No stage takes a word of the request and the
+                    // document keeps no sample: the place is the whole
+                    // answer.
+                    if !self.document.leases_or_samples {
+                        return Ok(Some(pick));
+                    }
+                    // A document that keeps a sample and takes no word: the
+                    // place is the whole answer all the same, counted
+                    // toward the thread's next sample behind the pick.
                     if !self.document.hears.intersects(EventSet::LEASE) {
+                        sample::place(self, maker, pick, members, clock);
                         return Ok(Some(pick));
                     }
                     picked = Some((pick, members, plain));
@@ -1106,6 +1116,7 @@ impl Loaded<'_, '_> {
             let text = (maker.prompt_chars(), maker.prompt_bytes());
             if let Some(decided) = single::noted(self, pick, members, plain, text, now) {
                 *whole = Some((decided, false));
+                sample::noted(self, maker, now, whole.as_ref());
                 return Ok(None);
             }
         }
@@ -1128,6 +1139,7 @@ impl Loaded<'_, '_> {
                 if let Some(said) = said {
                     let decided = with_shadow::issued(self, decision, &request, now, said);
                     *whole = Some((decided, later));
+                    sample::whole(self, &request, now, whole.as_ref(), Some(said));
                     return Ok(None);
                 }
                 decision
@@ -1154,6 +1166,7 @@ impl Loaded<'_, '_> {
                     counted,
                 );
                 *whole = Some((decided, later));
+                sample::whole(self, &request, now, whole.as_ref(), None);
                 return Ok(None);
             }
             // A request that hands no list of its own is decided over
@@ -1166,6 +1179,7 @@ impl Loaded<'_, '_> {
         };
         let decided = single::issued(self, decided, &request, now);
         *whole = Some((decided, later));
+        sample::whole(self, &request, now, whole.as_ref(), None);
         Ok(None)
     }
 }

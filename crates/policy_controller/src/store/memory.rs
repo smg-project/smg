@@ -31,9 +31,7 @@ use crate::{
     store::{
         applied::Applied,
         health::{HealthSink, VetoWrite},
-        index::{indexed_under, KvTables, LaneWriter},
         journal::{Journal, Position},
-        kv_events::{BatchFacts, BatchOutcome, KvCursor, KvEventSink, ResyncReason},
         leases::{
             DecodeMark, DecodeSide, HostCount, InFlightCounts, LeaseRecord, LeaseRefused,
             LeaseState, LeasesStore, Sides, WorkerSlot,
@@ -109,10 +107,6 @@ pub struct MemoryStore {
     /// is the last lock a writer takes: the workers lock, then the health
     /// lock, then this one.
     loads: Mutex<Loads>,
-    /// The KV lanes and the indexes they write, behind locks of their own
-    /// ([`KvTables`]): a membership write takes the table's after the
-    /// workers lock, a batch takes it alone.
-    kv: Arc<KvTables>,
     reservations: Mutex<Reservations>,
     /// The files of leases behind their turns, one a decider ([`turn`]).
     files: turn::Files,
@@ -212,7 +206,6 @@ impl MemoryStore {
         // own.
         let history = Duration::from_millis(u64::from(LOAD_REPORT_CLOCK_HISTORY_MS));
         let origin = now.checked_sub(history).unwrap_or(now);
-        let kv = Arc::new(KvTables::default());
         let writer = Writer::new(window, origin);
         let world = ArcSwap::new(writer.world());
         // The leases' file writes the counts the writer's shapes name, and
@@ -228,7 +221,6 @@ impl MemoryStore {
                 ranks: FxHashMap::default(),
                 writer,
             }),
-            kv,
             reservations: Mutex::default(),
             files: turn::Files::one(leases),
             blocks: Blocks::default(),
@@ -295,10 +287,9 @@ impl MemoryStore {
     /// vetoes in the table and in the world), the epoch
     /// is the cut's, and the journal starts again at the cut's place inside
     /// the same locks: a reader of the tables sees them before the restore
-    /// or after it, never between. The KV lanes follow the rows: one that
-    /// left gives up its lane, one that stays keeps what this replica heard
-    /// for it. The session pins take the steps of the writes the cut stands
-    /// for, as at a watch ([`Self::watch_from`]). The store's term rises to
+    /// or after it, never between. The session pins take the steps of the
+    /// writes the cut stands for, as at a watch ([`Self::watch_from`]). The
+    /// store's term rises to
     /// the cut's, as following that term's start leaves it. The engine is told the
     /// members once, by id, as an apply tells a generation's
     /// ([`Membership::Snapshot`]), and the journal's listener once the
@@ -361,8 +352,7 @@ impl MemoryStore {
     /// drops is filed as gone by this store's own clock, as a followed
     /// removal files it. A worker still present keeps its count
     /// slot, admission instant, gateway vetoes, completed-dispatch times
-    /// and local loads. Its KV lane stays while its cache events still
-    /// belong to the same model and rank.
+    /// and local loads.
     ///
     /// Returns `false` with the store as it was if the journal refuses the
     /// snapshot's place.
@@ -390,8 +380,7 @@ impl MemoryStore {
     fn lay_snapshot(&self, cut: StoreCheckpoint, keep_local: bool) -> Option<Vec<WorkerId>> {
         let mut workers = self.workers.lock();
         // The previous membership. A watch carries its local state for the
-        // ids it sees again. A restore carries none of it: it reads the old
-        // rows to retire the KV lanes of the ids that left. Either door reads
+        // ids it sees again. A restore carries none of it. Either door reads
         // the rows the cut drops: their session pins take a leave's steps.
         let mut previous;
         {
@@ -447,21 +436,12 @@ impl MemoryStore {
                 loads.ranks.retain(|id, _| stays(id));
             }
         }
-        // The index is this replica's own: a row that left gives up its
-        // lane, a row that stays keeps what was heard for it, and a row the
-        // cut brings takes the lane its facts ask for.
         // The rows the cut drops stay in hand. Each one's slot is given to
         // no row again, so the count its host handed for it goes.
         for held in previous.values() {
             self.counts.left(held.slot);
         }
         previous.retain(|id, _| !workers.rows.contains_key(id));
-        for &id in previous.keys() {
-            self.kv.forget(id);
-        }
-        for row in workers.rows.values() {
-            self.kv.member(&row.row);
-        }
         // The session pins take the steps of the writes the cut stands
         // for, ahead of the world that lists its rows: no decision reads
         // a new row before its pins stand under its id. Until that world
@@ -665,12 +645,10 @@ impl MemoryStore {
                     loads.writer.owe(classes, now)
                 };
                 self.wake_host(first);
-                self.index_member(&workers, id);
                 self.tell_membership(change);
             }
             MembershipChange::Replaced { old, new } => {
                 self.loads.lock().ranks.insert(new, Ranks::default());
-                self.index_member(&workers, new);
                 let classes = Classes::Written {
                     left: Some(old),
                     joined: Some(new),
@@ -684,7 +662,6 @@ impl MemoryStore {
                 self.tell_left(new, &models);
             }
             MembershipChange::Relabelled { id } | MembershipChange::Resized { id } => {
-                self.index_member(&workers, id);
                 let classes = if carried {
                     Classes::Carry
                 } else {
@@ -855,7 +832,6 @@ impl MemoryStore {
                 workers.members(),
                 OnTable(ranks),
             )?;
-            world.tell_kept_loads();
             spec.engine().succeed(self.world.load().spec().engine());
             writer.replaced(self.world.swap(world));
             // A generation of another pairing mode builds the membership
@@ -933,7 +909,6 @@ impl MemoryStore {
             OnTable(ranks),
             Classes::Derive,
         );
-        world.tell_kept_loads();
         writer.replaced(self.world.swap(world));
         // The build listed every member: none is left for the table.
         self.listed();
@@ -1154,13 +1129,8 @@ impl MemoryStore {
     /// Show the deciders the world a write made, when it made one. Called
     /// with the load lock held: the worlds reach the cell in the order the
     /// writer made them, and the writer takes back the one each replaces.
-    /// A world's engine is told the reports the world holds first, where a
-    /// stage of it keeps a number of them, under that lock and so in the
-    /// worlds' order: a load write waits for that tell and for no other
-    /// word to a stage.
     fn show(&self, writer: &mut Writer, world: Option<Arc<StoreSnapshot>>) {
         if let Some(world) = world {
-            world.tell_kept_loads();
             writer.replaced(self.world.swap(world));
         }
     }
@@ -1254,16 +1224,9 @@ impl MemoryStore {
             && self.loads.try_lock().is_some()
     }
 
-    /// The KV tables, for the cases of the index and of its feed.
-    #[cfg(test)]
-    pub(crate) fn kv(&self) -> &KvTables {
-        &self.kv
-    }
-
     /// A worker's row is gone (removed, or replaced by a new incarnation):
     /// the store's tables that live exactly as long as the row leave with
-    /// it: the health tables, the load rows and the worker's KV lane with
-    /// its blocks in the index. The vetoes a world
+    /// it: the health tables and the load rows. The vetoes a world
     /// carries are not among them: they leave with the row in the
     /// publication of the membership write that calls this. Nor are the
     /// engine's session pins that name the worker: they stand through
@@ -1279,7 +1242,6 @@ impl MemoryStore {
     /// the removal finds the row gone or lands before the tables are
     /// cleared.
     fn forget_worker(&self, id: WorkerId) {
-        self.kv.forget(id);
         let mut health = self.health.lock();
         health.forget(id);
         let mut loads = self.loads.lock();
@@ -1350,40 +1312,6 @@ impl MemoryStore {
     /// the build: the count says so by run.
     pub fn membership_builds(&self) -> u64 {
         self.loads.lock().writer.builds()
-    }
-
-    /// Give the row of `id` its KV lane as its facts ask
-    /// ([`KvTables::member`]). Called under the workers lock by every write
-    /// that makes a row or changes its facts.
-    fn index_member(&self, workers: &Workers, id: WorkerId) {
-        if let Some(row) = workers.rows.get(&id) {
-            self.kv.member(&row.row);
-        }
-    }
-
-    /// How many resyncs were recorded for `reason`.
-    pub fn resyncs(&self, reason: ResyncReason) -> u64 {
-        self.kv.resyncs(reason)
-    }
-
-    /// Blocks the index holds for the row of `id` at `rank`; `0` for a row
-    /// the store does not index.
-    pub fn indexed_blocks(&self, id: WorkerId, rank: u16) -> usize {
-        self.kv.indexed_blocks(id, rank)
-    }
-
-    /// Rows that ask for events and hold no lane. Each was written while
-    /// its model's index stood at its ceiling
-    /// ([`INDEX_WORKERS`](crate::store::INDEX_WORKERS)): it holds nothing
-    /// in the index until one of its own later writes finds a place.
-    pub fn unindexed_rows(&self) -> usize {
-        let workers = self.workers.lock();
-        let asking = workers
-            .rows
-            .values()
-            .filter(|row| indexed_under(&row.row).is_some())
-            .count();
-        asking.saturating_sub(self.kv.lanes())
     }
 }
 
@@ -2542,48 +2470,6 @@ impl LoadSink for MemoryStore {
                 self.show(writer, world);
             }
         }
-    }
-}
-
-// -------------------------------------------------------------- KV events
-
-impl KvEventSink for MemoryStore {
-    fn admit_through(
-        &self,
-        id: WorkerId,
-        rank: u16,
-        facts: BatchFacts,
-        body: &mut dyn FnMut(&mut LaneWriter<'_>),
-    ) -> BatchOutcome {
-        self.kv.admit_through(id, rank, facts, body)
-    }
-
-    fn reconnected(&self, id: WorkerId) {
-        self.kv.reconnected(id);
-    }
-
-    fn resync(&self, id: WorkerId, rank: Option<u16>, reason: ResyncReason) {
-        self.kv.resync(id, rank, reason);
-    }
-
-    fn cursor(&self, id: WorkerId, rank: u16) -> Option<KvCursor> {
-        self.kv.cursor(id, rank)
-    }
-
-    fn removed(&self, id: WorkerId) {
-        self.kv.removed(id);
-    }
-
-    fn block_size(&self, model: &str) -> Option<u32> {
-        self.kv.block_size(model)
-    }
-
-    fn set_block_size(&self, model: &str, size: u32) {
-        self.kv.set_block_size(model, size);
-    }
-
-    fn forget_block_size(&self, model: &str) {
-        self.kv.forget_block_size(model);
     }
 }
 

@@ -109,11 +109,11 @@ pub struct EncodeLists<'a> {
     pub encoders_held: &'a [u32],
     /// What the encode side reads of each encoder beside its record, by its
     /// place in the encoder list
-    /// ([`EncodeClasses::encoder_facts`](crate::store::EncodeClasses::encoder_facts)).
+    /// ([`EncodeClasses::encoder_facts`](crate::engine::EncodeClasses::encoder_facts)).
     pub facts: &'a [EncoderFacts],
     /// The encode class each prefill names, one entry a prefill, by its
     /// place in the prefill list
-    /// ([`EncodeClasses::prefill_class`](crate::store::EncodeClasses::prefill_class)).
+    /// ([`EncodeClasses::prefill_class`](crate::engine::EncodeClasses::prefill_class)).
     pub prefill_classes: &'a [u32],
 }
 
@@ -483,7 +483,14 @@ impl EncodeLists<'_> {
                 };
                 *every_encoder.get_or_init(asked) && sends_to(target)
             };
-            record_sides(&decision, facts, (prefill, decode), read, sends);
+            record_sides(
+                &decision,
+                facts,
+                (prefill, decode),
+                read,
+                &buffers.columns,
+                sends,
+            );
             decision
         };
         let decision = BUFFERS.with(|buffers| match buffers.try_borrow_mut() {

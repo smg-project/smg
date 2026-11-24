@@ -118,7 +118,7 @@ use crate::{
     service::elector::{Elector, Fence},
     stages::registry::StageRegistry,
     store::{MemoryStore, WorkersStore},
-    worker_host::{KvFeed, Members},
+    worker_host::{KvFeed, KvTables, Members},
 };
 
 /// The protobuf package of the controller's API.
@@ -472,7 +472,7 @@ impl Controller {
             woken,
             config.worker_overload,
         ));
-        let kv_feed = KvFeed::new(Arc::clone(&journal.0), workers.holder());
+        let kv_feed = KvFeed::new(workers.holder());
         let prober = worker_objects::Prober::new(Arc::clone(&workers), elector.fence());
         // The load monitor is built stopped, ahead of the deciding threads:
         // each takes its channel at its start, and the serve runs its task.
@@ -780,6 +780,14 @@ impl Controller {
     /// turns.
     pub fn store(&self) -> Arc<MemoryStore> {
         Arc::clone(&self.shared.store)
+    }
+
+    /// The KV tables of this replica: the ones its holder of worker objects
+    /// makes lanes in and its cache-event feed writes. A caller reads a
+    /// row's cursor, its indexed blocks, the resync counts and a model's
+    /// block size through it, and writes nothing.
+    pub fn kv_tables(&self) -> Arc<KvTables> {
+        self.workers.kv_tables()
     }
 
     /// A read handle on the controller's state, valid across [`Self::serve`].

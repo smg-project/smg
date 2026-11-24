@@ -1,8 +1,8 @@
-//! The cases of a prompt's entry in a token tree its caller lends
-//! ([`Prompt::entry`]): each places a request by the one call, under a host
-//! that lends its tree. They hold what the entry was asked to what the
-//! request's decisions read, and what the tree then holds to the worker the
-//! call sent to.
+//! The cases of a prompt's entry in a tree its caller lends, its token tree
+//! or its string tree ([`Prompt::entry`]): each places a request by the one
+//! call, under a host that lends its tree. They hold what the entry was
+//! asked to what the request's decisions read, and what the tree then holds
+//! to the worker the call sent to.
 
 use std::{
     borrow::Cow,
@@ -13,8 +13,8 @@ use kv_index::TokenTree;
 
 use super::*;
 use crate::engine::{
-    decision_engine::TokenKey,
-    policy_engine::single::tests::{lending, lent, Also},
+    decision_engine::{TextKey, TokenKey},
+    policy_engine::single::tests::{lending, lending_text, lent, Also},
 };
 
 /// A caller's entry for its prompt: the prompt's token ids under no cache
@@ -38,6 +38,28 @@ impl TokenEntry for Entry<'_> {
         self.asked.set(self.asked.get() + 1);
         Some(TokenKey {
             tokens: Cow::Borrowed(self.tokens),
+            marker: 0,
+        })
+    }
+}
+
+/// A caller's entry for a prompt it holds as text: the text under no cache
+/// partition, and how many times a decision asked for it. The caller holds
+/// no token ids of the prompt.
+struct Words<'a> {
+    text: &'a str,
+    asked: Cell<u32>,
+}
+
+impl TokenEntry for Words<'_> {
+    fn token_key(&self, _: usize) -> Option<TokenKey<'_>> {
+        None
+    }
+
+    fn text_key(&self) -> Option<TextKey<'_>> {
+        self.asked.set(self.asked.get() + 1);
+        Some(TextKey {
+            text: Cow::Borrowed(self.text),
             marker: 0,
         })
     }
@@ -129,6 +151,50 @@ fn a_conversation_placed_by_the_one_call_goes_back_to_its_worker() {
     let first = sent(&said);
     for turn in 1..32 {
         said.extend(turn * 1_000_000..turn * 1_000_000 + 16);
+        assert_eq!(sent(&said), first, "turn {turn}");
+    }
+}
+
+/// A conversation of text placed by the one call goes back to its worker
+/// however long it grows: its caller lends its string tree and states the
+/// prompt's entry there, and each turn's decision is made inside the tree's
+/// match. The entry is asked once a turn. Each call draws a seed of its
+/// own, so no turn is held to its worker by a seed.
+///
+/// The classic policy answers the same in its string tree
+/// (`select_worker_with_text` in
+/// `model_gateway/src/policies/cache_aware.rs`).
+#[test]
+fn a_conversation_of_text_placed_by_the_one_call_goes_back_to_its_worker() {
+    let mut document = PolicySpec::preset("cache_aware").expect("a built-in preset");
+    document.generation = 1;
+    let spec = AppliedSpec::validate(&document).expect("the document validates");
+    let (engine, _tree) = lending_text(spec);
+    let engine = hosted(engine);
+    let list = pool(8);
+    let members = PublishedList::new(Arc::clone(&list));
+    let sent = |text: &str| {
+        let entry = Words {
+            text,
+            asked: Cell::new(0),
+        };
+        let request = PlaceRequest {
+            prompt: Prompt {
+                text: Some(text),
+                entry: Some(&entry),
+                ..Prompt::NONE
+            },
+            ..PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()))
+        };
+        let placement = engine.place(&request).expect("a placement");
+        assert_eq!(entry.asked.get(), 1, "the entry is asked for once");
+        placement.id()
+    };
+    // A thousand windows of text, past what a host hashes of a prompt.
+    let mut said = "a system prompt of some length. ".repeat(2_000);
+    let first = sent(&said);
+    for turn in 1..32 {
+        said.push_str(&format!("turn {turn:059}"));
         assert_eq!(sent(&said), first, "turn {turn}");
     }
 }

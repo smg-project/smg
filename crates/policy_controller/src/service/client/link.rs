@@ -22,12 +22,15 @@ use super::{
     dial_leader, fit, hello, numbered, Answer, Decide, Error, Session, Stub, Watch, ANSWER_WAIT,
     KEEPALIVE,
 };
-use crate::service::{
-    controller::wire::{self, Refusal},
-    proto::{
-        busy, controller_frame, decide_answer, gateway_frame, released, Busy, ControllerFrame,
-        DecideAnswer, DecideRequest, Decision, GatewayFrame, Released, Side, SpecAck, SpecPush,
-        WatchWorkersRequest, Welcome,
+use crate::{
+    engine::view::Phase,
+    service::{
+        controller::wire::{self, Refusal},
+        proto::{
+            busy, controller_frame, decide_answer, gateway_frame, released, Busy, ControllerFrame,
+            DecideAnswer, DecideRequest, Decision, EncodePlaced, GatewayFrame, Released, Side,
+            SpecAck, SpecPush, WatchWorkersRequest, Welcome,
+        },
     },
 };
 
@@ -276,6 +279,9 @@ impl Link {
 
     /// Sends one ask if the stream holds credit and waits up to `budget`
     /// for its answer. A budget past the clock's range waits with no bound.
+    /// The answer is the controller's decision and, beside a pick of a
+    /// request that stated encode items (`DecideRequest.encode`), where
+    /// its items go (`DecideAnswer.encode`).
     ///
     /// An id stays taken until its ask's answer arrives, also where the
     /// asker left or its budget ended. An ask under it in that time is
@@ -289,7 +295,7 @@ impl Link {
         &self,
         request: DecideRequest,
         budget: Duration,
-    ) -> Result<Decision, DecisionUnavailable> {
+    ) -> Result<(Decision, Option<EncodePlaced>), DecisionUnavailable> {
         self.ask_cut(request, 0, budget).await
     }
 
@@ -301,7 +307,7 @@ impl Link {
         mut request: DecideRequest,
         left_out: usize,
         budget: Duration,
-    ) -> Result<Decision, DecisionUnavailable> {
+    ) -> Result<(Decision, Option<EncodePlaced>), DecisionUnavailable> {
         let cut = match fit(&mut request).and_then(|cut| in_range(&request).map(|()| cut)) {
             Ok(cut) => cut,
             Err(_) if !self.stands() => return Err(DecisionUnavailable::Ended),
@@ -319,7 +325,7 @@ impl Link {
             None => (&mut pending.answer).await,
         };
         match answer.map_err(|_| DecisionUnavailable::Ended)? {
-            Answer::Decision(decision) => Ok(decision),
+            Answer::Decision(decision, encode) => Ok((decision, encode)),
             Answer::Busy(busy) => Err(DecisionUnavailable::Busy(busy)),
         }
     }
@@ -354,11 +360,16 @@ impl Link {
 }
 
 /// The ranges the controller's check reads in a request, by that check's
-/// own functions: the lease a decode call names, then the facts.
+/// own functions: the lease a decode call names, then the facts, then the
+/// items of an encode request. A request with no facts reads as one that
+/// leaves every field of them unset, a single's.
 fn in_range(request: &DecideRequest) -> Result<(), Error> {
-    let checked = wire::asked_decode(request.decode_of).and_then(|_| match &request.facts {
-        Some(facts) => wire::ranges(facts).map(|_| ()),
-        None => Ok(()),
+    let checked = wire::asked_decode(request.decode_of).and_then(|decode_of| {
+        let phase = match &request.facts {
+            Some(facts) => wire::ranges(facts)?.0,
+            None => Phase::Single,
+        };
+        wire::stated_items(request.encode.as_ref(), phase, decode_of)
     });
     match checked {
         Ok(()) => Ok(()),
@@ -870,7 +881,9 @@ impl Shared {
                 open.credit = open.credit.saturating_add(credit.window);
                 return;
             }
-            Some(decide_answer::Answer::Decision(decision)) => Answer::Decision(decision),
+            Some(decide_answer::Answer::Decision(decision)) => {
+                Answer::Decision(decision, frame.encode)
+            }
             Some(decide_answer::Answer::Busy(busy)) if busy.reason() != busy::Reason::NotLeader => {
                 Answer::Busy(busy)
             }
@@ -896,7 +909,7 @@ impl Shared {
             open.pending.remove(id);
         }
         drop(state);
-        if let Some(Answer::Decision(decision)) = undelivered {
+        if let Some(Answer::Decision(decision, _)) = undelivered {
             self.release(decision);
         }
     }
@@ -951,7 +964,7 @@ impl Drop for Pending<'_> {
         }
         drop(state);
         // A send that won the race with close may still be in the channel.
-        if let Ok(Answer::Decision(decision)) = self.answer.try_recv() {
+        if let Ok(Answer::Decision(decision, _)) = self.answer.try_recv() {
             self.shared.release(decision);
         }
     }
@@ -973,8 +986,9 @@ pub(super) mod tests {
         service::{
             client::{PolicyControllerClient, Principal},
             proto::{
-                busy, controller_frame, decide_answer, released, Completed, Credit, Header, Lease,
-                NotLeader, Released, RequestFacts, Side,
+                busy, controller_frame, decide_answer, released, Completed, Credit, EncodeItems,
+                Header, Identity, Lease, NotLeader, Phase as FramePhase, Released, RequestFacts,
+                Side, Target,
             },
         },
     };
@@ -1085,6 +1099,18 @@ pub(super) mod tests {
         }
 
         pub(crate) fn answer(&self, id: u8, term: u64, answer: decide_answer::Answer) {
+            self.answer_beside(id, term, answer, None);
+        }
+
+        /// [`Self::answer`] with where an encode request's items go beside
+        /// the answer (`DecideAnswer.encode`).
+        pub(crate) fn answer_beside(
+            &self,
+            id: u8,
+            term: u64,
+            answer: decide_answer::Answer,
+            encode: Option<EncodePlaced>,
+        ) {
             self.decide
                 .as_ref()
                 .expect("the decide stream is open")
@@ -1092,7 +1118,7 @@ pub(super) mod tests {
                     request_id: if id == 0 { Vec::new() } else { vec![id] },
                     term,
                     answer: Some(answer),
-                    encode: None,
+                    encode,
                 }))
                 .expect("the decide reader takes the frame");
         }
@@ -1388,6 +1414,114 @@ pub(super) mod tests {
         assert_eq!(within(peer.requests.next()).await, Some(request(1)));
     }
 
+    /// An ask under the id 1 that states `keys` items on a frame of
+    /// `phase`.
+    fn with_items(phase: FramePhase, keys: usize) -> DecideRequest {
+        DecideRequest {
+            facts: Some(RequestFacts {
+                phase: phase.into(),
+                ..RequestFacts::default()
+            }),
+            encode: Some(EncodeItems {
+                keys: vec![Identity::default(); keys],
+                ..EncodeItems::default()
+            }),
+            ..request(1)
+        }
+    }
+
+    /// The items of an encode request have ranges the controller's check
+    /// reads too: more keys than the contract bounds, and items on a frame
+    /// of another phase, on one that states no facts, or beside a lease's
+    /// decode side. The link's door refuses each by its field, sends
+    /// nothing, spends no credit and stands. A frame at the bound is sent
+    /// as it is.
+    #[tokio::test]
+    async fn an_ask_out_of_the_items_ranges_sends_nothing_and_the_link_stands() {
+        let mut peer = Peer::new(1);
+        let wrong = [
+            (
+                "encode.keys",
+                with_items(FramePhase::Encode, wire::MAX_ITEMS + 1),
+            ),
+            ("encode", with_items(FramePhase::Prefill, 1)),
+            ("encode", with_items(FramePhase::Unspecified, 0)),
+            (
+                "encode",
+                DecideRequest {
+                    facts: None,
+                    ..with_items(FramePhase::Encode, 1)
+                },
+            ),
+            (
+                "encode",
+                DecideRequest {
+                    decode_of: Some(7),
+                    ..with_items(FramePhase::Encode, 1)
+                },
+            ),
+        ];
+        for (field, wrong) in wrong {
+            let refused = peer.link.ask(wrong, WAIT).await;
+            assert!(
+                matches!(refused, Err(DecisionUnavailable::Unsent(Error::OutOfRange(named))) if named == field),
+                "{field}: {refused:?}"
+            );
+        }
+        assert!(poll(Box::pin(peer.requests.next()).as_mut()).is_pending());
+        assert!(peer.link.stands() && peer.link.ended().is_none());
+        // The window of one is whole: a frame at the bound is sent.
+        let whole = with_items(FramePhase::Encode, wire::MAX_ITEMS);
+        let mut asked = Box::pin(peer.link.ask(whole.clone(), WAIT));
+        assert!(poll(asked.as_mut()).is_pending());
+        assert_eq!(within(peer.requests.next()).await, Some(whole));
+    }
+
+    /// An encode request's answer says where its items go beside its
+    /// decision: the ask hands both, the encoders in their order, and an
+    /// ask of any other request hands nothing beside its decision. Such an
+    /// answer that comes behind its asker gives back its pair's leases, as
+    /// any late decision does.
+    #[tokio::test(start_paused = true)]
+    async fn an_ask_hands_where_an_encode_requests_items_go() {
+        let mut peer = Peer::new(3);
+        peer.read_hello().await;
+        let encoder = |id| Target {
+            id,
+            ..Target::default()
+        };
+        let placed = EncodePlaced {
+            encoders: vec![encoder(9), encoder(4)],
+            one: false,
+        };
+        let pair = [Side::Prefill, Side::Decode];
+        let mut asked = Box::pin(peer.link.ask(request(1), WAIT));
+        assert!(poll(asked.as_mut()).is_pending());
+        peer.answer_beside(1, WELCOME_TERM, decision(8, &pair), Some(placed.clone()));
+        let (told, beside) = within(asked).await.expect("the ask's own answer");
+        assert_eq!(told.leases.len(), 2);
+        assert_eq!(beside, Some(placed.clone()));
+
+        let mut plain = Box::pin(peer.link.ask(request(2), WAIT));
+        assert!(poll(plain.as_mut()).is_pending());
+        peer.answer(2, WELCOME_TERM, decision(9, &[Side::Single]));
+        assert!(matches!(within(plain).await, Ok((_, None))));
+
+        assert!(matches!(
+            peer.link.ask(request(3), Duration::ZERO).await,
+            Err(DecisionUnavailable::Late)
+        ));
+        peer.answer_beside(3, WELCOME_TERM, decision(7, &pair), Some(placed));
+        assert_eq!(
+            within(peer.reports.next()).await.expect("a release").frame,
+            Some(release(
+                7,
+                Side::Unspecified,
+                released::Reason::LateDecision
+            ))
+        );
+    }
+
     #[tokio::test]
     async fn sixty_four_asks_take_their_own_answers_in_reverse_order() {
         let mut peer = Peer::new(u32::from(ASKS));
@@ -1404,7 +1538,7 @@ pub(super) mod tests {
             peer.answer(id, 4, decision(u64::from(id), &[Side::Single]));
         }
         for (id, ask) in (1..=ASKS).zip(asks) {
-            let answer = within(ask).await.expect("the ask gets a decision");
+            let (answer, _) = within(ask).await.expect("the ask gets a decision");
             assert_eq!(answer.leases[0].id, u64::from(id));
         }
     }
@@ -1425,7 +1559,7 @@ pub(super) mod tests {
             assert!(poll(Box::pin(peer.requests.next()).as_mut()).is_pending());
         }
         peer.answer(1, 6, decision(11, &[Side::Single]));
-        let first = within(first).await.expect("the original ask is answered");
+        let (first, _) = within(first).await.expect("the original ask is answered");
         assert_eq!(first.leases[0].id, 11);
         let mut again = Box::pin(peer.link.ask(request(1), WAIT));
         assert!(poll(again.as_mut()).is_pending());
@@ -1467,7 +1601,7 @@ pub(super) mod tests {
         assert!(poll(again.as_mut()).is_pending());
         assert_eq!(within(peer.requests.next()).await, Some(request(1)));
         peer.answer(1, 5, decision(8, &[Side::Single]));
-        let again = within(again).await.expect("the second ask's own answer");
+        let (again, _) = within(again).await.expect("the second ask's own answer");
         assert_eq!(again.leases[0].id, 8);
 
         assert!(matches!(
@@ -2046,7 +2180,7 @@ pub(super) mod tests {
         ));
 
         peer.answer(1, WELCOME_TERM, decision(8, &[Side::Single]));
-        let own = within(asked).await.expect("the ask's own answer");
+        let (own, _) = within(asked).await.expect("the ask's own answer");
         assert_eq!(own.leases[0].id, 8);
     }
 

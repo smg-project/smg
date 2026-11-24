@@ -2,10 +2,10 @@
 //! decision reads it.
 //!
 //! [`InForce`] is one value: the document, the number a list's value is
-//! made under, what the engine reads of the document once, and the shadow
-//! decisions counted under it. The engine keeps the value of the document
-//! in force in one field and replaces it whole where it takes a new
-//! document ([`PolicyEngine::apply`]).
+//! made under, what the engine reads of the document once, the shadow
+//! decisions counted under it and the decisions kept under it. The engine
+//! keeps the value of the document in force in one field and replaces it
+//! whole where it takes a new document ([`PolicyEngine::apply`]).
 //!
 //! [`Loaded`] is the engine with that value, for one decision. An entry of
 //! the engine reads the value once ([`PolicyEngine::in_force`]) and hands
@@ -41,8 +41,9 @@ use crate::{
 
 /// What the engine holds of one policy document: the document, its number,
 /// what is read of the document once, where the value is made
-/// ([`Self::of`]), and the shadow decisions counted under it. Those counts
-/// are written, by each decision a shadow answers beside.
+/// ([`Self::of`]), the shadow decisions counted under it and the decisions
+/// kept under it. Those counts are written, by each decision a shadow
+/// answers beside, and that ring by each decision kept.
 #[derive(Debug)]
 pub(in crate::engine) struct InForce {
     /// The validated document: its profiles, its bindings, and its stages
@@ -67,6 +68,13 @@ pub(in crate::engine) struct InForce {
     /// and its plain requests are answered a place
     /// ([`Decided::Alone`](crate::engine::Decided::Alone)).
     pub(super) hears: EventSet,
+    /// Whether a place one pick decided is not the whole of what the
+    /// document asks of its request: a stage takes a word on a lease
+    /// ([`Self::hears`]), or the document keeps a sample of its decisions
+    /// ([`Self::samples`]). Read once, here: a place tests this word once,
+    /// and under a document that asks neither it is the whole answer behind
+    /// that test.
+    pub(super) leases_or_samples: bool,
     /// Each profile's name as a label that lives as long as the process,
     /// by the profile's position in the document
     /// ([`Loaded::label_at`]). Made once, here: naming the profile of a
@@ -89,6 +97,18 @@ pub(in crate::engine) struct InForce {
     /// ([`SHADOWS`]), read once, here. A whole decision of a single request
     /// pays one test of it, and a place picked alone pays none.
     pub(super) any_shadow: bool,
+    /// Whether the document keeps a sample of its decisions: its
+    /// `explain.sample` is not zero
+    /// ([`Engine::explain_sample`](crate::engine::Engine::explain_sample)).
+    /// Read once, here. A whole decision tests it once
+    /// ([`super::sample::whole`]).
+    pub(super) samples: bool,
+    /// The decisions kept under the document, newest last
+    /// ([`super::sample`]): one ring of them, behind one lock that a kept
+    /// decision takes for its push and a reader for one scan
+    /// ([`PolicyEngine::explained`]). The ring is allocated at its first
+    /// push: a document that keeps no sample holds none.
+    pub(super) kept: super::sample::Kept,
     /// The shadow decisions counted so far
     /// ([`PolicyEngine::shadow_counts`]), by binding, side and kind. The
     /// tables are allocated at the first of them: a document that names no
@@ -100,6 +120,7 @@ impl InForce {
     /// What the engine holds of `spec`, under the next number of the
     /// process.
     pub(super) fn of(spec: AppliedSpec) -> Self {
+        let samples = spec.engine().explain_sample() != 0;
         let hears = spec.engine().hears();
         let needs = spec.needs();
         let any_shadow = spec.engine().seat_flags() & SHADOWS != 0;
@@ -109,10 +130,13 @@ impl InForce {
             older: engine.kept_since().into_iter().map(kept).collect(),
             table: engine.hearing(|_| false),
             hears,
+            leases_or_samples: hears.intersects(EventSet::LEASE) || samples,
             labels: labels::of(&spec),
             signals: needs.signal_cells,
             reads_loads: needs.loads || needs.signal_cells,
             any_shadow,
+            samples,
+            kept: super::sample::Kept::default(),
             spec,
             applied: next_applied(),
             shadow_counts: OnceLock::new(),
@@ -258,11 +282,11 @@ impl PolicyEngine {
     /// itself than the standing one: another name, other words of a
     /// request's life to hear, or anything else the engine reads of a
     /// stage when it builds a profile. A factory of the host's own may
-    /// build such a stage. A count of sends stands where every profile
-    /// that reads it is kept and the first of them by name made the
-    /// standing count, and its readers are built new where either fails.
-    /// A count built new takes over a standing count: which one is the
-    /// count's own rule
+    /// build such a stage. A count of sends stands where a profile that
+    /// reads it is kept, whichever of its other readers changed, left or
+    /// came: a profile built new beside it reads the same count. A count
+    /// none of whose readers is kept is built new and takes over a
+    /// standing count: which one is the count's own rule
     /// ([`Engine::succeed`](crate::engine::Engine::succeed)). Every other
     /// stage starts empty, a registered one too. The keep stands between
     /// two documents validated over the stock table, or over one table of
@@ -304,13 +328,15 @@ impl PolicyEngine {
     /// one document it read last, until it asks again or ends: so at most
     /// one replaced document stands for each thread, and an idle thread
     /// holds one for as long as it idles. As a rule the last holder is
-    /// such a thread, and those stages are dropped at the start of its
-    /// next request's decision or at its end. A stage whose drop blocks
-    /// holds that request's decision meanwhile, once for each document
-    /// replaced. A drop that panics at a decision's start unwinds out of
-    /// that entry, and one that panics at a thread's end aborts the
-    /// process, as any value does that panics while a thread's own
-    /// storage is torn down.
+    /// such a thread, and those stages are dropped at its next entry of
+    /// an engine, which is a decision, a word of a lease or a read of the
+    /// document, or at its end. A stage whose drop blocks holds that
+    /// entry meanwhile, once for each document replaced. A drop that
+    /// panics at an entry unwinds out of it. The process aborts where
+    /// the entry is made while the thread already unwinds, as a request's
+    /// guard dropped with a report owed speaks for its lease, and where
+    /// the drop runs at a thread's end, as any value does that panics
+    /// while a thread's own storage is torn down.
     ///
     /// [`DecisionEngine::say`]: crate::engine::DecisionEngine::say
     /// [`LentList`]: crate::engine::LentList

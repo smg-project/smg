@@ -104,13 +104,13 @@
 //! single's lease. An encode request that carries its items is decided
 //! here too, as its pair's one request: for both sides and for each
 //! item's encoder, with its pair's leases and none for an encoder. A frame
-//! of the encode phase that carries no items has no decision over worker
-//! lists, and a decode frame that names no lease under a plan that pairs
-//! it has none at all: each is answered `Busy` with no reason, and its
-//! gateway decides it. A decode call its lease refuses is
-//! answered `Busy` under that refusal's own reason: at the call's first
-//! test of the lease, ahead of every stage its decision runs, or at its
-//! issue, where the lease moved under the decision.
+//! of the encode phase that does not state `DecideRequest.encode` has no
+//! decision over worker lists, and a decode frame that names no lease
+//! under a plan that pairs it has none at all: each is answered `Busy`
+//! with no reason, and its gateway decides it. A decode call its lease
+//! refuses is answered `Busy` under that refusal's own reason: at the
+//! call's first test of the lease, ahead of every stage its decision runs,
+//! or at its issue, where the lease moved under the decision.
 //!
 //! One lease stands for a request its gateway asks again. A gateway whose
 //! stream ended with a request unanswered sends it again and says so
@@ -1110,10 +1110,11 @@ impl Deciding {
         // alone have a decision over worker lists. So has an encode
         // request that carries its items: it is read at the prefill phase,
         // as its pair's one request. A frame of the encode phase that
-        // carries none has no decision: it is answered `Busy` with no
-        // reason before anything is read for it, and its gateway decides
-        // it locally. A frame that names a lease is read at the decode
-        // phase, so a single request and a prefill are asked for none.
+        // does not state them has no decision: it is answered `Busy` with
+        // no reason before anything is read for it, and its gateway
+        // decides it locally. A frame that names a lease is read at the
+        // decode phase, so a single request and a prefill are asked for
+        // none.
         let entry = match request.phase() {
             Phase::Single => Entry::Single,
             Phase::Prefill => Entry::Prefill,
@@ -5439,11 +5440,11 @@ pub(crate) mod tests {
 
     /// A controller decides a single request, a pair at its prefill and a
     /// decode call. Under a pair plan a request of the decode phase that
-    /// names no lease, and one of the encode phase that carries no items,
-    /// have no decision: `Busy` with no reason, counted by its cause, never
-    /// one side's decision and never a shed, which is a policy's word. Its
-    /// gateway decides it. A prompt carried as text is never decided as a
-    /// request with no prefix.
+    /// names no lease, and one of the encode phase that does not state
+    /// `DecideRequest.encode`, have no decision: `Busy` with no reason,
+    /// counted by its cause, never one side's decision and never a shed,
+    /// which is a policy's word. Its gateway decides it. A prompt carried
+    /// as text is never decided as a request with no prefix.
     #[tokio::test]
     async fn a_request_of_a_decode_or_an_encode_phase_and_a_prompt_as_text_have_no_decision() {
         let spec = pair_plan(&StageRegistry::builtin(), "random");
@@ -5614,10 +5615,11 @@ pub(crate) mod tests {
     /// of its three single workers. Its pick is filed a single's lease: one
     /// lease of the single side on the wire, one record with no decode side
     /// on file, and its worker booked. Neither frame is counted with the
-    /// sides. An encode frame that carries no items has no decision under
-    /// this plan either: `Busy` with no reason, counted, and nothing filed.
-    /// A model that has no worker of the frame's role is shed with no
-    /// endpoint, as a single request of a model nobody serves is.
+    /// sides. An encode frame that does not state `DecideRequest.encode`
+    /// has no decision under this plan either: `Busy` with no reason,
+    /// counted, and nothing filed. A model that has no worker of the
+    /// frame's role is shed with no endpoint, as a single request of a
+    /// model nobody serves is.
     #[tokio::test]
     async fn a_prefill_or_a_decode_frame_that_stands_alone_is_decided_over_its_own_phases_list() {
         let mut bed = leading([]);

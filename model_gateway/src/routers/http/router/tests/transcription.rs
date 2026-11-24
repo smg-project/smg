@@ -17,6 +17,10 @@
 //! Each pool is asked under the classic `round_robin` policy and again with
 //! the policy engine started over the document the same settings mean: the
 //! route holds one rule and does not ask who places.
+//!
+//! The pool the route hands on is the list of the snapshot it read, so a
+//! transcription takes its turn in its model's one rotation, with the
+//! model's other requests: the last case.
 
 use std::{collections::BTreeSet, sync::Mutex};
 
@@ -390,5 +394,60 @@ async fn a_transcription_on_a_rank_worker_reaches_its_engine_with_no_rank() {
             !form.contains("data_parallel_rank"),
             "the form names a rank: {form}"
         );
+    }
+}
+
+/// How many workers each kind of request lands on, where a model's chat
+/// requests and its transcriptions come in turn over a pool of four free
+/// workers under `round_robin`: four of each kind. In one rotation a kind
+/// takes every other turn and lands on two workers. In a rotation of its
+/// own it would walk all four.
+fn kinds_spread(bed: &Bed) -> (usize, usize) {
+    let routing = RoutingDerivatives {
+        tokens: None,
+        text: None,
+        rid_key: None,
+        cache_namespace: None,
+    };
+    let at = |url: &str| {
+        bed.workers
+            .iter()
+            .position(|w| w.url() == url)
+            .expect("a worker of the pool")
+    };
+    let (mut chats, mut forms) = (BTreeSet::new(), BTreeSet::new());
+    for _ in 0..4 {
+        let placed = bed.router.select_worker_for_model(
+            MODEL,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            placement::Stated::nothing,
+        );
+        chats.insert(at(placed.expect("a free pool places").url()));
+        let placed = bed
+            .router
+            .select_transcription_worker(None, MODEL, &routing, None);
+        forms.insert(at(placed.expect("a free pool places").url()));
+    }
+    (chats.len(), forms.len())
+}
+
+/// A transcription takes its turn in its model's one rotation, with the
+/// model's other requests, whoever places. The route hands the pool on as
+/// the list of the snapshot it read: a classic `round_robin` is told that
+/// list by its name and turns the list's own rotation, and the policy
+/// engine keeps a list's turn with the list.
+#[tokio::test]
+async fn a_transcription_takes_its_turn_in_its_models_rotation() {
+    let pool = [plain(0), plain(1), plain(2), plain(3)];
+    for placer in PLACERS {
+        let bed = Bed::of(&pool, false, placer).await;
+        assert_eq!(kinds_spread(&bed), (2, 2), "{placer:?}");
     }
 }

@@ -51,7 +51,7 @@ struct Replica {
     record: WorkerFacts,
     store: Arc<MemoryStore>,
     objects: Arc<Objects<Members>>,
-    collector: Arc<KvEventCollector<KvHost<Members, MemoryStore>>>,
+    collector: Arc<KvEventCollector<KvHost<Members>>>,
     readiness: Readiness,
     loads: LoadReceiver,
     counts: Box<dyn Fn() -> LoadTotals>,

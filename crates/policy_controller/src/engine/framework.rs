@@ -2835,6 +2835,18 @@ const DRAWS_BY_ITS_TEST: [&str; 6] = [
 pub(crate) struct Drawn {
     index: u16,
     vetoed: AllVetoed,
+    /// Whether the draw places a keyed request under a sessions rule and
+    /// claims its worker for the key ([`Engine::decide_claimed`]).
+    claims: bool,
+}
+
+#[cfg(feature = "in-process")]
+impl Drawn {
+    /// Whether the draw is a keyed request's under a sessions rule: its
+    /// host asks [`Engine::decide_claimed`], which claims behind the draw.
+    pub(crate) const fn claims(self) -> bool {
+        self.claims
+    }
 }
 
 /// A record no decision wrote, as a debug build leaves every row before a
@@ -2884,7 +2896,8 @@ fn unwritten(fixed: &Candidate) -> Candidate {
 #[inline(never)]
 fn run_drawn_written(
     engine: &Engine,
-    drawn: Drawn,
+    index: u16,
+    vetoed: AllVetoed,
     facts: &RequestFacts<'_>,
     pool: &PoolFacts<'_>,
     fixed: &[Candidate],
@@ -2893,7 +2906,6 @@ fn run_drawn_written(
     cx: &Constraints<'_>,
     buf: &mut Buffers,
 ) -> Decision {
-    let Drawn { index, vetoed } = drawn;
     let at = usize::from(index);
     let (profile, tests) = (&engine.profiles[at], engine.row_tests[at]);
     debug_assert_eq!(fixed.len(), rows.len(), "one buffer row a fixed row");
@@ -3261,7 +3273,8 @@ impl Glob {
 /// fills its cap is held to a test of the profile's own too
 /// ([`Engine::keeps_for`]). Every input of a naming that is a profile's
 /// own stands here: two profiles are named the same rows where
-/// [`Self::names_as`] says so.
+/// [`Self::names_as`] says so. `==` asks another thing, whether two
+/// builds made one value: what a keep asks (`Engine::read_as`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct NamedBy {
     /// The cap of each list: `0` where the profile is named no row.
@@ -3299,7 +3312,9 @@ impl NamedBy {
 /// standing pass asks of a row ([`Engine::keeps_for`]), as far as one
 /// profile's can be told from another's. The key's mark is no part of
 /// it: the mark is set behind the build, and the test reads it where it
-/// is made.
+/// is made. `==` asks whether two builds made one value, what a keep
+/// asks (`Engine::read_as`): whether two namings are held to one test is
+/// [`Self::same_test`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Held {
     /// To no test: the pass alone can say which rows stay
@@ -3639,10 +3654,10 @@ pub struct Engine {
     /// build, so a publication asks no stage whether it keeps them.
     keepers: Vec<Keeper>,
     /// One tally for each two send settings a profile's stages read
-    /// under, in the order of the names of the profiles that made them:
-    /// a later engine finds one by its settings, then by that name, then
-    /// takes one that is left
-    /// ([`Engine::succeed`]).
+    /// under: a later engine finds one by its settings, then by the name
+    /// of the profile that made it, then takes one that is left
+    /// ([`Engine::succeed`]). A tally kept from an earlier engine bears
+    /// the name of the profile that made it there.
     pub(crate) sent_credits: Vec<Arc<DispatchCredit>>,
     /// Beside each profile, the place in `sent_credits` of the tally its
     /// stages read, where one asked for it at the build.
@@ -4797,9 +4812,6 @@ impl<'a> PairPools<'a> {
                 seed,
                 affinity,
                 named: None,
-                // Lent counts are positions in one pool: neither side takes
-                // them.
-                lent_in_flight: None,
                 // The side's own cells: the request's would be read by
                 // another pool's positions.
                 signal_cells,
@@ -5252,10 +5264,9 @@ impl Engine {
                     0 => prior
                         .iter()
                         .position(|count| count.settings == credit.settings),
-                    1 => prior
-                        .binary_search_by(|count| count.profile.cmp(&credit.profile))
-                        .ok()
-                        .filter(|&standing| free[standing]),
+                    1 => (0..prior.len()).find(|&standing| {
+                        free[standing] && prior[standing].profile == credit.profile
+                    }),
                     _ => left.find(|&standing| free[standing]),
                 };
                 if let Some(standing) = taken[at] {
@@ -5283,12 +5294,14 @@ impl Engine {
     /// engine's tables were folded from the stages built for it: a
     /// profile whose factory built it a stage that says otherwise, under
     /// the same name and text, is built new.
-    /// A count of sends goes with its readers: it is kept where every
-    /// profile that reads it is kept and the standing count was made under
-    /// the same profile's name, and else every reader of it is built new,
-    /// since a rank first heard behind this call would stand in one of two
-    /// counts alone. A profile kept keeps the generation its object was
-    /// made under ([`Engine::hearing`]).
+    /// A count of sends stands where a profile that reads it is kept: this
+    /// engine goes on with the standing count, and the count its build
+    /// made follows that one ([`DispatchCredit::follow`]), so a reader
+    /// built new and a reader kept read one set of entries and a rank
+    /// first heard behind this call stands once. A count none of whose
+    /// readers is kept is this engine's own, and takes a standing count
+    /// over ([`Self::succeed`]). A profile kept keeps the generation its
+    /// object was made under ([`Engine::hearing`]).
     ///
     /// Nothing is kept across two stage tables that may build another
     /// stage under one name: the stock table's number, or one table of a
@@ -5325,28 +5338,27 @@ impl Engine {
             like.then_some(stood)
         };
         let profiles = self.profiles.iter().enumerate();
-        let mut kept: Vec<Option<usize>> = profiles.map(twin).collect();
-        // A count's readers, by their places: kept whole, or built new whole.
+        let kept: Vec<Option<usize>> = profiles.map(twin).collect();
+        // A count's readers, by their places. Where one of them is kept,
+        // the engine goes on with the standing count that reader holds, and
+        // the count the build made follows it: a reader built new reads
+        // and writes the standing count's entries through its own.
         debug_assert_eq!(self.sent_of.len(), self.profiles.len());
         let read = |of: &Self, at: usize| of.sent_of.get(at).copied().flatten();
         self.sent_born = vec![self.generation; self.sent_credits.len()];
         for count in 0..self.sent_credits.len() {
-            let readers = (0..self.profiles.len()).filter(|&at| read(self, at) == Some(count));
-            let readers: Vec<usize> = readers.collect();
-            let stood = readers.first().and_then(|&at| {
-                let stood = read(standing, kept[at]?)?;
-                let reads = |other| read(standing, other) == Some(stood);
-                let whole = readers.iter().all(|&at| kept[at].is_some_and(reads));
-                let made = &standing.sent_credits[stood].profile;
-                (whole && *made == self.sent_credits[count].profile).then_some(stood)
-            });
-            let Some(stood) = stood else {
-                readers.into_iter().for_each(|at| kept[at] = None);
-                continue;
-            };
+            let mut readers = (0..self.profiles.len()).filter(|&at| read(self, at) == Some(count));
+            let stood = readers.find_map(|at| read(standing, kept[at]?));
+            let Some(stood) = stood else { continue };
+            // One pair of settings, one standing count: the other readers
+            // kept hold the same one.
+            let same = |twin| read(standing, twin) == Some(stood);
+            debug_assert!(readers.all(|at| kept[at].is_none_or(same)));
+            let leader = &standing.sent_credits[stood];
+            self.sent_credits[count].follow(leader);
             let born = standing.sent_born.get(stood).copied();
             self.sent_born[count] = born.unwrap_or(standing.generation);
-            self.sent_credits[count] = Arc::clone(&standing.sent_credits[stood]);
+            self.sent_credits[count] = Arc::clone(leader);
         }
         for (at, stood) in kept.into_iter().enumerate() {
             let Some(stood) = stood else { continue };
@@ -6232,7 +6244,10 @@ impl Engine {
     /// under, in its order: the binding the request resolves to; no column
     /// of affinity facts, which is one entry a written row; no scope to
     /// open, no assignment that places and no key that lifts a veto; no
-    /// sessions rule over a keyed request; no encode item; no list of the
+    /// sessions rule over a keyed request, but one that leaves a key with
+    /// no pin to a profile that takes turns and whose filters are one test
+    /// of a row: that draw claims ([`Drawn::claims`]), and its host asks
+    /// [`Self::decide_claimed`]; no encode item; no list of the
     /// pool's engines for a profile that decides over them; a pool of
     /// [`DRAW_FROM`] rows or more; and a profile that draws for every
     /// request, or for this one, which names rows. A smaller pool is
@@ -6263,7 +6278,7 @@ impl Engine {
             (binding.plan, facts.phase),
             (Plan::Epd { .. }, Phase::Encode)
         );
-        if !marks.asks_nothing_first() || keyed || encode {
+        if !marks.asks_nothing_first() || encode {
             return None;
         }
         if marks.first() & (Marks::ENGINES | Marks::OWNS) != 0 && !pool.engines.is_empty() {
@@ -6272,9 +6287,26 @@ impl Engine {
         let ahead = marks.ahead();
         let draws =
             ahead == Marks::DRAWS_FIRST || (facts.named.is_some() && ahead & Marks::JOINED != 0);
-        draws.then_some(Drawn {
+        if !draws {
+            return None;
+        }
+        // Under a rule that leaves a key with no pin to the profile, the
+        // whole decision places such a key by the list's own turn behind
+        // its pass ([`Self::pool_turn`]): that turn is this draw. Held to
+        // a profile whose filters fold into one test of a row, which says
+        // of a row what the pass says of it. The key is asked about last:
+        // a request with none pays the tests it paid before.
+        if keyed
+            && !(marks.turns()
+                && entry.placing == Assignment::Delegate
+                && self.row_tests[at].is_some())
+        {
+            return None;
+        }
+        Some(Drawn {
             index,
             vetoed: entry.vetoed,
+            claims: keyed,
         })
     }
 
@@ -6313,9 +6345,12 @@ impl Engine {
         {
             scratch.kept_last = false;
         }
+        // The draw's two words go apart, a register each: the three
+        // fields of a `Drawn` are handed as one packed word.
         run_drawn_written(
             self,
-            drawn,
+            drawn.index,
+            drawn.vetoed,
             facts,
             pool,
             fixed,
@@ -6324,6 +6359,144 @@ impl Engine {
             cx,
             &mut scratch.single,
         )
+    }
+
+    /// [`Self::decide_drawn`] for a draw that claims ([`Drawn::claims`]): a
+    /// keyed request under a sessions rule that leaves a key with no pin to
+    /// a profile that takes turns. The steps are the whole decision's, in
+    /// its order ([`Self::decide`]), with the row the list's word points at
+    /// in the place of the pass over the pool: that row is read with
+    /// nothing added to the word, and where the profile's filters keep it
+    /// the pool is not emptied; the key is read, which starts its idle
+    /// time; the draw takes the list's turn; and the worker the draw leads
+    /// with is claimed for the key. A claim another request took first is
+    /// settled as the whole decision settles it: its worker leads where
+    /// the filters keep its row, and no alternate at the rule's cap stands
+    /// behind it.
+    ///
+    /// `None` where the whole decision answers by another way, with no
+    /// turn taken and nothing written that it does not write again at the
+    /// same instant: a pool that lends no word, a retry, a request held to
+    /// places, a key that holds a pin, and a turn whose row is refused,
+    /// which says nothing of the pool. The host asks it over rows that each
+    /// carry an id of their own: behind a standing claim the rule's cap is
+    /// asked of the rows the draw kept. `None` too, behind the draw, where
+    /// the standing claim's worker is at the rule's cap: the whole decision
+    /// hands the key on by one more placement. The host then writes every
+    /// row and asks [`Self::decide`].
+    ///
+    /// Out of line: a draw that claims nothing holds one test and none of
+    /// this.
+    #[cfg(feature = "in-process")]
+    #[inline(never)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one decision's inputs, and the host's two halves of a row, as decide_drawn takes them"
+    )]
+    pub(crate) fn decide_claimed(
+        &self,
+        drawn: Drawn,
+        facts: &RequestFacts<'_>,
+        pool: &PoolFacts<'_>,
+        fixed: &[Candidate],
+        rows: &mut [Candidate],
+        write: &mut dyn FnMut(&Candidate, &mut Candidate),
+        cx: &Constraints<'_>,
+        scratch: &mut Scratch,
+    ) -> Option<Decision> {
+        use std::sync::atomic::Ordering;
+
+        let (word, tests) = (pool.word?, self.row_tests[usize::from(drawn.index)]?);
+        if facts.attempt != 0 || !facts.tried.is_empty() || places::stated(cx) {
+            return None;
+        }
+        let (entry, ..) = self.resolve(facts.model, facts.phase)?;
+        let rule = entry.binding.sessions.as_ref()?;
+        let key = facts.session();
+        let free = [WorkerId(0); 2];
+        // A pin that is down, at its cap or moved is the whole decision's.
+        if self.sessions.pins_at(key, facts.now_micros) != free {
+            return None;
+        }
+        let keeps = |row: &Candidate| {
+            tests.keeps(facts, row, cx) && !(tests.masked(cx) && cx.masks(row.position))
+        };
+        let place = word.load(Ordering::Relaxed) as usize % fixed.len().max(1);
+        let (head, row) = (fixed.get(place)?, rows.get_mut(place)?);
+        write(head, row);
+        let turned = *row;
+        if !keeps(&turned) {
+            return None;
+        }
+        // The whole decision reads the key behind a pass that kept a row.
+        let pins = self.sessions.lookup(key, facts.now_micros, rule);
+        if pins != free {
+            return None;
+        }
+        // One read a row: the draw is handed the record read above.
+        let mut once = |fixed: &Candidate, row: &mut Candidate| {
+            if fixed.position == head.position {
+                *row = turned;
+            } else {
+                write(fixed, row);
+            }
+        };
+        let mut decision =
+            self.decide_drawn(drawn, facts, pool, fixed, rows, &mut once, cx, scratch);
+        // A shed and the all-vetoed rule's pick claim nothing.
+        let Decision::Pick(pick) = &mut decision else {
+            return Some(decision);
+        };
+        let first = pick.targets.first().map(|target| target.id);
+        let (Some(first), LiftedVeto::None) = (first, pick.trace.lifted) else {
+            return Some(decision);
+        };
+        pick.session_verdict = SessionVerdict::Pinned;
+        match self.sessions.claim(key, pins, first) {
+            Claim::Made(id) => pick.session_verdict = SessionVerdict::Claimed(id),
+            // A full table records nothing of the key.
+            Claim::NoRoom => {}
+            Claim::Standing(owner, _) => {
+                // The first row of the standing worker the pass kept, in
+                // the pool's order. Behind a draw that widened the rows
+                // kept are every survivor. Behind a draw they are the rows
+                // drawn: each row of the worker is found by its id, read
+                // where the draw did not keep it, and asked the draw's
+                // test.
+                let kept = &scratch.single.kept;
+                let stands = if pick.trace.drew_first() {
+                    let of_owner = fixed.iter().filter(|head| head.id == owner);
+                    of_owner
+                        .filter_map(|head| {
+                            let row = rows.get_mut(head.position as usize)?;
+                            if !kept.contains(&head.position) {
+                                once(head, row);
+                            }
+                            Some(*row)
+                        })
+                        .find(keeps)
+                } else {
+                    kept.iter()
+                        .map(|&row| rows[row as usize])
+                        .find(|row| row.id == owner)
+                };
+                if let Some(row) = stands {
+                    if Self::at_cap(rule, &row) {
+                        return None;
+                    }
+                    if owner != first {
+                        pick.targets.lead(Target {
+                            position: row.position,
+                            id: row.id,
+                            dp_rank: row.dp_rank,
+                            pair: None,
+                        });
+                    }
+                    Self::drop_alternates_at_cap(rule, rows, kept, &mut pick.targets);
+                }
+            }
+        }
+        Some(decision)
     }
 
     /// The body of the two entries. `KEEPS` is the keeping entry's form.
@@ -8550,6 +8723,8 @@ impl Engine {
     /// is given. An engine with no such stage never runs it: a publication
     /// that tells nobody walks no row. A plugin that watches signals hears
     /// of a world's reports no more than it did before a stage kept any.
+    /// The engine over worker lists is the one host that tells reports.
+    #[cfg(feature = "in-process")]
     pub(crate) fn tell_loads(&self, reports: impl Fn(&mut dyn FnMut(&Signal<'_>))) {
         for keeper in &self.keepers {
             match *keeper {
@@ -8715,7 +8890,6 @@ mod tests {
             pickers::{self, Best, CountFirst},
             scorers::{self, LeastRequests},
         },
-        tracking::in_flight::tests::Lent,
     };
 
     fn candidate(position: u32, in_flight: u32) -> Candidate {
@@ -11413,13 +11587,6 @@ mod tests {
             }),
             ..RequestFacts::default()
         };
-        // Nor the counts a host lent: they are read by a position.
-        let mut counted = [0, 1].map(|position| Candidate {
-            position,
-            ..Candidate::default()
-        });
-        let lent = Lent::take(&mut counted);
-        let facts = lent.beside(&facts);
         let pools = PairPools {
             prefills: &prefills,
             decodes: &decodes,
@@ -11428,7 +11595,6 @@ mod tests {
         for (side, name) in [(PairSide::Prefill, "prefill"), (PairSide::Decode, "decode")] {
             let (_, read) = pools.side(side, &facts).expect("an empty column fits");
             assert!(read.named.is_none(), "the {name} side");
-            assert!(read.lent_in_flight.is_none(), "the {name} side");
         }
     }
 
@@ -18332,6 +18498,76 @@ mod tests {
         }
     }
 
+    /// A claim another request of the session took between a draw's read of
+    /// the key and its own claim, as `decide_claimed` settles it: the
+    /// claimed worker leads the draw's own turn, a worker of that turn at
+    /// the rule's cap is dropped behind it, and with the claimed worker at
+    /// the cap the draw answers nothing, so the whole decision hands the
+    /// key on.
+    #[cfg(feature = "in-process")]
+    #[test]
+    fn a_draw_that_loses_its_claim_leads_with_the_claimed_worker_or_answers_nothing() {
+        let rule = SessionRule {
+            inflight_cap: 1,
+            ..SESSIONS
+        };
+        let fixed = pool_of(20, |_| false);
+        let other = fixed[12].id;
+        // The key's requests in flight on the claimed worker, a worker of
+        // the turn at the cap, and the places the draw hands out.
+        let cases = [
+            (0, None, Some(vec![12, 3, 4, 5])),
+            (0, Some(5), Some(vec![12, 3, 4])),
+            (1, None, None),
+        ];
+        for (in_flight, capped, placed) in cases {
+            let engine = session_engine_of(round_robin_profile(), rule);
+            let word = AtomicU64::new(3);
+            let pool = PoolFacts {
+                word: Some(&word),
+                ..PoolFacts::default()
+            };
+            let facts = RequestFacts {
+                session_key: Identity::hashed(41),
+                ..request(0)
+            };
+            let key = facts.session();
+            let drawn = engine.drawn_for(&facts, &pool, fixed.len());
+            let mut rows = vec![Candidate::default(); fixed.len()];
+            let mut asked = 0;
+            // The other request claims behind this one's read of the key:
+            // at the second row the draw asks about.
+            let mut write = |head: &Candidate, row: &mut Candidate| {
+                *row = *head;
+                if head.id == other {
+                    row.session_in_flight = in_flight;
+                }
+                if Some(head.position) == capped {
+                    row.session_in_flight = 1;
+                }
+                asked += 1;
+                if asked == 2 {
+                    let claim = engine.sessions.claim(key, [WorkerId(0); 2], other);
+                    assert_eq!(claim, Claim::Made(other));
+                }
+            };
+            let decision = engine.decide_claimed(
+                drawn.expect("a draw that claims"),
+                &facts,
+                &pool,
+                &fixed,
+                &mut rows,
+                &mut write,
+                &Constraints::default(),
+                &mut Scratch::new(),
+            );
+            assert_eq!(decision.as_ref().map(positions), placed);
+            if let Some(Decision::Pick(pick)) = &decision {
+                assert_eq!(pick.session_verdict, SessionVerdict::Pinned);
+            }
+        }
+    }
+
     #[test]
     fn a_pick_that_stands_keeps_its_turn_behind_a_run_of_refused_rows() {
         // Row 4 is kept and the twelve rows behind it are not: the walk for
@@ -19795,11 +20031,10 @@ mod tests {
         assert!(led < 20, "{led} of 200 decisions were led by a busy holder");
     }
 
-    /// The mean the join hands on is of the drawn rows' counts as the
-    /// request's facts read them: the lent count where a table is lent.
+    /// The mean the join hands on is of the drawn rows' own counts.
     #[test]
-    fn the_join_hands_on_the_mean_of_the_drawn_rows_lent_counts() {
-        let mut pool: Vec<Candidate> = (0..)
+    fn the_join_hands_on_the_mean_of_the_drawn_rows_counts() {
+        let pool: Vec<Candidate> = (0..)
             .zip([6, 2, 9, 9])
             .map(|(position, in_flight)| Candidate {
                 position,
@@ -19807,8 +20042,7 @@ mod tests {
                 ..Candidate::default()
             })
             .collect();
-        let lent = Lent::take(&mut pool);
-        let facts = lent.beside(&RequestFacts::default());
+        let facts = RequestFacts::default();
         let mut kept = vec![0, 1];
         let mean = join_named(
             &facts,

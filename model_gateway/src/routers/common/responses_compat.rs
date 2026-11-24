@@ -20,6 +20,11 @@
 //!   without elevating the payload to a system/developer instruction. Non-
 //!   plaintext parts (such as `encrypted_content`) are rejected explicitly with
 //!   HTTP 400 rather than silently dropped.
+//! - `tool_search_output`: validates and lifts discovered tools into top-level
+//!   `tools`. The corresponding hosted search records (`tool_search_call` and
+//!   `web_search_call`) are omitted on local backends.
+//! - `function_call_output` without a call ID becomes a user message carrying
+//!   the tool name, namespace, and output. Reasoning items missing an ID get one.
 //!
 //! External OpenAI-compatible cloud providers bypass this lowering so the
 //! original wire items pass through untouched.
@@ -28,8 +33,9 @@ use axum::response::Response;
 use openai_protocol::{
     common::ToolReference,
     responses::{
-        generate_id, AgentMessageContentPart, NamespaceTool, ResponseContentPart, ResponseInput,
-        ResponseInputOutputItem, ResponseTool, ResponsesRequest, ResponsesToolChoice,
+        generate_id, validate_response_tools_at, AgentMessageContentPart, NamespaceTool,
+        ResponseContentPart, ResponseInput, ResponseInputOutputItem, ResponseTool,
+        ResponsesRequest, ResponsesToolChoice, StringOrContentParts,
     },
 };
 
@@ -38,6 +44,55 @@ use crate::routers::error;
 /// Default namespace Codex Responses Lite uses to group top-level function and
 /// custom tools inside an `additional_tools` input item.
 const DEFAULT_FUNCTION_NAMESPACE: &str = "functions";
+
+/// Header prefix used when lowering a `function_call_output` without `call_id`
+/// into a user message for local backends.
+pub(crate) fn format_call_id_less_tool_output_header(
+    name: Option<&str>,
+    namespace: Option<&str>,
+) -> String {
+    let ns = namespace.filter(|s| !s.is_empty());
+    let tool = name.filter(|s| !s.is_empty());
+    match (ns, tool) {
+        (Some(ns), Some(tool)) => format!("[tool_output {ns}.{tool}]"),
+        (None, Some(tool)) => format!("[tool_output {tool}]"),
+        (Some(ns), None) => format!("[tool_output {ns}]"),
+        (None, None) => "[tool_output]".to_string(),
+    }
+}
+
+/// Lower a `function_call_output` that has no `call_id` into user-message
+/// content parts preserving tool identity (`namespace`/`name`) and all output
+/// parts.
+pub(crate) fn lower_call_id_less_tool_output_parts(
+    name: Option<&str>,
+    namespace: Option<&str>,
+    output: StringOrContentParts,
+) -> Vec<ResponseContentPart> {
+    let header = format_call_id_less_tool_output_header(name, namespace);
+    match output {
+        StringOrContentParts::String(text) => {
+            let combined = if text.is_empty() {
+                header
+            } else {
+                format!("{header}\n{text}")
+            };
+            vec![ResponseContentPart::InputText { text: combined }]
+        }
+        StringOrContentParts::Array(mut parts) => {
+            if let Some(ResponseContentPart::InputText { text }) = parts.first_mut() {
+                if text.is_empty() {
+                    *text = header;
+                } else {
+                    *text = format!("{header}\n{text}");
+                }
+            } else {
+                parts.insert(0, ResponseContentPart::InputText { text: header });
+            }
+            parts
+        }
+    }
+}
 
 /// Render a plaintext [`ResponseInputOutputItem::AgentMessage`] into a single
 /// user-message string that preserves sender (`author`), recipient
@@ -79,9 +134,8 @@ pub(crate) fn format_agent_message_text(
     Ok(out)
 }
 
-/// Lower Codex-specific Responses input items (`additional_tools`,
-/// `agent_message`, and `reasoning` items missing an `id`) into standard forms
-/// understood by local HTTP/PD/gRPC inference backends.
+/// Lower inline and discovered tool declarations, agent messages, unpaired
+/// function outputs, reasoning items, and hosted search records for local backends.
 ///
 /// Requests that need no lowering return immediately without allocating.
 pub(crate) fn lower_responses_request_for_local_backend(
@@ -93,8 +147,14 @@ pub(crate) fn lower_responses_request_for_local_backend(
 
     let needs_lowering = items.iter().any(|item| match item {
         ResponseInputOutputItem::AdditionalTools { .. }
-        | ResponseInputOutputItem::AgentMessage { .. } => true,
+        | ResponseInputOutputItem::AgentMessage { .. }
+        | ResponseInputOutputItem::ToolSearchCall { .. }
+        | ResponseInputOutputItem::ToolSearchOutput { .. }
+        | ResponseInputOutputItem::WebSearchCall { .. } => true,
         ResponseInputOutputItem::Reasoning { id, .. } => id.as_deref().is_none_or(str::is_empty),
+        ResponseInputOutputItem::FunctionCallOutput { call_id, .. } => {
+            call_id.as_deref().is_none_or(str::is_empty)
+        }
         _ => false,
     });
     if !needs_lowering {
@@ -129,38 +189,67 @@ pub(crate) fn lower_responses_request_for_local_backend(
     let mut unwrapped_default_namespace = false;
     let mut unwrapped_custom_names: Vec<String> = Vec::new();
 
-    for item in original_items {
-        match item {
-            ResponseInputOutputItem::AdditionalTools { tools, .. } => {
-                for tool in tools {
-                    match tool {
-                        ResponseTool::Namespace(namespace)
-                            if !has_explicit_functions_namespace
-                                && namespace.name == DEFAULT_FUNCTION_NAMESPACE =>
-                        {
-                            unwrapped_default_namespace = true;
-                            for member in namespace.tools {
-                                let lifted = match member {
-                                    NamespaceTool::Function(ft) => ResponseTool::Function(ft),
-                                    NamespaceTool::Custom(ct) => {
-                                        unwrapped_custom_names.push(ct.name.clone());
-                                        ResponseTool::Custom(ct)
-                                    }
-                                };
-                                push_or_replace_tool(&mut lifted_tools, lifted);
+    let mut lift_tools = |tools: Vec<ResponseTool>| {
+        for tool in tools {
+            match tool {
+                ResponseTool::Namespace(namespace)
+                    if !has_explicit_functions_namespace
+                        && namespace.name == DEFAULT_FUNCTION_NAMESPACE =>
+                {
+                    unwrapped_default_namespace = true;
+                    for member in namespace.tools {
+                        let lifted = match member {
+                            NamespaceTool::Function(ft) => ResponseTool::Function(ft),
+                            NamespaceTool::Custom(ct) => {
+                                unwrapped_custom_names.push(ct.name.clone());
+                                ResponseTool::Custom(ct)
                             }
-                        }
-                        other => {
-                            if custom_choice_name.is_some_and(|choice_name| {
-                                callable_tool_name(&other) == Some(choice_name)
-                            }) {
-                                has_literal_custom_choice = true;
-                            }
-                            push_or_replace_tool(&mut lifted_tools, other);
-                        }
+                        };
+                        push_or_replace_tool(&mut lifted_tools, lifted);
                     }
                 }
+                other => {
+                    if custom_choice_name
+                        .is_some_and(|choice_name| callable_tool_name(&other) == Some(choice_name))
+                    {
+                        has_literal_custom_choice = true;
+                    }
+                    push_or_replace_tool(&mut lifted_tools, other);
+                }
             }
+        }
+    };
+
+    for (item_idx, item) in original_items.into_iter().enumerate() {
+        match item {
+            ResponseInputOutputItem::AdditionalTools { tools, .. } => {
+                lift_tools(tools);
+            }
+            ResponseInputOutputItem::ToolSearchOutput { tools, .. } => {
+                let prefix = format!("input[{item_idx}].tools");
+                let parsed: Vec<ResponseTool> = tools
+                    .into_iter()
+                    .enumerate()
+                    .map(|(tool_idx, value)| {
+                        serde_json::from_value(value).map_err(|err| {
+                            error::bad_request(
+                                "invalid_tool",
+                                format!("Invalid '{prefix}[{tool_idx}]': {err}"),
+                            )
+                        })
+                    })
+                    .collect::<Result<_, _>>()?;
+                validate_response_tools_at(&parsed, &prefix).map_err(|err| {
+                    error::bad_request(
+                        err.code,
+                        err.message
+                            .unwrap_or_else(|| format!("Invalid '{prefix}'").into()),
+                    )
+                })?;
+                lift_tools(parsed);
+            }
+            ResponseInputOutputItem::ToolSearchCall { .. }
+            | ResponseInputOutputItem::WebSearchCall { .. } => {}
             ResponseInputOutputItem::AgentMessage {
                 id,
                 author,
@@ -186,6 +275,27 @@ pub(crate) fn lower_responses_request_for_local_backend(
                     phase: None,
                 });
             }
+            ResponseInputOutputItem::FunctionCallOutput {
+                id,
+                call_id,
+                name,
+                namespace,
+                output,
+                ..
+            } if call_id.as_deref().is_none_or(str::is_empty) => {
+                let content = lower_call_id_less_tool_output_parts(
+                    name.as_deref(),
+                    namespace.as_deref(),
+                    output,
+                );
+                lowered_items.push(ResponseInputOutputItem::Message {
+                    id: id.unwrap_or_else(|| generate_id("msg")),
+                    role: "user".to_string(),
+                    content,
+                    status: Some("completed".to_string()),
+                    phase: None,
+                });
+            }
             mut other => {
                 if let ResponseInputOutputItem::Reasoning { id, .. } = &mut other {
                     if id.as_deref().is_none_or(str::is_empty) {
@@ -200,7 +310,7 @@ pub(crate) fn lower_responses_request_for_local_backend(
     if lowered_items.is_empty() {
         return Err(error::bad_request(
             "input_items_empty",
-            "Input must contain at least one message or item beyond additional_tools",
+            "Input must contain at least one item beyond tool declarations and hosted search records",
         ));
     }
 
@@ -783,5 +893,153 @@ mod tests {
         assert!(items[1].get("content").is_none());
         assert_eq!(items[3]["id"], "rs_existing");
         assert_eq!(items[3]["encrypted_content"], "opaque");
+    }
+
+    #[test]
+    fn lowers_call_id_less_function_call_output_for_local_backends() {
+        let mut req = parse_request(json!({
+            "model": "test-model",
+            "input": [
+                {"role": "user", "content": "open the page"},
+                {
+                    "type": "function_call_output",
+                    "name": "codex_apps_open_page",
+                    "namespace": "agent",
+                    "output": "{\"page_id\":null}"
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "exec_command",
+                    "arguments": "{}"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "ok"
+                }
+            ]
+        }));
+
+        lower_responses_request_for_local_backend(&mut req)
+            .expect("call_id-less function_call_output should lower cleanly");
+
+        let wire = serde_json::to_value(&req).unwrap();
+        let items = wire["input"].as_array().unwrap();
+        assert_eq!(items[1]["type"], "message");
+        assert_eq!(items[1]["role"], "user");
+        assert_eq!(
+            items[1]["content"][0]["text"],
+            "[tool_output agent.codex_apps_open_page]\n{\"page_id\":null}"
+        );
+        // Normal call_id-bearing function_call_output stays untouched.
+        assert_eq!(items[3]["type"], "function_call_output");
+        assert_eq!(items[3]["call_id"], "call_1");
+        assert_eq!(items[3]["output"], "ok");
+    }
+
+    #[test]
+    fn lowers_tool_search_and_web_search_items_for_local_backends() {
+        let mut req = parse_request(json!({
+            "model": "test-model",
+            "tools": [],
+            "input": [
+                {"role": "user", "content": "check weather"},
+                {
+                    "type": "tool_search_call",
+                    "call_id": "ts_1",
+                    "arguments": {"query": "weather"},
+                    "execution": "client"
+                },
+                {
+                    "type": "tool_search_output",
+                    "call_id": "ts_1",
+                    "execution": "client",
+                    "tools": [{
+                        "type": "function",
+                        "name": "get_weather",
+                        "parameters": {"type": "object"}
+                    }]
+                },
+                {
+                    "type": "web_search_call",
+                    "id": "ws_1",
+                    "status": "completed",
+                    "action": {"type": "search", "query": "sf weather"}
+                }
+            ]
+        }));
+
+        let mut explicit = req.clone();
+        explicit.tool_choice = Some(ResponsesToolChoice::Options(ToolChoiceOptions::None));
+        explicit.normalize();
+        lower_responses_request_for_local_backend(&mut explicit).unwrap();
+        assert!(matches!(
+            explicit.tool_choice,
+            Some(ResponsesToolChoice::Options(ToolChoiceOptions::None))
+        ));
+
+        let mut named = req.clone();
+        named.tool_choice = Some(
+            serde_json::from_value(json!({
+                "type": "function",
+                "name": "get_weather"
+            }))
+            .unwrap(),
+        );
+        named
+            .validate()
+            .expect("a discovered function can be selected by name");
+
+        req.validate().unwrap();
+        req.normalize();
+        assert!(matches!(
+            req.tool_choice,
+            Some(ResponsesToolChoice::Options(ToolChoiceOptions::Auto))
+        ));
+        lower_responses_request_for_local_backend(&mut req)
+            .expect("tool_search and web_search_call should lower cleanly");
+
+        let wire = serde_json::to_value(&req).unwrap();
+        let tools = wire["tools"].as_array().expect("discovered tool lifted");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["name"], "get_weather");
+        let items = wire["input"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["role"], "user");
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_discovered_tools_with_their_input_path() {
+        for (tool, code) in [
+            (json!({"type": "function"}), "invalid_tool"),
+            (
+                json!({"type": "function", "name": "lookup", "parameters": []}),
+                "invalid_type",
+            ),
+            (json!({"type": "local_shell"}), "tool_not_supported"),
+        ] {
+            let mut req = parse_request(json!({
+                "model": "test-model",
+                "input": [
+                    {"role": "user", "content": "hi"},
+                    {"type": "tool_search_output", "tools": [
+                        {"type": "function", "name": "valid", "parameters": {}},
+                        tool
+                    ]}
+                ]
+            }));
+            let response = lower_responses_request_for_local_backend(&mut req).unwrap_err();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let bytes = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            let payload: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(payload["error"]["code"], code);
+            assert!(payload["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("input[1].tools[1]"));
+        }
     }
 }

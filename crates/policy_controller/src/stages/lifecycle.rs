@@ -108,19 +108,16 @@ pub trait Lifecycle: Send + Sync {
     fn on_signal(&self, _signal: &Signal<'_>) {}
 
     /// Whether the stage keeps a number of each rank's report, which a host
-    /// tells it ([`Signal::Load`] with the report's sample instant, with
-    /// the rank's slot where the host keeps counts, and with the report's
-    /// named values where the host states them). The policy store tells
-    /// every report before it shows a decision that report. The engine over
-    /// a host's worker lists tells a report that is new before it keeps the
-    /// report's snapshot for its decisions, and its own doc names the
-    /// reports a decision can read first. `false` by
-    /// default: a host tells no report to an engine none of whose stages
-    /// keeps one, and such a stage decides the same untold. The engine asks
-    /// once, at its build: the answer is the stage's for the engine's life.
-    /// A host may tell such a stage under its own locks, as the policy store
-    /// does under its membership and load locks: a stage that calls from
-    /// that word a door of the host that takes one of them waits on itself.
+    /// tells it ([`Signal::Load`] with the report's sample instant, and with
+    /// the report's named values where the host states them). The engine
+    /// over a host's worker lists tells a report that is new before it keeps
+    /// the report's snapshot for its decisions, and its own doc names the
+    /// reports a decision can read first. `false` by default: a host tells
+    /// no report to an engine none of whose stages keeps one, and such a
+    /// stage decides the same untold. The engine asks once, at its build:
+    /// the answer is the stage's for the engine's life. A host may tell
+    /// such a stage under its own locks: a stage that calls from that word a
+    /// door of the host that takes one of them waits on itself.
     fn keeps_loads(&self) -> bool {
         false
     }

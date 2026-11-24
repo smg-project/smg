@@ -26,8 +26,8 @@
 //! A pair-index row picks nothing: it holds what the gateway's pair index
 //! made of a prefill pool and a decode pool, and must replay whole.
 //! An encode-pair row holds the gateway's answers to requests that carry
-//! encode items. The store's part of each answer replays: the encoders a
-//! prefill is handed items by.
+//! encode items. The encode rule's part of each answer replays: the
+//! encoders a prefill is handed items by.
 //! A sticky rank row holds the rank each request of one grouped worker was
 //! pinned to by its key. Two hashes place no key alike, so it must replay
 //! with the requests of one key on one rank, and a counted row count for
@@ -287,9 +287,9 @@ const fn module<R: Recorded>(inline: &'static str) -> Module {
 /// over a host's load monitor, and holds a copied row whole too.
 /// A minimum-tokens row names a rank or none: its module brings its own
 /// replay, over the rank cache of that monitor, and holds a copied row whole.
-/// An encode-pair row is replayed in its store part by its own module;
-/// its copied rows name no runtime either, and the pair index's rule
-/// holds them.
+/// An encode-pair row is replayed in the encode rule's part by its own
+/// module; its copied rows name no runtime either, and the pair index's
+/// rule holds them.
 /// A retry-wire row, a media row and a context-window row name the
 /// workers a request may take or its refusal, so each module brings its
 /// own replay too, over one bed; their copied rows name each runtime by a
@@ -689,7 +689,7 @@ fn the_classic_ring_rows_replay_on_a_ring_their_caller_lends() {
 }
 
 #[test]
-fn the_classic_encode_pair_rows_replay_the_stores_part_list_for_list() {
+fn the_classic_encode_pair_rows_replay_the_rules_part_list_for_list() {
     let (rows, defects) = replay_sheet(classic::encode_pair::INLINE, "the inline rows");
     assert!(rows >= 8, "{rows} inline rows");
     assert!(defects.is_empty(), "{defects:#?}");
@@ -1159,16 +1159,16 @@ fn a_sheet_of_a_policy_no_module_replays_is_a_defect() {
     );
 }
 
-/// An encode-pair row reads red on a list that is not the store's and on
+/// An encode-pair row reads red on a list that is not the rule's and on
 /// an answer that is not the decision's. An offered list that leaves the
-/// class's ready encoders out is a defect of the store's part, and so is an
+/// class's ready encoders out is a defect of the rule's part, and so is an
 /// encoder offered to a request that carries no item. An offered encoder
 /// that is not ready, and a permanent gap's refusal beside a class that
 /// serves the request, are a defect of each part. A copied row is its
 /// sheet's row under one renaming of its runtimes: other names in the same
 /// order are no defect, two names made one are.
 #[test]
-fn an_encode_pair_row_is_held_to_the_stores_lists_and_the_decision() {
+fn an_encode_pair_row_is_held_to_the_rules_lists_and_the_decision() {
     let inline = classic::encode_pair::INLINE;
     let defects_of = |name: &str, change: &dyn Fn(&mut Value)| {
         let mut sheet: Value = serde_json::from_str(inline).expect("the inline sheet");
@@ -1195,8 +1195,8 @@ fn an_encode_pair_row_is_held_to_the_stores_lists_and_the_decision() {
         *open.expect("the second encoder") = Value::from(false);
     });
     assert!(
-        matches!(unready.as_slice(), [store, decision]
-            if store.contains("of which [0] are ready")
+        matches!(unready.as_slice(), [rule, decision]
+            if rule.contains("of which [0] are ready")
                 && decision.contains("replayed [0, 0, 0]")),
         "{unready:#?}"
     );
@@ -1207,8 +1207,8 @@ fn an_encode_pair_row_is_held_to_the_stores_lists_and_the_decision() {
         *of_prefill.expect("the prefill's connector") = connector.expect("the encoder's");
     });
     assert!(
-        matches!(served.as_slice(), [store, decision]
-            if store.contains("yet the class of prefill 0 holds encoder 0")
+        matches!(served.as_slice(), [rule, decision]
+            if rule.contains("yet the class of prefill 0 holds encoder 0")
                 && decision.contains("refused as ec_incompatible, replayed Pick(")),
         "{served:#?}"
     );

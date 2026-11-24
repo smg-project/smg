@@ -161,7 +161,7 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     /// owner. Single-worker placement over regular workers then leaves the
     /// absolute overload veto off the selection instead of moving the session
     /// off the worker holding its cache each time that worker crosses a
-    /// threshold (see `placement::select_from`).
+    /// threshold (see `placement::select_single`).
     fn routes_by_session_key(&self, _info: &SelectWorkerInfo) -> bool {
         false
     }

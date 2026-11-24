@@ -407,11 +407,14 @@ fn session_of(key: &str, model: &str) -> u64 {
 async fn sessioned(harness: &mut Harness, ask: DecideRequest) -> Result<(u64, u64), String> {
     let before = harness.leases(GATEWAY);
     let answer = harness.client().decide(ask).await;
-    let Ok(Answer::Decision(Decision {
-        leases,
-        outcome: Some(Outcome::Pick(pick)),
-        ..
-    })) = &answer
+    let Ok(Answer::Decision(
+        Decision {
+            leases,
+            outcome: Some(Outcome::Pick(pick)),
+            ..
+        },
+        _,
+    )) = &answer
     else {
         return Err(format!("no pick: {answer:?}"));
     };
@@ -523,11 +526,14 @@ async fn leased(harness: &mut Harness, ask: DecideRequest) -> Result<(Picked, Ve
         .as_ref()
         .is_some_and(|facts| facts.session_key.is_some());
     let answer = answered(harness, ask).await;
-    let Ok(Answer::Decision(Decision {
-        leases,
-        outcome: Some(Outcome::Pick(pick)),
-        ..
-    })) = &answer
+    let Ok(Answer::Decision(
+        Decision {
+            leases,
+            outcome: Some(Outcome::Pick(pick)),
+            ..
+        },
+        _,
+    )) = &answer
     else {
         return Err(format!("no pick: {answer:?}"));
     };
@@ -650,11 +656,14 @@ fn row_of(harness: &Harness, id: u64, dp_rank: u32) -> Result<Picked, String> {
 /// caller's, to dispatch on a target and to give up.
 async fn offered(harness: &mut Harness, ask: DecideRequest) -> Result<(Vec<Picked>, u64), String> {
     let answer = harness.client().decide(ask).await;
-    let Ok(Answer::Decision(Decision {
-        leases,
-        outcome: Some(Outcome::Pick(pick)),
-        ..
-    })) = &answer
+    let Ok(Answer::Decision(
+        Decision {
+            leases,
+            outcome: Some(Outcome::Pick(pick)),
+            ..
+        },
+        _,
+    )) = &answer
     else {
         return Err(format!("no pick: {answer:?}"));
     };
@@ -1062,7 +1071,7 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
         for (name, ask) in [("subset-hint", hinted), ("wires", narrowed)] {
             let answer = harness.client().decide(ask).await;
             assert!(
-                matches!(&answer, Ok(Answer::Decision(Decision { outcome: Some(Outcome::Shed(shed)), .. }))
+                matches!(&answer, Ok(Answer::Decision(Decision { outcome: Some(Outcome::Shed(shed)), .. }, _))
                     if shed.reason() == ShedReason::NoEndpoints && shed.emptied_by == name),
                 "a constraint that leaves no row sheds under its own name, {name}: {answer:?}"
             );
@@ -2160,7 +2169,7 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             let report =
                 blocking::Client::connect(&address, "blocking-gateway").and_then(|mut client| {
                     let lease = match client.decide(ask(b"blocking-report"))? {
-                        Answer::Decision(Decision { leases, .. }) => {
+                        Answer::Decision(Decision { leases, .. }, _) => {
                             leases.first().map(|lease| lease.id)
                         }
                         Answer::Busy(_) => None,
@@ -2300,11 +2309,14 @@ fn at_prefill(n: u64) -> DecideRequest {
 async fn paired(harness: &mut Harness, ask: DecideRequest) -> Result<(Picked, Picked), String> {
     let before = harness.leases(GATEWAY);
     let answer = harness.client().decide(ask).await;
-    let Ok(Answer::Decision(Decision {
-        leases,
-        outcome: Some(Outcome::Pick(pick)),
-        ..
-    })) = &answer
+    let Ok(Answer::Decision(
+        Decision {
+            leases,
+            outcome: Some(Outcome::Pick(pick)),
+            ..
+        },
+        _,
+    )) = &answer
     else {
         return Err(format!("no pick: {answer:?}"));
     };
@@ -2479,7 +2491,7 @@ async fn the_blocking_client_asks_a_started_controller_from_a_thread_of_its_own(
         // and the answer is a shed for want of endpoints under the stage
         // `none`, whatever document is applied.
         assert!(
-            matches!(&decided, Answer::Decision(Decision { outcome: Some(Outcome::Shed(shed)), .. })
+            matches!(&decided, Answer::Decision(Decision { outcome: Some(Outcome::Shed(shed)), .. }, _)
                 if shed.reason() == ShedReason::NoEndpoints && shed.emptied_by == "none"),
             "{decided:?}"
         );
@@ -2524,11 +2536,14 @@ async fn linked_fleet(gateway: &str, workers: usize) -> Result<(Harness, Link), 
 
 async fn linked_pick(link: &Link, request: DecideRequest) -> Result<Lease, String> {
     let answer = link.ask(request, ROOM).await;
-    let Ok(Decision {
-        leases,
-        outcome: Some(Outcome::Pick(_)),
-        ..
-    }) = answer
+    let Ok((
+        Decision {
+            leases,
+            outcome: Some(Outcome::Pick(_)),
+            ..
+        },
+        _,
+    )) = answer
     else {
         return Err(format!("no pick: {answer:?}"));
     };

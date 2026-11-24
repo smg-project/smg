@@ -1,7 +1,7 @@
 //! The sent-prefix predictor (design 4.4): which workers each prefix of a
-//! model's requests was sent to. A worker the store hears no cache events
+//! model's requests was sent to. A worker its host hears no cache events
 //! from is remembered by what it was sent, and a decision reads that as it reads
-//! the holders of the event-fed index ([`crate::store`]): the
+//! the holders of the event-fed index its host keeps: the
 //! deepest block of its request that a worker was sent, and the workers
 //! sent it.
 //!
@@ -191,7 +191,7 @@ enum Ask<'a> {
 }
 
 /// The prefixes sent to a model's workers: what a decision reads for the
-/// workers the store hears no cache events from, and what its issue writes.
+/// workers its host hears no cache events from, and what its issue writes.
 #[derive(Debug)]
 pub struct PrefixPredictor {
     /// The blocks, in pieces. A whole piece never moves; the first
@@ -446,13 +446,45 @@ impl PrefixPredictor {
         worker: WorkerId,
         tick: u16,
     ) {
+        self.write_behind(keys, known, worker, tick, false);
+    }
+
+    /// One turn of a request its owner writes in parts:
+    /// [`Self::record_behind`] for the leading part `keys`, and whether
+    /// the worker holds the whole of it as the turn ends. A turn that
+    /// finds the worker to hold fewer than `known` blocks writes nothing.
+    /// Its owner ends the write at a turn that is not whole, so one
+    /// request takes room for one turn of blocks, and the next request of
+    /// the prefix writes on.
+    #[cfg(feature = "in-process")]
+    pub(crate) fn record_turn(
+        &mut self,
+        keys: &[u64],
+        known: usize,
+        worker: WorkerId,
+        tick: u16,
+    ) -> bool {
+        self.write_behind(keys, known, worker, tick, true)
+    }
+
+    /// [`Self::record_behind`], or one turn of a write in parts
+    /// ([`Self::record_turn`]) where `turn` says so: whether the worker
+    /// holds the whole of `keys` as the call ends.
+    fn write_behind(
+        &mut self,
+        keys: &[u64],
+        known: usize,
+        worker: WorkerId,
+        tick: u16,
+        turn: bool,
+    ) -> bool {
         let blocks = keys.len();
         if blocks == 0 {
-            return;
+            return true;
         }
         let Some(place) = self.place_of(worker) else {
             self.dropped += blocks as u64;
-            return;
+            return false;
         };
         // What anyone was sent of the request, and what the worker was.
         let stood = match known.checked_sub(1) {
@@ -468,13 +500,19 @@ impl PrefixPredictor {
             Some(at) => ((known, at), (known, at)),
             None => {
                 let (have, end) = self.depth(keys, blocks, Ask::Any);
-                ((have, end), self.depth(keys, have, Ask::Holds(place)))
+                let holds = self.depth(keys, have, Ask::Holds(place));
+                // A turn told more than the worker holds: what stood
+                // behind it was taken out since.
+                if turn && holds.0 < known {
+                    return false;
+                }
+                ((have, end), holds)
             }
         };
         let need = blocks - held;
         if need == 0 {
             self.end_at(before, tick);
-            return;
+            return true;
         }
         // The request's own path is the newest before any block leaves for
         // it, and its deepest block is kept: the write stands on it. A
@@ -490,6 +528,7 @@ impl PrefixPredictor {
         self.make_room(need, end);
         let room = need.min(self.bound.saturating_sub(self.placements));
         self.dropped += (need - room) as u64;
+        let mut whole = room == need;
         for (at, &key) in keys.iter().enumerate().take(held + room).skip(held) {
             // A block past what anyone was sent is not there: the lookup
             // that puts it in is its only one.
@@ -504,6 +543,7 @@ impl PrefixPredictor {
                 None => {
                     let Some((block, made)) = self.take(key, before, place, tick) else {
                         self.dropped += (held + room - at) as u64;
+                        whole = false;
                         break;
                     };
                     if made || self.add(block, place) {
@@ -522,6 +562,7 @@ impl PrefixPredictor {
             self.unlink(end);
             self.link_waiting(end);
         }
+        whole
     }
 
     /// Whether the record holds a place for the worker: it was sent a

@@ -266,7 +266,7 @@ fn every_field_of_a_frame_reaches_the_request_its_maker_makes() {
     // and the decision's instant is the engine's to write.
     assert_eq!((facts.budget_micros, facts.now_micros), (1_500, 0));
     assert!(facts.affinity.is_empty() && facts.named.is_none());
-    assert!(facts.lent_in_flight.is_none() && facts.signal_cells.is_none());
+    assert!(facts.signal_cells.is_none());
     // The frame carries its model's name and no fingerprint of it: each
     // read of the request's session fingerprints the name.
     assert_eq!(facts.model_fingerprint, ModelFingerprint::NONE);

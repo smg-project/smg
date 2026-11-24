@@ -38,10 +38,10 @@
 //! encoder, and its answer names each item's encoder
 //! ([`FrameBuffers::answered`]).
 //!
-//! A frame of the encode phase that carries no items has no decision here,
-//! and a decode frame that names no lease has none under a plan that pairs
-//! its phase: their deciding thread answers them `Busy` and reads no list
-//! for them.
+//! A frame of the encode phase that does not state `DecideRequest.encode`
+//! has no decision here, and a decode frame that names no lease has none
+//! under a plan that pairs its phase: their deciding thread answers them
+//! `Busy` and reads no list for them.
 
 use std::{
     mem,
