@@ -2085,12 +2085,9 @@ impl<G: Generation> WorkerMonitor<G> {
             return None;
         }
         let rank = i32::try_from(rank).ok()?;
-        let of_rank = || answer.loads.iter().filter(|load| load.dp_rank == rank);
-        let mut loads = Vec::with_capacity(of_rank().count());
-        loads.extend(of_rank().cloned());
-        if loads.is_empty() {
-            return None;
-        }
+        let mut of_rank = answer.loads.iter().filter(|load| load.dp_rank == rank);
+        let mut loads = vec![of_rank.next()?.clone()];
+        loads.extend(of_rank.cloned());
         Some(WorkerLoadResponse {
             timestamp: answer.timestamp.clone(),
             version: answer.version.clone(),
@@ -2363,10 +2360,11 @@ impl<G: Generation> WorkerMonitor<G> {
     /// engine answers once; each member's report is that
     /// answer scoped to its own rank, as its own poll would have had it (a
     /// rank the answer omits is an empty report). The last member takes the
-    /// answer itself and each member ahead of it a copy, so an engine of one
-    /// worker copies none. A report's ranks and its named values stand under
-    /// the report's bounds, and the values that left them are counted for
-    /// its member.
+    /// answer itself and each member ahead of it a copy of its own rank's
+    /// rows (of the whole of a gateway's rollup, which every member keeps),
+    /// so an engine of one worker copies none. A report's ranks and its
+    /// named values stand under the report's bounds, and the values that
+    /// left them are counted for its member.
     ///
     /// Where the host keeps a load source for an HTTP worker
     /// ([`Worker::load_source`]), the source answers for the engine in the
@@ -2472,10 +2470,6 @@ impl<G: Generation> WorkerMonitor<G> {
                 let one_engine = answer.ranks_are_dp_ranks();
                 let left =
                     value_bounds::bound_ranks(&mut answer.loads, member.dp_rank(), one_engine);
-                // The report stands until the worker's next one: it keeps no
-                // room for an entry that left, or that a decoder made room
-                // for and did not read.
-                answer.loads.shrink_to_fit();
                 if member.dp_rank().is_some() {
                     // `for_dp_rank` counted the scoped rows, a repeated one
                     // among them: a pinned member's count is its rows kept.
@@ -3806,6 +3800,8 @@ mod native_loads_tests {
     fn a_members_copy_of_its_rank_is_the_answer_scoped_to_that_rank() {
         let mut twice = host_answer(3);
         twice.loads[2].dp_rank = 0;
+        twice.timestamp = "2026-01-02T03:04:05Z".to_owned();
+        twice.version = "engine-7".to_owned();
         twice.aggregate = Some(Default::default());
         twice.sampled_at = Some(Instant::now());
         let mut rollup = host_answer(2);
@@ -3819,6 +3815,10 @@ mod native_loads_tests {
                 );
             }
         }
+        // Its list has room for its own row alone: a copy of the whole
+        // answer keeps room for every rank's.
+        let own = WorkerMonitor::copy_for_dp_rank(&host_answer(3), Some(1));
+        assert_eq!(own.map(|own| own.loads.capacity()), Some(1));
     }
 
     /// A connector that keeps no source is asked once, and its worker is

@@ -1727,9 +1727,9 @@ static FIXED_COUNT_NAMES: LazyLock<[Arc<str>; 3]> = LazyLock::new(|| {
 
 /// One value an engine reports by name alongside its fixed fields. The name
 /// and the unit are shared strings: a copy of an entry, which the load
-/// monitor makes where several workers share one engine's answer, allocates
-/// none. A connection that knows a name ahead of its reports makes it once
-/// and clones it.
+/// monitor makes where several workers share one polled answer and where
+/// it publishes a pushed report, allocates none. A connection that knows a
+/// name ahead of its reports makes it once and clones it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct NamedValue {
     pub name: Arc<str>,
@@ -2672,10 +2672,13 @@ mod load_snapshot_tests {
     }
 
     /// An entry's size. A report holds its entries until the worker's next
-    /// one, and a poll that several workers share copies an entry for each
-    /// of them but the last, so a field the entry gains is a cost of each
-    /// poll, on the path with a policy engine and on the one without: the
-    /// pin is exact. The entry's own sample instant is two words of it.
+    /// one, a poll that several workers share copies entries for each of
+    /// them but the last (the entries of the worker's own rank where an
+    /// engine answers, every entry of a gateway's rollup), and a pushed
+    /// report's publish copies each of its entries, so a field the entry
+    /// gains is a cost of each, on the path with a policy engine and on the
+    /// one without: the pin is exact. The entry's own sample instant is two
+    /// words of it.
     #[test]
     fn a_load_entry_takes_the_pinned_bytes() {
         assert_eq!(size_of::<Option<std::time::Instant>>(), 16);
