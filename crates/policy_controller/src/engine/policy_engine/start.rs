@@ -35,9 +35,10 @@ pub struct WorkerData {
     /// by the rule [`PolicyEngine::set_registry`] states. The worker
     /// crate's registry is one.
     pub registry: Arc<dyn Members>,
-    /// The program's load channel: its load monitor's subscription. An
-    /// engine whose document reads no load report and no named signal, and
-    /// none of whose stages keeps a report, keeps none. `None` from a
+    /// The program's load channel: its load monitor's subscription. The
+    /// engine keeps it whatever its document: under a document that reads
+    /// no load report and no named signal, and none of whose stages keeps
+    /// a report, its task keeps no snapshot of it. `None` from a
     /// program that runs no load monitor at its start: a decision whose
     /// request gives no snapshot reads no load report until the program
     /// hands a channel ([`PolicyEngine::set_loads`]).
@@ -53,7 +54,7 @@ pub struct WorkerData {
 impl PolicyEngine {
     /// Starts the engine of `spec`, the program's document, over the
     /// program's own data. A program has its engine by this call, made once,
-    /// at its start.
+    /// at its start, and gives it a later document by [`Self::apply`].
     ///
     /// It answers two things:
     ///
@@ -76,7 +77,7 @@ impl PolicyEngine {
     /// of the engine runs ahead of one. The task takes them at its first
     /// poll: it reads the registry whole there, so the document's stages
     /// are told the workers that stand, and takes the load channel, where
-    /// the engine kept one. A program relies on both once the task has been
+    /// the program handed one. A program relies on both once the task has been
     /// polled once, not when this call returns: a request decided ahead of
     /// that poll reaches stages told no worker, and reads no load report
     /// but one it gives itself.

@@ -105,7 +105,7 @@ fn asked<'a>(
     call: &mut Call,
     placed: &mut EncodePlaced,
 ) -> Result<Option<Placement<'a>>, Unplaced> {
-    let mut made = Made::asked(engine.object, request, call);
+    let mut made = Made::asked(engine, request, call);
     let dated = Cell::new(None);
     let clock = || {
         let now = Instant::now();

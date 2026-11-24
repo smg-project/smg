@@ -149,7 +149,7 @@ fn each_role_is_lent_in_the_registrys_order_with_its_rows_facts() {
     let engine = engine();
     let records = engine
         .members_of(single)
-        .records(engine.spec(), engine.clock());
+        .records(engine.standing_spec(), engine.clock());
     let take_images: Vec<bool> = records.fixed().iter().map(|row| row.vision).collect();
     assert_eq!(take_images, [false, true]);
 }

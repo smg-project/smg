@@ -87,10 +87,15 @@ fn kinds_at(engine: &PolicyEngine, binding: u32) -> [u64; 4] {
 }
 
 /// The engine of `document`, under the first generation.
-fn engine_of(mut document: PolicySpec, stages: &StageRegistry) -> PolicyEngine {
-    document.generation = 1;
+fn engine_of(document: PolicySpec, stages: &StageRegistry) -> PolicyEngine {
+    PolicyEngine::new(spec_at(1, document, stages))
+}
+
+/// `document` as applied under the generation `number`.
+fn spec_at(number: u64, mut document: PolicySpec, stages: &StageRegistry) -> AppliedSpec {
+    document.generation = number;
     let spec = AppliedSpec::validate_in(&document, stages, &[]);
-    PolicyEngine::new(spec.expect("the document validates"))
+    spec.expect("the document validates")
 }
 
 /// `preset`'s document with the profile `twin` named as its binding's
@@ -233,6 +238,18 @@ fn bed_of(
     shadow: Option<Rule>,
     edit: impl FnOnce(&mut PolicySpec),
 ) -> (PolicyEngine, Seen) {
+    let (document, stages, seen) = bed_document(preset, live, shadow, edit);
+    (engine_of(document, &stages), seen)
+}
+
+/// The document of [`bed_of`]'s engine, the stages it names, and what they
+/// see.
+fn bed_document(
+    preset: &str,
+    live: Rule,
+    shadow: Option<Rule>,
+    edit: impl FnOnce(&mut PolicySpec),
+) -> (PolicySpec, StageRegistry, Seen) {
     let seen = Seen::default();
     let stages = seen.stages(live, shadow.unwrap_or(Rule::Nobody));
     let mut profile = profile_of(preset);
@@ -246,7 +263,7 @@ fn bed_of(
     let own = document.profiles.get_mut(preset);
     *own.expect("the preset's profile") = profile;
     edit(&mut document);
-    (engine_of(document, &stages), seen)
+    (document, stages, seen)
 }
 
 /// [`bed_of`] under the `random` preset's stages, with a shadow.
@@ -282,6 +299,25 @@ fn a_shadow_that_picks_another_worker_is_counted_and_the_live_answer_served() {
     assert_eq!(placed(&unshadowed, &list, request(7)), answer.decision);
     assert_eq!(kinds(&unshadowed), [0; 4]);
     assert_eq!(seen.shadows(), 0);
+}
+
+/// The shadow decisions are counted under the document that made them: a
+/// document put in force on the running engine starts its count at zero,
+/// and counts its own.
+#[test]
+fn the_shadow_counts_start_at_zero_under_a_new_document() {
+    let list = pool(3);
+    let (engine, _) = bed(Rule::Place(0), Rule::Place(1));
+    let _ = placed(&engine, &list, request(7));
+    assert_eq!(kinds(&engine), [0, 1, 0, 0]);
+
+    let (live, shadow) = (Rule::Place(0), Some(Rule::Place(0)));
+    let (document, stages, _) = bed_document("random", live, shadow, |_| {});
+    let applied = engine.apply(spec_at(2, document, &stages));
+    applied.expect("a number above the standing one");
+    assert_eq!(kinds(&engine), [0; 4], "the new document's own count");
+    let _ = placed(&engine, &list, request(7));
+    assert_eq!(kinds(&engine), [1, 0, 0, 0]);
 }
 
 /// A shadow that sheds leaves the live pick as it was decided. A live
@@ -451,7 +487,7 @@ fn a_shadow_beside_a_decision_without_a_lease_is_counted_by_its_caller() {
     let (_, said) = answer.expect("a decision");
     assert!(said.is_some(), "the shadow's word");
     assert!(
-        engine.document.shadow_counts.get().is_none(),
+        engine.in_force().shadow_counts.get().is_none(),
         "nothing counted yet"
     );
     assert_eq!(kinds(&engine), [0; 4]);
@@ -473,7 +509,7 @@ fn a_shadow_beside_a_decision_without_a_lease_is_counted_by_its_caller() {
     assert_eq!(none, None);
     unshadowed.count_shadow(none);
     assert_eq!(seen.shadows(), 0);
-    assert!(unshadowed.document.shadow_counts.get().is_none());
+    assert!(unshadowed.in_force().shadow_counts.get().is_none());
 }
 
 /// A live decision that sheds files no lease, and the entry still answers
@@ -928,7 +964,7 @@ fn the_shadow_counts_of_every_thread_are_read_as_one() {
     let list = pool(3);
     let (engine, seen) = bed(Rule::Place(0), Rule::Place(1));
     assert!(
-        engine.document.shadow_counts.get().is_none(),
+        engine.in_force().shadow_counts.get().is_none(),
         "no count yet"
     );
     thread::scope(|scope| {
@@ -947,5 +983,5 @@ fn the_shadow_counts_of_every_thread_are_read_as_one() {
 
     let (unshadowed, _) = bed_of("random", Rule::Place(0), None, |_| {});
     let _ = placed(&unshadowed, &list, request(7));
-    assert!(unshadowed.document.shadow_counts.get().is_none());
+    assert!(unshadowed.in_force().shadow_counts.get().is_none());
 }

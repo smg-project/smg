@@ -183,7 +183,7 @@ fn decide_at(
         ..
     } = *taken;
     let front = world.front();
-    let spec = front.spec();
+    let spec = world.spec();
     let model = frame.model();
     if frame.hashes() > frame.hashes_read(spec) {
         own.hashes_cut.fetch_add(1, Ordering::Relaxed);
@@ -200,6 +200,9 @@ fn decide_at(
     let (decision, said) = match generation.as_deref() {
         Some(generation) => {
             let lent = objects.lent(generation, role);
+            // The list's value is asked under the document in force at this
+            // call, and the decision below loads that document again. The
+            // two read one document: a store's engine takes no new one.
             let members = front.members_of(lent);
             let records = members.records(spec, front.clock());
             let reach = objects.reach(generation, role);
@@ -308,7 +311,7 @@ pub(crate) fn decide_pair(
         ..
     } = *taken;
     let front = world.front();
-    let spec = front.spec();
+    let spec = world.spec();
     let model = frame.model();
     if frame.hashes() > frame.hashes_read(spec) {
         own.hashes_cut.fetch_add(1, Ordering::Relaxed);
@@ -512,7 +515,7 @@ pub(crate) fn issue(
         front.count_shadow(said);
         return Ok(None);
     };
-    let stages = front.spec().engine();
+    let stages = world.spec().engine();
     let sized = (session, tokens);
     // The stages hear of every pick but one the binding's sessions rule
     // keeps from the profile: that one's lease is filed under the word.
@@ -595,7 +598,7 @@ pub(crate) fn issue_pair(
         debug_assert!(decision.pick().is_none(), "a pair's pick: {decision:?}");
         return Ok(None);
     };
-    let stages = front.spec().engine();
+    let stages = world.spec().engine();
     let sized = (session, tokens);
     let record = record_of(front, taken, term, (pick, first), Side::Prefill, sized);
     let later = taken.request.decode_later();
@@ -672,7 +675,7 @@ pub(crate) fn decide_decode(
         ..
     } = *taken;
     let front = world.front();
-    let spec = front.spec();
+    let spec = world.spec();
     let model = frame.model();
     if frame.hashes() > frame.hashes_read(spec) {
         own.hashes_cut.fetch_add(1, Ordering::Relaxed);
