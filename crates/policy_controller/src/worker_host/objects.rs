@@ -1176,8 +1176,7 @@ mod tests {
     use super::*;
     use crate::{
         store::{
-            GatewayId, HealthSink, MemoryStore, Overload, Registrant, WorkerFacts, WorkerPatch,
-            WorkerStatus,
+            GatewayId, MemoryStore, Overload, Registrant, WorkerFacts, WorkerPatch, WorkerStatus,
         },
         worker_host::{object, HealthAdapter, KeptCredential, Members, SoleLead},
     };
@@ -2281,7 +2280,7 @@ mod tests {
         }
     }
 
-    /// By default a health or status write leaves the object alone.
+    /// By default a status write leaves the object alone.
     #[test]
     fn a_write_that_moves_no_fact_leaves_the_same_object() {
         let mut replica = Replica::new();
@@ -2291,7 +2290,6 @@ mod tests {
         let standing = replica.objects.standing(&id);
         replica.told();
         let revision = replica.row(A).revision;
-        replica.store.probe_outcome(row, true, revision, &|| true);
         let moved = replica.store.set_status(row, WorkerStatus::Ready, revision);
         assert!(moved.is_some());
         assert_eq!(replica.row(A).revision, revision);

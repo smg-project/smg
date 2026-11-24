@@ -33,7 +33,7 @@ use crate::{
     stages::lifecycle::Lifecycle,
     store::{
         applied::Applied,
-        health::{HealthSink, HealthWrite, VetoWrite},
+        health::{HealthSink, VetoWrite},
         index::{indexed_under, KvEvent, KvTables, LaneCounts, LaneWriter},
         journal::{Journal, Position},
         kv_events::{BatchFacts, BatchOutcome, KvCursor, KvEventSink, ResyncReason},
@@ -478,7 +478,10 @@ impl MemoryStore {
                     Row { row, ..kept }
                 } else {
                     loads.ranks.insert(id, Ranks::default());
-                    Row::new(row, self.join(id))
+                    Row {
+                        row,
+                        slot: self.join(id),
+                    }
                 };
                 workers.rows.insert(id, held);
             }
@@ -620,7 +623,7 @@ impl MemoryStore {
                 follows = old.map(|old| (old, id));
                 ended = past;
                 let slot = self.join(id);
-                workers.rows.insert(id, Row::new(row, slot));
+                workers.rows.insert(id, Row { row, slot });
                 (change, None)
             }
             (
@@ -662,7 +665,7 @@ impl MemoryStore {
                 }
                 workers.by_key.insert(row.facts.key.clone(), new);
                 let slot = self.join(new);
-                workers.rows.insert(new, Row::new(row, slot));
+                workers.rows.insert(new, Row { row, slot });
                 self.forget_worker(old);
                 (change, left)
             }
@@ -1305,19 +1308,6 @@ impl MemoryStore {
         &self.kv
     }
 
-    /// Sets a row's probe counters: no case reaches a counter's end by
-    /// probes.
-    #[cfg(test)]
-    pub(super) fn probed(&self, id: WorkerId, failures: u32, successes: u32, pending_total: u32) {
-        if let Some(row) = self.workers.lock().rows.get_mut(&id) {
-            row.probes = Probes {
-                failures,
-                successes,
-                pending_total,
-            };
-        }
-    }
-
     /// A worker's row is gone (removed, or replaced by a new incarnation):
     /// the store's tables that live exactly as long as the row leave with
     /// it: the health tables, the load rows and the worker's KV lane with
@@ -1497,31 +1487,11 @@ struct Workers {
 
 struct Row {
     row: WorkerRow,
-    probes: Probes,
     /// The slot of the worker's count of the leases on file, given at the
     /// write that first files it ([`MemoryStore::join`]). A member keeps
     /// it across builds, and the slot of a worker that left is given to no
     /// one: the leases still on file for it end on the count they booked.
     slot: WorkerSlot,
-}
-
-impl Row {
-    /// A row at its first write: no probe is counted.
-    fn new(row: WorkerRow, slot: WorkerSlot) -> Self {
-        Self {
-            row,
-            probes: Probes::default(),
-            slot,
-        }
-    }
-}
-
-/// The prober's counters for one row.
-#[derive(Default)]
-struct Probes {
-    failures: u32,
-    successes: u32,
-    pending_total: u32,
 }
 
 impl Workers {
@@ -1656,17 +1626,6 @@ impl Workers {
             .get_mut(&id)
             .filter(|row| row.row.revision == revision)
     }
-
-    /// What a health write says where [`Self::guarded`] gave no row: stale
-    /// where a row stands under another revision, no row where none stands.
-    /// Either way the write was judged against nothing.
-    fn unjudged(&self, id: WorkerId) -> HealthWrite {
-        if self.rows.contains_key(&id) {
-            HealthWrite::Stale
-        } else {
-            HealthWrite::NoRow
-        }
-    }
 }
 
 /// Tells the journal, at its drop, that a write's locks are let go
@@ -1797,6 +1756,9 @@ impl MemoryStore {
 }
 
 #[cfg(feature = "worker-host")]
+use super::health::HealthWrite;
+
+#[cfg(feature = "worker-host")]
 impl MemoryStore {
     /// One membership write this replica's worker objects decided, applied
     /// as their holder tells it: a leader's side of [`Self::follow`], over
@@ -1883,7 +1845,13 @@ impl MemoryStore {
     ) -> HealthWrite {
         let mut workers = self.writing();
         let Some(row) = workers.guarded(id, revision) else {
-            return workers.unjudged(id);
+            // Judged against nothing: stale where a row stands under
+            // another revision, no row where none stands.
+            return if workers.rows.contains_key(&id) {
+                HealthWrite::Stale
+            } else {
+                HealthWrite::NoRow
+            };
         };
         if !leads() {
             return HealthWrite::Stale;
@@ -2055,116 +2023,7 @@ impl HealthTables {
     }
 }
 
-/// The status machine of one probe over the row's counters: the registry's
-/// `compute_next_status`, with the counters here instead of on the handle.
-fn next_status(row: &mut Row, ok: bool) -> Option<WorkerStatus> {
-    let policy = row.row.facts.health;
-    let status = row.row.status;
-    let failure = policy.failure_threshold.max(1);
-    let success = policy.success_threshold.max(1);
-    // A threshold is any number its writer took: the products and the
-    // counters stop at their range's end, so a threshold whose product
-    // passes the range is never met before the counter's end.
-    let liveness = failure.saturating_mul(3);
-    let pending_cap = failure.saturating_mul(10);
-    let probes = &mut row.probes;
-    if ok {
-        probes.failures = 0;
-        probes.successes = probes.successes.saturating_add(1);
-        probes.pending_total = probes.pending_total.saturating_add(1);
-        if matches!(
-            status,
-            WorkerStatus::Pending | WorkerStatus::NotReady | WorkerStatus::Failed
-        ) && probes.successes >= success
-        {
-            probes.successes = 0;
-            probes.pending_total = 0;
-            return Some(WorkerStatus::Ready);
-        }
-        if status == WorkerStatus::Pending && probes.pending_total >= pending_cap {
-            probes.successes = 0;
-            return Some(WorkerStatus::Failed);
-        }
-        return None;
-    }
-    probes.successes = 0;
-    probes.failures = probes.failures.saturating_add(1);
-    probes.pending_total = probes.pending_total.saturating_add(1);
-    match status {
-        WorkerStatus::Ready if probes.failures >= failure => {
-            probes.failures = 0;
-            Some(WorkerStatus::NotReady)
-        }
-        WorkerStatus::NotReady if probes.failures >= liveness => {
-            probes.failures = 0;
-            Some(WorkerStatus::Failed)
-        }
-        WorkerStatus::Pending if probes.pending_total >= pending_cap => {
-            probes.failures = 0;
-            Some(WorkerStatus::Failed)
-        }
-        _ => None,
-    }
-}
-
 impl HealthSink for MemoryStore {
-    fn probe_outcome(
-        &self,
-        id: WorkerId,
-        ok: bool,
-        revision: u64,
-        leads: &dyn Fn() -> bool,
-    ) -> HealthWrite {
-        let mut workers = self.writing();
-        let Some(row) = workers.guarded(id, revision) else {
-            return workers.unjudged(id);
-        };
-        // The writer's last word, behind the lock this write waited for:
-        // past a no, no probe is counted and no status moves.
-        if !leads() {
-            return HealthWrite::Stale;
-        }
-        let from = row.row.status;
-        let Some(to) = next_status(row, ok) else {
-            return HealthWrite::Stood(from);
-        };
-        // The table refuses a status write for an absent row or for the
-        // status that stands. The row stands under this lock and the
-        // machine never names the status it stands in, so no write reaches
-        // this arm; it answers what stands.
-        if workers.set_status(id, to).is_none() {
-            return HealthWrite::Stood(from);
-        }
-        self.show_status(id, to);
-        HealthWrite::Moved { from, to }
-    }
-
-    fn connected(&self, id: WorkerId, revision: u64, leads: &dyn Fn() -> bool) -> HealthWrite {
-        let mut workers = self.writing();
-        let Some(row) = workers.guarded(id, revision) else {
-            return workers.unjudged(id);
-        };
-        // The writer's last word, as at a probe's outcome.
-        if !leads() {
-            return HealthWrite::Stale;
-        }
-        let from = row.row.status;
-        if matches!(from, WorkerStatus::Draining | WorkerStatus::Ready) {
-            return HealthWrite::Stood(from);
-        }
-        row.probes = Probes::default();
-        // No write reaches this arm either, as at a probe's outcome: the
-        // row stands under this lock, and it is not ready.
-        if workers.set_status(id, WorkerStatus::Ready).is_none() {
-            return HealthWrite::Stood(from);
-        }
-        self.show_status(id, WorkerStatus::Ready);
-        HealthWrite::Moved {
-            from,
-            to: WorkerStatus::Ready,
-        }
-    }
-
     fn gateway_veto(&self, gateway: GatewayId, id: WorkerId, until: Option<Instant>) {
         match until {
             Some(until) => {
