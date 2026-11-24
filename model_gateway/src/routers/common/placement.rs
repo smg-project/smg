@@ -794,7 +794,12 @@ impl ByEngine {
             None,
             inputs,
             self.stated,
-            |request| side.decode_again(request),
+            |request| {
+                // `ahead` counts the request on its first decode across
+                // this decision: the engine reads that decode without it.
+                request.counted_on_decode = true;
+                side.decode_again(request)
+            },
         );
         let worker = match asked {
             Ok(worker) if !ahead.counts(&worker) => worker,
@@ -2326,7 +2331,7 @@ fn with_pair_request<R>(
     prefill_capacity: Option<&PrefillSelectionContext<'_>>,
     inputs: PlacementInputs<'_>,
     stated: Stated,
-    ask: impl FnOnce(&PlaceRequest<'_>) -> R,
+    ask: impl FnOnce(&mut PlaceRequest<'_>) -> R,
 ) -> R {
     let [prefill, decode] = pairs.lent();
     let held = |pool: &[Arc<dyn Worker>]| -> Option<Vec<u32>> {
@@ -2371,7 +2376,7 @@ fn with_pair_request<R>(
     request.ring = ring.lent();
     request.attempt = u8::try_from(inputs.tried.len().div_ceil(2)).unwrap_or(u8::MAX);
     request.decode_again = true;
-    ask(&request)
+    ask(&mut request)
 }
 
 /// [`select_pair`] where the gateway started the policy engine, out of
