@@ -2273,6 +2273,9 @@ pub(crate) mod tests {
                 heard.push((pinned, None));
             }
             heard.push((pinned, Some(ReleaseReason::ClientGone)));
+            // The hand leaves the release to a decider still at work
+            // behind its answer, which tells it as it leaves that work.
+            settled(|| told.lock().len() >= heard.len()).await;
             assert_eq!(*told.lock(), heard, "{kept:?}");
         }
     }
