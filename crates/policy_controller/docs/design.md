@@ -653,8 +653,9 @@ request goes to.
 - **[planned]** The hash table leaves the single decision. Until then a model with an index of
   cache events reads the index and the hash table together, as today.
 - **[built]** A prefill-decode pair decided over worker lists reads the hash table and the
-  host's index of cache events for each side, by the side's own list, and writes each side's
-  pick into the hash table, where the index does not speak for the picked worker. An encode
+  host's index of cache events for each side, by the side's own list. Behind its pick it writes
+  the first target its caller sends to into the hash table, a side at a time, where the index
+  does not speak for that side's worker. An encode
   request's first decision does the same for its pair. It writes neither side where its caller
   cannot send to an encoder the decision placed (`RequestMaker::sends_to_encoder`). Classic keeps
   trees for each side. **[planned]** The engine reads the host's trees for each side.
@@ -1001,8 +1002,10 @@ On main three pickers say so: round robin, `random` and `passthrough`.
    key's pin in the session table, or from the workers its key reaches on the ring its host
    lends. Only the records of the workers the key names are read.
 6. **Cache affinity.** A profile that reads which worker holds the prompt's beginning has those
-   workers named before the pass. After it the prompt is recorded for the first target the
-   request's caller sends to, and for none where it sends to none (section 4.5).
+   workers named before the pass. Some such profiles are named no row, among them one that shows
+   its rows to a plugin: such a profile is handed a column that says it of each worker. After the
+   pass the prompt is recorded for the first target the request's caller sends to, and for none
+   where it sends to none (section 4.5).
 7. **Records.** One `Candidate` for each worker is written into the thread's buffer. Over a list
    of 16 workers or more, a profile whose picker draws first (`random`, `round-robin`,
    `passthrough`, power of two, `best` with a sample) has only the drawn workers' records written.
@@ -2549,7 +2552,8 @@ controller (section 11) brings `--policy-controller-address` and three TLS optio
 One more point under this decision. A document can write an `overload` block for each binding, and
 a worker may state thresholds of its own. A worker object holds one set. **Recommendation:** one
 set for each worker, the worker's own values over one default of the program, as the classic
-policies have it. What that leaves of a binding's block:
+policies have it. An external worker takes its own values alone, over no default, as classic
+registers it. What that leaves of a binding's block:
 
 - **Its two numbers [built].** A block names none. A document that names one is refused when it
   is applied, by the number's path, and the refusal says where a number is stated: a worker's
@@ -2560,7 +2564,8 @@ policies have it. What that leaves of a binding's block:
 - **Its shed word [built].** A binding keeps whether a request is shed when every worker is
   vetoed. A decision reads it.
 - **Its switch [partly].** Whether the program's default vetoes at all is one word for the
-  bindings a host runs, because a worker object has one default. The host reads it where it
+  bindings a host runs, because the default is the program's: one for every worker object that
+  takes one. The host reads it where it
   builds that default. A gateway that runs a supplied document reads it at its start, and
   refuses a document whose bindings disagree on it, or on the shed word: its routes read one
   shed word for the process. It also refuses one whose block is on where the gateway states
