@@ -88,6 +88,10 @@ use smg_worker::{identity::basic::Worker, load::state::LoadSnapshot, runtime::Ro
 
 pub(crate) use self::document::Loaded;
 pub use self::document::SpecHandle;
+// The count of a request that names its worker, for a controller's served
+// decision: the one the one call counts by.
+#[cfg(feature = "controller")]
+pub(crate) use self::place::target as named_worker;
 use self::{
     document::InForce,
     encode::EncodeLists,

@@ -883,6 +883,23 @@ mod tests {
         }
     }
 
+    /// The url of the decode worker a pair's placement holds, read through
+    /// one of its two sides.
+    fn decode_held(side: &PlacementSide) -> Option<String> {
+        let held = |of: &Of| match of {
+            Of::Shared(pair) => {
+                let pair = pair.lock();
+                let decode = pair.placement.decode.as_deref();
+                decode.map(|decode| decode.url().to_owned())
+            }
+            Of::Whole(_) => None,
+        };
+        match &side.kept {
+            Kept::Own(of) => held(of),
+            Kept::Told(told) => held(&told.lock().of),
+        }
+    }
+
     const P: Side = Side::Prefill;
     const D: Side = Side::Decode;
 
@@ -1144,7 +1161,7 @@ mod tests {
 
     /// The side answers the decode its second decision took, and not the
     /// one that stood chosen: by that call the host's decode list holds
-    /// another worker alone.
+    /// another worker alone. The pair's placement holds that decode too.
     #[test]
     fn a_decode_side_answers_the_decode_its_second_decision_took() {
         let host = Host::of_later_pairs();
@@ -1165,6 +1182,7 @@ mod tests {
         };
         let taken = decode.decode_again(&later(WorkerLists::Pair(lists)));
         assert_eq!(taken.expect("a decode").url(), other.url());
+        assert_eq!(decode_held(&decode).as_deref(), Some(other.url()));
         assert_eq!(host.words(), [("issued", D)]);
     }
 

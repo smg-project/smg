@@ -50,6 +50,14 @@
 //! with no prefill to count leaves its hold with its routing value, which
 //! keeps no prefill of a pair over a veto.
 //!
+//! **A controller's served decision** counts a single request's number by
+//! the same function ([`reached`]), over the list its worker objects lend
+//! and by tests of its own: a place the asking gateway may take, that none
+//! of its standing vetoes holds back, whose worker is available by its own
+//! test. Its frame states the number, which the asking host read by the
+//! same source. The route's rule is that gateway's own code, and is not
+//! asked there.
+//!
 //! [`Constraints::places`]: crate::engine::view::Constraints::places
 //! [`KeySourceSpec::target`]: crate::document::spec::KeySourceSpec::target
 
@@ -58,6 +66,8 @@ use std::{iter, sync::Arc};
 use smg_worker::identity::basic::Worker;
 
 use super::{admitted, Call, PlaceRequest, Unplaced, ASKS};
+#[cfg(feature = "controller")]
+use crate::engine::decision::{Decision, Shed};
 use crate::{
     document::spec::AppliedSpec,
     engine::{
@@ -68,8 +78,9 @@ use crate::{
 };
 
 /// What a request that names its worker is shed under where that worker
-/// cannot take it.
-const TARGET_WORKER: &str = "target-worker";
+/// cannot take it: by the one call in a host's own process, and by a
+/// controller's served decision.
+pub(crate) const TARGET_WORKER: &str = "target-worker";
 
 /// The shed of a request whose named worker cannot take it: the request
 /// has no worker, and moves to no other.
@@ -93,6 +104,71 @@ fn held<'a>(placed: Result<Placement<'a>, Unplaced>) -> Result<Placement<'a>, Un
         } => MISSED,
         other => other,
     })
+}
+
+/// [`held`] for a controller's served decision, the one decision it held
+/// to a named worker's place: the decision's own, but that a shed with no
+/// endpoint, or for workers over their thresholds, is the request's shed
+/// under [`TARGET_WORKER`]. The decision named no worker because of that
+/// worker, and the request moves to no other. The shed keeps the trace
+/// of the decision that ran: it names the profile that decision was made
+/// under, as any shed made once a profile is resolved does.
+#[cfg(feature = "controller")]
+pub(crate) fn held_answer(decision: Decision) -> Decision {
+    match decision {
+        Decision::Shed(Shed {
+            reason: ShedReason::NoEndpoints | ShedReason::Saturated,
+            trace,
+            ..
+        }) => Decision::Shed(Shed {
+            reason: ShedReason::NoEndpoints,
+            emptied_by: TARGET_WORKER,
+            retry_after_secs: 1,
+            wait_allowed: false,
+            trace,
+        }),
+        other => other,
+    }
+}
+
+/// Where the number a single request names its worker by reaches
+/// ([`reached`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Reached {
+    /// No worker of the list can be sent to: there is none to count, and
+    /// the request leaves its worker's hold.
+    NoneToCount,
+    /// A worker of the list can be sent to and the number reaches none:
+    /// its text is no number, or fewer workers can be sent to.
+    NoWorker,
+    /// The place of the worker the number reaches.
+    Place(u32),
+}
+
+/// The count of a single request that names its worker, the one count of
+/// both doors: the one call in a host's own process ([`single`]) and a
+/// controller's served decision hand it their own tests.
+///
+/// `number` counts, from 0 and in the list's order, the workers of
+/// `workers` the request can be sent to: those `takes` answers for, asked
+/// with each worker's place. `None` is a text that is no number, which
+/// reaches no worker of any list. `takes` is asked of each worker in turn
+/// as far as the worker the number reaches, and of none behind it: with no
+/// number, as far as the first worker it answers for.
+pub(crate) fn reached(
+    workers: &[Arc<dyn Worker>],
+    number: Option<u32>,
+    mut takes: impl FnMut(u32, &dyn Worker) -> bool,
+) -> Reached {
+    let mut taking = (0..)
+        .zip(workers)
+        .filter_map(|(place, worker)| takes(place, worker.as_ref()).then_some(place));
+    let Some(first) = taking.next() else {
+        return Reached::NoneToCount;
+    };
+    let mut taking = iter::once(first).chain(taking);
+    let reached = number.and_then(|number| taking.nth(number as usize));
+    reached.map_or(Reached::NoWorker, Reached::Place)
 }
 
 /// One call for a single request over `list`, under a document one of
@@ -155,18 +231,18 @@ pub(super) fn single<'a>(
             })
             .map_err(Unplaced::Refused)?;
     let mut meets = meeting.iter().copied().peekable();
-    let mut taking = (0..).zip(&list.workers[..]).filter_map(|(place, worker)| {
+    let place = match reached(&list.workers[..], named, |place, worker| {
         let met = !narrowed || meets.next_if_eq(&place).is_some();
-        let takes = met && worker.is_available() && admitted(request, worker.as_ref());
-        takes.then_some(place)
-    });
-    let Some(first) = taking.next() else {
-        call.unkeyed = true;
-        return super::single(engine, request, Some(list), &mut call);
+        met && worker.is_available() && admitted(request, worker)
+    }) {
+        Reached::NoneToCount => {
+            call.unkeyed = true;
+            return super::single(engine, request, Some(list), &mut call);
+        }
+        Reached::NoWorker => return Err(MISSED),
+        Reached::Place(place) => place,
     };
-    let mut taking = iter::once(first).chain(taking);
-    let reached = named.and_then(|number| taking.nth(number as usize));
-    call.admitted = Some(vec![reached.ok_or(MISSED)?]);
+    call.admitted = Some(vec![place]);
     // The call's one decision: behind a worker it cannot send to, no
     // second one is made.
     call.spent = ASKS - 1;

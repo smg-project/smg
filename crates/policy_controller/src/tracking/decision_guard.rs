@@ -893,8 +893,56 @@ impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
         now: Instant,
         budget: Duration,
     ) -> Result<Self, DecisionUnavailable> {
+        Self::asked_naming(link, request, None, now, budget).await
+    }
+
+    /// [`Self::asked`] for a request that may name its worker. `named` is
+    /// what the target source of the request's binding answered for it
+    /// ([`KeySources::target`](crate::document::KeySources::target)), which
+    /// its host reads once, where it derives the request's keys: the
+    /// number, `Some(None)` for a text that is no number, and `None` for a
+    /// request that names no worker, which is asked as [`Self::asked`]
+    /// asks it.
+    ///
+    /// The frame states the number (`DecideRequest.named_worker`). The
+    /// controller counts it over its own list, from 0 and in that list's
+    /// order, among the workers this gateway can be sent to: by its reach
+    /// and wires, its standing vetoes, and each worker's own test of being
+    /// available. The decision is held to the worker the number reaches,
+    /// and the answer names that worker or sheds the request with no
+    /// endpoint. The frame names `target-worker` for that shed, and this
+    /// handle reads it as `controller`, as it reads every shed's stage.
+    /// Where this gateway can be sent to no worker of the list, the request
+    /// is decided as one that names no worker, with neither its session
+    /// key nor its client's key, and the answer is that decision's. A
+    /// controller older than the field reads none, and places the request
+    /// by the rest of its document.
+    ///
+    /// Only a frame decided over one list is read for the number: a single
+    /// request's, and one that stands alone at a side's phase. A pair's
+    /// frame is decided as one that names no worker, and its pick need not
+    /// be the worker the number names.
+    ///
+    /// The host's own rule for a worker is not asked there, and the
+    /// controller's list need not stand in the order of the host's own. A
+    /// host that decides by itself for lack of an answer counts over its
+    /// own list, by its own rule.
+    ///
+    /// # Errors
+    ///
+    /// Those of [`Self::asked`].
+    pub async fn asked_naming(
+        link: &Link,
+        request: &Request<'_>,
+        named: Option<Option<u32>>,
+        now: Instant,
+        budget: Duration,
+    ) -> Result<Self, DecisionUnavailable> {
         Self::sendable(request)?;
-        Self::answered(link, wire::request(request), now, budget, |_, _| Ok(())).await
+        Self::answered(link, wire::request(request, named), now, budget, |_, _| {
+            Ok(())
+        })
+        .await
     }
 
     /// [`Self::asked`] for an encode request, its pair's one request: the
