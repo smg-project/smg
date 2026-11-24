@@ -20,6 +20,8 @@
 //!   `GET /admin/fault/{worker}`: the fault hooks (see the README).
 //! - `POST /admin/fault/{worker}/load-fail?status=S`: the worker's load
 //!   polls are answered with S instead of a report (see the README).
+//! - `POST /admin/fault/{worker}/load-mute?on=B`: the worker pushes no
+//!   load report while B is `true` (see the README).
 //! - `GET /admin/ops/{worker}`: what the gateway's admin fan-out reached on
 //!   the worker: its flushes, its profiling runs and the last trace written
 //!   (`all`: every worker).
@@ -100,6 +102,7 @@ fn router(state: Arc<AdminState>) -> Router {
         .route("/admin/fault/{worker}/resume", post(fault_resume))
         .route("/admin/fault/{worker}/fail", post(fault_fail))
         .route("/admin/fault/{worker}/load-fail", post(fault_load_fail))
+        .route("/admin/fault/{worker}/load-mute", post(fault_load_mute))
         .route("/admin/ops/{worker}", get(ops_status))
         .route("/admin/truth", get(truth_served))
         .route("/admin/truth/{worker}", post(truth_prompt))
@@ -311,6 +314,7 @@ fn status_json(e: &Engine) -> Value {
         "cut_total": s.cut_total,
         "stalled_total": s.stalled_total,
         "load_fail_status": s.load_fail_status,
+        "load_muted": s.load_muted,
     })
 }
 
@@ -729,6 +733,19 @@ async fn fault_load_fail(
         return (StatusCode::BAD_REQUEST, why).into_response();
     }
     apply(&worker, |e| e.fault_load_fail(status))
+}
+
+/// The worker pushes no load report (`on=true`), or pushes it again
+/// (`on=false`).
+async fn fault_load_mute(
+    Path(worker): Path<String>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let on: bool = match param(&q, "on") {
+        Ok(v) => v,
+        Err(response) => return response,
+    };
+    apply(&worker, |e| e.fault_load_mute(on))
 }
 
 async fn fault_resume(Path(worker): Path<String>) -> Response {
