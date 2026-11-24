@@ -39,8 +39,8 @@
 //! - **Once a model** ([`Affinity`]): the record of the prefixes sent to the
 //!   workers the index does not speak for ([`PrefixPredictor`]), behind one
 //!   reader-writer lock. A naming takes it as a reader, and only where the
-//!   list holds such a worker. A pick writes behind the blocks its worker
-//!   already holds, sixteen blocks a turn, and takes each turn by a try: a
+//!   list holds such a worker. A pick writes behind the blocks its naming
+//!   found its worker to hold, sixteen blocks a turn, each turn by a try: a
 //!   turn that meets a held lock ends the write there, so a pick waits for
 //!   nobody. The map of the records is behind a mutex that only the read of
 //!   a list's table, a change of membership and the timer's sweep take.
@@ -551,8 +551,13 @@ pub struct PrefixRead {
 }
 
 impl PrefixRead {
-    /// The deepest rows a read keeps. A pick of a row past them is written
-    /// again, which costs a write and moves nothing a reader can see.
+    /// The deepest rows a read keeps. A pick of a row past them is no
+    /// repeat: where it is written, the write is tried from the request's
+    /// first block ([`PrefixRecord::write`]). A turn of it that finds the
+    /// request held for that row as far as the turn's end adds no block:
+    /// it makes that end the newest of the record's list, its last use the
+    /// read's tick, which can change the block that leaves next at the
+    /// record's bound.
     const KEPT: usize = 8;
 }
 
@@ -627,10 +632,13 @@ impl PrefixRecord {
         }
     }
 
-    /// Whether a pick behind `read` is a repeat that writes nothing: the
-    /// record already holds the whole request for the picked worker, its
-    /// end used at this tick, so a write would move nothing a reader can
-    /// see. `held` says the naming found the picked worker among those
+    /// Whether a pick behind `read` is a repeat, which records nothing of
+    /// its request: by `read` the record holds the whole request for the
+    /// picked worker, its end used at this tick. While that still stands
+    /// a write would add no block and move no tick: it would make that
+    /// end the newest of the record's list again, which can change the
+    /// block that leaves next at the record's bound. A repeat gives that
+    /// up. `held` says the naming found the picked worker among those
     /// sent the request's deepest block.
     fn repeats(&self, read: RecordRead, held: bool) -> bool {
         if !(read.whole && read.fresh && held) {
@@ -650,8 +658,10 @@ impl PrefixRecord {
     /// the naming found the target among the workers sent the request's
     /// deepest recorded block.
     ///
-    /// The write begins behind the blocks the target already holds: a turn
-    /// of a conversation writes the blocks the turn added. It takes the
+    /// The write begins behind the blocks the naming found the target to
+    /// hold: a turn of a conversation writes the blocks the turn added, and
+    /// a target the naming did not find is written from the request's
+    /// first block. It takes the
     /// lock sixteen blocks a turn, each turn by a try. An entry is a
     /// prediction and a leading part of a request is a true one, so a turn
     /// that meets a held lock ends the write there and waits for no thread:

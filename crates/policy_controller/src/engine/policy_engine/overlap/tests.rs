@@ -825,9 +825,10 @@ fn a_later_model_of_its_workers_shares_the_first_models_record() {
 /// lookup returns the answer it is handed either
 /// way, but for what the pick states of its first target
 /// ([`a_pick_its_rule_keeps_from_the_profile_states_nothing`]): a pin the
-/// keyed entry followed passes through it with its answer made. A profile
-/// that is named no row keeps no record of its own: its
-/// list keeps one for a shadow that is named rows, and the column shows
+/// keyed entry followed passes through it with its answer made. The live
+/// profile of the column form is named no row, and its prefix stage reads
+/// sent prefixes: the list keeps the record by that profile's own word,
+/// with a shadow beside it or none, and the column shows
 /// what that record holds. A gateway's sticky map hands a request it places
 /// to no policy, so the policy's record never takes it
 /// (`model_gateway/src/policies/registry.rs:791`, `:840`).
