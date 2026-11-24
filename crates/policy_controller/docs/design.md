@@ -1309,9 +1309,9 @@ encode phase first, and the engine's answer for an encode decision carries that 
 ## 6. The lease and its events **[built]**
 
 A lease is the engine's note that a decision's request is on its way. For a single request it
-exists only when a stage of the document wants to hear what became of requests. A pair's pick
-always has one. On a controller every pick it answers has one on file: the leases on file are
-its count of requests in flight (section 4.2).
+exists only when a stage of the document wants to hear what became of requests, or its session
+table follows the pick's dispatch. A pair's pick always has one. On a controller every pick it
+answers has one on file: the leases on file are its count of requests in flight (section 4.2).
 
 ```rust
 // tracking/lease.rs
