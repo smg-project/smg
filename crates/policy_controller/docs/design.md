@@ -77,7 +77,7 @@ Everything below follows from seven rules.
    which policy is running.
 5. **Switched off, it costs a test.** With the option off no engine is built and classic's own
    selection decides. A request then pays two things: the test of the option where it is placed,
-   and what the five placement functions and the load guard cost for carrying an answer of either
+   and what the four placement functions and the load guard cost for carrying an answer of either
    side. That cost is counted for each policy in the gateway's decision bench and shown on the
    page of each change to those functions (section 13.2).
 6. **Classic is the reference.** Under the document that a set of routing flags means, the engine
@@ -2001,7 +2001,7 @@ The design adds no second mechanism where one exists.
 | which prefill pairs with which decode | the gateway's pair index (`PdPairIndex`) | the pair classes read from it, one file (section 9.2) |
 | which worker was sent a prompt | the host's own trees, of the kv-index crate's two tree types | one more question on the trait the host already answers for cache events |
 | a request's lifetime on a worker | the load guard every route keeps | one optional field (decision 4) |
-| the place where a worker is chosen | classic's five placement functions | one call in each |
+| the place where a worker is chosen | classic's four placement functions | one call in each |
 | the rank a request is sent with | the worker object's own rank, where its registration states one | nothing: no rank choice runs behind the pick of a worker registered rank by rank, and the classic rank option is refused at the start beside the engine (section 9.2 names the two places a rank is still chosen) |
 | the lease's reporting | `DecisionGuard` | `Placement`, which holds it |
 | proof against classic | classic's recorders and their sheets | replays through the kept engine |
@@ -2013,17 +2013,16 @@ back, behind an option that is off by default (section 9.3).
 
 ### 9.1 Where classic chooses a worker
 
-Every classic route ends in one of five functions:
+Every classic route ends in one of four functions:
 
 | Function | Used by |
 |---|---|
 | `placement::select_single` | HTTP typed requests; the token-count route |
-| `placement::select_single_of` | the gRPC regular stage |
-| `placement::select_from` | transcription |
+| `placement::select_single_of` | the gRPC regular stage; transcription |
 | `placement::select_pair` | the HTTP and gRPC prefill-decode routes |
 | the encode stage's own selection | the gRPC encode-prefill-decode stage |
 
-Four are in `model_gateway/src/routers/common/placement.rs`. They take what a classic policy
+Three are in `model_gateway/src/routers/common/placement.rs`. They take what a classic policy
 reads: the request's text or token ids, its headers, its request id, its cache partition, the
 route's own rule for a worker, and the workers already tried.
 
@@ -2037,7 +2036,7 @@ of its pool). They are not policy decisions and stay as they are.
 request ──> route (HTTP or gRPC, any family)
               │  has what classic placement reads today
               ▼
-        the five placement functions
+        the four placement functions
               │
               ├─ engine off ──> the classic policy object                 (unchanged)
               │
@@ -2058,14 +2057,14 @@ request ──> route (HTTP or gRPC, any family)
 
   The start makes the policy crate's one start call as the last step of the context's build. The document is checked first against the table of stages the gateway's host hands the start, or the stock table where it hands none, and a refused document ends the start before the gateway listens. The engine's task follows the registry's events and tells the document's stages a worker that joined and a worker that was removed. With the engine on, the gateway builds its policy registry with no classic policy object: a stand-in that places nothing stands in its default and encode slots, and a worker's registration and a router's build add no policy.
 
-- **Each request.** Four of the five functions ask the engine. They fill `PlaceRequest` from the inputs
+- **Each request.** Three of the four functions ask the engine. They fill `PlaceRequest` from the inputs
   they already take. A route names the answer's type and makes its load guard from the answer, in the places it made one before.
 
-  The fifth, the encode stage's own selection, takes its pair from `select_pair` and refuses a request that carries an item for the encode workers by name **[planned]**: the gateway does not yet hand the engine an encode request's three lists.
+  The fourth, the encode stage's own selection, takes its pair from `select_pair` and refuses a request that carries an item for the encode workers by name **[planned]**: the gateway does not yet hand the engine an encode request's three lists.
 
   Where the document asks a pair's decode again, the two pair routes make one more call between the prefill's answer and the decode's dispatch (section 8.2).
 
-  A retry held to its wire is placed over the pool's whole list and stays on the wire by its demand (section 8.2) **[built]**. The gateway gives each runtime and transport it dials one number. It states that number of each worker where a list is first lent to the engine, and a retry states its wire's number as its demand, as does a first attempt its route pins to a wire. A request pinned to no wire states none. A caller's own slice is still held to by the route's own rule for a worker. An encode request that states a demand is held to it a list at a time (section 5.4). The gateway hands the engine no such request yet: its encode entry waits until the two refusals of section 5.4 are named as classic names them **[planned]**.
+  A retry held to its wire is placed over the pool's whole list and stays on the wire by its demand (section 8.2) **[built]**. The gateway gives each runtime and transport it dials one number. It states that number of each worker where a list is first lent to the engine, and a retry states its wire's number as its demand, as does a first attempt its route pins to a wire. A request pinned to no wire states none. The route's own rule for a worker still holds beside the demand. An encode request that states a demand is held to it a list at a time (section 5.4). The gateway hands the engine no such request yet: its encode entry waits until the two refusals of section 5.4 are named as classic names them **[planned]**.
 
 - **The request's end.** The placement stays with the request's load guard, which every route
   already keeps to the end of the response, streamed or not (decision 4).
@@ -2118,7 +2117,7 @@ lines), and the cell beside each published list.
 The bar for that change:
 
 1. It adds no file of policy logic to the gateway and no branch on a policy's name.
-2. No route gets an engine branch. The call sites are the five functions, and one call in the two
+2. No route gets an engine branch. The call sites are the four functions, and one call in the two
    pair routes between a prefill's answer and its decode's dispatch, where the document asks the
    decode again. A route that tells an outcome makes one more call where it records the status
    on the worker: on the answer it keeps, or on a handle it asked of the guard for its stream's
@@ -2497,7 +2496,7 @@ gateway                                           controller (leader)
   reads those facts in two places: where a route applies its own rule for a worker, and where it
   decides by itself because no answer came in time (both below). It is sent no load report and no
   cache event: that data goes to the controller alone (section 10.2).
-- The gateway's side is the same five functions of section 9, made asynchronous: an answer from a
+- The gateway's side is the same four functions of section 9, made asynchronous: an answer from a
   controller is a round trip, so each route's call changes by that much.
 - The request crosses in the contract's own form. The prompt crosses as hashes of its blocks, not
   as token ids or text. A route's own rule for a worker crosses as the ids of the workers the
