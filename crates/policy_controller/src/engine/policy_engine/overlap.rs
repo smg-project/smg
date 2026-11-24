@@ -234,18 +234,19 @@ pub fn deepest_of_within_groups(
 
 thread_local! {
     /// The calling thread's own list for a request's chain of prefix
-    /// hashes, taken for one lookup and put back behind it: a lookup over
-    /// workers that keep cache groups allocates nothing once the list has
-    /// grown to a request's blocks.
+    /// hashes, taken for one lookup and put back behind it: the chain
+    /// allocates nothing once the list has grown to the depth of the
+    /// thread's deepest holder.
     static PREFIXES: Cell<Vec<SequenceHash>> = const { Cell::new(Vec::new()) };
 }
 
 /// Lowers each holder of `kept` to what its cache groups can serve, where
 /// the host's workers keep `groups`, and keeps the deepest, at most `cap`.
 ///
-/// The request's chain of prefix hashes is made from its block hashes as
-/// far as the deepest holder with groups reads it, in the calling thread's
-/// own list ([`PREFIXES`]).
+/// The request's chain of prefix hashes is made from its block hashes in
+/// the calling thread's own list ([`PREFIXES`]), no further than the depth
+/// of the deepest holder with a group view: no view reads the chain past
+/// its holder's depth.
 fn keep_within_groups(
     groups: Option<&GroupViews>,
     block_hashes: &[u64],
@@ -256,7 +257,9 @@ fn keep_within_groups(
 ) {
     if let Some(groups) = groups {
         let table = groups.read();
-        let mut prefixes = PREFIXES.take();
+        // A lookup made while its thread ends finds the thread's list
+        // gone and takes a list of its own.
+        let mut prefixes = PREFIXES.try_with(Cell::take).unwrap_or_default();
         prefixes.clear();
         kept.retain_mut(|(worker, depth)| {
             let Some(view) = table.view(*worker) else {
@@ -274,7 +277,7 @@ fn keep_within_groups(
             *depth = (*depth).min(view.cap(&prefixes, *depth, block_size as usize).depth);
             *depth > 0
         });
-        PREFIXES.set(prefixes);
+        let _ = PREFIXES.try_with(|list| list.set(prefixes));
     }
     keep_deepest(kept, cap, below);
 }

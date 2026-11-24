@@ -3076,4 +3076,37 @@ fn a_holder_is_lowered_to_what_its_groups_serve_before_the_deepest_are_kept() {
     );
     scored.sort_unstable();
     assert_eq!(scored, lookup(2));
+
+    // The chain a thread keeps is made anew for each request, and a deeper
+    // holder extends the chain a shallower one made: a second request, whose
+    // first block differs, held two blocks deep and three, the shallower
+    // holder handed first. Each holder's state group keeps its last block
+    // alone, so it is served its depth only under that request's own chain.
+    let second = [7u64, 2, 3];
+    store(&index, 4, &second);
+    store(&index, 5, &second[..2]);
+    let more = numbers(&index, 6);
+    let (deep, shallow) = (more[4], more[5]);
+    let chain = request_prefix_hashes(&second.map(ContentHash));
+    for (number, depth) in [(deep, 3u32), (shallow, 2)] {
+        let view = groups.get_or_create(number);
+        view.learn(1, Some(GroupKind::State), 0);
+        view.main_stored(None, &named(&second[..depth as usize]));
+        view.group_stored(1, &[chain[depth as usize - 1]]);
+        assert_eq!(view.cap(&chain, depth, BLOCK as usize).depth, depth);
+    }
+    deepest_of_within_groups(
+        [(shallow, 2), (deep, 3)],
+        &groups,
+        &second,
+        BLOCK,
+        &naming(&[deep, shallow]),
+        16,
+        &mut below,
+        &mut kept,
+    );
+    kept.sort_unstable();
+    let mut wanted = [(deep, 3), (shallow, 2)];
+    wanted.sort_unstable();
+    assert_eq!(kept, wanted);
 }
