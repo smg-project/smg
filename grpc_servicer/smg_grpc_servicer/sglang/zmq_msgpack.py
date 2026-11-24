@@ -705,6 +705,13 @@ def decode_request_frames(frames: list[bytes], traces: RequestTraces | None = No
     if type_byte == REQ_TYPE_ADD:
         request = _request_decoder().decode(frames)
         if getattr(request, "mm_inputs", None) is not None:
+            if os.environ.get("SMG_QWENVL_REQUEST_DIAGNOSTIC") == "1":
+                try:
+                    from smg_grpc_servicer.sglang.qwenvl_numerical_diagnostic import observe_wire
+
+                    observe_wire(request, frames)
+                except Exception:
+                    pass  # Observation must not reject or change a decoded request.
             request.mm_inputs = normalize_multimodal_processor_output(request.mm_inputs)
         if traces is not None and len(frames) > 2:
             traces.attach(request, request_meta(frames[-1]).get(TRACE_HEADERS_KEY))

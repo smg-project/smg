@@ -189,7 +189,7 @@ def collect_loaded_sources(logs: Path, output: Path, roots: dict[str, Path]) -> 
         "logs": [],
         "source": [],
         "limits": {
-            "source_files": 6,
+            "source_files": 8,
             "source_each": SOURCE_LIMIT,
             "source_total": 4 * 1024**2,
             "worker_log_files": 8,
@@ -224,21 +224,24 @@ def collect_loaded_sources(logs: Path, output: Path, roots: dict[str, Path]) -> 
                     record = json.loads(line.split(marker, 1)[1])
                 except (ValueError, UnicodeError):
                     continue
-                if not isinstance(record, dict) or record.get("event") != "model_consumer_metadata":
+                if not isinstance(record, dict) or record.get("event") not in (
+                    "model_consumer_metadata",
+                    "numerical_boundary",
+                ):
                     continue
                 fields = record.get("metadata")
                 if not isinstance(fields, dict) or records_seen >= 16:
                     continue
                 records_seen += 1
                 files = fields.get("source_files", {})
-                if not isinstance(files, dict) or len(files) > 6:
+                if not isinstance(files, dict) or len(files) > 8:
                     continue
                 for module, info in files.items():
                     if (
                         not isinstance(module, str)
                         or len(module) > 128
                         or not re.fullmatch(
-                            r"(?:sglang|transformers|sgl_kernel)(?:\.[A-Za-z_][A-Za-z_0-9]*)+",
+                            r"(?:sglang|transformers|sgl_kernel|aiter)(?:\.[A-Za-z_][A-Za-z_0-9]*)+",
                             module,
                         )
                         or not isinstance(info, dict)
@@ -252,7 +255,7 @@ def collect_loaded_sources(logs: Path, output: Path, roots: dict[str, Path]) -> 
                         or not re.fullmatch(r"[0-9a-f]{64}", value[1])
                     ):
                         continue
-                    if module not in observed and len(observed) >= 6:
+                    if module not in observed and len(observed) >= 8:
                         continue
                     values = observed.setdefault(module, set())
                     if len(values) < 2:
@@ -264,7 +267,7 @@ def collect_loaded_sources(logs: Path, output: Path, roots: dict[str, Path]) -> 
                 os.close(fd)
     remaining, attempted = 4 * 1024**2, 0
     for module, values in sorted(observed.items()):
-        if attempted >= 6:
+        if attempted >= 8:
             break
         row = {"module": module, "status": "UNAVAILABLE"}
         result["source"].append(row)
@@ -332,6 +335,7 @@ def main() -> int:
             for namespace, distribution in (
                 ("transformers", "transformers"),
                 ("sgl_kernel", "sgl-kernel"),
+                ("aiter", "amd-aiter"),
             ):
                 try:
                     roots[namespace] = Path(

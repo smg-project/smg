@@ -96,3 +96,50 @@ def test_loaded_consumer_capture_enforces_global_source_budget(tmp_path):
     assert result["source_bytes_read"] <= 4 * 1024**2
     assert sum(p.stat().st_size for p in output.glob("*.py")) <= 4 * 1024**2
     assert len(result["source"]) <= 6 and result["captured"] < 6
+
+
+def test_numerical_boundary_source_capture_keeps_same_job_public_aiter_bytes(tmp_path):
+    module = collector()
+    logs, output, sdk = [tmp_path / name for name in ("logs", "output", "aiter")]
+    for path in (logs, output, sdk):
+        path.mkdir()
+    source = sdk / "consumer.py"
+    body = b"# captured bound callable fixture; never imported\n"
+    source.write_bytes(body)
+    digest = hashlib.sha256(body).hexdigest()
+    record = {
+        "event": "numerical_boundary",
+        "boundary": "numerical_source_metadata",
+        "metadata": {
+            "source_files": {
+                "aiter.consumer": {"status": "captured", "path": str(source), "sha256": digest}
+            }
+        },
+    }
+    log = logs / "worker-Qwen__Qwen3-VL-8B-Instruct_sglang_grpc_fixture.log"
+    log.write_text("SMG_QWENVL_REQUEST_DIAGNOSTIC " + json.dumps(record) + "\n")
+    result = module.collect_loaded_sources(logs, output, {"aiter": sdk})
+    assert result["captured"] == 1 and (output / (digest + ".py")).read_bytes() == body
+    assert result["source_bytes_read"] <= 4 * 1024**2
+
+
+def test_numerical_boundary_aiter_source_stays_unknown_without_a_proven_root(tmp_path):
+    module = collector()
+    logs, output, sdk = [tmp_path / name for name in ("logs", "output", "aiter")]
+    for path in (logs, output, sdk):
+        path.mkdir()
+    source = sdk / "consumer.py"
+    source.write_bytes(b"# public fixture\n")
+    log_metadata(
+        logs,
+        {
+            "aiter.consumer": {
+                "status": "captured",
+                "path": str(source),
+                "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+            }
+        },
+    )
+    result = module.collect_loaded_sources(logs, output, {})
+    assert result["captured"] == 0 and not list(output.glob("*.py"))
+    assert result["source"][0]["status"] == "REJECTED_MODULE_PATH"

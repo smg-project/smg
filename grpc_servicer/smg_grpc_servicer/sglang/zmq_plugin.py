@@ -116,7 +116,8 @@ def attributes_grammar_aborts() -> bool:
     return active() or os.environ.get(GRAMMAR_ATTRIBUTION_ENV, "").strip() not in ("", "0")
 
 
-# Diagnostic only: correlated public CI requests; no GPU transfers or extra requests.
+# Diagnostic only: existing opt-in public Qwen traces. Numerical observations may
+# perform bounded GPU readback; they never issue model requests or measure performance.
 _QWENVL_TRACE_SLOTS = iter(range(64))
 _QWENVL_OUTPUTS = {}
 
@@ -557,6 +558,7 @@ def trace_qwenvl_output(output):
             reason = output.finished_reasons[index]
             if reason:
                 del _QWENVL_OUTPUTS[rid]
+                _qwenvl_numerical("finish", rid)
                 _trace_qwenvl(
                     "output",
                     client_trace_id=match.group(1),
@@ -569,7 +571,20 @@ def trace_qwenvl_output(output):
         return
 
 
+def _qwenvl_numerical(action, *args):
+    if os.environ.get("SMG_QWENVL_REQUEST_DIAGNOSTIC") != "1":
+        return
+    try:
+        from smg_grpc_servicer.sglang import qwenvl_numerical_diagnostic
+
+        getattr(qwenvl_numerical_diagnostic, action)(*args)
+    except Exception:
+        # Diagnostics never change an original request/return/exception.
+        return
+
+
 def _trace_mrope_call(original, scheduler, req, branch, *args, **kwargs):
+    _qwenvl_numerical("bind_scheduler", req)
     _trace_qwenvl("mrope_before", scheduler, req, branch=branch)
     try:
         return original(scheduler, req, *args, **kwargs)
@@ -668,6 +683,7 @@ def after_rust_server(result, scheduler, *args, **kwargs):
         scheduler, _state.context, _state.sender, handshake_address(), engine_index()
     )
     scheduler.recv_from_tokenizer = recv
+    _qwenvl_numerical("install", scheduler)
     if scheduler.server_args.sleep_on_idle:
         from sglang.srt.managers.scheduler_components.idle_sleeper import IdleSleeper
 
