@@ -172,6 +172,7 @@ mod tests {
                 target,
                 picked: PickRecord::default(),
                 decode: None,
+                untold: false,
                 term: 1,
                 issued_at: now,
                 dispatch_deadline: now + Duration::from_secs(1),

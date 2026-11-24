@@ -137,6 +137,7 @@ fn file_of(store: &MemoryStore, id: u64, target: WorkerId, session: Session, now
         target,
         picked: PickRecord::default(),
         decode: None,
+        untold: false,
         term: 1,
         issued_at: now,
         dispatch_deadline: now + DISPATCH_TTL,

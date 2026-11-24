@@ -1,11 +1,12 @@
 //! The load path against engines in-process: the mock worker's gRPC engine
 //! answers the `GetLoads` poll through the controller's own probe, a small
-//! HTTP server answers the scrape, and the store's rows and the admin
-//! listener's counters are read back. The Numbers cell at the end drives
-//! the driver against a fleet of mock engines and prints its cost.
+//! HTTP server answers the scrape, and the store's rows are read back. The
+//! Numbers cell at the end drives the driver against a fleet of mock engines
+//! and prints its cost.
 
 #[path = "common/engines.rs"]
 mod engines;
+#[expect(dead_code, reason = "this binary reads no admin page")]
 #[path = "common/net.rs"]
 mod net;
 
@@ -17,16 +18,14 @@ use std::{
 
 use axum::{routing::get, Router};
 use engines::{cpu_seconds, eventually, mock_engine};
-use net::{http_get, loopback, vm_rss_kib};
+use net::{loopback, vm_rss_kib};
 use openai_protocol::worker::RuntimeType;
 use smg_policy_controller::{
-    document::{AppliedSpec, BindingSpec, PolicySpec},
     engine::{Role, SignalSource, WireModes, WorkerId},
     load::ingest::{
         loads::{LoadDriver, LoadDriverConfig, LoadProbe, ReadError, Target},
         probe::EngineProbe,
     },
-    service::controller::{Config, Controller, ElectionConfig, Listener, Scope},
     store::{LoadSink, LoadSource, MemoryStore, Signals, WorkerFacts, WorkerStatus, WorkersStore},
 };
 use tokio::{
@@ -306,114 +305,6 @@ async fn the_scrape_reads_the_metrics_endpoint_and_a_closed_port_fails() {
     let line = error.to_string();
     assert!(!line.contains("://"), "{line}");
     assert!(line.contains("Connect"), "{line}");
-}
-
-#[tokio::test]
-async fn the_controller_runs_the_driver_and_renders_its_counters() {
-    let (addr, _engine) = mock_engine(1).await.expect("a mock engine");
-    let (url, _server) = metrics_server(METRICS_TEXT)
-        .await
-        .expect("a metrics server");
-    let controller = Controller::bind(Config {
-        controller_id: "c-1".to_owned(),
-        listeners: vec![Listener {
-            name: "all".to_owned(),
-            addr: loopback(),
-            scopes: Scope::ALL.to_vec(),
-            tls: None,
-        }],
-        admin: loopback(),
-        shutdown_settle: Duration::ZERO,
-        shutdown_grace: Duration::from_secs(5),
-        // Long enough that the counter below reads the first poll alone,
-        // however slow the host; the first tick polls at once.
-        load_poll_interval: Duration::from_secs(10),
-        decide_shards: 2,
-        election: ElectionConfig::default(),
-        discovery: None,
-    })
-    .await
-    .expect("the controller binds");
-    let admin = controller.addresses().admin;
-    let store = controller.store();
-    // The standing generation's binding has its overload block switched on,
-    // and the scraped engine's page is at the crate's count of queued
-    // requests: that engine's first row moves its verdict.
-    let mut document = PolicySpec::preset("round_robin").expect("a preset of this build");
-    document.generation = 1;
-    let profile = document
-        .profiles
-        .keys()
-        .next()
-        .expect("the preset's profile");
-    document.bindings = vec![BindingSpec {
-        profile: Some(profile.clone()),
-        ..BindingSpec::default()
-    }];
-    let bound = AppliedSpec::validate(&document).expect("the document validates");
-    store.apply(bound).expect("applied");
-    let endpoint = format!("http://{addr}");
-    let polled =
-        ready(&store, &endpoint, &endpoint, 0, 1, WireModes::GRPC, 0).expect("the polled row");
-    let scraped = ready(&store, &url, &url, 0, 1, WireModes::HTTP, 200).expect("the scraped row");
-    let (stop, stopped) = oneshot::channel::<()>();
-    let mut serving = JoinSet::new();
-    serving.spawn(async move {
-        controller
-            .serve(async move {
-                let _ = stopped.await;
-            })
-            .await
-    });
-
-    let both = eventually(Duration::from_secs(5), || {
-        store.load(polled, 0).is_some() && store.load(scraped, 0).is_some()
-    })
-    .await;
-    assert!(both, "the driver polls and scrapes from the serve");
-    let scrape = store.load(scraped, 0).expect("the scrape's row");
-    assert_eq!(scrape.source, LoadSource::Scrape);
-    assert_eq!(
-        (
-            scrape.row.running,
-            scrape.row.queued,
-            scrape.row.kv_usage_permille
-        ),
-        (3, 8, 750)
-    );
-
-    let (status, body) = http_get(admin, "/metrics").await.expect("the metrics page");
-    assert_eq!(status, 200);
-    assert!(
-        body.contains("smg_policy_controller_load_polls_total{mode=\"poll\"} 1"),
-        "{body}"
-    );
-    assert!(
-        body.contains("smg_policy_controller_load_scrapes_total "),
-        "{body}"
-    );
-    assert!(
-        body.contains("smg_policy_controller_load_scrape_failures_total{reason=\"no_load\"} 0"),
-        "{body}"
-    );
-    assert!(
-        body.contains("smg_policy_controller_load_rows_total "),
-        "{body}"
-    );
-    // The verdict the scraped row moved is counted at the controller's own
-    // scrape.
-    assert!(
-        body.contains("smg_policy_controller_overload_flips_total 1"),
-        "{body}"
-    );
-
-    stop.send(()).expect("the serve is listening for the stop");
-    serving
-        .join_next()
-        .await
-        .expect("the serve task")
-        .expect("no panic")
-        .expect("the serve ends clean");
 }
 
 /// The Numbers cell: the driver alone against `SMG_LOAD_BED_ENGINES` mock

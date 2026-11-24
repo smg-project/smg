@@ -6,7 +6,10 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use smg_policy_controller::engine::{PlaceRequest, Prompt, WorkerLists};
+use smg_policy_controller::{
+    engine::{PlaceRequest, Prompt, WorkerLists},
+    policies::consistent_hashing::LentRing,
+};
 
 use super::{place, Host, Run, MODEL};
 
@@ -33,13 +36,15 @@ pub(super) fn stated(run: &Run) -> bool {
 
 /// One request by the one call with its prompt stated as text, and the
 /// dispatch and the end said of a placement that owes them, as the `place`
-/// entry says them ([`place::one`]).
-pub(super) fn one(host: &Host) -> Option<u32> {
+/// entry says them ([`place::one`]). It lends `ring` as that entry does
+/// ([`place::lent`]).
+pub(super) fn one(host: &Host, ring: Option<&'static dyn LentRing>) -> Option<u32> {
     let request = PlaceRequest {
         prompt: Prompt {
             text: Some(TEXT),
             ..Prompt::NONE
         },
+        ring,
         ..PlaceRequest::of(MODEL, WorkerLists::Single(host.list.lent()))
     };
     let mut answer = host.engine.place(&request);

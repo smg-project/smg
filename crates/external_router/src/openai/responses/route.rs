@@ -415,4 +415,38 @@ mod tests {
         assert_eq!(output_text["type"], json!("output_text"));
         assert_eq!(output_text["annotations"], json!([]));
     }
+
+    #[test]
+    fn router_serialization_preserves_codex_additional_tools_and_agent_message() {
+        let input = json!([
+            {
+                "type": "additional_tools",
+                "id": "at_1",
+                "role": "developer",
+                "tools": [{
+                    "type": "function",
+                    "name": "exec_command",
+                    "parameters": {"type": "object"}
+                }]
+            },
+            {
+                "type": "agent_message",
+                "id": "am_1",
+                "author": "/root",
+                "recipient": "/root/sub",
+                "content": [
+                    {"type": "input_text", "text": "Header"},
+                    {"type": "encrypted_content", "encrypted_content": "gAAAAB-opaque"}
+                ]
+            }
+        ]);
+        let req: ResponsesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.4",
+            "input": input
+        }))
+        .expect("Codex request parses");
+
+        let payload = serialize_like_router(&req);
+        assert_eq!(payload["input"], input);
+    }
 }

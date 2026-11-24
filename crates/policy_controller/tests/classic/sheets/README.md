@@ -23,6 +23,9 @@ places a request on, over two pools its pair index has paired.
 One sheet records that placement behind the prefill admission alone: `pair_bound.json` holds what the gateway
 answers where a prefill that holds the admission's bound has an open partner, and where it has none.
 
+One sheet records that placement on the wire that carries one runtime's request: `pair_runtime.json` holds which
+pair the gateway places where the workers of one known runtime stand beside workers of another or of none.
+
 One sheet records no pick and no policy: `overload.json` holds whether the gateway reads one worker as overloaded
 after each thing its load monitor is handed about the worker.
 
@@ -51,6 +54,7 @@ crates/policy_controller/tests/classic/sheets/
   encode_pair.json
   pair_select.json
   pair_bound.json
+  pair_runtime.json
   overload.json
   bucket.json
   minimum_tokens.json
@@ -70,6 +74,7 @@ model_gateway/src/         the gateway's recorders, each a test module beside th
   routers/grpc/common/stages/worker_selection/classic_encode_pair_rows.rs   encode_pair.json
   routers/common/classic_pair_select_rows.rs                                pair_select.json
   routers/common/classic_pair_select_rows/classic_pair_bound_rows.rs        pair_bound.json
+  routers/common/classic_pair_select_rows/classic_pair_runtime_rows.rs      pair_runtime.json
   policies/bucket/classic_bucket_rows.rs                                    bucket.json
   routers/grpc/common/stages/request_execution/classic_sticky_rank_rows.rs  sticky_rank.json
   routers/grpc/common/stages/worker_selection/classic_hard_demand_rows.rs   retry_wire.json
@@ -198,6 +203,17 @@ with the one open partner beside a prefill with room and none, where it answers 
 a decode pool over its thresholds or doubted on every worker, with shedding on and off; and a prefill with room and
 an open partner, which takes the request.
 
+The rows of `pair_runtime.json` are sequence rows of that same shape too, each placed on the wire that carries one
+runtime's request (`wire`, `grpc`) and under `power_of_two:least_requests` on both sides, so nothing in them draws.
+A worker that is not on the sheet's one runtime names its own (`runtime`): `other`, a second known runtime, or
+`unknown`. The gateway's pair index keeps two known runtimes apart on that wire and pairs a worker of no known
+runtime with any, and the gateway places a pair on one known runtime ahead of every other. A row holds one state of
+that order: the pair on the known runtime past two workers that hold fewer requests; its prefill at the prefill
+admission's bound, where the route waits; that prefill not ready or over its thresholds, and its decode not ready,
+where every pair stands; a decode pool over its thresholds on every worker, with shedding on and off; a prefill pool
+over its thresholds on every worker, which the least-loaded default pairs with any partner; two known runtimes,
+which pair apart; and a prefill of a known runtime with no partner on it.
+
 The rows of `prefix_hash.json` are sequence rows and two kinds of counted row. A row names the policy's
 configuration in the gateway's own spelling: how many tokens of a prompt it hashes, the two margins of its load
 bound, and the boundaries a prompt is keyed at (`cache_boundaries`) where it names any. A prompt is written as runs
@@ -310,6 +326,7 @@ directory. The sha256 is of the file as committed.
 | `encode_pair.json` | a request with encode items: the pair, the encoders offered and each item's encoder | `4ba2a6431357be5411a2383cdc4916b41471d722` | 52: 52 sequence, 0 drawn | `988bf253da9310aeedd08ec2704d8e01ecc4a1210453353723ba0faa9001de33` | `classic_encode_pair_rows.rs` |
 | `pair_select.json` | the placement of a prefill and decode pair: each side under its policy, a side over its overload thresholds or doubted whole, a decode's rooms, the prefill admission's bound, the least-loaded default's own rules, a role with no worker | `4ba2a6431357be5411a2383cdc4916b41471d722` | 40: 23 sequence, 17 drawn | `bd8426316ae7337ede82b5a931c1d00cd9dee1aca22c528278f32b2671846eb8` | `classic_pair_select_rows.rs` |
 | `pair_bound.json` | the placement of a pair behind the prefill admission's bound: every prefill at its bound with no decode ready, the prefill at its bound with the only open partner, a decode pool over its thresholds or doubted on every worker, with shedding on and off, a prefill with room and an open partner | `7526c6664e4916620fad715f204d35968568e3ee` | 8: 8 sequence, 0 drawn | `a0af115d810052da2c48dc44fdb4bb5961a6c8e24dfb189f5cbdf0714d7ed426` | `classic_pair_bound_rows.rs` |
+| `pair_runtime.json` | the placement of a pair on the wire that carries one runtime's request: a pair on one known runtime beside workers of none, its prefill at the admission's bound, not ready or over its thresholds, its decode not ready, a decode pool and a prefill pool over their thresholds on every worker, two known runtimes, a prefill with no partner on its runtime | `adf621bcfd7c1a7921435a008a58fc297eff6747` | 10: 10 sequence, 0 drawn | `4519479db78be320591b87ff32e7bf8b161c3a23aae6b1d17155641ea0b42e9b` | `classic_pair_runtime_rows.rs` |
 | `overload.json` | the overload verdict of one worker: the gateway's thresholds and the worker's own, a poll's answer, a poll with no report, a pushed record, an eviction | `436f0c8c5725b0a408b990003d76eaddc72c4be4` | 25 verdict rows | `29c10ee8876e53d23a824a3b7bd0481efd118e8ac5a0d2822477729f6e21283a` | `classic_overload_rows.rs` |
 | `bucket.json` | bucket: a size's range and its worker, the hand-down when that worker is not offered, the two parts of the balance rule, the window a booking leaves, the adjustment's cut, a worker that joins or leaves, a pool nobody listed | `d92647556e91a3601ef647f12ae5784df2080dc3` | 19: 18 sequence, 1 drawn | `71a533017809566486335bb9f212ea49712a833bbe5ebcbde7c5d6319ee764e4` | `classic_bucket_rows.rs` |
 | `minimum_tokens.json` | the minimum-tokens rank of one worker: a poll's answer, a rank it omits, an answer with no token capacity or no entry, a failed poll, an eviction, a worker that stands for one rank, used tokens beside context tokens | `615542c4c69bb28fb3cb3e9e4ee29a8e2be0a7bc` | 18: 18 sequence, 0 drawn | `1ab41e023fa4f9b507860655a3d917aee68686479d09eaa3b1e9cf8e71d56139` | `classic_minimum_tokens_rows.rs` |
@@ -345,6 +362,7 @@ The overload and minimum-tokens sheets' recorders are tests of the worker crate:
 | `encode_pair.json` | `worker_selection::classic_encode_pair_rows` |
 | `pair_select.json` | `routers::common::classic_pair_select_rows` |
 | `pair_bound.json` | `classic_pair_select_rows::classic_pair_bound_rows` |
+| `pair_runtime.json` | `classic_pair_select_rows::classic_pair_runtime_rows` |
 | `overload.json` | `load::monitor::classic_overload_rows` |
 | `bucket.json` | `policies::bucket::classic_bucket_rows` |
 | `minimum_tokens.json` | `load::monitor::classic_minimum_tokens_rows` |
@@ -361,9 +379,10 @@ descriptor the gateway derived and never a second reading of the registration. T
 child of the gateway's worker selection stage: it runs the stage's own selection, and it wraps the encode policy to
 write down each call (the encoders offered and the key) and passes every call on unchanged. The pair placement
 sheet's recorder sits beside the placement it calls and builds its pools, policies and pair index with the gateway's
-own types. The bound sheet's recorder is a child of that recorder and builds its rows on the same bed; the pair
-placement sheet's filter runs it too, and it writes its own sheet, whose rows draw nothing. The overload sheet's
-recorder is a child of the load monitor's module, so each step enters the monitor
+own types. The bound sheet's recorder and the runtime sheet's are children of that recorder and build their rows on
+the same bed; the pair placement sheet's filter runs them too, and each writes its own sheet, whose rows draw
+nothing. A runtime row's bed dials its workers on the wire the row names and gives each the runtime it names. The
+overload sheet's recorder is a child of the load monitor's module, so each step enters the monitor
 through the monitor's own functions and the verdict is read off the worker the monitor wrote it on. The bucket
 sheet's recorder is a child of the policy's own module and stands in that policy's directory: the adjustment and
 the window are the policy's private state, and a module beside the policy's could reach neither.
@@ -417,6 +436,7 @@ fails once the reason no longer holds.
   among them: the gateway lifts the overload veto for such a policy and lets it place, and a prefill profile that
   reads affinity runs with that veto lifted under a binding that steers.
 - `pair_bound.json`: none. All 8 rows replay.
+- `pair_runtime.json`: none. All 10 rows replay.
 - `overload.json`: none where the worker is one object for all its ranks, as the recording gateway held it. All 25
   rows replay there, verdict for verdict, through the worker crate's load monitor. The replay builds the holder of
   worker objects with the calls a controller builds its own with, and writes the row's worker into the store the

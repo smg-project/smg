@@ -20,9 +20,12 @@ use serde::Serialize;
 use serde_json::json;
 
 use super::{
-    decision_slots::DecideStats, metrics::Metrics, readiness::Readiness, PROTOCOL_PACKAGE,
+    decision_slots::DecideStats,
+    metrics::{LoadTotals, Metrics},
+    readiness::Readiness,
+    PROTOCOL_PACKAGE,
 };
-use crate::{load::ingest::loads::Stats, store::MemoryStore};
+use crate::store::MemoryStore;
 
 /// What `/version` answers.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -47,8 +50,8 @@ pub const VERSION: Version = Version {
 pub(crate) struct Admin {
     pub(crate) readiness: Readiness,
     pub(crate) metrics: Arc<Metrics>,
-    /// The load driver's counts, rendered with the metrics.
-    pub(crate) loads: Arc<Stats>,
+    /// The reader of the load monitor's counts, read at each render.
+    pub(crate) loads: Arc<dyn Fn() -> LoadTotals + Send + Sync>,
     /// The decide call's counts, rendered with the metrics.
     pub(crate) decides: Arc<DecideStats>,
     /// The store, whose counts the metrics render reads.
@@ -101,7 +104,7 @@ async fn metrics(AxumState(admin): AxumState<Admin>) -> Response {
         )],
         admin.metrics.render(
             || admin.readiness.sample(),
-            &admin.loads,
+            &(admin.loads)(),
             &admin.decides,
             || admin.store.stats(),
         ),
@@ -111,7 +114,13 @@ async fn metrics(AxumState(admin): AxumState<Admin>) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, time::Instant};
+    use std::{
+        sync::{
+            atomic::{AtomicU64, Ordering},
+            Arc,
+        },
+        time::Instant,
+    };
 
     use axum::{
         body::{to_bytes, Body},
@@ -123,9 +132,8 @@ mod tests {
     use crate::{
         document::{spec::BindingSpec, AppliedSpec, PolicySpec},
         engine::view::{LoadRow, Role},
-        load::ingest::loads::Stats,
         service::controller::{
-            metrics::Metrics,
+            metrics::{LoadTotals, Metrics},
             readiness::{tests::fenced, Phase},
         },
         store::{LoadSink, LoadSource, MemoryStore, WorkerFacts, WorkersStore},
@@ -160,7 +168,7 @@ mod tests {
         let app = router(Admin {
             readiness: reader,
             metrics: Arc::new(metrics),
-            loads: Arc::new(Stats::default()),
+            loads: Arc::new(LoadTotals::default),
             decides: Arc::default(),
             store: Arc::new(MemoryStore::new()),
         });
@@ -208,7 +216,7 @@ mod tests {
         let app = router(Admin {
             readiness: reader,
             metrics: Arc::new(metrics),
-            loads: Arc::new(Stats::default()),
+            loads: Arc::new(LoadTotals::default),
             decides: Arc::default(),
             store: Arc::new(MemoryStore::new()),
         });
@@ -236,10 +244,17 @@ mod tests {
     async fn the_scrape_reads_the_stores_counts_at_each_render() {
         let (_elector, _phase, _steps, reader) = fenced();
         let store = Arc::new(MemoryStore::new());
+        // What the load monitor's reader answers for the flips: the case
+        // moves it.
+        let flips = Arc::new(AtomicU64::new(0));
+        let read = Arc::clone(&flips);
         let app = router(Admin {
             readiness: reader,
             metrics: Arc::new(Metrics::new()),
-            loads: Arc::new(Stats::default()),
+            loads: Arc::new(move || LoadTotals {
+                overload_flips: read.load(Ordering::Relaxed),
+                ..LoadTotals::default()
+            }),
             decides: Arc::default(),
             store: Arc::clone(&store),
         });
@@ -289,7 +304,8 @@ mod tests {
         assert!(body.contains("smg_policy_controller_members_outside_list{list=\"zones\"} 2"));
         assert!(body.contains("smg_policy_controller_overload_flips_total 0"));
 
-        // A load write that moves a verdict is counted at the scrape after it.
+        // A load write that moves the store's own verdict is no flip of the
+        // series: the flips are the load monitor's, read at each scrape.
         let queue = LoadRow {
             queued: 9,
             ..LoadRow::default()
@@ -299,7 +315,11 @@ mod tests {
             Instant::now(),
             LoadSource::Poll,
         );
+        assert_eq!(store.stats().overload_flips, 1, "the store's own count");
+        let (_, _, body) = get(app.clone(), "/metrics").await;
+        assert!(body.contains("smg_policy_controller_overload_flips_total 0"));
+        flips.store(3, Ordering::Relaxed);
         let (_, _, body) = get(app, "/metrics").await;
-        assert!(body.contains("smg_policy_controller_overload_flips_total 1"));
+        assert!(body.contains("smg_policy_controller_overload_flips_total 3"));
     }
 }

@@ -92,6 +92,7 @@ fn lease(gateway: GatewayId, id: u64, term: u64, now: Instant) -> LeaseRecord {
         target: WorkerId(7),
         picked: PickRecord::default(),
         decode: None,
+        untold: false,
         term,
         issued_at: now,
         dispatch_deadline: now + Duration::from_secs(1),
@@ -2027,6 +2028,32 @@ fn issue_pair(
     (record, decode): (LeaseRecord, DecodeSide),
 ) -> Result<(), LeaseRefused> {
     leases.issue_pair(record, decode)
+}
+
+/// A pair's record states no word of a request kept from its profile: the
+/// door that files a pair clears it, as it writes the pair's mark, so both
+/// sides of a pair are told whatever a caller wrote. A single's record
+/// keeps the word as it was filed.
+#[test]
+fn the_door_that_files_a_pair_clears_the_word_of_a_kept_request() {
+    let store = MemoryStore::new();
+    let [p, d] = ["p", "d"].map(|name| ready(&store, &format!("http://{name}:1")));
+    let leases: &dyn LeasesStore = &store;
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    leases.set_term(1);
+    let kept = LeaseRecord {
+        untold: true,
+        ..booking(gateway, 1, p, now)
+    };
+    leases.issue(kept).expect("free");
+    let (record, decode) = pair(2, p, &[d], now);
+    let kept = LeaseRecord {
+        untold: true,
+        ..record
+    };
+    issue_pair(leases, (kept, decode)).expect("free");
+    let word = |id| leases.get(gateway, LeaseId(id)).expect("on file").untold;
+    assert_eq!((word(1), word(2)), (true, false));
 }
 
 /// A dispatch of `side` on the pick's target at `index`.

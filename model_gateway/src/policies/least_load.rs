@@ -610,7 +610,7 @@ impl LeastLoadPolicy {
     fn live_drain_rate(worker: &Arc<dyn Worker>, load: &WorkerLoadResponse) -> Option<f64> {
         if worker.worker_type() == &WorkerType::Prefill {
             // Partial DP reports cannot represent aggregate engine capacity.
-            if load.loads.is_empty() || load.loads.len() < load.dp_rank_count.max(0) as usize {
+            if !load.lists_every_rank() {
                 return None;
             }
             let rate = load.loads.iter().try_fold(0.0, |sum, rank| {

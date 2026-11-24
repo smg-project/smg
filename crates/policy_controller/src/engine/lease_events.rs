@@ -48,6 +48,10 @@ use crate::{
 /// So the rule's word has this one reader, at the words of a lease and at
 /// those writes.
 ///
+/// A controller asks where it files a pick's lease, and keeps the answer on
+/// the lease's record: the dispatch it tells off its file later follows it
+/// (`LeaseRecord::untold`).
+///
 /// A pair's sides are not read here: each side keeps a verdict of its own,
 /// and a pick's one word does not say which side the rule placed.
 ///

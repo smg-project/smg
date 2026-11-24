@@ -38,12 +38,9 @@
 //! Whatever takes it waits for a copy, on the thread that brought it.
 //! Among the store's writes, these take it each time: a membership write,
 //! a probe's outcome, a veto that is set, a gateway's report of a request
-//! that completed well, and a generation's apply. Two take it only in a
-//! corner: a polled load answer where it names a rank with no row yet (a
-//! pushed load record takes the load lock alone), and the world's
-//! publication where a build is owed and due. Among the reads: a watch's
-//! open where it copies, a standby's base, and a polling load driver's
-//! tick.
+//! that completed well, and a generation's apply. One takes it only in a
+//! corner: the world's publication where a build is owed and due. Among
+//! the reads: a watch's open where it copies and a standby's base.
 //! **One snapshot is taken at a time, off the runtime's workers**
 //! ([`SerialTurn`]): one operator's copy is made at a time, and the take itself
 //! holds no thread a stream of the listener runs on. A watch's open and a

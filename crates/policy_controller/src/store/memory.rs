@@ -1911,19 +1911,6 @@ impl MemoryStore {
 
 #[cfg(feature = "worker-host")]
 impl MemoryStore {
-    /// Every row whose facts name `engine`: its plain row, or each rank
-    /// that stands. One pass over the rows under the membership lock, once
-    /// a registration at a door. No decision reads it.
-    pub(crate) fn of_engine(&self, engine: &str) -> Vec<WorkerRow> {
-        let workers = self.workers.lock();
-        workers
-            .rows
-            .values()
-            .filter(|row| row.row.facts.engine == engine)
-            .map(|row| row.row.clone())
-            .collect()
-    }
-
     /// One membership write this replica's worker objects decided, applied
     /// as their holder tells it: a leader's side of [`Self::follow`], over
     /// the one body ([`Self::decided`]). The holder decided the change over
@@ -1937,8 +1924,8 @@ impl MemoryStore {
     /// test the store's own patch and removal make there, and what its own
     /// registration has by deciding under the lock. A writer outside the
     /// holder's turn can move the row between the holder's read and this
-    /// call: a replica that just took the lead may still apply its last
-    /// leader's last event.
+    /// call: a caller of the store's own registration, patch or removal
+    /// takes no turn of the holder.
     ///
     /// A status is the table's word until a worker object's leads. The
     /// holder read `row`'s off an object, which trails the table by the
@@ -4078,14 +4065,17 @@ impl Leases {
 /// Marks `record` as a door files it, in place, and gives the slot it
 /// books: with `pair` the record takes the mark of a pair's lease, and a
 /// prefill side that ended books none; a
-/// record alone is a single's and carries no mark. In place: the record
-/// is not copied on its way to the file.
+/// record alone is a single's and carries no mark. A pair's record states
+/// no word of a request kept from its profile, whatever its caller wrote
+/// ([`LeaseRecord::untold`]): both sides of a pair are told. In place: the
+/// record is not copied on its way to the file.
 fn marked(
     record: &mut LeaseRecord,
     booked: Option<WorkerSlot>,
     pair: &Paired,
 ) -> Option<WorkerSlot> {
     record.decode = pair.as_ref().map(|_| DecodeMark);
+    record.untold &= pair.is_none();
     booked.filter(|_| pair.is_none() || record.state.is_live())
 }
 
@@ -4968,6 +4958,7 @@ mod tests {
             target: WorkerId(1),
             picked: PickRecord::default(),
             decode: None,
+            untold: false,
             term: 1,
             issued_at: now,
             dispatch_deadline: now + Duration::from_secs(1),
@@ -4993,6 +4984,7 @@ mod tests {
             target: WorkerId(1),
             picked: PickRecord::default(),
             decode: None,
+            untold: false,
             term: 1,
             issued_at: now,
             dispatch_deadline: deadline,

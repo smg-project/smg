@@ -62,7 +62,9 @@ use crate::{
         cost_terms::{signal_named, CostTerm, SIGNAL_FAMILY},
         filters::{has_room_rule, HasRoomRule, HasRoomSignals},
         pickers::SampledBest,
-        registry::{profile_sent, FilterFactory, Found, PickerFactory, StageBuild, StageRegistry},
+        registry::{
+            profile_sent, FilterFactory, Found, PickerFactory, SentSlot, StageBuild, StageRegistry,
+        },
         scorers::{
             with_load_report_age_limit, FewestSessions, LeastCost, LeastCostSignals,
             LeastCostWithDispatches, LeastRequests, ResidentWork, SessionAffinity,
@@ -234,15 +236,18 @@ pub struct Needs {
     pub text_hashes: bool,
     /// The request's size
     /// ([`RequestFacts::prompt_tokens`](crate::engine::RequestFacts::prompt_tokens)).
-    /// A stage that places by it declares this. A host that reads every
-    /// request's prompt counts it and states it always. A host that can
-    /// send a request on without reading its prompt reads the prompt where
-    /// this is declared, and may state zero where it is not: a stage that
-    /// read the size undeclared there would place every request as an
-    /// empty one, with no error. Where a request states its prompt's token
-    /// ids ahead of its body, their count stands for the size, up to the
-    /// host's cap on such a list. A plugin is shown the size where its own
-    /// row declares this, and zero otherwise, whatever the host read.
+    /// A stage that places by it declares this, and so does a stage that
+    /// prices what was sent to a worker by its size, as a `sent.tokens`
+    /// term does: a send of text alone is counted by its text's bytes. A
+    /// host that reads every request's prompt counts it and states it
+    /// always. A host that can send a request on without reading its
+    /// prompt reads the prompt where this is declared, and may state zero
+    /// where it is not: a stage that read the size undeclared there would
+    /// place every request as an empty one, with no error. Where a request
+    /// states its prompt's token ids ahead of its body, their count stands
+    /// for the size, up to the host's cap on such a list. A plugin is
+    /// shown the size where its own row declares this, and zero otherwise,
+    /// whatever the host read.
     #[serde(default)]
     pub prompt_size: bool,
     /// Load reports per worker.
@@ -2060,10 +2065,15 @@ pub struct ProfileSpec {
     /// a send leaves the send counted. Unset, a report sampled at or after
     /// a send ends it. A written zero is refused, as a zero limit is. A
     /// profile whose stages do not read its count of sends is refused if it
-    /// sets a delay. The limit ends a send whatever the delay. A new
-    /// document's profile of the same name takes over the sends the
-    /// standing profile holds and shares them: a read under the shorter of
-    /// the two delays ends such a send for both.
+    /// sets a delay. The limit ends a send whatever the delay. The
+    /// profiles of a document that set the same limit and the same delay
+    /// read one count, under the name of the first of them that reads it,
+    /// in the order of their names. A new document's count takes over the
+    /// sends the standing count under the same name holds and shares them:
+    /// a read under the shorter of the two delays ends such a send for
+    /// both. A count under a name with no standing count starts empty: a
+    /// document that drops that first profile, or groups it apart from the
+    /// others, starts the count of the others empty, once.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1))]
     pub sent_report_delay_ms: Option<u32>,
@@ -2309,10 +2319,8 @@ pub struct SessionsSpec {
     /// neither the engine's record of sent prefixes nor a lent token tree
     /// takes its prompt. The session table still hears its dispatch,
     /// and the stages its completion and its release. A pair's sides are
-    /// told under either word. A host that tells a lease's words off its
-    /// file keeps no such word of a pick: it takes the rule, and tells such
-    /// a request as it tells any other. Its decision is the engine's own,
-    /// so its record of sent prefixes follows the word all the same.
+    /// told under either word. A controller keeps the word on the lease it
+    /// files, and tells such a request off its file by it all the same.
     #[serde(default, skip_serializing_if = "is_default")]
     pub rule_placed: RulePlaced,
 }
@@ -3607,7 +3615,7 @@ fn picker_of(
     at: &At,
     from: StageInputs<'_>,
     settings: SentSettings,
-    sent: &mut Option<Arc<DispatchCredit>>,
+    sent: &mut SentSlot,
 ) -> Result<Resolved<Box<dyn Picker>>, SpecError> {
     let named = pick.name();
     let path = || format!("{}.pick.{named}", at.0);
@@ -3615,7 +3623,7 @@ fn picker_of(
     // picker has no weight: the map is the factory's whole.
     let made = |build: &PickerFactory,
                 mut params: serde_json::Map<String, serde_json::Value>,
-                sent: &mut Option<Arc<DispatchCredit>>| {
+                sent: &mut SentSlot| {
         in_key_order(&mut params);
         let picker = StageBuild::built(
             &params,
@@ -3754,7 +3762,7 @@ fn filtered<'a>(
     index: usize,
     from: StageInputs<'_>,
     settings: SentSettings,
-    sent: &mut Option<Arc<DispatchCredit>>,
+    sent: &mut SentSlot,
 ) -> Result<Filtered<'a>, SpecError> {
     let name = entry.name();
     let path = || format!("{}.filter[{index}].{name}", at.0);
@@ -3762,7 +3770,7 @@ fn filtered<'a>(
     // A filter has no weight: the map is the factory's whole.
     let made = |build: &FilterFactory,
                 mut params: serde_json::Map<String, serde_json::Value>,
-                sent: &mut Option<Arc<DispatchCredit>>| {
+                sent: &mut SentSlot| {
         in_key_order(&mut params);
         let filter = StageBuild::built(
             &params,
@@ -3966,7 +3974,7 @@ fn scored(
     at: &At,
     from: StageInputs<'_>,
     settings: SentSettings,
-    sent: &mut Option<Arc<DispatchCredit>>,
+    sent: &mut SentSlot,
 ) -> Result<Scored, SpecError> {
     let name = entry.name();
     let Some(found) = from.catalog.find_scorer(name) else {
@@ -4169,8 +4177,15 @@ fn check_profile(
         report_delay_ms: p.sent_report_delay_ms,
     };
     // The profile's count of sends, made where a stage's factory first
-    // asks for it: a filter's may, ahead of any scorer's.
-    let mut sent = None;
+    // asks for it: a filter's may, ahead of any scorer's. An earlier
+    // profile's count under the same two settings is the one handed.
+    let mut sent = SentSlot {
+        asked: None,
+        shared: sent_credits
+            .iter()
+            .find(|count| count.settings == settings)
+            .cloned(),
+    };
     let mut filters = Vec::with_capacity(p.filter.len());
     for (index, entry) in p.filter.iter().enumerate() {
         let filter = match filtered(entry, name, &at, index, from, settings, &mut sent)? {
@@ -4227,10 +4242,10 @@ fn check_profile(
             None
         }
     };
-    if let Some(ms) = p.sent_ttl_ms.filter(|_| sent.is_none()) {
+    if let Some(ms) = p.sent_ttl_ms.filter(|_| sent.asked.is_none()) {
         return Err(at.bad("sent_ttl_ms", ms, "a limit any stage of this profile reads"));
     }
-    if let Some(ms) = p.sent_report_delay_ms.filter(|_| sent.is_none()) {
+    if let Some(ms) = p.sent_report_delay_ms.filter(|_| sent.asked.is_none()) {
         return Err(at.bad(
             "sent_report_delay_ms",
             ms,
@@ -4300,7 +4315,11 @@ fn check_profile(
     }
     Ok(match picker {
         Some(picker) if complete => {
-            sent_credits.extend(sent);
+            // A shared count stands in the list under the profile that
+            // made it.
+            if sent.shared.is_none() {
+                sent_credits.extend(sent.asked);
+            }
             // A filter and a picker name no depth of their own.
             let unkeyed = filters.iter().map(|filter| filter.needs());
             depth.deepen(HashDepth::of(unkeyed.fold(picker.needs(), Needs::or)));
@@ -5263,7 +5282,8 @@ impl PolicySpec {
         needs.headers |= !self.view.headers.is_empty();
         let mut engine = Engine::new(profiles, bindings, self.generation, needs);
         // In the order of the profiles' names, as the map walks them: a
-        // later engine finds a profile's count by its name.
+        // later engine finds a count by the name of the profile that made
+        // it.
         debug_assert!(sent_credits
             .windows(2)
             .all(|pair| pair[0].profile < pair[1].profile));
@@ -7718,7 +7738,7 @@ mod tests {
             &At::new("profiles.p.score[0]"),
             from,
             SentSettings::default(),
-            &mut None,
+            &mut SentSlot::default(),
         )
         .expect("a built-in scorer") else {
             panic!("a typed scorer");
@@ -7766,6 +7786,66 @@ mod tests {
                 want.map_err(str::to_owned),
                 "{term} under {limit:?}"
             );
+        }
+    }
+
+    /// Profiles under one time limit and one report delay read one count
+    /// of sends. A profile under another limit or another delay keeps a
+    /// count of its own.
+    #[test]
+    fn profiles_under_one_sent_setting_read_one_count_of_sends() {
+        for (sent, want) in [
+            ((None, None), 1),
+            ((Some(43), None), 2),
+            ((None, Some(5)), 2),
+        ] {
+            let mut spec = doc(
+                r#"{"apiVersion":"smg.policy/v1","profiles":{"p":{"score":["least-load"],"pick":"best"},"q":{"score":["least-load"],"pick":"best"}},"bindings":[{"match":{"model":"m"},"profile":"p"},{"match":{"model":"*"},"profile":"q"}]}"#,
+            );
+            let q = spec.profiles.get_mut("q").expect("the profile");
+            (q.sent_ttl_ms, q.sent_report_delay_ms) = sent;
+            let engine = spec.validate().expect("a valid document");
+            assert_eq!(engine.sent_credits.len(), want, "q under {sent:?}");
+            // Both scorers hold a count of the list, the ones the engine
+            // feeds: the list holds each count once beside its readers.
+            let readers = engine
+                .sent_credits
+                .iter()
+                .map(|count| Arc::strong_count(count) - 1);
+            assert_eq!(readers.sum::<usize>(), 2, "q under {sent:?}");
+        }
+    }
+
+    /// A later document takes over a shared count by the name of the
+    /// profile that made it: the same profiles again keep its sends, and
+    /// where that profile is gone the count of the one that stays starts
+    /// empty.
+    #[test]
+    fn a_later_document_takes_a_shared_count_by_the_name_of_its_maker() {
+        let both = r#"{"apiVersion":"smg.policy/v1","profiles":{"p":{"score":["least-load"],"pick":"best"},"q":{"score":["least-load"],"pick":"best"}},"bindings":[{"match":{"model":"m"},"profile":"p"},{"match":{"model":"*"},"profile":"q"}]}"#;
+        let q_alone = r#"{"apiVersion":"smg.policy/v1","profiles":{"q":{"score":["least-load"],"pick":"best"}},"bindings":[{"match":{"model":"*"},"profile":"q"}]}"#;
+        let worker = crate::engine::WorkerId(7);
+        let target = crate::engine::Target {
+            id: worker,
+            ..Default::default()
+        };
+        // The later document, and the sends its one count holds.
+        for (later, want) in [(both, 1), (q_alone, 0)] {
+            let standing = doc(both).validate().expect("a valid document");
+            standing.on_dispatched(
+                &crate::tracking::Lease::default(),
+                &target,
+                crate::tracking::Side::Single,
+                0,
+            );
+            let next = doc(later).validate().expect("a valid document");
+            next.succeed(&standing);
+            let held: Vec<_> = next
+                .sent_credits
+                .iter()
+                .map(|count| count.credits.held(worker))
+                .collect();
+            assert_eq!(held, [want], "{later}");
         }
     }
 

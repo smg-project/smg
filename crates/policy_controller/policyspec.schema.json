@@ -281,7 +281,7 @@
           "minimum": 1
         },
         "sent_report_delay_ms": {
-          "description": "The least number of milliseconds between a send and the sample of a\nload report that ends it: a report sampled less than that long after\na send leaves the send counted. Unset, a report sampled at or after\na send ends it. A written zero is refused, as a zero limit is. A\nprofile whose stages do not read its count of sends is refused if it\nsets a delay. The limit ends a send whatever the delay. A new\ndocument's profile of the same name takes over the sends the\nstanding profile holds and shares them: a read under the shorter of\nthe two delays ends such a send for both.",
+          "description": "The least number of milliseconds between a send and the sample of a\nload report that ends it: a report sampled less than that long after\na send leaves the send counted. Unset, a report sampled at or after\na send ends it. A written zero is refused, as a zero limit is. A\nprofile whose stages do not read its count of sends is refused if it\nsets a delay. The limit ends a send whatever the delay. The\nprofiles of a document that set the same limit and the same delay\nread one count, under the name of the first of them that reads it,\nin the order of their names. A new document's count takes over the\nsends the standing count under the same name holds and shares them:\na read under the shorter of the two delays ends such a send for\nboth. A count under a name with no standing count starts empty: a\ndocument that drops that first profile, or groups it apart from the\nothers, starts the count of the others empty, once.",
           "type": [
             "integer",
             "null"
@@ -1718,7 +1718,7 @@
           "default": "original"
         },
         "rule_placed": {
-          "description": "Whether a single request this rule placed alone is the profile's\nown (default `told`). Under `untold` no stage hears that request's\nissue or its dispatch, it is none of the profile's sends, and\nneither the engine's record of sent prefixes nor a lent token tree\ntakes its prompt. The session table still hears its dispatch,\nand the stages its completion and its release. A pair's sides are\ntold under either word. A host that tells a lease's words off its\nfile keeps no such word of a pick: it takes the rule, and tells such\na request as it tells any other. Its decision is the engine's own,\nso its record of sent prefixes follows the word all the same.",
+          "description": "Whether a single request this rule placed alone is the profile's\nown (default `told`). Under `untold` no stage hears that request's\nissue or its dispatch, it is none of the profile's sends, and\nneither the engine's record of sent prefixes nor a lent token tree\ntakes its prompt. The session table still hears its dispatch,\nand the stages its completion and its release. A pair's sides are\ntold under either word. A controller keeps the word on the lease it\nfiles, and tells such a request off its file by it all the same.",
           "$ref": "#/$defs/RulePlaced"
         }
       },

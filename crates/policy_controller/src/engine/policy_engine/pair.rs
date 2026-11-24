@@ -108,8 +108,9 @@ use crate::{
     tracking::lease::{Lease, LeaseId, LeaseKind, Side, DISPATCH_TTL},
 };
 
-/// The filter that empties a pair's prefill list where every prefill the
-/// request could take is at its admission limit.
+/// The filter a pair's shed names where the admission limit alone holds
+/// back a prefill with an open partner, or the one prefill the pair's
+/// default took.
 const HAS_CAPACITY: &str = "has-capacity";
 
 /// Whether `decision` sheds a pair at the prefill admission limit: the
@@ -536,6 +537,7 @@ impl<'a> PairLists<'a> {
                 prefill_signal_cells,
                 decode_signal_cells,
                 table: self.classes.table(),
+                first: self.classes.first(),
             };
             let decision = match held {
                 None => {

@@ -27,11 +27,12 @@ use crate::{
 // Chat Messages
 // ============================================================================
 
+crate::kind_read::by_kind! {
 /// One message of a chat conversation, tagged by its `role` (system, user,
 /// assistant, tool, function, developer or root), carrying the content and
 /// fields that role has.
 #[serde_with::skip_serializing_none]
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 #[serde(tag = "role")]
 pub enum ChatMessage {
     #[serde(rename = "system")]
@@ -106,6 +107,7 @@ pub enum ChatMessage {
         content: MessageContent,
         name: Option<String>,
     },
+}
 }
 
 /// The audio answer of an earlier assistant turn, referred to by its id: the
@@ -374,7 +376,7 @@ impl MessageContent {
 pub struct ChatCompletionRequest {
     /// A list of messages comprising the conversation so far
     #[validate(custom(function = "validate_messages"))]
-    #[serde(deserialize_with = "crate::message_read::read")]
+    #[serde(deserialize_with = "crate::kind_read::list")]
     pub messages: Vec<ChatMessage>,
 
     /// ID of the model to use

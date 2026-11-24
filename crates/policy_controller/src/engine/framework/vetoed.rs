@@ -861,8 +861,9 @@ mod tests {
         engine::{
             decision::{Decision, LiftedVeto, ShedReason, Survivors},
             framework::{
-                Binding, DecisionScope, Engine, Filter, Marks, PairPools, PairSide, Picker, Plan,
-                Profile, Scorer, Scratch, TieBand, WeightedScorer, DRAW_FROM, WRITTEN_ROWS,
+                Binding, DecisionScope, Engine, Filter, FirstPartners, Marks, PairPools, PairSide,
+                PairTable, Picker, Plan, Profile, Scorer, Scratch, TieBand, WeightedScorer,
+                DRAW_FROM, WRITTEN_ROWS,
             },
             sticky_sessions::{SessionRule, SessionVerdict},
             view::{
@@ -1934,6 +1935,244 @@ mod tests {
         let alone = [room(over(0, 4))];
         let refused = decide_pair(&pair_engine_of(false, both), &alone, &decodes);
         assert_eq!(shed_of(&refused), (ShedReason::Saturated, "not-overloaded"));
+    }
+
+    /// The pools of a fleet some of whose partners go first. Both prefill
+    /// classes pair with both decode classes, and prefill class 1 is paired
+    /// with decode class 1 first. Prefill class 2 has no first partner. A
+    /// gateway hands such classes for the workers of one known runtime
+    /// beside workers whose runtime is unknown.
+    fn first_pools<'a>(prefills: &'a [Candidate], decodes: &'a [Candidate]) -> PairPools<'a> {
+        PairPools {
+            prefills,
+            decodes,
+            table: PairTable::new(&[2, 4], &[1, 2, 1, 2]),
+            first: FirstPartners::new(&[1, 1], &[1]),
+            ..PairPools::default()
+        }
+    }
+
+    /// The pair `engine` decides over [`first_pools`].
+    fn decide_first(engine: &Engine, prefills: &[Candidate], decodes: &[Candidate]) -> Decision {
+        let (pool, cx) = (PoolFacts::default(), Constraints::default());
+        let pools = first_pools(prefills, decodes);
+        engine.decide_pair(&facts(1), &pool, pools, &cx, &cx, &mut Scratch::new())
+    }
+
+    /// While a prefill has a first partner open, the pair is made among
+    /// such prefills and their first partners, whatever stands beside
+    /// them, and a request waits where the admission limit alone holds
+    /// such a prefill back. A prefill another stage refuses keeps no
+    /// request: the pair is then made among every prefill with an open
+    /// partner, as it is where no first partner is open. The gateway's own
+    /// selection orders its candidates so, asks the limit of them, and
+    /// takes the pick's decode among its partners of that order
+    /// (`model_gateway/src/routers/common/placement.rs:2479-2502`,
+    /// `:2532-2545`, `:2615-2618` on main `30f636706`).
+    #[test]
+    fn a_pair_is_made_among_first_partners_while_one_is_open() {
+        let mut filters = vetoes();
+        filters.push(Box::new(HasCapacity));
+        let engine = pair_engine_of(false, [filters, vetoes()]);
+        let room = |mut worker: Candidate, class: u32| {
+            worker.has_capacity = true;
+            classed(worker, class)
+        };
+        // Place 0 of each side holds a worker with no first partner, and
+        // place 1 the two workers that pair first.
+        let decodes = [classed(free(0, 0), 2), classed(free(1, 0), 1)];
+        let prefills = [room(free(0, 0), 2), room(free(1, 0), 1)];
+        assert_eq!(pair_of(&decide_first(&engine, &prefills, &decodes)), (1, 1));
+        // With no first partner stated the same lists pair by the picker
+        // alone, which takes the other prefill.
+        let (req, pool, cx) = (facts(1), PoolFacts::default(), Constraints::default());
+        let (pools, scratch) = (first_pools(&prefills, &decodes), &mut Scratch::new());
+        let plain = PairPools {
+            first: FirstPartners::default(),
+            ..pools
+        };
+        let unordered = engine.decide_pair(&req, &pool, plain, &cx, &cx, scratch);
+        assert_eq!(pair_of(&unordered), (0, 1));
+        // Each side's shadow is shown what its live side was shown: the
+        // prefills with a first partner open, and that pair's first
+        // partners. The decodes stand the other way round here, so the
+        // picker alone takes neither worker of the pair.
+        let turned = [classed(free(0, 0), 1), classed(free(1, 0), 2)];
+        let pools = first_pools(&prefills, &turned);
+        let live = engine.decide_pair(&req, &pool, pools, &cx, &cx, scratch);
+        assert_eq!(pair_of(&live), (1, 0));
+        let pick = live.pick().expect("a pair");
+        for (side, shown) in [(PairSide::Prefill, 1), (PairSide::Decode, 0)] {
+            let twin = engine.shadow_side(0, side, &req, &pool, pools, &cx, &cx, pick, scratch);
+            assert_eq!(
+                twin.map(|shadow| order(&shadow)[0]),
+                Some(shown),
+                "{side:?}"
+            );
+        }
+        // Under no table a class pairs with its own number, and no first
+        // partner is read, whatever an earlier decision marked in the
+        // buffer.
+        let bare = PairPools {
+            table: PairTable::default(),
+            ..first_pools(&prefills, &decodes)
+        };
+        let numbered = engine.decide_pair(&req, &pool, bare, &cx, &cx, scratch);
+        assert_eq!(pair_of(&numbered), (0, 0));
+        // At its admission limit the prefill with a first partner open
+        // keeps the request: it waits, beside a prefill with a slot and an
+        // open partner.
+        let full = [room(free(0, 0), 2), classed(free(1, 0), 1)];
+        assert_eq!(
+            shed_of(&decide_first(&engine, &full, &decodes)),
+            (ShedReason::NoEndpoints, "has-capacity")
+        );
+        // Refused by another stage it keeps none, with a slot or at its
+        // limit: the pair is made among every prefill with an open partner.
+        let mut down = free(1, 0);
+        down.health.healthy = false;
+        for refused in [over(1, 0), down] {
+            for prefill in [room(refused, 1), classed(refused, 1)] {
+                let next = decide_first(&engine, &[room(free(0, 0), 2), prefill], &decodes);
+                assert_eq!(pair_of(&next).0, 0);
+            }
+        }
+        // No first partner is open: a prefill pairs with any open partner
+        // of its, the one with first partners too.
+        let closed = [classed(free(0, 0), 2), classed(over(1, 0), 1)];
+        let alone = [classed(free(0, 0), 2), room(free(1, 0), 1)];
+        assert_eq!(pair_of(&decide_first(&engine, &alone, &closed)), (1, 0));
+    }
+
+    /// The decode of a pair made among first partners is one of them under
+    /// the binding's all-vetoed rule too: with every decode over its
+    /// thresholds the rule opens both classes, and the first partner is
+    /// taken though the other decode holds fewer requests
+    /// (`model_gateway/src/routers/common/placement.rs:2454-2456`,
+    /// `:2615-2618` on main `30f636706`). The pair's default reads no
+    /// first partner: over a prefill pool refused whole it takes the pair
+    /// of the least load among every partner, as the gateway's default
+    /// does (`:1804-1813` there).
+    #[test]
+    fn a_first_pairs_decode_is_a_first_partner_under_the_rule() {
+        let engine = pair_engine(false);
+        let prefills = [classed(free(0, 0), 2), classed(free(1, 0), 1)];
+        let busy = [classed(over(0, 0), 2), classed(over(1, 5), 1)];
+        let steered = decide_first(&engine, &prefills, &busy);
+        assert_eq!(pair_of(&steered), (1, 1));
+        assert_eq!(steered.trace().lifted, LiftedVeto::Overload);
+        // The default: the prefill of the least load with the partner of
+        // the fewest requests, which is no first partner of it.
+        let refused = [classed(over(0, 5), 2), classed(over(1, 0), 1)];
+        let decodes = [classed(free(0, 0), 2), classed(free(1, 3), 1)];
+        let paired = decide_first(&engine, &refused, &decodes);
+        assert_eq!(pair_of(&paired), (1, 0));
+        assert_eq!(paired.trace().lifted, LiftedVeto::Overload);
+    }
+
+    /// A decode asked again behind its prefill is put to the test a pair's
+    /// first decision makes, at its own instant: it is one of the held
+    /// prefill's first partners while one of them is open, or opens where
+    /// the rule lifts the overload veto for partners that are all over
+    /// their thresholds, and any partner of the prefill else. The gateway's
+    /// own selection asks no decode again, so these answers are the
+    /// engine's own.
+    #[test]
+    fn a_decode_asked_again_is_a_first_partner_while_one_is_open() {
+        let engine = pair_engine(false);
+        let prefills = [classed(free(0, 0), 2), classed(free(1, 0), 1)];
+        let asked = |held: usize, decodes: &[Candidate]| {
+            let (pool, cx) = (PoolFacts::default(), Constraints::default());
+            let (pools, id) = (first_pools(&prefills, decodes), prefills[held].id);
+            engine.decide_decode(&facts(1), &pool, pools, id, None, &cx, &mut Scratch::new())
+        };
+        let open = [classed(free(0, 0), 2), classed(free(1, 0), 1)];
+        assert_eq!(pair_of(&asked(1, &open)), (1, 1));
+        // The first partner over its thresholds beside an open partner:
+        // the open one, with no veto lifted.
+        let busy = [classed(free(0, 0), 2), classed(over(1, 0), 1)];
+        let other = asked(1, &busy);
+        assert_eq!(pair_of(&other), (1, 0));
+        assert_eq!(other.trace().lifted, LiftedVeto::None);
+        // Every partner over its thresholds: the rule's lift opens the
+        // first partner, which holds more requests than the other.
+        let over_all = [classed(over(0, 0), 2), classed(over(1, 5), 1)];
+        let steered = asked(1, &over_all);
+        assert_eq!(pair_of(&steered), (1, 1));
+        assert_eq!(steered.trace().lifted, LiftedVeto::Overload);
+        // A first partner the lifted veto does not open leaves the rule
+        // every partner.
+        let mut down = over(1, 5);
+        down.health.healthy = false;
+        let steered = asked(1, &[classed(over(0, 0), 2), classed(down, 1)]);
+        assert_eq!(pair_of(&steered), (1, 0));
+        // The prefill with no first partner is asked among all its
+        // partners: the fewest requests under the rule.
+        let steered = asked(0, &over_all);
+        assert_eq!(pair_of(&steered), (0, 0));
+        assert_eq!(steered.trace().lifted, LiftedVeto::Overload);
+        // The shadow of a decode asked again reads the partners that call
+        // read, the held prefill's first partners. It is asked with the
+        // decodes both ways round: the picker alone takes one place of the
+        // two, whichever class stands there.
+        let turned = [classed(free(0, 0), 1), classed(free(1, 0), 2)];
+        let (req, pool, cx) = (facts(1), PoolFacts::default(), Constraints::default());
+        for (decodes, first) in [(&open, 1), (&turned, 0)] {
+            let (pools, held) = (first_pools(&prefills, decodes), prefills[1].id);
+            let scratch = &mut Scratch::new();
+            let again = engine.decide_decode(&req, &pool, pools, held, None, &cx, scratch);
+            assert_eq!(pair_of(&again), (1, first));
+            let live = again.pick().expect("a decode");
+            let later = engine.shadow_decode_later(0, &req, &pool, pools, held, live, &cx, scratch);
+            assert_eq!(later.map(|shadow| order(&shadow)[0]), Some(first));
+        }
+    }
+
+    /// The pools of a first list that is no partner list of the table: the
+    /// table pairs class 1 with class 1 alone, and the first list names
+    /// class 2.
+    #[cfg(debug_assertions)]
+    fn stray_pools<'a>(prefills: &'a [Candidate], decodes: &'a [Candidate]) -> PairPools<'a> {
+        PairPools {
+            prefills,
+            decodes,
+            table: PairTable::new(&[1], &[1]),
+            first: FirstPartners::new(&[1], &[2]),
+            ..PairPools::default()
+        }
+    }
+
+    /// First partners that do not stand within the pair table stop a debug
+    /// build where a decision takes them: at a pair's first decision.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(
+        expected = "the first partners do not stand within the pair table: Err(NoPartner)"
+    )]
+    fn first_partners_outside_the_table_stop_a_debug_build_at_a_pairs_decision() {
+        let engine = pair_engine(false);
+        let (prefills, decodes) = ([classed(free(0, 0), 1)], [classed(free(0, 0), 1)]);
+        let (pool, cx) = (PoolFacts::default(), Constraints::default());
+        let pools = stray_pools(&prefills, &decodes);
+        let pair = engine.decide_pair(&facts(1), &pool, pools, &cx, &cx, &mut Scratch::new());
+        panic!("first partners outside the table answered {pair:?}");
+    }
+
+    /// And at a decode asked again behind its prefill, which reads the held
+    /// prefill's first list as it is handed.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(
+        expected = "the first partners do not stand within the pair table: Err(NoPartner)"
+    )]
+    fn first_partners_outside_the_table_stop_a_debug_build_at_a_decode_asked_again() {
+        let engine = pair_engine(false);
+        let (prefills, decodes) = ([classed(free(0, 0), 1)], [classed(free(0, 0), 1)]);
+        let (pool, cx) = (PoolFacts::default(), Constraints::default());
+        let (pools, held) = (stray_pools(&prefills, &decodes), prefills[0].id);
+        let scratch = &mut Scratch::new();
+        let again = engine.decide_decode(&facts(1), &pool, pools, held, None, &cx, scratch);
+        panic!("first partners outside the table answered {again:?}");
     }
 
     /// A prefill profile that reads affinity is taken to weigh load against

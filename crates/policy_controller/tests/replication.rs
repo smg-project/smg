@@ -1484,12 +1484,7 @@ async fn a_leader_that_loses_its_lease_ends_its_stream_and_joins_no_other() {
     let dir = tempfile::tempdir().expect("a temp dir");
     let lease = dir.path().join("lease");
     with_leader(shared(&dir), |leader| async move {
-        let id = writes(&leader.store, 3);
-        // A load row of the lead, on the leader's own table.
-        leader
-            .store
-            .record(id, 0, running(3), Instant::now(), LoadSource::Stream);
-        assert!(leader.store.load(id, 0).is_some());
+        writes(&leader.store, 3);
         let base = snapshot(leader.replication).await.expect("a snapshot");
         let held = place(base.replication_seq, base.replication_term);
         let mut open = replicate(leader.replication, held.clone())
@@ -1531,16 +1526,6 @@ async fn a_leader_that_loses_its_lease_ends_its_stream_and_joins_no_other() {
             never = removed_again(&lease) => match never {},
         };
         assert_eq!(ended, Some(Code::Aborted));
-        // The lead ended: its load row is dropped, so none stands for a
-        // later take to read.
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while leader.store.load(id, 0).is_some() {
-            assert!(
-                Instant::now() < deadline,
-                "a replica that lost the lead holds its lead's load row"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
         // The fence is closed, and the hello names a place past the head.
         let lost = place(base.replication_seq + 1_000, base.replication_term);
         late.send(proto::ReplicaFrame {
@@ -1801,7 +1786,7 @@ async fn a_promoted_standby_holds_every_row_of_its_leader_and_no_load_row() {
     let began = leader.held().0;
     let port = leader.replication.port();
     let mut standby = Replica::serve("replication-1", FOLLOWER, port, shared(&dir)).await;
-    // A ready worker the load driver polls, at an address nobody answers.
+    // A ready worker the load monitor polls, at an address nobody answers.
     let polled = WorkerFacts {
         wire_modes: WireModes::GRPC,
         ..facts("grpc://127.0.0.1:1", 1, 0)
@@ -1811,7 +1796,7 @@ async fn a_promoted_standby_holds_every_row_of_its_leader_and_no_load_row() {
     leader
         .store
         .set_status(polled, WorkerStatus::Ready, revision);
-    // A row no driver polls, with a load row on the leader's table.
+    // A row nobody polls, with a load row on the leader's table.
     let quiet = writes(&leader.store, 0);
     leader
         .store
@@ -1836,9 +1821,9 @@ async fn a_promoted_standby_holds_every_row_of_its_leader_and_no_load_row() {
     // the standby's holds none.
     assert!(leader.store.load(quiet, 0).is_some());
     assert_eq!(standby.load_rows(), 0, "a standby is sent no load row");
-    // The leader's driver polls the ready worker. The standby holds the
-    // same row and polls nobody while it follows: a tick of its driver
-    // later, its counter still reads none.
+    // The leader's load monitor polls the ready worker. The standby holds
+    // the same row and polls nobody while it follows: a while later, its
+    // counter still reads none.
     let deadline = Instant::now() + Duration::from_secs(20);
     while polls(leader.admin).await == 0 {
         assert!(Instant::now() < deadline, "the leader polls its worker");
@@ -1871,8 +1856,8 @@ async fn a_promoted_standby_holds_every_row_of_its_leader_and_no_load_row() {
     let (place, holds) = standby.held();
     assert_eq!(place, (served.replication_seq, served.replication_term));
     assert_eq!(holds, wrote);
-    // It reads its engines itself from its take: its own driver polls the
-    // ready worker.
+    // It reads its engines itself from its take: its own load monitor
+    // polls the ready worker.
     let deadline = Instant::now() + Duration::from_secs(20);
     while polls(standby.admin).await == 0 {
         assert!(
