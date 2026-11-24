@@ -967,12 +967,48 @@ impl SessionTable {
     /// nothing written: a key the table never read, or one past its end,
     /// has none, as at [`Self::lookup`]. The key's idle time is not
     /// renewed and no sweep runs: a decision that goes on to follow one of
-    /// these pins renews it by that read.
+    /// these pins reads them by [`Self::pins_renewed`].
     pub(crate) fn pins_at(&self, key: Session, now_micros: u64) -> SessionPins {
         let key = key.get();
         match self.shard(key).lock().get(&key) {
             Some(entry) if entry.expires_at_micros > now_micros => entry.pins,
             _ => [WorkerId(0); 2],
+        }
+    }
+
+    /// The pins of `key` for a decision at `now_micros` that follows one of
+    /// them, under one lock: a key that holds a pin and is not past its end
+    /// is touched as at [`Self::lookup`]. Of any other key nothing is
+    /// written, as at [`Self::pins_at`]: it reads as no pins and no entry is
+    /// made for it. No sweep runs here: the decision that goes on to follow
+    /// one of these pins runs the one this read owes ([`Self::sweep_owed`]).
+    pub(crate) fn pins_renewed(
+        &self,
+        key: Session,
+        now_micros: u64,
+        rule: &SessionRule,
+    ) -> SessionPins {
+        let key = key.get();
+        match self.shard(key).lock().get_mut(&key) {
+            Some(entry)
+                if entry.expires_at_micros > now_micros && entry.pins != [WorkerId(0); 2] =>
+            {
+                entry.touch(now_micros, rule);
+                entry.pins
+            }
+            _ => [WorkerId(0); 2],
+        }
+    }
+
+    /// The sweep a renewing read owes where no pass of the table's host
+    /// sweeps it ([`Self::lookup`]), for a decision that follows a pin
+    /// [`Self::pins_renewed`] read: it runs behind that read, with no
+    /// shard's lock held, and a request that follows no pin runs none.
+    /// Always inlined: the check is one compare on a followed pin's path.
+    #[inline(always)]
+    pub(crate) fn sweep_owed(&self, now_micros: u64) {
+        if !self.swept_by_pass.load(Ordering::Relaxed) {
+            self.sweep_if_due(now_micros);
         }
     }
 

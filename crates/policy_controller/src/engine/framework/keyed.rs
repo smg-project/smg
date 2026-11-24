@@ -111,9 +111,10 @@ impl Engine {
     /// its policy, and where the request is the profile's own, what it
     /// keeps behind the whole decision's pick.
     ///
-    /// The session table is read as the whole decision reads it: a pin
-    /// followed renews its key's idle time, and a request not decided here
-    /// writes nothing.
+    /// The session table is read once, under one lock: a key that holds a
+    /// pin has its idle time renewed by that read, whether a pin of it is
+    /// followed here or the request is left to the whole decision, and of
+    /// any other key nothing is written.
     ///
     /// The rows are taken for regular workers': a key keeps its worker over
     /// the overload veto among those alone, and the rows read here do not
@@ -201,11 +202,14 @@ impl Engine {
     /// filter steps aside: so the first pin whose own row every filter
     /// keeps is that pin.
     ///
-    /// The pins are read first with nothing written. The read that renews
-    /// the key's idle time follows once a pin's row is kept, where the
-    /// whole decision makes it too: behind filters that kept a row. Pins
-    /// that moved between the two reads are the whole decision's to read
-    /// again.
+    /// The pins are read once, by the read that renews the idle time of a
+    /// key that holds a pin ([`SessionTable::pins_renewed`]): no lock of
+    /// the table is held while the filters are asked. The whole decision
+    /// renews the key behind filters that kept a row, so the one request
+    /// the two differ on is that of a key with a pin whose pool every
+    /// filter refuses: its key is renewed here, and there it is not.
+    ///
+    /// [`SessionTable::pins_renewed`]: crate::engine::sticky_sessions::SessionTable::pins_renewed
     fn follow_pin<R: PoolRows>(
         &self,
         index: u16,
@@ -216,7 +220,7 @@ impl Engine {
     ) -> Option<Decision> {
         let key = facts.session();
         let test = self.row_test_at(index, facts, cx)?;
-        let pins = self.sessions.pins_at(key, facts.now_micros);
+        let pins = self.sessions.pins_renewed(key, facts.now_micros, rule);
         let pinned = pins
             .iter()
             .filter(|pin| **pin != WorkerId(0))
@@ -227,9 +231,9 @@ impl Engine {
         if Self::at_cap(rule, &pinned) {
             return None;
         }
-        if self.sessions.lookup(key, facts.now_micros, rule) != pins {
-            return None;
-        }
+        // The pin is followed: the sweep its key's read owes runs now, as
+        // the whole decision's read runs it behind filters that kept a row.
+        self.sessions.sweep_owed(facts.now_micros);
         let mut targets = Targets::new();
         targets.push(target_of(&pinned));
         // The rule's pin placed the request, as in the whole decision, and
