@@ -451,16 +451,21 @@ over gRPC, regular workers over HTTP, and so on). The controller's `G` holds its
 alone, with the workers of every protocol in one list.
 
 The controller's holder lends each role's list with its cell and with what its rows state of each
-worker (`Objects::lent`). Beside a pair's two lists it hands their pair classes
-(`Objects::pair_classes`): each worker's class by its place in the list as lent, under the store's
-own pairing rule over what the rows state. Those classes state no first partner, so a controller
-makes no pair on one known runtime ahead of another. A row's wires, engine kind and pairing
-descriptor can change under a worker object that stays, with no new list. The holder counts those
-changes, and the next ask of the classes derives them again. A controller knows no admission
-window of a gateway.
-So it reads a pair's admission open (`OpenAdmission`), as the rows its store builds state it, and
-the gateway that asks gates capacity when it commits. All of it stands in a build with the
-`in-process` feature, and a controller's decision of a pair at its prefill reads it (section
+worker (`Objects::lent`).
+
+Beside a pair's two lists it hands their pair classes (`Objects::pair_classes`): each worker's
+class by its place in the list as lent, under the store's own pairing rule over what the rows
+state. Those classes state no first partner, so a controller makes no pair on one known runtime
+ahead of another. A row whose facts change gets a new worker object, so the registry builds a
+new list and a new `G` for it. The classes are derived once for a `G` and a pairing mode, at the
+first ask, and stand with it.
+
+A controller knows no admission window of a gateway. So it reads a pair's admission open
+(`OpenAdmission`), as the rows its store builds state it. The gateway that asks is to gate
+capacity when it commits **[planned]**: no gateway calls a controller yet (section 11).
+
+All of it stands in a build with the `worker-host` and `in-process` features, as a controller's
+is. A controller's decision of a pair, at its prefill and at its decode call, reads it (section
 10.1).
 
 Beside its encoder list and its prefill list the holder hands the two columns an encode request's
@@ -1011,7 +1016,7 @@ for a model no worker serves, and for a gateway that dials no worker of the mode
 What one decision writes:
 
 - the thread's own buffer;
-- on the short path, one atomic add on the list's counter;
+- on the short path under `round-robin`, one atomic add on the list's counter;
 - one atomic add for a lease id, where a stage needs lease events;
 - a session pin, where a sessions rule decides;
 - the record of sent prefixes, where a cache-affinity profile decides;
@@ -1695,8 +1700,8 @@ The design adds no second mechanism where one exists.
 | a model's worker lists | the registry's published lists (`Generation`) | one field beside each list: the engine's value |
 | a worker's health, breaker, overload, in-flight count | the worker object, read in place | nothing |
 | load reports | the load monitor's `LoadSnapshot` | nothing |
-| which worker holds a prompt, by cache events | the kv-index crate's index, through two traits | the gateway's two readers of its index for those traits, about 130 lines (section 9.2) |
-| which prefill pairs with which decode | the gateway's pair index (`PdPairIndex`) | the pair classes read from it, one file of 404 lines (section 9.2) |
+| which worker holds a prompt, by cache events | the kv-index crate's index, through two traits | the gateway's two readers of its index for those traits (section 9.2) |
+| which prefill pairs with which decode | the gateway's pair index (`PdPairIndex`) | the pair classes read from it, one file (section 9.2) |
 | which worker was sent a prompt | the host's own trees, of the kv-index crate's two tree types | one more question on the trait the host already answers for cache events |
 | a request's lifetime on a worker | the load guard every route keeps | one optional field (decision 4) |
 | the place where a worker is chosen | classic's five placement functions | one call in each |
@@ -1786,7 +1791,7 @@ request ──> route (HTTP or gRPC, any family)
 
 The change also wrote again three small things that stage 0 took out with the earlier
 integration: the gateway's two readers of its own index of cache events for the engine (about
-130 lines on main today), the pair classes read from the gateway's pair index (one file of 404
+70 lines on main today), the pair classes read from the gateway's pair index (one file of 404
 lines), and the cell beside each published list.
 
 The bar for that change:
