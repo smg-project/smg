@@ -7,15 +7,15 @@
 //! is told under: [`single`] for a single request and [`pair`] for a pair,
 //! a side at a time. They take no lock and keep nothing.
 //!
-//! A controller keeps a file of leases and lends a single's back from it
-//! in the same form (`Sides::with_held_single`), so [`single`] is the one
-//! rule of a single's words under either host. The host says who hears
-//! ([`Hearers`]): a controller's word may come behind a later document's
-//! start, where the engine that issued the lease is gone and the standing
-//! one counts the send. A host that holds its decisions keeps one engine
-//! object across its documents: behind a later document the stages that
-//! document kept hear the lease's words, and every count of sends in force
-//! takes its dispatch ([`of_host`]).
+//! A controller keeps a file of leases and lends a lease back from it in
+//! the same form (`Sides::with_held_single`, `Sides::with_held_pair`), so
+//! [`single`] and [`pair`] are the one rule of a lease's words under either
+//! host. The host says who hears ([`Hearers`]): a controller's word may
+//! come behind a later document's start, where the engine that issued the
+//! lease is gone and the standing one counts the send. A host that holds
+//! its decisions keeps one engine object across its documents: behind a
+//! later document the stages that document kept hear the lease's words,
+//! and every count of sends in force takes its dispatch ([`of_host`]).
 //!
 //! A single request its binding's sessions rule keeps from the profile is
 //! told to the session table at its dispatch, and to no stage ahead of its
@@ -73,8 +73,9 @@ pub(crate) fn stages_hear(decision: &Decision) -> bool {
     decision.pick().is_none_or(|pick| !pick.untold())
 }
 
-/// Who hears a single's words, as the lease's host says it. The rule tells
-/// them in its one order ([`single`]): a host says which engine is which.
+/// Who hears a lease's words, as the lease's host says it. The rule tells
+/// them in its one order ([`single`], [`pair`]): a host says which engine
+/// is which.
 pub(crate) struct Hearers<'a, L> {
     /// The engine the lease was issued under, where it still stands: its
     /// session table and its stages hear the lease's words. `None` behind
@@ -192,15 +193,14 @@ pub(crate) fn decode_as_issued(prefill: &Lease, first: &Target, session: Session
     })
 }
 
-/// Tells the stages of `engine` what was `said` of a pair's lease, a side
-/// at a time, and the counts of sends of `sends` its dispatch: the two are
-/// one engine but behind a later document, as a single's hearers are
-/// ([`of_host`]).
+/// Tells those who hear it what was `said` of a pair's lease, a side at a
+/// time, from what the lease's host lends back: a request's guard, or a
+/// controller's file of leases.
 ///
-/// - A dispatch is told on the side it names: the send counts, the session
-///   table, then the stages. The lease told is the side's as issued, under
-///   the index the dispatch took, and the target is the worker the side
-///   went to. A decode that stood chosen
+/// - A dispatch is told on the side it names: the counts of sends, the
+///   session table, then the stages. The lease told is the side's as
+///   issued, under the index the dispatch took, and the target is the
+///   worker the side went to. A decode that stood chosen
 ///   ([`HeldDecode::chosen`](super::decision_engine::HeldDecode::chosen))
 ///   goes out as its pick's with no call:
 ///   its issue is told first, dated at the dispatch's instant by `micros`,
@@ -209,19 +209,24 @@ pub(crate) fn decode_as_issued(prefill: &Lease, first: &Target, session: Session
 ///   under its lease as issued: every target of a pair's pick names the one
 ///   prefill. The decode's names the decode it went to.
 /// - A release ends the side it names, as issued, and with none both sides:
-///   the prefill's first.
+///   the prefill's first. It states no index of its own: the decode's
+///   names the decode its host lends as the pick's first, under index 0.
 ///
 /// A word on a side a pair's lease does not hold tells nothing, and so
 /// does an end of a decode that stood chosen: no stage heard of that side.
-/// A send count takes a send at a rank it does not know yet, as it does of
-/// any host that tells a dispatch whole.
+///
+/// The hearers are a single's ([`Hearers`]). The counts of sends are those
+/// of the engine that counts its host's sends, and a count asks the host's
+/// test of a rank it does not know. The session table and the stages are
+/// those of the engine that issued the lease: behind a later document's
+/// start none of them hears a word of it, a chosen decode's issue among
+/// them.
 ///
 /// Every word behind a side's issue carries the instant of the pair's first
 /// decision, as a lease on file does. The decode's end names the index its
-/// guard holds, which is the one its dispatch took.
-pub(crate) fn pair(
-    engine: &Engine,
-    sends: &Engine,
+/// host holds, which is the one its dispatch took.
+pub(crate) fn pair<L: Fn(WorkerId, u16) -> bool + Copy>(
+    hearers: &Hearers<'_, L>,
     held: &HeldDecision<'_>,
     said: Said,
     micros: impl Fn(Instant) -> u64,
@@ -269,7 +274,15 @@ pub(crate) fn pair(
                 ..lease
             };
             let since = dispatch.since_decision_micros;
-            sends.dispatched_sent(&lease, &target, dispatch.side, since, || true);
+            // The test goes to the count by value, as a single's does.
+            let (listed, id, dp_rank) = (hearers.listed, target.id, target.dp_rank);
+            let listed = move || listed(id, dp_rank);
+            hearers
+                .sends
+                .dispatched_sent(&lease, &target, dispatch.side, since, listed);
+            let Some(engine) = hearers.issuing else {
+                return;
+            };
             engine.dispatched_table(&lease, &target, dispatch.side);
             if dispatch.side == Side::Decode && chosen {
                 // No call issued the side: this dispatch books it, so the
@@ -288,9 +301,9 @@ pub(crate) fn pair(
                 engine.dispatched_stages(&lease, &target, dispatch.side, since);
             }
         }
-        Said::Completed(outcome) => match outcome.side {
-            Side::Prefill => engine.on_completed(prefill, &outcome),
-            Side::Decode => {
+        Said::Completed(outcome) => match (hearers.issuing, outcome.side) {
+            (Some(engine), Side::Prefill) => engine.on_completed(prefill, &outcome),
+            (Some(engine), Side::Decode) => {
                 let (Some(decode), Some(pair)) = (decode, held.target.pair) else {
                     return;
                 };
@@ -304,9 +317,12 @@ pub(crate) fn pair(
                 };
                 engine.on_completed(&ended, &outcome);
             }
-            Side::Single | Side::Encode => {}
+            (None, _) | (_, Side::Single | Side::Encode) => {}
         },
         Said::Released(side, reason) => {
+            let Some(engine) = hearers.issuing else {
+                return;
+            };
             if matches!(side, None | Some(Side::Prefill)) {
                 engine.on_released(prefill, reason);
             }

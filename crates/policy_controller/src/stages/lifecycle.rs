@@ -92,7 +92,16 @@ pub trait Lifecycle: Send + Sync {
     /// A dispatched side finished, whatever the status.
     fn on_completed(&self, _lease: &Lease, _outcome: &Outcome) {}
 
-    /// The host gave the lease up before its completion.
+    /// The host gave the lease up before its completion. The lease told
+    /// names the worker the stages last heard the side on
+    /// ([`Lease::booked`]): the one its issue booked, or behind a dispatch
+    /// the one the side went to. A stage undoes what it holds of the lease
+    /// by that worker. A stage reads no index off a release: behind a
+    /// dispatch a single's names the target its dispatch took, and a
+    /// pair's decode side is told under index 0, whichever target its
+    /// dispatch took. That side states its claim
+    /// ([`Lease::session_verdict`]) where it stands on the worker it
+    /// claimed, and none behind a dispatch on another worker.
     fn on_released(&self, _lease: &Lease, _reason: ReleaseReason) {}
 
     /// The host's membership changed. A host may call this under its own

@@ -1308,13 +1308,15 @@ decide ──> lease issued ──> Dispatched ──> Completed
 The kept engine stores nothing about a lease. The host keeps what it was handed and hands it back
 with each event (`DecisionEngine::say`). The crate has a guard for that, `DecisionGuard`
 (`tracking/decision_guard.rs`): it holds one decision's lease, has `dispatched`, `completed` and
-`released`, and releases at its drop. A controller keeps its leases in a file. It lends a single
-request's lease back from that file in the guard's form, so one rule tells a single request's
-events under either host (`lease_events::single`). The host says who hears: behind a new
-document the engine that issued the lease is gone, and the standing one counts the send. In a
-gateway's own process the stages a later document kept hear the word, and every count of sends
-in force takes the dispatch (section 5.1). A pair's events on a controller are told by the
-controller's own code.
+`released`, and releases at its drop. A controller keeps its leases in a file. It lends a lease
+back from that file in the guard's form, so one rule tells a lease's events under either host
+(`lease_events::single`, `lease_events::pair`). The host says who hears: behind a new document
+the engine that issued the lease is gone, and the standing one counts the send. In a gateway's
+own process the stages a later document kept hear the word, and every count of sends in force
+takes the dispatch (section 5.1). A file meets events no guard says. An end is told once for each
+side of a pair that is still live. A release of a decode side behind its dispatch names the worker
+that side went to. It states the side's claim only where the side claimed that worker: behind a
+dispatch on another worker a release takes back no claim.
 
 What an event does:
 

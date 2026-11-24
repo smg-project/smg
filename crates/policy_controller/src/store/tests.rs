@@ -2385,11 +2385,10 @@ fn a_side_s_lease_names_the_worker_its_record_books() {
     };
     assert_eq!(record.lease.booked, WorkerId(0), "filed with no word");
     assert_eq!(told(&single, Side::Single), Some(record.target));
-    assert_eq!(single.ending(None).map(booked), [Some(record.target), None]);
-    // A single's end is told off its record, with no list built.
-    let mut ended = Vec::new();
-    single.each_ending(None, |lease| ended.push(lease.booked));
-    assert_eq!(ended, [record.target]);
+    // A single's end is lent off its record, under the same worker.
+    let whole = Said::Released(None, ReleaseReason::ClientGone);
+    let lent = single.with_held_single(whole, |held| held.lease.booked);
+    assert_eq!(lent, Some(record.target));
     let (record, decode) = pair(2, p, &[d], now);
     let both = Sides {
         record,
@@ -2397,7 +2396,16 @@ fn a_side_s_lease_names_the_worker_its_record_books() {
     };
     assert_eq!(told(&both, Side::Prefill), Some(p));
     assert_eq!(told(&both, Side::Decode), Some(d));
-    assert_eq!(both.ending(None).map(booked), [Some(p), Some(d)]);
+    // A pair's end is lent once a side, the prefill's first: the lease
+    // names the prefill, and the target's pair the decode.
+    let mut ended = Vec::new();
+    both.with_held_pair(whole, |held, said| {
+        let decode = held.target.pair.map(|pair| pair.decode_id);
+        ended.push((said, held.lease.booked, decode));
+    });
+    let of = |side| Said::Released(Some(side), ReleaseReason::ClientGone);
+    let sides = [Side::Prefill, Side::Decode].map(|side| (of(side), p, Some(d)));
+    assert_eq!(ended, sides);
 }
 
 #[test]
@@ -2564,10 +2572,12 @@ fn the_dispatch_deadline_ends_each_side_that_waits_and_a_dispatched_side_stands(
         let Said::Released(side, ReleaseReason::Abandoned) = said else {
             panic!("this issue tells the deadline's ends alone: {said:?}");
         };
-        // The word reads the side's lease off the lease as the end found
-        // it.
-        let lease = found.ending(side)[0];
-        (found.record.lease.id.0, lease.map(|lease| lease.side))
+        // The word is lent off the lease as the end found it: once, of
+        // the side it names, which waited.
+        let mut lent = Vec::new();
+        found.with_held_pair(said, |_, said| lent.push(said));
+        assert_eq!(lent, [said]);
+        (found.record.lease.id.0, side)
     });
     assert_eq!(
         ended.collect::<Vec<_>>(),
