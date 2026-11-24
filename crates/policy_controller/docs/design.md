@@ -293,7 +293,9 @@ that the document replaces. The command line refuses such a flag where it was ty
 default value. The Python launcher cannot tell whether a flag was typed, and refuses one that is
 off its default. A configuration built by hand is compared instead. The document is accepted when
 the routing settings say the same document or say nothing. Otherwise the start is refused, and the
-error names the first difference. A supplied document that binds no single request refuses each
+error names the first difference. A gateway's start also refuses a supplied document whose
+bindings differ in an overload word, and one whose overload block is on where the gateway states
+neither threshold (decision 10). A supplied document that binds no single request refuses each
 single request, in any gateway. For a prefill-decode mode of one router over HTTP that is the
 token count.
 
@@ -473,10 +475,15 @@ changed after it is published.
 **Who opens the stream.** A worker pushes on a stream that its host opens to it. The worker
 crate's collector connects to the worker and subscribes, and the worker answers on that stream
 (`crates/worker/src/kv_events/`). It sends its cache events with the load records that ride
-them, or its load records alone where the host keeps no index of its cache. The collector hands
-the load records to the load monitor and the cache events to the index of cache events
-(section 4.5). Only a worker dialed over gRPC has such a stream; the monitor polls the others.
-A worker dials nobody for this, so it needs no address of a gateway or of a controller.
+them, or its load records alone, as its host asks. A gateway asks a worker for its cache events
+where what places the worker reads them. Otherwise it asks for the load records alone, and opens
+no stream where its load monitor wants no loads of the worker. On main a controller opens no
+stream for load records alone. It asks a worker for its cache events where the worker's
+registration asks for them, on one stream for each engine: a data-parallel engine's rank 0
+streams every rank's events. The collector hands the load records to the load monitor and the
+cache events to the index of cache events (section 4.5). Only a worker dialed over gRPC has such
+a stream; the monitor polls the others. A worker dials nobody for this, so it needs no address
+of a gateway or of a controller.
 
 The host that opens the stream is the process that holds the workers' data (the table of
 section 1): the gateway in classic and with the engine in the gateway, the controller with the
@@ -1798,7 +1805,8 @@ A `Decide` request of the single phase is decided on one of a fixed set of threa
 picks the thread) by `PolicyEngine::decide_without_lease`, over the list of the model's workers
 that the worker objects' registry publishes. A pair's request at its prefill is decided there
 too, over the registry's two lists of its model. Its answer carries a lease a side, or the
-prefill side's alone where its frame stated the later decode. A decode call that names the
+prefill side's alone where its frame stated the later decode. A decode call that names a lease
+goes to the thread that keeps that lease's file. One that names the
 pair's lease is decided behind the prefill that lease holds, by
 `PolicyEngine::decide_decode_without_lease`, and its pick is issued under that lease. An encode
 request, a decode request that names no lease and a prefill whose plan pairs no side are
@@ -2424,10 +2432,11 @@ policies have it. What that leaves of a binding's block:
 - **Its switch [partly].** Whether the program's default vetoes at all is one word for the
   bindings a host runs, because a worker object has one default. The host reads it where it
   builds that default. A gateway that runs a supplied document reads it at its start, and
-  refuses a document whose bindings disagree on it, or on the shed word, which its routes read
-  once for the process. A binding with no block says the defaults. A controller's reader of the
-  switch is planned: it does not read it on its worker objects yet. A worker's own thresholds
-  veto either way.
+  refuses a document whose bindings disagree on it, or on the shed word: its routes read one
+  shed word for the process. It also refuses one whose block is on where the gateway states
+  neither number. With the switch off the gateway builds its worker objects with no default. A
+  binding with no block says the defaults. A controller's reader of the switch is planned: it
+  does not read it on its worker objects yet. A worker's own thresholds veto either way.
 
 ### Decision 11: the crate in CI and in the published set
 
