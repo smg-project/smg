@@ -47,8 +47,8 @@ pub struct KvFeed<G: Generation> {
     store: Arc<MemoryStore>,
     objects: Arc<Objects<G>>,
     /// The host's worker monitor, once handed: it says whether a worker's
-    /// loads are wanted. The collector keeps its own hold of the records'
-    /// sink.
+    /// loads are wanted. The collector keeps its own weak hold of the
+    /// records' sink.
     loads: OnceLock<Weak<WorkerMonitor<G>>>,
 }
 
@@ -75,7 +75,8 @@ impl<G: Generation> KvFeed<G> {
     /// later call is ignored): the host's worker monitor, or a sink of the
     /// host's own, which hands a record on to its monitor or drops it. No
     /// stream is opened for the records' sake: they ride the streams the
-    /// follow opens.
+    /// follow opens. The follow holds the sink weakly, and the caller keeps
+    /// it alive for as long as records should reach it ([`PushedLoadSink`]).
     pub fn set_load_sink<S: PushedLoadSink + 'static>(&self, sink: &Arc<S>) {
         self.collector.set_load_sink(sink);
     }

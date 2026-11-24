@@ -143,9 +143,12 @@ impl LoadMonitor {
     /// stop's end ([`WorkerMonitor::stop`]). Every task of the monitor
     /// that stands has ended then, a poll in flight with its task. The
     /// snapshot is published empty and every overload verdict is off the
-    /// objects. So a replica that does not lead dials no engine for its
-    /// load, and the next lead's start comes behind the last poll. This
-    /// task alone starts and stops the monitor, each in its turn.
+    /// objects. The monitor keeps nothing that a stream's records filed,
+    /// no rank of a report and no publish that waited for its window: the
+    /// next lead starts each worker from no report. So a replica that does
+    /// not lead dials no engine for its load, and the next lead's start
+    /// comes behind the last poll. This task alone starts and stops the
+    /// monitor, each in its turn.
     ///
     /// One loop is not awaited: that of a group which a registration, a
     /// removal or a change of its interval ended just ahead of the stop. A
@@ -232,6 +235,7 @@ mod tests {
 
     const A: &str = "grpc://a:9000";
     const B: &str = "grpc://b:9000";
+    const C: &str = "grpc://c:9000";
 
     /// How often the replica's monitor polls a worker.
     const EVERY: Duration = Duration::from_secs(2);
@@ -480,13 +484,18 @@ mod tests {
         /// Hands the sink a load record of the worker at `url`, as the task
         /// of the worker's event stream does: `waiting` requests queue.
         fn push(&self, url: &str, waiting: u32) {
+            self.push_rank(url, 0, waiting);
+        }
+
+        /// The same record for `rank` of the worker's engine.
+        fn push_rank(&self, url: &str, rank: i32, waiting: u32) {
             let registry = self.workers.objects().registry();
             let object = registry.get_by_url(url).expect("the row's object");
             let record = EngineLoad {
                 waiting_requests: waiting,
                 ..EngineLoad::default()
             };
-            Arc::clone(&self.pushed).push_load(&object, 0, &record, Instant::now());
+            Arc::clone(&self.pushed).push_load(&object, rank, &record, Instant::now());
         }
 
         /// Whether the object at `url` is marked as a worker whose stream
@@ -683,6 +692,67 @@ mod tests {
         assert!(!replica.overloaded(A), "a verdict stands behind the stop");
         // The step holds the sink, and the engine holds the step.
         replica.engine.at_cut.lock().take();
+        assert!(replica.stopped().await, "the task ends at the stop");
+    }
+
+    /// Nothing that a stream filed under one lead is published under a later
+    /// one. Under the first lead B's rank 1 pushed and was published, and
+    /// A's record came inside the lead's last publish window: it is still
+    /// queued where the lead ends. The monitor's stop evicts both files.
+    /// The next lead's first window, which B's rank 0 opens while no poll
+    /// has answered yet, publishes that record alone: no rank of B's from
+    /// the earlier lead, and no report of A. C never pushes: its poll goes
+    /// out at each take, whatever the monitor keeps of the other two.
+    #[tokio::test(start_paused = true)]
+    async fn a_report_filed_under_one_lead_is_published_under_no_later_one() {
+        let mut replica = Replica::new();
+        replica.register(facts(A));
+        replica.register(facts(B));
+        replica.register(facts(C));
+        replica.role.send_replace(Some(1));
+        assert!(
+            comes(|| replica.waiting(A) == Some(0) && replica.waiting(B) == Some(0)).await,
+            "the take's poll"
+        );
+
+        // Five wait on B's rank 1, and its window publishes them.
+        replica.push_rank(B, 1, 5);
+        assert!(
+            comes(|| replica.waiting(B) == Some(5)).await,
+            "the window publishes B's rank 1"
+        );
+        // A's record, and the lead ends inside its publish window.
+        replica.push(A, 9);
+        replica.role.send_replace(None);
+        assert!(
+            comes(|| replica.waiting(A).is_none() && replica.waiting(B).is_none()).await,
+            "the lead's end empties the snapshot"
+        );
+
+        // The next lead's polls are answered late, so none lays over a
+        // report, and B's rank 0 opens that lead's first publish window.
+        replica.engine.late.store(60_000, SeqCst);
+        let polled = replica.polls();
+        replica.role.send_replace(Some(2));
+        assert!(
+            comes(|| replica.polls() > polled).await,
+            "the take's poll is in flight"
+        );
+        replica.push(B, 1);
+        assert!(
+            comes(|| replica.waiting(B).is_some()).await,
+            "the window publishes B's record"
+        );
+        assert_eq!(
+            replica.waiting(B),
+            Some(1),
+            "a rank of the earlier lead is published"
+        );
+        assert_eq!(
+            replica.waiting(A),
+            None,
+            "a report of the earlier lead is published"
+        );
         assert!(replica.stopped().await, "the task ends at the stop");
     }
 

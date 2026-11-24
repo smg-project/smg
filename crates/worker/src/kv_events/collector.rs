@@ -195,7 +195,8 @@ impl<H: KvEventHost> KvEventCollector<H> {
 
     /// Route the load records on every worker's event stream to `sink`
     /// (once; a later call is ignored): the worker monitor, or a sink of
-    /// the host's own.
+    /// the host's own. The collector holds it weakly, and the caller keeps
+    /// it alive ([`PushedLoadSink`]).
     pub fn set_load_sink<S: PushedLoadSink + 'static>(&self, sink: &Arc<S>) {
         let sink: Weak<S> = Arc::downgrade(sink);
         let _ = self.load_sink.set(sink);
