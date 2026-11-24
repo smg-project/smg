@@ -3319,7 +3319,10 @@ mod native_loads_tests {
     #[path = "tests/poll_counts.rs"]
     mod poll_counts;
     use crate::{
-        connection::engine::{EngineConnection, EngineConnector, ZmqLink},
+        connection::{
+            client_factory::http_client,
+            engine::{EngineConnection, EngineConnector, ZmqLink},
+        },
         identity::basic::{ConnectionMode, WorkerLoadGuard, WorkerType},
         model_card::ModelCard,
         runtime::StallReason,
@@ -3910,6 +3913,8 @@ mod native_loads_tests {
     struct SourceConnector {
         source: Option<Arc<HostLoads>>,
         asked: Mutex<Vec<String>>,
+        /// The runtime each ask named.
+        asked_as: Mutex<Vec<RuntimeType>>,
         /// How many of the next asks never answer.
         silent_asks: AtomicUsize,
     }
@@ -3922,6 +3927,7 @@ mod native_loads_tests {
                     calls: AtomicUsize::new(0),
                 })),
                 asked: Mutex::new(Vec::new()),
+                asked_as: Mutex::new(Vec::new()),
                 silent_asks: AtomicUsize::new(0),
             })
         }
@@ -3954,9 +3960,10 @@ mod native_loads_tests {
         async fn http_load_source(
             &self,
             base_url: &str,
-            _runtime: RuntimeType,
+            runtime: RuntimeType,
         ) -> Option<Arc<dyn LoadSource>> {
             self.asked.lock().push(base_url.to_string());
+            self.asked_as.lock().push(runtime);
             // One poll asks at a time in these cases: a read, then a write.
             if self.silent_asks.load(Ordering::Relaxed) > 0 {
                 self.silent_asks.fetch_sub(1, Ordering::Relaxed);
@@ -4965,6 +4972,50 @@ mod native_loads_tests {
         assert_eq!(late.calls(), 1);
         assert_eq!(stub.probes.load(Ordering::Relaxed), 0);
         assert!(memo.is_empty());
+    }
+
+    /// A registration's one read of an engine's load route asks the host's
+    /// connector first, with the engine's address and its runtime. While
+    /// the connector may still say, the engine is asked nothing. A
+    /// connector that has not said at the poll's deadline keeps no source
+    /// for this read: the engine's route is asked once, its answer by rank
+    /// is the read's, and the source is never called.
+    #[tokio::test]
+    async fn a_registrations_read_asks_the_engine_once_its_connector_is_late_to_say() {
+        let stub = spawn_engine(StatusCode::OK, NATIVE_DP_BODY).await;
+        let late = SourceConnector::keeping(Some(host_answer(2)));
+        late.silent_asks.store(1, Ordering::Relaxed);
+        let client = http_client();
+        // The wait for the connector runs on a paused clock, and the engine
+        // is read on the running one: no request waits on a clock that jumps.
+        tokio::time::pause();
+        let read = WorkerMonitor::read_engine_loads(
+            late.as_ref(),
+            RuntimeType::Sglang,
+            &client,
+            &stub.url,
+            None,
+        );
+        tokio::pin!(read);
+        tokio::select! {
+            biased;
+            _ = &mut read => panic!("the read ended before the connector's deadline"),
+            () = std::future::ready(()) => {}
+        }
+        assert_eq!(*late.asked.lock(), [stub.url.as_str()]);
+        assert_eq!(*late.asked_as.lock(), [RuntimeType::Sglang]);
+        assert_eq!(stub.probes.load(Ordering::Relaxed), 0);
+
+        tokio::time::advance(LOAD_POLL_DEADLINE + Duration::from_millis(1)).await;
+        tokio::time::resume();
+        let loads = read.await;
+        assert!(
+            matches!(&loads, Some(NativeLoads::Available(answer)) if answer.names_dp_ranks(2)),
+            "the engine's own answer by rank"
+        );
+        assert_eq!(stub.probes.load(Ordering::Relaxed), 1);
+        assert_eq!(late.asked.lock().len(), 1);
+        assert_eq!(late.calls(), 0);
     }
 
     /// A polled answer's named values stand under the bounds a pushed

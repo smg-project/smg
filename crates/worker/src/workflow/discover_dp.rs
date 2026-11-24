@@ -126,6 +126,8 @@ fn missing_rank_loads(loads: &NativeLoads, ranks: usize) -> Option<&'static str>
         NativeLoads::Available(_) => Some("does not name every rank"),
         NativeLoads::Absent => Some("is not served"),
         NativeLoads::Unreadable(FetchFailure::Answer) => Some("answered what is no load report"),
+        // A status that is no success (a server error, a refused key) is the engine's answer too.
+        NativeLoads::Inconclusive(FetchFailure::Answer) => Some("answered with an error status"),
         // A send or a body read that failed on the way is no answer of the engine's.
         NativeLoads::Unreadable(_) | NativeLoads::Inconclusive(_) => Some("gave no answer"),
     }
