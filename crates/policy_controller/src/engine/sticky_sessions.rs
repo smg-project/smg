@@ -621,8 +621,10 @@ impl SessionTable {
     /// the lease's and the answer's, as behind a rename that finds a
     /// claim made ahead of it ([`Self::rename_worker`]). A worker that is
     /// a pin of the key already, under the id that stands or under one it
-    /// had that a rename's walk has yet to reach, is no claim: the answer
-    /// names the decision's own pick, and no pin is written beside it.
+    /// had that a rename's walk has yet to reach, and that the decision
+    /// read as no pin, is no claim: the answer names the decision's own
+    /// pick, and no pin is written beside it. A pin the decision read is
+    /// claimed as any worker is: no decision of the engine claims one.
     ///
     /// The ask comes ahead of the read of the pins against `seen`. Where
     /// it takes a rename's step for the key ([`Self::standing`]), that
@@ -632,8 +634,8 @@ impl SessionTable {
     /// worker, where the table remembers a rename: the answer names a
     /// pin, and a newcomer under an id its worker had is one no row of
     /// the decision holds. Pins the step makes the ones the decision
-    /// read again stand as read: a worker that is a pin already is no
-    /// claim there either.
+    /// read again stand as read: a worker that is a pin already, and
+    /// that the decision read as no pin, is no claim there either.
     /// Always inlined: the keyed decision has two forms, and a second caller
     /// would otherwise move this out of line under the first.
     #[inline(always)]
