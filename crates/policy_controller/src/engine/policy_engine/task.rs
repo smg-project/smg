@@ -182,7 +182,9 @@ impl PolicyEngine {
     ///   under the id of the join, where the report's sample instant is
     ///   not the one last told of the worker. A telling hears the
     ///   registry's words that stand ready first. A worker told as joined
-    ///   behind a snapshot is told its report at the next one. The channel
+    ///   behind a snapshot is told its report at the next one. A whole read
+    ///   that a panic of the host's own code put off to a later upkeep
+    ///   tells its workers the snapshot at hand at that upkeep. The channel
     ///   keeps one snapshot, so of two reports of one worker the task took
     ///   no snapshot between, the earlier is told to no stage. A request
     ///   that gives a snapshot of its own can show its decision a report
@@ -311,8 +313,13 @@ impl PolicyEngine {
     /// follow and told behind it: a new document owes its whole read of
     /// the registry ahead of its hand-over ([`Self::apply`]), so a
     /// hand-over the step reads finds that read made by its telling,
-    /// whenever the document came in. `told` is the row the task keeps
-    /// for the named values of the report a telling tells.
+    /// whenever the document came in. Where a program's own code panicked
+    /// in that read, the hand-over was told ahead of it: an upkeep behind
+    /// one that owed the read and did not make it tells the snapshot at
+    /// hand, so the workers the read tells as joined hear their reports at
+    /// its upkeep and not at the monitor's next publication. `told` is the
+    /// row the task keeps for the named values of the report a telling
+    /// tells.
     fn step(
         &self,
         upkeep: &impl Fn(Instant),
@@ -327,10 +334,14 @@ impl PolicyEngine {
         let handed = self.loads.handed_past(*taken);
         // Ahead of a hand-over's telling: it tells the reports of the
         // workers the follow told as joined.
-        self.follow_registry(members);
+        let again = self.follow_registry(members);
         if let Some(handed) = handed {
             (*taken, *feed) = handed;
             self.keep_loads(members, told, feed.as_mut());
+        } else if again {
+            if let Some(newest) = self.loads.newest.load_full() {
+                self.tell_loads(members, told, &newest);
+            }
         }
     }
 }
