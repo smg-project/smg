@@ -912,8 +912,7 @@ impl MemoryStore {
     }
 
     /// The snapshot as the last publication left it, taken through no lock.
-    /// Its identity moves with every publication: [`StoreSnapshot::epoch`] says
-    /// whether the membership moved.
+    /// Its identity moves with every publication.
     ///
     /// This door hands an owned pointer, for a reader that keeps a world
     /// across calls. Taking it and dropping it each write the count every

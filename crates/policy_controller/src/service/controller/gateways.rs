@@ -1701,7 +1701,7 @@ pub(crate) mod tests {
         // asks for one.
         store.publish_now();
         let world = store.snapshot();
-        assert!(world.first_row_of(worker).is_some(), "the worker's row");
+        assert!(world.booked_of(worker).is_some(), "the worker is published");
         let vetoes = world.gateway_vetoes("m", Role::Single, gateway);
         let veto = vetoes.standing_at(now).find(|veto| veto.id == worker);
         veto.map_or((false, false), |veto| (veto.held, true))
