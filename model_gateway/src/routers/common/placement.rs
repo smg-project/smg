@@ -495,10 +495,11 @@ pub(crate) fn accepted_by(
 /// A route asks it of the guard ([`Self::of`]) and tests nothing of who
 /// placed the request. The handle is empty for a guard that keeps no side
 /// of the policy engine's: a classic guard, a guard made ahead of its send
-/// ([`Placed::ahead`]) until [`Placed::sent`] hands it the side, and a
-/// guard made of another ([`WorkerLoadGuard::replicate`]). It is empty
-/// too where no stage of the engine's document takes an outcome. An empty
-/// handle holds nothing, and a report through it says nothing.
+/// until that send hands it the side ([`Placed::ahead`] until
+/// [`Placed::sent`], the load of a pair's prefill until [`Unsent::sent`]),
+/// and a guard made of another ([`WorkerLoadGuard::replicate`]). It is
+/// empty too where no stage of the engine's document takes an outcome. An
+/// empty handle holds nothing, and a report through it says nothing.
 ///
 /// Where the handle is not empty, the engine hears the request's end once
 /// the guard and every handle are gone: with the status last reported, or

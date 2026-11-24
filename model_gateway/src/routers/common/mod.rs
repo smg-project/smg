@@ -524,10 +524,17 @@ pub mod bench_support {
         .ok()?;
         let went = placed_on(pair.prefill.worker());
         let key = policies.sticky_key(None, None);
-        let prefill = pair.prefill.into_guard(key);
-        let decode = pair.decode.ahead(key);
-        let decode = pair.decode.sent(decode);
-        black_box((&prefill, &decode));
+        // The two loads as [`route_pair`] holds them.
+        let handed_on = |pair: PlacedPair| {
+            let (prefill, unsent) = pair.prefill.unsent();
+            ((prefill, pair.decode), unsent)
+        };
+        let ((_prefill, decode), ahead) =
+            hold_unbounded(pair, key, |pair| &pair.prefill, handed_on);
+        let prefill = ahead.sent();
+        let decode_guard = decode.ahead(key);
+        let decode_guard = decode.sent(decode_guard);
+        black_box((&prefill, &decode_guard));
         if end == Ended::Streamed {
             let reader = black_box(RequestEnd::default());
             reader.report(200, || true);
