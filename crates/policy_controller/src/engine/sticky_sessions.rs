@@ -948,13 +948,15 @@ impl SessionTable {
     /// respill's move and the commit. A moved claim, a respill's move and
     /// the commit ask ahead of every line of their own, and a claim asks
     /// ahead of its read of the pins against the ones its decision read
-    /// ([`Self::claim`]). The
-    /// pins are read first: a worker among them costs no read of the
-    /// renames' count. A write whose target is a pin as written asks
-    /// nothing, whatever a rename's walk has yet to reach: it adds no
-    /// pin. It puts the pins in another order or withdraws its own
-    /// decision's claim, so the walk, or the key's next write that asks,
-    /// finds what it would have found ahead of it.
+    /// ([`Self::claim`]). The pins are read first: a worker among them
+    /// costs no read of the renames' count. A write whose target is a pin
+    /// as written asks nothing here, whatever a rename's walk has yet to
+    /// reach: it adds no pin. It puts the pins in another order or
+    /// withdraws its own decision's claim, so the walk, or the key's next
+    /// write that asks, finds what it would have found ahead of it. One
+    /// caller asks past this test: a claim on pins that moved under its
+    /// decision takes the step whatever its target, a pin as written
+    /// too, because its answer names a pin ([`Self::claim`]).
     #[inline]
     fn stands(&self, entry: &mut Entry, target: WorkerId) -> WorkerId {
         if !entry.pins.contains(&target) && self.renamed_len.load(Ordering::Relaxed) != 0 {
@@ -975,7 +977,9 @@ impl SessionTable {
     /// it meets a worker's pin under the id that stands, and no claim's
     /// mark stands on a pin the key was served on. Out of line: a write
     /// asks only where its target is in neither pin and the table renamed
-    /// a worker ([`Self::stands`]).
+    /// a worker ([`Self::stands`]), and a claim where the pins moved
+    /// under its decision and the table renamed a worker
+    /// ([`Self::claim`]).
     #[cold]
     #[inline(never)]
     fn standing(&self, entry: &mut Entry, target: WorkerId) -> WorkerId {
@@ -3072,6 +3076,81 @@ mod tests {
                 Recovery::Original => [WorkerId(1), WorkerId(2)],
             };
             assert_eq!(table.pins(s(1)), Some(both), "the key keeps its pin");
+        }
+    }
+
+    /// Pins the step makes the ones the decision read again stand as
+    /// read for a pick that is in neither pin too: the claim is taken, as
+    /// where the pins stood as written. One worker is registered twice
+    /// around one decision: it was 1 where the decision read the key's
+    /// pins, a rename to 11 walked the key, and a rename back to 1 is
+    /// said and has yet to walk it. The step makes the pins the ones
+    /// read, and the decision's pick, another worker, is claimed by the
+    /// key's recovery. The claim is marked: the claiming decision's
+    /// commit elsewhere withdraws it, and the key's pin stays.
+    #[test]
+    fn a_claim_on_pins_the_step_makes_the_ones_read_again_is_taken_for_a_new_worker() {
+        for rule in [RULE, ORIGINAL] {
+            let table = SessionTable::new(rule.sweep_micros);
+            table.lookup(s(1), 10, &rule);
+            table.dispatched(s(1), SessionVerdict::Pinned, WorkerId(5));
+            table.dispatched(s(1), SessionVerdict::Pinned, WorkerId(1));
+            let read = table.lookup(s(1), 20, &rule);
+            assert!(read.contains(&WorkerId(1)) && read.contains(&WorkerId(5)));
+            table.rename_worker(WorkerId(1), WorkerId(11));
+            assert_ne!(table.pins(s(1)), Some(read), "the walk renamed the pin");
+            // The rename back by its first half: remembered, the shards
+            // not yet walked.
+            table.remember(WorkerId(11), WorkerId(1));
+            let claim = table.claim(s(1), read, WorkerId(2));
+            assert_eq!(claim, Claim::Made(WorkerId(2)));
+            let claimed = match rule.recovery {
+                Recovery::Latest => [WorkerId(2), WorkerId(1)],
+                Recovery::Original => [WorkerId(1), WorkerId(2)],
+            };
+            assert_eq!(table.pins(s(1)), Some(claimed), "on the walked pins");
+            // The claiming decision's commit lands elsewhere.
+            table.dispatched(s(1), SessionVerdict::Claimed(WorkerId(2)), WorkerId(7));
+            let withdrawn = match rule.recovery {
+                Recovery::Latest => [WorkerId(7), WorkerId(1)],
+                Recovery::Original => [WorkerId(1), WorkerId(7)],
+            };
+            assert_eq!(table.pins(s(1)), Some(withdrawn), "the claim is withdrawn");
+        }
+    }
+
+    /// A decision that claims a worker it read as a pin of the key, on
+    /// pins that stand as it read them, is given the claim: the worker
+    /// leads by the key's recovery and is marked, so the claiming
+    /// decision's commit elsewhere withdraws it. The answer for a worker
+    /// that is a pin already is for one the decision read as no pin. No
+    /// decision of the engine claims a pin it read: the keyed decision
+    /// answers such a pin ahead of its claim. The case holds the table's
+    /// answer as it stands.
+    #[test]
+    fn a_claim_of_a_pin_its_decision_read_is_taken_on_pins_that_stand() {
+        for rule in [RULE, ORIGINAL] {
+            let table = SessionTable::new(rule.sweep_micros);
+            table.lookup(s(1), 10, &rule);
+            table.dispatched(s(1), SessionVerdict::Pinned, WorkerId(5));
+            table.dispatched(s(1), SessionVerdict::Pinned, WorkerId(1));
+            let read = table.lookup(s(1), 20, &rule);
+            // The decision picks the pin it read behind the lead.
+            let pick = read[1];
+            let claim = table.claim(s(1), read, pick);
+            assert_eq!(claim, Claim::Made(pick));
+            let claimed = match rule.recovery {
+                Recovery::Latest => [pick, read[0]],
+                Recovery::Original => read,
+            };
+            assert_eq!(table.pins(s(1)), Some(claimed), "by the key's recovery");
+            // The claiming decision's commit lands elsewhere.
+            table.dispatched(s(1), SessionVerdict::Claimed(pick), WorkerId(9));
+            let withdrawn = match rule.recovery {
+                Recovery::Latest => [WorkerId(9), read[0]],
+                Recovery::Original => [read[0], WorkerId(9)],
+            };
+            assert_eq!(table.pins(s(1)), Some(withdrawn), "the pin it read goes");
         }
     }
 
