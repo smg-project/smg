@@ -1199,14 +1199,18 @@ impl TokenTree {
         // remaining slice for the splice.
         let mut matched_tokens = 0usize;
         let mut remaining = tokens;
-        // Every full-match node we descended through, in order, and the tenant
-        // the match stamped on it (`None` once the match is frozen). Each node
-        // is cloned once, into `path`; `current` indexes it (`None` = root).
-        let mut path: Vec<NodeRef> = Vec::with_capacity(16);
-        let mut stamped: Vec<Option<TenantId>> = Vec::with_capacity(16);
-        // The page key each edge of `path` was descended by, so the replay can
-        // confirm an edge still exists before it attaches a tenant under it.
-        let mut keys: Vec<TokenPageKey> = Vec::with_capacity(16);
+        // Every full-match node we descended through, in order, with the tenant
+        // the match stamped on it (`None` once the match is frozen) and the page
+        // key its edge was descended by, so the replay can confirm an edge still
+        // exists before it attaches a tenant under it. Each node is cloned once,
+        // into `path`; `current` indexes it (`None` = root). One list, so one
+        // allocation a request.
+        struct Step {
+            node: NodeRef,
+            stamped: Option<TenantId>,
+            key: TokenPageKey,
+        }
+        let mut path: Vec<Step> = Vec::with_capacity(16);
         let mut current: Option<usize> = None;
         // Where the match resolved: the deepest full-match node that had a
         // tenant (an index into `path`), or the partial-match node.
@@ -1229,7 +1233,7 @@ impl TokenTree {
         while remaining.len() >= page_size {
             let page_key = page_key_of(remaining, page_size);
             let current_node = match current {
-                Some(i) => &path[i],
+                Some(i) => &path[i].node,
                 None => &self.root,
             };
 
@@ -1303,9 +1307,11 @@ impl TokenTree {
                     if tenant.is_some() {
                         last_full = Some(path.len());
                     }
-                    path.push(next);
-                    stamped.push(tenant);
-                    keys.push(page_key);
+                    path.push(Step {
+                        node: next,
+                        stamped: tenant,
+                        key: page_key,
+                    });
                     remaining = &remaining[advance..];
                     current = Some(path.len() - 1);
                 }
@@ -1316,10 +1322,11 @@ impl TokenTree {
         let (tenant, matched_tenants) = match (&partial, last_full) {
             (Some((node, t)), _) => (Arc::clone(t), node.matched_tenants()),
             (None, Some(i)) => (
-                stamped[i]
+                path[i]
+                    .stamped
                     .as_ref()
                     .map_or_else(|| intern_tenant("empty"), Arc::clone),
-                path[i].matched_tenants(),
+                path[i].node.matched_tenants(),
             ),
             (None, None) => (intern_tenant("empty"), Vec::new()),
         };
@@ -1373,7 +1380,8 @@ impl TokenTree {
         // detach that came first shows here as a lost edge; an attach that
         // came first leaves a node the detach keeps.
         let mut lost_edge = false;
-        for (i, (node, matched)) in path.iter().zip(&stamped).enumerate() {
+        for (i, step) in path.iter().enumerate() {
+            let (node, matched) = (&step.node, &step.stamped);
             // The match stamped this very tenant on this node a moment ago (the
             // common hit: the request routes to the worker it matched). While
             // it is still attached there is nothing to re-stamp or credit: the
@@ -1395,8 +1403,12 @@ impl TokenTree {
                 }
                 continue;
             }
-            let parent = if i == 0 { &self.root } else { &path[i - 1] };
-            let edge = parent.children.get(&keys[i]);
+            let parent = if i == 0 {
+                &self.root
+            } else {
+                &path[i - 1].node
+            };
+            let edge = parent.children.get(&step.key);
             if !edge
                 .as_ref()
                 .is_some_and(|edge| Arc::ptr_eq(edge.value(), node))
@@ -1447,7 +1459,7 @@ impl TokenTree {
             // `insert_tokens`. The matched prefix above `current` was already
             // re-attached by the loop above and is never re-walked.
             let fall_off = match current {
-                Some(i) => Arc::clone(&path[i]),
+                Some(i) => Arc::clone(&path[i].node),
                 None => Arc::clone(&self.root),
             };
             let (added, ends_at) = Self::insert_from(
@@ -1466,7 +1478,7 @@ impl TokenTree {
             // The whole aligned sequence was matched: it ends at the deepest
             // node of the path (the replay above attached the tenant there).
             let end = match current {
-                Some(i) => &path[i],
+                Some(i) => &path[i].node,
                 None => &self.root,
             };
             self.record_hash(end, path_hash);
