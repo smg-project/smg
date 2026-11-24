@@ -5693,6 +5693,7 @@ impl Engine {
     /// column it is handed whole. The answer is of what the
     /// build kept: a membership write asks it of every pool, and no stage
     /// is asked again.
+    #[cfg(any(test, feature = "in-process"))]
     pub(crate) fn reads_sent_for(&self, model: &str, phase: Phase) -> bool {
         self.needs.sent_prefixes
             && self
@@ -5709,6 +5710,7 @@ impl Engine {
     /// cap it would lose them. A stage that reads cache events for a row's
     /// warm-up reads no holder and turns nothing here.
     /// Kept at the build, as [`Self::reads_sent_for`] is.
+    #[cfg(any(test, feature = "in-process"))]
     pub(crate) fn reads_sent_alone_for(&self, model: &str, phase: Phase) -> bool {
         self.resolve(model, phase)
             .is_some_and(|(_, index, _)| self.named_by[usize::from(index)].sent_alone)
@@ -5735,6 +5737,7 @@ impl Engine {
     /// the model's record. So a decode pool's word is, in this order,
     /// that request's profile's where it reads the record, the pair's
     /// decode profile's, and the shadow's as above.
+    #[cfg(any(test, feature = "in-process"))]
     pub(crate) fn pool_record_for(&self, model: &str, phase: Phase) -> Option<bool> {
         if self.reads_sent_for(model, phase) {
             return Some(self.reads_sent_alone_for(model, phase));
