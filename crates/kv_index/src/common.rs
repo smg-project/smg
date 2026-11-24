@@ -31,6 +31,12 @@ pub(super) fn intern_tenant(tenant: &str) -> TenantId {
     Arc::clone(entry.key())
 }
 
+/// How often an eviction asks its `keep_going`: every this many nodes walked
+/// or entries taken off its heap, so a stop lands within a fraction of a pass
+/// (a pass over a memory-sized tree walks for seconds). The value may change
+/// between releases.
+pub const CANCEL_CHECK_EVERY: usize = 4096;
+
 /// Trait for prefix match results.
 ///
 /// This trait provides a common interface for accessing match results

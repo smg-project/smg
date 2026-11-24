@@ -2678,3 +2678,118 @@ fn the_block_scan_skips_whole_chunks_and_finds_the_byte_after_them() {
     ];
     assert_scan_is_byte_wise(&text, lengths.into_iter());
 }
+
+/// A stop lands inside a pass, not only between passes: `keep_going` is asked
+/// every `CANCEL_CHECK_EVERY` nodes walked, so one pass over a large tree
+/// stops early, evicting nothing.
+#[test]
+fn test_eviction_stops_inside_a_pass() {
+    let tree = Tree::new();
+    for t in 0..(3 * CANCEL_CHECK_EVERY) as u32 {
+        tree.insert_text(
+            &format!(
+                "{}{t:05}",
+                char::from_u32(0x20000 + t).expect("a CJK ideograph")
+            ),
+            "tenant",
+        );
+    }
+    let full = tree.total_char_size();
+    let asked = std::cell::Cell::new(0usize);
+    let stop_on_second = || {
+        asked.set(asked.get() + 1);
+        asked.get() < 2
+    };
+    assert!(tree.evict_tenant_by_size_until(0, &stop_on_second));
+    assert_eq!(
+        asked.get(),
+        2,
+        "asked at entry, then at the walk's first check"
+    );
+    assert_eq!(
+        tree.total_char_size(),
+        full,
+        "the walk stopped, evicting nothing"
+    );
+    assert!(!tree.evict_tenant_by_size_until(0, &|| true));
+    assert_eq!(tree.total_char_size(), 0);
+}
+
+/// A stop lands while the pass evicts too, not only while it walks:
+/// `keep_going` is asked every `CANCEL_CHECK_EVERY` entries taken off the
+/// heap, so an eviction the walk let through stops within that many entries.
+#[test]
+fn test_eviction_stops_while_it_evicts() {
+    let tree = Tree::new();
+    for t in 0..(3 * CANCEL_CHECK_EVERY) as u32 {
+        tree.insert_text(
+            &format!(
+                "{}{t:05}",
+                char::from_u32(0x20000 + t).expect("a CJK ideograph")
+            ),
+            "tenant",
+        );
+    }
+    let full = tree.total_char_size();
+    // True at entry and through the walk's checks (3 × CANCEL_CHECK_EVERY
+    // nodes walked, asked 3 times), false from the first check of the
+    // evicting loop.
+    let asked = std::cell::Cell::new(0usize);
+    let walk_only = || {
+        asked.set(asked.get() + 1);
+        asked.get() <= 4
+    };
+    assert!(tree.evict_tenant_by_size_until(0, &walk_only));
+    let left = tree.total_char_size();
+    assert!(left < full, "the walk finished and eviction began");
+    assert!(left > 0, "the stop landed while evicting, not after");
+    let per_leaf = full / (3 * CANCEL_CHECK_EVERY);
+    assert!(
+        full - left <= CANCEL_CHECK_EVERY * per_leaf,
+        "stopped within {CANCEL_CHECK_EVERY} entries: {} of {full} evicted",
+        full - left
+    );
+}
+
+/// A stop is asked for before the eviction starts, so a tree smaller than
+/// one check's worth of nodes stops too, untouched.
+#[test]
+fn test_eviction_stops_before_it_starts() {
+    let tree = Tree::new();
+    tree.insert_text("aaaa", "t");
+    let full = tree.total_char_size();
+    assert!(tree.evict_tenant_by_size_until(0, &|| false));
+    assert_eq!(tree.total_char_size(), full);
+}
+
+/// A stopped eviction puts the hash sweep off, one in a row at most: after
+/// a second stop in a row, an entry whose node is gone has left the map.
+#[test]
+fn test_a_second_stop_in_a_row_sweeps_the_hash_map() {
+    let tree = Tree::new();
+    for t in 0..(3 * CANCEL_CHECK_EVERY) as u32 {
+        tree.insert_text(
+            &format!(
+                "{}{t:05}",
+                char::from_u32(0x20000 + t).expect("a CJK ideograph")
+            ),
+            "tenant",
+        );
+    }
+    // An entry naming no live node, as one that crossed its node's detach.
+    tree.hashed.insert(u64::MAX, Weak::new());
+    let asked = std::cell::Cell::new(0usize);
+    let stop_on_second = || {
+        asked.set(asked.get() + 1);
+        asked.get() < 2
+    };
+    assert!(tree.evict_tenant_by_size_until(0, &stop_on_second));
+    assert!(
+        tree.hashed.contains_key(&u64::MAX),
+        "the first stop puts it off"
+    );
+    asked.set(0);
+    assert!(tree.evict_tenant_by_size_until(0, &stop_on_second));
+    assert!(!tree.hashed.contains_key(&u64::MAX), "the second sweeps");
+    assert!(tree.total_char_size() > 0, "both stopped inside the walk");
+}
