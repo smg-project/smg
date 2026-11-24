@@ -15,13 +15,19 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import hashlib
 import json
 import os
+import random
 import subprocess
 import sys
+import uuid
 from dataclasses import dataclass, field
-from math import comb
+from math import comb, isfinite
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import guarded_cli as budget_guard
 
 EXIT_OK = 0
 EXIT_REGRESSION = 1
@@ -32,8 +38,10 @@ EXIT_INCOMPLETE = 2
 class Arm:
     name: str
     base_url: str
-    scores: dict[str, dict[str, float]] = field(default_factory=dict)
+    scores: dict[str, dict[str, object]] = field(default_factory=dict)
     timed_out: list[str] = field(default_factory=list)  # domains killed by --run-timeout
+    invocations: dict[str, dict[str, object]] = field(default_factory=dict)
+    budget: dict | None = None
 
 
 def passk(num_success: int, num_trials: int, k: int) -> float:
@@ -45,34 +53,266 @@ def passk(num_success: int, num_trials: int, k: int) -> float:
     return comb(num_success, k) / comb(num_trials, k)
 
 
-def load_results(raw: dict) -> list[dict]:
-    """Flatten τ²-bench results.json to [{task_id, reward}] (one record per trial).
+class InfrastructureResults(ValueError):
+    """Pinned tau2 placeholders are unscored obligations, never synthetic zeroes."""
 
-    Validated schema (tau2-bench 1.0.0, recon d8e915f): the top-level Results
-    object has a `simulations` list; each SimulationRun carries `task_id` and
-    `reward_info.reward` (0.0/1.0). (`simulation_index[].reward` mirrors it.)
-    """
+    def __init__(self, unscored: list[dict], scored: list[dict]):
+        super().__init__(f"{len(unscored)} infrastructure-error simulations remain unscored")
+        self.unscored = unscored
+        self.scored = scored
+
+
+class InvalidResults(ValueError):
+    """Malformed rows remain invalid without erasing valid unscored obligations."""
+
+    def __init__(self, invalid_rows: list[dict], unscored: list[dict], scored: list[dict]):
+        super().__init__("Malformed simulation rows")
+        self.invalid_rows = invalid_rows
+        self.unscored = unscored
+        self.scored = scored
+
+
+def load_results(raw: dict) -> list[dict]:
+    """Keep every pinned SDK obligation; never normalize unknown errors to zero."""
+    if not isinstance(raw, dict) or not isinstance(raw.get("simulations"), list):
+        raise ValueError("results must contain a simulations list")
     out: list[dict] = []
-    for s in raw["simulations"]:
-        out.append({"task_id": str(s["task_id"]), "reward": float(s["reward_info"]["reward"])})
+    unscored: list[dict] = []
+    invalid: list[dict] = []
+    for index, s in enumerate(raw["simulations"]):
+
+        def reject(kind):
+            # Only static categories and row offsets: no provider text or raw rows.
+            invalid.append({"row_index": index, "kind": kind})
+
+        if not isinstance(s, dict) or "reward_info" not in s:
+            reject("missing_reward_schema")
+            continue
+        if type(s.get("task_id")) not in (str, int) or not str(s["task_id"]):
+            reject("missing_task_identity")
+            continue
+        identity = {"task_id": str(s["task_id"]), "trial": s.get("trial")}
+        if "seed" in s:
+            identity["seed"] = s["seed"]
+        info = s["reward_info"]
+        if s.get("termination_reason") == "infrastructure_error":
+            if (
+                info is not None
+                or type(identity["trial"]) is not int
+                or identity["trial"] < 0
+                or type(s.get("seed")) is not int
+            ):
+                reject("contradictory_infrastructure_placeholder")
+                continue
+            error_info = s.get("info")
+            error_type = error_info.get("error_type") if isinstance(error_info, dict) else None
+            if (
+                not isinstance(error_type, str)
+                or not error_type.isidentifier()
+                or len(error_type) > 80
+            ):
+                error_type = "UnspecifiedError"
+            unscored.append(
+                {**identity, "termination_reason": "infrastructure_error", "error_type": error_type}
+            )
+            continue
+        if not isinstance(info, dict) or type(info.get("reward")) not in (int, float):
+            reject("malformed_reward")
+            continue
+        try:
+            reward = float(info["reward"])
+        except OverflowError:
+            reject("nonfinite_reward")
+            continue
+        if not isfinite(reward):
+            reject("nonfinite_reward")
+            continue
+        out.append({**identity, "reward": reward})
+    # All rows are inspected regardless of ordering, including schema-error
+    # siblings. Their diagnostics cannot waive a valid infrastructure obligation.
+    if invalid:
+        raise InvalidResults(invalid, unscored, out)
+    if unscored:
+        raise InfrastructureResults(unscored, out)
     return out
 
 
-def domain_scores(results: list[dict], k: int) -> dict[str, float]:
+def trial_seeds(configured_seed: int, num_trials: int) -> list[int]:
+    """Pinned tau2 batch.py seeds once, then draws one randint per trial."""
+    rng = random.Random(configured_seed)
+    return [rng.randint(0, 1000000) for _ in range(num_trials)]
+
+
+def domain_scores(results: list[dict], k: int) -> dict[str, object]:
     """pass1 = mean reward over all trials; passk = mean over tasks of C(c,k)/C(n,k).
 
     Also reports the sample sizes behind those numbers: n_tasks (pass^k denominator)
     and n_sims (total trials = pass^1 denominator), so the report can show how much
     data backs each cell (and expose arm asymmetry when a domain is missing).
     """
+    if not results:
+        raise ValueError("no simulations were executed")
     by_task: dict[str, list[float]] = {}
+    task_trials: dict[str, list[int | None]] = {}
+    task_trial_seeds: dict[str, list[dict]] = {}
     for r in results:
         by_task.setdefault(r["task_id"], []).append(r["reward"])
+        task_trials.setdefault(r["task_id"], []).append(r.get("trial"))
+        task_trial_seeds.setdefault(r["task_id"], []).append(
+            {"trial": r.get("trial"), "seed": r.get("seed")}
+        )
     all_rewards = [x for xs in by_task.values() for x in xs]
     pass1 = sum(all_rewards) / len(all_rewards) if all_rewards else 0.0
     per_task = [passk(sum(1 for x in xs if x >= 1.0), len(xs), k) for xs in by_task.values()]
     passk_val = sum(per_task) / len(per_task) if per_task else 0.0
-    return {"pass1": pass1, "passk": passk_val, "n_tasks": len(by_task), "n_sims": len(all_rewards)}
+    return {
+        "pass1": pass1,
+        "passk": passk_val,
+        "n_tasks": len(by_task),
+        "n_sims": len(all_rewards),
+        "task_trials": task_trials,
+        "task_trial_seeds": task_trial_seeds,
+    }
+
+
+def prepare_expected_tasks(domains: list[str], num_tasks: int, num_trials: int, seed: int) -> dict:
+    """Offline selection using the caller's pinned tau2 install, before any LLM call."""
+    from tau2.data_model.simulation import TextRunConfig
+    from tau2.runner.batch import _load_run_tasks
+
+    selected = {}
+    for domain in domains:
+        config = TextRunConfig(
+            domain=domain,
+            agent="llm_agent",
+            task_split_name="base",
+            num_tasks=num_tasks or None,
+            num_trials=num_trials,
+            seed=seed,
+        )
+        ids = [str(task.id) for task in _load_run_tasks(config)]
+        if not ids or len(ids) != len(set(ids)):
+            raise ValueError(f"empty or duplicate expected tasks for {domain}")
+        selected[domain] = ids
+    return {"schema_version": 1, "domains": selected, "num_trials": num_trials, "seed": seed}
+
+
+def read_expected_tasks(path: Path, domains: list[str], k: int, seed: int) -> dict:
+    data = json.loads(path.read_text())
+    if not isinstance(data, dict):
+        raise ValueError("expected task manifest must be an object")
+    if data.get("schema_version") != 1 or data.get("num_trials") != k or data.get("seed") != seed:
+        raise ValueError("expected task manifest schema/trials/seed mismatch")
+    selected = data.get("domains")
+    if not isinstance(selected, dict) or set(selected) != set(domains):
+        raise ValueError("expected task manifest domains mismatch")
+    for domain, ids in selected.items():
+        if (
+            not isinstance(ids, list)
+            or not ids
+            or any(not isinstance(task, str) or not task for task in ids)
+            or len(ids) != len(set(ids))
+        ):
+            raise ValueError(f"invalid expected task IDs for {domain}")
+    return selected
+
+
+def coverage_problem(
+    scores: dict, expected: list[str] | None, k: int, seed: int = 300
+) -> str | None:
+    if not expected:
+        return "missing expected task manifest"
+    manifest = scores.get("task_trials")
+    if not isinstance(manifest, dict) or not manifest:
+        return "missing task/trial identity manifest"
+    if set(manifest) != set(expected):
+        return "task IDs differ from expected selection"
+    for task, trials in manifest.items():
+        if (
+            not isinstance(trials, list)
+            or any(type(trial) is not int for trial in trials)
+            or sorted(trials) != list(range(k))
+        ):
+            return f"missing, duplicate or unexpected trials for task {task}"
+    if scores.get("n_tasks") != len(manifest) or scores.get("n_sims") != len(manifest) * k:
+        return "sample counts disagree with task/trial identity manifest"
+    return seed_identity_problem(scores, expected, k, seed)
+
+
+def seed_identity_problem(
+    scores: dict, expected: list[str] | None, k: int, seed: int
+) -> str | None:
+    """Scored or saved rows must prove the pinned runner's exact trial seeds."""
+    if (
+        not isinstance(expected, list)
+        or not expected
+        or any(not isinstance(task, str) or not task for task in expected)
+        or len(expected) != len(set(expected))
+    ):
+        return "missing or invalid expected task identity manifest"
+    identities = scores.get("task_trial_seeds")
+    if not isinstance(identities, dict) or set(identities) != set(expected):
+        return "missing task/trial/seed identity manifest"
+    seeds = trial_seeds(seed, k)
+    for task, rows in identities.items():
+        if (
+            not isinstance(rows, list)
+            or len(rows) != k
+            or any(
+                not isinstance(row, dict)
+                or type(row.get("trial")) is not int
+                or not 0 <= row["trial"] < k
+                or type(row.get("seed")) is not int
+                or row["seed"] != seeds[row["trial"]]
+                for row in rows
+            )
+            or sorted(row["trial"] for row in rows) != list(range(k))
+        ):
+            return f"missing, duplicate or unexpected trial seeds for task {task}"
+    return None
+
+
+def prepare_budget(args=None):
+    def value(name):
+        return (
+            getattr(args, name, None)
+            if args is not None
+            else os.environ.get("TAU2_" + name.upper())
+        )
+
+    policy_path, contexts_path, ledger_path = (
+        value(k) for k in ("budget_policy", "budget_contexts", "budget_ledger")
+    )
+    contexts_sha = value("budget_contexts_sha256")
+    if not all((policy_path, contexts_path, ledger_path, contexts_sha)):
+        raise budget_guard.BudgetError(
+            "Explicit paid policy, independently verified contexts and ONE ledger required"
+        )
+    policy, _ = budget_guard.load_policy(policy_path, contexts_path, contexts_sha)
+    if value("budget_scope") != policy.scope_id:
+        raise budget_guard.BudgetError("Explicit approved run/job scope must match policy")
+    # Explicit guarded_cli --initialize is the sole creator, before either arm.
+    budget_guard.Ledger(ledger_path, policy, create=False)
+    return dict(
+        policy_path=str(Path(policy_path).resolve()),
+        contexts_path=str(Path(contexts_path).resolve()),
+        contexts_sha256=contexts_sha,
+        ledger_path=str(Path(ledger_path).resolve()),
+        scope_id=policy.scope_id,
+    )
+
+
+def final_budget(baseline, candidate):
+    if not baseline.budget or baseline.budget != candidate.budget:
+        raise budget_guard.BudgetError(
+            "Both saved arms must bind the same policy/scope/shared ledger"
+        )
+    state = budget_guard.read_descriptor(baseline.budget).audit()
+    if state["halted"] or state["pending"] or state["unknown"]:
+        raise budget_guard.BudgetError(
+            "Shared paid budget halted, pending or unknown after all arms completed"
+        )
+    return state
 
 
 def run_tau2(
@@ -88,6 +328,10 @@ def run_tau2(
     data_dir: Path,
     request_timeout: int = 0,
     run_timeout: int = 0,
+    expected_task_ids: list[str] | None = None,
+    seed: int = 300,
+    budget_descriptor: dict | None = None,
+    tau2_python: str | None = None,
 ) -> None:
     """Run `tau2 run` for one arm+domain, then read back its results.json.
 
@@ -103,7 +347,48 @@ def run_tau2(
     subprocess so a wedged `tau2 run` is killed and its domain left unscored (the
     report renders "—") rather than blocking forever. Both are opt-in (0 = off).
     """
-    save_to = f"ab_{arm.name}_{domain}"
+    # A failed/new run must never resume or score a previous invocation's files.
+    invocation_id = uuid.uuid4().hex
+    save_to = f"ab_{invocation_id}"
+    results_json = data_dir / "simulations" / save_to / "results.json"
+    invocation = {
+        "invocation_id": invocation_id,
+        "arm": arm.name,
+        "domain": domain,
+        "configured_seed": seed,
+        "trial_seeds": trial_seeds(seed, num_trials),
+        "results_path": str(results_json),
+        "status": "running",
+        "exit_code": None,
+    }
+    arm.invocations[domain] = invocation
+    arm.scores.pop(domain, None)
+    arm.timed_out = [d for d in arm.timed_out if d != domain]
+
+    def fail(kind: str, stage: str, error: Exception | None = None) -> None:
+        invocation.update(status="failed", failure_kind=kind, failure_stage=stage)
+        if error is not None:
+            invocation["exception_type"] = type(error).__name__
+        print(
+            f"WARNING: [{arm.name}/{domain}] invocation {invocation_id}: {kind} ({stage})",
+            file=sys.stderr,
+        )
+
+    if os.path.lexists(results_json.parent):
+        fail("output_exists", "preflight")
+        return
+
+    if budget_descriptor is None:
+        fail("missing_budget", "budget")
+        return
+    arm.budget = budget_descriptor
+    try:
+        if budget_guard.read_descriptor(budget_descriptor).summary()["halted"]:
+            raise budget_guard.BudgetError("Shared paid budget is halted")
+    except (OSError, ValueError, KeyError) as error:
+        fail("invalid_budget", "budget", error)
+        return
+
     agent_llm_args: dict[str, object] = {
         "api_base": arm.base_url.rstrip("/") + "/v1",
         "api_key": "smg-local",
@@ -114,8 +399,32 @@ def run_tau2(
         agent_llm_args["timeout"] = request_timeout
     agent_args = json.dumps(agent_llm_args)
     user_args = json.dumps({"temperature": 0.0})
+    interpreter = tau2_python or str(Path(tau2).parent / "python")
     cmd = [
-        tau2,
+        interpreter,
+        "-I",
+        str(Path(__file__).with_name("guarded_cli.py")),
+        "--policy",
+        budget_descriptor["policy_path"],
+        "--contexts",
+        budget_descriptor["contexts_path"],
+        "--contexts-sha256",
+        budget_descriptor["contexts_sha256"],
+        "--ledger",
+        budget_descriptor["ledger_path"],
+        "--scope",
+        budget_descriptor["scope_id"],
+        "--arm",
+        arm.name,
+        "--domain",
+        domain,
+        "--invocation",
+        invocation_id,
+        "--local-model",
+        agent_model,
+        "--local-url",
+        arm.base_url,
+        "--",
         "run",
         "--domain",
         domain,
@@ -132,6 +441,9 @@ def run_tau2(
         "--save-to",
         save_to,
     ]
+    cmd += ["--agent", "llm_agent", "--task-split-name", "base", "--seed", str(seed)]
+    if expected_task_ids:
+        cmd += ["--task-ids", *expected_task_ids]
     if num_tasks > 0:
         cmd += ["--num-tasks", str(num_tasks)]
     if max_concurrency > 0:
@@ -144,44 +456,131 @@ def run_tau2(
     env["TAU2_DATA_DIR"] = str(data_dir)
     try:
         proc = subprocess.run(cmd, env=env, check=False, timeout=(run_timeout or None))
-    except subprocess.TimeoutExpired:
-        # tau2 is a single in-process asyncio run (no forked workers), so run() has
-        # already SIGKILLed it. Leave the domain unscored and move on; the servers
-        # are torn down by the workflow's own cleanup/nuke_gpus trap.
-        print(
-            f"WARNING: [{arm.name}/{domain}] timed out after {run_timeout}s; killed",
-            file=sys.stderr,
-        )
+    except subprocess.TimeoutExpired as error:
+        # subprocess.run has killed/reaped its child. Even a partial result from
+        # that invocation cannot establish a completed simulation domain.
         arm.timed_out.append(domain)
+        fail("timeout", "cli", error)
         return
+    except OSError as error:
+        fail("launch_error", "cli", error)
+        return
+    invocation["exit_code"] = proc.returncode
     if proc.returncode != 0:
-        print(f"WARNING: [{arm.name}/{domain}] exited {proc.returncode}", file=sys.stderr)
-    results_json = data_dir / "simulations" / save_to / "results.json"
+        # Do not interpret a generic process exit as an API/provider failure or
+        # accept partial files the failed command happened to write.
+        fail("nonzero_exit", "cli")
+        return
     try:
-        arm.scores[domain] = domain_scores(
-            load_results(json.loads(results_json.read_text())), k=num_trials
+        # B may legitimately be in flight while A returns; only A's requests are
+        # required settled here. The GLOBAL pending/halt gate runs after join/diff.
+        own = budget_guard.read_descriptor(budget_descriptor).audit(invocation_id)
+        if own["pending"] or own["unknown"]:
+            fail("invocation_budget_incomplete", "budget")
+            return
+        if results_json.is_symlink() or results_json.parent.is_symlink():
+            raise ValueError("results must belong to the fresh invocation directory")
+        body = results_json.read_bytes()
+        invocation["results_sha256"] = hashlib.sha256(body).hexdigest()
+        scores = domain_scores(load_results(json.loads(body)), k=num_trials)
+        if issue := coverage_problem(scores, expected_task_ids, num_trials, seed):
+            fail("incomplete_results", "results")
+            invocation["coverage_problem"] = issue
+            invocation["seed_identity_invalid"] = bool(
+                seed_identity_problem(scores, expected_task_ids, num_trials, seed)
+            )
+            return
+        arm.scores[domain] = scores
+        invocation["status"] = "completed"
+    except InvalidResults as error:
+        invocation.update(
+            invalid_rows=error.invalid_rows,
+            n_infrastructure_errors=len(error.unscored),
+            unscored_cases=error.unscored,
+            scored_case_diagnostics=error.scored,
         )
-    except (FileNotFoundError, KeyError, ValueError) as e:
-        # tau2 may have died before writing results (OOM, engine death, API auth).
-        # Skip this domain rather than aborting — build_report renders "—" for a
-        # missing domain, so one failure doesn't discard the rest of the run.
-        print(f"WARNING: [{arm.name}/{domain}] no usable results ({e})", file=sys.stderr)
+        fail("invalid_results", "results", error)
+    except InfrastructureResults as error:
+        invocation.update(
+            n_infrastructure_errors=len(error.unscored),
+            unscored_cases=error.unscored,
+            scored_case_diagnostics=error.scored,
+        )
+        fail("infrastructure_error_results", "results", error)
+    except FileNotFoundError as error:
+        fail("missing_results", "results", error)
+    except (OSError, KeyError, ValueError, TypeError) as error:
+        fail("invalid_results", "results", error)
 
 
-def incompleteness(arm: Arm, domains: list[str]) -> str | None:
+def incompleteness(
+    arm: Arm, domains: list[str], expected_tasks: dict | None = None, k: int = 1, seed: int = 300
+) -> str | None:
     """Why this arm can't be compared (timed out / unscored domains), else None."""
     missing = [d for d in domains if d not in arm.scores]
-    if not missing and not arm.timed_out:
+    # Saved score files (sequential mode) can predate the raw-results guard.
+    # A zero score is valid, but it needs positive evidence of executed tasks.
+    no_samples = [
+        d
+        for d in domains
+        if d in arm.scores
+        and any(
+            type(arm.scores[d].get(key)) is not int or arm.scores[d][key] <= 0
+            for key in ("n_tasks", "n_sims")
+        )
+    ]
+    coverage = {
+        d: issue
+        for d in domains
+        if d in arm.scores
+        if (issue := coverage_problem(arm.scores[d], (expected_tasks or {}).get(d), k, seed))
+    }
+    invocation_failures = {}
+    for domain in domains:
+        invocation = arm.invocations.get(domain)
+        if invocation is None:
+            continue  # Legacy score files do not gain new invocation provenance.
+        if not isinstance(invocation, dict) or (
+            invocation.get("arm"),
+            invocation.get("domain"),
+        ) != (arm.name, domain):
+            invocation_failures[domain] = "invalid invocation identity"
+        elif invocation.get("status") != "completed" or invocation.get("exit_code") != 0:
+            invocation_failures[domain] = str(
+                invocation.get("failure_kind", "unfinished invocation")
+            )
+    if (
+        not missing
+        and not arm.timed_out
+        and not no_samples
+        and not coverage
+        and not invocation_failures
+    ):
         return None
     reason = f"no score for {len(missing)}/{len(domains)} domains"
     if arm.timed_out:
         reason += f"; timed out: {', '.join(arm.timed_out)}"
     if missing:
         reason += f"; unscored: {', '.join(missing)}"
+    if no_samples:
+        reason += f"; no valid samples: {', '.join(no_samples)}"
+    if coverage:
+        reason += "; coverage: " + ", ".join(f"{d}: {issue}" for d, issue in coverage.items())
+    if invocation_failures:
+        reason += "; invocation failure: " + ", ".join(
+            f"{d}: {issue}" for d, issue in invocation_failures.items()
+        )
     return reason
 
 
-def build_report(baseline: Arm, candidate: Arm, domains: list[str], k: int):
+def build_report(
+    baseline: Arm,
+    candidate: Arm,
+    domains: list[str],
+    k: int,
+    expected_tasks: dict | None = None,
+    seed: int = 300,
+):
     """Markdown + JSON; candidate − baseline; overall = unweighted mean."""
 
     def cell(x):
@@ -263,7 +662,9 @@ def build_report(baseline: Arm, candidate: Arm, domains: list[str], k: int):
         + " |"
     )
     lines.append("")
-    incomplete = {a.name: incompleteness(a, domains) for a in (baseline, candidate)}
+    incomplete = {
+        a.name: incompleteness(a, domains, expected_tasks, k, seed) for a in (baseline, candidate)
+    }
     incomplete = {n: r for n, r in incomplete.items() if r}
     for name, reason in incomplete.items():
         lines.append(f"> ⚠️ **Incomplete arm `{name}`** — {reason}.")
@@ -271,7 +672,7 @@ def build_report(baseline: Arm, candidate: Arm, domains: list[str], k: int):
         "",
         f"_N = simulations per arm (baseline/candidate) = tasks × {k} trials. "
         "Same model · engine · checkpoint · sampling · user-sim (gpt-5.2) on both arms "
-        "— only the frontend differs, so Δ is the parsing layer._",
+        "— a delta is comparable only when neither arm is marked incomplete._",
     ]
     overall_out = dict(overall)
     overall_out["n"] = {"baseline": nsum["b"], "candidate": nsum["c"]}
@@ -280,11 +681,15 @@ def build_report(baseline: Arm, candidate: Arm, domains: list[str], k: int):
             "name": baseline.name,
             "scores": baseline.scores,
             "timed_out": baseline.timed_out,
+            "invocations": baseline.invocations,
+            "budget": baseline.budget,
         },
         "candidate": {
             "name": candidate.name,
             "scores": candidate.scores,
             "timed_out": candidate.timed_out,
+            "invocations": candidate.invocations,
+            "budget": candidate.budget,
         },
         "incomplete": incomplete,
         "per_domain": rows,
@@ -306,6 +711,10 @@ def score_arm(
     data_dir: Path,
     request_timeout: int = 0,
     run_timeout: int = 0,
+    expected_tasks: dict | None = None,
+    seed: int = 300,
+    budget_descriptor: dict | None = None,
+    tau2_python: str | None = None,
 ) -> None:
     """Run tau2 for every domain against one already-serving arm, filling arm.scores."""
     for domain in domains:
@@ -321,6 +730,10 @@ def score_arm(
             data_dir=data_dir,
             request_timeout=request_timeout,
             run_timeout=run_timeout,
+            expected_task_ids=(expected_tasks or {}).get(domain),
+            seed=seed,
+            budget_descriptor=budget_descriptor,
+            tau2_python=tau2_python,
         )
 
 
@@ -338,6 +751,8 @@ def save_scores(arm: Arm, path: Path) -> None:
                 "base_url": arm.base_url,
                 "scores": arm.scores,
                 "timed_out": arm.timed_out,
+                "invocations": arm.invocations,
+                "budget": arm.budget,
             },
             indent=2,
         )
@@ -354,6 +769,8 @@ def load_scores(path: Path) -> Arm:
         base_url=data.get("base_url", ""),
         scores=data["scores"],
         timed_out=data.get("timed_out", []),
+        invocations=data.get("invocations", {}),
+        budget=data.get("budget"),
     )
 
 
@@ -361,7 +778,22 @@ def write_report_and_gate(
     baseline: Arm, candidate: Arm, domains: list[str], k: int, args: argparse.Namespace
 ) -> int:
     """Emit the markdown + JSON comparison and apply the completeness/regression gates."""
-    report_md, payload = build_report(baseline, candidate, domains, k)
+    report_md, payload = build_report(
+        baseline,
+        candidate,
+        domains,
+        k,
+        getattr(args, "expected_task_ids", None),
+        getattr(args, "seed", 300),
+    )
+    budget_failed = False
+    if getattr(args, "enforce_budget", False):
+        try:
+            payload["budget"] = final_budget(baseline, candidate)
+        except (OSError, ValueError, KeyError) as error:
+            budget_failed = True
+            payload["incomplete"]["budget"] = str(error)
+            report_md += f"\n\n> Incomplete paid budget: {error}."
     print("\n" + report_md)
     if args.out:
         args.out.write_text(report_md + "\n", encoding="utf-8")
@@ -381,7 +813,39 @@ def write_report_and_gate(
     # An incomplete arm outranks a regression: there is no trustworthy delta to gate on.
     for name, reason in payload["incomplete"].items():
         print(f"\nINCOMPLETE: arm {name} — {reason}", file=sys.stderr)
-    if payload["incomplete"] and not args.allow_incomplete:
+    # Neither diagnostics nor a quality-tolerance flag can turn unscored
+    # infrastructure obligations into a complete comparison (or waive paid gates).
+    unscored_infrastructure = any(
+        (
+            invocation.get("failure_kind") == "infrastructure_error_results"
+            or bool(invocation.get("unscored_cases"))
+        )
+        for arm in (baseline, candidate)
+        for invocation in arm.invocations.values()
+        if isinstance(invocation, dict)
+    )
+    if (
+        budget_failed
+        or unscored_infrastructure
+        or any(
+            invocation.get("seed_identity_invalid") is True
+            for arm in (baseline, candidate)
+            for invocation in arm.invocations.values()
+            if isinstance(invocation, dict)
+        )
+        or any(
+            seed_identity_problem(
+                scores,
+                (getattr(args, "expected_task_ids", None) or {}).get(domain),
+                k,
+                getattr(args, "seed", 300),
+            )
+            for arm in (baseline, candidate)
+            for domain, scores in arm.scores.items()
+            if domain in domains
+        )
+        or (payload["incomplete"] and not args.allow_incomplete)
+    ):
         exit_code = EXIT_INCOMPLETE
     return exit_code
 
@@ -439,13 +903,63 @@ def main() -> int:
     p.add_argument(
         "--allow-incomplete",
         action="store_true",
-        help="report a timed-out or unscored arm without failing (exit 2 otherwise)",
+        help=(
+            "allow partial quality reports; paid-budget failures and "
+            "unscored infrastructure still exit 2"
+        ),
     )
     p.add_argument("--out", type=Path)
     p.add_argument("--json-out", type=Path)
+    p.add_argument("--seed", type=int, default=300)
+    p.add_argument("--expected-tasks", type=Path, help="preselected domain -> task IDs manifest")
+    p.add_argument(
+        "--prepare-expected-tasks",
+        type=Path,
+        help="write offline selection manifest using the pinned tau2 interpreter, then exit",
+    )
+    p.add_argument("--tau2-python", help="exact pinned tau2 venv interpreter for the guarded child")
+    for name in (
+        "budget-policy",
+        "budget-contexts",
+        "budget-contexts-sha256",
+        "budget-ledger",
+        "budget-scope",
+    ):
+        p.add_argument(
+            "--" + name, default=os.environ.get("TAU2_" + name.upper().replace("-", "_"))
+        )
     args = p.parse_args()
+    args.enforce_budget = True
 
     domains = [d.strip() for d in args.domains.split(",") if d.strip()]
+
+    if (
+        args.num_trials <= 0
+        or args.num_tasks < 0
+        or not domains
+        or len(set(domains)) != len(domains)
+    ):
+        p.error("positive trials, nonnegative task cap and unique nonempty domains are required")
+    if args.prepare_expected_tasks:
+        if not args.data_dir:
+            p.error("manifest preparation requires --data-dir")
+        os.environ["TAU2_DATA_DIR"] = str(args.data_dir.resolve())
+        data = prepare_expected_tasks(domains, args.num_tasks, args.num_trials, args.seed)
+        args.prepare_expected_tasks.write_text(json.dumps(data, indent=2) + "\n")
+        return EXIT_OK
+    try:
+        args.expected_task_ids = (
+            read_expected_tasks(args.expected_tasks, domains, args.num_trials, args.seed)
+            if args.expected_tasks
+            else None
+        )
+    except (OSError, ValueError, TypeError) as error:
+        p.error(f"invalid expected task coverage: {error}")
+    if not args.expected_task_ids and not (args.diff_baseline or args.diff_candidate):
+        p.error("--expected-tasks is required before any paid simulation")
+    if args.expected_task_ids and args.num_tasks > 0:
+        if any(len(ids) > args.num_tasks for ids in args.expected_task_ids.values()):
+            p.error("task cap would truncate the expected task manifest")
 
     # Mode: diff two previously-saved score files (sequential mode, final step).
     if args.diff_baseline or args.diff_candidate:
@@ -457,6 +971,11 @@ def main() -> int:
         # scored still shows up as missing instead of silently vanishing.
         diff_domains = sorted(set(domains) | set(baseline.scores) | set(candidate.scores))
         return write_report_and_gate(baseline, candidate, diff_domains, args.num_trials, args)
+
+    try:
+        args.budget_descriptor = prepare_budget(args)
+    except (OSError, ValueError, KeyError) as error:
+        p.error(f"invalid paid budget: {error}")
 
     # Mode: score a single live arm and persist its scores (sequential mode, per arm).
     if args.score_arm:
@@ -475,6 +994,10 @@ def main() -> int:
             data_dir=args.data_dir,
             request_timeout=args.request_timeout,
             run_timeout=args.run_timeout,
+            expected_tasks=args.expected_task_ids,
+            seed=args.seed,
+            budget_descriptor=args.budget_descriptor,
+            tau2_python=args.tau2_python,
         )
         save_scores(arm, args.scores_out)
         print(f"[{arm.name}] scores -> {args.scores_out}: {arm.scores}")
@@ -503,6 +1026,10 @@ def main() -> int:
             data_dir=args.data_dir,
             request_timeout=args.request_timeout,
             run_timeout=args.run_timeout,
+            expected_tasks=args.expected_task_ids,
+            seed=args.seed,
+            budget_descriptor=args.budget_descriptor,
+            tau2_python=args.tau2_python,
         )
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:

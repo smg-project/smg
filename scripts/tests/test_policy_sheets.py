@@ -28,7 +28,8 @@ SHEETS = ROOT / "crates" / "policy_controller" / "tests" / "classic" / "sheets"
 ROW = re.compile(
     r"^\| `(?P<sheet>[a-z_]+\.json)` \| [^|]+ \| `(?P<commit>[0-9a-f]{40})` "
     r"\| (?:(?P<rows>\d+): (?P<sequence>\d+) sequence, (?P<drawn>\d+) drawn"
-    r"|(?P<pairs>\d+) pair rows|(?P<verdicts>\d+) verdict rows|(?P<demands>\d+) demand rows) "
+    r"|(?P<pairs>\d+) pair rows|(?P<verdicts>\d+) verdict rows"
+    r"|(?P<placements>\d+) placement rows|(?P<demands>\d+) demand rows) "
     r"\| `(?P<sha256>[0-9a-f]{64})` \| `(?P<recorder>[a-z_]+\.rs)` \|$"
 )
 # A line of the README's layout that opens a source root: the root, then what stands under it.
@@ -118,12 +119,25 @@ def test_a_row_states_its_sheets_commit_row_counts_and_sha256():
         data = (SHEETS / name).read_bytes()
         sheet = json.loads(data)
         names = [recorded["name"] for recorded in sheet["rows"]]
-        # A demand row holds answers and no outcome.
+        placements = row["placements"] is not None
         demands = row["demands"] is not None
-        outcomes = [] if demands else [recorded["outcome"] for recorded in sheet["rows"]]
+        outcomes = []
+        if not placements and not demands:
+            outcomes = [recorded["outcome"] for recorded in sheet["rows"]]
         assert len(set(names)) == len(names), f"{name}: a row name repeats"
         assert sheet["recorded_from"] == row["commit"], name
-        if demands:
+        if placements:
+            assert len(names) == int(row["placements"]), name
+            for recorded in sheet["rows"]:
+                # The HTTP transcription recorder issues one request per row; the gRPC
+                # recorder writes the exact request list next to its ordered answers.
+                requests = [{}] if name == "rank_pin.json" else recorded["requests"]
+                answers = recorded["answers"]
+                assert len(answers) == len(requests), f"{name}: a request with no answer"
+                assert all(set(answer) in ({"placed"}, {"refused"}) for answer in answers), (
+                    f"{name}: a row that is no placement row"
+                )
+        elif demands:
             for recorded in sheet["rows"]:
                 # A row that lists no request holds the answer to the one request its sheet asks.
                 asked = len(recorded["requests"]) if "requests" in recorded else 1
