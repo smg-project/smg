@@ -905,6 +905,67 @@ fn a_whole_read_forgets_the_sent_prefixes_of_an_id_that_stands_no_more() {
     assert_eq!(places(400), third, "the read keeps a worker that stands");
 }
 
+/// A worker replaced under its id by a registration of another model
+/// serves the first model no more: the records of sent prefixes forget it,
+/// as at a leave. A prompt of the first model the records named it for is
+/// placed by its request's seed again. A replacement that keeps the model
+/// keeps what the worker was sent. The lists name eight workers by their
+/// addresses, whatever the registry holds.
+#[test]
+fn a_replacement_that_takes_a_model_forgets_the_workers_sent_prefixes() {
+    let mut document = PolicySpec::preset("cache_aware").expect("a built-in preset");
+    document.generation = 1;
+    let spec = AppliedSpec::validate(&document).expect("the document validates");
+    let engine = PolicyEngine::new(spec);
+    let registry = registry(8);
+    engine.set_registry(handed(&registry));
+    let mut follow = started(&engine).expect("a registry was handed");
+    let list = pool(8);
+    let members = PublishedList::new(Arc::clone(&list));
+    let sent = |prompt: u32, seed: u64| {
+        let tokens: Vec<u32> = (prompt * 100_000..prompt * 100_000 + 1_024).collect();
+        let hashes = engine.prompt_hashes(MODEL, Some(&tokens), None, HashSeeds::PLAIN);
+        let mut asked = request();
+        asked.facts.seed = seed;
+        hashes.write_to(&mut asked.facts);
+        let asks = Asks::of(asked, Some(&members));
+        let decided = decided(&engine, &asks);
+        let pick = decided.decision.pick().expect("a pick");
+        pick.targets.first().expect("a target").position
+    };
+    let places = |seeds: u64| -> Vec<u32> {
+        (0..16)
+            .map(|prompt| sent(prompt, seeds + u64::from(prompt)))
+            .collect()
+    };
+    let first = places(0);
+    assert_eq!(places(100), first, "a prompt stays where it was sent");
+
+    // Each worker is replaced under its id by a registration of the same
+    // model: the records keep what it was sent.
+    for at in 0..8 {
+        replace(&registry, at);
+    }
+    drain(&engine, &mut follow);
+    assert_eq!(
+        places(150),
+        first,
+        "a replacement that keeps the model keeps its sent prefixes"
+    );
+
+    // Each worker registers another model under its id.
+    for at in 0..8 {
+        let standing = object(&registry, at);
+        assert!(registry.replace(&standing, ready_worker(&url(at), "model-b")));
+    }
+    drain(&engine, &mut follow);
+    assert_ne!(
+        places(200),
+        first,
+        "a worker that left the model keeps no sent prefix of it"
+    );
+}
+
 /// The engine's own task follows the registry its host handed: the workers
 /// that stand are told at its first upkeep, a removal and a registration
 /// behind it as they come, with no call of the host. A registry handed
