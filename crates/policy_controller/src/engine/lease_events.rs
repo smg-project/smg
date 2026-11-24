@@ -12,7 +12,10 @@
 //! rule of a single's words under either host. The host says who hears
 //! ([`Hearers`]): a controller's word may come behind a later document's
 //! start, where the engine that issued the lease is gone and the standing
-//! one counts the send.
+//! one counts the send. A host that holds its decisions keeps one engine
+//! object across its documents: behind a later document the stages that
+//! document kept hear the lease's words, and every count of sends in force
+//! takes its dispatch ([`of_host`]).
 //!
 //! A single request its binding's sessions rule keeps from the profile is
 //! told to the session table at its dispatch, and to no stage ahead of its
@@ -87,14 +90,19 @@ pub(crate) struct Hearers<'a, L> {
     pub listed: L,
 }
 
-/// The hearers of a host that holds its decisions, which has one engine: it
-/// issued the lease and counts its send, and a count takes a send at a rank
-/// it does not know yet. The test is a type of no size: such a host pays
-/// for none.
-pub(crate) fn one_engine(engine: &Engine) -> Hearers<'_, impl Fn(WorkerId, u16) -> bool + Copy> {
+/// The hearers of a host that holds its decisions. `issuing` is what stood
+/// when the lease was issued and hears its words: the engine in force, or
+/// behind a later document the stages that document kept. `sends` is the
+/// engine in force: each of its counts of sends takes the dispatch once,
+/// and a count takes a send at a rank it does not know yet. The test is a
+/// type of no size: such a host pays for none.
+pub(crate) fn of_host<'a>(
+    issuing: &'a Engine,
+    sends: &'a Engine,
+) -> Hearers<'a, impl Fn(WorkerId, u16) -> bool + Copy> {
     Hearers {
-        issuing: Some(engine),
-        sends: engine,
+        issuing: Some(issuing),
+        sends,
         listed: |_, _| true,
     }
 }
@@ -184,7 +192,10 @@ pub(crate) fn decode_as_issued(prefill: &Lease, first: &Target, session: Session
     })
 }
 
-/// Tells the stages what was `said` of a pair's lease, a side at a time.
+/// Tells the stages of `engine` what was `said` of a pair's lease, a side
+/// at a time, and the counts of sends of `sends` its dispatch: the two are
+/// one engine but behind a later document, as a single's hearers are
+/// ([`of_host`]).
 ///
 /// - A dispatch is told on the side it names: the send counts, the session
 ///   table, then the stages. The lease told is the side's as issued, under
@@ -210,6 +221,7 @@ pub(crate) fn decode_as_issued(prefill: &Lease, first: &Target, session: Session
 /// guard holds, which is the one its dispatch took.
 pub(crate) fn pair(
     engine: &Engine,
+    sends: &Engine,
     held: &HeldDecision<'_>,
     said: Said,
     micros: impl Fn(Instant) -> u64,
@@ -257,7 +269,7 @@ pub(crate) fn pair(
                 ..lease
             };
             let since = dispatch.since_decision_micros;
-            engine.dispatched_sent(&lease, &target, dispatch.side, since, || true);
+            sends.dispatched_sent(&lease, &target, dispatch.side, since, || true);
             engine.dispatched_table(&lease, &target, dispatch.side);
             if dispatch.side == Side::Decode && chosen {
                 // No call issued the side: this dispatch books it, so the

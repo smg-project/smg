@@ -4184,6 +4184,11 @@ impl HashDepth {
     }
 }
 
+/// A profile as [`check_profile`] built it: the profile, whether it keeps a
+/// session key on its worker, and the place in the list of counts of the
+/// one its stages read.
+type BuiltProfile = (Profile, bool, Option<usize>);
+
 /// One profile's stages, built when this build carries every one of them,
 /// and whether the profile keeps a session key on its worker over the
 /// overload veto: the plain ring alone decides its pick. `depth` is
@@ -4196,7 +4201,7 @@ fn check_profile(
     deferred: &mut Deferred,
     depth: &mut HashDepth,
     sent_credits: &mut Vec<Arc<DispatchCredit>>,
-) -> Result<Option<(Profile, bool)>, SpecError> {
+) -> Result<Option<BuiltProfile>, SpecError> {
     let catalog = from.catalog;
     let gates = gates_of(p, view);
     let at = At::new(format!("profiles.{name}"));
@@ -4347,6 +4352,10 @@ fn check_profile(
         Some(picker) if complete => {
             // A shared count stands in the list under the profile that
             // made it.
+            let read = sent.asked.as_ref().map(|asked| {
+                let shared = sent_credits.iter().position(|c| Arc::ptr_eq(c, asked));
+                shared.unwrap_or(sent_credits.len())
+            });
             if sent.shared.is_none() {
                 sent_credits.extend(sent.asked);
             }
@@ -4361,10 +4370,21 @@ fn check_profile(
                     picker,
                 },
                 by_key,
+                read,
             ))
         }
         _ => None,
     })
+}
+
+/// What a spec's profiles were built from: each profile's block by its
+/// name, and the two blocks every profile's build reads beside its own.
+#[cfg(feature = "in-process")]
+#[derive(Debug, Default)]
+struct BuiltFrom {
+    profiles: BTreeMap<String, ProfileSpec>,
+    view: ViewSpec,
+    signals: BTreeMap<String, SignalSpec>,
 }
 
 /// What a binding's checks read beside the binding.
@@ -5207,6 +5227,7 @@ impl PolicySpec {
         let has_shadows = self.bindings.iter().any(|binding| binding.shadow.is_some());
         let mut scoped_stages = BTreeMap::new();
         let mut sent_credits = Vec::new();
+        let mut sent_of = Vec::new();
         // Noted by name: the built vector lines up with the document's
         // positions only once nothing is deferred.
         let mut by_assignment = Vec::new();
@@ -5231,7 +5252,8 @@ impl PolicySpec {
                 &mut depth,
                 &mut sent_credits,
             )?;
-            if let Some((built, by_key)) = built {
+            if let Some((built, by_key, read)) = built {
+                sent_of.push(read);
                 if has_shadows {
                     if let Some(stage) = scoped_stage(&built) {
                         scoped_stages.insert(name.as_str(), stage);
@@ -5332,6 +5354,11 @@ impl PolicySpec {
             .windows(2)
             .all(|pair| pair[0].profile < pair[1].profile));
         engine.sent_credits = sent_credits;
+        #[cfg(feature = "in-process")]
+        {
+            engine.sent_of = sent_of;
+            engine.stage_table = Some(catalog.own);
+        }
         engine.set_explain_sample(self.explain.sample);
         engine.limit_report_age(self.view.max_report_age_ms);
         for at in sheds {
@@ -5527,6 +5554,10 @@ fn index_matching<'a>(
 #[derive(Debug)]
 pub struct AppliedSpec {
     engine: Engine,
+    /// What the engine's profiles were built from
+    /// ([`AppliedSpec::keep_from`]).
+    #[cfg(feature = "in-process")]
+    built_from: BuiltFrom,
     /// The digest of the document the engine was validated from; none for
     /// the unbound start, which has no document.
     digest: Option<Digest>,
@@ -5620,6 +5651,12 @@ impl AppliedSpec {
         let key_sources: Box<[_]> = document.bindings.iter().map(sources).collect();
         Self {
             engine,
+            #[cfg(feature = "in-process")]
+            built_from: BuiltFrom {
+                profiles: document.profiles.clone(),
+                view: document.view.clone(),
+                signals: document.signals.clone(),
+            },
             digest: Some(digest),
             depth,
             signal_columns,
@@ -5651,6 +5688,8 @@ impl AppliedSpec {
     pub fn unbound() -> Self {
         Self {
             engine: Engine::new(Vec::new(), Vec::new(), 0, Needs::default()),
+            #[cfg(feature = "in-process")]
+            built_from: BuiltFrom::default(),
             digest: None,
             depth: HashDepth::Unread,
             signal_columns: Arc::default(),
@@ -5731,6 +5770,26 @@ impl AppliedSpec {
     #[cfg(feature = "in-process")]
     pub(crate) fn share_sessions(&mut self, table: Arc<SessionTable>) {
         self.engine.share_sessions(table);
+    }
+
+    /// Keeps `standing`'s stage objects, and with them what the stages
+    /// hold, for each profile whose name and text did not change
+    /// ([`Engine::keep_from`]). A profile's build reads three blocks of its
+    /// spec: its own, the spec's `view` and its `signals`. So a new spec
+    /// that changes `view` or `signals` builds every profile anew. The
+    /// engine keeps nothing across two stage tables that may build another
+    /// stage under one name.
+    #[cfg(feature = "in-process")]
+    pub(crate) fn keep_from(&mut self, standing: &Self) {
+        let (new, old) = (&self.built_from, &standing.built_from);
+        if new.view != old.view || new.signals != old.signals {
+            return;
+        }
+        let same = |name: &str| {
+            let block = new.profiles.get(name);
+            block.is_some() && block == old.profiles.get(name)
+        };
+        self.engine.keep_from(&standing.engine, same);
     }
 
     /// The document's block size, in tokens: the size a request's blocks
@@ -8017,6 +8076,379 @@ mod tests {
                 .collect();
             assert_eq!(held, want, "{was:?}, then {later} under {limits:?}");
         }
+    }
+
+    /// A later spec keeps the stage objects of each profile whose name and
+    /// text did not change, and builds every other profile's anew. A count
+    /// of sends goes with its readers: where one of them changed, or the
+    /// first of them left, the count and each of its readers are built
+    /// new, and where a later one left, the count and the others stand.
+    /// A spec that changes `view` or `signals` builds every profile anew.
+    #[cfg(feature = "in-process")]
+    #[test]
+    fn a_later_spec_keeps_the_stages_of_a_profile_whose_text_did_not_change() {
+        let standing = AppliedSpec::validate(&doc(KEPT)).expect("a valid document");
+        type Edit = fn(&mut PolicySpec);
+        let filter_of_q: Edit = |spec| {
+            let q = spec.profiles.get_mut("q").expect("the profile");
+            q.filter.push("healthy".into());
+        };
+        let pick_of_r: Edit = |spec| {
+            let r = spec.profiles.get_mut("r").expect("the profile");
+            r.pick = "round-robin".into();
+        };
+        // The same stages by name under another weight: the text alone moved.
+        let weight_of_q: Edit = |spec| {
+            let q = spec.profiles.get_mut("q").expect("the profile");
+            let score = serde_json::from_str(r#"[{"least-load":{"weight":2}}]"#);
+            q.score = score.expect("a score");
+        };
+        // The first reader of the count goes: the count is made under `q`.
+        let without_p: Edit = |spec| {
+            spec.profiles.remove("p");
+            spec.bindings.remove(0);
+        };
+        // A later reader of the count goes: `p` still makes it, so it stands.
+        let without_q: Edit = |spec| {
+            spec.profiles.remove("q");
+            spec.bindings.remove(1);
+        };
+        let view: Edit = |spec| spec.view.max_report_age_ms = Some(900);
+        let signals: Edit = |spec| {
+            let signal = serde_json::from_str(r#"{"unit":"tokens"}"#);
+            spec.signals
+                .insert("free".into(), signal.expect("a signal"));
+        };
+        // The edit, the profiles kept and whether the count is.
+        let cases: [(Edit, [bool; 3], bool); 8] = [
+            (|_| {}, [true; 3], true),
+            (filter_of_q, [false, false, true], false),
+            (weight_of_q, [false, false, true], false),
+            (pick_of_r, [true, true, false], true),
+            (without_p, [false, false, true], false),
+            (without_q, [true, false, true], true),
+            (view, [false; 3], false),
+            (signals, [false; 3], false),
+        ];
+        for (at, (edit, profiles, count)) in cases.into_iter().enumerate() {
+            let mut later = doc(KEPT);
+            edit(&mut later);
+            let mut next = AppliedSpec::validate(&later).expect("a valid document");
+            next.keep_from(&standing);
+            assert_eq!(kept(&next, &standing), (profiles, count), "case {at}");
+        }
+    }
+
+    /// Three profiles for a case of the keep: `p` and `q` read one count of
+    /// sends, and `r` reads none.
+    #[cfg(feature = "in-process")]
+    const KEPT: &str = r#"{"apiVersion":"smg.policy/v1","profiles":{"p":{"score":["least-load"],"pick":"best"},"q":{"score":["least-load"],"pick":"best"},"r":{"pick":"random"}},"bindings":[{"match":{"model":"m"},"profile":"p"},{"match":{"model":"n"},"profile":"q"},{"match":{"model":"*"},"profile":"r"}]}"#;
+
+    /// Which of [`KEPT`]'s three profiles `next` holds as `standing`'s own
+    /// objects, each found by its name, and whether its first count of
+    /// sends is `standing`'s.
+    #[cfg(feature = "in-process")]
+    fn kept(next: &AppliedSpec, standing: &AppliedSpec) -> ([bool; 3], bool) {
+        let (new, old) = (next.engine(), standing.engine());
+        let named = |engine: &Engine, name: &str| {
+            let mut profiles = engine.profiles().iter();
+            profiles.find(|profile| profile.name == name).cloned()
+        };
+        let same = |name| match (named(new, name), named(old, name)) {
+            (Some(new), Some(old)) => Arc::ptr_eq(&new, &old),
+            _ => false,
+        };
+        let count = Arc::ptr_eq(&new.sent_credits[0], &old.sent_credits[0]);
+        (["p", "q", "r"].map(same), count)
+    }
+
+    /// The keep stands between two specs validated over the stock table,
+    /// or over one table of a host's own as it stood at both validations.
+    /// Two tables of a host that hold the same names keep nothing, and
+    /// neither does one table that took a stage between the two.
+    #[cfg(feature = "in-process")]
+    #[test]
+    fn stages_are_kept_over_the_stock_table_or_one_table_as_it_stood() {
+        let own = || {
+            let mut own = StageRegistry::builtin();
+            let added = own.filter("guest", || Box::new(ReadsHashes("guest")));
+            added.expect("a free name");
+            own
+        };
+        let over = |stages: &StageRegistry| {
+            let spec = AppliedSpec::validate_in(&doc(KEPT), stages, &[]);
+            spec.expect("a valid document")
+        };
+        let all = ([true; 3], true);
+        let none = ([false; 3], false);
+        let keeps = |standing: &AppliedSpec, stages: &StageRegistry| {
+            let mut next = over(stages);
+            next.keep_from(standing);
+            kept(&next, standing)
+        };
+        // Two stock tables, each built for its validation.
+        let stock = over(&StageRegistry::builtin());
+        assert_eq!(keeps(&stock, &StageRegistry::builtin()), all);
+        // One table of a host's own, at two validations.
+        let mut table = own();
+        let hosted = over(&table);
+        assert_eq!(keeps(&hosted, &table), all);
+        // The stock table behind a host's, and another table of the host's
+        // under the same names.
+        assert_eq!(keeps(&hosted, &StageRegistry::builtin()), none);
+        assert_eq!(keeps(&hosted, &own()), none);
+        // The one table again, behind a stage it took since.
+        let added = table.filter("late", || Box::new(ReadsHashes("late")));
+        added.expect("a free name");
+        assert_eq!(keeps(&hosted, &table), none);
+    }
+
+    /// A profile is kept only where its stages bear the standing profile's
+    /// names in their order: a factory that builds a stage of another name
+    /// at a later call has its profile built new, and kept once the name
+    /// stands again.
+    #[cfg(feature = "in-process")]
+    #[test]
+    fn a_profile_whose_factory_builds_a_stage_of_another_name_is_built_new() {
+        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+
+        let calls = AtomicUsize::new(0);
+        let mut own = StageRegistry::builtin();
+        // The registration asks the name once, then each validation builds.
+        let added = own.picker("turns", move || {
+            let call = calls.fetch_add(1, Relaxed);
+            Box::new(ReadsHashes(
+                ["turns", "turns", "another", "another"][call.min(3)],
+            ))
+        });
+        added.expect("a free name");
+        let document = doc(r#"{"apiVersion":"smg.policy/v1","profiles":{"p":{"pick":"turns"}}}"#);
+        let validated = || AppliedSpec::validate_in(&document, &own, &[]);
+        let same = |next: &AppliedSpec, standing: &AppliedSpec| {
+            let (new, old) = (next.engine(), standing.engine());
+            Arc::ptr_eq(&new.profiles()[0], &old.profiles()[0])
+        };
+        let standing = validated().expect("a valid document");
+        let mut next = validated().expect("a valid document");
+        next.keep_from(&standing);
+        assert!(!same(&next, &standing), "another name: built new");
+        let mut third = validated().expect("a valid document");
+        third.keep_from(&next);
+        assert!(same(&third, &next), "the same name again: kept");
+    }
+
+    /// A profile is kept only where its stages say of themselves what the
+    /// standing ones said. A factory that builds, at a later call, a stage
+    /// that answers otherwise one thing a validation or the engine reads
+    /// of a stage has its profile built new: the words it takes, the load
+    /// reports, a need, a mark, its ranks, the rule of its heads, its
+    /// warm-up ruling, a filter of another type under one name, the
+    /// lifecycle's calls, or no ask for the count of sends. Each
+    /// other reader of its count of sends is built new with it, and the
+    /// count takes over the standing one's sends. The same stage again is
+    /// kept.
+    #[cfg(feature = "in-process")]
+    #[test]
+    fn a_profile_whose_factory_builds_a_stage_that_says_otherwise_is_built_new() {
+        use std::sync::atomic::{AtomicU8, Ordering::Relaxed};
+
+        use crate::{
+            engine::{ScoreSpread, WarmUpRule},
+            policies::prefix_hash::HeadRule,
+            stages::filters::Healthy,
+            tracking::{EventKind, EventSet},
+        };
+
+        /// A scorer that says of itself what its factory read at its build.
+        #[derive(Debug)]
+        struct Says(u8);
+        impl Lifecycle for Says {
+            fn keeps_loads(&self) -> bool {
+                self.0 == 2
+            }
+
+            fn needs_lifecycle(&self) -> bool {
+                self.0 == 9
+            }
+
+            fn hears(&self) -> EventSet {
+                let heard = [EventSet::NONE, EventSet::NONE.with(EventKind::Completed)];
+                heard[usize::from(self.0 == 1)]
+            }
+        }
+        impl Scorer for Says {
+            fn name(&self) -> &'static str {
+                "says"
+            }
+
+            fn score(
+                &self,
+                _: &RequestFacts<'_>,
+                _: &[Candidate],
+                _: &[u32],
+                out: &mut [f32],
+            ) -> TieBand {
+                out.fill(0.0);
+                TieBand::NORMALIZED
+            }
+
+            fn needs(&self) -> Needs {
+                Needs {
+                    text: self.0 == 3,
+                    ..Needs::default()
+                }
+            }
+
+            fn places_by_key_text(&self) -> bool {
+                self.0 == 4
+            }
+
+            fn spread(&self) -> ScoreSpread {
+                ScoreSpread::Levels(if self.0 == 5 { 0.25 } else { 0.5 })
+            }
+
+            fn places_by_heads(&self) -> Option<HeadRule<'_>> {
+                let rule = HeadRule {
+                    depth: 1,
+                    boundaries: &[],
+                };
+                (self.0 == 6).then_some(rule)
+            }
+
+            fn warm_up_rule(&self) -> Option<WarmUpRule> {
+                let rule = WarmUpRule {
+                    window_micros: 1,
+                    blocks: 1,
+                    thin_ratio: 0.5,
+                };
+                (self.0 == 7).then_some(rule)
+            }
+        }
+        /// A guest filter that says what `healthy` says, and is no type of
+        /// the engine's own.
+        #[derive(Debug)]
+        struct Wraps(&'static str);
+        impl Filter for Wraps {
+            fn name(&self) -> &'static str {
+                self.0
+            }
+
+            fn keep(
+                &self,
+                facts: &RequestFacts<'_>,
+                row: &Candidate,
+                cx: &Constraints<'_>,
+            ) -> bool {
+                Healthy.keep(facts, row, cx)
+            }
+
+            fn refuses_by_reports(&self) -> bool {
+                Healthy.refuses_by_reports()
+            }
+
+            fn row_wise(&self) -> bool {
+                Healthy.row_wise()
+            }
+        }
+
+        let says = Arc::new(AtomicU8::new(u8::MAX));
+        let (scorer, filter) = (Arc::clone(&says), Arc::clone(&says));
+        let mut own = StageRegistry::builtin();
+        // The guest asks its build for the profile's count of sends, but at
+        // the last turn.
+        let added = own.scorer_with("says", move |build| {
+            let said = scorer.load(Relaxed);
+            if said != 10 {
+                let _count = build.dispatch_credit();
+            }
+            Ok(Box::new(Says(said)))
+        });
+        added.expect("a free name");
+        // The registration asks the name once: `guest`. A validation then
+        // builds a filter that names itself `healthy`, the engine's own
+        // type at the last turn.
+        let added = own.filter("guest", move || match filter.load(Relaxed) {
+            u8::MAX => Box::new(Wraps("guest")),
+            8 => Box::new(Healthy),
+            _ => Box::new(Wraps("healthy")),
+        });
+        added.expect("a free name");
+        // `p` and `q` read one count of sends, and `p` holds the guests.
+        let document = doc(
+            r#"{"apiVersion":"smg.policy/v1","profiles":{"p":{"filter":["guest"],"score":["says"],"pick":"best"},"q":{"score":["least-load"],"pick":"best"}},"bindings":[{"match":{"model":"m"},"profile":"p"},{"match":{"model":"*"},"profile":"q"}]}"#,
+        );
+        let validated = || AppliedSpec::validate_in(&document, &own, &[]);
+        let worker = crate::engine::WorkerId(7);
+        let target = crate::engine::Target {
+            id: worker,
+            ..Default::default()
+        };
+        let all = ([true, true, false], true);
+        let none = ([false; 3], false);
+        let turns = [
+            (1, "other words"),
+            (2, "load reports"),
+            (3, "another need"),
+            (4, "another mark"),
+            (5, "other ranks"),
+            (6, "a rule of heads"),
+            (7, "a warm-up ruling"),
+            (8, "a filter of another type"),
+            (9, "the lifecycle's calls"),
+            (10, "no ask for the count"),
+        ];
+        for (other, what) in turns {
+            says.store(0, Relaxed);
+            let standing = validated().expect("a valid document");
+            let lease = crate::tracking::Lease::default();
+            let engine = standing.engine();
+            engine.on_dispatched(&lease, &target, crate::tracking::Side::Single, 0);
+            says.store(other, Relaxed);
+            let mut next = validated().expect("a valid document");
+            next.keep_from(&standing);
+            assert_eq!(kept(&next, &standing), none, "{what}: both readers anew");
+            next.engine().succeed(standing.engine());
+            let taken = next.engine().sent_credits[0].credits.held(worker);
+            assert_eq!(taken, 1, "{what}: the count built new takes the send over");
+            let mut third = validated().expect("a valid document");
+            third.keep_from(&next);
+            assert_eq!(kept(&third, &next), all, "{what}: the same stage again");
+        }
+    }
+
+    /// A spec that keeps one count of sends and builds a second, under
+    /// settings no standing count has, counts a send behind it once in
+    /// each. The count kept is the standing object: it takes nothing over,
+    /// and the count built beside it takes nothing of it.
+    #[cfg(feature = "in-process")]
+    #[test]
+    fn a_count_kept_is_taken_over_by_no_count_built_beside_it() {
+        let one = r#"{"apiVersion":"smg.policy/v1","profiles":{"p":{"score":["least-load"],"pick":"best"}}}"#;
+        let two = r#"{"apiVersion":"smg.policy/v1","profiles":{"p":{"score":["least-load"],"pick":"best"},"q":{"score":["least-load"],"pick":"best","sent_ttl_ms":43}},"bindings":[{"match":{"model":"m"},"profile":"p"},{"match":{"model":"*"},"profile":"q"}]}"#;
+        let worker = crate::engine::WorkerId(7);
+        let target = crate::engine::Target {
+            id: worker,
+            ..Default::default()
+        };
+        let send = |spec: &AppliedSpec| {
+            let lease = crate::tracking::Lease::default();
+            spec.engine()
+                .on_dispatched(&lease, &target, crate::tracking::Side::Single, 0);
+        };
+        let standing = AppliedSpec::validate(&doc(one)).expect("a valid document");
+        send(&standing);
+        let mut next = AppliedSpec::validate(&doc(two)).expect("a valid document");
+        next.keep_from(&standing);
+        next.engine().succeed(standing.engine());
+        send(&next);
+        let counts = &next.engine().sent_credits;
+        let kept = Arc::ptr_eq(&counts[0], &standing.engine().sent_credits[0]);
+        assert!(kept, "the count of `p` is the standing one");
+        let held: Vec<_> = counts
+            .iter()
+            .map(|count| count.credits.held(worker))
+            .collect();
+        assert_eq!(held, [2, 1], "each send once in each count that stood");
     }
 
     #[test]
