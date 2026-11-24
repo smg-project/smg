@@ -196,7 +196,8 @@ type Teller =
 /// Each run builds its own where it tells, so one hold of a turn may load
 /// twice: the leases an issue ends may be told under a later world than
 /// the frames its apply found. Where a generation starts between the two,
-/// the engine that issued those leases does not hear their ends. That is
+/// the stages that issued those leases hear their ends only where the new
+/// generation kept them. That is
 /// a limit of this form, not its aim: one load for both runs undoes it.
 /// None is passed in by a caller: that cost every take a holder's
 /// building and its drop, whatever the take found.

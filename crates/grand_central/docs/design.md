@@ -793,13 +793,15 @@ takes over the sends of a standing one (`Engine::succeed`). Profiles whose
 stages read a count under the same `sent_ttl_ms` and `sent_report_delay_ms` read one count, and a
 document that states neither, as the one built from the routing settings does, puts them all under
 one. It holds no worker of its own: the registry that its host hands it (section 8.1) holds them. A
-controller builds a new engine object for each document it applies, and every stage of it new
-(section 10.2).
+controller builds a new engine object for each document it applies. That object keeps the stages of
+an unchanged profile from the object before it, by the same rules (section 10.2).
 
-The host says who hears a word of a lease issued under an earlier document. On a controller, behind
-a new document the engine that issued the lease is gone, and the standing one counts the send. In a
-gateway's own process the stages kept since the lease's document hear the word, every count of
-sends in force takes a dispatch, the session table hears it, and a stage built since hears nothing.
+A word of a lease issued under an earlier document is told by one rule, in a gateway's own process
+and on a controller: the stages kept since the lease's document hear it, every count of sends in
+force takes a dispatch, and a stage built since hears nothing. The session table hears it where
+the table stood at the lease's issue. A gateway's engine keeps one table for its life. A
+controller's table is the new engine object's own: it starts empty and hears nothing of an earlier
+lease, whose first decision claimed in the table that left (section 10.2).
 
 An entry of the engine reads the document through a reference its own thread keeps. The engine
 holds the number of the document in force in one atomic word, written behind the document at an
@@ -1365,9 +1367,9 @@ with each event (`DecisionEngine::say`). The crate has a guard for that, `Decisi
 (`tracking/decision_guard.rs`): it holds one decision's lease, has `dispatched`, `completed` and
 `released`, and releases at its drop. A controller keeps its leases in a file. It lends a lease
 back from that file in the guard's form, so one rule tells a lease's events under either host
-(`lease_events::single`, `lease_events::pair`). The host says who hears: behind a new document
-the engine that issued the lease is gone, and the standing one counts the send. In a gateway's
-own process the stages a later document kept hear the word, and every count of sends in force
+(`lease_events::single`, `lease_events::pair`). The host says who hears. Behind a new document the
+stages that document kept of the ones that stood at the issue hear a lease's events, and no stage
+it built new: in a gateway's own process and on a controller alike. Every count of sends in force
 takes the dispatch (section 5.1). A file meets events no guard says. An end is told once for each
 side of a pair that is still live. A release of a decode side behind its dispatch names the worker
 that side went to. It states the side's claim only where the side claimed that worker: behind a
@@ -2341,8 +2343,13 @@ the store steps for each lease on file. A record made of a worker object states 
 no zone.
 The asking gateway's reach, its wires and its standing vetoes are stated to the engine as places
 of the list. A new document is a new engine object: its session pins and its record of sent
-prompts start empty. That engine runs no task of its own. The store tells it each word of its
-membership, so the record forgets a worker that leaves, is replaced or serves a model no more. The
+prompts start empty. The stages of a profile whose name and text did not change do not start
+empty, under the rules of section 5.1: the new object keeps them from the one before it, with what
+they hold, and tells the members that stand to the stages it built new alone. A lease issued under
+the earlier document is told to the stages kept, and writes nothing to the new session pins. That
+engine runs no task of its own. The store tells it each word of its
+membership, so the record forgets a worker that leaves, is replaced, serves a model no more or
+takes another role. The
 engine's upkeep runs at each pass of the presence sweep, a tenth of the grace period: once a
 second, the period of the engine's own task in a gateway's process. A sessions rule's cap reads a
 key's requests on the worker object too: the store steps that count for the lease of each keyed

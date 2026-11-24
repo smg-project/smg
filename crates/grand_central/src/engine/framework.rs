@@ -3592,6 +3592,10 @@ pub struct Engine {
     /// made with it, or the one its host keeps across documents
     /// ([`Self::share_sessions`]).
     sessions: Arc<SessionTable>,
+    /// The generation from which a lease tells this engine's session
+    /// table: `0`, every lease, but on a view of generations older than
+    /// the table ([`Self::table_from`]).
+    sessions_from: u64,
     assignment: AssignmentStages,
     /// Per profile, what its stages ask of a decision beyond the profile's
     /// own run ([`Marks`]).
@@ -5179,6 +5183,7 @@ impl Engine {
             phase_needs,
             keyed,
             sessions,
+            sessions_from: 0,
             assignment: AssignmentStages::default(),
             marks,
             head_places,
@@ -5401,6 +5406,28 @@ impl Engine {
         hearing.sent_credits = counts.map(count).collect();
         hearing.sessions = Arc::clone(&self.sessions);
         hearing
+    }
+
+    /// This view tells its session table the leases issued under `first`
+    /// or a later generation, and no earlier one. `first` is the
+    /// generation the table was made under, where a host builds an engine
+    /// object for each of its documents: a lease of an earlier document
+    /// was issued over the table that left with that document's object,
+    /// and the claim its first decision made was made there. The table
+    /// matches a claim by its worker alone, so it would read that verdict
+    /// as a later decision's claim of the key on the same worker, and
+    /// withdraw it. The view's stages and its counts of sends hear such a
+    /// lease all the same.
+    ///
+    /// One side of such a lease claims in this table: a pair's decode that
+    /// a later call decides behind the new document, whose lease keeps the
+    /// pair's generation. Its words are skipped with the lease's others:
+    /// its dispatch confirms no claim and its refused commit takes none
+    /// back, and the claim stands for as long as the table holds the key.
+    #[cfg(feature = "in-process")]
+    pub(crate) fn table_from(mut self, first: u64) -> Self {
+        self.sessions_from = first;
+        self
     }
 
     /// The generations below this engine's own under which a profile or a
@@ -8673,13 +8700,15 @@ impl Engine {
     /// otherwise. A dispatch is told in parts: the counts of sends, this
     /// table, then the stages ([`Self::dispatched_stages`]), so a stage's
     /// call that unwinds leaves the table's entry written. Every teller of
-    /// a dispatch keeps that order, the trait's own entry among them.
+    /// a dispatch keeps that order, the trait's own entry among them. A
+    /// view of generations older than its table writes nothing for a lease
+    /// of theirs ([`Self::table_from`]).
     pub(crate) fn dispatched_table(&self, lease: &Lease, target: &Target, side: Side) {
         let dispatched = match (side, target.pair) {
             (Side::Decode, Some(pair)) => pair.decode_id,
             _ => target.id,
         };
-        if lease.session_verdict != SessionVerdict::None {
+        if lease.session_verdict != SessionVerdict::None && lease.generation >= self.sessions_from {
             self.sessions
                 .dispatched(lease.session, lease.session_verdict, dispatched);
         }
@@ -8692,9 +8721,11 @@ impl Engine {
     /// ([`Self::released_stages`]). An engine in its host's process tells
     /// the table each side a pair's release ends ahead of any stage, a
     /// decode stated for later among them: no stage hears that side's end,
-    /// and the pair's first decision made its claim.
+    /// and the pair's first decision made its claim. A view of generations
+    /// older than its table takes back no claim for a lease of theirs
+    /// ([`Self::table_from`]).
     pub(crate) fn released_table(&self, lease: &Lease, reason: ReleaseReason) {
-        if reason == ReleaseReason::CommitFailed {
+        if reason == ReleaseReason::CommitFailed && lease.generation >= self.sessions_from {
             if let SessionVerdict::Claimed(claimed) = lease.session_verdict {
                 self.sessions
                     .move_claim(lease.session, claimed, WorkerId(0));

@@ -11,7 +11,10 @@
 //! validated once.
 //!
 //! A new document is a new engine object, built by the front's constructor.
-//! Its session table and its record of sent prompts start empty.
+//! Its session table and its record of sent prompts start empty. The
+//! stages of a profile that did not change do not: an apply's document
+//! keeps the standing one's stage objects for it ([`Applied::after`]), and
+//! the two engine objects run the one set of them.
 //!
 //! The front a store builds runs no task of its own. The store tells it
 //! each word of its membership ([`Applied::on_membership`]), and the store's
@@ -126,6 +129,48 @@ impl Applied {
             Self { spec }
         };
         applied
+    }
+
+    /// `spec` as a store holds it behind the apply that puts it in place of
+    /// `standing`, the document the store runs. The new document first
+    /// keeps the standing one's stage objects, and with them what the
+    /// stages hold, for each profile that did not change
+    /// (`AppliedSpec::keep_from`): the keep an engine makes where it takes
+    /// a new document itself, with no rule added here. Its caller holds the
+    /// standing document still for the call. A build without the front
+    /// keeps nothing. `origin` and `counts` are [`Applied::new`]'s.
+    pub(crate) fn after(
+        standing: &AppliedSpec,
+        spec: AppliedSpec,
+        origin: Instant,
+        counts: &EngineCounts,
+    ) -> Self {
+        #[cfg(feature = "in-process")]
+        let spec = {
+            let mut spec = spec;
+            spec.keep_from(standing);
+            spec
+        };
+        #[cfg(not(feature = "in-process"))]
+        let _ = standing;
+        Self::new(spec, origin, counts)
+    }
+
+    /// Tells a change of membership to what this document built new: the
+    /// stages and the counts of sends made under its own generation, and
+    /// its session table. What it kept of the standing document heard each
+    /// member as it came, and is told nothing again. A store tells the list
+    /// of its members through this at the document's apply. Where the build
+    /// holds the front, the front tells it, under its catch of a store's
+    /// word ([`InProcess::on_membership_built_new`]): a stage that
+    /// panics at the list is held and counted, and the apply goes on. A
+    /// build without the front kept nothing: every stage is told, under no
+    /// catch.
+    pub(crate) fn tell_built_new(&self, word: &Membership<'_>) {
+        #[cfg(feature = "in-process")]
+        self.engine.on_membership_built_new(word);
+        #[cfg(not(feature = "in-process"))]
+        self.spec.engine().on_membership(word);
     }
 
     /// The front that decides under the document: the one engine object

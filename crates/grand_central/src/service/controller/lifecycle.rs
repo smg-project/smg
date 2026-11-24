@@ -22,8 +22,9 @@
 //!
 //! A frame whose lease is on file tells the engine that issued it, the
 //! generation's own, what became of the decision: its dispatch, its
-//! completion or its release. A generation that no longer stands is told
-//! nothing: the stages of a later one never saw the issue. A dispatch
+//! completion or its release. Behind a later generation's start the
+//! stages that one kept are told, and no stage it built new: such a stage
+//! never saw the issue. A dispatch
 //! alone goes further: it feeds the standing generation's counts of
 //! sends, whichever generation issued the lease, where the replica's
 //! worker objects still list the worker at the rank the dispatch names.
@@ -255,6 +256,9 @@ fn past(field: &'static str, number: u32, most: u32) -> Status {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    // What an applied document keeps of the stages, and who hears a lease
+    // of the document before it.
+    mod kept_stages;
     // The rule a guard's lease is told by.
     mod lease_on_file;
     mod pair_on_file;
@@ -1231,8 +1235,17 @@ pub(crate) mod tests {
     /// `generation` of the least-load preset, whose scorer reads its
     /// profile's count of sends.
     fn counted(generation: u64) -> AppliedSpec {
+        counted_under(generation, None)
+    }
+
+    /// [`counted`] with `limit` as its profile's time limit on a send. A
+    /// document that states another limit than the standing one builds the
+    /// profile and its count anew.
+    fn counted_under(generation: u64, limit: Option<u32>) -> AppliedSpec {
         let mut document = PolicySpec::preset("least_load").expect("a preset of this build");
         document.generation = generation;
+        let profile = document.profiles.get_mut("least_load");
+        profile.expect("the preset's profile").sent_ttl_ms = limit;
         let digest = document.digest().expect("the document digests");
         AppliedSpec::validate_digested(&document, digest, &StageRegistry::builtin(), &[])
             .expect("a preset of this build validates")
@@ -1241,8 +1254,17 @@ pub(crate) mod tests {
     /// Applies [`counted`] of `generation` and hands back that generation's
     /// count of sends.
     fn counting(store: &MemoryStore, generation: u64) -> Arc<DispatchCredit> {
+        counting_under(store, generation, None)
+    }
+
+    /// [`counting`] for [`counted_under`].
+    fn counting_under(
+        store: &MemoryStore,
+        generation: u64,
+        limit: Option<u32>,
+    ) -> Arc<DispatchCredit> {
         store
-            .apply(counted(generation))
+            .apply(counted_under(generation, limit))
             .expect("a later generation");
         store.deciding(|world| Arc::clone(&world.spec().engine().sent_credits[0]))
     }
@@ -1268,6 +1290,8 @@ pub(crate) mod tests {
     /// A dispatch enters the count of sends of the generation that stands,
     /// whichever generation issued its lease: the store tells the standing
     /// engine of every send, and a generation that left counts no more.
+    /// The standing generation states another limit, so its count is built
+    /// new.
     #[test]
     fn a_dispatch_of_an_older_generations_lease_enters_the_standing_generations_sends() {
         let store = MemoryStore::new();
@@ -1275,10 +1299,32 @@ pub(crate) mod tests {
         let served = ready(&store, "a", COUNTED, Role::Single, WireModes::HTTP);
         let first = counting(&store, 1);
         issued_on(&store, 1, 1, served, t0);
-        let standing = counting(&store, 2);
+        let standing = counting_under(&store, 2, Some(60_000));
+        assert!(!Arc::ptr_eq(&first, &standing), "a count built new");
         dispatched(&store, &open(&store, A), &a_dispatched(1), t0).expect("the frame reads");
         assert_eq!(sends(&standing, served), 1);
         assert_eq!(sends(&first, served), 0, "the generation that left");
+    }
+
+    /// A generation that states the profile as it stood keeps the
+    /// profile's count of sends: the standing count is the one object, with
+    /// the sends it holds. A dispatch of an older generation's lease is
+    /// counted in it once.
+    #[test]
+    fn an_apply_keeps_the_count_of_an_unchanged_profile_with_its_sends() {
+        let store = MemoryStore::new();
+        let t0 = Instant::now();
+        let served = ready(&store, "a", COUNTED, Role::Single, WireModes::HTTP);
+        let first = counting(&store, 1);
+        for id in 1..=2 {
+            issued_on(&store, id, 1, served, t0);
+        }
+        dispatched(&store, &open(&store, A), &a_dispatched(1), t0).expect("the frame reads");
+        let kept = counting(&store, 2);
+        assert!(Arc::ptr_eq(&first, &kept), "the count stands as one object");
+        assert_eq!(sends(&kept, served), 1);
+        dispatched(&store, &open(&store, A), &a_dispatched(2), t0).expect("the frame reads");
+        assert_eq!(sends(&kept, served), 2);
     }
 
     /// The `random` picker, whose call at a dispatch panics.
@@ -1377,7 +1423,8 @@ pub(crate) mod tests {
 
     /// A pair's dispatch is counted as a single's is: on the side's own
     /// worker, by the generation that stands, whichever issued the lease,
-    /// and at no rank of a worker that left.
+    /// and at no rank of a worker that left. The standing generation states
+    /// another limit, so its count is built new.
     #[test]
     fn a_pairs_dispatch_is_counted_by_the_standing_generation_where_its_worker_stands() {
         let store = Arc::new(MemoryStore::new());
@@ -1391,7 +1438,8 @@ pub(crate) mod tests {
         for (id, decode) in [(1, stays), (2, left)] {
             issued_pair(&store, (id, 1), (prefill, decode), LeaseState::ISSUED, t0);
         }
-        let standing = counting(&store, 2);
+        let standing = counting_under(&store, 2, Some(60_000));
+        assert!(!Arc::ptr_eq(&first, &standing), "a count built new");
         objects.follow(&*store);
         let row = WorkersStore::get(&*store, left).expect("the row");
         let removed = objects.remove(&store, left, row.revision);
