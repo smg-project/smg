@@ -15,7 +15,7 @@
 //!   cache and publish `AllBlocksCleared` (an engine restart, to the index).
 //! - `POST /admin/fault/{worker}/drop?batches=N`, `.../duplicate?batches=N`,
 //!   `.../swap?pairs=N`, `.../cut-streams`, `.../delay?ms=D`,
-//!   `.../restart-publisher`, `.../pause`, `.../resume`,
+//!   `.../load-lag?ms=D`, `.../restart-publisher`, `.../pause`, `.../resume`,
 //!   `.../fail?status=S[&count=N|&secs=T][&after_tokens=K][&stall_ms=M]` and
 //!   `GET /admin/fault/{worker}`: the fault hooks (see the README).
 //! - `GET /admin/ops/{worker}`: what the gateway's admin fan-out reached on
@@ -89,6 +89,7 @@ fn router(state: Arc<AdminState>) -> Router {
         .route("/admin/fault/{worker}/admit-delay", post(fault_admit_delay))
         .route("/admin/fault/{worker}/admit-rate", post(fault_admit_rate))
         .route("/admin/fault/{worker}/cold-shape", post(fault_cold_shape))
+        .route("/admin/fault/{worker}/load-lag", post(fault_load_lag))
         .route(
             "/admin/fault/{worker}/restart-publisher",
             post(fault_restart_publisher),
@@ -282,6 +283,7 @@ fn status_json(e: &Engine) -> Value {
         "admit_delay_ms": s.admit_delay_ms,
         "admit_per_sec": s.admit_per_sec,
         "cold_shape_ms": s.cold_shape_ms,
+        "load_lag_ms": s.load_lag_ms,
         "paused": s.paused,
         "generation": s.generation,
         "restarts": s.restarts,
@@ -421,7 +423,7 @@ fn fleet_rows(cfg: &Config) -> Vec<Value> {
 }
 
 fn engine_row(e: &Engine, cfg: &Config) -> Value {
-    let load = e.load();
+    let load = e.load_truth();
     json!({
         "worker": e.name(),
         "engine": "realistic",
@@ -643,6 +645,18 @@ async fn fault_cold_shape(
         Err(response) => return response,
     };
     apply(&worker, |e| e.fault_cold_shape_ms(ms))
+}
+
+/// The worker's load reports state its counts of `ms` milliseconds ago.
+async fn fault_load_lag(
+    Path(worker): Path<String>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let ms: u64 = match param(&q, "ms") {
+        Ok(v) => v,
+        Err(response) => return response,
+    };
+    apply(&worker, |e| e.fault_load_lag_ms(ms))
 }
 
 async fn fault_admit_rate(

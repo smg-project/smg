@@ -710,11 +710,41 @@ impl EngineShared {
     }
 
     /// Publish the actor's snapshot with the time of its last prefill pass.
+    /// While the load-lag hook is set the snapshot also joins the history a
+    /// trailing report is read from. A millisecond keeps the last snapshot
+    /// published in it, under that snapshot's own instant, so a report
+    /// states no count before the engine published it; the oldest entry is
+    /// never replaced, and of the entries older than the lag only the
+    /// newest stays, the one a report states now.
     fn publish(&self, state: &SchedulerState, snapshot: LoadSnapshot) {
-        *self.snapshot.write().unwrap_or_else(|p| p.into_inner()) = PublishedLoad {
+        let published = PublishedLoad {
             snapshot,
             prefill_at: state.prefill_at(),
         };
+        *self.snapshot.write().unwrap_or_else(|p| p.into_inner()) = published.clone();
+        // Read after the write: a hook set meanwhile starts from this snapshot.
+        let lag = Duration::from_millis(self.faults.load_lag_ms.load(Ordering::Relaxed));
+        if lag.is_zero() {
+            return;
+        }
+        let now = Instant::now();
+        let mut history = self
+            .faults
+            .load_history
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        while history
+            .get(1)
+            .is_some_and(|(at, _)| now.saturating_duration_since(*at) >= lag)
+        {
+            history.pop_front();
+        }
+        let millis = |at: Instant| at.saturating_duration_since(self.output_clock).as_millis();
+        let kept = history.len();
+        match history.back_mut() {
+            Some(last) if kept > 1 && millis(last.0) == millis(now) => *last = (now, published),
+            _ => history.push_back((now, published)),
+        }
     }
 }
 
@@ -724,6 +754,7 @@ impl EngineShared {
 /// applied where the snapshot is read ([`Engine::load`]), so an idle or
 /// paused engine stops reporting the rate a minute after that pass, as a
 /// servicer's tracker does once its samples expired.
+#[derive(Clone)]
 struct PublishedLoad {
     snapshot: LoadSnapshot,
     prefill_at: Option<Instant>,
@@ -740,8 +771,9 @@ impl PublishedLoad {
 
 /// Fault hooks the admin API switches on: batches lost on the wire, published
 /// twice or in the other order, event streams cut, delayed publishing,
-/// delayed admission, a frozen engine, a publisher restart, and requests
-/// answered with an error status, held back or cut mid-stream.
+/// delayed admission, a load report that trails the engine, a frozen
+/// engine, a publisher restart, and requests answered with an error
+/// status, held back or cut mid-stream.
 #[derive(Default)]
 struct Faults {
     /// Event batches still to lose on the wire.
@@ -788,6 +820,15 @@ struct Faults {
     /// new shape, during which the engine produces nothing while its load
     /// record keeps flowing and its silence grows.
     cold_shape_ms: AtomicU64,
+    /// How far a load report trails the engine, in ms (0 = none): a report
+    /// states the snapshot that stood this long before it is read, as an
+    /// engine whose counters trail its intake reports.
+    load_lag_ms: AtomicU64,
+    /// The snapshots a trailing report is read from, oldest first, each
+    /// with the instant it was published: the report that stood when the
+    /// lag was set, then what the engine published since, less the entries
+    /// a newer one older than the lag made of no use.
+    load_history: Mutex<VecDeque<(Instant, PublishedLoad)>>,
 }
 
 /// A request fault the admin API arms: what the worker answers instead of
@@ -854,6 +895,7 @@ pub(crate) struct FaultStatus {
     pub cut_total: u64,
     pub stalled_total: u64,
     pub cold_shape_ms: u64,
+    pub load_lag_ms: u64,
 }
 
 /// What the engine itself would serve from cache for a prompt right now.
@@ -950,6 +992,10 @@ const RECORD_CAPACITY: usize = 500_000;
 /// capacity: the servicers' load trackers drop their samples after a minute,
 /// and a worker idle that long is priced by the fallback again.
 const PREFILL_RATE_TTL: Duration = Duration::from_secs(60);
+
+/// The longest lag the load-lag hook takes, in ms: it bounds the history
+/// of snapshots a trailing report is read from.
+const MAX_LOAD_LAG_MS: u64 = 60_000;
 
 /// The process-wide shared KV tier (`--global-l3-blocks`): block keys in LRU
 /// order. A pass writes the blocks it completed once its time has passed
@@ -1248,6 +1294,34 @@ impl Engine {
             .store(ms, Ordering::Relaxed);
     }
 
+    /// Have every load report state the counts the engine published `ms`
+    /// milliseconds before the report is read (0 clears, a minute at most):
+    /// an engine whose counters trail its intake. The requests are served
+    /// on time. A lag set on an engine that had none starts from the report
+    /// that stands; one set over another keeps the history it has, and a
+    /// cleared one gives the history's room back.
+    pub(crate) fn fault_load_lag_ms(&self, ms: u64) {
+        let faults = &self.shared.faults;
+        let ms = ms.min(MAX_LOAD_LAG_MS);
+        let mut history = faults
+            .load_history
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let was = faults.load_lag_ms.swap(ms, Ordering::Relaxed);
+        if ms == 0 {
+            *history = VecDeque::new();
+        } else if was == 0 {
+            let standing = self
+                .shared
+                .snapshot
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone();
+            history.clear();
+            history.push_back((Instant::now(), standing));
+        }
+    }
+
     /// Let at most `per_sec` new requests per second into the engine (0
     /// clears); the rest wait their turn, unseen by the load record.
     pub(crate) fn fault_admit_per_sec(&self, per_sec: u64) {
@@ -1443,6 +1517,7 @@ impl Engine {
             cut_total: f.cut_total.load(Ordering::Relaxed),
             stalled_total: f.stalled_total.load(Ordering::Relaxed),
             cold_shape_ms: f.cold_shape_ms.load(Ordering::Relaxed),
+            load_lag_ms: f.load_lag_ms.load(Ordering::Relaxed),
         }
     }
 
@@ -1548,17 +1623,48 @@ impl Engine {
         self.load_at(Instant::now())
     }
 
-    /// [`Self::load`] as read at `now` (a test reads a minute ahead).
+    /// The engine's own counts, whatever lag the load-lag hook has a report
+    /// state them under: the ground truth the admin API's fleet states.
+    pub(crate) fn load_truth(&self) -> LoadSnapshot {
+        self.load_behind(Instant::now(), Duration::ZERO)
+    }
+
+    /// [`Self::load`] as read at `now` (a test reads a minute ahead), under
+    /// the lag of the load-lag hook.
     fn load_at(&self, now: Instant) -> LoadSnapshot {
-        let published = self
-            .shared
-            .snapshot
-            .read()
-            .unwrap_or_else(|p| p.into_inner());
-        let mut snapshot = published.snapshot.clone();
+        let lag = self.shared.faults.load_lag_ms.load(Ordering::Relaxed);
+        self.load_behind(now, Duration::from_millis(lag))
+    }
+
+    /// The report that stood `lag` before `now`, or the oldest kept where
+    /// the hook was set later than that; with no lag, the engine's own.
+    fn load_behind(&self, now: Instant, lag: Duration) -> LoadSnapshot {
+        let as_of = now.checked_sub(lag).unwrap_or(now);
+        let trailing = if lag.is_zero() {
+            None
+        } else {
+            let history = self
+                .shared
+                .faults
+                .load_history
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let reached = history.partition_point(|(at, _)| *at <= as_of);
+            history
+                .get(reached.saturating_sub(1))
+                .map(|(_, published)| published.clone())
+        };
+        let published = trailing.unwrap_or_else(|| {
+            self.shared
+                .snapshot
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone()
+        });
+        let mut snapshot = published.snapshot;
         let expired = published
             .prefill_at
-            .is_none_or(|at| now.saturating_duration_since(at) > PREFILL_RATE_TTL);
+            .is_none_or(|at| as_of.saturating_duration_since(at) > PREFILL_RATE_TTL);
         if expired {
             snapshot.prefill_throughput = None;
         }
@@ -5797,6 +5903,66 @@ mod tests {
                 .is_none_or(|silence| silence < Duration::from_millis(150)),
             "a pass ran"
         );
+    }
+
+    /// An engine whose counters trail its intake: under the load-lag hook a
+    /// report states the counts of that long ago while the admin API's
+    /// truth states the engine's own, a request leaves the report the lag
+    /// after it ends, and a cleared hook gives the history's room back.
+    #[tokio::test]
+    async fn a_load_lag_reports_the_counts_of_that_long_ago() {
+        let lag = Duration::from_millis(100);
+        let engine = live();
+        engine.fault_load_lag_ms(100);
+        // A snapshot published in the millisecond the hook was set leaves
+        // the report that stood then.
+        let mut busy = LoadSnapshot::idle(&EngineParams::default());
+        busy.num_running_reqs = 7;
+        engine.shared.publish(&SchedulerState::new(), busy);
+        assert_eq!(engine.load().num_running_reqs, 0, "the report that stood");
+        assert_eq!(engine.load_truth().num_running_reqs, 7, "the engine's own");
+
+        let (request, mut rx) = req("a", vec![3; 32], 40);
+        engine.submit(request);
+        let mut served = false;
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("the request is served under the lag")
+                .expect("stream open");
+            if !served {
+                served = true;
+                assert_eq!(
+                    engine.load().num_running_reqs,
+                    0,
+                    "the report from before the request stands"
+                );
+                assert_eq!(engine.load_truth().num_running_reqs, 1, "the truth");
+            }
+            if matches!(event, GenEvent::Done { .. }) {
+                break;
+            }
+        }
+        // The request ran longer than the lag, so entries aged out meanwhile.
+        let ended = Instant::now();
+        assert_eq!(engine.load_truth().num_running_reqs, 0, "it ended");
+        assert_eq!(
+            engine.load_at(ended).num_running_reqs,
+            1,
+            "the report still counts it"
+        );
+        assert_eq!(
+            engine.load_at(ended + lag).num_running_reqs,
+            0,
+            "it leaves the report the lag after its end"
+        );
+        let history = &engine.shared.faults.load_history;
+        let kept = history.lock().unwrap_or_else(|p| p.into_inner()).len();
+        assert!(kept <= 102, "one snapshot a millisecond of the lag: {kept}");
+        engine.fault_load_lag_ms(0);
+        assert_eq!(engine.fault_status().load_lag_ms, 0);
+        let room = history.lock().unwrap_or_else(|p| p.into_inner()).capacity();
+        assert_eq!(room, 0, "a cleared lag gives the history's room back");
     }
 
     /// A kernel built for a new shape: the engine holds before the pass that
