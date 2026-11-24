@@ -82,6 +82,12 @@
 //! above rank 0 of a data-parallel worker gets no feed yet ([`SkipReason`]).
 //! The module `kv` names the decode's limits.
 //!
+//! The stock controller lends its engines the tables' indexes through the
+//! engine's own traits: the index the streams write, with no second copy
+//! (the module `kv_read`). A worker's number there is its row's place in
+//! its model's index, found from the worker's address through the registry
+//! and the holder's record beside the object.
+//!
 //! # The door
 //!
 //! The host hands out a [`MembershipWriter`] door. The crate holds one: the
@@ -112,6 +118,8 @@ mod health;
 mod kv;
 mod kv_cursor;
 mod kv_feed;
+#[cfg(feature = "controller")]
+mod kv_read;
 mod kv_tables;
 mod lead;
 mod loads;
@@ -131,6 +139,8 @@ pub use found::{facts, pairing_descriptor};
 pub use health::HealthAdapter;
 pub use kv::{KvAdapter, KvHost, SkipReason, SkippedSubscriptions};
 pub use kv_feed::KvFeed;
+#[cfg(feature = "controller")]
+pub(crate) use kv_read::EventIndexes;
 pub use kv_tables::KvTables;
 pub use lead::{Lead, SoleLead};
 pub use loads::load_monitor;

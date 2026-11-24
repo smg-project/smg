@@ -180,7 +180,7 @@ mod tests {
 
     use super::{
         super::{
-            tests::one_block,
+            tests::stored_chain,
             write::tests::{facts, Replica, A},
         },
         *,
@@ -672,7 +672,7 @@ mod tests {
             assert_eq!(tables.lanes(), 1, "{name}: the quiet row holds none");
             // The replica hears one block of the row, and the leader's next
             // cut brings one row more: the row that stays keeps its block.
-            let heard = one_block(&tables, asks, 1);
+            let heard = stored_chain(&tables, asks, 1, &[1]);
             assert_eq!(heard, BatchOutcome::Applied, "{name}");
             assert_eq!(tables.indexed_blocks(asks, 0), 1, "{name}");
             leader.upsert(asking("http://d:8000", true));

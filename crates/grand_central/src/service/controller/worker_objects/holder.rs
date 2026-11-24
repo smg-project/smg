@@ -11,8 +11,9 @@ use smg_worker::{
 #[cfg(test)]
 use crate::service::controller::Config;
 use crate::{
+    engine::CacheIndexes,
     store::MemoryStore,
-    worker_host::{KvTables, Members, Objects},
+    worker_host::{EventIndexes, KvTables, Members, Objects},
 };
 
 /// The replica's worker objects: their holder and the store their rows
@@ -96,6 +97,13 @@ impl WorkerObjects {
     /// The replica's KV tables: the ones the holder was handed at its build.
     pub(crate) fn kv_tables(&self) -> Arc<KvTables> {
         Arc::clone(&self.tables)
+    }
+
+    /// The indexes of cache events the replica's engines read: its KV
+    /// tables' own, a worker found by its address among the worker objects.
+    /// The store is lent them once, at the controller's build.
+    pub(crate) fn cache_indexes(&self) -> Arc<dyn CacheIndexes> {
+        Arc::new(EventIndexes::new(Arc::clone(&self.tables), &self.objects))
     }
 
     /// The holder shared with readers of the replica's worker objects.
