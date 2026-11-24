@@ -755,7 +755,9 @@ impl Default for PrefixAffinityParams {
 
 /// The KV-pressure gate: the fleet's KV-usage spread, or the usage the
 /// hottest candidate crosses, past which the profile's affinity stages
-/// yield to load. The stage orders nothing itself.
+/// yield to load. The stage orders nothing itself. A profile has one gate:
+/// its `kv-pressure` entries write the same limits. Limits that are off (1
+/// and above) count as the same.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct KvPressureParams {
@@ -4228,6 +4230,7 @@ fn check_profile(
     let mut scorers = Vec::with_capacity(p.score.len());
     let mut complete = true;
     let mut plain_ring = false;
+    let mut kv_gate = None;
     for (i, entry) in p.score.iter().enumerate() {
         let entry_at = At::new(format!("{}.score[{i}]", at.0));
         let stage = match scored(entry, name, &entry_at, from, settings, &mut sent)? {
@@ -4240,6 +4243,25 @@ fn check_profile(
         };
         let stage_at = entry_at.sub(stage.name());
         check_stage(&stage, &stage_at)?;
+        // A profile has one KV gate, and `gates_of` builds it from one
+        // entry: an entry that writes other limits would load and do
+        // nothing. At 1 and above a limit is off.
+        if let ScoreStage::KvPressure(params) = &stage {
+            let own = Gates::of(None, Some(params), None);
+            let first = *kv_gate.get_or_insert(own);
+            for (limit, own, first) in [
+                ("spread", own.kv_spread, first.kv_spread),
+                ("ceiling", own.kv_ceiling, first.kv_ceiling),
+            ] {
+                if own.min(1.0) != first.min(1.0) {
+                    return Err(stage_at.bad(
+                        limit,
+                        own,
+                        "the limit the profile's first kv-pressure entry writes: a profile has one KV gate, so its entries write the same limits",
+                    ));
+                }
+            }
+        }
         check_prefix_depth(&stage, gates, view, &stage_at)?;
         let count = || profile_sent(&mut sent, name, settings);
         match scorer_of(&stage, gates, view, from.signals, count, &stage_at)? {
@@ -9681,6 +9703,29 @@ mod tests {
             "    score: [{ least-load: { weight: -1.0 } }]\n    pick: best\n",
         ));
         assert!(weight.starts_with("profiles.default.score[0]"), "{weight}");
+        assert_eq!(
+            refused(&profile(
+                "    score: [{ kv-pressure: { spread: 0.3 } }, kv-pressure]\n    pick: best\n",
+            )),
+            "profiles.default.score[1].kv-pressure.spread"
+        );
+        assert_eq!(
+            refused(&profile(
+                "    score: [{ kv-pressure: { ceiling: 0.9 } }, kv-pressure]\n    pick: best\n",
+            )),
+            "profiles.default.score[1].kv-pressure.ceiling"
+        );
+        // Entries of one gate load: the weights apart, a bare name as the
+        // entry at its defaults, a limit at 1 and above as off.
+        for one_gate in [
+            "[{ kv-pressure: { spread: 0.3, weight: 2.0 } }, { kv-pressure: { spread: 0.3 } }]",
+            "[{ kv-pressure: { ceiling: 1.0 } }, kv-pressure]",
+            "[kv-pressure, { kv-pressure: { spread: 2.0 } }]",
+        ] {
+            let document = profile(&format!("    score: {one_gate}\n    pick: best\n"));
+            let document: PolicySpec = serde_yaml::from_str(&document).expect("a document");
+            document.validate().expect(one_gate);
+        }
         let bound = |binding: &str| {
             refused(&format!(
                 "{}bindings:\n  - {binding}\n",

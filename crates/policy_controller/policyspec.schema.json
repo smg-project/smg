@@ -781,7 +781,7 @@
       "additionalProperties": false
     },
     "KvPressureParams": {
-      "description": "The KV-pressure gate: the fleet's KV-usage spread, or the usage the\nhottest candidate crosses, past which the profile's affinity stages\nyield to load. The stage orders nothing itself.",
+      "description": "The KV-pressure gate: the fleet's KV-usage spread, or the usage the\nhottest candidate crosses, past which the profile's affinity stages\nyield to load. The stage orders nothing itself. A profile has one gate:\nits `kv-pressure` entries write the same limits. Limits that are off (1\nand above) count as the same.",
       "type": "object",
       "properties": {
         "weight": {
