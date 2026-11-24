@@ -2508,7 +2508,7 @@ fn a_served_pairs_later_decode_counts_its_key_from_its_calls_issue() {
     let mut frame = keyed(at_prefill(1, WireModes::NONE, None), 7);
     frame.decode_later = true;
     let (decision, prefill, decode) = leased_pair(&store, &objects, frame, now);
-    assert_eq!((decode, keys()), (None, [1, 0, 0]), "the side stands chosen");
+    assert_eq!((decode, keys()), (None, [1, 0, 0]), "a chosen side");
     let hand = open(&store, GATEWAY);
     let own = sent(&prefill, proto::Side::Prefill, 0);
     lifecycle::dispatched(&store, &hand, &own, now).expect("the frame reads");
@@ -2517,7 +2517,7 @@ fn a_served_pairs_later_decode_counts_its_key_from_its_calls_issue() {
     let call = keyed(at_call(2, prefill.id, WireModes::NONE, None), 7);
     let (again, issued) = leased_call(&store, &objects, call, now);
     let other = if first == decodes[0] { 1 } else { 0 };
-    assert_eq!(pairs_of(&again), [(p, decodes[other])], "the call picks again");
+    assert_eq!(pairs_of(&again), [(p, decodes[other])], "it picks again");
     let (_, issue) = issued.expect("a pick's issue");
     let mut counted = [1, 0, 0];
     counted[1 + other] = 1;
