@@ -569,6 +569,82 @@ fn the_record_names_the_worker_a_prefix_was_sent_to() {
     assert_eq!(bed.affinity.left_out(), 0);
 }
 
+/// A model's record of sent prefixes is its workers' model's, and so is its
+/// bound: the index settings of the id the workers registered under,
+/// whatever name a request gives the model.
+#[test]
+fn a_request_under_another_name_leaves_the_records_bound() {
+    use crate::document::spec::IndexSpec;
+    let (affinity, _, _) = hosted(false);
+    let mut document = PolicySpec::preset("cache_aware").expect("the preset");
+    document.generation = 1;
+    // One placement under any other name, the default under the workers'.
+    let one = IndexSpec {
+        max_size: u64::from(BLOCK),
+        ..IndexSpec::default()
+    };
+    document.index.insert("*".into(), one);
+    document.index.insert(MODEL.into(), IndexSpec::default());
+    let spec = AppliedSpec::validate(&document).expect("the document validates");
+    let bed = Bed::new(affinity, spec, 4);
+    let asked = prompt(1_000, 4);
+    bed.decide(&request(&asked, 7, NOW), Some(1));
+    assert_eq!(bed.holders(&asked, NOW), [(1, 0, 4)]);
+    // A request with no prompt that names the model by another name.
+    let other = RequestFacts {
+        model: "another-name",
+        seed: 7,
+        now_micros: NOW,
+        ..RequestFacts::default()
+    };
+    bed.decide(&other, None);
+    bed.affinity.sweep();
+    assert_eq!(bed.holders(&asked, NOW), [(1, 0, 4)]);
+}
+
+/// A model its workers registered after their first shares the record of
+/// the id they registered first, and that id's index settings bound it: a
+/// request for the later model reads them, before a request for the first
+/// model and after one.
+#[test]
+fn a_later_model_of_its_workers_shares_the_first_models_record() {
+    use smg_worker::{
+        identity::builder::BasicWorkerBuilder, model_card::ModelCard, test_support::no_health_check,
+    };
+
+    use crate::document::spec::IndexSpec;
+    const LATER: &str = "model-b";
+    let (affinity, _, _) = hosted(false);
+    let mut document = PolicySpec::preset("cache_aware").expect("the preset");
+    document.generation = 1;
+    // One placement under the later model's name, the default under the first's.
+    let one = IndexSpec {
+        max_size: u64::from(BLOCK),
+        ..IndexSpec::default()
+    };
+    document.index.insert(LATER.into(), one);
+    document.index.insert(MODEL.into(), IndexSpec::default());
+    let spec = AppliedSpec::validate(&document).expect("the document validates");
+    let mut bed = Bed::new(affinity, spec, 4);
+    for (at, worker) in bed.workers.iter_mut().enumerate() {
+        let models = vec![ModelCard::new(MODEL), ModelCard::new(LATER)];
+        let built = <BasicWorkerBuilder>::new(address(at)).models(models);
+        *worker = Arc::new(built.health_config(no_health_check()).build());
+    }
+    let asked = prompt(1_000, 4);
+    let later = RequestFacts {
+        model: LATER,
+        ..request(&asked, 7, NOW)
+    };
+    bed.decide(&later, Some(1));
+    bed.affinity.sweep();
+    // The holders are asked under the first model's name.
+    assert_eq!(bed.holders(&asked, NOW), [(1, 0, 4)]);
+    bed.decide(&later, None);
+    bed.affinity.sweep();
+    assert_eq!(bed.holders(&asked, NOW), [(1, 0, 4)]);
+}
+
 /// A pick the binding's sessions rule placed alone is recorded by the
 /// rule's own word of it, at both of the record's writes: the one behind a
 /// decision named its rows, and the one behind a decision handed the column

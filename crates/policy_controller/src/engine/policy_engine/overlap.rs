@@ -907,7 +907,8 @@ impl Table {
             table.warming = warming.into();
         }
         let record = engine.pool_record_for(model, phase);
-        let settings = spec.index_for(model);
+        // The record is the registered model's, and so are its settings.
+        let settings = spec.index_for(registered);
         if let Some(ahead) = record.filter(|_| settings.kind == IndexKind::Tree) {
             let size = affinity.block_size(registered);
             let size = size.unwrap_or_else(|| spec.block_size()).max(1);
