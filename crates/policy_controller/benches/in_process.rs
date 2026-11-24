@@ -34,7 +34,14 @@
 //! copy of the cell's profile as its binding's shadow, so each decision is
 //! followed by its shadow profile's. `--shadow other` names that shadow at
 //! a binding of another model: the cell's decisions then have no shadow,
-//! under a document that names one. `--callers` threads each
+//! under a document that names one. `--runtimes N` has the host state a
+//! fact of each worker beside its object: the number of one of `N` runtimes
+//! by the worker's place, as a gateway that dials several runtimes states
+//! it; `0`, the default, states nothing. The two cells named `on_runtime`
+//! hold each request to the first runtime, and state two runtimes where
+//! the run names no count: half the list then takes the request, and
+//! under `--runtimes 1` the whole list does.
+//! `--callers` threads each
 //! make `--decisions` timed decisions behind untimed first ones. The result
 //! is one line.
 //!
@@ -79,7 +86,7 @@ use std::{
     future::pending,
     hint::black_box,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU32, AtomicU64, Ordering},
         Arc, Barrier, OnceLock,
     },
     thread,
@@ -91,8 +98,8 @@ use parking_lot::{Condvar, Mutex};
 use smg_policy_controller::{
     document::{AppliedSpec, PolicySpec, RulePlaced, ShadowSpec},
     engine::{
-        Constraints, Decided, Identity, LentList, ListCell, Phase, Plain, PolicyEngine, Request,
-        RequestFacts, RequestMaker, TokenEntry, TokenKey, WorkerId, WorkerLists,
+        Constraints, Decided, FixedFacts, Identity, LentList, ListCell, Phase, Plain, PolicyEngine,
+        Request, RequestFacts, RequestMaker, TokenEntry, TokenKey, WorkerId, WorkerLists,
     },
     policies::consistent_hashing::{Head, LentRing},
     store::GatewayId,
@@ -267,6 +274,13 @@ const CELLS: &[Cell] = &[
         ..Cell::PLAIN
     },
     Cell {
+        name: "least_load_on_runtime",
+        document: || preset("least_load"),
+        behind: states_runtimes,
+        request: on_runtime,
+        ..Cell::PLAIN
+    },
+    Cell {
         name: "pair_least_load",
         document: || pair::of("least_load"),
         request: pair::request,
@@ -319,6 +333,13 @@ const CELLS: &[Cell] = &[
     Cell {
         name: "round_robin",
         document: || preset("round_robin"),
+        ..Cell::PLAIN
+    },
+    Cell {
+        name: "round_robin_on_runtime",
+        document: || preset("round_robin"),
+        behind: states_runtimes,
+        request: on_runtime,
         ..Cell::PLAIN
     },
     Cell {
@@ -413,6 +434,16 @@ fn plain(seed: u64) -> Request<'static> {
         facts,
         constraints: Constraints::default(),
     }
+}
+
+/// A request held to a runtime, as a request pinned to a wire states it:
+/// only a worker that states the first runtime's number takes it
+/// ([`Published::of`]). Such a request is not plain: the engine makes it
+/// and decides it whole.
+fn on_runtime(seed: u64) -> Request<'static> {
+    let mut request = plain(seed);
+    request.constraints.demands.runtime = 1;
+    request
 }
 
 /// The routing keys a keyed cell's callers send, one a turn by its seed.
@@ -561,6 +592,7 @@ fn run() -> Run {
             "--cell" => run.cell = Cell::named(&value),
             "--decisions" => run.decisions = number(),
             "--entry" => run.entry = place::named(&value),
+            "--runtimes" => RUNTIMES.store(number() as u32, Ordering::Relaxed),
             "--overloaded" => run.overloaded = number() != 0,
             "--publish-ms" => run.publish_ms = number(),
             "--refused" => run.refused = pair::Refused::named(&value),
@@ -639,29 +671,52 @@ impl RequestMaker for Stated<'_> {
     }
 }
 
-/// A list of worker objects as a host publishes it: the list, and the cell
-/// the host keeps beside it.
+/// How many runtimes the run's host states of its workers, one of them of
+/// each worker by its place: zero states nothing. `--runtimes` sets it
+/// where the switches are read, and a cell whose request is held to a
+/// runtime sets it behind its engine ([`states_runtimes`]). Both are ahead
+/// of every list.
+static RUNTIMES: AtomicU32 = AtomicU32::new(0);
+
+/// What a cell whose request is held to a runtime makes behind its engine:
+/// its host states two runtimes, where the run names no count.
+fn states_runtimes(_: &PolicyEngine) {
+    let _ = RUNTIMES.compare_exchange(0, 2, Ordering::Relaxed, Ordering::Relaxed);
+}
+
+/// A list of worker objects as a host publishes it: the list, the cell the
+/// host keeps beside it, and what the host states of each worker.
 struct Published {
     workers: Arc<[Arc<dyn Worker>]>,
     cell: ListCell,
+    facts: Option<Box<[FixedFacts]>>,
 }
 
 impl Published {
-    /// `workers` published: the cell beside them is empty.
+    /// `workers` published: the cell beside them is empty. Where the run's
+    /// host states runtimes ([`RUNTIMES`]), it states the number of one of
+    /// them of each worker, by the worker's place, from one up.
     fn of(workers: &Arc<[Arc<dyn Worker>]>) -> Self {
+        let runtimes = RUNTIMES.load(Ordering::Relaxed);
+        let stated = |place: u32| {
+            let mut facts = FixedFacts::default();
+            facts.demands.runtime = 1 + place % runtimes;
+            facts
+        };
         Self {
             workers: Arc::clone(workers),
             cell: ListCell::default(),
+            facts: (runtimes > 0).then(|| (0..workers.len() as u32).map(stated).collect()),
         }
     }
 
-    /// The list, lent with its cell: the host states nothing of its
+    /// The list, lent with its cell and with what the host states of its
     /// workers.
     fn lent(&self) -> LentList<'_> {
         LentList {
             workers: &self.workers,
             cell: &self.cell,
-            facts: None,
+            facts: self.facts.as_deref(),
         }
     }
 }
