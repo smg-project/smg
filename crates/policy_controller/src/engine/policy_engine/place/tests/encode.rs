@@ -550,6 +550,49 @@ fn a_rule_that_panics_behind_an_encoder_that_cannot_be_sent_to_loses_no_lease() 
     assert_eq!((engine.faults(), engine.unheard()), (0, 0));
 }
 
+/// An encode request whose pair's sides read their record of sent prefixes
+/// asks the route's rule inside its decision, at the question of where the
+/// prompt goes. A rule that panics there passes its panic to the call's
+/// caller, as a pair's does: the call places the request on no other
+/// prefill, and the engine is owed nothing.
+#[test]
+fn a_rule_that_panics_inside_an_encode_requests_decision_passes_its_panic() {
+    let preset = "cache_aware";
+    let mut document = PolicySpec::epd_presets("power_of_two", preset, preset).expect("presets");
+    document.generation = 1;
+    let spec = AppliedSpec::validate(&document).expect("a valid document");
+    let engine = hosted(PolicyEngine::new(spec));
+    let three = Three::of([2, 4, 1], |_, _| false);
+    let said: Said<'_> = (&[PLAIN], &[1, 1]);
+    let tokens: Vec<u32> = (1_000..5_096).collect();
+    let keys = [Identity::plain("item")];
+    let items = EncodeItems {
+        keys: &keys,
+        ..EncodeItems::default()
+    };
+    // The rule panics at its first question alone: a panic swallowed there
+    // would leave the walk a rule that admits, and the call's next decision
+    // a second prefill to place the request on.
+    let asked = Cell::new(false);
+    let once = |_: &dyn Worker| -> bool {
+        if asked.replace(true) {
+            return true;
+        }
+        panic!("the route's rule failed")
+    };
+    let request = PlaceRequest {
+        prompt: Prompt {
+            tokens: Some(&tokens),
+            ..Prompt::NONE
+        },
+        admits: Some(&once),
+        ..asking(three.lists(said), items)
+    };
+    let placed = catch_unwind(AssertUnwindSafe(|| engine.place(&request).is_ok()));
+    assert!(placed.is_err(), "the panic passes");
+    assert_eq!((engine.faults(), engine.unheard()), (0, 0));
+}
+
 /// The pair's targets of an encode request are walked as a pair's are. A
 /// target whose decode cannot be sent to is passed over and the next is
 /// taken, with the items' encoders beside it: every target of one decision

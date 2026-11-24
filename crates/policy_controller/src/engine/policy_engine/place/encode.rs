@@ -29,10 +29,11 @@ use std::{
 
 use super::{
     pair::{self, decode_label, sides},
-    ready, walk, Call, Made, PlaceRequest, Unplaced,
+    raise, ready, walk, Call, Made, PlaceRequest, Unplaced,
 };
 use crate::{
     engine::{
+        decision_engine::Decided,
         framework::{EncodeItems, EncodePlaced},
         policy_engine::Loaded,
         prefills_full, EncodeLists,
@@ -97,7 +98,7 @@ fn asked<'a>(
     call: &mut Call,
     placed: &mut EncodePlaced,
 ) -> Result<Option<Placement<'a>>, Unplaced> {
-    let made = Made::asked(engine.object, request, call);
+    let mut made = Made::asked(engine.object, request, call);
     let dated = Cell::new(None);
     let clock = || {
         let now = Instant::now();
@@ -105,6 +106,12 @@ fn asked<'a>(
         now
     };
     let decided = engine.decide_encode_at(&made, items, placed, clock);
+    // The route's rule panicked inside the decision, at the question of
+    // where the prompt goes: the panic is the caller's, as a pair's is.
+    if let Some(panic) = made.panicked.take() {
+        let whole = decided.map(|(decided, later)| (Decided::Whole(decided, later), dated.get()));
+        raise(engine.object, panic, whole);
+    }
     let (decided, later) = decided.map_err(Unplaced::Refused)?;
     let (key, kept) = (made.key(), [made.sent.get(), made.decodes.get()]);
     if prefills_full(&decided.decision) {
