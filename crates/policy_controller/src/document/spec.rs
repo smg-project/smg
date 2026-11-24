@@ -4941,10 +4941,10 @@ fn check_binding(
 /// cap, its largest idle time or sweep is for ever (a sweep for ever under a
 /// finite idle time is refused, as nothing would forget the keys; an idle
 /// time for ever sweeps nothing). The rule runs under the `single` plan, and
-/// on the two sides of a `pd-pair` plan where it states no cap and tells
-/// its stages: a pair's side reads no count of a key's requests in flight,
-/// and a pair's pick has one word for whether its stages hear of it, not
-/// one a side.
+/// on the two sides of a `pd-pair` plan where it tells its stages: a pair's
+/// pick has one word for whether its stages hear of it, not one a side.
+/// Under a cap each side's records carry the count of its key's requests
+/// in flight, as a single's do.
 fn session_rule(
     sessions: &SessionsSpec,
     index: usize,
@@ -4952,9 +4952,6 @@ fn session_rule(
 ) -> Result<SessionRule, SpecError> {
     let refused = match plan {
         Plan::Single => None,
-        Plan::PdPair if sessions.inflight_cap != u16::MAX => {
-            Some(("inflight_cap", "65535 (no cap) under the pd-pair plan"))
-        }
         Plan::PdPair if sessions.rule_placed != RulePlaced::Told => {
             Some(("rule_placed", "`told` under the pd-pair plan"))
         }
@@ -8326,36 +8323,33 @@ mod tests {
     }
 
     /// A sessions rule runs under the single plan, and on the two sides of
-    /// a pair where it states no cap and tells its stages. A cap under the
-    /// pair is refused by its own name, the schema's default cap as one
-    /// that is written. A rule that keeps what it places from the profile
-    /// is refused by that field's name, and a rule under `epd` by the
-    /// plan's.
+    /// a pair where it tells its stages, under a cap or under none. A cap
+    /// under the pair makes the document's engine read a worker's count of
+    /// a key's requests, the schema's default cap as one that is written.
+    /// A rule that keeps what it places from the profile is refused by
+    /// that field's name, and a rule under `epd` by the plan's.
     #[test]
-    fn a_sessions_rule_runs_under_a_pair_with_no_cap_and_not_under_epd() {
-        let under = |plan: &str, profiles: &str, sessions: &str| {
+    fn a_sessions_rule_runs_under_a_pair_that_tells_its_stages_and_not_under_epd() {
+        let built = |plan: &str, profiles: &str, sessions: &str| {
             spec_with_binding(&format!(
                 r#"{{"plan":"{plan}","profiles":{profiles},"sessions":{sessions}}}"#
             ))
             .validate()
-            .err()
         };
+        let under =
+            |plan: &str, profiles: &str, sessions: &str| built(plan, profiles, sessions).err();
         let pair = r#"{"prefill":"q","decode":"q"}"#;
         let uncapped = r#"{"sticky_header":"x-session-id","inflight_cap":65535}"#;
-        assert_eq!(under("pd-pair", pair, uncapped), None);
+        // Whether the pair's engine reads the count of a key's requests.
+        let counted = |sessions: &str| {
+            built("pd-pair", pair, sessions).map(|built| built.needs().session_in_flight)
+        };
+        assert_eq!(counted(uncapped), Ok(false));
         for capped in [
             r#"{"sticky_header":"x-session-id"}"#,
             r#"{"sticky_header":"x-session-id","inflight_cap":4}"#,
         ] {
-            assert_eq!(
-                under("pd-pair", pair, capped),
-                Some(SpecError::BadSessions {
-                    index: 0,
-                    name: "inflight_cap",
-                    reason: "65535 (no cap) under the pd-pair plan",
-                }),
-                "{capped}"
-            );
+            assert_eq!(counted(capped), Ok(true), "{capped}");
         }
         let untold =
             r#"{"sticky_header":"x-session-id","inflight_cap":65535,"rule_placed":"untold"}"#;

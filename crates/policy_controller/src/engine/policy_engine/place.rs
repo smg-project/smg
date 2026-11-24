@@ -302,7 +302,9 @@ pub struct PlaceRequest<'a> {
     /// ([`Constraints::counted_on_decode`]), and every other decode as it
     /// stands. That decode is the worker of its id in the list handed at
     /// this call, and its count of session keys is read as the worker
-    /// states it. A caller that states nothing here is read as it counts:
+    /// states it. Where a stage reads the count of the request's key on a
+    /// worker, that decode is read with one of the key's requests less
+    /// too. A caller that states nothing here is read as it counts:
     /// a request it counted on that decode stands among that decode's
     /// requests. A first decision reads nothing here.
     pub counted_on_decode: bool,

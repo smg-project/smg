@@ -2304,6 +2304,11 @@ fn ruled_pair_plan() -> AppliedSpec {
 
 /// [`ruled_pair_plan`] where the rule places a new key by `assignment`.
 fn ruled_pair_plan_of(assignment: Assignment) -> AppliedSpec {
+    ruled_pair_plan_under(assignment, u16::MAX)
+}
+
+/// [`ruled_pair_plan_of`] under the in-flight cap `cap`, 65535 for none.
+fn ruled_pair_plan_under(assignment: Assignment, cap: u16) -> AppliedSpec {
     let document = r#"{
       "apiVersion": "smg.policy/v1",
       "generation": 1,
@@ -2322,7 +2327,8 @@ fn ruled_pair_plan_of(assignment: Assignment) -> AppliedSpec {
     let mut document: PolicySpec =
         serde_json::from_str(document).expect("a document of this build");
     let rule = document.bindings[0].sessions.as_mut();
-    rule.expect("the pair's rule").assignment = assignment;
+    let rule = rule.expect("the pair's rule");
+    (rule.assignment, rule.inflight_cap) = (assignment, cap);
     staged(&document, &StageRegistry::builtin().without_lifecycle())
 }
 
@@ -2506,6 +2512,74 @@ fn a_served_pairs_keyed_lease_counts_its_key_on_each_sides_worker() {
     assert_eq!(keys(), made(&[second]), "the released pair's key left");
     let (third, _) = leased(4, Some(9));
     assert_eq!(third, first);
+}
+
+/// A served pair under a rule with an in-flight cap hands each side's key
+/// on at the cap, as a served single's rule does. The leases on file count
+/// each side's key under the side's own session, and each side's decision
+/// reads that count. The key's first two pairs stand on one prefill and one
+/// decode. The third meets the cap on both sides. It is placed again, on
+/// the prefill and the decode that carry none of the key's requests, and
+/// each side's lease states the respill. Each side's pin leads there where
+/// the pair is decided, ahead of any Dispatched frame, so the key's fourth
+/// pair follows the move on both sides.
+#[test]
+fn a_served_pair_hands_each_sides_key_on_at_its_rules_cap() {
+    let store = Arc::new(MemoryStore::new());
+    // The rule places a key on the worker with the fewest requests: a
+    // request placed again at the cap leaves the key's worker.
+    store
+        .apply(ruled_pair_plan_under(Assignment::MinLoad, 2))
+        .expect("above the unbound start");
+    for (role, names) in [(Role::Prefill, ["p0", "p1"]), (Role::Decode, ["d0", "d1"])] {
+        for name in names {
+            side_member(&store, name, role, None);
+        }
+    }
+    LeasesStore::set_term(&*store, 1);
+    let objects = holder(&store);
+    let now = Instant::now();
+    let leased = |n: u8| {
+        let frame = keyed(at_prefill(n, WireModes::NONE, None), 7);
+        let (decision, prefill, decode) = leased_pair(&store, &objects, frame, now);
+        let decode = decode.expect("issued with its prefill");
+        let verdicts = (prefill.session_verdict, decode.session_verdict);
+        (pairs_of(&decision)[0], verdicts, prefill, decode)
+    };
+    // The key's first pair claims a worker a side, and its gateway's two
+    // Dispatched frames pin each side's key there.
+    let (first, claims, prefill, _) = leased(1);
+    let claimed = (
+        SessionVerdict::Claimed(first.0),
+        SessionVerdict::Claimed(first.1),
+    );
+    assert_eq!(claims, claimed);
+    let hand = open(&store, GATEWAY);
+    for side in [proto::Side::Prefill, proto::Side::Decode] {
+        let own = sent(&prefill, side, 0);
+        lifecycle::dispatched(&store, &hand, &own, now).expect("the frame reads");
+    }
+    // One request of the key in flight a side: the second pair stays.
+    let pinned = (SessionVerdict::Pinned, SessionVerdict::Pinned);
+    let (second, stays, ..) = leased(2);
+    assert_eq!((second, stays), (first, pinned));
+    // Two in flight on each side's worker: the third pair is placed again
+    // on both sides, and no Dispatched frame has come for it.
+    let (third, respills, prefill, decode) = leased(3);
+    assert!(
+        third.0 != first.0 && third.1 != first.1,
+        "{first:?} {third:?}"
+    );
+    assert_eq!(respills, (SessionVerdict::Respill, SessionVerdict::Respill));
+    let pins = [prefill.session, decode.session].map(|session| pins_of(&store, session));
+    let moved = [Some([third.0, first.0]), Some([third.1, first.1])];
+    assert_eq!(
+        pins, moved,
+        "each side's pin, moved where the pair is decided"
+    );
+    // The fourth follows the move: each side's new worker carries one.
+    let (fourth, follows, ..) = leased(4);
+    assert_eq!((fourth, follows), (third, pinned));
 }
 
 /// A served pair whose decode is sent later counts its key on the

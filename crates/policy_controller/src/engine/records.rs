@@ -253,11 +253,25 @@ impl<'a> Live<'a> {
     /// `word`, the word a pick over the list alone counts its turns in: the
     /// pool's facts made by them lend it ([`PoolFacts::word`]), so a picker
     /// that takes turns counts a draw's turn in it too. A pair's decision
-    /// reads two lists by one value of these and lends none.
+    /// reads two lists by one value of these, the decodes' under their
+    /// side's own name ([`Self::counted_under`]), and lends none.
     #[must_use]
     pub(crate) fn turning(self, word: &'a AtomicU64) -> Self {
         Self {
             word: Some(word),
+            ..self
+        }
+    }
+
+    /// These reads with the request's key counted under `session_key`: for
+    /// the decodes' records of a pair. Each side of a pair keeps a session
+    /// of its own, so where the session's number names the count the
+    /// decodes' name is their own. Its caller names a key under a document
+    /// that reads the count and under no other, as [`Self::at`]'s does.
+    #[must_use]
+    pub(crate) fn counted_under(self, session_key: Option<&'a str>) -> Self {
+        Self {
+            counted_key: session_key,
             ..self
         }
     }

@@ -6409,14 +6409,14 @@ impl Engine {
             // The binding's own set, as the live decision hands it: a pool
             // the lifted run leaves nobody is put to the liveness tier.
             return Some(match rule {
-                Some(rule) => self.decide_with_session::<true, false, false>(
+                Some(rule) => self.decide_with_session::<true, false, false, false>(
                     profile, index, rule, placing, facts, pool, set, cx, scratch,
                 ),
                 None => self.keep::<false>(profile, index, None, facts, pool, set, cx, scratch),
             });
         }
         if let Some(rule) = rule {
-            return Some(self.decide_with_session::<false, false, false>(
+            return Some(self.decide_with_session::<false, false, false, false>(
                 profile, index, rule, placing, facts, pool, set, cx, scratch,
             ));
         }
@@ -6466,7 +6466,7 @@ impl Engine {
         cx: &Constraints<'_>,
         scratch: &mut Scratch,
     ) -> Decision {
-        self.decide_with_session::<KEPT, true, KEEPS>(
+        self.decide_with_session::<KEPT, true, true, KEEPS>(
             profile, index, rule, placing, facts, pool, set, cx, scratch,
         )
     }
@@ -6502,6 +6502,11 @@ impl Engine {
     /// ([`SessionsFound`]). Where it does not, the shadow reads the table's
     /// pins as they stand.
     ///
+    /// With `MOVES` off a pin at the cap is not moved here. The decision is
+    /// a pair's prefill side's: it is made ahead of its pair, and the
+    /// pair's decision moves the pin where the pair forms
+    /// ([`Self::decide_pair`]). A shadow's form states it off as well.
+    ///
     /// `KEEPS` is the form of the keeping entry
     /// ([`Engine::decide_keeping`]). Its live decision keeps that reading
     /// in the scratch, since its commit moves the pins and the shadow is
@@ -6511,7 +6516,12 @@ impl Engine {
         clippy::too_many_arguments,
         reason = "the profile run's inputs, as run_profile takes them"
     )]
-    fn decide_with_session<const KEPT: bool, const WRITE_SESSIONS: bool, const KEEPS: bool>(
+    fn decide_with_session<
+        const KEPT: bool,
+        const WRITE_SESSIONS: bool,
+        const MOVES: bool,
+        const KEEPS: bool,
+    >(
         &self,
         profile: &Profile,
         index: u16,
@@ -6581,7 +6591,7 @@ impl Engine {
                 if let Some(respilled) = self.respill(
                     profile, index, rule, placing, facts, pool, set, cx, buf, c.id,
                 ) {
-                    return self.moved::<WRITE_SESSIONS>(key, respilled);
+                    return self.moved::<WRITE_SESSIONS, MOVES>(key, respilled);
                 }
             }
             let mut targets = Targets::new();
@@ -6660,7 +6670,7 @@ impl Engine {
                             profile, index, rule, placing, facts, pool, set, cx, buf, all_vetoed,
                             first,
                         ) {
-                            return self.moved::<WRITE_SESSIONS>(key, handed);
+                            return self.moved::<WRITE_SESSIONS, MOVES>(key, handed);
                         }
                     }
                     return decision;
@@ -6734,7 +6744,7 @@ impl Engine {
                                     profile, index, rule, placing, facts, pool, set, cx, buf,
                                     all_vetoed, owner,
                                 ) {
-                                    return self.moved::<WRITE_SESSIONS>(key, handed);
+                                    return self.moved::<WRITE_SESSIONS, MOVES>(key, handed);
                                 }
                             }
                         }
@@ -6752,12 +6762,20 @@ impl Engine {
     /// worker, so the key's next request, decided ahead of that dispatch,
     /// follows the move there too. The live decision's alone: with
     /// `WRITE_SESSIONS` off the decision is a shadow's and writes no pin.
+    /// With `MOVES` off it is a pair's prefill side's, and writes none
+    /// either: a prefill whose partners leave no decode is passed over and
+    /// takes no request, so the pair's decision writes the move on the
+    /// prefill the pair forms on ([`Self::decide_pair`]).
     /// A placement on the pin again, and one on another worker at the cap,
     /// move no pin ([`Self::respill`]). `key` is the key the decision
     /// looked up.
     #[inline]
-    fn moved<const WRITE_SESSIONS: bool>(&self, key: Session, handed: Decision) -> Decision {
-        if WRITE_SESSIONS {
+    fn moved<const WRITE_SESSIONS: bool, const MOVES: bool>(
+        &self,
+        key: Session,
+        handed: Decision,
+    ) -> Decision {
+        if WRITE_SESSIONS && MOVES {
             if let Decision::Pick(pick) = &handed {
                 if pick.session_verdict == SessionVerdict::Respill {
                     if let Some(first) = pick.targets.first() {
@@ -7175,6 +7193,11 @@ impl Engine {
     /// with the overload veto as it stands: the form of a kept key
     /// ([`Self::keep`]) is the single plan's alone.
     ///
+    /// A decode side's pin at the cap moves where the side is decided
+    /// ([`Self::moved`]): a decode's pick forms the pair. A prefill side's
+    /// does not: the prefill it places first may be passed over, and the
+    /// pair's decision moves the pin where the pair forms.
+    ///
     /// Out of line: a pair under no rule holds nothing of it.
     #[inline(never)]
     #[expect(
@@ -7204,7 +7227,7 @@ impl Engine {
         }
         let decision = match &binding.sessions {
             Some(rule) if !facts.session_key.is_none() => self
-                .decide_with_session::<false, true, false>(
+                .decide_with_session::<false, true, DECODE, false>(
                     profile, index, rule, placing, facts, pool, set, cx, scratch,
                 ),
             _ => self.assign(profile, index, placing, facts, pool, set, cx, scratch),
@@ -7284,6 +7307,8 @@ impl Engine {
     /// ([`Pair::decode_verdict`](super::decision::Pair::decode_verdict)).
     /// A claim of the prefill side names the prefill the pair formed on,
     /// before any dispatch, and a decision that forms no pair leaves none.
+    /// A prefill side's pin at the cap moves to that prefill where the
+    /// pair forms, and a decision that forms no pair moves none.
     ///
     /// The decode side is put to its binding's all-vetoed rule for the
     /// overload veto, as the pool of a single request is ([`Self::decide`]).
@@ -7775,6 +7800,17 @@ impl Engine {
                             let (key, paired) = (prefill_facts.session(), prefill_target.id);
                             *session_verdict = self.sessions.move_claim(key, claimed, paired);
                         }
+                    }
+                    // The prefill side's run met its key's pin at the cap
+                    // and placed the request again, and moved no pin
+                    // ([`Self::moved`]). The pin moves here, where the
+                    // pair forms and ahead of any dispatch, to the
+                    // prefill the request goes to. A prefill passed over
+                    // is a pin at no instant, so no pin is taken back,
+                    // and none another request was sent to meanwhile.
+                    if prefill_pick.session_verdict == SessionVerdict::Respill {
+                        let key = prefill_facts.session();
+                        self.sessions.respilled(key, prefill_target.id);
                     }
                     return decision;
                 }
@@ -16610,6 +16646,267 @@ mod tests {
         let (places, verdicts) = pair_placed(&engine, &keyed, &sides, &mut scratch);
         assert_eq!(places, (1, 1));
         assert_eq!(verdicts.0, SessionVerdict::Claimed(sides[0][1].id));
+    }
+
+    /// [`pair_session_engine`] under the rule's cap of two, where the
+    /// profile places a new session.
+    fn capped_pair_engine(profiles: Vec<Profile>) -> Engine {
+        let binding = Binding {
+            decode_profile: Some(profiles.len() as u16 - 1),
+            sessions: Some(SESSIONS),
+            ..pair_binding()
+        };
+        Engine::new(profiles, vec![binding], 1, Needs::default())
+    }
+
+    /// Three prefills and two decodes for a key at its cap on the prefill
+    /// side. The key was served on the first prefill, the busiest, which
+    /// carries the rule's cap of the key's requests. The idle prefill is of
+    /// pair class 7 and the other two of class 8, as the two decodes are
+    /// in turn: a respill places the idle prefill first, and a decode
+    /// profile that declines class 7 ([`declining_decode_profile`]) pairs
+    /// the third.
+    fn capped_prefill_sides(engine: &Engine, keyed: &RequestFacts<'_>) -> [Vec<Candidate>; 2] {
+        let mut sides = two_sides(&[9, 0, 3], &[0, 0]);
+        let [prefills, decodes] = &mut sides;
+        for (row, class) in prefills.iter_mut().zip([8, 7, 8]) {
+            row.pair_class = class;
+        }
+        for (row, class) in decodes.iter_mut().zip([7, 8]) {
+            row.pair_class = class;
+        }
+        let [prefill_session, _] = side_sessions(keyed);
+        engine
+            .sessions
+            .lookup(prefill_session, keyed.now_micros, &SESSIONS);
+        let served = prefills[0].id;
+        engine
+            .sessions
+            .dispatched(prefill_session, SessionVerdict::Pinned, served);
+        prefills[0].session_in_flight = SESSIONS.inflight_cap;
+        sides
+    }
+
+    /// A prefill a capped pin's respill placed first and the decode side
+    /// declines is passed over under a cap too, and the pin's one move
+    /// goes with the pair. The side's run moves no pin. The pair forms on
+    /// the next prefill, and that one leads the key's pins where the pair
+    /// forms, ahead of the pin the key left and ahead of any dispatch. The
+    /// prefill passed over is no pin. So the key's second request, decided
+    /// before the first is dispatched, follows a prefill that pairs. The
+    /// first one's dispatch there moves nothing more. A pair that forms on
+    /// a pin taken as a pin moves none: the key's failover, taken while
+    /// the prefill that leads is not ready, stays the failover.
+    #[test]
+    fn a_respill_on_a_prefill_that_is_passed_over_moves_to_the_one_that_pairs() {
+        let profiles = vec![least_requests_profile(), declining_decode_profile()];
+        let engine = capped_pair_engine(profiles);
+        let keyed = pair_request(Some(7));
+        let [prefill_session, _] = side_sessions(&keyed);
+        let mut sides = capped_prefill_sides(&engine, &keyed);
+        let pools = PairPools {
+            prefills: &sides[0],
+            decodes: &sides[1],
+            ..PairPools::default()
+        };
+        let (pool, cx) = (PoolFacts::default(), Constraints::default());
+        let mut scratch = Scratch::new();
+        let (left, paired) = (sides[0][0].id, sides[0][2].id);
+        let first = engine.decide_pair(&keyed, &pool, pools, &cx, &cx, &mut scratch);
+        let first = first.pick().expect("a pair");
+        let went = *first.targets.first().expect("a target");
+        assert_eq!(went.id, paired);
+        assert_eq!(first.session_verdict, SessionVerdict::Respill);
+        let moved = Some([paired, left]);
+        assert_eq!(engine.sessions.pins(prefill_session), moved);
+        let second = engine.decide_pair(&keyed, &pool, pools, &cx, &cx, &mut scratch);
+        let second = second.pick().expect("the key's second pair");
+        assert_eq!(second.targets.first().map(|target| target.id), Some(paired));
+        assert_eq!(second.session_verdict, SessionVerdict::Pinned);
+        // The first decision's dispatch on the prefill that paired.
+        let lease = Lease {
+            session: prefill_session,
+            session_verdict: first.session_verdict,
+            ..Lease::default()
+        };
+        let went = Target { pair: None, ..went };
+        engine.on_dispatched(&lease, &went, Side::Prefill, 0);
+        assert_eq!(engine.sessions.pins(prefill_session), moved);
+        // The prefill that leads is not ready, and the pin the key left
+        // is under its cap again.
+        sides[0][2].health.healthy = false;
+        sides[0][0].session_in_flight = 0;
+        let pools = PairPools {
+            prefills: &sides[0],
+            decodes: &sides[1],
+            ..PairPools::default()
+        };
+        let third = engine.decide_pair(&keyed, &pool, pools, &cx, &cx, &mut scratch);
+        let third = third.pick().expect("the key's third pair");
+        assert_eq!(third.targets.first().map(|target| target.id), Some(left));
+        assert_eq!(third.session_verdict, SessionVerdict::Pinned);
+        assert_eq!(engine.sessions.pins(prefill_session), moved);
+    }
+
+    /// A pair's decision that forms no pair moves no pin. Its prefill
+    /// side's respill placed a prefill, which took no request: the key's
+    /// pins stand as the decision read them, and the key's next request
+    /// meets the pin at its cap again.
+    #[test]
+    fn a_pair_that_sheds_moves_no_pin_for_its_prefill_sides_respill() {
+        let profiles = vec![least_requests_profile(), declining_decode_profile()];
+        let engine = capped_pair_engine(profiles);
+        let keyed = pair_request(Some(7));
+        let [prefill_session, _] = side_sessions(&keyed);
+        let mut sides = capped_prefill_sides(&engine, &keyed);
+        // Every decode is of the refused class: no prefill pairs.
+        for row in sides.iter_mut().flatten() {
+            row.pair_class = 7;
+        }
+        let pools = PairPools {
+            prefills: &sides[0],
+            decodes: &sides[1],
+            ..PairPools::default()
+        };
+        let (pool, cx) = (PoolFacts::default(), Constraints::default());
+        let mut scratch = Scratch::new();
+        let declined = engine.decide_pair(&keyed, &pool, pools, &cx, &cx, &mut scratch);
+        assert!(declined.pick().is_none(), "{declined:?}");
+        let stands = Some([sides[0][0].id, WorkerId(0)]);
+        assert_eq!(engine.sessions.pins(prefill_session), stands);
+    }
+
+    /// What [`DecidesBeside`] stages, and what its request read.
+    #[derive(Debug, Default)]
+    struct Beside {
+        /// The table, the session and the worker of the staged request.
+        staged: Option<(Arc<SessionTable>, Session, WorkerId)>,
+        /// The pins that request read of its session.
+        read: Option<[WorkerId; 2]>,
+    }
+
+    /// [`RefusesClass`], with a second request of one session decided
+    /// inside a pair's decision. Where the picker declines, between the
+    /// prefill side's run and the pair's forming, the staged request reads
+    /// its session's pins, moves the capped pin to its worker and is sent
+    /// there. It is staged once.
+    #[derive(Debug)]
+    struct DecidesBeside(RefusesClass, Arc<Mutex<Beside>>);
+
+    impl Lifecycle for DecidesBeside {}
+
+    impl Picker for DecidesBeside {
+        fn name(&self) -> &'static str {
+            "decides-beside"
+        }
+
+        fn pick(
+            &self,
+            facts: &RequestFacts<'_>,
+            candidates: &[Candidate],
+            kept: &[u32],
+            scores: &[f32],
+            band: TieBand,
+            out: &mut Targets,
+        ) {
+            self.0.pick(facts, candidates, kept, scores, band, out);
+            if !out.is_empty() {
+                return;
+            }
+            let mut beside = self.1.lock().expect("the staged request");
+            if let Some((table, session, worker)) = beside.staged.take() {
+                beside.read = Some(table.lookup(session, facts.now_micros, &SESSIONS));
+                table.respilled(session, worker);
+                table.dispatched(session, SessionVerdict::Respill, worker);
+            }
+        }
+    }
+
+    /// The hole a move written ahead of the pair's forming leaves. A
+    /// second request of the session is decided and sent inside the
+    /// pair's decision, between the prefill side's run and the forming.
+    /// It reads the pins as they stood, with no pin on the prefill the
+    /// side placed first, and takes that prefill by a move of its own.
+    /// The pair forms on the next prefill and fronts it as a respill's
+    /// move does. Nothing is withdrawn behind the second request: the
+    /// prefill it was sent to stands behind the one that paired.
+    #[test]
+    fn a_request_decided_inside_a_pairs_decision_reads_no_move_and_keeps_its_pin() {
+        let beside = Arc::new(Mutex::new(Beside::default()));
+        let decode = Profile {
+            picker: Box::new(DecidesBeside(RefusesClass(7), Arc::clone(&beside))),
+            ..declining_decode_profile()
+        };
+        let engine = capped_pair_engine(vec![least_requests_profile(), decode]);
+        let keyed = pair_request(Some(7));
+        let [prefill_session, _] = side_sessions(&keyed);
+        let sides = capped_prefill_sides(&engine, &keyed);
+        let [left, passed_over, paired] = [0, 1, 2].map(|at: usize| sides[0][at].id);
+        let staged = (Arc::clone(&engine.sessions), prefill_session, passed_over);
+        beside.lock().expect("the staged request").staged = Some(staged);
+        let pools = PairPools {
+            prefills: &sides[0],
+            decodes: &sides[1],
+            ..PairPools::default()
+        };
+        let (pool, cx) = (PoolFacts::default(), Constraints::default());
+        let mut scratch = Scratch::new();
+        let decision = engine.decide_pair(&keyed, &pool, pools, &cx, &cx, &mut scratch);
+        let pick = decision.pick().expect("a pair");
+        assert_eq!(pick.targets.first().map(|target| target.id), Some(paired));
+        assert_eq!(pick.session_verdict, SessionVerdict::Respill);
+        let read = beside.lock().expect("the staged request").read;
+        assert_eq!(
+            read,
+            Some([left, WorkerId(0)]),
+            "no pin ahead of the forming"
+        );
+        let behind = Some([paired, passed_over]);
+        assert_eq!(engine.sessions.pins(prefill_session), behind);
+    }
+
+    /// A decode side under a capped rule hands its key on at the cap among
+    /// the partners of the prefill that pairs. The decode taken leads the
+    /// decode side's pins where the side is decided, ahead of any
+    /// dispatch, the pair states the respill as that side's verdict, and
+    /// the decode at its cap is no alternate.
+    #[test]
+    fn a_decode_side_at_its_cap_respills_among_its_partners_where_it_is_decided() {
+        let profiles = vec![least_requests_profile(), least_requests_profile()];
+        let engine = capped_pair_engine(profiles);
+        let keyed = pair_request(Some(7));
+        let [_, decode_session] = side_sessions(&keyed);
+        // The key's decode side was served on the first decode, the
+        // busier one, which carries the cap.
+        let mut sides = two_sides(&[0, 5], &[9, 5]);
+        let (served, taken) = (sides[1][0].id, sides[1][1].id);
+        engine
+            .sessions
+            .lookup(decode_session, keyed.now_micros, &SESSIONS);
+        engine
+            .sessions
+            .dispatched(decode_session, SessionVerdict::Pinned, served);
+        sides[1][0].session_in_flight = SESSIONS.inflight_cap;
+        let pools = PairPools {
+            prefills: &sides[0],
+            decodes: &sides[1],
+            ..PairPools::default()
+        };
+        let (pool, cx) = (PoolFacts::default(), Constraints::default());
+        let mut scratch = Scratch::new();
+        let decision = engine.decide_pair(&keyed, &pool, pools, &cx, &cx, &mut scratch);
+        let pick = decision.pick().expect("a pair");
+        assert_eq!(
+            pick.targets.len(),
+            1,
+            "the decode at its cap is not offered"
+        );
+        let pair = pick.targets.first().and_then(|target| target.pair);
+        let pair = pair.expect("a decode");
+        assert_eq!(pair.decode_id, taken);
+        assert_eq!(pair.decode_verdict, DecodeVerdict::RESPILL);
+        let moved = Some([taken, served]);
+        assert_eq!(engine.sessions.pins(decode_session), moved);
     }
 
     /// A decode side its rule places writes the decode side's buffers, as
