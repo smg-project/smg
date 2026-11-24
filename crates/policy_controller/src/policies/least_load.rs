@@ -98,12 +98,12 @@ impl LeastLoad {
     /// Dispatches no report reflects yet on `worker`, over every rank of it,
     /// for tests and dumps.
     pub fn held(&self, worker: WorkerId) -> usize {
-        self.sent.credits.held(worker)
+        self.sent.credits().held(worker)
     }
 
     /// Dispatches no report reflects yet on one rank of `worker`.
     pub fn held_at(&self, worker: WorkerId, dp_rank: u16) -> usize {
-        self.sent.credits.held_at(worker, dp_rank)
+        self.sent.credits().held_at(worker, dp_rank)
     }
 
     /// One rank's held work as a decision reads it: token-work, a send of
@@ -111,7 +111,7 @@ impl LeastLoad {
     #[cfg(test)]
     fn held_word_at(&self, worker: WorkerId, dp_rank: u16) -> (u64, u64) {
         self.sent
-            .credits
+            .credits()
             .tally
             .load()
             .get(&(worker, dp_rank))
@@ -129,7 +129,7 @@ impl LeastLoad {
     /// its bound runs it.
     #[cfg(test)]
     fn retire_oldest_of(&self, worker: WorkerId, dp_rank: u16) {
-        if let Some(since) = self.sent.credits.tally.load().get(&(worker, dp_rank)) {
+        if let Some(since) = self.sent.credits().tally.load().get(&(worker, dp_rank)) {
             since.retire_for_test();
         }
     }

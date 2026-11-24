@@ -282,11 +282,11 @@ impl PolicyEngine {
     /// itself than the standing one: another name, other words of a
     /// request's life to hear, or anything else the engine reads of a
     /// stage when it builds a profile. A factory of the host's own may
-    /// build such a stage. A count of sends stands where every profile
-    /// that reads it is kept and the first of them by name made the
-    /// standing count, and its readers are built new where either fails.
-    /// A count built new takes over a standing count: which one is the
-    /// count's own rule
+    /// build such a stage. A count of sends stands where a profile that
+    /// reads it is kept, whichever of its other readers changed, left or
+    /// came: a profile built new beside it reads the same count. A count
+    /// none of whose readers is kept is built new and takes over a
+    /// standing count: which one is the count's own rule
     /// ([`Engine::succeed`](crate::engine::Engine::succeed)). Every other
     /// stage starts empty, a registered one too. The keep stands between
     /// two documents validated over the stock table, or over one table of
@@ -328,13 +328,15 @@ impl PolicyEngine {
     /// one document it read last, until it asks again or ends: so at most
     /// one replaced document stands for each thread, and an idle thread
     /// holds one for as long as it idles. As a rule the last holder is
-    /// such a thread, and those stages are dropped at the start of its
-    /// next request's decision or at its end. A stage whose drop blocks
-    /// holds that request's decision meanwhile, once for each document
-    /// replaced. A drop that panics at a decision's start unwinds out of
-    /// that entry, and one that panics at a thread's end aborts the
-    /// process, as any value does that panics while a thread's own
-    /// storage is torn down.
+    /// such a thread, and those stages are dropped at its next entry of
+    /// an engine, which is a decision, a word of a lease or a read of the
+    /// document, or at its end. A stage whose drop blocks holds that
+    /// entry meanwhile, once for each document replaced. A drop that
+    /// panics at an entry unwinds out of it. The process aborts where
+    /// the entry is made while the thread already unwinds, as a request's
+    /// guard dropped with a report owed speaks for its lease, and where
+    /// the drop runs at a thread's end, as any value does that panics
+    /// while a thread's own storage is torn down.
     ///
     /// [`DecisionEngine::say`]: crate::engine::DecisionEngine::say
     /// [`LentList`]: crate::engine::LentList

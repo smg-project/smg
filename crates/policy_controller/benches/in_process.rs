@@ -44,7 +44,8 @@
 //! `--engines 2` builds a second engine under the cell's document, and each
 //! turn asks it one word of that document ahead of its decision: a caller's
 //! thread then asks two engines by turns, and reads each one's document
-//! anew at each turn. A pair's cell and an encode request's take one engine.
+//! anew at each turn. A pair's cell and an encode request's take one engine,
+//! and a cell whose callers make turns of their own refuses the switch.
 //! `--callers` threads each
 //! make `--decisions` timed decisions behind untimed first ones. The result
 //! is one line.
@@ -925,6 +926,12 @@ fn main() {
     let engine: &'static PolicyEngine = Box::leak(Box::new(PolicyEngine::new(spec)));
     behind(engine);
     assert!(matches!(run.engines, 1 | 2), "one engine or two");
+    // A cell whose callers make turns of their own times those turns
+    // itself, and they ask one engine.
+    assert!(
+        run.engines == 1 || run.cell.caller.is_none(),
+        "--engines 2 on a cell whose callers make turns of their own"
+    );
     let beside = (run.engines == 2).then(|| -> &'static PolicyEngine {
         let spec = AppliedSpec::validate(&document).expect("a valid document");
         Box::leak(Box::new(PolicyEngine::new(spec)))
