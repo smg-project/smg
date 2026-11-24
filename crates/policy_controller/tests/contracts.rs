@@ -190,6 +190,7 @@ fn constraints_record() -> &'static [&'static str] {
             wire_modes,
             overload_lifted,
             decode_later,
+            counted_on_decode,
             subset_hint,
             demands,
             stalled,
@@ -629,7 +630,14 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
         ProtoMirror {
             message: "Constraints",
             record: constraints_record(),
-            host_only: &["decode_later", "demands", "stalled", "held", "places"],
+            host_only: &[
+                "decode_later",
+                "counted_on_decode",
+                "demands",
+                "stalled",
+                "held",
+                "places",
+            ],
             wire_only: &[],
             wire: &[
                 ("excluded", Type::Fixed64),

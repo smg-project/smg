@@ -447,6 +447,8 @@ impl Checked {
             wire_modes: self.wires().unwrap_or_default(),
             overload_lifted: constraints.overload_lifted,
             decode_later: self.decode_later(),
+            // A frame's request is counted by the leases on file alone.
+            counted_on_decode: false,
             subset_hint: constraints.subset_hint,
             demands: Demands::default(),
             stalled: &[],

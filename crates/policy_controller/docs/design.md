@@ -874,6 +874,7 @@ pub struct Constraints<'a> {
     pub wire_modes: WireModes,    // the protocols this host can dial for the request
     pub overload_lifted: bool,    // the overload veto does not apply to this decision
     pub decode_later: bool,       // a pair's decode will be chosen after the prefill has run
+    pub counted_on_decode: bool,  // the host counts the request on its first decode at a decode asked again
     pub subset_hint: Option<u32>, // decide over at most this many workers
     pub demands: Demands,         // what the request needs of its worker
     pub stalled: &'a [u32],       // positions the host itself holds back
@@ -1525,6 +1526,7 @@ pub struct PlaceRequest<'a> {
     pub tried: &'a [WorkerId],        // workers earlier attempts used
     pub budget_micros: u32,           // time left for the decision
     pub decode_again: bool,           // the caller asks a pair's decode again behind its prefill
+    pub counted_on_decode: bool,      // the caller counts the request on its first decode at that ask
     pub ring: Option<&'a dyn LentRing>, // the hash ring the caller keeps of the model's workers
     pub admits: Option<WorkerRule<'a>>, // the route's own rule, asked of the pick
 }
@@ -1674,7 +1676,9 @@ makes one itself.
    `decode_again` is placed with its prefill booked alone. The decode the first decision named
    stands chosen.
 2. When the prefill has answered, the caller calls `decode_again` with the request stated
-   again, as its first call stated it.
+   again, as its first call stated it. A caller that counts the request on its first decode
+   across this call states `counted_on_decode` beside it, and the decision reads that decode
+   without the request: one request less in flight.
 3. The engine makes the request anew from what the caller stated, as it makes a first call's,
    and decides under the binding of the model stated there. Every fact of the decode's decision
    is that request's: the pair's two lists as they stand then, the request's size, its routing

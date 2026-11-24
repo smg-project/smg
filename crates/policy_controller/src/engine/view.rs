@@ -849,7 +849,9 @@ pub struct Candidate {
     /// makes the worker's load guard and lowers where the guard is
     /// dropped. A guard can be made ahead of its send. The decode of a
     /// pair named at the first decision is so counted on its row before
-    /// it is sent, and the classic policies count it the same way.
+    /// it is sent, and the classic policies count it the same way. Where
+    /// the host states [`Constraints::counted_on_decode`], a decode asked
+    /// again reads that decode's row without the asking request.
     pub in_flight: u32,
     /// The latest load row, when the host has a report for the worker.
     pub load: Option<LoadRow>,
@@ -1563,6 +1565,16 @@ pub struct Constraints<'a> {
     /// ask, and a decode call over the link answers that the side was not
     /// chosen.
     pub decode_later: bool,
+    /// The host counts this request on the decode its pair's first
+    /// decision named while it asks that decode again: one of that
+    /// decode's requests in flight. Default: false. The decode asked again
+    /// over the host's own worker lists then reads that decode's record
+    /// with one request less in flight: the record of that id in the list
+    /// handed at the call. Its count of session keys is read as the worker
+    /// states it. A first decision does not read it, and no frame carries
+    /// it: a controller's requests are counted by the leases it holds on
+    /// file.
+    pub counted_on_decode: bool,
     /// A subset hint: decide over at most this many candidates.
     pub subset_hint: Option<u32>,
     /// What the request demands of the worker that takes it
