@@ -2834,3 +2834,234 @@ fn hashes_name_live_nodes_through_random_inserts_and_evictions() {
     assert_eq!(tree.hashed_paths(), 0);
     assert_hashes_name_live_nodes(&tree);
 }
+
+/// a and b share [P, X], and d branches off P, so P is a node of its own; c
+/// holds Q, the newest. Evicting X for a leaves X in place for b.
+fn shared_node_tree(policy: EvictionPolicy) -> TokenTree {
+    let mut path = make_tokens(1, 1);
+    path.extend(make_tokens(500, 1));
+    let mut branch = make_tokens(1, 1);
+    branch.extend(make_tokens(700, 1));
+    let tree = TokenTree::with_policy(policy);
+    tree.insert_tokens(&path, "a");
+    tree.insert_tokens(&path, "b");
+    tree.insert_tokens(&branch, "d");
+    tree.insert_tokens(&make_tokens(9_000, 1), "c");
+    tree
+}
+
+fn held(tree: &TokenTree, tenant: &str) -> usize {
+    tree.get_tenant_token_counts()
+        .get(tenant)
+        .copied()
+        .unwrap_or(0)
+}
+
+/// Each tenant's maintained token count, zeros dropped.
+fn held_counts(tree: &TokenTree) -> HashMap<String, usize> {
+    let mut counts = tree.get_tenant_token_counts();
+    counts.retain(|_, tokens| *tokens > 0);
+    counts
+}
+
+/// Each tenant's tokens as a walk over the nodes holding it finds them (the
+/// root holds none): what its maintained count is in a single-threaded test.
+fn walked_counts(tree: &TokenTree) -> HashMap<String, usize> {
+    let mut counts = HashMap::new();
+    let mut stack = vec![Arc::clone(&tree.root)];
+    while let Some(node) = stack.pop() {
+        for child in &node.children {
+            stack.push(Arc::clone(child.value()));
+        }
+        let tokens = node.tokens.read().len();
+        for entry in &node.tenant_last_access_time {
+            *counts.entry(entry.key().to_string()).or_default() += tokens;
+        }
+    }
+    counts.retain(|_, tokens| *tokens > 0);
+    counts
+}
+
+/// Evicting a node another tenant still holds leaves the node in place, and
+/// its parent is then this tenant's leaf: the eviction takes it up in order.
+/// After X goes for a and for b, a's P is the first in order and goes before
+/// b's (LRU, and Priority, whose equal priorities order by last access).
+#[test]
+fn test_eviction_takes_up_the_parent_of_a_node_another_tenant_holds() {
+    for policy in [EvictionPolicy::Lru, EvictionPolicy::Priority] {
+        let tree = shared_node_tree(policy);
+        tree.evict_tenant_by_size(4 * PAGE_SIZE);
+        assert_eq!(
+            held(&tree, "a"),
+            0,
+            "{policy:?}: a's P, first in order, went"
+        );
+        assert_eq!(held(&tree, "b"), PAGE_SIZE, "{policy:?}: b's P stays");
+        assert_eq!(
+            (held(&tree, "c"), held(&tree, "d")),
+            (PAGE_SIZE, 2 * PAGE_SIZE)
+        );
+        assert_eq!(held_counts(&tree), walked_counts(&tree), "{policy:?}");
+    }
+}
+
+/// A tenant's own eviction takes up the same parent: all of a goes, and the
+/// nodes b and d hold stay whole.
+#[test]
+fn test_tenant_eviction_takes_up_the_parent_of_a_node_another_tenant_holds() {
+    let tree = shared_node_tree(EvictionPolicy::Lru);
+    tree.evict_tenant(&Arc::from("a"), 0);
+    assert_eq!(held(&tree, "a"), 0);
+    assert_eq!(
+        (held(&tree, "b"), held(&tree, "d")),
+        (2 * PAGE_SIZE, 2 * PAGE_SIZE)
+    );
+    assert_eq!(held_counts(&tree), walked_counts(&tree));
+}
+
+/// The root is never evicted: a tenant's only child under the root goes
+/// while another tenant keeps the tree over budget, and the tenant keeps its
+/// root entry. Its first insert gave it that entry at timestamp 0, so a root
+/// offered here would go first.
+#[test]
+fn test_eviction_keeps_the_root_entry_of_a_tenant_whose_last_child_went() {
+    let tree = TokenTree::new();
+    tree.insert_tokens(&make_tokens(1, 1), "a");
+    tree.insert_tokens(&make_tokens(100, 1), "b");
+    tree.insert_tokens(&make_tokens(200, 1), "b");
+
+    tree.evict_tenant_by_size(PAGE_SIZE);
+
+    assert_eq!((held(&tree, "a"), held(&tree, "b")), (0, PAGE_SIZE));
+    assert!(tree.root.tenant_last_access_time.contains_key("a"));
+    assert_eq!(held_counts(&tree), walked_counts(&tree));
+}
+
+/// The root is not offered when the node a tenant leaves stays, directly
+/// under it, for another tenant: a and b share X, the root's child, and c
+/// keeps the tree over budget past X's eviction for a.
+#[test]
+fn test_eviction_keeps_the_root_entry_under_a_kept_child() {
+    let tree = TokenTree::new();
+    tree.insert_tokens(&make_tokens(1, 1), "a");
+    tree.insert_tokens(&make_tokens(1, 1), "b");
+    tree.insert_tokens(&make_tokens(100, 1), "c");
+
+    tree.evict_tenant_by_size(PAGE_SIZE);
+
+    assert_eq!(held(&tree, "a"), 0);
+    assert!(tree.root.tenant_last_access_time.contains_key("a"));
+    assert_eq!(held_counts(&tree), walked_counts(&tree));
+}
+
+/// A tenant's own eviction keeps its root entry too. Its loop ends when
+/// the tenant's tokens are gone, before a root offered last could be taken,
+/// so this guards the shape rather than a path main gets wrong.
+#[test]
+fn test_tenant_eviction_keeps_the_root_entry() {
+    let tree = TokenTree::new();
+    let branch = |second: u32| {
+        let mut tokens = make_tokens(1, 1);
+        tokens.extend(make_tokens(second, 1));
+        tree.insert_tokens(&tokens, "a");
+    };
+    branch(100);
+    branch(200);
+    tree.insert_tokens(&make_tokens(9_000, 1), "b");
+
+    tree.evict_tenant(&Arc::from("a"), 0);
+
+    assert_eq!(held(&tree, "a"), 0);
+    assert!(tree.root.tenant_last_access_time.contains_key("a"));
+    assert_eq!(held_counts(&tree), walked_counts(&tree));
+}
+
+/// Evictions alongside an inserter that keeps re-attaching a tenant under
+/// nodes another tenant holds. Under that race the tree promises neither
+/// prefix-closed ownership nor exact counts (a touch and an attach, a check
+/// and a removal, are not one step), so the test asserts only what it does
+/// promise and prints the rest:
+/// - the run ends (no eviction loops or deadlocks against the inserter);
+/// - the tree stays usable: afterwards a new tenant's path inserts and
+///   matches in full.
+#[test]
+#[expect(
+    clippy::print_stderr,
+    reason = "the race's holes are reported, not asserted"
+)]
+fn test_evictions_alongside_reattaching_inserts_end_and_leave_a_usable_tree() {
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        sync::atomic::AtomicBool,
+    };
+    let tree = TokenTree::new();
+    let stop = AtomicBool::new(false);
+    let path = |i: u32| {
+        let mut tokens = make_tokens(1, 1);
+        tokens.extend(make_tokens(1_000 + i % 8 * 100, 1));
+        tokens.extend(make_tokens(100_000 + i % 64 * 100, 1));
+        tokens
+    };
+    thread::scope(|scope| {
+        scope.spawn(|| {
+            for i in 0..8_000u32 {
+                tree.insert_tokens(&path(i), "b");
+                tree.insert_tokens(&path(i), "a");
+            }
+            stop.store(true, Ordering::Relaxed);
+        });
+        scope.spawn(|| {
+            while !stop.load(Ordering::Relaxed) {
+                tree.evict_tenant(&Arc::from("a"), PAGE_SIZE);
+            }
+        });
+        while !stop.load(Ordering::Relaxed) {
+            tree.evict_tenant_by_size(8 * PAGE_SIZE);
+        }
+    });
+
+    // A raced path still takes a new tenant whole and matches in full.
+    let raced = path(0);
+    tree.insert_tokens(&raced, "z");
+    assert_eq!(
+        tree.match_prefix_with_counts(&raced).matched_token_count,
+        raced.len()
+    );
+
+    let mut holes = 0usize;
+    let mut stack = vec![Arc::clone(&tree.root)];
+    while let Some(node) = stack.pop() {
+        for child in &node.children {
+            let child = child.value();
+            if !Arc::ptr_eq(&node, &tree.root) {
+                holes += child
+                    .tenant_last_access_time
+                    .iter()
+                    .filter(|entry| {
+                        !node
+                            .tenant_last_access_time
+                            .contains_key(entry.key().as_ref())
+                    })
+                    .count();
+            }
+            stack.push(Arc::clone(child));
+        }
+    }
+    let (held, walked): (BTreeMap<_, _>, BTreeMap<_, _>) = (
+        held_counts(&tree).into_iter().collect(),
+        walked_counts(&tree).into_iter().collect(),
+    );
+    let differing: Vec<_> = held
+        .keys()
+        .chain(walked.keys())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter(|tenant| held.get(*tenant) != walked.get(*tenant))
+        .map(|tenant| (tenant, held.get(tenant), walked.get(tenant)))
+        .collect();
+    eprintln!(
+        "reattaching race: {holes} holes; counts equal to a walk's: {}; \
+         differing (tenant, count, walk): {differing:?}",
+        held == walked
+    );
+}
