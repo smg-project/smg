@@ -346,7 +346,9 @@ but cannot drive event-driven `cache_aware`, which requires token ids.)
 ### Fault hooks
 
 All under the admin API; `{worker}` is a worker name (`grpc:<port>`,
-`http:<port>`, `zmq:<index>`) or `all`. A hook applies to every KV-event
+`http:<port>`, `zmq:<index>`) or `all`. The name of a gRPC worker with
+data-parallel ranks addresses each of its ranks (engines of their own, named
+`grpc:<port>:r<k>`), and a rank's name that rank alone. A hook applies to every KV-event
 transport of the worker (gRPC `SubscribeKvEvents` and the ZMQ publisher alike)
 and answers with the worker's hook state (`drop_pending`, `dropped_total`,
 `delay_ms`, `admit_delay_ms`, `admit_per_sec`, `cold_shape_ms`, `paused`, `generation`,

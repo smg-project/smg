@@ -247,14 +247,25 @@ fn find(name: &str) -> Option<Engine> {
         .find(|e| e.name() == name)
 }
 
-/// The engines a `{worker}` path segment addresses: one by name, or `all`.
+/// Whether the engine named `engine` is `worker`'s: its own engine, or one
+/// of its data-parallel ranks (`<worker>:r<k>`).
+fn is_engine_of(worker: &str, engine: &str) -> bool {
+    engine
+        .strip_prefix(worker)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(":r"))
+}
+
+/// The engines a `{worker}` path segment addresses: one by name, each rank
+/// of a data-parallel worker by the worker's name, or `all`.
 fn select(worker: &str) -> Result<Vec<Engine>, Response> {
-    if worker == "all" {
-        return Ok(engine::fleet_engines());
+    let mut engines = engine::fleet_engines();
+    if worker != "all" {
+        engines.retain(|e| is_engine_of(worker, e.name()));
+        if engines.is_empty() {
+            return Err((StatusCode::NOT_FOUND, "unknown worker").into_response());
+        }
     }
-    find(worker)
-        .map(|e| vec![e])
-        .ok_or_else(|| (StatusCode::NOT_FOUND, "unknown worker").into_response())
+    Ok(engines)
 }
 
 fn status_json(e: &Engine) -> Value {
@@ -398,11 +409,7 @@ fn fleet_rows(cfg: &Config) -> Vec<Value> {
     for worker in script::registered() {
         let mut found = false;
         for (index, e) in engines.iter().enumerate() {
-            let rank_of_worker = e
-                .name()
-                .strip_prefix(worker.as_str())
-                .is_some_and(|rest| rest.starts_with(":r"));
-            if e.name() == worker || rank_of_worker {
+            if is_engine_of(&worker, e.name()) {
                 rows.push(engine_row(e, cfg));
                 listed[index] = true;
                 found = true;
@@ -907,6 +914,32 @@ mod tests {
         .await
         .expect("the server stops at the bind");
         drop(taken);
+    }
+
+    /// A hook addressed to a data-parallel worker by the worker's own name
+    /// reaches each of its ranks, and a rank's name that rank alone.
+    #[tokio::test]
+    async fn a_workers_name_addresses_each_of_its_ranks() {
+        // The fleet is process-wide; the names below are this test's own.
+        let ranks = ["grpc:hooked-dp:r0", "grpc:hooked-dp:r1"]
+            .map(|name| Engine::spawn_named(engine::EngineParams::default(), name.into(), true));
+        let paused = || ranks.each_ref().map(|rank| rank.fault_status().paused);
+        let answer = fault_pause(Path("grpc:hooked-dp".to_string())).await;
+        assert_eq!(
+            answer.status(),
+            StatusCode::OK,
+            "the name of the worker reaches its ranks"
+        );
+        assert_eq!(paused(), [true, true]);
+        let answer = fault_resume(Path("grpc:hooked-dp:r1".to_string())).await;
+        assert_eq!(answer.status(), StatusCode::OK);
+        assert_eq!(paused(), [true, false]);
+        // A name that only begins like the worker's addresses none of them.
+        let answer = fault_resume(Path("grpc:hooked".to_string())).await;
+        assert_eq!(answer.status(), StatusCode::NOT_FOUND);
+        assert_eq!(paused(), [true, false]);
+        fault_resume(Path("grpc:hooked-dp".to_string())).await;
+        assert_eq!(paused(), [false, false]);
     }
 
     #[tokio::test]
