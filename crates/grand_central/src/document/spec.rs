@@ -255,12 +255,17 @@ pub struct Needs {
     /// Load reports per worker.
     pub loads: bool,
     /// KV events into an index. A stage that declares this beside
-    /// `token_hashes` reads the request's holders from the index, and a
-    /// host names the index's holders ahead of the record's for its
-    /// profile. A stage that reads the events for another fact of a row,
-    /// as a warm-up does, declares no hashes beside it.
+    /// `token_hashes` reads the request's holders from the index. For its
+    /// profile a host names a single request of token ids by the index
+    /// alone where the model's index holds a block, and every other
+    /// request's holders in the index ahead of the record's. A stage that
+    /// reads the events for another fact of a row, as a warm-up does,
+    /// declares no hashes beside it.
     pub events: bool,
-    /// The stage reads the prefixes sent to each worker.
+    /// The stage reads the prefixes sent to each worker. Beside a stage of
+    /// its profile that reads a request's holders from the index, it is
+    /// named none for a single request of token ids under a model whose
+    /// index holds a block: the index names that request alone.
     #[serde(default)]
     pub sent_prefixes: bool,
     /// A consistent-hash ring per model. A host that keeps one lends it with
@@ -698,7 +703,8 @@ pub enum AffinitySource {
     /// Each worker by what it has: its cache events where it publishes
     /// them, and the prefixes sent to it where it does not. A request
     /// hashed by its text reads the prefixes sent to every worker: cache
-    /// events are token blocks.
+    /// events are token blocks. A single request of token ids under a
+    /// model whose index holds a block is read from the index alone.
     #[default]
     Merged,
 }
