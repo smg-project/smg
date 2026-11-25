@@ -16,7 +16,7 @@
 //! each from its registration and its state, whether an all-overloaded pool
 //! is shed, and a list of requests. The row records what the gateway's own
 //! selection answered at each request: the workers it placed the request on,
-//! or its refusal. The policy controller crate replays the rows through its
+//! or its refusal. The Grand Central crate replays the rows through its
 //! own decision.
 //!
 //! A row runs the two functions a first attempt and a retry of the gRPC
@@ -36,8 +36,8 @@
 //! This file is an ignored test of the gateway crate, kept beside the code
 //! it runs. It records from the checkout it is built in and writes the
 //! sheets under `CLASSIC_ROWS_OUT`, naming `CLASSIC_ROWS_COMMIT` as the
-//! commit it recorded from. The sheets the policy controller crate replays
-//! are in `crates/policy_controller/tests/classic/sheets`; to record these
+//! commit it recorded from. The sheets the Grand Central crate replays
+//! are in `crates/grand_central/tests/classic/sheets`; to record these
 //! again:
 //!
 //! ```text

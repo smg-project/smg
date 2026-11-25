@@ -182,7 +182,8 @@ struct CliArgs {
 /// for `grouped_dp_sticky`: the dispatch pins by the gateway's own key, and
 /// a supplied document names its own key sources. The two overload
 /// thresholds are not listed: no document names one, and the gateway builds
-/// its worker objects with them.
+/// its worker objects with them unless the document switches its overload
+/// block off.
 const DOCUMENT_REPLACES: [&str; 43] = [
     "policy",
     "cache_threshold",
@@ -535,8 +536,9 @@ struct RoutingArgs {
     eviction_interval: u64,
 
     /// Maximum total size of each model's approximation tree for cache-aware
-    /// routing (chars for HTTP, tokens for gRPC), shared across all workers;
-    /// eviction keeps every tree at or under this bound
+    /// routing, shared across all workers: for HTTP the chars of its texts
+    /// plus 1024 for each node a worker stands on, for gRPC tokens; eviction
+    /// keeps every tree at or under this bound
     #[arg(long, default_value_t = 67108864, help_heading = "Routing Policy")]
     max_tree_size: usize,
 
@@ -718,8 +720,8 @@ struct RoutingArgs {
     #[arg(long, default_value_t = 8, help_heading = "Routing Policy")]
     worker_warmup_divert_every: u64,
 
-    /// Choose off for the classic routing policies or on for the policy
-    /// controller. With on, the routing flags keep their meaning through a
+    /// Choose off for the classic routing policies or on for Grand
+    /// Central. With on, the routing flags keep their meaning through a
     /// policy document
     #[arg(
         long,
@@ -727,13 +729,15 @@ struct RoutingArgs {
         default_value = "off",
         help_heading = "Routing Policy"
     )]
-    policy_controller: String,
+    grand_central: String,
 
     /// Run this policy document in place of the one the routing flags mean.
     /// The document replaces those flags. A policy name, a policy's own
     /// setting, the overload switch and shed flag and the warm-up and pairing
     /// settings are each refused beside it by name. The two overload
-    /// thresholds stand beside it: the gateway builds its workers with them
+    /// thresholds stand beside it: the gateway builds its workers with them,
+    /// unless the document switches its overload block off.
+    /// A file named `.json` is read as JSON, any other name as YAML
     #[arg(
         long,
         value_name = "FILE",
@@ -1319,8 +1323,9 @@ struct ServingArgs {
     /// streams to the worker verbatim — forfeiting router-level retries. A
     /// streamed request reaches the worker as the client sent it: JSON
     /// validation defers to the worker, and the provider profile's request
-    /// normalization (which the buffered path applies) is skipped. 0 never
-    /// buffers for retries
+    /// normalization (which the buffered path applies) is skipped. This also
+    /// bounds the transcription audio held for one resend after a pre-response
+    /// connection failure; 0 disables both kinds of buffering.
     #[arg(long, default_value_t = 1_048_576, help_heading = "Request Handling")]
     max_buffered_request_bytes: u64,
 
@@ -2219,18 +2224,18 @@ mod tests {
 
         for (flags, enabled) in [
             (&[][..], false),
-            (&["--policy-controller", "on"][..], true),
-            (&["--policy-controller", "off"][..], false),
+            (&["--grand-central", "on"][..], true),
+            (&["--grand-central", "off"][..], false),
         ] {
             let config = cli_args_from(flags)
                 .to_router_config(vec![], vec![])
                 .expect("the routing configuration");
-            assert_eq!(config.policy_controller, enabled, "{flags:?}");
+            assert_eq!(config.grand_central, enabled, "{flags:?}");
         }
-        let refusal = Cli::try_parse_from(["smg", "--policy-controller", "other"])
+        let refusal = Cli::try_parse_from(["smg", "--grand-central", "other"])
             .expect_err("the switch takes only on and off");
         assert_eq!(refusal.kind(), ErrorKind::InvalidValue);
-        assert!(refusal.to_string().contains("--policy-controller"));
+        assert!(refusal.to_string().contains("--grand-central"));
     }
 
     fn policy_file(
@@ -2238,12 +2243,12 @@ mod tests {
     ) -> Result<
         (
             tempfile::NamedTempFile,
-            smg_policy_controller::document::PolicySpec,
+            smg_grand_central::document::PolicySpec,
         ),
         Box<dyn std::error::Error>,
     > {
         let file = tempfile::NamedTempFile::new()?;
-        let document = smg_policy_controller::document::PolicySpec::preset(name)?;
+        let document = smg_grand_central::document::PolicySpec::preset(name)?;
         serde_yaml::to_writer(file.as_file(), &document)?;
         Ok((file, document))
     }
@@ -2252,7 +2257,7 @@ mod tests {
     fn the_plain_start_takes_the_document() {
         let (file, document) = policy_file("round_robin").expect("a policy document file");
         let path = file.path().to_str().expect("a UTF-8 path");
-        let config = cli_args_from(&["--policy-controller", "on", "--policy-spec", path])
+        let config = cli_args_from(&["--grand-central", "on", "--policy-spec", path])
             .to_router_config(vec![], vec![])
             .expect("the routing configuration");
         assert_eq!(config.policy_spec_path.as_deref(), Some(path));
@@ -2261,14 +2266,15 @@ mod tests {
     }
 
     /// No document names an overload threshold. The two flags stand beside
-    /// a document, the document stays in force, and the settings a worker
-    /// object is built with hold the two.
+    /// a document, the document stays in force, and under a document whose
+    /// overload block is on the settings a worker object is built with hold
+    /// the two.
     #[test]
     fn the_overload_thresholds_stand_beside_a_document() {
         let (file, document) = policy_file("round_robin").expect("a policy document file");
         let path = file.path().to_str().expect("a UTF-8 path");
         let config = cli_args_from(&[
-            "--policy-controller",
+            "--grand-central",
             "on",
             "--policy-spec",
             path,
@@ -2288,7 +2294,7 @@ mod tests {
     /// The flags under the routing policy heading a document does not
     /// replace: the controller's own, and what the gateway reads itself.
     const BESIDE_A_DOCUMENT: [&str; 8] = [
-        "policy_controller",
+        "grand_central",
         "policy_spec",
         "print_policy_spec",
         "dp_aware",

@@ -1726,9 +1726,10 @@ static FIXED_COUNT_NAMES: LazyLock<[Arc<str>; 3]> = LazyLock::new(|| {
 });
 
 /// One value an engine reports by name alongside its fixed fields. The name
-/// and the unit are shared strings: a copy of a report, which the load
-/// monitor makes at each publish, allocates none. A connection that knows
-/// a name ahead of its reports makes it once and clones it.
+/// and the unit are shared strings: a copy of an entry, which the load
+/// monitor makes where several workers share one polled answer and where
+/// it publishes a pushed report, allocates none. A connection that knows a
+/// name ahead of its reports makes it once and clones it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct NamedValue {
     pub name: Arc<str>,
@@ -2157,14 +2158,22 @@ impl WorkerLoadResponse {
             .sum()
     }
 
+    /// Whether the report lists at least one entry and as many as the ranks it
+    /// states: a report short of a rank states no whole-worker sum.
+    pub fn lists_every_rank(&self) -> bool {
+        !self.loads.is_empty()
+            && self.loads.len() >= usize::try_from(self.dp_rank_count).unwrap_or(0)
+    }
+
     /// Resident context tokens summed across all DP ranks; `None` unless
-    /// every rank reports them.
+    /// every rank reports them. A report that lists fewer entries than the
+    /// ranks it states answers `None` too, ahead of any sum: the ranks it
+    /// leaves out are in none.
     pub fn total_resident_tokens(&self) -> Option<i64> {
-        self.loads
-            .iter()
-            .map(|l| l.num_resident_tokens)
-            .sum::<Option<i64>>()
-            .filter(|_| !self.loads.is_empty())
+        if !self.lists_every_rank() {
+            return None;
+        }
+        self.loads.iter().map(|l| l.num_resident_tokens).sum()
     }
 
     /// Total running requests summed across all DP ranks.
@@ -2191,6 +2200,17 @@ impl WorkerLoadResponse {
     /// overwrites another's.
     pub fn ranks_are_dp_ranks(&self) -> bool {
         self.loads.iter().all(|l| l.worker.is_none())
+    }
+
+    /// Whether one engine's answer holds a row for every one of its `ranks`,
+    /// so that [`Self::for_dp_rank`] finds each rank's own report in it.
+    pub fn names_dp_ranks(&self, ranks: usize) -> bool {
+        self.ranks_are_dp_ranks()
+            && (0..ranks).all(|rank| {
+                self.loads
+                    .iter()
+                    .any(|load| usize::try_from(load.dp_rank) == Ok(rank))
+            })
     }
 
     pub fn dp_rank_loads(&self) -> HashMap<isize, isize> {
@@ -2662,10 +2682,14 @@ mod load_snapshot_tests {
         );
     }
 
-    /// An entry's size. A publish copies every entry of a worker's report,
-    /// so a field the entry gains is a cost of each publish, on the path
-    /// with a policy engine and on the one without: the pin is exact. The
-    /// entry's own sample instant is two words of it.
+    /// An entry's size. A report holds its entries until the worker's next
+    /// one, a poll that several workers share copies entries for each of
+    /// them but the last (the entries of the worker's own rank where an
+    /// engine answers, every entry of a gateway's rollup), and a pushed
+    /// report's publish copies each of its entries, so a field the entry
+    /// gains is a cost of each, on the path with Grand Central and on the
+    /// one without: the pin is exact. The entry's own sample instant is two
+    /// words of it.
     #[test]
     fn a_load_entry_takes_the_pinned_bytes() {
         assert_eq!(size_of::<Option<std::time::Instant>>(), 16);

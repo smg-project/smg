@@ -1,5 +1,5 @@
 """scripts/ci_install_wasm_tools.sh: the wasm-tools CLI from its release, pinned to the release of the
-wit-component crate the policy crate's tests depend on, checked against its sha256 before anything is unpacked.
+wit-component crate the Grand Central crate's tests depend on, checked against its sha256 before anything is unpacked.
 
 Run with: pytest -q scripts/tests/test_ci_install_wasm_tools.py
 """
@@ -19,7 +19,7 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 SCRIPT = REPO / "scripts" / "ci_install_wasm_tools.sh"
-POLICY_MANIFEST = REPO / "crates" / "policy_controller" / "Cargo.toml"
+POLICY_MANIFEST = REPO / "crates" / "grand_central" / "Cargo.toml"
 
 VERSION = re.search(r'^VERSION="([^"]+)"$', SCRIPT.read_text(), re.MULTILINE).group(1)
 ARCH = {"x86_64": "x86_64", "aarch64": "aarch64", "arm64": "aarch64"}[platform.machine()]
@@ -91,7 +91,7 @@ def test_the_pinned_archive_is_not_the_stub(bed: Bed) -> None:
     assert not (bed.prefix / "bin" / "wasm-tools").exists()
 
 
-def test_the_pin_is_the_release_of_the_policy_crates_wit_component() -> None:
+def test_the_pin_is_the_release_of_the_grand_central_crates_wit_component() -> None:
     # One version of the component tooling: the encoder the crate's tests
     # link (wit-component 0.x.y) and the CLI that wraps the example plugin
     # (wasm-tools 1.x.y) come from one release.
@@ -99,7 +99,7 @@ def test_the_pin_is_the_release_of_the_policy_crates_wit_component() -> None:
     crate = re.search(
         r'^wit-component = \{ version = "0\.([0-9]+\.[0-9]+)"', manifest, re.MULTILINE
     )
-    assert crate, "the policy crate no longer names wit-component with a 0.x.y version"
+    assert crate, "the Grand Central crate no longer names wit-component with a 0.x.y version"
     assert VERSION == f"1.{crate.group(1)}"
 
 

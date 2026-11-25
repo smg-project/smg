@@ -315,6 +315,16 @@ fn stored_item_as_input(item: ConversationItem) -> Option<ResponseInputOutputIte
                 }
             }
         }
+        "additional_tools" | "agent_message" | "tool_search_call" | "tool_search_output"
+        | "web_search_call" | "program" | "program_output" => {
+            match serde_json::from_value::<ResponseInputOutputItem>(item.content) {
+                Ok(replayed) => Some(replayed),
+                Err(e) => {
+                    tracing::error!("Failed to deserialize {}: {}", item.item_type, e);
+                    None
+                }
+            }
+        }
         "reasoning" => None,
         _ => {
             warn!("Unknown item type in conversation: {}", item.item_type);
@@ -526,7 +536,7 @@ mod tests {
                     format!("function_call:{call_id}")
                 }
                 ResponseInputOutputItem::FunctionCallOutput { call_id, .. } => {
-                    format!("function_call_output:{call_id}")
+                    format!("function_call_output:{}", call_id.as_deref().unwrap_or(""))
                 }
                 other => format!("{other:?}"),
             })
@@ -548,6 +558,41 @@ mod tests {
             ResponseInput::Items(items) => items,
             ResponseInput::Text(_) => panic!("the loaded input is an item list"),
         }
+    }
+
+    #[tokio::test]
+    async fn external_conversation_replays_codex_tool_declarations_and_agent_messages() {
+        let components = components().await;
+        let first_input = json!([
+            {"type":"additional_tools","id":"at_1","role":"developer","tools":[
+                {"type":"function","name":"exec_command","parameters":{"type":"object"}}
+            ]},
+            {"type":"agent_message","id":"amsg_1","author":"/root","recipient":"/root/worker",
+             "internal_chat_message_metadata_passthrough":{"turn_id":"turn_1","create_time":1795400000.5},
+             "content":[{"type":"input_text","text":"Message Type: NEW_TASK\nTask name: /root/worker\nSender: /root\nPayload:\n"},
+                        {"type":"encrypted_content","encrypted_content":"opaque-agent-message"}]}
+        ]);
+        let first = serde_json::from_value(json!({
+            "model":"m", "conversation":"conv_1", "input":first_input
+        }))
+        .expect("the first request parses");
+        crate::persistence_utils::persist_conversation_items(
+            components.conversation_storage.clone(),
+            components.conversation_item_storage.clone(),
+            components.response_storage.clone(),
+            &json!({"id":"resp_first","status":"completed","output":[]}),
+            &first,
+            None,
+            None,
+        )
+        .await
+        .expect("the first turn is stored");
+
+        let replayed = loaded_input(&components, "Report the results.").await;
+        let wire = serde_json::to_value(replayed).expect("the follow-up input serializes");
+        assert_eq!(wire[0], first_input[0]);
+        assert_eq!(wire[1], first_input[1]);
+        assert_eq!(wire[2]["content"][0]["text"], "Report the results.");
     }
 
     /// A conversation of 120 items replays its newest 100, oldest first,

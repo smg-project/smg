@@ -1,9 +1,9 @@
-use std::{collections::HashMap, io::Read};
+use std::{collections::HashMap, io::Read, path::Path};
 
 use llm_multimodal::jpeg_turbo::TurboJpegPolicy;
 use openai_protocol::worker::{MmProcessingMode, TransportMode};
+use smg_grand_central::document::operator::{Format, SpecRejected, MAX_DOCUMENT_BYTES};
 use smg_mcp::McpConfig;
-use smg_policy_controller::document::operator::{SpecRejected, MAX_DOCUMENT_BYTES};
 use smg_worker::identity::basic::{ConnectionMode, RuntimeType};
 
 use super::{
@@ -14,33 +14,25 @@ use super::{
     RoutingMode, TenantApiKeyEntry, TokenizerCacheConfig, TraceConfig,
 };
 
-/// A policy document's text from its opened source, where `stated` is the
+/// A policy document's bytes from its opened source, where `stated` is the
 /// size the file's metadata states. A file over the controller's bound on
 /// a document ([`MAX_DOCUMENT_BYTES`]) is refused by that size, unread, in
 /// the controller's words. A file may grow behind its metadata, and a
 /// source that is no regular file states no size: the read takes one byte
-/// past the bound and no more, and refuses a source that reaches past it.
-fn bounded_document(stated: u64, source: impl Read) -> std::io::Result<String> {
-    let too_large = |len: u64| {
-        std::io::Error::new(
-            std::io::ErrorKind::FileTooLarge,
-            SpecRejected::TooLarge(len).to_string(),
-        )
-    };
+/// past the bound and no more. The Grand Central crate's read ([`Format::read`])
+/// then refuses a source that reaches past the bound, by its size.
+fn bounded_document(stated: u64, source: impl Read) -> std::io::Result<Vec<u8>> {
     if stated > MAX_DOCUMENT_BYTES {
-        return Err(too_large(stated));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::FileTooLarge,
+            SpecRejected::TooLarge(stated).to_string(),
+        ));
     }
     let mut bytes = Vec::new();
     source
         .take(MAX_DOCUMENT_BYTES + 1)
         .read_to_end(&mut bytes)?;
-    let read = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-    if read > MAX_DOCUMENT_BYTES {
-        return Err(too_large(read));
-    }
-    let mut text = String::new();
-    bytes.as_slice().read_to_string(&mut text)?;
-    Ok(text)
+    Ok(bytes)
 }
 
 /// Builder for RouterConfig that wraps the config itself
@@ -100,9 +92,9 @@ impl RouterConfigBuilder {
         self
     }
 
-    /// Choose the policy controller for the whole process when `on`.
-    pub fn policy_controller(mut self, on: bool) -> Self {
-        self.config.policy_controller = on;
+    /// Choose Grand Central for the whole process when `on`.
+    pub fn grand_central(mut self, on: bool) -> Self {
+        self.config.grand_central = on;
         self
     }
 
@@ -1083,19 +1075,39 @@ impl RouterConfigBuilder {
         Ok(self)
     }
 
+    /// Reads the supplied policy document by the Grand Central crate's own read
+    /// ([`Format::read`]), the one an apply passes too, in the form the
+    /// file's name states ([`Format::of`]). A refusal names the file and
+    /// stands in that read's words: the field by its path, or the line and
+    /// column where the file itself does not read.
     fn read_policy_spec(mut self) -> ConfigResult<Self> {
         if let Some(path) = &self.config.policy_spec_path {
-            let text = std::fs::File::open(path)
+            let refused = |reason: String| ConfigError::ValidationFailed {
+                reason: format!("Grand Central: {path}: {reason}"),
+            };
+            let document = std::fs::File::open(path)
                 .and_then(|file| Ok((file.metadata()?.len(), file)))
                 .and_then(|(stated, file)| bounded_document(stated, file))
-                .map_err(|error| ConfigError::ValidationFailed {
-                    reason: format!("{path}: could not read the policy document ({error})"),
+                .map_err(|error| {
+                    refused(format!("could not read the policy document ({error})"))
                 })?;
-            self.config.policy_spec = Some(serde_yaml::from_str(&text).map_err(|error| {
-                ConfigError::ValidationFailed {
-                    reason: format!("{path}: {error}"),
-                }
-            })?);
+            let format = Format::of(Path::new(path));
+            let spec = format.read(&document).map_err(|rejected| {
+                // The file's name alone made it JSON, and it does not read
+                // as JSON at all: it may be a YAML document.
+                let named = matches!(
+                    &rejected,
+                    SpecRejected::Unparsed { path, .. } if format == Format::Json && path.is_empty()
+                );
+                refused(if named {
+                    format!(
+                        "{rejected}: a file named .json is read as JSON, any other name as YAML"
+                    )
+                } else {
+                    rejected.to_string()
+                })
+            })?;
+            self.config.policy_spec = Some(spec);
         }
         Ok(self)
     }
@@ -1138,7 +1150,7 @@ impl RouterConfig {
 mod tests {
     use std::collections::HashMap;
 
-    use smg_policy_controller::document::PolicySpec;
+    use smg_grand_central::document::PolicySpec;
     use tempfile::tempdir;
 
     use super::*;
@@ -1150,7 +1162,7 @@ mod tests {
         let path = path.to_str().expect("a UTF-8 path");
         let io_error = std::fs::read_to_string(path).expect_err("the file is absent");
         let refusal = RouterConfig::builder()
-            .policy_controller(true)
+            .grand_central(true)
             .maybe_policy_spec_path(Some(path))
             .build()
             .expect_err("an unreadable file is refused");
@@ -1168,17 +1180,183 @@ mod tests {
         let path = path.to_str().expect("a UTF-8 path");
         let text = "apiVersion: smg.policy/v1\nprofiles: {}\nunknown: true\n";
         std::fs::write(path, text).expect("the document is written");
-        let read_error = serde_yaml::from_str::<PolicySpec>(text).expect_err("unknown field");
+        let read_error = Format::Yaml
+            .read(text.as_bytes())
+            .expect_err("unknown field");
         let refusal = RouterConfig::builder()
-            .policy_controller(true)
+            .grand_central(true)
             .maybe_policy_spec_path(Some(path))
             .build()
             .expect_err("an invalid document is refused");
-        assert!(matches!(
-            refusal,
-            ConfigError::ValidationFailed { reason } if reason.contains(path)
-                && reason.contains(&read_error.to_string())
-        ));
+        let ConfigError::ValidationFailed { reason } = refusal else {
+            panic!("a refused document fails the validation: {refusal:?}");
+        };
+        assert_eq!(reason, format!("Grand Central: {path}: {read_error}"));
+        // The refusal names the field by its path.
+        assert!(
+            reason.contains(": not a policy spec in yaml: unknown: unknown field `unknown`"),
+            "{reason}"
+        );
+    }
+
+    /// The refusal of `text`, supplied as the file `name`, in the words the
+    /// start prints behind the file's path.
+    fn refusal_of(name: &str, text: &str) -> String {
+        let dir = tempdir().expect("a temporary directory");
+        let path = dir.path().join(name);
+        let path = path.to_str().expect("a UTF-8 path");
+        std::fs::write(path, text).expect("the document is written");
+        let refusal = RouterConfig::builder()
+            .grand_central(true)
+            .maybe_policy_spec_path(Some(path))
+            .build_with_validation(false)
+            .expect_err("the document is refused");
+        let ConfigError::ValidationFailed { reason } = refusal else {
+            panic!("a refused document fails the validation: {refusal:?}");
+        };
+        reason
+            .strip_prefix(&format!("Grand Central: {path}: "))
+            .unwrap_or_else(|| panic!("the refusal names the file first: {reason}"))
+            .to_owned()
+    }
+
+    // Five kinds of document a typed YAML read took and the Grand Central crate's
+    // read refuses. Each refusal names its place and what a writer does.
+
+    #[test]
+    fn a_bare_number_where_a_field_takes_text_is_refused_with_its_cure() {
+        let text = "apiVersion: smg.policy/v1\nprofiles:\n  default: {pick: random}\n\
+                    bindings:\n- match: {model: 123}\n  profile: default\n";
+        assert_eq!(
+            refusal_of("routing.yaml", text),
+            "not a policy spec in yaml: bindings[0].match.model: invalid type: integer `123`, \
+             expected a string: text that reads as a number, a boolean or a null is written in quotes"
+        );
+    }
+
+    #[test]
+    fn a_key_with_nothing_under_it_is_refused_with_its_cure() {
+        let text =
+            "apiVersion: smg.policy/v1\nprofiles:\n  default:\n    score:\n    pick: random\n";
+        assert_eq!(
+            refusal_of("routing.yaml", text),
+            "not a policy spec in yaml: profiles.default.score: invalid type: null, \
+             expected a sequence: a key with nothing under it is a null: take the key out, \
+             or write [] or {}"
+        );
+    }
+
+    #[test]
+    fn a_tag_is_refused_by_its_name_and_its_place() {
+        let text = "apiVersion: smg.policy/v1\nprofiles:\n  default: {pick: random}\n\
+                    bindings:\n- match: {model: !mine batch}\n  profile: default\n";
+        assert_eq!(
+            refusal_of("routing.yaml", text),
+            "not a policy spec in yaml: bindings[0].match.model: the tag `!mine` is none JSON writes: \
+             take the tag out at line 5 column 18"
+        );
+    }
+
+    #[test]
+    fn aliases_past_the_readers_bounds_are_refused_by_the_bound() {
+        // One list of a thousand scorers, shared by a thousand profiles, each
+        // named by a binding.
+        let shared = vec!["least-load"; 1000].join(", ");
+        let sharing: Vec<String> = (0..1000)
+            .map(|profile| format!("  p{profile}:\n    score: *s\n    pick: best\n"))
+            .collect();
+        let naming: Vec<String> = (0..1000)
+            .map(|profile| format!("- match: {{model: m{profile}}}\n  profile: p{profile}\n"))
+            .collect();
+        let text = format!(
+            "apiVersion: smg.policy/v1\nprofiles:\n  default:\n    score: &s [{shared}]\n    pick: best\n{}bindings:\n{}",
+            sharing.concat(),
+            naming.concat()
+        );
+        let refusal = refusal_of("routing.yaml", &text);
+        assert!(
+            refusal.contains(
+                "the document reads as more than 2 bytes of text for each byte of the size bound \
+                 (131072): an alias reads as its anchor's value at each use at line "
+            ),
+            "{refusal}"
+        );
+    }
+
+    #[test]
+    fn a_yaml_document_in_a_file_named_json_is_refused_by_the_name() {
+        let text = "apiVersion: smg.policy/v1\nprofiles:\n  default: {pick: random}\n";
+        assert_eq!(
+            refusal_of("routing.json", text),
+            "not a policy spec in json: expected value at line 1 column 1: \
+             a file named .json is read as JSON, any other name as YAML"
+        );
+    }
+
+    /// A whole number past 64 bits where a fraction stands reads as a
+    /// fraction, in a YAML file as in a JSON file.
+    #[test]
+    fn a_whole_number_past_64_bits_reads_as_a_fraction_in_both_forms() {
+        let dir = tempdir().expect("a temporary directory");
+        let forms = [
+            (
+                "routing.yaml",
+                "apiVersion: smg.policy/v1\nprofiles:\n  default:\n    \
+                 score: [{least-load: {weight: 18446744073709551616}}]\n    pick: best\n",
+            ),
+            (
+                "routing.json",
+                r#"{"apiVersion":"smg.policy/v1","profiles":{"default":{"score":[{"least-load":{"weight":18446744073709551616}}],"pick":"best"}}}"#,
+            ),
+        ];
+        let [yaml, json] = forms.map(|(file, text)| {
+            let path = dir.path().join(file);
+            let path = path.to_str().expect("a UTF-8 path");
+            std::fs::write(path, text).expect("the document is written");
+            RouterConfig::builder()
+                .grand_central(true)
+                .maybe_policy_spec_path(Some(path))
+                .build_with_validation(false)
+                .expect("the document reads")
+                .policy_spec
+        });
+        assert!(yaml.is_some(), "the YAML file reads");
+        assert_eq!(yaml, json);
+    }
+
+    /// A file's form is read off its name, and what the print of a
+    /// document writes reads back as that document.
+    #[test]
+    fn a_json_file_and_a_printed_document_read_as_the_document() {
+        let dir = tempdir().expect("a temporary directory");
+        for name in ["random", "cache_aware", "prefix_hash"] {
+            let document = PolicySpec::preset(name).expect("a preset");
+            let forms = [
+                (
+                    "printed.yaml",
+                    serde_yaml::to_string(&document).expect("prints"),
+                ),
+                (
+                    "written.json",
+                    serde_json::to_string(&document).expect("writes"),
+                ),
+            ];
+            for (file, text) in forms {
+                let path = dir.path().join(file);
+                let path = path.to_str().expect("a UTF-8 path");
+                std::fs::write(path, text).expect("the document is written");
+                let config = RouterConfig::builder()
+                    .grand_central(true)
+                    .maybe_policy_spec_path(Some(path))
+                    .build_with_validation(false)
+                    .expect("the document reads");
+                assert_eq!(
+                    config.policy_spec.as_ref(),
+                    Some(&document),
+                    "{name} as {file}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1200,7 +1378,7 @@ mod tests {
             refusal,
             ConfigError::InvalidValue { field, value, reason }
                 if field == "policy_spec" && value == path
-                    && reason == "a policy document is run by the policy controller: set --policy-controller on"
+                    && reason == "a policy document is run by Grand Central: set --grand-central on"
         ));
     }
 
@@ -1217,7 +1395,7 @@ mod tests {
             config.validate().expect_err("the document needs the controller"),
             ConfigError::InvalidValue { field, value, reason }
                 if field == "policy_spec" && value == "the given document"
-                    && reason == "a policy document is run by the policy controller: set --policy-controller on"
+                    && reason == "a policy document is run by Grand Central: set --grand-central on"
         ));
     }
 
@@ -1225,7 +1403,7 @@ mod tests {
     fn a_path_with_no_loaded_document_is_refused() {
         let config = RouterConfig {
             enable_igw: true,
-            policy_controller: true,
+            grand_central: true,
             policy_spec_path: Some("routing.yaml".to_owned()),
             ..RouterConfig::default()
         };
@@ -1253,7 +1431,7 @@ mod tests {
         let path = path.to_str().expect("a UTF-8 path");
         std::fs::write(path, document_of(bound)).expect("the document is written");
         let config = RouterConfig::builder()
-            .policy_controller(true)
+            .grand_central(true)
             .maybe_policy_spec_path(Some(path))
             .build_with_validation(false)
             .expect("a document at the bound is read");
@@ -1271,14 +1449,14 @@ mod tests {
         let over = bound + 5;
         std::fs::write(path, document_of(over)).expect("the document is written");
         let refusal = RouterConfig::builder()
-            .policy_controller(true)
+            .grand_central(true)
             .maybe_policy_spec_path(Some(path))
             .build_with_validation(false)
             .expect_err("a document over the bound is refused");
         assert!(matches!(
             refusal,
             ConfigError::ValidationFailed { reason } if reason == format!(
-                "{path}: could not read the policy document (the document is {over} bytes; at most {bound})"
+                "Grand Central: {path}: could not read the policy document (the document is {over} bytes; at most {bound})"
             )
         ));
     }
@@ -1288,8 +1466,12 @@ mod tests {
         let bound = usize::try_from(MAX_DOCUMENT_BYTES).expect("the bound fits");
         // A source that states no size and holds ten bytes past the bound.
         let source = std::io::repeat(b'#').take(MAX_DOCUMENT_BYTES + 10);
-        let refusal = bounded_document(0, source).expect_err("the source is past the bound");
-        assert_eq!(refusal.kind(), std::io::ErrorKind::FileTooLarge);
+        let read = bounded_document(0, source).expect("the read stops by itself");
+        assert_eq!(read.len(), bound + 1);
+        // The Grand Central crate's read refuses what reached past the bound.
+        let refusal = Format::Yaml
+            .read(&read)
+            .expect_err("the source is past the bound");
         assert_eq!(
             refusal.to_string(),
             format!("the document is {} bytes; at most {bound}", bound + 1)

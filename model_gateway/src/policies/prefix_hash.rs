@@ -41,10 +41,11 @@
 
 use std::{cell::Cell, sync::Arc};
 
+use smg_grand_central::policies::consistent_hashing::Head;
 use smg_worker::identity::basic::Worker;
 use tracing::debug;
 
-use super::{LoadBalancingPolicy, SelectWorkerInfo};
+use super::{hash_ring::HashRing, LoadBalancingPolicy, SelectWorkerInfo};
 use crate::observability::metrics::Metrics;
 
 /// Configuration for the PrefixHash load balancing policy
@@ -216,16 +217,41 @@ impl PrefixHashPolicy {
 
     /// The ring key of a prefix hash: its sixteen lowercase hex digits, the
     /// spelling the ring has always hashed, written into `buf`.
+    ///
+    /// Inlined into each caller by the attribute. With one caller, the
+    /// policy's lookup, the compiler inlined it there. A second caller
+    /// ([`Self::head_position`]) made it stop, and the lookup paid a call
+    /// for its key: six instructions a decision.
     #[expect(
         clippy::expect_used,
         reason = "sixteen hex digits are ASCII, so the buffer is always a str"
     )]
+    #[inline(always)]
     fn ring_key(prefix_hash: u64, buf: &mut [u8; 16]) -> &str {
         const DIGITS: &[u8; 16] = b"0123456789abcdef";
         for (i, byte) in buf.iter_mut().enumerate() {
             *byte = DIGITS[((prefix_hash >> (60 - 4 * i)) & 0xf) as usize];
         }
         std::str::from_utf8(buf).expect("hex digits are ASCII")
+    }
+
+    /// Where a head of a request stands on the model's ring, as Grand
+    /// Central asks a ring it is lent
+    /// ([`LentRing::head_position`](smg_grand_central::policies::consistent_hashing::LentRing::head_position)):
+    /// the position of the ring key this policy finds the head's worker by.
+    /// A head's bytes are the ones this policy hashes: token ids cast in
+    /// place, a text's own, a routing key's among them. They are hashed
+    /// and the hash is spelled as [`Self::ring_key`] spells it, the two
+    /// steps of this policy's lookup, so the engine's walk starts where
+    /// that lookup does.
+    pub(crate) fn head_position(head: Head<'_>) -> u64 {
+        let bytes: &[u8] = match head {
+            Head::Tokens(ids) => bytemuck::cast_slice(ids),
+            Head::Text(text) => text.as_bytes(),
+        };
+        let mut buf = [0u8; 16];
+        let key = Self::ring_key(xxhash_rust::xxh3::xxh3_64(bytes), &mut buf);
+        HashRing::hash_position(key)
     }
 
     /// Check if a worker's load is acceptable
@@ -405,6 +431,17 @@ impl LoadBalancingPolicy for PrefixHashPolicy {
         "prefix_hash"
     }
 
+    /// A request that carries no token ids is keyed by its text.
+    fn needs_request_text(&self) -> bool {
+        true
+    }
+
+    /// With token ids the selection never reads the text: the ids key the
+    /// request.
+    fn needs_request_text_with_tokens(&self) -> bool {
+        false
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -413,10 +450,18 @@ impl LoadBalancingPolicy for PrefixHashPolicy {
 #[cfg(test)]
 mod tests {
     use openai_protocol::worker::WorkerStatus;
+    use smg_grand_central::policies::consistent_hashing::LentRing;
     use smg_worker::identity::basic::WorkerLoadGuard;
 
     use super::*;
-    use crate::policies::{hash_ring::HashRing, test_support::make_workers};
+    use crate::policies::{hash_ring::Unfilled, test_support::make_workers};
+
+    #[test]
+    fn text_is_wanted_only_without_token_ids() {
+        let policy = PrefixHashPolicy::with_defaults();
+        assert!(policy.needs_request_text());
+        assert!(!policy.needs_request_text_with_tokens());
+    }
 
     #[test]
     fn test_prefix_hash_consistent_routing() {
@@ -1146,6 +1191,70 @@ mod tests {
         assert_eq!(
             moved, RECORDED_THREE_NOT_READY,
             "with three workers not ready the prompts placed {moved:?}"
+        );
+    }
+
+    /// A head's place on the ring Grand Central is lent is where this
+    /// policy's own lookup of the head starts. The policy places a request
+    /// whose one head it is, and the walk from the head's lent place asks
+    /// that worker first. Token ids short of the depth and cut at it, a
+    /// prompt's text and a routing key are each placed by their own bytes.
+    /// A ring that holds no worker answers the same place. A routing key's
+    /// place as a head is not the place of its own text, which the
+    /// consistent-hashing policy asks for.
+    #[test]
+    fn a_heads_lent_place_is_where_this_policys_lookup_starts() {
+        let policy = PrefixHashPolicy::with_defaults();
+        let urls: Vec<String> = (0..40).map(|i| format!("http://w{i}:8000")).collect();
+        let workers = make_workers(&urls.iter().map(String::as_str).collect::<Vec<_>>());
+        let ring = Arc::new(HashRing::new(workers.iter().map(|w| w.url())));
+        let ids: Vec<u32> = (0..300).collect();
+        let text = "the leading text of a prompt";
+        // Each request with the one head the policy places it by: a prompt
+        // short of the depth is its own head, a longer one is cut at 256
+        // tokens, a text this short is its own head, and a routing key
+        // leads the prompt it comes with.
+        let requests = [
+            (Head::Tokens(&ids[..64]), Some(&ids[..64]), None, None),
+            (Head::Tokens(&ids[..256]), Some(&ids[..]), None, None),
+            (Head::Text(text), None, Some(text), None),
+            (
+                Head::Text("session-7"),
+                Some(&ids[..]),
+                None,
+                Some("session-7"),
+            ),
+        ];
+        let mut places = Vec::new();
+        for (head, tokens, request_text, routing_key) in requests {
+            let info = SelectWorkerInfo {
+                tokens,
+                request_text,
+                routing_key,
+                hash_ring: Some(ring.clone()),
+                ..Default::default()
+            };
+            let (picked, branch, _) = policy.select_worker_impl(&workers, &info);
+            assert_eq!(branch, Branch::RingHit, "{head:?}");
+            let picked = workers[picked.expect("an eligible owner")].url();
+
+            let place = LentRing::head_position(&*ring, head).expect("the ring places a head");
+            let mut first = None;
+            LentRing::walk(&*ring, place, &mut |url| {
+                first = Some(url.to_owned());
+                true
+            });
+            assert_eq!(first.as_deref(), Some(picked), "{head:?}");
+            let unfilled = LentRing::head_position(&Unfilled, head);
+            assert_eq!(unfilled, Some(place), "{head:?}");
+            places.push(place);
+        }
+        places.sort_unstable();
+        places.dedup();
+        assert_eq!(places.len(), requests.len(), "each head has a place");
+        assert_ne!(
+            LentRing::head_position(&*ring, Head::Text("session-7")),
+            Some(LentRing::position(&*ring, "session-7"))
         );
     }
 }

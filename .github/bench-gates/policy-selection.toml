@@ -56,9 +56,27 @@
 # on round robin rows of 276 ns. Those rows read 226 ns now, and the hash ring fetched again for
 # every policy, 29 ns a placement, fails them: +13.4 and +12.4 %, 2 of 8 ids failed and 0
 # suspect.
+#
+# Count: `count = true`, as grand-central-engine.toml records it. An id that still fails by time after
+# its re-measurement is counted on both executables before the verdict. On the same count with
+# the measured function at another address, a change within twice the threshold is a placement,
+# reported and not failed; any other id whose counts read level is measured again from a fresh
+# copy of each executable and fails where that measurement fails it too. A count that reads
+# higher fails as before. The case: a pull request that changed the pair placement alone failed
+# `round_robin/128` at +24.9 % (177.8 ns against 222.0 ns, every run apart, +7.7 % in the
+# re-measured round) and read `round_robin/1024` +8.7 % slower. Built as this workflow builds
+# them, its two executables count 1,558 instructions a placement on both ids, the batch of
+# 65,536 placements 102,108,564 on both, and no function of the regular placement differs in
+# size; the function the timed call spends the most in starts 1,088 bytes further on in the pull
+# request's executable, on a 64-byte boundary in both. Another pull request read the same two
+# ids 24.6 and 21.9 % faster on the same day.
 
 repeats = 3
-filter = "^regular_placement/(round_robin|cache_aware|cache_aware_first_attempt|cache_aware_context)/"
+count = true
+# The count ends 2,280 s into the run: the gate step's bound is 40 minutes, and the report is
+# written in the two minutes behind the count. No count starts in the budget's last 30 s.
+run_budget = 2280
+filter ="^regular_placement/(round_robin|cache_aware|cache_aware_first_attempt|cache_aware_context)/"
 
 # The files that feed this binary beyond the measured crate: the base side is built with them as the
 # pull request has them (bench_gate.py build --sources-from), so a row added here cannot move the

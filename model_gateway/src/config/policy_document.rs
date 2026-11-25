@@ -1,6 +1,6 @@
 //! The policy document the gateway gives to its controller.
 //!
-//! The policy crate converts routing settings into the controller's
+//! The Grand Central crate converts routing settings into the controller's
 //! document: [`RoutingSettings`] says where a setting lands, what is refused
 //! and what is left out. This module maps the gateway's configuration onto
 //! that type, hands the gateway's own defaults to the comparison with a
@@ -10,17 +10,18 @@
 //!
 //! The routing settings are described twice: by this crate's configuration
 //! types, which the flags, the configuration file and the bindings fill, and
-//! by the policy crate's input type. The map below ties the two. It takes
+//! by the Grand Central crate's input type. The map below ties the two. It takes
 //! each policy, each mode and the sticky override apart field by field, with
 //! no `..`, so a setting added to one of them does not build until the map
 //! carries it.
 
-use smg_policy_controller::{
+use smg_grand_central::{
     document::{
         AppliedSpec, Assignment, ConnectionModeSetting, IndexKind, LoadMetricSetting, ModeSettings,
-        Pairing, PolicySettings, PolicySpec, RoutingKeyOverrideSettings, RoutingSettings,
-        RoutingSettingsError, SpecError,
+        OverloadSpec, Pairing, PolicySettings, PolicySpec, RoutingKeyOverrideSettings,
+        RoutingSettings, RoutingSettingsError, ShadowSpec, SpecError,
     },
+    engine::Phase,
     stages::StageRegistry,
 };
 use smg_worker::identity::basic::ConnectionMode;
@@ -31,13 +32,23 @@ use super::{
 };
 use crate::policies::cost::DEFAULT_POLICY as DEFAULT_SELECTION_POLICY;
 
+/// The overload veto's two words a gateway reads once for its process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct OverloadWords {
+    /// Whether the gateway's default thresholds veto at all.
+    pub(crate) protection: bool,
+    /// Whether a request is shed where every worker it could use is vetoed.
+    pub(crate) shed: bool,
+}
+
 impl RouterConfig {
     /// The policy document this configuration says, or the first of its
     /// settings that no document says.
     ///
     /// A pure function of the configuration. The document is not validated
-    /// here: the controller validates a document where it is applied, and
-    /// names there a stage its build does not run yet.
+    /// here, the encode mode of many routers apart: the controller
+    /// validates a document where it is applied, and names there a stage
+    /// its build does not run yet.
     pub fn policy_document(&self) -> Result<PolicySpec, RoutingSettingsError> {
         self.routing_settings().policy_document()
     }
@@ -52,8 +63,31 @@ impl RouterConfig {
         self.routing_settings().policy_document_in_force(&defaults)
     }
 
-    /// How strictly this gateway pairs a prefill with a decode. Where the
-    /// policy controller runs a supplied document, it is that document's
+    /// Whether Grand Central places this process's requests. It does
+    /// where Grand Central is on, with one exception: a gateway
+    /// whose every router is one provider's
+    /// ([`RoutingSettings::provider_alone`]) places its requests by no
+    /// routing policy. There the option moves nothing: no engine runs, the
+    /// classic policies stay, and the start says so in one log line.
+    ///
+    /// Every reader of the option asks here: the start, the policy
+    /// registry, the pairing mode in force and the validator's refusal of
+    /// a document.
+    ///
+    /// A supplied document is never dropped in silence. Beside one the
+    /// answer is yes under a provider's mode alone too, and the start then
+    /// refuses the document by the mode's name
+    /// ([`Self::policy_document_in_force`]). So a yes may still end in a
+    /// refused start.
+    pub(crate) fn engine_decides(&self) -> bool {
+        self.grand_central
+            && (self.policy_spec.is_some()
+                || self.policy_spec_path.is_some()
+                || self.routing_settings().provider_alone().is_none())
+    }
+
+    /// How strictly this gateway pairs a prefill with a decode. Where
+    /// Grand Central runs a supplied document, it is that document's
     /// `plans.pd-pair.pairing`: the engine pairs within the classes the
     /// gateway derives and derives none itself, so the document's word is
     /// the mode they are derived under. Everywhere else it is the
@@ -61,13 +95,86 @@ impl RouterConfig {
     /// mean states too.
     pub(crate) fn pd_pairing_in_force(&self) -> PdPairingMode {
         match &self.policy_spec {
-            Some(document) if self.policy_controller => match document.plans.pd_pair.pairing {
+            Some(document) if self.engine_decides() => match document.plans.pd_pair.pairing {
                 Pairing::Off => PdPairingMode::Off,
                 Pairing::Lenient => PdPairingMode::Lenient,
                 Pairing::Strict => PdPairingMode::Strict,
             },
             _ => self.pd_pairing_mode,
         }
+    }
+
+    /// The overload veto's two words in force: whether this gateway's
+    /// default thresholds veto at all, and whether a request is shed where
+    /// every worker it could use is vetoed. Where Grand Central
+    /// runs a supplied document they are the words of that document's
+    /// `overload` blocks ([`Self::supplied_overload_words`]): the worker
+    /// objects are built with one default and the routes read one shed
+    /// word, and the document's words are the ones they are built and read
+    /// under. Everywhere else they are the configuration's own two
+    /// settings. They are those two as well for a document whose two words
+    /// this gateway refuses, which no start runs.
+    pub(crate) fn overload_words_in_force(&self) -> OverloadWords {
+        let own = OverloadWords {
+            protection: self.worker_overload_protection,
+            shed: self.worker_overload_shed,
+        };
+        self.supplied_overload_words().ok().flatten().unwrap_or(own)
+    }
+
+    /// The two words of the `overload` blocks of the supplied document
+    /// Grand Central runs, and `None` where it runs none. A worker
+    /// object has one default set of thresholds and the routes read one
+    /// shed word for the process, so the bindings say each word once. A
+    /// binding with no block says the block's defaults, and so does a
+    /// document with no binding.
+    ///
+    /// Two documents are refused, each in words a start ends on. One whose
+    /// bindings differ on a word, by the path of the first binding that
+    /// differs from the first, with both values. And one whose block is on
+    /// while both of this gateway's thresholds are none: the switch would
+    /// switch nothing on. The Grand Central crate's comparison lets the two
+    /// thresholds stand beside a document whatever they are, so the rule
+    /// is this host's.
+    pub(crate) fn supplied_overload_words(&self) -> Result<Option<OverloadWords>, String> {
+        let document = match &self.policy_spec {
+            Some(document) if self.grand_central => document,
+            _ => return Ok(None),
+        };
+        let stock = OverloadSpec::default();
+        let mut blocks = document
+            .bindings
+            .iter()
+            .map(|binding| binding.overload.as_ref().unwrap_or(&stock));
+        let first = blocks.next().unwrap_or(&stock);
+        for (at, block) in (1..).zip(blocks) {
+            if block.enabled != first.enabled {
+                return Err(overload_word_differs(
+                    at,
+                    "enabled",
+                    block.enabled,
+                    "a gateway builds its workers with one default set of overload thresholds",
+                ));
+            }
+            if block.shed_when_all_vetoed != first.shed_when_all_vetoed {
+                return Err(overload_word_differs(
+                    at,
+                    "shed_when_all_vetoed",
+                    block.shed_when_all_vetoed,
+                    "a gateway's routes read one shed word for the process",
+                ));
+            }
+        }
+        if first.enabled
+            && self.worker_overload_waiting_requests.is_none()
+            && self.worker_overload_token_usage.is_none()
+        {
+            return Err("worker_overload_waiting_requests and worker_overload_token_usage are both none beside a policy document whose overload block is on: the block has no default threshold to switch on, and a worker's own thresholds veto either way; state a threshold, or switch the block off in the document".to_owned());
+        }
+        Ok(Some(OverloadWords {
+            protection: first.enabled,
+            shed: first.shed_when_all_vetoed,
+        }))
     }
 
     /// Validates the document over `stages`, with the gateway's own
@@ -77,12 +184,30 @@ impl RouterConfig {
     /// ([`StageRegistry::builtin`]), or the table a build of the host's own
     /// hands in, which holds the stages that build added. A document that
     /// names a stage the table does not hold is refused by the stage's name.
+    ///
+    /// A binding's shadows by side are refused as not in this build: this
+    /// gateway takes a shadow of a single request's binding alone. The
+    /// shadow of a binding whose phase list is not empty and leaves out
+    /// `single` would load and never run, and it is refused too.
     pub fn hosted_policy(
         &self,
         document: &PolicySpec,
         stages: &StageRegistry,
     ) -> Result<AppliedSpec, SpecError> {
-        AppliedSpec::validate_in(document, stages, &self.denied_view_headers())
+        let applied = AppliedSpec::validate_in(document, stages, &self.denied_view_headers())?;
+        for (index, binding) in document.bindings.iter().enumerate() {
+            let phases = &binding.matcher.phase;
+            let what = match binding.shadow {
+                Some(ShadowSpec::Sides(_)) => "a pair's shadow",
+                Some(_) if !phases.is_empty() && !phases.contains(&Phase::Single) => {
+                    "a shadow outside the single phase"
+                }
+                _ => continue,
+            };
+            let path = format!("bindings[{index}].shadow");
+            return Err(SpecError::NotInBuild { path, what });
+        }
+        Ok(applied)
     }
 
     /// The header names this gateway denies the view of a document it
@@ -91,7 +216,7 @@ impl RouterConfig {
         [self.tenant_resolution.tenant_header_name.as_str()]
     }
 
-    /// This configuration's routing settings in the policy crate's form,
+    /// This configuration's routing settings in the Grand Central crate's form,
     /// each under its own name. A mode's pools are the gateway's own and
     /// are left behind.
     fn routing_settings(&self) -> RoutingSettings {
@@ -170,8 +295,18 @@ impl RouterConfig {
     }
 }
 
-/// How a key seen for the first time picks its worker, in the policy
-/// crate's form: the manual policy's setting and the sticky override's.
+/// The refusal of a supplied document whose binding `at` says `said` under
+/// `field` of its `overload` block where the first binding says the other
+/// word. `one` is why a gateway reads the word once.
+fn overload_word_differs(at: usize, field: &str, said: bool, one: &str) -> String {
+    format!(
+        "bindings[{at}].overload.{field} = {said} is not the {} bindings[0] says, by its block or the block's default: {one}, so the bindings of its document say one word",
+        !said
+    )
+}
+
+/// How a key seen for the first time picks its worker, in the Grand
+/// Central crate's form: the manual policy's setting and the sticky override's.
 fn assignment(mode: ManualAssignmentMode) -> Assignment {
     match mode {
         ManualAssignmentMode::Random => Assignment::Random,
@@ -181,7 +316,7 @@ fn assignment(mode: ManualAssignmentMode) -> Assignment {
     }
 }
 
-/// A policy in the policy crate's form, each setting under its own name.
+/// A policy in the Grand Central crate's form, each setting under its own name.
 fn policy_settings(policy: &PolicyConfig) -> PolicySettings {
     match policy.clone() {
         PolicyConfig::Random => PolicySettings::Random,
@@ -225,7 +360,7 @@ fn policy_settings(policy: &PolicyConfig) -> PolicySettings {
             },
             cache_ttl_secs,
             cache_boundaries,
-            // The policy crate takes a selection policy other than the
+            // The Grand Central crate takes a selection policy other than the
             // default one, which no document says. The default's own name
             // is the default.
             selection_policy: selection_policy.filter(|named| named != DEFAULT_SELECTION_POLICY),
@@ -284,7 +419,7 @@ fn policy_settings(policy: &PolicyConfig) -> PolicySettings {
 
 #[cfg(test)]
 mod tests {
-    use smg_policy_controller::{
+    use smg_grand_central::{
         document::PRESETS,
         engine::{Candidate, Constraints, Filter, RequestFacts},
     };
@@ -386,6 +521,210 @@ mod tests {
         }
     }
 
+    /// A binding's `overload` block that says `enabled` and `shed`.
+    fn block(enabled: bool, shed: bool) -> OverloadSpec {
+        OverloadSpec {
+            enabled,
+            shed_when_all_vetoed: shed,
+            ..OverloadSpec::default()
+        }
+    }
+
+    /// The stock document with one binding for each of `blocks`, under that
+    /// `overload` block or under none: the last binding is the stock one,
+    /// and each binding ahead of it matches a model of its own.
+    fn bound(blocks: &[Option<OverloadSpec>]) -> PolicySpec {
+        let mut document = preset("round_robin");
+        let stock = document.bindings.remove(0);
+        let ahead = blocks.len().saturating_sub(1);
+        document.bindings = blocks
+            .iter()
+            .enumerate()
+            .map(|(at, block)| {
+                let mut binding = stock.clone();
+                if at < ahead {
+                    binding.matcher.model = format!("model-{at}");
+                }
+                binding.overload = block.clone();
+                binding
+            })
+            .collect();
+        document
+    }
+
+    /// A gateway that runs `document` under Grand Central, with
+    /// every routing setting at its default.
+    fn supplied(document: PolicySpec) -> RouterConfig {
+        RouterConfig {
+            grand_central: true,
+            policy_spec: Some(document),
+            ..RouterConfig::default()
+        }
+    }
+
+    /// Where Grand Central runs a supplied document, the overload
+    /// veto's two words are the ones its bindings say: the switch and the
+    /// shed word, a binding with no block saying the block's defaults. With
+    /// the option off, and with no document supplied, they are the
+    /// configuration's own two settings.
+    #[test]
+    fn a_supplied_documents_overload_words_are_the_ones_in_force() {
+        let words = |protection, shed| OverloadWords { protection, shed };
+        let own = RouterConfig {
+            worker_overload_protection: false,
+            worker_overload_shed: true,
+            ..RouterConfig::default()
+        };
+        assert_eq!(
+            RouterConfig::default().overload_words_in_force(),
+            words(true, false)
+        );
+        assert_eq!(own.overload_words_in_force(), words(false, true));
+        assert_eq!(own.supplied_overload_words(), Ok(None));
+
+        for (blocks, said) in [
+            (vec![None], words(true, false)),
+            (vec![Some(block(false, false))], words(false, false)),
+            (vec![Some(block(true, true))], words(true, true)),
+            (
+                vec![Some(block(false, true)), Some(block(false, true))],
+                words(false, true),
+            ),
+            // A binding with no block says the block's defaults.
+            (
+                vec![None, Some(block(true, false)), None],
+                words(true, false),
+            ),
+        ] {
+            let config = supplied(bound(&blocks));
+            assert_eq!(
+                config.supplied_overload_words(),
+                Ok(Some(said)),
+                "{blocks:?}"
+            );
+            assert_eq!(config.overload_words_in_force(), said, "{blocks:?}");
+            // With the option off the document is not read.
+            let off = RouterConfig {
+                grand_central: false,
+                ..config
+            };
+            assert_eq!(off.overload_words_in_force(), words(true, false));
+            assert_eq!(off.supplied_overload_words(), Ok(None));
+        }
+        // A document with no binding says the block's defaults.
+        let mut bare = preset("round_robin");
+        bare.bindings.clear();
+        assert_eq!(
+            supplied(bare).supplied_overload_words(),
+            Ok(Some(words(true, false)))
+        );
+    }
+
+    /// A worker object has one default set of thresholds and the routes
+    /// read one shed word. Bindings that differ on either word are refused
+    /// by the path of the first binding that differs from the first, with
+    /// both values. For such a document, which no start runs, the words
+    /// read are the configuration's own.
+    #[test]
+    fn bindings_that_differ_on_an_overload_word_are_refused_by_name() {
+        let refused = |blocks: &[Option<OverloadSpec>]| {
+            supplied(bound(blocks))
+                .supplied_overload_words()
+                .expect_err("the bindings differ")
+        };
+        assert_eq!(
+            refused(&[None, Some(block(true, true)), Some(block(false, true))]),
+            "bindings[1].overload.shed_when_all_vetoed = true is not the false bindings[0] says, by its block or the block's default: a gateway's routes read one shed word for the process, so the bindings of its document say one word"
+        );
+        assert_eq!(
+            refused(&[Some(block(false, false)), Some(block(false, false)), None]),
+            "bindings[2].overload.enabled = true is not the false bindings[0] says, by its block or the block's default: a gateway builds its workers with one default set of overload thresholds, so the bindings of its document say one word"
+        );
+        // The shed word differs either way round: set first, dropped later.
+        assert_eq!(
+            refused(&[Some(block(true, true)), None]),
+            "bindings[1].overload.shed_when_all_vetoed = false is not the true bindings[0] says, by its block or the block's default: a gateway's routes read one shed word for the process, so the bindings of its document say one word"
+        );
+        // A binding that differs on both words is named by its switch.
+        assert_eq!(
+            refused(&[None, Some(block(false, true))]),
+            "bindings[1].overload.enabled = false is not the true bindings[0] says, by its block or the block's default: a gateway builds its workers with one default set of overload thresholds, so the bindings of its document say one word"
+        );
+        let differs = RouterConfig {
+            worker_overload_shed: true,
+            ..supplied(bound(&[Some(block(false, false)), None]))
+        };
+        assert_eq!(
+            differs.overload_words_in_force(),
+            OverloadWords {
+                protection: true,
+                shed: true
+            }
+        );
+    }
+
+    /// Both thresholds at none leave a gateway no default threshold to veto
+    /// by, and a worker's own thresholds veto either way. They stand
+    /// beside a supplied document as every threshold does, so the comparison
+    /// takes the document, whatever it is. This gateway then refuses one
+    /// whose block is on, by the two settings' names and with the two ways
+    /// out, and takes one whose bindings switch the block off. One threshold
+    /// at none leaves the other to veto by.
+    #[test]
+    fn both_thresholds_at_none_are_refused_beside_a_document_whose_block_is_on() {
+        let none = |document: PolicySpec| RouterConfig {
+            worker_overload_waiting_requests: None,
+            worker_overload_token_usage: None,
+            ..supplied(document)
+        };
+        // A document of another policy than the default's: the comparison
+        // names no difference, and the refusal names the two settings.
+        let on = none(preset("round_robin"));
+        assert_eq!(on.policy_document_in_force(), Ok(preset("round_robin")));
+        assert_eq!(
+            on.supplied_overload_words(),
+            Err("worker_overload_waiting_requests and worker_overload_token_usage are both none beside a policy document whose overload block is on: the block has no default threshold to switch on, and a worker's own thresholds veto either way; state a threshold, or switch the block off in the document".to_owned())
+        );
+
+        let off = bound(&[Some(block(false, false)), Some(block(false, false))]);
+        let agreed = none(off.clone());
+        assert_eq!(agreed.policy_document_in_force(), Ok(off));
+        assert_eq!(
+            agreed.supplied_overload_words(),
+            Ok(Some(OverloadWords {
+                protection: false,
+                shed: false
+            }))
+        );
+
+        let one = RouterConfig {
+            worker_overload_token_usage: None,
+            ..supplied(preset("round_robin"))
+        };
+        assert_eq!(one.policy_document_in_force(), Ok(preset("round_robin")));
+        assert_eq!(
+            one.supplied_overload_words(),
+            Ok(Some(OverloadWords {
+                protection: true,
+                shed: false
+            }))
+        );
+
+        // The count alone at none leaves the usage to veto by.
+        let other = RouterConfig {
+            worker_overload_waiting_requests: None,
+            ..supplied(preset("round_robin"))
+        };
+        assert_eq!(other.policy_document_in_force(), Ok(preset("round_robin")));
+        assert_eq!(
+            other.supplied_overload_words(),
+            Ok(Some(OverloadWords {
+                protection: true,
+                shed: false
+            }))
+        );
+    }
+
     #[test]
     fn the_pin_to_an_engine_of_a_grouped_worker_moves_no_document() {
         // The dispatch pins a sticky key behind the decision, on the worker
@@ -416,7 +755,7 @@ mod tests {
     /// Each setting holds a value of its own, so a setting the map drops or
     /// writes under another name shows.
     #[test]
-    fn every_routing_setting_reaches_the_policy_crate_under_its_name() {
+    fn every_routing_setting_reaches_the_grand_central_crate_under_its_name() {
         let document = preset("round_robin");
         let mut config = RouterConfig {
             mode: RoutingMode::Regular {
@@ -493,7 +832,7 @@ mod tests {
         }
     }
 
-    /// The policy crate says the settings of a gateway whose configuration
+    /// The Grand Central crate says the settings of a gateway whose configuration
     /// sets none ([`RoutingSettings::default`]). Its tests of the
     /// translation run over them, and over a literal of the cache-aware
     /// policy at its flags' defaults: `cache_aware()` in its
@@ -502,7 +841,7 @@ mod tests {
     /// moves on either side fails this case. The usage threshold is
     /// compared in 64 bits here: the crate's own cases compare it in 32.
     #[test]
-    fn the_gateways_defaults_are_the_policy_crates_fixtures_of_them() {
+    fn the_gateways_defaults_are_the_grand_central_crates_fixtures_of_them() {
         assert_eq!(
             RouterConfig::default().routing_settings(),
             RoutingSettings::default()
@@ -532,7 +871,7 @@ mod tests {
     }
 
     #[test]
-    fn every_policy_reaches_the_policy_crate_with_its_settings() {
+    fn every_policy_reaches_the_grand_central_crate_with_its_settings() {
         let cache_aware = PolicyConfig::CacheAware {
             cache_threshold: 0.5,
             balance_abs_threshold: 2,
@@ -678,7 +1017,7 @@ mod tests {
     }
 
     #[test]
-    fn a_mode_reaches_the_policy_crate_with_its_side_policies_and_no_pool() {
+    fn a_mode_reaches_the_grand_central_crate_with_its_side_policies_and_no_pool() {
         let mode = |mode: RoutingMode| config_of(mode).routing_settings().mode;
         assert_eq!(
             mode(RoutingMode::PrefillDecode {
@@ -758,6 +1097,96 @@ mod tests {
         }
     }
 
+    /// The one test every reader of the option asks. Grand Central
+    /// places the requests of every configuration that turns Grand
+    /// Central on, a provider's mode alone apart: under the multi-router
+    /// setting that mode has the regular document. With the option off the
+    /// engine decides nowhere.
+    #[test]
+    fn the_engine_decides_under_the_option_save_in_a_providers_mode_alone() {
+        let modes = [
+            RoutingMode::Regular {
+                worker_urls: Vec::new(),
+            },
+            RoutingMode::PrefillDecode {
+                prefill_urls: Vec::new(),
+                decode_urls: Vec::new(),
+                prefill_policy: None,
+                decode_policy: None,
+            },
+            RoutingMode::EncodePrefillDecode {
+                encode_urls: Vec::new(),
+                prefill_urls: Vec::new(),
+                decode_urls: Vec::new(),
+                encode_policy: None,
+                prefill_policy: None,
+                decode_policy: None,
+            },
+            RoutingMode::OpenAI {
+                worker_urls: Vec::new(),
+            },
+            RoutingMode::Anthropic {
+                worker_urls: Vec::new(),
+            },
+            RoutingMode::Gemini {
+                worker_urls: Vec::new(),
+            },
+        ];
+        for mode in modes {
+            let provider = matches!(
+                mode,
+                RoutingMode::OpenAI { .. }
+                    | RoutingMode::Anthropic { .. }
+                    | RoutingMode::Gemini { .. }
+            );
+            for enable_igw in [false, true] {
+                let on = RouterConfig {
+                    grand_central: true,
+                    enable_igw,
+                    ..config_of(mode.clone())
+                };
+                let row = format!("{} with enable_igw = {enable_igw}", on.mode_type());
+                assert_eq!(on.engine_decides(), !provider || enable_igw, "{row}");
+                let off = RouterConfig {
+                    grand_central: false,
+                    ..on
+                };
+                assert!(!off.engine_decides(), "{row}, the option off");
+            }
+        }
+    }
+
+    /// A supplied document is never dropped in silence. Beside one the
+    /// answer is yes under a provider's mode alone too, and the document in
+    /// force is refused there by the mode's name. The path of a document
+    /// that was never loaded stands for a document.
+    #[test]
+    fn a_supplied_document_keeps_the_option_in_force_in_a_providers_mode_alone() {
+        let alone = RouterConfig {
+            grand_central: true,
+            ..config_of(RoutingMode::OpenAI {
+                worker_urls: Vec::new(),
+            })
+        };
+        assert!(!alone.engine_decides());
+
+        let supplied = RouterConfig {
+            policy_spec: Some(preset("round_robin")),
+            ..alone.clone()
+        };
+        assert!(supplied.engine_decides());
+        assert!(matches!(
+            supplied.policy_document_in_force(),
+            Err(RoutingSettingsError::UnsupportedSetting { setting: "mode", value, .. }) if value == "openai"
+        ));
+
+        let named = RouterConfig {
+            policy_spec_path: Some("routing.yaml".to_owned()),
+            ..alone
+        };
+        assert!(named.engine_decides());
+    }
+
     /// A pair gateway counts tokens on a prefill worker over HTTP alone: its
     /// document binds that single request there, behind the pair, and plans
     /// the pair alone over gRPC and over ZMQ, where no request would reach
@@ -780,6 +1209,90 @@ mod tests {
             };
             let document = config.policy_document().expect("the mode's document");
             assert_eq!(document.bindings.len(), bindings, "{connection_mode:?}");
+        }
+    }
+
+    /// A gateway of many routers in the encode mode starts under a main
+    /// policy the controller's check refuses: a prefix ring the view carries
+    /// no block for, or a cache-aware setting the build does not run. The
+    /// validator takes the configuration, and the document the gateway hosts
+    /// is the mode's three sides alone, as it was before the mode bound a
+    /// single request. A main policy the check takes binds one.
+    #[test]
+    fn an_encode_gateway_of_many_routers_starts_under_a_main_policy_the_check_refuses() {
+        use crate::config::validation::ConfigValidator;
+        let ring = |prefix_token_count, cache_boundaries| PolicyConfig::PrefixHash {
+            prefix_token_count,
+            load_factor: 1.25,
+            balance_abs_threshold: 10,
+            cache_boundaries,
+        };
+        let cached = |setting: &str| {
+            let mut policy = PolicyConfig::cache_aware(0.3, 64, 1.5, 120, 67_108_864);
+            if let PolicyConfig::CacheAware {
+                overlap_decay,
+                selection_temperature,
+                selection_accounting_ttl_ms,
+                balance_uncached_credit,
+                ..
+            } = &mut policy
+            {
+                match setting {
+                    "overlap_decay" => *overlap_decay = 0.5,
+                    "selection_temperature" => *selection_temperature = 0.05,
+                    "selection_accounting_ttl_ms" => *selection_accounting_ttl_ms = 200,
+                    "balance_uncached_credit" => *balance_uncached_credit = true,
+                    _ => {}
+                }
+            }
+            policy
+        };
+        for (row, policy, bindings) in [
+            ("a main ring of 15 tokens", ring(15, vec![]), 1),
+            ("a main ring of 4112 tokens", ring(4112, vec![]), 1),
+            ("a main ring over a boundary of 8", ring(256, vec![8]), 1),
+            (
+                "a main ring over a boundary of 8192",
+                ring(256, vec![8192]),
+                1,
+            ),
+            ("a main ring of 256 tokens", ring(256, vec![]), 2),
+            ("an overlap decay", cached("overlap_decay"), 1),
+            (
+                "a selection temperature",
+                cached("selection_temperature"),
+                1,
+            ),
+            (
+                "an accounting time",
+                cached("selection_accounting_ttl_ms"),
+                1,
+            ),
+            ("the uncached credit", cached("balance_uncached_credit"), 1),
+            ("a cache-aware main policy that sets none", cached(""), 2),
+        ] {
+            let round_robin = Some(PolicyConfig::RoundRobin);
+            let config = RouterConfig {
+                enable_igw: true,
+                grand_central: true,
+                policy,
+                ..config_of(RoutingMode::EncodePrefillDecode {
+                    encode_urls: Vec::new(),
+                    prefill_urls: Vec::new(),
+                    decode_urls: Vec::new(),
+                    encode_policy: round_robin.clone(),
+                    prefill_policy: round_robin.clone(),
+                    decode_policy: round_robin,
+                })
+            };
+            let checked = ConfigValidator::validate(&config);
+            assert!(checked.is_ok(), "{row}: {:?}", checked.err());
+            let document = config
+                .policy_document_in_force()
+                .expect("the settings' document");
+            let hosted = config.hosted_policy(&document, &StageRegistry::builtin());
+            assert!(hosted.is_ok(), "{row}: {:?}", hosted.err());
+            assert_eq!(document.bindings.len(), bindings, "{row}");
         }
     }
 
@@ -835,6 +1348,55 @@ mod tests {
             config.hosted_policy(&document, &StageRegistry::builtin()).err(),
             Some(SpecError::UnknownFilter { name, .. }) if name == "keeps-all"
         ));
+    }
+
+    /// One model's single binding with a shadow stands ahead of a pair's
+    /// binding. The single binding's shadow loads, and a shadow by side on
+    /// the pair's binding is refused by that binding's path. Scoped to the
+    /// decode phase, the single binding's shadow is refused too.
+    #[test]
+    fn a_pair_bindings_shadow_is_refused_as_not_in_this_build() {
+        let pairs = PolicySpec::pair_presets("round_robin", "round_robin");
+        let mut document = pairs.expect("the presets of a pair");
+        document.profiles.extend(preset("random").profiles);
+        let mut single = preset("round_robin");
+        document.profiles.append(&mut single.profiles);
+        let mut ahead = single.bindings.pop().expect("the single binding");
+        ahead.matcher.model = "one-model".to_owned();
+        ahead.shadow = Some(ShadowSpec::Profile("random".to_owned()));
+        document.bindings.insert(0, ahead);
+
+        let config = RouterConfig::default();
+        let refused = |document: &PolicySpec| {
+            config
+                .hosted_policy(document, &StageRegistry::builtin())
+                .err()
+        };
+        assert_eq!(refused(&document), None);
+
+        let pair = document.bindings.last_mut().expect("the pair's binding");
+        let by_side = [("prefill".to_owned(), "random".to_owned())];
+        pair.shadow = Some(ShadowSpec::Sides(by_side.into()));
+        assert_eq!(
+            refused(&document),
+            Some(SpecError::NotInBuild {
+                path: "bindings[1].shadow".to_owned(),
+                what: "a pair's shadow",
+            })
+        );
+
+        // No single request reaches a binding scoped to the decode phase:
+        // its shadow is named ahead of the pair's, and alone too.
+        let outside = Some(SpecError::NotInBuild {
+            path: "bindings[0].shadow".to_owned(),
+            what: "a shadow outside the single phase",
+        });
+        let ahead = document.bindings.first_mut().expect("the single binding");
+        ahead.matcher.phase = vec![Phase::Decode];
+        assert_eq!(refused(&document), outside);
+        let pair = document.bindings.last_mut().expect("the pair's binding");
+        pair.shadow = None;
+        assert_eq!(refused(&document), outside);
     }
 
     #[test]

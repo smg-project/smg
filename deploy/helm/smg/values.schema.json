@@ -317,7 +317,7 @@
         }
       }
     },
-    "policyController": {
+    "grandCentral": {
       "type": ["object", "null"],
       "additionalProperties": false,
       "if": {

@@ -846,25 +846,7 @@ async fn preprocess_batch(
         .encoder_field_layouts_for(Modality::Video)
         .model_specific;
     let audio_processor = if media.modality() == Modality::Audio {
-        Some(
-            ctx.spec
-                .audio_processor(
-                    &ctx.model_config.config,
-                    &ctx.model_config.preprocessor_config,
-                )
-                .map_err(|error| {
-                    anyhow::anyhow!(
-                        "The audio processor of model spec {} cannot be built: {error}",
-                        ctx.spec.name()
-                    )
-                })?
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "No audio processor registered for model spec: {}",
-                        ctx.spec.name()
-                    )
-                })?,
-        )
+        Some(ctx.model_config.audio_processor(ctx.spec)?)
     } else {
         None
     };

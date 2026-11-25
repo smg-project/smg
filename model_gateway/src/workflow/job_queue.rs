@@ -324,7 +324,7 @@ pub(crate) async fn cancel_registration(
 
 /// Whether the status entry under `url` is a registration job that has
 /// not ended: queued, or running (the type name of [`Job::job_type`]).
-fn add_worker_in_flight(queue: &JobQueue, url: &str) -> bool {
+pub(crate) fn add_worker_in_flight(queue: &JobQueue, url: &str) -> bool {
     queue.get_status(url).is_some_and(|status| {
         status.job_type == Job::REGISTRATION_TYPE
             && matches!(status.status.as_str(), "pending" | "processing")
@@ -1234,9 +1234,21 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_registration_reads_failed_with_its_reason_at_its_id() {
+        use axum::response::IntoResponse;
+
         use crate::{
-            admin::worker_service::WorkerService, endpoints::tokenize::get_tokenizer_status,
+            admin::worker_service::{GetWorkerResponse, WorkerService},
+            endpoints::tokenize::get_tokenizer_status,
         };
+
+        // A read as its client gets it: the address takes its shown form
+        // where the answer is written.
+        async fn written(read: GetWorkerResponse) -> serde_json::Value {
+            let bytes = axum::body::to_bytes(read.into_response().into_body(), usize::MAX)
+                .await
+                .expect("a body");
+            serde_json::from_slice(&bytes).expect("a JSON body")
+        }
 
         let context = create_test_app_context();
         let queue = JobQueue::new(JobQueueConfig::default(), Arc::downgrade(&context));
@@ -1265,17 +1277,18 @@ mod tests {
         let id = fail().await;
         let read = service
             .get_worker(id.as_str())
-            .expect("the id of a failed registration answers while its status is kept")
-            .0;
-        let status = read.job_status.expect("its job status");
-        assert_eq!(status.status, "failed");
+            .expect("the id of a failed registration answers while its status is kept");
+        // The result holds the address as registered until the answer is written.
+        assert_eq!(read.0.spec.url, url);
+        let read = written(read).await;
+        assert_eq!(read["job_status"]["status"], "failed");
         assert_eq!(
-            status.message.as_deref(),
-            Some("Workflow engines not initialized")
+            read["job_status"]["message"],
+            "Workflow engines not initialized"
         );
-        // No plain address: the view writes it as the job's own lines write it.
-        assert_eq!(read.spec.url, Endpoint::redacted_str(url));
-        assert_eq!(status.worker_url, read.spec.url);
+        // No plain address: the answer writes it as the job's own lines write it.
+        assert_eq!(read["url"], Endpoint::redacted_str(url));
+        assert_eq!(read["job_status"]["worker_url"], read["url"]);
         // The tokenizer status route takes the status of a tokenizer job alone.
         let at_tokenizers = get_tokenizer_status(&context, id.as_str()).await;
         assert_eq!(at_tokenizers.status().as_u16(), 404);
@@ -1288,8 +1301,8 @@ mod tests {
         // The pending view of a reserved id writes the address in that form too.
         let held = context.worker_registry.reserve_id_for_url(url);
         assert_eq!(
-            service.get_worker(held.as_str()).unwrap().0.spec.url,
-            read.spec.url
+            written(service.get_worker(held.as_str()).unwrap()).await["url"],
+            read["url"]
         );
 
         // A plain address reads as registered, byte for byte.
@@ -1306,7 +1319,7 @@ mod tests {
             )
             .await;
         assert_eq!(
-            service.get_worker(plain_id.as_str()).unwrap().0.spec.url,
+            written(service.get_worker(plain_id.as_str()).unwrap()).await["url"],
             plain
         );
     }
@@ -1834,11 +1847,13 @@ mod tests {
     }
 
     /// A gateway given no setting for it registers one worker per
-    /// data-parallel rank an engine names. An HTTP engine whose server info
-    /// names four ranks stands as four rank workers and none at its base
-    /// address. An engine that names one rank, one that names no size and
-    /// one whose server info fails to read each stand as one plain worker,
-    /// and none of the four registrations fails.
+    /// data-parallel rank an engine names, where the engine's load route
+    /// holds a row for every rank. An HTTP engine whose server info names
+    /// four ranks and whose load route names the four stands as four rank
+    /// workers and none at its base address. One whose load route is not
+    /// served, or names three of the four, stands as one plain worker, and
+    /// so does an engine that names one rank, one that names no size and
+    /// one whose server info fails to read. No registration fails.
     #[tokio::test]
     async fn a_registration_registers_one_worker_per_rank_the_engine_names() {
         use http::StatusCode;
@@ -1853,11 +1868,33 @@ mod tests {
         let context = live_app_context();
         let registry = &context.worker_registry;
         let marks = DashSet::new();
-        for (status, server_info, ranks) in [
-            (StatusCode::OK, json!({"dp_size": 2, "attn_dp_size": 2}), 4),
-            (StatusCode::OK, json!({"dp_size": 1}), 1),
-            (StatusCode::OK, json!({"version": "test"}), 1),
-            (StatusCode::INTERNAL_SERVER_ERROR, json!({"dp_size": 4}), 1),
+        let loads_of = |ranks: std::ops::Range<usize>| {
+            let rows: Vec<_> = ranks.map(|rank| json!({"dp_rank": rank})).collect();
+            (StatusCode::OK, json!({ "loads": rows }))
+        };
+        let unserved = (StatusCode::NOT_FOUND, json!({}));
+        for (status, server_info, loads, ranks) in [
+            (
+                StatusCode::OK,
+                json!({"dp_size": 2, "attn_dp_size": 2}),
+                loads_of(0..4),
+                4,
+            ),
+            (StatusCode::OK, json!({"dp_size": 4}), unserved, 1),
+            (StatusCode::OK, json!({"dp_size": 4}), loads_of(0..3), 1),
+            (StatusCode::OK, json!({"dp_size": 1}), loads_of(0..4), 1),
+            (
+                StatusCode::OK,
+                json!({"version": "test"}),
+                loads_of(0..4),
+                1,
+            ),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"dp_size": 4}),
+                loads_of(0..4),
+                1,
+            ),
         ] {
             // The model list names the runtime whose server info reports the
             // size, so each of the four is read the same way.
@@ -1874,6 +1911,7 @@ mod tests {
                     json!({"model_path": "m", "is_generation": true}),
                 ),
                 ("/server_info", status, server_info.clone()),
+                ("/v1/loads", loads.0, loads.1.clone()),
             ])
             .await;
             let job = Job::AddWorker {
@@ -1884,7 +1922,7 @@ mod tests {
 
             let result = execute_job(&job, &context, &marks, None).await;
 
-            let case = format!("{status} {server_info}");
+            let case = format!("{status} {server_info}, loads {} {}", loads.0, loads.1);
             assert!(result.is_ok(), "{case}: {result:?}");
             let mut workers = find_workers_by_url(registry, &base);
             workers.sort_by_key(|worker| worker.dp_rank());
@@ -2056,10 +2094,108 @@ mod tests {
         );
     }
 
+    /// An engine registered by a bare `host:port`, as service discovery
+    /// registers one, is asked its load route over HTTP as the reads before
+    /// it are, and stands as its two rank workers.
+    #[tokio::test]
+    async fn an_engine_at_a_bare_address_registers_its_ranks() {
+        use http::StatusCode;
+        use serde_json::json;
+
+        use crate::app_context::testing::live_app_context;
+
+        let two_ranks = (StatusCode::OK, json!({"dp_size": 2}));
+        let (base, _) = engine_whose_server_info_turns(two_ranks.clone(), two_ranks).await;
+        let context = live_app_context();
+        let marks = DashSet::new();
+        let bare = base.strip_prefix("http://").expect("an HTTP base");
+        let upsert = add_worker(bare, WorkerRegistrationMode::Upsert);
+
+        let result = execute_job(&upsert, &context, &marks, None).await;
+
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(
+            standing_at(&context, &base),
+            [format!("{base}@0"), format!("{base}@1")]
+        );
+    }
+
+    /// An engine keeps the shape of its first registration when its load
+    /// route turns, either way. One that answered by rank stands as two rank
+    /// workers, and an upsert made once the route is no longer served reads
+    /// no ranks: it is refused by name and the rank workers stay. One whose
+    /// route was not served stands as one plain worker, and an upsert made
+    /// once the route names both ranks is refused by name too.
+    #[tokio::test]
+    async fn an_engine_keeps_its_first_shape_when_its_load_route_turns() {
+        use std::sync::atomic::Ordering;
+
+        use http::StatusCode;
+        use serde_json::json;
+
+        use crate::app_context::testing::live_app_context;
+
+        let by_rank = (
+            StatusCode::OK,
+            json!({"loads": [{"dp_rank": 0}, {"dp_rank": 1}]}),
+        );
+        let unserved = (StatusCode::NOT_FOUND, json!({}));
+        for (first, then, ranked, refusal) in [
+            (
+                by_rank.clone(),
+                unserved.clone(),
+                true,
+                "stands as 2 rank workers and this registration read no data-parallel ranks",
+            ),
+            (
+                unserved,
+                by_rank,
+                false,
+                "stands as one worker and this registration read 2 data-parallel ranks",
+            ),
+        ] {
+            let (base, turned) = engine_whose_route_turns("/v1/loads", first, then).await;
+            let context = live_app_context();
+            let marks = DashSet::new();
+            let upsert = add_worker(&base, WorkerRegistrationMode::Upsert);
+            let stands = if ranked {
+                vec![format!("{base}@0"), format!("{base}@1")]
+            } else {
+                vec![base.clone()]
+            };
+
+            let first = execute_job(&upsert, &context, &marks, None).await;
+            assert!(first.is_ok(), "{first:?}");
+            assert_eq!(standing_at(&context, &base), stands);
+
+            turned.store(true, Ordering::Relaxed);
+            let second = execute_job(&upsert, &context, &marks, None).await;
+            assert!(
+                matches!(&second, Err(said) if said.contains(refusal)),
+                "{second:?}"
+            );
+            assert_eq!(standing_at(&context, &base), stands, "the first shape");
+        }
+    }
+
     /// An engine stub whose server info answers `first` until the switch it
     /// returns is set, and `then` from then on: a read that fails, or one
-    /// that comes back. Returns its base address and the switch.
+    /// that comes back. Its load route names two ranks. Returns its base
+    /// address and the switch.
     async fn engine_whose_server_info_turns(
+        first: (http::StatusCode, serde_json::Value),
+        then: (http::StatusCode, serde_json::Value),
+    ) -> (String, Arc<AtomicBool>) {
+        engine_whose_route_turns("/server_info", first, then).await
+    }
+
+    /// An engine stub of two ranks, one of whose routes turns: `path`
+    /// answers `first` until the switch it returns is set, and `then` from
+    /// then on. Its server info names two ranks and its load route holds a
+    /// row for each, where neither is the route that turns. Returns its base
+    /// address and the switch.
+    async fn engine_whose_route_turns(
+        path: &'static str,
         first: (http::StatusCode, serde_json::Value),
         then: (http::StatusCode, serde_json::Value),
     ) -> (String, Arc<AtomicBool>) {
@@ -2072,7 +2208,7 @@ mod tests {
         use crate::workflow::steps::local::test_support::{json_router, serve_router};
 
         let turned = Arc::new(AtomicBool::new(false));
-        let server_info = {
+        let turning = {
             let turned = Arc::clone(&turned);
             move || {
                 let (status, body) = if turned.load(Ordering::Relaxed) {
@@ -2083,7 +2219,7 @@ mod tests {
                 async move { (status, Json(body)) }
             }
         };
-        let router = json_router(vec![
+        let steady = vec![
             ("/health", StatusCode::OK, json!({"status": "ok"})),
             (
                 "/v1/models",
@@ -2095,8 +2231,15 @@ mod tests {
                 StatusCode::OK,
                 json!({"model_path": "m", "is_generation": true}),
             ),
-        ])
-        .route("/server_info", get(server_info));
+            ("/server_info", StatusCode::OK, json!({"dp_size": 2})),
+            (
+                "/v1/loads",
+                StatusCode::OK,
+                json!({"loads": [{"dp_rank": 0}, {"dp_rank": 1}]}),
+            ),
+        ];
+        let steady = steady.into_iter().filter(|(route, ..)| *route != path);
+        let router = json_router(steady.collect()).route(path, get(turning));
         (serve_router(router).await, turned)
     }
 

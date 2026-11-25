@@ -12,7 +12,10 @@ use http::{header::HeaderName, HeaderMap};
 use openai_protocol::UNKNOWN_MODEL_ID;
 use parking_lot::{Mutex, RwLock};
 use rustc_hash::FxBuildHasher;
-use smg_policy_controller::{document::Needs, engine::PolicyEngine};
+use smg_grand_central::{
+    document::{Needs, PolicySpec},
+    engine::{Engine, InProcess, Phase},
+};
 use smg_worker::{
     identity::{
         basic::{RequestCompletionSink, Worker, WorkerType},
@@ -33,8 +36,8 @@ use super::{
     hash_ring::HashRing,
     kept_rings::KeptRings,
     manual::{ExecutionBranch, PinState},
-    normalize_model_key, DPRankLoadPolicy, LoadBalancingPolicy, ManualConfig, ManualPolicy,
-    PolicyFactory, SelectWorkerInfo, WorkerRole,
+    normalize_model_key, DPRankLoadPolicy, LentTrees, LoadBalancingPolicy, ManualConfig,
+    ManualPolicy, PolicyFactory, SelectWorkerInfo, WorkerRole,
 };
 use crate::{
     config::types::{
@@ -81,7 +84,7 @@ impl RequestCompletionSink for PolicyCompletionSink {
 }
 
 /// What stands where a classic policy would in a registry whose gateway
-/// runs the policy engine ([`PolicyRegistry::for_policy_engine`]): in the
+/// runs Grand Central ([`PolicyRegistry::for_engine`]): in the
 /// default slot and the encode slot, so every getter hands it out. It is no
 /// classic policy, and the policy factory never makes it.
 ///
@@ -93,11 +96,13 @@ impl RequestCompletionSink for PolicyCompletionSink {
 ///
 /// It answers the two text questions from the registry's stored bits
 /// ([`TextNeeds`]), so a reader that asks the object a getter handed it
-/// gets the registry's answer. It reads no load report and no cache event,
-/// and it keeps no state of its own.
+/// gets the registry's answer. The one in the two side slots answers from
+/// the pairs' own bits: the pair routes ask those two objects, as they ask
+/// a classic registry's two side policies. It reads no load report and no
+/// cache event, and it keeps no state of its own.
 #[derive(Debug)]
 struct NoClassicPolicy {
-    /// The registry's text bits.
+    /// The registry's text bits: the document's, or the pairs' own.
     text_needs: Arc<AtomicU8>,
     /// The registry's count.
     asked: Arc<AtomicUsize>,
@@ -116,7 +121,7 @@ impl LoadBalancingPolicy for NoClassicPolicy {
     }
 
     fn name(&self) -> &'static str {
-        "policy_controller"
+        "grand_central"
     }
 
     fn needs_request_text(&self) -> bool {
@@ -141,9 +146,10 @@ impl LoadBalancingPolicy for NoClassicPolicy {
 /// added or removed, and a request reads one byte instead of walking the
 /// per-model map.
 ///
-/// Where the policy engine places every request the bits are its
+/// Where Grand Central places every request the bits are its
 /// document's answers ([`Self::of_document`]), written where the engine is
-/// set, and no policy is asked.
+/// set, and no policy is asked. A second value there holds what a pair's
+/// two decisions read ([`Self::of_pairs`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct TextNeeds(u8);
 
@@ -186,7 +192,7 @@ impl TextNeeds {
         Self(self.0 | other.0)
     }
 
-    /// What a document that needs `needs` answers, where the policy engine
+    /// What a document that needs `needs` answers, where Grand Central
     /// places every request. The text of a request that carries no token
     /// ids is read where a stage hashes the text's windows or places by the
     /// prompt's size, and the text of a request that carries them where a
@@ -197,6 +203,21 @@ impl TextNeeds {
         let with_tokens = needs.text;
         let without_tokens = with_tokens || needs.text_hashes || needs.prompt_size;
         Self::from_answers(without_tokens, with_tokens, true)
+    }
+
+    /// What a pair's two decisions read of a request's text under the
+    /// document `engine` runs: what some decision of the prefill phase and
+    /// some decision of the decode phase may read
+    /// ([`Engine::needs_for_phase`]). The engine keeps that answer by the
+    /// bindings' order, and a binding behind a catch-all one adds nothing
+    /// to a phase: a binding of single requests behind the pairs' asks no
+    /// text of a pair. That is the grain of the classic answer, the two
+    /// side policies' and not the main policy's. It names no model, so it
+    /// is one answer for every pair request: a text one model's pair reads
+    /// is built for every model's.
+    fn of_pairs(engine: &Engine) -> Self {
+        let read = |phase| Self::of_document(engine.needs_for_phase(phase));
+        read(Phase::Prefill).join(read(Phase::Decode))
     }
 
     /// Whether some policy wants the text of a request that carries token
@@ -229,6 +250,13 @@ pub struct PolicyRegistry {
     /// started before a concurrent addition's insert must not publish over
     /// the bits that addition published.
     text_needs_refresh: Arc<Mutex<()>>,
+
+    /// What a pair's two decisions read of a request's text under
+    /// Grand Central ([`TextNeeds::of_pairs`]): the answer of the stand-in
+    /// a registry made for the engine keeps in its two side slots, written
+    /// where the engine is set ([`Self::set_engine`]). A classic registry
+    /// never reads it: its two side policies answer for themselves.
+    pair_text_needs: Arc<AtomicU8>,
 
     /// Default policy instance (cached, immutable after creation)
     default_policy: Arc<dyn LoadBalancingPolicy>,
@@ -265,16 +293,22 @@ pub struct PolicyRegistry {
     // DP-rank policy: Supports the selection of dp-rank outside the engine.
     dp_rank_policy: Arc<OnceLock<Arc<dyn DPRankLoadPolicy>>>,
 
-    /// The policy engine, where the gateway started one
-    /// (`policy_controller: on`): set once at start
+    /// Grand Central, where the gateway started one
+    /// (`grand_central: on`): set once at start
     /// ([`Self::set_engine`]). The placement functions ask it then, for
     /// every request.
-    engine: Arc<OnceLock<&'static PolicyEngine>>,
+    engine: Arc<OnceLock<&'static InProcess>>,
+
+    /// The token trees Grand Central is lent, where its start asked
+    /// for them ([`Self::lend_token_trees`]). A worker the registry lost is
+    /// taken out of them by their own task
+    /// ([`LentTrees::follow_removals`]).
+    lent_trees: Arc<OnceLock<Arc<LentTrees>>>,
 
     /// Shared sticky selector for the routing-key override. `Some` when the
     /// override is enabled; consulted (instead of the configured policy) for keyed
     /// requests via [`PolicyRegistry::select_worker_for_model`]. `None` in a
-    /// registry made for the policy engine, whatever the settings say.
+    /// registry made for Grand Central, whatever the settings say.
     routing_key_sticky: Option<Arc<ManualPolicy>>,
 
     /// Whether the settings enable the routing-key override: what the
@@ -283,8 +317,8 @@ pub struct PolicyRegistry {
     routing_key_override: bool,
 
     /// Whether the classic policies place this gateway's requests. `false`
-    /// in a registry made for the policy engine
-    /// ([`Self::for_policy_engine`]): it makes no classic policy object,
+    /// in a registry made for Grand Central
+    /// ([`Self::for_engine`]): it makes no classic policy object,
     /// and what feeds one does nothing. Read at the start and at a
     /// worker's registration, never by a decision.
     classic: bool,
@@ -297,7 +331,7 @@ pub struct PolicyRegistry {
     /// The name the settings give each side's policy, by the side's place
     /// in [`Side`]: kept where the side is set
     /// ([`Self::set_side_policy`]), the first name set standing as the
-    /// first policy does. A registry made for the policy engine keeps this
+    /// first policy does. A registry made for Grand Central keeps this
     /// of a side and nothing else ([`Self::side_policy_name`]).
     side_names: Arc<[OnceLock<&'static str>; 3]>,
 
@@ -307,6 +341,9 @@ pub struct PolicyRegistry {
     routing_key_headers: Arc<Vec<HeaderName>>,
     /// How strictly PD placement pairs prefill and decode descriptors.
     pd_pairing_mode: PdPairingMode,
+    /// Grand Central decides under a document the gateway was supplied
+    /// ([`Self::runs_supplied_document`]).
+    supplied_document: bool,
     /// The hash rings kept between membership generations ([`KeptRings`]).
     rings: Arc<KeptRings>,
 }
@@ -371,8 +408,8 @@ impl PolicyRegistry {
         )
     }
 
-    /// The registry of a gateway whose requests the policy engine places
-    /// (`policy_controller: on`). It makes NO classic policy object, here or
+    /// The registry of a gateway whose requests Grand Central places
+    /// (`grand_central: on`). It makes NO classic policy object, here or
     /// later: its default slot and its encode slot hold a stand-in that
     /// places nothing, it keeps no pin table for the routing-key override,
     /// a worker's registration and a router's build add no policy to it,
@@ -381,25 +418,38 @@ impl PolicyRegistry {
     /// and the removal of a policy's trees and tables find no policy in
     /// it. A request that reached the stand-in would be refused, and
     /// counted ([`Self::classic_made_or_asked`]). The stand-in answers the
-    /// two text questions from the registry's stored answers.
+    /// two text questions from the registry's stored answers, and the two
+    /// side slots hold one that answers what a pair's own decisions read.
     /// What a route asks of the registry beside a policy stands as the
     /// settings say: the routing key's headers, whether the override is on,
     /// the pairing mode, the hash rings.
-    pub fn for_policy_engine(
+    pub fn for_engine(
         default_policy_config: PolicyConfig,
         routing_key_override: RoutingKeyOverrideConfig,
     ) -> Self {
         let text_needs = Arc::new(AtomicU8::new(TextNeeds::default().0));
+        let pair_text_needs = Arc::new(AtomicU8::new(TextNeeds::default().0));
         let asked = Arc::new(AtomicUsize::new(0));
-        let stand_in: Arc<dyn LoadBalancingPolicy> = Arc::new(NoClassicPolicy {
-            text_needs: Arc::clone(&text_needs),
-            asked: Arc::clone(&asked),
-        });
+        let stand_in_over = |text_needs: &Arc<AtomicU8>| -> Arc<dyn LoadBalancingPolicy> {
+            Arc::new(NoClassicPolicy {
+                text_needs: Arc::clone(text_needs),
+                asked: Arc::clone(&asked),
+            })
+        };
+        let stand_in = stand_in_over(&text_needs);
+        // The pair routes ask the two side slots' objects what they read,
+        // as they ask a classic registry's two side policies. Their
+        // stand-in answers for a pair's own decisions, and not for the
+        // whole document.
+        let pair_side = stand_in_over(&pair_text_needs);
         Self {
             // The stand-in reads the registry's text bits and counts on
             // the registry's count.
             text_needs,
+            pair_text_needs,
             made_or_asked: asked,
+            prefill_policy: Arc::new(OnceLock::from(Arc::clone(&pair_side))),
+            decode_policy: Arc::new(OnceLock::from(pair_side)),
             // The encode slot is filled: empty, its getter would build a
             // policy at each call.
             encode_policy: Arc::new(OnceLock::from(Arc::clone(&stand_in))),
@@ -416,19 +466,24 @@ impl PolicyRegistry {
 
     /// The registry of a gateway of `config`: the classic one
     /// ([`Self::with_override`]), or the one that makes no classic policy
-    /// where the configuration runs the policy controller
-    /// ([`Self::for_policy_engine`]), under the pairing mode in force
+    /// where Grand Central places the gateway's requests
+    /// (`RouterConfig::engine_decides`, [`Self::for_engine`]),
+    /// under the pairing mode in force
     /// (`RouterConfig::pd_pairing_in_force`): a supplied document's own
-    /// where the policy controller runs one, else the configuration's. The
-    /// one place that reads the option for the registry.
+    /// where Grand Central runs one, else the configuration's. It
+    /// knows whether the engine decides under a supplied document
+    /// (`Self::runs_supplied_document`). The one place that reads the
+    /// option for the registry.
     pub fn of_config(config: &RouterConfig) -> Self {
         let (policy, routing_key_override) =
             (config.policy.clone(), config.routing_key_override.clone());
-        let registry = if config.policy_controller {
-            Self::for_policy_engine(policy, routing_key_override)
+        let decides = config.engine_decides();
+        let mut registry = if decides {
+            Self::for_engine(policy, routing_key_override)
         } else {
             Self::with_override(policy, routing_key_override)
         };
+        registry.supplied_document = decides && config.policy_spec.is_some();
         registry.with_pd_pairing_mode(config.pd_pairing_in_force())
     }
 
@@ -460,6 +515,7 @@ impl PolicyRegistry {
             model_policies: Arc::new(DashMap::with_hasher(FxBuildHasher)),
             text_needs: Arc::new(AtomicU8::new(text_needs.0)),
             text_needs_refresh: Arc::new(Mutex::new(())),
+            pair_text_needs: Arc::default(),
             default_policy,
             default_policy_config,
             prefill_policy: Arc::new(OnceLock::new()),
@@ -470,6 +526,7 @@ impl PolicyRegistry {
             mesh_tree_sync: Arc::new(RwLock::new(None)),
             dp_rank_policy: Arc::new(OnceLock::new()),
             engine: Arc::new(OnceLock::new()),
+            lent_trees: Arc::new(OnceLock::new()),
             routing_key_sticky,
             routing_key_override: routing_key_override.enabled,
             classic,
@@ -477,6 +534,7 @@ impl PolicyRegistry {
             side_names: Arc::default(),
             routing_key_headers: Arc::new(routing_key_headers),
             pd_pairing_mode: PdPairingMode::default(),
+            supplied_document: false,
             rings: Arc::new(KeptRings::default()),
         }
     }
@@ -822,28 +880,81 @@ impl PolicyRegistry {
         }
     }
 
-    /// The policy engine that places every request, where the gateway
+    /// The Grand Central that places every request, where the gateway
     /// started one. `None` under the classic policies, which is every
-    /// gateway that does not set `policy_controller: on`.
+    /// gateway that does not set `grand_central: on`.
     #[inline]
-    pub(crate) fn engine(&self) -> Option<&'static PolicyEngine> {
+    pub(crate) fn engine(&self) -> Option<&'static InProcess> {
         self.engine.get().copied()
     }
 
     /// Hands the registry the engine the gateway started, once: a second
     /// engine is not taken. From here on the engine's document answers the
     /// text questions ([`TextNeeds::of_document`]): the stored answer is
-    /// written here, and a request reads it as before.
-    pub(crate) fn set_engine(&self, engine: &'static PolicyEngine) {
+    /// written here, and a request reads it as before. What a pair's two
+    /// decisions read is settled here once, of the engine that is taken
+    /// ([`TextNeeds::of_pairs`]): an engine keeps one document for its life.
+    pub(crate) fn set_engine(&self, engine: &'static InProcess) {
         if self.engine.set(engine).is_err() {
-            warn!("a policy engine is already set: the second one is not taken");
+            warn!("Grand Central is already set: the second one is not taken");
+        } else {
+            let pairs = TextNeeds::of_pairs(engine.spec().engine());
+            self.pair_text_needs.store(pairs.0, Ordering::Release);
         }
         self.refresh_text_needs();
     }
 
+    /// Whether Grand Central decides under a document the gateway was
+    /// supplied, and not under the one its routing settings mean. The names
+    /// the settings give the policies ([`Self::policy_name`],
+    /// [`Self::side_policy_name`]) then name nothing that runs: a row of a
+    /// traced request's decision record reads none of them. False for a
+    /// registry made of settings alone, as a classic one is, and beside a
+    /// document's path whose document was not loaded: that configuration
+    /// runs the settings' document.
+    pub(crate) fn runs_supplied_document(&self) -> bool {
+        self.supplied_document
+    }
+
+    /// The token trees Grand Central is lent, made at the first call
+    /// under the numbers of `document`, the document the engine runs, whose
+    /// block size is `page` tokens ([`LentTrees::of_document`]), and kept
+    /// here. The engine's start calls it, and only where its document reads
+    /// the prefixes sent to each worker: with the engine on no classic
+    /// policy is made that would keep such trees.
+    ///
+    /// The trees are made with the task that takes a worker `workers` lost
+    /// out of them ([`LentTrees::follow_removals`]), on the runtime the
+    /// call is made on. The start runs on one, the engine's own task needs
+    /// it. Where none is entered no task is started, nothing takes a worker
+    /// out of the trees, and a debug line says so.
+    pub(crate) fn lend_token_trees(
+        &self,
+        document: &PolicySpec,
+        page: u32,
+        workers: &WorkerRegistry,
+    ) -> Arc<LentTrees> {
+        let made = || {
+            let trees = Arc::new(LentTrees::of_document(document.clone(), page));
+            match tokio::runtime::Handle::try_current() {
+                Ok(runtime) => trees.follow_removals(workers, &runtime),
+                Err(_) => debug!("No runtime is entered: no task takes a worker that leaves out of the lent token trees"),
+            }
+            trees
+        };
+        Arc::clone(self.lent_trees.get_or_init(made))
+    }
+
+    /// The token trees Grand Central is lent, where its start asked
+    /// for them: for a case that reads what the start made.
+    #[cfg(test)]
+    pub(crate) fn lent_trees(&self) -> Option<Arc<LentTrees>> {
+        self.lent_trees.get().cloned()
+    }
+
     /// The name the settings give the main policy: what a classic selection
     /// counts a request under where its model has no policy of its own. An
-    /// answer of the policy engine that names no profile is counted under
+    /// answer of Grand Central that names no profile is counted under
     /// it, and no policy object is asked for the name.
     pub(crate) fn policy_name(&self) -> &'static str {
         self.default_policy_config.name()
@@ -853,7 +964,7 @@ impl PolicyRegistry {
     /// ([`Self::set_side_policy`]), and where they give the side none the
     /// name of the policy its getter falls back to: the main policy for a
     /// prefill or a decode side, `consistent_hashing` for an encode side.
-    /// A side of the policy engine's answer that names no profile is
+    /// A side of Grand Central's answer that names no profile is
     /// counted under it. No policy object is asked for the name, and a
     /// policy handed whole ([`Self::set_prefill_policy`]) names nothing
     /// here.
@@ -960,7 +1071,7 @@ impl PolicyRegistry {
 
     /// The request-completion observer a worker of this gateway is given
     /// at its registration: the registry's own ([`Self::completion_sink`])
-    /// under the classic policies, and none where the policy engine places
+    /// under the classic policies, and none where Grand Central places
     /// the requests. The engine hears a request's end from its placement,
     /// and a guard's drop then reaches no policy.
     pub fn worker_completion_sink(self: &Arc<Self>) -> Option<Arc<dyn RequestCompletionSink>> {
@@ -968,7 +1079,7 @@ impl PolicyRegistry {
     }
 
     /// What this registry counts for the rule that a gateway which runs
-    /// the policy engine uses no classic policy: the classic policy
+    /// Grand Central uses no classic policy: the classic policy
     /// objects it made or was handed, and the requests that reached its
     /// stand-in's placing call.
     ///
@@ -981,10 +1092,10 @@ impl PolicyRegistry {
     /// alone, and the router factory builds the rank policy only for a
     /// registry that keeps classic policies. One object is not counted,
     /// the consistent-hashing policy [`Self::get_encode_policy`] builds at
-    /// each call where no encode policy was set: a registry made for the
-    /// policy engine never builds it.
+    /// each call where no encode policy was set: a registry made for
+    /// Grand Central never builds it.
     ///
-    /// A registry made for the policy engine makes none of these. It
+    /// A registry made for Grand Central makes none of these. It
     /// reads zero until a request reaches its stand-in's placing call,
     /// which refuses the request and counts it. The stand-in a getter
     /// hands out is no classic object and does not count by itself: a
@@ -994,7 +1105,7 @@ impl PolicyRegistry {
     }
 
     /// Whether the classic policies place this gateway's requests:
-    /// `false` for a registry made for the policy engine. The router
+    /// `false` for a registry made for Grand Central. The router
     /// factory reads it before it builds a policy to hand over.
     pub(crate) fn keeps_classic_policies(&self) -> bool {
         self.classic
@@ -1005,9 +1116,10 @@ impl PolicyRegistry {
         self.made_or_asked.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// What the document in force needs of the host, where the policy
-    /// engine stands: the load poll and a worker's cache-event stream are
-    /// asked of it in a registry made for the engine.
+    /// What the document in force needs of the host, where Grand
+    /// Central stands: the load poll and the stored text answers are asked of
+    /// it in a registry made for the engine. They are a group's poll and one
+    /// stored byte, read with no model at hand.
     fn document_needs(&self) -> Option<Needs> {
         self.engine().map(|engine| engine.spec().needs())
     }
@@ -1028,7 +1140,8 @@ impl PolicyRegistry {
     /// Reconcile the policy that places requests on `worker` against the
     /// router's live in-flight count there (see
     /// [`LoadBalancingPolicy::reconcile_in_flight`]). The worker monitor
-    /// calls this once per load poll for every polled worker.
+    /// calls this at every batch of a group's load answers, for every
+    /// worker of the group.
     pub fn reconcile_in_flight(&self, worker: &dyn Worker) {
         if !self.classic {
             return;
@@ -1389,7 +1502,7 @@ impl PolicyRegistry {
     /// range over: the default policy and the per-model policies. Called
     /// where the per-model map changes; one recomputation at a time, so the
     /// bits published last are those of a walk that saw every earlier change.
-    /// Where the policy engine places every request its document answers
+    /// Where Grand Central places every request its document answers
     /// instead, and no policy is walked: called where the engine is set too.
     fn refresh_text_needs(&self) {
         let _one_at_a_time = self.text_needs_refresh.lock();
@@ -1428,7 +1541,16 @@ impl PolicyRegistry {
     }
 
     /// Whether the prefill or the decode policy reads the request text: the
-    /// pair routers' body question.
+    /// pair routers' body question. Under Grand Central the two side
+    /// slots hold a stand-in that answers what a pair's own decisions read
+    /// ([`TextNeeds::of_pairs`]), settled where the engine is set: a
+    /// request looks nothing up, and no kind of registry is tested here.
+    ///
+    /// The count route asks it too, though its request is decided as a
+    /// single one over the prefill pool: the classic pass asks the model's
+    /// main policy there (`select_pass`). Beside a main policy that reads
+    /// the text and sides that read none, either kind places a count with
+    /// no text.
     pub(crate) fn pair_needs_request_text(&self) -> bool {
         self.get_prefill_policy().needs_request_text()
             || self.get_decode_policy().needs_request_text()
@@ -1436,10 +1558,23 @@ impl PolicyRegistry {
 
     /// Whether `worker`'s stream carries its KV events into its model's
     /// index: what the policy that places requests on it reads
-    /// ([`Self::policy_for_worker`]).
+    /// ([`Self::policy_for_worker`]). Under Grand Central it is what a
+    /// decision of the worker's kind for its model reads
+    /// ([`Engine::needs_for`]), and not the document's whole list: a binding
+    /// that another kind of worker runs under opens no stream to this one.
+    /// The answer is no before an engine stands.
     pub(crate) fn worker_needs_kv_events(&self, worker: &dyn Worker) -> bool {
         if !self.classic {
-            return self.document_needs().is_some_and(|needs| needs.events);
+            let phase = match worker.worker_type() {
+                WorkerType::Regular => Phase::Single,
+                WorkerType::Prefill => Phase::Prefill,
+                WorkerType::Decode => Phase::Decode,
+                WorkerType::Encode => Phase::Encode,
+            };
+            return self.engine().is_some_and(|engine| {
+                let reads = engine.spec().engine().needs_for(worker.model_id(), phase);
+                reads.events
+            });
         }
         self.policy_for_worker(worker).needs_kv_events()
     }
@@ -1602,12 +1737,14 @@ impl LoadConsumer for PolicyRegistry {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse};
-    use smg_policy_controller::document::{AppliedSpec, Pairing, PolicySpec};
+    use smg_grand_central::document::{AppliedSpec, Pairing, PolicySpec};
     use smg_worker::{
         identity::basic::{Worker, WorkerLoadGuard, WorkerType},
         load::state::LoadSnapshot,
-        test_support::ready_worker,
+        test_support::{ready_worker, worker_with_model_aliases},
     };
     use tokio::sync::watch;
     use tracing_test::traced_test;
@@ -1636,20 +1773,19 @@ mod tests {
         registry.set_dp_rank_policy(Arc::new(crate::policies::MinimumTokensPolicy::new(None)));
     }
 
-    /// Where the policy engine places the requests the registry makes no
+    /// Where Grand Central places the requests the registry makes no
     /// classic policy object and keeps none it is handed. The same steps
     /// count eight under the classic policies: the default and the
     /// override's pin table at the start, then the labelled model's policy,
     /// the three sides', the one handed whole and the rank policy.
     #[test]
-    fn a_registry_made_for_the_policy_engine_makes_no_classic_policy_object() {
+    fn a_registry_made_for_the_engine_makes_no_classic_policy_object() {
         let classic = PolicyRegistry::with_override(PolicyConfig::RoundRobin, enabled_override());
         assert_eq!(classic.classic_made_or_asked(), 2);
         every_making_step(&classic);
         assert_eq!(classic.classic_made_or_asked(), 8);
 
-        let engine =
-            PolicyRegistry::for_policy_engine(PolicyConfig::RoundRobin, enabled_override());
+        let engine = PolicyRegistry::for_engine(PolicyConfig::RoundRobin, enabled_override());
         every_making_step(&engine);
         assert_eq!(engine.classic_made_or_asked(), 0);
         assert!(engine.get_policy("labelled").is_none());
@@ -1670,7 +1806,7 @@ mod tests {
     /// is available and sends nothing, and the registry counts it. A
     /// classic policy places the same workers.
     #[test]
-    fn the_stand_in_of_a_registry_made_for_the_policy_engine_places_no_request() {
+    fn the_stand_in_of_a_registry_made_for_the_engine_places_no_request() {
         let workers = vec![
             worker_of("http://w1", WorkerType::Regular),
             worker_of("http://w2", WorkerType::Regular),
@@ -1680,8 +1816,7 @@ mod tests {
         let placed = classic.get_default_policy().select_worker(&workers, &info);
         assert!(placed.is_some());
 
-        let engine =
-            PolicyRegistry::for_policy_engine(PolicyConfig::RoundRobin, enabled_override());
+        let engine = PolicyRegistry::for_engine(PolicyConfig::RoundRobin, enabled_override());
         for policy in [
             engine.get_default_policy(),
             engine.get_policy_or_default("any-model"),
@@ -1698,15 +1833,18 @@ mod tests {
     }
 
     /// The stand-in answers the two text questions from the registry's
-    /// stored bits, so the pair's text question, which asks the two side
-    /// getters' objects, reads what the registry stored.
+    /// stored bits, so a reader that asks the object a getter handed it
+    /// reads what the registry stored. The one in the two side slots reads
+    /// the pairs' own bits: the pair's text question, which asks the two
+    /// side getters' objects, follows those and not the document's.
     #[test]
     fn the_stand_in_answers_the_text_questions_from_the_registrys_stored_bits() {
-        let engine = PolicyRegistry::for_policy_engine(
+        let engine = PolicyRegistry::for_engine(
             PolicyConfig::cache_aware(0.5, 32, 1.1, 0, 4096),
             RoutingKeyOverrideConfig::default(),
         );
-        let stand_in = engine.get_prefill_policy();
+        let stand_in = engine.get_default_policy();
+        let sides = [engine.get_prefill_policy(), engine.get_decode_policy()];
         let answers = |policy: &Arc<dyn LoadBalancingPolicy>| {
             (
                 policy.needs_request_text(),
@@ -1716,10 +1854,18 @@ mod tests {
         assert_eq!(answers(&stand_in), (false, false));
         assert!(!engine.pair_needs_request_text());
 
+        // The document's bits: a pair's two sides do not read them.
         engine.text_needs.store(TextNeeds::TEXT, Ordering::Release);
         assert_eq!(answers(&stand_in), (true, false));
-        assert!(engine.pair_needs_request_text());
         assert!(engine.any_policy_needs_request_text(None));
+        assert_eq!(sides.each_ref().map(answers), [(false, false); 2]);
+        assert!(!engine.pair_needs_request_text());
+
+        // The pairs' own bits: each side's object reads them.
+        let text = TextNeeds::TEXT;
+        engine.pair_text_needs.store(text, Ordering::Release);
+        assert_eq!(sides.each_ref().map(answers), [(true, false); 2]);
+        assert!(engine.pair_needs_request_text());
 
         let both = TextNeeds::TEXT | TextNeeds::TEXT_WITH_TOKENS;
         engine.text_needs.store(both, Ordering::Release);
@@ -1727,14 +1873,15 @@ mod tests {
         assert_eq!(engine.classic_made_or_asked(), 0);
     }
 
-    /// Under the policy engine the load poll and a worker's cache-event
-    /// stream follow what the document in force reads, whatever policy the
-    /// classic settings name, and nothing is asked before an engine stands.
+    /// Under Grand Central the load poll follows what the document in
+    /// force reads and a worker's cache-event stream what its own binding
+    /// reads, whatever policy the classic settings name, and nothing is
+    /// asked before an engine stands.
     #[test]
-    fn under_the_policy_engine_loads_and_cache_events_follow_the_document() {
+    fn under_the_engine_loads_and_cache_events_follow_the_document() {
         let asked = |settings: PolicyConfig, preset: &str| {
             let registry =
-                PolicyRegistry::for_policy_engine(settings, RoutingKeyOverrideConfig::default());
+                PolicyRegistry::for_engine(settings, RoutingKeyOverrideConfig::default());
             let worker = worker_of("http://w1:8000", WorkerType::Regular);
             let ask = |registry: &PolicyRegistry| {
                 (
@@ -1745,7 +1892,7 @@ mod tests {
             assert_eq!(ask(&registry), (false, false));
             let document = PolicySpec::preset(preset).expect("a stock preset");
             let spec = AppliedSpec::validate(&document).expect("a valid document");
-            registry.set_engine(Box::leak(Box::new(PolicyEngine::new(spec))));
+            registry.set_engine(Box::leak(Box::new(InProcess::new(spec))));
             assert_eq!(registry.classic_made_or_asked(), 0);
             ask(&registry)
         };
@@ -1754,13 +1901,13 @@ mod tests {
         assert_eq!(asked(PolicyConfig::RoundRobin, "cache_aware"), (true, true));
     }
 
-    /// Under the policy engine a supplied document's pairing is the mode
+    /// Under Grand Central a supplied document's pairing is the mode
     /// the registry answers, by which every pair route reads its pair
     /// index: the engine pairs within the classes that index states. The
     /// configuration's own mode stands with the option off, and under the
     /// document the routing settings mean, which states that mode.
     #[test]
-    fn under_the_policy_engine_a_supplied_documents_pairing_is_the_registrys() {
+    fn under_the_engine_a_supplied_documents_pairing_is_the_registrys() {
         let pair_mode = || RoutingMode::PrefillDecode {
             prefill_urls: vec![],
             decode_urls: vec![],
@@ -1781,7 +1928,7 @@ mod tests {
             document.plans.pd_pair.pairing = pairing;
             let supplied = RouterConfig {
                 mode: pair_mode(),
-                policy_controller: true,
+                grand_central: true,
                 policy_spec: Some(document.clone()),
                 ..RouterConfig::default()
             };
@@ -1790,7 +1937,7 @@ mod tests {
             assert_eq!(PolicyRegistry::of_config(&supplied).pd_pairing_mode(), mode);
             // With the option off no document is in force.
             let off = RouterConfig {
-                policy_controller: false,
+                grand_central: false,
                 ..supplied
             };
             assert_eq!(
@@ -1800,7 +1947,7 @@ mod tests {
         }
         let settings = RouterConfig {
             mode: pair_mode(),
-            policy_controller: true,
+            grand_central: true,
             pd_pairing_mode: PdPairingMode::Strict,
             ..RouterConfig::default()
         };
@@ -1808,6 +1955,49 @@ mod tests {
             PolicyRegistry::of_config(&settings).pd_pairing_mode(),
             PdPairingMode::Strict
         );
+    }
+
+    /// The registry of a gateway that was supplied a policy document knows
+    /// it ([`PolicyRegistry::runs_supplied_document`]), with the document's
+    /// path beside it or without. One made of the routing settings alone
+    /// does not, with Grand Central on or off. Neither does one
+    /// beside a document that the option leaves unread, nor one beside a
+    /// path whose document was not loaded: the document in force there is
+    /// the one the routing settings mean.
+    #[test]
+    fn a_registry_knows_whether_its_gateway_runs_a_supplied_document() {
+        let on = RouterConfig {
+            grand_central: true,
+            ..RouterConfig::default()
+        };
+        let supplied = RouterConfig {
+            policy_spec: Some(PolicySpec::preset("round_robin").expect("a stock preset")),
+            ..on.clone()
+        };
+        let path = || Some("policy.yaml".to_owned());
+        let read_from_its_path = RouterConfig {
+            policy_spec_path: path(),
+            ..supplied.clone()
+        };
+        let not_loaded = RouterConfig {
+            policy_spec_path: path(),
+            ..on.clone()
+        };
+        assert_eq!(
+            not_loaded.policy_document_in_force(),
+            not_loaded.policy_document(),
+            "the settings' document"
+        );
+        let unread = RouterConfig {
+            grand_central: false,
+            ..supplied.clone()
+        };
+        let knows =
+            |config: &RouterConfig| PolicyRegistry::of_config(config).runs_supplied_document();
+        assert_eq!([&supplied, &read_from_its_path].map(knows), [true, true]);
+        let settings_alone = [&on, &RouterConfig::default(), &unread, &not_loaded].map(knows);
+        assert_eq!(settings_alone, [false; 4]);
+        assert!(!PolicyRegistry::new(PolicyConfig::RoundRobin).runs_supplied_document());
     }
 
     /// The static needs the host answers before any request exists: a
@@ -1822,6 +2012,112 @@ mod tests {
         assert!(registry.needs_backend_loads());
         assert!(registry.worker_needs_kv_events(regular.as_ref()));
         assert!(registry.pair_needs_request_text());
+    }
+
+    /// Under Grand Central a worker's stream and a pair request's text
+    /// follow what their own decisions read, a side at a time, as the
+    /// classic answers follow the side policies. Under a document of two
+    /// families the pair's binding asks nothing of a regular worker, and the
+    /// binding behind it nothing of a pair. The stored text answer, which a
+    /// single route reads with no model at hand, stays the document's.
+    #[test]
+    fn under_the_engine_a_stream_and_a_pairs_text_follow_their_own_decisions() {
+        let cache_aware = || PolicyConfig::cache_aware(0.3, 64, 1.5, 120, 67_108_864);
+        let round_robin = || PolicyConfig::RoundRobin;
+        let under = |mode: RoutingMode, main: PolicyConfig, pairs_of: Option<&str>| {
+            let settings = RouterConfig {
+                mode,
+                policy: main,
+                ..RouterConfig::default()
+            };
+            let registry = PolicyRegistry::for_engine(
+                settings.policy.clone(),
+                settings.routing_key_override.clone(),
+            );
+            let mut document = settings.policy_document().expect("the settings' document");
+            if let Some(model) = pairs_of {
+                document.bindings[0].matcher.model = model.to_owned();
+            }
+            let spec = AppliedSpec::validate(&document).expect("a valid document");
+            registry.set_engine(Box::leak(Box::new(InProcess::new(spec))));
+            registry
+        };
+        let pairs = |prefill: PolicyConfig, decode: PolicyConfig| RoutingMode::PrefillDecode {
+            prefill_urls: Vec::new(),
+            decode_urls: Vec::new(),
+            prefill_policy: Some(prefill),
+            decode_policy: Some(decode),
+        };
+        let asked = |registry: &PolicyRegistry| {
+            let stream =
+                |kind| registry.worker_needs_kv_events(worker_of("grpc://w:9000", kind).as_ref());
+            (
+                [
+                    stream(WorkerType::Prefill),
+                    stream(WorkerType::Decode),
+                    stream(WorkerType::Regular),
+                    stream(WorkerType::Encode),
+                ],
+                registry.pair_needs_request_text(),
+                registry.any_policy_needs_request_text(None),
+            )
+        };
+        // Round-robin sides under a cache-aware main policy: the pair reads
+        // no cache event and no text. The binding behind it is every other
+        // phase's, and reads both.
+        let quiet_pairs = under(pairs(round_robin(), round_robin()), cache_aware(), None);
+        let streams = [false, false, true, true];
+        assert_eq!(asked(&quiet_pairs), (streams, false, true));
+        // The other way round.
+        let reading_pairs = under(pairs(cache_aware(), cache_aware()), round_robin(), None);
+        let streams = [true, true, false, false];
+        assert_eq!(asked(&reading_pairs), (streams, true, true));
+        assert_eq!(quiet_pairs.classic_made_or_asked(), 0);
+        // One side that reads: its own workers stream, and the pair's text is
+        // read whichever side it is.
+        let reading_prefill = under(pairs(cache_aware(), round_robin()), round_robin(), None);
+        let streams = [true, false, false, false];
+        assert_eq!(asked(&reading_prefill), (streams, true, true));
+        let reading_decode = under(pairs(round_robin(), cache_aware()), round_robin(), None);
+        let streams = [false, true, false, false];
+        assert_eq!(asked(&reading_decode), (streams, true, true));
+        // A second engine is not taken: every answer stays the first one's.
+        let quiet = RouterConfig {
+            mode: pairs(round_robin(), round_robin()),
+            policy: cache_aware(),
+            ..RouterConfig::default()
+        };
+        let document = quiet.policy_document().expect("the settings' document");
+        let spec = AppliedSpec::validate(&document).expect("a valid document");
+        reading_decode.set_engine(Box::leak(Box::new(InProcess::new(spec))));
+        assert_eq!(asked(&reading_decode), (streams, true, true));
+
+        // A pair binding of one model that reads, ahead of a quiet binding
+        // of every model. The pair's answer names no model, so the text is
+        // read. A stream is its worker's model's: a prefill worker of that
+        // model streams, and one of another model does not.
+        let one_models = under(
+            pairs(cache_aware(), cache_aware()),
+            round_robin(),
+            Some("m"),
+        );
+        assert_eq!(asked(&one_models), ([false; 4], true, true));
+        let its_own = worker_with_model_aliases("grpc://m:9000", "m", &[], WorkerType::Prefill);
+        assert!(one_models.worker_needs_kv_events(its_own.as_ref()));
+
+        // Three sides are one binding, and its encode phase is the encode
+        // side's own: an encode worker alone streams.
+        let three_sides = RoutingMode::EncodePrefillDecode {
+            encode_urls: Vec::new(),
+            prefill_urls: Vec::new(),
+            decode_urls: Vec::new(),
+            encode_policy: Some(cache_aware()),
+            prefill_policy: Some(round_robin()),
+            decode_policy: Some(round_robin()),
+        };
+        let reading_encode = under(three_sides, round_robin(), None);
+        let streams = [false, false, false, true];
+        assert_eq!(asked(&reading_encode), (streams, false, true));
     }
 
     /// An encode worker's KV-event question is the encode policy's own
@@ -3402,6 +3698,53 @@ mod tests {
         assert!(tree_of(&policy, "llama-3").is_empty());
     }
 
+    /// A registry made for Grand Central keeps the token trees the
+    /// engine is lent: none until the start asks, one owner however often
+    /// it asks, under the numbers of the document the start hands it. The
+    /// trees are made with their task: a worker the worker registry lost is
+    /// taken out of them, and the call that takes a worker out of a
+    /// cache-aware policy's trees finds no policy in such a registry.
+    #[tokio::test]
+    async fn a_worker_that_left_is_taken_out_of_the_lent_trees() {
+        let config = RouterConfig {
+            policy: cache_aware_config(),
+            ..RouterConfig::default()
+        };
+        let document = config.policy_document().expect("the settings' document");
+        let registry =
+            PolicyRegistry::for_engine(config.policy.clone(), RoutingKeyOverrideConfig::default());
+        let workers = WorkerRegistry::new();
+        for url in ["http://w1:8000", "http://w2:8000"] {
+            workers.register(ready_worker(url, "llama-3"));
+        }
+        assert!(registry.lent_trees().is_none());
+        let trees = registry.lend_token_trees(&document, 8, &workers);
+        assert!(Arc::ptr_eq(
+            &trees,
+            &registry.lend_token_trees(&document, 8, &workers)
+        ));
+        let tokens: Vec<u32> = (0..64).collect();
+        let tree = trees.token_tree("llama-3");
+        assert_eq!(tree.page_size(), 8, "the block size the start handed");
+        tree.insert_tokens(&tokens, "http://w1:8000");
+        tree.insert_tokens(&tokens, "http://w2:8000");
+
+        workers
+            .remove_by_url("http://w1:8000")
+            .expect("the removal");
+        let bound = Instant::now() + Duration::from_secs(60);
+        while tree.get_tenant_token_counts().len() > 1 {
+            assert!(Instant::now() < bound, "the trees' task never purged");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let kept: Vec<String> = tree.get_tenant_token_counts().into_keys().collect();
+        assert_eq!(kept, ["http://w2:8000"]);
+        // The removal step makes its call with the engine on too.
+        let left = HashSet::from(["http://w1:8000".to_owned()]);
+        registry.remove_workers_from_cache_aware("llama-3", &left);
+        assert_eq!(registry.classic_made_or_asked(), 0);
+    }
+
     #[test]
     fn init_pd_cache_aware_policies_fills_both_role_trees() {
         let registry = PolicyRegistry::new(PolicyConfig::RoundRobin);
@@ -3726,7 +4069,7 @@ mod tests {
     /// Hands `reg` an engine over a stock preset's document, as the
     /// gateway's start hands the one it started.
     fn preset_engine_on(reg: &PolicyRegistry, preset: &str) {
-        use smg_policy_controller::document::{AppliedSpec, PolicySpec};
+        use smg_grand_central::document::{AppliedSpec, PolicySpec};
 
         use crate::routers::common::placement::tests::engine_on;
 
@@ -3737,7 +4080,7 @@ mod tests {
         );
     }
 
-    /// Where the policy engine places every request its document answers
+    /// Where Grand Central places every request its document answers
     /// the text questions, from the call that sets the engine on, and the
     /// settings' policy is asked nothing: each row's settings say the
     /// opposite of its document. A document reads the text of a request
@@ -3749,16 +4092,17 @@ mod tests {
     /// routing-tokens hint lifts the need as it does under a classic
     /// policy, and a change of the membership keeps the document's answer.
     ///
-    /// Both registries answer so: the one a gateway makes where the policy
-    /// controller runs, and a classic one handed an engine. The first
+    /// Both registries answer so: the one a gateway makes where Grand
+    /// Central runs, and a classic one handed an engine. The first
     /// answers nothing before its engine is set, hands the pair's question
-    /// the same stored answer through its stand-in, and makes no classic
-    /// policy object.
+    /// the pairs' own stored answer through its stand-in, and makes no
+    /// classic policy object. Under one binding of every phase that answer
+    /// is the document's. The second asks its two side policies.
     #[test]
     fn an_engines_document_answers_the_text_questions() {
         type Made = fn(PolicyConfig, RoutingKeyOverrideConfig) -> PolicyRegistry;
         let kinds: [(Made, bool); 2] = [
-            (PolicyRegistry::for_policy_engine, false),
+            (PolicyRegistry::for_engine, false),
             (PolicyRegistry::with_override, true),
         ];
         let keyed = headers_with_routing_key("session-A");
@@ -3797,8 +4141,11 @@ mod tests {
                 assert_eq!(answers(&reg), documents, "{preset}: a worker added");
                 reg.on_model_unserved("m");
                 assert_eq!(answers(&reg), documents, "{preset}: its model unserved");
+                // A classic registry asks its two side policies, here the
+                // settings' one: the pairs' stored answer is never its own.
+                let pairs = if classic { !reads } else { reads };
+                assert_eq!(reg.pair_needs_request_text(), pairs, "{preset}");
                 if !classic {
-                    assert_eq!(reg.pair_needs_request_text(), reads, "{preset}");
                     assert_eq!(reg.classic_made_or_asked(), 0, "{preset}");
                 }
             }
@@ -3811,14 +4158,14 @@ mod tests {
     /// give no policy answers what its getter falls back to: the main
     /// policy, and `consistent_hashing` for an encode side. Under the
     /// classic policies the name is the one the side's policy object
-    /// answers for itself. A registry made for the policy engine answers
+    /// answers for itself. A registry made for Grand Central answers
     /// the same names and makes no policy object for them.
     #[test]
     fn the_settings_name_each_side_of_a_pair() {
         let sides = [Side::Prefill, Side::Decode, Side::Encode];
         let names = |reg: &PolicyRegistry| sides.map(|side| reg.side_policy_name(side));
         let classic = PolicyRegistry::new(PolicyConfig::RoundRobin);
-        let engine = PolicyRegistry::for_policy_engine(
+        let engine = PolicyRegistry::for_engine(
             PolicyConfig::RoundRobin,
             RoutingKeyOverrideConfig::default(),
         );
@@ -3848,7 +4195,7 @@ mod tests {
 
     /// The name the registry answers for the settings' main policy is the
     /// name that policy's object answers for itself, for every policy the
-    /// settings can name: a selection the policy engine counts under the
+    /// settings can name: a selection Grand Central counts under the
     /// settings' name is counted where a classic selection counts it.
     #[test]
     fn the_settings_name_each_policy_as_it_names_itself() {

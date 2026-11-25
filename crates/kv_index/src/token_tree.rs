@@ -1199,14 +1199,18 @@ impl TokenTree {
         // remaining slice for the splice.
         let mut matched_tokens = 0usize;
         let mut remaining = tokens;
-        // Every full-match node we descended through, in order, and the tenant
-        // the match stamped on it (`None` once the match is frozen). Each node
-        // is cloned once, into `path`; `current` indexes it (`None` = root).
-        let mut path: Vec<NodeRef> = Vec::with_capacity(16);
-        let mut stamped: Vec<Option<TenantId>> = Vec::with_capacity(16);
-        // The page key each edge of `path` was descended by, so the replay can
-        // confirm an edge still exists before it attaches a tenant under it.
-        let mut keys: Vec<TokenPageKey> = Vec::with_capacity(16);
+        // Every full-match node we descended through, in order, with the tenant
+        // the match stamped on it (`None` once the match is frozen) and the page
+        // key its edge was descended by, so the replay can confirm an edge still
+        // exists before it attaches a tenant under it. Each node is cloned once,
+        // into `path`; `current` indexes it (`None` = root). One list, so one
+        // allocation a request.
+        struct Step {
+            node: NodeRef,
+            stamped: Option<TenantId>,
+            key: TokenPageKey,
+        }
+        let mut path: Vec<Step> = Vec::with_capacity(16);
         let mut current: Option<usize> = None;
         // Where the match resolved: the deepest full-match node that had a
         // tenant (an index into `path`), or the partial-match node.
@@ -1229,7 +1233,7 @@ impl TokenTree {
         while remaining.len() >= page_size {
             let page_key = page_key_of(remaining, page_size);
             let current_node = match current {
-                Some(i) => &path[i],
+                Some(i) => &path[i].node,
                 None => &self.root,
             };
 
@@ -1303,9 +1307,11 @@ impl TokenTree {
                     if tenant.is_some() {
                         last_full = Some(path.len());
                     }
-                    path.push(next);
-                    stamped.push(tenant);
-                    keys.push(page_key);
+                    path.push(Step {
+                        node: next,
+                        stamped: tenant,
+                        key: page_key,
+                    });
                     remaining = &remaining[advance..];
                     current = Some(path.len() - 1);
                 }
@@ -1316,10 +1322,11 @@ impl TokenTree {
         let (tenant, matched_tenants) = match (&partial, last_full) {
             (Some((node, t)), _) => (Arc::clone(t), node.matched_tenants()),
             (None, Some(i)) => (
-                stamped[i]
+                path[i]
+                    .stamped
                     .as_ref()
                     .map_or_else(|| intern_tenant("empty"), Arc::clone),
-                path[i].matched_tenants(),
+                path[i].node.matched_tenants(),
             ),
             (None, None) => (intern_tenant("empty"), Vec::new()),
         };
@@ -1373,7 +1380,8 @@ impl TokenTree {
         // detach that came first shows here as a lost edge; an attach that
         // came first leaves a node the detach keeps.
         let mut lost_edge = false;
-        for (i, (node, matched)) in path.iter().zip(&stamped).enumerate() {
+        for (i, step) in path.iter().enumerate() {
+            let (node, matched) = (&step.node, &step.stamped);
             // The match stamped this very tenant on this node a moment ago (the
             // common hit: the request routes to the worker it matched). While
             // it is still attached there is nothing to re-stamp or credit: the
@@ -1395,8 +1403,12 @@ impl TokenTree {
                 }
                 continue;
             }
-            let parent = if i == 0 { &self.root } else { &path[i - 1] };
-            let edge = parent.children.get(&keys[i]);
+            let parent = if i == 0 {
+                &self.root
+            } else {
+                &path[i - 1].node
+            };
+            let edge = parent.children.get(&step.key);
             if !edge
                 .as_ref()
                 .is_some_and(|edge| Arc::ptr_eq(edge.value(), node))
@@ -1447,7 +1459,7 @@ impl TokenTree {
             // `insert_tokens`. The matched prefix above `current` was already
             // re-attached by the loop above and is never re-walked.
             let fall_off = match current {
-                Some(i) => Arc::clone(&path[i]),
+                Some(i) => Arc::clone(&path[i].node),
                 None => Arc::clone(&self.root),
             };
             let (added, ends_at) = Self::insert_from(
@@ -1466,7 +1478,7 @@ impl TokenTree {
             // The whole aligned sequence was matched: it ends at the deepest
             // node of the path (the replay above attached the tenant there).
             let end = match current {
-                Some(i) => &path[i],
+                Some(i) => &path[i].node,
                 None => &self.root,
             };
             self.record_hash(end, path_hash);
@@ -1660,6 +1672,13 @@ impl TokenTree {
         node: &NodeRef,
         tenant_id: &TenantId,
     ) -> (usize, Option<(NodeRef, u64)>) {
+        // The ownership leaves and the length is read under one `tokens` read
+        // guard, as a replay credits it: a concurrent split truncates the node
+        // and clones its tenant map in one `tokens` write section, so it hands
+        // the tenant's prefix to the new node with its count, or it runs behind
+        // both steps. Read apart, a split between the two debited the truncated
+        // length alone: the prefix stayed counted with no node behind it.
+        let tokens = node.tokens.read();
         if node
             .tenant_last_access_time
             .remove(tenant_id.as_ref())
@@ -1668,7 +1687,11 @@ impl TokenTree {
             return (0, None);
         }
 
-        let node_tokens = node.tokens.read().len();
+        let node_tokens = tokens.len();
+        // The guard ends ahead of the clean-up, which takes the parent's
+        // entry: a splitting insert holds that entry while it waits to write
+        // these tokens.
+        drop(tokens);
         let parent_leaf_info = self.cleanup_empty_ancestors_with_parent(node, tenant_id);
 
         (node_tokens, parent_leaf_info)
@@ -1790,14 +1813,26 @@ impl TokenTree {
     }
 
     /// Remove a tenant from every node (including the root), detach nodes
-    /// the removal emptied, and drop the tenant's token-count entry.
-    /// Size-based eviction never fires for a tenant whose count no longer
-    /// grows, so removed workers must be purged eagerly.
+    /// the removal emptied, and drop the tenant's token-count entry once it
+    /// reads zero. Size-based eviction never fires for a tenant whose count
+    /// no longer grows, so removed workers must be purged eagerly.
+    ///
+    /// Inserts for the tenant may run beside the purge, so its count is
+    /// debited by what each removal took out, as eviction debits, and is
+    /// never dropped whole. An insert counts behind the nodes it attached,
+    /// and a split hands the tenant's prefix to a new node: a count dropped
+    /// whole left such a node standing uncounted, so the total read short
+    /// by it and the tenant's next purge returned at a count of zero. A
+    /// node a split makes between the walk and its child's removal stays
+    /// the tenant's, counted, until its next purge. What can still drift is
+    /// a count with no node behind it: a node attached ahead of the walk
+    /// whose insert counts behind the debit. Such a count stays with the
+    /// tenant's entry.
     pub fn remove_tenant_all(&self, tenant_id: &TenantId) {
         let expected_tokens = self.tenant_token_size(tenant_id);
         self.root.tenant_last_access_time.remove(tenant_id.as_ref());
         if expected_tokens == 0 {
-            self.tenant_token_count.remove(tenant_id.as_ref());
+            self.drop_count_at_zero(tenant_id);
             return;
         }
 
@@ -1813,12 +1848,19 @@ impl TokenTree {
             nodes.clear();
             self.collect_tenant_nodes(&self.root, tenant_id, &mut nodes);
         }
+        let mut removed = 0;
         for node in &nodes {
-            self.remove_tenant_and_cleanup(node, tenant_id);
+            removed += self.remove_tenant_and_cleanup(node, tenant_id).0;
         }
-        if let Some((_, count)) = self.tenant_token_count.remove(tenant_id.as_ref()) {
-            self.total_token_count.fetch_sub(count, Ordering::Relaxed);
-        }
+        self.sub_tenant_tokens(tenant_id, removed);
+        self.drop_count_at_zero(tenant_id);
+    }
+
+    /// Drops a tenant's count entry where it reads zero, and only there: an
+    /// insert may have counted since the entry was last read.
+    fn drop_count_at_zero(&self, tenant_id: &TenantId) {
+        self.tenant_token_count
+            .remove_if(tenant_id.as_ref(), |_, count| *count == 0);
     }
 
     /// Fast tenant walk for the common prefix-closed ownership shape. If a

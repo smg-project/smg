@@ -7,28 +7,28 @@ on:
       - '.github/workflows/benchmark-policy-store.yml'
       - '.github/bench-gates/policy-store.toml'
       - 'scripts/bench_gate.py'
-      - 'crates/policy_controller/Cargo.toml'
-      - 'crates/policy_controller/benches/store_view.rs'
-      - 'crates/policy_controller/benches/common/mod.rs'
-      - 'crates/policy_controller/benches/common/placed.rs'
-      - 'crates/policy_controller/src/**'
-      - '!crates/policy_controller/src/**/tests/**'
-      - '!crates/policy_controller/src/**/tests.rs'
-      - '!crates/policy_controller/src/**/*_test.rs'
+      - 'crates/grand_central/Cargo.toml'
+      - 'crates/grand_central/benches/store_view.rs'
+      - 'crates/grand_central/benches/common/mod.rs'
+      - 'crates/grand_central/benches/common/placed.rs'
+      - 'crates/grand_central/src/**'
+      - '!crates/grand_central/src/**/tests/**'
+      - '!crates/grand_central/src/**/tests.rs'
+      - '!crates/grand_central/src/**/*_test.rs'
   pull_request:
     branches: [ main, release/** ]
     paths:
       - '.github/workflows/benchmark-policy-store.yml'
       - '.github/bench-gates/policy-store.toml'
       - 'scripts/bench_gate.py'
-      - 'crates/policy_controller/Cargo.toml'
-      - 'crates/policy_controller/benches/store_view.rs'
-      - 'crates/policy_controller/benches/common/mod.rs'
-      - 'crates/policy_controller/benches/common/placed.rs'
-      - 'crates/policy_controller/src/**'
-      - '!crates/policy_controller/src/**/tests/**'
-      - '!crates/policy_controller/src/**/tests.rs'
-      - '!crates/policy_controller/src/**/*_test.rs'
+      - 'crates/grand_central/Cargo.toml'
+      - 'crates/grand_central/benches/store_view.rs'
+      - 'crates/grand_central/benches/common/mod.rs'
+      - 'crates/grand_central/benches/common/placed.rs'
+      - 'crates/grand_central/src/**'
+      - '!crates/grand_central/src/**/tests/**'
+      - '!crates/grand_central/src/**/tests.rs'
+      - '!crates/grand_central/src/**/*_test.rs'
   workflow_dispatch:
   schedule:
     - cron: '0 0 * * 0'
@@ -48,7 +48,7 @@ jobs:
     env:
       # Both bench binaries of this job place every function on a 64-byte
       # boundary, as the decision gate's do and for its reason
-      # (.github/bench-gates/policy-engine.toml). RUSTFLAGS replaces the list in
+      # (.github/bench-gates/grand-central-engine.toml). RUSTFLAGS replaces the list in
       # .cargo/config.toml, so the outliner flag is repeated here.
       RUSTFLAGS: -C llvm-args=-enable-machine-outliner=never -C llvm-args=-align-all-functions=6
     steps:
@@ -76,7 +76,7 @@ jobs:
           cp scripts/bench_gate.py .github/bench-gates/policy-store.toml "$RUNNER_TEMP/bench-gate/"
           python3 scripts/bench_gate.py build --gates .github/bench-gates/policy-store.toml \
             --out "$RUNNER_TEMP/bench-gate/pr" -- \
-            cargo bench -p smg-policy-controller --bench store_view --no-run
+            cargo bench -p smg-grand-central --bench store_view --no-run
 
       # A base without the bench source (the pull request that adds it, a release
       # branch it was not backported to) has nothing to gate against: the base
@@ -90,10 +90,10 @@ jobs:
           source "$HOME/.cargo/env"
           head=$(git rev-parse HEAD)
           git -c advice.detachedHead=false checkout --quiet "$(git rev-parse HEAD^1)"
-          if [ -f crates/policy_controller/benches/store_view.rs ]; then
+          if [ -f crates/grand_central/benches/store_view.rs ]; then
             python3 "$RUNNER_TEMP/bench-gate/bench_gate.py" build --gates "$RUNNER_TEMP/bench-gate/policy-store.toml" \
               --sources-from "$head" --out "$RUNNER_TEMP/bench-gate/base" -- \
-              cargo bench -p smg-policy-controller --bench store_view --no-run
+              cargo bench -p smg-grand-central --bench store_view --no-run
             echo "present=true" >> "$GITHUB_OUTPUT"
           else
             echo "The base has no store_view bench; nothing to gate against."
@@ -121,12 +121,12 @@ jobs:
           set -o pipefail
           python3 scripts/bench_gate.py run --gates .github/bench-gates/policy-store.toml \
             --base "$RUNNER_TEMP/bench-gate/base" --pr "$RUNNER_TEMP/bench-gate/pr" \
-            --cwd crates/policy_controller --out bench-gate 2>&1 | tee benchmark_output.txt
+            --cwd crates/grand_central --out bench-gate 2>&1 | tee benchmark_output.txt
 
       - name: Run the pull request's benchmark (no base to gate against)
         if: github.event_name == 'pull_request' && steps.base.outputs.present != 'true'
         timeout-minutes: 40
-        working-directory: crates/policy_controller
+        working-directory: crates/grand_central
         run: |
           set -o pipefail
           CRITERION_HOME="$GITHUB_WORKSPACE/target/criterion" "$RUNNER_TEMP/bench-gate/pr" --bench --noplot 2>&1 | tee "$GITHUB_WORKSPACE/benchmark_output.txt"
@@ -137,7 +137,7 @@ jobs:
         run: |
           source "$HOME/.cargo/env"
           set -o pipefail
-          cargo bench -p smg-policy-controller --bench store_view 2>&1 | tee benchmark_output.txt
+          cargo bench -p smg-grand-central --bench store_view 2>&1 | tee benchmark_output.txt
 
       - name: Upload benchmark results
         if: always()

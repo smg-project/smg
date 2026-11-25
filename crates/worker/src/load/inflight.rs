@@ -130,7 +130,8 @@ impl fmt::Debug for WorkerRoutingKeyLoad {
 /// when the body is dropped: at the stream's end or the client's disconnect.
 ///
 /// A guard can keep one value of its maker's to the request's end
-/// ([`WorkerLoadGuard::keeping`]). The guard never reads it: it lets it go
+/// ([`WorkerLoadGuard::keeping`]). The guard never reads it: it hands it
+/// back to its maker's question ([`WorkerLoadGuard::kept`]) and lets it go
 /// where the guard is dropped, behind the worker's load.
 pub struct WorkerLoadGuard {
     worker: Arc<dyn Worker>,
@@ -150,6 +151,8 @@ impl WorkerLoadGuard {
 
     /// The guard's one copy of the key, made by the constructor that resolved
     /// it; the worker's keyed-load bookkeeping borrows it from here on.
+    // Always in line: on every request's path, and the call cost more than the body.
+    #[inline(always)]
     fn with_owned_key(worker: Arc<dyn Worker>, routing_key: Option<String>) -> Self {
         worker.increment_load();
         Self::from_acquired_load(worker, routing_key)
@@ -193,6 +196,24 @@ impl WorkerLoadGuard {
         Self::with_owned_key(worker, self.routing_key.clone())
     }
 
+    /// This guard, counted under `routing_key` from here on: for a request
+    /// whose key is known only behind the guard's making. The worker and
+    /// its load stand, and what the guard keeps stays with it. The key's
+    /// count is raised before the count of the key the guard held is
+    /// lowered, so the request is at no instant counted under no key. A
+    /// guard that holds `routing_key` already is handed back as it is.
+    #[must_use]
+    pub fn under_key(mut self, routing_key: &str) -> Self {
+        if self.routing_key.as_deref() == Some(routing_key) {
+            return self;
+        }
+        self.worker.increment_routing_key_load(routing_key);
+        if let Some(held) = self.routing_key.replace(routing_key.to_owned()) {
+            self.worker.decrement_routing_key_load(&held);
+        }
+        self
+    }
+
     fn from_acquired_load(worker: Arc<dyn Worker>, routing_key: Option<String>) -> Self {
         if let Some(ref key) = routing_key {
             worker.increment_routing_key_load(key);
@@ -216,6 +237,15 @@ impl WorkerLoadGuard {
         self
     }
 
+    /// What the guard keeps for its maker ([`Self::keeping`]), for that
+    /// maker to find again while the guard stands. The guard still reads
+    /// nothing of it. `None` for a guard that keeps nothing.
+    #[inline]
+    #[must_use]
+    pub fn kept(&self) -> Option<&(dyn Any + Send + Sync)> {
+        self.kept.as_deref()
+    }
+
     /// Whether this guard counts `worker`'s load: the same worker object.
     #[must_use]
     pub fn counts(&self, worker: &Arc<dyn Worker>) -> bool {
@@ -224,6 +254,8 @@ impl WorkerLoadGuard {
 }
 
 impl Drop for WorkerLoadGuard {
+    // Always in line: on every request's path, and the call cost more than the body.
+    #[inline(always)]
     fn drop(&mut self) {
         self.worker.decrement_load();
         if let Some(ref key) = self.routing_key {
@@ -544,5 +576,40 @@ mod tests {
         seen.store(0, Ordering::Relaxed);
         drop(twin);
         assert_eq!((worker.load(), seen.load(Ordering::Relaxed)), (0, 0));
+    }
+
+    /// A guard counts under another key from the call on: the worker's load
+    /// stands, the key the guard held is counted no more, the new key is
+    /// counted to the guard's drop, and what the guard keeps stays with it.
+    /// A guard under that key already is handed back as it is, and a guard
+    /// with no key takes one the same way.
+    #[test]
+    fn a_guard_counts_under_another_key_from_the_call_on() {
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://w1:8000")
+                .worker_type(WorkerType::Prefill)
+                .build(),
+        );
+        let counts = |key: &str| (worker.load(), worker.routing_key_inflight(key));
+        let seen = Arc::new(AtomicUsize::new(0));
+        let kept = LoadAtDrop(Arc::clone(&worker), Arc::clone(&seen));
+        let guard =
+            WorkerLoadGuard::with_key(Arc::clone(&worker), Some("route")).keeping(Box::new(kept));
+        assert_eq!((counts("route"), counts("engine")), ((1, 1), (1, 0)));
+
+        let guard = guard.under_key("engine");
+        assert_eq!((counts("route"), counts("engine")), ((1, 0), (1, 1)));
+        assert_eq!(worker.routing_key_load(), 1, "one key in flight, not two");
+        let guard = guard.under_key("engine");
+        assert_eq!(counts("engine"), (1, 1), "the same key counts once");
+        assert_eq!(seen.load(Ordering::Relaxed), 0, "what it keeps stays");
+        drop(guard);
+        assert_eq!((counts("route"), counts("engine")), ((0, 0), (0, 0)));
+        assert_eq!(seen.load(Ordering::Relaxed), 100, "behind the load");
+
+        let plain = WorkerLoadGuard::with_key(Arc::clone(&worker), None).under_key("engine");
+        assert_eq!(counts("engine"), (1, 1));
+        drop(plain);
+        assert_eq!((counts("engine"), worker.routing_key_load()), ((0, 0), 0));
     }
 }

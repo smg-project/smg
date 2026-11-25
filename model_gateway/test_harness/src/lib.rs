@@ -56,7 +56,7 @@ use smg::{
 use smg_data_connector::{
     MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage, StorageBundle,
 };
-use smg_policy_controller::stages::StageRegistry;
+use smg_grand_central::stages::StageRegistry;
 use smg_worker::{
     health::liveness,
     identity::basic::{RuntimeType, Worker, WorkerType},
@@ -453,17 +453,17 @@ impl AppTestContext {
 }
 
 tokio::task_local! {
-    /// The table of stages a test lent the policy engine of the contexts it
+    /// The table of stages a test lent the Grand Central of the contexts it
     /// builds ([`with_policy_stages`]).
     static POLICY_STAGES: StageRegistry;
 }
 
-/// Runs `test` with `stages` lent to the policy engine of every context it
+/// Runs `test` with `stages` lent to the Grand Central of every context it
 /// builds by [`create_test_context`] or one of its siblings in this file,
 /// which [`AppTestContext`] and the gRPC harness call. The builders of
 /// `test_app` start no engine and read no table. Where a context's
-/// configuration runs the policy controller
-/// (`policy_controller: true`), this harness starts the engine by the
+/// configuration runs Grand Central
+/// (`grand_central: true`), this harness starts the engine by the
 /// gateway's own start, over the document in force (a supplied one,
 /// `policy_spec`, too) validated against `stages`. It is the table a host
 /// brings a served gateway (`smg::server::Extensions::policy_stages`): the
@@ -476,47 +476,47 @@ pub async fn with_policy_stages<T>(stages: StageRegistry, test: impl Future<Outp
     POLICY_STAGES.scope(stages, test).await
 }
 
-/// The environment value that runs a test run's contexts under the policy
-/// controller, whatever their configuration says:
-/// `SMG_TEST_POLICY_CONTROLLER=on`. It reaches the contexts built by
+/// The environment value that runs a test run's contexts under Grand
+/// Central, whatever their configuration says:
+/// `SMG_TEST_GRAND_CENTRAL=on`. It reaches the contexts built by
 /// [`create_test_context`] or one of its siblings in this file, which
 /// [`AppTestContext`] and the gRPC harness call: a test binary built on
-/// them runs on the policy engine with no change to its tests. The
+/// them runs on Grand Central with no change to its tests. The
 /// builders of `test_app` (`create_test_app`, `create_test_app_context`
 /// and `create_test_app_context_with_config`) do not read it and start
 /// no engine: a case built on them runs on the classic policies under
 /// the value too.
-pub const POLICY_CONTROLLER_ENV: &str = "SMG_TEST_POLICY_CONTROLLER";
+pub const GRAND_CENTRAL_ENV: &str = "SMG_TEST_GRAND_CENTRAL";
 
-/// Whether this run turns the policy controller on for the contexts the
-/// value reaches ([`POLICY_CONTROLLER_ENV`]).
-pub fn policy_controller_forced() -> bool {
-    std::env::var(POLICY_CONTROLLER_ENV).is_ok_and(|value| value == "on")
+/// Whether this run turns Grand Central on for the contexts the
+/// value reaches ([`GRAND_CENTRAL_ENV`]).
+pub fn grand_central_forced() -> bool {
+    std::env::var(GRAND_CENTRAL_ENV).is_ok_and(|value| value == "on")
 }
 
-/// Starts the policy engine of a context this harness builds, where its
-/// configuration runs the policy controller: by the gateway's own start
-/// ([`AppContextBuilder::start_policy_engine_by_hand`]), over the table the
+/// Starts the Grand Central of a context this harness builds, where its
+/// configuration runs Grand Central: by the gateway's own start
+/// ([`AppContextBuilder::start_engine_by_hand`]), over the table the
 /// test lent ([`with_policy_stages`]) or else the stock one. A refused
-/// document fails the test with the refusal's words. With the policy
-/// controller off nothing is started.
+/// document fails the test with the refusal's words. With Grand
+/// Central off nothing is started.
 #[expect(
     clippy::expect_used,
     reason = "test helper - panicking on failure is intentional"
 )]
-fn start_policy_engine(
+fn start_engine(
     config: &RouterConfig,
     policies: &PolicyRegistry,
     registry: &Arc<WorkerRegistry>,
     monitor: &WorkerMonitor,
 ) {
     let start = |stages: Option<&StageRegistry>| {
-        AppContextBuilder::start_policy_engine_by_hand(config, stages, policies, registry, monitor)
+        AppContextBuilder::start_engine_by_hand(config, stages, policies, registry, monitor)
     };
     POLICY_STAGES
         .try_with(|stages| start(Some(stages)))
         .unwrap_or_else(|_| start(None))
-        .expect("the policy engine starts");
+        .expect("Grand Central starts");
 }
 
 /// Shared `AppContext` construction tail for the `create_test_context_*`
@@ -541,8 +541,8 @@ async fn build_test_app_context(
 ) -> Arc<AppContext> {
     use smg_mcp::McpOrchestrator;
 
-    if policy_controller_forced() {
-        config.policy_controller = true;
+    if grand_central_forced() {
+        config.grand_central = true;
     }
 
     // See `test_app::create_test_app_context`: no environment proxy in a test's path.
@@ -575,7 +575,7 @@ async fn build_test_app_context(
     // `AppContextBuilder::from_config` builds it: under its pairing mode
     // (without it a test router pairs under the default mode whatever its
     // configuration says), and with no classic policy where the
-    // configuration runs the policy controller.
+    // configuration runs Grand Central.
     let worker_registry = Arc::new(WorkerRegistry::new());
     let policy_registry = Arc::new(PolicyRegistry::of_config(&config));
 
@@ -600,10 +600,10 @@ async fn build_test_app_context(
         config.disable_load_monitoring,
     )));
 
-    // The policy engine behind the load monitor, as the server's builder
+    // Grand Central behind the load monitor, as the server's builder
     // starts it: nothing where the configuration leaves the controller off.
     if let Some(monitor) = &worker_monitor {
-        start_policy_engine(&config, &policy_registry, &worker_registry, monitor);
+        start_engine(&config, &policy_registry, &worker_registry, monitor);
     }
 
     // Create empty OnceLock for worker job queue, workflow engines, and mcp orchestrator

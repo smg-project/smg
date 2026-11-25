@@ -20,7 +20,7 @@ use smg_worker::identity::{
 use tracing::{debug, error, warn};
 
 use super::{
-    context_length::pair_context_length,
+    context_length::{output_budget, pair_context_length},
     helpers,
     pd_protocol::{EncodeHandoff, PdProtocol},
     ContextRequirements,
@@ -47,7 +47,7 @@ use crate::{
             },
             prefill_admission::{
                 acquire_prefill, PrefillAcquireError, PrefillAdmission, PrefillAdmissionRejection,
-                PrefillCandidateError, PrefillLoadGuard, PrefillSelectionContext,
+                PrefillAhead, PrefillCandidateError, PrefillSelectionContext,
             },
             retry::mark_non_retryable,
             snapshot::{ModelWorkerSnapshot, RoutingPool, WorkerRegistry, WorkerRegistryExt},
@@ -75,8 +75,9 @@ type PdWorkerPair = (Arc<dyn Worker>, Arc<dyn Worker>, RuntimeType);
 type PlacedPdPair = (Placed, Placed, RuntimeType);
 
 /// A PD pair the Prefill admission seated: the prefill's handle, whose
-/// guard the admission made from its answer, and the decode as its
-/// placement answered it, which the dispatch makes its guard from.
+/// load the admission holds ahead of its send ([`PrefillAhead`]), and the
+/// decode as its placement answered it, which the dispatch makes its
+/// guard from.
 type AdmittedPdPair = (Arc<dyn Worker>, Placed, RuntimeType);
 
 /// The candidate predicate of a request carrying media references with no
@@ -87,7 +88,7 @@ type AdmittedPdPair = (Arc<dyn Worker>, Placed, RuntimeType);
 const ACCEPTS_MEDIA_REFS: CandidateFilter<'static> = &accepts_media_refs;
 
 /// Why an EPD selection produced nothing: a full Prefill pool, unsupported
-/// media references, an encode item where the policy engine places the
+/// media references, an encode item where Grand Central places the
 /// gateway's requests, or a failure judged per role afterwards by
 /// [`WorkerSelectionStage::selection_failure`].
 enum EpdSelectionFailure {
@@ -97,9 +98,9 @@ enum EpdSelectionFailure {
     DecodeVisionUnsupported,
     EncodeNotSupported,
     EncodeVisionUnsupported,
-    /// The policy engine places the gateway's requests, and it places no
+    /// Grand Central places the gateway's requests, and it places no
     /// encoder: a request that carries an encode item is not served.
-    EncodeUnderPolicyEngine,
+    EncodeUnderGrandCentral,
 }
 
 impl PrefillCandidateError for EpdSelectionFailure {
@@ -159,14 +160,14 @@ pub(crate) const SELECTION_QUEUE_TIMEOUT_ERROR_CODE: &str = "selection_queue_tim
 
 /// Client-visible, gateway-owned code for a request refused ahead of its
 /// prefill/decode pair because it carries media for the model's encode
-/// workers and the gateway places its requests by the policy engine
-/// (`--policy-controller on`), which places no encoder.
-pub(crate) const ENCODE_UNDER_POLICY_ENGINE_CODE: &str = "encode_under_policy_engine";
+/// workers and the gateway places its requests by Grand Central
+/// (`--grand-central on`), which places no encoder.
+pub(crate) const ENCODE_UNDER_GRAND_CENTRAL_CODE: &str = "encode_under_grand_central";
 
 /// The lines of that refusal, a model at a time under the refusal lines'
 /// own allowance: a client that sends one such request sends the next
 /// alike.
-static ENCODE_UNDER_POLICY_ENGINE_LOG: KeyedLogThrottle = KeyedLogThrottle::new(
+static ENCODE_UNDER_GRAND_CENTRAL_LOG: KeyedLogThrottle = KeyedLogThrottle::new(
     placement::REFUSAL_LINES_PER_SECOND,
     Duration::from_secs(1),
     placement::REFUSAL_LOG_MODELS,
@@ -322,10 +323,10 @@ impl WorkerSelectionStage {
         ctx: &'a RequestContext,
         accepted: Option<Instant>,
         admission: F,
-    ) -> impl Future<Output = Result<(T, PrefillLoadGuard), Response>> + 'a
+    ) -> impl Future<Output = Result<(T, PrefillAhead), Response>> + 'a
     where
         T: 'a,
-        F: Future<Output = Result<(T, PrefillLoadGuard), Response>> + 'a,
+        F: Future<Output = Result<(T, PrefillAhead), Response>> + 'a,
     {
         self.admit_within_budget(ctx, accepted, admission)
             .map(move |admitted| {
@@ -385,7 +386,7 @@ impl WorkerSelectionStage {
 /// request type pins, and the model. Gathered once ([`Self::gather`]), kept
 /// for the retries in the routing snapshot ([`Self::snapshot`]; the token
 /// ids excepted: a retry reads them off the retained plan), read by the
-/// pick ([`WorkerSelectionStage::pick`]).
+/// pick ([`WorkerSelectionStage::select`]).
 struct SelectionInputs<'a> {
     intermediate: Option<&'a multimodal::MultimodalIntermediate>,
     /// Media references are forwarded: only a worker that advertises
@@ -565,9 +566,11 @@ impl WorkerSelectionStage {
     /// The selection behind [`Self::execute`]; a refusal it returns
     /// is reported there by [`Self::report_refusal`]. The request's inputs are
     /// gathered first and kept for the retries in the routing snapshot, the
-    /// mode's pick runs on them ([`Self::pick`]), and the selection is checked
-    /// against the request's modalities and media references before it is
-    /// stored.
+    /// mode's pick runs on them (the single worker that meets every demand, or
+    /// the pair admitted within the queue budget, with the encode assignments
+    /// in EPD mode, and the Prefill admission slot it holds), and the selection
+    /// is checked against the request's modalities and media references before
+    /// it is stored.
     async fn select(&self, ctx: &mut RequestContext) -> Result<(), Response> {
         let accepted = self.acceptance_for_selection(ctx);
         if let Some(refused) = accepted.and_then(|accepted| self.refuse_if_expired(ctx, accepted)) {
@@ -591,63 +594,8 @@ impl WorkerSelectionStage {
             .map(str::to_string);
         ctx.state.routing_snapshot = Some(inputs.snapshot());
 
-        let (workers, prefill_guard) = self.pick(ctx, accepted, &inputs).await?;
-        if let Some(guard) = prefill_guard {
-            ctx.state.pd_prefill_guard = Some(guard);
-        }
-        // Only an encoder that processes the media itself (a push handoff)
-        // takes references; a rendezvous encoder takes router-processed items.
-        if self.mode == WorkerSelectionMode::EncodePrefillDecode
-            && inputs.media_refs
-            && workers.encode_handoff() != Some(EncodeHandoff::Push)
-        {
-            return Err(multimodal::MmRefsError::EncodeNotSupported.into_response());
-        }
-
-        // Reject an unsupported (backend, modality) combination now that the
-        // runtime is known, before request building assembles the payload only
-        // to fail deep in assembly. Preparation refused the request before the
-        // decode when no worker of the model took a modality
-        // (`ensure_model_accepts_media`); this answers for the pools it let
-        // through, where the pick may land on a worker whose engine does not.
-        // The prefill side builds the request in disaggregated mode, so its
-        // runtime is the one that must support the request's modalities.
-        if let Some(intermediate) = inputs.intermediate {
-            if let Err(err) = multimodal::ensure_backend_supports_modalities(
-                selection_runtime(&workers),
-                intermediate,
-            ) {
-                return Err(error::bad_request(
-                    "multimodal_not_supported",
-                    format!("{err}"),
-                ));
-            }
-        }
-
-        if let Some(plan) = ctx.state.multimodal_refs.as_ref() {
-            if let Err(err) = multimodal::ensure_selection_supports_media_refs(
-                &workers,
-                plan,
-                ctx.state.media_refs_pipeline,
-            ) {
-                return Err(err.into_response());
-            }
-        }
-
-        ctx.state.workers = Some(workers);
-        Ok(())
-    }
-
-    /// The mode's pick over the gathered inputs: the single worker that
-    /// meets every demand, or the pair admitted within the queue budget (with
-    /// the encode assignments in EPD mode) and the Prefill admission slot it
-    /// holds.
-    async fn pick(
-        &self,
-        ctx: &RequestContext,
-        accepted: Option<Instant>,
-        inputs: &SelectionInputs<'_>,
-    ) -> Result<(WorkerSelection, Option<PrefillLoadGuard>), Response> {
+        // The mode's pick runs here and not in a future of its own: the
+        // regular mode awaits nothing.
         let model_id = inputs.model_id;
         let media = inputs.media;
         let context_requirements = inputs.context_requirements;
@@ -655,7 +603,7 @@ impl WorkerSelectionStage {
         let accepts_refs = |worker: &dyn Worker| media.accepts_refs(worker);
         let placement = inputs.placement(inputs.media_refs.then_some(&accepts_refs));
         let sticky_key = ctx.state.sticky_key.as_deref();
-        match self.mode {
+        let (workers, prefill_guard) = match self.mode {
             WorkerSelectionMode::Regular => {
                 match self.select_regular(
                     model_id,
@@ -671,13 +619,15 @@ impl WorkerSelectionStage {
                     wire,
                     &[],
                 ) {
-                    Some(w) => Ok((WorkerSelection::Single { worker: w }, None)),
-                    None => Err(self.context_selection_failure(
-                        model_id,
-                        wire,
-                        media,
-                        context_requirements,
-                    )),
+                    Some(w) => (WorkerSelection::Single { worker: w }, None),
+                    None => {
+                        return Err(self.context_selection_failure(
+                            model_id,
+                            wire,
+                            media,
+                            context_requirements,
+                        ));
+                    }
                 }
             }
             WorkerSelectionMode::PrefillDecode => {
@@ -692,10 +642,13 @@ impl WorkerSelectionStage {
                             wire,
                             media,
                             inputs.demand,
+                            // A first selection states the budget its
+                            // demand holds, and nothing again.
+                            placement::Stated::nothing,
                         ),
                     )
                     .await?;
-                Ok((disaggregated(pair), Some(guard)))
+                (disaggregated(pair), Some(guard))
             }
             WorkerSelectionMode::EncodePrefillDecode => {
                 let hashes = if let Some(plan) = ctx.state.multimodal_refs.as_ref() {
@@ -743,10 +696,15 @@ impl WorkerSelectionStage {
                                 decode_vision: inputs.demand.decode,
                                 image_fanout: ctx.state.image_anchor.is_some(),
                             },
+                            // This mode captures no context requirements, so
+                            // this call reads the budget off the body. The
+                            // placement makes it only where Grand
+                            // Central decides.
+                            || placement::Stated::of_limit(output_budget(&ctx.input.request_type)),
                         ),
                     )
                     .await?;
-                Ok((
+                (
                     WorkerSelection::Disaggregated {
                         encode_assignments: if encode_assignments.is_empty() {
                             None
@@ -758,9 +716,53 @@ impl WorkerSelectionStage {
                         runtime_type,
                     },
                     Some(guard),
-                ))
+                )
+            }
+        };
+        if let Some(guard) = prefill_guard {
+            ctx.state.pd_prefill_guard = Some(guard);
+        }
+        // Only an encoder that processes the media itself (a push handoff)
+        // takes references; a rendezvous encoder takes router-processed items.
+        if self.mode == WorkerSelectionMode::EncodePrefillDecode
+            && inputs.media_refs
+            && workers.encode_handoff() != Some(EncodeHandoff::Push)
+        {
+            return Err(multimodal::MmRefsError::EncodeNotSupported.into_response());
+        }
+
+        // Reject an unsupported (backend, modality) combination now that the
+        // runtime is known, before request building assembles the payload only
+        // to fail deep in assembly. Preparation refused the request before the
+        // decode when no worker of the model took a modality
+        // (`ensure_model_accepts_media`); this answers for the pools it let
+        // through, where the pick may land on a worker whose engine does not.
+        // The prefill side builds the request in disaggregated mode, so its
+        // runtime is the one that must support the request's modalities.
+        if let Some(intermediate) = inputs.intermediate {
+            if let Err(err) = multimodal::ensure_backend_supports_modalities(
+                selection_runtime(&workers),
+                intermediate,
+            ) {
+                return Err(error::bad_request(
+                    "multimodal_not_supported",
+                    format!("{err}"),
+                ));
             }
         }
+
+        if let Some(plan) = ctx.state.multimodal_refs.as_ref() {
+            if let Err(err) = multimodal::ensure_selection_supports_media_refs(
+                &workers,
+                plan,
+                ctx.state.media_refs_pipeline,
+            ) {
+                return Err(err.into_response());
+            }
+        }
+
+        ctx.state.workers = Some(workers);
+        Ok(())
     }
 }
 
@@ -779,7 +781,9 @@ impl WorkerSelectionStage {
     /// TokenSpeed EPD re-selects only the prefill/decode pair — the first dispatch
     /// already launched the encode jobs, and the plan carries their
     /// bootstrap rooms. A disaggregated retry takes a fresh Prefill
-    /// admission slot for its new prefill worker.
+    /// admission slot for its new prefill worker, and states to Grand
+    /// Central what the attempt before stated ([`Placed::stated`]) where the
+    /// snapshot keeps no budget.
     pub(crate) async fn reselect(
         &self,
         ctx: &mut DispatchContext,
@@ -876,6 +880,19 @@ impl WorkerSelectionStage {
                     candidate_filter: Some(&pinned),
                     tried: &ctx.tried,
                 };
+                // What the attempt before stated to Grand Central, as
+                // its decode's answer kept it. The body dropped at the
+                // build, and the encode mode's snapshot keeps no budget.
+                // The placement makes this call only where the engine
+                // decides and the snapshot holds no budget. The call takes
+                // its one reference by value.
+                let before = &ctx.workers;
+                let restated = move || {
+                    before
+                        .as_ref()
+                        .and_then(WorkerSelection::decode)
+                        .map_or_else(placement::Stated::nothing, Placed::stated)
+                };
                 let (pair, guard) = self
                     .admit_pd_pair(
                         model_id,
@@ -895,6 +912,7 @@ impl WorkerSelectionStage {
                         )
                         .with_media_refs(media_refs, ctx.wire.pipeline)
                         .with_context(context_requirements),
+                        restated,
                     )
                     .await?;
                 ctx.pd_prefill_guard = Some(guard);
@@ -914,7 +932,7 @@ impl WorkerSelectionStage {
     /// its load guard.
     ///
     /// The pair index as it stands now is read by the placement's own call,
-    /// for a decode the policy engine placed and whose send was not said.
+    /// for a decode Grand Central placed and whose send was not said.
     /// A classic pair reads nothing here.
     ///
     /// The route's rule for a decode the request may move to: the request's
@@ -1054,7 +1072,19 @@ impl WorkerSelectionStage {
 
     /// Select a PD pair and take its Prefill admission slot. With admission
     /// enabled the selection runs at the head of the admission queue, so a
-    /// queued request commits to a worker only once it is admitted.
+    /// queued request commits to a worker only once it is admitted. The
+    /// prefill's load is held ahead of its send ([`PrefillAhead`]): the
+    /// dispatch says the send where the prefill goes out.
+    /// `restated` is what a retry states again to Grand Central
+    /// ([`placement::Stated`]) where `demand` holds no budget: the
+    /// placement makes that call where the engine decides, and a classic
+    /// selection never makes it. A first selection hands
+    /// [`placement::Stated::nothing`], a function that is no data: its
+    /// admission holds and passes what it did before it took a call.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the pair selection's own arguments, and a retry's call"
+    )]
     async fn admit_pd_pair(
         &self,
         model_id: &str,
@@ -1063,19 +1093,28 @@ impl WorkerSelectionStage {
         wire: Option<WireConstraint>,
         media: MediaDemands,
         demand: PairDemands,
-    ) -> Result<(AdmittedPdPair, PrefillLoadGuard), Response> {
+        restated: impl Fn() -> placement::Stated + Send + Copy,
+    ) -> Result<(AdmittedPdPair, PrefillAhead), Response> {
+        // The selection borrows what this admission holds, as it did before
+        // it took a call, and takes the call itself by value: a first
+        // selection's is a function item, which is no data in it.
+        let (stage, model, inputs, wire, demand) = (self, &model_id, &inputs, &wire, &demand);
         acquire_prefill(
             self.prefill_admission.as_deref(),
             sticky_key,
             |(prefill, _, _): &PlacedPdPair| prefill,
-            |capacity| self.placed_pd_pair(model_id, inputs, wire, capacity, demand),
+            move |capacity| {
+                stage.placed_pd_pair(model, *inputs, *wire, capacity, *demand, restated)
+            },
+            // The prefill's worker goes on behind its load, and what its
+            // answer owes its send goes with that load. The dispatch makes
+            // the decode's guard from its answer.
+            |(prefill, decode, runtime)| {
+                let (prefill, unsent) = prefill.unsent();
+                ((prefill, decode, runtime), unsent)
+            },
         )
         .await
-        // The prefill's side went into its guard. The dispatch makes the
-        // decode's guard from its answer.
-        .map(|((prefill, decode, runtime), guard)| {
-            ((prefill.into_guarded_worker(), decode, runtime), guard)
-        })
         .map_err(|error| {
             Self::acquire_failure(model_id, error, |failure| {
                 self.pd_selection_failure(model_id, failure, media)
@@ -1083,7 +1122,10 @@ impl WorkerSelectionStage {
         })
     }
 
-    /// EPD counterpart of [`Self::admit_pd_pair`].
+    /// EPD counterpart of [`Self::admit_pd_pair`]. `stated` states the
+    /// request to Grand Central ([`placement::Stated`]): the placement
+    /// makes that call where the engine decides, once a pass of the
+    /// admission, and a classic selection never makes it.
     async fn admit_encode_prefill_decode_workers(
         &self,
         model_id: &str,
@@ -1091,7 +1133,8 @@ impl WorkerSelectionStage {
         sticky_key: Option<&str>,
         encode_item_hashes: &[Vec<u8>],
         demand: EpdDemands,
-    ) -> Result<(AdmittedEpdSelection, PrefillLoadGuard), Response> {
+        stated: impl Fn() -> placement::Stated + Sync,
+    ) -> Result<(AdmittedEpdSelection, PrefillAhead), Response> {
         acquire_prefill(
             self.prefill_admission.as_deref(),
             sticky_key,
@@ -1103,16 +1146,18 @@ impl WorkerSelectionStage {
                     encode_item_hashes,
                     demand,
                     capacity,
+                    &stated,
                 )
+            },
+            // As for a PD pair: what the prefill's answer owes its send goes
+            // with its load, and the dispatch makes the decode's guard from
+            // its answer.
+            |(assignments, prefill, decode, runtime)| {
+                let (prefill, unsent) = prefill.unsent();
+                ((assignments, prefill, decode, runtime), unsent)
             },
         )
         .await
-        // As for a PD pair: the prefill's side went into its guard, and the
-        // dispatch makes the decode's guard from its answer.
-        .map(|((assignments, prefill, decode, runtime), guard)| {
-            let prefill = prefill.into_guarded_worker();
-            ((assignments, prefill, decode, runtime), guard)
-        })
         .map_err(|error| {
             Self::acquire_failure(model_id, error, |failure| {
                 match failure {
@@ -1134,8 +1179,8 @@ impl WorkerSelectionStage {
                     EpdSelectionFailure::DecodeVisionUnsupported => {
                         return self.vision_refusal(model_id, "decode workers")
                     }
-                    EpdSelectionFailure::EncodeUnderPolicyEngine => {
-                        return self.encode_under_policy_engine(model_id)
+                    EpdSelectionFailure::EncodeUnderGrandCentral => {
+                        return self.encode_under_grand_central(model_id)
                     }
                     EpdSelectionFailure::Unavailable => {}
                 }
@@ -1981,31 +2026,31 @@ impl WorkerSelectionStage {
         )
     }
 
-    /// The gateway places its requests by the policy engine
-    /// (`--policy-controller on`), which places a prefill/decode pair and no
+    /// The gateway places its requests by Grand Central
+    /// (`--grand-central on`), which places a prefill/decode pair and no
     /// encoder: a request that carries media for the model's encode workers
     /// is not served, whatever the pools hold. A 501, as the gateway answers
     /// a kind of request that one of its routes does not serve. A 501 is
     /// terminal for the retry layer by status, and no retry changes this
     /// answer. Its line is written under the refusal lines' allowance.
-    fn encode_under_policy_engine(&self, model_id: &str) -> Response {
-        if let Some(admitted) = ENCODE_UNDER_POLICY_ENGINE_LOG.admit(model_id) {
+    fn encode_under_grand_central(&self, model_id: &str) -> Response {
+        if let Some(admitted) = ENCODE_UNDER_GRAND_CENTRAL_LOG.admit(model_id) {
             warn!(
                 function = "WorkerSelectionStage::execute",
                 mode = ?self.mode,
                 model_id = %model_id,
-                code = ENCODE_UNDER_POLICY_ENGINE_CODE,
+                code = ENCODE_UNDER_GRAND_CENTRAL_CODE,
                 suppressed = admitted.suppressed,
-                "Refused a request that carries media for the encode workers: the policy engine places no encoder"
+                "Refused a request that carries media for the encode workers: Grand Central places no encoder"
             );
         }
         error::not_implemented(
-            ENCODE_UNDER_POLICY_ENGINE_CODE,
+            ENCODE_UNDER_GRAND_CENTRAL_CODE,
             format!(
                 "model '{model_id}' takes a request's media on encode workers, and this gateway \
-                 runs with --policy-controller on, which places no request on encode workers \
+                 runs with --grand-central on, which places no request on encode workers \
                  yet: send the request without media, or to a gateway that runs with \
-                 --policy-controller off"
+                 --grand-central off"
             ),
         )
     }
@@ -2128,8 +2173,8 @@ impl WorkerSelectionStage {
     ) -> Option<Placed> {
         let snapshot = self.worker_registry.get_routing_snapshot(model_id);
         // What the pool's windows leave of the demand narrows the candidates.
-        // The demand as the request states it keeps the budget the policy
-        // engine is told.
+        // The demand as the request states it keeps the budget Grand
+        // Central is told.
         let left = context.left_by(&snapshot, &[RoutingPool::GrpcPipelineRegular], model_id);
         let accepts = |worker: &dyn Worker| {
             admits.is_none_or(|admits| admits(worker))
@@ -2198,7 +2243,7 @@ impl WorkerSelectionStage {
     /// the engines the request's failed attempts dispatched to, skipped
     /// while another available candidate is left (see
     /// `PlacementInputs::tried`); a first attempt has none. `stated` states
-    /// what the policy engine alone reads of the request, and is called
+    /// what Grand Central alone reads of the request, and is called
     /// where the engine decides and nowhere else ([`placement::Stated`]).
     #[expect(
         clippy::too_many_arguments,
@@ -2317,7 +2362,14 @@ impl WorkerSelectionStage {
     /// index, then let the configured policies and admission choose the roles.
     ///
     /// Each worker is answered as the placement answers it ([`Placed`]):
-    /// the route makes that side's load guard from it.
+    /// the route makes that side's load guard from it. Grand Central
+    /// is told the budget `demand` holds, which is the body's, and where it
+    /// holds none what `restated` answers (see [`Self::admit_pd_pair`]).
+    ///
+    /// Out of line, as it stood before it took that call: built into the
+    /// admission's selection, as a function over a call would be, it made
+    /// a classic first selection dearer.
+    #[inline(never)]
     fn placed_pd_pair(
         &self,
         model_id: &str,
@@ -2325,6 +2377,7 @@ impl WorkerSelectionStage {
         wire: Option<WireConstraint>,
         prefill_capacity: Option<&PrefillSelectionContext<'_>>,
         demand: PairDemands,
+        restated: impl FnOnce() -> placement::Stated,
     ) -> Result<PlacedPdPair, PdSelectionFailure> {
         // One snapshot answers both: the pair index, and what the windows
         // of its two pools leave of the context demand. Both pools derive
@@ -2339,7 +2392,7 @@ impl WorkerSelectionStage {
         let pairs = snapshot.pd_pairs(PdWire::Grpc, self.policy_registry.pd_pairing_mode());
         let (prefill_pool, decode_pool) = PdWire::Grpc.pools();
         // What the pools' windows leave of the demand narrows the pairs. The
-        // demand as the request states it keeps the budget the policy engine
+        // demand as the request states it keeps the budget Grand Central
         // is told.
         let left = demand.with_context(demand.context.left_by(
             &snapshot,
@@ -2355,7 +2408,10 @@ impl WorkerSelectionStage {
                 wire,
                 prefill_capacity,
                 inputs,
-                move || placement::Stated::of_limit(demand.context.output_tokens()),
+                move || match demand.context.output_tokens() {
+                    None => restated(),
+                    budget => placement::Stated::of_limit(budget),
+                },
             )
         })?;
         Ok((pair.prefill, pair.decode, pair.runtime))
@@ -2374,10 +2430,15 @@ impl WorkerSelectionStage {
         prefill_capacity: Option<&PrefillSelectionContext<'_>>,
         demand: PairDemands,
     ) -> Result<PdWorkerPair, PdSelectionFailure> {
-        self.placed_pd_pair(model_id, inputs, wire, prefill_capacity, demand)
-            .map(|(prefill, decode, runtime)| {
-                (prefill.into_worker(), decode.into_worker(), runtime)
-            })
+        self.placed_pd_pair(
+            model_id,
+            inputs,
+            wire,
+            prefill_capacity,
+            demand,
+            placement::Stated::nothing,
+        )
+        .map(|(prefill, decode, runtime)| (prefill.into_worker(), decode.into_worker(), runtime))
     }
 
     /// The per-request narrowing of a pair placement over `pairs`, then
@@ -2481,13 +2542,15 @@ impl WorkerSelectionStage {
     /// guard from it.
     ///
     /// This is the encode stage's own selection, the fifth of the functions
-    /// that choose a worker, and it holds that function's arm for the policy
-    /// engine. The engine places the pair, through
+    /// that choose a worker, and it holds that function's arm for Grand
+    /// Central. The engine places the pair, through
     /// [`placement::select_pair`], and no encoder. Where the gateway started
     /// the engine, a request that carries an encode item is refused by name
-    /// ahead of the pair ([`Self::encode_under_policy_engine`]). A request
+    /// ahead of the pair ([`Self::encode_under_grand_central`]). A request
     /// with no item is placed on the engine's pair, and the lines below
-    /// assign it no encoder and ask no policy.
+    /// assign it no encoder and ask no policy. `stated` states that
+    /// request to the engine ([`placement::Stated`]): the pair's placement
+    /// makes the call where the engine decides, and nowhere else.
     fn placed_encode_prefill_decode_workers(
         &self,
         model_id: &str,
@@ -2495,13 +2558,14 @@ impl WorkerSelectionStage {
         encode_item_hashes: &[Vec<u8>],
         demand: EpdDemands,
         prefill_capacity: Option<&PrefillSelectionContext<'_>>,
+        stated: impl FnOnce() -> placement::Stated,
     ) -> Result<PlacedEpdSelection, EpdSelectionFailure> {
         let snapshot = self.worker_registry.get_routing_snapshot(model_id);
         let needs_encode = !encode_item_hashes.is_empty();
         // The engine's arm. An item is refused ahead of the pair, so the
         // engine is told of no request that it would then have to give up.
         if needs_encode && self.policy_registry.engine().is_some() {
-            return Err(EpdSelectionFailure::EncodeUnderPolicyEngine);
+            return Err(EpdSelectionFailure::EncodeUnderGrandCentral);
         }
         let mut available_encode = Self::available_workers(&snapshot, RoutingPool::GrpcEncode);
         // An encoder serves the request by its runtime's encode handoff: a
@@ -2599,10 +2663,10 @@ impl WorkerSelectionStage {
                 candidate_filter: Some(&eligible),
                 ..inputs
             },
-            // This mode states nothing for the policy engine alone: its
-            // admission is handed no reading of the body, and under the
-            // engine it refuses a request that carries an item (above).
-            placement::Stated::nothing,
+            // The request as its caller states it, for Grand Central
+            // alone: under the engine this mode places a request that
+            // carries no item, and refuses one that does (above).
+            stated,
         )
         .map_err(EpdSelectionFailure::Placement)?;
         let handoff = PdProtocol::encode_handoff(pair.runtime);
@@ -2645,7 +2709,8 @@ impl WorkerSelectionStage {
     }
 
     /// [`Self::placed_encode_prefill_decode_workers`] with the pair's two
-    /// workers alone, for a case, which sends them no request.
+    /// workers alone, for a case, which sends them no request and states
+    /// none.
     #[cfg(test)]
     fn select_encode_prefill_decode_workers(
         &self,
@@ -2661,6 +2726,7 @@ impl WorkerSelectionStage {
             encode_item_hashes,
             demand,
             prefill_capacity,
+            placement::Stated::nothing,
         )
         .map(|(assignments, prefill, decode, runtime)| {
             (
@@ -2906,7 +2972,9 @@ mod tests {
         routers::{
             common::{
                 attempt_ledger::{mark_upstream_answer, AttemptLedger},
-                prefill_admission::{test_support::select_worker, PrefillReservation},
+                prefill_admission::{
+                    test_support::select_worker, PrefillLoadGuard, PrefillReservation,
+                },
                 retry::is_retryable_response,
             },
             grpc::{
@@ -3058,6 +3126,7 @@ mod tests {
                 None,
                 MediaDemands::NONE,
                 PairDemands::default(),
+                placement::Stated::nothing,
             )
             .await
             .unwrap_or_else(|_| panic!("admission should select the non-full prefill worker"));
@@ -3118,6 +3187,7 @@ mod tests {
                         None,
                         MediaDemands::NONE,
                         PairDemands::default(),
+                        placement::Stated::nothing,
                     )
                     .await
             }
@@ -3183,6 +3253,7 @@ mod tests {
                 None,
                 MediaDemands::NONE,
                 PairDemands::default(),
+                placement::Stated::nothing,
             )
             .await
             .err()
@@ -3933,7 +4004,7 @@ mod tests {
             .expect("a worker")
     }
 
-    /// Where the gateway started the policy engine, the regular stage's pick
+    /// Where the gateway started Grand Central, the regular stage's pick
     /// keeps the engine's placement for its load guards. The engine hears
     /// the dispatch where the first guard is made and the end where that
     /// guard is dropped. A batch's other guards and the selection's own drop
@@ -3968,7 +4039,7 @@ mod tests {
         assert_eq!(said()[3..], ["issued", "released Abandoned"]);
     }
 
-    /// The stage states the request's completion budget to the policy engine
+    /// The stage states the request's completion budget to Grand Central
     /// as the answer's limit. The regular selection reads it off the context
     /// requirements it is handed, a first attempt's and a retry's alike, and
     /// the pair selection off its demand as the request states it. What the
@@ -4016,7 +4087,14 @@ mod tests {
         let stage = round_robin_pd_stage(Arc::clone(&registry));
         let heard = hearing_pairs_on(&stage.policy_registry, false);
         let demand = PairDemands::default().with_context(budget);
-        let placed = stage.placed_pd_pair(model_id, PlacementInputs::default(), None, None, demand);
+        let placed = stage.placed_pd_pair(
+            model_id,
+            PlacementInputs::default(),
+            None,
+            None,
+            demand,
+            placement::Stated::nothing,
+        );
         drop(placed.unwrap_or_else(|_| panic!("the engine places the pair")));
         assert_eq!(
             heard.lock().expect("the stage heard")[..2],
@@ -4030,9 +4108,7 @@ mod tests {
     /// that worker. A request that states no id has no value to count under.
     #[test]
     fn the_regular_stage_hands_the_engine_the_bodys_id() {
-        use smg_policy_controller::document::{
-            AppliedSpec, KeySourceSpec, PolicySpec, RoutingKeySpec,
-        };
+        use smg_grand_central::document::{AppliedSpec, KeySourceSpec, PolicySpec, RoutingKeySpec};
 
         use crate::routers::{common::placement::tests::engine_on, grpc::context::LoadGuards};
 
@@ -5224,7 +5300,7 @@ mod tests {
         }
     }
 
-    /// Where the gateway started the policy engine, the encode stage's
+    /// Where the gateway started Grand Central, the encode stage's
     /// selection asks no classic policy. A request that carries an item is
     /// refused by name ahead of its pair: a 501 under the stage's own code,
     /// which the retry layer does not repeat, and the engine hears of no
@@ -5297,7 +5373,7 @@ mod tests {
         let item = [vec![1]];
 
         // The engine places: an item is refused, and the engine hears nothing.
-        let policies = PolicyRegistry::for_policy_engine(
+        let policies = PolicyRegistry::for_engine(
             PolicyConfig::RoundRobin,
             RoutingKeyOverrideConfig::default(),
         );
@@ -5311,6 +5387,7 @@ mod tests {
                 None,
                 &item,
                 demand(true),
+                placement::Stated::nothing,
             )
             .await
             .err()
@@ -5318,7 +5395,7 @@ mod tests {
         assert_eq!(refusal.status(), StatusCode::NOT_IMPLEMENTED);
         assert_eq!(
             error::extract_error_code_from_response(&refusal),
-            ENCODE_UNDER_POLICY_ENGINE_CODE
+            ENCODE_UNDER_GRAND_CENTRAL_CODE
         );
         assert!(!is_retryable_response(&refusal));
         assert!(said().is_empty(), "the engine heard {:?}", said());
@@ -5362,6 +5439,115 @@ mod tests {
         assert_eq!(encoders.len(), 1);
         assert_eq!(encoders[0].worker.url(), "grpc://127.0.0.1:8930");
         assert_eq!(counted.asked.load(Ordering::Relaxed), 1);
+    }
+
+    /// The encode mode states the body's completion budget to Grand
+    /// Central too. That mode captures no context requirements, so its stage
+    /// hands the selection a reading of the request itself, and the pair's
+    /// placement makes it where the engine decides. A request with no item
+    /// goes through the stage whole here: the engine places its pair, and
+    /// hears the limit ahead of that decision's words.
+    #[tokio::test]
+    async fn the_encode_mode_states_the_requests_budget_to_the_engine() {
+        use crate::{
+            config::types::RoutingKeyOverrideConfig,
+            routers::common::placement::tests::hearing_pairs_on,
+        };
+
+        let registry = ec_registry(
+            "test-model",
+            &[
+                (8940, WorkerType::Encode, "ECCPUConnector"),
+                (8941, WorkerType::Prefill, "ECCPUConnector"),
+                (8942, WorkerType::Decode, "ECCPUConnector"),
+            ],
+        );
+        let policies = PolicyRegistry::for_engine(
+            PolicyConfig::RoundRobin,
+            RoutingKeyOverrideConfig::default(),
+        );
+        let heard = hearing_pairs_on(&policies, false);
+        let stage = WorkerSelectionStage::new(
+            Arc::clone(&registry),
+            Arc::new(policies),
+            WorkerSelectionMode::EncodePrefillDecode,
+            None,
+        );
+        let body = serde_json::json!({
+            "model": "test-model",
+            "text": "Hello",
+            "sampling_params": {"max_new_tokens": 64}
+        });
+        let mut ctx = prepared_ctx_of(registry, None, body);
+        stage
+            .execute(&mut ctx)
+            .await
+            .expect("the engine places the pair");
+        assert_eq!(
+            heard.lock().expect("the stage heard")[..2],
+            ["limit 64", "issued"]
+        );
+    }
+
+    /// A retry of the encode mode states the request's budget again. The
+    /// body dropped at the build and this mode's snapshot keeps no budget,
+    /// so the retry states what the attempt before stated, off that
+    /// attempt's decode answer. The engine hears the limit ahead of the
+    /// retry's decision, and of a further retry's: the retry's own answer
+    /// keeps it in turn.
+    #[tokio::test]
+    async fn a_retried_encode_mode_request_states_its_budget_again() {
+        use crate::{
+            config::types::RoutingKeyOverrideConfig,
+            routers::common::placement::tests::hearing_pairs_on,
+        };
+
+        let registry = ec_registry(
+            "test-model",
+            &[
+                (8943, WorkerType::Encode, "ECCPUConnector"),
+                (8944, WorkerType::Prefill, "ECCPUConnector"),
+                (8945, WorkerType::Decode, "ECCPUConnector"),
+            ],
+        );
+        let policies = PolicyRegistry::for_engine(
+            PolicyConfig::RoundRobin,
+            RoutingKeyOverrideConfig::default(),
+        );
+        let heard = hearing_pairs_on(&policies, false);
+        let said = || heard.lock().expect("the stage heard").clone();
+        let stage = WorkerSelectionStage::new(
+            Arc::clone(&registry),
+            Arc::new(policies),
+            WorkerSelectionMode::EncodePrefillDecode,
+            None,
+        );
+        let body = serde_json::json!({
+            "model": "test-model",
+            "text": "Hello",
+            "sampling_params": {"max_new_tokens": 64}
+        });
+        let mut first = prepared_ctx_of(registry, None, body);
+        stage
+            .execute(&mut first)
+            .await
+            .expect("the engine places the pair");
+        assert_eq!(said()[..2], ["limit 64", "issued"]);
+
+        // The request drops at the build. The retry holds the first
+        // attempt's selection and its snapshot, which keeps no budget.
+        let mut ctx = dispatch_ctx("test-model", grpc_wire(RuntimeType::Vllm));
+        ctx.routing = first.state.routing_snapshot.take().expect("a snapshot");
+        assert_eq!(ctx.routing.context_requirements.output_tokens(), None);
+        ctx.workers = first.state.workers.take();
+        for _ in 0..2 {
+            let before = said().len();
+            stage
+                .reselect(&mut ctx, &retained_plan(&[1, 2, 3]))
+                .await
+                .expect("the engine places the pair again");
+            assert_eq!(said()[before..before + 2], ["limit 64", "issued"]);
+        }
     }
 
     /// The encode stage reads the hash ring off the generation it holds for
@@ -7381,6 +7567,45 @@ mod tests {
         }
     }
 
+    /// An image request to a model whose prefill workers are all gone, with
+    /// a language-model-only decode worker still registered, is the
+    /// `no_available_workers` 503 a text request gets then, not a 400 for
+    /// the encoder: no worker that would take the pixels is there to judge.
+    #[tokio::test]
+    async fn an_image_request_with_no_prefill_worker_is_unavailable_like_a_text_request() {
+        let registry = Arc::new(WorkerRegistry::new());
+        registry
+            .register(labeled_worker(
+                "grpc://127.0.0.1:9140",
+                "test-model",
+                WorkerType::Decode,
+                NO_VISION_ENCODER,
+            ))
+            .unwrap();
+        let stage = round_robin_pd_stage(Arc::clone(&registry));
+
+        for image in [true, false] {
+            let mut ctx = prepared_ctx(Arc::clone(&registry), None);
+            if image {
+                ctx.state.multimodal_intermediate = Some(image_intermediate(None));
+            }
+            let response = stage
+                .execute(&mut ctx)
+                .await
+                .expect_err("no prefill worker is registered");
+            assert_eq!(
+                response.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "image={image}"
+            );
+            assert_eq!(
+                error::extract_error_code_from_response(&response),
+                "no_available_workers",
+                "image={image}"
+            );
+        }
+    }
+
     /// A decode worker with the encoder over the thresholds next to an idle
     /// one without it: a request whose decode side needs the encoder is
     /// steered to the vetoed worker by the overload fallback (it is the
@@ -7452,11 +7677,17 @@ mod tests {
     /// A generate request's context, tokenized, accepted by the gateway at
     /// `accepted` (or carrying no stamp at all).
     fn prepared_ctx(registry: Arc<WorkerRegistry>, accepted: Option<Instant>) -> RequestContext {
-        let request: GenerateRequest = serde_json::from_value(serde_json::json!({
-            "model": "test-model",
-            "text": "Hello"
-        }))
-        .unwrap();
+        let body = serde_json::json!({"model": "test-model", "text": "Hello"});
+        prepared_ctx_of(registry, accepted, body)
+    }
+
+    /// [`prepared_ctx`] for the generate request `body` states.
+    fn prepared_ctx_of(
+        registry: Arc<WorkerRegistry>,
+        accepted: Option<Instant>,
+        body: serde_json::Value,
+    ) -> RequestContext {
+        let request: GenerateRequest = serde_json::from_value(body).unwrap();
         let components = Arc::new(SharedComponents {
             templates: Arc::new(Templates::new(Arc::new(TokenizerRegistry::new()))),
             tokenizer_registry: Arc::new(TokenizerRegistry::new()),
@@ -8341,9 +8572,9 @@ mod tests {
         .with_queue_timeout(Duration::from_millis(50));
         let ctx = prepared_ctx(Arc::clone(&registry), None);
         let accepted = Some(Instant::now() - Duration::from_millis(100));
-        let guard = PrefillLoadGuard::Unbounded {
+        let guard = PrefillAhead::classic(PrefillLoadGuard::Unbounded {
             _guard: WorkerLoadGuard::with_key(Arc::clone(&prefill), None),
-        };
+        });
         assert_eq!(prefill.load(), 1, "the admission holds its claim");
 
         let Err(refused) = stage

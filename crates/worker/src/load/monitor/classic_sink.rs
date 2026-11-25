@@ -172,8 +172,7 @@ impl<G: Generation> ClassicLoadSink<G> {
         // that counts more ranks than it lists says ranks exist that it
         // does not list, so it retracts none. A count of zero says nothing
         // against the list.
-        let lists_ranks = load.has_absolute_token_data()
-            && load.loads.len() >= usize::try_from(load.dp_rank_count).unwrap_or(0);
+        let lists_ranks = load.has_absolute_token_data() && load.lists_every_rank();
         // Every rank on file: one that pushed since the poll began keeps its
         // row and hands it to the publish, whether the poll's answer names
         // the rank or not; any other takes the answer's entry for it, and

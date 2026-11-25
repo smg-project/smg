@@ -3916,6 +3916,7 @@ fn polled(monitor: &WorkerMonitor, worker: &Arc<dyn Worker>, answer: WorkerLoadR
         &reports,
         &["http://w:1".to_string()],
         vec![(Arc::clone(worker), Arc::new(answer))],
+        &[],
     );
 }
 
@@ -3942,6 +3943,7 @@ async fn a_row_that_went_under_its_successors_ends_with_its_far_ranks() {
             "m",
             &["http://w:1".to_string()],
             vec![(Arc::clone(&next), answer_of(0, 9), false)],
+            &[],
         );
 
         monitor.evict_worker_loads(&first);
@@ -3969,7 +3971,7 @@ async fn a_row_a_tick_prunes_behind_its_workers_leave_ends_its_series() {
         polled(&monitor, &worker, answer_of(0, 7));
         registry.transition_status(&id, WorkerStatus::NotReady);
         monitor.evict_worker_loads(&worker);
-        monitor.publish_polled("m", &["http://w:1".to_string()], Vec::new());
+        monitor.publish_polled("m", &["http://w:1".to_string()], Vec::new(), &[]);
 
         monitor.flush_pending_evictions();
 
@@ -4496,6 +4498,7 @@ fn a_polls_rows_wait_for_the_lock_of_the_reports() {
                 "m",
                 &["http://w:1".to_string()],
                 vec![(worker, answer_of(0, 9), false)],
+                &[],
             );
         }
     });
@@ -4527,6 +4530,7 @@ fn a_polls_answer_for_a_worker_that_left_writes_no_series() {
             "m",
             &["http://w:1".to_string()],
             vec![(worker, answer_of(0, 9), false)],
+            &[],
         );
     });
 

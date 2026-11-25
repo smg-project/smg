@@ -46,14 +46,14 @@ spec:
     - port: metrics
       interval: {{ .Values.router.metrics.serviceMonitor.interval }}
 {{- end }}
-{{- /* The policy controller's ServiceMonitor, under the same switch and
+{{- /* Grand Central's ServiceMonitor, under the same switch and
 settings: its Service's `metrics` port is the admin listener. */ -}}
-{{- if and .Values.router.metrics.serviceMonitor.enabled (.Values.policyController).enabled }}
+{{- if and .Values.router.metrics.serviceMonitor.enabled (.Values.grandCentral).enabled }}
 ---
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
-  name: {{ include "smg.policyControllerName" . }}
+  name: {{ include "smg.grandCentralName" . }}
   labels:
     {{- include "smg.labels" . | nindent 4 }}
     {{- range $key, $value := .Values.router.metrics.serviceMonitor.labels }}
@@ -62,7 +62,7 @@ metadata:
 spec:
   selector:
     matchLabels:
-      {{- include "smg.policyControllerSelectorLabels" . | nindent 6 }}
+      {{- include "smg.grandCentralSelectorLabels" . | nindent 6 }}
   endpoints:
     - port: metrics
       interval: {{ .Values.router.metrics.serviceMonitor.interval }}

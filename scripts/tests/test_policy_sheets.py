@@ -1,6 +1,6 @@
-"""The recorded policy sheets under ``crates/policy_controller/tests/classic/sheets``.
+"""The recorded policy sheets under ``crates/grand_central/tests/classic/sheets``.
 
-The policy controller's replay runs the rows of a sheet it has a module for and reads no row of
+Grand Central's replay runs the rows of a sheet it has a module for and reads no row of
 the others, so the table in the sheets' README is the only statement of what each sheet is. This
 holds the table to the files: every sheet has a row and every row a sheet and a recorder, and a
 row's commit, row counts and sha256 are the file's. The recording table's test filter for a sheet
@@ -24,7 +24,7 @@ import pathlib
 import re
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-SHEETS = ROOT / "crates" / "policy_controller" / "tests" / "classic" / "sheets"
+SHEETS = ROOT / "crates" / "grand_central" / "tests" / "classic" / "sheets"
 ROW = re.compile(
     r"^\| `(?P<sheet>[a-z_]+\.json)` \| [^|]+ \| `(?P<commit>[0-9a-f]{40})` "
     r"\| (?:(?P<rows>\d+): (?P<sequence>\d+) sequence, (?P<drawn>\d+) drawn"

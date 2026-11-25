@@ -172,6 +172,7 @@ pub(super) fn build_next_request_with_tools(
         items.push(ResponseInputOutputItem::FunctionToolCall {
             id: Some(tool_call.id.clone()),
             call_id: tool_call.id.clone(),
+            caller: None,
             name,
             namespace,
             arguments: tool_call

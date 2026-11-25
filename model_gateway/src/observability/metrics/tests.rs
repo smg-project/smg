@@ -1,14 +1,39 @@
-use std::net::TcpListener;
-
-use metrics_exporter_prometheus::PrometheusBuilder;
-use smg_worker::{
-    metrics::writers::{Metrics as WorkerMetrics, WorkerHandles},
-    test_support::{gone, held},
+use std::{
+    net::TcpListener,
+    pin::pin,
+    sync::atomic::{AtomicU8, Ordering},
+    task::Poll,
 };
 
+use metrics_exporter_prometheus::PrometheusBuilder;
+use smg_grand_central::{
+    document::{AppliedSpec, PolicySpec},
+    engine::{Candidate, Decision, Members, RequestFacts, Scorer, TieBand},
+    stages::{Lifecycle, StageRegistry},
+    tracking::{EventSet, Lease},
+};
+use smg_worker::{
+    identity::basic::Worker,
+    metrics::writers::{Metrics as WorkerMetrics, WorkerHandles},
+    registry::{event::WorkerEvent, WorkerId as ObjectId},
+    test_support::{gone, held, ready_worker},
+};
+use tokio::sync::broadcast::Receiver;
+
 use super::{
-    test_support::{assert_metric, render_with_recorder, sorted_series},
+    test_support::{
+        assert_metric, fault_kinds, render_with_recorder, shadow_kinds, shadowing_spec,
+        sorted_series,
+    },
     *,
+};
+use crate::{
+    config::types::PolicyConfig,
+    policies::PolicyRegistry,
+    routers::common::{
+        placement::{select_single, PlacementInputs, Stated},
+        snapshot::{RoutingPool, WorkerRegistry},
+    },
 };
 
 #[test]
@@ -53,6 +78,268 @@ fn encode_path_activity_registers_every_path_and_reason_on_scrape() {
         }),
         "missing reason piece_declined: {rendered}"
     );
+}
+
+/// One ready worker of the model `m`, and a gateway's policies with an
+/// engine over a policy document whose second binding names a shadow
+/// ([`shadowing_spec`]). `place` has the engine place requests of that
+/// model.
+struct Shadowing {
+    workers: WorkerRegistry,
+    policies: PolicyRegistry,
+    engine: &'static InProcess,
+}
+
+impl Shadowing {
+    fn new() -> Self {
+        let workers = WorkerRegistry::new();
+        let worker = ready_worker("http://h:1", "m");
+        workers.register(worker).expect("the worker registers");
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        policies.set_engine(Box::leak(Box::new(InProcess::new(shadowing_spec()))));
+        let engine = policies.engine().expect("the engine that was set");
+        Self {
+            workers,
+            policies,
+            engine,
+        }
+    }
+
+    fn place(&self, requests: usize) {
+        for _ in 0..requests {
+            let (inputs, pool) = (PlacementInputs::default(), RoutingPool::HttpRegular);
+            let placed = select_single(
+                &self.workers,
+                &self.policies,
+                "m",
+                pool,
+                None,
+                inputs,
+                Stated::nothing,
+            );
+            assert!(placed.is_some(), "the one worker is selectable");
+        }
+    }
+}
+
+/// Grand Central's shadow counts on a scrape. The one binding that
+/// names a shadow has a zero series of each kind from the first scrape, by
+/// its place in the policy document and beside a single request. The
+/// binding ahead of it names none and has no series. A shadow that places
+/// on the one worker agrees with the live decision, and each such decision
+/// is added once, however many scrapes read it. A count read under another
+/// policy document starts from zero and is added whole: the series goes on
+/// from where it stood.
+///
+/// The series is new with Grand Central: a classic gateway counts no
+/// shadow, and publishes no such family.
+#[test]
+fn the_engines_shadow_counts_are_published_from_zero_and_added_by_their_growth() {
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    metrics::with_local_recorder(&recorder, || {
+        init_metrics();
+        let published = ShadowsPublished::default();
+        let scraped = |shadowing: &Shadowing| {
+            record_policy_shadow_activity(shadowing.engine, &published);
+            shadow_kinds(&handle.render())
+        };
+        let agreed = |count| [Some(count), Some(0), Some(0), Some(0)];
+        assert!(!handle
+            .render()
+            .contains("smg_policy_shadow_decisions_total"));
+
+        let first = Shadowing::new();
+        assert_eq!(scraped(&first), agreed(0));
+        let rendered = handle.render();
+        let help = "# HELP smg_policy_shadow_decisions_total Shadow decisions of Grand Central";
+        assert!(rendered.contains(help));
+        let series = |line: &&str| line.starts_with("smg_policy_shadow_decisions_total{");
+        assert_eq!(rendered.lines().filter(series).count(), 4, "{rendered}");
+        first.place(3);
+        assert_eq!(scraped(&first), agreed(3));
+        assert_eq!(scraped(&first), agreed(3));
+        first.place(2);
+        assert_eq!(scraped(&first), agreed(5));
+
+        let second = Shadowing::new();
+        second.place(2);
+        assert_eq!(scraped(&second), agreed(7));
+        assert_eq!(scraped(&second), agreed(7));
+    });
+}
+
+/// The stage of the fault counts' case, as its table and its document name
+/// it.
+const FAULTY: &str = "of-the-case";
+
+/// Where [`PanicsAt`] panics: nowhere, at its score, or at the issue of a
+/// request's lease.
+const NOWHERE: u8 = 0;
+const AT_ITS_SCORE: u8 = 1;
+const AT_AN_ISSUE: u8 = 2;
+
+/// A scorer that panics where the case says. It takes every word of a
+/// lease, so the engine leases each pick under it and tells it the issue.
+#[derive(Debug)]
+struct PanicsAt(Arc<AtomicU8>);
+
+impl Lifecycle for PanicsAt {
+    fn hears(&self) -> EventSet {
+        EventSet::LEASE
+    }
+
+    fn on_decision_issued(&self, _: &Lease, _: &Decision) {
+        let at = self.0.load(Ordering::Relaxed);
+        assert_ne!(at, AT_AN_ISSUE, "the case's panic at an issue");
+    }
+}
+
+impl Scorer for PanicsAt {
+    fn name(&self) -> &'static str {
+        FAULTY
+    }
+
+    fn score(&self, _: &RequestFacts<'_>, _: &[Candidate], _: &[u32], out: &mut [f32]) -> TieBand {
+        let at = self.0.load(Ordering::Relaxed);
+        assert_ne!(at, AT_ITS_SCORE, "the case's panic at a score");
+        out.fill(1.0);
+        TieBand::NORMALIZED
+    }
+}
+
+/// A host's registry whose own code panics where the engine's upkeep
+/// subscribes to it.
+struct PanicsAtItsEvents;
+
+impl Members for PanicsAtItsEvents {
+    fn events(&self) -> Receiver<WorkerEvent> {
+        panic!("the case's panic in the host's own code")
+    }
+
+    fn standing(&self) -> Vec<(ObjectId, Arc<dyn Worker>)> {
+        Vec::new()
+    }
+}
+
+/// Two ready workers of the model `m`, and a gateway's policies with an
+/// engine whose one scorer is [`PanicsAt`] and whose host's registry is
+/// [`PanicsAtItsEvents`]. `at` says where the scorer panics next.
+struct Faulty {
+    workers: WorkerRegistry,
+    policies: PolicyRegistry,
+    engine: &'static InProcess,
+    at: Arc<AtomicU8>,
+}
+
+impl Faulty {
+    fn new() -> Self {
+        let workers = WorkerRegistry::new();
+        for url in ["http://h:1", "http://h:2"] {
+            let worker = ready_worker(url, "m");
+            workers.register(worker).expect("the worker registers");
+        }
+        let at = Arc::new(AtomicU8::new(NOWHERE));
+        let asked = Arc::clone(&at);
+        let mut stages = StageRegistry::builtin();
+        stages
+            .scorer(FAULTY, move || Box::new(PanicsAt(Arc::clone(&asked))))
+            .expect("a free name");
+        let mut document = PolicySpec::preset("round_robin").expect("a stock preset");
+        for profile in document.profiles.values_mut() {
+            profile.score = vec![FAULTY.into()];
+            profile.pick = "best".into();
+        }
+        let spec = AppliedSpec::validate_in(&document, &stages, &[]);
+        let spec = spec.expect("the stages hold the scorer");
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        policies.set_engine(Box::leak(Box::new(InProcess::new(spec))));
+        let engine = policies.engine().expect("the engine that was set");
+        engine.set_registry(Arc::new(PanicsAtItsEvents));
+        Self {
+            workers,
+            policies,
+            engine,
+            at,
+        }
+    }
+
+    /// Whether the engine places one request of the model.
+    fn places(&self) -> bool {
+        let (inputs, pool) = (PlacementInputs::default(), RoutingPool::HttpRegular);
+        let placed = select_single(
+            &self.workers,
+            &self.policies,
+            "m",
+            pool,
+            None,
+            inputs,
+            Stated::nothing,
+        );
+        placed.is_some()
+    }
+
+    /// One poll of the engine's own task: its first upkeep runs at that
+    /// poll, and subscribes to the host's registry.
+    fn runs_one_upkeep(&self) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("a runtime");
+        runtime.block_on(async {
+            let mut task = pin!(self.engine.run());
+            assert!(matches!(futures::poll!(task.as_mut()), Poll::Pending));
+        });
+    }
+}
+
+/// The panics Grand Central held and counted, on a scrape. Each kind
+/// has a zero series from the first scrape. A decision that panics is
+/// refused, and raises `decision`. A stage that panics at the issue of a
+/// request's lease costs that request nothing, and raises `event`. A panic
+/// of the host's own code in a step of the engine's upkeep raises `upkeep`.
+/// Each series stands at its count as read, however many scrapes read it.
+///
+/// The series is new with Grand Central: a classic gateway starts no
+/// engine, and publishes no such family.
+#[test]
+fn the_engines_fault_counts_are_published_from_zero_each_under_its_kind() {
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    metrics::with_local_recorder(&recorder, || {
+        init_metrics();
+        let faulty = Faulty::new();
+        let scraped = || {
+            record_policy_fault_activity(faulty.engine);
+            fault_kinds(&handle.render())
+        };
+        assert!(!handle.render().contains("smg_policy_faults_total"));
+
+        assert_eq!(scraped(), [Some(0); 3]);
+        let rendered = handle.render();
+        let help = "# HELP smg_policy_faults_total Panics Grand Central held and counted";
+        assert!(rendered.contains(help), "{rendered}");
+        let series = |line: &&str| line.starts_with("smg_policy_faults_total{");
+        assert_eq!(rendered.lines().filter(series).count(), 3, "{rendered}");
+
+        faulty.at.store(AT_ITS_SCORE, Ordering::Relaxed);
+        assert!(!faulty.places(), "a decision that panicked places nothing");
+        assert_eq!(scraped(), [Some(1), Some(0), Some(0)]);
+
+        faulty.at.store(AT_AN_ISSUE, Ordering::Relaxed);
+        for _ in 0..2 {
+            assert!(faulty.places(), "the request keeps its decision");
+        }
+        assert_eq!(scraped(), [Some(1), Some(2), Some(0)]);
+
+        faulty.at.store(NOWHERE, Ordering::Relaxed);
+        for _ in 0..3 {
+            faulty.runs_one_upkeep();
+        }
+        assert!(faulty.places(), "no panic is left behind");
+        assert_eq!(scraped(), [Some(1), Some(2), Some(3)]);
+        assert_eq!(scraped(), [Some(1), Some(2), Some(3)]);
+    });
 }
 
 #[test]
@@ -858,12 +1145,15 @@ fn router_stream_families_name_the_attempt_anchor() {
 
 /// The dispatch wait says on `/metrics` what its clock is (the request's
 /// entry at the edge to the answering attempt's RPC dispatch, where the TTFT
-/// clock starts), which requests it observes (those the TTFT observes, under
-/// the same labels) and that the two add up to the time to first token from
-/// the request's receipt. It says where a later turn of a streamed tool loop
-/// counts from: that turn's start.
+/// clock starts), which answers it observes (streamed and collected, under
+/// the TTFT's labels) and which it does not (a Responses answer on the
+/// Harmony pipeline, a background Responses request that is not streamed),
+/// that for a streamed answer the two add up to the time to first token from
+/// the request's receipt, and that its count also holds the collected
+/// answers. It says where a later turn of a tool loop counts from: that
+/// turn's start.
 #[test]
-fn the_dispatch_wait_help_names_its_clock_its_requests_and_its_sum_with_the_ttft() {
+fn the_dispatch_wait_help_names_its_clock_its_answers_and_its_sum_with_the_ttft() {
     let (rendered, ()) = with_test_recorder(|| {
         init_metrics();
         Metrics::record_streaming_metrics(StreamingMetricsParams {
@@ -884,26 +1174,28 @@ fn the_dispatch_wait_help_names_its_clock_its_requests_and_its_sum_with_the_ttft
         .find_map(|line| line.strip_prefix(&format!("# HELP {DISPATCH_WAIT_SECONDS} ")))
         .unwrap_or_else(|| panic!("no # HELP for {DISPATCH_WAIT_SECONDS}; rendered:\n{rendered}"));
     for phrase in [
-        "by router_type, backend_type, model, endpoint",
+        "of streamed and collected answers by router_type, backend_type, model, endpoint",
+        "a Responses answer on the Harmony pipeline records none, streamed or collected, nor does a background Responses request that is not streamed",
         "from the request's entry at the edge to the answering attempt's RPC dispatch",
         "the prefill dispatch of a prefill-decode pair, after the encode call when encode pushes",
         "a refused attempt's wait and its backoff are here",
-        "observed with smg_router_ttft_seconds, once per observation of it and under the same labels",
-        "the two add up to the time to first token from the request's receipt",
-        "a streamed Responses tool loop observes one per turn",
+        "observed once per answer, under the labels of smg_router_ttft_seconds",
+        "for a streamed answer the two add up to the time to first token from the request's receipt",
+        "this family's count also holds the collected answers and is not the count of smg_router_ttft_seconds",
+        "a Responses tool loop observes one per turn, streamed or collected",
         "a later turn's from that turn's start",
     ] {
         assert!(help.contains(phrase), "{phrase:?} is not in: {help}");
     }
 }
 
-/// The dispatch wait is recorded where the TTFT is and only with it: once,
-/// under the TTFT's four labels, for a stream that has a first token and a
-/// wait. A stream with no first token records neither family though it
-/// carries a wait, and a stream dispatched outside a request's entry stamp
-/// records its TTFT alone.
+/// The dispatch wait is recorded whenever an answer carries one: once, under
+/// the TTFT's four labels. A streamed answer with a first token records both
+/// families. An answer with no first token (a collected one) records its
+/// wait alone, and one dispatched outside a request's entry stamp records
+/// its TTFT alone.
 #[test]
-fn the_dispatch_wait_is_recorded_with_the_ttft_and_only_with_it() {
+fn the_dispatch_wait_is_recorded_whenever_an_answer_carries_one() {
     let record = |model_id: &str, ttft: Option<Duration>, dispatch_wait: Option<Duration>| {
         Metrics::record_streaming_metrics(StreamingMetricsParams {
             router_type: metrics_labels::ROUTER_GRPC,
@@ -921,17 +1213,19 @@ fn the_dispatch_wait_is_recorded_with_the_ttft_and_only_with_it() {
     let (rendered, ()) = with_test_recorder(|| {
         let (ttft, wait) = (Duration::from_millis(40), Duration::from_millis(17));
         record("stamped", Some(ttft), Some(wait));
-        record("no-first-token", None, Some(wait));
+        record("collected", None, Some(wait));
         record("unstamped", Some(ttft), None);
     });
     let labels = |model: &str| {
         format!("router_type=\"grpc\",backend_type=\"pd\",model=\"{model}\",endpoint=\"messages\"")
     };
-    let stamped = labels("stamped");
+    let (stamped, collected) = (labels("stamped"), labels("collected"));
     for series in [
         format!("smg_router_ttft_seconds_count{{{stamped}}} 1"),
         format!("{DISPATCH_WAIT_SECONDS}_count{{{stamped}}} 1"),
         format!("{DISPATCH_WAIT_SECONDS}_sum{{{stamped}}} 0.017"),
+        format!("{DISPATCH_WAIT_SECONDS}_count{{{collected}}} 1"),
+        format!("{DISPATCH_WAIT_SECONDS}_sum{{{collected}}} 0.017"),
         format!("smg_router_ttft_seconds_count{{{}}} 1", labels("unstamped")),
     ] {
         assert!(
@@ -939,20 +1233,15 @@ fn the_dispatch_wait_is_recorded_with_the_ttft_and_only_with_it() {
             "{series} missing; rendered:\n{rendered}"
         );
     }
-    for model in ["no-first-token", "unstamped"] {
-        let wait = format!("{DISPATCH_WAIT_SECONDS}_count{{{}}}", labels(model));
-        assert!(
-            !rendered.contains(&wait),
-            "{model} recorded a dispatch wait; rendered:\n{rendered}"
-        );
-    }
-    let ttft = format!(
-        "smg_router_ttft_seconds_count{{{}}}",
-        labels("no-first-token")
+    let wait = format!("{DISPATCH_WAIT_SECONDS}_count{{{}}}", labels("unstamped"));
+    assert!(
+        !rendered.contains(&wait),
+        "an answer with no wait recorded one; rendered:\n{rendered}"
     );
+    let ttft = format!("smg_router_ttft_seconds_count{{{collected}}}");
     assert!(
         !rendered.contains(&ttft),
-        "a stream with no first token recorded a TTFT; rendered:\n{rendered}"
+        "an answer with no first token recorded a TTFT; rendered:\n{rendered}"
     );
 }
 
@@ -1104,14 +1393,15 @@ fn time_per_http_record() {
 /// as it does with a key built per record: the same series with the
 /// same values, and no series a stream had nothing for (no TTFT or
 /// TPOT for a model whose streams gave no token, no input tokens for an
-/// endpoint that reports none, no dispatch wait for a stream with no
-/// first token or no wait).
+/// endpoint that reports none, no dispatch wait for an answer that
+/// carries none).
 #[test]
 fn the_stream_timing_set_renders_the_same_through_kept_handles() {
     let records = || {
-        // The dispatch wait rides the first record, which has a first token
-        // to be recorded with, and the second, which has none; the third is
-        // a stream dispatched outside a request's entry stamp.
+        // The dispatch wait rides the first record, which has a first
+        // token, and the second, which has none and records its wait all
+        // the same; the third is a stream dispatched outside a request's
+        // entry stamp.
         for (ttft, dispatch_wait, output_tokens, input_tokens) in [
             (
                 Some(Duration::from_millis(10)),
@@ -1165,8 +1455,8 @@ fn the_stream_timing_set_renders_the_same_through_kept_handles() {
         "smg_router_tokens_total{router_type=\"grpc\",backend_type=\"regular\",model=\"m1\",endpoint=\"chat\",token_type=\"cached\"} 10",
         "smg_router_tokens_total{router_type=\"grpc\",backend_type=\"regular\",model=\"m2\",endpoint=\"generate\",token_type=\"output\"} 1",
         "smg_router_ttft_seconds_count{router_type=\"grpc\",backend_type=\"regular\",model=\"m1\",endpoint=\"chat\"} 2",
-        "smg_router_dispatch_wait_seconds_count{router_type=\"grpc\",backend_type=\"regular\",model=\"m1\",endpoint=\"chat\"} 1",
-        "smg_router_dispatch_wait_seconds_sum{router_type=\"grpc\",backend_type=\"regular\",model=\"m1\",endpoint=\"chat\"} 0.003",
+        "smg_router_dispatch_wait_seconds_count{router_type=\"grpc\",backend_type=\"regular\",model=\"m1\",endpoint=\"chat\"} 2",
+        "smg_router_dispatch_wait_seconds_sum{router_type=\"grpc\",backend_type=\"regular\",model=\"m1\",endpoint=\"chat\"} 0.007",
         "smg_router_tpot_seconds_count{router_type=\"grpc\",backend_type=\"regular\",model=\"m1\",endpoint=\"chat\"} 1",
         "smg_router_time_to_first_token_seconds_count{router_type=\"grpc\",backend_type=\"regular\",model=\"m1\",endpoint=\"chat\"} 2",
         "smg_router_request_time_per_output_token_seconds_count{router_type=\"grpc\",backend_type=\"regular\",model=\"m1\",endpoint=\"chat\"} 1",

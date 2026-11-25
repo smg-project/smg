@@ -13,10 +13,13 @@
 use std::sync::Arc;
 
 use axum::response::Response;
-use openai_protocol::responses::{
-    from_turn_boundary, generate_id, normalize_input_item, without_calls_answered_by,
-    without_outputs_of_missing_calls, McpToolCallError, ResponseContentPart, ResponseInput,
-    ResponseInputOutputItem, ResponsesRequest, StringOrContentParts,
+use openai_protocol::{
+    responses::{
+        from_turn_boundary, generate_id, normalize_input_item, without_calls_answered_by,
+        without_outputs_of_missing_calls, McpToolCallError, ResponseContentPart, ResponseInput,
+        ResponseInputOutputItem, ResponsesRequest, StringOrContentParts,
+    },
+    validated::Normalizable,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -26,8 +29,16 @@ use smg_data_connector::{
 };
 use tracing::{debug, warn};
 
-use super::{previous_response_chain, ResponsesContext};
-use crate::routers::{common::persistence_utils::split_stored_message_content, error};
+use super::{
+    previous_response_chain, utils::refuse_tools_without_a_direct_caller, ResponsesContext,
+};
+use crate::routers::{
+    common::{
+        persistence_utils::split_stored_message_content,
+        responses_compat::lower_responses_request_for_local_backend,
+    },
+    error,
+};
 
 /// How many of a conversation's stored items a request replays: its newest
 /// ones, oldest first; what is older is not in the prompt. A window this
@@ -141,6 +152,18 @@ pub(crate) async fn load_history(
             kept.extend(rest);
             *items = kept;
         }
+    }
+
+    // Lower any inline `additional_tools` / `agent_message` items (from the
+    // loaded history or the current turn) into standard top-level `tools` and
+    // `user` messages for local backends, while keeping the caller's original
+    // `request` untouched for persistence so subsequent turns can replay them.
+    lower_responses_request_for_local_backend(&mut loaded)?;
+    if continues && loaded.tool_choice.is_none() {
+        loaded.normalize();
+    }
+    if let Some(error_response) = refuse_tools_without_a_direct_caller(loaded.tools.as_deref()) {
+        return Err(error_response);
     }
 
     debug!(
@@ -293,7 +316,14 @@ fn unreplayed_kind(item: &ResponseInputOutputItem) -> Option<&'static str> {
         ResponseInputOutputItem::ApplyPatchCallOutput { .. } => Some("apply_patch_call_output"),
         ResponseInputOutputItem::LocalShellCall { .. } => Some("local_shell_call"),
         ResponseInputOutputItem::LocalShellCallOutput { .. } => Some("local_shell_call_output"),
-        ResponseInputOutputItem::Message { .. }
+        ResponseInputOutputItem::Program { .. } => Some("program"),
+        ResponseInputOutputItem::ProgramOutput { .. } => Some("program_output"),
+        ResponseInputOutputItem::AdditionalTools { .. }
+        | ResponseInputOutputItem::AgentMessage { .. }
+        | ResponseInputOutputItem::ToolSearchCall { .. }
+        | ResponseInputOutputItem::ToolSearchOutput { .. }
+        | ResponseInputOutputItem::WebSearchCall { .. }
+        | ResponseInputOutputItem::Message { .. }
         | ResponseInputOutputItem::SimpleInputMessage { .. }
         | ResponseInputOutputItem::Reasoning { .. }
         | ResponseInputOutputItem::FunctionToolCall { .. }
@@ -408,7 +438,9 @@ fn stored_item_as_input(item: &Value) -> Option<ResponseInputOutputItem> {
 
 /// The replayable items of a conversation, its newest
 /// [`MAX_CONVERSATION_HISTORY_ITEMS`] oldest first, as the caller's `tenant`
-/// may see it: a conversation of another tenant is as missing.
+/// may see it: a conversation of another tenant is as missing. An
+/// `item_reference` row of the window is resolved as one of the request's own
+/// is ([`resolve_item_references`], its 404 and its 400 included).
 async fn conversation_items(
     stores: HistoryStores<'_>,
     conversation_id: &str,
@@ -491,24 +523,59 @@ async fn conversation_items(
             })
         })
         .collect();
-    let items = without_calls_answered_by(items, &skipped);
-    if !cut {
-        // The output of a call the rule hid is no history, as after a cut.
-        return Ok(if hidden {
-            without_outputs_of_missing_calls(items)
-        } else {
-            items
-        });
+    let mut items = without_calls_answered_by(items, &skipped);
+    if cut {
+        // The window is cut at the limit: it begins at its first turn boundary
+        // (the tail of the turn the cut split is not replayed), and an output
+        // whose call is before it is not either.
+        debug!(
+            conversation_id,
+            limit = MAX_CONVERSATION_HISTORY_ITEMS,
+            "Conversation history cut to its newest items"
+        );
+        items = from_turn_boundary(items);
     }
-    // The window is cut at the limit: it begins at its first turn boundary
-    // (the tail of the turn the cut split is not replayed), and an output
-    // whose call is before it is not either.
-    debug!(
-        conversation_id,
-        limit = MAX_CONVERSATION_HISTORY_ITEMS,
-        "Conversation history cut to its newest items"
-    );
-    Ok(without_outputs_of_missing_calls(from_turn_boundary(items)))
+    // The output of a call the rule hid is no history, as after a cut.
+    let lost_rows = cut || hidden;
+    // A call the window holds as an `item_reference` row pairs as a stored
+    // call does: what the boundary left is resolved before the outputs are
+    // matched with their calls.
+    let references: Vec<(usize, ResponseInputOutputItem)> = items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| matches!(item, ResponseInputOutputItem::ItemReference { .. }))
+        .map(|(at, item)| (at, item.clone()))
+        .collect();
+    if !references.is_empty() {
+        let mut marked = resolve_item_references(stores.responses.as_ref(), items, tenant).await?;
+        // Each reference row goes back in front of the item it named, as a
+        // mark: the pair rule passes it by, whatever it takes out.
+        for (at, row) in references.into_iter().rev() {
+            marked.insert(at, row);
+        }
+        if !cut {
+            // Not after a cut: the boundary may have dropped the output the
+            // first run kept a stored call for, and a run here would take
+            // that call from under the output the request brings.
+            marked = without_calls_answered_by(marked, &skipped);
+        }
+        // An output before a reference pairs with the calls before that
+        // reference alone: a call a reference names must not keep an
+        // older output of its id.
+        items = Vec::with_capacity(marked.len());
+        for item in marked {
+            if !matches!(item, ResponseInputOutputItem::ItemReference { .. }) {
+                items.push(item);
+            } else if lost_rows {
+                items = without_outputs_of_missing_calls(items);
+            }
+        }
+    }
+    Ok(if lost_rows {
+        without_outputs_of_missing_calls(items)
+    } else {
+        items
+    })
 }
 
 /// Replace every `item_reference` input item by the item it points to: an item
@@ -593,15 +660,22 @@ async fn resolve_item_references(
 fn input_item_id(item: &ResponseInputOutputItem) -> Option<&str> {
     match item {
         ResponseInputOutputItem::Message { id, .. }
-        | ResponseInputOutputItem::Reasoning { id, .. }
         | ResponseInputOutputItem::McpApprovalRequest { id, .. }
-        | ResponseInputOutputItem::ImageGenerationCall { id, .. }
         | ResponseInputOutputItem::ComputerCall { id, .. }
-        | ResponseInputOutputItem::LocalShellCall { id, .. }
         | ResponseInputOutputItem::LocalShellCallOutput { id, .. }
         | ResponseInputOutputItem::McpCall { id, .. }
         | ResponseInputOutputItem::McpListTools { id, .. } => Some(id.as_str()),
-        ResponseInputOutputItem::FunctionToolCall { id, .. }
+        ResponseInputOutputItem::Reasoning { id, .. }
+        | ResponseInputOutputItem::AdditionalTools { id, .. }
+        | ResponseInputOutputItem::AgentMessage { id, .. }
+        | ResponseInputOutputItem::ToolSearchCall { id, .. }
+        | ResponseInputOutputItem::ToolSearchOutput { id, .. }
+        | ResponseInputOutputItem::WebSearchCall { id, .. }
+        | ResponseInputOutputItem::Program { id, .. }
+        | ResponseInputOutputItem::ProgramOutput { id, .. }
+        | ResponseInputOutputItem::ImageGenerationCall { id, .. }
+        | ResponseInputOutputItem::LocalShellCall { id, .. }
+        | ResponseInputOutputItem::FunctionToolCall { id, .. }
         | ResponseInputOutputItem::FunctionCallOutput { id, .. }
         | ResponseInputOutputItem::McpApprovalResponse { id, .. }
         | ResponseInputOutputItem::Compaction { id, .. }
@@ -708,7 +782,10 @@ pub(crate) mod tests {
     pub(crate) fn function_call_output_input() -> ResponseInput {
         ResponseInput::Items(vec![ResponseInputOutputItem::FunctionCallOutput {
             id: None,
-            call_id: "call_A".to_string(),
+            call_id: Some("call_A".to_string()),
+            caller: None,
+            name: None,
+            namespace: None,
             output: StringOrContentParts::String("42".to_string()),
             status: None,
         }])
@@ -728,7 +805,7 @@ pub(crate) mod tests {
                     if output.is_some() { "+output" } else { "" }
                 ),
                 ResponseInputOutputItem::FunctionCallOutput { call_id, .. } => {
-                    format!("function_call_output:{call_id}")
+                    format!("function_call_output:{}", call_id.as_deref().unwrap_or(""))
                 }
                 ResponseInputOutputItem::Reasoning { .. } => "reasoning".to_string(),
                 other => serde_json::to_value(other).expect("an item serializes")["type"]
@@ -1369,6 +1446,71 @@ pub(crate) mod tests {
         );
     }
 
+    /// A call the conversation holds as an `item_reference` row pairs as a
+    /// stored call does: it replays with its output behind a cut and beside
+    /// a row the caller may not see, and not at all when its output is such
+    /// a row. An output before the reference, of an older call of the id
+    /// that the cut left out, stays out, behind another reference too.
+    #[tokio::test]
+    async fn a_call_the_conversation_holds_by_reference_pairs_with_its_output() {
+        let pair = ["function_call:call_A", "function_call_output:call_A"];
+        for (case, messages, hidden, older_output, tool_items) in [
+            ("a cut window", 110, "", false, &pair[..]),
+            ("another row is hidden", 1, "message", false, &pair[..]),
+            ("the output is hidden", 1, "output", false, &pair[..0]),
+            ("an older output in a cut window", 110, "", true, &pair[..]),
+        ] {
+            let stores = Stores::with_conversation().await;
+            let first = ResponsesRequest {
+                input: ResponseInput::Text("q".to_string()),
+                ..Default::default()
+            };
+            stores
+                .store_turn("resp_1", &first, function_call_output())
+                .await;
+            let reference = |id: &str| NewConversationItem {
+                id: Some(ConversationItemId::from(id)),
+                response_id: None,
+                item_type: "item_reference".to_string(),
+                role: None,
+                content: json!({"type": "item_reference", "id": id}),
+                status: None,
+                tenant: None,
+            };
+            let mut rows: Vec<_> = (1..=messages).map(message_row).collect();
+            let mut output = output_row("call_A");
+            match hidden {
+                "message" => rows[0].tenant = Some("other".to_string()),
+                "output" => output.tenant = Some("other".to_string()),
+                _ => {}
+            }
+            if older_output {
+                // Behind another reference, to the message before it: the
+                // first reference of the window is not the call's.
+                rows[messages - 1].id = Some(ConversationItemId::from("msg_last"));
+                rows.push(NewConversationItem {
+                    id: None,
+                    ..reference("msg_last")
+                });
+                rows.push(output_row("call_A"));
+            }
+            rows.extend([reference("fc_1"), output]);
+            if messages > 100 {
+                // First in the cut window, before its turn boundary: a
+                // reference to nothing is dropped there, never looked up.
+                rows.insert(rows.len() - 99, reference("gone"));
+            }
+            link_rows(&stores, rows).await;
+            let kinds = shape(&replayed_items(&stores, "next").await);
+            let replayed: Vec<&str> = kinds
+                .iter()
+                .map(String::as_str)
+                .filter(|kind| kind.starts_with("function_call"))
+                .collect();
+            assert_eq!(replayed, tool_items, "{case}: {kinds:?}");
+        }
+    }
+
     /// A conversation of 120 items replays its newest 100, oldest first,
     /// then the request's input: the first 20 are not in the prompt.
     #[tokio::test]
@@ -1463,14 +1605,14 @@ pub(crate) mod tests {
         assert!(matches!(
             reasoning,
             ResponseInputOutputItem::Reasoning { ref id, ref content, .. }
-                if id == "reasoning_1" && content.len() == 1
+                if id.as_deref() == Some("reasoning_1") && content.len() == 1
         ));
 
         // a row with no input form is left out, not an error
         assert!(conversation_item_as_input(row(
-            "web_search_call",
+            "file_search_call",
             None,
-            json!({"type": "web_search_call", "status": "completed"})
+            json!({"type": "file_search_call", "status": "completed"})
         ))
         .is_none());
     }
@@ -1570,11 +1712,11 @@ pub(crate) mod tests {
         let mut stored = StoredResponse::new(None);
         stored.raw_response = json!({
             "id": "resp_stored",
-            "output": [{"type": "web_search_call", "id": "ws_1", "status": "completed"}]
+            "output": [{"type": "file_search_call", "id": "fs_1", "status": "completed"}]
         });
         storage.store_response(stored).await.unwrap();
 
-        let response = resolve_item_references(&storage, vec![reference("ws_1")], None)
+        let response = resolve_item_references(&storage, vec![reference("fs_1")], None)
             .await
             .expect_err("a stored item without an input form is refused");
 
@@ -1738,5 +1880,104 @@ pub(crate) mod tests {
         assert_eq!(kinds.last().map(String::as_str), Some("message:user"));
         // steps 18 to 50 whole, then the request
         assert_eq!(items.len(), 33 * 3 + 1);
+    }
+
+    /// A first turn that declares tools inline via `additional_tools` keeps
+    /// them in the stored input; a second turn continuing via
+    /// either history mechanism with only a `function_call_output` recovers
+    /// those tools even when the client sends an empty top-level list.
+    #[tokio::test]
+    async fn continuations_preserve_inline_additional_tools() {
+        let stores = Stores::with_conversation().await;
+        let turn_1_req: ResponsesRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "store": true,
+            "conversation": "conv_1",
+            "input": [
+                {
+                    "type": "additional_tools",
+                    "id": "at_1",
+                    "role": "developer",
+                    "tools": [{
+                        "type": "namespace",
+                        "name": "functions",
+                        "description": "",
+                        "tools": [{
+                            "type": "function",
+                            "name": "exec_command",
+                            "description": "Run shell command",
+                            "parameters": {"type": "object", "properties": {}}
+                        }]
+                    }]
+                },
+                {
+                    "type": "agent_message",
+                    "id": "am_1",
+                    "author": "/root",
+                    "recipient": "/root/worker",
+                    "content": [{"type": "input_text", "text": "Check status"}]
+                }
+            ]
+        }))
+        .unwrap();
+        let turn_1_resp =
+            openai_protocol::responses::ResponsesResponse::builder("resp_turn_1", "test-model")
+                .output(vec![
+                    openai_protocol::responses::ResponseOutputItem::FunctionToolCall {
+                        id: Some("fc_1".to_string()),
+                        call_id: "call_1".to_string(),
+                        name: "exec_command".to_string(),
+                        namespace: None,
+                        arguments: "{}".to_string(),
+                        output: None,
+                        status: "completed".to_string(),
+                    },
+                ])
+                .build();
+
+        super::super::utils::persist_response_if_needed(
+            stores.conversations.clone(),
+            stores.conversation_items.clone(),
+            stores.responses.clone(),
+            &turn_1_resp,
+            &turn_1_req,
+            None,
+            None,
+        )
+        .await
+        .expect("turn 1 persists");
+
+        for (field, id) in [
+            ("previous_response_id", "resp_turn_1"),
+            ("conversation", "conv_1"),
+        ] {
+            let body = json!({
+                (field): id,
+                "model": "test-model",
+                "tools": [],
+                "input": [{"type": "function_call_output", "call_id": "call_1", "output": "ok"}]
+            });
+            let mut turn_2: ResponsesRequest = serde_json::from_value(body).unwrap();
+
+            turn_2.normalize();
+            let loaded = load_history(stores.history(), &turn_2, None, ReplayInto::Chat)
+                .await
+                .expect("turn 2 reloads turn 1 history");
+            assert_eq!(serde_json::to_value(&loaded.tool_choice).unwrap(), "auto");
+            let tools = loaded.tools.as_deref().expect("lifted tools from turn 1");
+            assert_eq!(tools.len(), 1);
+            assert!(matches!(
+                &tools[0],
+                openai_protocol::responses::ResponseTool::Function(ft) if ft.function.name == "exec_command"
+            ));
+            let ResponseInput::Items(items) = &loaded.input else {
+                panic!("expected items");
+            };
+            assert_eq!(items.len(), 3);
+            assert!(matches!(
+                &items[0],
+                ResponseInputOutputItem::Message { role, .. } if role == "user"
+            ));
+        }
     }
 }

@@ -9,14 +9,14 @@
 //! worker's pushed report: the ranks that have pushed, each at its last
 //! record or at a later poll's figures. The
 //! verdict is the monitor's own, read off the worker after each step. The
-//! policy controller crate replays the rows through its store
-//! (`crates/policy_controller/tests/classic/overload.rs`).
+//! Grand Central crate replays the rows through its store
+//! (`crates/grand_central/tests/classic/overload.rs`).
 //!
 //! This file is an ignored test of the worker crate, kept beside the code
 //! it runs. It records from the checkout it is built in and writes the sheet
 //! under `CLASSIC_ROWS_OUT`, naming `CLASSIC_ROWS_COMMIT` as the commit it
-//! recorded from. The sheets the policy controller crate replays are in
-//! `crates/policy_controller/tests/classic/sheets`; to record this one again:
+//! recorded from. The sheets the Grand Central crate replays are in
+//! `crates/grand_central/tests/classic/sheets`; to record this one again:
 //!
 //! ```text
 //! CLASSIC_ROWS_OUT=<dir> CLASSIC_ROWS_COMMIT=<commit> \
@@ -549,7 +549,7 @@ fn rows() -> Vec<Row> {
                 Step::Poll(vec![rank(9, 0.125)]),
             ],
         ),
-        // The six rows the policy controller crate decides differently,
+        // The six rows the Grand Central crate decides differently,
         // each by a rule of its own that its replay names: a usage inside
         // half a permille of the threshold; a rank an answer omits, by the
         // queue's sum and by the usage's mean; and the three that show what
