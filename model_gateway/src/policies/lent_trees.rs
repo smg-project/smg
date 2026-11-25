@@ -23,7 +23,11 @@
 //! workers' caches ([`EngineCaches`]): the cache-event monitor's indexes and
 //! these trees, each to a single request's decision alone.
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    collections::HashSet,
+    sync::{Arc, Weak},
+    time::Duration,
+};
 
 use kv_index::{ModelTrees, TenantId, TokenTree, Tree as StringTree};
 use openai_protocol::worker::WorkerStatus;
@@ -171,14 +175,20 @@ impl LentTrees {
     /// removal is purged once more a settle window later
     /// ([`follow_removals`]).
     ///
-    /// The task holds the trees weakly, and of the registry its events
-    /// alone. It ends with the registry, at the first wake after the
+    /// The task holds the trees weakly, and the registry weakly too, for
+    /// the addresses it lists where a purge is owed across events that
+    /// went unheard. It ends with the registry, at the first wake after the
     /// trees are gone, or with its runtime.
-    pub(crate) fn follow_removals(self: &Arc<Self>, registry: &WorkerRegistry, runtime: &Handle) {
+    pub(crate) fn follow_removals(
+        self: &Arc<Self>,
+        registry: &Arc<WorkerRegistry>,
+        runtime: &Handle,
+    ) {
+        let listed = Arc::downgrade(registry);
         follow_removals(
             self,
             "the lent trees",
-            Self::forget_the_removed,
+            move |trees: &Self, left: &Left| trees.forget_the_removed(left, &listed),
             registry,
             runtime,
         );
@@ -197,8 +207,9 @@ impl LentTrees {
     /// line at warn says so. A removal may be among those events, and a
     /// registration under its address behind it. The worker that stands
     /// there is then not the one the prompts were sent to, and no event
-    /// that was heard tells the two apart: the registry's word keeps no
-    /// address. The trees fill again from the requests that follow.
+    /// that was heard tells the two apart: at such a wake the registry's
+    /// list keeps no address. The trees fill again from the requests that
+    /// follow.
     ///
     /// The trees are emptied by the size pass's own call, at no size, of
     /// one name on a token tree and on a string tree
@@ -209,14 +220,33 @@ impl LentTrees {
     /// it extends, as it was sent to the worker that stands. Or it leaves
     /// with its count kept, where the pass takes it between its attach
     /// and its count. The call ends where the tree's total reads zero.
-    /// Every address stays listed at no tokens, but one a removal named:
-    /// that one is purged by name behind the pass.
-    fn forget_the_removed(&self, left: &Left) {
+    /// Every address stays listed at no tokens, but one a removal named
+    /// and one owed a purge that the registry does not list: those are
+    /// purged by name behind the pass.
+    ///
+    /// A purge owed behind a settle window stays owed across events that
+    /// went unheard, and a registration under its address may be among
+    /// them. When it is due it runs unless `workers` lists the address: a
+    /// listed address is not purged by name, as what stands under it is
+    /// the prompts of the worker that came. A wake with unheard events of
+    /// its own empties every address all the same: the registry's list
+    /// keeps an address from an owed purge alone. The list is read at a
+    /// wake where such a purge is due alone, once, ahead of the first
+    /// tree's walk and under no lock of the stores. A worker registered
+    /// behind that read loses what was written under its address ahead of
+    /// its tree's walk, and the requests that follow write it again.
+    fn forget_the_removed(&self, left: &Left, workers: &Weak<WorkerRegistry>) {
         if left.unheard > 0 {
             warn!(
                 "{} events of the worker registry went unheard: the lent trees are emptied, and cache_aware remembers no prompt until they fill again",
                 left.unheard
             );
+        }
+        let mut owed: Vec<&str> = left.again_if_unlisted.iter().map(String::as_str).collect();
+        // With the registry gone no worker stands under any address.
+        if let Some(workers) = workers.upgrade().filter(|_| !owed.is_empty()) {
+            let listed: HashSet<String> = workers.get_all_urls().into_iter().collect();
+            owed.retain(|address| !listed.contains(*address));
         }
         // The stores are copied out and the lock is let go ahead of the
         // purge: a purge walks a tree once for every worker that left, and
@@ -230,12 +260,14 @@ impl LentTrees {
             .collect();
         for tree in stores.iter().flat_map(|trees| trees.token_trees()) {
             left.purge(
+                &owed,
                 || tree.evict_tenant_by_size(0),
                 |worker| tree.remove_tenant_all(worker),
             );
         }
         for tree in stores.iter().flat_map(|trees| trees.string_trees()) {
             left.purge(
+                &owed,
                 || tree.evict_tenant_by_size(0),
                 |worker| tree.remove_tenant_all(worker),
             );
@@ -260,16 +292,17 @@ impl LentTrees {
 ///
 /// A purge that is owed stays owed across events that went unheard. A
 /// registration under its address may be among them, so when it is due
-/// [`Left::settled`] alone names it: a store that can ask the registry
-/// does, and a store that cannot lets it go. A removal may be among them
-/// too, and no event that was heard names its address: `forget` is asked
-/// once more, five seconds behind them ([`Left::looks_again`]), and a
-/// store that asks the registry looks then for what a decision under way
-/// wrote behind the purge of that wake.
+/// the store asks the registry, and what stands under an address the
+/// registry lists stays. A removal may be among them too, and no event
+/// that was heard names its address: `forget` is asked once more, five
+/// seconds behind them ([`Left::looks_again`]), and a store that keeps
+/// by the registry's list looks then for what a decision under way wrote
+/// behind the purge of that wake.
 ///
-/// The task holds `stores` weakly, and of the registry its events alone. It
-/// ends with the registry, at the first wake after `stores` are gone, or
-/// with its runtime.
+/// The task holds `stores` weakly, and of the registry its events alone:
+/// the handle a store asks the registry by is `forget`'s own, and weak
+/// too. It ends with the registry, at the first wake after `stores` are
+/// gone, or with its runtime.
 pub(super) fn follow_removals<S: Send + Sync + 'static>(
     stores: &Arc<S>,
     what: &'static str,
@@ -429,8 +462,9 @@ impl Left {
     /// rejoins under its address starts with no prompt: those a removal
     /// named, then those whose purge behind a settle window is due, every
     /// event inside the window heard. Where events went unheard inside it,
-    /// a worker may stand under the address by one of them: such a store
-    /// asks no registry and lets that purge go.
+    /// a worker may stand under the address by one of them: this list
+    /// does not name it, and such a store asks the registry for it
+    /// ([`LentTrees::forget_the_removed`]).
     pub(super) fn purged(&self) -> impl Iterator<Item = &str> {
         self.addresses.iter().chain(&self.again).map(String::as_str)
     }
@@ -476,8 +510,10 @@ impl Left {
 
     /// The purge of one tree, of either kind: `empty` is the tree's size
     /// pass at no size, and `forget` its purge of one worker by name,
-    /// asked for every address [`Self::purged`] names.
-    fn purge(&self, empty: impl FnOnce(), forget: impl Fn(&TenantId)) {
+    /// asked for every address [`Self::purged`] names and for each of
+    /// `owed`: the addresses whose purge is due across events that went
+    /// unheard and that the registry does not list.
+    fn purge(&self, owed: &[&str], empty: impl FnOnce(), forget: impl Fn(&TenantId)) {
         if self.unheard > 0 {
             // A tree's own `clear` asks for no writer beside it. This
             // call may run beside the size pass's own: the second of
@@ -486,7 +522,7 @@ impl Left {
         }
         // Behind an eviction a named address's count reads zero, and
         // the purge drops its entries alone.
-        for address in self.purged() {
+        for address in self.purged().chain(owed.iter().copied()) {
             forget(&TenantId::from(address));
         }
     }
@@ -803,7 +839,7 @@ mod tests {
         let sized = entry(4_096, u32::MAX);
         stated.index.insert("another".to_owned(), sized);
         let trees = Arc::new(owner(stated));
-        let registry = WorkerRegistry::new();
+        let registry = Arc::new(WorkerRegistry::new());
         worker_at(&registry, "http://a:1");
         worker_at(&registry, "http://b:1");
         registry.on_remote_worker_state(&RemoteWorkerState {
@@ -847,7 +883,7 @@ mod tests {
     #[tokio::test]
     async fn a_worker_that_rejoins_under_its_address_starts_with_no_prompt() {
         let trees = Arc::new(owner(document(1_000, 0)));
-        let registry = WorkerRegistry::new();
+        let registry = Arc::new(WorkerRegistry::new());
         worker_at(&registry, "http://a:1");
         worker_at(&registry, "http://b:1");
         sent(&trees, MODEL, &["http://a:1", "http://b:1"]);
@@ -869,7 +905,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_prompt_written_behind_the_purge_leaves_a_settle_window_later() {
         let trees = Arc::new(owner(document(1_000, 0)));
-        let registry = WorkerRegistry::new();
+        let registry = Arc::new(WorkerRegistry::new());
         worker_at(&registry, "http://a:1");
         worker_at(&registry, "http://b:1");
         sent(&trees, MODEL, &["http://a:1", "http://b:1"]);
@@ -887,17 +923,17 @@ mod tests {
         .await;
     }
 
-    /// A purge that is owed is let go where events went unheard inside its
-    /// window: a worker may stand under the address by one of them, and
-    /// these trees ask no registry. A removal is heard and purged. More
-    /// events than the registry's channel holds follow, the task never run
-    /// between them, a registration under the address the first of them:
-    /// the trees are emptied. A prompt sent to the worker that came then
-    /// stands past the instant the purge was due, and past the look.
-    #[tokio::test(start_paused = true)]
-    async fn a_purge_owed_across_unheard_events_is_let_go() {
+    /// A purge owed across events that went unheard, up to the instant the
+    /// trees stand emptied behind them. The removal of `http://b:1` is
+    /// heard and purged. More events than the registry's channel holds
+    /// follow, the task never run between them: where `rejoins`, a
+    /// registration under that address is the first of them. The registry
+    /// is handed back, as the task ends with it.
+    async fn a_purge_owed_across_unheard_events(
+        rejoins: bool,
+    ) -> (Arc<LentTrees>, Arc<WorkerRegistry>) {
         let trees = Arc::new(owner(document(1_000, 0)));
-        let registry = WorkerRegistry::new();
+        let registry = Arc::new(WorkerRegistry::new());
         worker_at(&registry, "http://a:1");
         worker_at(&registry, "http://b:1");
         sent(&trees, MODEL, &["http://a:1", "http://b:1"]);
@@ -910,7 +946,9 @@ mod tests {
         .await;
 
         let mut witness = registry.subscribe_events();
-        worker_at(&registry, "http://b:1");
+        if rejoins {
+            worker_at(&registry, "http://b:1");
+        }
         for wave in 0..1_500 {
             worker_at(&registry, &format!("http://wave-{wave}:1"));
         }
@@ -922,6 +960,30 @@ mod tests {
             holds(&trees, MODEL, &[])
         })
         .await;
+        (trees, registry)
+    }
+
+    /// A purge that is owed runs across events that went unheard inside
+    /// its window, where the registry lists no worker under the address. A
+    /// prompt a decision under way writes under the address behind the
+    /// emptying leaves each tree when the purge is due.
+    #[tokio::test(start_paused = true)]
+    async fn a_purge_owed_across_unheard_events_runs_where_no_worker_stands() {
+        let (trees, _registry) = a_purge_owed_across_unheard_events(false).await;
+        sent(&trees, MODEL, &["http://b:1"]);
+        until("the purge a settle window behind the removal", || {
+            holds(&trees, MODEL, &[])
+        })
+        .await;
+    }
+
+    /// A purge that is owed is let go where a worker stands under the
+    /// address by one of the events that went unheard inside its window:
+    /// the registry lists it. A prompt sent to the worker that came stands
+    /// past the instant the purge was due, and past the look.
+    #[tokio::test(start_paused = true)]
+    async fn a_purge_owed_across_unheard_events_is_let_go_where_a_worker_stands() {
+        let (trees, _registry) = a_purge_owed_across_unheard_events(true).await;
         sent(&trees, MODEL, &["http://b:1"]);
         tokio::time::sleep(SETTLE_WHERE_NONE_IS_STATED * 2 + Duration::from_secs(1)).await;
         assert!(
@@ -942,7 +1004,7 @@ mod tests {
     #[tokio::test]
     async fn events_that_went_unheard_empty_every_tree() {
         let trees = Arc::new(owner(document(1_000, 0)));
-        let registry = WorkerRegistry::new();
+        let registry = Arc::new(WorkerRegistry::new());
         let all = ["http://a:1", "http://b:1", "http://c:1"];
         for worker in all {
             worker_at(&registry, worker);
@@ -1048,7 +1110,7 @@ mod tests {
                 });
             }
             while written.load(Ordering::Relaxed) < 2_000 {
-                trees.forget_the_removed(&unheard);
+                trees.forget_the_removed(&unheard, &Weak::new());
             }
         });
 
@@ -1076,7 +1138,7 @@ mod tests {
     #[tokio::test]
     async fn the_task_ends_with_the_registry_or_the_trees() {
         let tasks = || Handle::current().metrics().num_alive_tasks();
-        let registry = WorkerRegistry::new();
+        let registry = Arc::new(WorkerRegistry::new());
         let trees = Arc::new(owner(document(1_000, 0)));
         trees.follow_removals(&registry, &Handle::current());
         let alive = (tasks(), Arc::weak_count(&trees));
@@ -1085,7 +1147,7 @@ mod tests {
         until("its end with the registry", || tasks() == 0).await;
         assert_eq!(Arc::weak_count(&trees), 0);
 
-        let registry = WorkerRegistry::new();
+        let registry = Arc::new(WorkerRegistry::new());
         trees.follow_removals(&registry, &Handle::current());
         drop(trees);
         worker_at(&registry, "http://a:1");
