@@ -15,7 +15,7 @@ use serde_json::Value;
 
 #[cfg(test)]
 use self::translation::label_refused;
-use self::translation::{both_families, presets, written, written_with};
+use self::translation::{both_families, presets, three_sided, written, written_from, written_with};
 // The metric is named only by a doc link of this module and by its cases.
 #[cfg(any(test, doc))]
 use crate::policies::power_of_two::PowerOfTwoMetric;
@@ -67,6 +67,12 @@ use crate::{
 ///   policy, as under the gateway's own policies. Over gRPC or ZMQ the mode
 ///   counts tokens with no worker, so a gateway of one router plans the
 ///   pair alone there ([`ConnectionModeSetting`]).
+/// - A gateway of many routers mounts its three-sided router in every
+///   mode, and a model with an encode pool goes to it. Its document's
+///   first binding therefore plans three sides, over the encode, prefill
+///   and decode phases: the pair's two as above, and an encode side under
+///   the mode's encode policy, or under `consistent_hashing` where the mode
+///   names none.
 /// - A policy's own setting lands in the stage of the preset that reads it,
 ///   and only where it differs from the number that stage runs at when its
 ///   document names none. The controller names those numbers and this
@@ -121,6 +127,16 @@ use crate::{
 /// view carries no block for and a main policy setting the build does not
 /// run are two such. The mode's own document is checked where it is applied.
 /// A request of the family left out is refused.
+///
+/// The encode side is left out of a gateway of many routers, outside the
+/// encode mode, where the plan of three sides has no document. The
+/// settings then say what they said before that plan, and an encode
+/// request meets no binding with an encode side. Two settings leave it
+/// out. The manual policy on a pair's two sides places every side of a
+/// plan or none, so the pair's plan stands. The sticky override's rule
+/// places single requests alone, so under a policy it places such a
+/// gateway is refused by the setting's name, as it was. A document of
+/// three sides the controller's check refuses is left out too.
 ///
 /// # What is not read
 ///
@@ -601,6 +617,23 @@ pub enum RoutingSettingsError {
     },
 }
 
+/// The document a plan was written into, where that plan is taken: `None`
+/// where the next plan stands in its place. A setting that the plan's
+/// other family reads and that no document says leaves that plan. So does
+/// a document the controller's check refuses, for a plan that is `checked`:
+/// one that binds more than the gateway's document bound before it, so the
+/// binding costs the gateway no document that was taken.
+fn taken(
+    said: Result<PolicySpec, RoutingSettingsError>,
+    checked: bool,
+) -> Option<Result<PolicySpec, RoutingSettingsError>> {
+    match said {
+        Err(RoutingSettingsError::UnsupportedSetting { .. }) => None,
+        Ok(document) if checked && document.validate().is_err() => None,
+        said => Some(said),
+    }
+}
+
 fn unsupported(
     setting: &'static str,
     value: impl ToString,
@@ -617,26 +650,31 @@ impl RoutingSettings {
     /// The policy document these settings say, or the first of them that no
     /// document says.
     ///
+    /// A gateway of many routers mounts its three-sided router in every
+    /// mode, so its document plans the three sides first: one `epd`
+    /// binding ahead of the main policy's own. Where a setting has no
+    /// document under that plan, or the controller's check refuses the
+    /// plan's document, the settings say what they said before it: no
+    /// gateway loses a document it has, and a refusal keeps its words. An
+    /// encode request then meets no binding with an encode side. Two
+    /// settings do so: the manual policy on a pair's two sides, and the
+    /// sticky override under a policy it places.
+    ///
     /// A pure function of the settings. The document is not validated
-    /// here, the encode mode of many routers apart: the controller
-    /// validates a document where it is applied, and names there a stage
-    /// its build does not run yet.
+    /// here, a plan with an encode side in a gateway of many routers
+    /// apart: the controller validates a document where it is applied, and
+    /// names there a stage its build does not run yet.
     pub fn policy_document(&self) -> Result<PolicySpec, RoutingSettingsError> {
         refuse_unsupported(self)?;
+        if let Some(three) = three_sided(self)? {
+            if let Some(said) = taken(written(self, three), true) {
+                return said;
+            }
+        }
         if let Some(both) = both_families(self)? {
             let encode_mode = matches!(self.mode, ModeSettings::EncodePrefillDecode { .. });
-            match written(self, both) {
-                // A setting the other family's policy reads and no document
-                // says leaves that family out. The document then plans the
-                // configuration's own family alone.
-                Err(RoutingSettingsError::UnsupportedSetting { .. }) => {}
-                // The encode mode of many routers ran its own family alone
-                // before it bound a single request. A document of both that
-                // the controller's check refuses leaves the single family
-                // out as well, so that binding costs the mode no document
-                // that was taken.
-                Ok(both) if encode_mode && both.validate().is_err() => {}
-                said => return said,
+            if let Some(said) = taken(written(self, both), encode_mode) {
+                return said;
             }
         }
         written(self, presets(self)?)
@@ -723,12 +761,14 @@ impl RoutingSettings {
         if labels.is_empty() {
             return Ok(document);
         }
-        // The plan that document was written from, written again with the
-        // labels' sides. The plan of two families binds two bindings and
-        // the mode's own plan one, so the count says which it was.
-        let plan = match both_families(self)? {
-            Some(both) if both.1.len() == document.bindings.len() => both,
-            _ => presets(self)?,
+        // The plan that document was written from ([`written_from`]),
+        // written again with the labels' sides.
+        let plan = match three_sided(self)? {
+            Some(three) if written_from(&three, &document) => three,
+            _ => match both_families(self)? {
+                Some(both) if written_from(&both, &document) => both,
+                _ => presets(self)?,
+            },
         };
         written_with(self, plan, &labels)
     }
@@ -949,7 +989,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        document::spec::{AppliedSpec, PRESETS},
+        document::spec::{AppliedSpec, PlanName, PRESETS},
         engine::framework::{InTheWay, Place, Plan},
     };
 
@@ -2398,6 +2438,42 @@ mod tests {
         }
     }
 
+    /// `both`, a document of pairs and single requests, with the encode
+    /// side a gateway of many routers plans ahead of them: the side's
+    /// default profile, and the pair's binding under the plan of three
+    /// sides, over the encode phase too. Nothing else of the document
+    /// differs: the pair's two profiles are the pair plan's.
+    fn with_encode_side(mut both: PolicySpec) -> PolicySpec {
+        let ring = preset("consistent_hashing")
+            .profiles
+            .remove("consistent_hashing")
+            .expect("the preset's profile");
+        both.profiles.insert("encode".to_string(), ring);
+        let sides = both.bindings.first_mut().expect("the pair's binding");
+        sides.plan = Some(PlanName::Epd);
+        sides
+            .profiles
+            .insert("encode".to_string(), "encode".to_string());
+        sides.matcher.phase.insert(0, Phase::Encode);
+        both
+    }
+
+    /// The document `settings` said before a gateway of many routers
+    /// planned three sides: the plan of two families where it stands, and
+    /// the mode's own behind it.
+    fn before_three_sides(settings: &RoutingSettings) -> Result<PolicySpec, RoutingSettingsError> {
+        refuse_unsupported(settings)?;
+        if let Some(both) = both_families(settings)? {
+            let encode_mode = matches!(settings.mode, ModeSettings::EncodePrefillDecode { .. });
+            match written(settings, both) {
+                Err(RoutingSettingsError::UnsupportedSetting { .. }) => {}
+                Ok(both) if encode_mode && both.validate().is_err() => {}
+                said => return said,
+            }
+        }
+        written(settings, presets(settings)?)
+    }
+
     /// The pair's own document alone, as `presets` plans it: what a pair
     /// mode says where its main policy's single binding has no document.
     fn pair_alone(config: &RoutingSettings) -> Result<PolicySpec, RoutingSettingsError> {
@@ -2440,9 +2516,11 @@ mod tests {
                 { "match": { "model": "*", "phase": [] }, "profile": "least_load" },
             ]),
         );
+        // A gateway of many routers plans its encode side ahead of the
+        // same two families.
         assert_eq!(
-            many_routers(settings.clone()).policy_document().as_ref(),
-            Ok(&document)
+            many_routers(settings.clone()).policy_document(),
+            Ok(with_encode_side(document.clone()))
         );
 
         // Whether a single request has no side, and whether its place is
@@ -2608,8 +2686,8 @@ mod tests {
                 "{connection_mode:?}"
             );
             assert_eq!(
-                many_routers(settings).policy_document().as_ref(),
-                Ok(&both),
+                many_routers(settings).policy_document(),
+                Ok(with_encode_side(both.clone())),
                 "{connection_mode:?}"
             );
             let unset = RoutingSettings {
@@ -2626,8 +2704,12 @@ mod tests {
         }
     }
 
+    /// A gateway of many routers mounts its three-sided router in every
+    /// mode, and a model with an encode pool goes to it. So its default
+    /// document binds three sides over their phases, the encode side under
+    /// its default policy, and every other request behind them.
     #[test]
-    fn the_default_document_of_many_routers_binds_pairs_ahead_of_single_workers() {
+    fn the_default_document_of_many_routers_binds_three_sides_ahead_of_single_workers() {
         let document = many_routers(defaults())
             .policy_document()
             .expect("the default document");
@@ -2635,17 +2717,34 @@ mod tests {
             serde_json::to_value(&document.bindings).expect("a written form"),
             json!([
                 {
-                    "match": { "model": "*", "phase": ["prefill", "decode"] },
-                    "plan": "pd-pair",
-                    "profiles": { "decode": "decode", "prefill": "prefill" },
+                    "match": { "model": "*", "phase": ["encode", "prefill", "decode"] },
+                    "plan": "epd",
+                    "profiles": { "decode": "decode", "encode": "encode", "prefill": "prefill" },
                 },
                 { "match": { "model": "*", "phase": [] }, "profile": "random" },
             ]),
         );
         assert_eq!(
             document.profiles.keys().collect::<Vec<_>>(),
-            ["decode", "prefill", "random"]
+            ["decode", "encode", "prefill", "random"]
         );
+        assert_eq!(
+            document.profiles.get("encode"),
+            preset("consistent_hashing")
+                .profiles
+                .get("consistent_hashing")
+        );
+        let applied = validated(&document).expect("the controller takes the document");
+        let plan = |phase| {
+            applied
+                .engine()
+                .binding("m", phase)
+                .map(|binding| binding.plan)
+        };
+        for phase in [Phase::Encode, Phase::Prefill, Phase::Decode] {
+            assert!(matches!(plan(phase), Some(Plan::Epd { .. })), "{phase:?}");
+        }
+        assert_eq!(plan(Phase::Single), Some(Plan::Single));
     }
 
     #[test]
@@ -2658,9 +2757,9 @@ mod tests {
             };
             let single = regular.policy_document().expect("the regular document");
             let paired = pair_alone(&pair).expect("the pair's own document");
-            let both = many_routers(regular.clone())
+            let both = pair
                 .policy_document()
-                .expect("the document of many routers");
+                .expect("the pair configuration's document");
 
             // The pair binding leads over its two phases. The single binding
             // stands behind it as the regular configuration writes it.
@@ -2679,17 +2778,161 @@ mod tests {
                 "{name}"
             );
 
-            // A pair configuration with no side policy of its own says the
-            // same document, of one router as of many, and the controller
-            // takes it.
-            assert_eq!(pair.policy_document().as_ref(), Ok(&both), "{name}");
-            assert_eq!(
-                many_routers(pair).policy_document().as_ref(),
-                Ok(&both),
-                "{name}"
-            );
+            // A gateway of many routers says those two families with its
+            // encode side ahead of them, under a regular configuration as
+            // under a pair one with no side policy of its own. The pair's
+            // two profiles are the pair plan's, and the controller takes
+            // both documents.
+            let three = with_encode_side(both.clone());
+            for settings in [regular, pair] {
+                assert_eq!(
+                    many_routers(settings).policy_document().as_ref(),
+                    Ok(&three),
+                    "{name}"
+                );
+            }
             assert_eq!(validated(&both).err(), None, "{name}");
+            assert_eq!(validated(&three).err(), None, "{name}");
         }
+    }
+
+    /// A gateway of one router and the encode mode plan no third side of
+    /// this kind: each says, to the byte, the document it said before a
+    /// gateway of many routers planned three sides. One router mounts the
+    /// three-sided router under the encode mode alone, and the encode
+    /// mode's plan holds its three sides already.
+    #[test]
+    fn one_router_and_the_encode_mode_say_the_document_they_said() {
+        let named = |name: &str| Some(at_flag_defaults(name));
+        let mut said = 0;
+        for name in PRESETS {
+            let modes = [
+                ModeSettings::Regular,
+                pair_mode(None, None),
+                pair_mode(named(name), named("round_robin")),
+                ModeSettings::EncodePrefillDecode {
+                    encode_policy: None,
+                    prefill_policy: None,
+                    decode_policy: None,
+                },
+                ModeSettings::EncodePrefillDecode {
+                    encode_policy: named("round_robin"),
+                    prefill_policy: named(name),
+                    decode_policy: named("round_robin"),
+                },
+            ];
+            for mode in modes {
+                let encode_mode = matches!(mode, ModeSettings::EncodePrefillDecode { .. });
+                for connection_mode in [
+                    ConnectionModeSetting::Http,
+                    ConnectionModeSetting::Grpc,
+                    ConnectionModeSetting::Zmq,
+                ] {
+                    let one_router = RoutingSettings {
+                        mode: mode.clone(),
+                        connection_mode,
+                        ..config(at_flag_defaults(name))
+                    };
+                    let mut kinds = vec![one_router.clone()];
+                    if encode_mode {
+                        kinds.push(many_routers(one_router));
+                    }
+                    for settings in kinds {
+                        let row = format!("{name}, {:?}, {connection_mode:?}", settings.mode);
+                        assert!(matches!(three_sided(&settings), Ok(None)), "{row}");
+                        let document = settings.policy_document();
+                        assert_eq!(document, before_three_sides(&settings), "{row}");
+                        said += usize::from(document.is_ok());
+                    }
+                }
+            }
+        }
+        assert_eq!(said, 195, "documents were said");
+    }
+
+    /// The plan of three sides falls back to the plan that stood before it,
+    /// setting by setting: such a gateway says the document it said, and an
+    /// encode request meets no binding with an encode side. Three settings
+    /// fall back so. The manual policy places by its binding's one rule, so
+    /// every side of a plan is manual or none is, and the encode side runs
+    /// another policy. The sticky override's rule has no document on a plan
+    /// of more sides than one. And a main policy the controller's check
+    /// refuses leaves the plan as it leaves the encode mode's.
+    #[test]
+    fn many_routers_keep_the_plan_they_had_where_three_sides_have_no_document() {
+        let manual = || Some(at_flag_defaults("manual"));
+        let manual_sides = many_routers(RoutingSettings {
+            mode: pair_mode(manual(), manual()),
+            ..config(PolicySettings::RoundRobin)
+        });
+        let mut overridden = many_routers(config(PolicySettings::RoundRobin));
+        overridden.routing_key_override.enabled = true;
+        let mut ring = at_flag_defaults("prefix_hash");
+        if let PolicySettings::PrefixHash {
+            prefix_token_count, ..
+        } = &mut ring
+        {
+            *prefix_token_count = 15;
+        }
+        let unchecked = many_routers(RoutingSettings {
+            mode: pair_mode(
+                Some(PolicySettings::RoundRobin),
+                Some(PolicySettings::RoundRobin),
+            ),
+            ..config(ring)
+        });
+        // What the plan of three sides says alone: the setting it is
+        // refused by, or a document the check refuses.
+        let three = |settings: &RoutingSettings| {
+            let plan = three_sided(settings).expect("the plan's presets");
+            written(settings, plan.expect("a plan of three sides"))
+        };
+        let refused_by = |settings: &RoutingSettings| match three(settings) {
+            Err(RoutingSettingsError::UnsupportedSetting { setting, value, .. }) => {
+                Some((setting, value))
+            }
+            _ => None,
+        };
+        assert_eq!(
+            refused_by(&manual_sides),
+            Some(("policy", "manual".to_string()))
+        );
+        assert_eq!(
+            refused_by(&overridden),
+            Some(("routing_key_override.enabled", "true".to_string()))
+        );
+        let checked = three(&unchecked).expect("a written document");
+        assert!(checked.validate().is_err());
+
+        for (setting, settings) in [
+            ("the manual policy on a pair's two sides", &manual_sides),
+            ("the sticky override", &overridden),
+            ("a main ring under one block", &unchecked),
+        ] {
+            let said = settings.policy_document();
+            assert_eq!(said, before_three_sides(settings), "{setting}");
+            let leads = said
+                .ok()
+                .and_then(|document| document.bindings.first().map(|binding| binding.plan));
+            assert_ne!(leads, Some(Some(PlanName::Epd)), "{setting}");
+        }
+        // The manual pair keeps its two families, and the override under a
+        // policy it places keeps its refusal by the setting's name.
+        let pairs = manual_sides
+            .policy_document()
+            .expect("the plan of two families");
+        assert_eq!(pairs.bindings.len(), 2);
+        assert_eq!(pairs.bindings[0].plan, Some(PlanName::PdPair));
+        assert_eq!(
+            refusal(&overridden),
+            ("routing_key_override.enabled", "true".to_string())
+        );
+        // A label is written into the plan that stands: the pair's binding
+        // stays ahead of the label's, and no refusal of three sides is its.
+        let labelled = with_labels(&manual_sides, &[("m", "random")]).expect("a labelled one");
+        assert_eq!(labelled.bindings.len(), 3);
+        assert_eq!(labelled.bindings[0], pairs.bindings[0]);
+        assert_eq!(labelled.bindings[2], pairs.bindings[1]);
     }
 
     #[test]
@@ -3296,9 +3539,12 @@ mod tests {
     /// pair plan and its single request to the label's profile.
     #[test]
     fn a_pair_mode_keeps_its_pair_binding_ahead_of_a_labels() {
-        for settings in [
-            round_robin_pairs_under(at_flag_defaults("least_load")),
-            many_routers(config(at_flag_defaults("least_load"))),
+        for (settings, three_sides) in [
+            (
+                round_robin_pairs_under(at_flag_defaults("least_load")),
+                false,
+            ),
+            (many_routers(config(at_flag_defaults("least_load"))), true),
         ] {
             let own = settings
                 .policy_document()
@@ -3315,8 +3561,15 @@ mod tests {
                 .validate_with(&["x-smg-tenant-id"])
                 .expect("the controller's check takes the document");
             let plan = |phase| engine.binding("m", phase).map(|binding| binding.plan);
-            assert_eq!(plan(Phase::Prefill), Some(Plan::PdPair));
-            assert_eq!(plan(Phase::Decode), Some(Plan::PdPair));
+            // A gateway of many routers plans the pair among three sides.
+            for phase in [Phase::Prefill, Phase::Decode] {
+                let pairs = match plan(phase) {
+                    Some(Plan::PdPair) => !three_sides,
+                    Some(Plan::Epd { .. }) => three_sides,
+                    _ => false,
+                };
+                assert!(pairs, "{phase:?}");
+            }
             assert_eq!(plan(Phase::Single), Some(Plan::Single));
             assert_eq!(single_profile(&document, "m"), "random");
             assert_eq!(single_profile(&document, "another"), "least_load");

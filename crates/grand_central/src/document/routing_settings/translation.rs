@@ -89,9 +89,10 @@ type Planned<'a> = (PolicySpec, Vec<Vec<Side<'a>>>);
 /// self-hosted workers.
 ///
 /// A pair mode's document binds two families ([`both_families`]), and the
-/// encode mode's does in a gateway of many routers. The mode's arm here is
-/// then reached only where the main policy's single binding has no
-/// document, and plans the mode's own family alone.
+/// encode mode's does in a gateway of many routers. A gateway of many
+/// routers plans its three sides ahead of both ([`three_sided`]). The mode's
+/// arm here is then reached only where the main policy's single binding has
+/// no document, and plans the mode's own family alone.
 pub(super) fn presets(config: &RoutingSettings) -> Result<Planned<'_>, RoutingSettingsError> {
     let (mode, main) = (&config.mode, &config.policy);
     let (prefill, decode) = (mode.prefill_policy(main), mode.decode_policy(main));
@@ -157,6 +158,10 @@ pub(super) fn presets(config: &RoutingSettings) -> Result<Planned<'_>, RoutingSe
 /// mode whose two sides are manual is planned, under the one rule. A
 /// gateway of one router in the encode mode counts tokens with no worker,
 /// so its document binds no single request.
+///
+/// A gateway of many routers outside the encode mode plans its three sides
+/// ahead of this plan ([`three_sided`]), and this one stands where that
+/// plan has no document.
 pub(super) fn both_families(
     config: &RoutingSettings,
 ) -> Result<Option<Planned<'_>>, RoutingSettingsError> {
@@ -182,6 +187,40 @@ pub(super) fn both_families(
     if !both {
         return Ok(None);
     }
+    families(config, encode).map(Some)
+}
+
+/// The document of a gateway of many routers outside the encode mode, with
+/// an encode side: the three sides under one binding over their three
+/// phases, and the single binding behind it. Such a gateway mounts the
+/// three-sided router in every mode, and a model with an encode pool goes
+/// to it. Its encode side runs under the encode side's default policy, and
+/// its pair's two sides under the mode's side policies, as the pair plan's
+/// do ([`both_families`]): the pair's two profiles are that plan's.
+///
+/// `None` for a gateway of one router, which mounts that router under the
+/// encode mode alone, and for the encode mode, whose plan of two families
+/// is this one already. A setting with no document under three sides
+/// leaves the plan where it is written, as the manual policy on the pair's
+/// two sides does, a regular configuration's main policy among them.
+pub(super) fn three_sided(
+    config: &RoutingSettings,
+) -> Result<Option<Planned<'_>>, RoutingSettingsError> {
+    let encode_mode = matches!(config.mode, ModeSettings::EncodePrefillDecode { .. });
+    if !config.enable_igw || encode_mode {
+        return Ok(None);
+    }
+    families(config, Some(&ENCODE_DEFAULT)).map(Some)
+}
+
+/// The plan of two families: the pair's sides under one binding over their
+/// phases, with `encode` as a third side ahead of them where one is named,
+/// and the main policy's single binding behind it.
+fn families<'a>(
+    config: &'a RoutingSettings,
+    encode: Option<&'a PolicySettings>,
+) -> Result<Planned<'a>, RoutingSettingsError> {
+    let (mode, main) = (&config.mode, &config.policy);
     let (prefill, decode) = (mode.prefill_policy(main), mode.decode_policy(main));
     let mut sides = vec![("prefill", prefill), ("decode", decode)];
     let mut phases = vec![Phase::Prefill, Phase::Decode];
@@ -199,7 +238,17 @@ pub(super) fn both_families(
     let single = PolicySpec::preset(main.name())?;
     document.profiles.extend(single.profiles);
     document.bindings.extend(single.bindings);
-    Ok(Some((document, vec![sides, vec![(main.name(), main)]])))
+    Ok((document, vec![sides, vec![(main.name(), main)]]))
+}
+
+/// Whether `document` was written from `plan`. The settings try their plans
+/// in turn and write the first that stands. A plan of two families binds two
+/// bindings and the mode's own plan one, and the two plans of two families
+/// lead with two plans' names: the count of bindings and the first one's
+/// plan say which plan a document came from.
+pub(super) fn written_from((planned, bindings): &Planned<'_>, document: &PolicySpec) -> bool {
+    let leads = |spec: &PolicySpec| spec.bindings.first().map(|binding| binding.plan);
+    bindings.len() == document.bindings.len() && leads(planned) == leads(document)
 }
 
 /// Writes the configuration's settings over a planned document: each side's
