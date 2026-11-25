@@ -38,24 +38,25 @@ use crate::{
     started_as, under_pairs, MODEL,
 };
 
-/// A request for [`MODEL`] that carries no header.
-const PLAIN: Asked<'static> = Asked {
+/// A request for [`MODEL`] that carries no header and no item.
+pub(crate) const PLAIN: Asked<'static> = Asked {
     model: MODEL,
     headers: None,
+    items: &[],
 };
 
 /// The address of the prefill worker at `at`.
-fn prefill(at: usize) -> String {
+pub(crate) fn prefill(at: usize) -> String {
     format!("http://prefill-{at}:8000")
 }
 
 /// The address of the decode worker at `at`.
-fn decode(at: usize) -> String {
+pub(crate) fn decode(at: usize) -> String {
     format!("http://decode-{at}:8000")
 }
 
 /// A ready worker of `kind` that serves [`MODEL`], at `address`.
-fn typed(address: &str, kind: WorkerType) -> Arc<dyn Worker> {
+pub(crate) fn typed(address: &str, kind: WorkerType) -> Arc<dyn Worker> {
     let worker = worker_with_model_aliases(address, MODEL, &[], kind);
     worker.set_status(WorkerStatus::Ready);
     worker
@@ -63,14 +64,14 @@ fn typed(address: &str, kind: WorkerType) -> Arc<dyn Worker> {
 
 /// `prefills` prefill workers and then `decodes` decode workers, each kind
 /// in the order of its addresses.
-fn fleet(prefills: usize, decodes: usize) -> Vec<Arc<dyn Worker>> {
+pub(crate) fn fleet(prefills: usize, decodes: usize) -> Vec<Arc<dyn Worker>> {
     let prefills = (0..prefills).map(|at| typed(&prefill(at), WorkerType::Prefill));
     let decodes = (0..decodes).map(|at| typed(&decode(at), WorkerType::Decode));
     prefills.chain(decodes).collect()
 }
 
 /// How often each worker was sent to over `answers`, by its address.
-fn sends<'a>(answers: impl IntoIterator<Item = &'a Answer>) -> BTreeMap<&'a str, u32> {
+pub(crate) fn sends<'a>(answers: impl IntoIterator<Item = &'a Answer>) -> BTreeMap<&'a str, u32> {
     let mut times = BTreeMap::new();
     for address in answers.into_iter().flat_map(|answer| &answer.sent) {
         *times.entry(address.as_str()).or_insert(0) += 1;
@@ -86,7 +87,7 @@ fn sends<'a>(answers: impl IntoIterator<Item = &'a Answer>) -> BTreeMap<&'a str,
 ///
 /// The classic router names both sides of a pair with their places: its
 /// case `a_pair_placement_names_both_sides_with_their_positions`
-/// (`model_gateway/src/routers/common/placement.rs:3455-3502`).
+/// (`model_gateway/src/routers/common/placement.rs:3472-3519`).
 #[test]
 fn a_pair_names_a_prefill_and_a_decode_and_each_side_takes_its_turn() {
     let fleet = fleet(2, 3);
@@ -116,7 +117,7 @@ fn a_pair_names_a_prefill_and_a_decode_and_each_side_takes_its_turn() {
 /// time, and goes back to a tried worker that is the only one open: its
 /// cases `a_pairs_retry_steps_aside_from_the_tried_engines_a_side_at_a_time`
 /// and `a_pairs_retry_goes_back_to_a_tried_worker_that_is_the_only_one_open`
-/// (`model_gateway/src/routers/common/placement.rs:3686-3734`, `:3740-3772`).
+/// (`model_gateway/src/routers/common/placement.rs:3703-3751`, `:3757-3789`).
 #[test]
 fn a_pairs_retry_names_both_workers_it_tried_and_steps_aside_from_each() {
     let fleet = fleet(2, 2);
@@ -174,13 +175,15 @@ fn a_pairs_retry_names_both_workers_it_tried_and_steps_aside_from_each() {
 
 /// A worker that cannot be sent to takes no request on its side: a decode
 /// that is not ready, and a prefill whose circuit breaker is open. Where no
-/// decode can be sent to, the engine names no pair, and the program answers
-/// a 503. So it does for a model that has prefills and no decode at all.
+/// decode can be sent to, the engine names no pair under the `healthy`
+/// filter's name, and the program answers a 503. So it does for a model
+/// that has prefills and no decode at all, where no filter emptied a list
+/// and the engine names none.
 ///
 /// The classic router answers a pair whose only decode is not ready as the
 /// decode role's unavailability: its case
 /// `a_pair_whose_only_decode_is_not_ready_is_the_decode_roles_unavailability`
-/// (`model_gateway/src/routers/common/placement.rs:4495-4507`).
+/// (`model_gateway/src/routers/common/placement.rs:4512-4524`).
 #[test]
 fn a_side_that_cannot_be_sent_to_takes_no_request() {
     let fleet = fleet(2, 3);
@@ -220,8 +223,19 @@ fn a_side_that_cannot_be_sent_to_takes_no_request() {
     let prefills = self::fleet(2, 0);
     let (program, _loads, _task) = under_pairs(PolicySettings::RoundRobin, &prefills, served);
     let answer = program.serve(&PLAIN);
-    assert_eq!((answer.status, answer.sent.len()), (503, 0), "{answer:?}");
-    assert!(answer.unplaced.is_some(), "{answer:?}");
+    let no_list = Unplaced::Shed {
+        reason: ShedReason::NoEndpoints,
+        emptied_by: "none",
+        retry_after_secs: 1,
+    };
+    assert_eq!(
+        answer,
+        Answer {
+            sent: Vec::new(),
+            status: 503,
+            unplaced: Some(no_list),
+        }
+    );
 }
 
 /// The engine hears both sides of a pair from the placement its program
@@ -232,7 +246,7 @@ fn a_side_that_cannot_be_sent_to_takes_no_request() {
 ///
 /// The classic router's engine arm says each side by that side's guard: its
 /// case `the_engine_hears_each_side_of_a_placed_pair_by_that_sides_guard`
-/// (`model_gateway/src/routers/common/placement.rs:9267-9302`).
+/// (`model_gateway/src/routers/common/placement.rs:9367-9402`).
 #[tokio::test(start_paused = true)]
 async fn the_engine_hears_both_sides_of_a_pair() {
     let heard = Heard::default();
