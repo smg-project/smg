@@ -359,15 +359,13 @@ pub(crate) mod tests {
 
     /// Stand the worker object of `row` in `to` and tell `store`, as a
     /// probe's verdict leaves the two: a case's own hand on a worker's
-    /// health where it runs no probe. The holder reads the store to its
-    /// end first.
+    /// health where it runs no probe.
     pub(crate) fn stand<G: Generation>(
         objects: &Objects<G>,
         store: &MemoryStore,
         row: WorkerId,
         to: WorkerStatus,
     ) {
-        objects.follow(store);
         let id = objects.object(row).expect("the row's object");
         let registry = objects.registry();
         let revision = registry.get(&id).expect("it stands").revision();

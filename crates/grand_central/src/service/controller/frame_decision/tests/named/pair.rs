@@ -74,14 +74,15 @@ fn rings() -> Arc<MemoryStore> {
     pair_store(RING, RING)
 }
 
-/// The ready members `names` on `role`'s side, each beside its name: one
-/// `only` alone dials where it names a gateway.
+/// The ready members `names` on `role`'s side, written through `objects`,
+/// each beside its name: one `only` alone dials where it names a gateway.
 fn side<const N: usize>(
     store: &MemoryStore,
+    objects: &Objects<Members>,
     role: Role,
     names: [(&'static str, Option<GatewayId>); N],
 ) -> [(&'static str, WorkerId); N] {
-    names.map(|(name, only)| (name, side_member(store, name, role, only)))
+    names.map(|(name, only)| (name, side_member(store, objects, name, role, only)))
 }
 
 /// A fleet every gateway dials: the prefills `p0`.. and the decodes `d0`..,
@@ -92,10 +93,19 @@ fn fleet<const P: usize, const D: usize>(
     prefills: [&'static str; P],
     decodes: [&'static str; D],
 ) -> (Arc<Objects<Members>>, Vec<WorkerId>, Vec<WorkerId>) {
-    let prefills = side(store, Role::Prefill, prefills.map(|name| (name, None)));
-    let decodes = side(store, Role::Decode, decodes.map(|name| (name, None)));
     let objects = holder(store);
-    objects.follow(&**store);
+    let prefills = side(
+        store,
+        &objects,
+        Role::Prefill,
+        prefills.map(|name| (name, None)),
+    );
+    let decodes = side(
+        store,
+        &objects,
+        Role::Decode,
+        decodes.map(|name| (name, None)),
+    );
     let ahead = list_order(&objects, Role::Prefill, &prefills);
     let behind = list_order(&objects, Role::Decode, &decodes);
     (objects, ahead, behind)
@@ -146,7 +156,6 @@ fn booked_pair(
 ) -> (Decision, PairBooked) {
     let request = Checked::new(frame).expect("a frame the record holds");
     let taken = taken_at(&request, GATEWAY, (now, now), None);
-    objects.follow(store);
     let (mut frames, own) = (FrameBuffers::default(), Part::default());
     let loads = Arc::new(LoadSnapshot::default());
     let decided =
@@ -245,13 +254,12 @@ fn a_number_that_reaches_no_worker_on_a_side_sheds_the_pair_under_target_worker(
 #[test]
 fn each_sides_number_counts_the_workers_its_gateway_can_be_sent_to() {
     let store = rings();
+    let objects = holder(&store);
     let theirs = Some(OTHER);
     let prefills = [("p0", None), ("p1", theirs), ("p2", None), ("p3", None)];
-    let prefills = side(&store, Role::Prefill, prefills);
+    let prefills = side(&store, &objects, Role::Prefill, prefills);
     let decodes = [("d0", None), ("d1", None), ("d2", None), ("d3", theirs)];
-    let decodes = side(&store, Role::Decode, decodes);
-    let objects = holder(&store);
-    objects.follow(&*store);
+    let decodes = side(&store, &objects, Role::Decode, decodes);
     let ahead = list_order(&objects, Role::Prefill, &prefills);
     let behind = list_order(&objects, Role::Decode, &decodes);
     let dialed = |order: &[WorkerId], other: WorkerId| -> Vec<WorkerId> {
@@ -547,17 +555,16 @@ fn a_side_is_held_where_its_profile_is_the_plain_ring() {
 #[test]
 fn a_decode_named_alone_is_counted_behind_the_prefill_the_decision_picks() {
     let store = pair_store("round_robin", RING);
+    let objects = holder(&store);
     let prefills = [("p0", None), ("p1", None), ("p2", None)];
-    let prefills = side(&store, Role::Prefill, prefills);
+    let prefills = side(&store, &objects, Role::Prefill, prefills);
     let decodes = [
         ("d0", None),
         ("d1", Some(OTHER)),
         ("d2", None),
         ("d3", None),
     ];
-    let decodes = side(&store, Role::Decode, decodes);
-    let objects = holder(&store);
-    objects.follow(&*store);
+    let decodes = side(&store, &objects, Role::Decode, decodes);
     let behind = list_order(&objects, Role::Decode, &decodes);
     let ours: Vec<WorkerId> = behind
         .iter()

@@ -3,7 +3,9 @@
 
 use std::sync::atomic::Ordering;
 
-use super::{bed, booked, busy, frame_for, leading, outcome, pair_of, phased, GATEWAY, MODEL};
+use super::{
+    bed, booked, busy, frame_for, leading, outcome, pair_of, phased, written_ready, GATEWAY, MODEL,
+};
 use crate::{
     document::spec::{AppliedSpec, PolicySpec},
     engine::view::{Role, WireModes, WorkerId},
@@ -11,8 +13,8 @@ use crate::{
     stages::registry::StageRegistry,
     store::{
         EncodeHandoff, EncodeOffer, GatewayId, LeasesStore, MemoryStore, Reachability, WorkerFacts,
-        WorkerStatus, WorkersStore,
     },
+    worker_host::{Members, Objects},
 };
 
 /// The model of the encode request's cases.
@@ -72,11 +74,13 @@ pub(crate) const PUSHING: Stated = Stated {
     pushes: true,
 };
 
-/// A ready member `name` of `model` in `role` that states `stated`. An
-/// encoder and a prefill that state their end state one push between them,
-/// under one runtime: one encode class, which every such prefill names.
+/// A ready member `name` of `model` in `role` that states `stated`,
+/// written through `objects`. An encoder and a prefill that state their
+/// end state one push between them, under one runtime: one encode class,
+/// which every such prefill names.
 pub(crate) fn member_of(
     store: &MemoryStore,
+    objects: &Objects<Members>,
     model: &str,
     name: &str,
     role: Role,
@@ -107,12 +111,7 @@ pub(crate) fn member_of(
         encode,
         ..WorkerFacts::default()
     };
-    let id = store.upsert(facts).id();
-    store.publish_now();
-    let row = WorkersStore::get(store, id).expect("the row");
-    let ready = store.set_status(id, WorkerStatus::Ready, row.revision);
-    ready.expect("the row stands");
-    id
+    written_ready(store, objects, facts)
 }
 
 /// The `n`th encode request's frame for `model`: a frame of the encode
@@ -152,7 +151,8 @@ pub(crate) fn frame_of(
 #[tokio::test]
 async fn a_served_encode_request_is_answered_its_pairs_leases_and_each_items_encoder() {
     let mut bed = bed(Some(encode_plan()), true, (2, 8), []);
-    let member = |name: &str, role| member_of(&bed.store, ENCODED, name, role, PUSHING);
+    let member =
+        |name: &str, role| member_of(&bed.store, &bed.reads.objects, ENCODED, name, role, PUSHING);
     let p = member("ep0", Role::Prefill);
     let d = member("ed0", Role::Decode);
     let e = member("ee0", Role::Encode);
