@@ -240,6 +240,10 @@ def _strict_owned(
         if group_exited(pid):
             return None
         raise ValueError(f"thread group exit is not established: {pid}")
+    if not environ:
+        # An exec/exit can release the address space after environ was opened.
+        # Empty bytes cannot establish that a live process lacks our marker.
+        raise ValueError(f"empty environment observation for live pid {pid}")
     markers = [value for value in environ.split(b"\0") if value.startswith(b"E2E_JOB_MARKER=")]
     if entry not in markers:
         return None
@@ -350,17 +354,27 @@ def reap_strict(
         finally:
             close(fd)
 
-    def still_owned(process: OwnedProcess) -> bool:
+    def still_owned(process: OwnedProcess) -> bool | None:
         if group_exited(process.pid):
             return False
-        current = _strict_owned(proc_root, process.pid, owner_uid, entry, group_exited=group_exited)
-        if current is None:
-            stat = _strict_stat(proc_root, process.pid)
-            if stat is None:
+        try:
+            current = _strict_owned(
+                proc_root, process.pid, owner_uid, entry, group_exited=group_exited
+            )
+            # Exit may complete during the observation, leaving an unreaped Z
+            # leader in proc. Only the bound fd establishes whole-group exit.
+            if group_exited(process.pid):
                 return False
-            raise ValueError(f"tracked ownership changed or is unobservable: {process.pid}")
-        if (current.uid, current.starttime) != (process.uid, process.starttime):
-            raise ValueError(f"tracked UID or PID birth changed: {process.pid}")
+            if current is None or (current.uid, current.starttime) != (
+                process.uid,
+                process.starttime,
+            ):
+                return None
+        except (OSError, ValueError):
+            # A normal kernel exit can leave environ inaccessible while the
+            # pidfd is not ready yet. Retain this unresolved handle, never
+            # signal it without current ownership, and continue other workers.
+            return False if group_exited(process.pid) else None
         return True
 
     try:
@@ -371,15 +385,30 @@ def reap_strict(
                 raise ValueError("cleanup process ancestor chain changed")
             census_before, before_complete = _strict_census(proc_root)
             observed: list[OwnedProcess] = []
+            unresolved_observation = False
             for pid in sorted(census_before):
                 if pid in protected or pid <= 1:
                     continue
-                process = _strict_owned(proc_root, pid, owner_uid, entry, group_exited=group_exited)
+                try:
+                    process = _strict_owned(
+                        proc_root, pid, owner_uid, entry, group_exited=group_exited
+                    )
+                except (OSError, ValueError):
+                    if not handles:
+                        raise
+                    # Do not abandon independently verified handles because
+                    # one process is transiently unobservable. This pass can
+                    # never count as quiet, even for an unbound process.
+                    unresolved_observation = True
+                    continue
                 if process is not None:
                     observed.append(process)
             for process in observed:
                 if process.pid in seen and seen[process.pid] != process.starttime:
-                    raise ValueError(f"previously observed numeric PID was reused: {process.pid}")
+                    # Never retarget an existing numeric PID to another birth,
+                    # but do not abandon independently verified peers either.
+                    unresolved_observation = True
+                    continue
                 seen[process.pid] = process.starttime
                 if process.pid not in handles:
                     if clock() >= deadline:
@@ -391,11 +420,14 @@ def reap_strict(
                     handles[process.pid] = (process, fd)
                     # The pidfd and the post-open proc observation must bind the
                     # same identity. No signal is sent if the numeric PID changed.
-                    if not still_owned(process):
+                    if still_owned(process) is False:
                         retire(process.pid)
             for pid, (process, fd) in list(handles.items()):
-                if not still_owned(process):
+                ownership = still_owned(process)
+                if ownership is False:
                     retire(pid)
+                    continue
+                if ownership is None:
                     continue
                 signals = [signal.SIGTERM]
                 identity = (pid, process.starttime)
@@ -405,8 +437,11 @@ def reap_strict(
                     key = (pid, process.starttime, sig)
                     if key in sent:
                         continue
-                    if not still_owned(process):
+                    ownership = still_owned(process)
+                    if ownership is False:
                         retire(pid)
+                        break
+                    if ownership is None:
                         break
                     if clock() >= deadline:
                         raise TimeoutError("strict cleanup signal deadline reached")
@@ -425,7 +460,11 @@ def reap_strict(
             if clock() > deadline:
                 raise TimeoutError("strict cleanup final census exceeded deadline")
             stable = before_complete and after_complete and census_before == census_after
-            quiet = quiet + 1 if stable and not observed and not handles else 0
+            quiet = (
+                quiet + 1
+                if stable and not unresolved_observation and not observed and not handles
+                else 0
+            )
             if quiet == 2:
                 clean = True
                 break
