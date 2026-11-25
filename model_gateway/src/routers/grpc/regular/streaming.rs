@@ -735,11 +735,14 @@ impl StreamingProcessor {
         dispatch: context::DispatchMetadata,
         tokenizer: Arc<dyn Tokenizer>,
         stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool, bool),
-        original_request: ChatResponseSpec,
+        mut original_request: ChatResponseSpec,
         tx: &SseSender,
         pd_timing: Option<context::PdTiming>,
         reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Result<(), utils::StreamFailure> {
+        // The stream owns the rendered prompt a request asked back and lets
+        // it go with its first opening chunk; the spec is only read from here.
+        let prompt_text = original_request.prompt_text.take();
         let mut stream = ChatStream::open(
             self,
             &dispatch,
@@ -750,6 +753,7 @@ impl StreamingProcessor {
             pd_timing,
             start_time,
             dispatch_wait,
+            prompt_text,
         );
         stream.read_engine(&mut grpc_stream).await?;
         // The stream's verdict, before the engine side is released.
@@ -3587,6 +3591,12 @@ struct ChatStream<'a> {
     /// waits for nothing; after it, the engine messages ready at one poll
     /// share a frame (see [`Self::read_engine`]).
     first_token_out: bool,
+    /// The rendered prompt the request asked back (`return_prompt_text`),
+    /// until the first choice to open takes it ([`Self::open_choice`]).
+    prompt_text: Option<String>,
+    /// The prompt's chunk left as the body's first frame, so the first
+    /// token's frame is not the body's first ([`Self::read_engine`]).
+    prompt_frame_out: bool,
 }
 
 impl<'a> ChatStream<'a> {
@@ -3603,6 +3613,7 @@ impl<'a> ChatStream<'a> {
         pd_timing: Option<context::PdTiming>,
         start_time: Instant,
         dispatch_wait: context::DispatchWait,
+        prompt_text: Option<String>,
     ) -> Self {
         let model = &dispatch.model;
         let (stop, stop_token_ids, skip_special_tokens, no_stop_trim, ignore_eos) = stop_params;
@@ -3720,6 +3731,8 @@ impl<'a> ChatStream<'a> {
             chunk_frame,
             sse_buffer: BytesMut::with_capacity(4096),
             first_token_out: false,
+            prompt_text,
+            prompt_frame_out: false,
         }
     }
 
@@ -3747,17 +3760,62 @@ impl<'a> ChatStream<'a> {
     async fn open_choice(&mut self, index: u32) -> Result<(), String> {
         debug_assert!(!self.is_open(index), "open_choice after the choice opened");
         let usage = self.usage_snapshot();
-        StreamingProcessor::send_role_chunk(
-            self.tx,
-            &mut self.sse_buffer,
-            &self.chunk_frame,
-            index,
-            self.opens_tool_call,
-            usage.as_ref(),
-            self.emit_usage_null,
-        )
-        .await?;
+        if let Some(prompt_text) = self.prompt_text.take() {
+            self.send_prompt_chunk(index, usage.as_ref(), prompt_text)
+                .await?;
+        } else {
+            StreamingProcessor::send_role_chunk(
+                self.tx,
+                &mut self.sse_buffer,
+                &self.chunk_frame,
+                index,
+                self.opens_tool_call,
+                usage.as_ref(),
+                self.emit_usage_null,
+            )
+            .await?;
+        }
         self.choices[index as usize].opened = true;
+        Ok(())
+    }
+
+    /// The chunk that opens the stream's first choice when the request asked
+    /// its rendered prompt back: the role chunk with `prompt_text`, as a
+    /// frame of its own that leaves at once. Written into the stream's
+    /// buffer, which lives as long as the stream, it would grow that buffer
+    /// to the prompt's size. A function of its own: a stream that was not
+    /// asked runs none of it.
+    async fn send_prompt_chunk(
+        &mut self,
+        index: u32,
+        usage: Option<&Usage>,
+        prompt_text: String,
+    ) -> Result<(), String> {
+        debug_assert!(
+            self.sse_buffer.is_empty(),
+            "the prompt rides the stream's first chunk"
+        );
+        // Room for the prompt and the chunk around it; a prompt whose text
+        // needs escapes grows the frame.
+        let mut own = BytesMut::with_capacity(prompt_text.len() + 1024);
+        self.chunk_frame.write_chunk_with_prompt(
+            &mut own,
+            &prompt_text,
+            &opening_choice(index, self.opens_tool_call),
+            usage,
+            self.emit_usage_null,
+        );
+        drop(prompt_text);
+        self.prompt_frame_out = true;
+        self.tx
+            .send(Ok(own.freeze()))
+            .await
+            .map_err(|_| "Failed to send first chunk".to_string())?;
+        // The body driving this reading hands the prompt's frame out on this
+        // yield (see `DrivenBody`), so the channel is empty behind it: a
+        // frame that sits there at the top of the reading's loop before the
+        // first token's hand-off is a data frame ([`Self::read_engine`]).
+        tokio::task::yield_now().await;
         Ok(())
     }
 
@@ -3904,7 +3962,13 @@ impl<'a> ChatStream<'a> {
                     } else {
                         let frame_out = !self.sse_buffer.is_empty();
                         StreamingProcessor::flush_chunks(self.tx, &mut self.sse_buffer).await?;
-                        if frame_out && self.first_token_time.is_some() {
+                        // Behind the prompt's chunk a first data frame
+                        // that reached the flush bound left from inside
+                        // its turn and sits in the channel: it is handed
+                        // off as a frame that leaves here is.
+                        if self.first_token_time.is_some()
+                            && (frame_out || (self.prompt_frame_out && self.tx.capacity() == 0))
+                        {
                             self.first_token_out = true;
                             // The first token's frame reaches the
                             // connection before the engine is read
@@ -3912,6 +3976,14 @@ impl<'a> ChatStream<'a> {
                             // hands it out on this yield and writes it
                             // (see `DrivenBody`).
                             tokio::task::yield_now().await;
+                            // Behind the prompt's chunk this frame is not
+                            // the body's first, and the body yields for
+                            // its first frame alone: the reading yields
+                            // once more, so the first token's frame is
+                            // written too before the engine is read on.
+                            if self.prompt_frame_out {
+                                tokio::task::yield_now().await;
+                            }
                         }
                         next.await
                     }

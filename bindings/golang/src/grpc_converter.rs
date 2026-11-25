@@ -663,6 +663,7 @@ impl GrpcResponseConverterHandle {
             created: self.created,
             model: self.model.clone(),
             system_fingerprint: self.system_fingerprint.clone(),
+            prompt_text: None,
             choices: vec![ChatStreamChoice {
                 index,
                 delta,
