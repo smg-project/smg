@@ -111,6 +111,7 @@ use parking_lot::RwLock;
 use rand::RngExt;
 use rustc_hash::FxBuildHasher;
 use serde::{Deserialize, Serialize};
+use smg_grand_central::engine::CacheIndex;
 use smg_worker::{
     health::liveness,
     identity::{basic::Worker, endpoint::Endpoint},
@@ -1040,7 +1041,9 @@ struct OverlapCandidate {
 /// own space. An overlap lookup's `index id -> blocks` result maps to
 /// candidates through them instead of a string lookup per healthy worker
 /// per request, and the warm-up slice reads the workers inside its window
-/// from them instead of scanning the pool on every thin miss.
+/// from them instead of scanning the pool on every thin miss. They are read
+/// again inside the period once the index hands a removed worker's id to
+/// another: a kept id may then be the new worker's.
 #[derive(Debug)]
 struct Rows {
     /// Gateway clock at the build, for the refresh.
@@ -1049,6 +1052,10 @@ struct Rows {
     /// alive, and it keeps the index's allocation, so the address is never
     /// another index's while the rows live.
     index: Weak<KvIndex>,
+    /// The index's count of ids handed out a second time, read ahead of the
+    /// ids below: they are the index's while it reads the same
+    /// ([`Self::numbered`]).
+    reused: u64,
     /// The index id of the worker at each row; `None` while it is not
     /// interned.
     id_at: Vec<Option<u32>>,
@@ -1073,6 +1080,9 @@ impl Rows {
     /// once per list and refresh, not per request.
     fn read(workers: &[Arc<dyn Worker>], indexer: &Arc<KvIndex>, now_ms: u64) -> Self {
         let warmup = liveness::warmup();
+        // Ahead of the ids: one that changes hands under this pass leaves
+        // the rows a count the index has moved past.
+        let reused = indexer.numbers_reused();
         let mut id_at = Vec::with_capacity(workers.len());
         let mut row_of = HashMap::with_capacity(workers.len());
         let mut sized: Vec<Option<(usize, usize)>> = Vec::with_capacity(workers.len());
@@ -1129,6 +1139,7 @@ impl Rows {
         Self {
             built_ms: now_ms,
             index: Arc::downgrade(indexer),
+            reused,
             id_at,
             row_of,
             fleet_level,
@@ -1145,6 +1156,13 @@ impl Rows {
     /// Whether the rows are within their refresh period.
     fn fresh(&self, now_ms: u64) -> bool {
         now_ms.saturating_sub(self.built_ms) < POOL_TABLE_REFRESH_MS
+    }
+
+    /// Whether the ids the rows read are still `indexer`'s: it handed none
+    /// out a second time since. The count does not say which id it handed
+    /// on: once it moved, any id of the rows may be another worker's.
+    fn numbered(&self, indexer: &KvIndex) -> bool {
+        indexer.numbers_reused() == self.reused
     }
 }
 
@@ -1652,7 +1670,8 @@ impl CacheAwarePolicy {
             let tables = self.named_tables.load();
             if let Ok(at) = tables.binary_search_by_key(&key, |table| table.key()) {
                 let table = &tables[at];
-                if table.rows.fresh(now_ms) || self.pool_table_building.swap(true, Ordering::AcqRel)
+                if (table.rows.fresh(now_ms) && table.rows.numbered(indexer))
+                    || self.pool_table_building.swap(true, Ordering::AcqRel)
                 {
                     return Arc::clone(table);
                 }
@@ -1704,7 +1723,8 @@ impl CacheAwarePolicy {
                 .iter()
                 .find(|table| table.describes(workers, indexer))
             {
-                if table.rows.fresh(now_ms) || self.pool_table_building.swap(true, Ordering::AcqRel)
+                if (table.rows.fresh(now_ms) && table.rows.numbered(indexer))
+                    || self.pool_table_building.swap(true, Ordering::AcqRel)
                 {
                     return Arc::clone(table);
                 }
@@ -2869,7 +2889,9 @@ impl CacheAwarePolicy {
         let started = Instant::now();
         let mut overlap = indexer.find_matches(content_hashes, false);
         Metrics::record_kv_index_lookup(indexer.name(), started.elapsed().as_secs_f64());
-        if overlap.scores.is_empty() {
+        // An id handed on since the rows were read holds its new worker's
+        // blocks: such a lookup names nobody.
+        if overlap.scores.is_empty() || !table.rows().numbered(indexer) {
             return Vec::new();
         }
         let caps = indexer.cap_by_groups(content_hashes, block_size, &mut overlap);

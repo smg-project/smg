@@ -6242,6 +6242,122 @@ fn a_stale_table_is_rebuilt_by_one_decision_while_the_others_read_it() {
     assert_eq!(policy.named_tables.load().len(), 1);
 }
 
+/// Three workers over one index for the tests of an id that changes hands:
+/// worker 0 holds `prompt` under the id `first`, worker 1 is interned and
+/// holds nothing, worker 2 is not interned yet. `request` opens with the
+/// prompt.
+struct IdHandOver {
+    policy: CacheAwarePolicy,
+    workers: Vec<Arc<dyn Worker>>,
+    indexer: Arc<KvIndex>,
+    prompt: Vec<u32>,
+    request: Vec<u32>,
+    first: u32,
+}
+
+impl IdHandOver {
+    /// The case, and what worker 0's stream holds in the index.
+    fn new() -> (Self, WorkerBlocks) {
+        let workers = make_workers(&["http://w0:8000", "http://w1:8000", "http://w2:8000"]);
+        let policy = CacheAwarePolicy::with_config(test_config());
+        policy.init_workers(&workers);
+        update_expected_wait_loads(&policy, &workers, &[0, 0, 0]);
+        let indexer = Arc::new(KvIndex::chain());
+        let first = indexer.intern_worker(workers[0].url()).unwrap();
+        indexer.intern_worker(workers[1].url()).unwrap();
+        let prompt: Vec<u32> = (0..4_400u32).map(|i| 100_000 + i).collect();
+        let held = Self::store(&indexer, first, &prompt, 1_000_000);
+        let monitor = Arc::new(KvEventMonitor::new());
+        monitor
+            .indexers
+            .insert("unknown".to_string(), Arc::clone(&indexer));
+        policy.set_kv_event_monitor(Some(monitor));
+        let mut request: Vec<u32> = prompt[..240].to_vec();
+        request.extend(90_000..90_016);
+        let case = Self {
+            policy,
+            workers,
+            indexer,
+            prompt,
+            request,
+            first,
+        };
+        (case, held)
+    }
+
+    /// The prompt's blocks stored for index worker `id`.
+    fn store(indexer: &KvIndex, id: u32, prompt: &[u32], seq_base: u64) -> WorkerBlocks {
+        let blocks: Vec<StoredBlock> = prompt
+            .chunks(4)
+            .enumerate()
+            .map(|(i, chunk)| StoredBlock {
+                seq_hash: SequenceHash(seq_base + i as u64),
+                content_hash: compute_content_hash(chunk),
+            })
+            .collect();
+        let mut held = WorkerBlocks::default();
+        indexer.apply_stored(id, &blocks, None, &mut held).unwrap();
+        held
+    }
+
+    /// Worker 0's stream ends, and worker 2 is interned and stores the
+    /// prompt: the id it was handed.
+    fn hand_on(&self, held: WorkerBlocks) -> u32 {
+        self.indexer.remove_worker(self.first, held);
+        let second = self.indexer.intern_worker(self.workers[2].url()).unwrap();
+        Self::store(&self.indexer, second, &self.prompt, 2_000_000);
+        second
+    }
+}
+
+/// A decision inside the rows' period reads them again once the index
+/// handed a removed worker's id to another: the prompt the new worker holds
+/// under the id goes to that worker, not to the id's former one.
+#[test]
+fn an_id_handed_on_inside_the_rows_period_names_its_new_worker() {
+    let (case, held) = IdHandOver::new();
+    // The first decision reads the rows while worker 0 holds the prompt.
+    let before = route_tokens(&case.policy, &case.workers, &case.request);
+    let second = case.hand_on(held);
+    assert_eq!(case.first, second, "the id changed hands");
+    let inside = route_tokens(&case.policy, &case.workers, &case.request);
+    assert_eq!((before, inside), (0, 2));
+}
+
+/// A decision that reads the standing rows while another reads them again
+/// maps no lookup through them once an id was handed on: the id's former
+/// worker is not named a holder of its new worker's blocks.
+#[test]
+fn a_lookup_behind_a_handed_on_id_names_nobody_through_the_standing_rows() {
+    let (case, held) = IdHandOver::new();
+    let hashes = compute_request_content_hashes(&case.request, 4);
+    let holders = |table: &PoolTable<'_>| -> Vec<usize> {
+        CacheAwarePolicy::overlap_holders(
+            &case.workers,
+            &hashes,
+            table,
+            &case.indexer,
+            4,
+            Gather::All { cap: None },
+            &SelectWorkerInfo::default(),
+        )
+        .iter()
+        .map(|candidate| candidate.idx)
+        .collect()
+    };
+    // The rows read while worker 0 holds the id.
+    let table = case
+        .policy
+        .pool_table(&case.workers, None, &case.indexer, liveness::now_ms());
+    assert_eq!(holders(&table), [0]);
+    let second = case.hand_on(held);
+    assert_eq!(case.first, second, "the id changed hands");
+    assert!(
+        holders(&table).is_empty(),
+        "the standing rows name no holder by an id that changed hands"
+    );
+}
+
 /// `count` workers that all hold the shared block `[1, 2, 3, 4]` (a chat
 /// template's head), the one at `deep` also `[5, 6, 7, 8]`.
 fn shared_prefix_pool(
