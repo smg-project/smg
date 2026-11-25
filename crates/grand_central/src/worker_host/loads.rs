@@ -103,7 +103,7 @@ mod tests {
     use crate::{
         engine::view::{WireModes, WorkerId},
         store::{
-            GatewayId, MemoryStore, Overload, Reachability, WorkerFacts, WorkerStatus, WorkersStore,
+            GatewayId, MemoryStore, Overload, Reachability, Registrant, WorkerFacts, WorkersStore,
         },
         worker_host::Members,
     };
@@ -112,7 +112,7 @@ mod tests {
     const MODEL: &str = "m";
     const PERIOD: Duration = Duration::from_secs(2);
 
-    /// A holder that follows a store of its own.
+    /// A holder over a store of its own.
     struct Replica {
         objects: Arc<Objects<Members>>,
         store: MemoryStore,
@@ -129,12 +129,11 @@ mod tests {
         /// A ready worker of `facts`, with the object the holder lays for
         /// it.
         fn add(&self, facts: WorkerFacts) -> (WorkerId, Arc<dyn Worker>) {
-            let id = self.store.upsert(facts).id();
+            let written = self.objects.upsert(&self.store, facts, Registrant::Control);
+            let id = written.expect("the store takes the write").id();
             let stored = WorkersStore::get(&self.store, id).expect("the registered record");
-            self.store
-                .set_status(id, WorkerStatus::Ready, stored.revision);
+            self.objects.connect_row(&self.store, id, stored.revision);
             self.store.publish_now();
-            self.objects.follow(&self.store);
             let registry = self.objects.registry();
             let object = registry.get_by_url(&stored.facts.key);
             (id, object.expect("an object"))

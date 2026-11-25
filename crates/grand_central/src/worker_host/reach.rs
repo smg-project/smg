@@ -127,7 +127,7 @@ mod tests {
     use super::{ListReach, Reach};
     use crate::{
         engine::{view::WireModes, Role},
-        store::{GatewayId, MemoryStore, Reachability, WorkerFacts, WorkersStore as _},
+        store::{GatewayId, MemoryStore, Reachability, Registrant, WorkerFacts, WorkersStore as _},
         worker_host::{remainder::RowRemainder, Members, Objects},
     };
 
@@ -159,8 +159,8 @@ mod tests {
         }
     }
 
-    /// A holder that builds its objects from the rows, with the store it
-    /// follows.
+    /// A holder that builds its objects from the rows, with the store its
+    /// rows are written to.
     struct Replica {
         store: MemoryStore,
         objects: Objects<Members>,
@@ -174,8 +174,8 @@ mod tests {
             }
         }
 
-        /// Write the row at `url`, of `role` and stating `reach`, and have
-        /// the holder follow.
+        /// Write the row at `url`, of `role` and stating `reach`, through
+        /// the holder.
         fn write(&self, url: &str, role: Role, reach: Reach) {
             let facts = WorkerFacts {
                 key: url.to_owned(),
@@ -188,15 +188,15 @@ mod tests {
                 reachable_from: reach.from,
                 ..WorkerFacts::default()
             };
-            let _change = self.store.upsert(facts);
-            self.objects.follow(&self.store);
+            let written = self.objects.upsert(&self.store, facts, Registrant::Control);
+            written.expect("the store takes the write");
         }
 
-        /// Remove the row at `url` and have the holder follow.
+        /// Remove the row at `url` through the holder.
         fn remove(&self, url: &str) {
             let row = self.store.by_key(url).expect("a row");
-            assert!(self.store.remove(row.id, row.revision).is_some());
-            self.objects.follow(&self.store);
+            let removed = self.objects.remove(&self.store, row.id, row.revision);
+            assert!(removed.is_some());
         }
 
         /// A worker another writer registers: the holder lays no row for
