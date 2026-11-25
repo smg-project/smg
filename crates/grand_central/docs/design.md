@@ -2735,7 +2735,7 @@ tells the data once more:
 
 | Copy | Where | Read by |
 |---|---|---|
-| the worker record | the store's table of records (`store/memory.rs`) | the code that keeps the objects, among its reads: the one record behind a write the store refuses, every record where a cut is laid whole, a record's status where a leader's log tells it, a host's own follow, and a first copy, for the status the log told of each record; and the store itself, for its published copy and the membership log's event |
+| the worker record | the store's table of records (`store/memory.rs`) | the code that keeps the objects, among its reads: the one record behind a write the store refuses, every record where a cut is laid whole, a record's status where a leader's log tells it, and a first copy, for the status the log told of each record; and the store itself, for its published copy and the membership log's event |
 | a copy of the record's facts | beside the worker objects (`worker_host/objects.rs`) | the code that keeps the objects, to tell a record that changed under its object |
 | the worker object | the worker-crate registry | the health checker, the follower of cache events, a decision, and a watcher's, a standby's and an operator's first copy |
 | the remainder: 17 of the 24 facts and one bit of an eighteenth, with the record's id and revision | beside each worker object (`worker_host/remainder.rs`) | a decision, for the record's id, whether the worker takes images, its wire modes and from where it is reached. A pair's classes read the worker's engine kind and its pairing descriptor too, and for a record that states no descriptor the pairing facts its worker object derives of its labels. What the worker states for a request's hard demands is lent with the list, and no frame states a demand yet. The follower of cache events asks here whether a worker's events are indexed: its signals stand here and its models on the object (`worker_host/kv_feed.rs:191`, through `Objects::row_of`) |
@@ -2845,15 +2845,15 @@ A fact leaves the remainder when the worker object gets a field that holds it as
    and an object, and the task that follows the table are deleted. The task is deleted
    **[built]**: the calls a record is written by are public, a host of the worker objects
    writes through them, and a served controller hands the code that keeps its objects. A
-   record written through the store's own entries gets its object in three places: where the
-   store refuses the next write under its key, where a cut is laid whole, and where its host
-   reads the store's log. No task lays it. No turn that takes the controller's own store starts with
+   record written through the store's own entries gets its object in two places: at its
+   key's next refused write, and where a cut is laid whole.
+   No task lays it. No turn that takes the controller's own store starts with
    a read of its table **[built]**: a write call decides over the object that stands, a call's read
    and a first copy read the objects, and a standby's applier lays its leader's event. A
    turn of the keeper's own reads no log of the store's changes **[built]**: a refused write
    reads its own record, a cut laid whole reads the store's records once, then the status the
-   table holds for each, and the call that lays a kept credential again reads the objects. A
-   host's follow still reads the store's log.
+   table holds for each, and the call that lays a kept credential again reads the objects. No
+   host follows the store **[built]**.
 
 **One rule for a registration's write [built].** What a registration makes of the record under
 its address is one function beside the other membership rules (`WorkerFacts::laid_over`,
@@ -2893,9 +2893,9 @@ them, and they end with step 4.
 A copy reads the log's place and the store's epoch in one
 hold, and no record of the table. So a copy holds
 each record the log told at the copy's place, and none it did not, beside every writer that holds the turn. A
-record the store took and the registry did not get is in no copy until it is laid (step 1):
-one written through the store's own entries, once its host has had that code follow the
-store. A copy's statuses are the
+record the store took and the registry did not get is in no copy until it is laid (step 1).
+One written through the store's own entries is laid at its key's next refused write, or
+where a cut is laid whole. A copy's statuses are the
 ones the log last told at its place, and not the objects': an object can stand one tell
 ahead of the log. The store keeps what the log last told of each record's status, beside its
 epoch and its tail. A copy reads the log's place, the epoch and those statuses in one hold

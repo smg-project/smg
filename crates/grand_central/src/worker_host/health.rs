@@ -137,7 +137,7 @@ mod tests {
             membership::life, HealthPolicy, Registrant, WorkerFacts, WorkerPatch,
             WorkerStatus as RowStatus, WorkersStore,
         },
-        worker_host::{object, Members, SoleLead},
+        worker_host::{object, objects::lay_standing, Members, SoleLead},
     };
 
     const URL: &str = "http://a:8000";
@@ -454,7 +454,7 @@ mod tests {
         assert_eq!(adapter.connected(&replica.id, replica.revision), None);
         replica.assert_statuses(Some(RowStatus::Pending), ObjectStatus::Pending);
 
-        replica.objects.follow(replica.store.as_ref());
+        lay_standing(&replica.objects, &replica.store);
         let object = replica
             .objects
             .registry()
@@ -519,7 +519,7 @@ mod tests {
             .id();
         assert_ne!(next, earlier.id, "another life takes another id");
 
-        // The holder has not followed: its object is the earlier life's.
+        // The holder read neither write: its object is the earlier life's.
         assert_eq!(
             adapter.probe_outcome(&replica.id, true, replica.revision, ObjectStatus::Pending),
             ProbeAnswer::Stale

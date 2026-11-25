@@ -5,11 +5,7 @@
 //! - `policy_store_journal/status_write/<plain|journaled|told>/<n>`: one
 //!   status flip of a member, which publishes nothing; `told` is the journaled
 //!   write on a log with a listener of the watched kinds, as a controller
-//!   with a watch open has: the write's telling is in the cell. Under the
-//!   `worker-host` feature `followed` is that write with the worker
-//!   objects following the store: the listener wakes their follower, which
-//!   reads the store's tail on a thread of its own and waits again. The
-//!   wake is in the cell. For a run pinned to two cores; no gate reads it;
+//!   with a watch open has: the write's telling is in the cell;
 //! - `policy_store_journal/member_write/<plain|journaled>/<n>`: one refresh
 //!   of a member's facts, the pool derived again;
 //! - `policy_store_journal/read/<events>`: one reader's copy of a batch of
@@ -36,17 +32,11 @@ use std::{hint::black_box, sync::Arc};
 use criterion::{
     criterion_group, criterion_main, measurement::WallTime, BenchmarkGroup, BenchmarkId, Criterion,
 };
-#[cfg(feature = "worker-host")]
-use smg_grand_central::worker_host::{Members, Objects};
 use smg_grand_central::{
     engine::{Role, WorkerId},
     service::replication::Log,
     store::{LeasesStore, MemoryStore, Position, WorkerFacts, WorkerStatus, WorkersStore},
 };
-#[cfg(feature = "worker-host")]
-use smg_worker::registry::WorkerRegistry;
-#[cfg(feature = "worker-host")]
-use tokio::{runtime::Builder, sync::Notify, task::JoinSet};
 
 const SIZES: [usize; 3] = [8, 64, 512];
 const MODEL: &str = "m";
@@ -124,8 +114,6 @@ fn status_write(c: &mut Criterion) {
             flips(&mut group, kind, n, &build(n));
         }
     }
-    #[cfg(feature = "worker-host")]
-    followed(&mut group);
     group.finish();
 }
 
@@ -147,41 +135,6 @@ fn flips(group: &mut BenchmarkGroup<'_, WallTime>, kind: &str, n: usize, pool: &
             black_box(pool.store.set_status(id, status, revision));
         });
     });
-}
-
-/// The `told` write with the worker objects following the store, as a
-/// controller that hosts them has: the log's listener wakes their follower
-/// on a runtime thread of its own, and each wake reads the store's tail to
-/// its end. A status change builds nothing there, so the cell holds the
-/// wake and what the follower's read takes of the store's lock.
-#[cfg(feature = "worker-host")]
-fn followed(group: &mut BenchmarkGroup<'_, WallTime>) {
-    let runtime = Builder::new_multi_thread()
-        .worker_threads(1)
-        .build()
-        .expect("a runtime");
-    for n in SIZES {
-        let moved = Arc::new(Notify::new());
-        let told = Arc::clone(&moved);
-        let log = Log::new(WATCHED).on_watched(move || told.notify_one());
-        let pool = Arc::new(pool_on(n, Some(log)));
-        let objects = Objects::new(Arc::new(WorkerRegistry::<Members>::new()));
-        // Ended with the set, at the end of this size.
-        let mut follower = JoinSet::new();
-        follower.spawn_on(
-            {
-                let pool = Arc::clone(&pool);
-                async move {
-                    loop {
-                        objects.follow(&pool.store);
-                        moved.notified().await;
-                    }
-                }
-            },
-            runtime.handle(),
-        );
-        flips(group, "followed", n, &pool);
-    }
 }
 
 fn member_write(c: &mut Criterion) {

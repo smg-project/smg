@@ -1028,6 +1028,7 @@ mod tests {
         },
         stages::registry,
         store::{WorkerFacts, WorkerStatus, WorkersStore},
+        worker_host::lay_standing,
     };
 
     type Replica = (Arc<MemoryStore>, Arc<Log>);
@@ -1276,7 +1277,7 @@ mod tests {
         leader.upsert(side("http://da:8000", Role::Decode, "green"));
         follow(&follower, &led, Instant::now());
         let leading = WorkerObjects::new(Arc::clone(&leader)).holder();
-        leading.follow(&*leader);
+        lay_standing(&leading, &leader);
         for mode in [Pairing::Lenient, Pairing::Strict] {
             let behind = pair_classes(&follower.objects, mode);
             assert_eq!(behind, pair_classes(&leading, mode), "{mode:?}");
@@ -1315,9 +1316,9 @@ mod tests {
             panic!("a free lease is taken at the first tick");
         };
         // The cases write the leader's rows through its store's own
-        // entries: the holder its cut is taken from follows the store.
+        // entries: the holder its cut is taken from lays what stands.
         let cut_from = holder(store);
-        cut_from.follow(&**store);
+        lay_standing(&cut_from, store);
         let cut = Replication::new(
             Arc::clone(store),
             Arc::clone(log),

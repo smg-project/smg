@@ -33,7 +33,7 @@ mod tests {
         },
         store::{MemoryStore, Registrant, Signals, WorkerFacts, WorkerStatus, WorkersStore},
         worker_host::{
-            KvFeed, KvTables, Members, MembershipWriter as _, Objects, Precondition, StoreDoor,
+            HolderDoor, KvFeed, KvTables, Members, MembershipWriter as _, Objects, Precondition,
         },
     };
 
@@ -232,13 +232,12 @@ mod tests {
         f.store
             .apply(AppliedSpec::validate(&spec).expect("the preset validates"))
             .expect("the first generation");
-        let door = StoreDoor::new(Arc::clone(&f.store));
+        let door = HolderDoor::new(Arc::clone(&f.store), Arc::clone(&f.objects));
         f.check(async {
             door.found(&Registrant::Control, Precondition::Absent, FIRST, &|_| {
                 facts(FIRST, WireModes::GRPC, false)
             })
             .expect("registered");
-            f.objects.follow(&*f.store);
             f.new_slot(FIRST, None).await;
         })
         .await
