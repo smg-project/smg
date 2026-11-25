@@ -57,7 +57,7 @@ use crate::{
         grpc::{
             backend_client::{BackendConnector, Fronting},
             multimodal::MultimodalConfigRegistry,
-            regular::symphony::{check_names, named_table},
+            regular::symphony::{check_names, named_table, names_template},
             utils::{Names, ALIASES},
         },
     },
@@ -577,17 +577,19 @@ impl AppContextBuilder {
             );
             return Err(AppContextBuildError::InvalidConfig(why.into()));
         }
+        // `hf` names no table either, but selects the response template's, so it is not warned
+        // of here.
         if router_config.parser == ParserChoice::Symphony
             && names.tool.is_some()
             && named_table(&names).is_none()
+            && !names_template(&names)
         {
             tracing::warn!(
                 tool_call_parser = ?names.tool,
                 reasoning_parser = ?names.reasoning,
                 "The configured tool-call parser name selects no Symphony table, so under \
-                 --parser symphony every model the registry does not know is read by the legacy \
-                 parsers (the registry's table reads the models it knows, a worker's own labels \
-                 aside); a table's name, a legacy name that reads a table's format (qwen, \
+                 --parser symphony every model, the registry's included, is read by the legacy \
+                 parsers (a worker's own labels aside); a table's name, a legacy name that reads a table's format (qwen, \
                  qwen_xml, ...), a launcher's name for a family whose table has no older \
                  parser (muse), or an engine's exact name for a table (llama4_pythonic), reads \
                  those models with that table"
