@@ -2242,7 +2242,11 @@ impl<G: Generation> WorkerRegistry<G> {
         // lock in between took the URL's mapping and the lock's entry with
         // its worker, and a worker entered then would be one no read by URL
         // finds, under a lock no later call takes: where either is gone it
-        // is laid again for this id. One another call laid meanwhile stays.
+        // is laid again for this id. One another call laid meanwhile stays,
+        // and both windows stand as before: a lock laid for this id is not
+        // the one held here, so later calls on the id take another lock
+        // than this registration; a mapping of the URL to another id leaves
+        // this worker entered beside it.
         if !self.worker_mutation_locks.contains_key(&worker_id) {
             self.worker_mutation_locks
                 .entry(worker_id.clone())
