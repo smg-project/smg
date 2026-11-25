@@ -98,18 +98,16 @@ mod tests {
         }
 
         fn lay(&self, facts: WorkerFacts) -> RowId {
-            let row = self.store.upsert(facts).id();
-            self.objects.follow(&*self.store);
-            row
+            let written = self.objects.upsert(&self.store, facts, Registrant::Control);
+            written.expect("the store takes the write").id()
         }
 
         fn remove(&self, row: RowId) -> bool {
             let Some(standing) = self.store.get(row) else {
                 return false;
             };
-            let removed = self.store.remove(row, standing.revision).is_some();
-            self.objects.follow(&*self.store);
-            removed
+            let (store, objects) = (&self.store, &self.objects);
+            objects.remove(store, row, standing.revision).is_some()
         }
 
         /// The feed gets its first turn before the case writes any more rows.

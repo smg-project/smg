@@ -1432,7 +1432,7 @@ mod tests {
             assert!(begun.elapsed() < wait, "no first take");
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
-        bed::fleet(&store);
+        bed::fleet(&store, &shared.objects);
         let applied = store.apply(bed::preset("random", 1));
         applied.expect("above the unbound start");
         store.spend_ids(u32::MAX - TERM_MARK + 4);
@@ -1646,7 +1646,7 @@ mod tests {
             );
             standby = Some((fence, running));
         }
-        bed::fleet(&store);
+        bed::fleet(&store, &shared.objects);
         let applied = store.apply(bed::preset("random", 1));
         applied.expect("above the unbound start");
         store.spend_ids(u32::MAX - TERM_MARK + 4);
@@ -2718,7 +2718,7 @@ mod tests {
     #[tokio::test]
     async fn explain_echoes_the_key_and_decision_and_names_only_the_standing_generation() {
         let (_elector, _standing, control) = electing(true);
-        let _ = bed::fleet(&control.shared.store);
+        let _ = bed::fleet(&control.shared.store, &control.shared.objects);
         explain_spec(&control, "z-first", 1);
 
         for (model, id) in [(bed::MODEL, 1), ("empty", 2)] {
@@ -2799,7 +2799,7 @@ mod tests {
     #[tokio::test]
     async fn explain_names_only_the_plan_for_a_shed_ahead_of_the_first_profile() {
         let (_elector, _standing, control) = electing(true);
-        let _ = bed::fleet(&control.shared.store);
+        let _ = bed::fleet(&control.shared.store, &control.shared.objects);
         explain_spec(&control, "a-first", 1);
 
         let mut frame = bed::frame(1, 1);

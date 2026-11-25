@@ -1544,7 +1544,7 @@ mod tests {
     /// what happened to the objects.
     struct Replica {
         store: Arc<MemoryStore>,
-        objects: Objects<Members>,
+        objects: Arc<Objects<Members>>,
         credentials: Arc<Credentials>,
         events: Receiver<WorkerEvent>,
     }
@@ -1554,9 +1554,10 @@ mod tests {
             let registry = Arc::new(WorkerRegistry::new());
             let events = registry.subscribe_events();
             let credentials = Arc::new(Credentials::new());
+            let objects = Objects::new(registry).with_credentials(Arc::clone(&credentials));
             Self {
                 store: Arc::new(MemoryStore::new()),
-                objects: Objects::new(registry).with_credentials(Arc::clone(&credentials)),
+                objects: Arc::new(objects),
                 credentials,
                 events,
             }
@@ -1624,13 +1625,30 @@ mod tests {
             self.store.by_key(url).expect("a row")
         }
 
+        /// A patch through the holder.
         fn patch(&self, url: &str, patch: WorkerPatch) {
+            let (store, row) = (self.store.as_ref(), self.row(url));
+            let change = self.objects.patch(store, row.id, patch, row.revision);
+            assert_eq!(change, Some(MembershipChange::Relabelled { id: row.id }));
+        }
+
+        /// A removal through the holder.
+        fn remove(&self, url: &str) {
+            let (store, row) = (self.store.as_ref(), self.row(url));
+            let removed = self.objects.remove(store, row.id, row.revision);
+            assert!(removed.is_some());
+        }
+
+        /// Another writer's patch: the store's own entry, around the holder.
+        fn patch_around(&self, url: &str, patch: WorkerPatch) {
             let row = self.row(url);
             let change = self.store.patch(row.id, patch, row.revision);
             assert_eq!(change, Some(MembershipChange::Relabelled { id: row.id }));
         }
 
-        fn remove(&self, url: &str) {
+        /// Another writer's removal: the store's own entry, around the
+        /// holder.
+        fn remove_around(&self, url: &str) {
             let row = self.row(url);
             assert!(self.store.remove(row.id, row.revision).is_some());
         }
@@ -1730,7 +1748,6 @@ mod tests {
             id
         };
         let (seven, nine) = (ready(A, 7), ready(B, 9));
-        replica.follow();
 
         let registry = replica.objects.registry();
         let generation = registry
@@ -1781,7 +1798,7 @@ mod tests {
 
     /// A registration that changes the runtime a stored worker states is
     /// read by the decisions behind it. The door starts another life for
-    /// the worker, and one follow later the holder lends the new life's
+    /// the worker, and the holder lends the new life's
     /// statement under its id: a retry that demands the new runtime lands
     /// on the new life, and one that demands the old runtime is shed under
     /// the stage `wires`, as no worker states it any more.
@@ -1792,13 +1809,13 @@ mod tests {
             document::spec::{AppliedSpec, PolicySpec},
             engine::{Decision, DemandFacts, InProcess, Role, ShedReason},
             worker_host::{
-                membership_writer::tests::StoreDoor, MembershipWriteOutcome, MembershipWriter,
+                membership_writer::tests::HolderDoor, MembershipWriteOutcome, MembershipWriter,
                 Precondition,
             },
         };
 
         let replica = Replica::new();
-        let door = StoreDoor::new(Arc::clone(&replica.store));
+        let door = HolderDoor::new(Arc::clone(&replica.store), Arc::clone(&replica.objects));
         // The registration of the worker at `A` as one that states `runtime`.
         let registers = |runtime: u32| {
             let stating = |_: Option<&WorkerFacts>| WorkerFacts {
@@ -1847,25 +1864,22 @@ mod tests {
         let Ok(MembershipWriteOutcome::Registered(first)) = wrote else {
             panic!("the first registration is a join: {wrote:?}");
         };
-        // Its checks are on: a check's word makes the first life ready.
+        // Its checks are on: its connect signal makes the first life ready.
         let row = replica.store.get(first).expect("the registered row");
-        let ready = replica
-            .store
-            .set_status(first, WorkerStatus::Ready, row.revision);
-        ready.expect("ready");
-        replica.follow();
+        replica
+            .objects
+            .connect_row(&replica.store, first, row.revision);
         assert_eq!(lends(&replica).1, [(Some(first), 7)]);
         assert_eq!(retry(&replica, 7), Ok(Some(first)));
         assert_eq!(retry(&replica, 9), unstated);
 
         // The same worker registers again and states another runtime: the
-        // store hands the first life's status on to the next.
+        // rule hands the first life's status on to the next.
         let wrote = registers(9);
         let Ok(MembershipWriteOutcome::Another { old, new }) = wrote else {
             panic!("a changed runtime is another life: {wrote:?}");
         };
         assert_eq!(old, first);
-        replica.follow();
         assert_eq!(lends(&replica).1, [(Some(new), 9)], "under the new id");
         assert_eq!(retry(&replica, 9), Ok(Some(new)));
         assert_eq!(retry(&replica, 7), unstated);
@@ -1891,9 +1905,8 @@ mod tests {
                     role,
                     ..facts(url, 1)
                 };
-                replica.store.upsert(side);
+                replica.write(side);
             }
-            replica.follow();
             let mut row = replica.row(A);
             let between_blanks = PairingDescriptor {
                 transport: Some(" a ".to_string()),
@@ -1948,16 +1961,14 @@ mod tests {
         };
         let mut outside = Replica::new();
         let registry = Arc::clone(outside.objects.registry());
-        outside.objects = Objects::new(registry).with_host_local_unchecked();
+        outside.objects = Arc::new(Objects::new(registry).with_host_local_unchecked());
         for (replica, asked) in [(Replica::new(), false), (outside, true)] {
-            replica.store.upsert(local.clone());
-            replica.store.upsert(facts(B, 1));
-            replica.follow();
+            replica.write(local.clone());
+            replica.write(facts(B, 1));
             assert_eq!(checked(&replica, A), !asked, "the host-local row");
             assert!(checked(&replica, B), "a row any gateway dials");
 
-            replica.store.upsert(facts(A, 1));
-            replica.follow();
+            replica.write(facts(A, 1));
             assert!(checked(&replica, A), "the row once any gateway dials it");
         }
     }
@@ -1977,17 +1988,16 @@ mod tests {
         let stated = |replica: &Replica, url| replica.at(url).metadata().overload;
         let mut judging = Replica::new();
         let registry = Arc::clone(judging.objects.registry());
-        judging.objects = Objects::new(registry).with_overload_thresholds(defaults);
+        judging.objects = Arc::new(Objects::new(registry).with_overload_thresholds(defaults));
         for (replica, asked) in [(Replica::new(), false), (judging, true)] {
-            replica.store.upsert(facts(A, 1));
-            replica.store.upsert(WorkerFacts {
+            replica.write(facts(A, 1));
+            replica.write(WorkerFacts {
                 overload: Overload {
                     kv_usage_permille: Some(650),
                     waiting_requests: None,
                 },
                 ..facts(B, 1)
             });
-            replica.follow();
             let own = OverloadThresholds {
                 waiting_requests: Some(8),
                 token_usage: Some(0.65),
@@ -2007,7 +2017,6 @@ mod tests {
                     ..WorkerPatch::default()
                 },
             );
-            replica.follow();
             let own = OverloadThresholds {
                 waiting_requests: Some(3),
                 token_usage: Some(0.8),
@@ -2047,22 +2056,21 @@ mod tests {
         };
         let mut replica = Replica::new();
         let registry = Arc::clone(replica.objects.registry());
-        replica.objects = Objects::new(registry).with_overload_thresholds(defaults);
+        replica.objects = Arc::new(Objects::new(registry).with_overload_thresholds(defaults));
         // A names none, B a usage alone, C both, and D is external.
-        replica.store.upsert(facts(A, 1));
-        replica.store.upsert(WorkerFacts {
+        replica.write(facts(A, 1));
+        replica.write(WorkerFacts {
             overload: own(Some(650), None),
             ..facts(B, 1)
         });
-        replica.store.upsert(WorkerFacts {
+        replica.write(WorkerFacts {
             overload: own(Some(650), Some(3)),
             ..facts(C, 1)
         });
-        replica.store.upsert(WorkerFacts {
+        replica.write(WorkerFacts {
             engine_kind: "external".to_string(),
             ..facts(D, 1)
         });
-        replica.follow();
         let urls = [A, B, C, D];
         let stated = |replica: &Replica, url| replica.at(url).metadata().overload;
         // Every standing object runs: a request in flight, ready, vetoed.
@@ -2108,12 +2116,10 @@ mod tests {
 
         // The same word again lays nothing, behind a follow too.
         assert_eq!(switch(&replica, false), 0);
-        replica.follow();
         assert_eq!(switch(&replica, false), 0);
         assert!(replica.told().is_empty());
         // A row that comes under the word is built by it, once.
-        replica.store.upsert(facts(E, 1));
-        replica.follow();
+        replica.write(facts(E, 1));
         assert_eq!(replica.told(), [("registered", replica.id(E))]);
         assert_eq!(stated(&replica, E), set(None, None));
 
@@ -2144,7 +2150,7 @@ mod tests {
         let none = OverloadThresholds::default();
         let mut judging = Replica::new();
         let registry = Arc::clone(judging.objects.registry());
-        judging.objects = Objects::new(registry).with_overload_thresholds(defaults);
+        judging.objects = Arc::new(Objects::new(registry).with_overload_thresholds(defaults));
         for (mut replica, asked) in [(Replica::new(), false), (judging, true)] {
             replica.store.upsert(facts(A, 1));
             replica.store.upsert(facts(B, 1));
@@ -2182,7 +2188,7 @@ mod tests {
         let none = OverloadThresholds::default();
         let mut replica = Replica::new();
         let registry = Arc::clone(replica.objects.registry());
-        replica.objects = Objects::new(registry).with_overload_thresholds(defaults);
+        replica.objects = Arc::new(Objects::new(registry).with_overload_thresholds(defaults));
         let first = replica.store.upsert(facts(A, 1)).id();
         replica.follow();
         let (old_id, before) = (replica.id(A), replica.at(A));
@@ -2191,7 +2197,7 @@ mod tests {
         replica.told();
 
         // The second life stands in the store alone.
-        replica.remove(A);
+        replica.remove_around(A);
         assert_eq!(replica.store.upsert(labelled(A, 1, "gold")).id(), first);
         assert_eq!(switch(&replica, false), 1);
         let replaced = replica
@@ -2242,9 +2248,9 @@ mod tests {
         };
         let mut replica = Replica::new();
         let registry = Arc::clone(replica.objects.registry());
-        replica.objects = Objects::new(Arc::clone(&registry)).with_overload_thresholds(defaults);
-        replica.store.upsert(facts(A, 1));
-        replica.follow();
+        replica.objects =
+            Arc::new(Objects::new(Arc::clone(&registry)).with_overload_thresholds(defaults));
+        replica.write(facts(A, 1));
         let stopped = AtomicBool::new(false);
         thread::scope(|scope| {
             let _stop = Stop(&stopped);
@@ -2284,9 +2290,8 @@ mod tests {
         for leads in [true, false] {
             let mut replica = Replica::new();
             let registry = Arc::clone(replica.objects.registry());
-            replica.objects = Objects::new(registry).with_overload_thresholds(defaults);
-            let row = replica.store.upsert(facts(A, 1)).id();
-            replica.follow();
+            replica.objects = Arc::new(Objects::new(registry).with_overload_thresholds(defaults));
+            let row = replica.write(facts(A, 1));
             let before = replica.store.get(row).expect("the row");
             assert_eq!(before.status, WorkerStatus::Pending);
             // The driver's move, with no word to the table.
@@ -2321,9 +2326,8 @@ mod tests {
         };
         let mut replica = Replica::new();
         let registry = Arc::clone(replica.objects.registry());
-        replica.objects = Objects::new(registry).with_overload_thresholds(defaults);
-        replica.store.upsert(facts(A, 1));
-        replica.follow();
+        replica.objects = Arc::new(Objects::new(registry).with_overload_thresholds(defaults));
+        replica.write(facts(A, 1));
         let (objects, store) = (&replica.objects, replica.store.as_ref());
         let turns = RefCell::new(Vec::new());
         let leads = || {
@@ -2348,9 +2352,8 @@ mod tests {
         };
         let mut replica = Replica::new();
         let registry = Arc::clone(replica.objects.registry());
-        replica.objects = Objects::new(registry).with_overload_thresholds(defaults);
-        replica.store.upsert(facts(A, 1));
-        replica.follow();
+        replica.objects = Arc::new(Objects::new(registry).with_overload_thresholds(defaults));
+        replica.write(facts(A, 1));
         let (objects, store) = (&replica.objects, replica.store.as_ref());
         let (stated, state) = mpsc::channel();
         let turn = objects.read_to.lock();
@@ -2395,16 +2398,15 @@ mod tests {
         ] {
             let mut replica = Replica::new();
             let registry = Arc::clone(replica.objects.registry());
-            replica.objects = Objects::new(registry).with_overload_thresholds(defaults);
-            replica.store.upsert(WorkerFacts {
+            replica.objects = Arc::new(Objects::new(registry).with_overload_thresholds(defaults));
+            replica.write(WorkerFacts {
                 overload: takes,
                 ..facts(A, 1)
             });
-            replica.store.upsert(WorkerFacts {
+            replica.write(WorkerFacts {
                 overload: names,
                 ..facts(B, 1)
             });
-            replica.follow();
             let (took, named) = (replica.at(A), replica.at(B));
             let stated = named.metadata().overload;
             for on in [false, true] {
@@ -2433,30 +2435,29 @@ mod tests {
         };
         let mut replica = Replica::new();
         let registry = Arc::clone(replica.objects.registry());
-        replica.objects = Objects::new(registry).with_overload_thresholds(defaults);
+        replica.objects = Arc::new(Objects::new(registry).with_overload_thresholds(defaults));
         let of_kind = |url, kind: &str| WorkerFacts {
             engine_kind: kind.to_string(),
             ..facts(url, 1)
         };
-        replica.store.upsert(of_kind(A, "external"));
-        replica.store.upsert(WorkerFacts {
+        replica.write(of_kind(A, "external"));
+        replica.write(WorkerFacts {
             overload: Overload {
                 kv_usage_permille: None,
                 waiting_requests: Some(3),
             },
             ..of_kind(B, "external")
         });
-        replica.store.upsert(facts(C, 1));
-        replica.store.upsert(WorkerFacts {
+        replica.write(facts(C, 1));
+        replica.write(WorkerFacts {
             overload: Overload {
                 kv_usage_permille: Some(500),
                 waiting_requests: None,
             },
             ..of_kind(D, "external")
         });
-        replica.store.upsert(of_kind(E, "vllm"));
-        replica.store.upsert(of_kind(F, "EXTERNAL"));
-        replica.follow();
+        replica.write(of_kind(E, "vllm"));
+        replica.write(of_kind(F, "EXTERNAL"));
 
         let stated = |url| replica.at(url).metadata().overload;
         let queue = OverloadThresholds {
@@ -2508,7 +2509,6 @@ mod tests {
     fn a_row_laid_behind_a_kept_credential_builds_an_object_that_holds_it() {
         let replica = Replica::new();
         replica.register(facts(A, 1), Some(KEY_A));
-        replica.follow();
         assert!(replica.holds_credential(A, Some(KEY_A)));
 
         // A row that names no engine dials its key: the keeper works the
@@ -2519,8 +2519,7 @@ mod tests {
         };
         replica.register(keyed, Some(KEY_B));
         // A row no registration here stated takes none.
-        replica.store.upsert(facts(C, 1));
-        replica.follow();
+        replica.write(facts(C, 1));
         assert!(replica.holds_credential(A, Some(KEY_A)));
         assert!(replica.holds_credential(B, Some(KEY_B)));
         assert!(replica.holds_credential(C, None));
@@ -2531,8 +2530,7 @@ mod tests {
         let registry = Arc::new(WorkerRegistry::<Members>::new());
         let objects = Objects::new(Arc::clone(&registry));
         let store = MemoryStore::new();
-        store.upsert(facts(A, 1));
-        objects.follow(&store);
+        objects.upsert(&store, facts(A, 1), Registrant::Control);
         let laid = registry.get_by_url(A).expect("the row's object");
         assert!(laid.api_key().is_none());
         assert_eq!(objects.lay_again(&store, &facts(A, 1)), 0);
@@ -2589,36 +2587,34 @@ mod tests {
         let objects = Objects::new(Arc::new(WorkerRegistry::<Members>::new()))
             .with_kv_tables(Arc::clone(&tables));
         let store = MemoryStore::new();
-        let a = store.upsert(asking(A, 1)).id();
-        let b = store.upsert(asking(B, 1)).id();
-        let quiet = store.upsert(facts(C, 1)).id();
-        objects.follow(&store);
+        let write = |facts: WorkerFacts| {
+            let change = objects.upsert(&store, facts, Registrant::Control);
+            change.expect("the store takes the write").id()
+        };
+        let (a, b, quiet) = (write(asking(A, 1)), write(asking(B, 1)), write(facts(C, 1)));
         assert_eq!(lanes(&tables, &[a, b, quiet]), [true, true, false]);
         // A row stated again in place: one that stops asking gives its lane
         // up, one that asks takes one. No object is laid anew for either.
-        store.upsert(facts(A, 1));
-        store.upsert(asking(C, 1));
-        objects.follow(&store);
+        write(facts(A, 1));
+        write(asking(C, 1));
         assert_eq!(lanes(&tables, &[a, b, quiet]), [false, true, true]);
         // A replaced row's lane leaves with it, blocks and all, and its
         // next life under the same URL starts with an empty lane, unheard.
         assert_eq!(stored_chain(&tables, b, 1, &[1]), BatchOutcome::Applied);
         assert_eq!(tables.indexed_blocks(b, 0), 1);
-        let again = store.upsert(asking(B, 2)).id();
-        objects.follow(&store);
+        let again = write(asking(B, 2));
         assert_eq!(lanes(&tables, &[b, again]), [false, true]);
         assert_eq!(tables.indexed_blocks(again, 0), 0);
         assert_eq!(tables.cursor(again, 0), None, "unheard");
         // A removed row's lane leaves with it.
         let left = store.by_key(C).expect("the row");
-        assert!(store.remove(left.id, left.revision).is_some());
-        objects.follow(&store);
+        let removed = objects.remove(&store, left.id, left.revision);
+        assert!(removed.is_some());
         assert_eq!(lanes(&tables, &[quiet, again]), [false, true]);
         // A row that stays keeps what was heard for it through a later
-        // follow that changes nothing of it.
+        // write that changes nothing of it.
         assert_eq!(stored_chain(&tables, again, 1, &[1]), BatchOutcome::Applied);
-        store.upsert(asking(D, 1));
-        objects.follow(&store);
+        write(asking(D, 1));
         assert_eq!(tables.indexed_blocks(again, 0), 1);
     }
 
@@ -2626,8 +2622,7 @@ mod tests {
     fn a_holder_handed_no_tables_makes_no_lane() {
         let objects = Objects::new(Arc::new(WorkerRegistry::<Members>::new()));
         let store = MemoryStore::new();
-        store.upsert(asking(A, 1));
-        objects.follow(&store);
+        objects.upsert(&store, asking(A, 1), Registrant::Control);
         assert!(objects.kv_tables().is_none());
         assert!(
             objects.registry().get_by_url(A).is_some(),
@@ -2640,7 +2635,6 @@ mod tests {
         let replica = Replica::new();
         replica.register(rank_facts(A, C, 0), Some(KEY_C));
         replica.register(rank_facts(B, C, 1), Some(KEY_C));
-        replica.follow();
         assert!(replica.holds_credential(A, Some(KEY_C)));
         assert!(replica.holds_credential(B, Some(KEY_C)));
     }
@@ -2650,8 +2644,7 @@ mod tests {
         let replica = Replica::new();
         replica.register(rank_facts(A, C, 0), Some(KEY_C));
         // The engine's other rank came through another host: no keep here.
-        let other = replica.store.upsert(rank_facts(B, C, 1)).id();
-        replica.follow();
+        let other = replica.write(rank_facts(B, C, 1));
         assert!(replica.holds_credential(A, Some(KEY_C)));
         assert!(replica.holds_credential(B, None));
 
@@ -2668,7 +2661,6 @@ mod tests {
         let mut replica = Replica::new();
         let registered = facts(A, 1);
         replica.register(registered.clone(), Some(KEY_A));
-        replica.follow();
         assert!(replica.holds_credential(A, Some(KEY_A)));
         let id = replica.id(A);
         replica.told();
@@ -2676,8 +2668,7 @@ mod tests {
         // The row is written again behind another credential, and the
         // follow builds its object while the registration is in flight.
         let refreshed = replica.kept(&registered, Some(KEY_B));
-        let row = replica.store.upsert(registered.clone()).id();
-        replica.follow();
+        let row = replica.write(registered.clone());
         assert_eq!(replica.told(), [("replaced", id)]);
         assert!(replica.holds_credential(A, Some(KEY_B)));
 
@@ -2693,7 +2684,7 @@ mod tests {
         replica.follow();
 
         // The removal is another writer's: this host calls nothing.
-        replica.remove(A);
+        replica.remove_around(A);
         replica.follow();
         assert!(replica.credentials.is_empty());
 
@@ -2711,7 +2702,7 @@ mod tests {
         let row = replica.store.upsert(facts(A, 1)).id();
         assert!(token.accepted(row));
         // Another writer's removal, before this holder's next follow.
-        replica.remove(A);
+        replica.remove_around(A);
         replica.follow();
         assert!(replica.credentials.is_empty());
         replica.store.upsert(facts(A, 2));
@@ -2731,7 +2722,7 @@ mod tests {
         let row = replica.store.upsert(facts(A, 1)).id();
         // Another writer's removal, followed before the door's answer
         // reaches the token.
-        replica.remove(A);
+        replica.remove_around(A);
         replica.follow();
         assert!(token.accepted(row));
         // The lay-again its acceptance asks for finds no object for the
@@ -2754,7 +2745,7 @@ mod tests {
         // Another host takes the removal and registers the next worker at
         // the address, before this holder follows. The read that builds
         // the new object has not forgotten the old row yet.
-        replica.remove(A);
+        replica.remove_around(A);
         replica.store.upsert(facts(A, 2));
         replica.follow();
         assert!(replica.holds_credential(A, None));
@@ -2768,14 +2759,14 @@ mod tests {
         replica.register(rank_facts(B, C, 1), Some(KEY_C));
         replica.follow();
 
-        replica.remove(A);
+        replica.remove_around(A);
         replica.follow();
         assert_eq!(replica.credentials.len(), 1);
         // The other rank's row is written again: it is bound still.
         replica.store.upsert(rank_facts(B, C, 1));
         replica.follow();
         assert!(replica.holds_credential(B, Some(KEY_C)));
-        replica.remove(B);
+        replica.remove_around(B);
         replica.follow();
         assert!(replica.credentials.is_empty());
     }
@@ -2787,7 +2778,7 @@ mod tests {
         replica.follow();
         assert!(replica.holds_credential(A, Some(KEY_A)));
 
-        replica.remove(A);
+        replica.remove_around(A);
         let next = replica.kept(&facts(A, 2), Some(KEY_B));
         replica.follow();
         // The removed row is forgotten. What the flight stated stays.
@@ -2804,7 +2795,6 @@ mod tests {
         for put_back in [true, false] {
             let replica = Replica::new();
             let row = replica.register(facts(A, 1), Some(KEY_A));
-            replica.follow();
 
             // The same registration again: a door writes nothing over
             // equal facts, and nothing is to be laid again.
@@ -2814,10 +2804,8 @@ mod tests {
             } else {
                 assert!(!again.accepted(row));
             }
-            replica.follow();
 
             replica.remove(A);
-            replica.follow();
             assert!(replica.credentials.is_empty());
         }
     }
@@ -2826,15 +2814,12 @@ mod tests {
     fn a_registration_refused_at_an_address_that_stands_leaves_the_standing_workers_credential() {
         let replica = Replica::new();
         replica.register(facts(A, 1), Some(KEY_A));
-        replica.follow();
 
         let before = replica.at(A);
         assert!(!replica.kept(&facts(A, 1), Some(KEY_B)).put_back());
-        replica.follow();
         assert!(Arc::ptr_eq(&before, &replica.at(A)));
 
-        replica.store.upsert(facts(A, 1));
-        replica.follow();
+        replica.write(facts(A, 1));
         assert!(!Arc::ptr_eq(&before, &replica.at(A)));
         assert!(replica.holds_credential(A, Some(KEY_A)));
     }
@@ -2843,7 +2828,6 @@ mod tests {
     fn a_registration_that_moved_no_row_behind_a_new_credential_is_laid_again_with_it() {
         let mut replica = Replica::new();
         let row = replica.register(facts(A, 1), Some(KEY_A));
-        replica.follow();
         let id = replica.id(A);
         let standing = replica.objects.standing(&id);
         replica.told();
@@ -2853,7 +2837,6 @@ mod tests {
         // is built. The acceptance says the address is to be laid again.
         let again = replica.kept(&facts(A, 1), Some(KEY_B));
         assert!(again.accepted(row));
-        replica.follow();
         assert!(replica.holds_credential(A, Some(KEY_A)));
 
         // The holder lays the object again: one replacement under its id,
@@ -2878,13 +2861,11 @@ mod tests {
     fn an_object_built_with_a_refused_credential_is_laid_again_with_what_stood() {
         let replica = Replica::new();
         replica.register(facts(A, 1), Some(KEY_A));
-        replica.follow();
 
         // The standing row is written again while a registration is in
         // flight: its object is built with the stated credential.
         let refused = replica.kept(&facts(A, 1), Some(KEY_B));
-        replica.store.upsert(facts(A, 1));
-        replica.follow();
+        replica.write(facts(A, 1));
         assert!(replica.holds_credential(A, Some(KEY_B)));
 
         // The put-back says so, and the holder lays the object again.
@@ -2899,8 +2880,7 @@ mod tests {
         // The row came through another host while a registration here
         // stated a credential for its address and was then refused.
         let refused = replica.kept(&facts(A, 1), Some(KEY_A));
-        replica.store.upsert(facts(A, 1));
-        replica.follow();
+        replica.write(facts(A, 1));
         assert!(replica.holds_credential(A, Some(KEY_A)));
 
         assert!(refused.put_back());
@@ -2913,7 +2893,6 @@ mod tests {
     fn a_registration_refused_behind_a_rotation_not_yet_laid_leaves_the_rotated_credential() {
         let replica = Replica::new();
         let row = replica.register(facts(A, 1), Some(KEY_A));
-        replica.follow();
 
         // The credential alone changes. It is accepted, and the holder
         // has not laid the address again yet.
@@ -2949,7 +2928,6 @@ mod tests {
         let first = replica.register(rank_facts(A, C, 0), Some(KEY_C));
         replica.register(rank_facts(B, C, 1), Some(KEY_C));
         replica.register(facts(D, 1), Some(KEY_A));
-        replica.follow();
         let other = replica.at(D);
 
         // One rank's registration states another credential: it is the
@@ -2990,7 +2968,7 @@ mod tests {
             priority: Some(7),
             ..WorkerPatch::default()
         };
-        replica.patch(B, late);
+        replica.patch_around(B, late);
         assert_eq!(replica.lay_again(&facts(B, 1)), 1);
         assert!(replica.holds_credential(B, Some(KEY_B)));
         let standing = replica.objects.standing(&replica.id(B));
@@ -3040,11 +3018,9 @@ mod tests {
     fn a_registration_with_no_credential_clears_one_a_removed_worker_left() {
         let replica = Replica::new();
         replica.register(facts(A, 1), Some(KEY_A));
-        replica.follow();
         replica.remove(A);
 
         replica.register(facts(A, 1), None);
-        replica.follow();
         assert!(replica.holds_credential(A, None));
     }
 
@@ -3108,7 +3084,7 @@ mod tests {
         let token = replica.kept(&facts(B, 1), Some(KEY_B));
         assert!(token.accepted(store.upsert(facts(B, 1)).id()));
         // Another writer's removal, then the holder's own write of the key.
-        replica.remove(A);
+        replica.remove_around(A);
         let labelled = WorkerFacts {
             labels: BTreeMap::from([("tier".to_owned(), "gold".to_owned())]),
             ..facts(A, 1)
@@ -3157,7 +3133,7 @@ mod tests {
             let replica = Replica::new();
             let row = replica.register(facts(A, 1), Some(KEY_A));
             // Another writer's removal, around the holder.
-            replica.remove(A);
+            replica.remove_around(A);
             assert_eq!(write(&replica, row), None, "{name}: over a row that left");
             assert!(replica.credentials.is_empty(), "{name}");
         }
@@ -3176,13 +3152,13 @@ mod tests {
             priority: Some(7),
             ..WorkerPatch::default()
         };
-        replica.patch(A, late);
+        replica.patch_around(A, late);
         let refused = replica.objects.patch(store, row, labels("gold"), 1);
         assert_eq!(refused, None, "decided over a row that moved");
         assert_eq!(replica.credentials.len(), 1, "the row stands");
         assert!(replica.holds_credential(A, Some(KEY_A)));
         // What is bound still: an object laid later takes it.
-        replica.patch(A, labels("silver"));
+        replica.patch_around(A, labels("silver"));
         let refused = replica.objects.patch(store, row, labels("gold"), 2);
         assert_eq!(refused, None, "moved once more");
         assert!(replica.holds_credential(A, Some(KEY_A)), "laid with it");
@@ -3191,9 +3167,8 @@ mod tests {
     #[test]
     fn the_row_is_answered_only_for_the_object_the_entry_was_written_for() {
         let replica = Replica::new();
-        let row = replica.store.upsert(facts(A, 1)).id();
-        replica.store.upsert(facts(B, 1));
-        replica.follow();
+        let row = replica.write(facts(A, 1));
+        replica.write(facts(B, 1));
         let id = replica.id(A);
         let laid = replica.at(A);
         let standing = RowRevision {
@@ -3208,7 +3183,6 @@ mod tests {
         );
 
         replica.patch(A, labels("gold"));
-        replica.follow();
         assert_eq!(replica.objects.standing_of(&id, &laid), None);
         assert_eq!(
             replica.objects.standing_of(&id, &replica.at(A)),
@@ -3223,13 +3197,11 @@ mod tests {
     #[test]
     fn a_row_that_goes_has_its_object_dropped() {
         let mut replica = Replica::new();
-        let row = replica.store.upsert(facts(A, 1)).id();
-        replica.store.upsert(facts(B, 1));
-        replica.follow();
+        let row = replica.write(facts(A, 1));
+        replica.write(facts(B, 1));
         let id = replica.id(A);
         replica.told();
         replica.remove(A);
-        replica.follow();
         let registry = replica.objects.registry();
         assert!(registry.get_by_url(A).is_none());
         assert_eq!((replica.objects.len(), registry.len()), (1, 1));
@@ -3246,8 +3218,7 @@ mod tests {
     #[test]
     fn a_row_whose_facts_change_has_its_object_replaced_under_the_same_id() {
         let mut replica = Replica::new();
-        let row = replica.store.upsert(facts(A, 1)).id();
-        replica.follow();
+        let row = replica.write(facts(A, 1));
         let id = replica.id(A);
         replica.told();
         let wider = WorkerFacts {
@@ -3257,12 +3228,14 @@ mod tests {
         let writes: [Write<'_>; 3] = [
             ("a patch", &|replica| replica.patch(A, labels("gold"))),
             ("a refresh", &|replica| {
-                let change = replica.store.upsert(facts(A, 1));
-                assert_eq!(change, MembershipChange::Relabelled { id: row });
+                let (store, objects) = (replica.store.as_ref(), &replica.objects);
+                let change = objects.upsert(store, facts(A, 1), Registrant::Control);
+                assert_eq!(change, Some(MembershipChange::Relabelled { id: row }));
             }),
             ("a new width", &|replica| {
-                let change = replica.store.upsert(wider.clone());
-                assert_eq!(change, MembershipChange::Resized { id: row });
+                let (store, objects) = (replica.store.as_ref(), &replica.objects);
+                let change = objects.upsert(store, wider.clone(), Registrant::Control);
+                assert_eq!(change, Some(MembershipChange::Resized { id: row }));
             }),
         ];
         let shown: [(Option<&str>, Option<usize>); 3] =
@@ -3271,7 +3244,6 @@ mod tests {
             let before = replica.at(A);
             before.increment_load();
             write(&replica);
-            replica.follow();
             let after = replica.at(A);
             assert!(!Arc::ptr_eq(&before, &after), "{name}: another object");
             assert_eq!(replica.id(A), id, "{name}: the same id");
@@ -3321,9 +3293,7 @@ mod tests {
     #[test]
     fn a_status_copied_from_the_table_makes_a_worker_available_only_while_ready() {
         let mut replica = Replica::new();
-        replica.follow();
-        replica.store.upsert(facts(A, 1));
-        replica.follow();
+        replica.write(facts(A, 1));
         let row = replica.row(A);
         let copy = |replica: &Replica| replica.objects.copy_status(replica.store.as_ref(), row.id);
         let (id, worker) = (replica.id(A), replica.at(A));
@@ -3382,7 +3352,7 @@ mod tests {
         let before = replica.at(A);
         let moved = store.set_status(row.id, WorkerStatus::Ready, row.revision);
         assert!(moved.is_some(), "the status moved");
-        replica.patch(A, labels("gold"));
+        replica.patch_around(A, labels("gold"));
 
         replica.objects.copy_status(store, row.id);
         assert_eq!(before.status(), ObjectStatus::Pending);
@@ -3422,9 +3392,8 @@ mod tests {
     #[test]
     fn a_cut_laid_whole_lays_the_status_of_both_kept_and_replaced_objects() {
         let mut replica = Replica::new();
-        replica.store.upsert(facts(A, 1));
-        replica.store.upsert(facts(B, 1));
-        replica.follow();
+        replica.write(facts(A, 1));
+        replica.write(facts(B, 1));
         let (a, b) = (replica.at(A), replica.at(B));
         let (id_a, id_b) = (replica.id(A), replica.id(B));
         assert!(!a.is_available() && !b.is_available());
@@ -3466,14 +3435,12 @@ mod tests {
     #[test]
     fn a_new_incarnation_of_a_key_drops_the_old_object_and_builds_one_under_a_new_id() {
         let mut replica = Replica::new();
-        let old = replica.store.upsert(facts(A, 1)).id();
-        replica.follow();
+        let old = replica.write(facts(A, 1));
         let (old_id, before) = (replica.id(A), replica.at(A));
         before.increment_load();
         replica.told();
-        let new = replica.store.upsert(facts(A, 2)).id();
+        let new = replica.write(facts(A, 2));
         assert_ne!(old, new);
-        replica.follow();
         let new_id = replica.id(A);
         assert_ne!(old_id, new_id);
         assert_eq!(replica.at(A).load(), 0, "nothing of the old object runs on");
@@ -3507,7 +3474,7 @@ mod tests {
         before.increment_load();
         replica.told();
 
-        replica.remove(A);
+        replica.remove_around(A);
         assert_eq!(replica.store.upsert(labelled(A, 1, "gold")).id(), first);
         assert_eq!(replica.row(A).revision, 1, "the first revision again");
         replica.follow();
@@ -3545,10 +3512,10 @@ mod tests {
         replica.follow();
         let id = replica.id(A);
         replica.told();
-        replica.patch(A, labels("gold"));
-        replica.patch(A, labels("silver"));
+        replica.patch_around(A, labels("gold"));
+        replica.patch_around(A, labels("silver"));
         let passing = replica.store.upsert(facts(B, 1)).id();
-        replica.remove(B);
+        replica.remove_around(B);
         replica.follow();
         assert_eq!(replica.told(), [("replaced", id)]);
         assert_eq!(replica.tier(A).as_deref(), Some("silver"));
@@ -3583,11 +3550,11 @@ mod tests {
         let read_to = replica.store.epoch();
         replica.told();
 
-        replica.remove(A);
-        replica.patch(B, labels("gold"));
+        replica.remove_around(A);
+        replica.patch_around(B, labels("gold"));
         let next = replica.store.upsert(facts(C, 2)).id();
         let arrived = replica.store.upsert(facts(D, 1)).id();
-        replica.remove(F);
+        replica.remove_around(F);
         assert_eq!(replica.store.upsert(labelled(F, 1, "gold")).id(), back);
         assert_eq!(replica.row(F).revision, 1, "the first revision again");
         // A status write moves neither E's facts nor its revision.
@@ -3652,7 +3619,7 @@ mod tests {
         ];
         assert_eq!((told.len(), laid), (7, HashSet::from(each)));
 
-        replica.remove(D);
+        replica.remove_around(D);
         replica.follow();
         assert!(registry.get_by_url(D).is_none());
         assert_eq!(replica.told().len(), 1);
@@ -3988,10 +3955,9 @@ mod tests {
     #[test]
     fn an_engines_ranks_are_answered_by_their_rows() {
         let replica = Replica::new();
-        let lower = replica.store.upsert(rank_facts(A, C, 0)).id();
-        let upper = replica.store.upsert(rank_facts(B, C, 1)).id();
-        let alone = replica.store.upsert(facts(D, 1)).id();
-        replica.follow();
+        let lower = replica.write(rank_facts(A, C, 0));
+        let upper = replica.write(rank_facts(B, C, 1));
+        let alone = replica.write(facts(D, 1));
         let objects = &replica.objects;
         assert_eq!(objects.rank_row(lower, 0), Some(lower));
         assert_eq!(objects.rank_row(lower, 1), Some(upper));
@@ -4006,13 +3972,11 @@ mod tests {
     #[test]
     fn a_rank_row_that_leaves_is_answered_no_longer() {
         let replica = Replica::new();
-        let lower = replica.store.upsert(rank_facts(A, C, 0)).id();
-        let upper = replica.store.upsert(rank_facts(B, C, 1)).id();
-        replica.follow();
+        let lower = replica.write(rank_facts(A, C, 0));
+        let upper = replica.write(rank_facts(B, C, 1));
         assert_eq!(replica.objects.rank_row(lower, 1), Some(upper));
 
         replica.remove(B);
-        replica.follow();
         assert_eq!(replica.objects.rank_row(lower, 1), None);
         assert_eq!(replica.objects.rank_row(upper, 1), None);
         assert_eq!(replica.objects.rank_row(lower, 0), Some(lower));
@@ -4023,9 +3987,8 @@ mod tests {
     #[test]
     fn a_row_stands_at_its_own_rank_until_it_leaves() {
         let replica = Replica::new();
-        let lower = replica.store.upsert(rank_facts(A, C, 0)).id();
-        let upper = replica.store.upsert(rank_facts(B, C, 1)).id();
-        replica.follow();
+        let lower = replica.write(rank_facts(A, C, 0));
+        let upper = replica.write(rank_facts(B, C, 1));
         let objects = &replica.objects;
         assert!(objects.lists_rank(lower, 0));
         assert!(objects.lists_rank(upper, 1));
@@ -4033,7 +3996,6 @@ mod tests {
         assert!(!objects.lists_rank(upper, 0), "another row's rank");
 
         replica.remove(B);
-        replica.follow();
         assert!(!objects.lists_rank(upper, 1), "a row that left");
         assert!(objects.lists_rank(lower, 0));
     }
@@ -4044,31 +4006,22 @@ mod tests {
     #[test]
     fn a_rank_row_laid_again_is_answered_by_its_new_row() {
         let replica = Replica::new();
-        let lower = replica.store.upsert(rank_facts(A, C, 0)).id();
-        let upper = replica.store.upsert(rank_facts(B, C, 1)).id();
-        replica.follow();
+        let lower = replica.write(rank_facts(A, C, 0));
+        let upper = replica.write(rank_facts(B, C, 1));
 
-        let again = replica
-            .store
-            .upsert(WorkerFacts {
-                incarnation: 2,
-                ..rank_facts(B, C, 1)
-            })
-            .id();
-        replica.follow();
+        let again = replica.write(WorkerFacts {
+            incarnation: 2,
+            ..rank_facts(B, C, 1)
+        });
         assert_ne!(again, upper);
         assert_eq!(replica.objects.rank_row(lower, 1), Some(again));
 
-        let moved = replica
-            .store
-            .upsert(WorkerFacts {
-                incarnation: 2,
-                dp_rank: 2,
-                dp_size: 3,
-                ..rank_facts(B, C, 1)
-            })
-            .id();
-        replica.follow();
+        let moved = replica.write(WorkerFacts {
+            incarnation: 2,
+            dp_rank: 2,
+            dp_size: 3,
+            ..rank_facts(B, C, 1)
+        });
         assert_eq!(moved, again);
         assert_eq!(replica.objects.rank_row(lower, 1), None);
         assert_eq!(replica.objects.rank_row(lower, 2), Some(again));

@@ -859,7 +859,7 @@ mod tests {
             let registry = Arc::new(WorkerRegistry::new());
             let objects = Arc::new(Objects::new(Arc::clone(&registry)));
             let store = Arc::new(MemoryStore::default());
-            let door = Arc::new(StoreDoor::new(Arc::clone(&store)));
+            let door = Arc::new(HolderDoor::new(Arc::clone(&store), Arc::clone(&objects)));
             let host = Arc::new(Host {
                 registry,
                 settings: RegistrationSettings {
@@ -940,13 +940,26 @@ mod tests {
             maker: &Registrant,
             worker: &dyn Worker,
         ) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
-            let answer = self
-                .door
+            self.door
                 .found(maker, Precondition::Any, worker.url(), &|old| {
                     facts(worker, old)
-                })?;
-            self.objects.follow(&*self.store);
-            Ok(answer)
+                })
+        }
+
+        /// A row that stands ahead of a case's job: written through the
+        /// holder, as a control call's.
+        fn laid(&self, facts: WorkerFacts) {
+            let written = self.objects.upsert(&self.store, facts, Registrant::Control);
+            written.expect("the store takes the write");
+        }
+
+        /// The fixture of a host whose door writes the store alone and
+        /// whose holder follows it by hand: for the cases of what stands
+        /// between a door's write and that follow.
+        fn following() -> Self {
+            let mut fixture = Self::new();
+            fixture.door = Arc::new(StoreDoor::new(Arc::clone(&fixture.store)));
+            fixture
         }
 
         fn write(&self) -> WriteWorkersToStore<Members> {
@@ -1019,10 +1032,8 @@ mod tests {
         Arc::new(<BasicWorkerBuilder>::from_spec(spec).build())
     }
 
-    /// The credential the row's object at `url` holds, once the holder has
-    /// followed the store.
+    /// The credential the row's object at `url` holds.
     fn held_key(f: &Fixture, url: &str) -> Option<String> {
-        f.objects.follow(&*f.store);
         let object = f.host.registry.get_by_url(url).expect("the row's object");
         object.api_key().cloned()
     }
@@ -1058,7 +1069,6 @@ mod tests {
         // the ranks, whatever address the job's configuration names.
         cx.data.config.url = "worker:8000".to_owned();
         f.write().execute(&mut cx).await.expect("written");
-        f.objects.follow(&*f.store);
 
         let mut held = find_workers_by_url(&f.host.registry, URL);
         held.sort_by_key(|worker| worker.dp_rank());
@@ -1095,7 +1105,6 @@ mod tests {
         let row = f.store.by_key(URL).expect("the worker's one row");
         assert_eq!((row.facts.dp_rank, row.facts.dp_size), (0, 4));
         assert_eq!(f.store.all_rows().1.len(), 1);
-        f.objects.follow(&*f.store);
         let held = f
             .host
             .registry
@@ -1170,7 +1179,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_registration_writes_one_row_a_worker_under_its_askers_maker() {
-        let f = Fixture::new();
+        let f = Fixture::following();
         let urls = ["http://worker:8000@0", "http://worker:8000@1"];
         let workers = ranked_workers(2);
         let mut cx = f.registration(WorkerJobAsker::Discovery, workers.clone());
@@ -1298,12 +1307,13 @@ mod tests {
     /// not dropped yet: the worker stays the job's at either step.
     #[tokio::test]
     async fn a_removal_keeps_a_worker_whose_row_left_before_the_holder_followed() {
-        let f = Fixture::new();
+        let f = Fixture::following();
         let built = worker(URL, "model");
         let maker = Registrant::Control;
         let by = Remover::Registrant(&maker);
         for at_the_drain in [true, false] {
             f.seed(&maker, built.as_ref()).expect("registered");
+            f.objects.follow(&*f.store);
             let live = f.host.registry.get_by_url(URL).expect("the held worker");
             let id = f.host.registry.get_id_by_url(URL).expect("its id");
             let seen = f.objects.standing_of(&id, &live).expect("its row");
@@ -1331,7 +1341,7 @@ mod tests {
         let workers = ranked_workers(2);
         let available = workers[0].url().to_owned();
         let occupied = workers[1].url().to_owned();
-        f.store.upsert(facts(workers[1].as_ref(), None));
+        f.laid(facts(workers[1].as_ref(), None));
         let before = f.store.by_key(&occupied);
         let mut cx = f.registration(WorkerJobAsker::Discovery, workers);
         let write = f.write();
@@ -1597,12 +1607,10 @@ mod tests {
     }
 
     /// A door another writer moved the row under: it writes the row another
-    /// way, has the holder follow, and then refuses. So the holder builds
-    /// the row's object while the registration is in flight.
+    /// way and then refuses. So the holder builds the row's object while
+    /// the registration is in flight.
     struct MovedUnder {
         door: Arc<dyn MembershipWriter>,
-        objects: Arc<Objects<Members>>,
-        store: Arc<MemoryStore>,
     }
 
     impl MembershipWriter for MovedUnder {
@@ -1631,7 +1639,6 @@ mod tests {
                         moved
                     })?;
             }
-            self.objects.follow(&*self.store);
             Err(MembershipWriteRefused::Moved)
         }
 
@@ -1680,8 +1687,6 @@ mod tests {
         let write = WriteWorkersToStore {
             door: Arc::new(MovedUnder {
                 door: Arc::clone(&f.door),
-                objects: Arc::clone(&f.objects),
-                store: Arc::clone(&f.store),
             }),
             ..f.write_keeping(&credentials)
         };
@@ -1846,7 +1851,7 @@ mod tests {
         // is not written.
         let f = Fixture::new();
         let ranks = ranked_workers(2);
-        f.store.upsert(WorkerFacts {
+        f.laid(WorkerFacts {
             labels: [("tier".to_owned(), "gold".to_owned())].into(),
             ..facts(ranks[1].as_ref(), None)
         });
@@ -1864,7 +1869,7 @@ mod tests {
         // tried again, and it lays the first rank.
         let f = Fixture::new();
         let ranks = ranked_workers(2);
-        f.store.upsert(facts(ranks[1].as_ref(), None));
+        f.laid(facts(ranks[1].as_ref(), None));
         let mut cx = f.registration(WorkerJobAsker::Api, ranks);
         cx.data.registration_mode = WorkerRegistrationMode::CreateOnly;
         f.write()
@@ -1950,7 +1955,6 @@ mod tests {
             row.facts.labels.get("tier").map(String::as_str),
             Some("silver")
         );
-        f.objects.follow(&*f.store);
         assert_eq!(f.host.registry.get_id_by_url(URL), Some(id.clone()));
 
         // The worker drains: its removal wins, and the replacement is told.
@@ -1990,7 +1994,6 @@ mod tests {
             ..Overload::default()
         };
         let standing = || {
-            f.objects.follow(&*f.store);
             let id = f.host.registry.get_id_by_url(URL).expect("the worker's id");
             let live = f.host.registry.get(&id).expect("the worker");
             (id, live)
@@ -2064,7 +2067,6 @@ mod tests {
         f.door
             .gone(Remover::Registrant(&Registrant::Control), URL, seen)
             .expect("removed");
-        f.objects.follow(&*f.store);
         assert!(matches!(held(&f.host.registry, &second, URL), Held::Gone));
     }
 
@@ -2092,7 +2094,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_removal_marks_its_rows_draining_and_takes_them_behind_the_workers_own_window() {
-        let f = Fixture::new();
+        let f = Fixture::following();
         // The registration states a drain window of thirty seconds: the row
         // carries it, and the object the holder builds settles by it.
         let checks = HealthCheckConfig {
@@ -2291,10 +2293,11 @@ mod tests {
     /// the job at either step.
     #[tokio::test]
     async fn a_removal_leaves_a_row_that_moved_and_drops_its_worker_from_the_job() {
-        let f = Fixture::new();
+        let f = Fixture::following();
         let built = worker(URL, "model");
         f.seed(&Registrant::Control, built.as_ref())
             .expect("registered");
+        f.objects.follow(&*f.store);
         let live = f.host.registry.get_by_url(URL).expect("the held worker");
         f.door
             .found(&Registrant::Control, Precondition::Any, URL, &|old| {
@@ -2386,7 +2389,6 @@ mod tests {
                 }
             })
             .expect("registered again");
-        f.objects.follow(&*f.store);
         let replacement = f
             .host
             .registry

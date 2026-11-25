@@ -246,7 +246,7 @@ mod tests {
     use crate::{
         engine::view::WireModes,
         service::controller::{frame_loads::FrameLoads, Config},
-        store::{GatewayId, MemoryStore, Reachability, WorkerFacts, WorkerStatus, WorkersStore},
+        store::{GatewayId, MemoryStore, Reachability, Registrant, WorkerFacts, WorkersStore},
     };
 
     const A: &str = "grpc://a:9000";
@@ -471,14 +471,14 @@ mod tests {
             }
         }
 
-        /// Writes the `Ready` row of `facts` through the store's own entries
-        /// and has the holder follow it, as a host that writes its store does.
+        /// Writes the row of `facts` through the holder and readies its
+        /// object by the connect signal, as a registration call does.
         fn register(&self, facts: WorkerFacts) {
-            let row = self.store.upsert(facts).id();
+            let holder = self.workers.holder();
+            let written = holder.upsert(&self.store, facts, Registrant::Control);
+            let row = written.expect("the store takes the write").id();
             let standing = self.store.get(row).expect("the row");
-            self.store
-                .set_status(row, WorkerStatus::Ready, standing.revision);
-            self.workers.holder().follow(&*self.store);
+            holder.connect_row(&self.store, row, standing.revision);
         }
 
         /// How many load polls the engine answered.

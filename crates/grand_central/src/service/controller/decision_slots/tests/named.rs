@@ -34,10 +34,16 @@ fn pair_spec(prefill: &str, decode: &str, generation: u64) -> AppliedSpec {
 fn rings_bed() -> (Bed, [Vec<WorkerId>; 2]) {
     let bed = bed(Some(pair_spec(RING, RING, 1)), true, (1, 8), []);
     for (name, role) in [("p1", Role::Prefill), ("d1", Role::Decode)] {
-        ready(&bed.store, name, MODEL, role, WireModes::NONE);
+        ready(
+            &bed.store,
+            &bed.reads.objects,
+            name,
+            MODEL,
+            role,
+            WireModes::NONE,
+        );
     }
     let objects = &bed.reads.objects;
-    objects.follow(&*bed.store);
     let generation = objects.registry().model_generation(MODEL);
     let generation = generation.expect("the model's members");
     let listed = [Role::Prefill, Role::Decode].map(|role| {
