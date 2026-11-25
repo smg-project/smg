@@ -655,10 +655,11 @@ impl RoutingSettings {
     /// binding ahead of the main policy's own. Where a setting has no
     /// document under that plan, or the controller's check refuses the
     /// plan's document, the settings say what they said before it: no
-    /// gateway loses a document it has, and a refusal keeps its words. An
-    /// encode request then meets no binding with an encode side. Two
-    /// settings do so: the manual policy on a pair's two sides, and the
-    /// sticky override under a policy it places.
+    /// gateway loses a document it has, and a refusal keeps its words. Two
+    /// settings do so. Under the manual policy on a pair's two sides the
+    /// pair's plan stands, and an encode request meets no binding with an
+    /// encode side. The sticky override, under a policy it places, is
+    /// refused by the setting's name, as it was.
     ///
     /// A pure function of the settings. The document is not validated
     /// here, a plan with an encode side in a gateway of many routers
