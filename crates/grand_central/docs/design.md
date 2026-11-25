@@ -1539,6 +1539,7 @@ trait for that call. A host writes `model` and `make`; every other method has a 
 pub trait RequestMaker {
     fn model(&self) -> &str;                          // the request's model
     fn make<'w>(&'w self, spec: &'w AppliedSpec) -> Request<'w>; // builds the request
+    fn shadow_ring<'w>(&'w self, spec: &'w AppliedSpec, shadow: u16) -> Option<(&'w dyn LentRing, &'w [u64])>; // the ring it lends its binding's shadow profile and its places on it, by that profile's word
     fn plain(&self) -> Option<Plain>;                 // what a plain request states, if it is plain
     fn prompt_chars(&self) -> u32;                    // the length of its text in characters, asked for a plain request's lease
     fn prompt_bytes(&self) -> u32;                    // the same length in bytes

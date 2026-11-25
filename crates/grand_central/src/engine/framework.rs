@@ -5657,6 +5657,37 @@ impl Engine {
         (Some(usize::from(own)), decode.map(usize::from))
     }
 
+    /// The shadow profile of the single binding at `at` that is stated a
+    /// place of its own on a lent ring, for the request of `facts` over
+    /// `candidates`: one that reads a ring where no stage of the profile
+    /// that decides the request does, whatever its kind. That request
+    /// states no place when it is made, so the shadow's is asked inside
+    /// the shadow's own run
+    /// ([`RequestMaker::shadow_ring`](crate::engine::decision_engine::RequestMaker::shadow_ring)),
+    /// and the shadow walks the lent ring by the place it would be
+    /// stated live. `None` under every other binding: beside a profile
+    /// that reads the ring, a shadow reads that profile's place
+    /// ([`Self::shadow`]). And `None` where [`Self::shadow`] sheds ahead
+    /// of its profile, over no row or an affinity column that does not
+    /// fit them: nothing is asked for a place no row takes.
+    #[cfg(feature = "in-process")]
+    pub(crate) fn shadow_ring_profile(
+        &self,
+        at: u32,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+    ) -> Option<u16> {
+        let binding = self.binding_at(at)?;
+        let shadow = binding.single_shadow()?;
+        let reads = |profile: u16| Some(self.profile_needs.get(usize::from(profile))?.ring);
+        if !reads(shadow)? {
+            return None;
+        }
+        let live = profile_index(binding, facts.phase)?;
+        let placed = !candidates.is_empty() && column_fits(facts.affinity, candidates);
+        (placed && !reads(live)?).then_some(shadow)
+    }
+
     /// [`Self::states_key_place`] by the two profiles of
     /// [`Self::ring_profiles`].
     pub(crate) fn key_place_of(&self, (own, decode): RingProfiles) -> bool {
@@ -6851,7 +6882,9 @@ impl Engine {
     /// request by different rules ([`HeadPlaces`]). The place a request
     /// states is its live profiles', so it is no place of such a shadow,
     /// which places on its own ring. A profile that reads no ring is apart
-    /// from none, and a live profile that reads none states no place.
+    /// from none, and a live profile that reads none states no place: its
+    /// shadow under a single binding is stated one of its own inside its
+    /// run ([`Self::shadow_ring_profile`]).
     ///
     /// `None` where the facts stand: the request lends no ring, or the
     /// shadow is apart from no live profile.

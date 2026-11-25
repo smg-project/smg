@@ -108,7 +108,10 @@ use crate::{
         },
     },
     fresh_seed,
-    policies::consistent_hashing::{Head, LentRing},
+    policies::{
+        consistent_hashing::{Head, LentRing},
+        prefix_hash::HeadRule,
+    },
     store::GatewayId,
     tracking::{lease::ReleaseReason, DecisionGuard, Placement},
 };
@@ -691,10 +694,7 @@ impl<'r, 'a> Made<'r, 'a> {
     /// of one ask of the call, and a later making of that ask borrows
     /// what it answered. A call that asks again makes its request anew,
     /// and asks the lender again.
-    fn stated<'w>(
-        &'w self,
-        spec: &'w AppliedSpec,
-    ) -> (DerivedKeys<'a>, Option<&'a dyn LentRing>, &'w [u64]) {
+    fn stated<'w>(&'w self, spec: &'w AppliedSpec) -> Stated<'a, 'w> {
         let request = self.request;
         let (model, phase) = (request.model, request.phase());
         let Some(ring) = request.ring else {
@@ -704,14 +704,42 @@ impl<'r, 'a> Made<'r, 'a> {
         let engine = spec.engine();
         let profiles = engine.ring_profiles(model, phase);
         if engine.key_place_of(profiles) {
-            let first = self.place.get().is_none();
-            let keys = self.keys(spec, |text, _| first.then(|| ring.position(text)));
-            let place = self.place.get_or_init(|| keys.ring_position);
-            return (keys, Some(ring), place.as_slice());
+            return self.stated_key::<false>(spec, ring);
         }
-        let Some(rule) = engine.head_rule_of(profiles) else {
-            return (self.keys(spec, |_, _| None), None, &[]);
-        };
+        match engine.head_rule_of(profiles) {
+            Some(rule) => self.stated_heads::<false>(spec, ring, rule),
+            None => (self.keys(spec, |_, _| None), None, &[]),
+        }
+    }
+
+    /// [`Self::stated`] by a stage that places a routing value by its own
+    /// text: that text's place on `ring`. `SHADOW` parts the copy a
+    /// shadow's statement compiles ([`RequestMaker::shadow_ring`]) from
+    /// the live one: a closure called from one place is built into its
+    /// caller, so the live statement stays whole inside [`Self::stated`].
+    #[inline(always)]
+    fn stated_key<'w, const SHADOW: bool>(
+        &'w self,
+        spec: &AppliedSpec,
+        ring: &'a dyn LentRing,
+    ) -> Stated<'a, 'w> {
+        let first = self.place.get().is_none();
+        let keys = self.keys(spec, |text, _| first.then(|| ring.position(text)));
+        let place = self.place.get_or_init(|| keys.ring_position);
+        (keys, Some(ring), place.as_slice())
+    }
+
+    /// [`Self::stated`] by the prefix form of the ring, which cuts the
+    /// request by `rule`: the places of its heads on `ring`. `SHADOW` as
+    /// in [`Self::stated_key`].
+    #[inline(always)]
+    fn stated_heads<'w, const SHADOW: bool>(
+        &'w self,
+        spec: &AppliedSpec,
+        ring: &'a dyn LentRing,
+        rule: HeadRule<'_>,
+    ) -> Stated<'a, 'w> {
+        let request = self.request;
         // A routing value a header handed leads the prompt: its text is the
         // one head. A client's value places nothing under this form, and
         // neither does a value the request's own id handed: that request
@@ -748,6 +776,10 @@ impl<'r, 'a> Made<'r, 'a> {
         (keys, ring, places)
     }
 }
+
+/// What a request states of a lent ring ([`Made::stated`]): its keys, the
+/// ring its decision is lent, and its places on it.
+type Stated<'a, 'w> = (DerivedKeys<'a>, Option<&'a dyn LentRing>, &'w [u64]);
 
 /// Whether a routing value from `source` leads a request's prompt under a
 /// ring's prefix form: every source but the request's own id, whose value
@@ -926,6 +958,22 @@ impl RequestMaker for Made<'_, '_> {
                 ..Constraints::default()
             },
         }
+    }
+
+    fn shadow_ring<'w>(
+        &'w self,
+        spec: &'w AppliedSpec,
+        shadow: u16,
+    ) -> Option<(&'w dyn LentRing, &'w [u64])> {
+        let ring = self.request.ring?;
+        // The shadow profile alone is asked what a deciding profile is.
+        let (engine, profiles) = (spec.engine(), (Some(usize::from(shadow)), None));
+        let (_, ring, places) = if engine.key_place_of(profiles) {
+            self.stated_key::<true>(spec, ring)
+        } else {
+            self.stated_heads::<true>(spec, ring, engine.head_rule_of(profiles)?)
+        };
+        Some((ring?, places))
     }
 
     // A first attempt that names nothing tried or missed, is held to no
