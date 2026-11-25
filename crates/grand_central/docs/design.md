@@ -1171,7 +1171,8 @@ request (section 8). The call runs on the caller's thread.
 The engine waits on no lock of its own, but for these. Under a document that keeps a sample of its
 decisions (decision 7), a decision that is kept takes the one lock of the sample's ring for its
 push. A decision that finds a list no lookup table for cache affinity (5.2) reads one, and a table
-stands for a second before one decision reads it anew. Such a read takes the lock of the engine's
+stands for a second, or until the index of cache events hands a worker's number on to another
+worker, before one decision reads it anew. Such a read takes the lock of the engine's
 map of the records of sent prefixes, once at most. A stage that keeps state takes its own short
 lock (one shard of the session table or the record of sent prefixes, among them). A decision that
 meets the one build of a list's value, or of a part of it, waits for it (5.2).

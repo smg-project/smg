@@ -345,8 +345,9 @@ impl PoolMembers {
 
     /// What a decision whose stages read affinity keeps of the list: each
     /// worker's number in its model's index of cache events and the list's
-    /// warming rows, as a ruling read again at most once a second
-    /// ([`PoolAffinity`]). A caller that asks a whole decision of its own
+    /// warming rows, as a ruling read again once a second, and once the
+    /// index handed a number on to another worker ([`PoolAffinity`]). A
+    /// caller that asks a whole decision of its own
     /// over the list's records hands it to [`overlap::decide`], as a single
     /// request's decision here does.
     #[must_use]

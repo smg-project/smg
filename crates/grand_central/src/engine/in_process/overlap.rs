@@ -39,7 +39,8 @@
 //!   admitted, and the list's warming rows by the profile's own ruling
 //!   ([`WarmUpRule`]). It is a ruling read from the index and the worker
 //!   objects, never a copy of a worker's health or load. One decision reads
-//!   it again at most once a second, behind one atomic flag, and swaps it in
+//!   it again once its second is up, or once the index handed one of its
+//!   numbers on to another worker, behind one atomic flag, and swaps it in
 //!   by pointer. A decision loads the pointer and writes no shared word.
 //! - **Once a model** ([`Affinity`]): the record of the prefixes sent to the
 //!   workers the index does not speak for, and to every worker by a request
@@ -107,7 +108,8 @@ use crate::{
 const NONE: u32 = u32::MAX;
 
 /// How long a list's table stands before one decision reads it again, in
-/// microseconds.
+/// microseconds. One whose numbers the index handed on is read again
+/// before that ([`Table::numbered`]).
 const TABLE_STANDS_MICROS: u64 = 1_000_000;
 
 /// The index numbers a table maps. An index hands its numbers out from zero
@@ -137,6 +139,15 @@ pub trait CacheIndex: Send + Sync {
     /// worker's first block, so a number says nothing of what was heard.
     fn worker_number(&self, address: &str) -> Option<u32>;
 
+    /// How many times the index gave a number one worker handed back to the
+    /// next worker that asked for one. A list's table reads it ahead of the
+    /// numbers and is read again once it moved, and a lookup it moved under
+    /// names nobody: a number that changed hands never names its former
+    /// worker. The default is an index that hands no number out twice.
+    fn numbers_reused(&self) -> u64 {
+        0
+    }
+
     /// How many blocks the index holds for the worker of `number`.
     fn worker_blocks(&self, number: u32) -> usize;
 
@@ -164,6 +175,10 @@ pub trait CacheIndex: Send + Sync {
 impl CacheIndex for ChainIndex {
     fn worker_number(&self, address: &str) -> Option<u32> {
         self.worker_id(address)
+    }
+
+    fn numbers_reused(&self) -> u64 {
+        self.ids_reused()
     }
 
     fn worker_blocks(&self, number: u32) -> usize {
@@ -843,7 +858,8 @@ impl Drop for Reading<'_> {
 
 /// One list of workers as the affinity stages' rows are named from it, for
 /// the decisions of one model and phase: read in one pass over the list and
-/// standing for a second. It holds what the index and the worker objects
+/// standing for a second, or until the index hands one of its numbers on
+/// ([`Self::numbered`]). It holds what the index and the worker objects
 /// said at its read, as a ruling: who the index speaks for, and who warms.
 struct Table {
     /// The place the table answers for.
@@ -875,6 +891,10 @@ struct Table {
     column: Box<[AffinityFacts]>,
     /// The model's index of cache events, where it has one.
     index: Option<Arc<dyn CacheIndex>>,
+    /// The index's count of numbers handed out a second time
+    /// ([`CacheIndex::numbers_reused`]), read ahead of the numbers below:
+    /// they are the index's while it reads the same ([`Self::numbered`]).
+    reused: u64,
     /// Index number -> row of the list.
     row_of: Box<[u32]>,
     /// A bit an index number: a row of the list the index speaks for. The
@@ -993,6 +1013,7 @@ impl Table {
             states: engine.profile_reads_affinity(model, phase),
             column: Box::default(),
             index: None,
+            reused: 0,
             row_of: Box::default(),
             within: Box::default(),
             numbers: Box::default(),
@@ -1022,6 +1043,9 @@ impl Table {
             .indexes
             .get()
             .and_then(|indexes| indexes.index(registered));
+        // Ahead of the numbers: one that changes hands under this pass
+        // leaves the table a count the index has moved past.
+        table.reused = index.as_ref().map_or(0, |index| index.numbers_reused());
         let rows = workers.len();
         let mut numbers = vec![NONE; rows];
         let mut sizes = vec![0u32; rows];
@@ -1121,6 +1145,16 @@ impl Table {
     /// Whether the table answers for the decisions of `model` at `phase`.
     fn is_of(&self, model: &str, phase: Phase) -> bool {
         self.phase == phase && *self.model == *model
+    }
+
+    /// Whether the numbers the table read are still the index's: it handed
+    /// none out a second time since ([`CacheIndex::numbers_reused`]). The
+    /// count does not say which number it handed on: once it moved, any
+    /// number of the table may name a former worker at its new worker's
+    /// blocks.
+    fn numbered(&self) -> bool {
+        let index = self.index.as_ref();
+        index.is_none_or(|index| index.numbers_reused() == self.reused)
     }
 
     /// Whom the record of sent prefixes speaks for on a request hashed by
@@ -1319,6 +1353,11 @@ impl Table {
                 &mut |under| below(&mut draw, under),
                 kept,
             );
+            // A number handed on since the table read it holds its new
+            // worker's blocks: such a lookup names nobody.
+            if !self.numbered() {
+                kept.clear();
+            }
             for &(number, blocks) in kept.iter() {
                 let row = self.row_of.get(number as usize).copied().unwrap_or(NONE);
                 if row != NONE {
@@ -1592,6 +1631,11 @@ impl Table {
                 &mut |_| 0,
                 kept,
             );
+            // As where a decision is named its rows: no holder of a number
+            // handed on since the table read it.
+            if !self.numbered() {
+                kept.clear();
+            }
             for &(number, blocks) in kept.iter() {
                 let row = self.row_of.get(number as usize).copied().unwrap_or(NONE);
                 if let Some(entry) = column.get_mut(row as usize) {
@@ -1957,8 +2001,9 @@ struct Asked<'a> {
 ///
 /// The rows live in the calling thread's buffers until this returns:
 /// `decide` reads them and keeps nothing of them. Nothing is allocated once
-/// the buffers have grown, but where a table is read (once a list, and then
-/// by one decision a second) and by a tree's own match and write.
+/// the buffers have grown, but where a table is read (once a list, then by
+/// one decision a second and by one behind a number the index handed on)
+/// and by a tree's own match and write.
 ///
 /// [`Engine::needs_for_phase`]: crate::engine::Engine::needs_for_phase
 /// [`RequestMaker::sends_to`]: crate::engine::RequestMaker::sends_to
@@ -2319,9 +2364,13 @@ impl PoolAffinity {
         let standing = self.table.load();
         let table = standing.as_deref();
         if let Some(table) = table.filter(|table| table.is_of(asked.model, asked.phase)) {
-            let stands = asked.now.saturating_sub(table.read_at) < TABLE_STANDS_MICROS;
+            // It stands for its second, while the index hands none of its
+            // numbers on.
+            let stands =
+                asked.now.saturating_sub(table.read_at) < TABLE_STANDS_MICROS && table.numbered();
             // One decision reads a table again; the others decide by the
-            // one that stands.
+            // one that stands, whose lookup names nobody once a number of
+            // it was handed on.
             if stands || self.reading.swap(true, Ordering::AcqRel) {
                 return with(table);
             }
