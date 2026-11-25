@@ -652,18 +652,27 @@ path, a Generate deadline, cancellation or lost connection leaves its
 engine-side completion unconfirmed: a later successful request or cache flush
 is not an acknowledgement that the old request was cancelled or drained.
 That worker keeps NOT_SERVING and exits nonzero through server/engine cleanup;
-a fresh engine must start before admission. The plan, request shapes and
-budget are unchanged, and an unsupported cache flush alone is still a logged
-line. The shared asynchronous pass records the same transport facts; the
-Python servicer's existing health/shutdown policy is unchanged by this Rust
-lifecycle rule. `SMG_VLLM_SERVICER_WARMUP` = `full` (the default:
+a fresh engine must start before admission. The plan and request shapes are
+unchanged, and an unsupported cache flush alone is still a logged line. The
+shared asynchronous pass records the same transport facts; the Python
+servicer's health/shutdown decision policy is unchanged, but the shared pass
+can lengthen its NOT_SERVING window. `SMG_VLLM_SERVICER_WARMUP` = `full` (the default:
 every 128-token class; about a minute on a 16k step), `fast` (the tuners'
 bucket grid only: seconds), `off`, a budget in seconds (`120`) or
-`<level>:<seconds>` (`fast:30`); the budget (default 300 s; 900 s for
-TokenSpeed, whose plan holds the chunk remainders, below) bounds the pass:
-it ends between shapes, the remaining ones named in the log, and each
-request's timeout is clamped to what is left of it (one second at least), so
-a shape that hangs cannot hold readiness past the budget. On the Rust path the
+`<level>:<seconds>` (`fast:30`). The budget `B` (default 300 s; 900 s for
+TokenSpeed, whose plan holds the chunk remainders, below) controls admission
+of new steps: no step starts at or after `B`. It is not a hard wall-clock
+bound for the pass. Each admitted request keeps the fixed finite ceiling
+`D = min(R, max(initial B, F))`, where `R` is the caller's request timeout and
+`F` is the timeout floor (one second by default), rather than the shrinking
+budget remainder. For wires that honor their deadlines, Generate can take
+roughly `B + D`, plus fanout and scheduling overhead. Each of the two gRPC
+cache-flush calls has its own separate 60-second deadline; generic in-process
+async flushes gain no new bound here. With the default caller timeout and
+floor, `fast:30` gives an admitted request a 30-second ceiling, so even a
+healthy 40-second cold JIT or kernel compile can time out. Its engine-side
+completion is then unconfirmed: the Rust worker stays NOT_SERVING and exits
+nonzero. On the Rust path the
 pass runs over the servicer's own gRPC port between the engine's handshake and
 SERVING, once the KV-event relay's subscription has reached the engine's
 publisher (the warm-up's batches are the engine's first, and a subscription
