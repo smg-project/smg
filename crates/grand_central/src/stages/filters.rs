@@ -164,22 +164,18 @@ impl Filter for HasRoom {
 /// Asks `$rule.$method` with the three flags of a report's sum
 /// ([`Coefficients::add_report`]) settled from the names the rule reads. A
 /// flag left on for a name it does not read would drop a row for a value
-/// nobody named. With a stage named behind the rule, the stage is asked
-/// under the rule's flags: a stage that wraps the rule.
+/// nobody named. A stage that wraps the rule asks its rule the same way.
 macro_rules! by_names {
     ($rule:expr, $method:ident($($arg:expr),*)) => {
-        by_names!($rule, $rule, $method($($arg),*))
-    };
-    ($rule:expr, $stage:expr, $method:ident($($arg:expr),*)) => {
         match ($rule.resident, $rule.waiting, $rule.kv_or_running) {
-            (false, false, false) => $stage.$method::<false, false, false>($($arg),*),
-            (false, false, true) => $stage.$method::<false, false, true>($($arg),*),
-            (false, true, false) => $stage.$method::<false, true, false>($($arg),*),
-            (false, true, true) => $stage.$method::<false, true, true>($($arg),*),
-            (true, false, false) => $stage.$method::<true, false, false>($($arg),*),
-            (true, false, true) => $stage.$method::<true, false, true>($($arg),*),
-            (true, true, false) => $stage.$method::<true, true, false>($($arg),*),
-            (true, true, true) => $stage.$method::<true, true, true>($($arg),*),
+            (false, false, false) => $rule.$method::<false, false, false>($($arg),*),
+            (false, false, true) => $rule.$method::<false, false, true>($($arg),*),
+            (false, true, false) => $rule.$method::<false, true, false>($($arg),*),
+            (false, true, true) => $rule.$method::<false, true, true>($($arg),*),
+            (true, false, false) => $rule.$method::<true, false, false>($($arg),*),
+            (true, false, true) => $rule.$method::<true, false, true>($($arg),*),
+            (true, true, false) => $rule.$method::<true, true, false>($($arg),*),
+            (true, true, true) => $rule.$method::<true, true, true>($($arg),*),
         }
     };
 }
@@ -299,23 +295,17 @@ impl HasRoomRule {
         within(used)
     }
 
-    /// [`Self::fits_with`] under the rule's own bound.
+    /// One row's word, by the report `load` hands and the row's sends as
+    /// the count holds them now. `within` closes the sum
+    /// ([`Self::fits_with`]).
     #[inline(always)]
-    fn fits<const RESIDENT: bool, const WAITING: bool, const KV_OR_RUNNING: bool>(
+    fn keep_row<const RESIDENT: bool, const WAITING: bool, const KV_OR_RUNNING: bool>(
         &self,
-        asked: f64,
         facts: &RequestFacts<'_>,
         row: &Candidate,
         load: Option<&LoadRow>,
-        sent: impl FnOnce() -> Option<DispatchCounts>,
+        within: impl FnOnce(f64) -> bool,
     ) -> bool {
-        self.fits_with::<RESIDENT, WAITING, KV_OR_RUNNING>(asked, facts, row, load, sent, |used| {
-            used <= self.bound
-        })
-    }
-
-    /// [`Filter::keep`] of one row, by the report `load` hands.
-    fn keep_with(&self, facts: &RequestFacts<'_>, row: &Candidate, load: Option<&LoadRow>) -> bool {
         // One row's word reads the count as it stands, behind the rule's
         // flag, so the two numbers come back in registers. Mapped straight
         // into the `Option`, this closure hands the pair back through
@@ -326,16 +316,25 @@ impl HasRoomRule {
                 .map_or_else(DispatchCounts::default, |sent| sent.pass(facts).counts(row))
         };
         let asked = self.asked(facts);
-        by_names!(
-            self,
-            fits(asked, facts, row, load, || self.sent.is_some().then(sent))
+        self.fits_with::<RESIDENT, WAITING, KV_OR_RUNNING>(
+            asked,
+            facts,
+            row,
+            load,
+            || self.sent.is_some().then(sent),
+            within,
         )
     }
 
-    /// One pass over the kept rows, in one loop with the test in it: the
-    /// request's part is worked once, and the profile's sends are read
-    /// through one load of its tally. The rows that fit are written over
-    /// the list's front, in the list's order.
+    /// [`Filter::keep`] of one row, by the report `load` hands.
+    fn keep_with(&self, facts: &RequestFacts<'_>, row: &Candidate, load: Option<&LoadRow>) -> bool {
+        by_names!(self, keep_row(facts, row, load, |used| used <= self.bound))
+    }
+
+    /// One pass over the kept rows: the profile's sends are read through
+    /// one load of its tally. `within` closes each row's sum
+    /// ([`Self::fits_with`]). The pass is made once for a count to read
+    /// and once for none, so a row tests neither.
     #[inline(always)]
     fn rows<const RESIDENT: bool, const WAITING: bool, const KV_OR_RUNNING: bool>(
         &self,
@@ -343,8 +342,8 @@ impl HasRoomRule {
         candidates: &[Candidate],
         kept: &mut Vec<u32>,
         load: impl Fn(&Candidate) -> Option<&LoadRow>,
+        within: impl Fn(&Candidate, f64) -> bool,
     ) {
-        let asked = self.asked(facts);
         // A count that holds no row's entry adds nothing to any sum, each
         // coefficient being finite: the pass reads no count then.
         let sends = self
@@ -352,13 +351,52 @@ impl HasRoomRule {
             .as_ref()
             .map(|sent| sent.pass(facts))
             .filter(|sends| sends.holds_any());
+        match &sends {
+            Some(sends) => self.rows_by::<RESIDENT, WAITING, KV_OR_RUNNING>(
+                facts,
+                candidates,
+                kept,
+                load,
+                |row| Some(sends.counts(row)),
+                within,
+            ),
+            None => self.rows_by::<RESIDENT, WAITING, KV_OR_RUNNING>(
+                facts,
+                candidates,
+                kept,
+                load,
+                |_| None,
+                within,
+            ),
+        }
+    }
+
+    /// [`Self::rows`] by the sends `sent` counts of each row, in one loop
+    /// with the test in it: the request's part is worked once. The rows
+    /// that fit are written over the list's front, in the list's order.
+    #[inline(always)]
+    fn rows_by<const RESIDENT: bool, const WAITING: bool, const KV_OR_RUNNING: bool>(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &mut Vec<u32>,
+        load: impl Fn(&Candidate) -> Option<&LoadRow>,
+        sent: impl Fn(&Candidate) -> Option<DispatchCounts>,
+        within: impl Fn(&Candidate, f64) -> bool,
+    ) {
+        let asked = self.asked(facts);
         let mut held = 0;
         for at in 0..kept.len() {
             let i = kept[at];
             let row = &candidates[i as usize];
-            let sent = || sends.as_ref().map(|sends| sends.counts(row));
-            let fits =
-                self.fits::<RESIDENT, WAITING, KV_OR_RUNNING>(asked, facts, row, load(row), sent);
+            let fits = self.fits_with::<RESIDENT, WAITING, KV_OR_RUNNING>(
+                asked,
+                facts,
+                row,
+                load(row),
+                || sent(row),
+                |used| within(row, used),
+            );
             kept[held] = i;
             held += usize::from(fits);
         }
@@ -374,7 +412,10 @@ impl HasRoomRule {
         kept: &mut Vec<u32>,
         load: impl Fn(&Candidate) -> Option<&LoadRow>,
     ) {
-        by_names!(self, rows(facts, candidates, kept, load));
+        by_names!(
+            self,
+            rows(facts, candidates, kept, load, |_, used| used <= self.bound)
+        );
     }
 }
 
@@ -537,117 +578,30 @@ impl HasRoomSignals {
         }
     }
 
-    /// [`Filter::keep`] of one row, by the report `load` hands. A drawn
-    /// row reads each signal through [`SignalColumn::read`].
+    /// [`Filter::keep`] of one row, by the report `load` hands: the rule's
+    /// word on the row ([`HasRoomRule::keep_row`]), its sum closed by the
+    /// signals. A drawn row reads each signal through
+    /// [`SignalColumn::read`].
     fn keep_with(&self, facts: &RequestFacts<'_>, row: &Candidate, load: Option<&LoadRow>) -> bool {
-        let rule = &self.rule;
-        // The count is read behind the rule's flag, as
-        // [`HasRoomRule::keep_with`] reads it and for its reason.
-        let sent = || {
-            rule.sent
-                .as_ref()
-                .map_or_else(DispatchCounts::default, |sent| sent.pass(facts).counts(row))
-        };
-        let asked = rule.asked(facts);
         by_names!(
-            rule,
-            fits_with(
-                asked,
-                facts,
-                row,
-                load,
-                || rule.sent.is_some().then(sent),
-                |mut used| {
-                    for (signal, coefficient) in &self.signals {
-                        let Some(value) = signal.read(facts, row) else {
-                            return false;
-                        };
-                        used += value * coefficient;
-                    }
-                    self.within(used, |capacity| capacity.read(facts, row))
+            self.rule,
+            keep_row(facts, row, load, |mut used| {
+                for (signal, coefficient) in &self.signals {
+                    let Some(value) = signal.read(facts, row) else {
+                        return false;
+                    };
+                    used += value * coefficient;
                 }
-            )
+                self.within(used, |capacity| capacity.read(facts, row))
+            })
         )
     }
 
-    /// One pass over the kept rows, as [`HasRoomRule::rows`] makes it. A
-    /// count that holds no row's entry is not read, as there. The pass is
-    /// made once for a count to read and once for none, so a row tests
-    /// neither.
-    #[inline(always)]
-    fn rows<const RESIDENT: bool, const WAITING: bool, const KV_OR_RUNNING: bool>(
-        &self,
-        facts: &RequestFacts<'_>,
-        candidates: &[Candidate],
-        kept: &mut Vec<u32>,
-        load: impl Fn(&Candidate) -> Option<&LoadRow>,
-    ) {
-        let sends = self
-            .rule
-            .sent
-            .as_ref()
-            .map(|sent| sent.pass(facts))
-            .filter(|sends| sends.holds_any());
-        match &sends {
-            Some(sends) => self.rows_by::<RESIDENT, WAITING, KV_OR_RUNNING>(
-                facts,
-                candidates,
-                kept,
-                load,
-                |row| Some(sends.counts(row)),
-            ),
-            None => self.rows_by::<RESIDENT, WAITING, KV_OR_RUNNING>(
-                facts,
-                candidates,
-                kept,
-                load,
-                |_| None,
-            ),
-        }
-    }
-
-    /// [`Self::rows`] by the sends `sent` counts of each row. The facts'
-    /// cells and each signal's oldest instant still read are taken once a
-    /// pass, and a row's cells once a row.
-    #[inline(always)]
-    fn rows_by<const RESIDENT: bool, const WAITING: bool, const KV_OR_RUNNING: bool>(
-        &self,
-        facts: &RequestFacts<'_>,
-        candidates: &[Candidate],
-        kept: &mut Vec<u32>,
-        load: impl Fn(&Candidate) -> Option<&LoadRow>,
-        sent: impl Fn(&Candidate) -> Option<DispatchCounts>,
-    ) {
-        let rule = &self.rule;
-        let asked = rule.asked(facts);
-        let sums = SignalSums::new(facts, &self.signals);
-        let capacity_oldest = self
-            .capacity
-            .as_ref()
-            .map_or(0, |capacity| capacity.oldest(facts));
-        let mut held = 0;
-        for at in 0..kept.len() {
-            let i = kept[at];
-            let row = &candidates[i as usize];
-            let fits = rule.fits_with::<RESIDENT, WAITING, KV_OR_RUNNING>(
-                asked,
-                facts,
-                row,
-                load(row),
-                || sent(row),
-                |used| {
-                    let cells = sums.row(row);
-                    let (used, whole) = sums.add(used, cells);
-                    whole && self.within(used, |capacity| capacity.among(cells?, capacity_oldest))
-                },
-            );
-            kept[held] = i;
-            held += usize::from(fits);
-        }
-        kept.truncate(held);
-    }
-
-    /// [`Filter::retain`], by the report `load` hands of each row.
+    /// [`Filter::retain`], by the report `load` hands of each row: the
+    /// rule's pass over the kept rows ([`HasRoomRule::rows`]), each row's
+    /// sum closed by the signals. The facts' cells and each signal's oldest
+    /// instant still read are taken once a pass, and a row's cells once a
+    /// row.
     fn retain_with(
         &self,
         facts: &RequestFacts<'_>,
@@ -655,7 +609,19 @@ impl HasRoomSignals {
         kept: &mut Vec<u32>,
         load: impl Fn(&Candidate) -> Option<&LoadRow>,
     ) {
-        by_names!(self.rule, self, rows(facts, candidates, kept, load));
+        let sums = SignalSums::new(facts, &self.signals);
+        let capacity_oldest = self
+            .capacity
+            .as_ref()
+            .map_or(0, |capacity| capacity.oldest(facts));
+        by_names!(
+            self.rule,
+            rows(facts, candidates, kept, load, |row, used| {
+                let cells = sums.row(row);
+                let (used, whole) = sums.add(used, cells);
+                whole && self.within(used, |capacity| capacity.among(cells?, capacity_oldest))
+            })
+        );
     }
 }
 
