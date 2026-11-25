@@ -2,6 +2,7 @@
 
 mod decode_again;
 mod named;
+mod ring_words;
 mod ruled;
 
 use std::panic::{catch_unwind, AssertUnwindSafe};

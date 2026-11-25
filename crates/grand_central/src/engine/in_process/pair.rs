@@ -3529,6 +3529,49 @@ mod tests {
         assert_eq!(placed(3), (0, 2));
     }
 
+    /// Each side of a pair whose two sides read the lent ring by two words
+    /// is placed from its own places: the prefill side from the request's
+    /// list, the decode side from the list stated for it
+    /// ([`RequestFacts::decode_ring_positions`]), as each of the gateway's
+    /// two policies walks the pair's one ring from its own place
+    /// (`model_gateway/src/routers/common/placement.rs`, lines 3016 to 3031
+    /// and 3098 to 3101 at a06805492). The plain ring ahead of the prefix
+    /// form, and the reverse. A decode side stated no list of its own reads
+    /// the request's one list. One stated an empty list is placed by its
+    /// stage's own ring, and the prefill side keeps its place.
+    #[test]
+    fn each_side_of_a_pair_of_two_ring_words_places_from_its_own_places() {
+        let address = |at: &str| format!("grpc://{at}:9000");
+        let model = "decode-1 prefill-2 decode-0 prefill-0 prefill-1 decode-2";
+        let ring = InOrder(model.split(' ').map(address).collect());
+        let (plain, prefix) = ("consistent_hashing", "prefix_hash");
+        for (prefill, decode) in [(plain, prefix), (prefix, plain)] {
+            let document = PolicySpec::pair_presets(prefill, decode);
+            let spec = AppliedSpec::validate(&document.expect("the pair presets"));
+            let host = Host::under((spec.expect("a valid document"), Arc::default()), 3, 3);
+            let placed = |position: u64, decode_ring_positions: Option<&[u64]>| {
+                let classes = every(3, 3);
+                let positions = [position];
+                // The host's own request over its two lists, every pair open.
+                let Asks(mut request, lists, _) = host.asks(&classes, false);
+                request.facts = RequestFacts {
+                    ring: Some(&ring),
+                    ring_positions: &positions,
+                    decode_ring_positions,
+                    ..keyed()
+                };
+                let now = Instant::now();
+                host.picked(&lists.decide(&host.engine, None, now, &mut request, None))
+            };
+            // The prefill from the first place and the decode from the
+            // fourth, then the reverse.
+            assert_eq!(placed(0, Some(&[3])), (2, 2), "{prefill}, {decode}");
+            assert_eq!(placed(3, Some(&[0])), (0, 1), "{prefill}, {decode}");
+            assert_eq!(placed(0, None), (2, 1), "{prefill}, {decode}");
+            assert_eq!(placed(0, Some(&[])).0, 2, "{prefill}, {decode}");
+        }
+    }
+
     /// The stock presets of a pair as a document in force, round robin for
     /// its prefills and `decode` for its decodes, with the list its stages'
     /// words would be kept in.

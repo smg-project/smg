@@ -8623,6 +8623,136 @@ pub(crate) mod tests {
         assert_eq!(engine.classic_made_or_asked(), 0);
     }
 
+    /// A pair whose two sides read the model's ring by two words is placed
+    /// where its two classic policies place it. Classic reads the model's
+    /// one ring once for a pair and hands it to both policies (lines 3016
+    /// to 3031 and 3098 to 3101 of this file at a06805492), and each walks
+    /// it from its own place: the ring policy from its key's text
+    /// (`find_by_consistent_hash`,
+    /// `model_gateway/src/policies/consistent_hashing.rs`, lines 84 to
+    /// 140), the prefix policy from a head of the request
+    /// (`select_worker_impl` and `find_worker_with_load_balance`,
+    /// `model_gateway/src/policies/prefix_hash.rs`, lines 282 to 413), and
+    /// two prefix policies of two depths from two heads of one prompt. The
+    /// engine states each side its own places on the ring the gateway
+    /// lends. Three pairs: the ring policy ahead of the prefix policy, the
+    /// reverse, and two prefix policies that cut a prompt at two depths.
+    /// Each request carries what both policies place by: a prompt, and a
+    /// routing key or its client's address.
+    #[test]
+    fn the_engine_places_a_pair_of_two_ring_words_where_its_classic_policies_do() {
+        use crate::{
+            config::{RouterConfig, RoutingMode},
+            policies::PolicyFactory,
+        };
+
+        let prefix = |prefix_token_count: usize| PolicyConfig::PrefixHash {
+            prefix_token_count,
+            load_factor: 1.25,
+            balance_abs_threshold: 10,
+            cache_boundaries: vec![],
+        };
+        let fleet: Vec<(String, WorkerType)> = (0..8)
+            .flat_map(|at| {
+                [
+                    (format!("grpc://p{at}:1"), WorkerType::Prefill),
+                    (format!("grpc://d{at}:1"), WorkerType::Decode),
+                ]
+            })
+            .collect();
+        let listed: Vec<_> = fleet
+            .iter()
+            .map(|(url, role)| (url.as_str(), *role, Some("NixlConnector")))
+            .collect();
+        // A prompt of the set that carries no routing key is sent by a
+        // client of its own: the ring policy places it by that address.
+        let requests: Vec<Prefixed> = prefix_placed()
+            .into_iter()
+            .enumerate()
+            .map(|(at, (name, tokens, text, mut headers))| {
+                if headers.is_empty() {
+                    let client = format!("10.0.1.{at}").parse().expect("a header value");
+                    headers.insert("x-forwarded-for", client);
+                }
+                (name, tokens, text, headers)
+            })
+            .collect();
+        for (pair, prefill, decode) in [
+            (
+                "the ring ahead of the prefix",
+                PolicyConfig::ConsistentHashing,
+                prefix(256),
+            ),
+            (
+                "the prefix ahead of the ring",
+                prefix(256),
+                PolicyConfig::ConsistentHashing,
+            ),
+            ("two depths", prefix(256), prefix(128)),
+        ] {
+            let settings = RouterConfig {
+                mode: RoutingMode::PrefillDecode {
+                    prefill_urls: vec![],
+                    decode_urls: vec![],
+                    prefill_policy: Some(prefill.clone()),
+                    decode_policy: Some(decode.clone()),
+                },
+                policy: prefill.clone(),
+                ..Default::default()
+            };
+            let registry = pd_registry(&listed);
+            let classic = PolicyRegistry::new(prefill.clone());
+            classic.set_prefill_policy(PolicyFactory::create_from_config(&prefill));
+            classic.set_decode_policy(PolicyFactory::create_from_config(&decode));
+            let engine = PolicyRegistry::for_engine(
+                settings.policy.clone(),
+                settings.routing_key_override.clone(),
+            );
+            let document = settings.policy_document().expect("the settings' document");
+            let spec = AppliedSpec::validate(&document).expect("a valid document");
+            engine_on(&engine, spec);
+            let placed = |policies: &PolicyRegistry, inputs: PlacementInputs<'_>| {
+                let pairs = pairs_of(&registry, policies);
+                let placed = select_pair(
+                    &registry,
+                    policies,
+                    MODEL,
+                    &pairs,
+                    None,
+                    None,
+                    inputs,
+                    Stated::nothing,
+                );
+                let placed = placed.expect("a pair is open");
+                (
+                    placed.prefill.url().to_owned(),
+                    placed.decode.url().to_owned(),
+                )
+            };
+            let mut prefills = std::collections::BTreeSet::new();
+            let mut decodes = std::collections::BTreeSet::new();
+            for (name, tokens, text, headers) in &requests {
+                let inputs = PlacementInputs {
+                    tokens: tokens.as_deref(),
+                    text: text.as_deref(),
+                    headers: Some(headers),
+                    ..Default::default()
+                };
+                let by_classic = placed(&classic, inputs);
+                assert_eq!(placed(&engine, inputs), by_classic, "{pair}: {name}");
+                prefills.insert(by_classic.0);
+                decodes.insert(by_classic.1);
+            }
+            assert!(
+                prefills.len() > 3,
+                "{pair}: the prefills spread: {prefills:?}"
+            );
+            assert!(decodes.len() > 3, "{pair}: the decodes spread: {decodes:?}");
+            assert!(registry.get_routing_snapshot(MODEL).hash_ring_is_filled());
+            assert_eq!(engine.classic_made_or_asked(), 0, "{pair}");
+        }
+    }
+
     /// A model's first prompts, before a ring is kept for it, go where the
     /// `prefix_hash` policy sends them with no ring: to the worker with the
     /// fewest requests. The engine is lent a ring that holds no worker and

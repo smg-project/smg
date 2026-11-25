@@ -1009,6 +1009,7 @@ pub struct RequestFacts<'a> {
     pub now_micros: u64,           // the host's clock at the decision
     pub ring: Option<&'a dyn LentRing>, // the hash ring the host keeps, lent to this decision
     pub ring_positions: &'a [u64], // where the request stands on that ring, as the host states it
+    pub decode_ring_positions: Option<&'a [u64]>, // a pair's decode side's own places, where its two sides read the ring by two words
     // six more fields: `affinity`, `named`, `signal_cells`, `session_counted`,
     // `session_key_from_rid` and `model_fingerprint`, which 5.8 removes
 }
@@ -1663,10 +1664,17 @@ id as a source, the value it hands is no head: it names the session alone, as cl
 header's key and never the id's. A
 ring whose lender places no head answers nothing: such a request is lent no ring, the lender is
 asked about no further head, and the stage's own ring places the request. A request that has no
-head states no place and is lent no ring either. Neither is a pair whose two sides read the ring
-by two forms, or cut a prompt at two depths: each side's stage then places by its own ring.
+head states no place and is lent no ring either.
 The items of an encode request are placed on that one ring too, each by its own text, where the
 encode profile's ring stage reads it.
+
+A pair is lent the one ring for its two lists, and where its two sides read it by one word, one
+list of places is both sides'. Where they read it by two forms, or cut a prompt at two depths, each
+side is stated what a single request of its own profile is stated: the request's facts carry the
+decode side's list beside the prefill side's (`RequestFacts::decode_ring_positions`), and each
+side's stage walks the lent ring from its own places, as each classic policy walks the model's
+ring from its own. A side whose own profile reads the ring by two words is stated nothing, as a
+single request of that profile is, and its stage places by its own ring.
 
 ### 8.2 The contract as designed **[partly]**
 
@@ -2831,8 +2839,10 @@ Five things follow, and they are the first work of section 16.
    With a lent ring a request's place is the host's to state, so these 16 test the host's
    recipe. In the crate they stay on the crate's own ring with its own hashes, which a caller
    that lends no ring still runs: 15 hold classic's shares, as on main, and one is held apart.
-   A gateway runs that ring for some requests, among them a pair whose two sides read the ring
-   by two forms, or cut a prompt at two depths: such a pair is lent no ring (section 8.1).
+   A gateway runs that ring for some requests, among them a shadow profile whose live profile
+   reads the ring too, by another word: such a shadow is lent no ring (`Engine::unlent`). A
+   single binding's shadow beside a live profile that reads no ring is lent it, and stated its
+   own place.
    Classic's key recipe and its ring lookup are functions that classic and the lender both call
    (`PrefixHashPolicy::ring_key` and `HashRing::walk_from` in `model_gateway/src/policies/`), and
    gateway tests place the policy's own requests through classic and through the engine, worker

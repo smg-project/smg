@@ -1020,9 +1020,11 @@ impl Engine {
             // value's, or its prompt's heads': no item is placed by them.
             // A key's run is stated the key's own place, on the ring lent
             // for the items, where that run is made below. The passes
-            // over the encoders ahead of it read no ring.
+            // over the encoders ahead of it read no ring. The decode
+            // side's own places are that side's alone.
             ring: None,
             ring_positions: &[],
+            decode_ring_positions: None,
             // The word says how the request's own key came. An item's key
             // is its content's, whatever handed the request's: it leads
             // the item under every form of the ring.

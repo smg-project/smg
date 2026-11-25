@@ -1574,6 +1574,7 @@ mod tests {
             client_key: 0,
             ring: None,
             ring_positions: &[],
+            decode_ring_positions: None,
             session_key_from_rid: false,
         };
         let exposure = Exposure {

@@ -3171,9 +3171,10 @@ fn a_lender_that_declines_a_head_is_asked_nothing_more() {
 /// ([`RequestFacts::ring`]). The prefix form is lent it by the same rule,
 /// and states the lender's place of the routing value as a head. A side
 /// that reads no ring holds nothing back. A pair with no ring stage is
-/// lent none, and neither is a pair of two ring forms or of two depths,
-/// whose one list of places would be one side's alone: the caller's ring
-/// is asked nothing.
+/// lent none: the caller's ring is asked nothing. A pair of two ring forms
+/// or of two depths has no one list of places, and the engine's two
+/// questions answer nothing for it: each of its sides is stated its own
+/// (`pair::ring_words`).
 #[test]
 fn a_pairs_request_is_lent_the_ring_a_side_of_it_places_by() {
     let list = pool(2);
@@ -3209,16 +3210,6 @@ fn a_pairs_request_is_lent_the_ring_a_side_of_it_places_by() {
     assert_eq!(stated(pair(prefixed, plain), &ring), lent);
     let none = (false, Vec::new());
     assert_eq!(stated(pair(plain, plain), &Unasked), none);
-    assert_eq!(stated(pair(prefixed, ringed), &Unasked), none);
-    assert_eq!(stated(pair(ringed, prefixed), &Unasked), none);
-    let mut two_depths = pair(prefixed, prefixed);
-    let decode = two_depths.profiles.get_mut("decode").expect("the side");
-    decode.score[0] = ScoreStage::ConsistentHash(ConsistentHashParams {
-        prefix_tokens: Some(128),
-        ..ConsistentHashParams::default()
-    })
-    .into();
-    assert_eq!(stated(two_depths, &Unasked), none);
     // The engine's own word, phase by phase: a pair asked at its prefill
     // is answered for both its profiles, and a decode asked alone for its
     // own.
@@ -3231,6 +3222,7 @@ fn a_pairs_request_is_lent_the_ring_a_side_of_it_places_by() {
     assert_eq!(depths(pair(prefixed, plain)), [Some(256), None]);
     assert_eq!(depths(pair(plain, prefixed)), [Some(256), Some(256)]);
     assert_eq!(depths(pair(prefixed, ringed)), [None, None]);
+    assert_eq!(depths(pair(ringed, prefixed)), [None, Some(256)]);
 }
 
 /// An `epd` binding pairs its prefill and its decode as a `pd-pair`
