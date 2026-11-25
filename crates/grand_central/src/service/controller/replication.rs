@@ -1054,7 +1054,8 @@ mod tests {
         },
         stages::registry,
         store::{
-            LeasesStore, MembershipChange, WorkerFacts, WorkerRow, WorkerStatus, WorkersStore,
+            LeasesStore, MembershipChange, Registrant, WorkerFacts, WorkerRow, WorkerStatus,
+            WorkersStore,
         },
     };
 
@@ -1068,6 +1069,9 @@ mod tests {
     struct Leader {
         elector: Elector,
         store: Arc<MemoryStore>,
+        /// The holder of the leader's worker objects: the cases write its
+        /// rows through it, and its cuts are taken from it.
+        objects: Arc<Objects<Members>>,
         log: Arc<Log>,
         term: u64,
         at: Instant,
@@ -1090,6 +1094,7 @@ mod tests {
             };
             Self {
                 elector,
+                objects: holder(&store),
                 store,
                 log: feed.log,
                 term,
@@ -1104,14 +1109,16 @@ mod tests {
             leader
         }
 
-        /// A holder of the leader's worker objects, for a cut. The cases
-        /// write their rows through the store's own entries, which take no
-        /// turn of a holder: this one follows the store once, as the host
-        /// of such a store has it follow.
+        /// The holder of the leader's worker objects, for a cut.
         fn objects(&self) -> Arc<Objects<Members>> {
-            let objects = holder(&self.store);
-            objects.follow(&*self.store);
-            objects
+            Arc::clone(&self.objects)
+        }
+
+        /// `facts` written through the leader's holder, as its registration
+        /// call writes a row: the row's id.
+        fn registers(&self, facts: WorkerFacts) -> WorkerId {
+            let written = self.objects.upsert(&self.store, facts, Registrant::Control);
+            written.expect("the store takes the write").id()
         }
 
         fn replication(&self) -> Replication {
@@ -1143,17 +1150,14 @@ mod tests {
         /// One worker and `more` watched writes behind it: generations by
         /// their numbers alone, each one small entry of the log.
         fn writes(&self, more: u32) -> WorkerId {
-            let id = self
-                .store
-                .upsert(WorkerFacts {
-                    key: "http://a:8000".to_owned(),
-                    engine: "http://a:8000".to_owned(),
-                    incarnation: 1,
-                    models: vec!["m".to_owned()],
-                    dp_size: 1,
-                    ..WorkerFacts::default()
-                })
-                .id();
+            let id = self.registers(WorkerFacts {
+                key: "http://a:8000".to_owned(),
+                engine: "http://a:8000".to_owned(),
+                incarnation: 1,
+                models: vec!["m".to_owned()],
+                dp_size: 1,
+                ..WorkerFacts::default()
+            });
             for generation in 1..=more {
                 Journal::generation(&*self.log, None, u64::from(generation));
             }
@@ -1173,7 +1177,7 @@ mod tests {
                     dp_size: 1,
                     ..WorkerFacts::default()
                 };
-                let _id = self.store.upsert(facts).id();
+                let _id = self.registers(facts);
             }
         }
     }
@@ -1470,7 +1474,7 @@ mod tests {
         // that holds three labels at a value's bound: an event carries the
         // row it replaced beside the row it wrote.
         for incarnation in 1..=257 {
-            leader.store.upsert(WorkerFacts {
+            leader.registers(WorkerFacts {
                 key: "http://a:8000".to_owned(),
                 engine: "http://a:8000".to_owned(),
                 incarnation,
@@ -1791,7 +1795,7 @@ mod tests {
                     .into(),
                 ..WorkerFacts::default()
             };
-            let _id = leader.store.upsert(facts).id();
+            let _id = leader.registers(facts);
         }
         let cut = leader.replication().cut(leader.term).expect("a cut");
         let sent = parts(Arc::clone(&cut), leader.at);
