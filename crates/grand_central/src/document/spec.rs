@@ -2280,10 +2280,10 @@ impl OverloadSwitch {
     fn of(bindings: &[BindingSpec]) -> Self {
         let on =
             |binding: &&BindingSpec| binding.overload.as_ref().is_none_or(|block| block.enabled);
-        let ons = bindings.iter().filter(on).count();
-        if ons == bindings.len() {
+        let switched_on = bindings.iter().filter(on).count();
+        if switched_on == bindings.len() {
             Self::On
-        } else if ons == 0 {
+        } else if switched_on == 0 {
             Self::Off
         } else {
             Self::Differ
