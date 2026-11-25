@@ -1096,10 +1096,10 @@ pub(crate) fn mean_in_flight(
     if rows.is_empty() {
         return 0.0;
     }
-    let sum: u64 = crate::tracking::in_flight::with_counts!(facts, |counts| rows
+    let sum: u64 = rows
         .iter()
-        .map(|&i| u64::from(counts(&candidates[i as usize])))
-        .sum());
+        .map(|&i| u64::from(facts.in_flight(&candidates[i as usize])))
+        .sum();
     sum as f32 / rows.len() as f32
 }
 
@@ -1793,8 +1793,7 @@ pub struct PoolFacts<'a> {
 mod tests {
     use super::*;
 
-    /// The one reader of a row's requests in flight returns the row's own
-    /// count.
+    /// `RequestFacts::in_flight` returns the row's own count.
     #[test]
     fn a_rows_requests_in_flight_are_the_rows_own() {
         let row = |position, in_flight| Candidate {

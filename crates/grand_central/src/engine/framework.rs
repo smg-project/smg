@@ -8815,10 +8815,11 @@ impl Engine {
     /// every stage that keeps a number of the reports
     /// ([`Lifecycle::keeps_loads`]), and to no other stage. `reports` is
     /// run once for each such stage and hands every report to the call it
-    /// is given. An engine with no such stage never runs it: a publication
-    /// that tells nobody walks no row. A plugin that watches signals hears
-    /// of a world's reports no more than it did before a stage kept any.
-    /// The engine over worker lists is the one host that tells reports.
+    /// is given. An engine with no such stage never runs it: a load
+    /// snapshot that tells nobody walks no row. A plugin that watches
+    /// signals hears of a snapshot's reports no more than it did before a
+    /// stage kept any. The engine over worker lists is the one host that
+    /// tells reports.
     #[cfg(feature = "in-process")]
     pub(crate) fn tell_loads(&self, reports: impl Fn(&mut dyn FnMut(&Signal<'_>))) {
         for keeper in &self.keepers {

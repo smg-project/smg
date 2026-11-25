@@ -34,7 +34,6 @@ use crate::{
     },
     tracking::{
         dispatch_credit::{DispatchCounts, DispatchCredit},
-        in_flight::with_counts,
         lease::{EventKind, EventSet, Lease, Membership, Outcome, ReleaseReason, Side, Signal},
     },
 };
@@ -288,11 +287,9 @@ impl Scorer for LeastRequests {
         kept: &[u32],
         out: &mut [f32],
     ) -> TieBand {
-        with_counts!(facts, |counts| {
-            for (slot, &i) in out.iter_mut().zip(kept) {
-                *slot = counts(&candidates[i as usize]) as f32;
-            }
-        });
+        for (slot, &i) in out.iter_mut().zip(kept) {
+            *slot = facts.in_flight(&candidates[i as usize]) as f32;
+        }
         normalize_costs(out);
         TieBand::NORMALIZED
     }
@@ -1167,29 +1164,17 @@ impl Credits {
         self.tally.load().get(&rank).map(Arc::clone)
     }
 
-    /// The tally without the ranks `gone` names: the map replaced whole, as a
-    /// membership change is rare and a decision never waits on it. Each
-    /// entry that went is shown to `dropped` once the tally finds it no
-    /// more: a word that reached it earlier may still hold it.
-    fn forget(&self, gone: impl Fn(&RankKey) -> bool, mut dropped: impl FnMut(&RankCredit)) {
-        let mut went: Vec<Arc<RankCredit>> = Vec::new();
+    /// The tally without the ranks `gone` names: the table laid anew where a
+    /// rank goes and kept as it stands where none does, as a membership change
+    /// is rare and a decision never waits on it.
+    fn forget(&self, gone: impl Fn(&RankKey) -> bool) {
         self.tally.rcu(|tally| {
-            went.clear();
             // A change that takes no rank keeps the table it found.
             if !tally.keys().any(&gone) {
                 return Arc::clone(tally);
             }
-            Arc::new(tally.retained(|rank, since| {
-                let stays = !gone(rank);
-                if !stays {
-                    went.push(Arc::clone(since));
-                }
-                stays
-            }))
+            Arc::new(tally.retained(|rank, _| !gone(rank)))
         });
-        for since in &went {
-            dropped(since);
-        }
     }
 
     /// Credits the rank a dispatch landed on. `credit` is handed the
@@ -1245,9 +1230,8 @@ impl Credits {
     }
 
     /// Drops the ranks a membership change takes away, and at a join the
-    /// ranks held under the joining id, each entry that goes shown to
-    /// `dropped` first.
-    pub(crate) fn membership(&self, change: &Membership<'_>, dropped: impl FnMut(&RankCredit)) {
+    /// ranks held under the joining id.
+    pub(crate) fn membership(&self, change: &Membership<'_>) {
         match change {
             // Every rank of the worker goes with it. A resized worker's ranks
             // are a new set: what a vanished rank held would never release,
@@ -1256,7 +1240,7 @@ impl Credits {
             Membership::Removed(id)
             | Membership::Replaced { old: id, .. }
             | Membership::Resized(id) => {
-                self.forget(|(worker, _)| worker == id, dropped);
+                self.forget(|(worker, _)| worker == id);
             }
             // A join drops what a dispatch told behind the id's removal
             // entered: the worker that joins took none of those sends. A
@@ -1265,7 +1249,7 @@ impl Credits {
             // finds no rank of its id copies no map.
             Membership::Added(id) => {
                 if self.tally.load().keys().any(|(worker, _)| worker == id) {
-                    self.forget(|(worker, _)| worker == id, dropped);
+                    self.forget(|(worker, _)| worker == id);
                 }
             }
             // A snapshot (every worker of every pool, after a resync) stands
@@ -1274,10 +1258,7 @@ impl Credits {
             Membership::Snapshot(ids) => {
                 let mut sorted: Vec<u64> = ids.iter().map(|w| w.0).collect();
                 sorted.sort_unstable();
-                self.forget(
-                    |(worker, _)| sorted.binary_search(&worker.0).is_err(),
-                    dropped,
-                );
+                self.forget(|(worker, _)| sorted.binary_search(&worker.0).is_err());
             }
             Membership::Relabelled(_) | Membership::Left { .. } => {}
         }
@@ -1383,18 +1364,16 @@ impl ResidentWork {
             0.0
         };
         let in_flight_work = self.mean_prefill_tokens as f32 + self.request_tokens as f32;
-        with_counts!(facts, |counts| {
-            for (slot, &i) in out.iter_mut().zip(kept) {
-                if *slot == PENDING {
-                    let in_flight = counts(&candidates[i as usize]) as f32;
-                    *slot = if fleet_reports {
-                        peer_baseline + in_flight * in_flight_work
-                    } else {
-                        in_flight
-                    };
-                }
+        for (slot, &i) in out.iter_mut().zip(kept) {
+            if *slot == PENDING {
+                let in_flight = facts.in_flight(&candidates[i as usize]) as f32;
+                *slot = if fleet_reports {
+                    peer_baseline + in_flight * in_flight_work
+                } else {
+                    in_flight
+                };
             }
-        });
+        }
     }
 }
 
@@ -1449,7 +1428,9 @@ impl ResidentWork {
 
 impl ResidentWork {
     /// The rows' costs, and how many of them report: every row by its
-    /// report and its credit, under one load of the tally.
+    /// report and its credit, under one load of the tally. Out of line:
+    /// inlined into the score, the bench's cell `resident_work` ran 103
+    /// instructions a decision more at 64 workers and 10 fewer at 8.
     #[inline(never)]
     fn cost_own(
         &self,
@@ -1495,7 +1476,7 @@ impl Lifecycle for ResidentWork {
     }
 
     fn on_membership(&self, change: &Membership<'_>) {
-        self.credits.membership(change, |_| {});
+        self.credits.membership(change);
     }
 
     /// The dispatch: a credit is counted from it.
@@ -1628,14 +1609,12 @@ impl LeastCost {
     fn cost_of<const RESIDENT: bool, const WAITING: bool, const KV_OR_RUNNING: bool>(
         &self,
         load: Option<&LoadRow>,
-        reads_count: bool,
-        count: impl Fn() -> u32,
+        in_flight: u32,
     ) -> RowCost {
-        let in_flight = reads_count.then(&count);
-        let sum = 0.0 + f64::from(in_flight.unwrap_or_default()) * self.terms.in_flight;
+        let sum = 0.0 + f64::from(in_flight) * self.terms.in_flight;
         let missing = || {
             self.request_cost.map_or(RowCost::Sum(sum), |price| {
-                RowCost::OverLeast(f64::from(in_flight.unwrap_or_else(count)) * price)
+                RowCost::OverLeast(f64::from(in_flight) * price)
             })
         };
         match load {
@@ -1660,16 +1639,12 @@ impl LeastCost {
         costs: &mut Vec<RowCost>,
         load: impl Fn(&Candidate) -> Option<&LoadRow>,
         counts: impl Fn(&Candidate) -> u32,
-        reads_count: bool,
     ) -> (CostBounds, bool) {
         let mut bounds = CostBounds::EMPTY;
         let mut pending = false;
         costs.extend(kept.iter().map(|&i| {
             let row = &candidates[i as usize];
-            let cost =
-                self.cost_of::<RESIDENT, WAITING, KV_OR_RUNNING>(load(row), reads_count, || {
-                    counts(row)
-                });
+            let cost = self.cost_of::<RESIDENT, WAITING, KV_OR_RUNNING>(load(row), counts(row));
             match cost {
                 RowCost::Sum(sum) => bounds.include(sum),
                 RowCost::OverLeast(_) => pending = true,
@@ -1688,43 +1663,22 @@ impl LeastCost {
         costs: &mut Vec<RowCost>,
         load: impl Fn(&Candidate) -> Option<&LoadRow>,
         counts: impl Fn(&Candidate) -> u32,
-        reads_count: bool,
     ) -> (CostBounds, bool) {
         let resident = self.terms.resident_tokens != 0.0;
         let waiting = self.terms.waiting_uncached_tokens != 0.0;
         match (resident, waiting) {
-            (false, false) => self.sum_rows::<false, false, KV_OR_RUNNING>(
-                candidates,
-                kept,
-                costs,
-                load,
-                counts,
-                reads_count,
-            ),
-            (false, true) => self.sum_rows::<false, true, KV_OR_RUNNING>(
-                candidates,
-                kept,
-                costs,
-                load,
-                counts,
-                reads_count,
-            ),
-            (true, false) => self.sum_rows::<true, false, KV_OR_RUNNING>(
-                candidates,
-                kept,
-                costs,
-                load,
-                counts,
-                reads_count,
-            ),
-            (true, true) => self.sum_rows::<true, true, KV_OR_RUNNING>(
-                candidates,
-                kept,
-                costs,
-                load,
-                counts,
-                reads_count,
-            ),
+            (false, false) => {
+                self.sum_rows::<false, false, KV_OR_RUNNING>(candidates, kept, costs, load, counts)
+            }
+            (false, true) => {
+                self.sum_rows::<false, true, KV_OR_RUNNING>(candidates, kept, costs, load, counts)
+            }
+            (true, false) => {
+                self.sum_rows::<true, false, KV_OR_RUNNING>(candidates, kept, costs, load, counts)
+            }
+            (true, true) => {
+                self.sum_rows::<true, true, KV_OR_RUNNING>(candidates, kept, costs, load, counts)
+            }
         }
     }
 
@@ -1736,16 +1690,14 @@ impl LeastCost {
         costs: &mut Vec<RowCost>,
         load: impl Fn(&Candidate) -> Option<&LoadRow>,
     ) -> (CostBounds, bool) {
-        // Every row carries its count: `written` is true, and the walk
-        // reads it.
-        with_counts!(facts, |counts, written| {
-            let reads_count = written || self.terms.in_flight != 0.0;
-            if self.terms.names_kv_or_running() {
-                self.walk::<true>(candidates, kept, costs, load, counts, reads_count)
-            } else {
-                self.walk::<false>(candidates, kept, costs, load, counts, reads_count)
-            }
-        })
+        // Every row carries its count, and the walk reads it where it
+        // costs the row.
+        let counts = |row: &Candidate| facts.in_flight(row);
+        if self.terms.names_kv_or_running() {
+            self.walk::<true>(candidates, kept, costs, load, counts)
+        } else {
+            self.walk::<false>(candidates, kept, costs, load, counts)
+        }
     }
 }
 
@@ -1977,30 +1929,28 @@ impl ReadsLoad for LeastCostSignals {
             // instant still read. Once a row: the row's cells.
             let signals = SignalSums::new(facts, &self.signals);
             let mut bounds = CostBounds::EMPTY;
-            with_counts!(facts, |counts| {
-                for (&i, cost) in kept.iter().zip(costs.iter_mut()) {
-                    let RowCost::Sum(sum) = cost else {
-                        continue;
-                    };
-                    let row = &candidates[i as usize];
-                    if let Some(sends) = &sends {
-                        let sent = sends.counts(row);
-                        terms.add_sent(sum, sent);
-                    }
-                    let (priced, whole) = signals.add(*sum, signals.row(row));
-                    *sum = priced;
-                    // A signal with no fresh value leaves the row open under
-                    // `over-least`, as no report does in the walk: its sum
-                    // is dropped and its requests in flight price it.
-                    match self.cost.request_cost.filter(|_| !whole) {
-                        Some(price) => {
-                            *cost = RowCost::OverLeast(f64::from(counts(row)) * price);
-                            pending = true;
-                        }
-                        None => bounds.include(priced),
-                    }
+            for (&i, cost) in kept.iter().zip(costs.iter_mut()) {
+                let RowCost::Sum(sum) = cost else {
+                    continue;
+                };
+                let row = &candidates[i as usize];
+                if let Some(sends) = &sends {
+                    let sent = sends.counts(row);
+                    terms.add_sent(sum, sent);
                 }
-            });
+                let (priced, whole) = signals.add(*sum, signals.row(row));
+                *sum = priced;
+                // A signal with no fresh value leaves the row open under
+                // `over-least`, as no report does in the walk: its sum
+                // is dropped and its requests in flight price it.
+                match self.cost.request_cost.filter(|_| !whole) {
+                    Some(price) => {
+                        *cost = RowCost::OverLeast(f64::from(facts.in_flight(row)) * price);
+                        pending = true;
+                    }
+                    None => bounds.include(priced),
+                }
+            }
             self.cost.price_and_score(out, costs, bounds, pending)
         })
     }
@@ -2518,7 +2468,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_sum_and_the_missing_report_price_share_one_count() {
+    fn a_row_with_no_report_is_priced_by_its_count_over_least() {
         let stage = LeastCost::new(
             Box::new([
                 (CostTerm::InFlight, 2.0),
@@ -2527,8 +2477,7 @@ pub(crate) mod tests {
             CostMargin::default(),
             Some(Unreported::OverLeast { request_cost: 4.0 }),
         );
-        let count = Cell::new(13);
-        let missing = stage.cost_of::<false, false, false>(None, true, || count.replace(29));
+        let missing = stage.cost_of::<false, false, false>(None, 13);
         assert_eq!(cost_bits(missing), (true, 52.0f64.to_bits()));
     }
 

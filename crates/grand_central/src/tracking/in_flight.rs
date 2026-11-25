@@ -22,15 +22,14 @@ use crate::engine::view::Session;
 /// The place of one worker's count in the store's counts. A member is
 /// given its slot at the membership write that first files it and keeps
 /// it while its row stands, and no other member is given it after.
-/// In-process only: the store gives a slot, and a host that keeps no
-/// counts names [`WorkerSlot::NONE`].
+/// In-process only: the store gives a slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct WorkerSlot(u32);
+pub(crate) struct WorkerSlot(u32);
 
 impl WorkerSlot {
     /// The slot that names no cell: its count reads zero and books
     /// nothing. What a table that gave every slot gives.
-    pub const NONE: Self = Self(u32::MAX);
+    pub(crate) const NONE: Self = Self(u32::MAX);
 }
 
 /// The cells of the first piece of the counts; each piece after holds
@@ -435,25 +434,6 @@ impl InFlightCounts {
     }
 }
 
-/// Runs a walk of rows with the reader of the rows' requests in flight, a
-/// function of a row. A walk reads what the request's one reader reads
-/// ([`RequestFacts::in_flight`](crate::engine::RequestFacts::in_flight)),
-/// the row's own count, and a stage that reads a row or two asks that. The
-/// form `|counts, written|` also binds `written`, which is true: every row
-/// carries its count.
-macro_rules! with_counts {
-    ($facts:expr, |$counts:ident| $walk:expr) => {
-        $crate::tracking::in_flight::with_counts!($facts, |$counts, _written| $walk)
-    };
-    ($facts:expr, |$counts:ident, $written:ident| $walk:expr) => {{
-        let facts: &$crate::engine::view::RequestFacts<'_> = $facts;
-        let $counts = move |row: &$crate::engine::view::Candidate| facts.in_flight(row);
-        let $written = true;
-        $walk
-    }};
-}
-pub(crate) use with_counts;
-
 #[cfg(test)]
 mod tests {
     use std::{
@@ -465,23 +445,7 @@ mod tests {
     };
 
     use super::{InFlightCounts, WorkerSlot};
-    use crate::engine::view::{Candidate, RequestFacts, Session};
-
-    /// A walk is handed the reader of its rows' counts: each row's own
-    /// field.
-    #[test]
-    fn a_walk_reads_each_rows_own_count() {
-        let row = |position, in_flight| Candidate {
-            position,
-            in_flight,
-            ..Candidate::default()
-        };
-        let rows = [row(0, 4), row(1, 2)];
-        let read = |facts: &RequestFacts<'_>, rows: &[Candidate]| -> Vec<u32> {
-            with_counts!(facts, |counts| rows.iter().map(counts).collect())
-        };
-        assert_eq!(read(&RequestFacts::default(), &rows), [4, 2]);
-    }
+    use crate::engine::view::Session;
 
     /// Two files book one worker where it serves two models: a write is one
     /// atomic step, so no booking of either writer is lost under the
