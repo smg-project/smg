@@ -203,6 +203,18 @@ pub trait GenerationRequest: Send + Sync {
     /// Extract text content for routing decisions
     fn extract_text_for_routing(&self) -> String;
 
+    /// The text the routing policies key on: by default the text of
+    /// [`Self::extract_text_for_routing`]. A protocol whose content holds
+    /// parts that are no text (an image, a clip, a file) writes a marker at
+    /// the place of each, so two requests part where a backend's prefix
+    /// cache parts them. Every reader of the routing text sees the markers:
+    /// a reader of the prompt's size counts each as one word of 256
+    /// characters. A reader that must count the words of the text alone
+    /// reads `extract_text_for_routing`.
+    fn routing_text(&self) -> String {
+        self.extract_text_for_routing()
+    }
+
     /// Token IDs for routing when the request is already tokenized.
     /// Some(_) routes on the token radix tree instead of the decimal-string
     /// rendering of the same IDs.
