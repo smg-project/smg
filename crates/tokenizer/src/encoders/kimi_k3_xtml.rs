@@ -79,6 +79,8 @@ pub(crate) const PROFILE: RendererProfile = RendererProfile {
     capabilities: RendererCapabilities {
         raw_tool_call_arguments: true,
         enable_thinking_alias: true,
+        // The encoder writes the media anchor for a system message's image part.
+        text_role_media: RendererProfile::SYSTEM_IMAGE,
         ..RendererProfile::NO_CAPABILITIES
     },
     // The encoder resolves the mode by its own rule; the parser is armed

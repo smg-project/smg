@@ -4326,6 +4326,9 @@ pub struct ChatTemplateState {
     /// Whether the template writes a history tool call's `arguments` as the
     /// text the request sent (see [`Self::raw_tool_call_arguments`]).
     raw_tool_call_arguments: bool,
+    /// Whether an image part of a system message reaches the rendered
+    /// prompt (see [`Self::system_images`]).
+    system_images: bool,
     /// The `tool_use` template of a configuration that names its templates
     /// (see [`ConfigChatTemplates`]), rendered in place of the default one
     /// when the request declares tools, as the engine's chat utils render.
@@ -4395,6 +4398,7 @@ impl ChatTemplateState {
             developer_role_supported,
             root_role_supported,
             raw_tool_call_arguments: false,
+            system_images: false,
             tool_use: None,
             output_len: RenderedLength::default(),
             processor: None,
@@ -4533,6 +4537,7 @@ impl ChatTemplateState {
             developer_role_supported: true,
             root_role_supported: true,
             raw_tool_call_arguments: false,
+            system_images: false,
             tool_use: None,
             output_len: RenderedLength::default(),
             processor: None,
@@ -4867,6 +4872,7 @@ impl ChatTemplateState {
             developer_role_supported: self.developer_role_supported,
             root_role_supported: self.root_role_supported,
             raw_tool_call_arguments: self.raw_tool_call_arguments,
+            system_images: self.system_images,
             tool_use: None,
             output_len: RenderedLength::default(),
             processor: None,
@@ -5357,6 +5363,85 @@ impl ChatTemplateState {
         renders(serde_json::json!("{\"probe\": 1}")) && !renders(serde_json::json!({"probe": 1}))
     }
 
+    /// Whether an image part of a system message reaches the rendered
+    /// prompt: the Jinja renderer's answer to that part in
+    /// `RendererCapabilities::text_role_media`, for every template a request
+    /// may render through. Resolved when the template is bound (see
+    /// `Self::writes_a_system_image`).
+    pub(crate) fn system_images(&self) -> bool {
+        [
+            Some(self),
+            self.tool_use.as_deref(),
+            self.processor.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .all(|template| template.system_images)
+    }
+
+    /// Decide [`Self::system_images`] by the template's behaviour, not its
+    /// source, at one instant. A template that takes one string per message
+    /// is handed the image's anchor inside the string, so the image reaches
+    /// the prompt where the system message's text does. A template that
+    /// takes parts carries it only where it writes for an image part of a
+    /// system message exactly what it writes for one of a user message: a
+    /// template that drops the part, or prints the parts list, keeps the
+    /// refusal.
+    fn writes_a_system_image(&self) -> bool {
+        if self.env.is_none() {
+            return false;
+        }
+        let now = render_instant();
+        // What a `role` message's render gains from `without` to `with`: the
+        // text between the two renders' common prefix and suffix.
+        let written = |role: &str, without: serde_json::Value, with: serde_json::Value| {
+            let render = |content: serde_json::Value| {
+                let mut messages = vec![serde_json::json!({"role": role, "content": content})];
+                if role != "user" {
+                    messages.push(serde_json::json!({"role": "user", "content": "probe"}));
+                }
+                let params = ChatTemplateParams {
+                    now: Some(now),
+                    ..Default::default()
+                };
+                self.apply(&messages, params).ok()
+            };
+            let (without, with) = (render(without)?, render(with)?);
+            let same = |(a, b): &(u8, u8)| a == b;
+            let prefix = without.bytes().zip(with.bytes()).take_while(same).count();
+            let suffix = without
+                .bytes()
+                .rev()
+                .zip(with.bytes().rev())
+                .take_while(same)
+                .count();
+            let end = with.len().checked_sub(suffix.min(without.len() - prefix))?;
+            with.get(prefix..end)
+                .filter(|gained| !gained.is_empty())
+                .map(str::to_string)
+        };
+        match self.content_format {
+            ChatTemplateContentFormat::String => written(
+                "system",
+                serde_json::json!("probe"),
+                serde_json::json!("image\nprobe"),
+            )
+            .is_some(),
+            ChatTemplateContentFormat::OpenAI => {
+                let text = serde_json::json!({"type": "text", "text": "probe"});
+                let image = |role| {
+                    written(
+                        role,
+                        serde_json::json!([text]),
+                        serde_json::json!([{"type": "image"}, text]),
+                    )
+                };
+                let user = image("user");
+                user.is_some() && user == image("system")
+            }
+        }
+    }
+
     /// Decide the thinking switch's default by the template's behaviour, not
     /// its source: one bare user turn with the generation prompt, rendered
     /// with the switch absent, on and off, at one instant (a template may
@@ -5392,10 +5477,12 @@ impl ChatTemplateState {
     }
 
     /// The answers read from the template's behaviour once its environment
-    /// is in place: how it writes a history tool call's arguments, and the
-    /// thinking switch's default where its renders say it.
+    /// is in place: how it writes a history tool call's arguments, whether
+    /// it writes a system message's image, and the thinking switch's default
+    /// where its renders say it.
     fn settle_by_behaviour(&mut self) {
         self.raw_tool_call_arguments = self.writes_tool_call_arguments_as_text();
+        self.system_images = self.writes_a_system_image();
         if let Some(default) = self.rendered_thinking_default() {
             self.thinking_toggle = default;
         }

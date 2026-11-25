@@ -1454,6 +1454,7 @@ mod tests {
                 native_assistant_continuation: true,
                 raw_tool_call_arguments: true,
                 leading_system_only: false,
+                text_role_media: llm_tokenizer::traits::TextRoleMedia::NONE,
                 json_requires_separate_reasoning: false,
                 json_requires_empty_assistant_prefix: false,
             })

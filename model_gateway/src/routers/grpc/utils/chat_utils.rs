@@ -19,7 +19,7 @@ use llm_tokenizer::{
         ChatTemplateContentFormat, ChatTemplateParams, PreparedTools, TemplateFailure,
         TemplateRefusal, ThinkingKeyName,
     },
-    traits::{Encoding, PromptEncoding, Tokenizer},
+    traits::{Encoding, MediaKind, PromptEncoding, TextRole, TextRoleMedia, Tokenizer},
     StopRules, StopSequenceConfig, StopSequenceDecoder,
 };
 use openai_protocol::{
@@ -790,23 +790,28 @@ fn resolve_template_thinking(
 }
 
 /// Validate content sent to a model template, using the tool declarations
-/// that the template will receive.
+/// that the template will receive and the renderer's answer on the media
+/// parts of a text role (`RendererCapabilities::text_role_media`).
 pub(crate) fn validate_chat_template_content_parts(
     request: &ChatCompletionRequest,
+    text_role_media: TextRoleMedia,
 ) -> Result<(), String> {
-    validate_chat_parts(&request.messages, Some(request))
+    validate_chat_parts(&request.messages, Some(request), text_role_media)
 }
 
 /// Validate gRPC chat content outside the regular template preparation path.
 pub(crate) fn validate_chat_content_parts(messages: &[ChatMessage]) -> Result<(), String> {
-    validate_chat_parts(messages, None)
+    validate_chat_parts(messages, None, TextRoleMedia::NONE)
 }
 
 /// Reject unsupported parts and permit a homogeneous list of declared Flash
-/// tool references only in a tool message sent to the model template.
+/// tool references only in a tool message sent to the model template, and a
+/// media part in a text role's message only where the renderer writes it
+/// (`text_role_media`).
 fn validate_chat_parts(
     messages: &[ChatMessage],
     template_request: Option<&ChatCompletionRequest>,
+    text_role_media: TextRoleMedia,
 ) -> Result<(), String> {
     for message in messages {
         let content = match message {
@@ -823,14 +828,15 @@ fn validate_chat_parts(
         // part there is refused here, before any fetch, in this door's own
         // sentence, not after the pipeline processed it and the rendered
         // prompt's anchors did not match it (none for a system, developer or
-        // root part; one too many for an assistant part on a template that
-        // renders assistant media). The binding carries the role's article
-        // for the sentence.
+        // root part the template does not write; one too many for an
+        // assistant part on a template that renders assistant media). A
+        // part taken there is one the renderer writes (`text_role_media`).
+        // The binding carries the role's article for the sentence.
         let text_only_role = match message {
-            ChatMessage::System { .. } => Some("a system"),
-            ChatMessage::Developer { .. } => Some("a developer"),
-            ChatMessage::Assistant { .. } => Some("an assistant"),
-            ChatMessage::Root { .. } => Some("a root"),
+            ChatMessage::System { .. } => Some(("a system", TextRole::System)),
+            ChatMessage::Developer { .. } => Some(("a developer", TextRole::Developer)),
+            ChatMessage::Assistant { .. } => Some(("an assistant", TextRole::Assistant)),
+            ChatMessage::Root { .. } => Some(("a root", TextRole::Root)),
             ChatMessage::User { .. } | ChatMessage::Tool { .. } | ChatMessage::Function { .. } => {
                 None
             }
@@ -867,11 +873,16 @@ fn validate_chat_parts(
                         );
                     }
                     _ => {
-                        if let (Some(kind), Some(role)) = (media_part_type(part), text_only_role) {
-                            return Err(format!(
-                                "Unsupported chat content part type {kind:?} in {role} message \
-                                 for gRPC backends: media parts are taken in user and tool messages"
-                            ));
+                        if let (Some((type_name, kind)), Some((role_name, role))) =
+                            (media_part_type(part), text_only_role)
+                        {
+                            if !text_role_media.writes(role, kind) {
+                                return Err(format!(
+                                    "Unsupported chat content part type {type_name:?} in \
+                                     {role_name} message for gRPC backends: media parts are \
+                                     taken in user and tool messages"
+                                ));
+                            }
                         }
                     }
                 }
@@ -881,13 +892,14 @@ fn validate_chat_parts(
     Ok(())
 }
 
-/// The wire name (`type`) of a media content part; `None` for any other part.
-fn media_part_type(part: &ContentPart) -> Option<&'static str> {
+/// The wire name (`type`) of a media content part and the kind a renderer
+/// is handed for it; `None` for any other part.
+fn media_part_type(part: &ContentPart) -> Option<(&'static str, MediaKind)> {
     match part {
-        ContentPart::ImageUrl { .. } => Some("image_url"),
-        ContentPart::AudioUrl { .. } => Some("audio_url"),
-        ContentPart::InputAudio { .. } => Some("input_audio"),
-        ContentPart::VideoUrl { .. } => Some("video_url"),
+        ContentPart::ImageUrl { .. } => Some(("image_url", MediaKind::Image)),
+        ContentPart::AudioUrl { .. } => Some(("audio_url", MediaKind::Audio)),
+        ContentPart::InputAudio { .. } => Some(("input_audio", MediaKind::Audio)),
+        ContentPart::VideoUrl { .. } => Some(("video_url", MediaKind::Video)),
         ContentPart::Text { .. } | ContentPart::Refusal { .. } | ContentPart::Unknown(_) => None,
     }
 }
@@ -1391,7 +1403,11 @@ pub fn process_chat_messages_with_encoding(
     image_placeholder: Option<&str>,
 ) -> Result<(ProcessedMessages, PromptEncoding), String> {
     // Bindings call this entry point without the gRPC preparation stage.
-    validate_chat_content_parts(&request.messages)?;
+    validate_chat_parts(
+        &request.messages,
+        None,
+        tokenizer.renderer_capabilities().text_role_media,
+    )?;
     let placeholder_tokens = image_placeholder.map(|token| {
         let mut placeholders = PlaceholderTokens::default();
         placeholders.insert(Modality::Image, token.to_string());

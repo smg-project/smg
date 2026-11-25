@@ -90,14 +90,18 @@ pub(crate) async fn prepare_chat_like(
     request: &ChatCompletionRequest,
     wire_pools: &'static [RoutingPool],
 ) -> Result<(Vec<u32>, ProcessedMessages, symphony::PreparedConstraint), Response> {
-    // Validate against the rendered tool set, which allowed_tools may narrow.
     let body_ref = utils::request_as_rendered(request);
-    utils::validate_chat_template_content_parts(&body_ref)
-        .map_err(|e| error::bad_request("unsupported_content_part", e))?;
     {
         // Step 0: Resolve tokenizer from registry (cached for reuse in response processing)
         let tokenizer =
             utils::resolve_tokenizer(ctx, "ChatPreparationStage::prepare_chat").map_err(|e| *e)?;
+        // Validate against the rendered tool set, which allowed_tools may
+        // narrow, and against the media the renderer writes in a text role.
+        utils::validate_chat_template_content_parts(
+            &body_ref,
+            tokenizer.renderer_capabilities().text_role_media,
+        )
+        .map_err(|e| error::bad_request("unsupported_content_part", e))?;
         token_ids::validate_logit_bias_token_ids(
             request.logit_bias.as_ref(),
             tokenizer.as_ref(),

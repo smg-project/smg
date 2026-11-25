@@ -11,7 +11,7 @@ use crate::{
     chat_template::{
         ChatTemplateContentFormat, ChatTemplateState, ThinkingKeyName, ThinkingToggle,
     },
-    traits::{MediaHandling, RendererCapabilities},
+    traits::{MediaHandling, MediaKind, RendererCapabilities, TextRole, TextRoleMedia},
 };
 
 mod deepseek_common;
@@ -126,6 +126,7 @@ impl RendererProfile {
         native_assistant_continuation: false,
         raw_tool_call_arguments: false,
         leading_system_only: false,
+        text_role_media: TextRoleMedia::NONE,
         json_requires_separate_reasoning: false,
         json_requires_empty_assistant_prefix: false,
     };
@@ -137,6 +138,11 @@ impl RendererProfile {
         native_assistant_continuation: true,
         ..Self::NO_CAPABILITIES
     };
+
+    /// The one text-role media part a renderer is asked about today: a
+    /// system message's image.
+    pub(crate) const SYSTEM_IMAGE: TextRoleMedia =
+        TextRoleMedia::NONE.with(TextRole::System, MediaKind::Image);
 }
 
 /// What a tokenizer answers to the template questions the gateway asks: a
@@ -210,8 +216,9 @@ impl TemplateAnswers<'_> {
     /// The profile's capabilities, or the Jinja template's: it continues a
     /// trailing assistant message the way the reference's
     /// `continue_final_message` does, takes a history call's arguments as the
-    /// text the request sent when it writes them that way, and handles media
-    /// as `media_handling` says (resolved by the tokenizer that owns the
+    /// text the request sent when it writes them that way, takes a system
+    /// message's image where it writes one, and handles media as
+    /// `media_handling` says (resolved by the tokenizer that owns the
     /// template).
     pub(crate) fn renderer_capabilities(
         &self,
@@ -221,6 +228,11 @@ impl TemplateAnswers<'_> {
             || RendererCapabilities {
                 media_handling,
                 raw_tool_call_arguments: self.template.raw_tool_call_arguments(),
+                text_role_media: if self.template.system_images() {
+                    RendererProfile::SYSTEM_IMAGE
+                } else {
+                    TextRoleMedia::NONE
+                },
                 ..RendererProfile::TEMPLATE_CAPABILITIES
             },
             |profile| profile.capabilities,

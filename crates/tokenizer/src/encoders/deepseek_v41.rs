@@ -107,6 +107,8 @@ pub(crate) const PROFILE: RendererProfile = RendererProfile {
         enable_thinking_alias: true,
         native_assistant_continuation: true,
         raw_tool_call_arguments: true,
+        // The encoder writes the image placeholder for a system message's image part.
+        text_role_media: RendererProfile::SYSTEM_IMAGE,
         ..RendererProfile::NO_CAPABILITIES
     },
     thinking_mode: None,

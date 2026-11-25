@@ -54,6 +54,50 @@ pub enum MediaHandling {
     TemplateText,
 }
 
+/// A message role whose content is text by the public contract: a media part
+/// there is taken only where the renderer writes it ([`TextRoleMedia`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextRole {
+    System,
+    Developer,
+    Assistant,
+    Root,
+}
+
+/// A media part's kind, as a renderer is handed it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaKind {
+    Image,
+    Video,
+    Audio,
+}
+
+/// The media parts a renderer writes into the prompt from the messages of a
+/// [`TextRole`], by the message's role and the part's kind. None by default.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TextRoleMedia(u16);
+
+impl TextRoleMedia {
+    /// The renderer writes no media part of a text role.
+    pub const NONE: Self = Self(0);
+
+    /// These parts, and the `kind` parts of a `role` message.
+    #[must_use]
+    pub const fn with(self, role: TextRole, kind: MediaKind) -> Self {
+        Self(self.0 | Self::bit(role, kind))
+    }
+
+    /// Whether the renderer writes a `kind` part of a `role` message.
+    pub const fn writes(self, role: TextRole, kind: MediaKind) -> bool {
+        self.0 & Self::bit(role, kind) != 0
+    }
+
+    /// Four bits a role, one for each kind.
+    const fn bit(role: TextRole, kind: MediaKind) -> u16 {
+        1 << (role as u16 * 4 + kind as u16)
+    }
+}
+
 /// Renderer behaviours the gateway mirrors when it prepares a request, so
 /// the rendered prompt and the request handling never disagree.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -85,6 +129,10 @@ pub struct RendererCapabilities {
     /// message is forwarded in place, for the templates that render a
     /// system turn anywhere.
     pub leading_system_only: bool,
+    /// The media parts that reach the rendered prompt from a message of a
+    /// [`TextRole`]. The gateway takes such a part for this renderer and
+    /// refuses any other, whose prompt would carry no anchor for it.
+    pub text_role_media: TextRoleMedia,
     /// JSON constraints require reasoning outside the response body.
     pub json_requires_separate_reasoning: bool,
     /// JSON constraints start at an empty assistant body, not a partial value.

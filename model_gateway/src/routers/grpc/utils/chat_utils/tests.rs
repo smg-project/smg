@@ -146,6 +146,51 @@ fn a_media_part_in_a_text_only_role_message_is_refused_at_the_door() {
     assert!(validate_chat_content_parts(&messages).is_ok());
 }
 
+/// A system message's image is taken where the model's template writes it,
+/// its anchor in the rendered system turn, and refused at the door where it
+/// does not. The rows are two templates of one maker: the content macro of
+/// the first writes an image part in every role, that of the second writes a
+/// message's text parts alone.
+#[test]
+fn a_system_image_is_taken_where_the_template_writes_it() {
+    let request: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": "m",
+        "messages": [
+            {"role": "system", "content": [
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AQ=="}},
+                {"type": "text", "text": "You are an image analyst."}
+            ]},
+            {"role": "user", "content": "What did you see in the system image?"}
+        ]
+    }))
+    .unwrap();
+    let render = |template: &str| {
+        let mut tokenizer =
+            llm_tokenizer::TiktokenTokenizer::new(llm_tokenizer::TiktokenModel::Cl100kBase)
+                .unwrap();
+        tokenizer.set_chat_template(template.to_string()).unwrap();
+        process_chat_messages(&request, &tokenizer, None).map(|processed| processed.text)
+    };
+    let taken = render(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../crates/tokenizer/tests/fixtures/minimax_m3/chat_template.jinja"
+    )))
+    .unwrap();
+    assert!(
+        taken.contains("]<]image[>[You are an image analyst."),
+        "{taken}"
+    );
+    assert_eq!(
+        render(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../crates/tokenizer/tests/fixtures/minimax_m2/chat_template.jinja"
+        )))
+        .unwrap_err(),
+        "Unsupported chat content part type \"image_url\" in a system message for gRPC \
+         backends: media parts are taken in user and tool messages"
+    );
+}
+
 #[test]
 fn known_chat_content_parts_are_accepted() {
     let messages: Vec<ChatMessage> = serde_json::from_value(json!([
@@ -1900,6 +1945,7 @@ const NATIVE_CONTINUATION: RendererCapabilities = RendererCapabilities {
     native_assistant_continuation: true,
     raw_tool_call_arguments: false,
     leading_system_only: false,
+    text_role_media: TextRoleMedia::NONE,
     json_requires_separate_reasoning: false,
     json_requires_empty_assistant_prefix: false,
 };
@@ -1909,6 +1955,7 @@ const RAW_ARGUMENTS: RendererCapabilities = RendererCapabilities {
     native_assistant_continuation: false,
     raw_tool_call_arguments: true,
     leading_system_only: false,
+    text_role_media: TextRoleMedia::NONE,
     json_requires_separate_reasoning: false,
     json_requires_empty_assistant_prefix: false,
 };
