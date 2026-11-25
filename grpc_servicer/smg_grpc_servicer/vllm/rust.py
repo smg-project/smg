@@ -51,8 +51,6 @@ import os
 from collections.abc import Mapping
 from typing import Any
 
-from smg_grpc_servicer.constrained_decoding import structural_tag_vocabulary
-
 # The lifecycle's defaults and the switch's choices, re-exported: this
 # launcher's own documented values.
 from smg_grpc_servicer.rust_lifecycle import (  # noqa: F401
@@ -90,6 +88,7 @@ from smg_grpc_servicer.vllm.model_info import (
     mm_item_limits,
     model_facts,
     server_facts,
+    vllm_structural_tag_vocabulary,
 )
 from smg_grpc_servicer.vllm.warmup import WARMUP_ENV, warmup_inputs_from_config, warmup_wire
 
@@ -175,10 +174,7 @@ def model_info_from_config(
         ),
         "engine_reasoning_parser": engine_reasoning_parser(vllm_config),
         "constrained_decoding_start": constrained_decoding_start(vllm_config),
-        # The vocabulary of structural-tag nodes that backend takes, when the
-        # xgrammar installed beside the engine predates the current one: the
-        # Router spells such a worker's structural tags in the older vocabulary.
-        "structural_tag_vocabulary": structural_tag_vocabulary(structured_outputs_backend),
+        "structural_tag_vocabulary": vllm_structural_tag_vocabulary(vllm_config),
         # Whether a Mooncake connector runs in the engine at all, off the raw
         # `kv_transfer_config` (the top-level connector or any child a wrapper
         # lists): the servicer withholds a PD decode side's KV-transfer rejection

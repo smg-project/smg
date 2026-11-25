@@ -8,6 +8,8 @@
 pub(crate) mod preparation;
 pub(crate) mod request_building;
 pub(crate) mod response_processing;
+#[cfg(test)]
+mod tests;
 
 pub(crate) use preparation::HarmonyPreparationStage;
 pub(crate) use request_building::HarmonyRequestBuildingStage;

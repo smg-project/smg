@@ -70,7 +70,7 @@ async fn streamed_events(frames: Vec<proto::GenerateResponse>, choices: u32) -> 
             },
             Arc::new(request),
             dispatch,
-            Vec::new(),
+            Default::default(),
             None,
             None,
             source,

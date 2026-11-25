@@ -23,6 +23,7 @@ from smg_grpc_servicer import mm_shm
 from smg_grpc_servicer.constrained_decoding import (
     CONSTRAINED_DECODING_AFTER_REASONING,
     CONSTRAINED_DECODING_FIRST_TOKEN,
+    structural_tag_vocabulary,
 )
 from smg_grpc_servicer.mm_item_limits import MODALITIES, format_item_limits
 from smg_grpc_servicer.pd_pairing import pairing_protocol_from_env
@@ -198,6 +199,12 @@ def engine_reasoning_parser(vllm_config: Any) -> str:
     override the Router reads off a worker's labels); "" when the engine runs
     none or the config has no such section."""
     return EngineConfigView(vllm_config).structured_outputs.reasoning_parser
+
+
+def vllm_structural_tag_vocabulary(vllm_config: Any) -> str:
+    """The installed XGrammar vocabulary used for vLLM structural tags."""
+    backend = EngineConfigView(vllm_config).structured_outputs.backend or "auto"
+    return structural_tag_vocabulary(backend, report_current=True)
 
 
 # The `constrained_decoding_start` label's values (where the engine starts a

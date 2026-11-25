@@ -1108,6 +1108,12 @@ pub(crate) fn translate_sampling(
         logprobs: sp.logprobs,
         prompt_logprobs: sp.prompt_logprobs,
         logit_bias,
+        bad_words_token_ids: (!sp.suppressed_token_ids.is_empty()).then(|| {
+            sp.suppressed_token_ids
+                .into_iter()
+                .map(|id| vec![id])
+                .collect()
+        }),
         structured_outputs: sp
             .constraint
             .and_then(translate_constraint)
@@ -1272,7 +1278,7 @@ impl VocabBounds {
 /// An id past the model's vocabulary that a position is allowed to hold is
 /// still a target of `prompt_logprobs`, which reads the logits at every
 /// prompt id after the first: such a request is refused.
-/// `stop_token_ids` and `logit_bias` index the logits on every leg.
+/// `stop_token_ids`, `suppressed_token_ids` and `logit_bias` index the logits on every leg.
 pub(crate) fn validate_token_ids(
     req: &vllm::GenerateRequest,
     embed_positions: &[Range<usize>],
@@ -1321,6 +1327,16 @@ pub(crate) fn validate_token_ids(
     if !bad.is_empty() {
         return Err(format!(
             "token_id(s) {bad:?} in stop_token_ids contain out-of-vocab token ids. \
+             Vocabulary size: {vocab_size}"
+        ));
+    }
+    let bad = out_of_vocab(
+        sp.suppressed_token_ids.iter().map(|&id| i64::from(id)),
+        vocab_size,
+    );
+    if !bad.is_empty() {
+        return Err(format!(
+            "token_id(s) {bad:?} in suppressed_token_ids contain out-of-vocab token ids. \
              Vocabulary size: {vocab_size}"
         ));
     }

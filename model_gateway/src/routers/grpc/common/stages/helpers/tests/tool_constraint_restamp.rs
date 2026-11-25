@@ -105,6 +105,47 @@ fn plan_request(plan: &ExecutionPlan) -> &ProtoGenerateRequest {
     }
 }
 
+#[test]
+fn vllm_harmony_retries_use_a_vocabulary_both_pd_workers_can_compile() {
+    use smg_worker::identity::basic::RuntimeType;
+
+    use crate::routers::grpc::harmony::grammar::VllmHarmonyGrammar;
+
+    let current = worker(&[("structural_tag_vocabulary", "current")]);
+    let unknown = worker(&[]);
+    let pd = |prefill: &WorkerSelection, decode: &WorkerSelection| WorkerSelection::Disaggregated {
+        encode_assignments: None,
+        prefill: Arc::clone(prefill.single().unwrap()),
+        decode: Arc::clone(decode.single().unwrap()).into(),
+        runtime_type: RuntimeType::Vllm,
+    };
+    let grammar = VllmHarmonyGrammar::new([], Some(&serde_json::json!({"type": "string"})));
+    let factory = ToolParserFactory::new();
+    let mut request = ProtoGenerateRequest::Vllm(Box::default());
+    grammar.apply(&mut request, Some(&current));
+    let mut plan = ExecutionPlan::generate(ExecutionPlanKind::PrefillDecode, request);
+    let stamp = AttemptStamp {
+        id: IdStamp::Exact,
+        sampling_mask: None,
+        sampling_baseline: None,
+        inject_pd_metadata: false,
+        tool_constraint: Some(ToolConstraintStamp::Harmony(grammar.clone())),
+    };
+    for (selection, token_nodes) in [
+        (pd(&unknown, &current), false),
+        (pd(&current, &current), true),
+        (pd(&current, &unknown), false),
+    ] {
+        restamp_plan_for_attempt(&mut plan, &stamp, &selection, &factory).unwrap();
+        let ExecutionPlan::PrefillDecode(request) = &plan else {
+            panic!("expected prefill/decode generation");
+        };
+        let tag: Value = serde_json::from_str(request.structural_tag().unwrap()).unwrap();
+        assert_eq!(tag, grammar.render(token_nodes));
+        assert!(request.grammar_from_first_token());
+    }
+}
+
 /// A forced call built for an engine that starts the grammar after its
 /// reasoning parser's gate (the bare calls) reaches a retry's engine that
 /// starts it at the first token as the thought block then the calls, and

@@ -15,14 +15,11 @@ that backend cannot enforce before the engine (every kind under ``none``, a kind
 the backend does not compile, a JSON-schema feature xgrammar drops), the same
 refusal the vLLM path gives.
 
-The ``structural_tag_vocabulary`` key beside them: ``older`` when the xgrammar
-installed beside the engine predates the ``optional``, ``plus``, ``star`` and
-``token`` structural-tag nodes (0.1.33 is the first release with them) and so
-refuses a tag that carries one at compile time; the Router spells such a
-worker's structural tags without ``optional``, ``plus`` and ``star``, the same
-language (a ``token`` node stays as derived, so a table that writes single-token
-markers still meets the older compiler's refusal). Read off the distribution's
-metadata once, at start-up, never by importing xgrammar.
+The ``structural_tag_vocabulary`` label comes from the installed XGrammar
+distribution's metadata. Version 0.1.33 introduced the ``optional``, ``plus``,
+``star`` and ``token`` structural-tag nodes. Workers report ``older`` for
+earlier releases. The vLLM servicers also report ``current`` when support is
+known, so the Router can select workers for grammars that require token nodes.
 
 Engine-free at import: the readers take the parsed server arguments. The vLLM
 servicers read the same facts off their engine's structured-outputs config
@@ -59,12 +56,7 @@ GRAMMAR_BACKEND_NONE = "none"
 SGLANG_DEFAULT_GRAMMAR_BACKEND = "xgrammar"
 
 # The `server_args` key (SGLang, TokenSpeed) and the `GetServerInfo` field
-# (vLLM, TensorRT-LLM) naming the vocabulary of structural-tag nodes the
-# engine's grammar compiler takes, and its one value: `older` for an xgrammar
-# that predates the `optional`, `plus`, `star` and `token` nodes and refuses a
-# tag that carries one (the Router's older spelling leaves out `optional`,
-# `plus` and `star`; a `token` node stays as derived). Absent for a current
-# xgrammar, so the Router sends the tags as its tables build them.
+# (vLLM, TensorRT-LLM) naming the structural-tag vocabulary.
 STRUCTURAL_TAG_VOCABULARY_KEY = "structural_tag_vocabulary"
 STRUCTURAL_TAG_VOCABULARY_OLDER = "older"
 # The first xgrammar release whose structural tags take every node the Router
@@ -225,21 +217,22 @@ def _release_numbers(version: str) -> tuple[int, int, int] | None:
     return major, minor, patch
 
 
-def structural_tag_vocabulary(grammar_backend: str, xgrammar_version: str | None = None) -> str:
-    """The ``structural_tag_vocabulary`` label for an engine whose grammar
-    backend resolves to ``grammar_backend``: ``older`` when that backend runs
-    xgrammar (:data:`_XGRAMMAR_BACKENDS`) and the installed xgrammar
-    (``xgrammar_version``; the distribution's metadata when not given)
-    predates :data:`XGRAMMAR_CURRENT_VOCABULARY_SINCE`; "" for a current one,
-    no xgrammar at all, a version that does not parse, and a backend with a
-    vocabulary of its own or none (``llguidance``, ``outlines``, ``none``), so
-    nothing is said and the Router keeps the current spelling."""
+def structural_tag_vocabulary(
+    grammar_backend: str, xgrammar_version: str | None = None, *, report_current: bool = False
+) -> str:
+    """Report ``older`` for XGrammar versions that predate token nodes.
+
+    A vLLM worker sets ``report_current`` to advertise known token-node
+    support. An unknown version or a different backend leaves the label empty.
+    """
     if str(grammar_backend or "").strip().lower() not in _XGRAMMAR_BACKENDS:
         return ""
     version = installed_xgrammar_version() if xgrammar_version is None else xgrammar_version
     numbers = _release_numbers(version)
-    if numbers is None or numbers >= XGRAMMAR_CURRENT_VOCABULARY_SINCE:
+    if numbers is None:
         return ""
+    if numbers >= XGRAMMAR_CURRENT_VOCABULARY_SINCE:
+        return "current" if report_current else ""
     return STRUCTURAL_TAG_VOCABULARY_OLDER
 
 

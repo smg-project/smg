@@ -149,7 +149,7 @@ async fn harmony_chat_reports_the_dispatch_adapter_in_every_response_frame() {
                     execution,
                     request,
                     dispatch,
-                    Vec::new(),
+                    Default::default(),
                     None,
                     None,
                     source,
@@ -201,7 +201,7 @@ async fn streamed_chat_events(
             },
             Arc::new(chat_request(choices, true)),
             dispatch,
-            Vec::new(),
+            Default::default(),
             reservation,
             None,
             source,
@@ -281,7 +281,7 @@ async fn non_streamed_chat(
             },
             Arc::new(chat_request(choices, false)),
             dispatch(),
-            &[],
+            &Default::default(),
         )
         .await
         .unwrap_or_else(|response| panic!("{}", response.status()));
@@ -399,7 +399,7 @@ async fn streamed_responses_iteration(
             &tx,
             None,
             None,
-            &[],
+            &Default::default(),
             None,
         )
         .await;
@@ -428,7 +428,7 @@ async fn whole_responses_iteration(
             },
             Arc::new(request),
             dispatch(),
-            &[],
+            &Default::default(),
         )
         .await
         .unwrap_or_else(|response| panic!("{}", response.status()));

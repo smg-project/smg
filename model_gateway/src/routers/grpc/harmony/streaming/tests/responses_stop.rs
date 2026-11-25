@@ -101,7 +101,10 @@ async fn whole(frames: Vec<proto::GenerateResponse>, router_stops: &[String]) ->
             },
             Arc::new(request()),
             dispatch(),
-            router_stops,
+            &context::HarmonyReadOptions {
+                stop_strings: router_stops.to_vec(),
+                ..Default::default()
+            },
         )
         .await
         .unwrap_or_else(|response| panic!("{}", response.status()));
@@ -158,7 +161,10 @@ async fn streamed(execution: context::ExecutionResult, router_stops: &[String]) 
             &tx,
             None,
             None,
-            router_stops,
+            &context::HarmonyReadOptions {
+                stop_strings: router_stops.to_vec(),
+                ..Default::default()
+            },
             None,
         )
         .await;
@@ -469,7 +475,10 @@ async fn the_whole_chat_turn_keeps_its_cut_at_the_router_s_stop() {
             },
             Arc::new(request),
             dispatch(),
-            &stops(),
+            &context::HarmonyReadOptions {
+                stop_strings: stops(),
+                ..Default::default()
+            },
         )
         .await
         .unwrap_or_else(|response| panic!("{}", response.status()));

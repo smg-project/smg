@@ -1730,7 +1730,7 @@ impl RequestPipeline {
             ExecutionResult,
             Option<LoadGuards>,
             Arc<RateLimitCell>,
-            Vec<String>,
+            HarmonyReadOptions,
         ),
         Response,
     > {
@@ -1757,15 +1757,14 @@ impl RequestPipeline {
             Ok(RunOutcome::Final(mut dctx, _)) => match dctx.response.execution_result.take() {
                 Some(execution_result) => {
                     let load_guards = dctx.load_guards.take();
-                    // The string stops the engine will never match, for the
-                    // Harmony reader to scan the channel text for, as the
-                    // response stage hands them to a non-streamed iteration.
-                    let router_stops = std::mem::take(&mut dctx.response.router_stop_obligations);
+                    // Carry the same stop and grammar checks into the streamed
+                    // reader that the response stage applies to a collected turn.
+                    let read_options = dctx.response.take_harmony_read_options();
                     Ok((
                         execution_result,
                         load_guards,
                         rate_limit_cell.clone(),
-                        router_stops,
+                        read_options,
                     ))
                 }
                 None => {

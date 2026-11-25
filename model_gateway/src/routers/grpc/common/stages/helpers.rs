@@ -520,6 +520,8 @@ pub(crate) enum ToolConstraintStamp {
     /// stamp, so a retry's worker the table would give one goes without it
     /// too.
     Table(Arc<dyn TagForStart>),
+    /// Re-render a Harmony turn when a retry selects another XGrammar vocabulary.
+    Harmony(crate::routers::grpc::harmony::grammar::VllmHarmonyGrammar),
 }
 
 impl ToolConstraintStamp {
@@ -617,6 +619,10 @@ impl ToolConstraintStamp {
                     request.set_structural_tag(tag);
                 }
                 led || *first_token
+            }
+            Self::Harmony(grammar) => {
+                grammar.apply(request, Some(workers));
+                return Ok(());
             }
             Self::Table(tag) => {
                 let decoding = utils::WorkerDecoding::of(Some(workers));

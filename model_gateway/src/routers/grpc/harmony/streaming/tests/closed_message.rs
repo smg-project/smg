@@ -69,7 +69,7 @@ async fn streamed(frames: Vec<proto::GenerateResponse>) -> (Value, Value) {
             &tx,
             None,
             None,
-            &[],
+            &Default::default(),
             None,
         )
         .await;

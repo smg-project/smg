@@ -20,8 +20,8 @@ class _Aborted(Exception):
     """The fake gRPC context stops the RPC just as context.abort does."""
 
 
-def _generate(**overrides):
-    """Compile the actual handler with engine-independent dependencies."""
+def _servicer_method(name="Generate", **overrides):
+    """Compile the actual handler or converter with engine-independent dependencies."""
     path = Path(__file__).parents[1] / "smg_grpc_servicer/vllm/servicer.py"
     module = ast.parse(path.read_text())
     helper = next(
@@ -33,7 +33,9 @@ def _generate(**overrides):
         n for n in module.body if isinstance(n, ast.ClassDef) and n.name == "VllmEngineServicer"
     )
     method = next(
-        n for n in cls.body if isinstance(n, ast.AsyncFunctionDef) and n.name == "Generate"
+        n
+        for n in cls.body
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == name
     )
     method.returns = None
     for arg in method.args.args:
@@ -66,7 +68,7 @@ def _generate(**overrides):
     }
     namespace.update(overrides)
     exec(compile(ast.Module(body=[helper, method], type_ignores=[]), str(path), "exec"), namespace)
-    return namespace["Generate"]
+    return namespace[name]
 
 
 @pytest.mark.asyncio
@@ -140,14 +142,14 @@ async def test_grid_only_requires_a_handoff(hashes, consumer, ec, kv):
         else consumer and bool(hashes) and ec == '{"ec_items":[{"mm_hash":"h","transfer_id":"t"}]}'
     )
     if allowed:
-        assert [reply async for reply in _generate()(servicer, request, context)] == []
+        assert [reply async for reply in _servicer_method()(servicer, request, context)] == []
         assert len(seen) == 1
         build.assert_called_once()
         if ec is not None:
             assert seen[0]["sampling_params"].extra_args["ec_transfer_params"] == json.loads(ec)
     else:
         with pytest.raises(_Aborted) as exc:
-            _ = [reply async for reply in _generate()(servicer, request, context)]
+            _ = [reply async for reply in _servicer_method()(servicer, request, context)]
         assert exc.value.args[0] is grpc.StatusCode.INVALID_ARGUMENT
         assert not seen
         build.assert_not_called()
@@ -210,7 +212,7 @@ async def test_encoder_only_validates_connector_specific_handles(consumer, conne
         _complete_response=complete,
     )
     context = SimpleNamespace(abort=abort, invocation_metadata=lambda: ())
-    method = _generate(
+    method = _servicer_method(
         build_media_identity=lambda prompt: identity, _request_rank=lambda *args, **kwargs: 0
     )
     if connector == "ECCPUConnector" and not (handle.get("peer_host") and handle.get("peer_port")):
@@ -232,6 +234,7 @@ async def test_encoder_only_validates_connector_specific_handles(consumer, conne
             for mode in (None, "enabled", "disabled", "adaptive", "", "{", "[]", "null", "true")
         ),
         ("enabled", True, True),
+        (None, True, True),
         (None, True, False),
         (None, False, True),
     ],
@@ -277,11 +280,11 @@ async def test_reasoning_options_reach_engine_or_fail_before_submission(
     context = SimpleNamespace(abort=abort, invocation_metadata=lambda: ())
     if invalid:
         with pytest.raises(_Aborted) as exc:
-            _ = [reply async for reply in _generate()(servicer, request, context)]
+            _ = [reply async for reply in _servicer_method()(servicer, request, context)]
         assert exc.value.args[0] is grpc.StatusCode.INVALID_ARGUMENT
         assert not seen
     else:
-        assert [reply async for reply in _generate()(servicer, request, context)] == []
+        assert [reply async for reply in _servicer_method()(servicer, request, context)] == []
         assert len(seen) == 1
         expected = {"chat_template_kwargs": {"thinking_mode": mode}} if mode else None
         assert seen[0].get("reasoning_parser_kwargs") == expected
@@ -289,3 +292,42 @@ async def test_reasoning_options_reach_engine_or_fail_before_submission(
             assert seen[0]["reasoning_ended"] is True
         else:
             assert "reasoning_ended" not in seen[0]
+
+
+@pytest.mark.parametrize("real_vllm", [False, True])
+def test_suppressed_token_ids_survive_sampling_conversion(real_vllm):
+    """A positive client bias or EOS designation cannot remove a singleton bad word."""
+    if real_vllm:
+        sampling = pytest.importorskip("vllm.sampling_params")
+    else:
+        sampling = SimpleNamespace(
+            SamplingParams=SimpleNamespace, RequestOutputKind=SimpleNamespace(DELTA=1)
+        )
+    convert = _servicer_method(
+        "_sampling_params_from_proto",
+        SamplingParams=sampling.SamplingParams,
+        RequestOutputKind=sampling.RequestOutputKind,
+        envs=SimpleNamespace(VLLM_MAX_NUM_BAD_WORDS=2),
+    )
+    servicer = SimpleNamespace(
+        engine=SimpleNamespace(model_config=SimpleNamespace(get_vocab_size=lambda: 16))
+    )
+    wire = pb.SamplingParams(
+        top_k=8, suppressed_token_ids=[2, 3], stop_token_ids=[2, 5], logit_bias={2: 99, 7: 15}
+    )
+    params = convert(servicer, wire)
+    if real_vllm:
+        params = params.clone()
+        params.update_from_tokenizer(None)
+        assert params.bad_words_token_ids == [[2], [3]]
+    assert params._bad_words_token_ids == [[2], [3]]
+    assert params.stop_token_ids == [2, 5]
+    assert params.logit_bias == {2: 99, 7: 15}
+    wire.ClearField("suppressed_token_ids")
+    assert convert(servicer, wire)._bad_words_token_ids is None
+    wire.suppressed_token_ids.append(16)
+    with pytest.raises(ValueError, match="outside the model vocabulary"):
+        convert(servicer, wire)
+    wire.suppressed_token_ids[:] = [2, 3, 4]
+    with pytest.raises(ValueError, match="VLLM_MAX_NUM_BAD_WORDS"):
+        convert(servicer, wire)

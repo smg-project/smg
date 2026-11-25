@@ -140,7 +140,7 @@ async fn streamed(
             &tx,
             Some(session),
             Some(&registry),
-            &[],
+            &Default::default(),
             Some(allowance),
         )
         .await;

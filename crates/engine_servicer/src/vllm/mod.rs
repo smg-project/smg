@@ -186,8 +186,8 @@ pub struct VllmModelInfo {
     /// takes, as the launcher read it off the xgrammar installed beside the
     /// engine (`structural_tag_vocabulary` label): `older` for one that
     /// predates the `optional`, `plus`, `star` and `token` nodes and refuses
-    /// a tag that carries one; empty for a current one, another backend, or
-    /// nothing known.
+    /// a tag that carries one, `current` when token-node support is known,
+    /// or empty for an unknown version or another backend.
     pub structural_tag_vocabulary: String,
     /// Whether the engine's scheduler statistics are on (vLLM's
     /// `--disable-log-stats` not given), as the launcher started it: such an

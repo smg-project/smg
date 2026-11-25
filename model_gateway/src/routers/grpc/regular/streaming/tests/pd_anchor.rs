@@ -506,7 +506,7 @@ fn a_pd_harmony_chat_stream_anchors_at_the_prefill_dispatch() {
                 result,
                 Arc::new(chat_request()),
                 dispatch(),
-                Vec::new(),
+                Default::default(),
                 None,
                 None,
                 source(metrics_labels::ENDPOINT_CHAT),
@@ -542,7 +542,7 @@ fn a_pd_harmony_responses_iteration_records_the_pd_pair_at_its_first_decode_fram
                 &tx,
                 None,
                 None,
-                &[],
+                &Default::default(),
                 None,
             )
             .await;
@@ -578,7 +578,7 @@ fn a_single_harmony_chat_stream_anchors_at_dispatch() {
                 },
                 Arc::new(chat_request()),
                 dispatch(),
-                Vec::new(),
+                Default::default(),
                 None,
                 None,
                 source(metrics_labels::ENDPOINT_CHAT),

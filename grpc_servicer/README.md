@@ -820,16 +820,12 @@ the engine's own server would: the bare calls behind the parser's gate, so the
 call is forced right there; the thought and then the calls from the first
 token.
 
-The Rust servicer's launcher also advertises the vocabulary of structural-tag
-nodes the engine's grammar compiler takes (`GetServerInfo.structural_tag_vocabulary`,
-the `structural_tag_vocabulary` label): `older` when the xgrammar installed
-beside the engine predates the `optional`, `plus`, `star` and `token` nodes
-(0.1.33 is the first release with them) under `xgrammar` or `auto`, read off
-the distribution's metadata at start-up without importing it; absent for a
-current xgrammar or another backend. A router spells such a worker's structural
-tags without `optional`, `plus` and `star`, the same language, instead of a
-compile-time refusal per request; a `token` node stays as derived, so a table
-that writes single-token markers still meets the older compiler's refusal.
+Both vLLM servicers report the installed XGrammar vocabulary in
+`GetServerInfo.structural_tag_vocabulary` for the `xgrammar` and `auto`
+backends. Version 0.1.33 introduced the `optional`, `plus`, `star` and
+`token` nodes. Workers report `current` from that version onward and
+`older` on earlier releases. The field is empty for an unknown version
+or another backend.
 
 #### CUDA-graph capture cap
 

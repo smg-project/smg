@@ -31,7 +31,7 @@ use crate::{
                     utils::{generation_failure_error, response_status},
                 },
             },
-            context::{self, DispatchMetadata, ExecutionResult},
+            context::{self, DispatchMetadata, ExecutionResult, HarmonyReadOptions},
             proto_wrapper::ProtoGenerateComplete,
             regular::processor::generation_start,
         },
@@ -107,8 +107,9 @@ fn enforce_router_stops(
 fn parse_complete_response(
     complete: &ProtoGenerateComplete,
     function: &'static str,
+    require_action: bool,
 ) -> Result<(HarmonyParserAdapter, HarmonyChannelOutput), Response> {
-    let mut parser = HarmonyParserAdapter::new().map_err(|e| {
+    let mut parser = HarmonyParserAdapter::new(require_action).map_err(|e| {
         error!(function, error = %e, "Failed to create Harmony parser");
         error::internal_error(
             "create_harmony_parser_failed",
@@ -141,7 +142,7 @@ impl HarmonyResponseProcessor {
 
     /// Process a non-streaming Harmony chat response
     ///
-    /// `router_stop_strings` is non-empty only when the router must enforce
+    /// `read_options.stop_strings` is non-empty only when the router must enforce
     /// string `stop` sequences itself (direct-ZMQ backends: the engine sees
     /// token ids only).
     ///
@@ -153,7 +154,7 @@ impl HarmonyResponseProcessor {
         execution_result: ExecutionResult,
         chat_request: Arc<ChatCompletionRequest>,
         dispatch: DispatchMetadata,
-        router_stop_strings: &[String],
+        read_options: &HarmonyReadOptions,
     ) -> Result<(ChatCompletionResponse, response_formatting::TokenCounts), Response> {
         let started = generation_start(&execution_result);
         let request_logprobs = chat_request.logprobs;
@@ -175,8 +176,11 @@ impl HarmonyResponseProcessor {
         for (index, complete) in all_responses.iter().enumerate() {
             let matched_stop = complete.matched_stop_json();
 
-            let (_, mut parsed) =
-                parse_complete_response(complete, "process_non_streaming_chat_response")?;
+            let (_, mut parsed) = parse_complete_response(
+                complete,
+                "process_non_streaming_chat_response",
+                read_options.require_action,
+            )?;
 
             // Convert output logprobs if present: one entry per generated
             // token, with the candidates the request's `top_logprobs` asked for.
@@ -192,7 +196,7 @@ impl HarmonyResponseProcessor {
 
             // The router's own stops, where the engine cannot match them: the
             // turn is cut at the first match, and that stop is the choice's.
-            let matched_stop = match enforce_router_stops(router_stop_strings, &mut parsed) {
+            let matched_stop = match enforce_router_stops(&read_options.stop_strings, &mut parsed) {
                 Some(stop) => Some(serde_json::Value::String(stop)),
                 None => matched_stop,
             };
@@ -297,7 +301,7 @@ impl HarmonyResponseProcessor {
     /// * `execution_result` - The execution result from the model
     /// * `responses_request` - The original Responses API request
     /// * `dispatch` - Dispatch metadata for request tracking
-    /// * `router_stop_strings` - The string `stop`s the router must enforce
+    /// * `read_options.stop_strings` - The string `stop`s the router must enforce
     ///   itself, non-empty only where the engine sees token ids and cannot
     ///   match them: the turn is cut at the first match, as a chat turn is
     ///
@@ -312,7 +316,7 @@ impl HarmonyResponseProcessor {
         execution_result: ExecutionResult,
         responses_request: Arc<ResponsesRequest>,
         dispatch: DispatchMetadata,
-        router_stop_strings: &[String],
+        read_options: &HarmonyReadOptions,
     ) -> Result<(ResponsesIterationResult, response_formatting::TokenCounts), Response> {
         let request_logprobs = responses_request.top_logprobs.is_some();
 
@@ -331,8 +335,11 @@ impl HarmonyResponseProcessor {
             .first()
             .ok_or_else(|| error::internal_error("no_complete_response", "No complete response"))?;
 
-        let (parser, mut parsed) =
-            parse_complete_response(complete, "process_responses_iteration")?;
+        let (parser, mut parsed) = parse_complete_response(
+            complete,
+            "process_responses_iteration",
+            read_options.require_action,
+        )?;
 
         // VALIDATION: Check if model incorrectly generated Tool role messages
         // This happens when the model copies the format of tool result messages
@@ -352,7 +359,7 @@ impl HarmonyResponseProcessor {
 
         // The router's own stops, where the engine cannot match them: the
         // turn is cut at the first match, the calls past it dropped.
-        enforce_router_stops(router_stop_strings, &mut parsed);
+        enforce_router_stops(&read_options.stop_strings, &mut parsed);
 
         // The engine's counts of the iteration and the usage they make, as
         // the streamed iteration builds it (needed for both ToolCallsFound

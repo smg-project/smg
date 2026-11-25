@@ -10,6 +10,7 @@ import pytest
 from google.protobuf import descriptor_pb2, descriptor_pool, message_factory
 from smg_grpc_proto import vllm_engine_pb2
 from smg_grpc_proto.generated import common_pb2
+from smg_grpc_servicer import constrained_decoding
 from smg_grpc_servicer.vllm import model_info
 from smg_grpc_servicer.vllm.scheduler_loads import managed_ranks
 
@@ -37,6 +38,7 @@ def _server_info_method(response_type):
         "mm_item_limits": model_info.mm_item_limits,
         "engine_reasoning_parser": model_info.engine_reasoning_parser,
         "constrained_decoding_start": model_info.constrained_decoding_start,
+        "vllm_structural_tag_vocabulary": model_info.vllm_structural_tag_vocabulary,
     }
     exec(compile(ast.Module(body=[method], type_ignores=[]), str(_SERVICER), "exec"), namespace)
     return namespace["GetServerInfo"]
@@ -119,11 +121,14 @@ def _response_type_without(*names):
 
 
 @pytest.mark.parametrize("legacy", [False, True])
-def test_get_server_info_reports_where_the_engine_starts_a_grammar(legacy):
+def test_get_server_info_reports_where_the_engine_starts_a_grammar(legacy, monkeypatch):
     """The handler sets the reasoning-parser facts off the structured-outputs config when the
     schema carries the fields, and leaves them alone (no error) under an older schema."""
+    monkeypatch.setattr(constrained_decoding, "installed_xgrammar_version", lambda: "0.1.33")
     response_type = (
-        _response_type_without("engine_reasoning_parser", "constrained_decoding_start")
+        _response_type_without(
+            "engine_reasoning_parser", "constrained_decoding_start", "structural_tag_vocabulary"
+        )
         if legacy
         else _response_type(False)
     )
@@ -144,6 +149,7 @@ def test_get_server_info_reports_where_the_engine_starts_a_grammar(legacy):
     else:
         assert info.engine_reasoning_parser == "deepseek_r1"
         assert info.constrained_decoding_start == "after_reasoning"
+        assert info.structural_tag_vocabulary == "current"
 
 
 @pytest.mark.parametrize("legacy", [False, True])

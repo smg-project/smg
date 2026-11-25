@@ -499,6 +499,27 @@ fn a_grammar_led_for_the_first_token_starts_there_whatever_the_engines_parser() 
 }
 
 #[test]
+fn suppressed_tokens_become_single_token_bad_words() {
+    for ids in [vec![], vec![199999u32, 200012]] {
+        let request = translate_request(
+            tokenized_req(vllm::SamplingParams {
+                suppressed_token_ids: ids.clone(),
+                logit_bias: [(42, 1.0)].into(),
+                ..Default::default()
+            }),
+            4096,
+            ModelDtype::BFloat16,
+            &EosTokenIds::default(),
+        )
+        .expect("translated");
+        let sampling = request.sampling_params.expect("sampling params");
+        let expected = (!ids.is_empty()).then(|| ids.into_iter().map(|id| vec![id]).collect());
+        assert_eq!(sampling.bad_words_token_ids, expected);
+        assert_eq!(sampling.logit_bias, Some([(42, 1.0)].into()));
+    }
+}
+
+#[test]
 fn vllm_forwards_prompt_logprobs() {
     // Prompt logprobs ride the wire sampling params verbatim.
     let request = translate_request(
@@ -564,6 +585,7 @@ fn out_of_vocab_token_ids_are_refused() {
     };
     let ok = tokenized_req(vllm::SamplingParams {
         stop_token_ids: vec![0, 999],
+        suppressed_token_ids: vec![0, 999],
         logit_bias: [(0, 1.0), (999, -5.0)].into_iter().collect(),
         ..Default::default()
     });
@@ -590,6 +612,14 @@ fn out_of_vocab_token_ids_are_refused() {
     assert!(check(&stop)
         .unwrap_err()
         .contains("[1000] in stop_token_ids"));
+
+    let suppressed = tokenized_req(vllm::SamplingParams {
+        suppressed_token_ids: vec![999, 1000, 1000],
+        ..Default::default()
+    });
+    assert!(check(&suppressed)
+        .unwrap_err()
+        .contains("[1000] in suppressed_token_ids"));
 
     let mut prompt = tokenized_req(vllm::SamplingParams::default());
     if let Some(vllm::generate_request::Input::Tokenized(t)) = prompt.input.as_mut() {

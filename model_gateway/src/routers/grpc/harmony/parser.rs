@@ -50,22 +50,68 @@ fn append_reasoning(analysis: &mut Option<String>, text: String) {
 /// complete responses and streaming chunks.
 pub(crate) struct HarmonyParserAdapter {
     parser: StreamableParser,
+    action_stop_ids: Vec<u32>,
     prev_recipient: Option<String>,
     reasoning_token_count: u32,
 }
 
 impl HarmonyParserAdapter {
     /// Create a new Harmony parser
-    pub fn new() -> Result<Self, String> {
+    pub fn new(require_action: bool) -> Result<Self, String> {
         let encoding = try_harmony_encoding()?;
         let parser = StreamableParser::new(encoding.clone(), Some(Role::Assistant))
             .map_err(|e| format!("Failed to create StreamableParser: {e}"))?;
 
+        let action_stop_ids = if require_action {
+            encoding
+                .stop_tokens_for_assistant_actions()
+                .map_err(|e| format!("Failed to load Harmony action stops: {e}"))?
+                .into_iter()
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         Ok(Self {
             parser,
+            action_stop_ids,
             prev_recipient: None,
             reasoning_token_count: 0,
         })
+    }
+
+    fn process_token(&mut self, token_id: u32) -> Result<(), String> {
+        self.parser
+            .process(token_id)
+            .map_err(|e| format!("Failed to process token {token_id}: {e}"))?;
+
+        // String-based grammars also accept ordinary BPE tokens spelling
+        // <|message|>. Only the special token closes a Harmony header. The
+        // strict parser reports an unfinished header on EOS, so check at a
+        // real action stop; a length limit or a user stop can cut any header.
+        if self.action_stop_ids.contains(&token_id) {
+            self.parser
+                .process_eos()
+                .map_err(|e| format!("Invalid Harmony message at action stop: {e}"))?;
+            // A byte-spelled transition after real analysis is ordinary message
+            // text to Harmony. The generated grammar still requires a real
+            // assistant output before the action stop.
+            let valid_output = self.parser.messages().last().is_some_and(|message| {
+                message.author.role == Role::Assistant
+                    && (message.channel.as_deref() == Some("final")
+                        || message
+                            .recipient
+                            .as_deref()
+                            .is_some_and(|r| r.starts_with("functions.")))
+            });
+            if !valid_output {
+                return Err(
+                    "Constrained Harmony turn ended without a final message or function call"
+                        .into(),
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Extract text from message content (private helper)
@@ -233,9 +279,7 @@ impl HarmonyParserAdapter {
 
         // Feed all tokens to the parser
         for &token_id in output_ids {
-            self.parser
-                .process(token_id)
-                .map_err(|e| format!("Failed to process token {token_id}: {e}"))?;
+            self.process_token(token_id)?;
 
             if self.in_reasoning_channel() {
                 reasoning_token_count += 1;
@@ -336,9 +380,7 @@ impl HarmonyParserAdapter {
 
         // Process each token
         for &token_id in chunk_ids {
-            self.parser
-                .process(token_id)
-                .map_err(|e| format!("Failed to process token {token_id}: {e}"))?;
+            self.process_token(token_id)?;
 
             if self.in_reasoning_channel() {
                 self.reasoning_token_count += 1;
@@ -445,5 +487,123 @@ impl HarmonyParserAdapter {
     /// Final HarmonyChannelOutput with complete parsed content
     pub fn finalize(&mut self, finish_reason: String) -> HarmonyChannelOutput {
         self.output(finish_reason, self.reasoning_token_count)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn byte_spelled_headers_fail_at_the_action_stop_collected_and_streamed() {
+        let tokenizer = try_harmony_encoding()
+            .expect("Harmony encoding")
+            .tokenizer();
+        for (header, stop) in [
+            ("<|channel|>final<|message|>", "<|return|>"),
+            (
+                "<|channel|>commentary to=functions.lookup<|message|>",
+                "<|call|>",
+            ),
+        ] {
+            let prefix = tokenizer.encode_ordinary(&format!("{header}{{}}"));
+            let stop_ids = tokenizer.encode_with_special_tokens(stop);
+            let turn = [prefix.as_slice(), &stop_ids].concat();
+
+            let mut collected = HarmonyParserAdapter::new(true).expect("Harmony parser");
+            let error = collected
+                .parse_complete(&turn, "stop".to_string())
+                .expect_err("a natural stop cannot complete a byte-spelled header");
+            assert!(error.contains("message header"), "{error}");
+
+            let mut streamed = HarmonyParserAdapter::new(true).expect("Harmony parser");
+            for token in &prefix {
+                assert!(streamed
+                    .parse_chunk(std::slice::from_ref(token))
+                    .expect("the header is still open")
+                    .is_none());
+            }
+            assert!(streamed
+                .parse_chunk(&stop_ids)
+                .expect_err("the terminal chunk must report the malformed header")
+                .contains("message header"));
+
+            for reason in ["length", "stop"] {
+                let mut cut = HarmonyParserAdapter::new(true).expect("Harmony parser");
+                assert!(
+                    cut.parse_complete(&prefix, reason.to_string()).is_ok(),
+                    "a length limit or explicit stop can cut off the header"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn constrained_analysis_must_be_followed_by_a_real_output() {
+        let tokenizer = try_harmony_encoding()
+            .expect("Harmony encoding")
+            .tokenizer();
+        let analysis = tokenizer.encode_with_special_tokens("<|channel|>analysis<|message|>Think.");
+        let stop = tokenizer.encode_with_special_tokens("<|return|>");
+        for header in ["final", "commentary to=functions.lookup"] {
+            let transition = format!("<|end|><|start|>assistant<|channel|>{header}<|message|>{{}}");
+            for real_markers in [false, true] {
+                let mut prefix = analysis.clone();
+                prefix.extend(if real_markers {
+                    tokenizer.encode_with_special_tokens(&transition)
+                } else {
+                    tokenizer.encode_ordinary(&transition)
+                });
+                let turn = [prefix.as_slice(), &stop].concat();
+                let mut collected = HarmonyParserAdapter::new(true).unwrap();
+                let collected = collected.parse_complete(&turn, "stop".into());
+                let mut streamed = HarmonyParserAdapter::new(true).unwrap();
+                for chunk in prefix.chunks(2) {
+                    streamed.parse_chunk(chunk).unwrap();
+                }
+                let terminal = streamed.parse_chunk(&stop);
+                if real_markers {
+                    let collected = collected.unwrap();
+                    terminal.unwrap();
+                    let streamed = streamed.finalize("stop".into());
+                    for result in [collected, streamed] {
+                        assert_eq!(result.analysis.as_deref(), Some("Think."));
+                        if header == "final" {
+                            assert_eq!(result.final_text, "{}");
+                        } else {
+                            assert_eq!(result.commentary.unwrap()[0].function.name, "lookup");
+                        }
+                    }
+                } else {
+                    assert!(collected.unwrap_err().contains("without a final message"));
+                    assert!(terminal.unwrap_err().contains("without a final message"));
+                    // An explicit cut before the action token and unconstrained
+                    // output have no final-message requirement.
+                    HarmonyParserAdapter::new(true)
+                        .unwrap()
+                        .parse_complete(&prefix, "length".into())
+                        .unwrap();
+                    HarmonyParserAdapter::new(false)
+                        .unwrap()
+                        .parse_complete(&turn, "stop".into())
+                        .unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn byte_spelled_markers_remain_literal_in_a_valid_message() {
+        let tokenizer = try_harmony_encoding()
+            .expect("Harmony encoding")
+            .tokenizer();
+        let mut turn = tokenizer.encode_with_special_tokens("<|channel|>final<|message|>");
+        turn.extend(tokenizer.encode_ordinary("The literal marker is <|message|>."));
+        turn.extend(tokenizer.encode_with_special_tokens("<|return|>"));
+        let mut parser = HarmonyParserAdapter::new(true).expect("Harmony parser");
+        let result = parser
+            .parse_complete(&turn, "stop".to_string())
+            .expect("valid message");
+        assert_eq!(result.final_text, "The literal marker is <|message|>.");
     }
 }
