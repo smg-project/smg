@@ -247,11 +247,9 @@ impl Sides {
             key
         });
         let ring = self.ring.as_ref().map(|ring| ring as &dyn LentRing);
-        let items = EncodeItems {
-            keys: &keys,
-            ring,
-            ..EncodeItems::default()
-        };
+        let mut items = EncodeItems::default();
+        items.keys = &keys;
+        items.ring = ring;
         if one_call {
             self.place_items(host, items, ring, rule)
         } else {
@@ -265,10 +263,8 @@ impl Sides {
     /// encoder places nothing.
     fn decide(&self, host: &Host, seed: u64) -> Option<u32> {
         let keys = keys(seed);
-        let items = EncodeItems {
-            keys: &keys,
-            ..EncodeItems::default()
-        };
+        let mut items = EncodeItems::default();
+        items.keys = &keys;
         self.decide_items::<false>(host, seed, items)
     }
 
@@ -324,10 +320,8 @@ impl Sides {
     /// item with no encoder places nothing.
     fn place(&self, host: &Host, seed: u64, rule: bool) -> Option<u32> {
         let keys = keys(seed);
-        let items = EncodeItems {
-            keys: &keys,
-            ..EncodeItems::default()
-        };
+        let mut items = EncodeItems::default();
+        items.keys = &keys;
         self.place_items(host, items, None, rule)
     }
 
@@ -418,11 +412,10 @@ pub(super) fn runs(run: &Run) -> bool {
     let every = (0..prefills.len()).map(|_| partners.as_slice());
     let mut sees = FixedFacts::default();
     sees.vision = true;
-    let class = EncoderFacts {
-        class: 1,
-        pushes: false,
-        references: false,
-    };
+    let mut class = EncoderFacts::default();
+    class.class = 1;
+    class.pushes = false;
+    class.references = false;
     let sides = Sides {
         classes: PartnerClasses::number(decodes.len(), every),
         decodes: published(&decodes),

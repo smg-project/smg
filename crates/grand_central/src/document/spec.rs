@@ -9194,6 +9194,21 @@ mod tests {
         assert!(alone.validate().is_ok());
     }
 
+    /// The start a binding is built from by hand ([`Binding::of`]) is the
+    /// binding a document gets that states its model and its profile and
+    /// nothing else: the two are held equal here.
+    #[test]
+    fn a_binding_of_a_model_and_a_profile_alone_is_the_start_built_by_hand() {
+        let built = spec_with_binding(r#"{"match":{"model":"m"},"profile":"p"}"#)
+            .validate()
+            .expect("the binding validates");
+        let binding = built.binding("m", Phase::Single).expect("the binding");
+        assert_eq!(
+            format!("{binding:?}"),
+            format!("{:?}", Binding::of("m".into(), 0))
+        );
+    }
+
     #[test]
     fn the_binding_rules_are_checked_in_shape_then_by_the_build() {
         // A block names no number, and a null is no number. Switched on or

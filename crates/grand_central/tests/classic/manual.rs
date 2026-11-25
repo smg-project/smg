@@ -162,12 +162,10 @@ impl Bed {
         );
         let pick = decision.pick().expect("a pick");
         let target = *pick.targets.first().expect("a target");
-        let lease = Lease {
-            issued_micros: self.clock,
-            session: facts.session(),
-            session_verdict: pick.session_verdict,
-            ..Lease::default()
-        };
+        let mut lease = Lease::default();
+        lease.issued_micros = self.clock;
+        lease.session = facts.session();
+        lease.session_verdict = pick.session_verdict;
         self.engine.on_dispatched(&lease, &target, Side::Single, 0);
         target.position as usize
     }
@@ -201,12 +199,10 @@ impl Bed {
         };
         let prefills = side(prefills, WorkerRole::Prefill);
         let decodes = side(&self.pool, WorkerRole::Decode);
-        let pools = PairPools {
-            prefills: &prefills,
-            decodes: &decodes,
-            table: PairTable::new(&[1], &[1]),
-            ..PairPools::default()
-        };
+        let mut pools = PairPools::default();
+        pools.prefills = &prefills;
+        pools.decodes = &decodes;
+        pools.table = PairTable::new(&[1], &[1]);
         let cx = Constraints::default();
         let decision =
             (self.engine).decide_pair(&facts, &pool_facts, pools, &cx, &cx, &mut self.scratch);
@@ -223,28 +219,23 @@ impl Bed {
             }
             .session()
         };
-        let prefill = Lease {
-            issued_micros: self.clock,
-            side: Side::Prefill,
-            session: session(Phase::Prefill),
-            session_verdict: pick.session_verdict,
-            ..Lease::default()
-        };
+        let mut prefill = Lease::default();
+        prefill.issued_micros = self.clock;
+        prefill.side = Side::Prefill;
+        prefill.session = session(Phase::Prefill);
+        prefill.session_verdict = pick.session_verdict;
         self.engine
             .on_dispatched(&prefill, &target, Side::Prefill, 0);
-        let decode = Lease {
-            side: Side::Decode,
-            booked: pair.decode_id,
-            session: session(Phase::Decode),
-            session_verdict: pair.decode_verdict.on(pair.decode_id),
-            ..prefill
-        };
-        let went = Target {
-            position: pair.decode_position,
-            id: pair.decode_id,
-            dp_rank: pair.decode_dp_rank,
-            pair: None,
-        };
+        let mut decode = prefill;
+        decode.side = Side::Decode;
+        decode.booked = pair.decode_id;
+        decode.session = session(Phase::Decode);
+        decode.session_verdict = pair.decode_verdict.on(pair.decode_id);
+        let mut went = Target::default();
+        went.position = pair.decode_position;
+        went.id = pair.decode_id;
+        went.dp_rank = pair.decode_dp_rank;
+        went.pair = None;
         self.engine.on_dispatched(&decode, &went, Side::Decode, 0);
         [target.position as usize, pair.decode_position as usize]
     }

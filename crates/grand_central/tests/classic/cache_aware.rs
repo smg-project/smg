@@ -442,13 +442,11 @@ impl Bed {
             }
         };
         let target = *pick.targets.first().expect("a target");
-        let lease = Lease {
-            issued_micros: self.clock,
-            // A request carried as text states no size: the load stage
-            // credits its dispatch at its own mean.
-            tokens: if text { 0 } else { prompt.len() as u32 },
-            ..Lease::default()
-        };
+        let mut lease = Lease::default();
+        lease.issued_micros = self.clock;
+        // A request carried as text states no size: the load stage
+        // credits its dispatch at its own mean.
+        lease.tokens = if text { 0 } else { prompt.len() as u32 };
         self.engine.on_dispatched(&lease, &target, Side::Single, 0);
         let place = target.position as usize;
         self.pool[place].in_flight += 1;

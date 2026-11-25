@@ -89,20 +89,13 @@ const SENT_AT: u64 = 85_000;
 
 /// Tells the engine of one send to the row at `SENT_AT`, of `tokens` prompt tokens.
 fn send(engine: &Engine, row: &Candidate, tokens: u32) {
-    engine.on_dispatched(
-        &Lease {
-            issued_micros: SENT_AT,
-            tokens,
-            ..Lease::default()
-        },
-        &Target {
-            id: row.id,
-            dp_rank: row.dp_rank,
-            ..Target::default()
-        },
-        Side::Single,
-        0,
-    );
+    let mut lease = Lease::default();
+    lease.issued_micros = SENT_AT;
+    lease.tokens = tokens;
+    let mut target = Target::default();
+    target.id = row.id;
+    target.dp_rank = row.dp_rank;
+    engine.on_dispatched(&lease, &target, Side::Single, 0);
 }
 
 #[test]

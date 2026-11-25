@@ -4,12 +4,6 @@
 //! on its stream and the host's fallback takes over at once, so the enum
 //! never carries one.
 
-#![expect(
-    clippy::exhaustive_enums,
-    clippy::exhaustive_structs,
-    reason = "a caller still builds or matches these types whole: each mark comes with its call"
-)]
-
 use std::fmt;
 
 #[cfg(any(test, feature = "in-process"))]
@@ -33,9 +27,11 @@ pub const TRACE_TOP: usize = 3;
 /// One target: a candidate by position and id, with the decode side when the
 /// decision is a pair.
 ///
-/// The record gains fields: code outside this crate that builds one writes the
-/// rest as `..Target::default()`, and a pattern of it ends with `..`.
+/// The record gains fields: code outside this crate starts from the default,
+/// or from [`Target::of`], and assigns what it knows, and a pattern of it
+/// ends with `..`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Target {
     /// Position in the host's candidate slice (the prefill's for a pair).
     pub position: u32,
@@ -48,9 +44,11 @@ pub struct Target {
 /// The decode side of a pair target, by position in the host's decode slice.
 /// The rendezvous the two sides meet at is the host's at dispatch.
 ///
-/// The record gains fields: code outside this crate that builds one writes the
-/// rest as `..Pair::default()`, and a pattern of it ends with `..`.
+/// The record gains fields: code outside this crate starts from the default,
+/// or from [`Pair::of`], and assigns what it knows, and a pattern of it
+/// ends with `..`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Pair {
     pub decode_position: u32,
     pub decode_id: WorkerId,
@@ -339,6 +337,7 @@ impl fmt::Debug for Survivors {
 /// a byte the record had spare: the trace is no larger for it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum LiftedVeto {
     /// No veto was lifted.
     #[default]
@@ -368,6 +367,7 @@ impl From<LiftedVeto> for proto::LiftedVeto {
 /// per-scorer contributions, the plan, the picker and the shadow pick join it
 /// with the observability contract.
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct Trace {
     /// The position of the profile the decision was made under, or
     /// [`Self::NO_PROFILE`] where it was made ahead of every profile.
@@ -684,6 +684,7 @@ impl Pick {
 
 /// A shed: the reason, the stage that emptied the pool, and the pacing hint.
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct Shed {
     pub reason: ShedReason,
     /// The name of the filter or picker that left nothing.
@@ -699,6 +700,7 @@ pub struct Shed {
 /// built-in issues one until the admission step, and a host that meets one
 /// refuses the request.
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct Queue {
     pub ticket: u64,
     /// The longest the ticket may wait, within the request's admission

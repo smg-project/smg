@@ -309,15 +309,11 @@ fn a_report_age_limit_keeps_dispatch_credit_until_membership_removes_it() {
     let engine = policy(r#""least-load""#, Some(LIMIT_MS));
     assert!(engine.needs().loads);
     let rows = [candidate(0, EDGE), candidate(1, EDGE)];
-    let lease = Lease {
-        issued_micros: EDGE + 1,
-        tokens: 9_000,
-        ..Lease::default()
-    };
-    let target = Target {
-        id: rows[0].id,
-        ..Target::default()
-    };
+    let mut lease = Lease::default();
+    lease.issued_micros = EDGE + 1;
+    lease.tokens = 9_000;
+    let mut target = Target::default();
+    target.id = rows[0].id;
     assert_eq!(scores(&engine, &request(), &rows), [1.0, 0.0]);
     engine.on_dispatched(&lease, &target, Side::Single, 0);
     assert_eq!(scores(&engine, &request(), &rows), [0.0, 1.0]);
@@ -382,14 +378,13 @@ fn both_sides_of_a_pair_use_the_report_age_limit() {
     let (prefills, decodes) = (side(0), side(2));
     let cx = Constraints::default();
     let decide = |engine: &Engine| {
+        let mut pools = PairPools::default();
+        pools.prefills = &prefills;
+        pools.decodes = &decodes;
         let Decision::Pick(pick) = engine.decide_pair(
             &request(),
             &PoolFacts::default(),
-            PairPools {
-                prefills: &prefills,
-                decodes: &decodes,
-                ..PairPools::default()
-            },
+            pools,
             &cx,
             &cx,
             &mut Scratch::new(),

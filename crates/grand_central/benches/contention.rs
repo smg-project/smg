@@ -87,14 +87,15 @@ fn decide_and_book(
     // Dated after every row's sample, so the credit stands and the next
     // decision prices it: at one instant, or at the clock every booking of
     // every thread advances, so the lanes interleave.
-    let dated = || Lease {
-        issued_micros: if shape.rising {
+    let dated = || {
+        let mut lease = Lease::default();
+        lease.issued_micros = if shape.rising {
             1_000_000 + CLOCK.fetch_add(1, Ordering::Relaxed)
         } else {
             1_000_000
-        },
-        tokens: 512,
-        ..Lease::default()
+        };
+        lease.tokens = 512;
+        lease
     };
     let mut seed = thread << 48;
     let decide = |seed: u64, scratch: &mut Scratch| {
