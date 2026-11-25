@@ -800,7 +800,7 @@ lends the engine in the same type **[built]**.
 | a model's worker list | the registry, at each membership change | yes | yes, the same list |
 | the worker object's state | health checker, load monitor, load guard (on a controller, the leases on file), outcomes | yes | yes, at each decision, and once more for each worker of a target the placement call tests behind the pick |
 | `LoadSnapshot` | the load monitor | `least_load`, `cache_aware`, `power_of_two` | yes, the latest snapshot; a controller's deciding thread gives it with each request, where the document keeps no report |
-| the index of cache events | the workers' event streams | `cache_aware` | yes, through `CacheIndex`; a controller lends its engines the index in its worker host's KV tables (`worker_host/kv_read.rs`) |
+| the index of cache events | the workers' event streams | `cache_aware` | yes, through `CacheIndex`; a controller lends its engine the index in its worker host's KV tables (`worker_host/kv_read.rs`) |
 | the two trees | the deciding policy: classic's, or the engine inside the tree's walk | `cache_aware` | the host's own trees, lent: the token tree **[built]**, the string tree **[built]** |
 
 ## 5. The engine
@@ -827,17 +827,20 @@ takes over the sends of a standing one (`Engine::succeed`). Profiles whose
 stages read a count under the same `sent_ttl_ms` and `sent_report_delay_ms` read one count, and a
 document that states neither, as the one built from the routing settings does, puts them all under
 one. It holds no worker of its own: the registry that its host hands it (section 8.1) holds them. A
-controller builds a new engine object for each document it applies. That object keeps the stages of
-an unchanged profile from the object before it, by the same rules (section 10.2).
+controller keeps one engine object too, built at its store's start: the store puts each document it
+applies in force on it, by `InProcess::apply`, the call of a host that keeps one engine (section
+8.1, step 6, and section 10.2).
 
 A word of a lease issued under an earlier document is told by one rule, in a gateway's own process
 and on a controller: the stages kept since the lease's document hear it, every count of sends in
-force takes a dispatch, and a stage built since hears nothing. The session table hears it where
-the table stood at the lease's issue. A gateway's engine keeps one table for its life. A
-controller's table is the new engine object's own: it starts empty and hears nothing of an earlier
-lease, whose first decision claimed in the table that left (section 10.2).
+force takes a dispatch, the session table hears it, and a stage built since hears nothing. Either
+host keeps one session table for its engine's life, so a lease's word reaches the table its claim
+was made in. On a controller the document in force at a word is the one its store's standing world
+holds, and a lease of a generation above it tells no stage (section 10.2).
 
-An entry of the engine reads the document through a reference its own thread keeps. The engine
+An entry of the engine reads the document through a reference its own thread keeps, but for the
+entries that issue no lease: those run under the document their caller hands, a controller's
+world's (section 10.2), and their thread keeps none. The engine
 holds the number of the document in force in one atomic word, written behind the document at an
 apply. A thread keeps one counted reference of the document it read last, and an entry compares
 that document's number with the engine's. Where they are one, the entry takes a plain count on the
@@ -867,10 +870,10 @@ pub struct InProcess {
     affinity: Affinity,   // cache affinity: the host's index of cache events, and the engine's own
                           // record of the prefixes it sent, one for each model
     epochs: AtomicU64,    // how many list values were made
-    held: Arc<HeldFaults>, // the panics the engine held, three counts: decisions that panicked, lease events
+    held: HeldFaults,     // the panics the engine held, three counts: decisions that panicked, lease events
                           // and membership changes that panicked inside a stage, and steps of the engine's
                           // own task that panicked (the upkeep, the registry's follow, a telling of load
-                          // reports). A controller's store hands every engine it builds one set of them
+                          // reports). A controller's store reads them of its one engine
     loads: task::Loads,   // the host's load channel, once handed, and the newest load snapshot
                           // the engine's own task keeps at hand
     members: membership::Handed, // the host's worker registry, once handed: the engine's own task
@@ -1271,7 +1274,7 @@ held and counted apart: the request keeps its decision and its lease, and a regi
 removal or an apply goes on. A gateway shows both counts and the count of its upkeep's panics
 at each scrape of its metrics endpoint, as the series `smg_policy_faults_total` by `kind`:
 `decision`, `event` and `upkeep`. A controller shows the same series on its metrics page,
-counted over every engine its store built, so a count outlasts the document it rose under. Its
+counted on its store's one engine, so a count outlasts the document it rose under. Its
 `event` is a change of membership alone: a controller holds a stage's panic at a word of a
 lease under catches of its own, and counts it in series of its own. Where such a panic unwinds
 the decision that told the word, as at the issue of a single's or a pair's lease, the request
@@ -1344,8 +1347,8 @@ The types the two engines shared stay where they were moved ahead of the deletio
   its trait `PinSource`: no host lent any. A session's worker outlives a document on the same
   engine object, which is built. The call that puts a later document in force there shares
   the engine's table with the new document's engine (`Engine::share_sessions`, section 5.1).
-  A controller builds a new engine object for each document, and its pins start empty
-  (section 10.2).
+  A controller's store makes that call on its one engine object, so a session's worker outlives
+  a document there too (section 10.2).
 - The trait's method that the kept engine answers with a constant, `decide_encode_pair`, is built
   or removed. It is removed, and the guard's maker of that name with it, which is done: a host
   asks the engine's own entry with its three lists (`InProcess::decide_encode_at`) and holds
@@ -1537,8 +1540,9 @@ controller keep it differently on main.
 
 - **At start.** The gateway takes steps 1 to 3 of section 8.1's start. It hands no lists yet
   (step 4). A controller takes step 3 alone: its holder lends each role's list with its cell
-  (section 4.1). Its store builds an engine object for each document it applies, with no
-  hand-over (section 10.2).
+  (section 4.1). Its store builds one engine object at its start, with no hand-over but the
+  index of cache events the controller lends it (section 4.6), and puts each document it
+  applies in force on it (section 10.2).
 - **For each request.** The gateway makes the one call of section 8.2 and keeps the placement. A
   controller states worker ids of its own and keeps no placement: it calls the entry that issues
   nothing and files its own record.
@@ -2447,7 +2451,7 @@ objects and its load monitor, in the worker host's tables and in the engine's ow
 | health | the worker crate's health checker over the worker objects, on the leader | copied into the records |
 | loads | the worker crate's load monitor over the worker objects, while the replica leads: a poll every 10 seconds, and the load records on the workers' streams | a single request's decision is given the monitor's snapshot where the document reads reports and keeps none; the store holds no load table |
 | cache index | a follower of each worker's cache events | an index in the worker host's KV tables (`worker_host::KvTables`), which the holder of the worker objects is handed; a decision reads it through the engine's two index traits (`worker_host/kv_read.rs`), and the engine's own record of sent prompts for a worker the index holds no block for, and for every worker on a request given as text or under a profile that reads the record alone (`source: predictor`) |
-| leases | decisions | not replicated to a standby; a lease that counts for its session key steps that key's count on its worker's object, which a controller's in-flight cap reads (10.2); a single request's session pins are the engine's own table, one for each document |
+| leases | decisions | not replicated to a standby; a lease that counts for its session key steps that key's count on its worker's object, which a controller's in-flight cap reads (10.2); a single request's session pins are the engine's own table, one for the store's life |
 
 The gRPC service (`crates/grand_central/contracts/grand_central.proto`):
 
@@ -2592,7 +2596,7 @@ the worker crate's structures, and the one engine.
 | health | the worker crate's health checker over the worker objects, on the leader; each outcome moves the object, the store's record is told the status that stands, and a decision reads the object's | the same checker; a decision reads the object's own status; a gateway's veto on a worker stays in the store |
 | loads | the worker crate's load monitor over the worker objects, while the replica leads, fed by its polls and by the load records on the workers' streams: a decision is given its snapshot where the document reads reports and keeps none, and reads the overload verdict on the object; the crate's own poller runs no more, and the store holds no load table | the worker crate's load monitor, publishing `LoadSnapshot` (decision 10). Every worker is judged by the thresholds its object states, so the loads of every worker the controller dials are read: no new cost against classic as it runs by default, whose gateway hands each worker of an engine the same two defaults and an external worker none at its registration, as a controller's objects state them. A gateway started with `--disable-load-monitoring` polls by need, and this monitor polls every group |
 | cache events | an index in the worker host's KV tables, which a decision reads through the engine's two index traits | the kv-index crate's index, filled by the worker crate's collector |
-| sessions | the engine's session table for a single request, one for each document | the engine's session table |
+| sessions | the engine's session table for a single request, one for the store's life | the engine's session table |
 | leases | the store's lease tables, in memory, one for each deciding thread | stay: a controller must remember what it issued to gateways |
 | decisions | a single request, a pair at its prefill, its decode call, an encode request that carries its items, and a prefill or a decode request that stands alone: `InProcess` over the registry's lists; a frame of the encode phase that does not state `DecideRequest.encode`, and a decode request that names no lease under a pair plan: none, the request is answered `Busy` | `InProcess::decide_without_lease` over the registry's lists, and `decide_encode_without_lease` over an encode request's three |
 | discovery | the discovery crate through its host interface, registering and removing through the worker crate's job queue while the replica leads; behind a feature the image leaves out; a worker's API key is refused at the start, since no replica keeps one | the same in the image, with a worker's API key; how a replica comes by the key of a worker found before it led is open, as a gateway's way to a key is (section 11) |
@@ -2621,13 +2625,25 @@ order they registered, where the store's copy was sorted by id. It reads a worke
 breaker and its stalled bit on the worker object, and the count of requests in flight there, which
 the store steps for each lease on file. A record made of a worker object states one protocol and
 no zone.
-The asking gateway's reach, its wires and its standing vetoes are stated to the engine as places
-of the list. A new document is a new engine object: its session pins and its record of sent
-prompts start empty. The stages of a profile whose name and text did not change do not start
-empty, under the rules of section 5.1: the new object keeps them from the one before it, with what
-they hold, and tells the members that stand to the stages it built new alone. A lease issued under
-the earlier document is told to the stages kept, and writes nothing to the new session pins. That
-engine runs no task of its own. The store tells it each word of its
+The asking gateway's reach, its wires and its standing vetoes are stated to the engine as places of
+the list. The store keeps one engine object for its life and puts each document it applies in force
+on it, by `InProcess::apply`, the call of a host that keeps one engine (section 8.1, step 6). The
+session pins, the record of sent
+prompts and the stages of a profile whose name and text did not change stand, with what they hold,
+and the members that stand are told to the stages built new alone. A decision runs under the
+document of the world it read: the list's value it asks, its lease, the stages told that issue and
+its shadow's count are that document's, whatever document is applied meanwhile. A word of a lease on
+file is told by the document in force at the word, which on a controller is the one its store's
+standing world holds. The teller reads that document off a world and never off the engine object:
+the store's writer keeps a replaced world its reader still holds, so a telling frees no stage of a
+replaced document on its own thread, and a hold of the engine's own document has no such keeper.
+Between the engine's turn of an apply and the publication of the apply's world the standing world
+still holds the document before, and a word said there is told by it: no lease of the new document
+exists before its world is published. A lease issued under an earlier document is told to the stages
+kept and to the session table, which is the one its claim was made in, and a lease of a generation
+above the document in force to no stage. A document a later one replaced is let go by a thread that
+writes the store, the one that applies or one that publishes, and by no deciding thread. That engine
+runs no task of its own. The store tells it each word of its
 membership, so the record forgets a worker that leaves, is replaced, serves a model no more or
 takes another role. The
 engine's upkeep runs at each pass of the presence sweep, a tenth of the grace period: once a

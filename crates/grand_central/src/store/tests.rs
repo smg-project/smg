@@ -6034,3 +6034,203 @@ fn a_store_with_a_lease_on_a_later_file_is_not_laid_again() {
     }
     drop(store.with_decision_slots(8));
 }
+
+/// What an apply holds the store's two locks for, measured. Three instants
+/// are stamped inside the call. The first is the last word the store asks
+/// under both locks, the `admit` of [`MemoryStore::apply_admitted`]. The
+/// second is the first word a stage built new hears, which the store says
+/// under the workers lock once the load lock is let go: a scorer of the
+/// case's own stamps it. The third is the journal's word of the generation,
+/// the last step under the workers lock. A store of 64 members. Specs of 1,
+/// 8 and 32 profiles, each validated ahead of the timed call: 200
+/// generations that change the text of the stamping profile alone, then 200
+/// that change every profile's.
+#[cfg(all(feature = "controller", feature = "in-process"))]
+#[test]
+#[ignore = "a measurement for the Numbers table, run by name"]
+fn an_applys_time_under_the_stores_locks_measured() {
+    use std::io::Write as _;
+
+    use crate::{
+        document::{AppliedSpec, PolicySpec},
+        engine::{
+            view::{Candidate, RequestFacts},
+            Scorer, TieBand,
+        },
+        stages::{Lifecycle, StageRegistry},
+    };
+
+    /// A scorer that stamps the instant it hears the list of members.
+    #[derive(Debug)]
+    struct Stamps(Arc<Mutex<Option<Instant>>>);
+
+    impl Lifecycle for Stamps {
+        fn on_membership(&self, word: &Membership<'_>) {
+            if matches!(word, Membership::Snapshot(_)) {
+                *self.0.lock().expect("the case's own lock") = Some(Instant::now());
+            }
+        }
+    }
+
+    impl Scorer for Stamps {
+        fn name(&self) -> &'static str {
+            "stamps"
+        }
+
+        fn score(
+            &self,
+            _: &RequestFacts<'_>,
+            _: &[Candidate],
+            _: &[u32],
+            out: &mut [f32],
+        ) -> TieBand {
+            out.fill(0.0);
+            TieBand::NORMALIZED
+        }
+    }
+
+    /// A journal that stamps the instant it is told a generation.
+    struct Told(Arc<Mutex<Option<Instant>>>);
+
+    impl Journal for Told {
+        fn member(
+            &self,
+            _: Option<Position>,
+            _: u64,
+            _: MembershipChange,
+            _: Option<&WorkerRow>,
+            _: Option<&WorkerRow>,
+        ) {
+        }
+
+        fn term_rose(&self, _: u64) {}
+
+        fn generation(&self, _: Option<Position>, _: u64) {
+            *self.0.lock().expect("the case's own lock") = Some(Instant::now());
+        }
+
+        fn term_followed(&self, _: Position) {}
+
+        fn head(&self) -> Position {
+            Position::default()
+        }
+
+        fn followed(&self) -> Option<u64> {
+            None
+        }
+
+        fn restart(&self, _: Position) -> bool {
+            true
+        }
+    }
+
+    const ROUNDS: usize = 200;
+    const MEMBERS: usize = 64;
+    let heard = Arc::new(Mutex::new(None));
+    let cell = Arc::clone(&heard);
+    let mut catalog = StageRegistry::builtin();
+    catalog
+        .scorer("stamps", move || Box::new(Stamps(Arc::clone(&cell))))
+        .expect("a free name");
+    // A generation of `profiles` profiles, each bound to a model of its
+    // own and the first to every other model. The first holds the
+    // stamping scorer and a stock one whose weight changes at every
+    // generation, so its stages are built new each time. Each other holds
+    // a stock scorer whose weight is the text that `turn` changes.
+    let spec = |generation: u64, profiles: usize, turn: u64| {
+        let own = 1 + generation % 2;
+        let mut text = format!(
+            r#"{{"apiVersion":"smg.policy/v1","generation":{generation},"profiles":{{"p0":{{"score":["stamps",{{"least-load":{{"weight":{own}}}}}],"pick":"best"}}"#
+        );
+        for at in 1..profiles {
+            let weight = 1 + turn;
+            text.push_str(&format!(
+                r#","p{at}":{{"score":[{{"least-load":{{"weight":{weight}}}}}],"pick":"best"}}"#
+            ));
+        }
+        text.push_str(r#"},"bindings":["#);
+        for at in 1..profiles {
+            text.push_str(&format!(
+                r#"{{"match":{{"model":"m{at}"}},"profiles":{{"single":"p{at}"}}}},"#
+            ));
+        }
+        text.push_str(r#"{"match":{"model":"*"},"profiles":{"single":"p0"}}]}"#);
+        let document: PolicySpec = serde_json::from_str(&text).expect("a policy document");
+        AppliedSpec::validate_in(&document, &catalog, &[]).expect("a generation")
+    };
+    let said = Arc::new(Mutex::new(None));
+    let store = MemoryStore::journaled(Arc::new(Told(Arc::clone(&said))));
+    for member in 0..MEMBERS {
+        ready(&store, &format!("http://w{member}:1"));
+    }
+    let mut out = std::io::stdout();
+    let mut generation = 0_u64;
+    for profiles in [1_usize, 8, 32] {
+        for changed in [false, true] {
+            // Six spans a round, in nanoseconds: to the last word, under
+            // both locks, the telling, the three together (the workers
+            // lock), behind the locks, and the whole call.
+            let mut spans: [Vec<u128>; 6] = Default::default();
+            // One round more than is kept: the first of a kind follows
+            // another kind's last.
+            for round in 0..=ROUNDS {
+                generation += 1;
+                let turn = if changed { generation % 2 } else { 0 };
+                let next = spec(generation, profiles, turn);
+                let admitted = Cell::new(None);
+                let began = Instant::now();
+                let applied = store.apply_admitted(next, || {
+                    admitted.set(Some(Instant::now()));
+                    true
+                });
+                let ended = Instant::now();
+                assert_eq!(applied, Ok(true), "a number above the standing one");
+                let admitted = admitted.get().expect("the store asked its last word");
+                let heard = heard.lock().expect("the case's own lock").take();
+                let heard = heard.expect("the stamping scorer heard the members");
+                let told = said.lock().expect("the case's own lock").take();
+                let told = told.expect("the journal was told the generation");
+                if round > 0 {
+                    for (span, nanos) in spans.iter_mut().zip([
+                        admitted.duration_since(began).as_nanos(),
+                        heard.duration_since(admitted).as_nanos(),
+                        told.duration_since(heard).as_nanos(),
+                        told.duration_since(began).as_nanos(),
+                        ended.duration_since(told).as_nanos(),
+                        ended.duration_since(began).as_nanos(),
+                    ]) {
+                        span.push(nanos);
+                    }
+                }
+            }
+            let [ahead, both, telling, workers, behind, whole] = spans.map(|mut span| {
+                span.sort_unstable();
+                (span[span.len() / 2], span[span.len() * 9 / 10])
+            });
+            let kind = if changed {
+                "every text changed"
+            } else {
+                "one text changed"
+            };
+            writeln!(
+                out,
+                "an apply, {profiles} profiles, {kind}, {MEMBERS} members, ns (middle, ninth tenth): \
+                 to the last word {} {}, under both locks {} {}, the telling {} {}, \
+                 the workers lock {} {}, behind the locks {} {}, whole {} {}",
+                ahead.0,
+                ahead.1,
+                both.0,
+                both.1,
+                telling.0,
+                telling.1,
+                workers.0,
+                workers.1,
+                behind.0,
+                behind.1,
+                whole.0,
+                whole.1
+            )
+            .expect("stdout");
+        }
+    }
+}

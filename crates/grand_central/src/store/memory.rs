@@ -33,7 +33,7 @@ use crate::{
         view::{Session, WorkerId, LOAD_REPORT_CLOCK_HISTORY_MS},
     },
     store::{
-        applied::{Applied, EngineCounts, EngineFaults},
+        applied::EngineFaults,
         health::{HealthSink, VetoWrite},
         journal::{Journal, Position},
         leases::{
@@ -82,7 +82,7 @@ pub struct StoreStats {
     /// ([`MemoryStore::lifecycle_faults`]): a count of its own, read
     /// beside the first.
     pub lifecycle_faults: u64,
-    /// The panics the store's engines held under their own catches, over
+    /// The panics the store's engine held under its own catches, over
     /// every document the store applied: counts of their own too.
     pub engine_faults: EngineFaults,
 }
@@ -123,9 +123,6 @@ pub struct MemoryStore {
     counts: Arc<InFlightCounts>,
     /// Where the store's clock starts.
     origin: Instant,
-    /// What every engine the store builds counts its held panics into: the
-    /// unbound start's and each applied document's ([`Applied::new`]).
-    engine_faults: EngineCounts,
     /// Where the term is told, and that a write's locks are let go; `None`
     /// for a store nobody follows. The membership writes tell through
     /// their table's own handle.
@@ -135,9 +132,10 @@ pub struct MemoryStore {
     /// the one instant the host's loop cannot have read. A lock of its own,
     /// the last taken and held for the call alone.
     wake: Mutex<Option<Wake>>,
-    /// The indexes of cache events the store's host lends its engines
-    /// ([`MemoryStore::lend_cache_indexes`]): handed once, and handed on to
-    /// the engine of each policy spec the store applies. The store holds
+    /// The indexes of cache events the store's host lent its engine
+    /// ([`MemoryStore::lend_cache_indexes`]): handed once. The store's one
+    /// engine keeps them under every policy spec, so an apply hands nothing
+    /// on, and this hold answers a second lending alone. The store holds
     /// the engine's own trait object and names no index.
     #[cfg(feature = "controller")]
     indexes: OnceLock<Arc<dyn CacheIndexes>>,
@@ -207,8 +205,7 @@ impl MemoryStore {
         // own.
         let history = Duration::from_millis(u64::from(LOAD_REPORT_CLOCK_HISTORY_MS));
         let origin = now.checked_sub(history).unwrap_or(now);
-        let engine_faults = EngineCounts::default();
-        let writer = Writer::new(window, origin, &engine_faults);
+        let writer = Writer::new(window, origin);
         let world = ArcSwap::new(writer.world());
         // The leases' file writes the counts the writer's shapes name, and
         // a membership write gives a joining member its slot in them.
@@ -227,7 +224,6 @@ impl MemoryStore {
             joined: Mutex::default(),
             counts,
             origin,
-            engine_faults,
             journal: None,
             wake: Mutex::new(None),
             #[cfg(feature = "controller")]
@@ -717,14 +713,18 @@ impl MemoryStore {
     /// the load lock, as a membership write does: a writer's wait, never a
     /// decision's.
     ///
-    /// In a build with the `in-process` feature the generation keeps the
-    /// standing one's stage objects, with what they hold, for each profile
-    /// that did not change, as an engine does where it takes a new document
-    /// itself. A build without that feature keeps nothing: every stage is
-    /// built new. The generation's engine is built behind the workers
-    /// lock, where the standing generation cannot move. A number that does
-    /// not rise builds none: a generation the store refuses keeps nothing.
-    /// The stages it built new are then told every member once, by id
+    /// In a build with the `in-process` feature the store keeps one
+    /// engine for its life and the generation is put in force on it, by
+    /// the call a host that decides in its own process makes
+    /// (`InProcess::apply`). The session table and its pins, the records
+    /// of sent prefixes and the stage objects of each profile that did not
+    /// change stand across the apply, with what they hold. A build without
+    /// that feature keeps nothing: every stage is built new. That call
+    /// runs under both locks, behind the last word that may refuse the
+    /// generation: a generation the store does not publish is never in
+    /// force on the engine. A number that does not rise is refused behind
+    /// that word too, by the number alone, and keeps nothing. The stages
+    /// it built new are then told every member once, by id
     /// ([`Membership::Snapshot`]), under the workers lock and with the load
     /// lock let go: they start empty, and a stage kept heard each member as
     /// it came. Each membership write after it is told behind the same
@@ -734,6 +734,11 @@ impl MemoryStore {
     /// from the standing generation's count under the same two settings,
     /// or else by its profile's name, or else one that is left, before the
     /// publication ([`Engine::succeed`](crate::engine::Engine::succeed)).
+    ///
+    /// A decision that read its world ahead of the apply ends under that
+    /// world's generation: its list's value, its lease and the stages told
+    /// its issue are that generation's
+    /// ([`StoreSnapshot::spec`]).
     ///
     /// The journal is told the generation's number there too, behind the
     /// publication ([`Journal::generation`]).
@@ -790,13 +795,12 @@ impl MemoryStore {
         }
     }
 
-    /// Lend this store's engines the indexes of cache events its host
-    /// keeps, once: a later call is ignored. The engine that stands is
-    /// handed them here, and the engine of each policy spec applied from
-    /// now on where the apply publishes it. Under the membership lock, as
-    /// an apply publishes: an apply finds them here, or its engine stands
-    /// when this call hands them. The store calls nothing of what it is
-    /// handed.
+    /// Lend this store's engine the indexes of cache events its host
+    /// keeps, once: a later call is ignored. The store's one engine is
+    /// handed them here and keeps them under every policy spec applied
+    /// from now on: an apply builds no engine and hands nothing on. The
+    /// call takes the membership lock, so no apply runs beside it. The
+    /// store calls nothing of what it is handed.
     #[cfg(feature = "controller")]
     pub(crate) fn lend_cache_indexes(&self, indexes: Arc<dyn CacheIndexes>) {
         let _workers = self.workers.lock();
@@ -817,64 +821,45 @@ impl MemoryStore {
         admit: impl FnOnce() -> bool,
     ) -> Result<bool, StaleGeneration> {
         let generation = spec.generation();
-        // The writer takes a second reference: where `admit` refuses, the
-        // last one is this one, let go after the lock.
-        let built;
         let before = {
             // Taken before the lock, so dropped after it: the journal
             // wakes its readers with the membership lock let go.
             let _released = self.released();
             let workers = self.workers.lock();
-            // Behind the workers lock no apply moves the standing
-            // generation: what the new one keeps of its stages is what
-            // stands. A number that does not rise builds nothing, as an
-            // engine refuses it ahead of its keep: a refused generation
-            // keeps nothing, and is let go after the lock. The load lock is
-            // taken behind the build: a taker of that lock alone, as a
-            // scrape's counts and the read of what is due, does not wait
-            // for the build.
-            built = {
-                let world = self.world.load();
-                let standing = world.spec();
-                if generation > standing.generation() {
-                    Ok(Arc::new(Applied::after(
-                        standing,
-                        spec,
-                        self.origin,
-                        &self.engine_faults,
-                    )))
-                } else {
-                    Err(StaleGeneration {
-                        standing: standing.generation(),
-                        offered: generation,
-                    })
-                }
-            };
             let mut loads = self.loads.lock();
             // The last word, behind every lock this entry waits for: what
-            // follows is the publication.
+            // follows is the publication, or the refusal of a number that
+            // does not rise. The generation is put in force on the
+            // store's engine behind it and never ahead: the engine takes
+            // no generation back.
             if !admit() {
                 return Ok(false);
             }
-            // A number that did not rise is refused here, behind that word,
-            // as the writer refused it.
-            let spec = built.as_ref().map_err(|stale| *stale)?;
-            // The host's indexes of cache events, where it lent them: the
-            // engine holds them before a decision can reach it.
-            #[cfg(feature = "controller")]
-            if let Some(indexes) = self.indexes.get() {
-                spec.front().affinity().set_indexes(Arc::clone(indexes));
+            // Behind the workers lock no apply moves the standing
+            // generation. A number that does not rise is refused here, by
+            // the number alone. A generation refused here or by `admit`
+            // is let go after the locks: this call holds it still.
+            let standing = self.world.load().spec().generation();
+            if generation <= standing {
+                return Err(StaleGeneration {
+                    standing,
+                    offered: generation,
+                });
             }
             let writer = &mut loads.writer;
-            let (world, before) = writer.apply(Arc::clone(spec), workers.members())?;
-            spec.engine().succeed(self.world.load().spec().engine());
+            let (world, before) = writer.apply(spec, workers.members())?;
+            #[cfg(test)]
+            seam::turned();
             // The pools are published as they stood: a build the membership
             // writes left owed is left to its window, and with it the table
             // of the members no world named.
             writer.replaced(self.world.swap(world));
             drop(loads);
             // A stage the generation kept heard each member as it came.
-            Self::tell_members(&workers, |list| spec.tell_built_new(list));
+            // The world that stands is the generation's: the workers lock
+            // holds every other apply off.
+            let shown = self.world.load();
+            Self::tell_members(&workers, |list| shown.applied().tell_built_new(list));
             if let Some(journal) = &self.journal {
                 journal.generation(at, generation);
             }
@@ -940,16 +925,19 @@ impl MemoryStore {
     /// Tell every member once, by id ([`Membership::Snapshot`]), through
     /// `tell`: a snapshot tells the engine of the generation that stands,
     /// and an apply the stages its generation built new
-    /// ([`Applied::tell_built_new`]). Called under the workers lock, after
-    /// the world of those members is shown and with the load lock let go.
+    /// ([`Applied::tell_built_new`](super::applied::Applied::tell_built_new)).
+    /// Called under the workers lock, after the world of those members is
+    /// shown and with the load lock let go.
     fn tell_members(workers: &Workers, tell: impl FnOnce(&Membership<'_>)) {
         let mut members: Vec<WorkerId> = workers.rows.keys().copied().collect();
         members.sort_unstable();
         tell(&Membership::Snapshot(&members));
     }
 
-    /// Tell the engine of the world the store shows one membership word:
-    /// under the workers lock, with the load lock let go.
+    /// Tell the store's engine one membership word, through the world the
+    /// store shows: under the workers lock, with the load lock let go. The
+    /// engine tells the generation in force on it, which is the standing
+    /// one: an apply holds the workers lock.
     fn tell_engine(&self, word: &Membership<'_>) {
         self.world.load().applied().on_membership(word);
     }
@@ -1174,7 +1162,7 @@ impl MemoryStore {
         StoreStats {
             outside: loads.writer.outside(),
             lifecycle_faults: self.lifecycle_faults(),
-            engine_faults: self.engine_faults.read(),
+            engine_faults: self.world.load().applied().faults(),
         }
     }
 
@@ -4112,25 +4100,25 @@ mod tests {
         AppliedSpec::validate(&document).expect("the document validates")
     }
 
-    /// The indexes a store is lent reach the engine that stands at the
-    /// hand-over, in that call, and the engine of each policy spec applied
-    /// later, where the apply publishes it. The first lending stands: a
-    /// second is ignored, for the engine that stands and for the next one.
+    /// The indexes a store is lent reach its engine in that call, and the
+    /// engine holds them under each policy spec applied later: the store
+    /// keeps one engine for its life. The first lending stands: a second
+    /// is ignored, under the policy spec that stands and under the next.
     #[cfg(feature = "controller")]
     #[test]
-    fn the_engine_that_stands_and_each_one_applied_later_hold_the_lent_indexes() {
+    fn the_stores_engine_holds_the_lent_indexes_across_applies() {
         let store = MemoryStore::new();
         let size = || store.snapshot().front().affinity().block_size("m");
         store.apply(round_robin(1)).expect("generation 1");
         assert_eq!(size(), None, "lent none yet");
         store.lend_cache_indexes(Arc::new(OneSize(16)));
-        assert_eq!(size(), Some(16), "the engine that stood is handed them");
+        assert_eq!(size(), Some(16), "the engine is handed them");
         store.apply(round_robin(2)).expect("generation 2");
-        assert_eq!(size(), Some(16), "an engine applied later holds them");
+        assert_eq!(size(), Some(16), "it holds them under a later policy spec");
         store.lend_cache_indexes(Arc::new(OneSize(32)));
         assert_eq!(size(), Some(16), "the first lending stands");
         store.apply(round_robin(3)).expect("generation 3");
-        assert_eq!(size(), Some(16), "for the next engine too");
+        assert_eq!(size(), Some(16), "under the next policy spec too");
     }
 }
 
@@ -4138,8 +4126,10 @@ mod tests {
 /// by the store's one body has let the workers lock go
 /// ([`MemoryStore::decided`]): a registration, a followed change, or a
 /// change the replica's worker objects decided. The store's own patch,
-/// removal and status write run none. No case reaches there from outside.
-/// In no build but the cases'.
+/// removal and status write run none. A second hook runs inside an apply
+/// of a generation, between the engine's turn and the publication of the
+/// generation's world ([`MemoryStore::apply`]). No case reaches either
+/// place from outside. In no build but the cases'.
 #[cfg(test)]
 pub(crate) mod seam {
     use std::cell::RefCell;
@@ -4148,6 +4138,24 @@ pub(crate) mod seam {
 
     thread_local! {
         static RELEASED: RefCell<Option<Hook>> = const { RefCell::new(None) };
+        static TURNED: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    /// `hook` runs once inside this thread's next apply of a generation:
+    /// the store's engine holds the generation and the store's world still
+    /// holds the one before. The apply holds both the store's locks there:
+    /// a hook asks for neither. A controller's cases alone stand there.
+    #[cfg(feature = "controller")]
+    pub(crate) fn on_turn(hook: impl FnOnce() + 'static) {
+        TURNED.with(|held| *held.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    /// The hook of [`on_turn`] runs. It is taken out first.
+    pub(super) fn turned() {
+        let hook = TURNED.with(|held| held.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
     }
 
     /// `hook` runs once, behind the workers lock of this thread's next

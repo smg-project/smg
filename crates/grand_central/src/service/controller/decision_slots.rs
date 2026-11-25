@@ -1569,7 +1569,7 @@ fn take_back(
     reason: ReleaseReason,
 ) {
     if store.unissue_decode(gateway, lease.id, issue) {
-        if let Some(engine) = issuing(world, lease).engine() {
+        if let Some(engine) = issuing(world, lease) {
             engine.on_released(lease, reason);
         }
     }
@@ -2812,6 +2812,46 @@ pub(crate) mod tests {
         assert_eq!(sent_prefixes(&bed), Some(vec![sent]));
         let row = WorkersStore::get(&*bed.store, sent).expect("the row");
         (bed, sent, row.facts)
+    }
+
+    /// The record of sent prefixes stands across an apply: the store keeps
+    /// one engine for its life, and the record is that engine's. A request
+    /// whose prefix was sent under the generation before lands where the
+    /// prefix was sent.
+    #[tokio::test]
+    async fn a_request_lands_where_its_prefix_was_sent_under_the_generation_before() {
+        let (mut bed, sent, _) = sent_one_prefix().await;
+        let next = preset("cache_aware", 2);
+        bed.store.apply(next).expect("a later generation");
+        assert_eq!(sent_prefixes(&bed), Some(vec![sent]));
+        // Each lease on file books its worker: load alone would send the
+        // next request to another.
+        for (id, seed) in (2..=4).zip(101..) {
+            let returned = picked(&bed.ask(hashed(id, seed)).await);
+            assert_eq!(returned, sent, "request {id}");
+        }
+    }
+
+    /// The store tells its one engine each word of its membership, under
+    /// whichever generation stands. A worker that leaves behind an apply
+    /// leaves the record of the prefixes it was sent under the generation
+    /// before, and registered again under its id it is named for none of
+    /// them.
+    #[tokio::test]
+    async fn a_worker_that_left_behind_an_apply_is_named_for_no_prefix_it_held_before() {
+        let (bed, sent, facts) = sent_one_prefix().await;
+        let next = preset("cache_aware", 2);
+        bed.store.apply(next).expect("a later generation");
+        assert_eq!(sent_prefixes(&bed), Some(vec![sent]));
+        let row = WorkersStore::get(&*bed.store, sent).expect("the row");
+        bed.store.remove(sent, row.revision).expect("removed");
+        assert_eq!(
+            sent_prefixes(&bed),
+            Some(Vec::new()),
+            "the record forgot it"
+        );
+        assert_eq!(bed.store.upsert(facts).id(), sent, "its id again");
+        assert_eq!(sent_prefixes(&bed), Some(Vec::new()));
     }
 
     /// A served engine's records of sent prefixes hear the store's word of
@@ -7477,11 +7517,11 @@ pub(crate) mod tests {
     }
 
     /// A keyed session keeps its worker across an apply of a new
-    /// generation. The new document's engine is to take the session table
-    /// of the engine before it (`Engine::share_sessions`): a decision of a
-    /// dispatched key is made on its pin under either generation.
+    /// generation. The store's engine keeps one session table for its
+    /// life, and each generation's stages read it
+    /// (`AppliedSpec::share_sessions`): a decision of a dispatched key is
+    /// made on its pin under either generation.
     #[tokio::test]
-    #[ignore = "a new document's engine starts with no session pin yet"]
     async fn a_keyed_session_keeps_its_worker_across_an_apply() {
         use crate::{
             engine::sticky_sessions::SessionVerdict,
@@ -7532,7 +7572,7 @@ pub(crate) mod tests {
             assert_eq!(picked(&answer), worker);
             assert_eq!(verdict(&bed, &answer), SessionVerdict::Pinned);
         }
-        // A new generation: its engine is to hold the pins of the one before.
+        // A new generation: the pins of the one before stand.
         let held = pins(&bed, first[0].2);
         assert!(held.is_some());
         bed.store

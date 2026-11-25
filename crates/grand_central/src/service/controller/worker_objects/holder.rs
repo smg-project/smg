@@ -99,7 +99,7 @@ impl WorkerObjects {
         Arc::clone(&self.tables)
     }
 
-    /// The indexes of cache events the replica's engines read: its KV
+    /// The indexes of cache events the replica's engine reads: its KV
     /// tables' own, a worker found by its address among the worker objects.
     /// The store is lent them once, at the controller's build.
     pub(crate) fn cache_indexes(&self) -> Arc<dyn CacheIndexes> {
