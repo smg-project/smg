@@ -287,6 +287,10 @@ class _Pidfds:
         assert fd in self.opened and fd not in self.closed
         self.closed.add(fd)
 
+    def exited(self, fd):
+        assert fd in self.opened and fd not in self.closed
+        return not (self.root / str(self.opened[fd])).exists()
+
     def sleep(self, seconds):
         self.now += seconds
         self.on_sleep()
@@ -297,6 +301,7 @@ class _Pidfds:
             grace=0.4,
             pidfd_open=self.open,
             pidfd_send_signal=self.send,
+            pidfd_exited=self.exited,
             close=self.close,
             sleep=self.sleep,
             clock=lambda: self.now,
@@ -350,6 +355,7 @@ def test_strict_missing_pidfd_api_has_no_numeric_fallback(mod, strict_tree, monk
     monkeypatch.setattr(target, missing, None, raising=False)
     numeric = []
     monkeypatch.setattr(mod.os, "kill", lambda *args: numeric.append(args))
+    monkeypatch.setattr(mod, "reap", lambda *args, **kwargs: pytest.fail("legacy fallback"))
     assert not runtime.run(mod, **{missing: None})
     assert runtime.sent == [] and runtime.opened == {} and numeric == []
 
@@ -447,6 +453,197 @@ def test_strict_failure_is_nonzero_while_legacy_default_still_reports(mod, monke
     monkeypatch.setattr(mod, "reap", lambda *args, **kwargs: [])
     assert mod.main(["--strict", MARKER]) == 1
     assert mod.main([MARKER]) == 0
+
+
+@pytest.mark.parametrize("leaf", ["stat", "status", "environ"])
+def test_strict_open_read_exit_race_keeps_cleaning_other_workers(
+    mod, strict_tree, monkeypatch, leaf
+):
+    import builtins
+
+    runtime = _Pidfds(strict_tree)
+    original = builtins.open
+    target = strict_tree / "100" / leaf
+    triggered = []
+
+    class ReapedAfterOpen:
+        def __enter__(self):
+            return self
+
+        def read(self, *args):
+            triggered.append(True)
+            runtime.remove(100)
+            raise ProcessLookupError(3, "reaped after opening procfs file")
+
+        def __exit__(self, *args):
+            return False
+
+    def opened(path, *args, **kwargs):
+        if os.fspath(path) == str(target) and not triggered:
+            return ReapedAfterOpen()
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", opened)
+    assert runtime.run(mod)
+    assert triggered and (101, signal.SIGTERM) in runtime.sent
+    assert all(pid != 100 for pid, _ in runtime.sent)
+    assert runtime.closed == set(runtime.opened)
+
+
+def test_strict_esrch_for_a_still_live_ownership_file_fails_closed(mod, strict_tree, monkeypatch):
+    import builtins
+
+    original = builtins.open
+
+    def opened(path, *args, **kwargs):
+        if os.fspath(path) == str(strict_tree / "100" / "status"):
+            raise ProcessLookupError(3, "identity is unresolved, not confirmed gone")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", opened)
+    runtime = _Pidfds(strict_tree)
+    assert not runtime.run(mod)
+    assert runtime.sent == []
+
+
+def test_strict_raw_comm_bytes_do_not_prevent_uid_and_marker_checks(mod, strict_tree):
+    for pid in (100, 300):
+        p = strict_tree / str(pid) / "stat"
+        p.write_bytes(p.read_bytes().replace(b"(worker)", b"(raw\xff\xfe)"))
+        p = strict_tree / str(pid) / "status"
+        p.write_bytes(b"Name:\traw\xff\xfe\n" + p.read_bytes())
+    runtime = _Pidfds(strict_tree)
+    assert runtime.run(mod)
+    assert (100, signal.SIGTERM) in runtime.sent
+    assert all(pid != 300 for pid, _ in runtime.sent)
+
+
+def test_strict_fork_chain_cannot_turn_incomplete_scans_into_quiet_success(
+    mod, strict_tree, monkeypatch
+):
+    runtime = _Pidfds(strict_tree)
+    runtime.remove(101)
+    original = mod._strict_owned
+    transitions = []
+
+    def after_enumeration(root, pid, uid, entry, **kwargs):
+        if pid in (100, 102) and pid not in transitions:
+            runtime.remove(pid)
+            _strict_process(strict_tree, pid + 2 if pid == 100 else 103, birth=2000 + pid)
+            transitions.append(pid)
+        return original(root, pid, uid, entry, **kwargs)
+
+    monkeypatch.setattr(mod, "_strict_owned", after_enumeration)
+    assert runtime.run(mod)
+    assert transitions == [100, 102]
+    assert (103, signal.SIGTERM) in runtime.sent
+    assert not (strict_tree / "103").exists()
+
+
+def test_strict_final_census_cannot_certify_success_after_deadline(mod, strict_tree, monkeypatch):
+    runtime = _Pidfds(strict_tree)
+    runtime.remove(100)
+    runtime.remove(101)
+    original = mod._strict_census
+    calls = []
+
+    def slow_final_census(root):
+        found = original(root)
+        calls.append(True)
+        if len(calls) == 4:
+            runtime.now = 20.5
+        return found
+
+    monkeypatch.setattr(mod, "_strict_census", slow_final_census)
+    assert not runtime.run(mod)
+    assert len(calls) == 4 and runtime.sent == []
+
+
+def test_strict_late_worker_gets_its_own_term_grace(mod, strict_tree):
+    runtime = _Pidfds(strict_tree)
+    timed = []
+
+    def on_signal(pid, sig):
+        timed.append((pid, sig, runtime.now))
+        if pid == 100 and sig == signal.SIGKILL:
+            _strict_process(strict_tree, 102, birth=1102)
+        if pid == 101 or sig == signal.SIGKILL:
+            runtime.remove(pid)
+
+    runtime.on_signal = on_signal
+    assert runtime.run(mod)
+    term = next(t for pid, sig, t in timed if pid == 102 and sig == signal.SIGTERM)
+    kill = next(t for pid, sig, t in timed if pid == 102 and sig == signal.SIGKILL)
+    assert term >= 0.4 and kill - term >= 0.4 - 1e-9
+
+
+def test_strict_fixed_deadline_does_not_shorten_a_late_workers_grace(mod, strict_tree):
+    runtime = _Pidfds(strict_tree)
+    runtime.on_signal = lambda pid, sig: None
+
+    def late_birth():
+        if runtime.now >= 21.0 and not (strict_tree / "102").exists():
+            _strict_process(strict_tree, 102, birth=1102)
+
+    runtime.on_sleep = late_birth
+    assert not runtime.run(mod, grace=2.0)
+    assert (102, signal.SIGTERM) in runtime.sent
+    assert (102, signal.SIGKILL) not in runtime.sent
+    assert runtime.now <= 22.0 + 1e-9
+
+
+@pytest.mark.skipif(
+    not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"),
+    reason="requires Linux process pidfds",
+)
+def test_strict_zombie_main_thread_cannot_hide_live_threads(mod, tmp_path):
+    import select
+
+    child = None
+    fd = None
+    marker = f"e2e-zombie-main-{os.getpid()}-{time.time_ns()}"
+    try:
+        child = subprocess.Popen(
+            [
+                sys.executable,
+                "-I",
+                "-B",
+                "-c",
+                "import ctypes,threading,time; "
+                "threading.Thread(target=lambda:time.sleep(30)).start(); "
+                "print('READY',flush=True); ctypes.CDLL(None).pthread_exit(None)",
+            ],
+            env={"PATH": "/usr/bin:/bin", "E2E_JOB_MARKER": marker},
+            stdout=subprocess.PIPE,
+        )
+        fd = os.pidfd_open(child.pid, 0)
+        ready, _, _ = select.select([child.stdout], [], [], 5)
+        assert ready and child.stdout.readline() == b"READY\n"
+        limit = time.monotonic() + 5
+        while mod._strict_stat("/proc", child.pid)[0] != "Z" and time.monotonic() < limit:
+            time.sleep(0.01)
+        assert mod._strict_stat("/proc", child.pid)[0] == "Z"
+        assert not mod._pidfd_exited(fd)
+        view = tmp_path / "owned-proc"
+        view.mkdir()
+        for pid in set(mod._strict_ancestors("/proc", os.getpid())) | {child.pid}:
+            (view / str(pid)).symlink_to(Path("/proc") / str(pid), target_is_directory=True)
+        assert not mod.reap_strict(marker, proc_root=str(view), grace=0.1)
+        assert not mod._pidfd_exited(fd)
+    finally:
+        if fd is not None:
+            try:
+                signal.pidfd_send_signal(fd, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            finally:
+                os.close(fd)
+        elif child is not None and child.poll() is None:
+            child.kill()
+        if child is not None:
+            child.wait(timeout=5)
+            if child.stdout is not None:
+                child.stdout.close()
 
 
 @pytest.mark.skipif(
