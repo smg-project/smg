@@ -2405,7 +2405,7 @@ pub(crate) mod tests {
     /// The document of the default policy's profile under the stock
     /// sessions rule, a new key placed by the profile's own stages, and
     /// `kept`, the rule's word of a request it places alone.
-    fn default_under_sessions(kept: RulePlaced) -> AppliedSpec {
+    pub(crate) fn default_under_sessions(kept: RulePlaced) -> AppliedSpec {
         let mut document = PolicySpec::preset("manual").expect("a built-in preset");
         let default = PolicySpec::preset("cache_aware").expect("a built-in preset");
         document.profiles = default.profiles;

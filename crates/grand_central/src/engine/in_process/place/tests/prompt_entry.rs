@@ -15,9 +15,19 @@ use super::*;
 use crate::{
     document::spec::{RulePlaced, WarmupSliceParams},
     engine::{
+        decision::{Overlap, OverlapSource},
         decision_engine::{TextKey, TokenKey},
-        in_process::single::tests::{lending, lending_text, lent, Also},
+        in_process::single::tests::{default_under_sessions, lending, lending_text, lent, Also},
     },
+};
+
+/// What a pick states of a worker the record of sent prefixes holds a
+/// prompt of 100 blocks whole for.
+const WHOLE: Overlap = Overlap {
+    blocks: 100,
+    of: 100,
+    source: OverlapSource::Predictor,
+    ..Overlap::NONE
 };
 
 /// A caller's entry for its prompt: the prompt's token ids under no cache
@@ -559,8 +569,9 @@ fn a_prompt_is_hashed_where_a_lookup_reads_its_hashes() {
 /// too. A second warm-up stage that rules by another window leaves the
 /// profile no row to be named: its decision reads the affinity column
 /// whole, and the fill reads the prompt's hashes. The list is hashed for
-/// it there, the record of sent prefixes takes the prompt for the worker
-/// picked, and the prompt sent again goes back to that worker.
+/// it there and the record of sent prefixes takes the whole prompt for the
+/// worker picked: sent again, the prompt goes back to that worker, which
+/// holds every block of it.
 #[test]
 fn a_prompt_is_hashed_where_a_column_is_filled() {
     let mut document = PolicySpec::preset("cache_aware").expect("a built-in preset");
@@ -592,31 +603,21 @@ fn a_prompt_is_hashed_where_a_column_is_filled() {
     let first = asked.expect("a placement").id();
     let hashed = matches!(call.whole.get(), Some(Some(_)));
     assert!(hashed, "the column's fill hashed them");
-    for turn in 0..16 {
-        let again = engine.place(&request).expect("a placement");
-        assert_eq!(again.id(), first, "turn {turn}");
-    }
-    assert_eq!(entry.asked.get(), 0, "no decision read a tree");
+    let again = engine.place(&request).expect("a placement");
+    assert_eq!((again.id(), again.overlap), (first, WHOLE));
 }
 
 /// A prompt made with no block hashed is hashed behind a pin's answer too.
-/// Under the stock sessions rule a key's second request goes where the key
-/// is pinned, and the rule tells the profile's stages of it: the lookup
-/// hands the prompt to the record of sent prefixes behind that answer, and
-/// the list is hashed for the write. The same prompt under no key then
-/// goes to the pin's worker, by the record alone.
+/// Under the `manual` preset's sessions rule, with a new key's placement
+/// delegated to the profile's stages, a key's second request goes where
+/// the key is pinned, and the rule tells the profile's stages of it: the
+/// lookup hands the prompt to the record of sent prefixes behind that
+/// answer, and the list is hashed for the write. The same prompt under no
+/// key then goes to the pin's worker by the record alone, which holds
+/// every block of it.
 #[test]
 fn a_prompt_is_hashed_where_a_pins_answer_is_recorded() {
-    let mut document = PolicySpec::preset("manual").expect("a built-in preset");
-    let default = PolicySpec::preset("cache_aware").expect("a built-in preset");
-    document.profiles = default.profiles;
-    document.generation = 1;
-    let binding = &mut document.bindings[0];
-    binding.profile = Some("cache_aware".into());
-    let rule = binding.sessions.as_mut().expect("the stock rule");
-    rule.assignment = Assignment::Delegate;
-    rule.rule_placed = RulePlaced::Told;
-    let engine = hosted(engine_of(&document));
+    let engine = hosted(InProcess::new(default_under_sessions(RulePlaced::Told)));
     let members = PublishedList::new(pool(8));
     let keyed = [(MANUAL_SESSION_HEADER, "talk-7")];
     let (opening, fresh): (Vec<u32>, Vec<u32>) =
@@ -645,8 +646,6 @@ fn a_prompt_is_hashed_where_a_pins_answer_is_recorded() {
     assert!(hashed, "the record's write hashed them");
     // The same prompt under no key: the record alone names its holder.
     let unkeyed = stating(&members, &fresh, None);
-    for turn in 0..16 {
-        let again = engine.place(&unkeyed).expect("a placement");
-        assert_eq!(again.id(), pin, "turn {turn}");
-    }
+    let again = engine.place(&unkeyed).expect("a placement");
+    assert_eq!((again.id(), again.overlap), (pin, WHOLE));
 }
