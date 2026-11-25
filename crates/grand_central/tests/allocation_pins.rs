@@ -727,10 +727,11 @@ fn a_write_that_moves_an_offer_allocates_what_a_write_that_moves_none_does() {
 
 #[test]
 fn a_registrations_allocations_do_not_follow_the_fleet() {
-    // A membership write walks every member into its pool's list. A
-    // standing pool's list starts at the pool's last length and one more,
-    // so what a registration allocates does not follow the fleet: one into
-    // 512 workers makes the allocator calls of one into 8.
+    // A membership write walks every member once. Where no veto stands,
+    // each list that walk fills takes the members' count at once or is
+    // kept from the last build, so what a registration allocates does not
+    // follow the fleet: one into 512 workers makes the allocator calls of
+    // one into 8.
     let fewest = |n: usize| {
         let (store, _) = store_of(n);
         // The fewest allocation calls of one registration and the build it

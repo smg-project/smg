@@ -2303,7 +2303,7 @@ the worker crate's structures, and the one engine.
 | Data | On main | As designed |
 |---|---|---|
 | workers | records in the store, and worker objects kept in step with them | worker objects in a worker-crate registry; beside each, the code that keeps the objects holds what a registration stated and the object does not hold as stated (10.3); the membership log that watchers and standbys read stays |
-| lists | the store's published copy; a single request's decision reads the registry's published list of the model's single workers, a pair's, at its prefill and at its decode call, the lists of its two sides, an encode request's those two and its encoders', and a prefill or a decode request that stands alone the list of its own phase's workers | the registry's published lists by role and protocol, with the engine's value beside each (decision 10) |
+| lists | a single request's decision reads the registry's published list of the model's single workers, a pair's, at its prefill and at its decode call, the lists of its two sides, an encode request's those two and its encoders', and a prefill or a decode request that stands alone the list of its own phase's workers | the registry's published lists by role and protocol, with the engine's value beside each (decision 10) |
 | health | the worker crate's health checker over the worker objects, on the leader; each outcome moves the object, the store's record is told the status that stands, and a decision reads the object's | the same checker; a decision reads the object's own status; a gateway's veto on a worker stays in the store |
 | loads | the worker crate's load monitor over the worker objects, while the replica leads, fed by its polls and by the load records on the workers' streams: a decision is given its snapshot where the document reads reports and keeps none, and reads the overload verdict on the object; the crate's own poller runs no more, and the store holds no load table | the worker crate's load monitor, publishing `LoadSnapshot` (decision 10). Every worker is judged by the thresholds its object states, so the loads of every worker the controller dials are read: no new cost against classic as it runs by default, whose gateway hands each worker of an engine the same two defaults and an external worker none at its registration, as a controller's objects state them. A gateway started with `--disable-load-monitoring` polls by need, and this monitor polls every group |
 | cache events | an index in the worker host's KV tables; a decision reads none yet | the kv-index crate's index, filled by the worker crate's collector |
@@ -2367,7 +2367,7 @@ tells the data once more:
 | a copy of the record's facts | beside the worker objects (`worker_host/objects.rs`) | the code that keeps the objects, to tell a record that changed under its object |
 | the worker object | the worker-crate registry | the health checker, the follower of cache events, a decision, and a watcher's, a standby's and an operator's first copy |
 | the remainder: 17 of the 24 facts and one bit of an eighteenth, with the record's id and revision | beside each worker object (`worker_host/remainder.rs`) | a decision, for the record's id, whether the worker takes images, its wire modes and from where it is reached. A pair's classes read the worker's engine kind and its pairing descriptor too, and for a record that states no descriptor the pairing facts its worker object derives of its labels. What the worker states for a request's hard demands is lent with the list, and no frame states a demand yet. The follower of cache events asks here whether a worker's events are indexed: its signals stand here and its models on the object (`worker_host/kv_feed.rs:191`, through `Objects::row_of`) |
-| the published copy of the records | the store | a pick's booking and a gateway's vetoes, among others; no request is decided over it |
+| the published copy: of a record its id alone, beside its slot in the counts and in a gateway's vetoes by pool; with them each pool's index by model and role, the generation and the clock | the store | a pick's booking and a gateway's vetoes; every loader reads the generation; no row of a record stands in it and no request is decided over it |
 | the membership log's event | `service/replication/log.rs` | a watcher behind its first copy; a standby |
 
 A leader's write of a record is decided over the worker object since step 1 below, and the
@@ -2375,8 +2375,9 @@ table follows it. The object leads a status too since step 3, and the table is t
 object leads a first copy's facts since the last part of step 2, and the log its statuses. After the switch the object leads: a worker's data
 stands once, as its worker object with its remainder beside it, and the log still tells it. The
 remainder is the copy that stays. The table of records and the second copy of the facts end
-with step 4 below. The published copy ends when its readers, a pick's booking and a gateway's
-vetoes among them, read the worker objects: a later step **[planned]**.
+with step 4 below. The published copy holds no row of a record, and a status change makes no
+publication. It ends when the two readers of what it holds of a worker, a pick's booking and
+a gateway's vetoes, read the worker objects: a later step **[planned]**.
 
 **What stands beside an object [built].** `RowRemainder` (`worker_host/remainder.rs`) holds
 what a registration stated and the worker object does not hold as stated. The code that keeps

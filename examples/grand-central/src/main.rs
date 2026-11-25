@@ -17,9 +17,7 @@ use smg_grand_central::{
 /// The process's allocator, the one the stock controller's binary registers,
 /// on the targets where the settings below hold. An Apple target is left out:
 /// the allocator compiles no background thread there. The library registers
-/// none: a controller built on it chooses its own. A burst of registrations
-/// builds the store's world again at every write, and the system allocator
-/// keeps resident what those builds free.
+/// none: a controller built on it chooses its own.
 #[cfg(all(
     not(target_env = "msvc"),
     not(target_env = "musl"),

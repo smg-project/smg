@@ -117,7 +117,7 @@ pub struct MemoryStore {
     /// The store's counts of the leases on file, for the write that gives
     /// a joining member its slot.
     counts: Arc<InFlightCounts>,
-    /// Where the rows' clock starts.
+    /// Where the store's clock starts.
     origin: Instant,
     /// What every engine the store builds counts its held panics into: the
     /// unbound start's and each applied document's ([`Applied::new`]).
@@ -384,7 +384,7 @@ impl MemoryStore {
                 health.vetoes.clear();
                 // An unpublished build over no row drops the restore's old
                 // vetoes and the state derived from its membership.
-                drop(loads.writer.rebuild(cut.epoch, std::iter::empty()));
+                drop(loads.writer.rebuild(std::iter::empty()));
             }
             workers.by_key.clear();
             workers.log.clear();
@@ -423,10 +423,10 @@ impl MemoryStore {
         }
         previous.retain(|id, _| !workers.rows.contains_key(id));
         // The session pins take the steps of the writes the cut stands
-        // for, ahead of the world that lists its rows: no decision reads
+        // for, ahead of the world that lists its members: no decision reads
         // a new row before its pins stand under its id. Until that world
-        // stands, a row the last one held under its old id reads as in no
-        // pool: a request of its key is placed by the rule, as inside a
+        // stands, a member the last one listed under its old id reads as in
+        // no pool: a request of its key is placed by the rule, as inside a
         // replacement ([`Self::pins_follow`]).
         let left = previous.into_iter().map(|(id, held)| (id, held.row.facts));
         let (follows, ended) = workers.lay_gone(left, Instant::now(), self.pins_absence());
@@ -619,7 +619,9 @@ impl MemoryStore {
             MembershipChange::Relabelled { .. } | MembershipChange::Resized { .. } => {
                 self.tell_leaving(&workers, change, &off, now);
             }
-            MembershipChange::StatusChanged { id, to, .. } => self.show_status(id, to),
+            // A status is on the table's row and in the log: no world
+            // holds one, and none is published.
+            MembershipChange::StatusChanged { .. } => {}
             MembershipChange::Removed { id } => {
                 self.pay_leave(&workers, now);
                 self.tell_membership(change);
@@ -794,20 +796,16 @@ impl MemoryStore {
     /// write one cache line twice a decision. A decision reads the world
     /// through [`deciding`](Self::deciding), which borrows it and writes no
     /// shared count.
-    ///
-    /// A world kept across two publications of a pool keeps the rows it
-    /// lists as they are: the second publication writes over other rows,
-    /// and allocates that pool's rows when the writer holds none alone.
     pub fn snapshot(&self) -> Arc<StoreSnapshot> {
         self.world.load_full()
     }
 
     /// Read the snapshot of this instant under one load, held until `read`
-    /// returns: the rows it reads, the generation and its engine
+    /// returns: the vetoes it reads, the generation and its engine
     /// ([`StoreSnapshot::spec`]) are of one publication. Like
     /// [`deciding`](Self::deciding) it borrows the world and writes no
     /// shared count. The load is held for as long as `read` runs: a reader
-    /// that waits inside keeps the publication's rows from their next use.
+    /// that waits inside keeps that world from being let go.
     pub fn with_snapshot<R>(&self, read: impl FnOnce(&StoreSnapshot) -> R) -> R {
         let world = self.world.load();
         read(&world)
@@ -825,7 +823,7 @@ impl MemoryStore {
         decide(&self.world.load())
     }
 
-    /// `at` in the rows' clock: microseconds since the store's origin.
+    /// `at` in the store's clock: microseconds since the store's origin.
     pub fn micros(&self, at: Instant) -> u64 {
         micros(self.origin, at)
     }
@@ -836,7 +834,7 @@ impl MemoryStore {
         let mut loads = self.loads.lock();
         let writer = &mut loads.writer;
         writer.clear_listed();
-        let world = writer.rebuild(workers.epoch, workers.members());
+        let world = writer.rebuild(workers.members());
         writer.replaced(self.world.swap(world));
         // The build listed every member: none is left for the table.
         self.listed();
@@ -866,9 +864,9 @@ impl MemoryStore {
     /// paid its leave's, and with the load lock let go: the engine hears the
     /// writes in their order, and an apply, which takes the workers lock, moves no
     /// generation in between. A leave is told after the build that takes its
-    /// rows out of their pools: the worker is in no pool when its write
+    /// worker out of its pools: the worker is in no pool when its write
     /// returns, whoever wrote. A join is told when the store takes it, and
-    /// the world that lists its row follows at its window's build. A
+    /// the world that lists its worker follows at its window's build. A
     /// decision takes neither lock and meets the call at a stage's own lock
     /// or at a record of sent prefixes' own, and nowhere else. One that
     /// read its world before a leave's swap may still name the worker: a
@@ -959,7 +957,7 @@ impl MemoryStore {
         let (world, built) = match at {
             Some(now) if !writer.build_due(now) => (None, false),
             _ => {
-                let world = writer.build_owed(at, workers.epoch, workers.members());
+                let world = writer.build_owed(at, workers.members());
                 let built = world.is_some();
                 (world, built)
             }
@@ -1040,14 +1038,6 @@ impl MemoryStore {
         if let Some(world) = world {
             writer.replaced(self.world.swap(world));
         }
-    }
-
-    /// Fold a status change into the world and publish it at once. Called
-    /// under the workers lock, as the status was written.
-    fn show_status(&self, id: WorkerId, status: WorkerStatus) {
-        let mut loads = self.loads.lock();
-        let world = loads.writer.fold_status(id, status);
-        self.show(&mut loads.writer, world);
     }
 
     /// Publish `gateway`'s veto on `id` with its hold's end, or its
@@ -1687,7 +1677,6 @@ impl MemoryStore {
         if workers.set_status(id, status).is_none() {
             return HealthWrite::Stood(from);
         }
-        self.show_status(id, status);
         HealthWrite::Moved { from, to: status }
     }
 }
@@ -1750,9 +1739,7 @@ impl WorkersStore for MemoryStore {
     ) -> Option<MembershipChange> {
         let mut workers = self.writing();
         workers.guarded(id, revision)?;
-        let change = workers.set_status(id, status)?;
-        self.show_status(id, status);
-        Some(change)
+        workers.set_status(id, status)
     }
 
     fn get(&self, id: WorkerId) -> Option<WorkerRow> {
@@ -3490,7 +3477,7 @@ impl MemoryStore {
     /// where its registration filed one ([`Slots::filed`]). A decision
     /// over worker objects can pick a member inside its registration
     /// window: the objects follow a registration as its write lands, a
-    /// build ahead of the world that lists its row.
+    /// build ahead of the world that lists it.
     #[cfg(feature = "controller")]
     pub(crate) fn filed_slot(&self, target: WorkerId) -> Option<WorkerSlot> {
         self.slots().filed(target)

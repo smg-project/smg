@@ -5,7 +5,7 @@
 //! ([`MemoryStore::publish_due`]). No write pays for a publication itself:
 //! this loop keeps the instant and publishes at it ([`MemoryStore::publish`]).
 //! It runs on every replica for the serve's length, whoever wrote: a
-//! followed row reaches the published world as a leader's own does.
+//! followed member reaches the published world as a leader's own does.
 //!
 //! A membership write of another task can leave the store an instant the
 //! loop read none of, a registration's build: the store calls the wake the

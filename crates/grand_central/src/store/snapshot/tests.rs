@@ -25,7 +25,7 @@ fn facts(key: &str, role: Role, models: &[&str]) -> WorkerFacts {
     }
 }
 
-/// The tests' way to a row a decision reads: registered, and the build its
+/// The tests' way to a member a world lists: registered, and the build its
 /// write owes asked at once.
 fn admit(store: &MemoryStore, facts: WorkerFacts) -> WorkerId {
     let id = store.upsert(facts).id();

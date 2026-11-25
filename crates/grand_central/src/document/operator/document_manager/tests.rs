@@ -126,6 +126,44 @@ fn a_document_applied_through_the_door_lists_the_member_that_joins() {
     assert_eq!(store.outside_lists(), outside);
 }
 
+/// A generation whose lists differ from the standing one's has the standing
+/// members read again under them at its apply. The count of members outside
+/// the lists is the new generation's at once: no membership write and no
+/// build come between the apply and the read.
+#[test]
+fn an_apply_of_other_lists_counts_the_standing_members_under_them() {
+    use crate::store::{OutsideLists, WorkerFacts, WorkersStore};
+
+    let (store, generations) = generations();
+    let listing = |engines: &str| {
+        let document = format!("{RANDOM}view:\n  engines: [{engines}]\n");
+        yaml(&generations, document).expect("a valid document");
+        store.outside_lists().engines
+    };
+    assert_eq!(listing("alpha"), 0, "no member stands yet");
+    for (key, engine) in [("http://a:8000", "alpha"), ("http://b:8000", "beta")] {
+        store.upsert(WorkerFacts {
+            key: key.to_owned(),
+            engine: key.to_owned(),
+            incarnation: 1,
+            engine_kind: engine.to_owned(),
+            models: vec!["m".to_owned()],
+            dp_size: 1,
+            ..WorkerFacts::default()
+        });
+    }
+    store.publish_now();
+    let one = OutsideLists {
+        engines: 1,
+        zones: 0,
+    };
+    assert_eq!(store.outside_lists(), one);
+    // The next list takes the second member in, and the one after leaves
+    // both out.
+    assert_eq!(listing("alpha, beta"), 0);
+    assert_eq!(listing("gamma"), 2);
+}
+
 /// The writer that applies mints the number: a document with no line
 /// starts as generation 1, and a changed one is the next.
 #[test]

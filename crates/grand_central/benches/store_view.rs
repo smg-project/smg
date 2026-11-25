@@ -11,7 +11,7 @@
 //!   over 64 pools;
 //! - `policy_store/member_write_listed/512`: one membership write under a
 //!   generation that declares the view's three lists: the worker written
-//!   is read under them and the 512 members' fields are carried.
+//!   is read under them and what the 512 members read there is carried.
 //!
 //! This binary is built on the base branch with the pull request's bench
 //! sources, so a row here calls nothing the base's store lacks.
@@ -180,7 +180,7 @@ fn writes_beside_vetoes(c: &mut Criterion, fixtures: &mut [Fixture]) {
     }
     let mut group = c.benchmark_group("policy_store");
     // A member the others' vetoes name as well: the asking gateway's entry
-    // stands beside theirs on one row.
+    // stands beside theirs on one worker.
     let target = vetoed(31);
     let mut set = false;
     group.bench_with_input(BenchmarkId::new("veto_write", n), &n, |b, _| {
@@ -276,7 +276,7 @@ fn member_write_beside_spread_vetoes(c: &mut Criterion) {
 /// 512 members of one pool, each stating an engine family, a zone and
 /// twelve labels, under two families, four zones and eight selectors. A
 /// worker joins the pool and leaves it in turn: the write's build reads
-/// that worker under the lists and carries every other member's fields.
+/// that worker under the lists and carries what every other member read.
 fn member_write_under_lists(c: &mut Criterion) {
     const MEMBERS: usize = 512;
     let store = MemoryStore::new();

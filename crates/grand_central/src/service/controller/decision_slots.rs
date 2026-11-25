@@ -4938,7 +4938,7 @@ pub(crate) mod tests {
 
     /// A decision can pick a worker the store's world does not list yet:
     /// the worker objects follow a registration as its write lands, and
-    /// the store builds the pools that list the row a window later. The
+    /// the store builds the pools that list it a window later. The
     /// lease of such a pick books the worker's count all the same, by the
     /// slot the registration filed: the next decision reads one request in
     /// flight on the worker, on its object and in its record. A lease that
@@ -4955,7 +4955,7 @@ pub(crate) mod tests {
         });
         let mut bed = bed(Some(spec), true, (1, 8), []);
         // One more member, alone under its model, written ready and never
-        // published: the build that lists its row is still owed.
+        // published: the build that lists it is still owed.
         let key = String::from("http://late:8000");
         let facts = WorkerFacts {
             key: key.clone(),
@@ -4976,7 +4976,7 @@ pub(crate) mod tests {
             moved.expect("the row stands");
         }
         let listed = bed.store.snapshot().booked_of(late);
-        assert_eq!(listed, None, "no world lists the row yet");
+        assert_eq!(listed, None, "no world lists the worker yet");
         for request in 1..=2u8 {
             let answer = bed.ask(frame_for(LATE, request, u64::from(request))).await;
             assert_eq!(picked(&answer), late);
@@ -6148,7 +6148,7 @@ pub(crate) mod tests {
         let (mut bed, _, prefill) = later_bed();
         let (id, [chosen, other], _) = held(&mut bed).await;
         // One more decode, written ready and never published: the build
-        // that lists its row is still owed. A lease filed on the other
+        // that lists it is still owed. A lease filed on the other
         // decode leaves the new one alone with nothing in flight.
         let key = String::from("http://late:8000");
         let facts = WorkerFacts {
@@ -6170,7 +6170,7 @@ pub(crate) mod tests {
             moved.expect("the row stands");
         }
         let listed = bed.store.snapshot().booked_of(late);
-        assert_eq!(listed, None, "no world lists the row yet");
+        assert_eq!(listed, None, "no world lists the worker yet");
         file(&bed.store, 1, other, bed.script.taken);
         let answer = bed.ask(call(1, id)).await;
         assert_eq!(pair_of(&answer).0[0], (prefill.0, Some(late.0)));
@@ -7558,6 +7558,32 @@ pub(crate) mod tests {
     /// verdict leaves it, and the store is told.
     fn set_status(bed: &Bed, worker: WorkerId, status: WorkerStatus) {
         stand(&bed.reads.objects, &bed.store, worker, status);
+    }
+
+    /// A worker told not ready, or draining, is passed over by the very
+    /// next decision, and the store publishes no world for its status: a
+    /// decision reads a worker's status on its worker object, so none waits
+    /// a publication for a worker that left rotation. Under `round_robin`
+    /// the three ready workers take requests by turns, so six in a row on
+    /// one worker show the two others passed over.
+    #[tokio::test]
+    async fn a_worker_told_out_of_rotation_is_passed_over_with_no_publication() {
+        for out in [WorkerStatus::NotReady, WorkerStatus::Draining] {
+            let mut bed = bed(Some(preset("round_robin", 1)), true, (1, 8), []);
+            let stays = bed.workers[0];
+            assert_eq!(bed.store.publish_due(), None, "no build waits");
+            let published = bed.store.publications();
+            for other in [bed.workers[1], bed.workers[2]] {
+                set_status(&bed, other, out);
+            }
+            let told = bed.store.publications();
+            assert_eq!(told, published, "{out:?}: a status published a world");
+            for request in 1..=6 {
+                let answer = bed.ask(frame(request, 1_000 + u64::from(request))).await;
+                assert_eq!(picked(&answer), stays, "{out:?}: request {request}");
+            }
+            assert_eq!(bed.store.publications(), published, "{out:?}");
+        }
     }
 
     /// The service counts a keyed single request for its key under any
