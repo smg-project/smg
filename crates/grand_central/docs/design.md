@@ -1296,7 +1296,7 @@ list's conversion where it takes the list's claim, which it tries and never wait
 Main has one engine, `InProcess`, behind the trait `DecisionEngine`
 (`engine/decision_engine.rs`). It decides over its host's worker objects, read in place. It keeps
 no lease: the host hands the lease back with each event. This document also calls it the kept
-engine.
+engine, its name while a second engine stood beside it.
 
 A second engine stood beside it: the store-backed engine, also called the old engine here. It
 decided over records copied into the policy store and kept its leases there. Its type is deleted,
@@ -1309,7 +1309,7 @@ The types the two engines shared stay where they were moved ahead of the deletio
 `DecideOutcome`, `DecisionRefused` and `DecodeRefused` in the trait's file, and
 `Said` (section 6) beside `Lease`. `GatewayId` is still defined in the store.
 
-### 5.8 What changes in the kept engine **[planned]**
+### 5.8 What changes in the engine **[partly]**
 
 - It honours what it once refused: an encode request's pair held to some workers of its two
   lists, and its encoders held to some of theirs (`EncodeLists::decide` decides the request
@@ -1339,7 +1339,7 @@ The types the two engines shared stay where they were moved ahead of the deletio
   decided in are the host's own, lent (section 4.5).
 
 `signal_cells` stays, and it is built for a single request: where the request's profile reads a
-named signal, the kept engine fills the field itself, from the reports of the load snapshot the
+named signal, the engine fills the field itself, from the reports of the load snapshot the
 decision holds. Such a decision converts its list's reports where no decision under its snapshot
 has, ahead of a routing key's short answer too. A row that is one rank of a data-parallel worker
 reads its own rank's values. A worker object that stands for several ranks reads one value a
@@ -1452,9 +1452,10 @@ takes it, and neither the engine's record of sent prefixes nor a lent token tree
 The session's pin still follows its dispatch, and its completion and its release are told as any
 request's, so a stage matches an end by the lease's id. The routing settings write `untold` for
 the sticky override's rule alone: a gateway's sticky map keeps a request it places from the
-gateway's policy. The kept engine keeps the word on the pick, and one function reads it
-(`lease_events::stages_hear`) at four places: a single's lease words, the record's two writes, the
-tree's store, and the hand-over of a pin followed by one row. Such a pin that is the profile's own
+gateway's policy. The engine keeps the word on the pick, and one function reads it
+(`lease_events::stages_hear`) wherever it is asked, among them a single's lease words, the record's
+two writes, a pair's two writes behind its pick, the tree's store, and the hand-over of a pin
+followed by one row. Such a pin that is the profile's own
 goes through the lookup that names a request's holders with its answer made, so its prompt is
 recorded as a pin's the whole decision follows. A controller asks the same function where it files
 a pick's lease, and keeps the answer on the lease's record (`LeaseRecord::untold`): no stage hears
@@ -2128,7 +2129,7 @@ The design adds no second mechanism where one exists.
 | the place where a worker is chosen | classic's four placement functions | one call in each |
 | the rank a request is sent with | the worker object's own rank, where its registration states one | nothing: no rank choice runs behind the pick of a worker registered rank by rank, and the classic rank option is refused at the start beside the engine (section 9.2 names the two places a rank is still chosen) |
 | the lease's reporting | `DecisionGuard` | `Placement`, which holds it |
-| proof against classic | classic's recorders and their sheets | replays through the kept engine |
+| proof against classic | classic's recorders and their sheets | replays through the engine |
 
 ## 9. The gateway as a host **[partly]**
 
@@ -2807,7 +2808,7 @@ Five things follow, and they are the first work of section 16.
    call the decision function over hand-built candidates. Sixteen sheets
    (438 lines) record a decision, and each has to replay through `InProcess` over worker
    objects. The other four (74 lines: `overload` 25, `pair_index` 23, `minimum_tokens` 18,
-   `sticky_rank` 8) record an answer of the host, which the kept engine is never asked for. It
+   `sticky_rank` 8) record an answer of the host, which the engine is never asked for. It
    reads the overload verdict that the host's load monitor wrote on the worker object. It is
    handed each prefill's partners with a pair's two lists. It names the rank a worker
    registered, never one of the ranks behind a worker that stands for all of them. In a host's
@@ -2815,8 +2816,8 @@ Five things follow, and they are the first work of section 16.
    with no replay. For the two rank sheets that rests on a rule of the gateway's change
    (section 9.2). On main `pair_index` replays through the pairing rule a controller derives its pair classes by (`PairClasses::derive`), `sticky_rank` replays over rank objects through `InProcess`, and `overload` (25 lines) replays as recorded through the worker crate's load monitor, built as a host builds it, where the worker is one object for all its ranks. Eleven of its lines answer differently where each rank is a worker object, by the one rule stage 4's line names (section 16). `minimum_tokens` (18 lines) replays as recorded through the rank cache of that load monitor, where the worker is one object for all its ranks or the object of its one rank. No test replays it through the engine's pick among rank objects, which stage 4's line counts (section 16).
 2. **23 lines were held to the crate's own answer** (`minimum_tokens` 10, `overload` 6,
-   `sticky_rank` 4, `prefix_hash` 2, `manual` 1). The 16 of `minimum_tokens` and `overload` were held by the old engine's store. The 6 of `overload` replay as classic recorded now, through the host's load monitor (point 1). The 10 of `minimum_tokens` replay as classic recorded now too, through that monitor's rank cache (point 1); three of them are rules of the scorer and the picker, which the kept engine shares where it picks among rank objects. The 4 of `sticky_rank` are held the same through `InProcess`, by the ring and the picker. The
-   other three are the kept engine's. The 2 of `prefix_hash` differ from classic there too (a
+   `sticky_rank` 4, `prefix_hash` 2, `manual` 1). The 16 of `minimum_tokens` and `overload` were held by the old engine's store. The 6 of `overload` replay as classic recorded now, through the host's load monitor (point 1). The 10 of `minimum_tokens` replay as classic recorded now too, through that monitor's rank cache (point 1); three of them are rules of the scorer and the picker, which the engine shares where it picks among rank objects. The 4 of `sticky_rank` are held the same through `InProcess`, by the ring and the picker. The
+   other three are the engine's. The 2 of `prefix_hash` differ from classic there too (a
    key folds whole blocks). One of them turns in the crate on a ring its caller lends
    (decision 3). The other measures which tokens are in a prompt's head, which is then the
    caller's recipe: it is proven at stage 3, by a gateway test of classic's own function. The
@@ -2861,7 +2862,7 @@ Five things follow, and they are the first work of section 16.
    puts all 47 lines through both is not written **[planned]**.
 
 Hosted CI's first test line of the crate enables the feature `client`. It takes `controller`,
-which takes the feature the kept engine is behind, so that line runs that engine's own tests.
+which takes the feature the engine is behind, so that line runs the engine's own tests.
 Decision 11 says how this was closed.
 
 ### 13.2 Speed
@@ -2983,7 +2984,7 @@ and it has served traffic on a cluster beside classic.
 
 Each is the maintainer's. Work inside the crate goes on where a decision is not needed for it.
 
-All sixteen at a glance. An answer can be as short as the numbers with their letters.
+All seventeen at a glance. An answer can be as short as the numbers with their letters.
 
 | # | Decision | Recommended | Needed for |
 |---|---|---|---|
@@ -3003,6 +3004,7 @@ All sixteen at a glance. An answer can be as short as the numbers with their let
 | 14 | Round robin's order across deciding threads | recorded, the answer is open: (a) a thread takes a list's turns in runs | rule 6, for `round_robin` where several threads decide |
 | 15 | The workers a session's first request reads | recorded, the answer is open: (a) the workers its turn asks about | rule 6, for a sessions rule that leaves a new key to round robin |
 | 16 | `least_load`'s count of a request that is never sent | decided 2026-11-24: (a) the engine counts a send at its dispatch | rule 6, for `least_load` where a route refuses a request behind its selection |
+| 17 | The pick among workers that tie at the fewest requests | decided 2026-11-25: (a) the engine draws among them | rule 6, for `prefix_hash` where it places a request by load |
 
 ### Decision 1: the name of a cache partition
 
@@ -3335,6 +3337,33 @@ the worker's next report.
 
 **Decided 2026-11-24: (a).** The engine's count stays, and a request that is never sent is not
 counted.
+
+### Decision 17: the pick among workers that tie at the fewest requests
+
+*Needed for:* rule 6 (section 1), for `prefix_hash` where it places a request by load.
+
+Classic's `prefix_hash` places some requests by load, among them a request with nothing to hash: no
+routing key, no tokens and no text. For that request it takes the worker with the fewest requests in
+flight among those it may use, and of several at that count the first in the order of the list it is
+handed (`least_loaded_healthy` in `model_gateway/src/policies/prefix_hash.rs`). Classic's own
+`least_load` draws among the workers that tie, so that an idle fleet's requests spread
+(`TIE_EPSILON_SECS` in `model_gateway/src/policies/least_load.rs`).
+
+The engine's profile for `prefix_hash` adds the weighted scores of `consistent-hash` and
+`least-requests` (section 7). For such a request `consistent-hash` scores every worker alike, so
+`least-requests` orders them, and the picker `best` draws among the workers at the best score, from
+the decision's seed.
+
+So where several workers tie at the fewest requests in flight, classic takes the first of them and
+the engine draws one. That holds where the policy itself places: for a single request, and for each
+side of a pair.
+
+| Option | Cost |
+|---|---|
+| (a) The engine draws among the workers that tie. | Where several workers tie, the engine's pick can differ from classic's, by this decision. Classic's answers do not move. |
+| (b) The engine takes the first of them in its list's order, as classic does. | The two agree. Each request that finds its workers at one count then goes to the first of them. |
+
+**Decided 2026-11-25: (a).** The engine's draw stays.
 
 ## 16. The order of work
 
