@@ -388,6 +388,11 @@ pub struct Affinity {
     /// What the records that left the map had left out
     /// ([`Self::left_out`]). Written under the map's mutex.
     left_out: AtomicU64,
+    /// Where the next record made begins its count of leaves: past the
+    /// count of every record that left the map, so a write reads the count
+    /// its naming read in no record made since. Written under the map's
+    /// mutex.
+    left_past: AtomicU64,
     /// How many leaves were told ([`Self::leaves`]), each counted ahead of
     /// its records' own counts.
     leaves: AtomicU64,
@@ -480,13 +485,26 @@ impl Affinity {
                 (*record.taken.get_mut() == *taken).then(|| records.remove(model))?
             })
             .collect();
-        let left_out = left
-            .iter()
-            .map(|record| record.left_out.load(Ordering::Relaxed))
-            .sum();
-        self.left_out.fetch_add(left_out, Ordering::Relaxed);
+        self.count_gone(left.iter());
         // Freed once the mutex is given back, as at a sweep.
         drop(records);
+    }
+
+    /// Counts the records that left the map, under its mutex: what they
+    /// had left out stays in the total ([`Self::left_out`]), and the next
+    /// record made begins its count of leaves past theirs
+    /// ([`Self::left_past`]).
+    fn count_gone<'a>(&self, gone: impl Iterator<Item = &'a Arc<PrefixRecord>>) {
+        let (mut left_out, mut past) = (0, None);
+        for record in gone {
+            left_out += record.left_out.load(Ordering::Relaxed);
+            past = past.max(Some(record.left.load(Ordering::Relaxed)));
+        }
+        self.left_out.fetch_add(left_out, Ordering::Relaxed);
+        if let Some(past) = past {
+            self.left_past
+                .fetch_max(past.saturating_add(1), Ordering::Relaxed);
+        }
     }
 
     /// The work the records left waiting, a bounded step of each: the
@@ -499,9 +517,10 @@ impl Affinity {
     /// a write for it, and every worker it was written for was forgotten.
     /// So a model's record goes behind its last worker, and a record with
     /// no placement yet can go between two tables of its list. The model's
-    /// next table read makes a fresh record. A pick named from a record
-    /// that left writes to the fresh one or writes nothing: an entry is a
-    /// prediction, and the next request of the prefix writes it.
+    /// next table read makes a fresh record, whose count of leaves begins
+    /// past this one's: a pick named from a record that left writes
+    /// nothing, as behind a leave. An entry is a prediction, and the next
+    /// request of the prefix writes it.
     ///
     /// A write a thread keeps holds its record until the thread writes it
     /// on behind a pick, or until the thread ends. The record stays in the
@@ -524,11 +543,7 @@ impl Affinity {
                 lone
             })
             .collect();
-        let left_out = left
-            .iter()
-            .map(|(_, record)| record.left_out.load(Ordering::Relaxed))
-            .sum();
-        self.left_out.fetch_add(left_out, Ordering::Relaxed);
+        self.count_gone(left.iter().map(|(_, record)| record));
         // What left is freed once the mutex is given back, so the read of a
         // list's table waits for no free.
         drop(records);
@@ -565,7 +580,8 @@ impl Affinity {
             let record = if let Some(record) = records.get(model) {
                 Arc::clone(record)
             } else {
-                let record = Arc::new(PrefixRecord::new(bound));
+                let left = self.left_past.load(Ordering::Relaxed);
+                let record = Arc::new(PrefixRecord::new(bound, left));
                 records.insert(model.into(), Arc::clone(&record));
                 record
             };
@@ -591,9 +607,10 @@ struct PrefixRecord {
     bound: AtomicUsize,
     /// Work waits for a sweep: a worker left, or the bound came down.
     sweeping: AtomicBool,
-    /// How many leaves were told. Written under the record's guard, a
-    /// reader's where the leave takes no place out: a write in parts stops
-    /// where it moved since its naming.
+    /// How many leaves were told, counted on from where the map's records
+    /// before this one stopped ([`Affinity::left_past`]). Written under the
+    /// record's guard, a reader's where the leave takes no place out: a
+    /// write in parts stops where it moved since its naming.
     left: AtomicU64,
     /// How many writes ended before the request's last block: a turn of
     /// theirs met a held lock, and their thread kept them no longer
@@ -671,12 +688,12 @@ impl PrefixRecord {
     /// A sweep's step.
     const SWEEP: usize = 64;
 
-    fn new(bound: usize) -> Self {
+    fn new(bound: usize, left: u64) -> Self {
         Self {
             predictor: RwLock::new(PrefixPredictor::new(bound)),
             bound: AtomicUsize::new(bound),
             sweeping: AtomicBool::new(false),
-            left: AtomicU64::new(0),
+            left: AtomicU64::new(left),
             left_out: AtomicU64::new(0),
             taken: AtomicU64::new(0),
         }
