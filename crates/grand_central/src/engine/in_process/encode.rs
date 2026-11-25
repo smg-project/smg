@@ -35,8 +35,8 @@ use smg_worker::load::state::LoadSnapshot;
 
 use super::{
     pair::{
-        issued, not_decided, record_sides, side_columns, stamp, tried_engines, Buffers, PairLists,
-        BUFFERS,
+        issued, not_decided, record_sides, said_apart, side_columns, stamp, tried_engines, Buffers,
+        PairLists, BUFFERS,
     },
     signals, single, InProcess, Loaded, PoolMembers,
 };
@@ -511,8 +511,14 @@ impl EncodeLists<'_> {
         let decision = BUFFERS.with(|buffers| match buffers.try_borrow_mut() {
             Ok(mut buffers) => decide(&mut buffers),
             // A stage asked for a decision from inside its own, on this
-            // thread: that decision takes buffers of its own.
-            Err(_) => decide(&mut Buffers::default()),
+            // thread: that decision takes buffers of its own, and its word
+            // of a shed is kept for its call ([`said_apart`]).
+            Err(_) => {
+                let mut own = Buffers::default();
+                let decision = decide(&mut own);
+                said_apart(&own.scratch);
+                decision
+            }
         });
         // The thread's list goes back for its next retry.
         if let Some(tried) = tried {

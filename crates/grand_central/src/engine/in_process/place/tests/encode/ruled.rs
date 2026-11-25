@@ -186,9 +186,11 @@ fn an_encode_request_is_placed_on_the_rules_prefill_though_an_earlier_attempt_tr
 }
 
 /// An encode request whose rule takes no worker of one of its pair's lists
-/// is shed with no endpoint under the rule's name, behind one decision.
-/// The rule is asked of that decision's picks, then of every prefill, then
-/// of every decode, ready or not, and no second decision is made.
+/// is shed with no endpoint under the rule's name, behind one decision
+/// that picked. The rule is asked of that decision's picks, then of every
+/// prefill, then of every decode, ready or not, and no second decision is
+/// made. Behind a first decision that sheds the request as saturated, that
+/// shed stands in two cases ([`rows`](super::rows)).
 ///
 /// The classic router answers such a request that it has no worker: its
 /// pass finds nobody open on a side none of whose workers the filter takes
@@ -569,17 +571,17 @@ fn an_encode_request_shed_as_saturated_under_no_rule_keeps_its_shed() {
 /// takes no worker of one list, is shed with no endpoint under the rule's
 /// name. The rule is asked of the prefill and then of the two decodes, it
 /// takes neither decode, and no second decision is made. The saturated
-/// shed does not stand: a rule that takes no worker of a list is told
-/// first.
+/// shed does not stand here. The binding steers, and an idle decode that
+/// pairs with no prefill keeps the decode list from being wholly over its
+/// thresholds: the decision says no list of its shed. Where it says one,
+/// the shed stands where the rule's prefills let it
+/// ([`rows`](super::rows)).
 ///
 /// The classic router answers such a request that it has no worker: its
 /// pass finds nobody open on a side none of whose workers the filter takes
-/// (`placement.rs:2956-2982` on main `bd55beae5`). Where that side is
-/// wholly over its thresholds under a registry that sheds, classic's
-/// answer is its overload shed, judged over the pool with the filter left
-/// out (`admitted_pool`, `:1878-1900`; `failure_from`, `:1757-1771`): a
-/// difference on record for a pair's request, which this arm answers the
-/// same way.
+/// (`placement.rs:2956-2982` on main `bd55beae5`), and judges that side
+/// with the filter left out (`admitted_pool`, `:1878-1900`; `failure_from`,
+/// `:1757-1771`): a decode of it is under its thresholds.
 #[test]
 fn an_encode_request_shed_as_saturated_whose_rule_takes_no_worker_of_a_list_is_shed_under_its_name()
 {

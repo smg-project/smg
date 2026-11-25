@@ -185,6 +185,24 @@ impl Bed {
         facts: &RequestFacts<'_>,
         pool: &PoolFacts<'_>,
     ) -> (Decision, EncodePlaced) {
+        self.decide_asked_in(engine, facts, pool, &mut Scratch::new())
+    }
+
+    /// The encode entry's answer over the bed's pools, made with `scratch`:
+    /// the scratch keeps the decision's word of the list it shed over.
+    fn decide_in(&self, engine: &Engine, scratch: &mut Scratch) -> Decision {
+        let (facts, pool) = self.asked();
+        self.decide_asked_in(engine, &facts, &pool, scratch).0
+    }
+
+    /// [`Self::decide_asked`], made with `scratch`.
+    fn decide_asked_in(
+        &self,
+        engine: &Engine,
+        facts: &RequestFacts<'_>,
+        pool: &PoolFacts<'_>,
+        scratch: &mut Scratch,
+    ) -> (Decision, EncodePlaced) {
         fn cells(of: &[SignalCell]) -> Option<SignalCells> {
             (!of.is_empty()).then(|| SignalCells::new(of.to_vec(), 1))
         }
@@ -227,7 +245,7 @@ impl Bed {
             &cx,
             &cx,
             &encode_cx,
-            &mut Scratch::new(),
+            scratch,
             &mut placed,
         );
         (decision, placed)
@@ -673,6 +691,78 @@ fn overloaded(row: Candidate) -> Candidate {
         },
         ..row
     }
+}
+
+/// An encode decision says, in the scratch it is made with, the list it
+/// sheds its request over as saturated: the encoders where the overload
+/// veto left none of them open, and else the list its pair's decision
+/// says, where that decision was handed the pair's two lists whole. Where
+/// the pass handed it a part of either list, the decision says no list,
+/// of the list that was cut or of the other: the pair's decision judged
+/// the part. Each decision takes back the word of the one before where it
+/// begins, so an answer that is no such shed leaves none.
+#[test]
+fn an_encode_decision_says_the_list_it_sheds_over() {
+    let mut shedding = engine();
+    shedding.shed_when_all_vetoed(0);
+    let saturated = (ShedReason::Saturated, "not-overloaded");
+    let mut scratch = Scratch::new();
+    // The one encoder is over its thresholds.
+    let mut bed = Bed::new();
+    bed.encoders[0] = overloaded(bed.encoders[0]);
+    assert_eq!(shed_of(&bed.decide_in(&shedding, &mut scratch)), saturated);
+    assert_eq!(scratch.shed_over(), Some(ShedOver::Encoders));
+    // No encoder is ready: a missing endpoint, which says no list.
+    bed.encoders[0] = unready(bed.encoders[0]);
+    let missing = (ShedReason::NoEndpoints, "encoders");
+    assert_eq!(shed_of(&bed.decide_in(&shedding, &mut scratch)), missing);
+    assert_eq!(scratch.shed_over(), None, "behind a missing endpoint");
+    // The one prefill is over its thresholds: the pair's decision is
+    // handed both lists whole, and says the prefills.
+    let mut bed = Bed::new();
+    bed.prefills[0] = overloaded(bed.prefills[0]);
+    assert_eq!(shed_of(&bed.decide_in(&shedding, &mut scratch)), saturated);
+    assert_eq!(scratch.shed_over(), Some(ShedOver::Prefills));
+    // A second prefill under its thresholds hands to no encoder, so the
+    // pair's decision is handed the first alone: its word of the prefills
+    // says nothing of the list the caller lent, and goes.
+    bed.prefills.push(row(1, Role::Prefill, 1, 0));
+    bed.prefill_classes.push(2);
+    assert_eq!(shed_of(&bed.decide_in(&shedding, &mut scratch)), saturated);
+    assert_eq!(scratch.shed_over(), None, "a part of the prefills");
+    // A pick says no list either.
+    bed.prefills[0] = row(0, Role::Prefill, 1, 0);
+    let decision = bed.decide_in(&shedding, &mut scratch);
+    assert!(matches!(decision, Decision::Pick(_)), "{decision:?}");
+    assert_eq!(scratch.shed_over(), None, "behind a pick");
+    // The one decode is over its thresholds behind whole lists: the
+    // pair's decision says the decodes.
+    let mut bed = Bed::new();
+    bed.decodes[0] = overloaded(bed.decodes[0]);
+    assert_eq!(shed_of(&bed.decide_in(&shedding, &mut scratch)), saturated);
+    assert_eq!(scratch.shed_over(), Some(ShedOver::Decodes));
+    // Behind a part of the prefills that word goes too: the decision made
+    // its shed for the prefills it was handed.
+    bed.prefills.push(row(1, Role::Prefill, 1, 0));
+    bed.prefill_classes.push(2);
+    assert_eq!(shed_of(&bed.decide_in(&shedding, &mut scratch)), saturated);
+    assert_eq!(scratch.shed_over(), None, "the prefills cut, the decodes");
+    // The request's decode must take images, and a second decode under
+    // its thresholds takes none: a part of the decodes, behind a shed over
+    // the decodes and behind one over the prefills.
+    let mut bed = Bed::new();
+    bed.decode_images = true;
+    bed.decodes[0] = overloaded(bed.decodes[0]);
+    bed.decodes.push(Candidate {
+        vision: false,
+        ..row(1, Role::Decode, 1, 0)
+    });
+    assert_eq!(shed_of(&bed.decide_in(&shedding, &mut scratch)), saturated);
+    assert_eq!(scratch.shed_over(), None, "the decodes cut, the decodes");
+    bed.decodes[0] = row(0, Role::Decode, 1, 0);
+    bed.prefills[0] = overloaded(bed.prefills[0]);
+    assert_eq!(shed_of(&bed.decide_in(&shedding, &mut scratch)), saturated);
+    assert_eq!(scratch.shed_over(), None, "the decodes cut, the prefills");
 }
 
 /// Under a binding that sheds a pool the overload veto empties, encoders

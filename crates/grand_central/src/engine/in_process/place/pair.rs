@@ -18,8 +18,10 @@
 //! ([`again`]): they are lent the same two lists with each side's places
 //! beside it ([`PairLists::prefill_places`],
 //! [`PairLists::decode_places`]). A list the rule takes no worker of ends
-//! the call there: behind such prefills the decodes are not asked. An
-//! encode request that carries items is held the same way, by the same
+//! the call there: behind such prefills the decodes are not asked. The
+//! request is then shed with no endpoint under the rule's name, or by its
+//! first decision's shed as saturated where that shed stands ([`again`]).
+//! An encode request that carries items is held the same way, by the same
 //! routine, over the pair's two of its three lists ([`super::encode`]).
 //!
 //! Which workers pair is the caller's word: the classes its lists carry
@@ -29,13 +31,15 @@
 use std::{sync::Arc, time::Instant};
 
 use super::{
-    decide, hold_to_rule, raise, sendable, walk, Call, Made, PlaceRequest, Sent, Sides, Unplaced,
+    decide, hold_to_rule, raise, ready_by, sendable, walk, Call, Made, PlaceRequest, Sent, Sides,
+    Unplaced,
 };
 use crate::{
     engine::{
         decision::{ShedReason, Target},
         decision_engine::DecisionRefused,
-        in_process::Loaded,
+        framework::ShedOver,
+        in_process::{pair::shed_over, Loaded},
         list_cell::LentList,
         prefills_full,
         view::{Phase, WorkerId},
@@ -158,7 +162,8 @@ pub(super) fn sides(
 /// What an ask answers, and [`Unplaced::NoWorkers`] where no target of the
 /// call's last ask holds. A rule that takes no worker of one of the two
 /// lists sheds the request with no endpoint, under `admits`
-/// ([`hold_to_rule`]).
+/// ([`hold_to_rule`]), or leaves it its first decision's shed as saturated
+/// ([`again`]).
 pub(super) fn place<'a>(
     engine: Loaded<'static, '_>,
     request: &PlaceRequest<'a>,
@@ -202,6 +207,69 @@ pub(super) fn asks<'a>(
     again(request, lists, lent, call, shed, &next)
 }
 
+/// Whether a first decision's shed as saturated stands behind a rule that
+/// takes the prefills at the places `taken` and no decode, the decision
+/// having said the list `word` ([`again`]): whether the gateway's own pair
+/// selection answers its overload shed there too.
+///
+/// The rule's prefills here are the ones that pair with a decode: that
+/// selection holds no other prefill, so a rule that takes only prefills
+/// which pair with no decode takes none of its prefills
+/// (`model_gateway/src/routers/common/pair_index.rs:158-161`, on main
+/// `56773d28d`). The shed then stands as it does behind a rule that takes
+/// no prefill: where the decision shed over the prefills.
+///
+/// Else the rule's prefills are read in the list's order, each once and
+/// none behind the first that can take the request, with the host's
+/// vetoes beside the list. One is ready where it can be sent to ([`ready_by`])
+/// and no hold of its host stands on it. One can take the request where
+/// it is ready, under its thresholds and under no liveness doubt.
+///
+/// Where one of them can take the request, that selection judges the
+/// decode list, whole behind a rule that takes no decode
+/// (`model_gateway/src/routers/common/placement.rs:2909-2936`, `:1831-1852`):
+/// the shed stands where the decision said the decodes. Where none can,
+/// it judges the rule's prefills (`:2866-2884`): the shed stands where one
+/// of them is ready and every ready one is over its thresholds, whichever
+/// list the decision said. A ready prefill under a doubt is one of that
+/// count: under its thresholds it keeps the rule's prefills from being
+/// wholly over theirs, and over them it does not
+/// (`model_gateway/src/routers/common/overload.rs:58-74`).
+#[cold]
+#[inline(never)]
+fn stands(lists: &PairLists<'_>, taken: &[u32], word: ShedOver) -> bool {
+    let classes = lists.classes.prefills();
+    let pairs = |place: &&u32| {
+        classes
+            .get(**place as usize)
+            .is_some_and(|&class| class != 0)
+    };
+    let mut ruled = taken.iter().filter(pairs).peekable();
+    if ruled.peek().is_none() {
+        return word == ShedOver::Prefills;
+    }
+    let stated = |places: &[u32], place: u32| places.binary_search(&place).is_ok();
+    let (mut one_ready, mut all_over) = (false, true);
+    for &place in ruled {
+        let Some(worker) = lists.prefill.workers.get(place as usize) else {
+            continue;
+        };
+        let state = worker.routing_state();
+        if !ready_by(state) || stated(lists.prefill_held, place) {
+            continue;
+        }
+        one_ready = true;
+        if !state.overloaded {
+            // This one can take the request: no prefill behind it is read.
+            if !state.stalled && !stated(lists.prefill_stalled, place) {
+                return word == ShedOver::Decodes;
+            }
+            all_over = false;
+        }
+    }
+    one_ready && all_over
+}
+
 /// The call's next ask (`next`) behind one none of whose targets held, or
 /// that shed the request as saturated (`shed`), which was lent `lent`
 /// ([`asks`]). Behind the call's first ask, a rule the request
@@ -228,8 +296,9 @@ pub(super) fn asks<'a>(
 /// pair's two lists and of no encoder, and the encoders' list is lent as
 /// it stands. An encode request comes here too where an encoder could not
 /// be sent to: its pair is then decided among the rule's workers as well.
-/// A shed made over its encoders does not come here: it stands with the
-/// ask that made it.
+/// A shed made over its encoders comes here and stands, ahead of the rule:
+/// the rule is asked of no encoder, so it narrows nothing that decision
+/// judged, and a decision among its workers could only shed again.
 ///
 /// A decision judges the overload over the lists it is lent: a worker
 /// under its thresholds that the rule refuses, and that no decision
@@ -239,6 +308,62 @@ pub(super) fn asks<'a>(
 /// wholly over its thresholds that decision sheds again, and its shed
 /// stands. A shed stands where the rule is not asked here: behind a
 /// later ask, and under no rule.
+///
+/// Where the rule takes no worker of a list, no decision can be made
+/// among its workers. The first decision's shed as saturated is then the
+/// call's answer in two cases, and in both that decision said a list: its
+/// own word of the list it shed over ([`shed_over`]), which it says under
+/// a document that sheds a list wholly over its thresholds, where the
+/// gateway's own selection would read that list so too. The rule takes no
+/// prefill, and the decision shed over the prefills. Or the rule takes a
+/// prefill and no decode, and its prefills let the shed stand
+/// ([`stands`]): one of them can take the request and the decision shed
+/// over the decodes, or none can, one is ready and every ready one is over
+/// its thresholds. In every other case the request is shed with no
+/// endpoint under `admits`, as it is behind a first decision that picked
+/// and behind one that said no list.
+///
+/// A request held to a part of a list keeps the shed under `admits` in
+/// both cases: one that states a hard demand
+/// ([`PlaceRequest::demands`]), and one whose host states places of the
+/// prefills or of the decodes ([`PairLists::prefill_places`],
+/// [`PairLists::decode_places`]). The demand hands the decision the
+/// workers that meet it, and the places the workers at them, so a list
+/// the decision counted may be a part. The call acts on no word of the
+/// prefills or the decodes for such a request: a word of the list that
+/// stayed whole goes too, and so does one of a list whose places name
+/// every worker. The gateway's own selection states no places. It holds
+/// such a need in its filter, and judges the list on the request's wire
+/// whole where its filter takes nobody (`admitted_pool`).
+///
+/// A shed made over the encoders stands for such a request as for any,
+/// ahead of this test. Places of the encoders alone
+/// ([`EncodeLists::encoders_places`]) hold an encode request to no part
+/// of its pair's two lists. Where the encoders at them leave a prefill or
+/// a decode out, the encode pass takes the word back itself. So where the
+/// word stays, the decision judged both lists whole, and its shed stands.
+///
+/// The gateway's own pair selection answers its overload shed in both
+/// cases, and over the lists as the decision counted them the shed stands
+/// in no case where it answers that it has no worker. It judges one list:
+/// the prefills where no prefill the rule takes can take the request, and
+/// else the decodes. It judges that list over the rule's workers of it, and
+/// whole where the rule takes none of it
+/// (`model_gateway/src/routers/common/placement.rs:2866-2884`, `:2909-2936`
+/// and `:1831-1852`, on main `56773d28d`). A worker that is not ready is no
+/// part of a list's overload there, and one under a liveness doubt is
+/// (`model_gateway/src/routers/common/overload.rs:58-74`).
+///
+/// One read behind the rule is fresh, in the second case: the state of
+/// the prefills the rule takes that pair with a decode, in the list's
+/// order and up to the first that can take the request ([`stands`]),
+/// whether the decision counted them or not. One of them that is ready,
+/// under no hold, and came under its thresholds since the decision keeps
+/// no shed over the prefills. The decision's count of each list is not
+/// read again: a decode, or a prefill the rule does not take, whose state
+/// changes behind the decision leaves the answer as it is, though that
+/// selection asks its filter first and judges the list behind it
+/// (`:2866-2884`). A second read here would only move that instant.
 ///
 /// A pair held to the two workers its request names
 /// ([`target::pair`](super::target::pair)) is asked no second time: behind
@@ -267,18 +392,49 @@ pub(super) fn again<'a>(
     let (mut prefills, mut decodes) = (None, None);
     // The rule is asked of a list once a call: behind the first ask.
     if call.spent == 0 {
-        hold_to_rule(
-            request,
-            Some(lists.prefill),
-            lists.prefill_places,
-            &mut prefills,
-        )?;
-        hold_to_rule(
+        // The list the first decision shed the request over, by that
+        // decision's own word. Read ahead of the rule: a rule may place a
+        // request on this thread, and that decision writes its own word.
+        let over = shed.and_then(|shed| Some((shed, shed_over()?)));
+        // The rule is asked of no encoder: a shed made over the encoders
+        // stands, and no rule is asked behind it.
+        if let Some((shed, ShedOver::Encoders)) = over {
+            return Err(shed);
+        }
+        // A hard demand hands the decision a part of each list, the
+        // workers that meet it, and the places its host states for the
+        // prefills or the decodes hand it the workers at them. A list the
+        // decision counted may then be a part: no word of the prefills or
+        // the decodes is acted on for such a request.
+        let whole = request.demands.is_none()
+            && lists.prefill_places.is_none()
+            && lists.decode_places.is_none();
+        let over = over.filter(|_| whole);
+        let prefill = lists.prefill;
+        let asked = hold_to_rule(request, Some(prefill), lists.prefill_places, &mut prefills);
+        if let Err(none) = asked {
+            // The rule takes no prefill: a shed made over the prefills
+            // stands.
+            return Err(match over {
+                Some((shed, ShedOver::Prefills)) => shed,
+                _ => none,
+            });
+        }
+        let asked = hold_to_rule(
             request,
             Some(lists.decode),
             lists.decode_places,
             &mut decodes,
-        )?;
+        );
+        if let Err(none) = asked {
+            // The rule takes a prefill and no decode: the shed stands by
+            // what the rule's prefills are ([`stands`]).
+            let taken = prefills.as_deref().unwrap_or_default();
+            return Err(match over {
+                Some((shed, word)) if stands(lists, taken, word) => shed,
+                _ => none,
+            });
+        }
     }
     // A shed stands where the rule was not asked here: behind a later ask,
     // and under no rule.
